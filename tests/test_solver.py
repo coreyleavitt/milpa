@@ -65,6 +65,18 @@ def test_versionset_from_constraint_string_examples():
     assert not lt.contains((1, 0, 0))
 
 
+def test_versionset_normalize_merges_two_lo_none_intervals():
+    """Regression: Hypothesis (issue #63, 2026-05-22) found that
+    `lt(v).union(full())` produced a non-canonical VersionSet with two
+    intervals both starting at -∞. The fix lives in _normalize_intervals;
+    this asserts the observable user-facing property (union with full
+    yields full)."""
+    v = (0, 0, 0)
+    result = VersionSet.lt(v).union(VersionSet.full())
+    # full() ∪ anything == full()
+    assert result == VersionSet.full()
+
+
 def test_versionset_complement():
     # Complement of [0.5.0, ∞) is (-∞, 0.5.0)
     s = VersionSet.gte((0, 5, 0))

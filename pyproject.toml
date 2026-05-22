@@ -30,6 +30,7 @@ packages = ["milpa"]
 [dependency-groups]
 dev = [
     "pytest >= 8",
+    "hypothesis >= 6",
 ]
 
 [tool.pytest.ini_options]

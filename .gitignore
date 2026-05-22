@@ -8,6 +8,11 @@ __pycache__/
 build/
 dist/
 
+# Hypothesis's example replay database — a cache, not source of truth.
+# Counterexamples worth keeping are checked in as regression example
+# tests (see docs/rfc-property-based-testing.md §Counterexample lifecycle).
+.hypothesis/
+
 # Editor noise
 .vscode/
 .idea/

@@ -218,7 +218,15 @@ def _normalize_intervals(
             continue
         if merged:
             prev_lo, prev_hi = merged[-1]
-            if prev_hi is None or (lo is not None and lo <= prev_hi):
+            # Overlap conditions (any one of):
+            #   - prev extends to +∞ (prev_hi is None)
+            #   - current starts at -∞ (lo is None) — always overlaps a
+            #     non-empty prev. Found by Hypothesis 2026-05-22 in #63:
+            #     prior code only checked `lo is not None and lo <= prev_hi`
+            #     so two `lo=None` intervals failed to merge, breaking the
+            #     union-with-full identity property.
+            #   - current's lo is at or before prev's upper bound
+            if prev_hi is None or lo is None or lo <= prev_hi:
                 new_hi = (None if (prev_hi is None or hi is None)
                           else max(prev_hi, hi))
                 merged[-1] = (prev_lo, new_hi)
