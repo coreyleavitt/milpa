@@ -3,9 +3,10 @@
 Resolves named-package dependencies via nim-lang/packages's
 packages_official.json. Splits responsibility cleanly:
 
-  - Pure decision logic: parse_version, match_constraint,
-    resolve_version, parse_registry — testable with synthetic data,
-    zero I/O.
+  - Pure decision logic: parse_version, resolve_version, parse_registry
+    — testable with synthetic data, zero I/O. Constraint matching
+    routes through VersionSet (solver layer) so there's one source of
+    truth for 'does version v satisfy constraint c?' across milpa.
   - I/O wrappers: load_registry (fetch + cache + parse) and
     list_remote_tags (subprocess git ls-remote) — testable against
     local fixtures.
@@ -20,6 +21,8 @@ import re
 import subprocess
 
 import requests
+
+from .solver import VersionSet
 
 
 DEFAULT_REGISTRY_URL = (
@@ -86,29 +89,6 @@ def parse_version(tag: str) -> Version | None:
     if m is None:
         return None
     return int(m.group(1)), int(m.group(2)), int(m.group(3))
-
-
-_CMP_OPS = {
-    "==": lambda a, b: a == b,
-    ">=": lambda a, b: a >= b,
-    "<=": lambda a, b: a <= b,
-    ">":  lambda a, b: a >  b,
-    "<":  lambda a, b: a <  b,
-}
-
-
-def match_constraint(constraint: str | None, version: Version) -> bool:
-    """Does `version` satisfy `constraint`?
-
-    Constraint grammar (v0):
-      None, "" or "any version"      → any version matches
-      "<op> X.Y.Z"                   → single comparison
-      "<op> X.Y.Z & <op> A.B.C"      → conjunction of two comparisons
-    """
-    if constraint is None or constraint.strip() in ("", "any version"):
-        return True
-    return all(_match_clause(clause.strip(), version)
-               for clause in constraint.split("&"))
 
 
 def load_registry(
@@ -222,12 +202,16 @@ def resolve_version(
 
     Raises RegistryError if no tag matches.
     """
+    # Parse the constraint once into the canonical algebraic form; query
+    # each candidate via .contains(). Same predicate semantics as the
+    # solver — single source of truth (closes #67).
+    vs = VersionSet.from_constraint(constraint)
     candidates: list[tuple[Version, str]] = []
     for tag in available:
         v = parse_version(tag)
         if v is None:
             continue
-        if match_constraint(constraint, v):
+        if vs.contains(v):
             candidates.append((v, tag))
     if not candidates:
         raise RegistryError(
@@ -271,15 +255,3 @@ def _constraint_lower_bound(constraint: str | None) -> Version | None:
     return None
 
 
-def _match_clause(clause: str, version: Version) -> bool:
-    parts = clause.split(None, 1)
-    if len(parts) != 2:
-        return False
-    op, ver_str = parts[0], parts[1].strip()
-    cmp = _CMP_OPS.get(op)
-    if cmp is None:
-        return False
-    target = parse_version(ver_str)
-    if target is None:
-        return False
-    return cmp(version, target)

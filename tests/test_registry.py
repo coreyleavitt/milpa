@@ -1,7 +1,8 @@
 """Registry resolver tests.
 
-The pure-decision logic (parse_version, match_constraint, resolve_version,
-parse_registry) is exercised directly with synthetic data. I/O paths
+The pure-decision logic (parse_version, resolve_version, parse_registry)
+is exercised directly with synthetic data. Constraint matching is
+tested via VersionSet — single source of truth across milpa. I/O paths
 (load_registry's cache + fetch, list_remote_tags) are exercised against
 local fixtures. No network access required.
 """
@@ -16,7 +17,6 @@ from milpa.registry import (
     ResolvedRegistryDep,
     list_remote_tags,
     load_registry,
-    match_constraint,
     parse_registry,
     parse_version,
     resolve_named,
@@ -47,36 +47,6 @@ def test_parse_version_accepts_unprefixed():
 ])
 def test_parse_version_returns_none_for_unparseable(tag):
     assert parse_version(tag) is None
-
-
-def test_match_exact_constraint():
-    assert match_constraint("== 0.5.0", (0, 5, 0)) is True
-    assert match_constraint("== 0.5.0", (0, 5, 1)) is False
-    assert match_constraint("== 0.5.0", (0, 4, 9)) is False
-
-
-def test_match_ge_constraint():
-    assert match_constraint(">= 0.5.0", (0, 5, 0)) is True
-    assert match_constraint(">= 0.5.0", (0, 5, 1)) is True
-    assert match_constraint(">= 0.5.0", (1, 0, 0)) is True
-    assert match_constraint(">= 0.5.0", (0, 4, 9)) is False
-
-
-def test_match_combined_range_constraint():
-    assert match_constraint(">= 0.5.0 & < 1.0.0", (0, 5, 0)) is True
-    assert match_constraint(">= 0.5.0 & < 1.0.0", (0, 9, 9)) is True
-    assert match_constraint(">= 0.5.0 & < 1.0.0", (1, 0, 0)) is False
-    assert match_constraint(">= 0.5.0 & < 1.0.0", (0, 4, 9)) is False
-
-
-def test_match_none_constraint_accepts_any():
-    assert match_constraint(None, (0, 0, 0)) is True
-    assert match_constraint(None, (1, 2, 3)) is True
-
-
-def test_match_any_version_keyword_accepts_any():
-    assert match_constraint("any version", (0, 0, 0)) is True
-    assert match_constraint("any version", (99, 0, 0)) is True
 
 
 def test_resolve_version_picks_highest_matching():
