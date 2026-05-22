@@ -37,8 +37,9 @@ from .solver import (
 class ResolvedDep:
     name: str
     source: str           # URL or "registry:<name>"
-    sha: str | None       # commit SHA (URL deps only)
+    ref: str | None       # git ref originally requested (branch / tag / sha)
     tag: str | None       # tag name (registry deps only)
+    sha: str | None       # resolved commit SHA
     version: Version
     content_hash: str | None
     src_dir: str          # for nim.cfg --path emission
@@ -67,6 +68,7 @@ class _Candidate:
     name: str
     version: Version
     source: str                # URL or "registry:<name>"
+    ref: str | None
     sha: str | None
     tag: str | None
     content_hash: str | None
@@ -125,7 +127,7 @@ def resolve(
     # The synthetic root candidate at version (0,0,0):
     root_cand = _Candidate(
         name="__root__", version=(0, 0, 0),
-        source="root", sha=None, tag=None, content_hash=None,
+        source="root", ref=None, sha=None, tag=None, content_hash=None,
         src_dir="", dep_terms=root_terms,
         requires_names=root_requires,
     )
@@ -151,7 +153,7 @@ def resolve(
             )
             provider.add(_Candidate(
                 name=dep.name, version=_URL_DEP_VERSION,
-                source=dep.git, sha=result.sha, tag=None,
+                source=dep.git, ref=dep.ref, sha=result.sha, tag=None,
                 content_hash=result.content_hash,
                 src_dir=nm.src_dir or "",
                 dep_terms=terms, requires_names=requires_names,
@@ -184,9 +186,10 @@ def resolve(
             ver = (int(parts[0]), int(parts[1]), int(parts[2]))
             provider.add(_Candidate(
                 name=name, version=ver,
-                source=f"registry:{name}", sha=None, tag=r.tag,
+                source=f"registry:{name}", ref=r.tag,
+                sha=result.sha, tag=r.tag,
                 content_hash=result.content_hash,
-                src_dir=nm.src_dir if nm else "",
+                src_dir=(nm.src_dir or "") if nm else "",
                 dep_terms=terms, requires_names=requires_names,
             ))
             for u in sub_url_deps:
@@ -293,7 +296,7 @@ def _build_graph(
         c = name_to_cand[name]
         out.append(ResolvedDep(
             name=c.name, source=c.source,
-            sha=c.sha, tag=c.tag,
+            ref=c.ref, tag=c.tag, sha=c.sha,
             version=c.version,
             content_hash=c.content_hash,
             src_dir=c.src_dir,

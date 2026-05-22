@@ -78,9 +78,10 @@ def _locked_from_resolved(d: ResolvedDep) -> LockedDep:
 
 
 def _infer_ref(d: ResolvedDep) -> str | None:
-    """For URL deps, the ref is what was fetched (lost on the resolved
-    side; we record what we know). For registry deps, the tag IS the ref."""
-    return d.tag   # works for both shapes
+    """URL deps record the manifest-declared ref (branch/tag/sha) so
+    consumers can see what was originally requested. Registry deps fall
+    back to the resolved tag."""
+    return d.ref if d.ref is not None else d.tag
 
 
 def _format_version(v: tuple[int, int, int]) -> str:

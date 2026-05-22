@@ -35,3 +35,6 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "integration: end-to-end test using real network access. Opt-in via MILPA_INTEGRATION_TESTS=1.",
+]

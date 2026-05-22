@@ -22,7 +22,7 @@ def _dep(name, *, source="https://example.com/x.git", ref="main",
          tag=None, sha="abc123", content_hash="hash_x",
          version=(0, 0, 1), src_dir="src", requires=()):
     return ResolvedDep(
-        name=name, source=source, sha=sha, tag=tag,
+        name=name, source=source, ref=ref, tag=tag, sha=sha,
         version=version, content_hash=content_hash,
         src_dir=src_dir, requires=requires,
     )

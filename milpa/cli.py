@@ -25,7 +25,7 @@ from .fetcher import FetchResult, fetch_url_dep
 from .lockfile import format_lockfile, from_graph, load_lockfile, write_lockfile
 from .manifest import ManifestError, load_manifest
 from .nimcfg import write_nimcfg
-from .registry import list_remote_tags
+from .registry import RegistryEntry, list_remote_tags, load_registry
 from .resolver import resolve
 
 
@@ -59,14 +59,25 @@ def make_parser() -> argparse.ArgumentParser:
 # Commands
 # ---------------------------------------------------------------------------
 
+RegistryLoader = Callable[..., dict[str, RegistryEntry]]
+
+
+def _default_registry_loader(*, cache_path: Path) -> dict[str, RegistryEntry]:
+    return load_registry(cache_path=cache_path)
+
+
 def cmd_fetch(
     project_dir: Path,
     *,
     fetcher: Callable[..., FetchResult] = fetch_url_dep,
     list_tags: Callable[[str], list[str]] = list_remote_tags,
+    registry_loader: RegistryLoader = _default_registry_loader,
 ) -> int:
     """Resolve, fetch, emit nim.cfg + milpa.lock."""
-    graph = _resolve_or_error(project_dir, fetcher=fetcher, list_tags=list_tags)
+    graph = _resolve_or_error(
+        project_dir, fetcher=fetcher, list_tags=list_tags,
+        registry_loader=registry_loader,
+    )
     if isinstance(graph, int):
         return graph
     lockfile = from_graph(graph)
@@ -81,9 +92,13 @@ def cmd_lock(
     *,
     fetcher: Callable[..., FetchResult] = fetch_url_dep,
     list_tags: Callable[[str], list[str]] = list_remote_tags,
+    registry_loader: RegistryLoader = _default_registry_loader,
 ) -> int:
     """Resolve + write milpa.lock; do not emit nim.cfg."""
-    graph = _resolve_or_error(project_dir, fetcher=fetcher, list_tags=list_tags)
+    graph = _resolve_or_error(
+        project_dir, fetcher=fetcher, list_tags=list_tags,
+        registry_loader=registry_loader,
+    )
     if isinstance(graph, int):
         return graph
     lockfile = from_graph(graph)
@@ -134,9 +149,10 @@ def _resolve_or_error(
     *,
     fetcher: Callable[..., FetchResult],
     list_tags: Callable[[str], list[str]],
+    registry_loader: RegistryLoader,
 ):
-    """Load manifest + resolve. Returns ResolvedGraph on success, exit
-    code (int) on error."""
+    """Load manifest + registry + resolve. Returns ResolvedGraph on
+    success, exit code (int) on error."""
     manifest_path = project_dir / "milpa.kdl"
     if not manifest_path.exists():
         print(
@@ -149,11 +165,19 @@ def _resolve_or_error(
     except ManifestError as e:
         print(f"error reading manifest: {e}", file=sys.stderr)
         return 1
+    deps_dir = project_dir / "_deps"
+    deps_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = deps_dir / ".packages_official.json"
+    try:
+        registry = registry_loader(cache_path=cache_path)
+    except Exception as e:
+        print(f"failed to load registry: {e}", file=sys.stderr)
+        return 1
     try:
         return resolve(
             manifest,
-            deps_dir=project_dir / "_deps",
-            registry={},
+            deps_dir=deps_dir,
+            registry=registry,
             fetcher=fetcher,
             list_tags=list_tags,
         )
