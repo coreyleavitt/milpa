@@ -24,6 +24,11 @@ Homepage = "https://github.com/coreyleavitt/milpa"
 [tool.hatch.build.targets.wheel]
 packages = ["milpa"]
 
+[dependency-groups]
+dev = [
+    "pytest >= 8",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
