@@ -27,13 +27,55 @@ def test_help_lists_all_subcommands(capsys):
         assert cmd in out, f"{cmd!r} missing from --help output"
 
 
-@pytest.mark.parametrize("cmd", ["fetch", "lock", "show", "clean"])
-def test_subcommand_stub_exits_nonzero_with_message(capsys, cmd):
-    rc = main([cmd])
-    assert rc != 0, f"{cmd!r} should exit non-zero while unimplemented"
-    err = capsys.readouterr().err
-    assert "not yet implemented" in err
-    assert cmd in err
+def test_fetch_dispatches_to_cmd_fetch(monkeypatch, tmp_path):
+    """`milpa fetch -C <dir>` should call cmd_fetch with the resolved dir."""
+    called: dict[str, object] = {}
+
+    def fake_cmd_fetch(project_dir):
+        called["project_dir"] = project_dir
+        return 0
+
+    monkeypatch.setattr("milpa.cli.cmd_fetch", fake_cmd_fetch)
+    rc = main(["-C", str(tmp_path), "fetch"])
+    assert rc == 0
+    assert called["project_dir"] == tmp_path.resolve()
+
+
+def test_lock_dispatches_to_cmd_lock(monkeypatch, tmp_path):
+    called: dict[str, object] = {}
+
+    def fake(project_dir):
+        called["project_dir"] = project_dir
+        return 0
+
+    monkeypatch.setattr("milpa.cli.cmd_lock", fake)
+    rc = main(["-C", str(tmp_path), "lock"])
+    assert rc == 0
+    assert called["project_dir"] == tmp_path.resolve()
+
+
+def test_show_dispatches_to_cmd_show(monkeypatch, tmp_path):
+    called: dict[str, object] = {}
+
+    def fake(project_dir):
+        called["project_dir"] = project_dir
+        return 0
+
+    monkeypatch.setattr("milpa.cli.cmd_show", fake)
+    rc = main(["-C", str(tmp_path), "show"])
+    assert rc == 0
+
+
+def test_clean_dispatches_to_cmd_clean(monkeypatch, tmp_path):
+    called: dict[str, object] = {}
+
+    def fake(project_dir):
+        called["project_dir"] = project_dir
+        return 0
+
+    monkeypatch.setattr("milpa.cli.cmd_clean", fake)
+    rc = main(["-C", str(tmp_path), "clean"])
+    assert rc == 0
 
 
 @pytest.mark.parametrize("cmd", ["fetch", "lock", "show", "clean"])
