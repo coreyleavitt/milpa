@@ -115,17 +115,23 @@ deliberate scope-out.
 | `doctor` (environment check) | no | no | yes (filed) |
 | Binary distribution | yes | yes | yes |
 
-### Out of scope by design (ceded to nimble)
+### v2 — toolchain in the build closure (`rfc-toolchain-content-addressing.md`)
 
-| Feature | nimble v0.22.3 | atlas v0.14.2 | milpa (post-RFC) |
+The previous version of this doc framed these as "ceded to nimble
+forever." That framing was wrong — the name "milpa" (Mesoamerican
+polyculture) is the argument for the broader scope. v2 extends
+content-addressing from source deps to the complete build closure:
+the compiler, companion binaries, and a declarative task wrapper.
+
+| Feature | nimble v0.22.3 | atlas v0.14.2 | milpa post-RFC (v2) |
 |---|---|---|---|
-| Nim compiler installation / version selection | yes | yes | *no (intentional)* |
-| Task scripts / build hooks | yes (nimscript) | yes (NimScript plugins) | *no (intentional)* |
-| Companion binary symlinking (nimsuggest, nimgrep, ...) | yes | no | *no (intentional)* |
+| Nim compiler installation / version selection | yes | yes | **yes — content-addressed, identity-pinned in lockfile** |
+| Companion binary management (nimsuggest, nimgrep, ...) | yes | no | **yes — in the same closure as the compiler** |
+| Task system | yes (nimscript) | yes (NimScript plugins) | **declarative wrapper** — flat name → shell-command map, no embedded scripting language |
+| Hermetic devshell | no | no | **yes (research direction)** — `milpa shell` drops into a reproducible env |
 
-milpa stays a **narrow excellent dep resolver**. The single-tool model
-is nimble's territory; consumers compose milpa with nimble (or any
-build tool) for the broader story.
+Position B (full reproducible-build tool) is the v2 target. v0.x and
+v1 deliberately stay narrow to de-risk the identity model first.
 
 ## What this comparison reveals
 
