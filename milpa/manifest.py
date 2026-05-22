@@ -24,8 +24,24 @@ class UrlDep:
 
 
 @dataclass(frozen=True)
+class NamedDep:
+    """A dep declared by name (resolved via the registry).
+
+    Appears in manifests promoted from .nimble files that have
+    `requires "results"` or `requires "stew >= 0.5.0"` style lines.
+    milpa.kdl-authored manifests use only UrlDep today; named deps
+    would be added if/when KDL-level named-dep syntax is introduced.
+    """
+    name: str
+    constraint: str | None   # e.g. ">= 0.5.0" or None for any version
+
+
+Dep = UrlDep | NamedDep
+
+
+@dataclass(frozen=True)
 class Manifest:
-    deps: tuple[UrlDep, ...]
+    deps: tuple[Dep, ...]
     kind: Kind
 
 
@@ -143,3 +159,106 @@ def _validate_git_url(dep_name: str, url: str) -> None:
             f"{parsed.scheme!r} "
             f"(expected one of: {', '.join(sorted(_VALID_GIT_SCHEMES))})"
         )
+
+
+# ---------------------------------------------------------------------------
+# .nimble compatibility — auto-promote a .nimble file when no milpa.kdl exists
+# ---------------------------------------------------------------------------
+
+def manifest_from_nimble(nm) -> "Manifest":  # nm: NimbleManifest
+    """Convert a parsed NimbleManifest to a milpa Manifest.
+
+    Mapping:
+      - UrlRequirement   → UrlDep (name derived from URL last segment)
+      - NamedRequirement → NamedDep (constraint preserved)
+      - `nim` requirements are dropped — the compiler version is the
+        v2 toolchain RFC's territory, not source-dep resolution.
+
+    `kind` defaults to "library" since .nimble has no equivalent
+    concept. Consumers who want the library/application distinction
+    write milpa.kdl.
+    """
+    # Imported here to avoid a circular import at module load.
+    from .nimble_parse import NamedRequirement, UrlRequirement
+
+    deps: list[Dep] = []
+    for req in nm.requires:
+        if isinstance(req, UrlRequirement):
+            name = _name_from_url(req.url)
+            deps.append(UrlDep(name=name, git=req.url, ref=req.ref or "main"))
+        elif isinstance(req, NamedRequirement):
+            if req.name == "nim":
+                continue
+            deps.append(NamedDep(name=req.name, constraint=req.constraint))
+    return Manifest(deps=tuple(deps), kind="library")
+
+
+def _name_from_url(url: str) -> str:
+    """Derive a package name from a git URL.
+
+    `https://github.com/x/foo.git` → `foo`
+    `https://github.com/x/foo`     → `foo`
+    """
+    tail = url.rstrip("/").rsplit("/", 1)[-1]
+    if tail.endswith(".git"):
+        tail = tail[:-4]
+    return tail
+
+
+def load_or_discover_manifest(project_dir: Path) -> Manifest:
+    """Load milpa.kdl if present; otherwise auto-promote a .nimble file.
+
+    Discovery order:
+      1. <project_dir>/milpa.kdl — preferred. If present, wins regardless
+         of any .nimble files present.
+      2. <project_dir>/<project_dir_basename>.nimble — matches Nim
+         convention of naming the .nimble after the project.
+      3. Any single <project_dir>/*.nimble file — fallback when the
+         project dir name doesn't match a .nimble. Ambiguous (multiple
+         .nimble files) raises ManifestError.
+
+    Raises ManifestError if no manifest source can be found or if the
+    discovered source has parse errors.
+    """
+    milpa_kdl = project_dir / "milpa.kdl"
+    if milpa_kdl.exists():
+        return load_manifest(milpa_kdl)
+
+    # Try <project_name>.nimble first
+    project_name = project_dir.name
+    primary = project_dir / f"{project_name}.nimble"
+    if primary.exists():
+        return _load_manifest_from_nimble(primary)
+
+    # Fallback: any *.nimble
+    candidates = sorted(project_dir.glob("*.nimble"))
+    if len(candidates) == 1:
+        return _load_manifest_from_nimble(candidates[0])
+    if len(candidates) > 1:
+        names = ", ".join(c.name for c in candidates)
+        raise ManifestError(
+            f"multiple .nimble files in {project_dir} ({names}); "
+            f"either rename one to match the project directory "
+            f"({project_name}.nimble) or add a milpa.kdl"
+        )
+
+    raise ManifestError(
+        f"no manifest found in {project_dir} — looked for "
+        f"milpa.kdl, {project_name}.nimble, and any *.nimble"
+    )
+
+
+def _load_manifest_from_nimble(path: Path) -> Manifest:
+    """Read a .nimble file and convert it to a milpa Manifest."""
+    from .nimble_parse import NimbleParseError, parse_nimble
+    try:
+        text = path.read_text()
+    except OSError as e:
+        raise ManifestError(f"cannot read {path}: {e}") from e
+    try:
+        nm = parse_nimble(text)
+    except NimbleParseError as e:
+        raise ManifestError(
+            f"failed to parse {path} as a nimble manifest: {e}"
+        ) from e
+    return manifest_from_nimble(nm)

@@ -95,6 +95,27 @@ def test_rerun_is_idempotent(tmp_path: Path):
 
 
 @pytest.mark.integration
+def test_nimble_only_consumer_resolves(tmp_path: Path):
+    """A fresco-style consumer that has ONLY a .nimble file (no
+    milpa.kdl) should resolve identically to one with a milpa.kdl.
+    Uses intonaco's nimble shape: one URL requires (chronos) + the
+    'nim' compiler requires (which milpa drops)."""
+    (tmp_path / "myproj.nimble").write_text(
+        'requires "nim >= 2.0.0"\n'
+        'requires "https://github.com/coreyleavitt/chronos.git#feat/contextvars"\n'
+    )
+    rc = cmd_fetch(tmp_path)
+    assert rc == 0, "milpa fetch from .nimble alone should succeed"
+
+    lockfile = load_lockfile(tmp_path / "milpa.lock")
+    names = {dep.name for dep in lockfile.deps}
+    # chronos itself + its transitives
+    assert "chronos" in names
+    # nim should NOT be a dep — compiler version isn't a source dep
+    assert "nim" not in names
+
+
+@pytest.mark.integration
 def test_clean_then_fetch_works(tmp_path: Path):
     (tmp_path / "milpa.kdl").write_text(FRESCO_MANIFEST)
 

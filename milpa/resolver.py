@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .fetcher import FetchResult, fetch_url_dep
-from .manifest import Manifest, UrlDep
+from .manifest import Manifest, NamedDep, UrlDep
 from .nimble_parse import NamedRequirement, UrlRequirement, parse_nimble
 from .registry import (
     RegistryEntry,
@@ -118,11 +118,23 @@ def resolve(
     root_requires: list[str] = []
     queue: list[tuple[str, UrlDep] | tuple[str, str, str | None]] = []
 
-    # Manifest's URL deps go first.
+    # Manifest deps go first. UrlDep produces a fixed-singleton version
+    # in solver space; NamedDep gets its constraint mapped to a VersionSet
+    # and is resolved via the registry path (same code path as transitive
+    # named deps from a fetched .nimble).
     for dep in manifest.deps:
-        root_terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
-        root_requires.append(dep.name)
-        queue.append(("url", dep))
+        if isinstance(dep, UrlDep):
+            root_terms.append(
+                Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION))
+            )
+            root_requires.append(dep.name)
+            queue.append(("url", dep))
+        else:  # NamedDep
+            root_terms.append(Term.require(
+                dep.name, VersionSet.from_constraint(dep.constraint)
+            ))
+            root_requires.append(dep.name)
+            queue.append(("named", dep.name, dep.constraint))
 
     # The synthetic root candidate at version (0,0,0):
     root_cand = _Candidate(

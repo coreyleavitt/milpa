@@ -23,7 +23,7 @@ from collections.abc import Callable
 from . import __version__
 from .fetcher import FetchResult, fetch_url_dep
 from .lockfile import format_lockfile, from_graph, load_lockfile, write_lockfile
-from .manifest import ManifestError, load_manifest
+from .manifest import ManifestError, load_or_discover_manifest
 from .nimcfg import write_nimcfg
 from .registry import RegistryEntry, list_remote_tags, load_registry
 from .resolver import resolve
@@ -153,15 +153,8 @@ def _resolve_or_error(
 ):
     """Load manifest + registry + resolve. Returns ResolvedGraph on
     success, exit code (int) on error."""
-    manifest_path = project_dir / "milpa.kdl"
-    if not manifest_path.exists():
-        print(
-            f"no manifest found at {manifest_path}",
-            file=sys.stderr,
-        )
-        return 1
     try:
-        manifest = load_manifest(manifest_path)
+        manifest = load_or_discover_manifest(project_dir)
     except ManifestError as e:
         print(f"error reading manifest: {e}", file=sys.stderr)
         return 1

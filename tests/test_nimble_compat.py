@@ -1,0 +1,239 @@
+"""Tests for .nimble-as-manifest auto-promotion.
+
+When a project has no milpa.kdl but does have a <name>.nimble, milpa
+reads the requires lines and treats the .nimble as the manifest. This
+removes the biggest adoption-friction blocker — existing Nim projects
+don't need a parallel manifest to use milpa.
+"""
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import pytest
+
+from milpa.cli import cmd_fetch
+
+
+@dataclass
+class FakeFetch:
+    by_url_ref: dict[tuple[str, str], tuple[str, str, str]]
+    calls: list[tuple[str, str, str]] = field(default_factory=list)
+
+    def __call__(self, name, git, ref, *, deps_dir):
+        from milpa.fetcher import FetchResult
+        self.calls.append((name, git, ref))
+        sha, content_hash, nimble_text = self.by_url_ref[(git, ref)]
+        target = deps_dir / name
+        target.mkdir(parents=True, exist_ok=True)
+        (target / f"{name}.nimble").write_text(nimble_text)
+        return FetchResult(
+            name=name, path=target, sha=sha, content_hash=content_hash,
+        )
+
+
+_empty_registry = lambda *, cache_path: {}
+
+
+def test_cmd_fetch_reads_nimble_when_no_milpa_kdl(tmp_path):
+    # No milpa.kdl; a .nimble with one URL requires
+    (tmp_path / "myproject.nimble").write_text(
+        'requires "https://example.com/foo.git#main"\n'
+    )
+    fake = FakeFetch({
+        ("https://example.com/foo.git", "main"): (
+            "abc123", "hash_foo", 'srcDir = "src"\n',
+        ),
+    })
+    rc = cmd_fetch(tmp_path, fetcher=fake, registry_loader=_empty_registry)
+    assert rc == 0
+    assert (tmp_path / "milpa.lock").exists()
+    assert (tmp_path / "nim.cfg").exists()
+    # Verify the dep landed
+    assert "foo" in (tmp_path / "nim.cfg").read_text()
+
+
+def test_no_manifest_at_all_errors_mentioning_both_filenames(tmp_path, capsys):
+    # tmp_path is empty
+    rc = cmd_fetch(tmp_path, registry_loader=_empty_registry)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "milpa.kdl" in err
+    assert ".nimble" in err
+
+
+def test_milpa_kdl_wins_when_both_present(tmp_path):
+    # milpa.kdl declares "foo"; .nimble declares "bar". milpa.kdl wins.
+    (tmp_path / "milpa.kdl").write_text(
+        'deps {\n'
+        '    foo git="https://example.com/foo.git" ref="main"\n'
+        '}\n'
+    )
+    (tmp_path / "myproject.nimble").write_text(
+        'requires "https://example.com/bar.git#main"\n'
+    )
+    fake = FakeFetch({
+        ("https://example.com/foo.git", "main"): (
+            "fooo", "hash_foo", 'srcDir = "src"\n',
+        ),
+        # bar deliberately absent — if .nimble were read, the fetch would KeyError
+    })
+    rc = cmd_fetch(tmp_path, fetcher=fake, registry_loader=_empty_registry)
+    assert rc == 0
+    # Only foo got fetched, not bar
+    assert [c[0] for c in fake.calls] == ["foo"]
+    assert "foo" in (tmp_path / "nim.cfg").read_text()
+    assert "bar" not in (tmp_path / "nim.cfg").read_text()
+
+
+def test_nimble_with_named_dep_resolves_via_registry(tmp_path):
+    """A .nimble with a named (registry-resolved) dep — milpa fetches it
+    via the registry path. Test injects a fake registry + tag lister."""
+    from milpa.registry import RegistryEntry
+
+    (tmp_path / "myproject.nimble").write_text(
+        'requires "results >= 0.1.0"\n'
+    )
+
+    def fake_loader(*, cache_path):
+        return {
+            "results": RegistryEntry(
+                name="results",
+                url="https://example.com/results.git",
+                method="git",
+            ),
+        }
+
+    fake = FakeFetch({
+        ("https://example.com/results.git", "v0.5.0"): (
+            "rsha", "rhash", '',  # empty .nimble
+        ),
+    })
+    fake_list_tags = lambda url: ["v0.5.0"]
+
+    rc = cmd_fetch(
+        tmp_path,
+        fetcher=fake,
+        list_tags=fake_list_tags,
+        registry_loader=fake_loader,
+    )
+    assert rc == 0
+    assert "results" in (tmp_path / "nim.cfg").read_text()
+
+
+def test_nimble_with_mixed_url_and_named_deps(tmp_path):
+    from milpa.registry import RegistryEntry
+
+    (tmp_path / "myproject.nimble").write_text(
+        'requires "https://example.com/foo.git#main", "results"\n'
+    )
+
+    def fake_loader(*, cache_path):
+        return {
+            "results": RegistryEntry(
+                name="results", url="https://example.com/results.git", method="git",
+            ),
+        }
+    fake = FakeFetch({
+        ("https://example.com/foo.git", "main"): (
+            "fsha", "fhash", 'srcDir = "src"\n',
+        ),
+        ("https://example.com/results.git", "v0.5.0"): (
+            "rsha", "rhash", '',
+        ),
+    })
+
+    rc = cmd_fetch(
+        tmp_path,
+        fetcher=fake,
+        list_tags=lambda url: ["v0.5.0"],
+        registry_loader=fake_loader,
+    )
+    assert rc == 0
+    cfg = (tmp_path / "nim.cfg").read_text()
+    assert "foo" in cfg
+    assert "results" in cfg
+
+
+def test_multiple_nimble_files_resolves_to_project_named_one(tmp_path):
+    """If there are multiple .nimble files, milpa picks the one matching
+    the project directory name. (The directory name is whatever tmp_path
+    gives us — usually 'test_NNN0' under pytest.) Renaming the project
+    dir for this test is awkward; instead we use the basename-match
+    heuristic explicitly."""
+    # Create a subdir we can rename for the test
+    project = tmp_path / "myproj"
+    project.mkdir()
+    # Two .nimble files, one matches the dir name
+    (project / "myproj.nimble").write_text(
+        'requires "https://example.com/foo.git#main"\n'
+    )
+    (project / "other.nimble").write_text(
+        'requires "https://example.com/bar.git#main"\n'
+    )
+    fake = FakeFetch({
+        ("https://example.com/foo.git", "main"): (
+            "fsha", "fhash", 'srcDir = "src"\n',
+        ),
+        # bar deliberately absent — only myproj.nimble should be read
+    })
+    rc = cmd_fetch(project, fetcher=fake, registry_loader=_empty_registry)
+    assert rc == 0
+    assert [c[0] for c in fake.calls] == ["foo"]
+
+
+def test_ambiguous_nimble_files_with_no_match_errors(tmp_path, capsys):
+    """If there are multiple .nimble files and none matches the project
+    name, milpa won't guess — it errors with a clear message."""
+    project = tmp_path / "myproj"
+    project.mkdir()
+    (project / "alpha.nimble").write_text(
+        'requires "https://example.com/foo.git#main"\n'
+    )
+    (project / "beta.nimble").write_text(
+        'requires "https://example.com/bar.git#main"\n'
+    )
+    rc = cmd_fetch(project, registry_loader=_empty_registry)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "multiple" in err.lower()
+    assert "alpha.nimble" in err
+    assert "beta.nimble" in err
+
+
+def test_malformed_nimble_errors_with_context(tmp_path, capsys):
+    # Create a .nimble file with content that the nimble parser will
+    # accept structurally but where dep resolution fails downstream.
+    # Most "malformed" cases in nimble are actually silent because the
+    # line-scanner tolerates a lot — the realistic failure is the
+    # parser ManifestError from load_or_discover_manifest. Test that
+    # path: an UNREADABLE .nimble (we make it a directory).
+    project = tmp_path / "myproj"
+    project.mkdir()
+    (project / "myproj.nimble").mkdir()  # not a regular file
+    rc = cmd_fetch(project, registry_loader=_empty_registry)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "myproj.nimble" in err or "manifest" in err.lower()
+
+
+def test_nimble_with_nim_compiler_requires_is_skipped(tmp_path):
+    """`requires \"nim >= 2.0.0\"` is a compiler version constraint, not a
+    source dep. milpa drops it at conversion time — handled by the v2
+    toolchain RFC, not source resolution."""
+    (tmp_path / "myproject.nimble").write_text(
+        'requires "nim >= 2.0.0"\n'
+        'requires "https://example.com/foo.git#main"\n'
+    )
+    fake = FakeFetch({
+        ("https://example.com/foo.git", "main"): (
+            "fsha", "fhash", 'srcDir = "src"\n',
+        ),
+    })
+    rc = cmd_fetch(tmp_path, fetcher=fake, registry_loader=_empty_registry)
+    assert rc == 0
+    # nim should not appear as a dep
+    cfg = (tmp_path / "nim.cfg").read_text()
+    assert "_deps/nim" not in cfg
+    # lockfile should not have a 'nim' dep either
+    lock = (tmp_path / "milpa.lock").read_text()
+    assert 'dep "nim"' not in lock
