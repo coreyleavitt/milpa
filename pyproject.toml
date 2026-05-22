@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "milpa"
+version = "0.0.1"
+description = "Nim dependency resolver — reads milpa.kdl, emits nim.cfg, bypasses nimble's broken SAT solver."
+authors = [{name = "Corey Leavitt", email = "corey@knurl.io"}]
+license = "Apache-2.0"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "kdl-py >= 1.2",       # KDL v2 parser (tabatkins/kdlpy)
+    "requests >= 2.31",    # HTTP for packages_official.json
+]
+
+[project.scripts]
+milpa = "milpa.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/coreyleavitt/milpa"
+
+[tool.hatch.build.targets.wheel]
+packages = ["milpa"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
