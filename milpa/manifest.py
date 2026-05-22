@@ -8,7 +8,7 @@ kdl-py is an internal detail; callers see only the typed values.
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 import kdl
 
@@ -109,7 +109,11 @@ def _parse_url_dep(node: kdl.Node) -> UrlDep:
         raise ManifestError(f"dep {name!r}: missing required property 'git'")
     if "ref" not in node.props:
         raise ManifestError(f"dep {name!r}: missing required property 'ref'")
-    git = node.props["git"]
+    # `git` may be a plain str or a ParseResult (when written with the
+    # `(url)` KDL type annotation, kdl-py auto-converts). Normalize to
+    # str so UrlDep is shape-stable regardless of annotation choice.
+    git_raw = node.props["git"]
+    git = git_raw.geturl() if isinstance(git_raw, ParseResult) else git_raw
     _validate_git_url(name, git)
     return UrlDep(name=name, git=git, ref=node.props["ref"])
 

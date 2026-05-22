@@ -14,11 +14,21 @@
 //   git: a git-clonable URL (https / http / ssh / git scheme)
 //   ref: a git ref (branch / tag / commit SHA)
 //
-// Example:
+// The `(url)` KDL type annotation on the git value is supported and
+// recommended for self-documentation. Both forms parse identically;
+// future stricter parsers may enforce more at the annotation site.
+//
+// Example (recommended):
+//
+//   deps {
+//       chronos git=(url)"https://github.com/coreyleavitt/chronos.git" ref="feat/contextvars"
+//       intonaco git=(url)"https://github.com/coreyleavitt/intonaco.git" ref="main"
+//   }
+//
+// Also valid (no annotation):
 //
 //   deps {
 //       chronos git="https://github.com/coreyleavitt/chronos.git" ref="feat/contextvars"
-//       intonaco git="https://github.com/coreyleavitt/intonaco.git" ref="main"
 //   }
 //
 // Constraints:
@@ -26,7 +36,7 @@
 //   - unknown properties (e.g. `branch=`, `tag=`) are rejected with a clear error
 //
 deps "0..*" {
-    "<name>" git="<URL>" ref="<git-ref>"
+    "<name>" git=(url)"<URL>" ref="<git-ref>"
 }
 
 // `kind` declares whether this is a library or an application.

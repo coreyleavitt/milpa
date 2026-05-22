@@ -206,3 +206,22 @@ def test_schema_documentation_file_ships_with_package():
     content = schema.read_text()
     assert "deps" in content
     assert "kind" in content
+
+
+def test_url_with_kdl_type_annotation_parses():
+    # `(url)` is a KDL type annotation; the spec allows it as a
+    # self-documenting decoration. Both annotated and unannotated
+    # forms must produce identical results. (Future stricter parsers
+    # may enforce more at the annotation site; today's parser treats
+    # it as a hint.)
+    annotated = """
+deps {
+    chronos git=(url)"https://github.com/coreyleavitt/chronos.git" ref="feat/contextvars"
+}
+"""
+    plain = """
+deps {
+    chronos git="https://github.com/coreyleavitt/chronos.git" ref="feat/contextvars"
+}
+"""
+    assert parse_manifest(annotated) == parse_manifest(plain)
