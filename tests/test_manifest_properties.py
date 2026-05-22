@@ -15,6 +15,7 @@ from hypothesis import given, strategies as st
 from milpa.manifest import (
     Manifest,
     NamedDep,
+    Override,
     UrlDep,
     format_manifest,
     parse_manifest,
@@ -72,14 +73,22 @@ def constraints():
 @st.composite
 def manifests(draw):
     """A valid Manifest with unique dep names across both URL and
-    named variants."""
+    named variants. Also generates 0-3 overrides with unique names
+    that don't conflict with the dep names (they're in their own
+    namespace per the spec)."""
     n_deps = draw(st.integers(min_value=0, max_value=6))
-    unique_names = draw(st.lists(
-        names(), min_size=n_deps, max_size=n_deps, unique=True,
+    n_overrides = draw(st.integers(min_value=0, max_value=3))
+    all_names = draw(st.lists(
+        names(),
+        min_size=n_deps + n_overrides,
+        max_size=n_deps + n_overrides,
+        unique=True,
     ))
+    dep_names = all_names[:n_deps]
+    override_names = all_names[n_deps:n_deps + n_overrides]
+
     deps: list = []
-    for name in unique_names:
-        # Each dep is either URL or named, chosen randomly
+    for name in dep_names:
         if draw(st.booleans()):
             deps.append(UrlDep(
                 name=name,
@@ -88,8 +97,18 @@ def manifests(draw):
             ))
         else:
             deps.append(NamedDep(name=name, constraint=draw(constraints())))
+
+    overrides: list = []
+    for name in override_names:
+        overrides.append(Override(
+            name=name,
+            git=draw(git_urls()),
+            ref=draw(git_refs()),
+        ))
+
     return Manifest(
         deps=tuple(deps),
+        overrides=tuple(overrides),
         kind=draw(st.sampled_from(["library", "application"])),
     )
 

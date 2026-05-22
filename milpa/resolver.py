@@ -23,7 +23,7 @@ from pathlib import Path
 import sys
 
 from .fetcher import FetchResult, fetch_url_dep
-from .manifest import Manifest, NamedDep, UrlDep
+from .manifest import Manifest, NamedDep, Override, UrlDep
 from .nimble_parse import NamedRequirement, UrlRequirement, parse_nimble
 from .registry import (
     RegistryEntry,
@@ -134,18 +134,32 @@ def resolve(
     root_requires: list[str] = []
     queue: list[tuple[str, UrlDep] | tuple[str, str, str | None]] = []
 
+    # Index overrides up front so root-term construction knows when
+    # a NamedDep gets transformed into a URL fetch (which produces a
+    # singleton version, not a registry-constrained range).
+    _overrides_by_name: dict[str, Override] = {
+        ov.name: ov for ov in manifest.overrides
+    }
+
     # Manifest deps go first. UrlDep produces a fixed-singleton version
     # in solver space; NamedDep gets its constraint mapped to a VersionSet
     # and is resolved via the registry path (same code path as transitive
-    # named deps from a fetched .nimble).
+    # named deps from a fetched .nimble). NamedDeps whose name appears in
+    # overrides become URL fetches at the sentinel version — the
+    # constraint is irrelevant because the override IS the spec.
     for dep in manifest.deps:
-        if isinstance(dep, UrlDep):
+        if isinstance(dep, UrlDep) or dep.name in _overrides_by_name:
             root_terms.append(
                 Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION))
             )
             root_requires.append(dep.name)
-            queue.append(("url", dep))
-        else:  # NamedDep
+            if isinstance(dep, UrlDep):
+                queue.append(("url", dep))
+            else:
+                # NamedDep + override → fetched as URL via the
+                # submit() override path
+                queue.append(("named", dep.name, dep.constraint))
+        else:  # NamedDep (no override applies)
             root_terms.append(Term.require(
                 dep.name, VersionSet.from_constraint(dep.constraint)
             ))
@@ -161,6 +175,9 @@ def resolve(
     )
     provider.add(root_cand)
 
+    # Single source of truth (already built above for root-term construction)
+    overrides_by_name = _overrides_by_name
+
     # BFS over the dep graph, materializing candidates. The main thread
     # owns `provider`, `seen_url`, `seen_named`, and the queue. Worker
     # threads only execute self-contained fetch+parse work and return
@@ -172,8 +189,17 @@ def resolve(
         in_flight: dict = {}   # Future → queue item (for error context)
 
         def submit(item):
+            # Override application — checked uniformly for URL + named
+            # items. An override for `name` replaces the original
+            # provenance with the override's URL+ref. Named-dep deps
+            # become URL deps (skipping the registry lookup entirely).
             if item[0] == "url":
-                dep = item[1]
+                original_dep = item[1]
+                if original_dep.name in overrides_by_name:
+                    ov = overrides_by_name[original_dep.name]
+                    dep = UrlDep(name=original_dep.name, git=ov.git, ref=ov.ref)
+                else:
+                    dep = original_dep
                 key = (dep.git, dep.ref)
                 if key in seen_url:
                     return
@@ -191,11 +217,25 @@ def resolve(
                     seen_named.add(name)
                     return
                 seen_named.add(name)
-                print(f"fetching {name}...", file=sys.stderr)
-                fut = ex.submit(
-                    _process_named, name, constraint, deps_dir, fetcher,
-                    registry, list_tags, strategy,
-                )
+                if name in overrides_by_name:
+                    # Convert to a URL fetch using the override's spec.
+                    ov = overrides_by_name[name]
+                    overridden = UrlDep(name=name, git=ov.git, ref=ov.ref)
+                    key = (overridden.git, overridden.ref)
+                    if key in seen_url:
+                        return
+                    seen_url.add(key)
+                    print(f"fetching {name} (override)...", file=sys.stderr)
+                    fut = ex.submit(
+                        _process_url, overridden, deps_dir, fetcher,
+                        registry, list_tags,
+                    )
+                else:
+                    print(f"fetching {name}...", file=sys.stderr)
+                    fut = ex.submit(
+                        _process_named, name, constraint, deps_dir, fetcher,
+                        registry, list_tags, strategy,
+                    )
             in_flight[fut] = item
 
         for item in queue:

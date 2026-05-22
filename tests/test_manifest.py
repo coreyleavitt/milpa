@@ -283,6 +283,121 @@ deps {
     assert "one positional" in str(exc.value).lower() or "constraint" in str(exc.value).lower()
 
 
+def test_format_manifest_round_trips_overrides():
+    """A Manifest with an overrides tuple round-trips through
+    format_manifest → parse_manifest."""
+    from milpa.manifest import Override, format_manifest
+    m = Manifest(
+        deps=(UrlDep(name="foo", git="https://example.com/foo.git", ref="main"),),
+        kind="library",
+        overrides=(
+            Override(
+                name="chronos",
+                git="https://github.com/my-fork/chronos.git",
+                ref="my-fix",
+            ),
+        ),
+    )
+    text = format_manifest(m)
+    assert parse_manifest(text) == m
+
+
+def test_manifest_without_overrides_has_empty_tuple():
+    """Backwards compat: a manifest with no overrides block produces
+    Manifest.overrides == ()."""
+    text = '''
+deps {
+    foo git="https://example.com/foo.git" ref="main"
+}
+'''
+    m = parse_manifest(text)
+    assert m.overrides == ()
+
+
+def test_override_missing_git_property_raises():
+    text = '''
+overrides {
+    pkg "chronos" ref="my-fix"
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    assert "chronos" in str(exc.value)
+    assert "git" in str(exc.value)
+
+
+def test_override_missing_ref_property_raises():
+    text = '''
+overrides {
+    pkg "chronos" git="https://example.com/x.git"
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    assert "chronos" in str(exc.value)
+    assert "ref" in str(exc.value)
+
+
+def test_override_with_unknown_property_raises():
+    text = '''
+overrides {
+    pkg "chronos" git="https://x.git" ref="main" foo="bar"
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    assert "chronos" in str(exc.value)
+    assert "foo" in str(exc.value)
+
+
+def test_unknown_override_kind_raises():
+    """Only 'pkg' is supported in v0.x; other kinds error."""
+    text = '''
+overrides {
+    url "https://from.git" "https://to.git"
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    assert "url" in str(exc.value).lower() or "pkg" in str(exc.value).lower()
+
+
+def test_duplicate_override_for_same_name_raises():
+    text = '''
+overrides {
+    pkg "chronos" git="https://a.git" ref="main"
+    pkg "chronos" git="https://b.git" ref="main"
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    assert "chronos" in str(exc.value)
+    assert "duplicate" in str(exc.value).lower()
+
+
+def test_overrides_block_parses():
+    """A manifest with an `overrides { pkg ... }` block parses into
+    Manifest.overrides as a tuple of Override values."""
+    from milpa.manifest import Override
+    text = '''
+deps {
+    foo git="https://example.com/foo.git" ref="main"
+}
+
+overrides {
+    pkg "chronos" git=(url)"https://github.com/my-fork/chronos.git" ref="my-fix"
+}
+'''
+    m = parse_manifest(text)
+    assert m.overrides == (
+        Override(
+            name="chronos",
+            git="https://github.com/my-fork/chronos.git",
+            ref="my-fix",
+        ),
+    )
+
+
 def test_format_empty_manifest_round_trips():
     """An empty library manifest should round-trip through format/parse."""
     from milpa.manifest import format_manifest

@@ -74,3 +74,36 @@ deps "0..*" {
 // Default (if omitted): "library".
 //
 kind "library"  // or "application"
+
+// `overrides` block (optional): zero-or-more rewrite rules. Each
+// matches by dep NAME and substitutes the entire URL+ref. Applies
+// project-wide — to manifest-direct deps, transitive URL deps, and
+// named (registry) deps. Does not propagate to downstream consumers.
+//
+// v0.x supports only the `pkg` form. Atlas-style `url <from> <to>`
+// and `name <old> <new>` are future extensions.
+//
+// Example:
+//
+//   overrides {
+//       // Use a fork of chronos while upstream PR is in review
+//       pkg "chronos" git=(url)"https://github.com/my-fork/chronos.git" ref="my-fix"
+//
+//       // Redirect a registry dep to an internal mirror
+//       pkg "results" git=(url)"https://internal-mirror/results.git" ref="v0.5.1"
+//   }
+//
+// Constraints:
+//   - one override per name (duplicates rejected)
+//   - both `git=` and `ref=` are required on every pkg override
+//   - unknown properties or unknown override kinds (`url`, `name`)
+//     rejected with a clear error
+//
+// Interaction with content-addressed identity: overrides change
+// provenance only. Identity follows whatever the override's content
+// hashes to. milpa.lock records the override's URL/ref/sha/
+// content_hash — the actually-fetched provenance, not the
+// aspirational one.
+overrides "0..*" {
+    pkg "<name>" git=(url)"<URL>" ref="<git-ref>"
+}

@@ -354,6 +354,107 @@ def test_resolve_parallel_produces_same_graph_as_serial(tmp_path):
     assert normalize(serial) == normalize(parallel)
 
 
+def test_resolve_url_dep_with_override_fetches_override(tmp_path):
+    """A manifest URL dep matching an override is fetched from the
+    override's URL+ref, not the manifest's."""
+    from milpa.manifest import Override
+    fixtures = {
+        # Only the OVERRIDE's spec is in the fake fetcher's table.
+        # If the resolver tried the manifest's URL, FakeFetch would
+        # KeyError loudly.
+        ("https://my-fork/chronos.git", "my-fix"): (
+            "fork-sha", "fork-hash", 'srcDir = "src"\n',
+        ),
+    }
+    manifest = Manifest(
+        deps=(UrlDep(name="chronos",
+                     git="https://upstream/chronos.git",
+                     ref="main"),),
+        kind="library",
+        overrides=(Override(
+            name="chronos",
+            git="https://my-fork/chronos.git",
+            ref="my-fix",
+        ),),
+    )
+    graph = resolve(
+        manifest, deps_dir=tmp_path / "_deps",
+        registry={}, fetcher=FakeFetch(fixtures),
+    )
+    chronos = next(d for d in graph.deps if d.name == "chronos")
+    assert chronos.source == "https://my-fork/chronos.git"
+    assert chronos.ref == "my-fix"
+
+
+def test_resolve_named_dep_with_override_skips_registry(tmp_path):
+    """A NamedDep matching an override bypasses the registry entirely
+    and fetches the override's URL+ref directly."""
+    from milpa.manifest import NamedDep, Override
+    fixtures = {
+        ("https://my-fork/results.git", "patched"): (
+            "ovr-sha", "ovr-hash", '',
+        ),
+    }
+    manifest = Manifest(
+        deps=(NamedDep(name="results", constraint=">= 0.4.0"),),
+        kind="library",
+        overrides=(Override(
+            name="results",
+            git="https://my-fork/results.git",
+            ref="patched",
+        ),),
+    )
+    # Empty registry + no list_tags fake — proves the registry path
+    # is skipped entirely when an override matches.
+    fake_list_tags = lambda url: pytest.fail("list_tags should not be called when override matches")
+    graph = resolve(
+        manifest, deps_dir=tmp_path / "_deps",
+        registry={},
+        fetcher=FakeFetch(fixtures),
+        list_tags=fake_list_tags,
+    )
+    results_dep = next(d for d in graph.deps if d.name == "results")
+    assert results_dep.source == "https://my-fork/results.git"
+    assert results_dep.ref == "patched"
+
+
+def test_resolve_transitive_url_dep_override(tmp_path):
+    """An override applies to transitive deps brought in by other
+    deps' nimble files — project-wide scoping. Here `app` requires
+    chronos transitively; the override redirects it to a fork."""
+    from milpa.manifest import Override
+    fixtures = {
+        ("https://example.com/app.git", "main"): (
+            "app-sha", "app-hash",
+            'srcDir = "src"\nrequires "https://upstream/chronos.git#main"\n',
+        ),
+        # NOT in the table: ("https://upstream/chronos.git", "main")
+        # — if the resolver tried the upstream URL it would KeyError.
+        # The override redirects to:
+        ("https://my-fork/chronos.git", "my-fix"): (
+            "fork-sha", "fork-hash", 'srcDir = "src"\n',
+        ),
+    }
+    manifest = Manifest(
+        deps=(UrlDep(name="app",
+                     git="https://example.com/app.git",
+                     ref="main"),),
+        kind="library",
+        overrides=(Override(
+            name="chronos",
+            git="https://my-fork/chronos.git",
+            ref="my-fix",
+        ),),
+    )
+    graph = resolve(
+        manifest, deps_dir=tmp_path / "_deps",
+        registry={}, fetcher=FakeFetch(fixtures),
+    )
+    chronos = next(d for d in graph.deps if d.name == "chronos")
+    assert chronos.source == "https://my-fork/chronos.git"
+    assert chronos.ref == "my-fix"
+
+
 def test_resolve_topological_order(tmp_path):
     """Dependencies appear before the packages that require them."""
     fake = FakeFetch({

@@ -49,9 +49,28 @@ Dep = UrlDep | NamedDep
 
 
 @dataclass(frozen=True)
+class Override:
+    """A pkg-form override: any dep with this name resolves to this
+    URL+ref instead of whatever the manifest or transitive resolution
+    would otherwise produce.
+
+    Project-wide scope: applies to manifest-direct deps, transitive
+    URL deps, and named (registry-resolved) deps with the same name.
+    Does not propagate to downstream consumers of this project.
+
+    See docs/identity-and-provenance.md — overrides change provenance,
+    identity follows whatever the override's content hashes to.
+    """
+    name: str
+    git: str
+    ref: str
+
+
+@dataclass(frozen=True)
 class Manifest:
     deps: tuple[Dep, ...]
     kind: Kind
+    overrides: tuple[Override, ...] = ()
 
 
 class ManifestError(Exception):
@@ -62,7 +81,7 @@ class ManifestError(Exception):
 # the schema doc at milpa/schema/milpa.schema.kdl documents the same shape
 # for humans. Drift between the two is checked indirectly via tests against
 # example manifests.
-_TOP_LEVEL_NODES = frozenset({"deps", "kind"})
+_TOP_LEVEL_NODES = frozenset({"deps", "kind", "overrides"})
 _URL_DEP_PROPS = frozenset({"git", "ref"})
 _VALID_KINDS: tuple[Kind, ...] = ("library", "application")
 _VALID_GIT_SCHEMES = frozenset({"https", "http", "ssh", "git"})
@@ -80,9 +99,11 @@ def parse_manifest(text: str, *, source: str | None = None) -> Manifest:
         doc = kdl.parse(text)
     except kdl.errors.ParseError as e:
         raise ManifestError(f"KDL syntax error: {e}") from e
-    deps: list[UrlDep] = []
+    deps: list[Dep] = []
+    overrides: list[Override] = []
     kind: Kind = "library"
     seen_names: set[str] = set()
+    seen_override_names: set[str] = set()
     for node in doc.nodes:
         if node.name == "deps":
             for child in node.nodes:
@@ -94,13 +115,26 @@ def parse_manifest(text: str, *, source: str | None = None) -> Manifest:
                 deps.append(_parse_dep(child))
         elif node.name == "kind":
             kind = _parse_kind(node)
+        elif node.name == "overrides":
+            for child in node.nodes:
+                ov = _parse_override(child)
+                if ov.name in seen_override_names:
+                    raise ManifestError(
+                        f"duplicate override for {ov.name!r}"
+                    )
+                seen_override_names.add(ov.name)
+                overrides.append(ov)
         else:
             allowed = ", ".join(sorted(_TOP_LEVEL_NODES))
             raise ManifestError(
                 f"unknown top-level node {node.name!r} "
                 f"(allowed: {allowed})"
             )
-    return Manifest(deps=tuple(deps), kind=kind)
+    return Manifest(
+        deps=tuple(deps),
+        kind=kind,
+        overrides=tuple(overrides),
+    )
 
 
 def load_manifest(path: Path) -> Manifest:
@@ -137,6 +171,15 @@ def format_manifest(m: Manifest) -> str:
         lines.append("deps {")
         for dep in m.deps:
             lines.append(_format_dep_line(dep))
+        lines.append("}")
+        lines.append("")
+    if m.overrides:
+        lines.append("overrides {")
+        for ov in m.overrides:
+            lines.append(
+                f'    pkg {_quote_name(ov.name)} '
+                f'git=(url)"{ov.git}" ref="{ov.ref}"'
+            )
         lines.append("}")
         lines.append("")
     lines.append(f'kind "{m.kind}"')
@@ -227,6 +270,47 @@ def _parse_named_dep(node: kdl.Node) -> NamedDep:
         f"dep {name!r}: named deps take at most one positional argument "
         f"(the version constraint); got {len(node.args)}"
     )
+
+
+def _parse_override(node: kdl.Node) -> Override:
+    """Validate and convert one child of the `overrides` block.
+
+    Grammar (v0.x — pkg form only):
+      pkg "<name>" git=(url)"<URL>" ref="<git-ref>"
+
+    The first positional arg is the match name. The git= and ref=
+    properties carry the substitute provenance.
+    """
+    if node.name != "pkg":
+        raise ManifestError(
+            f"unknown override kind {node.name!r} "
+            f"(supported: 'pkg')"
+        )
+    if len(node.args) != 1 or not isinstance(node.args[0], str):
+        raise ManifestError(
+            "pkg override takes one positional argument (the dep name)"
+        )
+    name = node.args[0]
+    extra = set(node.props.keys()) - _URL_DEP_PROPS
+    if extra:
+        unknown = ", ".join(repr(p) for p in sorted(extra))
+        allowed = ", ".join(sorted(_URL_DEP_PROPS))
+        raise ManifestError(
+            f"override for {name!r}: unknown property/properties {unknown} "
+            f"(allowed: {allowed})"
+        )
+    if "git" not in node.props:
+        raise ManifestError(
+            f"override for {name!r}: missing required property 'git'"
+        )
+    if "ref" not in node.props:
+        raise ManifestError(
+            f"override for {name!r}: missing required property 'ref'"
+        )
+    git_raw = node.props["git"]
+    git = git_raw.geturl() if isinstance(git_raw, ParseResult) else git_raw
+    _validate_git_url(name, git)
+    return Override(name=name, git=git, ref=node.props["ref"])
 
 
 def _parse_kind(node: kdl.Node) -> Kind:
