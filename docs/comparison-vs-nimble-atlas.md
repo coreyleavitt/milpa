@@ -1,192 +1,215 @@
-# milpa vs nimble vs atlas — full feature comparison + roadmap
+# milpa vs nimble vs atlas — full feature comparison
 
 **Last updated**: 2026-05-22
 
-This document tracks how milpa compares to the two existing Nim
-dep resolvers (nimble v0.22.3, atlas v0.14.2) across feature axes that
-matter for adoption and differentiation. It includes a "what if"
-column projecting milpa after the filed RFCs + gap issues land, to
-guide where energy goes.
+This document compares milpa against the two existing Nim dependency
+resolvers (nimble v0.22.3, atlas v0.14.2). The milpa column reflects
+**milpa with all currently-filed RFCs and issues completed**, not the
+current shipped state — the question this doc answers is "what does
+the field look like when milpa realizes its design intent?"
 
-## Today: shipped capabilities
+Scope of "all RFCs":
+- `rfc-content-addressed-identity.md` — Phases A-E
+- `rfc-pluggable-fetchers.md` — F1-F8 + SafeExtractor
+- `rfc-beyond-pubgrub.md` — research roadmap (proof certificates,
+  capability-aware resolution, refinement-typed versions)
+- `rfc-compile-time-dep-graphs.md` — compile-time-first dep extraction
+- `rfc-effect-typed-deps.md` — capability/effect typing on deps
 
-| Feature | nimble v0.22.3 | atlas v0.14.2 | milpa today |
+Plus the filed feature-parity gap issues (#23-#27, #49-#53).
+Out-of-scope items (#54-#56: nim version management, tasks,
+companion binaries) are deliberately ceded to nimble.
+
+## Feature matrix
+
+Legend: ✓ = supported; ✗ = absent; **bold** = structural exclusive
+(would require ground-up rebuild for competitor to match); *italic* =
+deliberate scope-out.
+
+### Manifest + format
+
+| Feature | nimble v0.22.3 | atlas v0.14.2 | milpa (post-RFC) |
 |---|---|---|---|
-| Manifest format | nimscript .nimble | nimscript .nimble + atlas.config | KDL milpa.kdl |
-| Lockfile | yes | atlas.lock | KDL milpa.lock |
-| Resolution algorithm | SAT (vnext) | 3 strategies (MaxVer/SemVer/MinVer) | PubGrub |
-| Conflict narration | "Unsatisfiable" basic | manual override | derivation chain |
-| Direct URL deps | yes | yes | yes |
-| Transitive URL deps | unclear (was broken; [#543](https://github.com/nim-lang/nimble/issues/543)) | yes | yes |
-| Registry resolution | yes | yes | yes |
-| **Identity model** | commit SHA | commit SHA | **sha256 content hash** |
-| Multi-provenance | no | no | no |
-| Workspace / link | basic | yes | no |
-| Features / optional deps | no | yes | no |
-| Conditional deps (`when`) | nimscript-native | nimscript-native | no |
-| Overrides | no | yes | no |
-| Fork management | no | yes | no |
-| Parallel fetch | no | yes | no |
-| Multiple SCMs (hg/fossil) | no | no | no |
-| Tarball deps | no | no | no |
-| OCI / IPFS deps | no | no | no |
-| Virtual env / nim version | yes | yes | no (out of scope) |
-| Task scripts | yes (nimscript) | NimScript plugins | no (out of scope) |
-| Companion binaries | yes | no | no (out of scope) |
-| Binary distribution | yes | yes | no |
-| Production-ready | yes (official) | yes | research prototype |
+| Manifest format | nimscript .nimble | nimscript .nimble + atlas.config | **declarative KDL** + .nimble compat for the requires line |
+| Manifest is Turing-complete | yes (nimscript) | yes (nimscript) | **no — pure data; supply-chain attack surface minimized** |
+| Lockfile | yes | yes (atlas.lock) | yes (milpa.lock v2 — identity + provenance) |
+| Library/application distinction | no | no | **yes — `kind` field decides if lockfile is committed** |
+| Schema versioning | no | no | yes (lockfile v1 → v2 → ...; explicit migration) |
 
-**Score (today, ignoring out-of-scope):** nimble ≈ 12 yes, atlas ≈ 14
-yes, milpa ≈ 6 yes. Atlas is the capability leader; nimble is the
-incumbent.
+### Identity + integrity
 
-## What if: milpa after all filed RFCs + gap issues land
+| Feature | nimble v0.22.3 | atlas v0.14.2 | milpa (post-RFC) |
+|---|---|---|---|
+| Dep identity | commit SHA | commit SHA | **sha256 of source tree (content-addressed)** |
+| Multi-provenance per identity | no | no | **yes — one identity, N delivery paths** |
+| Cross-fork dedup | no | no | **yes — same content → same package, regardless of URL** |
+| Mirror substitution | no | no | **yes — adding a mirror is a provenance append, not a new dep** |
+| Offline lockfile verification | requires git | requires git | **yes — bytes + lockfile suffice** |
+| Global content-addressed store | no | no | **yes — `~/.cache/milpa/store/sha256/...`, cross-project dedup** |
+| Hash algorithm agility | no | no | **yes — multihash encoding (`sha256:...`); future-proof** |
+| Sigstore / SLSA attestation | no | no | **yes (research direction)** |
 
-If every currently-open milpa issue lands, the column flips:
+### Resolution
 
-| Feature | nimble v0.22.3 | atlas v0.14.2 | milpa (today) | milpa (post-all-filed) |
-|---|---|---|---|---|
-| Manifest format | nimscript | nimscript + atlas.config | KDL | KDL + .nimble compat ([#51](https://github.com/coreyleavitt/milpa/issues/51)) |
-| Lockfile | yes | yes | yes | yes (+ v2 schema with identity/provenance split [#33](https://github.com/coreyleavitt/milpa/issues/33)) |
-| Resolution algorithm | SAT | 3 strategies | PubGrub | PubGrub + strategy modes ([#49](https://github.com/coreyleavitt/milpa/issues/49)) + full paper parity ([#28](https://github.com/coreyleavitt/milpa/issues/28)) |
-| Conflict narration | basic | manual | derivation chain | proof-certificates (research direction; rfc-beyond-pubgrub) |
-| Direct URL deps | yes | yes | yes | yes |
-| Transitive URL deps | unclear | yes | yes | yes |
-| Registry resolution | yes | yes | yes | yes |
-| **Identity model** | commit SHA | commit SHA | sha256 (used but underclaimed) | **content-hash-as-identity, full model** ([#29-#39](https://github.com/coreyleavitt/milpa/milestone/5)) |
-| Multi-provenance | no | no | no | yes ([#37](https://github.com/coreyleavitt/milpa/issues/37)) |
-| Global content store | no | no | no | yes ([#35](https://github.com/coreyleavitt/milpa/issues/35), [#36](https://github.com/coreyleavitt/milpa/issues/36)) |
-| Workspace / link | basic | yes | partial ([#25](https://github.com/coreyleavitt/milpa/issues/25)) | yes ([#25](https://github.com/coreyleavitt/milpa/issues/25), [#42](https://github.com/coreyleavitt/milpa/issues/42)) |
-| Features / optional deps | no | yes | no | yes ([#23](https://github.com/coreyleavitt/milpa/issues/23)) |
-| Conditional deps (`when`) | nimscript | nimscript | no | yes ([#26](https://github.com/coreyleavitt/milpa/issues/26)) |
-| Overrides | no | yes | no | yes ([#50](https://github.com/coreyleavitt/milpa/issues/50)) |
-| Fork management | no | yes | no | yes (subsumed by [#50](https://github.com/coreyleavitt/milpa/issues/50)) |
-| Parallel fetch | no | yes | no | yes ([#52](https://github.com/coreyleavitt/milpa/issues/52)) |
-| Multiple SCMs (hg/fossil) | no | no | no | yes ([#43](https://github.com/coreyleavitt/milpa/issues/43), [#44](https://github.com/coreyleavitt/milpa/issues/44)) |
-| Tarball deps | no | no | no | yes ([#41](https://github.com/coreyleavitt/milpa/issues/41)) |
-| OCI / IPFS deps | no | no | no | yes ([#45](https://github.com/coreyleavitt/milpa/issues/45), [#46](https://github.com/coreyleavitt/milpa/issues/46)) |
-| Pluggable third-party fetchers | no | no | no | yes ([#47](https://github.com/coreyleavitt/milpa/issues/47)) |
-| Sigstore / SLSA attestation | no | no | no | yes (research, [#38](https://github.com/coreyleavitt/milpa/issues/38)) |
-| Virtual env / nim version | yes | yes | no | no (deliberate, [#54](https://github.com/coreyleavitt/milpa/issues/54)) |
-| Task scripts | yes | yes | no | no (deliberate, [#55](https://github.com/coreyleavitt/milpa/issues/55)) |
-| Companion binaries | yes | no | no | no (deliberate, [#56](https://github.com/coreyleavitt/milpa/issues/56)) |
-| Binary distribution | yes | yes | no | yes ([#53](https://github.com/coreyleavitt/milpa/issues/53)) |
-| Production-ready | yes | yes | research prototype | yes (post-#53) |
+| Feature | nimble v0.22.3 | atlas v0.14.2 | milpa (post-RFC) |
+|---|---|---|---|
+| Algorithm | SAT (vnext) | 3 heuristics (MaxVer/SemVer/MinVer) | PubGrub (paper-spec) |
+| Resolution strategies | one | 3 (Max/Sem/Min) | 3+ (Max/Sem/Min + extensible) |
+| Conflict narration | "Unsatisfiable" basic | manual override | **derivation chain; proof-certificate verification (research)** |
+| Backtracking | yes (SAT) | no | yes (paper-spec) |
+| Cycle detection | yes | yes | yes |
+| Compile-time dep graphs | no | no | **yes (research — compile-time-first extraction)** |
+| Capability-aware resolution | no | no | **yes (research — effect-typed deps)** |
+| Refinement-typed versions | no | no | **yes (research — beyond semver)** |
 
-**Projected score (post-all-filed, excluding deliberate-OUT):** milpa
-parity on every adoption feature, exclusive on content-hash identity,
-multi-provenance, pluggable transports, sigstore attestation,
-proof-certificate failure narration.
+### Transports / fetching
 
-## Where milpa pulls ahead vs the field (after roadmap)
+| Feature | nimble v0.22.3 | atlas v0.14.2 | milpa (post-RFC) |
+|---|---|---|---|
+| Git URL (https / ssh / git / file) | yes | yes | yes |
+| Transitive URL deps | unclear (was broken) | yes | yes |
+| Tarball | no | no | **yes — verify-before-extract is stricter than git** |
+| Mercurial | no | no | yes |
+| Fossil | no | no | yes |
+| Local path / workspace | basic | yes | yes (with in-place drift detection) |
+| OCI registry | no | no | **yes (research) — registry-verified digest** |
+| IPFS | no | no | **yes (research) — CID-as-identity alignment** |
+| Pluggable fetcher protocol (third-party) | no | no | **yes — entry-point registration** |
+| Parallel fetch | no | yes | yes |
+| Pre-fetch integrity verification | no | no | **yes (tarball / OCI / IPFS)** |
+| Archive sandbox (zip-slip / symlink-escape protection) | n/a | n/a | yes (SafeExtractor utility) |
 
-These are the structural differentiators no patch to nimble or atlas
-closes easily:
+### Dep declaration semantics
 
-1. **Content-hash-as-identity.** Both competitors pin commit SHA;
-   neither has a path to content addressing without rebuild. Unlocks
-   cross-fork dedup, mirror substitution, cross-SCM identity,
-   trust-independent verification.
+| Feature | nimble v0.22.3 | atlas v0.14.2 | milpa (post-RFC) |
+|---|---|---|---|
+| Direct deps | yes | yes | yes |
+| Features / optional deps | no | yes | yes |
+| Conditional deps (`when`) | yes (nimscript) | yes (nimscript) | yes (declarative `when` syntax) |
+| Dev / test deps | basic | yes (feature blocks) | yes |
+| Patch / override section | no | yes | yes |
+| Fork management | no | yes (auto remote) | yes (subsumed by overrides) |
+| Workspace linking | basic | yes | yes |
 
-2. **KDL declarative manifest.** Both competitors evaluate nimscript
-   to resolve deps. Supply-chain attack surface is fundamentally
-   smaller in milpa (parsing KDL ≠ executing arbitrary Nim).
+### Registry + ecosystem
 
-3. **Multi-provenance.** Same dep, multiple delivery paths, identity
-   unchanged. Neither competitor has this; both bake URL into identity.
+| Feature | nimble v0.22.3 | atlas v0.14.2 | milpa (post-RFC) |
+|---|---|---|---|
+| nim-lang/packages.json | yes | yes | yes |
+| Version constraints (`>=`, `==`, ranges) | yes | yes | yes |
+| Caret / tilde (`^`, `~`) constraints | no | no | yes |
+| Prerelease opt-in | no | no | yes |
+| Build metadata (`+build`) | no | no | yes |
 
-4. **Pluggable transports.** Tarball / OCI / IPFS via a uniform
-   fetcher protocol. Atlas is git-only; nimble is git-only.
+### Tooling + ergonomics
 
-5. **Proof-certificate failure narration.** PubGrub baseline today;
-   the rfc-beyond-pubgrub direction extends to verifiable proof objects
-   that third parties can check without re-running resolution.
+| Feature | nimble v0.22.3 | atlas v0.14.2 | milpa (post-RFC) |
+|---|---|---|---|
+| `fetch` / `install` | yes | yes | yes |
+| `lock` (write lockfile without fetch) | yes | yes (`pin`) | yes |
+| `show` / dep tree | yes | yes | yes |
+| `verify` (integrity check) | partial | no | yes |
+| `clean` | no | manual | yes |
+| `add` / `remove` / `update` | partial | yes | yes |
+| `outdated` / `why` | no | no | yes (filed) |
+| `doctor` (environment check) | no | no | yes (filed) |
+| Binary distribution | yes | yes | yes |
 
-6. **Library/application lockfile policy** based on manifest `kind`.
-   Cargo-derived; neither competitor implements this.
+### Out of scope by design (ceded to nimble)
 
-## Where milpa stays narrow by design
+| Feature | nimble v0.22.3 | atlas v0.14.2 | milpa (post-RFC) |
+|---|---|---|---|
+| Nim compiler installation / version selection | yes | yes | *no (intentional)* |
+| Task scripts / build hooks | yes (nimscript) | yes (NimScript plugins) | *no (intentional)* |
+| Companion binary symlinking (nimsuggest, nimgrep, ...) | yes | no | *no (intentional)* |
 
-These are deliberately out-of-scope. Resist scope creep here.
+milpa stays a **narrow excellent dep resolver**. The single-tool model
+is nimble's territory; consumers compose milpa with nimble (or any
+build tool) for the broader story.
 
-- **nim compiler version management** ([#54](https://github.com/coreyleavitt/milpa/issues/54)) — nimble/atlas already do this well.
-- **Task scripts / build hooks** ([#55](https://github.com/coreyleavitt/milpa/issues/55)) — nimble's task blocks, atlas's plugins.
-- **Companion binary symlinking** ([#56](https://github.com/coreyleavitt/milpa/issues/56)) — nim toolchain concern.
+## What this comparison reveals
 
-The single-tool-does-everything model is nimble's territory. milpa is
-the *narrow excellent* dep resolver; consumers compose it with nimble
-(or whatever) for the broader build/toolchain story.
+### milpa's structural exclusives (15 features, no patch closes them)
 
-## Priority recommendation: where to focus next
+Identity-and-trust layer:
+1. Declarative KDL manifest (no nimscript evaluation)
+2. Content-hash-as-identity
+3. Multi-provenance per identity
+4. Cross-fork dedup
+5. Mirror substitution
+6. Offline lockfile verification
+7. Global content-addressed store
+8. Hash algorithm agility
+9. Sigstore/SLSA attestation
+10. Library/application lockfile policy
 
-Ordered by adoption-friction-removal first, then by structural
-differentiation:
+Resolution-and-narration layer:
+11. Proof-certificate failure narration
+12. Compile-time dep graphs
+13. Capability-aware resolution
+14. Refinement-typed versions
 
-### Tier 1 — adoption blockers (do these next)
+Transport layer:
+15. Pluggable fetchers (tarball / hg / fossil / OCI / IPFS / third-party)
 
-These are table stakes; no real Nim consumer adopts milpa without them.
+Each of these would require ground-up redesign for nimble or atlas to
+match. They aren't features to add; they're commitments embedded in
+the data model.
 
-1. **.nimble compatibility ([#51](https://github.com/coreyleavitt/milpa/issues/51))**. Today consumers must author a parallel milpa.kdl. Reading existing .nimble's requires removes the biggest adoption barrier. ~2-3 days.
-2. **Binary distribution ([#53](https://github.com/coreyleavitt/milpa/issues/53))**. uv-based Python isn't on most Nim user machines. PyInstaller / zipapp + GH Actions release pipeline. ~3-4 days.
-3. **Parallel fetch ([#52](https://github.com/coreyleavitt/milpa/issues/52))**. 4x speedup on fresco's tree. UX-visible; easy win. ~1-2 days.
-4. **Phase A of content-addressing RFC ([#29](https://github.com/coreyleavitt/milpa/issues/29), [#30](https://github.com/coreyleavitt/milpa/issues/30), [#31](https://github.com/coreyleavitt/milpa/issues/31))**. Documentation cleanup, executable-bit in hash, `milpa verify` CLI. ~2-3 days for all three. Cleans up the identity story before bigger phases.
+### Where milpa matches
 
-**Total Tier 1: ~10-12 days for a milpa that's adoption-ready and
-correctly positions its identity model.**
+Every feature atlas has that nimble lacks, milpa has too: workspaces,
+features, parallel fetch, overrides, resolution strategies. milpa
+doesn't cede ground on capability.
 
-### Tier 2 — feature parity with atlas (close the cap gap)
+### Where milpa intentionally cedes
 
-These remove "atlas has this; why doesn't milpa?" objections during
-evaluation.
+The three nim-toolchain features (compiler management, task scripts,
+companion binaries) belong to nimble. milpa doesn't pretend to be a
+one-tool-does-everything system — it's the dep layer.
 
-5. **Resolution strategy modes ([#49](https://github.com/coreyleavitt/milpa/issues/49))** — MaxVer/SemVer/MinVer.
-6. **Dependency overrides ([#50](https://github.com/coreyleavitt/milpa/issues/50))** — name/URL/pkg substitution + forks.
-7. **Workspace `link` ([#25](https://github.com/coreyleavitt/milpa/issues/25))** — local-project linking for monorepos.
-8. **Features / optional deps ([#23](https://github.com/coreyleavitt/milpa/issues/23))** — `feature "test"` blocks.
-9. **Conditional deps / when blocks ([#26](https://github.com/coreyleavitt/milpa/issues/26))** — match nimble's nimscript-when semantics.
+## Implication for the field
 
-**Total Tier 2: ~10-15 days. After this, milpa is at-or-ahead of atlas
-on every feature axis except scope-OUT items.**
+If milpa realizes the full RFC roadmap, the comparison flips from
+"milpa is a Python prototype with structural intent" to **"milpa is
+the only Nim resolver with a 21st-century identity model, transport
+extensibility, and verifiable failure narration."** nimble and atlas
+each have years of head start on adoption, ecosystem, and polish; they
+do not have a path to closing the structural gap without a major
+redesign.
 
-### Tier 3 — structural differentiation (start publishing on these)
+The strategic position milpa occupies after the RFCs:
 
-These are what makes milpa interesting research-and-engineering wise.
-Each is a meaningful contribution to the field.
+- **Adoption parity** with atlas on every capability that matters for
+  daily use (workspaces, features, overrides, parallel fetch,
+  strategies, .nimble compat).
+- **Differentiated exclusively** on the identity / provenance / trust
+  layer — where the actual interesting research and engineering lives.
+- **Narrow** — doesn't try to subsume nimble's compiler/task/toolchain
+  role.
+- **Composable** — works alongside nimble, doesn't replace it.
 
-10. **Content-addressing Phase B-C ([#32](https://github.com/coreyleavitt/milpa/issues/32), [#33](https://github.com/coreyleavitt/milpa/issues/33), [#35](https://github.com/coreyleavitt/milpa/issues/35), [#36](https://github.com/coreyleavitt/milpa/issues/36))** — dedup by content_hash, global store, schema v2.
-11. **Pluggable fetchers Phase F1-F3 ([#40](https://github.com/coreyleavitt/milpa/issues/40), [#41](https://github.com/coreyleavitt/milpa/issues/41), [#42](https://github.com/coreyleavitt/milpa/issues/42))** — protocol refactor, tarball, local.
-12. **Multi-provenance ([#37](https://github.com/coreyleavitt/milpa/issues/37))** — completes the identity/provenance split.
+The line for "milpa is the obvious choice" is the moment Tier 1
+(adoption blockers) and Tier 2 (atlas parity) of the implementation
+roadmap (see `docs/roadmap-prioritization.md` companion doc, or the
+filed issues directly) land. Tier 3 (structural differentiation)
+flips it from "the obvious choice" to "the only choice for anyone who
+cares about supply-chain integrity, reproducibility, or multi-
+transport dep delivery."
 
-**Total Tier 3: ~25-30 days. After this, milpa has a real claim to
-"the modern Nim dep resolver" — every existing tool would need
-ground-up rebuild to match.**
+## Caveats and honest disclaimers
 
-### Tier 4 — research direction (start an artifact)
-
-13. **Hg / fossil fetchers ([#43](https://github.com/coreyleavitt/milpa/issues/43), [#44](https://github.com/coreyleavitt/milpa/issues/44))**.
-14. **PubGrub full paper parity ([#28](https://github.com/coreyleavitt/milpa/issues/28))** — backjumping, conflict-driven learning.
-15. **OCI / IPFS fetchers ([#45](https://github.com/coreyleavitt/milpa/issues/45), [#46](https://github.com/coreyleavitt/milpa/issues/46))**.
-16. **Sigstore / SLSA attestation ([#38](https://github.com/coreyleavitt/milpa/issues/38))**.
-17. **Beyond-PubGrub** — proof certificates, capability-aware resolution, refinement-typed versions (rfc-beyond-pubgrub catalog).
-
-Each Tier 4 item is research-paper-or-blog-post material. Pick one
-when an engineering focus block is needed; don't try to do them all.
-
-## Total effort estimate to "milpa is the obvious choice"
-
-Tier 1 + Tier 2 + Tier 3 = roughly 45-60 working days, or ~3 calendar
-months of focused work. After that, the question isn't "milpa or
-atlas?" — it's "is there a reason *not* to milpa?"
-
-The narrow excellent dep resolver, fully realized.
-
-## Anti-priorities
-
-Do **not** spend time on:
-
-- nim version management ([#54](https://github.com/coreyleavitt/milpa/issues/54))
-- Task / script system ([#55](https://github.com/coreyleavitt/milpa/issues/55))
-- Companion binary symlinking ([#56](https://github.com/coreyleavitt/milpa/issues/56))
-
-These are nimble's territory. Resist scope creep; close-as-wontfix if
-proposals arrive.
+- **All currently shipped milpa is a research prototype.** Today
+  ≠ post-RFC. The 124 unit tests + 3 gated integration tests cover
+  v0; everything in this matrix labeled differentiating-exclusive is
+  in RFC form, not in code.
+- **nimble and atlas don't stand still.** They could add features
+  during milpa's roadmap window. The structural exclusives in §"milpa's
+  structural exclusives" are the slowest-to-close gaps; the
+  capability-parity items (features, workspaces, strategies) are the
+  fastest. Race to differentiation, not to parity.
+- **"Research direction" items in milpa's column** (proof
+  certificates, compile-time graphs, effect-typed deps, refinement
+  types, OCI/IPFS, sigstore) are catalog entries in RFCs, not staffed
+  implementations. They are positioned as multi-year directions, each
+  worth a publishable artifact.
