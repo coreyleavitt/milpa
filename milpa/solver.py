@@ -60,18 +60,32 @@ class Strategy(StrEnum):
 Version = tuple[int, int, int]
 
 
-# ---------------------------------------------------------------------------
-# VersionSet — union of disjoint half-open intervals over Version.
-# ---------------------------------------------------------------------------
-
 _VERSION_RE = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
 
 
-def _parse_version(text: str) -> Version:
+def parse_version(text: str) -> Version | None:
+    """Parse a version string to a (major, minor, patch) triple.
+
+    Accepts an optional `v` prefix (`v0.5.1` and `0.5.1` both parse).
+    Returns `None` for tags milpa v0 doesn't model — prereleases,
+    build metadata, non-canonical prefixes (`nimble-1.2.3`). Callers
+    decide whether to skip silently or treat as error.
+
+    This is the canonical version parser used by both the solver
+    (for constraint clause parsing) and the registry (for filtering
+    available tags). Single source of truth across milpa.
+    """
+    if text is None:
+        return None
     m = _VERSION_RE.fullmatch(text.strip())
     if m is None:
-        raise ValueError(f"unparseable version in constraint: {text!r}")
+        return None
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+# ---------------------------------------------------------------------------
+# VersionSet — union of disjoint half-open intervals over Version.
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -128,7 +142,9 @@ class VersionSet:
         if len(parts) != 2:
             raise ValueError(f"unparseable constraint clause: {clause!r}")
         op, ver_str = parts[0], parts[1]
-        v = _parse_version(ver_str)
+        v = parse_version(ver_str)
+        if v is None:
+            raise ValueError(f"unparseable version in constraint: {ver_str!r}")
         match op:
             case ">=": return cls.gte(v)
             case "<=": return cls.lte(v)

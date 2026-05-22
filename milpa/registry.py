@@ -17,12 +17,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 import json
-import re
 import subprocess
 
 import requests
 
-from .solver import VersionSet
+from .solver import Version, VersionSet, parse_version
 
 
 DEFAULT_REGISTRY_URL = (
@@ -73,22 +72,6 @@ def parse_registry(text: str) -> dict[str, RegistryEntry]:
             method = "git"
         registry[name] = RegistryEntry(name=name, url=url, method=method)
     return registry
-
-
-Version = tuple[int, int, int]
-
-
-def parse_version(tag: str) -> Version | None:
-    """Parse a tag string into a (major, minor, patch) triple.
-
-    Returns None for tags milpa v0 doesn't model (prereleases, build
-    metadata, non-canonical prefixes). Skipped tags are filtered out of
-    the candidate set before version matching.
-    """
-    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", tag)
-    if m is None:
-        return None
-    return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
 
 def load_registry(

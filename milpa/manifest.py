@@ -1,7 +1,16 @@
-"""milpa.kdl parser.
+"""milpa.kdl parser, formatter, and discovery.
 
-Public surface: parse_manifest(text), load_manifest(path), and the
-value types Manifest / UrlDep, plus ManifestError for malformed input.
+Public surface, by intended use:
+  - parse_manifest(text) / format_manifest(m) — pure text↔value pair
+  - load_or_discover_manifest(project_dir) — entry point for the CLI;
+    prefers milpa.kdl, falls back to <name>.nimble auto-promotion
+  - load_manifest(path) — explicit-path loader (used internally by
+    discover; exposed for tools that know exactly which file to read)
+  - Value types: Manifest, UrlDep, NamedDep, Dep, ManifestError
+  - manifest_from_nimble(nm) — convert a parsed NimbleManifest to a
+    milpa Manifest (used by load_or_discover_manifest on the
+    .nimble fallback path)
+
 kdl-py is an internal detail; callers see only the typed values.
 """
 

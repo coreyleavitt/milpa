@@ -248,6 +248,12 @@ def verify_against_graph(
     - extra deps in the graph that aren't locked
     - missing deps that are locked but absent from the graph
     - content_hash or sha mismatches
+
+    Intended consumer (not yet wired): `milpa update` (#18) will
+    re-resolve the manifest, then call this to detect what changed
+    vs. the locked state. For verifying the on-disk _deps/ directory
+    matches the lockfile (no re-resolve), use
+    `verify_lockfile_against_deps` instead.
     """
     locked_by_name = {d.name: d for d in lockfile.deps}
     graph_by_name = {d.name: d for d in graph.deps}

@@ -76,7 +76,7 @@ def fetch_url_dep(
             shutil.rmtree(target, ignore_errors=True)
         raise
     sha = _git_head_sha(target)
-    content_hash = _content_hash(target)
+    content_hash = compute_content_hash(target)
     return FetchResult(name=name, path=target, sha=sha, content_hash=content_hash)
 
 
@@ -102,11 +102,3 @@ def _git_head_sha(path: Path) -> str:
     ).stdout.strip()
 
 
-def _content_hash(path: Path) -> str:
-    """sha256 over the source tree per milpa's identity spec.
-
-    Delegates to `milpa.identity.compute_content_hash`. Kept as a thin
-    private wrapper for backward import-compat — direct callers of the
-    identity primitive should use the public module.
-    """
-    return compute_content_hash(path)
