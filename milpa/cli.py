@@ -49,6 +49,10 @@ def make_parser() -> argparse.ArgumentParser:
         "-C", "--directory", metavar="<dir>", default=".",
         help="run as if invoked from <dir> instead of the current directory",
     )
+    parser.add_argument(
+        "-j", "--parallel", metavar="<N>", type=int, default=8,
+        help="number of concurrent fetches (default: 8; use 1 for serial)",
+    )
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
     for name, help_text in SUBCOMMAND_HELP.items():
         subparsers.add_parser(name, help=help_text)
@@ -72,11 +76,12 @@ def cmd_fetch(
     fetcher: Callable[..., FetchResult] = fetch_url_dep,
     list_tags: Callable[[str], list[str]] = list_remote_tags,
     registry_loader: RegistryLoader = _default_registry_loader,
+    max_parallel: int = 8,
 ) -> int:
     """Resolve, fetch, emit nim.cfg + milpa.lock."""
     graph = _resolve_or_error(
         project_dir, fetcher=fetcher, list_tags=list_tags,
-        registry_loader=registry_loader,
+        registry_loader=registry_loader, max_parallel=max_parallel,
     )
     if isinstance(graph, int):
         return graph
@@ -93,11 +98,12 @@ def cmd_lock(
     fetcher: Callable[..., FetchResult] = fetch_url_dep,
     list_tags: Callable[[str], list[str]] = list_remote_tags,
     registry_loader: RegistryLoader = _default_registry_loader,
+    max_parallel: int = 8,
 ) -> int:
     """Resolve + write milpa.lock; do not emit nim.cfg."""
     graph = _resolve_or_error(
         project_dir, fetcher=fetcher, list_tags=list_tags,
-        registry_loader=registry_loader,
+        registry_loader=registry_loader, max_parallel=max_parallel,
     )
     if isinstance(graph, int):
         return graph
@@ -150,6 +156,7 @@ def _resolve_or_error(
     fetcher: Callable[..., FetchResult],
     list_tags: Callable[[str], list[str]],
     registry_loader: RegistryLoader,
+    max_parallel: int = 8,
 ):
     """Load manifest + registry + resolve. Returns ResolvedGraph on
     success, exit code (int) on error."""
@@ -173,6 +180,7 @@ def _resolve_or_error(
             registry=registry,
             fetcher=fetcher,
             list_tags=list_tags,
+            max_parallel=max_parallel,
         )
     except Exception as e:
         print(f"resolution failed: {e}", file=sys.stderr)
@@ -191,8 +199,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     project_dir = Path(args.directory).resolve()
     match args.command:
-        case "fetch": return cmd_fetch(project_dir)
-        case "lock":  return cmd_lock(project_dir)
+        case "fetch": return cmd_fetch(project_dir, max_parallel=args.parallel)
+        case "lock":  return cmd_lock(project_dir, max_parallel=args.parallel)
         case "show":  return cmd_show(project_dir)
         case "clean": return cmd_clean(project_dir)
         case _:

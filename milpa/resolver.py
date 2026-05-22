@@ -12,8 +12,10 @@ git operations.
 """
 
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
+import sys
 
 from .fetcher import FetchResult, fetch_url_dep
 from .manifest import Manifest, NamedDep, UrlDep
@@ -104,11 +106,18 @@ def resolve(
     registry: dict[str, RegistryEntry],
     fetcher: Callable[..., FetchResult] = fetch_url_dep,
     list_tags: Callable[[str], list[str]] = list_remote_tags,
+    max_parallel: int = 8,
 ) -> ResolvedGraph:
     """Resolve `manifest` into a topologically-sorted ResolvedGraph.
 
     Eager fetch model: walk URL deps + transitive deps in BFS order,
     materializing every candidate, then run PubGrub over the result.
+
+    `max_parallel` controls how many concurrent fetches may be in
+    flight. Output is deterministic regardless of value — the resolved
+    graph, lockfile, and nim.cfg are byte-identical for any value.
+    Only the fetch ORDER varies. Use 1 for serial execution; the
+    default 8 is conservative for typical Nim dep graphs.
     """
     deps_dir.mkdir(parents=True, exist_ok=True)
     provider = _MaterializedProvider()
@@ -145,74 +154,135 @@ def resolve(
     )
     provider.add(root_cand)
 
-    # BFS over the dep graph, materializing candidates.
+    # BFS over the dep graph, materializing candidates. The main thread
+    # owns `provider`, `seen_url`, `seen_named`, and the queue. Worker
+    # threads only execute self-contained fetch+parse work and return
+    # results — no shared mutable state.
     seen_url: set[tuple[str, str]] = set()       # (git, ref)
-    seen_named: dict[str, ResolvedRegistryDep] = {}
+    seen_named: set[str] = set()
 
-    while queue:
-        item = queue.pop(0)
-        if item[0] == "url":
-            dep: UrlDep = item[1]  # type: ignore[assignment]
-            key = (dep.git, dep.ref)
-            if key in seen_url:
-                continue
-            seen_url.add(key)
-            result = fetcher(dep.name, dep.git, dep.ref, deps_dir=deps_dir)
-            nimble_path = _find_nimble_file(result.path, dep.name)
-            nm = parse_nimble(nimble_path.read_text())
-            terms, requires_names, sub_url_deps, sub_named = _build_terms(
-                nm, registry, list_tags,
-            )
-            provider.add(_Candidate(
-                name=dep.name, version=_URL_DEP_VERSION,
-                source=dep.git, ref=dep.ref, sha=result.sha, tag=None,
-                content_hash=result.content_hash,
-                src_dir=nm.src_dir or "",
-                dep_terms=terms, requires_names=requires_names,
-            ))
-            for u in sub_url_deps:
-                queue.append(("url", u))
-            for n in sub_named:
-                queue.append(("named", n.name, n.constraint))
-        else:  # named
-            name, constraint = item[1], item[2]  # type: ignore[misc]
-            if name in seen_named:
-                continue
-            # `name` may be "nim" — skip; we don't manage the compiler.
-            if name == "nim":
-                seen_named[name] = None  # type: ignore[assignment]
-                continue
-            r = resolve_named(name, constraint,
-                              registry=registry, list_tags=list_tags)
-            seen_named[name] = r
-            # Fetch via the registry URL at the resolved tag.
-            result = fetcher(name, r.url, r.tag, deps_dir=deps_dir)
-            nimble_path = _find_nimble_file(result.path, name)
-            nm = parse_nimble(nimble_path.read_text()) if nimble_path.exists() else None
-            terms, requires_names, sub_url_deps, sub_named = (
-                _build_terms(nm, registry, list_tags) if nm else ([], [], [], [])
-            )
-            # The registry-resolved version is `r.version` (parsed from tag).
-            v_str = r.version
-            parts = v_str.split(".")
-            ver = (int(parts[0]), int(parts[1]), int(parts[2]))
-            provider.add(_Candidate(
-                name=name, version=ver,
-                source=f"registry:{name}", ref=r.tag,
-                sha=result.sha, tag=r.tag,
-                content_hash=result.content_hash,
-                src_dir=(nm.src_dir or "") if nm else "",
-                dep_terms=terms, requires_names=requires_names,
-            ))
-            for u in sub_url_deps:
-                queue.append(("url", u))
-            for n in sub_named:
-                queue.append(("named", n.name, n.constraint))
+    with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as ex:
+        in_flight: dict = {}   # Future → queue item (for error context)
+
+        def submit(item):
+            if item[0] == "url":
+                dep = item[1]
+                key = (dep.git, dep.ref)
+                if key in seen_url:
+                    return
+                seen_url.add(key)
+                print(f"fetching {dep.name}...", file=sys.stderr)
+                fut = ex.submit(
+                    _process_url, dep, deps_dir, fetcher,
+                    registry, list_tags,
+                )
+            else:  # named
+                name, constraint = item[1], item[2]
+                if name in seen_named:
+                    return
+                if name == "nim":
+                    seen_named.add(name)
+                    return
+                seen_named.add(name)
+                print(f"fetching {name}...", file=sys.stderr)
+                fut = ex.submit(
+                    _process_named, name, constraint, deps_dir, fetcher,
+                    registry, list_tags,
+                )
+            in_flight[fut] = item
+
+        for item in queue:
+            submit(item)
+
+        while in_flight:
+            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for fut in done:
+                item = in_flight.pop(fut)
+                try:
+                    candidate, new_items = fut.result()
+                except Exception as e:
+                    # Cancel outstanding work and surface the error.
+                    for outstanding in in_flight:
+                        outstanding.cancel()
+                    raise
+                provider.add(candidate)
+                name = candidate.name
+                print(f"✓ {name}", file=sys.stderr)
+                for new_item in new_items:
+                    submit(new_item)
 
     # Solve.
     solution = solve(provider, "__root__", (0, 0, 0))
     # Map solution → ResolvedGraph (topologically sorted).
     return _build_graph(solution, provider)
+
+
+def _process_url(
+    dep: UrlDep,
+    deps_dir: Path,
+    fetcher: Callable[..., FetchResult],
+    registry: dict[str, RegistryEntry],
+    list_tags: Callable[[str], list[str]],
+) -> tuple["_Candidate", list]:
+    """Worker function: fetch + parse one URL dep. Returns the candidate
+    plus the queue items its requires introduce. Thread-safe: touches no
+    shared mutable state outside its own subtree of `deps_dir`."""
+    result = fetcher(dep.name, dep.git, dep.ref, deps_dir=deps_dir)
+    nimble_path = _find_nimble_file(result.path, dep.name)
+    nm = parse_nimble(nimble_path.read_text())
+    terms, requires_names, sub_url_deps, sub_named = _build_terms(
+        nm, registry, list_tags,
+    )
+    candidate = _Candidate(
+        name=dep.name, version=_URL_DEP_VERSION,
+        source=dep.git, ref=dep.ref, sha=result.sha, tag=None,
+        content_hash=result.content_hash,
+        src_dir=nm.src_dir or "",
+        dep_terms=terms, requires_names=requires_names,
+    )
+    new_items: list = []
+    for u in sub_url_deps:
+        new_items.append(("url", u))
+    for n in sub_named:
+        new_items.append(("named", n.name, n.constraint))
+    return candidate, new_items
+
+
+def _process_named(
+    name: str,
+    constraint: str | None,
+    deps_dir: Path,
+    fetcher: Callable[..., FetchResult],
+    registry: dict[str, RegistryEntry],
+    list_tags: Callable[[str], list[str]],
+) -> tuple["_Candidate", list]:
+    """Worker function: resolve a named dep through the registry, fetch
+    it, parse its nimble. Network ops (resolve_named's list_remote_tags
+    + fetcher's git clone) both happen here so they can parallelize."""
+    r = resolve_named(name, constraint,
+                      registry=registry, list_tags=list_tags)
+    result = fetcher(name, r.url, r.tag, deps_dir=deps_dir)
+    nimble_path = _find_nimble_file(result.path, name)
+    nm = parse_nimble(nimble_path.read_text()) if nimble_path.exists() else None
+    terms, requires_names, sub_url_deps, sub_named = (
+        _build_terms(nm, registry, list_tags) if nm else ([], [], [], [])
+    )
+    parts = r.version.split(".")
+    ver = (int(parts[0]), int(parts[1]), int(parts[2]))
+    candidate = _Candidate(
+        name=name, version=ver,
+        source=f"registry:{name}", ref=r.tag,
+        sha=result.sha, tag=r.tag,
+        content_hash=result.content_hash,
+        src_dir=(nm.src_dir or "") if nm else "",
+        dep_terms=terms, requires_names=requires_names,
+    )
+    new_items: list = []
+    for u in sub_url_deps:
+        new_items.append(("url", u))
+    for n in sub_named:
+        new_items.append(("named", n.name, n.constraint))
+    return candidate, new_items
 
 
 def _build_terms(

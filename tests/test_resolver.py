@@ -124,6 +124,192 @@ def test_resolve_dedup_same_url_ref(tmp_path):
     assert len(shared_calls) == 1
 
 
+def test_resolve_parallel_produces_byte_identical_lockfile(tmp_path):
+    """`milpa.lock` is byte-identical regardless of max_parallel.
+    Lockfile is sorted by name; fetch order doesn't affect output."""
+    from milpa.lockfile import format_lockfile, from_graph
+    fixtures = {
+        ("https://example.com/foo.git", "main"): (
+            "fsha", "fhash", 'srcDir = "src"\n',
+        ),
+        ("https://example.com/bar.git", "main"): (
+            "bsha", "bhash", 'srcDir = "src"\n',
+        ),
+        ("https://example.com/baz.git", "main"): (
+            "zsha", "zhash", 'srcDir = "src"\n',
+        ),
+    }
+    manifest = Manifest(
+        deps=(
+            UrlDep(name="foo", git="https://example.com/foo.git", ref="main"),
+            UrlDep(name="bar", git="https://example.com/bar.git", ref="main"),
+            UrlDep(name="baz", git="https://example.com/baz.git", ref="main"),
+        ),
+        kind="library",
+    )
+    serial = resolve(
+        manifest, deps_dir=tmp_path / "s",
+        registry={}, fetcher=FakeFetch(fixtures), max_parallel=1,
+    )
+    parallel = resolve(
+        manifest, deps_dir=tmp_path / "p",
+        registry={}, fetcher=FakeFetch(fixtures), max_parallel=8,
+    )
+    assert format_lockfile(from_graph(serial)) == format_lockfile(from_graph(parallel))
+
+
+def test_resolve_parallel_dedup_no_double_fetch(tmp_path):
+    """Two URL deps both pointing at the same (git, ref) should still
+    result in exactly one fetch under parallelism. The seen_url set is
+    guarded by the main thread; submit() is the only place that adds to
+    it, and the main thread submits sequentially even when workers run
+    concurrently."""
+    fixtures = {
+        ("https://example.com/foo.git", "main"): (
+            "fsha", "fhash",
+            'srcDir = "src"\nrequires "https://example.com/shared.git#v1"\n',
+        ),
+        ("https://example.com/bar.git", "main"): (
+            "bsha", "bhash",
+            'srcDir = "src"\nrequires "https://example.com/shared.git#v1"\n',
+        ),
+        ("https://example.com/shared.git", "v1"): (
+            "ssha", "shash", 'srcDir = "src"\n',
+        ),
+    }
+    fake = FakeFetch(fixtures)
+    manifest = Manifest(
+        deps=(
+            UrlDep(name="foo", git="https://example.com/foo.git", ref="main"),
+            UrlDep(name="bar", git="https://example.com/bar.git", ref="main"),
+        ),
+        kind="library",
+    )
+    graph = resolve(
+        manifest, deps_dir=tmp_path / "_deps",
+        registry={}, fetcher=fake, max_parallel=4,
+    )
+    # shared appears once
+    assert sum(1 for d in graph.deps if d.name == "shared") == 1
+    # shared was fetched exactly once
+    assert sum(1 for c in fake.calls if c[0] == "shared") == 1
+
+
+def test_resolve_parallel_failure_surfaces(tmp_path):
+    """One fetcher failure should surface as an exception, not deadlock."""
+    from milpa.fetcher import FetchError
+
+    @dataclass
+    class FailingFetch:
+        good: dict[tuple[str, str], tuple[str, str, str]]
+        calls: list = field(default_factory=list)
+        def __call__(self, name, git, ref, *, deps_dir):
+            from milpa.fetcher import FetchResult
+            self.calls.append(name)
+            if (git, ref) not in self.good:
+                raise FetchError(f"simulated failure for {name}")
+            sha, content_hash, nimble_text = self.good[(git, ref)]
+            target = deps_dir / name
+            target.mkdir(parents=True, exist_ok=True)
+            (target / f"{name}.nimble").write_text(nimble_text)
+            return FetchResult(name=name, path=target, sha=sha,
+                               content_hash=content_hash)
+
+    fixtures = {
+        ("https://example.com/good1.git", "main"): (
+            "g1", "g1h", 'srcDir = "src"\n',
+        ),
+        ("https://example.com/good2.git", "main"): (
+            "g2", "g2h", 'srcDir = "src"\n',
+        ),
+        # bad.git deliberately missing → fetcher raises
+    }
+    manifest = Manifest(
+        deps=(
+            UrlDep(name="good1", git="https://example.com/good1.git", ref="main"),
+            UrlDep(name="good2", git="https://example.com/good2.git", ref="main"),
+            UrlDep(name="bad",   git="https://example.com/bad.git",   ref="main"),
+        ),
+        kind="library",
+    )
+    with pytest.raises(FetchError) as exc:
+        resolve(
+            manifest, deps_dir=tmp_path / "_deps",
+            registry={}, fetcher=FailingFetch(fixtures), max_parallel=4,
+        )
+    assert "bad" in str(exc.value)
+
+
+def test_resolve_parallel_wide_graph(tmp_path):
+    """A wide graph (manifest root + 7 sibling URL deps) resolves under
+    parallelism without losing or duplicating any dep."""
+    names = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta"]
+    fixtures = {
+        (f"https://example.com/{n}.git", "main"): (
+            f"{n}sha", f"{n}hash", 'srcDir = "src"\n',
+        )
+        for n in names
+    }
+    manifest = Manifest(
+        deps=tuple(
+            UrlDep(name=n, git=f"https://example.com/{n}.git", ref="main")
+            for n in names
+        ),
+        kind="library",
+    )
+    graph = resolve(
+        manifest, deps_dir=tmp_path / "_deps",
+        registry={}, fetcher=FakeFetch(fixtures), max_parallel=4,
+    )
+    resolved_names = {d.name for d in graph.deps}
+    assert resolved_names == set(names)
+
+
+def test_resolve_parallel_produces_same_graph_as_serial(tmp_path):
+    """Parallel and serial resolution must produce identical ResolvedGraphs.
+    Output determinism is the key invariant — fetch ORDER may vary, but
+    the resolved tree, lockfile, and nim.cfg must be byte-identical."""
+    fixtures = {
+        ("https://example.com/foo.git", "main"): (
+            "fsha", "fhash", 'srcDir = "src"\n',
+        ),
+        ("https://example.com/bar.git", "main"): (
+            "bsha", "bhash", 'srcDir = "src"\n',
+        ),
+    }
+    manifest = Manifest(
+        deps=(
+            UrlDep(name="foo", git="https://example.com/foo.git", ref="main"),
+            UrlDep(name="bar", git="https://example.com/bar.git", ref="main"),
+        ),
+        kind="library",
+    )
+
+    serial = resolve(
+        manifest,
+        deps_dir=tmp_path / "serial",
+        registry={},
+        fetcher=FakeFetch(fixtures),
+        max_parallel=1,
+    )
+    parallel = resolve(
+        manifest,
+        deps_dir=tmp_path / "parallel",
+        registry={},
+        fetcher=FakeFetch(fixtures),
+        max_parallel=4,
+    )
+    # Ignoring the _deps path field (which differs by directory),
+    # graph deps should be byte-equal.
+    def normalize(g):
+        return tuple(
+            (d.name, d.source, d.ref, d.tag, d.sha, d.version,
+             d.content_hash, d.src_dir, d.requires)
+            for d in g.deps
+        )
+    assert normalize(serial) == normalize(parallel)
+
+
 def test_resolve_topological_order(tmp_path):
     """Dependencies appear before the packages that require them."""
     fake = FakeFetch({
