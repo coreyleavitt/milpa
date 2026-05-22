@@ -183,6 +183,41 @@ def test_failure_leaves_no_partial_dir(tmp_path):
     assert not (deps_dir / "r").exists()
 
 
+def test_content_hash_reflects_executable_bit_end_to_end(tmp_path):
+    """The content_hash returned by fetch_url_dep flips when a file's
+    executable bit changes — verifies the spec lives through git clone
+    + checkout + tree-walk, not just the unit-level identity tests."""
+    import stat as _stat
+
+    src = tmp_path / "src"
+    src.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(src)], check=True)
+    script = src / "run.sh"
+    script.write_text("#!/bin/sh\necho hi\n")
+    run = lambda *a: subprocess.run(
+        ["git", "-C", str(src), "-c", "user.email=t@e", "-c", "user.name=t", *a],
+        check=True, capture_output=True, text=True,
+    )
+    run("add", ".")
+    run("commit", "-q", "-m", "non-exec")
+
+    deps_dir_a = tmp_path / "deps_a"
+    deps_dir_a.mkdir()
+    r1 = fetch_url_dep("r", f"file://{src}", "main", deps_dir=deps_dir_a)
+
+    # Flip the exec bit and commit again
+    script.chmod(script.stat().st_mode | _stat.S_IXUSR)
+    run("update-index", "--chmod=+x", "run.sh")
+    run("commit", "-q", "-am", "make exec")
+
+    deps_dir_b = tmp_path / "deps_b"
+    deps_dir_b.mkdir()
+    r2 = fetch_url_dep("r", f"file://{src}", "main", deps_dir=deps_dir_b)
+
+    # Same file bytes, different exec bit → different content_hash
+    assert r1.content_hash != r2.content_hash
+
+
 def test_content_hash_excludes_dot_git(tmp_path):
     # Two repos with identical SOURCE files but different commit histories
     # (one has an extra empty commit) must have the same content hash —

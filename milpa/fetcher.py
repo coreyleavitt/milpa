@@ -24,10 +24,11 @@ local fixture repos via file:// URLs — no network required.
 """
 
 from dataclasses import dataclass
-from hashlib import sha256
 from pathlib import Path
 import shutil
 import subprocess
+
+from .identity import compute_content_hash
 
 
 @dataclass(frozen=True)
@@ -102,23 +103,10 @@ def _git_head_sha(path: Path) -> str:
 
 
 def _content_hash(path: Path) -> str:
-    """sha256 over the source tree, excluding `.git`.
+    """sha256 over the source tree per milpa's identity spec.
 
-    Walks every regular file under `path` except those in any `.git`
-    directory. Files are sorted by their POSIX-formatted relative path
-    for determinism. Each file contributes `relpath\\x00<bytes>\\x00` to
-    the accumulator. The hex digest is the content hash — same input
-    bytes regardless of clone location, commit timestamp, or git internals.
+    Delegates to `milpa.identity.compute_content_hash`. Kept as a thin
+    private wrapper for backward import-compat — direct callers of the
+    identity primitive should use the public module.
     """
-    h = sha256()
-    files = sorted(
-        (p for p in path.rglob("*") if p.is_file() and ".git" not in p.parts),
-        key=lambda p: p.relative_to(path).as_posix(),
-    )
-    for f in files:
-        rel = f.relative_to(path).as_posix().encode("utf-8")
-        h.update(rel)
-        h.update(b"\x00")
-        h.update(f.read_bytes())
-        h.update(b"\x00")
-    return h.hexdigest()
+    return compute_content_hash(path)
