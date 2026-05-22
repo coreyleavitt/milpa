@@ -29,6 +29,7 @@ from pathlib import Path
 
 import kdl
 
+from .identity import compute_content_hash
 from .resolver import ResolvedDep, ResolvedGraph
 
 
@@ -272,3 +273,58 @@ def verify_against_graph(
         raise LockfileError(
             "lockfile does not match resolved graph:\n  " + "\n  ".join(errors)
         )
+
+
+def verify_lockfile_against_deps(
+    lockfile: Lockfile,
+    deps_dir: Path,
+) -> list[str]:
+    """Walk `deps_dir/<name>/` for each locked dep and verify its
+    content_hash matches the lockfile's recorded identity.
+
+    Returns a list of divergence messages (empty list = no drift).
+    Each message is a single human-readable line suitable for stderr.
+
+    Divergences detected:
+      - missing: locked dep has no _deps/<name>/ directory
+      - mismatch: directory exists but its content_hash differs from
+        the lockfile's recorded identity
+      - extra: a non-dotfile / non-dotdir entry in _deps/ that isn't
+        a locked dep name (the user manually added something, or a
+        stale dep wasn't cleaned up)
+    """
+    divergences: list[str] = []
+
+    locked_by_name = {d.name: d for d in lockfile.deps}
+
+    # Missing / mismatch: walk every locked dep.
+    for name, locked in locked_by_name.items():
+        dep_path = deps_dir / name
+        if not dep_path.exists():
+            divergences.append(f"{name}: missing from {deps_dir}/")
+            continue
+        if not dep_path.is_dir():
+            divergences.append(
+                f"{name}: expected directory at {dep_path}, found something else"
+            )
+            continue
+        actual = compute_content_hash(dep_path)
+        expected = locked.content_hash
+        if expected != actual:
+            divergences.append(
+                f"{name}: content_hash mismatch — "
+                f"lockfile says sha256:{(expected or '<none>')[:16]}..., "
+                f"actual sha256:{actual[:16]}..."
+            )
+
+    # Extra: anything in _deps/ that isn't a locked name (skip dotfiles).
+    if deps_dir.exists() and deps_dir.is_dir():
+        for entry in deps_dir.iterdir():
+            if entry.name.startswith("."):
+                continue
+            if entry.name not in locked_by_name:
+                divergences.append(
+                    f"{entry.name}: extra dep in {deps_dir}/ not in lockfile"
+                )
+
+    return divergences

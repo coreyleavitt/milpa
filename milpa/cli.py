@@ -22,7 +22,10 @@ from collections.abc import Callable
 
 from . import __version__
 from .fetcher import FetchResult, fetch_url_dep
-from .lockfile import format_lockfile, from_graph, load_lockfile, write_lockfile
+from .lockfile import (
+    format_lockfile, from_graph, load_lockfile,
+    verify_lockfile_against_deps, write_lockfile,
+)
 from .manifest import ManifestError, load_or_discover_manifest
 from .nimcfg import write_nimcfg
 from .registry import RegistryEntry, list_remote_tags, load_registry
@@ -31,10 +34,11 @@ from .resolver import resolve
 
 
 SUBCOMMAND_HELP = {
-    "fetch": "resolve manifest, clone deps, emit nim.cfg, write lockfile",
-    "lock":  "resolve manifest and write lockfile (no nim.cfg)",
-    "show":  "print the resolved dep tree",
-    "clean": "remove _deps/ and nim.cfg (keeps milpa.lock)",
+    "fetch":  "resolve manifest, clone deps, emit nim.cfg, write lockfile",
+    "lock":   "resolve manifest and write lockfile (no nim.cfg)",
+    "show":   "print the resolved dep tree",
+    "verify": "recheck each dep in _deps/ against milpa.lock (no fetch)",
+    "clean":  "remove _deps/ and nim.cfg (keeps milpa.lock)",
 }
 
 
@@ -167,6 +171,50 @@ def cmd_show(project_dir: Path) -> int:
     return 0
 
 
+def cmd_verify(project_dir: Path) -> int:
+    """Verify every dep in _deps/ matches its lockfile-recorded identity.
+
+    Exits 0 if every dep's bytes hash to its locked content_hash AND
+    no extra (non-locked, non-dotfile) entries exist in _deps/. On any
+    divergence, lists every issue on stderr and exits 1.
+
+    This is the canonical integrity check — answers 'are my checked-out
+    deps what milpa.lock says they should be?' Useful in CI ('did
+    anyone hand-edit _deps/?') and after a checkout to confirm
+    reproducibility.
+    """
+    lockfile_path = project_dir / "milpa.lock"
+    deps_dir = project_dir / "_deps"
+    if not lockfile_path.exists():
+        print(
+            f"no lockfile found at {lockfile_path} — run `milpa fetch` first",
+            file=sys.stderr,
+        )
+        return 1
+    if not deps_dir.exists():
+        print(
+            f"no deps directory at {deps_dir} — run `milpa fetch` first",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        lockfile = load_lockfile(lockfile_path)
+    except Exception as e:
+        print(f"failed to read lockfile: {e}", file=sys.stderr)
+        return 1
+    divergences = verify_lockfile_against_deps(lockfile, deps_dir)
+    if divergences:
+        print(
+            f"verification failed — {len(divergences)} divergence(s):",
+            file=sys.stderr,
+        )
+        for msg in divergences:
+            print(f"  {msg}", file=sys.stderr)
+        return 1
+    print(f"verified {len(lockfile.deps)} deps", file=sys.stderr)
+    return 0
+
+
 def cmd_clean(project_dir: Path) -> int:
     """Remove _deps/ and nim.cfg; keep milpa.lock."""
     deps_dir = project_dir / "_deps"
@@ -242,8 +290,9 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_lock(
                 project_dir, max_parallel=args.parallel, strategy=strategy,
             )
-        case "show":  return cmd_show(project_dir)
-        case "clean": return cmd_clean(project_dir)
+        case "show":   return cmd_show(project_dir)
+        case "verify": return cmd_verify(project_dir)
+        case "clean":  return cmd_clean(project_dir)
         case _:
             print(f"unknown command: {args.command}", file=sys.stderr)
             return 1

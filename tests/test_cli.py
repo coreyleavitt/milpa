@@ -23,7 +23,7 @@ def test_help_lists_all_subcommands(capsys):
         main(["--help"])
     assert exc.value.code == 0
     out = capsys.readouterr().out
-    for cmd in ["fetch", "lock", "show", "clean"]:
+    for cmd in ["fetch", "lock", "show", "verify", "clean"]:
         assert cmd in out, f"{cmd!r} missing from --help output"
 
 
@@ -76,6 +76,19 @@ def test_clean_dispatches_to_cmd_clean(monkeypatch, tmp_path):
     monkeypatch.setattr("milpa.cli.cmd_clean", fake)
     rc = main(["-C", str(tmp_path), "clean"])
     assert rc == 0
+
+
+def test_verify_dispatches_to_cmd_verify(monkeypatch, tmp_path):
+    called: dict[str, object] = {}
+
+    def fake(project_dir):
+        called["project_dir"] = project_dir
+        return 0
+
+    monkeypatch.setattr("milpa.cli.cmd_verify", fake)
+    rc = main(["-C", str(tmp_path), "verify"])
+    assert rc == 0
+    assert called["project_dir"] == tmp_path.resolve()
 
 
 def test_parallel_flag_passed_to_cmd_fetch(monkeypatch, tmp_path):
@@ -151,7 +164,7 @@ def test_parallel_default_is_nontrivial(monkeypatch, tmp_path):
     assert called["max_parallel"] > 1
 
 
-@pytest.mark.parametrize("cmd", ["fetch", "lock", "show", "clean"])
+@pytest.mark.parametrize("cmd", ["fetch", "lock", "show", "verify", "clean"])
 def test_subcommand_help_works(capsys, cmd):
     with pytest.raises(SystemExit) as exc:
         main([cmd, "--help"])
@@ -168,5 +181,5 @@ def test_bare_invocation_prints_help_and_exits_zero(capsys):
     out = capsys.readouterr().out
     # Help output should mention the available subcommands so a user
     # who typed just `milpa` learns what's available.
-    for cmd in ["fetch", "lock", "show", "clean"]:
+    for cmd in ["fetch", "lock", "show", "verify", "clean"]:
         assert cmd in out

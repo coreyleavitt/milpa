@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from milpa.cli import cmd_clean, cmd_fetch, cmd_lock, cmd_show
+from milpa.cli import cmd_clean, cmd_fetch, cmd_lock, cmd_show, cmd_verify
 
 
 @dataclass
@@ -254,6 +254,144 @@ def test_cmd_clean_removes_deps_and_nimcfg_keeps_lockfile(tmp_path):
 def test_cmd_clean_is_idempotent_when_nothing_to_remove(tmp_path):
     rc = cmd_clean(tmp_path)
     assert rc == 0
+
+
+def _fetch_with_real_hash(deps_dir, name, git, ref, nimble_text, sha="abc"):
+    """A fetcher that materializes a real dep dir + reports the
+    actually-computed content_hash. Lets verify_lockfile_against_deps
+    have something coherent to verify against."""
+    from milpa.fetcher import FetchResult
+    from milpa.identity import compute_content_hash
+    target = deps_dir / name
+    target.mkdir(parents=True, exist_ok=True)
+    (target / f"{name}.nimble").write_text(nimble_text)
+    return FetchResult(
+        name=name, path=target, sha=sha,
+        content_hash=compute_content_hash(target),
+    )
+
+
+def test_cmd_verify_clean_tree_exits_zero(tmp_path):
+    """Right after a fresh fetch, every dep's bytes match its lockfile
+    identity — verify should report no drift."""
+    _write_minimal_manifest(tmp_path)
+
+    def fetcher(name, git, ref, *, deps_dir):
+        return _fetch_with_real_hash(
+            deps_dir, name, git, ref, 'srcDir = "src"\n', sha="abc123",
+        )
+
+    cmd_fetch(tmp_path, fetcher=fetcher, registry_loader=_empty_registry_loader)
+
+    rc = cmd_verify(tmp_path)
+    assert rc == 0
+
+
+def test_cmd_verify_detects_tampered_file(tmp_path, capsys):
+    """A modified file in _deps/<dep>/ flips the content_hash; verify
+    must detect this and name the affected dep."""
+    _write_minimal_manifest(tmp_path)
+
+    def fetcher(name, git, ref, *, deps_dir):
+        return _fetch_with_real_hash(
+            deps_dir, name, git, ref, 'srcDir = "src"\n',
+        )
+    cmd_fetch(tmp_path, fetcher=fetcher, registry_loader=_empty_registry_loader)
+    capsys.readouterr()
+
+    # Tamper: append to the .nimble file
+    nimble = tmp_path / "_deps" / "foo" / "foo.nimble"
+    nimble.write_text(nimble.read_text() + "# malicious comment\n")
+
+    rc = cmd_verify(tmp_path)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "foo" in err
+    assert "mismatch" in err
+
+
+def test_cmd_verify_detects_missing_dep_directory(tmp_path, capsys):
+    """A locked dep whose _deps/<name>/ directory has been removed
+    surfaces as 'missing'."""
+    import shutil
+    _write_minimal_manifest(tmp_path)
+
+    def fetcher(name, git, ref, *, deps_dir):
+        return _fetch_with_real_hash(
+            deps_dir, name, git, ref, 'srcDir = "src"\n',
+        )
+    cmd_fetch(tmp_path, fetcher=fetcher, registry_loader=_empty_registry_loader)
+    capsys.readouterr()
+
+    shutil.rmtree(tmp_path / "_deps" / "foo")
+
+    rc = cmd_verify(tmp_path)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "foo" in err
+    assert "missing" in err
+
+
+def test_cmd_verify_detects_extra_dep_directory(tmp_path, capsys):
+    """An extra directory in _deps/ that isn't a locked dep flags as
+    'extra'. The user manually added something, or a stale dep
+    wasn't cleaned up."""
+    _write_minimal_manifest(tmp_path)
+
+    def fetcher(name, git, ref, *, deps_dir):
+        return _fetch_with_real_hash(
+            deps_dir, name, git, ref, 'srcDir = "src"\n',
+        )
+    cmd_fetch(tmp_path, fetcher=fetcher, registry_loader=_empty_registry_loader)
+    capsys.readouterr()
+
+    # Plant a rogue dep dir
+    rogue = tmp_path / "_deps" / "rogue"
+    rogue.mkdir()
+    (rogue / "evil.nim").write_text("# unauthorized\n")
+
+    rc = cmd_verify(tmp_path)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "rogue" in err
+    assert "extra" in err
+
+
+def test_cmd_verify_ignores_dotfiles_in_deps_dir(tmp_path):
+    """Dotfiles like .packages_official.json (registry cache) should
+    NOT flag as extra."""
+    _write_minimal_manifest(tmp_path)
+
+    def fetcher(name, git, ref, *, deps_dir):
+        return _fetch_with_real_hash(
+            deps_dir, name, git, ref, 'srcDir = "src"\n',
+        )
+    cmd_fetch(tmp_path, fetcher=fetcher, registry_loader=_empty_registry_loader)
+
+    # Plant a dotfile (the registry cache uses this pattern)
+    (tmp_path / "_deps" / ".packages_official.json").write_text("{}")
+
+    rc = cmd_verify(tmp_path)
+    assert rc == 0
+
+
+def test_cmd_verify_no_lockfile_returns_1(tmp_path, capsys):
+    # _deps/ exists but no milpa.lock
+    (tmp_path / "_deps").mkdir()
+    rc = cmd_verify(tmp_path)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "milpa.lock" in err or "lockfile" in err.lower()
+
+
+def test_cmd_verify_no_deps_dir_returns_1(tmp_path, capsys):
+    # milpa.lock exists but no _deps/
+    from milpa.lockfile import Lockfile, format_lockfile
+    (tmp_path / "milpa.lock").write_text(format_lockfile(Lockfile(version=1, deps=())))
+    rc = cmd_verify(tmp_path)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "_deps" in err or "deps" in err.lower()
 
 
 def test_cmd_fetch_loads_registry_and_resolves_named_transitive(tmp_path):
