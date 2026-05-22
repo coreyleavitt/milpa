@@ -208,6 +208,99 @@ def test_schema_documentation_file_ships_with_package():
     assert "kind" in content
 
 
+def test_named_dep_no_constraint_parses():
+    """A bare name in deps {} is a named (registry-resolved) dep with
+    no version constraint."""
+    from milpa.manifest import NamedDep
+    text = '''
+deps {
+    results
+}
+'''
+    m = parse_manifest(text)
+    assert m.deps == (NamedDep(name="results", constraint=None),)
+
+
+def test_named_dep_with_constraint_parses():
+    """`<name> "<constraint>"` form."""
+    from milpa.manifest import NamedDep
+    text = '''
+deps {
+    stew ">= 0.5.0"
+}
+'''
+    m = parse_manifest(text)
+    assert m.deps == (NamedDep(name="stew", constraint=">= 0.5.0"),)
+
+
+def test_mixed_url_and_named_deps_in_manifest():
+    """A single deps block can carry both URL deps and named deps."""
+    from milpa.manifest import NamedDep
+    text = '''
+deps {
+    chronos git=(url)"https://github.com/x/chronos.git" ref="main"
+    results
+    stew ">= 0.5.0"
+}
+'''
+    m = parse_manifest(text)
+    names = [d.name for d in m.deps]
+    assert names == ["chronos", "results", "stew"]
+    # Identify by type
+    chronos = m.deps[0]
+    results = m.deps[1]
+    stew = m.deps[2]
+    assert isinstance(chronos, UrlDep)
+    assert isinstance(results, NamedDep)
+    assert results.constraint is None
+    assert isinstance(stew, NamedDep)
+    assert stew.constraint == ">= 0.5.0"
+
+
+def test_named_dep_with_unknown_property_raises():
+    """Named deps don't take properties (only positional constraint).
+    Unknown properties are an error so typos surface loudly."""
+    text = '''
+deps {
+    results version=">= 0.5"
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    assert "results" in str(exc.value)
+
+
+def test_named_dep_with_multiple_positional_args_raises():
+    """At most one positional argument (the version constraint)."""
+    text = '''
+deps {
+    foo ">= 1.0" "extra-thing"
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    assert "foo" in str(exc.value)
+    assert "one positional" in str(exc.value).lower() or "constraint" in str(exc.value).lower()
+
+
+def test_url_dep_missing_git_property_now_routes_to_named_path():
+    """Regression: previously a child without `git=` raised 'missing
+    required property git'. Now it's parsed as a named dep. A
+    truly-invalid manifest (e.g. URL-looking child with `ref=` but no
+    `git=`) is now a named dep with weird props — still errors via
+    the unknown-property path."""
+    text = '''
+deps {
+    chronos ref="main"
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    # The named-dep parser surfaces it as unknown property 'ref'
+    assert "chronos" in str(exc.value)
+    assert "ref" in str(exc.value)
+
+
 def test_url_with_kdl_type_annotation_parses():
     # `(url)` is a KDL type annotation; the spec allows it as a
     # self-documenting decoration. Both annotated and unannotated

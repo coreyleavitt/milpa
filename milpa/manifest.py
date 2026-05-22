@@ -82,7 +82,7 @@ def parse_manifest(text: str, *, source: str | None = None) -> Manifest:
                         f"duplicate dep {child.name!r} in manifest"
                     )
                 seen_names.add(child.name)
-                deps.append(_parse_url_dep(child))
+                deps.append(_parse_dep(child))
         elif node.name == "kind":
             kind = _parse_kind(node)
         else:
@@ -110,8 +110,25 @@ def load_manifest(path: Path) -> Manifest:
     return parse_manifest(text, source=str(path))
 
 
+def _parse_dep(node: kdl.Node) -> Dep:
+    """Validate and convert one child of the `deps` block.
+
+    Disambiguation: a child with `git=` property is a UrlDep; without
+    it, it's a NamedDep (registry-resolved). Named deps may carry zero
+    or one positional string argument for the version constraint.
+
+    Examples:
+        chronos git=(url)"..." ref="main"   → UrlDep
+        results                              → NamedDep(name, constraint=None)
+        stew ">= 0.5.0"                      → NamedDep(name, constraint=">= 0.5.0")
+    """
+    if "git" in node.props:
+        return _parse_url_dep(node)
+    return _parse_named_dep(node)
+
+
 def _parse_url_dep(node: kdl.Node) -> UrlDep:
-    """Validate and convert one child of the `deps` block into a UrlDep."""
+    """Validate and convert a URL-shaped dep child."""
     name = node.name
     extra = set(node.props.keys()) - _URL_DEP_PROPS
     if extra:
@@ -121,8 +138,6 @@ def _parse_url_dep(node: kdl.Node) -> UrlDep:
             f"dep {name!r}: unknown property/properties {unknown} "
             f"(allowed: {allowed})"
         )
-    if "git" not in node.props:
-        raise ManifestError(f"dep {name!r}: missing required property 'git'")
     if "ref" not in node.props:
         raise ManifestError(f"dep {name!r}: missing required property 'ref'")
     # `git` may be a plain str or a ParseResult (when written with the
@@ -132,6 +147,36 @@ def _parse_url_dep(node: kdl.Node) -> UrlDep:
     git = git_raw.geturl() if isinstance(git_raw, ParseResult) else git_raw
     _validate_git_url(name, git)
     return UrlDep(name=name, git=git, ref=node.props["ref"])
+
+
+def _parse_named_dep(node: kdl.Node) -> NamedDep:
+    """Validate and convert a named (registry-resolved) dep child.
+
+    Grammar: `<name> [<constraint-string>]`. Zero or one positional
+    string argument. No properties (any property other than `git=`,
+    which would route to URL path, is an error).
+    """
+    name = node.name
+    if node.props:
+        unknown = ", ".join(repr(p) for p in sorted(node.props.keys()))
+        raise ManifestError(
+            f"dep {name!r}: unknown property/properties {unknown} "
+            f"on a named dep (a URL dep must declare 'git=...'; "
+            f"a named dep takes only a positional version constraint)"
+        )
+    if len(node.args) == 0:
+        return NamedDep(name=name, constraint=None)
+    if len(node.args) == 1:
+        constraint = node.args[0]
+        if not isinstance(constraint, str):
+            raise ManifestError(
+                f"dep {name!r}: version constraint must be a quoted string"
+            )
+        return NamedDep(name=name, constraint=constraint)
+    raise ManifestError(
+        f"dep {name!r}: named deps take at most one positional argument "
+        f"(the version constraint); got {len(node.args)}"
+    )
 
 
 def _parse_kind(node: kdl.Node) -> Kind:

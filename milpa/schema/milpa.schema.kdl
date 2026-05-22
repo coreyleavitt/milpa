@@ -13,39 +13,54 @@
 // *identity* (sha256 content hash) post-fetch and records it in
 // milpa.lock. See docs/identity-and-provenance.md for the model.
 
-// `deps` block: zero-or-more URL dependencies.
+// `deps` block: zero-or-more dependencies. Two shapes per child:
 //
-// Each child of `deps` is a named dep — provenance metadata that
-// tells milpa where to find the bytes. Identity (sha256 content
-// hash) is computed by milpa after fetching, not declared here.
+// URL DEP — fetch the bytes from a git URL at a ref.
+//   <name> git=(url)"<URL>" ref="<git-ref>"
+//   Properties:
+//     git: a git-clonable URL (https / http / ssh / git scheme)
+//     ref: a git ref (branch / tag / commit SHA)
+//   The `(url)` KDL type annotation on the git value is recommended
+//   for self-documentation; both forms parse identically.
 //
-// Required properties (provenance):
-//   git: a git-clonable URL (https / http / ssh / git scheme)
-//   ref: a git ref (branch / tag / commit SHA)
+// NAMED DEP — resolve via the nim-lang/packages registry.
+//   <name>                       // any version
+//   <name> "<version-constraint>"  // pinned by constraint
+//   No properties; zero or one positional string argument carrying
+//   the version constraint (`>= 0.5.0`, `< 1.0.0`, `>= 0.5 & < 1.0`,
+//   `== 0.5.0`, or omitted for any version).
 //
-// The `(url)` KDL type annotation on the git value is supported and
-// recommended for self-documentation. Both forms parse identically;
-// future stricter parsers may enforce more at the annotation site.
+// Disambiguation: a child with the `git=` property is a URL dep;
+// without it, it's a named dep.
 //
-// Example (recommended):
+// Example (mixed):
 //
 //   deps {
+//       // URL deps (provenance: explicit git URL + ref)
 //       chronos git=(url)"https://github.com/coreyleavitt/chronos.git" ref="feat/contextvars"
 //       intonaco git=(url)"https://github.com/coreyleavitt/intonaco.git" ref="main"
+//
+//       // Named deps (provenance: nim-lang/packages registry)
+//       results
+//       stew ">= 0.5.0"
 //   }
 //
-// Also valid (no annotation):
-//
-//   deps {
-//       chronos git="https://github.com/coreyleavitt/chronos.git" ref="feat/contextvars"
-//   }
+// Identity model: every dep declares *provenance*. milpa computes the
+// *identity* (sha256 content hash) post-fetch and records it in
+// milpa.lock. See docs/identity-and-provenance.md for the model.
 //
 // Constraints:
-//   - dep names are unique within a manifest
-//   - unknown properties (e.g. `branch=`, `tag=`) are rejected with a clear error
+//   - dep names are unique within a manifest (URL or named — same namespace)
+//   - URL dep without `ref=` is an error
+//   - named dep with any property (other than `git=`, which routes
+//     to the URL path) is an error
+//   - named dep with multiple positional arguments is an error
 //
 deps "0..*" {
+    // URL form
     "<name>" git=(url)"<URL>" ref="<git-ref>"
+    // OR named form (no properties; optional positional constraint)
+    "<name>" "<version-constraint>?"
 }
 
 // `kind` declares whether this is a library or an application.
