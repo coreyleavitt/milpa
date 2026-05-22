@@ -1,0 +1,42 @@
+// milpa manifest schema — v0
+//
+// This file documents the shape of a `milpa.kdl` manifest. It is
+// authoritative *intent*; the canonical authority for what milpa
+// accepts is the parser in `milpa/manifest.py`. Keeping the two in
+// sync is enforced by writing tests against this schema's examples.
+//
+// Future work: actually parse this schema and use it as the source
+// of truth for validation. Tracked at backlog issue #24.
+
+// `deps` block: zero-or-more URL dependencies.
+//
+// Each child of `deps` is a named dep with two required properties:
+//   git: a git-clonable URL (https / http / ssh / git scheme)
+//   ref: a git ref (branch / tag / commit SHA)
+//
+// Example:
+//
+//   deps {
+//       chronos git="https://github.com/coreyleavitt/chronos.git" ref="feat/contextvars"
+//       intonaco git="https://github.com/coreyleavitt/intonaco.git" ref="main"
+//   }
+//
+// Constraints:
+//   - dep names are unique within a manifest
+//   - unknown properties (e.g. `branch=`, `tag=`) are rejected with a clear error
+//
+deps "0..*" {
+    "<name>" git="<URL>" ref="<git-ref>"
+}
+
+// `kind` declares whether this is a library or an application.
+//
+// - "library":     the project is a library others depend on. Lockfile
+//                  exists locally for fast iteration but should NOT be
+//                  committed — downstream consumers re-resolve their own.
+// - "application": the project is the final consumer. Lockfile is
+//                  committed to ensure reproducible builds across machines.
+//
+// Default (if omitted): "library".
+//
+kind "library"  // or "application"

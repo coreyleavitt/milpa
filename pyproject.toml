@@ -24,6 +24,9 @@ Homepage = "https://github.com/coreyleavitt/milpa"
 [tool.hatch.build.targets.wheel]
 packages = ["milpa"]
 
+[tool.hatch.build.targets.wheel.shared-data]
+"milpa/schema" = "milpa/schema"
+
 [dependency-groups]
 dev = [
     "pytest >= 8",
