@@ -283,6 +283,73 @@ deps {
     assert "one positional" in str(exc.value).lower() or "constraint" in str(exc.value).lower()
 
 
+def test_format_empty_manifest_round_trips():
+    """An empty library manifest should round-trip through format/parse."""
+    from milpa.manifest import format_manifest
+    m = Manifest(deps=(), kind="library")
+    text = format_manifest(m)
+    assert parse_manifest(text) == m
+
+
+def test_format_single_url_dep_round_trips():
+    from milpa.manifest import format_manifest
+    m = Manifest(
+        deps=(UrlDep(name="chronos",
+                     git="https://github.com/x/chronos.git",
+                     ref="feat/contextvars"),),
+        kind="library",
+    )
+    text = format_manifest(m)
+    assert parse_manifest(text) == m
+
+
+def test_format_emits_url_annotation():
+    from milpa.manifest import format_manifest
+    m = Manifest(
+        deps=(UrlDep(name="foo", git="https://example.com/foo.git", ref="main"),),
+        kind="library",
+    )
+    text = format_manifest(m)
+    # The recommended `(url)` annotation is emitted
+    assert "(url)" in text
+
+
+def test_format_application_kind_round_trips():
+    from milpa.manifest import format_manifest
+    m = Manifest(deps=(), kind="application")
+    text = format_manifest(m)
+    assert 'kind "application"' in text
+    assert parse_manifest(text) == m
+
+
+def test_format_named_dep_no_constraint_round_trips():
+    from milpa.manifest import NamedDep, format_manifest
+    m = Manifest(deps=(NamedDep(name="results", constraint=None),), kind="library")
+    text = format_manifest(m)
+    assert parse_manifest(text) == m
+
+
+def test_format_named_dep_with_constraint_round_trips():
+    from milpa.manifest import NamedDep, format_manifest
+    m = Manifest(deps=(NamedDep(name="stew", constraint=">= 0.5.0"),), kind="library")
+    text = format_manifest(m)
+    assert parse_manifest(text) == m
+
+
+def test_format_mixed_deps_round_trips():
+    from milpa.manifest import NamedDep, format_manifest
+    m = Manifest(
+        deps=(
+            UrlDep(name="chronos", git="https://example.com/chronos.git", ref="main"),
+            NamedDep(name="results", constraint=None),
+            NamedDep(name="stew", constraint=">= 0.5.0"),
+        ),
+        kind="library",
+    )
+    text = format_manifest(m)
+    assert parse_manifest(text) == m
+
+
 def test_url_dep_missing_git_property_now_routes_to_named_path():
     """Regression: previously a child without `git=` raised 'missing
     required property git'. Now it's parsed as a named dep. A
