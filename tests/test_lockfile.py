@@ -81,6 +81,28 @@ dep "chronos" {
     assert dep.requires == ()
 
 
+def test_lockfile_format_emits_tag_field_when_present():
+    """Regression: Hypothesis (issue #64, 2026-05-22) found that
+    format_lockfile silently dropped the `tag` field — parse read it,
+    format never wrote it. Round-trip was lossy for every registry-
+    resolved dep, but the loss went unnoticed because `ref` carried
+    redundant info via _infer_ref."""
+    L = Lockfile(
+        version=1,
+        deps=(LockedDep(
+            name="foo", source="registry:foo", ref="v0.5.1", tag="v0.5.1",
+            sha="abc123", content_hash="hashfoo", version="0.5.1",
+            src_dir="src", requires=(),
+        ),),
+        strategy="maxver",
+    )
+    text = format_lockfile(L)
+    assert 'tag "v0.5.1"' in text, "format_lockfile must emit tag"
+    # And the round-trip preserves it
+    parsed = parse_lockfile(text)
+    assert parsed.deps[0].tag == "v0.5.1"
+
+
 def test_format_parse_round_trip():
     graph = ResolvedGraph(deps=(
         _dep("chronos", source="https://example.com/chronos.git",

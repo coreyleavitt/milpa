@@ -198,6 +198,8 @@ def format_lockfile(lockfile: Lockfile) -> str:
         lines.append(f'    source "{dep.source}"')
         if dep.ref is not None:
             lines.append(f'    ref "{dep.ref}"')
+        if dep.tag is not None:
+            lines.append(f'    tag "{dep.tag}"')
         if dep.sha is not None:
             lines.append(f'    sha "{dep.sha}"')
         if dep.content_hash is not None:
