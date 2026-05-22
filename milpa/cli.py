@@ -129,7 +129,17 @@ def cmd_lock(
 
 
 def cmd_show(project_dir: Path) -> int:
-    """Print the resolved dep tree from milpa.lock."""
+    """Print the resolved dep tree from milpa.lock.
+
+    Each dep is shown as three lanes:
+      identity    sha256:<8 hex>   ← content hash (the canonical 'what')
+      provenance  <source> @ <ref> (sha <short>) ← where the bytes came from
+      requires    <names>          ← direct deps
+
+    The full identity and commit SHA are in milpa.lock — `milpa show`
+    truncates for readability. See docs/identity-and-provenance.md for
+    why the two are distinct.
+    """
     lockfile_path = project_dir / "milpa.lock"
     if not lockfile_path.exists():
         print(
@@ -143,10 +153,17 @@ def cmd_show(project_dir: Path) -> int:
         print(f"failed to read lockfile: {e}", file=sys.stderr)
         return 1
     for dep in lockfile.deps:
-        ref_str = f"@ {dep.ref}" if dep.ref else ""
-        print(f"{dep.name:20s} {dep.version:10s} {dep.source} {ref_str}".rstrip())
+        print(f"{dep.name:20s} {dep.version}")
+        if dep.content_hash:
+            print(f"  identity    sha256:{dep.content_hash[:8]}")
+        provenance = dep.source
+        if dep.ref:
+            provenance += f" @ {dep.ref}"
+        if dep.sha:
+            provenance += f" (sha {dep.sha[:8]})"
+        print(f"  provenance  {provenance}")
         if dep.requires:
-            print(f"  requires: {', '.join(dep.requires)}")
+            print(f"  requires    {', '.join(dep.requires)}")
     return 0
 
 

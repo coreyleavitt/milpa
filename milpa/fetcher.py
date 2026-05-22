@@ -2,8 +2,19 @@
 
 `fetch_url_dep(name, git, ref, deps_dir=...)` is the public entry. It
 clones `<git>` at `<ref>` into `<deps_dir>/<name>/`, returns a
-FetchResult with the resolved commit SHA and a deterministic content
-hash of the source tree.
+FetchResult with two values that serve different roles:
+
+  - `sha`           : the resolved commit SHA. *Provenance receipt* —
+                      records which commit was actually pulled. Useful
+                      for diagnostics and for re-fetching the same
+                      commit later.
+  - `content_hash`  : sha256 of the source tree (excluding .git).
+                      *Identity* — the canonical 'what' of the
+                      fetched bytes. Independent of which git server,
+                      which clone metadata, or which transport was
+                      used.
+
+See docs/identity-and-provenance.md for the model.
 
 Idempotent: re-running with the same args is a no-op (still validates
 the working copy). On any failure, no partial clone is left behind.

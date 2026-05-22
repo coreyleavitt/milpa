@@ -14,7 +14,13 @@ The Mesoamerican multi-crop polyculture: corn, beans, and squash grown together 
 
 ## Status
 
-Pre-v0. Design in `coreyleavitt/fresco`'s session memory and the v0 issue tracker on this repo.
+v0 shipped — fresco's hard split unblocked. v0.x and v1 in progress on Tier 1+2 features (`.nimble` compat, parallel fetch, resolution strategies, content-addressed identity Phase A). See `docs/comparison-vs-nimble-atlas.md` for the roadmap.
+
+## What's structurally distinct
+
+milpa separates **identity** (sha256 of source tree) from **provenance** (URL, ref, commit SHA). Existing Nim resolvers conflate them by pinning commit SHA. milpa records both — identity for trust-independent verification, provenance for delivery — which enables cross-fork dedup, mirror substitution, offline lockfile verification, and (when Phase B-C land) a global content-addressed package store.
+
+See [`docs/identity-and-provenance.md`](docs/identity-and-provenance.md) for the model and [`docs/rfc-content-addressed-identity.md`](docs/rfc-content-addressed-identity.md) for the structural argument.
 
 ## Why not fix nimble
 

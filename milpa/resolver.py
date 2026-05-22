@@ -7,6 +7,11 @@ registry. Once the candidate space is materialized, it hands a
 `PackageProvider` to the solver and maps the solver's `{name: version}`
 output back into a `ResolvedGraph` of `ResolvedDep` records.
 
+Each `ResolvedDep` carries both identity (`content_hash`) and provenance
+(`source`, `ref`, `tag`, `sha`) — see docs/identity-and-provenance.md.
+For v0.x, the resolver dedups by `(URL, ref)` for efficiency; content-
+hash-keyed dedup is Phase B work (#32).
+
 Tests inject a fake fetcher so the integration runs without network or
 git operations.
 """

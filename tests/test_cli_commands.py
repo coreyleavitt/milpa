@@ -105,6 +105,124 @@ def test_cmd_show_prints_dep_names_from_existing_lockfile(tmp_path, capsys):
     assert "foo" in out
 
 
+def test_cmd_show_labels_identity_and_provenance(tmp_path, capsys):
+    """`milpa show` output positions content_hash as identity and
+    URL/ref/sha as provenance — explicitly labeled, not implicit."""
+    _write_minimal_manifest(tmp_path)
+    fake = FakeFetch({
+        ("https://example.com/foo.git", "main"): (
+            "abc12345dead", "hash_foo_full_content", 'srcDir = "src"\n',
+        ),
+    })
+    cmd_fetch(tmp_path, fetcher=fake, registry_loader=_empty_registry_loader)
+    capsys.readouterr()
+
+    rc = cmd_show(tmp_path)
+    assert rc == 0
+    out = capsys.readouterr().out
+
+    # The model is explicit
+    assert "identity" in out
+    assert "provenance" in out
+    # Identity value is a sha256-prefixed hash
+    assert "sha256:" in out
+    # Provenance shows the URL + ref + commit sha
+    assert "https://example.com/foo.git" in out
+    assert "main" in out
+
+
+def test_cmd_show_truncates_hashes_for_readability(tmp_path, capsys):
+    """`milpa show` shows truncated hashes (8 chars). Full values
+    are in milpa.lock for machine-readable consumption."""
+    _write_minimal_manifest(tmp_path)
+    long_content_hash = "abcdef0123456789" * 4  # 64 hex chars
+    long_sha = "deadbeefcafebabe" * 2 + "abcd1234"   # 40 hex chars
+    fake = FakeFetch({
+        ("https://example.com/foo.git", "main"): (
+            long_sha, long_content_hash, 'srcDir = "src"\n',
+        ),
+    })
+    cmd_fetch(tmp_path, fetcher=fake, registry_loader=_empty_registry_loader)
+    capsys.readouterr()
+    cmd_show(tmp_path)
+    out = capsys.readouterr().out
+    # Full hashes should NOT appear in output
+    assert long_content_hash not in out
+    assert long_sha not in out
+    # Prefix should appear
+    assert long_content_hash[:8] in out
+    assert long_sha[:8] in out
+
+
+def test_cmd_show_requires_line_present_when_dep_has_requires(tmp_path, capsys):
+    """The requires line stays as it is — it's about the dep graph,
+    orthogonal to identity vs provenance."""
+    _write_minimal_manifest(tmp_path)
+    fake = FakeFetch({
+        ("https://example.com/foo.git", "main"): (
+            "fsha", "fhash",
+            'srcDir = "src"\nrequires "https://example.com/bar.git#v1"\n',
+        ),
+        ("https://example.com/bar.git", "v1"): (
+            "bsha", "bhash", 'srcDir = "src"\n',
+        ),
+    })
+    cmd_fetch(tmp_path, fetcher=fake, registry_loader=_empty_registry_loader)
+    capsys.readouterr()
+    cmd_show(tmp_path)
+    out = capsys.readouterr().out
+    # foo lists bar as required
+    assert "bar" in out
+    assert "requires" in out
+
+
+def test_cmd_show_registry_dep_shows_registry_provenance(tmp_path, capsys):
+    """Registry-resolved deps' provenance reads `registry:<name>`."""
+    from milpa.registry import RegistryEntry
+
+    (tmp_path / "milpa.kdl").write_text(
+        'deps {\n'
+        '    foo git="https://example.com/foo.git" ref="main"\n'
+        '}\n'
+    )
+
+    def fake_loader(*, cache_path):
+        return {
+            "bar": RegistryEntry(
+                name="bar", url="https://example.com/bar.git", method="git",
+            ),
+        }
+    fake = FakeFetch({
+        ("https://example.com/foo.git", "main"): (
+            "fsha", "fhash", 'srcDir = "src"\nrequires "bar"\n',
+        ),
+        ("https://example.com/bar.git", "v0.1.0"): (
+            "bsha", "bhash", '',
+        ),
+    })
+    cmd_fetch(
+        tmp_path, fetcher=fake,
+        list_tags=lambda url: ["v0.1.0"],
+        registry_loader=fake_loader,
+    )
+    capsys.readouterr()
+    cmd_show(tmp_path)
+    out = capsys.readouterr().out
+    assert "registry:bar" in out
+    # registry dep's ref is its resolved tag
+    assert "v0.1.0" in out
+
+
+def test_cmd_show_empty_lockfile_does_not_crash(tmp_path, capsys):
+    """A lockfile with no deps prints nothing per-dep but still exits 0."""
+    # Synthesize an empty lockfile directly
+    from milpa.lockfile import Lockfile, format_lockfile
+    empty = Lockfile(version=1, deps=())
+    (tmp_path / "milpa.lock").write_text(format_lockfile(empty))
+    rc = cmd_show(tmp_path)
+    assert rc == 0
+
+
 def test_cmd_show_no_lockfile_returns_1(tmp_path, capsys):
     # tmp_path has no milpa.lock
     rc = cmd_show(tmp_path)

@@ -1,8 +1,17 @@
 """milpa.lock — reproducible-build snapshot of a resolved dep graph.
 
-The lockfile pins every dep at its commit SHA and content hash. Two
-machines reading the same milpa.lock fetch byte-identical sources, no
-trust placed in branch references or remote tag mutability.
+The lockfile records two distinct kinds of data per dep:
+
+  - **Identity**: `content_hash` (sha256 of source tree). The
+    canonical 'what'. Trust-independent, recomputable from bytes
+    alone. This is the field consumers should verify against.
+  - **Provenance**: `source` (URL or registry name), `ref`, `tag`,
+    `sha`. Descriptive metadata for refetching. Trust-dependent —
+    the git server, mirror, or registry could disagree without
+    notice.
+
+See docs/identity-and-provenance.md for the model and why the two
+are distinct.
 
 Format is KDL (consistent with the manifest milpa.kdl). Schema is
 versioned so future format changes don't silently break readers.

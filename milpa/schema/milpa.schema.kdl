@@ -7,10 +7,19 @@
 //
 // Future work: actually parse this schema and use it as the source
 // of truth for validation. Tracked at backlog issue #24.
+//
+// Note on the identity model: every dep in milpa.kdl declares
+// *provenance* (where the bytes come from). milpa computes the
+// *identity* (sha256 content hash) post-fetch and records it in
+// milpa.lock. See docs/identity-and-provenance.md for the model.
 
 // `deps` block: zero-or-more URL dependencies.
 //
-// Each child of `deps` is a named dep with two required properties:
+// Each child of `deps` is a named dep — provenance metadata that
+// tells milpa where to find the bytes. Identity (sha256 content
+// hash) is computed by milpa after fetching, not declared here.
+//
+// Required properties (provenance):
 //   git: a git-clonable URL (https / http / ssh / git scheme)
 //   ref: a git ref (branch / tag / commit SHA)
 //
