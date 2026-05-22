@@ -124,6 +124,50 @@ def test_resolve_dedup_same_url_ref(tmp_path):
     assert len(shared_calls) == 1
 
 
+def test_resolve_minver_strategy_threads_through_to_solver(tmp_path):
+    """Strategy passes from resolve() to the solver. Use a named dep
+    with multiple registry versions and verify MinVer picks the floor."""
+    from milpa.registry import RegistryEntry
+    from milpa.solver import Strategy
+
+    # Manifest declares a named dep with `>= 0.4.0` constraint.
+    manifest = Manifest(
+        deps=(
+            # NamedDep — registry-resolved, multiple versions
+            __import__("milpa.manifest", fromlist=["NamedDep"]).NamedDep(
+                name="foo", constraint=">= 0.4.0",
+            ),
+        ),
+        kind="library",
+    )
+    registry = {
+        "foo": RegistryEntry(
+            name="foo", url="https://example.com/foo.git", method="git",
+        ),
+    }
+    # The registry lists three matching tags; MinVer should pick v0.4.0.
+    list_tags = lambda url: ["v0.4.0", "v0.5.0", "v1.0.0"]
+
+    fixtures = {
+        ("https://example.com/foo.git", "v0.4.0"): (
+            "sha040", "hash040", '',
+        ),
+        # Only fixture v0.4.0; if the resolver mistakenly picked another,
+        # FakeFetch would KeyError loudly.
+    }
+
+    graph = resolve(
+        manifest, deps_dir=tmp_path / "_deps",
+        registry=registry,
+        fetcher=FakeFetch(fixtures),
+        list_tags=list_tags,
+        strategy=Strategy.MINVER,
+    )
+    foo_dep = next(d for d in graph.deps if d.name == "foo")
+    assert foo_dep.tag == "v0.4.0"
+    assert foo_dep.version == (0, 4, 0)
+
+
 def test_resolve_parallel_produces_byte_identical_lockfile(tmp_path):
     """`milpa.lock` is byte-identical regardless of max_parallel.
     Lockfile is sorted by name; fetch order doesn't affect output."""

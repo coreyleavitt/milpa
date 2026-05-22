@@ -143,9 +143,10 @@ def resolve_named(
     *,
     registry: dict[str, RegistryEntry],
     list_tags: Callable[[str], list[str]] = None,  # type: ignore[assignment]
+    strategy: str = "maxver",
 ) -> ResolvedRegistryDep:
     """Resolve a named dep against the registry, returning the best
-    version that satisfies `constraint`.
+    version that satisfies `constraint` under `strategy`.
 
     `list_tags` defaults to the network-touching list_remote_tags; tests
     inject a fake. Raises RegistryError if `name` isn't in the registry
@@ -160,7 +161,7 @@ def resolve_named(
             f"(available: {len(registry)} entries)"
         )
     tags = list_tags(entry.url)
-    tag = resolve_version(constraint, tags)
+    tag = resolve_version(constraint, tags, strategy=strategy)
     parsed = parse_version(tag)
     assert parsed is not None  # resolve_version only picks parseable tags
     version_str = ".".join(str(p) for p in parsed)
@@ -203,8 +204,17 @@ def list_remote_tags(url: str) -> list[str]:
     return tags
 
 
-def resolve_version(constraint: str | None, available: list[str]) -> str:
-    """Pick the highest tag in `available` that satisfies `constraint`.
+def resolve_version(
+    constraint: str | None,
+    available: list[str],
+    *,
+    strategy: str = "maxver",
+) -> str:
+    """Pick a tag in `available` that satisfies `constraint`, per `strategy`.
+
+    `strategy` may be "maxver" (default; highest), "minver" (lowest), or
+    "semver" (highest within same major as the constraint's lower bound,
+    falling back to highest when constraint has no lower bound).
 
     Returns the tag string (verbatim — keep the `v` prefix if present
     in the input). Tags milpa v0 doesn't model (prereleases, build
@@ -225,7 +235,40 @@ def resolve_version(constraint: str | None, available: list[str]) -> str:
             f"(available: {available!r})"
         )
     candidates.sort(key=lambda x: x[0])
+    if strategy == "minver":
+        return candidates[0][1]
+    if strategy == "semver":
+        lower = _constraint_lower_bound(constraint)
+        if lower is not None:
+            same_major = [c for c in candidates if c[0][0] == lower[0]]
+            if not same_major:
+                raise RegistryError(
+                    f"semver: no tag in same major as constraint "
+                    f"lower bound (major={lower[0]}) — would require "
+                    f"crossing a major boundary"
+                )
+            return same_major[-1][1]
+        # No lower bound — fall back to maxver
     return candidates[-1][1]
+
+
+def _constraint_lower_bound(constraint: str | None) -> Version | None:
+    """Extract the lowest inclusive lower bound from a constraint string.
+    Returns None if the constraint has no lower bound or is empty."""
+    if constraint is None or constraint.strip() in ("", "any version"):
+        return None
+    for clause in constraint.split("&"):
+        clause = clause.strip()
+        parts = clause.split(None, 1)
+        if len(parts) != 2:
+            continue
+        op, ver_str = parts[0], parts[1].strip()
+        v = parse_version(ver_str)
+        if v is None:
+            continue
+        if op in (">=", "=="):
+            return v
+    return None
 
 
 def _match_clause(clause: str, version: Version) -> bool:

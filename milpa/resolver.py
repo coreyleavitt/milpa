@@ -28,6 +28,7 @@ from .registry import (
 )
 from .solver import (
     PackageProvider,
+    Strategy,
     Term,
     Version,
     VersionSet,
@@ -107,6 +108,7 @@ def resolve(
     fetcher: Callable[..., FetchResult] = fetch_url_dep,
     list_tags: Callable[[str], list[str]] = list_remote_tags,
     max_parallel: int = 8,
+    strategy: Strategy = Strategy.MAXVER,
 ) -> ResolvedGraph:
     """Resolve `manifest` into a topologically-sorted ResolvedGraph.
 
@@ -187,7 +189,7 @@ def resolve(
                 print(f"fetching {name}...", file=sys.stderr)
                 fut = ex.submit(
                     _process_named, name, constraint, deps_dir, fetcher,
-                    registry, list_tags,
+                    registry, list_tags, strategy,
                 )
             in_flight[fut] = item
 
@@ -212,7 +214,7 @@ def resolve(
                     submit(new_item)
 
     # Solve.
-    solution = solve(provider, "__root__", (0, 0, 0))
+    solution = solve(provider, "__root__", (0, 0, 0), strategy=strategy)
     # Map solution → ResolvedGraph (topologically sorted).
     return _build_graph(solution, provider)
 
@@ -255,12 +257,14 @@ def _process_named(
     fetcher: Callable[..., FetchResult],
     registry: dict[str, RegistryEntry],
     list_tags: Callable[[str], list[str]],
+    strategy: Strategy = Strategy.MAXVER,
 ) -> tuple["_Candidate", list]:
     """Worker function: resolve a named dep through the registry, fetch
     it, parse its nimble. Network ops (resolve_named's list_remote_tags
     + fetcher's git clone) both happen here so they can parallelize."""
     r = resolve_named(name, constraint,
-                      registry=registry, list_tags=list_tags)
+                      registry=registry, list_tags=list_tags,
+                      strategy=str(strategy))
     result = fetcher(name, r.url, r.tag, deps_dir=deps_dir)
     nimble_path = _find_nimble_file(result.path, name)
     nm = parse_nimble(nimble_path.read_text()) if nimble_path.exists() else None

@@ -199,6 +199,86 @@ def test_solve_missing_dep_raises_naming_the_dep():
     assert "missing_pkg" in str(exc.value)
 
 
+def test_solve_semver_strategy_locks_to_lower_bound_major():
+    """SemVer: highest candidate within the same major as the
+    constraint's lower bound. Constraint `>= 1.2.0` with candidates
+    [1.2, 1.5, 2.0, 2.3]: pick 1.5 (highest within major=1)."""
+    from milpa.solver import Strategy
+    provider = DictProvider({
+        "root": {(1, 0, 0): [
+            Term.require("foo", VersionSet.from_constraint(">= 1.2.0")),
+        ]},
+        "foo": {
+            (1, 2, 0): [],
+            (1, 5, 0): [],
+            (2, 0, 0): [],
+            (2, 3, 0): [],
+        },
+    })
+    solution = solve(provider, "root", (1, 0, 0), strategy=Strategy.SEMVER)
+    assert solution["foo"] == (1, 5, 0)
+
+
+def test_solve_semver_with_unbounded_constraint_falls_back_to_maxver():
+    """If the constraint has no lower bound, SemVer can't pick a
+    'compatible major' — falls back to MaxVer behavior."""
+    from milpa.solver import Strategy
+    provider = DictProvider({
+        "root": {(1, 0, 0): [
+            Term.require("foo", VersionSet.from_constraint("< 5.0.0")),
+        ]},
+        "foo": {
+            (1, 0, 0): [],
+            (2, 0, 0): [],
+            (3, 0, 0): [],
+            (4, 0, 0): [],
+        },
+    })
+    solution = solve(provider, "root", (1, 0, 0), strategy=Strategy.SEMVER)
+    # No lower bound → max(candidates)
+    assert solution["foo"] == (4, 0, 0)
+
+
+def test_solve_semver_rejects_when_only_cross_major_candidates_exist():
+    """If only candidates with a different major can satisfy the
+    constraint, SemVer refuses rather than silently accepting a
+    cross-major version."""
+    from milpa.solver import SolverError, Strategy
+    provider = DictProvider({
+        "root": {(1, 0, 0): [
+            # Wide constraint allows both 1.x and 2.x candidates
+            Term.require("foo", VersionSet.from_constraint(">= 1.0.0")),
+        ]},
+        "foo": {
+            # No 1.x — only 2.x candidates exist
+            (2, 0, 0): [],
+            (2, 5, 0): [],
+        },
+    })
+    with pytest.raises(SolverError):
+        solve(provider, "root", (1, 0, 0), strategy=Strategy.SEMVER)
+
+
+def test_solve_minver_strategy_picks_lowest_satisfying():
+    """MinVer locks libraries against the floor of their supported
+    versions — `requires "X >= 0.5"` resolves X=0.5.0, not the latest."""
+    from milpa.solver import Strategy
+    provider = DictProvider({
+        "root": {(1, 0, 0): [
+            Term.require("foo", VersionSet.from_constraint(">= 0.5.0")),
+        ]},
+        "foo": {
+            (0, 4, 0): [],
+            (0, 5, 0): [],
+            (0, 6, 0): [],
+            (1, 0, 0): [],
+        },
+    })
+    solution = solve(provider, "root", (1, 0, 0), strategy=Strategy.MINVER)
+    # Floor of the satisfying range is 0.5.0, not 1.0.0 like MaxVer would pick
+    assert solution["foo"] == (0, 5, 0)
+
+
 def test_solve_backtracks_to_compatible_version():
     """The PubGrub-forcing test.
 

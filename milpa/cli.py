@@ -26,6 +26,7 @@ from .lockfile import format_lockfile, from_graph, load_lockfile, write_lockfile
 from .manifest import ManifestError, load_or_discover_manifest
 from .nimcfg import write_nimcfg
 from .registry import RegistryEntry, list_remote_tags, load_registry
+from .solver import Strategy
 from .resolver import resolve
 
 
@@ -53,6 +54,16 @@ def make_parser() -> argparse.ArgumentParser:
         "-j", "--parallel", metavar="<N>", type=int, default=8,
         help="number of concurrent fetches (default: 8; use 1 for serial)",
     )
+    parser.add_argument(
+        "-s", "--strategy", metavar="<mode>",
+        choices=("maxver", "minver", "semver"),
+        default="maxver",
+        help=(
+            "resolution strategy: maxver (default, highest version), "
+            "minver (lowest — good for libraries), or semver (highest "
+            "within same major as the constraint's lower bound)"
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
     for name, help_text in SUBCOMMAND_HELP.items():
         subparsers.add_parser(name, help=help_text)
@@ -77,15 +88,17 @@ def cmd_fetch(
     list_tags: Callable[[str], list[str]] = list_remote_tags,
     registry_loader: RegistryLoader = _default_registry_loader,
     max_parallel: int = 8,
+    strategy: Strategy = Strategy.MAXVER,
 ) -> int:
     """Resolve, fetch, emit nim.cfg + milpa.lock."""
     graph = _resolve_or_error(
         project_dir, fetcher=fetcher, list_tags=list_tags,
         registry_loader=registry_loader, max_parallel=max_parallel,
+        strategy=strategy,
     )
     if isinstance(graph, int):
         return graph
-    lockfile = from_graph(graph)
+    lockfile = from_graph(graph, strategy=str(strategy))
     write_lockfile(lockfile, project_dir / "milpa.lock")
     write_nimcfg(graph, project_root=project_dir)
     print(f"resolved {len(graph.deps)} deps", file=sys.stderr)
@@ -99,15 +112,17 @@ def cmd_lock(
     list_tags: Callable[[str], list[str]] = list_remote_tags,
     registry_loader: RegistryLoader = _default_registry_loader,
     max_parallel: int = 8,
+    strategy: Strategy = Strategy.MAXVER,
 ) -> int:
     """Resolve + write milpa.lock; do not emit nim.cfg."""
     graph = _resolve_or_error(
         project_dir, fetcher=fetcher, list_tags=list_tags,
         registry_loader=registry_loader, max_parallel=max_parallel,
+        strategy=strategy,
     )
     if isinstance(graph, int):
         return graph
-    lockfile = from_graph(graph)
+    lockfile = from_graph(graph, strategy=str(strategy))
     write_lockfile(lockfile, project_dir / "milpa.lock")
     print(f"locked {len(graph.deps)} deps", file=sys.stderr)
     return 0
@@ -157,6 +172,7 @@ def _resolve_or_error(
     list_tags: Callable[[str], list[str]],
     registry_loader: RegistryLoader,
     max_parallel: int = 8,
+    strategy: Strategy = Strategy.MAXVER,
 ):
     """Load manifest + registry + resolve. Returns ResolvedGraph on
     success, exit code (int) on error."""
@@ -181,6 +197,7 @@ def _resolve_or_error(
             fetcher=fetcher,
             list_tags=list_tags,
             max_parallel=max_parallel,
+            strategy=strategy,
         )
     except Exception as e:
         print(f"resolution failed: {e}", file=sys.stderr)
@@ -198,9 +215,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 0
     project_dir = Path(args.directory).resolve()
+    strategy = Strategy(args.strategy)
     match args.command:
-        case "fetch": return cmd_fetch(project_dir, max_parallel=args.parallel)
-        case "lock":  return cmd_lock(project_dir, max_parallel=args.parallel)
+        case "fetch":
+            return cmd_fetch(
+                project_dir, max_parallel=args.parallel, strategy=strategy,
+            )
+        case "lock":
+            return cmd_lock(
+                project_dir, max_parallel=args.parallel, strategy=strategy,
+            )
         case "show":  return cmd_show(project_dir)
         case "clean": return cmd_clean(project_dir)
         case _:

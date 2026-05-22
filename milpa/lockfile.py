@@ -44,23 +44,30 @@ class LockedDep:
 class Lockfile:
     version: int
     deps: tuple[LockedDep, ...]
+    strategy: str = "maxver"   # resolution strategy that produced this lockfile
 
 
 class LockfileError(Exception):
     """Raised on malformed lockfile text or graph/lockfile mismatch."""
 
 
-def from_graph(graph: ResolvedGraph) -> Lockfile:
+def from_graph(graph: ResolvedGraph, *, strategy: str = "maxver") -> Lockfile:
     """Convert a ResolvedGraph into a Lockfile.
 
     Deps are sorted by name for deterministic output — same graph
-    always produces byte-identical lockfile text.
+    always produces byte-identical lockfile text. `strategy` records
+    which resolution strategy produced this lockfile (for diagnostics;
+    not used during reproduction since concrete versions are pinned).
     """
     deps = tuple(sorted(
         (_locked_from_resolved(d) for d in graph.deps),
         key=lambda d: d.name,
     ))
-    return Lockfile(version=LOCKFILE_SCHEMA_VERSION, deps=deps)
+    return Lockfile(
+        version=LOCKFILE_SCHEMA_VERSION,
+        deps=deps,
+        strategy=strategy,
+    )
 
 
 def _locked_from_resolved(d: ResolvedDep) -> LockedDep:
@@ -101,9 +108,13 @@ def parse_lockfile(text: str) -> Lockfile:
 
     schema_version: int | None = None
     deps: list[LockedDep] = []
+    strategy: str = "maxver"  # default for pre-strategy lockfiles
     for node in doc.nodes:
         if node.name == "version":
             schema_version = _scalar_int(node, "version")
+        elif node.name == "strategy":
+            if len(node.args) == 1 and isinstance(node.args[0], str):
+                strategy = node.args[0]
         elif node.name == "dep":
             deps.append(_parse_dep(node))
         else:
@@ -118,7 +129,7 @@ def parse_lockfile(text: str) -> Lockfile:
             f"unsupported lockfile schema version {schema_version} "
             f"(this milpa understands version {LOCKFILE_SCHEMA_VERSION})"
         )
-    return Lockfile(version=schema_version, deps=tuple(deps))
+    return Lockfile(version=schema_version, deps=tuple(deps), strategy=strategy)
 
 
 def _parse_dep(node: kdl.Node) -> LockedDep:
@@ -166,7 +177,12 @@ def _scalar_int(node: kdl.Node, field_name: str) -> int:
 
 def format_lockfile(lockfile: Lockfile) -> str:
     """Render a Lockfile to KDL text."""
-    lines = [_HEADER, f"version {lockfile.version}", ""]
+    lines = [
+        _HEADER,
+        f"version {lockfile.version}",
+        f'strategy "{lockfile.strategy}"',
+        "",
+    ]
     for dep in lockfile.deps:
         lines.append(f'dep "{dep.name}" {{')
         lines.append(f'    source "{dep.source}"')

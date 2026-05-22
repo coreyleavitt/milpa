@@ -36,9 +36,25 @@ The algorithm:
 """
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Protocol
 import re
+
+
+class Strategy(StrEnum):
+    """How the solver picks among candidates satisfying the current
+    constraint. Only affects packages with multiple satisfying
+    versions; URL deps (singleton-version) are unaffected.
+
+    - MAXVER: highest version (default; good for applications)
+    - MINVER: lowest version (good for libraries — locks against the
+      declared floor; surfaces accidental use of newer features)
+    - SEMVER: highest within same-major as the constraint's lower
+      bound (protects against accidental cross-major upgrades)
+    """
+    MAXVER = "maxver"
+    MINVER = "minver"
+    SEMVER = "semver"
 
 
 Version = tuple[int, int, int]
@@ -426,12 +442,18 @@ def solve(
     provider: PackageProvider,
     root: str,
     root_version: Version,
+    *,
+    strategy: Strategy = Strategy.MAXVER,
 ) -> dict[str, Version]:
     """Resolve a dep graph starting from `(root, root_version)`.
 
     Returns `{package: chosen_version}` for every package in the closure.
     Raises SolverError on unsatisfiable constraints (after exhausting
     backtracking).
+
+    `strategy` controls how candidates are picked when multiple
+    satisfy the current constraint (URL deps with one version are
+    unaffected). See `Strategy` for the semantics of each mode.
     """
     incompats: list[Incompatibility] = [
         Incompatibility(
@@ -454,7 +476,9 @@ def solve(
             raise SolverError("solver did not converge — likely a bug")
         try:
             _unit_propagate(next_package, incompats, partial)
-            next_package = _make_decision(provider, incompats, partial)
+            next_package = _make_decision(
+                provider, incompats, partial, strategy=strategy,
+            )
             if next_package is None:
                 return partial.decisions()
         except _Conflict as conflict:
@@ -512,6 +536,8 @@ def _make_decision(
     provider: PackageProvider,
     incompats: list[Incompatibility],
     partial: PartialSolution,
+    *,
+    strategy: Strategy = Strategy.MAXVER,
 ) -> str | None:
     """Pick a package with positive constraints but no decision yet,
     choose a version, add it as a decision, and encode its dependencies
@@ -531,7 +557,7 @@ def _make_decision(
             cause=f"no-versions-of-{package}",
         ))
 
-    chosen = max(candidates)
+    chosen = _pick_version(candidates, allowed, strategy, package)
 
     for dep_term in provider.dependencies(package, chosen):
         if not dep_term.positive:
@@ -546,6 +572,60 @@ def _make_decision(
 
     partial.add_decision(package, chosen)
     return package
+
+
+def _pick_version(
+    candidates: list[Version],
+    allowed: VersionSet,
+    strategy: Strategy,
+    package: str,
+) -> Version:
+    """Pick a version from `candidates` according to `strategy`.
+
+    All candidates are guaranteed to satisfy the accumulated constraint
+    (already filtered by `allowed.contains`).
+    """
+    match strategy:
+        case Strategy.MAXVER:
+            return max(candidates)
+        case Strategy.MINVER:
+            return min(candidates)
+        case Strategy.SEMVER:
+            return _pick_semver(candidates, allowed, package)
+
+
+def _pick_semver(
+    candidates: list[Version],
+    allowed: VersionSet,
+    package: str,
+) -> Version:
+    """SemVer: highest candidate within the same major as the
+    constraint's lower bound. If no lower bound exists (unbounded
+    below), fall back to MaxVer. If a lower bound exists but no
+    candidate shares its major, raise — the constraint can only be
+    satisfied by crossing a major boundary, which SemVer refuses."""
+    lower_bound = _lower_bound_of(allowed)
+    if lower_bound is None:
+        return max(candidates)
+    target_major = lower_bound[0]
+    same_major = [v for v in candidates if v[0] == target_major]
+    if not same_major:
+        raise _Conflict(Incompatibility(
+            terms=(Term.require(package, allowed),),
+            cause=f"semver-no-same-major-{package}-at-{target_major}",
+        ))
+    return max(same_major)
+
+
+def _lower_bound_of(vs: VersionSet) -> Version | None:
+    """Lowest inclusive lower bound across all intervals; None if any
+    interval is unbounded below."""
+    if not vs.intervals:
+        return None
+    bounds = [lo for lo, _ in vs.intervals]
+    if any(b is None for b in bounds):
+        return None
+    return min(b for b in bounds if b is not None)
 
 
 def _next_undecided(partial: PartialSolution) -> str | None:

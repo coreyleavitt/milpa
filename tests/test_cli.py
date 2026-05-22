@@ -81,9 +81,9 @@ def test_clean_dispatches_to_cmd_clean(monkeypatch, tmp_path):
 def test_parallel_flag_passed_to_cmd_fetch(monkeypatch, tmp_path):
     called: dict[str, object] = {}
 
-    def fake(project_dir, *, max_parallel):
+    def fake(project_dir, **kw):
         called["project_dir"] = project_dir
-        called["max_parallel"] = max_parallel
+        called["max_parallel"] = kw["max_parallel"]
         return 0
 
     monkeypatch.setattr("milpa.cli.cmd_fetch", fake)
@@ -95,8 +95,8 @@ def test_parallel_flag_passed_to_cmd_fetch(monkeypatch, tmp_path):
 def test_parallel_long_flag(monkeypatch, tmp_path):
     called: dict[str, object] = {}
 
-    def fake(project_dir, *, max_parallel):
-        called["max_parallel"] = max_parallel
+    def fake(project_dir, **kw):
+        called["max_parallel"] = kw["max_parallel"]
         return 0
 
     monkeypatch.setattr("milpa.cli.cmd_fetch", fake)
@@ -105,13 +105,44 @@ def test_parallel_long_flag(monkeypatch, tmp_path):
     assert called["max_parallel"] == 2
 
 
+def test_strategy_flag_passed_to_cmd_fetch(monkeypatch, tmp_path):
+    """`milpa fetch --strategy=minver` should reach cmd_fetch as
+    Strategy.MINVER."""
+    from milpa.solver import Strategy
+    called: dict[str, object] = {}
+
+    def fake(project_dir, **kw):
+        called["strategy"] = kw["strategy"]
+        return 0
+
+    monkeypatch.setattr("milpa.cli.cmd_fetch", fake)
+    rc = main(["-C", str(tmp_path), "--strategy", "minver", "fetch"])
+    assert rc == 0
+    assert called["strategy"] == Strategy.MINVER
+
+
+def test_strategy_default_is_maxver(monkeypatch, tmp_path):
+    """Default strategy is maxver — no behavior change for existing users."""
+    from milpa.solver import Strategy
+    called: dict[str, object] = {}
+
+    def fake(project_dir, **kw):
+        called["strategy"] = kw["strategy"]
+        return 0
+
+    monkeypatch.setattr("milpa.cli.cmd_fetch", fake)
+    rc = main(["-C", str(tmp_path), "fetch"])
+    assert rc == 0
+    assert called["strategy"] == Strategy.MAXVER
+
+
 def test_parallel_default_is_nontrivial(monkeypatch, tmp_path):
     """When -j isn't passed, max_parallel should default > 1 so we
     don't accidentally serialize."""
     called: dict[str, object] = {}
 
-    def fake(project_dir, *, max_parallel):
-        called["max_parallel"] = max_parallel
+    def fake(project_dir, **kw):
+        called["max_parallel"] = kw["max_parallel"]
         return 0
 
     monkeypatch.setattr("milpa.cli.cmd_fetch", fake)

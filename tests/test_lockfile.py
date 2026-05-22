@@ -162,3 +162,36 @@ def test_empty_graph_produces_empty_valid_lockfile():
     round_tripped = parse_lockfile(text)
     assert round_tripped == lockfile
     assert round_tripped.deps == ()
+
+
+def test_lockfile_records_strategy():
+    """Lockfile records which resolution strategy produced it, for
+    diagnostic clarity ('how was this lockfile generated?')."""
+    graph = ResolvedGraph(deps=(_dep("foo"),))
+    lockfile = from_graph(graph, strategy="minver")
+    text = format_lockfile(lockfile)
+    assert 'strategy "minver"' in text
+    # Round-trip preserves it
+    parsed = parse_lockfile(text)
+    assert parsed.strategy == "minver"
+
+
+def test_lockfile_without_strategy_field_parses_as_maxver():
+    """Lockfiles emitted before this feature shipped don't have a
+    strategy field. Parsing such files defaults to maxver — no
+    schema-version bump needed for this field."""
+    text = '''// older lockfile, pre-strategy
+version 1
+
+dep "foo" {
+    source "https://example.com/x.git"
+    ref "main"
+    sha "abc"
+    content_hash "sha256:hash_x"
+    version "0.0.1"
+    src_dir "src"
+    requires
+}
+'''
+    parsed = parse_lockfile(text)
+    assert parsed.strategy == "maxver"
