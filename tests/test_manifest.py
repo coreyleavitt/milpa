@@ -20,6 +20,7 @@ from milpa.manifest import (
 
 def test_minimal_manifest_with_one_url_dep():
     text = """
+name "test"
 deps {
     chronos git="https://github.com/coreyleavitt/chronos.git" ref="feat/contextvars"
 }
@@ -34,11 +35,13 @@ deps {
             ),
         ),
         kind="library",
+        name="test",
     )
 
 
 def test_kind_application_parses():
     text = """
+name "test"
 deps {
     chronos git="https://github.com/x/y.git" ref="main"
 }
@@ -50,6 +53,7 @@ kind "application"
 
 def test_missing_kind_defaults_to_library():
     text = """
+name "test"
 deps {
     chronos git="https://github.com/x/y.git" ref="main"
 }
@@ -60,6 +64,7 @@ deps {
 
 def test_two_deps_preserve_declaration_order():
     text = """
+name "test"
 deps {
     chronos git="https://github.com/coreyleavitt/chronos.git" ref="feat/contextvars"
     intonaco git="https://github.com/coreyleavitt/intonaco.git" ref="main"
@@ -181,6 +186,7 @@ deps {
 def test_load_manifest_reads_from_disk(tmp_path: Path):
     manifest_path = tmp_path / "milpa.kdl"
     manifest_path.write_text(
+        'name "test"\n'
         'deps {\n  chronos git="https://github.com/x/y.git" ref="main"\n}\n'
     )
     m = load_manifest(manifest_path)
@@ -213,6 +219,7 @@ def test_named_dep_no_constraint_parses():
     no version constraint."""
     from milpa.manifest import NamedDep
     text = '''
+name "test"
 deps {
     results
 }
@@ -225,6 +232,7 @@ def test_named_dep_with_constraint_parses():
     """`<name> "<constraint>"` form."""
     from milpa.manifest import NamedDep
     text = '''
+name "test"
 deps {
     stew ">= 0.5.0"
 }
@@ -237,6 +245,7 @@ def test_mixed_url_and_named_deps_in_manifest():
     """A single deps block can carry both URL deps and named deps."""
     from milpa.manifest import NamedDep
     text = '''
+name "test"
 deps {
     chronos git=(url)"https://github.com/x/chronos.git" ref="main"
     results
@@ -265,6 +274,7 @@ def test_local_dep_parses():
     not the parser's."""
     from milpa.manifest import LocalDep
     text = '''
+name "test"
 deps {
     intonaco local="../intonaco"
 }
@@ -279,10 +289,248 @@ def test_local_dep_round_trips_through_format_and_parse():
     original = Manifest(
         deps=(LocalDep(name="intonaco", path="../intonaco"),),
         kind="library",
+        name="test",
     )
     text = format_manifest(original)
     reparsed = parse_manifest(text)
     assert reparsed == original
+
+
+def test_workspace_block_with_one_member_parses():
+    """Tracer: a manifest with a workspace block declaring one member
+    parses to a Workspace value (distinct from Manifest). This is the
+    new top-level role: workspace root, no deps, no kind.
+
+    Per W1 / #73: virtual-workspace-only — a manifest is either a
+    workspace OR a package, never both. Hence Workspace is its own
+    value type; the parser routes based on which top-level node is
+    present.
+    """
+    from milpa.manifest import Workspace, parse_workspace_or_manifest
+    text = '''
+workspace {
+    member "fresco"
+}
+'''
+    result = parse_workspace_or_manifest(text)
+    assert isinstance(result, Workspace)
+    assert result.members == ("fresco",)
+
+
+def test_workspace_with_deps_block_is_rejected():
+    """Virtual-workspace-only: a manifest is workspace OR package,
+    never both. A workspace block coexisting with deps is structural
+    ambiguity and must be a parse error."""
+    from milpa.manifest import parse_workspace_or_manifest
+    text = '''
+workspace {
+    member "fresco"
+}
+
+deps {
+    chronos git=(url)"https://example.com/x.git" ref="main"
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_workspace_or_manifest(text)
+    msg = str(exc.value).lower()
+    assert "workspace" in msg
+    assert "deps" in msg or "package" in msg
+
+
+def test_empty_workspace_block_parses():
+    """A workspace { } with no members is grammatically valid — useful
+    for newly-initialized workspaces before any package is added.
+    Higher layers (W2 discovery) may emit a hint, but the parser
+    accepts."""
+    from milpa.manifest import Workspace, parse_workspace_or_manifest
+    text = '''
+workspace {
+}
+'''
+    result = parse_workspace_or_manifest(text)
+    assert isinstance(result, Workspace)
+    assert result.members == ()
+
+
+def test_multiple_members_preserve_declaration_order():
+    """Order matters for tooling determinism (per-member nim.cfg
+    emission, lockfile entries, etc.). The Workspace value's members
+    tuple reflects the source order."""
+    from milpa.manifest import Workspace, parse_workspace_or_manifest
+    text = '''
+workspace {
+    member "c"
+    member "a"
+    member "b"
+}
+'''
+    result = parse_workspace_or_manifest(text)
+    assert isinstance(result, Workspace)
+    assert result.members == ("c", "a", "b")
+
+
+def test_name_top_level_node_parses_and_is_recorded():
+    """Intrinsic identity: `name "<x>"` at top level records the
+    package's self-claimed name on the Manifest."""
+    text = '''
+name "fresco"
+
+deps {
+    chronos git=(url)"https://example.com/x.git" ref="main"
+}
+'''
+    m = parse_manifest(text)
+    assert m.name == "fresco"
+
+
+def test_package_manifest_without_name_raises():
+    """Intrinsic identity is required for every package. A manifest
+    with deps or kind must have a `name`."""
+    text = '''
+deps {
+    chronos git=(url)"https://example.com/x.git" ref="main"
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    msg = str(exc.value).lower()
+    assert "name" in msg
+
+
+def test_package_manifest_with_only_kind_still_requires_name():
+    """Even a manifest with no deps but a `kind` declaration is a
+    package manifest and must self-identify."""
+    text = '''
+kind "library"
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    msg = str(exc.value).lower()
+    assert "name" in msg
+
+
+def test_duplicate_member_paths_rejected():
+    """Same hygiene as duplicate dep names — every member is uniquely
+    identified by its path string. Duplicates are structural ambiguity."""
+    from milpa.manifest import parse_workspace_or_manifest
+    text = '''
+workspace {
+    member "fresco"
+    member "fresco"
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_workspace_or_manifest(text)
+    msg = str(exc.value).lower()
+    assert "fresco" in msg
+    assert "duplicate" in msg or "already" in msg
+
+
+def test_member_dep_kind_parses():
+    """A workspace-internal dep is `member "<name>"` — reserved keyword
+    leading the line, positional name argument. Symmetric with the
+    overrides `pkg "<name>"` form. KDL doesn't permit bare-identifier
+    arguments, so this is the cleanest way to mark a dep as
+    workspace-routed without conflicting with the NamedDep grammar."""
+    from milpa.manifest import MemberDep
+    text = '''
+name "fresco"
+deps {
+    member "intonaco"
+}
+'''
+    m = parse_manifest(text)
+    assert m.deps == (MemberDep(name="intonaco"),)
+
+
+def test_member_dep_with_extra_properties_is_rejected():
+    """`member` takes no properties — `member "foo" ref="bar"` is
+    malformed."""
+    text = '''
+name "fresco"
+deps {
+    member "intonaco" ref="main"
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    msg = str(exc.value).lower()
+    assert "member" in msg
+
+
+def test_member_dep_without_name_argument_is_rejected():
+    """`member` requires exactly one positional string (the member
+    name)."""
+    text = '''
+name "fresco"
+deps {
+    member
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    msg = str(exc.value).lower()
+    assert "member" in msg
+
+
+def test_member_dep_with_multiple_positional_args_is_rejected():
+    text = '''
+name "fresco"
+deps {
+    member "intonaco" "extra"
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    msg = str(exc.value).lower()
+    assert "member" in msg
+
+
+def test_member_dep_round_trips_through_format_and_parse():
+    """Member dep in a manifest survives format → parse identity."""
+    from milpa.manifest import MemberDep, format_manifest
+    original = Manifest(
+        deps=(
+            MemberDep(name="intonaco"),
+            UrlDep(name="chronos", git="https://example.com/x.git", ref="main"),
+        ),
+        kind="library",
+        name="fresco",
+    )
+    text = format_manifest(original)
+    reparsed = parse_manifest(text)
+    assert reparsed == original
+
+
+def test_workspace_round_trips_through_format_and_parse():
+    """A Workspace value survives format → parse identity. format_workspace
+    emits a workspace { member "..." } block; parse_workspace_or_manifest
+    reads it back as the same Workspace."""
+    from milpa.manifest import (
+        Workspace, format_workspace, parse_workspace_or_manifest,
+    )
+    original = Workspace(members=("fresco", "intonaco", "sinopia"))
+    text = format_workspace(original)
+    reparsed = parse_workspace_or_manifest(text)
+    assert reparsed == original
+
+
+def test_workspace_with_kind_is_rejected():
+    """Same disjoint-union rule for `kind`."""
+    from milpa.manifest import parse_workspace_or_manifest
+    text = '''
+workspace {
+    member "fresco"
+}
+
+kind "library"
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_workspace_or_manifest(text)
+    msg = str(exc.value).lower()
+    assert "workspace" in msg
+    assert "kind" in msg or "package" in msg
 
 
 def test_dep_with_both_git_and_local_raises():
@@ -334,6 +582,7 @@ def test_format_manifest_round_trips_overrides():
     m = Manifest(
         deps=(UrlDep(name="foo", git="https://example.com/foo.git", ref="main"),),
         kind="library",
+        name="test",
         overrides=(
             Override(
                 name="chronos",
@@ -350,6 +599,7 @@ def test_manifest_without_overrides_has_empty_tuple():
     """Backwards compat: a manifest with no overrides block produces
     Manifest.overrides == ()."""
     text = '''
+name "test"
 deps {
     foo git="https://example.com/foo.git" ref="main"
 }
@@ -424,6 +674,7 @@ def test_overrides_block_parses():
     Manifest.overrides as a tuple of Override values."""
     from milpa.manifest import Override
     text = '''
+name "test"
 deps {
     foo git="https://example.com/foo.git" ref="main"
 }
@@ -445,7 +696,7 @@ overrides {
 def test_format_empty_manifest_round_trips():
     """An empty library manifest should round-trip through format/parse."""
     from milpa.manifest import format_manifest
-    m = Manifest(deps=(), kind="library")
+    m = Manifest(deps=(), kind="library", name="test")
     text = format_manifest(m)
     assert parse_manifest(text) == m
 
@@ -457,6 +708,7 @@ def test_format_single_url_dep_round_trips():
                      git="https://github.com/x/chronos.git",
                      ref="feat/contextvars"),),
         kind="library",
+        name="test",
     )
     text = format_manifest(m)
     assert parse_manifest(text) == m
@@ -475,7 +727,7 @@ def test_format_emits_url_annotation():
 
 def test_format_application_kind_round_trips():
     from milpa.manifest import format_manifest
-    m = Manifest(deps=(), kind="application")
+    m = Manifest(deps=(), kind="application", name="test")
     text = format_manifest(m)
     assert 'kind "application"' in text
     assert parse_manifest(text) == m
@@ -483,14 +735,14 @@ def test_format_application_kind_round_trips():
 
 def test_format_named_dep_no_constraint_round_trips():
     from milpa.manifest import NamedDep, format_manifest
-    m = Manifest(deps=(NamedDep(name="results", constraint=None),), kind="library")
+    m = Manifest(deps=(NamedDep(name="results", constraint=None),), kind="library", name="test")
     text = format_manifest(m)
     assert parse_manifest(text) == m
 
 
 def test_format_named_dep_with_constraint_round_trips():
     from milpa.manifest import NamedDep, format_manifest
-    m = Manifest(deps=(NamedDep(name="stew", constraint=">= 0.5.0"),), kind="library")
+    m = Manifest(deps=(NamedDep(name="stew", constraint=">= 0.5.0"),), kind="library", name="test")
     text = format_manifest(m)
     assert parse_manifest(text) == m
 
@@ -504,6 +756,7 @@ def test_format_mixed_deps_round_trips():
             NamedDep(name="stew", constraint=">= 0.5.0"),
         ),
         kind="library",
+        name="test",
     )
     text = format_manifest(m)
     assert parse_manifest(text) == m
@@ -534,11 +787,13 @@ def test_url_with_kdl_type_annotation_parses():
     # may enforce more at the annotation site; today's parser treats
     # it as a hint.)
     annotated = """
+name "test"
 deps {
     chronos git=(url)"https://github.com/coreyleavitt/chronos.git" ref="feat/contextvars"
 }
 """
     plain = """
+name "test"
 deps {
     chronos git="https://github.com/coreyleavitt/chronos.git" ref="feat/contextvars"
 }

@@ -110,6 +110,7 @@ def manifests(draw):
         deps=tuple(deps),
         overrides=tuple(overrides),
         kind=draw(st.sampled_from(["library", "application"])),
+        name=draw(names()),
     )
 
 

@@ -34,6 +34,7 @@ pytestmark = pytest.mark.skipif(
 # fork) whose nimble file has named transitive requires. This exercises
 # every layer of milpa end-to-end.
 FRESCO_MANIFEST = '''
+name "fresco"
 deps {
     chronos git="https://github.com/coreyleavitt/chronos.git" ref="feat/contextvars"
 }

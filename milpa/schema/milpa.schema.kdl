@@ -13,7 +13,36 @@
 // *identity* (sha256 content hash) post-fetch and records it in
 // milpa.lock. See docs/identity-and-provenance.md for the model.
 
-// `deps` block: zero-or-more dependencies. Two shapes per child:
+// A milpa.kdl is one of two disjoint roles (virtual-workspace-only):
+//
+//   - PACKAGE manifest: declares `name`, `deps`, `kind`, optional
+//     `overrides`. The standalone-project case OR a workspace member.
+//   - WORKSPACE manifest: declares `workspace { member "<path>" }`,
+//     optional `name`, optional `overrides`. Pure container — must
+//     NOT carry `deps` or `kind`.
+//
+// Use `parse_workspace_or_manifest` to accept either kind; the
+// returned value's type tells you which.
+
+// `name` top-level node: required for any package manifest.
+//   name "<x>"
+//
+// Intrinsic identity. Required for every package (anything with
+// `deps` or `kind`). Optional for workspace-only manifests. Used by
+// the resolver (workspace member-table routing), by the lockfile
+// (self-describing), and in error messages.
+
+// `workspace` block: declares members of a virtual workspace.
+//   workspace {
+//       member "<path>"   // zero-or-more
+//   }
+//
+// A workspace manifest must NOT contain `deps` or `kind`. To make
+// the workspace root also a package, declare `member "."` and place
+// deps/kind in the root member's milpa.kdl. Member paths are
+// preserved in declaration order; duplicates are rejected.
+
+// `deps` block: zero-or-more dependencies. Four shapes per child:
 //
 // URL DEP — fetch the bytes from a git URL at a ref.
 //   <name> git=(url)"<URL>" ref="<git-ref>"
@@ -40,16 +69,26 @@
 //   time; `milpa verify` warns when the source has drifted from the
 //   snapshot (re-run `milpa fetch` to refresh).
 //
-// Disambiguation: a child with `git=` is a URL dep; with `local=`
-// is a local dep; without either, it's a named dep. Mixing `git=`
-// and `local=` is rejected.
+// MEMBER DEP — reference a workspace-internal member by name.
+//   member "<name>"
+//   Reserved leading keyword `member` (NOT a package name), followed
+//   by exactly one positional string (the member's intrinsic name).
+//   No properties. Resolved through the workspace member table, NOT
+//   through any fetcher — the bytes already live at the member's
+//   declared location.
+//
+// Disambiguation: a child whose KDL node name is `member` is a
+// member dep. Otherwise: with `git=` → URL dep; with `local=` → local
+// dep; without either → named dep. Mixing `git=` and `local=` is
+// rejected.
 //
 // Example (mixed):
+//
+//   name "fresco"  // intrinsic identity
 //
 //   deps {
 //       // URL deps (provenance: explicit git URL + ref)
 //       chronos git=(url)"https://github.com/coreyleavitt/chronos.git" ref="feat/contextvars"
-//       intonaco git=(url)"https://github.com/coreyleavitt/intonaco.git" ref="main"
 //
 //       // Named deps (provenance: nim-lang/packages registry)
 //       results
@@ -57,6 +96,10 @@
 //
 //       // Local dep (provenance: filesystem path)
 //       sinopia local="../sinopia"
+//
+//       // Member dep (workspace-internal reference, this manifest is
+//       // a workspace member)
+//       member "intonaco"
 //   }
 //
 // Identity model: every dep declares *provenance*. milpa computes the
@@ -77,7 +120,23 @@ deps "0..*" {
     "<name>" "<version-constraint>?"
     // Local form
     "<name>" local="<path>"
+    // Workspace-internal member form (reserved keyword `member`)
+    member "<member-name>"
 }
+
+// Workspace-root manifest example:
+//
+//   workspace {
+//       member "fresco"
+//       member "intonaco"
+//       member "sinopia"
+//   }
+workspace "0..1" {
+    member "<member-path>" "0..*"
+}
+
+// Intrinsic identity (required for every package manifest)
+name "<name>"
 
 // `kind` declares whether this is a library or an application.
 //

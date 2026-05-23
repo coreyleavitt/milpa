@@ -33,6 +33,24 @@ class UrlDep:
 
 
 @dataclass(frozen=True)
+class MemberDep:
+    """A dep declared as a workspace-internal reference.
+
+    Resolved through the workspace's member table by `name` — not
+    a fetch, not a filesystem path. Members live in their declared
+    location within the workspace; they are NOT copied into `_deps/`.
+
+    Grammar: `intonaco member` (bare keyword `member`, no value, no
+    other properties). Valid only inside a workspace member's manifest;
+    structural validation (member exists, name matches) happens at
+    workspace-load time (W2).
+
+    See #25 (umbrella) and W1 (#73).
+    """
+    name: str
+
+
+@dataclass(frozen=True)
 class LocalDep:
     """A dep declared by local filesystem path.
 
@@ -64,7 +82,7 @@ class NamedDep:
     constraint: str | None   # e.g. ">= 0.5.0" or None for any version
 
 
-Dep = UrlDep | NamedDep | LocalDep
+Dep = UrlDep | NamedDep | LocalDep | MemberDep
 
 
 @dataclass(frozen=True)
@@ -89,7 +107,22 @@ class Override:
 class Manifest:
     deps: tuple[Dep, ...]
     kind: Kind
+    name: str | None = None
     overrides: tuple[Override, ...] = ()
+
+
+@dataclass(frozen=True)
+class Workspace:
+    """A workspace-root manifest. Pure container — declares member
+    package paths and (eventually) workspace-level overrides.
+
+    Virtual-workspace-only: a workspace manifest may NOT carry deps
+    or kind. A package that wants to also act as the workspace's root
+    member declares `member "."` explicitly.
+
+    See #25 and W1 (#73) for the design.
+    """
+    members: tuple[str, ...]
 
 
 class ManifestError(Exception):
@@ -100,10 +133,71 @@ class ManifestError(Exception):
 # the schema doc at milpa/schema/milpa.schema.kdl documents the same shape
 # for humans. Drift between the two is checked indirectly via tests against
 # example manifests.
-_TOP_LEVEL_NODES = frozenset({"deps", "kind", "overrides"})
+_PACKAGE_TOP_LEVEL = frozenset({"deps", "kind", "overrides", "name"})
 _URL_DEP_PROPS = frozenset({"git", "ref"})
 _VALID_KINDS: tuple[Kind, ...] = ("library", "application")
 _VALID_GIT_SCHEMES = frozenset({"https", "http", "ssh", "git"})
+
+
+def parse_workspace_or_manifest(
+    text: str, *, source: str | None = None,
+) -> "Workspace | Manifest":
+    """Parse a milpa.kdl source string into either a Workspace (if it
+    declares a `workspace { ... }` block) or a Manifest (package form).
+
+    Virtual-workspace-only: the two roles are disjoint. A document
+    with a `workspace` block is a workspace; one with `deps`/`kind`
+    is a package. Mixing is rejected (see W1).
+    """
+    try:
+        doc = kdl.parse(text)
+    except kdl.errors.ParseError as e:
+        raise ManifestError(f"KDL syntax error: {e}") from e
+    has_workspace = any(node.name == "workspace" for node in doc.nodes)
+    if has_workspace:
+        return _parse_workspace_doc(doc)
+    return _parse_manifest_doc(doc)
+
+
+_WORKSPACE_TOP_LEVEL = frozenset({"workspace", "name", "overrides"})
+
+
+def _parse_workspace_doc(doc) -> "Workspace":
+    members: list[str] = []
+    for node in doc.nodes:
+        if node.name in {"deps", "kind"}:
+            raise ManifestError(
+                f"a workspace manifest must not declare {node.name!r} — "
+                f"workspaces are pure containers, not packages "
+                f"(virtual-workspace-only); to make the root also a "
+                f"package, declare `member \".\"` and put deps/kind in "
+                f"the root member's milpa.kdl"
+            )
+        if node.name == "workspace":
+            for child in node.nodes:
+                if child.name != "member":
+                    raise ManifestError(
+                        f"unknown node {child.name!r} in workspace block "
+                        f"(allowed: 'member')"
+                    )
+                if len(child.args) != 1 or not isinstance(child.args[0], str):
+                    raise ManifestError(
+                        "workspace 'member' takes exactly one positional "
+                        "string argument (the member directory path)"
+                    )
+                path = child.args[0]
+                if path in members:
+                    raise ManifestError(
+                        f"duplicate workspace member {path!r}"
+                    )
+                members.append(path)
+        elif node.name not in _WORKSPACE_TOP_LEVEL:
+            allowed = ", ".join(sorted(_WORKSPACE_TOP_LEVEL))
+            raise ManifestError(
+                f"unknown top-level node {node.name!r} in workspace "
+                f"manifest (allowed: {allowed})"
+            )
+    return Workspace(members=tuple(members))
 
 
 def parse_manifest(text: str, *, source: str | None = None) -> Manifest:
@@ -118,20 +212,43 @@ def parse_manifest(text: str, *, source: str | None = None) -> Manifest:
         doc = kdl.parse(text)
     except kdl.errors.ParseError as e:
         raise ManifestError(f"KDL syntax error: {e}") from e
+    return _parse_manifest_doc(doc)
+
+
+def _parse_manifest_doc(doc) -> Manifest:
     deps: list[Dep] = []
     overrides: list[Override] = []
     kind: Kind = "library"
+    name: str | None = None
     seen_names: set[str] = set()
     seen_override_names: set[str] = set()
     for node in doc.nodes:
+        if node.name == "name":
+            if name is not None:
+                raise ManifestError(
+                    "duplicate top-level 'name' node — only one allowed"
+                )
+            if len(node.args) != 1 or not isinstance(node.args[0], str):
+                raise ManifestError(
+                    "'name' takes exactly one positional string argument"
+                )
+            name = node.args[0]
+            continue
         if node.name == "deps":
             for child in node.nodes:
-                if child.name in seen_names:
+                dep = _parse_dep(child)
+                # Dedup key is the resolved dep's `name`, NOT the child
+                # node's name — `member "intonaco"` and `intonaco git=...`
+                # both produce a dep named 'intonaco' and conflict; two
+                # member deps in one block under the same KDL node name
+                # 'member' would otherwise pass the parent-node check
+                # while colliding on the resolved name.
+                if dep.name in seen_names:
                     raise ManifestError(
-                        f"duplicate dep {child.name!r} in manifest"
+                        f"duplicate dep {dep.name!r} in manifest"
                     )
-                seen_names.add(child.name)
-                deps.append(_parse_dep(child))
+                seen_names.add(dep.name)
+                deps.append(dep)
         elif node.name == "kind":
             kind = _parse_kind(node)
         elif node.name == "overrides":
@@ -143,15 +260,28 @@ def parse_manifest(text: str, *, source: str | None = None) -> Manifest:
                     )
                 seen_override_names.add(ov.name)
                 overrides.append(ov)
+        elif node.name == "workspace":
+            raise ManifestError(
+                "'workspace' block found in a package manifest — "
+                "workspace and package roles are disjoint "
+                "(virtual-workspace-only). Use parse_workspace_or_manifest "
+                "if you want to accept either kind."
+            )
         else:
-            allowed = ", ".join(sorted(_TOP_LEVEL_NODES))
+            allowed = ", ".join(sorted(_PACKAGE_TOP_LEVEL))
             raise ManifestError(
                 f"unknown top-level node {node.name!r} "
                 f"(allowed: {allowed})"
             )
+    if name is None:
+        raise ManifestError(
+            "package manifest is missing required top-level 'name' node "
+            "(every package must self-identify; add: `name \"<your-name>\"`)"
+        )
     return Manifest(
         deps=tuple(deps),
         kind=kind,
+        name=name,
         overrides=tuple(overrides),
     )
 
@@ -186,6 +316,9 @@ def format_manifest(m: Manifest) -> str:
     comments — comment-preserving serialization is #15's deliverable.
     """
     lines: list[str] = [_MANIFEST_HEADER, ""]
+    if m.name is not None:
+        lines.append(f'name "{m.name}"')
+        lines.append("")
     if m.deps:
         lines.append("deps {")
         for dep in m.deps:
@@ -211,10 +344,23 @@ def _format_dep_line(dep: Dep) -> str:
         return f'    {_quote_name(dep.name)} git=(url)"{dep.git}" ref="{dep.ref}"'
     if isinstance(dep, LocalDep):
         return f'    {_quote_name(dep.name)} local="{dep.path}"'
+    if isinstance(dep, MemberDep):
+        return f'    member "{dep.name}"'
     # NamedDep
     if dep.constraint is None:
         return f'    {_quote_name(dep.name)}'
     return f'    {_quote_name(dep.name)} "{dep.constraint}"'
+
+
+def format_workspace(w: Workspace) -> str:
+    """Render a Workspace to milpa.kdl text. Counterpart of
+    parse_workspace_or_manifest for the workspace branch."""
+    lines: list[str] = [_MANIFEST_HEADER, ""]
+    lines.append("workspace {")
+    for member in w.members:
+        lines.append(f'    member "{member}"')
+    lines.append("}")
+    return "\n".join(lines) + "\n"
 
 
 def _quote_name(name: str) -> str:
@@ -236,6 +382,12 @@ def _parse_dep(node: kdl.Node) -> Dep:
         results                              → NamedDep(name, constraint=None)
         stew ">= 0.5.0"                      → NamedDep(name, constraint=">= 0.5.0")
     """
+    # `member "<name>"` is the workspace-internal dep form (symmetric
+    # with `pkg "<name>"` in overrides). KDL doesn't allow bare-
+    # identifier args, so a reserved leading keyword is the cleanest
+    # way to disambiguate from NamedDep.
+    if node.name == "member":
+        return _parse_member_dep(node)
     if "git" in node.props:
         return _parse_url_dep(node)
     if "local" in node.props:
@@ -288,6 +440,25 @@ def _parse_local_dep(node: kdl.Node) -> LocalDep:
             f"dep {name!r}: 'local' property must be a non-empty string path"
         )
     return LocalDep(name=name, path=path)
+
+
+def _parse_member_dep(node: kdl.Node) -> MemberDep:
+    """Validate and convert a workspace-internal member dep.
+
+    Grammar: `member "<name>"`. Exactly one positional string
+    argument (the member name); no properties.
+    """
+    if node.props:
+        unknown = ", ".join(repr(p) for p in sorted(node.props.keys()))
+        raise ManifestError(
+            f"'member' dep takes no properties (got {unknown})"
+        )
+    if len(node.args) != 1 or not isinstance(node.args[0], str):
+        raise ManifestError(
+            "'member' dep takes exactly one positional string argument "
+            "(the workspace-member name)"
+        )
+    return MemberDep(name=node.args[0])
 
 
 def _parse_named_dep(node: kdl.Node) -> NamedDep:
@@ -392,8 +563,13 @@ def _validate_git_url(dep_name: str, url: str) -> None:
 # .nimble compatibility — auto-promote a .nimble file when no milpa.kdl exists
 # ---------------------------------------------------------------------------
 
-def manifest_from_nimble(nm) -> "Manifest":  # nm: NimbleManifest
+def manifest_from_nimble(nm, *, name: str) -> "Manifest":  # nm: NimbleManifest
     """Convert a parsed NimbleManifest to a milpa Manifest.
+
+    `name` is the package's intrinsic identity (W1, #73). For a .nimble
+    auto-promotion, callers pass the stem of the .nimble filename (Nim
+    convention — `myproject.nimble` is the manifest for package
+    `myproject`).
 
     Mapping:
       - UrlRequirement   → UrlDep (name derived from URL last segment)
@@ -411,13 +587,13 @@ def manifest_from_nimble(nm) -> "Manifest":  # nm: NimbleManifest
     deps: list[Dep] = []
     for req in nm.requires:
         if isinstance(req, UrlRequirement):
-            name = _name_from_url(req.url)
-            deps.append(UrlDep(name=name, git=req.url, ref=req.ref or "main"))
+            dep_name = _name_from_url(req.url)
+            deps.append(UrlDep(name=dep_name, git=req.url, ref=req.ref or "main"))
         elif isinstance(req, NamedRequirement):
             if req.name == "nim":
                 continue
             deps.append(NamedDep(name=req.name, constraint=req.constraint))
-    return Manifest(deps=tuple(deps), kind="library")
+    return Manifest(deps=tuple(deps), kind="library", name=name)
 
 
 def _name_from_url(url: str) -> str:
@@ -488,4 +664,4 @@ def _load_manifest_from_nimble(path: Path) -> Manifest:
         raise ManifestError(
             f"failed to parse {path} as a nimble manifest: {e}"
         ) from e
-    return manifest_from_nimble(nm)
+    return manifest_from_nimble(nm, name=path.stem)

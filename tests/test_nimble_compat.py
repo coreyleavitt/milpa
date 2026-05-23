@@ -73,6 +73,7 @@ def test_no_manifest_at_all_errors_mentioning_both_filenames(tmp_path, capsys):
 def test_milpa_kdl_wins_when_both_present(tmp_path):
     # milpa.kdl declares "foo"; .nimble declares "bar". milpa.kdl wins.
     (tmp_path / "milpa.kdl").write_text(
+        'name "test"\n'
         'deps {\n'
         '    foo git="https://example.com/foo.git" ref="main"\n'
         '}\n'

@@ -45,6 +45,7 @@ def _as_registry(fake: "FakeFetch") -> FetcherRegistry:
 
 def _write_minimal_manifest(project_dir: Path) -> None:
     (project_dir / "milpa.kdl").write_text(
+        'name "test"\n'
         'deps {\n'
         '    foo git="https://example.com/foo.git" ref="main"\n'
         '}\n'
@@ -201,6 +202,7 @@ def test_cmd_show_registry_dep_shows_registry_provenance(tmp_path, capsys):
     from milpa.registry import RegistryEntry
 
     (tmp_path / "milpa.kdl").write_text(
+        'name "test"\n'
         'deps {\n'
         '    foo git="https://example.com/foo.git" ref="main"\n'
         '}\n'
@@ -392,6 +394,7 @@ def test_cmd_verify_detects_in_place_edit_to_local_dep(tmp_path, capsys):
     source.mkdir()
     (source / "intonaco.nimble").write_text('srcDir = "src"\n')
     (project / "milpa.kdl").write_text(
+        'name "test"\n'
         'deps {\n'
         '    intonaco local="../intonaco"\n'
         '}\n'
@@ -430,6 +433,7 @@ def test_cmd_verify_warns_when_local_source_has_drifted(tmp_path, capsys):
     source.mkdir()
     (source / "intonaco.nimble").write_text('srcDir = "src"\n')
     (project / "milpa.kdl").write_text(
+        'name "test"\n'
         'deps {\n'
         '    intonaco local="../intonaco"\n'
         '}\n'
@@ -460,6 +464,7 @@ def test_cmd_verify_does_not_warn_when_local_source_matches_snapshot(tmp_path, c
     source.mkdir()
     (source / "intonaco.nimble").write_text('srcDir = "src"\n')
     (project / "milpa.kdl").write_text(
+        'name "test"\n'
         'deps {\n'
         '    intonaco local="../intonaco"\n'
         '}\n'
@@ -509,6 +514,7 @@ def test_cmd_fetch_loads_registry_and_resolves_named_transitive(tmp_path):
         }
 
     (tmp_path / "milpa.kdl").write_text(
+        'name "test"\n'
         'deps {\n'
         '    foo git="https://example.com/foo.git" ref="main"\n'
         '}\n'
