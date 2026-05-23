@@ -211,8 +211,44 @@ def cmd_verify(project_dir: Path) -> int:
         for msg in divergences:
             print(f"  {msg}", file=sys.stderr)
         return 1
+    for warning in _local_source_drift_warnings(project_dir, lockfile):
+        print(f"warning: {warning}", file=sys.stderr)
     print(f"verified {len(lockfile.deps)} deps", file=sys.stderr)
     return 0
+
+
+def _local_source_drift_warnings(
+    project_dir: Path, lockfile,
+) -> list[str]:
+    """For LocalDeps, check whether the source dir has drifted from the
+    snapshot recorded in the lockfile. Returns warning messages; does
+    NOT affect the exit code.
+
+    Local provenance is the only transport where source can change
+    between fetches without milpa noticing — git/tarball/etc fetch
+    immutable refs. This warning hints the user to re-`milpa fetch`
+    when the source is ahead of the snapshot.
+    """
+    from .identity import compute_content_hash
+    warnings: list[str] = []
+    for dep in lockfile.deps:
+        if not dep.source.startswith("local:"):
+            continue
+        declared = dep.source[len("local:"):]
+        abs_source = (project_dir / declared).resolve()
+        if not abs_source.is_dir():
+            warnings.append(
+                f"{dep.name}: local source {abs_source} is missing or "
+                f"no longer a directory"
+            )
+            continue
+        actual = compute_content_hash(abs_source)
+        if actual != dep.content_hash:
+            warnings.append(
+                f"{dep.name}: local source at {declared!r} has drifted "
+                f"from the snapshot in milpa.lock; run `milpa fetch` to refresh"
+            )
+    return warnings
 
 
 def cmd_clean(project_dir: Path) -> int:

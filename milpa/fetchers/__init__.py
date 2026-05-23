@@ -15,6 +15,7 @@ See docs/rfc-pluggable-fetchers.md for the design.
 """
 
 from .git import GitFetcher, GitProvenance, GitReceipt
+from .local import LocalFetcher, LocalProvenance, LocalReceipt
 from .types import (
     FetcherRegistry,
     FetchError,
@@ -27,6 +28,7 @@ from .types import (
 
 default_registry = FetcherRegistry()
 default_registry.register(GitFetcher())
+default_registry.register(LocalFetcher())
 
 
 __all__ = [
@@ -37,6 +39,9 @@ __all__ = [
     "GitFetcher",
     "GitProvenance",
     "GitReceipt",
+    "LocalFetcher",
+    "LocalProvenance",
+    "LocalReceipt",
     "Provenance",
     "ProvenanceReceipt",
     "default_registry",

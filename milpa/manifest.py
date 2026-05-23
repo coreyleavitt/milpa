@@ -33,6 +33,25 @@ class UrlDep:
 
 
 @dataclass(frozen=True)
+class LocalDep:
+    """A dep declared by local filesystem path.
+
+    `path` is the literal user-supplied string (relative-to-project
+    or absolute). The resolver lifts it to an absolute Path against
+    the project root before constructing a LocalProvenance — keeping
+    the string intent here means the lockfile can record portable
+    workspace-relative provenance instead of machine-specific
+    absolute paths.
+
+    Grammar: `intonaco local="../intonaco"`.
+
+    See docs/rfc-pluggable-fetchers.md Phase F3.
+    """
+    name: str
+    path: str
+
+
+@dataclass(frozen=True)
 class NamedDep:
     """A dep declared by name (resolved via the registry).
 
@@ -45,7 +64,7 @@ class NamedDep:
     constraint: str | None   # e.g. ">= 0.5.0" or None for any version
 
 
-Dep = UrlDep | NamedDep
+Dep = UrlDep | NamedDep | LocalDep
 
 
 @dataclass(frozen=True)
@@ -190,6 +209,8 @@ def _format_dep_line(dep: Dep) -> str:
     """One deps-block child as a single KDL line."""
     if isinstance(dep, UrlDep):
         return f'    {_quote_name(dep.name)} git=(url)"{dep.git}" ref="{dep.ref}"'
+    if isinstance(dep, LocalDep):
+        return f'    {_quote_name(dep.name)} local="{dep.path}"'
     # NamedDep
     if dep.constraint is None:
         return f'    {_quote_name(dep.name)}'
@@ -217,6 +238,8 @@ def _parse_dep(node: kdl.Node) -> Dep:
     """
     if "git" in node.props:
         return _parse_url_dep(node)
+    if "local" in node.props:
+        return _parse_local_dep(node)
     return _parse_named_dep(node)
 
 
@@ -240,6 +263,31 @@ def _parse_url_dep(node: kdl.Node) -> UrlDep:
     git = git_raw.geturl() if isinstance(git_raw, ParseResult) else git_raw
     _validate_git_url(name, git)
     return UrlDep(name=name, git=git, ref=node.props["ref"])
+
+
+_LOCAL_DEP_PROPS = frozenset({"local"})
+
+
+def _parse_local_dep(node: kdl.Node) -> LocalDep:
+    """Validate and convert a local-path dep child.
+
+    Grammar: `<name> local="<path>"`. The path string is preserved
+    verbatim; relative-to-project resolution happens in the resolver.
+    """
+    name = node.name
+    extra = set(node.props.keys()) - _LOCAL_DEP_PROPS
+    if extra:
+        unknown = ", ".join(repr(p) for p in sorted(extra))
+        raise ManifestError(
+            f"dep {name!r}: unknown property/properties {unknown} "
+            f"on a local dep (allowed: 'local')"
+        )
+    path = node.props["local"]
+    if not isinstance(path, str) or not path:
+        raise ManifestError(
+            f"dep {name!r}: 'local' property must be a non-empty string path"
+        )
+    return LocalDep(name=name, path=path)
 
 
 def _parse_named_dep(node: kdl.Node) -> NamedDep:

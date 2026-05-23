@@ -257,6 +257,50 @@ deps {
     assert stew.constraint == ">= 0.5.0"
 
 
+def test_local_dep_parses():
+    """`local="../path"` form declares a local-filesystem dep.
+
+    The path string is preserved verbatim (relative or absolute);
+    relative-to-project resolution is the resolver's responsibility,
+    not the parser's."""
+    from milpa.manifest import LocalDep
+    text = '''
+deps {
+    intonaco local="../intonaco"
+}
+'''
+    m = parse_manifest(text)
+    assert m.deps == (LocalDep(name="intonaco", path="../intonaco"),)
+
+
+def test_local_dep_round_trips_through_format_and_parse():
+    """A Manifest with a LocalDep must survive format → parse identity."""
+    from milpa.manifest import LocalDep, format_manifest
+    original = Manifest(
+        deps=(LocalDep(name="intonaco", path="../intonaco"),),
+        kind="library",
+    )
+    text = format_manifest(original)
+    reparsed = parse_manifest(text)
+    assert reparsed == original
+
+
+def test_dep_with_both_git_and_local_raises():
+    """A dep must declare exactly one transport. Mixing `git=` and
+    `local=` is a manifest error — the parser must reject it explicitly
+    rather than silently picking one."""
+    text = '''
+deps {
+    intonaco git=(url)"https://example.com/x.git" ref="main" local="../intonaco"
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    msg = str(exc.value).lower()
+    assert "intonaco" in msg
+    assert "git" in msg and "local" in msg
+
+
 def test_named_dep_with_unknown_property_raises():
     """Named deps don't take properties (only positional constraint).
     Unknown properties are an error so typos surface loudly."""

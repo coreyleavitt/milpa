@@ -19,7 +19,7 @@ import pytest
 
 from milpa.fetchers import FetcherRegistry
 from milpa.fetchers.git import GitProvenance, GitReceipt
-from milpa.manifest import Manifest, UrlDep
+from milpa.manifest import LocalDep, Manifest, UrlDep
 from milpa.resolver import ResolvedDep, ResolvedGraph, resolve
 
 
@@ -413,6 +413,99 @@ def test_resolve_transitive_url_dep_override(tmp_path):
     chronos = next(d for d in graph.deps if d.name == "chronos")
     assert chronos.source == "https://my-fork/chronos.git"
     assert chronos.ref == "my-fix"
+
+
+def test_resolve_local_dep_uses_default_local_fetcher(tmp_path):
+    """End-to-end: a manifest LocalDep gets copied into _deps/ via
+    LocalFetcher (default registry), and the ResolvedGraph carries the
+    local dep with source='local:<as-declared>', ref=None, sha=None,
+    content_hash populated."""
+    # Build a local source tree the resolver will treat as the dep.
+    project = tmp_path / "project"
+    project.mkdir()
+    source = tmp_path / "intonaco"
+    source.mkdir()
+    (source / "intonaco.nimble").write_text('srcDir = "src"\n')
+
+    manifest = Manifest(
+        deps=(LocalDep(name="intonaco", path="../intonaco"),),
+        kind="library",
+    )
+    # Use the default registry — exercises real LocalFetcher
+    graph = resolve(
+        manifest,
+        deps_dir=project / "_deps",
+        registry={},
+    )
+
+    assert len(graph.deps) == 1
+    d = graph.deps[0]
+    assert d.name == "intonaco"
+    assert d.source == "local:../intonaco"      # as-declared preserved
+    assert d.ref is None
+    assert d.sha is None
+    assert d.tag is None
+    assert d.content_hash is not None
+    assert len(d.content_hash) == 64
+    # Source bytes copied into _deps
+    assert (project / "_deps" / "intonaco" / "intonaco.nimble").exists()
+
+
+def test_resolve_local_dep_with_transitive_url_requires(tmp_path):
+    """A local dep whose .nimble has 'requires "https://..."' triggers
+    the URL fetch path for the transitive dep. Local + URL transports
+    compose end-to-end.
+
+    Uses the default registry for the LOCAL fetch (real LocalFetcher)
+    and a fake fetcher for the URL transitive (avoids network)."""
+    project = tmp_path / "project"
+    project.mkdir()
+
+    # Local source for intonaco with a transitive URL requires.
+    source = tmp_path / "intonaco"
+    source.mkdir()
+    (source / "intonaco.nimble").write_text(
+        'srcDir = "src"\n'
+        'requires "https://example.com/chronos.git#feat/contextvars"\n'
+    )
+
+    # Build a custom registry: LocalFetcher for local + fake fetcher
+    # for the URL transitive.
+    from milpa.fetchers import FetcherRegistry
+    from milpa.fetchers.local import LocalFetcher
+    reg = FetcherRegistry()
+    reg.register(LocalFetcher())
+    fake_url, _ = fake_registry({
+        ("https://example.com/chronos.git", "feat/contextvars"): (
+            "csha", 'srcDir = "src"\n',
+        ),
+    })
+    # fake_url is itself a registry; pull its single FakeFetcher out
+    # and re-register on the combined registry.
+    for f in fake_url._fetchers:
+        reg.register(f)
+
+    manifest = Manifest(
+        deps=(LocalDep(name="intonaco", path="../intonaco"),),
+        kind="library",
+    )
+    graph = resolve(
+        manifest,
+        deps_dir=project / "_deps",
+        registry={},
+        fetcher=reg,
+    )
+
+    names = {d.name for d in graph.deps}
+    assert "intonaco" in names
+    assert "chronos" in names
+    # intonaco is local
+    intonaco = next(d for d in graph.deps if d.name == "intonaco")
+    assert intonaco.source == "local:../intonaco"
+    # chronos is URL
+    chronos = next(d for d in graph.deps if d.name == "chronos")
+    assert chronos.source == "https://example.com/chronos.git"
+    assert chronos.sha == "csha"
 
 
 def test_resolve_topological_order(tmp_path):

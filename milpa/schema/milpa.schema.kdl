@@ -30,8 +30,19 @@
 //   the version constraint (`>= 0.5.0`, `< 1.0.0`, `>= 0.5 & < 1.0`,
 //   `== 0.5.0`, or omitted for any version).
 //
-// Disambiguation: a child with the `git=` property is a URL dep;
-// without it, it's a named dep.
+// LOCAL DEP — copy a source tree from a filesystem path.
+//   <name> local="<path>"
+//   Properties:
+//     local: a relative-to-project (or absolute) path to a directory
+//   The tree is copied into _deps/<name> at fetch time (snapshot
+//   semantics — symlink/live mode is deferred; see
+//   docs/rfc-pluggable-fetchers.md). Identity is recorded at fetch
+//   time; `milpa verify` warns when the source has drifted from the
+//   snapshot (re-run `milpa fetch` to refresh).
+//
+// Disambiguation: a child with `git=` is a URL dep; with `local=`
+// is a local dep; without either, it's a named dep. Mixing `git=`
+// and `local=` is rejected.
 //
 // Example (mixed):
 //
@@ -43,6 +54,9 @@
 //       // Named deps (provenance: nim-lang/packages registry)
 //       results
 //       stew ">= 0.5.0"
+//
+//       // Local dep (provenance: filesystem path)
+//       sinopia local="../sinopia"
 //   }
 //
 // Identity model: every dep declares *provenance*. milpa computes the
@@ -59,8 +73,10 @@
 deps "0..*" {
     // URL form
     "<name>" git=(url)"<URL>" ref="<git-ref>"
-    // OR named form (no properties; optional positional constraint)
+    // Named form (no properties; optional positional constraint)
     "<name>" "<version-constraint>?"
+    // Local form
+    "<name>" local="<path>"
 }
 
 // `kind` declares whether this is a library or an application.

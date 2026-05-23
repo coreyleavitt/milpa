@@ -24,7 +24,8 @@ import sys
 
 from .fetchers import FetcherRegistry, default_registry
 from .fetchers.git import GitProvenance, GitReceipt
-from .manifest import Manifest, NamedDep, Override, UrlDep
+from .fetchers.local import LocalProvenance
+from .manifest import LocalDep, Manifest, NamedDep, Override, UrlDep
 from .nimble_parse import NamedRequirement, UrlRequirement, parse_nimble
 from .registry import (
     RegistryEntry,
@@ -149,7 +150,17 @@ def resolve(
     # overrides become URL fetches at the sentinel version — the
     # constraint is irrelevant because the override IS the spec.
     for dep in manifest.deps:
-        if isinstance(dep, UrlDep) or dep.name in _overrides_by_name:
+        if isinstance(dep, LocalDep):
+            # Local deps are fixed-singleton in solver space (like URL),
+            # but routed through the local-fetch path. Overrides do NOT
+            # apply to local deps — the user wrote `local="..."` to mean
+            # "use this exact tree", which is itself an explicit override.
+            root_terms.append(
+                Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION))
+            )
+            root_requires.append(dep.name)
+            queue.append(("local", dep))
+        elif isinstance(dep, UrlDep) or dep.name in _overrides_by_name:
             root_terms.append(
                 Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION))
             )
@@ -185,6 +196,10 @@ def resolve(
     # results — no shared mutable state.
     seen_url: set[tuple[str, str]] = set()       # (git, ref)
     seen_named: set[str] = set()
+    seen_local: set[str] = set()                  # by declared path string
+
+    # Project root for resolving local-dep paths declared relative to it.
+    project_root = deps_dir.parent
 
     with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as ex:
         in_flight: dict = {}   # Future → queue item (for error context)
@@ -194,7 +209,17 @@ def resolve(
             # items. An override for `name` replaces the original
             # provenance with the override's URL+ref. Named-dep deps
             # become URL deps (skipping the registry lookup entirely).
-            if item[0] == "url":
+            if item[0] == "local":
+                ldep: LocalDep = item[1]
+                if ldep.path in seen_local:
+                    return
+                seen_local.add(ldep.path)
+                print(f"fetching {ldep.name} (local)...", file=sys.stderr)
+                fut = ex.submit(
+                    _process_local, ldep, project_root, deps_dir, fetcher,
+                    registry, list_tags,
+                )
+            elif item[0] == "url":
                 original_dep = item[1]
                 if original_dep.name in overrides_by_name:
                     ov = overrides_by_name[original_dep.name]
@@ -291,6 +316,48 @@ def _process_url(
         source=dep.git, ref=dep.ref, sha=sha, tag=None,
         content_hash=result.content_hash,
         src_dir=nm.src_dir or "",
+        dep_terms=terms, requires_names=requires_names,
+    )
+    new_items: list = []
+    for u in sub_url_deps:
+        new_items.append(("url", u))
+    for n in sub_named:
+        new_items.append(("named", n.name, n.constraint))
+    return candidate, new_items
+
+
+def _process_local(
+    dep: LocalDep,
+    project_root: Path,
+    deps_dir: Path,
+    fetcher: FetcherRegistry,
+    registry: dict[str, RegistryEntry],
+    list_tags: Callable[[str], list[str]],
+) -> tuple["_Candidate", list]:
+    """Worker: copy a LocalDep's source tree into _deps/, parse its
+    nimble for transitive requires.
+
+    The declared path string (dep.path) is preserved on the candidate's
+    `source` field (`local:<as-declared>`) so the lockfile records the
+    user's intent — portable across machines within the same workspace
+    layout. The absolute path used for the actual copy is only on the
+    LocalReceipt."""
+    abs_path = (project_root / dep.path).resolve()
+    result = fetcher.fetch(
+        dep.name,
+        LocalProvenance(path=abs_path),
+        dest=deps_dir / dep.name,
+    )
+    nimble_path = _find_nimble_file(result.path, dep.name)
+    nm = parse_nimble(nimble_path.read_text()) if nimble_path.exists() else None
+    terms, requires_names, sub_url_deps, sub_named = (
+        _build_terms(nm, registry, list_tags) if nm else ([], [], [], [])
+    )
+    candidate = _Candidate(
+        name=dep.name, version=_URL_DEP_VERSION,
+        source=f"local:{dep.path}", ref=None, sha=None, tag=None,
+        content_hash=result.content_hash,
+        src_dir=(nm.src_dir or "") if nm else "",
         dep_terms=terms, requires_names=requires_names,
     )
     new_items: list = []

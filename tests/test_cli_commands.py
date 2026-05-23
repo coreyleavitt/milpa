@@ -373,6 +373,107 @@ def test_cmd_verify_ignores_dotfiles_in_deps_dir(tmp_path):
     assert rc == 0
 
 
+def test_cmd_verify_detects_in_place_edit_to_local_dep(tmp_path, capsys):
+    """Acceptance from #42: editing a file in a LocalDep's source dir
+    between fetch and verify must be detected. The lockfile records
+    the identity at fetch time; verify recomputes from dest bytes; the
+    user's in-place edit propagates to dest only on the next fetch, so
+    the as-of-fetch hash and the live hash diverge.
+
+    Actually subtler: copy semantics means dest is a SNAPSHOT, so an
+    edit to SOURCE doesn't change dest's bytes — verify still passes.
+    The user must edit DEST (or re-run fetch) to invalidate. So this
+    test pins: edits to the dest tree (which is what _deps/<name> is
+    after a local fetch) flip the verify result, same as for any
+    other transport."""
+    project = tmp_path / "project"
+    project.mkdir()
+    source = tmp_path / "intonaco"
+    source.mkdir()
+    (source / "intonaco.nimble").write_text('srcDir = "src"\n')
+    (project / "milpa.kdl").write_text(
+        'deps {\n'
+        '    intonaco local="../intonaco"\n'
+        '}\n'
+    )
+
+    rc = cmd_fetch(project, registry_loader=_empty_registry_loader)
+    assert rc == 0
+    capsys.readouterr()
+
+    # Tamper with the COPIED tree at _deps/intonaco
+    nimble = project / "_deps" / "intonaco" / "intonaco.nimble"
+    nimble.write_text(nimble.read_text() + "# tampered\n")
+
+    rc = cmd_verify(project)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "intonaco" in err
+    assert "mismatch" in err
+
+
+def test_cmd_verify_warns_when_local_source_has_drifted(tmp_path, capsys):
+    """For LocalDeps, verify additionally checks whether the source dir
+    has drifted from the lockfile snapshot, even though dest is intact.
+
+    Local provenance is the only transport where source can change
+    between fetches without milpa knowing — git/tarball/etc fetch
+    immutable refs. The warning hints the user to re-`milpa fetch` to
+    refresh the snapshot.
+
+    Warnings do NOT flip the exit code — they're informational. The
+    snapshot at _deps/<name> still matches the lockfile; verify is
+    correct to call that 'clean'."""
+    project = tmp_path / "project"
+    project.mkdir()
+    source = tmp_path / "intonaco"
+    source.mkdir()
+    (source / "intonaco.nimble").write_text('srcDir = "src"\n')
+    (project / "milpa.kdl").write_text(
+        'deps {\n'
+        '    intonaco local="../intonaco"\n'
+        '}\n'
+    )
+
+    cmd_fetch(project, registry_loader=_empty_registry_loader)
+    capsys.readouterr()
+
+    # Edit SOURCE (not dest). Dest snapshot still matches the lockfile.
+    (source / "intonaco.nimble").write_text(
+        'srcDir = "src"\n# edited after fetch\n'
+    )
+
+    rc = cmd_verify(project)
+    # Exit 0 — dest is intact, lockfile matches dest
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "warning" in err.lower()
+    assert "intonaco" in err
+    assert "drift" in err.lower() or "drifted" in err.lower()
+
+
+def test_cmd_verify_does_not_warn_when_local_source_matches_snapshot(tmp_path, capsys):
+    """No-op case: source unchanged since fetch → no warning."""
+    project = tmp_path / "project"
+    project.mkdir()
+    source = tmp_path / "intonaco"
+    source.mkdir()
+    (source / "intonaco.nimble").write_text('srcDir = "src"\n')
+    (project / "milpa.kdl").write_text(
+        'deps {\n'
+        '    intonaco local="../intonaco"\n'
+        '}\n'
+    )
+
+    cmd_fetch(project, registry_loader=_empty_registry_loader)
+    capsys.readouterr()
+
+    rc = cmd_verify(project)
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "warning" not in err.lower()
+
+
 def test_cmd_verify_no_lockfile_returns_1(tmp_path, capsys):
     # _deps/ exists but no milpa.lock
     (tmp_path / "_deps").mkdir()
