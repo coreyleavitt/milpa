@@ -25,7 +25,10 @@ import sys
 from .fetchers import FetcherRegistry, default_registry
 from .fetchers.git import GitProvenance, GitReceipt
 from .fetchers.local import LocalProvenance
-from .manifest import LocalDep, Manifest, NamedDep, Override, UrlDep
+from .identity import compute_content_hash
+from .manifest import (
+    LocalDep, Manifest, MemberDep, NamedDep, Override, UrlDep,
+)
 from .nimble_parse import NamedRequirement, UrlRequirement, parse_nimble
 from .registry import (
     RegistryEntry,
@@ -41,6 +44,13 @@ from .solver import (
     VersionSet,
     solve,
 )
+
+
+class ResolverError(Exception):
+    """Raised by resolve() / resolve_workspace() for structural problems
+    surfaced during candidate-set construction (e.g. a `member "X"`
+    reference to a name with no matching workspace member). Solver-
+    level failures (unsatisfiable constraints) raise SolverError."""
 
 
 @dataclass(frozen=True)
@@ -288,6 +298,217 @@ def resolve(
     solution = solve(provider, "__root__", (0, 0, 0), strategy=strategy)
     # Map solution → ResolvedGraph (topologically sorted).
     return _build_graph(solution, provider)
+
+
+def resolve_workspace(
+    workspace,  # Workspace from milpa.workspace
+    *,
+    deps_dir: Path,
+    registry: dict[str, RegistryEntry],
+    fetcher: FetcherRegistry = default_registry,
+    list_tags: Callable[[str], list[str]] = list_remote_tags,
+    max_parallel: int = 8,
+    strategy: Strategy = Strategy.MAXVER,
+) -> ResolvedGraph:
+    """Resolve every member's deps into one shared global graph.
+
+    Workspace members appear as ResolvedDep entries with
+    source='member:<name>', content_hash computed from each member's
+    on-disk directory (no fetcher invocation). External deps (URL,
+    named, local) appear once each — one version per package across
+    the whole workspace.
+
+    NamedDeps (direct or transitive) whose name matches a workspace
+    member auto-coerce to member resolution. This handles the common
+    case where a member's .nimble file transitively requires another
+    workspace member by bare name (the .nimble syntax has no `member`
+    keyword expressible).
+
+    See #25 + W3 (#75) for design rationale.
+    """
+    deps_dir.mkdir(parents=True, exist_ok=True)
+    provider = _MaterializedProvider()
+
+    # Index members by name for fast lookup + auto-coercion.
+    members_by_name = {m.name: m for m in workspace.members}
+
+    # Pre-register each member as a Candidate. Members have no fetch
+    # step — their bytes are already on disk at member.directory.
+    # Each member's manifest deps become solver terms for that member.
+    root_terms: list[Term] = []
+    root_requires: list[str] = []
+    queue: list = []
+
+    # Validate member-to-member references before building anything —
+    # surfacing structural problems early beats letting the solver
+    # complain about a phantom term.
+    for member in workspace.members:
+        for dep in member.manifest.deps:
+            if isinstance(dep, MemberDep) and dep.name not in members_by_name:
+                raise ResolverError(
+                    f"workspace member {member.name!r} references "
+                    f"`member \"{dep.name}\"` but no member named "
+                    f"{dep.name!r} exists in the workspace"
+                )
+
+    for member in workspace.members:
+        terms, requires_names, sub_items = _terms_from_member_manifest(
+            member.manifest, members_by_name,
+        )
+        candidate = _Candidate(
+            name=member.name,
+            version=_URL_DEP_VERSION,
+            source=f"member:{member.name}",
+            ref=None, sha=None, tag=None,
+            content_hash=compute_content_hash(member.directory),
+            src_dir=_extract_src_dir(member.manifest),
+            dep_terms=terms,
+            requires_names=requires_names,
+        )
+        provider.add(candidate)
+        root_terms.append(
+            Term.require(member.name, VersionSet.eq(_URL_DEP_VERSION))
+        )
+        root_requires.append(member.name)
+        queue.extend(sub_items)
+
+    root_cand = _Candidate(
+        name="__root__", version=(0, 0, 0),
+        source="root", ref=None, sha=None, tag=None, content_hash=None,
+        src_dir="", dep_terms=root_terms,
+        requires_names=root_requires,
+    )
+    provider.add(root_cand)
+
+    # BFS over external deps reachable from members. Same shape as
+    # resolve() — URL/named/local items get fetched in parallel; the
+    # main thread owns provider + seen sets.
+    seen_url: set[tuple[str, str]] = set()
+    seen_named: set[str] = set()
+    seen_local: set[str] = set()
+    seen_member: set[str] = set(members_by_name.keys())  # all pre-registered
+
+    project_root = deps_dir.parent
+
+    with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as ex:
+        in_flight: dict = {}
+
+        def submit(item):
+            if item[0] == "url":
+                dep = item[1]
+                key = (dep.git, dep.ref)
+                if key in seen_url:
+                    return
+                seen_url.add(key)
+                print(f"fetching {dep.name}...", file=sys.stderr)
+                fut = ex.submit(
+                    _process_url, dep, deps_dir, fetcher,
+                    registry, list_tags,
+                )
+            elif item[0] == "local":
+                ldep = item[1]
+                if ldep.path in seen_local:
+                    return
+                seen_local.add(ldep.path)
+                print(f"fetching {ldep.name} (local)...", file=sys.stderr)
+                fut = ex.submit(
+                    _process_local, ldep, project_root, deps_dir, fetcher,
+                    registry, list_tags,
+                )
+            else:  # named
+                name, constraint = item[1], item[2]
+                if name in seen_named or name in seen_member:
+                    return
+                if name == "nim":
+                    seen_named.add(name)
+                    return
+                seen_named.add(name)
+                print(f"fetching {name}...", file=sys.stderr)
+                fut = ex.submit(
+                    _process_named, name, constraint, deps_dir, fetcher,
+                    registry, list_tags, strategy,
+                )
+            in_flight[fut] = item
+
+        for item in queue:
+            submit(item)
+
+        while in_flight:
+            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for fut in done:
+                item = in_flight.pop(fut)
+                try:
+                    candidate, new_items = fut.result()
+                except Exception:
+                    for outstanding in in_flight:
+                        outstanding.cancel()
+                    raise
+                provider.add(candidate)
+                print(f"✓ {candidate.name}", file=sys.stderr)
+                # Auto-coerce: filter out new_items whose name matches
+                # a workspace member — they're already pre-registered.
+                for new_item in new_items:
+                    if _item_targets_member(new_item, members_by_name):
+                        continue
+                    submit(new_item)
+
+    solution = solve(provider, "__root__", (0, 0, 0), strategy=strategy)
+    return _build_graph(solution, provider)
+
+
+def _terms_from_member_manifest(
+    manifest: Manifest,
+    members_by_name: dict,
+) -> tuple[list[Term], list[str], list]:
+    """Convert a member's milpa.kdl deps into solver terms + queue items
+    for external deps. MemberDep entries become solver terms targeting
+    the pre-registered member candidate (no queue item — no fetch).
+    NamedDeps whose name matches a member auto-coerce the same way."""
+    terms: list[Term] = []
+    names: list[str] = []
+    queue: list = []
+    for dep in manifest.deps:
+        if isinstance(dep, MemberDep):
+            terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
+            names.append(dep.name)
+        elif isinstance(dep, UrlDep):
+            terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
+            names.append(dep.name)
+            queue.append(("url", dep))
+        elif isinstance(dep, LocalDep):
+            terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
+            names.append(dep.name)
+            queue.append(("local", dep))
+        else:  # NamedDep — auto-coerce if name matches a member
+            if dep.name in members_by_name:
+                terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
+                names.append(dep.name)
+            else:
+                terms.append(Term.require(
+                    dep.name, VersionSet.from_constraint(dep.constraint),
+                ))
+                names.append(dep.name)
+                queue.append(("named", dep.name, dep.constraint))
+    return terms, names, queue
+
+
+def _extract_src_dir(manifest: Manifest) -> str:
+    """milpa.kdl doesn't (yet) carry a src_dir field directly — it lives
+    in the .nimble that the manifest auto-promoted from. For W3 we
+    return empty string; W4 (nim.cfg emission) will read src_dir from
+    the member's package on disk if needed."""
+    return ""
+
+
+def _item_targets_member(item, members_by_name: dict) -> bool:
+    """Auto-coerce: a sub-item (from a fetched dep's transitive
+    requires) targeting a workspace-member name is dropped — the
+    member is already pre-registered with its own dep edges."""
+    if item[0] == "named":
+        return item[1] in members_by_name
+    if item[0] == "url":
+        return item[1].name in members_by_name
+    return False
 
 
 def _process_url(

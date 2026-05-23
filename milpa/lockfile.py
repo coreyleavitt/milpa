@@ -336,3 +336,58 @@ def verify_lockfile_against_deps(
                 )
 
     return divergences
+
+
+def verify_workspace_against_disk(
+    workspace,  # Workspace from milpa.workspace
+    lockfile: Lockfile,
+) -> list[str]:
+    """Workspace-aware drift detection.
+
+    Each lockfile entry is verified against the right location:
+      - source='member:<name>'  → <root>/<member-path>/ (the member's
+        own source tree)
+      - otherwise               → <root>/_deps/<name>/ (standard fetched
+        dep location)
+
+    Returns a list of divergence messages, same format as
+    verify_lockfile_against_deps.
+
+    Out of scope for W3: extra-entry detection (would need to know
+    every member's expected directory + the shared _deps/ layout —
+    folded into W4 once CLI is workspace-aware).
+    """
+    members_by_name = {m.name: m for m in workspace.members}
+    deps_dir = workspace.root / "_deps"
+    divergences: list[str] = []
+
+    for locked in lockfile.deps:
+        if locked.source.startswith("member:"):
+            member_name = locked.source[len("member:"):]
+            member = members_by_name.get(member_name)
+            if member is None:
+                divergences.append(
+                    f"{locked.name}: lockfile references workspace member "
+                    f"{member_name!r} that is not in the current workspace"
+                )
+                continue
+            target = member.directory
+        else:
+            target = deps_dir / locked.name
+
+        if not target.exists():
+            divergences.append(f"{locked.name}: missing from {target}")
+            continue
+        if not target.is_dir():
+            divergences.append(
+                f"{locked.name}: expected directory at {target}, found something else"
+            )
+            continue
+        actual = compute_content_hash(target)
+        if locked.content_hash != actual:
+            divergences.append(
+                f"{locked.name}: content_hash mismatch — "
+                f"lockfile says sha256:{(locked.content_hash or '<none>')[:16]}..., "
+                f"actual sha256:{actual[:16]}..."
+            )
+    return divergences
