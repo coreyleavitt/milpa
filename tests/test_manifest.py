@@ -306,14 +306,14 @@ def test_workspace_block_with_one_member_parses():
     value type; the parser routes based on which top-level node is
     present.
     """
-    from milpa.manifest import Workspace, parse_workspace_or_manifest
+    from milpa.manifest import WorkspaceManifest, parse_workspace_or_manifest
     text = '''
 workspace {
     member "fresco"
 }
 '''
     result = parse_workspace_or_manifest(text)
-    assert isinstance(result, Workspace)
+    assert isinstance(result, WorkspaceManifest)
     assert result.members == ("fresco",)
 
 
@@ -343,13 +343,13 @@ def test_empty_workspace_block_parses():
     for newly-initialized workspaces before any package is added.
     Higher layers (W2 discovery) may emit a hint, but the parser
     accepts."""
-    from milpa.manifest import Workspace, parse_workspace_or_manifest
+    from milpa.manifest import WorkspaceManifest, parse_workspace_or_manifest
     text = '''
 workspace {
 }
 '''
     result = parse_workspace_or_manifest(text)
-    assert isinstance(result, Workspace)
+    assert isinstance(result, WorkspaceManifest)
     assert result.members == ()
 
 
@@ -357,7 +357,7 @@ def test_multiple_members_preserve_declaration_order():
     """Order matters for tooling determinism (per-member nim.cfg
     emission, lockfile entries, etc.). The Workspace value's members
     tuple reflects the source order."""
-    from milpa.manifest import Workspace, parse_workspace_or_manifest
+    from milpa.manifest import WorkspaceManifest, parse_workspace_or_manifest
     text = '''
 workspace {
     member "c"
@@ -366,7 +366,7 @@ workspace {
 }
 '''
     result = parse_workspace_or_manifest(text)
-    assert isinstance(result, Workspace)
+    assert isinstance(result, WorkspaceManifest)
     assert result.members == ("c", "a", "b")
 
 
@@ -504,13 +504,13 @@ def test_member_dep_round_trips_through_format_and_parse():
 
 
 def test_workspace_round_trips_through_format_and_parse():
-    """A Workspace value survives format → parse identity. format_workspace
-    emits a workspace { member "..." } block; parse_workspace_or_manifest
-    reads it back as the same Workspace."""
+    """A WorkspaceManifest value survives format → parse identity.
+    format_workspace emits a workspace { member "..." } block;
+    parse_workspace_or_manifest reads it back identically."""
     from milpa.manifest import (
-        Workspace, format_workspace, parse_workspace_or_manifest,
+        WorkspaceManifest, format_workspace, parse_workspace_or_manifest,
     )
-    original = Workspace(members=("fresco", "intonaco", "sinopia"))
+    original = WorkspaceManifest(members=("fresco", "intonaco", "sinopia"))
     text = format_workspace(original)
     reparsed = parse_workspace_or_manifest(text)
     assert reparsed == original

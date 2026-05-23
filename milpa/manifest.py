@@ -112,17 +112,19 @@ class Manifest:
 
 
 @dataclass(frozen=True)
-class Workspace:
+class WorkspaceManifest:
     """A workspace-root manifest. Pure container — declares member
-    package paths and (eventually) workspace-level overrides.
+    package paths and (optionally) workspace-level overrides that
+    apply to every member's resolution (W5 #77 wires the application).
 
     Virtual-workspace-only: a workspace manifest may NOT carry deps
-    or kind. A package that wants to also act as the workspace's root
-    member declares `member "."` explicitly.
+    or kind. To make the workspace root also be a package, put the
+    package at a subdirectory and list it as a member.
 
     See #25 and W1 (#73) for the design.
     """
     members: tuple[str, ...]
+    overrides: tuple["Override", ...] = ()
 
 
 class ManifestError(Exception):
@@ -141,8 +143,8 @@ _VALID_GIT_SCHEMES = frozenset({"https", "http", "ssh", "git"})
 
 def parse_workspace_or_manifest(
     text: str, *, source: str | None = None,
-) -> "Workspace | Manifest":
-    """Parse a milpa.kdl source string into either a Workspace (if it
+) -> "WorkspaceManifest | Manifest":
+    """Parse a milpa.kdl source string into either a WorkspaceManifest (if it
     declares a `workspace { ... }` block) or a Manifest (package form).
 
     Virtual-workspace-only: the two roles are disjoint. A document
@@ -162,8 +164,10 @@ def parse_workspace_or_manifest(
 _WORKSPACE_TOP_LEVEL = frozenset({"workspace", "name", "overrides"})
 
 
-def _parse_workspace_doc(doc) -> "Workspace":
+def _parse_workspace_doc(doc) -> "WorkspaceManifest":
     members: list[str] = []
+    overrides: list[Override] = []
+    seen_override_names: set[str] = set()
     for node in doc.nodes:
         if node.name in {"deps", "kind"}:
             raise ManifestError(
@@ -191,13 +195,25 @@ def _parse_workspace_doc(doc) -> "Workspace":
                         f"duplicate workspace member {path!r}"
                     )
                 members.append(path)
+        elif node.name == "overrides":
+            for child in node.nodes:
+                ov = _parse_override(child)
+                if ov.name in seen_override_names:
+                    raise ManifestError(
+                        f"duplicate override for {ov.name!r}"
+                    )
+                seen_override_names.add(ov.name)
+                overrides.append(ov)
         elif node.name not in _WORKSPACE_TOP_LEVEL:
             allowed = ", ".join(sorted(_WORKSPACE_TOP_LEVEL))
             raise ManifestError(
                 f"unknown top-level node {node.name!r} in workspace "
                 f"manifest (allowed: {allowed})"
             )
-    return Workspace(members=tuple(members))
+    return WorkspaceManifest(
+        members=tuple(members),
+        overrides=tuple(overrides),
+    )
 
 
 def parse_manifest(text: str, *, source: str | None = None) -> Manifest:
@@ -352,8 +368,8 @@ def _format_dep_line(dep: Dep) -> str:
     return f'    {_quote_name(dep.name)} "{dep.constraint}"'
 
 
-def format_workspace(w: Workspace) -> str:
-    """Render a Workspace to milpa.kdl text. Counterpart of
+def format_workspace(w: WorkspaceManifest) -> str:
+    """Render a WorkspaceManifest to milpa.kdl text. Counterpart of
     parse_workspace_or_manifest for the workspace branch."""
     lines: list[str] = [_MANIFEST_HEADER, ""]
     lines.append("workspace {")
