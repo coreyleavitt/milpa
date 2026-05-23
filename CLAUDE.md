@@ -1,8 +1,9 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code when working with the milpa
-repository. It is the canonical re-init document — open this first in
-any new session.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+It is the canonical re-init document for the milpa repo — open this
+first in any new session.
 
 ## What milpa is
 
