@@ -471,3 +471,241 @@ def test_resolve_workspace_handles_cyclic_member_references(tmp_path):
     )
 
     assert {d.name for d in graph.deps} == {"fresco", "intonaco"}
+
+
+def test_resolve_workspace_applies_override_to_member_url_dep(tmp_path):
+    """Tracer for W5: workspace-level override on chronos → a member's
+    UrlDep for chronos is fetched via the override URL/ref instead of
+    the manifest's URL/ref. The override's spec wins."""
+    from milpa.manifest import Override
+    fresco_dir = tmp_path / "fresco"
+    fresco_dir.mkdir()
+    (fresco_dir / "fresco.nim").write_text("# fresco\n")
+
+    fresco_manifest = Manifest(
+        deps=(UrlDep(name="chronos", git="https://upstream/chronos.git", ref="main"),),
+        kind="library", name="fresco",
+    )
+    ws = Workspace(
+        root=tmp_path,
+        members=(
+            LoadedMember(
+                name="fresco", path="fresco",
+                directory=fresco_dir, manifest=fresco_manifest,
+            ),
+        ),
+        overrides=(
+            Override(
+                name="chronos",
+                git="https://my-fork/chronos.git",
+                ref="my-fix",
+            ),
+        ),
+    )
+    # Only the OVERRIDE's spec is in the fake — if the resolver tried
+    # the upstream URL, FakeFetcher would KeyError loudly.
+    reg, _ = _fake_registry({
+        ("https://my-fork/chronos.git", "my-fix"): (
+            "fork-sha", 'srcDir = "src"\n',
+        ),
+    })
+
+    graph = resolve_workspace(
+        ws, deps_dir=tmp_path / "_deps", registry={}, fetcher=reg,
+    )
+
+    chronos = next(d for d in graph.deps if d.name == "chronos")
+    assert chronos.source == "https://my-fork/chronos.git"
+    assert chronos.ref == "my-fix"
+    assert chronos.sha == "fork-sha"
+
+
+def test_resolve_workspace_override_applies_uniformly_to_all_members(tmp_path):
+    """Two members both depend on chronos via URL. Workspace overrides
+    chronos. Both members see the override; chronos appears once in the
+    graph (deduped via the override's URL/ref)."""
+    from milpa.manifest import Override
+
+    fresco_dir = tmp_path / "fresco"
+    fresco_dir.mkdir()
+    intonaco_dir = tmp_path / "intonaco"
+    intonaco_dir.mkdir()
+
+    upstream_url = "https://upstream/chronos.git"
+    fork_url = "https://my-fork/chronos.git"
+
+    ws = Workspace(
+        root=tmp_path,
+        members=(
+            LoadedMember(
+                name="fresco", path="fresco", directory=fresco_dir,
+                manifest=Manifest(
+                    deps=(UrlDep(name="chronos", git=upstream_url, ref="main"),),
+                    kind="library", name="fresco",
+                ),
+            ),
+            LoadedMember(
+                name="intonaco", path="intonaco", directory=intonaco_dir,
+                manifest=Manifest(
+                    deps=(UrlDep(name="chronos", git=upstream_url, ref="main"),),
+                    kind="library", name="intonaco",
+                ),
+            ),
+        ),
+        overrides=(
+            Override(name="chronos", git=fork_url, ref="my-fix"),
+        ),
+    )
+    # Only the override URL is in the fake — both members must
+    # resolve via the override.
+    reg, fake = _fake_registry({
+        (fork_url, "my-fix"): ("fork-sha", 'srcDir = "src"\n'),
+    })
+
+    graph = resolve_workspace(
+        ws, deps_dir=tmp_path / "_deps", registry={}, fetcher=reg,
+    )
+
+    # chronos appears exactly once (deduped via the override URL)
+    chronos_entries = [d for d in graph.deps if d.name == "chronos"]
+    assert len(chronos_entries) == 1
+    assert chronos_entries[0].source == fork_url
+    # Both members' requires list chronos
+    for member_name in ("fresco", "intonaco"):
+        m = next(d for d in graph.deps if d.name == member_name)
+        assert "chronos" in m.requires
+    # Fetched exactly once (overridden URL)
+    assert sum(1 for c in fake.calls if c[0] == "chronos") == 1
+
+
+def test_resolve_workspace_override_on_named_dep_bypasses_registry(tmp_path):
+    """A member declares chronos as a NamedDep. The workspace overrides
+    chronos. Resolution bypasses the registry path entirely (list_tags
+    must not be called) and fetches from the override URL."""
+    from milpa.manifest import Override
+
+    fresco_dir = tmp_path / "fresco"
+    fresco_dir.mkdir()
+
+    ws = Workspace(
+        root=tmp_path,
+        members=(
+            LoadedMember(
+                name="fresco", path="fresco", directory=fresco_dir,
+                manifest=Manifest(
+                    deps=(NamedDep(name="chronos", constraint=">= 0.5.0"),),
+                    kind="library", name="fresco",
+                ),
+            ),
+        ),
+        overrides=(
+            Override(
+                name="chronos",
+                git="https://my-fork/chronos.git",
+                ref="my-fix",
+            ),
+        ),
+    )
+    def fail_if_called(url):
+        pytest.fail("list_tags should not be called — override bypasses registry")
+    reg, _ = _fake_registry({
+        ("https://my-fork/chronos.git", "my-fix"): ("fork-sha", ''),
+    })
+
+    graph = resolve_workspace(
+        ws, deps_dir=tmp_path / "_deps",
+        registry={}, fetcher=reg, list_tags=fail_if_called,
+    )
+
+    chronos = next(d for d in graph.deps if d.name == "chronos")
+    assert chronos.source == "https://my-fork/chronos.git"
+    assert chronos.ref == "my-fix"
+
+
+def test_resolve_workspace_override_applies_to_transitive_named_dep(tmp_path):
+    """A member depends on intonaco (URL). intonaco's .nimble has
+    `requires "chronos"` (NamedDep). Workspace overrides chronos →
+    the transitive NamedDep routes through the override URL fetch,
+    not the registry."""
+    from milpa.manifest import Override
+
+    fresco_dir = tmp_path / "fresco"
+    fresco_dir.mkdir()
+
+    ws = Workspace(
+        root=tmp_path,
+        members=(
+            LoadedMember(
+                name="fresco", path="fresco", directory=fresco_dir,
+                manifest=Manifest(
+                    deps=(UrlDep(name="intonaco",
+                                 git="https://example.com/intonaco.git",
+                                 ref="main"),),
+                    kind="library", name="fresco",
+                ),
+            ),
+        ),
+        overrides=(
+            Override(name="chronos",
+                     git="https://my-fork/chronos.git", ref="my-fix"),
+        ),
+    )
+    # intonaco's .nimble: NamedDep on chronos (transitive)
+    reg, _ = _fake_registry({
+        ("https://example.com/intonaco.git", "main"): (
+            "isha",
+            'srcDir = "src"\nrequires "chronos >= 0.5.0"\n',
+        ),
+        # Override URL — must be reached for the transitive
+        ("https://my-fork/chronos.git", "my-fix"): ("fork-sha", ''),
+    })
+
+    def fail_if_called(url):
+        pytest.fail("list_tags should not be called — chronos is overridden")
+
+    graph = resolve_workspace(
+        ws, deps_dir=tmp_path / "_deps",
+        registry={}, fetcher=reg, list_tags=fail_if_called,
+    )
+
+    chronos = next(d for d in graph.deps if d.name == "chronos")
+    assert chronos.source == "https://my-fork/chronos.git"
+
+
+def test_resolve_workspace_override_name_collision_with_member_raises(tmp_path):
+    """A workspace override on name X where X is also a workspace
+    member is structurally contradictory. resolve_workspace surfaces
+    a clear ResolverError naming the collision before any I/O."""
+    from milpa.manifest import Override
+    from milpa.resolver import ResolverError
+
+    fresco_dir = tmp_path / "fresco"
+    fresco_dir.mkdir()
+    intonaco_dir = tmp_path / "intonaco"
+    intonaco_dir.mkdir()
+
+    ws = Workspace(
+        root=tmp_path,
+        members=(
+            LoadedMember(
+                name="fresco", path="fresco", directory=fresco_dir,
+                manifest=_empty_manifest("fresco"),
+            ),
+            LoadedMember(
+                name="intonaco", path="intonaco", directory=intonaco_dir,
+                manifest=_empty_manifest("intonaco"),
+            ),
+        ),
+        overrides=(
+            # intonaco is both a workspace member AND an override target.
+            Override(name="intonaco",
+                     git="https://my-fork/intonaco.git", ref="my-fix"),
+        ),
+    )
+
+    with pytest.raises(ResolverError) as exc:
+        resolve_workspace(ws, deps_dir=tmp_path / "_deps", registry={})
+    msg = str(exc.value).lower()
+    assert "intonaco" in msg
+    assert "override" in msg
+    assert "member" in msg

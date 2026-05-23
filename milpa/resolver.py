@@ -229,48 +229,35 @@ def resolve(
                     _process_local, ldep, project_root, deps_dir, fetcher,
                     registry, list_tags,
                 )
-            elif item[0] == "url":
-                original_dep = item[1]
-                if original_dep.name in overrides_by_name:
-                    ov = overrides_by_name[original_dep.name]
-                    dep = UrlDep(name=original_dep.name, git=ov.git, ref=ov.ref)
-                else:
-                    dep = original_dep
-                key = (dep.git, dep.ref)
-                if key in seen_url:
-                    return
-                seen_url.add(key)
-                print(f"fetching {dep.name}...", file=sys.stderr)
-                fut = ex.submit(
-                    _process_url, dep, deps_dir, fetcher,
-                    registry, list_tags,
-                )
-            else:  # named
-                name, constraint = item[1], item[2]
-                if name in seen_named:
-                    return
-                if name == "nim":
-                    seen_named.add(name)
-                    return
-                seen_named.add(name)
-                if name in overrides_by_name:
-                    # Convert to a URL fetch using the override's spec.
-                    ov = overrides_by_name[name]
-                    overridden = UrlDep(name=name, git=ov.git, ref=ov.ref)
-                    key = (overridden.git, overridden.ref)
+            else:
+                # url or named — both share the override-then-dispatch
+                # shape with resolve_workspace's submit(). Single
+                # _apply_override pass eliminates the previous
+                # url-then-named duplication.
+                item = _apply_override(item, overrides_by_name)
+                if item[0] == "url":
+                    dep = item[1]
+                    key = (dep.git, dep.ref)
                     if key in seen_url:
                         return
                     seen_url.add(key)
-                    print(f"fetching {name} (override)...", file=sys.stderr)
+                    print(f"fetching {dep.name}...", file=sys.stderr)
                     fut = ex.submit(
-                        _process_url, overridden, deps_dir, fetcher,
-                        registry, list_tags,
+                        _process_url, dep, deps_dir, fetcher,
+                        registry, list_tags, overrides_by_name,
                     )
-                else:
+                else:  # named
+                    name, constraint = item[1], item[2]
+                    if name in seen_named:
+                        return
+                    if name == "nim":
+                        seen_named.add(name)
+                        return
+                    seen_named.add(name)
                     print(f"fetching {name}...", file=sys.stderr)
                     fut = ex.submit(
                         _process_named, name, constraint, deps_dir, fetcher,
-                        registry, list_tags, strategy,
+                        registry, list_tags, strategy, overrides_by_name,
                     )
             in_flight[fut] = item
 
@@ -331,6 +318,21 @@ def resolve_workspace(
 
     # Index members by name for fast lookup + auto-coercion.
     members_by_name = {m.name: m for m in workspace.members}
+    overrides_by_name = {ov.name: ov for ov in workspace.overrides}
+
+    # Reject the structurally contradictory case: a workspace override
+    # whose name matches a workspace member. The user is asking for X
+    # to come from both an external URL (override) AND the in-tree
+    # member — these can't both be true. Surface the ambiguity loudly
+    # so the user resolves it explicitly (remove one).
+    collisions = sorted(set(overrides_by_name) & set(members_by_name))
+    if collisions:
+        names_str = ", ".join(repr(n) for n in collisions)
+        raise ResolverError(
+            f"workspace override name(s) {names_str} also appear as "
+            f"workspace member(s) — remove either the override or the "
+            f"member; cannot have both"
+        )
 
     # Pre-register each member as a Candidate. Members have no fetch
     # step — their bytes are already on disk at member.directory.
@@ -353,7 +355,7 @@ def resolve_workspace(
 
     for member in workspace.members:
         terms, requires_names, sub_items = _terms_from_member_manifest(
-            member.manifest, members_by_name,
+            member.manifest, members_by_name, overrides_by_name,
         )
         candidate = _Candidate(
             name=member.name,
@@ -394,6 +396,10 @@ def resolve_workspace(
         in_flight: dict = {}
 
         def submit(item):
+            # Apply workspace overrides BEFORE dispatch. An override on
+            # a name replaces URL spec or routes a named dep to a URL
+            # fetch (same semantics as single-project resolve()).
+            item = _apply_override(item, overrides_by_name)
             if item[0] == "url":
                 dep = item[1]
                 key = (dep.git, dep.ref)
@@ -403,7 +409,7 @@ def resolve_workspace(
                 print(f"fetching {dep.name}...", file=sys.stderr)
                 fut = ex.submit(
                     _process_url, dep, deps_dir, fetcher,
-                    registry, list_tags,
+                    registry, list_tags, overrides_by_name,
                 )
             elif item[0] == "local":
                 ldep = item[1]
@@ -413,7 +419,7 @@ def resolve_workspace(
                 print(f"fetching {ldep.name} (local)...", file=sys.stderr)
                 fut = ex.submit(
                     _process_local, ldep, project_root, deps_dir, fetcher,
-                    registry, list_tags,
+                    registry, list_tags, overrides_by_name,
                 )
             else:  # named
                 name, constraint = item[1], item[2]
@@ -426,7 +432,7 @@ def resolve_workspace(
                 print(f"fetching {name}...", file=sys.stderr)
                 fut = ex.submit(
                     _process_named, name, constraint, deps_dir, fetcher,
-                    registry, list_tags, strategy,
+                    registry, list_tags, strategy, overrides_by_name,
                 )
             in_flight[fut] = item
 
@@ -459,11 +465,15 @@ def resolve_workspace(
 def _terms_from_member_manifest(
     manifest: Manifest,
     members_by_name: dict,
+    overrides_by_name: dict,
 ) -> tuple[list[Term], list[str], list]:
     """Convert a member's milpa.kdl deps into solver terms + queue items
     for external deps. MemberDep entries become solver terms targeting
     the pre-registered member candidate (no queue item — no fetch).
-    NamedDeps whose name matches a member auto-coerce the same way."""
+    NamedDeps whose name matches a member auto-coerce the same way.
+    NamedDeps whose name matches a workspace override get a sentinel-
+    version root term because the override turns them into a URL fetch
+    (same shape as resolve()'s NamedDep+Override path)."""
     terms: list[Term] = []
     names: list[str] = []
     queue: list = []
@@ -479,10 +489,15 @@ def _terms_from_member_manifest(
             terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
             names.append(dep.name)
             queue.append(("local", dep))
-        else:  # NamedDep — auto-coerce if name matches a member
-            if dep.name in members_by_name:
+        else:  # NamedDep
+            if dep.name in members_by_name or dep.name in overrides_by_name:
+                # Auto-coerce (member) OR override-routed → sentinel.
                 terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
                 names.append(dep.name)
+                if dep.name not in members_by_name:
+                    # Goes through the named-queue path; override
+                    # substitution happens in submit().
+                    queue.append(("named", dep.name, dep.constraint))
             else:
                 terms.append(Term.require(
                     dep.name, VersionSet.from_constraint(dep.constraint),
@@ -497,6 +512,36 @@ def _extract_src_dir(manifest: Manifest) -> str:
     string when not declared — consumers' nim.cfg lines then point at
     the member's directory itself (no /src suffix)."""
     return manifest.src_dir or ""
+
+
+def _apply_override(item, overrides_by_name: dict):
+    """Transform a queue item per the override table. Pure function:
+
+    - URL item with name in overrides → URL item whose git/ref are the
+      override's spec (the name stays; only the provenance changes).
+    - Named item with name in overrides → URL item targeting the
+      override's spec (skips the registry path entirely).
+    - Local item: unchanged. `local` is itself an explicit override of
+      the transport; workspace/manifest overrides don't apply to it.
+    - No matching override: item unchanged.
+
+    Used by both resolve() and resolve_workspace() at every enqueue
+    point so override application is uniform regardless of which
+    resolver path is active.
+    """
+    if item[0] == "url":
+        dep = item[1]
+        if dep.name in overrides_by_name:
+            ov = overrides_by_name[dep.name]
+            return ("url", UrlDep(name=dep.name, git=ov.git, ref=ov.ref))
+        return item
+    if item[0] == "named":
+        name = item[1]
+        if name in overrides_by_name:
+            ov = overrides_by_name[name]
+            return ("url", UrlDep(name=name, git=ov.git, ref=ov.ref))
+        return item
+    return item
 
 
 def _item_targets_member(item, members_by_name: dict) -> bool:
@@ -516,6 +561,7 @@ def _process_url(
     fetcher: FetcherRegistry,
     registry: dict[str, RegistryEntry],
     list_tags: Callable[[str], list[str]],
+    overrides_by_name: dict | None = None,
 ) -> tuple["_Candidate", list]:
     """Worker function: fetch + parse one URL dep. Returns the candidate
     plus the queue items its requires introduce. Thread-safe: touches no
@@ -529,7 +575,7 @@ def _process_url(
     nimble_path = _find_nimble_file(result.path, dep.name)
     nm = parse_nimble(nimble_path.read_text())
     terms, requires_names, sub_url_deps, sub_named = _build_terms(
-        nm, registry, list_tags,
+        nm, registry, list_tags, overrides_by_name,
     )
     candidate = _Candidate(
         name=dep.name, version=_URL_DEP_VERSION,
@@ -553,6 +599,7 @@ def _process_local(
     fetcher: FetcherRegistry,
     registry: dict[str, RegistryEntry],
     list_tags: Callable[[str], list[str]],
+    overrides_by_name: dict | None = None,
 ) -> tuple["_Candidate", list]:
     """Worker: copy a LocalDep's source tree into _deps/, parse its
     nimble for transitive requires.
@@ -571,7 +618,8 @@ def _process_local(
     nimble_path = _find_nimble_file(result.path, dep.name)
     nm = parse_nimble(nimble_path.read_text()) if nimble_path.exists() else None
     terms, requires_names, sub_url_deps, sub_named = (
-        _build_terms(nm, registry, list_tags) if nm else ([], [], [], [])
+        _build_terms(nm, registry, list_tags, overrides_by_name)
+        if nm else ([], [], [], [])
     )
     candidate = _Candidate(
         name=dep.name, version=_URL_DEP_VERSION,
@@ -596,6 +644,7 @@ def _process_named(
     registry: dict[str, RegistryEntry],
     list_tags: Callable[[str], list[str]],
     strategy: Strategy = Strategy.MAXVER,
+    overrides_by_name: dict | None = None,
 ) -> tuple["_Candidate", list]:
     """Worker function: resolve a named dep through the registry, fetch
     it, parse its nimble. Network ops (resolve_named's list_remote_tags
@@ -612,7 +661,8 @@ def _process_named(
     nimble_path = _find_nimble_file(result.path, name)
     nm = parse_nimble(nimble_path.read_text()) if nimble_path.exists() else None
     terms, requires_names, sub_url_deps, sub_named = (
-        _build_terms(nm, registry, list_tags) if nm else ([], [], [], [])
+        _build_terms(nm, registry, list_tags, overrides_by_name)
+        if nm else ([], [], [], [])
     )
     parts = r.version.split(".")
     ver = (int(parts[0]), int(parts[1]), int(parts[2]))
@@ -636,9 +686,17 @@ def _build_terms(
     nm,
     registry: dict[str, RegistryEntry],
     list_tags: Callable[[str], list[str]],
+    overrides_by_name: dict | None = None,
 ) -> tuple[list[Term], list[str], list[UrlDep], list[NamedRequirement]]:
     """Convert a NimbleManifest's requires into solver Terms + the queues
-    of sub-deps to fetch."""
+    of sub-deps to fetch.
+
+    Override-aware: when overrides_by_name is provided and a transitive
+    NamedRequirement's name matches an override, the produced Term uses
+    the URL-dep sentinel version (because the override turns it into a
+    URL fetch downstream). This keeps the term shape consistent with
+    the candidate the override path actually produces."""
+    overrides_by_name = overrides_by_name or {}
     terms: list[Term] = []
     names: list[str] = []
     sub_url: list[UrlDep] = []
@@ -657,9 +715,17 @@ def _build_terms(
             if req.name == "nim":
                 # Skip the compiler version requirement.
                 continue
-            terms.append(Term.require(
-                req.name, VersionSet.from_constraint(req.constraint)
-            ))
+            if req.name in overrides_by_name:
+                # Override will route this through a URL fetch (sentinel
+                # version candidate). Use sentinel here so the term
+                # shape matches the candidate.
+                terms.append(Term.require(
+                    req.name, VersionSet.eq(_URL_DEP_VERSION)
+                ))
+            else:
+                terms.append(Term.require(
+                    req.name, VersionSet.from_constraint(req.constraint)
+                ))
             names.append(req.name)
             sub_named.append(req)
     return terms, names, sub_url, sub_named

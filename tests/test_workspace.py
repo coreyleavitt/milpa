@@ -285,3 +285,31 @@ def test_find_workspace_root_walks_past_package_milpa_kdls(tmp_path):
     # From inside the member dir: discovery must walk past the package
     # manifest to find the workspace at the parent.
     assert find_workspace_root(member_dir) == tmp_path
+
+
+def test_load_workspace_rejects_per_member_overrides(tmp_path):
+    """A workspace member's milpa.kdl declares its own `overrides`
+    block. Per-member overrides are unsupported in v1 — overrides are
+    workspace-root-only (per W5 design). Reject with a clear error at
+    load time so the silent-drop bug class doesn't recur."""
+    (tmp_path / "milpa.kdl").write_text(
+        'workspace {\n'
+        '    member "fresco"\n'
+        '}\n'
+    )
+    fresco = tmp_path / "fresco"
+    fresco.mkdir()
+    (fresco / "milpa.kdl").write_text(
+        'name "fresco"\n'
+        'kind "library"\n'
+        'overrides {\n'
+        '    pkg "chronos" git=(url)"https://x.git" ref="main"\n'
+        '}\n'
+    )
+
+    with pytest.raises(WorkspaceError) as exc:
+        load_workspace(tmp_path)
+    msg = str(exc.value).lower()
+    assert "fresco" in msg
+    assert "override" in msg
+    assert "workspace" in msg

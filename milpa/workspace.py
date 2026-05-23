@@ -166,6 +166,12 @@ def load_workspace(root: Path) -> Workspace:
                 f"workspace member {member_path!r} is itself a workspace "
                 f"— nested workspaces are not supported"
             )
+        if member_parsed.overrides:
+            raise WorkspaceError(
+                f"workspace member {member_parsed.name!r} declares its own "
+                f"`overrides` block — per-member overrides are not supported "
+                f"in v1; overrides may only appear at the workspace root"
+            )
         if member_parsed.name in name_to_path:
             other = name_to_path[member_parsed.name]
             raise WorkspaceError(
