@@ -58,3 +58,106 @@ def write_nimcfg(
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(format_nimcfg(graph, deps_dir=deps_dir))
     return target
+
+
+# ---------------------------------------------------------------------------
+# Workspace emission — per-member nim.cfg pointing at shared _deps/
+# (W4 / #76)
+# ---------------------------------------------------------------------------
+
+def member_dep_closure(
+    graph: ResolvedGraph, member_name: str,
+) -> list[ResolvedDep]:
+    """Transitive closure from `member_name` in `graph`, excluding the
+    member itself. Returns deps in topological order (deps before
+    dependents) so consumers can emit them in a deterministic --path:
+    sequence.
+
+    The graph already encodes per-member reachability via each
+    ResolvedDep's `requires` field; this function just walks it.
+    """
+    by_name = {d.name: d for d in graph.deps}
+    if member_name not in by_name:
+        return []
+
+    visited: set[str] = set()
+    order: list[str] = []
+
+    def visit(name: str) -> None:
+        if name in visited or name not in by_name:
+            return
+        visited.add(name)
+        for req in by_name[name].requires:
+            visit(req)
+        order.append(name)
+
+    # Walk requires from the member, but DON'T include the member itself
+    # in the closure (you don't --path: your own src).
+    for req in by_name[member_name].requires:
+        visit(req)
+    return [by_name[n] for n in order]
+
+
+def write_workspace_nimcfgs(
+    workspace,  # Workspace from milpa.workspace
+    graph: ResolvedGraph,
+) -> list[Path]:
+    """Emit one nim.cfg per workspace member at <root>/<member-path>/nim.cfg.
+
+    Each member's nim.cfg lists only its transitively-reachable deps
+    (Nim isolation per-member). --path: lines use relative paths from
+    the member's directory:
+      - external deps     → <root>/_deps/<dep>/<src>
+      - member references → <root>/<other-member-path>/<src>
+
+    POSIX path separators regardless of host OS — nim.cfg syntax is
+    OS-agnostic.
+
+    Returns the list of written paths, in member declaration order.
+    """
+    import os
+
+    deps_dir = workspace.root / "_deps"
+    member_dir_by_name = {m.name: m.directory for m in workspace.members}
+    written: list[Path] = []
+
+    for member in workspace.members:
+        target = member.directory / "nim.cfg"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        lines = [_HEADER.rstrip("\n"), ""]
+
+        closure = member_dep_closure(graph, member.name)
+        for dep in closure:
+            dep_target = _absolute_path_for_dep(
+                dep, deps_dir=deps_dir, member_dir_by_name=member_dir_by_name,
+            )
+            rel = os.path.relpath(dep_target, member.directory)
+            # Normalize to POSIX separators
+            rel_posix = Path(rel).as_posix()
+            lines.append(f'--path:"{rel_posix}"')
+
+        if closure:
+            lines.append("")
+        target.write_text("\n".join(lines))
+        written.append(target)
+
+    return written
+
+
+def _absolute_path_for_dep(
+    dep: ResolvedDep, *,
+    deps_dir: Path,
+    member_dir_by_name: dict[str, Path],
+) -> Path:
+    """Compute the absolute on-disk path for a dep's source tree.
+
+    Member deps resolve to the member's directory (with src_dir
+    appended if declared). External deps resolve to deps_dir/<name>
+    (with src_dir appended if declared)."""
+    if dep.source.startswith("member:"):
+        base = member_dir_by_name[dep.name]
+    else:
+        base = deps_dir / dep.name
+    if dep.src_dir:
+        return base / dep.src_dir
+    return base

@@ -479,6 +479,118 @@ def test_cmd_verify_does_not_warn_when_local_source_matches_snapshot(tmp_path, c
     assert "warning" not in err.lower()
 
 
+def test_cmd_fetch_detects_workspace_root_and_runs_workspace_pipeline(tmp_path):
+    """cmd_fetch on a workspace root → resolve_workspace + write
+    per-member nim.cfgs + write shared lockfile at root."""
+    # Workspace at tmp_path with one member; member has no deps so we
+    # don't need a registry loader (the workspace pipeline reads its
+    # own loader for any external deps).
+    (tmp_path / "milpa.kdl").write_text(
+        'workspace {\n'
+        '    member "fresco"\n'
+        '}\n'
+    )
+    fresco_dir = tmp_path / "fresco"
+    fresco_dir.mkdir()
+    (fresco_dir / "milpa.kdl").write_text(
+        'name "fresco"\nkind "library"\n'
+    )
+    (fresco_dir / "fresco.nim").write_text("# fresco\n")
+
+    rc = cmd_fetch(tmp_path, registry_loader=_empty_registry_loader)
+    assert rc == 0
+    # Shared lockfile at workspace root
+    assert (tmp_path / "milpa.lock").exists()
+    # Per-member nim.cfg at member's directory
+    assert (fresco_dir / "nim.cfg").exists()
+    # No top-level nim.cfg (workspace mode emits per-member only)
+    assert not (tmp_path / "nim.cfg").exists()
+
+
+def test_cmd_fetch_from_member_subdir_walks_up_to_workspace_root(tmp_path):
+    """cmd_fetch invoked with project_dir pointed at the member dir
+    walks up to the workspace root via workspace_containing, and
+    operates against the workspace as a whole."""
+    (tmp_path / "milpa.kdl").write_text(
+        'workspace {\n'
+        '    member "fresco"\n'
+        '}\n'
+    )
+    fresco_dir = tmp_path / "fresco"
+    fresco_dir.mkdir()
+    (fresco_dir / "milpa.kdl").write_text(
+        'name "fresco"\nkind "library"\n'
+    )
+
+    # Invoke cmd_fetch FROM the member dir
+    rc = cmd_fetch(fresco_dir, registry_loader=_empty_registry_loader)
+    assert rc == 0
+    # Shared lockfile is at the WORKSPACE root, not the member dir
+    assert (tmp_path / "milpa.lock").exists()
+    assert not (fresco_dir / "milpa.lock").exists()
+    # nim.cfg in the member
+    assert (fresco_dir / "nim.cfg").exists()
+
+
+def test_cmd_verify_workspace_branch_detects_member_drift(tmp_path, capsys):
+    """cmd_verify on a workspace dispatches to verify_workspace_against_disk.
+    Member-source drift is detected."""
+    (tmp_path / "milpa.kdl").write_text(
+        'workspace {\n'
+        '    member "fresco"\n'
+        '}\n'
+    )
+    fresco_dir = tmp_path / "fresco"
+    fresco_dir.mkdir()
+    (fresco_dir / "milpa.kdl").write_text(
+        'name "fresco"\nkind "library"\n'
+    )
+    (fresco_dir / "fresco.nim").write_text("# original\n")
+
+    rc = cmd_fetch(tmp_path, registry_loader=_empty_registry_loader)
+    assert rc == 0
+    capsys.readouterr()
+
+    # Edit the member's source
+    (fresco_dir / "fresco.nim").write_text("# edited\n")
+
+    rc = cmd_verify(tmp_path)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "fresco" in err
+    assert "mismatch" in err
+
+
+def test_cmd_clean_workspace_removes_deps_and_member_nimcfgs(tmp_path):
+    """cmd_clean on a workspace removes <root>/_deps/ and each
+    member's nim.cfg. Lockfile is preserved (symmetric with the
+    single-project behavior)."""
+    (tmp_path / "milpa.kdl").write_text(
+        'workspace {\n'
+        '    member "fresco"\n'
+        '    member "intonaco"\n'
+        '}\n'
+    )
+    for m in ["fresco", "intonaco"]:
+        d = tmp_path / m
+        d.mkdir()
+        (d / "milpa.kdl").write_text(f'name "{m}"\nkind "library"\n')
+
+    rc = cmd_fetch(tmp_path, registry_loader=_empty_registry_loader)
+    assert rc == 0
+    assert (tmp_path / "_deps").exists()
+    assert (tmp_path / "fresco" / "nim.cfg").exists()
+    assert (tmp_path / "intonaco" / "nim.cfg").exists()
+    assert (tmp_path / "milpa.lock").exists()
+
+    rc = cmd_clean(tmp_path)
+    assert rc == 0
+    assert not (tmp_path / "_deps").exists()
+    assert not (tmp_path / "fresco" / "nim.cfg").exists()
+    assert not (tmp_path / "intonaco" / "nim.cfg").exists()
+    assert (tmp_path / "milpa.lock").exists()  # preserved
+
+
 def test_cmd_verify_no_lockfile_returns_1(tmp_path, capsys):
     # _deps/ exists but no milpa.lock
     (tmp_path / "_deps").mkdir()

@@ -493,11 +493,10 @@ def _terms_from_member_manifest(
 
 
 def _extract_src_dir(manifest: Manifest) -> str:
-    """milpa.kdl doesn't (yet) carry a src_dir field directly — it lives
-    in the .nimble that the manifest auto-promoted from. For W3 we
-    return empty string; W4 (nim.cfg emission) will read src_dir from
-    the member's package on disk if needed."""
-    return ""
+    """Read the member's intrinsic src_dir from its milpa.kdl. Empty
+    string when not declared — consumers' nim.cfg lines then point at
+    the member's directory itself (no /src suffix)."""
+    return manifest.src_dir or ""
 
 
 def _item_targets_member(item, members_by_name: dict) -> bool:

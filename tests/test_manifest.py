@@ -427,6 +427,55 @@ workspace {
     assert "duplicate" in msg or "already" in msg
 
 
+def test_src_dir_top_level_node_parses_and_is_recorded():
+    """A milpa.kdl may declare `src_dir "<x>"` to record the package's
+    Nim source layout. Required for workspace members whose consumers
+    need to emit `--path:<member>/<src_dir>` lines in nim.cfg (W4)."""
+    text = '''
+name "fresco"
+src_dir "src"
+deps {
+    chronos git=(url)"https://example.com/x.git" ref="main"
+}
+'''
+    m = parse_manifest(text)
+    assert m.src_dir == "src"
+
+
+def test_src_dir_defaults_to_empty_when_absent():
+    """Backwards compat: existing manifests without src_dir produce
+    Manifest.src_dir == ''."""
+    text = '''
+name "test"
+deps {
+    chronos git=(url)"https://example.com/x.git" ref="main"
+}
+'''
+    m = parse_manifest(text)
+    assert m.src_dir == ""
+
+
+def test_src_dir_round_trips_through_format_parse():
+    from milpa.manifest import format_manifest
+    original = Manifest(
+        deps=(UrlDep(name="foo", git="https://x/y.git", ref="main"),),
+        kind="library",
+        name="fresco",
+        src_dir="src",
+    )
+    reparsed = parse_manifest(format_manifest(original))
+    assert reparsed == original
+
+
+def test_src_dir_absent_does_not_emit_line():
+    """Manifests without src_dir round-trip cleanly — formatter
+    doesn't add an `src_dir ""` noise line."""
+    from milpa.manifest import format_manifest
+    m = Manifest(deps=(), kind="library", name="test")
+    text = format_manifest(m)
+    assert "src_dir" not in text
+
+
 def test_member_dep_kind_parses():
     """A workspace-internal dep is `member "<name>"` — reserved keyword
     leading the line, positional name argument. Symmetric with the

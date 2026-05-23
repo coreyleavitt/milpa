@@ -108,6 +108,7 @@ class Manifest:
     deps: tuple[Dep, ...]
     kind: Kind
     name: str | None = None
+    src_dir: str = ""
     overrides: tuple[Override, ...] = ()
 
 
@@ -135,7 +136,7 @@ class ManifestError(Exception):
 # the schema doc at milpa/schema/milpa.schema.kdl documents the same shape
 # for humans. Drift between the two is checked indirectly via tests against
 # example manifests.
-_PACKAGE_TOP_LEVEL = frozenset({"deps", "kind", "overrides", "name"})
+_PACKAGE_TOP_LEVEL = frozenset({"deps", "kind", "overrides", "name", "src_dir"})
 _URL_DEP_PROPS = frozenset({"git", "ref"})
 _VALID_KINDS: tuple[Kind, ...] = ("library", "application")
 _VALID_GIT_SCHEMES = frozenset({"https", "http", "ssh", "git"})
@@ -236,6 +237,7 @@ def _parse_manifest_doc(doc) -> Manifest:
     overrides: list[Override] = []
     kind: Kind = "library"
     name: str | None = None
+    src_dir: str = ""
     seen_names: set[str] = set()
     seen_override_names: set[str] = set()
     for node in doc.nodes:
@@ -249,6 +251,13 @@ def _parse_manifest_doc(doc) -> Manifest:
                     "'name' takes exactly one positional string argument"
                 )
             name = node.args[0]
+            continue
+        if node.name == "src_dir":
+            if len(node.args) != 1 or not isinstance(node.args[0], str):
+                raise ManifestError(
+                    "'src_dir' takes exactly one positional string argument"
+                )
+            src_dir = node.args[0]
             continue
         if node.name == "deps":
             for child in node.nodes:
@@ -298,6 +307,7 @@ def _parse_manifest_doc(doc) -> Manifest:
         deps=tuple(deps),
         kind=kind,
         name=name,
+        src_dir=src_dir,
         overrides=tuple(overrides),
     )
 
@@ -334,6 +344,9 @@ def format_manifest(m: Manifest) -> str:
     lines: list[str] = [_MANIFEST_HEADER, ""]
     if m.name is not None:
         lines.append(f'name "{m.name}"')
+        lines.append("")
+    if m.src_dir:
+        lines.append(f'src_dir "{m.src_dir}"')
         lines.append("")
     if m.deps:
         lines.append("deps {")

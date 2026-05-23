@@ -22,15 +22,18 @@ from collections.abc import Callable
 
 from . import __version__
 from .fetchers import FetcherRegistry, default_registry
+from .nimcfg import write_workspace_nimcfgs
 from .lockfile import (
     format_lockfile, from_graph, load_lockfile,
-    verify_lockfile_against_deps, write_lockfile,
+    verify_lockfile_against_deps, verify_workspace_against_disk,
+    write_lockfile,
 )
 from .manifest import ManifestError, load_or_discover_manifest
 from .nimcfg import write_nimcfg
 from .registry import RegistryEntry, list_remote_tags, load_registry
 from .solver import Strategy
-from .resolver import resolve
+from .resolver import resolve, resolve_workspace
+from .workspace import workspace_containing
 
 
 SUBCOMMAND_HELP = {
@@ -94,7 +97,20 @@ def cmd_fetch(
     max_parallel: int = 8,
     strategy: Strategy = Strategy.MAXVER,
 ) -> int:
-    """Resolve, fetch, emit nim.cfg + milpa.lock."""
+    """Resolve, fetch, emit nim.cfg + milpa.lock.
+
+    Workspace-aware: if project_dir is inside a workspace (root or any
+    member), the workspace is resolved as a unit — shared lockfile at
+    <root>/milpa.lock, per-member nim.cfgs at <root>/<member>/nim.cfg.
+    Otherwise behaves as a single-project fetch.
+    """
+    ws = workspace_containing(project_dir)
+    if ws is not None:
+        return _cmd_fetch_workspace(
+            ws, fetcher=fetcher, list_tags=list_tags,
+            registry_loader=registry_loader, max_parallel=max_parallel,
+            strategy=strategy,
+        )
     graph = _resolve_or_error(
         project_dir, fetcher=fetcher, list_tags=list_tags,
         registry_loader=registry_loader, max_parallel=max_parallel,
@@ -106,6 +122,43 @@ def cmd_fetch(
     write_lockfile(lockfile, project_dir / "milpa.lock")
     write_nimcfg(graph, project_root=project_dir)
     print(f"resolved {len(graph.deps)} deps", file=sys.stderr)
+    return 0
+
+
+def _cmd_fetch_workspace(
+    ws,  # Workspace
+    *,
+    fetcher: FetcherRegistry,
+    list_tags: Callable[[str], list[str]],
+    registry_loader: RegistryLoader,
+    max_parallel: int,
+    strategy: Strategy,
+) -> int:
+    deps_dir = ws.root / "_deps"
+    cache_path = deps_dir / ".packages_official.json"
+    try:
+        registry = registry_loader(cache_path=cache_path)
+    except Exception as e:
+        print(f"failed to load registry: {e}", file=sys.stderr)
+        return 1
+    try:
+        graph = resolve_workspace(
+            ws, deps_dir=deps_dir,
+            registry=registry, fetcher=fetcher,
+            list_tags=list_tags, max_parallel=max_parallel,
+            strategy=strategy,
+        )
+    except Exception as e:
+        print(f"workspace resolution failed: {e}", file=sys.stderr)
+        return 1
+    lockfile = from_graph(graph, strategy=str(strategy))
+    write_lockfile(lockfile, ws.root / "milpa.lock")
+    written = write_workspace_nimcfgs(ws, graph)
+    print(
+        f"resolved {len(graph.deps)} deps across {len(ws.members)} members; "
+        f"emitted {len(written)} nim.cfg(s)",
+        file=sys.stderr,
+    )
     return 0
 
 
@@ -183,6 +236,36 @@ def cmd_verify(project_dir: Path) -> int:
     anyone hand-edit _deps/?') and after a checkout to confirm
     reproducibility.
     """
+    ws = workspace_containing(project_dir)
+    if ws is not None:
+        lockfile_path = ws.root / "milpa.lock"
+        if not lockfile_path.exists():
+            print(
+                f"no lockfile found at {lockfile_path} — run `milpa fetch` first",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            lockfile = load_lockfile(lockfile_path)
+        except Exception as e:
+            print(f"failed to read lockfile: {e}", file=sys.stderr)
+            return 1
+        divergences = verify_workspace_against_disk(ws, lockfile)
+        if divergences:
+            print(
+                f"verification failed — {len(divergences)} divergence(s):",
+                file=sys.stderr,
+            )
+            for msg in divergences:
+                print(f"  {msg}", file=sys.stderr)
+            return 1
+        print(
+            f"verified {len(lockfile.deps)} deps across "
+            f"{len(ws.members)} workspace members",
+            file=sys.stderr,
+        )
+        return 0
+
     lockfile_path = project_dir / "milpa.lock"
     deps_dir = project_dir / "_deps"
     if not lockfile_path.exists():
@@ -252,7 +335,22 @@ def _local_source_drift_warnings(
 
 
 def cmd_clean(project_dir: Path) -> int:
-    """Remove _deps/ and nim.cfg; keep milpa.lock."""
+    """Remove _deps/ and nim.cfg; keep milpa.lock.
+
+    Workspace-aware: when invoked inside a workspace, removes
+    <root>/_deps/ and each member's nim.cfg. Lockfile preserved.
+    """
+    ws = workspace_containing(project_dir)
+    if ws is not None:
+        deps_dir = ws.root / "_deps"
+        if deps_dir.exists():
+            shutil.rmtree(deps_dir)
+        for member in ws.members:
+            cfg = member.directory / "nim.cfg"
+            if cfg.exists():
+                cfg.unlink()
+        return 0
+
     deps_dir = project_dir / "_deps"
     nim_cfg = project_dir / "nim.cfg"
     if deps_dir.exists():
