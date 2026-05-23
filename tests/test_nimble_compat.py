@@ -12,23 +12,32 @@ from pathlib import Path
 import pytest
 
 from milpa.cli import cmd_fetch
+from milpa.fetchers import FetcherRegistry
+from milpa.fetchers.git import GitProvenance, GitReceipt
 
 
 @dataclass
 class FakeFetch:
+    """Fetcher protocol implementation. Fixture middle field
+    (legacy content_hash) is ignored — milpa computes identity itself."""
     by_url_ref: dict[tuple[str, str], tuple[str, str, str]]
     calls: list[tuple[str, str, str]] = field(default_factory=list)
 
-    def __call__(self, name, git, ref, *, deps_dir):
-        from milpa.fetcher import FetchResult
-        self.calls.append((name, git, ref))
-        sha, content_hash, nimble_text = self.by_url_ref[(git, ref)]
-        target = deps_dir / name
-        target.mkdir(parents=True, exist_ok=True)
-        (target / f"{name}.nimble").write_text(nimble_text)
-        return FetchResult(
-            name=name, path=target, sha=sha, content_hash=content_hash,
-        )
+    def can_handle(self, p):
+        return isinstance(p, GitProvenance)
+
+    def fetch(self, name, p, *, dest):
+        self.calls.append((name, p.url, p.ref))
+        sha, _legacy_hash, nimble_text = self.by_url_ref[(p.url, p.ref)]
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / f"{name}.nimble").write_text(nimble_text)
+        return GitReceipt(commit_sha=sha)
+
+
+def _as_registry(fake: "FakeFetch") -> FetcherRegistry:
+    reg = FetcherRegistry()
+    reg.register(fake)
+    return reg
 
 
 _empty_registry = lambda *, cache_path: {}
@@ -44,7 +53,7 @@ def test_cmd_fetch_reads_nimble_when_no_milpa_kdl(tmp_path):
             "abc123", "hash_foo", 'srcDir = "src"\n',
         ),
     })
-    rc = cmd_fetch(tmp_path, fetcher=fake, registry_loader=_empty_registry)
+    rc = cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry)
     assert rc == 0
     assert (tmp_path / "milpa.lock").exists()
     assert (tmp_path / "nim.cfg").exists()
@@ -77,7 +86,7 @@ def test_milpa_kdl_wins_when_both_present(tmp_path):
         ),
         # bar deliberately absent — if .nimble were read, the fetch would KeyError
     })
-    rc = cmd_fetch(tmp_path, fetcher=fake, registry_loader=_empty_registry)
+    rc = cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry)
     assert rc == 0
     # Only foo got fetched, not bar
     assert [c[0] for c in fake.calls] == ["foo"]
@@ -112,7 +121,7 @@ def test_nimble_with_named_dep_resolves_via_registry(tmp_path):
 
     rc = cmd_fetch(
         tmp_path,
-        fetcher=fake,
+        fetcher=_as_registry(fake),
         list_tags=fake_list_tags,
         registry_loader=fake_loader,
     )
@@ -144,7 +153,7 @@ def test_nimble_with_mixed_url_and_named_deps(tmp_path):
 
     rc = cmd_fetch(
         tmp_path,
-        fetcher=fake,
+        fetcher=_as_registry(fake),
         list_tags=lambda url: ["v0.5.0"],
         registry_loader=fake_loader,
     )
@@ -176,7 +185,7 @@ def test_multiple_nimble_files_resolves_to_project_named_one(tmp_path):
         ),
         # bar deliberately absent — only myproj.nimble should be read
     })
-    rc = cmd_fetch(project, fetcher=fake, registry_loader=_empty_registry)
+    rc = cmd_fetch(project, fetcher=_as_registry(fake), registry_loader=_empty_registry)
     assert rc == 0
     assert [c[0] for c in fake.calls] == ["foo"]
 
@@ -229,7 +238,7 @@ def test_nimble_with_nim_compiler_requires_is_skipped(tmp_path):
             "fsha", "fhash", 'srcDir = "src"\n',
         ),
     })
-    rc = cmd_fetch(tmp_path, fetcher=fake, registry_loader=_empty_registry)
+    rc = cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry)
     assert rc == 0
     # nim should not appear as a dep
     cfg = (tmp_path / "nim.cfg").read_text()

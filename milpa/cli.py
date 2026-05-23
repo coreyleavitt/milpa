@@ -21,7 +21,7 @@ from pathlib import Path
 from collections.abc import Callable
 
 from . import __version__
-from .fetcher import FetchResult, fetch_url_dep
+from .fetchers import FetcherRegistry, default_registry
 from .lockfile import (
     format_lockfile, from_graph, load_lockfile,
     verify_lockfile_against_deps, write_lockfile,
@@ -88,7 +88,7 @@ def _default_registry_loader(*, cache_path: Path) -> dict[str, RegistryEntry]:
 def cmd_fetch(
     project_dir: Path,
     *,
-    fetcher: Callable[..., FetchResult] = fetch_url_dep,
+    fetcher: FetcherRegistry = default_registry,
     list_tags: Callable[[str], list[str]] = list_remote_tags,
     registry_loader: RegistryLoader = _default_registry_loader,
     max_parallel: int = 8,
@@ -112,7 +112,7 @@ def cmd_fetch(
 def cmd_lock(
     project_dir: Path,
     *,
-    fetcher: Callable[..., FetchResult] = fetch_url_dep,
+    fetcher: FetcherRegistry = default_registry,
     list_tags: Callable[[str], list[str]] = list_remote_tags,
     registry_loader: RegistryLoader = _default_registry_loader,
     max_parallel: int = 8,
@@ -233,7 +233,7 @@ def cmd_clean(project_dir: Path) -> int:
 def _resolve_or_error(
     project_dir: Path,
     *,
-    fetcher: Callable[..., FetchResult],
+    fetcher: FetcherRegistry,
     list_tags: Callable[[str], list[str]],
     registry_loader: RegistryLoader,
     max_parallel: int = 8,

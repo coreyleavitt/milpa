@@ -1,10 +1,15 @@
 """Resolver glue tests.
 
-The resolver assembles fetcher + registry + nimble_parse + solver into a
-single `resolve(manifest, ...) -> ResolvedGraph` call. Tests inject a
-fake fetcher (and an empty registry, since fresco's tree mostly uses URL
-deps for these scenarios) so we exercise the integration without
+The resolver assembles fetcher + registry + nimble_parse + solver into
+a single `resolve(manifest, ...) -> ResolvedGraph` call. Tests inject a
+fake Fetcher (an implementation of the milpa.fetchers Fetcher protocol)
+wrapped in a FetcherRegistry, so we exercise the integration without
 network or git.
+
+Note on content_hash: identity is computed by the registry from bytes
+written to dest, NOT supplied by the fake. The fake writes a synthetic
+.nimble; the registry hashes that. So tests don't assert specific
+content_hash values — only that they are well-formed sha256 hex.
 """
 
 from dataclasses import dataclass, field
@@ -12,39 +17,46 @@ from pathlib import Path
 
 import pytest
 
+from milpa.fetchers import FetcherRegistry
+from milpa.fetchers.git import GitProvenance, GitReceipt
 from milpa.manifest import Manifest, UrlDep
 from milpa.resolver import ResolvedDep, ResolvedGraph, resolve
 
 
 @dataclass
-class FakeFetch:
-    """In-test fetcher. Maps (git, ref) → (sha, content_hash, nimble_text).
+class FakeFetcher:
+    """In-test Fetcher. Maps (url, ref) → (sha, nimble_text).
 
-    The fetch function (passed as `fetcher` kwarg to resolve) signature
-    matches milpa.fetcher.fetch_url_dep but consults this dict instead
-    of running git.
-    """
-    by_url_ref: dict[tuple[str, str], tuple[str, str, str]]
+    Implements the Fetcher protocol — handles GitProvenance, writes a
+    synthetic .nimble to dest, returns a GitReceipt with the recorded
+    sha. content_hash is computed by the registry."""
+    by_url_ref: dict[tuple[str, str], tuple[str, str]]
     calls: list[tuple[str, str, str]] = field(default_factory=list)
 
-    def __call__(self, name, git, ref, *, deps_dir):
-        from milpa.fetcher import FetchResult
-        self.calls.append((name, git, ref))
-        sha, content_hash, nimble_text = self.by_url_ref[(git, ref)]
-        # Write a synthetic _deps/<name>/<name>.nimble for the parser
-        target = deps_dir / name
-        target.mkdir(parents=True, exist_ok=True)
-        (target / f"{name}.nimble").write_text(nimble_text)
-        return FetchResult(
-            name=name, path=target, sha=sha, content_hash=content_hash,
-        )
+    def can_handle(self, p):
+        return isinstance(p, GitProvenance)
+
+    def fetch(self, name, p, *, dest):
+        self.calls.append((name, p.url, p.ref))
+        sha, nimble_text = self.by_url_ref[(p.url, p.ref)]
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / f"{name}.nimble").write_text(nimble_text)
+        return GitReceipt(commit_sha=sha)
+
+
+def fake_registry(by_url_ref):
+    """Build a FetcherRegistry containing one FakeFetcher. Returns
+    (registry, fake) so callers can inspect fake.calls."""
+    fake = FakeFetcher(by_url_ref)
+    reg = FetcherRegistry()
+    reg.register(fake)
+    return reg, fake
 
 
 def test_resolve_single_url_dep_no_transitive(tmp_path):
-    fake = FakeFetch({
+    reg, _ = fake_registry({
         ("https://example.com/foo.git", "main"): (
-            "aaa111", "deadbeef",
-            'srcDir = "src"\n',   # no requires
+            "aaa111", 'srcDir = "src"\n',
         ),
     })
     manifest = Manifest(
@@ -55,27 +67,26 @@ def test_resolve_single_url_dep_no_transitive(tmp_path):
         manifest,
         deps_dir=tmp_path / "_deps",
         registry={},
-        fetcher=fake,
+        fetcher=reg,
     )
     assert isinstance(graph, ResolvedGraph)
     assert len(graph.deps) == 1
     assert graph.deps[0].name == "foo"
     assert graph.deps[0].sha == "aaa111"
-    assert graph.deps[0].content_hash == "deadbeef"
+    # content_hash is now milpa-computed from the dest tree; only assert shape
+    assert graph.deps[0].content_hash is not None
+    assert len(graph.deps[0].content_hash) == 64
     assert graph.deps[0].src_dir == "src"
 
 
 def test_resolve_url_dep_with_transitive_url(tmp_path):
-    """Manifest's `foo` URL dep has its own `requires` for `bar` URL.
-    Both should be fetched and appear in the resolved graph."""
-    fake = FakeFetch({
+    reg, _ = fake_registry({
         ("https://example.com/foo.git", "main"): (
-            "aaa111", "hash_foo",
+            "aaa111",
             'srcDir = "src"\nrequires "https://example.com/bar.git#v1"\n',
         ),
         ("https://example.com/bar.git", "v1"): (
-            "bbb222", "hash_bar",
-            'srcDir = "src"\n',
+            "bbb222", 'srcDir = "src"\n',
         ),
     })
     manifest = Manifest(
@@ -84,7 +95,7 @@ def test_resolve_url_dep_with_transitive_url(tmp_path):
     )
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=fake,
+        registry={}, fetcher=reg,
     )
     names = [d.name for d in graph.deps]
     assert "foo" in names
@@ -93,18 +104,17 @@ def test_resolve_url_dep_with_transitive_url(tmp_path):
 
 def test_resolve_dedup_same_url_ref(tmp_path):
     """Two paths to the same URL+ref → fetched once, single entry."""
-    fake = FakeFetch({
+    reg, fake = fake_registry({
         ("https://example.com/foo.git", "main"): (
-            "aaa111", "hash_foo",
+            "aaa111",
             'srcDir = "src"\nrequires "https://example.com/shared.git#v1"\n',
         ),
         ("https://example.com/bar.git", "main"): (
-            "bbb222", "hash_bar",
+            "bbb222",
             'srcDir = "src"\nrequires "https://example.com/shared.git#v1"\n',
         ),
         ("https://example.com/shared.git", "v1"): (
-            "ccc333", "hash_shared",
-            'srcDir = "src"\n',
+            "ccc333", 'srcDir = "src"\n',
         ),
     })
     manifest = Manifest(
@@ -115,11 +125,9 @@ def test_resolve_dedup_same_url_ref(tmp_path):
         kind="library",
     )
     graph = resolve(manifest, deps_dir=tmp_path / "_deps",
-                    registry={}, fetcher=fake)
-    # Shared appears once in the graph
+                    registry={}, fetcher=reg)
     shared_entries = [d for d in graph.deps if d.name == "shared"]
     assert len(shared_entries) == 1
-    # The fetcher was called for shared only once
     shared_calls = [c for c in fake.calls if c[0] == "shared"]
     assert len(shared_calls) == 1
 
@@ -130,10 +138,8 @@ def test_resolve_minver_strategy_threads_through_to_solver(tmp_path):
     from milpa.registry import RegistryEntry
     from milpa.solver import Strategy
 
-    # Manifest declares a named dep with `>= 0.4.0` constraint.
     manifest = Manifest(
         deps=(
-            # NamedDep — registry-resolved, multiple versions
             __import__("milpa.manifest", fromlist=["NamedDep"]).NamedDep(
                 name="foo", constraint=">= 0.4.0",
             ),
@@ -145,21 +151,16 @@ def test_resolve_minver_strategy_threads_through_to_solver(tmp_path):
             name="foo", url="https://example.com/foo.git", method="git",
         ),
     }
-    # The registry lists three matching tags; MinVer should pick v0.4.0.
     list_tags = lambda url: ["v0.4.0", "v0.5.0", "v1.0.0"]
 
-    fixtures = {
-        ("https://example.com/foo.git", "v0.4.0"): (
-            "sha040", "hash040", '',
-        ),
-        # Only fixture v0.4.0; if the resolver mistakenly picked another,
-        # FakeFetch would KeyError loudly.
-    }
+    reg, _ = fake_registry({
+        ("https://example.com/foo.git", "v0.4.0"): ("sha040", ""),
+    })
 
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
         registry=registry,
-        fetcher=FakeFetch(fixtures),
+        fetcher=reg,
         list_tags=list_tags,
         strategy=Strategy.MINVER,
     )
@@ -169,19 +170,12 @@ def test_resolve_minver_strategy_threads_through_to_solver(tmp_path):
 
 
 def test_resolve_parallel_produces_byte_identical_lockfile(tmp_path):
-    """`milpa.lock` is byte-identical regardless of max_parallel.
-    Lockfile is sorted by name; fetch order doesn't affect output."""
+    """`milpa.lock` is byte-identical regardless of max_parallel."""
     from milpa.lockfile import format_lockfile, from_graph
     fixtures = {
-        ("https://example.com/foo.git", "main"): (
-            "fsha", "fhash", 'srcDir = "src"\n',
-        ),
-        ("https://example.com/bar.git", "main"): (
-            "bsha", "bhash", 'srcDir = "src"\n',
-        ),
-        ("https://example.com/baz.git", "main"): (
-            "zsha", "zhash", 'srcDir = "src"\n',
-        ),
+        ("https://example.com/foo.git", "main"): ("fsha", 'srcDir = "src"\n'),
+        ("https://example.com/bar.git", "main"): ("bsha", 'srcDir = "src"\n'),
+        ("https://example.com/baz.git", "main"): ("zsha", 'srcDir = "src"\n'),
     }
     manifest = Manifest(
         deps=(
@@ -191,37 +185,34 @@ def test_resolve_parallel_produces_byte_identical_lockfile(tmp_path):
         ),
         kind="library",
     )
+    reg_s, _ = fake_registry(fixtures)
     serial = resolve(
         manifest, deps_dir=tmp_path / "s",
-        registry={}, fetcher=FakeFetch(fixtures), max_parallel=1,
+        registry={}, fetcher=reg_s, max_parallel=1,
     )
+    reg_p, _ = fake_registry(fixtures)
     parallel = resolve(
         manifest, deps_dir=tmp_path / "p",
-        registry={}, fetcher=FakeFetch(fixtures), max_parallel=8,
+        registry={}, fetcher=reg_p, max_parallel=8,
     )
     assert format_lockfile(from_graph(serial)) == format_lockfile(from_graph(parallel))
 
 
 def test_resolve_parallel_dedup_no_double_fetch(tmp_path):
     """Two URL deps both pointing at the same (git, ref) should still
-    result in exactly one fetch under parallelism. The seen_url set is
-    guarded by the main thread; submit() is the only place that adds to
-    it, and the main thread submits sequentially even when workers run
-    concurrently."""
+    result in exactly one fetch under parallelism."""
     fixtures = {
         ("https://example.com/foo.git", "main"): (
-            "fsha", "fhash",
+            "fsha",
             'srcDir = "src"\nrequires "https://example.com/shared.git#v1"\n',
         ),
         ("https://example.com/bar.git", "main"): (
-            "bsha", "bhash",
+            "bsha",
             'srcDir = "src"\nrequires "https://example.com/shared.git#v1"\n',
         ),
-        ("https://example.com/shared.git", "v1"): (
-            "ssha", "shash", 'srcDir = "src"\n',
-        ),
+        ("https://example.com/shared.git", "v1"): ("ssha", 'srcDir = "src"\n'),
     }
-    fake = FakeFetch(fixtures)
+    reg, fake = fake_registry(fixtures)
     manifest = Manifest(
         deps=(
             UrlDep(name="foo", git="https://example.com/foo.git", ref="main"),
@@ -231,42 +222,33 @@ def test_resolve_parallel_dedup_no_double_fetch(tmp_path):
     )
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=fake, max_parallel=4,
+        registry={}, fetcher=reg, max_parallel=4,
     )
-    # shared appears once
     assert sum(1 for d in graph.deps if d.name == "shared") == 1
-    # shared was fetched exactly once
     assert sum(1 for c in fake.calls if c[0] == "shared") == 1
 
 
 def test_resolve_parallel_failure_surfaces(tmp_path):
     """One fetcher failure should surface as an exception, not deadlock."""
-    from milpa.fetcher import FetchError
+    from milpa.fetchers import FetchError
 
     @dataclass
-    class FailingFetch:
-        good: dict[tuple[str, str], tuple[str, str, str]]
+    class FailingFetcher:
+        good: dict[tuple[str, str], tuple[str, str]]
         calls: list = field(default_factory=list)
-        def __call__(self, name, git, ref, *, deps_dir):
-            from milpa.fetcher import FetchResult
+        def can_handle(self, p): return isinstance(p, GitProvenance)
+        def fetch(self, name, p, *, dest):
             self.calls.append(name)
-            if (git, ref) not in self.good:
+            if (p.url, p.ref) not in self.good:
                 raise FetchError(f"simulated failure for {name}")
-            sha, content_hash, nimble_text = self.good[(git, ref)]
-            target = deps_dir / name
-            target.mkdir(parents=True, exist_ok=True)
-            (target / f"{name}.nimble").write_text(nimble_text)
-            return FetchResult(name=name, path=target, sha=sha,
-                               content_hash=content_hash)
+            sha, nimble_text = self.good[(p.url, p.ref)]
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / f"{name}.nimble").write_text(nimble_text)
+            return GitReceipt(commit_sha=sha)
 
     fixtures = {
-        ("https://example.com/good1.git", "main"): (
-            "g1", "g1h", 'srcDir = "src"\n',
-        ),
-        ("https://example.com/good2.git", "main"): (
-            "g2", "g2h", 'srcDir = "src"\n',
-        ),
-        # bad.git deliberately missing → fetcher raises
+        ("https://example.com/good1.git", "main"): ("g1", 'srcDir = "src"\n'),
+        ("https://example.com/good2.git", "main"): ("g2", 'srcDir = "src"\n'),
     }
     manifest = Manifest(
         deps=(
@@ -276,10 +258,12 @@ def test_resolve_parallel_failure_surfaces(tmp_path):
         ),
         kind="library",
     )
+    reg = FetcherRegistry()
+    reg.register(FailingFetcher(fixtures))
     with pytest.raises(FetchError) as exc:
         resolve(
             manifest, deps_dir=tmp_path / "_deps",
-            registry={}, fetcher=FailingFetch(fixtures), max_parallel=4,
+            registry={}, fetcher=reg, max_parallel=4,
         )
     assert "bad" in str(exc.value)
 
@@ -289,9 +273,7 @@ def test_resolve_parallel_wide_graph(tmp_path):
     parallelism without losing or duplicating any dep."""
     names = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta"]
     fixtures = {
-        (f"https://example.com/{n}.git", "main"): (
-            f"{n}sha", f"{n}hash", 'srcDir = "src"\n',
-        )
+        (f"https://example.com/{n}.git", "main"): (f"{n}sha", 'srcDir = "src"\n')
         for n in names
     }
     manifest = Manifest(
@@ -301,25 +283,20 @@ def test_resolve_parallel_wide_graph(tmp_path):
         ),
         kind="library",
     )
+    reg, _ = fake_registry(fixtures)
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=FakeFetch(fixtures), max_parallel=4,
+        registry={}, fetcher=reg, max_parallel=4,
     )
     resolved_names = {d.name for d in graph.deps}
     assert resolved_names == set(names)
 
 
 def test_resolve_parallel_produces_same_graph_as_serial(tmp_path):
-    """Parallel and serial resolution must produce identical ResolvedGraphs.
-    Output determinism is the key invariant — fetch ORDER may vary, but
-    the resolved tree, lockfile, and nim.cfg must be byte-identical."""
+    """Parallel and serial resolution must produce identical ResolvedGraphs."""
     fixtures = {
-        ("https://example.com/foo.git", "main"): (
-            "fsha", "fhash", 'srcDir = "src"\n',
-        ),
-        ("https://example.com/bar.git", "main"): (
-            "bsha", "bhash", 'srcDir = "src"\n',
-        ),
+        ("https://example.com/foo.git", "main"): ("fsha", 'srcDir = "src"\n'),
+        ("https://example.com/bar.git", "main"): ("bsha", 'srcDir = "src"\n'),
     }
     manifest = Manifest(
         deps=(
@@ -329,22 +306,16 @@ def test_resolve_parallel_produces_same_graph_as_serial(tmp_path):
         kind="library",
     )
 
+    reg_s, _ = fake_registry(fixtures)
     serial = resolve(
-        manifest,
-        deps_dir=tmp_path / "serial",
-        registry={},
-        fetcher=FakeFetch(fixtures),
-        max_parallel=1,
+        manifest, deps_dir=tmp_path / "serial",
+        registry={}, fetcher=reg_s, max_parallel=1,
     )
+    reg_p, _ = fake_registry(fixtures)
     parallel = resolve(
-        manifest,
-        deps_dir=tmp_path / "parallel",
-        registry={},
-        fetcher=FakeFetch(fixtures),
-        max_parallel=4,
+        manifest, deps_dir=tmp_path / "parallel",
+        registry={}, fetcher=reg_p, max_parallel=4,
     )
-    # Ignoring the _deps path field (which differs by directory),
-    # graph deps should be byte-equal.
     def normalize(g):
         return tuple(
             (d.name, d.source, d.ref, d.tag, d.sha, d.version,
@@ -359,27 +330,23 @@ def test_resolve_url_dep_with_override_fetches_override(tmp_path):
     override's URL+ref, not the manifest's."""
     from milpa.manifest import Override
     fixtures = {
-        # Only the OVERRIDE's spec is in the fake fetcher's table.
-        # If the resolver tried the manifest's URL, FakeFetch would
-        # KeyError loudly.
-        ("https://my-fork/chronos.git", "my-fix"): (
-            "fork-sha", "fork-hash", 'srcDir = "src"\n',
-        ),
+        ("https://my-fork/chronos.git", "my-fix"): ("fork-sha", 'srcDir = "src"\n'),
     }
     manifest = Manifest(
         deps=(UrlDep(name="chronos",
                      git="https://upstream/chronos.git",
                      ref="main"),),
         kind="library",
-        overrides=(Override(
+        overrides=(__import__("milpa.manifest", fromlist=["Override"]).Override(
             name="chronos",
             git="https://my-fork/chronos.git",
             ref="my-fix",
         ),),
     )
+    reg, _ = fake_registry(fixtures)
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=FakeFetch(fixtures),
+        registry={}, fetcher=reg,
     )
     chronos = next(d for d in graph.deps if d.name == "chronos")
     assert chronos.source == "https://my-fork/chronos.git"
@@ -391,9 +358,7 @@ def test_resolve_named_dep_with_override_skips_registry(tmp_path):
     and fetches the override's URL+ref directly."""
     from milpa.manifest import NamedDep, Override
     fixtures = {
-        ("https://my-fork/results.git", "patched"): (
-            "ovr-sha", "ovr-hash", '',
-        ),
+        ("https://my-fork/results.git", "patched"): ("ovr-sha", ""),
     }
     manifest = Manifest(
         deps=(NamedDep(name="results", constraint=">= 0.4.0"),),
@@ -404,13 +369,14 @@ def test_resolve_named_dep_with_override_skips_registry(tmp_path):
             ref="patched",
         ),),
     )
-    # Empty registry + no list_tags fake — proves the registry path
-    # is skipped entirely when an override matches.
-    fake_list_tags = lambda url: pytest.fail("list_tags should not be called when override matches")
+    fake_list_tags = lambda url: pytest.fail(
+        "list_tags should not be called when override matches"
+    )
+    reg, _ = fake_registry(fixtures)
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
         registry={},
-        fetcher=FakeFetch(fixtures),
+        fetcher=reg,
         list_tags=fake_list_tags,
     )
     results_dep = next(d for d in graph.deps if d.name == "results")
@@ -419,21 +385,14 @@ def test_resolve_named_dep_with_override_skips_registry(tmp_path):
 
 
 def test_resolve_transitive_url_dep_override(tmp_path):
-    """An override applies to transitive deps brought in by other
-    deps' nimble files — project-wide scoping. Here `app` requires
-    chronos transitively; the override redirects it to a fork."""
+    """An override applies to transitive deps brought in by other deps."""
     from milpa.manifest import Override
     fixtures = {
         ("https://example.com/app.git", "main"): (
-            "app-sha", "app-hash",
+            "app-sha",
             'srcDir = "src"\nrequires "https://upstream/chronos.git#main"\n',
         ),
-        # NOT in the table: ("https://upstream/chronos.git", "main")
-        # — if the resolver tried the upstream URL it would KeyError.
-        # The override redirects to:
-        ("https://my-fork/chronos.git", "my-fix"): (
-            "fork-sha", "fork-hash", 'srcDir = "src"\n',
-        ),
+        ("https://my-fork/chronos.git", "my-fix"): ("fork-sha", 'srcDir = "src"\n'),
     }
     manifest = Manifest(
         deps=(UrlDep(name="app",
@@ -446,9 +405,10 @@ def test_resolve_transitive_url_dep_override(tmp_path):
             ref="my-fix",
         ),),
     )
+    reg, _ = fake_registry(fixtures)
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=FakeFetch(fixtures),
+        registry={}, fetcher=reg,
     )
     chronos = next(d for d in graph.deps if d.name == "chronos")
     assert chronos.source == "https://my-fork/chronos.git"
@@ -457,27 +417,23 @@ def test_resolve_transitive_url_dep_override(tmp_path):
 
 def test_resolve_topological_order(tmp_path):
     """Dependencies appear before the packages that require them."""
-    fake = FakeFetch({
+    reg, _ = fake_registry({
         ("https://example.com/app.git", "main"): (
-            "a1", "hash_app",
+            "a1",
             'srcDir = "src"\nrequires "https://example.com/mid.git#main"\n',
         ),
         ("https://example.com/mid.git", "main"): (
-            "m1", "hash_mid",
+            "m1",
             'srcDir = "src"\nrequires "https://example.com/leaf.git#main"\n',
         ),
-        ("https://example.com/leaf.git", "main"): (
-            "l1", "hash_leaf",
-            'srcDir = "src"\n',
-        ),
+        ("https://example.com/leaf.git", "main"): ("l1", 'srcDir = "src"\n'),
     })
     manifest = Manifest(
         deps=(UrlDep(name="app", git="https://example.com/app.git", ref="main"),),
         kind="library",
     )
     graph = resolve(manifest, deps_dir=tmp_path / "_deps",
-                    registry={}, fetcher=fake)
+                    registry={}, fetcher=reg)
     names = [d.name for d in graph.deps]
-    # leaf before mid before app
     assert names.index("leaf") < names.index("mid")
     assert names.index("mid") < names.index("app")

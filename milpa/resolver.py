@@ -22,7 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import sys
 
-from .fetcher import FetchResult, fetch_url_dep
+from .fetchers import FetcherRegistry, default_registry
+from .fetchers.git import GitProvenance, GitReceipt
 from .manifest import Manifest, NamedDep, Override, UrlDep
 from .nimble_parse import NamedRequirement, UrlRequirement, parse_nimble
 from .registry import (
@@ -110,7 +111,7 @@ def resolve(
     *,
     deps_dir: Path,
     registry: dict[str, RegistryEntry],
-    fetcher: Callable[..., FetchResult] = fetch_url_dep,
+    fetcher: FetcherRegistry = default_registry,
     list_tags: Callable[[str], list[str]] = list_remote_tags,
     max_parallel: int = 8,
     strategy: Strategy = Strategy.MAXVER,
@@ -267,14 +268,19 @@ def resolve(
 def _process_url(
     dep: UrlDep,
     deps_dir: Path,
-    fetcher: Callable[..., FetchResult],
+    fetcher: FetcherRegistry,
     registry: dict[str, RegistryEntry],
     list_tags: Callable[[str], list[str]],
 ) -> tuple["_Candidate", list]:
     """Worker function: fetch + parse one URL dep. Returns the candidate
     plus the queue items its requires introduce. Thread-safe: touches no
     shared mutable state outside its own subtree of `deps_dir`."""
-    result = fetcher(dep.name, dep.git, dep.ref, deps_dir=deps_dir)
+    result = fetcher.fetch(
+        dep.name,
+        GitProvenance(url=dep.git, ref=dep.ref),
+        dest=deps_dir / dep.name,
+    )
+    sha = _commit_sha_or_none(result.receipt)
     nimble_path = _find_nimble_file(result.path, dep.name)
     nm = parse_nimble(nimble_path.read_text())
     terms, requires_names, sub_url_deps, sub_named = _build_terms(
@@ -282,7 +288,7 @@ def _process_url(
     )
     candidate = _Candidate(
         name=dep.name, version=_URL_DEP_VERSION,
-        source=dep.git, ref=dep.ref, sha=result.sha, tag=None,
+        source=dep.git, ref=dep.ref, sha=sha, tag=None,
         content_hash=result.content_hash,
         src_dir=nm.src_dir or "",
         dep_terms=terms, requires_names=requires_names,
@@ -299,7 +305,7 @@ def _process_named(
     name: str,
     constraint: str | None,
     deps_dir: Path,
-    fetcher: Callable[..., FetchResult],
+    fetcher: FetcherRegistry,
     registry: dict[str, RegistryEntry],
     list_tags: Callable[[str], list[str]],
     strategy: Strategy = Strategy.MAXVER,
@@ -310,7 +316,12 @@ def _process_named(
     r = resolve_named(name, constraint,
                       registry=registry, list_tags=list_tags,
                       strategy=str(strategy))
-    result = fetcher(name, r.url, r.tag, deps_dir=deps_dir)
+    result = fetcher.fetch(
+        name,
+        GitProvenance(url=r.url, ref=r.tag),
+        dest=deps_dir / name,
+    )
+    sha = _commit_sha_or_none(result.receipt)
     nimble_path = _find_nimble_file(result.path, name)
     nm = parse_nimble(nimble_path.read_text()) if nimble_path.exists() else None
     terms, requires_names, sub_url_deps, sub_named = (
@@ -321,7 +332,7 @@ def _process_named(
     candidate = _Candidate(
         name=name, version=ver,
         source=f"registry:{name}", ref=r.tag,
-        sha=result.sha, tag=r.tag,
+        sha=sha, tag=r.tag,
         content_hash=result.content_hash,
         src_dir=(nm.src_dir or "") if nm else "",
         dep_terms=terms, requires_names=requires_names,
@@ -365,6 +376,20 @@ def _build_terms(
             names.append(req.name)
             sub_named.append(req)
     return terms, names, sub_url, sub_named
+
+
+def _commit_sha_or_none(receipt) -> str | None:
+    """Extract commit_sha from a fetcher receipt if it's a GitReceipt.
+
+    The ResolvedDep model carries `sha` as a flat optional field for
+    historical reasons; future provenance kinds (tarball, hg, etc.)
+    will populate this slot with their own receipt's primary id, or
+    `None` once ResolvedDep migrates to carry typed receipts directly
+    (rfc-content-addressed-identity Phase D).
+    """
+    if isinstance(receipt, GitReceipt):
+        return receipt.commit_sha
+    return None
 
 
 def _name_from_url(url: str) -> str:

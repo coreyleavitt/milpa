@@ -5,7 +5,7 @@ fetched dep. Spec details — what bytes go in, in what order, with
 what mode markers — are tested here directly against synthetic trees.
 
 No git involvement. No fetcher integration. End-to-end exercise of
-the same hash through `fetch_url_dep` is covered in test_fetcher.py.
+the same hash through GitFetcher is covered in test_git_fetcher.py.
 """
 
 import os

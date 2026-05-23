@@ -9,23 +9,38 @@ from pathlib import Path
 import pytest
 
 from milpa.cli import cmd_clean, cmd_fetch, cmd_lock, cmd_show, cmd_verify
+from milpa.fetchers import FetcherRegistry
+from milpa.fetchers.git import GitProvenance, GitReceipt
 
 
 @dataclass
 class FakeFetch:
+    """Fetcher protocol implementation. Fixtures are kept as 3-tuples
+    `(sha, _legacy_content_hash, nimble_text)` for fixture-shape stability;
+    the middle field is ignored since milpa computes content_hash from
+    bytes itself via the registry.
+
+    Calling FakeFetch(by_url_ref) returns a FetcherRegistry with the
+    fake registered, so test sites read `fetcher=FakeFetch({...})`
+    unchanged."""
     by_url_ref: dict[tuple[str, str], tuple[str, str, str]]
     calls: list[tuple[str, str, str]] = field(default_factory=list)
 
-    def __call__(self, name, git, ref, *, deps_dir):
-        from milpa.fetcher import FetchResult
-        self.calls.append((name, git, ref))
-        sha, content_hash, nimble_text = self.by_url_ref[(git, ref)]
-        target = deps_dir / name
-        target.mkdir(parents=True, exist_ok=True)
-        (target / f"{name}.nimble").write_text(nimble_text)
-        return FetchResult(
-            name=name, path=target, sha=sha, content_hash=content_hash,
-        )
+    def can_handle(self, p):
+        return isinstance(p, GitProvenance)
+
+    def fetch(self, name, p, *, dest):
+        self.calls.append((name, p.url, p.ref))
+        sha, _legacy_hash, nimble_text = self.by_url_ref[(p.url, p.ref)]
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / f"{name}.nimble").write_text(nimble_text)
+        return GitReceipt(commit_sha=sha)
+
+
+def _as_registry(fake: "FakeFetch") -> FetcherRegistry:
+    reg = FetcherRegistry()
+    reg.register(fake)
+    return reg
 
 
 def _write_minimal_manifest(project_dir: Path) -> None:
@@ -49,7 +64,7 @@ def test_cmd_fetch_produces_lockfile_and_nimcfg(tmp_path):
             "abc123", "hash_foo", 'srcDir = "src"\n',
         ),
     })
-    rc = cmd_fetch(tmp_path, fetcher=fake, registry_loader=_empty_registry_loader)
+    rc = cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry_loader)
     assert rc == 0
     assert (tmp_path / "milpa.lock").exists()
     assert (tmp_path / "nim.cfg").exists()
@@ -83,7 +98,7 @@ def test_cmd_lock_writes_lockfile_but_not_nimcfg(tmp_path):
             "abc", "hash_foo", 'srcDir = "src"\n',
         ),
     })
-    rc = cmd_lock(tmp_path, fetcher=fake, registry_loader=_empty_registry_loader)
+    rc = cmd_lock(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry_loader)
     assert rc == 0
     assert (tmp_path / "milpa.lock").exists()
     assert not (tmp_path / "nim.cfg").exists()
@@ -96,7 +111,7 @@ def test_cmd_show_prints_dep_names_from_existing_lockfile(tmp_path, capsys):
             "abc", "hash_foo", 'srcDir = "src"\n',
         ),
     })
-    cmd_fetch(tmp_path, fetcher=fake, registry_loader=_empty_registry_loader)
+    cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry_loader)
     capsys.readouterr()  # drain fetch's output
 
     rc = cmd_show(tmp_path)
@@ -114,7 +129,7 @@ def test_cmd_show_labels_identity_and_provenance(tmp_path, capsys):
             "abc12345dead", "hash_foo_full_content", 'srcDir = "src"\n',
         ),
     })
-    cmd_fetch(tmp_path, fetcher=fake, registry_loader=_empty_registry_loader)
+    cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry_loader)
     capsys.readouterr()
 
     rc = cmd_show(tmp_path)
@@ -134,23 +149,28 @@ def test_cmd_show_labels_identity_and_provenance(tmp_path, capsys):
 def test_cmd_show_truncates_hashes_for_readability(tmp_path, capsys):
     """`milpa show` shows truncated hashes (8 chars). Full values
     are in milpa.lock for machine-readable consumption."""
+    from milpa.lockfile import load_lockfile
     _write_minimal_manifest(tmp_path)
-    long_content_hash = "abcdef0123456789" * 4  # 64 hex chars
     long_sha = "deadbeefcafebabe" * 2 + "abcd1234"   # 40 hex chars
     fake = FakeFetch({
         ("https://example.com/foo.git", "main"): (
-            long_sha, long_content_hash, 'srcDir = "src"\n',
+            long_sha, "ignored", 'srcDir = "src"\n',
         ),
     })
-    cmd_fetch(tmp_path, fetcher=fake, registry_loader=_empty_registry_loader)
+    cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry_loader)
+    # Read the actual content_hash milpa computed from the bytes.
+    locked = load_lockfile(tmp_path / "milpa.lock")
+    actual_hash = locked.deps[0].content_hash
+    assert actual_hash and len(actual_hash) == 64
+
     capsys.readouterr()
     cmd_show(tmp_path)
     out = capsys.readouterr().out
     # Full hashes should NOT appear in output
-    assert long_content_hash not in out
+    assert actual_hash not in out
     assert long_sha not in out
     # Prefix should appear
-    assert long_content_hash[:8] in out
+    assert actual_hash[:8] in out
     assert long_sha[:8] in out
 
 
@@ -167,7 +187,7 @@ def test_cmd_show_requires_line_present_when_dep_has_requires(tmp_path, capsys):
             "bsha", "bhash", 'srcDir = "src"\n',
         ),
     })
-    cmd_fetch(tmp_path, fetcher=fake, registry_loader=_empty_registry_loader)
+    cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry_loader)
     capsys.readouterr()
     cmd_show(tmp_path)
     out = capsys.readouterr().out
@@ -201,7 +221,7 @@ def test_cmd_show_registry_dep_shows_registry_provenance(tmp_path, capsys):
         ),
     })
     cmd_fetch(
-        tmp_path, fetcher=fake,
+        tmp_path, fetcher=_as_registry(fake),
         list_tags=lambda url: ["v0.1.0"],
         registry_loader=fake_loader,
     )
@@ -238,7 +258,7 @@ def test_cmd_clean_removes_deps_and_nimcfg_keeps_lockfile(tmp_path):
             "abc", "hash_foo", 'srcDir = "src"\n',
         ),
     })
-    cmd_fetch(tmp_path, fetcher=fake, registry_loader=_empty_registry_loader)
+    cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry_loader)
     # Sanity: all three artifacts present
     assert (tmp_path / "_deps").exists()
     assert (tmp_path / "nim.cfg").exists()
@@ -256,19 +276,13 @@ def test_cmd_clean_is_idempotent_when_nothing_to_remove(tmp_path):
     assert rc == 0
 
 
-def _fetch_with_real_hash(deps_dir, name, git, ref, nimble_text, sha="abc"):
-    """A fetcher that materializes a real dep dir + reports the
-    actually-computed content_hash. Lets verify_lockfile_against_deps
-    have something coherent to verify against."""
-    from milpa.fetcher import FetchResult
-    from milpa.identity import compute_content_hash
-    target = deps_dir / name
-    target.mkdir(parents=True, exist_ok=True)
-    (target / f"{name}.nimble").write_text(nimble_text)
-    return FetchResult(
-        name=name, path=target, sha=sha,
-        content_hash=compute_content_hash(target),
-    )
+def _verify_test_registry(nimble_text='srcDir = "src"\n', sha="abc"):
+    """Build a registry for the verify-test scenarios. Writes a synthetic
+    nimble for the canonical 'foo' dep; the registry computes content_hash
+    so the lockfile and on-disk bytes agree (verify won't flag drift)."""
+    return _as_registry(FakeFetch({
+        ("https://example.com/foo.git", "main"): (sha, "ignored", nimble_text),
+    }))
 
 
 def test_cmd_verify_clean_tree_exits_zero(tmp_path):
@@ -276,12 +290,8 @@ def test_cmd_verify_clean_tree_exits_zero(tmp_path):
     identity — verify should report no drift."""
     _write_minimal_manifest(tmp_path)
 
-    def fetcher(name, git, ref, *, deps_dir):
-        return _fetch_with_real_hash(
-            deps_dir, name, git, ref, 'srcDir = "src"\n', sha="abc123",
-        )
-
-    cmd_fetch(tmp_path, fetcher=fetcher, registry_loader=_empty_registry_loader)
+    cmd_fetch(tmp_path, fetcher=_verify_test_registry(sha="abc123"),
+              registry_loader=_empty_registry_loader)
 
     rc = cmd_verify(tmp_path)
     assert rc == 0
@@ -292,11 +302,8 @@ def test_cmd_verify_detects_tampered_file(tmp_path, capsys):
     must detect this and name the affected dep."""
     _write_minimal_manifest(tmp_path)
 
-    def fetcher(name, git, ref, *, deps_dir):
-        return _fetch_with_real_hash(
-            deps_dir, name, git, ref, 'srcDir = "src"\n',
-        )
-    cmd_fetch(tmp_path, fetcher=fetcher, registry_loader=_empty_registry_loader)
+    cmd_fetch(tmp_path, fetcher=_verify_test_registry(),
+              registry_loader=_empty_registry_loader)
     capsys.readouterr()
 
     # Tamper: append to the .nimble file
@@ -316,11 +323,8 @@ def test_cmd_verify_detects_missing_dep_directory(tmp_path, capsys):
     import shutil
     _write_minimal_manifest(tmp_path)
 
-    def fetcher(name, git, ref, *, deps_dir):
-        return _fetch_with_real_hash(
-            deps_dir, name, git, ref, 'srcDir = "src"\n',
-        )
-    cmd_fetch(tmp_path, fetcher=fetcher, registry_loader=_empty_registry_loader)
+    cmd_fetch(tmp_path, fetcher=_verify_test_registry(),
+              registry_loader=_empty_registry_loader)
     capsys.readouterr()
 
     shutil.rmtree(tmp_path / "_deps" / "foo")
@@ -338,11 +342,8 @@ def test_cmd_verify_detects_extra_dep_directory(tmp_path, capsys):
     wasn't cleaned up."""
     _write_minimal_manifest(tmp_path)
 
-    def fetcher(name, git, ref, *, deps_dir):
-        return _fetch_with_real_hash(
-            deps_dir, name, git, ref, 'srcDir = "src"\n',
-        )
-    cmd_fetch(tmp_path, fetcher=fetcher, registry_loader=_empty_registry_loader)
+    cmd_fetch(tmp_path, fetcher=_verify_test_registry(),
+              registry_loader=_empty_registry_loader)
     capsys.readouterr()
 
     # Plant a rogue dep dir
@@ -362,11 +363,8 @@ def test_cmd_verify_ignores_dotfiles_in_deps_dir(tmp_path):
     NOT flag as extra."""
     _write_minimal_manifest(tmp_path)
 
-    def fetcher(name, git, ref, *, deps_dir):
-        return _fetch_with_real_hash(
-            deps_dir, name, git, ref, 'srcDir = "src"\n',
-        )
-    cmd_fetch(tmp_path, fetcher=fetcher, registry_loader=_empty_registry_loader)
+    cmd_fetch(tmp_path, fetcher=_verify_test_registry(),
+              registry_loader=_empty_registry_loader)
 
     # Plant a dotfile (the registry cache uses this pattern)
     (tmp_path / "_deps" / ".packages_official.json").write_text("{}")
@@ -430,7 +428,7 @@ def test_cmd_fetch_loads_registry_and_resolves_named_transitive(tmp_path):
 
     rc = cmd_fetch(
         tmp_path,
-        fetcher=fake_fetch,
+        fetcher=_as_registry(fake_fetch),
         list_tags=fake_list_tags,
         registry_loader=fake_loader,
     )
@@ -459,6 +457,6 @@ def test_cmd_lock_also_loads_registry(tmp_path):
         ),
     })
 
-    rc = cmd_lock(tmp_path, fetcher=fake, registry_loader=fake_loader)
+    rc = cmd_lock(tmp_path, fetcher=_as_registry(fake), registry_loader=fake_loader)
     assert rc == 0
     assert len(loader_calls) == 1
