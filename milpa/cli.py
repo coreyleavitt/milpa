@@ -28,11 +28,12 @@ from .lockfile import (
     verify_lockfile_against_deps, verify_workspace_against_disk,
     write_lockfile,
 )
+from .frozen import NotFrozen, resolve_frozen
 from .manifest import ManifestError, load_or_discover_manifest
 from .nimcfg import write_nimcfg
 from .registry import RegistryEntry, list_remote_tags, load_registry
 from .solver import Strategy
-from .resolver import resolve, resolve_workspace
+from .resolver import ResolvedGraph, resolve, resolve_workspace
 from .workspace import workspace_containing
 
 
@@ -71,6 +72,14 @@ def make_parser() -> argparse.ArgumentParser:
             "within same major as the constraint's lower bound)"
         ),
     )
+    parser.add_argument(
+        "--frozen", action="store_true",
+        help=(
+            "fetch: require the lockfile + CAS to fully resolve the "
+            "graph with no network access; exit 1 if anything is "
+            "missing or drifted. (CI mode.)"
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
     for name, help_text in SUBCOMMAND_HELP.items():
         subparsers.add_parser(name, help=help_text)
@@ -96,6 +105,7 @@ def cmd_fetch(
     registry_loader: RegistryLoader = _default_registry_loader,
     max_parallel: int = 8,
     strategy: Strategy = Strategy.MAXVER,
+    frozen: bool = False,
 ) -> int:
     """Resolve, fetch, emit nim.cfg + milpa.lock.
 
@@ -103,6 +113,12 @@ def cmd_fetch(
     member), the workspace is resolved as a unit — shared lockfile at
     <root>/milpa.lock, per-member nim.cfgs at <root>/<member>/nim.cfg.
     Otherwise behaves as a single-project fetch.
+
+    Frozen fast path (#36): if a lockfile is present and the global CAS
+    holds every pinned identity, resolution skips fetching entirely —
+    just symlinks _deps/ into the CAS. On any precondition failure
+    (manifest drift, CAS miss, etc.), falls through to the slow path.
+    With `frozen=True`, the fall-through is an error instead.
     """
     ws = workspace_containing(project_dir)
     if ws is not None:
@@ -111,6 +127,21 @@ def cmd_fetch(
             registry_loader=registry_loader, max_parallel=max_parallel,
             strategy=strategy,
         )
+
+    frozen_result = _try_frozen(
+        project_dir, fetcher=fetcher, strategy=strategy,
+    )
+    if isinstance(frozen_result, ResolvedGraph):
+        write_nimcfg(frozen_result, project_root=project_dir)
+        print(
+            f"resolved {len(frozen_result.deps)} deps (frozen)",
+            file=sys.stderr,
+        )
+        return 0
+    if frozen:
+        print(f"frozen: {frozen_result}", file=sys.stderr)
+        return 1
+
     graph = _resolve_or_error(
         project_dir, fetcher=fetcher, list_tags=list_tags,
         registry_loader=registry_loader, max_parallel=max_parallel,
@@ -123,6 +154,36 @@ def cmd_fetch(
     write_nimcfg(graph, project_root=project_dir)
     print(f"resolved {len(graph.deps)} deps", file=sys.stderr)
     return 0
+
+
+def _try_frozen(
+    project_dir: Path,
+    *,
+    fetcher: FetcherRegistry,
+    strategy: Strategy,
+):
+    """Attempt the frozen fast path. Returns ResolvedGraph on success
+    or a NotFrozen reason (str) on failure."""
+    lockfile_path = project_dir / "milpa.lock"
+    if not lockfile_path.exists():
+        return "no lockfile"
+    if fetcher.store is None:
+        return "no CAS attached to fetcher"
+    try:
+        manifest = load_or_discover_manifest(project_dir)
+    except ManifestError:
+        return "manifest could not be loaded"
+    try:
+        lockfile = load_lockfile(lockfile_path)
+    except Exception as e:
+        return f"lockfile could not be loaded: {e}"
+    try:
+        return resolve_frozen(
+            manifest, lockfile=lockfile, deps_dir=project_dir / "_deps",
+            store=fetcher.store, strategy=strategy,
+        )
+    except NotFrozen as e:
+        return str(e)
 
 
 def _cmd_fetch_workspace(
@@ -458,6 +519,7 @@ def main(argv: list[str] | None = None) -> int:
         case "fetch":
             return cmd_fetch(
                 project_dir, max_parallel=args.parallel, strategy=strategy,
+                frozen=args.frozen,
             )
         case "lock":
             return cmd_lock(

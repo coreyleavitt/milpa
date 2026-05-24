@@ -107,6 +107,11 @@ class FetcherRegistry:
         self._fetchers: list[Fetcher] = []
         self._store = store
 
+    @property
+    def store(self) -> "CAStore | None":
+        """The CAStore this registry routes through, if any."""
+        return self._store
+
     def register(self, fetcher: Fetcher) -> None:
         self._fetchers.append(fetcher)
 
