@@ -222,6 +222,7 @@ def resolve(
     max_parallel: int = 8,
     strategy: Strategy = Strategy.MAXVER,
     prior_lockfile=None,    # Lockfile | None — pins fetched identities per-dep (#82)
+    profile=None,           # Profile | None — conditional predicate context (#26)
 ) -> ResolvedGraph:
     """Resolve `manifest` into a topologically-sorted ResolvedGraph.
 
@@ -236,6 +237,12 @@ def resolve(
     """
     deps_dir.mkdir(parents=True, exist_ok=True)
     provider = _MaterializedProvider()
+
+    # Filter conditional manifest deps by profile up-front. Deps whose
+    # predicates don't match the current Profile are dropped before
+    # BFS — they're never fetched or considered by the solver (#26).
+    if profile is not None:
+        manifest = _filter_manifest_by_profile(manifest, profile)
 
     # Build a synthetic "root" candidate that requires each manifest dep.
     root_terms: list[Term] = []
@@ -425,6 +432,7 @@ def resolve_workspace(
     max_parallel: int = 8,
     strategy: Strategy = Strategy.MAXVER,
     prior_lockfile=None,    # threaded to workers for identity-pin enforcement (#82)
+    profile=None,           # conditional-predicate context (#26) — per-member filtering
 ) -> ResolvedGraph:
     """Resolve every member's deps into one shared global graph.
 
@@ -690,6 +698,80 @@ def _item_targets_member(item, members_by_name: dict) -> bool:
     if item[0] == "url":
         return item[1].name in members_by_name
     return False
+
+
+def _filter_manifest_by_profile(manifest: Manifest, profile) -> Manifest:
+    """Drop deps whose predicates don't match `profile`. Returns a new
+    Manifest with the filtered deps tuple."""
+    from dataclasses import replace as dc_replace
+    kept = tuple(
+        d for d in manifest.deps
+        if _dep_matches_profile(d, profile)
+    )
+    if len(kept) == len(manifest.deps):
+        return manifest
+    return dc_replace(manifest, deps=kept)
+
+
+def _dep_matches_profile(dep, profile) -> bool:
+    """True if every predicate on the dep matches the profile."""
+    preds = getattr(dep, "predicates", ())
+    for p in preds:
+        if not _predicate_satisfied(p, profile):
+            return False
+    return True
+
+
+def _predicate_satisfied(pred, profile) -> bool:
+    """Evaluate a single Predicate against the profile.
+
+    For version-style predicates (nim, milpa), the value may be either
+    an exact version literal (\"2.0\") or a constraint string
+    (\">=2.0\"). For string predicates (platform, arch), exact equality."""
+    actual = getattr(profile, pred.name, None)
+    if actual is None:
+        return False
+    if pred.name in ("nim", "milpa") and _looks_like_constraint(pred.value):
+        matches = _version_satisfies(actual, pred.value)
+    else:
+        matches = (actual == pred.value)
+    return (not matches) if pred.negated else matches
+
+
+def _looks_like_constraint(s: str) -> bool:
+    """A constraint string starts with a comparison operator."""
+    return s.startswith((">=", "<=", ">", "<", "==", "!=", "~", "^"))
+
+
+def _version_satisfies(actual: str, constraint: str) -> bool:
+    """Check `actual` (a semver string) against a constraint like
+    \">=2.0\" using the existing VersionSet algebra. Short versions
+    (\"2.0\") in the constraint are normalized to full triples
+    (\"2.0.0\") since VersionSet only accepts complete versions."""
+    parts = actual.split(".")
+    triple = tuple(int(x) for x in parts[:3]) + (0,) * (3 - len(parts[:3]))
+    try:
+        vset = VersionSet.from_constraint(_normalize_constraint(constraint))
+    except Exception:
+        return False
+    return vset.contains(triple)
+
+
+def _normalize_constraint(s: str) -> str:
+    """Normalize a user-written predicate constraint for VersionSet:
+      - insert a space after the comparison operator
+      - expand short version literals to full triples
+    \">=2.0\" → \">= 2.0.0\"."""
+    import re
+    # Operator + immediately-attached version → operator + space + version
+    s = re.sub(r"^(>=|<=|==|!=|>|<|~|\^)\s*", r"\1 ", s)
+    # Expand short versions
+    def expand(m):
+        digits = [int(x) for x in m.group(0).split(".")]
+        while len(digits) < 3:
+            digits.append(0)
+        return ".".join(str(x) for x in digits)
+    return re.sub(r"\d+(?:\.\d+){0,2}", expand, s)
 
 
 def _pin_for_url_dep(dep: UrlDep, prior_lockfile) -> str | None:

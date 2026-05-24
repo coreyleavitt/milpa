@@ -47,16 +47,28 @@ _URL_SCHEMES = ("http://", "https://", "ssh://", "git://", "file://")
 _REQUIRES_RE = re.compile(r"^\s*requires\s+(.*)$")
 _SRCDIR_RE = re.compile(r'^\s*srcDir\s*=\s*"?([^"\s]+)"?\s*$')
 _QUOTED_RE = re.compile(r'"([^"]*)"')
+_WHEN_RE = re.compile(r"^\s*when\b")
 
 
 def parse_nimble(text: str) -> NimbleManifest:
-    """Parse a .nimble file's text into a typed NimbleManifest."""
+    """Parse a .nimble file's text into a typed NimbleManifest.
+
+    nimscript `when` blocks are not evaluated (the language is
+    Turing-complete; we don't run arbitrary code at resolve time).
+    If any `when` is detected, we emit a warning and conservatively
+    include every `requires` we find — over-including is harmless to
+    the resolver, under-including would silently break the build.
+    See #26 Part B."""
+    import warnings as _warnings
     specs: list[str] = []
     src_dir: str | None = None
+    has_when = False
     lines = text.splitlines()
     i = 0
     while i < len(lines):
         line = _strip_comment(lines[i])
+        if _WHEN_RE.match(line):
+            has_when = True
         # Try srcDir first — single-line, simple regex.
         srcdir_match = _SRCDIR_RE.match(line)
         if srcdir_match:
@@ -74,6 +86,15 @@ def parse_nimble(text: str) -> NimbleManifest:
                 tail = tail + " " + _strip_comment(lines[i]).strip()
             specs.extend(_QUOTED_RE.findall(tail))
         i += 1
+    if has_when:
+        _warnings.warn(
+            ".nimble contains `when` block(s); milpa does not evaluate "
+            "nimscript, so all `requires` are included unconditionally. "
+            "If this over-includes, consider expressing the conditionality "
+            "in milpa.kdl with platform=/nim= predicates (#26).",
+            UserWarning,
+            stacklevel=2,
+        )
     requires = tuple(_parse_spec(s) for s in specs)
     return NimbleManifest(requires=requires, src_dir=src_dir)
 

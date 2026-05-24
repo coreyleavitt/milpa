@@ -26,11 +26,21 @@ Kind = Literal["library", "application"]
 
 
 @dataclass(frozen=True)
+class Predicate:
+    """One conditional clause on a dep. `negated=True` represents the
+    KDL `(not)` type annotation on the value."""
+    name: str       # one of: platform, arch, nim, milpa
+    value: str
+    negated: bool = False
+
+
+@dataclass(frozen=True)
 class UrlDep:
     name: str
     git: str
     ref: str
     mirrors: tuple[str, ...] = ()    # fall-back URLs tried in order (#37)
+    predicates: tuple[Predicate, ...] = ()    # conditional gates (#26)
 
 
 @dataclass(frozen=True)
@@ -159,7 +169,8 @@ class ManifestError(Exception):
 # for humans. Drift between the two is checked indirectly via tests against
 # example manifests.
 _PACKAGE_TOP_LEVEL = frozenset({"deps", "kind", "overrides", "name", "src_dir"})
-_URL_DEP_PROPS = frozenset({"git", "ref"})
+_PREDICATE_PROPS = frozenset({"platform", "arch", "nim", "milpa"})
+_URL_DEP_PROPS = frozenset({"git", "ref"}) | _PREDICATE_PROPS
 _VALID_KINDS: tuple[Kind, ...] = ("library", "application")
 _VALID_GIT_SCHEMES = frozenset({"https", "http", "ssh", "git"})
 
@@ -283,19 +294,13 @@ def _parse_manifest_doc(doc) -> Manifest:
             continue
         if node.name == "deps":
             for child in node.nodes:
-                dep = _parse_dep(child)
-                # Dedup key is the resolved dep's `name`, NOT the child
-                # node's name — `member "intonaco"` and `intonaco git=...`
-                # both produce a dep named 'intonaco' and conflict; two
-                # member deps in one block under the same KDL node name
-                # 'member' would otherwise pass the parent-node check
-                # while colliding on the resolved name.
-                if dep.name in seen_names:
-                    raise ManifestError(
-                        f"duplicate dep {dep.name!r} in manifest"
-                    )
-                seen_names.add(dep.name)
-                deps.append(dep)
+                for dep in _expand_dep_child(child, inherited_preds=()):
+                    if dep.name in seen_names:
+                        raise ManifestError(
+                            f"duplicate dep {dep.name!r} in manifest"
+                        )
+                    seen_names.add(dep.name)
+                    deps.append(dep)
         elif node.name == "kind":
             kind = _parse_kind(node)
         elif node.name == "overrides":
@@ -397,6 +402,11 @@ def _format_dep_line(dep: Dep) -> str:
             f'    {_quote_name(dep.name)} '
             f'git=(url)"{dep.git}" ref="{dep.ref}"'
         )
+        for pred in dep.predicates:
+            if pred.negated:
+                head += f' {pred.name}=(not)"{pred.value}"'
+            else:
+                head += f' {pred.name}="{pred.value}"'
         if not dep.mirrors:
             return head
         lines = [head + " {"]
@@ -491,7 +501,70 @@ def _parse_url_dep(node: kdl.Node) -> UrlDep:
     git = git_raw.geturl() if isinstance(git_raw, ParseResult) else git_raw
     _validate_git_url(name, git)
     mirrors = _parse_mirrors(name, node)
-    return UrlDep(name=name, git=git, ref=node.props["ref"], mirrors=mirrors)
+    predicates = _parse_predicates(name, node)
+    return UrlDep(
+        name=name, git=git, ref=node.props["ref"],
+        mirrors=mirrors, predicates=predicates,
+    )
+
+
+def _expand_dep_child(child: kdl.Node, *, inherited_preds: tuple[Predicate, ...]):
+    """Yield one or more Dep values from a child of the `deps {}` block.
+
+    A plain dep node yields itself (with inherited predicates appended).
+    A `when` block yields each of its children with the block's
+    predicates added to those inherited from any outer context.
+    Block + inline predicates compose with AND."""
+    if child.name == "when":
+        block_preds = _parse_predicates_from_props(
+            "<when block>", child.props,
+        )
+        all_preds = inherited_preds + block_preds
+        for grandchild in child.nodes:
+            yield from _expand_dep_child(grandchild, inherited_preds=all_preds)
+        return
+    dep = _parse_dep(child)
+    if inherited_preds and isinstance(dep, UrlDep):
+        from dataclasses import replace as dc_replace
+        dep = dc_replace(dep, predicates=inherited_preds + dep.predicates)
+    yield dep
+
+
+def _parse_predicates_from_props(
+    context: str, props,
+) -> tuple[Predicate, ...]:
+    """Shared predicate parser — works on a kdl.Node's props OR any
+    mapping. Used by both inline dep predicates and when blocks."""
+    preds: list[Predicate] = []
+    for key, val in props.items():
+        if key not in _PREDICATE_PROPS:
+            raise ManifestError(
+                f"{context}: unknown predicate {key!r} "
+                f"(allowed: {', '.join(sorted(_PREDICATE_PROPS))})"
+            )
+        tag = getattr(val, "tag", None)
+        actual = getattr(val, "value", val)
+        if not isinstance(actual, str):
+            raise ManifestError(
+                f"{context}: predicate {key!r} value must be a string"
+            )
+        negated = (tag == "not")
+        if tag is not None and not negated:
+            raise ManifestError(
+                f"{context}: predicate {key!r} unsupported "
+                f"type annotation ({tag!r}); only (not) is recognized"
+            )
+        preds.append(Predicate(name=key, value=actual, negated=negated))
+    return tuple(preds)
+
+
+def _parse_predicates(dep_name: str, node: kdl.Node) -> tuple[Predicate, ...]:
+    """Extract predicate props from a UrlDep node. Predicates are the
+    subset of props whose names are in _PREDICATE_PROPS; non-predicate
+    props (git, ref) are silently ignored here (they're handled
+    separately)."""
+    pred_props = {k: v for k, v in node.props.items() if k in _PREDICATE_PROPS}
+    return _parse_predicates_from_props(f"dep {dep_name!r}", pred_props)
 
 
 def _parse_mirrors(dep_name: str, node: kdl.Node) -> tuple[str, ...]:

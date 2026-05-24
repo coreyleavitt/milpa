@@ -117,6 +117,7 @@ def apply_manifest_change_with_resolve(
     cmd_update, etc.
     """
     from .lockfile import from_graph, load_lockfile, write_lockfile
+    from .profile import Profile
     from .resolver import resolve
 
     if pre_resolve_validate is not None:
@@ -148,6 +149,7 @@ def apply_manifest_change_with_resolve(
         list_tags=list_tags,
         strategy=strategy,
         prior_lockfile=prior_lockfile,
+        profile=Profile.from_environment(),
     )
     new_lockfile = from_graph(graph, strategy=str(strategy))
 

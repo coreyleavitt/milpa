@@ -29,6 +29,7 @@ from .lockfile import (
     write_lockfile,
 )
 from .frozen import NotFrozen, resolve_frozen
+from .profile import Profile
 from .manifest import (
     LocalDep, ManifestError, MemberDep, NamedDep, TarballDep, UrlDep,
     load_or_discover_manifest,
@@ -229,6 +230,7 @@ def _cmd_fetch_workspace(
         print(f"failed to load registry: {e}", file=sys.stderr)
         return 1
     prior_lockfile = _maybe_load_prior_lockfile(ws.root / "milpa.lock")
+    profile = Profile.from_environment()
     try:
         graph = resolve_workspace(
             ws, deps_dir=deps_dir,
@@ -236,6 +238,7 @@ def _cmd_fetch_workspace(
             list_tags=list_tags, max_parallel=max_parallel,
             strategy=strategy,
             prior_lockfile=prior_lockfile,
+            profile=profile,
         )
     except Exception as e:
         print(f"workspace resolution failed: {e}", file=sys.stderr)
@@ -777,6 +780,7 @@ def _resolve_or_error(
         print(f"failed to load registry: {e}", file=sys.stderr)
         return 1
     prior_lockfile = _maybe_load_prior_lockfile(project_dir / "milpa.lock")
+    profile = Profile.from_environment()
     try:
         return resolve(
             manifest,
@@ -787,6 +791,7 @@ def _resolve_or_error(
             max_parallel=max_parallel,
             strategy=strategy,
             prior_lockfile=prior_lockfile,
+            profile=profile,
         )
     except Exception as e:
         print(f"resolution failed: {e}", file=sys.stderr)
