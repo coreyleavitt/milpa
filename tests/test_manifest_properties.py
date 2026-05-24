@@ -119,3 +119,15 @@ def test_manifest_format_parse_round_trip(m):
     """parse(format(M)) == M for any valid Manifest."""
     text = format_manifest(m)
     assert parse_manifest(text) == m
+
+
+@given(manifests())
+def test_manifest_format_is_idempotent(m):
+    """format(parse(format(M))) is BYTE-IDENTICAL to format(M).
+
+    Once a manifest has been rewritten by milpa, subsequent rewrites
+    produce no diff. Bounds the "first write reformats the file" CI
+    noise (#15) — a second invocation is a no-op write."""
+    text1 = format_manifest(m)
+    text2 = format_manifest(parse_manifest(text1))
+    assert text1 == text2
