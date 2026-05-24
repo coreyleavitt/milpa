@@ -28,7 +28,7 @@ from .lockfile import (
     verify_lockfile_against_deps, verify_workspace_against_disk,
     write_lockfile,
 )
-from .frozen import NotFrozen, resolve_frozen
+from .frozen import NotFrozen, resolve_frozen, resolve_workspace_frozen
 from .profile import Profile
 from .manifest import (
     LocalDep, ManifestError, MemberDep, NamedDep, TarballDep, UrlDep,
@@ -167,7 +167,7 @@ def cmd_fetch(
         return _cmd_fetch_workspace(
             ws, fetcher=fetcher, list_tags=list_tags,
             registry_loader=registry_loader, max_parallel=max_parallel,
-            strategy=strategy,
+            strategy=strategy, frozen=frozen,
         )
 
     frozen_result = _try_frozen(
@@ -228,6 +228,32 @@ def _try_frozen(
         return str(e)
 
 
+def _try_workspace_frozen(
+    ws,
+    *,
+    fetcher: FetcherRegistry,
+    strategy: Strategy,
+):
+    """Workspace analog of _try_frozen. Returns ResolvedGraph on success
+    or a NotFrozen reason (str) on failure (#78)."""
+    lockfile_path = ws.root / "milpa.lock"
+    if not lockfile_path.exists():
+        return "no lockfile"
+    if fetcher.store is None:
+        return "no CAS attached to fetcher"
+    try:
+        lockfile = load_lockfile(lockfile_path)
+    except Exception as e:
+        return f"lockfile could not be loaded: {e}"
+    try:
+        return resolve_workspace_frozen(
+            ws, lockfile=lockfile, deps_dir=ws.root / "_deps",
+            store=fetcher.store, strategy=strategy,
+        )
+    except NotFrozen as e:
+        return str(e)
+
+
 def _cmd_fetch_workspace(
     ws,  # Workspace
     *,
@@ -236,8 +262,27 @@ def _cmd_fetch_workspace(
     registry_loader: RegistryLoader,
     max_parallel: int,
     strategy: Strategy,
+    frozen: bool = False,
 ) -> int:
     deps_dir = ws.root / "_deps"
+
+    # Try workspace frozen fast path before any registry / fetch work (#78).
+    frozen_result = _try_workspace_frozen(
+        ws, fetcher=fetcher, strategy=strategy,
+    )
+    if isinstance(frozen_result, ResolvedGraph):
+        written = write_workspace_nimcfgs(ws, frozen_result)
+        print(
+            f"resolved {len(frozen_result.deps)} deps across "
+            f"{len(ws.members)} members (frozen); "
+            f"emitted {len(written)} nim.cfg(s)",
+            file=sys.stderr,
+        )
+        return 0
+    if frozen:
+        print(f"frozen: {frozen_result}", file=sys.stderr)
+        return 1
+
     cache_path = deps_dir / ".packages_official.json"
     try:
         registry = registry_loader(cache_path=cache_path)

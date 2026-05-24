@@ -40,59 +40,148 @@ def resolve_frozen(
     No network, no fetcher invocation. Raises NotFrozen with a
     specific reason if any precondition fails.
     """
+    _check_strategy(strategy, lockfile)
+    locked_by_name = {d.name: d for d in lockfile.deps}
+    _check_manifest_alignment(
+        manifest, locked_by_name, context_prefix="",
+    )
+
+    deps_dir.mkdir(parents=True, exist_ok=True)
+    resolved: list[ResolvedDep] = []
+    for locked in lockfile.deps:
+        # In single-package mode, MemberProvenance / LocalProvenance are
+        # both "editable, always re-resolve."
+        first = locked.provenances[0] if locked.provenances else None
+        if isinstance(first, MemberProvenanceRecord):
+            raise NotFrozen(
+                f"dep {locked.name!r} is a workspace member — "
+                f"members always re-resolve"
+            )
+        if isinstance(first, LocalProvenanceRecord):
+            raise NotFrozen(
+                f"dep {locked.name!r} has a local provenance — "
+                f"editable trees always re-resolve"
+            )
+        _link_external(locked, deps_dir, store)
+        resolved.append(_resolved_from_locked(locked))
+    return ResolvedGraph(deps=tuple(resolved))
+
+
+def resolve_workspace_frozen(
+    workspace,
+    *,
+    lockfile: Lockfile,
+    deps_dir: Path,
+    store: CAStore,
+    strategy: Strategy = Strategy.MAXVER,
+) -> ResolvedGraph:
+    """Workspace analog of resolve_frozen (#78).
+
+    External deps come from the CAS (symlinked into deps_dir/<name>);
+    members are verified against their on-disk content_hash and stay
+    in their declared workspace locations (no symlink under _deps/).
+
+    NotFrozen reasons: strategy mismatch, member identity drift,
+    member-removed-from-workspace, manifest-vs-lockfile drift,
+    external CAS miss, or any non-member LocalProvenanceRecord (those
+    are always editable and re-resolve)."""
+    from .identity import compute_content_hash as _compute_hash
+
+    _check_strategy(strategy, lockfile)
+    locked_by_name = {d.name: d for d in lockfile.deps}
+    members_by_name = {m.name: m for m in workspace.members}
+
+    for member in workspace.members:
+        _check_manifest_alignment(
+            member.manifest, locked_by_name,
+            context_prefix=f"member {member.name!r}: ",
+        )
+
+    deps_dir.mkdir(parents=True, exist_ok=True)
+    resolved: list[ResolvedDep] = []
+    for locked in lockfile.deps:
+        first = locked.provenances[0] if locked.provenances else None
+
+        if isinstance(first, MemberProvenanceRecord):
+            member = members_by_name.get(first.name)
+            if member is None:
+                raise NotFrozen(
+                    f"lockfile references workspace member "
+                    f"{first.name!r} that is not in the current "
+                    f"workspace"
+                )
+            actual = _compute_hash(member.directory)
+            if actual != locked.identity:
+                raise NotFrozen(
+                    f"member {first.name!r}: on-disk identity "
+                    f"{actual[:23]}... differs from lockfile pin "
+                    f"{(locked.identity or '<none>')[:23]}..."
+                )
+            resolved.append(_resolved_from_locked(locked))
+            continue
+
+        if isinstance(first, LocalProvenanceRecord):
+            raise NotFrozen(
+                f"dep {locked.name!r} has a local provenance — "
+                f"editable trees always re-resolve"
+            )
+
+        _link_external(locked, deps_dir, store)
+        resolved.append(_resolved_from_locked(locked))
+
+    return ResolvedGraph(deps=tuple(resolved))
+
+
+# ---------------------------------------------------------------------------
+# Shared frozen-precondition helpers
+# ---------------------------------------------------------------------------
+
+
+def _check_strategy(strategy: Strategy, lockfile: Lockfile) -> None:
     if str(strategy) != lockfile.strategy:
         raise NotFrozen(
             f"strategy mismatch: lockfile built with "
             f"{lockfile.strategy!r}, requested {str(strategy)!r}"
         )
-    # Every manifest dep must have a lockfile entry — else the user
-    # added something they haven't locked yet.
-    locked_by_name = {d.name: d for d in lockfile.deps}
+
+
+def _check_manifest_alignment(
+    manifest: Manifest,
+    locked_by_name: dict,
+    *,
+    context_prefix: str,
+) -> None:
+    """Every manifest dep must have a lockfile entry; NamedDep
+    constraints must still be satisfied by the locked version.
+    `context_prefix` is prepended to error messages so workspace
+    failures name the offending member."""
     for mdep in manifest.deps:
         if mdep.name not in locked_by_name:
             raise NotFrozen(
-                f"manifest dep {mdep.name!r} has no lockfile entry "
-                f"(re-run `milpa lock`)"
+                f"{context_prefix}manifest dep {mdep.name!r} has no "
+                f"lockfile entry (re-run `milpa fetch`)"
             )
-        # Strict constraint re-check: if the manifest tightened a
-        # NamedDep constraint, the locked version may no longer satisfy
-        # it. Forcing a re-resolve preserves correctness when the user
-        # edits constraints without re-locking.
         if isinstance(mdep, NamedDep) and mdep.constraint:
             locked = locked_by_name[mdep.name]
             locked_version = _parse_version(locked.version)
             vset = VersionSet.from_constraint(mdep.constraint)
             if not vset.contains(locked_version):
                 raise NotFrozen(
-                    f"dep {mdep.name!r}: locked version "
-                    f"{locked.version} no longer satisfies manifest "
-                    f"constraint {mdep.constraint!r}"
+                    f"{context_prefix}dep {mdep.name!r}: locked "
+                    f"version {locked.version} no longer satisfies "
+                    f"manifest constraint {mdep.constraint!r}"
                 )
 
-    deps_dir.mkdir(parents=True, exist_ok=True)
-    resolved: list[ResolvedDep] = []
-    for locked in lockfile.deps:
-        # Editable sources (local paths, workspace members) can change
-        # between runs — never serve them from CAS even if identity hits.
-        for p in locked.provenances:
-            if isinstance(p, LocalProvenanceRecord):
-                raise NotFrozen(
-                    f"dep {locked.name!r} has a local provenance — "
-                    f"editable trees always re-resolve"
-                )
-            if isinstance(p, MemberProvenanceRecord):
-                raise NotFrozen(
-                    f"dep {locked.name!r} is a workspace member — "
-                    f"members always re-resolve"
-                )
-        if not locked.identity or not store.contains(locked.identity):
-            raise NotFrozen(
-                f"dep {locked.name!r} identity "
-                f"{(locked.identity or '<none>')[:23]}... not in store"
-            )
-        store.link(locked.identity, deps_dir / locked.name)
-        resolved.append(_resolved_from_locked(locked))
-    return ResolvedGraph(deps=tuple(resolved))
+
+def _link_external(locked, deps_dir: Path, store: CAStore) -> None:
+    """Link an external (CAS-resident) dep into deps_dir. Raises
+    NotFrozen if its identity isn't in the store."""
+    if not locked.identity or not store.contains(locked.identity):
+        raise NotFrozen(
+            f"dep {locked.name!r} identity "
+            f"{(locked.identity or '<none>')[:23]}... not in store"
+        )
+    store.link(locked.identity, deps_dir / locked.name)
 
 
 def _resolved_from_locked(locked) -> ResolvedDep:
