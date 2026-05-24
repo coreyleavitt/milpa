@@ -68,8 +68,10 @@ def test_registry_dispatches_to_git_fetcher_end_to_end(tmp_path):
     assert result.path == deps_dir / "myrepo"
     assert (result.path / "hello.txt").read_text() == "hello world\n"
     # Identity: 64 hex chars (sha256 of source tree)
-    assert len(result.content_hash) == 64
-    assert all(c in "0123456789abcdef" for c in result.content_hash)
+    # Multihash form: "sha256:" + 64 hex chars
+    assert result.content_hash.startswith("sha256:")
+    assert len(result.content_hash) == len("sha256:") + 64
+    assert all(c in "0123456789abcdef" for c in result.content_hash.split(":", 1)[1])
     # Receipt: transport-specific provenance record
     assert isinstance(result.receipt, GitReceipt)
     assert len(result.receipt.commit_sha) == 40

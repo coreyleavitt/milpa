@@ -160,18 +160,21 @@ def test_cmd_show_truncates_hashes_for_readability(tmp_path, capsys):
     })
     cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry_loader)
     # Read the actual content_hash milpa computed from the bytes.
+    # Multihash form (#34) — `sha256:` + 64-char digest.
     locked = load_lockfile(tmp_path / "milpa.lock")
     actual_hash = locked.deps[0].content_hash
-    assert actual_hash and len(actual_hash) == 64
+    assert actual_hash and actual_hash.startswith("sha256:")
+    actual_digest = actual_hash.split(":", 1)[1]
+    assert len(actual_digest) == 64
 
     capsys.readouterr()
     cmd_show(tmp_path)
     out = capsys.readouterr().out
     # Full hashes should NOT appear in output
-    assert actual_hash not in out
+    assert actual_digest not in out
     assert long_sha not in out
-    # Prefix should appear
-    assert actual_hash[:8] in out
+    # 8-char digest prefix shown (after the `sha256:` algorithm tag)
+    assert actual_digest[:8] in out
     assert long_sha[:8] in out
 
 

@@ -75,7 +75,8 @@ def test_resolve_single_url_dep_no_transitive(tmp_path):
     assert graph.deps[0].sha == "aaa111"
     # content_hash is now milpa-computed from the dest tree; only assert shape
     assert graph.deps[0].content_hash is not None
-    assert len(graph.deps[0].content_hash) == 64
+    assert graph.deps[0].content_hash.startswith("sha256:")
+    assert len(graph.deps[0].content_hash) == len("sha256:") + 64
     assert graph.deps[0].src_dir == "src"
 
 
@@ -446,7 +447,8 @@ def test_resolve_local_dep_uses_default_local_fetcher(tmp_path):
     assert d.sha is None
     assert d.tag is None
     assert d.content_hash is not None
-    assert len(d.content_hash) == 64
+    assert d.content_hash.startswith("sha256:")
+    assert len(d.content_hash) == len("sha256:") + 64
     # Source bytes copied into _deps
     assert (project / "_deps" / "intonaco" / "intonaco.nimble").exists()
 
@@ -549,7 +551,8 @@ def test_resolve_tarball_dep_via_default_registry(tmp_path):
     assert d.sha is None
     assert d.tag is None
     assert d.content_hash is not None
-    assert len(d.content_hash) == 64
+    assert d.content_hash.startswith("sha256:")
+    assert len(d.content_hash) == len("sha256:") + 64
 
 
 def test_resolve_topological_order(tmp_path):

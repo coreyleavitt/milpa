@@ -49,8 +49,10 @@ def test_local_fetcher_copies_source_tree_and_returns_receipt(tmp_path):
     assert (dest / "src" / "intonaco.nim").read_text() == '# stub\n'
 
     # Identity computed by registry (64-hex sha256)
-    assert len(result.content_hash) == 64
-    assert all(c in "0123456789abcdef" for c in result.content_hash)
+    # Multihash form: "sha256:" + 64 hex chars
+    assert result.content_hash.startswith("sha256:")
+    assert len(result.content_hash) == len("sha256:") + 64
+    assert all(c in "0123456789abcdef" for c in result.content_hash.split(":", 1)[1])
 
     # Receipt records where we copied from
     assert isinstance(result.receipt, LocalReceipt)

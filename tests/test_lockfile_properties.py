@@ -61,6 +61,11 @@ def hex_strings(length):
     return st.text(alphabet="0123456789abcdef", min_size=length, max_size=length)
 
 
+def multihash_identities():
+    """Multihash-encoded identity strings — `sha256:<64-hex>` (#34)."""
+    return st.builds(lambda h: f"sha256:{h}", hex_strings(64))
+
+
 def version_triples():
     """`<major>.<minor>.<patch>` strings."""
     return st.builds(
@@ -81,7 +86,7 @@ def locked_deps(draw, allowed_requires_names=None):
         ref=draw(st.one_of(st.none(), names())),
         tag=draw(st.one_of(st.none(), names())),
         sha=draw(st.one_of(st.none(), hex_strings(40))),
-        content_hash=draw(st.one_of(st.none(), hex_strings(64))),
+        content_hash=draw(st.one_of(st.none(), multihash_identities())),
         version=draw(version_triples()),
         src_dir=draw(st.text(alphabet=_NAME_ALPHABET, max_size=20)),
         requires=tuple(draw(st.lists(
@@ -117,7 +122,7 @@ def lockfiles(draw):
             ref=draw(st.one_of(st.none(), names())),
             tag=draw(st.one_of(st.none(), names())),
             sha=draw(st.one_of(st.none(), hex_strings(40))),
-            content_hash=draw(st.one_of(st.none(), hex_strings(64))),
+            content_hash=draw(st.one_of(st.none(), multihash_identities())),
             version=draw(version_triples()),
             src_dir=draw(st.text(alphabet=_NAME_ALPHABET, max_size=20)),
             requires=tuple(draw(st.lists(

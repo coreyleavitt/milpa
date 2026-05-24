@@ -107,7 +107,9 @@ def test_symlink_pointing_outside_tree_does_not_crash(tmp_path):
     a = tmp_path / "a"
     a.mkdir()
     (a / "broken").symlink_to("/nonexistent/elsewhere")
-    # No crash; produces a valid hash
+    # No crash; produces a valid multihash-encoded identity
     h = compute_content_hash(a)
-    assert len(h) == 64
-    assert all(c in "0123456789abcdef" for c in h)
+    assert h.startswith("sha256:")
+    digest = h.split(":", 1)[1]
+    assert len(digest) == 64
+    assert all(c in "0123456789abcdef" for c in digest)

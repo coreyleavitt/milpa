@@ -93,7 +93,8 @@ def test_resolve_workspace_single_member_no_deps(tmp_path):
     assert d.sha is None
     assert d.tag is None
     assert d.content_hash is not None
-    assert len(d.content_hash) == 64
+    assert d.content_hash.startswith("sha256:")
+    assert len(d.content_hash) == len("sha256:") + 64
     assert d.requires == ()
 
 

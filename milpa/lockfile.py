@@ -29,7 +29,7 @@ from pathlib import Path
 
 import kdl
 
-from .identity import compute_content_hash
+from .identity import IdentityError, compute_content_hash, parse_identity
 from .resolver import ResolvedDep, ResolvedGraph
 
 
@@ -156,9 +156,17 @@ def _parse_dep(node: kdl.Node) -> LockedDep:
                 f"dep {name!r} field {child.name!r} must have exactly one value"
             )
         fields[child.name] = child.args[0]
+    # content_hash is multihash-encoded (#34) — already in `sha256:<hex>`
+    # form. Validate via parse_identity at load time so an unsupported
+    # algorithm (e.g. md5:) fails loudly here, not deep in verify.
     content_hash = fields.get("content_hash")
-    if isinstance(content_hash, str) and content_hash.startswith("sha256:"):
-        content_hash = content_hash[len("sha256:"):]
+    if isinstance(content_hash, str):
+        try:
+            content_hash = parse_identity(content_hash)
+        except IdentityError as e:
+            raise LockfileError(
+                f"dep {name!r}: invalid content_hash — {e}"
+            ) from e
     return LockedDep(
         name=name,
         source=fields.get("source", ""),
@@ -203,7 +211,8 @@ def format_lockfile(lockfile: Lockfile) -> str:
         if dep.sha is not None:
             lines.append(f'    sha "{dep.sha}"')
         if dep.content_hash is not None:
-            lines.append(f'    content_hash "sha256:{dep.content_hash}"')
+            # content_hash is already multihash-encoded (#34) — emit as-is
+            lines.append(f'    content_hash "{dep.content_hash}"')
         lines.append(f'    version "{dep.version}"')
         lines.append(f'    src_dir "{dep.src_dir}"')
         if dep.requires:
@@ -321,8 +330,8 @@ def verify_lockfile_against_deps(
         if expected != actual:
             divergences.append(
                 f"{name}: content_hash mismatch — "
-                f"lockfile says sha256:{(expected or '<none>')[:16]}..., "
-                f"actual sha256:{actual[:16]}..."
+                f"lockfile says {(expected or '<none>')[:23]}..., "
+                f"actual {actual[:23]}..."
             )
 
     # Extra: anything in _deps/ that isn't a locked name (skip dotfiles).
@@ -387,7 +396,7 @@ def verify_workspace_against_disk(
         if locked.content_hash != actual:
             divergences.append(
                 f"{locked.name}: content_hash mismatch — "
-                f"lockfile says sha256:{(locked.content_hash or '<none>')[:16]}..., "
-                f"actual sha256:{actual[:16]}..."
+                f"lockfile says {(locked.content_hash or '<none>')[:23]}..., "
+                f"actual {actual[:23]}..."
             )
     return divergences

@@ -18,9 +18,17 @@ from milpa.lockfile import (
 from milpa.resolver import ResolvedDep, ResolvedGraph
 
 
+# A canonical valid multihash identity; tests that don't care about
+# the actual hash bytes use this. Real fetches produce a real digest
+# via compute_content_hash.
+_VALID_HASH = "sha256:" + "f" * 64
+
+
 def _dep(name, *, source="https://example.com/x.git", ref="main",
-         tag=None, sha="abc123", content_hash="hash_x",
+         tag=None, sha="abc123", content_hash=None,
          version=(0, 0, 1), src_dir="src", requires=()):
+    if content_hash is None:
+        content_hash = _VALID_HASH
     return ResolvedDep(
         name=name, source=source, ref=ref, tag=tag, sha=sha,
         version=version, content_hash=content_hash,
@@ -54,18 +62,19 @@ def test_format_lockfile_deps_sorted_by_name_regardless_of_graph_order():
 
 
 def test_parse_lockfile_reads_single_dep():
-    text = '''// header
+    canonical_hash = "sha256:" + "d" * 64
+    text = f'''// header
 version 1
 
-dep "chronos" {
+dep "chronos" {{
     source "https://example.com/chronos.git"
     ref "main"
     sha "abc123"
-    content_hash "sha256:deadbeef"
+    content_hash "{canonical_hash}"
     version "0.0.1"
     src_dir ""
     requires
-}
+}}
 '''
     lockfile = parse_lockfile(text)
     assert lockfile.version == 1
@@ -75,7 +84,9 @@ dep "chronos" {
     assert dep.source == "https://example.com/chronos.git"
     assert dep.ref == "main"
     assert dep.sha == "abc123"
-    assert dep.content_hash == "deadbeef"     # algorithm prefix stripped
+    # content_hash preserved in canonical multihash form (#34) —
+    # no longer stripped at parse time
+    assert dep.content_hash == canonical_hash
     assert dep.version == "0.0.1"
     assert dep.src_dir == ""
     assert dep.requires == ()
@@ -91,7 +102,7 @@ def test_lockfile_format_emits_tag_field_when_present():
         version=1,
         deps=(LockedDep(
             name="foo", source="registry:foo", ref="v0.5.1", tag="v0.5.1",
-            sha="abc123", content_hash="hashfoo", version="0.5.1",
+            sha="abc123", content_hash="sha256:" + "a" * 64, version="0.5.1",
             src_dir="src", requires=(),
         ),),
         strategy="maxver",
@@ -106,9 +117,9 @@ def test_lockfile_format_emits_tag_field_when_present():
 def test_format_parse_round_trip():
     graph = ResolvedGraph(deps=(
         _dep("chronos", source="https://example.com/chronos.git",
-             ref="feat/x", sha="abc", content_hash="hash_c", src_dir=""),
+             ref="feat/x", sha="abc", content_hash="sha256:" + "c" * 64, src_dir=""),
         _dep("intonaco", source="https://example.com/intonaco.git",
-             ref="main", sha="def", content_hash="hash_i", src_dir="src",
+             ref="main", sha="def", content_hash="sha256:" + "1" * 64, src_dir="src",
              requires=("chronos",)),
     ))
     lockfile = from_graph(graph)
@@ -125,8 +136,8 @@ def test_parse_lockfile_rejects_unknown_schema_version():
 
 def test_write_and_load_round_trip(tmp_path):
     graph = ResolvedGraph(deps=(
-        _dep("alpha", sha="aaa", content_hash="hash_a"),
-        _dep("bravo", sha="bbb", content_hash="hash_b", requires=("alpha",)),
+        _dep("alpha", sha="aaa", content_hash="sha256:" + "a" * 64),
+        _dep("bravo", sha="bbb", content_hash="sha256:" + "b" * 64, requires=("alpha",)),
     ))
     lockfile = from_graph(graph)
     path = write_lockfile(lockfile, tmp_path / "milpa.lock")
@@ -138,7 +149,7 @@ def test_write_and_load_round_trip(tmp_path):
 
 def test_verify_against_graph_passes_for_matching_graph():
     graph = ResolvedGraph(deps=(
-        _dep("foo", sha="abc", content_hash="hash_foo"),
+        _dep("foo", sha="abc", content_hash="sha256:" + "0" * 64),
     ))
     lockfile = from_graph(graph)
     # No exception
@@ -147,11 +158,11 @@ def test_verify_against_graph_passes_for_matching_graph():
 
 def test_verify_against_graph_raises_on_content_hash_mismatch():
     graph_locked = ResolvedGraph(deps=(
-        _dep("foo", sha="abc", content_hash="hash_original"),
+        _dep("foo", sha="abc", content_hash="sha256:" + "0" * 64),
     ))
     lockfile = from_graph(graph_locked)
     graph_drifted = ResolvedGraph(deps=(
-        _dep("foo", sha="abc", content_hash="hash_TAMPERED"),
+        _dep("foo", sha="abc", content_hash="sha256:" + "1" * 64),
     ))
     with pytest.raises(LockfileError) as exc:
         verify_against_graph(lockfile, graph_drifted)
@@ -209,7 +220,7 @@ dep "foo" {
     source "https://example.com/x.git"
     ref "main"
     sha "abc"
-    content_hash "sha256:hash_x"
+    content_hash "sha256:''' + "0" * 64 + '''"
     version "0.0.1"
     src_dir "src"
     requires
@@ -217,3 +228,27 @@ dep "foo" {
 '''
     parsed = parse_lockfile(text)
     assert parsed.strategy == "maxver"
+
+
+def test_parse_lockfile_rejects_unsupported_algorithm():
+    """parse_identity-driven rejection at lockfile load time: an
+    md5-encoded content_hash is unsupported and surfaces as a
+    LockfileError naming the algorithm. Catches the bad data
+    early, not deep in verify."""
+    text = '''version 1
+
+dep "foo" {
+    source "https://example.com/x.git"
+    ref "main"
+    sha "abc"
+    content_hash "md5:''' + "f" * 32 + '''"
+    version "0.0.1"
+    src_dir ""
+    requires
+}
+'''
+    with pytest.raises(LockfileError) as exc:
+        parse_lockfile(text)
+    msg = str(exc.value).lower()
+    assert "md5" in msg
+    assert "unsupported" in msg

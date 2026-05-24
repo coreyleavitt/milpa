@@ -212,7 +212,11 @@ def cmd_show(project_dir: Path) -> int:
     for dep in lockfile.deps:
         print(f"{dep.name:20s} {dep.version}")
         if dep.content_hash:
-            print(f"  identity    sha256:{dep.content_hash[:8]}")
+            # content_hash is multihash-encoded (#34) — already
+            # `sha256:<hex>`. Truncate the digest portion for display
+            # but preserve the algorithm prefix.
+            algo, _, digest = dep.content_hash.partition(":")
+            print(f"  identity    {algo}:{digest[:8]}")
         provenance = dep.source
         if dep.ref:
             provenance += f" @ {dep.ref}"

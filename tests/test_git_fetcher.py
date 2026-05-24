@@ -84,8 +84,10 @@ def test_content_hash_is_64_hex_chars(tmp_path, registry):
     deps_dir.mkdir()
 
     result = fetch(registry, "r", src, "main", deps_dir)
-    assert len(result.content_hash) == 64
-    assert all(c in "0123456789abcdef" for c in result.content_hash)
+    # Multihash form: "sha256:" + 64 hex chars
+    assert result.content_hash.startswith("sha256:")
+    assert len(result.content_hash) == len("sha256:") + 64
+    assert all(c in "0123456789abcdef" for c in result.content_hash.split(":", 1)[1])
 
 
 def test_content_hash_is_deterministic(tmp_path, registry):

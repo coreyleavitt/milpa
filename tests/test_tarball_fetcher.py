@@ -59,8 +59,10 @@ def test_tarball_fetcher_extracts_local_archive(tmp_path):
     assert (dest / "pkg.nimble").read_text() == 'srcDir = "src"\n'
     assert (dest / "src" / "pkg.nim").read_text() == "echo 1\n"
     # Registry-computed identity (sha256 of source tree)
-    assert len(result.content_hash) == 64
-    assert all(c in "0123456789abcdef" for c in result.content_hash)
+    # Multihash form: "sha256:" + 64 hex chars
+    assert result.content_hash.startswith("sha256:")
+    assert len(result.content_hash) == len("sha256:") + 64
+    assert all(c in "0123456789abcdef" for c in result.content_hash.split(":", 1)[1])
     # Receipt records the archive sha256 (provenance, not identity)
     assert isinstance(result.receipt, TarballReceipt)
     assert result.receipt.archive_sha256 == archive_sha
