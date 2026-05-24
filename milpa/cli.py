@@ -228,12 +228,14 @@ def _cmd_fetch_workspace(
     except Exception as e:
         print(f"failed to load registry: {e}", file=sys.stderr)
         return 1
+    prior_lockfile = _maybe_load_prior_lockfile(ws.root / "milpa.lock")
     try:
         graph = resolve_workspace(
             ws, deps_dir=deps_dir,
             registry=registry, fetcher=fetcher,
             list_tags=list_tags, max_parallel=max_parallel,
             strategy=strategy,
+            prior_lockfile=prior_lockfile,
         )
     except Exception as e:
         print(f"workspace resolution failed: {e}", file=sys.stderr)
@@ -738,6 +740,18 @@ def cmd_clean(project_dir: Path) -> int:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _maybe_load_prior_lockfile(path: Path):
+    """Load a prior lockfile if present; return None otherwise. Silently
+    treat parse errors as 'no prior lockfile' — better to run unprotected
+    than to refuse to resolve over a corrupt lockfile."""
+    if not path.exists():
+        return None
+    try:
+        return load_lockfile(path)
+    except Exception:
+        return None
+
+
 def _resolve_or_error(
     project_dir: Path,
     *,
@@ -762,6 +776,7 @@ def _resolve_or_error(
     except Exception as e:
         print(f"failed to load registry: {e}", file=sys.stderr)
         return 1
+    prior_lockfile = _maybe_load_prior_lockfile(project_dir / "milpa.lock")
     try:
         return resolve(
             manifest,
@@ -771,6 +786,7 @@ def _resolve_or_error(
             list_tags=list_tags,
             max_parallel=max_parallel,
             strategy=strategy,
+            prior_lockfile=prior_lockfile,
         )
     except Exception as e:
         print(f"resolution failed: {e}", file=sys.stderr)

@@ -221,6 +221,7 @@ def resolve(
     list_tags: Callable[[str], list[str]] = list_remote_tags,
     max_parallel: int = 8,
     strategy: Strategy = Strategy.MAXVER,
+    prior_lockfile=None,    # Lockfile | None — pins fetched identities per-dep (#82)
 ) -> ResolvedGraph:
     """Resolve `manifest` into a topologically-sorted ResolvedGraph.
 
@@ -334,7 +335,7 @@ def resolve(
                 print(f"fetching {ldep.name} (local)...", file=sys.stderr)
                 fut = ex.submit(
                     _process_local, ldep, project_root, deps_dir, fetcher,
-                    registry, list_tags,
+                    registry, list_tags, None, prior_lockfile,
                 )
             elif item[0] == "tarball":
                 tdep: TarballDep = item[1]
@@ -345,6 +346,7 @@ def resolve(
                 fut = ex.submit(
                     _process_tarball, tdep, deps_dir, fetcher,
                     registry, list_tags, overrides_by_name,
+                    prior_lockfile,
                 )
             else:
                 # url or named — both share the override-then-dispatch
@@ -362,6 +364,7 @@ def resolve(
                     fut = ex.submit(
                         _process_url, dep, deps_dir, fetcher,
                         registry, list_tags, overrides_by_name,
+                        prior_lockfile,
                     )
                 else:  # named
                     name, constraint = item[1], item[2]
@@ -375,6 +378,7 @@ def resolve(
                     fut = ex.submit(
                         _process_named, name, constraint, deps_dir, fetcher,
                         registry, list_tags, strategy, overrides_by_name,
+                        prior_lockfile,
                     )
             in_flight[fut] = item
 
@@ -420,6 +424,7 @@ def resolve_workspace(
     list_tags: Callable[[str], list[str]] = list_remote_tags,
     max_parallel: int = 8,
     strategy: Strategy = Strategy.MAXVER,
+    prior_lockfile=None,    # threaded to workers for identity-pin enforcement (#82)
 ) -> ResolvedGraph:
     """Resolve every member's deps into one shared global graph.
 
@@ -534,6 +539,7 @@ def resolve_workspace(
                 fut = ex.submit(
                     _process_url, dep, deps_dir, fetcher,
                     registry, list_tags, overrides_by_name,
+                    prior_lockfile,
                 )
             elif item[0] == "local":
                 ldep = item[1]
@@ -544,6 +550,7 @@ def resolve_workspace(
                 fut = ex.submit(
                     _process_local, ldep, project_root, deps_dir, fetcher,
                     registry, list_tags, overrides_by_name,
+                    prior_lockfile,
                 )
             else:  # named
                 name, constraint = item[1], item[2]
@@ -557,6 +564,7 @@ def resolve_workspace(
                 fut = ex.submit(
                     _process_named, name, constraint, deps_dir, fetcher,
                     registry, list_tags, strategy, overrides_by_name,
+                    prior_lockfile,
                 )
             in_flight[fut] = item
 
@@ -684,6 +692,76 @@ def _item_targets_member(item, members_by_name: dict) -> bool:
     return False
 
 
+def _pin_for_url_dep(dep: UrlDep, prior_lockfile) -> str | None:
+    """Return the locked identity for `dep` iff the manifest's git+ref
+    still matches the lockfile's recorded GitProvenanceRecord. Drops
+    the pin on any user-visible change (different URL, different ref)
+    so an intentional manifest edit doesn't get rejected as a
+    'hostile mirror'."""
+    if prior_lockfile is None:
+        return None
+    from .lockfile import GitProvenanceRecord
+    locked = next(
+        (d for d in prior_lockfile.deps if d.name == dep.name),
+        None,
+    )
+    if locked is None or not locked.identity:
+        return None
+    # Primary git provenance — first GitProvenanceRecord, if any
+    primary = next(
+        (p for p in locked.provenances if isinstance(p, GitProvenanceRecord)),
+        None,
+    )
+    if primary is None:
+        return None
+    if primary.url == dep.git and primary.ref == dep.ref:
+        return locked.identity
+    return None
+
+
+def _pin_for_tarball_dep(dep: TarballDep, prior_lockfile) -> str | None:
+    """Return the locked identity for a TarballDep iff the manifest's
+    url matches the lockfile's recorded TarballProvenanceRecord url."""
+    if prior_lockfile is None:
+        return None
+    from .lockfile import TarballProvenanceRecord
+    locked = next(
+        (d for d in prior_lockfile.deps if d.name == dep.name),
+        None,
+    )
+    if locked is None or not locked.identity:
+        return None
+    for p in locked.provenances:
+        if isinstance(p, TarballProvenanceRecord) and p.url == dep.url:
+            return locked.identity
+    return None
+
+
+def _pin_for_named_dep(name: str, resolved, prior_lockfile) -> str | None:
+    """Return the locked identity for a NamedDep iff the registry's
+    just-resolved (tag, url) matches the lockfile's recorded
+    RegistryProvenanceRecord (or GitProvenanceRecord for the same tag).
+    When the constraint allows a newer tag than was locked, the pin
+    drops — that's the user's constraint working as intended."""
+    if prior_lockfile is None:
+        return None
+    from .lockfile import GitProvenanceRecord, RegistryProvenanceRecord
+    locked = next(
+        (d for d in prior_lockfile.deps if d.name == name),
+        None,
+    )
+    if locked is None or not locked.identity:
+        return None
+    # The registry-resolved provenance is stored as a Git or Registry
+    # record. Either form must reference the same tag we just resolved.
+    for p in locked.provenances:
+        if isinstance(p, RegistryProvenanceRecord) and p.tag == resolved.tag:
+            return locked.identity
+        if isinstance(p, GitProvenanceRecord) and p.ref == resolved.tag:
+            return locked.identity
+    return None
+
+
 def _process_url(
     dep: UrlDep,
     deps_dir: Path,
@@ -691,17 +769,25 @@ def _process_url(
     registry: dict[str, RegistryEntry],
     list_tags: Callable[[str], list[str]],
     overrides_by_name: dict | None = None,
+    prior_lockfile=None,
 ) -> tuple["_Candidate", list]:
     """Worker function: fetch + parse one URL dep. Returns the candidate
     plus the queue items its requires introduce. Thread-safe: touches no
-    shared mutable state outside its own subtree of `deps_dir`."""
+    shared mutable state outside its own subtree of `deps_dir`.
+
+    When `prior_lockfile` is supplied and its recorded GitProvenanceRecord
+    for `dep.name` matches the manifest's git+ref, the locked identity
+    is enforced via fetch_any's expected_identity guard (#82). A
+    hostile mirror or rewritten tag is rejected at fetch time."""
     candidates = [GitProvenance(url=dep.git, ref=dep.ref)]
     for mirror_url in dep.mirrors:
         candidates.append(GitProvenance(url=mirror_url, ref=dep.ref))
+    expected_identity = _pin_for_url_dep(dep, prior_lockfile)
     result = fetcher.fetch_any(
         dep.name,
         candidates,
         dest=deps_dir / dep.name,
+        expected_identity=expected_identity,
     )
     sha = _commit_sha_or_none(result.receipt)
     nimble_path = _find_nimble_file(result.path, dep.name)
@@ -731,18 +817,21 @@ def _process_tarball(
     registry: dict[str, RegistryEntry],
     list_tags: Callable[[str], list[str]],
     overrides_by_name: dict | None = None,
+    prior_lockfile=None,
 ) -> tuple["_Candidate", list]:
     """Worker: download + verify + extract a TarballDep via the
     TarballFetcher. Reads the extracted .nimble for transitive
     requires. Source recorded as 'tarball:<url>' for the lockfile."""
-    result = fetcher.fetch(
+    expected_identity = _pin_for_tarball_dep(dep, prior_lockfile)
+    result = fetcher.fetch_any(
         dep.name,
-        TarballProvenance(
+        [TarballProvenance(
             url=dep.url,
             expected_sha256=dep.sha256,
             strip_components=dep.strip_components,
-        ),
+        )],
         dest=deps_dir / dep.name,
+        expected_identity=expected_identity,
     )
     nimble_path = _find_nimble_file(result.path, dep.name)
     nm = parse_nimble(nimble_path.read_text()) if nimble_path.exists() else None
@@ -773,6 +862,7 @@ def _process_local(
     registry: dict[str, RegistryEntry],
     list_tags: Callable[[str], list[str]],
     overrides_by_name: dict | None = None,
+    prior_lockfile=None,    # never enforced for local (cas_admissible=False)
 ) -> tuple["_Candidate", list]:
     """Worker: copy a LocalDep's source tree into _deps/, parse its
     nimble for transitive requires.
@@ -818,6 +908,7 @@ def _process_named(
     list_tags: Callable[[str], list[str]],
     strategy: Strategy = Strategy.MAXVER,
     overrides_by_name: dict | None = None,
+    prior_lockfile=None,
 ) -> tuple["_Candidate", list]:
     """Worker function: resolve a named dep through the registry, fetch
     it, parse its nimble. Network ops (resolve_named's list_remote_tags
@@ -825,10 +916,12 @@ def _process_named(
     r = resolve_named(name, constraint,
                       registry=registry, list_tags=list_tags,
                       strategy=str(strategy))
-    result = fetcher.fetch(
+    expected_identity = _pin_for_named_dep(name, r, prior_lockfile)
+    result = fetcher.fetch_any(
         name,
-        GitProvenance(url=r.url, ref=r.tag),
+        [GitProvenance(url=r.url, ref=r.tag)],
         dest=deps_dir / name,
+        expected_identity=expected_identity,
     )
     sha = _commit_sha_or_none(result.receipt)
     nimble_path = _find_nimble_file(result.path, name)

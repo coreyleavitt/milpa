@@ -116,11 +116,24 @@ def apply_manifest_change_with_resolve(
     changes resolution: cmd_add, cmd_add_mirror, future cmd_remove,
     cmd_update, etc.
     """
-    from .lockfile import from_graph, write_lockfile
+    from .lockfile import from_graph, load_lockfile, write_lockfile
     from .resolver import resolve
 
     if pre_resolve_validate is not None:
         pre_resolve_validate()
+
+    # Pick up the prior lockfile (if any) so existing deps inherit
+    # identity-pin protection during the proposed-manifest resolve.
+    # New deps in the proposed manifest have no entry yet — no pin
+    # is enforced for them (consistent with _pin_for_*_dep returning
+    # None when the name isn't in the lockfile).
+    prior_lockfile_path = project_dir / "milpa.lock"
+    prior_lockfile = None
+    if prior_lockfile_path.exists():
+        try:
+            prior_lockfile = load_lockfile(prior_lockfile_path)
+        except Exception:
+            prior_lockfile = None
 
     deps_dir = project_dir / "_deps"
     deps_dir.mkdir(parents=True, exist_ok=True)
@@ -134,6 +147,7 @@ def apply_manifest_change_with_resolve(
         fetcher=fetcher,
         list_tags=list_tags,
         strategy=strategy,
+        prior_lockfile=prior_lockfile,
     )
     new_lockfile = from_graph(graph, strategy=str(strategy))
 
