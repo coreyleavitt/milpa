@@ -27,10 +27,19 @@ Kind = Literal["library", "application"]
 
 @dataclass(frozen=True)
 class Predicate:
-    """One conditional clause on a dep. `negated=True` represents the
-    KDL `(not)` type annotation on the value."""
-    name: str       # one of: platform, arch, nim, milpa
-    value: str
+    """One conditional clause on a dep.
+
+    `values` is the set of literal values the predicate is checked
+    against. `negated=False` means the predicate is satisfied if the
+    profile's value MATCHES any of `values` (OR semantics — #88).
+    `negated=True` means the predicate is satisfied if the profile
+    MATCHES NONE — equivalent to the (not) annotation applied to every
+    value (De Morgan: NOT (a OR b) = NOT a AND NOT b).
+
+    A mixed-negation clause (some args (not), some bare in a child
+    node) is rejected at parse time as ambiguous."""
+    name: str                    # one of: platform, arch, nim, milpa
+    values: tuple[str, ...]
     negated: bool = False
 
 
@@ -402,14 +411,28 @@ def _format_dep_line(dep: Dep) -> str:
             f'    {_quote_name(dep.name)} '
             f'git=(url)"{dep.git}" ref="{dep.ref}"'
         )
-        for pred in dep.predicates:
+        # Single-value predicates emit inline; multi-value predicates
+        # emit as child nodes (#88). Negation: (not) annotation on the
+        # value (inline) or on every arg (child).
+        inline_preds = [p for p in dep.predicates if len(p.values) == 1]
+        child_preds = [p for p in dep.predicates if len(p.values) > 1]
+        for pred in inline_preds:
+            v = pred.values[0]
             if pred.negated:
-                head += f' {pred.name}=(not)"{pred.value}"'
+                head += f' {pred.name}=(not)"{v}"'
             else:
-                head += f' {pred.name}="{pred.value}"'
-        if not dep.mirrors:
+                head += f' {pred.name}="{v}"'
+
+        if not dep.mirrors and not child_preds:
             return head
+
         lines = [head + " {"]
+        for pred in child_preds:
+            args = " ".join(
+                f'(not)"{v}"' if pred.negated else f'"{v}"'
+                for v in pred.values
+            )
+            lines.append(f'        {pred.name} {args}')
         for url in dep.mirrors:
             lines.append(f'        mirror "{url}"')
         lines.append("    }")
@@ -500,12 +523,66 @@ def _parse_url_dep(node: kdl.Node) -> UrlDep:
     git_raw = node.props["git"]
     git = git_raw.geturl() if isinstance(git_raw, ParseResult) else git_raw
     _validate_git_url(name, git)
-    mirrors = _parse_mirrors(name, node)
-    predicates = _parse_predicates(name, node)
+    mirrors, child_preds = _parse_url_dep_children(name, node)
+    inline_preds = _parse_predicates(name, node)
+    predicates = _merge_predicates(name, inline_preds, child_preds)
     return UrlDep(
         name=name, git=git, ref=node.props["ref"],
         mirrors=mirrors, predicates=predicates,
     )
+
+
+def _parse_url_dep_children(
+    dep_name: str, node: kdl.Node,
+) -> tuple[tuple[str, ...], tuple[Predicate, ...]]:
+    """Split a UrlDep's child nodes into (mirror URLs, predicate
+    child nodes). Unknown children raise."""
+    mirrors: list[str] = []
+    child_preds: list[Predicate] = []
+    for child in node.nodes:
+        if child.name == "mirror":
+            if len(child.args) != 1 or not isinstance(child.args[0], str):
+                raise ManifestError(
+                    f"dep {dep_name!r}: 'mirror' takes exactly one "
+                    f"positional string argument (the URL)"
+                )
+            mirrors.append(child.args[0])
+        elif child.name in _PREDICATE_PROPS:
+            child_preds.append(
+                _parse_predicate_child_node(f"dep {dep_name!r}", child),
+            )
+        else:
+            raise ManifestError(
+                f"dep {dep_name!r}: unknown child node {child.name!r} "
+                f"(allowed: 'mirror' or a predicate child node — "
+                f"{', '.join(sorted(_PREDICATE_PROPS))})"
+            )
+    return tuple(mirrors), tuple(child_preds)
+
+
+def _merge_predicates(
+    dep_name: str,
+    inline: tuple[Predicate, ...],
+    child: tuple[Predicate, ...],
+) -> tuple[Predicate, ...]:
+    """Combine inline-form + child-node-form predicates. Reject if the
+    same predicate name appears in BOTH forms — that's ambiguous; the
+    user should pick one form per predicate."""
+    inline_names = {p.name for p in inline}
+    child_names = {p.name for p in child}
+    overlap = inline_names & child_names
+    if overlap:
+        names = ", ".join(sorted(overlap))
+        raise ManifestError(
+            f"dep {dep_name!r}: predicate(s) {names} declared in both "
+            f"inline form (e.g. {next(iter(overlap))}=\"...\") and "
+            f"child-node form ({{ {next(iter(overlap))} ... }}) — "
+            f"pick one form per predicate"
+        )
+    # Canonical order: sort by predicate name so structural equality
+    # holds regardless of which form (inline / child) the user chose
+    # for each predicate.
+    return tuple(sorted(inline + child, key=lambda p: p.name))
 
 
 def _expand_dep_child(child: kdl.Node, *, inherited_preds: tuple[Predicate, ...]):
@@ -534,7 +611,11 @@ def _parse_predicates_from_props(
     context: str, props,
 ) -> tuple[Predicate, ...]:
     """Shared predicate parser — works on a kdl.Node's props OR any
-    mapping. Used by both inline dep predicates and when blocks."""
+    mapping. Used by both inline dep predicates and when blocks.
+
+    Single value per prop (KDL has no array value type). For OR
+    semantics use the child-node form (#88) which goes through
+    _parse_predicate_child_node."""
     preds: list[Predicate] = []
     for key, val in props.items():
         if key not in _PREDICATE_PROPS:
@@ -554,8 +635,53 @@ def _parse_predicates_from_props(
                 f"{context}: predicate {key!r} unsupported "
                 f"type annotation ({tag!r}); only (not) is recognized"
             )
-        preds.append(Predicate(name=key, value=actual, negated=negated))
+        preds.append(Predicate(name=key, values=(actual,), negated=negated))
     return tuple(preds)
+
+
+def _parse_predicate_child_node(
+    context: str, child: kdl.Node,
+) -> Predicate:
+    """Parse a predicate expressed as a child node with positional args
+    (e.g., `platform \"linux\" \"macosx\"` ≡ OR over those values).
+
+    Per-arg (not) annotations are honored: ALL args must agree on
+    negation. Mixing (some bare, some (not)) is rejected as ambiguous."""
+    if child.name not in _PREDICATE_PROPS:
+        raise ManifestError(
+            f"{context}: unknown predicate {child.name!r} as child node "
+            f"(allowed: {', '.join(sorted(_PREDICATE_PROPS))})"
+        )
+    if not child.args:
+        raise ManifestError(
+            f"{context}: predicate child node {child.name!r} requires "
+            f"at least one positional argument"
+        )
+    values: list[str] = []
+    negations: list[bool] = []
+    for a in child.args:
+        tag = getattr(a, "tag", None)
+        actual = getattr(a, "value", a)
+        if not isinstance(actual, str):
+            raise ManifestError(
+                f"{context}: predicate {child.name!r} arg must be a string"
+            )
+        neg = (tag == "not")
+        if tag is not None and not neg:
+            raise ManifestError(
+                f"{context}: predicate {child.name!r} unsupported "
+                f"type annotation ({tag!r}); only (not) is recognized"
+            )
+        values.append(actual)
+        negations.append(neg)
+    if len(set(negations)) > 1:
+        raise ManifestError(
+            f"{context}: predicate {child.name!r} mixes (not) and bare "
+            f"args — all args must agree on negation"
+        )
+    return Predicate(
+        name=child.name, values=tuple(values), negated=negations[0],
+    )
 
 
 def _parse_predicates(dep_name: str, node: kdl.Node) -> tuple[Predicate, ...]:
@@ -565,27 +691,6 @@ def _parse_predicates(dep_name: str, node: kdl.Node) -> tuple[Predicate, ...]:
     separately)."""
     pred_props = {k: v for k, v in node.props.items() if k in _PREDICATE_PROPS}
     return _parse_predicates_from_props(f"dep {dep_name!r}", pred_props)
-
-
-def _parse_mirrors(dep_name: str, node: kdl.Node) -> tuple[str, ...]:
-    """Collect `mirror "URL"` child nodes under a UrlDep. Each mirror
-    takes exactly one positional string argument. URLs are validated
-    only at fetch time — a mirror that's unreachable today may be
-    reachable tomorrow."""
-    mirrors: list[str] = []
-    for child in node.nodes:
-        if child.name != "mirror":
-            raise ManifestError(
-                f"dep {dep_name!r}: unknown child node {child.name!r} "
-                f"in dep block (allowed: 'mirror')"
-            )
-        if len(child.args) != 1 or not isinstance(child.args[0], str):
-            raise ManifestError(
-                f"dep {dep_name!r}: 'mirror' takes exactly one "
-                f"positional string argument (the URL)"
-            )
-        mirrors.append(child.args[0])
-    return tuple(mirrors)
 
 
 _LOCAL_DEP_PROPS = frozenset({"local"})

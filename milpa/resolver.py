@@ -491,8 +491,17 @@ def resolve_workspace(
                 )
 
     for member in workspace.members:
+        # Apply profile-based predicate filtering per member (#89) so
+        # member-declared conditional deps respect the active profile.
+        # Members lacking matching predicates simply don't contribute
+        # their gated deps to the workspace's resolution.
+        member_manifest = member.manifest
+        if profile is not None:
+            member_manifest = _filter_manifest_by_profile(
+                member_manifest, profile,
+            )
         terms, requires_names, sub_items = _terms_from_member_manifest(
-            member.manifest, members_by_name, overrides_by_name,
+            member_manifest, members_by_name, overrides_by_name,
         )
         candidate = _Candidate(
             name=member.name,
@@ -725,17 +734,22 @@ def _dep_matches_profile(dep, profile) -> bool:
 def _predicate_satisfied(pred, profile) -> bool:
     """Evaluate a single Predicate against the profile.
 
-    For version-style predicates (nim, milpa), the value may be either
-    an exact version literal (\"2.0\") or a constraint string
-    (\">=2.0\"). For string predicates (platform, arch), exact equality."""
+    `pred.values` is a non-empty tuple of literal values. With
+    `negated=False`: satisfied if profile matches ANY value (OR over
+    the set). With `negated=True`: satisfied if profile matches NONE
+    (De Morgan dual). For version-style predicates (nim, milpa), each
+    value may be a literal version or a constraint string."""
     actual = getattr(profile, pred.name, None)
     if actual is None:
         return False
-    if pred.name in ("nim", "milpa") and _looks_like_constraint(pred.value):
-        matches = _version_satisfies(actual, pred.value)
-    else:
-        matches = (actual == pred.value)
-    return (not matches) if pred.negated else matches
+    any_match = any(_value_matches(pred.name, actual, v) for v in pred.values)
+    return (not any_match) if pred.negated else any_match
+
+
+def _value_matches(predicate_name: str, actual: str, declared: str) -> bool:
+    if predicate_name in ("nim", "milpa") and _looks_like_constraint(declared):
+        return _version_satisfies(actual, declared)
+    return actual == declared
 
 
 def _looks_like_constraint(s: str) -> bool:

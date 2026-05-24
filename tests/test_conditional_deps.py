@@ -199,17 +199,17 @@ def test_format_manifest_round_trips_predicates():
             UrlDep(
                 name="pywin32",
                 git="https://example.com/pywin32.git", ref="main",
-                predicates=(Predicate(name="platform", value="windows"),),
+                predicates=(Predicate(name="platform", values=("windows",)),),
             ),
             UrlDep(
                 name="uvloop",
                 git="https://example.com/uvloop.git", ref="main",
-                predicates=(Predicate(name="platform", value="windows", negated=True),),
+                predicates=(Predicate(name="platform", values=("windows",), negated=True),),
             ),
             UrlDep(
                 name="modern",
                 git="https://example.com/modern.git", ref="main",
-                predicates=(Predicate(name="nim", value=">=2.0"),),
+                predicates=(Predicate(name="nim", values=(">=2.0",)),),
             ),
         ),
     )
@@ -239,7 +239,7 @@ deps {
     assert len(manifest.deps) == 2
     for d in manifest.deps:
         assert any(
-            p.name == "platform" and p.value == "windows" and not p.negated
+            p.name == "platform" and "windows" in p.values and not p.negated
             for p in d.predicates
         ), f"{d.name} missing inherited predicate"
 
@@ -298,3 +298,234 @@ deps {
         profile=Profile(platform="linux", arch="amd64", nim="2.0.4", milpa="0.1.0"),
     )
     assert "modern_winapi" not in {d.name for d in g.deps}
+
+
+# ---------------------------------------------------------------------------
+# #88 — OR / set membership via child-node syntax
+# ---------------------------------------------------------------------------
+
+
+def test_child_node_with_multiple_positional_args_is_OR(tmp_path):
+    """Tracer (#88): a child node with multiple positional args means
+    'predicate satisfied if profile matches ANY value'."""
+    text = '''name "proj"
+kind "library"
+deps {
+    cross git=(url)"https://example.com/cross.git" ref="main" {
+        platform "linux" "macosx"
+    }
+}
+'''
+    manifest = parse_manifest(text)
+
+    fetcher_impl = StubFetcher()
+    registry = FetcherRegistry()
+    registry.register(fetcher_impl)
+
+    # On linux: included
+    g_lin = resolve(
+        manifest, deps_dir=tmp_path / "lin", registry={},
+        fetcher=registry, list_tags=lambda url: [],
+        profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
+    )
+    assert "cross" in {d.name for d in g_lin.deps}
+
+    # On macosx: included
+    g_mac = resolve(
+        manifest, deps_dir=tmp_path / "mac", registry={},
+        fetcher=registry, list_tags=lambda url: [],
+        profile=Profile(platform="macosx", arch="amd64", nim="2.0.0", milpa="0.1.0"),
+    )
+    assert "cross" in {d.name for d in g_mac.deps}
+
+    # On windows: excluded
+    g_win = resolve(
+        manifest, deps_dir=tmp_path / "win", registry={},
+        fetcher=registry, list_tags=lambda url: [],
+        profile=Profile(platform="windows", arch="amd64", nim="2.0.0", milpa="0.1.0"),
+    )
+    assert "cross" not in {d.name for d in g_win.deps}
+
+
+def test_single_arg_child_node_equivalent_to_inline():
+    """A single-arg child node produces the same Predicate value as
+    the inline form: { platform "x" } ≡ platform="x"."""
+    text_inline = '''name "proj"
+kind "library"
+deps {
+    a git=(url)"https://x/a.git" ref="main" platform="windows"
+}
+'''
+    text_child = '''name "proj"
+kind "library"
+deps {
+    a git=(url)"https://x/a.git" ref="main" {
+        platform "windows"
+    }
+}
+'''
+    m_inline = parse_manifest(text_inline)
+    m_child = parse_manifest(text_child)
+    # Predicates are structurally equal
+    assert m_inline.deps[0].predicates == m_child.deps[0].predicates
+
+
+def test_all_negated_args_in_child_node_mean_match_none(tmp_path):
+    """{ platform (not)"windows" (not)"linux" } = profile must NOT
+    be windows AND NOT be linux."""
+    text = '''name "proj"
+kind "library"
+deps {
+    a git=(url)"https://x/a.git" ref="main" {
+        platform (not)"windows" (not)"linux"
+    }
+}
+'''
+    manifest = parse_manifest(text)
+    fetcher_impl = StubFetcher()
+    registry = FetcherRegistry()
+    registry.register(fetcher_impl)
+
+    # On macosx: included (not windows AND not linux → True)
+    g = resolve(
+        manifest, deps_dir=tmp_path / "mac", registry={},
+        fetcher=registry, list_tags=lambda url: [],
+        profile=Profile(platform="macosx", arch="amd64", nim="2.0.0", milpa="0.1.0"),
+    )
+    assert "a" in {d.name for d in g.deps}
+
+    # On windows: excluded
+    g = resolve(
+        manifest, deps_dir=tmp_path / "win", registry={},
+        fetcher=registry, list_tags=lambda url: [],
+        profile=Profile(platform="windows", arch="amd64", nim="2.0.0", milpa="0.1.0"),
+    )
+    assert "a" not in {d.name for d in g.deps}
+
+    # On linux: excluded
+    g = resolve(
+        manifest, deps_dir=tmp_path / "lin", registry={},
+        fetcher=registry, list_tags=lambda url: [],
+        profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
+    )
+    assert "a" not in {d.name for d in g.deps}
+
+
+def test_mixed_negation_in_child_node_is_rejected():
+    """{ platform "windows" (not)"linux" } is ambiguous — reject."""
+    text = '''name "proj"
+kind "library"
+deps {
+    bad git=(url)"https://x/a.git" ref="main" {
+        platform "windows" (not)"linux"
+    }
+}
+'''
+    from milpa.manifest import ManifestError
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    assert "negation" in str(exc.value).lower() or "mixed" in str(exc.value).lower() or "(not)" in str(exc.value)
+
+
+def test_multiple_distinct_child_predicates_compose_with_and(tmp_path):
+    """{ platform "a" "b"  arch "amd64" } = (platform∈{a,b}) AND (arch=amd64)."""
+    text = '''name "proj"
+kind "library"
+deps {
+    cross git=(url)"https://x/c.git" ref="main" {
+        platform "linux" "macosx"
+        arch "amd64"
+    }
+}
+'''
+    manifest = parse_manifest(text)
+    fetcher_impl = StubFetcher()
+    registry = FetcherRegistry()
+    registry.register(fetcher_impl)
+
+    # linux + amd64 → included
+    g = resolve(
+        manifest, deps_dir=tmp_path / "a", registry={},
+        fetcher=registry, list_tags=lambda url: [],
+        profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
+    )
+    assert "cross" in {d.name for d in g.deps}
+
+    # macosx + amd64 → included
+    g = resolve(
+        manifest, deps_dir=tmp_path / "b", registry={},
+        fetcher=registry, list_tags=lambda url: [],
+        profile=Profile(platform="macosx", arch="amd64", nim="2.0.0", milpa="0.1.0"),
+    )
+    assert "cross" in {d.name for d in g.deps}
+
+    # linux + arm64 → excluded (arch mismatch)
+    g = resolve(
+        manifest, deps_dir=tmp_path / "c", registry={},
+        fetcher=registry, list_tags=lambda url: [],
+        profile=Profile(platform="linux", arch="arm64", nim="2.0.0", milpa="0.1.0"),
+    )
+    assert "cross" not in {d.name for d in g.deps}
+
+    # windows + amd64 → excluded (platform mismatch)
+    g = resolve(
+        manifest, deps_dir=tmp_path / "d", registry={},
+        fetcher=registry, list_tags=lambda url: [],
+        profile=Profile(platform="windows", arch="amd64", nim="2.0.0", milpa="0.1.0"),
+    )
+    assert "cross" not in {d.name for d in g.deps}
+
+
+def test_inline_and_child_node_form_for_same_predicate_is_rejected():
+    """`platform="x"` inline AND `{ platform "y" }` child on the same
+    dep is ambiguous — reject with a clear error naming the predicate."""
+    text = '''name "proj"
+kind "library"
+deps {
+    bad git=(url)"https://x/a.git" ref="main" platform="windows" {
+        platform "linux"
+    }
+}
+'''
+    from milpa.manifest import ManifestError
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    msg = str(exc.value)
+    assert "platform" in msg
+    assert "both" in msg.lower() or "pick one" in msg.lower()
+
+
+def test_format_manifest_emits_canonical_form_for_multi_value_predicates():
+    """A multi-value Predicate round-trips as a child node; a
+    single-value Predicate round-trips as inline. format∘parse∘format
+    is byte-identical (idempotence)."""
+    from milpa.manifest import Predicate, format_manifest
+
+    # Construct in canonical (sorted-by-name) order so equality holds
+    # against the reparsed form.
+    original = Manifest(
+        kind="library", name="proj",
+        deps=(
+            UrlDep(
+                name="cross",
+                git="https://x/c.git", ref="main",
+                predicates=(
+                    Predicate(name="arch", values=("amd64",)),
+                    Predicate(name="platform", values=("linux", "macosx")),
+                ),
+            ),
+        ),
+    )
+    text1 = format_manifest(original)
+    # Multi-value as child node
+    assert 'platform "linux" "macosx"' in text1
+    # Single-value as inline
+    assert 'arch="amd64"' in text1
+
+    # Round-trip preserves the structure
+    reparsed = parse_manifest(text1)
+    assert reparsed == original
+
+    # Second emission byte-identical (idempotence)
+    text2 = format_manifest(reparsed)
+    assert text1 == text2
