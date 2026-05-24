@@ -377,6 +377,20 @@ def _parse_manifest_doc(doc) -> Manifest:
             "package manifest is missing required top-level 'name' node "
             "(every package must self-identify; add: `name \"<your-name>\"`)"
         )
+    # Validate flag predicates against declared flags (#23/#90):
+    # `when flag="X"` must reference a declared flag, else it's a typo.
+    declared_flag_names = {fd.name for fd in flags}
+    for dep in deps:
+        for pred in getattr(dep, "predicates", ()):
+            if pred.name != "flag":
+                continue
+            for v in pred.values:
+                if v not in declared_flag_names:
+                    allowed = ", ".join(repr(n) for n in sorted(declared_flag_names)) or "<none declared>"
+                    raise ManifestError(
+                        f"dep {dep.name!r}: `when flag={v!r}` references "
+                        f"an undeclared flag (declared flags: {allowed})"
+                    )
     return Manifest(
         deps=tuple(deps),
         kind=kind,

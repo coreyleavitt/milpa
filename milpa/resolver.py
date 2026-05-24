@@ -103,6 +103,9 @@ class _Candidate:
     src_dir: str
     dep_terms: list[Term]      # for the solver
     requires_names: list[str]  # for ResolvedDep.requires
+    # Feature-flag state on this candidate (#90).
+    active_flags: tuple[str, ...] = ()
+    flag_defines: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 class _MaterializedProvider:
@@ -150,6 +153,33 @@ class _MaterializedProvider:
         name across all candidates sharing a content_hash) regardless
         of BFS arrival order."""
         self._pending.append(c)
+
+    def update_pending(
+        self,
+        *,
+        source: str,
+        ref: str | None,
+        dep_terms=None,
+        requires_names=None,
+        active_flags=None,
+        flag_defines=None,
+    ) -> bool:
+        """Find a not-yet-finalized candidate by (source, ref) and
+        mutate the provided fields. Used by the #90 fixpoint sweep to
+        update a candidate's transitive deps after later consumer
+        flag requests union in. Returns True iff a candidate matched."""
+        for c in self._pending:
+            if c.source == source and c.ref == ref:
+                if dep_terms is not None:
+                    c.dep_terms = list(dep_terms)
+                if requires_names is not None:
+                    c.requires_names = list(requires_names)
+                if active_flags is not None:
+                    c.active_flags = active_flags
+                if flag_defines is not None:
+                    c.flag_defines = flag_defines
+                return True
+        return False
 
     def finalize(self, deps_dir: Path) -> None:
         """Resolve all buffered candidates into the canonical provider
@@ -329,6 +359,17 @@ def resolve(
     seen_local: set[str] = set()                  # by declared path string
     seen_tarball: set[str] = set()                # by URL
 
+    # Cross-graph flag-request accumulation (#90). Every UrlDep that
+    # references a transitive dep contributes its FlagRequests to that
+    # dep's bucket — even if the dep was already fetched (so consumer
+    # flag requests from later consumers aren't lost to BFS dedup).
+    from collections import defaultdict as _dd
+    dep_flag_requests: dict[tuple[str, str], list] = _dd(list)
+    dep_milpa_kdl_path: dict[tuple[str, str], Path] = {}
+    # Track sub-deps already queued from each milpa.kdl dep, so the
+    # fixpoint re-evaluation only queues NEWLY-included transitives.
+    dep_queued_sub_keys: dict[tuple[str, str], set] = _dd(set)
+
     # Project root for resolving local-dep paths declared relative to it.
     project_root = deps_dir.parent
 
@@ -370,6 +411,11 @@ def resolve(
                 if item[0] == "url":
                     dep = item[1]
                     key = (dep.git, dep.ref)
+                    # ALWAYS accumulate per-consumer flag requests
+                    # even on dup so cross-graph union works (#90).
+                    # Each consumer contributes a tuple of FlagRequests.
+                    if dep.flag_requests:
+                        dep_flag_requests[key].append(dep.flag_requests)
                     if key in seen_url:
                         return
                     seen_url.add(key)
@@ -395,27 +441,80 @@ def resolve(
                     )
             in_flight[fut] = item
 
+        def drain_inflight():
+            """Drain all currently in-flight futures, recording results
+            and queueing any sub-items they introduce. Tracks per-dep
+            milpa.kdl path + initial sub-deps so the fixpoint sweep
+            below can identify newly-needed transitives (#90)."""
+            while in_flight:
+                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    item = in_flight.pop(fut)
+                    try:
+                        candidate, new_items = fut.result()
+                    except Exception as e:
+                        for outstanding in in_flight:
+                            outstanding.cancel()
+                        raise
+                    provider.record(candidate)
+                    print(f"✓ {candidate.name}", file=sys.stderr)
+                    if item[0] == "url":
+                        dep_url = item[1]
+                        key = (dep_url.git, dep_url.ref)
+                        mp = deps_dir / dep_url.name / "milpa.kdl"
+                        if mp.exists():
+                            dep_milpa_kdl_path[key] = mp
+                        # Track the names we've already queued from
+                        # this dep so the fixpoint pass doesn't
+                        # re-queue them.
+                        for sub in new_items:
+                            dep_queued_sub_keys[key].add(_sub_item_key(sub))
+                    for new_item in new_items:
+                        submit(new_item)
+
         for item in queue:
             submit(item)
+        drain_inflight()
 
-        while in_flight:
-            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
-            for fut in done:
-                item = in_flight.pop(fut)
-                try:
-                    candidate, new_items = fut.result()
-                except Exception as e:
-                    # Cancel outstanding work and surface the error.
-                    for outstanding in in_flight:
-                        outstanding.cancel()
-                    raise
-                provider.record(candidate)
-                print(f"✓ {candidate.name}", file=sys.stderr)
-                # Transitive deps still flow through BFS — they're real
-                # edges in the dep graph regardless of whether this
-                # candidate ends up canonical or aliased.
-                for new_item in new_items:
-                    submit(new_item)
+        # Fixpoint sweep: re-evaluate each fetched milpa.kdl dep with
+        # the FULL accumulated FlagRequest set from across the graph.
+        # If new flags became active (because a later consumer's
+        # request was unioned in), submit any newly-included
+        # transitives. Monotonic — active sets only grow, so iteration
+        # terminates (bounded by total flag count across all deps).
+        while True:
+            new_submits = 0
+            for key, milpa_kdl_path in list(dep_milpa_kdl_path.items()):
+                all_requests = dep_flag_requests.get(key)
+                if not all_requests:
+                    continue
+                (new_terms, new_requires, _, sub_items,
+                 new_active, new_flag_defines) = _extract_from_milpa_kdl(
+                    milpa_kdl_path, "<re-eval>", registry, list_tags,
+                    overrides_by_name,
+                    consumer_flag_requests=tuple(all_requests),
+                )
+                added_this_round = False
+                for sub in sub_items:
+                    sk = _sub_item_key(sub)
+                    if sk not in dep_queued_sub_keys[key]:
+                        dep_queued_sub_keys[key].add(sk)
+                        submit(sub)
+                        new_submits += 1
+                        added_this_round = True
+                if added_this_round:
+                    # Update the existing candidate's requires_names +
+                    # dep_terms + active_flags so the solver sees the
+                    # newly-activated transitives as real edges from
+                    # this dep, and ResolvedDep carries the correct
+                    # flag state for nim.cfg emission.
+                    _update_candidate_requires(
+                        provider, key, new_terms, new_requires,
+                        new_active, new_flag_defines,
+                    )
+            if new_submits == 0:
+                break
+            drain_inflight()
 
     # Resolve content-hash duplicates into canonical/alias form and
     # rewrite all terms to use canonical names. Deterministic
@@ -715,6 +814,37 @@ def _item_targets_member(item, members_by_name: dict) -> bool:
     return False
 
 
+def _update_candidate_requires(
+    provider, key: tuple[str, str], new_terms, new_requires,
+    new_active=None, new_flag_defines=None,
+) -> None:
+    """Thin wrapper around _MaterializedProvider.update_pending —
+    locates a buffered candidate by (URL, ref) and updates its
+    transitive-dep state to reflect post-fixpoint flag activation
+    (#90)."""
+    provider.update_pending(
+        source=key[0], ref=key[1],
+        dep_terms=new_terms, requires_names=new_requires,
+        active_flags=new_active, flag_defines=new_flag_defines,
+    )
+
+
+def _sub_item_key(item):
+    """Stable identifier for a sub-dep queue item, used for fixpoint
+    dedup (#90). Different KINDS of dep go through different submit
+    branches; the key includes the kind to keep them disjoint."""
+    kind = item[0]
+    if kind == "url":
+        return ("url", item[1].name)
+    if kind == "named":
+        return ("named", item[1])
+    if kind == "local":
+        return ("local", item[1].name)
+    if kind == "tarball":
+        return ("tarball", item[1].name)
+    return (kind, str(item))
+
+
 def _filter_manifest_by_profile(
     manifest: Manifest, profile, active_flags: frozenset | None = None,
 ) -> Manifest:
@@ -908,24 +1038,158 @@ def _process_url(
         expected_identity=expected_identity,
     )
     sha = _commit_sha_or_none(result.receipt)
-    nimble_path = _find_nimble_file(result.path, dep.name)
-    nm = parse_nimble(nimble_path.read_text())
-    terms, requires_names, sub_url_deps, sub_named = _build_terms(
-        nm, registry, list_tags, overrides_by_name,
-    )
+    # Prefer milpa.kdl if present (#90); falls back to .nimble for
+    # legacy Nim packages that don't yet ship a milpa manifest.
+    milpa_kdl_path = result.path / "milpa.kdl"
+    active_flags: tuple[str, ...] = ()
+    flag_defines: tuple = ()
+    if milpa_kdl_path.exists():
+        (terms, requires_names, src_dir_value, new_items,
+         active_flags, flag_defines) = _extract_from_milpa_kdl(
+            milpa_kdl_path, dep.name, registry, list_tags,
+            overrides_by_name,
+            consumer_flag_requests=dep.flag_requests,
+        )
+    else:
+        nimble_path = _find_nimble_file(result.path, dep.name)
+        nm = parse_nimble(nimble_path.read_text())
+        terms, requires_names, sub_url_deps, sub_named = _build_terms(
+            nm, registry, list_tags, overrides_by_name,
+        )
+        src_dir_value = nm.src_dir or ""
+        new_items = []
+        for u in sub_url_deps:
+            new_items.append(("url", u))
+        for n in sub_named:
+            new_items.append(("named", n.name, n.constraint))
     candidate = _Candidate(
         name=dep.name, version=_URL_DEP_VERSION,
         source=dep.git, ref=dep.ref, sha=sha, tag=None,
         identity=result.identity,
-        src_dir=nm.src_dir or "",
+        src_dir=src_dir_value,
         dep_terms=terms, requires_names=requires_names,
+        active_flags=active_flags,
+        flag_defines=flag_defines,
     )
-    new_items: list = []
-    for u in sub_url_deps:
-        new_items.append(("url", u))
-    for n in sub_named:
-        new_items.append(("named", n.name, n.constraint))
     return candidate, new_items
+
+
+def _extract_from_milpa_kdl(
+    path,
+    dep_name: str,
+    registry,
+    list_tags,
+    overrides_by_name,
+    consumer_flag_requests: tuple = (),
+):
+    """Parse a milpa.kdl manifest from a fetched transitive dep,
+    compute the dep's active flag set, filter its `when flag=...`
+    blocks, and return (dep_terms, requires_names, src_dir, queue_items).
+
+    `consumer_flag_requests` is a tuple of per-consumer FlagRequest
+    tuples: each inner tuple is one consumer's requests on this dep.
+    Cargo-style additive union: per-consumer effective set =
+    declared-defaults overridden by that consumer's explicit values;
+    final active set = UNION across consumers.
+
+    Unknown flag requests are silently ignored (resolve-time tolerance)."""
+    from .manifest import load_manifest, UrlDep as ManUrlDep, NamedDep as ManNamedDep
+    manifest = load_manifest(path)
+
+    declared_flags = {fd.name for fd in manifest.flags}
+    defaults = {fd.name for fd in manifest.flags if fd.default}
+
+    # Normalize: accept a flat tuple of FlagRequests (legacy single-
+    # consumer form) by wrapping it; otherwise expect tuple-of-tuples.
+    if consumer_flag_requests and isinstance(
+        consumer_flag_requests[0], tuple,
+    ):
+        per_consumer = consumer_flag_requests
+    elif consumer_flag_requests:
+        per_consumer = (consumer_flag_requests,)
+    else:
+        per_consumer = ()
+
+    active: set = set()
+    if not per_consumer:
+        # No external consumer; defaults apply (top-level case)
+        active = set(defaults)
+    else:
+        for consumer_reqs in per_consumer:
+            consumer_mentions = {
+                fr.name: fr.enabled for fr in consumer_reqs
+                if fr.name in declared_flags
+            }
+            effective = set()
+            for fd in manifest.flags:
+                if fd.name in consumer_mentions:
+                    if consumer_mentions[fd.name]:
+                        effective.add(fd.name)
+                else:
+                    if fd.default:
+                        effective.add(fd.name)
+            active |= effective
+    active_frozen = frozenset(active)
+
+    # Filter manifest.deps by `when flag=...` predicates (other
+    # predicates default-permissive for now — profile-aware
+    # transitive filtering is a separate concern).
+    kept_deps = tuple(
+        d for d in manifest.deps
+        if _dep_passes_flag_predicates(d, active_frozen)
+    )
+
+    sub_terms: list[Term] = []
+    sub_requires: list[str] = []
+    sub_items: list = []
+    for d in kept_deps:
+        if isinstance(d, ManUrlDep):
+            sub_terms.append(
+                Term.require(d.name, VersionSet.eq(_URL_DEP_VERSION))
+            )
+            sub_requires.append(d.name)
+            sub_items.append(("url", d))
+        elif isinstance(d, ManNamedDep):
+            if d.name == "nim":
+                continue
+            from .solver import VersionSet as _VS
+            constraint_set = (
+                _VS.from_constraint(d.constraint)
+                if d.constraint else _VS.all()
+            )
+            sub_terms.append(
+                Term.require(d.name, constraint_set)
+            )
+            sub_requires.append(d.name)
+            sub_items.append(("named", d.name, d.constraint))
+        # LocalDep / TarballDep / MemberDep from a transitive milpa.kdl
+        # are out of scope for #90's initial slice; defer.
+    # Compute flag_defines for nim.cfg emission (#23 cycle 11 wiring).
+    # Only flags with explicit `defines` get an entry; flags with empty
+    # defines use the convention -d:<dep>_<flag> at emission time.
+    flag_defines = tuple(
+        (fd.name, fd.defines) for fd in manifest.flags
+        if fd.name in active_frozen and fd.defines
+    )
+    return (
+        tuple(sub_terms), tuple(sub_requires),
+        manifest.src_dir, sub_items,
+        tuple(sorted(active_frozen)), flag_defines,
+    )
+
+
+def _dep_passes_flag_predicates(dep, active_flags: frozenset) -> bool:
+    """Check only flag predicates (other predicates evaluated elsewhere
+    via the profile-filter path)."""
+    preds = getattr(dep, "predicates", ())
+    for p in preds:
+        if p.name != "flag":
+            continue
+        any_match = any(v in active_flags for v in p.values)
+        satisfied = (not any_match) if p.negated else any_match
+        if not satisfied:
+            return False
+    return True
 
 
 def _process_tarball(
@@ -1194,5 +1458,7 @@ def _build_graph(
             identity=c.identity,
             src_dir=c.src_dir,
             requires=tuple(c.requires_names),
+            active_flags=getattr(c, "active_flags", ()),
+            flag_defines=getattr(c, "flag_defines", ()),
         ))
     return ResolvedGraph(deps=tuple(out))
