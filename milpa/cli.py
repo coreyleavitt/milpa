@@ -49,6 +49,8 @@ SUBCOMMAND_HELP = {
     "verify": "recheck each dep in _deps/ against milpa.lock (no fetch)",
     "clean":  "remove _deps/ and nim.cfg (keeps milpa.lock)",
     "add":    "add a mirror for an existing dep (more verbs to come)",
+    "remove": "remove a dep from milpa.kdl and regenerate the lockfile",
+    "update": "re-resolve (optionally a single dep) and refresh the lockfile",
 }
 
 
@@ -89,7 +91,20 @@ def make_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
     for name, help_text in SUBCOMMAND_HELP.items():
         sp = subparsers.add_parser(name, help=help_text)
-        if name == "add":
+        if name == "remove":
+            sp.add_argument(
+                "dep_name", metavar="<dep>",
+                help="name of the dep to remove from milpa.kdl",
+            )
+        elif name == "update":
+            sp.add_argument(
+                "dep_name", metavar="<dep>", nargs="?", default=None,
+                help=(
+                    "name of a single dep to refresh; if omitted, "
+                    "all pins are dropped and the entire graph re-resolves"
+                ),
+            )
+        elif name == "add":
             sp.add_argument(
                 "dep_name", metavar="<dep>",
                 help="dep name (new dep with --git, or existing dep with --mirror)",
@@ -521,6 +536,164 @@ def cmd_add(
     return 0
 
 
+def cmd_update(
+    project_dir: Path,
+    *,
+    name: str | None = None,
+    fetcher: FetcherRegistry = default_registry,
+    list_tags: Callable[[str], list[str]] = list_remote_tags,
+    registry_loader: "RegistryLoader" = _default_registry_loader,
+    max_parallel: int = 8,
+    strategy: Strategy = Strategy.MAXVER,
+) -> int:
+    """Re-resolve and refresh the lockfile (#18).
+
+    `name=None`: drop ALL pins; the entire graph re-resolves with
+    freedom to pick up new upstream bytes.
+    `name=<str>`: drop only that dep's pin; everything else stays
+    stable (transitives self-update when their resolved provenance
+    changes — see #82's per-dep tag-match logic).
+
+    Does NOT mutate milpa.kdl — manifest text is byte-identical
+    after this call. Lockfile + _deps/ change.
+    """
+    from dataclasses import replace
+
+    manifest_path = project_dir / "milpa.kdl"
+    lockfile_path = project_dir / "milpa.lock"
+
+    if not manifest_path.exists():
+        print(f"update: no milpa.kdl at {manifest_path}", file=sys.stderr)
+        return 1
+
+    try:
+        manifest = load_or_discover_manifest(project_dir)
+    except ManifestError as e:
+        print(f"update: cannot load manifest: {e}", file=sys.stderr)
+        return 1
+
+    prior_lockfile = None
+    if name is not None:
+        # Targeted update: load lockfile, filter out the named entry
+        if not lockfile_path.exists():
+            print(
+                f"update: no lockfile at {lockfile_path} — "
+                f"run `milpa fetch` first",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            full_lockfile = load_lockfile(lockfile_path)
+        except Exception as e:
+            print(f"update: cannot load lockfile: {e}", file=sys.stderr)
+            return 1
+        if not any(d.name == name for d in full_lockfile.deps):
+            names = ", ".join(sorted(d.name for d in full_lockfile.deps))
+            print(
+                f"update: no dep {name!r} in lockfile "
+                f"(known: {names or '<none>'})",
+                file=sys.stderr,
+            )
+            return 1
+        prior_lockfile = replace(
+            full_lockfile,
+            deps=tuple(d for d in full_lockfile.deps if d.name != name),
+        )
+
+    deps_dir = project_dir / "_deps"
+    deps_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = deps_dir / ".packages_official.json"
+    try:
+        registry = registry_loader(cache_path=cache_path)
+    except Exception as e:
+        print(f"update: failed to load registry: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        graph = resolve(
+            manifest,
+            deps_dir=deps_dir,
+            registry=registry,
+            fetcher=fetcher,
+            list_tags=list_tags,
+            max_parallel=max_parallel,
+            strategy=strategy,
+            prior_lockfile=prior_lockfile,
+            profile=Profile.from_environment(),
+        )
+    except Exception as e:
+        print(f"update: resolution failed: {e}", file=sys.stderr)
+        return 1
+
+    new_lockfile = from_graph(graph, strategy=str(strategy))
+    write_lockfile(new_lockfile, lockfile_path)
+    target = name if name else "all deps"
+    print(f"updated {target}", file=sys.stderr)
+    return 0
+
+
+def cmd_remove(
+    project_dir: Path,
+    *,
+    name: str,
+    fetcher: FetcherRegistry = default_registry,
+    list_tags: Callable[[str], list[str]] = list_remote_tags,
+    registry_loader: "RegistryLoader" = _default_registry_loader,
+    strategy: Strategy = Strategy.MAXVER,
+) -> int:
+    """Drop `name` from milpa.kdl + regenerate the lockfile (#17).
+
+    Orphaned transitives disappear naturally from the new lockfile
+    via the full re-resolve. If `name` is still required transitively
+    by another dep, it stays in the resolved graph — removing from
+    the manifest doesn't force removal from the graph."""
+    from dataclasses import replace
+
+    manifest_path = project_dir / "milpa.kdl"
+    if not manifest_path.exists():
+        print(
+            f"remove: no milpa.kdl at {manifest_path}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        manifest = load_or_discover_manifest(project_dir)
+    except ManifestError as e:
+        print(f"remove: cannot load manifest: {e}", file=sys.stderr)
+        return 1
+
+    if not any(d.name == name for d in manifest.deps):
+        names = ", ".join(sorted(d.name for d in manifest.deps))
+        print(
+            f"remove: no dep {name!r} in milpa.kdl "
+            f"(known: {names or '<none>'})",
+            file=sys.stderr,
+        )
+        return 1
+
+    proposed = replace(
+        manifest,
+        deps=tuple(d for d in manifest.deps if d.name != name),
+    )
+
+    try:
+        apply_manifest_change_with_resolve(
+            project_dir,
+            proposed_manifest=proposed,
+            fetcher=fetcher,
+            list_tags=list_tags,
+            registry_loader=registry_loader,
+            strategy=strategy,
+        )
+    except Exception as e:
+        print(f"remove: resolution failed: {e}", file=sys.stderr)
+        return 1
+
+    print(f"removed {name}", file=sys.stderr)
+    return 0
+
+
 def cmd_add_mirror(
     project_dir: Path,
     *,
@@ -823,6 +996,15 @@ def main(argv: list[str] | None = None) -> int:
         case "show":   return cmd_show(project_dir)
         case "verify": return cmd_verify(project_dir)
         case "clean":  return cmd_clean(project_dir)
+        case "remove":
+            return cmd_remove(
+                project_dir, name=args.dep_name, strategy=strategy,
+            )
+        case "update":
+            return cmd_update(
+                project_dir, name=args.dep_name, strategy=strategy,
+                max_parallel=args.parallel,
+            )
         case "add":
             if args.mirror:
                 return cmd_add_mirror(
