@@ -565,6 +565,88 @@ def test_workspace_round_trips_through_format_and_parse():
     assert reparsed == original
 
 
+def test_tarball_dep_with_full_properties_parses():
+    """A `<name> tarball=(url)"..." sha256="..." strip_components=N`
+    parses to TarballDep with all three fields populated."""
+    from milpa.manifest import TarballDep
+    text = '''
+name "fresco"
+deps {
+    chronos tarball=(url)"https://example.com/chronos-1.0.tar.gz" \
+            sha256="abc123" \
+            strip_components=1
+}
+'''
+    m = parse_manifest(text)
+    assert m.deps == (
+        TarballDep(
+            name="chronos",
+            url="https://example.com/chronos-1.0.tar.gz",
+            sha256="abc123",
+            strip_components=1,
+        ),
+    )
+
+
+def test_tarball_dep_defaults_sha256_none_and_strip_zero():
+    """Bare `tarball="..."` (no sha256, no strip_components) → TOFU
+    mode (sha256=None) and strip_components=0."""
+    from milpa.manifest import TarballDep
+    text = '''
+name "fresco"
+deps {
+    pkg tarball="https://example.com/pkg.tar.gz"
+}
+'''
+    m = parse_manifest(text)
+    assert m.deps == (
+        TarballDep(
+            name="pkg",
+            url="https://example.com/pkg.tar.gz",
+            sha256=None,
+            strip_components=0,
+        ),
+    )
+
+
+def test_tarball_dep_round_trips_full_form(tmp_path):
+    """A TarballDep with all properties survives format → parse."""
+    from milpa.manifest import TarballDep, format_manifest
+    original = Manifest(
+        deps=(TarballDep(
+            name="chronos",
+            url="https://example.com/chronos-1.0.tar.gz",
+            sha256="abc123",
+            strip_components=1,
+        ),),
+        kind="library",
+        name="test",
+    )
+    text = format_manifest(original)
+    reparsed = parse_manifest(text)
+    assert reparsed == original
+
+
+def test_tarball_dep_round_trips_minimal_form():
+    """A TarballDep with only the URL (TOFU mode, no strip) round-
+    trips. The formatter omits default values from output."""
+    from milpa.manifest import TarballDep, format_manifest
+    original = Manifest(
+        deps=(TarballDep(
+            name="pkg",
+            url="https://example.com/pkg.tar.gz",
+        ),),
+        kind="library",
+        name="test",
+    )
+    text = format_manifest(original)
+    reparsed = parse_manifest(text)
+    assert reparsed == original
+    # And the formatter didn't emit noisy defaults
+    assert "sha256" not in text
+    assert "strip_components" not in text
+
+
 def test_workspace_with_kind_is_rejected():
     """Same disjoint-union rule for `kind`."""
     from milpa.manifest import parse_workspace_or_manifest

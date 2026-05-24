@@ -25,9 +25,10 @@ import sys
 from .fetchers import FetcherRegistry, default_registry
 from .fetchers.git import GitProvenance, GitReceipt
 from .fetchers.local import LocalProvenance
+from .fetchers.tarball import TarballProvenance
 from .identity import compute_content_hash
 from .manifest import (
-    LocalDep, Manifest, MemberDep, NamedDep, Override, UrlDep,
+    LocalDep, Manifest, MemberDep, NamedDep, Override, TarballDep, UrlDep,
 )
 from .nimble_parse import NamedRequirement, UrlRequirement, parse_nimble
 from .registry import (
@@ -160,6 +161,17 @@ def resolve(
     # overrides become URL fetches at the sentinel version — the
     # constraint is irrelevant because the override IS the spec.
     for dep in manifest.deps:
+        if isinstance(dep, TarballDep):
+            # Tarball deps are fixed-singleton (like URL/Local), routed
+            # through TarballFetcher with pre-fetch sha256 verification.
+            # Overrides don't apply — the user wrote a specific URL +
+            # hash; that's itself an explicit specification.
+            root_terms.append(
+                Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION))
+            )
+            root_requires.append(dep.name)
+            queue.append(("tarball", dep))
+            continue
         if isinstance(dep, LocalDep):
             # Local deps are fixed-singleton in solver space (like URL),
             # but routed through the local-fetch path. Overrides do NOT
@@ -207,6 +219,7 @@ def resolve(
     seen_url: set[tuple[str, str]] = set()       # (git, ref)
     seen_named: set[str] = set()
     seen_local: set[str] = set()                  # by declared path string
+    seen_tarball: set[str] = set()                # by URL
 
     # Project root for resolving local-dep paths declared relative to it.
     project_root = deps_dir.parent
@@ -228,6 +241,16 @@ def resolve(
                 fut = ex.submit(
                     _process_local, ldep, project_root, deps_dir, fetcher,
                     registry, list_tags,
+                )
+            elif item[0] == "tarball":
+                tdep: TarballDep = item[1]
+                if tdep.url in seen_tarball:
+                    return
+                seen_tarball.add(tdep.url)
+                print(f"fetching {tdep.name} (tarball)...", file=sys.stderr)
+                fut = ex.submit(
+                    _process_tarball, tdep, deps_dir, fetcher,
+                    registry, list_tags, overrides_by_name,
                 )
             else:
                 # url or named — both share the override-then-dispatch
@@ -582,6 +605,47 @@ def _process_url(
         source=dep.git, ref=dep.ref, sha=sha, tag=None,
         content_hash=result.content_hash,
         src_dir=nm.src_dir or "",
+        dep_terms=terms, requires_names=requires_names,
+    )
+    new_items: list = []
+    for u in sub_url_deps:
+        new_items.append(("url", u))
+    for n in sub_named:
+        new_items.append(("named", n.name, n.constraint))
+    return candidate, new_items
+
+
+def _process_tarball(
+    dep: TarballDep,
+    deps_dir: Path,
+    fetcher: FetcherRegistry,
+    registry: dict[str, RegistryEntry],
+    list_tags: Callable[[str], list[str]],
+    overrides_by_name: dict | None = None,
+) -> tuple["_Candidate", list]:
+    """Worker: download + verify + extract a TarballDep via the
+    TarballFetcher. Reads the extracted .nimble for transitive
+    requires. Source recorded as 'tarball:<url>' for the lockfile."""
+    result = fetcher.fetch(
+        dep.name,
+        TarballProvenance(
+            url=dep.url,
+            expected_sha256=dep.sha256,
+            strip_components=dep.strip_components,
+        ),
+        dest=deps_dir / dep.name,
+    )
+    nimble_path = _find_nimble_file(result.path, dep.name)
+    nm = parse_nimble(nimble_path.read_text()) if nimble_path.exists() else None
+    terms, requires_names, sub_url_deps, sub_named = (
+        _build_terms(nm, registry, list_tags, overrides_by_name)
+        if nm else ([], [], [], [])
+    )
+    candidate = _Candidate(
+        name=dep.name, version=_URL_DEP_VERSION,
+        source=f"tarball:{dep.url}", ref=None, sha=None, tag=None,
+        content_hash=result.content_hash,
+        src_dir=(nm.src_dir or "") if nm else "",
         dep_terms=terms, requires_names=requires_names,
     )
     new_items: list = []

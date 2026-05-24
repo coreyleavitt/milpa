@@ -51,6 +51,27 @@ class MemberDep:
 
 
 @dataclass(frozen=True)
+class TarballDep:
+    """A dep declared by tarball URL (F2 / #41).
+
+    `sha256` is optional — when set, the fetcher verifies the
+    archive's hash BEFORE extraction (strictly stronger than git's
+    "clone and hope"). When absent, the fetcher trusts the URL on
+    first fetch and records the actual hash on the TarballReceipt
+    so the lockfile can pin it for subsequent fetches (TOFU model).
+
+    `strip_components` defaults to 0; the github-tarball idiom of
+    "everything under <repo>-<sha>/" needs 1.
+
+    See docs/rfc-pluggable-fetchers.md Phase F2.
+    """
+    name: str
+    url: str
+    sha256: str | None = None
+    strip_components: int = 0
+
+
+@dataclass(frozen=True)
 class LocalDep:
     """A dep declared by local filesystem path.
 
@@ -82,7 +103,7 @@ class NamedDep:
     constraint: str | None   # e.g. ">= 0.5.0" or None for any version
 
 
-Dep = UrlDep | NamedDep | LocalDep | MemberDep
+Dep = UrlDep | NamedDep | LocalDep | TarballDep | MemberDep
 
 
 @dataclass(frozen=True)
@@ -375,6 +396,18 @@ def _format_dep_line(dep: Dep) -> str:
         return f'    {_quote_name(dep.name)} local="{dep.path}"'
     if isinstance(dep, MemberDep):
         return f'    member "{dep.name}"'
+    if isinstance(dep, TarballDep):
+        # Only emit non-default properties — keeps minimal-form
+        # manifests round-trip-stable without sha256/strip noise.
+        parts = [
+            f'    {_quote_name(dep.name)}',
+            f'tarball=(url)"{dep.url}"',
+        ]
+        if dep.sha256 is not None:
+            parts.append(f'sha256="{dep.sha256}"')
+        if dep.strip_components != 0:
+            parts.append(f'strip_components={dep.strip_components}')
+        return " ".join(parts)
     # NamedDep
     if dep.constraint is None:
         return f'    {_quote_name(dep.name)}'
@@ -421,6 +454,8 @@ def _parse_dep(node: kdl.Node) -> Dep:
         return _parse_url_dep(node)
     if "local" in node.props:
         return _parse_local_dep(node)
+    if "tarball" in node.props:
+        return _parse_tarball_dep(node)
     return _parse_named_dep(node)
 
 
@@ -469,6 +504,58 @@ def _parse_local_dep(node: kdl.Node) -> LocalDep:
             f"dep {name!r}: 'local' property must be a non-empty string path"
         )
     return LocalDep(name=name, path=path)
+
+
+_TARBALL_DEP_PROPS = frozenset({"tarball", "sha256", "strip_components"})
+
+
+def _parse_tarball_dep(node: kdl.Node) -> TarballDep:
+    """Validate and convert a tarball-form dep child.
+
+    Grammar: `<name> tarball="<URL>" [sha256="<hex>"] [strip_components=<N>]`
+
+    `sha256` is optional (TOFU on first fetch; lockfile pins
+    thereafter). `strip_components` defaults to 0; set to 1 for
+    GitHub-auto-generated tarballs that wrap content in `<repo>-<sha>/`.
+    """
+    name = node.name
+    extra = set(node.props.keys()) - _TARBALL_DEP_PROPS
+    if extra:
+        unknown = ", ".join(repr(p) for p in sorted(extra))
+        allowed = ", ".join(sorted(_TARBALL_DEP_PROPS))
+        raise ManifestError(
+            f"dep {name!r}: unknown property/properties {unknown} "
+            f"on a tarball dep (allowed: {allowed})"
+        )
+    url_raw = node.props["tarball"]
+    url = url_raw.geturl() if isinstance(url_raw, ParseResult) else url_raw
+    if not isinstance(url, str) or not url:
+        raise ManifestError(
+            f"dep {name!r}: 'tarball' must be a non-empty URL string"
+        )
+
+    sha256 = node.props.get("sha256")
+    if sha256 is not None and not isinstance(sha256, str):
+        raise ManifestError(
+            f"dep {name!r}: 'sha256' must be a string when provided"
+        )
+
+    strip_raw = node.props.get("strip_components", 0)
+    # kdl-py parses bare numeric literals as float; accept ints or
+    # integer-valued floats.
+    if isinstance(strip_raw, float) and strip_raw.is_integer():
+        strip_raw = int(strip_raw)
+    if not isinstance(strip_raw, int) or isinstance(strip_raw, bool) or strip_raw < 0:
+        raise ManifestError(
+            f"dep {name!r}: 'strip_components' must be a non-negative integer"
+        )
+
+    return TarballDep(
+        name=name,
+        url=url,
+        sha256=sha256,
+        strip_components=strip_raw,
+    )
 
 
 def _parse_member_dep(node: kdl.Node) -> MemberDep:

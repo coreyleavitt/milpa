@@ -19,7 +19,7 @@ import pytest
 
 from milpa.fetchers import FetcherRegistry
 from milpa.fetchers.git import GitProvenance, GitReceipt
-from milpa.manifest import LocalDep, Manifest, UrlDep
+from milpa.manifest import LocalDep, Manifest, TarballDep, UrlDep
 from milpa.resolver import ResolvedDep, ResolvedGraph, resolve
 
 
@@ -506,6 +506,50 @@ def test_resolve_local_dep_with_transitive_url_requires(tmp_path):
     chronos = next(d for d in graph.deps if d.name == "chronos")
     assert chronos.source == "https://example.com/chronos.git"
     assert chronos.sha == "csha"
+
+
+def test_resolve_tarball_dep_via_default_registry(tmp_path):
+    """End-to-end: a manifest TarballDep flows through the default
+    registry's TarballFetcher; resolved graph carries the dep with
+    source='tarball:<url>' and content_hash populated."""
+    import hashlib
+    import io
+    import tarfile
+
+    # Build a local tarball that the resolver will fetch via file://
+    archive = tmp_path / "pkg.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        data = 'srcDir = "src"\n'.encode()
+        info = tarfile.TarInfo(name="pkg.nimble")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    archive_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+
+    manifest = Manifest(
+        deps=(TarballDep(
+            name="pkg",
+            url=f"file://{archive}",
+            sha256=archive_sha,
+        ),),
+        kind="library",
+        name="test",
+    )
+
+    graph = resolve(
+        manifest,
+        deps_dir=tmp_path / "_deps",
+        registry={},
+    )
+
+    assert len(graph.deps) == 1
+    d = graph.deps[0]
+    assert d.name == "pkg"
+    assert d.source == f"tarball:file://{archive}"
+    assert d.ref is None
+    assert d.sha is None
+    assert d.tag is None
+    assert d.content_hash is not None
+    assert len(d.content_hash) == 64
 
 
 def test_resolve_topological_order(tmp_path):
