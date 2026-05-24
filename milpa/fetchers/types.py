@@ -27,17 +27,31 @@ FetchResult from the fetcher); the tightened types enforce the
 invariant structurally.
 """
 
+import shutil
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
 from ..identity import compute_content_hash
+
+if TYPE_CHECKING:
+    from ..cas import CAStore
 
 
 @dataclass(frozen=True)
 class Provenance:
     """Base class for provenance descriptors. Subclasses carry
-    transport-specific fields (URL, ref, digest, path, etc.)."""
+    transport-specific fields (URL, ref, digest, path, etc.).
+
+    `cas_admissible` (class attribute, not dataclass field) controls
+    whether the fetched bytes get admitted to the global content-
+    addressed store (#35). True for immutable sources (git, tarball —
+    bytes are pinned by ref or hash). False for editable sources
+    (local paths — admission would silently freeze user edits).
+    Subclasses override by re-declaring the class attribute."""
+
+    cas_admissible: ClassVar[bool] = True
 
 
 @dataclass(frozen=True)
@@ -57,7 +71,7 @@ class FetchResult:
     """
     name: str
     path: Path
-    content_hash: str
+    identity: str            # multihash-encoded (#34); was content_hash (#33 rename)
     receipt: ProvenanceReceipt
 
 
@@ -89,8 +103,9 @@ class FetcherRegistry:
     construct empty registries for isolation.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, store: "CAStore | None" = None) -> None:
         self._fetchers: list[Fetcher] = []
+        self._store = store
 
     def register(self, fetcher: Fetcher) -> None:
         self._fetchers.append(fetcher)
@@ -102,16 +117,42 @@ class FetcherRegistry:
         *,
         dest: Path,
     ) -> FetchResult:
+        fetcher = self._select(provenance)
+        if self._store is None or not provenance.cas_admissible:
+            # No CAS, or this provenance opts out (editable source —
+            # local path, workspace member). Fetch directly to dest.
+            receipt = fetcher.fetch(name, provenance, dest=dest)
+            identity = compute_content_hash(dest)
+            return FetchResult(
+                name=name, path=dest, identity=identity, receipt=receipt,
+            )
+
+        # CAS path: fetch into a scratch dir under the store, compute
+        # identity, admit, then link dest → CAS entry. Scratch lives
+        # under the CAS root so rename(scratch, canonical) stays
+        # intra-filesystem (atomic).
+        scratch_root = self._store.root / "_scratch"
+        scratch_root.mkdir(parents=True, exist_ok=True)
+        scratch = scratch_root / uuid.uuid4().hex
+        try:
+            receipt = fetcher.fetch(name, provenance, dest=scratch)
+            identity = compute_content_hash(scratch)
+            canonical = self._store.admit(scratch, identity)
+        except BaseException:
+            if scratch.exists():
+                shutil.rmtree(scratch, ignore_errors=True)
+            raise
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        self._store.link(identity, dest)
+        return FetchResult(
+            name=name, path=dest, identity=identity, receipt=receipt,
+        )
+
+    def _select(self, provenance: Provenance) -> "Fetcher":
         for f in self._fetchers:
             if f.can_handle(provenance):
-                receipt = f.fetch(name, provenance, dest=dest)
-                content_hash = compute_content_hash(dest)
-                return FetchResult(
-                    name=name,
-                    path=dest,
-                    content_hash=content_hash,
-                    receipt=receipt,
-                )
+                return f
         raise FetchError(
             f"no registered fetcher handles provenance kind "
             f"{type(provenance).__name__}"

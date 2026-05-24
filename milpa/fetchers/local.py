@@ -32,6 +32,7 @@ class LocalProvenance(Provenance):
     'relative to what'.
     """
     path: Path
+    cas_admissible = False     # local trees stay editable (#35)
 
     def __post_init__(self):
         if not self.path.is_absolute():

@@ -1,10 +1,15 @@
-"""Lockfile tests — KDL round-trip + verification against ResolvedGraph."""
+"""Lockfile tests — KDL round-trip + verification against ResolvedGraph.
+
+Schema is v2 (#33) — structured identity + provenance blocks.
+Legacy v1 reader exercised in test_lockfile_v2.py.
+"""
 
 from pathlib import Path
 
 import pytest
 
 from milpa.lockfile import (
+    GitProvenanceRecord,
     LockedDep,
     Lockfile,
     LockfileError,
@@ -18,21 +23,36 @@ from milpa.lockfile import (
 from milpa.resolver import ResolvedDep, ResolvedGraph
 
 
-# A canonical valid multihash identity; tests that don't care about
-# the actual hash bytes use this. Real fetches produce a real digest
-# via compute_content_hash.
 _VALID_HASH = "sha256:" + "f" * 64
 
 
 def _dep(name, *, source="https://example.com/x.git", ref="main",
-         tag=None, sha="abc123", content_hash=None,
+         tag=None, sha="abc123", identity=None,
          version=(0, 0, 1), src_dir="src", requires=()):
-    if content_hash is None:
-        content_hash = _VALID_HASH
+    """Helper for ResolvedDep construction (flat-field shape)."""
+    if identity is None:
+        identity = _VALID_HASH
     return ResolvedDep(
         name=name, source=source, ref=ref, tag=tag, sha=sha,
-        version=version, content_hash=content_hash,
+        version=version, identity=identity,
         src_dir=src_dir, requires=requires,
+    )
+
+
+def _locked_git(name, *, identity=_VALID_HASH, url="https://example.com/x.git",
+                ref="main", commit_sha=None, version="0.0.1",
+                src_dir="src", requires=()):
+    """Helper for LockedDep construction in tests that need direct
+    structured-lockfile shape."""
+    return LockedDep(
+        name=name,
+        identity=identity,
+        version=version,
+        src_dir=src_dir,
+        requires=requires,
+        provenances=(GitProvenanceRecord(
+            url=url, ref=ref, commit_sha=commit_sha,
+        ),),
     )
 
 
@@ -41,6 +61,7 @@ def test_format_lockfile_emits_dep_name_and_sha():
     lockfile = from_graph(graph)
     text = format_lockfile(lockfile)
     assert "chronos" in text
+    # commit_sha shows up inside the git provenance block
     assert "abc123def" in text
 
 
@@ -52,7 +73,6 @@ def test_format_lockfile_has_header_and_version():
 
 
 def test_format_lockfile_deps_sorted_by_name_regardless_of_graph_order():
-    # Construct in z, a, m order; output must be a, m, z.
     graph = ResolvedGraph(deps=(_dep("zebra"), _dep("alpha"), _dep("mid")))
     text = format_lockfile(from_graph(graph))
     a_idx = text.index('"alpha"')
@@ -61,65 +81,15 @@ def test_format_lockfile_deps_sorted_by_name_regardless_of_graph_order():
     assert a_idx < m_idx < z_idx
 
 
-def test_parse_lockfile_reads_single_dep():
-    canonical_hash = "sha256:" + "d" * 64
-    text = f'''// header
-version 1
-
-dep "chronos" {{
-    source "https://example.com/chronos.git"
-    ref "main"
-    sha "abc123"
-    content_hash "{canonical_hash}"
-    version "0.0.1"
-    src_dir ""
-    requires
-}}
-'''
-    lockfile = parse_lockfile(text)
-    assert lockfile.version == 1
-    assert len(lockfile.deps) == 1
-    dep = lockfile.deps[0]
-    assert dep.name == "chronos"
-    assert dep.source == "https://example.com/chronos.git"
-    assert dep.ref == "main"
-    assert dep.sha == "abc123"
-    # content_hash preserved in canonical multihash form (#34) —
-    # no longer stripped at parse time
-    assert dep.content_hash == canonical_hash
-    assert dep.version == "0.0.1"
-    assert dep.src_dir == ""
-    assert dep.requires == ()
-
-
-def test_lockfile_format_emits_tag_field_when_present():
-    """Regression: Hypothesis (issue #64, 2026-05-22) found that
-    format_lockfile silently dropped the `tag` field — parse read it,
-    format never wrote it. Round-trip was lossy for every registry-
-    resolved dep, but the loss went unnoticed because `ref` carried
-    redundant info via _infer_ref."""
-    L = Lockfile(
-        version=1,
-        deps=(LockedDep(
-            name="foo", source="registry:foo", ref="v0.5.1", tag="v0.5.1",
-            sha="abc123", content_hash="sha256:" + "a" * 64, version="0.5.1",
-            src_dir="src", requires=(),
-        ),),
-        strategy="maxver",
-    )
-    text = format_lockfile(L)
-    assert 'tag "v0.5.1"' in text, "format_lockfile must emit tag"
-    # And the round-trip preserves it
-    parsed = parse_lockfile(text)
-    assert parsed.deps[0].tag == "v0.5.1"
-
-
 def test_format_parse_round_trip():
+    """ResolvedGraph → from_graph → format_lockfile → parse_lockfile
+    is round-trip stable. v2 schema preserves identity-vs-provenance
+    separation."""
     graph = ResolvedGraph(deps=(
         _dep("chronos", source="https://example.com/chronos.git",
-             ref="feat/x", sha="abc", content_hash="sha256:" + "c" * 64, src_dir=""),
+             ref="feat/x", sha="abc", identity="sha256:" + "c" * 64, src_dir=""),
         _dep("intonaco", source="https://example.com/intonaco.git",
-             ref="main", sha="def", content_hash="sha256:" + "1" * 64, src_dir="src",
+             ref="main", sha="def", identity="sha256:" + "1" * 64, src_dir="src",
              requires=("chronos",)),
     ))
     lockfile = from_graph(graph)
@@ -136,8 +106,8 @@ def test_parse_lockfile_rejects_unknown_schema_version():
 
 def test_write_and_load_round_trip(tmp_path):
     graph = ResolvedGraph(deps=(
-        _dep("alpha", sha="aaa", content_hash="sha256:" + "a" * 64),
-        _dep("bravo", sha="bbb", content_hash="sha256:" + "b" * 64, requires=("alpha",)),
+        _dep("alpha", sha="aaa", identity="sha256:" + "a" * 64),
+        _dep("bravo", sha="bbb", identity="sha256:" + "b" * 64, requires=("alpha",)),
     ))
     lockfile = from_graph(graph)
     path = write_lockfile(lockfile, tmp_path / "milpa.lock")
@@ -149,38 +119,35 @@ def test_write_and_load_round_trip(tmp_path):
 
 def test_verify_against_graph_passes_for_matching_graph():
     graph = ResolvedGraph(deps=(
-        _dep("foo", sha="abc", content_hash="sha256:" + "0" * 64),
+        _dep("foo", sha="abc", identity="sha256:" + "0" * 64),
     ))
     lockfile = from_graph(graph)
-    # No exception
-    verify_against_graph(lockfile, graph)
+    verify_against_graph(lockfile, graph)  # no exception
 
 
-def test_verify_against_graph_raises_on_content_hash_mismatch():
+def test_verify_against_graph_raises_on_identity_mismatch():
     graph_locked = ResolvedGraph(deps=(
-        _dep("foo", sha="abc", content_hash="sha256:" + "0" * 64),
+        _dep("foo", sha="abc", identity="sha256:" + "0" * 64),
     ))
     lockfile = from_graph(graph_locked)
     graph_drifted = ResolvedGraph(deps=(
-        _dep("foo", sha="abc", content_hash="sha256:" + "1" * 64),
+        _dep("foo", sha="abc", identity="sha256:" + "1" * 64),
     ))
     with pytest.raises(LockfileError) as exc:
         verify_against_graph(lockfile, graph_drifted)
     assert "foo" in str(exc.value)
-    assert "hash" in str(exc.value).lower() or "content" in str(exc.value).lower()
+    assert "identity" in str(exc.value).lower()
 
 
 def test_verify_against_graph_raises_on_missing_or_extra_dep():
     locked_graph = ResolvedGraph(deps=(_dep("foo"), _dep("bar")))
     lockfile = from_graph(locked_graph)
 
-    # Graph missing 'bar'
     missing = ResolvedGraph(deps=(_dep("foo"),))
     with pytest.raises(LockfileError) as exc:
         verify_against_graph(lockfile, missing)
     assert "bar" in str(exc.value)
 
-    # Graph has an extra dep 'baz'
     extra = ResolvedGraph(deps=(_dep("foo"), _dep("bar"), _dep("baz")))
     with pytest.raises(LockfileError) as exc:
         verify_against_graph(lockfile, extra)
@@ -198,32 +165,31 @@ def test_empty_graph_produces_empty_valid_lockfile():
 
 
 def test_lockfile_records_strategy():
-    """Lockfile records which resolution strategy produced it, for
-    diagnostic clarity ('how was this lockfile generated?')."""
+    """Lockfile records which resolution strategy produced it."""
     graph = ResolvedGraph(deps=(_dep("foo"),))
     lockfile = from_graph(graph, strategy="minver")
     text = format_lockfile(lockfile)
     assert 'strategy "minver"' in text
-    # Round-trip preserves it
     parsed = parse_lockfile(text)
     assert parsed.strategy == "minver"
 
 
 def test_lockfile_without_strategy_field_parses_as_maxver():
-    """Lockfiles emitted before this feature shipped don't have a
-    strategy field. Parsing such files defaults to maxver — no
-    schema-version bump needed for this field."""
+    """Pre-strategy lockfiles default to maxver — no schema bump."""
     text = '''// older lockfile, pre-strategy
 version 1
 
 dep "foo" {
-    source "https://example.com/x.git"
-    ref "main"
-    sha "abc"
-    content_hash "sha256:''' + "0" * 64 + '''"
+    identity "sha256:''' + "0" * 64 + '''"
     version "0.0.1"
     src_dir "src"
     requires
+    provenance {
+        kind "git"
+        url "https://example.com/x.git"
+        ref "main"
+        commit_sha "abc"
+    }
 }
 '''
     parsed = parse_lockfile(text)
@@ -232,19 +198,21 @@ dep "foo" {
 
 def test_parse_lockfile_rejects_unsupported_algorithm():
     """parse_identity-driven rejection at lockfile load time: an
-    md5-encoded content_hash is unsupported and surfaces as a
-    LockfileError naming the algorithm. Catches the bad data
-    early, not deep in verify."""
+    md5-encoded identity is unsupported and surfaces as a
+    LockfileError naming the algorithm."""
     text = '''version 1
 
 dep "foo" {
-    source "https://example.com/x.git"
-    ref "main"
-    sha "abc"
-    content_hash "md5:''' + "f" * 32 + '''"
+    identity "md5:''' + "f" * 32 + '''"
     version "0.0.1"
     src_dir ""
     requires
+    provenance {
+        kind "git"
+        url "https://example.com/x.git"
+        ref "main"
+        commit_sha "abc"
+    }
 }
 '''
     with pytest.raises(LockfileError) as exc:

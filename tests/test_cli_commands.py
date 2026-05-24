@@ -162,7 +162,7 @@ def test_cmd_show_truncates_hashes_for_readability(tmp_path, capsys):
     # Read the actual content_hash milpa computed from the bytes.
     # Multihash form (#34) — `sha256:` + 64-char digest.
     locked = load_lockfile(tmp_path / "milpa.lock")
-    actual_hash = locked.deps[0].content_hash
+    actual_hash = locked.deps[0].identity
     assert actual_hash and actual_hash.startswith("sha256:")
     actual_digest = actual_hash.split(":", 1)[1]
     assert len(actual_digest) == 64
@@ -233,8 +233,9 @@ def test_cmd_show_registry_dep_shows_registry_provenance(tmp_path, capsys):
     capsys.readouterr()
     cmd_show(tmp_path)
     out = capsys.readouterr().out
-    assert "registry:bar" in out
-    # registry dep's ref is its resolved tag
+    # v2 schema displays registry provenance as `registry <name>` (kind
+    # prefix + name); the tag appears after `@`
+    assert "registry bar" in out
     assert "v0.1.0" in out
 
 

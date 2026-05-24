@@ -14,6 +14,7 @@ Public surface:
 See docs/rfc-pluggable-fetchers.md for the design.
 """
 
+from ..cas import default_store
 from .git import GitFetcher, GitProvenance, GitReceipt
 from .local import LocalFetcher, LocalProvenance, LocalReceipt
 from .tarball import TarballFetcher, TarballProvenance, TarballReceipt
@@ -27,7 +28,7 @@ from .types import (
 )
 
 
-default_registry = FetcherRegistry()
+default_registry = FetcherRegistry(store=default_store())
 default_registry.register(GitFetcher())
 default_registry.register(LocalFetcher())
 default_registry.register(TarballFetcher())

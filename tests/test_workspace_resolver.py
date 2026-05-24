@@ -92,9 +92,9 @@ def test_resolve_workspace_single_member_no_deps(tmp_path):
     assert d.ref is None
     assert d.sha is None
     assert d.tag is None
-    assert d.content_hash is not None
-    assert d.content_hash.startswith("sha256:")
-    assert len(d.content_hash) == len("sha256:") + 64
+    assert d.identity is not None
+    assert d.identity.startswith("sha256:")
+    assert len(d.identity) == len("sha256:") + 64
     assert d.requires == ()
 
 
@@ -396,12 +396,15 @@ def test_lockfile_round_trip_preserves_member_source(tmp_path):
     text = format_lockfile(lockfile)
     reloaded = parse_lockfile(text)
 
+    from milpa.lockfile import MemberProvenanceRecord
     assert reloaded == lockfile
-    sources = {d.name: d.source for d in reloaded.deps}
-    assert sources == {
-        "fresco": "member:fresco",
-        "intonaco": "member:intonaco",
-    }
+    # Each member's provenance is a MemberProvenanceRecord naming the member
+    by_name = {d.name: d for d in reloaded.deps}
+    for name in ("fresco", "intonaco"):
+        provs = by_name[name].provenances
+        assert len(provs) == 1
+        assert isinstance(provs[0], MemberProvenanceRecord)
+        assert provs[0].name == name
 
 
 def test_resolve_workspace_unknown_member_reference_raises(tmp_path):

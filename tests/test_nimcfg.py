@@ -9,10 +9,10 @@ from milpa.resolver import ResolvedDep, ResolvedGraph
 
 
 def _dep(name, src_dir="", source="src", ref=None, sha=None, tag=None,
-         version=(0, 0, 1), content_hash=None, requires=()):
+         version=(0, 0, 1), identity=None, requires=()):
     return ResolvedDep(
         name=name, source=source, ref=ref, tag=tag, sha=sha, version=version,
-        content_hash=content_hash, src_dir=src_dir, requires=requires,
+        identity=identity, src_dir=src_dir, requires=requires,
     )
 
 

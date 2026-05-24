@@ -69,9 +69,9 @@ def test_registry_dispatches_to_git_fetcher_end_to_end(tmp_path):
     assert (result.path / "hello.txt").read_text() == "hello world\n"
     # Identity: 64 hex chars (sha256 of source tree)
     # Multihash form: "sha256:" + 64 hex chars
-    assert result.content_hash.startswith("sha256:")
-    assert len(result.content_hash) == len("sha256:") + 64
-    assert all(c in "0123456789abcdef" for c in result.content_hash.split(":", 1)[1])
+    assert result.identity.startswith("sha256:")
+    assert len(result.identity) == len("sha256:") + 64
+    assert all(c in "0123456789abcdef" for c in result.identity.split(":", 1)[1])
     # Receipt: transport-specific provenance record
     assert isinstance(result.receipt, GitReceipt)
     assert len(result.receipt.commit_sha) == 40
@@ -140,7 +140,7 @@ def test_registry_computes_identity_externally(tmp_path):
     the content_hash, even if it tries.
 
     We verify by writing known bytes through a stub fetcher whose
-    receipt is unrelated, then asserting the FetchResult.content_hash
+    receipt is unrelated, then asserting the FetchResult.identity
     equals the registry's independent recomputation against the bytes
     actually at dest. Two different fetchers that produce the SAME
     bytes at dest must produce the SAME content_hash, regardless of
@@ -178,7 +178,7 @@ def test_registry_computes_identity_externally(tmp_path):
     # Different receipts (the fetchers report different lies)...
     assert r_a.receipt.lie != r_b.receipt.lie
     # ...but identity is purely a function of dest contents.
-    assert r_a.content_hash == r_b.content_hash
+    assert r_a.identity == r_b.identity
     # And it matches what we'd compute directly against dest, with no
     # registry/fetcher involvement at all.
-    assert r_a.content_hash == compute_content_hash(tmp_path / "a")
+    assert r_a.identity == compute_content_hash(tmp_path / "a")

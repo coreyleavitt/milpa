@@ -74,9 +74,9 @@ def test_resolve_single_url_dep_no_transitive(tmp_path):
     assert graph.deps[0].name == "foo"
     assert graph.deps[0].sha == "aaa111"
     # content_hash is now milpa-computed from the dest tree; only assert shape
-    assert graph.deps[0].content_hash is not None
-    assert graph.deps[0].content_hash.startswith("sha256:")
-    assert len(graph.deps[0].content_hash) == len("sha256:") + 64
+    assert graph.deps[0].identity is not None
+    assert graph.deps[0].identity.startswith("sha256:")
+    assert len(graph.deps[0].identity) == len("sha256:") + 64
     assert graph.deps[0].src_dir == "src"
 
 
@@ -320,7 +320,7 @@ def test_resolve_parallel_produces_same_graph_as_serial(tmp_path):
     def normalize(g):
         return tuple(
             (d.name, d.source, d.ref, d.tag, d.sha, d.version,
-             d.content_hash, d.src_dir, d.requires)
+             d.identity, d.src_dir, d.requires)
             for d in g.deps
         )
     assert normalize(serial) == normalize(parallel)
@@ -446,9 +446,9 @@ def test_resolve_local_dep_uses_default_local_fetcher(tmp_path):
     assert d.ref is None
     assert d.sha is None
     assert d.tag is None
-    assert d.content_hash is not None
-    assert d.content_hash.startswith("sha256:")
-    assert len(d.content_hash) == len("sha256:") + 64
+    assert d.identity is not None
+    assert d.identity.startswith("sha256:")
+    assert len(d.identity) == len("sha256:") + 64
     # Source bytes copied into _deps
     assert (project / "_deps" / "intonaco" / "intonaco.nimble").exists()
 
@@ -550,9 +550,9 @@ def test_resolve_tarball_dep_via_default_registry(tmp_path):
     assert d.ref is None
     assert d.sha is None
     assert d.tag is None
-    assert d.content_hash is not None
-    assert d.content_hash.startswith("sha256:")
-    assert len(d.content_hash) == len("sha256:") + 64
+    assert d.identity is not None
+    assert d.identity.startswith("sha256:")
+    assert len(d.identity) == len("sha256:") + 64
 
 
 def test_resolve_topological_order(tmp_path):

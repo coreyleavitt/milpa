@@ -63,8 +63,8 @@ class ResolvedDep:
     tag: str | None       # tag name (registry deps only)
     sha: str | None       # resolved commit SHA
     version: Version
-    content_hash: str | None
-    src_dir: str          # for nim.cfg --path emission
+    identity: str | None   # multihash-encoded content hash (#34); was content_hash (#33)
+    src_dir: str           # for nim.cfg --path emission
     requires: tuple[str, ...]  # names of direct deps
 
 
@@ -93,7 +93,7 @@ class _Candidate:
     ref: str | None
     sha: str | None
     tag: str | None
-    content_hash: str | None
+    identity: str | None       # multihash-encoded (#34); was content_hash
     src_dir: str
     dep_terms: list[Term]      # for the solver
     requires_names: list[str]  # for ResolvedDep.requires
@@ -156,10 +156,10 @@ class _MaterializedProvider:
         by_hash: dict[str, list[_Candidate]] = {}
         no_hash: list[_Candidate] = []
         for c in self._pending:
-            if c.content_hash is None or c.source.startswith("member:"):
+            if c.identity is None or c.source.startswith("member:"):
                 no_hash.append(c)
                 continue
-            by_hash.setdefault(c.content_hash, []).append(c)
+            by_hash.setdefault(c.identity, []).append(c)
 
         # Pass-through: no-hash + member candidates land as-is.
         for c in no_hash:
@@ -297,7 +297,7 @@ def resolve(
     # The synthetic root candidate at version (0,0,0):
     root_cand = _Candidate(
         name="__root__", version=(0, 0, 0),
-        source="root", ref=None, sha=None, tag=None, content_hash=None,
+        source="root", ref=None, sha=None, tag=None, identity=None,
         src_dir="", dep_terms=root_terms,
         requires_names=root_requires,
     )
@@ -486,7 +486,7 @@ def resolve_workspace(
             version=_URL_DEP_VERSION,
             source=f"member:{member.name}",
             ref=None, sha=None, tag=None,
-            content_hash=compute_content_hash(member.directory),
+            identity=compute_content_hash(member.directory),
             src_dir=_extract_src_dir(member.manifest),
             dep_terms=terms,
             requires_names=requires_names,
@@ -500,7 +500,7 @@ def resolve_workspace(
 
     root_cand = _Candidate(
         name="__root__", version=(0, 0, 0),
-        source="root", ref=None, sha=None, tag=None, content_hash=None,
+        source="root", ref=None, sha=None, tag=None, identity=None,
         src_dir="", dep_terms=root_terms,
         requires_names=root_requires,
     )
@@ -709,7 +709,7 @@ def _process_url(
     candidate = _Candidate(
         name=dep.name, version=_URL_DEP_VERSION,
         source=dep.git, ref=dep.ref, sha=sha, tag=None,
-        content_hash=result.content_hash,
+        identity=result.identity,
         src_dir=nm.src_dir or "",
         dep_terms=terms, requires_names=requires_names,
     )
@@ -750,7 +750,7 @@ def _process_tarball(
     candidate = _Candidate(
         name=dep.name, version=_URL_DEP_VERSION,
         source=f"tarball:{dep.url}", ref=None, sha=None, tag=None,
-        content_hash=result.content_hash,
+        identity=result.identity,
         src_dir=(nm.src_dir or "") if nm else "",
         dep_terms=terms, requires_names=requires_names,
     )
@@ -794,7 +794,7 @@ def _process_local(
     candidate = _Candidate(
         name=dep.name, version=_URL_DEP_VERSION,
         source=f"local:{dep.path}", ref=None, sha=None, tag=None,
-        content_hash=result.content_hash,
+        identity=result.identity,
         src_dir=(nm.src_dir or "") if nm else "",
         dep_terms=terms, requires_names=requires_names,
     )
@@ -840,7 +840,7 @@ def _process_named(
         name=name, version=ver,
         source=f"registry:{name}", ref=r.tag,
         sha=sha, tag=r.tag,
-        content_hash=result.content_hash,
+        identity=result.identity,
         src_dir=(nm.src_dir or "") if nm else "",
         dep_terms=terms, requires_names=requires_names,
     )
@@ -977,7 +977,7 @@ def _build_graph(
             name=c.name, source=c.source,
             ref=c.ref, tag=c.tag, sha=c.sha,
             version=c.version,
-            content_hash=c.content_hash,
+            identity=c.identity,
             src_dir=c.src_dir,
             requires=tuple(c.requires_names),
         ))

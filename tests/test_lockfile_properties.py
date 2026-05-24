@@ -20,6 +20,7 @@ counterexamples Hypothesis surfaces.
 from hypothesis import HealthCheck, given, settings, strategies as st
 
 from milpa.lockfile import (
+    GitProvenanceRecord,
     Lockfile,
     LockedDep,
     format_lockfile,
@@ -76,17 +77,22 @@ def version_triples():
     )
 
 
+def _git_provenance_record(draw_):
+    """Build a single GitProvenanceRecord for tests."""
+    return GitProvenanceRecord(
+        url=draw_(source_urls()),
+        ref=draw_(st.one_of(st.none(), names())),
+        commit_sha=draw_(st.one_of(st.none(), hex_strings(40))),
+    )
+
+
 @st.composite
 def locked_deps(draw, allowed_requires_names=None):
-    """A single LockedDep value with KDL-safe components."""
+    """A single LockedDep value (v2 shape) with KDL-safe components."""
     name = draw(names())
     return LockedDep(
         name=name,
-        source=draw(source_urls()),
-        ref=draw(st.one_of(st.none(), names())),
-        tag=draw(st.one_of(st.none(), names())),
-        sha=draw(st.one_of(st.none(), hex_strings(40))),
-        content_hash=draw(st.one_of(st.none(), multihash_identities())),
+        identity=draw(st.one_of(st.none(), multihash_identities())),
         version=draw(version_triples()),
         src_dir=draw(st.text(alphabet=_NAME_ALPHABET, max_size=20)),
         requires=tuple(draw(st.lists(
@@ -95,6 +101,7 @@ def locked_deps(draw, allowed_requires_names=None):
             max_size=5,
             unique=True,
         ))),
+        provenances=(_git_provenance_record(draw),),
     )
 
 
@@ -118,16 +125,13 @@ def lockfiles(draw):
         )
         deps.append(LockedDep(
             name=name,
-            source=draw(source_urls()),
-            ref=draw(st.one_of(st.none(), names())),
-            tag=draw(st.one_of(st.none(), names())),
-            sha=draw(st.one_of(st.none(), hex_strings(40))),
-            content_hash=draw(st.one_of(st.none(), multihash_identities())),
+            identity=draw(st.one_of(st.none(), multihash_identities())),
             version=draw(version_triples()),
             src_dir=draw(st.text(alphabet=_NAME_ALPHABET, max_size=20)),
             requires=tuple(draw(st.lists(
                 require_strategy, max_size=3, unique=True,
             ))) if other_names else (),
+            provenances=(_git_provenance_record(draw),),
         ))
     # Lockfile sorts by name on output, so canonical form sorts here too
     deps.sort(key=lambda d: d.name)

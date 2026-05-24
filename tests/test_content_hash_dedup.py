@@ -305,9 +305,13 @@ def test_lockfile_records_single_entry_per_content_hash(tmp_path):
     # Single lockfile entry — the canonical (lex-min) name + its
     # provenance URL. The non-canonical fork URL doesn't appear
     # (Phase D #37 adds multi-provenance).
+    from milpa.lockfile import GitProvenanceRecord
     assert len(lockfile.deps) == 1
     assert lockfile.deps[0].name == "chronos"
-    assert lockfile.deps[0].source == "https://upstream/chronos.git"
+    assert len(lockfile.deps[0].provenances) == 1
+    prov = lockfile.deps[0].provenances[0]
+    assert isinstance(prov, GitProvenanceRecord)
+    assert prov.url == "https://upstream/chronos.git"
 
 
 # Pre-fetch (URL, ref) dedup regression coverage lives in

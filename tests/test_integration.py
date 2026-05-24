@@ -57,10 +57,18 @@ def test_fresco_tree_resolves_end_to_end(tmp_path: Path):
     # chronos is the manifest-declared URL dep
     assert "chronos" in names, f"chronos missing from lockfile (got: {names})"
 
-    # Every dep has cryptographic pins
+    # Every dep has cryptographic pins: an identity (multihash) plus at
+    # least one provenance. Git and registry provenances carry a
+    # commit_sha; we require one when present.
+    from milpa.lockfile import GitProvenanceRecord, RegistryProvenanceRecord
     for dep in lockfile.deps:
-        assert dep.sha, f"dep {dep.name!r} has no sha pin"
-        assert dep.content_hash, f"dep {dep.name!r} has no content_hash pin"
+        assert dep.identity, f"dep {dep.name!r} has no identity pin"
+        assert dep.provenances, f"dep {dep.name!r} has no provenance"
+        first = dep.provenances[0]
+        if isinstance(first, (GitProvenanceRecord, RegistryProvenanceRecord)):
+            assert first.commit_sha, (
+                f"dep {dep.name!r} provenance has no commit_sha pin"
+            )
 
     # nim.cfg has a --path line for each resolved dep
     nim_cfg = (tmp_path / "nim.cfg").read_text()

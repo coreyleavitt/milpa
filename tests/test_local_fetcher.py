@@ -50,9 +50,9 @@ def test_local_fetcher_copies_source_tree_and_returns_receipt(tmp_path):
 
     # Identity computed by registry (64-hex sha256)
     # Multihash form: "sha256:" + 64 hex chars
-    assert result.content_hash.startswith("sha256:")
-    assert len(result.content_hash) == len("sha256:") + 64
-    assert all(c in "0123456789abcdef" for c in result.content_hash.split(":", 1)[1])
+    assert result.identity.startswith("sha256:")
+    assert len(result.identity) == len("sha256:") + 64
+    assert all(c in "0123456789abcdef" for c in result.identity.split(":", 1)[1])
 
     # Receipt records where we copied from
     assert isinstance(result.receipt, LocalReceipt)
@@ -121,7 +121,7 @@ def test_refetch_reflects_source_changes(tmp_path):
 
     r2 = registry.fetch("x", LocalProvenance(path=src), dest=dest)
     assert (dest / "file.txt").read_text() == "second\n"
-    assert r1.content_hash != r2.content_hash
+    assert r1.identity != r2.identity
 
 
 def test_symlinks_in_source_preserved_as_symlinks_in_dest(tmp_path):
@@ -162,6 +162,6 @@ def test_identity_is_path_independent(tmp_path):
     r1 = registry.fetch("x", LocalProvenance(path=s1), dest=tmp_path / "d1")
     r2 = registry.fetch("x", LocalProvenance(path=s2), dest=tmp_path / "d2")
 
-    assert r1.content_hash == r2.content_hash
+    assert r1.identity == r2.identity
     # Receipts DO record the different paths (that's their job — provenance)
     assert r1.receipt.source_path != r2.receipt.source_path

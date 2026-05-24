@@ -211,21 +211,48 @@ def cmd_show(project_dir: Path) -> int:
         return 1
     for dep in lockfile.deps:
         print(f"{dep.name:20s} {dep.version}")
-        if dep.content_hash:
-            # content_hash is multihash-encoded (#34) — already
-            # `sha256:<hex>`. Truncate the digest portion for display
-            # but preserve the algorithm prefix.
-            algo, _, digest = dep.content_hash.partition(":")
+        if dep.identity:
+            # identity is multihash-encoded (#34) — `<algo>:<hex>`.
+            # Truncate the digest portion for display.
+            algo, _, digest = dep.identity.partition(":")
             print(f"  identity    {algo}:{digest[:8]}")
-        provenance = dep.source
-        if dep.ref:
-            provenance += f" @ {dep.ref}"
-        if dep.sha:
-            provenance += f" (sha {dep.sha[:8]})"
-        print(f"  provenance  {provenance}")
+        for prov in dep.provenances:
+            print(f"  provenance  {_format_provenance_for_show(prov)}")
         if dep.requires:
             print(f"  requires    {', '.join(dep.requires)}")
     return 0
+
+
+def _format_provenance_for_show(p) -> str:
+    """Render a ProvenanceRecord as a one-line summary for cmd_show."""
+    from .lockfile import (
+        GitProvenanceRecord,
+        TarballProvenanceRecord,
+        LocalProvenanceRecord,
+        MemberProvenanceRecord,
+        RegistryProvenanceRecord,
+    )
+    if isinstance(p, GitProvenanceRecord):
+        parts = [f"git {p.url}"]
+        if p.ref:
+            parts.append(f"@ {p.ref}")
+        if p.commit_sha:
+            parts.append(f"(sha {p.commit_sha[:8]})")
+        return " ".join(parts)
+    if isinstance(p, TarballProvenanceRecord):
+        return f"tarball {p.url}"
+    if isinstance(p, LocalProvenanceRecord):
+        return f"local {p.path}"
+    if isinstance(p, MemberProvenanceRecord):
+        return f"member {p.name}"
+    if isinstance(p, RegistryProvenanceRecord):
+        parts = [f"registry {p.name}"]
+        if p.tag:
+            parts.append(f"@ {p.tag}")
+        if p.commit_sha:
+            parts.append(f"(sha {p.commit_sha[:8]})")
+        return " ".join(parts)
+    return str(p)
 
 
 def cmd_verify(project_dir: Path) -> int:
@@ -317,11 +344,19 @@ def _local_source_drift_warnings(
     when the source is ahead of the snapshot.
     """
     from .identity import compute_content_hash
+    from .lockfile import LocalProvenanceRecord
     warnings: list[str] = []
     for dep in lockfile.deps:
-        if not dep.source.startswith("local:"):
+        # Find the first LocalProvenanceRecord (if any). Multi-
+        # provenance: identity is single per dep, so the source-drift
+        # check applies once even if multiple provenances are recorded.
+        local_prov = next(
+            (p for p in dep.provenances if isinstance(p, LocalProvenanceRecord)),
+            None,
+        )
+        if local_prov is None:
             continue
-        declared = dep.source[len("local:"):]
+        declared = local_prov.path
         abs_source = (project_dir / declared).resolve()
         if not abs_source.is_dir():
             warnings.append(
@@ -330,7 +365,7 @@ def _local_source_drift_warnings(
             )
             continue
         actual = compute_content_hash(abs_source)
-        if actual != dep.content_hash:
+        if actual != dep.identity:
             warnings.append(
                 f"{dep.name}: local source at {declared!r} has drifted "
                 f"from the snapshot in milpa.lock; run `milpa fetch` to refresh"

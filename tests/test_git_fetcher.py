@@ -85,9 +85,9 @@ def test_content_hash_is_64_hex_chars(tmp_path, registry):
 
     result = fetch(registry, "r", src, "main", deps_dir)
     # Multihash form: "sha256:" + 64 hex chars
-    assert result.content_hash.startswith("sha256:")
-    assert len(result.content_hash) == len("sha256:") + 64
-    assert all(c in "0123456789abcdef" for c in result.content_hash.split(":", 1)[1])
+    assert result.identity.startswith("sha256:")
+    assert len(result.identity) == len("sha256:") + 64
+    assert all(c in "0123456789abcdef" for c in result.identity.split(":", 1)[1])
 
 
 def test_content_hash_is_deterministic(tmp_path, registry):
@@ -100,7 +100,7 @@ def test_content_hash_is_deterministic(tmp_path, registry):
     r1 = fetch(registry, "r1", s1, "main", deps_dir)
     r2 = fetch(registry, "r2", s2, "main", deps_dir)
 
-    assert r1.content_hash == r2.content_hash
+    assert r1.identity == r2.identity
 
 
 def test_content_hash_differs_on_content_change(tmp_path, registry):
@@ -112,7 +112,7 @@ def test_content_hash_differs_on_content_change(tmp_path, registry):
     r1 = fetch(registry, "r1", s1, "main", deps_dir)
     r2 = fetch(registry, "r2", s2, "main", deps_dir)
 
-    assert r1.content_hash != r2.content_hash
+    assert r1.identity != r2.identity
 
 
 def test_idempotent_rerun_returns_same_result(tmp_path, registry):
@@ -153,7 +153,7 @@ def test_wrong_ref_existing_dir_updated(tmp_path, registry):
     r_dev = fetch(registry, "r", src, "dev", deps_dir)
     assert (deps_dir / "r" / "a.txt").read_text() == "beta\n"
     assert r_main.receipt.commit_sha != r_dev.receipt.commit_sha
-    assert r_main.content_hash != r_dev.content_hash
+    assert r_main.identity != r_dev.identity
 
 
 def test_bad_url_raises_fetch_error_with_url_in_message(tmp_path, registry):
@@ -220,7 +220,7 @@ def test_content_hash_reflects_executable_bit_end_to_end(tmp_path, registry):
     deps_dir_b.mkdir()
     r2 = fetch(registry, "r", src, "main", deps_dir_b)
 
-    assert r1.content_hash != r2.content_hash
+    assert r1.identity != r2.identity
 
 
 def test_content_hash_excludes_dot_git(tmp_path, registry):
@@ -257,4 +257,4 @@ def test_content_hash_excludes_dot_git(tmp_path, registry):
     r2 = fetch(registry, "r2", s2, "main", deps_dir)
 
     assert r1.receipt.commit_sha != r2.receipt.commit_sha
-    assert r1.content_hash == r2.content_hash
+    assert r1.identity == r2.identity
