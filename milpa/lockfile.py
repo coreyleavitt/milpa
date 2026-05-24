@@ -118,6 +118,10 @@ class LockedDep:
     `provenances` tuple records one or more ProvenanceRecord entries
     describing where the bytes came from. #33 ships with exactly one
     provenance per dep; #37 (Phase D) lights up multi-provenance.
+
+    `active_flags` (#23) records the feature flag set active for this
+    dep in the resolved graph. Empty tuple = no flags (or all defaults
+    apply); omitted from emitted KDL when empty to keep diffs minimal.
     """
     name: str
     identity: str | None
@@ -125,6 +129,7 @@ class LockedDep:
     src_dir: str
     requires: tuple[str, ...]
     provenances: tuple[ProvenanceRecord, ...]
+    active_flags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -255,6 +260,7 @@ def _parse_dep(node: kdl.Node) -> LockedDep:
     version = "0.0.0"
     src_dir = ""
     requires: tuple[str, ...] = ()
+    active_flags: tuple[str, ...] = ()
     provenances: list[ProvenanceRecord] = []
 
     for child in node.nodes:
@@ -272,6 +278,8 @@ def _parse_dep(node: kdl.Node) -> LockedDep:
             src_dir = _scalar_str(child, name, "src_dir")
         elif child.name == "requires":
             requires = tuple(a for a in child.args if isinstance(a, str))
+        elif child.name == "active_flags":
+            active_flags = tuple(a for a in child.args if isinstance(a, str))
         elif child.name == "provenance":
             provenances.append(_parse_provenance_block(child, name))
         else:
@@ -284,6 +292,7 @@ def _parse_dep(node: kdl.Node) -> LockedDep:
         src_dir=src_dir,
         requires=requires,
         provenances=tuple(provenances),
+        active_flags=active_flags,
     )
 
 
@@ -389,6 +398,9 @@ def format_lockfile(lockfile: Lockfile) -> str:
             lines.append(f'    requires {req_args}')
         else:
             lines.append("    requires")
+        if dep.active_flags:
+            flag_args = " ".join(f'"{f}"' for f in dep.active_flags)
+            lines.append(f'    active_flags {flag_args}')
         for prov in dep.provenances:
             lines.append("    provenance {")
             for line in _format_provenance_fields(prov):

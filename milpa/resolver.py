@@ -66,6 +66,12 @@ class ResolvedDep:
     identity: str | None   # multihash-encoded content hash (#34); was content_hash (#33)
     src_dir: str           # for nim.cfg --path emission
     requires: tuple[str, ...]  # names of direct deps
+    active_flags: tuple[str, ...] = ()  # feature flags active on this dep (#23)
+    # Per-flag explicit -d: overrides. Each entry: (flag_name, tuple of
+    # -d: strings to emit). Flags not listed here use the convention
+    # `-d:<dep_name>_<flag_name>`. Stored as a tuple of pairs so the
+    # dataclass stays hashable and immutable (#23).
+    flag_defines: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -709,36 +715,52 @@ def _item_targets_member(item, members_by_name: dict) -> bool:
     return False
 
 
-def _filter_manifest_by_profile(manifest: Manifest, profile) -> Manifest:
-    """Drop deps whose predicates don't match `profile`. Returns a new
-    Manifest with the filtered deps tuple."""
+def _filter_manifest_by_profile(
+    manifest: Manifest, profile, active_flags: frozenset | None = None,
+) -> Manifest:
+    """Drop deps whose predicates don't match `profile` (#26) or the
+    given `active_flags` set (#23). Returns a new Manifest with the
+    filtered deps tuple.
+
+    `active_flags` defaults to the set of declared flags whose
+    `default=True` (the natural choice for top-level resolution).
+    """
     from dataclasses import replace as dc_replace
+    if active_flags is None:
+        active_flags = frozenset(
+            fd.name for fd in manifest.flags if fd.default
+        )
     kept = tuple(
         d for d in manifest.deps
-        if _dep_matches_profile(d, profile)
+        if _dep_matches_profile(d, profile, active_flags)
     )
     if len(kept) == len(manifest.deps):
         return manifest
     return dc_replace(manifest, deps=kept)
 
 
-def _dep_matches_profile(dep, profile) -> bool:
-    """True if every predicate on the dep matches the profile."""
+def _dep_matches_profile(dep, profile, active_flags: frozenset) -> bool:
+    """True if every predicate on the dep matches the profile + flags."""
     preds = getattr(dep, "predicates", ())
     for p in preds:
-        if not _predicate_satisfied(p, profile):
+        if not _predicate_satisfied(p, profile, active_flags):
             return False
     return True
 
 
-def _predicate_satisfied(pred, profile) -> bool:
-    """Evaluate a single Predicate against the profile.
+def _predicate_satisfied(pred, profile, active_flags: frozenset) -> bool:
+    """Evaluate a single Predicate against the profile + active flags.
+
+    For `flag` predicates: satisfied iff any (none, if negated) of the
+    values is in `active_flags`. For other predicates: evaluate against
+    the global Profile as in #26.
 
     `pred.values` is a non-empty tuple of literal values. With
-    `negated=False`: satisfied if profile matches ANY value (OR over
-    the set). With `negated=True`: satisfied if profile matches NONE
-    (De Morgan dual). For version-style predicates (nim, milpa), each
-    value may be a literal version or a constraint string."""
+    `negated=False`: satisfied if matches ANY value. With
+    `negated=True`: satisfied if matches NONE."""
+    if pred.name == "flag":
+        any_match = any(v in active_flags for v in pred.values)
+        return (not any_match) if pred.negated else any_match
     actual = getattr(profile, pred.name, None)
     if actual is None:
         return False

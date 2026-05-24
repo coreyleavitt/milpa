@@ -44,12 +44,23 @@ class Predicate:
 
 
 @dataclass(frozen=True)
+class FlagRequest:
+    """A consumer's request for a specific flag state on a dep (#23).
+
+    `enabled=True` turns the flag on; `enabled=False` explicitly opts
+    out (overrides the dep's default-true)."""
+    name: str
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
 class UrlDep:
     name: str
     git: str
     ref: str
     mirrors: tuple[str, ...] = ()    # fall-back URLs tried in order (#37)
     predicates: tuple[Predicate, ...] = ()    # conditional gates (#26)
+    flag_requests: tuple[FlagRequest, ...] = ()    # consumer feature requests (#23)
 
 
 @dataclass(frozen=True)
@@ -145,12 +156,28 @@ class Override:
 
 
 @dataclass(frozen=True)
+class FlagDecl:
+    """A named feature flag declared by a package (#23).
+
+    `default` is the flag's value when no consumer explicitly requests
+    otherwise. `description` is human-facing documentation. `defines`
+    are explicit `-d:` flags to pass to the Nim compiler when this
+    flag is active; empty tuple means use the convention
+    `-d:<package_name>_<flag_name>`."""
+    name: str
+    default: bool = False
+    description: str = ""
+    defines: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Manifest:
     deps: tuple[Dep, ...]
     kind: Kind
     name: str | None = None
     src_dir: str = ""
     overrides: tuple[Override, ...] = ()
+    flags: tuple[FlagDecl, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -177,8 +204,8 @@ class ManifestError(Exception):
 # the schema doc at milpa/schema/milpa.schema.kdl documents the same shape
 # for humans. Drift between the two is checked indirectly via tests against
 # example manifests.
-_PACKAGE_TOP_LEVEL = frozenset({"deps", "kind", "overrides", "name", "src_dir"})
-_PREDICATE_PROPS = frozenset({"platform", "arch", "nim", "milpa"})
+_PACKAGE_TOP_LEVEL = frozenset({"deps", "kind", "overrides", "name", "src_dir", "flags"})
+_PREDICATE_PROPS = frozenset({"platform", "arch", "nim", "milpa", "flag"})
 _URL_DEP_PROPS = frozenset({"git", "ref"}) | _PREDICATE_PROPS
 _VALID_KINDS: tuple[Kind, ...] = ("library", "application")
 _VALID_GIT_SCHEMES = frozenset({"https", "http", "ssh", "git"})
@@ -277,11 +304,13 @@ def parse_manifest(text: str, *, source: str | None = None) -> Manifest:
 def _parse_manifest_doc(doc) -> Manifest:
     deps: list[Dep] = []
     overrides: list[Override] = []
+    flags: list[FlagDecl] = []
     kind: Kind = "library"
     name: str | None = None
     src_dir: str = ""
     seen_names: set[str] = set()
     seen_override_names: set[str] = set()
+    seen_flag_names: set[str] = set()
     for node in doc.nodes:
         if node.name == "name":
             if name is not None:
@@ -321,6 +350,15 @@ def _parse_manifest_doc(doc) -> Manifest:
                     )
                 seen_override_names.add(ov.name)
                 overrides.append(ov)
+        elif node.name == "flags":
+            for child in node.nodes:
+                fd = _parse_flag_decl(child)
+                if fd.name in seen_flag_names:
+                    raise ManifestError(
+                        f"duplicate flag declaration {fd.name!r}"
+                    )
+                seen_flag_names.add(fd.name)
+                flags.append(fd)
         elif node.name == "workspace":
             raise ManifestError(
                 "'workspace' block found in a package manifest — "
@@ -345,6 +383,7 @@ def _parse_manifest_doc(doc) -> Manifest:
         name=name,
         src_dir=src_dir,
         overrides=tuple(overrides),
+        flags=tuple(flags),
     )
 
 
@@ -399,6 +438,26 @@ def format_manifest(m: Manifest) -> str:
             )
         lines.append("}")
         lines.append("")
+    if m.flags:
+        lines.append("flags {")
+        for fd in m.flags:
+            parts = [f'    {_quote_name(fd.name)}']
+            if fd.default:
+                parts.append("default=true")
+            else:
+                parts.append("default=false")
+            if fd.description:
+                parts.append(f'description="{fd.description}"')
+            if fd.defines:
+                # Multi-line: head then defines child node
+                lines.append(" ".join(parts) + " {")
+                args = " ".join(f'"{d}"' for d in fd.defines)
+                lines.append(f"        defines {args}")
+                lines.append("    }")
+            else:
+                lines.append(" ".join(parts))
+        lines.append("}")
+        lines.append("")
     lines.append(f'kind "{m.kind}"')
     return "\n".join(lines) + "\n"
 
@@ -423,7 +482,7 @@ def _format_dep_line(dep: Dep) -> str:
             else:
                 head += f' {pred.name}="{v}"'
 
-        if not dep.mirrors and not child_preds:
+        if not dep.mirrors and not child_preds and not dep.flag_requests:
             return head
 
         lines = [head + " {"]
@@ -435,6 +494,11 @@ def _format_dep_line(dep: Dep) -> str:
             lines.append(f'        {pred.name} {args}')
         for url in dep.mirrors:
             lines.append(f'        mirror "{url}"')
+        for fr in dep.flag_requests:
+            if fr.enabled:
+                lines.append(f'        flag "{fr.name}"')
+            else:
+                lines.append(f'        flag "{fr.name}" false')
         lines.append("    }")
         return "\n".join(lines)
     if isinstance(dep, LocalDep):
@@ -523,22 +587,24 @@ def _parse_url_dep(node: kdl.Node) -> UrlDep:
     git_raw = node.props["git"]
     git = git_raw.geturl() if isinstance(git_raw, ParseResult) else git_raw
     _validate_git_url(name, git)
-    mirrors, child_preds = _parse_url_dep_children(name, node)
+    mirrors, child_preds, flag_requests = _parse_url_dep_children(name, node)
     inline_preds = _parse_predicates(name, node)
     predicates = _merge_predicates(name, inline_preds, child_preds)
     return UrlDep(
         name=name, git=git, ref=node.props["ref"],
         mirrors=mirrors, predicates=predicates,
+        flag_requests=flag_requests,
     )
 
 
 def _parse_url_dep_children(
     dep_name: str, node: kdl.Node,
-) -> tuple[tuple[str, ...], tuple[Predicate, ...]]:
+) -> tuple[tuple[str, ...], tuple[Predicate, ...], tuple[FlagRequest, ...]]:
     """Split a UrlDep's child nodes into (mirror URLs, predicate
-    child nodes). Unknown children raise."""
+    child nodes, flag requests). Unknown children raise."""
     mirrors: list[str] = []
     child_preds: list[Predicate] = []
+    flag_requests: list[FlagRequest] = []
     for child in node.nodes:
         if child.name == "mirror":
             if len(child.args) != 1 or not isinstance(child.args[0], str):
@@ -547,6 +613,8 @@ def _parse_url_dep_children(
                     f"positional string argument (the URL)"
                 )
             mirrors.append(child.args[0])
+        elif child.name == "flag":
+            flag_requests.append(_parse_flag_request(dep_name, child))
         elif child.name in _PREDICATE_PROPS:
             child_preds.append(
                 _parse_predicate_child_node(f"dep {dep_name!r}", child),
@@ -554,10 +622,41 @@ def _parse_url_dep_children(
         else:
             raise ManifestError(
                 f"dep {dep_name!r}: unknown child node {child.name!r} "
-                f"(allowed: 'mirror' or a predicate child node — "
+                f"(allowed: 'mirror', 'flag', or a predicate child node — "
                 f"{', '.join(sorted(_PREDICATE_PROPS))})"
             )
-    return tuple(mirrors), tuple(child_preds)
+    return tuple(mirrors), tuple(child_preds), tuple(flag_requests)
+
+
+def _parse_flag_request(dep_name: str, node: kdl.Node) -> FlagRequest:
+    """Parse a consumer flag request on a dep.
+
+    Grammar:
+      flag "name"           # enable
+      flag "name" true      # enable (explicit)
+      flag "name" false     # opt out (overrides default-true)
+    """
+    if len(node.args) < 1 or not isinstance(node.args[0], str):
+        raise ManifestError(
+            f"dep {dep_name!r}: 'flag' requires a quoted name as the "
+            f"first positional argument"
+        )
+    if len(node.args) > 2:
+        raise ManifestError(
+            f"dep {dep_name!r}: 'flag' takes at most two args "
+            f"(name, optional bool)"
+        )
+    name = node.args[0]
+    enabled = True
+    if len(node.args) == 2:
+        v = node.args[1]
+        if not isinstance(v, bool):
+            raise ManifestError(
+                f"dep {dep_name!r}: 'flag {name!r}' second arg must be "
+                f"a boolean"
+            )
+        enabled = v
+    return FlagRequest(name=name, enabled=enabled)
 
 
 def _merge_predicates(
@@ -816,6 +915,62 @@ def _parse_named_dep(node: kdl.Node) -> NamedDep:
     raise ManifestError(
         f"dep {name!r}: named deps take at most one positional argument "
         f"(the version constraint); got {len(node.args)}"
+    )
+
+
+_FLAG_DECL_PROPS = frozenset({"default", "description"})
+
+
+def _parse_flag_decl(node: kdl.Node) -> FlagDecl:
+    """Parse one child of the `flags { ... }` block.
+
+    Grammar:
+      <name> [default=<bool>] [description="..."] [{ defines "X" "Y" }]
+
+    The node's identifier is the flag name. `defines` (a child node)
+    overrides the convention `-d:<package>_<flag>` emission."""
+    name = node.name
+    if node.args:
+        raise ManifestError(
+            f"flag {name!r}: positional args not allowed "
+            f"(use props: default=<bool>, description=\"...\")"
+        )
+    extra = set(node.props.keys()) - _FLAG_DECL_PROPS
+    if extra:
+        unknown = ", ".join(repr(p) for p in sorted(extra))
+        allowed = ", ".join(sorted(_FLAG_DECL_PROPS))
+        raise ManifestError(
+            f"flag {name!r}: unknown property/properties {unknown} "
+            f"(allowed: {allowed})"
+        )
+    default_raw = node.props.get("default", False)
+    if not isinstance(default_raw, bool):
+        raise ManifestError(
+            f"flag {name!r}: 'default' must be a boolean"
+        )
+    description_raw = node.props.get("description", "")
+    if not isinstance(description_raw, str):
+        raise ManifestError(
+            f"flag {name!r}: 'description' must be a string"
+        )
+    defines: list[str] = []
+    for child in node.nodes:
+        if child.name != "defines":
+            raise ManifestError(
+                f"flag {name!r}: unknown child node {child.name!r} "
+                f"(allowed: 'defines')"
+            )
+        for a in child.args:
+            if not isinstance(a, str):
+                raise ManifestError(
+                    f"flag {name!r}: 'defines' args must be strings"
+                )
+            defines.append(a)
+    return FlagDecl(
+        name=name,
+        default=default_raw,
+        description=description_raw,
+        defines=tuple(defines),
     )
 
 

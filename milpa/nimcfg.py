@@ -32,6 +32,22 @@ def format_nimcfg(
     lines = [_HEADER.rstrip("\n"), ""]
     for dep in graph.deps:
         lines.append(f'--path:"{_path_for(dep, deps_dir)}"')
+    # Feature flag defines (#23). For each active flag on a dep:
+    #   - If dep.flag_defines has an explicit override for this flag,
+    #     emit those literal -d: strings.
+    #   - Otherwise use the convention `-d:<dep_name>_<flag_name>`.
+    flag_lines: list[str] = []
+    for dep in graph.deps:
+        explicit = dict(dep.flag_defines)
+        for flag in dep.active_flags:
+            if flag in explicit:
+                for d in explicit[flag]:
+                    flag_lines.append(f'-d:{d}')
+            else:
+                flag_lines.append(f'-d:{dep.name}_{flag}')
+    if flag_lines:
+        lines.append("")
+        lines.extend(flag_lines)
     if graph.deps:
         lines.append("")
     return "\n".join(lines)
