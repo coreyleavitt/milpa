@@ -3,9 +3,9 @@
 format_manifest already handles Manifest → text. This module adds the
 infrastructure callers need to safely PERSIST mutations:
 
-  - write_manifest(m, path)         — atomic file write
-  - mutate_manifest_file(path, fn)  — read-modify-write with comment-loss reporting
-  - apply_manifest_change(...)      — canonical validate → mutate → relock flow
+  - write_manifest(m, path)              — atomic file write
+  - mutate_manifest_file(path, fn)       — read-modify-write with comment-loss reporting
+  - apply_manifest_change_with_resolve(...) — resolve-first transaction (cargo/uv shape)
 
 The orchestration layer prevents future command authors from forgetting
 the relock step or skipping pre-mutation validation. See cargo-add /
@@ -27,7 +27,7 @@ from milpa.manifest import (
     parse_manifest,
 )
 from milpa.manifest_writer import (
-    apply_manifest_change,
+    apply_manifest_change_with_resolve,
     mutate_manifest_file,
     write_manifest,
 )
@@ -225,102 +225,141 @@ def test_write_result_reports_comment_lines_lost_in_source(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# apply_manifest_change — codified orchestration
+# apply_manifest_change_with_resolve — resolve-then-commit (#16)
 # ---------------------------------------------------------------------------
 
 
-def test_apply_manifest_change_runs_validate_then_mutate_then_relock(tmp_path):
-    """The canonical sequence: validate fires first (catches bad
-    preconditions), mutate edits the file, relock refreshes the
-    lockfile. Each step happens, in order."""
+def _empty_registry_loader(*, cache_path):
+    return {}
+
+
+def test_apply_change_with_resolve_commits_both_files_atomically(tmp_path):
+    """Tracer: build a proposed Manifest, run resolve, commit both
+    milpa.kdl and milpa.lock. After return, both files exist and
+    reflect the new state."""
     from dataclasses import replace
 
-    target = tmp_path / "milpa.kdl"
+    from milpa.fetchers import FetcherRegistry
+    from milpa.fetchers.git import GitProvenance, GitReceipt
+    from milpa.lockfile import load_lockfile
+    from milpa.solver import Strategy
+
     write_manifest(
         Manifest(kind="library", name="proj", deps=()),
-        target,
+        tmp_path / "milpa.kdl",
     )
 
-    call_log: list[str] = []
+    # Fake fetcher serves any git URL with a minimal .nimble
+    class StubFetcher:
+        def can_handle(self, p): return isinstance(p, GitProvenance)
+        def fetch(self, name, p, *, dest):
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / f"{name}.nimble").write_text('srcDir = "src"\n')
+            return GitReceipt(commit_sha="abc")
 
-    def validate() -> None:
-        call_log.append("validate")
+    registry = FetcherRegistry()
+    registry.register(StubFetcher())
 
-    def mutate(m: Manifest) -> Manifest:
-        call_log.append("mutate")
-        return replace(m, deps=m.deps + (UrlDep(
-            name="chronos",
-            git="https://example.com/chronos.git", ref="main",
-        ),))
+    proposed = Manifest(
+        kind="library", name="proj",
+        deps=(UrlDep(name="x", git="https://example.com/x.git", ref="main"),),
+    )
 
-    def relock(project_dir) -> None:
-        call_log.append(f"relock:{project_dir}")
-
-    apply_manifest_change(
+    apply_manifest_change_with_resolve(
         tmp_path,
-        validate=validate, mutate=mutate, relock=relock,
+        proposed_manifest=proposed,
+        fetcher=registry,
+        list_tags=lambda url: [],
+        registry_loader=_empty_registry_loader,
+        strategy=Strategy.MAXVER,
     )
 
-    assert call_log == ["validate", "mutate", f"relock:{tmp_path}"]
-    # Side effect on disk: manifest now has chronos
-    reparsed = parse_manifest(target.read_text())
-    assert reparsed.deps[0].name == "chronos"
+    # Both files reflect the new state
+    reparsed = parse_manifest((tmp_path / "milpa.kdl").read_text())
+    assert reparsed.deps[0].name == "x"
+    lockfile = load_lockfile(tmp_path / "milpa.lock")
+    assert any(d.name == "x" for d in lockfile.deps)
 
 
-def test_apply_manifest_change_aborts_on_validate_failure_without_mutating(tmp_path):
-    """validate raising must short-circuit the sequence — mutate is
-    never called, file is unchanged, relock is never called."""
-    target = tmp_path / "milpa.kdl"
-    original_m = Manifest(kind="library", name="proj", deps=())
-    write_manifest(original_m, target)
-    pre_text = target.read_text()
+def test_apply_change_with_resolve_aborts_on_resolve_failure(tmp_path):
+    """If resolve raises, manifest + lockfile remain untouched —
+    cargo/uv-style atomicity guarantee."""
+    from milpa.fetchers import FetcherRegistry, FetchError
+    from milpa.fetchers.git import GitProvenance
+    from milpa.solver import Strategy
 
-    relock_called = []
+    write_manifest(
+        Manifest(kind="library", name="proj", deps=()),
+        tmp_path / "milpa.kdl",
+    )
+    original_manifest = (tmp_path / "milpa.kdl").read_text()
+    # No pre-existing lockfile
+    assert not (tmp_path / "milpa.lock").exists()
 
-    def validate() -> None:
-        raise RuntimeError("fetch failed; cannot mutate manifest")
+    class FailingFetcher:
+        def can_handle(self, p): return isinstance(p, GitProvenance)
+        def fetch(self, name, p, *, dest):
+            raise FetchError(f"synthetic failure for {p.url}")
 
-    def mutate(m):
-        raise AssertionError("mutate must not be called when validate fails")
+    registry = FetcherRegistry()
+    registry.register(FailingFetcher())
 
-    def relock(project_dir):
-        relock_called.append(project_dir)
+    proposed = Manifest(
+        kind="library", name="proj",
+        deps=(UrlDep(name="x", git="https://example.com/x.git", ref="main"),),
+    )
 
-    with pytest.raises(RuntimeError):
-        apply_manifest_change(
+    with pytest.raises(Exception):
+        apply_manifest_change_with_resolve(
             tmp_path,
-            validate=validate, mutate=mutate, relock=relock,
+            proposed_manifest=proposed,
+            fetcher=registry,
+            list_tags=lambda url: [],
+            registry_loader=_empty_registry_loader,
+            strategy=Strategy.MAXVER,
         )
 
-    assert target.read_text() == pre_text
-    assert relock_called == []
+    # Manifest unchanged
+    assert (tmp_path / "milpa.kdl").read_text() == original_manifest
+    # No stray lockfile
+    assert not (tmp_path / "milpa.lock").exists()
 
 
-def test_apply_manifest_change_skips_relock_when_none(tmp_path):
-    """relock=None: mutation happens, lockfile refresh does not.
-    Opt-out for bulk operations that re-lock at the end."""
-    from dataclasses import replace
+def test_apply_change_with_resolve_aborts_on_pre_validate_failure(tmp_path):
+    """pre_resolve_validate raising short-circuits — resolve is never
+    invoked, no disk writes happen."""
+    from milpa.fetchers import FetcherRegistry
+    from milpa.solver import Strategy
 
-    target = tmp_path / "milpa.kdl"
     write_manifest(
         Manifest(kind="library", name="proj", deps=()),
-        target,
+        tmp_path / "milpa.kdl",
     )
+    original = (tmp_path / "milpa.kdl").read_text()
 
-    def mutate(m):
-        return replace(m, deps=m.deps + (UrlDep(
-            name="x", git="https://example.com/x.git", ref="main",
-        ),))
+    class ExplodingFetcher:
+        def can_handle(self, p): return True
+        def fetch(self, name, p, *, dest):
+            raise AssertionError(
+                "resolve must not run when pre_validate failed"
+            )
 
-    # No relock callback at all
-    result = apply_manifest_change(
-        tmp_path,
-        validate=lambda: None,
-        mutate=mutate,
-        relock=None,
-    )
+    registry = FetcherRegistry()
+    registry.register(ExplodingFetcher())
 
-    # File was mutated; result returned
-    reparsed = parse_manifest(target.read_text())
-    assert reparsed.deps[0].name == "x"
-    assert result.path == target
+    def pre_validate():
+        raise RuntimeError("synthetic pre-validate failure")
+
+    with pytest.raises(RuntimeError, match="synthetic pre-validate"):
+        apply_manifest_change_with_resolve(
+            tmp_path,
+            proposed_manifest=Manifest(kind="library", name="proj", deps=()),
+            fetcher=registry,
+            list_tags=lambda url: [],
+            registry_loader=_empty_registry_loader,
+            strategy=Strategy.MAXVER,
+            pre_resolve_validate=pre_validate,
+        )
+
+    assert (tmp_path / "milpa.kdl").read_text() == original
+    assert not (tmp_path / "milpa.lock").exists()

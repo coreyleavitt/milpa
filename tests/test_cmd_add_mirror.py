@@ -3,7 +3,7 @@
 Adds URL as a mirror provenance for the existing dep DEPNAME. Fetches
 URL, verifies its bytes hash to DEPNAME's locked identity, and appends
 a `mirror "URL"` line to the manifest atomically via
-apply_manifest_change.
+apply_manifest_change_with_resolve.
 
 Refuses on hash mismatch, unknown dep, local/member sources, missing
 manifest, or missing lockfile.

@@ -1,13 +1,14 @@
-"""Manifest writer + mutation orchestration (#15).
+"""Manifest writer + mutation orchestration (#15, #16).
 
 format_manifest already handles Manifest → text. This module adds:
 
-  - write_manifest(m, path)         — atomic file write (temp + rename)
-  - mutate_manifest_file(path, fn)  — read-modify-write with comment reporting
-  - apply_manifest_change(...)      — canonical validate → mutate → relock
-
-The orchestration helper (apply_manifest_change) is the layer the CLI
-commands use; lower layers exist for niche use + tests.
+  - write_manifest(m, path)              — atomic file write (temp + rename)
+  - mutate_manifest_file(path, fn)       — read-modify-write with comment reporting
+  - apply_manifest_change_with_resolve(...) — resolve-first orchestration:
+      run a full resolve on the proposed manifest; only if resolution
+      succeeds, atomically commit manifest + lockfile. cargo/uv-shape
+      transaction. Single canonical entry point for every command that
+      edits milpa.kdl (cmd_add, cmd_add_mirror, future cmd_remove, etc.).
 
 Trivia preservation is out of scope here — see #80 for the Python-
 specific limitation. Mutations DROP comments; callers warn the user
@@ -88,30 +89,67 @@ def mutate_manifest_file(
     return WriteResult(path=path, comments_lost=lost)
 
 
-def apply_manifest_change(
+def apply_manifest_change_with_resolve(
     project_dir: Path,
     *,
-    validate: Callable[[], None],
-    mutate: Callable[[Manifest], Manifest],
-    relock: Callable[[Path], None] | None,
+    proposed_manifest: Manifest,
+    fetcher,                              # FetcherRegistry
+    list_tags,                            # Callable[[str], list[str]]
+    registry_loader,                      # cache_path → registry dict
+    strategy,                             # Strategy enum
+    pre_resolve_validate: "Callable[[], None] | None" = None,
 ) -> WriteResult:
-    """Canonical orchestration for any command that edits milpa.kdl.
+    """Resolve proposed_manifest in full; on success atomically commit
+    milpa.kdl and milpa.lock.
 
     Sequence:
-      1. validate()  — raises if the change isn't safe to apply
-      2. mutate      — atomic read-modify-write of milpa.kdl
-      3. relock      — refresh milpa.lock to match the new manifest
-                       (pass None to skip; default callers always relock)
+      1. pre_resolve_validate() (optional) — transport-specific checks
+         that the resolver won't do (e.g., probe a mirror URL).
+      2. resolve(proposed_manifest) — full graph including any new dep.
+         If resolution raises, NEITHER file is written.
+      3. Atomic commit: write milpa.lock first, then milpa.kdl.
+         Lockfile-first ordering means a mid-sequence crash leaves a
+         self-healing state — next `milpa fetch` sees a lockfile
+         "ahead" of the manifest and runs slow path to reconcile.
 
-    The relock callback is parameterized so workspace- or test-specific
-    flows can substitute their own re-resolution. Production CLI
-    commands pass cmd_lock.
+    Single point of orchestration for every manifest mutation that
+    changes resolution: cmd_add, cmd_add_mirror, future cmd_remove,
+    cmd_update, etc.
     """
-    validate()
-    result = mutate_manifest_file(project_dir / "milpa.kdl", mutate)
-    if relock is not None:
-        relock(project_dir)
-    return result
+    from .lockfile import from_graph, write_lockfile
+    from .resolver import resolve
+
+    if pre_resolve_validate is not None:
+        pre_resolve_validate()
+
+    deps_dir = project_dir / "_deps"
+    deps_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = deps_dir / ".packages_official.json"
+    registry = registry_loader(cache_path=cache_path)
+
+    graph = resolve(
+        proposed_manifest,
+        deps_dir=deps_dir,
+        registry=registry,
+        fetcher=fetcher,
+        list_tags=list_tags,
+        strategy=strategy,
+    )
+    new_lockfile = from_graph(graph, strategy=str(strategy))
+
+    write_lockfile(new_lockfile, project_dir / "milpa.lock")
+    return _commit_manifest(project_dir / "milpa.kdl", proposed_manifest)
+
+
+def _commit_manifest(path: Path, m: Manifest) -> WriteResult:
+    """Write a manifest atomically; report comment loss vs prior text
+    if file existed."""
+    before_comments = 0
+    if path.exists():
+        before_comments = _count_line_comments(path.read_text())
+    write_manifest(m, path)
+    after_comments = _count_line_comments(path.read_text())
+    return WriteResult(path=path, comments_lost=max(0, before_comments - after_comments))
 
 
 def _count_line_comments(text: str) -> int:

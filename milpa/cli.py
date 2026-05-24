@@ -33,7 +33,7 @@ from .manifest import (
     LocalDep, ManifestError, MemberDep, NamedDep, TarballDep, UrlDep,
     load_or_discover_manifest,
 )
-from .manifest_writer import apply_manifest_change
+from .manifest_writer import apply_manifest_change_with_resolve
 from .nimcfg import write_nimcfg
 from .registry import RegistryEntry, list_remote_tags, load_registry
 from .solver import Strategy
@@ -90,12 +90,24 @@ def make_parser() -> argparse.ArgumentParser:
         sp = subparsers.add_parser(name, help=help_text)
         if name == "add":
             sp.add_argument(
+                "dep_name", metavar="<dep>",
+                help="dep name (new dep with --git, or existing dep with --mirror)",
+            )
+            mode = sp.add_mutually_exclusive_group()
+            mode.add_argument(
+                "--git", metavar="<url>",
+                help="add as a brand-new git-sourced dep at <url>",
+            )
+            mode.add_argument(
                 "--mirror", metavar="<url>",
-                help="add <url> as a mirror provenance for <dep>",
+                help="add <url> as a mirror provenance for the existing <dep>",
             )
             sp.add_argument(
-                "dep_name", metavar="<dep>",
-                help="the lockfile-known dep name to attach the mirror to",
+                "--ref", metavar="<ref>",
+                help=(
+                    "git ref (branch / tag / sha) when using --git "
+                    "(default: discovered from remote HEAD)"
+                ),
             )
     return parser
 
@@ -406,23 +418,130 @@ def cmd_verify(project_dir: Path) -> int:
     return 0
 
 
+def _git_default_branch(url: str) -> str:
+    """Discover the remote's default branch via git ls-remote --symref HEAD.
+
+    Returns the branch name (e.g. "main" or "master"). On failure
+    raises subprocess.CalledProcessError — the caller surfaces the
+    error before any manifest mutation."""
+    import re
+    import subprocess
+    out = subprocess.run(
+        ["git", "ls-remote", "--symref", url, "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    # First line of output: "ref: refs/heads/<branch>\tHEAD"
+    m = re.search(r"refs/heads/(\S+)\s+HEAD", out)
+    if not m:
+        raise RuntimeError(
+            f"could not determine default branch for {url}; "
+            f"pass --ref explicitly"
+        )
+    return m.group(1)
+
+
+def cmd_add(
+    project_dir: Path,
+    *,
+    name: str,
+    git: str,
+    ref: str | None = None,
+    fetcher: FetcherRegistry = default_registry,
+    list_tags: Callable[[str], list[str]] = list_remote_tags,
+    registry_loader: "RegistryLoader" = _default_registry_loader,
+    strategy: Strategy = Strategy.MAXVER,
+    default_branch_discoverer: Callable[[str], str] = _git_default_branch,
+) -> int:
+    """Add a brand-new UrlDep to milpa.kdl. Validates by running a
+    full resolve over the proposed manifest; commits manifest +
+    lockfile atomically only if resolution succeeds (#16)."""
+    from dataclasses import replace
+
+    manifest_path = project_dir / "milpa.kdl"
+    if not manifest_path.exists():
+        print(
+            f"add: no milpa.kdl at {manifest_path}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        manifest = load_or_discover_manifest(project_dir)
+    except ManifestError as e:
+        print(f"add: cannot load manifest: {e}", file=sys.stderr)
+        return 1
+
+    if any(d.name == name for d in manifest.deps):
+        print(
+            f"add: dep {name!r} already declared in milpa.kdl — "
+            f"use `milpa update` to change refs / mirrors",
+            file=sys.stderr,
+        )
+        return 1
+
+    resolved_ref = ref
+    if resolved_ref is None:
+        try:
+            resolved_ref = default_branch_discoverer(git)
+        except Exception as e:
+            print(
+                f"add: could not discover default branch for {git}: {e}; "
+                f"pass --ref explicitly",
+                file=sys.stderr,
+            )
+            return 1
+
+    proposed = replace(
+        manifest,
+        deps=manifest.deps + (UrlDep(name=name, git=git, ref=resolved_ref),),
+    )
+
+    try:
+        apply_manifest_change_with_resolve(
+            project_dir,
+            proposed_manifest=proposed,
+            fetcher=fetcher,
+            list_tags=list_tags,
+            registry_loader=registry_loader,
+            strategy=strategy,
+        )
+    except Exception as e:
+        print(f"add: resolution failed: {e}", file=sys.stderr)
+        return 1
+
+    print(
+        f"added {name} (git={git} ref={resolved_ref})",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def cmd_add_mirror(
     project_dir: Path,
     *,
     url: str,
     dep_name: str,
     fetcher: FetcherRegistry = default_registry,
-    relock: Callable[[Path], None] | None = None,
+    list_tags: Callable[[str], list[str]] = list_remote_tags,
+    registry_loader: "RegistryLoader" = _default_registry_loader,
+    strategy: Strategy = Strategy.MAXVER,
+    relock: Callable[[Path], None] | None = None,    # back-compat; ignored
 ) -> int:
     """Append `url` as a mirror provenance for `dep_name` in the
     manifest (#37).
 
-    Validates by fetching `url` and confirming its bytes hash to the
-    identity locked for `dep_name`. On mismatch, returns 1 without
-    mutating. On success, atomically appends `mirror "url"` to the
-    UrlDep block and triggers `relock` (defaults to cmd_lock when
-    None — see apply_manifest_change).
+    Validates by (1) fetching `url` and confirming its bytes hash to
+    the locked identity for `dep_name`, then (2) running a full
+    resolve over the proposed manifest. On success, atomically
+    commits manifest + lockfile. On any failure, neither file is
+    modified.
     """
+    from dataclasses import replace
+    from .fetchers.git import GitProvenance
+    from .lockfile import (
+        GitProvenanceRecord, LocalProvenanceRecord, MemberProvenanceRecord,
+    )
+
     lockfile_path = project_dir / "milpa.lock"
     manifest_path = project_dir / "milpa.kdl"
 
@@ -456,9 +575,6 @@ def cmd_add_mirror(
         )
         return 1
 
-    # Local + member deps don't have a meaningful "mirror" concept —
-    # their bytes come from an editable source, not a fetchable one.
-    from .lockfile import LocalProvenanceRecord, MemberProvenanceRecord
     if any(isinstance(p, (LocalProvenanceRecord, MemberProvenanceRecord))
            for p in locked.provenances):
         print(
@@ -468,22 +584,56 @@ def cmd_add_mirror(
         )
         return 1
 
-    # Validate: fetch the URL into a scratch dir and verify identity
-    # matches the locked pin. apply_manifest_change runs this in the
-    # `validate` phase so any failure aborts before mutation.
-    import tempfile
-    with tempfile.TemporaryDirectory() as td:
-        scratch = Path(td) / dep_name
+    try:
+        manifest = load_or_discover_manifest(project_dir)
+    except ManifestError as e:
+        print(f"add --mirror: cannot load manifest: {e}", file=sys.stderr)
+        return 1
 
-        def validate() -> None:
-            from .fetchers.git import GitProvenance
-            from .lockfile import GitProvenanceRecord
-            # Get a reference ref from the existing git provenance (if any)
-            ref = "main"
-            for p in locked.provenances:
-                if isinstance(p, GitProvenanceRecord) and p.ref:
-                    ref = p.ref
-                    break
+    # Build the proposed manifest (append mirror to the target UrlDep).
+    target_in_manifest = next(
+        (d for d in manifest.deps
+         if isinstance(d, UrlDep) and d.name == dep_name),
+        None,
+    )
+    if target_in_manifest is None:
+        print(
+            f"add --mirror: dep {dep_name!r} in lockfile has no "
+            f"matching UrlDep in milpa.kdl",
+            file=sys.stderr,
+        )
+        return 1
+    if url in target_in_manifest.mirrors:
+        # Idempotent: nothing to do
+        print(
+            f"add --mirror: {url} already a mirror for {dep_name}",
+            file=sys.stderr,
+        )
+        return 0
+
+    new_deps = tuple(
+        replace(d, mirrors=d.mirrors + (url,))
+        if isinstance(d, UrlDep) and d.name == dep_name
+        else d
+        for d in manifest.deps
+    )
+    proposed = replace(manifest, deps=new_deps)
+
+    # pre_resolve_validate: probe the mirror URL specifically and
+    # check identity. The subsequent full resolve will use the
+    # primary URL (which succeeded last time), so the mirror URL
+    # itself would never be touched by resolve alone.
+    def pre_validate() -> None:
+        # Pick a ref from the existing git provenance, falling back
+        # to 'main' if no git provenance is recorded.
+        ref = "main"
+        for p in locked.provenances:
+            if isinstance(p, GitProvenanceRecord) and p.ref:
+                ref = p.ref
+                break
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            scratch = Path(td) / dep_name
             result = fetcher.fetch(
                 dep_name, GitProvenance(url=url, ref=ref), dest=scratch,
             )
@@ -491,34 +641,24 @@ def cmd_add_mirror(
                 raise ManifestError(
                     f"add --mirror: bytes at {url} hash to "
                     f"{result.identity[:23]}..., "
-                    f"locked identity is {(locked.identity or '<none>')[:23]}... "
+                    f"locked identity is "
+                    f"{(locked.identity or '<none>')[:23]}... "
                     f"— mirrors must serve identical bytes"
                 )
 
-        def mutate(m: Manifest) -> Manifest:
-            from dataclasses import replace
-            new_deps = []
-            for dep in m.deps:
-                if isinstance(dep, UrlDep) and dep.name == dep_name:
-                    if url in dep.mirrors:
-                        # Idempotent: already present
-                        new_deps.append(dep)
-                    else:
-                        new_deps.append(
-                            replace(dep, mirrors=dep.mirrors + (url,)),
-                        )
-                else:
-                    new_deps.append(dep)
-            return replace(m, deps=tuple(new_deps))
-
-        try:
-            apply_manifest_change(
-                project_dir,
-                validate=validate, mutate=mutate, relock=relock,
-            )
-        except ManifestError as e:
-            print(str(e), file=sys.stderr)
-            return 1
+    try:
+        apply_manifest_change_with_resolve(
+            project_dir,
+            proposed_manifest=proposed,
+            fetcher=fetcher,
+            list_tags=list_tags,
+            registry_loader=registry_loader,
+            strategy=strategy,
+            pre_resolve_validate=pre_validate,
+        )
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        return 1
 
     print(
         f"added mirror {url} for {dep_name}", file=sys.stderr,
@@ -663,19 +803,26 @@ def main(argv: list[str] | None = None) -> int:
         case "verify": return cmd_verify(project_dir)
         case "clean":  return cmd_clean(project_dir)
         case "add":
-            if not args.mirror:
-                print(
-                    "add: only --mirror is supported today; "
-                    "general `milpa add` lands with #16",
-                    file=sys.stderr,
+            if args.mirror:
+                return cmd_add_mirror(
+                    project_dir, url=args.mirror, dep_name=args.dep_name,
+                    strategy=strategy,
                 )
-                return 1
-            return cmd_add_mirror(
-                project_dir, url=args.mirror, dep_name=args.dep_name,
-                relock=lambda pd: cmd_lock(
-                    pd, max_parallel=args.parallel, strategy=strategy,
-                ),
+            if args.git:
+                return cmd_add(
+                    project_dir,
+                    name=args.dep_name,
+                    git=args.git,
+                    ref=args.ref,
+                    strategy=strategy,
+                )
+            print(
+                "add: requires either --git <url> "
+                "(brand-new dep) or --mirror <url> "
+                "(extra provenance for existing dep)",
+                file=sys.stderr,
             )
+            return 1
         case _:
             print(f"unknown command: {args.command}", file=sys.stderr)
             return 1
