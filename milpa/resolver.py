@@ -20,6 +20,7 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
+import shutil
 import sys
 
 from .fetchers import FetcherRegistry, default_registry
@@ -99,14 +100,107 @@ class _Candidate:
 
 
 class _MaterializedProvider:
-    """PackageProvider backed by the resolver's materialized candidate set."""
+    """PackageProvider backed by the resolver's materialized candidate set.
+
+    Two-phase population for content-hash dedup (#32):
+
+    1. During BFS, workers produce candidates which are buffered via
+       `record(c)`. The provider's `candidates` map is NOT populated
+       during BFS — only after all candidates are collected.
+
+    2. After BFS completes, `finalize(deps_dir)` partitions buffered
+       candidates by content_hash, picks a deterministic canonical
+       name (lexicographically earliest) per group, registers only
+       canonicals in `candidates`, builds the alias map, and removes
+       duplicate _deps/<name>/ directories from disk.
+
+    Pre-existing synthetic candidates (__root__, workspace members)
+    are added via `add()` directly — they bypass dedup and are in
+    the provider from the start.
+
+    Workspace members (source prefix 'member:') are exempt from
+    content-hash dedup — workspace identity is by-name within the
+    workspace, not interchangeable with external deps even if bytes
+    happen to coincide.
+    """
 
     def __init__(self) -> None:
         # name -> {version: _Candidate}
         self.candidates: dict[str, dict[Version, _Candidate]] = {}
+        # Pending candidates collected during BFS; canonicalized in finalize()
+        self._pending: list[_Candidate] = []
+        # alias name → canonical name (populated by finalize())
+        self.aliases: dict[str, str] = {}
 
     def add(self, c: _Candidate) -> None:
+        """Add unconditionally — used for synthetic candidates (__root__,
+        pre-registered workspace members). Production worker results
+        go through `record()` + `finalize()`."""
         self.candidates.setdefault(c.name, {})[c.version] = c
+
+    def record(self, c: _Candidate) -> None:
+        """Buffer a fetched candidate; canonical-vs-alias decision is
+        deferred to finalize() so it can be deterministic (lex-min
+        name across all candidates sharing a content_hash) regardless
+        of BFS arrival order."""
+        self._pending.append(c)
+
+    def finalize(self, deps_dir: Path) -> None:
+        """Resolve all buffered candidates into the canonical provider
+        state. Deterministic — same set of buffered candidates always
+        produces the same canonical/alias mapping.
+
+        Cleans up duplicate _deps/<name>/ directories on disk; only
+        the canonical's directory survives.
+        """
+        by_hash: dict[str, list[_Candidate]] = {}
+        no_hash: list[_Candidate] = []
+        for c in self._pending:
+            if c.content_hash is None or c.source.startswith("member:"):
+                no_hash.append(c)
+                continue
+            by_hash.setdefault(c.content_hash, []).append(c)
+
+        # Pass-through: no-hash + member candidates land as-is.
+        for c in no_hash:
+            self.candidates.setdefault(c.name, {})[c.version] = c
+
+        # Content-hash groups: canonical is lex-min name (deterministic).
+        for content_hash, group in by_hash.items():
+            canonical = min(group, key=lambda c: c.name)
+            self.candidates.setdefault(
+                canonical.name, {}
+            )[canonical.version] = canonical
+            for c in group:
+                if c is canonical:
+                    continue
+                self.aliases[c.name] = canonical.name
+                # Clean up the duplicate's _deps directory; the canonical's
+                # stays. (rmtree on a missing dir would already raise; the
+                # ignore_errors covers concurrent removal edge cases.)
+                dup_path = deps_dir / c.name
+                if dup_path.exists():
+                    shutil.rmtree(dup_path, ignore_errors=True)
+
+        self._pending.clear()
+
+        # Rewrite all candidates' dep_terms + requires_names to use
+        # canonical names. The solver sees a clean graph where each
+        # package has exactly one name.
+        if self.aliases:
+            for cands in self.candidates.values():
+                for c in cands.values():
+                    c.dep_terms[:] = [
+                        Term(
+                            package=self.aliases.get(t.package, t.package),
+                            positive=t.positive,
+                            versions=t.versions,
+                        )
+                        for t in c.dep_terms
+                    ]
+                    c.requires_names[:] = [
+                        self.aliases.get(n, n) for n in c.requires_names
+                    ]
 
     def get(self, name: str, version: Version) -> _Candidate:
         return self.candidates[name][version]
@@ -298,11 +392,18 @@ def resolve(
                     for outstanding in in_flight:
                         outstanding.cancel()
                     raise
-                provider.add(candidate)
-                name = candidate.name
-                print(f"✓ {name}", file=sys.stderr)
+                provider.record(candidate)
+                print(f"✓ {candidate.name}", file=sys.stderr)
+                # Transitive deps still flow through BFS — they're real
+                # edges in the dep graph regardless of whether this
+                # candidate ends up canonical or aliased.
                 for new_item in new_items:
                     submit(new_item)
+
+    # Resolve content-hash duplicates into canonical/alias form and
+    # rewrite all terms to use canonical names. Deterministic
+    # regardless of BFS arrival order.
+    provider.finalize(deps_dir)
 
     # Solve.
     solution = solve(provider, "__root__", (0, 0, 0), strategy=strategy)
@@ -472,7 +573,7 @@ def resolve_workspace(
                     for outstanding in in_flight:
                         outstanding.cancel()
                     raise
-                provider.add(candidate)
+                provider.record(candidate)
                 print(f"✓ {candidate.name}", file=sys.stderr)
                 # Auto-coerce: filter out new_items whose name matches
                 # a workspace member — they're already pre-registered.
@@ -480,6 +581,11 @@ def resolve_workspace(
                     if _item_targets_member(new_item, members_by_name):
                         continue
                     submit(new_item)
+
+    # Same finalize+solve sequence as resolve(): canonical/alias
+    # resolution then PubGrub. Workspace members were pre-registered
+    # via add() and are exempt from content-hash dedup.
+    provider.finalize(deps_dir)
 
     solution = solve(provider, "__root__", (0, 0, 0), strategy=strategy)
     return _build_graph(solution, provider)
