@@ -31,6 +31,7 @@ import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
 from ..identity import compute_content_hash
@@ -152,6 +153,57 @@ class FetcherRegistry:
         self._store.link(identity, dest)
         return FetchResult(
             name=name, path=dest, identity=identity, receipt=receipt,
+        )
+
+    def fetch_any(
+        self,
+        name: str,
+        candidates: "Sequence[Provenance]",
+        *,
+        dest: Path,
+        expected_identity: str | None = None,
+    ) -> FetchResult:
+        """Try each candidate provenance in order; return the first
+        successful FetchResult. Raises FetchError if every candidate
+        fails (composite message lists each underlying failure).
+
+        Used for multi-provenance fall-through (#37): primary +
+        mirrors. Single-candidate calls are equivalent to fetch().
+
+        When `expected_identity` is set, each candidate's bytes must
+        hash to it. Candidates that produce mismatched bytes are
+        treated as failures — the bytes are dropped and the next
+        candidate is tried. This is the structural guarantee that a
+        hostile mirror cannot substitute itself for the locked dep.
+        """
+        if not candidates:
+            raise FetchError(
+                f"fetch_any({name!r}): no candidates provided"
+            )
+        failures: list[str] = []
+        for p in candidates:
+            try:
+                result = self.fetch(name, p, dest=dest)
+            except Exception as e:
+                failures.append(f"{type(p).__name__}: {e}")
+                continue
+            if expected_identity is not None and result.identity != expected_identity:
+                failures.append(
+                    f"{type(p).__name__}: identity mismatch "
+                    f"(expected {expected_identity[:23]}..., "
+                    f"got {result.identity[:23]}...)"
+                )
+                # Drop the mismatched bytes so the next candidate's
+                # fetch sees a clean destination.
+                if dest.is_symlink():
+                    dest.unlink()
+                elif dest.exists():
+                    shutil.rmtree(dest, ignore_errors=True)
+                continue
+            return result
+        raise FetchError(
+            f"fetch_any({name!r}): all {len(candidates)} candidates failed:\n  "
+            + "\n  ".join(failures)
         )
 
     def _select(self, provenance: Provenance) -> "Fetcher":

@@ -30,6 +30,7 @@ class UrlDep:
     name: str
     git: str
     ref: str
+    mirrors: tuple[str, ...] = ()    # fall-back URLs tried in order (#37)
 
 
 @dataclass(frozen=True)
@@ -389,9 +390,20 @@ def format_manifest(m: Manifest) -> str:
 
 
 def _format_dep_line(dep: Dep) -> str:
-    """One deps-block child as a single KDL line."""
+    """One deps-block child as a single KDL line (or multi-line block
+    when the dep has children — e.g. mirrors on a UrlDep)."""
     if isinstance(dep, UrlDep):
-        return f'    {_quote_name(dep.name)} git=(url)"{dep.git}" ref="{dep.ref}"'
+        head = (
+            f'    {_quote_name(dep.name)} '
+            f'git=(url)"{dep.git}" ref="{dep.ref}"'
+        )
+        if not dep.mirrors:
+            return head
+        lines = [head + " {"]
+        for url in dep.mirrors:
+            lines.append(f'        mirror "{url}"')
+        lines.append("    }")
+        return "\n".join(lines)
     if isinstance(dep, LocalDep):
         return f'    {_quote_name(dep.name)} local="{dep.path}"'
     if isinstance(dep, MemberDep):
@@ -478,7 +490,29 @@ def _parse_url_dep(node: kdl.Node) -> UrlDep:
     git_raw = node.props["git"]
     git = git_raw.geturl() if isinstance(git_raw, ParseResult) else git_raw
     _validate_git_url(name, git)
-    return UrlDep(name=name, git=git, ref=node.props["ref"])
+    mirrors = _parse_mirrors(name, node)
+    return UrlDep(name=name, git=git, ref=node.props["ref"], mirrors=mirrors)
+
+
+def _parse_mirrors(dep_name: str, node: kdl.Node) -> tuple[str, ...]:
+    """Collect `mirror "URL"` child nodes under a UrlDep. Each mirror
+    takes exactly one positional string argument. URLs are validated
+    only at fetch time — a mirror that's unreachable today may be
+    reachable tomorrow."""
+    mirrors: list[str] = []
+    for child in node.nodes:
+        if child.name != "mirror":
+            raise ManifestError(
+                f"dep {dep_name!r}: unknown child node {child.name!r} "
+                f"in dep block (allowed: 'mirror')"
+            )
+        if len(child.args) != 1 or not isinstance(child.args[0], str):
+            raise ManifestError(
+                f"dep {dep_name!r}: 'mirror' takes exactly one "
+                f"positional string argument (the URL)"
+            )
+        mirrors.append(child.args[0])
+    return tuple(mirrors)
 
 
 _LOCAL_DEP_PROPS = frozenset({"local"})

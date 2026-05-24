@@ -695,9 +695,12 @@ def _process_url(
     """Worker function: fetch + parse one URL dep. Returns the candidate
     plus the queue items its requires introduce. Thread-safe: touches no
     shared mutable state outside its own subtree of `deps_dir`."""
-    result = fetcher.fetch(
+    candidates = [GitProvenance(url=dep.git, ref=dep.ref)]
+    for mirror_url in dep.mirrors:
+        candidates.append(GitProvenance(url=mirror_url, ref=dep.ref))
+    result = fetcher.fetch_any(
         dep.name,
-        GitProvenance(url=dep.git, ref=dep.ref),
+        candidates,
         dest=deps_dir / dep.name,
     )
     sha = _commit_sha_or_none(result.receipt)

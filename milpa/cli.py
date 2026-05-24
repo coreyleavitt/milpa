@@ -29,7 +29,11 @@ from .lockfile import (
     write_lockfile,
 )
 from .frozen import NotFrozen, resolve_frozen
-from .manifest import ManifestError, load_or_discover_manifest
+from .manifest import (
+    LocalDep, ManifestError, MemberDep, NamedDep, TarballDep, UrlDep,
+    load_or_discover_manifest,
+)
+from .manifest_writer import apply_manifest_change
 from .nimcfg import write_nimcfg
 from .registry import RegistryEntry, list_remote_tags, load_registry
 from .solver import Strategy
@@ -43,6 +47,7 @@ SUBCOMMAND_HELP = {
     "show":   "print the resolved dep tree",
     "verify": "recheck each dep in _deps/ against milpa.lock (no fetch)",
     "clean":  "remove _deps/ and nim.cfg (keeps milpa.lock)",
+    "add":    "add a mirror for an existing dep (more verbs to come)",
 }
 
 
@@ -82,7 +87,16 @@ def make_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
     for name, help_text in SUBCOMMAND_HELP.items():
-        subparsers.add_parser(name, help=help_text)
+        sp = subparsers.add_parser(name, help=help_text)
+        if name == "add":
+            sp.add_argument(
+                "--mirror", metavar="<url>",
+                help="add <url> as a mirror provenance for <dep>",
+            )
+            sp.add_argument(
+                "dep_name", metavar="<dep>",
+                help="the lockfile-known dep name to attach the mirror to",
+            )
     return parser
 
 
@@ -392,6 +406,126 @@ def cmd_verify(project_dir: Path) -> int:
     return 0
 
 
+def cmd_add_mirror(
+    project_dir: Path,
+    *,
+    url: str,
+    dep_name: str,
+    fetcher: FetcherRegistry = default_registry,
+    relock: Callable[[Path], None] | None = None,
+) -> int:
+    """Append `url` as a mirror provenance for `dep_name` in the
+    manifest (#37).
+
+    Validates by fetching `url` and confirming its bytes hash to the
+    identity locked for `dep_name`. On mismatch, returns 1 without
+    mutating. On success, atomically appends `mirror "url"` to the
+    UrlDep block and triggers `relock` (defaults to cmd_lock when
+    None — see apply_manifest_change).
+    """
+    lockfile_path = project_dir / "milpa.lock"
+    manifest_path = project_dir / "milpa.kdl"
+
+    if not lockfile_path.exists():
+        print(
+            f"add --mirror: no lockfile at {lockfile_path} — "
+            f"run `milpa fetch` first",
+            file=sys.stderr,
+        )
+        return 1
+    if not manifest_path.exists():
+        print(
+            f"add --mirror: no milpa.kdl at {manifest_path}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        lockfile = load_lockfile(lockfile_path)
+    except Exception as e:
+        print(f"add --mirror: cannot load lockfile: {e}", file=sys.stderr)
+        return 1
+
+    locked = next((d for d in lockfile.deps if d.name == dep_name), None)
+    if locked is None:
+        names = ", ".join(sorted(d.name for d in lockfile.deps))
+        print(
+            f"add --mirror: no dep {dep_name!r} in lockfile "
+            f"(known: {names or '<none>'})",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Local + member deps don't have a meaningful "mirror" concept —
+    # their bytes come from an editable source, not a fetchable one.
+    from .lockfile import LocalProvenanceRecord, MemberProvenanceRecord
+    if any(isinstance(p, (LocalProvenanceRecord, MemberProvenanceRecord))
+           for p in locked.provenances):
+        print(
+            f"add --mirror: dep {dep_name!r} has a local/member "
+            f"provenance — cannot add a mirror to an editable source",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Validate: fetch the URL into a scratch dir and verify identity
+    # matches the locked pin. apply_manifest_change runs this in the
+    # `validate` phase so any failure aborts before mutation.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        scratch = Path(td) / dep_name
+
+        def validate() -> None:
+            from .fetchers.git import GitProvenance
+            from .lockfile import GitProvenanceRecord
+            # Get a reference ref from the existing git provenance (if any)
+            ref = "main"
+            for p in locked.provenances:
+                if isinstance(p, GitProvenanceRecord) and p.ref:
+                    ref = p.ref
+                    break
+            result = fetcher.fetch(
+                dep_name, GitProvenance(url=url, ref=ref), dest=scratch,
+            )
+            if result.identity != locked.identity:
+                raise ManifestError(
+                    f"add --mirror: bytes at {url} hash to "
+                    f"{result.identity[:23]}..., "
+                    f"locked identity is {(locked.identity or '<none>')[:23]}... "
+                    f"— mirrors must serve identical bytes"
+                )
+
+        def mutate(m: Manifest) -> Manifest:
+            from dataclasses import replace
+            new_deps = []
+            for dep in m.deps:
+                if isinstance(dep, UrlDep) and dep.name == dep_name:
+                    if url in dep.mirrors:
+                        # Idempotent: already present
+                        new_deps.append(dep)
+                    else:
+                        new_deps.append(
+                            replace(dep, mirrors=dep.mirrors + (url,)),
+                        )
+                else:
+                    new_deps.append(dep)
+            return replace(m, deps=tuple(new_deps))
+
+        try:
+            apply_manifest_change(
+                project_dir,
+                validate=validate, mutate=mutate, relock=relock,
+            )
+        except ManifestError as e:
+            print(str(e), file=sys.stderr)
+            return 1
+
+    print(
+        f"added mirror {url} for {dep_name}", file=sys.stderr,
+    )
+    return 0
+
+
 def _local_source_drift_warnings(
     project_dir: Path, lockfile,
 ) -> list[str]:
@@ -528,6 +662,20 @@ def main(argv: list[str] | None = None) -> int:
         case "show":   return cmd_show(project_dir)
         case "verify": return cmd_verify(project_dir)
         case "clean":  return cmd_clean(project_dir)
+        case "add":
+            if not args.mirror:
+                print(
+                    "add: only --mirror is supported today; "
+                    "general `milpa add` lands with #16",
+                    file=sys.stderr,
+                )
+                return 1
+            return cmd_add_mirror(
+                project_dir, url=args.mirror, dep_name=args.dep_name,
+                relock=lambda pd: cmd_lock(
+                    pd, max_parallel=args.parallel, strategy=strategy,
+                ),
+            )
         case _:
             print(f"unknown command: {args.command}", file=sys.stderr)
             return 1

@@ -90,10 +90,13 @@ def manifests(draw):
     deps: list = []
     for name in dep_names:
         if draw(st.booleans()):
+            n_mirrors = draw(st.integers(min_value=0, max_value=3))
+            mirrors = tuple(draw(git_urls()) for _ in range(n_mirrors))
             deps.append(UrlDep(
                 name=name,
                 git=draw(git_urls()),
                 ref=draw(git_refs()),
+                mirrors=mirrors,
             ))
         else:
             deps.append(NamedDep(name=name, constraint=draw(constraints())))
