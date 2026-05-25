@@ -22,14 +22,21 @@ def format_nimcfg(
     graph: ResolvedGraph,
     *,
     deps_dir: Path = Path("_deps"),
+    self_src_dir: str = "",
 ) -> str:
     """Render `graph` into nim.cfg text.
 
     Each dep contributes a `--path:"<deps_dir>/<name>[/<src_dir>]"`
     line. Paths use POSIX separators regardless of host OS — nim.cfg
     syntax is OS-agnostic.
+
+    `self_src_dir` adds a `--path:"<self_src_dir>"` line for the
+    consuming package's own source tree. Emitted before dep paths so
+    self-modules shadow any same-named dep import paths.
     """
     lines = [_HEADER.rstrip("\n"), ""]
+    if self_src_dir:
+        lines.append(f'--path:"{self_src_dir}"')
     for dep in graph.deps:
         lines.append(f'--path:"{_path_for(dep, deps_dir)}"')
     # Feature flag defines (#23). For each active flag on a dep:
@@ -65,6 +72,7 @@ def write_nimcfg(
     *,
     project_root: Path,
     deps_dir: Path = Path("_deps"),
+    self_src_dir: str = "",
 ) -> Path:
     """Write `nim.cfg` at `project_root/nim.cfg`. Returns the path.
 
@@ -72,7 +80,9 @@ def write_nimcfg(
     """
     target = project_root / "nim.cfg"
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(format_nimcfg(graph, deps_dir=deps_dir))
+    target.write_text(
+        format_nimcfg(graph, deps_dir=deps_dir, self_src_dir=self_src_dir)
+    )
     return target
 
 

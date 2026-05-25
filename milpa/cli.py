@@ -170,11 +170,22 @@ def cmd_fetch(
             strategy=strategy, frozen=frozen,
         )
 
+    # Load manifest once to forward self_src_dir to nim.cfg emission.
+    # Errors propagate via the existing resolve/frozen paths.
+    self_src_dir = ""
+    try:
+        self_src_dir = load_or_discover_manifest(project_dir).src_dir
+    except ManifestError:
+        pass  # frozen / slow path will surface the same error with full context
+
     frozen_result = _try_frozen(
         project_dir, fetcher=fetcher, strategy=strategy,
     )
     if isinstance(frozen_result, ResolvedGraph):
-        write_nimcfg(frozen_result, project_root=project_dir)
+        write_nimcfg(
+            frozen_result, project_root=project_dir,
+            self_src_dir=self_src_dir,
+        )
         print(
             f"resolved {len(frozen_result.deps)} deps (frozen)",
             file=sys.stderr,
@@ -193,7 +204,9 @@ def cmd_fetch(
         return graph
     lockfile = from_graph(graph, strategy=str(strategy))
     write_lockfile(lockfile, project_dir / "milpa.lock")
-    write_nimcfg(graph, project_root=project_dir)
+    write_nimcfg(
+        graph, project_root=project_dir, self_src_dir=self_src_dir,
+    )
     print(f"resolved {len(graph.deps)} deps", file=sys.stderr)
     return 0
 

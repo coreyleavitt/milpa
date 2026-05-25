@@ -82,3 +82,40 @@ def test_custom_deps_dir_used_in_paths():
     graph = ResolvedGraph(deps=(_dep("foo", src_dir="src"),))
     text = format_nimcfg(graph, deps_dir=Path("vendor/nim"))
     assert '--path:"vendor/nim/foo/src"' in text
+
+
+def test_self_src_dir_emits_path_for_owning_package():
+    """When the consumer declares its own src_dir, nim.cfg includes
+    --path:"<self_src_dir>" so the consumer's own modules resolve via
+    `import myPkg/foo` without a separate tests/nim.cfg.
+    """
+    graph = ResolvedGraph(deps=(_dep("foo", src_dir="src"),))
+    text = format_nimcfg(graph, self_src_dir="src")
+    assert '--path:"src"' in text
+    # Self path appears before dep paths so the consumer's own modules
+    # shadow any same-named dep in surprise cases (defensible ordering).
+    assert text.index('--path:"src"') < text.index('--path:"_deps/foo/src"')
+
+
+def test_self_src_dir_empty_omits_self_path():
+    """No src_dir declared → no self --path: line."""
+    graph = ResolvedGraph(deps=(_dep("foo", src_dir="src"),))
+    text = format_nimcfg(graph, self_src_dir="")
+    # The dep path still appears; only the self path is absent.
+    assert '--path:"_deps/foo/src"' in text
+    self_lines = [l for l in text.splitlines() if l == '--path:"src"']
+    assert self_lines == []
+
+
+def test_self_src_dir_with_empty_graph():
+    """A package with no deps but its own src still gets a self path."""
+    graph = ResolvedGraph(deps=())
+    text = format_nimcfg(graph, self_src_dir="src")
+    assert '--path:"src"' in text
+
+
+def test_write_nimcfg_forwards_self_src_dir(tmp_path):
+    graph = ResolvedGraph(deps=(_dep("foo", src_dir="src"),))
+    path = write_nimcfg(graph, project_root=tmp_path, self_src_dir="src")
+    content = path.read_text()
+    assert '--path:"src"' in content
