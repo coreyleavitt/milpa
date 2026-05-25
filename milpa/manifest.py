@@ -179,6 +179,7 @@ class Manifest:
     overrides: tuple[Override, ...] = ()
     flags: tuple[FlagDecl, ...] = ()
     self_mirrors: tuple[str, ...] = ()    # alternative URLs where THIS package is hosted (#79)
+    cas_dir: str = ""                     # project-level CAS override (env var > this > XDG default)
 
 
 @dataclass(frozen=True)
@@ -213,7 +214,7 @@ class ManifestError(Exception):
 # the schema doc at milpa/schema/milpa.schema.kdl documents the same shape
 # for humans. Drift between the two is checked indirectly via tests against
 # example manifests.
-_PACKAGE_TOP_LEVEL = frozenset({"deps", "kind", "overrides", "name", "src_dir", "flags", "mirrors"})
+_PACKAGE_TOP_LEVEL = frozenset({"deps", "kind", "overrides", "name", "src_dir", "flags", "mirrors", "cas"})
 _PREDICATE_PROPS = frozenset({"platform", "arch", "nim", "milpa", "flag"})
 _URL_DEP_PROPS = frozenset({"git", "ref"}) | _PREDICATE_PROPS
 _VALID_KINDS: tuple[Kind, ...] = ("library", "application")
@@ -328,6 +329,7 @@ def _parse_manifest_doc(doc) -> Manifest:
     kind: Kind = "library"
     name: str | None = None
     src_dir: str = ""
+    cas_dir: str = ""
     seen_names: set[str] = set()
     seen_override_names: set[str] = set()
     seen_flag_names: set[str] = set()
@@ -352,6 +354,23 @@ def _parse_manifest_doc(doc) -> Manifest:
                     code="MAN-SRC-DIR-TYPE",
                 )
             src_dir = node.args[0]
+            continue
+        if node.name == "cas":
+            dir_node = next(
+                (c for c in node.nodes if c.name == "dir"), None,
+            )
+            if dir_node is None:
+                raise ManifestError(
+                    "'cas' block requires a 'dir' child node",
+                    code="MAN-CAS-DIR-MISSING",
+                )
+            if (len(dir_node.args) != 1
+                    or not isinstance(dir_node.args[0], str)):
+                raise ManifestError(
+                    "'cas.dir' takes exactly one positional string argument",
+                    code="MAN-CAS-DIR-TYPE",
+                )
+            cas_dir = dir_node.args[0]
             continue
         if node.name == "deps":
             for child in node.nodes:
@@ -448,6 +467,7 @@ def _parse_manifest_doc(doc) -> Manifest:
         overrides=tuple(overrides),
         flags=tuple(flags),
         self_mirrors=tuple(self_mirrors),
+        cas_dir=cas_dir,
     )
 
 
@@ -490,6 +510,11 @@ def format_manifest(m: Manifest) -> str:
         lines.append("")
     if m.src_dir:
         lines.append(f'src_dir "{m.src_dir}"')
+        lines.append("")
+    if m.cas_dir:
+        lines.append("cas {")
+        lines.append(f'    dir "{m.cas_dir}"')
+        lines.append("}")
         lines.append("")
     if m.deps:
         lines.append("deps {")

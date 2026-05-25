@@ -108,6 +108,36 @@ def test_link_creates_symlink_resolving_to_cas_entry(tmp_path):
     assert (target / "file.txt").read_text() == "ABC"
 
 
+def test_link_uses_relative_target_for_portability(tmp_path):
+    """Symlink target is a path *relative* to the symlink's directory,
+    not an absolute host path. Reason: portability under bind-mounts —
+    a project's _deps/<name> symlink should resolve identically whether
+    the project tree is at /home/foo/projects/x on the host or /work
+    inside a container (with only the project tree mounted).
+
+    Containerized builds were repeatedly broken when symlinks pointed
+    at absolute host paths the container couldn't see.
+    """
+    import os
+    store = CAStore(root=tmp_path / ".milpa" / "cas")
+    scratch = _scratch_tree(tmp_path, content="ABC")
+    identity = compute_content_hash(scratch)
+    store.admit(scratch, identity)
+
+    target = tmp_path / "_deps" / "foo"
+    target.parent.mkdir(parents=True)
+    store.link(identity, target)
+
+    # The link's stored target string is relative — does NOT start with /
+    link_target = os.readlink(target)
+    assert not os.path.isabs(link_target), (
+        f"expected relative symlink target; got {link_target!r}"
+    )
+    # The relative target still resolves to the CAS entry from the
+    # symlink's location.
+    assert target.resolve() == store.path_for(identity).resolve()
+
+
 def test_default_store_honors_milpa_cache_dir(tmp_path, monkeypatch):
     """MILPA_CACHE_DIR wins over everything."""
     monkeypatch.setenv("MILPA_CACHE_DIR", str(tmp_path / "override"))

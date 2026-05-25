@@ -72,7 +72,13 @@ class CAStore:
     def link(self, identity: str, target: Path) -> None:
         """Create a symlink at `target` resolving to the CAS entry for
         `identity`. If `target` already exists, it is replaced
-        (idempotent re-linking)."""
+        (idempotent re-linking).
+
+        The stored symlink target is **relative** to the symlink's
+        directory, not an absolute host path. This keeps `_deps/<name>`
+        symlinks valid when the project tree is bind-mounted into a
+        container at a different path (e.g., host `/home/x/proj` mounted
+        as `/work` inside the container)."""
         canonical = self.path_for(identity)
         if not canonical.is_dir():
             raise CASError(
@@ -83,7 +89,8 @@ class CAStore:
                 target.unlink()
             else:
                 shutil.rmtree(target)
-        target.symlink_to(canonical, target_is_directory=True)
+        rel = os.path.relpath(canonical, start=target.parent)
+        target.symlink_to(rel, target_is_directory=True)
 
 
 def default_store() -> CAStore:

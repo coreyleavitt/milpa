@@ -78,6 +78,18 @@ SRC_DIR_TYPE = register(
     when="`src_dir` node has wrong arity or non-string arg.",
 )
 
+CAS_DIR_MISSING = register(
+    slug="MAN-CAS-DIR-MISSING", category=_CAT,
+    description="`cas` block requires a `dir` child node.",
+    when="A `cas { ... }` block is declared without a `dir \"<path>\"` entry.",
+)
+
+CAS_DIR_TYPE = register(
+    slug="MAN-CAS-DIR-TYPE", category=_CAT,
+    description="`cas.dir` must take exactly one positional string argument.",
+    when="`cas.dir` value is missing, multi-valued, or non-string.",
+)
+
 UNKNOWN_TOP_LEVEL = register(
     slug="MAN-UNKNOWN-TOP-LEVEL", category=_CAT,
     description="Unknown top-level node in package manifest.",

@@ -15,6 +15,18 @@ Generated from `milpa/error_catalog.py` — do not edit by hand.
 
 **Triggered:** The proposed mirror URL serves bytes that differ from what the lockfile pinned.
 
+### `MAN-CAS-DIR-MISSING`
+
+`cas` block requires a `dir` child node.
+
+**Triggered:** A `cas { ... }` block is declared without a `dir "<path>"` entry.
+
+### `MAN-CAS-DIR-TYPE`
+
+`cas.dir` must take exactly one positional string argument.
+
+**Triggered:** `cas.dir` value is missing, multi-valued, or non-string.
+
 ### `MAN-DEP-DUPLICATE`
 
 A dep name appears more than once in the deps block.

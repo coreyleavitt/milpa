@@ -467,6 +467,83 @@ def test_src_dir_round_trips_through_format_parse():
     assert reparsed == original
 
 
+def test_cas_block_parses_dir_field():
+    """A milpa.kdl may declare a `cas { dir "..." }` block to override
+    the CAS location for this project. Path is relative to the project
+    root (unless absolute). Enables container-first / self-contained
+    builds without polluting ~/.cache/milpa.
+    """
+    text = '''
+name "tianguis"
+cas {
+    dir ".milpa/cas"
+}
+deps {
+    kdl git=(url)"https://example.com/x.git" ref="main"
+}
+'''
+    m = parse_manifest(text)
+    assert m.cas_dir == ".milpa/cas"
+
+
+def test_cas_dir_defaults_to_empty_when_absent():
+    """No cas block → cas_dir == '' → resolver uses env-var/XDG default."""
+    text = '''
+name "test"
+deps {
+    chronos git=(url)"https://example.com/x.git" ref="main"
+}
+'''
+    m = parse_manifest(text)
+    assert m.cas_dir == ""
+
+
+def test_cas_block_round_trips_through_format_parse():
+    from milpa.manifest import format_manifest
+    original = Manifest(
+        deps=(UrlDep(name="foo", git="https://x/y.git", ref="main"),),
+        kind="library",
+        name="t",
+        cas_dir=".milpa/cas",
+    )
+    reparsed = parse_manifest(format_manifest(original))
+    assert reparsed == original
+
+
+def test_cas_block_absent_does_not_emit():
+    """Default cas_dir round-trips without a noise block."""
+    from milpa.manifest import format_manifest
+    m = Manifest(deps=(), kind="library", name="t")
+    text = format_manifest(m)
+    assert "cas" not in text
+
+
+def test_cas_block_requires_dir_field():
+    """Empty cas block is a typed error — the block exists to set dir."""
+    text = '''
+name "t"
+cas {
+}
+deps {}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    assert exc.value.code == "MAN-CAS-DIR-MISSING"
+
+
+def test_cas_dir_must_be_string():
+    text = '''
+name "t"
+cas {
+    dir 42
+}
+deps {}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    assert exc.value.code == "MAN-CAS-DIR-TYPE"
+
+
 def test_src_dir_absent_does_not_emit_line():
     """Manifests without src_dir round-trip cleanly — formatter
     doesn't add an `src_dir ""` noise line."""

@@ -15,12 +15,14 @@ exercise them without subprocess overhead or network access. The
 """
 
 import argparse
+import os
 import shutil
 import sys
 from pathlib import Path
 from collections.abc import Callable
 
 from . import __version__
+from .cas import CAStore
 from .fetchers import FetcherRegistry, default_registry
 from .nimcfg import write_workspace_nimcfgs
 from .lockfile import (
@@ -170,11 +172,16 @@ def cmd_fetch(
             strategy=strategy, frozen=frozen,
         )
 
-    # Load manifest once to forward self_src_dir to nim.cfg emission.
+    # Load manifest once to forward self_src_dir to nim.cfg emission
+    # and to honor a project-level CAS override (cas { dir "..." }).
     # Errors propagate via the existing resolve/frozen paths.
     self_src_dir = ""
     try:
-        self_src_dir = load_or_discover_manifest(project_dir).src_dir
+        manifest = load_or_discover_manifest(project_dir)
+        self_src_dir = manifest.src_dir
+        fetcher = _fetcher_for_manifest(
+            manifest, project_dir, default=fetcher,
+        )
     except ManifestError:
         pass  # frozen / slow path will surface the same error with full context
 
@@ -209,6 +216,30 @@ def cmd_fetch(
     )
     print(f"resolved {len(graph.deps)} deps", file=sys.stderr)
     return 0
+
+
+def _fetcher_for_manifest(
+    manifest, project_dir: Path, *, default: FetcherRegistry,
+) -> FetcherRegistry:
+    """Honor a project-level CAS override (`cas { dir "..." }`).
+
+    Precedence (highest first):
+      1. `MILPA_CACHE_DIR` env var — already picked up by default_store(); we
+         do nothing here so the passed-in registry's CAS wins.
+      2. Manifest `cas { dir "..." }` — construct a fresh FetcherRegistry
+         with a CAStore at <project_dir>/<cas_dir>. Relative paths resolve
+         against the project root; absolute paths used verbatim.
+      3. Default (XDG / ~/.cache) — passed-in registry.
+    """
+    if os.environ.get("MILPA_CACHE_DIR"):
+        return default
+    if not manifest.cas_dir:
+        return default
+    cas_root = Path(manifest.cas_dir)
+    if not cas_root.is_absolute():
+        cas_root = project_dir / cas_root
+    cas_root.mkdir(parents=True, exist_ok=True)
+    return default.with_store(CAStore(root=cas_root))
 
 
 def _try_frozen(

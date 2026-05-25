@@ -113,6 +113,21 @@ class FetcherRegistry:
         """The CAStore this registry routes through, if any."""
         return self._store
 
+    @property
+    def fetchers(self) -> tuple[Fetcher, ...]:
+        """Registered fetchers in declaration order — useful for cloning
+        a registry with a different store while preserving fetcher set."""
+        return tuple(self._fetchers)
+
+    def with_store(self, store: "CAStore") -> "FetcherRegistry":
+        """Return a new registry with the same fetchers but a different
+        CAS. Enables per-project CAS overrides (cas { dir "..." }) without
+        mutating the global default_registry singleton."""
+        new = FetcherRegistry(store=store)
+        for f in self._fetchers:
+            new.register(f)
+        return new
+
     def register(self, fetcher: Fetcher) -> None:
         self._fetchers.append(fetcher)
 
