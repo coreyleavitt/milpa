@@ -67,6 +67,7 @@ class ResolvedDep:
     src_dir: str           # for nim.cfg --path emission
     requires: tuple[str, ...]  # names of direct deps
     active_flags: tuple[str, ...] = ()  # feature flags active on this dep (#23)
+    self_mirrors: tuple[str, ...] = ()  # alternative URLs declared by this dep (#79)
     # Per-flag explicit -d: overrides. Each entry: (flag_name, tuple of
     # -d: strings to emit). Flags not listed here use the convention
     # `-d:<dep_name>_<flag_name>`. Stored as a tuple of pairs so the
@@ -106,6 +107,10 @@ class _Candidate:
     # Feature-flag state on this candidate (#90).
     active_flags: tuple[str, ...] = ()
     flag_defines: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # Self-mirrors harvested from this dep's milpa.kdl (#79). Used
+    # as fall-back candidates in subsequent resolves via the lockfile
+    # cache.
+    self_mirrors: tuple[str, ...] = ()
 
 
 class _MaterializedProvider:
@@ -489,7 +494,8 @@ def resolve(
                 if not all_requests:
                     continue
                 (new_terms, new_requires, _, sub_items,
-                 new_active, new_flag_defines) = _extract_from_milpa_kdl(
+                 new_active, new_flag_defines,
+                 _self_mirrors) = _extract_from_milpa_kdl(
                     milpa_kdl_path, "<re-eval>", registry, list_tags,
                     overrides_by_name,
                     consumer_flag_requests=tuple(all_requests),
@@ -940,6 +946,17 @@ def _normalize_constraint(s: str) -> str:
     return re.sub(r"\d+(?:\.\d+){0,2}", expand, s)
 
 
+def _prior_self_mirrors_for(name: str, prior_lockfile) -> tuple[str, ...]:
+    """Return self-mirrors cached in the prior lockfile for `name`
+    (#79). Empty tuple when no prior or no entry."""
+    if prior_lockfile is None:
+        return ()
+    for d in prior_lockfile.deps:
+        if d.name == name:
+            return d.self_mirrors
+    return ()
+
+
 def _pin_for_url_dep(dep: UrlDep, prior_lockfile) -> str | None:
     """Return the locked identity for `dep` iff the manifest's git+ref
     still matches the lockfile's recorded GitProvenanceRecord. Drops
@@ -1028,8 +1045,14 @@ def _process_url(
     is enforced via fetch_any's expected_identity guard (#82). A
     hostile mirror or rewritten tag is rejected at fetch time."""
     candidates = [GitProvenance(url=dep.git, ref=dep.ref)]
+    # Consumer-declared dep-mirrors next (#37)
     for mirror_url in dep.mirrors:
         candidates.append(GitProvenance(url=mirror_url, ref=dep.ref))
+    # Self-mirrors cached from prior lockfile (#79): the dep's own
+    # milpa.kdl declared them on a previous resolve; available now as
+    # additional fall-back candidates even before this fetch succeeds.
+    for sm_url in _prior_self_mirrors_for(dep.name, prior_lockfile):
+        candidates.append(GitProvenance(url=sm_url, ref=dep.ref))
     expected_identity = _pin_for_url_dep(dep, prior_lockfile)
     result = fetcher.fetch_any(
         dep.name,
@@ -1043,9 +1066,11 @@ def _process_url(
     milpa_kdl_path = result.path / "milpa.kdl"
     active_flags: tuple[str, ...] = ()
     flag_defines: tuple = ()
+    self_mirrors: tuple[str, ...] = ()
     if milpa_kdl_path.exists():
         (terms, requires_names, src_dir_value, new_items,
-         active_flags, flag_defines) = _extract_from_milpa_kdl(
+         active_flags, flag_defines,
+         self_mirrors) = _extract_from_milpa_kdl(
             milpa_kdl_path, dep.name, registry, list_tags,
             overrides_by_name,
             consumer_flag_requests=dep.flag_requests,
@@ -1070,6 +1095,7 @@ def _process_url(
         dep_terms=terms, requires_names=requires_names,
         active_flags=active_flags,
         flag_defines=flag_defines,
+        self_mirrors=self_mirrors,
     )
     return candidate, new_items
 
@@ -1175,6 +1201,7 @@ def _extract_from_milpa_kdl(
         tuple(sub_terms), tuple(sub_requires),
         manifest.src_dir, sub_items,
         tuple(sorted(active_frozen)), flag_defines,
+        manifest.self_mirrors,
     )
 
 
@@ -1460,5 +1487,6 @@ def _build_graph(
             requires=tuple(c.requires_names),
             active_flags=getattr(c, "active_flags", ()),
             flag_defines=getattr(c, "flag_defines", ()),
+            self_mirrors=getattr(c, "self_mirrors", ()),
         ))
     return ResolvedGraph(deps=tuple(out))

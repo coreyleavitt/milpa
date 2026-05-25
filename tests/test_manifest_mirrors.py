@@ -64,8 +64,8 @@ def test_format_manifest_emits_mirrors_and_round_trips():
         ),),
     )
     text = format_manifest(original)
-    assert 'mirror "https://gitlab.com/x/chronos.git"' in text
-    assert 'mirror "https://mirror.example.com/x/chronos.git"' in text
+    assert 'mirror (url)"https://gitlab.com/x/chronos.git"' in text
+    assert 'mirror (url)"https://mirror.example.com/x/chronos.git"' in text
     reparsed = parse_manifest(text)
     assert reparsed == original
 

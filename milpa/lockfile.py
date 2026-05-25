@@ -130,6 +130,10 @@ class LockedDep:
     requires: tuple[str, ...]
     provenances: tuple[ProvenanceRecord, ...]
     active_flags: tuple[str, ...] = ()
+    # Self-mirrors harvested from this dep's milpa.kdl (#79).
+    # Cached so subsequent resolves can fall through to them even
+    # when the primary fetch fails before discovery.
+    self_mirrors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -173,6 +177,8 @@ def _locked_from_resolved(d: ResolvedDep) -> LockedDep:
         src_dir=d.src_dir,
         requires=d.requires,
         provenances=(_provenance_from_resolved(d),),
+        active_flags=getattr(d, "active_flags", ()),
+        self_mirrors=getattr(d, "self_mirrors", ()),
     )
 
 
@@ -261,6 +267,7 @@ def _parse_dep(node: kdl.Node) -> LockedDep:
     src_dir = ""
     requires: tuple[str, ...] = ()
     active_flags: tuple[str, ...] = ()
+    self_mirrors: tuple[str, ...] = ()
     provenances: list[ProvenanceRecord] = []
 
     for child in node.nodes:
@@ -280,6 +287,16 @@ def _parse_dep(node: kdl.Node) -> LockedDep:
             requires = tuple(a for a in child.args if isinstance(a, str))
         elif child.name == "active_flags":
             active_flags = tuple(a for a in child.args if isinstance(a, str))
+        elif child.name == "self_mirrors":
+            # Accept both bare strings and (url)-annotated values
+            from urllib.parse import ParseResult
+            sm = []
+            for a in child.args:
+                if isinstance(a, ParseResult):
+                    sm.append(a.geturl())
+                elif isinstance(a, str):
+                    sm.append(a)
+            self_mirrors = tuple(sm)
         elif child.name == "provenance":
             provenances.append(_parse_provenance_block(child, name))
         else:
@@ -293,6 +310,7 @@ def _parse_dep(node: kdl.Node) -> LockedDep:
         requires=requires,
         provenances=tuple(provenances),
         active_flags=active_flags,
+        self_mirrors=self_mirrors,
     )
 
 
@@ -401,6 +419,9 @@ def format_lockfile(lockfile: Lockfile) -> str:
         if dep.active_flags:
             flag_args = " ".join(f'"{f}"' for f in dep.active_flags)
             lines.append(f'    active_flags {flag_args}')
+        if dep.self_mirrors:
+            sm_args = " ".join(f'(url)"{u}"' for u in dep.self_mirrors)
+            lines.append(f'    self_mirrors {sm_args}')
         for prov in dep.provenances:
             lines.append("    provenance {")
             for line in _format_provenance_fields(prov):

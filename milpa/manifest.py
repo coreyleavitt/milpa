@@ -178,6 +178,7 @@ class Manifest:
     src_dir: str = ""
     overrides: tuple[Override, ...] = ()
     flags: tuple[FlagDecl, ...] = ()
+    self_mirrors: tuple[str, ...] = ()    # alternative URLs where THIS package is hosted (#79)
 
 
 @dataclass(frozen=True)
@@ -204,7 +205,7 @@ class ManifestError(Exception):
 # the schema doc at milpa/schema/milpa.schema.kdl documents the same shape
 # for humans. Drift between the two is checked indirectly via tests against
 # example manifests.
-_PACKAGE_TOP_LEVEL = frozenset({"deps", "kind", "overrides", "name", "src_dir", "flags"})
+_PACKAGE_TOP_LEVEL = frozenset({"deps", "kind", "overrides", "name", "src_dir", "flags", "mirrors"})
 _PREDICATE_PROPS = frozenset({"platform", "arch", "nim", "milpa", "flag"})
 _URL_DEP_PROPS = frozenset({"git", "ref"}) | _PREDICATE_PROPS
 _VALID_KINDS: tuple[Kind, ...] = ("library", "application")
@@ -305,6 +306,7 @@ def _parse_manifest_doc(doc) -> Manifest:
     deps: list[Dep] = []
     overrides: list[Override] = []
     flags: list[FlagDecl] = []
+    self_mirrors: list[str] = []
     kind: Kind = "library"
     name: str | None = None
     src_dir: str = ""
@@ -359,6 +361,23 @@ def _parse_manifest_doc(doc) -> Manifest:
                     )
                 seen_flag_names.add(fd.name)
                 flags.append(fd)
+        elif node.name == "mirrors":
+            # Top-level mirrors {} block declares URLs where THIS
+            # package is hosted (#79). Each child is `mirror (url)"X"`.
+            for child in node.nodes:
+                if child.name != "mirror":
+                    raise ManifestError(
+                        f"unknown child node {child.name!r} in mirrors "
+                        f"block (allowed: 'mirror')"
+                    )
+                if len(child.args) != 1:
+                    raise ManifestError(
+                        "top-level 'mirror' takes exactly one positional "
+                        "URL argument"
+                    )
+                self_mirrors.append(
+                    _url_arg("top-level mirrors", "mirror", child.args[0]),
+                )
         elif node.name == "workspace":
             raise ManifestError(
                 "'workspace' block found in a package manifest — "
@@ -398,6 +417,7 @@ def _parse_manifest_doc(doc) -> Manifest:
         src_dir=src_dir,
         overrides=tuple(overrides),
         flags=tuple(flags),
+        self_mirrors=tuple(self_mirrors),
     )
 
 
@@ -450,6 +470,12 @@ def format_manifest(m: Manifest) -> str:
                 f'    pkg {_quote_name(ov.name)} '
                 f'git=(url)"{ov.git}" ref="{ov.ref}"'
             )
+        lines.append("}")
+        lines.append("")
+    if m.self_mirrors:
+        lines.append("mirrors {")
+        for url in m.self_mirrors:
+            lines.append(f'    mirror (url)"{url}"')
         lines.append("}")
         lines.append("")
     if m.flags:
@@ -507,7 +533,7 @@ def _format_dep_line(dep: Dep) -> str:
             )
             lines.append(f'        {pred.name} {args}')
         for url in dep.mirrors:
-            lines.append(f'        mirror "{url}"')
+            lines.append(f'        mirror (url)"{url}"')
         for fr in dep.flag_requests:
             if fr.enabled:
                 lines.append(f'        flag "{fr.name}"')
@@ -611,6 +637,20 @@ def _parse_url_dep(node: kdl.Node) -> UrlDep:
     )
 
 
+def _url_arg(context: str, field: str, raw) -> str:
+    """Normalize a URL argument: accepts either a bare string (legacy)
+    or a urllib ParseResult (from KDL's `(url)` type annotation).
+    Always returns the URL as a string."""
+    if isinstance(raw, ParseResult):
+        return raw.geturl()
+    if isinstance(raw, str):
+        return raw
+    raise ManifestError(
+        f"{context}: {field!r} expects a URL string "
+        f"(plain or (url)-annotated); got {type(raw).__name__}"
+    )
+
+
 def _parse_url_dep_children(
     dep_name: str, node: kdl.Node,
 ) -> tuple[tuple[str, ...], tuple[Predicate, ...], tuple[FlagRequest, ...]]:
@@ -621,12 +661,12 @@ def _parse_url_dep_children(
     flag_requests: list[FlagRequest] = []
     for child in node.nodes:
         if child.name == "mirror":
-            if len(child.args) != 1 or not isinstance(child.args[0], str):
+            if len(child.args) != 1:
                 raise ManifestError(
                     f"dep {dep_name!r}: 'mirror' takes exactly one "
-                    f"positional string argument (the URL)"
+                    f"positional argument (the URL)"
                 )
-            mirrors.append(child.args[0])
+            mirrors.append(_url_arg(dep_name, "mirror", child.args[0]))
         elif child.name == "flag":
             flag_requests.append(_parse_flag_request(dep_name, child))
         elif child.name in _PREDICATE_PROPS:
