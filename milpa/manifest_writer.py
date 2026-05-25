@@ -67,18 +67,21 @@ def mutate_manifest_file(
     if not path.exists():
         raise ManifestError(
             f"manifest file not found: {path} — "
-            f"create a milpa.kdl before mutating"
+            f"create a milpa.kdl before mutating",
+            code="MAN-MUTATE-FILE-NOT-FOUND",
         )
     if path.suffix == ".nimble":
         raise ManifestError(
             f"refusing to mutate a .nimble file ({path}); "
-            f"promote to milpa.kdl first (`milpa init` — TBD)"
+            f"promote to milpa.kdl first (`milpa init` — TBD)",
+            code="MAN-MUTATE-NIMBLE-REFUSED",
         )
     text = path.read_text()
     if "workspace" in text and _has_workspace_block(text):
         raise ManifestError(
             f"{path}: workspace manifests are pure containers and "
-            f"cannot be mutated by this helper"
+            f"cannot be mutated by this helper",
+            code="MAN-MUTATE-WORKSPACE-REFUSED",
         )
     m = parse_manifest(text)
     new_m = mutator(m)

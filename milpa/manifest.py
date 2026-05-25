@@ -198,7 +198,15 @@ class WorkspaceManifest:
 
 
 class ManifestError(Exception):
-    """Raised when milpa.kdl is malformed or violates the schema."""
+    """Raised when milpa.kdl is malformed or violates the schema.
+
+    `code` is the stable error-catalog identifier (#14). New raise
+    sites should always pass it; legacy single-arg raises remain
+    valid (code is None) during the gradual instrumentation."""
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 # What the parser accepts. These are the source of truth for validation;
@@ -225,7 +233,9 @@ def parse_workspace_or_manifest(
     try:
         doc = kdl.parse(text)
     except kdl.errors.ParseError as e:
-        raise ManifestError(f"KDL syntax error: {e}") from e
+        raise ManifestError(
+            f"KDL syntax error: {e}", code="MAN-KDL-SYNTAX",
+        ) from e
     has_workspace = any(node.name == "workspace" for node in doc.nodes)
     if has_workspace:
         return _parse_workspace_doc(doc)
@@ -246,24 +256,28 @@ def _parse_workspace_doc(doc) -> "WorkspaceManifest":
                 f"workspaces are pure containers, not packages "
                 f"(virtual-workspace-only); to make the root also a "
                 f"package, declare `member \".\"` and put deps/kind in "
-                f"the root member's milpa.kdl"
+                f"the root member's milpa.kdl",
+                code="MAN-WORKSPACE-HAS-DEPS-OR-KIND",
             )
         if node.name == "workspace":
             for child in node.nodes:
                 if child.name != "member":
                     raise ManifestError(
                         f"unknown node {child.name!r} in workspace block "
-                        f"(allowed: 'member')"
+                        f"(allowed: 'member')",
+                        code="MAN-WORKSPACE-UNKNOWN-NODE",
                     )
                 if len(child.args) != 1 or not isinstance(child.args[0], str):
                     raise ManifestError(
                         "workspace 'member' takes exactly one positional "
-                        "string argument (the member directory path)"
+                        "string argument (the member directory path)",
+                        code="MAN-WORKSPACE-MEMBER-ARITY",
                     )
                 path = child.args[0]
                 if path in members:
                     raise ManifestError(
-                        f"duplicate workspace member {path!r}"
+                        f"duplicate workspace member {path!r}",
+                        code="MAN-WORKSPACE-MEMBER-DUPLICATE",
                     )
                 members.append(path)
         elif node.name == "overrides":
@@ -271,7 +285,8 @@ def _parse_workspace_doc(doc) -> "WorkspaceManifest":
                 ov = _parse_override(child)
                 if ov.name in seen_override_names:
                     raise ManifestError(
-                        f"duplicate override for {ov.name!r}"
+                        f"duplicate override for {ov.name!r}",
+                        code="MAN-OVERRIDE-DUPLICATE",
                     )
                 seen_override_names.add(ov.name)
                 overrides.append(ov)
@@ -279,7 +294,8 @@ def _parse_workspace_doc(doc) -> "WorkspaceManifest":
             allowed = ", ".join(sorted(_WORKSPACE_TOP_LEVEL))
             raise ManifestError(
                 f"unknown top-level node {node.name!r} in workspace "
-                f"manifest (allowed: {allowed})"
+                f"manifest (allowed: {allowed})",
+                code="MAN-WORKSPACE-UNKNOWN-TOP-LEVEL",
             )
     return WorkspaceManifest(
         members=tuple(members),
@@ -298,7 +314,9 @@ def parse_manifest(text: str, *, source: str | None = None) -> Manifest:
     try:
         doc = kdl.parse(text)
     except kdl.errors.ParseError as e:
-        raise ManifestError(f"KDL syntax error: {e}") from e
+        raise ManifestError(
+            f"KDL syntax error: {e}", code="MAN-KDL-SYNTAX",
+        ) from e
     return _parse_manifest_doc(doc)
 
 
@@ -317,18 +335,21 @@ def _parse_manifest_doc(doc) -> Manifest:
         if node.name == "name":
             if name is not None:
                 raise ManifestError(
-                    "duplicate top-level 'name' node — only one allowed"
+                    "duplicate top-level 'name' node — only one allowed",
+                    code="MAN-NAME-DUPLICATE",
                 )
             if len(node.args) != 1 or not isinstance(node.args[0], str):
                 raise ManifestError(
-                    "'name' takes exactly one positional string argument"
+                    "'name' takes exactly one positional string argument",
+                    code="MAN-NAME-TYPE",
                 )
             name = node.args[0]
             continue
         if node.name == "src_dir":
             if len(node.args) != 1 or not isinstance(node.args[0], str):
                 raise ManifestError(
-                    "'src_dir' takes exactly one positional string argument"
+                    "'src_dir' takes exactly one positional string argument",
+                    code="MAN-SRC-DIR-TYPE",
                 )
             src_dir = node.args[0]
             continue
@@ -337,7 +358,8 @@ def _parse_manifest_doc(doc) -> Manifest:
                 for dep in _expand_dep_child(child, inherited_preds=()):
                     if dep.name in seen_names:
                         raise ManifestError(
-                            f"duplicate dep {dep.name!r} in manifest"
+                            f"duplicate dep {dep.name!r} in manifest",
+                            code="MAN-DEP-DUPLICATE",
                         )
                     seen_names.add(dep.name)
                     deps.append(dep)
@@ -348,7 +370,8 @@ def _parse_manifest_doc(doc) -> Manifest:
                 ov = _parse_override(child)
                 if ov.name in seen_override_names:
                     raise ManifestError(
-                        f"duplicate override for {ov.name!r}"
+                        f"duplicate override for {ov.name!r}",
+                        code="MAN-OVERRIDE-DUPLICATE",
                     )
                 seen_override_names.add(ov.name)
                 overrides.append(ov)
@@ -357,7 +380,8 @@ def _parse_manifest_doc(doc) -> Manifest:
                 fd = _parse_flag_decl(child)
                 if fd.name in seen_flag_names:
                     raise ManifestError(
-                        f"duplicate flag declaration {fd.name!r}"
+                        f"duplicate flag declaration {fd.name!r}",
+                        code="MAN-FLAG-DUPLICATE",
                     )
                 seen_flag_names.add(fd.name)
                 flags.append(fd)
@@ -368,12 +392,14 @@ def _parse_manifest_doc(doc) -> Manifest:
                 if child.name != "mirror":
                     raise ManifestError(
                         f"unknown child node {child.name!r} in mirrors "
-                        f"block (allowed: 'mirror')"
+                        f"block (allowed: 'mirror')",
+                        code="MAN-MIRRORS-UNKNOWN-CHILD",
                     )
                 if len(child.args) != 1:
                     raise ManifestError(
                         "top-level 'mirror' takes exactly one positional "
-                        "URL argument"
+                        "URL argument",
+                        code="MAN-MIRRORS-ARITY",
                     )
                 self_mirrors.append(
                     _url_arg("top-level mirrors", "mirror", child.args[0]),
@@ -383,18 +409,21 @@ def _parse_manifest_doc(doc) -> Manifest:
                 "'workspace' block found in a package manifest — "
                 "workspace and package roles are disjoint "
                 "(virtual-workspace-only). Use parse_workspace_or_manifest "
-                "if you want to accept either kind."
+                "if you want to accept either kind.",
+                code="MAN-WORKSPACE-IN-PACKAGE",
             )
         else:
             allowed = ", ".join(sorted(_PACKAGE_TOP_LEVEL))
             raise ManifestError(
                 f"unknown top-level node {node.name!r} "
-                f"(allowed: {allowed})"
+                f"(allowed: {allowed})",
+                code="MAN-UNKNOWN-TOP-LEVEL",
             )
     if name is None:
         raise ManifestError(
             "package manifest is missing required top-level 'name' node "
-            "(every package must self-identify; add: `name \"<your-name>\"`)"
+            "(every package must self-identify; add: `name \"<your-name>\"`)",
+            code="MAN-NAME-MISSING",
         )
     # Validate flag predicates against declared flags (#23/#90):
     # `when flag="X"` must reference a declared flag, else it's a typo.
@@ -408,7 +437,8 @@ def _parse_manifest_doc(doc) -> Manifest:
                     allowed = ", ".join(repr(n) for n in sorted(declared_flag_names)) or "<none declared>"
                     raise ManifestError(
                         f"dep {dep.name!r}: `when flag={v!r}` references "
-                        f"an undeclared flag (declared flags: {allowed})"
+                        f"an undeclared flag (declared flags: {allowed})",
+                        code="MAN-FLAG-UNDECLARED-REFERENCE",
                     )
     return Manifest(
         deps=tuple(deps),
@@ -431,9 +461,13 @@ def load_manifest(path: Path) -> Manifest:
     try:
         text = path.read_text()
     except FileNotFoundError as e:
-        raise ManifestError(f"manifest file not found: {path}") from e
+        raise ManifestError(
+            f"manifest file not found: {path}", code="MAN-FILE-NOT-FOUND",
+        ) from e
     except OSError as e:
-        raise ManifestError(f"cannot read manifest {path}: {e}") from e
+        raise ManifestError(
+            f"cannot read manifest {path}: {e}", code="MAN-FILE-UNREADABLE",
+        ) from e
     return parse_manifest(text, source=str(path))
 
 
@@ -617,10 +651,14 @@ def _parse_url_dep(node: kdl.Node) -> UrlDep:
         allowed = ", ".join(sorted(_URL_DEP_PROPS))
         raise ManifestError(
             f"dep {name!r}: unknown property/properties {unknown} "
-            f"(allowed: {allowed})"
+            f"(allowed: {allowed})",
+            code="MAN-DEP-UNKNOWN-PROPS",
         )
     if "ref" not in node.props:
-        raise ManifestError(f"dep {name!r}: missing required property 'ref'")
+        raise ManifestError(
+            f"dep {name!r}: missing required property 'ref'",
+            code="MAN-DEP-REF-MISSING",
+        )
     # `git` may be a plain str or a ParseResult (when written with the
     # `(url)` KDL type annotation, kdl-py auto-converts). Normalize to
     # str so UrlDep is shape-stable regardless of annotation choice.
@@ -647,7 +685,8 @@ def _url_arg(context: str, field: str, raw) -> str:
         return raw
     raise ManifestError(
         f"{context}: {field!r} expects a URL string "
-        f"(plain or (url)-annotated); got {type(raw).__name__}"
+        f"(plain or (url)-annotated); got {type(raw).__name__}",
+        code="MAN-URL-ARG-TYPE",
     )
 
 
@@ -664,7 +703,8 @@ def _parse_url_dep_children(
             if len(child.args) != 1:
                 raise ManifestError(
                     f"dep {dep_name!r}: 'mirror' takes exactly one "
-                    f"positional argument (the URL)"
+                    f"positional argument (the URL)",
+                    code="MAN-DEP-MIRROR-ARITY",
                 )
             mirrors.append(_url_arg(dep_name, "mirror", child.args[0]))
         elif child.name == "flag":
@@ -677,7 +717,8 @@ def _parse_url_dep_children(
             raise ManifestError(
                 f"dep {dep_name!r}: unknown child node {child.name!r} "
                 f"(allowed: 'mirror', 'flag', or a predicate child node — "
-                f"{', '.join(sorted(_PREDICATE_PROPS))})"
+                f"{', '.join(sorted(_PREDICATE_PROPS))})",
+                code="MAN-DEP-UNKNOWN-CHILD",
             )
     return tuple(mirrors), tuple(child_preds), tuple(flag_requests)
 
@@ -693,12 +734,14 @@ def _parse_flag_request(dep_name: str, node: kdl.Node) -> FlagRequest:
     if len(node.args) < 1 or not isinstance(node.args[0], str):
         raise ManifestError(
             f"dep {dep_name!r}: 'flag' requires a quoted name as the "
-            f"first positional argument"
+            f"first positional argument",
+            code="MAN-DEP-FLAG-NAME-MISSING",
         )
     if len(node.args) > 2:
         raise ManifestError(
             f"dep {dep_name!r}: 'flag' takes at most two args "
-            f"(name, optional bool)"
+            f"(name, optional bool)",
+            code="MAN-DEP-FLAG-TOO-MANY-ARGS",
         )
     name = node.args[0]
     enabled = True
@@ -707,7 +750,8 @@ def _parse_flag_request(dep_name: str, node: kdl.Node) -> FlagRequest:
         if not isinstance(v, bool):
             raise ManifestError(
                 f"dep {dep_name!r}: 'flag {name!r}' second arg must be "
-                f"a boolean"
+                f"a boolean",
+                code="MAN-DEP-FLAG-BOOL",
             )
         enabled = v
     return FlagRequest(name=name, enabled=enabled)
@@ -730,7 +774,8 @@ def _merge_predicates(
             f"dep {dep_name!r}: predicate(s) {names} declared in both "
             f"inline form (e.g. {next(iter(overlap))}=\"...\") and "
             f"child-node form ({{ {next(iter(overlap))} ... }}) — "
-            f"pick one form per predicate"
+            f"pick one form per predicate",
+            code="MAN-PREDICATE-FORM-CONFLICT",
         )
     # Canonical order: sort by predicate name so structural equality
     # holds regardless of which form (inline / child) the user chose
@@ -774,19 +819,22 @@ def _parse_predicates_from_props(
         if key not in _PREDICATE_PROPS:
             raise ManifestError(
                 f"{context}: unknown predicate {key!r} "
-                f"(allowed: {', '.join(sorted(_PREDICATE_PROPS))})"
+                f"(allowed: {', '.join(sorted(_PREDICATE_PROPS))})",
+                code="MAN-PREDICATE-UNKNOWN",
             )
         tag = getattr(val, "tag", None)
         actual = getattr(val, "value", val)
         if not isinstance(actual, str):
             raise ManifestError(
-                f"{context}: predicate {key!r} value must be a string"
+                f"{context}: predicate {key!r} value must be a string",
+                code="MAN-PREDICATE-VALUE-TYPE",
             )
         negated = (tag == "not")
         if tag is not None and not negated:
             raise ManifestError(
                 f"{context}: predicate {key!r} unsupported "
-                f"type annotation ({tag!r}); only (not) is recognized"
+                f"type annotation ({tag!r}); only (not) is recognized",
+                code="MAN-PREDICATE-UNSUPPORTED-ANNOTATION",
             )
         preds.append(Predicate(name=key, values=(actual,), negated=negated))
     return tuple(preds)
@@ -803,12 +851,14 @@ def _parse_predicate_child_node(
     if child.name not in _PREDICATE_PROPS:
         raise ManifestError(
             f"{context}: unknown predicate {child.name!r} as child node "
-            f"(allowed: {', '.join(sorted(_PREDICATE_PROPS))})"
+            f"(allowed: {', '.join(sorted(_PREDICATE_PROPS))})",
+            code="MAN-PREDICATE-UNKNOWN",
         )
     if not child.args:
         raise ManifestError(
             f"{context}: predicate child node {child.name!r} requires "
-            f"at least one positional argument"
+            f"at least one positional argument",
+            code="MAN-PREDICATE-CHILD-NO-ARGS",
         )
     values: list[str] = []
     negations: list[bool] = []
@@ -817,20 +867,23 @@ def _parse_predicate_child_node(
         actual = getattr(a, "value", a)
         if not isinstance(actual, str):
             raise ManifestError(
-                f"{context}: predicate {child.name!r} arg must be a string"
+                f"{context}: predicate {child.name!r} arg must be a string",
+                code="MAN-PREDICATE-CHILD-ARG-TYPE",
             )
         neg = (tag == "not")
         if tag is not None and not neg:
             raise ManifestError(
                 f"{context}: predicate {child.name!r} unsupported "
-                f"type annotation ({tag!r}); only (not) is recognized"
+                f"type annotation ({tag!r}); only (not) is recognized",
+                code="MAN-PREDICATE-UNSUPPORTED-ANNOTATION",
             )
         values.append(actual)
         negations.append(neg)
     if len(set(negations)) > 1:
         raise ManifestError(
             f"{context}: predicate {child.name!r} mixes (not) and bare "
-            f"args — all args must agree on negation"
+            f"args — all args must agree on negation",
+            code="MAN-PREDICATE-MIXED-NEGATION",
         )
     return Predicate(
         name=child.name, values=tuple(values), negated=negations[0],
@@ -861,12 +914,14 @@ def _parse_local_dep(node: kdl.Node) -> LocalDep:
         unknown = ", ".join(repr(p) for p in sorted(extra))
         raise ManifestError(
             f"dep {name!r}: unknown property/properties {unknown} "
-            f"on a local dep (allowed: 'local')"
+            f"on a local dep (allowed: 'local')",
+            code="MAN-DEP-UNKNOWN-PROPS",
         )
     path = node.props["local"]
     if not isinstance(path, str) or not path:
         raise ManifestError(
-            f"dep {name!r}: 'local' property must be a non-empty string path"
+            f"dep {name!r}: 'local' property must be a non-empty string path",
+            code="MAN-DEP-LOCAL-PATH",
         )
     return LocalDep(name=name, path=path)
 
@@ -890,19 +945,22 @@ def _parse_tarball_dep(node: kdl.Node) -> TarballDep:
         allowed = ", ".join(sorted(_TARBALL_DEP_PROPS))
         raise ManifestError(
             f"dep {name!r}: unknown property/properties {unknown} "
-            f"on a tarball dep (allowed: {allowed})"
+            f"on a tarball dep (allowed: {allowed})",
+            code="MAN-DEP-UNKNOWN-PROPS",
         )
     url_raw = node.props["tarball"]
     url = url_raw.geturl() if isinstance(url_raw, ParseResult) else url_raw
     if not isinstance(url, str) or not url:
         raise ManifestError(
-            f"dep {name!r}: 'tarball' must be a non-empty URL string"
+            f"dep {name!r}: 'tarball' must be a non-empty URL string",
+            code="MAN-DEP-TARBALL-URL",
         )
 
     sha256 = node.props.get("sha256")
     if sha256 is not None and not isinstance(sha256, str):
         raise ManifestError(
-            f"dep {name!r}: 'sha256' must be a string when provided"
+            f"dep {name!r}: 'sha256' must be a string when provided",
+            code="MAN-DEP-TARBALL-SHA",
         )
 
     strip_raw = node.props.get("strip_components", 0)
@@ -912,7 +970,8 @@ def _parse_tarball_dep(node: kdl.Node) -> TarballDep:
         strip_raw = int(strip_raw)
     if not isinstance(strip_raw, int) or isinstance(strip_raw, bool) or strip_raw < 0:
         raise ManifestError(
-            f"dep {name!r}: 'strip_components' must be a non-negative integer"
+            f"dep {name!r}: 'strip_components' must be a non-negative integer",
+            code="MAN-DEP-TARBALL-STRIP",
         )
 
     return TarballDep(
@@ -932,12 +991,14 @@ def _parse_member_dep(node: kdl.Node) -> MemberDep:
     if node.props:
         unknown = ", ".join(repr(p) for p in sorted(node.props.keys()))
         raise ManifestError(
-            f"'member' dep takes no properties (got {unknown})"
+            f"'member' dep takes no properties (got {unknown})",
+            code="MAN-DEP-MEMBER-PROPS",
         )
     if len(node.args) != 1 or not isinstance(node.args[0], str):
         raise ManifestError(
             "'member' dep takes exactly one positional string argument "
-            "(the workspace-member name)"
+            "(the workspace-member name)",
+            code="MAN-DEP-MEMBER-ARITY",
         )
     return MemberDep(name=node.args[0])
 
@@ -955,7 +1016,8 @@ def _parse_named_dep(node: kdl.Node) -> NamedDep:
         raise ManifestError(
             f"dep {name!r}: unknown property/properties {unknown} "
             f"on a named dep (a URL dep must declare 'git=...'; "
-            f"a named dep takes only a positional version constraint)"
+            f"a named dep takes only a positional version constraint)",
+            code="MAN-DEP-NAMED-PROPS",
         )
     if len(node.args) == 0:
         return NamedDep(name=name, constraint=None)
@@ -963,12 +1025,14 @@ def _parse_named_dep(node: kdl.Node) -> NamedDep:
         constraint = node.args[0]
         if not isinstance(constraint, str):
             raise ManifestError(
-                f"dep {name!r}: version constraint must be a quoted string"
+                f"dep {name!r}: version constraint must be a quoted string",
+                code="MAN-DEP-NAMED-CONSTRAINT",
             )
         return NamedDep(name=name, constraint=constraint)
     raise ManifestError(
         f"dep {name!r}: named deps take at most one positional argument "
-        f"(the version constraint); got {len(node.args)}"
+        f"(the version constraint); got {len(node.args)}",
+        code="MAN-DEP-NAMED-ARITY",
     )
 
 
@@ -987,7 +1051,8 @@ def _parse_flag_decl(node: kdl.Node) -> FlagDecl:
     if node.args:
         raise ManifestError(
             f"flag {name!r}: positional args not allowed "
-            f"(use props: default=<bool>, description=\"...\")"
+            f"(use props: default=<bool>, description=\"...\")",
+            code="MAN-FLAG-POS-ARGS",
         )
     extra = set(node.props.keys()) - _FLAG_DECL_PROPS
     if extra:
@@ -995,29 +1060,34 @@ def _parse_flag_decl(node: kdl.Node) -> FlagDecl:
         allowed = ", ".join(sorted(_FLAG_DECL_PROPS))
         raise ManifestError(
             f"flag {name!r}: unknown property/properties {unknown} "
-            f"(allowed: {allowed})"
+            f"(allowed: {allowed})",
+            code="MAN-FLAG-UNKNOWN-PROPS",
         )
     default_raw = node.props.get("default", False)
     if not isinstance(default_raw, bool):
         raise ManifestError(
-            f"flag {name!r}: 'default' must be a boolean"
+            f"flag {name!r}: 'default' must be a boolean",
+            code="MAN-FLAG-DEFAULT-TYPE",
         )
     description_raw = node.props.get("description", "")
     if not isinstance(description_raw, str):
         raise ManifestError(
-            f"flag {name!r}: 'description' must be a string"
+            f"flag {name!r}: 'description' must be a string",
+            code="MAN-FLAG-DESCRIPTION-TYPE",
         )
     defines: list[str] = []
     for child in node.nodes:
         if child.name != "defines":
             raise ManifestError(
                 f"flag {name!r}: unknown child node {child.name!r} "
-                f"(allowed: 'defines')"
+                f"(allowed: 'defines')",
+                code="MAN-FLAG-UNKNOWN-CHILD",
             )
         for a in child.args:
             if not isinstance(a, str):
                 raise ManifestError(
-                    f"flag {name!r}: 'defines' args must be strings"
+                    f"flag {name!r}: 'defines' args must be strings",
+                    code="MAN-FLAG-DEFINES-ARG-TYPE",
                 )
             defines.append(a)
     return FlagDecl(
@@ -1040,11 +1110,13 @@ def _parse_override(node: kdl.Node) -> Override:
     if node.name != "pkg":
         raise ManifestError(
             f"unknown override kind {node.name!r} "
-            f"(supported: 'pkg')"
+            f"(supported: 'pkg')",
+            code="MAN-OVERRIDE-KIND",
         )
     if len(node.args) != 1 or not isinstance(node.args[0], str):
         raise ManifestError(
-            "pkg override takes one positional argument (the dep name)"
+            "pkg override takes one positional argument (the dep name)",
+            code="MAN-OVERRIDE-ARITY",
         )
     name = node.args[0]
     extra = set(node.props.keys()) - _URL_DEP_PROPS
@@ -1053,15 +1125,18 @@ def _parse_override(node: kdl.Node) -> Override:
         allowed = ", ".join(sorted(_URL_DEP_PROPS))
         raise ManifestError(
             f"override for {name!r}: unknown property/properties {unknown} "
-            f"(allowed: {allowed})"
+            f"(allowed: {allowed})",
+            code="MAN-OVERRIDE-UNKNOWN-PROPS",
         )
     if "git" not in node.props:
         raise ManifestError(
-            f"override for {name!r}: missing required property 'git'"
+            f"override for {name!r}: missing required property 'git'",
+            code="MAN-OVERRIDE-GIT-MISSING",
         )
     if "ref" not in node.props:
         raise ManifestError(
-            f"override for {name!r}: missing required property 'ref'"
+            f"override for {name!r}: missing required property 'ref'",
+            code="MAN-OVERRIDE-REF-MISSING",
         )
     git_raw = node.props["git"]
     git = git_raw.geturl() if isinstance(git_raw, ParseResult) else git_raw
@@ -1072,12 +1147,16 @@ def _parse_override(node: kdl.Node) -> Override:
 def _parse_kind(node: kdl.Node) -> Kind:
     if len(node.args) != 1:
         raise ManifestError(
-            f"'kind' takes exactly one value (got {len(node.args)})"
+            f"'kind' takes exactly one value (got {len(node.args)})",
+            code="MAN-KIND-ARITY",
         )
     value = node.args[0]
     if value not in _VALID_KINDS:
         allowed = ", ".join(repr(k) for k in _VALID_KINDS)
-        raise ManifestError(f"invalid kind {value!r} (allowed: {allowed})")
+        raise ManifestError(
+            f"invalid kind {value!r} (allowed: {allowed})",
+            code="MAN-KIND-INVALID",
+        )
     return value
 
 
@@ -1086,13 +1165,15 @@ def _validate_git_url(dep_name: str, url: str) -> None:
     if not parsed.scheme:
         raise ManifestError(
             f"dep {dep_name!r}: git URL {url!r} has no scheme "
-            f"(expected one of: {', '.join(sorted(_VALID_GIT_SCHEMES))})"
+            f"(expected one of: {', '.join(sorted(_VALID_GIT_SCHEMES))})",
+            code="MAN-GIT-URL-NO-SCHEME",
         )
     if parsed.scheme not in _VALID_GIT_SCHEMES:
         raise ManifestError(
             f"dep {dep_name!r}: git URL {url!r} has unsupported scheme "
             f"{parsed.scheme!r} "
-            f"(expected one of: {', '.join(sorted(_VALID_GIT_SCHEMES))})"
+            f"(expected one of: {', '.join(sorted(_VALID_GIT_SCHEMES))})",
+            code="MAN-GIT-URL-BAD-SCHEME",
         )
 
 
@@ -1179,12 +1260,14 @@ def load_or_discover_manifest(project_dir: Path) -> Manifest:
         raise ManifestError(
             f"multiple .nimble files in {project_dir} ({names}); "
             f"either rename one to match the project directory "
-            f"({project_name}.nimble) or add a milpa.kdl"
+            f"({project_name}.nimble) or add a milpa.kdl",
+            code="MAN-NIMBLE-AMBIGUOUS",
         )
 
     raise ManifestError(
         f"no manifest found in {project_dir} — looked for "
-        f"milpa.kdl, {project_name}.nimble, and any *.nimble"
+        f"milpa.kdl, {project_name}.nimble, and any *.nimble",
+        code="MAN-NO-MANIFEST",
     )
 
 
@@ -1194,11 +1277,14 @@ def _load_manifest_from_nimble(path: Path) -> Manifest:
     try:
         text = path.read_text()
     except OSError as e:
-        raise ManifestError(f"cannot read {path}: {e}") from e
+        raise ManifestError(
+            f"cannot read {path}: {e}", code="MAN-FILE-UNREADABLE",
+        ) from e
     try:
         nm = parse_nimble(text)
     except NimbleParseError as e:
         raise ManifestError(
-            f"failed to parse {path} as a nimble manifest: {e}"
+            f"failed to parse {path} as a nimble manifest: {e}",
+            code="MAN-NIMBLE-PARSE",
         ) from e
     return manifest_from_nimble(nm, name=path.stem)

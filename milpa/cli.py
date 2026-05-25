@@ -866,7 +866,8 @@ def cmd_add_mirror(
                     f"{result.identity[:23]}..., "
                     f"locked identity is "
                     f"{(locked.identity or '<none>')[:23]}... "
-                    f"— mirrors must serve identical bytes"
+                    f"— mirrors must serve identical bytes",
+                    code="MAN-ADD-MIRROR-IDENTITY-MISMATCH",
                 )
 
     try:
