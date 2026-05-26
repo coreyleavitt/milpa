@@ -53,6 +53,7 @@ SUBCOMMAND_HELP = {
     "add":    "add a mirror for an existing dep (more verbs to come)",
     "remove": "remove a dep from milpa.kdl and regenerate the lockfile",
     "update": "re-resolve (optionally a single dep) and refresh the lockfile",
+    "publish": "pack + push + sign + POST tianguis dispatch (author-side)",
 }
 
 
@@ -127,6 +128,22 @@ def make_parser() -> argparse.ArgumentParser:
                     "(default: discovered from remote HEAD)"
                 ),
             )
+        elif name == "publish":
+            sp.add_argument("--name", required=True, help="package name")
+            sp.add_argument("--version", required=True, help="semver tag (e.g. v1.2.3)")
+            sp.add_argument("--registry", required=True, metavar="<ref>",
+                            help="OCI registry ref (e.g. ghcr.io/owner/repo:v1.2.3)")
+            sp.add_argument("--provider", required=True,
+                            help="CI provider name (github, gitlab, ...)")
+            sp.add_argument("--repo-url", required=True, help="https URL of source repo")
+            sp.add_argument("--signed-by", required=True,
+                            help="cosign signer identity (workflow URL + ref)")
+            sp.add_argument("--dispatch-url", default="https://dispatch.tianguis.dev",
+                            help="tianguis dispatch endpoint (default: production)")
+            sp.add_argument("--oidc-token-env", default="ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+                            help="env var holding the bearer OIDC token")
+            sp.add_argument("--dry-run", action="store_true",
+                            help="pack + push + sign but skip dispatch POST")
     return parser
 
 
@@ -976,6 +993,61 @@ def _local_source_drift_warnings(
     return warnings
 
 
+def cmd_publish(
+    project_dir: Path,
+    *,
+    name: str,
+    version: str,
+    registry_ref: str,
+    provider: str,
+    repo_url: str,
+    signed_by: str,
+    dispatch_url: str,
+    oidc_token_env: str,
+    dry_run: bool,
+) -> int:
+    """Glue between argparse and milpa.publish.publish().
+
+    Reads the OIDC bearer from the chosen env var (per-provider name —
+    GH's ACTIONS_ID_TOKEN_REQUEST_TOKEN, GitLab's CI_JOB_JWT_V2, etc.)
+    so the same publish module works across CIs.
+    """
+    from .publish import publish
+
+    if not dry_run:
+        token = os.environ.get(oidc_token_env, "")
+        if not token:
+            print(f"publish: ${oidc_token_env} is empty; this command must run "
+                  f"inside a CI job with OIDC enabled (or pass --dry-run)",
+                  file=sys.stderr)
+            return 1
+    else:
+        token = ""
+
+    try:
+        result = publish(
+            source_dir=project_dir,
+            name=name,
+            version=version,
+            registry_ref=registry_ref,
+            provider=provider,
+            repo_url=repo_url,
+            signed_by=signed_by,
+            oidc_token=token,
+            dispatch_url=dispatch_url,
+            dry_run=dry_run,
+        )
+    except RuntimeError as e:
+        print(f"publish: {e}", file=sys.stderr)
+        return 1
+
+    if dry_run:
+        print(f"publish: --dry-run complete (no dispatch POST sent)")
+    else:
+        print(f"publish: dispatch accepted ({result})")
+    return 0
+
+
 def cmd_clean(project_dir: Path) -> int:
     """Remove _deps/ and nim.cfg; keep milpa.lock.
 
@@ -1116,6 +1188,19 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
+        case "publish":
+            return cmd_publish(
+                project_dir,
+                name=args.name,
+                version=args.version,
+                registry_ref=args.registry,
+                provider=args.provider,
+                repo_url=args.repo_url,
+                signed_by=args.signed_by,
+                dispatch_url=args.dispatch_url,
+                oidc_token_env=args.oidc_token_env,
+                dry_run=args.dry_run,
+            )
         case _:
             print(f"unknown command: {args.command}", file=sys.stderr)
             return 1
