@@ -34,8 +34,8 @@ from typing import Any
 Runner = Callable[..., tuple[int, str, str]]
 
 
-def _real_runner(argv: list[str], *, input: bytes | None = None, **kw: Any) -> tuple[int, str, str]:
-    proc = subprocess.run(argv, input=input, capture_output=True, **kw)
+def _real_runner(argv: list[str], *, input: bytes | None = None, cwd: str | None = None, **kw: Any) -> tuple[int, str, str]:
+    proc = subprocess.run(argv, input=input, cwd=cwd, capture_output=True, **kw)
     return (proc.returncode, proc.stdout.decode("utf-8", "replace"),
             proc.stderr.decode("utf-8", "replace"))
 
@@ -106,19 +106,21 @@ def push_oci(
     to the registry (e.g. setting GHCR creds via the GH Actions OIDC
     permission); this function just orchestrates oras.
     """
-    with tempfile.NamedTemporaryFile(suffix=".tar.gz") as tmp:
-        tmp.write(blob)
-        tmp.flush()
+    # Write the tarball into a temp DIRECTORY under a fixed basename so
+    # oras records `source.tar.gz` (relative) in the OCI manifest. If we
+    # used an absolute /tmp path, pullers would refuse to write outside
+    # their CWD ("path traversal disallowed") and the artifact would be
+    # unfetchable.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        artifact_name = "source.tar.gz"
+        artifact_path = Path(tmpdir) / artifact_name
+        artifact_path.write_bytes(blob)
         argv = [
             "oras", "push",
-            # oras rejects absolute paths in artifact specifications by
-            # default; ours is a NamedTemporaryFile which always lives
-            # under /tmp, so opt out of the check.
-            "--disable-path-validation",
             registry_ref,
-            f"{tmp.name}:application/vnd.tianguis.source.v1.tar+gzip",
+            f"{artifact_name}:application/vnd.tianguis.source.v1.tar+gzip",
         ]
-        code, out, err = runner(argv)
+        code, out, err = runner(argv, cwd=tmpdir)
     if code != 0:
         raise RuntimeError(f"oras push failed (exit {code}): {err.strip() or out.strip()}")
 
