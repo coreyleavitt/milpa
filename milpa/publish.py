@@ -111,6 +111,10 @@ def push_oci(
         tmp.flush()
         argv = [
             "oras", "push",
+            # oras rejects absolute paths in artifact specifications by
+            # default; ours is a NamedTemporaryFile which always lives
+            # under /tmp, so opt out of the check.
+            "--disable-path-validation",
             registry_ref,
             f"{tmp.name}:application/vnd.tianguis.source.v1.tar+gzip",
         ]
@@ -220,7 +224,15 @@ def publish(
         "signed_by": signed_by,
     }
     if dry_run:
-        return None
+        # Local-dev path: no OIDC token to authenticate the dispatch
+        # POST, so skip it entirely. Author inspects the OCI artifact +
+        # Rekor entry directly.
+        if not oidc_token:
+            return None
+        # CI-side path: full chain runs end-to-end — dispatch sees
+        # dry_run=true and skips the commit workflow only. This proves
+        # OIDC + identity wiring is correct before going live.
+        payload["dry_run"] = True
     return post_dispatch(
         dispatch_url=dispatch_url,
         oidc_token=oidc_token,
