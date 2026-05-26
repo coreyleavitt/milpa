@@ -1014,15 +1014,21 @@ def cmd_publish(
     """
     from .publish import publish
 
-    if not dry_run:
-        token = os.environ.get(oidc_token_env, "")
-        if not token:
-            print(f"publish: ${oidc_token_env} is empty; this command must run "
-                  f"inside a CI job with OIDC enabled (or pass --dry-run)",
-                  file=sys.stderr)
-            return 1
-    else:
-        token = ""
+    # Try to fetch a sigstore-audience OIDC token regardless of dry-run
+    # mode. dry-run only suppresses the index commit on the dispatch
+    # side; the rest of the chain (including the POST) should still
+    # exercise. If no token is available, dry-run downgrades to the
+    # local-dev path (skip POST entirely); a real publish errors out.
+    from .publish import fetch_sigstore_oidc_token
+
+    token = fetch_sigstore_oidc_token(oidc_token_env)
+    if not token and not dry_run:
+        print(f"publish: no sigstore-audience OIDC token available "
+              f"(checked ${oidc_token_env} and GH Actions OIDC API); "
+              f"this command must run inside a CI job with OIDC enabled "
+              f"(or pass --dry-run for local testing)",
+              file=sys.stderr)
+        return 1
 
     try:
         result = publish(

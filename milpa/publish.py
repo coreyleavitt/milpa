@@ -239,3 +239,40 @@ def publish(
         payload=payload,
         http_post=http_post,
     )
+
+
+def _real_http_get(url: str, headers: dict[str, str]) -> dict[str, Any]:
+    import json as _json
+    import urllib.request
+    req = urllib.request.Request(url, method="GET")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    with urllib.request.urlopen(req) as resp:
+        return _json.loads(resp.read().decode("utf-8"))
+
+
+def fetch_sigstore_oidc_token(direct_env: str, *, _http_get=_real_http_get) -> str:
+    """Return an OIDC token with audience=sigstore, or "" if unavailable.
+
+    GH Actions exposes `ACTIONS_ID_TOKEN_REQUEST_TOKEN` (an opaque
+    request-bearer, NOT a usable sigstore token) and
+    `ACTIONS_ID_TOKEN_REQUEST_URL` (the endpoint to exchange it).
+    We call the endpoint with `audience=sigstore` to get back a real
+    JWT that Sigstore Fulcio + tianguis dispatch both accept.
+
+    Other CIs (GitLab, Codeberg, ...) expose a pre-minted token in a
+    well-known env var (CI_JOB_JWT_V2 etc.); for those, `direct_env`
+    is the var name and we use whatever's there as-is.
+    """
+    import os
+    import urllib.parse
+
+    gh_token = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
+    gh_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+    if gh_token and gh_url:
+        sep = "&" if "?" in gh_url else "?"
+        url = f"{gh_url}{sep}audience={urllib.parse.quote('sigstore')}"
+        resp = _http_get(url, headers={"Authorization": f"Bearer {gh_token}"})
+        return resp.get("value", "")
+
+    return os.environ.get(direct_env, "")

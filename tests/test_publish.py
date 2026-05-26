@@ -320,7 +320,33 @@ def test_publish_pipeline_threads_oci_digest_into_dispatch_payload(tmp_path: Pat
     assert tools == ["oras", "cosign"]
 
 
-def test_publish_dry_run_skips_dispatch_post(tmp_path: Path):
+def test_publish_dry_run_with_token_sends_dispatch_with_dry_run_flag(tmp_path: Path):
+    """With an OIDC token available, dry-run still POSTs to dispatch so
+    the CI-side smoke test exercises the full OIDC + identity chain.
+    The `dry_run: true` flag tells dispatch to skip the commit step."""
+    (tmp_path / "main.nim").write_text("x\n")
+    state, runner, http_post = _make_fakes()
+
+    publish(
+        source_dir=tmp_path,
+        name="sample", version="v1.0.0",
+        registry_ref="ghcr.io/x/y:v1",
+        provider="github", repo_url="https://github.com/x/y",
+        signed_by="https://github.com/x/y/.github/workflows/p.yaml@refs/tags/v1",
+        oidc_token="eyJ.real.token",
+        dispatch_url="https://dispatch.tianguis.dev",
+        dry_run=True,
+        runner=runner, http_post=http_post,
+    )
+
+    assert len(state["http_calls"]) == 1
+    payload = state["http_calls"][0]["json"]
+    assert payload.get("dry_run") is True, "dispatch payload must carry dry_run=true"
+
+
+def test_publish_dry_run_without_token_skips_dispatch_entirely(tmp_path: Path):
+    """Without an OIDC token (local-dev path), dry-run skips the POST
+    entirely — author can still inspect the OCI artifact + Rekor entry."""
     (tmp_path / "main.nim").write_text("x\n")
 
     state, runner, http_post = _make_fakes()
@@ -333,7 +359,7 @@ def test_publish_dry_run_skips_dispatch_post(tmp_path: Path):
         provider="github",
         repo_url="https://github.com/x/y",
         signed_by="https://github.com/x/y/.github/workflows/p.yaml@refs/tags/v1",
-        oidc_token="ignored",
+        oidc_token="",
         dispatch_url="https://dispatch.tianguis.dev",
         dry_run=True,
         runner=runner,
@@ -345,3 +371,59 @@ def test_publish_dry_run_skips_dispatch_post(tmp_path: Path):
     assert "oras" in tools and "cosign" in tools
     # But no dispatch POST.
     assert state["http_calls"] == []
+
+
+# ---------------------------------------------------------------------------
+# Cycle 9 — OIDC token retrieval with sigstore audience.
+#
+# GH Actions' ACTIONS_ID_TOKEN_REQUEST_TOKEN is NOT directly usable as a
+# Sigstore-audience bearer — it's the bearer for the OIDC TOKEN REQUEST
+# endpoint. The actual usable token comes from calling that endpoint
+# with audience=sigstore. cosign does this internally; we have to do
+# the same for the dispatch POST.
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_sigstore_oidc_token_calls_gh_endpoint_with_audience(monkeypatch):
+    """When ACTIONS_ID_TOKEN_REQUEST_{TOKEN,URL} are set, fetch the
+    real OIDC token from GH's API with audience=sigstore."""
+    from milpa.publish import fetch_sigstore_oidc_token
+
+    monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "gh-bearer-xxx")
+    monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://token.actions.githubusercontent.com/?...")
+
+    captured = {}
+
+    def fake_get(url, headers):
+        captured["url"] = url
+        captured["headers"] = headers
+        return {"value": "eyJ.sigstore-audience.token"}
+
+    token = fetch_sigstore_oidc_token("ACTIONS_ID_TOKEN_REQUEST_TOKEN", _http_get=fake_get)
+
+    assert token == "eyJ.sigstore-audience.token"
+    assert "audience=sigstore" in captured["url"]
+    assert captured["headers"]["Authorization"] == "Bearer gh-bearer-xxx"
+
+
+def test_fetch_sigstore_oidc_token_falls_back_to_direct_env(monkeypatch):
+    """For non-GH CIs that expose the token directly in an env var
+    (e.g. GitLab's CI_JOB_JWT_V2), use it as-is."""
+    from milpa.publish import fetch_sigstore_oidc_token
+
+    monkeypatch.delenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", raising=False)
+    monkeypatch.delenv("ACTIONS_ID_TOKEN_REQUEST_URL", raising=False)
+    monkeypatch.setenv("CI_JOB_JWT_V2", "gitlab-sigstore-jwt")
+
+    token = fetch_sigstore_oidc_token("CI_JOB_JWT_V2")
+    assert token == "gitlab-sigstore-jwt"
+
+
+def test_fetch_sigstore_oidc_token_returns_empty_when_no_source(monkeypatch):
+    from milpa.publish import fetch_sigstore_oidc_token
+
+    for k in ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL",
+              "CI_JOB_JWT_V2", "MY_TOKEN"):
+        monkeypatch.delenv(k, raising=False)
+
+    assert fetch_sigstore_oidc_token("MY_TOKEN") == ""
