@@ -39,6 +39,7 @@ import kdl
 
 from .fetchers.git import GitProvenance
 from .fetchers.local import LocalProvenance
+from .fetchers.oci import OciProvenance
 from .fetchers.tarball import TarballProvenance
 from .identity import IdentityError, compute_content_hash, parse_identity
 from .resolver import ResolvedDep, ResolvedGraph
@@ -91,8 +92,23 @@ class MemberProvenanceRecord:
 
 
 @dataclass(frozen=True)
+class OciProvenanceRecord:
+    """Provenance for an OCI-artifact-fetched dep (milpa#97). Mirrors
+    fetchers.oci.OciProvenance; the digest is the immutable pin."""
+    registry: str
+    repository: str
+    digest: str
+    kind: str = "oci"
+
+
+@dataclass(frozen=True)
 class RegistryProvenanceRecord:
-    """Provenance for a registry-resolved dep."""
+    """Provenance for a registry-resolved dep.
+
+    READ-COMPAT ONLY (milpa#97): the writer never emits this again — named
+    deps now write git/oci records. Kept so existing `milpa.lock`s with
+    `kind "registry"` still parse; the dataclass is removed only once
+    straggler old locks are regenerated (not on #97's critical path)."""
     name: str
     tag: str | None
     commit_sha: str | None
@@ -104,6 +120,7 @@ ProvenanceRecord = (
     | TarballProvenanceRecord
     | LocalProvenanceRecord
     | MemberProvenanceRecord
+    | OciProvenanceRecord
     | RegistryProvenanceRecord
 )
 
@@ -210,6 +227,12 @@ def _provenance_from_resolved(d: ResolvedDep) -> ProvenanceRecord:
         # threaded onto the candidate) — behavior-preserving with the
         # legacy arm.
         return TarballProvenanceRecord(url=prov.url, sha256=None)
+    if isinstance(prov, OciProvenance):
+        return OciProvenanceRecord(
+            registry=prov.registry,
+            repository=prov.repository,
+            digest=prov.digest,
+        )
 
     # --- None provenance: legacy source-string fallback ---
     src = d.source
@@ -369,6 +392,12 @@ def _parse_provenance_block(node: kdl.Node, dep_name: str) -> ProvenanceRecord:
         return MemberProvenanceRecord(
             name=_required_str(fields, "name", dep_name),
         )
+    if kind == "oci":
+        return OciProvenanceRecord(
+            registry=_required_str(fields, "registry", dep_name),
+            repository=_required_str(fields, "repository", dep_name),
+            digest=_required_str(fields, "digest", dep_name),
+        )
     if kind == "registry":
         return RegistryProvenanceRecord(
             name=_required_str(fields, "name", dep_name),
@@ -377,7 +406,7 @@ def _parse_provenance_block(node: kdl.Node, dep_name: str) -> ProvenanceRecord:
         )
     raise LockfileError(
         f"dep {dep_name!r}: unknown provenance kind {kind!r} "
-        f"(supported: git, tarball, local, member, registry)"
+        f"(supported: git, tarball, local, member, oci, registry)"
     )
 
 
@@ -471,6 +500,10 @@ def _format_provenance_fields(p: ProvenanceRecord) -> list[str]:
         out.append(f'path "{p.path}"')
     elif isinstance(p, MemberProvenanceRecord):
         out.append(f'name "{p.name}"')
+    elif isinstance(p, OciProvenanceRecord):
+        out.append(f'registry "{p.registry}"')
+        out.append(f'repository "{p.repository}"')
+        out.append(f'digest "{p.digest}"')
     elif isinstance(p, RegistryProvenanceRecord):
         out.append(f'name "{p.name}"')
         if p.tag is not None:

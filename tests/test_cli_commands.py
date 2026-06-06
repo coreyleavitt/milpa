@@ -233,9 +233,10 @@ def test_cmd_show_registry_dep_shows_registry_provenance(tmp_path, capsys):
     capsys.readouterr()
     cmd_show(tmp_path)
     out = capsys.readouterr().out
-    # v2 schema displays registry provenance as `registry <name>` (kind
-    # prefix + name); the tag appears after `@`
-    assert "registry bar" in out
+    # milpa#97: registry provenance is now legacy read-compat — show marks
+    # it `registry (legacy) <name>` so a stale lock is legible; the tag
+    # still appears after `@`.
+    assert "registry (legacy) bar" in out
     assert "v0.1.0" in out
 
 

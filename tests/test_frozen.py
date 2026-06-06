@@ -367,3 +367,40 @@ def test_cmd_fetch_with_frozen_flag_errors_on_not_frozen(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "frozen" in err.lower()
     assert "lockfile" in err.lower()
+
+
+# ---------------------------------------------------------------------------
+# S3 (milpa#97) — a legacy `kind "registry"` lock cannot be honored by the
+# frozen fast path (no fetchable URL). It must raise an actionable
+# NotFrozen so the slow path re-resolves via the index — NOT fabricate a
+# git clone URL.
+# ---------------------------------------------------------------------------
+
+
+def test_frozen_legacy_registry_record_raises_actionable_notfrozen():
+    from milpa.frozen import _source_from_provenance
+    from milpa.lockfile import RegistryProvenanceRecord
+
+    rec = RegistryProvenanceRecord(name="foo", tag="v1", commit_sha="abc")
+    with pytest.raises(NotFrozen) as exc:
+        _source_from_provenance(rec)
+    msg = str(exc.value)
+    assert "foo" in msg
+    assert "milpa update" in msg
+
+
+def test_show_renders_legacy_registry_and_oci_records():
+    from milpa.cli import _format_provenance_for_show
+    from milpa.lockfile import OciProvenanceRecord, RegistryProvenanceRecord
+
+    legacy = _format_provenance_for_show(
+        RegistryProvenanceRecord(name="foo", tag="v1", commit_sha="abc12345")
+    )
+    assert "legacy" in legacy and "foo" in legacy
+
+    oci = _format_provenance_for_show(
+        OciProvenanceRecord(
+            registry="ghcr.io", repository="x/y", digest="sha256:abc",
+        )
+    )
+    assert oci.startswith("oci ") and "ghcr.io/x/y" in oci

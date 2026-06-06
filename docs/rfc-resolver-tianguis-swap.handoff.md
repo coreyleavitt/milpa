@@ -1,6 +1,6 @@
 # resolver→tianguis swap (milpa#97) — handoff
 
-- **Stage:** 3 /tdd grind — **S0–S2.7 DONE (green, 594 passed)**; next = **S3** (lockfile OciProvenanceRecord add-only)
+- **Stage:** 3 /tdd grind — **S0–S3 DONE (green, 598 passed)**; next = **S4** (resolver `_process_named` swap — HARD-depends on S3)
 - **Resume:** `/loop implement the next unimplemented RFC slice from docs/rfc-resolver-tianguis-swap.md with /tdd, following the standing rules; report one progress line per slice; stop when every slice is implemented`
 - **RFC:** `docs/rfc-resolver-tianguis-swap.md`   •   **Deferrals filed:** #98 (strategy), #99 (add-by-name), #100 (constraint accumulation), #101 (fetch observability), #102 (fetch_any mismatch warn)
 
@@ -16,7 +16,7 @@
 - [x] S1 — `tianguis_client` provenance-agnostic. `GitProvenance.commit_sha` added (additive); `_parse_version_node` dispatches git/oci (unknown kind skipped); `Version.provenances: tuple[Provenance,...]` pref-ordered + `canonical_provenance`; empty-prov guard `TNG-NO-PROVENANCE`; `schema_version` int check (kdl lib parses bare ints as float — handled) `TNG-SCHEMA-UNKNOWN`; `TianguisError(code=,message=)` + `_TNG_CODES` bijection; partition sort; dup-version dedupe+warn; `load_index` timeout=30 + atomic os.replace + `DEFAULT_INDEX_URL`. +11 tests, 589 passed.
 - [x] S2 — registered `OciFetcher()` in default_registry; `_select` routes oci→OciFetcher, git→GitFetcher (disjoint isinstance, first-match). +2 tests, 591 passed.
 - [x] S2.5 — `GitFetcher.fetch` honors `p.commit_sha` (clone → `_ensure_commit_present` cat-file/targeted-fetch/unshallow fallback → checkout exact commit); `None` keeps legacy ref-tip. `make_repo_with_history` helper added. +2 tests, 593 passed.
-- [ ] S3 — lockfile `OciProvenanceRecord` **add-only** + `cmd_show`/`frozen.py` OCI branches; keep `RegistryProvenanceRecord` as read-compat alias (NO delete here)
+- [x] S3 — lockfile `OciProvenanceRecord` add-only: dataclass + union member; `_provenance_from_resolved` OciProvenance type arm; `_format_provenance_fields` + `_parse_provenance_block` `kind "oci"` (write→parse round-trip); `cmd_show` oci branch + legacy-registry `(legacy)` display; `frozen._source_from_provenance` oci branch + RegistryProvenanceRecord → actionable `NotFrozen` (no fabricated URL). RegistryProvenanceRecord kept (read-compat). +4 tests, 598 passed.
 - [ ] S4 — resolver `_process_named` swap (inject `index:` incl. `apply_manifest_change_with_resolve`; `parse_version` on raw index version; `source`=git url / `oci:` prefix; `_pin_for_named_dep` → `locked.identity == version.content_hash`; hash-parity unit fixture)
 - [ ] S5 — CLI `_default_index_loader`; cmd_fetch/lock/update/add/remove + workspace + `manifest_writer` pass `index=`
 - [ ] S6 — delete `registry.py` + `test_registry.py`; migrate fixtures (synthetic Index via `parse_index(inline_kdl)`) across 7 files incl. `test_integration.py` import; update CLAUDE.md + comparison doc; grep-clean

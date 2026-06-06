@@ -205,6 +205,7 @@ def _source_from_provenance(p) -> str:
         GitProvenanceRecord,
         LocalProvenanceRecord,
         MemberProvenanceRecord,
+        OciProvenanceRecord,
         RegistryProvenanceRecord,
         TarballProvenanceRecord,
     )
@@ -216,8 +217,17 @@ def _source_from_provenance(p) -> str:
         return f"local:{p.path}"
     if isinstance(p, MemberProvenanceRecord):
         return f"member:{p.name}"
+    if isinstance(p, OciProvenanceRecord):
+        return f"oci:{p.registry}/{p.repository}"
     if isinstance(p, RegistryProvenanceRecord):
-        return f"registry:{p.name}"
+        # A legacy registry record has no fetchable URL — the frozen path
+        # cannot honor it. Raise NotFrozen so the slow path re-resolves the
+        # name through the tianguis index (regenerating a modern git/oci
+        # record). Do NOT fabricate a fetch URL (milpa#97).
+        raise NotFrozen(
+            f"lock entry {p.name!r} uses the legacy registry provenance; "
+            f"run `milpa update {p.name}` to re-resolve via the tianguis index"
+        )
     raise ValueError(f"unknown provenance kind {type(p).__name__}")
 
 

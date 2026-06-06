@@ -443,6 +443,7 @@ def _format_provenance_for_show(p) -> str:
         TarballProvenanceRecord,
         LocalProvenanceRecord,
         MemberProvenanceRecord,
+        OciProvenanceRecord,
         RegistryProvenanceRecord,
     )
     if isinstance(p, GitProvenanceRecord):
@@ -458,8 +459,13 @@ def _format_provenance_for_show(p) -> str:
         return f"local {p.path}"
     if isinstance(p, MemberProvenanceRecord):
         return f"member {p.name}"
+    if isinstance(p, OciProvenanceRecord):
+        return f"oci {p.registry}/{p.repository}@{p.digest[:15]}"
     if isinstance(p, RegistryProvenanceRecord):
-        parts = [f"registry {p.name}"]
+        # Legacy read-compat (milpa#97): named deps no longer write this;
+        # surface it as such so a stale lock is legible. `milpa update`
+        # regenerates a modern git/oci record.
+        parts = [f"registry (legacy) {p.name}"]
         if p.tag:
             parts.append(f"@ {p.tag}")
         if p.commit_sha:
