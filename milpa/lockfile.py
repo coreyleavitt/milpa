@@ -38,7 +38,6 @@ from pathlib import Path
 import kdl
 
 from .fetchers.git import GitProvenance
-from .fetchers.local import LocalProvenance
 from .fetchers.oci import OciProvenance
 from .fetchers.tarball import TarballProvenance
 from .identity import IdentityError, compute_content_hash, parse_identity
@@ -216,13 +215,15 @@ def _provenance_from_resolved(d: ResolvedDep) -> ProvenanceRecord:
     parse the `source` string. Named deps now always carry a typed git/oci
     provenance (milpa#97), so no `registry:` source string is ever
     produced; the bare-git arm remains a defensive catch-all."""
+    # Dispatch lives here (the serialization layer) rather than as
+    # Provenance.to_record() on the fetcher types: that would make
+    # fetchers/* depend on lockfile record types — wrong layering
+    # direction (fetchers are a lower layer than the lockfile).
     prov = d.provenance
     if isinstance(prov, GitProvenance):
         # commit_sha is the RESOLVED sha from the receipt (d.sha), not the
         # provenance's pin field — matches the legacy git arm exactly.
         return GitProvenanceRecord(url=prov.url, ref=prov.ref, commit_sha=d.sha)
-    if isinstance(prov, LocalProvenance):
-        return LocalProvenanceRecord(path=prov.path)
     if isinstance(prov, TarballProvenance):
         # sha256 stays None here (the archive hash is a receipt, not yet
         # threaded onto the candidate) — behavior-preserving with the
@@ -234,8 +235,19 @@ def _provenance_from_resolved(d: ResolvedDep) -> ProvenanceRecord:
             repository=prov.repository,
             digest=prov.digest,
         )
+    # NOTE: LocalProvenance is intentionally absent here. _process_local in
+    # resolver.py deliberately leaves provenance=None on local dep candidates
+    # (see its comment: the typed LocalProvenance.path is absolute, but the
+    # lockfile records the *declared relative* path). Local deps always reach
+    # the source-string fallback below.
+    if prov is not None:
+        raise ValueError(
+            f"dep {d.name!r}: unexpected typed provenance {type(prov).__name__!r} "
+            f"— add a lockfile record arm for this provenance kind"
+        )
 
-    # --- None provenance: legacy source-string fallback ---
+    # --- None provenance: source-string fallback ---
+    # Legitimate for: synthetic root, workspace members, local deps.
     src = d.source
     if src.startswith("local:"):
         return LocalProvenanceRecord(path=src[len("local:"):])
@@ -327,15 +339,15 @@ def _parse_dep(node: kdl.Node) -> LockedDep:
         elif child.name == "active_flags":
             active_flags = tuple(a for a in child.args if isinstance(a, str))
         elif child.name == "self_mirrors":
-            # Accept both bare strings and (url)-annotated values
-            from urllib.parse import ParseResult
-            sm = []
-            for a in child.args:
-                if isinstance(a, ParseResult):
-                    sm.append(a.geturl())
-                elif isinstance(a, str):
-                    sm.append(a)
-            self_mirrors = tuple(sm)
+            # Accept both bare strings and (url)-annotated values (parsed
+            # as ParseResult by kdl-py). url_value_to_str handles both and
+            # returns "" for any other type — filter those out post-call so
+            # no empty strings enter self_mirrors.
+            from .kdl_util import url_value_to_str
+            self_mirrors = tuple(
+                s for a in child.args
+                if (s := url_value_to_str(a))
+            )
         elif child.name == "provenance":
             provenances.append(_parse_provenance_block(child, name))
         else:

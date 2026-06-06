@@ -25,6 +25,7 @@ from milpa.lockfile import (
     LockedDep,
     Lockfile,
     MemberProvenanceRecord,
+    OciProvenanceRecord,
 )
 from milpa.manifest import Manifest, NamedDep, UrlDep
 
@@ -388,6 +389,48 @@ def test_frozen_legacy_registry_record_raises_actionable_notfrozen():
     msg = str(exc.value)
     assert "foo" in msg
     assert "milpa update" in msg
+
+
+# ---------------------------------------------------------------------------
+# L11 — frozen + OCI provenance arm
+# ---------------------------------------------------------------------------
+
+
+def test_frozen_oci_provenance_record_produces_oci_source(tmp_path):
+    """L11: a LockedDep whose provenance is OciProvenanceRecord passes the
+    frozen fast path; resolve_frozen produces a dep whose source starts with
+    'oci:' (exercises _source_from_provenance's OCI arm)."""
+    store = CAStore(root=tmp_path / "cas")
+    identity = _populate_cas(store, content="nimkdl-bytes")
+
+    manifest = Manifest(kind="library", deps=())
+    lockfile = Lockfile(deps=(LockedDep(
+        name="nimkdl",
+        identity=identity,
+        version="0.1.4",
+        src_dir="src",
+        requires=(),
+        provenances=(OciProvenanceRecord(
+            registry="ghcr.io",
+            repository="coreyleavitt/nimkdl",
+            digest="sha256:" + "d" * 64,
+        ),),
+    ),))
+
+    deps_dir = tmp_path / "_deps"
+    graph = resolve_frozen(
+        manifest, lockfile=lockfile, deps_dir=deps_dir, store=store,
+    )
+
+    assert len(graph.deps) == 1
+    dep = graph.deps[0]
+    assert dep.name == "nimkdl"
+    # _source_from_provenance's OCI arm: "oci:{registry}/{repository}"
+    assert dep.source.startswith("oci:")
+    assert "ghcr.io" in dep.source
+    assert "coreyleavitt/nimkdl" in dep.source
+    # The symlink was created in _deps/
+    assert (deps_dir / "nimkdl").is_symlink()
 
 
 def test_show_renders_legacy_registry_and_oci_records():

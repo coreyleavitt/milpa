@@ -97,11 +97,14 @@ def test_registry_raises_fetch_error_for_unknown_provenance(tmp_path):
     assert "UnknownProvenance" in str(exc.value)
 
 
-def test_first_registered_fetcher_wins_when_multiple_can_handle(tmp_path):
-    """When two fetchers both handle a provenance kind, the
-    first-registered one is invoked. This is the dispatch ordering
-    contract for fetcher overrides (e.g., a third-party fetcher
-    shadowing a built-in)."""
+def test_ambiguous_dispatch_raises_when_multiple_fetchers_match(tmp_path):
+    """Registering two fetchers that both claim can_handle for the same
+    provenance kind raises FetchError with a clear ambiguity message,
+    rather than silently dispatching to the first-registered one.
+
+    This guards against subtle mis-registrations where two fetchers
+    overlap on the same provenance type, which would otherwise produce
+    non-deterministic or surprising dispatch."""
 
     @dataclass(frozen=True)
     class MarkerProvenance(Provenance):
@@ -129,9 +132,8 @@ def test_first_registered_fetcher_wins_when_multiple_can_handle(tmp_path):
     registry.register(FetcherA())
     registry.register(FetcherB())
 
-    result = registry.fetch("x", MarkerProvenance(), dest=tmp_path / "x")
-    assert result.receipt.who == "A"
-    assert (tmp_path / "x" / "marker").read_text() == "A"
+    with pytest.raises(FetchError, match="ambiguous fetcher dispatch"):
+        registry.fetch("x", MarkerProvenance(), dest=tmp_path / "x")
 
 
 def test_registry_computes_identity_externally(tmp_path):

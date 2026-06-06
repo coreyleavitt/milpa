@@ -686,9 +686,9 @@ def _parse_url_dep(node: kdl.Node) -> UrlDep:
         )
     # `git` may be a plain str or a ParseResult (when written with the
     # `(url)` KDL type annotation, kdl-py auto-converts). Normalize to
-    # str so UrlDep is shape-stable regardless of annotation choice.
-    git_raw = node.props["git"]
-    git = git_raw.geturl() if isinstance(git_raw, ParseResult) else git_raw
+    # str via the strict helper so UrlDep is shape-stable regardless of
+    # annotation choice; an unexpected type raises ManifestError.
+    git = _url_arg(f"dep {name!r}", "git", node.props["git"])
     _validate_git_url(name, git)
     mirrors, child_preds, flag_requests = _parse_url_dep_children(name, node)
     inline_preds = _parse_predicates(name, node)
@@ -973,9 +973,10 @@ def _parse_tarball_dep(node: kdl.Node) -> TarballDep:
             f"on a tarball dep (allowed: {allowed})",
             code="MAN-DEP-UNKNOWN-PROPS",
         )
-    url_raw = node.props["tarball"]
-    url = url_raw.geturl() if isinstance(url_raw, ParseResult) else url_raw
-    if not isinstance(url, str) or not url:
+    # `tarball` may be a plain str or a (url)-annotated ParseResult;
+    # _url_arg normalizes and raises ManifestError on unexpected types.
+    url = _url_arg(f"dep {name!r}", "tarball", node.props["tarball"])
+    if not url:
         raise ManifestError(
             f"dep {name!r}: 'tarball' must be a non-empty URL string",
             code="MAN-DEP-TARBALL-URL",
@@ -1163,8 +1164,7 @@ def _parse_override(node: kdl.Node) -> Override:
             f"override for {name!r}: missing required property 'ref'",
             code="MAN-OVERRIDE-REF-MISSING",
         )
-    git_raw = node.props["git"]
-    git = git_raw.geturl() if isinstance(git_raw, ParseResult) else git_raw
+    git = _url_arg(f"override {name!r}", "git", node.props["git"])
     _validate_git_url(name, git)
     return Override(name=name, git=git, ref=node.props["ref"])
 

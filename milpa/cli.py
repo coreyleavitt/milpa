@@ -39,7 +39,7 @@ from .manifest import (
 from .manifest_writer import apply_manifest_change_with_resolve
 from .nimcfg import write_nimcfg
 from .tianguis_client import (
-    DEFAULT_INDEX_URL, Index, default_index_cache_dir, load_index,
+    DEFAULT_INDEX_URL, Index, IndexLoader, default_index_cache_dir, load_index,
 )
 from .solver import Strategy
 from .resolver import ResolvedGraph, resolve, resolve_workspace
@@ -152,16 +152,6 @@ def make_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
-
-from typing import Protocol
-
-
-class IndexLoader(Protocol):
-    """The seam for loading the tianguis index. Typed as a Protocol (not
-    an untyped Callable alias) so a test fake with a misnamed kwarg fails
-    at type-check time rather than at runtime (milpa#97)."""
-
-    def __call__(self, *, cache_dir: Path) -> Index: ...
 
 
 def _default_index_loader(*, cache_dir: Path) -> Index:
@@ -813,7 +803,6 @@ def cmd_add_mirror(
     fetcher: FetcherRegistry = default_registry,
     index_loader: IndexLoader = _default_index_loader,
     strategy: Strategy = Strategy.MAXVER,
-    relock: Callable[[Path], None] | None = None,    # back-compat; ignored
 ) -> int:
     """Append `url` as a mirror provenance for `dep_name` in the
     manifest (#37).

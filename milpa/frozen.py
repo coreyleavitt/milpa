@@ -18,7 +18,7 @@ from .lockfile import (
 )
 from .manifest import Manifest, NamedDep
 from .resolver import ResolvedDep, ResolvedGraph
-from .solver import Strategy, VersionSet
+from .solver import Strategy, VersionSet, parse_version
 
 
 class NotFrozen(Exception):
@@ -163,7 +163,12 @@ def _check_manifest_alignment(
             )
         if isinstance(mdep, NamedDep) and mdep.constraint:
             locked = locked_by_name[mdep.name]
-            locked_version = _parse_version(locked.version)
+            locked_version = parse_version(locked.version)
+            if locked_version is None:
+                raise NotFrozen(
+                    f"dep {mdep.name!r}: locked version {locked.version!r} "
+                    f"is not a parseable X.Y.Z version"
+                )
             vset = VersionSet.from_constraint(mdep.constraint)
             if not vset.contains(locked_version):
                 raise NotFrozen(
@@ -186,14 +191,19 @@ def _link_external(locked, deps_dir: Path, store: CAStore) -> None:
 
 def _resolved_from_locked(locked) -> ResolvedDep:
     """Convert a LockedDep into a ResolvedDep, deriving source / ref /
-    sha / tag from the first provenance."""
+    sha from the first provenance."""
+    ver = parse_version(locked.version)
+    if ver is None:
+        raise NotFrozen(
+            f"dep {locked.name!r}: locked version {locked.version!r} "
+            f"is not a parseable X.Y.Z version"
+        )
     return ResolvedDep(
         name=locked.name,
         source=_source_from_provenance(locked.provenances[0]),
         ref=getattr(locked.provenances[0], "ref", None),
-        tag=getattr(locked.provenances[0], "tag", None),
         sha=getattr(locked.provenances[0], "commit_sha", None),
-        version=_parse_version(locked.version),
+        version=ver,
         identity=locked.identity,
         src_dir=locked.src_dir,
         requires=locked.requires,
@@ -231,6 +241,3 @@ def _source_from_provenance(p) -> str:
     raise ValueError(f"unknown provenance kind {type(p).__name__}")
 
 
-def _parse_version(s: str):
-    parts = s.split(".")
-    return tuple(int(x) for x in parts[:3]) + (0,) * (3 - len(parts[:3]))

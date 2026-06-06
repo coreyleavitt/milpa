@@ -222,10 +222,17 @@ class FetcherRegistry:
         )
 
     def _select(self, provenance: Provenance) -> "Fetcher":
-        for f in self._fetchers:
-            if f.can_handle(provenance):
-                return f
-        raise FetchError(
-            f"no registered fetcher handles provenance kind "
-            f"{type(provenance).__name__}"
-        )
+        matches = [f for f in self._fetchers if f.can_handle(provenance)]
+        if len(matches) > 1:
+            raise FetchError(
+                f"ambiguous fetcher dispatch for provenance kind "
+                f"{type(provenance).__name__!r}: "
+                f"{len(matches)} registered fetchers all claim can_handle — "
+                f"registrations: {[type(f).__name__ for f in matches]}"
+            )
+        if not matches:
+            raise FetchError(
+                f"no registered fetcher handles provenance kind "
+                f"{type(provenance).__name__}"
+            )
+        return matches[0]

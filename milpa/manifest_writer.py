@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .manifest import Manifest, ManifestError, format_manifest, parse_manifest
+from .tianguis_client import IndexLoader
 
 
 @dataclass(frozen=True)
@@ -97,7 +98,7 @@ def apply_manifest_change_with_resolve(
     *,
     proposed_manifest: Manifest,
     fetcher,                              # FetcherRegistry
-    index_loader,                         # IndexLoader: cache_dir → Index
+    index_loader: IndexLoader,
     strategy,                             # Strategy enum
     pre_resolve_validate: "Callable[[], None] | None" = None,
 ) -> WriteResult:

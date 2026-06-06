@@ -81,7 +81,7 @@ def test_cmd_add_mirror_appends_to_manifest_on_identity_match(tmp_path):
 
     rc = cmd_add_mirror(
         tmp_path, url=mirror_url, dep_name="x",
-        fetcher=registry, relock=None,
+        fetcher=registry,
     )
 
     assert rc == 0
@@ -115,7 +115,6 @@ def test_cmd_add_mirror_refuses_on_identity_mismatch(tmp_path, capsys):
         url="https://wrong.example.com/x.git",
         dep_name="x",
         fetcher=registry,
-        relock=None,
     )
 
     assert rc == 1
@@ -133,7 +132,7 @@ def test_cmd_add_mirror_refuses_when_no_lockfile(tmp_path, capsys):
     )
     rc = cmd_add_mirror(
         tmp_path, url="https://x", dep_name="x",
-        fetcher=FetcherRegistry(), relock=None,
+        fetcher=FetcherRegistry(),
     )
     assert rc == 1
     err = capsys.readouterr().err
@@ -147,7 +146,7 @@ def test_cmd_add_mirror_refuses_unknown_dep_name(tmp_path, capsys):
 
     rc = cmd_add_mirror(
         tmp_path, url="https://x", dep_name="nonexistent",
-        fetcher=FetcherRegistry(), relock=None,
+        fetcher=FetcherRegistry(),
     )
     assert rc == 1
     err = capsys.readouterr().err
@@ -175,7 +174,7 @@ def test_cmd_add_mirror_refuses_on_local_provenance(tmp_path, capsys):
 
     rc = cmd_add_mirror(
         tmp_path, url="https://x", dep_name="sibling",
-        fetcher=FetcherRegistry(), relock=None,
+        fetcher=FetcherRegistry(),
     )
     assert rc == 1
     err = capsys.readouterr().err

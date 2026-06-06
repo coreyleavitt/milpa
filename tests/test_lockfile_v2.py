@@ -207,7 +207,7 @@ def test_from_graph_builds_correct_provenance_variant():
     def _rd(name, source, **kw):
         return ResolvedDep(
             name=name, source=source,
-            ref=kw.get("ref"), tag=kw.get("tag"), sha=kw.get("sha"),
+            ref=kw.get("ref"), sha=kw.get("sha"),
             version=(0, 0, 1), identity=_HASH, src_dir="", requires=(),
         )
 
@@ -240,7 +240,7 @@ def test_typed_provenance_reconstructs_same_record_as_source_string():
     def _rd(name, source, provenance, **kw):
         return ResolvedDep(
             name=name, source=source,
-            ref=kw.get("ref"), tag=kw.get("tag"), sha=kw.get("sha"),
+            ref=kw.get("ref"), sha=kw.get("sha"),
             version=(0, 0, 1), identity=_HASH, src_dir="", requires=(),
             provenance=provenance,
         )
@@ -293,6 +293,38 @@ def test_oci_provenance_record_round_trips():
     assert p.digest == "sha256:deadbeef"
 
 
+def test_from_graph_oci_provenance_builds_oci_record():
+    """M8 (focused unit): a ResolvedDep carrying OciProvenance produces an
+    OciProvenanceRecord from from_graph — complementing the existing git +
+    tarball typed-dispatch test."""
+    from milpa.fetchers.oci import OciProvenance
+    from milpa.lockfile import OciProvenanceRecord, from_graph
+    from milpa.resolver import ResolvedDep, ResolvedGraph
+
+    digest = "sha256:" + "a" * 64
+    dep = ResolvedDep(
+        name="nimkdl",
+        source="oci:ghcr.io/coreyleavitt/nimkdl",
+        ref=None,
+        sha=None,
+        version=(0, 1, 4),
+        identity=_HASH,
+        src_dir="src",
+        requires=(),
+        provenance=OciProvenance(
+            registry="ghcr.io",
+            repository="coreyleavitt/nimkdl",
+            digest=digest,
+        ),
+    )
+    lockfile = from_graph(ResolvedGraph(deps=(dep,)))
+    rec = lockfile.deps[0].provenances[0]
+    assert isinstance(rec, OciProvenanceRecord)
+    assert rec.registry == "ghcr.io"
+    assert rec.repository == "coreyleavitt/nimkdl"
+    assert rec.digest == digest
+
+
 def test_legacy_registry_record_still_parses():
     from milpa.lockfile import RegistryProvenanceRecord
 
@@ -319,3 +351,42 @@ dep "foo" {
     assert isinstance(p, RegistryProvenanceRecord)
     assert p.name == "foo"
     assert p.tag == "v1.2.0"
+
+
+# ---------------------------------------------------------------------------
+# RD3 — unknown typed provenance raises ValueError (programmer-error trap)
+# ---------------------------------------------------------------------------
+
+
+def test_rd3_unknown_provenance_type_raises_value_error():
+    """_provenance_from_resolved must raise ValueError for an unexpected
+    typed Provenance subclass. This pins the programmer-error trap so a
+    future refactor can't silently make the else-arm unreachable without
+    a red test.
+
+    Uses a trivial stub subclass — only needs to satisfy the type check.
+    """
+    import pytest
+    from dataclasses import dataclass
+
+    from milpa.fetchers.types import Provenance
+    from milpa.lockfile import from_graph
+    from milpa.resolver import ResolvedDep, ResolvedGraph
+
+    @dataclass(frozen=True)
+    class _StubProvenance(Provenance):
+        """Unknown transport — not git, tarball, or OCI."""
+
+    dep = ResolvedDep(
+        name="mystery",
+        source="unknown://example.com/mystery",
+        ref=None,
+        sha=None,
+        version=(1, 0, 0),
+        identity=_HASH,
+        src_dir="",
+        requires=(),
+        provenance=_StubProvenance(),
+    )
+    with pytest.raises(ValueError, match="unexpected typed provenance"):
+        from_graph(ResolvedGraph(deps=(dep,)))
