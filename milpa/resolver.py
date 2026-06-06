@@ -27,6 +27,7 @@ from .fetchers import FetcherRegistry, default_registry
 from .fetchers.git import GitProvenance, GitReceipt
 from .fetchers.local import LocalProvenance
 from .fetchers.tarball import TarballProvenance
+from .fetchers.types import Provenance
 from .identity import compute_content_hash
 from .manifest import (
     LocalDep, Manifest, MemberDep, NamedDep, Override, TarballDep, UrlDep,
@@ -66,6 +67,11 @@ class ResolvedDep:
     identity: str | None   # multihash-encoded content hash (#34); was content_hash (#33)
     src_dir: str           # for nim.cfg --path emission
     requires: tuple[str, ...]  # names of direct deps
+    # Authoritative provenance-reconstruction input (#97 / Option A). The
+    # lockfile boundary dispatches on its type to build the *Record — no
+    # source-string parsing. None only for the synthetic root + workspace
+    # members (never fetched); `source` then carries the member marker.
+    provenance: Provenance | None = None
     active_flags: tuple[str, ...] = ()  # feature flags active on this dep (#23)
     self_mirrors: tuple[str, ...] = ()  # alternative URLs declared by this dep (#79)
     # Per-flag explicit -d: overrides. Each entry: (flag_name, tuple of
@@ -104,6 +110,9 @@ class _Candidate:
     src_dir: str
     dep_terms: list[Term]      # for the solver
     requires_names: list[str]  # for ResolvedDep.requires
+    # Typed provenance carried onto the candidate (#97 / Option A) — the
+    # authoritative lockfile-reconstruction input. None for root/members.
+    provenance: Provenance | None = None
     # Feature-flag state on this candidate (#90).
     active_flags: tuple[str, ...] = ()
     flag_defines: tuple[tuple[str, tuple[str, ...]], ...] = ()
@@ -1093,6 +1102,7 @@ def _process_url(
         identity=result.identity,
         src_dir=src_dir_value,
         dep_terms=terms, requires_names=requires_names,
+        provenance=GitProvenance(url=dep.git, ref=dep.ref),
         active_flags=active_flags,
         flag_defines=flag_defines,
         self_mirrors=self_mirrors,
@@ -1250,6 +1260,11 @@ def _process_tarball(
         identity=result.identity,
         src_dir=(nm.src_dir or "") if nm else "",
         dep_terms=terms, requires_names=requires_names,
+        provenance=TarballProvenance(
+            url=dep.url,
+            expected_sha256=dep.sha256,
+            strip_components=dep.strip_components,
+        ),
     )
     new_items: list = []
     for u in sub_url_deps:
@@ -1293,6 +1308,12 @@ def _process_local(
         identity=result.identity,
         src_dir=(nm.src_dir or "") if nm else "",
         dep_terms=terms, requires_names=requires_names,
+        # NOTE: local deps deliberately stay on the source-string fallback
+        # (`local:<declared>`). LocalProvenance.path is absolute-truthful,
+        # but the lockfile records the *declared relative* path — carrying
+        # the typed object would write the abs path (a behavior change).
+        # The `local:` prefix is unambiguous, so no typed dispatch is
+        # needed here; the OCI-ambiguity driver for Option A doesn't apply.
     )
     new_items: list = []
     for u in sub_url_deps:
@@ -1477,6 +1498,7 @@ def _build_graph(
             identity=c.identity,
             src_dir=c.src_dir,
             requires=tuple(c.requires_names),
+            provenance=getattr(c, "provenance", None),
             active_flags=getattr(c, "active_flags", ()),
             flag_defines=getattr(c, "flag_defines", ()),
             self_mirrors=getattr(c, "self_mirrors", ()),

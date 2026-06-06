@@ -225,3 +225,41 @@ def test_from_graph_builds_correct_provenance_variant():
         "m": "MemberProvenanceRecord",
         "r": "RegistryProvenanceRecord",
     }
+
+
+def test_typed_provenance_reconstructs_same_record_as_source_string():
+    """S2.7 (milpa#97 / Option A): a ResolvedDep carrying a typed
+    Provenance reconstructs byte-identically to the legacy source-string
+    path. Typed objects take the type-dispatch fast path; None falls back
+    to source parsing — both must agree."""
+    from milpa.lockfile import from_graph
+    from milpa.resolver import ResolvedDep, ResolvedGraph
+    from milpa.fetchers.git import GitProvenance
+    from milpa.fetchers.tarball import TarballProvenance
+
+    def _rd(name, source, provenance, **kw):
+        return ResolvedDep(
+            name=name, source=source,
+            ref=kw.get("ref"), tag=kw.get("tag"), sha=kw.get("sha"),
+            version=(0, 0, 1), identity=_HASH, src_dir="", requires=(),
+            provenance=provenance,
+        )
+
+    # git + tarball migrate to typed dispatch. (local stays on the
+    # unambiguous source-string fallback — see _process_local.)
+    typed = ResolvedGraph(deps=(
+        _rd("g", "https://x/g.git",
+            GitProvenance(url="https://x/g.git", ref="main"),
+            ref="main", sha="abc"),
+        _rd("t", "tarball:https://x/t.tar.gz",
+            TarballProvenance(url="https://x/t.tar.gz", expected_sha256="z")),
+    ))
+    untyped = ResolvedGraph(deps=(
+        _rd("g", "https://x/g.git", None, ref="main", sha="abc"),
+        _rd("t", "tarball:https://x/t.tar.gz", None),
+    ))
+
+    lt = {d.name: d.provenances[0] for d in from_graph(typed).deps}
+    lu = {d.name: d.provenances[0] for d in from_graph(untyped).deps}
+    # Same record content from both paths.
+    assert lt == lu

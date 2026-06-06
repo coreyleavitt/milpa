@@ -1,6 +1,6 @@
 # resolver→tianguis swap (milpa#97) — handoff
 
-- **Stage:** 3 /tdd grind — **S0–S2.5 DONE (green, 593 passed)**; next = **S2.7** (typed provenance dispatch, pure refactor)
+- **Stage:** 3 /tdd grind — **S0–S2.7 DONE (green, 594 passed)**; next = **S3** (lockfile OciProvenanceRecord add-only)
 - **Resume:** `/loop implement the next unimplemented RFC slice from docs/rfc-resolver-tianguis-swap.md with /tdd, following the standing rules; report one progress line per slice; stop when every slice is implemented`
 - **RFC:** `docs/rfc-resolver-tianguis-swap.md`   •   **Deferrals filed:** #98 (strategy), #99 (add-by-name), #100 (constraint accumulation), #101 (fetch observability), #102 (fetch_any mismatch warn)
 

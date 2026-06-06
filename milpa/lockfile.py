@@ -37,6 +37,9 @@ from pathlib import Path
 
 import kdl
 
+from .fetchers.git import GitProvenance
+from .fetchers.local import LocalProvenance
+from .fetchers.tarball import TarballProvenance
 from .identity import IdentityError, compute_content_hash, parse_identity
 from .resolver import ResolvedDep, ResolvedGraph
 
@@ -183,8 +186,32 @@ def _locked_from_resolved(d: ResolvedDep) -> LockedDep:
 
 
 def _provenance_from_resolved(d: ResolvedDep) -> ProvenanceRecord:
-    """Dispatch on ResolvedDep.source's prefix to pick the right
-    ProvenanceRecord variant."""
+    """Reconstruct the lockfile ProvenanceRecord for a resolved dep.
+
+    Primary path (#97 / Option A): dispatch on the type of the typed
+    `provenance` object the resolver carried. This is the single source
+    of truth — no source-string parsing, so the OCI case (whose flat
+    `oci:{registry}/{repository}@{digest}` string is genuinely ambiguous
+    to split) reconstructs cleanly by type.
+
+    Fallback: when `provenance` is None (the synthetic root, workspace
+    members, and — until S4 — named deps that still set a `registry:`
+    source), parse the legacy `source` string. That arm becomes dead once
+    every producer carries a typed provenance."""
+    prov = d.provenance
+    if isinstance(prov, GitProvenance):
+        # commit_sha is the RESOLVED sha from the receipt (d.sha), not the
+        # provenance's pin field — matches the legacy git arm exactly.
+        return GitProvenanceRecord(url=prov.url, ref=prov.ref, commit_sha=d.sha)
+    if isinstance(prov, LocalProvenance):
+        return LocalProvenanceRecord(path=prov.path)
+    if isinstance(prov, TarballProvenance):
+        # sha256 stays None here (the archive hash is a receipt, not yet
+        # threaded onto the candidate) — behavior-preserving with the
+        # legacy arm.
+        return TarballProvenanceRecord(url=prov.url, sha256=None)
+
+    # --- None provenance: legacy source-string fallback ---
     src = d.source
     if src.startswith("local:"):
         return LocalProvenanceRecord(path=src[len("local:"):])
@@ -198,13 +225,7 @@ def _provenance_from_resolved(d: ResolvedDep) -> ProvenanceRecord:
             tag=d.tag,
             commit_sha=d.sha,
         )
-    # Default: treat as a git URL (https://, http://, ssh://, git://,
-    # or file:// for tests). Anything not prefix-tagged is git.
-    return GitProvenanceRecord(
-        url=src,
-        ref=d.ref,
-        commit_sha=d.sha,
-    )
+    return GitProvenanceRecord(url=src, ref=d.ref, commit_sha=d.sha)
 
 
 def _format_version(v: tuple[int, int, int]) -> str:
