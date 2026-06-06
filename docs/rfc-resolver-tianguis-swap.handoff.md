@@ -23,7 +23,22 @@
 - [ ] S7 — gated live integration: transitive tree, git fetch at `commit_sha`, content_hash verify (validates S2.5)
 
 ## Open forks (awaiting Corey)
-- **NONE.** Fork 1 resolved → **Option A (full typed provenance dispatch)**. New pure-refactor
+- **S4/S5 SLICE-BOUNDARY ESCALATION (open, blocks the grind).** The RFC assumes S4
+  (resolver `_process_named` swap) lands green migrating only the 2 RegistryEntry named
+  tests, with CLI index-wiring deferred to S5. Exploration shows that's unworkable: the
+  moment `_process_named` routes through `index` instead of `registry`/`list_tags`, **every**
+  named-dep test goes red until its caller supplies an index — and several route through the
+  **CLI** (`cmd_fetch` → `resolve`), whose index-wiring is S5: `test_cli_commands.py:228`
+  (named `bar` via `registry_loader`), `test_nimble_compat.py:126/158`,
+  `test_workspace_resolver.py:275` (workspace named), plus `test_resolver.py:160` +
+  `test_resolver_pins.py:253` (direct). So **S4 cannot be green without S5**.
+  **Recommendation: merge S4+S5 into one green step** (resolver swap + `cmd_fetch`/`lock`/
+  `update`/`add`/`remove` + workspace + `manifest_writer` index wiring + the
+  `_default_index_loader`/`IndexLoader` Protocol), migrating all named-dep tests to a
+  synthetic `Index` in the same step; S6 stays the `registry.py` deletion + grep-clean; S7
+  stays gated integration. This is a re-slice, not a design change — Option A and every
+  settled decision hold. Awaiting confirm before executing the merged step.
+- ~~Fork 1~~ resolved → **Option A (full typed provenance dispatch)**. New pure-refactor
   slice **S2.7** carries `provenance: Provenance | None` on `_Candidate`/`ResolvedDep` and
   type-dispatches `_provenance_from_resolved` (string-prefix arms deleted); `source` demoted to
   display/member-marker, no longer parsed. RFC §Design-decisions #6 records it. S3/S4 add typed
