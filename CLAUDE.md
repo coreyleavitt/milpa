@@ -43,7 +43,7 @@ milpa is a Python package (uv-managed). All code in `milpa/`:
 | `nimble_parse.py` | `.nimble` line-form parser (no nimscript eval) |
 | `identity.py` | `compute_content_hash(path)` — sha256 of source tree per spec |
 | `fetcher.py` | git clone + content hash via `fetch_url_dep(name, git, ref, deps_dir)` |
-| `registry.py` | nim-lang/packages registry resolution + version constraint matching |
+| `tianguis_client.py` | tianguis `index.kdl` reader — named-dep resolution (identity + provenance + version set); replaced `registry.py`/nim-lang per #97 |
 | `solver.py` | **PubGrub** (teaching-clean form) + `VersionSet` algebra + `Strategy` enum |
 | `resolver.py` | top-level glue: manifest → fetch + parse + solve → `ResolvedGraph` |
 | `lockfile.py` | `milpa.lock` parse + format + verification (`verify_against_graph`, `verify_lockfile_against_deps`) |
@@ -71,8 +71,9 @@ defeats the design intent.
 Every dep records two distinct kinds of information:
 - **Identity** (`content_hash`): sha256 of the source tree. Immutable,
   trust-independent, recomputable from bytes alone.
-- **Provenance** (`source` + `ref` + `tag` + `sha`): URL or registry
-  name + git ref + commit SHA. Mutable, trust-dependent.
+- **Provenance** (typed `Provenance` on the resolved dep → lockfile
+  `*Record`): git URL + ref + commit SHA, or OCI registry/repository/
+  digest. Mutable, trust-dependent.
 
 These are NOT the same field. Treat them as orthogonal. See
 `docs/identity-and-provenance.md` for the conceptual model and
@@ -218,7 +219,7 @@ Toolchain expectations:
 - Integration tests gated by `MILPA_INTEGRATION_TESTS=1` (real network
   against real github URLs; uses fresco's actual dep tree as fixture)
 - No mocking. Tests use real subprocess for git, real Hypothesis,
-  fakes injected as kwargs (`fetcher`, `list_tags`, `registry_loader`)
+  fakes injected as kwargs (`fetcher`, `index`/`index_loader`)
   for unit tests where network would be undesirable.
 
 Counterexamples Hypothesis discovers get **pinned as regression tests**

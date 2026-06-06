@@ -7,9 +7,9 @@ without network skip these. Run manually with:
 
 What's exercised:
   - Real git clone of chronos (URL dep)
-  - Real fetch of packages_official.json (registry)
-  - Real git ls-remote --tags for each chronos transitive named dep
-  - Real git clone of each named dep
+  - Real fetch of the tianguis index (the named-dep registry, milpa#97)
+  - Real index lookup for each chronos transitive named dep
+  - Real git clone of each named dep at its index-pinned provenance
   - .nimble parsing across all deps
   - Full PubGrub resolution over the materialized candidate set
   - milpa.lock + nim.cfg emission
@@ -58,14 +58,14 @@ def test_fresco_tree_resolves_end_to_end(tmp_path: Path):
     assert "chronos" in names, f"chronos missing from lockfile (got: {names})"
 
     # Every dep has cryptographic pins: an identity (multihash) plus at
-    # least one provenance. Git and registry provenances carry a
-    # commit_sha; we require one when present.
-    from milpa.lockfile import GitProvenanceRecord, RegistryProvenanceRecord
+    # least one provenance. Git provenances (URL deps + index-resolved
+    # named deps) carry a commit_sha; we require one when present.
+    from milpa.lockfile import GitProvenanceRecord
     for dep in lockfile.deps:
         assert dep.identity, f"dep {dep.name!r} has no identity pin"
         assert dep.provenances, f"dep {dep.name!r} has no provenance"
         first = dep.provenances[0]
-        if isinstance(first, (GitProvenanceRecord, RegistryProvenanceRecord)):
+        if isinstance(first, GitProvenanceRecord):
             assert first.commit_sha, (
                 f"dep {dep.name!r} provenance has no commit_sha pin"
             )

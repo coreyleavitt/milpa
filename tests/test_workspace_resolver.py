@@ -582,8 +582,8 @@ def test_resolve_workspace_override_applies_uniformly_to_all_members(tmp_path):
 
 def test_resolve_workspace_override_on_named_dep_bypasses_registry(tmp_path):
     """A member declares chronos as a NamedDep. The workspace overrides
-    chronos. Resolution bypasses the registry path entirely (list_tags
-    must not be called) and fetches from the override URL."""
+    chronos. Resolution bypasses the tianguis index entirely (the empty
+    index would otherwise raise) and fetches from the override URL."""
     from milpa.manifest import Override
 
     fresco_dir = tmp_path / "fresco"

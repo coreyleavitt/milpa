@@ -95,7 +95,7 @@ deliberate scope-out.
 
 | Feature | nimble v0.22.3 | atlas v0.14.2 | milpa (post-RFC) |
 |---|---|---|---|
-| nim-lang/packages.json | yes | yes | yes |
+| Named-package registry | nim-lang/packages.json | nim-lang/packages.json | tianguis index (content-addressed, per #97) |
 | Version constraints (`>=`, `==`, ranges) | yes | yes | yes |
 | Caret / tilde (`^`, `~`) constraints | no | no | yes |
 | Prerelease opt-in | no | no | yes |

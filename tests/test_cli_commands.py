@@ -362,15 +362,15 @@ def test_cmd_verify_detects_extra_dep_directory(tmp_path, capsys):
 
 
 def test_cmd_verify_ignores_dotfiles_in_deps_dir(tmp_path):
-    """Dotfiles like .packages_official.json (registry cache) should
-    NOT flag as extra."""
+    """Dotfiles planted in _deps/ (caches, editor scratch, etc.) should
+    NOT flag as extra during verify."""
     _write_minimal_manifest(tmp_path)
 
     cmd_fetch(tmp_path, fetcher=_verify_test_registry(),
               index_loader=_empty_index_loader)
 
-    # Plant a dotfile (the registry cache uses this pattern)
-    (tmp_path / "_deps" / ".packages_official.json").write_text("{}")
+    # Plant a dotfile under _deps/
+    (tmp_path / "_deps" / ".scratch.json").write_text("{}")
 
     rc = cmd_verify(tmp_path)
     assert rc == 0
