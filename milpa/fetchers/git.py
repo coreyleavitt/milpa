@@ -25,6 +25,11 @@ from .types import FetchError, Provenance, ProvenanceReceipt
 class GitProvenance(Provenance):
     url: str
     ref: str
+    # Immutable commit pin (milpa#97). When set, GitFetcher checks out
+    # this exact commit rather than the (mutable) `ref` tip — `ref` is
+    # retained for provenance/debuggability. None preserves the legacy
+    # tip-checkout behavior for every existing caller (additive default).
+    commit_sha: str | None = None
 
 
 @dataclass(frozen=True)

@@ -54,31 +54,42 @@ def test_lookup_returns_one_version_for_known_name():
 # ---------------------------------------------------------------------------
 
 
+def _git_prov(sha: str) -> str:
+    return (
+        '        provenance {\n'
+        '            kind "git"\n'
+        '            url "https://github.com/status-im/nim-chronos"\n'
+        '            ref "HEAD"\n'
+        f'            commit_sha "{sha}"\n'
+        '        }\n'
+    )
+
+
 MULTI_VERSION_INDEX = """\
 schema_version 1
-package "chronos" {
+package "chronos" {{
     namespace "status-im"
     upstream (url)"https://github.com/status-im/nim-chronos"
-    version "0.2.0" {
+    version "0.2.0" {{
         content_hash "sha256:aaa"
-        attestation "milpa-vendored"
+{p_a}        attestation "milpa-vendored"
         signed_by "milpa-bot"
         published_at "2026-01-01T00:00:00Z"
-    }
-    version "1.0.0" {
+    }}
+    version "1.0.0" {{
         content_hash "sha256:bbb"
-        attestation "milpa-vendored"
+{p_b}        attestation "milpa-vendored"
         signed_by "milpa-bot"
         published_at "2026-02-01T00:00:00Z"
-    }
-    version "0.10.3" {
+    }}
+    version "0.10.3" {{
         content_hash "sha256:ccc"
-        attestation "milpa-vendored"
+{p_c}        attestation "milpa-vendored"
         signed_by "milpa-bot"
         published_at "2026-03-01T00:00:00Z"
-    }
-}
-"""
+    }}
+}}
+""".format(p_a=_git_prov("a" * 40), p_b=_git_prov("b" * 40), p_c=_git_prov("c" * 40))
 
 
 def test_versions_returned_in_descending_semver_order():
@@ -319,3 +330,213 @@ def test_resolve_no_satisfying_version_errors_clearly():
     # All chronos versions are < 2.0.0; constraint demands >= 2.0.0.
     with pytest.raises(TianguisError, match="no version.*satisfies"):
         resolve_named(idx, "chronos", ">= 2.0.0")
+
+
+# ===========================================================================
+# S1 (milpa#97) — provenance-agnostic index. The real index.kdl is
+# 2613 git provenances + 1 oci; the reader must parse BOTH kinds into the
+# fetcher Provenance vocabulary, dispatch-ready, with coded errors.
+# ===========================================================================
+
+
+MIXED_INDEX = """\
+schema_version 1
+package "results" {
+    namespace "arnetheduck"
+    upstream (url)"https://github.com/arnetheduck/nim-results"
+    version "0.5.0" {
+        content_hash "sha256:res050"
+        provenance {
+            kind "git"
+            url "https://github.com/arnetheduck/nim-results"
+            ref "HEAD"
+            commit_sha "f3a2b1c9d8e7061524384950617283940a1b2c3d"
+        }
+        attestation "milpa-vendored"
+    }
+}
+package "nimkdl" {
+    namespace "coreyleavitt"
+    upstream (url)"https://github.com/coreyleavitt/nimkdl"
+    version "0.1.4" {
+        content_hash "sha256:1aaf2a95f53681c86f6dcd4c1267144401ba923f31afa42da3c5ae783dc7ab61"
+        provenance {
+            kind "oci"
+            registry "ghcr.io"
+            repository "coreyleavitt/nimkdl"
+            digest "sha256:e51aab085ef4f58ed3827742f3314cadb901ac1da36988cae05bb221f3652c24"
+        }
+        attestation "author-signed"
+    }
+}
+"""
+
+
+def test_git_provenance_parses_with_commit_sha():
+    from milpa.tianguis_client import parse_index, resolve_named
+    from milpa.fetchers.git import GitProvenance
+
+    idx = parse_index(MIXED_INDEX)
+    v = resolve_named(idx, "results", None)
+    assert v.version == "0.5.0"
+    assert len(v.provenances) == 1
+    p = v.provenances[0]
+    assert isinstance(p, GitProvenance)
+    assert p.url == "https://github.com/arnetheduck/nim-results"
+    assert p.ref == "HEAD"
+    # commit_sha is the immutable pin the resolver fetches at (Invariant 2).
+    assert p.commit_sha == "f3a2b1c9d8e7061524384950617283940a1b2c3d"
+
+
+def test_oci_provenance_still_parses_in_mixed_index():
+    from milpa.tianguis_client import parse_index, resolve_named
+    from milpa.fetchers.oci import OciProvenance
+
+    idx = parse_index(MIXED_INDEX)
+    v = resolve_named(idx, "nimkdl", None)
+    p = v.provenances[0]
+    assert isinstance(p, OciProvenance)
+    assert p.registry == "ghcr.io"
+    assert p.repository == "coreyleavitt/nimkdl"
+
+
+def test_canonical_provenance_is_first_in_index_order():
+    from milpa.tianguis_client import parse_index, resolve_named
+
+    idx = parse_index(MIXED_INDEX)
+    v = resolve_named(idx, "results", None)
+    assert v.canonical_provenance is v.provenances[0]
+
+
+def test_unknown_provenance_kind_is_skipped_not_fatal():
+    from milpa.tianguis_client import parse_index, resolve_named
+    from milpa.fetchers.git import GitProvenance
+
+    idx = parse_index("""\
+schema_version 1
+package "x" {
+    version "1.0.0" {
+        content_hash "sha256:x"
+        provenance {
+            kind "ipfs"
+            cid "bafy-future-transport"
+        }
+        provenance {
+            kind "git"
+            url "https://example.com/x"
+            ref "HEAD"
+            commit_sha "0000000000000000000000000000000000000000"
+        }
+    }
+}
+""")
+    v = resolve_named(idx, "x", None)
+    # The unknown ipfs kind is skipped; the git provenance survives.
+    assert len(v.provenances) == 1
+    assert isinstance(v.provenances[0], GitProvenance)
+
+
+def test_schema_version_newer_than_known_raises_coded():
+    from milpa.tianguis_client import parse_index, TianguisError
+
+    with pytest.raises(TianguisError) as exc:
+        parse_index("""\
+schema_version 99
+package "x" {
+    version "1.0.0" {
+        content_hash "sha256:x"
+    }
+}
+""")
+    assert exc.value.code == "TNG-SCHEMA-UNKNOWN"
+
+
+def test_empty_provenance_version_raises_coded():
+    from milpa.tianguis_client import parse_index, resolve_named, TianguisError
+
+    idx = parse_index("""\
+schema_version 1
+package "x" {
+    version "1.0.0" {
+        content_hash "sha256:x"
+    }
+}
+""")
+    with pytest.raises(TianguisError) as exc:
+        resolve_named(idx, "x", None)
+    assert exc.value.code == "TNG-NO-PROVENANCE"
+
+
+def test_unknown_package_error_carries_code():
+    from milpa.tianguis_client import parse_index, resolve_named, TianguisError
+
+    idx = parse_index(MIXED_INDEX)
+    with pytest.raises(TianguisError) as exc:
+        resolve_named(idx, "nonexistent", None)
+    assert exc.value.code == "TNG-NOT-FOUND"
+
+
+def test_no_satisfying_version_error_carries_code():
+    from milpa.tianguis_client import parse_index, resolve_named, TianguisError
+
+    idx = parse_index(MULTI_VERSION_INDEX)
+    with pytest.raises(TianguisError) as exc:
+        resolve_named(idx, "chronos", ">= 99.0.0")
+    assert exc.value.code == "TNG-NO-SATISFYING-VERSION"
+
+
+def test_unparseable_index_version_does_not_crash_sort():
+    from milpa.tianguis_client import parse_index
+
+    # A non-X.Y.Z tag ("nightly") mixed with clean semver. Parsing must
+    # not crash on the heterogeneous sort, and the clean versions sort
+    # ahead of the unparseable one.
+    idx = parse_index("""\
+schema_version 1
+package "x" {
+    version "nightly" {
+        content_hash "sha256:n"
+        provenance {
+            kind "git"
+            url "https://e.com/x"
+            ref "HEAD"
+            commit_sha "0000000000000000000000000000000000000000"
+        }
+    }
+    version "1.2.0" {
+        content_hash "sha256:a"
+        provenance {
+            kind "git"
+            url "https://e.com/x"
+            ref "HEAD"
+            commit_sha "1111111111111111111111111111111111111111"
+        }
+    }
+    version "1.10.0" {
+        content_hash "sha256:b"
+        provenance {
+            kind "git"
+            url "https://e.com/x"
+            ref "HEAD"
+            commit_sha "2222222222222222222222222222222222222222"
+        }
+    }
+}
+""")
+    versions = [v.version for v in idx.lookup("x")]
+    # Clean semver descending first, unparseable last (stable).
+    assert versions == ["1.10.0", "1.2.0", "nightly"]
+
+
+def test_unknown_error_code_is_rejected_at_construction():
+    # The _TNG_CODES bijection guard: a typo'd code fails loudly.
+    from milpa.tianguis_client import TianguisError
+
+    with pytest.raises(AssertionError, match="unknown tianguis error code"):
+        TianguisError(code="TNG-TYPO", message="nope")
+
+
+def test_default_index_url_is_defined():
+    from milpa.tianguis_client import DEFAULT_INDEX_URL
+
+    assert DEFAULT_INDEX_URL.endswith("/index.kdl")

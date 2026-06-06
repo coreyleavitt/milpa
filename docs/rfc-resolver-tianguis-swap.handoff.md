@@ -1,6 +1,6 @@
 # resolver→tianguis swap (milpa#97) — handoff
 
-- **Stage:** 3 /tdd grind — **S0 DONE (green)**; next = **S1** (`tianguis_client` provenance-agnostic)
+- **Stage:** 3 /tdd grind — **S0+S1 DONE (green, 589 passed)**; next = **S2** (register `OciFetcher`)
 - **Resume:** `/loop implement the next unimplemented RFC slice from docs/rfc-resolver-tianguis-swap.md with /tdd, following the standing rules; report one progress line per slice; stop when every slice is implemented`
 - **RFC:** `docs/rfc-resolver-tianguis-swap.md`   •   **Deferrals filed:** #98 (strategy), #99 (add-by-name), #100 (constraint accumulation), #101 (fetch observability), #102 (fetch_any mismatch warn)
 
@@ -13,7 +13,7 @@
 > lazy-import cleanup + the 2 named-test migrations. S0 covers `_extract_from_milpa_kdl`'s two
 > call sites.
 - [x] S0 — dead-param cleanup (dropped unused `registry`/`list_tags` from `_build_terms`/`_process_url`/`_process_tarball`/`_process_local`/`_extract_from_milpa_kdl` + their submit closures; `_process_named` kept live; `resolve`/`resolve_workspace` `registry` made optional; stripped empty `registry={}`/`list_tags=lambda url: []` kwargs from 15 test files — apply_manifest_change_with_resolve calls retain `list_tags` (S4/S5 scope)). Pure refactor, **578 passed** (== baseline).
-- [ ] S1 — `tianguis_client` provenance-agnostic (git+oci → fetcher Provenance; `tuple[Provenance,...]` pref-ordered; empty-prov guard `TNG-NO-PROVENANCE`; `schema_version` check `TNG-SCHEMA-UNKNOWN`; `TianguisError.code`)
+- [x] S1 — `tianguis_client` provenance-agnostic. `GitProvenance.commit_sha` added (additive); `_parse_version_node` dispatches git/oci (unknown kind skipped); `Version.provenances: tuple[Provenance,...]` pref-ordered + `canonical_provenance`; empty-prov guard `TNG-NO-PROVENANCE`; `schema_version` int check (kdl lib parses bare ints as float — handled) `TNG-SCHEMA-UNKNOWN`; `TianguisError(code=,message=)` + `_TNG_CODES` bijection; partition sort; dup-version dedupe+warn; `load_index` timeout=30 + atomic os.replace + `DEFAULT_INDEX_URL`. +11 tests, 589 passed.
 - [ ] S2 — register `OciFetcher`; `_select` routes by kind
 - [ ] S2.5 — `GitFetcher` arbitrary-`commit_sha` checkout (clone→`fetch origin <sha>`→checkout, unshallow/full fallback). The former R1, now a fix.
 - [ ] S3 — lockfile `OciProvenanceRecord` **add-only** + `cmd_show`/`frozen.py` OCI branches; keep `RegistryProvenanceRecord` as read-compat alias (NO delete here)
