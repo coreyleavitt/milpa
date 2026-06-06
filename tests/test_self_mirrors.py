@@ -162,8 +162,8 @@ mirrors {
     registry.register(fetcher_impl)
 
     graph = resolve(
-        top_manifest, deps_dir=tmp_path / "_deps", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        top_manifest, deps_dir=tmp_path / "_deps",
+        fetcher=registry,
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
 
@@ -260,8 +260,8 @@ def test_lockfile_cached_self_mirrors_used_as_fallback_on_primary_failure(tmp_pa
 
     # No identity pin so the mirror's bytes are accepted on first fetch
     graph = resolve(
-        top_manifest, deps_dir=tmp_path / "_deps", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        top_manifest, deps_dir=tmp_path / "_deps",
+        fetcher=registry,
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
         prior_lockfile=prior_lockfile,
     )
@@ -322,8 +322,8 @@ def test_hostile_self_mirror_rejected_by_identity_verification(tmp_path):
 
     with pytest.raises(Exception) as exc:
         resolve(
-            top_manifest, deps_dir=tmp_path / "_deps", registry={},
-            fetcher=registry, list_tags=lambda url: [],
+            top_manifest, deps_dir=tmp_path / "_deps",
+            fetcher=registry,
             profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
             prior_lockfile=prior_lockfile,
         )

@@ -88,7 +88,6 @@ def test_cmd_update_with_name_drops_only_that_pin(tmp_path):
     rc = cmd_update(
         tmp_path, name="chronos",
         fetcher=registry,
-        list_tags=lambda url: [],
         registry_loader=lambda *, cache_path: {},
         strategy=Strategy.MAXVER,
     )
@@ -112,7 +111,6 @@ def test_cmd_update_without_name_drops_all_pins(tmp_path):
         tmp_path,
         name=None,    # no targeting → full refresh
         fetcher=registry,
-        list_tags=lambda url: [],
         registry_loader=lambda *, cache_path: {},
         strategy=Strategy.MAXVER,
     )
@@ -141,7 +139,6 @@ def test_cmd_update_never_mutates_manifest(tmp_path):
     rc = cmd_update(
         tmp_path,
         fetcher=registry,
-        list_tags=lambda url: [],
         registry_loader=lambda *, cache_path: {},
         strategy=Strategy.MAXVER,
     )
@@ -162,7 +159,6 @@ def test_cmd_update_unknown_name_exits_1(tmp_path, capsys):
     rc = cmd_update(
         tmp_path, name="nonexistent",
         fetcher=registry,
-        list_tags=lambda url: [],
         registry_loader=lambda *, cache_path: {},
         strategy=Strategy.MAXVER,
     )
@@ -186,7 +182,6 @@ def test_cmd_update_no_lockfile_with_name_exits_1(tmp_path, capsys):
     rc = cmd_update(
         tmp_path, name="anything",
         fetcher=FetcherRegistry(),
-        list_tags=lambda url: [],
         registry_loader=lambda *, cache_path: {},
         strategy=Strategy.MAXVER,
     )

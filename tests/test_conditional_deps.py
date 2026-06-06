@@ -62,9 +62,7 @@ deps {
     graph = resolve(
         manifest,
         deps_dir=tmp_path / "_deps",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
 
@@ -95,9 +93,7 @@ deps {
     graph = resolve(
         manifest,
         deps_dir=tmp_path / "_deps",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
         profile=Profile(platform="linux", arch="arm64", nim="2.0.0", milpa="0.1.0"),
     )
     assert "foo" not in {d.name for d in graph.deps}
@@ -106,9 +102,7 @@ deps {
     graph2 = resolve(
         manifest,
         deps_dir=tmp_path / "_deps2",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     assert "foo" in {d.name for d in graph2.deps}
@@ -132,9 +126,7 @@ deps {
     graph_linux = resolve(
         manifest,
         deps_dir=tmp_path / "linux_deps",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     assert "uvloop" in {d.name for d in graph_linux.deps}
@@ -143,9 +135,7 @@ deps {
     graph_win = resolve(
         manifest,
         deps_dir=tmp_path / "win_deps",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
         profile=Profile(platform="windows", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     assert "uvloop" not in {d.name for d in graph_win.deps}
@@ -169,9 +159,7 @@ deps {
     graph_new = resolve(
         manifest,
         deps_dir=tmp_path / "new",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
         profile=Profile(platform="linux", arch="amd64", nim="2.0.4", milpa="0.1.0"),
     )
     assert "modern" in {d.name for d in graph_new.deps}
@@ -180,9 +168,7 @@ deps {
     graph_old = resolve(
         manifest,
         deps_dir=tmp_path / "old",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
         profile=Profile(platform="linux", arch="amd64", nim="1.6.20", milpa="0.1.0"),
     )
     assert "modern" not in {d.name for d in graph_old.deps}
@@ -251,9 +237,7 @@ deps {
     graph = resolve(
         manifest,
         deps_dir=tmp_path / "_deps",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     assert graph.deps == ()
@@ -277,24 +261,24 @@ deps {
 
     # Windows + nim 2.0+ → included
     g = resolve(
-        manifest, deps_dir=tmp_path / "a", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        manifest, deps_dir=tmp_path / "a",
+        fetcher=registry,
         profile=Profile(platform="windows", arch="amd64", nim="2.0.4", milpa="0.1.0"),
     )
     assert "modern_winapi" in {d.name for d in g.deps}
 
     # Windows + nim 1.6 → excluded (nim mismatch)
     g = resolve(
-        manifest, deps_dir=tmp_path / "b", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        manifest, deps_dir=tmp_path / "b",
+        fetcher=registry,
         profile=Profile(platform="windows", arch="amd64", nim="1.6.20", milpa="0.1.0"),
     )
     assert "modern_winapi" not in {d.name for d in g.deps}
 
     # Linux + nim 2.0+ → excluded (platform mismatch)
     g = resolve(
-        manifest, deps_dir=tmp_path / "c", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        manifest, deps_dir=tmp_path / "c",
+        fetcher=registry,
         profile=Profile(platform="linux", arch="amd64", nim="2.0.4", milpa="0.1.0"),
     )
     assert "modern_winapi" not in {d.name for d in g.deps}
@@ -324,24 +308,24 @@ deps {
 
     # On linux: included
     g_lin = resolve(
-        manifest, deps_dir=tmp_path / "lin", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        manifest, deps_dir=tmp_path / "lin",
+        fetcher=registry,
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     assert "cross" in {d.name for d in g_lin.deps}
 
     # On macosx: included
     g_mac = resolve(
-        manifest, deps_dir=tmp_path / "mac", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        manifest, deps_dir=tmp_path / "mac",
+        fetcher=registry,
         profile=Profile(platform="macosx", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     assert "cross" in {d.name for d in g_mac.deps}
 
     # On windows: excluded
     g_win = resolve(
-        manifest, deps_dir=tmp_path / "win", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        manifest, deps_dir=tmp_path / "win",
+        fetcher=registry,
         profile=Profile(platform="windows", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     assert "cross" not in {d.name for d in g_win.deps}
@@ -388,24 +372,24 @@ deps {
 
     # On macosx: included (not windows AND not linux → True)
     g = resolve(
-        manifest, deps_dir=tmp_path / "mac", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        manifest, deps_dir=tmp_path / "mac",
+        fetcher=registry,
         profile=Profile(platform="macosx", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     assert "a" in {d.name for d in g.deps}
 
     # On windows: excluded
     g = resolve(
-        manifest, deps_dir=tmp_path / "win", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        manifest, deps_dir=tmp_path / "win",
+        fetcher=registry,
         profile=Profile(platform="windows", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     assert "a" not in {d.name for d in g.deps}
 
     # On linux: excluded
     g = resolve(
-        manifest, deps_dir=tmp_path / "lin", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        manifest, deps_dir=tmp_path / "lin",
+        fetcher=registry,
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     assert "a" not in {d.name for d in g.deps}
@@ -445,32 +429,32 @@ deps {
 
     # linux + amd64 → included
     g = resolve(
-        manifest, deps_dir=tmp_path / "a", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        manifest, deps_dir=tmp_path / "a",
+        fetcher=registry,
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     assert "cross" in {d.name for d in g.deps}
 
     # macosx + amd64 → included
     g = resolve(
-        manifest, deps_dir=tmp_path / "b", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        manifest, deps_dir=tmp_path / "b",
+        fetcher=registry,
         profile=Profile(platform="macosx", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     assert "cross" in {d.name for d in g.deps}
 
     # linux + arm64 → excluded (arch mismatch)
     g = resolve(
-        manifest, deps_dir=tmp_path / "c", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        manifest, deps_dir=tmp_path / "c",
+        fetcher=registry,
         profile=Profile(platform="linux", arch="arm64", nim="2.0.0", milpa="0.1.0"),
     )
     assert "cross" not in {d.name for d in g.deps}
 
     # windows + amd64 → excluded (platform mismatch)
     g = resolve(
-        manifest, deps_dir=tmp_path / "d", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        manifest, deps_dir=tmp_path / "d",
+        fetcher=registry,
         profile=Profile(platform="windows", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     assert "cross" not in {d.name for d in g.deps}

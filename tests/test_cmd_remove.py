@@ -58,7 +58,6 @@ def test_cmd_remove_drops_dep_from_manifest_and_regenerates_lockfile(tmp_path):
     rc = cmd_remove(
         tmp_path, name="chronos",
         fetcher=registry,
-        list_tags=lambda url: [],
         registry_loader=lambda *, cache_path: {},
         strategy=Strategy.MAXVER,
     )
@@ -87,7 +86,6 @@ def test_cmd_remove_unknown_name_exits_1_without_mutating(tmp_path, capsys):
     rc = cmd_remove(
         tmp_path, name="nonexistent",
         fetcher=registry,
-        list_tags=lambda url: [],
         registry_loader=lambda *, cache_path: {},
         strategy=Strategy.MAXVER,
     )

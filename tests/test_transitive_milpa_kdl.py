@@ -71,9 +71,7 @@ deps {
     graph = resolve(
         top_manifest,
         deps_dir=tmp_path / "_deps",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
 
@@ -127,9 +125,7 @@ def test_milpa_kdl_wins_precedence_over_nimble(tmp_path):
     graph = resolve(
         top_manifest,
         deps_dir=tmp_path / "_deps",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     names = {d.name for d in graph.deps}
@@ -175,9 +171,7 @@ deps {
     graph = resolve(
         top_manifest,
         deps_dir=tmp_path / "_deps",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     names = {d.name for d in graph.deps}
@@ -217,8 +211,8 @@ deps {
     registry.register(fetcher_impl)
 
     graph = resolve(
-        top_manifest, deps_dir=tmp_path / "_deps", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        top_manifest, deps_dir=tmp_path / "_deps",
+        fetcher=registry,
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     names = {d.name for d in graph.deps}
@@ -256,8 +250,8 @@ deps {
     registry.register(fetcher_impl)
 
     graph = resolve(
-        top_manifest, deps_dir=tmp_path / "_deps", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        top_manifest, deps_dir=tmp_path / "_deps",
+        fetcher=registry,
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     assert "serde" in {d.name for d in graph.deps}
@@ -317,8 +311,8 @@ deps {
     registry.register(fetcher_impl)
 
     graph = resolve(
-        top_manifest, deps_dir=tmp_path / "_deps", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        top_manifest, deps_dir=tmp_path / "_deps",
+        fetcher=registry,
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     names = {d.name for d in graph.deps}
@@ -377,8 +371,8 @@ deps {
     registry.register(fetcher_impl)
 
     graph = resolve(
-        top_manifest, deps_dir=tmp_path / "_deps", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        top_manifest, deps_dir=tmp_path / "_deps",
+        fetcher=registry,
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     names = {d.name for d in graph.deps}
@@ -421,8 +415,8 @@ deps {
     registry.register(fetcher_impl)
 
     graph = resolve(
-        top_manifest, deps_dir=tmp_path / "_deps", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        top_manifest, deps_dir=tmp_path / "_deps",
+        fetcher=registry,
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
 
@@ -482,8 +476,8 @@ deps {
     registry.register(fetcher_impl)
 
     graph = resolve(
-        top_manifest, deps_dir=tmp_path / "_deps", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        top_manifest, deps_dir=tmp_path / "_deps",
+        fetcher=registry,
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     names = {d.name for d in graph.deps}
@@ -553,8 +547,8 @@ deps {
 
     # Should not raise — unknown flag silently ignored
     graph = resolve(
-        top_manifest, deps_dir=tmp_path / "_deps", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        top_manifest, deps_dir=tmp_path / "_deps",
+        fetcher=registry,
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     names = {d.name for d in graph.deps}

@@ -66,7 +66,6 @@ def test_resolve_single_url_dep_no_transitive(tmp_path):
     graph = resolve(
         manifest,
         deps_dir=tmp_path / "_deps",
-        registry={},
         fetcher=reg,
     )
     assert isinstance(graph, ResolvedGraph)
@@ -96,7 +95,7 @@ def test_resolve_url_dep_with_transitive_url(tmp_path):
     )
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=reg,
+        fetcher=reg,
     )
     names = [d.name for d in graph.deps]
     assert "foo" in names
@@ -126,7 +125,7 @@ def test_resolve_dedup_same_url_ref(tmp_path):
         kind="library",
     )
     graph = resolve(manifest, deps_dir=tmp_path / "_deps",
-                    registry={}, fetcher=reg)
+        fetcher=reg)
     shared_entries = [d for d in graph.deps if d.name == "shared"]
     assert len(shared_entries) == 1
     shared_calls = [c for c in fake.calls if c[0] == "shared"]
@@ -189,12 +188,12 @@ def test_resolve_parallel_produces_byte_identical_lockfile(tmp_path):
     reg_s, _ = fake_registry(fixtures)
     serial = resolve(
         manifest, deps_dir=tmp_path / "s",
-        registry={}, fetcher=reg_s, max_parallel=1,
+        fetcher=reg_s, max_parallel=1,
     )
     reg_p, _ = fake_registry(fixtures)
     parallel = resolve(
         manifest, deps_dir=tmp_path / "p",
-        registry={}, fetcher=reg_p, max_parallel=8,
+        fetcher=reg_p, max_parallel=8,
     )
     assert format_lockfile(from_graph(serial)) == format_lockfile(from_graph(parallel))
 
@@ -223,7 +222,7 @@ def test_resolve_parallel_dedup_no_double_fetch(tmp_path):
     )
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=reg, max_parallel=4,
+        fetcher=reg, max_parallel=4,
     )
     assert sum(1 for d in graph.deps if d.name == "shared") == 1
     assert sum(1 for c in fake.calls if c[0] == "shared") == 1
@@ -264,7 +263,7 @@ def test_resolve_parallel_failure_surfaces(tmp_path):
     with pytest.raises(FetchError) as exc:
         resolve(
             manifest, deps_dir=tmp_path / "_deps",
-            registry={}, fetcher=reg, max_parallel=4,
+        fetcher=reg, max_parallel=4,
         )
     assert "bad" in str(exc.value)
 
@@ -287,7 +286,7 @@ def test_resolve_parallel_wide_graph(tmp_path):
     reg, _ = fake_registry(fixtures)
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=reg, max_parallel=4,
+        fetcher=reg, max_parallel=4,
     )
     resolved_names = {d.name for d in graph.deps}
     assert resolved_names == set(names)
@@ -310,12 +309,12 @@ def test_resolve_parallel_produces_same_graph_as_serial(tmp_path):
     reg_s, _ = fake_registry(fixtures)
     serial = resolve(
         manifest, deps_dir=tmp_path / "serial",
-        registry={}, fetcher=reg_s, max_parallel=1,
+        fetcher=reg_s, max_parallel=1,
     )
     reg_p, _ = fake_registry(fixtures)
     parallel = resolve(
         manifest, deps_dir=tmp_path / "parallel",
-        registry={}, fetcher=reg_p, max_parallel=4,
+        fetcher=reg_p, max_parallel=4,
     )
     def normalize(g):
         return tuple(
@@ -347,7 +346,7 @@ def test_resolve_url_dep_with_override_fetches_override(tmp_path):
     reg, _ = fake_registry(fixtures)
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=reg,
+        fetcher=reg,
     )
     chronos = next(d for d in graph.deps if d.name == "chronos")
     assert chronos.source == "https://my-fork/chronos.git"
@@ -376,7 +375,6 @@ def test_resolve_named_dep_with_override_skips_registry(tmp_path):
     reg, _ = fake_registry(fixtures)
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={},
         fetcher=reg,
         list_tags=fake_list_tags,
     )
@@ -409,7 +407,7 @@ def test_resolve_transitive_url_dep_override(tmp_path):
     reg, _ = fake_registry(fixtures)
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=reg,
+        fetcher=reg,
     )
     chronos = next(d for d in graph.deps if d.name == "chronos")
     assert chronos.source == "https://my-fork/chronos.git"
@@ -436,7 +434,6 @@ def test_resolve_local_dep_uses_default_local_fetcher(tmp_path):
     graph = resolve(
         manifest,
         deps_dir=project / "_deps",
-        registry={},
     )
 
     assert len(graph.deps) == 1
@@ -494,7 +491,6 @@ def test_resolve_local_dep_with_transitive_url_requires(tmp_path):
     graph = resolve(
         manifest,
         deps_dir=project / "_deps",
-        registry={},
         fetcher=reg,
     )
 
@@ -540,7 +536,6 @@ def test_resolve_tarball_dep_via_default_registry(tmp_path):
     graph = resolve(
         manifest,
         deps_dir=tmp_path / "_deps",
-        registry={},
     )
 
     assert len(graph.deps) == 1
@@ -573,7 +568,7 @@ def test_resolve_topological_order(tmp_path):
         kind="library",
     )
     graph = resolve(manifest, deps_dir=tmp_path / "_deps",
-                    registry={}, fetcher=reg)
+        fetcher=reg)
     names = [d.name for d in graph.deps]
     assert names.index("leaf") < names.index("mid")
     assert names.index("mid") < names.index("app")

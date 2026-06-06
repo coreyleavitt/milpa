@@ -204,9 +204,7 @@ deps {
     graph = resolve(
         manifest,
         deps_dir=tmp_path / "_deps",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     names = {d.name for d in graph.deps}
@@ -242,9 +240,7 @@ deps {
     graph = resolve(
         manifest,
         deps_dir=tmp_path / "_deps",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     names = {d.name for d in graph.deps}

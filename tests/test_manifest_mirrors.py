@@ -135,9 +135,7 @@ def test_resolver_falls_through_to_manifest_mirror_when_primary_url_fails(tmp_pa
     graph = resolve(
         manifest,
         deps_dir=tmp_path / "_deps",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
     )
 
     # Both URLs attempted, in order

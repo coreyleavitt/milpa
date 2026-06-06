@@ -69,7 +69,7 @@ def test_write_workspace_nimcfgs_one_member_no_deps(tmp_path):
     one empty (header-only) nim.cfg at <root>/<member>/nim.cfg."""
     ws = Workspace(root=tmp_path, members=(_member("fresco", tmp_path),))
     graph = resolve_workspace(
-        ws, deps_dir=tmp_path / "_deps", registry={},
+        ws, deps_dir=tmp_path / "_deps",
     )
 
     paths = write_workspace_nimcfgs(ws, graph)
@@ -98,7 +98,7 @@ def test_member_with_url_dep_emits_relative_path_into_deps(tmp_path):
     })
 
     graph = resolve_workspace(
-        ws, deps_dir=tmp_path / "_deps", registry={}, fetcher=reg,
+        ws, deps_dir=tmp_path / "_deps", fetcher=reg,
     )
     write_workspace_nimcfgs(ws, graph)
 
@@ -115,7 +115,7 @@ def test_member_to_member_ref_emits_relative_path_to_sibling(tmp_path):
     ws = Workspace(root=tmp_path, members=(fresco, intonaco))
 
     graph = resolve_workspace(
-        ws, deps_dir=tmp_path / "_deps", registry={},
+        ws, deps_dir=tmp_path / "_deps",
     )
     write_workspace_nimcfgs(ws, graph)
 
@@ -140,7 +140,7 @@ def test_per_member_closure_isolates_dep_visibility(tmp_path):
     })
 
     graph = resolve_workspace(
-        ws, deps_dir=tmp_path / "_deps", registry={}, fetcher=reg,
+        ws, deps_dir=tmp_path / "_deps", fetcher=reg,
     )
     write_workspace_nimcfgs(ws, graph)
 
@@ -174,7 +174,7 @@ def test_deeper_member_paths_emit_deeper_relpaths(tmp_path):
     })
 
     graph = resolve_workspace(
-        ws, deps_dir=tmp_path / "_deps", registry={}, fetcher=reg,
+        ws, deps_dir=tmp_path / "_deps", fetcher=reg,
     )
     write_workspace_nimcfgs(ws, graph)
 
@@ -192,7 +192,7 @@ def test_member_with_src_dir_appears_in_consumer_path(tmp_path):
     ws = Workspace(root=tmp_path, members=(fresco, intonaco))
 
     graph = resolve_workspace(
-        ws, deps_dir=tmp_path / "_deps", registry={},
+        ws, deps_dir=tmp_path / "_deps",
     )
     write_workspace_nimcfgs(ws, graph)
 

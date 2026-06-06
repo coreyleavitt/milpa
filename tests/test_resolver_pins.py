@@ -71,9 +71,7 @@ def test_resolve_passes_expected_identity_when_prior_lockfile_matches(tmp_path):
         resolve(
             manifest,
             deps_dir=tmp_path / "_deps",
-            registry={},
             fetcher=registry,
-            list_tags=lambda url: [],
             prior_lockfile=prior,
         )
 
@@ -103,9 +101,7 @@ def test_resolve_no_prior_lockfile_accepts_any_identity(tmp_path):
     graph = resolve(
         manifest,
         deps_dir=tmp_path / "_deps",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
         # No prior_lockfile
     )
 
@@ -147,9 +143,7 @@ def test_resolve_drops_pin_when_manifest_ref_changed(tmp_path):
     graph = resolve(
         manifest,
         deps_dir=tmp_path / "_deps",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
         prior_lockfile=prior,
     )
     assert graph.deps[0].name == "x"
@@ -201,9 +195,7 @@ def test_resolve_pin_applies_when_manifest_added_mirror_but_primary_unchanged(tm
         resolve(
             manifest,
             deps_dir=tmp_path / "_deps",
-            registry={},
             fetcher=registry,
-            list_tags=lambda url: [],
             prior_lockfile=prior,
         )
     assert "identity" in str(exc.value).lower()

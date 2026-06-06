@@ -77,7 +77,7 @@ def test_two_url_deps_with_same_content_dedup_to_one_entry(tmp_path):
     )
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=reg,
+        fetcher=reg,
     )
 
     # ONE entry in the graph, not two
@@ -111,7 +111,7 @@ def test_deterministic_canonical_lex_min_under_reverse_declaration(tmp_path):
     )
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=reg,
+        fetcher=reg,
     )
 
     assert len(graph.deps) == 1
@@ -141,7 +141,7 @@ def test_three_url_deps_two_share_content_yields_two_entries(tmp_path):
     )
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=reg,
+        fetcher=reg,
     )
 
     # Exactly 2 entries: a (the canonical for the deduped pair) + b
@@ -191,7 +191,7 @@ def test_tarball_dep_and_url_dep_with_same_content_unify(tmp_path):
     )
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=reg,
+        fetcher=reg,
     )
 
     # Both transports produced the same content; one entry survives
@@ -233,7 +233,7 @@ def test_local_dep_and_url_dep_with_same_content_unify(tmp_path):
     )
     graph = resolve(
         manifest, deps_dir=project / "_deps",
-        registry={}, fetcher=reg,
+        fetcher=reg,
     )
 
     assert len(graph.deps) == 1
@@ -261,7 +261,7 @@ def test_duplicate_deps_directory_is_removed(tmp_path):
         name="test",
     )
     deps_dir = tmp_path / "_deps"
-    resolve(manifest, deps_dir=deps_dir, registry={}, fetcher=reg)
+    resolve(manifest, deps_dir=deps_dir, fetcher=reg)
 
     # Only the canonical's directory survives
     assert (deps_dir / "chronos").exists()
@@ -298,7 +298,7 @@ def test_lockfile_records_single_entry_per_content_hash(tmp_path):
     )
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=reg,
+        fetcher=reg,
     )
     lockfile = from_graph(graph)
 
@@ -371,7 +371,7 @@ def test_duplicate_candidate_transitives_still_propagate(tmp_path):
     )
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=reg,
+        fetcher=reg,
     )
 
     # The graph has one resolved entry (canonical). The root's
@@ -413,7 +413,7 @@ def test_workspace_members_are_exempt_from_content_hash_dedup(tmp_path):
         ),
     )
     graph = resolve_workspace(
-        ws, deps_dir=tmp_path / "_deps", registry={},
+        ws, deps_dir=tmp_path / "_deps",
     )
 
     # BOTH members appear in the graph; identical content does NOT

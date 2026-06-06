@@ -81,7 +81,6 @@ def test_resolve_workspace_single_member_no_deps(tmp_path):
     graph = resolve_workspace(
         ws,
         deps_dir=tmp_path / "_deps",
-        registry={},
     )
 
     assert isinstance(graph, ResolvedGraph)
@@ -124,7 +123,7 @@ def test_resolve_workspace_member_with_url_transitive_dep(tmp_path):
     })
 
     graph = resolve_workspace(
-        ws, deps_dir=tmp_path / "_deps", registry={}, fetcher=reg,
+        ws, deps_dir=tmp_path / "_deps", fetcher=reg,
     )
 
     names = {d.name for d in graph.deps}
@@ -168,7 +167,7 @@ def test_resolve_workspace_member_to_member_reference(tmp_path):
     reg, fake = _fake_registry({})  # no external deps; fetcher must not be invoked
 
     graph = resolve_workspace(
-        ws, deps_dir=tmp_path / "_deps", registry={}, fetcher=reg,
+        ws, deps_dir=tmp_path / "_deps", fetcher=reg,
     )
 
     assert {d.name for d in graph.deps} == {"fresco", "intonaco"}
@@ -213,7 +212,7 @@ def test_resolve_workspace_shared_external_dep_deduped(tmp_path):
     })
 
     graph = resolve_workspace(
-        ws, deps_dir=tmp_path / "_deps", registry={}, fetcher=reg,
+        ws, deps_dir=tmp_path / "_deps", fetcher=reg,
     )
 
     # chronos appears once in graph
@@ -315,7 +314,7 @@ def test_resolve_workspace_named_dep_auto_coerces_to_member(tmp_path):
 
     graph = resolve_workspace(
         ws, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=reg, list_tags=list_tags_should_not_be_called,
+        fetcher=reg, list_tags=list_tags_should_not_be_called,
     )
 
     intonaco = next(d for d in graph.deps if d.name == "intonaco")
@@ -345,7 +344,7 @@ def test_verify_workspace_against_disk_detects_member_drift(tmp_path):
     )
 
     graph = resolve_workspace(
-        ws, deps_dir=tmp_path / "_deps", registry={},
+        ws, deps_dir=tmp_path / "_deps",
     )
     lockfile = from_graph(graph)
 
@@ -390,7 +389,7 @@ def test_lockfile_round_trip_preserves_member_source(tmp_path):
     )
 
     graph = resolve_workspace(
-        ws, deps_dir=tmp_path / "_deps", registry={},
+        ws, deps_dir=tmp_path / "_deps",
     )
     lockfile = from_graph(graph)
     text = format_lockfile(lockfile)
@@ -433,7 +432,7 @@ def test_resolve_workspace_unknown_member_reference_raises(tmp_path):
     )
 
     with pytest.raises(ResolverError) as exc:
-        resolve_workspace(ws, deps_dir=tmp_path / "_deps", registry={})
+        resolve_workspace(ws, deps_dir=tmp_path / "_deps")
     msg = str(exc.value)
     assert "fresco" in msg
     assert "ghost" in msg
@@ -471,7 +470,7 @@ def test_resolve_workspace_handles_cyclic_member_references(tmp_path):
     )
 
     graph = resolve_workspace(
-        ws, deps_dir=tmp_path / "_deps", registry={},
+        ws, deps_dir=tmp_path / "_deps",
     )
 
     assert {d.name for d in graph.deps} == {"fresco", "intonaco"}
@@ -515,7 +514,7 @@ def test_resolve_workspace_applies_override_to_member_url_dep(tmp_path):
     })
 
     graph = resolve_workspace(
-        ws, deps_dir=tmp_path / "_deps", registry={}, fetcher=reg,
+        ws, deps_dir=tmp_path / "_deps", fetcher=reg,
     )
 
     chronos = next(d for d in graph.deps if d.name == "chronos")
@@ -567,7 +566,7 @@ def test_resolve_workspace_override_applies_uniformly_to_all_members(tmp_path):
     })
 
     graph = resolve_workspace(
-        ws, deps_dir=tmp_path / "_deps", registry={}, fetcher=reg,
+        ws, deps_dir=tmp_path / "_deps", fetcher=reg,
     )
 
     # chronos appears exactly once (deduped via the override URL)
@@ -618,7 +617,7 @@ def test_resolve_workspace_override_on_named_dep_bypasses_registry(tmp_path):
 
     graph = resolve_workspace(
         ws, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=reg, list_tags=fail_if_called,
+        fetcher=reg, list_tags=fail_if_called,
     )
 
     chronos = next(d for d in graph.deps if d.name == "chronos")
@@ -669,7 +668,7 @@ def test_resolve_workspace_override_applies_to_transitive_named_dep(tmp_path):
 
     graph = resolve_workspace(
         ws, deps_dir=tmp_path / "_deps",
-        registry={}, fetcher=reg, list_tags=fail_if_called,
+        fetcher=reg, list_tags=fail_if_called,
     )
 
     chronos = next(d for d in graph.deps if d.name == "chronos")
@@ -708,7 +707,7 @@ def test_resolve_workspace_override_name_collision_with_member_raises(tmp_path):
     )
 
     with pytest.raises(ResolverError) as exc:
-        resolve_workspace(ws, deps_dir=tmp_path / "_deps", registry={})
+        resolve_workspace(ws, deps_dir=tmp_path / "_deps")
     msg = str(exc.value).lower()
     assert "intonaco" in msg
     assert "override" in msg

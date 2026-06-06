@@ -257,7 +257,7 @@ def resolve(
     manifest: Manifest,
     *,
     deps_dir: Path,
-    registry: dict[str, RegistryEntry],
+    registry: dict[str, RegistryEntry] | None = None,
     fetcher: FetcherRegistry = default_registry,
     list_tags: Callable[[str], list[str]] = list_remote_tags,
     max_parallel: int = 8,
@@ -276,6 +276,7 @@ def resolve(
     Only the fetch ORDER varies. Use 1 for serial execution; the
     default 8 is conservative for typical Nim dep graphs.
     """
+    registry = registry or {}
     deps_dir.mkdir(parents=True, exist_ok=True)
     provider = _MaterializedProvider()
 
@@ -394,7 +395,7 @@ def resolve(
                 print(f"fetching {ldep.name} (local)...", file=sys.stderr)
                 fut = ex.submit(
                     _process_local, ldep, project_root, deps_dir, fetcher,
-                    registry, list_tags, None, prior_lockfile,
+                    None, prior_lockfile,
                 )
             elif item[0] == "tarball":
                 tdep: TarballDep = item[1]
@@ -404,7 +405,7 @@ def resolve(
                 print(f"fetching {tdep.name} (tarball)...", file=sys.stderr)
                 fut = ex.submit(
                     _process_tarball, tdep, deps_dir, fetcher,
-                    registry, list_tags, overrides_by_name,
+                    overrides_by_name,
                     prior_lockfile,
                 )
             else:
@@ -427,7 +428,7 @@ def resolve(
                     print(f"fetching {dep.name}...", file=sys.stderr)
                     fut = ex.submit(
                         _process_url, dep, deps_dir, fetcher,
-                        registry, list_tags, overrides_by_name,
+                        overrides_by_name,
                         prior_lockfile,
                     )
                 else:  # named
@@ -496,7 +497,7 @@ def resolve(
                 (new_terms, new_requires, _, sub_items,
                  new_active, new_flag_defines,
                  _self_mirrors) = _extract_from_milpa_kdl(
-                    milpa_kdl_path, "<re-eval>", registry, list_tags,
+                    milpa_kdl_path, "<re-eval>",
                     overrides_by_name,
                     consumer_flag_requests=tuple(all_requests),
                 )
@@ -537,7 +538,7 @@ def resolve_workspace(
     workspace,  # Workspace from milpa.workspace
     *,
     deps_dir: Path,
-    registry: dict[str, RegistryEntry],
+    registry: dict[str, RegistryEntry] | None = None,
     fetcher: FetcherRegistry = default_registry,
     list_tags: Callable[[str], list[str]] = list_remote_tags,
     max_parallel: int = 8,
@@ -561,6 +562,7 @@ def resolve_workspace(
 
     See #25 + W3 (#75) for design rationale.
     """
+    registry = registry or {}
     deps_dir.mkdir(parents=True, exist_ok=True)
     provider = _MaterializedProvider()
 
@@ -666,7 +668,7 @@ def resolve_workspace(
                 print(f"fetching {dep.name}...", file=sys.stderr)
                 fut = ex.submit(
                     _process_url, dep, deps_dir, fetcher,
-                    registry, list_tags, overrides_by_name,
+                    overrides_by_name,
                     prior_lockfile,
                 )
             elif item[0] == "local":
@@ -677,7 +679,7 @@ def resolve_workspace(
                 print(f"fetching {ldep.name} (local)...", file=sys.stderr)
                 fut = ex.submit(
                     _process_local, ldep, project_root, deps_dir, fetcher,
-                    registry, list_tags, overrides_by_name,
+                    overrides_by_name,
                     prior_lockfile,
                 )
             else:  # named
@@ -1031,8 +1033,6 @@ def _process_url(
     dep: UrlDep,
     deps_dir: Path,
     fetcher: FetcherRegistry,
-    registry: dict[str, RegistryEntry],
-    list_tags: Callable[[str], list[str]],
     overrides_by_name: dict | None = None,
     prior_lockfile=None,
 ) -> tuple["_Candidate", list]:
@@ -1071,7 +1071,7 @@ def _process_url(
         (terms, requires_names, src_dir_value, new_items,
          active_flags, flag_defines,
          self_mirrors) = _extract_from_milpa_kdl(
-            milpa_kdl_path, dep.name, registry, list_tags,
+            milpa_kdl_path, dep.name,
             overrides_by_name,
             consumer_flag_requests=dep.flag_requests,
         )
@@ -1079,7 +1079,7 @@ def _process_url(
         nimble_path = _find_nimble_file(result.path, dep.name)
         nm = parse_nimble(nimble_path.read_text())
         terms, requires_names, sub_url_deps, sub_named = _build_terms(
-            nm, registry, list_tags, overrides_by_name,
+            nm, overrides_by_name,
         )
         src_dir_value = nm.src_dir or ""
         new_items = []
@@ -1103,8 +1103,6 @@ def _process_url(
 def _extract_from_milpa_kdl(
     path,
     dep_name: str,
-    registry,
-    list_tags,
     overrides_by_name,
     consumer_flag_requests: tuple = (),
 ):
@@ -1223,8 +1221,6 @@ def _process_tarball(
     dep: TarballDep,
     deps_dir: Path,
     fetcher: FetcherRegistry,
-    registry: dict[str, RegistryEntry],
-    list_tags: Callable[[str], list[str]],
     overrides_by_name: dict | None = None,
     prior_lockfile=None,
 ) -> tuple["_Candidate", list]:
@@ -1245,7 +1241,7 @@ def _process_tarball(
     nimble_path = _find_nimble_file(result.path, dep.name)
     nm = parse_nimble(nimble_path.read_text()) if nimble_path.exists() else None
     terms, requires_names, sub_url_deps, sub_named = (
-        _build_terms(nm, registry, list_tags, overrides_by_name)
+        _build_terms(nm, overrides_by_name)
         if nm else ([], [], [], [])
     )
     candidate = _Candidate(
@@ -1268,8 +1264,6 @@ def _process_local(
     project_root: Path,
     deps_dir: Path,
     fetcher: FetcherRegistry,
-    registry: dict[str, RegistryEntry],
-    list_tags: Callable[[str], list[str]],
     overrides_by_name: dict | None = None,
     prior_lockfile=None,    # never enforced for local (cas_admissible=False)
 ) -> tuple["_Candidate", list]:
@@ -1290,7 +1284,7 @@ def _process_local(
     nimble_path = _find_nimble_file(result.path, dep.name)
     nm = parse_nimble(nimble_path.read_text()) if nimble_path.exists() else None
     terms, requires_names, sub_url_deps, sub_named = (
-        _build_terms(nm, registry, list_tags, overrides_by_name)
+        _build_terms(nm, overrides_by_name)
         if nm else ([], [], [], [])
     )
     candidate = _Candidate(
@@ -1336,7 +1330,7 @@ def _process_named(
     nimble_path = _find_nimble_file(result.path, name)
     nm = parse_nimble(nimble_path.read_text()) if nimble_path.exists() else None
     terms, requires_names, sub_url_deps, sub_named = (
-        _build_terms(nm, registry, list_tags, overrides_by_name)
+        _build_terms(nm, overrides_by_name)
         if nm else ([], [], [], [])
     )
     parts = r.version.split(".")
@@ -1359,8 +1353,6 @@ def _process_named(
 
 def _build_terms(
     nm,
-    registry: dict[str, RegistryEntry],
-    list_tags: Callable[[str], list[str]],
     overrides_by_name: dict | None = None,
 ) -> tuple[list[Term], list[str], list[UrlDep], list[NamedRequirement]]:
     """Convert a NimbleManifest's requires into solver Terms + the queues

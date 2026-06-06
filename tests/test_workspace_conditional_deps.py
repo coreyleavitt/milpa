@@ -62,9 +62,7 @@ def test_workspace_member_conditional_dep_filtered_by_profile(tmp_path):
     graph = resolve_workspace(
         ws,
         deps_dir=tmp_path / "_deps",
-        registry={},
         fetcher=registry,
-        list_tags=lambda url: [],
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
 
@@ -113,8 +111,8 @@ deps {
 
     # On linux: winapi excluded, cross included
     g_lin = resolve_workspace(
-        ws, deps_dir=tmp_path / "lin_deps", registry={},
-        fetcher=registry, list_tags=lambda url: [],
+        ws, deps_dir=tmp_path / "lin_deps",
+        fetcher=registry,
         profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
     )
     names = {d.name for d in g_lin.deps}
