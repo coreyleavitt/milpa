@@ -101,3 +101,30 @@ def test_oci_fetcher_raises_on_oras_failure(tmp_path: Path):
     )
     with pytest.raises(FetchError, match="oras pull failed"):
         fetcher.fetch("x", prov, dest=tmp_path / "out")
+
+
+# ---------------------------------------------------------------------------
+# S2 (milpa#97) — the default registry must include OciFetcher so
+# provenance-agnostic resolution can route an OciProvenance. Dispatch is
+# first-match can_handle on disjoint isinstance types.
+# ---------------------------------------------------------------------------
+
+
+def test_default_registry_routes_oci_to_oci_fetcher():
+    from milpa.fetchers import default_registry
+    from milpa.fetchers.oci import OciFetcher, OciProvenance
+
+    selected = default_registry._select(
+        OciProvenance(registry="ghcr.io", repository="x/y", digest="sha256:abc")
+    )
+    assert isinstance(selected, OciFetcher)
+
+
+def test_default_registry_routes_git_to_git_fetcher():
+    from milpa.fetchers import default_registry
+    from milpa.fetchers.git import GitFetcher, GitProvenance
+
+    selected = default_registry._select(
+        GitProvenance(url="https://example.com/x", ref="main")
+    )
+    assert isinstance(selected, GitFetcher)

@@ -17,6 +17,7 @@ See docs/rfc-pluggable-fetchers.md for the design.
 from ..cas import default_store
 from .git import GitFetcher, GitProvenance, GitReceipt
 from .local import LocalFetcher, LocalProvenance, LocalReceipt
+from .oci import OciFetcher, OciProvenance, OciReceipt
 from .tarball import TarballFetcher, TarballProvenance, TarballReceipt
 from .types import (
     FetcherRegistry,
@@ -32,6 +33,9 @@ default_registry = FetcherRegistry(store=default_store())
 default_registry.register(GitFetcher())
 default_registry.register(LocalFetcher())
 default_registry.register(TarballFetcher())
+# OCI last for readable specificity order; _select is first-match on
+# disjoint isinstance types, so registration order is correctness-neutral.
+default_registry.register(OciFetcher())
 
 
 __all__ = [
@@ -45,6 +49,9 @@ __all__ = [
     "LocalFetcher",
     "LocalProvenance",
     "LocalReceipt",
+    "OciFetcher",
+    "OciProvenance",
+    "OciReceipt",
     "Provenance",
     "ProvenanceReceipt",
     "TarballFetcher",

@@ -1,6 +1,6 @@
 # resolver→tianguis swap (milpa#97) — handoff
 
-- **Stage:** 3 /tdd grind — **S0+S1 DONE (green, 589 passed)**; next = **S2** (register `OciFetcher`)
+- **Stage:** 3 /tdd grind — **S0+S1+S2 DONE (green, 591 passed)**; next = **S2.5** (`GitFetcher` arbitrary-commit_sha checkout)
 - **Resume:** `/loop implement the next unimplemented RFC slice from docs/rfc-resolver-tianguis-swap.md with /tdd, following the standing rules; report one progress line per slice; stop when every slice is implemented`
 - **RFC:** `docs/rfc-resolver-tianguis-swap.md`   •   **Deferrals filed:** #98 (strategy), #99 (add-by-name), #100 (constraint accumulation), #101 (fetch observability), #102 (fetch_any mismatch warn)
 
@@ -14,7 +14,7 @@
 > call sites.
 - [x] S0 — dead-param cleanup (dropped unused `registry`/`list_tags` from `_build_terms`/`_process_url`/`_process_tarball`/`_process_local`/`_extract_from_milpa_kdl` + their submit closures; `_process_named` kept live; `resolve`/`resolve_workspace` `registry` made optional; stripped empty `registry={}`/`list_tags=lambda url: []` kwargs from 15 test files — apply_manifest_change_with_resolve calls retain `list_tags` (S4/S5 scope)). Pure refactor, **578 passed** (== baseline).
 - [x] S1 — `tianguis_client` provenance-agnostic. `GitProvenance.commit_sha` added (additive); `_parse_version_node` dispatches git/oci (unknown kind skipped); `Version.provenances: tuple[Provenance,...]` pref-ordered + `canonical_provenance`; empty-prov guard `TNG-NO-PROVENANCE`; `schema_version` int check (kdl lib parses bare ints as float — handled) `TNG-SCHEMA-UNKNOWN`; `TianguisError(code=,message=)` + `_TNG_CODES` bijection; partition sort; dup-version dedupe+warn; `load_index` timeout=30 + atomic os.replace + `DEFAULT_INDEX_URL`. +11 tests, 589 passed.
-- [ ] S2 — register `OciFetcher`; `_select` routes by kind
+- [x] S2 — registered `OciFetcher()` in default_registry; `_select` routes oci→OciFetcher, git→GitFetcher (disjoint isinstance, first-match). +2 tests, 591 passed.
 - [ ] S2.5 — `GitFetcher` arbitrary-`commit_sha` checkout (clone→`fetch origin <sha>`→checkout, unshallow/full fallback). The former R1, now a fix.
 - [ ] S3 — lockfile `OciProvenanceRecord` **add-only** + `cmd_show`/`frozen.py` OCI branches; keep `RegistryProvenanceRecord` as read-compat alias (NO delete here)
 - [ ] S4 — resolver `_process_named` swap (inject `index:` incl. `apply_manifest_change_with_resolve`; `parse_version` on raw index version; `source`=git url / `oci:` prefix; `_pin_for_named_dep` → `locked.identity == version.content_hash`; hash-parity unit fixture)
