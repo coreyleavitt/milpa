@@ -111,8 +111,10 @@ def test_nimble_with_named_dep_resolves_via_registry(tmp_path):
     ])
 
     fake = FakeFetch({
+        # Write the standard default nimble so make_index's auto-computed
+        # content_hash matches the recomputed identity (H1 fix).
         ("https://example.com/results.git", "v0.5.0"): (
-            "rsha", "rhash", '',  # empty .nimble
+            "rsha", "rhash", 'srcDir = "src"\n',
         ),
     })
 
@@ -140,8 +142,10 @@ def test_nimble_with_mixed_url_and_named_deps(tmp_path):
         ("https://example.com/foo.git", "main"): (
             "fsha", "fhash", 'srcDir = "src"\n',
         ),
+        # Write the standard default nimble so make_index's auto-computed
+        # content_hash matches the recomputed identity (H1 fix).
         ("https://example.com/results.git", "v0.5.0"): (
-            "rsha", "rhash", '',
+            "rsha", "rhash", 'srcDir = "src"\n',
         ),
     })
 

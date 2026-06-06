@@ -8,7 +8,7 @@ tianguis index (milpa#97). Once the candidate space is materialized, it hands a
 output back into a `ResolvedGraph` of `ResolvedDep` records.
 
 Each `ResolvedDep` carries both identity (`content_hash`) and provenance
-(`source`, `ref`, `tag`, `sha`) — see docs/identity-and-provenance.md.
+(typed `provenance` + `source`/`ref`/`sha`) — see docs/identity-and-provenance.md.
 For v0.x, the resolver dedups by `(URL, ref)` for efficiency; content-
 hash-keyed dedup is Phase B work (#32).
 
@@ -25,6 +25,7 @@ import sys
 from .fetchers import FetcherRegistry, default_registry
 from .fetchers.git import GitProvenance, GitReceipt
 from .fetchers.local import LocalProvenance
+from .fetchers.oci import OciProvenance
 from .fetchers.tarball import TarballProvenance
 from .fetchers.types import Provenance
 from .identity import compute_content_hash
@@ -57,7 +58,6 @@ class ResolvedDep:
     name: str
     source: str           # display marker: git URL / "oci:<registry>/<repo>" / "local:" / "member:"
     ref: str | None       # git ref originally requested (branch / tag / sha)
-    tag: str | None       # tag name (registry deps only)
     sha: str | None       # resolved commit SHA
     version: Version
     identity: str | None   # multihash-encoded content hash (#34); was content_hash (#33)
@@ -101,13 +101,17 @@ class _Candidate:
     source: str                # display marker (see ResolvedDep.source)
     ref: str | None
     sha: str | None
-    tag: str | None
     identity: str | None       # multihash-encoded (#34); was content_hash
     src_dir: str
     dep_terms: list[Term]      # for the solver
     requires_names: list[str]  # for ResolvedDep.requires
     # Typed provenance carried onto the candidate (#97 / Option A) — the
-    # authoritative lockfile-reconstruction input. None for root/members.
+    # authoritative lockfile-reconstruction input. None is legitimate ONLY
+    # for: (1) the synthetic __root__ candidate, (2) workspace member
+    # candidates (source prefix "member:"), and (3) local deps (source
+    # prefix "local:") — see _process_local's comment for why local stays
+    # on the string-fallback path. All other fetched deps carry a typed
+    # GitProvenance / OciProvenance / TarballProvenance.
     provenance: Provenance | None = None
     # Feature-flag state on this candidate (#90).
     active_flags: tuple[str, ...] = ()
@@ -167,19 +171,24 @@ class _MaterializedProvider:
     def update_pending(
         self,
         *,
-        source: str,
+        git_url: str,
         ref: str | None,
         dep_terms=None,
         requires_names=None,
         active_flags=None,
         flag_defines=None,
     ) -> bool:
-        """Find a not-yet-finalized candidate by (source, ref) and
+        """Find a not-yet-finalized candidate by (git_url, ref) and
         mutate the provided fields. Used by the #90 fixpoint sweep to
         update a candidate's transitive deps after later consumer
-        flag requests union in. Returns True iff a candidate matched."""
+        flag requests union in. Returns True iff a candidate matched.
+
+        URL-dep-only: the sole caller keys by (dep_url.git, dep_url.ref),
+        and a URL candidate's `source` IS its git URL (see `_process_url`),
+        so matching on `source` here is matching on the git URL — not a
+        general use of the display-oriented `source` field."""
         for c in self._pending:
-            if c.source == source and c.ref == ref:
+            if c.source == git_url and c.ref == ref:
                 if dep_terms is not None:
                     c.dep_terms = list(dep_terms)
                 if requires_names is not None:
@@ -284,6 +293,17 @@ def resolve(
     `index=None` defaults to an empty index — fine for manifests with no
     named deps (URL/local/tarball/member only).
     """
+    if index is None:
+        _overrides = {ov.name for ov in manifest.overrides}
+        unresolvable = [
+            d.name for d in manifest.deps
+            if isinstance(d, NamedDep) and d.name not in _overrides
+        ]
+        if unresolvable:
+            raise ResolverError(
+                f"manifest has named dep(s) {unresolvable} but no tianguis "
+                f"index was provided — pass index= to resolve named deps"
+            )
     index = index if index is not None else Index({})
     deps_dir.mkdir(parents=True, exist_ok=True)
     provider = _MaterializedProvider()
@@ -355,7 +375,7 @@ def resolve(
     # The synthetic root candidate at version (0,0,0):
     root_cand = _Candidate(
         name="__root__", version=(0, 0, 0),
-        source="root", ref=None, sha=None, tag=None, identity=None,
+        source="root", ref=None, sha=None, identity=None,
         src_dir="", dep_terms=root_terms,
         requires_names=root_requires,
     )
@@ -568,6 +588,22 @@ def resolve_workspace(
 
     See #25 + W3 (#75) for design rationale.
     """
+    if index is None:
+        _ws_overrides = {ov.name for ov in workspace.overrides}
+        _member_names = {m.name for m in workspace.members}
+        _unresolvable = [
+            d.name
+            for member in workspace.members
+            for d in member.manifest.deps
+            if isinstance(d, NamedDep)
+            and d.name not in _ws_overrides
+            and d.name not in _member_names
+        ]
+        if _unresolvable:
+            raise ResolverError(
+                f"workspace has named dep(s) {_unresolvable} but no tianguis "
+                f"index was provided — pass index= to resolve named deps"
+            )
     index = index if index is not None else Index({})
     deps_dir.mkdir(parents=True, exist_ok=True)
     provider = _MaterializedProvider()
@@ -626,7 +662,7 @@ def resolve_workspace(
             name=member.name,
             version=_URL_DEP_VERSION,
             source=f"member:{member.name}",
-            ref=None, sha=None, tag=None,
+            ref=None, sha=None,
             identity=compute_content_hash(member.directory),
             src_dir=_extract_src_dir(member.manifest),
             dep_terms=terms,
@@ -641,7 +677,7 @@ def resolve_workspace(
 
     root_cand = _Candidate(
         name="__root__", version=(0, 0, 0),
-        source="root", ref=None, sha=None, tag=None, identity=None,
+        source="root", ref=None, sha=None, identity=None,
         src_dir="", dep_terms=root_terms,
         requires_names=root_requires,
     )
@@ -836,7 +872,7 @@ def _update_candidate_requires(
     transitive-dep state to reflect post-fixpoint flag activation
     (#90)."""
     provider.update_pending(
-        source=key[0], ref=key[1],
+        git_url=key[0], ref=key[1],
         dep_terms=new_terms, requires_names=new_requires,
         active_flags=new_active, flag_defines=new_flag_defines,
     )
@@ -1014,7 +1050,6 @@ def _named_source_display(name: str, prov: Provenance) -> str:
     provenance. Display / member-marker only — never parsed back; the
     lockfile reconstructs the record by dispatching on the typed
     `provenance` object (milpa#97 / Option A)."""
-    from .fetchers.oci import OciProvenance
     if isinstance(prov, GitProvenance):
         return prov.url
     if isinstance(prov, OciProvenance):
@@ -1082,7 +1117,7 @@ def _process_url(
             new_items.append(("named", n.name, n.constraint))
     candidate = _Candidate(
         name=dep.name, version=_URL_DEP_VERSION,
-        source=dep.git, ref=dep.ref, sha=sha, tag=None,
+        source=dep.git, ref=dep.ref, sha=sha,
         identity=result.identity,
         src_dir=src_dir_value,
         dep_terms=terms, requires_names=requires_names,
@@ -1111,7 +1146,7 @@ def _extract_from_milpa_kdl(
     final active set = UNION across consumers.
 
     Unknown flag requests are silently ignored (resolve-time tolerance)."""
-    from .manifest import load_manifest, UrlDep as ManUrlDep, NamedDep as ManNamedDep
+    from .manifest import load_manifest
     manifest = load_manifest(path)
 
     declared_flags = {fd.name for fd in manifest.flags}
@@ -1161,19 +1196,18 @@ def _extract_from_milpa_kdl(
     sub_requires: list[str] = []
     sub_items: list = []
     for d in kept_deps:
-        if isinstance(d, ManUrlDep):
+        if isinstance(d, UrlDep):
             sub_terms.append(
                 Term.require(d.name, VersionSet.eq(_URL_DEP_VERSION))
             )
             sub_requires.append(d.name)
             sub_items.append(("url", d))
-        elif isinstance(d, ManNamedDep):
+        elif isinstance(d, NamedDep):
             if d.name == "nim":
                 continue
-            from .solver import VersionSet as _VS
             constraint_set = (
-                _VS.from_constraint(d.constraint)
-                if d.constraint else _VS.all()
+                VersionSet.from_constraint(d.constraint)
+                if d.constraint else VersionSet.all()
             )
             sub_terms.append(
                 Term.require(d.name, constraint_set)
@@ -1240,7 +1274,7 @@ def _process_tarball(
     )
     candidate = _Candidate(
         name=dep.name, version=_URL_DEP_VERSION,
-        source=f"tarball:{dep.url}", ref=None, sha=None, tag=None,
+        source=f"tarball:{dep.url}", ref=None, sha=None,
         identity=result.identity,
         src_dir=(nm.src_dir or "") if nm else "",
         dep_terms=terms, requires_names=requires_names,
@@ -1288,7 +1322,7 @@ def _process_local(
     )
     candidate = _Candidate(
         name=dep.name, version=_URL_DEP_VERSION,
-        source=f"local:{dep.path}", ref=None, sha=None, tag=None,
+        source=f"local:{dep.path}", ref=None, sha=None,
         identity=result.identity,
         src_dir=(nm.src_dir or "") if nm else "",
         dep_terms=terms, requires_names=requires_names,
@@ -1326,25 +1360,33 @@ def _process_named(
     transitive deps still come from parsing the fetched tree's manifest.
     The fetch + git clone happen here so they parallelize."""
     version = tianguis_client.resolve_named(index, name, constraint)
+    # resolve_named only returns entries where parse_version succeeds
+    # (unparseable versions are skipped in tianguis_client with `continue`;
+    # a package whose ALL versions are unparseable raises TNG-NO-SATISFYING-VERSION
+    # there). So ver is guaranteed non-None here — no defensive branch needed.
     ver = parse_version(version.version)
-    if ver is None:
-        raise tianguis_client.TianguisError(
-            code="TNG-BAD-VERSION",
-            message=(
-                f"index version {version.version!r} for package {name!r} "
-                f"is not a parseable X.Y.Z version"
-            ),
-        )
+    assert ver is not None, (
+        f"invariant violation: resolve_named returned unparseable version "
+        f"{version.version!r} for {name!r}"
+    )
     # Identity gate (Invariant 1): fetched bytes must hash to the index's
     # content_hash. For named deps the index *is* the trust root and pins
     # identity immutably, so the index content_hash subsumes the old
     # prior-lockfile pin (`_pin_for_url/tarball_dep` remain for the
-    # transports the index doesn't vouch for). `prior_lockfile` is
-    # therefore unused on this path — re-fetch re-resolves index-maxver
-    # and re-verifies against the index, exactly as the registry path
-    # floated to maxver before; `milpa update` is unchanged. An empty
-    # content_hash (synthetic/legacy index entry) disables the gate.
-    expected_identity = version.content_hash or None
+    # transports the index doesn't vouch for). An empty content_hash is a
+    # hard error (H1) — a named dep without an identity pin cannot be
+    # verified and must NOT silently install unverified bytes.
+    if not version.content_hash:
+        raise tianguis_client.TianguisError(
+            code="TNG-NO-IDENTITY",
+            message=(
+                f"index entry for {name!r} version {version.version!r} "
+                f"carries no content_hash — cannot verify fetched bytes. "
+                f"This index entry is malformed; file a bug at "
+                f"coreyleavitt/tianguis."
+            ),
+        )
+    expected_identity = version.content_hash
     result = fetcher.fetch_any(
         name,
         list(version.provenances),
@@ -1367,7 +1409,7 @@ def _process_named(
         name=name, version=ver,
         source=_named_source_display(name, chosen),
         ref=getattr(chosen, "ref", None),
-        sha=sha, tag=None,
+        sha=sha,
         identity=result.identity,
         src_dir=(nm.src_dir or "") if nm else "",
         dep_terms=terms, requires_names=requires_names,
@@ -1446,10 +1488,25 @@ def _name_from_url(url: str) -> str:
     """Derive a package name from a git URL.
 
     `https://github.com/x/foo.git` → `foo`
+
+    Raises ValueError if the derived name is a path-traversal vector
+    (H3: a crafted URL tail like `..` must not produce a name that
+    escapes `_deps/`). Uses the same pattern as `tianguis_client`'s
+    `_validate_safe_name` — single source of truth for what is unsafe.
     """
     tail = url.rstrip("/").rsplit("/", 1)[-1]
     if tail.endswith(".git"):
         tail = tail[:-4]
+    # Validate: reject `..`, `/`, `\\`, absolute paths. Delegates to the
+    # public predicate in tianguis_client — single source of truth for the
+    # safe-name rule. ValueError is intentional here (the name came from a
+    # URL in a .nimble, not from the tianguis index, so a TNG- code would
+    # be semantically wrong).
+    if not tianguis_client.is_safe_name(tail):
+        raise ValueError(
+            f"unsafe package name {tail!r} derived from URL {url!r} — "
+            f"path traversal via URL tail is not permitted"
+        )
     return tail
 
 
@@ -1502,14 +1559,14 @@ def _build_graph(
         c = name_to_cand[name]
         out.append(ResolvedDep(
             name=c.name, source=c.source,
-            ref=c.ref, tag=c.tag, sha=c.sha,
+            ref=c.ref, sha=c.sha,
             version=c.version,
             identity=c.identity,
             src_dir=c.src_dir,
             requires=tuple(c.requires_names),
-            provenance=getattr(c, "provenance", None),
-            active_flags=getattr(c, "active_flags", ()),
-            flag_defines=getattr(c, "flag_defines", ()),
-            self_mirrors=getattr(c, "self_mirrors", ()),
+            provenance=c.provenance,
+            active_flags=c.active_flags,
+            flag_defines=c.flag_defines,
+            self_mirrors=c.self_mirrors,
         ))
     return ResolvedGraph(deps=tuple(out))

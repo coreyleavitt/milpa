@@ -27,13 +27,13 @@ _VALID_HASH = "sha256:" + "f" * 64
 
 
 def _dep(name, *, source="https://example.com/x.git", ref="main",
-         tag=None, sha="abc123", identity=None,
+         sha="abc123", identity=None,
          version=(0, 0, 1), src_dir="src", requires=()):
     """Helper for ResolvedDep construction (flat-field shape)."""
     if identity is None:
         identity = _VALID_HASH
     return ResolvedDep(
-        name=name, source=source, ref=ref, tag=tag, sha=sha,
+        name=name, source=source, ref=ref, sha=sha,
         version=version, identity=identity,
         src_dir=src_dir, requires=requires,
     )

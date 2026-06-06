@@ -90,7 +90,6 @@ def test_resolve_workspace_single_member_no_deps(tmp_path):
     assert d.source == "member:fresco"
     assert d.ref is None
     assert d.sha is None
-    assert d.tag is None
     assert d.identity is not None
     assert d.identity.startswith("sha256:")
     assert len(d.identity) == len("sha256:") + 64
@@ -265,9 +264,11 @@ def test_resolve_workspace_constraint_conflict_surfaces_clear_error(tmp_path):
         {"name": "results", "version": "0.5.0",
          "url": "https://example.com/results.git", "ref": "v0.5.0"},
     ])
+    # Write the standard default nimble so make_index's auto-computed
+    # content_hash matches the recomputed identity (H1 fix).
     reg, _ = _fake_registry({
-        ("https://example.com/results.git", "v0.3.0"): ("s3", ""),
-        ("https://example.com/results.git", "v0.5.0"): ("s5", ""),
+        ("https://example.com/results.git", "v0.3.0"): ("s3", 'srcDir = "src"\n'),
+        ("https://example.com/results.git", "v0.5.0"): ("s5", 'srcDir = "src"\n'),
     })
 
     with pytest.raises(SolverError):

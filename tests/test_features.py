@@ -297,13 +297,13 @@ def test_nim_cfg_emits_define_for_each_active_flag_using_convention():
 
     graph = ResolvedGraph(deps=(
         ResolvedDep(
-            name="mylib", source="https://x", ref="main", tag=None,
+            name="mylib", source="https://x", ref="main",
             sha="abc", version=(0, 0, 1), identity=None,
             src_dir="", requires=(),
             active_flags=("json", "postgres"),
         ),
         ResolvedDep(
-            name="other", source="https://x", ref="main", tag=None,
+            name="other", source="https://x", ref="main",
             sha="def", version=(0, 0, 1), identity=None,
             src_dir="", requires=(),
             # No active flags — no -d: lines
@@ -324,7 +324,7 @@ def test_nim_cfg_emits_explicit_defines_when_provided(tmp_path):
 
     graph = ResolvedGraph(deps=(
         ResolvedDep(
-            name="mylib", source="https://x", ref="main", tag=None,
+            name="mylib", source="https://x", ref="main",
             sha="abc", version=(0, 0, 1), identity=None,
             src_dir="", requires=(),
             active_flags=("postgres", "json"),

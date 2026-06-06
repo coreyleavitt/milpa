@@ -405,7 +405,7 @@ package "results" {
             kind "git"
             url (url)"https://github.com/arnetheduck/nim-results"
             ref "HEAD"
-            commit_sha "f3a2b1c9"
+            commit_sha "f3a2b1c9d8e7061524384950617283940a1b2c3d"
         }
     }
 }
@@ -414,7 +414,7 @@ package "results" {
     p = resolve_named(idx, "results", None).provenances[0]
     assert isinstance(p, GitProvenance)
     assert p.url == "https://github.com/arnetheduck/nim-results"
-    assert p.commit_sha == "f3a2b1c9"
+    assert p.commit_sha == "f3a2b1c9d8e7061524384950617283940a1b2c3d"
 
 
 def test_oci_provenance_still_parses_in_mixed_index():
@@ -569,3 +569,72 @@ def test_default_index_url_is_defined():
     from milpa.tianguis_client import DEFAULT_INDEX_URL
 
     assert DEFAULT_INDEX_URL.endswith("/index.kdl")
+
+
+# ---------------------------------------------------------------------------
+# L11 — duplicate-version warn and missing schema_version tolerated
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_version_does_not_crash_and_keeps_first_and_warns():
+    """L11: a package declaring the same version string twice must (a) not
+    crash, (b) keep the first occurrence (len == 1), (c) emit a warning."""
+    import warnings
+    from milpa.tianguis_client import parse_index
+
+    text = """\
+package "foo" {
+    version "1.0.0" {
+        content_hash "sha256:first"
+        provenance {
+            kind "git"
+            url "https://example.com/foo"
+            ref "main"
+        }
+    }
+    version "1.0.0" {
+        content_hash "sha256:second"
+        provenance {
+            kind "git"
+            url "https://example.com/foo-mirror"
+            ref "main"
+        }
+    }
+}
+"""
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        idx = parse_index(text)
+
+    versions = idx.lookup("foo")
+    # (b) exactly one entry — first occurrence kept
+    assert len(versions) == 1, (
+        "duplicate version must be dropped, not accumulated"
+    )
+    # (a) no crash — reached here
+    # (c) at least one warning mentioning the duplicate
+    assert any("1.0.0" in str(warning.message) for warning in w), (
+        "duplicate version must emit a warning naming the version"
+    )
+
+
+def test_parse_index_without_schema_version_does_not_raise():
+    """L11: an index with no schema_version node must parse without error
+    (forward/back-compat — both older and draft indexes may omit it)."""
+    from milpa.tianguis_client import parse_index
+
+    # Deliberately omit schema_version — must not raise.
+    idx = parse_index("""\
+package "foo" {
+    version "1.0.0" {
+        content_hash "sha256:abc"
+        provenance {
+            kind "git"
+            url "https://example.com/foo"
+            ref "main"
+        }
+    }
+}
+"""
+    )
+    assert idx.lookup("foo")[0].version == "1.0.0"

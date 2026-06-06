@@ -8,10 +8,10 @@ from milpa.nimcfg import format_nimcfg, write_nimcfg
 from milpa.resolver import ResolvedDep, ResolvedGraph
 
 
-def _dep(name, src_dir="", source="src", ref=None, sha=None, tag=None,
+def _dep(name, src_dir="", source="src", ref=None, sha=None,
          version=(0, 0, 1), identity=None, requires=()):
     return ResolvedDep(
-        name=name, source=source, ref=ref, tag=tag, sha=sha, version=version,
+        name=name, source=source, ref=ref, sha=sha, version=version,
         identity=identity, src_dir=src_dir, requires=requires,
     )
 

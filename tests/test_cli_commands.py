@@ -221,8 +221,9 @@ def test_cmd_show_named_dep_shows_git_provenance(tmp_path, capsys):
         ("https://example.com/foo.git", "main"): (
             "fsha", "fhash", 'srcDir = "src"\nrequires "bar"\n',
         ),
+        # bar writes the standard default nimble so make_index's auto-hash matches
         ("https://example.com/bar.git", "v0.1.0"): (
-            "bsha", "bhash", '',
+            "bsha", "bhash", 'srcDir = "src"\n',
         ),
     })
     cmd_fetch(
@@ -640,9 +641,10 @@ def test_cmd_fetch_loads_index_and_resolves_named_transitive(tmp_path):
             "abc", "hash_foo", 'requires "bar >= 0.1.0"\n',
         ),
         # bar is a named dep — the index points it at example.com/bar.git
-        # at ref v0.1.0
+        # at ref v0.1.0. Writes the standard default nimble so make_index's
+        # auto-computed content_hash matches the recomputed identity.
         ("https://example.com/bar.git", "v0.1.0"): (
-            "def", "hash_bar", '',
+            "def", "hash_bar", 'srcDir = "src"\n',
         ),
     })
 

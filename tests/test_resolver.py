@@ -155,8 +155,10 @@ def test_resolve_named_dep_picks_maxver_from_index(tmp_path):
          "url": "https://example.com/foo.git", "ref": "v1.0.0"},
     ])
 
+    # Write the standard default nimble so make_index's auto-computed
+    # content_hash matches the recomputed identity (H1 fix).
     reg, _ = fake_registry({
-        ("https://example.com/foo.git", "v1.0.0"): ("sha100", ""),
+        ("https://example.com/foo.git", "v1.0.0"): ("sha100", 'srcDir = "src"\n'),
     })
 
     graph = resolve(
@@ -321,7 +323,7 @@ def test_resolve_parallel_produces_same_graph_as_serial(tmp_path):
     )
     def normalize(g):
         return tuple(
-            (d.name, d.source, d.ref, d.tag, d.sha, d.version,
+            (d.name, d.source, d.ref, d.sha, d.version,
              d.identity, d.src_dir, d.requires)
             for d in g.deps
         )
@@ -445,7 +447,6 @@ def test_resolve_local_dep_uses_default_local_fetcher(tmp_path):
     assert d.source == "local:../intonaco"      # as-declared preserved
     assert d.ref is None
     assert d.sha is None
-    assert d.tag is None
     assert d.identity is not None
     assert d.identity.startswith("sha256:")
     assert len(d.identity) == len("sha256:") + 64
@@ -547,7 +548,6 @@ def test_resolve_tarball_dep_via_default_registry(tmp_path):
     assert d.source == f"tarball:file://{archive}"
     assert d.ref is None
     assert d.sha is None
-    assert d.tag is None
     assert d.identity is not None
     assert d.identity.startswith("sha256:")
     assert len(d.identity) == len("sha256:") + 64

@@ -111,6 +111,20 @@ def _ensure_commit_present(name: str, p: GitProvenance, dest: Path) -> None:
         capture_output=True, text=True,
     )
     _run_git(name, p, ["git", "-C", str(dest), "fetch", "-q", "origin"])
+    # L10: re-check after the full history fetch. If the commit is still
+    # absent, raise a clear error rather than letting `git checkout` fail
+    # with an opaque "fatal: unable to read tree" message.
+    recheck = subprocess.run(
+        ["git", "-C", str(dest), "cat-file", "-e",
+         f"{p.commit_sha}^{{commit}}"],
+        capture_output=True, text=True,
+    )
+    if recheck.returncode != 0:
+        raise FetchError(
+            f"commit {p.commit_sha!r} not found in {p.url!r} even after "
+            f"full history fetch — the index pin may be stale or the commit "
+            f"was force-pushed away"
+        )
 
 
 def _run_git(name: str, p: GitProvenance, argv: list[str]) -> None:

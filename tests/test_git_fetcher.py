@@ -302,6 +302,48 @@ def test_content_hash_reflects_executable_bit_end_to_end(tmp_path, registry):
     assert r1.identity != r2.identity
 
 
+# ---------------------------------------------------------------------------
+# L11 — _ensure_commit_present fallback branches
+# ---------------------------------------------------------------------------
+# The targeted-fetch (allowReachableSHA1InWant) branch is network-only —
+# it requires a server that accepts bare-SHA fetch requests (GitHub/GitLab
+# feature) which cannot be reproduced with a plain local file:// repo. That
+# branch is noted here as network-only.
+#
+# The unshallow-then-full-fetch fallback (and the L10 re-check that fires
+# when the commit is STILL absent) CAN be exercised with a local fixture:
+# a SHA that was never committed to the repo triggers the same code path
+# as a stale index pin.
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_commit_present_raises_when_sha_never_existed(tmp_path):
+    """L11: when the requested commit_sha does not exist in the repo's
+    history at all, _ensure_commit_present exhausts every fallback branch
+    (cat-file miss → targeted-fetch ignored for file:// → unshallow →
+    full fetch → re-check) and raises a clear FetchError naming the SHA."""
+    src = make_repo(tmp_path / "src", {"a.txt": "hello\n"})
+    deps_dir = tmp_path / "deps"
+    deps_dir.mkdir()
+
+    phantom_sha = "cafebabe" * 5  # 40-hex, never committed
+
+    fetcher = GitFetcher()
+    with pytest.raises(FetchError) as exc:
+        fetcher.fetch(
+            "r",
+            GitProvenance(
+                url=f"file://{src}",
+                ref="main",
+                commit_sha=phantom_sha,
+            ),
+            dest=deps_dir / "r",
+        )
+    msg = str(exc.value)
+    assert phantom_sha in msg, "error must name the missing commit SHA"
+    assert "not found" in msg.lower(), "error must say the commit was not found"
+
+
 def test_content_hash_excludes_dot_git(tmp_path, registry):
     """Different commits (extra empty commit history) but identical
     source tree → same content_hash. .git is provenance, not content."""
