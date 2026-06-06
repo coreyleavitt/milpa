@@ -195,8 +195,10 @@ def test_each_provenance_kind_round_trips():
 
 
 def test_from_graph_builds_correct_provenance_variant():
-    """from_graph dispatches on ResolvedDep.source prefix to choose
-    the right ProvenanceRecord variant."""
+    """from_graph dispatches on a None-provenance ResolvedDep's source
+    prefix to choose the right ProvenanceRecord variant. (milpa#97: named
+    deps now carry a typed provenance and never emit a `registry:` source
+    string, so that arm is gone — git is the bare-source catch-all.)"""
     from milpa.lockfile import (
         from_graph,
     )
@@ -214,7 +216,6 @@ def test_from_graph_builds_correct_provenance_variant():
         _rd("t", "tarball:https://x/t.tar.gz"),
         _rd("l", "local:../l"),
         _rd("m", "member:m"),
-        _rd("r", "registry:r", tag="v1", sha="r1"),
     ))
     lockfile = from_graph(graph)
     kinds = {d.name: type(d.provenances[0]).__name__ for d in lockfile.deps}
@@ -223,7 +224,6 @@ def test_from_graph_builds_correct_provenance_variant():
         "t": "TarballProvenanceRecord",
         "l": "LocalProvenanceRecord",
         "m": "MemberProvenanceRecord",
-        "r": "RegistryProvenanceRecord",
     }
 
 

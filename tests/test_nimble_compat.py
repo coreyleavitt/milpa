@@ -13,6 +13,7 @@ import pytest
 
 from milpa.cli import cmd_fetch
 from milpa.fetchers import FetcherRegistry
+from milpa.tianguis_client import Index
 from milpa.fetchers.git import GitProvenance, GitReceipt
 
 
@@ -40,7 +41,7 @@ def _as_registry(fake: "FakeFetch") -> FetcherRegistry:
     return reg
 
 
-_empty_registry = lambda *, cache_path: {}
+_empty_index = lambda *, cache_dir: Index({})
 
 
 def test_cmd_fetch_reads_nimble_when_no_milpa_kdl(tmp_path):
@@ -53,7 +54,7 @@ def test_cmd_fetch_reads_nimble_when_no_milpa_kdl(tmp_path):
             "abc123", "hash_foo", 'srcDir = "src"\n',
         ),
     })
-    rc = cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry)
+    rc = cmd_fetch(tmp_path, fetcher=_as_registry(fake), index_loader=_empty_index)
     assert rc == 0
     assert (tmp_path / "milpa.lock").exists()
     assert (tmp_path / "nim.cfg").exists()
@@ -63,7 +64,7 @@ def test_cmd_fetch_reads_nimble_when_no_milpa_kdl(tmp_path):
 
 def test_no_manifest_at_all_errors_mentioning_both_filenames(tmp_path, capsys):
     # tmp_path is empty
-    rc = cmd_fetch(tmp_path, registry_loader=_empty_registry)
+    rc = cmd_fetch(tmp_path, index_loader=_empty_index)
     assert rc == 1
     err = capsys.readouterr().err
     assert "milpa.kdl" in err
@@ -87,7 +88,7 @@ def test_milpa_kdl_wins_when_both_present(tmp_path):
         ),
         # bar deliberately absent — if .nimble were read, the fetch would KeyError
     })
-    rc = cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry)
+    rc = cmd_fetch(tmp_path, fetcher=_as_registry(fake), index_loader=_empty_index)
     assert rc == 0
     # Only foo got fetched, not bar
     assert [c[0] for c in fake.calls] == ["foo"]
@@ -97,52 +98,44 @@ def test_milpa_kdl_wins_when_both_present(tmp_path):
 
 def test_nimble_with_named_dep_resolves_via_registry(tmp_path):
     """A .nimble with a named (registry-resolved) dep — milpa fetches it
-    via the registry path. Test injects a fake registry + tag lister."""
-    from milpa.registry import RegistryEntry
+    via the index path. Test injects a synthetic tianguis index."""
+    from tests.indexkdl import make_index
 
     (tmp_path / "myproject.nimble").write_text(
         'requires "results >= 0.1.0"\n'
     )
 
-    def fake_loader(*, cache_path):
-        return {
-            "results": RegistryEntry(
-                name="results",
-                url="https://example.com/results.git",
-                method="git",
-            ),
-        }
+    index = make_index([
+        {"name": "results", "version": "0.5.0",
+         "url": "https://example.com/results.git", "ref": "v0.5.0"},
+    ])
 
     fake = FakeFetch({
         ("https://example.com/results.git", "v0.5.0"): (
             "rsha", "rhash", '',  # empty .nimble
         ),
     })
-    fake_list_tags = lambda url: ["v0.5.0"]
 
     rc = cmd_fetch(
         tmp_path,
         fetcher=_as_registry(fake),
-        list_tags=fake_list_tags,
-        registry_loader=fake_loader,
+        index_loader=lambda *, cache_dir: index,
     )
     assert rc == 0
     assert "results" in (tmp_path / "nim.cfg").read_text()
 
 
 def test_nimble_with_mixed_url_and_named_deps(tmp_path):
-    from milpa.registry import RegistryEntry
+    from tests.indexkdl import make_index
 
     (tmp_path / "myproject.nimble").write_text(
         'requires "https://example.com/foo.git#main", "results"\n'
     )
 
-    def fake_loader(*, cache_path):
-        return {
-            "results": RegistryEntry(
-                name="results", url="https://example.com/results.git", method="git",
-            ),
-        }
+    index = make_index([
+        {"name": "results", "version": "0.5.0",
+         "url": "https://example.com/results.git", "ref": "v0.5.0"},
+    ])
     fake = FakeFetch({
         ("https://example.com/foo.git", "main"): (
             "fsha", "fhash", 'srcDir = "src"\n',
@@ -155,8 +148,7 @@ def test_nimble_with_mixed_url_and_named_deps(tmp_path):
     rc = cmd_fetch(
         tmp_path,
         fetcher=_as_registry(fake),
-        list_tags=lambda url: ["v0.5.0"],
-        registry_loader=fake_loader,
+        index_loader=lambda *, cache_dir: index,
     )
     assert rc == 0
     cfg = (tmp_path / "nim.cfg").read_text()
@@ -186,7 +178,7 @@ def test_multiple_nimble_files_resolves_to_project_named_one(tmp_path):
         ),
         # bar deliberately absent — only myproj.nimble should be read
     })
-    rc = cmd_fetch(project, fetcher=_as_registry(fake), registry_loader=_empty_registry)
+    rc = cmd_fetch(project, fetcher=_as_registry(fake), index_loader=_empty_index)
     assert rc == 0
     assert [c[0] for c in fake.calls] == ["foo"]
 
@@ -202,7 +194,7 @@ def test_ambiguous_nimble_files_with_no_match_errors(tmp_path, capsys):
     (project / "beta.nimble").write_text(
         'requires "https://example.com/bar.git#main"\n'
     )
-    rc = cmd_fetch(project, registry_loader=_empty_registry)
+    rc = cmd_fetch(project, index_loader=_empty_index)
     assert rc == 1
     err = capsys.readouterr().err
     assert "multiple" in err.lower()
@@ -220,7 +212,7 @@ def test_malformed_nimble_errors_with_context(tmp_path, capsys):
     project = tmp_path / "myproj"
     project.mkdir()
     (project / "myproj.nimble").mkdir()  # not a regular file
-    rc = cmd_fetch(project, registry_loader=_empty_registry)
+    rc = cmd_fetch(project, index_loader=_empty_index)
     assert rc == 1
     err = capsys.readouterr().err
     assert "myproj.nimble" in err or "manifest" in err.lower()
@@ -239,7 +231,7 @@ def test_nimble_with_nim_compiler_requires_is_skipped(tmp_path):
             "fsha", "fhash", 'srcDir = "src"\n',
         ),
     })
-    rc = cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry)
+    rc = cmd_fetch(tmp_path, fetcher=_as_registry(fake), index_loader=_empty_index)
     assert rc == 0
     # nim should not appear as a dep
     cfg = (tmp_path / "nim.cfg").read_text()

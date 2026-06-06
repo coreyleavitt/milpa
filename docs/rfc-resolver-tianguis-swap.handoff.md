@@ -1,6 +1,6 @@
 # resolver→tianguis swap (milpa#97) — handoff
 
-- **Stage:** 3 /tdd grind — **S0–S3 DONE (green, 598 passed)**; next = **S4** (resolver `_process_named` swap — HARD-depends on S3)
+- **Stage:** 3 /tdd grind — **S0–S5 DONE (green, 604 passed)**; next = **S6** (delete registry.py + grep-clean + doc updates), then **S7** (gated integration)
 - **Resume:** `/loop implement the next unimplemented RFC slice from docs/rfc-resolver-tianguis-swap.md with /tdd, following the standing rules; report one progress line per slice; stop when every slice is implemented`
 - **RFC:** `docs/rfc-resolver-tianguis-swap.md`   •   **Deferrals filed:** #98 (strategy), #99 (add-by-name), #100 (constraint accumulation), #101 (fetch observability), #102 (fetch_any mismatch warn)
 
@@ -17,13 +17,26 @@
 - [x] S2 — registered `OciFetcher()` in default_registry; `_select` routes oci→OciFetcher, git→GitFetcher (disjoint isinstance, first-match). +2 tests, 591 passed.
 - [x] S2.5 — `GitFetcher.fetch` honors `p.commit_sha` (clone → `_ensure_commit_present` cat-file/targeted-fetch/unshallow fallback → checkout exact commit); `None` keeps legacy ref-tip. `make_repo_with_history` helper added. +2 tests, 593 passed.
 - [x] S3 — lockfile `OciProvenanceRecord` add-only: dataclass + union member; `_provenance_from_resolved` OciProvenance type arm; `_format_provenance_fields` + `_parse_provenance_block` `kind "oci"` (write→parse round-trip); `cmd_show` oci branch + legacy-registry `(legacy)` display; `frozen._source_from_provenance` oci branch + RegistryProvenanceRecord → actionable `NotFrozen` (no fabricated URL). RegistryProvenanceRecord kept (read-compat). +4 tests, 598 passed.
-- [ ] S4 — resolver `_process_named` swap (inject `index:` incl. `apply_manifest_change_with_resolve`; `parse_version` on raw index version; `source`=git url / `oci:` prefix; `_pin_for_named_dep` → `locked.identity == version.content_hash`; hash-parity unit fixture)
-- [ ] S5 — CLI `_default_index_loader`; cmd_fetch/lock/update/add/remove + workspace + `manifest_writer` pass `index=`
+- [x] S4+S5 — **MERGED** (per the slice-boundary escalation below; Corey approved). resolver `resolve`/`resolve_workspace`/`_process_named` take `index:` (drop `registry`/`list_tags`); `parse_version` on the raw index version (coded `TNG-BAD-VERSION` on None); typed `provenance` recorded on the candidate, `source`=git url / `oci:<reg>/<repo>` display-only; `fetch_any(version.provenances, expected_identity=version.content_hash)`. **`_pin_for_named_dep` DELETED** (deliberate deviation from RFC §S4 — see note): exploration proved it vacuous (the predicate returns either `version.content_hash` or None, so `pinned or content_hash` ≡ `content_hash`). The index content_hash IS the named-dep identity gate and subsumes the lockfile pin; `_pin_for_url/tarball_dep` stay (transports the index doesn't vouch for). CLI: `IndexLoader` Protocol + `_default_index_loader` + `tianguis_client.default_index_cache_dir()` (global XDG, single source); cmd_fetch/lock/update/add/remove + workspace + `manifest_writer` build an `Index` and pass `index=`. Lockfile dead `registry:` source-string arm removed (named deps carry typed git/oci provenance). New `tests/indexkdl.make_index` (routes through real `parse_index`). New `tests/test_resolver_index.py` (+6: typed-git record, v-prefixed version, unparseable→coded error, R2 hash-parity pass + mismatch reject, TNG-NOT-FOUND). 9 test files migrated to synthetic `Index`. **604 passed.**
 - [ ] S6 — delete `registry.py` + `test_registry.py`; migrate fixtures (synthetic Index via `parse_index(inline_kdl)`) across 7 files incl. `test_integration.py` import; update CLAUDE.md + comparison doc; grep-clean
 - [ ] S7 — gated live integration: transitive tree, git fetch at `commit_sha`, content_hash verify (validates S2.5)
 
 ## Open forks (awaiting Corey)
-- **S4/S5 SLICE-BOUNDARY ESCALATION (open, blocks the grind).** The RFC assumes S4
+- **`_pin_for_named_dep` deletion (deviation from RFC §S4, executed).** RFC §S4 said
+  "rewrite `_pin_for_named_dep` to the identity predicate." Implementing it revealed the
+  function is **vacuous** under the new design: its predicate returns `locked.identity` only
+  when `locked.identity == version.content_hash`, so `expected_identity = pin or content_hash`
+  reduces to `content_hash` in every case. The index content_hash is the immutable named-dep
+  identity gate and fully subsumes the old lockfile pin (which floated to maxver anyway). Per
+  [[feedback_no_workarounds]] + single-source-of-truth, kept dead code is a bug → deleted it
+  and set `expected_identity = version.content_hash or None` directly, with a comment.
+  `_pin_for_url_dep`/`_pin_for_tarball_dep` are untouched (those transports the index doesn't
+  vouch for). Flag for Stage-4 /code-review confirmation. Note: RFC §Design-decision #3
+  ("a lock is a lock") is now only literally true for URL/tarball/local; named deps re-resolve
+  index-maxver each fetch (unchanged from the registry era) and `milpa update` is the advance path.
+- ~~**S4/S5 SLICE-BOUNDARY ESCALATION**~~ RESOLVED — Corey approved merging S4+S5 into one
+  green step; executed (see Slices above). Original note retained below for provenance.
+- **S4/S5 SLICE-BOUNDARY ESCALATION (resolved).** The RFC assumes S4
   (resolver `_process_named` swap) lands green migrating only the 2 RegistryEntry named
   tests, with CLI index-wiring deferred to S5. Exploration shows that's unworkable: the
   moment `_process_named` routes through `index` instead of `registry`/`list_tags`, **every**

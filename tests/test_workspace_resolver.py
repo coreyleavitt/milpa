@@ -230,8 +230,8 @@ def test_resolve_workspace_constraint_conflict_surfaces_clear_error(tmp_path):
     """Two members declare incompatible constraints on the same registry
     dep. Resolution must fail with a clear error — the user should be
     able to identify which members are in conflict."""
-    from milpa.registry import RegistryEntry
     from milpa.solver import SolverError
+    from tests.indexkdl import make_index
 
     fresco_dir = tmp_path / "fresco"
     fresco_dir.mkdir()
@@ -257,13 +257,14 @@ def test_resolve_workspace_constraint_conflict_surfaces_clear_error(tmp_path):
             ),
         ),
     )
-    registry = {
-        "results": RegistryEntry(
-            name="results", url="https://example.com/results.git", method="git",
-        ),
-    }
-    # Both tags exist; the issue is the cross-member constraint conflict.
-    list_tags = lambda url: ["v0.3.0", "v0.5.0"]
+    # Both versions exist in the index; the issue is the cross-member
+    # constraint conflict the solver must reject.
+    index = make_index([
+        {"name": "results", "version": "0.3.0",
+         "url": "https://example.com/results.git", "ref": "v0.3.0"},
+        {"name": "results", "version": "0.5.0",
+         "url": "https://example.com/results.git", "ref": "v0.5.0"},
+    ])
     reg, _ = _fake_registry({
         ("https://example.com/results.git", "v0.3.0"): ("s3", ""),
         ("https://example.com/results.git", "v0.5.0"): ("s5", ""),
@@ -272,7 +273,7 @@ def test_resolve_workspace_constraint_conflict_surfaces_clear_error(tmp_path):
     with pytest.raises(SolverError):
         resolve_workspace(
             ws, deps_dir=tmp_path / "_deps",
-            registry=registry, fetcher=reg, list_tags=list_tags,
+            index=index, fetcher=reg,
         )
 
 
@@ -306,15 +307,13 @@ def test_resolve_workspace_named_dep_auto_coerces_to_member(tmp_path):
             ),
         ),
     )
-    # NO registry entry, NO fetcher fixture for intonaco. If the
-    # resolver tried to resolve via registry, list_tags would fail.
-    def list_tags_should_not_be_called(url):
-        pytest.fail("list_tags should not be called — intonaco should auto-coerce")
+    # NO index entry, NO fetcher fixture for intonaco. If the resolver
+    # tried to resolve via the index, it would raise TNG-NOT-FOUND.
     reg, fake = _fake_registry({})
 
     graph = resolve_workspace(
         ws, deps_dir=tmp_path / "_deps",
-        fetcher=reg, list_tags=list_tags_should_not_be_called,
+        fetcher=reg,
     )
 
     intonaco = next(d for d in graph.deps if d.name == "intonaco")
@@ -609,15 +608,13 @@ def test_resolve_workspace_override_on_named_dep_bypasses_registry(tmp_path):
             ),
         ),
     )
-    def fail_if_called(url):
-        pytest.fail("list_tags should not be called — override bypasses registry")
     reg, _ = _fake_registry({
         ("https://my-fork/chronos.git", "my-fix"): ("fork-sha", ''),
     })
 
     graph = resolve_workspace(
         ws, deps_dir=tmp_path / "_deps",
-        fetcher=reg, list_tags=fail_if_called,
+        fetcher=reg,
     )
 
     chronos = next(d for d in graph.deps if d.name == "chronos")
@@ -663,12 +660,9 @@ def test_resolve_workspace_override_applies_to_transitive_named_dep(tmp_path):
         ("https://my-fork/chronos.git", "my-fix"): ("fork-sha", ''),
     })
 
-    def fail_if_called(url):
-        pytest.fail("list_tags should not be called — chronos is overridden")
-
     graph = resolve_workspace(
         ws, deps_dir=tmp_path / "_deps",
-        fetcher=reg, list_tags=fail_if_called,
+        fetcher=reg,
     )
 
     chronos = next(d for d in graph.deps if d.name == "chronos")

@@ -11,6 +11,8 @@ import pytest
 from milpa.cli import cmd_clean, cmd_fetch, cmd_lock, cmd_show, cmd_verify
 from milpa.fetchers import FetcherRegistry
 from milpa.fetchers.git import GitProvenance, GitReceipt
+from milpa.tianguis_client import Index
+from tests.indexkdl import make_index
 
 
 @dataclass
@@ -52,10 +54,10 @@ def _write_minimal_manifest(project_dir: Path) -> None:
     )
 
 
-# Default no-op registry loader for tests that don't care about it.
+# Default no-op index loader for tests that don't care about it.
 # Without this, cmd_fetch's default loader hits the real network to
-# fetch packages.json on each test run.
-_empty_registry_loader = lambda *, cache_path: {}
+# fetch the tianguis index on each test run.
+_empty_index_loader = lambda *, cache_dir: Index({})
 
 
 def test_cmd_fetch_produces_lockfile_and_nimcfg(tmp_path):
@@ -65,7 +67,7 @@ def test_cmd_fetch_produces_lockfile_and_nimcfg(tmp_path):
             "abc123", "hash_foo", 'srcDir = "src"\n',
         ),
     })
-    rc = cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry_loader)
+    rc = cmd_fetch(tmp_path, fetcher=_as_registry(fake), index_loader=_empty_index_loader)
     assert rc == 0
     assert (tmp_path / "milpa.lock").exists()
     assert (tmp_path / "nim.cfg").exists()
@@ -99,7 +101,7 @@ def test_cmd_lock_writes_lockfile_but_not_nimcfg(tmp_path):
             "abc", "hash_foo", 'srcDir = "src"\n',
         ),
     })
-    rc = cmd_lock(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry_loader)
+    rc = cmd_lock(tmp_path, fetcher=_as_registry(fake), index_loader=_empty_index_loader)
     assert rc == 0
     assert (tmp_path / "milpa.lock").exists()
     assert not (tmp_path / "nim.cfg").exists()
@@ -112,7 +114,7 @@ def test_cmd_show_prints_dep_names_from_existing_lockfile(tmp_path, capsys):
             "abc", "hash_foo", 'srcDir = "src"\n',
         ),
     })
-    cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry_loader)
+    cmd_fetch(tmp_path, fetcher=_as_registry(fake), index_loader=_empty_index_loader)
     capsys.readouterr()  # drain fetch's output
 
     rc = cmd_show(tmp_path)
@@ -130,7 +132,7 @@ def test_cmd_show_labels_identity_and_provenance(tmp_path, capsys):
             "abc12345dead", "hash_foo_full_content", 'srcDir = "src"\n',
         ),
     })
-    cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry_loader)
+    cmd_fetch(tmp_path, fetcher=_as_registry(fake), index_loader=_empty_index_loader)
     capsys.readouterr()
 
     rc = cmd_show(tmp_path)
@@ -158,7 +160,7 @@ def test_cmd_show_truncates_hashes_for_readability(tmp_path, capsys):
             long_sha, "ignored", 'srcDir = "src"\n',
         ),
     })
-    cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry_loader)
+    cmd_fetch(tmp_path, fetcher=_as_registry(fake), index_loader=_empty_index_loader)
     # Read the actual content_hash milpa computed from the bytes.
     # Multihash form (#34) — `sha256:` + 64-char digest.
     locked = load_lockfile(tmp_path / "milpa.lock")
@@ -191,7 +193,7 @@ def test_cmd_show_requires_line_present_when_dep_has_requires(tmp_path, capsys):
             "bsha", "bhash", 'srcDir = "src"\n',
         ),
     })
-    cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry_loader)
+    cmd_fetch(tmp_path, fetcher=_as_registry(fake), index_loader=_empty_index_loader)
     capsys.readouterr()
     cmd_show(tmp_path)
     out = capsys.readouterr().out
@@ -200,10 +202,10 @@ def test_cmd_show_requires_line_present_when_dep_has_requires(tmp_path, capsys):
     assert "requires" in out
 
 
-def test_cmd_show_registry_dep_shows_registry_provenance(tmp_path, capsys):
-    """Registry-resolved deps' provenance reads `registry:<name>`."""
-    from milpa.registry import RegistryEntry
-
+def test_cmd_show_named_dep_shows_git_provenance(tmp_path, capsys):
+    """A named transitive dep resolved through the tianguis index now
+    records a GIT provenance (milpa#97) — `milpa show` prints its git URL
+    and ref, not a `registry:` marker."""
     (tmp_path / "milpa.kdl").write_text(
         'name "test"\n'
         'deps {\n'
@@ -211,12 +213,10 @@ def test_cmd_show_registry_dep_shows_registry_provenance(tmp_path, capsys):
         '}\n'
     )
 
-    def fake_loader(*, cache_path):
-        return {
-            "bar": RegistryEntry(
-                name="bar", url="https://example.com/bar.git", method="git",
-            ),
-        }
+    index = make_index([
+        {"name": "bar", "version": "0.1.0",
+         "url": "https://example.com/bar.git", "ref": "v0.1.0"},
+    ])
     fake = FakeFetch({
         ("https://example.com/foo.git", "main"): (
             "fsha", "fhash", 'srcDir = "src"\nrequires "bar"\n',
@@ -227,16 +227,12 @@ def test_cmd_show_registry_dep_shows_registry_provenance(tmp_path, capsys):
     })
     cmd_fetch(
         tmp_path, fetcher=_as_registry(fake),
-        list_tags=lambda url: ["v0.1.0"],
-        registry_loader=fake_loader,
+        index_loader=lambda *, cache_dir: index,
     )
     capsys.readouterr()
     cmd_show(tmp_path)
     out = capsys.readouterr().out
-    # milpa#97: registry provenance is now legacy read-compat — show marks
-    # it `registry (legacy) <name>` so a stale lock is legible; the tag
-    # still appears after `@`.
-    assert "registry (legacy) bar" in out
+    assert "git https://example.com/bar.git" in out
     assert "v0.1.0" in out
 
 
@@ -265,7 +261,7 @@ def test_cmd_clean_removes_deps_and_nimcfg_keeps_lockfile(tmp_path):
             "abc", "hash_foo", 'srcDir = "src"\n',
         ),
     })
-    cmd_fetch(tmp_path, fetcher=_as_registry(fake), registry_loader=_empty_registry_loader)
+    cmd_fetch(tmp_path, fetcher=_as_registry(fake), index_loader=_empty_index_loader)
     # Sanity: all three artifacts present
     assert (tmp_path / "_deps").exists()
     assert (tmp_path / "nim.cfg").exists()
@@ -298,7 +294,7 @@ def test_cmd_verify_clean_tree_exits_zero(tmp_path):
     _write_minimal_manifest(tmp_path)
 
     cmd_fetch(tmp_path, fetcher=_verify_test_registry(sha="abc123"),
-              registry_loader=_empty_registry_loader)
+              index_loader=_empty_index_loader)
 
     rc = cmd_verify(tmp_path)
     assert rc == 0
@@ -310,7 +306,7 @@ def test_cmd_verify_detects_tampered_file(tmp_path, capsys):
     _write_minimal_manifest(tmp_path)
 
     cmd_fetch(tmp_path, fetcher=_verify_test_registry(),
-              registry_loader=_empty_registry_loader)
+              index_loader=_empty_index_loader)
     capsys.readouterr()
 
     # Tamper: append to the .nimble file
@@ -331,7 +327,7 @@ def test_cmd_verify_detects_missing_dep_directory(tmp_path, capsys):
     _write_minimal_manifest(tmp_path)
 
     cmd_fetch(tmp_path, fetcher=_verify_test_registry(),
-              registry_loader=_empty_registry_loader)
+              index_loader=_empty_index_loader)
     capsys.readouterr()
 
     shutil.rmtree(tmp_path / "_deps" / "foo")
@@ -350,7 +346,7 @@ def test_cmd_verify_detects_extra_dep_directory(tmp_path, capsys):
     _write_minimal_manifest(tmp_path)
 
     cmd_fetch(tmp_path, fetcher=_verify_test_registry(),
-              registry_loader=_empty_registry_loader)
+              index_loader=_empty_index_loader)
     capsys.readouterr()
 
     # Plant a rogue dep dir
@@ -371,7 +367,7 @@ def test_cmd_verify_ignores_dotfiles_in_deps_dir(tmp_path):
     _write_minimal_manifest(tmp_path)
 
     cmd_fetch(tmp_path, fetcher=_verify_test_registry(),
-              registry_loader=_empty_registry_loader)
+              index_loader=_empty_index_loader)
 
     # Plant a dotfile (the registry cache uses this pattern)
     (tmp_path / "_deps" / ".packages_official.json").write_text("{}")
@@ -405,7 +401,7 @@ def test_cmd_verify_detects_in_place_edit_to_local_dep(tmp_path, capsys):
         '}\n'
     )
 
-    rc = cmd_fetch(project, registry_loader=_empty_registry_loader)
+    rc = cmd_fetch(project, index_loader=_empty_index_loader)
     assert rc == 0
     capsys.readouterr()
 
@@ -444,7 +440,7 @@ def test_cmd_verify_warns_when_local_source_has_drifted(tmp_path, capsys):
         '}\n'
     )
 
-    cmd_fetch(project, registry_loader=_empty_registry_loader)
+    cmd_fetch(project, index_loader=_empty_index_loader)
     capsys.readouterr()
 
     # Edit SOURCE (not dest). Dest snapshot still matches the lockfile.
@@ -475,7 +471,7 @@ def test_cmd_verify_does_not_warn_when_local_source_matches_snapshot(tmp_path, c
         '}\n'
     )
 
-    cmd_fetch(project, registry_loader=_empty_registry_loader)
+    cmd_fetch(project, index_loader=_empty_index_loader)
     capsys.readouterr()
 
     rc = cmd_verify(project)
@@ -502,7 +498,7 @@ def test_cmd_fetch_detects_workspace_root_and_runs_workspace_pipeline(tmp_path):
     )
     (fresco_dir / "fresco.nim").write_text("# fresco\n")
 
-    rc = cmd_fetch(tmp_path, registry_loader=_empty_registry_loader)
+    rc = cmd_fetch(tmp_path, index_loader=_empty_index_loader)
     assert rc == 0
     # Shared lockfile at workspace root
     assert (tmp_path / "milpa.lock").exists()
@@ -528,7 +524,7 @@ def test_cmd_fetch_from_member_subdir_walks_up_to_workspace_root(tmp_path):
     )
 
     # Invoke cmd_fetch FROM the member dir
-    rc = cmd_fetch(fresco_dir, registry_loader=_empty_registry_loader)
+    rc = cmd_fetch(fresco_dir, index_loader=_empty_index_loader)
     assert rc == 0
     # Shared lockfile is at the WORKSPACE root, not the member dir
     assert (tmp_path / "milpa.lock").exists()
@@ -552,7 +548,7 @@ def test_cmd_verify_workspace_branch_detects_member_drift(tmp_path, capsys):
     )
     (fresco_dir / "fresco.nim").write_text("# original\n")
 
-    rc = cmd_fetch(tmp_path, registry_loader=_empty_registry_loader)
+    rc = cmd_fetch(tmp_path, index_loader=_empty_index_loader)
     assert rc == 0
     capsys.readouterr()
 
@@ -581,7 +577,7 @@ def test_cmd_clean_workspace_removes_deps_and_member_nimcfgs(tmp_path):
         d.mkdir()
         (d / "milpa.kdl").write_text(f'name "{m}"\nkind "library"\n')
 
-    rc = cmd_fetch(tmp_path, registry_loader=_empty_registry_loader)
+    rc = cmd_fetch(tmp_path, index_loader=_empty_index_loader)
     assert rc == 0
     assert (tmp_path / "_deps").exists()
     assert (tmp_path / "fresco" / "nim.cfg").exists()
@@ -615,20 +611,21 @@ def test_cmd_verify_no_deps_dir_returns_1(tmp_path, capsys):
     assert "_deps" in err or "deps" in err.lower()
 
 
-def test_cmd_fetch_loads_registry_and_resolves_named_transitive(tmp_path):
-    """The CLI must load the registry so that named transitive deps
-    (chronos's `requires "results"`, etc.) actually resolve."""
-    from milpa.registry import RegistryEntry
+def test_cmd_fetch_loads_index_and_resolves_named_transitive(tmp_path):
+    """The CLI must load the tianguis index so that named transitive deps
+    (chronos's `requires "results"`, etc.) actually resolve (milpa#97)."""
+    from milpa.tianguis_client import default_index_cache_dir
 
     loader_calls: list = []
 
-    def fake_loader(*, cache_path):
-        loader_calls.append(cache_path)
-        return {
-            "bar": RegistryEntry(
-                name="bar", url="https://example.com/bar.git", method="git",
-            ),
-        }
+    index = make_index([
+        {"name": "bar", "version": "0.1.0",
+         "url": "https://example.com/bar.git", "ref": "v0.1.0"},
+    ])
+
+    def fake_loader(*, cache_dir):
+        loader_calls.append(cache_dir)
+        return index
 
     (tmp_path / "milpa.kdl").write_text(
         'name "test"\n'
@@ -642,37 +639,34 @@ def test_cmd_fetch_loads_registry_and_resolves_named_transitive(tmp_path):
         ("https://example.com/foo.git", "main"): (
             "abc", "hash_foo", 'requires "bar >= 0.1.0"\n',
         ),
-        # bar is a named dep — registry says it's at example.com/bar.git;
-        # we serve it at tag v0.1.0
+        # bar is a named dep — the index points it at example.com/bar.git
+        # at ref v0.1.0
         ("https://example.com/bar.git", "v0.1.0"): (
             "def", "hash_bar", '',
         ),
     })
-    fake_list_tags = lambda url: ["v0.1.0"]
 
     rc = cmd_fetch(
         tmp_path,
         fetcher=_as_registry(fake_fetch),
-        list_tags=fake_list_tags,
-        registry_loader=fake_loader,
+        index_loader=fake_loader,
     )
     assert rc == 0
-    assert loader_calls == [tmp_path / "_deps" / ".packages_official.json"]
-    # bar appears in the lockfile (proves registry was used)
+    # The index loader was consulted at the global cache location.
+    assert loader_calls == [default_index_cache_dir()]
+    # bar appears in the lockfile (proves the index was used)
     lockfile_text = (tmp_path / "milpa.lock").read_text()
     assert "bar" in lockfile_text
 
 
-def test_cmd_lock_also_loads_registry(tmp_path):
+def test_cmd_lock_also_loads_index(tmp_path):
     """cmd_lock has the same need as cmd_fetch — named transitives only
-    resolve if the registry is loaded."""
-    from milpa.registry import RegistryEntry
-
+    resolve if the index is loaded."""
     loader_calls: list = []
 
-    def fake_loader(*, cache_path):
-        loader_calls.append(cache_path)
-        return {}
+    def fake_loader(*, cache_dir):
+        loader_calls.append(cache_dir)
+        return Index({})
 
     _write_minimal_manifest(tmp_path)
     fake = FakeFetch({
@@ -681,6 +675,6 @@ def test_cmd_lock_also_loads_registry(tmp_path):
         ),
     })
 
-    rc = cmd_lock(tmp_path, fetcher=_as_registry(fake), registry_loader=fake_loader)
+    rc = cmd_lock(tmp_path, fetcher=_as_registry(fake), index_loader=fake_loader)
     assert rc == 0
     assert len(loader_calls) == 1

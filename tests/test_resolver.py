@@ -132,41 +132,44 @@ def test_resolve_dedup_same_url_ref(tmp_path):
     assert len(shared_calls) == 1
 
 
-def test_resolve_minver_strategy_threads_through_to_solver(tmp_path):
-    """Strategy passes from resolve() to the solver. Use a named dep
-    with multiple registry versions and verify MinVer picks the floor."""
-    from milpa.registry import RegistryEntry
+def test_resolve_named_dep_picks_maxver_from_index(tmp_path):
+    """A named dep resolves through the tianguis index, which is
+    maxver-only (milpa#97; strategy selection over the index is deferred
+    to #98). With three satisfying index versions, the highest (1.0.0) is
+    fetched and becomes the single candidate — even under MINVER, which
+    no longer reaches into the index's version set."""
+    from milpa.manifest import NamedDep
     from milpa.solver import Strategy
+    from tests.indexkdl import make_index
 
     manifest = Manifest(
-        deps=(
-            __import__("milpa.manifest", fromlist=["NamedDep"]).NamedDep(
-                name="foo", constraint=">= 0.4.0",
-            ),
-        ),
+        deps=(NamedDep(name="foo", constraint=">= 0.4.0"),),
         kind="library",
     )
-    registry = {
-        "foo": RegistryEntry(
-            name="foo", url="https://example.com/foo.git", method="git",
-        ),
-    }
-    list_tags = lambda url: ["v0.4.0", "v0.5.0", "v1.0.0"]
+    index = make_index([
+        {"name": "foo", "version": "0.4.0",
+         "url": "https://example.com/foo.git", "ref": "v0.4.0"},
+        {"name": "foo", "version": "0.5.0",
+         "url": "https://example.com/foo.git", "ref": "v0.5.0"},
+        {"name": "foo", "version": "1.0.0",
+         "url": "https://example.com/foo.git", "ref": "v1.0.0"},
+    ])
 
     reg, _ = fake_registry({
-        ("https://example.com/foo.git", "v0.4.0"): ("sha040", ""),
+        ("https://example.com/foo.git", "v1.0.0"): ("sha100", ""),
     })
 
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
-        registry=registry,
+        index=index,
         fetcher=reg,
-        list_tags=list_tags,
         strategy=Strategy.MINVER,
     )
     foo_dep = next(d for d in graph.deps if d.name == "foo")
-    assert foo_dep.tag == "v0.4.0"
-    assert foo_dep.version == (0, 4, 0)
+    assert foo_dep.version == (1, 0, 0)
+    # Named deps now record a git provenance (the index's), not a tag.
+    assert foo_dep.source == "https://example.com/foo.git"
+    assert foo_dep.ref == "v1.0.0"
 
 
 def test_resolve_parallel_produces_byte_identical_lockfile(tmp_path):
@@ -353,10 +356,13 @@ def test_resolve_url_dep_with_override_fetches_override(tmp_path):
     assert chronos.ref == "my-fix"
 
 
-def test_resolve_named_dep_with_override_skips_registry(tmp_path):
-    """A NamedDep matching an override bypasses the registry entirely
-    and fetches the override's URL+ref directly."""
+def test_resolve_named_dep_with_override_skips_index(tmp_path):
+    """A NamedDep matching an override bypasses the tianguis index
+    entirely and fetches the override's URL+ref directly. The index is
+    deliberately empty — if the override path consulted it, resolution
+    would raise TNG-NOT-FOUND."""
     from milpa.manifest import NamedDep, Override
+    from tests.indexkdl import make_index
     fixtures = {
         ("https://my-fork/results.git", "patched"): ("ovr-sha", ""),
     }
@@ -369,14 +375,11 @@ def test_resolve_named_dep_with_override_skips_registry(tmp_path):
             ref="patched",
         ),),
     )
-    fake_list_tags = lambda url: pytest.fail(
-        "list_tags should not be called when override matches"
-    )
     reg, _ = fake_registry(fixtures)
     graph = resolve(
         manifest, deps_dir=tmp_path / "_deps",
         fetcher=reg,
-        list_tags=fake_list_tags,
+        index=make_index([]),   # empty — must not be consulted
     )
     results_dep = next(d for d in graph.deps if d.name == "results")
     assert results_dep.source == "https://my-fork/results.git"

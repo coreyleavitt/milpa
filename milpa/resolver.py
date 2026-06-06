@@ -3,7 +3,7 @@
 The resolver eagerly walks the manifest's URL deps, fetches each into
 `_deps/<name>/`, parses its `.nimble` for transitive requires, recurses
 on URL transitive deps and resolves named transitive deps via the
-registry. Once the candidate space is materialized, it hands a
+tianguis index (milpa#97). Once the candidate space is materialized, it hands a
 `PackageProvider` to the solver and maps the solver's `{name: version}`
 output back into a `ResolvedGraph` of `ResolvedDep` records.
 
@@ -16,7 +16,6 @@ Tests inject a fake fetcher so the integration runs without network or
 git operations.
 """
 
-from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,18 +32,15 @@ from .manifest import (
     LocalDep, Manifest, MemberDep, NamedDep, Override, TarballDep, UrlDep,
 )
 from .nimble_parse import NamedRequirement, UrlRequirement, parse_nimble
-from .registry import (
-    RegistryEntry,
-    ResolvedRegistryDep,
-    list_remote_tags,
-    resolve_named,
-)
+from . import tianguis_client
+from .tianguis_client import Index
 from .solver import (
     PackageProvider,
     Strategy,
     Term,
     Version,
     VersionSet,
+    parse_version,
     solve,
 )
 
@@ -59,7 +55,7 @@ class ResolverError(Exception):
 @dataclass(frozen=True)
 class ResolvedDep:
     name: str
-    source: str           # URL or "registry:<name>"
+    source: str           # display marker: git URL / "oci:<registry>/<repo>" / "local:" / "member:"
     ref: str | None       # git ref originally requested (branch / tag / sha)
     tag: str | None       # tag name (registry deps only)
     sha: str | None       # resolved commit SHA
@@ -102,7 +98,7 @@ class _Candidate:
     """
     name: str
     version: Version
-    source: str                # URL or "registry:<name>"
+    source: str                # display marker (see ResolvedDep.source)
     ref: str | None
     sha: str | None
     tag: str | None
@@ -266,9 +262,8 @@ def resolve(
     manifest: Manifest,
     *,
     deps_dir: Path,
-    registry: dict[str, RegistryEntry] | None = None,
+    index: Index | None = None,
     fetcher: FetcherRegistry = default_registry,
-    list_tags: Callable[[str], list[str]] = list_remote_tags,
     max_parallel: int = 8,
     strategy: Strategy = Strategy.MAXVER,
     prior_lockfile=None,    # Lockfile | None — pins fetched identities per-dep (#82)
@@ -284,8 +279,12 @@ def resolve(
     graph, lockfile, and nim.cfg are byte-identical for any value.
     Only the fetch ORDER varies. Use 1 for serial execution; the
     default 8 is conservative for typical Nim dep graphs.
+
+    Named deps resolve through the injected tianguis `index` (milpa#97);
+    `index=None` defaults to an empty index — fine for manifests with no
+    named deps (URL/local/tarball/member only).
     """
-    registry = registry or {}
+    index = index if index is not None else Index({})
     deps_dir.mkdir(parents=True, exist_ok=True)
     provider = _MaterializedProvider()
 
@@ -451,8 +450,7 @@ def resolve(
                     print(f"fetching {name}...", file=sys.stderr)
                     fut = ex.submit(
                         _process_named, name, constraint, deps_dir, fetcher,
-                        registry, list_tags, strategy, overrides_by_name,
-                        prior_lockfile,
+                        index, overrides_by_name,
                     )
             in_flight[fut] = item
 
@@ -547,9 +545,8 @@ def resolve_workspace(
     workspace,  # Workspace from milpa.workspace
     *,
     deps_dir: Path,
-    registry: dict[str, RegistryEntry] | None = None,
+    index: Index | None = None,
     fetcher: FetcherRegistry = default_registry,
-    list_tags: Callable[[str], list[str]] = list_remote_tags,
     max_parallel: int = 8,
     strategy: Strategy = Strategy.MAXVER,
     prior_lockfile=None,    # threaded to workers for identity-pin enforcement (#82)
@@ -571,7 +568,7 @@ def resolve_workspace(
 
     See #25 + W3 (#75) for design rationale.
     """
-    registry = registry or {}
+    index = index if index is not None else Index({})
     deps_dir.mkdir(parents=True, exist_ok=True)
     provider = _MaterializedProvider()
 
@@ -702,8 +699,7 @@ def resolve_workspace(
                 print(f"fetching {name}...", file=sys.stderr)
                 fut = ex.submit(
                     _process_named, name, constraint, deps_dir, fetcher,
-                    registry, list_tags, strategy, overrides_by_name,
-                    prior_lockfile,
+                    index, overrides_by_name,
                 )
             in_flight[fut] = item
 
@@ -1013,29 +1009,17 @@ def _pin_for_tarball_dep(dep: TarballDep, prior_lockfile) -> str | None:
     return None
 
 
-def _pin_for_named_dep(name: str, resolved, prior_lockfile) -> str | None:
-    """Return the locked identity for a NamedDep iff the registry's
-    just-resolved (tag, url) matches the lockfile's recorded
-    RegistryProvenanceRecord (or GitProvenanceRecord for the same tag).
-    When the constraint allows a newer tag than was locked, the pin
-    drops — that's the user's constraint working as intended."""
-    if prior_lockfile is None:
-        return None
-    from .lockfile import GitProvenanceRecord, RegistryProvenanceRecord
-    locked = next(
-        (d for d in prior_lockfile.deps if d.name == name),
-        None,
-    )
-    if locked is None or not locked.identity:
-        return None
-    # The registry-resolved provenance is stored as a Git or Registry
-    # record. Either form must reference the same tag we just resolved.
-    for p in locked.provenances:
-        if isinstance(p, RegistryProvenanceRecord) and p.tag == resolved.tag:
-            return locked.identity
-        if isinstance(p, GitProvenanceRecord) and p.ref == resolved.tag:
-            return locked.identity
-    return None
+def _named_source_display(name: str, prov: Provenance) -> str:
+    """Human-readable `source` marker for a named dep's resolved
+    provenance. Display / member-marker only — never parsed back; the
+    lockfile reconstructs the record by dispatching on the typed
+    `provenance` object (milpa#97 / Option A)."""
+    from .fetchers.oci import OciProvenance
+    if isinstance(prov, GitProvenance):
+        return prov.url
+    if isinstance(prov, OciProvenance):
+        return f"oci:{prov.registry}/{prov.repository}"
+    return name
 
 
 def _process_url(
@@ -1328,22 +1312,42 @@ def _process_named(
     constraint: str | None,
     deps_dir: Path,
     fetcher: FetcherRegistry,
-    registry: dict[str, RegistryEntry],
-    list_tags: Callable[[str], list[str]],
-    strategy: Strategy = Strategy.MAXVER,
+    index: Index,
     overrides_by_name: dict | None = None,
-    prior_lockfile=None,
 ) -> tuple["_Candidate", list]:
-    """Worker function: resolve a named dep through the registry, fetch
-    it, parse its nimble. Network ops (resolve_named's list_remote_tags
-    + fetcher's git clone) both happen here so they can parallelize."""
-    r = resolve_named(name, constraint,
-                      registry=registry, list_tags=list_tags,
-                      strategy=str(strategy))
-    expected_identity = _pin_for_named_dep(name, r, prior_lockfile)
+    """Worker function: resolve a named dep through the tianguis index,
+    fetch it at the index-pinned provenance, parse its nimble for
+    transitives (milpa#97).
+
+    The index authoritatively supplies identity (`content_hash` — the
+    verification gate), provenance (git/oci, dispatched by the
+    FetcherRegistry with no privileged transport), and the version set
+    (replacing the old `list_tags`). It does NOT supply graph edges —
+    transitive deps still come from parsing the fetched tree's manifest.
+    The fetch + git clone happen here so they parallelize."""
+    version = tianguis_client.resolve_named(index, name, constraint)
+    ver = parse_version(version.version)
+    if ver is None:
+        raise tianguis_client.TianguisError(
+            code="TNG-BAD-VERSION",
+            message=(
+                f"index version {version.version!r} for package {name!r} "
+                f"is not a parseable X.Y.Z version"
+            ),
+        )
+    # Identity gate (Invariant 1): fetched bytes must hash to the index's
+    # content_hash. For named deps the index *is* the trust root and pins
+    # identity immutably, so the index content_hash subsumes the old
+    # prior-lockfile pin (`_pin_for_url/tarball_dep` remain for the
+    # transports the index doesn't vouch for). `prior_lockfile` is
+    # therefore unused on this path — re-fetch re-resolves index-maxver
+    # and re-verifies against the index, exactly as the registry path
+    # floated to maxver before; `milpa update` is unchanged. An empty
+    # content_hash (synthetic/legacy index entry) disables the gate.
+    expected_identity = version.content_hash or None
     result = fetcher.fetch_any(
         name,
-        [GitProvenance(url=r.url, ref=r.tag)],
+        list(version.provenances),
         dest=deps_dir / name,
         expected_identity=expected_identity,
     )
@@ -1354,15 +1358,20 @@ def _process_named(
         _build_terms(nm, overrides_by_name)
         if nm else ([], [], [], [])
     )
-    parts = r.version.split(".")
-    ver = (int(parts[0]), int(parts[1]), int(parts[2]))
+    # The chosen provenance for record reconstruction (Option A). Mirrors
+    # are byte-identical by the identity gate, so the canonical (index-
+    # first) provenance is the authoritative one to record even when a
+    # mirror served the bytes.
+    chosen = version.canonical_provenance
     candidate = _Candidate(
         name=name, version=ver,
-        source=f"registry:{name}", ref=r.tag,
-        sha=sha, tag=r.tag,
+        source=_named_source_display(name, chosen),
+        ref=getattr(chosen, "ref", None),
+        sha=sha, tag=None,
         identity=result.identity,
         src_dir=(nm.src_dir or "") if nm else "",
         dep_terms=terms, requires_names=requires_names,
+        provenance=chosen,
     )
     new_items: list = []
     for u in sub_url_deps:

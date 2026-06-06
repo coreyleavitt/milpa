@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from milpa.tianguis_client import Index
 from milpa.manifest import (
     Manifest,
     ManifestError,
@@ -229,7 +230,7 @@ def test_write_result_reports_comment_lines_lost_in_source(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _empty_registry_loader(*, cache_path):
+def _empty_index_loader(*, cache_dir):
     return {}
 
 
@@ -269,8 +270,7 @@ def test_apply_change_with_resolve_commits_both_files_atomically(tmp_path):
         tmp_path,
         proposed_manifest=proposed,
         fetcher=registry,
-        list_tags=lambda url: [],
-        registry_loader=_empty_registry_loader,
+        index_loader=_empty_index_loader,
         strategy=Strategy.MAXVER,
     )
 
@@ -314,8 +314,7 @@ def test_apply_change_with_resolve_aborts_on_resolve_failure(tmp_path):
             tmp_path,
             proposed_manifest=proposed,
             fetcher=registry,
-            list_tags=lambda url: [],
-            registry_loader=_empty_registry_loader,
+            index_loader=_empty_index_loader,
             strategy=Strategy.MAXVER,
         )
 
@@ -355,8 +354,7 @@ def test_apply_change_with_resolve_aborts_on_pre_validate_failure(tmp_path):
             tmp_path,
             proposed_manifest=Manifest(kind="library", name="proj", deps=()),
             fetcher=registry,
-            list_tags=lambda url: [],
-            registry_loader=_empty_registry_loader,
+            index_loader=_empty_index_loader,
             strategy=Strategy.MAXVER,
             pre_resolve_validate=pre_validate,
         )

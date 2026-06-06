@@ -9,7 +9,7 @@ argparse-based dispatch over four v0 subcommands:
   clean  — remove _deps/ and nim.cfg; keep milpa.lock
 
 Commands are exposed as `cmd_*` functions taking `project_dir` plus
-dependency-injectable callables (fetcher, list_tags) so tests can
+dependency-injectable seams (fetcher, index_loader) so tests can
 exercise them without subprocess overhead or network access. The
 `main(argv)` dispatcher is a thin argparse layer over these.
 """
@@ -38,7 +38,9 @@ from .manifest import (
 )
 from .manifest_writer import apply_manifest_change_with_resolve
 from .nimcfg import write_nimcfg
-from .registry import RegistryEntry, list_remote_tags, load_registry
+from .tianguis_client import (
+    DEFAULT_INDEX_URL, Index, default_index_cache_dir, load_index,
+)
 from .solver import Strategy
 from .resolver import ResolvedGraph, resolve, resolve_workspace
 from .workspace import workspace_containing
@@ -151,19 +153,26 @@ def make_parser() -> argparse.ArgumentParser:
 # Commands
 # ---------------------------------------------------------------------------
 
-RegistryLoader = Callable[..., dict[str, RegistryEntry]]
+from typing import Protocol
 
 
-def _default_registry_loader(*, cache_path: Path) -> dict[str, RegistryEntry]:
-    return load_registry(cache_path=cache_path)
+class IndexLoader(Protocol):
+    """The seam for loading the tianguis index. Typed as a Protocol (not
+    an untyped Callable alias) so a test fake with a misnamed kwarg fails
+    at type-check time rather than at runtime (milpa#97)."""
+
+    def __call__(self, *, cache_dir: Path) -> Index: ...
+
+
+def _default_index_loader(*, cache_dir: Path) -> Index:
+    return load_index(url=DEFAULT_INDEX_URL, cache_dir=cache_dir)
 
 
 def cmd_fetch(
     project_dir: Path,
     *,
     fetcher: FetcherRegistry = default_registry,
-    list_tags: Callable[[str], list[str]] = list_remote_tags,
-    registry_loader: RegistryLoader = _default_registry_loader,
+    index_loader: IndexLoader = _default_index_loader,
     max_parallel: int = 8,
     strategy: Strategy = Strategy.MAXVER,
     frozen: bool = False,
@@ -184,8 +193,8 @@ def cmd_fetch(
     ws = workspace_containing(project_dir)
     if ws is not None:
         return _cmd_fetch_workspace(
-            ws, fetcher=fetcher, list_tags=list_tags,
-            registry_loader=registry_loader, max_parallel=max_parallel,
+            ws, fetcher=fetcher,
+            index_loader=index_loader, max_parallel=max_parallel,
             strategy=strategy, frozen=frozen,
         )
 
@@ -220,8 +229,8 @@ def cmd_fetch(
         return 1
 
     graph = _resolve_or_error(
-        project_dir, fetcher=fetcher, list_tags=list_tags,
-        registry_loader=registry_loader, max_parallel=max_parallel,
+        project_dir, fetcher=fetcher,
+        index_loader=index_loader, max_parallel=max_parallel,
         strategy=strategy,
     )
     if isinstance(graph, int):
@@ -319,8 +328,7 @@ def _cmd_fetch_workspace(
     ws,  # Workspace
     *,
     fetcher: FetcherRegistry,
-    list_tags: Callable[[str], list[str]],
-    registry_loader: RegistryLoader,
+    index_loader: IndexLoader,
     max_parallel: int,
     strategy: Strategy,
     frozen: bool = False,
@@ -344,19 +352,18 @@ def _cmd_fetch_workspace(
         print(f"frozen: {frozen_result}", file=sys.stderr)
         return 1
 
-    cache_path = deps_dir / ".packages_official.json"
     try:
-        registry = registry_loader(cache_path=cache_path)
+        index = index_loader(cache_dir=default_index_cache_dir())
     except Exception as e:
-        print(f"failed to load registry: {e}", file=sys.stderr)
+        print(f"failed to load index: {e}", file=sys.stderr)
         return 1
     prior_lockfile = _maybe_load_prior_lockfile(ws.root / "milpa.lock")
     profile = Profile.from_environment()
     try:
         graph = resolve_workspace(
             ws, deps_dir=deps_dir,
-            registry=registry, fetcher=fetcher,
-            list_tags=list_tags, max_parallel=max_parallel,
+            index=index, fetcher=fetcher,
+            max_parallel=max_parallel,
             strategy=strategy,
             prior_lockfile=prior_lockfile,
             profile=profile,
@@ -379,15 +386,14 @@ def cmd_lock(
     project_dir: Path,
     *,
     fetcher: FetcherRegistry = default_registry,
-    list_tags: Callable[[str], list[str]] = list_remote_tags,
-    registry_loader: RegistryLoader = _default_registry_loader,
+    index_loader: IndexLoader = _default_index_loader,
     max_parallel: int = 8,
     strategy: Strategy = Strategy.MAXVER,
 ) -> int:
     """Resolve + write milpa.lock; do not emit nim.cfg."""
     graph = _resolve_or_error(
-        project_dir, fetcher=fetcher, list_tags=list_tags,
-        registry_loader=registry_loader, max_parallel=max_parallel,
+        project_dir, fetcher=fetcher,
+        index_loader=index_loader, max_parallel=max_parallel,
         strategy=strategy,
     )
     if isinstance(graph, int):
@@ -579,8 +585,7 @@ def cmd_add(
     git: str,
     ref: str | None = None,
     fetcher: FetcherRegistry = default_registry,
-    list_tags: Callable[[str], list[str]] = list_remote_tags,
-    registry_loader: "RegistryLoader" = _default_registry_loader,
+    index_loader: IndexLoader = _default_index_loader,
     strategy: Strategy = Strategy.MAXVER,
     default_branch_discoverer: Callable[[str], str] = _git_default_branch,
 ) -> int:
@@ -633,8 +638,7 @@ def cmd_add(
             project_dir,
             proposed_manifest=proposed,
             fetcher=fetcher,
-            list_tags=list_tags,
-            registry_loader=registry_loader,
+            index_loader=index_loader,
             strategy=strategy,
         )
     except Exception as e:
@@ -653,8 +657,7 @@ def cmd_update(
     *,
     name: str | None = None,
     fetcher: FetcherRegistry = default_registry,
-    list_tags: Callable[[str], list[str]] = list_remote_tags,
-    registry_loader: "RegistryLoader" = _default_registry_loader,
+    index_loader: IndexLoader = _default_index_loader,
     max_parallel: int = 8,
     strategy: Strategy = Strategy.MAXVER,
 ) -> int:
@@ -714,20 +717,18 @@ def cmd_update(
 
     deps_dir = project_dir / "_deps"
     deps_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = deps_dir / ".packages_official.json"
     try:
-        registry = registry_loader(cache_path=cache_path)
+        index = index_loader(cache_dir=default_index_cache_dir())
     except Exception as e:
-        print(f"update: failed to load registry: {e}", file=sys.stderr)
+        print(f"update: failed to load index: {e}", file=sys.stderr)
         return 1
 
     try:
         graph = resolve(
             manifest,
             deps_dir=deps_dir,
-            registry=registry,
+            index=index,
             fetcher=fetcher,
-            list_tags=list_tags,
             max_parallel=max_parallel,
             strategy=strategy,
             prior_lockfile=prior_lockfile,
@@ -749,8 +750,7 @@ def cmd_remove(
     *,
     name: str,
     fetcher: FetcherRegistry = default_registry,
-    list_tags: Callable[[str], list[str]] = list_remote_tags,
-    registry_loader: "RegistryLoader" = _default_registry_loader,
+    index_loader: IndexLoader = _default_index_loader,
     strategy: Strategy = Strategy.MAXVER,
 ) -> int:
     """Drop `name` from milpa.kdl + regenerate the lockfile (#17).
@@ -794,8 +794,7 @@ def cmd_remove(
             project_dir,
             proposed_manifest=proposed,
             fetcher=fetcher,
-            list_tags=list_tags,
-            registry_loader=registry_loader,
+            index_loader=index_loader,
             strategy=strategy,
         )
     except Exception as e:
@@ -812,8 +811,7 @@ def cmd_add_mirror(
     url: str,
     dep_name: str,
     fetcher: FetcherRegistry = default_registry,
-    list_tags: Callable[[str], list[str]] = list_remote_tags,
-    registry_loader: "RegistryLoader" = _default_registry_loader,
+    index_loader: IndexLoader = _default_index_loader,
     strategy: Strategy = Strategy.MAXVER,
     relock: Callable[[Path], None] | None = None,    # back-compat; ignored
 ) -> int:
@@ -942,8 +940,7 @@ def cmd_add_mirror(
             project_dir,
             proposed_manifest=proposed,
             fetcher=fetcher,
-            list_tags=list_tags,
-            registry_loader=registry_loader,
+            index_loader=index_loader,
             strategy=strategy,
             pre_resolve_validate=pre_validate,
         )
@@ -1106,12 +1103,11 @@ def _resolve_or_error(
     project_dir: Path,
     *,
     fetcher: FetcherRegistry,
-    list_tags: Callable[[str], list[str]],
-    registry_loader: RegistryLoader,
+    index_loader: IndexLoader,
     max_parallel: int = 8,
     strategy: Strategy = Strategy.MAXVER,
 ):
-    """Load manifest + registry + resolve. Returns ResolvedGraph on
+    """Load manifest + index + resolve. Returns ResolvedGraph on
     success, exit code (int) on error."""
     try:
         manifest = load_or_discover_manifest(project_dir)
@@ -1120,11 +1116,10 @@ def _resolve_or_error(
         return 1
     deps_dir = project_dir / "_deps"
     deps_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = deps_dir / ".packages_official.json"
     try:
-        registry = registry_loader(cache_path=cache_path)
+        index = index_loader(cache_dir=default_index_cache_dir())
     except Exception as e:
-        print(f"failed to load registry: {e}", file=sys.stderr)
+        print(f"failed to load index: {e}", file=sys.stderr)
         return 1
     prior_lockfile = _maybe_load_prior_lockfile(project_dir / "milpa.lock")
     profile = Profile.from_environment()
@@ -1132,9 +1127,8 @@ def _resolve_or_error(
         return resolve(
             manifest,
             deps_dir=deps_dir,
-            registry=registry,
+            index=index,
             fetcher=fetcher,
-            list_tags=list_tags,
             max_parallel=max_parallel,
             strategy=strategy,
             prior_lockfile=prior_lockfile,

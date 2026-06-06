@@ -256,6 +256,18 @@ DEFAULT_INDEX_URL = (
 )
 
 
+def default_index_cache_dir() -> Path:
+    """Global XDG index cache (`$XDG_CACHE_HOME/milpa/index/`, default
+    `~/.cache/milpa/index/`). The index is the *registry* — shared across
+    every project, not project state — so it lives outside any project's
+    `_deps/` and is untouched by `milpa clean` (milpa#97). A single source
+    of truth for the location, imported by the CLI and manifest writer."""
+    import os
+    base = os.environ.get("XDG_CACHE_HOME")
+    root = Path(base) if base else Path.home() / ".cache"
+    return root / "milpa" / "index"
+
+
 def _real_http_get(url: str) -> str:
     import urllib.request
     # timeout so a wedged server can't hang the resolver forever.

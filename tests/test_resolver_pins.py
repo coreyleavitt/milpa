@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 import pytest
 
+from milpa.tianguis_client import Index
 from milpa.fetchers import (
     FetcherRegistry,
     FetchError,
@@ -201,13 +202,14 @@ def test_resolve_pin_applies_when_manifest_added_mirror_but_primary_unchanged(tm
     assert "identity" in str(exc.value).lower()
 
 
-def test_resolve_drops_pin_for_named_dep_when_constraint_picks_new_tag(tmp_path):
-    """A NamedDep with constraint='^1.2.3'; registry now serves
-    v1.2.5 (where lockfile had v1.2.4). The pin must drop — the
-    constraint allows newer satisfying versions, and the user gets
-    the newer bytes."""
+def test_resolve_drops_pin_for_named_dep_when_constraint_picks_new_version(tmp_path):
+    """A NamedDep with constraint='>= 1.2.3'; the tianguis index now
+    serves v1.2.5 (where the lockfile had v1.2.4). The pin must drop —
+    the locked identity won't match the newly-resolved version's
+    content_hash, the constraint allows newer, and the user gets the
+    newer bytes (milpa#97 §Re-lock pin semantics)."""
     from milpa.manifest import NamedDep
-    from milpa.registry import RegistryEntry
+    from tests.indexkdl import make_index
 
     class StubFetcher:
         def can_handle(self, p): return isinstance(p, GitProvenance)
@@ -224,35 +226,31 @@ def test_resolve_drops_pin_for_named_dep_when_constraint_picks_new_tag(tmp_path)
         deps=(NamedDep(name="results", constraint=">= 1.2.3"),),
     )
 
-    # Registry exposes results; tags list returns the newer v1.2.5
-    reg_entries = {
-        "results": RegistryEntry(
-            name="results",
-            url="https://example.com/results.git",
-            method="git",
-        ),
-    }
-    def fake_list_tags(url: str) -> list[str]:
-        return ["v1.2.5"]   # picked over the locked v1.2.4
+    # Index serves the newer v1.2.5 (content_hash omitted → no gate, so
+    # the stub's arbitrary bytes resolve; the point is the *pin* drops).
+    index = make_index([
+        {"name": "results", "version": "1.2.5",
+         "url": "https://example.com/results.git", "ref": "v1.2.5"},
+    ])
 
-    # Lockfile had v1.2.4 pinned to identity X
+    # Lockfile had v1.2.4 pinned to identity X — a git record, the modern
+    # named-dep provenance shape.
     bogus_identity = "sha256:" + "f" * 64
-    from milpa.lockfile import RegistryProvenanceRecord
     prior = Lockfile(deps=(LockedDep(
         name="results", identity=bogus_identity, version="1.2.4",
         src_dir="", requires=(),
-        provenances=(RegistryProvenanceRecord(
-            name="results", tag="v1.2.4", commit_sha="old-sha",
+        provenances=(GitProvenanceRecord(
+            url="https://example.com/results.git", ref="v1.2.4",
+            commit_sha="old-sha",
         ),),
     ),))
 
-    # Should NOT raise — resolved tag (v1.2.5) doesn't match locked tag (v1.2.4)
+    # Should NOT raise — locked identity != resolved v1.2.5 content_hash.
     graph = resolve(
         manifest,
         deps_dir=tmp_path / "_deps",
-        registry=reg_entries,
+        index=index,
         fetcher=registry,
-        list_tags=fake_list_tags,
         prior_lockfile=prior,
     )
     assert any(d.name == "results" for d in graph.deps)
@@ -300,7 +298,7 @@ def test_cmd_fetch_loads_prior_lockfile_and_enforces_pin(tmp_path, capsys):
 
     rc = cmd_fetch(
         tmp_path, fetcher=registry,
-        registry_loader=lambda *, cache_path: {},
+        index_loader=lambda *, cache_dir: Index({}),
     )
 
     # cmd_fetch detects the identity mismatch (either via frozen-path
@@ -365,8 +363,7 @@ def test_apply_manifest_change_with_resolve_threads_prior_lockfile(tmp_path):
             tmp_path,
             proposed_manifest=proposed,
             fetcher=registry_fetcher,
-            list_tags=lambda url: [],
-            registry_loader=lambda *, cache_path: {},
+            index_loader=lambda *, cache_dir: Index({}),
             strategy=Strategy.MAXVER,
         )
 

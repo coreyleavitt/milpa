@@ -97,8 +97,7 @@ def apply_manifest_change_with_resolve(
     *,
     proposed_manifest: Manifest,
     fetcher,                              # FetcherRegistry
-    list_tags,                            # Callable[[str], list[str]]
-    registry_loader,                      # cache_path → registry dict
+    index_loader,                         # IndexLoader: cache_dir → Index
     strategy,                             # Strategy enum
     pre_resolve_validate: "Callable[[], None] | None" = None,
 ) -> WriteResult:
@@ -141,15 +140,14 @@ def apply_manifest_change_with_resolve(
 
     deps_dir = project_dir / "_deps"
     deps_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = deps_dir / ".packages_official.json"
-    registry = registry_loader(cache_path=cache_path)
+    from .tianguis_client import default_index_cache_dir
+    index = index_loader(cache_dir=default_index_cache_dir())
 
     graph = resolve(
         proposed_manifest,
         deps_dir=deps_dir,
-        registry=registry,
+        index=index,
         fetcher=fetcher,
-        list_tags=list_tags,
         strategy=strategy,
         prior_lockfile=prior_lockfile,
         profile=Profile.from_environment(),

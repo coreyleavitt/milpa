@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from milpa.tianguis_client import Index
 from milpa.cas import CAStore
 from milpa.frozen import NotFrozen, resolve_frozen
 from milpa.identity import compute_content_hash
@@ -288,7 +289,7 @@ def test_cmd_fetch_uses_frozen_path_and_does_not_call_fetcher(tmp_path):
 
     rc = cmd_fetch(
         tmp_path, fetcher=registry,
-        registry_loader=lambda *, cache_path: {},
+        index_loader=lambda *, cache_dir: Index({}),
     )
 
     assert rc == 0
@@ -326,7 +327,7 @@ def test_cmd_fetch_falls_through_to_slow_path_on_not_frozen(tmp_path):
 
     rc = cmd_fetch(
         tmp_path, fetcher=registry,
-        registry_loader=lambda *, cache_path: {},
+        index_loader=lambda *, cache_dir: Index({}),
     )
 
     assert rc == 0
@@ -360,7 +361,7 @@ def test_cmd_fetch_with_frozen_flag_errors_on_not_frozen(tmp_path, capsys):
 
     rc = cmd_fetch(
         tmp_path, fetcher=registry,
-        registry_loader=lambda *, cache_path: {}, frozen=True,
+        index_loader=lambda *, cache_dir: Index({}), frozen=True,
     )
 
     assert rc == 1

@@ -211,10 +211,11 @@ def _provenance_from_resolved(d: ResolvedDep) -> ProvenanceRecord:
     `oci:{registry}/{repository}@{digest}` string is genuinely ambiguous
     to split) reconstructs cleanly by type.
 
-    Fallback: when `provenance` is None (the synthetic root, workspace
-    members, and — until S4 — named deps that still set a `registry:`
-    source), parse the legacy `source` string. That arm becomes dead once
-    every producer carries a typed provenance."""
+    Fallback: when `provenance` is None (the synthetic root and workspace
+    members — both never fetched, so they carry only a `source` marker),
+    parse the `source` string. Named deps now always carry a typed git/oci
+    provenance (milpa#97), so no `registry:` source string is ever
+    produced; the bare-git arm remains a defensive catch-all."""
     prov = d.provenance
     if isinstance(prov, GitProvenance):
         # commit_sha is the RESOLVED sha from the receipt (d.sha), not the
@@ -242,12 +243,6 @@ def _provenance_from_resolved(d: ResolvedDep) -> ProvenanceRecord:
         return TarballProvenanceRecord(url=src[len("tarball:"):], sha256=None)
     if src.startswith("member:"):
         return MemberProvenanceRecord(name=src[len("member:"):])
-    if src.startswith("registry:"):
-        return RegistryProvenanceRecord(
-            name=src[len("registry:"):],
-            tag=d.tag,
-            commit_sha=d.sha,
-        )
     return GitProvenanceRecord(url=src, ref=d.ref, commit_sha=d.sha)
 
 

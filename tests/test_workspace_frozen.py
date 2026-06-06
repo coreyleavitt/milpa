@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from milpa.tianguis_client import Index
 from milpa.cas import CAStore
 from milpa.fetchers import FetcherRegistry
 from milpa.fetchers.git import GitProvenance, GitReceipt
@@ -330,7 +331,7 @@ def test_cmd_fetch_workspace_uses_frozen_path_when_aligned(tmp_path):
 
     rc = cmd_fetch(
         tmp_path, fetcher=registry,
-        registry_loader=lambda *, cache_path: {},
+        index_loader=lambda *, cache_dir: Index({}),
     )
 
     assert rc == 0
@@ -362,7 +363,7 @@ def test_cmd_fetch_workspace_falls_through_silently_on_not_frozen(tmp_path):
 
     rc = cmd_fetch(
         tmp_path, fetcher=registry,
-        registry_loader=lambda *, cache_path: {},
+        index_loader=lambda *, cache_dir: Index({}),
     )
     assert rc == 0
     # Lockfile was created by slow path
@@ -395,7 +396,7 @@ def test_cmd_fetch_workspace_with_frozen_flag_exits_1_on_not_frozen(tmp_path, ca
 
     rc = cmd_fetch(
         tmp_path, fetcher=registry,
-        registry_loader=lambda *, cache_path: {}, frozen=True,
+        index_loader=lambda *, cache_dir: Index({}), frozen=True,
     )
     assert rc == 1
     err = capsys.readouterr().err

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from milpa.tianguis_client import Index
 from milpa.cas import CAStore
 from milpa.cli import cmd_add
 from milpa.fetchers import FetcherRegistry
@@ -62,7 +63,7 @@ def test_cmd_add_discovers_default_branch_and_appends_dep(tmp_path):
         git="https://example.com/chronos.git",
         ref=None,
         fetcher=registry,
-        registry_loader=lambda *, cache_path: {},
+        index_loader=lambda *, cache_dir: Index({}),
         strategy=Strategy.MAXVER,
         default_branch_discoverer=lambda url: "main",
     )
@@ -102,7 +103,7 @@ def test_cmd_add_explicit_ref_skips_default_branch_discovery(tmp_path):
         git="https://example.com/chronos.git",
         ref="feat/contextvars",
         fetcher=registry,
-        registry_loader=lambda *, cache_path: {},
+        index_loader=lambda *, cache_dir: Index({}),
         strategy=Strategy.MAXVER,
         default_branch_discoverer=exploding_discoverer,
     )
@@ -144,7 +145,7 @@ def test_cmd_add_refuses_when_dep_name_already_declared(tmp_path, capsys):
         git="https://other.example.com/chronos.git",
         ref="main",
         fetcher=registry,
-        registry_loader=lambda *, cache_path: {},
+        index_loader=lambda *, cache_dir: Index({}),
         strategy=Strategy.MAXVER,
         default_branch_discoverer=lambda url: "main",
     )
@@ -182,7 +183,7 @@ def test_cmd_add_exits_when_default_branch_query_fails(tmp_path, capsys):
         git="https://broken.example.com/x.git",
         ref=None,
         fetcher=registry,
-        registry_loader=lambda *, cache_path: {},
+        index_loader=lambda *, cache_dir: Index({}),
         strategy=Strategy.MAXVER,
         default_branch_discoverer=failing_discoverer,
     )
