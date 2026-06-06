@@ -112,12 +112,21 @@ class Index:
 
 
 def _scalar_child(node: kdl.Node, name: str) -> str:
-    """Return the first string-arg of `node`'s child named `name`, or ""."""
+    """Return the first scalar-arg of `node`'s child named `name`, or "".
+
+    Accepts both bare strings and `(url)`-annotated values: the tianguis
+    index annotates every URL `(url)"https://..."` (the milpa KDL url
+    convention), which the kdl lib parses into a urllib ParseResult, not a
+    str. Without handling that, `url` fields silently read as "" and every
+    git-vendored entry becomes unfetchable (caught by the S7 live test)."""
+    from urllib.parse import ParseResult
     for c in node.nodes:
         if c.name == name and c.args:
             v = c.args[0]
             if isinstance(v, str):
                 return v
+            if isinstance(v, ParseResult):
+                return v.geturl()
     return ""
 
 

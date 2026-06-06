@@ -143,3 +143,54 @@ def test_clean_then_fetch_works(tmp_path: Path):
     assert rc == 0
     assert (tmp_path / "_deps").exists()
     assert (tmp_path / "nim.cfg").exists()
+
+
+@pytest.mark.integration
+def test_named_dep_fetched_at_index_pinned_commit_sha(tmp_path: Path):
+    """S7 (milpa#97): end-to-end validation of the named-dep index path
+    against the LIVE tianguis index, including S2.5's exact-commit_sha
+    checkout.
+
+    Resolve a bare NamedDep through the real index, then assert:
+      1. the lockfile git record's commit_sha == the index's pinned
+         commit_sha (the immutable pin was honored, not a branch tip);
+      2. the lockfile identity == the index's content_hash (the identity
+         gate compared real fetched bytes against the index, R2);
+      3. `milpa verify` passes (the on-disk tree hashes to the pin).
+    """
+    from milpa.cli import cmd_verify
+    from milpa.fetchers.git import GitProvenance
+    from milpa.lockfile import GitProvenanceRecord
+    from milpa.tianguis_client import (
+        default_index_cache_dir, load_index, DEFAULT_INDEX_URL, resolve_named,
+    )
+
+    # A tiny, ubiquitously-vendored package. Resolve what the live index
+    # actually says rather than hardcoding a version/sha.
+    pkg = "results"
+    index = load_index(url=DEFAULT_INDEX_URL, cache_dir=default_index_cache_dir())
+    version = resolve_named(index, pkg, None)
+    git_prov = next(
+        (p for p in version.provenances if isinstance(p, GitProvenance)), None,
+    )
+    if git_prov is None or not git_prov.commit_sha:
+        pytest.skip(
+            f"live index entry for {pkg!r} has no git commit_sha pin to validate"
+        )
+
+    (tmp_path / "milpa.kdl").write_text(
+        f'name "consumer"\ndeps {{\n    {pkg}\n}}\n'
+    )
+    rc = cmd_fetch(tmp_path)
+    assert rc == 0
+
+    lockfile = load_lockfile(tmp_path / "milpa.lock")
+    locked = next(d for d in lockfile.deps if d.name == pkg)
+    rec = locked.provenances[0]
+    assert isinstance(rec, GitProvenanceRecord)
+    # 1. exact-commit pin honored (S2.5)
+    assert rec.commit_sha == git_prov.commit_sha
+    # 2. identity gate compared against the index content_hash (R2)
+    assert locked.identity == version.content_hash
+    # 3. on-disk tree verifies against the pin
+    assert cmd_verify(tmp_path) == 0

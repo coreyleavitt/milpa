@@ -388,6 +388,35 @@ def test_git_provenance_parses_with_commit_sha():
     assert p.commit_sha == "f3a2b1c9d8e7061524384950617283940a1b2c3d"
 
 
+def test_git_url_with_url_type_annotation_parses():
+    """Regression (milpa#97 S7): the live tianguis index annotates every
+    URL `(url)"https://..."` (the milpa KDL url convention). The kdl lib
+    parses that into a urllib ParseResult, not a str — `_scalar_child`
+    must still recover the URL, or every git-vendored entry becomes
+    unfetchable (empty url → `git clone ''`)."""
+    from milpa.tianguis_client import parse_index, resolve_named
+    from milpa.fetchers.git import GitProvenance
+
+    text = """\
+package "results" {
+    version "0.5.0" {
+        content_hash "sha256:abc"
+        provenance {
+            kind "git"
+            url (url)"https://github.com/arnetheduck/nim-results"
+            ref "HEAD"
+            commit_sha "f3a2b1c9"
+        }
+    }
+}
+"""
+    idx = parse_index(text)
+    p = resolve_named(idx, "results", None).provenances[0]
+    assert isinstance(p, GitProvenance)
+    assert p.url == "https://github.com/arnetheduck/nim-results"
+    assert p.commit_sha == "f3a2b1c9"
+
+
 def test_oci_provenance_still_parses_in_mixed_index():
     from milpa.tianguis_client import parse_index, resolve_named
     from milpa.fetchers.oci import OciProvenance
