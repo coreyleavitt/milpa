@@ -115,3 +115,85 @@
 - Dev loop: `uv run pytest` (~6s); `MILPA_INTEGRATION_TESTS=1 uv run pytest tests/test_integration.py` (gated).
 - Grounding map (registry/resolver/tianguis_client/fetchers/lockfile/cli + fixture sizing) gathered by an
   Explore agent this session; captured in the RFC's Surface section with file:line anchors.
+
+---
+
+## Stage 4 — /code-review (review ledger)
+
+5-agent panel (correctness, quality, security, design, test-coverage) over the
+#97 source scope. Findings adversarially verified against the cited code +
+old registry.py before presenting. Status: `open` until fixed.
+
+### Refuted (dropped from presentation)
+- **CORR-1 "named-dep solver regression" — REFUTED.** Claim: #97 materializes
+  only one version (vs all tags before) so the solver can't backtrack. False:
+  old `registry.resolve_named` → `resolve_version` picked a SINGLE
+  max-satisfying tag and old `_process_named` built ONE `_Candidate`. The
+  eager single-version provider predates #97 (BFS-model property), not a swap
+  regression. (Pre-existing limitation; out of #97 scope — backlog if
+  multi-version backtracking is ever wanted.)
+
+### High
+- **H1** (sec-crit + corr + cov converge) `resolver.py:1347` `version.content_hash or None` →
+  empty `content_hash` silently disables the identity gate (`types.py:205`). Violates Invariant 1.
+  Fix: empty content_hash on a git/oci named dep = hard error, not silent pass. — **fixed** (test_security_hardening.py)
+- **H2** (sec) `fetchers/git.py:58,69,76,102,113` git argv has no `--` end-of-options guard and no
+  format validation → `commit_sha`/`ref`/`url` = `--upload-pack=…` is flag/arg injection → RCE if
+  index or transport compromised. Fix: validate commit_sha=40-hex, reject leading `-`, add `--`. — **fixed** (test_security_hardening.py)
+- **H3** (sec) `resolver.py:1351,1051,228` + `_name_from_url:1445` path traversal via dep `name`
+  (`deps_dir / name` with `..`/abs escapes `_deps/`; also reaches `shutil.rmtree`). Fix: validate
+  dep names at index-parse + url-derived. — **fixed** (test_security_hardening.py)
+
+### Medium
+- **M1** (sec) `fetchers/oci.py:52,84,109` OCI fields unvalidated → oras flag injection; digest format
+  unchecked; receipt records input digest. (oras DOES verify the pinned `@digest`, so content integrity
+  is covered — this is injection/validation hardening.) — **fixed** (test_security_hardening.py)
+- **M2** (sec) `tianguis_client.py:280,323` index fetched w/o signature/hash check; stale-cache fallback
+  enables poison-then-block. Rekor attest exists in publish flow but isn't enforced at parse.
+  — **DEFERRED → milpa#103** (consumer-side index attestation = new trust subsystem w/ design forks;
+  own RFC. User-approved defer.)
+- **M3** (qual SSOT) `frozen.py:234` `_parse_version` duplicates `solver.parse_version`. Fix: import + delete. — **fixed**
+- **M4** (qual+corr+design) `lockfile.py:224-246` typed `LocalProvenance` arm unreachable + Path/str
+  mismatch; isinstance ladder → `Provenance.to_record()`. Fix: delete dead arm; consider to_record(). — **fixed** (dead arm deleted; isinstance dispatch kept in serialization layer per layering)
+- **M5** (qual+corr) `resolver.py:60,104` `ResolvedDep.tag`/`_Candidate.tag` vestigial post-registry
+  (always None; "registry deps only" comment stale). Fix: remove field or fix comment. — **fixed**
+- **M6** (design) `cli.py:159` `IndexLoader` Protocol mislocated; `manifest_writer` types it as a comment.
+  Move to `tianguis_client` as the canonical type. — **fixed** (IndexLoader → tianguis_client)
+- **M7** (design) `resolver.py:287,571` `index=None` default → misleading `TNG-NOT-FOUND` when manifest
+  has named deps but no index supplied. Fix: require non-None index when NamedDeps present. — **fixed**
+- **M8** (cov) OCI named-dep path never driven through the resolver in-process (only gated integration);
+  `from_graph` OCI→`OciProvenanceRecord` dispatch untested. Add in-process test w/ fake OciFetcher. — **fixed** (in-process OCI resolver test + from_graph OCI unit test)
+
+### Low
+- **L1** cov: empty-content_hash gate test (moot if H1 → hard-error; then test the error). — **fixed** (covered by test_security_hardening H1 TNG-NO-IDENTITY)
+- **L2** cov/corr: `TNG-BAD-VERSION` (`resolver.py:1332`) unreachable (same `parse_version` twice); weak
+  `in {…}` assertion in the existing test. Resolve dead-code question. — **fixed**
+- **L3** qual: redundant re-imports `resolver.py:1173,1114,1017` (`_VS`, `ManUrlDep/ManNamedDep`, deferred
+  `OciProvenance`). — **fixed**
+- **L4** qual: `cli.py:816` `cmd_add_mirror` `relock` vestigial param. — **fixed**
+- **L5** qual: `(url)`→ParseResult coercion duplicated in `tianguis_client._scalar_child` + `lockfile`. — **fixed** (shared kdl_util.url_value_to_str)
+- **L6** design: `source` field doubles as display + lookup key (`update_pending`) + reconstruction fallback. — **fixed** (update_pending param source→git_url + URL-dep-only comment; investigated — not actually ambiguous)
+- **L7** design: `_Candidate.provenance` default `None` + `getattr` soft-landing at `_build_graph:1503`. — **fixed** (getattr soft-landing removed; None-cases documented)
+- **L8** design: `FetcherRegistry._select` open-world dispatch over a closed Provenance hierarchy. — **fixed** (ambiguous-dispatch guard)
+- **L9** design: `tianguis_client.Version` name collides w/ `solver.Version` → rename `IndexVersion`. — **fixed** (Version→IndexVersion)
+- **L10** corr/sec: no commit re-check after unshallow → misleading error (largely covered by H2's 40-hex). — **fixed** (test_security_hardening.py)
+- **L11** cov: frozen-OCI path, `_ensure_commit_present` branches b/c, duplicate-version warn,
+  missing-schema_version tolerated — coverage gaps. — **fixed** (frozen-OCI, dup-version warn, missing schema_version, _ensure_commit_present fallback)
+- **L12** corr: silent drop of malformed package name (no warning) `tianguis_client.py:215`. — **fixed** (test_security_hardening.py)
+
+### Re-review round 2 (post-fix) — new findings
+Fresh Security + Design + Correctness over the fix-loop delta (`git diff HEAD`). Correctness: clean.
+Security: all controls HOLD; no Critical/High. New items below (all Low/Med):
+- **RS1** (sec, Low) `tianguis_client.py:71,99` validators use `re.match` not `re.fullmatch` → a trailing `\n`
+  passes (`$` matches before final newline). Not injectable (single argv C-string) but malformed data slips
+  the gate then fails at git/oras. Fix: `re.fullmatch` (or `\Z`). + regression test. — **fixed**
+- **RD1** (design/SSOT, Med) `manifest.py` still has ~4 inline `(url)`→ParseResult duplicates (≈691,707-708,977,1167)
+  not unified with `kdl_util.url_value_to_str`; L5 extraction half-done. Unify where semantics match (note:
+  `_url_arg` is strict/raises vs helper returns ""). — **fixed**
+- **RD2** (design, Med) `resolver._name_from_url` reaches into private `tianguis_client._RE_UNSAFE_NAME` + raises
+  `ValueError` while index path raises `TianguisError(TNG-UNSAFE-NAME)`. Promote a PUBLIC safe-name predicate
+  (single source), keep context-appropriate exception types. — **fixed**
+- **RD3** (test, Low) lockfile `_provenance_from_resolved` new `else: raise ValueError` arm has no pinned test
+  ([[feedback_no_invariant_dismissal]]). — **fixed**
+- **RD4** (cleanup, Low) `lockfile.py:348` redundant isinstance guard before `url_value_to_str` + misleading
+  "filter those out" comment. — **fixed**
