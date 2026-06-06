@@ -37,6 +37,37 @@ def make_repo(path: Path, files: dict[str, str], branch: str = "main") -> Path:
     return path
 
 
+def make_repo_with_history(
+    path: Path, commits: list[dict[str, str]], branch: str = "main",
+) -> list[str]:
+    """Create a repo with one commit per entry in `commits`. Returns the
+    list of commit SHAs in order. Lets a test pin a commit that is NOT the
+    branch tip (the single-commit make_repo can't express that)."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-q", "-b", branch, str(path)],
+        check=True, capture_output=True, text=True,
+    )
+    run = lambda *args: subprocess.run(
+        ["git", "-C", str(path),
+         "-c", "user.email=test@example.com", "-c", "user.name=test",
+         *args],
+        check=True, capture_output=True, text=True,
+    )
+    shas: list[str] = []
+    for i, files in enumerate(commits):
+        for relpath, content in files.items():
+            f = path / relpath
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(content)
+        run("add", ".")
+        run("commit", "-q", "-m", f"commit {i}")
+        shas.append(
+            run("rev-parse", "HEAD").stdout.strip()
+        )
+    return shas
+
+
 @pytest.fixture
 def registry():
     r = FetcherRegistry()
@@ -76,6 +107,54 @@ def test_receipt_commit_sha_matches_clone_head(tmp_path, registry):
     ).stdout.strip()
     assert result.receipt.commit_sha == head
     assert len(result.receipt.commit_sha) == 40
+
+
+def test_commit_sha_checks_out_exact_commit_not_tip(tmp_path, registry):
+    # S2.5 (milpa#97): the index pins an immutable commit_sha, which may
+    # NOT be the branch tip. GitFetcher must check out that exact commit.
+    shas = make_repo_with_history(
+        tmp_path / "src",
+        [
+            {"v.txt": "first\n"},
+            {"v.txt": "second\n"},
+            {"v.txt": "third-tip\n"},
+        ],
+    )
+    first_sha = shas[0]
+    deps_dir = tmp_path / "deps"
+    deps_dir.mkdir()
+
+    result = registry.fetch(
+        "r",
+        GitProvenance(
+            url=f"file://{tmp_path / 'src'}",
+            ref="main",
+            commit_sha=first_sha,
+        ),
+        dest=deps_dir / "r",
+    )
+    # The working tree is the FIRST commit's content, not the tip's.
+    assert (result.path / "v.txt").read_text() == "first\n"
+    assert result.receipt.commit_sha == first_sha
+
+
+def test_no_commit_sha_falls_back_to_ref_tip(tmp_path, registry):
+    # commit_sha=None preserves the legacy tip-checkout behavior for every
+    # existing caller (url/named-without-pin).
+    shas = make_repo_with_history(
+        tmp_path / "src",
+        [{"v.txt": "first\n"}, {"v.txt": "tip\n"}],
+    )
+    deps_dir = tmp_path / "deps"
+    deps_dir.mkdir()
+
+    result = registry.fetch(
+        "r",
+        GitProvenance(url=f"file://{tmp_path / 'src'}", ref="main"),
+        dest=deps_dir / "r",
+    )
+    assert (result.path / "v.txt").read_text() == "tip\n"
+    assert result.receipt.commit_sha == shas[-1]
 
 
 def test_content_hash_is_64_hex_chars(tmp_path, registry):

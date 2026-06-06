@@ -53,14 +53,25 @@ class GitFetcher:
         assert isinstance(p, GitProvenance)
         pre_existed = dest.exists()
         try:
-            if pre_existed:
-                _run_git(name, p,
-                         ["git", "-C", str(dest), "fetch", "-q", "origin"])
-                _run_git(name, p,
-                         ["git", "-C", str(dest), "checkout", "-q", p.ref])
-            else:
+            if not pre_existed:
                 _run_git(name, p,
                          ["git", "clone", "-q", p.url, str(dest)])
+            if p.commit_sha:
+                # Exact-commit pin (Invariant 2): the index records an
+                # immutable commit_sha which may NOT be the branch tip.
+                # Ensure it's present (a plain clone of a small repo
+                # usually has it), then check out that exact commit —
+                # `ref` is recorded for provenance but never determines
+                # the working tree here.
+                _ensure_commit_present(name, p, dest)
+                _run_git(name, p,
+                         ["git", "-C", str(dest), "checkout", "-q",
+                          p.commit_sha])
+            else:
+                # Legacy tip behavior: fetch latest then check out the ref.
+                if pre_existed:
+                    _run_git(name, p,
+                             ["git", "-C", str(dest), "fetch", "-q", "origin"])
                 _run_git(name, p,
                          ["git", "-C", str(dest), "checkout", "-q", p.ref])
         except FetchError:
@@ -68,6 +79,38 @@ class GitFetcher:
                 shutil.rmtree(dest, ignore_errors=True)
             raise
         return GitReceipt(commit_sha=_git_head_sha(dest))
+
+
+def _ensure_commit_present(name: str, p: GitProvenance, dest: Path) -> None:
+    """Make `p.commit_sha` available in `dest` so it can be checked out.
+
+    A plain clone of a small repo usually already has every commit, so the
+    cheap `cat-file -e` check short-circuits the common case. Otherwise try
+    a targeted `git fetch origin <sha>` (needs the server's
+    `uploadpack.allowReachableSHA1InWant`; GitHub/GitLab enable it). If the
+    server rejects bare-SHA requests or the clone was shallow, fall back to
+    a full history fetch (`--unshallow` when shallow, else a plain fetch).
+    """
+    have = subprocess.run(
+        ["git", "-C", str(dest), "cat-file", "-e",
+         f"{p.commit_sha}^{{commit}}"],
+        capture_output=True, text=True,
+    )
+    if have.returncode == 0:
+        return
+    targeted = subprocess.run(
+        ["git", "-C", str(dest), "fetch", "-q", "origin", p.commit_sha],
+        capture_output=True, text=True,
+    )
+    if targeted.returncode == 0:
+        return
+    # Fallback: deepen/complete history. --unshallow errors on a complete
+    # clone, so ignore its result and follow with a plain full fetch.
+    subprocess.run(
+        ["git", "-C", str(dest), "fetch", "-q", "--unshallow", "origin"],
+        capture_output=True, text=True,
+    )
+    _run_git(name, p, ["git", "-C", str(dest), "fetch", "-q", "origin"])
 
 
 def _run_git(name: str, p: GitProvenance, argv: list[str]) -> None:
