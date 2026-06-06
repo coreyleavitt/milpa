@@ -28,6 +28,7 @@ invariant structurally.
 """
 
 import shutil
+import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -207,6 +208,19 @@ class FetcherRegistry:
                     f"{type(p).__name__}: identity mismatch "
                     f"(expected {expected_identity[:23]}..., "
                     f"got {result.identity[:23]}...)"
+                )
+                # A candidate returning mismatched bytes is not the same as a
+                # candidate being down: it's a possible supply-chain signal
+                # (a primary serving substituted content). Falling through to
+                # a mirror that happens to match would mask it, so warn loudly
+                # naming the candidate + expected/actual identity (#102).
+                print(
+                    f"warning: {name}: provenance {type(p).__name__} returned "
+                    f"bytes that do not match the expected identity "
+                    f"(expected {expected_identity[:23]}..., "
+                    f"got {result.identity[:23]}...); discarding and trying "
+                    f"the next candidate",
+                    file=sys.stderr,
                 )
                 # Drop the mismatched bytes so the next candidate's
                 # fetch sees a clean destination.

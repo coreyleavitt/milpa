@@ -194,6 +194,52 @@ def test_fetch_any_rejects_candidate_whose_identity_does_not_match_expected(tmp_
     assert (tmp_path / "x" / "file.txt").read_text() == "mirror_a"
 
 
+def test_fetch_any_warns_on_identity_mismatch_before_falling_through(tmp_path, capsys):
+    """#102: a candidate whose bytes fail the identity gate is a possible
+    supply-chain signal, not just an unavailable mirror. Before falling
+    through to the next candidate, fetch_any must emit a warning naming the
+    candidate + the expected/actual identity — so a mismatched primary
+    masked by a matching mirror doesn't pass silently."""
+    from milpa.identity import compute_content_hash
+
+    class TwoFlavorFetcher:
+        def can_handle(self, p):
+            return isinstance(p, StubProvenance)
+
+        def fetch(self, name, p, *, dest):
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / "file.txt").write_text(p.name)
+            return StubReceipt(name=p.name)
+
+    registry = FetcherRegistry()
+    registry.register(TwoFlavorFetcher())
+
+    import tempfile
+    from pathlib import Path as P
+    with tempfile.TemporaryDirectory() as td:
+        good = P(td) / "x"
+        good.mkdir()
+        (good / "file.txt").write_text("mirror_a")
+        expected = compute_content_hash(good)
+
+    result = registry.fetch_any(
+        "chronos",
+        [StubProvenance(name="primary"), StubProvenance(name="mirror_a")],
+        dest=tmp_path / "chronos",
+        expected_identity=expected,
+    )
+
+    # The mirror still served the locked bytes (fall-through still works)…
+    assert result.identity == expected
+    # …but the mismatched primary was announced, not swallowed.
+    err = capsys.readouterr().err
+    assert "warning:" in err
+    assert "chronos" in err
+    assert "identity" in err
+    # the expected hash prefix is surfaced for the user to compare
+    assert expected[:23] in err
+
+
 def test_fetch_any_raises_when_no_candidate_matches_expected_identity(tmp_path):
     """All candidates produce wrong-identity bytes → composite
     FetchError citing each mismatch."""
