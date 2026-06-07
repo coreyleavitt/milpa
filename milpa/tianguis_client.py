@@ -48,6 +48,7 @@ _TNG_CODES: frozenset[str] = frozenset({
     "TNG-UNSAFE-NAME",
     "TNG-BAD-OCI-DIGEST",
     "TNG-UNSAFE-OCI-FIELD",
+    "TNG-AMBIGUOUS-NAME",
 })
 
 
@@ -190,20 +191,68 @@ class IndexVersion:
 
 @dataclass(frozen=True)
 class Package:
-    """A package with one or more versions."""
+    """A package with one or more versions.
+
+    `namespace` is the registry namespace (e.g. a GitHub org/user), forming
+    the first half of the `(namespace, name)` identity key. Two packages may
+    share a bare `name` under different namespaces (e.g. the nimkdl split:
+    `greenm01/nimkdl` vs `coreyleavitt/nimkdl`) — this is the real identity.
+    """
     name: str
+    namespace: str
     versions: tuple[IndexVersion, ...]
 
 
-class Index:
-    """Parsed tianguis index. Look up by name."""
+@dataclass(frozen=True)
+class AmbiguousName:
+    """Returned by `Index.lookup_bare` when a bare `name` matches more than
+    one namespace in the index. Callers decide the policy: resolve_named raises
+    `TNG-AMBIGUOUS-NAME`; a future multi-version provider may enumerate all
+    candidates for backtracking. This is a typed result, NOT an exception —
+    keeping the registry primitive raise-free lets callers control flow.
+    """
+    name: str
+    namespaces: list[str]
 
-    def __init__(self, packages: dict[str, Package]) -> None:
+
+class Index:
+    """Parsed tianguis index. Look up by (namespace, name) tuple key.
+
+    The internal store is `dict[tuple[str, str], Package]` keyed on
+    `(namespace, name)`. Two packages sharing a bare name under different
+    namespaces are distinct entries — no silent drop.
+    """
+
+    def __init__(self, packages: dict[tuple[str, str], Package]) -> None:
         self._packages = packages
 
-    def lookup(self, name: str) -> list[IndexVersion]:
-        pkg = self._packages.get(name)
+    def lookup(self, namespace: str, name: str) -> list[IndexVersion]:
+        """Return the IndexVersion list for `(namespace, name)`, or [] if
+        not found. The primary qualified entry point."""
+        pkg = self._packages.get((namespace, name))
         return list(pkg.versions) if pkg is not None else []
+
+    def lookup_bare(self, name: str) -> Package | AmbiguousName | None:
+        """Look up by bare `name` without a namespace qualifier.
+
+        - Unique match: returns the `Package`.
+        - Collision (multiple namespaces): returns `AmbiguousName`; does NOT
+          raise (the caller decides policy).
+        - Not found: returns None.
+
+        Load-bearing for P3.2/#100: the future multi-version provider
+        enumerates candidates while backtracking — a raise inside this
+        primitive would be a hard stop mid-solve.
+        """
+        matches = [pkg for (ns, n), pkg in self._packages.items() if n == name]
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        return AmbiguousName(
+            name=name,
+            namespaces=[pkg.namespace for pkg in matches],
+        )
 
 
 class IndexLoader(Protocol):
@@ -325,11 +374,26 @@ def _parse_version_node(ver_str: str, node: kdl.Node) -> IndexVersion:
     )
 
 
+def _parse_namespace(node: kdl.Node) -> str:
+    """Return the `namespace` child's first string arg, or "" if absent."""
+    for child in node.nodes:
+        if child.name == "namespace" and child.args and isinstance(child.args[0], str):
+            return child.args[0]
+    return ""
+
+
 def parse_index(text: str) -> Index:
-    """Parse an index.kdl document into a queryable Index."""
+    """Parse an index.kdl document into a queryable Index.
+
+    Internal store is keyed on `(namespace, name)` so two packages sharing
+    a bare name under different namespaces are distinct entries (no silent
+    drop). Use `Index.lookup(ns, name)` for qualified access or
+    `Index.lookup_bare(name)` for a bare lookup that returns `AmbiguousName`
+    on a collision rather than silently picking one.
+    """
     doc = kdl.parse(text)
     _check_schema_version(doc)
-    packages: dict[str, Package] = {}
+    packages: dict[tuple[str, str], Package] = {}
     for node in doc.nodes:
         if node.name != "package":
             continue
@@ -347,6 +411,7 @@ def parse_index(text: str) -> Index:
         # never reach `deps_dir / name` (hard error, not warn — a crafted
         # `..`-name is an active attack vector, not just a formatting quirk).
         _validate_safe_name(name)
+        namespace = _parse_namespace(node)
         versions: list[IndexVersion] = []
         seen: set[str] = set()
         for child in node.nodes:
@@ -373,8 +438,10 @@ def parse_index(text: str) -> Index:
         parseable = [v for v in versions if parse_version(v.version) is not None]
         unparseable = [v for v in versions if parse_version(v.version) is None]
         parseable.sort(key=lambda v: parse_version(v.version), reverse=True)
-        packages[name] = Package(
-            name=name, versions=tuple(parseable + unparseable),
+        packages[(namespace, name)] = Package(
+            name=name,
+            namespace=namespace,
+            versions=tuple(parseable + unparseable),
         )
     return Index(packages)
 
@@ -475,18 +542,19 @@ def load_index(
     return parse_index(text)
 
 
-def resolve_named(idx: Index, name: str, constraint: str | None) -> IndexVersion:
-    """Resolve `name` against `idx` and return the highest satisfying
-    IndexVersion. Constraint matching routes through VersionSet — same
-    semantics as URL deps and registry-pinned deps.
+def resolve_named_all(idx: Index, name: str, constraint: str | None) -> list[IndexVersion]:
+    """Resolve `name` against `idx` and return ALL satisfying IndexVersions,
+    ordered descending by semver (newest first). This is the Phase-A enumerate
+    step for P3.2's two-phase model: the caller registers the full candidate set
+    into the provider so the solver can choose and backtrack.
 
-    Tianguis-only: a name not in the index is a hard error (no
-    fallback). The vendor-en-absentia bot makes "missing from
-    tianguis" a vendor-bot bug rather than a transient state worth
-    routing around.
+    Same policy as `resolve_named` for structural errors (TNG-NOT-FOUND,
+    TNG-AMBIGUOUS-NAME, TNG-NO-SATISFYING-VERSION, TNG-NO-PROVENANCE).
+    Versions whose version string is unparseable are silently skipped
+    (same behaviour as `resolve_named`).
     """
-    versions = idx.lookup(name)
-    if not versions:
+    result = idx.lookup_bare(name)
+    if result is None:
         raise TianguisError(
             code="TNG-NOT-FOUND",
             message=(
@@ -496,18 +564,24 @@ def resolve_named(idx: Index, name: str, constraint: str | None) -> IndexVersion
                 f"that's a vendor-bot bug; file at coreyleavitt/tianguis)"
             ),
         )
-
+    if isinstance(result, AmbiguousName):
+        raise TianguisError(
+            code="TNG-AMBIGUOUS-NAME",
+            message=(
+                f"package {name!r} matches multiple namespaces: "
+                f"{', '.join(sorted(result.namespaces))} — "
+                f"use a namespace-qualified reference to disambiguate"
+            ),
+        )
+    versions = list(result.versions)
     vs = VersionSet.from_constraint(constraint) if constraint else None
-    # Versions arrive descending-semver; first match is the max satisfying.
+
+    satisfying: list[IndexVersion] = []
     for v in versions:
         parsed = parse_version(v.version)
         if parsed is None:
             continue
         if vs is None or vs.contains(parsed):
-            # An entry that carries identity but no fetchable provenance
-            # is malformed — catch it here, naming the package + version,
-            # rather than letting an empty tuple reach fetch_any (which
-            # raises an opaque "no candidates provided").
             if not v.provenances:
                 raise TianguisError(
                     code="TNG-NO-PROVENANCE",
@@ -516,12 +590,34 @@ def resolve_named(idx: Index, name: str, constraint: str | None) -> IndexVersion
                         f"in the index — unfetchable (malformed entry)"
                     ),
                 )
-            return v
+            satisfying.append(v)
 
-    raise TianguisError(
-        code="TNG-NO-SATISFYING-VERSION",
-        message=(
-            f"no version of {name!r} satisfies constraint {constraint!r} "
-            f"(available: {', '.join(v.version for v in versions)})"
-        ),
-    )
+    if not satisfying:
+        raise TianguisError(
+            code="TNG-NO-SATISFYING-VERSION",
+            message=(
+                f"no version of {name!r} satisfies constraint {constraint!r} "
+                f"(available: {', '.join(v.version for v in versions)})"
+            ),
+        )
+    return satisfying
+
+
+def resolve_named(idx: Index, name: str, constraint: str | None) -> IndexVersion:
+    """Resolve `name` against `idx` and return the highest satisfying
+    IndexVersion. Delegates to `resolve_named_all` and returns the first
+    (highest-semver) result.
+
+    Tianguis-only: a name not in the index is a hard error (no
+    fallback). The vendor-en-absentia bot makes "missing from
+    tianguis" a vendor-bot bug rather than a transient state worth
+    routing around.
+
+    Calls `lookup_bare` (the unqualified registry primitive). On a bare-name
+    collision (AmbiguousName result), raises TNG-AMBIGUOUS-NAME at this policy
+    layer — NOT inside the registry primitive, which stays raise-free for the
+    multi-version provider's backtracking use (P3.2/#100).
+    """
+    # resolve_named_all returns versions in descending semver order; index 0
+    # is the maximum satisfying version — the single-winner semantics.
+    return resolve_named_all(idx, name, constraint)[0]

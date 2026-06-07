@@ -42,7 +42,7 @@ package "nimkdl" {
 
 def test_lookup_returns_one_version_for_known_name():
     idx = parse_index(MINIMAL_INDEX)
-    versions = idx.lookup("nimkdl")
+    versions = idx.lookup("coreyleavitt", "nimkdl")
     assert len(versions) == 1
     assert versions[0].version == "0.1.4"
 
@@ -94,7 +94,7 @@ package "chronos" {{
 
 def test_versions_returned_in_descending_semver_order():
     idx = parse_index(MULTI_VERSION_INDEX)
-    versions = [v.version for v in idx.lookup("chronos")]
+    versions = [v.version for v in idx.lookup("status-im", "chronos")]
     assert versions == ["1.0.0", "0.10.3", "0.2.0"], (
         "versions must be ordered newest-first by semver — input order in "
         "the index file is incidental"
@@ -110,7 +110,7 @@ def test_versions_returned_in_descending_semver_order():
 
 def test_version_exposes_oci_provenance_and_content_hash():
     idx = parse_index(MINIMAL_INDEX)
-    v = idx.lookup("nimkdl")[0]
+    v = idx.lookup("coreyleavitt", "nimkdl")[0]
 
     assert v.content_hash == "sha256:1aaf2a95f53681c86f6dcd4c1267144401ba923f31afa42da3c5ae783dc7ab61"
 
@@ -152,7 +152,7 @@ def test_load_index_fetches_from_url_and_writes_cache(tmp_path: Path):
     # The HTTP layer was consulted once with the expected URL.
     assert calls == ["https://tianguis.dev/index.kdl"]
     # The Index was constructed and is queryable.
-    assert idx.lookup("nimkdl")[0].version == "0.1.4"
+    assert idx.lookup("coreyleavitt", "nimkdl")[0].version == "0.1.4"
     # The cache directory now holds the index file (callers will reuse it).
     cached_files = list(tmp_path.iterdir())
     assert len(cached_files) == 1
@@ -180,7 +180,7 @@ def test_load_index_serves_cache_when_present_without_network(tmp_path: Path):
         cache_dir=tmp_path,
         http_get=forbidden_http,
     )
-    assert idx.lookup("nimkdl")[0].version == "0.1.4"
+    assert idx.lookup("coreyleavitt", "nimkdl")[0].version == "0.1.4"
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +271,7 @@ def test_offline_with_cache_falls_back_to_cache(tmp_path: Path):
         http_get=offline,
         ttl_seconds=60, clock=lambda: 120.0,
     )
-    assert idx.lookup("nimkdl")[0].version == "0.1.4"
+    assert idx.lookup("coreyleavitt", "nimkdl")[0].version == "0.1.4"
 
 
 def test_offline_without_cache_propagates_error(tmp_path: Path):
@@ -552,7 +552,7 @@ package "x" {
     }
 }
 """)
-    versions = [v.version for v in idx.lookup("x")]
+    versions = [v.version for v in idx.lookup("", "x")]
     # Clean semver descending first, unparseable last (stable).
     assert versions == ["1.10.0", "1.2.0", "nightly"]
 
@@ -606,7 +606,7 @@ package "foo" {
         warnings.simplefilter("always")
         idx = parse_index(text)
 
-    versions = idx.lookup("foo")
+    versions = idx.lookup("", "foo")
     # (b) exactly one entry — first occurrence kept
     assert len(versions) == 1, (
         "duplicate version must be dropped, not accumulated"
@@ -637,4 +637,231 @@ package "foo" {
 }
 """
     )
-    assert idx.lookup("foo")[0].version == "1.0.0"
+    assert idx.lookup("", "foo")[0].version == "1.0.0"
+
+
+# ===========================================================================
+# P1.2 — parse_index tuple-key + namespace + AmbiguousName (tianguis #32)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# (0) TNG-AMBIGUOUS-NAME is registered in _TNG_CODES
+# ---------------------------------------------------------------------------
+
+
+def test_tng_ambiguous_name_is_in_codes():
+    """TNG-AMBIGUOUS-NAME must appear in _TNG_CODES so TianguisError
+    construction with this code doesn't AssertionError."""
+    from milpa.tianguis_client import _TNG_CODES
+    assert "TNG-AMBIGUOUS-NAME" in _TNG_CODES, (
+        "TNG-AMBIGUOUS-NAME must be registered in _TNG_CODES before any "
+        "raise site can use it"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (a/b) Package.namespace field + (namespace, name) store key
+# ---------------------------------------------------------------------------
+
+NIMKDL_COLLISION_INDEX = """\
+schema_version 1
+package "nimkdl" {
+    namespace "greenm01"
+    upstream (url)"https://github.com/greenm01/nimkdl"
+    version "0.3.0" {
+        content_hash "sha256:aaa0000000000000000000000000000000000000000000000000000000000000"
+        provenance {
+            kind "git"
+            url "https://github.com/greenm01/nimkdl"
+            ref "HEAD"
+            commit_sha "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+    }
+}
+package "nimkdl" {
+    namespace "coreyleavitt"
+    upstream (url)"https://github.com/coreyleavitt/nimkdl"
+    version "0.1.4" {
+        content_hash "sha256:bbb0000000000000000000000000000000000000000000000000000000000000"
+        provenance {
+            kind "oci"
+            registry "ghcr.io"
+            repository "coreyleavitt/nimkdl"
+            digest "sha256:e51aab085ef4f58ed3827742f3314cadb901ac1da36988cae05bb221f3652c24"
+        }
+    }
+}
+"""
+
+
+def test_package_has_namespace_field():
+    """(a) Package dataclass must carry a `namespace` field populated from
+    the index block."""
+    idx = parse_index(MINIMAL_INDEX)
+    pkgs = list(idx._packages.values())
+    assert len(pkgs) == 1
+    pkg = pkgs[0]
+    assert hasattr(pkg, "namespace"), "Package must have a namespace field"
+    assert pkg.namespace == "coreyleavitt"
+
+
+def test_collision_index_parses_to_two_packages_not_one():
+    """(b) Two `nimkdl` blocks under different namespaces must produce 2
+    distinct entries — not a silent drop of the second."""
+    idx = parse_index(NIMKDL_COLLISION_INDEX)
+    assert len(idx._packages) == 2, (
+        "collision pair must produce 2 package entries, not 1 — "
+        "bare-name keying silently drops one"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (c) lookup(ns, name) + lookup_bare typed union
+# ---------------------------------------------------------------------------
+
+
+def test_lookup_by_namespace_and_name_returns_correct_package():
+    """(c) lookup(namespace, name) returns the one matching Package's
+    versions; a qualified lookup with the wrong namespace returns []."""
+    idx = parse_index(NIMKDL_COLLISION_INDEX)
+    versions = idx.lookup("coreyleavitt", "nimkdl")
+    assert len(versions) == 1
+    assert versions[0].version == "0.1.4"
+
+    versions_other = idx.lookup("greenm01", "nimkdl")
+    assert len(versions_other) == 1
+    assert versions_other[0].version == "0.3.0"
+
+
+def test_lookup_bare_returns_package_when_name_is_unique():
+    """(c) lookup_bare on a unique name returns the Package directly
+    (not AmbiguousName, not None)."""
+    from milpa.tianguis_client import AmbiguousName
+
+    idx = parse_index(MINIMAL_INDEX)
+    result = idx.lookup_bare("nimkdl")
+    assert not isinstance(result, AmbiguousName), (
+        "lookup_bare on a unique name must return the Package, not AmbiguousName"
+    )
+    assert result is not None
+    # It should be a Package — check it has versions
+    assert len(result.versions) == 1
+
+
+def test_lookup_bare_returns_ambiguous_name_on_collision_not_raises():
+    """(c) lookup_bare on a name collision returns AmbiguousName (typed
+    result, does NOT raise). Rationale: the multi-version provider in
+    P3.2/#100 enumerates candidates while backtracking — a raise inside
+    the registry primitive would be a hard stop mid-solve."""
+    from milpa.tianguis_client import AmbiguousName
+
+    idx = parse_index(NIMKDL_COLLISION_INDEX)
+    result = idx.lookup_bare("nimkdl")
+    assert isinstance(result, AmbiguousName), (
+        "lookup_bare on a collision pair must return AmbiguousName, not raise"
+    )
+    assert result.name == "nimkdl"
+    assert set(result.namespaces) == {"greenm01", "coreyleavitt"}
+
+
+# ---------------------------------------------------------------------------
+# (d) resolve_named raises TNG-AMBIGUOUS-NAME at the policy layer
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_named_raises_ambiguous_on_collision():
+    """(d) resolve_named calls lookup_bare; on an AmbiguousName result it
+    raises TianguisError(code='TNG-AMBIGUOUS-NAME'). The raise lives here
+    (policy layer), NOT in the registry primitive."""
+    from milpa.tianguis_client import resolve_named, TianguisError
+
+    idx = parse_index(NIMKDL_COLLISION_INDEX)
+    with pytest.raises(TianguisError) as exc:
+        resolve_named(idx, "nimkdl", None)
+    assert exc.value.code == "TNG-AMBIGUOUS-NAME"
+    # Message names the competing namespaces so the error is actionable.
+    assert "greenm01" in str(exc.value) or "coreyleavitt" in str(exc.value)
+
+
+# ===========================================================================
+# P3.2 — multi-version named-dep provider (resolve_named_all)
+# ===========================================================================
+#
+# `resolve_named` keeps its single-maxver contract (used by existing callers
+# in tests).  `resolve_named_all` is the new entry point that returns ALL
+# satisfying IndexVersions so the resolver can build a multi-candidate set.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_named_all_returns_all_satisfying_versions():
+    """P3.2 gate 1: a named dep with N satisfying index versions yields all N
+    IndexVersions, not just the highest one. The solver can then choose and
+    backtrack among them."""
+    from milpa.tianguis_client import parse_index, resolve_named_all
+
+    idx = parse_index(MULTI_VERSION_INDEX)
+    # chronos has 1.0.0, 0.10.3, 0.2.0; >= 0.5 admits 1.0.0 and 0.10.3
+    versions = resolve_named_all(idx, "chronos", ">= 0.5.0")
+    assert len(versions) == 2
+    version_strs = [v.version for v in versions]
+    assert "1.0.0" in version_strs
+    assert "0.10.3" in version_strs
+
+
+def test_resolve_named_all_returns_all_when_no_constraint():
+    """resolve_named_all with constraint=None returns every parseable version."""
+    from milpa.tianguis_client import parse_index, resolve_named_all
+
+    idx = parse_index(MULTI_VERSION_INDEX)
+    versions = resolve_named_all(idx, "chronos", None)
+    assert len(versions) == 3
+    version_strs = [v.version for v in versions]
+    assert "1.0.0" in version_strs
+    assert "0.10.3" in version_strs
+    assert "0.2.0" in version_strs
+
+
+def test_resolve_named_all_raises_not_found_for_unknown_name():
+    """resolve_named_all raises TNG-NOT-FOUND for a name not in the index."""
+    from milpa.tianguis_client import parse_index, resolve_named_all, TianguisError
+
+    idx = parse_index(MINIMAL_INDEX)
+    with pytest.raises(TianguisError) as exc:
+        resolve_named_all(idx, "ghost", None)
+    assert exc.value.code == "TNG-NOT-FOUND"
+
+
+def test_resolve_named_all_raises_no_satisfying_version_when_none_match():
+    """resolve_named_all raises TNG-NO-SATISFYING-VERSION when no version
+    satisfies the constraint (all parseable versions are excluded)."""
+    from milpa.tianguis_client import parse_index, resolve_named_all, TianguisError
+
+    idx = parse_index(MULTI_VERSION_INDEX)
+    with pytest.raises(TianguisError) as exc:
+        resolve_named_all(idx, "chronos", ">= 99.0.0")
+    assert exc.value.code == "TNG-NO-SATISFYING-VERSION"
+
+
+def test_resolve_named_all_raises_ambiguous_on_name_collision():
+    """resolve_named_all raises TNG-AMBIGUOUS-NAME when a bare name matches
+    multiple namespaces (same policy layer as resolve_named)."""
+    from milpa.tianguis_client import parse_index, resolve_named_all, TianguisError
+
+    idx = parse_index(NIMKDL_COLLISION_INDEX)
+    with pytest.raises(TianguisError) as exc:
+        resolve_named_all(idx, "nimkdl", None)
+    assert exc.value.code == "TNG-AMBIGUOUS-NAME"
+
+
+def test_resolve_named_all_versions_are_ordered_descending_by_semver():
+    """The returned list is ordered newest-first (descending semver) — the
+    provider registers them in this order so maxver still picks index 0."""
+    from milpa.tianguis_client import parse_index, resolve_named_all
+
+    idx = parse_index(MULTI_VERSION_INDEX)
+    versions = resolve_named_all(idx, "chronos", None)
+    version_strs = [v.version for v in versions]
+    # Descending: 1.0.0 > 0.10.3 > 0.2.0
+    from milpa.solver import parse_version
+    parsed = [parse_version(s) for s in version_strs]
+    assert parsed == sorted(parsed, reverse=True)
