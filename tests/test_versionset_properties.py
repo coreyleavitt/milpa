@@ -16,7 +16,7 @@ shrinking fast and edge cases concentrated.
 
 from hypothesis import given, strategies as st
 
-from milpa.solver import VersionSet
+from milpa.solver import Version, VersionSet
 
 
 # ---------------------------------------------------------------------------
@@ -25,10 +25,11 @@ from milpa.solver import VersionSet
 
 @st.composite
 def version_tuple(draw):
-    """A single Version tuple (major, minor, patch) ∈ [0,9]^3.
+    """A single Version (major, minor, patch) ∈ [0,9]^3.
     Bounded space keeps generation + shrinking fast while preserving
-    boundary-case coverage."""
-    return (
+    boundary-case coverage. Emits the new Version NamedTuple so
+    VersionSet algebra receives the correct element type."""
+    return Version(
         draw(st.integers(min_value=0, max_value=9)),
         draw(st.integers(min_value=0, max_value=9)),
         draw(st.integers(min_value=0, max_value=9)),

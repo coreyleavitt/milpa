@@ -42,6 +42,7 @@ from .fetchers.oci import OciProvenance
 from .fetchers.tarball import TarballProvenance
 from .identity import IdentityError, compute_content_hash, parse_identity
 from .resolver import ResolvedDep, ResolvedGraph
+from .solver import Version
 
 
 LOCKFILE_SCHEMA_VERSION = 1
@@ -258,7 +259,18 @@ def _provenance_from_resolved(d: ResolvedDep) -> ProvenanceRecord:
     return GitProvenanceRecord(url=src, ref=d.ref, commit_sha=d.sha)
 
 
-def _format_version(v: tuple[int, int, int]) -> str:
+def _format_version(v: Version) -> str:
+    """Format a Version as a lossless semver string.
+
+    Emits major.minor.patch[-pre][+build]. Build metadata is preserved
+    for round-trip even though it is ignored for ordering and equality.
+    Accepts both Version objects and bare 3-tuples (backward compat for
+    tests and call sites that pass raw tuples).
+    """
+    if isinstance(v, Version):
+        from .solver import _format_version_str
+        return _format_version_str(v)
+    # Bare tuple (e.g. (0, 0, 1)) — emit the release triple only.
     return f"{v[0]}.{v[1]}.{v[2]}"
 
 

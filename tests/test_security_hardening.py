@@ -182,7 +182,7 @@ package "foo" {
 }
 """)
     from milpa.fetchers.git import GitProvenance
-    p = idx.lookup("foo")[0].provenances[0]
+    p = idx.lookup("", "foo")[0].provenances[0]
     assert isinstance(p, GitProvenance)
     assert p.commit_sha == "cafef00dcafef00dcafef00dcafef00dcafef00d"
 
@@ -281,7 +281,7 @@ package "nim-chronos" {
     }
 }
 """)
-    assert idx.lookup("nim-chronos")[0].version == "1.0.0"
+    assert idx.lookup("", "nim-chronos")[0].version == "1.0.0"
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +363,7 @@ package "foo" {
 }
 """)
     from milpa.fetchers.oci import OciProvenance
-    p = idx.lookup("foo")[0].provenances[0]
+    p = idx.lookup("", "foo")[0].provenances[0]
     assert isinstance(p, OciProvenance)
     assert p.digest == "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 

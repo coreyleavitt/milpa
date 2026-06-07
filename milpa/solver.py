@@ -37,8 +37,54 @@ The algorithm:
 
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
+from functools import total_ordering
 from typing import Protocol
 import re
+
+
+# ---------------------------------------------------------------------------
+# Conflict narration structures (P3.4)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ConflictStep:
+    """One step in a PubGrub conflict derivation.
+
+    consequent_package: the package whose version space is constrained
+      (or exhausted) by this step.
+    consequent_description: human-readable description of what happened
+      to the consequent (e.g. "has no satisfying version").
+    antecedents: the *depender* Terms (positive terms from dep-constraint
+      incompatibilities) that introduce conflicting requirements on the
+      consequent package.  E.g. for "a@1.0.0 requires shared ≥1.0.0",
+      the antecedent Term is the positive ``a`` term.  Each antecedent
+      pairs with the corresponding entry in ``antecedent_constraints``.
+    antecedent_constraints: the constraint Terms for the consequent
+      package from each dep-incompatibility (the negative terms, i.e.
+      what the depender *requires* of the consequent).  Parallel to
+      ``antecedents`` — same length.
+    cause_tag: the raw cause string from the incompatibility that
+      triggered this step (e.g. "dependency:a@1.0.0").
+    """
+    consequent_package: str
+    consequent_description: str
+    antecedents: tuple["Term", ...]
+    antecedent_constraints: tuple["Term", ...]
+    cause_tag: str
+
+
+@dataclass(frozen=True)
+class ConflictChain:
+    """Structured PubGrub conflict derivation — an ordered list of steps.
+
+    The chain is ordered from root causes to final conclusion.  Each
+    step names the package whose resolution fails and the antecedent
+    Terms (dependency requirements) that force the failure.
+
+    Use ``render_conflict_chain`` to produce human-readable prose; use
+    the ``steps`` field directly for structural assertions in tests.
+    """
+    steps: tuple[ConflictStep, ...]
 
 
 class Strategy(StrEnum):
@@ -57,19 +103,214 @@ class Strategy(StrEnum):
     SEMVER = "semver"
 
 
-Version = tuple[int, int, int]
+@total_ordering
+class Version:
+    """Semantic version with semver-2.0 total order (P3.1b).
+
+    Carries major/minor/patch as ints, pre as a tuple of (int | str)
+    identifiers (empty = release), and build as a str (empty = none).
+    Build metadata is parsed and stored for round-trip but IGNORED for
+    equality and ordering per semver 2.0.
+
+    Backward-compat drop-in for bare 3-tuples (P3.1a invariant):
+      - Version(1,0,0) == (1,0,0) and hash(Version(1,0,0)) == hash((1,0,0))
+        so existing dict[(x,y,z)] lookups and equality checks with bare
+        tuples continue to work without modification.
+      - v[0]/v[1]/v[2] index access is preserved via __getitem__.
+      - Version(1,0,0,pre=('alpha',)) != (1,0,0) (different pre ≠ release).
+
+    Prerelease total order (semver 2.0 §11):
+      1. Pre-release version has lower precedence than the release it
+         annotates: 1.0.0-alpha < 1.0.0.
+      2. Pre-release identifiers compared left-to-right:
+         - Numeric identifiers compared numerically.
+         - Alphanumeric identifiers compared in ASCII order.
+         - Numeric identifiers always have lower precedence than
+           alphanumeric identifiers.
+      3. A larger set of identifiers has higher precedence than a smaller
+         set (when all preceding identifiers are equal).
+    """
+
+    __slots__ = ("major", "minor", "patch", "pre", "build")
+
+    def __init__(
+        self,
+        major: int,
+        minor: int,
+        patch: int,
+        pre: tuple = (),
+        build: str = "",
+    ) -> None:
+        object.__setattr__(self, "major", major)
+        object.__setattr__(self, "minor", minor)
+        object.__setattr__(self, "patch", patch)
+        object.__setattr__(self, "pre", pre)
+        object.__setattr__(self, "build", build)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("Version is immutable")
+
+    def __getitem__(self, index: int) -> int:
+        """Support v[0]/v[1]/v[2] index access for backward compat."""
+        if index == 0:
+            return self.major
+        if index == 1:
+            return self.minor
+        if index == 2:
+            return self.patch
+        raise IndexError(f"Version index {index} out of range (0-2)")
+
+    def __iter__(self):
+        """Support iteration / unpacking for backward compat.
+
+        Yields only (major, minor, patch) — the 3-element tuple that
+        existing code expects. Build metadata and prerelease are not
+        yielded so that `tuple(v)` == `(major, minor, patch)` and
+        dict[(x,y,z)] lookups continue to work.
+        """
+        yield self.major
+        yield self.minor
+        yield self.patch
+
+    def __len__(self) -> int:
+        return 3
+
+    def _precedence_key(self):
+        """Comparison key for semver precedence (build ignored).
+
+        Returns (major, minor, patch, is_release, pre_key) where:
+          - is_release=1 for releases (no prerelease, sorts above pre)
+          - is_release=0 for prereleases
+          - pre_key is the semver-ordered prerelease key
+        """
+        if not self.pre:
+            return (self.major, self.minor, self.patch, 1, ())
+        # Per semver: numeric identifiers sort before alphanumeric.
+        # Represent each identifier as (0, n) for numeric or (1, s) for alpha.
+        pre_key = tuple(
+            (0, id_) if isinstance(id_, int) else (1, id_)
+            for id_ in self.pre
+        )
+        return (self.major, self.minor, self.patch, 0, pre_key)
+
+    def __eq__(self, other) -> bool:
+        """Equality ignores build metadata (semver 2.0).
+
+        For release versions (empty pre), also equals a plain 3-tuple
+        (major, minor, patch) for backward compat with existing code
+        that uses bare tuples as dict keys and in equality checks.
+        """
+        if isinstance(other, Version):
+            return self._precedence_key() == other._precedence_key()
+        if isinstance(other, tuple) and len(other) == 3:
+            # Compare as a release version: this works correctly for
+            # prerelease versions too — Version(1,0,0,pre=('alpha',)) has
+            # precedence_key (1,0,0,0,...) which != (1,0,0) so they won't
+            # equal.
+            # We compare by constructing a release Version from the tuple.
+            return self._precedence_key() == Version(other[0], other[1], other[2])._precedence_key()
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        """Hash consistent with __eq__.
+
+        Release versions (empty pre) hash identically to the plain
+        3-tuple (major, minor, patch) so that existing dict[(x,y,z)]
+        lookups hit entries keyed by Version(x,y,z) and vice versa.
+        """
+        if not self.pre:
+            return hash((self.major, self.minor, self.patch))
+        # Prerelease versions: hash the full precedence key so that
+        # Version(1,0,0,pre=('alpha',)) != Version(1,0,0) in sets/dicts.
+        return hash(self._precedence_key())
+
+    def __lt__(self, other) -> bool:
+        if isinstance(other, Version):
+            return self._precedence_key() < other._precedence_key()
+        if isinstance(other, tuple) and len(other) == 3:
+            return self._precedence_key() < Version(other[0], other[1], other[2])._precedence_key()
+        return NotImplemented
+
+    def __le__(self, other) -> bool:
+        if isinstance(other, Version):
+            return self._precedence_key() <= other._precedence_key()
+        if isinstance(other, tuple) and len(other) == 3:
+            return self._precedence_key() <= Version(other[0], other[1], other[2])._precedence_key()
+        return NotImplemented
+
+    def __gt__(self, other) -> bool:
+        if isinstance(other, Version):
+            return self._precedence_key() > other._precedence_key()
+        if isinstance(other, tuple) and len(other) == 3:
+            return self._precedence_key() > Version(other[0], other[1], other[2])._precedence_key()
+        return NotImplemented
+
+    def __ge__(self, other) -> bool:
+        if isinstance(other, Version):
+            return self._precedence_key() >= other._precedence_key()
+        if isinstance(other, tuple) and len(other) == 3:
+            return self._precedence_key() >= Version(other[0], other[1], other[2])._precedence_key()
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        s = f"Version({self.major}, {self.minor}, {self.patch}"
+        if self.pre:
+            s += f", pre={self.pre!r}"
+        if self.build:
+            s += f", build={self.build!r}"
+        s += ")"
+        return s
+
+    def __str__(self) -> str:
+        return _format_version_str(self)
 
 
-_VERSION_RE = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
+def _format_version_str(v: "Version") -> str:
+    """Format a Version as a semver string (major.minor.patch[-pre][+build])."""
+    s = f"{v.major}.{v.minor}.{v.patch}"
+    if v.pre:
+        s += "-" + ".".join(str(id_) for id_ in v.pre)
+    if v.build:
+        s += "+" + v.build
+    return s
 
 
-def parse_version(text: str) -> Version | None:
-    """Parse a version string to a (major, minor, patch) triple.
+# Semver regex: optional v-prefix, M.m.p, optional -pre, optional +build.
+# Pre-release identifiers: dot-separated alphanumeric+hyphen identifiers.
+# Build metadata: dot-separated alphanumeric+hyphen identifiers.
+_VERSION_RE = re.compile(
+    r"v?(\d+)\.(\d+)\.(\d+)"
+    r"(?:-([0-9A-Za-z\-]+(?:\.[0-9A-Za-z\-]+)*))?"
+    r"(?:\+([0-9A-Za-z\-]+(?:\.[0-9A-Za-z\-]+)*))?"
+    r"\Z"
+)
+
+
+def _parse_pre_identifiers(pre_str: str) -> tuple:
+    """Parse a semver prerelease string into a tuple of (int | str) identifiers.
+
+    Per semver 2.0: identifiers consisting entirely of digits are parsed
+    as integers (no leading zeros). Others remain strings.
+    """
+    ids = []
+    for part in pre_str.split("."):
+        if part.isdigit():
+            ids.append(int(part))
+        else:
+            ids.append(part)
+    return tuple(ids)
+
+
+def parse_version(text: str) -> "Version | None":
+    """Parse a semver string to a Version.
 
     Accepts an optional `v` prefix (`v0.5.1` and `0.5.1` both parse).
-    Returns `None` for tags milpa v0 doesn't model — prereleases,
-    build metadata, non-canonical prefixes (`nimble-1.2.3`). Callers
-    decide whether to skip silently or treat as error.
+    Parses prerelease identifiers (stored in `pre`) and build metadata
+    (stored in `build`). Build metadata is preserved for round-trip but
+    ignored for ordering and equality per semver 2.0.
+
+    Returns `None` for non-canonical tags (e.g., `nimble-1.2.3`).
+    Callers decide whether to skip silently or treat as error.
 
     This is the canonical version parser used by both the solver
     (for constraint clause parsing) and the registry (for filtering
@@ -80,25 +321,60 @@ def parse_version(text: str) -> Version | None:
     m = _VERSION_RE.fullmatch(text.strip())
     if m is None:
         return None
-    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    major = int(m.group(1))
+    minor = int(m.group(2))
+    patch = int(m.group(3))
+    pre_str = m.group(4)
+    build_str = m.group(5)
+    pre = _parse_pre_identifiers(pre_str) if pre_str else ()
+    build = build_str if build_str else ""
+    return Version(major, minor, patch, pre=pre, build=build)
 
 
 # ---------------------------------------------------------------------------
-# VersionSet — union of disjoint half-open intervals over Version.
+# VersionSet — union of disjoint generalized intervals over Version.
+#
+# P3.1b interval representation: each interval is a 4-tuple
+#   (lo, hi, lo_closed, hi_closed)
+# where:
+#   lo = Version | None (None = -∞, always exclusive)
+#   hi = Version | None (None = +∞, always exclusive)
+#   lo_closed = bool: True → lo is inclusive (lo <= v), False → exclusive (lo < v)
+#   hi_closed = bool: True → hi is inclusive (v <= hi), False → exclusive (v < hi)
+#
+# Existing half-open [lo, hi) intervals are (lo, hi, True, False).
+# Closed singletons {v} used by eq(v) are (v, v, True, True).
+# Open-left intervals (v, +∞) used by complement of {v} are (v, None, False, True).
 # ---------------------------------------------------------------------------
+
+# Type alias for the 4-tuple interval representation.
+_Interval = tuple  # (lo, hi, lo_closed, hi_closed) — all 4 elements
 
 
 @dataclass(frozen=True)
 class VersionSet:
-    """Union of disjoint half-open intervals [lo, hi). `None` means
-    unbounded on that side. Intervals sorted by lo, non-overlapping,
-    no zero-width intervals."""
+    """Union of disjoint generalized intervals over Version.
 
-    intervals: tuple[tuple[Version | None, Version | None], ...]
+    Each interval is a 4-tuple (lo, hi, lo_closed, hi_closed):
+      - lo/hi: Version endpoints (None = unbounded)
+      - lo_closed: True → lo inclusive ([lo,...), False → exclusive ((lo,...))
+      - hi_closed: True → hi inclusive (...,hi]), False → exclusive (...,hi))
+
+    Canonical form: intervals sorted by lo, non-overlapping, no empty
+    intervals, adjacent intervals merged when they share a common point
+    that is inclusive on at least one side.
+
+    eq(v) is the true singleton {v} = (v, v, True, True). This is the
+    P3.1b fix: the old [v, v_next) half-open representation admitted
+    prerelease versions of v_next because prereleases sort below their
+    release. The closed-point form is structurally exact.
+    """
+
+    intervals: tuple
 
     @classmethod
     def full(cls) -> "VersionSet":
-        return cls(intervals=((None, None),))
+        return cls(intervals=((None, None, True, False),))
 
     @classmethod
     def empty(cls) -> "VersionSet":
@@ -106,7 +382,7 @@ class VersionSet:
 
     @classmethod
     def gte(cls, v: Version) -> "VersionSet":
-        return cls(intervals=((v, None),))
+        return cls(intervals=((v, None, True, False),))
 
     @classmethod
     def gt(cls, v: Version) -> "VersionSet":
@@ -114,7 +390,7 @@ class VersionSet:
 
     @classmethod
     def lt(cls, v: Version) -> "VersionSet":
-        return cls(intervals=((None, v),))
+        return cls(intervals=((None, v, True, False),))
 
     @classmethod
     def lte(cls, v: Version) -> "VersionSet":
@@ -122,44 +398,118 @@ class VersionSet:
 
     @classmethod
     def eq(cls, v: Version) -> "VersionSet":
-        """Single point [v, v_next)."""
-        v_next = (v[0], v[1], v[2] + 1)
-        return cls(intervals=((v, v_next),))
+        """True singleton {v} — the P3.1b closed-point representation.
+
+        (v, v, True, True) is a closed-closed interval meaning exactly
+        {v}. This is structurally correct: no other version can satisfy
+        both lo <= w <= hi when lo == hi == v.
+
+        Prior to P3.1b this used [v, v_next) which admitted prerelease
+        versions of v_next (since e.g. 1.0.1-rc.1 < 1.0.1, the interval
+        [1.0.0, 1.0.1) wrongly contained 1.0.1-rc.1).
+        """
+        return cls(intervals=((v, v, True, True),))
 
     @classmethod
     def from_constraint(cls, constraint: str | None) -> "VersionSet":
         if constraint is None or constraint.strip() in ("", "any version"):
             return cls.full()
-        clauses = [c.strip() for c in constraint.split("&")]
-        result = cls.full()
-        for clause in clauses:
-            result = result.intersect(cls._parse_clause(clause))
+        # OR has lower precedence than AND: split on || or | first, then
+        # each arm is a conjunction of &-separated clauses.
+        arms = re.split(r"\|\|?", constraint)
+        result = cls.empty()
+        for arm in arms:
+            arm_clauses = [c.strip() for c in arm.split("&")]
+            arm_result = cls.full()
+            for clause in arm_clauses:
+                arm_result = arm_result.intersect(cls._parse_clause(clause))
+            result = result.union(arm_result)
         return result
 
     @classmethod
     def _parse_clause(cls, clause: str) -> "VersionSet":
-        parts = clause.split(None, 1)
-        if len(parts) != 2:
-            raise ValueError(f"unparseable constraint clause: {clause!r}")
-        op, ver_str = parts[0], parts[1]
-        v = parse_version(ver_str)
-        if v is None:
-            raise ValueError(f"unparseable version in constraint: {ver_str!r}")
-        match op:
-            case ">=": return cls.gte(v)
-            case "<=": return cls.lte(v)
-            case ">":  return cls.gt(v)
-            case "<":  return cls.lt(v)
-            case "==": return cls.eq(v)
-            case _:
-                raise ValueError(f"unknown comparison op {op!r}")
+        clause = clause.strip()
+        # Match longest operators first to avoid prefix collisions
+        # (>= before >, <= before <, == and != before =).
+        for op in (">=", "<=", "==", "!=", ">", "<", "~", "^", "="):
+            if clause.startswith(op):
+                ver_str = clause[len(op):].strip()
+                v = parse_version(ver_str)
+                if v is None:
+                    raise ValueError(
+                        f"unparseable version in constraint: {ver_str!r}"
+                    )
+                match op:
+                    case ">=": return cls.gte(v)
+                    case "<=": return cls.lte(v)
+                    case ">":  return cls.gt(v)
+                    case "<":  return cls.lt(v)
+                    case "==" | "=": return cls.eq(v)
+                    case "!=": return cls.eq(v).complement()
+                    case "~":  return cls._tilde(v)
+                    case "^":  return cls._caret(v)
+        raise ValueError(f"unparseable constraint clause: {clause!r}")
 
-    def contains(self, v: Version) -> bool:
-        for lo, hi in self.intervals:
-            if lo is not None and v < lo:
-                continue
-            if hi is not None and v >= hi:
-                continue
+    @classmethod
+    def _tilde(cls, v: "Version") -> "VersionSet":
+        """Tilde operator: allow patch-level changes within the specified
+        minor (or minor-level changes within the specified major when
+        patch and minor are both zero).
+
+        ~M.m.p → >=M.m.p <M.(m+1).0
+        ~M.m.0 → >=M.m.0 <M.(m+1).0  (same rule when patch is 0)
+        ~M.0.0 → >=M.0.0 <(M+1).0.0  (when minor is also 0, bump major)
+        """
+        lo = cls.gte(v)
+        if v.minor == 0 and v.patch == 0:
+            # ~M.0.0 — bump major for the upper bound
+            hi = cls.lt(Version(v.major + 1, 0, 0))
+        else:
+            # ~M.m.p — bump minor for the upper bound
+            hi = cls.lt(Version(v.major, v.minor + 1, 0))
+        return lo.intersect(hi)
+
+    @classmethod
+    def _caret(cls, v: "Version") -> "VersionSet":
+        """Caret operator: compatible-with — bump the left-most non-zero
+        component for the upper bound.
+
+        ^M.m.p (M>0) → >=M.m.p <(M+1).0.0
+        ^0.m.p (m>0) → >=0.m.p <0.(m+1).0
+        ^0.0.p       → >=0.0.p <0.0.(p+1)
+        ^0.0.0       → >=0.0.0 <0.1.0
+        """
+        lo = cls.gte(v)
+        if v.major > 0:
+            hi = cls.lt(Version(v.major + 1, 0, 0))
+        elif v.minor > 0:
+            hi = cls.lt(Version(0, v.minor + 1, 0))
+        elif v.patch > 0:
+            hi = cls.lt(Version(0, 0, v.patch + 1))
+        else:
+            # ^0.0.0 — no non-zero component; treat as ^0.0 → <0.1.0
+            hi = cls.lt(Version(0, 1, 0))
+        return lo.intersect(hi)
+
+    def contains(self, v) -> bool:
+        # Accept both Version and plain 3-tuples (backward compat).
+        if not isinstance(v, Version):
+            v = Version(v[0], v[1], v[2])
+        for lo, hi, lo_c, hi_c in self.intervals:
+            if lo is not None:
+                if lo_c:
+                    if v < lo:
+                        continue
+                else:
+                    if v <= lo:
+                        continue
+            if hi is not None:
+                if hi_c:
+                    if v > hi:
+                        continue
+                else:
+                    if v >= hi:
+                        continue
             return True
         return False
 
@@ -167,13 +517,13 @@ class VersionSet:
         return not self.intervals
 
     def intersect(self, other: "VersionSet") -> "VersionSet":
-        out: list[tuple[Version | None, Version | None]] = []
-        for a_lo, a_hi in self.intervals:
-            for b_lo, b_hi in other.intervals:
-                lo = _max_lo(a_lo, b_lo)
-                hi = _min_hi(a_hi, b_hi)
-                if _interval_nonempty(lo, hi):
-                    out.append((lo, hi))
+        out: list = []
+        for a_lo, a_hi, a_lc, a_hc in self.intervals:
+            for b_lo, b_hi, b_lc, b_hc in other.intervals:
+                lo, lo_c = _max_lo_with_closed(a_lo, a_lc, b_lo, b_lc)
+                hi, hi_c = _min_hi_with_closed(a_hi, a_hc, b_hi, b_hc)
+                if _interval_nonempty(lo, hi, lo_c, hi_c):
+                    out.append((lo, hi, lo_c, hi_c))
         return VersionSet(intervals=tuple(_normalize_intervals(out)))
 
     def union(self, other: "VersionSet") -> "VersionSet":
@@ -184,71 +534,180 @@ class VersionSet:
         )
 
     def complement(self) -> "VersionSet":
+        """Complement of the VersionSet.
+
+        For each interval (lo, hi, lo_c, hi_c):
+          - If lo is not None: the left gap endpoint is (None, lo) where
+            the hi-side of the gap is open iff lo was closed (complement
+            inverts the endpoint's closedness).
+          - Between intervals i and i+1: gap from hi_i to lo_{i+1} where
+            the gap's lo_c = not hi_c_i and hi_c = not lo_c_{i+1}.
+          - If hi is not None: the right tail is (hi, None) where the
+            lo-side is open iff hi was closed.
+        """
         if not self.intervals:
             return VersionSet.full()
-        out: list[tuple[Version | None, Version | None]] = []
-        first_lo = self.intervals[0][0]
-        if first_lo is not None:
-            out.append((None, first_lo))
+        out: list = []
+        lo0, _, lo0_c, _ = self.intervals[0]
+        if lo0 is not None:
+            # Left gap: (-∞, lo0) with hi openness = not lo0_c
+            out.append((None, lo0, True, not lo0_c))
         for i in range(len(self.intervals) - 1):
-            _, hi = self.intervals[i]
-            next_lo, _ = self.intervals[i + 1]
-            out.append((hi, next_lo))
-        last_hi = self.intervals[-1][1]
+            _, hi_i, _, hi_c_i = self.intervals[i]
+            lo_n, _, lo_c_n, _ = self.intervals[i + 1]
+            # Gap between interval i's hi and interval i+1's lo
+            out.append((hi_i, lo_n, not hi_c_i, not lo_c_n))
+        _, last_hi, _, last_hi_c = self.intervals[-1]
         if last_hi is not None:
-            out.append((last_hi, None))
-        return VersionSet(intervals=tuple(out))
+            # Right tail: (last_hi, +∞) with lo openness = not last_hi_c
+            # hi=None means +∞ (always exclusive), so hi_closed=False.
+            out.append((last_hi, None, not last_hi_c, False))
+        return VersionSet(intervals=tuple(_normalize_intervals(out)))
 
     def is_subset_of(self, other: "VersionSet") -> bool:
         """`self` ⊆ `other` iff `self ∩ other^c = ∅`."""
         return self.intersect(other.complement()).is_empty()
 
 
-def _max_lo(a: Version | None, b: Version | None) -> Version | None:
-    if a is None: return b
-    if b is None: return a
-    return max(a, b)
+def _max_lo_with_closed(
+    a: "Version | None", a_c: bool,
+    b: "Version | None", b_c: bool,
+) -> tuple:
+    """Return the larger of two lower bounds, preserving closedness.
+
+    When both bounds are equal, prefer open (False) over closed (True)
+    because the intersection of [lo, ...) and (lo, ...) is (lo, ...).
+    """
+    if a is None:
+        return b, b_c
+    if b is None:
+        return a, a_c
+    if a > b:
+        return a, a_c
+    if b > a:
+        return b, b_c
+    # Equal bounds: intersection is open iff either is open
+    return a, (a_c and b_c)
 
 
-def _min_hi(a: Version | None, b: Version | None) -> Version | None:
-    if a is None: return b
-    if b is None: return a
-    return min(a, b)
+def _min_hi_with_closed(
+    a: "Version | None", a_c: bool,
+    b: "Version | None", b_c: bool,
+) -> tuple:
+    """Return the smaller of two upper bounds, preserving closedness.
+
+    When both bounds are equal, prefer open (False) for the same reason.
+    """
+    if a is None:
+        return b, b_c
+    if b is None:
+        return a, a_c
+    if a < b:
+        return a, a_c
+    if b < a:
+        return b, b_c
+    # Equal bounds: intersection is open iff either is open
+    return a, (a_c and b_c)
 
 
-def _interval_nonempty(lo: Version | None, hi: Version | None) -> bool:
+def _interval_nonempty(
+    lo: "Version | None", hi: "Version | None", lo_c: bool, hi_c: bool
+) -> bool:
     if lo is None or hi is None:
         return True
-    return lo < hi
+    if lo < hi:
+        return True
+    if lo == hi and lo_c and hi_c:
+        return True  # closed point [v, v] = {v}
+    return False
 
 
-def _normalize_intervals(
-    intervals: list[tuple[Version | None, Version | None]],
-) -> list[tuple[Version | None, Version | None]]:
-    def lo_key(iv):
-        return (0,) if iv[0] is None else (1, iv[0])
-    sorted_ivs = sorted(intervals, key=lo_key)
-    merged: list[tuple[Version | None, Version | None]] = []
-    for lo, hi in sorted_ivs:
-        if not _interval_nonempty(lo, hi):
+def _normalize_intervals(intervals: list) -> list:
+    """Sort + merge a list of 4-tuple intervals into canonical form.
+
+    Two intervals can merge if they overlap OR are adjacent at a point
+    that is closed on at least one side. Returns sorted, non-overlapping,
+    non-degenerate intervals.
+    """
+    def lo_sort_key(iv):
+        lo, _, lo_c, _ = iv
+        if lo is None:
+            return (0,)
+        # Sort by lo value; when equal, closed comes before open
+        # (closed interval starts "earlier" in the inclusive sense)
+        return (1, lo, 0 if lo_c else 1)
+
+    def canonical(iv):
+        lo, hi, lo_c, hi_c = iv
+        # Unbounded endpoints: lo=None is always exclusive (irrelevant),
+        # canonicalize to lo_closed=True; hi=None is always exclusive,
+        # canonicalize to hi_closed=False.
+        if lo is None:
+            lo_c = True
+        if hi is None:
+            hi_c = False
+        return (lo, hi, lo_c, hi_c)
+
+    sorted_ivs = sorted(intervals, key=lo_sort_key)
+    merged: list = []
+    for raw_iv in sorted_ivs:
+        iv = canonical(raw_iv)
+        lo, hi, lo_c, hi_c = iv
+        if not _interval_nonempty(lo, hi, lo_c, hi_c):
             continue
-        if merged:
-            prev_lo, prev_hi = merged[-1]
-            # Overlap conditions (any one of):
-            #   - prev extends to +∞ (prev_hi is None)
-            #   - current starts at -∞ (lo is None) — always overlaps a
-            #     non-empty prev. Found by Hypothesis 2026-05-22 in #63:
-            #     prior code only checked `lo is not None and lo <= prev_hi`
-            #     so two `lo=None` intervals failed to merge, breaking the
-            #     union-with-full identity property.
-            #   - current's lo is at or before prev's upper bound
-            if prev_hi is None or lo is None or lo <= prev_hi:
-                new_hi = (None if (prev_hi is None or hi is None)
-                          else max(prev_hi, hi))
-                merged[-1] = (prev_lo, new_hi)
-                continue
-        merged.append((lo, hi))
+        if not merged:
+            merged.append((lo, hi, lo_c, hi_c))
+            continue
+        prev_lo, prev_hi, prev_lo_c, prev_hi_c = merged[-1]
+        if _intervals_connectable(prev_lo, prev_hi, prev_lo_c, prev_hi_c,
+                                   lo, hi, lo_c, hi_c):
+            new_hi, new_hi_c = _max_bound(prev_hi, prev_hi_c, hi, hi_c)
+            merged[-1] = (prev_lo, new_hi, prev_lo_c, new_hi_c)
+        else:
+            merged.append((lo, hi, lo_c, hi_c))
     return merged
+
+
+def _intervals_connectable(
+    a_lo, a_hi, a_lo_c, a_hi_c,
+    b_lo, b_hi, b_lo_c, b_hi_c,
+) -> bool:
+    """True if intervals A and B should be merged (overlap or adjacent).
+
+    Assumes A is sorted before B (a_lo <= b_lo semantically).
+    """
+    # A extends to +∞ → always overlaps
+    if a_hi is None:
+        return True
+    # B starts at -∞ → always overlaps a non-empty A
+    if b_lo is None:
+        return True
+    # a_hi < b_lo: definitely separate (gap exists)
+    if a_hi < b_lo:
+        return False
+    # a_hi > b_lo: definitely overlap
+    if a_hi > b_lo:
+        return True
+    # a_hi == b_lo: connectable iff either endpoint is closed
+    # (i.e., the shared point is included by at least one interval)
+    return a_hi_c or b_lo_c
+
+
+def _max_bound(
+    a: "Version | None", a_c: bool,
+    b: "Version | None", b_c: bool,
+) -> tuple:
+    """Return the larger of two upper bounds for a merged interval."""
+    if a is None:
+        return a, a_c
+    if b is None:
+        return b, b_c
+    if a > b:
+        return a, a_c
+    if b > a:
+        return b, b_c
+    # Equal: keep closed if either is closed (union is closed)
+    return a, (a_c or b_c)
 
 
 # ---------------------------------------------------------------------------
@@ -451,9 +910,14 @@ class PackageProvider(Protocol):
 class SolverError(Exception):
     """Raised when no solution exists.
 
-    The message includes the constraint chain that produced the
-    contradiction.
+    Carries a structured ``ConflictChain`` (the ``chain`` attribute) that
+    can be rendered with ``render_conflict_chain``.  ``str(err)`` returns
+    the rendered prose so existing log/print sites keep working.
     """
+
+    def __init__(self, chain: "ConflictChain") -> None:
+        self.chain = chain
+        super().__init__(render_conflict_chain(chain))
 
 
 class _Conflict(Exception):
@@ -513,14 +977,14 @@ def solve(
             # Full PubGrub does conflict-driven incompatibility learning +
             # multi-level backjumping. Tracked at #28.)
             if partial.decision_level == 0:
-                raise SolverError(_format_conflict_chain(
-                    root_cause_conflicts, conflict.incompat, partial
+                raise SolverError(build_conflict_chain(
+                    root_cause_conflicts, conflict.incompat, incompats
                 ))
             target_level = partial.decision_level - 1
             undone = partial.backtrack_to(target_level)
             if undone is None:
-                raise SolverError(_format_conflict_chain(
-                    root_cause_conflicts, conflict.incompat, partial
+                raise SolverError(build_conflict_chain(
+                    root_cause_conflicts, conflict.incompat, incompats
                 ))
             decided_pkg = undone.term.package
             decided_version = undone.term.versions.intervals[0][0]
@@ -646,7 +1110,7 @@ def _lower_bound_of(vs: VersionSet) -> Version | None:
     interval is unbounded below."""
     if not vs.intervals:
         return None
-    bounds = [lo for lo, _ in vs.intervals]
+    bounds = [iv[0] for iv in vs.intervals]
     if any(b is None for b in bounds):
         return None
     return min(b for b in bounds if b is not None)
@@ -669,30 +1133,197 @@ def _next_undecided(partial: PartialSolution) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Error formatting
+# Error formatting (P3.4: structured ConflictChain + rendered prose)
 # ---------------------------------------------------------------------------
 
-def _format_conflict_chain(
+def build_conflict_chain(
     root_causes: list[Incompatibility],
     final_incompat: Incompatibility,
-    partial: PartialSolution,
-) -> str:
-    """Produce a multi-conflict narration covering every real dep-graph
-    contradiction the solver hit before giving up."""
-    lines = ["version solving failed"]
-    # De-duplicate root causes by their string representation.
-    seen: set[str] = set()
-    for incompat in root_causes + [final_incompat]:
-        if incompat.cause.startswith("conflict-blocks:"):
+    all_incompats: list[Incompatibility],
+) -> ConflictChain:
+    """Build a structured ConflictChain from the solver's collected conflicts.
+
+    Algorithm (per spec):
+    - Build a term-package index: {package → list[Incompatibility]} keyed
+      on each package appearing in an incompat's terms (NOT its cause).
+      This answers "which incompatibilities constrain package X?" and is
+      the correct index for finding antecedents.
+    - The root_cause_conflicts identify which packages triggered conflicts.
+      For each such incompat, find the *constrained* package (the one that
+      appears as a negative term — the package the dependency *requires*).
+      Then look it up in the term-package index to get ALL dep-incompats
+      that constrain it, producing the full antecedent set.
+    - Each unique constrained package becomes one ConflictStep.
+    """
+    # Build the term-package index over all known incompatibilities.
+    # Key = package name appearing in any term; value = list of dep-constraint
+    # incompatibilities (cause starts with "dependency:") whose terms contain
+    # that package.  This is keyed on *terms*, NOT on cause.
+    term_pkg_index: dict[str, list[Incompatibility]] = {}
+    for incompat in all_incompats:
+        if not incompat.cause.startswith("dependency:"):
             continue
-        key = "|".join(_term_str(t) for t in incompat.terms)
-        if key in seen:
-            continue
-        seen.add(key)
-        lines.append(f"  conflict ({incompat.cause}):")
         for term in incompat.terms:
-            lines.append(f"    {_term_str(term)}")
-    return "\n".join(lines)
+            term_pkg_index.setdefault(term.package, []).append(incompat)
+
+    steps: list[ConflictStep] = []
+    seen_consequents: set[str] = set()
+
+    def _emit_step_for_package(pkg: str, cause_tag: str) -> None:
+        """Emit one ConflictStep for a conflicted package, using the
+        term-package index to find all dep-constraint antecedents.
+
+        For each dep-incompat that constrains `pkg`, collect:
+        - The positive term (the depender — who requires `pkg`).
+        - The negative term (the constraint on `pkg` — what version range
+          the depender requires of `pkg`).
+        These are stored as parallel tuples: ``antecedents`` (dependers)
+        and ``antecedent_constraints`` (what they require of `pkg`).
+        """
+        if pkg in seen_consequents:
+            return
+        seen_consequents.add(pkg)
+
+        # Look up all dep-incompatibilities that constrain this package.
+        dep_incompats = term_pkg_index.get(pkg, [])
+
+        depender_terms: list[Term] = []
+        constraint_terms: list[Term] = []
+        seen_constraints: set[str] = set()
+
+        for dep_ic in dep_incompats:
+            # Each dep-incompat has terms like:
+            #   [positive: depender@ver, negative: pkg NOT in constraint]
+            pos_terms = [t for t in dep_ic.terms if t.positive and t.package != pkg]
+            neg_terms = [t for t in dep_ic.terms if not t.positive and t.package == pkg]
+            if not neg_terms:
+                continue
+            constraint_t = neg_terms[0]
+            ck = _term_str(constraint_t)
+            if ck in seen_constraints:
+                continue
+            seen_constraints.add(ck)
+            # Use first positive (depender) term, or create a synthetic one
+            # if none (e.g. root-level requirement).
+            depender_t = pos_terms[0] if pos_terms else constraint_t
+            depender_terms.append(depender_t)
+            constraint_terms.append(constraint_t)
+
+        if not constraint_terms:
+            # No dep-index entry: e.g. package is missing from provider.
+            steps.append(ConflictStep(
+                consequent_package=pkg,
+                consequent_description=f"{pkg} has no satisfying version",
+                antecedents=(),
+                antecedent_constraints=(),
+                cause_tag=cause_tag,
+            ))
+            return
+
+        steps.append(ConflictStep(
+            consequent_package=pkg,
+            consequent_description=f"{pkg} has no satisfying version",
+            antecedents=tuple(depender_terms),
+            antecedent_constraints=tuple(constraint_terms),
+            cause_tag=cause_tag,
+        ))
+
+    # Process real (non-conflict-blocks) root causes to find the
+    # packages whose constraints are directly contradictory.
+    real_causes = [
+        ic for ic in root_causes + [final_incompat]
+        if not ic.cause.startswith("conflict-blocks:")
+    ]
+
+    for incompat in real_causes:
+        if incompat.cause.startswith("dependency:"):
+            # A dependency-constraint incompat: terms = [positive:depender,
+            # negative:required_pkg]. The *required* package (the negative
+            # term) is the one being constrained — look it up in the index.
+            neg_terms = [t for t in incompat.terms if not t.positive]
+            for neg_t in neg_terms:
+                # Only emit if this package has ≥2 antecedents (diamond) OR
+                # if it has no satisfying versions at all (missing dep).
+                _emit_step_for_package(neg_t.package, incompat.cause)
+        elif incompat.cause.startswith("no-versions"):
+            # A "no versions" incompat: the single positive term is the
+            # package that ran out of versions. Emit it.
+            pos_terms = [t for t in incompat.terms if t.positive]
+            for pos_t in pos_terms:
+                _emit_step_for_package(pos_t.package, incompat.cause)
+
+    if not steps:
+        # Final fallback: emit something useful from the final incompat.
+        terms = list(final_incompat.terms)
+        pkg = terms[0].package if terms else "unknown"
+        cause = final_incompat.cause
+        steps.append(ConflictStep(
+            consequent_package=pkg,
+            consequent_description=f"{pkg} has no satisfying version",
+            antecedents=(),
+            antecedent_constraints=tuple(terms),
+            cause_tag=cause,
+        ))
+
+    return ConflictChain(steps=tuple(steps))
+
+
+def render_conflict_chain(chain: ConflictChain) -> str:
+    """Render a ConflictChain as human-readable English prose.
+
+    Produces the PubGrub-style derivation:
+      "Because a ≥1.0.0 requires shared ≥1.0.0 and b ≥1.0.0 requires
+       shared <1.0.0, shared has no satisfying version."
+
+    Each step is indented on its own line so the derivation reads as a
+    proof, not one wrapped sentence.  The CLI prints this multi-line so
+    it reads as a derivation tree, not one wrapped paragraph.
+    """
+    if not chain.steps:
+        return "version solving failed"
+
+    lines: list[str] = []
+    for step in chain.steps:
+        dependers = step.antecedents
+        constraints = step.antecedent_constraints
+        if dependers and constraints:
+            # Produce "X requires Y" clauses for each antecedent pair.
+            clauses: list[str] = []
+            for dep_t, con_t in zip(dependers, constraints):
+                dep_str = _format_set(dep_t.versions)
+                con_str = _format_constraint_as_requirement(con_t)
+                if dep_t.package == con_t.package:
+                    # Degenerate: depender and constraint are the same package
+                    # (root-level or fallback). Just describe the constraint.
+                    clauses.append(con_str)
+                else:
+                    clauses.append(
+                        f"{dep_t.package} {dep_str} requires {con_t.package} {con_str}"
+                    )
+            because_str = " and ".join(clauses)
+            lines.append(f"  Because {because_str},")
+            lines.append(f"    {step.consequent_description}.")
+        elif constraints:
+            # No dependers (fallback), show raw constraints.
+            con_strs = " and ".join(_term_str(t) for t in constraints)
+            lines.append(f"  Because {con_strs},")
+            lines.append(f"    {step.consequent_description}.")
+        else:
+            lines.append(f"  {step.consequent_description}.")
+
+    return "version solving failed\n" + "\n".join(lines)
+
+
+def _format_constraint_as_requirement(term: Term) -> str:
+    """Render a negative Term as the requirement it encodes.
+
+    A negative Term ``pkg NOT in [1.0, +∞)`` in a dependency incompat
+    means the depender *requires* pkg in [1.0, +∞).  We negate the
+    VersionSet to get the actual requirement range and format that.
+    """
+    # Negate the forbidden set to get the required set.
+    required = term.versions.complement()
+    return _format_set(required)
 
 
 def _term_str(term: Term) -> str:
@@ -704,17 +1335,25 @@ def _format_set(vs: VersionSet) -> str:
     if not vs.intervals:
         return "(empty)"
     parts: list[str] = []
-    for lo, hi in vs.intervals:
+    for lo, hi, lo_c, hi_c in vs.intervals:
         if lo is None and hi is None:
             parts.append("any")
         elif lo is None:
-            parts.append(f"< {_v(hi)}")
+            end = "]" if hi_c else ")"
+            parts.append(f"(-∞, {_v(hi)}{end}")
         elif hi is None:
-            parts.append(f">= {_v(lo)}")
+            start = "[" if lo_c else "("
+            parts.append(f"{start}{_v(lo)}, +∞)")
+        elif lo == hi and lo_c and hi_c:
+            parts.append(f"{{{_v(lo)}}}")
         else:
-            parts.append(f"[{_v(lo)}, {_v(hi)})")
+            start = "[" if lo_c else "("
+            end = "]" if hi_c else ")"
+            parts.append(f"{start}{_v(lo)}, {_v(hi)}{end}")
     return " ∪ ".join(parts)
 
 
-def _v(v: Version) -> str:
+def _v(v: "Version | tuple") -> str:
+    if isinstance(v, Version):
+        return _format_version_str(v)
     return f"{v[0]}.{v[1]}.{v[2]}"
