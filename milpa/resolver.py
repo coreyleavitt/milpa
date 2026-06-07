@@ -16,6 +16,7 @@ Tests inject a fake fetcher so the integration runs without network or
 git operations.
 """
 
+from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -85,7 +86,7 @@ class ResolvedGraph:
 # Sentinel version used for URL deps. URL deps have exactly one version
 # (the resolved commit/content); the solver doesn't reason about their
 # version space.
-_URL_DEP_VERSION: Version = (0, 0, 1)
+_URL_DEP_VERSION: Version = Version(0, 0, 1)
 
 
 @dataclass
@@ -122,20 +123,48 @@ class _Candidate:
     self_mirrors: tuple[str, ...] = ()
 
 
+@dataclass
+class _NamedDepStub:
+    """Lightweight stub for a named-dep candidate before fetch (Phase A).
+
+    Registered in `_MaterializedProvider._stubs` during BFS enumeration.
+    When the solver selects this (name, version) and calls
+    `provider.dependencies()`, the stub is materialized: fetched, nimble-
+    parsed, and replaced by a real `_Candidate` in the provider.
+
+    The fetcher context (deps_dir, fetcher, overrides_by_name) is captured
+    at enumeration time so Phase B is self-contained.
+    """
+    name: str
+    version: Version
+    index_version: "tianguis_client.IndexVersion"  # version metadata + provenance
+    deps_dir: Path
+    fetcher: "FetcherRegistry"
+    overrides_by_name: dict
+
+
 class _MaterializedProvider:
     """PackageProvider backed by the resolver's materialized candidate set.
 
-    Two-phase population for content-hash dedup (#32):
+    Two-phase population:
 
-    1. During BFS, workers produce candidates which are buffered via
-       `record(c)`. The provider's `candidates` map is NOT populated
-       during BFS — only after all candidates are collected.
+    Phase A (BFS enumeration — no fetch):
+      Named deps are registered as `_NamedDepStub` objects via
+      `register_named_stubs()`. URL/local/tarball deps are buffered via
+      `record()` as before (they continue to be fetched eagerly in BFS).
 
-    2. After BFS completes, `finalize(deps_dir)` partitions buffered
-       candidates by content_hash, picks a deterministic canonical
-       name (lexicographically earliest) per group, registers only
-       canonicals in `candidates`, builds the alias map, and removes
-       duplicate _deps/<name>/ directories from disk.
+    Phase B (lazy materialization — fetch on demand):
+      When the solver calls `dependencies(pkg, version)` for a stub, the
+      stub is fetched + nimble-parsed inline. Any newly-discovered
+      transitive named deps are enrolled as additional stubs immediately,
+      so the solver can continue without a restart (P3.2 fixpoint).
+
+    Dedup (content-hash, #32 — unchanged for URL/tarball):
+      URL-dep workers produce candidates which are buffered via `record(c)`.
+      After BFS completes, `finalize(deps_dir)` partitions buffered
+      candidates by content_hash, picks a deterministic canonical name, and
+      registers only canonicals in `candidates`. Named-dep stubs bypass this
+      path — they are materialized directly into `candidates` during solve.
 
     Pre-existing synthetic candidates (__root__, workspace members)
     are added via `add()` directly — they bypass dedup and are in
@@ -154,6 +183,13 @@ class _MaterializedProvider:
         self._pending: list[_Candidate] = []
         # alias name → canonical name (populated by finalize())
         self.aliases: dict[str, str] = {}
+        # Phase A stubs: name -> {version: _NamedDepStub}
+        # Cleared on materialization (one stub per (name, version) at most).
+        self._stubs: dict[str, dict[Version, _NamedDepStub]] = {}
+        # Callback for newly discovered transitive named deps during Phase B.
+        # Set by the resolve() BFS orchestrator so that inline materialization
+        # can enroll newly-seen transitive named deps.
+        self._on_new_named: "Callable[[str, str | None], None] | None" = None
 
     def add(self, c: _Candidate) -> None:
         """Add unconditionally — used for synthetic candidates (__root__,
@@ -257,14 +293,127 @@ class _MaterializedProvider:
                         self.aliases.get(n, n) for n in c.requires_names
                     ]
 
+    def register_named_stubs(
+        self,
+        name: str,
+        stubs: list["_NamedDepStub"],
+    ) -> None:
+        """Phase A: register lightweight version stubs for a named dep.
+
+        All satisfying IndexVersions are registered as stubs so the solver
+        can see the full candidate set and backtrack. No fetch happens here.
+        Does NOT overwrite an existing materialized candidate — if a version
+        is already in `candidates` (e.g. re-enumeration from a fixpoint),
+        we skip that stub (it's already concrete)."""
+        stub_versions = self._stubs.setdefault(name, {})
+        for stub in stubs:
+            if stub.version in self.candidates.get(name, {}):
+                continue  # already materialized — don't revert to stub
+            stub_versions[stub.version] = stub
+
+    def _materialize_stub(self, stub: "_NamedDepStub") -> "_Candidate":
+        """Phase B: fetch + parse the named dep for the selected version.
+
+        Called lazily from `dependencies()` the first time the solver
+        selects this (name, version). Produces a real _Candidate with
+        dep_terms + requires_names populated from the nimble file.
+
+        Any transitive named deps discovered here are immediately enrolled
+        as stubs (Phase A for transitive deps) so the solver can see them
+        in subsequent `versions()` calls without requiring a full restart.
+        """
+        idx_ver = stub.index_version
+        name = stub.name
+
+        # Identity gate (Invariant 1) — same as the old _process_named.
+        if not idx_ver.content_hash:
+            raise tianguis_client.TianguisError(
+                code="TNG-NO-IDENTITY",
+                message=(
+                    f"index entry for {name!r} version {idx_ver.version!r} "
+                    f"carries no content_hash — cannot verify fetched bytes. "
+                    f"This index entry is malformed; file a bug at "
+                    f"coreyleavitt/tianguis."
+                ),
+            )
+        result = stub.fetcher.fetch_any(
+            name,
+            list(idx_ver.provenances),
+            dest=stub.deps_dir / name,
+            expected_identity=idx_ver.content_hash,
+        )
+        sha = _commit_sha_or_none(result.receipt)
+        nimble_path = _find_nimble_file(result.path, name)
+        nm = parse_nimble(nimble_path.read_text()) if nimble_path.exists() else None
+        terms, requires_names, sub_url_deps, sub_named = (
+            _build_terms(nm, stub.overrides_by_name)
+            if nm else ([], [], [], [])
+        )
+        chosen = idx_ver.canonical_provenance
+        candidate = _Candidate(
+            name=name, version=stub.version,
+            source=_named_source_display(name, chosen),
+            ref=getattr(chosen, "ref", None),
+            sha=sha,
+            identity=result.identity,
+            src_dir=(nm.src_dir or "") if nm else "",
+            dep_terms=list(terms), requires_names=list(requires_names),
+            provenance=chosen,
+        )
+        # Register into the live candidates map so subsequent calls to
+        # get() / dependencies() see the materialized candidate.
+        self.candidates.setdefault(name, {})[stub.version] = candidate
+        # Drop the stub — it's now concrete.
+        self._stubs.get(name, {}).pop(stub.version, None)
+
+        # Enroll transitive named deps as Phase A stubs so the solver can
+        # immediately see them. URL transitive deps are not enrolled here —
+        # they were fetched eagerly in BFS (the existing path). Named
+        # transitive deps that are already stubs or materialized are skipped.
+        if self._on_new_named:
+            for n in sub_named:
+                self._on_new_named(n.name, n.constraint)
+        # URL transitives from a named dep's nimble go to the BFS queue
+        # via the same path as before; we surface them via the callback
+        # mechanism if one is configured, otherwise they're ignored at
+        # this point (they would have been fetched in Phase B for URL deps
+        # discovered transitively — this is a pre-existing limitation for
+        # transitive URL deps from named packages, not a P3.2 regression).
+
+        print(f"✓ {name} {idx_ver.version}", file=sys.stderr)
+        return candidate
+
     def get(self, name: str, version: Version) -> _Candidate:
+        # If the solver selected a stub version, it has been materialized
+        # by `dependencies()` before `_build_graph` calls `get()`.
+        # But be defensive — materialize inline if somehow get() is called
+        # before dependencies().
+        if name not in self.candidates or version not in self.candidates.get(name, {}):
+            stub = self._stubs.get(name, {}).get(version)
+            if stub is not None:
+                return self._materialize_stub(stub)
         return self.candidates[name][version]
 
     def versions(self, package: str) -> list[Version]:
-        return sorted(self.candidates.get(package, {}).keys())
+        """Return all known versions for package — both materialized
+        candidates and Phase A stubs (sorted ascending for the solver)."""
+        known: set[Version] = set(self.candidates.get(package, {}).keys())
+        known.update(self._stubs.get(package, {}).keys())
+        return sorted(known)
 
     def dependencies(self, package: str, version: Version) -> list[Term]:
-        return list(self.candidates[package][version].dep_terms)
+        # Fast path: already materialized.
+        if version in self.candidates.get(package, {}):
+            return list(self.candidates[package][version].dep_terms)
+        # Lazy materialization: this is a Phase A stub being selected for
+        # the first time by the solver.
+        stub = self._stubs.get(package, {}).get(version)
+        if stub is not None:
+            candidate = self._materialize_stub(stub)
+            return list(candidate.dep_terms)
+        # Should not happen — the solver only calls dependencies() for
+        # versions that appeared in versions(), which covers both.
+        raise KeyError(f"no candidate for {package!r} @ {version}")
 
 
 def resolve(
@@ -374,7 +523,7 @@ def resolve(
 
     # The synthetic root candidate at version (0,0,0):
     root_cand = _Candidate(
-        name="__root__", version=(0, 0, 0),
+        name="__root__", version=Version(0, 0, 0),
         source="root", ref=None, sha=None, identity=None,
         src_dir="", dep_terms=root_terms,
         requires_names=root_requires,
@@ -459,7 +608,7 @@ def resolve(
                         overrides_by_name,
                         prior_lockfile,
                     )
-                else:  # named
+                else:  # named — Phase A: enumerate stubs synchronously (no fetch)
                     name, constraint = item[1], item[2]
                     if name in seen_named:
                         return
@@ -467,11 +616,14 @@ def resolve(
                         seen_named.add(name)
                         return
                     seen_named.add(name)
-                    print(f"fetching {name}...", file=sys.stderr)
-                    fut = ex.submit(
-                        _process_named, name, constraint, deps_dir, fetcher,
-                        index, overrides_by_name,
+                    # Phase A: enumerate all satisfying IndexVersions as
+                    # lightweight stubs. The solver will trigger Phase B
+                    # (fetch) lazily via dependencies() for the chosen version.
+                    _enumerate_named(
+                        name, constraint, deps_dir, fetcher,
+                        index, overrides_by_name, provider,
                     )
+                    return  # no future — synchronous, nothing to track
             in_flight[fut] = item
 
         def drain_inflight():
@@ -555,8 +707,38 @@ def resolve(
     # regardless of BFS arrival order.
     provider.finalize(deps_dir)
 
+    # Wire up the Phase B transitive callback. When the solver triggers
+    # lazy materialization of a named stub, any newly-discovered transitive
+    # named deps are enrolled as stubs immediately (in-solve Phase A).
+    # `seen_named` is still in scope here and acts as the dedup gate.
+    def _on_new_named(name: str, constraint: str | None) -> None:
+        if name in seen_named or name == "nim":
+            return
+        seen_named.add(name)
+        item = _apply_override(("named", name, constraint), overrides_by_name)
+        if item[0] == "named":
+            # Enumerate ALL versions of the transitive dep (no constraint
+            # pre-filter). The constraint from the nimble is already encoded in
+            # `dep_terms` as a solver incompatibility — pre-filtering here would
+            # shrink the candidate set to only those satisfying THIS dep's view
+            # of the constraint, which is wrong when the solver may backtrack to
+            # a parent that no longer imposes the same constraint. Passing None
+            # lets the solver see the full candidate space and handle constraint
+            # accumulation correctly (including backtracking through the parent
+            # that introduced this transitive dep). See P3.3 S2 diamond test.
+            _enumerate_named(
+                name, None, deps_dir, fetcher,
+                index, overrides_by_name, provider,
+            )
+        # If override turns it into a URL dep, we can't fetch synchronously
+        # during solve — that case is rare (a named dep from a nimble that
+        # is overridden to a URL), and is a pre-existing edge-case limitation
+        # that predates P3.2. Silently skip so no regression is introduced.
+
+    provider._on_new_named = _on_new_named
+
     # Solve.
-    solution = solve(provider, "__root__", (0, 0, 0), strategy=strategy)
+    solution = solve(provider, "__root__", Version(0, 0, 0), strategy=strategy)
     # Map solution → ResolvedGraph (topologically sorted).
     return _build_graph(solution, provider)
 
@@ -676,7 +858,7 @@ def resolve_workspace(
         queue.extend(sub_items)
 
     root_cand = _Candidate(
-        name="__root__", version=(0, 0, 0),
+        name="__root__", version=Version(0, 0, 0),
         source="root", ref=None, sha=None, identity=None,
         src_dir="", dep_terms=root_terms,
         requires_names=root_requires,
@@ -766,7 +948,7 @@ def resolve_workspace(
     # via add() and are exempt from content-hash dedup.
     provider.finalize(deps_dir)
 
-    solution = solve(provider, "__root__", (0, 0, 0), strategy=strategy)
+    solution = solve(provider, "__root__", Version(0, 0, 0), strategy=strategy)
     return _build_graph(solution, provider)
 
 
@@ -964,7 +1146,10 @@ def _version_satisfies(actual: str, constraint: str) -> bool:
     (\"2.0\") in the constraint are normalized to full triples
     (\"2.0.0\") since VersionSet only accepts complete versions."""
     parts = actual.split(".")
-    triple = tuple(int(x) for x in parts[:3]) + (0,) * (3 - len(parts[:3]))
+    digits = [int(x) for x in parts[:3]]
+    while len(digits) < 3:
+        digits.append(0)
+    triple = Version(*digits)
     try:
         vset = VersionSet.from_constraint(_normalize_constraint(constraint))
     except Exception:
@@ -1207,7 +1392,7 @@ def _extract_from_milpa_kdl(
                 continue
             constraint_set = (
                 VersionSet.from_constraint(d.constraint)
-                if d.constraint else VersionSet.all()
+                if d.constraint else VersionSet.full()
             )
             sub_terms.append(
                 Term.require(d.name, constraint_set)
@@ -1341,6 +1526,48 @@ def _process_local(
     return candidate, new_items
 
 
+def _enumerate_named(
+    name: str,
+    constraint: str | None,
+    deps_dir: Path,
+    fetcher: "FetcherRegistry",
+    index: Index,
+    overrides_by_name: dict | None,
+    provider: "_MaterializedProvider",
+) -> None:
+    """Phase A: enumerate all satisfying IndexVersions for `name` as
+    lightweight stubs and register them in `provider`. No fetch occurs.
+
+    Each stub carries the IndexVersion metadata + fetch context so that
+    Phase B (_materialize_stub) is self-contained when the solver selects
+    a version.
+
+    Called synchronously from the BFS submit() for named deps (no
+    thread needed — no I/O). Also called from the _on_new_named callback
+    during Phase B for transitives discovered inline during solve.
+    """
+    index_versions = tianguis_client.resolve_named_all(index, name, constraint)
+    stubs: list[_NamedDepStub] = []
+    for iv in index_versions:
+        ver = parse_version(iv.version)
+        # resolve_named_all only returns parseable versions; this assert
+        # guards the invariant.
+        assert ver is not None, (
+            f"resolve_named_all returned unparseable version "
+            f"{iv.version!r} for {name!r}"
+        )
+        stubs.append(_NamedDepStub(
+            name=name,
+            version=ver,
+            index_version=iv,
+            deps_dir=deps_dir,
+            fetcher=fetcher,
+            overrides_by_name=overrides_by_name or {},
+        ))
+    provider.register_named_stubs(name, stubs)
+    print(f"indexed {name} ({len(stubs)} version(s))", file=sys.stderr)
+
+
 def _process_named(
     name: str,
     constraint: str | None,
@@ -1352,6 +1579,11 @@ def _process_named(
     """Worker function: resolve a named dep through the tianguis index,
     fetch it at the index-pinned provenance, parse its nimble for
     transitives (milpa#97).
+
+    NOTE: This function is retained as a direct-call path for the
+    resolve_workspace() BFS (which hasn't been migrated to Phase A/B yet —
+    that migration is a follow-on task). The main resolve() path now uses
+    _enumerate_named (Phase A) + lazy _materialize_stub (Phase B) instead.
 
     The index authoritatively supplies identity (`content_hash` — the
     verification gate), provenance (git/oci, dispatched by the

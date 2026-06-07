@@ -17,6 +17,7 @@ from milpa.fetchers.git import GitProvenance, GitReceipt
 from milpa.manifest import Manifest, UrlDep
 from milpa.profile import Profile
 from milpa.resolver import resolve
+from tests.indexkdl import make_index
 
 
 class MilpaKdlFetcher:
@@ -554,3 +555,64 @@ deps {
     names = {d.name for d in graph.deps}
     # json was honored
     assert "serde" in names
+
+
+def test_transitive_milpa_kdl_named_dep_without_constraint_does_not_crash(tmp_path):
+    """Regression: _extract_from_milpa_kdl called VersionSet.all() (line 1210)
+    when a transitive milpa.kdl contained a bare NamedDep (constraint=None).
+    That classmethod does not exist — the correct name is VersionSet.full().
+    The AttributeError fires only via this transitive milpa.kdl path; a
+    top-level NamedDep goes through a different code path and doesn't hit it.
+
+    Setup: top → mylib (UrlDep), mylib has a milpa.kdl that declares
+    results as a bare NamedDep (no constraint).  The tianguis index has
+    one version of results.  Resolution must succeed (not raise
+    AttributeError) and results must appear in the graph."""
+    index = make_index([
+        {"name": "results", "version": "0.3.0",
+         "url": "https://example.com/results.git", "ref": "v0.3.0"},
+    ])
+
+    class MilpaKdlWithNamedDepFetcher:
+        def __init__(self): self.fetched = []
+        def can_handle(self, p): return isinstance(p, GitProvenance)
+        def fetch(self, name, p, *, dest):
+            self.fetched.append(name)
+            dest.mkdir(parents=True, exist_ok=True)
+            if name == "mylib":
+                (dest / "milpa.kdl").write_text(
+                    'name "mylib"\n'
+                    'kind "library"\n'
+                    'deps {\n'
+                    '    results\n'   # bare NamedDep — no constraint
+                    '}\n'
+                )
+            (dest / f"{name}.nimble").write_text('srcDir = "src"\n')
+            return GitReceipt(commit_sha="abc")
+
+    fetcher_impl = MilpaKdlWithNamedDepFetcher()
+    registry = FetcherRegistry()
+    registry.register(fetcher_impl)
+
+    top_manifest = Manifest(
+        kind="library", name="proj",
+        deps=(UrlDep(
+            name="mylib",
+            git="https://example.com/mylib.git", ref="main",
+        ),),
+    )
+
+    # Before the fix this raises:
+    #   AttributeError: type object 'VersionSet' has no attribute 'all'
+    graph = resolve(
+        top_manifest,
+        deps_dir=tmp_path / "_deps",
+        fetcher=registry,
+        index=index,
+        profile=Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0"),
+    )
+    names = {d.name for d in graph.deps}
+    assert "mylib" in names
+    assert "results" in names, (
+        f"results (bare NamedDep from transitive milpa.kdl) should be in graph; got {names}"
+    )

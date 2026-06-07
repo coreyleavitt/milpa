@@ -132,46 +132,61 @@ def test_resolve_dedup_same_url_ref(tmp_path):
     assert len(shared_calls) == 1
 
 
-def test_resolve_named_dep_picks_maxver_from_index(tmp_path):
-    """A named dep resolves through the tianguis index, which is
-    maxver-only (milpa#97; strategy selection over the index is deferred
-    to #98). With three satisfying index versions, the highest (1.0.0) is
-    fetched and becomes the single candidate — even under MINVER, which
-    no longer reaches into the index's version set."""
+def test_resolve_named_dep_strategy_applies_to_index_versions(tmp_path):
+    """P3.2: with the multi-version candidate set, the resolver strategy now
+    applies to named deps from the index.
+
+    - MAXVER picks the highest satisfying version (1.0.0).
+    - MINVER picks the lowest satisfying version (0.4.0).
+
+    Pre-P3.2 behaviour (always maxver regardless of strategy) is GONE —
+    this test documents the new correct behaviour.
+    """
     from milpa.manifest import NamedDep
     from milpa.solver import Strategy
-    from tests.indexkdl import make_index
+    from tests.indexkdl import make_index, fake_content_hash
 
     manifest = Manifest(
         deps=(NamedDep(name="foo", constraint=">= 0.4.0"),),
         kind="library",
     )
+    nimble = 'srcDir = "src"\n'
     index = make_index([
         {"name": "foo", "version": "0.4.0",
-         "url": "https://example.com/foo.git", "ref": "v0.4.0"},
+         "url": "https://example.com/foo.git", "ref": "v0.4.0",
+         "content_hash": fake_content_hash("foo", nimble)},
         {"name": "foo", "version": "0.5.0",
-         "url": "https://example.com/foo.git", "ref": "v0.5.0"},
+         "url": "https://example.com/foo.git", "ref": "v0.5.0",
+         "content_hash": fake_content_hash("foo", nimble)},
         {"name": "foo", "version": "1.0.0",
-         "url": "https://example.com/foo.git", "ref": "v1.0.0"},
+         "url": "https://example.com/foo.git", "ref": "v1.0.0",
+         "content_hash": fake_content_hash("foo", nimble)},
     ])
 
-    # Write the standard default nimble so make_index's auto-computed
-    # content_hash matches the recomputed identity (H1 fix).
-    reg, _ = fake_registry({
-        ("https://example.com/foo.git", "v1.0.0"): ("sha100", 'srcDir = "src"\n'),
+    reg_max, _ = fake_registry({
+        ("https://example.com/foo.git", "v1.0.0"): ("sha100", nimble),
+    })
+    reg_min, _ = fake_registry({
+        ("https://example.com/foo.git", "v0.4.0"): ("sha040", nimble),
     })
 
-    graph = resolve(
-        manifest, deps_dir=tmp_path / "_deps",
-        index=index,
-        fetcher=reg,
-        strategy=Strategy.MINVER,
+    # MAXVER: highest satisfying wins.
+    graph_max = resolve(
+        manifest, deps_dir=tmp_path / "_deps_max",
+        index=index, fetcher=reg_max, strategy=Strategy.MAXVER,
     )
-    foo_dep = next(d for d in graph.deps if d.name == "foo")
-    assert foo_dep.version == (1, 0, 0)
-    # Named deps now record a git provenance (the index's), not a tag.
-    assert foo_dep.source == "https://example.com/foo.git"
-    assert foo_dep.ref == "v1.0.0"
+    foo_max = next(d for d in graph_max.deps if d.name == "foo")
+    assert foo_max.version == (1, 0, 0)
+    assert foo_max.ref == "v1.0.0"
+
+    # MINVER: lowest satisfying wins (strategy now applies to named deps).
+    graph_min = resolve(
+        manifest, deps_dir=tmp_path / "_deps_min",
+        index=index, fetcher=reg_min, strategy=Strategy.MINVER,
+    )
+    foo_min = next(d for d in graph_min.deps if d.name == "foo")
+    assert foo_min.version == (0, 4, 0)
+    assert foo_min.ref == "v0.4.0"
 
 
 def test_resolve_parallel_produces_byte_identical_lockfile(tmp_path):

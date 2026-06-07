@@ -41,7 +41,7 @@ from .nimcfg import write_nimcfg
 from .tianguis_client import (
     DEFAULT_INDEX_URL, Index, IndexLoader, default_index_cache_dir, load_index,
 )
-from .solver import Strategy
+from .solver import SolverError, Strategy, render_conflict_chain
 from .resolver import ResolvedGraph, resolve, resolve_workspace
 from .workspace import workspace_containing
 
@@ -1123,6 +1123,14 @@ def _resolve_or_error(
             prior_lockfile=prior_lockfile,
             profile=profile,
         )
+    except SolverError as e:
+        # Render the structured conflict derivation multi-line so it reads
+        # as a proof, not one wrapped line.
+        rendered = render_conflict_chain(e.chain)
+        print("resolution failed:", file=sys.stderr)
+        for line in rendered.splitlines():
+            print(f"  {line}", file=sys.stderr)
+        return 1
     except Exception as e:
         print(f"resolution failed: {e}", file=sys.stderr)
         return 1
