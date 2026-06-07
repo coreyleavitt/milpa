@@ -39,25 +39,51 @@ fix *is* the substrate #98 and #86 build on. Designing them separately would mea
 rebuilding the same constraint-accumulation + multi-candidate-materialization path
 three times.
 
-## Design direction (sketch — to be settled)
+## Design direction — settled at the architecture level (2026-06-06)
 
-- Replace name-only `seen_named` with a name→constraint-set accumulator; defer
-  `resolve_named` until the constraint set for a name is closed (or feed multiple
-  candidate versions to the solver so it can backtrack, restoring the old
-  list-all-tags semantics without the old network cost).
-- Make `resolve_named` strategy-aware (walk ascending/descending/semver-major).
-- Thread an optional `exclude_newer` timestamp into candidate filtering; needs an
-  index-recorded publish timestamp per version (tianguis schema question).
+The root cause is **not** in the resolver — it's that the tianguis index carries
+no dependency edges, so milpa must *fetch* a package to learn its requires, which
+forces the eager single-version pre-resolution layer that drops the second
+constraint. Every best-in-class resolver avoids this by keeping dep metadata cheap
+and lazy and letting the solver own selection:
+
+- **uv** (pubgrub-rs): PubGrub accumulates constraints natively; `get_dependencies`
+  is a cheap per-version metadata fetch (PEP 658), never the artifact.
+- **Cargo**: the crates.io index *is* per-version `{name, version, deps[]}` — the
+  whole graph resolves with zero crate downloads.
+
+milpa **already has the constraint-accumulating PubGrub** (`solver.py`); it's being
+starved by the eager layer. So the real fix is the **Cargo/uv model: put per-version
+dep edges in the tianguis index** → milpa's provider answers `get_dependencies`
+from the index → the eager layer is retired → PubGrub resolves natively → **#100
+dissolves**, with backtracking + good conflict diagnostics for free. #98 (strategy)
+and #86 (exclude-newer; `published_at` already exists per index version) ride the
+same provider.
+
+This depends on tianguis schema work and is sequenced **after** tianguis #32
+(identity = `(namespace, name)`), because dep edges reference packages by identity:
+
+1. tianguis **#32** — settle `(namespace, name)`, designed to be referenceable.
+2. tianguis **`docs/rfc-index-deps.md`** (DRAFT, committed) — per-version dep
+   metadata citing #32 identity.
+3. milpa — provider gains cheap `get_dependencies`; retire the eager named-dep
+   layer; #98/#86 land on the native PubGrub path.
+
+**Rejected:** the in-architecture "re-resolve against the accumulated intersection
++ re-fetch on conflict" patch — it's throwaway machinery the index-deps model
+deletes ([[feedback_no_workarounds]]). No stopgap is being built; #100 stays open,
+blocked on the index-deps work.
 
 ## Open questions
 
-- Eager-accumulate vs. feed-many-candidates-to-solver (the cleaner restoration of
-  pre-#97 backtracking) — which model?
-- Does `exclude_newer` need a publish timestamp in the tianguis index schema?
-  (cross-repo: tianguis).
-- Error message for the #100 conflict case (name the two constraints + sources).
+- Constraint grammar in the index `requires` edges (align with #27); see the
+  tianguis RFC's open questions (vendor-bot edge extraction from `.nimble`,
+  non-index deps, edge attestation, schema versioning).
+- Strategy (#98) semantics once the solver owns selection (minver/semver as a
+  PubGrub version-ordering policy).
 
 ## Slices
 
-TBD once the design is settled. #100 (the bug) likely lands first as a
-correctness fix with its own regression test.
+TBD — gated on tianguis #32 + `rfc-index-deps`. #100 is **blocked on index-deps**
+(not a standalone milpa fix). #98 and #86 are the milpa-side resolver work once the
+index carries edges + timestamps (the latter already present).
