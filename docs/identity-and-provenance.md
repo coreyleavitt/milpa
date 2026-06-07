@@ -155,6 +155,29 @@ Content addressing wins on cases commit SHA misses:
   The data is recorded today; the dedup logic that uses it is the
   next phase.
 
+## Org renames and registry identity (tianguis #36)
+
+The tianguis registry derives a package's identity — `(namespace, name)` where
+`namespace` is `host/org` — from each version's provenance anchor (git `provenance.url`
+for vendored packages; OIDC `signed_by` SAN for author-signed packages). This derivation
+runs once per version at ingest and is then immutable.
+
+A consequence: when an author renames their GitHub org (or transfers a repo to a
+different org), a new version's anchor now derives a *different* `host/org`. The
+registry creates a **new `(namespace, name)` entry** for that new namespace. The old
+entry is not updated or removed — it goes **stale**: it retains all historical versions
+and remains valid for any lockfile that already references it, but new versions from the
+renamed/transferred repo will not appear under it.
+
+This is the correct behavior for a no-curation, attestation-anchored registry: identity
+follows the attested publisher, not social continuity. The practical consequence is that
+a consumer who upgrades to a version published from the new org needs to update their
+`milpa.kdl` reference to the new qualified identity.
+
+Automatic cross-identity continuity after a rename (an alias or supersede mechanism) is
+deferred to **tianguis #36**. Until that lands, renames produce two distinct entries —
+an accepted, documented property of the model, not silent corruption.
+
 ## See also
 
 - [`rfc-content-addressed-identity.md`](rfc-content-addressed-identity.md) — the structural argument

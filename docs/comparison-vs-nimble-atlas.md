@@ -55,7 +55,7 @@ deliberate scope-out.
 |---|---|---|---|
 | Algorithm | SAT (vnext) | 3 heuristics (MaxVer/SemVer/MinVer) | PubGrub (paper-spec) |
 | Resolution strategies | one | 3 (Max/Sem/Min) | 3+ (Max/Sem/Min + extensible) |
-| Conflict narration | "Unsatisfiable" basic | manual override | **derivation chain; proof-certificate verification (research)** |
+| Conflict narration | "Unsatisfiable" basic | manual override | **structured derivation-chain narration (built — `ConflictChain` / `render_conflict_chain`); proof-certificate verification (research)** |
 | Backtracking | yes (SAT) | no | yes (paper-spec) |
 | Cycle detection | yes | yes | yes |
 | Compile-time dep graphs | no | no | **yes (research — compile-time-first extraction)** |
@@ -99,7 +99,7 @@ deliberate scope-out.
 | Version constraints (`>=`, `==`, ranges) | yes | yes | yes |
 | Caret / tilde (`^`, `~`) constraints | no | no | yes |
 | Prerelease opt-in | no | no | yes |
-| Build metadata (`+build`) | no | no | yes |
+| Build metadata (`+build`) | no | no | parsed and preserved; ignored for version ordering |
 
 ### Tooling + ergonomics
 

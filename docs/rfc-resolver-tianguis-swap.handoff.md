@@ -1,8 +1,32 @@
 # resolver→tianguis swap (milpa#97) — handoff
 
-- **Stage:** 3 /tdd grind — **ALL SLICES (S0–S7) DONE (587 passed + 5 gated integration green against live tianguis)**; next = **Stage 4 (`/code-review`)**
-- **Resume:** `/loop implement the next unimplemented RFC slice from docs/rfc-resolver-tianguis-swap.md with /tdd, following the standing rules; report one progress line per slice; stop when every slice is implemented`
-- **RFC:** `docs/rfc-resolver-tianguis-swap.md`   •   **Deferrals filed:** #98 (strategy), #99 (add-by-name), #100 (constraint accumulation), #101 (fetch observability), #102 (fetch_any mismatch warn)
+- **Stage:** 4 /code-review — **COMPLETE.** All slices S0–S7 done; review ledger
+  below fully resolved (0 open Critical/High/Medium — all fixed; M2 deferred →
+  milpa#103). Effort is ship-ready pending commit.
+- **Resume:** nothing outstanding on this RFC. If reopening: `/code-review the latest
+  rfc implementation` for a fresh round, else commit the code-review fixes (milpa repo
+  has uncommitted M lockfile.py/resolver.py/test_lockfile_v2.py from the fix loop).
+- **Status note (2026-06-07):** still untouched — the active session ran the *separate*
+  tianguis `rfc-identity-completion` RFC (#32 finish-out; architect rounds 1+2 complete,
+  one open escalation: delete `checkOidcGitAgreement` + split #38 into its own RFC, both
+  approved by Corey). This #97 effort remains stage-4-complete, ship-ready pending commit;
+  content unchanged.
+- **NEW — resolver-core gap analysis (2026-06-07, this session, NOT yet an RFC):** Corey
+  asked whether the *milpa resolver* itself is at the PhD/best-in-class bar. Grounded audit
+  (solver.py/resolver.py/tianguis_client.py) verdict: **identity/trust layer = best-in-class;
+  resolution core = foundational gaps.** Concretely: (1) PubGrub omits its payoff — no
+  conflict-driven learning, single-level backtrack only, and **no derivation-tree narration**
+  (the `Assignment.cause` chain is never walked; flat raw term-sets printed) despite the
+  comparison doc listing "derivation chain / proof certificates" as a structural exclusive;
+  (2) **version model isn't semver** — `Version=tuple[int,int,int]`, prereleases→`None`
+  (dropped), build metadata dropped, no `~`/`^`/`!=`/bare-`=` operators; (3) `Strategy` is
+  dead for named deps (tianguis path always MAXVER); (4) **latent crash**: `VersionSet.all()`
+  called at `resolver.py:1210` but method is `full()` → AttributeError on the transitive
+  milpa.kdl path. Proposed next steps (awaiting Corey's pick): draft a **resolver-core RFC**
+  (proper semver model + PubGrub `cause`-chain narration) after #32; **file the
+  `VersionSet.all()` bug** now; **correct `comparison-vs-nimble-atlas.md`** to stop claiming
+  unimplemented semver/narration as done. None executed yet.
+- **RFC:** `docs/rfc-resolver-tianguis-swap.md`   •   **Deferrals filed:** #98 (strategy), #99 (add-by-name), #100 (constraint accumulation), #101 (fetch observability), #102 (fetch_any mismatch warn), #103 (consumer-side index attestation, was M2)
 
 ## Slices (gate = full suite green each slice)
 > Round-2 sharpened each slice — **RFC §Slices is authoritative**. New **S2.7** (typed
