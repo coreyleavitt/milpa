@@ -11,6 +11,135 @@
   `.github/workflows/commit-entry.yaml`, `dispatch/handler.go`, `dispatch/handler_test.go`,
   `docs/spec/index-format.md`, `spec/fixtures/derive-namespace.json`. RFC P2.3 text patched (milpa repo).
 
+## ✅ DONE (2026-06-08, uncommitted both repos) — durable Rekor reference in the index
+**ALL 8 touch-points implemented + tested green. Nothing committed (standing rule); the backfilled
+index.kdl is the trust anchor → Corey-gated commit.**
+- **jq paths SPIKED LIVE** against real cosign v2.4.0 on nkdl's genuine signed artifact
+  (`ghcr.io/coreyleavitt/nkdl@sha256:01c9ee…`): `.[0].optional.Subject` ✓,
+  `.[0].optional.Bundle.Payload.logIndex` → `1753541583` ✓, `.integratedTime` → `1780881469` ✓.
+  UUID = top-level key of `GET rekor.sigstore.dev/api/v1/log/entries?logIndex=N` →
+  `108e9186…2890d636` (verified round-trips back to the same logIndex). The old P2.1 Gate-B SAN-path
+  TODO is now also retired (same verify exercised it).
+- **Model:** `RekorRef{uuid,logIndex,integratedTime}` + `Version.rekor: Option[RekorRef]` (model.nim,
+  all strings — dodges bare-KDL-number float hazard; `==` updated). Emit+parse in **kdl_io.nim**
+  (`rekor{uuid;log_index;integrated_time}`, 8-sp indent, strict RekorChildren, only non-empty
+  sub-fields, block only when `some`) AND **json_io.nim** (site reads index.json — bijection holds).
+- **add-entry:** `--rekor-uuid/--rekor-log-index/--rekor-integrated-time` (tianguis_cli.nim +
+  addentry.nim); all-empty trio → `rekor=none` (no hollow block). **commit-entry.yaml:** cosign step
+  extracts the trio (+best-effort UUID curl), env-routed into the three flags.
+- **site/build.py:** `rekor_link()` reads `ver["rekor"]` (prefers `?uuid=`, falls back `?logIndex=`);
+  DELETED `lookup_logindex`/`load|save_rekor_cache`/`CACHE*`/`REKOR_URL_BY_INDEX`/`subprocess`.
+  **pages.yaml:** cosign step removed. **`site/_cache/rekor-logindex.json` git-rm'd.** Built locally
+  vs real index (2617 pkgs) → nkdl page renders `view in Rekor` `?uuid=108e9186…`.
+- **nkdl backfill DONE:** wrote the rekor block into nkdl v0.1.0 in index.kdl; **canonical-stable**
+  (`formatKdl(parse(index.kdl))==index.kdl`), `tianguis project` regenerated index.json,
+  `project --check` parity ✓.
+- **milpa:** `parse_index` already ignores unknown version children → forward-compat test added
+  (`test_rekor_block_is_tolerated_and_ignored`). Spec `index-format.md`: normative RekorRef section +
+  data-model tree + KDL/JSON examples.
+- **Tests:** milpa **714 pass**/6 skip; tianguis **20/20 files** green (kdl+json round-trip incl.
+  none/partial, strict-schema unknown-rekor-child reject, add-entry records-rekor + no-flags-no-block).
+- **Corey-gated remainder:** (1) commit+push both repos (backfilled index.kdl = trust-anchor commit);
+  (2) a real end-to-end publish still only Corey can run, but the extraction logic is now live-verified,
+  not a TODO. Container test cmd needs `-v "$HOME/.cache/milpa":/.cache/milpa:Z` (deps are CAS symlinks).
+
+## (historical) NEXT EFFORT — durable Rekor reference in the index
+**Decided 2026-06-08.** Replace the site's fragile build-time `cosign verify` + `rekor-logindex.json` cache
+(root cause of the recurring "Rekor link disappeared" bug — see below) with a **publish-time-captured Rekor
+reference stored in the index**. Site reads a field; no cosign/cache at build → link can't silently vanish.
+
+**Why:** the link currently re-derives the logIndex every site build via cosign; the committed cache has only
+the stale `nimkdl` digest (not nkdl); pages.yaml never persists the cache (contents:read). So the link rides on
+a live cosign verify each build and drops on any transient failure / digest change. Latent since `fc4ca7a`
+(2026-05-26, "real view-in-Rekor link via cosign-verify-at-build-time").
+
+**Design (root-cause):** record the Rekor pointer once, at publish, as attestation provenance in the index.
+Most durable identifier = Rekor **entry UUID / entryID** (content-addressed, shard-independent) > logIndex (int,
+shard-blurry). Store UUID (primary) + logIndex + integratedTime (convenience). search.sigstore.dev accepts both
+`?uuid=` and `?logIndex=`. Point the link at the AUTHOR's `cosign sign` entry (what verify resolves), not the
+commit-decision attest-blob entry (optionally record both for full transparency).
+
+**Capture is ~free:** commit-entry already runs `cosign verify --output json` (the Gate-B SAN step). Same
+COSIGN_OUTPUT has the Rekor entry — `logIndex`/`integratedTime` are in `…optional.Bundle.Payload.*`
+(jq path needs a Gate-B-style verify vs real cosign v2.4.0). UUID may need deriving from the bundle body or a
+`--bundle` out — SPIKE the exact extraction first.
+
+**Touch-points (tianguis unless noted):**
+1. `.github/workflows/commit-entry.yaml` cosign step — extract `rekor_log_index` (+ uuid if feasible) +
+   `integrated_time` from COSIGN_OUTPUT, export to step outputs (env-routed, like the SAN). SPIKE jq paths.
+2. `add-entry` (`vendor/addentry.nim` + `tianguis_cli.nim`) — new `--rekor-uuid`/`--rekor-log-index`/
+   `--rekor-integrated-time` flags; thread into the Version/VendoredEntry model.
+3. `model.nim` + `kdl_io.nim` — new optional `rekor { uuid; log_index; integrated_time }` child on the version
+   block (author-signed only); emit + parse (escape via kdlEscapeString).
+4. `docs/spec/index-format.md` — normative spec for the rekor attestation block.
+5. milpa `tianguis_client.py` parse_index — confirm it tolerates/ignores the new child (forward-compat;
+   it's attestation metadata, not identity/provenance milpa enforces). Add a test.
+6. `site/scripts/build.py` — read rekor from index.json, render the link directly; **DELETE**
+   `get_rekor_logindex` + `load/save_rekor_cache` + `REKOR_URL_BY_INDEX` plumbing + the cosign step in
+   `pages.yaml` (and the `site/_cache/rekor-logindex.json` file).
+7. Backfill nkdl (one-time): resolve nkdl's Rekor ref and write it into its index entry so the link works now.
+8. Tests: add-entry records rekor fields; kdl round-trip; milpa parse ignores; (site build renders link from field).
+
+**Migration:** existing author-signed entries lack the field → site renders no link for them until republished,
+OR a one-time backfill script resolves + writes them. nkdl backfill is immediate (#7).
+**Resume:** `/clear`, then "implement the durable Rekor reference per the handoff" → run as a small RFC/slice set.
+
+## nkdl publish — ✅ COMPLETE (2026-06-08)
+**nkdl v0.1.0 LIVE in registry.** tianguis main `be108c5 publish: nkdl v0.1.0`. Entry:
+`package "nkdl"` ns `github.com/coreyleavitt` v0.1.0, content_hash `sha256:dd907474…`, provenance oci/ghcr.io/
+coreyleavitt/nkdl. **Gate B VERIFIED LIVE** — cosign verify + jq `.[0].optional.Subject` SAN path works against
+real cosign v2.4.0 (the P2.1 TODO can now be removed). End state: nkdl repo PRIVATE, OCI package PUBLIC
+(independent — re-privatizing repo didn't cascade), artifact anon-pullable (200) → entry fully usable.
+Full chain validated: author pack/push/sign ✓ → dispatch OIDC ✓ → commit-entry milpa fetch ✓ → build ✓ →
+cosign verify ✓ → add-entry/namespace-derive ✓ → index.kdl write ✓ → Rekor attest ✓ → commit ✓.
+Follow-ups: tianguis issue (publish requires public OCI pkg; no API to auto-set → document author one-time
+UI step); optional cleanups (remove Gate-B TODO in commit-entry.yaml; nkdl publish.yaml `@main`→`@v1` once
+tianguis tags v1). See below for the blow-by-blow.
+
+### (historical) nkdl publish status (2026-06-08) — was IN PROGRESS
+RFC stage 4 done + pushed (milpa 599feca, tianguis ea318a9, closes #38). Then: publish nkdl v0.1.0.
+- nkdl prep DONE+pushed: name fix `nimkdl→nkdl` (publish.yaml) + src_dir fix; `main`+`core-rebuild` @ `f425884`.
+  Tags pushed: `v0.1.0-canary`, `v0.1.0`. MILPA_READ_PAT present.
+- **Canary (dry-run) ✓** — validated author-side (checkout/installs/GHCR login/CLI); dry-run short-circuits
+  before pack/push/sign (no throwaway OCI/Rekor). signed_by → namespace `github.com/coreyleavitt` (correct).
+- **Real v0.1.0 publish: author-side ✓** (nkdl publish run 27109485490 success — pack+OCI push+cosign sign+
+  dispatch POST). Dispatch fired → tianguis `commit-entry` run **27109493616 FAILED** at "Fetch deps via milpa"
+  (BEFORE cosign/add-entry → **index.kdl NOT written, fail-closed, no corruption**).
+- **BLOCKER (root cause):** tianguis depends on nkdl (`milpa.kdl`: `nkdl ref="main"`); `milpa.lock` pinned
+  `identity c8ee4804` / `commit_sha f3ce655`. We moved nkdl main → `f425884` → hash `dd907474` ≠ pin →
+  milpa content-integrity check correctly rejects → tianguis CLI can't build in commit-entry. Recurs while
+  tianguis tracks nkdl `ref=main`.
+- **FIX (recommended, root-cause):** pin tianguis to nkdl **`ref="v0.1.0"`** (stable tag = f425884, hash
+  dd907474) in milpa.kdl, re-lock (`milpa lock`), commit+push tianguis, then re-trigger commit-entry
+  (workflow_dispatch or re-dispatch). NEXT failure point will be **Gate B** (cosign jq SAN path, still unverified
+  live) — fail-closed if wrong.
+- **Re-pin DONE+pushed:** tianguis `milpa.kdl` nkdl `ref="v0.1.0"` + re-locked (identity dd907474);
+  tianguis main `88a7bf4`. Re-dispatched publish (workflow_dispatch version=v0.1.0) — author-side ✓ again.
+- **commit-entry run 27110062587:** got PAST milpa fetch ✓ + Build CLI ✓ + payload ✓ → reached Gate B step
+  "Verify author cosign signature" → **FAILED at the cosign artifact PULL** (not the jq path):
+  `ghcr.io/coreyleavitt/nkdl ... UNAUTHORIZED: authentication required`. **index.kdl still NOT written.**
+- **BLOCKER (manual, USER):** `ghcr.io/coreyleavitt/nkdl` package is **private**; tianguis commit-entry can't
+  pull it to cosign-verify. A public registry must pull any author's artifact anonymously (can't hold per-author
+  GHCR creds). No REST endpoint to flip visibility (PATCH .../visibility → 404). **Corey must set the package
+  Public in the GitHub UI:** github.com/users/coreyleavitt/packages/container/nkdl/settings → Change visibility
+  → Public. One-time (sticky for future pushes).
+- **Architectural gap (file tianguis issue):** publish flow should guarantee published OCI packages are publicly
+  pullable (milpa publish / reusable workflow can't auto-set visibility via API → must document the one-time
+  author step, OR commit-entry authenticates to GHCR with a read:packages cred — but per-author creds don't scale,
+  so PUBLIC is the right model).
+- **Update:** repo `coreyleavitt/nkdl` made **PUBLIC** (gh repo edit). But the linked **package stays
+  `private`** (anon ghcr pull still 403 after propagation) — repo-public is necessary-not-sufficient. NO API
+  for package visibility (PATCH /user|/users .../packages/container/nkdl/visibility → Not Found, both variants).
+  **Package flip is UI-only** (now enabled since repo is public): github.com/users/coreyleavitt/packages/
+  container/nkdl/settings → Change visibility → Public. AFTER publish completes: re-privatize repo via
+  `gh repo edit coreyleavitt/nkdl --visibility private --accept-visibility-change-consequences` (Corey wants
+  it private again for now; package re-privatize is UI too). NOTE: re-privatizing makes the published OCI
+  unpullable → registry entry present-but-unfetchable until re-public; Corey accepts "for now".
+- **Resume after Corey flips the PACKAGE public:** re-dispatch `gh workflow run publish.yaml --repo coreyleavitt/nkdl
+  -f version=v0.1.0` → watch commit-entry → cosign verify pulls anonymously → **Gate B jq SAN path finally
+  exercised** (`.[0].optional.Subject`; fail-closed if wrong) → add-entry writes index.kdl → Rekor attest → commit.
+  nkdl OCI `ghcr.io/coreyleavitt/nkdl:v0.1.0` (digest sha256:86f80f63…) already pushed + cosign-signed (Rekor).
+
 ## Review ledger (stage 4 — `/code-review the RFC`, 2026-06-07)
 6 reviewers (milpa correctness/design, tianguis correctness/design, security, spec-consistency) +
 5 adversarial verifier passes. Severities post-verification.
@@ -92,8 +221,8 @@ Version.__iter__ drops pre · lookup_bare O(N) · semver leading-zero pre-releas
 → index-format.md · corpus "Python later" comment · trailing-dot host fixture · parse_index empty-ns transitional note.
 
 ### Resume / next
-- **Corey-gated:** commit/push decision for the full RFC working tree (milpa 4 files M + tianguis ~16 files M/new).
-  Nothing committed. · **Gate-B manual smoke** (P2.1 cosign jq SAN path on a real signed publish) — only Corey can run.
+- ✅ **PUSHED (2026-06-07):** milpa `130ecd1..599feca` (review fixes + docs); tianguis `9e277e0..ea318a9`
+  (Phase 2 #38 + hardening, **closes #38**). RFC stage 4 DONE. · **Gate-B manual smoke** (P2.1 cosign jq SAN path on a real signed publish) — only Corey can run.
 - Optional: a Low-cleanup pass (batchable) before commit, or fold into the commit.
 
 | id | sev | finding | file | status | proof / verify |

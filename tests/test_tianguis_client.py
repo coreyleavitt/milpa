@@ -129,6 +129,56 @@ def test_version_exposes_oci_provenance_and_content_hash():
 
 
 # ---------------------------------------------------------------------------
+# Forward-compat: the tianguis `rekor` attestation block is metadata milpa
+# does not enforce (it is provenance for the site's Rekor link, not identity
+# or content-hash). parse_index MUST tolerate and ignore it — a milpa older
+# than the field must keep reading a newer index without choking.
+# ---------------------------------------------------------------------------
+
+
+REKOR_INDEX = """\
+schema_version 1
+package "nkdl" {
+    namespace "github.com/coreyleavitt"
+    upstream (url)"https://github.com/coreyleavitt/nkdl"
+    version "0.1.0" {
+        content_hash "sha256:dd907474be3ae29640286d382525d3c49ef59e7f190219e4e45aa24a7766b277"
+        provenance {
+            kind "oci"
+            registry "ghcr.io"
+            repository "coreyleavitt/nkdl"
+            digest "sha256:01c9ee334f7dc1203586ef55d6254f3b850e8376dc66ff4a2db0b85eb9f6dff3"
+        }
+        attestation "author-signed"
+        signed_by "https://github.com/coreyleavitt/tianguis/.github/workflows/publish.yaml@refs/heads/main"
+        published_at "2026-06-08T01:18:24Z"
+        rekor {
+            uuid "108e9186e8c5677abce5a62d285437741218f878474a02d9a4dac01dc12e39b979336e712890d636"
+            log_index "1753541583"
+            integrated_time "1780881469"
+        }
+    }
+}
+"""
+
+
+def test_rekor_block_is_tolerated_and_ignored():
+    idx = parse_index(REKOR_INDEX)
+    versions = idx.lookup("github.com/coreyleavitt", "nkdl")
+    assert len(versions) == 1
+    v = versions[0]
+    # The version parses normally — rekor does not perturb the fields milpa
+    # actually consumes (content_hash + provenance).
+    assert v.version == "0.1.0"
+    assert v.content_hash == "sha256:dd907474be3ae29640286d382525d3c49ef59e7f190219e4e45aa24a7766b277"
+    assert len(v.provenances) == 1
+    assert v.provenances[0].kind == "oci"
+    # IndexVersion carries no rekor field — milpa does not model attestation
+    # provenance; it is inert here.
+    assert not hasattr(v, "rekor")
+
+
+# ---------------------------------------------------------------------------
 # Cycle 4 — fetch index.kdl from a URL into a cache dir, serve from cache.
 # HTTP is injected so we don't touch the network in unit tests.
 # ---------------------------------------------------------------------------
