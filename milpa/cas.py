@@ -11,6 +11,7 @@ import os
 import shutil
 from pathlib import Path
 
+from .fsutil import clear_dest
 from .identity import compute_content_hash, parse_identity
 
 
@@ -84,11 +85,7 @@ class CAStore:
             raise CASError(
                 f"cannot link {target} → {identity}: not in store"
             )
-        if target.is_symlink() or target.exists():
-            if target.is_symlink() or target.is_file():
-                target.unlink()
-            else:
-                shutil.rmtree(target)
+        clear_dest(target)
         rel = os.path.relpath(canonical, start=target.parent)
         target.symlink_to(rel, target_is_directory=True)
 

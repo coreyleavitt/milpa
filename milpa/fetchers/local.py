@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import shutil
 
+from ..fsutil import clear_dest
 from .types import FetchError, Provenance, ProvenanceReceipt
 
 
@@ -71,7 +72,11 @@ class LocalFetcher:
             raise FetchError(
                 f"fetching {name!r}: local source path is not a directory: {p.path}"
             )
-        if dest.exists():
-            shutil.rmtree(dest)
+        # dest may be a stale symlink (e.g. proptest was a CAS-routed
+        # url/git dep before the manifest switched it to local=, leaving
+        # `_deps/proptest` pointing into the CAS). clear_dest unlinks it
+        # without following into the CAS, where a plain rmtree would
+        # raise on the symlink (#112).
+        clear_dest(dest)
         shutil.copytree(p.path, dest, symlinks=True)
         return LocalReceipt(source_path=p.path)

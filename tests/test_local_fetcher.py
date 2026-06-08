@@ -124,6 +124,36 @@ def test_refetch_reflects_source_changes(tmp_path):
     assert r1.identity != r2.identity
 
 
+def test_refetch_over_stale_symlink_dest(tmp_path):
+    """Regression for #112: dest is a stale symlink (e.g. the dep was a
+    CAS-routed url/git dep before the manifest switched it to local=,
+    leaving `_deps/<name>` pointing into the CAS). Path.exists() follows
+    the link so a naive `if dest.exists(): rmtree(dest)` guard tripped
+    OSError('Cannot call rmtree on a symbolic link'); the fetch must
+    instead unlink the stale link and copy the source tree fresh —
+    without disturbing the link target."""
+    src = _make_source(tmp_path / "src", {"file.txt": "real source\n"})
+
+    # Stand in for a CAS entry the stale symlink points at.
+    cas_entry = _make_source(tmp_path / "cas", {"file.txt": "cas bytes\n"})
+    dest = tmp_path / "deps" / "x"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.symlink_to(cas_entry, target_is_directory=True)
+    assert dest.is_symlink()
+
+    registry = FetcherRegistry()
+    registry.register(LocalFetcher())
+
+    result = registry.fetch("x", LocalProvenance(path=src), dest=dest)
+
+    # dest is now a real copied tree carrying the source bytes...
+    assert not dest.is_symlink()
+    assert (dest / "file.txt").read_text() == "real source\n"
+    assert result.path == dest
+    # ...and the symlink's former target was left untouched.
+    assert (cas_entry / "file.txt").read_text() == "cas bytes\n"
+
+
 def test_symlinks_in_source_preserved_as_symlinks_in_dest(tmp_path):
     """Per the identity model: symlinks within a source tree are data
     (the link target string is part of the hash), not references to

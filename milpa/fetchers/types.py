@@ -35,6 +35,7 @@ from pathlib import Path
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
+from ..fsutil import clear_dest
 from ..identity import compute_content_hash
 
 if TYPE_CHECKING:
@@ -224,10 +225,7 @@ class FetcherRegistry:
                 )
                 # Drop the mismatched bytes so the next candidate's
                 # fetch sees a clean destination.
-                if dest.is_symlink():
-                    dest.unlink()
-                elif dest.exists():
-                    shutil.rmtree(dest, ignore_errors=True)
+                clear_dest(dest)
                 continue
             return result
         raise FetchError(
