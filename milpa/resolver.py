@@ -186,10 +186,26 @@ class _MaterializedProvider:
         # Phase A stubs: name -> {version: _NamedDepStub}
         # Cleared on materialization (one stub per (name, version) at most).
         self._stubs: dict[str, dict[Version, _NamedDepStub]] = {}
-        # Callback for newly discovered transitive named deps during Phase B.
-        # Set by the resolve() BFS orchestrator so that inline materialization
-        # can enroll newly-seen transitive named deps.
+        # Phase B transitive callbacks — None until start_solve() is called.
+        # Callers must call start_solve() AFTER finalize() and BEFORE solve()
+        # to ensure the callbacks are set before the solver can call
+        # dependencies(). Use start_solve() to set both atomically.
         self._on_new_named: "Callable[[str, str | None], None] | None" = None
+        self._on_new_url: "Callable[[UrlDep], None] | None" = None
+
+    def start_solve(
+        self,
+        on_new_named: "Callable[[str, str | None], None]",
+        on_new_url: "Callable[[UrlDep], None]",
+    ) -> None:
+        """Wire up Phase B transitive callbacks before the solver starts.
+
+        Must be called after finalize() and before solve() to eliminate the
+        half-built window where dependencies() could be called without the
+        callbacks set (M4). Both callbacks are set atomically so there is no
+        intermediate state where one is set but not the other."""
+        self._on_new_named = on_new_named
+        self._on_new_url = on_new_url
 
     def add(self, c: _Candidate) -> None:
         """Add unconditionally — used for synthetic candidates (__root__,
@@ -325,40 +341,10 @@ class _MaterializedProvider:
         idx_ver = stub.index_version
         name = stub.name
 
-        # Identity gate (Invariant 1) — same as the old _process_named.
-        if not idx_ver.content_hash:
-            raise tianguis_client.TianguisError(
-                code="TNG-NO-IDENTITY",
-                message=(
-                    f"index entry for {name!r} version {idx_ver.version!r} "
-                    f"carries no content_hash — cannot verify fetched bytes. "
-                    f"This index entry is malformed; file a bug at "
-                    f"coreyleavitt/tianguis."
-                ),
-            )
-        result = stub.fetcher.fetch_any(
-            name,
-            list(idx_ver.provenances),
-            dest=stub.deps_dir / name,
-            expected_identity=idx_ver.content_hash,
-        )
-        sha = _commit_sha_or_none(result.receipt)
-        nimble_path = _find_nimble_file(result.path, name)
-        nm = parse_nimble(nimble_path.read_text()) if nimble_path.exists() else None
-        terms, requires_names, sub_url_deps, sub_named = (
-            _build_terms(nm, stub.overrides_by_name)
-            if nm else ([], [], [], [])
-        )
-        chosen = idx_ver.canonical_provenance
-        candidate = _Candidate(
-            name=name, version=stub.version,
-            source=_named_source_display(name, chosen),
-            ref=getattr(chosen, "ref", None),
-            sha=sha,
-            identity=result.identity,
-            src_dir=(nm.src_dir or "") if nm else "",
-            dep_terms=list(terms), requires_names=list(requires_names),
-            provenance=chosen,
+        # Delegate to the shared fetch+parse core (M3 — SSOT).
+        candidate, sub_url_deps, sub_named = _fetch_and_build_named_candidate(
+            name, idx_ver, stub.version, stub.deps_dir, stub.fetcher,
+            stub.overrides_by_name,
         )
         # Register into the live candidates map so subsequent calls to
         # get() / dependencies() see the materialized candidate.
@@ -367,18 +353,18 @@ class _MaterializedProvider:
         self._stubs.get(name, {}).pop(stub.version, None)
 
         # Enroll transitive named deps as Phase A stubs so the solver can
-        # immediately see them. URL transitive deps are not enrolled here —
-        # they were fetched eagerly in BFS (the existing path). Named
-        # transitive deps that are already stubs or materialized are skipped.
+        # immediately see them. Named transitive deps that are already stubs
+        # or materialized are skipped.
         if self._on_new_named:
             for n in sub_named:
                 self._on_new_named(n.name, n.constraint)
-        # URL transitives from a named dep's nimble go to the BFS queue
-        # via the same path as before; we surface them via the callback
-        # mechanism if one is configured, otherwise they're ignored at
-        # this point (they would have been fetched in Phase B for URL deps
-        # discovered transitively — this is a pre-existing limitation for
-        # transitive URL deps from named packages, not a P3.2 regression).
+        # Enroll transitive URL deps discovered in this named dep's nimble.
+        # These were previously silently ignored during Phase B, causing a
+        # spurious no-versions SolverError (H4). The callback synchronously
+        # fetches + enrolls each URL dep so the solver can satisfy it.
+        if self._on_new_url:
+            for u in sub_url_deps:
+                self._on_new_url(u)
 
         print(f"✓ {name} {idx_ver.version}", file=sys.stderr)
         return candidate
@@ -735,7 +721,33 @@ def resolve(
         # is overridden to a URL), and is a pre-existing edge-case limitation
         # that predates P3.2. Silently skip so no regression is introduced.
 
-    provider._on_new_named = _on_new_named
+    # Wire up the Phase B URL-transitive callback. When _materialize_stub
+    # finds a URL require in a named dep's nimble, this callback synchronously
+    # fetches + enrolls the URL dep into the provider so the solver can
+    # satisfy it. `seen_url` deduplicates so the same URL is only fetched once.
+    def _on_new_url(dep: "UrlDep") -> None:
+        key = (dep.git, dep.ref)
+        if key in seen_url:
+            return
+        seen_url.add(key)
+        print(f"fetching {dep.name} (transitive from named dep)...", file=sys.stderr)
+        candidate, new_items = _process_url(dep, deps_dir, fetcher,
+                                             overrides_by_name, prior_lockfile)
+        # Phase B happens after finalize() — add directly to candidates
+        # (not pending) so the solver sees this dep immediately.
+        provider.add(candidate)
+        # Recurse: the URL dep's own transitives may introduce more URL or
+        # named deps. Route them through the same Phase B enrollment path.
+        for new_item in new_items:
+            if new_item[0] == "url":
+                _on_new_url(new_item[1])
+            elif new_item[0] == "named":
+                _on_new_named(new_item[1], new_item[2])
+
+    # Atomically wire up both Phase B callbacks before the solver starts
+    # (M4: eliminates the half-built window where dependencies() could fire
+    # before both callbacks are set).
+    provider.start_solve(_on_new_named, _on_new_url)
 
     # Solve.
     solution = solve(provider, "__root__", Version(0, 0, 0), strategy=strategy)
@@ -1568,6 +1580,68 @@ def _enumerate_named(
     print(f"indexed {name} ({len(stubs)} version(s))", file=sys.stderr)
 
 
+def _fetch_and_build_named_candidate(
+    name: str,
+    idx_ver: "tianguis_client.IndexVersion",
+    version: Version,
+    deps_dir: Path,
+    fetcher: "FetcherRegistry",
+    overrides_by_name: dict | None = None,
+) -> tuple["_Candidate", list["UrlDep"], list]:
+    """Shared fetch + parse core for named deps (M3 — single source of truth).
+
+    Given an already-resolved IndexVersion and its pre-parsed `version`,
+    fetches the dep at the index-pinned provenance, parses its nimble for
+    transitive deps, and returns:
+      (candidate, sub_url_deps, sub_named)
+
+    Both `_materialize_stub` (Phase B) and `_process_named` (workspace BFS)
+    delegate to this function so there is exactly one fetch+parse+_build_terms
+    +_Candidate path.
+
+    Identity gate (Invariant 1) is enforced here: the index content_hash
+    is the trust root for named deps."""
+    if not idx_ver.content_hash:
+        raise tianguis_client.TianguisError(
+            code="TNG-NO-IDENTITY",
+            message=(
+                f"index entry for {name!r} version {idx_ver.version!r} "
+                f"carries no content_hash — cannot verify fetched bytes. "
+                f"This index entry is malformed; file a bug at "
+                f"coreyleavitt/tianguis."
+            ),
+        )
+    result = fetcher.fetch_any(
+        name,
+        list(idx_ver.provenances),
+        dest=deps_dir / name,
+        expected_identity=idx_ver.content_hash,
+    )
+    sha = _commit_sha_or_none(result.receipt)
+    nimble_path = _find_nimble_file(result.path, name)
+    nm = parse_nimble(nimble_path.read_text()) if nimble_path.exists() else None
+    terms, requires_names, sub_url_deps, sub_named = (
+        _build_terms(nm, overrides_by_name)
+        if nm else ([], [], [], [])
+    )
+    # The chosen provenance for record reconstruction (Option A). Mirrors
+    # are byte-identical by the identity gate, so the canonical (index-
+    # first) provenance is the authoritative one to record even when a
+    # mirror served the bytes.
+    chosen = idx_ver.canonical_provenance
+    candidate = _Candidate(
+        name=name, version=version,
+        source=_named_source_display(name, chosen),
+        ref=getattr(chosen, "ref", None),
+        sha=sha,
+        identity=result.identity,
+        src_dir=(nm.src_dir or "") if nm else "",
+        dep_terms=terms, requires_names=requires_names,
+        provenance=chosen,
+    )
+    return candidate, sub_url_deps, sub_named
+
+
 def _process_named(
     name: str,
     constraint: str | None,
@@ -1590,7 +1664,9 @@ def _process_named(
     FetcherRegistry with no privileged transport), and the version set
     (replacing the old `list_tags`). It does NOT supply graph edges —
     transitive deps still come from parsing the fetched tree's manifest.
-    The fetch + git clone happen here so they parallelize."""
+    The fetch + git clone happen here so they parallelize.
+
+    Delegates to _fetch_and_build_named_candidate (M3 — SSOT)."""
     version = tianguis_client.resolve_named(index, name, constraint)
     # resolve_named only returns entries where parse_version succeeds
     # (unparseable versions are skipped in tianguis_client with `continue`;
@@ -1601,51 +1677,8 @@ def _process_named(
         f"invariant violation: resolve_named returned unparseable version "
         f"{version.version!r} for {name!r}"
     )
-    # Identity gate (Invariant 1): fetched bytes must hash to the index's
-    # content_hash. For named deps the index *is* the trust root and pins
-    # identity immutably, so the index content_hash subsumes the old
-    # prior-lockfile pin (`_pin_for_url/tarball_dep` remain for the
-    # transports the index doesn't vouch for). An empty content_hash is a
-    # hard error (H1) — a named dep without an identity pin cannot be
-    # verified and must NOT silently install unverified bytes.
-    if not version.content_hash:
-        raise tianguis_client.TianguisError(
-            code="TNG-NO-IDENTITY",
-            message=(
-                f"index entry for {name!r} version {version.version!r} "
-                f"carries no content_hash — cannot verify fetched bytes. "
-                f"This index entry is malformed; file a bug at "
-                f"coreyleavitt/tianguis."
-            ),
-        )
-    expected_identity = version.content_hash
-    result = fetcher.fetch_any(
-        name,
-        list(version.provenances),
-        dest=deps_dir / name,
-        expected_identity=expected_identity,
-    )
-    sha = _commit_sha_or_none(result.receipt)
-    nimble_path = _find_nimble_file(result.path, name)
-    nm = parse_nimble(nimble_path.read_text()) if nimble_path.exists() else None
-    terms, requires_names, sub_url_deps, sub_named = (
-        _build_terms(nm, overrides_by_name)
-        if nm else ([], [], [], [])
-    )
-    # The chosen provenance for record reconstruction (Option A). Mirrors
-    # are byte-identical by the identity gate, so the canonical (index-
-    # first) provenance is the authoritative one to record even when a
-    # mirror served the bytes.
-    chosen = version.canonical_provenance
-    candidate = _Candidate(
-        name=name, version=ver,
-        source=_named_source_display(name, chosen),
-        ref=getattr(chosen, "ref", None),
-        sha=sha,
-        identity=result.identity,
-        src_dir=(nm.src_dir or "") if nm else "",
-        dep_terms=terms, requires_names=requires_names,
-        provenance=chosen,
+    candidate, sub_url_deps, sub_named = _fetch_and_build_named_candidate(
+        name, version, ver, deps_dir, fetcher, overrides_by_name,
     )
     new_items: list = []
     for u in sub_url_deps:

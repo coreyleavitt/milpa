@@ -226,10 +226,10 @@ def _provenance_from_resolved(d: ResolvedDep) -> ProvenanceRecord:
         # provenance's pin field — matches the legacy git arm exactly.
         return GitProvenanceRecord(url=prov.url, ref=prov.ref, commit_sha=d.sha)
     if isinstance(prov, TarballProvenance):
-        # sha256 stays None here (the archive hash is a receipt, not yet
-        # threaded onto the candidate) — behavior-preserving with the
-        # legacy arm.
-        return TarballProvenanceRecord(url=prov.url, sha256=None)
+        # Preserve the declared expected_sha256 — this is the archive hash
+        # recorded in the manifest (provenance receipt). Previously this was
+        # incorrectly set to None, silently losing the declared hash (M11).
+        return TarballProvenanceRecord(url=prov.url, sha256=prov.expected_sha256)
     if isinstance(prov, OciProvenance):
         return OciProvenanceRecord(
             registry=prov.registry,

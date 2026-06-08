@@ -761,3 +761,67 @@ def test_semver_strategy_with_prerelease_opt_in_excludes_prerelease(tmp_path):
     assert foo_dep.ref == "v1.1.0", (
         f"expected ref v1.1.0, got {foo_dep.ref}"
     )
+
+
+# ===========================================================================
+# H4 — URL transitive deps from a Phase-B named dep are not dropped
+# ===========================================================================
+
+
+def test_named_dep_url_transitive_appears_in_resolved_graph(tmp_path):
+    """H4: a named dep whose .nimble declares a URL require must produce
+    that URL dep in the resolved graph. Previously _materialize_stub put
+    the URL dep in dep_terms but never enrolled it with the provider,
+    so the solver raised a spurious no-versions SolverError.
+
+    Setup:
+      - manifest requires named dep `foo` (in the index)
+      - `foo`'s nimble requires `https://github.com/x/bar.git` (URL)
+      - `bar` is a git URL dep, not in the index
+      - resolve() must succeed and bar must appear in the graph
+    """
+    from tests.indexkdl import fake_content_hash
+    from milpa.fetchers.git import GitProvenance, GitReceipt
+
+    bar_nimble = 'srcDir = "src"\n'
+    foo_nimble = 'requires "https://github.com/x/bar.git"\nsrcDir = "src"\n'
+
+    foo_ch = fake_content_hash("foo", foo_nimble)
+
+    @dataclass
+    class _FakeMultiUrl:
+        calls: list = field(default_factory=list)
+        sha: str = "c" * 40
+
+        def can_handle(self, p):
+            return isinstance(p, GitProvenance)
+
+        def fetch(self, name, p, *, dest):
+            self.calls.append((name, p.url, p.ref))
+            dest.mkdir(parents=True, exist_ok=True)
+            content = bar_nimble if name == "bar" else foo_nimble
+            (dest / f"{name}.nimble").write_text(content)
+            return GitReceipt(commit_sha=self.sha)
+
+    fake = _FakeMultiUrl()
+    r = FetcherRegistry()
+    r.register(fake)
+
+    index = make_index([
+        {"name": "foo", "version": "1.0.0",
+         "url": "https://example.com/foo.git", "ref": "v1.0.0",
+         "content_hash": foo_ch},
+    ])
+    manifest = Manifest(
+        kind="library", name="proj",
+        deps=(NamedDep(name="foo", constraint=None),),
+    )
+    graph = resolve(
+        manifest, deps_dir=tmp_path / "_deps", index=index, fetcher=r,
+    )
+    names = {d.name for d in graph.deps}
+    assert "foo" in names, f"foo missing from graph: {names}"
+    assert "bar" in names, (
+        f"H4 regression: bar (URL transitive from named dep foo) "
+        f"missing from resolved graph: {names}"
+    )

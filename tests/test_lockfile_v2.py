@@ -228,14 +228,14 @@ def test_from_graph_builds_correct_provenance_variant():
 
 
 def test_typed_provenance_reconstructs_same_record_as_source_string():
-    """S2.7 (milpa#97 / Option A): a ResolvedDep carrying a typed
-    Provenance reconstructs byte-identically to the legacy source-string
-    path. Typed objects take the type-dispatch fast path; None falls back
-    to source parsing — both must agree."""
+    """S2.7 (milpa#97 / Option A): git typed dispatch matches source-string.
+    Tarball diverges intentionally when expected_sha256 is set — the typed
+    path preserves it; the source-string fallback has no sha256 to preserve.
+    Only verify git identity here; tarball sha256 preservation is tested
+    separately in test_tarball_provenance_sha256_round_trips."""
     from milpa.lockfile import from_graph
     from milpa.resolver import ResolvedDep, ResolvedGraph
     from milpa.fetchers.git import GitProvenance
-    from milpa.fetchers.tarball import TarballProvenance
 
     def _rd(name, source, provenance, **kw):
         return ResolvedDep(
@@ -245,23 +245,17 @@ def test_typed_provenance_reconstructs_same_record_as_source_string():
             provenance=provenance,
         )
 
-    # git + tarball migrate to typed dispatch. (local stays on the
-    # unambiguous source-string fallback — see _process_local.)
-    typed = ResolvedGraph(deps=(
+    # git: typed dispatch and source-string fallback must agree.
+    typed_g = ResolvedGraph(deps=(
         _rd("g", "https://x/g.git",
             GitProvenance(url="https://x/g.git", ref="main"),
             ref="main", sha="abc"),
-        _rd("t", "tarball:https://x/t.tar.gz",
-            TarballProvenance(url="https://x/t.tar.gz", expected_sha256="z")),
     ))
-    untyped = ResolvedGraph(deps=(
+    untyped_g = ResolvedGraph(deps=(
         _rd("g", "https://x/g.git", None, ref="main", sha="abc"),
-        _rd("t", "tarball:https://x/t.tar.gz", None),
     ))
-
-    lt = {d.name: d.provenances[0] for d in from_graph(typed).deps}
-    lu = {d.name: d.provenances[0] for d in from_graph(untyped).deps}
-    # Same record content from both paths.
+    lt = {d.name: d.provenances[0] for d in from_graph(typed_g).deps}
+    lu = {d.name: d.provenances[0] for d in from_graph(untyped_g).deps}
     assert lt == lu
 
 
@@ -390,3 +384,47 @@ def test_rd3_unknown_provenance_type_raises_value_error():
     )
     with pytest.raises(ValueError, match="unexpected typed provenance"):
         from_graph(ResolvedGraph(deps=(dep,)))
+
+
+# ---------------------------------------------------------------------------
+# M11 regression: TarballProvenance.expected_sha256 round-trips
+# ---------------------------------------------------------------------------
+
+def test_tarball_provenance_sha256_round_trips():
+    """M11: a TarballProvenance with expected_sha256 set must survive the
+    from_graph → format_lockfile → parse_lockfile round-trip. Previously
+    _provenance_from_resolved wrote sha256=None unconditionally."""
+    from milpa.fetchers.tarball import TarballProvenance
+    from milpa.lockfile import TarballProvenanceRecord, format_lockfile, from_graph, parse_lockfile
+    from milpa.resolver import ResolvedDep, ResolvedGraph
+
+    sha = "sha256:" + "b" * 64
+    dep = ResolvedDep(
+        name="archive",
+        source="tarball:https://example.com/archive.tar.gz",
+        ref=None,
+        sha=None,
+        version=(1, 2, 3),
+        identity=_HASH,
+        src_dir="",
+        requires=(),
+        provenance=TarballProvenance(
+            url="https://example.com/archive.tar.gz",
+            expected_sha256=sha,
+        ),
+    )
+    lockfile = from_graph(ResolvedGraph(deps=(dep,)))
+    rec = lockfile.deps[0].provenances[0]
+    assert isinstance(rec, TarballProvenanceRecord)
+    assert rec.sha256 == sha, (
+        f"M11 regression: expected_sha256 {sha!r} was not preserved; got {rec.sha256!r}"
+    )
+
+    # format → parse round-trip preserves the sha256
+    text = format_lockfile(lockfile)
+    parsed = parse_lockfile(text)
+    rec2 = parsed.deps[0].provenances[0]
+    assert isinstance(rec2, TarballProvenanceRecord)
+    assert rec2.sha256 == sha, (
+        f"round-trip dropped sha256: expected {sha!r}, got {rec2.sha256!r}"
+    )

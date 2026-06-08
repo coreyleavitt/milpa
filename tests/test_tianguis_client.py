@@ -865,3 +865,73 @@ def test_resolve_named_all_versions_are_ordered_descending_by_semver():
     from milpa.solver import parse_version
     parsed = [parse_version(s) for s in version_strs]
     assert parsed == sorted(parsed, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# M12 regression: resolve_named_all skips provenance-less versions
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_named_all_skips_provenance_less_versions_and_returns_older():
+    """M12: when the newest satisfying version has no provenance, it must be
+    skipped (with a warning) rather than raising TNG-NO-PROVENANCE mid-loop.
+    An older version with provenance is the correct result.
+
+    Previously the function raised immediately on the first provenance-less
+    version, blocking older valid satisfying versions from being considered."""
+    import warnings
+    from milpa.tianguis_client import parse_index, resolve_named_all
+
+    idx = parse_index("""\
+schema_version 1
+package "foo" {
+    version "2.0.0" {
+        content_hash "sha256:aaa0000000000000000000000000000000000000000000000000000000000000"
+    }
+    version "1.0.0" {
+        content_hash "sha256:bbb0000000000000000000000000000000000000000000000000000000000000"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "v1.0.0"
+            commit_sha "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+    }
+}
+""")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = resolve_named_all(idx, "foo", None)
+
+    # Must resolve to the older version with provenance, not raise.
+    assert len(result) == 1, f"expected 1 result, got {len(result)}: {result}"
+    assert result[0].version == "1.0.0", (
+        f"M12 regression: expected 1.0.0 (provenance-less 2.0.0 skipped), "
+        f"got {result[0].version!r}"
+    )
+    # A warning must have been emitted for the skipped provenance-less version.
+    warn_messages = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+    assert any("2.0.0" in m or "provenance" in m.lower() for m in warn_messages), (
+        f"expected a UserWarning mentioning '2.0.0' or 'provenance', got: {warn_messages}"
+    )
+
+
+def test_resolve_named_all_raises_if_all_satisfying_have_no_provenance():
+    """M12: when ALL satisfying versions lack provenance, TNG-NO-PROVENANCE
+    must still be raised (no valid fallback exists)."""
+    import warnings
+    from milpa.tianguis_client import TianguisError, parse_index, resolve_named_all
+
+    idx = parse_index("""\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "sha256:ccc0000000000000000000000000000000000000000000000000000000000000"
+    }
+}
+""")
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        with pytest.raises(TianguisError) as exc:
+            resolve_named_all(idx, "foo", None)
+    assert exc.value.code == "TNG-NO-PROVENANCE"

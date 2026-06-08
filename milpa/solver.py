@@ -961,7 +961,13 @@ def solve(
     while True:
         iterations += 1
         if iterations > 10_000:
-            raise SolverError("solver did not converge — likely a bug")
+            raise SolverError(ConflictChain(steps=(ConflictStep(
+                consequent_package="<solver>",
+                consequent_description="solver did not converge — likely a bug",
+                antecedents=(),
+                antecedent_constraints=(),
+                cause_tag="convergence-limit",
+            ),)))
         try:
             _unit_propagate(next_package, incompats, partial)
             next_package = _make_decision(
@@ -1251,6 +1257,37 @@ def build_conflict_chain(
             pos_terms = [t for t in incompat.terms if t.positive]
             for pos_t in pos_terms:
                 _emit_step_for_package(pos_t.package, incompat.cause)
+        elif incompat.cause.startswith("semver-"):
+            # A SEMVER strategy conflict: the cause encodes the package and
+            # required major as `semver-no-same-major-{pkg}-at-{major}`.
+            # The single positive term is the package whose major-version
+            # constraint could not be satisfied. Emit it directly with a
+            # description that names the major constraint, rather than
+            # falling through to the bare uninformative fallback step.
+            pos_terms = [t for t in incompat.terms if t.positive]
+            for pos_t in pos_terms:
+                # Parse the required major from the cause tag (best effort;
+                # fall back gracefully if the tag format changes).
+                cause_tail = incompat.cause  # e.g. "semver-no-same-major-foo-at-1"
+                at_idx = cause_tail.rfind("-at-")
+                if at_idx != -1:
+                    required_major = cause_tail[at_idx + 4:]
+                    desc = (
+                        f"{pos_t.package} has no version with major {required_major} "
+                        f"(SEMVER strategy requires same-major as constraint lower bound)"
+                    )
+                else:
+                    desc = (
+                        f"{pos_t.package} has no satisfying version "
+                        f"(SEMVER major-version constraint)"
+                    )
+                steps.append(ConflictStep(
+                    consequent_package=pos_t.package,
+                    consequent_description=desc,
+                    antecedents=(pos_t,),
+                    antecedent_constraints=(pos_t,),
+                    cause_tag=incompat.cause,
+                ))
 
     if not steps:
         # Final fallback: emit something useful from the final incompat.

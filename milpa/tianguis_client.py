@@ -577,22 +577,40 @@ def resolve_named_all(idx: Index, name: str, constraint: str | None) -> list[Ind
     vs = VersionSet.from_constraint(constraint) if constraint else None
 
     satisfying: list[IndexVersion] = []
+    provenance_less: list[str] = []   # version strings skipped due to no provenance
     for v in versions:
         parsed = parse_version(v.version)
         if parsed is None:
             continue
         if vs is None or vs.contains(parsed):
             if not v.provenances:
-                raise TianguisError(
-                    code="TNG-NO-PROVENANCE",
-                    message=(
-                        f"{name!r} version {v.version!r} has no provenance "
-                        f"in the index — unfetchable (malformed entry)"
-                    ),
+                # Skip provenance-less versions with a warning (forward-compat:
+                # unknown or malformed entries should not block older valid
+                # versions). Raise TNG-NO-PROVENANCE only if no satisfying
+                # version with provenance remains (M12).
+                provenance_less.append(v.version)
+                import warnings
+                warnings.warn(
+                    f"{name!r} version {v.version!r} has no provenance in the "
+                    f"index — skipping (malformed entry); older versions will be "
+                    f"tried",
+                    UserWarning,
+                    stacklevel=2,
                 )
+                continue
             satisfying.append(v)
 
     if not satisfying:
+        if provenance_less:
+            # All satisfying versions lacked provenance — surface a coded error.
+            raise TianguisError(
+                code="TNG-NO-PROVENANCE",
+                message=(
+                    f"{name!r} has no fetchable version satisfying {constraint!r} "
+                    f"— all satisfying versions lack provenance: "
+                    f"{', '.join(provenance_less)}"
+                ),
+            )
         raise TianguisError(
             code="TNG-NO-SATISFYING-VERSION",
             message=(
