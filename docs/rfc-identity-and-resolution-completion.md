@@ -620,12 +620,28 @@ are Nim today + Rust later.)*
 Add OIDC SAN cases to `spec/fixtures/derive-namespace.json` (verified: currently 40 cases, **all**
 git/SSH clone URLs — zero OIDC SAN inputs, so this is real fixture work, not a one-liner). Concrete
 cases: (a) a full canonical GH Actions SAN
-`https://github.com/owner/repo/.github/workflows/publish.yaml@refs/heads/main` → `github.com/owner`;
-(b) a non-`github.com` SAN → derivation error (bounds the GH-Actions-OIDC-only assumption);
-(c) malformed/empty SAN → derivation error (guards the empty-SAN silent-hard-reject path flagged in
-P2.1). Specify the normative `signed_by` format per attestation kind in `index-format.md`:
-author-signed = parseable GH Actions SAN URL (load-bearing for derivation); milpa-vendored = freeform
-provenance string, **not** an identity anchor.
+`https://github.com/owner/repo/.github/workflows/publish.yaml@refs/heads/main` → `github.com/owner`
+(the repo path, workflow suffix, and `@<ref>` fragment are discarded; host/org kept);
+(c) malformed/empty SAN → derivation error (`derrUnparseable`) — guards the empty-SAN
+silent-hard-reject path flagged in P2.1.
+
+**No "non-github → error" case.** An earlier draft proposed *(b) a non-`github.com` SAN → derivation
+error* to "bound the GH-Actions-OIDC-only assumption." That was a **spec error**, dropped during
+implementation (validated against the live `deriveNamespace`): derivation is **forge-agnostic by
+design** — `https://example.com/owner/repo` → `example.com/owner` via the generic fallback; it does
+NOT gate on `github.com`. The github-only-ness is an entirely separate, *temporary* **OIDC-issuer
+trust scope** enforced at the cosign-verify step in `commit-entry.yaml`
+(`--certificate-oidc-issuer="https://token.actions.githubusercontent.com"`, expandable as other
+issuers are validated), orthogonal to namespace derivation. Cementing "non-github → reject" into the
+`deriveNamespace` conformance oracle would wrongly fuse the two; identity derivation answers "whose
+namespace?", the verify gate answers "is this signer's issuer trusted?".
+
+Specify the normative `signed_by` format per attestation kind in `index-format.md`: author-signed =
+a parseable identity SAN URL from a **trusted keyless-OIDC issuer** (Fulcio cert + Rekor inclusion,
+cosign-verified at ingest), load-bearing for `deriveNamespace`; the canonical GH Actions form is
+`https://github.com/<org>/<repo>/.github/workflows/<wf>.yaml@<ref>`. milpa-vendored = freeform
+provenance string, **not** an identity anchor (vendor-en-absentia uses the git `provenance.url`).
+Note the forge-agnostic-derivation / issuer-trust-gate separation explicitly so it is not re-conflated.
 
 ### PHASE 3 — resolution core to the bar (milpa)
 
