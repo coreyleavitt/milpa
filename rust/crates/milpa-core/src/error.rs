@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn wrapper_delegates_code_across_domains() {
-        let m: MilpaError = ManifestError::Parse("x".into()).into();
+        let m: MilpaError = ManifestError::new("MAN-KDL-SYNTAX", "x").into();
         assert_eq!(m.code(), "MAN-KDL-SYNTAX");
 
         let s: MilpaError = SolverError::Conflict("x".into()).into();

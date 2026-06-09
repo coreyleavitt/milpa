@@ -197,9 +197,20 @@ impl Target for MilpaTarget {
         match fx.cmd {
             // S5a wires `parse_lockfile`; S3 the manifest parse it depends on.
             Cmd::ParseLockfile => Err(NOT_WIRED.to_string()),
-            // S3 (parse) + S4 (identity/CAS) + S6 (version) + S7 (solve) + S5b
-            // (lock emit) + S9 (nim.cfg) compose into this arm.
-            Cmd::Resolve => Err(NOT_WIRED.to_string()),
+            // S3 wires manifest parsing — the first stage of the resolve path.
+            // A malformed manifest surfaces its `MAN-*` code here (greening the
+            // 62 parse-error fixtures, which fail before any fetch/solve). A
+            // *valid* manifest falls through to the not-yet-wired tail (S4
+            // identity/CAS → S6 version → S7 solve → S5b lock emit → S9
+            // nim.cfg), so success/resolve-error fixtures stay parked.
+            Cmd::Resolve => {
+                let text = std::fs::read_to_string(fx.dir.join("milpa.kdl"))
+                    .map_err(|e| format!("E2E-MANIFEST-UNREADABLE: {e}"))?;
+                match milpa_core::parse_document(&text) {
+                    Ok(_doc) => Err(NOT_WIRED.to_string()),
+                    Err(e) => Err(e.code().to_string()),
+                }
+            }
             // S10 wires the frozen path.
             Cmd::Frozen => Err(NOT_WIRED.to_string()),
         }
@@ -242,15 +253,51 @@ mod tests {
     }
 
     #[test]
-    fn milpa_target_is_not_wired_yet() {
-        // Guards the S2→S3 transition: when a cmd arm is wired, this asserts the
-        // sentinel is gone for that path (update as arms light up).
+    fn milpa_target_resolve_parses_then_falls_through() {
+        // S3: a *valid* manifest parses, then the resolve tail is still unwired,
+        // so the arm returns the sentinel (proves parsing ran without error).
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = Scratch::new(tmp.path()).unwrap();
+        std::fs::write(
+            tmp.path().join("milpa.kdl"),
+            "name \"probe\"\nkind \"library\"\n",
+        )
+        .unwrap();
+        let fx = Fixture {
+            id: "synthetic/probe".into(),
+            dir: tmp.path().to_path_buf(),
+            cmd: Cmd::Resolve,
+            expected: Expected::Success,
+        };
+        assert_eq!(MilpaTarget.execute(&fx, &scratch), Err(NOT_WIRED.into()));
+    }
+
+    #[test]
+    fn milpa_target_resolve_surfaces_manifest_error_code() {
+        // A malformed manifest surfaces its MAN-* code (the S3 greening path).
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = Scratch::new(tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("milpa.kdl"), "kind \"library\"\n").unwrap();
+        let fx = Fixture {
+            id: "synthetic/probe".into(),
+            dir: tmp.path().to_path_buf(),
+            cmd: Cmd::Resolve,
+            expected: Expected::Error("MAN-NAME-MISSING".into()),
+        };
+        assert_eq!(
+            MilpaTarget.execute(&fx, &scratch),
+            Err("MAN-NAME-MISSING".into())
+        );
+    }
+
+    #[test]
+    fn milpa_target_frozen_not_wired_yet() {
         let tmp = tempfile::tempdir().unwrap();
         let scratch = Scratch::new(tmp.path()).unwrap();
         let fx = Fixture {
             id: "synthetic/probe".into(),
             dir: tmp.path().to_path_buf(),
-            cmd: Cmd::Resolve,
+            cmd: Cmd::Frozen,
             expected: Expected::Success,
         };
         assert_eq!(MilpaTarget.execute(&fx, &scratch), Err(NOT_WIRED.into()));

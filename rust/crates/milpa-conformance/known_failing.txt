@@ -1,68 +1,12 @@
 # Conformance fixtures not yet greenable by the Rust impl (RFC §4.3).
 # Format: one fixture id per line; '#' starts a comment; blanks ignored.
 # These leave the list as their slices land; MUST be empty for v1-Done (§6).
-# S2: MilpaTarget is unwired, so the entire spec-v1 corpus is parked here.
+# S2: MilpaTarget unwired — entire corpus parked.
+# S3: manifest grammar wired — 62 MAN-* parse-error fixtures greened + removed
+#     (001,002,004-060,102,103,105). 55 remain (resolve/lock/frozen/tng/ws/res
+#     paths, pending S4-S13).
 
-spec-v1/fixture-001-man-kdl-syntax
-spec-v1/fixture-002-man-name-missing
 spec-v1/fixture-003-single-url-dep
-spec-v1/fixture-004-man-name-duplicate
-spec-v1/fixture-005-man-name-type
-spec-v1/fixture-006-man-src-dir-type
-spec-v1/fixture-007-man-cas-dir-missing
-spec-v1/fixture-008-man-cas-dir-type
-spec-v1/fixture-009-man-unknown-top-level
-spec-v1/fixture-010-man-workspace-has-kind
-spec-v1/fixture-011-man-kind-arity
-spec-v1/fixture-012-man-kind-invalid
-spec-v1/fixture-013-man-dep-duplicate
-spec-v1/fixture-014-man-dep-unknown-props
-spec-v1/fixture-015-man-dep-ref-missing
-spec-v1/fixture-016-man-dep-local-path
-spec-v1/fixture-017-man-dep-tarball-url
-spec-v1/fixture-018-man-dep-tarball-sha
-spec-v1/fixture-019-man-dep-tarball-strip
-spec-v1/fixture-020-man-dep-member-props
-spec-v1/fixture-021-man-dep-member-arity
-spec-v1/fixture-022-man-dep-named-props
-spec-v1/fixture-023-man-dep-named-constraint
-spec-v1/fixture-024-man-dep-named-arity
-spec-v1/fixture-025-man-dep-mirror-arity
-spec-v1/fixture-026-man-dep-flag-name-missing
-spec-v1/fixture-027-man-dep-flag-too-many-args
-spec-v1/fixture-028-man-dep-flag-bool
-spec-v1/fixture-029-man-dep-unknown-child
-spec-v1/fixture-030-man-git-url-no-scheme
-spec-v1/fixture-031-man-git-url-bad-scheme
-spec-v1/fixture-032-man-override-kind
-spec-v1/fixture-033-man-override-arity
-spec-v1/fixture-034-man-override-unknown-props
-spec-v1/fixture-035-man-override-git-missing
-spec-v1/fixture-036-man-override-ref-missing
-spec-v1/fixture-037-man-override-duplicate
-spec-v1/fixture-038-man-flag-duplicate
-spec-v1/fixture-039-man-flag-pos-args
-spec-v1/fixture-040-man-flag-unknown-props
-spec-v1/fixture-041-man-flag-default-type
-spec-v1/fixture-042-man-flag-description-type
-spec-v1/fixture-043-man-flag-unknown-child
-spec-v1/fixture-044-man-flag-defines-arg-type
-spec-v1/fixture-045-man-flag-undeclared-reference
-spec-v1/fixture-046-man-predicate-unknown
-spec-v1/fixture-047-man-predicate-value-type
-spec-v1/fixture-048-man-predicate-unsupported-annotation
-spec-v1/fixture-049-man-predicate-child-no-args
-spec-v1/fixture-050-man-predicate-child-arg-type
-spec-v1/fixture-051-man-predicate-mixed-negation
-spec-v1/fixture-052-man-predicate-form-conflict
-spec-v1/fixture-053-man-mirrors-unknown-child
-spec-v1/fixture-054-man-mirrors-arity
-spec-v1/fixture-055-man-workspace-has-deps-or-kind
-spec-v1/fixture-056-man-workspace-unknown-node
-spec-v1/fixture-057-man-workspace-member-arity
-spec-v1/fixture-058-man-workspace-member-duplicate
-spec-v1/fixture-059-man-workspace-unknown-top-level
-spec-v1/fixture-060-man-url-arg-type
 spec-v1/fixture-061-named-dep
 spec-v1/fixture-062-diamond-conflict
 spec-v1/fixture-063-canonical-selection
@@ -103,10 +47,7 @@ spec-v1/fixture-098-tng-unsafe-oci-field
 spec-v1/fixture-099-res-provenance-conflict
 spec-v1/fixture-100-res-ws-override-member-collision
 spec-v1/fixture-101-res-ws-member-ref-unknown
-spec-v1/fixture-102-man-spec-version-type
-spec-v1/fixture-103-man-spec-version-unsupported
 spec-v1/fixture-104-ws-member-is-workspace
-spec-v1/fixture-105-man-workspace-has-deps
 spec-v1/fixture-106-frozen-locked-version-unparseable
 spec-v1/fixture-107-ws-member-dir-missing
 spec-v1/fixture-108-ws-member-dot

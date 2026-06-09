@@ -21,7 +21,13 @@ pub mod registry;
 pub mod store;
 
 pub use error::{CoreError, MilpaError};
+// The manifest parse entry point + role discriminant, re-exported so the
+// conformance harness (and the CLI, S13) reach them through the integration
+// crate rather than depending on `milpa-manifest` directly. `MilpaError`'s
+// `From<ManifestError>` impl lives here, so `?` lifts parse errors at this
+// boundary.
 pub use fetch::{FetchError, Fetcher, FetcherRegistry, Receipt};
+pub use milpa_manifest::{parse_document, ManifestDoc};
 pub use registry::Index;
 pub use store::CaStore;
 
