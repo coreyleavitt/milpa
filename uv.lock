@@ -160,6 +160,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "hypothesis" },
+    { name = "milpa-fetcher-stub" },
     { name = "pytest" },
 ]
 
@@ -172,8 +173,14 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "hypothesis", specifier = ">=6" },
+    { name = "milpa-fetcher-stub", editable = "tests/fixtures/milpa_fetcher_stub" },
     { name = "pytest", specifier = ">=8" },
 ]
+
+[[package]]
+name = "milpa-fetcher-stub"
+version = "0.1.0"
+source = { editable = "tests/fixtures/milpa_fetcher_stub" }
 
 [[package]]
 name = "packaging"

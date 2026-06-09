@@ -7,6 +7,330 @@ on slugs but MUST NOT rely on message wording.
 
 Generated from `milpa/error_catalog.py` — do not edit by hand.
 
+---
+
+## Normative surface
+
+Every catalog entry in this document is **normative**: a conformant
+milpa implementation MUST raise the exact slug shown for the exact
+condition described. The slug is the cross-implementation contract.
+
+The human-readable **message text** (the string passed to the
+exception constructor) is **incidental**: it is NOT byte-normative.
+A conformant implementation MAY differ in phrasing, language, or
+level of detail, provided the slug is correct.
+
+The **Triggered** field describes the reference Python implementation's
+raise site. Alternate implementations MUST produce the same slug for
+the same condition but MAY structure their internals differently.
+
+Bijection invariant: every slug in this catalog MUST have at least
+one raise site in the reference implementation; every raise site MUST
+reference a slug defined here. The test suite enforces both directions
+via `check_catalog_orphan_slugs` for each category prefix.
+
+---
+
+## CAS
+
+### `CAS-IDENTITY-MISMATCH`
+
+Source tree bytes do not hash to the claimed identity string.
+
+**Triggered:** CAStore.admit computes content_hash of src and finds it differs from the identity argument — possible tamper or corruption.
+
+### `CAS-NOT-IN-STORE`
+
+The requested identity is not present in the CAS.
+
+**Triggered:** CAStore.link is called for an identity that has no entry under <root>/<algorithm>/<hex>/.
+
+## EXTRACT
+
+### `EXTRACT-SIZE-LIMIT`
+
+The archive exceeds a configured size or file-count limit (decompression bomb protection).
+
+**Triggered:** extract_tar finds a single-file size, total decompressed size, or file count exceeds the configured caps.
+
+### `EXTRACT-SYMLINK-ESCAPE`
+
+A symlink entry's target resolves outside the destination directory (symlink-escape attack).
+
+**Triggered:** extract_tar finds a symlink entry whose target, when resolved from its parent directory, exits the destination tree.
+
+### `EXTRACT-ZIP-SLIP`
+
+An archive entry's resolved path escapes the destination directory (zip-slip attack).
+
+**Triggered:** extract_tar finds an entry whose path, after joining with dest, resolves outside the destination tree.
+
+## FETCH
+
+### `FETCH-ALL-FAILED`
+
+Every candidate provenance failed — the dep cannot be fetched.
+
+**Triggered:** fetch_any() tries all candidate provenances in order and every one either raises or produces a mismatched identity.  Identity-mismatch candidates are folded into the composite failure message.
+
+### `FETCH-DOWNLOAD-FAILED`
+
+Could not download the tarball from the declared URL.
+
+**Triggered:** TarballFetcher._download raises URLError, FileNotFoundError, or OSError.
+
+### `FETCH-EXTRACT-FAILED`
+
+Safe extraction of the tarball raised an ExtractionError.
+
+**Triggered:** TarballFetcher calls safe_extract.extract_tar and it raises ZipSlipError, SymlinkEscapeError, or SizeLimitError.
+
+### `FETCH-GIT-COMMIT-ABSENT`
+
+The index-pinned commit SHA is absent even after a full history fetch.
+
+**Triggered:** _ensure_commit_present cannot find commit_sha in the cloned repo after exhausting targeted + unshallow fetches.
+
+### `FETCH-GIT-FAILED`
+
+A git subprocess (clone/fetch/checkout) exited non-zero.
+
+**Triggered:** _run_git receives a non-zero exit code from git.
+
+### `FETCH-LOCAL-PATH-NOT-DIR`
+
+The declared local source path is not a directory.
+
+**Triggered:** LocalFetcher.fetch finds p.path exists but is not a directory.
+
+### `FETCH-LOCAL-PATH-NOT-FOUND`
+
+The declared local source path does not exist.
+
+**Triggered:** LocalFetcher.fetch finds p.path does not exist on the filesystem.
+
+### `FETCH-OCI-AMBIGUOUS-TARBALL`
+
+OCI artifact contained more than one *.tar.gz blob.
+
+**Triggered:** OciFetcher.fetch finds multiple *.tar.gz files; cannot determine which to extract.
+
+### `FETCH-OCI-NO-TARBALL`
+
+OCI artifact contained no *.tar.gz blob.
+
+**Triggered:** OciFetcher.fetch pulls the artifact but finds no *.tar.gz in the scratch directory.
+
+### `FETCH-OCI-PULL-FAILED`
+
+oras pull exited non-zero.
+
+**Triggered:** OciFetcher.fetch runs `oras pull` and receives a non-zero exit code.
+
+### `FETCH-RECEIPT-EMPTY`
+
+A fetcher returned a receipt whose transport_fields() is empty — no provenance evidence was recorded.
+
+**Triggered:** FetcherRegistry.fetch calls receipt.transport_fields() after a successful fetch and the returned dict is empty, violating the spec §3.2 non-empty-receipt contract.
+
+### `FETCH-SHA256-MISMATCH`
+
+Downloaded archive sha256 does not match the declared expected_sha256.
+
+**Triggered:** TarballFetcher compares the archive's actual sha256 against TarballProvenance.expected_sha256 and finds a mismatch.
+
+## FROZEN
+
+### `FROZEN-CONSTRAINT-UNSATISFIED`
+
+A manifest NamedDep's version constraint is no longer satisfied by the locked version.
+
+**Triggered:** _check_manifest_alignment checks VersionSet.from_constraint against the locked version and finds it fails.
+
+### `FROZEN-IDENTITY-NOT-IN-STORE`
+
+A dep's pinned identity is not present in the CAS.
+
+**Triggered:** _link_external finds the dep's identity is absent or None, or CAStore.contains returns False.
+
+### `FROZEN-LEGACY-REGISTRY-PROVENANCE`
+
+A lock entry uses the legacy registry provenance and cannot be reconstructed by the frozen path.
+
+**Triggered:** _source_from_provenance encounters a RegistryProvenanceRecord; the user must run `milpa update <name>` to re-resolve via tianguis.
+
+### `FROZEN-LOCAL-DEP`
+
+A dep has a local provenance; editable trees always re-resolve.
+
+**Triggered:** resolve_frozen or resolve_workspace_frozen encounters a LocalProvenanceRecord.
+
+### `FROZEN-LOCKED-VERSION-UNPARSEABLE`
+
+A dep's locked version string is not a parseable X.Y.Z version.
+
+**Triggered:** _check_manifest_alignment or _resolved_from_locked calls parse_version on the locked version and gets None.
+
+### `FROZEN-MANIFEST-DEP-NOT-IN-LOCK`
+
+A manifest dep has no lockfile entry; lockfile is stale.
+
+**Triggered:** _check_manifest_alignment finds a manifest dep name absent from the lockfile's dep list.
+
+### `FROZEN-MEMBER-DEP`
+
+A dep is a workspace member; members always re-resolve.
+
+**Triggered:** resolve_frozen encounters a MemberProvenanceRecord — single-package frozen path does not handle workspace members.
+
+### `FROZEN-MEMBER-IDENTITY-DRIFT`
+
+A workspace member's on-disk content hash differs from the lockfile pin.
+
+**Triggered:** resolve_workspace_frozen computes the member directory's content hash and finds it differs from the lockfile's recorded identity.
+
+### `FROZEN-MEMBER-NOT-IN-WORKSPACE`
+
+The lockfile references a workspace member that is absent from the current workspace.
+
+**Triggered:** resolve_workspace_frozen finds MemberProvenanceRecord.name is not in the workspace's member list.
+
+### `FROZEN-STRATEGY-MISMATCH`
+
+The requested resolution strategy differs from what the lockfile was built with.
+
+**Triggered:** _check_strategy finds the requested strategy string does not match lockfile.strategy.
+
+## ID
+
+### `ID-NO-ALGORITHM-PREFIX`
+
+Identity string is missing the `<algorithm>:` prefix (expected `<algorithm>:<digest>` form).
+
+**Triggered:** parse_identity finds no `:` separator in the input string.
+
+### `ID-NON-HEX-DIGEST`
+
+Digest component contains non-lowercase-hex characters.
+
+**Triggered:** parse_identity finds characters outside `0-9`, `a-f` in the digest.
+
+### `ID-NON-UTF8-SYMLINK-TARGET`
+
+A symlink in the source tree points to a target that is not valid UTF-8, so it cannot be encoded into the content-hash algorithm.
+
+**Triggered:** compute_content_hash encounters a symlink whose os.readlink target fails to re-encode as UTF-8 (surrogate-escaped bytes on POSIX).
+
+### `ID-NOT-A-STRING`
+
+Identity value is not a string.
+
+**Triggered:** parse_identity receives a non-str argument.
+
+### `ID-UNSUPPORTED-ALGORITHM`
+
+Identity string uses an algorithm milpa does not support.
+
+**Triggered:** parse_identity finds an algorithm prefix not in SUPPORTED_ALGORITHMS (currently only `sha256` is supported).
+
+### `ID-WRONG-DIGEST-LENGTH`
+
+Digest component has the wrong number of hex characters.
+
+**Triggered:** parse_identity finds the digest length does not match the expected length for the algorithm (sha256 requires exactly 64 hex chars).
+
+## LOCK
+
+### `LOCK-DEP-FIELD-ARITY`
+
+A dep child field must have exactly one string value.
+
+**Triggered:** A `version`, `src_dir`, or similar child node of a `dep` block has wrong arity.
+
+### `LOCK-DEP-IDENTITY-INVALID`
+
+A dep's `identity` field is not a valid multihash-encoded content hash.
+
+**Triggered:** parse_identity rejects the recorded identity string.
+
+### `LOCK-DEP-NAME-ARITY`
+
+A `dep` node requires exactly one string argument (the name).
+
+**Triggered:** A `dep` node has wrong arity or a non-string arg.
+
+### `LOCK-FIELD-ARITY`
+
+A lockfile scalar field takes exactly one value.
+
+**Triggered:** A `version` or similar scalar node has wrong arity.
+
+### `LOCK-FIELD-TYPE`
+
+A lockfile scalar field value has the wrong type.
+
+**Triggered:** A scalar node's value cannot be coerced to the expected type (e.g. int).
+
+### `LOCK-FILE-NOT-FOUND`
+
+The lockfile path does not exist.
+
+**Triggered:** load_lockfile is called with a path that doesn't exist.
+
+### `LOCK-FILE-UNREADABLE`
+
+The lockfile cannot be read (permissions, OS error).
+
+**Triggered:** OS denies reading the lockfile file.
+
+### `LOCK-GRAPH-MISMATCH`
+
+The resolved graph does not match the lockfile.
+
+**Triggered:** verify_against_graph finds missing, extra, or identity-mismatched deps.
+
+### `LOCK-KDL-SYNTAX`
+
+The lockfile is not valid KDL.
+
+**Triggered:** kdl-py's parser rejects the lockfile text.
+
+### `LOCK-PROV-FIELD-ARITY`
+
+A provenance child field must have exactly one value.
+
+**Triggered:** A provenance block's child node has wrong arity.
+
+### `LOCK-PROV-FIELD-MISSING`
+
+A provenance block is missing a required field.
+
+**Triggered:** A required field (e.g. `url` for git, `path` for local) is absent.
+
+### `LOCK-PROV-KIND-MISSING`
+
+A provenance block is missing the `kind` discriminator.
+
+**Triggered:** No `kind` field is found in the provenance block.
+
+### `LOCK-PROV-KIND-UNKNOWN`
+
+Unknown provenance `kind` value.
+
+**Triggered:** The `kind` field is not one of: git, tarball, local, member, oci, registry.
+
+### `LOCK-VERSION-MISSING`
+
+Lockfile is missing the required top-level `version` node.
+
+**Triggered:** parse_lockfile finds no `version` node in the KDL document.
+
+### `LOCK-VERSION-UNSUPPORTED`
+
+Lockfile schema version is not supported by this milpa.
+
+**Triggered:** The `version` integer is higher than LOCKFILE_SCHEMA_VERSION.
+
 ## MAN
 
 ### `MAN-ADD-MIRROR-IDENTITY-MISMATCH`
@@ -273,6 +597,12 @@ Multiple .nimble files in a project; cannot pick automatically.
 
 **Triggered:** load_or_discover_manifest finds >1 .nimble and no project-named match.
 
+### `MAN-NIMBLE-CONSTRAINT`
+
+A transitive .nimble file's `requires` constraint string is malformed.
+
+**Triggered:** resolver._build_terms tries VersionSet.from_constraint on a .nimble requires entry and gets an unparseable clause.
+
 ### `MAN-NIMBLE-PARSE`
 
 A .nimble fallback file failed to parse.
@@ -363,6 +693,18 @@ Predicate value must be a string.
 
 **Triggered:** A predicate's value is non-string.
 
+### `MAN-SPEC-VERSION-TYPE`
+
+`spec-version` must carry exactly one positional integer argument >= 1.
+
+**Triggered:** spec-version node has wrong arity, non-integer arg, or value < 1.
+
+### `MAN-SPEC-VERSION-UNSUPPORTED`
+
+Manifest declares a spec-version epoch greater than this implementation supports.
+
+**Triggered:** spec-version <N> where N > MANIFEST_SPEC_VERSION.
+
 ### `MAN-SRC-DIR-TYPE`
 
 `src_dir` must take exactly one positional string argument.
@@ -416,3 +758,187 @@ Unknown node in workspace block.
 Unknown top-level node in workspace manifest.
 
 **Triggered:** A workspace manifest has a top-level node outside the allowed set.
+
+## NIMBLE
+
+### `NIMBLE-FILE-NOT-FOUND`
+
+The .nimble file path does not exist.
+
+**Triggered:** load_nimble is called with a path that has no file on disk.
+
+### `NIMBLE-FILE-UNREADABLE`
+
+The .nimble file cannot be read (permissions, OS error).
+
+**Triggered:** OS denies reading the .nimble file.
+
+## RES
+
+### `RES-NO-INDEX`
+
+Manifest has named dep(s) but no tianguis index was provided.
+
+**Triggered:** resolve() is called without index= when the manifest has NamedDep entries.
+
+### `RES-PROVENANCE-CONFLICT`
+
+Two transitive deps declare different provenance (source) for the same package name and the root does not override that name. The resolver cannot unambiguously choose between two different source trees for the same package name.
+
+**Triggered:** A package name is first encountered via one transport (URL/local/named) and then a transitive dep requests it via a different, incompatible transport/URL, and the root manifest has no authority over that name (it is not declared in deps, dev-deps, or overrides).
+
+### `RES-WS-MEMBER-REF-UNKNOWN`
+
+A workspace member references a `member "X"` dep that doesn't exist.
+
+**Triggered:** A MemberDep name is not in the workspace's member list.
+
+### `RES-WS-NO-INDEX`
+
+Workspace has named dep(s) but no tianguis index was provided.
+
+**Triggered:** resolve_workspace() is called without index= when members have NamedDep entries.
+
+### `RES-WS-OVERRIDE-MEMBER-COLLISION`
+
+A workspace override name also appears as a workspace member.
+
+**Triggered:** The same name appears in both overrides and workspace members.
+
+## SOLVE
+
+### `SOLVE-CONFLICT`
+
+No version solution exists — dep constraints are unsatisfiable.
+
+**Triggered:** PubGrub exhausts all backtracking options and finds no consistent assignment.  SolverError.chain carries the structured ConflictChain narrating why.
+
+## TNG
+
+### `TNG-AMBIGUOUS-NAME`
+
+The bare package name matches more than one namespace in the index.
+
+**Triggered:** resolve_named (or resolve_named_all) calls lookup_bare and receives AmbiguousName — use a namespace-qualified reference to disambiguate.
+
+### `TNG-BAD-COMMIT-SHA`
+
+A git provenance commit_sha is not a valid 40-character lowercase hex SHA1.
+
+**Triggered:** _validate_commit_sha finds the commit_sha field does not match `^[0-9a-f]{40}$` — rejects abbreviated SHAs and flag-injection vectors.
+
+### `TNG-BAD-OCI-DIGEST`
+
+An OCI provenance digest is not in `sha256:<64 lowercase hex>` format.
+
+**Triggered:** _validate_oci_digest finds the digest field does not match `^sha256:[0-9a-f]{64}$` — rejects malformed oras pull references.
+
+### `TNG-BAD-VERSION`
+
+An index version string is not a parseable X.Y.Z semver.
+
+**Triggered:** Reserved for a future strict-parse pass.  Currently unparseable version strings are silently skipped (forward-compat); this code will be raised when a strict mode is enabled.
+
+### `TNG-NO-IDENTITY`
+
+An index entry carries no content_hash — identity verification is impossible.
+
+**Triggered:** The resolver's identity gate (_fetch_and_build_named_candidate in resolver.py) finds IndexVersion.content_hash is empty or absent.  A content_hash is required before any fetch is attempted; absence is a malformed index entry.  The resolver MUST NOT attempt to fetch a named dep without a verifiable identity.
+
+### `TNG-NO-PROVENANCE`
+
+A package version has no fetchable provenance in the index.
+
+**Triggered:** resolve_named_all finds a version whose provenances tuple is empty after skipping provenance-less entries, or IndexVersion.canonical_provenance is called on an entry with no provenances.
+
+### `TNG-NO-SATISFYING-VERSION`
+
+No version of the requested package satisfies the declared constraint.
+
+**Triggered:** resolve_named_all applies VersionSet.from_constraint to every IndexVersion and finds none satisfying — the constraint is incompatible with all available versions.
+
+### `TNG-NOT-FOUND`
+
+The requested package name is not in the tianguis index.
+
+**Triggered:** resolve_named_all looks up a bare name and finds no matching package in the index.  Every nim-lang/packages entry should be vendored; absence indicates a vendor-bot gap.
+
+### `TNG-SCHEMA-UNKNOWN`
+
+The index declares a schema_version higher than this milpa supports.
+
+**Triggered:** _check_schema_version finds the index schema_version integer is greater than TIANGUIS_INDEX_SCHEMA_VERSION — the caller must upgrade milpa.
+
+### `TNG-UNSAFE-NAME`
+
+A package name contains path-traversal characters and is unsafe as a filesystem path component under `_deps/`.
+
+**Triggered:** _validate_safe_name finds the name contains `..`, `/`, `\\`, or is an absolute path — would escape the _deps/ sandbox if used as a directory name.
+
+### `TNG-UNSAFE-OCI-FIELD`
+
+An OCI provenance field (registry or repository) begins with `-` and would be interpreted as a CLI flag.
+
+**Triggered:** _validate_no_leading_dash finds an oci registry or repository value starting with `-` — flag-injection prevention for oras argv.
+
+### `TNG-UNSAFE-REF`
+
+A git ref begins with `-` and would be interpreted as a CLI flag.
+
+**Triggered:** _validate_no_leading_dash finds a git ref value starting with `-` — flag-injection prevention at the index trust boundary.
+
+### `TNG-UNSAFE-URL`
+
+A git URL begins with `-` and would be interpreted as a CLI flag.
+
+**Triggered:** _validate_no_leading_dash finds a git url value starting with `-` — flag-injection prevention at the index trust boundary.
+
+## WS
+
+### `WS-MEMBER-DIR-MISSING`
+
+A workspace member has no directory at the declared path.
+
+**Triggered:** load_workspace resolves a member path and finds no directory there.
+
+### `WS-MEMBER-DOT`
+
+Member path "." is not supported; the workspace root cannot also be a package.
+
+**Triggered:** A workspace member declaration uses "." as the member path.
+
+### `WS-MEMBER-DUPLICATE-NAME`
+
+Two workspace members claim the same package name.
+
+**Triggered:** load_workspace finds two members whose milpa.kdl both declare the same name.
+
+### `WS-MEMBER-HAS-OVERRIDES`
+
+A workspace member declares its own `overrides` block; per-member overrides are not supported.
+
+**Triggered:** load_workspace finds overrides declared in a member's manifest.
+
+### `WS-MEMBER-IS-WORKSPACE`
+
+A workspace member is itself a workspace; nested workspaces are not supported.
+
+**Triggered:** load_workspace parses a member's milpa.kdl and finds a WorkspaceManifest.
+
+### `WS-MEMBER-NO-MANIFEST`
+
+A workspace member directory has no milpa.kdl.
+
+**Triggered:** load_workspace finds the member directory but no milpa.kdl inside it.
+
+### `WS-NO-MANIFEST`
+
+No milpa.kdl found at the expected workspace root.
+
+**Triggered:** load_workspace is called on a directory with no milpa.kdl.
+
+### `WS-NOT-A-WORKSPACE`
+
+The milpa.kdl at the root is a package manifest, not a workspace.
+
+**Triggered:** load_workspace parses the root milpa.kdl and finds a Manifest, not WorkspaceManifest.

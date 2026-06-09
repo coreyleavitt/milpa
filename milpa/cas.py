@@ -18,6 +18,10 @@ from .identity import compute_content_hash, parse_identity
 class CASError(Exception):
     """Raised on store-integrity violations (identity mismatch, etc.)."""
 
+    def __init__(self, message: str = "", *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 class CAStore:
     """On-disk content-addressed store.
@@ -55,7 +59,8 @@ class CAStore:
         if actual != identity:
             raise CASError(
                 f"identity mismatch — claimed {identity!r}, "
-                f"computed {actual!r}"
+                f"computed {actual!r}",
+                code="CAS-IDENTITY-MISMATCH",
             )
         canonical = self.path_for(identity)
         canonical.parent.mkdir(parents=True, exist_ok=True)
@@ -83,7 +88,8 @@ class CAStore:
         canonical = self.path_for(identity)
         if not canonical.is_dir():
             raise CASError(
-                f"cannot link {target} → {identity}: not in store"
+                f"cannot link {target} → {identity}: not in store",
+                code="CAS-NOT-IN-STORE",
             )
         clear_dest(target)
         rel = os.path.relpath(canonical, start=target.parent)

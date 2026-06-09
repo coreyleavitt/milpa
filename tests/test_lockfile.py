@@ -102,6 +102,7 @@ def test_parse_lockfile_rejects_unknown_schema_version():
     with pytest.raises(LockfileError) as exc:
         parse_lockfile(text)
     assert "99" in str(exc.value) or "version" in str(exc.value).lower()
+    assert exc.value.code == "LOCK-VERSION-UNSUPPORTED"
 
 
 def test_write_and_load_round_trip(tmp_path):
@@ -137,6 +138,7 @@ def test_verify_against_graph_raises_on_identity_mismatch():
         verify_against_graph(lockfile, graph_drifted)
     assert "foo" in str(exc.value)
     assert "identity" in str(exc.value).lower()
+    assert exc.value.code == "LOCK-GRAPH-MISMATCH"
 
 
 def test_verify_against_graph_raises_on_missing_or_extra_dep():
@@ -220,3 +222,174 @@ dep "foo" {
     msg = str(exc.value).lower()
     assert "md5" in msg
     assert "unsupported" in msg
+    assert exc.value.code == "LOCK-DEP-IDENTITY-INVALID"
+
+
+# ---------------------------------------------------------------------------
+# Error-catalog code coverage (LOCK-* bijection)
+# ---------------------------------------------------------------------------
+
+def test_lock_kdl_syntax_code():
+    """LOCK-KDL-SYNTAX: malformed KDL text."""
+    with pytest.raises(LockfileError) as exc:
+        parse_lockfile("this is not { kdl")
+    assert exc.value.code == "LOCK-KDL-SYNTAX"
+
+
+def test_lock_version_missing_code():
+    """LOCK-VERSION-MISSING: no version node in lockfile."""
+    with pytest.raises(LockfileError) as exc:
+        parse_lockfile('dep "foo" { }')
+    assert exc.value.code == "LOCK-VERSION-MISSING"
+
+
+def test_lock_file_not_found_code(tmp_path):
+    """LOCK-FILE-NOT-FOUND: lockfile path doesn't exist."""
+    from milpa.lockfile import load_lockfile
+    with pytest.raises(LockfileError) as exc:
+        load_lockfile(tmp_path / "no_such_file.lock")
+    assert exc.value.code == "LOCK-FILE-NOT-FOUND"
+
+
+def test_lock_field_arity_code():
+    """LOCK-FIELD-ARITY: version node with wrong arity."""
+    with pytest.raises(LockfileError) as exc:
+        parse_lockfile("version 1 2\n")
+    assert exc.value.code == "LOCK-FIELD-ARITY"
+
+
+def test_lock_field_type_code():
+    """LOCK-FIELD-TYPE: version node with non-integer value."""
+    with pytest.raises(LockfileError) as exc:
+        parse_lockfile('version "notanint"\n')
+    assert exc.value.code == "LOCK-FIELD-TYPE"
+
+
+def _minimal_dep_block(extra: str = "") -> str:
+    """KDL text for a minimal valid lockfile with one dep, plus optional extra
+    text injected into the dep block."""
+    return (
+        "version 1\n"
+        'dep "foo" {\n'
+        '    version "0.0.1"\n'
+        '    src_dir "src"\n'
+        '    requires\n'
+        f"{extra}"
+        "    provenance {\n"
+        '        kind "git"\n'
+        '        url "https://example.com/foo.git"\n'
+        '        ref "main"\n'
+        "    }\n"
+        "}\n"
+    )
+
+
+def test_lock_dep_name_arity_code():
+    """LOCK-DEP-NAME-ARITY: dep node without a name arg."""
+    text = (
+        "version 1\n"
+        "dep {\n"
+        '    version "0.0.1"\n'
+        '    src_dir ""\n'
+        "    requires\n"
+        "    provenance {\n"
+        '        kind "git"\n'
+        '        url "https://x.com/y.git"\n'
+        "    }\n"
+        "}\n"
+    )
+    with pytest.raises(LockfileError) as exc:
+        parse_lockfile(text)
+    assert exc.value.code == "LOCK-DEP-NAME-ARITY"
+
+
+def test_lock_dep_field_arity_code():
+    """LOCK-DEP-FIELD-ARITY: dep child field (e.g. version) with wrong arity."""
+    text = (
+        "version 1\n"
+        'dep "foo" {\n'
+        '    version "a" "b"\n'
+        '    src_dir "src"\n'
+        "    requires\n"
+        "    provenance {\n"
+        '        kind "git"\n'
+        '        url "https://example.com/foo.git"\n'
+        '        ref "main"\n'
+        "    }\n"
+        "}\n"
+    )
+    with pytest.raises(LockfileError) as exc:
+        parse_lockfile(text)
+    assert exc.value.code == "LOCK-DEP-FIELD-ARITY"
+
+
+def test_lock_prov_field_arity_code():
+    """LOCK-PROV-FIELD-ARITY: provenance child with wrong arity."""
+    text = (
+        "version 1\n"
+        'dep "foo" {\n'
+        '    version "0.0.1"\n'
+        '    src_dir "src"\n'
+        "    requires\n"
+        "    provenance {\n"
+        '        kind "git" "extra"\n'
+        "    }\n"
+        "}\n"
+    )
+    with pytest.raises(LockfileError) as exc:
+        parse_lockfile(text)
+    assert exc.value.code == "LOCK-PROV-FIELD-ARITY"
+
+
+def test_lock_prov_kind_missing_code():
+    """LOCK-PROV-KIND-MISSING: provenance block without a kind field."""
+    text = (
+        "version 1\n"
+        'dep "foo" {\n'
+        '    version "0.0.1"\n'
+        '    src_dir "src"\n'
+        "    requires\n"
+        "    provenance {\n"
+        '        url "https://example.com/foo.git"\n'
+        "    }\n"
+        "}\n"
+    )
+    with pytest.raises(LockfileError) as exc:
+        parse_lockfile(text)
+    assert exc.value.code == "LOCK-PROV-KIND-MISSING"
+
+
+def test_lock_prov_kind_unknown_code():
+    """LOCK-PROV-KIND-UNKNOWN: provenance block with unrecognized kind."""
+    text = (
+        "version 1\n"
+        'dep "foo" {\n'
+        '    version "0.0.1"\n'
+        '    src_dir "src"\n'
+        "    requires\n"
+        "    provenance {\n"
+        '        kind "hg"\n'
+        "    }\n"
+        "}\n"
+    )
+    with pytest.raises(LockfileError) as exc:
+        parse_lockfile(text)
+    assert exc.value.code == "LOCK-PROV-KIND-UNKNOWN"
+
+
+def test_lock_prov_field_missing_code():
+    """LOCK-PROV-FIELD-MISSING: git provenance without the required url."""
+    text = (
+        "version 1\n"
+        'dep "foo" {\n'
+        '    version "0.0.1"\n'
+        '    src_dir "src"\n'
+        "    requires\n"
+        "    provenance {\n"
+        '        kind "git"\n'
+        "    }\n"
+        "}\n"
+    )
+    with pytest.raises(LockfileError) as exc:
+        parse_lockfile(text)
+    assert exc.value.code == "LOCK-PROV-FIELD-MISSING"

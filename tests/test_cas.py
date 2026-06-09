@@ -191,6 +191,9 @@ def test_fetcher_registry_routes_through_cas_and_symlinks_dest(tmp_path):
     class StubReceipt(ProvenanceReceipt):
         marker: str
 
+        def transport_fields(self) -> dict[str, str]:
+            return {"marker": self.marker}
+
     class StubFetcher:
         def can_handle(self, p): return isinstance(p, StubProvenance)
         def fetch(self, name, p, *, dest):
@@ -244,7 +247,8 @@ def test_cas_admissible_false_provenances_bypass_the_store(tmp_path):
 
     @dataclass(frozen=True)
     class EditableReceipt(ProvenanceReceipt):
-        pass
+        def transport_fields(self) -> dict[str, str]:
+            return {"kind": "editable"}
 
     class EditableFetcher:
         def can_handle(self, p): return isinstance(p, EditableProvenance)

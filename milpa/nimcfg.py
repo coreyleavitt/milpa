@@ -37,16 +37,23 @@ def format_nimcfg(
     lines = [_HEADER.rstrip("\n"), ""]
     if self_src_dir:
         lines.append(f'--path:"{self_src_dir}"')
-    for dep in graph.deps:
+    # Emission order is lexicographic by dep name — the spec's single
+    # canonical ordering rule (resolver-semantics.md §4.4). A toposort
+    # would also be deterministic but its sibling tie-break is not
+    # reproducible across implementations; lexicographic is, and it
+    # matches the lockfile's own dep-entry order. Nim search-path order
+    # is not semantically load-bearing (deps live in disjoint dirs).
+    ordered = sorted(graph.deps, key=lambda d: d.name)
+    for dep in ordered:
         lines.append(f'--path:"{_path_for(dep, deps_dir)}"')
     # Feature flag defines (#23). For each active flag on a dep:
     #   - If dep.flag_defines has an explicit override for this flag,
     #     emit those literal -d: strings.
     #   - Otherwise use the convention `-d:<dep_name>_<flag_name>`.
     flag_lines: list[str] = []
-    for dep in graph.deps:
+    for dep in ordered:
         explicit = dict(dep.flag_defines)
-        for flag in dep.active_flags:
+        for flag in sorted(dep.active_flags):
             if flag in explicit:
                 for d in explicit[flag]:
                     flag_lines.append(f'-d:{d}')
@@ -152,7 +159,13 @@ def write_workspace_nimcfgs(
         target.parent.mkdir(parents=True, exist_ok=True)
         lines = [_HEADER.rstrip("\n"), ""]
 
-        closure = member_dep_closure(graph, member.name)
+        # Lexicographic emission order — same canonical rule as the
+        # single-package nim.cfg (resolver-semantics.md §4.4). The
+        # closure is computed via toposort for reachability; emission
+        # sorts by name so the output is reproducible across impls.
+        closure = sorted(
+            member_dep_closure(graph, member.name), key=lambda d: d.name
+        )
         for dep in closure:
             dep_target = _absolute_path_for_dep(
                 dep, deps_dir=deps_dir, member_dir_by_name=member_dir_by_name,

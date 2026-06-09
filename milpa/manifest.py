@@ -170,6 +170,18 @@ class FlagDecl:
     defines: tuple[str, ...] = ()
 
 
+MANIFEST_SPEC_VERSION = 1
+"""The highest manifest spec-version epoch this implementation understands.
+
+Bumped only for breaking semantic changes to the manifest grammar;
+additive grammar evolution stays within an epoch (handled by the P3
+forward-unknown properties). See §4.4 of docs/spec/manifest-grammar.md.
+
+Distinct namespace from LOCKFILE_SCHEMA_VERSION (lockfile.py) and
+TIANGUIS_INDEX_SCHEMA_VERSION (tianguis_client.py).
+"""
+
+
 @dataclass(frozen=True)
 class Manifest:
     deps: tuple[Dep, ...]
@@ -180,6 +192,10 @@ class Manifest:
     flags: tuple[FlagDecl, ...] = ()
     self_mirrors: tuple[str, ...] = ()    # alternative URLs where THIS package is hosted (#79)
     cas_dir: str = ""                     # project-level CAS override (env var > this > XDG default)
+    spec_version: int = 1                 # epoch declared by spec-version node (default 1 = absent)
+    spec_version_explicit: bool = False   # True iff spec-version was declared in source
+    dev_deps: tuple[Dep, ...] = ()        # deps needed only when building/testing this package;
+                                          # NOT propagated to downstream consumers (Cargo model)
 
 
 @dataclass(frozen=True)
@@ -214,7 +230,7 @@ class ManifestError(Exception):
 # the schema doc at milpa/schema/milpa.schema.kdl documents the same shape
 # for humans. Drift between the two is checked indirectly via tests against
 # example manifests.
-_PACKAGE_TOP_LEVEL = frozenset({"deps", "kind", "overrides", "name", "src_dir", "flags", "mirrors", "cas"})
+_PACKAGE_TOP_LEVEL = frozenset({"deps", "dev-deps", "kind", "overrides", "name", "src_dir", "flags", "mirrors", "cas", "spec-version"})
 _PREDICATE_PROPS = frozenset({"platform", "arch", "nim", "milpa", "flag"})
 _URL_DEP_PROPS = frozenset({"git", "ref"}) | _PREDICATE_PROPS
 _VALID_KINDS: tuple[Kind, ...] = ("library", "application")
@@ -243,7 +259,7 @@ def parse_workspace_or_manifest(
     return _parse_manifest_doc(doc)
 
 
-_WORKSPACE_TOP_LEVEL = frozenset({"workspace", "name", "overrides"})
+_WORKSPACE_TOP_LEVEL = frozenset({"workspace", "name", "overrides", "spec-version"})
 
 
 def _parse_workspace_doc(doc) -> "WorkspaceManifest":
@@ -251,6 +267,16 @@ def _parse_workspace_doc(doc) -> "WorkspaceManifest":
     overrides: list[Override] = []
     seen_override_names: set[str] = set()
     for node in doc.nodes:
+        if node.name == "spec-version":
+            epoch = _parse_spec_version_node(node)
+            if epoch > MANIFEST_SPEC_VERSION:
+                raise ManifestError(
+                    f"manifest declares spec-version {epoch} but this "
+                    f"implementation only supports up to "
+                    f"spec-version {MANIFEST_SPEC_VERSION}",
+                    code="MAN-SPEC-VERSION-UNSUPPORTED",
+                )
+            continue
         if node.name in {"deps", "kind"}:
             raise ManifestError(
                 f"a workspace manifest must not declare {node.name!r} — "
@@ -323,6 +349,7 @@ def parse_manifest(text: str, *, source: str | None = None) -> Manifest:
 
 def _parse_manifest_doc(doc) -> Manifest:
     deps: list[Dep] = []
+    dev_deps: list[Dep] = []
     overrides: list[Override] = []
     flags: list[FlagDecl] = []
     self_mirrors: list[str] = []
@@ -330,10 +357,25 @@ def _parse_manifest_doc(doc) -> Manifest:
     name: str | None = None
     src_dir: str = ""
     cas_dir: str = ""
+    spec_version: int = 1
+    spec_version_explicit: bool = False
     seen_names: set[str] = set()
+    seen_dev_dep_names: set[str] = set()
     seen_override_names: set[str] = set()
     seen_flag_names: set[str] = set()
     for node in doc.nodes:
+        if node.name == "spec-version":
+            epoch = _parse_spec_version_node(node)
+            if epoch > MANIFEST_SPEC_VERSION:
+                raise ManifestError(
+                    f"manifest declares spec-version {epoch} but this "
+                    f"implementation only supports up to "
+                    f"spec-version {MANIFEST_SPEC_VERSION}",
+                    code="MAN-SPEC-VERSION-UNSUPPORTED",
+                )
+            spec_version = epoch
+            spec_version_explicit = True
+            continue
         if node.name == "name":
             if name is not None:
                 raise ManifestError(
@@ -382,6 +424,19 @@ def _parse_manifest_doc(doc) -> Manifest:
                         )
                     seen_names.add(dep.name)
                     deps.append(dep)
+        elif node.name == "dev-deps":
+            # dev-deps: same dep forms as `deps`; same error codes for
+            # malformed entries (MAN-DEP-*). NOT propagated to downstream
+            # consumers — resolved only when this package is the root.
+            for child in node.nodes:
+                for dep in _expand_dep_child(child, inherited_preds=()):
+                    if dep.name in seen_dev_dep_names:
+                        raise ManifestError(
+                            f"duplicate dep {dep.name!r} in manifest",
+                            code="MAN-DEP-DUPLICATE",
+                        )
+                    seen_dev_dep_names.add(dep.name)
+                    dev_deps.append(dep)
         elif node.name == "kind":
             kind = _parse_kind(node)
         elif node.name == "overrides":
@@ -446,8 +501,9 @@ def _parse_manifest_doc(doc) -> Manifest:
         )
     # Validate flag predicates against declared flags (#23/#90):
     # `when flag="X"` must reference a declared flag, else it's a typo.
+    # Applies to both deps and dev-deps.
     declared_flag_names = {fd.name for fd in flags}
-    for dep in deps:
+    for dep in deps + dev_deps:
         for pred in getattr(dep, "predicates", ()):
             if pred.name != "flag":
                 continue
@@ -461,6 +517,7 @@ def _parse_manifest_doc(doc) -> Manifest:
                     )
     return Manifest(
         deps=tuple(deps),
+        dev_deps=tuple(dev_deps),
         kind=kind,
         name=name,
         src_dir=src_dir,
@@ -468,6 +525,8 @@ def _parse_manifest_doc(doc) -> Manifest:
         flags=tuple(flags),
         self_mirrors=tuple(self_mirrors),
         cas_dir=cas_dir,
+        spec_version=spec_version,
+        spec_version_explicit=spec_version_explicit,
     )
 
 
@@ -505,6 +564,9 @@ def format_manifest(m: Manifest) -> str:
     comments — comment-preserving serialization is #15's deliverable.
     """
     lines: list[str] = [_MANIFEST_HEADER, ""]
+    if m.spec_version_explicit:
+        lines.append(f"spec-version {m.spec_version}")
+        lines.append("")
     if m.name is not None:
         lines.append(f'name "{m.name}"')
         lines.append("")
@@ -519,6 +581,12 @@ def format_manifest(m: Manifest) -> str:
     if m.deps:
         lines.append("deps {")
         for dep in m.deps:
+            lines.append(_format_dep_line(dep))
+        lines.append("}")
+        lines.append("")
+    if m.dev_deps:
+        lines.append("dev-deps {")
+        for dep in m.dev_deps:
             lines.append(_format_dep_line(dep))
         lines.append("}")
         lines.append("")
@@ -1167,6 +1235,39 @@ def _parse_override(node: kdl.Node) -> Override:
     git = _url_arg(f"override {name!r}", "git", node.props["git"])
     _validate_git_url(name, git)
     return Override(name=name, git=git, ref=node.props["ref"])
+
+
+def _parse_spec_version_node(node: kdl.Node) -> int:
+    """Parse a `spec-version <int>` top-level node.
+
+    Returns the declared epoch (a positive integer). Validates arity,
+    type, and value range; raises ManifestError on any violation.
+    The caller is responsible for checking that the epoch is within the
+    supported range (MANIFEST_SPEC_VERSION) and raising
+    MAN-SPEC-VERSION-UNSUPPORTED if not.
+    """
+    if len(node.args) != 1:
+        raise ManifestError(
+            f"'spec-version' takes exactly one positional integer argument "
+            f"(got {len(node.args)} args)",
+            code="MAN-SPEC-VERSION-TYPE",
+        )
+    raw = node.args[0]
+    # kdl-py parses bare numeric literals as float; accept ints or
+    # integer-valued floats (same pattern as strip_components).
+    if isinstance(raw, float) and raw.is_integer():
+        raw = int(raw)
+    if not isinstance(raw, int) or isinstance(raw, bool):
+        raise ManifestError(
+            f"'spec-version' argument must be an integer; got {type(raw).__name__}",
+            code="MAN-SPEC-VERSION-TYPE",
+        )
+    if raw < 1:
+        raise ManifestError(
+            f"'spec-version' must be >= 1; got {raw}",
+            code="MAN-SPEC-VERSION-TYPE",
+        )
+    return raw
 
 
 def _parse_kind(node: kdl.Node) -> Kind:

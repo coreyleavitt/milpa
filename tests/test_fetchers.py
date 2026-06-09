@@ -114,6 +114,9 @@ def test_ambiguous_dispatch_raises_when_multiple_fetchers_match(tmp_path):
     class MarkerReceipt(ProvenanceReceipt):
         who: str
 
+        def transport_fields(self) -> dict[str, str]:
+            return {"who": self.who}
+
     class FetcherA:
         def can_handle(self, p): return isinstance(p, MarkerProvenance)
         def fetch(self, name, p, *, dest):
@@ -156,6 +159,9 @@ def test_registry_computes_identity_externally(tmp_path):
     @dataclass(frozen=True)
     class StubReceipt(ProvenanceReceipt):
         lie: str
+
+        def transport_fields(self) -> dict[str, str]:
+            return {"lie": self.lie}
 
     class StubFetcher:
         """Writes `payload` bytes to dest. Returns a receipt with

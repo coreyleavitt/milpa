@@ -436,6 +436,7 @@ def test_resolve_workspace_unknown_member_reference_raises(tmp_path):
     msg = str(exc.value)
     assert "fresco" in msg
     assert "ghost" in msg
+    assert exc.value.code == "RES-WS-MEMBER-REF-UNKNOWN"
 
 
 def test_resolve_workspace_handles_cyclic_member_references(tmp_path):
@@ -707,3 +708,115 @@ def test_resolve_workspace_override_name_collision_with_member_raises(tmp_path):
     assert "intonaco" in msg
     assert "override" in msg
     assert "member" in msg
+    assert exc.value.code == "RES-WS-OVERRIDE-MEMBER-COLLISION"
+
+
+def test_resolve_workspace_named_dep_version_selection_parity(tmp_path):
+    """Workspace named-dep resolution must select the same version as
+    resolve() would for an equivalent merged manifest — version-selection
+    parity (G2/#109).
+
+    Setup: two members each constrain `foo` with non-overlapping upper/lower
+    bounds so that only ONE index version satisfies the intersection:
+
+      member fresco:   foo >= 0.3.0
+      member intonaco: foo <= 0.4.0
+      index:           foo@0.3.0 (satisfies both), foo@0.5.0 (violates intonaco)
+
+    The correct resolution is foo@0.3.0.  With the old _process_named path,
+    the first-queued constraint (>= 0.3.0) is the only one resolve_named sees;
+    it returns foo@0.5.0 (highest satisfying >= 0.3.0), which then fails the
+    solver's <= 0.4.0 term from intonaco — a SolverError on a solvable graph.
+
+    With the enumerate-then-solve model, both 0.3.0 and 0.5.0 are registered
+    as stubs; the solver picks 0.3.0 (the only one satisfying the intersection)
+    and succeeds.
+    """
+    from milpa.manifest import Manifest, NamedDep
+    from tests.indexkdl import fake_content_hash, make_index
+
+    fresco_dir = tmp_path / "fresco"
+    fresco_dir.mkdir()
+    intonaco_dir = tmp_path / "intonaco"
+    intonaco_dir.mkdir()
+
+    nimble_text = 'srcDir = "src"\n'
+    # Both versions share the same nimble body but differ by ref;
+    # fake_content_hash is determined by the content written to dest,
+    # so we must match what the fake fetcher will actually write.
+    foo_hash = fake_content_hash("foo", nimble_text)
+
+    ws = Workspace(
+        root=tmp_path,
+        members=(
+            LoadedMember(
+                name="fresco", path="fresco", directory=fresco_dir,
+                manifest=Manifest(
+                    deps=(NamedDep(name="foo", constraint=">= 0.3.0"),),
+                    kind="library", name="fresco",
+                ),
+            ),
+            LoadedMember(
+                name="intonaco", path="intonaco", directory=intonaco_dir,
+                manifest=Manifest(
+                    deps=(NamedDep(name="foo", constraint="<= 0.4.0"),),
+                    kind="library", name="intonaco",
+                ),
+            ),
+        ),
+    )
+
+    index = make_index([
+        {
+            "name": "foo", "version": "0.3.0",
+            "url": "https://example.com/foo.git", "ref": "v0.3.0",
+            "content_hash": foo_hash,
+        },
+        {
+            "name": "foo", "version": "0.5.0",
+            "url": "https://example.com/foo.git", "ref": "v0.5.0",
+            "content_hash": foo_hash,
+        },
+    ])
+    reg, _ = _fake_registry({
+        ("https://example.com/foo.git", "v0.3.0"): ("sha030", nimble_text),
+        ("https://example.com/foo.git", "v0.5.0"): ("sha050", nimble_text),
+    })
+
+    graph = resolve_workspace(
+        ws, deps_dir=tmp_path / "_deps",
+        index=index, fetcher=reg,
+    )
+
+    foo = next(d for d in graph.deps if d.name == "foo")
+    assert foo.ref == "v0.3.0", (
+        f"expected foo@0.3.0 (the only version satisfying both >= 0.3.0 and "
+        f"<= 0.4.0) but got ref={foo.ref!r}"
+    )
+
+
+def test_resolve_workspace_named_dep_without_index_raises_res_ws_no_index(tmp_path):
+    """RES-WS-NO-INDEX: a workspace member has a NamedDep but resolve_workspace
+    is called without an index — must raise ResolverError with code
+    'RES-WS-NO-INDEX'."""
+    from milpa.resolver import ResolverError
+
+    member_dir = tmp_path / "pkgA"
+    member_dir.mkdir()
+    member_manifest = Manifest(
+        deps=(NamedDep(name="somelib", constraint=">=1.0.0"),),
+        kind="library", name="pkgA",
+    )
+    ws = Workspace(
+        root=tmp_path,
+        members=(
+            LoadedMember(
+                name="pkgA", path="pkgA",
+                directory=member_dir, manifest=member_manifest,
+            ),
+        ),
+    )
+    with pytest.raises(ResolverError) as exc:
+        resolve_workspace(ws, deps_dir=tmp_path / "_deps")
+    assert exc.value.code == "RES-WS-NO-INDEX"
+    assert "somelib" in str(exc.value)

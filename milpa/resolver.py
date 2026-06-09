@@ -23,6 +23,7 @@ from pathlib import Path
 import shutil
 import sys
 
+from .error_codes import resolver_codes as _RC  # noqa: F401 — populates catalog
 from .fetchers import FetcherRegistry, default_registry
 from .fetchers.git import GitProvenance, GitReceipt
 from .fetchers.local import LocalProvenance
@@ -32,6 +33,7 @@ from .fetchers.types import Provenance
 from .identity import compute_content_hash
 from .manifest import (
     LocalDep, Manifest, MemberDep, NamedDep, Override, TarballDep, UrlDep,
+    ManifestError,
 )
 from .nimble_parse import NamedRequirement, UrlRequirement, parse_nimble
 from . import tianguis_client
@@ -51,7 +53,13 @@ class ResolverError(Exception):
     """Raised by resolve() / resolve_workspace() for structural problems
     surfaced during candidate-set construction (e.g. a `member "X"`
     reference to a name with no matching workspace member). Solver-
-    level failures (unsatisfiable constraints) raise SolverError."""
+    level failures (unsatisfiable constraints) raise SolverError.
+
+    Carries a stable `code` (a `RES-*` slug from the error catalog)."""
+
+    def __init__(self, message: str, *, code: str) -> None:
+        self.code = code
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -437,7 +445,8 @@ def resolve(
         if unresolvable:
             raise ResolverError(
                 f"manifest has named dep(s) {unresolvable} but no tianguis "
-                f"index was provided — pass index= to resolve named deps"
+                f"index was provided — pass index= to resolve named deps",
+                code="RES-NO-INDEX",
             )
     index = index if index is not None else Index({})
     deps_dir.mkdir(parents=True, exist_ok=True)
@@ -467,7 +476,12 @@ def resolve(
     # named deps from a fetched .nimble). NamedDeps whose name appears in
     # overrides become URL fetches at the sentinel version — the
     # constraint is irrelevant because the override IS the spec.
-    for dep in manifest.deps:
+    #
+    # dev_deps for the ROOT package are enrolled here alongside regular
+    # deps — they are requirements when this package is the root. Only the
+    # root's dev_deps ever appear here; transitive deps' dev_deps are
+    # silently ignored (see _extract_from_milpa_kdl).
+    for dep in list(manifest.deps) + list(manifest.dev_deps):
         if isinstance(dep, TarballDep):
             # Tarball deps are fixed-singleton (like URL/Local), routed
             # through TarballFetcher with pre-fetch sha256 verification.
@@ -519,6 +533,52 @@ def resolve(
     # Single source of truth (already built above for root-term construction)
     overrides_by_name = _overrides_by_name
 
+    # Root authority set: every package name the root controls.  Covers all
+    # deps, dev-deps, and overrides declared directly in the root manifest.
+    # A transitive dep claiming a name in this set is SUPPRESSED — the root's
+    # provenance wins (Cargo [patch] / npm overrides semantics).
+    root_authority: set[str] = {
+        dep.name
+        for dep in list(manifest.deps) + list(manifest.dev_deps)
+    } | {ov.name for ov in manifest.overrides}
+
+    # Cross-name provenance gate.  Tracks the first provenance key that claimed
+    # each package name (from any transport).  Root-authority deps are enrolled
+    # during queue seeding below; transitive deps are enrolled in submit().
+    # Format: name → (item_provenance_key, is_root_authority_claim).
+    _seen_by_name: dict[str, tuple[tuple, bool]] = {}
+
+    # Seed the name map with root-declared deps so root provenance wins the
+    # first-seen race regardless of BFS arrival order.  For deps whose name
+    # appears in overrides_by_name, use the OVERRIDE's provenance (because
+    # _apply_override will rewrite those items before the gate runs — the
+    # gate must compare post-override keys, not pre-override keys).
+    for dep in list(manifest.deps) + list(manifest.dev_deps):
+        if isinstance(dep, LocalDep):
+            # Local deps: overrides don't apply; seed with local path.
+            _seen_by_name[dep.name] = (("local", dep.path), True)
+        elif isinstance(dep, TarballDep):
+            # Tarball deps: overrides don't apply.
+            _seen_by_name[dep.name] = (("tarball", dep.url), True)
+        elif isinstance(dep, UrlDep):
+            # URL dep: _apply_override may redirect to a different URL+ref.
+            # Seed with the effective (post-override) provenance.
+            if dep.name in _overrides_by_name:
+                ov = _overrides_by_name[dep.name]
+                _seen_by_name[dep.name] = (("url", ov.git, ov.ref), True)
+            else:
+                _seen_by_name[dep.name] = (("url", dep.git, dep.ref), True)
+        else:  # NamedDep: may be redirected to URL via override, or stay named.
+            if dep.name in _overrides_by_name:
+                ov = _overrides_by_name[dep.name]
+                _seen_by_name[dep.name] = (("url", ov.git, ov.ref), True)
+            else:
+                _seen_by_name[dep.name] = (("named", dep.name), True)
+    for ov in manifest.overrides:
+        # Overrides not already covered by a direct dep also carry root authority.
+        if ov.name not in _seen_by_name:
+            _seen_by_name[ov.name] = (("url", ov.git, ov.ref), True)
+
     # BFS over the dep graph, materializing candidates. The main thread
     # owns `provider`, `seen_url`, `seen_named`, and the queue. Worker
     # threads only execute self-contained fetch+parse work and return
@@ -550,6 +610,44 @@ def resolve(
             # items. An override for `name` replaces the original
             # provenance with the override's URL+ref. Named-dep deps
             # become URL deps (skipping the registry lookup entirely).
+            #
+            # Root-provenance gate: apply BEFORE transport-specific dedup.
+            # When a package name was already claimed by a root-authority dep
+            # (or earlier dep of any kind), a transitive dep requesting the
+            # same name via a DIFFERENT provenance key is either suppressed
+            # (root-authority) or raised as a conflict (non-root).
+            # Apply override first so the gate compares resolved provenance.
+            if item[0] not in ("local", "tarball"):
+                item = _apply_override(item, overrides_by_name)
+
+            name = _item_name(item)
+            if name is not None and name != "nim":
+                pkey = _item_provenance_key(item)
+                prior = _seen_by_name.get(name)
+                if prior is None:
+                    # First claim on this name — record it.
+                    _seen_by_name[name] = (pkey, False)
+                elif prior[0] != pkey:
+                    # Different provenance for the same name.
+                    if prior[1] or name in root_authority:
+                        # Root authority wins: suppress the transitive claim.
+                        return
+                    # Non-root disagreement: two transitives want different
+                    # provenance for the same name.
+                    raise ResolverError(
+                        f"provenance conflict for package {name!r}: "
+                        f"one transitive dep claims provenance {prior[0]!r} "
+                        f"and another claims {pkey!r}. "
+                        f"The root manifest does not override {name!r}. "
+                        f"Add an override in your milpa.kdl to resolve "
+                        f"which source to use.",
+                        code="RES-PROVENANCE-CONFLICT",
+                    )
+                else:
+                    # Same provenance key — the transport-specific dedup
+                    # below will suppress; nothing more to do here.
+                    pass
+
             if item[0] == "local":
                 ldep: LocalDep = item[1]
                 if ldep.path in seen_local:
@@ -571,45 +669,39 @@ def resolve(
                     overrides_by_name,
                     prior_lockfile,
                 )
-            else:
-                # url or named — both share the override-then-dispatch
-                # shape with resolve_workspace's submit(). Single
-                # _apply_override pass eliminates the previous
-                # url-then-named duplication.
-                item = _apply_override(item, overrides_by_name)
-                if item[0] == "url":
-                    dep = item[1]
-                    key = (dep.git, dep.ref)
-                    # ALWAYS accumulate per-consumer flag requests
-                    # even on dup so cross-graph union works (#90).
-                    # Each consumer contributes a tuple of FlagRequests.
-                    if dep.flag_requests:
-                        dep_flag_requests[key].append(dep.flag_requests)
-                    if key in seen_url:
-                        return
-                    seen_url.add(key)
-                    print(f"fetching {dep.name}...", file=sys.stderr)
-                    fut = ex.submit(
-                        _process_url, dep, deps_dir, fetcher,
-                        overrides_by_name,
-                        prior_lockfile,
-                    )
-                else:  # named — Phase A: enumerate stubs synchronously (no fetch)
-                    name, constraint = item[1], item[2]
-                    if name in seen_named:
-                        return
-                    if name == "nim":
-                        seen_named.add(name)
-                        return
+            elif item[0] == "url":
+                dep = item[1]
+                key = (dep.git, dep.ref)
+                # ALWAYS accumulate per-consumer flag requests
+                # even on dup so cross-graph union works (#90).
+                # Each consumer contributes a tuple of FlagRequests.
+                if dep.flag_requests:
+                    dep_flag_requests[key].append(dep.flag_requests)
+                if key in seen_url:
+                    return
+                seen_url.add(key)
+                print(f"fetching {dep.name}...", file=sys.stderr)
+                fut = ex.submit(
+                    _process_url, dep, deps_dir, fetcher,
+                    overrides_by_name,
+                    prior_lockfile,
+                )
+            else:  # named — Phase A: enumerate stubs synchronously (no fetch)
+                name, constraint = item[1], item[2]
+                if name in seen_named:
+                    return
+                if name == "nim":
                     seen_named.add(name)
-                    # Phase A: enumerate all satisfying IndexVersions as
-                    # lightweight stubs. The solver will trigger Phase B
-                    # (fetch) lazily via dependencies() for the chosen version.
-                    _enumerate_named(
-                        name, constraint, deps_dir, fetcher,
-                        index, overrides_by_name, provider,
-                    )
-                    return  # no future — synchronous, nothing to track
+                    return
+                seen_named.add(name)
+                # Phase A: enumerate all satisfying IndexVersions as
+                # lightweight stubs. The solver will trigger Phase B
+                # (fetch) lazily via dependencies() for the chosen version.
+                _enumerate_named(
+                    name, constraint, deps_dir, fetcher,
+                    index, overrides_by_name, provider,
+                )
+                return  # no future — synchronous, nothing to track
             in_flight[fut] = item
 
         def drain_inflight():
@@ -796,7 +888,8 @@ def resolve_workspace(
         if _unresolvable:
             raise ResolverError(
                 f"workspace has named dep(s) {_unresolvable} but no tianguis "
-                f"index was provided — pass index= to resolve named deps"
+                f"index was provided — pass index= to resolve named deps",
+                code="RES-WS-NO-INDEX",
             )
     index = index if index is not None else Index({})
     deps_dir.mkdir(parents=True, exist_ok=True)
@@ -817,7 +910,8 @@ def resolve_workspace(
         raise ResolverError(
             f"workspace override name(s) {names_str} also appear as "
             f"workspace member(s) — remove either the override or the "
-            f"member; cannot have both"
+            f"member; cannot have both",
+            code="RES-WS-OVERRIDE-MEMBER-COLLISION",
         )
 
     # Pre-register each member as a Candidate. Members have no fetch
@@ -836,7 +930,8 @@ def resolve_workspace(
                 raise ResolverError(
                     f"workspace member {member.name!r} references "
                     f"`member \"{dep.name}\"` but no member named "
-                    f"{dep.name!r} exists in the workspace"
+                    f"{dep.name!r} exists in the workspace",
+                    code="RES-WS-MEMBER-REF-UNKNOWN",
                 )
 
     for member in workspace.members:
@@ -877,6 +972,55 @@ def resolve_workspace(
     )
     provider.add(root_cand)
 
+    # Root authority for the workspace: all names declared in any member's
+    # deps/dev-deps plus workspace-level overrides.  A transitive dep
+    # claiming a name already in root authority is suppressed (root wins).
+    ws_root_authority: set[str] = {
+        dep.name
+        for member in workspace.members
+        for dep in list(member.manifest.deps) + list(member.manifest.dev_deps)
+        if hasattr(dep, "name")
+    } | set(overrides_by_name.keys()) | set(members_by_name.keys())
+
+    # Cross-name provenance gate for the workspace resolver.  Same semantics
+    # as resolve()'s _seen_by_name: first provenance claim on a name wins when
+    # it has root authority; two non-root claims with different provenance →
+    # RES-PROVENANCE-CONFLICT.
+    _ws_seen_by_name: dict[str, tuple[tuple, bool]] = {}
+
+    # Seed with all root-authority external deps from all members.
+    # As in resolve(), seed with POST-override provenance for URL deps
+    # that have a workspace override — _apply_override rewrites before
+    # the gate runs.
+    for member in workspace.members:
+        for dep in list(member.manifest.deps) + list(member.manifest.dev_deps):
+            if not hasattr(dep, "name"):
+                continue
+            n = dep.name
+            if n in members_by_name or isinstance(dep, MemberDep):
+                continue  # member-to-member handled separately
+            if n not in _ws_seen_by_name:
+                if isinstance(dep, LocalDep):
+                    _ws_seen_by_name[n] = (("local", dep.path), True)
+                elif isinstance(dep, TarballDep):
+                    _ws_seen_by_name[n] = (("tarball", dep.url), True)
+                elif isinstance(dep, UrlDep):
+                    # Use override URL+ref if this dep is overridden.
+                    if n in overrides_by_name:
+                        ov = overrides_by_name[n]
+                        _ws_seen_by_name[n] = (("url", ov.git, ov.ref), True)
+                    else:
+                        _ws_seen_by_name[n] = (("url", dep.git, dep.ref), True)
+                else:  # NamedDep
+                    if n in overrides_by_name:
+                        ov = overrides_by_name[n]
+                        _ws_seen_by_name[n] = (("url", ov.git, ov.ref), True)
+                    else:
+                        _ws_seen_by_name[n] = (("named", n), True)
+    for ov_name, ov in overrides_by_name.items():
+        if ov_name not in _ws_seen_by_name:
+            _ws_seen_by_name[ov_name] = (("url", ov.git, ov.ref), True)
+
     # BFS over external deps reachable from members. Same shape as
     # resolve() — URL/named/local items get fetched in parallel; the
     # main thread owns provider + seen sets.
@@ -895,6 +1039,27 @@ def resolve_workspace(
             # a name replaces URL spec or routes a named dep to a URL
             # fetch (same semantics as single-project resolve()).
             item = _apply_override(item, overrides_by_name)
+
+            # Root-provenance gate (same semantics as resolve()'s gate).
+            ws_name = _item_name(item)
+            if ws_name is not None and ws_name != "nim" and ws_name not in seen_member:
+                ws_pkey = _item_provenance_key(item)
+                ws_prior = _ws_seen_by_name.get(ws_name)
+                if ws_prior is None:
+                    _ws_seen_by_name[ws_name] = (ws_pkey, False)
+                elif ws_prior[0] != ws_pkey:
+                    if ws_prior[1] or ws_name in ws_root_authority:
+                        return  # root authority wins; suppress transitive
+                    raise ResolverError(
+                        f"provenance conflict for package {ws_name!r}: "
+                        f"one transitive dep claims provenance {ws_prior[0]!r} "
+                        f"and another claims {ws_pkey!r}. "
+                        f"No workspace member overrides {ws_name!r}. "
+                        f"Add an override in your workspace milpa.kdl to resolve "
+                        f"which source to use.",
+                        code="RES-PROVENANCE-CONFLICT",
+                    )
+
             if item[0] == "url":
                 dep = item[1]
                 key = (dep.git, dep.ref)
@@ -918,7 +1083,7 @@ def resolve_workspace(
                     overrides_by_name,
                     prior_lockfile,
                 )
-            else:  # named
+            else:  # named — Phase A: enumerate stubs synchronously (no fetch)
                 name, constraint = item[1], item[2]
                 if name in seen_named or name in seen_member:
                     return
@@ -926,11 +1091,18 @@ def resolve_workspace(
                     seen_named.add(name)
                     return
                 seen_named.add(name)
-                print(f"fetching {name}...", file=sys.stderr)
-                fut = ex.submit(
-                    _process_named, name, constraint, deps_dir, fetcher,
-                    index, overrides_by_name,
+                # Phase A: enumerate ALL versions from the index (no constraint
+                # pre-filter — pass None so the full candidate space is visible to
+                # the solver). The member-declared constraints are already encoded
+                # as solver terms in dep_terms; pre-filtering here would shrink the
+                # candidate set to only those satisfying the first-arrival member's
+                # view, which is wrong when a second member has a tighter bound.
+                _enumerate_named(
+                    name, None, deps_dir, fetcher,
+                    index, overrides_by_name, provider,
                 )
+                return  # synchronous — no future to track
+
             in_flight[fut] = item
 
         for item in queue:
@@ -960,6 +1132,40 @@ def resolve_workspace(
     # via add() and are exempt from content-hash dedup.
     provider.finalize(deps_dir)
 
+    # Wire up Phase B transitive callbacks. When _materialize_stub fires
+    # during solve for a named dep, any transitives it discovers must be
+    # enrolled immediately. `seen_named` / `seen_url` are still in scope
+    # and act as dedup gates — mirrors resolve()'s start_solve() wiring.
+    def _ws_on_new_named(name: str, constraint: str | None) -> None:
+        if name in seen_named or name in seen_member or name == "nim":
+            return
+        seen_named.add(name)
+        item = _apply_override(("named", name, constraint), overrides_by_name)
+        if item[0] == "named":
+            # Enumerate ALL versions of the transitive dep (no constraint
+            # pre-filter) — same reasoning as the BFS submit() path above.
+            _enumerate_named(
+                name, None, deps_dir, fetcher,
+                index, overrides_by_name, provider,
+            )
+
+    def _ws_on_new_url(dep: "UrlDep") -> None:
+        key = (dep.git, dep.ref)
+        if key in seen_url:
+            return
+        seen_url.add(key)
+        print(f"fetching {dep.name} (transitive from named dep)...", file=sys.stderr)
+        candidate, new_items = _process_url(dep, deps_dir, fetcher,
+                                             overrides_by_name, prior_lockfile)
+        provider.add(candidate)
+        for new_item in new_items:
+            if new_item[0] == "url":
+                _ws_on_new_url(new_item[1])
+            elif new_item[0] == "named":
+                _ws_on_new_named(new_item[1], new_item[2])
+
+    provider.start_solve(_ws_on_new_named, _ws_on_new_url)
+
     solution = solve(provider, "__root__", Version(0, 0, 0), strategy=strategy)
     return _build_graph(solution, provider)
 
@@ -969,17 +1175,22 @@ def _terms_from_member_manifest(
     members_by_name: dict,
     overrides_by_name: dict,
 ) -> tuple[list[Term], list[str], list]:
-    """Convert a member's milpa.kdl deps into solver terms + queue items
-    for external deps. MemberDep entries become solver terms targeting
-    the pre-registered member candidate (no queue item — no fetch).
+    """Convert a member's milpa.kdl deps (AND dev_deps) into solver terms +
+    queue items for external deps. MemberDep entries become solver terms
+    targeting the pre-registered member candidate (no queue item — no fetch).
     NamedDeps whose name matches a member auto-coerce the same way.
     NamedDeps whose name matches a workspace override get a sentinel-
     version root term because the override turns them into a URL fetch
-    (same shape as resolve()'s NamedDep+Override path)."""
+    (same shape as resolve()'s NamedDep+Override path).
+
+    A workspace member is a package being primarily developed; its own
+    dev_deps are therefore enrolled here alongside regular deps. The
+    transitive-exclusion rule still applies to any external dep's milpa.kdl
+    that this member transitively reaches (enforced in _extract_from_milpa_kdl)."""
     terms: list[Term] = []
     names: list[str] = []
     queue: list = []
-    for dep in manifest.deps:
+    for dep in list(manifest.deps) + list(manifest.dev_deps):
         if isinstance(dep, MemberDep):
             terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
             names.append(dep.name)
@@ -1014,6 +1225,44 @@ def _extract_src_dir(manifest: Manifest) -> str:
     string when not declared — consumers' nim.cfg lines then point at
     the member's directory itself (no /src suffix)."""
     return manifest.src_dir or ""
+
+
+def _item_name(item) -> str | None:
+    """Extract the package name from a queue item, or None for unknown kinds."""
+    kind = item[0]
+    if kind == "url":
+        return item[1].name
+    if kind == "named":
+        return item[1]
+    if kind == "local":
+        return item[1].name
+    if kind == "tarball":
+        return item[1].name
+    return None
+
+
+def _item_provenance_key(item) -> tuple:
+    """A canonical key that identifies the provenance of a queue item.
+
+    Used to detect when two items claim the same package name from different
+    sources. Two items with the same key are compatible (dedup); different
+    keys for the same name are a potential provenance conflict.
+
+    Returns a tuple whose first element is the transport kind string so keys
+    from different transports are always distinct."""
+    kind = item[0]
+    if kind == "url":
+        dep = item[1]
+        return ("url", dep.git, dep.ref)
+    if kind == "named":
+        # Named deps are keyed by name alone — the index is the single
+        # source of truth; constraint differences are resolved by the solver.
+        return ("named", item[1])
+    if kind == "local":
+        return ("local", item[1].path)
+    if kind == "tarball":
+        return ("tarball", item[1].url)
+    return (kind,)
 
 
 def _apply_override(item, overrides_by_name: dict):
@@ -1093,7 +1342,7 @@ def _filter_manifest_by_profile(
 ) -> Manifest:
     """Drop deps whose predicates don't match `profile` (#26) or the
     given `active_flags` set (#23). Returns a new Manifest with the
-    filtered deps tuple.
+    filtered deps and dev_deps tuples.
 
     `active_flags` defaults to the set of declared flags whose
     `default=True` (the natural choice for top-level resolution).
@@ -1107,9 +1356,13 @@ def _filter_manifest_by_profile(
         d for d in manifest.deps
         if _dep_matches_profile(d, profile, active_flags)
     )
-    if len(kept) == len(manifest.deps):
+    kept_dev = tuple(
+        d for d in manifest.dev_deps
+        if _dep_matches_profile(d, profile, active_flags)
+    )
+    if len(kept) == len(manifest.deps) and len(kept_dev) == len(manifest.dev_deps):
         return manifest
-    return dc_replace(manifest, deps=kept)
+    return dc_replace(manifest, deps=kept, dev_deps=kept_dev)
 
 
 def _dep_matches_profile(dep, profile, active_flags: frozenset) -> bool:
@@ -1197,12 +1450,22 @@ def _prior_self_mirrors_for(name: str, prior_lockfile) -> tuple[str, ...]:
     return ()
 
 
-def _pin_for_url_dep(dep: UrlDep, prior_lockfile) -> str | None:
-    """Return the locked identity for `dep` iff the manifest's git+ref
-    still matches the lockfile's recorded GitProvenanceRecord. Drops
-    the pin on any user-visible change (different URL, different ref)
-    so an intentional manifest edit doesn't get rejected as a
-    'hostile mirror'."""
+def _git_pin_for_url_dep(
+    dep: UrlDep, prior_lockfile
+) -> tuple[str, str | None] | None:
+    """Return ``(locked_identity, locked_commit_sha)`` for ``dep`` iff the
+    manifest's git+ref still matches the lockfile's recorded
+    GitProvenanceRecord.  Drops the pin on any user-visible change (different
+    URL, different ref) so an intentional manifest edit is never rejected as a
+    'hostile mirror'.
+
+    Both identity AND commit_sha come from the same matched record — single
+    source of truth.  The commit_sha may be None for old lockfiles that
+    pre-date the field; in that case callers fall back to ref-tip checkout
+    (legacy behaviour).
+
+    Returns None when there is no prior lockfile, no matching entry, or the
+    provenance has changed."""
     if prior_lockfile is None:
         return None
     from .lockfile import GitProvenanceRecord
@@ -1220,8 +1483,19 @@ def _pin_for_url_dep(dep: UrlDep, prior_lockfile) -> str | None:
     if primary is None:
         return None
     if primary.url == dep.git and primary.ref == dep.ref:
-        return locked.identity
+        return (locked.identity, primary.commit_sha)
     return None
+
+
+def _pin_for_url_dep(dep: UrlDep, prior_lockfile) -> str | None:
+    """Return the locked identity for `dep` iff the manifest's git+ref
+    still matches the lockfile's recorded GitProvenanceRecord.
+
+    Thin wrapper around ``_git_pin_for_url_dep`` for callers that only need
+    the identity (kept for back-compat with existing call sites outside
+    ``_process_url``)."""
+    result = _git_pin_for_url_dep(dep, prior_lockfile)
+    return result[0] if result is not None else None
 
 
 def _pin_for_tarball_dep(dep: TarballDep, prior_lockfile) -> str | None:
@@ -1269,16 +1543,33 @@ def _process_url(
     for `dep.name` matches the manifest's git+ref, the locked identity
     is enforced via fetch_any's expected_identity guard (#82). A
     hostile mirror or rewritten tag is rejected at fetch time."""
-    candidates = [GitProvenance(url=dep.git, ref=dep.ref)]
-    # Consumer-declared dep-mirrors next (#37)
+    # Single lookup: both identity pin AND commit_sha come from the same
+    # matched lockfile record — no duplicated matching logic (#82).
+    git_pin = _git_pin_for_url_dep(dep, prior_lockfile)
+    expected_identity: str | None
+    pinned_commit_sha: str | None
+    if git_pin is not None:
+        expected_identity, pinned_commit_sha = git_pin
+    else:
+        expected_identity, pinned_commit_sha = None, None
+    # Primary candidate carries the pinned commit_sha so GitFetcher checks
+    # out the immutable commit rather than the (mutable) ref tip.  When
+    # commit_sha is None (no prior lockfile, or pre-pin old lock), the
+    # existing ref-tip checkout behaviour is preserved (#82 + #97).
+    candidates = [GitProvenance(url=dep.git, ref=dep.ref,
+                                commit_sha=pinned_commit_sha)]
+    # Consumer-declared dep-mirrors next (#37).  A git mirror of the same
+    # content can also use the commit_sha — the same commit on a mirror is
+    # the same bytes (immutable object hash).
     for mirror_url in dep.mirrors:
-        candidates.append(GitProvenance(url=mirror_url, ref=dep.ref))
+        candidates.append(GitProvenance(url=mirror_url, ref=dep.ref,
+                                        commit_sha=pinned_commit_sha))
     # Self-mirrors cached from prior lockfile (#79): the dep's own
     # milpa.kdl declared them on a previous resolve; available now as
     # additional fall-back candidates even before this fetch succeeds.
     for sm_url in _prior_self_mirrors_for(dep.name, prior_lockfile):
-        candidates.append(GitProvenance(url=sm_url, ref=dep.ref))
-    expected_identity = _pin_for_url_dep(dep, prior_lockfile)
+        candidates.append(GitProvenance(url=sm_url, ref=dep.ref,
+                                        commit_sha=pinned_commit_sha))
     result = fetcher.fetch_any(
         dep.name,
         candidates,
@@ -1384,6 +1675,11 @@ def _extract_from_milpa_kdl(
     # Filter manifest.deps by `when flag=...` predicates (other
     # predicates default-permissive for now — profile-aware
     # transitive filtering is a separate concern).
+    # NORMATIVE: manifest.dev_deps is intentionally NOT included here.
+    # A transitive dep's dev-deps MUST NEVER enter the resolved graph;
+    # only the root package's (and workspace members') dev_deps are enrolled
+    # (see resolve() / _terms_from_member_manifest). This is the single
+    # structural guard that enforces the transitive-exclusion rule.
     kept_deps = tuple(
         d for d in manifest.deps
         if _dep_passes_flag_predicates(d, active_frozen)
@@ -1595,9 +1891,8 @@ def _fetch_and_build_named_candidate(
     transitive deps, and returns:
       (candidate, sub_url_deps, sub_named)
 
-    Both `_materialize_stub` (Phase B) and `_process_named` (workspace BFS)
-    delegate to this function so there is exactly one fetch+parse+_build_terms
-    +_Candidate path.
+    `_materialize_stub` (Phase B) delegates to this function so there is
+    exactly one fetch+parse+_build_terms+_Candidate path.
 
     Identity gate (Invariant 1) is enforced here: the index content_hash
     is the trust root for named deps."""
@@ -1642,52 +1937,6 @@ def _fetch_and_build_named_candidate(
     return candidate, sub_url_deps, sub_named
 
 
-def _process_named(
-    name: str,
-    constraint: str | None,
-    deps_dir: Path,
-    fetcher: FetcherRegistry,
-    index: Index,
-    overrides_by_name: dict | None = None,
-) -> tuple["_Candidate", list]:
-    """Worker function: resolve a named dep through the tianguis index,
-    fetch it at the index-pinned provenance, parse its nimble for
-    transitives (milpa#97).
-
-    NOTE: This function is retained as a direct-call path for the
-    resolve_workspace() BFS (which hasn't been migrated to Phase A/B yet —
-    that migration is a follow-on task). The main resolve() path now uses
-    _enumerate_named (Phase A) + lazy _materialize_stub (Phase B) instead.
-
-    The index authoritatively supplies identity (`content_hash` — the
-    verification gate), provenance (git/oci, dispatched by the
-    FetcherRegistry with no privileged transport), and the version set
-    (replacing the old `list_tags`). It does NOT supply graph edges —
-    transitive deps still come from parsing the fetched tree's manifest.
-    The fetch + git clone happen here so they parallelize.
-
-    Delegates to _fetch_and_build_named_candidate (M3 — SSOT)."""
-    version = tianguis_client.resolve_named(index, name, constraint)
-    # resolve_named only returns entries where parse_version succeeds
-    # (unparseable versions are skipped in tianguis_client with `continue`;
-    # a package whose ALL versions are unparseable raises TNG-NO-SATISFYING-VERSION
-    # there). So ver is guaranteed non-None here — no defensive branch needed.
-    ver = parse_version(version.version)
-    assert ver is not None, (
-        f"invariant violation: resolve_named returned unparseable version "
-        f"{version.version!r} for {name!r}"
-    )
-    candidate, sub_url_deps, sub_named = _fetch_and_build_named_candidate(
-        name, version, ver, deps_dir, fetcher, overrides_by_name,
-    )
-    new_items: list = []
-    for u in sub_url_deps:
-        new_items.append(("url", u))
-    for n in sub_named:
-        new_items.append(("named", n.name, n.constraint))
-    return candidate, new_items
-
-
 def _build_terms(
     nm,
     overrides_by_name: dict | None = None,
@@ -1727,9 +1976,15 @@ def _build_terms(
                     req.name, VersionSet.eq(_URL_DEP_VERSION)
                 ))
             else:
-                terms.append(Term.require(
-                    req.name, VersionSet.from_constraint(req.constraint)
-                ))
+                try:
+                    vset = VersionSet.from_constraint(req.constraint)
+                except ValueError as e:
+                    raise ManifestError(
+                        f"dep {req.name!r}: malformed version constraint "
+                        f"{req.constraint!r} in .nimble requires — {e}",
+                        code="MAN-NIMBLE-CONSTRAINT",
+                    ) from e
+                terms.append(Term.require(req.name, vset))
             names.append(req.name)
             sub_named.append(req)
     return terms, names, sub_url, sub_named

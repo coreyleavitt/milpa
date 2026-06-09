@@ -1007,3 +1007,82 @@ deps {
 }
 """
     assert parse_manifest(annotated) == parse_manifest(plain)
+
+
+# ---------------------------------------------------------------------------
+# spec-version epoch field
+# ---------------------------------------------------------------------------
+
+_SIMPLE_PKG = '''\
+name "test"
+deps {
+    chronos git=(url)"https://github.com/x/y.git" ref="main"
+}
+'''
+
+
+def test_spec_version_future_epoch_raises_unsupported():
+    """A manifest declaring spec-version 2 (or any epoch > current) MUST
+    raise ManifestError with code MAN-SPEC-VERSION-UNSUPPORTED."""
+    text = 'spec-version 2\n' + _SIMPLE_PKG
+    with pytest.raises(ManifestError) as exc_info:
+        parse_manifest(text)
+    assert exc_info.value.code == "MAN-SPEC-VERSION-UNSUPPORTED"
+
+
+def test_spec_version_absent_defaults_to_1():
+    """A manifest with no spec-version node parses with spec_version == 1."""
+    m = parse_manifest(_SIMPLE_PKG)
+    assert m.spec_version == 1
+
+
+def test_spec_version_1_parses_and_round_trips():
+    """spec-version 1 parses successfully and round-trips byte-identically
+    (present stays present)."""
+    from milpa.manifest import format_manifest
+    text = 'spec-version 1\n' + _SIMPLE_PKG
+    m = parse_manifest(text)
+    assert m.spec_version == 1
+    formatted = format_manifest(m)
+    reparsed = parse_manifest(formatted)
+    assert reparsed.spec_version == 1
+    assert "spec-version 1" in formatted
+
+
+def test_spec_version_absent_stays_absent_after_round_trip():
+    """Absence stays absent: format_manifest must NOT emit spec-version
+    into a manifest that didn't have it — keeps round-trips byte-clean."""
+    from milpa.manifest import format_manifest
+    m = parse_manifest(_SIMPLE_PKG)
+    assert m.spec_version == 1
+    formatted = format_manifest(m)
+    assert "spec-version" not in formatted
+    reparsed = parse_manifest(formatted)
+    assert reparsed.spec_version == 1
+
+
+def test_spec_version_non_int_raises_type_code():
+    """Non-int argument to spec-version (e.g. a string) raises ManifestError
+    with code MAN-SPEC-VERSION-TYPE."""
+    text = 'spec-version "one"\n' + _SIMPLE_PKG
+    with pytest.raises(ManifestError) as exc_info:
+        parse_manifest(text)
+    assert exc_info.value.code == "MAN-SPEC-VERSION-TYPE"
+
+
+def test_spec_version_zero_raises_type_code():
+    """spec-version < 1 (i.e. 0) is invalid — epoch must be >= 1.
+    Raises MAN-SPEC-VERSION-TYPE."""
+    text = 'spec-version 0\n' + _SIMPLE_PKG
+    with pytest.raises(ManifestError) as exc_info:
+        parse_manifest(text)
+    assert exc_info.value.code == "MAN-SPEC-VERSION-TYPE"
+
+
+def test_spec_version_wrong_arity_raises_type_code():
+    """spec-version with zero or two positional args raises MAN-SPEC-VERSION-TYPE."""
+    for bad in ('spec-version\n', 'spec-version 1 2\n'):
+        text = bad + _SIMPLE_PKG
+        with pytest.raises(ManifestError) as exc_info:
+            parse_manifest(text)
+        assert exc_info.value.code == "MAN-SPEC-VERSION-TYPE"

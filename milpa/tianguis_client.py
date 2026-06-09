@@ -20,6 +20,7 @@ from typing import Any, Protocol
 
 import kdl
 
+from .error_catalog import ERROR_CATALOG
 from .fetchers.git import GitProvenance
 from .fetchers.oci import OciProvenance
 from .fetchers.types import Provenance
@@ -30,26 +31,6 @@ from .solver import VersionSet, parse_version
 # declaring a *higher* version is refused (TNG-SCHEMA-UNKNOWN) rather than
 # silently misread; a lower-or-equal version is read forward-compatibly.
 TIANGUIS_INDEX_SCHEMA_VERSION: int = 1
-
-
-# The single source of truth for tianguis-domain error codes. The
-# error-catalog bijection lint greps this one set. `TianguisError.__init__`
-# validates against it so a typo'd code fails loudly at raise time.
-_TNG_CODES: frozenset[str] = frozenset({
-    "TNG-NOT-FOUND",
-    "TNG-NO-SATISFYING-VERSION",
-    "TNG-NO-PROVENANCE",
-    "TNG-NO-IDENTITY",
-    "TNG-SCHEMA-UNKNOWN",
-    "TNG-BAD-VERSION",
-    "TNG-BAD-COMMIT-SHA",
-    "TNG-UNSAFE-REF",
-    "TNG-UNSAFE-URL",
-    "TNG-UNSAFE-NAME",
-    "TNG-BAD-OCI-DIGEST",
-    "TNG-UNSAFE-OCI-FIELD",
-    "TNG-AMBIGUOUS-NAME",
-})
 
 
 # ---------------------------------------------------------------------------
@@ -136,14 +117,19 @@ def _validate_safe_name(name: str) -> None:
 class TianguisError(Exception):
     """Raised when tianguis lookup, parsing, or resolution fails.
 
-    Carries a stable `code` (one of `_TNG_CODES`) so the CLI can print
-    `code: message` per the error-catalog discipline and tests can assert
-    on the code rather than brittle message substrings."""
+    Carries a stable `code` (a TNG-* slug from the error catalog) so the
+    CLI can print `code: message` per the error-catalog discipline and tests
+    can assert on the code rather than brittle message substrings.
+
+    The catalog is the single source of truth for valid TNG-* slugs
+    (milpa/error_codes/tianguis_codes.py).  A typo in a code= raise site
+    fails loudly at raise time via the catalog lookup below."""
 
     def __init__(self, *, code: str, message: str) -> None:
-        if code not in _TNG_CODES:
+        if code not in ERROR_CATALOG:
             raise AssertionError(
-                f"unknown tianguis error code {code!r} — add it to _TNG_CODES"
+                f"unknown tianguis error code {code!r} — add it to "
+                f"milpa/error_codes/tianguis_codes.py"
             )
         self.code = code
         self.message = message

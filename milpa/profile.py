@@ -28,14 +28,18 @@ class Profile:
         cls,
         *,
         nim_version_query: Callable[[], str] | None = None,
-        milpa_version: str = "0.1.0",
+        milpa_version: str | None = None,
     ) -> "Profile":
         """Detect the host profile.
 
         OS + arch normalized to Nim conventions; Nim version queried
         via the injected callable (defaults to `nim --version`).
         Env vars override individual fields:
-            MILPA_TARGET_PLATFORM, MILPA_TARGET_ARCH, MILPA_TARGET_NIM
+            MILPA_TARGET_PLATFORM, MILPA_TARGET_ARCH, MILPA_TARGET_NIM,
+            MILPA_TARGET_MILPA
+        The `milpa` field defaults to this implementation's own version
+        (milpa.__version__) when neither the env var nor an explicit
+        `milpa_version` argument is supplied.
         """
         plat = os.environ.get("MILPA_TARGET_PLATFORM") or _detect_platform()
         arch = os.environ.get("MILPA_TARGET_ARCH") or _detect_arch()
@@ -46,7 +50,27 @@ class Profile:
                 nim_v = q()
             except Exception:
                 nim_v = "0.0.0"     # unknown; conditional deps on `nim` won't match
-        return cls(platform=plat, arch=arch, nim=nim_v, milpa=milpa_version)
+        milpa_v = (
+            os.environ.get("MILPA_TARGET_MILPA")
+            or milpa_version
+            or _milpa_version()
+        )
+        return cls(platform=plat, arch=arch, nim=nim_v, milpa=milpa_v)
+
+
+def _milpa_version() -> str:
+    """This implementation's own version, for the `milpa` predicate.
+
+    Reads `milpa.__version__` (the single source of truth, also surfaced
+    by `milpa --version`). Falls back to "0.0.0" if it cannot be
+    imported, so conditional deps gated on `milpa` simply won't match
+    rather than crashing.
+    """
+    try:
+        from . import __version__
+        return __version__
+    except Exception:
+        return "0.0.0"
 
 
 def _detect_platform() -> str:

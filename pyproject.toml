@@ -31,7 +31,14 @@ packages = ["milpa"]
 dev = [
     "pytest >= 8",
     "hypothesis >= 6",
+    # S11 reference-plugin fixture — installed so its entry point populates
+    # importlib.metadata and exercises the real discovery path in tests.
+    # Source is mapped to the local path via [tool.uv.sources] below.
+    "milpa-fetcher-stub",
 ]
+
+[tool.uv.sources]
+milpa-fetcher-stub = { path = "tests/fixtures/milpa_fetcher_stub", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

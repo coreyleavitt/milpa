@@ -54,6 +54,10 @@ class WorkspaceError(Exception):
     a single file) — workspace topology is its own concern.
     """
 
+    def __init__(self, message: str = "", *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 @dataclass(frozen=True)
 class LoadedMember:
@@ -128,12 +132,14 @@ def load_workspace(root: Path) -> Workspace:
     workspace_kdl = root / "milpa.kdl"
     if not workspace_kdl.exists():
         raise WorkspaceError(
-            f"no milpa.kdl at workspace root {root}"
+            f"no milpa.kdl at workspace root {root}",
+            code="WS-NO-MANIFEST",
         )
     parsed = parse_workspace_or_manifest(workspace_kdl.read_text())
     if not isinstance(parsed, WorkspaceManifest):
         raise WorkspaceError(
-            f"{workspace_kdl} is a package manifest, not a workspace"
+            f"{workspace_kdl} is a package manifest, not a workspace",
+            code="WS-NOT-A-WORKSPACE",
         )
 
     loaded: list[LoadedMember] = []
@@ -145,38 +151,44 @@ def load_workspace(root: Path) -> Workspace:
                 '— the workspace root is a pure container and cannot also '
                 'be a package. To make a package the workspace root, '
                 'place it in a subdirectory and list that subdirectory '
-                'as the member.'
+                'as the member.',
+                code="WS-MEMBER-DOT",
             )
         member_dir = (root / member_path).resolve()
         if not member_dir.is_dir():
             raise WorkspaceError(
                 f"workspace member {member_path!r} has no directory at "
-                f"{member_dir}"
+                f"{member_dir}",
+                code="WS-MEMBER-DIR-MISSING",
             )
         member_kdl = member_dir / "milpa.kdl"
         if not member_kdl.exists():
             raise WorkspaceError(
                 f"workspace member {member_path!r} has no milpa.kdl at "
-                f"{member_kdl}"
+                f"{member_kdl}",
+                code="WS-MEMBER-NO-MANIFEST",
             )
         member_text = member_kdl.read_text()
         member_parsed = parse_workspace_or_manifest(member_text)
         if isinstance(member_parsed, WorkspaceManifest):
             raise WorkspaceError(
                 f"workspace member {member_path!r} is itself a workspace "
-                f"— nested workspaces are not supported"
+                f"— nested workspaces are not supported",
+                code="WS-MEMBER-IS-WORKSPACE",
             )
         if member_parsed.overrides:
             raise WorkspaceError(
                 f"workspace member {member_parsed.name!r} declares its own "
                 f"`overrides` block — per-member overrides are not supported "
-                f"in v1; overrides may only appear at the workspace root"
+                f"in v1; overrides may only appear at the workspace root",
+                code="WS-MEMBER-HAS-OVERRIDES",
             )
         if member_parsed.name in name_to_path:
             other = name_to_path[member_parsed.name]
             raise WorkspaceError(
                 f"workspace has two members claiming name "
-                f"{member_parsed.name!r}: {other!r} and {member_path!r}"
+                f"{member_parsed.name!r}: {other!r} and {member_path!r}",
+                code="WS-MEMBER-DUPLICATE-NAME",
             )
         name_to_path[member_parsed.name] = member_path
         loaded.append(LoadedMember(

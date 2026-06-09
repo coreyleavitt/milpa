@@ -29,6 +29,10 @@ from pathlib import Path
 class ExtractionError(Exception):
     """Base class for archive-extraction failures."""
 
+    def __init__(self, message: str = "", *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 class ZipSlipError(ExtractionError):
     """An entry's path resolves outside the destination directory."""
@@ -98,7 +102,8 @@ def extract_tar(
             except ValueError:
                 raise ZipSlipError(
                     f"archive entry {member.name!r} resolves outside "
-                    f"destination: {target} not under {dest_resolved}"
+                    f"destination: {target} not under {dest_resolved}",
+                    code="EXTRACT-ZIP-SLIP",
                 )
 
             if member.issym() or member.islnk():
@@ -111,7 +116,8 @@ def extract_tar(
                     raise SymlinkEscapeError(
                         f"symlink {member.name!r} → {member.linkname!r} "
                         f"resolves outside destination: {link_target} "
-                        f"not under {dest_resolved}"
+                        f"not under {dest_resolved}",
+                        code="EXTRACT-SYMLINK-ESCAPE",
                     )
                 target.parent.mkdir(parents=True, exist_ok=True)
                 os.symlink(member.linkname, target)
@@ -130,19 +136,22 @@ def extract_tar(
             if member.size > max_file_size:
                 raise SizeLimitError(
                     f"archive entry {member.name!r} exceeds per-file "
-                    f"size cap ({member.size} > {max_file_size})"
+                    f"size cap ({member.size} > {max_file_size})",
+                    code="EXTRACT-SIZE-LIMIT",
                 )
             total_bytes += member.size
             if total_bytes > max_total_size:
                 raise SizeLimitError(
                     f"archive total decompressed size exceeds cap "
-                    f"({total_bytes} > {max_total_size})"
+                    f"({total_bytes} > {max_total_size})",
+                    code="EXTRACT-SIZE-LIMIT",
                 )
             file_count += 1
             if file_count > max_file_count:
                 raise SizeLimitError(
                     f"archive file count exceeds cap "
-                    f"({file_count} > {max_file_count})"
+                    f"({file_count} > {max_file_count})",
+                    code="EXTRACT-SIZE-LIMIT",
                 )
 
             target.parent.mkdir(parents=True, exist_ok=True)

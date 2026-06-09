@@ -30,7 +30,8 @@ invariant structurally.
 import shutil
 import sys
 import uuid
-from dataclasses import dataclass
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
@@ -40,6 +41,22 @@ from ..identity import compute_content_hash
 
 if TYPE_CHECKING:
     from ..cas import CAStore
+
+
+@dataclass(frozen=True)
+class FetcherConfig:
+    """Configuration passed to every plugin factory.
+
+    v1 shape (spec §7.1): no required fields; one optional forward hook
+    `mirror_urls` reserved for future mirror-candidate passing. Factories
+    MUST accept exactly one positional `FetcherConfig` argument — the slot
+    is reserved so future spec versions can add fields without a signature
+    change (e.g. timeouts, credential tokens).
+
+    v1 fetchers MAY ignore mirror_urls. The field is here to pin the
+    factory signature today at zero cost.
+    """
+    mirror_urls: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -57,11 +74,24 @@ class Provenance:
     cas_admissible: ClassVar[bool] = True
 
 
-@dataclass(frozen=True)
-class ProvenanceReceipt:
-    """Base class for per-fetch receipts. Subclasses record what the
+class ProvenanceReceipt(ABC):
+    """Abstract base class for per-fetch receipts. Subclasses record what the
     transport actually delivered (commit SHA, archive hash, etc.).
-    Receipts are *descriptive* — they do NOT establish identity."""
+    Receipts are *descriptive* — they do NOT establish identity.
+
+    Every concrete subclass MUST implement `transport_fields()` returning
+    a non-empty dict of transport-pinning fields (spec §3.2). A receipt
+    with no transport-specific information provides no provenance evidence
+    and is rejected at admission time with FETCH-RECEIPT-EMPTY.
+    """
+
+    @abstractmethod
+    def transport_fields(self) -> dict[str, str]:
+        """Return a non-empty dict mapping field-name → str-value for every
+        transport-pinning field this receipt carries (e.g. commit SHA,
+        archive digest, local path). The registry validates non-emptiness
+        after fetch; returning {} triggers FETCH-RECEIPT-EMPTY."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -82,6 +112,10 @@ class FetchError(Exception):
     """Raised when a fetch cannot complete or no fetcher can handle a
     given provenance kind."""
 
+    def __init__(self, message: str = "", *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 @runtime_checkable
 class Fetcher(Protocol):
@@ -97,13 +131,16 @@ class Fetcher(Protocol):
 
 
 class FetcherRegistry:
-    """Dispatches a Provenance to the first registered Fetcher whose
+    """Dispatches a Provenance to exactly one registered Fetcher whose
     `can_handle` accepts it, then computes identity externally and
     wraps the receipt into a FetchResult.
 
-    Order of registration matters: first match wins. A production setup
-    pre-registers the built-in fetchers (GitFetcher today); tests can
-    construct empty registries for isolation.
+    Dispatch is **exclusive**: `_select` collects ALL fetchers whose
+    `can_handle` returns True and raises FetchError if more than one
+    matches (ambiguity error) or if none match. Registration order is
+    for readability only — it confers no priority. A production setup
+    pre-registers the four built-in fetchers (Git, Local, Tarball, OCI);
+    tests can construct empty registries for isolation.
     """
 
     def __init__(self, store: "CAStore | None" = None) -> None:
@@ -133,6 +170,19 @@ class FetcherRegistry:
     def register(self, fetcher: Fetcher) -> None:
         self._fetchers.append(fetcher)
 
+    @staticmethod
+    def _validate_receipt(name: str, receipt: "ProvenanceReceipt") -> None:
+        """Raise FetchError(code='FETCH-RECEIPT-EMPTY') if the receipt's
+        transport_fields() is empty.  A receipt with no transport-specific
+        fields provides no provenance evidence — spec §3.2 forbids it."""
+        if not receipt.transport_fields():
+            raise FetchError(
+                f"fetcher for {name!r} returned a receipt with empty "
+                f"transport_fields() — no provenance evidence recorded; "
+                f"receipt type: {type(receipt).__name__!r}",
+                code="FETCH-RECEIPT-EMPTY",
+            )
+
     def fetch(
         self,
         name: str,
@@ -145,6 +195,7 @@ class FetcherRegistry:
             # No CAS, or this provenance opts out (editable source —
             # local path, workspace member). Fetch directly to dest.
             receipt = fetcher.fetch(name, provenance, dest=dest)
+            self._validate_receipt(name, receipt)
             identity = compute_content_hash(dest)
             return FetchResult(
                 name=name, path=dest, identity=identity, receipt=receipt,
@@ -159,6 +210,7 @@ class FetcherRegistry:
         scratch = scratch_root / uuid.uuid4().hex
         try:
             receipt = fetcher.fetch(name, provenance, dest=scratch)
+            self._validate_receipt(name, receipt)
             identity = compute_content_hash(scratch)
             canonical = self._store.admit(scratch, identity)
         except BaseException:
@@ -194,6 +246,8 @@ class FetcherRegistry:
         hostile mirror cannot substitute itself for the locked dep.
         """
         if not candidates:
+            # Programmer-invariant: callers must supply at least one candidate.
+            # This is a call-site bug, not user input, so no catalog code.
             raise FetchError(
                 f"fetch_any({name!r}): no candidates provided"
             )
@@ -230,12 +284,14 @@ class FetcherRegistry:
             return result
         raise FetchError(
             f"fetch_any({name!r}): all {len(candidates)} candidates failed:\n  "
-            + "\n  ".join(failures)
+            + "\n  ".join(failures),
+            code="FETCH-ALL-FAILED",
         )
 
     def _select(self, provenance: Provenance) -> "Fetcher":
         matches = [f for f in self._fetchers if f.can_handle(provenance)]
         if len(matches) > 1:
+            # Programmer-invariant: a registration bug, not user input.
             raise FetchError(
                 f"ambiguous fetcher dispatch for provenance kind "
                 f"{type(provenance).__name__!r}: "
@@ -243,6 +299,8 @@ class FetcherRegistry:
                 f"registrations: {[type(f).__name__ for f in matches]}"
             )
         if not matches:
+            # Programmer-invariant: caller built a registry without the
+            # fetcher needed for this provenance kind.
             raise FetchError(
                 f"no registered fetcher handles provenance kind "
                 f"{type(provenance).__name__}"

@@ -48,6 +48,9 @@ class LocalReceipt(ProvenanceReceipt):
     path the tree was copied from."""
     source_path: Path
 
+    def transport_fields(self) -> dict[str, str]:
+        return {"source_path": str(self.source_path)}
+
 
 class LocalFetcher:
     """Copies LocalProvenance.path into dest. Identity computed by the
@@ -66,11 +69,13 @@ class LocalFetcher:
         assert isinstance(p, LocalProvenance)
         if not p.path.exists():
             raise FetchError(
-                f"fetching {name!r}: local source path does not exist: {p.path}"
+                f"fetching {name!r}: local source path does not exist: {p.path}",
+                code="FETCH-LOCAL-PATH-NOT-FOUND",
             )
         if not p.path.is_dir():
             raise FetchError(
-                f"fetching {name!r}: local source path is not a directory: {p.path}"
+                f"fetching {name!r}: local source path is not a directory: {p.path}",
+                code="FETCH-LOCAL-PATH-NOT-DIR",
             )
         # dest may be a stale symlink (e.g. proptest was a CAS-routed
         # url/git dep before the manifest switched it to local=, leaving

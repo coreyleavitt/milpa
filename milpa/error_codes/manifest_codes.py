@@ -44,6 +44,15 @@ NIMBLE_AMBIGUOUS = register(
     when="load_or_discover_manifest finds >1 .nimble and no project-named match.",
 )
 
+NIMBLE_CONSTRAINT = register(
+    slug="MAN-NIMBLE-CONSTRAINT", category=_CAT,
+    description="A transitive .nimble file's `requires` constraint string is malformed.",
+    when=(
+        "resolver._build_terms tries VersionSet.from_constraint on a .nimble "
+        "requires entry and gets an unparseable clause."
+    ),
+)
+
 NO_MANIFEST = register(
     slug="MAN-NO-MANIFEST", category=_CAT,
     description="No milpa.kdl or .nimble found in the project directory.",
@@ -94,6 +103,18 @@ UNKNOWN_TOP_LEVEL = register(
     slug="MAN-UNKNOWN-TOP-LEVEL", category=_CAT,
     description="Unknown top-level node in package manifest.",
     when="A top-level node is not in the package manifest's allowed set.",
+)
+
+SPEC_VERSION_UNSUPPORTED = register(
+    slug="MAN-SPEC-VERSION-UNSUPPORTED", category=_CAT,
+    description="Manifest declares a spec-version epoch greater than this implementation supports.",
+    when="spec-version <N> where N > MANIFEST_SPEC_VERSION.",
+)
+
+SPEC_VERSION_TYPE = register(
+    slug="MAN-SPEC-VERSION-TYPE", category=_CAT,
+    description="`spec-version` must carry exactly one positional integer argument >= 1.",
+    when="spec-version node has wrong arity, non-integer arg, or value < 1.",
 )
 
 WORKSPACE_IN_PACKAGE = register(

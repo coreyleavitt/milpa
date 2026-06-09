@@ -58,6 +58,9 @@ class OciReceipt(ProvenanceReceipt):
     (digest pulled from the registry)."""
     oci_digest: str
 
+    def transport_fields(self) -> dict[str, str]:
+        return {"oci_digest": self.oci_digest}
+
 
 class OciFetcher:
     """Pulls an OCI artifact via oras + extracts its tarball into dest.
@@ -86,20 +89,23 @@ class OciFetcher:
             if code != 0:
                 raise FetchError(
                     f"oras pull failed for {name!r} ({p.oci_ref}): "
-                    f"{err.strip() or out.strip()}"
+                    f"{err.strip() or out.strip()}",
+                    code="FETCH-OCI-PULL-FAILED",
                 )
 
             tarballs = sorted(scratch_path.glob("*.tar.gz"))
             if not tarballs:
                 raise FetchError(
                     f"OCI artifact {p.oci_ref} contained no *.tar.gz "
-                    f"(found: {[str(p_) for p_ in scratch_path.iterdir()]})"
+                    f"(found: {[str(p_) for p_ in scratch_path.iterdir()]})",
+                    code="FETCH-OCI-NO-TARBALL",
                 )
             if len(tarballs) > 1:
                 raise FetchError(
                     f"OCI artifact {p.oci_ref} contained multiple "
                     f"*.tar.gz files; ambiguous which to extract: "
-                    f"{[t.name for t in tarballs]}"
+                    f"{[t.name for t in tarballs]}",
+                    code="FETCH-OCI-AMBIGUOUS-TARBALL",
                 )
 
             if dest.exists():

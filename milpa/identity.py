@@ -57,6 +57,10 @@ class IdentityError(ValueError):
     """Raised by parse_identity when an identity string is malformed
     or uses an unsupported algorithm."""
 
+    def __init__(self, message: str = "", *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 def parse_identity(s: str) -> str:
     """Validate a multihash-encoded identity string.
@@ -70,30 +74,35 @@ def parse_identity(s: str) -> str:
     """
     if not isinstance(s, str):
         raise IdentityError(
-            f"identity must be a string, got {type(s).__name__}"
+            f"identity must be a string, got {type(s).__name__}",
+            code="ID-NOT-A-STRING",
         )
     if ":" not in s:
         raise IdentityError(
             f"identity {s!r} is missing the algorithm prefix; "
-            f"expected '<algorithm>:<digest>' (e.g. 'sha256:abc...')"
+            f"expected '<algorithm>:<digest>' (e.g. 'sha256:abc...')",
+            code="ID-NO-ALGORITHM-PREFIX",
         )
     algorithm, _, digest = s.partition(":")
     if algorithm not in SUPPORTED_ALGORITHMS:
         allowed = ", ".join(sorted(SUPPORTED_ALGORITHMS))
         raise IdentityError(
             f"identity {s!r} uses unsupported algorithm {algorithm!r} "
-            f"(supported: {allowed})"
+            f"(supported: {allowed})",
+            code="ID-UNSUPPORTED-ALGORITHM",
         )
     expected_len = _DIGEST_HEX_LEN[algorithm]
     if len(digest) != expected_len:
         raise IdentityError(
             f"identity {s!r}: {algorithm} digest must be exactly "
-            f"{expected_len} hex characters, got {len(digest)}"
+            f"{expected_len} hex characters, got {len(digest)}",
+            code="ID-WRONG-DIGEST-LENGTH",
         )
     if not all(c in "0123456789abcdef" for c in digest):
         raise IdentityError(
             f"identity {s!r}: digest must be lowercase hex characters "
-            f"(0-9, a-f)"
+            f"(0-9, a-f)",
+            code="ID-NON-HEX-DIGEST",
         )
     return s
 
@@ -148,7 +157,18 @@ def _enumerate_entries(root: Path) -> list[_Entry]:
 
         if p.is_symlink():
             # Hash the link target string as content; don't follow.
-            target = os.readlink(p).encode("utf-8")
+            try:
+                target = os.readlink(p).encode("utf-8")
+            except UnicodeEncodeError as e:
+                # os.readlink surrogate-escapes undecodable bytes on POSIX;
+                # re-encoding to UTF-8 then fails. A non-UTF-8 symlink target
+                # is not representable in the content-hash algorithm.
+                raise IdentityError(
+                    f"symlink target at "
+                    f"{p.relative_to(root).as_posix()!r} is not valid "
+                    f"UTF-8 — cannot compute a content hash",
+                    code="ID-NON-UTF8-SYMLINK-TARGET",
+                ) from e
             entries.append(_Entry(
                 relpath=p.relative_to(root).as_posix(),
                 mode_marker=MODE_SYMLINK,

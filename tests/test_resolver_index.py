@@ -102,9 +102,8 @@ def test_named_dep_unparseable_version_raises_coded_error(tmp_path):
     """An index whose only version is unparseable surfaces a coded
     TianguisError — never a bare Python ValueError.
 
-    The unparseable version is filtered inside tianguis_client.resolve_named
-    (L2: the TNG-BAD-VERSION arm in _process_named is unreachable); the
-    error that fires is TNG-NO-SATISFYING-VERSION."""
+    The unparseable version is filtered inside tianguis_client.resolve_named_all;
+    the error that fires is TNG-NO-SATISFYING-VERSION."""
     fake = _Fake()
     # 1.2.3.4 (four components) is not a clean X.Y.Z; it's the lone version.
     index = make_index([
@@ -204,7 +203,7 @@ def test_named_dep_without_index_raises_clear_resolver_error(tmp_path):
 # ---------------------------------------------------------------------------
 # M8 — OCI named-dep path through the resolver in-process
 # ---------------------------------------------------------------------------
-# The chain parse_index → resolve_named → _process_named →
+# The chain parse_index → resolve_named_all → _enumerate_named →
 # fetch_any(OciProvenance) → from_graph → OciProvenanceRecord had been
 # covered only by the gated live integration test. These tests close that gap
 # with a fake OciFetcher injected via FetcherRegistry (no oras invocation).

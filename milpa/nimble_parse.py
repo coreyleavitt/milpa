@@ -41,6 +41,10 @@ class NimbleManifest:
 class NimbleParseError(Exception):
     """Raised when a .nimble file cannot be read or parsed."""
 
+    def __init__(self, message: str = "", *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 _URL_SCHEMES = ("http://", "https://", "ssh://", "git://", "file://")
 
@@ -109,9 +113,15 @@ def load_nimble(path: Path) -> NimbleManifest:
     try:
         text = path.read_text()
     except FileNotFoundError as e:
-        raise NimbleParseError(f".nimble file not found: {path}") from e
+        raise NimbleParseError(
+            f".nimble file not found: {path}",
+            code="NIMBLE-FILE-NOT-FOUND",
+        ) from e
     except OSError as e:
-        raise NimbleParseError(f"cannot read .nimble {path}: {e}") from e
+        raise NimbleParseError(
+            f"cannot read .nimble {path}: {e}",
+            code="NIMBLE-FILE-UNREADABLE",
+        ) from e
     return parse_nimble(text)
 
 

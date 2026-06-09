@@ -37,6 +37,7 @@ from pathlib import Path
 
 import kdl
 
+from .error_codes import lockfile_codes as _LC  # noqa: F401 — populates catalog
 from .fetchers.git import GitProvenance
 from .fetchers.oci import OciProvenance
 from .fetchers.tarball import TarballProvenance
@@ -164,7 +165,14 @@ class Lockfile:
 
 
 class LockfileError(Exception):
-    """Raised on malformed lockfile text or graph/lockfile mismatch."""
+    """Raised on malformed lockfile text or graph/lockfile mismatch.
+
+    Carries a stable `code` (a `LOCK-*` slug from the error catalog) so
+    callers can assert on condition rather than brittle message strings."""
+
+    def __init__(self, message: str, *, code: str) -> None:
+        self.code = code
+        super().__init__(message)
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +203,12 @@ def _locked_from_resolved(d: ResolvedDep) -> LockedDep:
         identity=d.identity,
         version=_format_version(d.version),
         src_dir=d.src_dir,
-        requires=d.requires,
+        # Sort lexicographically: `requires` is accumulated in BFS
+        # arrival order, which is not reproducible across parallel-fetch
+        # runs or independent implementations. Lexicographic order is
+        # the spec's single canonical ordering rule (lockfile-schema
+        # §3.4 / resolver-semantics §4.4).
+        requires=tuple(sorted(d.requires)),
         provenances=(_provenance_from_resolved(d),),
         active_flags=getattr(d, "active_flags", ()),
         self_mirrors=getattr(d, "self_mirrors", ()),
@@ -284,7 +297,9 @@ def parse_lockfile(text: str) -> Lockfile:
     try:
         doc = kdl.parse(text)
     except kdl.errors.ParseError as e:
-        raise LockfileError(f"KDL syntax error: {e}") from e
+        raise LockfileError(
+            f"KDL syntax error: {e}", code="LOCK-KDL-SYNTAX"
+        ) from e
 
     deps: list[LockedDep] = []
     strategy: str = "maxver"
@@ -299,11 +314,15 @@ def parse_lockfile(text: str) -> Lockfile:
             deps.append(_parse_dep(node))
 
     if version is None:
-        raise LockfileError("lockfile missing required 'version' node")
+        raise LockfileError(
+            "lockfile missing required 'version' node",
+            code="LOCK-VERSION-MISSING",
+        )
     if version != LOCKFILE_SCHEMA_VERSION:
         raise LockfileError(
             f"unsupported lockfile schema version {version} "
-            f"(this milpa understands version {LOCKFILE_SCHEMA_VERSION})"
+            f"(this milpa understands version {LOCKFILE_SCHEMA_VERSION})",
+            code="LOCK-VERSION-UNSUPPORTED",
         )
 
     return Lockfile(deps=tuple(deps), strategy=strategy, version=version)
@@ -311,13 +330,17 @@ def parse_lockfile(text: str) -> Lockfile:
 
 def _scalar_int(node: kdl.Node, field_name: str) -> int:
     if len(node.args) != 1:
-        raise LockfileError(f"{field_name!r} takes exactly one value")
+        raise LockfileError(
+            f"{field_name!r} takes exactly one value",
+            code="LOCK-FIELD-ARITY",
+        )
     val = node.args[0]
     try:
         return int(val)  # type: ignore[arg-type]
     except (TypeError, ValueError) as e:
         raise LockfileError(
-            f"{field_name!r} must be an integer (got {val!r})"
+            f"{field_name!r} must be an integer (got {val!r})",
+            code="LOCK-FIELD-TYPE",
         ) from e
 
 
@@ -340,7 +363,8 @@ def _parse_dep(node: kdl.Node) -> LockedDep:
                 identity = parse_identity(val)
             except IdentityError as e:
                 raise LockfileError(
-                    f"dep {name!r}: invalid identity — {e}"
+                    f"dep {name!r}: invalid identity — {e}",
+                    code="LOCK-DEP-IDENTITY-INVALID",
                 ) from e
         elif child.name == "version":
             version = _scalar_str(child, name, "version")
@@ -384,13 +408,15 @@ def _parse_provenance_block(node: kdl.Node, dep_name: str) -> ProvenanceRecord:
         if len(child.args) != 1:
             raise LockfileError(
                 f"dep {dep_name!r}: provenance field {child.name!r} "
-                f"must have exactly one value"
+                f"must have exactly one value",
+                code="LOCK-PROV-FIELD-ARITY",
             )
         fields[child.name] = child.args[0]
     kind = fields.get("kind")
     if not isinstance(kind, str):
         raise LockfileError(
-            f"dep {dep_name!r}: provenance block missing 'kind' discriminator"
+            f"dep {dep_name!r}: provenance block missing 'kind' discriminator",
+            code="LOCK-PROV-KIND-MISSING",
         )
     if kind == "git":
         return GitProvenanceRecord(
@@ -425,14 +451,16 @@ def _parse_provenance_block(node: kdl.Node, dep_name: str) -> ProvenanceRecord:
         )
     raise LockfileError(
         f"dep {dep_name!r}: unknown provenance kind {kind!r} "
-        f"(supported: git, tarball, local, member, oci, registry)"
+        f"(supported: git, tarball, local, member, oci, registry)",
+        code="LOCK-PROV-KIND-UNKNOWN",
     )
 
 
 def _dep_name(node: kdl.Node) -> str:
     if len(node.args) != 1 or not isinstance(node.args[0], str):
         raise LockfileError(
-            "dep node requires exactly one string argument (the name)"
+            "dep node requires exactly one string argument (the name)",
+            code="LOCK-DEP-NAME-ARITY",
         )
     return node.args[0]
 
@@ -440,7 +468,8 @@ def _dep_name(node: kdl.Node) -> str:
 def _scalar_str(node: kdl.Node, dep_name: str, field_name: str) -> str:
     if len(node.args) != 1 or not isinstance(node.args[0], str):
         raise LockfileError(
-            f"dep {dep_name!r} field {field_name!r} must have exactly one string value"
+            f"dep {dep_name!r} field {field_name!r} must have exactly one string value",
+            code="LOCK-DEP-FIELD-ARITY",
         )
     return node.args[0]
 
@@ -449,7 +478,8 @@ def _required_str(fields: dict, key: str, dep_name: str) -> str:
     val = fields.get(key)
     if not isinstance(val, str):
         raise LockfileError(
-            f"dep {dep_name!r}: provenance missing required field {key!r}"
+            f"dep {dep_name!r}: provenance missing required field {key!r}",
+            code="LOCK-PROV-FIELD-MISSING",
         )
     return val
 
@@ -544,9 +574,13 @@ def load_lockfile(path: Path) -> Lockfile:
     try:
         text = path.read_text()
     except FileNotFoundError as e:
-        raise LockfileError(f"lockfile not found: {path}") from e
+        raise LockfileError(
+            f"lockfile not found: {path}", code="LOCK-FILE-NOT-FOUND"
+        ) from e
     except OSError as e:
-        raise LockfileError(f"cannot read lockfile {path}: {e}") from e
+        raise LockfileError(
+            f"cannot read lockfile {path}: {e}", code="LOCK-FILE-UNREADABLE"
+        ) from e
     return parse_lockfile(text)
 
 
@@ -579,7 +613,8 @@ def verify_against_graph(
 
     if errors:
         raise LockfileError(
-            "lockfile does not match resolved graph:\n  " + "\n  ".join(errors)
+            "lockfile does not match resolved graph:\n  " + "\n  ".join(errors),
+            code="LOCK-GRAPH-MISMATCH",
         )
 
 

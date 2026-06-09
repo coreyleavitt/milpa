@@ -65,6 +65,9 @@ class TarballReceipt(ProvenanceReceipt):
     extracted_bytes: int
     extracted_file_count: int
 
+    def transport_fields(self) -> dict[str, str]:
+        return {"archive_sha256": self.archive_sha256}
+
 
 class TarballFetcher:
     def can_handle(self, p: Provenance) -> bool:
@@ -92,7 +95,8 @@ class TarballFetcher:
             except (urllib.error.URLError, FileNotFoundError, OSError) as e:
                 raise FetchError(
                     f"fetching {name!r}: cannot download tarball from "
-                    f"{p.url}: {e}"
+                    f"{p.url}: {e}",
+                    code="FETCH-DOWNLOAD-FAILED",
                 )
 
             archive_sha = _sha256_file(tmp_path)
@@ -100,7 +104,8 @@ class TarballFetcher:
                 raise FetchError(
                     f"fetching {name!r}: archive sha256 mismatch — "
                     f"expected {p.expected_sha256}, got {archive_sha} "
-                    f"(URL {p.url}); rejected BEFORE extraction"
+                    f"(URL {p.url}); rejected BEFORE extraction",
+                    code="FETCH-SHA256-MISMATCH",
                 )
 
             # Extract into dest under safe-extraction caps.
@@ -117,7 +122,8 @@ class TarballFetcher:
                     shutil.rmtree(dest, ignore_errors=True)
                 raise FetchError(
                     f"fetching {name!r}: archive from {p.url} failed "
-                    f"safe extraction: {e}"
+                    f"safe extraction: {e}",
+                    code="FETCH-EXTRACT-FAILED",
                 )
 
             return TarballReceipt(

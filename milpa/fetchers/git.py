@@ -36,6 +36,9 @@ class GitProvenance(Provenance):
 class GitReceipt(ProvenanceReceipt):
     commit_sha: str
 
+    def transport_fields(self) -> dict[str, str]:
+        return {"commit_sha": self.commit_sha}
+
 
 class GitFetcher:
     """Fetcher for GitProvenance — clones the URL at the ref into dest."""
@@ -123,7 +126,8 @@ def _ensure_commit_present(name: str, p: GitProvenance, dest: Path) -> None:
         raise FetchError(
             f"commit {p.commit_sha!r} not found in {p.url!r} even after "
             f"full history fetch — the index pin may be stale or the commit "
-            f"was force-pushed away"
+            f"was force-pushed away",
+            code="FETCH-GIT-COMMIT-ABSENT",
         )
 
 
@@ -132,7 +136,8 @@ def _run_git(name: str, p: GitProvenance, argv: list[str]) -> None:
     if result.returncode != 0:
         raise FetchError(
             f"fetching {name!r} from {p.url} at {p.ref!r} failed: "
-            f"{result.stderr.strip() or result.stdout.strip() or 'git exited non-zero'}"
+            f"{result.stderr.strip() or result.stdout.strip() or 'git exited non-zero'}",
+            code="FETCH-GIT-FAILED",
         )
 
 

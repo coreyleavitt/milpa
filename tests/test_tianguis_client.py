@@ -608,7 +608,7 @@ package "x" {
 
 
 def test_unknown_error_code_is_rejected_at_construction():
-    # The _TNG_CODES bijection guard: a typo'd code fails loudly.
+    # The error-catalog validation: a typo'd code fails loudly.
     from milpa.tianguis_client import TianguisError
 
     with pytest.raises(AssertionError, match="unknown tianguis error code"):
@@ -695,17 +695,17 @@ package "foo" {
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# (0) TNG-AMBIGUOUS-NAME is registered in _TNG_CODES
+# (0) TNG-AMBIGUOUS-NAME is registered in the error catalog
 # ---------------------------------------------------------------------------
 
 
 def test_tng_ambiguous_name_is_in_codes():
-    """TNG-AMBIGUOUS-NAME must appear in _TNG_CODES so TianguisError
+    """TNG-AMBIGUOUS-NAME must appear in the error catalog so TianguisError
     construction with this code doesn't AssertionError."""
-    from milpa.tianguis_client import _TNG_CODES
-    assert "TNG-AMBIGUOUS-NAME" in _TNG_CODES, (
-        "TNG-AMBIGUOUS-NAME must be registered in _TNG_CODES before any "
-        "raise site can use it"
+    from milpa.error_catalog import ERROR_CATALOG
+    assert "TNG-AMBIGUOUS-NAME" in ERROR_CATALOG, (
+        "TNG-AMBIGUOUS-NAME must be registered in the error catalog "
+        "(milpa/error_codes/tianguis_codes.py) before any raise site can use it"
     )
 
 

@@ -155,7 +155,10 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 def _default_index_loader(*, cache_dir: Path) -> Index:
-    return load_index(url=DEFAULT_INDEX_URL, cache_dir=cache_dir)
+    # MILPA_INDEX_URL overrides the default registry (air-gapped / mirror /
+    # test environments). Spec: registry-protocol.md §1, cli-contract.md §8.
+    url = os.environ.get("MILPA_INDEX_URL") or DEFAULT_INDEX_URL
+    return load_index(url=url, cache_dir=cache_dir)
 
 
 def cmd_fetch(

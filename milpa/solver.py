@@ -41,6 +41,8 @@ from functools import total_ordering
 from typing import Protocol
 import re
 
+from .error_codes import solver_codes as _SC  # noqa: F401 — populates catalog
+
 
 # ---------------------------------------------------------------------------
 # Conflict narration structures (P3.4)
@@ -913,7 +915,12 @@ class SolverError(Exception):
     Carries a structured ``ConflictChain`` (the ``chain`` attribute) that
     can be rendered with ``render_conflict_chain``.  ``str(err)`` returns
     the rendered prose so existing log/print sites keep working.
+
+    ``code`` is always ``"SOLVE-CONFLICT"`` — there is exactly one
+    user-facing solver-error condition (unsatisfiable constraints).
     """
+
+    code: str = "SOLVE-CONFLICT"
 
     def __init__(self, chain: "ConflictChain") -> None:
         self.chain = chain

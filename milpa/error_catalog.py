@@ -3,15 +3,17 @@
 Each error condition carries a stable code (semantic-kebab format,
 e.g. `MAN-NAME-MISSING`). Codes are categorized by a short prefix:
 
-  MAN-*  : ManifestError (parser, validation)
-  LOCK-* : LockfileError
-  RES-*  : ResolverError
-  FETCH-*: FetchError
-  CAS-*  : CASError
-  FROZEN-*: NotFrozen
-  ID-*   : IdentityError
-  NIM-*  : NimbleParseError
-  SOLVE-*: SolverError
+  MAN-*     : ManifestError (parser, validation)
+  LOCK-*    : LockfileError
+  RES-*     : ResolverError
+  FETCH-*   : FetchError (fetchers)
+  CAS-*     : CASError (content-addressed store)
+  FROZEN-*  : NotFrozen (frozen fast path precondition failures)
+  ID-*      : IdentityError (identity string parser)
+  NIMBLE-*  : NimbleParseError (.nimble file loader)
+  SOLVE-*   : SolverError
+  WS-*      : WorkspaceError (workspace topology)
+  EXTRACT-* : ExtractionError subclasses (archive extraction)
 
 This module is the **single source of truth**. It generates the
 normative spec at docs/spec/errors.md. Tests enforce a bijection:
@@ -79,6 +81,30 @@ def generate_errors_markdown(catalog: dict[str, ErrorCode] | None = None) -> str
         "on slugs but MUST NOT rely on message wording.",
         "",
         "Generated from `milpa/error_catalog.py` — do not edit by hand.",
+        "",
+        "---",
+        "",
+        "## Normative surface",
+        "",
+        "Every catalog entry in this document is **normative**: a conformant",
+        "milpa implementation MUST raise the exact slug shown for the exact",
+        "condition described. The slug is the cross-implementation contract.",
+        "",
+        "The human-readable **message text** (the string passed to the",
+        "exception constructor) is **incidental**: it is NOT byte-normative.",
+        "A conformant implementation MAY differ in phrasing, language, or",
+        "level of detail, provided the slug is correct.",
+        "",
+        "The **Triggered** field describes the reference Python implementation's",
+        "raise site. Alternate implementations MUST produce the same slug for",
+        "the same condition but MAY structure their internals differently.",
+        "",
+        "Bijection invariant: every slug in this catalog MUST have at least",
+        "one raise site in the reference implementation; every raise site MUST",
+        "reference a slug defined here. The test suite enforces both directions",
+        "via `check_catalog_orphan_slugs` for each category prefix.",
+        "",
+        "---",
         "",
     ]
     by_category: dict[str, list[ErrorCode]] = {}

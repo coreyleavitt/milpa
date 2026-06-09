@@ -19,7 +19,7 @@ import pytest
 
 from milpa.fetchers import FetcherRegistry
 from milpa.fetchers.git import GitProvenance, GitReceipt
-from milpa.manifest import LocalDep, Manifest, TarballDep, UrlDep
+from milpa.manifest import LocalDep, Manifest, ManifestError, TarballDep, UrlDep
 from milpa.resolver import ResolvedDep, ResolvedGraph, resolve
 
 
@@ -590,3 +590,58 @@ def test_resolve_topological_order(tmp_path):
     names = [d.name for d in graph.deps]
     assert names.index("leaf") < names.index("mid")
     assert names.index("mid") < names.index("app")
+
+
+def test_malformed_nimble_constraint_raises_manifest_error_not_value_error(tmp_path):
+    """MAN-NIMBLE-CONSTRAINT: a transitive .nimble file with an unparseable
+    version constraint in its `requires` line surfaces as a ManifestError
+    (not a bare ValueError) at the resolver boundary.
+
+    This is the reclassification required by the error-catalog discipline:
+    the constraint string is user-supplied package data, so it must carry
+    a catalog code rather than propagating a raw internal ValueError."""
+    from tests.indexkdl import make_index
+
+    reg, _ = fake_registry({
+        ("https://example.com/foo.git", "main"): (
+            "aaa111",
+            # 'requires "bar 0.0.1"' — "bar" is a named dep and "0.0.1"
+            # starts with a digit (no operator prefix), which is NOT a valid
+            # constraint clause and causes VersionSet.from_constraint to
+            # raise ValueError.
+            'srcDir = "src"\nrequires "bar 0.0.1"\n',
+        ),
+    })
+    manifest = Manifest(
+        deps=(UrlDep(name="foo", git="https://example.com/foo.git", ref="main"),),
+        kind="library",
+    )
+    # The tianguis index must list "bar" so the resolver reaches _build_terms
+    # before failing on the malformed constraint.
+    index = make_index([{"name": "bar", "url": "https://example.com/bar.git"}])
+
+    with pytest.raises(ManifestError) as exc:
+        resolve(
+            manifest,
+            deps_dir=tmp_path / "_deps",
+            fetcher=reg,
+            index=index,
+        )
+    assert exc.value.code == "MAN-NIMBLE-CONSTRAINT"
+    assert "bar" in str(exc.value)
+
+
+def test_resolve_named_dep_without_index_raises_resolver_error(tmp_path):
+    """RES-NO-INDEX: resolve() with a NamedDep and no index raises
+    ResolverError with code 'RES-NO-INDEX'."""
+    from milpa.manifest import NamedDep
+    from milpa.resolver import ResolverError
+
+    manifest = Manifest(
+        deps=(NamedDep(name="somelib", constraint=">=1.0.0"),),
+        kind="library",
+    )
+    with pytest.raises(ResolverError) as exc:
+        resolve(manifest, deps_dir=tmp_path / "_deps")
+    assert exc.value.code == "RES-NO-INDEX"
+    assert "somelib" in str(exc.value)

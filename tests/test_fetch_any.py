@@ -31,6 +31,9 @@ class StubProvenance(Provenance):
 class StubReceipt(ProvenanceReceipt):
     name: str
 
+    def transport_fields(self) -> dict[str, str]:
+        return {"name": self.name}
+
 
 class StubFetcher:
     """Fetches StubProvenance: writes `name` to dest, or raises if

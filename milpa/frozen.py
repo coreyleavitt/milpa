@@ -26,6 +26,10 @@ class NotFrozen(Exception):
     specific reason; the resolver falls through to the slow path
     unless --frozen was set."""
 
+    def __init__(self, message: str = "", *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 def resolve_frozen(
     manifest: Manifest,
@@ -55,12 +59,14 @@ def resolve_frozen(
         if isinstance(first, MemberProvenanceRecord):
             raise NotFrozen(
                 f"dep {locked.name!r} is a workspace member — "
-                f"members always re-resolve"
+                f"members always re-resolve",
+                code="FROZEN-MEMBER-DEP",
             )
         if isinstance(first, LocalProvenanceRecord):
             raise NotFrozen(
                 f"dep {locked.name!r} has a local provenance — "
-                f"editable trees always re-resolve"
+                f"editable trees always re-resolve",
+                code="FROZEN-LOCAL-DEP",
             )
         _link_external(locked, deps_dir, store)
         resolved.append(_resolved_from_locked(locked))
@@ -108,14 +114,16 @@ def resolve_workspace_frozen(
                 raise NotFrozen(
                     f"lockfile references workspace member "
                     f"{first.name!r} that is not in the current "
-                    f"workspace"
+                    f"workspace",
+                    code="FROZEN-MEMBER-NOT-IN-WORKSPACE",
                 )
             actual = _compute_hash(member.directory)
             if actual != locked.identity:
                 raise NotFrozen(
                     f"member {first.name!r}: on-disk identity "
                     f"{actual[:23]}... differs from lockfile pin "
-                    f"{(locked.identity or '<none>')[:23]}..."
+                    f"{(locked.identity or '<none>')[:23]}...",
+                    code="FROZEN-MEMBER-IDENTITY-DRIFT",
                 )
             resolved.append(_resolved_from_locked(locked))
             continue
@@ -123,7 +131,8 @@ def resolve_workspace_frozen(
         if isinstance(first, LocalProvenanceRecord):
             raise NotFrozen(
                 f"dep {locked.name!r} has a local provenance — "
-                f"editable trees always re-resolve"
+                f"editable trees always re-resolve",
+                code="FROZEN-LOCAL-DEP",
             )
 
         _link_external(locked, deps_dir, store)
@@ -141,7 +150,8 @@ def _check_strategy(strategy: Strategy, lockfile: Lockfile) -> None:
     if str(strategy) != lockfile.strategy:
         raise NotFrozen(
             f"strategy mismatch: lockfile built with "
-            f"{lockfile.strategy!r}, requested {str(strategy)!r}"
+            f"{lockfile.strategy!r}, requested {str(strategy)!r}",
+            code="FROZEN-STRATEGY-MISMATCH",
         )
 
 
@@ -159,7 +169,8 @@ def _check_manifest_alignment(
         if mdep.name not in locked_by_name:
             raise NotFrozen(
                 f"{context_prefix}manifest dep {mdep.name!r} has no "
-                f"lockfile entry (re-run `milpa fetch`)"
+                f"lockfile entry (re-run `milpa fetch`)",
+                code="FROZEN-MANIFEST-DEP-NOT-IN-LOCK",
             )
         if isinstance(mdep, NamedDep) and mdep.constraint:
             locked = locked_by_name[mdep.name]
@@ -167,14 +178,16 @@ def _check_manifest_alignment(
             if locked_version is None:
                 raise NotFrozen(
                     f"dep {mdep.name!r}: locked version {locked.version!r} "
-                    f"is not a parseable X.Y.Z version"
+                    f"is not a parseable X.Y.Z version",
+                    code="FROZEN-LOCKED-VERSION-UNPARSEABLE",
                 )
             vset = VersionSet.from_constraint(mdep.constraint)
             if not vset.contains(locked_version):
                 raise NotFrozen(
                     f"{context_prefix}dep {mdep.name!r}: locked "
                     f"version {locked.version} no longer satisfies "
-                    f"manifest constraint {mdep.constraint!r}"
+                    f"manifest constraint {mdep.constraint!r}",
+                    code="FROZEN-CONSTRAINT-UNSATISFIED",
                 )
 
 
@@ -184,7 +197,8 @@ def _link_external(locked, deps_dir: Path, store: CAStore) -> None:
     if not locked.identity or not store.contains(locked.identity):
         raise NotFrozen(
             f"dep {locked.name!r} identity "
-            f"{(locked.identity or '<none>')[:23]}... not in store"
+            f"{(locked.identity or '<none>')[:23]}... not in store",
+            code="FROZEN-IDENTITY-NOT-IN-STORE",
         )
     store.link(locked.identity, deps_dir / locked.name)
 
@@ -196,7 +210,8 @@ def _resolved_from_locked(locked) -> ResolvedDep:
     if ver is None:
         raise NotFrozen(
             f"dep {locked.name!r}: locked version {locked.version!r} "
-            f"is not a parseable X.Y.Z version"
+            f"is not a parseable X.Y.Z version",
+            code="FROZEN-LOCKED-VERSION-UNPARSEABLE",
         )
     return ResolvedDep(
         name=locked.name,
@@ -236,7 +251,8 @@ def _source_from_provenance(p) -> str:
         # record). Do NOT fabricate a fetch URL (milpa#97).
         raise NotFrozen(
             f"lock entry {p.name!r} uses the legacy registry provenance; "
-            f"run `milpa update {p.name}` to re-resolve via the tianguis index"
+            f"run `milpa update {p.name}` to re-resolve via the tianguis index",
+            code="FROZEN-LEGACY-REGISTRY-PROVENANCE",
         )
     raise ValueError(f"unknown provenance kind {type(p).__name__}")
 
