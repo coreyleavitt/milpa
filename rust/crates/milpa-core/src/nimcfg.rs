@@ -13,7 +13,12 @@
 //! does not yet carry `active_flags`/`flag_defines` (no success fixture resolves
 //! a flag-carrying dep — same deferral as `from_graph`'s flag fields).
 
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+
 use milpa_types::{ResolvedDep, ResolvedGraph};
+
+use crate::workspace::LoadedWorkspace;
 
 /// The normative `nim.cfg` header (conformance-fixtures §2). Stored without its
 /// trailing newline; the join below re-introduces line breaks.
@@ -58,10 +63,126 @@ fn path_for(dep: &ResolvedDep, deps_dir: &str) -> String {
     base
 }
 
+// ---------------------------------------------------------------------------
+// Workspace: per-member nim.cfg (W4 / lockfile §7.6)
+// ---------------------------------------------------------------------------
+
+/// Render one `nim.cfg` per workspace member, keyed by the member's as-declared
+/// workspace-relative `path`. Mirrors `nimcfg.py:format_workspace_nimcfgs`: each
+/// member lists only its transitively-reachable deps (Nim per-member isolation),
+/// with POSIX-relative `--path:` lines from the member's directory — external
+/// deps under `<root>/_deps/<name>[/src]`, member refs under
+/// `<root>/<other-member-path>[/src]`. There is **no** root `nim.cfg`.
+pub fn format_workspace_nimcfgs(
+    workspace: &LoadedWorkspace,
+    graph: &ResolvedGraph,
+) -> Vec<(String, String)> {
+    let deps_dir = workspace.root.join("_deps");
+    let member_dir: HashMap<&str, &Path> = workspace
+        .members
+        .iter()
+        .map(|m| (m.name.as_str(), m.directory.as_path()))
+        .collect();
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    for member in &workspace.members {
+        let mut lines: Vec<String> = vec![HEADER.to_string(), String::new()];
+        let mut closure = member_dep_closure(graph, &member.name);
+        closure.sort_by(|a, b| a.name.cmp(&b.name));
+        for dep in &closure {
+            let target = dep_target(dep, &deps_dir, &member_dir);
+            let rel = relpath(&target, &member.directory);
+            lines.push(format!("--path:\"{}\"", posix(&rel)));
+        }
+        if !closure.is_empty() {
+            lines.push(String::new());
+        }
+        out.push((member.path.clone(), lines.join("\n")));
+    }
+    out
+}
+
+/// The on-disk source path of a dep: a member resolves to its member directory,
+/// an external dep to `<deps_dir>/<name>`; `src_dir` is appended when declared.
+fn dep_target(dep: &ResolvedDep, deps_dir: &Path, member_dir: &HashMap<&str, &Path>) -> PathBuf {
+    let base = match member_dir.get(dep.name.as_str()) {
+        Some(dir) => dir.to_path_buf(),
+        None => deps_dir.join(&dep.name),
+    };
+    if dep.src_dir.is_empty() {
+        base
+    } else {
+        base.join(&dep.src_dir)
+    }
+}
+
+/// Transitive closure reachable from `member_name` (excluding the member itself),
+/// in topological order. Mirrors `nimcfg.py:member_dep_closure`.
+fn member_dep_closure<'a>(graph: &'a ResolvedGraph, member_name: &str) -> Vec<&'a ResolvedDep> {
+    let by_name: HashMap<&str, &ResolvedDep> =
+        graph.deps.iter().map(|d| (d.name.as_str(), d)).collect();
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut order: Vec<&ResolvedDep> = Vec::new();
+
+    fn visit<'a>(
+        name: &str,
+        by_name: &HashMap<&str, &'a ResolvedDep>,
+        visited: &mut BTreeSet<String>,
+        order: &mut Vec<&'a ResolvedDep>,
+    ) {
+        if visited.contains(name) {
+            return;
+        }
+        let Some(dep) = by_name.get(name) else {
+            return;
+        };
+        visited.insert(name.to_string());
+        for req in &dep.requires {
+            visit(req, by_name, visited, order);
+        }
+        order.push(dep);
+    }
+
+    if let Some(member) = by_name.get(member_name) {
+        for req in &member.requires {
+            visit(req, &by_name, &mut visited, &mut order);
+        }
+    }
+    order
+}
+
+/// Lexical relative path from `base` (a directory) to `target`, like Python's
+/// `os.path.relpath(target, start=base)`. Both are expected absolute.
+fn relpath(target: &Path, base: &Path) -> PathBuf {
+    use std::path::Component;
+    let t: Vec<Component> = target.components().collect();
+    let b: Vec<Component> = base.components().collect();
+    let common = t.iter().zip(b.iter()).take_while(|(a, c)| a == c).count();
+    let mut out = PathBuf::new();
+    for _ in 0..(b.len() - common) {
+        out.push("..");
+    }
+    for comp in &t[common..] {
+        out.push(comp.as_os_str());
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
+/// Render a path with POSIX separators (nim.cfg syntax is OS-agnostic).
+fn posix(p: &Path) -> String {
+    p.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use milpa_types::{Provenance, Version};
+    use milpa_types::{ProvenanceRecord, Version};
 
     fn dep(name: &str, src_dir: &str) -> ResolvedDep {
         ResolvedDep {
@@ -70,9 +191,9 @@ mod tests {
             version: Version::release(0, 0, 1),
             src_dir: src_dir.into(),
             requires: vec![],
-            provenance: Provenance::Git {
+            provenance: ProvenanceRecord::Git {
                 url: "https://e/x.git".into(),
-                ref_spec: "main".into(),
+                ref_spec: Some("main".into()),
                 commit_sha: None,
             },
         }

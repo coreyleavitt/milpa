@@ -130,6 +130,9 @@ impl CoreError {
             "FROZEN-LOCAL-DEP",
             "FROZEN-IDENTITY-NOT-IN-STORE",
             "FROZEN-LEGACY-REGISTRY-PROVENANCE",
+            // workspace-frozen disqualifications (S11b)
+            "FROZEN-MEMBER-NOT-IN-WORKSPACE",
+            "FROZEN-MEMBER-IDENTITY-DRIFT",
             // workspace topology (workspace-semantics) — S11a loader. The
             // resolve-time RES-WS-* codes live in the resolver domain; the two
             // workspace-frozen FROZEN-MEMBER-* codes land in S11b.

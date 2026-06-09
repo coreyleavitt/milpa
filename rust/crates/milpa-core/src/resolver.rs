@@ -36,6 +36,7 @@ use crate::error::{CoreError, MilpaError};
 use crate::fetch::{FetchError, FetcherRegistry};
 use crate::identity::compute_content_hash;
 use crate::registry::{Index, IndexVersion};
+use crate::workspace::LoadedWorkspace;
 
 /// Canonical version for URL/local/tarball/member deps (resolver-semantics §3):
 /// such deps are version-unique by identity, so they enter the solver as a
@@ -177,6 +178,123 @@ pub(crate) fn resolve_default_strategy(
     )
 }
 
+/// Resolve a loaded workspace into one shared [`ResolvedGraph`] (resolver §11).
+///
+/// Members appear as `ProvenanceRecord::Member` deps whose identity is the
+/// content hash of their on-disk directory (never fetched); external deps from
+/// all members resolve once each through the same machinery as [`resolve`]. A
+/// member-named dep (direct `member "X"` or a bare named dep matching a member)
+/// auto-coerces to the in-tree member. Workspace-level checks: `RES-WS-NO-INDEX`,
+/// `RES-WS-OVERRIDE-MEMBER-COLLISION`, `RES-WS-MEMBER-REF-UNKNOWN`.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_workspace(
+    workspace: &LoadedWorkspace,
+    index: Option<&Index>,
+    fetcher: &dyn FetcherRegistry,
+    profile: Option<&Profile>,
+    prior: Option<&Lockfile>,
+    strategy: Strategy,
+    deps_dir: &Path,
+) -> Result<ResolvedGraph, MilpaError> {
+    let overrides: BTreeMap<String, Override> = workspace
+        .overrides
+        .iter()
+        .map(|o| (o.name.clone(), o.clone()))
+        .collect();
+    let members_by_name: BTreeSet<String> =
+        workspace.members.iter().map(|m| m.name.clone()).collect();
+
+    // RES-WS-OVERRIDE-MEMBER-COLLISION: a name cannot be both an external
+    // override and an in-tree member.
+    let mut collisions: Vec<&str> = overrides
+        .keys()
+        .filter(|n| members_by_name.contains(n.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !collisions.is_empty() {
+        collisions.sort();
+        return Err(res_err(
+            "RES-WS-OVERRIDE-MEMBER-COLLISION",
+            format!(
+                "workspace override name(s) {collisions:?} also appear as workspace member(s) \
+                 — remove either the override or the member; cannot have both"
+            ),
+        ));
+    }
+
+    // RES-WS-MEMBER-REF-UNKNOWN: a `member "X"` dep with no such member.
+    for member in &workspace.members {
+        for dep in &member.manifest.deps {
+            if let Dep::Member(md) = dep {
+                if !members_by_name.contains(&md.name) {
+                    return Err(res_err(
+                        "RES-WS-MEMBER-REF-UNKNOWN",
+                        format!(
+                            "workspace member {:?} references `member {:?}` but no such member exists",
+                            member.name, md.name
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    // RES-WS-NO-INDEX: a member's named dep with neither an index, an override,
+    // nor a matching member is unresolvable.
+    let empty_index = Index::default();
+    let index: &Index = match index {
+        Some(i) => i,
+        None => {
+            let unresolvable: Vec<&str> = workspace
+                .members
+                .iter()
+                .flat_map(|m| m.manifest.deps.iter().chain(m.manifest.dev_deps.iter()))
+                .filter(|d| {
+                    matches!(d, Dep::Named(_))
+                        && !overrides.contains_key(d.name())
+                        && !members_by_name.contains(d.name())
+                })
+                .map(Dep::name)
+                .collect();
+            if !unresolvable.is_empty() {
+                return Err(res_err(
+                    "RES-WS-NO-INDEX",
+                    format!(
+                        "workspace has named dep(s) {unresolvable:?} but no tianguis index \
+                         was provided"
+                    ),
+                ));
+            }
+            &empty_index
+        }
+    };
+
+    std::fs::create_dir_all(deps_dir).map_err(io_err)?;
+    let project_root = deps_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let mut provider = ResolveProvider::new(
+        fetcher,
+        index,
+        deps_dir.to_path_buf(),
+        project_root,
+        overrides,
+        prior,
+    );
+    let queue = provider.seed_workspace(workspace, profile)?;
+    for item in queue {
+        provider.process_item(item)?;
+    }
+    provider.finalize();
+    let solution = solve(&provider, ROOT, root_version(), strategy)?;
+    if let Some(e) = provider.take_error() {
+        return Err(e);
+    }
+    Ok(provider.build_graph(&solution))
+}
+
 // ---------------------------------------------------------------------------
 // Queue items + provenance keys
 // ---------------------------------------------------------------------------
@@ -243,8 +361,10 @@ struct Candidate {
     src_dir: String,
     requires_names: Vec<String>,
     deps: Vec<SolverDep>,
-    /// `None` for the synthetic root; `Some` for every fetched dep.
-    provenance: Option<Provenance>,
+    /// Emission-level record. `None` for the synthetic root; `Some` for every
+    /// fetched dep + workspace member. The resolver maps its internal transport
+    /// [`Provenance`] → [`ProvenanceRecord`] here so the graph is emission-ready.
+    provenance: Option<ProvenanceRecord>,
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +383,10 @@ struct ResolveProvider<'a> {
     overrides: BTreeMap<String, Override>,
     prior: Option<&'a Lockfile>,
     root_authority: BTreeSet<String>,
+    /// Workspace member names — pre-registered candidates that are never fetched
+    /// and never index-resolved (a member-named transitive dep is satisfied by
+    /// the in-tree member). Empty in single-package mode.
+    member_names: BTreeSet<String>,
 
     candidates: RefCell<BTreeMap<String, BTreeMap<Version, Candidate>>>,
     stubs: RefCell<BTreeMap<String, BTreeMap<Version, IndexVersion>>>,
@@ -300,6 +424,7 @@ impl<'a> ResolveProvider<'a> {
             overrides,
             prior,
             root_authority: BTreeSet::new(),
+            member_names: BTreeSet::new(),
             candidates: RefCell::new(BTreeMap::new()),
             stubs: RefCell::new(BTreeMap::new()),
             seen_url: RefCell::new(BTreeSet::new()),
@@ -387,6 +512,147 @@ impl<'a> ResolveProvider<'a> {
             seen_by_name
                 .entry(ov.name.clone())
                 .or_insert_with(|| (PKey::Url(ov.git.clone(), ov.git_ref.clone()), true));
+        }
+
+        self.root_authority = authority;
+        *self.seen_by_name.borrow_mut() = seen_by_name;
+
+        let root = Candidate {
+            name: ROOT.to_string(),
+            version: root_version(),
+            identity: String::new(),
+            src_dir: String::new(),
+            requires_names: root_requires,
+            deps: root_deps,
+            provenance: None,
+        };
+        self.store_candidate(root);
+        Ok(queue)
+    }
+
+    /// Pre-register every workspace member as a (never-fetched) candidate and
+    /// build the synthetic root requiring each member. Members' external deps
+    /// seed the BFS queue; member-named deps coerce to the in-tree member.
+    /// Returns the initial external-dep queue.
+    fn seed_workspace(
+        &mut self,
+        workspace: &LoadedWorkspace,
+        profile: Option<&Profile>,
+    ) -> Result<Vec<Item>, MilpaError> {
+        let members_by_name: BTreeSet<String> =
+            workspace.members.iter().map(|m| m.name.clone()).collect();
+        self.member_names = members_by_name.clone();
+
+        let mut root_deps: Vec<SolverDep> = Vec::new();
+        let mut root_requires: Vec<String> = Vec::new();
+        let mut queue: Vec<Item> = Vec::new();
+        let mut seen_by_name: BTreeMap<String, (PKey, bool)> = BTreeMap::new();
+        let mut authority: BTreeSet<String> = members_by_name.clone();
+
+        for ov in &workspace.overrides {
+            authority.insert(ov.name.clone());
+            seen_by_name.insert(
+                ov.name.clone(),
+                (PKey::Url(ov.git.clone(), ov.git_ref.clone()), true),
+            );
+        }
+
+        for member in &workspace.members {
+            // Per-member profile filtering (§6) when a profile is active.
+            let filtered;
+            let manifest = match profile {
+                Some(p) => {
+                    filtered = filter_manifest_by_profile(&member.manifest, p);
+                    &filtered
+                }
+                None => &member.manifest,
+            };
+
+            let mut terms: Vec<SolverDep> = Vec::new();
+            let mut requires: Vec<String> = Vec::new();
+            for dep in manifest.deps.iter().chain(manifest.dev_deps.iter()) {
+                let name = dep.name().to_string();
+                authority.insert(name.clone());
+
+                // Member ref / member-named auto-coercion: satisfied by the
+                // in-tree member candidate, no fetch, no queue.
+                if matches!(dep, Dep::Member(_)) || members_by_name.contains(&name) {
+                    terms.push(SolverDep::new(name.clone(), eq_sentinel()));
+                    requires.push(name);
+                    continue;
+                }
+
+                if self.overrides.contains_key(&name) {
+                    let ov = &self.overrides[&name];
+                    terms.push(SolverDep::new(name.clone(), eq_sentinel()));
+                    requires.push(name.clone());
+                    seen_by_name
+                        .entry(name.clone())
+                        .or_insert((PKey::Url(ov.git.clone(), ov.git_ref.clone()), true));
+                    queue.push(Item::Named {
+                        name,
+                        constraint: None,
+                    });
+                    continue;
+                }
+
+                match dep {
+                    Dep::Url(u) => {
+                        terms.push(SolverDep::new(name.clone(), eq_sentinel()));
+                        requires.push(name.clone());
+                        seen_by_name
+                            .entry(name.clone())
+                            .or_insert((PKey::Url(u.git.clone(), u.git_ref.clone()), true));
+                        queue.push(Item::Url(u.clone()));
+                    }
+                    Dep::Local(l) => {
+                        terms.push(SolverDep::new(name.clone(), eq_sentinel()));
+                        requires.push(name.clone());
+                        seen_by_name
+                            .entry(name.clone())
+                            .or_insert((PKey::Local(l.path.clone()), true));
+                        queue.push(Item::Local(l.clone()));
+                    }
+                    Dep::Tarball(t) => {
+                        terms.push(SolverDep::new(name.clone(), eq_sentinel()));
+                        requires.push(name.clone());
+                        seen_by_name
+                            .entry(name.clone())
+                            .or_insert((PKey::Tarball(t.url.clone()), true));
+                        queue.push(Item::Tarball(t.clone()));
+                    }
+                    Dep::Named(n) => {
+                        terms.push(SolverDep::new(
+                            name.clone(),
+                            from_constraint(n.constraint.as_deref())?,
+                        ));
+                        requires.push(name.clone());
+                        seen_by_name
+                            .entry(name.clone())
+                            .or_insert((PKey::Named(name.clone()), true));
+                        queue.push(Item::Named {
+                            name,
+                            constraint: n.constraint.clone(),
+                        });
+                    }
+                    Dep::Member(_) => unreachable!("handled by the coercion branch above"),
+                }
+            }
+
+            let identity = compute_content_hash(&member.directory)?;
+            self.store_candidate(Candidate {
+                name: member.name.clone(),
+                version: url_dep_version(),
+                identity,
+                src_dir: member.manifest.src_dir.clone(),
+                requires_names: requires,
+                deps: terms,
+                provenance: Some(ProvenanceRecord::Member {
+                    name: member.name.clone(),
+                }),
+            });
+            root_deps.push(SolverDep::new(member.name.clone(), eq_sentinel()));
+            root_requires.push(member.name.clone());
         }
 
         self.root_authority = authority;
@@ -504,9 +770,8 @@ impl<'a> ResolveProvider<'a> {
         let (deps, requires, src_dir, sub_items) = self.extract_requires(&dest, &dep.name)?;
 
         // Record the declared primary provenance; carry the resolved commit
-        // (preferring the freshly-resolved SHA over a pin) for S7c emission.
+        // (preferring the freshly-resolved SHA over a pin) for emission.
         let commit = resolved_ref.or(pinned_sha);
-        let prov = git_prov(&dep.git, &dep.git_ref, commit);
         self.store_candidate(Candidate {
             name: dep.name.clone(),
             version: url_dep_version(),
@@ -514,7 +779,11 @@ impl<'a> ResolveProvider<'a> {
             src_dir,
             requires_names: requires,
             deps,
-            provenance: Some(prov),
+            provenance: Some(ProvenanceRecord::Git {
+                url: dep.git.clone(),
+                ref_spec: opt(&dep.git_ref),
+                commit_sha: commit,
+            }),
         });
 
         for it in sub_items {
@@ -547,7 +816,9 @@ impl<'a> ResolveProvider<'a> {
             src_dir,
             requires_names: requires,
             deps,
-            provenance: Some(Provenance::Local {
+            provenance: Some(ProvenanceRecord::Local {
+                // The recorded path is the *declared relative* path (portable),
+                // not the absolute fetch path.
                 path: dep.path.clone(),
             }),
         });
@@ -582,7 +853,11 @@ impl<'a> ResolveProvider<'a> {
             src_dir,
             requires_names: requires,
             deps,
-            provenance: Some(prov),
+            // Record preserves the declared archive hash (lockfile.py M11).
+            provenance: Some(ProvenanceRecord::Tarball {
+                url: dep.url.clone(),
+                sha256: dep.sha256.clone(),
+            }),
         });
         for it in sub_items {
             self.process_item(it)?;
@@ -594,6 +869,11 @@ impl<'a> ResolveProvider<'a> {
     fn process_named(&self, name: &str, constraint: Option<&str>) -> Result<(), MilpaError> {
         if name == "nim" {
             self.seen_named.borrow_mut().insert(name.to_string());
+            return Ok(());
+        }
+        // A member-named transitive dep is already satisfied by the in-tree
+        // workspace member candidate — never index-resolve it.
+        if self.member_names.contains(name) {
             return Ok(());
         }
         if !self.seen_named.borrow_mut().insert(name.to_string()) {
@@ -662,8 +942,9 @@ impl<'a> ResolveProvider<'a> {
             src_dir,
             requires_names: requires,
             deps: deps.clone(),
-            // Record the canonical (first) provenance for emission.
-            provenance: entry.provenances.first().cloned(),
+            // Record the canonical (first) provenance for emission, mapped to
+            // the emission-level record.
+            provenance: entry.provenances.first().map(transport_to_record),
         };
         self.store_candidate(candidate);
         self.stubs
@@ -970,7 +1251,7 @@ impl<'a> ResolveProvider<'a> {
                 requires: c.requires_names.clone(),
                 // Every non-root candidate carries a provenance; default
                 // defensively (unreachable — root is excluded above).
-                provenance: c.provenance.clone().unwrap_or(Provenance::Local {
+                provenance: c.provenance.clone().unwrap_or(ProvenanceRecord::Local {
                     path: String::new(),
                 }),
             })
@@ -1091,6 +1372,53 @@ fn git_prov(url: &str, git_ref: &str, commit_sha: Option<String>) -> Provenance 
         url: url.to_string(),
         ref_spec: git_ref.to_string(),
         commit_sha,
+    }
+}
+
+/// Map a transport [`Provenance`] (what the fetcher dispatches on) to its
+/// emission-level [`ProvenanceRecord`] (what the lockfile records). A git
+/// `ref_spec` of `""` becomes `None` (the record's "omitted, never empty"
+/// convention). The non-transport `Member`/`Registry` records have no transport
+/// source, so they are produced directly (workspace resolve / lockfile read),
+/// never through this map.
+fn transport_to_record(p: &Provenance) -> ProvenanceRecord {
+    match p {
+        Provenance::Git {
+            url,
+            ref_spec,
+            commit_sha,
+        } => ProvenanceRecord::Git {
+            url: url.clone(),
+            ref_spec: opt(ref_spec),
+            commit_sha: commit_sha.clone(),
+        },
+        Provenance::Tarball {
+            url,
+            expected_sha256,
+            ..
+        } => ProvenanceRecord::Tarball {
+            url: url.clone(),
+            sha256: expected_sha256.clone(),
+        },
+        Provenance::Local { path } => ProvenanceRecord::Local { path: path.clone() },
+        Provenance::Oci {
+            registry,
+            repository,
+            digest,
+        } => ProvenanceRecord::Oci {
+            registry: registry.clone(),
+            repository: repository.clone(),
+            digest: digest.clone(),
+        },
+    }
+}
+
+/// `""` → `None`, else `Some` (the record's optional-field convention).
+fn opt(s: &str) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
     }
 }
 

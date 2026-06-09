@@ -11,8 +11,7 @@
 
 use kdl::{KdlDocument, KdlNode, KdlValue};
 use milpa_types::{
-    LockedDep, Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph,
-    LOCKFILE_SCHEMA_VERSION,
+    LockedDep, Lockfile, ProvenanceRecord, ResolvedDep, ResolvedGraph, LOCKFILE_SCHEMA_VERSION,
 };
 
 use crate::error::CoreError;
@@ -546,7 +545,10 @@ fn locked_from_resolved(d: &ResolvedDep) -> LockedDep {
         version: d.version.to_string(),
         src_dir: d.src_dir.clone(),
         requires,
-        provenances: vec![record_from_provenance(&d.provenance)],
+        // `ResolvedDep.provenance` is already the emission-level record (the
+        // resolver mapped transport→record at graph-build time), so this is a
+        // direct clone — no per-kind dispatch here.
+        provenances: vec![d.provenance.clone()],
         // #23 active feature flags and #79 self-mirrors are resolver-enrichment
         // concerns not yet carried on `ResolvedDep`; emitted empty (the Python
         // default for deps that declare neither). Threading them through lands
@@ -557,45 +559,7 @@ fn locked_from_resolved(d: &ResolvedDep) -> LockedDep {
     }
 }
 
-/// Reconstruct a lockfile [`ProvenanceRecord`] from a resolved dep's typed
-/// transport [`Provenance`]. Unlike the Python reference (which parses a flat
-/// `source` string), the Rust resolver carries the typed provenance with its
-/// resolved commit/sha already populated, so this is a pure structural map.
-fn record_from_provenance(prov: &Provenance) -> ProvenanceRecord {
-    match prov {
-        Provenance::Git {
-            url,
-            ref_spec,
-            commit_sha,
-        } => ProvenanceRecord::Git {
-            url: url.clone(),
-            ref_spec: opt(ref_spec),
-            commit_sha: commit_sha.clone(),
-        },
-        Provenance::Tarball {
-            url,
-            expected_sha256,
-            ..
-        } => ProvenanceRecord::Tarball {
-            url: url.clone(),
-            // Preserve the declared archive hash (the transport receipt), never
-            // identity (lockfile.py M11).
-            sha256: expected_sha256.clone(),
-        },
-        Provenance::Local { path } => ProvenanceRecord::Local { path: path.clone() },
-        Provenance::Oci {
-            registry,
-            repository,
-            digest,
-        } => ProvenanceRecord::Oci {
-            registry: registry.clone(),
-            repository: repository.clone(),
-            digest: digest.clone(),
-        },
-    }
-}
-
-/// Map a transport field that is `""` when absent onto the lockfile's
+/// Map a field that is `""` when absent onto the lockfile's
 /// "None-when-omitted, never empty string" optional-field convention.
 fn opt(s: &str) -> Option<String> {
     if s.is_empty() {
@@ -990,7 +954,7 @@ mod tests {
 
     use milpa_types::Version;
 
-    fn rdep(name: &str, prov: Provenance, requires: Vec<&str>) -> ResolvedDep {
+    fn rdep(name: &str, prov: ProvenanceRecord, requires: Vec<&str>) -> ResolvedDep {
         ResolvedDep {
             name: name.into(),
             identity: format!("sha256:{}", "0".repeat(63) + "1"),
@@ -1001,10 +965,10 @@ mod tests {
         }
     }
 
-    fn git(url: &str, ref_spec: &str, sha: Option<&str>) -> Provenance {
-        Provenance::Git {
+    fn git(url: &str, ref_spec: &str, sha: Option<&str>) -> ProvenanceRecord {
+        ProvenanceRecord::Git {
             url: url.into(),
-            ref_spec: ref_spec.into(),
+            ref_spec: opt(ref_spec),
             commit_sha: sha.map(String::from),
         }
     }
@@ -1052,29 +1016,35 @@ mod tests {
     }
 
     #[test]
-    fn from_graph_maps_each_transport_provenance_arm() {
+    fn from_graph_carries_each_provenance_record_arm() {
         let graph = ResolvedGraph {
             deps: vec![
                 rdep("g", git("https://e/g.git", "main", Some("abc123")), vec![]),
                 rdep(
                     "t",
-                    Provenance::Tarball {
+                    ProvenanceRecord::Tarball {
                         url: "https://e/t.tar.gz".into(),
-                        expected_sha256: Some("sha256:tar".into()),
-                        strip_components: 1,
+                        sha256: Some("sha256:tar".into()),
                     },
                     vec![],
                 ),
                 rdep(
                     "l",
-                    Provenance::Local {
+                    ProvenanceRecord::Local {
                         path: "../liba".into(),
                     },
                     vec![],
                 ),
                 rdep(
+                    "m",
+                    ProvenanceRecord::Member {
+                        name: "liba".into(),
+                    },
+                    vec![],
+                ),
+                rdep(
                     "o",
-                    Provenance::Oci {
+                    ProvenanceRecord::Oci {
                         registry: "ghcr.io".into(),
                         repository: "org/pkg".into(),
                         digest: "sha256:dig".into(),
@@ -1111,6 +1081,12 @@ mod tests {
             by_name("l"),
             vec![ProvenanceRecord::Local {
                 path: "../liba".into()
+            }]
+        );
+        assert_eq!(
+            by_name("m"),
+            vec![ProvenanceRecord::Member {
+                name: "liba".into()
             }]
         );
         assert_eq!(

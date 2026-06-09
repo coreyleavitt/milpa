@@ -33,12 +33,14 @@ pub use lockfile::{format_lockfile, from_graph, load_lockfile, parse_lockfile, w
 // `From<ManifestError>` impl lives here, so `?` lifts parse errors at this
 // boundary.
 pub use fetch::{FetchError, Fetcher, FetcherRegistry, Receipt};
-pub use frozen::resolve_frozen;
+pub use frozen::{resolve_frozen, resolve_workspace_frozen};
 pub use identity::{compute_content_hash, parse_identity, SUPPORTED_ALGORITHMS};
 pub use milpa_manifest::{parse_document, ManifestDoc};
+pub use milpa_solver::Strategy;
 pub use nimcfg::format_nimcfg;
+pub use nimcfg::format_workspace_nimcfgs;
 pub use registry::Index;
-pub use resolver::resolve;
+pub use resolver::{resolve, resolve_workspace};
 pub use store::{default_store, CaStore};
 pub use workspace::{load_workspace, LoadedWorkspace};
 
@@ -100,15 +102,28 @@ impl Resolver for Milpa {
     fn resolve_workspace(
         &self,
         _w: &Workspace,
-        _idx: Option<&Index>,
-        _f: &dyn FetcherRegistry,
-        _p: Option<&Profile>,
-        _prior: Option<&Lockfile>,
-        _deps_dir: &Path,
+        idx: Option<&Index>,
+        f: &dyn FetcherRegistry,
+        p: Option<&Profile>,
+        prior: Option<&Lockfile>,
+        deps_dir: &Path,
     ) -> Result<ResolvedGraph, MilpaError> {
-        // Workspace resolution (multi-member union, per-member nim.cfg) lands in
-        // S11; the single-package path is the S7b deliverable.
-        unimplemented!("resolve_workspace lands in S11")
+        // The trait carries the *parsed* workspace, but the union resolve needs
+        // each member's loaded manifest + directory. In a real project layout the
+        // workspace root is the deps_dir's parent; load from there. (The
+        // conformance harness, whose scratch `_deps/` is detached from the fixture
+        // inputs, calls the free `load_workspace` + `resolve_workspace` directly.)
+        let root = deps_dir.parent().unwrap_or_else(|| Path::new("."));
+        let loaded = workspace::load_workspace(root)?;
+        resolver::resolve_workspace(
+            &loaded,
+            idx,
+            f,
+            p,
+            prior,
+            milpa_solver::Strategy::default(),
+            deps_dir,
+        )
     }
 }
 
@@ -126,14 +141,15 @@ impl FrozenResolver for Milpa {
     fn resolve_workspace_frozen(
         &self,
         _w: &Workspace,
-        _lock: &Lockfile,
-        _store: &CaStore,
-        _deps_dir: &Path,
+        lock: &Lockfile,
+        store: &CaStore,
+        deps_dir: &Path,
     ) -> Result<ResolvedGraph, MilpaError> {
-        // Needs the workspace member loader (per-member manifest + on-disk
-        // identity check). Lands in S11 with FROZEN-MEMBER-NOT-IN-WORKSPACE /
-        // FROZEN-MEMBER-IDENTITY-DRIFT.
-        unimplemented!("resolve_workspace_frozen lands in S11")
+        // As with resolve_workspace: load members from the deps_dir's parent (the
+        // real project layout). The harness calls the free functions directly.
+        let root = deps_dir.parent().unwrap_or_else(|| Path::new("."));
+        let loaded = workspace::load_workspace(root)?;
+        frozen::resolve_workspace_frozen(&loaded, lock, store, deps_dir)
     }
 }
 

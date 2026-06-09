@@ -165,6 +165,14 @@ impl Provenance {
 }
 
 /// One dep after resolution: identity (content hash) ⊥ provenance.
+///
+/// `provenance` is the emission-level [`ProvenanceRecord`] (6 kinds), **not** the
+/// 4-kind transport [`Provenance`]: a resolved dep is post-fetch, so what matters
+/// downstream (lockfile emission, frozen rebuild) is *what to record about where
+/// the bytes came from* — including the non-transport `Member` (workspace) and
+/// `Registry` (legacy) kinds a workspace resolve / lockfile read produce. The
+/// resolver maps its internal transport `Provenance` → `ProvenanceRecord` when
+/// building the graph; `from_graph` is then a near-trivial clone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDep {
     pub name: String,
@@ -173,7 +181,7 @@ pub struct ResolvedDep {
     pub version: Version,
     pub src_dir: String,
     pub requires: Vec<String>,
-    pub provenance: Provenance,
+    pub provenance: ProvenanceRecord,
 }
 
 /// The resolved dependency graph — the resolver's output, the emitters' input.

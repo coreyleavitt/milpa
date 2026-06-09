@@ -48,8 +48,16 @@ pub struct Outputs {
 /// What a `Target` produced for a non-error run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Produced {
-    /// A success run with byte-diffable outputs (the `resolve`/`frozen` path).
+    /// A success run with byte-diffable outputs (the single-package
+    /// `resolve`/`frozen` path).
     Outputs(Outputs),
+    /// A workspace success run: a shared `milpa.lock` + one `nim.cfg` per member
+    /// (keyed by the member's workspace-relative path). There is no root
+    /// `nim.cfg` (lockfile §7.6 / P1).
+    WorkspaceOutputs {
+        lock_text: String,
+        member_nimcfgs: Vec<(String, String)>,
+    },
     /// A `cmd=parse-lockfile` run that did not error. The spec defines no
     /// success variant for `parse-lockfile` (§2.7), so a fixture reaching this
     /// is an authoring error, surfaced as a failure by `run_fixture`.
@@ -102,7 +110,47 @@ pub fn run_fixture(fx: &Fixture, target: &dyn Target, scratch: &Scratch) -> Verd
                 .to_string(),
         ),
         (Expected::Success, Ok(Produced::Outputs(out))) => diff_success(fx, scratch, &out),
+        (
+            Expected::Success,
+            Ok(Produced::WorkspaceOutputs {
+                lock_text,
+                member_nimcfgs,
+            }),
+        ) => diff_workspace_success(fx, scratch, &lock_text, &member_nimcfgs),
     }
+}
+
+/// Byte-diff a workspace success: the shared `milpa.lock`, each member's
+/// `expected/<path>/nim.cfg`, and `_deps_structure.txt` (members are not
+/// symlinked into `_deps/`, so it reflects only external deps).
+fn diff_workspace_success(
+    fx: &Fixture,
+    scratch: &Scratch,
+    lock_text: &str,
+    member_nimcfgs: &[(String, String)],
+) -> Verdict {
+    let expected = fx.dir.join("expected");
+    if let Some(fail) = diff_file(&expected.join("milpa.lock"), lock_text, "milpa.lock") {
+        return fail;
+    }
+    for (path, text) in member_nimcfgs {
+        let label = format!("{path}/nim.cfg");
+        if let Some(fail) = diff_file(&expected.join(path).join("nim.cfg"), text, &label) {
+            return fail;
+        }
+    }
+    let got_structure = match read_deps_structure(&scratch.deps_dir, &scratch.cas_root) {
+        Ok(s) => s,
+        Err(e) => return Verdict::Fail(format!("reading _deps structure: {e}")),
+    };
+    if let Some(fail) = diff_file(
+        &expected.join("_deps_structure.txt"),
+        &got_structure,
+        "_deps_structure.txt",
+    ) {
+        return fail;
+    }
+    Verdict::Pass
 }
 
 /// Byte-diff the three success outputs against `expected/`.
@@ -181,16 +229,10 @@ pub fn read_deps_structure(deps_dir: &Path, cas_root: &Path) -> std::io::Result<
 }
 
 /// The real implementation under test: delegates to `milpa-core`. Wired
-/// **incrementally** — at S2 every path returns the not-wired sentinel, so the
-/// whole real corpus fails (all entries live in `known_failing.txt`). Each
-/// later slice replaces one arm with the real `milpa-core` call, at which point
-/// its fixtures green and leave the known-failing list.
+/// **incrementally** — at S2 every path returned a not-wired sentinel; by S11b
+/// all three `cmd` paths (parse-lockfile / resolve / frozen, single-package and
+/// workspace) delegate to real `milpa-core` calls.
 pub struct MilpaTarget;
-
-/// Sentinel returned by not-yet-wired `MilpaTarget` arms. Not a `docs/spec`
-/// slug (the parity check only enumerates real domain-enum codes), so it can
-/// never accidentally satisfy an `expected/error` fixture.
-const NOT_WIRED: &str = "E2E-NOT-WIRED";
 
 impl Target for MilpaTarget {
     fn execute(&self, fx: &Fixture, scratch: &Scratch) -> Result<Produced, String> {
@@ -218,21 +260,6 @@ impl Target for MilpaTarget {
             Cmd::Resolve => {
                 let text = std::fs::read_to_string(fx.dir.join("milpa.kdl"))
                     .map_err(|e| format!("E2E-MANIFEST-UNREADABLE: {e}"))?;
-                let manifest = match milpa_core::parse_document(&text) {
-                    // S11a: load + structurally validate the workspace (surfaces
-                    // WS-* topology errors). The multi-member union *resolve* +
-                    // per-member nim.cfg is S11b, so a structurally-valid
-                    // workspace still falls through to NOT_WIRED.
-                    Ok(ManifestDoc::Workspace(_)) => {
-                        return match milpa_core::load_workspace(&fx.dir) {
-                            Ok(_w) => Err(NOT_WIRED.to_string()),
-                            Err(e) => Err(e.code().to_string()),
-                        };
-                    }
-                    Ok(ManifestDoc::Package(m)) => m,
-                    Err(e) => return Err(e.code().to_string()),
-                };
-
                 // Optional tianguis index for named-dep resolution. The parser
                 // surfaces TNG-* trust-boundary errors (schema/unsafe/bad-*).
                 let index = {
@@ -247,6 +274,42 @@ impl Target for MilpaTarget {
                     } else {
                         None
                     }
+                };
+
+                let manifest = match milpa_core::parse_document(&text) {
+                    // Workspace: load (WS-* topology) → multi-member union resolve
+                    // (RES-WS-*) → shared milpa.lock + per-member nim.cfg.
+                    Ok(ManifestDoc::Workspace(_)) => {
+                        let loaded = match milpa_core::load_workspace(&fx.dir) {
+                            Ok(w) => w,
+                            Err(e) => return Err(e.code().to_string()),
+                        };
+                        let fetcher = crate::fake_fetcher::FakeFetcher::new(
+                            fx.dir.join("mocked-fetches"),
+                            scratch.cas_root.clone(),
+                        );
+                        return match milpa_core::resolve_workspace(
+                            &loaded,
+                            index.as_ref(),
+                            &fetcher,
+                            None,
+                            None,
+                            milpa_core::Strategy::default(),
+                            &scratch.deps_dir,
+                        ) {
+                            Ok(graph) => Ok(Produced::WorkspaceOutputs {
+                                lock_text: milpa_core::format_lockfile(&milpa_core::from_graph(
+                                    &graph, "maxver",
+                                )),
+                                member_nimcfgs: milpa_core::format_workspace_nimcfgs(
+                                    &loaded, &graph,
+                                ),
+                            }),
+                            Err(e) => Err(e.code().to_string()),
+                        };
+                    }
+                    Ok(ManifestDoc::Package(m)) => m,
+                    Err(e) => return Err(e.code().to_string()),
                 };
 
                 // The fake fetcher also admits into the scratch CAS and symlinks
@@ -286,9 +349,8 @@ impl Target for MilpaTarget {
             Cmd::Frozen => {
                 let mtext = std::fs::read_to_string(fx.dir.join("milpa.kdl"))
                     .map_err(|e| format!("E2E-MANIFEST-UNREADABLE: {e}"))?;
-                let manifest = match milpa_core::parse_document(&mtext) {
-                    Ok(ManifestDoc::Workspace(_)) => return Err(NOT_WIRED.to_string()),
-                    Ok(ManifestDoc::Package(m)) => m,
+                let doc = match milpa_core::parse_document(&mtext) {
+                    Ok(d) => d,
                     Err(e) => return Err(e.code().to_string()),
                 };
                 let ltext = std::fs::read_to_string(fx.dir.join("milpa.lock"))
@@ -303,6 +365,33 @@ impl Target for MilpaTarget {
                 // standing in for what a prior `milpa fetch` would have populated.
                 let store = milpa_core::CaStore::new(scratch.cas_root.clone());
                 seed_cas(&fx.dir.join("cas-seed"), &store, &scratch.root)?;
+
+                // Workspace-frozen: members are verified by on-disk identity (no
+                // `_deps` symlink), externals come from the CAS.
+                if matches!(doc, ManifestDoc::Workspace(_)) {
+                    let loaded = match milpa_core::load_workspace(&fx.dir) {
+                        Ok(w) => w,
+                        Err(e) => return Err(e.code().to_string()),
+                    };
+                    return match milpa_core::resolve_workspace_frozen(
+                        &loaded,
+                        &lock,
+                        &store,
+                        &scratch.deps_dir,
+                    ) {
+                        Ok(graph) => Ok(Produced::WorkspaceOutputs {
+                            lock_text: milpa_core::format_lockfile(&milpa_core::from_graph(
+                                &graph, "maxver",
+                            )),
+                            member_nimcfgs: milpa_core::format_workspace_nimcfgs(&loaded, &graph),
+                        }),
+                        Err(e) => Err(e.code().to_string()),
+                    };
+                }
+                let manifest = match doc {
+                    ManifestDoc::Package(m) => m,
+                    ManifestDoc::Workspace(_) => unreachable!("handled above"),
+                };
 
                 match milpa_core::Milpa.resolve_frozen(&manifest, &lock, &store, &scratch.deps_dir)
                 {

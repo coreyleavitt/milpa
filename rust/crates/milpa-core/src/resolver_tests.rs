@@ -228,13 +228,13 @@ fn resolve_single_url_dep_no_transitive() {
     assert!(foo.identity.starts_with("sha256:"));
     assert_eq!(foo.identity.len(), "sha256:".len() + 64);
     match &foo.provenance {
-        Provenance::Git {
+        ProvenanceRecord::Git {
             url,
             ref_spec,
             commit_sha,
         } => {
             assert_eq!(url, "https://example.com/foo.git");
-            assert_eq!(ref_spec, "main");
+            assert_eq!(ref_spec.as_deref(), Some("main"));
             assert_eq!(commit_sha.as_deref(), Some("aaa111"));
         }
         other => panic!("expected git provenance, got {other:?}"),
@@ -427,9 +427,9 @@ fn resolve_url_dep_with_override_fetches_override() {
     .unwrap();
     let foo = graph.deps.iter().find(|d| d.name == "foo").unwrap();
     match &foo.provenance {
-        Provenance::Git { url, ref_spec, .. } => {
+        ProvenanceRecord::Git { url, ref_spec, .. } => {
             assert_eq!(url, "https://fork.example.com/foo.git");
-            assert_eq!(ref_spec, "patched");
+            assert_eq!(ref_spec.as_deref(), Some("patched"));
         }
         other => panic!("expected git, got {other:?}"),
     }
@@ -477,7 +477,7 @@ fn resolve_root_override_precedence_suppresses_transitive_provenance() {
     let shared: Vec<_> = graph.deps.iter().filter(|d| d.name == "shared").collect();
     assert_eq!(shared.len(), 1);
     match &shared[0].provenance {
-        Provenance::Git { url, .. } => assert_eq!(url, "https://fork.example.com/shared.git"),
+        ProvenanceRecord::Git { url, .. } => assert_eq!(url, "https://fork.example.com/shared.git"),
         other => panic!("expected git, got {other:?}"),
     }
     assert!(
@@ -599,7 +599,7 @@ fn resolve_local_dep_copies_and_parses() {
     assert_eq!(dep.src_dir, "src");
     match &dep.provenance {
         // The recorded path is the declared relative path, not the absolute copy.
-        Provenance::Local { path } => assert_eq!(path, "liblocal"),
+        ProvenanceRecord::Local { path } => assert_eq!(path, "liblocal"),
         other => panic!("expected local, got {other:?}"),
     }
 }

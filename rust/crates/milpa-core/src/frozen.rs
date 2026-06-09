@@ -5,18 +5,17 @@
 //! `_deps/<name>` → the store and rebuild a [`ResolvedGraph`] from the lockfile.
 //! Any precondition failure is a coded `FROZEN-*` disqualification.
 //!
-//! This is the **single-package** path. `resolve_workspace_frozen` and its two
-//! workspace-member disqualifications (`FROZEN-MEMBER-NOT-IN-WORKSPACE` /
-//! `FROZEN-MEMBER-IDENTITY-DRIFT`) need the workspace member loader and land in
-//! S11. `FROZEN-LEGACY-REGISTRY-PROVENANCE` is raised here (and from the
-//! workspace path in S11) — a legacy registry record has no fetchable URL, so
-//! the frozen path cannot honor it.
+//! Both the single-package [`resolve_frozen`] and the [`resolve_workspace_frozen`]
+//! paths live here; the latter adds the workspace-member disqualifications
+//! (`FROZEN-MEMBER-NOT-IN-WORKSPACE` / `FROZEN-MEMBER-IDENTITY-DRIFT`).
+//! `FROZEN-LEGACY-REGISTRY-PROVENANCE` is raised from both — a legacy registry
+//! record has no fetchable URL, so the frozen path cannot honor it.
 
 use std::path::Path;
 
 use milpa_manifest::{Dep, Manifest};
 use milpa_solver::{parse_version, Strategy, VersionSet};
-use milpa_types::{LockedDep, Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph};
+use milpa_types::{LockedDep, Lockfile, ProvenanceRecord, ResolvedDep, ResolvedGraph};
 
 use crate::error::{CoreError, MilpaError};
 use crate::store::CaStore;
@@ -74,6 +73,68 @@ pub fn resolve_frozen(
         }
         link_external(locked, deps_dir, store)?;
         resolved.push(resolved_from_locked(locked)?);
+    }
+    Ok(ResolvedGraph { deps: resolved })
+}
+
+/// Workspace analog of [`resolve_frozen`] (mirrors `frozen.py:resolve_workspace_frozen`).
+///
+/// External deps come from the CAS (symlinked into `deps_dir`); members are
+/// verified against their on-disk `content_hash` and stay in place (no `_deps`
+/// symlink). Disqualifications: strategy mismatch, per-member manifest drift,
+/// a member in the lock not in the workspace (`FROZEN-MEMBER-NOT-IN-WORKSPACE`),
+/// member identity drift (`FROZEN-MEMBER-IDENTITY-DRIFT`), a non-member local
+/// provenance, an external CAS miss, or a legacy registry record.
+pub fn resolve_workspace_frozen(
+    workspace: &crate::workspace::LoadedWorkspace,
+    lock: &Lockfile,
+    store: &CaStore,
+    deps_dir: &Path,
+) -> Result<ResolvedGraph, MilpaError> {
+    check_strategy(Strategy::default(), lock)?;
+    for member in &workspace.members {
+        check_manifest_alignment(&member.manifest, lock)?;
+    }
+    std::fs::create_dir_all(deps_dir).map_err(|e| {
+        frozen(
+            "FROZEN-IDENTITY-NOT-IN-STORE",
+            format!("cannot create deps dir {}: {e}", deps_dir.display()),
+        )
+    })?;
+
+    let mut resolved: Vec<ResolvedDep> = Vec::new();
+    for locked in &lock.deps {
+        match locked.provenances.first() {
+            Some(ProvenanceRecord::Member { name }) => {
+                let Some(member) = workspace.members.iter().find(|m| &m.name == name) else {
+                    return Err(frozen(
+                        "FROZEN-MEMBER-NOT-IN-WORKSPACE",
+                        format!("lockfile references workspace member {name:?} not in the current workspace"),
+                    ));
+                };
+                let actual = crate::compute_content_hash(&member.directory)?;
+                if Some(actual.as_str()) != locked.identity.as_deref() {
+                    return Err(frozen(
+                        "FROZEN-MEMBER-IDENTITY-DRIFT",
+                        format!("member {name:?}: on-disk identity differs from the lockfile pin"),
+                    ));
+                }
+                resolved.push(resolved_from_locked(locked)?);
+            }
+            Some(ProvenanceRecord::Local { .. }) => {
+                return Err(frozen(
+                    "FROZEN-LOCAL-DEP",
+                    format!(
+                        "dep {:?} has a local provenance — editable trees always re-resolve",
+                        locked.name
+                    ),
+                ));
+            }
+            _ => {
+                link_external(locked, deps_dir, store)?;
+                resolved.push(resolved_from_locked(locked)?);
+            }
+        }
     }
     Ok(ResolvedGraph { deps: resolved })
 }
@@ -188,37 +249,17 @@ fn resolved_from_locked(locked: &LockedDep) -> Result<ResolvedDep, MilpaError> {
     })
 }
 
-/// Map a lockfile [`ProvenanceRecord`] back to a transport [`Provenance`] for the
-/// resolved graph. `Registry` → `FROZEN-LEGACY-REGISTRY-PROVENANCE` (no fetchable
-/// URL); `Member`/`Local`/`None` are unreachable on this path.
+/// The emission-level provenance record for a resolved dep — `ResolvedDep` now
+/// carries the record directly, so this is the lockfile record itself, with two
+/// guards: a `Registry` record is the legacy disqualification
+/// (`FROZEN-LEGACY-REGISTRY-PROVENANCE` — no fetchable URL), and a missing record
+/// is a malformed lockfile dep. `Member` passes through (workspace-frozen members
+/// keep their member record); single-package `Local`/`Member` bail before here.
 fn provenance_from_record(
     record: Option<&ProvenanceRecord>,
     name: &str,
-) -> Result<Provenance, MilpaError> {
+) -> Result<ProvenanceRecord, MilpaError> {
     match record {
-        Some(ProvenanceRecord::Git {
-            url,
-            ref_spec,
-            commit_sha,
-        }) => Ok(Provenance::Git {
-            url: url.clone(),
-            ref_spec: ref_spec.clone().unwrap_or_default(),
-            commit_sha: commit_sha.clone(),
-        }),
-        Some(ProvenanceRecord::Tarball { url, sha256 }) => Ok(Provenance::Tarball {
-            url: url.clone(),
-            expected_sha256: sha256.clone(),
-            strip_components: 0,
-        }),
-        Some(ProvenanceRecord::Oci {
-            registry,
-            repository,
-            digest,
-        }) => Ok(Provenance::Oci {
-            registry: registry.clone(),
-            repository: repository.clone(),
-            digest: digest.clone(),
-        }),
         Some(ProvenanceRecord::Registry { .. }) => Err(frozen(
             "FROZEN-LEGACY-REGISTRY-PROVENANCE",
             format!(
@@ -226,11 +267,10 @@ fn provenance_from_record(
                  run `milpa update {name}` to re-resolve via the tianguis index"
             ),
         )),
-        // Member/Local bail before this point in resolve_frozen; a None record is
-        // a malformed lockfile dep (the parser requires a provenance kind).
-        other => Err(frozen(
+        Some(rec) => Ok(rec.clone()),
+        None => Err(frozen(
             "FROZEN-IDENTITY-NOT-IN-STORE",
-            format!("dep {name:?}: unexpected provenance {other:?} on the frozen path"),
+            format!("dep {name:?}: lockfile entry has no provenance record"),
         )),
     }
 }
