@@ -137,9 +137,7 @@ pub fn resolve(
     // BFS queue. dev_deps for the ROOT are enrolled here alongside deps (§9);
     // transitive deps never read dev_deps.
     let queue = provider.seed_root(manifest)?;
-    for item in queue {
-        provider.process_item(item)?;
-    }
+    provider.process_items(queue)?;
 
     // Content-hash dedup/alias for eagerly-materialized candidates (Phase B, #32).
     provider.finalize();
@@ -284,9 +282,7 @@ pub fn resolve_workspace(
         prior,
     );
     let queue = provider.seed_workspace(workspace, profile)?;
-    for item in queue {
-        provider.process_item(item)?;
-    }
+    provider.process_items(queue)?;
     provider.finalize();
     let solution = solve(&provider, ROOT, root_version(), strategy)?;
     if let Some(e) = provider.take_error() {
@@ -672,25 +668,47 @@ impl<'a> ResolveProvider<'a> {
     }
 
     /// Apply overrides, run the precedence gate, and dispatch one item.
-    fn process_item(&self, item: Item) -> Result<(), MilpaError> {
-        let item = self.apply_override(item);
-
-        match self.gate(&item) {
-            Gate::Suppress => return Ok(()),
-            Gate::Conflict(a, b) => {
-                return Err(res_err(
-                    "RES-PROVENANCE-CONFLICT",
-                    format!(
-                        "provenance conflict for package {:?}: one transitive dep claims {a:?} \
-                         and another claims {b:?}; the root manifest does not override it. \
-                         Add an override to resolve which source to use.",
-                        item.name()
-                    ),
-                ));
+    /// Process a batch of newly-discovered items: **gate every item first** —
+    /// so a provenance conflict between two sibling items (e.g. a parent that
+    /// `requires` the same name from two different URLs) raises
+    /// `RES-PROVENANCE-CONFLICT` *before* any fetch is attempted — then dispatch
+    /// the survivors. Gating before fetching is what makes the conflict win over
+    /// an unrelated fetch failure of the first sibling (resolver-semantics §10).
+    fn process_items(&self, items: Vec<Item>) -> Result<(), MilpaError> {
+        let mut survivors: Vec<Item> = Vec::new();
+        for item in items {
+            if let Some(gated) = self.gate_only(item)? {
+                survivors.push(gated);
             }
-            Gate::Proceed => {}
         }
+        for item in survivors {
+            self.dispatch(item)?;
+        }
+        Ok(())
+    }
 
+    /// Apply overrides then the precedence gate to one item. Returns the
+    /// (override-rewritten) item to dispatch, `None` if suppressed, or
+    /// `RES-PROVENANCE-CONFLICT`.
+    fn gate_only(&self, item: Item) -> Result<Option<Item>, MilpaError> {
+        let item = self.apply_override(item);
+        match self.gate(&item) {
+            Gate::Suppress => Ok(None),
+            Gate::Conflict(a, b) => Err(res_err(
+                "RES-PROVENANCE-CONFLICT",
+                format!(
+                    "provenance conflict for package {:?}: one transitive dep claims {a:?} \
+                     and another claims {b:?}; the root manifest does not override it. \
+                     Add an override to resolve which source to use.",
+                    item.name()
+                ),
+            )),
+            Gate::Proceed => Ok(Some(item)),
+        }
+    }
+
+    /// Dispatch an already-gated item to its transport worker (no re-gating).
+    fn dispatch(&self, item: Item) -> Result<(), MilpaError> {
         match item {
             Item::Url(dep) => self.process_url(dep),
             Item::Local(dep) => self.process_local(dep),
@@ -786,9 +804,7 @@ impl<'a> ResolveProvider<'a> {
             }),
         });
 
-        for it in sub_items {
-            self.process_item(it)?;
-        }
+        self.process_items(sub_items)?;
         Ok(())
     }
 
@@ -822,9 +838,7 @@ impl<'a> ResolveProvider<'a> {
                 path: dep.path.clone(),
             }),
         });
-        for it in sub_items {
-            self.process_item(it)?;
-        }
+        self.process_items(sub_items)?;
         Ok(())
     }
 
@@ -859,9 +873,7 @@ impl<'a> ResolveProvider<'a> {
                 sha256: dep.sha256.clone(),
             }),
         });
-        for it in sub_items {
-            self.process_item(it)?;
-        }
+        self.process_items(sub_items)?;
         Ok(())
     }
 
@@ -953,9 +965,7 @@ impl<'a> ResolveProvider<'a> {
             .map(|m| m.remove(version));
         // Enroll transitives discovered in this named dep (URL fetched eagerly;
         // named enrolled as stubs) so the solver can continue without a restart.
-        for it in sub_items {
-            self.process_item(it)?;
-        }
+        self.process_items(sub_items)?;
         Ok(deps)
     }
 
