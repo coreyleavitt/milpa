@@ -19,6 +19,7 @@ pub mod error;
 pub mod fetch;
 pub mod frozen;
 pub mod identity;
+pub mod index_cache;
 pub mod lockfile;
 pub mod manifest_writer;
 pub mod nimcfg;
@@ -29,6 +30,7 @@ pub mod workspace;
 
 pub use discovery::{discover_manifest, load_manifest};
 pub use error::{CoreError, MilpaError};
+pub use index_cache::{index_url_from_env, load_index, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS};
 pub use lockfile::{
     format_lockfile, from_graph, load_lockfile, parse_lockfile, verify_against_graph,
     verify_lockfile_against_deps, write_lockfile,
