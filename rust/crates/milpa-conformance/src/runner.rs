@@ -193,7 +193,9 @@ pub struct MilpaTarget;
 const NOT_WIRED: &str = "E2E-NOT-WIRED";
 
 impl Target for MilpaTarget {
-    fn execute(&self, fx: &Fixture, _scratch: &Scratch) -> Result<Produced, String> {
+    fn execute(&self, fx: &Fixture, scratch: &Scratch) -> Result<Produced, String> {
+        use milpa_core::{ManifestDoc, Resolver};
+
         match fx.cmd {
             // S5a: parse the fixture's `milpa.lock` and surface any LOCK-* code.
             // A clean parse yields no byte-diff outputs (`parse-lockfile` has no
@@ -207,17 +209,50 @@ impl Target for MilpaTarget {
                     Err(e) => Err(e.code().to_string()),
                 }
             }
-            // S3 wires manifest parsing — the first stage of the resolve path.
-            // A malformed manifest surfaces its `MAN-*` code here (greening the
-            // 62 parse-error fixtures, which fail before any fetch/solve). A
-            // *valid* manifest falls through to the not-yet-wired tail (S4
-            // identity/CAS → S6 version → S7 solve → S5b lock emit → S9
-            // nim.cfg), so success/resolve-error fixtures stay parked.
+            // The resolve path: parse `milpa.kdl` (MAN-* on malformed), parse the
+            // optional `index.kdl` (TNG-* parse validators), then resolve against
+            // the `mocked-fetches/` fake. A *valid* resolve falls through to the
+            // not-yet-wired tail (S9 nim.cfg + lock emission produce the byte-diff
+            // outputs), so success fixtures stay parked until S9; resolve-time
+            // error fixtures (TNG-*/RES-*/SOLVE-*) green here.
             Cmd::Resolve => {
                 let text = std::fs::read_to_string(fx.dir.join("milpa.kdl"))
                     .map_err(|e| format!("E2E-MANIFEST-UNREADABLE: {e}"))?;
-                match milpa_core::parse_document(&text) {
-                    Ok(_doc) => Err(NOT_WIRED.to_string()),
+                let manifest = match milpa_core::parse_document(&text) {
+                    // Workspace resolution (multi-member) is S11; leave parked.
+                    Ok(ManifestDoc::Workspace(_)) => return Err(NOT_WIRED.to_string()),
+                    Ok(ManifestDoc::Package(m)) => m,
+                    Err(e) => return Err(e.code().to_string()),
+                };
+
+                // Optional tianguis index for named-dep resolution. The parser
+                // surfaces TNG-* trust-boundary errors (schema/unsafe/bad-*).
+                let index = {
+                    let p = fx.dir.join("index.kdl");
+                    if p.is_file() {
+                        let itext = std::fs::read_to_string(&p)
+                            .map_err(|e| format!("E2E-INDEX-UNREADABLE: {e}"))?;
+                        match milpa_core::Index::parse(&itext) {
+                            Ok(i) => Some(i),
+                            Err(e) => return Err(e.code().to_string()),
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                let fetcher = crate::fake_fetcher::FakeFetcher::new(fx.dir.join("mocked-fetches"));
+                match milpa_core::Milpa.resolve(
+                    &manifest,
+                    index.as_ref(),
+                    &fetcher,
+                    None,
+                    None,
+                    &scratch.deps_dir,
+                ) {
+                    // nim.cfg + milpa.lock emission (the byte-diff outputs) are
+                    // wired in S9; a clean resolve has no outputs to diff yet.
+                    Ok(_graph) => Err(NOT_WIRED.to_string()),
                     Err(e) => Err(e.code().to_string()),
                 }
             }

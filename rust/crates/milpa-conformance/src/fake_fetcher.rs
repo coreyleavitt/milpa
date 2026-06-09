@@ -14,7 +14,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use milpa_core::{FetchError, Fetcher, Receipt};
+use milpa_core::{FetchError, Fetcher, FetcherRegistry, Receipt};
 use milpa_types::Provenance;
 
 use crate::urlkey::url_key;
@@ -104,6 +104,16 @@ impl Fetcher for FakeFetcher {
     }
 }
 
+/// The fake mocks every transport from one `mocked-fetches/` tree, so it *is*
+/// the whole registry in a fixture run — there is nothing to dispatch between.
+/// (The real `FetcherRegistry` that routes a `Provenance` to a per-transport
+/// `Fetcher` lands in S14, where the real transports it dispatches to exist.)
+impl FetcherRegistry for FakeFetcher {
+    fn fetch(&self, name: &str, p: &Provenance, dest: &Path) -> Result<Receipt, FetchError> {
+        Fetcher::fetch(self, name, p, dest)
+    }
+}
+
 /// Recursively copy the contents of `src` into `dst` (both must be dirs).
 fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
@@ -146,7 +156,7 @@ mod tests {
             ref_spec: "main".into(),
             commit_sha: None,
         };
-        let receipt = fetcher.fetch("foo", &p, &dest).unwrap();
+        let receipt = Fetcher::fetch(&fetcher, "foo", &p, &dest).unwrap();
 
         assert_eq!(
             receipt.resolved_ref.as_deref(),
@@ -168,9 +178,7 @@ mod tests {
             ref_spec: "main".into(),
             commit_sha: None,
         };
-        let err = fetcher
-            .fetch("x", &p, &tmp.path().join("dest"))
-            .unwrap_err();
+        let err = Fetcher::fetch(&fetcher, "x", &p, &tmp.path().join("dest")).unwrap_err();
         assert_eq!(err.code(), "FETCH-FAILED");
     }
 }

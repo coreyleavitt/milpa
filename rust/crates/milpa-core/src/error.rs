@@ -93,6 +93,22 @@ impl CoreError {
             // workspace RES-WS-* codes wire with the workspace path in S11.
             "RES-NO-INDEX",
             "RES-PROVENANCE-CONFLICT",
+            // tianguis index reader (registry-protocol §2–§4) — S8. The parse-
+            // time validators + the resolve-time policy. TNG-BAD-VERSION is in
+            // the catalog but unraised by both impls (reserved); not listed here
+            // since the union enumerates only codes this impl can emit.
+            "TNG-SCHEMA-UNKNOWN",
+            "TNG-UNSAFE-NAME",
+            "TNG-BAD-COMMIT-SHA",
+            "TNG-BAD-OCI-DIGEST",
+            "TNG-UNSAFE-URL",
+            "TNG-UNSAFE-REF",
+            "TNG-UNSAFE-OCI-FIELD",
+            "TNG-NOT-FOUND",
+            "TNG-AMBIGUOUS-NAME",
+            "TNG-NO-SATISFYING-VERSION",
+            "TNG-NO-PROVENANCE",
+            "TNG-NO-IDENTITY",
         ]
     }
 }

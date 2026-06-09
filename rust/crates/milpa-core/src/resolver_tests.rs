@@ -16,7 +16,7 @@ use milpa_types::{
 
 use crate::fetch::{FetchError, FetcherRegistry, Receipt};
 use crate::identity::compute_content_hash;
-use crate::registry::{Index, IndexEntry};
+use crate::registry::{Index, IndexVersion, Package};
 use crate::resolver::resolve;
 
 // --- fake fetcher ----------------------------------------------------------
@@ -331,39 +331,21 @@ fn resolve_named_dep_strategy_selects_version() {
     // index content_hash gates identity; the fake mocks only the selected
     // version's fetch, proving lazy (two-phase) materialization.
     let body = "srcDir = \"src\"\n";
+    let idx_ver = |ver: &str| IndexVersion {
+        version: ver.into(),
+        content_hash: hash_of_nimble("foo", body),
+        provenances: vec![Provenance::Git {
+            url: "https://example.com/foo.git".into(),
+            ref_spec: format!("v{ver}"),
+            commit_sha: None,
+        }],
+    };
     let index = Index {
-        packages: vec![(
-            "foo".to_string(),
-            vec![
-                IndexEntry {
-                    version: "0.4.0".into(),
-                    content_hash: hash_of_nimble("foo", body),
-                    provenance: Provenance::Git {
-                        url: "https://example.com/foo.git".into(),
-                        ref_spec: "v0.4.0".into(),
-                        commit_sha: None,
-                    },
-                },
-                IndexEntry {
-                    version: "0.5.0".into(),
-                    content_hash: hash_of_nimble("foo", body),
-                    provenance: Provenance::Git {
-                        url: "https://example.com/foo.git".into(),
-                        ref_spec: "v0.5.0".into(),
-                        commit_sha: None,
-                    },
-                },
-                IndexEntry {
-                    version: "1.0.0".into(),
-                    content_hash: hash_of_nimble("foo", body),
-                    provenance: Provenance::Git {
-                        url: "https://example.com/foo.git".into(),
-                        ref_spec: "v1.0.0".into(),
-                        commit_sha: None,
-                    },
-                },
-            ],
-        )],
+        packages: vec![Package {
+            name: "foo".to_string(),
+            namespace: String::new(),
+            versions: vec![idx_ver("0.4.0"), idx_ver("0.5.0"), idx_ver("1.0.0")],
+        }],
     };
     let m = manifest(vec![named_dep("foo", Some(">= 0.4.0"))]);
 

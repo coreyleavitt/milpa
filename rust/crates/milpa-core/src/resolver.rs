@@ -35,7 +35,7 @@ use milpa_types::{Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedG
 use crate::error::{CoreError, MilpaError};
 use crate::fetch::{FetchError, FetcherRegistry};
 use crate::identity::compute_content_hash;
-use crate::registry::{Index, IndexEntry};
+use crate::registry::{Index, IndexVersion};
 
 /// Canonical version for URL/local/tarball/member deps (resolver-semantics §3):
 /// such deps are version-unique by identity, so they enter the solver as a
@@ -265,7 +265,7 @@ struct ResolveProvider<'a> {
     root_authority: BTreeSet<String>,
 
     candidates: RefCell<BTreeMap<String, BTreeMap<Version, Candidate>>>,
-    stubs: RefCell<BTreeMap<String, BTreeMap<Version, IndexEntry>>>,
+    stubs: RefCell<BTreeMap<String, BTreeMap<Version, IndexVersion>>>,
 
     seen_url: RefCell<BTreeSet<(String, String)>>,
     seen_named: RefCell<BTreeSet<String>>,
@@ -599,9 +599,18 @@ impl<'a> ResolveProvider<'a> {
         if !self.seen_named.borrow_mut().insert(name.to_string()) {
             return Ok(());
         }
-        let entries = self.index_entries_for(name, constraint)?;
-        let mut by_ver: BTreeMap<Version, IndexEntry> = BTreeMap::new();
-        for e in entries {
+        // Phase A enumerate: the index applies the full resolve-time policy
+        // (TNG-NOT-FOUND / TNG-AMBIGUOUS-NAME / TNG-NO-SATISFYING-VERSION /
+        // TNG-NO-PROVENANCE) and returns every satisfying version newest-first.
+        // The constraint is already validated upstream (seed_root / build_from_*
+        // call `from_constraint`), so this parse is defensive.
+        let vs = from_constraint(constraint)?;
+        let versions = self
+            .index
+            .resolve_named_all(name, &vs, constraint)
+            .map_err(MilpaError::from)?;
+        let mut by_ver: BTreeMap<Version, IndexVersion> = BTreeMap::new();
+        for e in versions {
             if let Some(v) = parse_version(&e.version) {
                 by_ver.insert(v, e);
             }
@@ -621,19 +630,29 @@ impl<'a> ResolveProvider<'a> {
         &self,
         name: &str,
         version: &Version,
-        entry: &IndexEntry,
+        entry: &IndexVersion,
     ) -> Result<Vec<SolverDep>, MilpaError> {
+        // Identity gate (registry-protocol §4): the index content_hash is the
+        // trust root for a named dep. A version with no identity cannot have its
+        // fetched bytes verified, so it is refused before any fetch is attempted.
+        if entry.content_hash.is_empty() {
+            return Err(MilpaError::Core(CoreError::Tianguis(
+                "TNG-NO-IDENTITY",
+                format!(
+                    "index entry for {name:?} version {:?} carries no content_hash \
+                     — cannot verify fetched bytes (malformed index entry)",
+                    entry.version
+                ),
+            )));
+        }
         let dest = self.deps_dir.join(name);
-        let expected = if entry.content_hash.is_empty() {
-            None
-        } else {
-            Some(entry.content_hash.as_str())
-        };
+        // The index provenances are preference-ordered (canonical, then mirrors);
+        // fetch_any tries them in order, identity-gated on the content_hash.
         let (identity, _ref) = self.fetch_any(
             name,
-            std::slice::from_ref(&entry.provenance),
+            &entry.provenances,
             &dest,
-            expected,
+            Some(entry.content_hash.as_str()),
         )?;
         let (deps, requires, src_dir, sub_items) = self.extract_requires(&dest, name)?;
         let candidate = Candidate {
@@ -643,7 +662,8 @@ impl<'a> ResolveProvider<'a> {
             src_dir,
             requires_names: requires,
             deps: deps.clone(),
-            provenance: Some(entry.provenance.clone()),
+            // Record the canonical (first) provenance for emission.
+            provenance: entry.provenances.first().cloned(),
         };
         self.store_candidate(candidate);
         self.stubs
@@ -858,29 +878,6 @@ impl<'a> ResolveProvider<'a> {
             .and_then(|p| p.deps.iter().find(|d| d.name == name))
             .map(|d| d.self_mirrors.clone())
             .unwrap_or_default()
-    }
-
-    // --- index -------------------------------------------------------------
-
-    /// Index entries for `name` satisfying `constraint` (parseable versions only).
-    fn index_entries_for(
-        &self,
-        name: &str,
-        constraint: Option<&str>,
-    ) -> Result<Vec<IndexEntry>, MilpaError> {
-        let Some((_, entries)) = self.index.packages.iter().find(|(n, _)| n == name) else {
-            return Ok(Vec::new());
-        };
-        let vs = from_constraint(constraint)?;
-        let mut out = Vec::new();
-        for e in entries {
-            if let Some(v) = parse_version(&e.version) {
-                if vs.contains(&v) {
-                    out.push(e.clone());
-                }
-            }
-        }
-        Ok(out)
     }
 
     // --- finalize / graph --------------------------------------------------
