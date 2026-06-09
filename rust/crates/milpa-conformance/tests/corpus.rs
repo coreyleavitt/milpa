@@ -118,11 +118,8 @@ fn spec_error_codes() -> BTreeSet<String> {
 /// (modulo [`EXEMPT`]). This is the honest S12 "bijection lint": every spec code
 /// has exactly one home — implemented, deferred-to-a-known-slice, or exempt.
 const DEFERRED: &[&str] = &[
-    // S13b/S13c — the manifest-mutating verbs (add/remove/update) + format_manifest.
+    // S13d — `add --mirror` (needs fetching both URLs to compare identities).
     "MAN-ADD-MIRROR-IDENTITY-MISMATCH",
-    "MAN-MUTATE-FILE-NOT-FOUND",
-    "MAN-MUTATE-NIMBLE-REFUSED",
-    "MAN-MUTATE-WORKSPACE-REFUSED",
     // S14 — real transport fetchers + safe tarball extraction.
     "FETCH-DOWNLOAD-FAILED",
     "FETCH-EXTRACT-FAILED",

@@ -16,7 +16,10 @@ use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 
 use milpa_types::Version;
 
+pub mod format;
 pub mod nimble;
+
+pub use format::format_manifest;
 
 /// Highest manifest spec-version epoch this implementation understands
 /// (grammar §4.4). Bumped only for breaking semantic changes; additive
@@ -244,6 +247,10 @@ const MAN_CODES: &[&str] = &[
     "MAN-FILE-UNREADABLE",
     "MAN-NO-MANIFEST",
     "MAN-NIMBLE-AMBIGUOUS",
+    // Manifest mutation (milpa-core `manifest_writer`) — S13.
+    "MAN-MUTATE-FILE-NOT-FOUND",
+    "MAN-MUTATE-NIMBLE-REFUSED",
+    "MAN-MUTATE-WORKSPACE-REFUSED",
     "MAN-URL-ARG-TYPE",
     "MAN-UNKNOWN-TOP-LEVEL",
     "MAN-NAME-MISSING",
