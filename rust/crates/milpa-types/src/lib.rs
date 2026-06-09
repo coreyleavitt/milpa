@@ -18,6 +18,7 @@
 //! (`parse_version`, `VersionSet`, the solver) still lives in `milpa-solver`.
 
 use std::cmp::Ordering;
+use std::fmt;
 
 /// One identifier in a semver pre-release tag (semver 2.0 §9).
 ///
@@ -97,6 +98,33 @@ impl Ord for Version {
 impl PartialOrd for Version {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+/// The canonical semver string `major.minor.patch[-pre][+build]`. This is the
+/// single source of truth for rendering a [`Version`] — `milpa-solver`'s
+/// `format_version_str` delegates here, and the `pubgrub` traits (which bound
+/// `V: Display`) consume it. Like `Ord`/`Eq`, a value type's string form is part
+/// of its data-model definition and the orphan rule keeps the impl in this crate.
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        if !self.pre.is_empty() {
+            f.write_str("-")?;
+            for (i, id) in self.pre.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(".")?;
+                }
+                match id {
+                    PreId::Numeric(n) => write!(f, "{n}")?,
+                    PreId::Alpha(a) => f.write_str(a)?,
+                }
+            }
+        }
+        if !self.build.is_empty() {
+            write!(f, "+{}", self.build)?;
+        }
+        Ok(())
     }
 }
 
@@ -296,6 +324,17 @@ mod tests {
         plain.hash(&mut h1);
         built.hash(&mut h2);
         assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    fn display_renders_canonical_semver_string() {
+        assert_eq!(Version::release(1, 2, 3).to_string(), "1.2.3");
+        let full = Version {
+            pre: vec![PreId::Alpha("rc".into()), PreId::Numeric(1)],
+            build: "build.9".into(),
+            ..Version::release(2, 3, 4)
+        };
+        assert_eq!(full.to_string(), "2.3.4-rc.1+build.9");
     }
 
     #[test]

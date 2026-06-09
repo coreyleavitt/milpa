@@ -148,25 +148,12 @@ fn parse_pre_identifiers(pre: &str) -> Option<Vec<PreId>> {
 /// Format a [`Version`] as a lossless semver string `major.minor.patch[-pre][+build]`
 /// (mirrors `milpa/solver.py:_format_version_str`). The inverse of
 /// [`parse_version`] modulo a dropped `v` prefix and leading-zero normalization.
+///
+/// The rendering itself is the `Display` impl on [`Version`] (the SSOT, living in
+/// `milpa-types` because the `pubgrub` trait bounds also need it); this is the
+/// named entry point the lockfile/nim.cfg emitters call.
 pub fn format_version_str(v: &Version) -> String {
-    let mut s = format!("{}.{}.{}", v.major, v.minor, v.patch);
-    if !v.pre.is_empty() {
-        s.push('-');
-        let pre: Vec<String> = v
-            .pre
-            .iter()
-            .map(|id| match id {
-                PreId::Numeric(n) => n.to_string(),
-                PreId::Alpha(a) => a.clone(),
-            })
-            .collect();
-        s.push_str(&pre.join("."));
-    }
-    if !v.build.is_empty() {
-        s.push('+');
-        s.push_str(&v.build);
-    }
-    s
+    v.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -465,6 +452,76 @@ impl VersionSet {
     }
 }
 
+/// Human-readable interval rendering (mirrors `solver.py:_format_set`). Only the
+/// `pubgrub` conflict reporter consumes it, but the trait bound `VS: Display`
+/// makes it mandatory, and a readable form keeps `SOLVE-CONFLICT` narration legible.
+impl std::fmt::Display for VersionSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.intervals.is_empty() {
+            return f.write_str("(empty)");
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for iv in &self.intervals {
+            parts.push(match (&iv.lo, &iv.hi) {
+                (None, None) => "any".to_string(),
+                (None, Some(hi)) => format!("(-∞, {}{}", hi, if iv.hi_closed { ']' } else { ')' }),
+                (Some(lo), None) => format!("{}{}, +∞)", if iv.lo_closed { '[' } else { '(' }, lo),
+                (Some(lo), Some(hi)) if lo == hi && iv.lo_closed && iv.hi_closed => {
+                    format!("{{{lo}}}")
+                }
+                (Some(lo), Some(hi)) => format!(
+                    "{}{}, {}{}",
+                    if iv.lo_closed { '[' } else { '(' },
+                    lo,
+                    hi,
+                    if iv.hi_closed { ']' } else { ')' }
+                ),
+            });
+        }
+        f.write_str(&parts.join(" ∪ "))
+    }
+}
+
+/// Bridge milpa's `VersionSet` into `pubgrub`'s set protocol (the S0(b) seam: the
+/// crate drives resolution, milpa owns the set algebra). The five required
+/// methods delegate to the inherent algebra; `full`/`union`/`subset_of` are
+/// overridden to milpa's canonical implementations so set equality stays exact.
+impl pubgrub::VersionSet for VersionSet {
+    type V = Version;
+
+    fn empty() -> Self {
+        VersionSet::empty()
+    }
+
+    fn singleton(v: Self::V) -> Self {
+        VersionSet::eq(v)
+    }
+
+    fn complement(&self) -> Self {
+        VersionSet::complement(self)
+    }
+
+    fn intersection(&self, other: &Self) -> Self {
+        VersionSet::intersect(self, other)
+    }
+
+    fn contains(&self, v: &Self::V) -> bool {
+        VersionSet::contains(self, v)
+    }
+
+    fn full() -> Self {
+        VersionSet::full()
+    }
+
+    fn union(&self, other: &Self) -> Self {
+        VersionSet::union(self, other)
+    }
+
+    fn subset_of(&self, other: &Self) -> bool {
+        self.is_subset_of(other)
+    }
+}
+
 fn interval_contains(iv: &Interval, v: &Version) -> bool {
     if let Some(lo) = &iv.lo {
         if iv.lo_closed {
@@ -657,13 +714,187 @@ fn split_or(s: &str) -> Vec<&str> {
 }
 
 // ---------------------------------------------------------------------------
-// SolverError — the catalog-coded solve error (S7 wires the PubGrub loop that
-// raises it). Constraint-parse failures use the uncoded `ConstraintError`.
+// Solver core (S7a) — PubGrub via the `pubgrub` 0.4.0 crate.
+//
+// The Python `milpa/solver.py` hand-rolls a teaching-clean PubGrub (Term /
+// Incompatibility / PartialSolution / the unit-propagate loop). The S0(b)
+// decision is to USE the crate here instead, so this slice ports the *contract*
+// — a `PackageProvider` seam, a `solve()` entry point, MaxVer/MinVer/SemVer
+// candidate selection, and a `SOLVE-CONFLICT` error carrying a conflict
+// narration — not the hand-rolled loop. `pubgrub` owns the partial solution,
+// incompatibility learning, backjumping, and the derivation tree.
+// ---------------------------------------------------------------------------
+
+use std::cmp::Reverse;
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+
+/// One dependency edge: a required package plus the version set it is constrained
+/// to. Mirrors a positive `Term` from the Python provider's `dependencies`
+/// (the solver only ever consumes positive requirements; negation is internal to
+/// `pubgrub`). The resolver (S7b) builds these from parsed `.nimble`/`milpa.kdl`
+/// requires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dep {
+    pub package: String,
+    pub constraint: VersionSet,
+}
+
+impl Dep {
+    pub fn new(package: impl Into<String>, constraint: VersionSet) -> Self {
+        Dep {
+            package: package.into(),
+            constraint,
+        }
+    }
+}
+
+/// The two queries the solver makes against the dependency universe (mirrors the
+/// Python `PackageProvider` protocol). The resolver (S7b) supplies a
+/// fetch-backed implementation; tests supply an in-memory one.
+pub trait PackageProvider {
+    /// Every available version of `package` (order irrelevant — the solver
+    /// selects per `Strategy`). An unknown package yields an empty list, which
+    /// the solver reports as "no version of <package>".
+    fn versions(&self, package: &str) -> Vec<Version>;
+
+    /// The dependencies of `package` at `version`.
+    fn dependencies(&self, package: &str, version: &Version) -> Vec<Dep>;
+}
+
+/// Resolve the dependency closure of `(root, root_version)`, returning the chosen
+/// version for every package in the solution (root included). `strategy` governs
+/// candidate selection when more than one version satisfies the accumulated
+/// constraint (resolver-semantics §4.2/§4.3).
+///
+/// Returns [`SolverError::Conflict`] (`SOLVE-CONFLICT`) when the constraints are
+/// unsatisfiable, carrying a human-readable derivation from `pubgrub`'s
+/// derivation tree.
+pub fn solve<P: PackageProvider>(
+    provider: &P,
+    root: &str,
+    root_version: Version,
+    strategy: Strategy,
+) -> Result<BTreeMap<String, Version>, SolverError> {
+    let adapter = ProviderAdapter { provider, strategy };
+    match pubgrub::resolve(&adapter, root.to_string(), root_version) {
+        Ok(selected) => Ok(selected.into_iter().collect()),
+        Err(pubgrub::PubGrubError::NoSolution(mut tree)) => {
+            // Collapse chains of "no versions" derivations into their external
+            // cause so the narration names the exhausted package directly.
+            tree.collapse_no_versions();
+            let prose =
+                <pubgrub::DefaultStringReporter as pubgrub::Reporter<_, _, _>>::report(&tree);
+            Err(SolverError::Conflict(prose))
+        }
+        // The other `PubGrubError` variants only arise when the provider's
+        // associated `Err` is produced — ours is `Infallible`, so these are
+        // unreachable; render defensively rather than panic.
+        Err(other) => Err(SolverError::Conflict(other.to_string())),
+    }
+}
+
+/// Adapts a milpa [`PackageProvider`] + [`Strategy`] into `pubgrub`'s
+/// `DependencyProvider`. Zero-cost: it just routes `pubgrub`'s callbacks to the
+/// milpa queries and applies the strategy in `choose_version`.
+struct ProviderAdapter<'a, P: PackageProvider> {
+    provider: &'a P,
+    strategy: Strategy,
+}
+
+impl<P: PackageProvider> pubgrub::DependencyProvider for ProviderAdapter<'_, P> {
+    type P = String;
+    type V = Version;
+    type VS = VersionSet;
+    type M = String;
+    // Smallest package name → highest priority (the S0(b) BFS-by-name order);
+    // ties are impossible since names are unique, keeping resolution deterministic.
+    type Priority = Reverse<String>;
+    type Err = Infallible;
+
+    fn prioritize(
+        &self,
+        package: &Self::P,
+        _range: &Self::VS,
+        _stats: &pubgrub::PackageResolutionStatistics,
+    ) -> Self::Priority {
+        Reverse(package.clone())
+    }
+
+    fn choose_version(
+        &self,
+        package: &Self::P,
+        range: &Self::VS,
+    ) -> Result<Option<Self::V>, Self::Err> {
+        let candidates: Vec<Version> = self
+            .provider
+            .versions(package)
+            .into_iter()
+            .filter(|v| range.contains(v))
+            .collect();
+        Ok(pick_version(candidates, range, self.strategy))
+    }
+
+    fn get_dependencies(
+        &self,
+        package: &Self::P,
+        version: &Self::V,
+    ) -> Result<pubgrub::Dependencies<Self::P, Self::VS, Self::M>, Self::Err> {
+        // `DependencyConstraints` is an ordered (P, VS) list, so merge duplicate
+        // packages here: a package depending on another twice intersects the
+        // constraints (the solver treats both as simultaneous requirements). A
+        // BTreeMap also makes the emitted order deterministic.
+        let mut merged: BTreeMap<String, VersionSet> = BTreeMap::new();
+        for dep in self.provider.dependencies(package, version) {
+            merged
+                .entry(dep.package)
+                .and_modify(|vs| *vs = vs.intersect(&dep.constraint))
+                .or_insert(dep.constraint);
+        }
+        Ok(pubgrub::Dependencies::Available(
+            merged.into_iter().collect(),
+        ))
+    }
+}
+
+/// Pick a version from `candidates` (already filtered to `range`) per `strategy`.
+/// `None` (no candidate) makes `pubgrub` derive a "no versions" conflict and
+/// backtrack — which is also how `SemVer`'s cross-major refusal surfaces.
+fn pick_version(
+    candidates: Vec<Version>,
+    range: &VersionSet,
+    strategy: Strategy,
+) -> Option<Version> {
+    if candidates.is_empty() {
+        return None;
+    }
+    match strategy {
+        Strategy::Maxver => candidates.into_iter().max(),
+        Strategy::Minver => candidates.into_iter().min(),
+        Strategy::Semver => pick_semver(candidates, range),
+    }
+}
+
+/// SemVer: the highest candidate sharing the major of the constraint's lower
+/// bound (resolver-semantics §4.3.1, `_pick_semver`). No lower bound ⇒ fall back
+/// to MaxVer; a lower bound with no same-major candidate ⇒ `None` (refuse the
+/// cross-major jump → `pubgrub` reports the conflict).
+fn pick_semver(candidates: Vec<Version>, range: &VersionSet) -> Option<Version> {
+    match range.lower_bound() {
+        None => candidates.into_iter().max(),
+        Some(lb) => candidates.into_iter().filter(|v| v.major == lb.major).max(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SolverError — the catalog-coded solve error. Constraint-parse failures use
+// the uncoded `ConstraintError`.
 // ---------------------------------------------------------------------------
 
 /// Errors from solving. `SOLVE-CONFLICT` is the only solver code in
-/// `docs/spec/errors.md` (unsatisfiable constraints). The PubGrub loop + the
-/// structured conflict chain it carries land in S7.
+/// `docs/spec/errors.md` (unsatisfiable constraints). The `String` payload is the
+/// `pubgrub` derivation-tree narration (the structured form lives in the tree,
+/// mirroring how the Python impl carries a `ConflictChain`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SolverError {
     /// No assignment satisfies the constraints.
@@ -683,6 +914,16 @@ impl SolverError {
         &["SOLVE-CONFLICT"]
     }
 }
+
+impl std::fmt::Display for SolverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SolverError::Conflict(narration) => f.write_str(narration),
+        }
+    }
+}
+
+impl std::error::Error for SolverError {}
 
 #[cfg(test)]
 mod tests {
@@ -983,5 +1224,297 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- solver core (S7a) -------------------------------------------------
+
+    /// In-test [`PackageProvider`] backed by a static map (mirrors the Python
+    /// `DictProvider`): package → version → its dependency list.
+    /// `(package, [(version, deps)])` — the literal shape the tests build.
+    type ProviderEntry<'a> = (&'a str, Vec<(Version, Vec<Dep>)>);
+
+    struct DictProvider {
+        data: BTreeMap<String, BTreeMap<Version, Vec<Dep>>>,
+    }
+
+    impl DictProvider {
+        fn new(entries: Vec<ProviderEntry<'_>>) -> Self {
+            let mut data = BTreeMap::new();
+            for (pkg, versions) in entries {
+                data.insert(pkg.to_string(), versions.into_iter().collect());
+            }
+            DictProvider { data }
+        }
+    }
+
+    impl PackageProvider for DictProvider {
+        fn versions(&self, package: &str) -> Vec<Version> {
+            self.data
+                .get(package)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default()
+        }
+
+        fn dependencies(&self, package: &str, version: &Version) -> Vec<Dep> {
+            self.data
+                .get(package)
+                .and_then(|m| m.get(version))
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    fn require(package: &str, constraint: &str) -> Dep {
+        Dep::new(
+            package,
+            VersionSet::from_constraint(Some(constraint)).unwrap(),
+        )
+    }
+
+    fn solution(pairs: &[(&str, Version)]) -> BTreeMap<String, Version> {
+        pairs
+            .iter()
+            .map(|(p, v)| (p.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn solve_single_root_no_deps() {
+        let p = DictProvider::new(vec![("root", vec![(v(1, 0, 0), vec![])])]);
+        let sol = solve(&p, "root", v(1, 0, 0), Strategy::Maxver).unwrap();
+        assert_eq!(sol, solution(&[("root", v(1, 0, 0))]));
+    }
+
+    #[test]
+    fn solve_single_named_dep_one_version() {
+        let p = DictProvider::new(vec![
+            (
+                "root",
+                vec![(v(1, 0, 0), vec![Dep::new("foo", VersionSet::full())])],
+            ),
+            ("foo", vec![(v(1, 0, 0), vec![])]),
+        ]);
+        let sol = solve(&p, "root", v(1, 0, 0), Strategy::Maxver).unwrap();
+        assert_eq!(sol, solution(&[("root", v(1, 0, 0)), ("foo", v(1, 0, 0))]));
+    }
+
+    #[test]
+    fn solve_picks_highest_matching_version() {
+        let p = DictProvider::new(vec![
+            ("root", vec![(v(1, 0, 0), vec![require("foo", ">= 0.5.0")])]),
+            (
+                "foo",
+                vec![
+                    (v(0, 4, 0), vec![]),
+                    (v(0, 5, 0), vec![]),
+                    (v(0, 6, 0), vec![]),
+                    (v(1, 0, 0), vec![]),
+                ],
+            ),
+        ]);
+        let sol = solve(&p, "root", v(1, 0, 0), Strategy::Maxver).unwrap();
+        assert_eq!(sol["foo"], v(1, 0, 0));
+    }
+
+    #[test]
+    fn solve_unifies_compatible_constraints_across_packages() {
+        let p = DictProvider::new(vec![
+            (
+                "root",
+                vec![(
+                    v(1, 0, 0),
+                    vec![
+                        Dep::new("a", VersionSet::full()),
+                        Dep::new("b", VersionSet::full()),
+                    ],
+                )],
+            ),
+            ("a", vec![(v(1, 0, 0), vec![require("shared", ">= 0.5.0")])]),
+            ("b", vec![(v(1, 0, 0), vec![require("shared", "< 1.0.0")])]),
+            (
+                "shared",
+                vec![
+                    (v(0, 5, 0), vec![]),
+                    (v(0, 9, 0), vec![]),
+                    (v(1, 0, 0), vec![]),
+                ],
+            ),
+        ]);
+        let sol = solve(&p, "root", v(1, 0, 0), Strategy::Maxver).unwrap();
+        // Intersection [0.5.0, 1.0.0) → highest matching is 0.9.0.
+        assert_eq!(sol["shared"], v(0, 9, 0));
+    }
+
+    #[test]
+    fn solve_incompatible_constraints_conflict_names_package() {
+        let p = DictProvider::new(vec![
+            (
+                "root",
+                vec![(
+                    v(1, 0, 0),
+                    vec![
+                        Dep::new("a", VersionSet::full()),
+                        Dep::new("b", VersionSet::full()),
+                    ],
+                )],
+            ),
+            ("a", vec![(v(1, 0, 0), vec![require("shared", ">= 1.0.0")])]),
+            ("b", vec![(v(1, 0, 0), vec![require("shared", "< 1.0.0")])]),
+            ("shared", vec![(v(0, 9, 0), vec![]), (v(1, 0, 0), vec![])]),
+        ]);
+        let err = solve(&p, "root", v(1, 0, 0), Strategy::Maxver).unwrap_err();
+        assert_eq!(err.code(), "SOLVE-CONFLICT");
+        // The narration (pubgrub's derivation) must implicate the conflict point.
+        let msg = err.to_string();
+        assert!(msg.contains("shared"), "narration must name shared: {msg}");
+    }
+
+    #[test]
+    fn solve_diamond_conflict_narration_names_dependers() {
+        let p = DictProvider::new(vec![
+            (
+                "root",
+                vec![(
+                    v(1, 0, 0),
+                    vec![
+                        Dep::new("a", VersionSet::full()),
+                        Dep::new("b", VersionSet::full()),
+                    ],
+                )],
+            ),
+            ("a", vec![(v(1, 0, 0), vec![require("shared", ">= 1.0.0")])]),
+            ("b", vec![(v(1, 0, 0), vec![require("shared", "< 1.0.0")])]),
+            ("shared", vec![(v(0, 9, 0), vec![]), (v(1, 0, 0), vec![])]),
+        ]);
+        let msg = solve(&p, "root", v(1, 0, 0), Strategy::Maxver)
+            .unwrap_err()
+            .to_string();
+        // The diamond's two dependers and the shared consequent all appear.
+        for needle in ["a", "b", "shared"] {
+            assert!(
+                msg.contains(needle),
+                "narration must mention {needle}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn solve_missing_dep_conflict_names_the_dep() {
+        let p = DictProvider::new(vec![(
+            "root",
+            vec![(
+                v(1, 0, 0),
+                vec![Dep::new("missing_pkg", VersionSet::full())],
+            )],
+        )]);
+        let err = solve(&p, "root", v(1, 0, 0), Strategy::Maxver).unwrap_err();
+        assert_eq!(err.code(), "SOLVE-CONFLICT");
+        assert!(
+            err.to_string().contains("missing_pkg"),
+            "narration must name the missing package: {err}"
+        );
+    }
+
+    #[test]
+    fn solve_cycle_resolves_without_hanging() {
+        // a→b→a, each with one version; the cycle resolves.
+        let p = DictProvider::new(vec![
+            (
+                "a",
+                vec![(v(1, 0, 0), vec![Dep::new("b", VersionSet::full())])],
+            ),
+            (
+                "b",
+                vec![(v(1, 0, 0), vec![Dep::new("a", VersionSet::full())])],
+            ),
+        ]);
+        let sol = solve(&p, "a", v(1, 0, 0), Strategy::Maxver).unwrap();
+        assert_eq!(sol, solution(&[("a", v(1, 0, 0)), ("b", v(1, 0, 0))]));
+    }
+
+    #[test]
+    fn solve_backtracks_to_compatible_version() {
+        // a@2 requires b>=2 (no such b); the solver must backtrack to a@1.
+        let p = DictProvider::new(vec![
+            (
+                "root",
+                vec![(v(1, 0, 0), vec![Dep::new("a", VersionSet::full())])],
+            ),
+            (
+                "a",
+                vec![
+                    (v(1, 0, 0), vec![require("b", ">= 1.0.0")]),
+                    (v(2, 0, 0), vec![require("b", ">= 2.0.0")]),
+                ],
+            ),
+            ("b", vec![(v(1, 0, 0), vec![])]),
+        ]);
+        let sol = solve(&p, "root", v(1, 0, 0), Strategy::Maxver).unwrap();
+        assert_eq!(sol["a"], v(1, 0, 0));
+        assert_eq!(sol["b"], v(1, 0, 0));
+    }
+
+    #[test]
+    fn solve_minver_picks_lowest_satisfying() {
+        let p = DictProvider::new(vec![
+            ("root", vec![(v(1, 0, 0), vec![require("foo", ">= 0.5.0")])]),
+            (
+                "foo",
+                vec![
+                    (v(0, 4, 0), vec![]),
+                    (v(0, 5, 0), vec![]),
+                    (v(0, 6, 0), vec![]),
+                    (v(1, 0, 0), vec![]),
+                ],
+            ),
+        ]);
+        let sol = solve(&p, "root", v(1, 0, 0), Strategy::Minver).unwrap();
+        assert_eq!(sol["foo"], v(0, 5, 0));
+    }
+
+    #[test]
+    fn solve_semver_locks_to_lower_bound_major() {
+        let p = DictProvider::new(vec![
+            ("root", vec![(v(1, 0, 0), vec![require("foo", ">= 1.2.0")])]),
+            (
+                "foo",
+                vec![
+                    (v(1, 2, 0), vec![]),
+                    (v(1, 5, 0), vec![]),
+                    (v(2, 0, 0), vec![]),
+                    (v(2, 3, 0), vec![]),
+                ],
+            ),
+        ]);
+        let sol = solve(&p, "root", v(1, 0, 0), Strategy::Semver).unwrap();
+        assert_eq!(sol["foo"], v(1, 5, 0));
+    }
+
+    #[test]
+    fn solve_semver_unbounded_falls_back_to_maxver() {
+        let p = DictProvider::new(vec![
+            ("root", vec![(v(1, 0, 0), vec![require("foo", "< 5.0.0")])]),
+            (
+                "foo",
+                vec![
+                    (v(1, 0, 0), vec![]),
+                    (v(2, 0, 0), vec![]),
+                    (v(3, 0, 0), vec![]),
+                    (v(4, 0, 0), vec![]),
+                ],
+            ),
+        ]);
+        let sol = solve(&p, "root", v(1, 0, 0), Strategy::Semver).unwrap();
+        assert_eq!(sol["foo"], v(4, 0, 0));
+    }
+
+    #[test]
+    fn solve_semver_rejects_cross_major_only() {
+        let p = DictProvider::new(vec![
+            ("root", vec![(v(1, 0, 0), vec![require("foo", ">= 1.0.0")])]),
+            ("foo", vec![(v(2, 0, 0), vec![]), (v(2, 5, 0), vec![])]),
+        ]);
+        let err = solve(&p, "root", v(1, 0, 0), Strategy::Semver).unwrap_err();
+        assert_eq!(err.code(), "SOLVE-CONFLICT");
     }
 }
