@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/milpa-types",
+    "crates/milpa-solver",
+    "crates/milpa-manifest",
+    "crates/milpa-core",
+    "crates/milpa-cli",
+    "crates/milpa-conformance",
+]
+
+# Shared dependency versions, pinned by the S0 de-risking spikes (RFC §6 S0):
+#   kdl 6.7.1   — parse only (annotation + value reachable; line/col on error)
+#   pubgrub 0.4.0 — DependencyProvider seam; prioritize() = BFS order P
+#   miette 7.6.0  — kdl's diagnostic substrate
+[workspace.dependencies]
+milpa-types = { path = "crates/milpa-types" }
+milpa-solver = { path = "crates/milpa-solver" }
+milpa-manifest = { path = "crates/milpa-manifest" }
+milpa-core = { path = "crates/milpa-core" }
+kdl = "=6.7.1"
+miette = "=7.6.0"
+pubgrub = "=0.4.0"
+sha2 = "0.10"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+publish = false

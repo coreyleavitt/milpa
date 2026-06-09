@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Run cargo for the Rust reference impl inside the pinned toolchain container
+# (RFC §4.1: no host toolchains; podman preferred, docker fallback). The repo
+# root is mounted at /work so the conformance harness can read the shared
+# corpus at /work/tests/conformance via its relative path; cargo runs in
+# /work/rust. Build output lands in rust/target/ (gitignored) on the host.
+#
+#   ./dev-rust build
+#   ./dev-rust test
+#   ./dev-rust test -p milpa-conformance
+#   ./dev-rust clippy --all-targets
+set -euo pipefail
+
+IMAGE="${MILPA_RUST_IMAGE:-ghcr.io/coreyleavitt/milpa-rust:1.96}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if command -v podman >/dev/null 2>&1; then
+    ENGINE=podman
+elif command -v docker >/dev/null 2>&1; then
+    ENGINE=docker
+else
+    echo "dev-rust: need podman or docker on PATH" >&2
+    exit 1
+fi
+
+# Allocate a TTY only when stdin is one (so CI / piped invocations still work).
+TTY_FLAGS=()
+[ -t 0 ] && TTY_FLAGS=(-it)
+
+# Persist cargo's registry/git caches across runs so deps aren't re-downloaded.
+exec "$ENGINE" run --rm "${TTY_FLAGS[@]}" \
+    -v "$REPO_ROOT":/work \
+    -v milpa-cargo-registry:/usr/local/cargo/registry \
+    -w /work/rust \
+    "$IMAGE" \
+    cargo "$@"

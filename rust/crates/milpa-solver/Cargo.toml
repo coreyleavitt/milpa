@@ -1,0 +1,11 @@
+[package]
+name = "milpa-solver"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+milpa-types = { workspace = true }
+pubgrub = { workspace = true }

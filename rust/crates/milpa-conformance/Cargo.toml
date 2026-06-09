@@ -1,0 +1,10 @@
+[package]
+name = "milpa-conformance"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+milpa-core = { workspace = true }

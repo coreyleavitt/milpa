@@ -1,0 +1,46 @@
+# Rust dev image for milpa's reference implementation.
+#
+# Base: openSUSE Tumbleweed (rolling). Toolchain pinned to an exact Rust
+# release via rustup so the container matches rust/rust-toolchain.toml and
+# the RFC's MSRV floor (>= 1.74); 1.96 is the working dev toolchain.
+#
+# Build:  podman build -t ghcr.io/coreyleavitt/milpa-rust:1.96 -f rust/Containerfile rust
+# Run:    podman run --rm -it -v "$PWD":/work -w /work ghcr.io/coreyleavitt/milpa-rust:1.96
+FROM opensuse/tumbleweed:latest
+
+ARG RUST_VERSION=1.96.0
+
+# Build prerequisites: C toolchain for crates with native build scripts,
+# git for cargo's source fetches, pkg-config/openssl for transitive deps,
+# ca-certificates for TLS, plus curl to bootstrap rustup.
+RUN zypper --non-interactive refresh \
+ && zypper --non-interactive install --no-recommends \
+      gcc \
+      gcc-c++ \
+      make \
+      git \
+      curl \
+      tar \
+      gzip \
+      pkg-config \
+      libopenssl-devel \
+      ca-certificates \
+ && zypper clean --all
+
+# rustup + the pinned toolchain, installed system-wide.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y \
+        --no-modify-path \
+        --profile minimal \
+        --default-toolchain "${RUST_VERSION}" \
+        --component rustfmt --component clippy \
+ && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
+
+RUN rustc --version && cargo --version && rustfmt --version && cargo clippy --version
+
+WORKDIR /work
+CMD ["/bin/bash"]

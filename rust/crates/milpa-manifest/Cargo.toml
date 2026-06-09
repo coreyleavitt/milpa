@@ -1,0 +1,12 @@
+[package]
+name = "milpa-manifest"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+milpa-types = { workspace = true }
+kdl = { workspace = true }
+miette = { workspace = true }

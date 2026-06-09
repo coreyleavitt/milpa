@@ -1,0 +1,7 @@
+# Pinned toolchain for the Rust reference implementation (RFC §4.1).
+# Matches rust/Containerfile's ARG RUST_VERSION; MSRV floor is 1.74 (workspace
+# `rust-version`), but the dev/CI toolchain is pinned exact for reproducibility.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

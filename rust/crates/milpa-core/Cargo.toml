@@ -1,0 +1,13 @@
+[package]
+name = "milpa-core"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+milpa-types = { workspace = true }
+milpa-solver = { workspace = true }
+milpa-manifest = { workspace = true }
+sha2 = { workspace = true }

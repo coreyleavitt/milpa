@@ -1,0 +1,4 @@
+# Build output and any in-tree cargo home (RFC §4.1). Everything else under
+# /rust/ is tracked, including Cargo.lock (milpa-cli is a deployable binary).
+/target/
+/.cargo/
