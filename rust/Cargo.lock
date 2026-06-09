@@ -284,6 +284,7 @@ dependencies = [
  "milpa-solver",
  "milpa-types",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]

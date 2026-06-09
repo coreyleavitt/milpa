@@ -33,6 +33,11 @@ pub struct Receipt {
 pub enum FetchError {
     /// Placeholder transport failure (see type docs). Carries no catalog code.
     Failed(String),
+    /// Every mirror candidate failed — network error or identity mismatch on
+    /// all of `fetch_any`'s ordered candidate list (`FETCH-ALL-FAILED`,
+    /// resolver-semantics §8a). Raised by the resolver (S7b), which owns the
+    /// candidate-list construction, but it is a *fetch*-domain outcome.
+    AllFailed(String),
     /// Archive extraction failed / unsafe (`EXTRACT-*`), wired in S14.
     Extract(&'static str, String),
 }
@@ -42,15 +47,17 @@ impl FetchError {
         match self {
             // Non-catalog placeholder until S14 (see type docs).
             FetchError::Failed(_) => "FETCH-FAILED",
+            FetchError::AllFailed(_) => "FETCH-ALL-FAILED",
             FetchError::Extract(c, _) => c,
         }
     }
 
     /// Every *catalog* code this domain can emit (parity companion to `code()`).
-    /// Empty until S14 wires the real `FETCH-*`/`EXTRACT-*` codes — every entry
-    /// added then MUST be a real spec slug.
+    /// `FETCH-ALL-FAILED` is wired at S7b (mirror fallback); the rest of the
+    /// `FETCH-*`/`EXTRACT-*` transport codes land in S14 — every entry added
+    /// MUST be a real spec slug.
     pub fn all_codes() -> &'static [&'static str] {
-        &[]
+        &["FETCH-ALL-FAILED"]
     }
 }
 

@@ -16,6 +16,8 @@ use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 
 use milpa_types::Version;
 
+pub mod nimble;
+
 /// Highest manifest spec-version epoch this implementation understands
 /// (grammar §4.4). Bumped only for breaking semantic changes; additive
 /// evolution stays within an epoch via the P3 forward-unknown properties.
@@ -225,6 +227,11 @@ impl std::error::Error for ManifestError {}
 /// `all_codes()`; ordered roughly by grammar section for auditability.
 const MAN_CODES: &[&str] = &[
     "MAN-KDL-SYNTAX",
+    // Raised by the resolver (S7b) when a transitive `.nimble` `requires`
+    // carries a malformed version constraint — surfaced as a `ManifestError`
+    // (the slug is `MAN-*`) so the boundary stays one domain. Not produced by
+    // the milpa.kdl text parser, but it IS a code this domain emits.
+    "MAN-NIMBLE-CONSTRAINT",
     "MAN-URL-ARG-TYPE",
     "MAN-UNKNOWN-TOP-LEVEL",
     "MAN-NAME-MISSING",

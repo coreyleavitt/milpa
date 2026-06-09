@@ -19,6 +19,7 @@ pub mod fetch;
 pub mod identity;
 pub mod lockfile;
 pub mod registry;
+pub mod resolver;
 pub mod store;
 
 pub use error::{CoreError, MilpaError};
@@ -32,6 +33,7 @@ pub use fetch::{FetchError, Fetcher, FetcherRegistry, Receipt};
 pub use identity::{compute_content_hash, parse_identity, SUPPORTED_ALGORITHMS};
 pub use milpa_manifest::{parse_document, ManifestDoc};
 pub use registry::Index;
+pub use resolver::resolve;
 pub use store::{default_store, CaStore};
 
 /// The union of every error code the Rust implementation can currently emit,
@@ -73,6 +75,34 @@ pub struct Milpa;
 impl LockfileParser for Milpa {
     fn parse_lockfile(&self, text: &str) -> Result<Lockfile, MilpaError> {
         Ok(lockfile::parse_lockfile(text)?)
+    }
+}
+
+impl Resolver for Milpa {
+    fn resolve(
+        &self,
+        m: &Manifest,
+        idx: Option<&Index>,
+        f: &dyn FetcherRegistry,
+        p: Option<&Profile>,
+        prior: Option<&Lockfile>,
+        deps_dir: &Path,
+    ) -> Result<ResolvedGraph, MilpaError> {
+        resolver::resolve_default_strategy(m, idx, f, p, prior, deps_dir)
+    }
+
+    fn resolve_workspace(
+        &self,
+        _w: &Workspace,
+        _idx: Option<&Index>,
+        _f: &dyn FetcherRegistry,
+        _p: Option<&Profile>,
+        _prior: Option<&Lockfile>,
+        _deps_dir: &Path,
+    ) -> Result<ResolvedGraph, MilpaError> {
+        // Workspace resolution (multi-member union, per-member nim.cfg) lands in
+        // S11; the single-package path is the S7b deliverable.
+        unimplemented!("resolve_workspace lands in S11")
     }
 }
 
