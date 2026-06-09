@@ -10,7 +10,10 @@
 //! and defined in `docs/spec/errors.md`.
 
 use kdl::{KdlDocument, KdlNode, KdlValue};
-use milpa_types::{LockedDep, Lockfile, ProvenanceRecord, LOCKFILE_SCHEMA_VERSION};
+use milpa_types::{
+    LockedDep, Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph,
+    LOCKFILE_SCHEMA_VERSION,
+};
 
 use crate::error::CoreError;
 use crate::identity::parse_identity;
@@ -502,6 +505,106 @@ pub fn write_lockfile(
     Ok(path.to_path_buf())
 }
 
+// ---------------------------------------------------------------------------
+// from_graph — bridge ResolvedGraph → canonical Lockfile (S7c emission glue)
+// ---------------------------------------------------------------------------
+
+/// Convert a resolved graph into a canonical [`Lockfile`].
+///
+/// Mirrors `lockfile.py:from_graph` / `_locked_from_resolved` /
+/// `_provenance_from_resolved`. Deps are sorted by name and each dep's
+/// `requires` lexicographically (resolver-semantics §4.4 / lockfile-schema
+/// §3.4): the resolver accumulates both in topological / BFS-arrival order,
+/// which is not a stable cross-implementation key, so the lockfile imposes the
+/// single canonical ordering here — the same graph always renders byte-identical
+/// text. `strategy` records which resolution strategy produced this lockfile.
+///
+/// The four transport [`Provenance`] kinds map onto their [`ProvenanceRecord`]
+/// counterparts. The `Member` and `Registry` records have **no** transport
+/// `Provenance` source — they are produced only by the workspace resolve (S11)
+/// and the legacy read path, never from a resolved graph, so they cannot arise
+/// here.
+pub fn from_graph(graph: &ResolvedGraph, strategy: &str) -> Lockfile {
+    let mut deps: Vec<LockedDep> = graph.deps.iter().map(locked_from_resolved).collect();
+    deps.sort_by(|a, b| a.name.cmp(&b.name));
+    Lockfile {
+        version: LOCKFILE_SCHEMA_VERSION,
+        strategy: strategy.to_string(),
+        deps,
+    }
+}
+
+/// Translate one flat [`ResolvedDep`] into a structured [`LockedDep`].
+fn locked_from_resolved(d: &ResolvedDep) -> LockedDep {
+    let mut requires = d.requires.clone();
+    requires.sort();
+    LockedDep {
+        name: d.name.clone(),
+        // Every dep in a resolved graph is content-hashed; an empty identity
+        // would only be the synthetic root, which `build_graph` already drops.
+        identity: opt(&d.identity),
+        version: d.version.to_string(),
+        src_dir: d.src_dir.clone(),
+        requires,
+        provenances: vec![record_from_provenance(&d.provenance)],
+        // #23 active feature flags and #79 self-mirrors are resolver-enrichment
+        // concerns not yet carried on `ResolvedDep`; emitted empty (the Python
+        // default for deps that declare neither). Threading them through lands
+        // with the feature-flag work that exercises them — no current fixture
+        // resolves a flag-carrying or self-mirroring dep.
+        active_flags: Vec::new(),
+        self_mirrors: Vec::new(),
+    }
+}
+
+/// Reconstruct a lockfile [`ProvenanceRecord`] from a resolved dep's typed
+/// transport [`Provenance`]. Unlike the Python reference (which parses a flat
+/// `source` string), the Rust resolver carries the typed provenance with its
+/// resolved commit/sha already populated, so this is a pure structural map.
+fn record_from_provenance(prov: &Provenance) -> ProvenanceRecord {
+    match prov {
+        Provenance::Git {
+            url,
+            ref_spec,
+            commit_sha,
+        } => ProvenanceRecord::Git {
+            url: url.clone(),
+            ref_spec: opt(ref_spec),
+            commit_sha: commit_sha.clone(),
+        },
+        Provenance::Tarball {
+            url,
+            expected_sha256,
+            ..
+        } => ProvenanceRecord::Tarball {
+            url: url.clone(),
+            // Preserve the declared archive hash (the transport receipt), never
+            // identity (lockfile.py M11).
+            sha256: expected_sha256.clone(),
+        },
+        Provenance::Local { path } => ProvenanceRecord::Local { path: path.clone() },
+        Provenance::Oci {
+            registry,
+            repository,
+            digest,
+        } => ProvenanceRecord::Oci {
+            registry: registry.clone(),
+            repository: repository.clone(),
+            digest: digest.clone(),
+        },
+    }
+}
+
+/// Map a transport field that is `""` when absent onto the lockfile's
+/// "None-when-omitted, never empty string" optional-field convention.
+fn opt(s: &str) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
 // --- kdl-rs access helpers (mirroring milpa-manifest) ---
 
 /// Positional arguments of a node (entries with no property name), in order.
@@ -881,5 +984,182 @@ mod tests {
             load_lockfile(missing).unwrap_err().code(),
             "LOCK-FILE-NOT-FOUND"
         );
+    }
+
+    // --- from_graph (S7c emission glue) ---
+
+    use milpa_types::Version;
+
+    fn rdep(name: &str, prov: Provenance, requires: Vec<&str>) -> ResolvedDep {
+        ResolvedDep {
+            name: name.into(),
+            identity: format!("sha256:{}", "0".repeat(63) + "1"),
+            version: Version::release(0, 0, 1),
+            src_dir: "src".into(),
+            requires: requires.into_iter().map(String::from).collect(),
+            provenance: prov,
+        }
+    }
+
+    fn git(url: &str, ref_spec: &str, sha: Option<&str>) -> Provenance {
+        Provenance::Git {
+            url: url.into(),
+            ref_spec: ref_spec.into(),
+            commit_sha: sha.map(String::from),
+        }
+    }
+
+    #[test]
+    fn from_graph_sorts_deps_by_name_and_requires_lexicographically() {
+        // Graph arrives in topological (non-lexicographic) order; from_graph
+        // must impose the canonical ordering (§4.4).
+        let graph = ResolvedGraph {
+            deps: vec![
+                rdep("zlib", git("https://e/zlib.git", "main", None), vec![]),
+                rdep(
+                    "alpha",
+                    git("https://e/alpha.git", "main", None),
+                    vec!["gamma", "beta"],
+                ),
+            ],
+        };
+        let lock = from_graph(&graph, "maxver");
+        assert_eq!(lock.version, LOCKFILE_SCHEMA_VERSION);
+        assert_eq!(lock.strategy, "maxver");
+        let names: Vec<&str> = lock.deps.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zlib"]);
+        // requires sorted lexicographically, not in arrival order.
+        assert_eq!(lock.deps[0].requires, vec!["beta", "gamma"]);
+    }
+
+    #[test]
+    fn from_graph_records_strategy_and_singleton_version() {
+        let graph = ResolvedGraph {
+            deps: vec![rdep(
+                "foo",
+                git("https://e/foo.git", "v1", Some("deadbeef")),
+                vec![],
+            )],
+        };
+        let lock = from_graph(&graph, "minver");
+        assert_eq!(lock.strategy, "minver");
+        let dep = &lock.deps[0];
+        assert_eq!(dep.version, "0.0.1");
+        assert!(dep.identity.is_some());
+        // Resolver-enrichment fields are emitted empty until the feature work.
+        assert!(dep.active_flags.is_empty());
+        assert!(dep.self_mirrors.is_empty());
+    }
+
+    #[test]
+    fn from_graph_maps_each_transport_provenance_arm() {
+        let graph = ResolvedGraph {
+            deps: vec![
+                rdep("g", git("https://e/g.git", "main", Some("abc123")), vec![]),
+                rdep(
+                    "t",
+                    Provenance::Tarball {
+                        url: "https://e/t.tar.gz".into(),
+                        expected_sha256: Some("sha256:tar".into()),
+                        strip_components: 1,
+                    },
+                    vec![],
+                ),
+                rdep(
+                    "l",
+                    Provenance::Local {
+                        path: "../liba".into(),
+                    },
+                    vec![],
+                ),
+                rdep(
+                    "o",
+                    Provenance::Oci {
+                        registry: "ghcr.io".into(),
+                        repository: "org/pkg".into(),
+                        digest: "sha256:dig".into(),
+                    },
+                    vec![],
+                ),
+            ],
+        };
+        let lock = from_graph(&graph, "maxver");
+        let by_name = |n: &str| {
+            lock.deps
+                .iter()
+                .find(|d| d.name == n)
+                .unwrap()
+                .provenances
+                .clone()
+        };
+        assert_eq!(
+            by_name("g"),
+            vec![ProvenanceRecord::Git {
+                url: "https://e/g.git".into(),
+                ref_spec: Some("main".into()),
+                commit_sha: Some("abc123".into()),
+            }]
+        );
+        assert_eq!(
+            by_name("t"),
+            vec![ProvenanceRecord::Tarball {
+                url: "https://e/t.tar.gz".into(),
+                sha256: Some("sha256:tar".into()),
+            }]
+        );
+        assert_eq!(
+            by_name("l"),
+            vec![ProvenanceRecord::Local {
+                path: "../liba".into()
+            }]
+        );
+        assert_eq!(
+            by_name("o"),
+            vec![ProvenanceRecord::Oci {
+                registry: "ghcr.io".into(),
+                repository: "org/pkg".into(),
+                digest: "sha256:dig".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn from_graph_empty_git_ref_becomes_none() {
+        let graph = ResolvedGraph {
+            deps: vec![rdep("foo", git("https://e/foo.git", "", None), vec![])],
+        };
+        let lock = from_graph(&graph, "maxver");
+        assert_eq!(
+            lock.deps[0].provenances,
+            vec![ProvenanceRecord::Git {
+                url: "https://e/foo.git".into(),
+                ref_spec: None,
+                commit_sha: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn from_graph_output_round_trips_through_format_and_parse() {
+        let graph = ResolvedGraph {
+            deps: vec![
+                rdep(
+                    "beta",
+                    git("https://e/beta.git", "v2", Some("c2")),
+                    vec!["alpha"],
+                ),
+                rdep(
+                    "alpha",
+                    git("https://e/alpha.git", "v1", Some("c1")),
+                    vec![],
+                ),
+            ],
+        };
+        let lock = from_graph(&graph, "maxver");
+        let text = format_lockfile(&lock);
+        let reparsed = parse_lockfile(&text).unwrap();
+        assert_eq!(reparsed, lock);
+        // Canonical: deps sorted, so alpha precedes beta in the emitted text.
+        assert!(text.find("dep \"alpha\"").unwrap() < text.find("dep \"beta\"").unwrap());
     }
 }
