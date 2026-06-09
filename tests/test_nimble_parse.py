@@ -166,6 +166,18 @@ def test_load_nimble_missing_path_raises_with_path(tmp_path: Path):
     with pytest.raises(NimbleParseError) as exc:
         load_nimble(missing)
     assert str(missing) in str(exc.value)
+    assert exc.value.code == "NIMBLE-FILE-NOT-FOUND"
+
+
+def test_load_nimble_unreadable_raises_with_code(tmp_path: Path):
+    """A path that exists but can't be read as a file (here: a directory)
+    raises NIMBLE-FILE-UNREADABLE — load_nimble is the single .nimble
+    reader, so its OS-read failures carry the nimble-layer code."""
+    not_a_file = tmp_path / "dir.nimble"
+    not_a_file.mkdir()
+    with pytest.raises(NimbleParseError) as exc:
+        load_nimble(not_a_file)
+    assert exc.value.code == "NIMBLE-FILE-UNREADABLE"
 
 
 # Integration: real-world fixtures from sibling projects.

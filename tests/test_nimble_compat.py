@@ -222,6 +222,24 @@ def test_malformed_nimble_errors_with_context(tmp_path, capsys):
     assert "myproj.nimble" in err or "manifest" in err.lower()
 
 
+def test_discovery_of_unreadable_nimble_raises_man_file_unreadable(tmp_path):
+    """The discovery layer (load_or_discover_manifest → _load_manifest_from_nimble)
+    delegates the read to load_nimble (the single .nimble reader) and translates
+    its nimble-layer NimbleParseError into the discovery layer's ManifestError
+    contract: an unreadable .nimble surfaces as MAN-FILE-UNREADABLE (the same
+    generic 'manifest unreadable' code milpa.kdl reads use), NOT a leaked
+    NimbleParseError. CLI callers catch `except ManifestError`, so the
+    contract type matters."""
+    from milpa.manifest import ManifestError, load_or_discover_manifest
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "proj.nimble").mkdir()  # exists but not a readable file
+    with pytest.raises(ManifestError) as exc:
+        load_or_discover_manifest(project)
+    assert exc.value.code == "MAN-FILE-UNREADABLE"
+
+
 def test_nimble_with_nim_compiler_requires_is_skipped(tmp_path):
     """`requires \"nim >= 2.0.0\"` is a compiler version constraint, not a
     source dep. milpa drops it at conversion time — handled by the v2

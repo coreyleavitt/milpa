@@ -29,13 +29,21 @@ FILE_NOT_FOUND = register(
 FILE_UNREADABLE = register(
     slug="MAN-FILE-UNREADABLE", category=_CAT,
     description="The manifest file cannot be read (permissions, etc.).",
-    when="OS denies reading the file.",
+    when=(
+        "OS denies reading the manifest file. Covers both milpa.kdl and a "
+        "discovered .nimble: _load_manifest_from_nimble delegates the read to "
+        "load_nimble and translates its NIMBLE-FILE-* IO error to this code."
+    ),
 )
 
 NIMBLE_PARSE_FAILED = register(
     slug="MAN-NIMBLE-PARSE", category=_CAT,
     description="A .nimble fallback file failed to parse.",
-    when="load_or_discover_manifest auto-promotes a .nimble whose nimble_parse raises.",
+    when=(
+        "load_or_discover_manifest auto-promotes a .nimble and load_nimble "
+        "raises a non-IO NimbleParseError. Reserved: parse_nimble is currently "
+        "tolerant and does not raise on content."
+    ),
 )
 
 NIMBLE_AMBIGUOUS = register(

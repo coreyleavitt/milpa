@@ -207,14 +207,12 @@ def test_every_man_code_has_at_least_one_test_that_triggers_it():
     # typically internal defensive raises or extremely rare states.
     # Adding here requires a comment explaining why.
     KNOWN_UNTESTED: set[str] = {
-        # File-IO failures depend on OS-level state (perms, etc.) and
-        # are exercised in production rather than the unit suite.
-        "MAN-FILE-UNREADABLE",
-        # NimbleParseError is currently only raised on file-IO failures
-        # in nimble_parse, which are caught and re-raised as
-        # MAN-FILE-UNREADABLE by _load_manifest_from_nimble. The
-        # MAN-NIMBLE-PARSE code is reserved for future content-level
-        # parse failures.
+        # MAN-NIMBLE-PARSE is reserved for future content-level .nimble
+        # parse validation. _load_manifest_from_nimble maps a non-IO
+        # NimbleParseError from load_nimble to it, but parse_nimble is
+        # currently tolerant and never raises on content, so there is no
+        # trigger yet. (MAN-FILE-UNREADABLE is now directly tested via the
+        # discovery-of-unreadable-.nimble path — see test_nimble_compat.)
         "MAN-NIMBLE-PARSE",
     }
 
@@ -936,10 +934,10 @@ def test_every_nimble_code_has_at_least_one_test_that_triggers_it():
     from pathlib import Path
     from milpa.error_catalog import ERROR_CATALOG
 
-    KNOWN_UNTESTED: set[str] = {
-        # OS-level failure; exercised in production, not unit suite.
-        "NIMBLE-FILE-UNREADABLE",
-    }
+    # Both NIMBLE-FILE-* codes are now directly tested: -NOT-FOUND and
+    # -UNREADABLE via load_nimble (test_nimble_parse), and surfaced through
+    # the discovery layer (test_nimble_compat). No exemptions needed.
+    KNOWN_UNTESTED: set[str] = set()
 
     tests_dir = Path(__file__).parent
     test_text = "\n".join(p.read_text() for p in tests_dir.rglob("test_*.py"))

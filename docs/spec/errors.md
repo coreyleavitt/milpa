@@ -463,7 +463,7 @@ The manifest file path does not exist.
 
 The manifest file cannot be read (permissions, etc.).
 
-**Triggered:** OS denies reading the file.
+**Triggered:** OS denies reading the manifest file. Covers both milpa.kdl and a discovered .nimble: _load_manifest_from_nimble delegates the read to load_nimble and translates its NIMBLE-FILE-* IO error to this code.
 
 ### `MAN-FLAG-DEFAULT-TYPE`
 
@@ -607,7 +607,7 @@ A transitive .nimble file's `requires` constraint string is malformed.
 
 A .nimble fallback file failed to parse.
 
-**Triggered:** load_or_discover_manifest auto-promotes a .nimble whose nimble_parse raises.
+**Triggered:** load_or_discover_manifest auto-promotes a .nimble and load_nimble raises a non-IO NimbleParseError. Reserved: parse_nimble is currently tolerant and does not raise on content.
 
 ### `MAN-NO-MANIFEST`
 

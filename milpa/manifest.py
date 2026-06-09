@@ -1398,17 +1398,27 @@ def load_or_discover_manifest(project_dir: Path) -> Manifest:
 
 
 def _load_manifest_from_nimble(path: Path) -> Manifest:
-    """Read a .nimble file and convert it to a milpa Manifest."""
-    from .nimble_parse import NimbleParseError, parse_nimble
+    """Read a .nimble file and convert it to a milpa Manifest.
+
+    Delegates the file read + heuristic parse to `load_nimble` — the single
+    .nimble reader (SSOT); this function does NOT read the file itself.
+    `load_nimble` owns the nimble-layer error codes (NIMBLE-FILE-*); the
+    discovery layer translates them into its own ManifestError contract so
+    CLI callers can keep catching `except ManifestError`:
+      - file-IO failure (NIMBLE-FILE-NOT-FOUND / -UNREADABLE) → MAN-FILE-UNREADABLE,
+        the same generic 'manifest unreadable' code milpa.kdl reads use;
+      - any other NimbleParseError (reserved for future content-level
+        validation) → MAN-NIMBLE-PARSE.
+    """
+    from .nimble_parse import NimbleParseError, load_nimble
+    _IO_CODES = {"NIMBLE-FILE-NOT-FOUND", "NIMBLE-FILE-UNREADABLE"}
     try:
-        text = path.read_text()
-    except OSError as e:
-        raise ManifestError(
-            f"cannot read {path}: {e}", code="MAN-FILE-UNREADABLE",
-        ) from e
-    try:
-        nm = parse_nimble(text)
+        nm = load_nimble(path)
     except NimbleParseError as e:
+        if e.code in _IO_CODES:
+            raise ManifestError(
+                f"cannot read {path}: {e}", code="MAN-FILE-UNREADABLE",
+            ) from e
         raise ManifestError(
             f"failed to parse {path} as a nimble manifest: {e}",
             code="MAN-NIMBLE-PARSE",

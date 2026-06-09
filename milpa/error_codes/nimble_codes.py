@@ -8,6 +8,13 @@ the registry guarantees the slug is defined.
 Scope: load_nimble raise sites — file-not-found and OS read errors.
 parse_nimble itself does not raise NimbleParseError (it is tolerant;
 it warns on when-blocks but does not fail).
+
+Layering: load_nimble is the single .nimble reader (SSOT). When a .nimble
+is discovered as a manifest (load_or_discover_manifest →
+_load_manifest_from_nimble), these nimble-layer codes are translated to the
+manifest-discovery layer's MAN-FILE-UNREADABLE so the ManifestError contract
+holds. They surface directly only to callers that use load_nimble's raw
+NimbleManifest API.
 """
 
 from milpa.error_catalog import register
