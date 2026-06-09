@@ -165,8 +165,9 @@ pub enum ManifestDoc {
 }
 
 /// The build profile used to evaluate `when`/predicate blocks. Absent profile
-/// ⇒ all conditional deps included (RFC §4.4). Predicate *evaluation* lands in
-/// S6; this carries the inputs.
+/// ⇒ all conditional deps included (RFC §4.4). This carries the inputs; the
+/// predicate *evaluation* against a profile is a resolver concern and lands with
+/// conditional-dep resolution (S7b, fixture-115).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Profile {
     pub nim_version: Option<Version>,

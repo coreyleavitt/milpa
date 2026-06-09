@@ -9,20 +9,95 @@
 //!
 //! S1 (scaffold): these are type skeletons. Fields and methods are filled in
 //! by their owning slices; nothing here carries algorithm logic.
+//!
+//! S6 note: [`Version`] is the one type here that owns hand-written `Ord` / `Eq`
+//! / `Hash`. That is not "algorithm logic" in the sense the zero-logic rule
+//! forbids — a value type's *total order and equality are part of its data-model
+//! definition* (semver 2.0 §11), and Rust's orphan rule requires those `impl`s
+//! to live in the crate that defines the type. The *resolution* algebra
+//! (`parse_version`, `VersionSet`, the solver) still lives in `milpa-solver`.
 
-/// A package version.
+use std::cmp::Ordering;
+
+/// One identifier in a semver pre-release tag (semver 2.0 §9).
 ///
-/// Raw newtype (RFC §4.1 type-placement table): the *parse* and the comparison
-/// algebra live in `milpa-solver` (`parse_version`, `VersionSet`). Holding the
-/// canonical numeric components plus the original text keeps ordering derivable
-/// as data (lexicographic over `components`) while preserving the source form
-/// for byte-exact emission. Real construction/validation arrives in S6.
+/// Numeric identifiers compare numerically and always have *lower* precedence
+/// than alphanumeric ones (§11.4.3) — so the variant order here (`Numeric`
+/// before `Alpha`) makes the derived `Ord` exactly the semver rule, and
+/// `Vec<PreId>` comparison is the field-by-field, shorter-is-lower rule of
+/// §11.4.4 for free.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PreId {
+    Numeric(u64),
+    Alpha(String),
+}
+
+/// A package version with the semver-2.0 total order (mirrors the Python
+/// `solver.Version`).
+///
+/// Carries `major`/`minor`/`patch`, a `pre` tag (empty ⇒ a release), and
+/// `build` metadata. Build metadata is preserved for round-trip emission but
+/// **ignored for ordering, equality, and hashing** (semver 2.0 §10) — which is
+/// why `Eq`/`Ord`/`Hash` are hand-written over [`Version::precedence_key`]
+/// rather than derived. The *parser* (`parse_version`) and the comparison
+/// *algebra* (`VersionSet`) live in `milpa-solver`; this type only knows how to
+/// order itself.
+#[derive(Debug, Clone)]
 pub struct Version {
-    /// Canonical numeric release components, most-significant first.
-    pub components: Vec<u64>,
-    /// The version exactly as written (for byte-exact lockfile emission).
-    pub raw: String,
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+    /// Pre-release identifiers; empty for a normal release.
+    pub pre: Vec<PreId>,
+    /// Build metadata; empty when absent. Ignored for ord/eq/hash.
+    pub build: String,
+}
+
+impl Version {
+    /// A release version (no pre-release tag, no build metadata).
+    pub fn release(major: u64, minor: u64, patch: u64) -> Self {
+        Version {
+            major,
+            minor,
+            patch,
+            pre: Vec::new(),
+            build: String::new(),
+        }
+    }
+
+    /// The semver precedence key (build metadata excluded). `is_release` sorts a
+    /// release *above* any pre-release of the same `M.m.p` (§11.3): releases get
+    /// `1`, pre-releases `0`, and a larger value wins.
+    fn precedence_key(&self) -> (u64, u64, u64, u8, &[PreId]) {
+        let is_release = u8::from(self.pre.is_empty());
+        (self.major, self.minor, self.patch, is_release, &self.pre)
+    }
+}
+
+impl PartialEq for Version {
+    fn eq(&self, other: &Self) -> bool {
+        self.precedence_key() == other.precedence_key()
+    }
+}
+
+impl Eq for Version {}
+
+impl std::hash::Hash for Version {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.precedence_key().hash(state);
+    }
+}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.precedence_key().cmp(&other.precedence_key())
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Where a resolved dep's bytes come from. A **closed enum** (RFC §4.6): the
@@ -188,15 +263,44 @@ mod tests {
     }
 
     #[test]
-    fn version_orders_by_components() {
-        let v1 = Version {
-            components: vec![1, 0, 0],
-            raw: "1.0.0".into(),
+    fn version_orders_by_release_components() {
+        assert!(Version::release(1, 0, 0) < Version::release(2, 0, 0));
+        assert!(Version::release(0, 9, 9) < Version::release(1, 0, 0));
+        assert_eq!(Version::release(1, 0, 0), Version::release(1, 0, 0));
+    }
+
+    #[test]
+    fn prerelease_sorts_below_its_release() {
+        // semver §11.3: 1.0.0-alpha < 1.0.0
+        let alpha = Version {
+            pre: vec![PreId::Alpha("alpha".into())],
+            ..Version::release(1, 0, 0)
         };
-        let v2 = Version {
-            components: vec![2, 0, 0],
-            raw: "2.0.0".into(),
+        assert!(alpha < Version::release(1, 0, 0));
+    }
+
+    #[test]
+    fn build_metadata_ignored_for_eq_and_hash() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let plain = Version::release(1, 2, 3);
+        let built = Version {
+            build: "20260609".into(),
+            ..Version::release(1, 2, 3)
         };
-        assert!(v1 < v2);
+        assert_eq!(plain, built);
+
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        plain.hash(&mut h1);
+        built.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    fn numeric_pre_id_sorts_below_alpha() {
+        // semver §11.4.3: numeric identifiers < alphanumeric.
+        assert!(PreId::Numeric(99) < PreId::Alpha("0".into()));
     }
 }
