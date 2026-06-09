@@ -8,12 +8,7 @@
 #     (066-077). 43 remain (resolve/frozen/tng/ws/res success+error paths,
 #     pending S4/S5b/S6-S13).
 
-spec-v1/fixture-003-single-url-dep
-spec-v1/fixture-061-named-dep
 spec-v1/fixture-062-diamond-conflict
-spec-v1/fixture-063-canonical-selection
-spec-v1/fixture-064-dev-deps
-spec-v1/fixture-065-root-override-precedence
 spec-v1/fixture-078-frozen-strategy-mismatch
 spec-v1/fixture-079-frozen-manifest-dep-not-in-lock
 spec-v1/fixture-080-frozen-constraint-unsatisfied
@@ -35,6 +30,4 @@ spec-v1/fixture-111-ws-member-duplicate-name
 spec-v1/fixture-113-res-ws-no-index
 spec-v1/fixture-114-frozen-legacy-registry-provenance
 spec-v1/fixture-115-conditional-dep-excluded
-spec-v1/fixture-116-src-dir-self-path
 spec-v1/fixture-117-ws-two-member-success
-spec-v1/fixture-118-lock-string-escaping

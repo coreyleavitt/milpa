@@ -10,11 +10,19 @@
 //!
 //! It never reports an identity — identity is computed by the caller from the
 //! materialized bytes (RFC §4.6), so a fake cannot lie about content.
+//!
+//! Like the Python `FetcherRegistry(store=…)`, the fake is also the **CAS
+//! materialization layer**: it stages the mocked bytes, admits them into a
+//! [`CaStore`] under their content hash, and replaces `dest` with a relative
+//! symlink into the store. That is what makes `_deps/<name>` a CAS symlink (the
+//! shape `_deps_structure.txt` records), and it keeps the store inside the
+//! registry where the resolve trait — which carries no store parameter — can
+//! reach it.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use milpa_core::{FetchError, Fetcher, FetcherRegistry, Receipt};
+use milpa_core::{compute_content_hash, CaStore, FetchError, Fetcher, FetcherRegistry, Receipt};
 use milpa_types::Provenance;
 
 use crate::urlkey::url_key;
@@ -28,16 +36,19 @@ pub struct FetchCall {
     pub ref_spec: String,
 }
 
-/// Fake fetcher reading mocked returns from `mocked-fetches/`.
+/// Fake fetcher reading mocked returns from `mocked-fetches/`, admitting into the
+/// content-addressed store rooted at `cas_root`.
 pub struct FakeFetcher {
     mocked_fetches_dir: PathBuf,
+    cas_root: PathBuf,
     calls: RefCell<Vec<FetchCall>>,
 }
 
 impl FakeFetcher {
-    pub fn new(mocked_fetches_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(mocked_fetches_dir: impl Into<PathBuf>, cas_root: impl Into<PathBuf>) -> Self {
         FakeFetcher {
             mocked_fetches_dir: mocked_fetches_dir.into(),
+            cas_root: cas_root.into(),
             calls: RefCell::new(Vec::new()),
         }
     }
@@ -45,6 +56,33 @@ impl FakeFetcher {
     /// The fetch calls recorded so far, in order.
     pub fn calls(&self) -> Vec<FetchCall> {
         self.calls.borrow().clone()
+    }
+
+    /// Stage the mocked bytes into a scratch dir beside the CAS (same filesystem,
+    /// so `admit`'s rename is atomic), returning the staged dir.
+    fn stage(&self, name: &str, key_dir: &Path) -> Result<PathBuf, FetchError> {
+        let staging = self
+            .cas_root
+            .parent()
+            .unwrap_or(&self.cas_root)
+            .join(".milpa-staging")
+            .join(name);
+        // A prior attempt (mirror fall-through) may have left a staging dir.
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging)
+            .map_err(|e| FetchError::Failed(format!("FakeFetcher: cannot create staging: {e}")))?;
+
+        let content = key_dir.join("content");
+        if content.is_dir() {
+            copy_tree(&content, &staging)
+                .map_err(|e| FetchError::Failed(format!("FakeFetcher: copy content: {e}")))?;
+        }
+        let nimble = key_dir.join(format!("{name}.nimble"));
+        if nimble.is_file() {
+            std::fs::copy(&nimble, staging.join(format!("{name}.nimble")))
+                .map_err(|e| FetchError::Failed(format!("FakeFetcher: copy nimble: {e}")))?;
+        }
+        Ok(staging)
     }
 }
 
@@ -79,24 +117,24 @@ impl Fetcher for FakeFetcher {
             ref_spec: ref_spec.to_string(),
         });
 
-        std::fs::create_dir_all(dest)
-            .map_err(|e| FetchError::Failed(format!("FakeFetcher: cannot create dest: {e}")))?;
-
-        // Copy the content/ tree verbatim (§2.3.2). It is the identity ground
-        // truth, so a byte-exact copy is required.
-        let content = key_dir.join("content");
-        if content.is_dir() {
-            copy_tree(&content, dest)
-                .map_err(|e| FetchError::Failed(format!("FakeFetcher: copy content: {e}")))?;
-        }
-
-        // The dep's own `<name>.nimble` lives beside content/ as an authoring
-        // convenience; it is materialized at the tree root and IS hashed (§2.3.2).
-        let nimble = key_dir.join(format!("{name}.nimble"));
-        if nimble.is_file() {
-            std::fs::copy(&nimble, dest.join(format!("{name}.nimble")))
-                .map_err(|e| FetchError::Failed(format!("FakeFetcher: copy nimble: {e}")))?;
-        }
+        // Stage the mocked bytes (content/ + the root `<name>.nimble`, both
+        // hashed — §2.3.2), compute their identity, admit into the CAS, and
+        // symlink `dest` → the store entry. The store computes the identity by
+        // walking the tree, so the fake cannot lie about content (RFC §4.6).
+        let staging = self.stage(name, &key_dir)?;
+        let store = CaStore::new(self.cas_root.clone());
+        let identity = compute_content_hash(&staging).map_err(|e| {
+            FetchError::Failed(format!("FakeFetcher: hash staged tree: {}", e.message()))
+        })?;
+        store.admit(&staging, &identity).map_err(|e| {
+            FetchError::Failed(format!("FakeFetcher: admit to CAS: {}", e.message()))
+        })?;
+        // `admit` moves the staging dir on success; a duplicate admission leaves
+        // it behind, so clean up defensively.
+        let _ = std::fs::remove_dir_all(&staging);
+        store.link(&identity, dest).map_err(|e| {
+            FetchError::Failed(format!("FakeFetcher: link _deps entry: {}", e.message()))
+        })?;
 
         Ok(Receipt {
             resolved_ref: Some(sha),
@@ -149,8 +187,10 @@ mod tests {
         std::fs::write(key_dir.join("content").join("foo.nim"), b"# src").unwrap();
         std::fs::write(key_dir.join("foo.nimble"), b"version = \"1.0.0\"").unwrap();
 
-        let fetcher = FakeFetcher::new(&mocked);
-        let dest = tmp.path().join("dest");
+        let fetcher = FakeFetcher::new(&mocked, tmp.path().join(".cas"));
+        // The resolver guarantees `_deps/` exists before fetch; mirror that.
+        std::fs::create_dir_all(tmp.path().join("_deps")).unwrap();
+        let dest = tmp.path().join("_deps").join("foo");
         let p = Provenance::Git {
             url: "https://github.com/example/foo.git".into(),
             ref_spec: "main".into(),
@@ -162,8 +202,13 @@ mod tests {
             receipt.resolved_ref.as_deref(),
             Some("abcdef1234567890abcdef1234567890abcdef12")
         );
+        // dest is now a CAS symlink; reads follow it into the store.
+        assert!(std::fs::symlink_metadata(&dest)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert_eq!(std::fs::read(dest.join("foo.nim")).unwrap(), b"# src");
-        // The `.nimble` is materialized at the tree root (and would be hashed).
+        // The `.nimble` is materialized at the tree root (and IS hashed).
         assert!(dest.join("foo.nimble").is_file());
         assert_eq!(fetcher.calls().len(), 1);
         assert_eq!(fetcher.calls()[0].name, "foo");
@@ -172,7 +217,7 @@ mod tests {
     #[test]
     fn missing_mock_is_a_fetch_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let fetcher = FakeFetcher::new(tmp.path().join("mocked-fetches"));
+        let fetcher = FakeFetcher::new(tmp.path().join("mocked-fetches"), tmp.path().join(".cas"));
         let p = Provenance::Git {
             url: "https://example.com/x.git".into(),
             ref_spec: "main".into(),

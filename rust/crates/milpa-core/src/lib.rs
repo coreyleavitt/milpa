@@ -18,6 +18,7 @@ pub mod error;
 pub mod fetch;
 pub mod identity;
 pub mod lockfile;
+pub mod nimcfg;
 pub mod registry;
 pub mod resolver;
 pub mod store;
@@ -32,6 +33,7 @@ pub use lockfile::{format_lockfile, from_graph, load_lockfile, parse_lockfile, w
 pub use fetch::{FetchError, Fetcher, FetcherRegistry, Receipt};
 pub use identity::{compute_content_hash, parse_identity, SUPPORTED_ALGORITHMS};
 pub use milpa_manifest::{parse_document, ManifestDoc};
+pub use nimcfg::format_nimcfg;
 pub use registry::Index;
 pub use resolver::resolve;
 pub use store::{default_store, CaStore};
