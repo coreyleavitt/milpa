@@ -1,10 +1,11 @@
 # Rust-port design RFC — handoff
 
-- **Stage:** 2 architecture review — **rounds 1+2 DONE** → **stage 3 (slice grind) next**   •   **Round:** 2/2
-- **Resume (stage 3):** `/loop implement the next unimplemented RFC slice with /tdd, following the standing rules; after each slice report one progress line; stop when every slice is implemented` — BUT first do the §10 pre-grind prerequisites (P1–P5) + S0 spikes.
-- **RFC:** `docs/rfc-rust-port-design.md` (rounds 1+2 fixes applied, uncommitted — Corey-gated).
-- **§8 GATE: RESOLVED** — R1–R11 applied to spec docs (uncommitted). Suite 901 green.
-- **Uncommitted files (Corey-gated commit):** `docs/rfc-rust-port-design.md`, `.handoff.md`, `docs/spec/{lockfile-schema,conformance-fixtures,resolver-semantics}.md`.
+- **Stage:** 3 (slice grind) — **rounds 1+2 DONE, RFC+specs COMMITTED to main** → grind starts at P1   •   **Round:** 2/2
+- **Resume (stage 3):** `/loop implement the next unimplemented RFC slice with /tdd, following the standing rules; after each slice report one progress line; stop when every slice is implemented` — order: §10 pre-grind P1–P4 (on `main`) → S0 spikes → cut `rust` branch → S1 scaffold → S2…
+- **RFC:** `docs/rfc-rust-port-design.md` (rounds 1+2 fixes applied; **committed** main `8375f84`).
+- **§8 GATE: RESOLVED + COMMITTED** — R1–R11 spec reconciliations committed main `b49e21b`. Suite 901 green.
+- **Branch:** still on `main`. `rust` branch NOT yet cut — it's created at S1 scaffold (after P1–P4 + S0).
+- **Dev image (untracked):** `rust/Containerfile` built = `ghcr.io/coreyleavitt/milpa-rust:1.96` (Tumbleweed + rustup-pinned Rust 1.96.0 + rustfmt/clippy; `cargo build` smoke-tested). Untracked on purpose — gets committed at S1 with the workspace, on the `rust` branch.
 
 ## Round-2 changes applied (clear-best)
 - **CRITICAL** fixed: VersionSet/Strategy+algebra moved to milpa-solver (orphan-rule); milpa-types = raw Version + data only. Added type-placement table.
@@ -18,7 +19,8 @@
 P1–P4 (on `main`) → S0 spikes (kdl-rs, pubgrub-rs) → S1 scaffold → S2 harness+self-test+CI → S3… per §6. First success fixture greens at S9.
 
 ## Open items for Corey
-1. **Commit gate** — all uncommitted (RFC + handoff + 3 spec docs); Corey-gated. (Q2 "next step" not yet answered — Corey said sort Q1 first; Q1 now resolved as P-slices.)
+1. ~~Commit gate~~ — DONE: RFC+handoff (`8375f84`) + 3 spec docs (`b49e21b`) committed to main.
+2. Containerfile push to ghcr-public deferred (needs `podman login ghcr.io` + push + flip package visibility). Not blocking.
 
 ## Constraints from Corey (verbatim intent)
 - Rust impl developed on a **separate branch** (`rust`); merge to main when green.
