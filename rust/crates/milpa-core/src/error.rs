@@ -40,10 +40,27 @@ impl CoreError {
     /// Every catalog code `milpa-core`'s own domains can emit (parity companion
     /// to `code()`). Each variant carries a dynamic `&'static str` slug, so this
     /// is the hand-maintained enumeration of the `LOCK-*`/`ID-*`/`CAS-*`/`RES-*`/
-    /// `TNG-*` codes as their slices wire them. Empty until S4/S5a/S7b/S8 land
-    /// real raises; grown there and completed to a bijection in S12.
+    /// `TNG-*` codes as their slices wire them. Grown per-slice; completed to a
+    /// bijection with `errors.md` in S12.
+    ///
+    /// S4 added the identity + CAS codes. Deliberately excluded:
+    /// `ID-NOT-A-STRING` (unreachable — `parse_identity` takes a `&str`, so the
+    /// type system enforces it statically) and the `MILPA-INTERNAL-IO` sentinel
+    /// (a non-catalog infrastructure failure the spec leaves uncoded; see
+    /// `identity.rs`). `CAS-DIR-MISSING`/`CAS-DIR-TYPE` are manifest-`cas{dir}`
+    /// validation codes, wired with the resolver/CLI tier-2 path, not here.
     pub fn all_codes() -> &'static [&'static str] {
-        &[]
+        &[
+            // identity (identity.md §2.2 / §1.5)
+            "ID-NO-ALGORITHM-PREFIX",
+            "ID-UNSUPPORTED-ALGORITHM",
+            "ID-WRONG-DIGEST-LENGTH",
+            "ID-NON-HEX-DIGEST",
+            "ID-NON-UTF8-SYMLINK-TARGET",
+            // CAS (identity.md §3.3 / §3.6)
+            "CAS-IDENTITY-MISMATCH",
+            "CAS-NOT-IN-STORE",
+        ]
     }
 }
 

@@ -27,9 +27,10 @@ pub use error::{CoreError, MilpaError};
 // `From<ManifestError>` impl lives here, so `?` lifts parse errors at this
 // boundary.
 pub use fetch::{FetchError, Fetcher, FetcherRegistry, Receipt};
+pub use identity::{compute_content_hash, parse_identity, SUPPORTED_ALGORITHMS};
 pub use milpa_manifest::{parse_document, ManifestDoc};
 pub use registry::Index;
-pub use store::CaStore;
+pub use store::{default_store, CaStore};
 
 /// The union of every error code the Rust implementation can currently emit,
 /// across all domains. The single boundary the conformance parity check reads:
