@@ -178,13 +178,13 @@ dep "depname2" { ... }
 > single-quoted strings, no raw strings, no integer types except the top-level
 > `version` node.
 
-> NOTE: The reference Python `format_lockfile` does **not** currently perform
-> this escaping (it interpolates raw strings). This is latent — no spec-v1
-> fixture exercises a dep name or URL containing `"`, `\`, or a control
-> character, so the gap is unobservable in the conformance suite. An
-> implementation that escapes correctly (producing valid KDL for such inputs) is
-> *more* conformant than the current Python reference; this is a Python defect to
-> reconcile, not a license to skip escaping. New implementations MUST escape.
+> NOTE: The reference Python `format_lockfile` performs this escaping via the
+> single `_kdl_str` helper (every emitted string value passes through it). The
+> conformance fixture `fixture-118-lock-string-escaping` exercises a dep `ref`
+> containing both `"` and `\` and pins the escaped `expected/milpa.lock`, so the
+> requirement is now observable in the suite. (Historical: pre-P3 the Python
+> reference interpolated raw strings — a latent defect, reconciled here. All
+> implementations MUST escape.)
 
 > NOTE: The reference implementation is `format_lockfile` and
 > `_format_provenance_fields` in `lockfile.py`. The final text is produced by

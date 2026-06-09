@@ -496,30 +496,62 @@ def _optional_str(fields: dict, key: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+_KDL_ESCAPES = {
+    '"': '\\"',
+    "\\": "\\\\",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+    "\b": "\\b",
+    "\f": "\\f",
+}
+
+
+def _kdl_str(s: str) -> str:
+    """Return `s` as a double-quoted, KDL-escaped string literal.
+
+    The single source of truth for emitting a KDL string value in a
+    lockfile (R11, lockfile-schema §7). Escapes `"`, `\\`, and control
+    characters so the output is valid KDL that `parse_lockfile` recovers
+    byte-for-value — the parser uses the real KDL grammar (which unescapes
+    on read), so the writer MUST escape on write or the round-trip breaks.
+    """
+    out = []
+    for ch in s:
+        esc = _KDL_ESCAPES.get(ch)
+        if esc is not None:
+            out.append(esc)
+        elif ord(ch) < 0x20:
+            out.append(f"\\u{{{ord(ch):x}}}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
 def format_lockfile(lockfile: Lockfile) -> str:
     """Render a Lockfile to KDL text."""
     lines = [
         _HEADER,
         f"version {lockfile.version}",
-        f'strategy "{lockfile.strategy}"',
+        f"strategy {_kdl_str(lockfile.strategy)}",
         "",
     ]
     for dep in lockfile.deps:
-        lines.append(f'dep "{dep.name}" {{')
+        lines.append(f"dep {_kdl_str(dep.name)} {{")
         if dep.identity is not None:
-            lines.append(f'    identity "{dep.identity}"')
-        lines.append(f'    version "{dep.version}"')
-        lines.append(f'    src_dir "{dep.src_dir}"')
+            lines.append(f"    identity {_kdl_str(dep.identity)}")
+        lines.append(f"    version {_kdl_str(dep.version)}")
+        lines.append(f"    src_dir {_kdl_str(dep.src_dir)}")
         if dep.requires:
-            req_args = " ".join(f'"{r}"' for r in dep.requires)
+            req_args = " ".join(_kdl_str(r) for r in dep.requires)
             lines.append(f'    requires {req_args}')
         else:
             lines.append("    requires")
         if dep.active_flags:
-            flag_args = " ".join(f'"{f}"' for f in dep.active_flags)
+            flag_args = " ".join(_kdl_str(f) for f in dep.active_flags)
             lines.append(f'    active_flags {flag_args}')
         if dep.self_mirrors:
-            sm_args = " ".join(f'(url)"{u}"' for u in dep.self_mirrors)
+            sm_args = " ".join(f"(url){_kdl_str(u)}" for u in dep.self_mirrors)
             lines.append(f'    self_mirrors {sm_args}')
         for prov in dep.provenances:
             lines.append("    provenance {")
@@ -534,31 +566,31 @@ def format_lockfile(lockfile: Lockfile) -> str:
 def _format_provenance_fields(p: ProvenanceRecord) -> list[str]:
     """Emit the kind discriminator + kind-specific fields for a
     provenance block."""
-    out = [f'kind "{p.kind}"']
+    out = [f"kind {_kdl_str(p.kind)}"]
     if isinstance(p, GitProvenanceRecord):
-        out.append(f'url "{p.url}"')
+        out.append(f"url {_kdl_str(p.url)}")
         if p.ref is not None:
-            out.append(f'ref "{p.ref}"')
+            out.append(f"ref {_kdl_str(p.ref)}")
         if p.commit_sha is not None:
-            out.append(f'commit_sha "{p.commit_sha}"')
+            out.append(f"commit_sha {_kdl_str(p.commit_sha)}")
     elif isinstance(p, TarballProvenanceRecord):
-        out.append(f'url "{p.url}"')
+        out.append(f"url {_kdl_str(p.url)}")
         if p.sha256 is not None:
-            out.append(f'sha256 "{p.sha256}"')
+            out.append(f"sha256 {_kdl_str(p.sha256)}")
     elif isinstance(p, LocalProvenanceRecord):
-        out.append(f'path "{p.path}"')
+        out.append(f"path {_kdl_str(p.path)}")
     elif isinstance(p, MemberProvenanceRecord):
-        out.append(f'name "{p.name}"')
+        out.append(f"name {_kdl_str(p.name)}")
     elif isinstance(p, OciProvenanceRecord):
-        out.append(f'registry "{p.registry}"')
-        out.append(f'repository "{p.repository}"')
-        out.append(f'digest "{p.digest}"')
+        out.append(f"registry {_kdl_str(p.registry)}")
+        out.append(f"repository {_kdl_str(p.repository)}")
+        out.append(f"digest {_kdl_str(p.digest)}")
     elif isinstance(p, RegistryProvenanceRecord):
-        out.append(f'name "{p.name}"')
+        out.append(f"name {_kdl_str(p.name)}")
         if p.tag is not None:
-            out.append(f'tag "{p.tag}"')
+            out.append(f"tag {_kdl_str(p.tag)}")
         if p.commit_sha is not None:
-            out.append(f'commit_sha "{p.commit_sha}"')
+            out.append(f"commit_sha {_kdl_str(p.commit_sha)}")
     return out
 
 

@@ -393,3 +393,34 @@ def test_lock_prov_field_missing_code():
     with pytest.raises(LockfileError) as exc:
         parse_lockfile(text)
     assert exc.value.code == "LOCK-PROV-FIELD-MISSING"
+
+
+def test_format_lockfile_escapes_special_chars_roundtrip():
+    """R11: every emitted string value must be KDL-escaped (`\\`, `"`, control
+    chars). A ref/url/name/src_dir containing `"` or `\\` must format to valid
+    KDL that parse_lockfile recovers byte-for-value — proving format/parse are
+    inverse over the full string domain, not just the ASCII-identifier subset."""
+    tricky_ref = 'feat/"weird"\\path'      # contains both " and \
+    tricky_url = 'https://example.com/a"b\\c.git'
+    dep = LockedDep(
+        name='pkg"q\\x',
+        identity=_VALID_HASH,
+        version="0.0.1",
+        src_dir='src"dir',
+        requires=('a"b', 'c\\d'),
+        provenances=(
+            GitProvenanceRecord(url=tricky_url, ref=tricky_ref, commit_sha="abc"),
+        ),
+    )
+    lf = Lockfile(deps=(dep,))
+    text = format_lockfile(lf)
+    # Round-trips through the real KDL parser back to identical values.
+    parsed = parse_lockfile(text)
+    assert len(parsed.deps) == 1
+    got = parsed.deps[0]
+    assert got.name == 'pkg"q\\x'
+    assert got.src_dir == 'src"dir'
+    assert got.requires == ('a"b', 'c\\d')
+    prov = got.provenances[0]
+    assert prov.url == tricky_url
+    assert prov.ref == tricky_ref
