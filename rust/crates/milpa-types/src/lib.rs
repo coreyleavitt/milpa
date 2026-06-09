@@ -79,12 +79,94 @@ pub struct ResolvedGraph {
     pub deps: Vec<ResolvedDep>,
 }
 
-/// The parsed `milpa.lock` as data (parse/emit logic lives in `milpa-core`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Lockfile {
-    pub strategy: String,
-    pub deps: Vec<ResolvedDep>,
+/// One recorded provenance in a lockfile entry (lockfile-schema §4).
+///
+/// **Distinct from the transport [`Provenance`] enum**, deliberately. `Provenance`
+/// models the four *transport* kinds a fetcher dispatches on; `ProvenanceRecord`
+/// models what a `milpa.lock` *records about where bytes came from* — six kinds,
+/// because it additionally carries workspace-internal `Member` references and the
+/// read-compat legacy `Registry` kind (milpa#97), neither of which is a transport.
+/// They are different sets by design, so they are different types (mirrors the
+/// Python `ProvenanceRecord` union in `lockfile.py`). Optional fields are `None`
+/// when omitted from the KDL — never an empty string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvenanceRecord {
+    Git {
+        url: String,
+        ref_spec: Option<String>,
+        commit_sha: Option<String>,
+    },
+    Tarball {
+        url: String,
+        /// Archive sha256 (transport receipt, NOT identity); `None` pre-TOFU.
+        sha256: Option<String>,
+    },
+    Local {
+        /// As-declared relative path from the project root (never absolutized).
+        path: String,
+    },
+    Member {
+        name: String,
+    },
+    Oci {
+        registry: String,
+        repository: String,
+        digest: String,
+    },
+    /// Read-compat only (milpa#97): the writer never emits this; the parser
+    /// still accepts it so pre-#97 lockfiles round-trip.
+    Registry {
+        name: String,
+        tag: Option<String>,
+        commit_sha: Option<String>,
+    },
 }
+
+/// A single dep entry in a `milpa.lock` (lockfile-schema §3).
+///
+/// Structurally distinct from [`ResolvedDep`]: the lockfile records `identity`
+/// as **optional** (Phase A partial — a dep not yet content-hashed stores
+/// `None`), carries `ProvenanceRecord`s (the metadata model) rather than a
+/// transport `Provenance`, and adds `active_flags` / `self_mirrors`. Mirrors the
+/// Python `LockedDep`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockedDep {
+    pub name: String,
+    pub identity: Option<String>,
+    pub version: String,
+    pub src_dir: String,
+    pub requires: Vec<String>,
+    pub provenances: Vec<ProvenanceRecord>,
+    pub active_flags: Vec<String>,
+    pub self_mirrors: Vec<String>,
+}
+
+/// The parsed `milpa.lock` as data (parse/emit logic lives in `milpa-core`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lockfile {
+    /// Lockfile schema epoch (`LOCKFILE_SCHEMA_VERSION`, currently `1`); a
+    /// distinct namespace from the manifest `spec-version` (lockfile-schema §2.1).
+    pub version: u32,
+    pub strategy: String,
+    pub deps: Vec<LockedDep>,
+}
+
+impl Default for Lockfile {
+    /// An empty `maxver` lockfile at the current schema version. (A bare
+    /// `version: 0` default would be a non-existent schema epoch, so `Default`
+    /// is written by hand rather than derived.)
+    fn default() -> Self {
+        Lockfile {
+            version: LOCKFILE_SCHEMA_VERSION,
+            strategy: "maxver".to_string(),
+            deps: Vec::new(),
+        }
+    }
+}
+
+/// The current `milpa.lock` schema epoch (lockfile-schema §2.1). A v2 schema is
+/// a spec amendment, independent of the manifest `spec-version` epoch.
+pub const LOCKFILE_SCHEMA_VERSION: u32 = 1;
 
 #[cfg(test)]
 mod tests {

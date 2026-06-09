@@ -37,6 +37,17 @@ impl CoreError {
         }
     }
 
+    /// The human-readable diagnostic message (never compared by the conformance
+    /// harness — for logs and for composing nested diagnostics).
+    pub fn message(&self) -> &str {
+        match self {
+            CoreError::Lockfile(_, m)
+            | CoreError::Identity(_, m)
+            | CoreError::Resolver(_, m)
+            | CoreError::Tianguis(_, m) => m,
+        }
+    }
+
     /// Every catalog code `milpa-core`'s own domains can emit (parity companion
     /// to `code()`). Each variant carries a dynamic `&'static str` slug, so this
     /// is the hand-maintained enumeration of the `LOCK-*`/`ID-*`/`CAS-*`/`RES-*`/
@@ -60,6 +71,24 @@ impl CoreError {
             // CAS (identity.md §3.3 / §3.6)
             "CAS-IDENTITY-MISMATCH",
             "CAS-NOT-IN-STORE",
+            // lockfile parse (lockfile-schema §2–§4) — S5a. The two file-IO
+            // codes (LOCK-FILE-NOT-FOUND / LOCK-FILE-UNREADABLE) are emitted by
+            // `load_lockfile`, the disk wrapper, and are included here too. The
+            // verify/frozen codes (LOCK-GRAPH-MISMATCH, FROZEN-*) wire in S7/S10.
+            "LOCK-KDL-SYNTAX",
+            "LOCK-VERSION-MISSING",
+            "LOCK-VERSION-UNSUPPORTED",
+            "LOCK-FIELD-ARITY",
+            "LOCK-FIELD-TYPE",
+            "LOCK-DEP-NAME-ARITY",
+            "LOCK-DEP-FIELD-ARITY",
+            "LOCK-DEP-IDENTITY-INVALID",
+            "LOCK-PROV-FIELD-ARITY",
+            "LOCK-PROV-KIND-MISSING",
+            "LOCK-PROV-KIND-UNKNOWN",
+            "LOCK-PROV-FIELD-MISSING",
+            "LOCK-FILE-NOT-FOUND",
+            "LOCK-FILE-UNREADABLE",
         ]
     }
 }

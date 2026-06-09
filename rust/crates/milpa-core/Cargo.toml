@@ -11,3 +11,4 @@ milpa-types = { workspace = true }
 milpa-solver = { workspace = true }
 milpa-manifest = { workspace = true }
 sha2 = { workspace = true }
+kdl = { workspace = true }

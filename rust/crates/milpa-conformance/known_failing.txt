@@ -3,8 +3,10 @@
 # These leave the list as their slices land; MUST be empty for v1-Done (§6).
 # S2: MilpaTarget unwired — entire corpus parked.
 # S3: manifest grammar wired — 62 MAN-* parse-error fixtures greened + removed
-#     (001,002,004-060,102,103,105). 55 remain (resolve/lock/frozen/tng/ws/res
-#     paths, pending S4-S13).
+#     (001,002,004-060,102,103,105).
+# S5a: lockfile-parse wired — 12 LOCK-* parse-error fixtures greened + removed
+#     (066-077). 43 remain (resolve/frozen/tng/ws/res success+error paths,
+#     pending S4/S5b/S6-S13).
 
 spec-v1/fixture-003-single-url-dep
 spec-v1/fixture-061-named-dep
@@ -12,18 +14,6 @@ spec-v1/fixture-062-diamond-conflict
 spec-v1/fixture-063-canonical-selection
 spec-v1/fixture-064-dev-deps
 spec-v1/fixture-065-root-override-precedence
-spec-v1/fixture-066-lock-kdl-syntax
-spec-v1/fixture-067-lock-version-missing
-spec-v1/fixture-068-lock-version-unsupported
-spec-v1/fixture-069-lock-field-arity
-spec-v1/fixture-070-lock-field-type
-spec-v1/fixture-071-lock-dep-name-arity
-spec-v1/fixture-072-lock-dep-field-arity
-spec-v1/fixture-073-lock-dep-identity-invalid
-spec-v1/fixture-074-lock-prov-field-arity
-spec-v1/fixture-075-lock-prov-kind-missing
-spec-v1/fixture-076-lock-prov-kind-unknown
-spec-v1/fixture-077-lock-prov-field-missing
 spec-v1/fixture-078-frozen-strategy-mismatch
 spec-v1/fixture-079-frozen-manifest-dep-not-in-lock
 spec-v1/fixture-080-frozen-constraint-unsatisfied

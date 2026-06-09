@@ -17,10 +17,12 @@ use milpa_types::{Lockfile, ResolvedGraph};
 pub mod error;
 pub mod fetch;
 pub mod identity;
+pub mod lockfile;
 pub mod registry;
 pub mod store;
 
 pub use error::{CoreError, MilpaError};
+pub use lockfile::{load_lockfile, parse_lockfile};
 // The manifest parse entry point + role discriminant, re-exported so the
 // conformance harness (and the CLI, S13) reach them through the integration
 // crate rather than depending on `milpa-manifest` directly. `MilpaError`'s
@@ -59,6 +61,19 @@ pub fn implemented_error_codes() -> Vec<&'static str> {
 /// Parse a `milpa.lock` (the `cmd=parse-lockfile` path).
 pub trait LockfileParser {
     fn parse_lockfile(&self, text: &str) -> Result<Lockfile, MilpaError>;
+}
+
+/// The reference implementation of the resolver traits. A zero-sized handle that
+/// the CLI (S13) and conformance harness drive. `LockfileParser` lands here at
+/// S5a; `Resolver` (S7) and `FrozenResolver` (S10) follow on the same type, so
+/// the three `cmd` paths share one entry point.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Milpa;
+
+impl LockfileParser for Milpa {
+    fn parse_lockfile(&self, text: &str) -> Result<Lockfile, MilpaError> {
+        Ok(lockfile::parse_lockfile(text)?)
+    }
 }
 
 /// Full resolution (the `cmd=resolve` path). `prior` carries the previous

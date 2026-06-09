@@ -195,8 +195,18 @@ const NOT_WIRED: &str = "E2E-NOT-WIRED";
 impl Target for MilpaTarget {
     fn execute(&self, fx: &Fixture, _scratch: &Scratch) -> Result<Produced, String> {
         match fx.cmd {
-            // S5a wires `parse_lockfile`; S3 the manifest parse it depends on.
-            Cmd::ParseLockfile => Err(NOT_WIRED.to_string()),
+            // S5a: parse the fixture's `milpa.lock` and surface any LOCK-* code.
+            // A clean parse yields no byte-diff outputs (`parse-lockfile` has no
+            // success variant, §2.7), so `run_fixture` flags a non-erroring
+            // success fixture as an authoring error.
+            Cmd::ParseLockfile => {
+                let text = std::fs::read_to_string(fx.dir.join("milpa.lock"))
+                    .map_err(|e| format!("E2E-LOCKFILE-UNREADABLE: {e}"))?;
+                match milpa_core::parse_lockfile(&text) {
+                    Ok(_lock) => Ok(Produced::NoByteDiff),
+                    Err(e) => Err(e.code().to_string()),
+                }
+            }
             // S3 wires manifest parsing — the first stage of the resolve path.
             // A malformed manifest surfaces its `MAN-*` code here (greening the
             // 62 parse-error fixtures, which fail before any fetch/solve). A

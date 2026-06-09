@@ -279,6 +279,7 @@ dependencies = [
 name = "milpa-core"
 version = "0.0.0"
 dependencies = [
+ "kdl 6.7.1",
  "milpa-manifest",
  "milpa-solver",
  "milpa-types",
