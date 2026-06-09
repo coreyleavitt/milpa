@@ -238,6 +238,12 @@ const MAN_CODES: &[&str] = &[
     // (the slug is `MAN-*`) so the boundary stays one domain. Not produced by
     // the milpa.kdl text parser, but it IS a code this domain emits.
     "MAN-NIMBLE-CONSTRAINT",
+    // Manifest discovery / loading (milpa-core `discovery`) — S13. Emitted via
+    // `ManifestError` (the MAN-* domain) though raised from the integration crate.
+    "MAN-FILE-NOT-FOUND",
+    "MAN-FILE-UNREADABLE",
+    "MAN-NO-MANIFEST",
+    "MAN-NIMBLE-AMBIGUOUS",
     "MAN-URL-ARG-TYPE",
     "MAN-UNKNOWN-TOP-LEVEL",
     "MAN-NAME-MISSING",

@@ -569,6 +569,112 @@ fn opt(s: &str) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// verify — lockfile ⟷ graph / disk (S13)
+// ---------------------------------------------------------------------------
+
+/// Confirm a resolved graph matches the lockfile dep-for-dep (mirrors
+/// `lockfile.py:verify_against_graph`). Any divergence — a dep in one but not the
+/// other, or an identity mismatch — is `LOCK-GRAPH-MISMATCH`. Used by `milpa lock`
+/// / `milpa verify` to assert the lockfile is in sync with a fresh resolve.
+pub fn verify_against_graph(lockfile: &Lockfile, graph: &ResolvedGraph) -> Result<(), CoreError> {
+    use std::collections::BTreeMap;
+    let locked: BTreeMap<&str, &LockedDep> =
+        lockfile.deps.iter().map(|d| (d.name.as_str(), d)).collect();
+    let resolved: BTreeMap<&str, &ResolvedDep> =
+        graph.deps.iter().map(|d| (d.name.as_str(), d)).collect();
+
+    let mut errors: Vec<String> = Vec::new();
+    for name in resolved.keys() {
+        if !locked.contains_key(name) {
+            errors.push(format!(
+                "unexpected dep {name:?} in resolved graph (not in lockfile)"
+            ));
+        }
+    }
+    for name in locked.keys() {
+        if !resolved.contains_key(name) {
+            errors.push(format!(
+                "locked dep {name:?} is missing from resolved graph"
+            ));
+        }
+    }
+    for (name, r) in &resolved {
+        if let Some(l) = locked.get(name) {
+            if l.identity.as_deref() != Some(r.identity.as_str()) {
+                errors.push(format!(
+                    "identity mismatch for {name:?}: locked={:?}, actual={:?}",
+                    l.identity, r.identity
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(err(
+            "LOCK-GRAPH-MISMATCH",
+            format!(
+                "lockfile does not match resolved graph:\n  {}",
+                errors.join("\n  ")
+            ),
+        ))
+    }
+}
+
+/// Verify each locked dep's on-disk bytes (under `deps_dir/<name>`) hash to its
+/// recorded identity, and that no extra non-dotfile entries exist (mirrors
+/// `lockfile.py:verify_lockfile_against_deps`). Returns the list of divergence
+/// messages — empty means verified. This is `milpa verify`'s primitive; the CLI
+/// prints the divergences and exits 1 (no single catalog code — it is a report).
+pub fn verify_lockfile_against_deps(
+    lockfile: &Lockfile,
+    deps_dir: &std::path::Path,
+) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut divergences: Vec<String> = Vec::new();
+    let locked_names: BTreeSet<&str> = lockfile.deps.iter().map(|d| d.name.as_str()).collect();
+
+    for locked in &lockfile.deps {
+        let dep_path = deps_dir.join(&locked.name);
+        if !dep_path.exists() {
+            divergences.push(format!(
+                "{}: missing from {}/",
+                locked.name,
+                deps_dir.display()
+            ));
+            continue;
+        }
+        match crate::identity::compute_content_hash(&dep_path) {
+            Ok(actual) => {
+                if locked.identity.as_deref() != Some(actual.as_str()) {
+                    divergences.push(format!(
+                        "{}: identity mismatch — lockfile says {:?}, actual {:?}",
+                        locked.name, locked.identity, actual
+                    ));
+                }
+            }
+            Err(e) => divergences.push(format!("{}: cannot hash — {}", locked.name, e.message())),
+        }
+    }
+
+    if let Ok(rd) = std::fs::read_dir(deps_dir) {
+        let mut extras: Vec<String> = rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.') && !locked_names.contains(n.as_str()))
+            .collect();
+        extras.sort();
+        for n in extras {
+            divergences.push(format!(
+                "{n}: extra dep in {}/ not in lockfile",
+                deps_dir.display()
+            ));
+        }
+    }
+    divergences
+}
+
 // --- kdl-rs access helpers (mirroring milpa-manifest) ---
 
 /// Positional arguments of a node (entries with no property name), in order.
@@ -1113,6 +1219,61 @@ mod tests {
                 commit_sha: None,
             }]
         );
+    }
+
+    #[test]
+    fn verify_against_graph_matches_and_mismatches() {
+        let graph = ResolvedGraph {
+            deps: vec![rdep(
+                "foo",
+                git("https://e/foo.git", "v1", Some("c1")),
+                vec![],
+            )],
+        };
+        let lock = from_graph(&graph, "maxver");
+        // A lockfile produced from the graph matches it.
+        assert!(verify_against_graph(&lock, &graph).is_ok());
+
+        // A dep missing from the graph diverges.
+        let empty = ResolvedGraph { deps: vec![] };
+        assert_eq!(
+            verify_against_graph(&lock, &empty).unwrap_err().code(),
+            "LOCK-GRAPH-MISMATCH"
+        );
+
+        // An identity mismatch diverges.
+        let mut drifted = lock.clone();
+        drifted.deps[0].identity = Some("sha256:different".into());
+        assert_eq!(
+            verify_against_graph(&drifted, &graph).unwrap_err().code(),
+            "LOCK-GRAPH-MISMATCH"
+        );
+    }
+
+    #[test]
+    fn verify_lockfile_against_deps_reports_divergences() {
+        let dir = std::env::temp_dir().join("milpa-s13-verify-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = Lockfile {
+            version: 1,
+            strategy: "maxver".into(),
+            deps: vec![LockedDep {
+                name: "foo".into(),
+                identity: Some("sha256:00".into()),
+                version: "0.0.1".into(),
+                src_dir: String::new(),
+                requires: vec![],
+                provenances: vec![ProvenanceRecord::Local { path: "x".into() }],
+                active_flags: vec![],
+                self_mirrors: vec![],
+            }],
+        };
+        // foo is not on disk → "missing" divergence.
+        let d = verify_lockfile_against_deps(&lock, &dir);
+        assert_eq!(d.len(), 1);
+        assert!(d[0].contains("foo") && d[0].contains("missing"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

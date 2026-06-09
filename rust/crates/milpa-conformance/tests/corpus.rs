@@ -118,20 +118,11 @@ fn spec_error_codes() -> BTreeSet<String> {
 /// (modulo [`EXEMPT`]). This is the honest S12 "bijection lint": every spec code
 /// has exactly one home — implemented, deferred-to-a-known-slice, or exempt.
 const DEFERRED: &[&str] = &[
-    // S13 — CLI manifest discovery, the manifest-mutating verbs (add/remove/
-    // update), nimble auto-discovery, and `milpa verify`.
-    "MAN-FILE-NOT-FOUND",
-    "MAN-FILE-UNREADABLE",
-    "MAN-NO-MANIFEST",
-    "MAN-NIMBLE-PARSE",
-    "MAN-NIMBLE-AMBIGUOUS",
+    // S13b/S13c — the manifest-mutating verbs (add/remove/update) + format_manifest.
     "MAN-ADD-MIRROR-IDENTITY-MISMATCH",
     "MAN-MUTATE-FILE-NOT-FOUND",
     "MAN-MUTATE-NIMBLE-REFUSED",
     "MAN-MUTATE-WORKSPACE-REFUSED",
-    "NIMBLE-FILE-NOT-FOUND",
-    "NIMBLE-FILE-UNREADABLE",
-    "LOCK-GRAPH-MISMATCH",
     // S14 — real transport fetchers + safe tarball extraction.
     "FETCH-DOWNLOAD-FAILED",
     "FETCH-EXTRACT-FAILED",
@@ -156,6 +147,14 @@ const EXEMPT: &[&str] = &[
     "ID-NOT-A-STRING",
     // Reserved in the catalog; raised by neither the Python nor the Rust impl.
     "TNG-BAD-VERSION",
+    // The Rust `.nimble` line-form parser is a *total* heuristic scan (it never
+    // raises), so a `.nimble` is never a "parse error" — discovery surfaces a
+    // `.nimble` file-read failure as MAN-FILE-UNREADABLE instead. So MAN-NIMBLE-PARSE
+    // is unreachable and the standalone NIMBLE-FILE-* codes are never emitted (the
+    // Python `load_nimble` that raises them is dead outside its own tests — P2).
+    "MAN-NIMBLE-PARSE",
+    "NIMBLE-FILE-NOT-FOUND",
+    "NIMBLE-FILE-UNREADABLE",
 ];
 
 /// Error-catalog bijection lint (RFC §4.6). Every code in `docs/spec/errors.md`

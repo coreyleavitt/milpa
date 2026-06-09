@@ -14,6 +14,7 @@ use std::path::Path;
 use milpa_manifest::{Manifest, Workspace};
 use milpa_types::{Lockfile, ResolvedGraph};
 
+pub mod discovery;
 pub mod error;
 pub mod fetch;
 pub mod frozen;
@@ -25,8 +26,12 @@ pub mod resolver;
 pub mod store;
 pub mod workspace;
 
+pub use discovery::{discover_manifest, load_manifest};
 pub use error::{CoreError, MilpaError};
-pub use lockfile::{format_lockfile, from_graph, load_lockfile, parse_lockfile, write_lockfile};
+pub use lockfile::{
+    format_lockfile, from_graph, load_lockfile, parse_lockfile, verify_against_graph,
+    verify_lockfile_against_deps, write_lockfile,
+};
 // The manifest parse entry point + role discriminant, re-exported so the
 // conformance harness (and the CLI, S13) reach them through the integration
 // crate rather than depending on `milpa-manifest` directly. `MilpaError`'s

@@ -97,6 +97,8 @@ impl CoreError {
             "LOCK-PROV-FIELD-MISSING",
             "LOCK-FILE-NOT-FOUND",
             "LOCK-FILE-UNREADABLE",
+            // verify path (lockfile ⟷ resolved graph) — S13.
+            "LOCK-GRAPH-MISMATCH",
             // resolver orchestration (resolver-semantics §3/§10) — S7b. The
             // workspace RES-WS-* codes wire with the workspace path in S11.
             "RES-NO-INDEX",
