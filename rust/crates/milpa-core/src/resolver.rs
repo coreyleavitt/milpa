@@ -1571,7 +1571,10 @@ fn io_err(e: std::io::Error) -> MilpaError {
 
 fn fetch_msg(e: &FetchError) -> String {
     match e {
-        FetchError::Failed(m) | FetchError::AllFailed(m) | FetchError::Extract(_, m) => m.clone(),
+        FetchError::Failed(m)
+        | FetchError::AllFailed(m)
+        | FetchError::Extract(_, m)
+        | FetchError::Transport(_, m) => m.clone(),
     }
 }
 

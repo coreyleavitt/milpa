@@ -120,17 +120,12 @@ fn spec_error_codes() -> BTreeSet<String> {
 const DEFERRED: &[&str] = &[
     // S13d — `add --mirror` (needs fetching both URLs to compare identities).
     "MAN-ADD-MIRROR-IDENTITY-MISMATCH",
-    // S14 — real transport fetchers + safe tarball extraction.
+    // S14c — tarball + oci transport fetchers (Local + Git already wired).
     "FETCH-DOWNLOAD-FAILED",
     "FETCH-EXTRACT-FAILED",
-    "FETCH-GIT-COMMIT-ABSENT",
-    "FETCH-GIT-FAILED",
-    "FETCH-LOCAL-PATH-NOT-DIR",
-    "FETCH-LOCAL-PATH-NOT-FOUND",
     "FETCH-OCI-AMBIGUOUS-TARBALL",
     "FETCH-OCI-NO-TARBALL",
     "FETCH-OCI-PULL-FAILED",
-    "FETCH-RECEIPT-EMPTY",
     "FETCH-SHA256-MISMATCH",
 ];
 
@@ -141,6 +136,11 @@ const EXEMPT: &[&str] = &[
     "ID-NOT-A-STRING",
     // Reserved in the catalog; raised by neither the Python nor the Rust impl.
     "TNG-BAD-VERSION",
+    // Unrepresentable in the Rust model: a fetcher returns a typed `Receipt`
+    // (struct), so a "receipt with no transport evidence" — which the Python
+    // dict-based receipt guards against — cannot occur (same kind of
+    // type-enforced exemption as ID-NOT-A-STRING).
+    "FETCH-RECEIPT-EMPTY",
     // The Rust `.nimble` line-form parser is a *total* heuristic scan (it never
     // raises), so a `.nimble` is never a "parse error" — discovery surfaces a
     // `.nimble` file-read failure as MAN-FILE-UNREADABLE instead. So MAN-NIMBLE-PARSE

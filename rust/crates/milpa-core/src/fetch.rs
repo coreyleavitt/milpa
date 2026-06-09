@@ -40,15 +40,19 @@ pub enum FetchError {
     AllFailed(String),
     /// Archive extraction failed / unsafe (`EXTRACT-*`), wired in S14.
     Extract(&'static str, String),
+    /// A coded transport failure from a real fetcher (`FETCH-LOCAL-*` /
+    /// `FETCH-GIT-*` / `FETCH-DOWNLOAD-FAILED` / `FETCH-SHA256-MISMATCH` /
+    /// `FETCH-OCI-*`), wired per-transport in S14c.
+    Transport(&'static str, String),
 }
 
 impl FetchError {
     pub fn code(&self) -> &'static str {
         match self {
-            // Non-catalog placeholder until S14 (see type docs).
+            // Non-catalog placeholder (see type docs); never satisfies a fixture.
             FetchError::Failed(_) => "FETCH-FAILED",
             FetchError::AllFailed(_) => "FETCH-ALL-FAILED",
-            FetchError::Extract(c, _) => c,
+            FetchError::Extract(c, _) | FetchError::Transport(c, _) => c,
         }
     }
 
@@ -63,6 +67,12 @@ impl FetchError {
             "EXTRACT-ZIP-SLIP",
             "EXTRACT-SYMLINK-ESCAPE",
             "EXTRACT-SIZE-LIMIT",
+            // real transport fetchers (S14c). Local + Git land first (offline-
+            // testable); tarball/oci codes are added as those fetchers wire.
+            "FETCH-LOCAL-PATH-NOT-FOUND",
+            "FETCH-LOCAL-PATH-NOT-DIR",
+            "FETCH-GIT-FAILED",
+            "FETCH-GIT-COMMIT-ABSENT",
         ]
     }
 }
