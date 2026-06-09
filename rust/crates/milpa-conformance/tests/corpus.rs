@@ -1,0 +1,143 @@
+//! The real corpus run (RFC §4.3/§4.4) + error-catalog parity (§4.6).
+//!
+//! Every `tests/conformance/spec-v<N>/fixture-*` is discovered and run through
+//! [`MilpaTarget`]. Because `MilpaTarget` is wired incrementally, at S2 they all
+//! fail and every id is parked in `known_failing.txt`; as slices land, fixtures
+//! green and their entries are removed. The xfail/xpass policy (§4.3): a parked
+//! fixture that *fails* is expected (xfail); one that *passes* is an
+//! `UNEXPECTED PASS` — a warning locally, a hard failure under `CI` (the entry
+//! must be removed before merge). An *un-parked* fixture that fails is a real
+//! regression and always fails the build. `known_failing.txt` must be empty for
+//! the suite to be Done (§6).
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use milpa_conformance::{discover, run_fixture, MilpaTarget, Scratch, Verdict, CORPUS_REL};
+
+fn corpus_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(CORPUS_REL)
+}
+
+/// Parse `known_failing.txt`: one fixture id per line; `#` starts a comment;
+/// blank lines ignored.
+fn known_failing() -> BTreeSet<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("known_failing.txt");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect()
+}
+
+fn in_ci() -> bool {
+    std::env::var_os("CI").is_some()
+}
+
+#[test]
+fn conformance_corpus() {
+    let fixtures = discover(&corpus_root());
+    assert!(
+        !fixtures.is_empty(),
+        "no fixtures discovered under {}",
+        corpus_root().display()
+    );
+    let kf = known_failing();
+    let discovered: BTreeSet<String> = fixtures.iter().map(|f| f.id.clone()).collect();
+
+    // Stale parks (renamed/deleted fixtures still listed) rot silently — reject.
+    let stale: Vec<&String> = kf.difference(&discovered).collect();
+    assert!(
+        stale.is_empty(),
+        "known_failing.txt lists fixtures that no longer exist: {stale:?}"
+    );
+
+    let mut passed = 0usize;
+    let mut xfail = 0usize;
+    let mut xpass: Vec<String> = Vec::new();
+    let mut regressions: Vec<String> = Vec::new();
+
+    for fx in &fixtures {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = Scratch::new(tmp.path()).unwrap();
+        let verdict = run_fixture(fx, &MilpaTarget, &scratch);
+        let parked = kf.contains(&fx.id);
+        match (verdict, parked) {
+            (Verdict::Pass, false) => passed += 1,
+            (Verdict::Pass, true) => xpass.push(fx.id.clone()),
+            (Verdict::Fail(_), true) => xfail += 1,
+            (Verdict::Fail(reason), false) => regressions.push(format!("{}: {reason}", fx.id)),
+        }
+    }
+
+    eprintln!(
+        "conformance: {} fixtures — {passed} pass, {xfail} xfail (parked), {} xpass, {} regressions",
+        fixtures.len(),
+        xpass.len(),
+        regressions.len()
+    );
+    for id in &xpass {
+        eprintln!("UNEXPECTED PASS: {id} (remove from known_failing.txt)");
+    }
+
+    assert!(
+        regressions.is_empty(),
+        "un-parked fixtures failed (real regressions):\n{}",
+        regressions.join("\n")
+    );
+    if in_ci() {
+        assert!(
+            xpass.is_empty(),
+            "fixtures parked in known_failing.txt unexpectedly passed (CI blocks this); \
+             remove them:\n{}",
+            xpass.join("\n")
+        );
+    }
+}
+
+/// Extract the error slugs from `docs/spec/errors.md` (one `### \`SLUG\`` per
+/// code).
+fn spec_error_codes() -> BTreeSet<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../docs/spec/errors.md");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    text.lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("### `")?;
+            let slug = rest.split('`').next()?;
+            Some(slug.to_string())
+        })
+        .collect()
+}
+
+/// Error-catalog parity (RFC §4.6). At S2 the Rust catalog is a *subset* of the
+/// spec (only wired codes), so this asserts `implemented ⊆ spec`: any Rust code
+/// absent from `errors.md` is a typo or an orphan slug. S12 completes every
+/// domain's `all_codes()` and flips this to a full bijection (also asserting
+/// `spec ⊆ implemented`).
+#[test]
+fn rust_error_codes_are_a_subset_of_the_spec() {
+    let spec = spec_error_codes();
+    assert!(
+        spec.len() > 50,
+        "errors.md parse looks wrong: only {} slugs found",
+        spec.len()
+    );
+
+    let implemented: BTreeSet<String> = milpa_core::implemented_error_codes()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert!(
+        !implemented.is_empty(),
+        "no implemented error codes enumerated"
+    );
+
+    let orphans: Vec<&String> = implemented.difference(&spec).collect();
+    assert!(
+        orphans.is_empty(),
+        "Rust emits error codes absent from docs/spec/errors.md: {orphans:?}"
+    );
+}

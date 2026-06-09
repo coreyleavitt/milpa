@@ -55,7 +55,9 @@ pub struct Profile {
 pub enum ManifestError {
     /// File could not be read (`MAN-FILE-UNREADABLE`).
     FileUnreadable(String),
-    /// KDL/structural parse failure (`MAN-PARSE`).
+    /// KDL/structural parse failure. S1/S2 skeleton uses the real generic
+    /// KDL-syntax slug (`MAN-KDL-SYNTAX`, the code fixture-001 asserts); S3 fans
+    /// this into the ~62 granular structural `MAN-*` codes.
     Parse(String),
     /// A `.nimble` translation failed (`MAN-NIMBLE-PARSE`).
     NimbleParse(String),
@@ -65,9 +67,18 @@ impl ManifestError {
     pub fn code(&self) -> &'static str {
         match self {
             ManifestError::FileUnreadable(_) => "MAN-FILE-UNREADABLE",
-            ManifestError::Parse(_) => "MAN-PARSE",
+            ManifestError::Parse(_) => "MAN-KDL-SYNTAX",
             ManifestError::NimbleParse(_) => "MAN-NIMBLE-PARSE",
         }
+    }
+
+    /// Every catalog code this domain can emit (parity companion to `code()`).
+    /// S3 fans the generic parse code out into the ~62 granular `MAN-*` grammar
+    /// codes; this list grows with them so the conformance parity check stays a
+    /// true bijection against `docs/spec/errors.md` (S12). Every entry MUST be a
+    /// real spec slug.
+    pub fn all_codes() -> &'static [&'static str] {
+        &["MAN-FILE-UNREADABLE", "MAN-KDL-SYNTAX", "MAN-NIMBLE-PARSE"]
     }
 }
 
@@ -91,6 +102,6 @@ mod tests {
             ManifestError::FileUnreadable("x".into()).code(),
             "MAN-FILE-UNREADABLE"
         );
-        assert_eq!(ManifestError::Parse("x".into()).code(), "MAN-PARSE");
+        assert_eq!(ManifestError::Parse("x".into()).code(), "MAN-KDL-SYNTAX");
     }
 }

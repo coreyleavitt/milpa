@@ -1,0 +1,3 @@
+// Synthetic harness self-test input (NOT part of the spec corpus).
+// The stub Target returns a canned error code for this fixture.
+version 1

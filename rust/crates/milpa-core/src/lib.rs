@@ -20,10 +20,29 @@ pub mod identity;
 pub mod registry;
 pub mod store;
 
-pub use error::MilpaError;
+pub use error::{CoreError, MilpaError};
 pub use fetch::{FetchError, Fetcher, FetcherRegistry, Receipt};
 pub use registry::Index;
 pub use store::CaStore;
+
+/// The union of every error code the Rust implementation can currently emit,
+/// across all domains. The single boundary the conformance parity check reads:
+/// `milpa-core` is the only crate that sees every domain enum, so it owns the
+/// union (the per-domain `all_codes()` are the SSOT; this just gathers them).
+///
+/// At S2 the catalog is intentionally a *subset* of `docs/spec/errors.md` (only
+/// the codes whose slices have wired real raises). The parity test asserts
+/// `implemented ⊆ spec` now; S12 completes every domain's `all_codes()` and the
+/// test flips to a full bijection. A code here that is *not* in the spec is
+/// always a defect (a typo or an orphaned slug), which the subset check catches.
+pub fn implemented_error_codes() -> Vec<&'static str> {
+    let mut codes: Vec<&'static str> = Vec::new();
+    codes.extend_from_slice(milpa_manifest::ManifestError::all_codes());
+    codes.extend_from_slice(milpa_solver::SolverError::all_codes());
+    codes.extend_from_slice(fetch::FetchError::all_codes());
+    codes.extend_from_slice(error::CoreError::all_codes());
+    codes
+}
 
 // ---------------------------------------------------------------------------
 // The three resolver traits (RFC §4.6). All defined here; a partially-
@@ -79,4 +98,3 @@ pub trait FrozenResolver {
         deps_dir: &Path,
     ) -> Result<ResolvedGraph, MilpaError>;
 }
-

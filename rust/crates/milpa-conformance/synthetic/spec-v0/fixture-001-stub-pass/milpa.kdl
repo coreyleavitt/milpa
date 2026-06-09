@@ -1,0 +1,5 @@
+// Synthetic harness self-test input (NOT part of the spec corpus).
+// The stub Target ignores this content; it exists so the fixture has the
+// shape of a real `resolve` fixture for the discovery + dispatch path.
+name "stub-app"
+kind "application"

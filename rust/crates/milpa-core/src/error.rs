@@ -36,6 +36,15 @@ impl CoreError {
             | CoreError::Tianguis(c, _) => c,
         }
     }
+
+    /// Every catalog code `milpa-core`'s own domains can emit (parity companion
+    /// to `code()`). Each variant carries a dynamic `&'static str` slug, so this
+    /// is the hand-maintained enumeration of the `LOCK-*`/`ID-*`/`CAS-*`/`RES-*`/
+    /// `TNG-*` codes as their slices wire them. Empty until S4/S5a/S7b/S8 land
+    /// real raises; grown there and completed to a bijection in S12.
+    pub fn all_codes() -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// The boundary wrapper every public API returns. `code()` delegates to the
@@ -90,12 +99,12 @@ mod tests {
     #[test]
     fn wrapper_delegates_code_across_domains() {
         let m: MilpaError = ManifestError::Parse("x".into()).into();
-        assert_eq!(m.code(), "MAN-PARSE");
+        assert_eq!(m.code(), "MAN-KDL-SYNTAX");
 
         let s: MilpaError = SolverError::Conflict("x".into()).into();
         assert_eq!(s.code(), "SOLVE-CONFLICT");
 
-        let c: MilpaError = CoreError::Lockfile("LOCK-PARSE", "x".into()).into();
-        assert_eq!(c.code(), "LOCK-PARSE");
+        let c: MilpaError = CoreError::Lockfile("LOCK-KDL-SYNTAX", "x".into()).into();
+        assert_eq!(c.code(), "LOCK-KDL-SYNTAX");
     }
 }

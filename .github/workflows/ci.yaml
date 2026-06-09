@@ -1,0 +1,54 @@
+# Minimal CI for the Rust reference impl + the Python impl (RFC §5).
+#
+# One small workflow, landed at S2 (when the conformance harness first exists)
+# so the long-lived `rust` branch never accumulates silent build breakage.
+# Deliberately un-elaborate: no matrix, no caching, no extra lints — those stay
+# deferred per §5. The Rust job builds the pinned `rust/Containerfile` and runs
+# cargo *inside* it (via `./dev-rust`), so CI and local dev share one toolchain.
+#
+# Scope: the `rust` branch only. The `rust/` workspace does not exist on `main`,
+# and the spec/Python side already lands directly on `main` pre-1.0.
+name: ci
+
+on:
+  push:
+    branches: [rust]
+  pull_request:
+    branches: [rust]
+
+# CI=true is set by GitHub Actions automatically; the conformance harness reads
+# it to make an unexpected `known_failing.txt` pass (xpass) a hard failure.
+
+jobs:
+  rust:
+    name: rust (conformance harness, pinned container)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Bake the pinned toolchain image (Tumbleweed + rustup Rust 1.96). dev-rust
+      # then runs cargo inside it; MILPA_RUST_IMAGE points at the freshly built
+      # tag instead of the (not-yet-published) ghcr image.
+      - name: Build toolchain image
+        run: docker build -f rust/Containerfile -t milpa-rust:ci rust
+
+      - name: cargo fmt --check
+        run: MILPA_RUST_IMAGE=milpa-rust:ci ./dev-rust fmt --all -- --check
+
+      - name: cargo clippy -D warnings
+        run: MILPA_RUST_IMAGE=milpa-rust:ci ./dev-rust clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test (honors known_failing.txt)
+        run: MILPA_RUST_IMAGE=milpa-rust:ci ./dev-rust test --workspace
+
+  python:
+    name: python (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: uv sync
+        run: uv sync
+      - name: uv run pytest
+        run: uv run pytest

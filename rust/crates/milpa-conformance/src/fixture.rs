@@ -1,0 +1,128 @@
+//! Fixture *I/O*: discovery, `cmd` dispatch, and `expected/` reading
+//! (conformance-fixtures.md §1.2, §2.7, §3.1). Deliberately free of any milpa
+//! input parsing — a [`Fixture`] exposes its directory and the harness contract
+//! (which `cmd`, success-or-error, the expected error slug), and the
+//! implementation-under-test ([`crate::runner::Target`]) reads and parses the
+//! raw inputs itself. That keeps this layer a true black box.
+
+use std::path::{Path, PathBuf};
+
+/// Which entry point a fixture exercises (conformance-fixtures.md §2.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cmd {
+    /// `resolve` (default): parse `milpa.kdl` (+ optional `index.kdl`) and
+    /// resolve against `mocked-fetches/`.
+    Resolve,
+    /// `parse-lockfile`: parse the fixture's `milpa.lock` input only. Always an
+    /// error fixture (no success variant).
+    ParseLockfile,
+    /// `frozen`: no-network frozen path against `milpa.kdl` + `milpa.lock`,
+    /// optionally CAS-seeded from `cas-seed/`.
+    Frozen,
+}
+
+impl Cmd {
+    fn from_dir(dir: &Path) -> Self {
+        match std::fs::read_to_string(dir.join("cmd")) {
+            Ok(text) => match text.trim() {
+                "parse-lockfile" => Cmd::ParseLockfile,
+                "frozen" => Cmd::Frozen,
+                _ => Cmd::Resolve,
+            },
+            // Absent `cmd` ⇒ resolve (§2.7).
+            Err(_) => Cmd::Resolve,
+        }
+    }
+}
+
+/// The harness contract a fixture asserts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expected {
+    /// Byte-diff `expected/{milpa.lock,nim.cfg,_deps_structure.txt}`.
+    Success,
+    /// Assert the raised error's `.code()` equals this spec slug
+    /// (`expected/error`, §3.1).
+    Error(String),
+}
+
+/// A discovered fixture: its identity, directory, selected `cmd`, and contract.
+#[derive(Debug, Clone)]
+pub struct Fixture {
+    /// Stable id, e.g. `spec-v1/fixture-003-single-url-dep`. Used in
+    /// `known_failing.txt` and test output.
+    pub id: String,
+    /// The fixture directory (inputs + `expected/`).
+    pub dir: PathBuf,
+    pub cmd: Cmd,
+    pub expected: Expected,
+}
+
+impl Fixture {
+    /// Load a single fixture directory into its harness contract. Reads `cmd`
+    /// and `expected/` only — inputs are left on disk for the `Target`.
+    pub fn load(id: impl Into<String>, dir: &Path) -> Self {
+        let error_file = dir.join("expected").join("error");
+        let expected = match std::fs::read_to_string(&error_file) {
+            Ok(slug) => Expected::Error(slug.trim().to_string()),
+            Err(_) => Expected::Success,
+        };
+        Fixture {
+            id: id.into(),
+            dir: dir.to_path_buf(),
+            cmd: Cmd::from_dir(dir),
+            expected,
+        }
+    }
+}
+
+/// Discover every `spec-v<N>/fixture-*` directory under `root`, sorted by id for
+/// deterministic ordering. `root` may be the shared corpus ([`crate::CORPUS_REL`]
+/// resolved against `CARGO_MANIFEST_DIR`) or the synthetic self-test corpus.
+///
+/// The walk mirrors the Python adapter's two-level scan: `spec-v*` group dirs,
+/// then `fixture-*` dirs within each. Non-matching entries are ignored.
+pub fn discover(root: &Path) -> Vec<Fixture> {
+    let mut fixtures = Vec::new();
+    let Ok(groups) = std::fs::read_dir(root) else {
+        return fixtures;
+    };
+    let mut group_dirs: Vec<PathBuf> = groups
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("spec-v"))
+        })
+        .collect();
+    group_dirs.sort();
+
+    for group in group_dirs {
+        let group_name = group.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let Ok(entries) = std::fs::read_dir(&group) else {
+            continue;
+        };
+        let mut fixture_dirs: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_dir()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("fixture-"))
+            })
+            .collect();
+        fixture_dirs.sort();
+
+        for fixture_dir in fixture_dirs {
+            let name = fixture_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let id = format!("{group_name}/{name}");
+            fixtures.push(Fixture::load(id, &fixture_dir));
+        }
+    }
+    fixtures
+}

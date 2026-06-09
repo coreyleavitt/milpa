@@ -20,21 +20,37 @@ pub struct Receipt {
     pub resolved_ref: Option<String>,
 }
 
-/// Fetch errors. Carries a stable catalog `code()`.
+/// Fetch errors.
+///
+/// S1/S2 skeleton. The real transport-specific catalog codes (`FETCH-GIT-FAILED`,
+/// `FETCH-DOWNLOAD-FAILED`, `FETCH-SHA256-MISMATCH`, the `EXTRACT-*` family, …)
+/// are wired in S14 when the real fetchers land; `docs/spec/errors.md` has no
+/// generic `FETCH-FAILED` slug. Until then `Failed` is a non-catalog placeholder
+/// used only for *harness-level* failures (e.g. the fake fetcher's "no mock for
+/// this URL"), which never reach a fixture's `expected/error` assertion — so
+/// `all_codes()` reports none, keeping the parity check honest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchError {
-    /// The transport could not retrieve the source (`FETCH-FAILED`).
+    /// Placeholder transport failure (see type docs). Carries no catalog code.
     Failed(String),
-    /// Archive extraction failed / unsafe (`EXTRACT-*`).
+    /// Archive extraction failed / unsafe (`EXTRACT-*`), wired in S14.
     Extract(&'static str, String),
 }
 
 impl FetchError {
     pub fn code(&self) -> &'static str {
         match self {
+            // Non-catalog placeholder until S14 (see type docs).
             FetchError::Failed(_) => "FETCH-FAILED",
             FetchError::Extract(c, _) => c,
         }
+    }
+
+    /// Every *catalog* code this domain can emit (parity companion to `code()`).
+    /// Empty until S14 wires the real `FETCH-*`/`EXTRACT-*` codes — every entry
+    /// added then MUST be a real spec slug.
+    pub fn all_codes() -> &'static [&'static str] {
+        &[]
     }
 }
 

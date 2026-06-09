@@ -50,10 +50,12 @@ impl VersionSet {
 }
 
 /// Errors from parsing/solving. Carries a stable `code()` for catalog parity.
+///
+/// S1/S2 skeleton: `SOLVE-CONFLICT` is the only solve code in `docs/spec/errors.md`.
+/// Version-string parse failures map to a manifest/constraint code, wired with
+/// `parse_version` in S6 — not a fabricated `SOLVE-*` slug.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SolverError {
-    /// A version string is not parseable.
-    BadVersion(String),
     /// No assignment satisfies the constraints.
     Conflict(String),
 }
@@ -61,9 +63,17 @@ pub enum SolverError {
 impl SolverError {
     pub fn code(&self) -> &'static str {
         match self {
-            SolverError::BadVersion(_) => "SOLVE-BAD-VERSION",
             SolverError::Conflict(_) => "SOLVE-CONFLICT",
         }
+    }
+
+    /// Every catalog code this domain can emit. The companion to `code()` for
+    /// error-catalog parity (the conformance harness unions these across domains
+    /// and checks them against `docs/spec/errors.md`). Kept beside `code()` so
+    /// adding a variant forces updating both — the closest Rust gets to deriving
+    /// the slug set without a macro. Every entry MUST be a real spec slug.
+    pub fn all_codes() -> &'static [&'static str] {
+        &["SOLVE-CONFLICT"]
     }
 }
 
