@@ -1,0 +1,6 @@
+name "libb"
+kind "library"
+src_dir "src"
+deps {
+    member "liba"
+}

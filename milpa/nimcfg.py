@@ -131,32 +131,30 @@ def member_dep_closure(
     return [by_name[n] for n in order]
 
 
-def write_workspace_nimcfgs(
+def format_workspace_nimcfgs(
     workspace,  # Workspace from milpa.workspace
     graph: ResolvedGraph,
-) -> list[Path]:
-    """Emit one nim.cfg per workspace member at <root>/<member-path>/nim.cfg.
+) -> dict[str, str]:
+    """Render the per-member nim.cfg text for every workspace member.
 
-    Each member's nim.cfg lists only its transitively-reachable deps
-    (Nim isolation per-member). --path: lines use relative paths from
-    the member's directory:
+    Returns a dict keyed by each member's as-declared workspace-relative
+    `path` (the same string that names its subdirectory) → nim.cfg text.
+    This is the pure SSOT emitter; `write_workspace_nimcfgs` and the
+    conformance harness both consume it so neither re-derives the format.
+
+    Each member's text lists only its transitively-reachable deps (Nim
+    isolation per-member). --path: lines use POSIX-separator relative
+    paths from the member's directory:
       - external deps     → <root>/_deps/<dep>/<src>
       - member references → <root>/<other-member-path>/<src>
-
-    POSIX path separators regardless of host OS — nim.cfg syntax is
-    OS-agnostic.
-
-    Returns the list of written paths, in member declaration order.
     """
     import os
 
     deps_dir = workspace.root / "_deps"
     member_dir_by_name = {m.name: m.directory for m in workspace.members}
-    written: list[Path] = []
+    result: dict[str, str] = {}
 
     for member in workspace.members:
-        target = member.directory / "nim.cfg"
-        target.parent.mkdir(parents=True, exist_ok=True)
         lines = [_HEADER.rstrip("\n"), ""]
 
         # Lexicographic emission order — same canonical rule as the
@@ -177,9 +175,29 @@ def write_workspace_nimcfgs(
 
         if closure:
             lines.append("")
-        target.write_text("\n".join(lines))
-        written.append(target)
+        result[member.path] = "\n".join(lines)
 
+    return result
+
+
+def write_workspace_nimcfgs(
+    workspace,  # Workspace from milpa.workspace
+    graph: ResolvedGraph,
+) -> list[Path]:
+    """Emit one nim.cfg per workspace member at <root>/<member-path>/nim.cfg.
+
+    Delegates formatting to `format_workspace_nimcfgs` (the SSOT emitter)
+    and writes each member's text to its directory.
+
+    Returns the list of written paths, in member declaration order.
+    """
+    texts = format_workspace_nimcfgs(workspace, graph)
+    written: list[Path] = []
+    for member in workspace.members:
+        target = member.directory / "nim.cfg"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(texts[member.path])
+        written.append(target)
     return written
 
 

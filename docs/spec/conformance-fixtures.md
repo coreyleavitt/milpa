@@ -145,12 +145,19 @@ fixture-NNN-<slug>/
       <name>.nimble            # nimble file for the package (may be absent)
   expected/                    # success: outputs to byte-diff
     milpa.lock                 # or: error fixture has none of these
-    nim.cfg
+    nim.cfg                    # single-package fixtures only (see §2.5)
+    <member>/                  # workspace fixtures only: one dir per member
+      nim.cfg                  #   the member's own nim.cfg (see §2.5)
     _deps_structure.txt
   # — OR for an error fixture (see §3) —
   expected/
     error                      # contains the bare error slug
 ```
+
+> NOTE: A single-package fixture has exactly one `expected/nim.cfg`. A
+> workspace fixture instead has one `expected/<member-path>/nim.cfg` per
+> declared member and **no** root `expected/nim.cfg` (§2.5). `milpa.lock` and
+> `_deps_structure.txt` remain single shared root outputs in both cases.
 
 ### 2.1  `milpa.kdl` — project manifest
 
@@ -173,6 +180,16 @@ fixture-NNN-<slug>/
 > adapter calls `load_workspace(fixture_root)`); member manifests are NOT
 > inlined into the root `milpa.kdl`. Member subdirectories are the only nested
 > manifest inputs a fixture may contain.
+
+> NORMATIVE: A workspace success fixture expresses its `nim.cfg` outputs
+> **per-member**, mirroring the input layout: for each member declared as
+> `member "<path>"`, the expected output is `expected/<path>/nim.cfg`. A
+> workspace fixture MUST NOT contain a root `expected/nim.cfg`. This reflects
+> milpa's workspace emission model: members do not share a single root
+> `nim.cfg`; each member gets its own with `--path:` lines relative to that
+> member's directory (sibling member dirs and the shared `_deps/`). The
+> reference adapter renders these via the same emitter milpa's CLI uses and
+> byte-diffs each against its `expected/<path>/nim.cfg`.
 
 ### 2.2  `index.kdl` — frozen index snapshot (optional)
 
@@ -291,9 +308,20 @@ Each subdirectory under `mocked-fetches/<key>/` MUST contain:
 
 ### 2.5  `expected/nim.cfg` — expected compiler path config
 
-> NORMATIVE: For a success fixture, `expected/nim.cfg` MUST contain the
-> nim.cfg output as defined in `docs/spec/lockfile-schema.md` §nim.cfg
-> emission. A conformant implementation's output MUST be byte-identical.
+> NORMATIVE: For a **single-package** success fixture, `expected/nim.cfg` MUST
+> contain the nim.cfg output as defined in `docs/spec/lockfile-schema.md`
+> §nim.cfg emission. A conformant implementation's output MUST be
+> byte-identical.
+
+> NORMATIVE: For a **workspace** success fixture, there is no root
+> `expected/nim.cfg`. Instead, each declared member `member "<path>"` has an
+> `expected/<path>/nim.cfg` containing that member's nim.cfg output (the
+> per-member emission defined in `docs/spec/resolver-semantics.md` §11.4).
+> Each member's `--path:` lines are relative to the member's own
+> directory: sibling member references resolve to `../<other-member>/<src_dir>`
+> and external deps to the shared `../_deps/<dep>/<src_dir>`. A conformant
+> implementation's output for each member MUST be byte-identical to its
+> `expected/<path>/nim.cfg`.
 
 > NOTE: `nim.cfg` uses POSIX path separators regardless of the host OS
 > (`docs/spec/lockfile-schema.md` NORMATIVE item 8). Fixtures MUST use POSIX

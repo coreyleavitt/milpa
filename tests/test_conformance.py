@@ -47,7 +47,7 @@ from milpa.resolver import ResolvedGraph, resolve, resolve_workspace
 from milpa.lockfile import (
     LockfileError, format_lockfile, from_graph, parse_lockfile,
 )
-from milpa.nimcfg import format_nimcfg
+from milpa.nimcfg import format_nimcfg, format_workspace_nimcfgs
 from milpa.profile import Profile
 from milpa.tianguis_client import parse_index, TianguisError
 from milpa.solver import SolverError
@@ -251,13 +251,14 @@ def _fixture_profile(fixture_dir: Path):
 
 def _execute(
     fixture_dir: Path, scratch: Path, cmd: str,
-) -> tuple[ResolvedGraph | None, str]:
+) -> tuple[ResolvedGraph | None, str, "Workspace | None"]:
     """Run the fixture's selected entry point.
 
-    Returns (graph, self_src_dir): a ResolvedGraph + the root package's
-    src_dir (for nim.cfg's self-path line) for "resolve"/"frozen";
-    (None, "") for "parse-lockfile" (validated for its raised code only).
-    Raises the implementation's coded exception on any error.
+    Returns (graph, self_src_dir, workspace): a ResolvedGraph + the root
+    package's src_dir (for nim.cfg's self-path line) for "resolve"/"frozen",
+    plus the loaded Workspace when the fixture is a workspace (else None).
+    Returns (None, "", None) for "parse-lockfile" (validated for its raised
+    code only). Raises the implementation's coded exception on any error.
 
     Workspace fixtures route through the real load_workspace() (reading the
     fixture dir tree from disk) — the same entry point milpa's CLI uses — so
@@ -269,7 +270,7 @@ def _execute(
 
     if cmd == "parse-lockfile":
         parse_lockfile((fixture_dir / "milpa.lock").read_text())
-        return None, ""
+        return None, "", None
 
     parsed = parse_workspace_or_manifest((fixture_dir / "milpa.kdl").read_text())
     is_ws = isinstance(parsed, WorkspaceManifest)
@@ -284,10 +285,10 @@ def _execute(
             workspace = load_workspace(fixture_dir)
             return resolve_workspace_frozen(
                 workspace, lockfile=lockfile, deps_dir=deps_dir, store=store,
-            ), self_src_dir
+            ), self_src_dir, workspace
         return resolve_frozen(
             parsed, lockfile=lockfile, deps_dir=deps_dir, store=store,
-        ), self_src_dir
+        ), self_src_dir, None
 
     # cmd == "resolve" (default). index.kdl is optional — its absence drives
     # the index=None path (RES-NO-INDEX / RES-WS-NO-INDEX).
@@ -299,24 +300,36 @@ def _execute(
         return resolve_workspace(
             workspace, deps_dir=deps_dir, index=index, fetcher=fetcher,
             profile=profile,
-        ), self_src_dir
+        ), self_src_dir, workspace
     return resolve(
         parsed, deps_dir=deps_dir, index=index, fetcher=fetcher,
         profile=profile,
-    ), self_src_dir
+    ), self_src_dir, None
 
 
 def _outputs(
     graph: ResolvedGraph, self_src_dir: str, scratch: Path,
-) -> tuple[str, str, str]:
-    """Render the three byte-diffable outputs from a resolved graph."""
+) -> tuple[str, str]:
+    """Render the shared byte-diffable outputs from a resolved graph.
+
+    Returns (lockfile_text, deps_structure). nim.cfg is handled
+    separately: single-package fixtures use `format_nimcfg`; workspace
+    fixtures emit per-member nim.cfg via `_workspace_nimcfgs`.
+    """
     lockfile_text = format_lockfile(from_graph(graph))
-    # Relative _deps path so the absolute scratch path never appears.
-    nimcfg_text = format_nimcfg(
-        graph, deps_dir=Path("_deps"), self_src_dir=self_src_dir,
-    )
     deps_structure = _read_deps_structure(scratch / "_deps", scratch / ".cas")
-    return lockfile_text, nimcfg_text, deps_structure
+    return lockfile_text, deps_structure
+
+
+def _workspace_nimcfgs(workspace, graph: ResolvedGraph) -> dict[str, str]:
+    """Per-member nim.cfg text keyed by member path, for a workspace fixture.
+
+    Workspaces emit one nim.cfg per member (members point at sibling
+    member dirs / shared _deps via relative paths), not a single root
+    nim.cfg. The harness byte-diffs each against expected/<member>/nim.cfg.
+    Uses the same SSOT emitter milpa's CLI uses (no re-derivation here).
+    """
+    return format_workspace_nimcfgs(workspace, graph)
 
 
 # ---------------------------------------------------------------------------
@@ -366,13 +379,13 @@ def test_conformance_fixture(fixture_dir: Path, tmp_path: Path):
 
     # Success fixture: run and byte-diff against expected/
     try:
-        graph, self_src_dir = _execute(fixture_dir, tmp_path, cmd)
+        graph, self_src_dir, workspace = _execute(fixture_dir, tmp_path, cmd)
         assert graph is not None, (
             f"Fixture {fixture_dir.name}: cmd {cmd!r} produced no graph but "
             f"is not an error fixture (parse-lockfile success is not a "
             f"byte-diff fixture; add expected/error)"
         )
-        lockfile_text, nimcfg_text, deps_structure = _outputs(
+        lockfile_text, deps_structure = _outputs(
             graph, self_src_dir, tmp_path,
         )
     except Exception as e:
@@ -383,14 +396,10 @@ def test_conformance_fixture(fixture_dir: Path, tmp_path: Path):
         return
 
     expected_lock = expected_dir / "milpa.lock"
-    expected_nimcfg = expected_dir / "nim.cfg"
     expected_deps = expected_dir / "_deps_structure.txt"
 
     assert expected_lock.exists(), (
         f"expected/milpa.lock missing in {fixture_dir.name}"
-    )
-    assert expected_nimcfg.exists(), (
-        f"expected/nim.cfg missing in {fixture_dir.name}"
     )
     assert expected_deps.exists(), (
         f"expected/_deps_structure.txt missing in {fixture_dir.name}"
@@ -402,11 +411,40 @@ def test_conformance_fixture(fixture_dir: Path, tmp_path: Path):
         f"--- expected ---\n{want_lock}\n--- actual ---\n{lockfile_text}"
     )
 
-    want_nimcfg = expected_nimcfg.read_text()
-    assert nimcfg_text == want_nimcfg, (
-        f"nim.cfg mismatch in {fixture_dir.name}:\n"
-        f"--- expected ---\n{want_nimcfg}\n--- actual ---\n{nimcfg_text}"
-    )
+    # nim.cfg — workspaces emit one per member (expected/<member>/nim.cfg);
+    # single-package fixtures emit one root expected/nim.cfg.
+    if workspace is not None:
+        member_cfgs = _workspace_nimcfgs(workspace, graph)
+        for member in workspace.members:
+            expected_member_cfg = expected_dir / member.path / "nim.cfg"
+            assert expected_member_cfg.exists(), (
+                f"expected/{member.path}/nim.cfg missing in {fixture_dir.name} "
+                f"(workspace fixtures emit per-member nim.cfg)"
+            )
+            want = expected_member_cfg.read_text()
+            got = member_cfgs[member.path]
+            assert got == want, (
+                f"{member.path}/nim.cfg mismatch in {fixture_dir.name}:\n"
+                f"--- expected ---\n{want}\n--- actual ---\n{got}"
+            )
+        # A workspace fixture must NOT carry a root expected/nim.cfg.
+        assert not (expected_dir / "nim.cfg").exists(), (
+            f"workspace fixture {fixture_dir.name} has a root expected/nim.cfg; "
+            f"workspaces emit per-member expected/<member>/nim.cfg instead"
+        )
+    else:
+        expected_nimcfg = expected_dir / "nim.cfg"
+        assert expected_nimcfg.exists(), (
+            f"expected/nim.cfg missing in {fixture_dir.name}"
+        )
+        nimcfg_text = format_nimcfg(
+            graph, deps_dir=Path("_deps"), self_src_dir=self_src_dir,
+        )
+        want_nimcfg = expected_nimcfg.read_text()
+        assert nimcfg_text == want_nimcfg, (
+            f"nim.cfg mismatch in {fixture_dir.name}:\n"
+            f"--- expected ---\n{want_nimcfg}\n--- actual ---\n{nimcfg_text}"
+        )
 
     # _deps_structure.txt: actual is already <CAS_ROOT>-normalized by _read_deps_structure
     want_deps = expected_deps.read_text()
