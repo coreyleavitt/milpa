@@ -1,0 +1,5 @@
+name "x"
+kind "library"
+deps {
+    foo git="ftp://example.com/foo.git" ref="main"
+}

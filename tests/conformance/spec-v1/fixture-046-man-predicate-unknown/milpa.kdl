@@ -1,0 +1,7 @@
+name "x"
+kind "library"
+deps {
+    when bogus_pred="x" {
+        foo git=(url)"https://a/foo.git" ref="main"
+    }
+}

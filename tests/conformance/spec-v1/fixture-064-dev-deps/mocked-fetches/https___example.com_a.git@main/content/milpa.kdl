@@ -1,0 +1,6 @@
+name "a"
+src_dir "src"
+dev-deps {
+    e git=(url)"https://example.com/e.git" ref="main"
+}
+kind "library"

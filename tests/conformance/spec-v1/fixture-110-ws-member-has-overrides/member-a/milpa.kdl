@@ -1,0 +1,5 @@
+name "libfoo"
+kind "library"
+overrides {
+    pkg "bar" git=(url)"https://github.com/example/bar.git" ref="main"
+}

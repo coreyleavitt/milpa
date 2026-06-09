@@ -1,0 +1,5 @@
+name "member-a"
+kind "library"
+deps {
+    foo "== 0.3.0"
+}

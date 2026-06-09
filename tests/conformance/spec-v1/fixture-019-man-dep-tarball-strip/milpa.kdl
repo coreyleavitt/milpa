@@ -1,0 +1,5 @@
+name "x"
+kind "library"
+deps {
+    foo tarball=(url)"https://x/t.tar.gz" strip_components=-1
+}

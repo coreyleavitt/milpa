@@ -1,0 +1,6 @@
+name "translib"
+kind "library"
+src_dir "src"
+deps {
+    shared git=(url)"https://upstream.example.com/shared.git" ref="main"
+}

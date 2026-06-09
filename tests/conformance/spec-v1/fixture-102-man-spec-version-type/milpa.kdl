@@ -1,0 +1,3 @@
+spec-version "x"
+name "myapp"
+kind "application"

@@ -1,0 +1,6 @@
+name "x"
+kind "library"
+flags {
+    f default=true
+    f default=false
+}

@@ -1,0 +1,10 @@
+name "x"
+kind "library"
+flags {
+    json default=false
+}
+deps {
+    when flag="undeclared" {
+        foo git=(url)"https://a/foo.git" ref="main"
+    }
+}

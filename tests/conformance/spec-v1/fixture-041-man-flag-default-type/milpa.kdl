@@ -1,0 +1,5 @@
+name "x"
+kind "library"
+flags {
+    f default="not-a-bool"
+}

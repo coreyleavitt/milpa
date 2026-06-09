@@ -1,0 +1,6 @@
+version = "0.1.0"
+author = "ex"
+description = "pkga"
+license = "MIT"
+requires "https://github.com/example/sharedlib.git"
+requires "https://github.com/other/sharedlib.git"

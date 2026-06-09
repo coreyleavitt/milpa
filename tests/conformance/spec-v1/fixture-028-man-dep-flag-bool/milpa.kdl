@@ -1,0 +1,7 @@
+name "x"
+kind "library"
+deps {
+    foo git=(url)"https://a/foo.git" ref="main" {
+        flag "a" "not-a-bool"
+    }
+}

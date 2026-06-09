@@ -1,0 +1,5 @@
+name "pkga"
+kind "library"
+deps {
+    member "pkgb"
+}

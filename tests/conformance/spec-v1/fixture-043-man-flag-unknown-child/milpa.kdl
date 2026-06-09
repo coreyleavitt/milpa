@@ -1,0 +1,7 @@
+name "x"
+kind "library"
+flags {
+    f {
+        bogus "y"
+    }
+}

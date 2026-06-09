@@ -1,0 +1,5 @@
+name "libfoo"
+kind "library"
+deps {
+    results
+}

@@ -1,0 +1,5 @@
+name "x"
+kind "library"
+overrides {
+    pkg "a" ref="main"
+}

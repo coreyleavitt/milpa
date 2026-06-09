@@ -1,0 +1,3 @@
+name "d"
+src_dir "src"
+kind "library"

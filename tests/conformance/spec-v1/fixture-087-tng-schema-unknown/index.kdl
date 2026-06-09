@@ -1,0 +1,11 @@
+schema_version 99
+package "bar" {
+    version "1.0.0" {
+        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://github.com/example/bar.git"
+            ref "v1.0.0"
+        }
+    }
+}
