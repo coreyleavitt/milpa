@@ -135,7 +135,117 @@ fn registry_dispatches_local() {
         path: src.to_string_lossy().into_owned(),
     };
     let dest = d.path().join("_deps/x");
-    let r = DefaultRegistry.fetch("x", &prov, &dest).unwrap();
+    let r = DefaultRegistry::with_curl()
+        .fetch("x", &prov, &dest)
+        .unwrap();
     assert_eq!(r.resolved_ref, None);
     assert!(dest.join("x").is_file());
+}
+
+// --- Tarball (injected http, offline) --------------------------------------
+
+/// A minimal uncompressed USTAR archive containing one regular file.
+fn single_file_tar(name: &str, data: &[u8]) -> Vec<u8> {
+    let mut h = [0u8; 512];
+    let nb = name.as_bytes();
+    h[..nb.len().min(100)].copy_from_slice(&nb[..nb.len().min(100)]);
+    h[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+    h[156] = b'0';
+    let mut out = h.to_vec();
+    out.extend_from_slice(data);
+    let pad = (512 - data.len() % 512) % 512;
+    out.extend(std::iter::repeat_n(0u8, pad));
+    out.extend(std::iter::repeat_n(0u8, 1024)); // end-of-archive
+    out
+}
+
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+    let mut e = GzEncoder::new(Vec::new(), Compression::default());
+    e.write_all(bytes).unwrap();
+    e.finish().unwrap()
+}
+
+#[test]
+fn tarball_extracts_raw_tar() {
+    let d = tmp();
+    let tar = single_file_tar("foo.nim", b"echo 1");
+    let http = move |_: &str| Ok(tar.clone());
+    let dest = d.path().join("_deps/foo");
+    fetch_tarball("foo", "https://e/foo.tar", None, 0, &dest, &http).unwrap();
+    assert_eq!(std::fs::read(dest.join("foo.nim")).unwrap(), b"echo 1");
+}
+
+#[test]
+fn tarball_extracts_gzip() {
+    let d = tmp();
+    let tgz = gzip(&single_file_tar("foo.nim", b"gz"));
+    let http = move |_: &str| Ok(tgz.clone());
+    let dest = d.path().join("_deps/foo");
+    fetch_tarball("foo", "https://e/foo.tar.gz", None, 0, &dest, &http).unwrap();
+    assert_eq!(std::fs::read(dest.join("foo.nim")).unwrap(), b"gz");
+}
+
+#[test]
+fn tarball_sha256_mismatch_rejects_before_extraction() {
+    let d = tmp();
+    let tar = single_file_tar("foo.nim", b"x");
+    let http = move |_: &str| Ok(tar.clone());
+    let dest = d.path().join("_deps/foo");
+    let err = fetch_tarball(
+        "foo",
+        "https://e/foo.tar",
+        Some("sha256:deadbeef"),
+        0,
+        &dest,
+        &http,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "FETCH-SHA256-MISMATCH");
+    assert!(!dest.exists(), "rejected before extraction");
+}
+
+#[test]
+fn tarball_sha256_match_accepts() {
+    let d = tmp();
+    let tar = single_file_tar("foo.nim", b"x");
+    let want = super::sha256_hex(&tar);
+    let http = move |_: &str| Ok(tar.clone());
+    let dest = d.path().join("_deps/foo");
+    fetch_tarball("foo", "https://e/foo.tar", Some(&want), 0, &dest, &http).unwrap();
+    assert!(dest.join("foo.nim").is_file());
+}
+
+#[test]
+fn tarball_download_failure_is_download_failed() {
+    let d = tmp();
+    let http = |_: &str| Err("connection refused".to_string());
+    let err = fetch_tarball(
+        "foo",
+        "https://e/foo.tar",
+        None,
+        0,
+        &d.path().join("dest"),
+        &http,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "FETCH-DOWNLOAD-FAILED");
+}
+
+// --- OCI (oras almost certainly absent in the container → pull-failed) ------
+
+#[test]
+fn oci_pull_failure_is_pull_failed() {
+    let d = tmp();
+    let err = fetch_oci(
+        "x",
+        "ghcr.io",
+        "org/pkg",
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        &d.path().join("_deps/x"),
+    )
+    .unwrap_err();
+    // oras absent (or the digest unresolvable) → pull failure.
+    assert_eq!(err.code(), "FETCH-OCI-PULL-FAILED");
 }

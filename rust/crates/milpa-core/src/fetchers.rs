@@ -12,20 +12,58 @@
 //! in the next sub-slice; their dispatch arms return a clearly-marked
 //! non-catalog placeholder until then.
 
+use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 
+use flate2::read::GzDecoder;
 use milpa_types::Provenance;
+use sha2::{Digest, Sha256};
 
 use crate::fetch::{FetchError, FetcherRegistry, Receipt};
+use crate::safe_extract::{extract_tar, Limits};
 
 fn transport(code: &'static str, message: impl Into<String>) -> FetchError {
     FetchError::Transport(code, message.into())
 }
 
-/// The reference [`FetcherRegistry`]: dispatch by transport kind.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct DefaultRegistry;
+/// A byte-fetching transport (an injected seam, like the index cache's): maps a
+/// URL to its bytes, or an error string. `DefaultRegistry::with_curl` uses the
+/// `curl` CLI; tests inject a closure.
+pub type HttpGet = Box<dyn Fn(&str) -> Result<Vec<u8>, String>>;
+
+/// The reference [`FetcherRegistry`]: dispatch the closed `Provenance` enum to a
+/// per-transport fetch. Carries an [`HttpGet`] for the tarball transport.
+pub struct DefaultRegistry {
+    http_get: HttpGet,
+}
+
+impl DefaultRegistry {
+    /// A registry whose tarball downloads use a custom byte transport.
+    pub fn new(http_get: impl Fn(&str) -> Result<Vec<u8>, String> + 'static) -> Self {
+        DefaultRegistry {
+            http_get: Box::new(http_get),
+        }
+    }
+
+    /// The production registry: tarball downloads shell out to `curl -fsSL`.
+    pub fn with_curl() -> Self {
+        DefaultRegistry::new(|url| {
+            let out = Command::new("curl")
+                .args(["-fsSL", url])
+                .output()
+                .map_err(|e| format!("cannot run curl: {e}"))?;
+            if out.status.success() {
+                Ok(out.stdout)
+            } else {
+                Err(format!(
+                    "curl failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ))
+            }
+        })
+    }
+}
 
 impl FetcherRegistry for DefaultRegistry {
     fn fetch(&self, name: &str, p: &Provenance, dest: &Path) -> Result<Receipt, FetchError> {
@@ -36,12 +74,23 @@ impl FetcherRegistry for DefaultRegistry {
                 ref_spec,
                 commit_sha,
             } => fetch_git(name, url, ref_spec, commit_sha.as_deref(), dest),
-            Provenance::Tarball { .. } => Err(FetchError::Failed(
-                "tarball fetcher not yet wired (S14c-next)".into(),
-            )),
-            Provenance::Oci { .. } => Err(FetchError::Failed(
-                "oci fetcher not yet wired (S14c-next)".into(),
-            )),
+            Provenance::Tarball {
+                url,
+                expected_sha256,
+                strip_components,
+            } => fetch_tarball(
+                name,
+                url,
+                expected_sha256.as_deref(),
+                *strip_components,
+                dest,
+                self.http_get.as_ref(),
+            ),
+            Provenance::Oci {
+                registry,
+                repository,
+                digest,
+            } => fetch_oci(name, registry, repository, digest, dest),
         }
     }
 }
@@ -162,6 +211,155 @@ fn git_head_sha(dir: &Path) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Download a tarball, verify its sha256 (before extraction), gunzip if needed,
+/// and safe-extract into `dest` (mirrors `TarballFetcher`). `FETCH-DOWNLOAD-FAILED`
+/// on transport error; `FETCH-SHA256-MISMATCH` if the declared hash differs (the
+/// archive is rejected BEFORE any extraction); `FETCH-EXTRACT-FAILED` wrapping any
+/// `safe_extract` violation.
+pub fn fetch_tarball(
+    name: &str,
+    url: &str,
+    expected_sha256: Option<&str>,
+    strip_components: u32,
+    dest: &Path,
+    http_get: &dyn Fn(&str) -> Result<Vec<u8>, String>,
+) -> Result<Receipt, FetchError> {
+    let bytes = http_get(url).map_err(|e| {
+        transport(
+            "FETCH-DOWNLOAD-FAILED",
+            format!("fetching {name:?} from {url}: {e}"),
+        )
+    })?;
+
+    if let Some(expected) = expected_sha256 {
+        let actual = sha256_hex(&bytes);
+        // Accept a bare hex digest or a `sha256:`-prefixed one.
+        let want = expected.strip_prefix("sha256:").unwrap_or(expected);
+        if actual != want {
+            return Err(transport(
+                "FETCH-SHA256-MISMATCH",
+                format!(
+                    "fetching {name:?}: archive sha256 mismatch — expected {expected}, got {actual} \
+                     (URL {url}); rejected before extraction"
+                ),
+            ));
+        }
+    }
+
+    // gzip magic (1f 8b) → decompress; else treat the bytes as a raw tar.
+    let tar_bytes = if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+        let mut out = Vec::new();
+        GzDecoder::new(&bytes[..])
+            .read_to_end(&mut out)
+            .map_err(|e| {
+                transport(
+                    "FETCH-EXTRACT-FAILED",
+                    format!("fetching {name:?}: gunzip: {e}"),
+                )
+            })?;
+        out
+    } else {
+        bytes
+    };
+
+    clear_dest(dest).map_err(|e| transport("FETCH-EXTRACT-FAILED", e))?;
+    extract_tar(&tar_bytes, dest, strip_components, Limits::default()).map_err(|e| {
+        let _ = std::fs::remove_dir_all(dest);
+        // Re-key any EXTRACT-* (or other) failure as the tarball-transport code.
+        transport(
+            "FETCH-EXTRACT-FAILED",
+            format!("fetching {name:?}: safe extraction failed ({})", e.code()),
+        )
+    })?;
+    Ok(Receipt { resolved_ref: None })
+}
+
+/// Pull an OCI artifact via `oras` and safe-extract its single source tarball
+/// (mirrors `OciFetcher`). `FETCH-OCI-PULL-FAILED` (incl. `oras` absent);
+/// `FETCH-OCI-NO-TARBALL` / `FETCH-OCI-AMBIGUOUS-TARBALL` on 0 / >1 `*.tar.gz`.
+pub fn fetch_oci(
+    name: &str,
+    registry: &str,
+    repository: &str,
+    digest: &str,
+    dest: &Path,
+) -> Result<Receipt, FetchError> {
+    let oci_ref = format!("{registry}/{repository}@{digest}");
+    let scratch = dest
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{name}.oci-pull"));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch)
+        .map_err(|e| transport("FETCH-OCI-PULL-FAILED", format!("oci scratch: {e}")))?;
+
+    let pull = Command::new("oras")
+        .args(["pull", &oci_ref, "--output"])
+        .arg(&scratch)
+        .output();
+    let ok = matches!(&pull, Ok(o) if o.status.success());
+    if !ok {
+        let detail = match &pull {
+            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            Err(e) => format!("cannot run oras: {e}"),
+        };
+        let _ = std::fs::remove_dir_all(&scratch);
+        return Err(transport(
+            "FETCH-OCI-PULL-FAILED",
+            format!("oras pull failed for {name:?} ({oci_ref}): {detail}"),
+        ));
+    }
+
+    let mut tarballs: Vec<std::path::PathBuf> = std::fs::read_dir(&scratch)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.to_string_lossy().ends_with(".tar.gz"))
+                .collect()
+        })
+        .unwrap_or_default();
+    tarballs.sort();
+
+    let result = match tarballs.as_slice() {
+        [] => Err(transport(
+            "FETCH-OCI-NO-TARBALL",
+            format!("OCI artifact {oci_ref} contained no *.tar.gz"),
+        )),
+        [one] => {
+            let bytes = std::fs::read(one).map_err(|e| {
+                transport(
+                    "FETCH-OCI-PULL-FAILED",
+                    format!("reading pulled tarball: {e}"),
+                )
+            })?;
+            let mut tar = Vec::new();
+            GzDecoder::new(&bytes[..])
+                .read_to_end(&mut tar)
+                .map_err(|e| transport("FETCH-EXTRACT-FAILED", format!("gunzip: {e}")))?;
+            clear_dest(dest).map_err(|e| transport("FETCH-EXTRACT-FAILED", e))?;
+            extract_tar(&tar, dest, 0, Limits::default())
+                .map(|_| Receipt { resolved_ref: None })
+                .map_err(|e| transport("FETCH-EXTRACT-FAILED", e.code().to_string()))
+        }
+        many => Err(transport(
+            "FETCH-OCI-AMBIGUOUS-TARBALL",
+            format!(
+                "OCI artifact {oci_ref} has {} *.tar.gz files; ambiguous",
+                many.len()
+            ),
+        )),
+    };
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+/// Lowercase hex sha256 of `bytes` (no `sha256:` prefix).
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Remove `dest` if present (symlink-safe), leaving the parent intact.

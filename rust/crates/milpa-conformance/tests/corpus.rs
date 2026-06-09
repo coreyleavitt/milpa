@@ -118,15 +118,9 @@ fn spec_error_codes() -> BTreeSet<String> {
 /// (modulo [`EXEMPT`]). This is the honest S12 "bijection lint": every spec code
 /// has exactly one home — implemented, deferred-to-a-known-slice, or exempt.
 const DEFERRED: &[&str] = &[
-    // S13d — `add --mirror` (needs fetching both URLs to compare identities).
+    // The milpa-cli `add --mirror` verb (fetches canonical + mirror, compares
+    // identities) — the last code awaiting the CLI binary.
     "MAN-ADD-MIRROR-IDENTITY-MISMATCH",
-    // S14c — tarball + oci transport fetchers (Local + Git already wired).
-    "FETCH-DOWNLOAD-FAILED",
-    "FETCH-EXTRACT-FAILED",
-    "FETCH-OCI-AMBIGUOUS-TARBALL",
-    "FETCH-OCI-NO-TARBALL",
-    "FETCH-OCI-PULL-FAILED",
-    "FETCH-SHA256-MISMATCH",
 ];
 
 /// Spec codes this implementation intentionally never emits.

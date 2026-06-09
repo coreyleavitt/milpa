@@ -73,6 +73,13 @@ impl FetchError {
             "FETCH-LOCAL-PATH-NOT-DIR",
             "FETCH-GIT-FAILED",
             "FETCH-GIT-COMMIT-ABSENT",
+            // tarball + oci (S14c-2).
+            "FETCH-DOWNLOAD-FAILED",
+            "FETCH-EXTRACT-FAILED",
+            "FETCH-SHA256-MISMATCH",
+            "FETCH-OCI-PULL-FAILED",
+            "FETCH-OCI-NO-TARBALL",
+            "FETCH-OCI-AMBIGUOUS-TARBALL",
         ]
     }
 }
