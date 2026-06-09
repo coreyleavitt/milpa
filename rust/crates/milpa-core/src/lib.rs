@@ -22,7 +22,7 @@ pub mod registry;
 pub mod store;
 
 pub use error::{CoreError, MilpaError};
-pub use lockfile::{load_lockfile, parse_lockfile};
+pub use lockfile::{format_lockfile, load_lockfile, parse_lockfile, write_lockfile};
 // The manifest parse entry point + role discriminant, re-exported so the
 // conformance harness (and the CLI, S13) reach them through the integration
 // crate rather than depending on `milpa-manifest` directly. `MilpaError`'s
