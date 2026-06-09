@@ -127,7 +127,9 @@ Each `fixture-NNN-<slug>/` directory has this exact layout:
 
 ```
 fixture-NNN-<slug>/
-  milpa.kdl                    # input: project manifest
+  milpa.kdl                    # input: project manifest (workspace root for workspace fixtures)
+  <member>/                    # input (optional): workspace member subdir (see §2.1.1)
+    milpa.kdl                  #   the member's own manifest
   index.kdl                    # input (optional): frozen tianguis index snapshot
   cmd                          # input (optional): entry-point selector (see §2.7)
   env                          # input (optional): MILPA_TARGET_* overrides (see §2.8)
@@ -160,6 +162,17 @@ fixture-NNN-<slug>/
 > (e.g., `MAN-KDL-SYNTAX`), `milpa.kdl` deliberately contains the malformed
 > content that triggers the error. The fixture is still valid from the
 > conformance-suite perspective; only the fixture inputs are malformed.
+
+### 2.1.1  Workspace member subdirectories (optional)
+
+> NORMATIVE: When the fixture's `milpa.kdl` declares a `workspace { }` block,
+> each member path named by a `member "<path>"` node MUST exist as a
+> subdirectory of the fixture root, and each such subdirectory MUST contain at
+> minimum its own `milpa.kdl`. The runner treats the fixture root as the
+> workspace root and loads members from these subdirectories (the reference
+> adapter calls `load_workspace(fixture_root)`); member manifests are NOT
+> inlined into the root `milpa.kdl`. Member subdirectories are the only nested
+> manifest inputs a fixture may contain.
 
 ### 2.2  `index.kdl` — frozen index snapshot (optional)
 
@@ -199,10 +212,11 @@ mocked network round-trip.
 > ```
 >
 > The encoding rule: apply `re.sub(r'[^A-Za-z0-9._-]', '_', url)` to the URL
-> portion, then append `@` and apply the same substitution to the ref. The
-> `@` separator is literal and is NOT substituted, because refs do not contain
-> `@` in normal usage. (If a ref contains `@`, the entire key is URL-encoded as
-> a unit with `@` also replaced; this is expected to be rare.)
+> portion, then append the literal `@` separator, then apply the same
+> substitution to the ref. The `@` separator is literal and is NOT substituted.
+> A `@` *within the ref* is not special-cased: it is replaced by `_` like any
+> other character outside `[A-Za-z0-9._-]` (so a ref `v1@beta` encodes to
+> `v1_beta`). Only the single separator `@` between url and ref is preserved.
 
 > NOTE: The Python conformance adapter (S8b) derives the subdirectory name
 > from a `GitProvenance(url, ref)` pair using this rule. The derivation is the
@@ -294,34 +308,33 @@ the CAS-admission and symlink-creation steps defined in `docs/spec/identity.md`
 §3.
 
 > NORMATIVE: `_deps_structure.txt` MUST be a plain text file whose lines are
-> `<name> -> <relative-symlink-target>` pairs, one per dep, sorted
-> lexicographically by name, terminated by a trailing newline. Example:
->
-> ```
-> chronos -> ../../../../../../.cache/milpa/cas/sha256/a3f9.../
-> intonaco -> ../../../../../../.cache/milpa/cas/sha256/7c21.../
-> ```
->
-> The symlink target is the **relative** path from `_deps/<name>` to the CAS
-> entry, as required by `docs/spec/identity.md` §3.4. Absolute symlink targets
-> are non-conformant and MUST NOT appear in `_deps_structure.txt`.
-
-> NORMATIVE: The conformance adapter MUST replace the implementation-specific
-> CAS root prefix with a fixture-stable placeholder when writing the expected
-> file. The placeholder is `<CAS_ROOT>`. A runner compares lines after
-> substituting the actual CAS root with `<CAS_ROOT>`. Example stable form:
+> `<name> -> <CAS_ROOT>/sha256/<hex>/` pairs, one per dep, sorted
+> lexicographically by name, terminated by a trailing newline. Each line is
+> produced by **resolving** the `_deps/<name>` symlink to an absolute CAS entry
+> path and then substituting the runner's CAS root prefix with the
+> fixture-stable placeholder `<CAS_ROOT>` (next clause). Example stable form:
 >
 > ```
 > chronos -> <CAS_ROOT>/sha256/a3f9.../
 > intonaco -> <CAS_ROOT>/sha256/7c21.../
 > ```
 >
-> This ensures `_deps_structure.txt` is machine-independent even though the CAS
-> root location varies (`~/.cache/milpa/cas` vs `$MILPA_CACHE_DIR`).
+> The on-disk symlink itself MAY be created with a relative target (per
+> `docs/spec/identity.md` §3.4); `_deps_structure.txt` records the *resolved*
+> CAS entry, not the raw link target.
 
-> NOTE: A Rust implementation running the same fixture must apply the same
-> `<CAS_ROOT>` substitution. The Python adapter (S8b) normalizes the actual
-> symlink targets before diffing.
+> NORMATIVE: The runner MUST normalize the CAS root before substitution:
+> 1. Resolve the CAS root path to its canonical form (no symlink components — on
+>    hosts where the temp dir is itself a symlink, an unresolved prefix would
+>    fail to match the resolved symlink target).
+> 2. Form the substitution prefix as that canonical string with **no trailing
+>    path separator**.
+> 3. Replace that prefix with `<CAS_ROOT>` in each resolved target before the
+>    byte-diff.
+>
+> This makes `_deps_structure.txt` machine-independent even though the CAS root
+> location varies (`~/.cache/milpa/cas` vs `$MILPA_CACHE_DIR`). Every
+> implementation's runner (Python, Rust) applies the identical algorithm.
 
 ### 2.7  `cmd` — entry-point selector (optional)
 
@@ -544,11 +557,18 @@ emitting `milpa.lock` and `nim.cfg`.
 > 4. For an error fixture: assert that the implementation exited with a
 >    non-zero status and emitted an error whose `.code` matches `expected/error`.
 
+> NORMATIVE: When the runner invokes `nim.cfg` emission, it MUST supply the deps
+> directory as the literal relative path `_deps` (not an absolute scratch path).
+> The checked-in `expected/nim.cfg` files encode `_deps/` as the `--path:`
+> prefix; passing any other path fails the byte-diff. (This is the
+> `deps_dir=_deps` argument to `format_nimcfg` in the reference adapter.)
+
 > NOTE: The Python conformance adapter (S8b) wraps this protocol as a `pytest`
 > parametrized test that discovers all `tests/conformance/spec-v<N>/` fixture
-> directories at collection time. The Rust conformance runner (v2) invokes the
-> same fixtures via a standalone binary. Both diff against the same checked-in
-> `expected/` files; neither generates expected files at test time.
+> directories at collection time. The Rust conformance runner drives the library
+> API via `cargo test` (`#[test]` parametrization, one test per fixture), not a
+> standalone binary. Both diff against the same checked-in `expected/` files;
+> neither generates expected files at test time.
 
 ---
 

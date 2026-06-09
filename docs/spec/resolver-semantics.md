@@ -467,6 +467,13 @@ error `MAN-PREDICATE-MIXED-NEGATION`) is defined in
 > profile-filtered manifest as if the non-matching deps were never
 > declared.
 
+> NORMATIVE: When **no profile is supplied** (an absent/None profile, as opposed
+> to a profile with unset fields), predicate filtering is **disabled**: every
+> dep is included regardless of its predicates, exactly as if no predicates were
+> declared. An absent profile is not the same as a profile that matches nothing.
+> (The conformance runner passes an absent profile when a fixture has no `env`
+> file — see `conformance-fixtures.md` §2.8.)
+
 > NORMATIVE: Evaluation order within a single dep's predicate list is
 > conjunction: ALL predicates on a dep must match. Evaluation across
 > values within one predicate is disjunction (OR semantics): the
@@ -557,10 +564,14 @@ cross-references this section rather than restating the list.
 >
 > No other `FROZEN-*` codes exist. The list is closed.
 
-> NORMATIVE: Conditions 1–5 and 6–7 are checked inside
-> `resolve_frozen()` (single-package path); conditions 8–10 are checked
-> inside `resolve_workspace_frozen()`. Condition 6 (`FROZEN-LEGACY-REGISTRY-PROVENANCE`)
-> may be raised from either path via `_source_from_provenance`.
+> NORMATIVE: Conditions 1–5 and 7 are checked inside `resolve_frozen()`
+> (single-package path); conditions 8–10 are checked inside
+> `resolve_workspace_frozen()`. **Condition 6
+> (`FROZEN-LEGACY-REGISTRY-PROVENANCE`) is checked in BOTH paths** — it is
+> raised via `_source_from_provenance` wherever a locked dep is materialized, so
+> a `registry`-provenance dep in a workspace member triggers it under
+> `resolve_workspace_frozen()` exactly as it does in the single-package path. An
+> implementation MUST NOT scope condition 6 to the single-package path only.
 
 > NORMATIVE: Workspace-member deps are verified by computing their
 > on-disk `content_hash` and comparing against the lockfile's pinned
