@@ -451,6 +451,25 @@ honest expectations; the §9 coverage map ties each fixture family to its slice.
   and the first-success-fixture milestone shifts accordingly. Likewise an S0(a)
   fall to the hand-rolled KDL reader enlarges S3. These contingencies are why S0
   runs *before* the grind commits to estimates, not mid-S7.
+  - **DECISION S0(a) — kdl-rs: USE THE CRATE (`kdl` 6.7.1).** Throwaway probe
+    confirmed both pass criteria: `dep "X" git=(url)"https://…"` exposes the
+    `(url)` annotation via `KdlEntry::ty()` and the value via
+    `KdlEntry::value().as_string()`; a malformed doc surfaces
+    `KdlError::diagnostics[].span` (byte offset+len) resolvable to line/column
+    (probe hit `line=2 col=18`). No hand-rolled reader needed — S3 keeps its
+    baseline scope.
+  - **DECISION S0(b) — pubgrub-rs: USE THE CRATE (`pubgrub` 0.4.0).** Throwaway
+    probe drove `resolve()` over the fixture-063 scenario and got the canonical
+    solution **X=2.0.0, Y=1.0.0, Z=1.0.0** (byte-matches `expected/milpa.lock`).
+    BFS order P is achieved by `DependencyProvider::prioritize` returning
+    `Reverse(package_name)` (lex-smaller name → higher priority → chosen first);
+    maxver is `choose_version` = highest in-range candidate. No teaching-solver
+    port — **S7a stays the ~3-day "wire the crate" branch**, not the ~10+-day
+    port. API facts for the grind: 0.4 `prioritize` takes a third
+    `PackageResolutionStatistics` arg; `Dependencies::Available(DependencyConstraints)`;
+    `Range`/`SemanticVersion` re-exported from `pubgrub`; `Err = Infallible` ok.
+  - **Pinned crate versions (carry into S1's `Cargo.lock`):** `kdl` 6.7.1,
+    `pubgrub` 0.4.0, `miette` 7.6.0 (kdl's diagnostic substrate).
 - **S1 — Workspace scaffold + coexistence.** Six-crate `/rust/` workspace
   (§4.1), `rust-toolchain.toml`, committed `Cargo.lock`, `Containerfile` +
   `./dev-rust`, `.gitignore`. `milpa-types` holds the type skeletons; the three
