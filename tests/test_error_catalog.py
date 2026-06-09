@@ -478,21 +478,27 @@ def test_every_fetch_code_in_source_is_in_the_catalog():
     )
 
 
+# Exclusive-dispatch / no-candidates programmer-invariants — exempt from the
+# error catalog by explicit decision (plugin-contract §5): they are call-site
+# or registration bugs, not reachable from user input, so they carry no
+# user-facing slug. Each entry is a stable identifying substring of the raised
+# FetchError message. This is THE single exemption list (no separate unused
+# set); the Rust catalog lint MUST mirror it (RFC §10/P4).
+FETCH_UNCODED_INVARIANTS: set[str] = {
+    "no candidates provided",        # fetch_any() with empty candidate list
+    "ambiguous fetcher dispatch",    # >1 fetcher claims a provenance kind
+    "no registered fetcher handles", # 0 fetchers claim a provenance kind
+}
+
+
 def test_every_fetch_raise_in_source_carries_a_code():
     """Every user-facing `raise FetchError(...)` in production code must
-    include a `code=` kwarg.  Programmer-invariant raises (no-candidates,
-    no-registered-fetcher, ambiguous-dispatch) are exempt and listed in
-    KNOWN_UNCODED."""
+    include a `code=` kwarg. The exclusive-dispatch / no-candidates
+    programmer-invariants are exempt — identified by FETCH_UNCODED_INVARIANTS
+    (the single exemption list, per plugin-contract §5). A new uncoded raise
+    that isn't one of those invariants fails this lint."""
     import re
     from pathlib import Path
-
-    # These raise sites are programmer-invariant panics (registration bugs
-    # or call-site bugs) — not reachable from user input.
-    KNOWN_UNCODED: set[str] = {
-        "fetchers/types.py:_select-ambiguous",
-        "fetchers/types.py:_select-no-match",
-        "fetchers/types.py:fetch_any-no-candidates",
-    }
 
     root = Path(__file__).parent.parent / "milpa"
     missing: list[str] = []
@@ -502,22 +508,16 @@ def test_every_fetch_raise_in_source_carries_a_code():
         text = py.read_text()
         for m in re.finditer(r'raise\s+FetchError\(', text):
             tail = text[m.start():m.start() + 800]
-            if "code=" not in tail:
-                lineno = text[:m.start()].count("\n") + 1
-                rel = str(py.relative_to(root))
-                # Check against known-uncoded whitelist by pattern
-                # (the comment in the source identifies these).
-                snippet = tail[:120].replace("\n", " ")
-                if (
-                    "no candidates provided" in snippet
-                    or "ambiguous fetcher dispatch" in snippet
-                    or "no registered fetcher handles" in snippet
-                ):
-                    continue
-                missing.append(f"{rel}:{lineno}")
+            if "code=" in tail:
+                continue
+            snippet = tail[:200].replace("\n", " ")
+            if any(token in snippet for token in FETCH_UNCODED_INVARIANTS):
+                continue
+            lineno = text[:m.start()].count("\n") + 1
+            missing.append(f"{py.relative_to(root)}:{lineno}")
     assert missing == [], (
-        "raise FetchError(...) without code= at:\n  "
-        + "\n  ".join(missing)
+        "raise FetchError(...) without code= (and not an exempt dispatch "
+        "invariant in FETCH_UNCODED_INVARIANTS) at:\n  " + "\n  ".join(missing)
     )
 
 

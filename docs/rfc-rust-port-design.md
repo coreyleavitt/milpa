@@ -473,10 +473,11 @@ honest expectations; the §9 coverage map ties each fixture family to its slice.
   `when`/predicate blocks, feature flags, `dev-deps`, `spec-version`; **and the
   `.nimble` line-form compat parser** (four `requires` forms, `srcDir`,
   `when`-block warning, `nim`-requirement drop). Greens the **62 MAN-* error
-  fixtures** (the bulk of the corpus). *Note (round-2): there are **no**
-  `NIMBLE-*` error fixtures (corpus gap, §10); the `.nimble` parser is exercised
-  only indirectly via transitive `.nimble` files in S7b+ success fixtures, plus
-  the unit tests this slice ports.*
+  fixtures** (the bulk of the corpus). *Note: `NIMBLE-*` codes are **exempt**
+  from the conformance corpus (§10/P2 — not fixture-expressible; unit-tested and
+  translated to `MAN-FILE-UNREADABLE` at the discovery layer); the `.nimble`
+  parser is exercised indirectly via transitive `.nimble` files in S7b+ success
+  fixtures, plus the unit tests this slice ports.*
 - **S4 — Identity + CAS.** Byte-exact content hash, CAS layout/admit/link, the
   4-tier precedence, scratch lifecycle, symlink UTF-8 guard, **two-table
   algorithm-agility dispatch** (`SUPPORTED_ALGORITHMS` + digest-length table, not
@@ -522,9 +523,11 @@ honest expectations; the §9 coverage map ties each fixture family to its slice.
 - **S11 — Workspace resolution.** Multi-member union + detection (resolver §11,
   cli §7.1) **and per-member `nim.cfg` emission filtered to each member's own
   closure** (lockfile §7.6). Greens the 6 WS-* error fixtures + unit tests for
-  unreachable `WS-NO-MANIFEST`. **Prerequisite: ≥1 workspace *success* fixture
-  must be created on `main` first (§10) — it does not exist yet; without it
-  S11's success path has no byte-validation target.**
+  unreachable `WS-NO-MANIFEST`. Greens the workspace *success* fixture
+  (fixture-117, created in §10/P1), whose expected nim.cfg is **per-member**
+  (`expected/<member>/nim.cfg`, no root `nim.cfg`) — the Rust harness must route
+  workspace fixtures through the per-member emitter, exactly as the Python
+  adapter now does.
 - **S12 — Error catalog parity.** Independent Rust catalog + the **`#[test]`**
   bijection lint against `errors.md` (§4.6, not `build.rs`). Add the
   **conformance declaration** (`[package.metadata.milpa]` spec version +
@@ -616,8 +619,8 @@ Sets honest expectations for the grind and exposes the front-loading:
 | nim.cfg-shape **success** | + S9 | success |
 | FROZEN-* | S10 | error |
 | WS-* (6, errors) | S11 | error |
-| workspace **success** (must be added, §10) | S11 (+ the new fixture) | success |
-| NIMBLE-* | — none exist (corpus gap, §10) | — |
+| workspace **success** (added, §10/P1) | S11 (fixture-117; **per-member** nim.cfg, see §10/P1) | success |
+| NIMBLE-* | exempt — unit-tested, not fixture-expressible (§10/P2) | exempt |
 
 The first *success* fixture greens only after **S4+S5b+S6+S7b+S7c+S9** — the RED
 backbone's value is real but concentrated in the error families until then. Note
@@ -633,26 +636,63 @@ oracle generates them) so the corpus-drift protocol (§4.3) then carries them to
 `rust`. They run *before* the Rust scaffold grind; none of them block S0–S2, but
 they gate S3/S5b/S8/S11, so doing them first keeps those slices unblocked.
 
-- **P1 — Workspace success fixture(s).** There are zero (all 6 WS fixtures are
-  errors), so S11's success path has no byte-validation target. Author ≥1
-  two-member workspace success fixture via the Python oracle, with
-  `expected/{milpa.lock,nim.cfg,_deps_structure.txt}`. Done: Python suite greens
-  it. **Gates S11.**
-- **P2 — `NIMBLE-*` error fixtures.** `NIMBLE-FILE-NOT-FOUND` / `-UNREADABLE` are
-  in `errors.md` with no fixture — a coverage-floor bijection gap. Author 2
-  NIMBLE-* error fixtures. Done: Python suite greens them; bijection lint clean.
-  **Gates S3 completeness.**
-- **P3 — Lockfile string-escaping fixture (R11).** Author 1 fixture with a `"`/`\`
-  in a name/URL + correctly-escaped `expected/`. Because Python doesn't escape
-  yet (R11), this also requires fixing the Python `format_lockfile` defect — or
-  parking the fixture in Python's `known_failing` until that fix lands. Done:
-  fixture + Python escaping fix both green. **Gates S5b escaping correctness.**
-- **P4 — Exclusive-dispatch error decision (plugin-contract §5).** The ambiguous
-  / no-handler conditions raise bare `FetchError` with no slug. **Decision
-  (recommended): exempt** — they are programmer-invariants, not user-facing, so
-  both impls' bijection lints share an explicit exemption list (rather than
-  minting `FETCH-AMBIGUOUS-DISPATCH`/`FETCH-NO-HANDLER`). Done: exemption list
-  added to the Python lint + documented for the Rust lint. **Gates S8/S12.**
+- **P1 — Workspace success fixture(s). DONE.** There were zero (all 6 WS fixtures
+  are errors), so S11's success path had no byte-validation target. Authored
+  fixture-117 (two-member workspace) via the Python oracle. **Workspace nim.cfg is
+  per-member, not a single root file** — milpa emits one `nim.cfg` per member
+  (`write_workspace_nimcfgs`, W4/#76) with `--path:` lines relative to each
+  member's dir (sibling members → `../<member>/<src>`, externals → shared
+  `../_deps/<dep>/<src>`); there is no root `nim.cfg`. The first workspace success
+  fixture surfaced this latent gap (the harness previously emitted a single
+  single-package `nim.cfg`). Resolution (approved): expected layout is
+  `expected/{milpa.lock,_deps_structure.txt}` + `expected/<member>/nim.cfg` per
+  member; the harness routes `WorkspaceManifest` fixtures through the per-member
+  emitter (`format_workspace_nimcfgs`, extracted as the SSOT emitter shared by the
+  CLI writer and the harness); spec `conformance-fixtures.md` §2/§2.1.1/§2.5
+  amended; `resolver-semantics.md` §11.4 already covered per-member emission. Done:
+  Python suite greens it (902 passing). **Gates S11.**
+- **P2 — `NIMBLE-*` codes. DONE (premise corrected + SSOT fix).** The original
+  framing ("coverage-floor bijection gap, author 2 fixtures") was wrong on
+  investigation: (1) the bijection lint was already clean (`NIMBLE-FILE-NOT-FOUND`
+  unit-tested, `-UNREADABLE` in `KNOWN_UNTESTED`); (2) `NIMBLE-*` are **not
+  conformance-fixture-expressible** — `load_nimble` (their sole raiser) had no
+  production caller, the conformance harness never runs `.nimble` discovery, and a
+  missing/unreadable file can't be committed to git. Investigation also surfaced an
+  **SSOT duplication**: `_load_manifest_from_nimble` re-implemented the file read and
+  raised `MAN-FILE-UNREADABLE`, while `load_nimble`(→`NIMBLE-*`) was dead outside
+  tests. Resolution (Corey: fix inline): `_load_manifest_from_nimble` now **delegates
+  to `load_nimble`** (single `.nimble` reader / SSOT) and **translates** its
+  nimble-layer error to the discovery layer's `ManifestError` contract
+  (IO→`MAN-FILE-UNREADABLE`, non-IO→`MAN-NIMBLE-PARSE`); the `ManifestError`
+  contract is load-bearing (CLI catches it at 6 sites). The MAN-/NIMBLE- overlap is
+  resolved by **explicit layering** (loader codes vs discovery-adapter codes, one
+  read impl), not duplicate reads. Catalog `when=` text + `errors.md` updated to
+  document the layering; both file-IO codes are now directly tested
+  (`KNOWN_UNTESTED` for them removed). **Conformance/Rust note (S12):** `NIMBLE-*`
+  are exempt from the conformance corpus — covered by unit tests, translated to
+  `MAN-FILE-UNREADABLE` before any resolver/CLI surface; the Rust catalog lint
+  carries the same exemption. Done: suite 904 passing. **Gates S3 completeness.**
+- **P3 — Lockfile string-escaping fixture (R11). DONE.** Authored
+  `fixture-118-lock-string-escaping` — a URL dep whose `ref` contains both `"`
+  and `\` (raw value `v1"x\y`), with the escaped `expected/milpa.lock`
+  (`ref "v1\"x\\y"`). Fixed the Python `format_lockfile` R11 defect at the root:
+  added the SSOT `_kdl_str` escaper (escapes `"`, `\`, control chars) and routed
+  **every** emitted string value through it (dep/strategy/identity/version/src_dir/
+  requires/active_flags/self_mirrors + all provenance fields). Added a
+  format→parse round-trip unit test over the full special-char domain. No
+  `known_failing` parking needed — the fix landed directly. lockfile-schema R11
+  NOTE updated (defect reconciled). Done: suite 906 passing. **Gates S5b escaping
+  correctness.**
+- **P4 — Exclusive-dispatch error decision (plugin-contract §5). DONE.** The
+  ambiguous / no-handler conditions (+ `fetch_any` no-candidates) raise bare
+  `FetchError` with no slug. **Decision: exempt** — programmer-invariants, not
+  user-facing; no `FETCH-AMBIGUOUS-DISPATCH`/`FETCH-NO-HANDLER` minted. Made the
+  exemption a true SSOT: replaced the Python lint's dead `KNOWN_UNCODED` set +
+  fragile inline snippet-chain with one used list, `FETCH_UNCODED_INVARIANTS`
+  (three condition tokens), in `tests/test_error_catalog.py`. Added a NORMATIVE
+  §5.1 to `plugin-contract.md` recording the catalog exemption for **both** impls
+  (the Rust catalog lint mirrors the same set). Done: suite 906 passing.
+  **Gates S8/S12.**
 
 > NOTE: P-slices land on `main` and feed `rust` via §4.3. The
 > `strip_components`-before-hash ordering (earlier listed separately) needs no

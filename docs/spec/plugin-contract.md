@@ -311,6 +311,26 @@ will trigger the ambiguity error. A fetcher for a **new kind** (not in the
 built-in set) is possible only with a spec amendment that adds the kind to the
 kind registry; see `docs/spec/manifest-grammar.md` §4 (Layer 1 / P3).
 
+### 5.1  Dispatch errors are uncoded programmer-invariants (catalog exemption)
+
+> NORMATIVE: The ambiguity error and the no-handler error — together with the
+> `fetch_any` "no candidates provided" guard — are **programmer-invariants**:
+> they signal a registration bug or a call-site bug, never a condition reachable
+> from user input (manifest, lockfile, index, or fetched bytes). They therefore
+> carry **no error-catalog slug** and are **exempt from the error-catalog
+> bijection lint** (`docs/spec/errors.md`). An implementation MUST NOT mint
+> user-facing codes such as `FETCH-AMBIGUOUS-DISPATCH` or `FETCH-NO-HANDLER` for
+> them; it raises its transport-error type without a code (reference: bare
+> `FetchError` with `code=None`).
+
+> NORMATIVE: Every implementation's catalog-bijection lint MUST share this
+> exemption list — exactly these three invariants, identified by their condition
+> (ambiguous dispatch, no handler, no candidates), not by message text. The
+> Python reference encodes it as `FETCH_UNCODED_INVARIANTS` in
+> `tests/test_error_catalog.py`; the Rust catalog lint mirrors the same set.
+> Adding a genuinely user-reachable `FETCH-*` condition is the only path to a new
+> coded fetch error — these three never become coded.
+
 ---
 
 ## 6  Layer-2 backend binding and content-addressing override safety
