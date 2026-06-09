@@ -251,6 +251,8 @@ const MAN_CODES: &[&str] = &[
     "MAN-MUTATE-FILE-NOT-FOUND",
     "MAN-MUTATE-NIMBLE-REFUSED",
     "MAN-MUTATE-WORKSPACE-REFUSED",
+    // `milpa add --mirror` identity gate (milpa-core `add_mirror`) — S14/CLI.
+    "MAN-ADD-MIRROR-IDENTITY-MISMATCH",
     "MAN-URL-ARG-TYPE",
     "MAN-UNKNOWN-TOP-LEVEL",
     "MAN-NAME-MISSING",

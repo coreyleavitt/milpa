@@ -108,6 +108,95 @@ fn io_err(path: &Path, e: std::io::Error) -> MilpaError {
     ))
 }
 
+/// Add a mirror URL to an existing URL dep, **validated by identity** (mirrors
+/// `cli.py:cmd_add_mirror`). Fetches `mirror_url` (at the dep's declared ref) and
+/// confirms its content hash equals the dep's locked identity before recording
+/// it — a mirror that yields different bytes is a `MAN-ADD-MIRROR-IDENTITY-MISMATCH`
+/// (the identity-gate invariant: every provenance of a dep must produce identical
+/// bytes). `dep_name` must be a `UrlDep` in `milpa.kdl` with an entry in
+/// `milpa.lock`.
+pub fn add_mirror(project_dir: &Path, dep_name: &str, mirror_url: &str) -> Result<(), MilpaError> {
+    let manifest_kdl = project_dir.join("milpa.kdl");
+    let manifest = match milpa_manifest::parse_document(
+        &std::fs::read_to_string(&manifest_kdl).map_err(|e| {
+            man(
+                "MAN-MUTATE-FILE-NOT-FOUND",
+                format!("cannot read {}: {e}", manifest_kdl.display()),
+            )
+        })?,
+    )? {
+        ManifestDoc::Package(m) => m,
+        ManifestDoc::Workspace(_) => {
+            return Err(man(
+                "MAN-MUTATE-WORKSPACE-REFUSED",
+                "add --mirror is not valid on a workspace manifest".to_string(),
+            ));
+        }
+    };
+    let git_ref = manifest
+        .deps
+        .iter()
+        .find_map(|d| match d {
+            milpa_manifest::Dep::Url(u) if u.name == dep_name => Some(u.git_ref.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            man(
+                "MAN-ADD-MIRROR-IDENTITY-MISMATCH",
+                format!("add --mirror: {dep_name:?} is not a url dep in milpa.kdl"),
+            )
+        })?;
+
+    // The dep's locked identity is the trust anchor the mirror must match.
+    let lock = crate::lockfile::load_lockfile(&project_dir.join("milpa.lock"))?;
+    let locked_identity = lock
+        .deps
+        .iter()
+        .find(|d| d.name == dep_name)
+        .and_then(|d| d.identity.clone())
+        .ok_or_else(|| {
+            man(
+                "MAN-ADD-MIRROR-IDENTITY-MISMATCH",
+                format!(
+                    "add --mirror: {dep_name:?} has no locked identity — run `milpa fetch` first"
+                ),
+            )
+        })?;
+
+    // Fetch the mirror into a scratch dir and compare its content hash.
+    let scratch = project_dir.join(format!(".{dep_name}.mirror-probe"));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let actual = crate::fetchers::fetch_git(dep_name, mirror_url, &git_ref, None, &scratch)
+        .map_err(MilpaError::from)
+        .and_then(|_| crate::identity::compute_content_hash(&scratch).map_err(MilpaError::from));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let actual = actual?;
+
+    if actual != locked_identity {
+        return Err(man(
+            "MAN-ADD-MIRROR-IDENTITY-MISMATCH",
+            format!(
+                "add --mirror: {mirror_url} yields identity {actual} but {dep_name:?} is locked at \
+                 {locked_identity} — a mirror must produce byte-identical content"
+            ),
+        ));
+    }
+
+    // Identity matches → record the mirror on the dep.
+    let url = mirror_url.to_string();
+    mutate_manifest_file(&manifest_kdl, move |mut m| {
+        for d in &mut m.deps {
+            if let milpa_manifest::Dep::Url(u) = d {
+                if u.name == dep_name && !u.mirrors.contains(&url) {
+                    u.mirrors.push(url.clone());
+                }
+            }
+        }
+        m
+    })?;
+    Ok(())
+}
+
 /// Count `//`-comment lines (trimmed-leading), the comment-loss heuristic.
 fn count_comments(text: &str) -> usize {
     text.lines()

@@ -37,7 +37,7 @@ pub use lockfile::{
     format_lockfile, from_graph, load_lockfile, parse_lockfile, verify_against_graph,
     verify_lockfile_against_deps, write_lockfile,
 };
-pub use manifest_writer::{mutate_manifest_file, write_manifest, WriteResult};
+pub use manifest_writer::{add_mirror, mutate_manifest_file, write_manifest, WriteResult};
 pub use milpa_manifest::format_manifest;
 // The manifest parse entry point + role discriminant, re-exported so the
 // conformance harness (and the CLI, S13) reach them through the integration

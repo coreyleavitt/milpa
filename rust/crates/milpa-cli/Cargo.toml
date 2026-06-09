@@ -12,3 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 milpa-core = { workspace = true }
+milpa-manifest = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

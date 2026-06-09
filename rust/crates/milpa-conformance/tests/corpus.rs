@@ -117,11 +117,9 @@ fn spec_error_codes() -> BTreeSet<String> {
 /// this list; when it is empty the catalog is a pure bijection with the spec
 /// (modulo [`EXEMPT`]). This is the honest S12 "bijection lint": every spec code
 /// has exactly one home — implemented, deferred-to-a-known-slice, or exempt.
-const DEFERRED: &[&str] = &[
-    // The milpa-cli `add --mirror` verb (fetches canonical + mirror, compares
-    // identities) — the last code awaiting the CLI binary.
-    "MAN-ADD-MIRROR-IDENTITY-MISMATCH",
-];
+/// No codes remain deferred — every spec code is implemented or exempt, so the
+/// catalog is a pure bijection (`implemented ∪ exempt == spec`).
+const DEFERRED: &[&str] = &[];
 
 /// Spec codes this implementation intentionally never emits.
 const EXEMPT: &[&str] = &[

@@ -289,6 +289,8 @@ name = "milpa-cli"
 version = "0.0.0"
 dependencies = [
  "milpa-core",
+ "milpa-manifest",
+ "tempfile",
 ]
 
 [[package]]
