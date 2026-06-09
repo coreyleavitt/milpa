@@ -168,11 +168,17 @@ pub enum ManifestDoc {
 
 /// The build profile used to evaluate `when`/predicate blocks. Absent profile
 /// ⇒ all conditional deps included (RFC §4.4). This carries the inputs; the
-/// predicate *evaluation* against a profile is a resolver concern and lands with
-/// conditional-dep resolution (S7b, fixture-115).
+/// predicate *evaluation* against a profile is a resolver concern (S7b/S13,
+/// fixture-115). Mirrors the four `MILPA_TARGET_*` axes of the Python `Profile`
+/// (platform / arch / nim / milpa) plus the active feature `flags`. Each axis is
+/// `Option`: an absent axis matches no predicate of that name (the resolver's
+/// `getattr(profile, name, None)`-equivalent).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Profile {
+    pub platform: Option<String>,
+    pub arch: Option<String>,
     pub nim_version: Option<Version>,
+    pub milpa_version: Option<Version>,
     pub flags: Vec<String>,
 }
 

@@ -9,4 +9,3 @@
 #     pending S4/S5b/S6-S13).
 
 spec-v1/fixture-099-res-provenance-conflict
-spec-v1/fixture-115-conditional-dep-excluded

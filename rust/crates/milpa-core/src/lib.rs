@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use milpa_manifest::{Manifest, Profile, Workspace};
+use milpa_manifest::{Manifest, Workspace};
 use milpa_types::{Lockfile, ResolvedGraph};
 
 pub mod error;
@@ -35,8 +35,8 @@ pub use lockfile::{format_lockfile, from_graph, load_lockfile, parse_lockfile, w
 pub use fetch::{FetchError, Fetcher, FetcherRegistry, Receipt};
 pub use frozen::{resolve_frozen, resolve_workspace_frozen};
 pub use identity::{compute_content_hash, parse_identity, SUPPORTED_ALGORITHMS};
-pub use milpa_manifest::{parse_document, ManifestDoc};
-pub use milpa_solver::Strategy;
+pub use milpa_manifest::{parse_document, ManifestDoc, Profile};
+pub use milpa_solver::{parse_version, Strategy};
 pub use nimcfg::format_nimcfg;
 pub use nimcfg::format_workspace_nimcfgs;
 pub use registry::Index;

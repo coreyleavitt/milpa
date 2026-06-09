@@ -276,6 +276,10 @@ impl Target for MilpaTarget {
                     }
                 };
 
+                // Optional `MILPA_TARGET_*` profile (from the fixture's `env`
+                // file) for conditional-dep predicate filtering (§6).
+                let profile = fixture_profile(&fx.dir);
+
                 let manifest = match milpa_core::parse_document(&text) {
                     // Workspace: load (WS-* topology) → multi-member union resolve
                     // (RES-WS-*) → shared milpa.lock + per-member nim.cfg.
@@ -292,7 +296,7 @@ impl Target for MilpaTarget {
                             &loaded,
                             index.as_ref(),
                             &fetcher,
-                            None,
+                            profile.as_ref(),
                             None,
                             milpa_core::Strategy::default(),
                             &scratch.deps_dir,
@@ -323,7 +327,7 @@ impl Target for MilpaTarget {
                     &manifest,
                     index.as_ref(),
                     &fetcher,
-                    None,
+                    profile.as_ref(),
                     None,
                     &scratch.deps_dir,
                 ) {
@@ -410,6 +414,31 @@ impl Target for MilpaTarget {
             }
         }
     }
+}
+
+/// Build a [`Profile`] from a fixture's optional `env` file (KEY=VALUE per line,
+/// the `MILPA_TARGET_*` axes — conformance-fixtures §2). Returns `None` when the
+/// file is absent (no predicate filtering — the common case). Mirrors the Python
+/// harness's `_fixture_profile`.
+fn fixture_profile(dir: &Path) -> Option<milpa_core::Profile> {
+    let text = std::fs::read_to_string(dir.join("env")).ok()?;
+    let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            env.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    Some(milpa_core::Profile {
+        platform: env.get("MILPA_TARGET_PLATFORM").cloned(),
+        arch: env.get("MILPA_TARGET_ARCH").cloned(),
+        nim_version: env
+            .get("MILPA_TARGET_NIM")
+            .and_then(|s| milpa_core::parse_version(s)),
+        milpa_version: env
+            .get("MILPA_TARGET_MILPA")
+            .and_then(|s| milpa_core::parse_version(s)),
+        flags: Vec::new(),
+    })
 }
 
 /// Admit every `cas-seed/<name>/` tree into `store` under its content hash,

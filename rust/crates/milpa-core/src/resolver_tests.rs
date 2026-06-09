@@ -811,7 +811,7 @@ fn resolve_profile_filters_conditional_dep() {
     let m = manifest(vec![dep]);
     let profile = Profile {
         nim_version: Some(v(1, 9, 0)),
-        flags: Vec::new(),
+        ..Profile::default()
     };
     let graph = resolve(
         &m,

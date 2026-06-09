@@ -1482,13 +1482,25 @@ fn dep_matches_profile(dep: &Dep, profile: &Profile) -> bool {
 fn predicate_satisfied(pred: &Predicate, profile: &Profile) -> bool {
     let any_match = match pred.name.as_str() {
         "flag" => pred.values.iter().any(|v| profile.flags.contains(v)),
+        // platform / arch are plain string-equality axes (Nim's hostOS / hostCPU
+        // vocabulary); an absent axis matches nothing.
+        "platform" => match &profile.platform {
+            Some(actual) => pred.values.iter().any(|v| v == actual),
+            None => false,
+        },
+        "arch" => match &profile.arch {
+            Some(actual) => pred.values.iter().any(|v| v == actual),
+            None => false,
+        },
+        // nim / milpa are version-constraint (or plain-equality) axes.
         "nim" => match &profile.nim_version {
             Some(actual) => pred.values.iter().any(|v| version_satisfies(actual, v)),
             None => false,
         },
-        // `platform` / `arch` / `milpa` need profile fields the minimal S6
-        // `Profile` does not yet carry; a present profile that lacks the field
-        // matches nothing (mirrors Python's `getattr(profile, name, None)`).
+        "milpa" => match &profile.milpa_version {
+            Some(actual) => pred.values.iter().any(|v| version_satisfies(actual, v)),
+            None => false,
+        },
         _ => false,
     };
     if pred.negated {
