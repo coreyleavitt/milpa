@@ -1,0 +1,771 @@
+# milpa CLI contract (S15)
+
+Normative spec of the milpa command-line interface. Every implementation
+that claims milpa conformance MUST implement the behaviour marked
+`> NORMATIVE:`. Items marked `> NOTE:` describe the reference Python
+implementation; conformant alternatives MAY differ in those details.
+
+This document covers **conformance-tested verbs, global flags, exit codes,
+stdout/stderr routing, and environment variables**. Related specs:
+
+- `docs/spec/resolver-semantics.md` (S6) — `--frozen` no-network and
+  solver-bypass guarantees; prior-lockfile pin reuse
+- `docs/spec/identity.md` (S12) — CAS layout; `MILPA_CACHE_DIR` layout
+- `docs/spec/manifest-grammar.md` (S4) — predicate keys and
+  platform/arch vocabulary that `MILPA_TARGET_*` override
+- `docs/spec/errors.md` — error codes emitted to stderr
+
+---
+
+## Normative surface
+
+A conformant implementation of this spec MUST:
+
+1. Expose the eight conformance-tested verbs: `fetch`, `lock`, `show`,
+   `verify`, `clean`, `add`, `remove`, `update`.
+2. Accept `-C <dir>` (or `--directory <dir>`) as a global flag that
+   resolves the working directory before any verb executes.
+3. Accept `--frozen` as a global flag; apply its exit-1 semantics only
+   to `fetch` (the only verb with a frozen fast-path).
+4. Accept `-s`/`--strategy` with the three values `maxver`, `minver`,
+   `semver`; default to `maxver` when absent.
+5. Accept `-j`/`--parallel` as a global concurrency limit; default to 8.
+6. Route all human-readable diagnostic output to **stderr**; route all
+   machine-readable output (currently only `milpa show`'s dep tree) to
+   **stdout**.
+7. Exit 0 on success; exit 1 on any failure. No other exit codes are
+   defined for spec v1.0.
+8. Honour `MILPA_TARGET_PLATFORM`, `MILPA_TARGET_ARCH`, `MILPA_TARGET_NIM`,
+   and `MILPA_TARGET_MILPA` as overrides for conditional-dep predicate
+   evaluation; these affect the resolved graph and are normative.
+9. Honour `MILPA_CACHE_DIR` as the CAS root override; the default
+   search order is `MILPA_CACHE_DIR` → `$XDG_CACHE_HOME/milpa/cas` →
+   `~/.cache/milpa/cas`.
+10. Mark `publish` as outside spec v1.0 conformance (see §10).
+11. Implement the workspace detection algorithm described in §7.1 (parent
+    traversal; package manifests transparent; unparseable manifests absent;
+    membership check; orphan warning).
+12. Honour `MILPA_INDEX_URL` as an override for the tianguis index URL
+    (§8.1); required for air-gapped and mirror deployments.
+
+---
+
+## 1  Invocation form
+
+```
+milpa [--version] [-C <dir>] [-j <N>] [-s <mode>] [--frozen] <verb> [<verb-args>]
+```
+
+> NORMATIVE: The implementation MUST support the short flag `-C` (and
+> equivalently the long flag `--directory`) to specify a project directory.
+> All path resolution within a verb MUST be relative to the resolved
+> `<dir>`, not the process working directory at invocation.
+
+> NORMATIVE: When invoked with no verb, the implementation MUST print
+> help text to stdout and exit 0.
+
+> NOTE: The reference Python implementation resolves `<dir>` with
+> `Path(args.directory).resolve()` before dispatching, so the verb
+> functions receive an absolute path (`project_dir`).
+
+---
+
+## 2  Global flags
+
+All global flags are parsed before the verb and apply to any verb that
+uses them. Verbs that have no use for a flag silently ignore it.
+
+### 2.1  `-C <dir>` / `--directory <dir>`
+
+> NORMATIVE: Changes the effective project directory for the duration of
+> the invocation. MUST be resolved to an absolute path before any
+> filesystem operation. Default: `.` (the process working directory).
+
+### 2.2  `-j <N>` / `--parallel <N>`
+
+> NORMATIVE: Maximum number of concurrent fetch operations. MUST be a
+> positive integer. Default: `8`. A value of `1` enforces serial fetching.
+
+> NOTE: Parallelism is implemented via `concurrent.futures.ThreadPoolExecutor`
+> in `resolver.py`. The flag is forwarded as `max_parallel` to `resolve()`.
+
+### 2.3  `-s <mode>` / `--strategy <mode>`
+
+> NORMATIVE: Resolution strategy. Accepted values:
+>
+> - `maxver` (default) — select the highest version satisfying constraints
+> - `minver` — select the lowest version satisfying constraints (useful for
+>   library authors verifying minimum-version compatibility)
+> - `semver` — select the highest version within the same major as the
+>   constraint's lower bound
+>
+> The strategy is recorded in `milpa.lock` and MUST match when
+> `--frozen` is used (mismatch raises `FROZEN-STRATEGY-MISMATCH` and,
+> with `--frozen`, exits 1). Cross-reference S6 for selection semantics.
+
+> NORMATIVE: An implementation MUST reject any `--strategy` value not in
+> the set `{maxver, minver, semver}`.
+
+### 2.4  `--frozen`
+
+> NORMATIVE: When `--frozen` is given and the frozen fast-path
+> **preconditions fail** (no lockfile, CAS miss, manifest drift, strategy
+> mismatch, or any other `NotFrozen` reason), the implementation MUST
+> print the failure reason to stderr and exit 1. It MUST NOT fall through
+> to network-based resolution.
+
+> NORMATIVE: When `--frozen` is given and the frozen fast-path
+> **succeeds**, the implementation MUST exit 0 after writing `nim.cfg`
+> and MUST NOT contact any network resource.
+
+> NORMATIVE: When `--frozen` is **absent** and the frozen fast-path
+> succeeds, the implementation MUST take the fast-path (no network). When
+> the fast-path fails, it MUST silently fall through to the full
+> network-based resolve.
+
+> NOTE: `--frozen` is currently effective only for `fetch`. Other verbs
+> receive the flag but do not inspect it. The no-network and
+> solver-bypass guarantees for the frozen path are specified in S6
+> (`docs/spec/resolver-semantics.md`); this document specifies only the
+> flag-level exit semantics.
+
+> NOTE: The reference implementation performs the frozen fast-path
+> attempt unconditionally in `_try_frozen` / `_try_workspace_frozen`; the
+> `frozen` boolean only gates whether a `NotFrozen` result is an error or
+> a silent fallthrough.
+
+---
+
+## 3  Exit-code taxonomy
+
+> NORMATIVE: An implementation MUST exit with code `0` on success and
+> code `1` on any failure. No other exit codes are defined for spec v1.0.
+
+> NORMATIVE: Failure MUST produce at least one diagnostic line on stderr
+> before exiting 1. An implementation MUST NOT exit 1 silently.
+
+> NOTE: The reference Python implementation returns the exit code from
+> each `cmd_*` function and passes it to `sys.exit` via the entry point
+> (`__main__.py` or the `milpa` console-script wrapper). The return value
+> is always `0` or `1`; no other codes are produced.
+
+There is no distinction between error categories at the exit-code level
+(e.g., solver conflict vs network failure both exit 1). Error
+**identity** is carried by the slug printed to stderr (e.g.,
+`SOLVE-CONFLICT`, `FROZEN-IDENTITY-NOT-IN-STORE`) as specified in
+`docs/spec/errors.md`. Tooling that needs to distinguish failure kinds
+MUST parse the slug, not the exit code.
+
+---
+
+## 4  Stdout vs stderr routing
+
+> NORMATIVE: All human-readable diagnostic output (progress, warnings,
+> error messages) MUST be written to **stderr**.
+
+> NORMATIVE: Machine-readable output — currently only the dep tree
+> printed by `milpa show` — MUST be written to **stdout**.
+
+> NORMATIVE: Verbs that produce no machine-readable output (`fetch`,
+> `lock`, `verify`, `clean`, `add`, `remove`, `update`) MUST produce
+> **no output on stdout** on a successful run.
+
+> NOTE: The reference implementation follows this routing strictly. All
+> `print(…, file=sys.stderr)` calls are diagnostics; the sole `print(…)`
+> without a `file=` argument is in `cmd_publish`'s dry-run confirmation
+> line, which is incidental to the out-of-scope `publish` verb.
+> `cmd_show` writes its dep-tree lines to stdout (the implicit default).
+
+---
+
+## 5  Conformance-tested verbs
+
+### 5.1  `fetch`
+
+**Purpose:** Resolve the manifest, clone all deps into `_deps/`, emit
+`nim.cfg`, and write `milpa.lock`. Workspace-aware.
+
+**Arguments:** none beyond global flags.
+
+**Global flags used:** `-C`, `-j`, `-s`, `--frozen`.
+
+**Frozen fast-path:** If a lockfile is present and the global CAS holds
+every pinned identity, resolution skips fetching and only symlinks
+`_deps/` from the CAS. With `--frozen`, any precondition failure exits 1.
+Without `--frozen`, precondition failure falls through to full resolution.
+See S6 for the no-network + solver-bypass guarantees.
+
+> NORMATIVE: On success, `fetch` MUST:
+>
+> - Write or overwrite `<dir>/milpa.lock`.
+> - Write or overwrite `<dir>/nim.cfg`.
+> - Populate `<dir>/_deps/` with the fetched or CAS-linked source trees.
+> - Print a summary line to stderr (`resolved N deps` or
+>   `resolved N deps (frozen)`).
+> - Exit 0.
+
+> NORMATIVE: On any failure (manifest error, network failure, solver
+> conflict, `--frozen` precondition miss), `fetch` MUST print a
+> diagnostic to stderr and exit 1. Neither `milpa.lock` nor `nim.cfg`
+> MUST be partially written: writes are atomic (write-then-rename) or
+> the command exits 1 before reaching them.
+
+> NOTE: Workspace mode is triggered when `workspace_containing(project_dir)`
+> returns a non-None `Workspace`. In workspace mode a shared lockfile is
+> written at `<ws_root>/milpa.lock` and per-member `nim.cfg` files are
+> written at `<ws_root>/<member>/nim.cfg`. The stderr summary includes a
+> member count.
+
+**Exit codes:** 0 success, 1 failure.
+
+**stdout:** none.
+
+**stderr:** progress summary on success; diagnostic on failure.
+
+### 5.2  `lock`
+
+**Purpose:** Resolve the manifest and write `milpa.lock`; do NOT emit
+`nim.cfg` or populate `_deps/`.
+
+**Arguments:** none beyond global flags.
+
+**Global flags used:** `-C`, `-j`, `-s`. (`--frozen` is accepted but has
+no effect; `lock` always runs the full resolver.)
+
+> NORMATIVE: On success, `lock` MUST:
+>
+> - Write or overwrite `<dir>/milpa.lock`.
+> - Print a summary line to stderr (`locked N deps`).
+> - Exit 0.
+> - Leave `nim.cfg` and `_deps/` untouched.
+
+> NORMATIVE: On any failure, `lock` MUST print a diagnostic to stderr
+> and exit 1.
+
+**Exit codes:** 0 success, 1 failure.
+
+**stdout:** none.
+
+**stderr:** `locked N deps` on success; diagnostic on failure.
+
+### 5.3  `show`
+
+**Purpose:** Read `milpa.lock` and print the resolved dep tree to
+stdout. Does not resolve or fetch.
+
+**Arguments:** none beyond `-C`.
+
+**Global flags used:** `-C`.
+
+> NORMATIVE: `show` MUST read `milpa.lock` from the project directory
+> and print each dep as a block to stdout with at least: name, version,
+> truncated identity (if present), provenance summary, and direct
+> requires (if non-empty).
+
+> NORMATIVE: If `milpa.lock` does not exist, `show` MUST print a
+> diagnostic to stderr and exit 1.
+
+> NOTE: The reference output format is:
+>
+> ```
+> <name padded to 20 chars>  <version>
+>   identity    <algo>:<first-8-hex-chars>
+>   provenance  <transport> <url> @ <ref> (sha <first-8-sha-chars>)
+>   requires    <dep1>, <dep2>
+> ```
+>
+> The identity digest is truncated to 8 characters for readability.
+> This format is incidental; a conformant implementation MAY use a
+> different layout provided identity, provenance, and requires are
+> distinguishable. Machine-readable `show` output format is NOT frozen
+> for spec v1.0.
+
+**Exit codes:** 0 success, 1 failure (no lockfile, parse error).
+
+**stdout:** dep tree (one block per dep).
+
+**stderr:** diagnostic on failure only.
+
+### 5.4  `verify`
+
+**Purpose:** Recheck every dep in `_deps/` against `milpa.lock` using
+content hashes. Does not fetch.
+
+**Arguments:** none beyond `-C`.
+
+**Global flags used:** `-C`.
+
+> NORMATIVE: `verify` MUST:
+>
+> - Compute the content hash of each directory under `_deps/`.
+> - Compare against the `identity` field in `milpa.lock`.
+> - Detect extra (unlocked) entries in `_deps/` (excluding dotfiles).
+> - If all hashes match and there are no extra entries, print a summary
+>   to stderr and exit 0.
+> - If any divergence is found, print every divergence to stderr and
+>   exit 1.
+
+> NORMATIVE: If `milpa.lock` does not exist, `verify` MUST print a
+> diagnostic to stderr and exit 1. If `_deps/` does not exist, `verify`
+> MUST print a diagnostic to stderr and exit 1.
+
+> NORMATIVE: For deps with a `local` provenance, `verify` MUST emit a
+> **warning** (not an error) to stderr when the source directory's
+> current content hash differs from the lockfile pin, then continue and
+> exit 0 if no other divergence exists. Local source drift is advisory
+> because local sources are mutable by design; the user is instructed to
+> re-run `milpa fetch` to refresh the pin.
+
+> NOTE: Workspace mode is triggered when `workspace_containing(project_dir)`
+> returns a non-None `Workspace`. In workspace mode `verify` checks
+> `<ws_root>/_deps/` against the shared lockfile and reports across all
+> members.
+
+**Exit codes:** 0 success (all hashes match), 1 failure (any divergence,
+missing lockfile, or missing `_deps/`).
+
+**stdout:** none.
+
+**stderr:** `verified N deps` on success; divergence list on failure;
+local-source drift warnings are printed regardless of exit code.
+
+### 5.5  `clean`
+
+**Purpose:** Remove `_deps/` and `nim.cfg`; keep `milpa.lock`.
+
+**Arguments:** none beyond `-C`.
+
+**Global flags used:** `-C`.
+
+> NORMATIVE: `clean` MUST remove `<dir>/_deps/` (recursively) and
+> `<dir>/nim.cfg` if they exist. It MUST leave `milpa.lock` untouched.
+> It MUST exit 0 even if `_deps/` or `nim.cfg` do not exist (idempotent).
+
+> NORMATIVE: In workspace mode, `clean` MUST remove `<ws_root>/_deps/`
+> and each member's `nim.cfg`.
+
+> NOTE: `clean` produces no stdout or stderr output on success in the
+> reference implementation. An implementation MAY emit a confirmation
+> line to stderr.
+
+**Exit codes:** 0 always.
+
+**stdout:** none.
+
+**stderr:** none (reference implementation); MAY emit a confirmation.
+
+### 5.6  `add`
+
+**Purpose:** Add a new dep to `milpa.kdl` (with `--git`) or add a
+mirror provenance to an existing dep (with `--mirror`). Validates by
+running a full resolve before writing.
+
+**Arguments:**
+
+```
+milpa add <dep> --git <url> [--ref <ref>]
+milpa add <dep> --mirror <url>
+```
+
+> NORMATIVE: `add` with `--git` MUST:
+>
+> - Reject if `<dep>` is already declared in `milpa.kdl`
+>   (`dep <name> already declared`; exit 1).
+> - If `--ref` is omitted, discover the remote's default branch via
+>   `git ls-remote --symref HEAD`; exit 1 if discovery fails.
+> - Run a full resolve over the proposed manifest (manifest + new dep).
+> - On successful resolve, atomically write the updated `milpa.kdl` and
+>   `milpa.lock`.
+> - Print `added <name> (git=<url> ref=<ref>)` to stderr and exit 0.
+> - On any failure, leave `milpa.kdl` and `milpa.lock` unmodified.
+
+> NORMATIVE: `add` with `--mirror` MUST:
+>
+> - Reject if the lockfile does not exist (exit 1).
+> - Reject if `<dep>` is not in the lockfile (exit 1).
+> - Reject if `<dep>` has a local or member provenance (cannot mirror
+>   editable sources; exit 1).
+> - Fetch `<url>` and verify that its bytes hash to the locked identity
+>   for `<dep>`; reject with `MAN-ADD-MIRROR-IDENTITY-MISMATCH` if not.
+> - Run a full resolve over the proposed manifest.
+> - On successful resolve, atomically write the updated `milpa.kdl` and
+>   `milpa.lock`.
+> - Exit 0 if `<url>` is already a mirror for `<dep>` (idempotent).
+> - On any failure, leave `milpa.kdl` and `milpa.lock` unmodified.
+
+> NORMATIVE: `add` without `--git` or `--mirror` MUST print a usage
+> error to stderr and exit 1.
+
+**Exit codes:** 0 success, 1 failure.
+
+**stdout:** none.
+
+**stderr:** summary on success; diagnostic on failure.
+
+### 5.7  `remove`
+
+**Purpose:** Remove a dep from `milpa.kdl` and regenerate the lockfile.
+
+**Arguments:**
+
+```
+milpa remove <dep>
+```
+
+> NORMATIVE: `remove` MUST:
+>
+> - Reject if `<dep>` is not declared in `milpa.kdl` (exit 1).
+> - Run a full resolve over the proposed manifest (manifest minus `<dep>`).
+> - On successful resolve, atomically write the updated `milpa.kdl` and
+>   `milpa.lock`.
+> - Print `removed <name>` to stderr and exit 0.
+> - On any failure, leave `milpa.kdl` and `milpa.lock` unmodified.
+
+> NOTE: Orphaned transitives that were only required by `<dep>` disappear
+> naturally from the new lockfile via the full re-resolve. If `<dep>` is
+> still required transitively by another dep, it remains in the resolved
+> graph; removal from the manifest does not force removal from the graph.
+> The manifest MUST NOT be modified in this case — if the dep is still
+> in the graph it was never a top-level dep requiring removal from
+> `milpa.kdl`.
+
+**Exit codes:** 0 success, 1 failure.
+
+**stdout:** none.
+
+**stderr:** `removed <name>` on success; diagnostic on failure.
+
+### 5.8  `update`
+
+**Purpose:** Re-resolve and refresh the lockfile, optionally scoped to a
+single dep. Does not mutate `milpa.kdl`.
+
+**Arguments:**
+
+```
+milpa update [<dep>]
+```
+
+> NORMATIVE: `update` with no `<dep>` argument MUST drop all pins and
+> re-resolve the entire graph from scratch; the resulting `milpa.lock`
+> may select different versions for any dep.
+
+> NORMATIVE: `update <dep>` MUST:
+>
+> - Reject if `<dep>` is not in the lockfile (exit 1).
+> - Drop only `<dep>`'s pin; all other pins are retained as a prior
+>   lockfile (passed to the resolver as `prior_lockfile`).
+> - Re-resolve; all other deps are stable unless their provenance changes.
+> - Write the new `milpa.lock`.
+> - Print `updated <name>` to stderr and exit 0.
+
+> NORMATIVE: `update` MUST NOT mutate `milpa.kdl`; only `milpa.lock`
+> and `_deps/` change.
+
+> NORMATIVE: If `<dep>` is provided but `milpa.lock` does not exist,
+> `update` MUST print a diagnostic to stderr and exit 1 (no lockfile
+> means no prior pins to drop selectively; a full `milpa fetch` is the
+> correct action).
+
+**Exit codes:** 0 success, 1 failure.
+
+**stdout:** none.
+
+**stderr:** `updated <name>` or `updated all deps` on success; diagnostic
+on failure.
+
+---
+
+## 6  `--frozen` flag/exit semantics (normative)
+
+This section specifies the CLI-level semantics of `--frozen`. The
+resolver-level guarantees (no network access; solver bypass; lockfile is
+used as-is without re-running PubGrub) are specified in
+`docs/spec/resolver-semantics.md` §7.1 (S6), which is the **authoritative
+source** for the complete list of frozen-fast-path disqualifying conditions.
+
+> NORMATIVE: The frozen fast-path is disqualified by any of the conditions
+> enumerated in `docs/spec/resolver-semantics.md` §7.1. For convenience the
+> full list of disqualifying error codes is reproduced here; the resolver-
+> semantics document is authoritative in case of any discrepancy:
+>
+> - `FROZEN-STRATEGY-MISMATCH` — requested strategy differs from the
+>   lockfile's recorded strategy
+> - `FROZEN-MANIFEST-DEP-NOT-IN-LOCK` — a manifest dep has no lockfile entry
+> - `FROZEN-LOCKED-VERSION-UNPARSEABLE` — a locked version string cannot be
+>   parsed as X.Y.Z
+> - `FROZEN-CONSTRAINT-UNSATISFIED` — a named dep's locked version no longer
+>   satisfies the manifest constraint
+> - `FROZEN-IDENTITY-NOT-IN-STORE` — a dep's pinned identity is absent from
+>   the CAS
+> - `FROZEN-LEGACY-REGISTRY-PROVENANCE` — a lockfile entry uses the legacy
+>   `kind "registry"` provenance (pre-#97); must re-resolve via tianguis
+> - `FROZEN-LOCAL-DEP` — a dep has a local provenance (editable trees always
+>   re-resolve)
+> - `FROZEN-MEMBER-DEP` — a dep is a workspace member (members always
+>   re-resolve in single-package mode)
+> - `FROZEN-MEMBER-NOT-IN-WORKSPACE` — the lockfile references a workspace
+>   member that is absent from the current workspace definition
+> - `FROZEN-MEMBER-IDENTITY-DRIFT` — a workspace member's on-disk content
+>   hash differs from the lockfile pin
+
+> NORMATIVE: When `--frozen` is absent and the frozen fast-path fails
+> for any reason, the implementation MUST silently fall through to the
+> full resolution path. The failure reason MUST NOT be printed.
+
+> NORMATIVE: When `--frozen` is present and the frozen fast-path fails
+> for any reason, the implementation MUST print the `NotFrozen` reason to
+> stderr in the form `frozen: <reason>` and exit 1. The full resolution
+> path MUST NOT be attempted.
+
+> NORMATIVE: When `--frozen` is present and the frozen fast-path
+> succeeds, the implementation MUST exit 0 after writing `nim.cfg`. No
+> network request MUST occur.
+
+---
+
+## 7  `-C <dir>` working-directory semantics
+
+> NORMATIVE: The `-C <dir>` flag MUST be resolved to an absolute path at
+> parse time. All subsequent path lookups — `milpa.kdl`, `milpa.lock`,
+> `_deps/`, `nim.cfg` — MUST be joined against this resolved path, not
+> against the process working directory.
+
+> NORMATIVE: A relative `<dir>` MUST be resolved relative to the process
+> working directory at invocation time.
+
+> NORMATIVE: `-C` applies before workspace detection. The resolved
+> `<dir>` is the starting point for `workspace_containing()`.
+
+> NOTE: The reference implementation calls `Path(args.directory).resolve()`
+> immediately after argument parsing. The resulting absolute `project_dir`
+> is passed to every `cmd_*` function.
+
+### 7.1  Workspace detection algorithm
+
+> NORMATIVE: An implementation MUST detect whether the resolved `-C <dir>` is
+> inside a workspace using the following parent-traversal algorithm
+> (`workspace_containing` in `milpa/workspace.py`):
+>
+> 1. Start from `<dir>` (resolved to an absolute path per §7).
+> 2. Walk up the directory tree one level at a time.
+> 3. At each directory, check whether a `milpa.kdl` file exists. If it does:
+>    - Attempt to parse it. If the parse fails (e.g., syntax error), treat
+>      the file as **absent** and continue walking upward.
+>    - If the parse succeeds and the document is a **package manifest** (no
+>      top-level `workspace {}` block), the file is **transparent** — continue
+>      walking upward. Package manifests along the walk do NOT terminate
+>      discovery; workspace members carry their own package manifest.
+>    - If the parse succeeds and the document is a **workspace manifest**
+>      (contains a top-level `workspace {}` block), this directory is
+>      the **workspace root** — stop walking.
+> 4. If the filesystem root is reached without finding a workspace manifest,
+>    workspace mode is NOT active; return `None`.
+>
+> After finding a workspace root, the implementation MUST:
+>
+> 5. Load the workspace manifest and resolve all declared member directories.
+> 6. Verify that `<dir>` is either the workspace root itself **or** exactly
+>    the resolved directory of one of the declared members. If neither, return
+>    `None` (the workspace found does not legitimately contain `<dir>`).
+> 7. Return the loaded `Workspace` value.
+
+> NORMATIVE: When walking past package manifests in step 3, the implementation
+> MUST NOT emit any diagnostic. The transparent-package behavior is by design
+> (it lets `milpa -C <member-dir>` discover the workspace above the member).
+
+> NORMATIVE: When `load_workspace` scans the workspace root for depth-1
+> subdirectories that contain a `milpa.kdl` but are NOT declared as members,
+> the implementation MUST emit a warning to stderr per orphaned directory:
+>
+> ```
+> warning: <rel>/milpa.kdl exists but is not declared as a workspace member
+>          (add `member "<rel>"` to the workspace block to include it)
+> ```
+>
+> This warning MUST NOT cause the workspace load to fail.
+
+> NOTE: The membership check in step 6 guards against the "accidental ancestor"
+> scenario — a workspace manifest higher up the tree that happens to be an
+> ancestor of `<dir>` but does not declare it as a member. Only declared
+> members are activated; an undeclared subdirectory is not silently enrolled.
+
+---
+
+## 8  Environment variables
+
+### 8.1  Resolution-affecting (normative)
+
+These variables affect the resolved dep graph and MUST be honoured by
+any conformant implementation.
+
+#### `MILPA_TARGET_PLATFORM`
+
+> NORMATIVE: When set, this value MUST be used as the `platform` key in
+> the resolution `Profile` instead of the auto-detected host platform.
+> Accepted values are Nim `hostOS` names: `linux`, `macosx`, `windows`,
+> `freebsd`, `openbsd`, `netbsd`. Unknown values are passed through
+> without rejection; a `when platform="X"` predicate that names an
+> unknown platform simply will not match.
+
+> NORMATIVE: Setting `MILPA_TARGET_PLATFORM` enables cross-resolution:
+> deps gated on `when platform="windows"` will be included (or excluded)
+> correctly for the named target even when resolving on a different host.
+
+#### `MILPA_TARGET_ARCH`
+
+> NORMATIVE: When set, this value MUST be used as the `arch` key in the
+> resolution `Profile` instead of the auto-detected host architecture.
+> Accepted values are Nim `hostCPU` names: `amd64`, `arm64`, `i386`.
+> Unknown values are passed through without rejection.
+
+#### `MILPA_TARGET_NIM`
+
+> NORMATIVE: When set, this value MUST be used as the Nim version in the
+> resolution `Profile` instead of the version queried from `nim --version`.
+> The value MUST be a semver string `X.Y.Z`. If `nim` is not installed and
+> `MILPA_TARGET_NIM` is not set, the Nim version defaults to `"0.0.0"` and
+> `when nim="X"` predicates will not match.
+
+#### `MILPA_TARGET_MILPA`
+
+> NORMATIVE: When set, this value MUST be used as the milpa version in the
+> resolution `Profile` instead of the implementation's own version
+> (`milpa.__version__`). The value MUST be a semver string `X.Y.Z`. This
+> override is evaluated by `when milpa="..."` predicates (§6.4 of S4) and
+> enables testing version-gated conditional deps without changing the
+> installed binary.
+
+> NOTE: The four `MILPA_TARGET_*` env vars are read in
+> `Profile.from_environment()` (`milpa/profile.py`). `profile.py` maps
+> Python's `platform.system()` and `platform.machine()` strings to Nim's
+> `hostOS`/`hostCPU` vocabulary; the env var override bypasses that
+> mapping entirely. The canonical vocabulary tables are in
+> `docs/spec/manifest-grammar.md` §6.
+
+#### `MILPA_INDEX_URL`
+
+> NORMATIVE: When set, this value MUST be used as the tianguis index URL
+> instead of the default. The default index URL is:
+>
+> ```
+> https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl
+> ```
+>
+> This override is required for air-gapped environments, mirror deployments,
+> and conformance test harnesses that serve a local fixture index. Any HTTP(S)
+> URL pointing to a valid `index.kdl` document is accepted.
+
+> NOTE: The default URL is defined as `DEFAULT_INDEX_URL` in
+> `milpa/tianguis_client.py`. The reference CLI passes it unconditionally to
+> `load_index`; `MILPA_INDEX_URL` support is a normative requirement for
+> conformant implementations even if the reference Python implementation
+> has not yet wired the env var check.
+
+### 8.2  CAS root (normative)
+
+#### `MILPA_CACHE_DIR`
+
+> NORMATIVE: When set, this value MUST be used as the root of the
+> content-addressed store instead of the XDG-derived default. The value
+> MUST be an absolute path to a directory (which will be created if
+> absent).
+
+> NORMATIVE: `MILPA_CACHE_DIR` takes precedence over a manifest-level
+> `cas { dir "..." }` override. Precedence order (highest first):
+>
+> 1. `MILPA_CACHE_DIR` env var
+> 2. Manifest `cas { dir "..." }` (relative paths resolved against
+>    the project root)
+> 3. `$XDG_CACHE_HOME/milpa/cas`
+> 4. `~/.cache/milpa/cas`
+
+> NOTE: `default_store()` in `milpa/cas.py` implements this precedence.
+> The CAS layout (`<root>/<algorithm>/<hex>/`) is specified in
+> `docs/spec/identity.md` (S12).
+
+### 8.3  Convenience / infrastructure (non-normative)
+
+These variables affect operational behaviour but do NOT affect the
+resolved dep graph. An implementation MAY ignore them.
+
+#### `XDG_CACHE_HOME`
+
+Used as the base for both the CAS default path (`$XDG_CACHE_HOME/milpa/cas`)
+and the tianguis index cache (`$XDG_CACHE_HOME/milpa/index`). Standard
+XDG Base Directory specification. Not milpa-specific.
+
+#### `ACTIONS_ID_TOKEN_REQUEST_TOKEN` / `ACTIONS_ID_TOKEN_REQUEST_URL`
+
+GitHub Actions OIDC token environment variables consumed by `publish`
+(out-of-scope for conformance; see §10). Not relevant to resolution.
+
+---
+
+## 9  `--version`
+
+> NORMATIVE: The implementation MUST support `milpa --version` and print
+> a version string to stdout, then exit 0.
+
+> NOTE: The reference implementation prints `milpa <version>` where
+> `<version>` comes from `milpa/__init__.py:__version__` (a PEP 440
+> version string). The exact format is incidental.
+
+---
+
+## 10  `publish` — out of scope for spec v1.0
+
+> NORMATIVE: `publish` is NOT part of milpa spec v1.0 conformance. A
+> conformant implementation is not required to implement it. It is
+> reserved for a later spec amendment.
+
+`publish` exists in the reference Python implementation as the
+author-side packaging and registry-submission pipeline:
+
+```
+milpa publish --name <pkg> --version <semver> --registry <oci-ref> \
+              --provider <ci> --repo-url <url> --signed-by <identity> \
+              [--dispatch-url <url>] [--oidc-token-env <var>] [--dry-run]
+```
+
+It depends on external services (OCI registry, cosign/Sigstore, tianguis
+dispatch endpoint) and is not amenable to dir-tree-fixture conformance
+testing. Its exit semantics and env var usage (`ACTIONS_ID_TOKEN_REQUEST_TOKEN`,
+`ACTIONS_ID_TOKEN_REQUEST_URL`, and any per-CI OIDC token vars) are
+implementation-specific and not frozen by this spec.
+
+> NORMATIVE: An implementation that does NOT implement `publish` MUST
+> NOT silently succeed when `milpa publish` is invoked — it MUST exit
+> with a non-zero code and a clear "not implemented" diagnostic.
+
+---
+
+## Appendix A — Summary table
+
+| Verb      | Args                     | `--frozen` | `-j` | `-s` | Stdout     | Stderr           | Exit |
+|-----------|--------------------------|-----------|------|------|------------|------------------|------|
+| `fetch`   | —                        | yes       | yes  | yes  | none       | progress/error   | 0/1  |
+| `lock`    | —                        | ignored   | yes  | yes  | none       | progress/error   | 0/1  |
+| `show`    | —                        | ignored   | —    | —    | dep tree   | error only       | 0/1  |
+| `verify`  | —                        | ignored   | —    | —    | none       | progress/error   | 0/1  |
+| `clean`   | —                        | ignored   | —    | —    | none       | none/confirm     | 0    |
+| `add`     | `<dep> --git/--mirror`   | ignored   | —    | yes  | none       | summary/error    | 0/1  |
+| `remove`  | `<dep>`                  | ignored   | —    | yes  | none       | summary/error    | 0/1  |
+| `update`  | `[<dep>]`                | ignored   | yes  | yes  | none       | summary/error    | 0/1  |
+| `publish` | *(out-of-scope)*         | —         | —    | —    | —          | —                | —    |
+
+---
+
+## Appendix B — Environment variable reference
+
+| Variable                          | Normative? | Affects                       | Default                                          |
+|-----------------------------------|-----------|-------------------------------|--------------------------------------------------|
+| `MILPA_TARGET_PLATFORM`           | YES       | resolved dep graph            | auto-detected host OS                            |
+| `MILPA_TARGET_ARCH`               | YES       | resolved dep graph            | auto-detected host CPU                           |
+| `MILPA_TARGET_NIM`                | YES       | resolved dep graph            | queried from `nim --version`                     |
+| `MILPA_TARGET_MILPA`              | YES       | resolved dep graph            | `milpa.__version__`                              |
+| `MILPA_INDEX_URL`                 | YES       | tianguis index URL            | `https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl` |
+| `MILPA_CACHE_DIR`                 | YES       | CAS root                      | `$XDG_CACHE_HOME/milpa/cas`                     |
+| `XDG_CACHE_HOME`                  | NO        | CAS + index cache base        | `~/.cache`                                       |
+| `ACTIONS_ID_TOKEN_REQUEST_TOKEN`  | NO        | `publish` OIDC (out-of-scope) | —                                                |
+| `ACTIONS_ID_TOKEN_REQUEST_URL`    | NO        | `publish` OIDC (out-of-scope) | —                                                |

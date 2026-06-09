@@ -290,3 +290,10 @@ Sequenced from most actionable to most exploratory:
 
 Read `docs/comparison-vs-nimble-atlas.md` for the full picture before
 deciding what to prioritize.
+
+## Compact Instructions
+
+When compacting, preserve in the summary: the active RFC and its handoff-doc
+path, the current stage/round, slices done vs remaining, open forks awaiting
+Corey, and the exact resume command. After compacting, re-read the handoff doc
+and MEMORY.md before continuing.
