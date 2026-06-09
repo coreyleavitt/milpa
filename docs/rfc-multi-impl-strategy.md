@@ -121,7 +121,7 @@ it.
 ## The spec — what it contains
 
 A separate repo: `coreyleavitt/milpa-spec` (TBD on naming). Or
-initially `docs/spec/` in this repo, lifted to its own repo when
+initially `spec/` in this repo, lifted to its own repo when
 stable.
 
 Sections:
@@ -361,7 +361,7 @@ validate the model. Third parties can come or not; the spec stands.
   decide during extraction)
 - A specific differential-testing framework (decide when building
   the conformance suite)
-- A separate repo for the spec vs `docs/spec/` in milpa itself
+- A separate repo for the spec vs `spec/` in milpa itself
   (start in-tree, lift when stable)
 - Third-party fetcher implementations (those compose with either
   impl independently per `rfc-pluggable-fetchers.md`)

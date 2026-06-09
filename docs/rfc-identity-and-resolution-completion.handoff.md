@@ -9,7 +9,7 @@
 - **Uncommitted Phase-2 working tree (tianguis), all 20/20 suite + corpus 44/44 green:**
   `addentry.nim`, `alerts.nim`, `tianguis_cli.nim`, `tests/test_cmd_add_entry.nim`,
   `.github/workflows/commit-entry.yaml`, `dispatch/handler.go`, `dispatch/handler_test.go`,
-  `docs/spec/index-format.md`, `spec/fixtures/derive-namespace.json`. RFC P2.3 text patched (milpa repo).
+  `spec/index-format.md`, `spec/fixtures/derive-namespace.json`. RFC P2.3 text patched (milpa repo).
 
 ## ✅ DONE (2026-06-08, uncommitted both repos) — durable Rekor reference in the index
 **ALL 8 touch-points implemented + tested green. Nothing committed (standing rule); the backfilled
@@ -71,7 +71,7 @@ COSIGN_OUTPUT has the Rekor entry — `logIndex`/`integratedTime` are in `…opt
    `--rekor-integrated-time` flags; thread into the Version/VendoredEntry model.
 3. `model.nim` + `kdl_io.nim` — new optional `rekor { uuid; log_index; integrated_time }` child on the version
    block (author-signed only); emit + parse (escape via kdlEscapeString).
-4. `docs/spec/index-format.md` — normative spec for the rekor attestation block.
+4. `spec/index-format.md` — normative spec for the rekor attestation block.
 5. milpa `tianguis_client.py` parse_index — confirm it tolerates/ignores the new child (forward-compat;
    it's attestation metadata, not identity/provenance milpa enforces). Add a test.
 6. `site/scripts/build.py` — read rekor from index.json, render the link directly; **DELETE**
@@ -276,7 +276,7 @@ Version.__iter__ drops pre · lookup_bare O(N) · semver leading-zero pre-releas
       ✅ Built 2026-06-07 via sonnet /tdd: `src/tianguis/cmd_migrate.nim` (pure `buildMigrationReport`
       → `MigrationReport`, pure `renderDryRun`/`renderAuditRecord`, `atomicWrite`, `cmdMigrate(dir,
       execute)`; `--dry-run` default, `--execute` opt-in, both-artifact atomic regen via staging+rename,
-      `index.kdl.bak`, audit record → `docs/spec/migrations/0001-32-identity.json`,
+      `index.kdl.bak`, audit record → `spec/migrations/0001-32-identity.json`,
       `{.deprecated.}` + stderr notice). host/org-reject guard in `cmdAddEntry` (**exit 4**,
       `'/' notin args.namespace`, no mutation); test_cmd_add_entry.nim org-only fixtures converted to
       guard-rejection + new host/org positive case. New test_cmd_migrate.nim (28 tests). **Full tianguis
@@ -315,7 +315,7 @@ Version.__iter__ drops pre · lookup_bare O(N) · semver leading-zero pre-releas
       (a) GH Actions SAN w/ branch ref → github.com/coreyleavitt; (a) tag ref → github.com/greenm01;
       (c) empty → derrUnparseable; (c) malformed → derrUnparseable — all exercised by
       `tests/test_namespace_corpus.nim`. **Case (b) DROPPED** (the wrong spec assumption, below).
-      Rewrote the `signed_by` NORMATIVE block in `docs/spec/index-format.md` (was a P2.3 placeholder):
+      Rewrote the `signed_by` NORMATIVE block in `spec/index-format.md` (was a P2.3 placeholder):
       author-signed = parseable identity SAN from a trusted keyless-OIDC issuer (Fulcio+Rekor verified),
       canonical GH Actions form, forge-agnostic derivation vs separately-gated issuer-trust spelled out;
       milpa-vendored = freeform provenance, not an identity anchor. Patched RFC P2.3 text to delete the
@@ -381,7 +381,7 @@ Version.__iter__ drops pre · lookup_bare O(N) · semver leading-zero pre-releas
   pushed before; workflow pins a MILPA sha, not a tianguis sha.
 - **Migration result:** 2616→2617, exactly 1 split `nimkdl → {greenm01, coreyleavitt}`; all
   namespaces host/org; `project --check` green; audit record at
-  docs/spec/migrations/0001-32-identity.json. index.kdl.bak gitignored (local aid).
+  spec/migrations/0001-32-identity.json. index.kdl.bak gitignored (local aid).
 - **P1.6 live:** only `github.com/greenm01` nimkdl block remains on origin; bare `nimkdl` now
   re-resolves uniquely to greenm01 (the documented correct #32 repair). **Phase 1 COMPLETE.**
 - **NEXT:** Phase 2 (#38 hardening) — `/tdd` P2.1 SAN-derivation → P2.2 drop Go deriveNamespace →

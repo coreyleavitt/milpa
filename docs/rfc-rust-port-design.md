@@ -1,8 +1,8 @@
 # RFC: Rust reference implementation — design & in-repo coexistence
 
 - **Status:** Draft — rfc-flow stage 2 (architecture review, rounds 1+2 applied)
-- **Depends on:** spec v1.0 (`docs/spec/`), the spec-v1 conformance suite
-  (`tests/conformance/spec-v1/`), `rfc-multi-impl-strategy.md`
+- **Depends on:** spec v1.0 (`spec/`), the spec-v1 conformance suite
+  (`conformance/spec-v1/`), `rfc-multi-impl-strategy.md`
 - **Supersedes:** nothing (this is the "separate later RFC" the
   reaching-rust-rewrite gate deferred Rust-port design to)
 
@@ -28,7 +28,7 @@ grind in stage 3).
 
 **In scope (v1 Rust reference = "done"):**
 - A pure-Rust implementation that **passes every fixture in
-  `tests/conformance/spec-v1/`** via its own harness.
+  `conformance/spec-v1/`** via its own harness.
 - In-repo coexistence layout (Python + Rust side by side, one shared spec +
   one shared fixture corpus).
 - A Rust conformance harness consuming the **same** fixture format the Python
@@ -104,8 +104,8 @@ self-contained Rust workspace lives in a sibling directory.
                             the three above
     milpa-cli/              bin: the CLI contract (S13); depends on milpa-core
     milpa-conformance/      the Rust fixture harness; depends on milpa-core
-/docs/spec/                 shared normative spec (unchanged)
-/tests/conformance/         shared, language-agnostic fixture corpus (unchanged)
+/spec/                 shared normative spec (unchanged)
+/conformance/         shared, language-agnostic fixture corpus (unchanged)
 ```
 
 **Type placement** (resolves the round-2 orphan-rule problem — see §4.6):
@@ -119,7 +119,7 @@ self-contained Rust workspace lives in a sibling directory.
 
 Rationale: keeping Rust under `/rust/` (not scattered) means the Python build,
 `uv`, and pytest are wholly unaffected. The fixture corpus is referenced by
-**relative path** from the Rust harness (`../../tests/conformance/`), so there
+**relative path** from the Rust harness (`../../conformance/`), so there
 is exactly one copy.
 
 > CORRECTION (round-2): an earlier draft put `VersionSet`/`Strategy` in
@@ -207,7 +207,7 @@ The spec/fixture change is never carried as an informal note on `rust`.
 
 ### 4.4 The Rust conformance harness (the coexistence linchpin)
 
-`milpa-conformance` walks `tests/conformance/spec-v<N>/`, and for each fixture
+`milpa-conformance` walks `conformance/spec-v<N>/`, and for each fixture
 reproduces exactly the contract `conformance-fixtures.md` defines and the
 Python runner implements:
 
@@ -400,7 +400,7 @@ per-*code*, keeping the wrapper bounded as the catalog grows.
 would couple the "independent oracle" to the thing it validates). A **`#[test]`**
 in `milpa-conformance` (not a `build.rs` — round-2: build scripts have no
 well-defined CWD and break for packaged/relocated builds; a test anchored at
-`env!("CARGO_MANIFEST_DIR")` is robust) reads `docs/spec/errors.md` and asserts
+`env!("CARGO_MANIFEST_DIR")` is robust) reads `spec/errors.md` and asserts
 the Rust `code()` slug set is in bijection with the spec's. **`errors.md` is the
 shared truth, edited only spec-first:** when the Rust impl is *more* conformant
 and needs a code Python lacks (e.g. #117), the flow is amend `errors.md` →
@@ -568,7 +568,7 @@ honest expectations; the §9 coverage map ties each fixture family to its slice.
   counterexamples become fixtures (README §4) or spec amendments.
 
 **Done (v1 Rust reference):** P1–P4 landed on `main`; S0 decisions recorded;
-S1–S13 complete; the full `tests/conformance/spec-v1/` suite green under
+S1–S13 complete; the full `conformance/spec-v1/` suite green under
 `milpa-conformance` with `known_failing.txt` **empty**; S14 for real-world use;
 S15 optional.
 

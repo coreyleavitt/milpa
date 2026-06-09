@@ -113,7 +113,7 @@ solver.
 - **Index-deps consumer work** — gated on tianguis `rfc-index-deps` (a draft stub,
   itself unblocked now that tianguis #32 is closed). Retires fetch-to-learn-edges.
 
-**Spec note (critical-path).** When `docs/spec/resolver-semantics.md` is extracted,
+**Spec note (critical-path).** When `spec/resolver-semantics.md` is extracted,
 it must specify the **PubGrub-native** constraint-accumulation target (all
 consumers' constraints intersect; empty intersection → structured conflict chain
 naming every contributing dep), explicitly **not** any eager/first-constraint-wins

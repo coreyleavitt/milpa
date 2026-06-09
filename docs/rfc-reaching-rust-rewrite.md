@@ -42,7 +42,7 @@ Five items. State verified against the repo 2026-06-08.
 
 ### G1 — Error catalog complete (#92)
 **State:** `ManifestError` done (#14 — 61 codes, bijection-tested,
-`docs/spec/errors.md`). `TianguisError` already follows the pattern.
+`spec/errors.md`). `TianguisError` already follows the pattern.
 Remaining: extend it ([[error_catalog_discipline]]) to the other user-facing
 categories — LockfileError, ResolverError, FetchError, CASError, NotFrozen,
 IdentityError, NimbleParseError, SolverError, **WorkspaceError**,
@@ -81,7 +81,7 @@ it takes a constant `.code` (e.g. `SOLVE-CONFLICT`). S2 executes both.
 incomplete catalog means undefined error behavior the Rust impl would have to
 invent and then reconcile.
 **Done when:** every user-facing raise carries a catalog code; the bijection
-lint passes for all categories; `docs/spec/errors.md` covers them; **slugs are
+lint passes for all categories; `spec/errors.md` covers them; **slugs are
 frozen at gate-close** via a **bidirectional** validator — it errors if a spec'd
 slug disappears from code without a tombstone/alias entry (catches *renames/
 deletions*), **and** errors if a slug appears in code that is absent from
@@ -136,7 +136,7 @@ a workspace diamond that succeeds single-project also succeeds in a workspace;
 `_process_named` (sole caller `resolver.py:931`) and `resolve_named` retired.
 **Kind:** code (`/tdd`).
 
-### G3 — Spec extraction (`docs/spec/`)
+### G3 — Spec extraction (`spec/`)
 **State:** only `errors.md` exists.
 **Anchor:** `rfc-multi-impl-strategy.md` §"The spec — what it contains" already
 enumerates the **canonical 7 sections** the spec must cover. The gate must
@@ -369,14 +369,14 @@ trigger tables means extracting the *input KDL document* + *expected error code*
 into this layout (a translation, since the current tables hold Python lambdas, not
 data).
 **Spec-version & fixture lifecycle (cross-cutting G3↔G4).** Each fixture is tagged
-with the spec-version it targets and lives under `tests/conformance/spec-v<N>/`. A
+with the spec-version it targets and lives under `conformance/spec-v<N>/`. A
 **normative behavior change requires a new spec-version**; old-version fixtures are
 **retained** under their version dir (not mutated in place), so each impl declares
 which spec-version it conforms to and the corpus stays a stable arbiter (the
 HTTP/1.1 pattern this RFC cites). Format-break vs behavioral-extension is the
 major-vs-minor bump rule. (Note: the impl-internal `LOCKFILE_SCHEMA_VERSION` and
 spec-version are *related but distinct* namespaces — state the mapping in S5.)
-**Done when:** `tests/conformance/spec-v1/` holds dir-tree fixtures in the above
+**Done when:** `conformance/spec-v1/` holds dir-tree fixtures in the above
 format; the existing trigger tables are promoted; **a diamond-conflict fixture**
 (two consumers, conflicting constraints on one named dep → structured failure
 refutation) is included (pairs with `resolver-semantics.md`); **coverage floor —
@@ -466,7 +466,7 @@ reference plugin is a minimal package `tests/fixtures/milpa_fetcher_<x>/` with a
 dependency** (`[dependency-groups].dev`) so the test exercises the *real*
 `importlib.metadata` path (not a monkeypatched `entry_points()`). It is a
 "third-party" plugin only in the structural sense. This test lives in the
-**Python unit suite, never in `tests/conformance/`** — discovery is a
+**Python unit suite, never in `conformance/`** — discovery is a
 Python-specific *mechanism*; only the *contract* (P2) is language-agnostic.
 
 ### P2 — The language-agnostic Fetcher contract (the spec artifact)
@@ -511,7 +511,7 @@ implicit (each a cross-impl divergence risk if unstated):
   and flagged as a known spec hole, so no impl invents a credential convention.
 
 This contract is the **fetcher protocol** spec section (§5). It goes in
-`docs/spec/plugin-contract.md` and covers the *protocol obligations only*. The
+`spec/plugin-contract.md` and covers the *protocol obligations only*. The
 **enumeration of valid provenance shapes** (the closed grammar, P3) lives in
 `manifest-grammar.md` (§1), not here — one question ("what shapes may `milpa.kdl`
 declare?") must have one home.
@@ -603,7 +603,7 @@ proven* extensibility contract — not a hook with a TODO.
 The Rust-port RFC may open when **all** hold:
 1. G1–G5 complete per their done-criteria.
 2. Full Python suite green (unit + property + gated integration).
-3. `docs/spec/` covers the canonical sections — errors, manifest-grammar
+3. `spec/` covers the canonical sections — errors, manifest-grammar
    (+`.nimble` compat, **conditional-dep/`when` syntax + platform/arch tables**,
    spec-version field, forward-unknown policy), lockfile-schema (+**version
    negotiation**, **tarball TOFU**), **identity** (+CAS layout, **append-only
@@ -615,7 +615,7 @@ The Rust-port RFC may open when **all** hold:
    normative/incidental marked **per the prescribed convention**, and **declaring a
    single spec-version** (this gate produces spec **v1.0**; the Python impl declares
    conformance to it).
-4. `tests/conformance/spec-v1/` dir-tree fixtures pass via the Python adapter,
+4. `conformance/spec-v1/` dir-tree fixtures pass via the Python adapter,
    meet the **≥1-fixture-per-MUST-clause coverage floor**, and are documented as the
    cross-impl arbiter with the fixture-lifecycle/versioning rule.
 
@@ -674,19 +674,19 @@ architect rounds; they just don't have a failing test as their contract.
   `check_no_orphan_slugs(prefix, tombstoned=…)`: RED test registers a probe slug,
   deletes its raise from source, validator fails (deletion direction) **and** a
   slug present in code but absent from `errors.md` fails (addition direction).
-- **S4 [doc]** G3 §1+§5-shapes — `docs/spec/manifest-grammar.md` (KDL grammar,
+- **S4 [doc]** G3 §1+§5-shapes — `spec/manifest-grammar.md` (KDL grammar,
   `(url)` convention, P3 **provenance-descriptor model**: closed meta-grammar +
   spec-version-owned kind registry + parse/verify/fetch properties, spec-version
   field, `.nimble`-compat parsing section, **conditional-dep / `when`-block syntax**
   (4 keys, OR semantics, negation annotation, mixed-negation parse error) +
   **canonical platform/arch vocabulary tables**, **tarball `strip_components`**
   (stripping precedes content-hash)).
-- **S5 [doc]** G3 §2 — `docs/spec/lockfile-schema.md` (+ `nim.cfg` emission spec:
+- **S5 [doc]** G3 §2 — `spec/lockfile-schema.md` (+ `nim.cfg` emission spec:
   `--path:` form, POSIX separators, ordering, `<dep>_<flag>` rule, workspace
   relative paths — or split to `nim-cfg.md`; **lockfile version-negotiation policy**
   (hard-reject unknown version) + the `LOCKFILE_SCHEMA_VERSION`↔spec-version mapping;
   **tarball TOFU first-use pinning**).
-- **S6 [doc]** G3 §4 — `docs/spec/resolver-semantics.md` — **engine-agnostic
+- **S6 [doc]** G3 §4 — `spec/resolver-semantics.md` — **engine-agnostic
   observable semantics** (PubGrub = reference producer, not normative):
   completeness; constraint accumulation; URL/local/member identity-constraint
   convention; **the canonical-solution selection function** (lexicographically-
@@ -704,21 +704,21 @@ architect rounds; they just don't have a failing test as their contract.
   implementations of the selection rule produce byte-identical lockfiles on the
   diamond fixture. *(Exact canonical-order procedure revisited at spec-writing, per
   Corey.)*
-- **S7 [doc]** G3 §7 — extend `docs/spec/errors.md` to the categories added in
+- **S7 [doc]** G3 §7 — extend `spec/errors.md` to the categories added in
   S2/S3 (normative/incidental marked; bijection lint extended).
 - **S8a [doc]** G4 — adopt + document the dir-tree fixture format from
   `rfc-multi-impl-strategy.md`, **correcting `registry.json`→`index.kdl`** (raw KDL
   the `parse_index` path consumes; post-#97) and adding the **spec-version/fixture-
-  lifecycle** layout (`tests/conformance/spec-v<N>/`, old versions retained). The
+  lifecycle** layout (`conformance/spec-v<N>/`, old versions retained). The
   `expected/` outputs depend on **S5** (nim.cfg) + **S12** (identity/CAS symlink
   format for `_deps_structure.txt`) being settled.
 - **S8b [code]** G4/#72 — Python adapter + promote existing trigger tables into
-  `tests/conformance/spec-v1/` dir-tree fixtures. **Depends on S8a (format), S5
+  `conformance/spec-v1/` dir-tree fixtures. **Depends on S8a (format), S5
   (nim.cfg), S12 (CAS/`_deps_structure.txt`), and S14 (index input format).**
 - **S9 [code]** G4 — diamond-conflict fixture (pairs with S6). **Depends on S1** —
   the fixture's correctness needs the migrated workspace named-dep path (else the
   second member's constraint is dropped and the conflict won't surface).
-- **S10 [doc]** G3 §5 — `docs/spec/plugin-contract.md` (P2 Layer-2 backend
+- **S10 [doc]** G3 §5 — `spec/plugin-contract.md` (P2 Layer-2 backend
   obligations: claim/materialize/receipt + failure / identity-forbidden-as-field-
   level-line / non-empty-receipt-via-ABC / `cas_admissible` / cancellation / auth;
   the explicit-total-binding + content-addressing override-safety argument **scoped
@@ -733,18 +733,18 @@ architect rounds; they just don't have a failing test as their contract.
   preserved; reference plugin as a dev-dep fixture package (`tests/fixtures/
   milpa_fetcher_<x>/` with its own `pyproject.toml`) loads through the real
   `importlib.metadata` path (Python unit suite, not conformance).
-- **S12 [doc]** G3 §3 — `docs/spec/identity.md` (content-hash canonical byte
+- **S12 [doc]** G3 §3 — `spec/identity.md` (content-hash canonical byte
   stream, sort, mode/symlink/`.git` rules, raw-bytes/no-EOL-normalization,
   multihash; CAS layout + atomic admission + `_deps/` symlink convention;
   **CAS-append-only / no-silent-eviction** normative statement).
 - **S13** — *(reserved; folded — nim.cfg into S5, nimble-compat into S4)*.
-- **S14 [doc]** G3 — `docs/spec/registry-protocol.md` (tianguis `index.kdl` read
+- **S14 [doc]** G3 — `spec/registry-protocol.md` (tianguis `index.kdl` read
   format: schema + version negotiation + per-version provenance record + TNG
   validators). **Normative cross-ref: index provenance records are a strict subset
   of the manifest descriptor grammar (S4/P3)** — not a second grammar. Read
   contract only; **not** index-deps policy. **Settle before S8b** (fixtures embed
   index input).
-- **S15 [doc]** G3 §6 — `docs/spec/cli-contract.md` (conformance-tested verbs:
+- **S15 [doc]** G3 §6 — `spec/cli-contract.md` (conformance-tested verbs:
   fetch/lock/show/verify/clean/add/remove/update; flags, exit-code semantics,
   stderr/stdout, env vars incl. `MILPA_TARGET_PLATFORM`/`_ARCH`/`_NIM`; `--frozen`
   flag/exit semantics — the no-network + solver-bypass *guarantees* live in S6).

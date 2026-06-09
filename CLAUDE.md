@@ -33,9 +33,29 @@ initial fresco-unblock charter (v0). It then expanded scope to become
 **the best possible Nim dep manager**, not just a narrow workaround.
 See `docs/comparison-vs-nimble-atlas.md` for the full design ambition.
 
-## Architecture
+## Repository layout (mono-repo, multi-impl)
 
-milpa is a Python package (uv-managed). All code in `milpa/`:
+milpa is a **multi-implementation** project in one repo. The three first-class
+peers are the spec, the shared conformance corpus, and the implementations:
+
+```
+spec/          — normative contract (manifest, lockfile, identity, resolution, CLI, errors)
+conformance/   — shared spec-v<N>/ fixture corpus, consumed by EVERY impl's runner (impl-neutral)
+impls/
+  python/      — Python reference impl (uv-managed): milpa/ package + pyproject.toml + tests/
+  rust/        — Rust reference impl: cargo workspace (crates/…); run via ./dev-rust
+  (nim/        — future dogfood impl)
+harness/       — (future) the differential conformance harness (rfc-differential-conformance-harness.md)
+docs/          — RFCs + design docs
+```
+
+Each impl declares which spec version it conforms to and passes the shared
+`conformance/` corpus. See `docs/rfc-multi-impl-strategy.md`.
+
+## Architecture (Python impl)
+
+The Python implementation (uv-managed) lives in `impls/python/`; its package is
+`impls/python/milpa/`:
 
 | Module | Role |
 |---|---|
@@ -182,16 +202,27 @@ issue). #25's body still needs sharpening to reflect this. **Sharpen
 
 ## Dev workflow
 
+The Python impl is uv-managed from `impls/python/` (run these from there):
+
 ```bash
+cd impls/python
 uv sync                    # install milpa + dev deps (pytest, hypothesis)
-uv run pytest              # unit tests (~6 sec)
+uv run pytest              # unit tests (~11 sec)
 MILPA_INTEGRATION_TESTS=1 uv run pytest tests/test_integration.py   # gated network tests
 uv run python -m milpa --help                          # invoke CLI
 uv run python -m milpa -C <project_dir> fetch          # fetch in some other project
 ```
 
-No Docker. Pure Python. Hypothesis runs ~100 examples per property
-by default; the database lives at `.hypothesis/` (gitignored).
+The Rust impl runs inside the pinned container via `./dev-rust` (from repo root):
+
+```bash
+./dev-rust test --workspace          # full Rust suite (incl. conformance corpus)
+./dev-rust test -p milpa-conformance # just the shared-corpus run
+```
+
+Both impls read the shared corpus at the repo-root `conformance/`. No Docker for
+Python (pure Python); Rust uses podman/docker. Hypothesis runs ~100 examples per
+property by default; the database lives at `impls/python/.hypothesis/` (gitignored).
 
 Toolchain expectations:
 - Python 3.11+

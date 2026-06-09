@@ -2,8 +2,8 @@
 # Run cargo for the Rust reference impl inside the pinned toolchain container
 # (RFC §4.1: no host toolchains; podman preferred, docker fallback). The repo
 # root is mounted at /work so the conformance harness can read the shared
-# corpus at /work/tests/conformance via its relative path; cargo runs in
-# /work/rust. Build output lands in rust/target/ (gitignored) on the host.
+# corpus at /work/conformance via its relative path; cargo runs in
+# /work/impls/rust. Build output lands in impls/rust/target/ (gitignored) on the host.
 #
 #   ./dev-rust build
 #   ./dev-rust test
@@ -31,6 +31,6 @@ TTY_FLAGS=()
 exec "$ENGINE" run --rm "${TTY_FLAGS[@]}" \
     -v "$REPO_ROOT":/work \
     -v milpa-cargo-registry:/usr/local/cargo/registry \
-    -w /work/rust \
+    -w /work/impls/rust \
     "$IMAGE" \
     cargo "$@"

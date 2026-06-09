@@ -129,7 +129,7 @@ PHASE 3 — resolution core to the bar (milpa headline; after identity is stable
 |---|---|
 | #32 S1 | `namespace.nim` — `deriveNamespace -> Result[ForgeRef, DerivationError]` (structured parse→normalize→serialize; forges + case policy + SSH residue + percent-decode + gitlab-depth>2 fail + no-org fail). Model promoted to `(namespace,name)`. |
 | #32 S1/S4 | `checkIdentityStable` (wired here, P1.1), `checkOidcGitAgreement` (**deleted** here, P0.4). |
-| #32 S2 | `docs/spec/index-format.md` host/org model + `spec/fixtures/derive-namespace.json` (40-case corpus). |
+| #32 S2 | `spec/index-format.md` host/org model + `spec/fixtures/derive-namespace.json` (40-case corpus). |
 | #32 S3 | kdl_io host/org round-trip; the two-`nimkdl` pair survives parse→emit as two entries. |
 | #32 S4 | `buildVendoredEntry -> Result` (hard-reject underivable provenance); intra-org leaf collision → reject-new/preserve-existing; tuple-keyed denylist; `tianguis show <url>`. |
 | #32 S5 | `vendor/resolve.nim` pure bare→qualified require mapping; `Version.partiallyResolved`. |
@@ -323,7 +323,7 @@ same-version dual-anchor agreement).
 Edit `rfc-package-identity.md`: replace preserve-verbatim with **derive-all-per-version +
 regroup** (§3); org-only/empty are pre-#32 forms the migration derives **once**, immutability
 binds *after*; nimkdl repair is a deterministic per-version split; restate gate #4 as achievable
-by the migration alone. Update `docs/spec/index-format.md` (normative): the per-version
+by the migration alone. Update `spec/index-format.md` (normative): the per-version
 attestation-anchor algorithm + the normative `signed_by` format (see P2.3). No code; verification
 = review + §3 audit + sign-off. **Named deliverable in the gate (else it slips):** milpa repo
 `docs/identity-and-provenance.md` updated with the org-rename consequence (per the corrected §P2.1
@@ -468,7 +468,7 @@ CI verify*, not a manual operator step.
 **Migration audit record (R2 breadth, medium — this is a new trust anchor; treat it like one).** A
 trust-anchor-establishing mutation must leave an auditable trace, the way vendor-en-absentia runs
 already append to `alerts.kdl`. `--execute` writes a machine-readable migration record (a committed
-`docs/spec/migrations/0001-32-identity.json` or an `alerts.kdl` append) capturing: package count
+`spec/migrations/0001-32-identity.json` or an `alerts.kdl` append) capturing: package count
 before/after, the exact split set (expect `{nimkdl}`), and the resulting `(name → [namespaces])`
 for every split. This is the provenance of the anchor itself; milpa#103's index attestation binds
 to this commit and benefits from a self-describing record.
