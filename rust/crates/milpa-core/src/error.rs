@@ -27,6 +27,8 @@ pub enum CoreError {
     Tianguis(&'static str, String),
     /// Frozen-path disqualification (`FROZEN-*`).
     Frozen(&'static str, String),
+    /// Workspace topology / structural failure (`WS-*`).
+    Workspace(&'static str, String),
 }
 
 impl CoreError {
@@ -36,7 +38,8 @@ impl CoreError {
             | CoreError::Identity(c, _)
             | CoreError::Resolver(c, _)
             | CoreError::Tianguis(c, _)
-            | CoreError::Frozen(c, _) => c,
+            | CoreError::Frozen(c, _)
+            | CoreError::Workspace(c, _) => c,
         }
     }
 
@@ -48,7 +51,8 @@ impl CoreError {
             | CoreError::Identity(_, m)
             | CoreError::Resolver(_, m)
             | CoreError::Tianguis(_, m)
-            | CoreError::Frozen(_, m) => m,
+            | CoreError::Frozen(_, m)
+            | CoreError::Workspace(_, m) => m,
         }
     }
 
@@ -126,6 +130,17 @@ impl CoreError {
             "FROZEN-LOCAL-DEP",
             "FROZEN-IDENTITY-NOT-IN-STORE",
             "FROZEN-LEGACY-REGISTRY-PROVENANCE",
+            // workspace topology (workspace-semantics) — S11a loader. The
+            // resolve-time RES-WS-* codes live in the resolver domain; the two
+            // workspace-frozen FROZEN-MEMBER-* codes land in S11b.
+            "WS-NO-MANIFEST",
+            "WS-NOT-A-WORKSPACE",
+            "WS-MEMBER-DOT",
+            "WS-MEMBER-DIR-MISSING",
+            "WS-MEMBER-NO-MANIFEST",
+            "WS-MEMBER-IS-WORKSPACE",
+            "WS-MEMBER-HAS-OVERRIDES",
+            "WS-MEMBER-DUPLICATE-NAME",
         ]
     }
 }

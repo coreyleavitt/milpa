@@ -219,8 +219,16 @@ impl Target for MilpaTarget {
                 let text = std::fs::read_to_string(fx.dir.join("milpa.kdl"))
                     .map_err(|e| format!("E2E-MANIFEST-UNREADABLE: {e}"))?;
                 let manifest = match milpa_core::parse_document(&text) {
-                    // Workspace resolution (multi-member) is S11; leave parked.
-                    Ok(ManifestDoc::Workspace(_)) => return Err(NOT_WIRED.to_string()),
+                    // S11a: load + structurally validate the workspace (surfaces
+                    // WS-* topology errors). The multi-member union *resolve* +
+                    // per-member nim.cfg is S11b, so a structurally-valid
+                    // workspace still falls through to NOT_WIRED.
+                    Ok(ManifestDoc::Workspace(_)) => {
+                        return match milpa_core::load_workspace(&fx.dir) {
+                            Ok(_w) => Err(NOT_WIRED.to_string()),
+                            Err(e) => Err(e.code().to_string()),
+                        };
+                    }
                     Ok(ManifestDoc::Package(m)) => m,
                     Err(e) => return Err(e.code().to_string()),
                 };

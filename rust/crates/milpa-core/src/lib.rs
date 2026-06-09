@@ -23,6 +23,7 @@ pub mod nimcfg;
 pub mod registry;
 pub mod resolver;
 pub mod store;
+pub mod workspace;
 
 pub use error::{CoreError, MilpaError};
 pub use lockfile::{format_lockfile, from_graph, load_lockfile, parse_lockfile, write_lockfile};
@@ -39,6 +40,7 @@ pub use nimcfg::format_nimcfg;
 pub use registry::Index;
 pub use resolver::resolve;
 pub use store::{default_store, CaStore};
+pub use workspace::{load_workspace, LoadedWorkspace};
 
 /// The union of every error code the Rust implementation can currently emit,
 /// across all domains. The single boundary the conformance parity check reads:
