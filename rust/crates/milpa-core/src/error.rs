@@ -25,6 +25,8 @@ pub enum CoreError {
     Resolver(&'static str, String),
     /// Registry/index read failure (`TNG-*`).
     Tianguis(&'static str, String),
+    /// Frozen-path disqualification (`FROZEN-*`).
+    Frozen(&'static str, String),
 }
 
 impl CoreError {
@@ -33,7 +35,8 @@ impl CoreError {
             CoreError::Lockfile(c, _)
             | CoreError::Identity(c, _)
             | CoreError::Resolver(c, _)
-            | CoreError::Tianguis(c, _) => c,
+            | CoreError::Tianguis(c, _)
+            | CoreError::Frozen(c, _) => c,
         }
     }
 
@@ -44,7 +47,8 @@ impl CoreError {
             CoreError::Lockfile(_, m)
             | CoreError::Identity(_, m)
             | CoreError::Resolver(_, m)
-            | CoreError::Tianguis(_, m) => m,
+            | CoreError::Tianguis(_, m)
+            | CoreError::Frozen(_, m) => m,
         }
     }
 
@@ -109,6 +113,19 @@ impl CoreError {
             "TNG-NO-SATISFYING-VERSION",
             "TNG-NO-PROVENANCE",
             "TNG-NO-IDENTITY",
+            // frozen path (frozen-semantics) — S10, single-package. The two
+            // workspace-member disqualifications (FROZEN-MEMBER-NOT-IN-WORKSPACE /
+            // FROZEN-MEMBER-IDENTITY-DRIFT) are raised only by
+            // resolve_workspace_frozen, which lands with the workspace member
+            // loader in S11 — added then (subset rule: list only codes emitted).
+            "FROZEN-STRATEGY-MISMATCH",
+            "FROZEN-MANIFEST-DEP-NOT-IN-LOCK",
+            "FROZEN-LOCKED-VERSION-UNPARSEABLE",
+            "FROZEN-CONSTRAINT-UNSATISFIED",
+            "FROZEN-MEMBER-DEP",
+            "FROZEN-LOCAL-DEP",
+            "FROZEN-IDENTITY-NOT-IN-STORE",
+            "FROZEN-LEGACY-REGISTRY-PROVENANCE",
         ]
     }
 }

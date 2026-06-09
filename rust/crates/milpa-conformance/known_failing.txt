@@ -9,25 +9,17 @@
 #     pending S4/S5b/S6-S13).
 
 spec-v1/fixture-062-diamond-conflict
-spec-v1/fixture-078-frozen-strategy-mismatch
-spec-v1/fixture-079-frozen-manifest-dep-not-in-lock
-spec-v1/fixture-080-frozen-constraint-unsatisfied
-spec-v1/fixture-081-frozen-member-dep
-spec-v1/fixture-082-frozen-local-dep
-spec-v1/fixture-083-frozen-identity-not-in-store
 spec-v1/fixture-085-frozen-member-not-in-workspace
 spec-v1/fixture-086-frozen-member-identity-drift
 spec-v1/fixture-099-res-provenance-conflict
 spec-v1/fixture-100-res-ws-override-member-collision
 spec-v1/fixture-101-res-ws-member-ref-unknown
 spec-v1/fixture-104-ws-member-is-workspace
-spec-v1/fixture-106-frozen-locked-version-unparseable
 spec-v1/fixture-107-ws-member-dir-missing
 spec-v1/fixture-108-ws-member-dot
 spec-v1/fixture-109-ws-member-no-manifest
 spec-v1/fixture-110-ws-member-has-overrides
 spec-v1/fixture-111-ws-member-duplicate-name
 spec-v1/fixture-113-res-ws-no-index
-spec-v1/fixture-114-frozen-legacy-registry-provenance
 spec-v1/fixture-115-conditional-dep-excluded
 spec-v1/fixture-117-ws-two-member-success

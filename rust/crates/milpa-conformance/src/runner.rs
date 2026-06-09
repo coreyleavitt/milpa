@@ -194,7 +194,7 @@ const NOT_WIRED: &str = "E2E-NOT-WIRED";
 
 impl Target for MilpaTarget {
     fn execute(&self, fx: &Fixture, scratch: &Scratch) -> Result<Produced, String> {
-        use milpa_core::{ManifestDoc, Resolver};
+        use milpa_core::{FrozenResolver, ManifestDoc, Resolver};
 
         match fx.cmd {
             // S5a: parse the fixture's `milpa.lock` and surface any LOCK-* code.
@@ -271,10 +271,101 @@ impl Target for MilpaTarget {
                     Err(e) => Err(e.code().to_string()),
                 }
             }
-            // S10 wires the frozen path.
-            Cmd::Frozen => Err(NOT_WIRED.to_string()),
+            // The frozen path: parse milpa.kdl + milpa.lock, seed the CAS from
+            // `cas-seed/`, then reconstruct the graph from the lockfile (no
+            // fetch/solve). Surfaces FROZEN-* disqualifications. Workspace-frozen
+            // (per-member identity checks) is S11.
+            Cmd::Frozen => {
+                let mtext = std::fs::read_to_string(fx.dir.join("milpa.kdl"))
+                    .map_err(|e| format!("E2E-MANIFEST-UNREADABLE: {e}"))?;
+                let manifest = match milpa_core::parse_document(&mtext) {
+                    Ok(ManifestDoc::Workspace(_)) => return Err(NOT_WIRED.to_string()),
+                    Ok(ManifestDoc::Package(m)) => m,
+                    Err(e) => return Err(e.code().to_string()),
+                };
+                let ltext = std::fs::read_to_string(fx.dir.join("milpa.lock"))
+                    .map_err(|e| format!("E2E-LOCKFILE-UNREADABLE: {e}"))?;
+                let lock = match milpa_core::parse_lockfile(&ltext) {
+                    Ok(l) => l,
+                    Err(e) => return Err(e.code().to_string()),
+                };
+
+                // Seed the CAS from `cas-seed/` (the S2-deferred copy-then-admit):
+                // each `cas-seed/<name>/` tree is admitted under its content hash,
+                // standing in for what a prior `milpa fetch` would have populated.
+                let store = milpa_core::CaStore::new(scratch.cas_root.clone());
+                seed_cas(&fx.dir.join("cas-seed"), &store, &scratch.root)?;
+
+                match milpa_core::Milpa.resolve_frozen(&manifest, &lock, &store, &scratch.deps_dir)
+                {
+                    Ok(graph) => {
+                        let lock_text =
+                            milpa_core::format_lockfile(&milpa_core::from_graph(&graph, "maxver"));
+                        let nimcfg_text =
+                            milpa_core::format_nimcfg(&graph, "_deps", &manifest.src_dir);
+                        Ok(Produced::Outputs(Outputs {
+                            lock_text,
+                            nimcfg_text,
+                        }))
+                    }
+                    Err(e) => Err(e.code().to_string()),
+                }
+            }
         }
     }
+}
+
+/// Admit every `cas-seed/<name>/` tree into `store` under its content hash,
+/// standing in for a prior `milpa fetch`. `admit` moves its source, so each tree
+/// is copied to a staging dir (on the same filesystem as the CAS) first. A no-op
+/// when `cas-seed/` is absent.
+fn seed_cas(
+    seed_root: &Path,
+    store: &milpa_core::CaStore,
+    scratch_root: &Path,
+) -> Result<(), String> {
+    if !seed_root.is_dir() {
+        return Ok(());
+    }
+    let staging_root = scratch_root.join(".cas-seed-staging");
+    for entry in std::fs::read_dir(seed_root).map_err(|e| format!("E2E-CAS-SEED: {e}"))? {
+        let entry = entry.map_err(|e| format!("E2E-CAS-SEED: {e}"))?;
+        if !entry
+            .file_type()
+            .map_err(|e| format!("E2E-CAS-SEED: {e}"))?
+            .is_dir()
+        {
+            continue;
+        }
+        let name = entry.file_name();
+        let staged = staging_root.join(&name);
+        let _ = std::fs::remove_dir_all(&staged);
+        copy_tree(&entry.path(), &staged).map_err(|e| format!("E2E-CAS-SEED: {e}"))?;
+        let identity = milpa_core::compute_content_hash(&staged)
+            .map_err(|e| format!("E2E-CAS-SEED: {}", e.message()))?;
+        if !store.contains(&identity).unwrap_or(false) {
+            store
+                .admit(&staged, &identity)
+                .map_err(|e| format!("E2E-CAS-SEED: {}", e.message()))?;
+        }
+        let _ = std::fs::remove_dir_all(&staged);
+    }
+    Ok(())
+}
+
+/// Recursively copy `src`'s contents into `dst` (mirrors the fake-fetcher copy).
+fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -357,15 +448,57 @@ mod tests {
     }
 
     #[test]
-    fn milpa_target_frozen_not_wired_yet() {
+    fn milpa_target_frozen_emits_outputs_for_a_dependency_free_lockfile() {
+        // S10: a no-dep manifest + matching empty maxver lockfile resolves frozen
+        // (no fetch/solve) and emits outputs.
         let tmp = tempfile::tempdir().unwrap();
         let scratch = Scratch::new(tmp.path()).unwrap();
+        std::fs::write(
+            tmp.path().join("milpa.kdl"),
+            "name \"probe\"\nkind \"library\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("milpa.lock"),
+            "version 1\nstrategy \"maxver\"\n",
+        )
+        .unwrap();
         let fx = Fixture {
             id: "synthetic/probe".into(),
             dir: tmp.path().to_path_buf(),
             cmd: Cmd::Frozen,
             expected: Expected::Success,
         };
-        assert_eq!(MilpaTarget.execute(&fx, &scratch), Err(NOT_WIRED.into()));
+        match MilpaTarget.execute(&fx, &scratch) {
+            Ok(Produced::Outputs(out)) => assert!(out.lock_text.contains("strategy \"maxver\"")),
+            other => panic!("expected Outputs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn milpa_target_frozen_surfaces_strategy_mismatch() {
+        // A minver lockfile against the default maxver request → FROZEN-*.
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = Scratch::new(tmp.path()).unwrap();
+        std::fs::write(
+            tmp.path().join("milpa.kdl"),
+            "name \"probe\"\nkind \"library\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("milpa.lock"),
+            "version 1\nstrategy \"minver\"\n",
+        )
+        .unwrap();
+        let fx = Fixture {
+            id: "synthetic/probe".into(),
+            dir: tmp.path().to_path_buf(),
+            cmd: Cmd::Frozen,
+            expected: Expected::Error("FROZEN-STRATEGY-MISMATCH".into()),
+        };
+        assert_eq!(
+            MilpaTarget.execute(&fx, &scratch),
+            Err("FROZEN-STRATEGY-MISMATCH".into())
+        );
     }
 }

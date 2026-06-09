@@ -16,6 +16,7 @@ use milpa_types::{Lockfile, ResolvedGraph};
 
 pub mod error;
 pub mod fetch;
+pub mod frozen;
 pub mod identity;
 pub mod lockfile;
 pub mod nimcfg;
@@ -31,6 +32,7 @@ pub use lockfile::{format_lockfile, from_graph, load_lockfile, parse_lockfile, w
 // `From<ManifestError>` impl lives here, so `?` lifts parse errors at this
 // boundary.
 pub use fetch::{FetchError, Fetcher, FetcherRegistry, Receipt};
+pub use frozen::resolve_frozen;
 pub use identity::{compute_content_hash, parse_identity, SUPPORTED_ALGORITHMS};
 pub use milpa_manifest::{parse_document, ManifestDoc};
 pub use nimcfg::format_nimcfg;
@@ -105,6 +107,31 @@ impl Resolver for Milpa {
         // Workspace resolution (multi-member union, per-member nim.cfg) lands in
         // S11; the single-package path is the S7b deliverable.
         unimplemented!("resolve_workspace lands in S11")
+    }
+}
+
+impl FrozenResolver for Milpa {
+    fn resolve_frozen(
+        &self,
+        m: &Manifest,
+        lock: &Lockfile,
+        store: &CaStore,
+        deps_dir: &Path,
+    ) -> Result<ResolvedGraph, MilpaError> {
+        frozen::resolve_frozen(m, lock, store, deps_dir)
+    }
+
+    fn resolve_workspace_frozen(
+        &self,
+        _w: &Workspace,
+        _lock: &Lockfile,
+        _store: &CaStore,
+        _deps_dir: &Path,
+    ) -> Result<ResolvedGraph, MilpaError> {
+        // Needs the workspace member loader (per-member manifest + on-disk
+        // identity check). Lands in S11 with FROZEN-MEMBER-NOT-IN-WORKSPACE /
+        // FROZEN-MEMBER-IDENTITY-DRIFT.
+        unimplemented!("resolve_workspace_frozen lands in S11")
     }
 }
 
