@@ -101,6 +101,10 @@ impl CoreError {
             // workspace RES-WS-* codes wire with the workspace path in S11.
             "RES-NO-INDEX",
             "RES-PROVENANCE-CONFLICT",
+            // workspace resolve-time checks (resolver §11) — S11b.
+            "RES-WS-NO-INDEX",
+            "RES-WS-OVERRIDE-MEMBER-COLLISION",
+            "RES-WS-MEMBER-REF-UNKNOWN",
             // tianguis index reader (registry-protocol §2–§4) — S8. The parse-
             // time validators + the resolve-time policy. TNG-BAD-VERSION is in
             // the catalog but unraised by both impls (reserved); not listed here

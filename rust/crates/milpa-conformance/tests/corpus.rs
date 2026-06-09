@@ -112,13 +112,60 @@ fn spec_error_codes() -> BTreeSet<String> {
         .collect()
 }
 
-/// Error-catalog parity (RFC §4.6). At S2 the Rust catalog is a *subset* of the
-/// spec (only wired codes), so this asserts `implemented ⊆ spec`: any Rust code
-/// absent from `errors.md` is a typo or an orphan slug. S12 completes every
-/// domain's `all_codes()` and flips this to a full bijection (also asserting
-/// `spec ⊆ implemented`).
+/// Spec codes not yet emittable, tagged with the slice that will wire them. As
+/// each slice lands its codes move into `implemented_error_codes()` and leave
+/// this list; when it is empty the catalog is a pure bijection with the spec
+/// (modulo [`EXEMPT`]). This is the honest S12 "bijection lint": every spec code
+/// has exactly one home — implemented, deferred-to-a-known-slice, or exempt.
+const DEFERRED: &[&str] = &[
+    // S13 — CLI manifest discovery, the manifest-mutating verbs (add/remove/
+    // update), nimble auto-discovery, and `milpa verify`.
+    "MAN-FILE-NOT-FOUND",
+    "MAN-FILE-UNREADABLE",
+    "MAN-NO-MANIFEST",
+    "MAN-NIMBLE-PARSE",
+    "MAN-NIMBLE-AMBIGUOUS",
+    "MAN-ADD-MIRROR-IDENTITY-MISMATCH",
+    "MAN-MUTATE-FILE-NOT-FOUND",
+    "MAN-MUTATE-NIMBLE-REFUSED",
+    "MAN-MUTATE-WORKSPACE-REFUSED",
+    "NIMBLE-FILE-NOT-FOUND",
+    "NIMBLE-FILE-UNREADABLE",
+    "LOCK-GRAPH-MISMATCH",
+    // S14 — real transport fetchers + safe tarball extraction.
+    "FETCH-DOWNLOAD-FAILED",
+    "FETCH-EXTRACT-FAILED",
+    "FETCH-GIT-COMMIT-ABSENT",
+    "FETCH-GIT-FAILED",
+    "FETCH-LOCAL-PATH-NOT-DIR",
+    "FETCH-LOCAL-PATH-NOT-FOUND",
+    "FETCH-OCI-AMBIGUOUS-TARBALL",
+    "FETCH-OCI-NO-TARBALL",
+    "FETCH-OCI-PULL-FAILED",
+    "FETCH-RECEIPT-EMPTY",
+    "FETCH-SHA256-MISMATCH",
+    "EXTRACT-SIZE-LIMIT",
+    "EXTRACT-SYMLINK-ESCAPE",
+    "EXTRACT-ZIP-SLIP",
+];
+
+/// Spec codes this implementation intentionally never emits.
+const EXEMPT: &[&str] = &[
+    // The type system enforces it: `parse_identity` takes a `&str`, so a
+    // non-string identity is unrepresentable (Python guards a `dict` value).
+    "ID-NOT-A-STRING",
+    // Reserved in the catalog; raised by neither the Python nor the Rust impl.
+    "TNG-BAD-VERSION",
+];
+
+/// Error-catalog bijection lint (RFC §4.6). Every code in `docs/spec/errors.md`
+/// must have exactly one home — emittable now ([`implemented_error_codes`]),
+/// [`DEFERRED`] to a named slice, or [`EXEMPT`] — and every emittable code must
+/// be in the spec (no orphans). The three sets are pairwise disjoint and their
+/// union is exactly the spec. (The non-catalog `MILPA-INTERNAL-IO` sentinel is in
+/// none of them — it is deliberately absent from `errors.md`.)
 #[test]
-fn rust_error_codes_are_a_subset_of_the_spec() {
+fn rust_error_catalog_is_a_bijection_with_the_spec() {
     let spec = spec_error_codes();
     assert!(
         spec.len() > 50,
@@ -128,16 +175,58 @@ fn rust_error_codes_are_a_subset_of_the_spec() {
 
     let implemented: BTreeSet<String> = milpa_core::implemented_error_codes()
         .into_iter()
-        .map(|s| s.to_string())
+        .map(str::to_string)
         .collect();
-    assert!(
-        !implemented.is_empty(),
-        "no implemented error codes enumerated"
-    );
+    let deferred: BTreeSet<String> = DEFERRED.iter().map(|s| s.to_string()).collect();
+    let exempt: BTreeSet<String> = EXEMPT.iter().map(|s| s.to_string()).collect();
 
+    // No orphans: every emittable code is in the spec.
     let orphans: Vec<&String> = implemented.difference(&spec).collect();
     assert!(
         orphans.is_empty(),
         "Rust emits error codes absent from docs/spec/errors.md: {orphans:?}"
+    );
+
+    // Pairwise disjoint: a code is in exactly one bucket.
+    let imp_def: Vec<&String> = implemented.intersection(&deferred).collect();
+    assert!(
+        imp_def.is_empty(),
+        "codes both implemented and DEFERRED: {imp_def:?}"
+    );
+    let imp_ex: Vec<&String> = implemented.intersection(&exempt).collect();
+    assert!(
+        imp_ex.is_empty(),
+        "codes both implemented and EXEMPT: {imp_ex:?}"
+    );
+    let def_ex: Vec<&String> = deferred.intersection(&exempt).collect();
+    assert!(
+        def_ex.is_empty(),
+        "codes both DEFERRED and EXEMPT: {def_ex:?}"
+    );
+
+    // DEFERRED / EXEMPT must reference real spec codes (no stale entries).
+    let stale_def: Vec<&String> = deferred.difference(&spec).collect();
+    assert!(
+        stale_def.is_empty(),
+        "DEFERRED lists non-spec codes: {stale_def:?}"
+    );
+    let stale_ex: Vec<&String> = exempt.difference(&spec).collect();
+    assert!(
+        stale_ex.is_empty(),
+        "EXEMPT lists non-spec codes: {stale_ex:?}"
+    );
+
+    // Exhaustive: the three buckets cover the whole spec.
+    let covered: BTreeSet<String> = implemented
+        .union(&deferred)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .union(&exempt)
+        .cloned()
+        .collect();
+    let uncovered: Vec<&String> = spec.difference(&covered).collect();
+    assert!(
+        uncovered.is_empty(),
+        "spec codes with no home (add to implemented, DEFERRED, or EXEMPT): {uncovered:?}"
     );
 }

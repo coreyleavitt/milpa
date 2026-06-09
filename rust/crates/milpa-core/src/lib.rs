@@ -49,11 +49,13 @@ pub use workspace::{load_workspace, LoadedWorkspace};
 /// `milpa-core` is the only crate that sees every domain enum, so it owns the
 /// union (the per-domain `all_codes()` are the SSOT; this just gathers them).
 ///
-/// At S2 the catalog is intentionally a *subset* of `docs/spec/errors.md` (only
-/// the codes whose slices have wired real raises). The parity test asserts
-/// `implemented ⊆ spec` now; S12 completes every domain's `all_codes()` and the
-/// test flips to a full bijection. A code here that is *not* in the spec is
-/// always a defect (a typo or an orphaned slug), which the subset check catches.
+/// The set of codes emittable *now*. The S12 bijection lint
+/// (`milpa-conformance` corpus test) partitions every `docs/spec/errors.md` code
+/// into this set, a `DEFERRED` set (tagged with the slice that will wire it), or
+/// an `EXEMPT` set (never emitted) — pairwise disjoint, union == spec. A code
+/// here absent from the spec is a defect (typo / orphan slug); a spec code in no
+/// bucket fails the lint. The pure bijection (implemented ∪ exempt == spec) is
+/// reached when the deferred set empties (after S13/S14).
 pub fn implemented_error_codes() -> Vec<&'static str> {
     let mut codes: Vec<&'static str> = Vec::new();
     codes.extend_from_slice(milpa_manifest::ManifestError::all_codes());
