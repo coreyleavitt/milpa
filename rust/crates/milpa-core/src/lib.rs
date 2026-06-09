@@ -25,6 +25,7 @@ pub mod manifest_writer;
 pub mod nimcfg;
 pub mod registry;
 pub mod resolver;
+pub mod safe_extract;
 pub mod store;
 pub mod workspace;
 
@@ -51,6 +52,7 @@ pub use nimcfg::format_nimcfg;
 pub use nimcfg::format_workspace_nimcfgs;
 pub use registry::Index;
 pub use resolver::{resolve, resolve_workspace};
+pub use safe_extract::{extract_tar, ExtractionResult, Limits};
 pub use store::{default_store, CaStore};
 pub use workspace::{load_workspace, LoadedWorkspace};
 

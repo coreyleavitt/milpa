@@ -57,7 +57,13 @@ impl FetchError {
     /// `FETCH-*`/`EXTRACT-*` transport codes land in S14 — every entry added
     /// MUST be a real spec slug.
     pub fn all_codes() -> &'static [&'static str] {
-        &["FETCH-ALL-FAILED"]
+        &[
+            "FETCH-ALL-FAILED",
+            // safe tar extraction (S14b) — carried by the Extract variant.
+            "EXTRACT-ZIP-SLIP",
+            "EXTRACT-SYMLINK-ESCAPE",
+            "EXTRACT-SIZE-LIMIT",
+        ]
     }
 }
 

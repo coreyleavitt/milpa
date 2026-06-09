@@ -132,9 +132,6 @@ const DEFERRED: &[&str] = &[
     "FETCH-OCI-PULL-FAILED",
     "FETCH-RECEIPT-EMPTY",
     "FETCH-SHA256-MISMATCH",
-    "EXTRACT-SIZE-LIMIT",
-    "EXTRACT-SYMLINK-ESCAPE",
-    "EXTRACT-ZIP-SLIP",
 ];
 
 /// Spec codes this implementation intentionally never emits.
