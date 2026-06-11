@@ -13,11 +13,12 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use milpa_core::{
-    add_mirror, discover_manifest, format_nimcfg, format_workspace_nimcfgs, from_graph,
-    index_url_from_env, load_index, load_lockfile, load_workspace, mutate_manifest_file,
-    parse_lockfile, resolve_workspace, verify_lockfile_against_deps, write_lockfile, CaStore,
-    CoreError, DefaultRegistry, FrozenResolver, Index, ManifestDoc, Milpa, MilpaError, Resolver,
-    Strategy, DEFAULT_TTL_SECONDS,
+    add_mirror, discover_manifest, fetch::FetcherRegistry, format_nimcfg, format_workspace_nimcfgs,
+    from_graph, index_url_from_env, load_index, load_lockfile, load_manifest, load_workspace,
+    mutate_manifest_file, parse_lockfile, parse_version, resolve, resolve_workspace,
+    resolve_workspace_frozen, verify_lockfile_against_deps, write_lockfile, CaStore,
+    CasAdmittingFetcher, CoreError, DefaultRegistry, FrozenResolver, Index, ManifestDoc, Milpa,
+    MilpaError, MockedFetcher, Profile, Resolver, Strategy, DEFAULT_TTL_SECONDS,
 };
 use milpa_manifest::{Dep, UrlDep};
 
@@ -27,12 +28,22 @@ const USAGE: &str = "usage: milpa [-C <dir>] [-j <N>] [-s <mode>] [--frozen] \
 <fetch|lock|show|verify|clean|add|remove|update> [args]";
 
 fn main() {
+    // Gap-1 R4: catch any Rust panic, emit a human line + the machine-readable
+    // slug, then exit 1. An unhandled panic exiting 101 is a crash verdict.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("{info}");
+        eprintln!("milpa-error: INTERNAL-PANIC");
+    }));
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     std::process::exit(match run(&args) {
         Ok(code) => code,
-        // The single normative diagnostic line: `CODE: message` to stderr (§4).
+        // Gap-1 R1/R2: on a typed Err, emit the human line then the terminal
+        // machine-readable slug. The human line is first for readability (R2
+        // says position-independent, but slug-last is the SHOULD).
         Err(e) => {
             eprintln!("{}: {}", e.code(), message_of(&e));
+            eprintln!("milpa-error: {}", e.code());
             1
         }
     });
@@ -54,7 +65,9 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
     }
     let Some(cli) = parse_args(args) else {
         eprintln!("{USAGE}");
-        return Ok(if args.is_empty() { 0 } else { 1 });
+        // Gap-1 R4/§3: argument-parse failures exit 2 (NO milpa-error: line).
+        // Empty args → print help and exit 0 (NORMATIVE: §1, "no verb → exit 0").
+        return Ok(if args.is_empty() { 0 } else { 2 });
     };
 
     let dir = &cli.directory;
@@ -64,12 +77,13 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
         "clean" => cmd_clean(dir),
         "fetch" => cmd_fetch(dir, cli.strategy, cli.frozen, true),
         "lock" => cmd_fetch(dir, cli.strategy, cli.frozen, false),
-        "update" => cmd_fetch(dir, cli.strategy, false, true),
+        "update" => cmd_update(dir, cli.strategy, &cli.rest),
         "add" => cmd_add(dir, &cli.rest),
         "remove" => cmd_remove(dir, &cli.rest),
         other => {
+            // Gap-1 §3: unknown verb is a usage error → exit 2 (no milpa-error: line).
             eprintln!("milpa: unknown command {other:?}\n{USAGE}");
-            Ok(1)
+            Ok(2)
         }
     }
 }
@@ -151,8 +165,18 @@ fn cmd_show(dir: &Path) -> Result<i32, MilpaError> {
 
 /// `milpa verify` — confirm `_deps/` matches the lockfile (stderr report).
 fn cmd_verify(dir: &Path) -> Result<i32, MilpaError> {
+    // Gap-1 D: load_lockfile's `?` surfaces LOCK-FILE-NOT-FOUND via the Err path
+    // in main (which now emits the milpa-error: slug automatically). No inline
+    // slug needed for the missing-lockfile case.
     let lock = load_lockfile(&dir.join("milpa.lock"))?;
-    let divergences = verify_lockfile_against_deps(&lock, &dir.join("_deps"));
+    let deps_dir = dir.join("_deps");
+    // Gap-1 D: VERIFY-DEPS-DIR-MISSING — emitted inline (Ok(1) path).
+    if !deps_dir.exists() {
+        eprintln!("verify: _deps/ directory not found — run `milpa fetch` first");
+        eprintln!("milpa-error: VERIFY-DEPS-DIR-MISSING");
+        return Ok(1);
+    }
+    let divergences = verify_lockfile_against_deps(&lock, &deps_dir);
     if divergences.is_empty() {
         eprintln!("verified {} deps", lock.deps.len());
         Ok(0)
@@ -161,6 +185,8 @@ fn cmd_verify(dir: &Path) -> Result<i32, MilpaError> {
         for d in &divergences {
             eprintln!("  {d}");
         }
+        // Gap-1 D: LOCK-GRAPH-MISMATCH — emitted inline (Ok(1) path).
+        eprintln!("milpa-error: LOCK-GRAPH-MISMATCH");
         Ok(1)
     }
 }
@@ -174,6 +200,39 @@ fn cmd_clean(dir: &Path) -> Result<i32, MilpaError> {
 
 /// `milpa fetch` / `lock` / `update` — resolve, write `milpa.lock` (+ `nim.cfg`
 /// for fetch). `--frozen` reconstructs from the lockfile + CAS (no network).
+/// `MILPA_MOCKED_FETCHES` if set+non-empty (the conformance fetch transport,
+/// cli-contract §8.4). `None` selects the real network transports.
+fn mocked_fetches_dir() -> Option<PathBuf> {
+    std::env::var("MILPA_MOCKED_FETCHES")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Build the fetcher registry used by every resolve path (fetch / lock / add /
+/// remove / update). All fetches go through `CasAdmittingFetcher` so
+/// `_deps/<name>` is always a relative CAS symlink. The inner fetcher is the
+/// `MockedFetcher` when `MILPA_MOCKED_FETCHES` is set (offline, conformance),
+/// else `DefaultRegistry` (real network). Single source of truth for the
+/// stage→hash→admit→link orchestration lives in `CasAdmittingFetcher`.
+fn build_registry() -> Box<dyn FetcherRegistry> {
+    let store = CaStore::new(cas_root());
+    // staging_root on the same filesystem as the CAS so rename(2) is atomic.
+    let staging_root = cas_root();
+    match mocked_fetches_dir() {
+        Some(mocked_dir) => Box::new(CasAdmittingFetcher::new(
+            MockedFetcher::new(mocked_dir),
+            store,
+            staging_root,
+        )),
+        None => Box::new(CasAdmittingFetcher::new(
+            DefaultRegistry::with_curl(),
+            store,
+            staging_root,
+        )),
+    }
+}
+
 fn cmd_fetch(
     dir: &Path,
     strategy: Strategy,
@@ -183,18 +242,42 @@ fn cmd_fetch(
     let deps_dir = dir.join("_deps");
     let doc = discover_manifest(dir)?;
 
+    // All fetches go through CasAdmittingFetcher so that _deps/<name> is
+    // always a relative CAS symlink (matching Python's registry layer and the
+    // conformance harness's FakeFetcher). The inner fetcher is selected by
+    // MILPA_MOCKED_FETCHES: set+non-empty → MockedFetcher (offline, for
+    // conformance / testing); unset/empty → DefaultRegistry (real network).
+    // Single source of truth for stage→hash→admit→link lives in
+    // CasAdmittingFetcher (fetchers.rs) — no parallel orchestration elsewhere.
+    let registry = build_registry();
+
     if let ManifestDoc::Workspace(_) = doc {
         let ws = load_workspace(dir)?;
-        let index = maybe_index();
-        let graph = resolve_workspace(
-            &ws,
-            index.as_ref(),
-            &DefaultRegistry::with_curl(),
-            None,
-            None,
-            strategy,
-            &deps_dir,
-        )?;
+        let graph = if frozen {
+            // Workspace frozen path: reconstruct from lockfile + CAS, check
+            // FROZEN-MEMBER-NOT-IN-WORKSPACE and FROZEN-MEMBER-IDENTITY-DRIFT.
+            let lock_path = dir.join("milpa.lock");
+            if !lock_path.exists() {
+                return Err(MilpaError::Core(CoreError::Frozen(
+                    "FROZEN-NO-LOCKFILE",
+                    "frozen: no milpa.lock — run `milpa fetch` first".into(),
+                )));
+            }
+            let lock = load_lockfile(&lock_path)?;
+            resolve_workspace_frozen(&ws, &lock, &CaStore::new(cas_root()), &deps_dir)?
+        } else {
+            let index = maybe_index()?;
+            let profile = profile_from_env();
+            resolve_workspace(
+                &ws,
+                index.as_ref(),
+                registry.as_ref(),
+                profile.as_ref(),
+                None,
+                strategy,
+                &deps_dir,
+            )?
+        };
         write_lockfile(
             &from_graph(&graph, strategy.as_str()),
             &dir.join("milpa.lock"),
@@ -209,9 +292,10 @@ fn cmd_fetch(
             }
         }
         eprintln!(
-            "resolved {} deps across {} members",
+            "resolved {} deps across {} members{}",
             graph.deps.len(),
-            ws.members.len()
+            ws.members.len(),
+            if frozen { " (frozen)" } else { "" }
         );
         return Ok(0);
     }
@@ -221,15 +305,29 @@ fn cmd_fetch(
     };
 
     let graph = if frozen {
-        let lock = load_lockfile(&dir.join("milpa.lock"))?;
+        // Gap-1 E (partial): FROZEN-NO-LOCKFILE — distinguish "no lockfile"
+        // from other lockfile errors when --frozen is active. Without --frozen,
+        // a missing lockfile falls through to full resolution (not an error).
+        let lock_path = dir.join("milpa.lock");
+        if !lock_path.exists() {
+            return Err(MilpaError::Core(CoreError::Frozen(
+                "FROZEN-NO-LOCKFILE",
+                "frozen: no milpa.lock — run `milpa fetch` first".into(),
+            )));
+        }
+        // FROZEN-NO-CAS: the Rust impl always constructs a CaStore (never None),
+        // so this condition is unrepresentable — left as a known cross-impl
+        // divergence (the differential harness will catch it later).
+        let lock = load_lockfile(&lock_path)?;
         Milpa.resolve_frozen(&manifest, &lock, &CaStore::new(cas_root()), &deps_dir)?
     } else {
-        let index = maybe_index();
+        let index = maybe_index()?;
+        let profile = profile_from_env();
         Milpa.resolve(
             &manifest,
             index.as_ref(),
-            &DefaultRegistry::with_curl(),
-            None,
+            registry.as_ref(),
+            profile.as_ref(),
             None,
             &deps_dir,
         )?
@@ -253,11 +351,104 @@ fn cmd_fetch(
     Ok(0)
 }
 
+/// `milpa update [<dep>]` — re-resolve and refresh `milpa.lock`, optionally
+/// scoped to a single dep (cli-contract §5.8). Never mutates `milpa.kdl`; never
+/// emits `nim.cfg` (only `milpa.lock` and `_deps/` change).
+///
+/// - No `<dep>`: drop ALL pins (`prior = None`) → full re-resolve from scratch.
+/// - `update <dep>`: reject if `<dep>` is not in the lockfile (LOCK-DEP-NOT-FOUND);
+///   drop ONLY that pin; pass all other pins to the resolver as `prior` so they
+///   stay stable; re-resolve; write the new lockfile.
+fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String]) -> Result<i32, MilpaError> {
+    let name = rest.first().cloned();
+    let lock_path = dir.join("milpa.lock");
+
+    // Scoped update: load the lockfile and build the prior (all pins minus the
+    // named dep). Reject if the named dep is not pinned.
+    let prior: Option<milpa_core::Lockfile> = match &name {
+        None => None,
+        Some(name) => {
+            // §5.8: with a <dep> arg but no lockfile, exit 1 (no prior pins to
+            // drop selectively — `milpa fetch` is the correct action).
+            if !lock_path.exists() {
+                return Err(MilpaError::Core(CoreError::Lockfile(
+                    "LOCK-FILE-NOT-FOUND",
+                    "update: no milpa.lock — run `milpa fetch` first".into(),
+                )));
+            }
+            let full = load_lockfile(&lock_path)?;
+            if !full.deps.iter().any(|d| &d.name == name) {
+                let mut known: Vec<&str> = full.deps.iter().map(|d| d.name.as_str()).collect();
+                known.sort_unstable();
+                eprintln!(
+                    "update: no dep {name:?} in lockfile (known: {})",
+                    if known.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                );
+                eprintln!("milpa-error: LOCK-DEP-NOT-FOUND");
+                return Ok(1);
+            }
+            // Drop only the named pin; everything else is retained as prior.
+            let mut prior = full;
+            prior.deps.retain(|d| &d.name != name);
+            Some(prior)
+        }
+    };
+
+    let doc = discover_manifest(dir)?;
+    let deps_dir = dir.join("_deps");
+    let registry = build_registry();
+
+    if let ManifestDoc::Workspace(_) = doc {
+        let ws = load_workspace(dir)?;
+        let index = maybe_index()?;
+        let profile = profile_from_env();
+        let graph = resolve_workspace(
+            &ws,
+            index.as_ref(),
+            registry.as_ref(),
+            profile.as_ref(),
+            prior.as_ref(),
+            strategy,
+            &deps_dir,
+        )?;
+        write_lockfile(&from_graph(&graph, strategy.as_str()), &lock_path)?;
+        eprintln!(
+            "updated {} across {} members",
+            name.as_deref().unwrap_or("all deps"),
+            ws.members.len()
+        );
+        return Ok(0);
+    }
+
+    let ManifestDoc::Package(manifest) = doc else {
+        unreachable!("workspace handled above");
+    };
+    let index = maybe_index()?;
+    let profile = profile_from_env();
+    let graph = resolve(
+        &manifest,
+        index.as_ref(),
+        registry.as_ref(),
+        profile.as_ref(),
+        prior.as_ref(),
+        strategy,
+        &deps_dir,
+    )?;
+    write_lockfile(&from_graph(&graph, strategy.as_str()), &lock_path)?;
+    eprintln!("updated {}", name.as_deref().unwrap_or("all deps"));
+    Ok(0)
+}
+
 /// `milpa add <name> --git <url> [--ref <r>]` / `add <name> --mirror <url>`.
 fn cmd_add(dir: &Path, rest: &[String]) -> Result<i32, MilpaError> {
     let Some(name) = rest.first().cloned().filter(|n| !n.starts_with('-')) else {
+        // Gap-1 C: no-name → usage error → exit 2 (no milpa-error: line).
         eprintln!("add: usage: milpa add <name> --git <url> [--ref <r>] | --mirror <url>");
-        return Ok(1);
+        return Ok(2);
     };
     if let Some(url) = flag_value(rest, "--mirror") {
         add_mirror(dir, &name, &url)?;
@@ -265,10 +456,74 @@ fn cmd_add(dir: &Path, rest: &[String]) -> Result<i32, MilpaError> {
         return Ok(0);
     }
     let Some(url) = flag_value(rest, "--git") else {
+        // Gap-1 C: no --git/--mirror → usage error → exit 2 (no milpa-error: line).
         eprintln!("add: requires --git <url> (new dep) or --mirror <url> (existing dep)");
-        return Ok(1);
+        return Ok(2);
     };
-    let git_ref = flag_value(rest, "--ref").unwrap_or_else(|| "main".to_string());
+
+    // Gap-1 D: MAN-ADD-DEP-EXISTS — pre-check by loading the manifest before
+    // mutating. `load_manifest` returns Err(MAN-*) on parse failures, which
+    // propagate via `?`. On success we check for the duplicate and return
+    // MAN-ADD-DEP-EXISTS via Err (which main's Err path will slug-print).
+    let existing_doc = load_manifest(&dir.join("milpa.kdl"))?;
+    let ManifestDoc::Package(existing) = existing_doc else {
+        return Err(MilpaError::Manifest(milpa_manifest::ManifestError::new(
+            "MAN-ADD-DEP-EXISTS",
+            "add: cannot add a dep to a workspace root manifest".to_string(),
+        )));
+    };
+    if existing.deps.iter().any(|d| d.name() == name) {
+        return Err(MilpaError::Manifest(milpa_manifest::ManifestError::new(
+            "MAN-ADD-DEP-EXISTS",
+            format!("dep {name:?} is already declared in milpa.kdl"),
+        )));
+    }
+
+    // Ref discovery (cli-contract §5.6): if --ref is omitted, discover the
+    // default branch. Under MILPA_MOCKED_FETCHES this is answered from the mock
+    // tree (no network, conformance-fixtures §2.3.3); otherwise via
+    // `git ls-remote --symref HEAD`. Discovery failure → exit 1 (no slug).
+    let git_ref = match flag_value(rest, "--ref") {
+        Some(r) => r,
+        None => match discover_default_branch(&url) {
+            Ok(r) => r,
+            Err(msg) => {
+                eprintln!(
+                    "add: could not discover default branch for {url}: {msg}; \
+                     pass --ref explicitly"
+                );
+                return Ok(1);
+            }
+        },
+    };
+
+    // Build the proposed manifest (existing + the new url dep) and run a full
+    // resolve (cli-contract §5.6). Only on success do we write milpa.kdl +
+    // milpa.lock atomically; on any failure both files are left unmodified.
+    let mut proposed = existing.clone();
+    proposed.deps.push(Dep::Url(UrlDep {
+        name: name.clone(),
+        git: url.clone(),
+        git_ref: git_ref.clone(),
+        mirrors: Vec::new(),
+        predicates: Vec::new(),
+        flag_requests: Vec::new(),
+    }));
+
+    let deps_dir = dir.join("_deps");
+    let registry = build_registry();
+    let index = maybe_index()?;
+    let profile = profile_from_env();
+    let graph = Milpa.resolve(
+        &proposed,
+        index.as_ref(),
+        registry.as_ref(),
+        profile.as_ref(),
+        None,
+        &deps_dir,
+    )?;
+
+    // Resolution succeeded → commit both outputs.
     mutate_manifest_file(&dir.join("milpa.kdl"), move |mut m| {
         m.deps.push(Dep::Url(UrlDep {
             name: name.clone(),
@@ -280,42 +535,118 @@ fn cmd_add(dir: &Path, rest: &[String]) -> Result<i32, MilpaError> {
         }));
         m
     })?;
+    write_lockfile(&from_graph(&graph, "maxver"), &dir.join("milpa.lock"))?;
     eprintln!("added dep");
     Ok(0)
 }
 
-/// `milpa remove <name>` — drop a dep from the manifest.
+/// Discover a remote's default branch. Under `MILPA_MOCKED_FETCHES` this is the
+/// mocked ref-resolution path (conformance-fixtures §2.3.3) — no network.
+/// Otherwise it runs `git ls-remote --symref HEAD`. Returns the branch name or
+/// a human-readable error string (the caller maps it to exit 1, cli-contract
+/// §5.6 — a discovery failure carries no catalog slug).
+fn discover_default_branch(url: &str) -> Result<String, String> {
+    if let Some(mocked) = mocked_fetches_dir() {
+        return match milpa_core::mocked_default_branch(&mocked, url) {
+            Ok(r) => Ok(r),
+            Err(e) => Err(format!("{e:?}")),
+        };
+    }
+    let out = std::process::Command::new("git")
+        .args(["ls-remote", "--symref", url, "HEAD"])
+        .output()
+        .map_err(|e| format!("git ls-remote: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // First line: "ref: refs/heads/<branch>\tHEAD".
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("ref: refs/heads/") {
+            if let Some(branch) = rest.split_whitespace().next() {
+                return Ok(branch.to_string());
+            }
+        }
+    }
+    Err("could not parse default branch from ls-remote output".to_string())
+}
+
+/// `milpa remove <name>` — drop a dep from `milpa.kdl` and regenerate the
+/// lockfile (cli-contract §5.7). Mirrors `cmd_add`'s structure: load the
+/// manifest, reject an undeclared dep, build the proposed manifest (minus the
+/// dep), run a FULL resolve, and only on success atomically write BOTH
+/// `milpa.kdl` and `milpa.lock`. On any failure both files are left unmodified.
 fn cmd_remove(dir: &Path, rest: &[String]) -> Result<i32, MilpaError> {
     let Some(name) = rest.first().cloned() else {
+        // Gap-1 C: no-name → usage error → exit 2 (no milpa-error: line).
         eprintln!("remove: usage: milpa remove <name>");
-        return Ok(1);
+        return Ok(2);
     };
-    let mut removed = false;
+
+    // Load the current manifest. Parse failures propagate via `?` (MAN-* slug).
+    let existing_doc = load_manifest(&dir.join("milpa.kdl"))?;
+    let ManifestDoc::Package(existing) = existing_doc else {
+        return Err(MilpaError::Manifest(milpa_manifest::ManifestError::new(
+            "MAN-REMOVE-DEP-ABSENT",
+            "remove: cannot remove a dep from a workspace root manifest".to_string(),
+        )));
+    };
+
+    // §5.7: reject if <dep> is not declared in milpa.kdl.
+    if !existing.deps.iter().any(|d| d.name() == name) {
+        eprintln!("remove: no dep {name:?} in milpa.kdl");
+        eprintln!("milpa-error: MAN-REMOVE-DEP-ABSENT");
+        return Ok(1);
+    }
+
+    // Build the proposed manifest (manifest minus <dep>) and run a full resolve
+    // (§5.7). Only on success do we commit both outputs; on any failure both
+    // files are left unmodified (resolve runs before any write).
+    let mut proposed = existing.clone();
+    proposed.deps.retain(|d| d.name() != name);
+
+    let deps_dir = dir.join("_deps");
+    let registry = build_registry();
+    let index = maybe_index()?;
+    let profile = profile_from_env();
+    let graph = Milpa.resolve(
+        &proposed,
+        index.as_ref(),
+        registry.as_ref(),
+        profile.as_ref(),
+        None,
+        &deps_dir,
+    )?;
+
+    // Resolution succeeded → commit both outputs.
     {
-        let removed = &mut removed;
         let name = name.clone();
         mutate_manifest_file(&dir.join("milpa.kdl"), move |mut m| {
-            let before = m.deps.len();
             m.deps.retain(|d| d.name() != name);
-            *removed = m.deps.len() != before;
             m
         })?;
     }
-    if removed {
-        eprintln!("removed {name}");
-        Ok(0)
-    } else {
-        eprintln!("remove: no dep {name:?} in milpa.kdl");
-        Ok(1)
-    }
+    write_lockfile(&from_graph(&graph, "maxver"), &dir.join("milpa.lock"))?;
+    eprintln!("removed {name}");
+    Ok(0)
 }
 
 // --- helpers ---------------------------------------------------------------
 
-/// Load the tianguis index from the cache (real network via `curl`), or `None`
-/// when unreachable — `resolve` only surfaces `RES-NO-INDEX` if a named dep
-/// actually needs it.
-fn maybe_index() -> Option<Index> {
+/// Load the tianguis index from the cache (real network via `curl`).
+///
+/// Returns:
+/// - `Ok(Some(index))` — index loaded and parsed successfully.
+/// - `Ok(None)` — index is genuinely unreachable (no network + no cache);
+///   the resolver surfaces `RES-NO-INDEX` only if a named dep actually needs it.
+/// - `Err(e)` — index was fetched but `Index::parse` raised a `TNG-*` (or
+///   other catalog) error; this MUST propagate so the correct slug is emitted.
+///
+/// The two non-catalog sentinels (`MILPA-INDEX-UNREACHABLE`, `MILPA-INTERNAL-IO`)
+/// are infrastructure failures (no network / cache I/O error) — treated as
+/// "absent" rather than a validation error so the resolver decides whether the
+/// absence is fatal.
+fn maybe_index() -> Result<Option<Index>, MilpaError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -331,14 +662,24 @@ fn maybe_index() -> Option<Index> {
             Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
         }
     };
-    load_index(
+    match load_index(
         &index_url_from_env(),
         &index_cache_dir(),
         &http,
         DEFAULT_TTL_SECONDS,
         now,
-    )
-    .ok()
+    ) {
+        Ok(index) => Ok(Some(index)),
+        // Non-catalog sentinels: index is unreachable or cache I/O failed.
+        // Treat as absent — the resolver will raise RES-NO-INDEX only if a
+        // named dep actually needs the index.
+        Err(e) if matches!(e.code(), "MILPA-INDEX-UNREACHABLE" | "MILPA-INTERNAL-IO") => {
+            Ok(None)
+        }
+        // Catalog errors (TNG-*, etc.): the index was fetched but failed
+        // parse/validation. Propagate so the correct slug reaches the user.
+        Err(e) => Err(e),
+    }
 }
 
 /// `$MILPA_CACHE_DIR` else `$XDG_CACHE_HOME/milpa` else `~/.cache/milpa` — the CAS
@@ -361,6 +702,37 @@ fn cache_home() -> PathBuf {
                 .map(|h| PathBuf::from(h).join(".cache"))
                 .unwrap_or_else(|_| PathBuf::from(".cache"))
         })
+}
+
+/// Build a [`Profile`] from the `MILPA_TARGET_*` environment variables
+/// (cli-contract §8, manifest-grammar §6.6). Returns `None` when none of the
+/// four variables are set (the common case — no conditional filtering).
+fn profile_from_env() -> Option<Profile> {
+    let platform = std::env::var("MILPA_TARGET_PLATFORM")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let arch = std::env::var("MILPA_TARGET_ARCH")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let nim_version = std::env::var("MILPA_TARGET_NIM")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| parse_version(&s));
+    let milpa_version = std::env::var("MILPA_TARGET_MILPA")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| parse_version(&s));
+
+    if platform.is_none() && arch.is_none() && nim_version.is_none() && milpa_version.is_none() {
+        return None;
+    }
+    Some(Profile {
+        platform,
+        arch,
+        nim_version,
+        milpa_version,
+        flags: Vec::new(),
+    })
 }
 
 /// The value following `flag` in `args` (e.g. `--git <url>`), if present.
@@ -418,31 +790,388 @@ mod tests {
     }
 
     #[test]
-    fn show_clean_remove_run_offline() {
+    fn clean_run_offline() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         // clean on an empty project is a no-op success.
         assert_eq!(cmd_clean(dir).unwrap(), 0);
-        // a manifest + add/remove round-trip.
+    }
+
+    /// `remove` rejects an undeclared dep WITHOUT resolving or writing anything
+    /// (cli-contract §5.7 — reject if <dep> not in milpa.kdl, exit 1; both files
+    /// left unmodified). No mocked transport needed: the reject path is hit
+    /// before any resolve.
+    #[test]
+    fn remove_rejects_undeclared_dep_and_leaves_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let manifest = "name \"app\"\nkind \"application\"\ndeps {\n  foo git=\"https://e/foo.git\" ref=\"main\"\n}\n";
+        std::fs::write(dir.join("milpa.kdl"), manifest).unwrap();
+        // remove of an absent dep → exit 1 (MAN-REMOVE-DEP-ABSENT).
+        assert_eq!(cmd_remove(dir, &["ghost".into()]).unwrap(), 1);
+        // manifest is unmodified; no lockfile was written.
+        assert_eq!(std::fs::read_to_string(dir.join("milpa.kdl")).unwrap(), manifest);
+        assert!(!dir.join("milpa.lock").exists());
+    }
+
+    /// `remove <dep>` now conforms to cli-contract §5.7: it runs a FULL resolve
+    /// over the manifest-minus-dep and writes BOTH milpa.kdl and milpa.lock.
+    /// Removing the only dep → empty graph → empty/header-only lockfile.
+    /// Exercised offline via the mocked transport.
+    #[test]
+    fn remove_resolves_and_writes_both_files_via_mock() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let url = "https://example.com/foo.git";
+        let mocked = make_mocked_fetches(
+            tmp.path(),
+            url,
+            "main",
+            &"b".repeat(40),
+            &[("foo.nim", b"# foo")],
+        );
         std::fs::write(
-            dir.join("milpa.kdl"),
+            proj.join("milpa.kdl"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=\"{url}\" ref=\"main\"\n}}\n"),
+        )
+        .unwrap();
+
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let r = cmd_remove(&proj, &["foo".into()]);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(r.unwrap(), 0, "remove should resolve + write both files");
+        let after = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+        assert!(!after.contains("\"foo\""), "foo must be gone from milpa.kdl");
+        // milpa.lock MUST be (re)written — the empty graph yields a header-only lock.
+        let lock = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
+        assert!(!lock.contains("\"foo\""), "lockfile must not contain foo");
+        assert!(lock.contains("version 1"), "lockfile must have the header");
+    }
+
+    /// Scoped `update <dep>` (cli-contract §5.8): drops ONLY the named pin,
+    /// retains all other pins as `prior`, re-resolves, writes the new lockfile,
+    /// and leaves milpa.kdl untouched. Exercised offline via the mocked transport.
+    #[test]
+    fn update_scoped_drops_one_pin_retains_others_via_mock() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let foo = "https://example.com/foo.git";
+        let bar = "https://example.com/bar.git";
+        let _ = make_mocked_fetches(tmp.path(), foo, "main", &"a".repeat(40), &[("foo.nim", b"# foo")]);
+        let mocked = make_mocked_fetches(tmp.path(), bar, "main", &"b".repeat(40), &[("bar.nim", b"# bar")]);
+
+        let manifest = format!(
+            "name \"app\"\nkind \"application\"\ndeps {{\n  foo git=\"{foo}\" ref=\"main\"\n  bar git=\"{bar}\" ref=\"main\"\n}}\n"
+        );
+        std::fs::write(proj.join("milpa.kdl"), &manifest).unwrap();
+
+        // First, fetch to produce a baseline lockfile with both pins.
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        assert_eq!(cmd_fetch(&proj, Strategy::default(), false, true).unwrap(), 0);
+        let baseline = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
+        assert!(baseline.contains("\"foo\"") && baseline.contains("\"bar\""));
+
+        // Scoped update of foo: succeeds, writes the lockfile, leaves kdl intact.
+        let r = cmd_update(&proj, Strategy::default(), &["foo".into()]);
+        let after_kdl = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+        let after_lock = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(r.unwrap(), 0, "scoped update should succeed");
+        assert_eq!(after_kdl, manifest, "update MUST NOT mutate milpa.kdl");
+        // Both deps still present (bar retained via prior, foo re-resolved).
+        assert!(after_lock.contains("\"foo\"") && after_lock.contains("\"bar\""));
+    }
+
+    /// Scoped `update <dep>` rejects a dep not in the lockfile (LOCK-DEP-NOT-FOUND,
+    /// exit 1) and rejects when no lockfile exists (LOCK-FILE-NOT-FOUND).
+    #[test]
+    fn update_scoped_rejects_dep_not_in_lock() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("milpa.kdl"),
             "name \"app\"\nkind \"application\"\n",
         )
         .unwrap();
-        assert_eq!(
-            cmd_add(
-                dir,
-                &["foo".into(), "--git".into(), "https://e/foo.git".into()]
-            )
-            .unwrap(),
-            0
+
+        // No lockfile yet → scoped update fails with LOCK-FILE-NOT-FOUND.
+        let no_lock = cmd_update(&proj, Strategy::default(), &["ghost".into()]);
+        assert!(no_lock.is_err());
+        assert_eq!(no_lock.unwrap_err().code(), "LOCK-FILE-NOT-FOUND");
+
+        // Write an empty lockfile; scoped update of an absent dep → exit 1.
+        std::fs::write(
+            proj.join("milpa.lock"),
+            "// generated by milpa; reproducible build snapshot\nversion 1\nstrategy \"maxver\"\n",
+        )
+        .unwrap();
+        let r = cmd_update(&proj, Strategy::default(), &["ghost".into()]);
+        assert_eq!(r.unwrap(), 1, "dep-not-in-lock → exit 1");
+    }
+
+    /// `add --git` now conforms to cli-contract §5.6: it runs a full resolve and
+    /// writes BOTH milpa.kdl and milpa.lock. Exercised offline via the mocked
+    /// transport. Covers explicit --ref, mocked default-branch discovery (no
+    /// --ref), and the MAN-ADD-DEP-EXISTS duplicate guard.
+    #[test]
+    fn add_git_resolves_and_writes_lockfile_via_mock() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let sha = "b".repeat(40);
+        let url = "https://example.com/foo.git";
+        let mocked = make_mocked_fetches(tmp.path(), url, "main", &sha, &[("foo.nim", b"# foo")]);
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\n",
+        )
+        .unwrap();
+
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+
+        // (1) add with explicit --ref → resolve + write both files.
+        let r = cmd_add(
+            &proj,
+            &["foo".into(), "--git".into(), url.into(), "--ref".into(), "main".into()],
         );
-        let after_add = std::fs::read_to_string(dir.join("milpa.kdl")).unwrap();
-        assert!(after_add.contains("\"foo\""));
-        assert_eq!(cmd_remove(dir, &["foo".into()]).unwrap(), 0);
-        let after_rm = std::fs::read_to_string(dir.join("milpa.kdl")).unwrap();
-        assert!(!after_rm.contains("\"foo\""));
-        // remove of an absent dep → exit 1.
-        assert_eq!(cmd_remove(dir, &["ghost".into()]).unwrap(), 1);
+        let after_add = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+        let lock = std::fs::read_to_string(proj.join("milpa.lock")).unwrap_or_default();
+
+        // (2) duplicate guard.
+        let dup = cmd_add(
+            &proj,
+            &["foo".into(), "--git".into(), url.into(), "--ref".into(), "main".into()],
+        );
+
+        // (3) add a second dep with NO --ref → mocked default-branch discovery.
+        let url2 = "https://example.com/bar.git";
+        let _ = make_mocked_fetches(tmp.path(), url2, "trunk", &"c".repeat(40), &[("bar.nim", b"# bar")]);
+        let r2 = cmd_add(&proj, &["bar".into(), "--git".into(), url2.into()]);
+        let after_add2 = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(r.unwrap(), 0, "add --git --ref should succeed");
+        assert!(after_add.contains("\"foo\""), "manifest should contain foo");
+        assert!(lock.contains("\"foo\""), "lockfile should contain foo");
+
+        assert!(dup.is_err());
+        assert_eq!(dup.unwrap_err().code(), "MAN-ADD-DEP-EXISTS");
+
+        assert_eq!(r2.unwrap(), 0, "add --git (no --ref) should resolve via mock");
+        // Discovered ref "trunk" must land in the manifest.
+        assert!(after_add2.contains("\"bar\""), "manifest should contain bar");
+        assert!(after_add2.contains("trunk"), "discovered ref should be trunk");
+    }
+
+    #[test]
+    fn parse_failure_returns_exit_2() {
+        // An invalid strategy value makes parse_args return None → exit 2.
+        let args: Vec<String> = vec!["-s".into(), "bogus".into(), "fetch".into()];
+        assert_eq!(run(&args).unwrap(), 2);
+    }
+
+    #[test]
+    fn unknown_verb_returns_exit_2() {
+        assert_eq!(run(&["notaverb".to_string()]).unwrap(), 2);
+    }
+
+    #[test]
+    fn usage_subcmds_return_exit_2() {
+        // remove with no name → exit 2.
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(cmd_remove(tmp.path(), &[]).unwrap(), 2);
+        // add with no name → exit 2.
+        assert_eq!(cmd_add(tmp.path(), &[]).unwrap(), 2);
+        // add with no --git/--mirror → exit 2.
+        assert_eq!(cmd_add(tmp.path(), &["foo".into()]).unwrap(), 2);
+    }
+
+    // --- MILPA_MOCKED_FETCHES integration -----------------------------------
+    //
+    // These tests verify that `cmd_fetch` selects `MockedFetcher` when the env
+    // var is set. Because `std::env::set_var` is shared state, the two env-var
+    // tests are serialized with a static Mutex; all other tests never touch
+    // `MILPA_MOCKED_FETCHES` and run freely in parallel.
+
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Build a minimal `mocked-fetches/<url_key>/` fixture tree and return its
+    /// root dir (inside `base`).
+    fn make_mocked_fetches(
+        base: &std::path::Path,
+        url: &str,
+        ref_spec: &str,
+        sha: &str,
+        src_files: &[(&str, &[u8])],
+    ) -> std::path::PathBuf {
+        let mocked = base.join("mocked-fetches");
+        let key_dir = mocked.join(milpa_core::url_key(url, ref_spec));
+        std::fs::create_dir_all(key_dir.join("content")).unwrap();
+        std::fs::write(key_dir.join("sha"), format!("{sha}\n")).unwrap();
+        for (name, data) in src_files {
+            std::fs::write(key_dir.join("content").join(name), data).unwrap();
+        }
+        mocked
+    }
+
+    #[test]
+    fn mocked_fetches_env_resolves_offline_and_writes_lockfile() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let sha = "a".repeat(40);
+        let mocked = make_mocked_fetches(
+            tmp.path(),
+            "https://example.com/foo.git",
+            "main",
+            &sha,
+            &[("foo.nim", b"# foo")],
+        );
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\ndeps {\n  foo git=\"https://example.com/foo.git\" ref=\"main\"\n}\n",
+        )
+        .unwrap();
+
+        // SAFETY: serialized by ENV_MUTEX; unique env var name; cleaned up after.
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let result = cmd_fetch(&proj, Strategy::default(), false, true);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert_eq!(result.unwrap(), 0);
+        let lock = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
+        assert!(lock.contains("\"foo\""), "lockfile should contain dep name");
+
+        // BLOCKER-R1 fix (#118): _deps/<name> must be a CAS symlink, not a
+        // real directory. The CasAdmittingFetcher wrapper is what produces
+        // this — verify the symlink is present.
+        let foo_meta = std::fs::symlink_metadata(proj.join("_deps").join("foo")).unwrap();
+        assert!(
+            foo_meta.file_type().is_symlink(),
+            "_deps/foo must be a CAS symlink after mocked fetch (BLOCKER-R1)"
+        );
+    }
+
+    #[test]
+    fn mocked_fetches_missing_key_errors_with_fetch_all_failed() {
+        // The resolver wraps a per-candidate FETCH-MOCK-MISSING in FETCH-ALL-FAILED
+        // (mirror-fallback §8a): all 1 candidate(s) failed. The CLI sees
+        // FETCH-ALL-FAILED; the inner cause text carries the slug for human
+        // diagnostics. This is the correct, spec-conformant behaviour.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // An empty mocked-fetches dir — no key for the dep below.
+        let mocked = tmp.path().join("mocked-fetches");
+        std::fs::create_dir_all(&mocked).unwrap();
+
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\ndeps {\n  foo git=\"https://example.com/foo.git\" ref=\"main\"\n}\n",
+        )
+        .unwrap();
+
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let result = cmd_fetch(&proj, Strategy::default(), false, true);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert!(result.is_err(), "expected Err, got {result:?}");
+        // Resolver wraps per-candidate failures into FETCH-ALL-FAILED (§8a).
+        assert_eq!(result.unwrap_err().code(), "FETCH-ALL-FAILED");
+    }
+
+    // --- maybe_index propagation (BLOCKER-R2) ---------------------------------
+    //
+    // These tests verify that maybe_index() propagates TNG-* parse errors instead
+    // of swallowing them via .ok(). They set MILPA_INDEX_URL and MILPA_CACHE_DIR
+    // so are serialized behind ENV_MUTEX like the other env-var tests above.
+
+    #[test]
+    fn maybe_index_propagates_tng_error_for_malformed_index() {
+        // BLOCKER-R2 fix (#118): a fetched index that fails Index::parse with a
+        // TNG-* error (e.g. schema_version too high → TNG-SCHEMA-UNKNOWN) must
+        // surface as Err(TNG-*), NOT be swallowed into Ok(None).
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Write an index.kdl with schema_version 99 — raises TNG-SCHEMA-UNKNOWN.
+        let index_path = tmp.path().join("index.kdl");
+        std::fs::write(
+            &index_path,
+            "schema_version 99\npackage \"foo\" {\n  version \"1.0.0\" {\n    content_hash \"sha256:0000000000000000000000000000000000000000000000000000000000000001\"\n    provenance {\n      kind \"git\"\n      url \"https://github.com/example/foo.git\"\n      ref \"v1.0.0\"\n    }\n  }\n}\n",
+        )
+        .unwrap();
+
+        // Point MILPA_INDEX_URL at the file; isolate the index cache via
+        // XDG_CACHE_HOME (index_cache_dir uses XDG_CACHE_HOME/milpa/index).
+        let url = format!("file://{}", index_path.display());
+        unsafe { std::env::set_var("MILPA_INDEX_URL", &url) };
+        unsafe { std::env::set_var("XDG_CACHE_HOME", tmp.path()) };
+
+        let result = maybe_index();
+
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
+
+        // Must propagate TNG-SCHEMA-UNKNOWN, not return Ok(None).
+        assert!(
+            result.is_err(),
+            "expected Err(TNG-SCHEMA-UNKNOWN), got Ok({result:?})"
+        );
+        assert_eq!(
+            result.unwrap_err().code(),
+            "TNG-SCHEMA-UNKNOWN",
+            "wrong error code: expected TNG-SCHEMA-UNKNOWN"
+        );
+    }
+
+    #[test]
+    fn maybe_index_returns_none_when_index_unreachable() {
+        // When the index URL is unreachable (no cache, curl fails), maybe_index()
+        // returns Ok(None) — the resolver decides whether RES-NO-INDEX applies.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        // A file:// URL that doesn't exist → curl will fail; no cache exists.
+        unsafe {
+            std::env::set_var(
+                "MILPA_INDEX_URL",
+                "file:///nonexistent-milpa-test-index-12345.kdl",
+            )
+        };
+        unsafe { std::env::set_var("XDG_CACHE_HOME", tmp.path()) };
+
+        let result = maybe_index();
+
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
+
+        // Unreachable → Ok(None), not an error.
+        assert_eq!(
+            result,
+            Ok(None),
+            "expected Ok(None) for unreachable index, got {result:?}"
+        );
     }
 }

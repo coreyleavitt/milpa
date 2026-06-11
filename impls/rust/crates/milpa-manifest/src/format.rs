@@ -74,7 +74,7 @@ pub fn format_manifest(m: &Manifest) -> String {
             let mut head = format!(
                 "    \"{}\" default={}",
                 fd.name,
-                if fd.default { "true" } else { "false" }
+                if fd.default { "#true" } else { "#false" }
             );
             if !fd.description.is_empty() {
                 head.push_str(&format!(" description=\"{}\"", fd.description));
@@ -146,7 +146,7 @@ fn format_dep_line(dep: &Dep) -> String {
                 if fr.enabled {
                     block.push(format!("        flag \"{}\"", fr.name));
                 } else {
-                    block.push(format!("        flag \"{}\" false", fr.name));
+                    block.push(format!("        flag \"{}\" #false", fr.name));
                 }
             }
             block.push("    }".to_string());
@@ -223,6 +223,9 @@ mod tests {
             Dep::Named(NamedDep {
                 name: "bar".into(),
                 constraint: Some(">= 1.0.0".into()),
+                parsed_constraint: Some(
+                    milpa_solver::VersionSet::from_constraint(Some(">= 1.0.0")).unwrap(),
+                ),
             }),
         ];
         let text = format_manifest(&m);

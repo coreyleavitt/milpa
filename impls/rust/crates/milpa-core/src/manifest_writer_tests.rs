@@ -57,6 +57,7 @@ fn add_dep_rewrites_canonically_and_reports_comment_loss() {
             .push(milpa_manifest::Dep::Named(milpa_manifest::NamedDep {
                 name: "newdep".into(),
                 constraint: None,
+                parsed_constraint: None,
             }));
         m
     })

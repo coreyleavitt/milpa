@@ -56,6 +56,7 @@ fn conformance_corpus() {
 
     let mut passed = 0usize;
     let mut xfail = 0usize;
+    let mut skipped = 0usize;
     let mut xpass: Vec<String> = Vec::new();
     let mut regressions: Vec<String> = Vec::new();
 
@@ -65,6 +66,9 @@ fn conformance_corpus() {
         let verdict = run_fixture(fx, &MilpaTarget, &scratch);
         let parked = kf.contains(&fx.id);
         match (verdict, parked) {
+            // CLI-only verb fixtures are not assertable in-process — skipped
+            // here, covered by the black-box CLI harness (harness/).
+            (Verdict::Skip(_), _) => skipped += 1,
             (Verdict::Pass, false) => passed += 1,
             (Verdict::Pass, true) => xpass.push(fx.id.clone()),
             (Verdict::Fail(_), true) => xfail += 1,
@@ -73,7 +77,7 @@ fn conformance_corpus() {
     }
 
     eprintln!(
-        "conformance: {} fixtures — {passed} pass, {xfail} xfail (parked), {} xpass, {} regressions",
+        "conformance: {} fixtures — {passed} pass, {xfail} xfail (parked), {skipped} skip (cli-only), {} xpass, {} regressions",
         fixtures.len(),
         xpass.len(),
         regressions.len()

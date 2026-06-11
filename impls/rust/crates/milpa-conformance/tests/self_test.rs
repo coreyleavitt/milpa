@@ -113,6 +113,6 @@ fn diff_detects_a_wrong_lockfile() {
     let (_tmp, s) = scratch();
     match run_fixture(&fx, &WrongStubTarget, &s) {
         Verdict::Fail(msg) => assert!(msg.contains("milpa.lock mismatch"), "got: {msg}"),
-        Verdict::Pass => panic!("diff failed to detect a wrong lockfile"),
+        other => panic!("diff failed to detect a wrong lockfile: {other:?}"),
     }
 }

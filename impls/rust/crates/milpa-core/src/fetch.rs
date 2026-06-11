@@ -80,6 +80,10 @@ impl FetchError {
             "FETCH-OCI-PULL-FAILED",
             "FETCH-OCI-NO-TARBALL",
             "FETCH-OCI-AMBIGUOUS-TARBALL",
+            // mocked transport (issue #2 / differential-conformance-harness RFC):
+            // the env-var-activated mocked fetcher (`MILPA_MOCKED_FETCHES`) found
+            // no fixture directory for the requested `(url, ref)` key.
+            "FETCH-MOCK-MISSING",
         ]
     }
 }

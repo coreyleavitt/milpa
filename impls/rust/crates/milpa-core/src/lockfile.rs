@@ -10,6 +10,7 @@
 //! and defined in `spec/errors.md`.
 
 use kdl::{KdlDocument, KdlNode, KdlValue};
+use milpa_manifest::{kdl_brace_depth, KDL_MAX_NESTING_DEPTH};
 use milpa_types::{
     LockedDep, Lockfile, ProvenanceRecord, ResolvedDep, ResolvedGraph, LOCKFILE_SCHEMA_VERSION,
 };
@@ -31,7 +32,14 @@ fn err(code: &'static str, message: impl Into<String>) -> CoreError {
 /// malformed `strategy` node is silently ignored (spec §2.2: tolerate pre-v1.0
 /// lockfiles that predate the always-emitted node).
 pub fn parse_lockfile(text: &str) -> LockResult<Lockfile> {
-    let doc = KdlDocument::parse_v1(text)
+    // Depth guard — see milpa_manifest::KDL_MAX_NESTING_DEPTH for rationale.
+    if kdl_brace_depth(text) > KDL_MAX_NESTING_DEPTH {
+        return Err(err(
+            "LOCK-KDL-SYNTAX",
+            format!("KDL input exceeds maximum nesting depth ({KDL_MAX_NESTING_DEPTH})"),
+        ));
+    }
+    let doc = KdlDocument::parse(text)
         .map_err(|e| err("LOCK-KDL-SYNTAX", format!("KDL syntax error: {e}")))?;
 
     let mut deps: Vec<LockedDep> = Vec::new();

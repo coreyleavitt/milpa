@@ -1,29 +1,10 @@
 //! URL-key encoding for `mocked-fetches/<key>/` (conformance-fixtures.md §2.3.1).
 //!
-//! NORMATIVE rule: encode the URL by replacing every character outside
-//! `[A-Za-z0-9._-]` with `_`, append a literal `@` separator, then append the
-//! ref encoded by the same substitution. The `@` *separator* is preserved; a
-//! `@` *inside the ref* is replaced like any other out-of-class character (so
-//! ref `v1@beta` → `v1_beta`). This is the single source of truth shared by the
-//! fixture generator and the fake fetcher — no lookup table.
+//! The single source of truth is [`milpa_core::url_key`]; this module re-exports
+//! it so conformance code keeps its existing `crate::urlkey::url_key` call sites
+//! unchanged.
 
-/// Replace every character outside `[A-Za-z0-9._-]` with `_`.
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// Encode a `(url, ref)` pair to its `mocked-fetches/` subdirectory name.
-pub fn url_key(url: &str, ref_spec: &str) -> String {
-    format!("{}@{}", sanitize(url), sanitize(ref_spec))
-}
+pub use milpa_core::url_key;
 
 #[cfg(test)]
 mod tests {

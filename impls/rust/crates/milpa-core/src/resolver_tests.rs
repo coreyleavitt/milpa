@@ -158,6 +158,10 @@ fn named_dep(name: &str, constraint: Option<&str>) -> Dep {
     Dep::Named(NamedDep {
         name: name.to_string(),
         constraint: constraint.map(str::to_string),
+        parsed_constraint: constraint.map(|c| {
+            milpa_solver::VersionSet::from_constraint(Some(c))
+                .expect("test constraint must be valid")
+        }),
     })
 }
 
@@ -788,6 +792,120 @@ fn resolve_content_hash_dedup_aliases_to_lex_min_name() {
     .unwrap();
     let names: Vec<&str> = graph.deps.iter().map(|d| d.name.as_str()).collect();
     assert_eq!(names, vec!["bar"], "deduped to lex-min canonical");
+}
+
+/// Regression: fixture-115 — dep with `platform "windows"` child-node predicate
+/// is excluded when `MILPA_TARGET_PLATFORM=linux` (§6.2 + §6.6).
+#[test]
+fn resolve_profile_excludes_platform_mismatch() {
+    let reg = FakeReg::default(); // no mocks needed — dep must not be fetched
+    let tmp = tempfile::tempdir().unwrap();
+    let dep = Dep::Url(UrlDep {
+        name: "winonly".into(),
+        git: "https://github.com/example/winonly.git".into(),
+        git_ref: "main".into(),
+        mirrors: Vec::new(),
+        predicates: vec![Predicate {
+            name: "platform".into(),
+            values: vec!["windows".into()],
+            negated: false,
+        }],
+        flag_requests: Vec::new(),
+    });
+    let m = manifest(vec![dep]);
+    let profile = Profile {
+        platform: Some("linux".into()),
+        arch: Some("amd64".into()),
+        nim_version: Some(v(2, 0, 0)),
+        ..Profile::default()
+    };
+    let graph = resolve(
+        &m,
+        None,
+        &reg,
+        Some(&profile),
+        None,
+        Strategy::Maxver,
+        &deps_dir(&tmp),
+    )
+    .unwrap();
+    assert!(graph.deps.is_empty(), "windows-gated dep excluded on linux");
+    assert!(reg.calls().is_empty(), "excluded dep must never be fetched");
+}
+
+/// Dep with matching platform predicate IS included when the profile matches.
+#[test]
+fn resolve_profile_includes_platform_match() {
+    let reg = FakeReg::git(&[(
+        "https://github.com/example/linuxonly.git",
+        "main",
+        nimble("abc", "srcDir = \"src\"\n"),
+    )]);
+    let tmp = tempfile::tempdir().unwrap();
+    let dep = Dep::Url(UrlDep {
+        name: "linuxonly".into(),
+        git: "https://github.com/example/linuxonly.git".into(),
+        git_ref: "main".into(),
+        mirrors: Vec::new(),
+        predicates: vec![Predicate {
+            name: "platform".into(),
+            values: vec!["linux".into()],
+            negated: false,
+        }],
+        flag_requests: Vec::new(),
+    });
+    let m = manifest(vec![dep]);
+    let profile = Profile {
+        platform: Some("linux".into()),
+        ..Profile::default()
+    };
+    let graph = resolve(
+        &m,
+        None,
+        &reg,
+        Some(&profile),
+        None,
+        Strategy::Maxver,
+        &deps_dir(&tmp),
+    )
+    .unwrap();
+    assert_eq!(graph.deps.len(), 1, "linux-gated dep included on linux");
+    assert_eq!(graph.deps[0].name, "linuxonly");
+}
+
+/// Absent profile includes deps regardless of predicates (§6 absent-profile rule).
+#[test]
+fn resolve_absent_profile_includes_platform_gated_dep() {
+    let reg = FakeReg::git(&[(
+        "https://github.com/example/winonly.git",
+        "main",
+        nimble("abc", "srcDir = \"src\"\n"),
+    )]);
+    let tmp = tempfile::tempdir().unwrap();
+    let dep = Dep::Url(UrlDep {
+        name: "winonly".into(),
+        git: "https://github.com/example/winonly.git".into(),
+        git_ref: "main".into(),
+        mirrors: Vec::new(),
+        predicates: vec![Predicate {
+            name: "platform".into(),
+            values: vec!["windows".into()],
+            negated: false,
+        }],
+        flag_requests: Vec::new(),
+    });
+    let m = manifest(vec![dep]);
+    let graph = resolve(
+        &m,
+        None,
+        &reg,
+        None, // absent profile
+        None,
+        Strategy::Maxver,
+        &deps_dir(&tmp),
+    )
+    .unwrap();
+    assert_eq!(graph.deps.len(), 1, "absent profile includes all deps");
 }
 
 #[test]

@@ -299,9 +299,14 @@ pub fn resolve_workspace(
 #[derive(Debug, Clone)]
 enum Item {
     Url(UrlDep),
+    /// A named (index-resolved) dep. `constraint` carries the pre-parsed
+    /// `VersionSet`: validated at the manifest-parse boundary for milpa.kdl deps
+    /// (`MAN-DEP-NAMED-CONSTRAINT`) or at the nimble-parse boundary for .nimble
+    /// deps (`MAN-NIMBLE-CONSTRAINT`). The `VersionSet` is never re-parsed at
+    /// dispatch time; `process_named` receives it directly.
     Named {
         name: String,
-        constraint: Option<String>,
+        constraint: VersionSet,
     },
     Local(LocalDep),
     Tarball(TarballDep),
@@ -470,6 +475,12 @@ impl<'a> ResolveProvider<'a> {
                     queue.push(Item::Url(u.clone()));
                 }
                 Dep::Named(n) => {
+                    // Manifest-parsed: use the pre-validated VersionSet
+                    // (MAN-DEP-NAMED-CONSTRAINT raised at parse time).
+                    let vs = n
+                        .parsed_constraint
+                        .clone()
+                        .unwrap_or_else(VersionSet::full);
                     if self.overrides.contains_key(&name) {
                         // Override routes a named dep to a URL fetch → singleton.
                         let ov = &self.overrides[&name];
@@ -479,16 +490,13 @@ impl<'a> ResolveProvider<'a> {
                             (PKey::Url(ov.git.clone(), ov.git_ref.clone()), true),
                         );
                     } else {
-                        root_deps.push(SolverDep::new(
-                            name.clone(),
-                            from_constraint(n.constraint.as_deref())?,
-                        ));
+                        root_deps.push(SolverDep::new(name.clone(), vs.clone()));
                         seen_by_name.insert(name.clone(), (PKey::Named(name.clone()), true));
                     }
                     root_requires.push(name.clone());
                     queue.push(Item::Named {
                         name,
-                        constraint: n.constraint.clone(),
+                        constraint: vs,
                     });
                 }
                 Dep::Member(_) => {
@@ -585,9 +593,10 @@ impl<'a> ResolveProvider<'a> {
                     seen_by_name
                         .entry(name.clone())
                         .or_insert((PKey::Url(ov.git.clone(), ov.git_ref.clone()), true));
+                    // Override converts Named→Url at dispatch; constraint is unused.
                     queue.push(Item::Named {
                         name,
-                        constraint: None,
+                        constraint: VersionSet::full(),
                     });
                     continue;
                 }
@@ -618,17 +627,20 @@ impl<'a> ResolveProvider<'a> {
                         queue.push(Item::Tarball(t.clone()));
                     }
                     Dep::Named(n) => {
-                        terms.push(SolverDep::new(
-                            name.clone(),
-                            from_constraint(n.constraint.as_deref())?,
-                        ));
+                        // Manifest-parsed: use the pre-validated VersionSet
+                        // (MAN-DEP-NAMED-CONSTRAINT raised at parse time).
+                        let vs = n
+                            .parsed_constraint
+                            .clone()
+                            .unwrap_or_else(VersionSet::full);
+                        terms.push(SolverDep::new(name.clone(), vs.clone()));
                         requires.push(name.clone());
                         seen_by_name
                             .entry(name.clone())
                             .or_insert((PKey::Named(name.clone()), true));
                         queue.push(Item::Named {
                             name,
-                            constraint: n.constraint.clone(),
+                            constraint: vs,
                         });
                     }
                     Dep::Member(_) => unreachable!("handled by the coercion branch above"),
@@ -713,7 +725,7 @@ impl<'a> ResolveProvider<'a> {
             Item::Url(dep) => self.process_url(dep),
             Item::Local(dep) => self.process_local(dep),
             Item::Tarball(dep) => self.process_tarball(dep),
-            Item::Named { name, constraint } => self.process_named(&name, constraint.as_deref()),
+            Item::Named { name, constraint } => self.process_named(&name, constraint),
         }
     }
 
@@ -878,7 +890,10 @@ impl<'a> ResolveProvider<'a> {
     }
 
     /// Phase A: enumerate index versions for a named dep as stubs (no fetch).
-    fn process_named(&self, name: &str, constraint: Option<&str>) -> Result<(), MilpaError> {
+    /// `constraint` is a pre-parsed `VersionSet` — validated at the parse
+    /// boundary (manifest: `MAN-DEP-NAMED-CONSTRAINT`; nimble:
+    /// `MAN-NIMBLE-CONSTRAINT`). No re-parsing occurs here.
+    fn process_named(&self, name: &str, constraint: VersionSet) -> Result<(), MilpaError> {
         if name == "nim" {
             self.seen_named.borrow_mut().insert(name.to_string());
             return Ok(());
@@ -894,12 +909,11 @@ impl<'a> ResolveProvider<'a> {
         // Phase A enumerate: the index applies the full resolve-time policy
         // (TNG-NOT-FOUND / TNG-AMBIGUOUS-NAME / TNG-NO-SATISFYING-VERSION /
         // TNG-NO-PROVENANCE) and returns every satisfying version newest-first.
-        // The constraint is already validated upstream (seed_root / build_from_*
-        // call `from_constraint`), so this parse is defensive.
-        let vs = from_constraint(constraint)?;
+        let vs = &constraint;
+        let raw_str: Option<&str> = None; // display hint only; constraint is pre-parsed
         let versions = self
             .index
-            .resolve_named_all(name, &vs, constraint)
+            .resolve_named_all(name, vs, raw_str)
             .map_err(MilpaError::from)?;
         let mut by_ver: BTreeMap<Version, IndexVersion> = BTreeMap::new();
         for e in versions {
@@ -1059,16 +1073,20 @@ impl<'a> ResolveProvider<'a> {
                     if n.name == "nim" {
                         continue;
                     }
+                    // Manifest-parsed: use the pre-validated VersionSet
+                    // (MAN-DEP-NAMED-CONSTRAINT raised at parse time).
                     let vs = if self.overrides.contains_key(&n.name) {
                         eq_sentinel()
                     } else {
-                        from_constraint(n.constraint.as_deref())?
+                        n.parsed_constraint
+                            .clone()
+                            .unwrap_or_else(VersionSet::full)
                     };
-                    deps.push(SolverDep::new(n.name.clone(), vs));
+                    deps.push(SolverDep::new(n.name.clone(), vs.clone()));
                     names.push(n.name.clone());
                     items.push(Item::Named {
                         name: n.name.clone(),
-                        constraint: n.constraint.clone(),
+                        constraint: vs,
                     });
                 }
                 // Local/Tarball/Member from a transitive milpa.kdl are out of
@@ -1102,16 +1120,17 @@ impl<'a> ResolveProvider<'a> {
                     if name == "nim" {
                         continue;
                     }
+                    // Nimble-path: parse at the nimble boundary → MAN-NIMBLE-CONSTRAINT.
                     let vs = if self.overrides.contains_key(name) {
                         eq_sentinel()
                     } else {
-                        from_constraint(constraint.as_deref())?
+                        from_nimble_constraint(constraint.as_deref())?
                     };
-                    deps.push(SolverDep::new(name.clone(), vs));
+                    deps.push(SolverDep::new(name.clone(), vs.clone()));
                     names.push(name.clone());
                     items.push(Item::Named {
                         name: name.clone(),
-                        constraint: constraint.clone(),
+                        constraint: vs,
                     });
                 }
             }
@@ -1365,10 +1384,12 @@ fn eq_sentinel() -> VersionSet {
     VersionSet::eq(url_dep_version())
 }
 
-/// `VersionSet::from_constraint`, remapping the solver's uncoded
-/// [`ConstraintError`](milpa_solver::ConstraintError) to `MAN-NIMBLE-CONSTRAINT`
-/// (resolver-semantics — a malformed constraint discovered at resolve time).
-fn from_constraint(constraint: Option<&str>) -> Result<VersionSet, MilpaError> {
+/// Parse a `.nimble` requires constraint string → `VersionSet`, mapping any
+/// [`ConstraintError`](milpa_solver::ConstraintError) to `MAN-NIMBLE-CONSTRAINT`.
+/// This is the ONLY call site that should emit `MAN-NIMBLE-CONSTRAINT`; manifest
+/// named-dep constraints are validated at the manifest-parse boundary and arrive
+/// as pre-parsed `VersionSet`s on `NamedDep::parsed_constraint`.
+fn from_nimble_constraint(constraint: Option<&str>) -> Result<VersionSet, MilpaError> {
     VersionSet::from_constraint(constraint).map_err(|e| {
         MilpaError::Manifest(milpa_manifest::ManifestError::new(
             "MAN-NIMBLE-CONSTRAINT",

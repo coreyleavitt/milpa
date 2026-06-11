@@ -19,16 +19,30 @@ pub enum Cmd {
     /// `frozen`: no-network frozen path against `milpa.kdl` + `milpa.lock`,
     /// optionally CAS-seeded from `cas-seed/`.
     Frozen,
+    /// A CLI-only verb fixture (§2.7.1 mutation `add`/`remove`/`update` or
+    /// §2.7.2 liveness `show`/`--version`). These exercise the CLI binary and
+    /// its argv/output contract, which the in-process library [`Target`] does
+    /// not model — they are driven exclusively by the black-box CLI harness
+    /// (`harness/`). The in-process corpus runner SKIPS them (not a failure).
+    CliOnly,
 }
 
 impl Cmd {
     fn from_dir(dir: &Path) -> Self {
         match std::fs::read_to_string(dir.join("cmd")) {
-            Ok(text) => match text.trim() {
-                "parse-lockfile" => Cmd::ParseLockfile,
-                "frozen" => Cmd::Frozen,
-                _ => Cmd::Resolve,
-            },
+            Ok(text) => {
+                // The first whitespace token is the selector (§2.7).
+                let head = text.trim().split_whitespace().next().unwrap_or("");
+                match head {
+                    "parse-lockfile" => Cmd::ParseLockfile,
+                    "frozen" => Cmd::Frozen,
+                    "resolve" | "" => Cmd::Resolve,
+                    // Mutation (§2.7.1) + liveness (§2.7.2) selectors: CLI-only.
+                    "add" | "remove" | "update" | "show" | "--version" => Cmd::CliOnly,
+                    // Unknown selector defaults to resolve (back-compat).
+                    _ => Cmd::Resolve,
+                }
+            }
             // Absent `cmd` ⇒ resolve (§2.7).
             Err(_) => Cmd::Resolve,
         }

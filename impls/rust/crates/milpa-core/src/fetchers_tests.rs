@@ -249,3 +249,234 @@ fn oci_pull_failure_is_pull_failed() {
     // oras absent (or the digest unresolvable) → pull failure.
     assert_eq!(err.code(), "FETCH-OCI-PULL-FAILED");
 }
+
+// --- CasAdmittingFetcher ---------------------------------------------------
+
+#[test]
+fn cas_admitting_fetcher_produces_cas_symlink_at_dest() {
+    // The mocked path goes through CasAdmittingFetcher → dest is a symlink,
+    // not a real directory (BLOCKER-R1 fix: issue #118).
+    let d = tmp();
+    let mocked = d.path().join("mocked-fetches");
+    let key = super::url_key("https://github.com/example/bar.git", "main");
+    let key_dir = mocked.join(&key);
+    std::fs::create_dir_all(key_dir.join("content")).unwrap();
+    std::fs::write(
+        key_dir.join("sha"),
+        "abcdef1234567890abcdef1234567890abcdef12\n",
+    )
+    .unwrap();
+    std::fs::write(key_dir.join("content").join("bar.nim"), b"# bar").unwrap();
+
+    let cas_root = d.path().join(".cas");
+    let store = crate::store::CaStore::new(&cas_root);
+    let fetcher = super::CasAdmittingFetcher::new(
+        super::MockedFetcher::new(&mocked),
+        store,
+        d.path().join("staging"),
+    );
+
+    std::fs::create_dir_all(d.path().join("_deps")).unwrap();
+    let dest = d.path().join("_deps").join("bar");
+    let p = milpa_types::Provenance::Git {
+        url: "https://github.com/example/bar.git".into(),
+        ref_spec: "main".into(),
+        commit_sha: None,
+    };
+    let receipt = FetcherRegistry::fetch(&fetcher, "bar", &p, &dest).unwrap();
+
+    // Receipt carries the SHA from the mock fixture.
+    assert_eq!(
+        receipt.resolved_ref.as_deref(),
+        Some("abcdef1234567890abcdef1234567890abcdef12")
+    );
+
+    // dest MUST be a symlink, not a real directory (the R1 fix).
+    let meta = std::fs::symlink_metadata(&dest).unwrap();
+    assert!(
+        meta.file_type().is_symlink(),
+        "_deps/bar must be a CAS symlink, not a real directory"
+    );
+
+    // The symlink target is relative (identity.md §3.4).
+    let link_target = std::fs::read_link(&dest).unwrap();
+    assert!(
+        link_target.is_relative(),
+        "CAS symlink target must be relative, got {link_target:?}"
+    );
+
+    // Content is accessible through the symlink.
+    assert_eq!(std::fs::read(dest.join("bar.nim")).unwrap(), b"# bar");
+
+    // The CAS entry lives under <cas_root>/sha256/<hex>/.
+    assert!(cas_root.join("sha256").is_dir());
+}
+
+// Local provenance through CasAdmittingFetcher must NOT be admitted to CAS.
+// spec/plugin-contract.md §4: editable sources declare cas_admissible = false,
+// so the registry skips admit+link and materializes a real working dir at dest.
+#[test]
+fn cas_admitting_fetcher_local_provenance_stays_real_dir() {
+    let d = tmp();
+    let src = d.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("local.nim"), b"# local").unwrap();
+
+    let cas_root = d.path().join(".cas");
+    let store = crate::store::CaStore::new(&cas_root);
+    let inner = super::DefaultRegistry::with_curl();
+    let fetcher = super::CasAdmittingFetcher::new(inner, store, d.path().join("staging"));
+
+    std::fs::create_dir_all(d.path().join("_deps")).unwrap();
+    let dest = d.path().join("_deps").join("local_dep");
+    let p = milpa_types::Provenance::Local {
+        path: src.to_string_lossy().into_owned(),
+    };
+    FetcherRegistry::fetch(&fetcher, "local_dep", &p, &dest).unwrap();
+
+    // Must be a real directory, NOT a CAS symlink (plugin-contract §4).
+    let meta = std::fs::symlink_metadata(&dest).unwrap();
+    assert!(
+        meta.file_type().is_dir(),
+        "Local provenance through CasAdmittingFetcher must stay a real dir, not a symlink"
+    );
+    assert!(
+        !meta.file_type().is_symlink(),
+        "Local provenance must not be admitted to CAS (would freeze user edits)"
+    );
+
+    // CAS must NOT have been populated (no sha256/ subdir created).
+    assert!(
+        !cas_root.join("sha256").is_dir(),
+        "CAS must not be populated for Local provenance"
+    );
+
+    // Content is readable from the real dir.
+    assert_eq!(std::fs::read(dest.join("local.nim")).unwrap(), b"# local");
+}
+
+// --- url_key (§2.3.1) -------------------------------------------------------
+
+#[test]
+fn url_key_encodes_the_spec_example() {
+    assert_eq!(
+        super::url_key("https://github.com/example/foo.git", "main"),
+        "https___github.com_example_foo.git@main"
+    );
+}
+
+#[test]
+fn url_key_separator_at_is_literal_but_ref_at_is_substituted() {
+    assert_eq!(
+        super::url_key("https://x.example/r.git", "v1@beta"),
+        "https___x.example_r.git@v1_beta"
+    );
+}
+
+#[test]
+fn url_key_preserves_allowed_class() {
+    assert_eq!(super::url_key("a.b_c-d", "1.2.3-rc.4"), "a.b_c-d@1.2.3-rc.4");
+}
+
+// --- MockedFetcher ----------------------------------------------------------
+
+#[test]
+fn mocked_fetcher_copies_content_and_returns_sha() {
+    let d = tmp();
+    let mocked = d.path().join("mocked-fetches");
+    let key = super::url_key("https://github.com/example/foo.git", "main");
+    let key_dir = mocked.join(&key);
+    std::fs::create_dir_all(key_dir.join("content")).unwrap();
+    std::fs::write(
+        key_dir.join("sha"),
+        "abcdef1234567890abcdef1234567890abcdef12\n",
+    )
+    .unwrap();
+    std::fs::write(key_dir.join("content").join("foo.nim"), b"# src").unwrap();
+    std::fs::write(key_dir.join("foo.nimble"), b"version = \"1.0.0\"").unwrap();
+
+    let fetcher = super::MockedFetcher::new(&mocked);
+    let dest = d.path().join("_deps").join("foo");
+    std::fs::create_dir_all(d.path().join("_deps")).unwrap();
+    let p = milpa_types::Provenance::Git {
+        url: "https://github.com/example/foo.git".into(),
+        ref_spec: "main".into(),
+        commit_sha: None,
+    };
+    let receipt = FetcherRegistry::fetch(&fetcher, "foo", &p, &dest).unwrap();
+
+    assert_eq!(
+        receipt.resolved_ref.as_deref(),
+        Some("abcdef1234567890abcdef1234567890abcdef12")
+    );
+    assert_eq!(std::fs::read(dest.join("foo.nim")).unwrap(), b"# src");
+    assert!(dest.join("foo.nimble").is_file());
+}
+
+// --- mocked ref-resolution (conformance-fixtures §2.3.3) --------------------
+
+#[test]
+fn mocked_default_branch_resolves_ref_from_mock_entry_without_network() {
+    let d = tmp();
+    let mocked = d.path().join("mocked-fetches");
+    // One entry keyed url@main; mocked_default_branch should return "main".
+    let key = super::url_key("https://github.com/example/foo.git", "main");
+    let key_dir = mocked.join(&key);
+    std::fs::create_dir_all(key_dir.join("content")).unwrap();
+    std::fs::write(
+        key_dir.join("sha"),
+        "abcdef1234567890abcdef1234567890abcdef12\n",
+    )
+    .unwrap();
+
+    let r =
+        super::mocked_default_branch(&mocked, "https://github.com/example/foo.git").unwrap();
+    assert_eq!(r, "main");
+}
+
+#[test]
+fn mocked_default_branch_uses_same_entry_as_fetch_sha_ssot() {
+    // The ref discovered by mocked_default_branch must point at the very same
+    // entry resolve_mock_key reads for its sha — single source of truth.
+    let d = tmp();
+    let mocked = d.path().join("mocked-fetches");
+    let url = "https://github.com/example/bar.git";
+    let key = super::url_key(url, "trunk");
+    let key_dir = mocked.join(&key);
+    std::fs::create_dir_all(key_dir.join("content")).unwrap();
+    std::fs::write(key_dir.join("sha"), "0123456789012345678901234567890123456789\n")
+        .unwrap();
+
+    let discovered = super::mocked_default_branch(&mocked, url).unwrap();
+    assert_eq!(discovered, "trunk");
+    let (sha, _) = super::resolve_mock_key(&mocked, url, &discovered).unwrap();
+    assert_eq!(sha, "0123456789012345678901234567890123456789");
+}
+
+#[test]
+fn mocked_default_branch_no_entry_is_error() {
+    let d = tmp();
+    let mocked = d.path().join("mocked-fetches");
+    std::fs::create_dir_all(&mocked).unwrap();
+    let err = super::mocked_default_branch(&mocked, "https://example.com/none.git")
+        .unwrap_err();
+    // Non-catalog Failed — surfaced by the caller as a discovery failure.
+    match err {
+        super::FetchError::Failed(m) => assert!(m.contains("no mocked-fetches entry"), "{m}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+#[test]
+fn mocked_fetcher_missing_key_is_fetch_mock_missing() {
+    let d = tmp();
+    let fetcher = super::MockedFetcher::new(d.path().join("mocked-fetches"));
+    let p = milpa_types::Provenance::Git {
+        url: "https://example.com/x.git".into(),
+        ref_spec: "main".into(),
+        commit_sha: None,
+    };
+    let err =
+        FetcherRegistry::fetch(&fetcher, "x", &p, &d.path().join("dest")).unwrap_err();
+    assert_eq!(err.code(), "FETCH-MOCK-MISSING");
+}

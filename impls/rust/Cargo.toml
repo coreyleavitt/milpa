@@ -18,11 +18,11 @@ milpa-types = { path = "crates/milpa-types" }
 milpa-solver = { path = "crates/milpa-solver" }
 milpa-manifest = { path = "crates/milpa-manifest" }
 milpa-core = { path = "crates/milpa-core" }
-# milpa.kdl is KDL **1.0** (grammar §1; the reference impl uses kdl-py, a 1.0
-# parser). kdl-rs's default `parse` prefers KDL 2.0, where bare `true`/`false`
-# decode as strings rather than booleans — so the parser MUST call `parse_v1`,
-# which requires the `v1` feature.
-kdl = { version = "=6.7.1", features = ["v1"] }
+# milpa.kdl is KDL **2.0** (grammar §1; #123 migrated from 1.0).
+# kdl-rs's default `parse` is the KDL 2.0 parser — `#true`/`#false`/`#null`
+# are the boolean/null keywords; bare `true`/`false` are reserved identifiers
+# and are rejected as syntax errors. No `v1` feature needed.
+kdl = { version = "=6.7.1" }
 miette = "=7.6.0"
 pubgrub = "=0.4.0"
 sha2 = "0.10"

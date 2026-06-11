@@ -16,6 +16,7 @@
 //! dispatch to (a registry with no fetchers to resolve to is meaningless).
 
 use kdl::{KdlDocument, KdlNode};
+use milpa_manifest::{kdl_brace_depth, KDL_MAX_NESTING_DEPTH};
 use milpa_solver::{parse_version, VersionSet};
 use milpa_types::Provenance;
 
@@ -159,8 +160,15 @@ impl Index {
     /// provenances on the same version may still be usable). Versions sort
     /// newest-first by semver, unparseable trailing in document order.
     pub fn parse(text: &str) -> Result<Index, CoreError> {
-        let doc = KdlDocument::parse_v1(text)
-            .map_err(|e| tng("TNG-SCHEMA-UNKNOWN", format!("index KDL syntax error: {e}")))?;
+        // Depth guard — see milpa_manifest::KDL_MAX_NESTING_DEPTH for rationale.
+        if kdl_brace_depth(text) > KDL_MAX_NESTING_DEPTH {
+            return Err(tng(
+                "TNG-KDL-SYNTAX",
+                format!("KDL input exceeds maximum nesting depth ({KDL_MAX_NESTING_DEPTH})"),
+            ));
+        }
+        let doc = KdlDocument::parse(text)
+            .map_err(|e| tng("TNG-KDL-SYNTAX", format!("index KDL syntax error: {e}")))?;
 
         check_schema_version(&doc)?;
 

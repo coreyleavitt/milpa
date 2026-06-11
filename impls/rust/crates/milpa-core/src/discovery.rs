@@ -153,9 +153,13 @@ pub fn manifest_from_nimble(nm: &NimbleManifest, name: &str) -> Manifest {
                 if dep_name == "nim" {
                     continue;
                 }
+                // Nimble-derived deps: constraint is validated lazily at
+                // resolve time by build_from_nimble → from_nimble_constraint
+                // (MAN-NIMBLE-CONSTRAINT). parsed_constraint stays None here.
                 deps.push(Dep::Named(NamedDep {
                     name: dep_name.clone(),
                     constraint: constraint.clone(),
+                    parsed_constraint: None,
                 }));
             }
         }

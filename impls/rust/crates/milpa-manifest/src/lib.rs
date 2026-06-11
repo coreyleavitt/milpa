@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 
+use milpa_solver::VersionSet;
 use milpa_types::Version;
 
 pub mod format;
@@ -59,12 +60,33 @@ pub struct UrlDep {
 }
 
 /// A dep resolved through the tianguis index by name (grammar §3.2 NamedDep).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Two fields capture the constraint (mirrors `manifest.py:NamedDep`):
+/// - `constraint` — the raw string from the manifest, preserved for round-trip
+///   emit (e.g. `">= 0.5.0"`). `None` = any version.
+/// - `parsed_constraint` — the pre-parsed `VersionSet`, guaranteed valid at
+///   parse time. `None` iff `constraint` is `None`. The manifest parser rejects
+///   an unparseable string at the parse boundary with `MAN-DEP-NAMED-CONSTRAINT`;
+///   the resolver consumes this field directly and never re-parses manifest deps.
+#[derive(Debug, Clone)]
 pub struct NamedDep {
     pub name: String,
-    /// Opaque constraint text (`>= 0.5.0`), parsed by the solver. `None` = any.
+    /// Raw constraint string, preserved for KDL round-trip emit. `None` = any.
     pub constraint: Option<String>,
+    /// Pre-parsed `VersionSet`; `None` iff `constraint` is `None`.
+    pub parsed_constraint: Option<VersionSet>,
 }
+
+impl PartialEq for NamedDep {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare by name + raw constraint string only (mirrors Python's
+        // `compare=False` on `constraint_set`; the parsed form is deterministic
+        // from the raw string so excluding it preserves test ergonomics).
+        self.name == other.name && self.constraint == other.constraint
+    }
+}
+
+impl Eq for NamedDep {}
 
 /// A dep declared by local filesystem path (grammar §3.2 LocalDep).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,6 +273,12 @@ const MAN_CODES: &[&str] = &[
     "MAN-MUTATE-FILE-NOT-FOUND",
     "MAN-MUTATE-NIMBLE-REFUSED",
     "MAN-MUTATE-WORKSPACE-REFUSED",
+    // `milpa add --git` duplicate-dep guard (CLI cmd_add) — Gap-1/S1c.
+    "MAN-ADD-DEP-EXISTS",
+    // `milpa remove` absent-dep guard (CLI cmd_remove) — Gap-1/S1c.
+    "MAN-REMOVE-DEP-ABSENT",
+    // `milpa add --mirror` editable-provenance guard (CLI cmd_add) — S14/CLI.
+    "MAN-MIRROR-EDITABLE-PROVENANCE",
     // `milpa add --mirror` identity gate (milpa-core `add_mirror`) — S14/CLI.
     "MAN-ADD-MIRROR-IDENTITY-MISMATCH",
     "MAN-URL-ARG-TYPE",
@@ -416,10 +444,65 @@ pub fn parse_workspace(text: &str) -> Result<Workspace, ManifestError> {
     parse_workspace_doc(&doc)
 }
 
+/// Maximum structural `{` brace nesting depth accepted before handing input to
+/// the KDL parser.  kdl-rs 6.7.1 is recursive-descent with no internal depth
+/// limit; empirical measurement shows it stack-overflows at depth ≈ 50 in
+/// debug builds (OS-level SIGABRT — not a catchable panic).  Any real
+/// `milpa.kdl`, `milpa.lock`, or `index.kdl` nests at most 4–5 levels deep;
+/// 32 is an extremely generous ceiling that simultaneously ensures no
+/// real-world document is rejected and that maliciously-crafted deeply-nested
+/// input is rejected as `MAN-KDL-SYNTAX` (or `LOCK-KDL-SYNTAX` /
+/// `TNG-KDL-SYNTAX`) instead of crashing the process.
+///
+/// Used by all three KDL parse entry points milpa owns (manifest, lockfile,
+/// index).  Single source of truth.
+pub const KDL_MAX_NESTING_DEPTH: usize = 32;
+
+/// Return the maximum structural `{` brace nesting depth observed in `text`.
+///
+/// This is a conservative O(n) pre-scan: it counts every `{` and `}` byte
+/// regardless of whether it appears inside a string literal or comment.  It
+/// therefore *over-counts* (a `{` inside a KDL string still increments the
+/// depth), making it a safe upper bound for the purpose of a guard — any input
+/// that passes this check has a *true* structural depth ≤ the reported value,
+/// so if the reported value ≤ [`KDL_MAX_NESTING_DEPTH`] the recursive-descent
+/// parser will not overflow its call stack.
+pub fn kdl_brace_depth(text: &str) -> usize {
+    let mut depth: usize = 0;
+    let mut max: usize = 0;
+    for b in text.bytes() {
+        match b {
+            b'{' => {
+                depth += 1;
+                if depth > max {
+                    max = depth;
+                }
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    max
+}
+
 fn parse_kdl(text: &str) -> Result<KdlDocument, ManifestError> {
-    // KDL **1.0** (grammar §1) — `parse_v1`, not the v2-preferring `parse`, so
-    // bare `true`/`false` decode as booleans and `42` as an integer.
-    KdlDocument::parse_v1(text).map_err(|e| err("MAN-KDL-SYNTAX", format!("KDL syntax error: {e}")))
+    // Depth guard: kdl-rs 6.7.1 is recursive-descent with no internal stack
+    // limit; deeply-nested input causes an OS stack overflow (SIGABRT — not
+    // a catchable panic).  Reject before calling the parser.
+    if kdl_brace_depth(text) > KDL_MAX_NESTING_DEPTH {
+        return Err(err(
+            "MAN-KDL-SYNTAX",
+            format!(
+                "KDL input exceeds maximum nesting depth ({KDL_MAX_NESTING_DEPTH})"
+            ),
+        ));
+    }
+    // KDL **2.0** (grammar §1; #123 migrated from 1.0) — native `parse`.
+    // Boolean keywords are `#true`/`#false`; bare `true`/`false` are reserved
+    // and rejected as syntax errors.
+    KdlDocument::parse(text).map_err(|e| err("MAN-KDL-SYNTAX", format!("KDL syntax error: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,17 +1148,32 @@ fn parse_named_dep(node: &KdlNode) -> Result<NamedDep, ManifestError> {
         0 => Ok(NamedDep {
             name,
             constraint: None,
+            parsed_constraint: None,
         }),
-        1 => match a[0].value().as_string() {
-            Some(c) => Ok(NamedDep {
+        1 => {
+            let raw_str = match a[0].value().as_string() {
+                Some(c) => c.to_string(),
+                None => {
+                    return Err(err(
+                        "MAN-DEP-NAMED-CONSTRAINT",
+                        format!("dep {name:?}: version constraint must be a quoted string"),
+                    ));
+                }
+            };
+            // Parse at the manifest-parse boundary: wrong-type OR unparseable
+            // string both map to MAN-DEP-NAMED-CONSTRAINT (spec §errors.md).
+            let parsed = VersionSet::from_constraint(Some(&raw_str)).map_err(|e| {
+                err(
+                    "MAN-DEP-NAMED-CONSTRAINT",
+                    format!("dep {name:?}: invalid version constraint {raw_str:?}: {e}"),
+                )
+            })?;
+            Ok(NamedDep {
                 name,
-                constraint: Some(c.to_string()),
-            }),
-            None => Err(err(
-                "MAN-DEP-NAMED-CONSTRAINT",
-                format!("dep {name:?}: version constraint must be a quoted string"),
-            )),
-        },
+                constraint: Some(raw_str),
+                parsed_constraint: Some(parsed),
+            })
+        }
         n => Err(err(
             "MAN-DEP-NAMED-ARITY",
             format!("dep {name:?}: named deps take at most one positional argument; got {n}"),
@@ -1400,3 +1498,6 @@ fn validate_git_url(dep_name: &str, url: &str) -> Result<(), ManifestError> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod fuzz_tests;

@@ -354,6 +354,275 @@ pub fn fetch_oci(
     result
 }
 
+// ---------------------------------------------------------------------------
+// CAS-admitting fetcher wrapper (issue #2 / differential-conformance-harness RFC)
+// ---------------------------------------------------------------------------
+
+/// A [`FetcherRegistry`] wrapper that admits every fetched tree into a
+/// [`CaStore`] and replaces `dest` with a relative CAS symlink.
+///
+/// The inner registry materializes content into a staging directory; the
+/// wrapper then:
+///   1. Computes the content hash of the staged tree.
+///   2. Admits the staging tree into `store` (move-via-rename, duplicate is no-op).
+///   3. Removes any stale `dest` and creates a relative symlink at `dest` →
+///      the store entry.
+///
+/// This is the CAS layer used by the CLI when `MILPA_MOCKED_FETCHES` is set,
+/// producing the same `_deps/<name>` → CAS symlink structure that the
+/// conformance harness's `FakeFetcher` produces (single source of truth for
+/// the CAS logic lives in `store.rs`; this wrapper just orchestrates).
+pub struct CasAdmittingFetcher<R> {
+    inner: R,
+    store: crate::store::CaStore,
+    staging_root: std::path::PathBuf,
+}
+
+impl<R: FetcherRegistry> CasAdmittingFetcher<R> {
+    /// Wrap `inner` so every successful fetch is admitted into `store`.
+    /// `staging_root` is a directory on the same filesystem as the CAS root;
+    /// staging sub-dirs are created there so `rename(2)` into the store is atomic.
+    pub fn new(
+        inner: R,
+        store: crate::store::CaStore,
+        staging_root: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        CasAdmittingFetcher {
+            inner,
+            store,
+            staging_root: staging_root.into(),
+        }
+    }
+}
+
+impl<R: FetcherRegistry> FetcherRegistry for CasAdmittingFetcher<R> {
+    fn fetch(&self, name: &str, p: &milpa_types::Provenance, dest: &Path) -> Result<Receipt, FetchError> {
+        if p.cas_admissible() {
+            // Immutable source (Git / Tarball / OCI): fetch into a staging directory
+            // on the same filesystem as the CAS (for atomic rename(2) during admit),
+            // then admit + create a relative CAS symlink at `dest`.
+            // spec/plugin-contract.md §4; spec/identity.md §3.5.
+            let staging = self.staging_root.join(".milpa-cas-stage").join(name);
+            let _ = std::fs::remove_dir_all(&staging);
+            std::fs::create_dir_all(&staging).map_err(|e| {
+                FetchError::Failed(format!("CasAdmittingFetcher: cannot create staging dir: {e}"))
+            })?;
+
+            let receipt = self.inner.fetch(name, p, &staging)?;
+
+            // Compute the identity and admit to the CAS.
+            use crate::identity::compute_content_hash;
+            let identity = compute_content_hash(&staging).map_err(|e| {
+                FetchError::Failed(format!("CasAdmittingFetcher: hash staged tree: {}", e.message()))
+            })?;
+            self.store.admit(&staging, &identity).map_err(|e| {
+                FetchError::Failed(format!("CasAdmittingFetcher: admit to CAS: {}", e.message()))
+            })?;
+            // `admit` moves staging on success; clean up defensively.
+            let _ = std::fs::remove_dir_all(&staging);
+
+            // Create the relative CAS symlink at dest.
+            self.store.link(&identity, dest).map_err(|e| {
+                FetchError::Failed(format!("CasAdmittingFetcher: link _deps entry: {}", e.message()))
+            })?;
+
+            Ok(receipt)
+        } else {
+            // Editable / Local provenance: do NOT admit to CAS — the dep must stay
+            // as a real working directory so the user's in-progress edits remain live.
+            // spec/plugin-contract.md §4: "editable sources MUST declare
+            // cas_admissible = False … Admitting would silently freeze user edits."
+            self.inner.fetch(name, p, dest)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mocked transport (issue #2 / differential-conformance-harness RFC)
+// ---------------------------------------------------------------------------
+
+/// Encode a `(url, ref_spec)` pair to its `mocked-fetches/` subdirectory name
+/// (conformance-fixtures.md §2.3.1). Every character outside `[A-Za-z0-9._-]`
+/// is replaced with `_`; a literal `@` separates the encoded URL from the
+/// encoded ref.
+///
+/// This is the **production single source of truth** — `milpa-conformance`
+/// re-exports this function rather than maintaining a parallel copy.
+pub fn url_key(url: &str, ref_spec: &str) -> String {
+    fn sanitize(s: &str) -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+    format!("{}@{}", sanitize(url), sanitize(ref_spec))
+}
+
+/// A [`FetcherRegistry`] backed by a `mocked-fetches/` fixture tree.
+///
+/// When `MILPA_MOCKED_FETCHES=<dir>` is set, `milpa-cli` wraps the resolution
+/// with this registry instead of [`DefaultRegistry`]. Every fetch is satisfied
+/// offline from `<dir>/<url_key(url, ref)>/`:
+///
+/// 1. Read `<key>/sha` — the commit SHA to return in the receipt.
+/// 2. Copy `<key>/content/` verbatim into `dest` (if the sub-directory exists).
+/// 3. Copy `<key>/<name>.nimble` into `dest` if present.
+/// 4. Return a `Receipt` with `resolved_ref = Some(sha)`.
+///
+/// If the key directory is missing, returns `FETCH-MOCK-MISSING`.
+/// Only `Provenance::Git` is supported; any other provenance yields a clear
+/// (non-catalog) error.
+///
+/// `milpa-conformance`'s `FakeFetcher` also delegates to [`stage_mock`] for
+/// the core logic, then additionally admits the staged tree into the CAS and
+/// symlinks `dest` → the store entry.
+pub struct MockedFetcher {
+    mocked_fetches_dir: std::path::PathBuf,
+}
+
+impl MockedFetcher {
+    pub fn new(mocked_fetches_dir: impl Into<std::path::PathBuf>) -> Self {
+        MockedFetcher {
+            mocked_fetches_dir: mocked_fetches_dir.into(),
+        }
+    }
+}
+
+impl FetcherRegistry for MockedFetcher {
+    fn fetch(&self, name: &str, p: &Provenance, dest: &Path) -> Result<Receipt, FetchError> {
+        let (url, ref_spec) = match p {
+            Provenance::Git { url, ref_spec, .. } => (url.as_str(), ref_spec.as_str()),
+            other => {
+                return Err(FetchError::Failed(format!(
+                    "MockedFetcher: unsupported provenance kind: {other:?}; \
+                     only Git provenance is mocked"
+                )));
+            }
+        };
+        let (sha, key_dir) = resolve_mock_key(&self.mocked_fetches_dir, url, ref_spec)?;
+        clear_dest(dest).map_err(|e| FetchError::Failed(e))?;
+        std::fs::create_dir_all(dest)
+            .map_err(|e| FetchError::Failed(format!("MockedFetcher: cannot create dest: {e}")))?;
+        stage_mock_content(name, &key_dir, dest)?;
+        Ok(Receipt {
+            resolved_ref: Some(sha),
+        })
+    }
+}
+
+/// Resolve the `(url, ref_spec)` pair to its `mocked-fetches/<key>/` directory
+/// and read its `sha` file. Returns `(sha, key_dir)`.
+///
+/// `FETCH-MOCK-MISSING` if the key directory does not exist.
+pub fn resolve_mock_key(
+    mocked_fetches_dir: &Path,
+    url: &str,
+    ref_spec: &str,
+) -> Result<(String, std::path::PathBuf), FetchError> {
+    let key_dir = mocked_fetches_dir.join(url_key(url, ref_spec));
+    if !key_dir.is_dir() {
+        return Err(FetchError::Transport(
+            "FETCH-MOCK-MISSING",
+            format!(
+                "mocked fetch: no fixture for {url:?} @ {ref_spec:?} \
+                 (expected dir: {})",
+                key_dir.display()
+            ),
+        ));
+    }
+    let sha = std::fs::read_to_string(key_dir.join("sha"))
+        .map_err(|e| {
+            FetchError::Failed(format!(
+                "mock fixture: cannot read {}/sha: {e}",
+                key_dir.display()
+            ))
+        })?
+        .trim()
+        .to_string();
+    Ok((sha, key_dir))
+}
+
+/// Stage the mocked bytes from `key_dir` into `dest`: copy `content/` verbatim,
+/// then copy `<name>.nimble` if present. `dest` must already exist.
+///
+/// Used by both [`MockedFetcher`] (copy-to-dest path) and `milpa-conformance`'s
+/// `FakeFetcher` (stage-then-CAS-admit path) — the single source of truth for
+/// the byte-staging step.
+pub fn stage_mock_content(name: &str, key_dir: &Path, dest: &Path) -> Result<(), FetchError> {
+    let content = key_dir.join("content");
+    if content.is_dir() {
+        copy_tree(&content, dest)
+            .map_err(|e| FetchError::Failed(format!("mock fixture: copy content: {e}")))?;
+    }
+    let nimble_src = key_dir.join(format!("{name}.nimble"));
+    if nimble_src.is_file() {
+        std::fs::copy(&nimble_src, dest.join(format!("{name}.nimble")))
+            .map_err(|e| FetchError::Failed(format!("mock fixture: copy nimble: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Mocked default-branch (ref) discovery (conformance-fixtures.md §2.3.3,
+/// cli-contract.md §8.4). When `MILPA_MOCKED_FETCHES` is set, `add --git`
+/// answers `git ls-remote --symref HEAD` from the mock tree with no network:
+/// it finds the unique `mocked-fetches/<key>/` entry whose encoded URL matches
+/// `url` and returns that entry's ref (the ref component of the §2.3.1 URL-key).
+///
+/// SSOT: the very same `mocked-fetches/<key>/` entry is then read at fetch time
+/// for its `sha` — there is no separate ref→SHA table. Returns the ref string.
+///
+/// Errors (non-catalog `Failed`) if no entry, or more than one entry, matches
+/// `url` — the caller surfaces this as a default-branch-discovery failure
+/// (cli-contract §5.6: exit 1), exactly as a network discovery failure would.
+pub fn mocked_default_branch(mocked_fetches_dir: &Path, url: &str) -> Result<String, FetchError> {
+    // url_key encodes (url, ref) as "<san(url)>@<san(ref)>"; the URL portion is
+    // everything before the LAST '@'. Match on the sanitized URL so this stays
+    // the single source of truth with url_key (no parallel decode).
+    let want_url = url_key(url, "");
+    // want_url == "<san(url)>@" — strip the trailing '@' to get the URL prefix.
+    let want_prefix = want_url.trim_end_matches('@').to_string();
+
+    let read = std::fs::read_dir(mocked_fetches_dir).map_err(|e| {
+        FetchError::Failed(format!(
+            "mocked ref-resolution: cannot read {}: {e}",
+            mocked_fetches_dir.display()
+        ))
+    })?;
+
+    let mut matches: Vec<String> = Vec::new();
+    for entry in read.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Split on the LAST '@': the separator url_key inserts between url+ref.
+        if let Some(at) = name.rfind('@') {
+            let (enc_url, enc_ref) = (&name[..at], &name[at + 1..]);
+            if enc_url == want_prefix {
+                matches.push(enc_ref.to_string());
+            }
+        }
+    }
+
+    match matches.len() {
+        1 => Ok(matches.pop().unwrap()),
+        0 => Err(FetchError::Failed(format!(
+            "mocked ref-resolution: no mocked-fetches entry for url {url:?} \
+             (looked under {})",
+            mocked_fetches_dir.display()
+        ))),
+        n => Err(FetchError::Failed(format!(
+            "mocked ref-resolution: {n} mocked-fetches entries match url {url:?}; \
+             pass --ref explicitly to disambiguate"
+        ))),
+    }
+}
+
 /// Lowercase hex sha256 of `bytes` (no `sha256:` prefix).
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)

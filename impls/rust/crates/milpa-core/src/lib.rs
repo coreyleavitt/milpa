@@ -12,7 +12,8 @@
 use std::path::Path;
 
 use milpa_manifest::{Manifest, Workspace};
-use milpa_types::{Lockfile, ResolvedGraph};
+pub use milpa_types::Lockfile;
+use milpa_types::ResolvedGraph;
 
 pub mod discovery;
 pub mod error;
@@ -45,7 +46,10 @@ pub use milpa_manifest::format_manifest;
 // `From<ManifestError>` impl lives here, so `?` lifts parse errors at this
 // boundary.
 pub use fetch::{FetchError, Fetcher, FetcherRegistry, Receipt};
-pub use fetchers::DefaultRegistry;
+pub use fetchers::{
+    mocked_default_branch, resolve_mock_key, stage_mock_content, url_key, CasAdmittingFetcher,
+    DefaultRegistry, MockedFetcher,
+};
 pub use frozen::{resolve_frozen, resolve_workspace_frozen};
 pub use identity::{compute_content_hash, parse_identity, SUPPORTED_ALGORITHMS};
 pub use milpa_manifest::{parse_document, ManifestDoc, Profile};
@@ -213,3 +217,6 @@ pub trait FrozenResolver {
         deps_dir: &Path,
     ) -> Result<ResolvedGraph, MilpaError>;
 }
+
+#[cfg(test)]
+mod parser_fuzz_tests;

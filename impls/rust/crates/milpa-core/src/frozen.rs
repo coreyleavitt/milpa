@@ -14,7 +14,7 @@
 use std::path::Path;
 
 use milpa_manifest::{Dep, Manifest};
-use milpa_solver::{parse_version, Strategy, VersionSet};
+use milpa_solver::{parse_version, Strategy};
 use milpa_types::{LockedDep, Lockfile, ProvenanceRecord, ResolvedDep, ResolvedGraph};
 
 use crate::error::{CoreError, MilpaError};
@@ -169,7 +169,9 @@ fn check_manifest_alignment(manifest: &Manifest, lock: &Lockfile) -> Result<(), 
             ));
         };
         if let Dep::Named(n) = mdep {
-            if let Some(constraint) = n.constraint.as_deref() {
+            if let Some(vset) = &n.parsed_constraint {
+                // Constraint was validated at parse time (MAN-DEP-NAMED-CONSTRAINT).
+                // Use the pre-parsed VersionSet directly — no re-parse needed.
                 let Some(locked_version) = parse_version(&locked.version) else {
                     return Err(frozen(
                         "FROZEN-LOCKED-VERSION-UNPARSEABLE",
@@ -179,20 +181,13 @@ fn check_manifest_alignment(manifest: &Manifest, lock: &Lockfile) -> Result<(), 
                         ),
                     ));
                 };
-                let vset = VersionSet::from_constraint(Some(constraint)).map_err(|e| {
-                    // A malformed manifest constraint (should have been caught at
-                    // parse) surfaces as the manifest's coded error, not a FROZEN-*.
-                    MilpaError::Manifest(milpa_manifest::ManifestError::new(
-                        "MAN-NIMBLE-CONSTRAINT",
-                        format!("malformed constraint {constraint:?}: {e}"),
-                    ))
-                })?;
                 if !vset.contains(&locked_version) {
                     return Err(frozen(
                         "FROZEN-CONSTRAINT-UNSATISFIED",
                         format!(
-                            "dep {name:?}: locked version {} no longer satisfies manifest constraint {constraint:?}",
-                            locked.version
+                            "dep {name:?}: locked version {} no longer satisfies manifest constraint {:?}",
+                            locked.version,
+                            n.constraint.as_deref().unwrap_or("any")
                         ),
                     ));
                 }

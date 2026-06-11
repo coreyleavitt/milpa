@@ -86,7 +86,7 @@ fn error_codes_match_fixtures() {
             "MAN-DEP-FLAG-NAME-MISSING",
         ),
         (
-            "name \"x\"\ndeps {\n  foo git=(url)\"https://a/f.git\" ref=\"m\" {\n    flag \"a\" true false\n  }\n}\n",
+            "name \"x\"\ndeps {\n  foo git=(url)\"https://a/f.git\" ref=\"m\" {\n    flag \"a\" #true #false\n  }\n}\n",
             "MAN-DEP-FLAG-TOO-MANY-ARGS",
         ),
         (
@@ -131,7 +131,7 @@ fn error_codes_match_fixtures() {
             "MAN-FLAG-DUPLICATE",
         ),
         ("name \"x\"\nflags {\n  a \"pos\"\n}\n", "MAN-FLAG-POS-ARGS"),
-        ("name \"x\"\nflags {\n  a bogus=true\n}\n", "MAN-FLAG-UNKNOWN-PROPS"),
+        ("name \"x\"\nflags {\n  a bogus=#true\n}\n", "MAN-FLAG-UNKNOWN-PROPS"),
         ("name \"x\"\nflags {\n  a default=\"no\"\n}\n", "MAN-FLAG-DEFAULT-TYPE"),
         (
             "name \"x\"\nflags {\n  a description=42\n}\n",
@@ -244,6 +244,41 @@ fn named_dep_with_constraint() {
         Dep::Named(n) => {
             assert_eq!(n.name, "bar");
             assert_eq!(n.constraint.as_deref(), Some(">= 2.0.0"));
+            // Parse-boundary: parsed_constraint is pre-populated and valid.
+            assert!(
+                n.parsed_constraint.is_some(),
+                "NamedDep with a constraint string must carry a pre-parsed VersionSet"
+            );
+        }
+        other => panic!("expected NamedDep, got {other:?}"),
+    }
+}
+
+/// A malformed version-constraint string in a milpa.kdl NamedDep must be
+/// rejected at the manifest-parse boundary with MAN-DEP-NAMED-CONSTRAINT
+/// (not at resolve time with MAN-NIMBLE-CONSTRAINT).
+#[test]
+fn named_dep_malformed_constraint_raises_at_parse_boundary() {
+    // "@@@bad" is not a valid version constraint (no leading operator, no version)
+    let code = doc_err("name \"a\"\ndeps {\n  z \"@@@bad\"\n}\n");
+    assert_eq!(
+        code, "MAN-DEP-NAMED-CONSTRAINT",
+        "malformed named-dep constraint must yield MAN-DEP-NAMED-CONSTRAINT at parse time"
+    );
+}
+
+/// A named dep with no constraint parses successfully; parsed_constraint is None.
+#[test]
+fn named_dep_without_constraint_has_no_parsed_constraint() {
+    let m = pkg("name \"a\"\ndeps {\n  results\n}\n");
+    match &m.deps[0] {
+        Dep::Named(n) => {
+            assert_eq!(n.name, "results");
+            assert!(n.constraint.is_none());
+            assert!(
+                n.parsed_constraint.is_none(),
+                "NamedDep with no constraint string must have no parsed_constraint"
+            );
         }
         other => panic!("expected NamedDep, got {other:?}"),
     }
@@ -344,7 +379,7 @@ fn workspace_members_parse() {
 #[test]
 fn flag_declaration_with_defines() {
     let m = pkg(
-        "name \"a\"\nflags {\n  ssl default=true description=\"use ssl\" {\n    defines \"a_ssl\" \"b_ssl\"\n  }\n}\n",
+        "name \"a\"\nflags {\n  ssl default=#true description=\"use ssl\" {\n    defines \"a_ssl\" \"b_ssl\"\n  }\n}\n",
     );
     assert_eq!(m.flags.len(), 1);
     let f = &m.flags[0];
@@ -362,4 +397,50 @@ fn all_codes_are_real_spec_slugs_and_nonempty() {
     for c in ManifestError::all_codes() {
         assert!(c.starts_with("MAN-"), "unexpected non-MAN code {c}");
     }
+}
+
+// --------------------------------------------------------- KDL 2.0 (#123)
+
+/// KDL 2.0 booleans use `#true`/`#false`. A manifest using `#true` for a
+/// flag default must parse correctly — `KdlValue::Bool` still fires for the
+/// v2 keyword form.
+#[test]
+fn kdl2_hash_true_flag_default_parses() {
+    let m = pkg("name \"a\"\nflags {\n  ssl default=#true\n}\n");
+    assert_eq!(m.flags.len(), 1);
+    assert!(m.flags[0].default, "expected default=true from #true");
+}
+
+/// KDL 2.0: bare `true` (without `#`) is reserved and must be rejected as a
+/// KDL syntax error — milpa surfaces it as MAN-KDL-SYNTAX.
+#[test]
+fn kdl2_bare_true_is_syntax_error() {
+    assert_eq!(
+        doc_err("name \"a\"\nflags {\n  ssl default=true\n}\n"),
+        "MAN-KDL-SYNTAX",
+        "bare `true` must be rejected by KDL 2.0 parser"
+    );
+}
+
+/// Empirical #122/#123 check: KDL 2.0 behaviour for `¼` (U+00BC VULGAR FRACTION
+/// ONE QUARTER) as a top-level node name.
+///
+/// kdl-rs 6.7.1 in v2 mode accepts `¼` as a valid identifier (KDL 2.0 allows
+/// Unicode letters and numbers in identifiers, and U+00BC is category No =
+/// Other_Number — which KDL 2.0 does allow in identifiers). The Rust impl
+/// therefore surfaces it as MAN-UNKNOWN-TOP-LEVEL (the node name is not a
+/// recognised milpa top-level keyword), which is the CONFORMANT result.
+///
+/// This confirms #123 resolves the #122 divergence: under v2, Rust is now
+/// conformant (MAN-UNKNOWN-TOP-LEVEL); the divergence was caused by the v1 parser
+/// via kdl-rs's legacy shim (which used `char::is_numeric()` = Nd+Nl+No, but
+/// the shim incorrectly rejected No-category chars as initial chars).
+#[test]
+fn kdl2_quarter_fraction_is_unknown_top_level() {
+    // `¼` = U+00BC, KDL-2.0-valid identifier (No category)
+    assert_eq!(
+        doc_err("\u{00BC} \"x\"\n"),
+        "MAN-UNKNOWN-TOP-LEVEL",
+        "¼ should be a valid KDL 2.0 ident, rejected as unknown top-level by milpa"
+    );
 }

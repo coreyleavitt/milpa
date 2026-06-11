@@ -26,6 +26,10 @@ fn named(name: &str, constraint: Option<&str>) -> Dep {
     Dep::Named(NamedDep {
         name: name.into(),
         constraint: constraint.map(str::to_string),
+        parsed_constraint: constraint.map(|c| {
+            milpa_solver::VersionSet::from_constraint(Some(c))
+                .expect("test constraint must be valid")
+        }),
     })
 }
 
@@ -215,6 +219,97 @@ fn legacy_registry_provenance() {
     // rebuilding the resolved dep from the legacy record.
     let err = resolve_frozen(&manifest(vec![]), &lf, &store, &deps_dir(&tmp)).unwrap_err();
     assert_eq!(err.code(), "FROZEN-LEGACY-REGISTRY-PROVENANCE");
+}
+
+// ---------------------------------------------------------------------------
+// Workspace frozen path tests (fixtures 085, 086)
+// ---------------------------------------------------------------------------
+
+/// Build a minimal workspace on disk: root milpa.kdl with one member, and the
+/// member directory with its own milpa.kdl. Returns (tmp, loaded_workspace).
+fn make_workspace_with_member(
+    member_name: &str,
+    member_kdl: &str,
+) -> (tempfile::TempDir, crate::workspace::LoadedWorkspace) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("milpa.kdl"),
+        format!("workspace {{\n    member \"{member_name}\"\n}}\n"),
+    )
+    .unwrap();
+    let member_dir = root.join(member_name);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    std::fs::write(member_dir.join("milpa.kdl"), member_kdl).unwrap();
+    let ws = crate::workspace::load_workspace(root).unwrap();
+    (tmp, ws)
+}
+
+#[test]
+fn workspace_frozen_member_not_in_workspace() {
+    // Lockfile references "libfoo" (member provenance), but the workspace only
+    // declares "libbar". → FROZEN-MEMBER-NOT-IN-WORKSPACE (fixture 085 analog).
+    let (tmp, ws) = make_workspace_with_member("libbar", "name \"libbar\"\nkind \"library\"\n");
+    let store = CaStore::new(tmp.path().join(".cas"));
+    let lf = lock(
+        "maxver",
+        vec![
+            // "libbar" IS in the workspace.
+            locked(
+                "libbar",
+                "0.0.1",
+                Some("sha256:8e5993e3c885dc876559e664001b5c1184aee88f7e9f3cd1538b6718305760bc"),
+                ProvenanceRecord::Member {
+                    name: "libbar".into(),
+                },
+            ),
+            // "libfoo" is NOT in the workspace — this triggers the error.
+            locked(
+                "libfoo",
+                "0.0.1",
+                Some("sha256:0000000000000000000000000000000000000000000000000000000000000002"),
+                ProvenanceRecord::Member {
+                    name: "libfoo".into(),
+                },
+            ),
+        ],
+    );
+    let err = crate::frozen::resolve_workspace_frozen(
+        &ws,
+        &lf,
+        &store,
+        &tmp.path().join("_deps"),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "FROZEN-MEMBER-NOT-IN-WORKSPACE");
+}
+
+#[test]
+fn workspace_frozen_member_identity_drift() {
+    // Lockfile records an identity for "libfoo" that does NOT match the real
+    // on-disk content hash. → FROZEN-MEMBER-IDENTITY-DRIFT (fixture 086 analog).
+    let (tmp, ws) = make_workspace_with_member("libfoo", "name \"libfoo\"\nkind \"library\"\n");
+    let store = CaStore::new(tmp.path().join(".cas"));
+    // Use a deliberately wrong identity (all-99 bytes).
+    let lf = lock(
+        "maxver",
+        vec![locked(
+            "libfoo",
+            "0.0.1",
+            Some("sha256:0000000000000000000000000000000000000000000000000000000000000099"),
+            ProvenanceRecord::Member {
+                name: "libfoo".into(),
+            },
+        )],
+    );
+    let err = crate::frozen::resolve_workspace_frozen(
+        &ws,
+        &lf,
+        &store,
+        &tmp.path().join("_deps"),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "FROZEN-MEMBER-IDENTITY-DRIFT");
 }
 
 #[test]

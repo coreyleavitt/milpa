@@ -76,6 +76,9 @@ pub trait Target {
 pub enum Verdict {
     Pass,
     Fail(String),
+    /// Not assertable by the in-process library Target (a CLI-only verb fixture
+    /// — §2.7.1/§2.7.2). Driven by the black-box CLI harness instead.
+    Skip(String),
 }
 
 impl Verdict {
@@ -86,6 +89,16 @@ impl Verdict {
 
 /// Run one fixture against `target` in `scratch` and return the verdict.
 pub fn run_fixture(fx: &Fixture, target: &dyn Target, scratch: &Scratch) -> Verdict {
+    // CLI-only fixtures (mutation/liveness verbs) are not modeled by the
+    // in-process library Target; they are covered by the black-box CLI harness.
+    if fx.cmd == Cmd::CliOnly {
+        return Verdict::Skip(
+            "CLI-only verb fixture (add/remove/update/show/--version); \
+             covered by the black-box CLI harness, not the in-process runner"
+                .to_string(),
+        );
+    }
+
     let produced = target.execute(fx, scratch);
 
     match (&fx.expected, produced) {
@@ -412,6 +425,13 @@ impl Target for MilpaTarget {
                     Err(e) => Err(e.code().to_string()),
                 }
             }
+            // CLI-only verbs are skipped by `run_fixture` before reaching the
+            // Target; this arm exists only for match exhaustiveness.
+            Cmd::CliOnly => Err(
+                "E2E-CLI-ONLY: mutation/liveness verb fixtures are driven by the \
+                 black-box CLI harness, not the in-process Target"
+                    .to_string(),
+            ),
         }
     }
 }

@@ -8,5 +8,6 @@ publish.workspace = true
 
 [dependencies]
 milpa-types = { workspace = true }
+milpa-solver = { workspace = true }
 kdl = { workspace = true }
 miette = { workspace = true }

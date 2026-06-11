@@ -111,6 +111,7 @@ impl CoreError {
             // time validators + the resolve-time policy. TNG-BAD-VERSION is in
             // the catalog but unraised by both impls (reserved); not listed here
             // since the union enumerates only codes this impl can emit.
+            "TNG-KDL-SYNTAX",
             "TNG-SCHEMA-UNKNOWN",
             "TNG-UNSAFE-NAME",
             "TNG-BAD-COMMIT-SHA",
@@ -150,6 +151,19 @@ impl CoreError {
             "WS-MEMBER-IS-WORKSPACE",
             "WS-MEMBER-HAS-OVERRIDES",
             "WS-MEMBER-DUPLICATE-NAME",
+            // frozen fast-path precondition failures (Gap-1 / S1c). These are
+            // the two missing-precondition codes: no lockfile and no CAS.
+            "FROZEN-NO-LOCKFILE",
+            "FROZEN-NO-CAS",
+            // verify verb (Gap-1 / S1c). Emitted by cmd_verify when _deps/
+            // is absent (nothing fetched yet).
+            "VERIFY-DEPS-DIR-MISSING",
+            // lockfile verb (update/add --mirror): dep absent in the lock.
+            "LOCK-DEP-NOT-FOUND",
+            // internal / panic sentinels (Gap-1 R4 / S1c). MILPA-INTERNAL is
+            // the outermost catch-all; INTERNAL-PANIC fires from the panic hook.
+            "MILPA-INTERNAL",
+            "INTERNAL-PANIC",
         ]
     }
 }
