@@ -1,5 +1,5 @@
 name "x"
 kind "library"
-flags {
-    f bogus=#true
+deps {
+    z "@@@bad"
 }

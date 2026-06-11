@@ -1,7 +1,7 @@
 name "x"
 kind "library"
 flags {
-    json default=false
+    json default=#false
 }
 deps {
     when flag="undeclared" {
