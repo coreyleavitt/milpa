@@ -33,7 +33,7 @@ use milpa_solver::{parse_version, solve, Dep as SolverDep, PackageProvider, Stra
 use milpa_types::{Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph, Version};
 
 use crate::error::{CoreError, MilpaError};
-use crate::fetch::{FetchError, FetcherRegistry};
+use crate::fetch::{FetchError, FetcherRegistry, Receipt};
 use crate::identity::compute_content_hash;
 use crate::registry::{Index, IndexVersion};
 use crate::workspace::LoadedWorkspace;
@@ -794,14 +794,14 @@ impl<'a> ResolveProvider<'a> {
         }
 
         let dest = self.deps_dir.join(&dep.name);
-        let (identity, resolved_ref) =
+        let (identity, receipt) =
             self.fetch_any(&dep.name, &provs, &dest, expected_identity.as_deref())?;
 
         let (deps, requires, src_dir, sub_items) = self.extract_requires(&dest, &dep.name)?;
 
         // Record the declared primary provenance; carry the resolved commit
         // (preferring the freshly-resolved SHA over a pin) for emission.
-        let commit = resolved_ref.or(pinned_sha);
+        let commit = receipt.resolved_ref.or(pinned_sha);
         self.store_candidate(Candidate {
             name: dep.name.clone(),
             version: url_dep_version(),
@@ -858,20 +858,33 @@ impl<'a> ResolveProvider<'a> {
         if !self.seen_tarball.borrow_mut().insert(dep.url.clone()) {
             return Ok(());
         }
-        let expected_identity = self.tarball_pin(&dep);
+        let (expected_identity, locked_sha256) = self.tarball_pin(&dep);
+        // §5 (TOFU): re-assert the archive-level pin on refetch. A manifest
+        // `sha256=` is authoritative; otherwise reuse the locked TOFU pin so a
+        // substituted archive is rejected at the archive boundary, not just the
+        // tree-hash boundary.
+        let expected_sha256 = dep.sha256.clone().or_else(|| locked_sha256.clone());
         let prov = Provenance::Tarball {
             url: dep.url.clone(),
-            expected_sha256: dep.sha256.clone(),
+            expected_sha256,
             strip_components: dep.strip_components,
         };
         let dest = self.deps_dir.join(&dep.name);
-        let (identity, _ref) = self.fetch_any(
+        let (identity, receipt) = self.fetch_any(
             &dep.name,
             std::slice::from_ref(&prov),
             &dest,
             expected_identity.as_deref(),
         )?;
         let (deps, requires, src_dir, sub_items) = self.extract_requires(&dest, &dep.name)?;
+        // §5: record the TOFU pin. A manifest `sha256=` is authoritative; else
+        // capture the digest the fetcher just computed (first fetch), falling
+        // back to the prior lock's pin (refetch preserves it).
+        let recorded_sha256 = dep
+            .sha256
+            .clone()
+            .or(receipt.archive_sha256)
+            .or(locked_sha256);
         self.store_candidate(Candidate {
             name: dep.name.clone(),
             version: url_dep_version(),
@@ -879,10 +892,9 @@ impl<'a> ResolveProvider<'a> {
             src_dir,
             requires_names: requires,
             deps,
-            // Record preserves the declared archive hash (lockfile.py M11).
             provenance: Some(ProvenanceRecord::Tarball {
                 url: dep.url.clone(),
-                sha256: dep.sha256.clone(),
+                sha256: recorded_sha256,
             }),
         });
         self.process_items(sub_items)?;
@@ -995,7 +1007,7 @@ impl<'a> ResolveProvider<'a> {
         candidates: &[Provenance],
         dest: &Path,
         expected_identity: Option<&str>,
-    ) -> Result<(String, Option<String>), MilpaError> {
+    ) -> Result<(String, Receipt), MilpaError> {
         let mut last_err: Option<String> = None;
         for prov in candidates {
             clear_dir(dest)?;
@@ -1009,7 +1021,7 @@ impl<'a> ResolveProvider<'a> {
                             ));
                             continue;
                         }
-                        _ => return Ok((identity, receipt.resolved_ref)),
+                        _ => return Ok((identity, receipt)),
                     }
                 }
                 Err(e) => {
@@ -1169,18 +1181,27 @@ impl<'a> ResolveProvider<'a> {
         (None, None)
     }
 
-    fn tarball_pin(&self, dep: &TarballDep) -> Option<String> {
-        let prior = self.prior?;
-        let locked = prior.deps.iter().find(|d| d.name == dep.name)?;
-        let identity = locked.identity.clone().filter(|s| !s.is_empty())?;
+    /// `(expected_identity, locked_sha256)` for a tarball dep whose manifest URL
+    /// still matches the prior lockfile's tarball record. Both come from the same
+    /// matched record (single source of truth — mirrors [`Self::git_pin`]).
+    fn tarball_pin(&self, dep: &TarballDep) -> (Option<String>, Option<String>) {
+        let Some(prior) = self.prior else {
+            return (None, None);
+        };
+        let Some(locked) = prior.deps.iter().find(|d| d.name == dep.name) else {
+            return (None, None);
+        };
+        let Some(identity) = locked.identity.clone().filter(|s| !s.is_empty()) else {
+            return (None, None);
+        };
         for p in &locked.provenances {
-            if let ProvenanceRecord::Tarball { url, .. } = p {
+            if let ProvenanceRecord::Tarball { url, sha256 } = p {
                 if url == &dep.url {
-                    return Some(identity);
+                    return (Some(identity), sha256.clone());
                 }
             }
         }
-        None
+        (None, None)
     }
 
     fn prior_self_mirrors(&self, name: &str) -> Vec<String> {

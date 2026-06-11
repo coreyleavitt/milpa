@@ -121,7 +121,10 @@ pub fn fetch_local(name: &str, src: &Path, dest: &Path) -> Result<Receipt, Fetch
         .map_err(|e| transport("FETCH-LOCAL-PATH-NOT-DIR", format!("copying {name:?}: {e}")))?;
     // A local copy carries no resolved ref; its provenance evidence is the
     // declared path, recorded by the resolver.
-    Ok(Receipt { resolved_ref: None })
+    Ok(Receipt {
+        resolved_ref: None,
+        archive_sha256: None,
+    })
 }
 
 /// Clone `url` into `dest` and check out the pinned commit (or `ref_spec`).
@@ -157,6 +160,7 @@ pub fn fetch_git(
 
     Ok(Receipt {
         resolved_ref: git_head_sha(dest),
+        archive_sha256: None,
     })
 }
 
@@ -233,15 +237,19 @@ pub fn fetch_tarball(
         )
     })?;
 
+    // Compute the archive digest once: it gates an existing pin (below) AND is
+    // returned as the TOFU receipt so the resolver can record/preserve it
+    // (`lockfile-schema.md §5`).
+    let actual_sha = sha256_hex(&bytes);
+
     if let Some(expected) = expected_sha256 {
-        let actual = sha256_hex(&bytes);
         // Accept a bare hex digest or a `sha256:`-prefixed one.
         let want = expected.strip_prefix("sha256:").unwrap_or(expected);
-        if actual != want {
+        if actual_sha != want {
             return Err(transport(
                 "FETCH-SHA256-MISMATCH",
                 format!(
-                    "fetching {name:?}: archive sha256 mismatch — expected {expected}, got {actual} \
+                    "fetching {name:?}: archive sha256 mismatch — expected {expected}, got {actual_sha} \
                      (URL {url}); rejected before extraction"
                 ),
             ));
@@ -273,7 +281,10 @@ pub fn fetch_tarball(
             format!("fetching {name:?}: safe extraction failed ({})", e.code()),
         )
     })?;
-    Ok(Receipt { resolved_ref: None })
+    Ok(Receipt {
+        resolved_ref: None,
+        archive_sha256: Some(actual_sha),
+    })
 }
 
 /// Pull an OCI artifact via `oras` and safe-extract its single source tarball
@@ -339,7 +350,10 @@ pub fn fetch_oci(
                 .map_err(|e| transport("FETCH-EXTRACT-FAILED", format!("gunzip: {e}")))?;
             clear_dest(dest).map_err(|e| transport("FETCH-EXTRACT-FAILED", e))?;
             extract_tar(&tar, dest, 0, Limits::default())
-                .map(|_| Receipt { resolved_ref: None })
+                .map(|_| Receipt {
+                    resolved_ref: None,
+                    archive_sha256: None,
+                })
                 .map_err(|e| transport("FETCH-EXTRACT-FAILED", e.code().to_string()))
         }
         many => Err(transport(
@@ -495,23 +509,60 @@ impl MockedFetcher {
 
 impl FetcherRegistry for MockedFetcher {
     fn fetch(&self, name: &str, p: &Provenance, dest: &Path) -> Result<Receipt, FetchError> {
-        let (url, ref_spec) = match p {
-            Provenance::Git { url, ref_spec, .. } => (url.as_str(), ref_spec.as_str()),
+        // Resolve the mock key dir and the receipt fields per transport. Git keys
+        // on (url, ref) and returns a commit SHA; tarball keys on (url, "") and
+        // returns the recorded archive sha256 (gating an existing pin first,
+        // exactly like the real `fetch_tarball` — conformance-fixtures.md §2.3.4).
+        let (key_dir, receipt) = match p {
+            Provenance::Git { url, ref_spec, .. } => {
+                let (sha, key_dir) = resolve_mock_key(&self.mocked_fetches_dir, url, ref_spec)?;
+                (
+                    key_dir,
+                    Receipt {
+                        resolved_ref: Some(sha),
+                        archive_sha256: None,
+                    },
+                )
+            }
+            Provenance::Tarball {
+                url,
+                expected_sha256,
+                ..
+            } => {
+                let (archive_sha, key_dir) =
+                    resolve_tarball_mock_key(&self.mocked_fetches_dir, url)?;
+                if let Some(expected) = expected_sha256 {
+                    let want = expected.strip_prefix("sha256:").unwrap_or(expected);
+                    if want != archive_sha {
+                        return Err(FetchError::Transport(
+                            "FETCH-SHA256-MISMATCH",
+                            format!(
+                                "mocked fetch {name:?}: archive sha256 mismatch — \
+                                 expected {expected}, got {archive_sha} (URL {url})"
+                            ),
+                        ));
+                    }
+                }
+                (
+                    key_dir,
+                    Receipt {
+                        resolved_ref: None,
+                        archive_sha256: Some(archive_sha),
+                    },
+                )
+            }
             other => {
                 return Err(FetchError::Failed(format!(
                     "MockedFetcher: unsupported provenance kind: {other:?}; \
-                     only Git provenance is mocked"
+                     only Git and Tarball provenance are mocked"
                 )));
             }
         };
-        let (sha, key_dir) = resolve_mock_key(&self.mocked_fetches_dir, url, ref_spec)?;
         clear_dest(dest).map_err(|e| FetchError::Failed(e))?;
         std::fs::create_dir_all(dest)
             .map_err(|e| FetchError::Failed(format!("MockedFetcher: cannot create dest: {e}")))?;
         stage_mock_content(name, &key_dir, dest)?;
-        Ok(Receipt {
-            resolved_ref: Some(sha),
-        })
+        Ok(receipt)
     }
 }
 
@@ -545,6 +596,40 @@ pub fn resolve_mock_key(
         .trim()
         .to_string();
     Ok((sha, key_dir))
+}
+
+/// Resolve a tarball URL to its `mocked-fetches/<url_key(url, "")>/` directory
+/// and read its `archive_sha256` file (the sha256 the transport reports for the
+/// downloaded archive — conformance-fixtures.md §2.3.4). Returns
+/// `(archive_sha256, key_dir)`. Tarballs have no ref, so the key's ref slot is
+/// empty (`<san(url)>@`), matching [`mocked_default_branch`]'s URL-prefix match.
+///
+/// `FETCH-MOCK-MISSING` if the key directory does not exist.
+pub fn resolve_tarball_mock_key(
+    mocked_fetches_dir: &Path,
+    url: &str,
+) -> Result<(String, std::path::PathBuf), FetchError> {
+    let key_dir = mocked_fetches_dir.join(url_key(url, ""));
+    if !key_dir.is_dir() {
+        return Err(FetchError::Transport(
+            "FETCH-MOCK-MISSING",
+            format!(
+                "mocked fetch: no tarball fixture for {url:?} \
+                 (expected dir: {})",
+                key_dir.display()
+            ),
+        ));
+    }
+    let archive_sha = std::fs::read_to_string(key_dir.join("archive_sha256"))
+        .map_err(|e| {
+            FetchError::Failed(format!(
+                "mock fixture: cannot read {}/archive_sha256: {e}",
+                key_dir.display()
+            ))
+        })?
+        .trim()
+        .to_string();
+    Ok((archive_sha, key_dir))
 }
 
 /// Stage the mocked bytes from `key_dir` into `dest`: copy `content/` verbatim,

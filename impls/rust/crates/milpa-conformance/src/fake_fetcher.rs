@@ -64,9 +64,12 @@ impl FakeFetcher {
 
 impl FetcherRegistry for FakeFetcher {
     fn fetch(&self, name: &str, p: &Provenance, dest: &Path) -> Result<Receipt, FetchError> {
-        // The conformance corpus mocks git provenance exclusively (§2.3).
+        // The conformance corpus mocks git and tarball provenance (§2.3). The
+        // (url, ref) pair is only for the call record; the transport + CAS admit
+        // are delegated to the inner fetcher below (single source of truth).
         let (url, ref_spec) = match p {
             Provenance::Git { url, ref_spec, .. } => (url.as_str(), ref_spec.as_str()),
+            Provenance::Tarball { url, .. } => (url.as_str(), ""),
             other => {
                 return Err(FetchError::Failed(format!(
                     "FakeFetcher: unmocked provenance kind: {other:?}"
@@ -148,5 +151,50 @@ mod tests {
         let err = FetcherRegistry::fetch(&fetcher, "x", &p, &tmp.path().join("dest")).unwrap_err();
         // Production code emits FETCH-MOCK-MISSING (not the old FETCH-FAILED).
         assert_eq!(err.code(), "FETCH-MOCK-MISSING");
+    }
+
+    fn stage_tarball_mock(mocked: &Path, url: &str, archive_sha: &str) {
+        let key_dir = mocked.join(url_key(url, ""));
+        std::fs::create_dir_all(key_dir.join("content")).unwrap();
+        std::fs::write(key_dir.join("archive_sha256"), format!("{archive_sha}\n")).unwrap();
+        std::fs::write(key_dir.join("content").join("foo.nim"), b"# src").unwrap();
+    }
+
+    #[test]
+    fn tarball_mock_returns_archive_sha256() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mocked = tmp.path().join("mocked-fetches");
+        let url = "https://example.com/foo.tar.gz";
+        stage_tarball_mock(&mocked, url, "abc123");
+        let fetcher = FakeFetcher::new(&mocked, tmp.path().join(".cas"));
+        std::fs::create_dir_all(tmp.path().join("_deps")).unwrap();
+        let dest = tmp.path().join("_deps").join("foo");
+        let p = Provenance::Tarball {
+            url: url.into(),
+            expected_sha256: None,
+            strip_components: 0,
+        };
+        let receipt = FetcherRegistry::fetch(&fetcher, "foo", &p, &dest).unwrap();
+        assert_eq!(receipt.archive_sha256.as_deref(), Some("abc123"));
+        assert_eq!(std::fs::read(dest.join("foo.nim")).unwrap(), b"# src");
+        assert_eq!(fetcher.calls()[0].url, url);
+    }
+
+    #[test]
+    fn tarball_mock_pin_mismatch_is_sha256_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mocked = tmp.path().join("mocked-fetches");
+        let url = "https://example.com/foo.tar.gz";
+        stage_tarball_mock(&mocked, url, "actual_sha");
+        let fetcher = FakeFetcher::new(&mocked, tmp.path().join(".cas"));
+        std::fs::create_dir_all(tmp.path().join("_deps")).unwrap();
+        let dest = tmp.path().join("_deps").join("foo");
+        let p = Provenance::Tarball {
+            url: url.into(),
+            expected_sha256: Some("declared_sha".into()),
+            strip_components: 0,
+        };
+        let err = FetcherRegistry::fetch(&fetcher, "foo", &p, &dest).unwrap_err();
+        assert_eq!(err.code(), "FETCH-SHA256-MISMATCH");
     }
 }

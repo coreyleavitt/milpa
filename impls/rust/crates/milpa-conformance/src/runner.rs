@@ -293,6 +293,13 @@ impl Target for MilpaTarget {
                 // file) for conditional-dep predicate filtering (§6).
                 let profile = fixture_profile(&fx.dir);
 
+                // §8 prior-lockfile pin reuse: a `resolve` fixture MAY ship a
+                // milpa.lock input (conformance-fixtures §2.9 / resolver-semantics
+                // §8). Load it (gracefully — absent/unparseable ⇒ None, a soft
+                // preference) so tarball TOFU / git pinned-commit re-assertion is
+                // exercised exactly as the CLI's `cmd_fetch` does.
+                let prior_lock = milpa_core::load_lockfile(&fx.dir.join("milpa.lock")).ok();
+
                 let manifest = match milpa_core::parse_document(&text) {
                     // Workspace: load (WS-* topology) → multi-member union resolve
                     // (RES-WS-*) → shared milpa.lock + per-member nim.cfg.
@@ -310,7 +317,7 @@ impl Target for MilpaTarget {
                             index.as_ref(),
                             &fetcher,
                             profile.as_ref(),
-                            None,
+                            prior_lock.as_ref(),
                             milpa_core::Strategy::default(),
                             &scratch.deps_dir,
                         ) {
@@ -341,7 +348,7 @@ impl Target for MilpaTarget {
                     index.as_ref(),
                     &fetcher,
                     profile.as_ref(),
-                    None,
+                    prior_lock.as_ref(),
                     &scratch.deps_dir,
                 ) {
                     // S9: emit the byte-diff outputs. `_deps_structure.txt` is read

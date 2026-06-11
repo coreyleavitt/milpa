@@ -18,6 +18,10 @@ use milpa_types::Provenance;
 pub struct Receipt {
     /// Resolved concrete reference (e.g. the commit SHA a ref pinned to).
     pub resolved_ref: Option<String>,
+    /// sha256 of the downloaded archive bytes (transport receipt, NOT identity).
+    /// `Some` only for the tarball transport, where it is the value recorded as
+    /// the TOFU pin (`lockfile-schema.md §5`); `None` for git/local/oci.
+    pub archive_sha256: Option<String>,
 }
 
 /// Fetch errors.

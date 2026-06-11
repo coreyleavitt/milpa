@@ -8,12 +8,15 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use milpa_manifest::{Dep, LocalDep, Manifest, NamedDep, Override, Predicate, Profile, UrlDep};
+use milpa_manifest::{
+    Dep, LocalDep, Manifest, NamedDep, Override, Predicate, Profile, TarballDep, UrlDep,
+};
 use milpa_solver::Strategy;
 use milpa_types::{
     LockedDep, Lockfile, Provenance, ProvenanceRecord, Version, LOCKFILE_SCHEMA_VERSION,
 };
 
+use crate::error::MilpaError;
 use crate::fetch::{FetchError, FetcherRegistry, Receipt};
 use crate::identity::compute_content_hash;
 use crate::registry::{Index, IndexVersion, Package};
@@ -28,6 +31,10 @@ struct Mock {
     sha: String,
     nimble: Option<String>,
     milpa_kdl: Option<String>,
+    /// For tarball mocks: the sha256 the transport reports for the downloaded
+    /// archive bytes. Modelled like the real `fetch_tarball`: an `expected_sha256`
+    /// pin is checked against this value, and it is returned in the receipt.
+    archive_sha: Option<String>,
 }
 
 #[derive(Default)]
@@ -83,9 +90,14 @@ impl FetcherRegistry for FakeReg {
                 self.materialize(name, &m, dest)?;
                 Ok(Receipt {
                     resolved_ref: Some(m.sha),
+                    archive_sha256: None,
                 })
             }
-            Provenance::Tarball { url, .. } => {
+            Provenance::Tarball {
+                url,
+                expected_sha256,
+                ..
+            } => {
                 self.calls
                     .borrow_mut()
                     .push((name.to_string(), url.clone(), String::new()));
@@ -94,8 +106,23 @@ impl FetcherRegistry for FakeReg {
                     .get(&(url.clone(), String::new()))
                     .ok_or_else(|| FetchError::Failed(format!("no tarball mock for {url:?}")))?
                     .clone();
+                let archive_sha = m.archive_sha.clone();
+                // Model the real `fetch_tarball`: gate an existing pin against the
+                // archive's actual sha before materializing.
+                if let (Some(exp), Some(actual)) = (expected_sha256.as_deref(), &archive_sha) {
+                    let want = exp.strip_prefix("sha256:").unwrap_or(exp);
+                    if want != actual {
+                        return Err(FetchError::Transport(
+                            "FETCH-SHA256-MISMATCH",
+                            format!("archive sha256 mismatch — expected {exp}, got {actual}"),
+                        ));
+                    }
+                }
                 self.materialize(name, &m, dest)?;
-                Ok(Receipt { resolved_ref: None })
+                Ok(Receipt {
+                    resolved_ref: None,
+                    archive_sha256: archive_sha,
+                })
             }
             Provenance::Local { path } => {
                 self.calls
@@ -103,7 +130,10 @@ impl FetcherRegistry for FakeReg {
                     .push((name.to_string(), path.clone(), String::new()));
                 copy_tree(Path::new(path), dest)
                     .map_err(|e| FetchError::Failed(format!("local copy: {e}")))?;
-                Ok(Receipt { resolved_ref: None })
+                Ok(Receipt {
+                    resolved_ref: None,
+                    archive_sha256: None,
+                })
             }
             other => Err(FetchError::Failed(format!("unmocked: {other:?}"))),
         }
@@ -131,15 +161,47 @@ fn nimble(sha: &str, body: &str) -> Mock {
     Mock {
         sha: sha.to_string(),
         nimble: Some(body.to_string()),
-        milpa_kdl: None,
+        ..Mock::default()
     }
 }
 
 fn milpa_kdl(sha: &str, body: &str) -> Mock {
     Mock {
         sha: sha.to_string(),
-        nimble: None,
         milpa_kdl: Some(body.to_string()),
+        ..Mock::default()
+    }
+}
+
+/// A tarball mock: serves `<name>.nimble = body` and reports `archive_sha` as the
+/// downloaded archive's sha256 (the transport receipt the resolver records/pins).
+fn tarball_mock(archive_sha: &str, body: &str) -> Mock {
+    Mock {
+        nimble: Some(body.to_string()),
+        archive_sha: Some(archive_sha.to_string()),
+        ..Mock::default()
+    }
+}
+
+fn tarball_dep(name: &str, url: &str, sha256: Option<&str>) -> Dep {
+    Dep::Tarball(TarballDep {
+        name: name.to_string(),
+        url: url.to_string(),
+        sha256: sha256.map(str::to_string),
+        strip_components: 0,
+    })
+}
+
+/// Build a `FakeReg` from tarball mocks keyed by URL (ref slot is empty for
+/// tarballs, matching the `Provenance::Tarball` dispatch arm).
+fn tarball_reg(mocks: &[(&str, Mock)]) -> FakeReg {
+    let mut by_url_ref = BTreeMap::new();
+    for (url, m) in mocks {
+        by_url_ref.insert((url.to_string(), String::new()), m.clone());
+    }
+    FakeReg {
+        by_url_ref,
+        calls: RefCell::new(Vec::new()),
     }
 }
 
@@ -978,4 +1040,134 @@ fn resolve_absent_profile_includes_conditional_dep() {
     )
     .unwrap();
     assert_eq!(graph.deps.len(), 1);
+}
+
+// --- tarball TOFU pinning (lockfile-schema.md §5, issue #116) ---------------
+
+#[test]
+fn resolve_tarball_first_fetch_records_archive_sha256() {
+    // §5: a tarball dep declared without a manifest `sha256=` undergoes first-use
+    // pinning — the downloaded archive's sha256 is recorded in the lockfile's
+    // tarball provenance. (RED before the fix: the record drops it to `None`.)
+    let url = "https://example.com/foo.tar.gz";
+    let body = "srcDir = \"src\"\n";
+    let reg = tarball_reg(&[(url, tarball_mock("archivesha_aaaa", body))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![tarball_dep("foo", url, None)]);
+    let graph = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp)).unwrap();
+    let foo = graph.deps.iter().find(|d| d.name == "foo").unwrap();
+    assert_eq!(
+        foo.provenance,
+        ProvenanceRecord::Tarball {
+            url: url.into(),
+            sha256: Some("archivesha_aaaa".into()),
+        }
+    );
+}
+
+/// Build a prior lockfile pinning `name` to `identity` with a tarball provenance
+/// recording `sha256` (the TOFU pin).
+fn tarball_prior(name: &str, url: &str, identity: &str, sha256: &str) -> Lockfile {
+    Lockfile {
+        version: LOCKFILE_SCHEMA_VERSION,
+        strategy: "maxver".into(),
+        deps: vec![LockedDep {
+            name: name.into(),
+            identity: Some(identity.into()),
+            version: "0.0.1".into(),
+            src_dir: "src".into(),
+            requires: Vec::new(),
+            provenances: vec![ProvenanceRecord::Tarball {
+                url: url.into(),
+                sha256: Some(sha256.into()),
+            }],
+            active_flags: Vec::new(),
+            self_mirrors: Vec::new(),
+        }],
+    }
+}
+
+#[test]
+fn resolve_tarball_refetch_rejects_substituted_archive() {
+    // §5: on refetch of a TOFU-pinned tarball, the resolver MUST supply the locked
+    // sha256 as the expected archive hash. Here the remote archive has been
+    // substituted (different bytes → different archive sha) but extracts to the
+    // SAME tree, so the identity gate alone would pass — only the archive-level
+    // pin catches it. RED before the fix: expected_sha256 is None → accepted.
+    let url = "https://example.com/foo.tar.gz";
+    let body = "srcDir = \"src\"\n";
+    let identity = hash_of_nimble("foo", body);
+    // Substituted archive: same body (identity matches) but a different sha.
+    let reg = tarball_reg(&[(url, tarball_mock("archivesha_BBBB", body))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![tarball_dep("foo", url, None)]);
+    let prior = tarball_prior("foo", url, &identity, "archivesha_AAAA");
+    let err = resolve(
+        &m,
+        None,
+        &reg,
+        None,
+        Some(&prior),
+        Strategy::Maxver,
+        &deps_dir(&tmp),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "FETCH-ALL-FAILED");
+    let MilpaError::Fetch(FetchError::AllFailed(msg)) = &err else {
+        panic!("expected AllFailed, got {err:?}");
+    };
+    assert!(
+        msg.contains("FETCH-SHA256-MISMATCH"),
+        "substituted archive must be rejected at the archive boundary, got: {msg}"
+    );
+}
+
+#[test]
+fn resolve_tarball_refetch_preserves_pin() {
+    // §5: a matching refetch rewrites the lockfile with the TOFU pin intact —
+    // the archive sha256 must not silently drop to None. RED before the fix: the
+    // record used the (absent) manifest sha256.
+    let url = "https://example.com/foo.tar.gz";
+    let body = "srcDir = \"src\"\n";
+    let identity = hash_of_nimble("foo", body);
+    let reg = tarball_reg(&[(url, tarball_mock("archivesha_AAAA", body))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![tarball_dep("foo", url, None)]);
+    let prior = tarball_prior("foo", url, &identity, "archivesha_AAAA");
+    let graph = resolve(
+        &m,
+        None,
+        &reg,
+        None,
+        Some(&prior),
+        Strategy::Maxver,
+        &deps_dir(&tmp),
+    )
+    .unwrap();
+    let foo = graph.deps.iter().find(|d| d.name == "foo").unwrap();
+    assert_eq!(
+        foo.provenance,
+        ProvenanceRecord::Tarball {
+            url: url.into(),
+            sha256: Some("archivesha_AAAA".into()),
+        }
+    );
+}
+
+#[test]
+fn resolve_tarball_manifest_sha256_mismatch_rejected_on_first_fetch() {
+    // §5: a manifest-declared `sha256=` is an explicit pin enforced from the very
+    // first fetch — a non-matching archive is rejected at the archive boundary
+    // even with no prior lockfile.
+    let url = "https://example.com/foo.tar.gz";
+    let body = "srcDir = \"src\"\n";
+    let reg = tarball_reg(&[(url, tarball_mock("archivesha_actual", body))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![tarball_dep("foo", url, Some("archivesha_declared"))]);
+    let err = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp)).unwrap_err();
+    assert_eq!(err.code(), "FETCH-ALL-FAILED");
+    let MilpaError::Fetch(FetchError::AllFailed(msg)) = &err else {
+        panic!("expected AllFailed, got {err:?}");
+    };
+    assert!(msg.contains("FETCH-SHA256-MISMATCH"), "got: {msg}");
 }

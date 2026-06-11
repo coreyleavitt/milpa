@@ -268,12 +268,14 @@ fn cmd_fetch(
         } else {
             let index = maybe_index()?;
             let profile = profile_from_env();
+            // §8: reuse existing pins (idempotent repeated fetch — see single-pkg path).
+            let prior = maybe_prior_lockfile(&dir.join("milpa.lock"));
             resolve_workspace(
                 &ws,
                 index.as_ref(),
                 registry.as_ref(),
                 profile.as_ref(),
-                None,
+                prior.as_ref(),
                 strategy,
                 &deps_dir,
             )?
@@ -323,12 +325,15 @@ fn cmd_fetch(
     } else {
         let index = maybe_index()?;
         let profile = profile_from_env();
+        // §8: reuse the existing lockfile's pins so repeated `fetch`/`lock` runs
+        // are idempotent and a silently-moved ref / substituted archive is caught.
+        let prior = maybe_prior_lockfile(&dir.join("milpa.lock"));
         Milpa.resolve(
             &manifest,
             index.as_ref(),
             registry.as_ref(),
             profile.as_ref(),
-            None,
+            prior.as_ref(),
             &deps_dir,
         )?
     };
@@ -733,6 +738,19 @@ fn profile_from_env() -> Option<Profile> {
         milpa_version,
         flags: Vec::new(),
     })
+}
+
+/// Load an existing `milpa.lock` as the §8 prior for pin reuse (resolver-
+/// semantics §8: the named stability guarantee that makes repeated `milpa fetch`
+/// runs idempotent for an unchanged manifest). Returns `None` when the lockfile
+/// is absent or unparseable: §8 pin reuse is a *soft preference*, so a
+/// missing/corrupt prior degrades to a fresh resolve rather than blocking
+/// `fetch`/`lock` — contrast `--frozen`, which errors on a bad lock.
+fn maybe_prior_lockfile(path: &Path) -> Option<milpa_core::Lockfile> {
+    if !path.exists() {
+        return None;
+    }
+    load_lockfile(path).ok()
 }
 
 /// The value following `flag` in `args` (e.g. `--git <url>`), if present.
