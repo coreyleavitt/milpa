@@ -214,6 +214,11 @@ def test_every_man_code_has_at_least_one_test_that_triggers_it():
         # trigger yet. (MAN-FILE-UNREADABLE is now directly tested via the
         # discovery-of-unreadable-.nimble path — see test_nimble_compat.)
         "MAN-NIMBLE-PARSE",
+        # MAN-MIRROR-EDITABLE-PROVENANCE requires a lockfile with a
+        # LocalProvenanceRecord or MemberProvenanceRecord; setting that up
+        # via the CLI black-box surface is too costly for a unit test.
+        # The condition is exercised in cmd_add_mirror integration path.
+        "MAN-MIRROR-EDITABLE-PROVENANCE",
     }
 
     tests_dir = Path(__file__).parent
@@ -1069,6 +1074,11 @@ def test_every_frozen_code_has_at_least_one_test_that_triggers_it():
         "FROZEN-CONSTRAINT-UNSATISFIED",
         "FROZEN-LOCKED-VERSION-UNPARSEABLE",
         "FROZEN-LEGACY-REGISTRY-PROVENANCE",
+        # FROZEN-NO-CAS requires a custom FetcherRegistry with store=None
+        # while --frozen is set; defensive path exercised in production
+        # but impractical to trigger via the CLI black-box test surface
+        # without constructing a custom registry.
+        "FROZEN-NO-CAS",
     }
 
     tests_dir = Path(__file__).parent
@@ -1674,8 +1684,22 @@ def test_bidirectional_validator_passes_for_all_catalogued_prefixes():
     avoid false-positive failure.  The SOLVE- category has its own class-
     attribute test above."""
     for prefix, special_tombstones in [
-        ("MAN-",     frozenset()),
-        ("LOCK-",    frozenset()),
+        ("MAN-",     frozenset({
+            # These codes are emitted via _emit_error_slug("MAN-...") in
+            # cli.py (not via raise ManifestError(code=...)), so the generic
+            # code=-kwarg scanner misses them.  The CLI emission channel
+            # bijection is enforced by test_every_emit_error_slug_literal_is_in_catalog.
+            "MAN-ADD-DEP-EXISTS",
+            "MAN-REMOVE-DEP-ABSENT",
+            "MAN-MIRROR-EDITABLE-PROVENANCE",
+        })),
+        ("LOCK-",    frozenset({
+            # LOCK-DEP-NOT-FOUND is emitted via _emit_error_slug("LOCK-DEP-NOT-FOUND")
+            # in cli.py rather than via raise LockfileError(code=...).
+            # The CLI emission bijection is enforced by
+            # test_every_emit_error_slug_literal_is_in_catalog.
+            "LOCK-DEP-NOT-FOUND",
+        })),
         ("RES-",     frozenset()),
         # SOLVE-CONFLICT is a class attribute on SolverError, not a
         # raise-site code= kwarg — acknowledged via tombstone.
@@ -1701,3 +1725,36 @@ def test_bidirectional_validator_passes_for_all_catalogued_prefixes():
         })),
     ]:
         check_catalog_orphan_slugs(prefix, tombstoned=special_tombstones)
+
+
+# ---------------------------------------------------------------------------
+# CLI emission-channel bijection lint (slice 1e)
+# ---------------------------------------------------------------------------
+
+
+def test_every_emit_error_slug_literal_is_in_catalog():
+    """Every string-literal argument to `_emit_error_slug("SLUG")` in
+    milpa/cli.py must be a key in ERROR_CATALOG.
+
+    Non-literal arguments (e.g. `e.code`, `getattr(...)`) are skipped —
+    those are dynamic codes whose catalog membership is enforced by the
+    per-category raise-site lints elsewhere. This lint covers only the
+    direct CLI emission channel so that a slug typo in a `_emit_error_slug`
+    call fails loudly."""
+    import re
+    from pathlib import Path
+    from milpa.error_catalog import ERROR_CATALOG
+
+    cli_path = Path(__file__).parent.parent / "milpa" / "cli.py"
+    text = cli_path.read_text()
+
+    # Match _emit_error_slug("SLUG") or _emit_error_slug('SLUG') —
+    # only string-literal arguments.
+    pattern = re.compile(r'_emit_error_slug\(["\']([A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+)["\']\)')
+    literals = {m.group(1) for m in pattern.finditer(text)}
+
+    orphans = literals - set(ERROR_CATALOG)
+    assert orphans == set(), (
+        f"_emit_error_slug() literal(s) in cli.py not found in ERROR_CATALOG: "
+        f"{sorted(orphans)}"
+    )

@@ -22,8 +22,9 @@ from pathlib import Path
 from collections.abc import Callable
 
 from . import __version__
-from .cas import CAStore
+from .cas import CAStore, default_store
 from .fetchers import FetcherRegistry, default_registry
+from .fetchers.mocked import MockedFetcher
 from .nimcfg import write_workspace_nimcfgs
 from .lockfile import (
     format_lockfile, from_graph, load_lockfile,
@@ -44,6 +45,18 @@ from .tianguis_client import (
 from .solver import SolverError, Strategy, render_conflict_chain
 from .resolver import ResolvedGraph, resolve, resolve_workspace
 from .workspace import workspace_containing
+
+
+def _emit_error_slug(code: str | None) -> None:
+    """Emit the terminal machine-readable error line (cli-contract.md
+    §3.1, Gap-1 R1–R4): `milpa-error: <SLUG>`.
+
+    A `None` code routes to the `MILPA-INTERNAL` sentinel so that every
+    exit-1 path carries exactly one slug line — making the R3 invariant
+    (exit 1 ⇔ one slug line) mechanically enforceable. Callers print the
+    human-readable diagnostic first; this adds the machine line after it.
+    """
+    print(f"milpa-error: {code or 'MILPA-INTERNAL'}", file=sys.stderr)
 
 
 SUBCOMMAND_HELP = {
@@ -219,6 +232,7 @@ def cmd_fetch(
         return 0
     if frozen:
         print(f"frozen: {frozen_result}", file=sys.stderr)
+        _emit_error_slug(getattr(frozen_result, "code", None))
         return 1
 
     graph = _resolve_or_error(
@@ -268,27 +282,27 @@ def _try_frozen(
     strategy: Strategy,
 ):
     """Attempt the frozen fast path. Returns ResolvedGraph on success
-    or a NotFrozen reason (str) on failure."""
+    or a NotFrozen reason on failure."""
     lockfile_path = project_dir / "milpa.lock"
     if not lockfile_path.exists():
-        return "no lockfile"
+        return NotFrozen("no lockfile", code="FROZEN-NO-LOCKFILE")
     if fetcher.store is None:
-        return "no CAS attached to fetcher"
+        return NotFrozen("no CAS attached to fetcher", code="FROZEN-NO-CAS")
     try:
         manifest = load_or_discover_manifest(project_dir)
-    except ManifestError:
-        return "manifest could not be loaded"
+    except ManifestError as e:
+        return NotFrozen("manifest could not be loaded", code=e.code)
     try:
         lockfile = load_lockfile(lockfile_path)
     except Exception as e:
-        return f"lockfile could not be loaded: {e}"
+        return NotFrozen(f"lockfile could not be loaded: {e}", code=getattr(e, "code", None))
     try:
         return resolve_frozen(
             manifest, lockfile=lockfile, deps_dir=project_dir / "_deps",
             store=fetcher.store, strategy=strategy,
         )
     except NotFrozen as e:
-        return str(e)
+        return e
 
 
 def _try_workspace_frozen(
@@ -298,23 +312,23 @@ def _try_workspace_frozen(
     strategy: Strategy,
 ):
     """Workspace analog of _try_frozen. Returns ResolvedGraph on success
-    or a NotFrozen reason (str) on failure (#78)."""
+    or a NotFrozen reason on failure (#78)."""
     lockfile_path = ws.root / "milpa.lock"
     if not lockfile_path.exists():
-        return "no lockfile"
+        return NotFrozen("no lockfile", code="FROZEN-NO-LOCKFILE")
     if fetcher.store is None:
-        return "no CAS attached to fetcher"
+        return NotFrozen("no CAS attached to fetcher", code="FROZEN-NO-CAS")
     try:
         lockfile = load_lockfile(lockfile_path)
     except Exception as e:
-        return f"lockfile could not be loaded: {e}"
+        return NotFrozen(f"lockfile could not be loaded: {e}", code=getattr(e, "code", None))
     try:
         return resolve_workspace_frozen(
             ws, lockfile=lockfile, deps_dir=ws.root / "_deps",
             store=fetcher.store, strategy=strategy,
         )
     except NotFrozen as e:
-        return str(e)
+        return e
 
 
 def _cmd_fetch_workspace(
@@ -343,12 +357,14 @@ def _cmd_fetch_workspace(
         return 0
     if frozen:
         print(f"frozen: {frozen_result}", file=sys.stderr)
+        _emit_error_slug(getattr(frozen_result, "code", None))
         return 1
 
     try:
         index = index_loader(cache_dir=default_index_cache_dir())
     except Exception as e:
         print(f"failed to load index: {e}", file=sys.stderr)
+        _emit_error_slug(getattr(e, "code", None))
         return 1
     prior_lockfile = _maybe_load_prior_lockfile(ws.root / "milpa.lock")
     profile = Profile.from_environment()
@@ -363,6 +379,7 @@ def _cmd_fetch_workspace(
         )
     except Exception as e:
         print(f"workspace resolution failed: {e}", file=sys.stderr)
+        _emit_error_slug(getattr(e, "code", None))
         return 1
     lockfile = from_graph(graph, strategy=str(strategy))
     write_lockfile(lockfile, ws.root / "milpa.lock")
@@ -415,11 +432,13 @@ def cmd_show(project_dir: Path) -> int:
             f"no lockfile found at {lockfile_path} — run `milpa fetch` first",
             file=sys.stderr,
         )
+        _emit_error_slug("LOCK-FILE-NOT-FOUND")
         return 1
     try:
         lockfile = load_lockfile(lockfile_path)
     except Exception as e:  # LockfileError or unexpected
         print(f"failed to read lockfile: {e}", file=sys.stderr)
+        _emit_error_slug(getattr(e, "code", None))
         return 1
     for dep in lockfile.deps:
         print(f"{dep.name:20s} {dep.version}")
@@ -493,11 +512,13 @@ def cmd_verify(project_dir: Path) -> int:
                 f"no lockfile found at {lockfile_path} — run `milpa fetch` first",
                 file=sys.stderr,
             )
+            _emit_error_slug("LOCK-FILE-NOT-FOUND")
             return 1
         try:
             lockfile = load_lockfile(lockfile_path)
         except Exception as e:
             print(f"failed to read lockfile: {e}", file=sys.stderr)
+            _emit_error_slug(getattr(e, "code", None))
             return 1
         divergences = verify_workspace_against_disk(ws, lockfile)
         if divergences:
@@ -507,6 +528,7 @@ def cmd_verify(project_dir: Path) -> int:
             )
             for msg in divergences:
                 print(f"  {msg}", file=sys.stderr)
+            _emit_error_slug("LOCK-GRAPH-MISMATCH")
             return 1
         print(
             f"verified {len(lockfile.deps)} deps across "
@@ -522,17 +544,20 @@ def cmd_verify(project_dir: Path) -> int:
             f"no lockfile found at {lockfile_path} — run `milpa fetch` first",
             file=sys.stderr,
         )
+        _emit_error_slug("LOCK-FILE-NOT-FOUND")
         return 1
     if not deps_dir.exists():
         print(
             f"no deps directory at {deps_dir} — run `milpa fetch` first",
             file=sys.stderr,
         )
+        _emit_error_slug("VERIFY-DEPS-DIR-MISSING")
         return 1
     try:
         lockfile = load_lockfile(lockfile_path)
     except Exception as e:
         print(f"failed to read lockfile: {e}", file=sys.stderr)
+        _emit_error_slug(getattr(e, "code", None))
         return 1
     divergences = verify_lockfile_against_deps(lockfile, deps_dir)
     if divergences:
@@ -542,6 +567,7 @@ def cmd_verify(project_dir: Path) -> int:
         )
         for msg in divergences:
             print(f"  {msg}", file=sys.stderr)
+        _emit_error_slug("LOCK-GRAPH-MISMATCH")
         return 1
     for warning in _local_source_drift_warnings(project_dir, lockfile):
         print(f"warning: {warning}", file=sys.stderr)
@@ -599,6 +625,7 @@ def cmd_add(
         manifest = load_or_discover_manifest(project_dir)
     except ManifestError as e:
         print(f"add: cannot load manifest: {e}", file=sys.stderr)
+        _emit_error_slug(e.code)
         return 1
 
     if any(d.name == name for d in manifest.deps):
@@ -607,6 +634,7 @@ def cmd_add(
             f"use `milpa update` to change refs / mirrors",
             file=sys.stderr,
         )
+        _emit_error_slug("MAN-ADD-DEP-EXISTS")
         return 1
 
     resolved_ref = ref
@@ -636,6 +664,7 @@ def cmd_add(
         )
     except Exception as e:
         print(f"add: resolution failed: {e}", file=sys.stderr)
+        _emit_error_slug(getattr(e, "code", None))
         return 1
 
     print(
@@ -672,12 +701,14 @@ def cmd_update(
 
     if not manifest_path.exists():
         print(f"update: no milpa.kdl at {manifest_path}", file=sys.stderr)
+        _emit_error_slug("MAN-NO-MANIFEST")
         return 1
 
     try:
         manifest = load_or_discover_manifest(project_dir)
     except ManifestError as e:
         print(f"update: cannot load manifest: {e}", file=sys.stderr)
+        _emit_error_slug(e.code)
         return 1
 
     prior_lockfile = None
@@ -689,11 +720,13 @@ def cmd_update(
                 f"run `milpa fetch` first",
                 file=sys.stderr,
             )
+            _emit_error_slug("LOCK-FILE-NOT-FOUND")
             return 1
         try:
             full_lockfile = load_lockfile(lockfile_path)
         except Exception as e:
             print(f"update: cannot load lockfile: {e}", file=sys.stderr)
+            _emit_error_slug(getattr(e, "code", None))
             return 1
         if not any(d.name == name for d in full_lockfile.deps):
             names = ", ".join(sorted(d.name for d in full_lockfile.deps))
@@ -702,6 +735,7 @@ def cmd_update(
                 f"(known: {names or '<none>'})",
                 file=sys.stderr,
             )
+            _emit_error_slug("LOCK-DEP-NOT-FOUND")
             return 1
         prior_lockfile = replace(
             full_lockfile,
@@ -714,6 +748,7 @@ def cmd_update(
         index = index_loader(cache_dir=default_index_cache_dir())
     except Exception as e:
         print(f"update: failed to load index: {e}", file=sys.stderr)
+        _emit_error_slug(getattr(e, "code", None))
         return 1
 
     try:
@@ -729,6 +764,7 @@ def cmd_update(
         )
     except Exception as e:
         print(f"update: resolution failed: {e}", file=sys.stderr)
+        _emit_error_slug(getattr(e, "code", None))
         return 1
 
     new_lockfile = from_graph(graph, strategy=str(strategy))
@@ -766,6 +802,7 @@ def cmd_remove(
         manifest = load_or_discover_manifest(project_dir)
     except ManifestError as e:
         print(f"remove: cannot load manifest: {e}", file=sys.stderr)
+        _emit_error_slug(e.code)
         return 1
 
     if not any(d.name == name for d in manifest.deps):
@@ -775,6 +812,7 @@ def cmd_remove(
             f"(known: {names or '<none>'})",
             file=sys.stderr,
         )
+        _emit_error_slug("MAN-REMOVE-DEP-ABSENT")
         return 1
 
     proposed = replace(
@@ -792,6 +830,7 @@ def cmd_remove(
         )
     except Exception as e:
         print(f"remove: resolution failed: {e}", file=sys.stderr)
+        _emit_error_slug(getattr(e, "code", None))
         return 1
 
     print(f"removed {name}", file=sys.stderr)
@@ -831,6 +870,7 @@ def cmd_add_mirror(
             f"run `milpa fetch` first",
             file=sys.stderr,
         )
+        _emit_error_slug("LOCK-FILE-NOT-FOUND")
         return 1
     if not manifest_path.exists():
         print(
@@ -843,6 +883,7 @@ def cmd_add_mirror(
         lockfile = load_lockfile(lockfile_path)
     except Exception as e:
         print(f"add --mirror: cannot load lockfile: {e}", file=sys.stderr)
+        _emit_error_slug(getattr(e, "code", None))
         return 1
 
     locked = next((d for d in lockfile.deps if d.name == dep_name), None)
@@ -853,6 +894,7 @@ def cmd_add_mirror(
             f"(known: {names or '<none>'})",
             file=sys.stderr,
         )
+        _emit_error_slug("LOCK-DEP-NOT-FOUND")
         return 1
 
     if any(isinstance(p, (LocalProvenanceRecord, MemberProvenanceRecord))
@@ -862,12 +904,14 @@ def cmd_add_mirror(
             f"provenance — cannot add a mirror to an editable source",
             file=sys.stderr,
         )
+        _emit_error_slug("MAN-MIRROR-EDITABLE-PROVENANCE")
         return 1
 
     try:
         manifest = load_or_discover_manifest(project_dir)
     except ManifestError as e:
         print(f"add --mirror: cannot load manifest: {e}", file=sys.stderr)
+        _emit_error_slug(e.code)
         return 1
 
     # Build the proposed manifest (append mirror to the target UrlDep).
@@ -938,6 +982,7 @@ def cmd_add_mirror(
         )
     except Exception as e:
         print(str(e), file=sys.stderr)
+        _emit_error_slug(getattr(e, "code", None))
         return 1
 
     print(
@@ -1105,6 +1150,7 @@ def _resolve_or_error(
         manifest = load_or_discover_manifest(project_dir)
     except ManifestError as e:
         print(f"error reading manifest: {e}", file=sys.stderr)
+        _emit_error_slug(e.code)
         return 1
     deps_dir = project_dir / "_deps"
     deps_dir.mkdir(parents=True, exist_ok=True)
@@ -1112,6 +1158,7 @@ def _resolve_or_error(
         index = index_loader(cache_dir=default_index_cache_dir())
     except Exception as e:
         print(f"failed to load index: {e}", file=sys.stderr)
+        _emit_error_slug(getattr(e, "code", None))
         return 1
     prior_lockfile = _maybe_load_prior_lockfile(project_dir / "milpa.lock")
     profile = Profile.from_environment()
@@ -1133,9 +1180,11 @@ def _resolve_or_error(
         print("resolution failed:", file=sys.stderr)
         for line in rendered.splitlines():
             print(f"  {line}", file=sys.stderr)
+        _emit_error_slug(e.code)
         return 1
     except Exception as e:
         print(f"resolution failed: {e}", file=sys.stderr)
+        _emit_error_slug(getattr(e, "code", None))
         return 1
 
 
@@ -1144,22 +1193,59 @@ def _resolve_or_error(
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point.
+
+    Argument-parse failures raise `SystemExit(2)` from argparse and
+    propagate as a usage/crash-class verdict (no `milpa-error:` line, per
+    cli-contract.md §3.1 R4). Any exception that escapes a verb's own
+    typed handlers is caught here and rendered with its slug — falling to
+    the `MILPA-INTERNAL` sentinel when the exception carries no `.code` —
+    so no exit-1 path is ever silent (R3)."""
     parser = make_parser()
     args = parser.parse_args(argv)
     if args.command is None:
         parser.print_help()
         return 0
+    try:
+        return _dispatch(args)
+    except Exception as e:  # noqa: BLE001 — last-resort net; SystemExit propagates
+        print(f"internal error: {e}", file=sys.stderr)
+        _emit_error_slug(getattr(e, "code", None))
+        return 1
+
+
+def _mocked_fetcher_registry() -> FetcherRegistry | None:
+    """Return a FetcherRegistry backed by MockedFetcher when
+    MILPA_MOCKED_FETCHES is set and non-empty; else return None.
+
+    The store uses the normal per-run CAS (honouring MILPA_CACHE_DIR) so
+    that content-addressed admit/link logic works identically to the real
+    transport. The mocked transport takes full precedence when the env var
+    is present — no real network is ever contacted.
+    """
+    mocked_dir = os.environ.get("MILPA_MOCKED_FETCHES", "").strip()
+    if not mocked_dir:
+        return None
+    store = default_store()
+    reg = FetcherRegistry(store=store)
+    reg.register(MockedFetcher(mocked_fetches_dir=Path(mocked_dir)))
+    return reg
+
+
+def _dispatch(args: argparse.Namespace) -> int:
     project_dir = Path(args.directory).resolve()
     strategy = Strategy(args.strategy)
+    fetcher = _mocked_fetcher_registry() or default_registry
     match args.command:
         case "fetch":
             return cmd_fetch(
-                project_dir, max_parallel=args.parallel, strategy=strategy,
-                frozen=args.frozen,
+                project_dir, fetcher=fetcher, max_parallel=args.parallel,
+                strategy=strategy, frozen=args.frozen,
             )
         case "lock":
             return cmd_lock(
-                project_dir, max_parallel=args.parallel, strategy=strategy,
+                project_dir, fetcher=fetcher, max_parallel=args.parallel,
+                strategy=strategy,
             )
         case "show":   return cmd_show(project_dir)
         case "verify": return cmd_verify(project_dir)
@@ -1193,7 +1279,7 @@ def main(argv: list[str] | None = None) -> int:
                 "(extra provenance for existing dep)",
                 file=sys.stderr,
             )
-            return 1
+            return 2
         case "publish":
             return cmd_publish(
                 project_dir,

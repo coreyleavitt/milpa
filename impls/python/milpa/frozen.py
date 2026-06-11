@@ -181,7 +181,14 @@ def _check_manifest_alignment(
                     f"is not a parseable X.Y.Z version",
                     code="FROZEN-LOCKED-VERSION-UNPARSEABLE",
                 )
-            vset = VersionSet.from_constraint(mdep.constraint)
+            # constraint_set is guaranteed populated by NamedDep.__post_init__
+            # when constraint is set; None only when constraint is None (any
+            # version → full set).
+            vset = (
+                mdep.constraint_set
+                if mdep.constraint_set is not None
+                else VersionSet.full()
+            )
             if not vset.contains(locked_version):
                 raise NotFrozen(
                     f"{context_prefix}dep {mdep.name!r}: locked "

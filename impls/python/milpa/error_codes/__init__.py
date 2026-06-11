@@ -13,3 +13,5 @@ from . import frozen_codes     # noqa: F401
 from . import workspace_codes  # noqa: F401
 from . import extract_codes    # noqa: F401
 from . import tianguis_codes   # noqa: F401
+from . import internal_codes   # noqa: F401
+from . import verify_codes     # noqa: F401

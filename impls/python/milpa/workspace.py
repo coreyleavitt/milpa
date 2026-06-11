@@ -41,6 +41,7 @@ from .manifest import (
     ManifestError,
     Override,
     WorkspaceManifest,
+    kdl_has_workspace_block,
     parse_workspace_or_manifest,
 )
 
@@ -103,14 +104,16 @@ def find_workspace_root(start_dir: Path) -> Path | None:
     while True:
         candidate = current / "milpa.kdl"
         if candidate.exists():
-            try:
-                parsed = parse_workspace_or_manifest(candidate.read_text())
-            except ManifestError:
-                # Unparseable manifest along the walk-up isn't a
-                # workspace by definition; keep going.
-                parsed = None
-            if isinstance(parsed, WorkspaceManifest):
-                return current
+            text = candidate.read_text()
+            if kdl_has_workspace_block(text):
+                # The file is workspace-shaped. Parse it fully — any
+                # ManifestError here is a real schema violation in a
+                # workspace manifest and MUST propagate (not be swallowed).
+                parsed = parse_workspace_or_manifest(text)
+                if isinstance(parsed, WorkspaceManifest):
+                    return current
+            # Not workspace-shaped (no workspace block, or KDL syntax error)
+            # — treat as absent for discovery purposes and keep walking.
         parent = current.parent
         if parent == current:
             return None

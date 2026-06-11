@@ -14,12 +14,14 @@ Public surface, by intended use:
 kdl-py is an internal detail; callers see only the typed values.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 from urllib.parse import ParseResult, urlparse
 
 import kdl
+
+from .solver import VersionSet
 
 
 Kind = Literal["library", "application"]
@@ -126,12 +128,48 @@ class NamedDep:
     """A dep declared by name (resolved via the registry).
 
     Appears in manifests promoted from .nimble files that have
-    `requires "results"` or `requires "stew >= 0.5.0"` style lines.
-    milpa.kdl-authored manifests use only UrlDep today; named deps
-    would be added if/when KDL-level named-dep syntax is introduced.
+    `requires "results"` or `requires "stew >= 0.5.0"` style lines,
+    and in milpa.kdl-authored manifests.
+
+    Two fields capture the constraint:
+      constraint     — the raw string from the manifest (preserved for
+                       faithful round-trip formatting; None if absent)
+      constraint_set — the pre-parsed VersionSet (None when constraint
+                       is None). Parsed at construction time by
+                       __post_init__ — every NamedDep with a constraint
+                       carries a valid parsed set, making the illegal
+                       state (constraint set, constraint_set None)
+                       unrepresentable.
     """
     name: str
-    constraint: str | None   # e.g. ">= 0.5.0" or None for any version
+    constraint: str | None       # e.g. ">= 0.5.0" or None for any version
+    constraint_set: VersionSet | None = field(default=None, compare=False, hash=False)
+
+    def __post_init__(self) -> None:
+        """Guarantee: if constraint is set, constraint_set is populated.
+
+        Parses constraint_set from constraint when it is not supplied.
+        Raises ManifestError(code="MAN-DEP-NAMED-CONSTRAINT") on a
+        malformed constraint string — whether the NamedDep is built by
+        the manifest parser or constructed directly in code or tests.
+
+        The manifest parser (_parse_named_dep) catches that error and
+        re-raises enriched with the KDL node's line/col.
+
+        Uses object.__setattr__ because the dataclass is frozen.
+        ManifestError is defined later in this module; Python resolves
+        it at call time (not at class-definition time), so this works.
+        """
+        if self.constraint is not None and self.constraint_set is None:
+            try:
+                parsed = VersionSet.from_constraint(self.constraint)
+            except ValueError as exc:
+                raise ManifestError(  # noqa: F821 — defined later in this module
+                    f"dep {self.name!r}: invalid version constraint "
+                    f"{self.constraint!r}: {exc}",
+                    code="MAN-DEP-NAMED-CONSTRAINT",
+                ) from exc
+            object.__setattr__(self, "constraint_set", parsed)
 
 
 Dep = UrlDep | NamedDep | LocalDep | TarballDep | MemberDep
@@ -235,6 +273,22 @@ _PREDICATE_PROPS = frozenset({"platform", "arch", "nim", "milpa", "flag"})
 _URL_DEP_PROPS = frozenset({"git", "ref"}) | _PREDICATE_PROPS
 _VALID_KINDS: tuple[Kind, ...] = ("library", "application")
 _VALID_GIT_SCHEMES = frozenset({"https", "http", "ssh", "git"})
+
+
+def kdl_has_workspace_block(text: str) -> bool:
+    """Return True iff `text` is valid KDL that contains a `workspace` node.
+
+    Silently returns False on any KDL parse error (caller treats the file
+    as not-a-workspace and keeps walking). This is intentionally a
+    lightweight probe used only by discovery (find_workspace_root) to
+    decide whether a ManifestError from full parsing should propagate or
+    be swallowed as "not a workspace here".
+    """
+    try:
+        doc = kdl.parse(text)
+    except kdl.errors.ParseError:
+        return False
+    return any(node.name == "workspace" for node in doc.nodes)
 
 
 def parse_workspace_or_manifest(
@@ -1122,6 +1176,9 @@ def _parse_named_dep(node: kdl.Node) -> NamedDep:
                 f"dep {name!r}: version constraint must be a quoted string",
                 code="MAN-DEP-NAMED-CONSTRAINT",
             )
+        # __post_init__ parses the constraint and raises ManifestError on
+        # malformed input; no duplicate parse here. Construction is the single
+        # source of truth for validation.
         return NamedDep(name=name, constraint=constraint)
     raise ManifestError(
         f"dep {name!r}: named deps take at most one positional argument "
@@ -1336,7 +1393,19 @@ def manifest_from_nimble(nm, *, name: str) -> "Manifest":  # nm: NimbleManifest
         elif isinstance(req, NamedRequirement):
             if req.name == "nim":
                 continue
-            deps.append(NamedDep(name=req.name, constraint=req.constraint))
+            # Pre-parse to carry a typed VersionSet. A bad constraint from
+            # a .nimble file raises ValueError here, which propagates up to
+            # manifest_from_nimble's callers; in practice the resolver's
+            # _build_terms_for_nimble_dep catches it as MAN-NIMBLE-CONSTRAINT
+            # (resolver.py ~1980 handles NamedRequirement directly, not
+            # NamedDep). The NamedDep objects produced here go through the
+            # standard resolver paths (sites 519/1216/1702) which expect a
+            # pre-parsed constraint_set.
+            _cs: VersionSet | None = (
+                VersionSet.from_constraint(req.constraint)
+                if req.constraint else None
+            )
+            deps.append(NamedDep(name=req.name, constraint=req.constraint, constraint_set=_cs))
     return Manifest(deps=tuple(deps), kind="library", name=name)
 
 

@@ -116,6 +116,22 @@ PROV_FIELD_MISSING = register(
 
 GRAPH_MISMATCH = register(
     slug="LOCK-GRAPH-MISMATCH", category=_CAT,
-    description="The resolved graph does not match the lockfile.",
-    when="verify_against_graph finds missing, extra, or identity-mismatched deps.",
+    description=(
+        "The deps do not match the lockfile — either the resolved graph or "
+        "the on-disk _deps/ tree diverges from what milpa.lock records."
+    ),
+    when=(
+        "verify_against_graph finds missing, extra, or identity-mismatched "
+        "deps; or `milpa verify` finds the on-disk _deps/ content hashes / "
+        "membership diverge from the lockfile."
+    ),
+)
+
+DEP_NOT_FOUND = register(
+    slug="LOCK-DEP-NOT-FOUND", category=_CAT,
+    description="A named dep is absent from the lockfile.",
+    when=(
+        "`milpa update <dep>` or `milpa add --mirror <dep>` is asked to act "
+        "on a dep that has no entry in milpa.lock."
+    ),
 )

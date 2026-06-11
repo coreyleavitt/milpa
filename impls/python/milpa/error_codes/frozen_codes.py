@@ -118,3 +118,27 @@ LEGACY_REGISTRY_PROVENANCE = register(
         "the user must run `milpa update <name>` to re-resolve via tianguis."
     ),
 )
+
+NO_LOCKFILE = register(
+    slug="FROZEN-NO-LOCKFILE", category=_CAT,
+    description=(
+        "The frozen fast path requires a lockfile, but none is present."
+    ),
+    when=(
+        "_try_frozen / _try_workspace_frozen find no milpa.lock at the "
+        "project (or workspace) root; with --frozen this is exit 1 rather "
+        "than a silent fall-through to full resolution."
+    ),
+)
+
+NO_CAS = register(
+    slug="FROZEN-NO-CAS", category=_CAT,
+    description=(
+        "The frozen fast path requires a content-addressed store, but the "
+        "fetcher has none attached."
+    ),
+    when=(
+        "_try_frozen / _try_workspace_frozen find fetcher.store is None; the "
+        "frozen path cannot link _deps/ from a CAS that does not exist."
+    ),
+)

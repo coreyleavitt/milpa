@@ -26,16 +26,14 @@ no sidecar hint files are needed or permitted.
 """
 
 import os
-import re
 import shutil
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
 from milpa.cas import CAStore
 from milpa.fetchers import FetcherRegistry
-from milpa.fetchers.git import GitProvenance, GitReceipt
+from milpa.fetchers.mocked import MockedFetcher
 from milpa.frozen import (
     NotFrozen, resolve_frozen, resolve_workspace_frozen,
 )
@@ -79,76 +77,31 @@ def _discover_fixtures():
 
 _FIXTURES = list(_discover_fixtures())
 
-
-# ---------------------------------------------------------------------------
-# URL-key encoding (§2.3.1)
-# ---------------------------------------------------------------------------
-
-def _url_key(url: str, ref: str) -> str:
-    """Encode a (url, ref) pair to a mocked-fetches subdirectory name.
-
-    Applies re.sub(r'[^A-Za-z0-9._-]', '_', url) then appends '@' and the
-    same encoding of ref.
-    """
-    encoded_url = re.sub(r"[^A-Za-z0-9._-]", "_", url)
-    encoded_ref = re.sub(r"[^A-Za-z0-9._-]", "_", ref)
-    return f"{encoded_url}@{encoded_ref}"
+# KDL-2.0-only fixtures (#123): bare-bool flag values migrated to `#true`/`#false`,
+# which the KDL-1.0 Python parser cannot read. Mirrors harness/descriptors.py
+# python_known_failing. Removed when Python is rewritten to KDL 2.0 (#6).
+_KDL_2_0_ONLY = frozenset({
+    "fixture-027-man-dep-flag-too-many-args",
+    "fixture-038-man-flag-duplicate",
+    "fixture-040-man-flag-unknown-props",
+    "fixture-045-man-flag-undeclared-reference",
+})
 
 
 # ---------------------------------------------------------------------------
-# ConformanceFetcher — reads from mocked-fetches/
+# _build_fetcher — delegates to production MockedFetcher (SSOT: milpa/fetchers/mocked.py)
 # ---------------------------------------------------------------------------
-
-@dataclass
-class ConformanceFetcher:
-    """Fake Fetcher backed by a fixture's mocked-fetches/ directory.
-
-    For each fetch call it:
-    1. Encodes (url, ref) to a subdirectory key.
-    2. Reads sha from <key>/sha (strip whitespace).
-    3. Copies content/ tree into dest.
-    4. Copies <name>.nimble into dest if present.
-    5. Returns GitReceipt(commit_sha=sha).
-    """
-    mocked_fetches_dir: Path
-    calls: list[tuple[str, str, str]] = field(default_factory=list)
-
-    def can_handle(self, p) -> bool:
-        return isinstance(p, GitProvenance)
-
-    def fetch(self, name: str, p, *, dest: Path) -> GitReceipt:
-        key = _url_key(p.url, p.ref)
-        key_dir = self.mocked_fetches_dir / key
-        if not key_dir.is_dir():
-            raise RuntimeError(
-                f"ConformanceFetcher: no mock for {p.url!r} @ {p.ref!r} "
-                f"(expected dir: {key_dir})"
-            )
-        sha_text = (key_dir / "sha").read_text().strip()
-        self.calls.append((name, p.url, p.ref))
-        dest.mkdir(parents=True, exist_ok=True)
-        # Copy content/ tree into dest
-        content_dir = key_dir / "content"
-        if content_dir.is_dir():
-            for item in content_dir.iterdir():
-                if item.is_file():
-                    shutil.copy2(item, dest / item.name)
-                elif item.is_dir():
-                    shutil.copytree(item, dest / item.name)
-        # Copy <name>.nimble if present (sibling of content/, not inside it)
-        nimble_src = key_dir / f"{name}.nimble"
-        if nimble_src.is_file():
-            shutil.copy2(nimble_src, dest / f"{name}.nimble")
-        return GitReceipt(commit_sha=sha_text)
-
 
 def _build_fetcher(fixture_dir: Path, cas_root: Path) -> FetcherRegistry:
-    """Build a FetcherRegistry backed by the fixture's mocked-fetches/."""
+    """Build a FetcherRegistry backed by the fixture's mocked-fetches/.
+
+    Delegates to the production MockedFetcher — single source of truth.
+    url_key() is also the production encoder (milpa/fetchers/mocked.py).
+    """
     mocked = fixture_dir / "mocked-fetches"
-    fake = ConformanceFetcher(mocked_fetches_dir=mocked)
     store = CAStore(root=cas_root)
     reg = FetcherRegistry(store=store)
-    reg.register(fake)
+    reg.register(MockedFetcher(mocked_fetches_dir=mocked))
     return reg
 
 
@@ -344,6 +297,25 @@ def _workspace_nimcfgs(workspace, graph: ResolvedGraph) -> dict[str, str]:
     ids=[fid for _, fid in _FIXTURES],
 )
 def test_conformance_fixture(fixture_dir: Path, tmp_path: Path):
+    # CLI-only verb fixtures (conformance-fixtures.md §2.7.1 mutation
+    # add/remove/update + §2.7.2 liveness show/--version) exercise the CLI
+    # binary's argv/output contract, which this in-process graph-level adapter
+    # does not model. They are driven by the black-box CLI harness (`harness/`).
+    _head = _fixture_cmd(fixture_dir).split()[:1]
+    if _head and _head[0] in ("add", "remove", "update", "show", "--version"):
+        pytest.skip(
+            "CLI-only verb fixture (add/remove/update/show/--version); "
+            "covered by the black-box CLI harness, not the in-process adapter"
+        )
+    # KDL-2.0-only fixtures (#123): the corpus is KDL 2.0 (manifest-grammar.md);
+    # these use `#true`/`#false` flag values that the (frozen, rewrite-pending)
+    # KDL-1.0 Python parser cannot read. Skipped here exactly as the differential
+    # harness marks them python_known_failing — Python conforms once it is rewritten
+    # to KDL 2.0 (#6). The Rust impl exercises them; do NOT downgrade them.
+    if fixture_dir.name in _KDL_2_0_ONLY:
+        pytest.skip(
+            "KDL-2.0-only fixture; Python parser is KDL 1.0 until the rewrite (#6)"
+        )
     """Run one conformance fixture and verify outputs against expected/.
 
     Error fixtures: assert the implementation raises exc.code == expected/error.

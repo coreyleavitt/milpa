@@ -213,8 +213,15 @@ DEP_NAMED_PROPS = register(
 
 DEP_NAMED_CONSTRAINT = register(
     slug="MAN-DEP-NAMED-CONSTRAINT", category=_CAT,
-    description="NamedDep's version constraint must be a quoted string.",
-    when="The positional arg is not a string.",
+    description=(
+        "NamedDep's version constraint is invalid: either the positional arg "
+        "is not a string, or the string is not a syntactically valid constraint."
+    ),
+    when=(
+        "The positional arg is not a string, OR the string cannot be parsed "
+        "by VersionSet.from_constraint (e.g. '@@@bad'). Validated at manifest "
+        "parse time so the resolver always holds pre-typed VersionSets."
+    ),
 )
 
 DEP_NAMED_ARITY = register(
@@ -493,4 +500,28 @@ ADD_MIRROR_IDENTITY_MISMATCH = register(
     slug="MAN-ADD-MIRROR-IDENTITY-MISMATCH", category=_CAT,
     description="`milpa add --mirror` rejected: the URL's bytes don't hash to the locked identity.",
     when="The proposed mirror URL serves bytes that differ from what the lockfile pinned.",
+)
+
+ADD_DEP_EXISTS = register(
+    slug="MAN-ADD-DEP-EXISTS", category=_CAT,
+    description="`milpa add --git` rejected: the dep is already declared in milpa.kdl.",
+    when="cmd_add finds <dep> is already present in the manifest's deps block.",
+)
+
+REMOVE_DEP_ABSENT = register(
+    slug="MAN-REMOVE-DEP-ABSENT", category=_CAT,
+    description="`milpa remove` rejected: the dep is not declared in milpa.kdl.",
+    when="cmd_remove finds <dep> is not present in the manifest's deps block.",
+)
+
+MIRROR_EDITABLE_PROVENANCE = register(
+    slug="MAN-MIRROR-EDITABLE-PROVENANCE", category=_CAT,
+    description=(
+        "`milpa add --mirror` rejected: the dep has a local or member "
+        "provenance — editable sources cannot be mirrored."
+    ),
+    when=(
+        "cmd_add_mirror finds the locked dep's provenance is local or member; "
+        "a mirror would contradict the editable, mutable-by-design source."
+    ),
 )

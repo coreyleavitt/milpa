@@ -18,6 +18,15 @@ _CAT = "TNG"
 # Schema / index-level errors
 # ---------------------------------------------------------------------------
 
+KDL_SYNTAX = register(
+    slug="TNG-KDL-SYNTAX", category=_CAT,
+    description="The index text is not valid KDL and cannot be parsed.",
+    when=(
+        "parse_index calls kdl.parse() and it raises kdl.errors.ParseError — "
+        "the raw text supplied as the index is syntactically invalid KDL."
+    ),
+)
+
 SCHEMA_UNKNOWN = register(
     slug="TNG-SCHEMA-UNKNOWN", category=_CAT,
     description=(

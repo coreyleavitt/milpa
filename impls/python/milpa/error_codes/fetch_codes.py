@@ -139,6 +139,27 @@ OCI_AMBIGUOUS_TARBALL = register(
 # Receipt contract
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Mocked transport
+# ---------------------------------------------------------------------------
+
+MOCK_MISSING = register(
+    slug="FETCH-MOCK-MISSING", category=_CAT,
+    description=(
+        "No mocked-fetches entry for the requested url@ref under the "
+        "mocked transport."
+    ),
+    when=(
+        "MILPA_MOCKED_FETCHES is set and MockedFetcher.fetch is called with "
+        "a (url, ref) pair whose encoded key directory does not exist under "
+        "the mocked-fetches/ root."
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# Receipt contract
+# ---------------------------------------------------------------------------
+
 RECEIPT_EMPTY = register(
     slug="FETCH-RECEIPT-EMPTY", category=_CAT,
     description=(

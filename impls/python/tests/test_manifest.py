@@ -783,6 +783,70 @@ deps {
     assert "one positional" in str(exc.value).lower() or "constraint" in str(exc.value).lower()
 
 
+def test_named_dep_with_malformed_constraint_raises_at_parse_time():
+    """A syntactically invalid constraint string must be rejected at
+    manifest parse time with MAN-DEP-NAMED-CONSTRAINT, NOT deferred to
+    resolve time (where it would surface as MILPA-INTERNAL)."""
+    text = '''
+name "test"
+deps {
+    z "@@@bad"
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    assert exc.value.code == "MAN-DEP-NAMED-CONSTRAINT"
+    assert "z" in str(exc.value)
+
+
+def test_named_dep_nonstring_constraint_still_raises_man_dep_named_constraint():
+    """The existing non-string-arg case (integer) still maps to
+    MAN-DEP-NAMED-CONSTRAINT — broadened code, not a new code."""
+    text = '''
+name "test"
+deps {
+    foo 42
+}
+'''
+    with pytest.raises(ManifestError) as exc:
+        parse_manifest(text)
+    assert exc.value.code == "MAN-DEP-NAMED-CONSTRAINT"
+
+
+def test_named_dep_valid_constraint_parses_to_constraint_set():
+    """A valid constraint string stores a parsed VersionSet on the dep
+    so the resolver can consume it without re-parsing."""
+    from milpa.manifest import NamedDep
+    from milpa.solver import VersionSet
+    text = '''
+name "test"
+deps {
+    stew ">= 0.5.0"
+}
+'''
+    m = parse_manifest(text)
+    dep = m.deps[0]
+    assert isinstance(dep, NamedDep)
+    assert dep.constraint == ">= 0.5.0"           # raw string preserved
+    assert isinstance(dep.constraint_set, VersionSet)  # pre-parsed set present
+
+
+def test_named_dep_no_constraint_has_none_constraint_set():
+    """A bare-name dep (no constraint) has constraint_set=None."""
+    from milpa.manifest import NamedDep
+    text = '''
+name "test"
+deps {
+    results
+}
+'''
+    m = parse_manifest(text)
+    dep = m.deps[0]
+    assert isinstance(dep, NamedDep)
+    assert dep.constraint is None
+    assert dep.constraint_set is None
+
+
 def test_format_manifest_round_trips_overrides():
     """A Manifest with an overrides tuple round-trips through
     format_manifest → parse_manifest."""

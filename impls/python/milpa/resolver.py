@@ -516,7 +516,9 @@ def resolve(
                 queue.append(("named", dep.name, dep.constraint))
         else:  # NamedDep (no override applies)
             root_terms.append(Term.require(
-                dep.name, VersionSet.from_constraint(dep.constraint)
+                dep.name,
+                dep.constraint_set if dep.constraint_set is not None
+                else VersionSet.full(),
             ))
             root_requires.append(dep.name)
             queue.append(("named", dep.name, dep.constraint))
@@ -1213,7 +1215,9 @@ def _terms_from_member_manifest(
                     queue.append(("named", dep.name, dep.constraint))
             else:
                 terms.append(Term.require(
-                    dep.name, VersionSet.from_constraint(dep.constraint),
+                    dep.name,
+                    dep.constraint_set if dep.constraint_set is not None
+                    else VersionSet.full(),
                 ))
                 names.append(dep.name)
                 queue.append(("named", dep.name, dep.constraint))
@@ -1698,10 +1702,7 @@ def _extract_from_milpa_kdl(
         elif isinstance(d, NamedDep):
             if d.name == "nim":
                 continue
-            constraint_set = (
-                VersionSet.from_constraint(d.constraint)
-                if d.constraint else VersionSet.full()
-            )
+            constraint_set = d.constraint_set if d.constraint_set is not None else VersionSet.full()
             sub_terms.append(
                 Term.require(d.name, constraint_set)
             )

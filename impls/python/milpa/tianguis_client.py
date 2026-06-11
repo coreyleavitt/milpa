@@ -377,7 +377,13 @@ def parse_index(text: str) -> Index:
     `Index.lookup_bare(name)` for a bare lookup that returns `AmbiguousName`
     on a collision rather than silently picking one.
     """
-    doc = kdl.parse(text)
+    try:
+        doc = kdl.parse(text)
+    except kdl.errors.ParseError as e:
+        raise TianguisError(
+            code="TNG-KDL-SYNTAX",
+            message=f"KDL syntax error in index: {e}",
+        ) from e
     _check_schema_version(doc)
     packages: dict[tuple[str, str], Package] = {}
     for node in doc.nodes:

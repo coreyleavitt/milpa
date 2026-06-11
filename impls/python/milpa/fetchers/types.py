@@ -282,6 +282,10 @@ class FetcherRegistry:
                 clear_dest(dest)
                 continue
             return result
+        # Per resolver-semantics §8a: the candidate list always includes the
+        # primary, so any total fetch failure — single-candidate or not — is
+        # FETCH-ALL-FAILED. The inner cause (e.g. FETCH-MOCK-MISSING) is folded
+        # into the human message below; the machine slug stays FETCH-ALL-FAILED.
         raise FetchError(
             f"fetch_any({name!r}): all {len(candidates)} candidates failed:\n  "
             + "\n  ".join(failures),
