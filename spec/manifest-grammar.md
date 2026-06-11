@@ -19,7 +19,7 @@ model** only. Related specs:
 
 A conformant implementation of this spec MUST:
 
-1. Parse `milpa.kdl` files as valid KDL 1.0, rejecting all other input.
+1. Parse `milpa.kdl` files as valid KDL 2.0, rejecting all other input.
 2. Distinguish the two disjoint document roles — **package** and **workspace** —
    by detecting a top-level `workspace { }` node.
 3. Accept the top-level nodes of a package manifest (`name`, `kind`, `deps`,
@@ -55,7 +55,7 @@ A conformant implementation of this spec MUST:
     MUST NOT enter the graph. Cross-reference resolver-semantics.md §9.
 15. Honor `MILPA_TARGET_MILPA` as an override for the `milpa` predicate field
     (§6.6); default to the implementation's own version (`milpa.__version__`).
-16. When serializing the manifest (§8): emit valid KDL 1.0; warn to stderr
+16. When serializing the manifest (§8): emit valid KDL 2.0; warn to stderr
     when comments are dropped; preserve dep-entry insertion order; emit
     `(url)` annotations on all URL fields.
 
@@ -63,9 +63,10 @@ A conformant implementation of this spec MUST:
 
 ## 1  Document format and file name
 
-> NORMATIVE: A milpa manifest MUST be a valid [KDL 1.0](https://kdl.dev)
-> document. A parser MUST reject documents that do not conform to KDL 1.0
-> syntax and raise `MAN-KDL-SYNTAX`.
+> NORMATIVE: A milpa manifest MUST be a valid [KDL 2.0](https://kdl.dev)
+> document. A parser MUST reject documents that do not conform to KDL 2.0
+> syntax and raise `MAN-KDL-SYNTAX`. Boolean values are written `#true`/`#false`;
+> bare `true`/`false` are reserved identifiers and are rejected as syntax errors.
 
 > NORMATIVE: The canonical manifest file name is `milpa.kdl`. Discovery order
 > when no explicit path is given: (1) `<project_dir>/milpa.kdl`; (2)
@@ -88,7 +89,7 @@ A conformant implementation of this spec MUST:
 
 ## 2  The `(url)` type-annotation convention
 
-KDL 1.0 supports optional type annotations on values: `(tag)"value"`. milpa
+KDL 2.0 supports optional type annotations on values: `(tag)"value"`. milpa
 uses the `(url)` annotation to mark URL strings.
 
 > NORMATIVE: A parser MUST accept both forms for any URL-typed field:
@@ -747,10 +748,10 @@ The profile fields are normalized to Nim's `hostOS` / `hostCPU` vocabulary.
 ## 8  Manifest serialization
 
 When milpa rewrites `milpa.kdl` (via `add`, `remove`, `update`, or any other
-verb that mutates the manifest), it produces a serialized KDL 1.0 document.
+verb that mutates the manifest), it produces a serialized KDL 2.0 document.
 This section specifies the normative constraints on that output.
 
-> NORMATIVE: A serializer MUST produce a valid KDL 1.0 document. The output
+> NORMATIVE: A serializer MUST produce a valid KDL 2.0 document. The output
 > MUST parse back to the same logical `Manifest` value as the input (semantic
 > round-trip), but it is NOT required to be byte-identical to the original
 > source (this output is **not byte-normative**, unlike the lockfile).

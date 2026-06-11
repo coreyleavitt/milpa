@@ -33,8 +33,9 @@ A conformant implementation of this spec MUST:
 6. Route all human-readable diagnostic output to **stderr**; route all
    machine-readable output (currently only `milpa show`'s dep tree) to
    **stdout**.
-7. Exit 0 on success; exit 1 on any failure. No other exit codes are
-   defined for spec v1.0.
+7. Exit 0 on success; exit 1 on any diagnosed failure; exit 2 on an
+   argument-parse / usage error (§3). On any exit-1 failure, emit exactly
+   one terminal `milpa-error: <SLUG>` line to stderr (§3, R1–R4).
 8. Honour `MILPA_TARGET_PLATFORM`, `MILPA_TARGET_ARCH`, `MILPA_TARGET_NIM`,
    and `MILPA_TARGET_MILPA` as overrides for conditional-dep predicate
    evaluation; these affect the resolved graph and are normative.
@@ -47,6 +48,8 @@ A conformant implementation of this spec MUST:
     membership check; orphan warning).
 12. Honour `MILPA_INDEX_URL` as an override for the tianguis index URL
     (§8.1); required for air-gapped and mirror deployments.
+13. Honour `MILPA_MOCKED_FETCHES` as the deterministic conformance fetch
+    transport (§8.4); required for black-box corpus conformance.
 
 ---
 
@@ -139,22 +142,74 @@ uses them. Verbs that have no use for a flag silently ignore it.
 ## 3  Exit-code taxonomy
 
 > NORMATIVE: An implementation MUST exit with code `0` on success and
-> code `1` on any failure. No other exit codes are defined for spec v1.0.
+> code `1` on any **diagnosed failure** (a condition with an `errors.md`
+> slug). Code `2` is reserved for **argument-parse / usage errors** (an
+> invalid flag value, a missing required positional, an unrecognized
+> flag). No other exit codes are defined for spec v1.0.
 
 > NORMATIVE: Failure MUST produce at least one diagnostic line on stderr
-> before exiting 1. An implementation MUST NOT exit 1 silently.
+> before exiting. An implementation MUST NOT exit non-zero silently.
 
-> NOTE: The reference Python implementation returns the exit code from
-> each `cmd_*` function and passes it to `sys.exit` via the entry point
-> (`__main__.py` or the `milpa` console-script wrapper). The return value
-> is always `0` or `1`; no other codes are produced.
-
-There is no distinction between error categories at the exit-code level
-(e.g., solver conflict vs network failure both exit 1). Error
-**identity** is carried by the slug printed to stderr (e.g.,
+There is no distinction between *diagnosed-error categories* at the
+exit-code level (e.g., solver conflict vs network failure both exit 1).
+Error **identity** is carried by a slug printed to stderr (e.g.,
 `SOLVE-CONFLICT`, `FROZEN-IDENTITY-NOT-IN-STORE`) as specified in
-`spec/errors.md`. Tooling that needs to distinguish failure kinds
-MUST parse the slug, not the exit code.
+`spec/errors.md`. Tooling that needs to distinguish failure kinds MUST
+parse the slug, not the exit code.
+
+### 3.1  The machine-readable error channel (`milpa-error:` line)
+
+The slug above is carried by a dedicated, machine-parseable line so that
+a language-neutral conformance runner can extract it without substring-
+grepping free-form human prose (which may mention multiple slug-like
+tokens and differs per impl by design).
+
+> NORMATIVE (R1 — slug grammar): On a diagnosed failure (exit 1) stderr
+> MUST contain a line of the exact form `milpa-error: <SLUG>`, where
+> `<SLUG>` matches `^[A-Z][A-Z0-9]*(-[A-Z0-9]+)+$` (at least one hyphen
+> segment) and is a code defined in `spec/errors.md`.
+
+> NORMATIVE (R2 — exactly one, position-independent): On an exit-1
+> failure there MUST be exactly one full-line match of
+> `^milpa-error: <SLUG>$` anywhere in stderr, and **no other emitted line
+> may begin with `milpa-error:`**. A conformance runner scans all stderr
+> lines for the unique match and validates it against the catalog; it
+> MUST NOT rely on line position (a stack trace, a finalizer, or
+> container startup noise emitted after the slug line does not corrupt
+> extraction). Zero matches is a crash verdict (R4); two or more is a
+> protocol-violation reported as a harness-level failure. Impls SHOULD
+> emit the slug line last for human readability, but the contract does
+> not depend on it.
+
+> NORMATIVE (R3 — iff exit 1): The `milpa-error:` line appears **if and
+> only if** the process exits 1. An exit-0 run — including a `verify` run
+> that emits drift *warnings* to stderr (§5.4) — MUST NOT emit a
+> `milpa-error:` line. No non-error diagnostic line a conformant impl
+> emits may begin with `milpa-error:`.
+
+> NORMATIVE (R4 — crash is observable): Any exit with **no** terminal
+> `milpa-error:` line is a **crash/panic verdict**, distinct from a clean
+> diagnosed error. This covers exit 1 without the line (impl forgot to
+> emit it), exit 2 (argument-parse failure — a usage/crash-class verdict,
+> not an R1–R3 coded error; **no** `milpa-error:` line is expected), and
+> any exit ≠ 0, ≠ 1 (e.g., a Rust panic exiting 101, an OOM kill exiting
+> 137, signal termination). A conformance runner treats every exit ≠ 0,
+> ≠ 1 as a crash-class verdict. Rust impls MUST install a top-level panic
+> handler that emits `milpa-error: INTERNAL-PANIC` (or another catalog
+> code) before exiting 1; an unhandled `panic!()` exiting 101 is a crash
+> verdict.
+
+A human still gets a readable message; impls MAY keep or improve their
+human-facing rendering above the terminal line. A structured JSON error
+format remains a trivial later addition — emitted as lines *before* the
+terminal slug line, so it never conflicts with R2. The machine line is
+present by default; there is no flag to enable it.
+
+> NOTE: The reference Python implementation's outermost `main()` wrapper
+> catches any exception escaping the typed handlers, emits the
+> `MILPA-INTERNAL` sentinel, and exits 1 — making the R3 invariant
+> mechanically enforceable. Argument-parse failures (Python `argparse`)
+> exit 2 by default; the Rust CLI exits 2 from its parse-failure paths.
 
 ---
 
@@ -394,7 +449,8 @@ milpa add <dep> --mirror <url>
 > - On any failure, leave `milpa.kdl` and `milpa.lock` unmodified.
 
 > NORMATIVE: `add` without `--git` or `--mirror` MUST print a usage
-> error to stderr and exit 1.
+> error to stderr and exit 2 (a usage/crash-class verdict per §3.1 R4;
+> no `milpa-error:` slug line, like any argument-parse failure).
 
 **Exit codes:** 0 success, 1 failure.
 
@@ -656,6 +712,14 @@ any conformant implementation.
 > and conformance test harnesses that serve a local fixture index. Any HTTP(S)
 > URL pointing to a valid `index.kdl` document is accepted.
 
+> NORMATIVE: A `file://` URL pointing to a local `index.kdl` MUST also be
+> accepted. This is what lets a black-box conformance harness point each impl
+> at a fixture's local `index.kdl` (`MILPA_INDEX_URL=file:///abs/path/index.kdl`)
+> without standing up an HTTP server — the index analog of the
+> `MILPA_MOCKED_FETCHES` local fetch transport (§8.4). Both reference impls
+> already satisfy this (Python `urllib.request.urlopen`; Rust `curl`), which
+> handle the `file://` scheme natively.
+
 > NOTE: The default URL is defined as `DEFAULT_INDEX_URL` in
 > `milpa/tianguis_client.py`. The reference CLI passes it unconditionally to
 > `load_index`; `MILPA_INDEX_URL` support is a normative requirement for
@@ -699,6 +763,65 @@ XDG Base Directory specification. Not milpa-specific.
 
 GitHub Actions OIDC token environment variables consumed by `publish`
 (out-of-scope for conformance; see §10). Not relevant to resolution.
+
+### 8.4  Conformance fetch transport (normative)
+
+#### `MILPA_MOCKED_FETCHES`
+
+This is the env var that makes the fixture corpus **black-box runnable**: it
+lets a language-neutral harness drive any impl's CLI as a subprocess and have
+its fetches satisfied deterministically from a directory, with no network and
+no in-process fake-fetcher injection. It is the CLI-level counterpart of the
+in-process fetcher that a per-impl test adapter would otherwise inject.
+
+> NORMATIVE: When `MILPA_MOCKED_FETCHES` is set to a non-empty value, it MUST
+> be the path to a `mocked-fetches/` directory as specified in
+> `spec/conformance-fixtures.md` §2.3, and the implementation MUST satisfy
+> **every** dependency fetch exclusively from that directory — the **mocked
+> transport** — performing no network access and consulting no real transport
+> (git/tarball/OCI/local). For each fetch the implementation MUST:
+>
+> 1. encode the candidate's `(url, ref)` to a subdirectory key per
+>    conformance-fixtures.md §2.3.1;
+> 2. if `<dir>/<key>/` does not exist, fail that candidate with
+>    `FETCH-MOCK-MISSING`;
+> 3. otherwise read `<key>/sha` (the returned commit SHA), copy the
+>    `<key>/content/` tree into the fetch destination, copy `<key>/<name>.nimble`
+>    into the destination root if present, and compute the content hash over the
+>    destination per `spec/identity.md`.
+>
+> When `MILPA_MOCKED_FETCHES` is unset or empty, transport selection is
+> unaffected.
+
+> NORMATIVE: When `MILPA_MOCKED_FETCHES` is set, **ref-resolution** is also
+> answered from the mocked transport with no network. Specifically, the
+> default-branch discovery `add --git` performs when `--ref` is omitted (§5.6,
+> `git ls-remote --symref HEAD`) MUST instead locate the unique
+> `mocked-fetches/<key>/` entry whose decoded URL equals the requested URL and
+> return that entry's ref (the ref component of the §2.3.1 URL-key). The fetch
+> then proceeds against that same entry, so the entry's `sha` (read at fetch
+> time) is the single source of truth for both ref-resolution and the returned
+> commit SHA — no parallel ref→SHA mapping exists. If the entry is absent, ref
+> discovery fails exactly as a network discovery failure would (§5.6: exit 1).
+
+> NORMATIVE: The mocked transport participates in the §8a mirror-fallback
+> candidate loop like any other transport: a `FETCH-MOCK-MISSING` candidate
+> failure is folded into the candidate list, and an exhausted candidate list
+> still terminates in `FETCH-ALL-FAILED` (the `FETCH-MOCK-MISSING` cause appears
+> in the human message, not as the terminal `milpa-error:` slug). This keeps the
+> observable error contract identical to the real transports.
+
+> NORMATIVE: `MILPA_MOCKED_FETCHES` takes precedence over all real-transport
+> selection and over a manifest-level `cas { dir }` transport choice; it does
+> NOT override `MILPA_CACHE_DIR` (the mocked transport still admits fetched
+> content into the CAS root resolved per §8.2).
+
+> NOTE: In the reference implementations this is a single `MockedFetcher`
+> (`milpa/fetchers/mocked.py`; `milpa-core` `fetchers.rs`) selected by the CLI
+> when the env var is set; the per-impl in-process conformance adapters delegate
+> to the **same** implementation, so there is one source of truth for the
+> directory convention. This is a testing/conformance transport: it is inert
+> unless the env var is explicitly set.
 
 ---
 

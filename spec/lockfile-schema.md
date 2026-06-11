@@ -23,7 +23,7 @@ Related specs:
 
 A conformant implementation of this spec MUST:
 
-1. Write and read `milpa.lock` as valid KDL 1.0.
+1. Write and read `milpa.lock` as valid KDL 2.0.
 2. Emit a top-level `version` integer node whose value equals
    `LOCKFILE_SCHEMA_VERSION` (currently `1`).
 3. Raise `LOCK-VERSION-MISSING` when `version` is absent from a lockfile being
@@ -52,8 +52,8 @@ A conformant implementation of this spec MUST:
 
 ## 1  Document format and file name
 
-> NORMATIVE: `milpa.lock` MUST be a valid [KDL 1.0](https://kdl.dev) document.
-> A parser MUST reject documents that do not conform to KDL 1.0 syntax and
+> NORMATIVE: `milpa.lock` MUST be a valid [KDL 2.0](https://kdl.dev) document.
+> A parser MUST reject documents that do not conform to KDL 2.0 syntax and
 > raise `LOCK-KDL-SYNTAX`.
 
 > NORMATIVE: The canonical lockfile file name is `milpa.lock` in the project
@@ -173,10 +173,10 @@ dep "depname2" { ... }
 > - Optional fields (`ref`, `commit_sha`, `sha256`) are omitted entirely when
 >   null — no null literal, no empty string.
 >
-> **All string values are double-quoted** with no escaping beyond what KDL 1.0
+> **All string values are double-quoted** with no escaping beyond what KDL 2.0
 > requires (backslash-escaping of `\`, `"`, and control characters). No
-> single-quoted strings, no raw strings, no integer types except the top-level
-> `version` node.
+> single-quoted strings, no raw strings (`#"..."#`), no integer types except
+> the top-level `version` node.
 
 > NOTE: The reference Python `format_lockfile` performs this escaping via the
 > single `_kdl_str` helper (every emitted string value passes through it). The
@@ -687,7 +687,7 @@ All error codes in this section are defined in `spec/errors.md`.
 
 | Code | Condition |
 |---|---|
-| `LOCK-KDL-SYNTAX` | Input is not valid KDL 1.0 |
+| `LOCK-KDL-SYNTAX` | Input is not valid KDL 2.0 |
 | `LOCK-VERSION-MISSING` | Top-level `version` node absent |
 | `LOCK-VERSION-UNSUPPORTED` | `version` value is not `1` |
 | `LOCK-FIELD-ARITY` | Top-level scalar field has wrong arity |

@@ -144,6 +144,7 @@ fixture-NNN-<slug>/
         <file> ...
       <name>.nimble            # nimble file for the package (may be absent)
   expected/                    # success: outputs to byte-diff
+    milpa.kdl                  # mutation fixtures only: post-mutation manifest (see §2.4.1)
     milpa.lock                 # or: error fixture has none of these
     nim.cfg                    # single-package fixtures only (see §2.5)
     <member>/                  # workspace fixtures only: one dir per member
@@ -216,6 +217,17 @@ fixture-NNN-<slug>/
 `mocked-fetches/` contains one subdirectory per URL+ref combination that the
 fixture's resolver will attempt to fetch. Each subdirectory represents one
 mocked network round-trip.
+
+> NORMATIVE: `mocked-fetches/` is a **language-neutral CLI transport**, not a
+> per-impl in-process detail. A conformant implementation MUST consume it
+> through the `MILPA_MOCKED_FETCHES` env var (`spec/cli-contract.md` §8.4):
+> pointing that var at a fixture's `mocked-fetches/` directory makes the CLI
+> satisfy every fetch from it, with no network. This is what lets a single
+> black-box harness run the corpus against any implementation as a subprocess.
+> The "conformance adapter" phrasing below describes the reference *in-process*
+> path (a developer-loop convenience that MUST delegate to the same mocked
+> transport); the normative consumption contract is §8.4. The directory layout
+> and key encoding in this section are the shared source of truth for both.
 
 #### 2.3.1  Subdirectory key encoding
 
@@ -294,6 +306,20 @@ Each subdirectory under `mocked-fetches/<key>/` MUST contain:
 > into `dest`, so the distinction has no effect on the hash: the `.nimble` is
 > hashed exactly as if it had been placed inside `content/` at the tree root.
 
+#### 2.3.3  Mocked ref-resolution (default-branch discovery)
+
+> NORMATIVE: When `MILPA_MOCKED_FETCHES` is set, **ref-resolution** (the
+> `git ls-remote --symref HEAD` default-branch discovery that `add --git`
+> performs when no `ref=` is given — `spec/cli-contract.md` §5.6) MUST also be
+> answered from the `mocked-fetches/` tree, with no network. The implementation
+> discovers the default branch for `<url>` by locating the unique
+> `mocked-fetches/<key>/` whose decoded URL equals `<url>` and returning that
+> entry's ref (the ref component of the URL-key, §2.3.1). The fetch then proceeds
+> against that same entry. This reuses the single mock entry as the source of
+> truth for both the ref and the `sha` (§2.3.2) — there is no separate
+> ref→SHA table. If `add --git` is given `ref=` explicitly, no ref-resolution
+> occurs and the fetch is satisfied directly from `mocked-fetches/<url-key>/`.
+
 ### 2.4  `expected/milpa.lock` — expected lockfile
 
 > NORMATIVE: For a success fixture, `expected/milpa.lock` MUST be a valid
@@ -305,6 +331,15 @@ Each subdirectory under `mocked-fetches/<key>/` MUST contain:
 > by the reference implementation and checked in. If the lockfile format
 > changes in a normative way, the spec version bumps and new fixtures are
 > written. Existing `spec-v1/` fixtures are not regenerated.
+
+### 2.4.1  `expected/milpa.kdl` — expected post-mutation manifest (mutation fixtures only)
+
+> NORMATIVE: For a mutation success fixture whose verb rewrites the manifest
+> (`add`, `remove`), `expected/milpa.kdl` MUST be the exact bytes of the
+> rewritten `milpa.kdl` the verb leaves in the project directory. A conformant
+> implementation's post-run `milpa.kdl` MUST be byte-identical after the §2.6
+> normalization rules. The `update` verb MUST NOT mutate `milpa.kdl`, so an
+> `update` fixture MUST NOT contain `expected/milpa.kdl`.
 
 ### 2.5  `expected/nim.cfg` — expected compiler path config
 
@@ -366,8 +401,11 @@ the CAS-admission and symlink-creation steps defined in `spec/identity.md`
 
 ### 2.7  `cmd` — entry-point selector (optional)
 
-> NORMATIVE: If `cmd` is present, it MUST contain exactly one of the following
-> strings (no leading/trailing whitespace, no newline required):
+> NORMATIVE: If `cmd` is present, its **first whitespace-separated token** MUST
+> be one of the following selectors. The `resolve` / `parse-lockfile` / `frozen`
+> selectors take no further tokens. The mutation selectors (`add` / `remove` /
+> `update`) and the liveness selectors (`show` / `--version`) take the argv
+> tokens defined below.
 >
 > - `resolve` — parse `milpa.kdl` (and optionally `index.kdl`) and resolve the
 >   dep graph against mocked-fetches. This is the default when `cmd` is absent.
@@ -378,6 +416,46 @@ the CAS-admission and symlink-creation steps defined in `spec/identity.md`
 > - `frozen` — exercise the no-network frozen fast path: parse `milpa.kdl` and
 >   `milpa.lock`, optionally seed the CAS from `cas-seed/`, then resolve without
 >   fetching. Used for `FROZEN-*` fixtures; MAY be a success or error fixture.
+
+#### 2.7.1  Mutation selectors (`add` / `remove` / `update`)
+
+> NORMATIVE: The mutation selectors exercise the manifest/lockfile-rewriting
+> verbs (`spec/cli-contract.md` §5.6–5.8). The `cmd` line mirrors the real CLI
+> verb argv in a transport-neutral surface form; a runner maps each form to the
+> implementation's actual verb flags (e.g. `git=<url>` → `--git <url>`). The
+> recognized forms are:
+>
+> - `add <name> git=<url> ref=<ref>` — add a new git dep `<name>` with the given
+>   URL and ref. The runner MUST supply `ref=<ref>` explicitly so the fixture is
+>   deterministic (no default-branch discovery is required). When `ref=` is
+>   omitted, the implementation discovers the default branch via the mocked
+>   ref-resolution transport (§2.3.3) — never the network.
+> - `remove <name>` — drop top-level dep `<name>` from `milpa.kdl` and
+>   re-resolve. No fetch occurs for the removed dep; a `remove` fixture whose
+>   resulting graph is empty needs no `index.kdl` or `mocked-fetches/`.
+> - `update` / `update <name>` — re-resolve and refresh `milpa.lock` (does NOT
+>   mutate `milpa.kdl`). Requires `milpa.lock` as an input.
+
+> NORMATIVE: A mutation success fixture expresses its post-mutation outputs via
+> `expected/milpa.kdl` (the rewritten manifest; required for `add`/`remove`,
+> absent for `update` which MUST NOT mutate the manifest) and, when the verb
+> rewrites the lockfile, `expected/milpa.lock`. Both are byte-compared after the
+> §2.6 normalization rules (`<CAS_ROOT>` substitution applies to any CAS path
+> that leaks into a normative output; manifest/lockfile bytes otherwise compare
+> verbatim). `expected/nim.cfg` and `expected/_deps_structure.txt` MAY also be
+> present when the verb materializes `_deps/`. A mutation error fixture expresses
+> the failure via `expected/error` (§3) and MUST leave `milpa.kdl`/`milpa.lock`
+> unmodified.
+
+#### 2.7.2  Liveness selectors (`show` / `--version`)
+
+> NORMATIVE: `show` and `--version` have **non-frozen** output formats
+> (`spec/cli-contract.md` §5.3 and §9). A fixture exercising either is a
+> **liveness fixture**: the runner asserts only that the implementation exits 0
+> and writes non-empty stdout. There is NO `expected/stdout` slot and stdout is
+> NOT byte-compared. A `show` fixture supplies a resolvable project plus a
+> `milpa.lock` input; `--version` requires no project inputs. The `cmd` line is
+> the bare selector (`show` or `--version`).
 
 > NORMATIVE: When `cmd` is absent or contains `resolve`, `index.kdl` MAY be
 > omitted; its absence causes the runner to pass `index=None`, which triggers
@@ -472,9 +550,16 @@ emitting `milpa.lock` and `nim.cfg`.
 > runner does not inspect output files for error fixtures.
 
 > NORMATIVE: A conformant implementation passes an error fixture if and only
-> if the raised exception carries `.code == <slug>` as defined in
-> `spec/errors.md`. The human-readable error message is **not** checked
-> and is NOT byte-normative.
+> if it exits 1 and emits a terminal `milpa-error: <slug>` line (per
+> `cli-contract.md` §3, R1–R4) whose slug equals `expected/error`, as defined
+> in `spec/errors.md`. The human-readable error message is **not** checked and
+> is NOT byte-normative.
+
+> NOTE: A per-impl in-process adapter (pytest / `cargo test`) MAY assert the
+> raised exception's `.code` instead of parsing stderr — it tests the
+> implementation's internal API, a developer convenience. The **normative**
+> conformance gate is the black-box CLI check above (§5 item 4): the slug is
+> observed on stderr, not read from an in-process exception.
 
 ### 3.2  Error fixture inputs
 
@@ -582,8 +667,12 @@ emitting `milpa.lock` and `nim.cfg`.
 > 3. For a success fixture: diff `milpa.lock`, `nim.cfg`, and
 >    `_deps_structure.txt` (after `<CAS_ROOT>` substitution) against
 >    `expected/`. Any diff is a failure.
-> 4. For an error fixture: assert that the implementation exited with a
->    non-zero status and emitted an error whose `.code` matches `expected/error`.
+> 4. For an error fixture: assert that the implementation exited 1 and emitted
+>    exactly one terminal `milpa-error: <slug>` line on stderr (the unique
+>    full-line match of `^milpa-error: <SLUG>$`, per `cli-contract.md` §3
+>    R1–R4) whose slug matches `expected/error`. An exit ≠ 1, a missing line,
+>    or two or more such lines is a failure (crash / protocol-violation
+>    verdict), not a slug match.
 
 > NORMATIVE: When the runner invokes `nim.cfg` emission, it MUST supply the deps
 > directory as the literal relative path `_deps` (not an absolute scratch path).

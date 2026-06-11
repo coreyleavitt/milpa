@@ -40,10 +40,19 @@
 > existing conflict fixture, no runner needed). §2c tier-2 oracle sharpened:
 > structural post-hoc validity check (locked version satisfies manifest
 > constraint) added as the oracle for "both impls wrong"; pure cross-impl
-> agreement alone is insufficient. §2a container-vs-host tension resolved: the
-> "in-container" alternative requires a two-pass harness and is not equivalent
-> to a single differential run; wrapper-script approach (host harness + per-impl
-> container wrapper) is the only viable single-pass design.
+> agreement alone is insufficient.
+>
+> Round 3 (issue-#4 implementation feedback) correction: §2a's container-vs-host
+> "resolution" was **wrong** and is rewritten. The earlier text considered only
+> two options — host harness + per-fixture `podman run`, vs harness inside the
+> *toolchain* container — and chose the former, conflating *toolchain container*
+> (rustc/cargo, can't reach Python) with *harness container* (runtime artifacts
+> only). The right design is a third option: build each impl's **runtime artifact**
+> once in its toolchain container (build-time), then run the harness once in a
+> single environment holding *all* artifacts, invoking every impl `Direct`.
+> Per-fixture `podman run` (measured ~0.54s/fixture, linear in corpus size) is
+> eliminated; `invoke_via: Container` is demoted from the first-class Rust path to
+> an optional escape hatch. See §2a.
 
 ## Why this RFC exists
 
@@ -83,9 +92,10 @@ Gap 1 is presented first because everything downstream depends on it.
 > and never linked against any impl.
 
 Corollary: adding a new implementation to the harness MUST require only one
-**descriptor entry** (an `ImplDescriptor` struct — name, argv, cwd, static env)
-and, for container-wrapped impls, one thin wrapper script. No harness code
-changes.
+**descriptor entry** (an `ImplDescriptor` struct — name, argv, cwd, static env;
+its prebuilt artifact already present in the harness env per the §2a build/run
+split). No harness code changes, and no per-impl wrapper script — the optional
+`Container` escape hatch is driven by the harness from `image`/`mounts` alone.
 
 ## What already exists (do not rebuild)
 
@@ -259,28 +269,52 @@ ImplDescriptor {
     env:           dict              # static extras; harness ALSO injects per-run isolation env
     known_failing: list[int] | None  # fixture numbers this impl is not yet expected to pass
 }
-Direct                                   # exec argv directly on the host
-Container { image: str, mounts: list }   # harness synthesizes the `podman run`
+Direct                                   # exec argv as a local subprocess in the harness env
+Container { image: str, mounts: list }   # OPTIONAL escape hatch — harness synthesizes the `podman run`
 ```
 
 - **python:** `Direct`, `argv=["uv","run","python","-m","milpa"]`, `cwd=<repo>`.
 - **nim:** `Direct`, `argv=["/path/to/milpa"]`.
-- **rust:** `Container{image, mounts}`. The binary lives in the build container.
-  Per-fixture `podman run` costs ~200–600ms on WSL2 (~24–70s over the current
-  corpus, growing) and must bind-mount the scratch dir so `-C <scratch>` resolves
-  *inside* the container. Container support is **first-class in the harness**, not
-  an opaque external wrapper script (round-2 finding): the harness owns the
-  `podman run` synthesis from `Container{image, mounts}`, so the mount recipe,
-  env-forwarding (`MILPA_CACHE_DIR`, `MILPA_INDEX_URL`, `LC_ALL`), and — crucially
-  — **distinguishing a `podman`-infrastructure failure (image pull / mount error,
-  reported before any impl output) from an impl failure** are written and tested
-  once, uniformly, rather than reimplemented per impl in bash. The "harness runs
-  *inside* the container" alternative is **not equivalent** for a differential
-  run: a container holding only the Rust toolchain cannot also invoke the host
-  Python impl, so a single differential pass — which must drive *all* registered
-  impls from one harness process — cannot be in-container. At issue-#2 time,
-  benchmark whether per-fixture `podman run` overhead is tolerable or whether to
-  precompile a host-runnable Rust binary (`Direct`) to skip containers entirely.
+- **rust:** `Direct`, `argv=["/path/to/milpa"]` — the **prebuilt binary**, not the
+  toolchain. (Round 3 correction; see below.)
+
+#### Build-time / run-time split — every impl is `Direct` in the harness env
+
+The harness needs each impl's **runtime artifact** (the Python package + interpreter,
+the compiled Rust binary, the future Nim binary), never its *toolchain* (rustc, cargo,
+the Nim compiler). So the two are separated cleanly:
+
+- **Build-time** — each impl produces its runtime artifact in whatever container its
+  toolchain lives in (Rust in `dev-rust`'s toolchain image, Nim later in its own).
+  Python has nothing to build. This stage runs once per impl change.
+- **Run-time** — the harness runs **once** in a single environment that holds *all*
+  the artifacts, invoking every impl as a local `Direct` subprocess. For CI that
+  environment is one **multi-stage harness image** whose final stage = python3 (for
+  the stdlib harness + the Python impl) with the Rust/Nim binaries `COPY`'d in from
+  their build stages; for local dev it is simply the host with the binary copied out
+  of the build container. Either way, **container startup is paid once per harness
+  run, not once per fixture.**
+
+This is the option round 2 missed. It had reduced the choice to (1) host harness +
+per-fixture `podman run` for Rust, or (2) harness inside the *Rust toolchain*
+container — and rejected (2) correctly (that image has only Rust, so it cannot also
+drive the Python impl), leaving (1). But (1)'s per-fixture `podman run` is the cost
+that kills the generator loop: measured **~0.54s/fixture** on WSL2 (container startup;
+milpa itself is ~0.02s of that) → ~63s over the current 117-fixture corpus, **linear
+in fixture count**, so issue #3's generated inputs (thousands) would spend minutes in
+pure container startup. Option (3) — one harness env, all `Direct` — eliminates it
+entirely: the same Rust binary, run directly, is **~0.0006s/invocation** (~900× faster;
+the binary is a portable ELF, so the per-fixture *wrapper* was the whole cost, not the
+binary). (3) drives all impls from one process (so it is a true single differential
+pass, unlike (2)) at no per-fixture container cost (unlike (1)).
+
+`invoke_via: Container` therefore survives only as an **optional escape hatch** — for
+ad-hoc differential runs against an impl not baked into the harness image — not as the
+canonical Rust path. When used, the harness still owns the `podman run` synthesis from
+`Container{image, mounts}` (mount recipe, env-forwarding of `MILPA_CACHE_DIR` /
+`MILPA_INDEX_URL` / `LC_ALL`, and distinguishing a `podman`-infrastructure failure —
+image pull / mount error, before any impl output — from an impl failure), written and
+tested once rather than reimplemented per impl in bash. It is not on the CI hot path.
 
 `known_failing` mirrors the partial-conformance declaration in
 `conformance-fixtures.md` §1.4: a mid-development impl (the Nim dogfood, or any
@@ -483,13 +517,20 @@ the vocabulary so code, issues, and acceptance criteria agree):
 - **shrink/pin loop** — drives the generator's shrink on a divergence, emits a
   corpus fixture (human-gated, §2c).
 
-The corpus + shrink layers are a **standalone `python3`-stdlib program** (not the
-uv-managed milpa package — it must run on a CI runner that has none of the impls'
-toolchains pre-installed, and must not be able to `import` any impl's internals).
-Rationale over bash: it grows a structured divergence record, the normalization
-pass, and the shrink/generator integration — stdlib Python stays readable where
-bash would not, at the same zero-install cost. It depends on nothing but the CLI
-contract.
+The corpus + shrink layers are a **standalone `python3`-stdlib program** — a
+*separate* program from the uv-managed milpa package, depending on nothing but the
+CLI contract and the stdlib. Note (round 3): under the §2a build/run split the
+harness env is a single image that *does* contain the Python impl's runtime artifact
+(it is the base layer the Rust/Nim binaries are `COPY`'d onto), so the python impl is
+physically `import`-able there. The "drive every impl as a black-box subprocess, never
+`import` its internals" rule is therefore a **design discipline enforced by code review
+and by the harness being a distinct program** — not by the impl's physical absence from
+the environment. (The earlier "CI runner has none of the impls pre-installed" framing
+no longer holds and is the cost of eliminating per-fixture containers; it is the right
+trade.) What the harness still must NOT require is any impl's *toolchain* (rustc, cargo,
+the Nim compiler) — only prebuilt artifacts. Rationale over bash: it grows a structured
+divergence record, the normalization pass, and the shrink/generator integration —
+stdlib Python stays readable where bash would not, at the same zero-install cost.
 
 On divergence it emits one JSON record per finding for human triage + ingestion:
 `{ fixture, cmd, output_file, impls: { <name>: <normalized-bytes-or-slug> } }`.
@@ -545,8 +586,8 @@ real on a second impl *before* Nim, at near-zero marginal cost.
 ## Acceptance: testable invariants
 
 - A new impl is added to the differential harness by adding exactly one
-  descriptor entry (struct) — plus, for a container-wrapped impl, one wrapper
-  script — and changing no harness code.
+  descriptor entry (struct), its prebuilt artifact present in the harness env
+  (§2a build/run split) — and changing no harness code.
 - Every corpus fixture passes via the **black-box CLI** path (not only the
   in-process adapter) for every registered impl (excepting the §2f scope gaps,
   which are tracked, not silently skipped).
@@ -601,8 +642,8 @@ generator; **#2 + #3 together are the minimum viable differential harness**
    (e.g., `add --git` ref-discovery failure, unrecognized `--strategy` value,
    `verify` with missing `_deps/`) and add any missing slugs; (f) smoke-check
    both CLIs via subprocess. **No corpus `expected/` files change.**
-2. Neutral CLI black-box runner + impl-descriptor struct (+ Rust wrapper script /
-   in-container decision after a per-fixture overhead benchmark) + §2b
+2. Neutral CLI black-box runner + impl-descriptor struct (all impls `Direct` per the
+   §2a build/run split — Rust via its prebuilt binary, no per-fixture container) + §2b
    normalization + divergence record (Gap 2a/2b/2e); re-run the existing corpus
    through it for Python + Rust. *Depends on #1.*
 3. Differential generator harness + directory-shrink + tier-1/2 generators +

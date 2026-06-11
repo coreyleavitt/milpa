@@ -109,6 +109,12 @@ The declared local source path does not exist.
 
 **Triggered:** LocalFetcher.fetch finds p.path does not exist on the filesystem.
 
+### `FETCH-MOCK-MISSING`
+
+No mocked-fetches entry for the requested url@ref under the mocked transport.
+
+**Triggered:** MILPA_MOCKED_FETCHES is set and MockedFetcher.fetch is called with a (url, ref) pair whose encoded key directory does not exist under the mocked-fetches/ root.
+
 ### `FETCH-OCI-AMBIGUOUS-TARBALL`
 
 OCI artifact contained more than one *.tar.gz blob.
@@ -195,6 +201,18 @@ The lockfile references a workspace member that is absent from the current works
 
 **Triggered:** resolve_workspace_frozen finds MemberProvenanceRecord.name is not in the workspace's member list.
 
+### `FROZEN-NO-CAS`
+
+The frozen fast path requires a content-addressed store, but the fetcher has none attached.
+
+**Triggered:** _try_frozen / _try_workspace_frozen find fetcher.store is None; the frozen path cannot link _deps/ from a CAS that does not exist.
+
+### `FROZEN-NO-LOCKFILE`
+
+The frozen fast path requires a lockfile, but none is present.
+
+**Triggered:** _try_frozen / _try_workspace_frozen find no milpa.lock at the project (or workspace) root; with --frozen this is exit 1 rather than a silent fall-through to full resolution.
+
 ### `FROZEN-STRATEGY-MISMATCH`
 
 The requested resolution strategy differs from what the lockfile was built with.
@@ -239,6 +257,20 @@ Digest component has the wrong number of hex characters.
 
 **Triggered:** parse_identity finds the digest length does not match the expected length for the algorithm (sha256 requires exactly 64 hex chars).
 
+## INTERNAL
+
+### `INTERNAL-PANIC`
+
+A Rust implementation's top-level panic handler fired — an internal failure that reached the panic boundary.
+
+**Triggered:** A Rust impl installs a top-level panic handler that emits this slug to stderr before exiting 1.  An unhandled `panic!()` that exits 101 is a crash verdict under Gap-1 R4, not this coded error.
+
+### `MILPA-INTERNAL`
+
+An unexpected error escaped milpa's typed error handlers — an internal failure rather than a diagnosed condition.
+
+**Triggered:** The outermost CLI entry-point wrapper catches an exception that no typed handler (ManifestError, SolverError, NotFrozen, …) accounted for, emits this sentinel slug to stderr, and exits 1.  Guarantees the R3 invariant — every exit-1 failure carries a `milpa-error:` line — is mechanically enforceable.
+
 ## LOCK
 
 ### `LOCK-DEP-FIELD-ARITY`
@@ -258,6 +290,12 @@ A dep's `identity` field is not a valid multihash-encoded content hash.
 A `dep` node requires exactly one string argument (the name).
 
 **Triggered:** A `dep` node has wrong arity or a non-string arg.
+
+### `LOCK-DEP-NOT-FOUND`
+
+A named dep is absent from the lockfile.
+
+**Triggered:** `milpa update <dep>` or `milpa add --mirror <dep>` is asked to act on a dep that has no entry in milpa.lock.
 
 ### `LOCK-FIELD-ARITY`
 
@@ -285,9 +323,9 @@ The lockfile cannot be read (permissions, OS error).
 
 ### `LOCK-GRAPH-MISMATCH`
 
-The resolved graph does not match the lockfile.
+The deps do not match the lockfile — either the resolved graph or the on-disk _deps/ tree diverges from what milpa.lock records.
 
-**Triggered:** verify_against_graph finds missing, extra, or identity-mismatched deps.
+**Triggered:** verify_against_graph finds missing, extra, or identity-mismatched deps; or `milpa verify` finds the on-disk _deps/ content hashes / membership diverge from the lockfile.
 
 ### `LOCK-KDL-SYNTAX`
 
@@ -332,6 +370,12 @@ Lockfile schema version is not supported by this milpa.
 **Triggered:** The `version` integer is higher than LOCKFILE_SCHEMA_VERSION.
 
 ## MAN
+
+### `MAN-ADD-DEP-EXISTS`
+
+`milpa add --git` rejected: the dep is already declared in milpa.kdl.
+
+**Triggered:** cmd_add finds <dep> is already present in the manifest's deps block.
 
 ### `MAN-ADD-MIRROR-IDENTITY-MISMATCH`
 
@@ -407,9 +451,9 @@ NamedDep takes at most one positional argument (the version constraint).
 
 ### `MAN-DEP-NAMED-CONSTRAINT`
 
-NamedDep's version constraint must be a quoted string.
+NamedDep's version constraint is invalid: either the positional arg is not a string, or the string is not a syntactically valid constraint.
 
-**Triggered:** The positional arg is not a string.
+**Triggered:** The positional arg is not a string, OR the string cannot be parsed by VersionSet.from_constraint (e.g. '@@@bad'). Validated at manifest parse time so the resolver always holds pre-typed VersionSets.
 
 ### `MAN-DEP-NAMED-PROPS`
 
@@ -542,6 +586,12 @@ The manifest file is not valid KDL.
 `kind` value is not one of the allowed values (library, application).
 
 **Triggered:** kind is anything other than the documented set.
+
+### `MAN-MIRROR-EDITABLE-PROVENANCE`
+
+`milpa add --mirror` rejected: the dep has a local or member provenance — editable sources cannot be mirrored.
+
+**Triggered:** cmd_add_mirror finds the locked dep's provenance is local or member; a mirror would contradict the editable, mutable-by-design source.
 
 ### `MAN-MIRRORS-ARITY`
 
@@ -693,6 +743,12 @@ Predicate value must be a string.
 
 **Triggered:** A predicate's value is non-string.
 
+### `MAN-REMOVE-DEP-ABSENT`
+
+`milpa remove` rejected: the dep is not declared in milpa.kdl.
+
+**Triggered:** cmd_remove finds <dep> is not present in the manifest's deps block.
+
 ### `MAN-SPEC-VERSION-TYPE`
 
 `spec-version` must carry exactly one positional integer argument >= 1.
@@ -839,6 +895,12 @@ An index version string is not a parseable X.Y.Z semver.
 
 **Triggered:** Reserved for a future strict-parse pass.  Currently unparseable version strings are silently skipped (forward-compat); this code will be raised when a strict mode is enabled.
 
+### `TNG-KDL-SYNTAX`
+
+The index text is not valid KDL and cannot be parsed.
+
+**Triggered:** parse_index calls kdl.parse() and it raises kdl.errors.ParseError — the raw text supplied as the index is syntactically invalid KDL.
+
 ### `TNG-NO-IDENTITY`
 
 An index entry carries no content_hash — identity verification is impossible.
@@ -892,6 +954,14 @@ A git ref begins with `-` and would be interpreted as a CLI flag.
 A git URL begins with `-` and would be interpreted as a CLI flag.
 
 **Triggered:** _validate_no_leading_dash finds a git url value starting with `-` — flag-injection prevention at the index trust boundary.
+
+## VERIFY
+
+### `VERIFY-DEPS-DIR-MISSING`
+
+`milpa verify` cannot run: there is no _deps/ directory.
+
+**Triggered:** cmd_verify finds no _deps/ under the project (or workspace) root — nothing has been fetched, so there is nothing to verify against the lockfile. The user is directed to run `milpa fetch` first.
 
 ## WS
 

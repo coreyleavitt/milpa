@@ -26,7 +26,7 @@ Related specs:
 
 A conformant implementation of this spec MUST:
 
-1. Parse `index.kdl` as a valid KDL 1.0 document.
+1. Parse `index.kdl` as a valid KDL 2.0 document.
 2. Reject (`TNG-SCHEMA-UNKNOWN`) any document whose declared `schema_version`
    integer exceeds `TIANGUIS_INDEX_SCHEMA_VERSION` (currently `1`).
 3. Treat provenance records inside index entries as **strict subsets of the
