@@ -116,7 +116,7 @@ def assert_conformance(
     cmd = cmd_file.read_text().strip() if cmd_file.exists() else "resolve"
 
     if is_error_fixture:
-        _assert_error_fixture(run, expected_dir, cmd, failures, normalized_outputs)
+        _assert_error_fixture(run, fixture_dir, expected_dir, cmd, failures, normalized_outputs)
     elif _is_liveness_cmd(cmd):
         _assert_liveness_fixture(run, failures, normalized_outputs)
     else:
@@ -137,6 +137,7 @@ def assert_conformance(
 
 def _assert_error_fixture(
     run: RunResult,
+    fixture_dir: Path,
     expected_dir: Path,
     cmd: str,
     failures: list[AssertionFailure],
@@ -180,23 +181,56 @@ def _assert_error_fixture(
         normalized_outputs["expected/error"] = run.slug
 
     # For resolve and frozen cmds: assert no output files were left in scratch.
-    # For resolve: milpa.lock and nim.cfg are OUTPUTS — neither should exist on error.
+    # For resolve: nim.cfg is an OUTPUT — never present on error. milpa.lock is
+    #   normally an output too (must be absent), BUT a §8 refetch fixture ships a
+    #   prior milpa.lock as INPUT; atomic-write-on-failure then means the input
+    #   must survive byte-IDENTICAL (neither removed nor partially rewritten).
     # For frozen: milpa.lock is an INPUT (copied to scratch before the run), so its
     #   presence is expected and must NOT be checked. Only nim.cfg is an output here.
     # For parse-lockfile: no scratch output files to check (we skip entirely).
     if cmd == "resolve":
         scratch = Path(run.scratch_dir)
-        for unwanted in ("milpa.lock", "nim.cfg"):
-            if (scratch / unwanted).exists():
+        if (scratch / "nim.cfg").exists():
+            failures.append(AssertionFailure(
+                fixture_name=run.fixture_name,
+                impl_name=run.impl_name,
+                kind="error-fixture",
+                detail=(
+                    "error fixture left 'nim.cfg' in scratch "
+                    "(expected atomic-write-on-failure to suppress it)"
+                ),
+            ))
+        input_lock = fixture_dir / "milpa.lock"
+        scratch_lock = scratch / "milpa.lock"
+        if input_lock.exists():
+            # §8 refetch fixture: the prior lock must be left untouched on failure.
+            if not scratch_lock.exists():
+                failures.append(AssertionFailure(
+                    fixture_name=run.fixture_name,
+                    impl_name=run.impl_name,
+                    kind="error-fixture",
+                    detail="error fixture removed the input 'milpa.lock' (expected it left unchanged)",
+                ))
+            elif scratch_lock.read_text() != input_lock.read_text():
                 failures.append(AssertionFailure(
                     fixture_name=run.fixture_name,
                     impl_name=run.impl_name,
                     kind="error-fixture",
                     detail=(
-                        f"error fixture left {unwanted!r} in scratch "
-                        f"(expected atomic-write-on-failure to suppress it)"
+                        "error fixture modified 'milpa.lock' "
+                        "(expected atomic-write-on-failure to leave the prior lock unchanged)"
                     ),
                 ))
+        elif scratch_lock.exists():
+            failures.append(AssertionFailure(
+                fixture_name=run.fixture_name,
+                impl_name=run.impl_name,
+                kind="error-fixture",
+                detail=(
+                    "error fixture left 'milpa.lock' in scratch "
+                    "(expected atomic-write-on-failure to suppress it)"
+                ),
+            ))
     elif cmd == "frozen":
         scratch = Path(run.scratch_dir)
         # milpa.lock is the INPUT for frozen — skip it.

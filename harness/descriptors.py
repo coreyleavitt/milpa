@@ -93,6 +93,12 @@ def build_descriptors(repo_root: str | Path) -> list[ImplDescriptor]:
                                        # KDL-1.0/2.0 split fixed (both at Python rewrite #6)
         # fixture-122-show-liveness is NOT here: it is liveness-only (exit 0 +
         # non-empty stdout, no byte-compare) and Python passes it.
+        # #116 tarball TOFU fixtures — target the spec-conforming Rust impl.
+        # Python is the frozen design vehicle: its MockedFetcher.can_handle()
+        # returns False for TarballProvenance (only git is mocked), so a tarball
+        # resolve cannot run offline. Wired at the Python rewrite #6, not now.
+        "fixture-125-tarball-tofu-record",            # tarball mock transport not in frozen Python
+        "fixture-126-tarball-tofu-refetch-mismatch",  # ditto + §8 refetch re-assertion
     }
 
     python_desc = ImplDescriptor(

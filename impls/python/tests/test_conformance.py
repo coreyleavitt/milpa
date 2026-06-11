@@ -87,6 +87,15 @@ _KDL_2_0_ONLY = frozenset({
     "fixture-045-man-flag-undeclared-reference",
 })
 
+# #116 tarball TOFU fixtures: the frozen Python impl mocks only git provenance
+# (MockedFetcher.can_handle → False for TarballProvenance), so a tarball resolve
+# cannot run offline. Mirrors harness/descriptors.py python_known_failing; the
+# Rust reference impl exercises them. Wired at the Python rewrite (#6).
+_TARBALL_TOFU_PYTHON_FROZEN = frozenset({
+    "fixture-125-tarball-tofu-record",
+    "fixture-126-tarball-tofu-refetch-mismatch",
+})
+
 
 # ---------------------------------------------------------------------------
 # _build_fetcher — delegates to production MockedFetcher (SSOT: milpa/fetchers/mocked.py)
@@ -315,6 +324,11 @@ def test_conformance_fixture(fixture_dir: Path, tmp_path: Path):
     if fixture_dir.name in _KDL_2_0_ONLY:
         pytest.skip(
             "KDL-2.0-only fixture; Python parser is KDL 1.0 until the rewrite (#6)"
+        )
+    if fixture_dir.name in _TARBALL_TOFU_PYTHON_FROZEN:
+        pytest.skip(
+            "tarball TOFU fixture; frozen Python mocks only git provenance "
+            "(tarball mock transport wired at the rewrite #6)"
         )
     """Run one conformance fixture and verify outputs against expected/.
 

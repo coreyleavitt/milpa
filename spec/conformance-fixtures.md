@@ -320,6 +320,48 @@ Each subdirectory under `mocked-fetches/<key>/` MUST contain:
 > ref→SHA table. If `add --git` is given `ref=` explicitly, no ref-resolution
 > occurs and the fetch is satisfied directly from `mocked-fetches/<url-key>/`.
 
+#### 2.3.4  Tarball mock entries
+
+> NORMATIVE: A **tarball** dep is mocked by a `mocked-fetches/<key>/` entry whose
+> key is `url_key(url, "")` (§2.3.1 with an **empty ref** component, i.e.
+> `<sanitized-url>@`). A tarball has no ref, so the ref slot is always empty; this
+> is consistent with the URL-prefix match used by ref-resolution (§2.3.3).
+
+A tarball subdirectory under `mocked-fetches/<key>/` MUST contain:
+
+**`archive_sha256`** (required)
+
+> NORMATIVE: A plain text file containing exactly one line: the lowercase
+> hexadecimal sha256 of the (notional) downloaded archive bytes — the value the
+> mocked tarball transport reports as the archive digest. No trailing whitespace
+> other than a single newline. This is the **archive receipt** (provenance), NOT
+> the identity: the identity is still computed by hashing the materialized
+> `content/` tree (`spec/identity.md`). The two are orthogonal
+> (`lockfile-schema.md §5`).
+>
+> The mocked transport mirrors the real `TarballFetcher`: when the resolver
+> supplies an `expected_sha256` (a manifest `sha256=` pin, or a TOFU pin reused
+> from the prior lockfile per `resolver-semantics.md §8`), the transport compares
+> it against `archive_sha256` and MUST raise `FETCH-SHA256-MISMATCH` on a
+> mismatch — before staging any content. On a first fetch with no pin, the
+> `archive_sha256` value is recorded as the tarball provenance `sha256` (TOFU
+> first-use pinning).
+
+**`content/`** (required) and **`<name>.nimble`** (optional)
+
+> NORMATIVE: Identical semantics to the git case (§2.3.2): `content/` is the
+> source tree staged into `dest` and hashed for the identity, and a sibling
+> `<name>.nimble` is flattened into `dest` and included in the hash.
+
+> NOTE: A tarball TOFU refetch fixture (a substituted-archive scenario) pairs
+> this entry with a prior `milpa.lock` input (§2.9) whose tarball provenance
+> records a `sha256` differing from `archive_sha256`, while `content/` still
+> hashes to the locked `identity`. The identity gate alone then passes; only the
+> archive-level §8 pin re-assertion catches the substitution — surfaced as
+> `FETCH-ALL-FAILED` (the resolver's candidate-exhaustion code, §8a) wrapping the
+> inner `FETCH-SHA256-MISMATCH`. On that failure the prior `milpa.lock` is left
+> unchanged (atomic-write-on-failure).
+
 ### 2.4  `expected/milpa.lock` — expected lockfile
 
 > NORMATIVE: For a success fixture, `expected/milpa.lock` MUST be a valid
@@ -505,6 +547,14 @@ the CAS-admission and symlink-creation steps defined in `spec/identity.md`
 
 > NORMATIVE: When `cmd` is `frozen`, `milpa.lock` MUST be present. The runner
 > parses both `milpa.kdl` and `milpa.lock` and runs the no-network frozen path.
+
+> NORMATIVE: When `cmd` is `resolve` (the default), `milpa.lock` is OPTIONAL. If
+> present, it is the **§8 prior lockfile**: the resolver MUST load it and reuse
+> its pins (`resolver-semantics.md §8`), so repeated `fetch`/`lock` runs are
+> idempotent and a moved ref or substituted tarball archive is caught. On an
+> error in this path the prior `milpa.lock` MUST be left unchanged
+> (atomic-write-on-failure); on success it is overwritten with the new lockfile.
+> See fixture-126-tarball-tofu-refetch-mismatch for the canonical refetch example.
 
 ### 2.10  `cas-seed/` — CAS pre-population trees (optional, `frozen` only)
 

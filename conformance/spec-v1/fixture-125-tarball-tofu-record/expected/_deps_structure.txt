@@ -1,0 +1,1 @@
+foo -> <CAS_ROOT>/sha256/a2e634cc8fa6e2b3b79ee01f835eddacff54dd5d2392d747c4d6ce5c7a5d27e9/
