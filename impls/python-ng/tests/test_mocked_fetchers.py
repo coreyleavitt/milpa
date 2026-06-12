@@ -1,0 +1,622 @@
+"""Tests for milpa.fetchers.mocked — url_key SSOT + per-kind mocked fetchers (slice 7c).
+
+Coverage:
+  - url_key encoding: safe chars preserved; unsafe chars → '_'; '@' separator literal;
+    tarball empty-ref form; Rust cross-check on two representative URLs.
+  - MockedGitFetcher: staged content from fixture dir; commit SHA from 'sha' file.
+  - MockedTarballFetcher: staged content; archive_sha256 from fixture; TOFU pin
+    re-assertion (FETCH-SHA256-MISMATCH on mismatch); first-fetch (no prior pin) succeeds.
+  - MockedLocalFetcher: staged content from fixture dir; resolved_path in receipt.
+  - MockedOciFetcher: stub raises FETCH-MOCK-MISSING.
+  - mocked_registry factory: all four kinds claimed; exclusive dispatch (no ambiguity).
+  - cas_admissible per kind: Git/Tarball/OCI = True; Local = False.
+  - receipt transport_fields non-empty for all concrete receipts.
+
+Spec authority: spec/conformance-fixtures.md §2.3, spec/plugin-contract.md §4.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from milpa.errors import FETCH_MOCK_MISSING, FETCH_SHA256_MISMATCH, MilpaError
+from milpa.fetchers.mocked import (
+    GitProvenance,
+    GitReceipt,
+    LocalProvenance,
+    LocalReceipt,
+    MockedGitFetcher,
+    MockedLocalFetcher,
+    MockedOciFetcher,
+    MockedTarballFetcher,
+    OciProvenance,
+    TarballProvenance,
+    TarballReceipt,
+    mocked_registry,
+    url_key,
+)
+from milpa.fetchers.types import FetcherRegistry
+
+# ---------------------------------------------------------------------------
+# url_key encoding
+# ---------------------------------------------------------------------------
+
+
+class TestUrlKey:
+    """§2.3.1 NORMATIVE — every character outside [A-Za-z0-9._-] replaced by '_';
+    '@' separator literal; ref portion uses same substitution."""
+
+    def test_safe_chars_preserved(self) -> None:
+        # alphanumeric, dot, underscore, dash — all safe
+        assert url_key("foo-bar_1.2", "v1.0") == "foo-bar_1.2@v1.0"
+
+    def test_scheme_colons_and_slashes_replaced(self) -> None:
+        result = url_key("https://github.com/example/foo.git", "main")
+        assert result == "https___github.com_example_foo.git@main"
+
+    def test_at_in_ref_replaced(self) -> None:
+        # A '@' within the ref is replaced by '_', not kept as literal.
+        result = url_key("https://example.com/pkg.git", "v1@beta")
+        assert result == "https___example.com_pkg.git@v1_beta"
+
+    def test_tarball_empty_ref(self) -> None:
+        # Tarballs use url_key(url, "") — ref slot is empty → trailing '@'.
+        result = url_key("https://example.com/pkg.tar.gz", "")
+        assert result == "https___example.com_pkg.tar.gz@"
+
+    def test_local_path_as_url(self) -> None:
+        # Local mocked key uses url_key(path, "") per SSOT rule.
+        result = url_key("/home/user/mylib", "")
+        assert result == "_home_user_mylib@"
+
+    def test_separator_is_literal_at(self) -> None:
+        # Exactly one literal '@' separates the encoded url and encoded ref.
+        result = url_key("https://a.example.com/b", "main")
+        url_part, sep, ref_part = result.partition("@")
+        assert sep == "@"
+        assert url_part == "https___a.example.com_b"
+        assert ref_part == "main"
+
+    def test_rust_cross_check_github_main(self) -> None:
+        """Cross-check against the Rust url_key output.
+
+        Rust: url_key("https://github.com/example/foo.git", "main")
+              → "https___github.com_example_foo.git@main"
+
+        This is the canonical example from conformance-fixtures.md §2.3.1.
+        """
+        expected = "https___github.com_example_foo.git@main"
+        assert url_key("https://github.com/example/foo.git", "main") == expected
+
+    def test_rust_cross_check_tarball_empty_ref(self) -> None:
+        """Cross-check tarball form against Rust.
+
+        Rust: url_key("https://releases.example.com/v1/pkg.tar.gz", "")
+              → "https___releases.example.com_v1_pkg.tar.gz@"
+        """
+        expected = "https___releases.example.com_v1_pkg.tar.gz@"
+        assert url_key("https://releases.example.com/v1/pkg.tar.gz", "") == expected
+
+
+# ---------------------------------------------------------------------------
+# Fixture tree builder helper
+# ---------------------------------------------------------------------------
+
+
+def _make_git_fixture(
+    mocked_dir: Path,
+    url: str,
+    ref: str,
+    sha: str,
+    files: dict[str, bytes] | None = None,
+    nimble: str | None = None,
+    nimble_name: str | None = None,
+) -> Path:
+    """Create a git mock fixture directory under mocked_dir."""
+    key_dir = mocked_dir / url_key(url, ref)
+    key_dir.mkdir(parents=True)
+    (key_dir / "sha").write_text(sha + "\n", encoding="utf-8")
+    content = key_dir / "content"
+    content.mkdir()
+    if files:
+        for rel, data in files.items():
+            fp = content / rel
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_bytes(data)
+    if nimble is not None:
+        name = nimble_name or "pkg"
+        (key_dir / f"{name}.nimble").write_text(nimble, encoding="utf-8")
+    return key_dir
+
+
+def _make_tarball_fixture(
+    mocked_dir: Path,
+    url: str,
+    archive_sha256: str,
+    files: dict[str, bytes] | None = None,
+) -> Path:
+    """Create a tarball mock fixture directory under mocked_dir."""
+    key_dir = mocked_dir / url_key(url, "")
+    key_dir.mkdir(parents=True)
+    (key_dir / "archive_sha256").write_text(archive_sha256 + "\n", encoding="utf-8")
+    content = key_dir / "content"
+    content.mkdir()
+    if files:
+        for rel, data in files.items():
+            fp = content / rel
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_bytes(data)
+    return key_dir
+
+
+def _make_local_fixture(
+    mocked_dir: Path,
+    path: str,
+    files: dict[str, bytes] | None = None,
+) -> Path:
+    """Create a local mock fixture directory under mocked_dir."""
+    key_dir = mocked_dir / url_key(path, "")
+    key_dir.mkdir(parents=True)
+    content = key_dir / "content"
+    content.mkdir()
+    if files:
+        for rel, data in files.items():
+            fp = content / rel
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_bytes(data)
+    return key_dir
+
+
+# ---------------------------------------------------------------------------
+# MockedGitFetcher
+# ---------------------------------------------------------------------------
+
+
+class TestMockedGitFetcher:
+    URL = "https://github.com/example/foo.git"
+    REF = "main"
+    SHA = "a" * 40  # 40-char lowercase hex
+
+    def _fetcher(self, mocked_dir: Path) -> MockedGitFetcher:
+        return MockedGitFetcher(mocked_dir)
+
+    def test_returns_commit_sha_in_receipt(
+        self, tmp_path: Path
+    ) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        _make_git_fixture(mocked_dir, self.URL, self.REF, self.SHA)
+        fetcher = self._fetcher(mocked_dir)
+        prov = GitProvenance(url=self.URL, ref=self.REF)
+        dest = tmp_path / "_deps" / "foo"
+
+        receipt = fetcher.fetch("foo", prov, dest=dest)
+
+        assert isinstance(receipt, GitReceipt)
+        assert receipt.commit_sha == self.SHA
+
+    def test_stages_content_files(self, tmp_path: Path) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        files = {"src/foo.nim": b"# foo", "README.md": b"readme"}
+        _make_git_fixture(mocked_dir, self.URL, self.REF, self.SHA, files=files)
+        fetcher = self._fetcher(mocked_dir)
+        prov = GitProvenance(url=self.URL, ref=self.REF)
+        dest = tmp_path / "_deps" / "foo"
+
+        fetcher.fetch("foo", prov, dest=dest)
+
+        assert (dest / "src" / "foo.nim").read_bytes() == b"# foo"
+        assert (dest / "README.md").read_bytes() == b"readme"
+
+    def test_stages_nimble_file(self, tmp_path: Path) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        nimble_content = 'requires "nim >= 1.0.0"\n'
+        _make_git_fixture(
+            mocked_dir, self.URL, self.REF, self.SHA,
+            nimble=nimble_content, nimble_name="foo",
+        )
+        fetcher = self._fetcher(mocked_dir)
+        prov = GitProvenance(url=self.URL, ref=self.REF)
+        dest = tmp_path / "_deps" / "foo"
+
+        fetcher.fetch("foo", prov, dest=dest)
+
+        assert (dest / "foo.nimble").read_text(encoding="utf-8") == nimble_content
+
+    def test_missing_fixture_raises_fetch_mock_missing(
+        self, tmp_path: Path
+    ) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        fetcher = self._fetcher(mocked_dir)
+        prov = GitProvenance(url=self.URL, ref=self.REF)
+        dest = tmp_path / "_deps" / "foo"
+
+        with pytest.raises(MilpaError) as exc_info:
+            fetcher.fetch("foo", prov, dest=dest)
+
+        assert exc_info.value.slug == FETCH_MOCK_MISSING
+
+    def test_can_handle_git_provenance(self, tmp_path: Path) -> None:
+        fetcher = self._fetcher(tmp_path)
+        assert fetcher.can_handle(GitProvenance(url="https://x.com/a.git", ref="main"))
+
+    def test_cannot_handle_tarball_provenance(self, tmp_path: Path) -> None:
+        fetcher = self._fetcher(tmp_path)
+        assert not fetcher.can_handle(TarballProvenance(url="https://x.com/a.tar.gz"))
+
+    def test_receipt_transport_fields_non_empty(self, tmp_path: Path) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        _make_git_fixture(mocked_dir, self.URL, self.REF, self.SHA)
+        fetcher = self._fetcher(mocked_dir)
+        prov = GitProvenance(url=self.URL, ref=self.REF)
+        dest = tmp_path / "_deps" / "foo"
+
+        receipt = fetcher.fetch("foo", prov, dest=dest)
+        assert receipt.transport_fields()  # must be non-empty
+
+    def test_sha_file_whitespace_stripped(self, tmp_path: Path) -> None:
+        """sha file may have trailing newline; SHA is stripped."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        key_dir = mocked_dir / url_key(self.URL, self.REF)
+        key_dir.mkdir(parents=True)
+        (key_dir / "sha").write_text(f"  {self.SHA}  \n", encoding="utf-8")
+        (key_dir / "content").mkdir()
+        fetcher = self._fetcher(mocked_dir)
+        prov = GitProvenance(url=self.URL, ref=self.REF)
+        dest = tmp_path / "_deps" / "foo"
+
+        receipt = fetcher.fetch("foo", prov, dest=dest)
+        assert receipt.commit_sha == self.SHA
+
+
+# ---------------------------------------------------------------------------
+# MockedTarballFetcher
+# ---------------------------------------------------------------------------
+
+
+class TestMockedTarballFetcher:
+    URL = "https://releases.example.com/v1/pkg.tar.gz"
+    ARCHIVE_SHA = "b" * 64  # 64 hex chars = sha256
+
+    def _fetcher(self, mocked_dir: Path) -> MockedTarballFetcher:
+        return MockedTarballFetcher(mocked_dir)
+
+    def test_returns_archive_sha256_in_receipt(self, tmp_path: Path) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        _make_tarball_fixture(mocked_dir, self.URL, self.ARCHIVE_SHA)
+        fetcher = self._fetcher(mocked_dir)
+        prov = TarballProvenance(url=self.URL)
+        dest = tmp_path / "_deps" / "pkg"
+
+        receipt = fetcher.fetch("pkg", prov, dest=dest)
+
+        assert isinstance(receipt, TarballReceipt)
+        assert receipt.archive_sha256 == self.ARCHIVE_SHA
+
+    def test_stages_content_files(self, tmp_path: Path) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        files = {"lib.nim": b"# lib"}
+        _make_tarball_fixture(mocked_dir, self.URL, self.ARCHIVE_SHA, files=files)
+        fetcher = self._fetcher(mocked_dir)
+        prov = TarballProvenance(url=self.URL)
+        dest = tmp_path / "_deps" / "pkg"
+
+        fetcher.fetch("pkg", prov, dest=dest)
+
+        assert (dest / "lib.nim").read_bytes() == b"# lib"
+
+    def test_first_fetch_no_pin_succeeds(self, tmp_path: Path) -> None:
+        """expected_sha256=None (first fetch, no TOFU pin yet) must succeed."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        _make_tarball_fixture(mocked_dir, self.URL, self.ARCHIVE_SHA)
+        fetcher = self._fetcher(mocked_dir)
+        prov = TarballProvenance(url=self.URL, expected_sha256=None)
+        dest = tmp_path / "_deps" / "pkg"
+
+        receipt = fetcher.fetch("pkg", prov, dest=dest)
+        assert receipt.archive_sha256 == self.ARCHIVE_SHA
+
+    def test_pin_matches_archive_sha_succeeds(self, tmp_path: Path) -> None:
+        """expected_sha256 pin matching the fixture archive_sha256 must succeed."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        _make_tarball_fixture(mocked_dir, self.URL, self.ARCHIVE_SHA)
+        fetcher = self._fetcher(mocked_dir)
+        prov = TarballProvenance(url=self.URL, expected_sha256=self.ARCHIVE_SHA)
+        dest = tmp_path / "_deps" / "pkg"
+
+        receipt = fetcher.fetch("pkg", prov, dest=dest)
+        assert receipt.archive_sha256 == self.ARCHIVE_SHA
+
+    def test_pin_with_sha256_prefix_matches(self, tmp_path: Path) -> None:
+        """sha256:<hex> prefix form is accepted (stripped before comparison)."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        _make_tarball_fixture(mocked_dir, self.URL, self.ARCHIVE_SHA)
+        fetcher = self._fetcher(mocked_dir)
+        prov = TarballProvenance(url=self.URL, expected_sha256=f"sha256:{self.ARCHIVE_SHA}")
+        dest = tmp_path / "_deps" / "pkg"
+
+        receipt = fetcher.fetch("pkg", prov, dest=dest)
+        assert receipt.archive_sha256 == self.ARCHIVE_SHA
+
+    def test_tofu_pin_mismatch_raises_sha256_mismatch(self, tmp_path: Path) -> None:
+        """TOFU refetch with wrong expected_sha256 must raise FETCH-SHA256-MISMATCH (§2.3.4)."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        _make_tarball_fixture(mocked_dir, self.URL, self.ARCHIVE_SHA)
+        fetcher = self._fetcher(mocked_dir)
+        wrong_sha = "c" * 64
+        prov = TarballProvenance(url=self.URL, expected_sha256=wrong_sha)
+        dest = tmp_path / "_deps" / "pkg"
+
+        with pytest.raises(MilpaError) as exc_info:
+            fetcher.fetch("pkg", prov, dest=dest)
+
+        assert exc_info.value.slug == FETCH_SHA256_MISMATCH
+
+    def test_tofu_mismatch_no_content_staged(self, tmp_path: Path) -> None:
+        """SHA mismatch is detected before staging any content (§2.3.4 NORMATIVE)."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        files = {"sentinel.nim": b"should not appear"}
+        _make_tarball_fixture(mocked_dir, self.URL, self.ARCHIVE_SHA, files=files)
+        fetcher = self._fetcher(mocked_dir)
+        wrong_sha = "d" * 64
+        prov = TarballProvenance(url=self.URL, expected_sha256=wrong_sha)
+        dest = tmp_path / "_deps" / "pkg"
+        dest.mkdir(parents=True)
+
+        with pytest.raises(MilpaError):
+            fetcher.fetch("pkg", prov, dest=dest)
+
+        # dest must not contain staged files
+        assert not (dest / "sentinel.nim").exists()
+
+    def test_missing_fixture_raises_fetch_mock_missing(self, tmp_path: Path) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        fetcher = self._fetcher(mocked_dir)
+        prov = TarballProvenance(url=self.URL)
+        dest = tmp_path / "_deps" / "pkg"
+
+        with pytest.raises(MilpaError) as exc_info:
+            fetcher.fetch("pkg", prov, dest=dest)
+
+        assert exc_info.value.slug == FETCH_MOCK_MISSING
+
+    def test_can_handle_tarball_provenance(self, tmp_path: Path) -> None:
+        fetcher = self._fetcher(tmp_path)
+        assert fetcher.can_handle(TarballProvenance(url="https://x.com/a.tar.gz"))
+
+    def test_cannot_handle_git_provenance(self, tmp_path: Path) -> None:
+        fetcher = self._fetcher(tmp_path)
+        assert not fetcher.can_handle(GitProvenance(url="https://x.com/a.git", ref="main"))
+
+    def test_receipt_transport_fields_non_empty(self, tmp_path: Path) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        _make_tarball_fixture(mocked_dir, self.URL, self.ARCHIVE_SHA)
+        fetcher = self._fetcher(mocked_dir)
+        prov = TarballProvenance(url=self.URL)
+        dest = tmp_path / "_deps" / "pkg"
+
+        receipt = fetcher.fetch("pkg", prov, dest=dest)
+        assert receipt.transport_fields()
+
+    def test_tarball_key_uses_empty_ref(self, tmp_path: Path) -> None:
+        """Tarball fixture key is url_key(url, "") — empty ref slot (§2.3.4)."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        _make_tarball_fixture(mocked_dir, self.URL, self.ARCHIVE_SHA)
+        # The key directory name must end with '@' (empty ref slot).
+        key = url_key(self.URL, "")
+        assert key.endswith("@"), f"tarball key {key!r} must end with '@'"
+        assert (mocked_dir / key).is_dir()
+
+
+# ---------------------------------------------------------------------------
+# MockedLocalFetcher
+# ---------------------------------------------------------------------------
+
+
+class TestMockedLocalFetcher:
+    PATH = "/home/user/mylib"
+
+    def _fetcher(self, mocked_dir: Path) -> MockedLocalFetcher:
+        return MockedLocalFetcher(mocked_dir)
+
+    def test_stages_content_files(self, tmp_path: Path) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        files = {"mylib.nim": b"# mylib"}
+        _make_local_fixture(mocked_dir, self.PATH, files=files)
+        fetcher = self._fetcher(mocked_dir)
+        prov = LocalProvenance(path=Path(self.PATH))
+        dest = tmp_path / "_deps" / "mylib"
+
+        fetcher.fetch("mylib", prov, dest=dest)
+
+        assert (dest / "mylib.nim").read_bytes() == b"# mylib"
+
+    def test_returns_resolved_path_in_receipt(self, tmp_path: Path) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        _make_local_fixture(mocked_dir, self.PATH)
+        fetcher = self._fetcher(mocked_dir)
+        prov = LocalProvenance(path=Path(self.PATH))
+        dest = tmp_path / "_deps" / "mylib"
+
+        receipt = fetcher.fetch("mylib", prov, dest=dest)
+
+        assert isinstance(receipt, LocalReceipt)
+        assert receipt.resolved_path == Path(self.PATH)
+
+    def test_missing_fixture_raises_fetch_mock_missing(self, tmp_path: Path) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        fetcher = self._fetcher(mocked_dir)
+        prov = LocalProvenance(path=Path(self.PATH))
+        dest = tmp_path / "_deps" / "mylib"
+
+        with pytest.raises(MilpaError) as exc_info:
+            fetcher.fetch("mylib", prov, dest=dest)
+
+        assert exc_info.value.slug == FETCH_MOCK_MISSING
+
+    def test_can_handle_local_provenance(self, tmp_path: Path) -> None:
+        fetcher = self._fetcher(tmp_path)
+        assert fetcher.can_handle(LocalProvenance(path=Path("/some/path")))
+
+    def test_cannot_handle_git_provenance(self, tmp_path: Path) -> None:
+        fetcher = self._fetcher(tmp_path)
+        assert not fetcher.can_handle(GitProvenance(url="https://x.com/a.git", ref="main"))
+
+    def test_receipt_transport_fields_non_empty(self, tmp_path: Path) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        _make_local_fixture(mocked_dir, self.PATH)
+        fetcher = self._fetcher(mocked_dir)
+        prov = LocalProvenance(path=Path(self.PATH))
+        dest = tmp_path / "_deps" / "mylib"
+
+        receipt = fetcher.fetch("mylib", prov, dest=dest)
+        assert receipt.transport_fields()
+
+
+# ---------------------------------------------------------------------------
+# MockedOciFetcher (stub)
+# ---------------------------------------------------------------------------
+
+
+class TestMockedOciFetcher:
+    def test_always_raises_fetch_mock_missing(self, tmp_path: Path) -> None:
+        fetcher = MockedOciFetcher(tmp_path)
+        prov = OciProvenance(
+            registry="registry.example.com",
+            repository="foo/bar",
+            digest="sha256:" + "e" * 64,
+        )
+        dest = tmp_path / "_deps" / "ocipkg"
+
+        with pytest.raises(MilpaError) as exc_info:
+            fetcher.fetch("ocipkg", prov, dest=dest)
+
+        assert exc_info.value.slug == FETCH_MOCK_MISSING
+
+    def test_can_handle_oci_provenance(self, tmp_path: Path) -> None:
+        fetcher = MockedOciFetcher(tmp_path)
+        prov = OciProvenance(
+            registry="registry.example.com",
+            repository="foo/bar",
+            digest="sha256:" + "e" * 64,
+        )
+        assert fetcher.can_handle(prov)
+
+    def test_cannot_handle_git_provenance(self, tmp_path: Path) -> None:
+        fetcher = MockedOciFetcher(tmp_path)
+        assert not fetcher.can_handle(GitProvenance(url="https://x.com/a.git", ref="main"))
+
+
+# ---------------------------------------------------------------------------
+# mocked_registry factory
+# ---------------------------------------------------------------------------
+
+
+class TestMockedRegistry:
+    def test_returns_fetcher_registry(self, tmp_path: Path) -> None:
+        registry = mocked_registry(tmp_path)
+        assert isinstance(registry, FetcherRegistry)
+
+    def test_registers_four_fetchers(self, tmp_path: Path) -> None:
+        registry = mocked_registry(tmp_path)
+        assert len(registry.fetchers) == 4
+
+    def test_git_dispatch_unique(self, tmp_path: Path) -> None:
+        """Exactly one fetcher claims GitProvenance (exclusive dispatch)."""
+        registry = mocked_registry(tmp_path)
+        prov = GitProvenance(url="https://x.com/a.git", ref="main")
+        claims = [f for f in registry.fetchers if f.can_handle(prov)]
+        assert len(claims) == 1
+        assert isinstance(claims[0], MockedGitFetcher)
+
+    def test_tarball_dispatch_unique(self, tmp_path: Path) -> None:
+        registry = mocked_registry(tmp_path)
+        prov = TarballProvenance(url="https://x.com/a.tar.gz")
+        claims = [f for f in registry.fetchers if f.can_handle(prov)]
+        assert len(claims) == 1
+        assert isinstance(claims[0], MockedTarballFetcher)
+
+    def test_local_dispatch_unique(self, tmp_path: Path) -> None:
+        registry = mocked_registry(tmp_path)
+        prov = LocalProvenance(path=Path("/some/path"))
+        claims = [f for f in registry.fetchers if f.can_handle(prov)]
+        assert len(claims) == 1
+        assert isinstance(claims[0], MockedLocalFetcher)
+
+    def test_oci_dispatch_unique(self, tmp_path: Path) -> None:
+        registry = mocked_registry(tmp_path)
+        prov = OciProvenance(
+            registry="registry.example.com",
+            repository="foo/bar",
+            digest="sha256:" + "f" * 64,
+        )
+        claims = [f for f in registry.fetchers if f.can_handle(prov)]
+        assert len(claims) == 1
+        assert isinstance(claims[0], MockedOciFetcher)
+
+    def test_git_fetches_from_fixture(self, tmp_path: Path) -> None:
+        """End-to-end: mocked_registry dispatches to MockedGitFetcher and returns result."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        url = "https://github.com/example/bar.git"
+        ref = "v1.0.0"
+        sha = "0" * 40
+        _make_git_fixture(mocked_dir, url, ref, sha, files={"bar.nim": b"# bar"})
+        registry = mocked_registry(mocked_dir)
+        prov = GitProvenance(url=url, ref=ref)
+        dest = tmp_path / "_deps" / "bar"
+
+        result = registry.fetch("bar", prov, dest=dest)
+
+        assert isinstance(result.receipt, GitReceipt)
+        assert result.receipt.commit_sha == sha
+        assert (dest / "bar.nim").read_bytes() == b"# bar"
+        assert result.identity.startswith("sha256:")
+
+
+# ---------------------------------------------------------------------------
+# cas_admissible per provenance kind
+# ---------------------------------------------------------------------------
+
+
+class TestCasAdmissiblePerKind:
+    def test_git_is_cas_admissible(self) -> None:
+        assert GitProvenance.cas_admissible is True
+
+    def test_tarball_is_cas_admissible(self) -> None:
+        assert TarballProvenance.cas_admissible is True
+
+    def test_oci_is_cas_admissible(self) -> None:
+        assert OciProvenance.cas_admissible is True
+
+    def test_local_is_not_cas_admissible(self) -> None:
+        assert LocalProvenance.cas_admissible is False
+
+    def test_git_instance_is_cas_admissible(self) -> None:
+        p = GitProvenance(url="https://x.com/a.git", ref="main")
+        assert p.cas_admissible is True
+
+    def test_local_instance_is_not_cas_admissible(self) -> None:
+        p = LocalProvenance(path=Path("/tmp/x"))
+        assert p.cas_admissible is False

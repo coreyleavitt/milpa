@@ -6,7 +6,8 @@ Design constraints:
   clear extension point. Registering a descriptor with invoke_via="Container"
   will raise NotImplementedError at run time.
 
-The two registered descriptors are built by build_descriptors(repo_root).
+The registered descriptors are built by build_descriptors(repo_root).
+python-ng is dormant by default; set MILPA_PYTHON_NG=1 to activate it.
 """
 
 from __future__ import annotations
@@ -145,4 +146,56 @@ def build_descriptors(repo_root: str | Path) -> list[ImplDescriptor]:
         known_failing=rust_known_failing,
     )
 
-    return [python_desc, rust_desc]
+    descriptors = [python_desc, rust_desc]
+
+    # python-ng: dormant by default; activated by MILPA_PYTHON_NG=1.
+    #
+    # A stub registered unconditionally would FAIL every corpus fixture not in
+    # its known_failing set and break overall_passed() immediately.  The gate
+    # keeps the green harness undisturbed until the new impl reaches parity.
+    # The gate is removed at swap (S11c), when python-ng *is* python.
+    if os.environ.get("MILPA_PYTHON_NG") == "1":
+        python_ng_dir = root / "impls" / "python-ng"
+        venv_python_ng = python_ng_dir / ".venv" / "bin" / "python"
+        if venv_python_ng.exists():
+            python_ng_argv = [str(venv_python_ng), "-m", "milpa"]
+        else:
+            python_ng_argv = ["uv", "run", "python", "-m", "milpa"]
+
+        # known_failing: only the mutation stubs (slice 10e — not yet implemented).
+        #
+        # All other fixtures (10a-0 through 10c) are implemented and pass.
+        # The add/remove/update verbs are wired as stubs in cli.py; they emit
+        # MILPA-INTERNAL and exit 1.  The expected outputs require a fully
+        # implemented add/remove/update with mocked transport + KDL 2.0 emitter
+        # (both from the Python rewrite #6 / slice 10e).
+        python_ng_known_failing: set[str] = {}
+
+        python_ng_desc = ImplDescriptor(
+            name="python-ng",
+            argv=python_ng_argv,
+            cwd=str(python_ng_dir),
+            env={},
+            known_failing=python_ng_known_failing,
+        )
+        descriptors.append(python_ng_desc)
+
+    return descriptors
+
+
+def _all_fixture_names(conformance_root: Path) -> set[str]:
+    """Return the basename of every fixture directory under conformance_root.
+
+    Used to pre-populate python-ng's known_failing so the stub impl does not
+    cause unexpected failures while overall_passed() must stay meaningful.
+    """
+    names: set[str] = set()
+    if not conformance_root.is_dir():
+        return names
+    for spec_dir in conformance_root.iterdir():
+        if not spec_dir.is_dir() or not spec_dir.name.startswith("spec-v"):
+            continue
+        for fixture_dir in spec_dir.iterdir():
+            if fixture_dir.is_dir() and fixture_dir.name.startswith("fixture-"):
+                names.add(fixture_dir.name)
+    return names

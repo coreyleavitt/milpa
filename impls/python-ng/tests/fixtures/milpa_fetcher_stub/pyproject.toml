@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "milpa-fetcher-stub"
+version = "0.1.0"
+description = "Stub fetcher plugin for milpa S7a entry-point discovery tests."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.entry-points."milpa.fetchers"]
+stub = "milpa_fetcher_stub:stub_factory"
+
+[tool.hatch.build.targets.wheel]
+packages = ["milpa_fetcher_stub"]

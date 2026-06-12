@@ -534,7 +534,8 @@ This section is the **authoritative source** for the complete list of
 conditions that disqualify the `--frozen` fast path. `spec/cli-contract.md`
 cross-references this section rather than restating the list.
 
-> NORMATIVE: The frozen path raises exactly the following ten
+> NORMATIVE: The frozen *resolve path* (`resolve_frozen()` /
+> `resolve_workspace_frozen()`) raises exactly the following ten
 > `FROZEN-*` codes on precondition failure (non-`FROZEN-*` failures
 > silently fall through to the slow path when `--frozen` was not
 > explicitly set, or hard-error when it was):
@@ -562,7 +563,14 @@ cross-references this section rather than restating the list.
 > 10. **`FROZEN-MEMBER-IDENTITY-DRIFT`** — a workspace member's on-disk
 >     `content_hash` differs from the lockfile's pinned identity.
 >
-> No other `FROZEN-*` codes exist. The list is closed.
+> No other `FROZEN-*` *resolve-path preconditions* exist; this list is
+> closed. Two further `FROZEN-*` codes — `FROZEN-NO-LOCKFILE` and
+> `FROZEN-NO-CAS` — are **CLI-level guards** raised *before* the resolve
+> path is entered (the caller, `_try_frozen` / `_try_workspace_frozen`,
+> checks for a present `milpa.lock` and an attached CAS; see
+> `spec/cli-contract.md` and `spec/errors.md`). They are a distinct layer
+> from the ten preconditions above and bring the catalog total to twelve
+> `FROZEN-*` codes.
 
 > NORMATIVE: Conditions 1–5 and 7 are checked inside `resolve_frozen()`
 > (single-package path); conditions 8–10 are checked inside
