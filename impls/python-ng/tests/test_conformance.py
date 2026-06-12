@@ -52,6 +52,7 @@ Spec authority: spec/conformance-fixtures.md, RFC §4.4/§4.5.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Literal
 
@@ -59,7 +60,7 @@ import pytest
 
 from milpa.cas import CAStore
 from milpa.context import MilpaEnv, ResolveParams
-from milpa.errors import MilpaError
+from milpa.errors import SOLVE_CONFLICT, MilpaError
 from milpa.fetchers.cas_admitting import CasAdmittingFetcher
 from milpa.fetchers.mocked import mocked_registry
 from milpa.lockfile import Lockfile, parse_lockfile
@@ -69,7 +70,10 @@ from milpa.manifest import (
     parse_workspace_or_manifest,
 )
 from milpa.profile import Profile
+from milpa.resolver import resolve, resolve_workspace
+from milpa.solver import SolverError, certificate_to_json
 from milpa.version import Strategy
+from milpa.workspace import load_workspace
 
 # ---------------------------------------------------------------------------
 # Corpus path — parents[N] depth assertion
@@ -267,6 +271,62 @@ def _load_prior_lockfile(fixture_dir: Path) -> Lockfile | None:
 
 
 # ---------------------------------------------------------------------------
+# Certificate JSON comparison (cli-contract.md §2.5 / conformance-fixtures §2.7.3)
+# ---------------------------------------------------------------------------
+
+
+def _compare_certificate_json(
+    got: dict[str, Any],
+    expected: dict[str, Any],
+) -> str | None:
+    """Canonical JSON comparison for certificates per conformance-fixtures §2.7.3.
+
+    - Object comparison is key-order-independent (dicts already handle this).
+    - ``resolved`` and ``witness`` arrays are order-sensitive.
+    - ``message`` field is EXCLUDED from comparison.
+    - ``refutation`` is set-equality: sort both by (package, constraint).
+
+    Returns None on match, or a human-readable mismatch string.
+    """
+    if got.get("kind") != expected.get("kind"):
+        return f"kind mismatch: expected {expected.get('kind')!r}, got {got.get('kind')!r}"
+
+    if got["kind"] == "success":
+        # resolved: order-sensitive
+        if got.get("resolved") != expected.get("resolved"):
+            return (
+                f"resolved mismatch:\n"
+                f"  expected: {json.dumps(expected.get('resolved'), indent=2)}\n"
+                f"  got:      {json.dumps(got.get('resolved'), indent=2)}"
+            )
+        # witness: order-sensitive
+        if got.get("witness") != expected.get("witness"):
+            return (
+                f"witness mismatch:\n"
+                f"  expected: {json.dumps(expected.get('witness'), indent=2)}\n"
+                f"  got:      {json.dumps(got.get('witness'), indent=2)}"
+            )
+    elif got["kind"] == "failure":
+        # message: EXCLUDED from comparison
+        # refutation: set-equality (sort by (package, constraint))
+        def _sort_refutation(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return sorted(entries, key=lambda e: (e.get("package", ""), e.get("constraint", "")))
+
+        got_ref = _sort_refutation(got.get("refutation", []))
+        exp_ref = _sort_refutation(expected.get("refutation", []))
+        if got_ref != exp_ref:
+            return (
+                f"refutation set mismatch:\n"
+                f"  expected (sorted): {json.dumps(exp_ref, indent=2)}\n"
+                f"  got (sorted):      {json.dumps(got_ref, indent=2)}"
+            )
+    else:
+        return f"unknown certificate kind: {got.get('kind')!r}"
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # The in-process "execute" function — drives core functions directly
 # ---------------------------------------------------------------------------
 
@@ -339,6 +399,12 @@ def _execute_fixture(
                 return ("fail", f"expected error {fixture.expected_error!r}, got {e.slug!r}")
             else:
                 return ("fail", f"expected success but got error {e.slug!r}")
+
+    # ------------------------------------------------------------------
+    # check-certificate: resolve + assert certificate JSON (§2.7.3)
+    # ------------------------------------------------------------------
+    if cmd == "check-certificate":
+        return _execute_check_certificate(fixture, tmp_dir, env)
 
     # ------------------------------------------------------------------
     # resolve / frozen: read milpa.kdl + dispatch
@@ -444,6 +510,117 @@ def _execute_fixture(
         raise
 
     # Success: byte-diff against expected/
+    return _diff_success(fixture, graph, doc, tmp_dir, deps_dir)
+
+
+# ---------------------------------------------------------------------------
+# check-certificate execution (conformance-fixtures §2.7.3)
+# ---------------------------------------------------------------------------
+
+
+def _execute_check_certificate(
+    fixture: Fixture,
+    tmp_dir: Path,
+    env: MilpaEnv,
+) -> tuple[Literal["pass", "fail", "skip"], str]:
+    """Execute a check-certificate fixture in-process.
+
+    1. Parse the manifest.
+    2. Run resolve() (or resolve_workspace()).
+    3. On success: extract graph.cert → compare to expected/certificate.json.
+       Also assert the normal success outcome (milpa.lock etc).
+    4. On SOLVE_CONFLICT: extract solver_error from exc.context → compare
+       failure cert to expected/certificate.json. Assert error slug matches.
+    """
+    fixture_dir = fixture.dir
+    deps_dir = tmp_dir / "_deps"
+    deps_dir.mkdir(parents=True, exist_ok=True)
+
+    # Parse manifest
+    kdl_path = fixture_dir / "milpa.kdl"
+    try:
+        kdl_text = kdl_path.read_text(encoding="utf-8")
+    except OSError as e:
+        return ("fail", f"E2E-MANIFEST-UNREADABLE: {e}")
+
+    try:
+        doc = parse_workspace_or_manifest(kdl_text)
+    except MilpaError as e:
+        if fixture.expected_error is not None and e.slug == fixture.expected_error:
+            return ("pass", "")
+        elif fixture.expected_error is not None:
+            return ("fail", f"expected error {fixture.expected_error!r}, got {e.slug!r}")
+        else:
+            return ("fail", f"expected success but manifest parse failed: {e.slug!r}")
+
+    prior = _load_prior_lockfile(fixture_dir)
+    profile = _fixture_profile(fixture_dir)
+    params = ResolveParams(
+        strategy=Strategy.MAXVER,
+        max_parallel=1,
+        profile=profile,
+        prior=prior,
+    )
+
+    # Expected certificate
+    expected_cert_path = fixture_dir / "expected" / "certificate.json"
+    if not expected_cert_path.exists():
+        return ("fail", "expected/certificate.json not found in fixture")
+    try:
+        expected_cert = json.loads(expected_cert_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return ("fail", f"expected/certificate.json parse error: {e}")
+
+    # Resolve
+    try:
+        if isinstance(doc, WorkspaceManifest):
+            try:
+                loaded_ws = load_workspace(fixture_dir)
+            except MilpaError as e:
+                if fixture.expected_error is not None and e.slug == fixture.expected_error:
+                    return ("pass", "")
+                return ("fail", f"workspace load failed: {e.slug!r}")
+            graph = resolve_workspace(loaded_ws, deps_dir, env, params)
+        else:
+            assert isinstance(doc, Manifest)
+            graph = resolve(doc, deps_dir, env, params)
+    except MilpaError as e:
+        if fixture.expected_error is not None and e.slug == fixture.expected_error:
+            # Error fixture: compare failure certificate.
+            if e.slug == SOLVE_CONFLICT:
+                solver_err = e.context.get("solver_error")
+                if solver_err is None:
+                    return ("fail", "SOLVE_CONFLICT MilpaError missing solver_error in context")
+                assert isinstance(solver_err, SolverError)
+                cert_json_str = certificate_to_json(solver_err)
+                got_cert = json.loads(cert_json_str)
+                mismatch = _compare_certificate_json(got_cert, expected_cert)
+                if mismatch:
+                    return ("fail", f"failure certificate mismatch: {mismatch}")
+            return ("pass", "")
+        elif fixture.expected_error is not None:
+            return ("fail", f"expected error {fixture.expected_error!r}, got {e.slug!r}")
+        else:
+            return ("fail", f"expected success but resolve failed: {e.slug!r}")
+
+    # Success: compare certificate from graph.cert
+    if fixture.expected_error is not None:
+        return ("fail", f"expected error {fixture.expected_error!r} but resolve succeeded")
+
+    cert_obj = getattr(graph, "cert", None)
+    if cert_obj is None:
+        return ("fail", "graph.cert is None — resolver did not build a certificate")
+
+    got_cert_str = certificate_to_json(cert_obj)
+    got_cert = json.loads(got_cert_str)
+
+    mismatch = _compare_certificate_json(got_cert, expected_cert)
+    if mismatch:
+        return ("fail", f"success certificate mismatch: {mismatch}")
+
+    # Also assert the normal success outputs (milpa.lock etc) depending on verb.
+    # For 'fetch', assert lock + nim.cfg + _deps_structure.txt.
+    # For 'lock', assert only milpa.lock.
     return _diff_success(fixture, graph, doc, tmp_dir, deps_dir)
 
 

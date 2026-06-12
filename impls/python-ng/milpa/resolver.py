@@ -90,7 +90,7 @@ from milpa.manifest import (
 from milpa.nimble import parse_nimble
 from milpa.profile import Profile
 from milpa.registry import GitIndexProvenance, Index, IndexVersion
-from milpa.solver import SolverError, Term, solve
+from milpa.solver import SolverError, Term, solve_with_cert
 from milpa.version import Strategy, Version, VersionSet, format_version_str, parse_version
 from milpa.workspace import LoadedWorkspace
 
@@ -1039,10 +1039,10 @@ def resolve(
     provider.set_transitive_callback(_on_transitive_named)
 
     # ------------------------------------------------------------------
-    # Step 8: solve
+    # Step 8: solve (+ build §5.1 certificate for --certificate flag)
     # ------------------------------------------------------------------
     try:
-        solution = solve(
+        solution, cert = solve_with_cert(
             provider,
             "__root__",
             Version(0, 0, 0),
@@ -1054,12 +1054,15 @@ def resolve(
             SOLVE_CONFLICT,
             f"dependency conflict: {exc}",
             chain=exc.chain,
+            solver_error=exc,
         ) from exc
 
     # ------------------------------------------------------------------
-    # Step 9: build the ResolvedGraph
+    # Step 9: build the ResolvedGraph (attach cert for CLI §2.5)
     # ------------------------------------------------------------------
-    return _build_graph(solution, provider, deps_dir, params.strategy)
+    graph = _build_graph(solution, provider, deps_dir, params.strategy)
+    from dataclasses import replace as _replace
+    return _replace(graph, cert=cert)
 
 
 # ---------------------------------------------------------------------------
@@ -1857,10 +1860,10 @@ def resolve_workspace(
     provider.set_transitive_callback(_on_transitive_named)
 
     # ------------------------------------------------------------------
-    # Solve
+    # Solve (+ build §5.1 certificate for --certificate flag)
     # ------------------------------------------------------------------
     try:
-        solution = solve(
+        solution, cert = solve_with_cert(
             provider,
             "__root__",
             Version(0, 0, 0),
@@ -1872,9 +1875,12 @@ def resolve_workspace(
             SOLVE_CONFLICT,
             f"dependency conflict: {exc}",
             chain=exc.chain,
+            solver_error=exc,
         ) from exc
 
     # ------------------------------------------------------------------
-    # Build graph
+    # Build graph (attach cert for CLI §2.5)
     # ------------------------------------------------------------------
-    return _build_graph(solution, provider, deps_dir, params.strategy)
+    graph = _build_graph(solution, provider, deps_dir, params.strategy)
+    from dataclasses import replace as _replace
+    return _replace(graph, cert=cert)

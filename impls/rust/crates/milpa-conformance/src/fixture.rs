@@ -38,7 +38,9 @@ impl Cmd {
                     "frozen" => Cmd::Frozen,
                     "resolve" | "" => Cmd::Resolve,
                     // Mutation (§2.7.1) + liveness (§2.7.2) selectors: CLI-only.
-                    "add" | "remove" | "update" | "show" | "--version" => Cmd::CliOnly,
+                    // check-certificate (§2.7.3): also CLI-only (--certificate flag).
+                    "add" | "remove" | "update" | "show" | "--version"
+                    | "check-certificate" => Cmd::CliOnly,
                     // Unknown selector defaults to resolve (back-compat).
                     _ => Cmd::Resolve,
                 }

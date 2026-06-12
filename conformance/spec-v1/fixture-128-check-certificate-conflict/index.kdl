@@ -1,0 +1,21 @@
+schema_version 1
+package "shared" {
+    version "1.0.0" {
+        content_hash "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        provenance {
+            kind "git"
+            url "https://example.com/shared.git"
+            ref "v1.0.0"
+            commit_sha "1111111111111111111111111111111111111111"
+        }
+    }
+    version "2.0.0" {
+        content_hash "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        provenance {
+            kind "git"
+            url "https://example.com/shared.git"
+            ref "v2.0.0"
+            commit_sha "2222222222222222222222222222222222222222"
+        }
+    }
+}

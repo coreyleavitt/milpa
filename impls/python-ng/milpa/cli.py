@@ -69,6 +69,7 @@ from milpa.lockfile import (
 from milpa.nimcfg import format_nimcfg, format_workspace_nimcfgs
 from milpa.profile import Profile
 from milpa.resolver import resolve, resolve_workspace
+from milpa.solver import SolverError, SolveSuccess, certificate_to_json
 from milpa.version import Strategy
 from milpa.workspace import find_workspace_root, load_or_discover_manifest
 
@@ -129,6 +130,15 @@ def _make_parser() -> argparse.ArgumentParser:
         help=(
             "require lockfile + CAS to satisfy fetch with no network; "
             "exit 1 if any precondition fails"
+        ),
+    )
+    parser.add_argument(
+        "--certificate",
+        metavar="<path>",
+        default=None,
+        help=(
+            "write the solve result certificate as JSON to <path> "
+            "(applies to fetch and lock; silently ignored by other verbs)"
         ),
     )
 
@@ -302,6 +312,34 @@ def _atomic_write(path: Path, text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Certificate write helper (cli-contract.md §2.5)
+# ---------------------------------------------------------------------------
+
+
+def _write_certificate(
+    cert_path: Path | None,
+    result: object,
+) -> None:
+    """Atomically write the solve result certificate to *cert_path*.
+
+    ``result`` must be a ``SolveSuccess`` (success) or ``SolverError``
+    (failure) from ``milpa.solver``.  Uses ``certificate_to_json`` as the
+    SSOT serialiser.  No-op when ``cert_path`` is None.
+
+    Atomic discipline: write to a sibling tmp, then os.replace.  If the
+    serialisation or write fails, the file at cert_path is left absent or
+    unchanged (cli-contract.md §2.5 NORMATIVE).
+    """
+    if cert_path is None:
+        return
+    assert isinstance(result, (SolveSuccess, SolverError)), (
+        f"_write_certificate: expected SolveSuccess or SolverError, got {type(result)!r}"
+    )
+    cert_json = certificate_to_json(result)
+    _atomic_write(cert_path, cert_json)
+
+
+# ---------------------------------------------------------------------------
 # cmd_fetch (10b)
 # ---------------------------------------------------------------------------
 
@@ -313,6 +351,7 @@ def cmd_fetch(
     strategy: Strategy,
     max_parallel: int,
     frozen: bool,
+    certificate_path: Path | None = None,
 ) -> int:
     """Resolve, fetch, emit nim.cfg + milpa.lock.
 
@@ -336,6 +375,7 @@ def cmd_fetch(
             strategy=strategy,
             max_parallel=max_parallel,
             frozen=frozen,
+            certificate_path=certificate_path,
         )
 
     # --- Single-package path ---
@@ -401,7 +441,20 @@ def cmd_fetch(
         manifest_dir=project_dir,
     )
 
-    graph = resolve(manifest, deps_dir, env_with_index, params)
+    # Resolve — intercept SOLVE_CONFLICT to write the failure certificate.
+    try:
+        graph = resolve(manifest, deps_dir, env_with_index, params)
+    except MilpaError as exc:
+        if exc.slug == "SOLVE-CONFLICT" and certificate_path is not None:
+            solver_err = exc.context.get("solver_error")
+            if solver_err is not None:
+                _write_certificate(certificate_path, solver_err)
+        raise
+
+    # Success: write the certificate (built by the resolver, attached to graph).
+    if certificate_path is not None and graph.cert is not None:
+        _write_certificate(certificate_path, graph.cert)
+
     lockfile = from_graph(graph, strategy=str(strategy))
     lock_text = format_lockfile(lockfile)
     nim_cfg_text = format_nimcfg(
@@ -423,6 +476,7 @@ def _cmd_fetch_workspace(
     strategy: Strategy,
     max_parallel: int,
     frozen: bool,
+    certificate_path: Path | None = None,
 ) -> int:
     """Workspace variant of cmd_fetch."""
     from milpa.workspace import LoadedWorkspace
@@ -476,7 +530,20 @@ def _cmd_fetch_workspace(
         manifest_dir=ws_root,
     )
 
-    graph = resolve_workspace(workspace, deps_dir, env_with_index, params)
+    # Resolve — intercept SOLVE_CONFLICT to write the failure certificate.
+    try:
+        graph = resolve_workspace(workspace, deps_dir, env_with_index, params)
+    except MilpaError as exc:
+        if exc.slug == "SOLVE-CONFLICT" and certificate_path is not None:
+            solver_err = exc.context.get("solver_error")
+            if solver_err is not None:
+                _write_certificate(certificate_path, solver_err)
+        raise
+
+    # Success: write the certificate (built by the resolver, attached to graph).
+    if certificate_path is not None and graph.cert is not None:
+        _write_certificate(certificate_path, graph.cert)
+
     lockfile = from_graph(graph, strategy=str(strategy))
     lock_text = format_lockfile(lockfile)
     per_member = format_workspace_nimcfgs(workspace, graph)
@@ -505,6 +572,7 @@ def cmd_lock(
     *,
     strategy: Strategy,
     max_parallel: int,
+    certificate_path: Path | None = None,
 ) -> int:
     """Resolve + write milpa.lock; do NOT emit nim.cfg or populate _deps/.
 
@@ -518,6 +586,7 @@ def cmd_lock(
             env=env,
             strategy=strategy,
             max_parallel=max_parallel,
+            certificate_path=certificate_path,
         )
 
     manifest = load_or_discover_manifest(project_dir)
@@ -535,7 +604,20 @@ def cmd_lock(
         manifest_dir=project_dir,
     )
 
-    graph = resolve(manifest, deps_dir, env_with_index, params)
+    # Resolve — intercept SOLVE_CONFLICT to write the failure certificate.
+    try:
+        graph = resolve(manifest, deps_dir, env_with_index, params)
+    except MilpaError as exc:
+        if exc.slug == "SOLVE-CONFLICT" and certificate_path is not None:
+            solver_err = exc.context.get("solver_error")
+            if solver_err is not None:
+                _write_certificate(certificate_path, solver_err)
+        raise
+
+    # Success: write the certificate (built by the resolver, attached to graph).
+    if certificate_path is not None and graph.cert is not None:
+        _write_certificate(certificate_path, graph.cert)
+
     lockfile = from_graph(graph, strategy=str(strategy))
     _atomic_write(lock_path, format_lockfile(lockfile))
     print(f"locked {len(graph.deps)} deps", file=sys.stderr)
@@ -548,6 +630,7 @@ def _cmd_lock_workspace(
     *,
     strategy: Strategy,
     max_parallel: int,
+    certificate_path: Path | None = None,
 ) -> int:
     from milpa.workspace import LoadedWorkspace
     assert isinstance(workspace, LoadedWorkspace)
@@ -567,7 +650,20 @@ def _cmd_lock_workspace(
         manifest_dir=ws_root,
     )
 
-    graph = resolve_workspace(workspace, deps_dir, env_with_index, params)
+    # Resolve — intercept SOLVE_CONFLICT to write the failure certificate.
+    try:
+        graph = resolve_workspace(workspace, deps_dir, env_with_index, params)
+    except MilpaError as exc:
+        if exc.slug == "SOLVE-CONFLICT" and certificate_path is not None:
+            solver_err = exc.context.get("solver_error")
+            if solver_err is not None:
+                _write_certificate(certificate_path, solver_err)
+        raise
+
+    # Success: write the certificate (built by the resolver, attached to graph).
+    if certificate_path is not None and graph.cert is not None:
+        _write_certificate(certificate_path, graph.cert)
+
     lockfile = from_graph(graph, strategy=str(strategy))
     _atomic_write(lock_path, format_lockfile(lockfile))
     print(f"locked {len(graph.deps)} deps", file=sys.stderr)
@@ -1264,6 +1360,11 @@ def main(argv: list[str] | None = None) -> int:
     # Resolve strategy enum.
     strategy = Strategy(args.strategy)
 
+    # Parse --certificate path (cli-contract.md §2.5).
+    certificate_path: Path | None = (
+        Path(args.certificate).resolve() if args.certificate is not None else None
+    )
+
     # Dispatch.
     try:
         if args.command == "fetch":
@@ -1273,6 +1374,7 @@ def main(argv: list[str] | None = None) -> int:
                 strategy=strategy,
                 max_parallel=args.parallel,
                 frozen=args.frozen,
+                certificate_path=certificate_path,
             )
         elif args.command == "lock":
             return cmd_lock(
@@ -1280,6 +1382,7 @@ def main(argv: list[str] | None = None) -> int:
                 env,
                 strategy=strategy,
                 max_parallel=args.parallel,
+                certificate_path=certificate_path,
             )
         elif args.command == "show":
             return cmd_show(project_dir)

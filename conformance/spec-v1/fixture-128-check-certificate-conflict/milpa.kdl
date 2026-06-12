@@ -1,0 +1,6 @@
+name "myapp"
+kind "application"
+deps {
+    left git=(url)"https://example.com/left.git" ref="main"
+    right git=(url)"https://example.com/right.git" ref="main"
+}

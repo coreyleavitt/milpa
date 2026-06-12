@@ -156,6 +156,43 @@ pub fn format_version_str(v: &Version) -> String {
     v.to_string()
 }
 
+/// Convert a `VersionSet` to a constraint string parseable by
+/// `VersionSet::from_constraint` (mirrors Python's `_vs_to_constraint_str`).
+///
+/// Each interval becomes a conjunction of `>=`/`>`/`<=`/`<` clauses joined by
+/// ` & `; multiple intervals are joined by ` | `. This is the SSOT for the
+/// `constraint` field in the §5.1 success-certificate witness and the §5.2
+/// failure-certificate refutation.
+///
+/// Special cases:
+/// - Empty → `">0.0.0 & <0.0.0"` (canonical always-empty expression)
+/// - Full (None, None) → `"any version"`
+pub fn vs_to_constraint_str(vs: &VersionSet) -> String {
+    if vs.is_empty() {
+        return ">0.0.0 & <0.0.0".to_string();
+    }
+    let mut arms: Vec<String> = Vec::new();
+    for iv in &vs.intervals {
+        if iv.lo.is_none() && iv.hi.is_none() {
+            return "any version".to_string();
+        }
+        let mut clauses: Vec<String> = Vec::new();
+        if let Some(lo) = &iv.lo {
+            let op = if iv.lo_closed { ">=" } else { ">" };
+            clauses.push(format!("{op}{lo}"));
+        }
+        if let Some(hi) = &iv.hi {
+            let op = if iv.hi_closed { "<=" } else { "<" };
+            clauses.push(format!("{op}{hi}"));
+        }
+        if clauses.is_empty() {
+            return "any version".to_string();
+        }
+        arms.push(clauses.join(" & "));
+    }
+    arms.join(" | ")
+}
+
 // ---------------------------------------------------------------------------
 // Constraint parse error — uncoded, mirroring the bare `ValueError` Python's
 // `VersionSet.from_constraint` raises. The resolver (S7b) maps this to the
@@ -762,6 +799,14 @@ pub trait PackageProvider {
     fn dependencies(&self, package: &str, version: &Version) -> Vec<Dep>;
 }
 
+/// One refutation entry: a package name and its constraint string. Used in the
+/// §5.2 failure certificate's `refutation` array.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefutationEntry {
+    pub package: String,
+    pub constraint: String,
+}
+
 /// Resolve the dependency closure of `(root, root_version)`, returning the chosen
 /// version for every package in the solution (root included). `strategy` governs
 /// candidate selection when more than one version satisfies the accumulated
@@ -792,6 +837,94 @@ pub fn solve<P: PackageProvider>(
         // unreachable; render defensively rather than panic.
         Err(other) => Err(SolverError::Conflict(other.to_string())),
     }
+}
+
+/// Solve and also return refutation entries when the constraints are
+/// unsatisfiable (for building the §5.2 failure certificate). On success returns
+/// `Ok(solution)` with an empty refutation vec; on conflict returns
+/// `Err((error, refutation))` with the weak UNSAT core extracted from the
+/// derivation tree.
+pub fn solve_with_refutation<P: PackageProvider>(
+    provider: &P,
+    root: &str,
+    root_version: Version,
+    strategy: Strategy,
+) -> Result<BTreeMap<String, Version>, (SolverError, Vec<RefutationEntry>)> {
+    let adapter = ProviderAdapter { provider, strategy };
+    match pubgrub::resolve(&adapter, root.to_string(), root_version) {
+        Ok(selected) => Ok(selected.into_iter().collect()),
+        Err(pubgrub::PubGrubError::NoSolution(mut tree)) => {
+            tree.collapse_no_versions();
+            let prose =
+                <pubgrub::DefaultStringReporter as pubgrub::Reporter<_, _, _>>::report(&tree);
+            let refutation = extract_refutation(&tree);
+            Err((SolverError::Conflict(prose), refutation))
+        }
+        Err(other) => Err((SolverError::Conflict(other.to_string()), Vec::new())),
+    }
+}
+
+/// Walk the pubgrub derivation tree and produce the §5.2 weak UNSAT core.
+///
+/// Strategy: collect every `FromDependencyOf(_, _, dep, range)` leaf, grouping
+/// by dep package.  A package is "conflicted" when the intersection of ALL its
+/// accumulated ranges is empty — those are the packages whose constraints are
+/// mutually exclusive.  Non-conflicted packages (packages that appear in the
+/// tree only as transitive declarants, e.g. `left`/`right` in fixture-128, not
+/// `shared`) are excluded from the refutation.
+fn extract_refutation(
+    tree: &pubgrub::DerivationTree<String, VersionSet, String>,
+) -> Vec<RefutationEntry> {
+    use pubgrub::{DerivationTree, External};
+    use std::collections::BTreeMap;
+
+    // pkg → list of (constraint_str, VersionSet) pairs seen in the tree.
+    let mut by_pkg: BTreeMap<String, Vec<(String, VersionSet)>> = BTreeMap::new();
+    let mut stack = vec![tree];
+
+    while let Some(node) = stack.pop() {
+        match node {
+            DerivationTree::External(External::FromDependencyOf(_, _, dep, range)) => {
+                let cstr = vs_to_constraint_str(range);
+                let entry = by_pkg.entry(dep.clone()).or_default();
+                // Deduplicate by constraint string (same constraint from two paths = one entry).
+                if !entry.iter().any(|(c, _)| c == &cstr) {
+                    entry.push((cstr, range.clone()));
+                }
+            }
+            DerivationTree::Derived(derived) => {
+                stack.push(&derived.cause1);
+                stack.push(&derived.cause2);
+            }
+            _ => {}
+        }
+    }
+
+    let mut out: Vec<RefutationEntry> = Vec::new();
+    for (pkg, constraints) in &by_pkg {
+        // A package is conflicted iff the intersection of ALL its ranges is empty.
+        // Single-entry packages are never conflicted on their own; they only appear
+        // in the refutation when a conflict manifests between ≥2 constraints.
+        if constraints.len() < 2 {
+            continue;
+        }
+        let intersection = constraints
+            .iter()
+            .fold(VersionSet::full(), |acc, (_, vs)| acc.intersect(vs));
+        if intersection.is_empty() {
+            for (cstr, _) in constraints {
+                out.push(RefutationEntry {
+                    package: pkg.clone(),
+                    constraint: cstr.clone(),
+                });
+            }
+        }
+    }
+
+    // Sort for determinism (the harness checks set-equality so order doesn't matter,
+    // but stable output makes tests easier to read).
+    out.sort_by(|a, b| a.package.cmp(&b.package).then(a.constraint.cmp(&b.constraint)));
+    out
 }
 
 /// Adapts a milpa [`PackageProvider`] + [`Strategy`] into `pubgrub`'s

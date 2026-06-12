@@ -243,9 +243,17 @@ class ResolvedDep:
 
 @dataclass(frozen=True)
 class ResolvedGraph:
-    """Complete set of resolved deps produced by the resolver."""
+    """Complete set of resolved deps produced by the resolver.
+
+    ``cert`` carries the ``SolveSuccess`` certificate (``solver.py``) when
+    the resolver builds it.  Typed ``Any`` to avoid a circular import
+    (lockfile.py ← resolver.py ← solver.py; lockfile.py MUST NOT import
+    solver.py).  The CLI's certificate flag reads this field; all other
+    consumers ignore it.  ``None`` means no certificate was built.
+    """
 
     deps: tuple[ResolvedDep, ...]
+    cert: Any = None  # SolveSuccess | None
 
 
 # ---------------------------------------------------------------------------

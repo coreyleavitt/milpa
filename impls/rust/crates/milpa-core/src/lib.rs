@@ -57,7 +57,10 @@ pub use milpa_solver::{parse_version, Strategy};
 pub use nimcfg::format_nimcfg;
 pub use nimcfg::format_workspace_nimcfgs;
 pub use registry::Index;
-pub use resolver::{resolve, resolve_workspace};
+pub use resolver::{
+    resolve, resolve_with_cert, resolve_workspace, FailureCert, SuccessCert, WitnessEntry,
+};
+pub use milpa_solver::RefutationEntry;
 pub use safe_extract::{extract_tar, ExtractionResult, Limits};
 pub use store::{default_store, CaStore};
 pub use workspace::{load_workspace, LoadedWorkspace};

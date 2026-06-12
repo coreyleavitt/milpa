@@ -15,17 +15,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use milpa_core::{
     add_mirror, discover_manifest, fetch::FetcherRegistry, format_nimcfg, format_workspace_nimcfgs,
     from_graph, index_url_from_env, load_index, load_lockfile, load_manifest, load_workspace,
-    mutate_manifest_file, parse_lockfile, parse_version, resolve, resolve_workspace,
-    resolve_workspace_frozen, verify_lockfile_against_deps, write_lockfile, CaStore,
-    CasAdmittingFetcher, CoreError, DefaultRegistry, FrozenResolver, Index, ManifestDoc, Milpa,
-    MilpaError, MockedFetcher, Profile, Resolver, Strategy, DEFAULT_TTL_SECONDS,
+    mutate_manifest_file, parse_lockfile, parse_version, resolve, resolve_with_cert,
+    resolve_workspace, resolve_workspace_frozen, verify_lockfile_against_deps, write_lockfile,
+    CaStore, CasAdmittingFetcher, CoreError, DefaultRegistry, FailureCert, FrozenResolver, Index,
+    ManifestDoc, Milpa, MilpaError, MockedFetcher, Profile, Resolver, Strategy, SuccessCert,
+    DEFAULT_TTL_SECONDS,
 };
-use milpa_manifest::{Dep, UrlDep};
+use milpa_manifest::{Dep, Manifest, UrlDep};
 
 const VERSION: &str = "0.1.0";
 
 const USAGE: &str = "usage: milpa [-C <dir>] [-j <N>] [-s <mode>] [--frozen] \
-<fetch|lock|show|verify|clean|add|remove|update> [args]";
+[--certificate <path>] <fetch|lock|show|verify|clean|add|remove|update> [args]";
 
 fn main() {
     // Gap-1 R4: catch any Rust panic, emit a human line + the machine-readable
@@ -54,6 +55,10 @@ struct Cli {
     directory: PathBuf,
     strategy: Strategy,
     frozen: bool,
+    /// Path for the §5 result certificate (cli-contract §2.5). `None` when
+    /// `--certificate` is absent; `Some(path)` when present. Only used by
+    /// `fetch` and `lock`; other verbs silently ignore it.
+    certificate: Option<PathBuf>,
     verb: String,
     rest: Vec<String>,
 }
@@ -71,12 +76,13 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
     };
 
     let dir = &cli.directory;
+    let cert_path = cli.certificate.as_deref();
     match cli.verb.as_str() {
         "show" => cmd_show(dir),
         "verify" => cmd_verify(dir),
         "clean" => cmd_clean(dir),
-        "fetch" => cmd_fetch(dir, cli.strategy, cli.frozen, true),
-        "lock" => cmd_fetch(dir, cli.strategy, cli.frozen, false),
+        "fetch" => cmd_fetch(dir, cli.strategy, cli.frozen, true, cert_path),
+        "lock" => cmd_fetch(dir, cli.strategy, cli.frozen, false, cert_path),
         "update" => cmd_update(dir, cli.strategy, &cli.rest),
         "add" => cmd_add(dir, &cli.rest),
         "remove" => cmd_remove(dir, &cli.rest),
@@ -93,6 +99,7 @@ fn parse_args(args: &[String]) -> Option<Cli> {
     let mut directory = PathBuf::from(".");
     let mut strategy = Strategy::default();
     let mut frozen = false;
+    let mut certificate: Option<PathBuf> = None;
     let mut i = 0;
     let verb;
     loop {
@@ -114,6 +121,10 @@ fn parse_args(args: &[String]) -> Option<Cli> {
                 frozen = true;
                 i += 1;
             }
+            "--certificate" => {
+                certificate = Some(PathBuf::from(args.get(i + 1)?));
+                i += 2;
+            }
             v if !v.starts_with('-') => {
                 verb = v.to_string();
                 i += 1;
@@ -126,6 +137,7 @@ fn parse_args(args: &[String]) -> Option<Cli> {
         directory,
         strategy,
         frozen,
+        certificate,
         verb,
         rest: args[i..].to_vec(),
     })
@@ -198,6 +210,109 @@ fn cmd_clean(dir: &Path) -> Result<i32, MilpaError> {
     Ok(0)
 }
 
+// ---------------------------------------------------------------------------
+// Certificate JSON serialisation (cli-contract §2.5 + resolver-semantics §5)
+// ---------------------------------------------------------------------------
+
+/// Serialise a success certificate to the §2.5.1 JSON schema and write it
+/// atomically to `path` (tmp + rename). On any I/O or serialisation error the
+/// file at `path` is left absent or unchanged.
+fn write_success_cert(path: &Path, cert: &SuccessCert) -> std::io::Result<()> {
+    let json = success_cert_to_json(cert);
+    write_cert_atomic(path, &json)
+}
+
+/// Serialise a failure certificate to the §2.5.2 JSON schema and write it
+/// atomically to `path` (tmp + rename).
+fn write_failure_cert(path: &Path, cert: &FailureCert) -> std::io::Result<()> {
+    let json = failure_cert_to_json(cert);
+    write_cert_atomic(path, &json)
+}
+
+/// Build the §2.5.1 JSON string for a success certificate.
+fn success_cert_to_json(cert: &SuccessCert) -> String {
+    let resolved: Vec<String> = cert
+        .resolved
+        .iter()
+        .map(|(pkg, ver)| {
+            format!(r#"    {{"package": {pkg_j}, "version": {ver_j}}}"#,
+                pkg_j = json_str(pkg),
+                ver_j = json_str(ver))
+        })
+        .collect();
+    let witness: Vec<String> = cert
+        .witness
+        .iter()
+        .map(|w| {
+            format!(
+                r#"    {{"package": {p}, "version": {v}, "constraint": {c}, "satisfied_by": {s}}}"#,
+                p = json_str(&w.package),
+                v = json_str(&w.version),
+                c = json_str(&w.constraint),
+                s = json_str(&w.satisfied_by),
+            )
+        })
+        .collect();
+    format!(
+        "{{\n  \"kind\": \"success\",\n  \"resolved\": [\n{}\n  ],\n  \"witness\": [\n{}\n  ]\n}}",
+        resolved.join(",\n"),
+        witness.join(",\n"),
+    )
+}
+
+/// Build the §2.5.2 JSON string for a failure certificate.
+fn failure_cert_to_json(cert: &FailureCert) -> String {
+    // message: null when empty (python-ng convention; not byte-normative).
+    let message_val = if cert.message.is_empty() {
+        "null".to_string()
+    } else {
+        json_str(&cert.message)
+    };
+    let refutation: Vec<String> = cert
+        .refutation
+        .iter()
+        .map(|r| {
+            format!(
+                r#"    {{"package": {p}, "constraint": {c}}}"#,
+                p = json_str(&r.package),
+                c = json_str(&r.constraint),
+            )
+        })
+        .collect();
+    format!(
+        "{{\n  \"kind\": \"failure\",\n  \"message\": {message_val},\n  \"refutation\": [\n{}\n  ]\n}}",
+        refutation.join(",\n"),
+    )
+}
+
+/// Minimal JSON string escaping (only what spec values contain: printable ASCII
+/// without control chars; no need for full Unicode escape).
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Atomic write: write to a sibling tmp file, then rename into place.
+fn write_cert_atomic(path: &Path, json: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// `milpa fetch` / `lock` / `update` — resolve, write `milpa.lock` (+ `nim.cfg`
 /// for fetch). `--frozen` reconstructs from the lockfile + CAS (no network).
 /// `MILPA_MOCKED_FETCHES` if set+non-empty (the conformance fetch transport,
@@ -238,6 +353,7 @@ fn cmd_fetch(
     strategy: Strategy,
     frozen: bool,
     emit_nimcfg: bool,
+    cert_path: Option<&Path>,
 ) -> Result<i32, MilpaError> {
     let deps_dir = dir.join("_deps");
     let doc = discover_manifest(dir)?;
@@ -328,6 +444,16 @@ fn cmd_fetch(
         // §8: reuse the existing lockfile's pins so repeated `fetch`/`lock` runs
         // are idempotent and a silently-moved ref / substituted archive is caught.
         let prior = maybe_prior_lockfile(&dir.join("milpa.lock"));
+
+        if let Some(cert_dest) = cert_path {
+            // §2.5: resolve with certificate — emit JSON regardless of success/failure,
+            // then propagate the normal exit/slug outcome.
+            return cmd_fetch_with_cert(
+                dir, &manifest, &deps_dir, index.as_ref(), registry.as_ref(),
+                profile.as_ref(), prior.as_ref(), strategy, emit_nimcfg, cert_dest,
+            );
+        }
+
         Milpa.resolve(
             &manifest,
             index.as_ref(),
@@ -354,6 +480,46 @@ fn cmd_fetch(
         if frozen { " (frozen)" } else { "" }
     );
     Ok(0)
+}
+
+/// The `--certificate` sub-path for `cmd_fetch`/`cmd_lock` (single-package,
+/// non-frozen). Runs `resolve_with_cert`, writes the certificate, then applies
+/// the normal exit/slug discipline (§2.5).
+#[allow(clippy::too_many_arguments)]
+fn cmd_fetch_with_cert(
+    dir: &Path,
+    manifest: &Manifest,
+    deps_dir: &Path,
+    index: Option<&Index>,
+    registry: &dyn FetcherRegistry,
+    profile: Option<&Profile>,
+    prior: Option<&milpa_core::Lockfile>,
+    strategy: Strategy,
+    emit_nimcfg: bool,
+    cert_dest: &Path,
+) -> Result<i32, MilpaError> {
+    match resolve_with_cert(manifest, index, registry, profile, prior, strategy, deps_dir) {
+        Ok((graph, cert)) => {
+            // Write the success certificate (best-effort; a cert write failure
+            // does NOT abort the command — the lock/nim.cfg still land).
+            let _ = write_success_cert(cert_dest, &cert);
+            write_lockfile(&from_graph(&graph, strategy.as_str()), &dir.join("milpa.lock"))?;
+            if emit_nimcfg {
+                let _ = std::fs::write(
+                    dir.join("nim.cfg"),
+                    format_nimcfg(&graph, "_deps", &manifest.src_dir),
+                );
+            }
+            eprintln!("resolved {} deps", graph.deps.len());
+            Ok(0)
+        }
+        Err((err, failure_cert)) => {
+            // Write the failure certificate, then surface the error normally.
+            // The normal error path (main's Err arm) emits the slug + exits 1.
+            let _ = write_failure_cert(cert_dest, &failure_cert);
+            Err(err)
+        }
+    }
 }
 
 /// `milpa update [<dep>]` — re-resolve and refresh `milpa.lock`, optionally
@@ -893,7 +1059,7 @@ mod tests {
 
         // First, fetch to produce a baseline lockfile with both pins.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        assert_eq!(cmd_fetch(&proj, Strategy::default(), false, true).unwrap(), 0);
+        assert_eq!(cmd_fetch(&proj, Strategy::default(), false, true, None).unwrap(), 0);
         let baseline = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
         assert!(baseline.contains("\"foo\"") && baseline.contains("\"bar\""));
 
@@ -1070,7 +1236,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX; unique env var name; cleaned up after.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let result = cmd_fetch(&proj, Strategy::default(), false, true);
+        let result = cmd_fetch(&proj, Strategy::default(), false, true, None);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert!(result.is_ok(), "expected Ok, got {result:?}");
@@ -1111,7 +1277,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let result = cmd_fetch(&proj, Strategy::default(), false, true);
+        let result = cmd_fetch(&proj, Strategy::default(), false, true, None);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert!(result.is_err(), "expected Err, got {result:?}");

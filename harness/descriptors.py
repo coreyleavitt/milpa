@@ -100,6 +100,10 @@ def build_descriptors(repo_root: str | Path) -> list[ImplDescriptor]:
         # resolve cannot run offline. Wired at the Python rewrite #6, not now.
         "fixture-125-tarball-tofu-record",            # tarball mock transport not in frozen Python
         "fixture-126-tarball-tofu-refetch-mismatch",  # ditto + §8 refetch re-assertion
+        # check-certificate fixtures — new-impl-only; frozen python does not
+        # implement --certificate (wired at the Python rewrite #6, not now).
+        "fixture-127-check-certificate-success",  # --certificate not in frozen Python
+        "fixture-128-check-certificate-conflict",  # --certificate not in frozen Python
     }
 
     python_desc = ImplDescriptor(
@@ -131,11 +135,16 @@ def build_descriptors(repo_root: str | Path) -> list[ImplDescriptor]:
     # emitted correctly via resolve_workspace_frozen (issue #118).
     rust_frozen_workspace_gaps: set[str] = set()
 
+    # check-certificate fixtures: wired in batch 2 via --certificate CLI flag.
+    # 127/128 now PASS via the black-box harness (Rust emits cert JSON).
+    rust_check_certificate_pending: set[str] = set()
+
     rust_known_failing = (
         rust_no_cas_symlinks
         | rust_index_err_swallowed
         | rust_no_predicate_filtering
         | rust_frozen_workspace_gaps
+        | rust_check_certificate_pending
     )
 
     rust_desc = ImplDescriptor(

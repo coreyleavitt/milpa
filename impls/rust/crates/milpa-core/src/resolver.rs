@@ -29,7 +29,10 @@ use std::path::{Path, PathBuf};
 
 use milpa_manifest::nimble::{parse_nimble, NimbleRequirement};
 use milpa_manifest::{Dep, LocalDep, Manifest, Override, Predicate, Profile, TarballDep, UrlDep};
-use milpa_solver::{parse_version, solve, Dep as SolverDep, PackageProvider, Strategy, VersionSet};
+use milpa_solver::{
+    parse_version, solve, solve_with_refutation, vs_to_constraint_str, Dep as SolverDep,
+    PackageProvider, RefutationEntry, Strategy, VersionSet,
+};
 use milpa_types::{Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph, Version};
 
 use crate::error::{CoreError, MilpaError};
@@ -1627,6 +1630,190 @@ fn clear_dir(dir: &Path) -> Result<(), MilpaError> {
         std::fs::remove_dir_all(dir).map_err(io_err)?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Result certificate (resolver-semantics §5 + cli-contract §2.5)
+// ---------------------------------------------------------------------------
+
+/// One entry in the §5.1 success-certificate witness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WitnessEntry {
+    pub package: String,
+    pub version: String,
+    pub constraint: String,
+    pub satisfied_by: String,
+}
+
+/// §5.1 success certificate data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuccessCert {
+    /// Lexicographic by package name, root included.
+    pub resolved: Vec<(String, String)>,
+    /// Lexicographic by (package, satisfied_by).
+    pub witness: Vec<WitnessEntry>,
+}
+
+/// §5.2 failure certificate data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureCert {
+    /// Human-readable prose (any text; not byte-normative per spec).
+    pub message: String,
+    /// Weak UNSAT core — set-equality comparison by the harness.
+    pub refutation: Vec<RefutationEntry>,
+}
+
+/// Resolve and also build a §5 result certificate.
+///
+/// On success returns `Ok((graph, cert))`.
+/// On SOLVE-CONFLICT returns `Err((err, failure_cert))`.
+/// On any other error (manifest/fetch/index) returns `Err((err, failure_cert))` with
+/// an empty refutation (the certificate is only written when the resolver ran).
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_with_cert(
+    manifest: &milpa_manifest::Manifest,
+    index: Option<&Index>,
+    fetcher: &dyn FetcherRegistry,
+    profile: Option<&milpa_manifest::Profile>,
+    prior: Option<&Lockfile>,
+    strategy: Strategy,
+    deps_dir: &std::path::Path,
+) -> Result<(ResolvedGraph, SuccessCert), (MilpaError, FailureCert)> {
+    // All the same setup as `resolve`, but delegates to `solve_with_refutation`.
+    let filtered;
+    let manifest = match profile {
+        Some(p) => {
+            filtered = filter_manifest_by_profile(manifest, p);
+            &filtered
+        }
+        None => manifest,
+    };
+
+    let overrides: BTreeMap<String, Override> = manifest
+        .overrides
+        .iter()
+        .map(|ov| (ov.name.clone(), ov.clone()))
+        .collect();
+
+    let empty_index = Index::default();
+    let index: &Index = match index {
+        Some(i) => i,
+        None => {
+            let unresolvable: Vec<&str> = manifest
+                .deps
+                .iter()
+                .chain(manifest.dev_deps.iter())
+                .filter(|d| matches!(d, Dep::Named(_)) && !overrides.contains_key(d.name()))
+                .map(|d| d.name())
+                .collect();
+            if !unresolvable.is_empty() {
+                let err = res_err(
+                    "RES-NO-INDEX",
+                    format!(
+                        "manifest has named dep(s) {unresolvable:?} but no tianguis index was provided"
+                    ),
+                );
+                return Err((err, FailureCert { message: String::new(), refutation: Vec::new() }));
+            }
+            &empty_index
+        }
+    };
+
+    if let Err(e) = std::fs::create_dir_all(deps_dir).map_err(io_err) {
+        return Err((e, FailureCert { message: String::new(), refutation: Vec::new() }));
+    }
+
+    let project_root = deps_dir
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let mut provider = ResolveProvider::new(
+        fetcher,
+        index,
+        deps_dir.to_path_buf(),
+        project_root,
+        overrides,
+        prior,
+    );
+
+    let queue = match provider.seed_root(manifest) {
+        Ok(q) => q,
+        Err(e) => return Err((e, FailureCert { message: String::new(), refutation: Vec::new() })),
+    };
+    if let Err(e) = provider.process_items(queue) {
+        return Err((e, FailureCert { message: String::new(), refutation: Vec::new() }));
+    }
+    provider.finalize();
+
+    match solve_with_refutation(&provider, ROOT, root_version(), strategy) {
+        Ok(solution) => {
+            if let Some(e) = provider.take_error() {
+                return Err((e, FailureCert { message: String::new(), refutation: Vec::new() }));
+            }
+            let cert = provider.build_success_cert(&solution);
+            let graph = provider.build_graph(&solution);
+            Ok((graph, cert))
+        }
+        Err((solver_err, refutation)) => {
+            let message = solver_err.to_string();
+            Err((
+                MilpaError::Solver(solver_err),
+                FailureCert { message, refutation },
+            ))
+        }
+    }
+}
+
+impl ResolveProvider<'_> {
+    /// Build a §5.1 success certificate from the completed solve.
+    ///
+    /// `resolved`: all packages in the solution (including root) sorted by name.
+    /// `witness`: one entry per dep-edge across all resolved packages, sorted
+    ///   by (package, satisfied_by) per spec §2.5.1.
+    fn build_success_cert(&self, solution: &BTreeMap<String, Version>) -> SuccessCert {
+        // resolved — sorted by package name (BTreeMap iteration is already sorted).
+        let resolved: Vec<(String, String)> = solution
+            .iter()
+            .map(|(pkg, ver)| (pkg.clone(), ver.to_string()))
+            .collect();
+
+        // witness — one entry per dep edge (depender → dep, with constraint).
+        // A dep edge: package `depender` at `depender_version` requires `dep` in
+        // `constraint_vs`. We iterate every resolved package's `Candidate.deps`.
+        let cands = self.candidates.borrow();
+        let mut entries: Vec<WitnessEntry> = Vec::new();
+        let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
+
+        for (depender, depender_ver) in solution {
+            if let Some(c) = cands
+                .get(depender)
+                .and_then(|m| m.get(depender_ver))
+            {
+                for dep in &c.deps {
+                    // Only emit witness entries for packages that are in the solution.
+                    let Some(dep_ver) = solution.get(&dep.package) else {
+                        continue;
+                    };
+                    let cstr = vs_to_constraint_str(&dep.constraint);
+                    let key = (dep.package.clone(), cstr.clone(), depender.clone());
+                    if seen.insert(key) {
+                        entries.push(WitnessEntry {
+                            package: dep.package.clone(),
+                            version: dep_ver.to_string(),
+                            constraint: cstr,
+                            satisfied_by: depender.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Sort per §2.5.1: lexicographic by (package, satisfied_by).
+        entries.sort_by(|a, b| a.package.cmp(&b.package).then(a.satisfied_by.cmp(&b.satisfied_by)));
+
+        SuccessCert { resolved, witness: entries }
+    }
 }
 
 #[cfg(test)]

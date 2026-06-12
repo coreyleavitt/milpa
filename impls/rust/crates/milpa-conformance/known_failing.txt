@@ -7,4 +7,6 @@
 # S5a: lockfile-parse wired — 12 LOCK-* parse-error fixtures greened + removed
 #     (066-077). 43 remain (resolve/frozen/tng/ws/res success+error paths,
 #     pending S4/S5b/S6-S13).
-
+#
+# check-certificate: wired in batch 2 via --certificate CLI flag.
+# Skipped in-process (CliOnly); verified by the black-box harness.

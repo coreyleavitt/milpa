@@ -11,10 +11,11 @@ Design constraints:
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from harness.runner import RunResult
 
@@ -86,6 +87,62 @@ def _normalize_deps_structure(scratch_dir: str, cas_dir: str) -> Optional[str]:
 # Public assertion entry point
 # ---------------------------------------------------------------------------
 
+def _is_check_certificate_cmd(cmd: str) -> bool:
+    """True when the fixture cmd is check-certificate."""
+    head = cmd.split()[0] if cmd.split() else ""
+    return head == "check-certificate"
+
+
+def _compare_certificate_json(
+    got: dict[str, Any],
+    expected: dict[str, Any],
+) -> Optional[str]:
+    """Canonical JSON comparison for certificates (conformance-fixtures §2.7.3).
+
+    - Object comparison is key-order-independent.
+    - ``resolved`` and ``witness`` arrays are order-sensitive.
+    - ``message`` field is EXCLUDED from comparison.
+    - ``refutation`` is set-equality: sort both by (package, constraint).
+
+    Returns None on match, or a human-readable mismatch string.
+    """
+    if got.get("kind") != expected.get("kind"):
+        return f"kind mismatch: expected {expected.get('kind')!r}, got {got.get('kind')!r}"
+
+    if got["kind"] == "success":
+        if got.get("resolved") != expected.get("resolved"):
+            return (
+                f"resolved mismatch:\n"
+                f"  expected: {json.dumps(expected.get('resolved'))}\n"
+                f"  got:      {json.dumps(got.get('resolved'))}"
+            )
+        if got.get("witness") != expected.get("witness"):
+            return (
+                f"witness mismatch:\n"
+                f"  expected: {json.dumps(expected.get('witness'))}\n"
+                f"  got:      {json.dumps(got.get('witness'))}"
+            )
+    elif got["kind"] == "failure":
+        # message: excluded
+        def _sort_ref(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return sorted(
+                entries,
+                key=lambda e: (e.get("package", ""), e.get("constraint", "")),
+            )
+        got_ref = _sort_ref(got.get("refutation", []))
+        exp_ref = _sort_ref(expected.get("refutation", []))
+        if got_ref != exp_ref:
+            return (
+                f"refutation set mismatch:\n"
+                f"  expected (sorted): {json.dumps(exp_ref)}\n"
+                f"  got (sorted):      {json.dumps(got_ref)}"
+            )
+    else:
+        return f"unknown certificate kind: {got.get('kind')!r}"
+
+    return None
+
+
 def assert_conformance(
     run: RunResult,
     fixture_dir: Path,
@@ -115,7 +172,12 @@ def assert_conformance(
     cmd_file = fixture_dir / "cmd"
     cmd = cmd_file.read_text().strip() if cmd_file.exists() else "resolve"
 
-    if is_error_fixture:
+    if _is_check_certificate_cmd(cmd):
+        _assert_check_certificate_fixture(
+            run, fixture_dir, expected_dir, cmd, is_error_fixture,
+            failures, normalized_outputs,
+        )
+    elif is_error_fixture:
         _assert_error_fixture(run, fixture_dir, expected_dir, cmd, failures, normalized_outputs)
     elif _is_liveness_cmd(cmd):
         _assert_liveness_fixture(run, failures, normalized_outputs)
@@ -129,6 +191,85 @@ def assert_conformance(
         failures=failures,
         normalized_outputs=normalized_outputs,
     )
+
+
+# ---------------------------------------------------------------------------
+# check-certificate fixture assertions (conformance-fixtures §2.7.3)
+# ---------------------------------------------------------------------------
+
+
+def _assert_check_certificate_fixture(
+    run: RunResult,
+    fixture_dir: Path,
+    expected_dir: Path,
+    cmd: str,
+    is_error_fixture: bool,
+    failures: list[AssertionFailure],
+    normalized_outputs: dict[str, str],
+) -> None:
+    """Assert a check-certificate fixture.
+
+    1. Assert certificate.json was emitted (run.cert_path must exist).
+    2. Compare emitted JSON to expected/certificate.json (canonical comparison).
+    3. Assert the normal exit/slug outcome (same as a resolve or error fixture).
+    """
+    # Step 1: certificate file must exist (unless the resolver never ran —
+    # a non-resolver error like MAN-KDL-SYNTAX won't have a cert).
+    cert_file = Path(run.cert_path) if run.cert_path else None
+    expected_cert_path = expected_dir / "certificate.json"
+
+    if expected_cert_path.exists():
+        # Fixture declares a certificate — impl must have written one.
+        if cert_file is None or not cert_file.exists():
+            failures.append(AssertionFailure(
+                fixture_name=run.fixture_name,
+                impl_name=run.impl_name,
+                kind="success-fixture",
+                detail=(
+                    f"check-certificate: impl did not write certificate to {run.cert_path!r} "
+                    f"(expected it to exist after the verb)"
+                ),
+            ))
+        else:
+            try:
+                got_cert = json.loads(cert_file.read_text(encoding="utf-8"))
+                expected_cert = json.loads(expected_cert_path.read_text(encoding="utf-8"))
+                mismatch = _compare_certificate_json(got_cert, expected_cert)
+                if mismatch:
+                    failures.append(AssertionFailure(
+                        fixture_name=run.fixture_name,
+                        impl_name=run.impl_name,
+                        kind="success-fixture",
+                        detail=f"check-certificate: {mismatch}",
+                    ))
+                else:
+                    # Record a stable marker for cross-impl comparison
+                    # (normalized: sort refutation, exclude message).
+                    normalized_outputs["expected/certificate.json"] = json.dumps(
+                        got_cert.get("kind", "")
+                    )
+            except Exception as e:
+                failures.append(AssertionFailure(
+                    fixture_name=run.fixture_name,
+                    impl_name=run.impl_name,
+                    kind="harness-error",
+                    detail=f"check-certificate: JSON parse error: {e}",
+                ))
+
+    # Step 2: normal exit/slug assertions.
+    # For an error fixture: assert exit 1 + correct slug.
+    # For a success fixture: assert exit 0 + no slug.
+    # We strip the "resolve" cmd from the command to get the verb-level
+    # assertion; _assert_error_fixture / _assert_success_fixture already handle
+    # the sub-command case, so we can delegate to them but treat cmd as "resolve"
+    # for their purposes (they only need to know it's not frozen/parse-lockfile).
+    effective_cmd = "resolve"  # check-certificate is a resolve-class fixture
+    if is_error_fixture:
+        _assert_error_fixture(
+            run, fixture_dir, expected_dir, effective_cmd, failures, normalized_outputs,
+        )
+    else:
+        _assert_success_fixture(run, expected_dir, cmd, failures, normalized_outputs)
 
 
 # ---------------------------------------------------------------------------

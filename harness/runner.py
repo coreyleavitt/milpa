@@ -47,6 +47,7 @@ class RunResult:
     slug_error: Optional[str]     # non-None = protocol violation (2+ slug lines)
     scratch_dir: str              # path to the isolated scratch dir
     cas_dir: str                  # path to the isolated CAS dir
+    cert_path: Optional[str] = None  # path to the emitted certificate (check-certificate only)
 
 
 def _read_cmd(fixture_dir: Path) -> str:
@@ -179,6 +180,12 @@ def _cmd_to_cli(cmd: str) -> tuple[list[str], list[str]]:
     if head == "--version":
         # --version is a global flag, not a verb; the impl prints + exits 0.
         return ["--version"], []
+    if head == "check-certificate":
+        # "check-certificate" → verb=fetch; "check-certificate lock" → verb=lock
+        verb = tokens[1] if len(tokens) >= 2 and tokens[1] in ("fetch", "lock") else "fetch"
+        # --certificate flag goes in global_flags; the runner must provide a tmp path.
+        # We use a sentinel that run_fixture replaces with a real path.
+        return ["--certificate", "__CERT_PATH__"], [verb]
     if head == "add":
         return [], _add_argv(tokens[1:])
     if head == "remove":
@@ -241,6 +248,13 @@ def run_fixture(
     scratch = Path(tempfile.mkdtemp(prefix=f"milpa-harness-{descriptor.name}-"))
     cas_dir = Path(tempfile.mkdtemp(prefix=f"milpa-harness-cas-{descriptor.name}-"))
 
+    # Resolve the __CERT_PATH__ sentinel for check-certificate fixtures.
+    cert_path: Optional[str] = None
+    if "__CERT_PATH__" in global_flags:
+        cert_file = scratch / "_milpa_certificate.json"
+        cert_path = str(cert_file)
+        global_flags = [cert_path if f == "__CERT_PATH__" else f for f in global_flags]
+
     try:
         _copy_fixture_inputs(fixture_dir, scratch)
 
@@ -276,6 +290,7 @@ def run_fixture(
             slug_error=None,
             scratch_dir=str(scratch),
             cas_dir=str(cas_dir),
+            cert_path=cert_path,
         )
 
     slug, slug_error = _extract_slug(proc.stderr)
@@ -290,4 +305,5 @@ def run_fixture(
         slug_error=slug_error,
         scratch_dir=str(scratch),
         cas_dir=str(cas_dir),
+        cert_path=cert_path,
     )

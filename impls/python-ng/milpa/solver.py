@@ -436,6 +436,40 @@ def solve(
     the current constraint (URL deps with one version are unaffected).
     See ``Strategy`` for the semantics of each mode.
     """
+    solution, _ = _solve_internal(provider, root, root_version, strategy=strategy)
+    return solution
+
+
+def solve_with_cert(
+    provider: PackageProvider,
+    root: str,
+    root_version: Version,
+    *,
+    strategy: Strategy = Strategy.MAXVER,
+) -> tuple[dict[str, Version], SolveSuccess]:
+    """Like ``solve()``, but also returns the §5.1 success certificate.
+
+    Used by the resolver when ``--certificate`` is active.  Raises
+    ``SolverError`` on unsatisfiable constraints (the caller is responsible
+    for building the §5.2 failure certificate from the error's ``refutation``).
+    """
+    solution, incompats = _solve_internal(provider, root, root_version, strategy=strategy)
+    cert = build_success_certificate(solution, incompats, root)
+    return solution, cert
+
+
+def _solve_internal(
+    provider: PackageProvider,
+    root: str,
+    root_version: Version,
+    *,
+    strategy: Strategy = Strategy.MAXVER,
+) -> tuple[dict[str, Version], list[Incompatibility]]:
+    """Inner solve loop — returns (solution, all_incompats).
+
+    Shared implementation used by both ``solve()`` and ``solve_with_cert()``.
+    Raises ``SolverError`` on unsatisfiable constraints.
+    """
     incompats: list[Incompatibility] = [
         Incompatibility(
             terms=(Term.forbid(root, VersionSet.eq(root_version)),),
@@ -475,7 +509,7 @@ def solve(
                 strategy=strategy,
             )
             if next_package is None:
-                return partial.decisions()
+                return partial.decisions(), incompats
         except _Conflict as conflict:
             if not conflict.incompat.cause.startswith("conflict-blocks:"):
                 root_cause_conflicts.append(conflict.incompat)
@@ -731,6 +765,10 @@ def build_success_certificate(
                     satisfied_by=satisfied_by,
                 )
             )
+
+    # Sort witness per spec §2.5.1: lexicographic by package (same order as
+    # resolved), then by satisfied_by within the same package.
+    entries.sort(key=lambda e: (e.package, e.satisfied_by))
 
     return SolveSuccess(resolved=resolved, witness=tuple(entries))
 
