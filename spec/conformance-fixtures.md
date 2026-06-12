@@ -150,9 +150,11 @@ fixture-NNN-<slug>/
     <member>/                  # workspace fixtures only: one dir per member
       nim.cfg                  #   the member's own nim.cfg (see §2.5)
     _deps_structure.txt
+    certificate.json           # check-certificate fixtures only (see §2.7.3)
   # — OR for an error fixture (see §3) —
   expected/
     error                      # contains the bare error slug
+    certificate.json           # check-certificate error fixtures only (see §2.7.3)
 ```
 
 > NOTE: A single-package fixture has exactly one `expected/nim.cfg`. A
@@ -447,7 +449,8 @@ the CAS-admission and symlink-creation steps defined in `spec/identity.md`
 > be one of the following selectors. The `resolve` / `parse-lockfile` / `frozen`
 > selectors take no further tokens. The mutation selectors (`add` / `remove` /
 > `update`) and the liveness selectors (`show` / `--version`) take the argv
-> tokens defined below.
+> tokens defined below. The `check-certificate` selector takes an optional
+> verb token (`fetch` or `lock`; default `fetch`).
 >
 > - `resolve` — parse `milpa.kdl` (and optionally `index.kdl`) and resolve the
 >   dep graph against mocked-fetches. This is the default when `cmd` is absent.
@@ -458,6 +461,9 @@ the CAS-admission and symlink-creation steps defined in `spec/identity.md`
 > - `frozen` — exercise the no-network frozen fast path: parse `milpa.kdl` and
 >   `milpa.lock`, optionally seed the CAS from `cas-seed/`, then resolve without
 >   fetching. Used for `FROZEN-*` fixtures; MAY be a success or error fixture.
+> - `check-certificate` — resolve and assert the `--certificate` JSON output
+>   alongside the normal exit/slug. MAY be a success or error fixture (see
+>   §2.7.3).
 
 #### 2.7.1  Mutation selectors (`add` / `remove` / `update`)
 
@@ -506,6 +512,89 @@ the CAS-admission and symlink-creation steps defined in `spec/identity.md`
 > MAY be omitted. When `cmd` is `frozen`, `milpa.lock` MUST be present;
 > `index.kdl` and `mocked-fetches/` MAY be omitted if the fixture does not
 > exercise the resolve path.
+
+#### 2.7.3  Certificate selector (`check-certificate`)
+
+> NORMATIVE: The `check-certificate` selector exercises the `--certificate`
+> flag defined in `spec/cli-contract.md` §2.5. The `cmd` line for this selector
+> is the bare token `check-certificate`; the runner maps it to the invocation:
+>
+> ```
+> milpa --certificate <tmp-path> fetch   # (or lock, per §2.7.3 verb choice)
+> ```
+>
+> The verb is `fetch` unless the fixture's `cmd` line is
+> `check-certificate lock`, in which case `lock` is used. When `cmd` is
+> the bare `check-certificate`, `fetch` is the default verb.
+>
+> A `check-certificate` fixture is always a **resolve** fixture (not
+> `parse-lockfile` or `frozen`): it requires `milpa.kdl` and MAY include
+> `index.kdl`, `mocked-fetches/`, and `milpa.lock` (as a prior lockfile per
+> §2.9). It MUST contain `expected/certificate.json`.
+
+> NORMATIVE: The runner MUST:
+>
+> 1. Invoke the implementation with `--certificate <tmp-path>` as a global flag
+>    alongside the designated verb and the fixture's standard inputs
+>    (`MILPA_MOCKED_FETCHES`, `MILPA_INDEX_URL`, `MILPA_CACHE_DIR`, etc.
+>    applied as usual).
+> 2. After the verb exits, read the file at `<tmp-path>` (it MUST exist unless
+>    the fixture is a non-resolver error fixture — see below).
+> 3. Parse the emitted file as JSON and compare it to `expected/certificate.json`
+>    (also parsed as JSON) using the **canonical JSON comparison** defined below.
+> 4. Also assert the exit code and slug as for a normal success or error fixture
+>    (§3): a `check-certificate` fixture asserts BOTH the certificate JSON AND
+>    the verb's normal exit/slug. These are independent assertions; both MUST
+>    pass.
+
+> NORMATIVE: **Canonical JSON comparison for certificates.**
+>
+> - Object comparison is **key-order-independent**: two JSON objects with the
+>   same keys and values are equal regardless of their serialised key order.
+> - Array comparison is **order-sensitive** for the `resolved` and `witness`
+>   arrays: entries MUST appear in the order mandated by `cli-contract.md`
+>   §2.5.1 (lexicographic by `package`, then by `satisfied_by` within
+>   `package`). A conformant implementation that emits a different order fails
+>   the fixture.
+> - The `message` field in a failure certificate is **excluded from
+>   comparison**: the runner MUST NOT compare `message` values. The expected
+>   `certificate.json` for a failure fixture MUST set `message` to `null` to
+>   make the exclusion explicit and machine-enforceable.
+> - The `refutation` array in a failure certificate is compared for **set
+>   equality** (order-independent), not sequence equality. The runner MUST sort
+>   both arrays by `(package, constraint)` before comparing. The expected
+>   `certificate.json` for a failure fixture MAY list entries in any order.
+> - Numeric values and string values are compared by value, not by lexical form.
+
+**`expected/` layout for `check-certificate` fixtures.**
+
+> NORMATIVE: A `check-certificate` success fixture MUST contain:
+>
+> - `expected/certificate.json` — the expected certificate JSON (comparison
+>   semantics above).
+> - `expected/milpa.lock` — the expected lockfile (byte-exact, as for a normal
+>   `resolve` success fixture). When the verb is `fetch`, `expected/nim.cfg`
+>   and `expected/_deps_structure.txt` MUST also be present; when the verb is
+>   `lock`, they MUST NOT be present (consistent with §5.2).
+>
+> A `check-certificate` error fixture (one where the verb exits 1 because the
+> resolve is UNSATISFIABLE) MUST contain:
+>
+> - `expected/error` — the bare slug (e.g. `SOLVE-CONFLICT`), as for a normal
+>   error fixture.
+> - `expected/certificate.json` — the expected failure certificate. The
+>   `message` field MUST be `null`. The `refutation` array MUST list the
+>   contributing incompatibilities (compared as a set, not a sequence).
+>
+> An error fixture for a non-resolver error (e.g. `MAN-KDL-SYNTAX`) MUST NOT
+> contain `expected/certificate.json`: no certificate is emitted when the
+> resolver never runs, so the runner MUST NOT expect the file.
+
+> NOTE: The `check-certificate` selector is the **only** mechanism for
+> conformance-testing the `--certificate` flag. A `resolve` fixture does not
+> assert the certificate even if `--certificate` were passed; conversely, a
+> `check-certificate` fixture MUST pass `--certificate` and MUST assert the
+> JSON. The two fixture types are orthogonal.
 
 ### 2.8  `env` — target-profile overrides (optional)
 

@@ -50,13 +50,16 @@ A conformant implementation of this spec MUST:
     (§8.1); required for air-gapped and mirror deployments.
 13. Honour `MILPA_MOCKED_FETCHES` as the deterministic conformance fetch
     transport (§8.4); required for black-box corpus conformance.
+14. Accept `--certificate <path>` as a global flag; when given, write the
+    result certificate as JSON to `<path>` for every solver-running verb
+    (`fetch`, `lock`) — on both success and failure outcomes (§2.5).
 
 ---
 
 ## 1  Invocation form
 
 ```
-milpa [--version] [-C <dir>] [-j <N>] [-s <mode>] [--frozen] <verb> [<verb-args>]
+milpa [--version] [-C <dir>] [-j <N>] [-s <mode>] [--frozen] [--certificate <path>] <verb> [<verb-args>]
 ```
 
 > NORMATIVE: The implementation MUST support the short flag `-C` (and
@@ -136,6 +139,133 @@ uses them. Verbs that have no use for a flag silently ignore it.
 > attempt unconditionally in `_try_frozen` / `_try_workspace_frozen`; the
 > `frozen` boolean only gates whether a `NotFrozen` result is an error or
 > a silent fallthrough.
+
+### 2.5  `--certificate <path>`
+
+This flag provides an exit-code–orthogonal channel for the result certificate
+defined in `spec/resolver-semantics.md` §5. It applies to the solver-running
+verbs (`fetch` and `lock`) — the only verbs that invoke the resolver and produce
+a solve result. All other verbs silently ignore it.
+
+> NORMATIVE: When `--certificate <path>` is given and the verb runs the resolver,
+> the implementation MUST write the solve result as a JSON document to `<path>`,
+> regardless of whether the resolve succeeded or failed. The write is
+> **orthogonal** to the normal exit-code and slug discipline (R1–R4):
+>
+> - **SATISFIABLE resolve:** write the success certificate (§2.5.1), exit 0,
+>   emit NO `milpa-error:` line — as usual.
+> - **UNSATISFIABLE resolve (`SOLVE-CONFLICT`):** write the failure certificate
+>   (§2.5.2), AND exit 1 with the normal `milpa-error: SOLVE-CONFLICT` slug —
+>   as if `--certificate` were absent. The certificate never suppresses a slug.
+>
+> The write MUST be **atomic**: the implementation MUST write to a sibling
+> temporary file and rename it into place. On any failure before the rename
+> (disk error, serialisation error) the file at `<path>` MUST be left
+> absent or unchanged (consistent with the §5.6 atomic-write discipline used
+> for `milpa.lock` and `milpa.kdl`).
+
+> NORMATIVE: `--certificate` MUST NOT add or suppress any `milpa-error:` slug
+> line. R1–R4 are unaffected. The certificate is a side-output; it carries no
+> new error codes. A tooling consumer that wants the resolve outcome reads the
+> certificate JSON `kind` field; it MUST NOT rely on the presence or absence of
+> `--certificate` to change the exit-code semantics.
+
+#### 2.5.1  Success certificate JSON schema
+
+> NORMATIVE: On a SATISFIABLE resolve the certificate MUST be a JSON object of
+> the following schema (derived from `resolver-semantics.md` §5.1):
+>
+> ```json
+> {
+>   "kind": "success",
+>   "resolved": [
+>     {"package": "<name>", "version": "<semver>"},
+>     ...
+>   ],
+>   "witness": [
+>     {
+>       "package":      "<name>",
+>       "version":      "<semver>",
+>       "constraint":   "<constraint-string>",
+>       "satisfied_by": "<consuming-package-name>"
+>     },
+>     ...
+>   ]
+> }
+> ```
+>
+> Field semantics (cross-reference `resolver-semantics.md` §5.1):
+>
+> - `kind` — the string literal `"success"`. The discriminant field; always
+>   present.
+> - `resolved` — an array of `{package, version}` objects, one per package in
+>   the solved graph. `package` is the dep name (string); `version` is the
+>   selected version as a semver string `X.Y.Z`. The validity predicate
+>   requires every named package to be in the candidate set.
+> - `witness` — an array of `{package, version, constraint, satisfied_by}`
+>   objects, one per declared dep constraint across all resolved packages.
+>   `package` is the dep name; `version` is the selected version for that dep;
+>   `constraint` is the constraint string as declared by the consuming package;
+>   `satisfied_by` is the name of the package that declared the constraint.
+>   The validity predicate is:
+>   `VersionSet.from_constraint(constraint).contains(parse_version(version))`.
+>   Every declared constraint across all resolved packages MUST appear as
+>   exactly one entry.
+>
+> Array ordering:
+>
+> - `resolved` entries MUST be ordered lexicographically by `package` name
+>   (consistent with the canonical emission order defined in
+>   `resolver-semantics.md` §4.4).
+> - `witness` entries MUST be ordered in the same lexicographic-by-dep-name
+>   order as `resolved`; within entries for the same `package`, ordering is
+>   by `satisfied_by` (lexicographic). This order is deterministic and
+>   implementation-independent.
+
+> NOTE: The reference serialiser is `certificate_to_json` in `solver.py` (the
+> new `impls/python-ng` impl) and its Rust equivalent. It produces the JSON
+> with `indent=2` (two-space indentation). The indentation style is NOT
+> byte-normative for the conformance check: the `check-certificate` fixture
+> type (`conformance-fixtures.md` §2.7.3) compares parsed JSON objects, not
+> raw bytes.
+
+#### 2.5.2  Failure certificate JSON schema
+
+> NORMATIVE: On an UNSATISFIABLE resolve the certificate MUST be a JSON object
+> of the following schema (derived from `resolver-semantics.md` §5.2):
+>
+> ```json
+> {
+>   "kind": "failure",
+>   "message": "<human-readable conflict prose>",
+>   "refutation": [
+>     {"package": "<name>", "constraint": "<constraint-string>"},
+>     ...
+>   ]
+> }
+> ```
+>
+> Field semantics (cross-reference `resolver-semantics.md` §5.2):
+>
+> - `kind` — the string literal `"failure"`. The discriminant field; always
+>   present.
+> - `message` — a human-readable description of the conflict. This field is
+>   present but is **NOT byte-normative**: two conformant implementations MAY
+>   render the conflict prose differently; neither is wrong. Conformance
+>   checking MUST NOT byte-compare `message`.
+> - `refutation` — an array of `{package, constraint}` objects forming the
+>   weak UNSAT core (`resolver-semantics.md` §5.2). Each entry names a package
+>   and a constraint that contributed to the unsatisfiability. The named set
+>   MUST be genuinely unsatisfiable — no version assignment satisfies all
+>   constraints simultaneously. The conformance check (`check-certificate`
+>   fixture type, §2.7.3) asserts the set is genuinely unsatisfiable; it does
+>   NOT require byte-identical `refutation` arrays.
+
+> NORMATIVE: On an UNSATISFIABLE resolve the implementation MUST ALSO exit 1
+> with `milpa-error: SOLVE-CONFLICT` on stderr (the normal R1–R4 failure
+> protocol). Writing the failure certificate does NOT replace that line and does
+> NOT count as the `milpa-error:` line. R2 still requires exactly one
+> `milpa-error:` line on stderr.
 
 ---
 
@@ -865,17 +995,17 @@ implementation-specific and not frozen by this spec.
 
 ## Appendix A — Summary table
 
-| Verb      | Args                     | `--frozen` | `-j` | `-s` | Stdout     | Stderr           | Exit |
-|-----------|--------------------------|-----------|------|------|------------|------------------|------|
-| `fetch`   | —                        | yes       | yes  | yes  | none       | progress/error   | 0/1  |
-| `lock`    | —                        | ignored   | yes  | yes  | none       | progress/error   | 0/1  |
-| `show`    | —                        | ignored   | —    | —    | dep tree   | error only       | 0/1  |
-| `verify`  | —                        | ignored   | —    | —    | none       | progress/error   | 0/1  |
-| `clean`   | —                        | ignored   | —    | —    | none       | none/confirm     | 0    |
-| `add`     | `<dep> --git/--mirror`   | ignored   | —    | yes  | none       | summary/error    | 0/1  |
-| `remove`  | `<dep>`                  | ignored   | —    | yes  | none       | summary/error    | 0/1  |
-| `update`  | `[<dep>]`                | ignored   | yes  | yes  | none       | summary/error    | 0/1  |
-| `publish` | *(out-of-scope)*         | —         | —    | —    | —          | —                | —    |
+| Verb      | Args                     | `--frozen` | `-j` | `-s` | `--certificate` | Stdout     | Stderr           | Exit |
+|-----------|--------------------------|-----------|------|------|-----------------|------------|------------------|------|
+| `fetch`   | —                        | yes       | yes  | yes  | yes (§2.5)      | none       | progress/error   | 0/1  |
+| `lock`    | —                        | ignored   | yes  | yes  | yes (§2.5)      | none       | progress/error   | 0/1  |
+| `show`    | —                        | ignored   | —    | —    | ignored         | dep tree   | error only       | 0/1  |
+| `verify`  | —                        | ignored   | —    | —    | ignored         | none       | progress/error   | 0/1  |
+| `clean`   | —                        | ignored   | —    | —    | ignored         | none       | none/confirm     | 0    |
+| `add`     | `<dep> --git/--mirror`   | ignored   | —    | yes  | ignored         | none       | summary/error    | 0/1  |
+| `remove`  | `<dep>`                  | ignored   | —    | yes  | ignored         | none       | summary/error    | 0/1  |
+| `update`  | `[<dep>]`                | ignored   | yes  | yes  | ignored         | none       | summary/error    | 0/1  |
+| `publish` | *(out-of-scope)*         | —         | —    | —    | —               | —          | —                | —    |
 
 ---
 
