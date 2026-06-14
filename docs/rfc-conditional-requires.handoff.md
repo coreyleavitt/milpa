@@ -1,7 +1,8 @@
 # rfc-conditional-requires (#26) — handoff
 
-- **Stage:** 3 (/tdd grind) — **S1+S2+S3a+S3b+S4+S5 done; S6 LAST**   •   **Round:** —
-- After S6: Stage 4 = `/code-review <#26 scope>` (natural `/clear` point first).
+- **Stage:** 3 COMPLETE — **all slices S1–S6 done + committed.** Next: Stage 4 `/code-review`.   •   **Round:** —
+- **Resume:** `/clear` first (between-stage), then `/code-review #26` (RFC `docs/rfc-conditional-requires.md`; scope = the 8 commits S1→S6).
+- **Deferred + filed:** `milpa show` CLI-only cond_requires conformance fixture → **#135** (cmd_show is unit-tested; corpus completeness only).
 - **Resume:** `/loop implement the next unimplemented RFC slice (docs/rfc-conditional-requires.md §9) with /tdd following the standing rules; after each slice report one progress line; stop when every slice is implemented`
 
 ## Stage-3 progress
@@ -11,7 +12,10 @@
 - [x] **S3b** — wired `parse_when_branches` into both scanners; predicates carried across `edge_sources` bridge onto `NamedRequire`/`UrlRequire`. **Python**: aligned `NimbleManifest.dep_predicates` tuple (shared `NamedDep`/`UrlDep` untouched); warning flips to fire ONLY on UNRECOGNIZED/poisoned. **Rust**: predicates inline on scanner-local `NimbleRequirement` variants; no warning channel. Colon-form `when X: requires "y"` now extracted (was missed). Dep set + lockfile byte-identical. Updated `test_when_block_emits_user_warning` (now uses `defined(release)` to keep asserting the warn path). 12 Py + 5 Rust tests; green.
 - [x] **S4** — additive `cond-require` lockfile recorder, both impls. `CondRequire`+`LockedDep.cond_requires`/`ResolvedDep.cond_requires`; `edgeset_to_terms` 3-tuple w/ `requires_predicates` dict (advisory only); threaded `_Candidate`→`ResolvedDep`→`LockedDep`. Canonical byte-identical emission (inline single `cond-require "x" platform="linux"` / `platform=(not)"linux"`; `{ when … }` block for AND; sorted after `requires`). Parser reads `(not)` tag. `cmd_show` shows it; frozen/verify/nimcfg read `requires` only. fixture-138 expected.lock gained the additive line (requires byte-identical — note: CLI harness `python3 -m harness` not re-run yet; validated in S6 w/ rust release rebuild). 29 Py + 14 Rust tests; round-trip identity; both gates verified green by control loop.
 - [x] **S5** — spec prose. `dep-decl.md` §1 (predicates field) + §7.5 (grammar table w/ NimMajor-all-5-operators + space-free nim value + posix exclusion, branch/poison algebra, warn-only-on-UNRECOGNIZED); `manifest-grammar.md` §5.3 mirror (§6 untouched); `lockfile-schema.md` §3.5 cond-require (inline + `{ when }` block, `(not)`, ordering) + CondRequire/cond_requires + #110 addendum. No version bump, no new error codes, in-code warning text already matched. Both gates green.
-- [ ] **S6 LAST** — conformance corpus + four-runner/harness validation. Per RFC §6/§9 S6: author cond-require fixtures (recognized single/elif/else, URL + dev-deps, **unrecognized→warns+no cond-require**, mixed recognized+unrecognized graph); fixture-138 already carries the additive line. **Add the `lockfile.cond-require` coverage clause ATOMICALLY with the fixture dirs** (register in `harness/coverage.py` `CLAUSE_INVENTORY` — else `test_inventory_fully_covered` reddens). Gate = ALL FOUR runners: `cd impls/python && uv run pytest` (python in-process) + `./dev-rust test --workspace` (rust in-process) + **rebuild rust release `./dev-rust build --release -p milpa-cli` THEN `python3 -m harness`** (python CLI + rust CLI) → zero divergence + coverage 100%. This is the slice that finally validates the CLI harness against the fixture-138 expected.lock change from S4.
+- [x] **S6** — conformance corpus + four-runner validation. 5 fixtures (166 translate, 167 negation elif/else block, 168 nim two-sided block, 169 unrecognized over-include, 170 multi-requires-per-branch) + 5 coverage clauses registered atomically. **ALL FOUR runners green**: python 1455 passed, rust workspace ok, `python3 -m harness` 168 fixtures ZERO divergence (post rust-release rebuild — validated fixture-138's S4 change for the first time), coverage 52/52 0 gaps. `milpa show` fixture deferred→#135.
+
+## ✅ #26 IMPLEMENTATION COMPLETE (Stage 3 done)
+8 commits S1→S6. Zero cross-impl divergence, spec updated, no version bump. Stage 4 = `/code-review #26`.
 
 ## Round 2 outcome — additive `cond-require` (NO genuine forks)
 The round-2 depth agent edited the RFC toward an *overloaded* `requires { when }` form;
