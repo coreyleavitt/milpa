@@ -95,22 +95,22 @@ impl NimbleEdgeSource {
         let mut requires = Vec::new();
         for req in &nm.requires {
             match req {
-                NimbleRequirement::Url { url, ref_spec, .. } => {
+                NimbleRequirement::Url { url, ref_spec, predicates, .. } => {
                     let ref_ = ref_spec.clone().unwrap_or_else(|| "main".to_string());
                     requires.push(RequireEntry::Url(UrlRequire {
                         url: url.clone(),
                         ref_,
-                        predicates: Vec::new(),
+                        predicates: predicates.clone(),
                     }));
                 }
-                NimbleRequirement::Named { name, constraint, .. } => {
+                NimbleRequirement::Named { name, constraint, predicates, .. } => {
                     if name == "nim" {
                         continue;
                     }
                     requires.push(RequireEntry::Named(NamedRequire {
                         name: name.clone(),
                         constraint_str: constraint.clone().unwrap_or_default(),
-                        predicates: Vec::new(),
+                        predicates: predicates.clone(),
                     }));
                 }
             }

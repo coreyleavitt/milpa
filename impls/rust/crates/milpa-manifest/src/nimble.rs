@@ -25,6 +25,10 @@ pub enum NimbleRequirement {
         url: String,
         /// `None` when no `#ref` was appended.
         ref_spec: Option<String>,
+        /// `when`-gate predicates (S3b — RFC §3.3).  Empty for unconditional
+        /// deps AND for deps from UNRECOGNIZED branches (over-include carries
+        /// no annotation; only recognized branches contribute predicates).
+        predicates: Vec<crate::Predicate>,
     },
     /// A named requirement (`requires "foo >= 0.5.0"`).
     Named {
@@ -32,6 +36,9 @@ pub enum NimbleRequirement {
         name: String,
         /// `None` for an any-version requirement.
         constraint: Option<String>,
+        /// `when`-gate predicates (S3b — RFC §3.3).  Empty for unconditional
+        /// deps AND for deps from UNRECOGNIZED branches.
+        predicates: Vec<crate::Predicate>,
     },
 }
 
@@ -46,11 +53,36 @@ pub struct NimbleManifest {
 /// Parse a `.nimble` file's text into a [`NimbleManifest`]. Never fails: an
 /// unrecognised file simply yields no requires and no `srcDir` (the heuristic
 /// scan is total).
+///
+/// **S3b (RFC §3.3):** recognized `when`/`elif`/`else` conditions are
+/// translated to `Predicate` tuples and attached to each extracted
+/// `NimbleRequirement`.  Every `requires` is still included unconditionally
+/// (dep set is unchanged vs pre-S3b); predicates are metadata only.
+/// Unrecognized branches and unconditional requires carry `predicates: vec![]`.
 pub fn parse_nimble(text: &str) -> NimbleManifest {
-    let mut specs: Vec<String> = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
     let mut src_dir: Option<String> = None;
 
-    let lines: Vec<&str> = text.lines().collect();
+    // --- Step 1: run the S3a branch tracker ---
+    let branches = parse_when_branches(&lines);
+
+    // Build line→predicates map.  `None` = unrecognized branch (over-include,
+    // no annotation).
+    let mut line_preds: std::collections::HashMap<usize, Option<Vec<crate::Predicate>>> =
+        std::collections::HashMap::new();
+    for branch in &branches {
+        for &ln in &branch.require_lines {
+            line_preds.insert(ln, branch.predicates.clone());
+        }
+    }
+
+    // --- Step 2: scan for srcDir + collect (spec, source_line_idx) pairs ---
+    // For plain `requires` lines and block-body requires, the source line is
+    // the `requires` keyword line itself.  For colon-form tails
+    // (`when …: requires "x"`), the source line is the header line (matching
+    // what parse_when_branches records).
+    let mut specs_with_lines: Vec<(String, usize)> = Vec::new();
+
     let mut i = 0;
     while i < lines.len() {
         let line = strip_comment(lines[i]);
@@ -63,8 +95,8 @@ pub fn parse_nimble(text: &str) -> NimbleManifest {
 
         if let Some(rest) = match_requires(&line) {
             let mut tail = rest.trim().to_string();
-            // Trailing-comma continuation: a `requires` clause that ends with a
-            // comma continues on the next line.
+            let req_line = i;
+            // Trailing-comma continuation.
             while tail.ends_with(',') {
                 i += 1;
                 if i >= lines.len() {
@@ -73,16 +105,75 @@ pub fn parse_nimble(text: &str) -> NimbleManifest {
                 tail.push(' ');
                 tail.push_str(strip_comment(lines[i]).trim());
             }
-            extract_quoted(&tail, &mut specs);
+            let mut quoted = Vec::new();
+            extract_quoted(&tail, &mut quoted);
+            for spec in quoted {
+                specs_with_lines.push((spec, req_line));
+            }
+            i += 1;
+            continue;
+        }
+
+        // Colon-form: `when <cond>: requires "x"` or `elif <cond>: requires "x"`
+        // or `else: requires "x"`.  The tail is extracted here; source line = i.
+        if let Some(colon_specs) = extract_colon_form_requires(&line, i) {
+            specs_with_lines.extend(colon_specs);
         }
 
         i += 1;
     }
 
-    NimbleManifest {
-        requires: specs.iter().map(|s| parse_spec(s)).collect(),
-        src_dir,
+    // --- Step 3: build NimbleRequirements with attached predicates ---
+    let requires: Vec<NimbleRequirement> = specs_with_lines
+        .into_iter()
+        .map(|(spec, source_line)| {
+            // Predicate lookup: recognized branch → its predicates; unrecognized /
+            // absent → empty vec (over-include with no annotation).
+            let preds = match line_preds.get(&source_line) {
+                Some(Some(p)) => p.clone(),
+                _ => Vec::new(),
+            };
+            parse_spec(&spec, preds)
+        })
+        .collect();
+
+    NimbleManifest { requires, src_dir }
+}
+
+/// Extract specs from the colon-tail of a `when`/`elif`/`else` header line.
+///
+/// Returns `Some(vec)` of `(spec, line_idx)` pairs when the tail contains a
+/// `requires` keyword followed by quoted strings, `None` otherwise.
+/// `line_idx` is passed through from the caller (the header line index).
+fn extract_colon_form_requires(line: &str, line_idx: usize) -> Option<Vec<(String, usize)>> {
+    // Match when/elif/else header, then look for requires in the tail.
+    let tail = if let Some((_, _, t)) = match_when_header(line) {
+        t.to_string()
+    } else if let Some((_, _, t)) = match_elif_header(line) {
+        t.to_string()
+    } else if let Some((_, t)) = match_else_header(line) {
+        t.to_string()
+    } else {
+        return None;
+    };
+    if tail.is_empty() {
+        return None;
     }
+    // The tail must contain a `requires` keyword (word-boundary).
+    if !tail_has_requires(&tail) {
+        return None;
+    }
+    // Extract from the part after `requires`.
+    let rest = match match_requires(&tail) {
+        Some(r) => r.trim().to_string(),
+        None => return None,
+    };
+    let mut quoted = Vec::new();
+    extract_quoted(&rest, &mut quoted);
+    if quoted.is_empty() {
+        return None;
+    }
+    Some(quoted.into_iter().map(|s| (s, line_idx)).collect())
 }
 
 /// Strip a `# …` comment from a line, ignoring `#` inside double-quoted strings,
@@ -445,19 +536,24 @@ fn split_on_and(cond: &str) -> Option<(&str, &str)> {
 }
 
 /// Classify a single requirement spec into the right variant (`_parse_spec`).
-fn parse_spec(spec: &str) -> NimbleRequirement {
+///
+/// `predicates` are the `when`-gate predicates from the branch this spec
+/// was extracted from (empty for unconditional deps and UNRECOGNIZED branches).
+fn parse_spec(spec: &str, predicates: Vec<crate::Predicate>) -> NimbleRequirement {
     if URL_SCHEMES.iter().any(|s| spec.starts_with(s)) {
         if let Some((url, refp)) = spec.split_once('#') {
             return NimbleRequirement::Url {
                 spec: spec.to_string(),
                 url: url.to_string(),
                 ref_spec: Some(refp.to_string()),
+                predicates,
             };
         }
         return NimbleRequirement::Url {
             spec: spec.to_string(),
             url: spec.to_string(),
             ref_spec: None,
+            predicates,
         };
     }
     let mut parts = spec.splitn(2, char::is_whitespace);
@@ -470,6 +566,7 @@ fn parse_spec(spec: &str) -> NimbleRequirement {
         spec: spec.to_string(),
         name,
         constraint,
+        predicates,
     }
 }
 
@@ -502,6 +599,7 @@ mod tests {
                 spec: "foo >= 0.5.0".into(),
                 name: "foo".into(),
                 constraint: Some(">= 0.5.0".into()),
+                predicates: vec![],
             }]
         );
     }
@@ -515,6 +613,7 @@ mod tests {
                 spec: "foo".into(),
                 name: "foo".into(),
                 constraint: None,
+                predicates: vec![],
             }]
         );
     }
@@ -528,6 +627,7 @@ mod tests {
                 spec: "https://example.com/bar.git#v1".into(),
                 url: "https://example.com/bar.git".into(),
                 ref_spec: Some("v1".into()),
+                predicates: vec![],
             }]
         );
     }
@@ -541,6 +641,7 @@ mod tests {
                 spec: "https://example.com/bar.git".into(),
                 url: "https://example.com/bar.git".into(),
                 ref_spec: None,
+                predicates: vec![],
             }]
         );
     }
@@ -571,8 +672,121 @@ mod tests {
     #[test]
     fn when_block_includes_requires_unconditionally() {
         // `when` is never evaluated; the requires inside it are still extracted.
+        // S3b: recognized when (windows) → predicates populated.
         let nm = parse_nimble("when defined(windows):\n  requires \"winfoo\"\n");
         assert_eq!(nm.requires.len(), 1);
+        if let NimbleRequirement::Named { predicates, .. } = &nm.requires[0] {
+            assert_eq!(
+                predicates,
+                &vec![crate::Predicate {
+                    name: "platform".to_string(),
+                    values: vec!["windows".to_string()],
+                    negated: false,
+                }],
+                "S3b: recognized when (windows) must carry platform predicate"
+            );
+        } else {
+            panic!("expected Named requirement");
+        }
+    }
+
+    // ----- S3b: predicate propagation tests -----
+
+    #[test]
+    fn s3b_unconditional_requires_empty_predicates() {
+        let nm = parse_nimble("requires \"stew >= 0.1.0\"\n");
+        match &nm.requires[0] {
+            NimbleRequirement::Named { predicates, .. } => assert!(predicates.is_empty()),
+            _ => panic!("expected Named"),
+        }
+    }
+
+    #[test]
+    fn s3b_colon_form_recognized_predicates() {
+        // when defined(arm64): requires "neon" → predicates=(arch(arm64),)
+        let nm = parse_nimble("when defined(arm64): requires \"neon\"\n");
+        assert_eq!(nm.requires.len(), 1);
+        match &nm.requires[0] {
+            NimbleRequirement::Named { name, predicates, .. } => {
+                assert_eq!(name, "neon");
+                assert_eq!(predicates, &vec![crate::Predicate {
+                    name: "arch".to_string(),
+                    values: vec!["arm64".to_string()],
+                    negated: false,
+                }]);
+            }
+            _ => panic!("expected Named"),
+        }
+    }
+
+    #[test]
+    fn s3b_block_recognized_mixed() {
+        // when defined(linux): linuxpkg gets preds; common (outside) gets empty.
+        let text = "when defined(linux):\n  requires \"linuxpkg\"\nrequires \"common\"\n";
+        let nm = parse_nimble(text);
+        assert_eq!(nm.requires.len(), 2);
+        // linuxpkg: index 0 (order may vary; find by name)
+        let find = |n: &str| {
+            nm.requires.iter().find(|r| match r {
+                NimbleRequirement::Named { name, .. } => name == n,
+                _ => false,
+            })
+        };
+        if let Some(NimbleRequirement::Named { predicates, .. }) = find("linuxpkg") {
+            assert_eq!(predicates, &vec![crate::Predicate {
+                name: "platform".to_string(),
+                values: vec!["linux".to_string()],
+                negated: false,
+            }]);
+        } else { panic!("linuxpkg not found"); }
+        if let Some(NimbleRequirement::Named { predicates, .. }) = find("common") {
+            assert!(predicates.is_empty());
+        } else { panic!("common not found"); }
+    }
+
+    #[test]
+    fn s3b_unrecognized_empty_predicates() {
+        // defined(release) is UNRECOGNIZED → dep present, predicates empty
+        let nm = parse_nimble("when defined(release):\n  requires \"relpkg\"\n");
+        assert_eq!(nm.requires.len(), 1);
+        match &nm.requires[0] {
+            NimbleRequirement::Named { predicates, .. } => assert!(predicates.is_empty()),
+            _ => panic!("expected Named"),
+        }
+    }
+
+    #[test]
+    fn s3b_elif_else_predicates() {
+        let text = concat!(
+            "when defined(linux):\n  requires \"a\"\n",
+            "elif defined(macosx):\n  requires \"b\"\n",
+            "else:\n  requires \"c\"\n",
+        );
+        let nm = parse_nimble(text);
+        assert_eq!(nm.requires.len(), 3);
+        let find = |n: &str| {
+            nm.requires.iter().find(|r| match r {
+                NimbleRequirement::Named { name, .. } => name == n,
+                _ => false,
+            })
+        };
+        if let Some(NimbleRequirement::Named { predicates, .. }) = find("a") {
+            assert_eq!(predicates, &vec![crate::Predicate {
+                name: "platform".to_string(), values: vec!["linux".to_string()], negated: false,
+            }]);
+        } else { panic!("a not found"); }
+        if let Some(NimbleRequirement::Named { predicates, .. }) = find("b") {
+            assert_eq!(predicates, &vec![
+                crate::Predicate { name: "platform".to_string(), values: vec!["macosx".to_string()], negated: false },
+                crate::Predicate { name: "platform".to_string(), values: vec!["linux".to_string()], negated: true },
+            ]);
+        } else { panic!("b not found"); }
+        if let Some(NimbleRequirement::Named { predicates, .. }) = find("c") {
+            assert_eq!(predicates, &vec![
+                crate::Predicate { name: "platform".to_string(), values: vec!["linux".to_string()], negated: true },
+                crate::Predicate { name: "platform".to_string(), values: vec!["macosx".to_string()], negated: true },
+            ]);
+        } else { panic!("c not found"); }
     }
 }
 

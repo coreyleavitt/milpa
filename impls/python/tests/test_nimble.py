@@ -24,12 +24,14 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from milpa.dep_decl import NamedRequire, UrlRequire
 from milpa.errors import MilpaError
 from milpa.manifest import NamedDep, UrlDep
 from milpa.nimble import (
     NimbleManifest,
     parse_nimble,
 )
+from milpa.predicate import Predicate
 from milpa.workspace import _load_nimble_file
 
 # ---------------------------------------------------------------------------
@@ -244,11 +246,36 @@ class TestSrcDir:
 # ---------------------------------------------------------------------------
 
 
+def _plat(name: str) -> Predicate:
+    return Predicate(name="platform", values=(name,))
+
+
+def _notplat(name: str) -> Predicate:
+    return Predicate(name="platform", values=(name,), negated=True)
+
+
+def _arch(name: str) -> Predicate:
+    return Predicate(name="arch", values=(name,))
+
+
+def _preds(m: NimbleManifest, dep_name: str) -> tuple[Predicate, ...]:
+    """Return dep_predicates for the first dep with the given name."""
+    for i, dep in enumerate(m.deps):
+        if dep.name == dep_name:
+            if i < len(m.dep_predicates):
+                return m.dep_predicates[i]
+            return ()
+    raise KeyError(dep_name)
+
+
 class TestWhenBlockPolicy:
+    # --- original tests (warning-flip updated) ---
+
     def test_when_block_emits_user_warning(self) -> None:
+        """UNRECOGNIZED when (compound/release) still fires the warning."""
         text = (
-            'when defined(linux):\n'
-            '  requires "linuxpkg"\n'
+            'when defined(release):\n'
+            '  requires "relpkg"\n'
             'requires "common"\n'
         )
         with warnings.catch_warnings(record=True) as caught:
@@ -259,7 +286,7 @@ class TestWhenBlockPolicy:
         assert any("when" in msg for msg in warn_msgs)
 
     def test_when_block_includes_all_requires_unconditionally(self) -> None:
-        """All requires inside and outside when are included."""
+        """All requires inside and outside when are included (dep SET unchanged)."""
         text = (
             'requires "always"\n'
             'when defined(windows):\n'
@@ -289,6 +316,102 @@ class TestWhenBlockPolicy:
         user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
         assert len(user_warnings) == 0
         assert _names(m) == ["whenpkg"]
+
+    # --- S3b: new warning-flip + predicate tests ---
+
+    def test_recognized_when_block_no_warning(self) -> None:
+        """Recognized when (linux) → NO warning."""
+        text = 'when defined(linux):\n  requires "x"\n'
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            parse_nimble(text)
+        user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
+        assert len(user_warnings) == 0
+
+    # T1: colon form recognized
+    def test_t1_colon_form_recognized(self) -> None:
+        """when defined(arm64): requires "neon" → dep present; no warning; preds=(arch(arm64),)."""
+        text = 'when defined(arm64): requires "neon"\n'
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            m = parse_nimble(text)
+        assert "neon" in _names(m)
+        user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
+        assert len(user_warnings) == 0
+        assert _preds(m, "neon") == (_arch("arm64"),)
+
+    # T2: block recognized
+    def test_t2_block_recognized(self) -> None:
+        """when defined(linux): block → linuxpkg preds=(plat(linux),); common preds=()."""
+        text = (
+            'when defined(linux):\n'
+            '  requires "linuxpkg"\n'
+            'requires "common"\n'
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            m = parse_nimble(text)
+        assert "linuxpkg" in _names(m)
+        assert "common" in _names(m)
+        user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
+        assert len(user_warnings) == 0
+        assert _preds(m, "linuxpkg") == (_plat("linux"),)
+        assert _preds(m, "common") == ()
+
+    # T3: unrecognized → dep present, WARNING fires, preds=()
+    def test_t3_unrecognized_warns_and_includes(self) -> None:
+        """when defined(release) → dep present; WARNING; preds=()."""
+        text = 'when defined(release):\n  requires "relpkg"\n'
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            m = parse_nimble(text)
+        assert "relpkg" in _names(m)
+        user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
+        assert len(user_warnings) == 1
+        assert _preds(m, "relpkg") == ()
+
+    # T4: poisoned chain (or compound) → dep present, WARNING, preds=()
+    def test_t4_poisoned_chain(self) -> None:
+        """when defined(linux) or defined(macosx) → dep present; WARNING; preds=()."""
+        text = 'when defined(linux) or defined(macosx):\n  requires "a"\n'
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            m = parse_nimble(text)
+        assert "a" in _names(m)
+        user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
+        assert len(user_warnings) == 1
+        assert _preds(m, "a") == ()
+
+    # T5: elif/else propagation
+    def test_t5_elif_else_predicates(self) -> None:
+        """Full when/elif/else chain propagates predicates correctly; no warning."""
+        text = (
+            'when defined(linux):\n'
+            '  requires "a"\n'
+            'elif defined(macosx):\n'
+            '  requires "b"\n'
+            'else:\n'
+            '  requires "c"\n'
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            m = parse_nimble(text)
+        user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
+        assert len(user_warnings) == 0
+        assert _preds(m, "a") == (_plat("linux"),)
+        assert _preds(m, "b") == (_plat("macosx"), _notplat("linux"))
+        assert _preds(m, "c") == (_notplat("linux"), _notplat("macosx"))
+
+    # T6: no when → no warning, preds=()
+    def test_t6_no_when_no_preds(self) -> None:
+        """Unconditional requires → preds=()."""
+        text = 'requires "foo"\n'
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            m = parse_nimble(text)
+        user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
+        assert len(user_warnings) == 0
+        assert _preds(m, "foo") == ()
 
 
 # ---------------------------------------------------------------------------

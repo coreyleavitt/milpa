@@ -66,10 +66,24 @@ class NimbleManifest:
 
     ``deps`` is an ordered tuple of ``UrlDep | NamedDep`` (the ``"nim"``
     entry is excluded per §5.4).  ``src_dir`` is ``None`` when not found.
+
+    ``dep_predicates`` is a tuple aligned by index with ``deps``.  Each
+    element is the tuple of ``Predicate`` instances that apply to that dep
+    (S3b — RFC ``rfc-conditional-requires.md`` §3.3).  An empty tuple
+    means either the dep is unconditional or the branch was UNRECOGNIZED
+    (over-include carries no annotation).  Defaults to an empty tuple of
+    tuples for back-compat (old callers that ignore predicates are safe).
+
+    NOTE: ``NamedDep``/``UrlDep`` are shared with the ``milpa.kdl`` path
+    which MUST NOT gain predicates.  Predicates live here (scanner-local),
+    not on the dep objects themselves.  The bridge ``edge_sources._nimble_edges``
+    is the single crossing point that maps these onto ``NamedRequire``/
+    ``UrlRequire`` (which DO carry predicates per spec §3.3).
     """
 
     deps: tuple[UrlDep | NamedDep, ...]
     src_dir: str | None
+    dep_predicates: tuple[tuple[Predicate, ...], ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -109,26 +123,44 @@ def parse_nimble(
 ) -> NimbleManifest:
     """Parse a ``.nimble`` file's text into a ``NimbleManifest``.
 
-    NimScript ``when`` blocks are not evaluated (Turing-complete; milpa
-    does not run arbitrary code at resolve time).  If any ``when`` is
-    detected the spec-mandated ``UserWarning`` is emitted and all
-    ``requires`` are included unconditionally (over-inclusion is safe;
-    under-inclusion would silently break builds — §5.3).
+    NimScript ``when`` blocks: recognized conditions (§5.3 / RFC §3.1–3.2) are
+    translated to ``Predicate`` tuples and attached to each extracted require via
+    ``NimbleManifest.dep_predicates`` (S3b).  Every requires is STILL included
+    unconditionally (dep set is unchanged); predicates are metadata only.
+
+    Warning policy (S3b flip):
+    - Recognized branches → NO warning.
+    - Any UNRECOGNIZED branch in any chain → emit the spec-mandated ``UserWarning``.
+    This replaces the old "any ``when`` keyword → warn" rule.
 
     This function is **total**: it never raises for bad file content.
     """
-    raw_specs: list[str] = []
-    src_dir: str | None = None
-    has_when: bool = False
-
     lines = text.splitlines()
+    src_dir: str | None = None
+
+    # --- Step 1: run the S3a branch tracker to get per-line predicate mapping ---
+    branches = parse_when_branches(lines)
+
+    # Build line→predicates map.  ``None`` = unrecognized branch.
+    # A line can appear in at most one branch (parse_when_branches guarantees
+    # non-overlapping require_lines across branches).
+    line_preds: dict[int, tuple[Predicate, ...] | None] = {}
+    has_unrecognized = any(b.predicates is None for b in branches)
+    for branch in branches:
+        for ln in branch.require_lines:
+            line_preds[ln] = branch.predicates  # None = unrecognized
+
+    # --- Step 2: scan for srcDir + collect (spec, line_index) pairs ---
+    # We need to track which source line each spec came from so we can look up
+    # predicates.  For indented-block requires and the plain form the source
+    # line is the ``requires`` keyword line.  For the colon-form tail
+    # (``when …: requires "x"``) the source line is the header line itself
+    # (matching what parse_when_branches records).
+    raw_specs_with_lines: list[tuple[str, int]] = []  # (spec_string, source_line_idx)
+
     i = 0
     while i < len(lines):
         line = _strip_comment(lines[i])
-
-        # §5.3: detect ``when`` on any line.
-        if _WHEN_RE.match(line):
-            has_when = True
 
         # §5.2: ``srcDir`` — first match wins; single-line.
         srcdir_m = _SRCDIR_RE.match(line)
@@ -138,25 +170,34 @@ def parse_nimble(
             i += 1
             continue
 
-        # §5.1 forms 1-4: ``requires`` — collect raw quoted strings.
+        # §5.1 forms 1-4: plain ``requires`` statement.
         req_m = _REQUIRES_RE.match(line)
         if req_m:
             tail = req_m.group(1).rstrip()
-            # Form 3: multi-line continuation — lines ending with a comma
-            # (possibly with trailing whitespace/comment) are joined.
+            req_line = i
+            # Form 3: multi-line continuation — lines ending with a comma are joined.
             while tail.rstrip(",") != tail or tail.endswith(","):
-                # Tail ends with comma → consume the next line.
                 i += 1
                 if i >= len(lines):
                     break
                 next_line = _strip_comment(lines[i]).strip()
                 tail = tail + " " + next_line
-            raw_specs.extend(_QUOTED_RE.findall(tail))
+            for spec in _QUOTED_RE.findall(tail):
+                raw_specs_with_lines.append((spec, req_line))
+            i += 1
+            continue
+
+        # Colon-form requires: ``when …: requires "x"`` / ``elif …: requires "x"``
+        # The branch tracker already records these under the header line index.
+        # We need to extract the specs from the tail here so they get the header
+        # line as their source line (enabling predicate lookup).
+        colon_specs = _extract_colon_form_requires(line, i)
+        raw_specs_with_lines.extend(colon_specs)
 
         i += 1
 
-    # §5.3: emit the spec-mandated warning text verbatim.
-    if has_when:
+    # §5.3: emit the spec-mandated warning text iff any branch is UNRECOGNIZED.
+    if has_unrecognized:
         warnings.warn(
             ".nimble contains `when` block(s); milpa does not evaluate nimscript, so\n"
             "all `requires` are included unconditionally. If this over-includes,\n"
@@ -166,23 +207,17 @@ def parse_nimble(
             stacklevel=2,
         )
 
-    # Build typed deps; §5.4: drop ``"nim"`` requirements silently.
+    # --- Step 3: build typed deps with aligned predicates ---
+    # §5.4: drop ``"nim"`` requirements silently.
+    # Dedup key depends on dep kind (first occurrence wins).
     deps: list[UrlDep | NamedDep] = []
-    # Dedup key depends on dep kind:
-    # - NamedDep: dedup by name (first occurrence wins).
-    # - UrlDep: dedup by (name, git, ref) — identical provenance = duplicate.
-    #   Two UrlDeps with the same name but DIFFERENT URLs are NOT deduplicated
-    #   here; the resolver's provenance gate (resolver-semantics §10.3) detects
-    #   the conflict and raises RES-PROVENANCE-CONFLICT.
+    dep_predicates: list[tuple[Predicate, ...]] = []
     seen_named: set[str] = set()
     seen_url: set[tuple[str, str, str]] = set()
-    for spec in raw_specs:
+
+    for spec, source_line in raw_specs_with_lines:
         dep = _build_dep(spec)
         if dep is None:
-            # Empty spec or no package name → drop silently.
-            # Note: malformed constraints are NOT dropped here; _build_dep
-            # returns a NamedDep with constraint_set=None so the EdgeSource
-            # layer can escalate (NimbleFallback) or widen (MilpaKdl).
             continue
         if isinstance(dep, NamedDep) and dep.name == "nim":
             # §5.4: Nim compiler is v2 toolchain territory; drop.
@@ -192,14 +227,24 @@ def parse_nimble(
                 continue
             seen_named.add(dep.name)
         else:
-            # UrlDep: dedup by (name, git, ref) — same provenance = duplicate.
             url_key = (dep.name, dep.git, dep.ref)
             if url_key in seen_url:
                 continue
             seen_url.add(url_key)
-        deps.append(dep)
 
-    return NimbleManifest(deps=tuple(deps), src_dir=src_dir)
+        # Predicate lookup: recognized branch → its predicates; unrecognized /
+        # unconditional → empty tuple (over-include with no annotation).
+        raw_preds = line_preds.get(source_line)
+        preds: tuple[Predicate, ...] = raw_preds if raw_preds is not None else ()
+
+        deps.append(dep)
+        dep_predicates.append(preds)
+
+    return NimbleManifest(
+        deps=tuple(deps),
+        src_dir=src_dir,
+        dep_predicates=tuple(dep_predicates),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +334,37 @@ def _build_dep(spec: str) -> UrlDep | NamedDep | None:
     object.__setattr__(dep, "constraint", constraint_str)
     object.__setattr__(dep, "constraint_set", constraint_set)
     return dep
+
+
+def _extract_colon_form_requires(line: str, line_idx: int) -> list[tuple[str, int]]:
+    """Extract specs from the colon-tail of a ``when``/``elif``/``else`` header.
+
+    Handles: ``when <cond>: requires "x"`` and ``elif <cond>: requires "x"``.
+    Returns a list of ``(spec_string, line_idx)`` pairs (empty if none found).
+
+    The ``line_idx`` is the header line itself — matching what
+    ``parse_when_branches`` records in ``WhenBranch.require_lines``.
+
+    Only extracts when the tail (post-colon text) contains a ``requires``
+    keyword followed by at least one quoted string.  The line must be a
+    ``when``/``elif``/``else`` header (matched by ``_WHEN_HEADER_RE`` etc.).
+    """
+    # Match when/elif/else header with a non-empty tail.
+    m = _WHEN_HEADER_RE.match(line) or _ELIF_HEADER_RE.match(line) or _ELSE_HEADER_RE.match(line)
+    if m is None:
+        return []
+    # For when/elif: group(3) is the tail; for else: group(2) is the tail.
+    # Both regexes capture tail as the last group.
+    tail = m.group(m.lastindex).strip() if m.lastindex else ""
+    if not tail:
+        return []
+    # Check the tail starts with (or contains) a ``requires`` keyword.
+    req_m = _REQUIRES_RE.match(tail)
+    if not req_m:
+        return []
+    req_tail = req_m.group(1).rstrip()
+    specs = _QUOTED_RE.findall(req_tail)
+    return [(spec, line_idx) for spec in specs]
 
 
 def _url_to_name(url: str) -> str:

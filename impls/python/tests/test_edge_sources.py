@@ -369,6 +369,109 @@ def test_nimble_no_file_returns_empty(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# S3b: NimbleEdgeSource → bridge → predicates on NamedRequire / UrlRequire
+# ---------------------------------------------------------------------------
+
+
+from milpa.predicate import Predicate  # noqa: E402  (after test_edge_sources imports)
+import warnings as _warnings  # noqa: E402
+
+
+def _plat(name: str) -> Predicate:
+    return Predicate(name="platform", values=(name,))
+
+
+def _notplat(name: str) -> Predicate:
+    return Predicate(name="platform", values=(name,), negated=True)
+
+
+def _arch(name: str) -> Predicate:
+    return Predicate(name="arch", values=(name,))
+
+
+def _get_named(es: EdgeSet, name: str) -> NamedRequire:
+    for r in es.requires:
+        if isinstance(r, NamedRequire) and r.name == name:
+            return r
+    raise KeyError(name)
+
+
+def test_bridge_unconditional_requires_empty_predicates(tmp_path: Path) -> None:
+    """Unconditional requires → NamedRequire.predicates == ()."""
+    dep_path = _make_nimble_tree(tmp_path, "pkg", 'requires "stew >= 0.1.0"\n')
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg")
+    with _warnings.catch_warnings(record=True):
+        _warnings.simplefilter("always")
+        es = NimbleEdgeSource().edges_for("pkg", _V, ctx)
+    assert _get_named(es, "stew").predicates == ()
+
+
+def test_bridge_recognized_when_block_carries_predicates(tmp_path: Path) -> None:
+    """Recognized when → NamedRequire.predicates carries the translated predicates."""
+    nimble = (
+        'when defined(linux):\n'
+        '  requires "linuxpkg"\n'
+        'requires "common"\n'
+    )
+    dep_path = _make_nimble_tree(tmp_path, "pkg", nimble)
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg")
+    with _warnings.catch_warnings(record=True):
+        _warnings.simplefilter("always")
+        es = NimbleEdgeSource().edges_for("pkg", _V, ctx)
+
+    linux_req = _get_named(es, "linuxpkg")
+    common_req = _get_named(es, "common")
+    assert linux_req.predicates == (_plat("linux"),)
+    assert common_req.predicates == ()
+
+
+def test_bridge_colon_form_carries_predicates(tmp_path: Path) -> None:
+    """Colon-form when → NamedRequire.predicates = (arch(arm64),)."""
+    dep_path = _make_nimble_tree(
+        tmp_path, "pkg", 'when defined(arm64): requires "neon"\n'
+    )
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg")
+    with _warnings.catch_warnings(record=True):
+        _warnings.simplefilter("always")
+        es = NimbleEdgeSource().edges_for("pkg", _V, ctx)
+    assert _get_named(es, "neon").predicates == (_arch("arm64"),)
+
+
+def test_bridge_elif_else_predicates(tmp_path: Path) -> None:
+    """when/elif/else → all three NamedRequires carry correct predicate tuples."""
+    nimble = (
+        'when defined(linux):\n'
+        '  requires "a"\n'
+        'elif defined(macosx):\n'
+        '  requires "b"\n'
+        'else:\n'
+        '  requires "c"\n'
+    )
+    dep_path = _make_nimble_tree(tmp_path, "pkg", nimble)
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg")
+    with _warnings.catch_warnings(record=True):
+        _warnings.simplefilter("always")
+        es = NimbleEdgeSource().edges_for("pkg", _V, ctx)
+    assert _get_named(es, "a").predicates == (_plat("linux"),)
+    assert _get_named(es, "b").predicates == (_plat("macosx"), _notplat("linux"))
+    assert _get_named(es, "c").predicates == (_notplat("linux"), _notplat("macosx"))
+
+
+def test_bridge_unrecognized_when_empty_predicates(tmp_path: Path) -> None:
+    """Unrecognized when → dep present (set unchanged) AND predicates == ()."""
+    dep_path = _make_nimble_tree(
+        tmp_path, "pkg", 'when defined(release):\n  requires "relpkg"\n'
+    )
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg")
+    with _warnings.catch_warnings(record=True):
+        _warnings.simplefilter("always")
+        es = NimbleEdgeSource().edges_for("pkg", _V, ctx)
+    # dep is still included (over-include invariant)
+    rel_req = _get_named(es, "relpkg")
+    assert rel_req.predicates == ()
+
+
+# ---------------------------------------------------------------------------
 # edgeset_to_terms
 # ---------------------------------------------------------------------------
 

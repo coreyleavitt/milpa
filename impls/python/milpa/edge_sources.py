@@ -171,9 +171,13 @@ def _nimble_edges(dep_path: Path, dep_name: str) -> tuple[list[NamedRequire | Ur
     nm = parse_nimble(text)
     src_dir = nm.src_dir or ""
     requires: list[NamedRequire | UrlRequire] = []
-    for dep in nm.deps:
+    for i, dep in enumerate(nm.deps):
+        # Aligned predicates: dep_predicates is a tuple aligned with nm.deps.
+        # Guard against index out of range for back-compat with callers that
+        # produce NimbleManifest without dep_predicates (e.g. old tests).
+        preds = nm.dep_predicates[i] if i < len(nm.dep_predicates) else ()
         if isinstance(dep, UrlDep):
-            requires.append(UrlRequire(url=dep.git, ref=dep.ref))
+            requires.append(UrlRequire(url=dep.git, ref=dep.ref, predicates=preds))
         elif isinstance(dep, NamedDep):
             if dep.name == "nim":
                 continue
@@ -191,6 +195,7 @@ def _nimble_edges(dep_path: Path, dep_name: str) -> tuple[list[NamedRequire | Ur
             requires.append(NamedRequire(
                 name=dep.name,
                 constraint_str=dep.constraint or "",
+                predicates=preds,
             ))
     return requires, src_dir
 
