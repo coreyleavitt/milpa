@@ -1,7 +1,21 @@
 # rfc-conditional-requires (#26) — handoff
 
-- **Stage:** 2 (architect) — round 1 applied + **R1 resolved (c)** + RFC restructured   •   **Round:** ready for 2
-- **Resume:** `/architect docs/rfc-conditional-requires.md round 2`
+- **Stage:** 2 (architect) — **rounds 1 + 2 applied; ready for Stage 3 (/tdd)**   •   **Round:** 2 done
+- **Resume:** `/loop implement the next unimplemented RFC slice (docs/rfc-conditional-requires.md §9) with /tdd following the standing rules; after each slice report one progress line; stop when every slice is implemented`
+
+## Round 2 outcome — additive `cond-require` (NO genuine forks)
+The round-2 depth agent edited the RFC toward an *overloaded* `requires { when }` form;
+design + feasibility lenses found the additive **`cond-require`** node is strictly
+better. Reconciled to `cond-require`:
+- Lockfile: `requires "bar" "extra"` UNCHANGED (byte-identical, no re-lock churn); NEW
+  `cond-require "extra" platform="linux"` (inline single / `{ when … }` block multi-clause).
+- Data model: `LockedDep.cond_requires` ADDITIVE field; `requires: tuple[str,...]` unchanged →
+  frozen/verify/nimcfg untouched; `cmd_show` displays cond_requires.
+- Propagation: `edgeset_to_terms` drops predicates → add a `requires_predicates` dict (§3.4.3 opt a).
+- `Predicate` extracted to `predicate.py` in S2 (breaks manifest↔dep_decl import cycle).
+- Asymmetry acknowledged: milpa.kdl root `when` FILTERS now; `.nimble` transitive `when` RECORDS (→#110).
+- S3a/S3b test-timing fixed: TestWhenBlockPolicy warning update lands in S3b (scanner wiring), not S3a.
+- Pre-S4 gate: confirm manifest §6 negation spelling `(not)"value"`, mirror in cond-require.
 
 ## R1 RESOLVED — (c): reduce #26, defer activation to #110
 #26 = recognize `when` + attach predicates + **record them on a universal (platform-

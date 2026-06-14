@@ -1,6 +1,6 @@
 # RFC: Conditional (`when`-gated) requires in `.nimble` files
 
-- **Status:** Draft (Stage 1 — sliced; **architecture round 1 applied + R1 resolved**; ready for round 2). R1 resolved **(c)**: #26 recognizes `when`, attaches predicates, and **records them on a universal (platform-neutral) lockfile** — it does NOT exclude deps by host. Build-time *activation* (filtering nim.cfg / the active set by profile) is deferred to **#110**. §3.4/§5/§6/§9 restructured accordingly.
+- **Status:** Draft (**architecture rounds 1 + 2 applied; ready for `/tdd`**). R1 resolved **(c)**: #26 recognizes `when`, attaches predicates, and records them on a universal (platform-neutral) lockfile via an **additive `cond-require` node** — no host exclusion (the existing `requires` line is byte-identical); build-time *activation* deferred to **#110**. Round 2 replaced the overloaded-`requires` draft with the additive `cond-require` design (no re-lock churn), pinned the EdgeSet→lockfile predicate propagation, extracted `Predicate` to break an import cycle, and acknowledged the root-vs-transitive `when` semantic asymmetry.
 - **Scope:** milpa spec (`dep-decl.md` §1 + §7.5, `manifest-grammar.md` §5.3 + §6, `resolver-semantics.md` transitive predicate filtering) + both reference impls (nimble scanner, edge types, resolver) + conformance corpus.
 - **Milestone:** v1 Tier 2 (atlas parity — #26). Additive; no day-one breakage (unrecognized conditions keep today's over-include + warn behavior).
 - **Closes:** #26. **Files (deferred):** DepDecl artifact schema v1 carrying predicates (cross-repo tianguis) — see §8 F3.
@@ -222,57 +222,122 @@ must NOT gain predicates). So the scanner must NOT thread predicates through
   agree trivially; unifying them is a worthwhile cleanup but **not load-bearing for #26**
   (no never-fetched invariant to protect). Treat it as optional refactor, not a gate.
 
-### 3.4  Recording predicates on the lockfile edge (NO host exclusion)
+### 3.4  Recording predicates on the lockfile — additive `cond-require` node
 
 **R1 resolved (c):** #26 does **not** filter transitive edges by host profile. The
-resolver enrolls every branch exactly as today (the dep *set* is unchanged → the
-lockfile stays platform-neutral and reproducible). The predicate's only effect in #26
-is to be **recorded on the locked `requires` edge**, where #110 will later read it to
-drive build-time activation.
+resolver enrolls every branch exactly as today (the dep *set* AND the existing
+`requires` line are byte-identical). The predicate is recorded as a **new additive
+`cond-require` annotation node**, which #110 later reads to drive build-time activation.
 
-This is small and additive:
-1. **Predicates flow through unchanged resolution** from the scanner-produced
-   `EdgeSet` (§3.3) into the lockfile writer. No `_filter_manifest_by_profile` change,
-   no `edgeset_to_terms` filtering, no `Profile=None` trap, no frozen interaction — the
-   resolver's dep selection is byte-identical to today.
-2. **Lockfile schema gains a predicate annotation on conditional requires**
-   (`lockfile-schema.md`). The `requires` edge, today a bare name list, gains an
-   optional predicate child for `.nimble`-derived conditional edges:
+#### 3.4.1  Lockfile schema — `requires` UNCHANGED, additive `cond-require`
 
-   ```kdl
-   dep "qux" {
-       version "1.0.0"
-       requires "bar"
-       requires "extra" {            // conditional edge from `when defined(linux)`
-           when platform="linux"     // recorded predicate (mirrors manifest §6 syntax)
-       }
-       ...
-   }
-   ```
+The existing `requires "bar" "extra"` node is **left exactly as today** — a flat
+multi-arg list naming the full (universal) require set, conditional entries included. A
+**new sibling node `cond-require`** annotates which of those requires are conditional and
+records their predicate(s):
 
-   The annotation reuses the milpa.kdl `when`-predicate surface syntax (§6) verbatim —
-   one predicate vocabulary across manifest and lockfile. Unconditional requires keep
-   the bare `requires "name"` form (back-compatible; existing lockfiles unchanged).
-3. **No new matcher call site, no `predicates.py` split required for #26** — that
-   refactor belongs to #110 when activation actually evaluates the recorded predicate.
-   #26 only *writes* the annotation; it never *reads* it to filter.
+```kdl
+dep "qux" {
+    version "1.0.0"
+    requires "bar" "extra"                  // UNCHANGED — full universal require set
+    cond-require "extra" platform="linux"   // NEW — additive annotation only
+    provenance { ... }
+}
+```
 
-> The round-1 matcher/`Profile=None`/double-parse/frozen findings were all consequences
-> of host-*exclusion*. Under (c) there is no exclusion, so they dissolve. They are
-> preserved in the §8 ledger as **#110's** concerns (activation will re-introduce a
-> filter call site, and must handle them then).
+- **Single predicate → inline property form:** `cond-require "name" key="value"`, with
+  negation as `key=(not)"value"` (manifest §6 syntax, verbatim).
+- **AND-conjunction** (an `elif` branch → `platform="macosx" AND not platform="linux"`,
+  or a two-sided `nim` range) → **child block, one `when` node per clause:**
 
-### 3.5  Attested DepDecl path — unchanged (and why)
+  ```kdl
+  cond-require "macstuff" {
+      when platform="macosx"
+      when platform=(not)"linux"
+  }
+  ```
+  Stacked `when` children on a `cond-require` are **AND** by definition (OR within a key
+  is the multi-value inline form `key="a" "b"`; OR across keys does not arise from the
+  §3.1 grammar). The single-predicate inline form and the multi-clause block form are the
+  only two shapes — a proper, byte-canonical subset of the manifest §6 surface.
+- **Canonical ordering:** `cond-require` nodes follow the `requires` node, sorted
+  lexicographically by name (byte-stable across impls).
+- **Negation encoding** = manifest §6 `(not)"value"` **verbatim** — confirm the exact §6
+  spelling in S5 before writing S4 tests; do NOT invent a lockfile-specific form.
 
-A DepDecl artifact is publisher-curated: fixture-137 shows the publisher already
-resolved the `when` at publish time and emitted a flat require list. That remains
-valid and is the *higher-fidelity* path (a human/tool decided). This RFC does not
-touch artifact bytes, the index, or tianguis. The natural next step — let an artifact
-carry `require "extra" ">= 1.0.0" platform="linux"` so attestation itself is
-conditional — is a schema-v1 bump with cross-repo blast radius; filed, not built
-(§8 F3). Doing it now would violate minimal-over-completeness
-([[feedback_minimal_over_completeness]]): one proven consumer (the fallback) needs
-predicates; the attested path has a working alternative (curation).
+**Why additive `cond-require` and NOT overloading `requires` (round 2, design +
+feasibility lenses — supersedes the round-1 depth-agent draft):**
+- `requires` stays a flat multi-arg node → **no re-lock byte-churn** for existing
+  lockfiles (a one-node-per-entry rewrite would have changed *every* lockfile on
+  re-lock — eliminated here), **no last-wins→accumulate parser change** for `requires`,
+  and **no change to `frozen.py` / `cmd_show` / `nimcfg.py` / `verify`**, which all read
+  `requires` by name and are untouched.
+- **Forward-compat by construction:** an older milpa skips the unknown `cond-require`
+  node and still sees the complete universal set in `requires` (correct degradation —
+  the dep is included, only the annotation is dropped).
+- **Generalizes to #134:** the DepDecl artifact gains the symmetric
+  `cond-require "name" "constraint" key="value"`, distinct from unconditional
+  `require "name" "constraint"` by node name — no `require` overloading in either spec.
+
+#### 3.4.2  Data model — additive `cond_requires` field
+
+- `LockedDep` gains `cond_requires: tuple[CondRequire, ...] = ()`, where
+  `CondRequire(name: str, predicates: tuple[Predicate, ...])`. **`requires: tuple[str, ...]`
+  is UNCHANGED.** Both impls (Rust: `LockedDep.cond_requires: Vec<CondRequire>`).
+- **`Predicate` placement / circular import (round 2, design Finding 4):** `Predicate`
+  lives in `manifest.py`, but `manifest.py` imports `dep_decl.py` (via `edge_sources`),
+  so importing `Predicate` into `dep_decl.py`/`lockfile.py` would cycle. Extract
+  `Predicate` into its own tiny module (`predicate.py`) imported by `manifest.py`,
+  `dep_decl.py`, and `lockfile.py`. This is an **S1/S2 prerequisite, not deferred to
+  #110** (S2's "no existing test breaks" still holds — it's a pure move).
+- **`cmd_show`** is extended to surface `cond_requires` (one line per conditional require
+  with its predicate) — cheap, and keeps the annotation visible to users. `verify`,
+  `frozen`, `nimcfg` read `requires` only → unaffected; state this in S5/§5.
+
+#### 3.4.3  Predicate propagation path (the load-bearing data flow — round 2, depth lens)
+
+`edgeset_to_terms()` returns `(list[Term], list[str])`; the `list[str]` is
+`requires_names`, which **discards predicates**. `_Candidate.requires_names`,
+`ResolvedDep.requires`, and `LockedDep.requires` are all names-only — no type in the
+selection path carries predicates. So S4 is *not* merely a writer change; the predicate
+must be routed to the writer out-of-band:
+
+**Adopt option (a):** extend `edgeset_to_terms` to also return
+`dict[str, tuple[Predicate, ...]]` (dep-name → predicates; empty for unconditional).
+`_Candidate` grows a parallel `requires_predicates` dict; `_locked_from_resolved` reads
+it to populate `LockedDep.cond_requires`. This is additive — the `list[str]` selection
+contract and all `requires_names` callers (incl. Rust's multi-site type) are unchanged;
+the dict is **advisory metadata only, never consulted for selection/solving** (dep-name
+keys are unique per candidate — a PubGrub invariant).
+
+#### 3.4.4  Semantic asymmetry: root `when` filters, transitive `when` records (round 2, breadth Gap 6)
+
+The same `when platform="linux"` surface means **different things by origin**, and the
+RFC names this deliberately:
+- A **milpa.kdl ROOT** dep `when platform="linux" { foo … }` is **FILTERED at resolve
+  time** (existing, intentional behavior — `foo` is absent from the lockfile on a
+  non-linux host). This is *authored intent*: you declared `foo` linux-only.
+- A **`.nimble` TRANSITIVE** `when defined(linux): requires "extra"` is **RECORDED**
+  under (c) — `extra` stays in the universal lockfile, annotated; #110 activates it.
+  This is *inferred-from-opaque-NimScript*: milpa extracted a predicate it cannot safely
+  act on at resolve time until #110's universal-activation model exists.
+
+The justification is the trust gradient: declarative authored intent is honored
+immediately; a predicate reverse-engineered from un-evaluated NimScript is recorded for
+a deliberate, universal-lockfile-preserving activation later. The S3 warning text and
+spec MUST distinguish the two so a user reading `when` in both places is not misled.
+
+**No matcher call site, no `predicates.py`-matcher split for #26** — #26 only *writes*
+the annotation; it never *reads* it to filter. The round-1 host-exclusion findings
+(matcher SSOT / `Profile=None` / double-parse / frozen contract / CI diagnostic) were
+consequences of *exclusion*; under (c) they do not arise and are transferred to **#110**
+(§8). *(Note: the `predicate.py` extraction in §3.4.2 is a type-placement move, distinct
+from the #110 matcher SSOT.)*
+
+**Other `parse_nimble` callers (round 2, breadth Gap 7):** the narrowed warning (fires
+only on UNRECOGNIZED after S3) is also observed by `workspace` root ingest and **tianguis
+ingest** (which runs the same scanner at publish). This is the correct behavior change —
+a recognized `when` no longer warns; no cross-repo coordination is required for #26.
 
 ### 3.5  Attested DepDecl path — unchanged (and why)
 
@@ -294,7 +359,7 @@ predicates; the attested path has a working alternative (curation).
 | `dep-decl.md §1` | `RequireEntry` = name+constraint / url+ref | Add optional `predicates` tuple (in-memory; not serialized in v0 artifacts). |
 | `manifest-grammar.md §5.3` | mirror of §7.5 | Mirror the same update (the two are kept in lockstep — they already cross-reference). |
 | `manifest-grammar.md §6` | predicate vocab + matcher | **Unchanged** — reused verbatim. The §3.1 table maps INTO this vocabulary; the lockfile annotation (§3.4) reuses the `when platform=…` surface syntax. |
-| `lockfile-schema.md` | `requires` = bare name list | Add the optional `requires "name" { when … }` predicate-annotation form for conditional edges (§3.4). Back-compatible; unconditional requires unchanged. |
+| `lockfile-schema.md` | `requires` = one node, N positional-arg names | **`requires` UNCHANGED.** ADD a sibling `cond-require` node (§3.4.1): inline `cond-require "name" key="value"` (single predicate, `(not)"value"` for negation per §6) or a `{ when … }` block (multi-clause AND). Add the `cond_requires`/`CondRequire` type (§3.4.2). |
 | `resolver-semantics.md` | — | **No change in #26.** Transitive predicate *activation* (filtering by profile) is **#110**, not here. |
 
 No error-catalog change: UNRECOGNIZED is a warning, not an error; malformed
@@ -303,18 +368,24 @@ constraints still raise the existing `MAN-NIMBLE-CONSTRAINT`.
 ## 5  Transition & compatibility
 
 - **Strictly additive, never under-includes.** Under (c) the resolved dep *set* is
-  identical to today on every platform — #26 excludes nothing. The only observable
-  change is *metadata*: conditional `.nimble`-derived edges gain a `when …` annotation
-  in `milpa.lock`.
-- **`.nimble` with no `when` blocks:** byte-identical lockfile.
-- **`.nimble` with a recognized `when`:** the conditional require is still locked
-  (universal lockfile), now annotated with its predicate. Lockfile bytes change for
-  exactly those edges; the dep set does not.
-- **Unrecognized `when`:** identical to today (include + warn), no annotation.
+  identical to today on every platform — #26 excludes nothing. The only observable change
+  is a NEW `cond-require` annotation node; the existing `requires` line is untouched.
+- **`.nimble` with no `when` blocks:** **byte-identical lockfile** — no `cond-require`
+  nodes, `requires` exactly as today. (The additive `cond-require` design means there is
+  **no re-lock churn** for existing lockfiles — the round-2 depth-agent's overloaded-
+  `requires` rewrite, which would have changed every lockfile, is avoided.)
+- **`.nimble` with a recognized `when`:** the conditional require stays in `requires`
+  (universal lockfile, unchanged), and the lock gains a `cond-require` annotation for it.
+  Lockfile bytes change only by *adding* the `cond-require` line; the dep set does not.
+- **Unrecognized `when`:** identical to today (include + warn), no `cond-require`.
+- **Unaffected consumers** (read `requires` by name; never `cond-require`): `frozen.py`,
+  `milpa verify`, `nimcfg.py`. `cmd_show` is extended to *display* `cond-require`. Older
+  milpa silently skips the unknown `cond-require` node → still sees the full universal
+  set in `requires` (correct degradation; no lockfile-schema-version bump needed).
 - **Lockfile stays platform-neutral** → `--frozen`, prior-reuse, and cross-host sharing
   are unaffected (the round-1 frozen/reproducibility hazard does not arise under (c)).
-- **#110 later** reads the recorded annotation to filter the active build set / `nim.cfg`
-  by the resolving profile — that is where host-specific *activation* (and any default-
+- **#110 later** reads the recorded `cond-require` to filter the active build set /
+  `nim.cfg` by the resolving profile — where host-specific *activation* (and the default-
   profile / CI-diagnostic concerns from round 1) will be designed.
 
 ## 6  Conformance plan
@@ -325,26 +396,31 @@ Under (c) every fixture asserts the lockfile **records** the right predicate ann
 annotation is recorded regardless of host), which also makes the fixtures
 **host-deterministic on any CI machine** (round-1 determinism concern dissolves).
 
-- **fixture-138 expected.lock gains the annotation** (round 1's "don't mutate" concern
-  was about changing the dep *set* via exclusion — under (c) the set is unchanged;
-  `extra` is still locked, now as `requires "extra" { when platform="linux" }`). This is
-  an additive format evolution, not a contract weakening. Update its expected bytes.
+- **fixture-138 expected.lock gains a `cond-require` line** — its `requires "bar" "extra"`
+  line stays **byte-identical** (the dep set is unchanged); the lock simply gains
+  `cond-require "extra" platform="linux"`. Purely additive; not a contract weakening.
 - **recognized translation** (one fixture per §3.1 family): `defined(linux)`,
   `defined(win)`, `defined(amd64)`, `not defined(windows)`, nim-version (two-tuple,
-  three-tuple, **two-sided range**) → assert the exact recorded `when …` annotation.
-- **else/elif chain** → assert each branch's require carries its canonical predicate
-  tuple (incl. the negation conjunction).
-- **UNRECOGNIZED** (`defined(release)`, compound `or`) → no annotation, require still
-  locked, warning fires.
+  three-tuple, **two-sided range** → the multi-clause `cond-require { when … }` block) →
+  assert the exact recorded `cond-require` node.
+- **else/elif chain** → assert each branch's `cond-require` carries its canonical
+  predicate clauses (incl. the negation conjunction in block form).
+- **UNRECOGNIZED** (`defined(release)`, compound `or`) → no `cond-require` node, require
+  still in `requires`, warning fires.
+- **`milpa show`** (breadth Gap 1/8) → a liveness/format fixture asserting `show`
+  surfaces the conditional require with its predicate (the `cmd_show` extension, §3.4.2).
+- **mixed attested + fallback graph** (breadth Gap 10) → one dep via DepDecl (flat
+  `requires`, no `cond-require`), one via nimble fallback (annotated) — assert the lock
+  records `cond-require` only for the fallback dep.
 - **Scenarios the reviews flagged (add fixtures):** a `when`-gated **URL** require
-  (breadth Gap 4); **multiple requires in one branch** each annotated (breadth Gap 5);
-  a **workspace member** `.nimble` `when` fallback (breadth Gap 9); a **root** `.nimble`-
-  only project with a `when` block (breadth Gap 3). *(`overrides` interaction — breadth
-  Gap 8 — is moot under (c): nothing is filtered, so override coercion is unchanged.)*
+  (breadth Gap 4); **multiple requires in one branch** each getting a `cond-require`
+  (breadth Gap 5); a **workspace member** `.nimble` `when` fallback (breadth Gap 9); a
+  **root** `.nimble`-only project with a `when` block (breadth Gap 3). *(`overrides`
+  interaction — Gap 8 — is moot under (c): nothing is filtered.)*
 - **attested unchanged**: fixture-137 stays green untouched (regression guard).
 - **coverage clauses (add atomically with fixtures — feasibility RISK 5):**
   `nimble.when-translate`, `nimble.when-negation`, `nimble.when-nim-version`,
-  `nimble.when-unrecognized-over-include`, `lockfile.requires-when-annotation`.
+  `nimble.when-unrecognized-over-include`, `lockfile.cond-require`.
 
 ## 7  Threat model
 
@@ -401,31 +477,46 @@ rebuild the rust **release** binary before `python3 -m harness`.*
   impls (the §3.1 table; returns `None`/`Option::None` for UNRECOGNIZED; never empty).
   RED: unit tests per table row + UNRECOGNIZED. No scanner/resolver wiring. Smallest,
   highest-leverage; pins the grammar. *(F6/posix resolved in §3.1 — no pre-S1 lookup.)*
-- **S2 — `RequireEntry.predicates` data model.** Add the optional field to
+- **S2 — `RequireEntry.predicates` data model + `Predicate` extraction.** First **move
+  `Predicate` into its own `predicate.py`** (imported by `manifest.py`/`dep_decl.py`/
+  `lockfile.py`) to break the import cycle (§3.4.2 / round-2 design Finding 4) — a pure
+  move, no behavior change. Then add the optional `predicates` field to
   `NamedRequire`/`UrlRequire` (both impls); `EdgeSet` equality/repr round-trips it.
   Nothing populates it yet — no existing test breaks. RED: predicate-bearing edge
-  equality/repr.
+  equality/repr; import-cycle-free.
 - **S3a — branch-tracker state machine.** Standalone, unit-testable
   `parse_when_branches(lines)` handling indented-block AND single-line-colon forms,
   `elif`/`else` negation algebra, chain-poisoning, nested→UNRECOGNIZED. RED: a battery
-  of indentation/chain inputs. **Updates the existing `TestWhenBlockPolicy` /
-  `when_block_includes_requires_unconditionally` tests in the SAME slice** (the
-  warning now fires only on UNRECOGNIZED — feasibility RISK 1; do NOT defer to S5).
+  of indentation/chain inputs. **No `parse_nimble` wiring yet → the warning still fires
+  as today; existing `TestWhenBlockPolicy` tests stay green this slice.**
 - **S3b — scanner wiring.** Thread `parse_when_branches` + `parse_when_condition` into
   `parse_nimble`; carry predicates across the `edge_sources._nimble_edges` bridge onto
   `NamedRequire`/`UrlRequire` **without** touching the shared `NamedDep`/`UrlDep` (§3.3).
+  **Update `TestWhenBlockPolicy` / `when_block_includes_requires_unconditionally` HERE**
+  (the warning now fires only on UNRECOGNIZED — this is the slice that wires the scanner,
+  so the behavior change lands here, NOT S3a; round-2 feasibility RISK 5).
   RED: §1 example → the `extra` EdgeSet entry carries `platform="linux"`; UNRECOGNIZED
-  still over-includes + warns. (Lockfile unchanged this slice — recording is S4.)
-- **S4 — lockfile recorder.** Extend `lockfile.py` writer + `lockfile-schema.md` to emit
-  `requires "name" { when … }` for predicate-bearing edges; parser round-trips it.
-  Predicates flow scanner → EdgeSet → resolved graph → lockfile. NO graph/selection
-  change. RED: resolve the §1 example → `milpa.lock` records the annotation on `extra`;
-  unconditional requires unchanged; round-trip parse=format. Both impls. Rebuild rust
-  release before harness.
+  still over-includes + warns. (Lockfile byte-identical this slice — recording is S4.)
+- **S4 — lockfile recorder (additive `cond-require`).** Well-bounded, additive (§3.4):
+  (a) New `CondRequire(name, predicates)` type (both impls); `LockedDep` gains
+  `cond_requires` — **`requires` type UNCHANGED**.
+  (b) `edgeset_to_terms` extended to also return a `requires_predicates` dict (§3.4.3
+  option a); `_Candidate` gains the field; `_locked_from_resolved` reads it → `cond_requires`.
+  (c) `format_lockfile` emits `cond-require` nodes (inline single / `{ when … }` block
+  multi-clause) after `requires`, lexicographically — `requires` emission untouched.
+  (d) Parser learns the new `cond-require` node into `cond_requires` — **`requires`
+  parsing untouched** (no last-wins→accumulate change). `cmd_show` displays `cond_requires`.
+  `frozen.py`/`verify`/`nimcfg` read `requires` only — unchanged.
+  NO graph selection change. RED: resolve §1 example → lock gains `cond-require "extra"
+  platform="linux"`, `requires "bar" "extra"` byte-identical; round-trip parse=format=parse
+  identity. Both impls. Rebuild rust release before harness.
+  **Pre-coding gate:** confirm `manifest-grammar.md §6` negation spelling (`(not)"value"`)
+  and mirror it in the lockfile `cond-require` exactly (§3.4.1).
 - **S5 — spec.** `dep-decl.md §7.5` (table + algebra + warning-on-UNRECOGNIZED),
   `dep-decl.md §1` (predicates field), `manifest-grammar.md §5.3` (mirror),
-  `lockfile-schema.md` (the `requires { when … }` annotation). Update in-code warning
-  text. **No spec-version bump** (additive, pre-stabilization — `spec_versioning_deferred`).
+  `lockfile-schema.md` (the additive `cond-require` node + the `§7.5`-activation-→#110
+  addendum). Update in-code warning text. **No spec/lockfile-version bump** (additive,
+  forward-compatible, pre-stabilization — `spec_versioning_deferred`).
 - **S6 — conformance corpus.** Author §6 fixtures; **update fixture-138 expected.lock**
   (additive annotation, dep set unchanged); add coverage clauses **atomically** with
   fixture dirs (feasibility RISK 5 — else `test_inventory_fully_covered` reddens).
