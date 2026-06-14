@@ -455,6 +455,72 @@ CLAUSE_INVENTORY: list[SpecClause] = [
     ),
 
     # -----------------------------------------------------------------------
+    # dep-decl.md §7.5 / lockfile-schema.md §3.5 — nimble when-translation
+    # (RFC rfc-conditional-requires.md S6 conformance corpus, closes #26)
+    # -----------------------------------------------------------------------
+    SpecClause(
+        id="nimble.when-translate",
+        spec_ref="dep-decl.md §7.5; rfc-conditional-requires.md §3.1",
+        description=(
+            "Recognized when defined(platform) block MUST translate to "
+            "cond-require inline-property form in the lockfile"
+        ),
+        covering_fixtures=(
+            "fixture-166-nimble-when-translate",
+            "fixture-170-nimble-when-multi-requires",
+        ),
+        covering_tiers=(),
+    ),
+    SpecClause(
+        id="nimble.when-negation",
+        spec_ref="dep-decl.md §7.5; rfc-conditional-requires.md §3.2",
+        description=(
+            "when/elif/else chain MUST emit negated predicates on elif/else branches "
+            "as cond-require block form; fixture-138 covers the mixed-attested variant"
+        ),
+        covering_fixtures=(
+            "fixture-167-nimble-when-negation",
+            "fixture-138-depdecl-when-fallback",
+        ),
+        covering_tiers=(),
+    ),
+    SpecClause(
+        id="nimble.when-nim-version",
+        spec_ref="dep-decl.md §7.5; rfc-conditional-requires.md §3.1",
+        description=(
+            "Two-sided NimMajor/NimMinor range MUST translate to multi-clause "
+            "cond-require block form (AND of two nim predicates)"
+        ),
+        covering_fixtures=("fixture-168-nimble-when-nim-version",),
+        covering_tiers=(),
+    ),
+    SpecClause(
+        id="nimble.when-unrecognized-over-include",
+        spec_ref="dep-decl.md §7.5; rfc-conditional-requires.md §3.1",
+        description=(
+            "Unrecognized when condition (e.g. defined(release)) MUST over-include "
+            "the dep unconditionally; NO cond-require node MUST appear in the lockfile"
+        ),
+        covering_fixtures=("fixture-169-nimble-when-unrecognized",),
+        covering_tiers=(),
+    ),
+    SpecClause(
+        id="lockfile.cond-require",
+        spec_ref="lockfile-schema.md §3.5; rfc-conditional-requires.md §3.4.1",
+        description=(
+            "Lockfile MUST record conditional requires as additive cond-require nodes "
+            "following the requires node; requires node itself is UNCHANGED (universal set)"
+        ),
+        covering_fixtures=(
+            "fixture-138-depdecl-when-fallback",
+            "fixture-166-nimble-when-translate",
+            "fixture-167-nimble-when-negation",
+            "fixture-168-nimble-when-nim-version",
+        ),
+        covering_tiers=(),
+    ),
+
+    # -----------------------------------------------------------------------
     # Known gaps (currently unexercised by corpus or generator)
     # -----------------------------------------------------------------------
     SpecClause(
