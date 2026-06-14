@@ -51,7 +51,7 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
-from milpa.manifest import NamedDep, UrlDep
+from milpa.manifest import NamedDep, Predicate, UrlDep
 from milpa.version import VersionSet
 
 # ---------------------------------------------------------------------------
@@ -303,3 +303,195 @@ def _url_to_name(url: str) -> str:
     if last.endswith(".git"):
         last = last[:-4]
     return last if last else url
+
+
+# ---------------------------------------------------------------------------
+# parse_when_condition — RFC §3.1 S1
+# ---------------------------------------------------------------------------
+
+# Platform vocabulary: canonical token → canonical predicate value.
+# Aliases normalize to the canonical name.
+_PLATFORM_TOKENS: dict[str, str] = {
+    "linux": "linux",
+    "macosx": "macosx",
+    "macos": "macosx",   # alias
+    "windows": "windows",
+    "win": "windows",    # alias
+    "freebsd": "freebsd",
+    "openbsd": "openbsd",
+    "netbsd": "netbsd",
+}
+
+# Arch vocabulary (no aliases).
+_ARCH_TOKENS: frozenset[str] = frozenset({"amd64", "arm64", "i386"})
+
+# Recognized comparison operators for all Nim version forms.
+_NIM_OPS: frozenset[str] = frozenset({">=", ">", "<", "<=", "=="})
+
+# Regex: ``defined(token)`` — whitespace inside parens is tolerated.
+_DEFINED_RE: re.Pattern[str] = re.compile(r"^defined\(\s*(\w+)\s*\)$")
+
+# Regex: ``NimMajor OP X`` (no spaces required around operator).
+_NIM_MAJOR_RE: re.Pattern[str] = re.compile(
+    r"^NimMajor\s*(>=|>|<=|<|==)\s*(\d+)$"
+)
+
+# Regex: ``(NimMajor, NimMinor) OP (X, Y)`` — arbitrary internal spacing.
+_NIM_TUPLE2_RE: re.Pattern[str] = re.compile(
+    r"^\(\s*NimMajor\s*,\s*NimMinor\s*\)\s*(>=|>|<=|<|==)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$"
+)
+
+# Regex: ``(NimMajor, NimMinor, NimPatch) OP (X, Y, Z)``
+_NIM_TUPLE3_RE: re.Pattern[str] = re.compile(
+    r"^\(\s*NimMajor\s*,\s*NimMinor\s*,\s*NimPatch\s*\)\s*(>=|>|<=|<|==)\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$"
+)
+
+
+def _parse_defined(cond: str) -> Predicate | None:
+    """Try to parse ``defined(token)`` into a platform or arch Predicate.
+
+    Returns ``None`` if the token is not in the recognized vocabulary
+    (including the deliberate ``posix`` exclusion).
+    """
+    m = _DEFINED_RE.match(cond)
+    if not m:
+        return None
+    token = m.group(1)
+    if token in _PLATFORM_TOKENS:
+        return Predicate(name="platform", values=(_PLATFORM_TOKENS[token],))
+    if token in _ARCH_TOKENS:
+        return Predicate(name="arch", values=(token,))
+    return None
+
+
+def _parse_nim_comparison(cond: str) -> Predicate | None:
+    """Try to parse a NimMajor/tuple comparison into a single nim Predicate.
+
+    Handles:
+    - ``NimMajor OP X``
+    - ``(NimMajor, NimMinor) OP (X, Y)``
+    - ``(NimMajor, NimMinor, NimPatch) OP (X, Y, Z)``
+
+    Returns ``None`` if the expression doesn't match any of these forms
+    or if the operator is not in the recognized set.
+    """
+    m = _NIM_MAJOR_RE.match(cond)
+    if m:
+        op, major = m.group(1), m.group(2)
+        if op not in _NIM_OPS:
+            return None
+        return Predicate(name="nim", values=(f"{op}{major}.0.0",))
+
+    m = _NIM_TUPLE2_RE.match(cond)
+    if m:
+        op, major, minor = m.group(1), m.group(2), m.group(3)
+        if op not in _NIM_OPS:
+            return None
+        return Predicate(name="nim", values=(f"{op}{major}.{minor}.0",))
+
+    m = _NIM_TUPLE3_RE.match(cond)
+    if m:
+        op, major, minor, patch = m.group(1), m.group(2), m.group(3), m.group(4)
+        if op not in _NIM_OPS:
+            return None
+        return Predicate(name="nim", values=(f"{op}{major}.{minor}.{patch}",))
+
+    return None
+
+
+def _parse_single(cond: str) -> Predicate | None:
+    """Parse a single (non-compound, non-not) condition to a Predicate.
+
+    Tries defined(token) first, then Nim comparison forms.
+    Returns ``None`` if unrecognized.
+    """
+    p = _parse_defined(cond)
+    if p is not None:
+        return p
+    return _parse_nim_comparison(cond)
+
+
+def parse_when_condition(cond: str) -> tuple[Predicate, ...] | None:
+    """Map a NimScript ``when``/``elif`` condition string to Predicates.
+
+    Implements the normative grammar table from RFC §3.1.  Returns a
+    non-empty tuple of ``Predicate`` instances when the condition is
+    recognized, or ``None`` (UNRECOGNIZED) otherwise.
+
+    Postcondition: a recognized condition ALWAYS yields a non-empty tuple.
+
+    Recognized forms (§3.1 table):
+    - ``defined(token)``              → platform or arch Predicate
+    - ``not defined(token)``          → negated platform or arch Predicate
+    - ``NimMajor OP X``               → nim Predicate ``"OPX.0.0"``
+    - ``(NimMajor, NimMinor) OP (X, Y)``
+    - ``(NimMajor, NimMinor, NimPatch) OP (X, Y, Z)``
+    - ``<nim-tuple> OP1 <v1> and <nim-tuple> OP2 <v2>``  → two nim Predicates
+
+    Deliberately NOT recognized (→ None):
+    - ``defined(posix)``              — cross-platform abstraction, not stable
+    - Any other ``defined(token)``    — unknown token
+    - ``or`` / compound non-nim ``and``
+    - Empty / blank input
+    """
+    stripped = cond.strip()
+    if not stripped:
+        return None
+
+    # --- ``not <single>`` form ---
+    # Accept "not " (one or more spaces) followed by a single recognized form.
+    # The inner form must yield exactly 1 predicate; if it yields 0 or >1 → None.
+    if stripped.startswith("not ") or stripped.startswith("not\t"):
+        inner = stripped[3:].strip()
+        inner_pred = _parse_single(inner)
+        if inner_pred is None:
+            return None
+        return (Predicate(name=inner_pred.name, values=inner_pred.values, negated=True),)
+
+    # --- Two-sided ``and`` form ---
+    # Split on " and " (with surrounding spaces) to find the two halves.
+    # Only recognized when BOTH halves are Nim-tuple comparisons.
+    # We try splitting on every occurrence of " and " / "and" and take the
+    # first that yields two valid Nim tuple comparisons.
+    #
+    # Strategy: find "and" token boundaries — split on all whitespace-bounded
+    # "and" tokens, try each split point.
+    and_parts = _split_on_and(stripped)
+    if and_parts is not None:
+        left_str, right_str = and_parts
+        left_pred = _parse_nim_comparison(left_str)
+        right_pred = _parse_nim_comparison(right_str)
+        if left_pred is not None and right_pred is not None:
+            result = (left_pred, right_pred)
+            assert len(result) > 0  # postcondition
+            return result
+        # One or both sides are not Nim tuple comparisons → unrecognized.
+        return None
+
+    # --- Single predicate forms ---
+    p = _parse_single(stripped)
+    if p is None:
+        return None
+    result = (p,)
+    assert len(result) > 0  # postcondition
+    return result
+
+
+def _split_on_and(cond: str) -> tuple[str, str] | None:
+    """Split ``cond`` on the first occurrence of the ``and`` keyword token.
+
+    Returns ``(left, right)`` both stripped, or ``None`` if no valid split.
+
+    The ``and`` must appear as a standalone word (not inside parentheses or
+    glued to identifiers).  We find the first occurrence of ``and`` where the
+    surrounding characters are not word characters (or start/end of string).
+    """
+    # Find all positions of "and" as a standalone keyword.
+    # Use regex to match word-boundary-like "and" tokens.
+    pattern = re.compile(r"(?<!\w)and(?!\w)")
+    for m in pattern.finditer(cond):
+        left = cond[: m.start()].strip()
+        right = cond[m.end() :].strip()
+        if left and right:
+            return left, right
+    return None
