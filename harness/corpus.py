@@ -228,12 +228,8 @@ def run_corpus(
             run = run_fixture(fixture_dir, desc, timeout=timeout)
             result = assert_conformance(run, fixture_dir)
 
-            # Clean up scratch and CAS dirs after asserting.
-            for tmpdir in (run.scratch_dir, run.cas_dir):
-                try:
-                    shutil.rmtree(tmpdir, ignore_errors=True)
-                except Exception:
-                    pass
+            # Clean up scratch and CAS dirs after asserting (SSOT via RunResult.cleanup).
+            run.cleanup()
 
             if result.passed:
                 report.passed[desc.name] += 1

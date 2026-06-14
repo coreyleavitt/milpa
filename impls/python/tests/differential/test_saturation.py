@@ -306,6 +306,7 @@ class TestSaturationTier2Satisfiable:
         def _inner(spec: FixtureSpec) -> None:
             state.n_run += 1
             tmp_dir = Path(tempfile.mkdtemp(prefix="milpa-sat-run-"))
+            results: dict = {}
             try:
                 serialize(spec, tmp_dir)
                 results = run_all_impls(tmp_dir, _DESCRIPTORS, timeout=60)
@@ -326,6 +327,9 @@ class TestSaturationTier2Satisfiable:
                         state.record_oracle_failure(spec, failure, "structural", tmp_dir)
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
+                # Clean up per-impl scratch + CAS dirs created by run_fixture.
+                for run_result in results.values():
+                    run_result.cleanup()
 
         _inner()  # runs the @given loop
 
@@ -411,6 +415,7 @@ class TestSaturationTier2Unsatisfiable:
             spec, _witness = spec_witness
             state.n_run += 1
             tmp_dir = Path(tempfile.mkdtemp(prefix="milpa-unsat-run-"))
+            results: dict = {}
             try:
                 serialize(spec, tmp_dir)
                 results = run_all_impls(tmp_dir, _DESCRIPTORS, timeout=60)
@@ -432,6 +437,9 @@ class TestSaturationTier2Unsatisfiable:
                     state.record_divergence(spec, div, tmp_dir)
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
+                # Clean up per-impl scratch + CAS dirs created by run_fixture.
+                for run_result in results.values():
+                    run_result.cleanup()
 
         _inner()  # runs the @given loop
 

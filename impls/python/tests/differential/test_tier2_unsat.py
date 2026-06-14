@@ -97,6 +97,7 @@ def test_tier2_unsatisfiable_semantic(
     """
     spec, witness = spec_and_witness
     tmp_dir = Path(tempfile.mkdtemp(prefix="milpa-diff-t2-unsat-"))
+    results: dict = {}
     try:
         serialize(spec, tmp_dir)
         results = run_all_impls(tmp_dir, _DESCRIPTORS, timeout=60)
@@ -184,3 +185,5 @@ def test_tier2_unsatisfiable_semantic(
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        for run_result in results.values():
+            run_result.cleanup()

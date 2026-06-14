@@ -79,6 +79,7 @@ def test_tier1_syntactic_agreement(inp: RawManifestInput) -> None:
       - Per-impl: returncode, exit_class, slug
     """
     tmp_dir = Path(tempfile.mkdtemp(prefix="milpa-diff-t1-"))
+    results: dict = {}
     try:
         write_raw_fixture(inp, tmp_dir)
         results = run_all_impls(tmp_dir, _DESCRIPTORS, timeout=30)
@@ -116,3 +117,5 @@ def test_tier1_syntactic_agreement(inp: RawManifestInput) -> None:
             assert False, "\n".join(detail_lines)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        for run_result in results.values():
+            run_result.cleanup()

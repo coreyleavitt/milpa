@@ -131,6 +131,7 @@ def _runs_diverge_with_broken(spec: FixtureSpec, descriptors: list[ImplDescripto
     is detected.
     """
     tmp_dir = Path(tempfile.mkdtemp(prefix="milpa-seeded-check-"))
+    results: dict = {}
     try:
         serialize(spec, tmp_dir)
         results = run_all_impls(tmp_dir, descriptors, timeout=60)
@@ -138,6 +139,8 @@ def _runs_diverge_with_broken(spec: FixtureSpec, descriptors: list[ImplDescripto
         return div is not None
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        for run_result in results.values():
+            run_result.cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +205,7 @@ class TestSeededDivergence:
         # --- Step 3: Assert divergence is detected ---
         # Run the minimal spec through all impls and assert divergence.
         fixture_dir = Path(tempfile.mkdtemp(prefix="milpa-seeded-min-"))
+        results: dict = {}
         try:
             serialize(minimal_spec, fixture_dir)
             results = run_all_impls(fixture_dir, all_descriptors, timeout=60)
@@ -212,6 +216,8 @@ class TestSeededDivergence:
             )
         finally:
             shutil.rmtree(fixture_dir, ignore_errors=True)
+            for run_result in results.values():
+                run_result.cleanup()
 
         assert div is not None, (
             "Expected divergence on seeded unsatisfiable fixture: broken shim (exit 0) "

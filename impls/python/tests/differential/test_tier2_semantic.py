@@ -93,6 +93,7 @@ def test_tier2_satisfiable_semantic(spec: FixtureSpec) -> None:
       - The specific divergence or oracle violation
     """
     tmp_dir = Path(tempfile.mkdtemp(prefix="milpa-diff-t2-"))
+    results: dict = {}
     try:
         serialize(spec, tmp_dir)
         results = run_all_impls(tmp_dir, _DESCRIPTORS, timeout=60)
@@ -181,3 +182,5 @@ def test_tier2_satisfiable_semantic(spec: FixtureSpec) -> None:
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        for run_result in results.values():
+            run_result.cleanup()

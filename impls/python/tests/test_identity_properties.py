@@ -21,6 +21,7 @@ bounded for fast shrinking.
 """
 
 import os
+import shutil
 import stat
 import tempfile
 from pathlib import Path
@@ -107,10 +108,15 @@ def materialize(tree_dict: dict[str, tuple], root: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def _scratch_dirs(n: int) -> list[Path]:
-    """Create n fresh, unique scratch directories. Used per Hypothesis
-    example to avoid collisions across runs (each example needs its
-    own clean state)."""
+    """Create n fresh, unique scratch directories with try/finally cleanup
+    handled by the CALLER. Returns the list of paths."""
     return [Path(tempfile.mkdtemp(prefix="milpa-prop-")) for _ in range(n)]
+
+
+def _cleanup_dirs(dirs: list[Path]) -> None:
+    """Remove all directories in `dirs`, ignoring errors."""
+    for d in dirs:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 @given(tree())
@@ -118,25 +124,33 @@ def test_content_hash_is_deterministic_across_directories(t):
     """Materializing the same tree into two different directories
     produces the same content_hash. The hash depends on the tree's
     relative structure, not on its absolute path."""
-    a, b = _scratch_dirs(2)
-    materialize(t, a)
-    materialize(t, b)
-    assert compute_content_hash(a) == compute_content_hash(b)
+    dirs = _scratch_dirs(2)
+    try:
+        a, b = dirs
+        materialize(t, a)
+        materialize(t, b)
+        assert compute_content_hash(a) == compute_content_hash(b)
+    finally:
+        _cleanup_dirs(dirs)
 
 
 @given(tree(), st.binary(min_size=0, max_size=100))
 def test_git_directory_contents_dont_affect_hash(t, git_blob):
     """Adding arbitrary .git/ content doesn't change the content_hash.
     Provenance lives in .git/; content lives in everything else."""
-    a, b = _scratch_dirs(2)
-    materialize(t, a)
-    materialize(t, b)
-    # Add fake .git/ to b only
-    (b / ".git").mkdir(parents=True, exist_ok=True)
-    (b / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
-    (b / ".git" / "objects").mkdir(parents=True, exist_ok=True)
-    (b / ".git" / "objects" / "fake_obj").write_bytes(git_blob)
-    assert compute_content_hash(a) == compute_content_hash(b)
+    dirs = _scratch_dirs(2)
+    try:
+        a, b = dirs
+        materialize(t, a)
+        materialize(t, b)
+        # Add fake .git/ to b only
+        (b / ".git").mkdir(parents=True, exist_ok=True)
+        (b / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+        (b / ".git" / "objects").mkdir(parents=True, exist_ok=True)
+        (b / ".git" / "objects" / "fake_obj").write_bytes(git_blob)
+        assert compute_content_hash(a) == compute_content_hash(b)
+    finally:
+        _cleanup_dirs(dirs)
 
 
 @given(tree())
@@ -156,10 +170,14 @@ def test_flipping_exec_bit_on_any_file_changes_hash(t):
     # Build two variants: with and without the exec bit on `rp`.
     t_off = dict(t); t_off[rp] = ("file", content, False)
     t_on  = dict(t); t_on[rp]  = ("file", content, True)
-    a, b = _scratch_dirs(2)
-    materialize(t_off, a)
-    materialize(t_on, b)
-    assert compute_content_hash(a) != compute_content_hash(b)
+    dirs = _scratch_dirs(2)
+    try:
+        a, b = dirs
+        materialize(t_off, a)
+        materialize(t_on, b)
+        assert compute_content_hash(a) != compute_content_hash(b)
+    finally:
+        _cleanup_dirs(dirs)
 
 
 @given(
@@ -169,16 +187,20 @@ def test_flipping_exec_bit_on_any_file_changes_hash(t):
 def test_symlink_and_file_with_same_content_discriminate(rp, target):
     """A regular file with bytes `X` and a symlink whose target string
     is `X` must hash differently — the mode marker discriminates."""
-    a, b = _scratch_dirs(2)
-    # a: regular file with content = target
-    f_path = a / rp
-    f_path.parent.mkdir(parents=True, exist_ok=True)
-    f_path.write_text(target)
-    # b: symlink whose link target string = target
-    s_path = b / rp
-    s_path.parent.mkdir(parents=True, exist_ok=True)
-    os.symlink(target, s_path)
-    assert compute_content_hash(a) != compute_content_hash(b)
+    dirs = _scratch_dirs(2)
+    try:
+        a, b = dirs
+        # a: regular file with content = target
+        f_path = a / rp
+        f_path.parent.mkdir(parents=True, exist_ok=True)
+        f_path.write_text(target)
+        # b: symlink whose link target string = target
+        s_path = b / rp
+        s_path.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, s_path)
+        assert compute_content_hash(a) != compute_content_hash(b)
+    finally:
+        _cleanup_dirs(dirs)
 
 
 @given(tree(), st.binary(min_size=1, max_size=50))
@@ -192,7 +214,11 @@ def test_modifying_any_file_byte_changes_hash(t, extra_byte):
     rp, (_, content, executable) = file_entries[0]
     t_modified = dict(t)
     t_modified[rp] = ("file", content + extra_byte, executable)
-    a, b = _scratch_dirs(2)
-    materialize(t, a)
-    materialize(t_modified, b)
-    assert compute_content_hash(a) != compute_content_hash(b)
+    dirs = _scratch_dirs(2)
+    try:
+        a, b = dirs
+        materialize(t, a)
+        materialize(t_modified, b)
+        assert compute_content_hash(a) != compute_content_hash(b)
+    finally:
+        _cleanup_dirs(dirs)

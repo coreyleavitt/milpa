@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import stat
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -31,20 +30,20 @@ from milpa.identity import SUPPORTED_ALGORITHMS, compute_content_hash, parse_ide
 # ---------------------------------------------------------------------------
 
 
-def make_tree(files: dict[str, tuple[str, bool]]) -> Path:
-    """Create a temp dir containing the given files.
+def make_tree(files: dict[str, tuple[str, bool]], root: Path) -> Path:
+    """Populate `root` with the given files and return `root`.
 
     ``files`` maps relpath → (content, executable).
-    Returns the root Path.
+    ``root`` must already exist (caller creates it via tmp_path / "name").
     """
-    tmp = Path(tempfile.mkdtemp())
+    root.mkdir(parents=True, exist_ok=True)
     for relpath, (content, executable) in files.items():
-        full = tmp / relpath
+        full = root / relpath
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_text(content, encoding="utf-8")
         if executable:
             full.chmod(full.stat().st_mode | stat.S_IXUSR)
-    return tmp
+    return root
 
 
 # ---------------------------------------------------------------------------
@@ -169,22 +168,22 @@ def test_parse_identity_uppercase_f_rejected() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_same_tree_produces_same_hash_determinism() -> None:
+def test_same_tree_produces_same_hash_determinism(tmp_path: Path) -> None:
     """Two identical trees produce the same hash (determinism, §1.1)."""
     files: dict[str, tuple[str, bool]] = {
         "src/main.nim": ("import std/strutils\nproc main() = echo \"hi\"\n", False),
         "README.md": ("# project\n", False),
         "scripts/run.sh": ("#!/bin/sh\nexec nim r src/main.nim\n", True),
     }
-    tree_a = make_tree(files)
-    tree_b = make_tree(files)
+    tree_a = make_tree(files, tmp_path / "a")
+    tree_b = make_tree(files, tmp_path / "b")
     assert compute_content_hash(tree_a) == compute_content_hash(tree_b)
 
 
-def test_different_content_produces_different_hash() -> None:
+def test_different_content_produces_different_hash(tmp_path: Path) -> None:
     """Adding a file changes the hash (basic sanity)."""
-    tree_a = make_tree({"a.txt": ("hello\n", False)})
-    tree_b = make_tree({"a.txt": ("hello\n", False), "b.txt": ("world\n", False)})
+    tree_a = make_tree({"a.txt": ("hello\n", False)}, tmp_path / "a")
+    tree_b = make_tree({"a.txt": ("hello\n", False), "b.txt": ("world\n", False)}, tmp_path / "b")
     assert compute_content_hash(tree_a) != compute_content_hash(tree_b)
 
 
@@ -193,37 +192,37 @@ def test_different_content_produces_different_hash() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_dot_git_at_root_excluded() -> None:
+def test_dot_git_at_root_excluded(tmp_path: Path) -> None:
     """Files under .git/ at the root are excluded from the hash (§1.4)."""
-    tree_a = make_tree({"src/main.nim": ("echo 'hi'\n", False)})
+    tree_a = make_tree({"src/main.nim": ("echo 'hi'\n", False)}, tmp_path / "a")
     tree_b = make_tree({
         "src/main.nim": ("echo 'hi'\n", False),
         ".git/HEAD": ("ref: refs/heads/main\n", False),
         ".git/objects/ab/cd1234": ("binary junk", False),
-    })
+    }, tmp_path / "b")
     assert compute_content_hash(tree_a) == compute_content_hash(tree_b)
 
 
-def test_dot_git_at_nested_depth_excluded() -> None:
+def test_dot_git_at_nested_depth_excluded(tmp_path: Path) -> None:
     """Files under a nested .git/ (e.g. vendor/foo/.git/) are also excluded (§1.4)."""
-    tree_a = make_tree({"src/main.nim": ("echo 'hi'\n", False)})
+    tree_a = make_tree({"src/main.nim": ("echo 'hi'\n", False)}, tmp_path / "a")
     tree_b = make_tree({
         "src/main.nim": ("echo 'hi'\n", False),
         "vendor/foo/.git/HEAD": ("ref: refs/heads/main\n", False),
-    })
+    }, tmp_path / "b")
     assert compute_content_hash(tree_a) == compute_content_hash(tree_b)
 
 
-def test_adding_files_under_git_does_not_change_hash() -> None:
+def test_adding_files_under_git_does_not_change_hash(tmp_path: Path) -> None:
     """Adding arbitrary files under .git/ does not affect the hash (§1.4)."""
     base_files: dict[str, tuple[str, bool]] = {"main.nim": ("echo hi\n", False)}
-    tree_a = make_tree(base_files)
+    tree_a = make_tree(base_files, tmp_path / "a")
     tree_b = make_tree({
         **base_files,
         ".git/HEAD": ("ref: refs/heads/main\n", False),
         ".git/config": ("[core]\n\trepositoryformatversion = 0\n", False),
         ".git/objects/pack/pack-abc123.pack": ("binary\x00data", False),
-    })
+    }, tmp_path / "b")
     assert compute_content_hash(tree_a) == compute_content_hash(tree_b)
 
 
@@ -232,17 +231,17 @@ def test_adding_files_under_git_does_not_change_hash() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_executable_bit_changes_hash() -> None:
+def test_executable_bit_changes_hash(tmp_path: Path) -> None:
     """Toggling the owner-execute bit changes the hash (§1.7)."""
     content = "#!/bin/sh\necho hi\n"
-    tree_non_exec = make_tree({"script.sh": (content, False)})
-    tree_exec = make_tree({"script.sh": (content, True)})
+    tree_non_exec = make_tree({"script.sh": (content, False)}, tmp_path / "non_exec")
+    tree_exec = make_tree({"script.sh": (content, True)}, tmp_path / "exec")
     assert compute_content_hash(tree_non_exec) != compute_content_hash(tree_exec)
 
 
-def test_only_owner_execute_bit_is_significant() -> None:
+def test_only_owner_execute_bit_is_significant(tmp_path: Path) -> None:
     """Group/world execute bits do NOT affect the hash; only S_IXUSR does (§1.7)."""
-    tree = make_tree({"f.sh": ("#!/bin/sh\n", False)})
+    tree = make_tree({"f.sh": ("#!/bin/sh\n", False)}, tmp_path / "t")
     fpath = tree / "f.sh"
 
     # Start with no execute bits.
@@ -266,10 +265,12 @@ def test_only_owner_execute_bit_is_significant() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_symlink_hashed_by_target_string_not_followed() -> None:
+def test_symlink_hashed_by_target_string_not_followed(tmp_path: Path) -> None:
     """Symlinks with different targets produce different hashes (§1.5)."""
-    tmp_a = Path(tempfile.mkdtemp())
-    tmp_b = Path(tempfile.mkdtemp())
+    tmp_a = tmp_path / "a"
+    tmp_b = tmp_path / "b"
+    tmp_a.mkdir()
+    tmp_b.mkdir()
     (tmp_a / "real.txt").write_text("hello\n", encoding="utf-8")
     os.symlink("real.txt", tmp_a / "link")
     (tmp_b / "real.txt").write_text("hello\n", encoding="utf-8")
@@ -277,19 +278,22 @@ def test_symlink_hashed_by_target_string_not_followed() -> None:
     assert compute_content_hash(tmp_a) != compute_content_hash(tmp_b)
 
 
-def test_symlink_vs_regular_file_same_content_differ() -> None:
+def test_symlink_vs_regular_file_same_content_differ(tmp_path: Path) -> None:
     """A symlink whose target string equals a file's content still hashes differently
     because the mode marker differs (§1.2)."""
-    tmp_a = Path(tempfile.mkdtemp())
-    tmp_b = Path(tempfile.mkdtemp())
+    tmp_a = tmp_path / "a"
+    tmp_b = tmp_path / "b"
+    tmp_a.mkdir()
+    tmp_b.mkdir()
     (tmp_a / "entry").write_bytes(b"target")  # regular file
     os.symlink("target", tmp_b / "entry")     # symlink with same bytes as target string
     assert compute_content_hash(tmp_a) != compute_content_hash(tmp_b)
 
 
-def test_broken_symlink_does_not_crash() -> None:
+def test_broken_symlink_does_not_crash(tmp_path: Path) -> None:
     """A symlink pointing to a non-existent target is hashed by target string (§1.5)."""
-    tmp = Path(tempfile.mkdtemp())
+    tmp = tmp_path / "t"
+    tmp.mkdir()
     os.symlink("/nonexistent/elsewhere", tmp / "broken")
     result = compute_content_hash(tmp)
     assert result.startswith("sha256:")
@@ -303,9 +307,10 @@ def test_broken_symlink_does_not_crash() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_empty_tree_hashes_empty_byte_stream() -> None:
+def test_empty_tree_hashes_empty_byte_stream(tmp_path: Path) -> None:
     """An empty tree produces sha256 of the empty byte stream (§1.2)."""
-    tmp = Path(tempfile.mkdtemp())
+    tmp = tmp_path / "empty"
+    tmp.mkdir()
     # sha256("") = e3b0c44...
     assert compute_content_hash(tmp) == (
         "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -317,25 +322,25 @@ def test_empty_tree_hashes_empty_byte_stream() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_output_has_sha256_prefix() -> None:
+def test_output_has_sha256_prefix(tmp_path: Path) -> None:
     """Output always starts with 'sha256:' (§2.1)."""
-    tmp = make_tree({"a.nim": ("echo hi\n", False)})
+    tmp = make_tree({"a.nim": ("echo hi\n", False)}, tmp_path / "t")
     result = compute_content_hash(tmp)
     assert result.startswith("sha256:")
 
 
-def test_output_hex_is_64_lowercase_chars() -> None:
+def test_output_hex_is_64_lowercase_chars(tmp_path: Path) -> None:
     """The digest part is exactly 64 lowercase hex chars (§2.1)."""
-    tmp = make_tree({"a.nim": ("echo hi\n", False)})
+    tmp = make_tree({"a.nim": ("echo hi\n", False)}, tmp_path / "t")
     result = compute_content_hash(tmp)
     digest = result[len("sha256:"):]
     assert len(digest) == 64
     assert all(c in "0123456789abcdef" for c in digest)
 
 
-def test_output_is_valid_per_parse_identity() -> None:
+def test_output_is_valid_per_parse_identity(tmp_path: Path) -> None:
     """compute_content_hash output always passes parse_identity (§2.1 / §2.2)."""
-    tmp = make_tree({"src/lib.nim": ("proc foo() = discard\n", False)})
+    tmp = make_tree({"src/lib.nim": ("proc foo() = discard\n", False)}, tmp_path / "t")
     identity = compute_content_hash(tmp)
     assert parse_identity(identity) == identity
 
@@ -354,13 +359,14 @@ RUST_ORACLE_HASH = (
 )
 
 
-def test_byte_compat_with_rust_reference_oracle() -> None:
+def test_byte_compat_with_rust_reference_oracle(tmp_path: Path) -> None:
     """Byte-exact hash matches the Rust reference impl's oracle (cross-impl parity).
 
     Tree: README.md (non-exec), src/main.nim (non-exec), run.sh (exec),
           mainlink→src/main.nim (symlink), .git/HEAD (excluded).
     """
-    tmp = Path(tempfile.mkdtemp())
+    tmp = tmp_path / "oracle"
+    tmp.mkdir()
 
     # src/main.nim — non-executable
     src = tmp / "src"
@@ -393,10 +399,10 @@ def test_byte_compat_with_rust_reference_oracle() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_crlf_and_lf_produce_different_hashes() -> None:
+def test_crlf_and_lf_produce_different_hashes(tmp_path: Path) -> None:
     """CRLF and LF are distinct; no normalisation is applied (§1.6)."""
-    tree_lf = make_tree({"file.txt": ("line1\nline2\n", False)})
-    tree_crlf = make_tree({"file.txt": ("line1\r\nline2\r\n", False)})
+    tree_lf = make_tree({"file.txt": ("line1\nline2\n", False)}, tmp_path / "lf")
+    tree_crlf = make_tree({"file.txt": ("line1\r\nline2\r\n", False)}, tmp_path / "crlf")
     assert compute_content_hash(tree_lf) != compute_content_hash(tree_crlf)
 
 
@@ -405,9 +411,10 @@ def test_crlf_and_lf_produce_different_hashes() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_non_utf8_symlink_target_raises_error() -> None:
+def test_non_utf8_symlink_target_raises_error(tmp_path: Path) -> None:
     """A symlink whose target is non-UTF-8 raises ID-NON-UTF8-SYMLINK-TARGET (§1.5)."""
-    tmp = Path(tempfile.mkdtemp())
+    tmp = tmp_path / "t"
+    tmp.mkdir()
     # Create a symlink with a raw non-UTF-8 target using os.symlink with bytes.
     raw_target = b"\xff\xfe"  # not valid UTF-8
     os.symlink(raw_target, tmp / "bad_link")
