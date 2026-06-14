@@ -93,54 +93,73 @@ def _is_check_certificate_cmd(cmd: str) -> bool:
     return head == "check-certificate"
 
 
+def _canonical_certificate(cert: dict[str, Any]) -> dict[str, Any]:
+    """Comparison-significant canonical form of a certificate.
+
+    The SINGLE definition of "what content is significant in a certificate"
+    (conformance-fixtures §2.7.3), shared by BOTH the fixture-vs-impl
+    assertion (`_compare_certificate_json`) and the cross-impl divergence
+    token (`_assert_check_certificate_fixture`). Keeping these in lockstep is
+    the whole point: a kind-only token (#130) was blind to body divergence.
+
+    - ``message`` is EXCLUDED (human-readable, impl-specific).
+    - success: ``resolved`` and ``witness`` are order-sensitive (kept as-is).
+    - failure: ``refutation`` is set-equality (sorted by package, constraint).
+    """
+    kind = cert.get("kind")
+    if kind == "success":
+        return {
+            "kind": "success",
+            "resolved": cert.get("resolved"),
+            "witness": cert.get("witness"),
+        }
+    if kind == "failure":
+        refutation = sorted(
+            cert.get("refutation", []),
+            key=lambda e: (e.get("package", ""), e.get("constraint", "")),
+        )
+        return {"kind": "failure", "refutation": refutation}
+    return {"kind": kind}
+
+
 def _compare_certificate_json(
     got: dict[str, Any],
     expected: dict[str, Any],
 ) -> Optional[str]:
     """Canonical JSON comparison for certificates (conformance-fixtures §2.7.3).
 
-    - Object comparison is key-order-independent.
-    - ``resolved`` and ``witness`` arrays are order-sensitive.
-    - ``message`` field is EXCLUDED from comparison.
-    - ``refutation`` is set-equality: sort both by (package, constraint).
+    Equality is decided on the shared `_canonical_certificate` form; on
+    mismatch a field-level message is produced for the human reader.
 
     Returns None on match, or a human-readable mismatch string.
     """
     if got.get("kind") != expected.get("kind"):
         return f"kind mismatch: expected {expected.get('kind')!r}, got {got.get('kind')!r}"
-
-    if got["kind"] == "success":
-        if got.get("resolved") != expected.get("resolved"):
-            return (
-                f"resolved mismatch:\n"
-                f"  expected: {json.dumps(expected.get('resolved'))}\n"
-                f"  got:      {json.dumps(got.get('resolved'))}"
-            )
-        if got.get("witness") != expected.get("witness"):
-            return (
-                f"witness mismatch:\n"
-                f"  expected: {json.dumps(expected.get('witness'))}\n"
-                f"  got:      {json.dumps(got.get('witness'))}"
-            )
-    elif got["kind"] == "failure":
-        # message: excluded
-        def _sort_ref(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            return sorted(
-                entries,
-                key=lambda e: (e.get("package", ""), e.get("constraint", "")),
-            )
-        got_ref = _sort_ref(got.get("refutation", []))
-        exp_ref = _sort_ref(expected.get("refutation", []))
-        if got_ref != exp_ref:
-            return (
-                f"refutation set mismatch:\n"
-                f"  expected (sorted): {json.dumps(exp_ref)}\n"
-                f"  got (sorted):      {json.dumps(got_ref)}"
-            )
-    else:
+    if got.get("kind") not in ("success", "failure"):
         return f"unknown certificate kind: {got.get('kind')!r}"
 
-    return None
+    cg = _canonical_certificate(got)
+    ce = _canonical_certificate(expected)
+    if cg == ce:
+        return None
+
+    if cg["kind"] == "success":
+        if cg["resolved"] != ce["resolved"]:
+            return (
+                f"resolved mismatch:\n"
+                f"  expected: {json.dumps(ce['resolved'])}\n"
+                f"  got:      {json.dumps(cg['resolved'])}"
+            )
+        return (
+            f"witness mismatch:\n"
+            f"  expected: {json.dumps(ce['witness'])}\n"
+            f"  got:      {json.dumps(cg['witness'])}"
+        )
+    return (
+        f"refutation set mismatch:\n"
+        f"  expected (sorted): {json.dumps(ce['refutation'])}\n"
+        f"  got (sorted):      {json.dumps(cg['refutation'])}"
+    )
 
 
 def assert_conformance(
@@ -243,10 +262,12 @@ def _assert_check_certificate_fixture(
                         detail=f"check-certificate: {mismatch}",
                     ))
                 else:
-                    # Record a stable marker for cross-impl comparison
-                    # (normalized: sort refutation, exclude message).
+                    # Cross-impl divergence token: the full canonical cert
+                    # body (#130), not just kind — two impls that each match
+                    # their fixture can still differ from each other in
+                    # witness/resolved/refutation, and that must surface.
                     normalized_outputs["expected/certificate.json"] = json.dumps(
-                        got_cert.get("kind", "")
+                        _canonical_certificate(got_cert), sort_keys=True
                     )
             except Exception as e:
                 failures.append(AssertionFailure(

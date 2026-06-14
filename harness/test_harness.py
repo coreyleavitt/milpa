@@ -371,6 +371,59 @@ class TestB3DivergenceDetection(unittest.TestCase):
         self.assertEqual(parsed["impls"]["python"], "MAN-KDL-SYNTAX")
         self.assertEqual(parsed["impls"]["broken"], "WRONG-SLUG")
 
+    def test_certificate_content_divergence_not_just_kind(self) -> None:
+        """#130: the cross-impl cert token captures content, not just kind.
+
+        Two impls can each pass their own fixture's expected JSON yet differ
+        from each other in certificate *body*. The divergence token must
+        reflect that — comparing only ``kind`` ("success"/"failure") is blind
+        to a witness/resolved/refutation mismatch.
+        """
+        from harness.assertions import _canonical_certificate
+
+        a = {
+            "kind": "success",
+            "resolved": [{"package": "foo", "version": "1.0.0"}],
+            "witness": [{"package": "foo", "decision": "1.0.0"}],
+        }
+        b = {
+            "kind": "success",
+            "resolved": [{"package": "foo", "version": "2.0.0"}],
+            "witness": [{"package": "foo", "decision": "2.0.0"}],
+        }
+        # Same kind — a kind-only token would call these identical.
+        self.assertEqual(a["kind"], b["kind"])
+        tok_a = json.dumps(_canonical_certificate(a), sort_keys=True)
+        tok_b = json.dumps(_canonical_certificate(b), sort_keys=True)
+        self.assertNotEqual(
+            tok_a, tok_b,
+            "content-differing certs must yield different divergence tokens",
+        )
+
+    def test_canonical_certificate_excludes_message(self) -> None:
+        """#130: message is human-readable/impl-specific — not part of the token."""
+        from harness.assertions import _canonical_certificate
+
+        a = {"kind": "failure", "refutation": [{"package": "x", "constraint": ">=1"}],
+             "message": "no version of x satisfies >=1"}
+        b = {"kind": "failure", "refutation": [{"package": "x", "constraint": ">=1"}],
+             "message": "x has no compatible release"}
+        self.assertEqual(_canonical_certificate(a), _canonical_certificate(b))
+
+    def test_canonical_certificate_refutation_order_insensitive(self) -> None:
+        """#130: refutation is set-equality (sorted by package, constraint)."""
+        from harness.assertions import _canonical_certificate
+
+        a = {"kind": "failure", "refutation": [
+            {"package": "x", "constraint": ">=1"},
+            {"package": "y", "constraint": "<2"},
+        ]}
+        b = {"kind": "failure", "refutation": [
+            {"package": "y", "constraint": "<2"},
+            {"package": "x", "constraint": ">=1"},
+        ]}
+        self.assertEqual(_canonical_certificate(a), _canonical_certificate(b))
+
     def test_format_report_includes_divergence(self) -> None:
         """B3: format_report includes divergence section when divergences present."""
         from harness.corpus import DivergenceRecord, CorpusReport
