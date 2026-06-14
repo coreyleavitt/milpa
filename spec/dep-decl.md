@@ -68,15 +68,39 @@ EdgeSet = {
                                                # fidelity tag — NOT serialized
 }
 
-NamedRequire = { name: string, constraint_str: string }
-UrlRequire   = { url: string, ref: string }
+NamedRequire = {
+    name:            string
+    constraint_str:  string
+    predicates:      tuple[Predicate, ...]     # optional; defaults empty
+                                               # in-memory only — NOT serialized
+                                               # in v0 DepDecl artifacts (#134)
+}
+UrlRequire = {
+    url:        string
+    ref:        string
+    predicates: tuple[Predicate, ...]          # optional; defaults empty
+                                               # in-memory only — NOT serialized
+                                               # in v0 DepDecl artifacts (#134)
+}
 ```
+
+The `Predicate` type is the same type defined in `spec/manifest-grammar.md §6` — there is one predicate model shared across manifest conditionals and nimble-fallback annotations.
 
 > NORMATIVE: `EdgeSet` is the **single** edge type in each implementation.
 > There MUST NOT be a separate "DepDecl type" duplicating it. The `.nimble`
 > heuristic (§7), `milpa.kdl` parsing, and DepDecl artifact parsing all
 > return an `EdgeSet`. (Cross-reference: `rfc-content-addressed-metadata.md`
 > §3.2 SSOT rationale.)
+
+> NORMATIVE: The `predicates` field on `NamedRequire` and `UrlRequire` is
+> **in-memory only**. It MUST NOT appear in any serialized v0 DepDecl artifact.
+> For edges derived from the `.nimble` heuristic (§7), the field carries the
+> translated `Predicate` tuple from recognized `when` conditions (§7.5). For
+> edges from a DepDecl artifact or `milpa.kdl`, the field is empty. The field
+> flows through the edge-source bridge into the resolver and is recorded in the
+> lockfile as an additive `cond-require` annotation (see `spec/lockfile-schema.md`
+> §3.5). Carrying predicates inside DepDecl artifact bytes is a schema-v1
+> change deferred to #134.
 
 > NORMATIVE: The `source` field is **in-memory only**. It MUST NOT appear in
 > any serialized artifact (lockfile, DepDecl, index). Its sole purpose is to
@@ -97,9 +121,13 @@ UrlRequire   = { url: string, ref: string }
 attach to later schema versions:
 
 - `dep_decl_schema_version 0` — v0 fields: `requires`, `src_dir`.
-- **Any additive field** (e.g., `capabilities` from `rfc-beyond-pubgrub.md`
-  D2, or per-condition branches from issue #26) is a **schema-version bump**,
-  not a retroactive extension of v0.
+- **Any additive field serialized in the artifact** (e.g., `capabilities` from
+  `rfc-beyond-pubgrub.md` D2, or per-condition branches from issue #134 — the
+  DepDecl artifact carrying predicates) is a **schema-version bump**, not a
+  retroactive extension of v0. NOTE: issue #26 adds `predicates` to the
+  in-memory `RequireEntry` type (§1) but does NOT serialize them in v0 DepDecl
+  artifacts; that is deferred to #134. The `RequireEntry.predicates` field is
+  therefore not a schema bump.
 
 A v0 DepDecl artifact is **never** re-read as if it had a later schema's
 fields. Old `dep_decl_hash` pins remain valid for v0 artifacts indefinitely.
@@ -561,31 +589,135 @@ edge cases.
 
 ### 7.5  `when`-block policy
 
-> NORMATIVE: If any line matches the pattern `^\s*when\b`, the parser MUST:
->
-> 1. Set an internal `has_when` flag.
-> 2. Continue processing all `requires` and `srcDir` lines **unconditionally**
->    (do NOT attempt to evaluate the NimScript condition; include every branch).
-> 3. The order of entries encountered across `when`-block branches is their
->    **authored file order** — exactly as if the `when` lines were not present.
->    No reordering or deduplication is performed.
-> 4. After completing the scan, emit a `UserWarning` with the exact text:
->
->    ```
->    .nimble contains `when` block(s); milpa does not evaluate nimscript, so
->    all `requires` are included unconditionally. If this over-includes,
->    consider expressing the conditionality in milpa.kdl with platform=/nim=
->    predicates (#26).
->    ```
->
-> Conformant implementations MUST include all `requires` unconditionally when
-> `when` blocks are present.
+The `.nimble` scanner recognizes a bounded, well-defined subset of NimScript
+`when` conditions and translates them into milpa `Predicate` tuples (per
+`spec/manifest-grammar.md §6`). Everything outside that surface degrades to
+the pre-#26 over-include + warn behavior. NimScript is never evaluated.
 
-> NOTE: Unconditional inclusion is the safe choice because `when` blocks in
-> `.nimble` files are NimScript expressions that the parser cannot evaluate.
-> Over-inclusion causes no correctness harm (the resolver may include an
-> unneeded dep for some platforms); under-inclusion would silently drop a dep
-> and break builds.
+**The dep set is unchanged:** every `requires` from every branch is still
+included unconditionally in `EdgeSet.requires`. Predicates are recorded as
+metadata on the `RequireEntry.predicates` field (§1) and flow to the lockfile
+as an additive `cond-require` annotation (`spec/lockfile-schema.md §3.5`).
+Build-time activation (filtering the active dep set by the resolving profile)
+is deferred to #110; #26 never under-includes relative to the pre-#26 behavior.
+
+#### 7.5.1  Recognized condition → Predicate translation table
+
+> NORMATIVE: Implementations MUST attempt to translate each `when` / `elif`
+> condition string using the following table. A condition that does not match
+> any row is **UNRECOGNIZED**. A recognized condition ALWAYS yields a
+> **non-empty** tuple of `Predicate` instances; the function MUST NOT return an
+> empty tuple for any recognized condition.
+>
+> | NimScript condition | Predicate(s) | Notes |
+> |---|---|---|
+> | `defined(windows)` or `defined(win)` | `platform="windows"` | `win` is a standard Nim alias |
+> | `defined(macosx)` or `defined(macos)` | `platform="macosx"` | `macos` is a Nim ≥1.4 alias |
+> | `defined(linux)` | `platform="linux"` | |
+> | `defined(freebsd)` | `platform="freebsd"` | |
+> | `defined(openbsd)` | `platform="openbsd"` | |
+> | `defined(netbsd)` | `platform="netbsd"` | |
+> | `defined(amd64)` | `arch="amd64"` | Nim `hostCPU` vocabulary |
+> | `defined(arm64)` | `arch="arm64"` | |
+> | `defined(i386)` | `arch="i386"` | |
+> | `not <recognized-single>` | the predicate with `negated=true` | single negation only; flips the `negated` flag, does NOT invert the operator |
+> | `NimMajor OP X` | `nim="OPX.0.0"` | OP ∈ `{>=, >, <, <=, ==}` |
+> | `(NimMajor, NimMinor) OP (X, Y)` | `nim="OPX.Y.0"` | same OP set |
+> | `(NimMajor, NimMinor, NimPatch) OP (X, Y, Z)` | `nim="OPX.Y.Z"` | three-tuple form; all five operators accepted |
+> | `<nim-tuple> OP1 <v1> and <nim-tuple> OP2 <v2>` | `(nim="OP1v1", nim="OP2v2")` | two-sided range — tuple of two Predicates; AND semantics |
+> | anything else | **UNRECOGNIZED** | `defined(posix)`, `defined(release)`, `defined(js)`, `defined(<custom>)`, general `or`, nested calls, etc. |
+>
+> **`nim` value spelling:** the canonical form is **space-free** — the operator
+> is concatenated directly with the version string, e.g. `">=1.4.0"` not
+> `">= 1.4.0"`. This is the single serialization form; both impls MUST produce
+> this spacing. The lockfile `cond-require` annotation (§7.5.4) reproduces the
+> same string verbatim.
+>
+> **`defined(posix)` is deliberately NOT recognized** (→ UNRECOGNIZED →
+> over-include). Nim's `posix` predicate is true on platforms outside milpa's
+> closed vocabulary (haiku, solaris, android-on-linux). Mapping it to a fixed
+> OR set would under-include on those platforms — violating the invariant that
+> this path never under-includes relative to today's behavior. Over-including on
+> the few posix-using packages is the safe choice; a precise `posix` mapping
+> waits on a formally closed platform vocabulary.
+
+#### 7.5.2  Branch algebra
+
+> NORMATIVE: Implementations MUST track `when` / `elif` / `else` chain structure
+> using an indentation-aware state machine that handles both NimScript block
+> forms:
+>
+> - **Indented-block form:** `when <cond>:` followed by body lines at a deeper
+>   indent level.
+> - **Single-line colon form:** `when <cond>: requires "x"` with the body on
+>   the same line as the header.
+>
+> Branch predicate semantics (canonical, pinned across all impls):
+>
+> - A branch's predicate(s) attach to **every** `requires` inside that branch
+>   (including multiple requires statements per branch).
+> - `when A:` branch → predicates from translating condition A.
+> - `elif B:` branch (after `when A`) → (predicates of B) AND (negation of
+>   every predicate in A's translation). Example: `when defined(linux) … elif
+>   defined(macosx)` — the `elif` branch carries `(platform="macosx",
+>   platform=(not)"windows")` is incorrect; the correct composition is
+>   `(platform="macosx", platform=(not)"linux")`.
+> - `else:` branch → AND of the negations of all preceding branch conditions
+>   (one negated predicate per preceding `when`/`elif` condition).
+> - **Chain poisoning:** if ANY branch in the chain has an UNRECOGNIZED
+>   condition, OR if the chain has more than one branch and any recognized
+>   condition yields more than one predicate, the ENTIRE chain is poisoned —
+>   every branch in that chain is treated as UNRECOGNIZED (over-include, no
+>   annotation). Poisoning is necessary because correct `elif`/`else` negation
+>   cannot be computed across an opaque condition.
+> - **Nested `when`:** an inner `when` chain (at depth ≥ 1 inside an outer
+>   branch body) is UNRECOGNIZED — all its branches get `predicates=None` (over-
+>   include + warn). The enclosing outer chain is unaffected.
+
+#### 7.5.3  Warning policy
+
+> NORMATIVE: The spec-mandated `UserWarning` MUST fire if and only if at least
+> one branch in any chain in the file is UNRECOGNIZED (as defined in §7.5.2 —
+> including chains that are wholly poisoned or contain nested `when` blocks).
+> A file whose `when` blocks are ALL recognized MUST NOT emit the warning.
+>
+> The exact warning text when the condition is met:
+>
+> ```
+> .nimble contains `when` block(s); milpa does not evaluate nimscript, so
+> all `requires` are included unconditionally. If this over-includes,
+> consider expressing the conditionality in milpa.kdl with platform=/nim=
+> predicates (#26).
+> ```
+>
+> A recognized `when` translates precisely and emits NO warning. The warning
+> announces only the cases where translation failed and over-inclusion applies.
+
+#### 7.5.4  Lockfile annotation and activation
+
+> NORMATIVE: Predicates attached to `RequireEntry.predicates` (§1) are recorded
+> in the lockfile as additive `cond-require` nodes (see
+> `spec/lockfile-schema.md §3.5`). The `requires` node in the lockfile is
+> **unchanged** — it continues to list the full universal require set, including
+> entries that carry predicates. Build-time **activation** (filtering `nim.cfg`
+> or the active dep set by a resolving profile) is the domain of #110 and is NOT
+> part of this spec section. The consumers `frozen`, `milpa verify`, and
+> `nimcfg` read `requires` only and MUST NOT be changed to consult
+> `cond-require`.
+
+#### 7.5.5  Semantic asymmetry: root `when` vs transitive `when`
+
+> NOTE: The same `platform="linux"` predicate surface means different things
+> depending on origin. A `milpa.kdl` root dep declared inside a
+> `when platform="linux" { }` block is **filtered at resolve time** — the dep is
+> absent from the lockfile on a non-linux host (existing, intentional behavior).
+> A `.nimble` transitive dep inside `when defined(linux): requires "extra"` is
+> **recorded** under this policy — `extra` stays in the universal lockfile,
+> annotated with the predicate, and #110 activates it at build time. The
+> distinction reflects the trust gradient: declarative authored intent
+> (`milpa.kdl`) is honored immediately; a predicate reverse-engineered from
+> un-evaluated NimScript is recorded for deliberate, universal-lockfile-
+> preserving activation later.
 
 ### 7.6  `nim` requirement filtering
 

@@ -37,8 +37,10 @@ A conformant implementation of this spec MUST:
    properties (parse-always, verify-always, fetch-fails-precisely).
 8. Reject an unknown provenance kind **only on a cache-miss fetch**; parse and
    verify-if-materialized MUST succeed.
-9. Parse `.nimble` transitive-dep files using the heuristic described in §5;
-   emit `UserWarning` on `when` blocks; include all `requires` unconditionally.
+9. Parse `.nimble` transitive-dep files using the heuristic defined normatively
+   in `spec/dep-decl.md §7`; translate recognized `when` conditions to
+   `Predicate` tuples (§7.5.1); emit `UserWarning` only on UNRECOGNIZED
+   conditions (§7.5.3); always include all `requires` unconditionally.
 10. Parse the `when`-block / inline-predicate conditional syntax (§6): four keys,
     OR semantics, negation annotation, mixed-negation rejection
     (`MAN-PREDICATE-MIXED-NEGATION`).
@@ -564,27 +566,37 @@ execute them. Instead it applies the heuristic defined normatively in
 
 ### 5.3  `when`-block policy
 
-> NORMATIVE: If any line matches the pattern `^\s*when\b`, the parser MUST:
->
-> 1. Set an internal `has_when` flag.
-> 2. Continue processing all `requires` and `srcDir` lines unconditionally
->    (do NOT attempt to evaluate the condition).
-> 3. After completing the scan, emit a `UserWarning` with the exact text:
->
->    ```
->    .nimble contains `when` block(s); milpa does not evaluate nimscript, so
->    all `requires` are included unconditionally. If this over-includes,
->    consider expressing the conditionality in milpa.kdl with platform=/nim=
->    predicates (#26).
->    ```
->
-> Conformant implementations MUST include all `requires` unconditionally when
-> `when` blocks are present — over-inclusion is safe; under-inclusion would
-> silently break builds.
+> **NORMATIVE DEFINITION IS IN `spec/dep-decl.md §7.5`** — the joint
+> milpa↔tianguis contract. This section is a cross-reference summary only;
+> `dep-decl.md §7.5` is the normative source and MUST be consulted for
+> implementation.
 
-> NOTE: The rationale for unconditional inclusion is that `when` blocks in
-> `.nimble` files are NimScript expressions that milpa cannot safely evaluate.
-> Skipping requires inside a `when` block could silently drop a dep.
+> NORMATIVE: Implementations MUST recognize the bounded subset of NimScript
+> `when` conditions defined in `spec/dep-decl.md §7.5.1` and translate them
+> to `Predicate` tuples. Every `requires` from every branch is STILL included
+> unconditionally — the dep set is unchanged. Predicates are recorded as
+> metadata on `RequireEntry.predicates` and flow to the lockfile as additive
+> `cond-require` annotations (`spec/lockfile-schema.md §3.5`). See
+> `spec/dep-decl.md §7.5` for the complete normative algorithm including:
+>
+> - §7.5.1 — the translation table (recognized conditions → Predicate tuples)
+> - §7.5.2 — branch algebra (`elif`/`else` negation, chain poisoning, nesting)
+> - §7.5.3 — warning policy (fires ONLY on UNRECOGNIZED conditions; a fully
+>   recognized file emits NO warning)
+> - §7.5.4 — lockfile annotation and activation boundary (#110)
+> - §7.5.5 — semantic asymmetry between root `milpa.kdl` `when` (filtered at
+>   resolve time) and transitive `.nimble` `when` (recorded, activated by #110)
+>
+> The `spec/manifest-grammar.md §6` predicate vocabulary and `(not)` negation
+> syntax (§6.1) are reused verbatim by the `.nimble` `when` translation — there
+> is one predicate model in milpa. **`manifest-grammar.md §6` is UNCHANGED** by
+> #26; the §7.5.1 table maps into the existing §6 vocabulary.
+
+> NOTE: Unconditional inclusion is the safety invariant for the dep *set*:
+> #26 never under-includes relative to pre-#26 behavior. The observable change
+> is the addition of `cond-require` annotation nodes in the lockfile for
+> recognized conditions; the `requires` line is byte-identical to today for any
+> given dep's transitive set.
 
 ### 5.4  `nim` requirement filtering
 

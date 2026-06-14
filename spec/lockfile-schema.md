@@ -47,6 +47,9 @@ A conformant implementation of this spec MUST:
 10. Apply the `<dep_name>_<flag_name>` define convention for feature flags
     unless the dep declares an explicit override mapping.
 11. Emit exactly one top-level `strategy` node per lockfile (see §2.2).
+12. Emit additive `cond-require` nodes (§3.5) immediately after `requires`,
+    sorted lexicographically by name, when any dep has conditional require
+    annotations derived from recognized `.nimble` `when` conditions.
 
 ---
 
@@ -153,6 +156,9 @@ dep "depname2" { ... }
 > - `    requires` (bare, no arguments) when the dep has no transitive deps;
 >   otherwise `    requires "<dep1>" "<dep2>" ...` with args in lexicographic
 >   order, space-separated, each double-quoted.
+> - Zero or more `    cond-require ...` nodes (§3.5) — emitted immediately
+>   after `requires`, sorted lexicographically by name; omitted entirely when
+>   the dep has no conditional require annotations.
 > - `    active_flags "<f1>" "<f2>" ...` — emitted only when non-empty; args
 >   are double-quoted and space-separated.
 > - `    self_mirrors (url)"<url1>" (url)"<url2>" ...` — emitted only when
@@ -204,8 +210,9 @@ dep "depname" {
     version "1.2.3"
     src_dir "src"
     requires "dep1" "dep2"
-    active_flags "flag1"          // omitted when empty
-    self_mirrors (url)"https://..." // omitted when empty
+    cond-require "dep2" platform="linux"  // additive; omitted when empty (§3.5)
+    active_flags "flag1"                  // omitted when empty
+    self_mirrors (url)"https://..."       // omitted when empty
     provenance {
         kind "git"
         url "https://..."
@@ -276,14 +283,154 @@ dep "depname" {
 > fetch runs, which accumulate `requires` in non-deterministic BFS arrival
 > order, always produce byte-identical output.
 
-### 3.5  `active_flags` field (optional)
+### 3.5  `cond-require` nodes (additive, optional)
+
+`cond-require` nodes record which of a dep's transitive requires are
+conditional (i.e., gated by a recognized `when` condition in the dep's
+`.nimble` file). They are **additive annotation nodes** — they do not alter the
+dep's `requires` node and never affect dep-set selection, `frozen`, `verify`, or
+`nimcfg` behavior. Build-time activation (filtering the active dep set by a
+resolving profile) is deferred to #110.
+
+> NORMATIVE: `requires` is **unchanged**: it continues to list the full,
+> universal (platform-neutral) transitive dep set for every dep, including
+> entries that also carry `cond-require` annotations. An older milpa that does
+> not understand `cond-require` MUST still see the complete dep set in `requires`
+> — this is the correct degradation: the annotation is silently ignored and the
+> dep is included on all platforms (pre-#26 behavior). No lockfile-schema-version
+> bump is needed.
+
+> NORMATIVE: A `cond-require` node carries **one** positional string argument
+> (the dep name, which MUST also appear as an argument in the sibling `requires`
+> node) and encodes the predicate(s) in one of two forms:
+>
+> **Single-predicate inline form** (one `Predicate` clause):
+>
+> ```kdl
+>     cond-require "extra" platform="linux"
+> ```
+>
+> The property key is the predicate name (`platform`, `arch`, or `nim`); the
+> value is the single match token. Negation uses the `(not)` type annotation
+> from `manifest-grammar.md §6`:
+>
+> ```kdl
+>     cond-require "extra" platform=(not)"windows"
+> ```
+>
+> **Multi-clause AND form** (two or more `Predicate` clauses — e.g., an `elif`
+> branch or a two-sided nim-version range):
+>
+> ```kdl
+>     cond-require "macstuff" {
+>         when platform="macosx"
+>         when platform=(not)"linux"
+>     }
+> ```
+>
+> Each `when` child node inside the block carries exactly one property (predicate
+> name + value). Stacked `when` children compose with **AND** — the same
+> semantics as multiple `Predicate` entries in a tuple. The `(not)` annotation is
+> accepted on `when` child values in block form, identical to inline form.
+>
+> These are the **only two shapes** for `cond-require`; no other structure is
+> conformant.
+
+> NORMATIVE: Predicate value spelling follows `manifest-grammar.md §6` verbatim.
+> For `nim` predicates specifically: the canonical form is **space-free** — the
+> comparison operator is concatenated directly with the version string, e.g.
+> `nim=">=1.4.0"` (not `nim=">= 1.4.0"`). This matches the `nim` predicate
+> value form in §7.5.1 of `spec/dep-decl.md`. Implementations MUST produce
+> this space-free form when emitting `cond-require` nodes.
+
+> NORMATIVE: `cond-require` nodes MUST appear **immediately after** the
+> `requires` node, in lexicographic order by name (byte-stable across impls).
+> Within a single block form, the `when` children preserve **predicate-tuple
+> order** — the order in which predicates were produced by the §7.5.2 branch
+> algebra — and MUST NOT be re-sorted.
+
+> NORMATIVE: `cond-require` is **omitted entirely** for deps that have no
+> conditional require annotations (i.e., deps with no recognized `when`
+> conditions in their `.nimble` file, or deps resolved via DepDecl artifacts).
+> This keeps the lockfile **byte-identical** for such deps relative to pre-#26
+> output.
+
+> NORMATIVE: `frozen.py`, `milpa verify`, and `nimcfg` MUST read `requires`
+> only and MUST NOT be modified to consult `cond-require`. Activation is #110.
+
+#### 3.5.1  `CondRequire` type and `LockedDep.cond_requires` field
+
+> NORMATIVE: The in-memory type is:
+>
+> ```
+> CondRequire = { name: string, predicates: tuple[Predicate, ...] }
+> ```
+>
+> `predicates` MUST be non-empty (an annotation with no predicates is
+> meaningless and MUST NOT be emitted). `name` MUST appear in the sibling
+> `LockedDep.requires` tuple.
+>
+> `LockedDep` gains an additive field `cond_requires: tuple[CondRequire, ...]`
+> (default empty). **`LockedDep.requires: tuple[str, ...]` is UNCHANGED.**
+>
+> For Rust: `LockedDep.cond_requires: Vec<CondRequire>`.
+
+#### 3.5.2  Forward-compatibility guarantee
+
+> NOTE: An older milpa parser that does not recognize the `cond-require` node
+> identifier will skip it (KDL 2.0 unknown-node skip behavior). It will read
+> the `requires` node normally and see the complete, universal transitive dep
+> set — the same set it would have seen before #26. This is correct degradation:
+> the dep is included on all platforms; only the predicate annotation is lost.
+> Because `cond-require` is purely additive and `requires` is unchanged, no
+> schema-version bump is required for this addition.
+
+#### 3.5.3  Annotated example
+
+```kdl
+dep "qux" {
+    identity "sha256:abc...def"
+    version "1.0.0"
+    src_dir ""
+    requires "bar" "extra"
+    cond-require "extra" platform="linux"
+    provenance {
+        kind "git"
+        url "https://github.com/example/qux.git"
+        ref "v1.0.0"
+        commit_sha "deadbeef..."
+    }
+}
+```
+
+`requires "bar" "extra"` is UNCHANGED — the full universal require set.
+`cond-require "extra" platform="linux"` is the additive annotation recording
+that `extra` was gated by `when defined(linux):` in `qux.nimble`. An older
+milpa skips the `cond-require` line and still sees `"bar" "extra"` in
+`requires` — correct behavior.
+
+Multi-clause AND example (an `elif` branch):
+
+```kdl
+dep "pkg" {
+    ...
+    requires "bar" "macstuff"
+    cond-require "macstuff" {
+        when platform="macosx"
+        when platform=(not)"linux"
+    }
+    provenance { ... }
+}
+```
+
+### 3.6  `active_flags` field (optional)
 
 > NORMATIVE: `active_flags` carries zero or more positional string arguments,
 > each being the name of a feature flag active for this dep in the resolved
 > graph. MUST be omitted from the emitted KDL when no flags are active, to
 > keep diffs minimal.
 
-### 3.6  `self_mirrors` field (optional)
+### 3.7  `self_mirrors` field (optional)
 
 > NORMATIVE: `self_mirrors` carries zero or more URL arguments. Each URL MAY
 > be either a plain string or a `(url)`-annotated value; both forms MUST be
