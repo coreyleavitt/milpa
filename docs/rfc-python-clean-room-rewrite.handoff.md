@@ -27,7 +27,17 @@ All 11b items done, all gates green, zero divergence (see consolidated gate). Su
 **Candidate follow-ups (non-blocking):** workspace `milpa add` UX (gets MAN-WORKSPACE-HAS-DEPS-OR-KIND, not a
 clear refused-message); coverage gaps cli.verify-no-lock + resolver.dev-deps-root-only.
 
-## ⏳ 11c — THE SWAP: EXECUTED (uncommitted, awaiting Corey diff-review + commit) — 2026-06-14
+## 🏁 #6 COMPLETE — 11c SWAP COMMITTED + PUSHED (2026-06-14). RFC DONE.
+On main: `408b063` (11b saturation) · `5ae87ad` (arch! swap) · `521a511` (README install) ·
+`ebafed2` (CLAUDE.md refresh). impls/python IS the rewrite; frozen impl gone; spec/errors.md
+spec-owned (#128 resolved); harness = {python, rust}, no MILPA_PYTHON_NG, zero divergence.
+Memory + CLAUDE.md refreshed to the post-swap topology. Follow-up issues open: #129/#130/#131
+(cert+ws no-op / harness cert-divergence / workers bypass), #132/#133 (Tier-3 registry-requires /
+milpa adopt). Candidate non-blocking follow-ups: workspace `milpa add` UX message; coverage gaps
+cli.verify-no-lock + resolver.dev-deps-root-only. **Both this session's RFCs (DepDecl + #6) are
+shipped — clean `/clear` point (between RFCs).**
+
+## (historical) ⏳ 11c — THE SWAP: EXECUTED (uncommitted, awaiting Corey diff-review + commit) — 2026-06-14
 Corey gave the go. errors.md = SPEC-OWNED (closes #128; chosen over python-ng-as-generator —
 discovered python-ng errors.py is slug-only, no metadata/generator). Done (all staged, NOT committed):
 - `impls/python-ng` → `impls/python` (git mv, 27 renames); FROZEN impl deleted (127 files incl.
