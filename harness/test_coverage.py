@@ -140,11 +140,11 @@ class TestCoverageReport(unittest.TestCase):
                 report.gap_ids,
                 "Expected 'resolver.dev-deps-root-only' in gap_ids (it has no fixtures or tiers)",
             )
-            # "cli.add-git" is also a known gap
+            # "cli.add-git" has no tiers, so with an empty corpus it's a gap
             self.assertIn(
                 "cli.add-git",
                 report.gap_ids,
-                "Expected 'cli.add-git' in gap_ids (§2f scope-out: no manifest-mutate fixtures yet)",
+                "Expected 'cli.add-git' in gap_ids against empty corpus (fixtures absent)",
             )
             # GAP lines must appear in log output
             gap_log_lines = [l for l in log_lines if "[coverage] GAP" in l]
@@ -187,16 +187,25 @@ class TestCoverageReport(unittest.TestCase):
             "Either the corpus is smaller than expected or the inventory is wrong.",
         )
 
-        # The known gap clauses (§2f scope-out) must still be in gap_ids
-        # (they have no covering_fixtures or tiers)
-        scope_out_gaps = {"cli.add-git", "cli.remove", "cli.update"}
-        for gap_id in scope_out_gaps:
+        # cli.add-git, cli.remove, cli.update are now covered by corpus fixtures
+        # (120/121/123/124/160/161/162) — they must NOT be in gap_ids.
+        now_covered = {"cli.add-git", "cli.remove", "cli.update"}
+        for clause_id in now_covered:
+            self.assertNotIn(
+                clause_id, report.gap_ids,
+                f"Clause {clause_id!r} should be covered by corpus fixtures "
+                "(fixtures 120/121/123/124/160/161/162 are present in spec-v1/)",
+            )
+
+        # The still-open gap clauses must remain in gap_ids
+        still_open = {"cli.verify-no-lock", "resolver.dev-deps-root-only"}
+        for gap_id in still_open:
             clause = next((c for c in CLAUSE_INVENTORY if c.id == gap_id), None)
             if clause is not None and clause.observable:
                 self.assertIn(
                     gap_id, report.gap_ids,
-                    f"§2f scope-out clause {gap_id!r} must remain in gaps "
-                    "(no manifest-mutate fixtures exist yet)",
+                    f"Clause {gap_id!r} must remain in gaps "
+                    "(no fixture covers it yet)",
                 )
 
     def test_c4_log_output_structure(self) -> None:

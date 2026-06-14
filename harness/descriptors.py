@@ -171,6 +171,12 @@ def build_descriptors(repo_root: str | Path) -> list[ImplDescriptor]:
         # frozen Python does not consult member attestation-policy in `milpa verify`
         # (the fix is python-ng; wired at the Python rewrite #6).
         "fixture-151-ws-verify-edge-mismatch-member-strict",
+        # FETCH-REF-DISCOVERY-FAILED (fixture-163): frozen Python's cmd_add()
+        # does NOT check MILPA_MOCKED_FETCHES for ref discovery; it always calls
+        # _git_default_branch() (real git ls-remote). With no network this exits 1
+        # but emits no milpa-error: slug. The fix lives in python-ng cli.py
+        # (_mocked_default_branch wiring). Wired at the Python rewrite (#6).
+        "fixture-163-fetch-ref-discovery-failed",  # mocked ref-discovery not in frozen Python
     }
 
     python_desc = ImplDescriptor(
@@ -206,12 +212,22 @@ def build_descriptors(repo_root: str | Path) -> list[ImplDescriptor]:
     # 127/128 now PASS via the black-box harness (Rust emits cert JSON).
     rust_check_certificate_pending: set[str] = set()
 
+    # FETCH-REF-DISCOVERY-FAILED (fixture-163): Rust's discover_default_branch()
+    # exits 1 with a human-readable message but emits NO milpa-error: slug line
+    # when mocked ref-discovery fails (cli-contract §5.6 comment "no slug").
+    # The Python impl (and spec) require FETCH-REF-DISCOVERY-FAILED to be emitted.
+    # Tracked as a Rust conformance gap to fix in the 11c swap.
+    rust_ref_discovery_no_slug: set[str] = {
+        "fixture-163-fetch-ref-discovery-failed",
+    }
+
     rust_known_failing = (
         rust_no_cas_symlinks
         | rust_index_err_swallowed
         | rust_no_predicate_filtering
         | rust_frozen_workspace_gaps
         | rust_check_certificate_pending
+        | rust_ref_discovery_no_slug
     )
 
     rust_desc = ImplDescriptor(

@@ -89,6 +89,24 @@ impl Verdict {
     }
 }
 
+/// CLI filesystem-discovery guard fixtures whose error path cannot be modelled
+/// by the in-process runner.  These exercise the CLI's file-discovery layer
+/// (load_or_discover_manifest, frozen lockfile existence guard) which runs
+/// before any resolver or parser call.  The in-process runner reads fixture
+/// files directly by name and cannot represent a "missing milpa.kdl/milpa.lock"
+/// scenario.  Covered by the black-box CLI harness for all three impls; skipped
+/// in-process (same rationale as [`Cmd::CliOnly`]).
+const CLI_DISCOVERY_GUARD: &[&str] = &[
+    // MAN-NO-MANIFEST: no milpa.kdl in fixture dir (runner reads it by path).
+    "fixture-153-man-no-manifest",
+    // MAN-NIMBLE-AMBIGUOUS: two *.nimble files, no milpa.kdl (runner reads milpa.kdl).
+    "fixture-154-man-nimble-ambiguous",
+    // FROZEN-NO-LOCKFILE: cmd:frozen but no milpa.lock (runner reads it by path).
+    "fixture-156-frozen-no-lockfile",
+    // LOCK-FILE-NOT-FOUND via show: cmd:show is CliOnly but listed for completeness.
+    "fixture-157-lock-file-not-found",
+];
+
 /// Run one fixture against `target` in `scratch` and return the verdict.
 pub fn run_fixture(fx: &Fixture, target: &dyn Target, scratch: &Scratch) -> Verdict {
     // CLI-only fixtures (mutation/liveness verbs) are not modeled by the
@@ -99,6 +117,20 @@ pub fn run_fixture(fx: &Fixture, target: &dyn Target, scratch: &Scratch) -> Verd
              covered by the black-box CLI harness, not the in-process runner"
                 .to_string(),
         );
+    }
+
+    // CLI filesystem-discovery guard fixtures: the in-process runner reads
+    // fixture files by name (milpa.kdl, milpa.lock) and cannot model the
+    // CLI's file-discovery layer that raises MAN-NO-MANIFEST, MAN-NIMBLE-AMBIGUOUS,
+    // or FROZEN-NO-LOCKFILE.  These are covered by the black-box CLI harness.
+    if let Some(fixture_name) = fx.dir.file_name().and_then(|n| n.to_str()) {
+        if CLI_DISCOVERY_GUARD.contains(&fixture_name) {
+            return Verdict::Skip(format!(
+                "CLI filesystem-discovery guard fixture ({fixture_name}); \
+                 in-process runner cannot model a missing milpa.kdl/milpa.lock — \
+                 covered by the black-box CLI harness"
+            ));
+        }
     }
 
     let produced = target.execute(fx, scratch);

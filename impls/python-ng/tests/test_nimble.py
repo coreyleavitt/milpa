@@ -345,10 +345,21 @@ class TestTotalNeverRaises:
         m = parse_nimble("requires\n")
         assert m.deps == ()
 
-    def test_unparseable_constraint_dropped_silently(self) -> None:
-        """A garbled constraint → dep silently dropped (total-scan)."""
+    def test_unparseable_constraint_preserved_with_none_set(self) -> None:
+        """A garbled constraint → dep preserved with constraint_set=None (total-scan).
+
+        The scanner does NOT drop the dep; it preserves the raw constraint
+        string so the EdgeSource layer can escalate (NimbleEdgeSource raises
+        MAN-NIMBLE-CONSTRAINT) or widen (MilpaKdl/DepDecl → VersionSet.full()).
+        """
+        from milpa.manifest import NamedDep
         m = parse_nimble('requires "foo NOTANOP version"')
-        assert m.deps == ()
+        assert len(m.deps) == 1
+        dep = m.deps[0]
+        assert isinstance(dep, NamedDep)
+        assert dep.name == "foo"
+        assert dep.constraint == "NOTANOP version"
+        assert dep.constraint_set is None
 
     def test_unquoted_line_not_confused_with_requires(self) -> None:
         m = parse_nimble("requiresAnonymous = true\n")

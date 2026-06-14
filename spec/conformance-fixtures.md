@@ -203,9 +203,20 @@ fixture-NNN-<slug>/
 > named packages visible to this fixture's resolver run. A fixture that
 > exercises no named deps MAY include `index.kdl` as an empty index (a document
 > with only a `schema_version` node and no `package` nodes), or MAY omit
-> `index.kdl` entirely. When `index.kdl` is absent the runner passes
-> `index=None` to the resolver, which raises `RES-NO-INDEX` or
-> `RES-WS-NO-INDEX` if the manifest contains named deps without an override.
+> `index.kdl` entirely.
+
+> NORMATIVE: `MILPA_INDEX_URL` env-var semantics in the harness (three-way;
+> `spec/cli-contract.md §8.1` NORMATIVE):
+>
+> | Fixture state | Harness sets `MILPA_INDEX_URL` to | Impl behavior |
+> |---|---|---|
+> | `index.kdl` **present** | `file://<abs-path>` | Load from that file (no network). |
+> | `index.kdl` **absent** | `""` (empty string) | Explicitly no index; `index=None` without any network attempt. |
+>
+> The harness ALWAYS sets `MILPA_INDEX_URL` (never leaves it absent), so the
+> impl's "absent → DEFAULT_INDEX_URL" production path is never triggered inside
+> the conformance corpus. This keeps the corpus hermetic: no fixture ever touches
+> the live tianguis network.
 
 > NORMATIVE: The frozen index is `index.kdl`, consumed via the `parse_index`
 > path. The earlier `registry.json` placeholder in `rfc-multi-impl-strategy.md`
@@ -822,22 +833,125 @@ emitting `milpa.lock` and `nim.cfg`.
 > NOTE: The ≥1-per-code floor is now met for all codes that are reachable
 > through the conformance runner's fixture mechanism. The following codes are
 > documented as **structurally unreachable** via the current runner and are
-> therefore exempt from the coverage floor:
+> therefore exempt from the coverage floor. They are grouped by the structural
+> reason they cannot be triggered via fixture inputs:
+>
+> **Router-shadowed (raise site unreachable due to caller routing):**
 >
 > - `MAN-WORKSPACE-IN-PACKAGE` — raised only by `parse_manifest()` (not
 >   `parse_workspace_or_manifest()`); the runner always uses the latter, which
 >   routes workspace blocks to the workspace parser before this error can fire.
-> - `LOCK-FILE-NOT-FOUND`, `LOCK-FILE-UNREADABLE` — raised only by
->   `load_lockfile()` (disk-read path); the `parse-lockfile` cmd uses
->   `parse_lockfile()` which receives text directly, bypassing disk I/O errors.
-> - `LOCK-GRAPH-MISMATCH` — raised only by `verify_against_graph()`; the
->   runner does not call the verifier.
 > - `WS-NO-MANIFEST`, `WS-NOT-A-WORKSPACE` — the runner dispatches on
 >   `parse_workspace_or_manifest()` output type and always passes a directory
 >   that has a workspace-typed `milpa.kdl` to `load_workspace()`; the two
 >   pre-conditions checked by those codes are therefore never false.
+> - `VERIFY-DEPS-DIR-MISSING` — not black-box reachable via the `verify` cmd
+>   token: both impls call `deps_dir.mkdir(parents=True, exist_ok=True)` at
+>   the start of `resolve`, so any harness two-phase (`resolve` then `verify`)
+>   run always creates `_deps/` before the verifier checks for it. Reachable
+>   only via a direct `milpa verify` with no prior fetch, which the harness
+>   fixture mechanism has no cmd token for.
+> - `MAN-MUTATE-WORKSPACE-REFUSED` — shadowed at the CLI mutation verb layer:
+>   `add`/`remove`/`update` call `parse_manifest()` before
+>   `mutate_manifest_file()`, so a workspace-root manifest raises
+>   `MAN-WORKSPACE-HAS-DEPS-OR-KIND` (or `MAN-ADD-DEP-EXISTS` on the add
+>   pre-check) first; the raise site in `manifest_writer.py` is never reached
+>   via any fixture cmd token.
+>
+> **Fetch-wrapping (inner codes always wrapped by an outer code at the
+> fetcher-registry boundary):**
+>
+> - `FETCH-DOWNLOAD-FAILED`, `FETCH-GIT-FAILED`, `FETCH-GIT-COMMIT-ABSENT`,
+>   `FETCH-MOCK-MISSING`, `FETCH-SHA256-MISMATCH`, `FETCH-OCI-PULL-FAILED`,
+>   `FETCH-OCI-NO-TARBALL`, `FETCH-OCI-AMBIGUOUS-TARBALL`,
+>   `FETCH-LOCAL-PATH-NOT-FOUND`, `FETCH-LOCAL-PATH-NOT-DIR`,
+>   `FETCH-RECEIPT-EMPTY` — raised inside individual fetcher implementations
+>   and caught by `fetch_any()` at `fetchers/types.py`; all are re-wrapped as
+>   `FETCH-ALL-FAILED` before reaching the CLI error channel. The terminal
+>   slug observed by the harness is always `FETCH-ALL-FAILED`; the inner
+>   codes are implementation details not observable at the black-box boundary.
+> - `EXTRACT-ZIP-SLIP`, `EXTRACT-SYMLINK-ESCAPE`, `EXTRACT-SIZE-LIMIT` —
+>   raised by the safe-extractor and caught by `TarballFetcher`, which
+>   re-wraps them as `FETCH-EXTRACT-FAILED`; same wrapping boundary.
+> - `CAS-IDENTITY-MISMATCH` — raised by `CAStore.admit()` when the staged
+>   tree's actual hash does not match the fetcher-computed identity; caught
+>   by the outer `fetch_any()` handler and re-wrapped as `FETCH-ALL-FAILED`.
+> - `CAS-NOT-IN-STORE` — raised by `CAStore.link()` when the identity has no
+>   CAS entry; in the frozen path the implementation checks `store.contains()`
+>   explicitly before calling `link()` and raises `FROZEN-IDENTITY-NOT-IN-STORE`
+>   instead, so `CAS-NOT-IN-STORE` never reaches the CLI error channel.
+>
+> **ID-wrapping (identity codes always wrapped at the lockfile layer):**
+>
+> - `ID-NO-ALGORITHM-PREFIX`, `ID-NON-HEX-DIGEST`, `ID-NOT-A-STRING`,
+>   `ID-UNSUPPORTED-ALGORITHM`, `ID-WRONG-DIGEST-LENGTH` — raised by
+>   `parse_identity()` and caught by `parse_lockfile()`, which re-wraps them
+>   as `LOCK-DEP-IDENTITY-INVALID`. The terminal slug observed by the harness
+>   is always `LOCK-DEP-IDENTITY-INVALID` (fixture-073).
+> - `ID-NON-UTF8-SYMLINK-TARGET` — raised by `compute_content_hash()` during
+>   CAS admission; not wrappable via a fixture input (requires a source tree
+>   with a non-UTF-8 symlink target, which cannot be expressed in the
+>   platform-neutral fixture format).
+>
+> **Swallow (code raised internally then converted to a different observable
+> outcome at the CLI boundary):**
+>
+> - `MILPA-INDEX-UNREACHABLE` *(pending spec inclusion at the 11c swap)* —
+>   raised by the index-cache layer when the network is unreachable and no
+>   cached index is available; caught by `cli.py` at the index-load site and
+>   converted to `index=None`, which surfaces as `RES-NO-INDEX` or
+>   `RES-WS-NO-INDEX` when the manifest has named deps. The harness always
+>   operates with a fixture-supplied `index.kdl` (hermetic corpus); the
+>   network-failure path is not constructible via fixture inputs alone.
+>
+> **Dead-catalog (no active raise site in the current implementation; code
+> reserved or structurally prevented):**
+>
+> - `FROZEN-NO-CAS` — the CAS default store is always valid (constructed from
+>   `MILPA_CACHE_DIR`, XDG, or `~/.cache/milpa`); `fetcher.store` is never
+>   `None` in any path the CLI constructs.
+> - `MAN-NIMBLE-PARSE` — `parse_nimble()` is a total scanner that skips
+>   malformed entries rather than raising; this code is reserved for a future
+>   strict-parse mode and currently has no raise site.
+> - `MAN-MUTATE-NIMBLE-REFUSED` — mutation verbs (`add`/`remove`) always
+>   operate on the hardcoded `milpa.kdl` path; the CLI never passes a `.nimble`
+>   path to `mutate_manifest_file()`. Constructible only via a direct library
+>   call, not via any fixture cmd token.
 > - `TNG-BAD-VERSION` — explicitly reserved for a future strict-parse pass;
 >   currently unparseable version strings are silently skipped.
+> - `MILPA-INTERNAL` — the outermost catch-all; only fires if an unexpected
+>   exception escapes all typed handlers. Not constructible from a fixture
+>   input (by definition, fixtures trigger typed error paths).
+> - `INTERNAL-PANIC` — Rust-only; emitted by a top-level panic handler. Has
+>   no fixture-triggerable raise site (an unhandled panic is a crash verdict
+>   under R4, not a slug match).
+>
+> **Permission/race-only (only triggerable by host filesystem permission
+> errors or OS races, not by fixture inputs):**
+>
+> - `MAN-FILE-NOT-FOUND`, `MAN-FILE-UNREADABLE` — raised by `load_manifest()`
+>   on disk-read failure; the harness always supplies `milpa.kdl` as a fixture
+>   input, so the file is always present and readable.
+> - `LOCK-FILE-UNREADABLE` — raised by `load_lockfile()` on a permission
+>   error; distinct from `LOCK-FILE-NOT-FOUND` (which IS covered by
+>   fixture-157 via the `show` cmd token, where the harness intentionally
+>   omits `milpa.lock`).
+> - `NIMBLE-FILE-NOT-FOUND`, `NIMBLE-FILE-UNREADABLE` — raised by the nimble
+>   file reader on disk-read failure; the harness always writes the nimble file
+>   into the scratch directory before invoking the implementation.
+> - `WS-NO-MANIFEST`, `WS-NOT-A-WORKSPACE` — also listed under
+>   router-shadowed above.
+> - `MAN-MUTATE-FILE-NOT-FOUND` — raised by `mutate_manifest_file()` when the
+>   target file is absent; in practice the mutation verbs always operate on a
+>   manifest the CLI has already successfully parsed from disk.
+> - `MAN-ADD-MIRROR-IDENTITY-MISMATCH` — raised by `cmd_add_mirror()` when
+>   the proposed mirror URL serves bytes that don't hash to the locked
+>   identity; requires a live network round-trip to a mismatched server, which
+>   no fixture-format transport slot expresses.
+> - `MAN-MIRROR-EDITABLE-PROVENANCE` — raised by `cmd_add_mirror()` for local
+>   or member provenance; constructible only when a lockfile has a
+>   local/member entry, which the `add --mirror` cmd token does not combine
+>   with (local deps have no tarball-sha to mirror).
 >
 > The following codes were previously listed as unreachable but are now covered
 > by fixtures added in this revision:
@@ -866,6 +980,17 @@ emitting `milpa.lock` and `nim.cfg`.
 > - `--path:"src"` self-path line — fixture-116: root manifest declares
 >   `src_dir "src"`; the runner now passes `self_src_dir` to `format_nimcfg()`,
 >   producing a leading self-path line before the dep paths.
+> - `LOCK-FILE-NOT-FOUND` — fixture-157: `show` cmd token with no `milpa.lock`
+>   input; the `show` verb calls `load_lockfile()` on the missing path before
+>   printing, which triggers the disk-read error code. (Previously listed as
+>   unreachable because the `parse-lockfile` cmd bypasses disk I/O; the `show`
+>   cmd token is the correct harness vehicle for this code.)
+> - `LOCK-GRAPH-MISMATCH` — fixture-159: `verify` cmd token with a
+>   `milpa.lock` that contains a dep absent from the actually-resolved `_deps/`
+>   tree; `milpa verify` calls the verifier, which detects the graph
+>   divergence. (Previously listed as unreachable because the runner did not
+>   exercise `milpa verify`; the `verify` cmd token added in Stage 11b is the
+>   correct harness vehicle.)
 >
 > The following codes are **newly minted** for the content-addressed-metadata RFC
 > (S0–S7) and are covered by fixtures added in that revision:

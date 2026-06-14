@@ -117,7 +117,10 @@ def _build_env(
       1. os.environ (host), with all MILPA_* keys stripped.
       2. LC_ALL=C (stable locale).
       3. MILPA_CACHE_DIR=<iso cas abs path>.
-      4. MILPA_INDEX_URL if scratch/index.kdl exists.
+      4. MILPA_INDEX_URL — ALWAYS set (three-way semantics, cli-contract §8.1):
+           - scratch/index.kdl present → file://<abs-path> (that fixture's index).
+           - scratch/index.kdl absent  → "" (empty = explicitly no index;
+             prevents the impl from falling back to the live tianguis network).
       5. MILPA_MOCKED_FETCHES if scratch/mocked-fetches exists.
       6. MILPA_DEP_DECL_DIR if scratch/dep-decl exists (S3a).
       7. Fixture env file overrides (MILPA_TARGET_* etc).
@@ -127,9 +130,13 @@ def _build_env(
     env["LC_ALL"] = "C"
     env["MILPA_CACHE_DIR"] = str(cas_dir.resolve())
 
+    # Always set MILPA_INDEX_URL: file:// URL when index.kdl is present,
+    # empty string when absent (= explicitly no index, no network fallback).
     index_kdl = scratch / "index.kdl"
     if index_kdl.exists():
         env["MILPA_INDEX_URL"] = f"file://{index_kdl.resolve()}"
+    else:
+        env["MILPA_INDEX_URL"] = ""
 
     mocked = scratch / "mocked-fetches"
     if mocked.exists():

@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from milpa.dep_decl import EdgeSet, EdgeSource, NamedRequire, UrlRequire
 from milpa.errors import (
+    MAN_NIMBLE_CONSTRAINT,
     TNG_DEPDECL_SCHEMA_MISMATCH,
     TNG_DEPDECL_SCHEMA_UNSUPPORTED,
     MilpaError,
@@ -146,7 +147,15 @@ class NimbleEdgeSource:
 
 
 def _nimble_edges(dep_path: Path, dep_name: str) -> tuple[list[NamedRequire | UrlRequire], str]:
-    """Extract requires + src_dir from the ``.nimble`` file at ``dep_path``."""
+    """Extract requires + src_dir from the ``.nimble`` file at ``dep_path``.
+
+    Raises:
+        MilpaError(MAN-NIMBLE-CONSTRAINT): a named requires line has a
+            malformed version constraint (``NamedDep.constraint`` is set but
+            ``NamedDep.constraint_set`` is ``None``).  Mirrors the Rust
+            reference (``resolver.rs`` ~line 1326-1348): the scanner stores
+            the raw string; the NimbleFallback layer validates and raises.
+    """
     from milpa.nimble import parse_nimble
     from milpa.manifest import UrlDep, NamedDep
 
@@ -168,6 +177,17 @@ def _nimble_edges(dep_path: Path, dep_name: str) -> tuple[list[NamedRequire | Ur
         elif isinstance(dep, NamedDep):
             if dep.name == "nim":
                 continue
+            # Malformed constraint detection (§121 / Rust parity):
+            # _build_dep preserves constraint_set=None when parsing failed.
+            # Here (NimbleFallback path) we raise instead of widening.
+            if dep.constraint is not None and dep.constraint_set is None:
+                raise MilpaError(
+                    MAN_NIMBLE_CONSTRAINT,
+                    f"dep {dep.name!r}: malformed version constraint "
+                    f"{dep.constraint!r} in .nimble requires",
+                    name=dep.name,
+                    constraint=dep.constraint,
+                )
             requires.append(NamedRequire(
                 name=dep.name,
                 constraint_str=dep.constraint or "",

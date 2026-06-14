@@ -259,20 +259,29 @@ def _build_dep_decl_store() -> object | None:
 
     Priority:
       1. ``MILPA_DEP_DECL_DIR`` → ``FileDepDeclStore`` (conformance / air-gapped).
-      2. ``MILPA_INDEX_URL`` set → ``HttpDepDeclStore`` derived per §3.3.
-      3. Neither set → ``None`` (DepDecl branch unreachable at resolve time).
+      2. ``MILPA_INDEX_URL`` **absent** → ``HttpDepDeclStore`` from ``DEFAULT_INDEX_URL``.
+      3. ``MILPA_INDEX_URL`` **present and non-empty** → ``HttpDepDeclStore`` from that URL.
+      4. ``MILPA_INDEX_URL`` **present but empty** → ``None`` (explicitly no index;
+         DepDecl branch unreachable).
+
+    Three-way env semantics match ``_load_index_for_verb``:
+    absent → default, empty → no-index, non-empty → that URL.
     """
     from milpa.dep_decl_store import FileDepDeclStore, make_dep_decl_store
+    from milpa.index_cache import DEFAULT_INDEX_URL
 
     dep_decl_dir = os.environ.get("MILPA_DEP_DECL_DIR", "").strip()
     if dep_decl_dir:
         return FileDepDeclStore(Path(dep_decl_dir))
 
-    index_url = os.environ.get("MILPA_INDEX_URL", "").strip()
-    if index_url:
-        return make_dep_decl_store(index_url)
+    raw = os.environ.get("MILPA_INDEX_URL")  # None if absent, str if set
+    if raw is not None and raw.strip() == "":
+        # Explicitly no index → DepDecl branch unreachable.
+        return None
 
-    return None
+    # Absent → DEFAULT_INDEX_URL; non-empty → that URL.
+    index_url = raw.strip() if raw is not None else DEFAULT_INDEX_URL
+    return make_dep_decl_store(index_url)
 
 
 # ---------------------------------------------------------------------------
@@ -283,31 +292,35 @@ def _build_dep_decl_store() -> object | None:
 def _load_index_for_verb(env: MilpaEnv) -> MilpaEnv:
     """Return a new MilpaEnv with the index eagerly loaded (or None if unreachable).
 
-    Reads MILPA_INDEX_URL (cli-contract.md §8.1).
+    Reads MILPA_INDEX_URL (cli-contract.md §8.1) using three-way semantics:
 
-    When the index is unreachable (MILPA-INDEX-UNREACHABLE) → index=None.
-    The resolver raises RES-NO-INDEX if a named dep requires the index.
-    This mirrors the Rust `maybe_index()` design: network failure is NOT
-    a hard error here; it becomes a hard error at resolve time iff named
-    deps need the index.
+    - ``MILPA_INDEX_URL`` **absent** from env → load from ``DEFAULT_INDEX_URL``
+      (the live tianguis index). Network failure → ``index=None`` (soft; the
+      resolver raises RES-NO-INDEX only if a named dep needs the index).
+    - ``MILPA_INDEX_URL`` **present but empty** (``""``) → explicitly NO index;
+      ``index=None`` without any network attempt. Used by the harness for
+      air-gapped fixtures that contain no ``index.kdl``.
+    - ``MILPA_INDEX_URL`` **present and non-empty** → load from that URL.
 
-    TNG-* parse errors propagate — the index was fetched but failed
-    validation; surfacing the correct slug is more useful than silently
-    treating a malformed index as absent.
+    TNG-* parse errors always propagate — the index was fetched but failed
+    validation; the correct slug is more useful than silently treating a
+    malformed index as absent.
+
+    spec/cli-contract.md §8.1 NORMATIVE.
     """
     from dataclasses import replace
 
     from milpa.errors import MILPA_INDEX_UNREACHABLE
 
-    # The index is opt-in: only load it when MILPA_INDEX_URL is explicitly set.
-    # No MILPA_INDEX_URL → no index configured → index=None.
-    # The resolver raises RES-NO-INDEX if a named dep requires an absent index.
-    # This mirrors the conformance spec (§2.3): the harness sets MILPA_INDEX_URL
-    # only when index.kdl exists in the fixture; absence means "no index".
-    index_url = os.environ.get("MILPA_INDEX_URL", "").strip()
-    if not index_url:
+    # Three-way semantics: distinguish absent (→ default URL) from
+    # present-but-empty (→ explicitly no index).
+    raw = os.environ.get("MILPA_INDEX_URL")  # None if absent, str if set
+    if raw is not None and raw.strip() == "":
+        # Explicitly no index (e.g. harness air-gapped fixture).
         return replace(env, index=None)
 
+    # Absent → DEFAULT_INDEX_URL; non-empty → that URL.
+    # load_default_index() calls index_url_from_env() which handles both cases.
     try:
         index = load_default_index()
     except MilpaError as exc:
@@ -938,10 +951,13 @@ def _verify_dep_decl_pins(
 
     Returns 0 on success; emits slug and returns 1 on failure.
     """
-    # Determine offline state: dep_decl_store must exist AND MILPA_INDEX_URL set.
+    # Determine offline state: dep_decl_store must exist AND MILPA_INDEX_URL
+    # must not be explicitly empty (three-way: absent→default=online,
+    # empty→no-index=offline, non-empty→that-URL=online).
     dep_decl_store = env.dep_decl_store if env is not None else None
-    index_url = os.environ.get("MILPA_INDEX_URL", "").strip()
-    offline = dep_decl_store is None or not index_url
+    raw_index_url = os.environ.get("MILPA_INDEX_URL")  # None if absent
+    explicitly_no_index = raw_index_url is not None and raw_index_url.strip() == ""
+    offline = dep_decl_store is None or explicitly_no_index
 
     if offline:
         if strict:

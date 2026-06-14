@@ -157,10 +157,8 @@ CLAUSE_INVENTORY: list[SpecClause] = [
         id="cli.show-no-lock",
         spec_ref="cli-contract.md §5.3",
         description="show MUST exit 1 with LOCK-FILE-NOT-FOUND when milpa.lock absent",
-        covering_fixtures=(),
+        covering_fixtures=("fixture-157-lock-file-not-found",),
         covering_tiers=(),
-        # GAP: no corpus fixture exercises show with a missing milpa.lock
-        # (tracked alongside §2f gap; no cmd=show fixture exists yet)
     ),
 
     # -----------------------------------------------------------------------
@@ -173,6 +171,15 @@ CLAUSE_INVENTORY: list[SpecClause] = [
         covering_fixtures=(),
         covering_tiers=(),
         # GAP: no corpus fixture exercises verify with a missing milpa.lock
+        # (fixture-157 covers the show verb; a separate verify+no-lock fixture
+        # would need cmd=verify without milpa.lock — not yet authored)
+    ),
+    SpecClause(
+        id="cli.verify-graph-drift",
+        spec_ref="cli-contract.md §5.4",
+        description="verify MUST exit 1 with LOCK-GRAPH-MISMATCH when _deps/ diverges from milpa.lock",
+        covering_fixtures=("fixture-159-lock-graph-mismatch",),
+        covering_tiers=(),
     ),
 
     # -----------------------------------------------------------------------
@@ -435,25 +442,26 @@ CLAUSE_INVENTORY: list[SpecClause] = [
         id="cli.add-git",
         spec_ref="cli-contract.md §5.6",
         description="add --git MUST fetch, resolve commit SHA, write to milpa.kdl + milpa.lock",
-        covering_fixtures=(),
+        covering_fixtures=("fixture-120-add-git-dep",
+                           "fixture-161-man-add-dep-exists"),
         covering_tiers=(),
-        # GAP: §2f scope-out — manifest-mutate fixtures not yet built (#5)
     ),
     SpecClause(
         id="cli.remove",
         spec_ref="cli-contract.md §5.7",
         description="remove MUST remove dep from milpa.kdl; absent dep raises MAN-REMOVE-DEP-ABSENT",
-        covering_fixtures=(),
+        covering_fixtures=("fixture-121-remove-dep",
+                           "fixture-162-man-remove-dep-absent"),
         covering_tiers=(),
-        # GAP: §2f scope-out — manifest-mutate fixtures not yet built (#5)
     ),
     SpecClause(
         id="cli.update",
         spec_ref="cli-contract.md §5.8",
         description="update MUST drop pins and refetch; MUST NOT mutate milpa.kdl",
-        covering_fixtures=(),
+        covering_fixtures=("fixture-123-update-all",
+                           "fixture-124-update-scoped",
+                           "fixture-160-lock-dep-not-found"),
         covering_tiers=(),
-        # GAP: §2f scope-out — manifest-mutate fixtures not yet built (#5)
     ),
     SpecClause(
         id="cli.show-format",

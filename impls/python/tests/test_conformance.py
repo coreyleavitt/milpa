@@ -106,6 +106,30 @@ _TARBALL_TOFU_PYTHON_FROZEN = frozenset({
 # the Rust reference impl and python-ng exercise them. Wired at the rewrite (#6).
 # (fixture-139 is the NON-strict summary-warn arm: it resolves via the .nimble
 #  fallback with no pin, so the frozen impl matches it and it is NOT listed.)
+# CLI-level filesystem-discovery guard fixtures: these error codes are raised by
+# the CLI's file-discovery layer (load_or_discover_manifest, frozen lockfile guard)
+# before any resolver logic runs.  The in-process adapter always reads milpa.kdl
+# directly from the fixture dir — it cannot model "no milpa.kdl found" or "no
+# milpa.lock found" without the CLI's filesystem-scanning entry points.
+# Covered by the black-box CLI harness for all three impls; skipped here.
+_CLI_DISCOVERY_GUARD_FROZEN = frozenset({
+    # MAN-NO-MANIFEST: fixture has no milpa.kdl; CLI's load_or_discover_manifest
+    # raises MAN-NO-MANIFEST; the in-process adapter would FileNotFoundError.
+    "fixture-153-man-no-manifest",
+    # MAN-NIMBLE-AMBIGUOUS: fixture has two *.nimble files, no milpa.kdl;
+    # CLI's load_or_discover_manifest raises MAN-NIMBLE-AMBIGUOUS; adapter would
+    # FileNotFoundError on the missing milpa.kdl.
+    "fixture-154-man-nimble-ambiguous",
+    # FROZEN-NO-LOCKFILE: cmd:frozen but no milpa.lock; CLI guard checks existence
+    # before calling resolve_frozen; the in-process adapter would FileNotFoundError.
+    "fixture-156-frozen-no-lockfile",
+    # LOCK-GRAPH-MISMATCH via verify: cmd:verify; the in-process adapter does not
+    # model the verify two-phase harness protocol (pre-fetch + restore wrong lock
+    # + disk check).  The frozen Python impl has no _execute_verify equivalent.
+    "fixture-159-lock-graph-mismatch",
+})
+
+
 _DEPDECL_PYTHON_FROZEN = frozenset({
     "fixture-129-index-dep-decl-pointer",
     "fixture-131-depdecl-hash-mismatch",
@@ -393,6 +417,12 @@ def test_conformance_fixture(fixture_dir: Path, tmp_path: Path):
             "DepDecl fixture (rfc-content-addressed-metadata); frozen Python "
             "has no DepDecl support — Rust + python-ng exercise it; wired at "
             "the rewrite (#6)"
+        )
+    if fixture_dir.name in _CLI_DISCOVERY_GUARD_FROZEN:
+        pytest.skip(
+            "CLI filesystem-discovery guard fixture; the in-process adapter reads "
+            "fixture files by name and cannot model a missing milpa.kdl/milpa.lock. "
+            "Covered by the black-box CLI harness for all impls."
         )
     """Run one conformance fixture and verify outputs against expected/.
 

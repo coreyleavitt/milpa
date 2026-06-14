@@ -1,19 +1,126 @@
 # Clean-room Python rewrite — handoff
 
-- **Stage:** 3 (tdd) — **LOOP PAUSED (2026-06-12): all autonomous implementation slices DONE. Awaiting Corey for the gated final mile** (see "LOOP PAUSED" below).
+- **Stage:** 3 (tdd) — **RESUMED 2026-06-14: Stage 11b grind (fork resolved).** Corey's call on the
+  nimble-role fork = **finish #6, defer b/c** (b→issue #132 registry-requires-graph, largely subsumed by
+  DepDecl; c→issue #133 `milpa adopt`). Transitive `.nimble` parsing stays (irreducible: URL/git deps bypass
+  the registry). The swap (11c) still needs Corey's explicit go.
+
+## ✅ 11b COMPLETE (2026-06-14) — awaiting Corey's explicit go for 11c (the swap)
+All 11b items done, all gates green, zero divergence (see consolidated gate). Summary:
+- **MAN-NIMBLE-CONSTRAINT fixed** (fixture-152): was a SILENT-DROP (not MILPA-INTERNAL) — python-ng
+  dropped the dep + resolved without it; now `NimbleEdgeSource` raises (matches Rust's NimbleFallback-only).
+- **10 of 12 black-box error fixtures authored** (153 MAN-NO-MANIFEST, 154 MAN-NIMBLE-AMBIGUOUS,
+  155 TNG-KDL-SYNTAX, 156 FROZEN-NO-LOCKFILE, 157 LOCK-FILE-NOT-FOUND via show, 159 LOCK-GRAPH-MISMATCH,
+  160 LOCK-DEP-NOT-FOUND, 161 MAN-ADD-DEP-EXISTS, 162 MAN-REMOVE-DEP-ABSENT, 163 FETCH-REF-DISCOVERY-FAILED
+  [Rust known_failing until 11c]). **2 found structurally UNREACHABLE → §4 exemptions**: VERIFY-DEPS-DIR-MISSING
+  (mkdir-always), MAN-MUTATE-WORKSPACE-REFUSED (shadowed by package-parse precheck). (158 unused.)
+- **spec/conformance-fixtures.md §4 reconciled**: un-exempted LOCK-FILE-NOT-FOUND + LOCK-GRAPH-MISMATCH;
+  added 2 new exemptions + 5 structured exemption categories (router-shadowed/fetch-wrapping/ID-wrapping/
+  swallow/dead-catalog/permission-race). Verified: every catalog code is fixture-covered OR §4-exempt.
+- **coverage.py false gaps fixed** 5→2 (remaining documented: cli.verify-no-lock, resolver.dev-deps-root-only).
+- **5c index fallback fixed** (the design call): three-way `MILPA_INDEX_URL` semantics — absent→DEFAULT_INDEX_URL,
+  present-empty→no-index, present-nonempty→that-url — in BOTH CLIs; harness always sets it (empty when air-gapped);
+  spec cli-contract §8.1 + conformance-fixtures §2.2 sharpened. Harness pass counts UNCHANGED (proves no fixture
+  outcome changed); real `milpa fetch` now defaults to the registry.
+- **kdl_io dead-code pruned** (NotValue/build_node/emit_document/_milpa_val_to_kdl) + RFC §3 byte-exact wording fixed.
+
+**Candidate follow-ups (non-blocking):** workspace `milpa add` UX (gets MAN-WORKSPACE-HAS-DEPS-OR-KIND, not a
+clear refused-message); coverage gaps cli.verify-no-lock + resolver.dev-deps-root-only.
+
+## ⏭ 11c — THE SWAP (Corey-gated, irreversible — needs explicit go). One atomic commit (RFC §6 checklist):
+1. `git mv impls/python-ng → impls/python` (frozen impl moves out / is replaced).
+2. Regenerate `spec/errors.md` FROM the new `errors.py` (now the generator) — gains FETCH-REF-DISCOVERY-FAILED +
+   MILPA-INDEX-UNREACHABLE + the DepDecl codes.
+3. Rust companion: implement the 2 pending raise sites (FETCH-REF-DISCOVERY-FAILED slug + MILPA-INDEX-UNREACHABLE)
+   so fixture-163 leaves Rust known_failing.
+4. Drop the `MILPA_PYTHON_NG=1` harness gate (python-ng IS python); update `harness/descriptors.py`.
+5. Update CLAUDE.md + MEMORY.md (architecture table, dev workflow).
+NOTE: this session's DepDecl + 11b work all lives in python-ng, so the swap carries it (all conformant + green).
+
+## 11b worklist (RE-GROUNDED 2026-06-14 against post-DepDecl state)
+DepDecl already did: the `verify` harness cmd token (DONE) + §4 new-codes block. Remaining:
+1. **Fix MAN-NIMBLE-CONSTRAINT (correctness divergence, FIRST).** Re-verified: python-ng does NOT leak
+   MILPA-INTERNAL — it **silently drops the dep** (`nimble.py:253` `except ValueError: return None`) and
+   resolves successfully WITHOUT it; Rust raises MAN-NIMBLE-CONSTRAINT (only on `EdgeSource::NimbleFallback`;
+   MilpaKdl/DepDecl widen to full(), which python-ng `edge_sources.py:551` path-B already matches). Fix =
+   move constraint validation out of `nimble._build_dep`'s silent drop into `NimbleEdgeSource` so it RAISES.
+   Doubles as the MAN-NIMBLE-CONSTRAINT black-box fixture.
+2. **Author the 12 black-box error-path fixtures** (ALL still missing, ALL reachable in current python-ng CLI;
+   raise-sites confirmed): MAN-NO-MANIFEST, MAN-NIMBLE-AMBIGUOUS, TNG-KDL-SYNTAX, FROZEN-NO-LOCKFILE,
+   LOCK-FILE-NOT-FOUND, LOCK-DEP-NOT-FOUND, MAN-ADD-DEP-EXISTS, MAN-REMOVE-DEP-ABSENT,
+   MAN-MUTATE-WORKSPACE-REFUSED, FETCH-REF-DISCOVERY-FAILED, VERIFY-DEPS-DIR-MISSING, LOCK-GRAPH-MISMATCH.
+   Each must PASS python-ng AND Rust; FETCH-REF-DISCOVERY-FAILED → Rust `known_failing` until 11c.
+3. **Reconcile `spec/conformance-fixtures.md §4`**: un-exempt LOCK-FILE-NOT-FOUND + LOCK-GRAPH-MISMATCH (now
+   black-box reachable); add type/flow-unreachable exemption categories (fetch-wrapping, ID-wrapping,
+   MILPA-INDEX-UNREACHABLE swallow, dead-catalog, permission/race-only).
+4. **coverage.py false gaps**: list fixtures 120/121/123/124 under cli.add-git/remove/update; optional
+   `kdl_io` build_node/emit_document/NotValue dead-code prune.
+5. **Index fallback (5c) — RESOLVED under the bar (Corey may override):** production unset `MILPA_INDEX_URL`
+   → `DEFAULT_INDEX_URL` (restore frozen-impl behavior; `cli.py:_load_index_for_verb` early-return guard is
+   the regression); keep corpus hermetic via an explicit harness air-gapped signal (don't overload
+   "absence = no index"); small `spec/conformance-fixtures.md §2.2` sharpening. Confirm at live-fresco gate.
+6. Then **11c THE SWAP** (Corey-gated): `git mv impls/python-ng → impls/python`, regenerate errors.md from new
+   errors.py (gains FETCH-REF-DISCOVERY-FAILED + MILPA-INDEX-UNREACHABLE + the DepDecl codes), Rust companion,
+   drop `MILPA_PYTHON_NG=1` gate, CLAUDE.md/MEMORY update.
+
+## ⏸ (historical) LOOP PAUSED — awaiting Corey (the implementation is COMPLETE + fully conformant)
 
 ## ⏸ LOOP PAUSED — awaiting Corey (the implementation is COMPLETE + fully conformant)
 **Done:** Stages 0–10 — the entire clean-room rewrite. `MILPA_PYTHON_NG=1 python -m harness` → python-ng 121/121, FAIL=0, known-failing=0, **ZERO divergence vs Rust**. pytest 1171/5/0, mypy --strict + ruff clean. **COMMITTED to main as `f4f54e2`** (2026-06-12, not pushed) — impls/python-ng/ + gated harness descriptor + RFC docs + §7.1 spec scope. Frozen impl untouched.
 
 **Remaining work is all Corey-gated — the loop correctly stopped rather than do it autonomously:**
 1. **COMMIT (recommended first):** the whole rewrite is uncommitted. Natural checkpoint before the swap. Suggest committing `impls/python-ng/` + the gated `harness/descriptors.py` change as a `feat(python-ng):` commit (frozen impl untouched, so nothing breaks).
-2. **`--certificate` flag** (RFC §8 external MUST): **SPEC SECTIONS DONE — committed `6c683d9`** (cli-contract.md §2.5 `--certificate <path>` flag, both-outcomes design, exact JSON schema + deterministic ordering; conformance-fixtures.md §2.7.3 `check-certificate` fixture type w/ canonical comparison). REMAINING (S10b): wire the flag in cli.py (serializer `certificate_to_json` exists in solver.py, SSOT) + author check-certificate corpus fixtures + **reconcile certificate_to_json's array order to the spec-mandated order** (resolved lexicographic-by-package; witness by package then satisfied_by) — verify the serializer emits exactly that, fix if not (spec is oracle). Cross-impl: Rust must emit the same JSON + pass the new fixtures.
-3. **11b saturation:** run `harness/coverage.py` MUST-clause map against the new impl; produce the ~50-no-fixture-slug 3-bucket partition (black-box-testable / network-only / type-enforced-unreachable) as the deliverable (no silent gaps); file NEW corpus fixtures for the black-box-testable bucket (FETCH-SHA256-MISMATCH, FETCH-MOCK-MISSING, VERIFY-DEPS-DIR-MISSING, MAN-NO-MANIFEST, mutation-verb slugs). **Cross-impl — Rust must also pass any new shared fixture (run ./dev-rust).**
+2. **`--certificate` flag — ✅ DONE** (spec `6c683d9`; impl `9057d06`). End-to-end both impls: python-ng + Rust `--certificate` flag (fetch/lock; success cert exit-0/no-slug, failure refutation cert exit-1+SOLVE-CONFLICT; atomic; orthogonal R1–R4); serializers reconciled to spec order; corpus fixtures 127 (success)/128 (conflict); harness + in-process adapter check-certificate canonical comparison. `MILPA_PYTHON_NG=1 harness`: python-ng 123/0, rust 123/0, **Cross-impl divergences NONE**. Rust --workspace 281 green. Frozen python parks 127/128 (rides the swap).
+3. **11b saturation — ANALYSIS DONE 2026-06-12, fixture-authoring PAUSED on a design fork (see below).**
+   **Partition (54 no-fixture slugs), grounded in raise-site + wrapping investigation:**
+   - **BLACK-BOX (reachable terminally via the black-box CLI harness → need fixtures): 12** —
+     MAN-NO-MANIFEST (empty dir), MAN-NIMBLE-AMBIGUOUS (2×.nimble), TNG-KDL-SYNTAX (bad index.kdl),
+     FROZEN-NO-LOCKFILE (cmd=frozen, no lock), LOCK-FILE-NOT-FOUND (cmd=parse-lockfile, no lock),
+     LOCK-DEP-NOT-FOUND (cmd=update <absent>), MAN-ADD-DEP-EXISTS (cmd=add dup),
+     MAN-REMOVE-DEP-ABSENT (cmd=remove absent), MAN-MUTATE-WORKSPACE-REFUSED (cmd=add in workspace),
+     FETCH-REF-DISCOVERY-FAILED (cmd=add, mocked, no matching url, no ref);
+     **+ needs a small harness `verify` cmd token:** VERIFY-DEPS-DIR-MISSING, LOCK-GRAPH-MISMATCH.
+   - **TYPE/FLOW-UNREACHABLE: 41** — fetch family ALL wrapped by FETCH-ALL-FAILED at `fetchers/types.py:383`
+     (`except (MilpaError,FetchError,Exception)`); EXTRACT-* wrapped by FETCH-EXTRACT-FAILED; ID-* wrapped
+     by LOCK-DEP-IDENTITY-INVALID at the lockfile layer; permission/race-only (MAN-FILE-*, LOCK-FILE-UNREADABLE,
+     NIMBLE-FILE-*, WS-NO-MANIFEST/NOT-A-WORKSPACE, MAN-MUTATE-FILE-NOT-FOUND); MILPA-INDEX-UNREACHABLE
+     **swallowed** at `cli.py:268` (→ index=None → RES-NO-INDEX); dead/reserved catalog entries with NO raise
+     site in python-ng (FROZEN-NO-CAS [default_store always valid], MAN-WORKSPACE-IN-PACKAGE [parse routes away],
+     TNG-BAD-VERSION [reserved future strict-parse], MAN-NIMBLE-PARSE [total scanner — matches Rust], MILPA-INTERNAL/
+     INTERNAL-PANIC [catch-all/Rust-only]).
+   - **NETWORK-ONLY: 0** (everything transport-bound is ALSO wrapped → folds into unreachable).
+   - **Partition's normative home = `spec/conformance-fixtures.md §4`** ("structurally unreachable" exemption ledger).
+     It was written against the OLD in-process runner; 11b must RECONCILE it to the new black-box CLI harness:
+     un-exempt the now-reachable codes (LOCK-FILE-NOT-FOUND, LOCK-GRAPH-MISMATCH) + add the new exemption
+     reasons (fetch-wrapping, ID-wrapping, swallow, dead-catalog). This §4 update IS the deliverable, not a new doc.
+   - **SATURATION FINDING (cross-impl gap): MAN-NIMBLE-CONSTRAINT.** Rust raises it (`resolver.rs:1419`, passing
+     test) when a transitive named-dep `.nimble` has a malformed version constraint; python-ng's nimble path is
+     total → the constraint `ValueError` leaks as MILPA-INTERNAL. Black-box reachable (named dep + mocked .nimble
+     with bad constraint) → fixture would PASS Rust, FAIL python-ng. Real python-ng bug to fix.
+   - **Cross-impl:** every new fixture MUST pass BOTH impls (run `./dev-rust` / the rust harness descriptor);
+     a Rust divergence on any new fixture is a separate escalation, not papered over.
+   - **Investigation evidence:** raise-site/wrapping table in the agent transcript (a69fbc9f145fe608e); spec §4
+     read at handoff time.
 4. **11c THE SWAP (irreversible — needs explicit go):** atomic `git mv impls/python-ng → impls/python` (frozen impl out); regenerate `spec/errors.md` FROM the new `errors.py` (gains the 2 pending codes FETCH-REF-DISCOVERY-FAILED + MILPA-INDEX-UNREACHABLE); land the Rust companion (catalog entry + DEFERRED→implemented + raise sites for those 2 codes); remove the `MILPA_PYTHON_NG=1` harness gate (python-ng IS python); update CLAUDE.md + MEMORY.md. Follow RFC §6 swap checklist as ONE atomic commit.
 
 **Open findings to resolve during the above (in handoff, see below):** format_manifest is now byte-exact hand-rolled (RFC §3 wording stale; possibly-dead kdl_io build_node/emit_document/NotValue/UrlValue to prune); verify-at-live-fresco: default tianguis index fallback when MILPA_INDEX_URL unset; verify-at-gate: Rust lockfile control-char escaping (\\u{NNNN} vs named) + certificate JSON shape match.
 
-**Resume after Corey decides:** re-run `/loop …` (or `/tdd` a specific item). The grind itself is done.
+**⏸ OPEN FORK (2026-06-12, awaiting Corey) — nimble's role:** Corey questioned whether `.nimble` should be
+supported only via a "translate to milpa" command. Clarified the TWO paths: (1) **root auto-promotion** (silent
+fallback when no milpa.kdl — genuinely optional, could become an explicit `milpa adopt`/translate command);
+(2) **transitive .nimble parsing** (load-bearing — URL/git-pinned deps like fresco→intonaco→chronos bypass the
+tianguis registry and MUST be read live; this is milpa's founding charter, chained URL requires). Corey floated
+"pause and make tianguis encode full requires graphs" to resolve it. **My analysis: it does NOT resolve the mess** —
+URL deps are outside the registry so they still need live transitive parsing, and the .nimble parser merely relocates
+to tianguis ingest-time (same MAN-NIMBLE-* error surface). It's a good additive **Tier 3 RFC** (registry-encoded
+requires graph) for the NAMED-dep subset, not a replacement for the parser. **My recommendation to Corey (awaiting
+his pick, independent options):** (a) resume 11b + fix the MAN-NIMBLE-CONSTRAINT python-ng gap (transitive parsing
+stays regardless); (b) file the Tier 3 registry-requires RFC first; (c) separately pull on root-auto-promotion →
+`milpa adopt`. Transitive parsing stays no matter what.
+
+**Resume after Corey decides:** if (a) → resume 11b: reconcile `spec/conformance-fixtures.md §4`, add `verify` cmd
+token to the harness, author the 12 black-box fixtures (each verified PASS on BOTH python-ng + Rust), fix
+MAN-NIMBLE-CONSTRAINT in python-ng, update §4 + handoff. Then 11c (the swap). The grind itself is done.
 
 - **Stage (orig):** 3 (tdd) — `/loop` grinding slices with `/tdd`
 - **Resume:** `/loop implement the next unimplemented RFC slice … with /tdd` — next is **Stage 11 (saturation + swap)** + the deferred **--certificate flag** (write its cli-contract + conformance-fixtures spec sections FIRST, §8 follow-on). Stage 11 sequencing: 11a full harness/triage (already ~there — known-failing empty, 0 divergence), 11b coverage.py MUST-clause + the ~50 no-fixture-slug 3-bucket partition + new fixtures for black-box-testable ones, 11c the SWAP (atomic git mv python-ng→python; regenerate errors.md from new errors.py; Rust companion for the 2 pending codes; un-gate the harness descriptor; CLAUDE.md/memory update).

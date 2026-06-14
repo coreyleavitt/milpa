@@ -98,6 +98,25 @@ _CORPUS_ROOT = _REPO_ROOT / "conformance"
 # CLI-only verb selectors: handled exclusively by the black-box CLI harness.
 _CLI_ONLY_VERBS = frozenset({"add", "remove", "update", "show", "--version"})
 
+# CLI-level filesystem-discovery guard fixtures: these error codes are raised by
+# the CLI's file-discovery layer (load_or_discover_manifest, frozen lockfile guard)
+# before any resolver logic runs.  The in-process adapter always reads milpa.kdl
+# directly from the fixture dir — it cannot model "no milpa.kdl found" or "no
+# milpa.lock found" without the CLI's filesystem-scanning entry points.
+# Covered by the black-box CLI harness for all three impls; skipped here.
+_CLI_DISCOVERY_GUARD_NAMES: frozenset[str] = frozenset({
+    # MAN-NO-MANIFEST: fixture has no milpa.kdl; CLI's load_or_discover_manifest
+    # raises MAN-NO-MANIFEST; the in-process adapter returns E2E-MANIFEST-UNREADABLE.
+    "fixture-153-man-no-manifest",
+    # MAN-NIMBLE-AMBIGUOUS: fixture has two *.nimble files, no milpa.kdl;
+    # CLI's load_or_discover_manifest raises MAN-NIMBLE-AMBIGUOUS; adapter returns
+    # E2E-MANIFEST-UNREADABLE on the missing milpa.kdl.
+    "fixture-154-man-nimble-ambiguous",
+    # FROZEN-NO-LOCKFILE: cmd:frozen but no milpa.lock; CLI guard checks existence
+    # before calling resolve_frozen; the in-process adapter returns E2E-LOCKFILE-UNREADABLE.
+    "fixture-156-frozen-no-lockfile",
+})
+
 
 class FixtureCmd(str):
     """The resolved command selector from the fixture's ``cmd`` file."""
@@ -1057,7 +1076,16 @@ _FIXTURE_IDS: list[str] = [f.id for f in _ALL_FIXTURES]
 # RES-*, FROZEN-*) are NOT_YET_WIRED.
 
 def _is_cli_only(fx: Fixture) -> bool:
-    return fx.is_cli_only
+    """True when this fixture is driven by the black-box CLI harness only.
+
+    Covers both CLI-verb fixtures (add/remove/update/show/--version) and
+    CLI-level filesystem-discovery guard fixtures whose error path cannot be
+    modelled by the in-process adapter (no milpa.kdl / no milpa.lock in the
+    fixture dir — the adapter reads these files directly by path).
+    """
+    if fx.is_cli_only:
+        return True
+    return fx.dir.name in _CLI_DISCOVERY_GUARD_NAMES
 
 
 ##
@@ -1212,12 +1240,23 @@ class TestConformanceAdapterMachinery:
         assert profile is None
 
     def test_cli_only_fixtures_detected(self) -> None:
-        """CLI-only verb fixtures are correctly identified as cli-only."""
+        """CLI-only verb fixtures (and CLI discovery-guard fixtures) are identified.
+
+        CLI-only verb fixtures have cmd in _CLI_ONLY_VERBS.
+        CLI discovery-guard fixtures (no milpa.kdl/milpa.lock on disk) are also
+        treated as CLI-only (in-process adapter cannot model them); their cmd
+        may be 'resolve' or 'frozen'.
+        """
         cli_only = [f for f in _ALL_FIXTURES if _is_cli_only(f)]
         # We know there are mutation + liveness fixtures (120-124, etc.)
         assert len(cli_only) > 0, "Expected some CLI-only fixtures"
         for fx in cli_only:
-            assert fx.cmd in _CLI_ONLY_VERBS, f"{fx.id}: unexpected cmd {fx.cmd!r}"
+            is_verb_only = fx.cmd in _CLI_ONLY_VERBS
+            is_discovery_guard = fx.dir.name in _CLI_DISCOVERY_GUARD_NAMES
+            assert is_verb_only or is_discovery_guard, (
+                f"{fx.id}: cli-only fixture has unexpected cmd {fx.cmd!r} "
+                f"and is not a known discovery-guard fixture"
+            )
 
     def test_parse_lockfile_fixtures_are_wired(self) -> None:
         """parse-lockfile fixtures are wired (not marked xfail)."""
@@ -1246,12 +1285,17 @@ class TestConformanceAdapterMachinery:
             )
 
     def test_frozen_fixtures_correct_marking(self) -> None:
-        """frozen fixtures: FROZEN-* errors are wired (resolve_frozen implemented)."""
+        """frozen fixtures: FROZEN-* errors are wired (resolve_frozen implemented).
+
+        CLI-discovery-guard FROZEN-* fixtures (no milpa.lock on disk) are excluded:
+        those are skipped here and covered by the black-box CLI harness.
+        """
         frozen = [f for f in _ALL_FIXTURES if f.cmd == "frozen"]
         assert len(frozen) > 0, "Expected some frozen fixtures"
         frozen_error_codes = [
             f for f in frozen
             if f.expected_error and f.expected_error.startswith("FROZEN-")
+            and f.dir.name not in _CLI_DISCOVERY_GUARD_NAMES
         ]
         assert len(frozen_error_codes) > 0
         for fx in frozen_error_codes:
@@ -1261,14 +1305,19 @@ class TestConformanceAdapterMachinery:
             )
 
     def test_man_error_resolve_fixtures_are_wired(self) -> None:
-        """MAN-* error fixtures with cmd=resolve are wired (parse boundary)."""
+        """MAN-* error fixtures with cmd=resolve are wired (parse boundary).
+
+        CLI-discovery-guard fixtures (no milpa.kdl on disk) are excluded:
+        those are skipped here and covered by the black-box CLI harness.
+        """
         man_errors = [
             f for f in _ALL_FIXTURES
             if f.cmd == "resolve"
             and f.expected_error is not None
             and f.expected_error.startswith("MAN-")
+            and f.dir.name not in _CLI_DISCOVERY_GUARD_NAMES
         ]
-        assert len(man_errors) > 0, "Expected some MAN-* resolve error fixtures"
+        assert len(man_errors) > 0, "Expected some non-skip MAN-* resolve error fixtures"
         for fx in man_errors:
             assert _mark_for(fx) == "normal", (
                 f"{fx.id}: MAN-* error fixture should be 'normal' but got {_mark_for(fx)!r}"

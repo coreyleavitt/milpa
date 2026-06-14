@@ -4,10 +4,18 @@
 execute them.  Instead this module performs a **total** line-by-line scan that
 extracts as much information as possible and silently ignores everything else.
 
-Design: **total-never-raises** (mirrors the Rust reference).
-  The scanner never raises ``MilpaError`` for mal-formed input within the
-  file.  Constraint-parse failures on individual ``requires`` strings are
-  silently dropped (the spec: §5.1 says "extract"; extraction can be partial).
+Design: **scanner is total; EdgeSource validates** (mirrors the Rust reference).
+  The scanner (``parse_nimble`` / ``_build_dep``) never raises ``MilpaError``
+  for mal-formed input within the file.  A constraint that fails
+  ``VersionSet.from_nimble_constraint`` is preserved as a raw string
+  (``NamedDep.constraint`` set, ``NamedDep.constraint_set = None``) so the
+  caller can inspect or escalate it.
+
+  The validation decision — raise ``MAN-NIMBLE-CONSTRAINT`` or widen to
+  ``VersionSet.full()`` — belongs to the **EdgeSource layer**:
+  ``NimbleEdgeSource`` (in ``edge_sources.py``) raises for NimbleFallback
+  sources; ``edgeset_to_terms`` widens for MilpaKdl/DepDecl sources.
+  This mirrors the Rust reference (``resolver.rs`` ~line 1326-1348).
 
   File-read failures (not found / unreadable) are NOT handled here — that is
   the responsibility of ``workspace.py``'s ``_load_nimble_file`` helper, which
@@ -15,10 +23,10 @@ Design: **total-never-raises** (mirrors the Rust reference).
   consistently with the rest of the error model.  This module is pure
   text↔value; no filesystem I/O lives here.
 
-The result is a ``NimbleManifest`` whose ``deps`` are ready-to-use
-``UrlDep | NamedDep`` instances (constraints pre-typed via
-``VersionSet.from_nimble_constraint`` — the §121 parse-to-typed-value
-discipline from ``manifest.py``).  ``"nim"`` requirements are dropped per §5.4.
+The result is a ``NimbleManifest`` whose ``deps`` are ``UrlDep | NamedDep``
+instances.  For ``NamedDep`` entries with a malformed constraint,
+``constraint_set`` is ``None`` and ``constraint`` holds the raw string.
+``"nim"`` requirements are dropped per §5.4.
 
 Entry point
 -----------
@@ -170,7 +178,10 @@ def parse_nimble(
     for spec in raw_specs:
         dep = _build_dep(spec)
         if dep is None:
-            # Constraint-parse failure → total-scan: drop silently.
+            # Empty spec or no package name → drop silently.
+            # Note: malformed constraints are NOT dropped here; _build_dep
+            # returns a NamedDep with constraint_set=None so the EdgeSource
+            # layer can escalate (NimbleFallback) or widen (MilpaKdl).
             continue
         if isinstance(dep, NamedDep) and dep.name == "nim":
             # §5.4: Nim compiler is v2 toolchain territory; drop.
@@ -219,8 +230,11 @@ def _strip_comment(line: str) -> str:
 def _build_dep(spec: str) -> UrlDep | NamedDep | None:
     """Classify and construct one dep from a raw spec string.
 
-    Returns ``None`` if the spec is empty or the constraint cannot be
-    parsed (total-scan design: caller drops the entry silently).
+    Returns ``None`` only if the spec is empty or has no package name.
+    Malformed constraints are NOT dropped here — the ``NamedDep`` is returned
+    with ``constraint_set=None`` and the raw ``constraint`` string preserved,
+    so the EdgeSource layer can decide: raise ``MAN-NIMBLE-CONSTRAINT``
+    (NimbleFallback) or widen to ``VersionSet.full()`` (MilpaKdl/DepDecl).
 
     Spec §5.1 URL-vs-named classification:
       - Starts with one of the URL schemes → ``UrlDep`` (``#ref`` split off).
@@ -248,13 +262,19 @@ def _build_dep(spec: str) -> UrlDep | NamedDep | None:
     constraint_str: str | None = parts[1].strip() if len(parts) > 1 else None
 
     # Pre-type the constraint at parse time (§121 discipline).
-    # On ValueError: total-scan → return None so caller drops silently.
+    # On ValueError: preserve the raw string (constraint_set stays None) so
+    # the EdgeSource layer can escalate (NimbleEdgeSource → MAN-NIMBLE-CONSTRAINT)
+    # or widen (MilpaKdl/DepDecl → VersionSet.full()).  Mirrors Rust resolver.rs
+    # ~line 1326-1348: scanner stores the raw string; EdgeSource validates.
     constraint_set = None
     if constraint_str is not None:
         try:
             constraint_set = VersionSet.from_nimble_constraint(constraint_str)
         except ValueError:
-            return None
+            # Malformed constraint: keep the dep with constraint_set=None.
+            # NimbleEdgeSource detects dep.constraint is not None and
+            # dep.constraint_set is None → raises MAN-NIMBLE-CONSTRAINT.
+            pass
 
     # NamedDep.__post_init__ would re-parse the constraint if constraint_set
     # is None. Supply the already-parsed value directly via object.__setattr__

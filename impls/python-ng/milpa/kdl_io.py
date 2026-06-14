@@ -111,35 +111,6 @@ class UrlValue:
         return hash(self._raw)
 
 
-class NotValue:
-    """A ``(not)``-annotated KDL string scalar.
-
-    Used by ``format_manifest`` to emit negated predicate values, e.g.
-    ``platform=(not)"windows"``.  ``build_node``/``_milpa_val_to_kdl``
-    converts this to ``kdl.types.String(value=..., tag="not")`` so no
-    ``kdl.*`` types cross the module boundary.
-    """
-
-    __slots__ = ("_raw",)
-
-    def __init__(self, raw: str) -> None:
-        self._raw = raw
-
-    def __str__(self) -> str:
-        return self._raw
-
-    def __repr__(self) -> str:
-        return f"NotValue({self._raw!r})"
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, NotValue):
-            return self._raw == other._raw
-        return NotImplemented
-
-    def __hash__(self) -> int:
-        return hash(("not", self._raw))
-
-
 class KdlNode:
     """Opaque wrapper around a single kdl-py ``Node``.  Never expose kdl.*."""
 
@@ -434,48 +405,6 @@ def value_as_url(v: KdlValue) -> UrlValue | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Builder + emitter
-# ---------------------------------------------------------------------------
-
-
-def build_node(
-    name: str,
-    args: tuple[KdlValue | UrlValue | NotValue, ...] = (),
-    props: tuple[tuple[str, KdlValue | UrlValue | NotValue], ...] = (),
-    children: tuple[KdlNode, ...] = (),
-) -> KdlNode:
-    """Construct a new ``KdlNode`` explicitly.
-
-    Used by ``format_manifest`` to produce a fresh KDL 2.0 AST without
-    mutating a parsed document.  Args and props accept ``KdlValue``,
-    ``UrlValue``, and ``NotValue``; each is converted to the appropriate
-    kdl-py representation:
-    - ``UrlValue`` → ``(url)"…"`` (§2 normative URL annotation)
-    - ``NotValue`` → ``(not)"…"`` (negated predicate annotation, §6.1)
-    - ``KdlValue`` → passed through natively
-    """
-    entries: list[tuple[str | None, object]] = []
-    for a in args:
-        entries.append((None, _milpa_val_to_kdl(a)))
-    for k, pv in props:
-        entries.append((k, _milpa_val_to_kdl(pv)))
-    child_nodes = [c._node for c in children]
-    raw_node = _kdl.Node(name, entries=entries, nodes=child_nodes)
-    return KdlNode(raw_node)
-
-
-def emit_document(nodes_list: list[KdlNode]) -> str:
-    """Serialize a list of ``KdlNode`` values to KDL 2.0 text.
-
-    Uses kdl-py's printer as the final serializer of an explicitly-built
-    document (never as a round-trip reserializer of a parsed document).
-    """
-    raw_nodes = [n._node for n in nodes_list]
-    doc = _kdl.Document(nodes=raw_nodes)
-    return doc.print()
-
-
 def has_kdl_comments(text: str) -> bool:
     """Return ``True`` if *text* contains any KDL comment (``//``, ``/*``, or ``/-``).
 
@@ -555,11 +484,3 @@ def _kdl_entry_as_url(val: object) -> UrlValue | None:
     return None
 
 
-def _milpa_val_to_kdl(v: KdlValue | UrlValue | NotValue) -> object:
-    """Convert a milpa value back to a kdl-py-compatible entry value."""
-    if isinstance(v, UrlValue):
-        return _kdl.types.String(value=str(v), tag="url")
-    if isinstance(v, NotValue):
-        return _kdl.types.String(value=str(v), tag="not")
-    # For plain Python types kdl-py accepts them natively in entries
-    return v

@@ -380,7 +380,149 @@ class TestIndexUrlFromEnv:
 
 
 # ---------------------------------------------------------------------------
-# 10. Atomic write — no partial file observed
+# 10. _load_index_for_verb — three-way MILPA_INDEX_URL semantics
+# ---------------------------------------------------------------------------
+
+
+class TestLoadIndexForVerbThreeWay:
+    """Unit tests for the three-way MILPA_INDEX_URL semantics in _load_index_for_verb.
+
+    Three-way semantics (cli-contract.md §8.1 NORMATIVE):
+      - absent → load from DEFAULT_INDEX_URL (production fallback).
+      - present-but-empty → index=None (explicitly no index, no network).
+      - present-non-empty → load from that URL.
+
+    These tests verify the routing decision (which URL is chosen / whether
+    index=None is returned) WITHOUT hitting the network.  We inject a fake
+    ``load_default_index`` so the test environment stays hermetic.
+    """
+
+    def _make_env(self) -> "MilpaEnv":
+        """Build a minimal MilpaEnv for testing (no real fetcher or store needed)."""
+        import unittest.mock
+        from milpa.context import MilpaEnv
+        return MilpaEnv(
+            fetcher=unittest.mock.MagicMock(),
+            index=None,
+            store=unittest.mock.MagicMock(),
+            dep_decl_store=None,
+        )
+
+    def test_absent_uses_default_url(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """MILPA_INDEX_URL absent → _load_index_for_verb attempts DEFAULT_INDEX_URL."""
+        import unittest.mock
+        monkeypatch.delenv("MILPA_INDEX_URL", raising=False)
+
+        # Track what URL load_default_index would call index_url_from_env with.
+        captured_urls: list[str] = []
+
+        def fake_load_default_index() -> object:
+            # Record the URL that index_url_from_env() returns at call time.
+            captured_urls.append(index_url_from_env())
+            # Return a sentinel index object so _load_index_for_verb gets index≠None.
+            return object()
+
+        from milpa.cli import _load_index_for_verb
+        import milpa.cli as _cli_mod
+        with unittest.mock.patch.object(_cli_mod, "load_default_index", fake_load_default_index):
+            result = _load_index_for_verb(self._make_env())
+
+        assert captured_urls == [DEFAULT_INDEX_URL], (
+            f"Expected DEFAULT_INDEX_URL to be used when env var absent; got {captured_urls!r}"
+        )
+        assert result.index is not None, "index must be populated when load succeeds"
+
+    def test_empty_returns_none_without_network(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MILPA_INDEX_URL='' → index=None immediately, no network call."""
+        import unittest.mock
+        monkeypatch.setenv("MILPA_INDEX_URL", "")
+
+        called = False
+
+        def fake_load_default_index() -> object:
+            nonlocal called
+            called = True
+            return object()
+
+        from milpa.cli import _load_index_for_verb
+        import milpa.cli as _cli_mod
+        with unittest.mock.patch.object(_cli_mod, "load_default_index", fake_load_default_index):
+            result = _load_index_for_verb(self._make_env())
+
+        assert not called, "load_default_index must NOT be called when MILPA_INDEX_URL=''"
+        assert result.index is None, "index must be None when MILPA_INDEX_URL=''"
+
+    def test_whitespace_only_returns_none_without_network(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MILPA_INDEX_URL='   ' (whitespace only) → treated as empty → index=None."""
+        import unittest.mock
+        monkeypatch.setenv("MILPA_INDEX_URL", "   ")
+
+        called = False
+
+        def fake_load_default_index() -> object:
+            nonlocal called
+            called = True
+            return object()
+
+        from milpa.cli import _load_index_for_verb
+        import milpa.cli as _cli_mod
+        with unittest.mock.patch.object(_cli_mod, "load_default_index", fake_load_default_index):
+            result = _load_index_for_verb(self._make_env())
+
+        assert not called, "whitespace-only MILPA_INDEX_URL must be treated as empty"
+        assert result.index is None
+
+    def test_nonempty_uses_that_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MILPA_INDEX_URL=<url> → load_default_index called; index_url_from_env returns that URL."""
+        import unittest.mock
+        custom_url = "file:///tmp/test-index.kdl"
+        monkeypatch.setenv("MILPA_INDEX_URL", custom_url)
+
+        captured_urls: list[str] = []
+
+        def fake_load_default_index() -> object:
+            captured_urls.append(index_url_from_env())
+            return object()
+
+        from milpa.cli import _load_index_for_verb
+        import milpa.cli as _cli_mod
+        with unittest.mock.patch.object(_cli_mod, "load_default_index", fake_load_default_index):
+            result = _load_index_for_verb(self._make_env())
+
+        assert captured_urls == [custom_url], (
+            f"Expected custom URL to be used; got {captured_urls!r}"
+        )
+        assert result.index is not None
+
+    def test_unreachable_index_when_absent_gives_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When MILPA_INDEX_URL absent and network unreachable → index=None (soft failure)."""
+        import unittest.mock
+        from milpa.errors import MILPA_INDEX_UNREACHABLE, MilpaError as _MilpaError
+        monkeypatch.delenv("MILPA_INDEX_URL", raising=False)
+
+        def fake_load_unreachable() -> object:
+            raise _MilpaError(MILPA_INDEX_UNREACHABLE, "test: network unavailable")
+
+        from milpa.cli import _load_index_for_verb
+        import milpa.cli as _cli_mod
+        with unittest.mock.patch.object(_cli_mod, "load_default_index", fake_load_unreachable):
+            result = _load_index_for_verb(self._make_env())
+
+        assert result.index is None, "Unreachable index must soft-fail to index=None"
+
+
+# ---------------------------------------------------------------------------
+# 11. Atomic write — no partial file observed
 # ---------------------------------------------------------------------------
 
 

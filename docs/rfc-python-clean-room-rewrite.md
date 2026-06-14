@@ -107,17 +107,14 @@ Swap to `kdl-py>=2.0` when it publishes to PyPI (tracked as a follow-up issue).
   it is process-global across all threads, so lowering it inside a `ThreadPoolExecutor`
   worker (parallel fetch, S9b-7) would spuriously trip unrelated threads. The pre-scan
   + `except RecursionError` pair is the complete guard.
-- *Byte-format vs canonicalization.* The **lockfile** emitter is **hand-rolled**
-  (string templating, like Rust, which never re-emits via a KDL AST) so
-  `milpa.lock` is byte-identical per S5 §2.4. The **manifest** rewrite (S4 §8) is
-  *semantic* round-trip only ("output MUST parse back to the same logical
-  `Manifest`"), but is **not** produced by mutating `kdl-py`'s parsed AST: the
-  writer constructs a fresh KDL document explicitly — every URL field re-emitted as
-  a typed `(url)"…"` value (`manifest-grammar.md` §2, normative), `spec-version`
-  present-stays-present / absent-stays-absent (§4.4), and a stderr warning emitted
-  when comments are dropped (§8). `kdl-py`'s printer is used only as the final
-  serializer of that explicitly-built document, never as a round-trip. Parsing
-  always goes through `kdl-py`.
+- *Byte-format vs canonicalization.* Both the **lockfile** and **manifest**
+  emitters are **hand-rolled** (string templating, like Rust) so their output is
+  byte-exact: `milpa.lock` per S5 §2.4, `milpa.kdl` per S3 3e.  The manifest
+  emitter (`format_manifest`) re-emits every URL field as a typed `(url)"…"` value
+  (`manifest-grammar.md` §2, normative), preserves `spec-version`
+  present-stays-present / absent-stays-absent (§4.4), and emits a stderr warning
+  when comments are dropped (§8).  `kdl-py`'s printer is not used for serialization.
+  Parsing always goes through `kdl-py`.
 - *Edge-case differences from the corpus.* The S2 slice validates `kdl_io` against
   the relevant corpus fixtures (KDL syntax error fixtures) before anything builds
   on it.
@@ -251,8 +248,6 @@ def value_as_int(v: KdlValue) -> int | None
 def value_as_bool(v: KdlValue) -> bool | None
 def value_as_url(v: KdlValue) -> UrlValue | None
 
-def build_node(name, args=(), props=(), children=()) -> KdlNode   # for format_manifest
-def emit_document(nodes: list[KdlNode]) -> str    # final serializer (manifest rewrite only)
 ```
 
 `manifest.py` calls `node_arg_url(node, 0)` / `value_as_url(v)` and gets a `UrlValue`
@@ -443,10 +438,11 @@ prerequisites*, not in isolation.
 - 3c-9 `spec-version`, `dev-deps`, `cas`, top-level (`MAN-SPEC-VERSION-*`,
   `MAN-UNKNOWN-TOP-LEVEL`).
 - 3d workspace manifest grammar (`MAN-WORKSPACE-*`).
-- 3e `format_manifest`: explicit KDL-2.0 AST build (§3) — `(url)` annotations,
-  insertion-stable order, `spec-version` present/absent round-trip (§4.4),
-  comment-dropped stderr warning (§8). Property test: parse→format→parse round-trips
-  to the same logical `Manifest`.
+- 3e `format_manifest`: hand-rolled byte-exact serializer (mirrors Rust
+  `milpa-manifest::format_manifest`) — `(url)` annotations, insertion-stable order,
+  `spec-version` present/absent round-trip (§4.4), comment-dropped stderr warning
+  (§8). Property test: parse→format→parse round-trips to the same logical
+  `Manifest`; byte-exact property: format(parse(x)) == format(parse(format(parse(x)))).
 - 3f `nimble.py` (4 `requires` forms, `srcDir`, `when` warning, `nim` drop);
   property test mirroring the frozen `test_manifest_properties.py`.
 - *Gate:* manifest-parse error fixtures exercised via a **stage-local
@@ -713,8 +709,9 @@ separate commits breaks CI mid-swap):
 
 1. **Dev path/package name during coexistence.** → separate `impls/python-ng/` path,
    descriptor by absolute interpreter path, swap at parity (§6).
-2. **Lockfile emitter mechanism.** → hand-rolled byte templating with the `_kdl_str`
-   escaper (§5 4c); `kdl-py` printer used only for the explicitly-built manifest AST.
+2. **Emitter mechanisms.** → both lockfile and manifest use hand-rolled byte templating
+   (`_kdl_str` escaper for lockfile §5 4c; equivalent escaping for manifest §3 3e);
+   `kdl-py`'s printer is not used for serialization.
 3. **`errors.py` shape.** → single module of slug constants + bijection test (§5 1a).
 4. **PubGrub.** → port the frozen impl's teaching-clean algorithm verbatim (§5 6a).
 5. **`kdl-py` SHA pin + PyPI-swap tracking issue.** → file now

@@ -83,6 +83,12 @@ def index_url_from_env() -> str:
 
     Registry-protocol §1 NORMATIVE; cli-contract.md §8.1 NORMATIVE.
     Supports the ``file://`` scheme for air-gapped / harness deployments.
+
+    NOTE: This helper is for callers that have already decided to load an
+    index. It does NOT implement the three-way "absent vs empty" gate.
+    The three-way gate (absent→default, empty→no-index, non-empty→that-URL)
+    lives in ``cli._load_index_for_verb``. Call ``index_url_from_env()`` only
+    after confirming ``MILPA_INDEX_URL`` is not present-but-empty.
     """
     override = os.environ.get("MILPA_INDEX_URL", "").strip()
     return override if override else DEFAULT_INDEX_URL

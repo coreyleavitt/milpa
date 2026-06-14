@@ -837,30 +837,38 @@ any conformant implementation.
 
 #### `MILPA_INDEX_URL`
 
-> NORMATIVE: When set, this value MUST be used as the tianguis index URL
-> instead of the default. The default index URL is:
+> NORMATIVE: Three-way semantics based on **presence vs value**, not just
+> truthiness:
+>
+> | State | Behavior |
+> |---|---|
+> | **Absent** from env | Load from `DEFAULT_INDEX_URL` (live tianguis; see below). Network failure → soft `index=None`; resolver raises `RES-NO-INDEX` only when a named dep actually needs the index. |
+> | **Present but empty** (`""`) | Explicitly NO index. `index=None` without any network attempt. Used by the conformance harness for air-gapped fixtures that contain no `index.kdl`. |
+> | **Present and non-empty** | Load from that URL. Any HTTP(S) or `file://` URL pointing to a valid `index.kdl` is accepted. |
+>
+> The default index URL is:
 >
 > ```
 > https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl
 > ```
 >
-> This override is required for air-gapped environments, mirror deployments,
-> and conformance test harnesses that serve a local fixture index. Any HTTP(S)
-> URL pointing to a valid `index.kdl` document is accepted.
+> This three-way design is required so that `milpa fetch` works out of the
+> box in production (no env var needed for named deps), while the conformance
+> harness can opt out of the network entirely by setting `MILPA_INDEX_URL=""`
+> for air-gapped fixtures.
 
-> NORMATIVE: A `file://` URL pointing to a local `index.kdl` MUST also be
-> accepted. This is what lets a black-box conformance harness point each impl
+> NORMATIVE: A `file://` URL MUST be accepted as a non-empty value.
+> This is what lets a black-box conformance harness point each impl
 > at a fixture's local `index.kdl` (`MILPA_INDEX_URL=file:///abs/path/index.kdl`)
 > without standing up an HTTP server — the index analog of the
 > `MILPA_MOCKED_FETCHES` local fetch transport (§8.4). Both reference impls
-> already satisfy this (Python `urllib.request.urlopen`; Rust `curl`), which
-> handle the `file://` scheme natively.
+> handle the `file://` scheme natively (Python `urllib.request.urlopen`;
+> Rust `curl`).
 
-> NOTE: The default URL is defined as `DEFAULT_INDEX_URL` in
-> `milpa/tianguis_client.py`. The reference CLI passes it unconditionally to
-> `load_index`; `MILPA_INDEX_URL` support is a normative requirement for
-> conformant implementations even if the reference Python implementation
-> has not yet wired the env var check.
+> NOTE: See `spec/conformance-fixtures.md §2.2` for the harness-side contract:
+> the harness ALWAYS sets `MILPA_INDEX_URL`, either to a `file://` path (when
+> `index.kdl` is present in the fixture) or to the empty string (when no index
+> file is present, keeping the fixture air-gapped).
 
 ### 8.2  CAS root (normative)
 

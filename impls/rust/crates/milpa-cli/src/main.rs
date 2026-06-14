@@ -15,13 +15,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use milpa_core::{
     add_mirror, dep_decl_store::DepDeclStore, discover_manifest, effective_strict_policy,
     fetch::FetcherRegistry, format_nimcfg, format_workspace_nimcfgs, from_graph,
-    index_url_from_env, load_index, load_lockfile, load_manifest, load_workspace,
+    load_index, load_lockfile, load_manifest, load_workspace,
     make_dep_decl_store, mutate_manifest_file, parse_env_bool, parse_lockfile, parse_version,
     resolve, resolve_with_cert, resolve_workspace, resolve_workspace_frozen,
     verify_lockfile_against_deps, workspace_any_member_strict, write_lockfile, CaStore,
     CasAdmittingFetcher, CoreError, DefaultRegistry, FailureCert, FileDepDeclStore,
     FrozenResolver, Index, ManifestDoc, Milpa, MilpaError, MockedFetcher, Profile, Resolver,
-    Strategy, SuccessCert, DEFAULT_TTL_SECONDS,
+    Strategy, SuccessCert, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS,
 };
 use milpa_manifest::{Dep, Manifest, UrlDep};
 
@@ -941,10 +941,16 @@ fn cmd_remove(dir: &Path, rest: &[String]) -> Result<i32, MilpaError> {
 
 /// Load the tianguis index from the cache (real network via `curl`).
 ///
+/// Three-way `MILPA_INDEX_URL` semantics (cli-contract.md §8.1 NORMATIVE):
+/// - **absent** from env → load from `DEFAULT_INDEX_URL` (live tianguis).
+/// - **present but empty** (`""`) → explicitly NO index; return `Ok(None)`
+///   without any network attempt. The harness sets this for air-gapped fixtures.
+/// - **present and non-empty** → load from that URL.
+///
 /// Returns:
 /// - `Ok(Some(index))` — index loaded and parsed successfully.
-/// - `Ok(None)` — index is genuinely unreachable (no network + no cache);
-///   the resolver surfaces `RES-NO-INDEX` only if a named dep actually needs it.
+/// - `Ok(None)` — no index (explicitly-empty env var, or genuinely unreachable).
+///   The resolver surfaces `RES-NO-INDEX` only if a named dep actually needs it.
 /// - `Err(e)` — index was fetched but `Index::parse` raised a `TNG-*` (or
 ///   other catalog) error; this MUST propagate so the correct slug is emitted.
 ///
@@ -953,6 +959,15 @@ fn cmd_remove(dir: &Path, rest: &[String]) -> Result<i32, MilpaError> {
 /// "absent" rather than a validation error so the resolver decides whether the
 /// absence is fatal.
 fn maybe_index() -> Result<Option<Index>, MilpaError> {
+    // Three-way semantics: distinguish absent (→ DEFAULT_INDEX_URL) from
+    // present-but-empty (→ explicitly no index, no network).
+    let raw = std::env::var("MILPA_INDEX_URL");
+    let url = match &raw {
+        Err(_) => DEFAULT_INDEX_URL.to_string(), // absent → production default
+        Ok(s) if s.trim().is_empty() => return Ok(None), // empty → no index
+        Ok(s) => s.clone(), // non-empty → that URL
+    };
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -969,7 +984,7 @@ fn maybe_index() -> Result<Option<Index>, MilpaError> {
         }
     };
     match load_index(
-        &index_url_from_env(),
+        &url,
         &index_cache_dir(),
         &http,
         DEFAULT_TTL_SECONDS,
@@ -1045,8 +1060,10 @@ fn profile_from_env() -> Option<Profile> {
 ///
 /// Priority:
 /// 1. `MILPA_DEP_DECL_DIR` set → `FileDepDeclStore` (conformance / air-gapped).
-/// 2. `MILPA_INDEX_URL` set → `HttpDepDeclStore` derived via `index_base_url` (§3.3).
-/// 3. Neither set → `None` (DepDecl branch unreachable at resolve time).
+/// 2. Three-way `MILPA_INDEX_URL` semantics (cli-contract §8.1):
+///    - **absent** → `HttpDepDeclStore` from `DEFAULT_INDEX_URL` (production default).
+///    - **present but empty** → `None` (explicitly no index; DepDecl unreachable).
+///    - **present and non-empty** → `HttpDepDeclStore` from that URL.
 ///
 /// Returns `None` when DepDecl is not configured (the common case for URL-dep-only
 /// projects); the resolver's clause (c) is structurally present but falls through
@@ -1056,11 +1073,14 @@ fn maybe_dep_decl_store() -> Option<Box<dyn DepDeclStore>> {
     if !dep_decl_dir.is_empty() {
         return Some(Box::new(FileDepDeclStore::new(PathBuf::from(dep_decl_dir))));
     }
-    let index_url = std::env::var("MILPA_INDEX_URL").unwrap_or_default();
-    if !index_url.is_empty() {
-        return Some(Box::new(make_dep_decl_store(&index_url)));
-    }
-    None
+    // Three-way semantics: absent → default URL, empty → no index, non-empty → that URL.
+    let raw = std::env::var("MILPA_INDEX_URL");
+    let index_url = match &raw {
+        Err(_) => DEFAULT_INDEX_URL.to_string(), // absent → production default
+        Ok(s) if s.trim().is_empty() => return None, // empty → no index
+        Ok(s) => s.clone(), // non-empty → that URL
+    };
+    Some(Box::new(make_dep_decl_store(&index_url)))
 }
 
 /// Load an existing `milpa.lock` as the §8 prior for pin reuse (resolver-

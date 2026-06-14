@@ -26,9 +26,6 @@ Type extractor tests
 - integer literal → int (via value_as_int)
 - wrong type → None from extractors
 
-Builder / emitter tests
------------------------
-- round-trip: build_node + emit_document → valid KDL that re-parses
 """
 
 from __future__ import annotations
@@ -47,8 +44,6 @@ from milpa.kdl_io import (
     KdlDocument,
     KdlNode,
     UrlValue,
-    build_node,
-    emit_document,
     node_arg_str,
     node_arg_url,
     node_args,
@@ -412,63 +407,6 @@ class TestValueAsStr:
 
     def test_none_is_none(self) -> None:
         assert value_as_str(None) is None
-
-
-# ---------------------------------------------------------------------------
-# build_node + emit_document round-trip
-# ---------------------------------------------------------------------------
-
-
-class TestBuildAndEmit:
-    """build_node + emit_document produce valid KDL that re-parses correctly."""
-
-    def test_simple_node_round_trips(self) -> None:
-        n = build_node("hello", args=("world",))
-        text = emit_document([n])
-        doc = parse_kdl(text, context="manifest")
-        ns = nodes(doc)
-        assert len(ns) == 1
-        assert node_name(ns[0]) == "hello"
-        assert node_arg_str(ns[0]) == "world"
-
-    def test_url_prop_emitted_with_annotation(self) -> None:
-        """UrlValue props are emitted as (url)"…" in the KDL output."""
-        uv = UrlValue("https://github.com/x/y")
-        n = build_node("dep", props=(("git", uv),))
-        text = emit_document([n])
-        assert '(url)' in text
-        # Re-parse and check it comes back as UrlValue
-        doc = parse_kdl(text, context="manifest")
-        ns = nodes(doc)
-        assert node_prop_url(ns[0], "git") is not None
-        assert str(node_prop_url(ns[0], "git")) == "https://github.com/x/y"  # type: ignore[arg-type]
-
-    def test_bool_prop_round_trips(self) -> None:
-        n = build_node("foo", props=(("dev", True),))
-        text = emit_document([n])
-        doc = parse_kdl(text, context="manifest")
-        ns = nodes(doc)
-        assert node_prop_bool(ns[0], "dev") is True
-
-    def test_multiple_nodes(self) -> None:
-        n1 = build_node("name", args=("milpa",))
-        n2 = build_node("version", args=("0.1.0",))
-        text = emit_document([n1, n2])
-        doc = parse_kdl(text, context="manifest")
-        ns = nodes(doc)
-        assert len(ns) == 2
-        assert node_arg_str(ns[0]) == "milpa"
-        assert node_arg_str(ns[1]) == "0.1.0"
-
-    def test_children_round_trip(self) -> None:
-        child = build_node("dep", args=("intonaco",))
-        parent = build_node("deps", children=(child,))
-        text = emit_document([parent])
-        doc = parse_kdl(text, context="manifest")
-        ns = nodes(doc)
-        ch = node_children(ns[0])
-        assert len(ch) == 1
-        assert node_arg_str(ch[0]) == "intonaco"
 
 
 # ---------------------------------------------------------------------------
