@@ -10,6 +10,8 @@
 
 use std::path::{Path, PathBuf};
 
+use milpa_core::parse_env_bool;
+
 use crate::fixture::{Cmd, Expected, Fixture};
 
 /// A per-fixture scratch project: a sandbox `_deps/` and content-addressed store
@@ -249,7 +251,7 @@ pub struct MilpaTarget;
 
 impl Target for MilpaTarget {
     fn execute(&self, fx: &Fixture, scratch: &Scratch) -> Result<Produced, String> {
-        use milpa_core::{FrozenResolver, ManifestDoc, Resolver};
+        use milpa_core::{FrozenResolver, ManifestDoc};
 
         match fx.cmd {
             // S5a: parse the fixture's `milpa.lock` and surface any LOCK-* code.
@@ -312,6 +314,9 @@ impl Target for MilpaTarget {
                             fx.dir.join("mocked-fetches"),
                             scratch.cas_root.clone(),
                         );
+                        // S5: read MILPA_REQUIRE_ATTESTED_METADATA from the fixture env
+                        // and thread it to the workspace resolve path (§13.1 workspace rule).
+                        let ws_require_attested = fixture_require_attested_metadata(&fx.dir);
                         return match milpa_core::resolve_workspace(
                             &loaded,
                             index.as_ref(),
@@ -320,6 +325,7 @@ impl Target for MilpaTarget {
                             prior_lock.as_ref(),
                             milpa_core::Strategy::default(),
                             &scratch.deps_dir,
+                            ws_require_attested,
                         ) {
                             Ok(graph) => Ok(Produced::WorkspaceOutputs {
                                 lock_text: milpa_core::format_lockfile(&milpa_core::from_graph(
@@ -343,13 +349,34 @@ impl Target for MilpaTarget {
                     fx.dir.join("mocked-fetches"),
                     scratch.cas_root.clone(),
                 );
-                match milpa_core::Milpa.resolve(
+
+                // S3b: if the fixture ships a `dep-decl/` directory, wire a
+                // `FileDepDeclStore` so clause (c) of the EdgeSource coordinator
+                // is reachable. Mirrors the harness runner's MILPA_DEP_DECL_DIR
+                // injection (harness/runner.py:128–130).
+                let dep_decl_dir = fx.dir.join("dep-decl");
+                let file_store;
+                let dep_decl_store: Option<&dyn milpa_core::dep_decl_store::DepDeclStore> =
+                    if dep_decl_dir.is_dir() {
+                        file_store = milpa_core::FileDepDeclStore::new(&dep_decl_dir);
+                        Some(&file_store)
+                    } else {
+                        None
+                    };
+
+                // S5: read MILPA_REQUIRE_ATTESTED_METADATA from the fixture env.
+                let require_attested_metadata = fixture_require_attested_metadata(&fx.dir);
+
+                match milpa_core::resolve(
                     &manifest,
                     index.as_ref(),
                     &fetcher,
                     profile.as_ref(),
                     prior_lock.as_ref(),
+                    milpa_core::Strategy::default(),
                     &scratch.deps_dir,
+                    dep_decl_store,
+                    require_attested_metadata,
                 ) {
                     // S9: emit the byte-diff outputs. `_deps_structure.txt` is read
                     // by the harness from the materialized (symlinked) `_deps/`.
@@ -432,6 +459,172 @@ impl Target for MilpaTarget {
                     Err(e) => Err(e.code().to_string()),
                 }
             }
+            // S6: verify path — regular (non-frozen) resolve to populate _deps/
+            // and warm the CAS, then restore the pre-authored lock and check
+            // dep_decl pins against the live index (§3.7.2).
+            // This mirrors the harness black-box approach exactly.
+            Cmd::Verify => {
+                let mtext = std::fs::read_to_string(fx.dir.join("milpa.kdl"))
+                    .map_err(|e| format!("E2E-MANIFEST-UNREADABLE: {e}"))?;
+                let doc = match milpa_core::parse_document(&mtext) {
+                    Ok(d) => d,
+                    Err(e) => return Err(e.code().to_string()),
+                };
+                let ltext = std::fs::read_to_string(fx.dir.join("milpa.lock"))
+                    .map_err(|e| format!("E2E-LOCKFILE-UNREADABLE: {e}"))?;
+                let lock = match milpa_core::parse_lockfile(&ltext) {
+                    Ok(l) => l,
+                    Err(e) => return Err(e.code().to_string()),
+                };
+
+                // Phase 1: regular resolve to populate _deps/ and warm the CAS.
+                // Uses the fixture's mocked-fetches/ + dep-decl/ + index.kdl.
+                let store = milpa_core::CaStore::new(scratch.cas_root.clone());
+                let fetcher = crate::fake_fetcher::FakeFetcher::new(
+                    fx.dir.join("mocked-fetches"),
+                    scratch.cas_root.clone(),
+                );
+                let dep_decl_dir = fx.dir.join("dep-decl");
+                let file_store;
+                let dep_decl_store: Option<&dyn milpa_core::dep_decl_store::DepDeclStore> =
+                    if dep_decl_dir.is_dir() {
+                        file_store = milpa_core::FileDepDeclStore::new(&dep_decl_dir);
+                        Some(&file_store)
+                    } else {
+                        None
+                    };
+                let verify_index = {
+                    let p = fx.dir.join("index.kdl");
+                    if p.is_file() {
+                        let itext = std::fs::read_to_string(&p)
+                            .map_err(|e| format!("E2E-INDEX-UNREADABLE: {e}"))?;
+                        match milpa_core::Index::parse(&itext) {
+                            Ok(i) => Some(i),
+                            Err(e) => return Err(e.code().to_string()),
+                        }
+                    } else {
+                        None
+                    }
+                };
+                let profile = fixture_profile(&fx.dir);
+
+                let _ = match doc {
+                    ManifestDoc::Workspace(_) => {
+                        let loaded = match milpa_core::load_workspace(&fx.dir) {
+                            Ok(w) => w,
+                            Err(e) => return Err(e.code().to_string()),
+                        };
+                        milpa_core::resolve_workspace(
+                            &loaded,
+                            verify_index.as_ref(),
+                            &fetcher,
+                            profile.as_ref(),
+                            None,
+                            milpa_core::Strategy::default(),
+                            &scratch.deps_dir,
+                            false, // verify pre-phase: no attestation flag
+                        ).map_err(|e| e.code().to_string())
+                    }
+                    ManifestDoc::Package(ref manifest) => {
+                        milpa_core::resolve(
+                            manifest,
+                            verify_index.as_ref(),
+                            &fetcher,
+                            profile.as_ref(),
+                            None,
+                            milpa_core::Strategy::default(),
+                            &scratch.deps_dir,
+                            dep_decl_store,
+                            false,
+                        ).map_err(|e| e.code().to_string())
+                    }
+                };
+                // Pre-phase resolve errors are ignored — if _deps/ isn't populated,
+                // the disk check below will fail with LOCK-GRAPH-MISMATCH.
+                // For S6 fixtures the pre-phase always succeeds.
+                let _ = store; // silence unused warning
+
+                // Restore the pre-authored milpa.lock (with the old dep_decl pins
+                // under test). The pre-phase may have generated a new lock with
+                // the current index's dep_decl hash — we discard that.
+                std::fs::write(scratch.root.join("milpa.lock"), &ltext)
+                    .map_err(|e| format!("E2E-LOCKFILE-WRITE: {e}"))?;
+
+                // Phase 2: disk check.
+                let divergences =
+                    milpa_core::verify_lockfile_against_deps(&lock, &scratch.deps_dir);
+                if !divergences.is_empty() {
+                    return Err("LOCK-GRAPH-MISMATCH".to_string());
+                }
+
+                // Phase 3: dep_decl edge check vs live index (§3.7.2).
+                let pinned: Vec<_> = lock
+                    .deps
+                    .iter()
+                    .filter(|d| d.dep_decl.is_some())
+                    .collect();
+                if pinned.is_empty() {
+                    // No pins — verify passes.
+                    return Ok(Produced::NoByteDiff);
+                }
+
+                // §13.1: effective strict = OR(manifest attestation-policy "strict",
+                // MILPA_REQUIRE_ATTESTED_METADATA flag from fixture env).
+                // Route through the milpa-core SSOT helpers (effective_strict_policy /
+                // workspace_any_member_strict) rather than re-deriving the OR rule.
+                let flag_strict = fixture_require_attested_metadata(&fx.dir);
+                let strict = match &doc {
+                    ManifestDoc::Package(m) => {
+                        milpa_core::effective_strict_policy(&m.attestation_policy, flag_strict)
+                    }
+                    ManifestDoc::Workspace(_) => {
+                        // Workspace: OR across all members (+ flag).
+                        match milpa_core::load_workspace(&fx.dir) {
+                            Ok(ws) => milpa_core::workspace_any_member_strict(&ws) || flag_strict,
+                            Err(_) => flag_strict,
+                        }
+                    }
+                };
+
+                // Use the index loaded for the pre-phase (if absent → offline).
+                let index = match verify_index {
+                    None => {
+                        // Offline: strict → VERIFY-EDGE-MISMATCH; non-strict → skip.
+                        if strict {
+                            return Err("VERIFY-EDGE-MISMATCH".to_string());
+                        }
+                        return Ok(Produced::NoByteDiff);
+                    }
+                    Some(i) => i,
+                };
+
+                // Per-dep edge check.
+                for dep in &pinned {
+                    let locked_pin = dep.dep_decl.as_deref().unwrap();
+                    // Find the package by bare name, then find the exact version-node.
+                    let iv = match index.lookup_bare(&dep.name) {
+                        milpa_core::registry::BareLookup::NotFound
+                        | milpa_core::registry::BareLookup::Ambiguous(_) => {
+                            return Err("LOCK-DEPDECL-PIN-MISSING".to_string());
+                        }
+                        milpa_core::registry::BareLookup::Found(pkg) => pkg
+                            .versions
+                            .into_iter()
+                            .find(|v| v.version == dep.version),
+                    };
+                    match iv {
+                        None => return Err("LOCK-DEPDECL-PIN-MISSING".to_string()),
+                        Some(entry) => match &entry.dep_decl {
+                            None => return Err("LOCK-DEPDECL-PIN-MISSING".to_string()),
+                            Some(current) if current != locked_pin => {
+                                return Err("VERIFY-EDGE-MISMATCH".to_string());
+                            }
+                            _ => {} // match
+                        },
+                    }
+                }
+                Ok(Produced::NoByteDiff)
+            }
             // CLI-only verbs are skipped by `run_fixture` before reaching the
             // Target; this arm exists only for match exhaustiveness.
             Cmd::CliOnly => Err(
@@ -443,17 +636,30 @@ impl Target for MilpaTarget {
     }
 }
 
-/// Build a [`Profile`] from a fixture's optional `env` file (KEY=VALUE per line,
-/// the `MILPA_TARGET_*` axes — conformance-fixtures §2). Returns `None` when the
-/// file is absent (no predicate filtering — the common case). Mirrors the Python
-/// harness's `_fixture_profile`.
-fn fixture_profile(dir: &Path) -> Option<milpa_core::Profile> {
-    let text = std::fs::read_to_string(dir.join("env")).ok()?;
-    let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+/// Parse the fixture's optional `env` file (KEY=VALUE per line) into a map.
+/// Returns an empty map when the file is absent.
+fn fixture_env(dir: &Path) -> std::collections::HashMap<String, String> {
+    let text = match std::fs::read_to_string(dir.join("env")) {
+        Ok(t) => t,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    let mut env = std::collections::HashMap::new();
     for line in text.lines() {
         if let Some((k, v)) = line.split_once('=') {
             env.insert(k.trim().to_string(), v.trim().to_string());
         }
+    }
+    env
+}
+
+/// Build a [`Profile`] from a fixture's optional `env` file (KEY=VALUE per line,
+/// the `MILPA_TARGET_*` axes — conformance-fixtures §2). Returns `None` when the
+/// file is absent or carries no `MILPA_TARGET_*` keys (no predicate filtering —
+/// the common case). Mirrors the Python harness's `_fixture_profile`.
+fn fixture_profile(dir: &Path) -> Option<milpa_core::Profile> {
+    let env = fixture_env(dir);
+    if env.is_empty() {
+        return None;
     }
     Some(milpa_core::Profile {
         platform: env.get("MILPA_TARGET_PLATFORM").cloned(),
@@ -466,6 +672,15 @@ fn fixture_profile(dir: &Path) -> Option<milpa_core::Profile> {
             .and_then(|s| milpa_core::parse_version(s)),
         flags: Vec::new(),
     })
+}
+
+/// S5: read `MILPA_REQUIRE_ATTESTED_METADATA` from the fixture's `env` file.
+/// Returns `true` when the value is a non-empty string that is not `"0"` or `"false"`.
+fn fixture_require_attested_metadata(dir: &Path) -> bool {
+    let env = fixture_env(dir);
+    env.get("MILPA_REQUIRE_ATTESTED_METADATA")
+        .map(|v| parse_env_bool(v))
+        .unwrap_or(false)
 }
 
 /// Admit every `cas-seed/<name>/` tree into `store` under its content hash,

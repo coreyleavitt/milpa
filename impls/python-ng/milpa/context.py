@@ -63,11 +63,21 @@ class MilpaEnv:
         The ``CAStore`` instance.  Used by the frozen path
         (``resolve_frozen``/``resolve_workspace_frozen``) to locate admitted
         trees without any fetcher invocation.
+
+    dep_decl_store:
+        The ``DepDeclStore`` for fetching/caching DepDecl artifacts (S3b).
+        ``None`` disables the attested-metadata path (DepDecl branch in
+        ``resolve_edges`` falls through to MilpaKdl/Nimble).
+
+        Production: ``HttpDepDeclStore`` derived from ``MILPA_INDEX_URL``.
+        Conformance harness: ``FileDepDeclStore`` from ``MILPA_DEP_DECL_DIR``.
+        Frozen / show / verify paths: ``None`` (no DepDecl fetch needed).
     """
 
     fetcher: CasAdmittingFetcher
     index: Index | None
     store: CAStore
+    dep_decl_store: object | None = None  # DepDeclStore protocol (S3b)
 
 
 @dataclass(frozen=True)
@@ -103,3 +113,4 @@ class ResolveParams:
     profile: Profile | None = None
     prior: Lockfile | None = None
     manifest_dir: Path | None = None  # project root; used by resolver to resolve local dep paths
+    require_attested_metadata: bool = False  # S5: --require-attested-metadata CLI flag

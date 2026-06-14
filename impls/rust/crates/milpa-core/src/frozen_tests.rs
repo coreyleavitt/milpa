@@ -19,6 +19,7 @@ fn manifest(deps: Vec<Dep>) -> Manifest {
         cas_dir: String::new(),
         spec_version: 1,
         spec_version_explicit: false,
+        attestation_policy: milpa_manifest::AttestationPolicy::Permissive,
     }
 }
 
@@ -51,6 +52,7 @@ fn locked(name: &str, version: &str, identity: Option<&str>, prov: ProvenanceRec
         provenances: vec![prov],
         active_flags: vec![],
         self_mirrors: vec![],
+        dep_decl: None,
     }
 }
 

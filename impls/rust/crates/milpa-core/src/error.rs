@@ -29,6 +29,10 @@ pub enum CoreError {
     Frozen(&'static str, String),
     /// Workspace topology / structural failure (`WS-*`).
     Workspace(&'static str, String),
+    /// DepDecl artifact parse/verify failure (`TNG-DEPDECL-*`; spec/dep-decl.md §6).
+    /// Raise sites for all five codes are S3b; S1 only wires `TNG-DEPDECL-PARSE-ERROR`
+    /// (propagated from `parse_dep_decl` for KDL syntax / structural errors).
+    DepDecl(&'static str, String),
 }
 
 impl CoreError {
@@ -39,7 +43,8 @@ impl CoreError {
             | CoreError::Resolver(c, _)
             | CoreError::Tianguis(c, _)
             | CoreError::Frozen(c, _)
-            | CoreError::Workspace(c, _) => c,
+            | CoreError::Workspace(c, _)
+            | CoreError::DepDecl(c, _) => c,
         }
     }
 
@@ -52,7 +57,8 @@ impl CoreError {
             | CoreError::Resolver(_, m)
             | CoreError::Tianguis(_, m)
             | CoreError::Frozen(_, m)
-            | CoreError::Workspace(_, m) => m,
+            | CoreError::Workspace(_, m)
+            | CoreError::DepDecl(_, m) => m,
         }
     }
 
@@ -103,6 +109,9 @@ impl CoreError {
             // workspace RES-WS-* codes wire with the workspace path in S11.
             "RES-NO-INDEX",
             "RES-PROVENANCE-CONFLICT",
+            // S5: attestation policy enforcement — strict mode raises this when
+            // any resolved dep fell back to un-attested .nimble metadata.
+            "RES-UNATTESTED-METADATA",
             // workspace resolve-time checks (resolver §11) — S11b.
             "RES-WS-NO-INDEX",
             "RES-WS-OVERRIDE-MEMBER-COLLISION",
@@ -116,6 +125,7 @@ impl CoreError {
             "TNG-UNSAFE-NAME",
             "TNG-BAD-COMMIT-SHA",
             "TNG-BAD-OCI-DIGEST",
+            "TNG-BAD-DEP-DECL",
             "TNG-UNSAFE-URL",
             "TNG-UNSAFE-REF",
             "TNG-UNSAFE-OCI-FIELD",
@@ -158,8 +168,21 @@ impl CoreError {
             // verify verb (Gap-1 / S1c). Emitted by cmd_verify when _deps/
             // is absent (nothing fetched yet).
             "VERIFY-DEPS-DIR-MISSING",
+            // S6: dep_decl edge-drift detection (spec §3.7 / rfc-content-addressed-metadata).
+            // VERIFY-EDGE-MISMATCH: locked dep_decl pin ≠ live index dep_decl pointer.
+            "VERIFY-EDGE-MISMATCH",
+            // LOCK-DEPDECL-PIN-MISSING: dep_decl pin present in lock but index
+            // version-node lacks a dep_decl pointer (DepDecl retracted / rolled back).
+            "LOCK-DEPDECL-PIN-MISSING",
             // lockfile verb (update/add --mirror): dep absent in the lock.
             "LOCK-DEP-NOT-FOUND",
+            // DepDecl artifact parse/verify (spec/dep-decl.md §6) — S1 wires
+            // TNG-DEPDECL-PARSE-ERROR; remaining four raise sites are S3b.
+            "TNG-DEPDECL-PARSE-ERROR",
+            "TNG-DEPDECL-HASH-MISMATCH",
+            "TNG-DEPDECL-FETCH-FAILED",
+            "TNG-DEPDECL-SCHEMA-MISMATCH",
+            "TNG-DEPDECL-SCHEMA-UNSUPPORTED",
             // internal / panic sentinels (Gap-1 R4 / S1c). MILPA-INTERNAL is
             // the outermost catch-all; INTERNAL-PANIC fires from the panic hook.
             "MILPA-INTERNAL",

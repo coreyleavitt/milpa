@@ -38,6 +38,7 @@ from milpa.errors import (
     LOCK_DEP_FIELD_ARITY,
     LOCK_DEP_IDENTITY_INVALID,
     LOCK_DEP_NAME_ARITY,
+    LOCK_DEPDECL_PIN_MISSING,
     LOCK_FIELD_ARITY,
     LOCK_FIELD_TYPE,
     LOCK_GRAPH_MISMATCH,
@@ -47,6 +48,7 @@ from milpa.errors import (
     LOCK_PROV_KIND_UNKNOWN,
     LOCK_VERSION_MISSING,
     LOCK_VERSION_UNSUPPORTED,
+    VERIFY_EDGE_MISMATCH,
     MilpaError,
 )
 from milpa.identity import compute_content_hash
@@ -191,6 +193,10 @@ class LockedDep:
     provenances: tuple[ProvenanceRecord, ...]
     active_flags: tuple[str, ...] = ()
     self_mirrors: tuple[str, ...] = ()
+    # S6: additive dep_decl pin (§3.7). Emitted only when present (dep resolved
+    # via DepDeclEdgeSource). Forward-compat: older/absent = None = fine; no
+    # lockfile schema bump (lockfile-schema.md §3.7).
+    dep_decl: str | None = None
 
 
 @dataclass(frozen=True)
@@ -239,6 +245,11 @@ class ResolvedDep:
     provenance: ProvenanceRecord | None = None
     active_flags: tuple[str, ...] = ()
     self_mirrors: tuple[str, ...] = ()
+    # S6: the dep_decl hash this resolution was computed against (from the index
+    # pointer, carried through _Candidate → ResolvedDep → LockedDep → lockfile).
+    # None for non-indexed deps (URL/tarball/local/member) and for named deps
+    # whose index entry has no dep_decl pointer yet.
+    dep_decl: str | None = None
 
 
 @dataclass(frozen=True)
@@ -405,6 +416,7 @@ def _parse_dep(node: KdlNode) -> LockedDep:
     active_flags: tuple[str, ...] = ()
     self_mirrors: tuple[str, ...] = ()
     provenances: list[ProvenanceRecord] = []
+    dep_decl: str | None = None  # S6: additive dep_decl pin (§3.7)
 
     for child in node_children(node):
         cname = node_name(child)
@@ -422,7 +434,12 @@ def _parse_dep(node: KdlNode) -> LockedDep:
             self_mirrors = _parse_dep_self_mirrors(child)
         elif cname == "provenance":
             provenances.append(_parse_provenance_block(child, dep_name))
-        # unknown child nodes are silently skipped (forward compat)
+        elif cname == "dep_decl":
+            # S6: forward-compat parse — silently ignored when absent or malformed.
+            args = node_args(child)
+            if len(args) == 1:
+                dep_decl = value_as_str(args[0])
+        # other unknown child nodes are silently skipped (forward compat)
 
     return LockedDep(
         name=dep_name,
@@ -433,6 +450,7 @@ def _parse_dep(node: KdlNode) -> LockedDep:
         provenances=tuple(provenances),
         active_flags=active_flags,
         self_mirrors=self_mirrors,
+        dep_decl=dep_decl,
     )
 
 
@@ -636,6 +654,8 @@ def _locked_from_resolved(d: ResolvedDep) -> LockedDep:
         provenances=(d.provenance,) if d.provenance is not None else (),
         active_flags=d.active_flags,
         self_mirrors=d.self_mirrors,
+        # S6: carry the dep_decl hash from the resolver through to the lockfile pin.
+        dep_decl=d.dep_decl,
     )
 
 
@@ -719,6 +739,9 @@ def format_lockfile(lockfile: Lockfile) -> str:
         if dep.self_mirrors:
             sm_args = " ".join(f"(url){_kdl_str(u)}" for u in dep.self_mirrors)
             lines.append(f"    self_mirrors {sm_args}")
+        # dep_decl pin — S6: emitted only when present (forward-compat additive)
+        if dep.dep_decl is not None:
+            lines.append(f"    dep_decl {_kdl_str(dep.dep_decl)}")
         # provenance block
         for prov in dep.provenances:
             lines.append("    provenance {")

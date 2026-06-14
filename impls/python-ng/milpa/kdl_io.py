@@ -67,6 +67,7 @@ import kdl as _kdl
 from milpa.errors import (
     LOCK_KDL_SYNTAX,
     MAN_KDL_SYNTAX,
+    TNG_DEPDECL_PARSE_ERROR,
     TNG_KDL_SYNTAX,
     MilpaError,
 )
@@ -167,6 +168,7 @@ _CONTEXT_SLUG: dict[str, str] = {
     "manifest": MAN_KDL_SYNTAX,
     "lockfile": LOCK_KDL_SYNTAX,
     "registry": TNG_KDL_SYNTAX,
+    "dep_decl": TNG_DEPDECL_PARSE_ERROR,
 }
 
 _PARSE_CONFIG = _kdl.ParseConfig(nativeTaggedValues=False)
@@ -230,7 +232,7 @@ def _check_nesting_depth(text: str, slug: str) -> None:
 def parse_kdl(
     text: str,
     *,
-    context: Literal["manifest", "lockfile", "registry"],
+    context: Literal["manifest", "lockfile", "registry", "dep_decl"],
 ) -> KdlDocument:
     """Parse KDL 2.0 text into a ``KdlDocument``.
 

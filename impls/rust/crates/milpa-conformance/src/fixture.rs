@@ -19,6 +19,9 @@ pub enum Cmd {
     /// `frozen`: no-network frozen path against `milpa.kdl` + `milpa.lock`,
     /// optionally CAS-seeded from `cas-seed/`.
     Frozen,
+    /// `verify`: frozen-fetch to populate `_deps/`, then run `cmd_verify`.
+    /// S6 dep_decl edge-drift fixtures (§3.7.2).
+    Verify,
     /// A CLI-only verb fixture (§2.7.1 mutation `add`/`remove`/`update` or
     /// §2.7.2 liveness `show`/`--version`). These exercise the CLI binary and
     /// its argv/output contract, which the in-process library [`Target`] does
@@ -36,6 +39,7 @@ impl Cmd {
                 match head {
                     "parse-lockfile" => Cmd::ParseLockfile,
                     "frozen" => Cmd::Frozen,
+                    "verify" => Cmd::Verify,
                     "resolve" | "" => Cmd::Resolve,
                     // Mutation (§2.7.1) + liveness (§2.7.2) selectors: CLI-only.
                     // check-certificate (§2.7.3): also CLI-only (--certificate flag).

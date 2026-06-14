@@ -53,13 +53,19 @@ A conformant implementation of this spec MUST:
 14. Accept `--certificate <path>` as a global flag; when given, write the
     result certificate as JSON to `<path>` for every solver-running verb
     (`fetch`, `lock`) — on both success and failure outcomes (§2.5).
+15. Accept `--require-attested-metadata` as a global flag (S5 attestation
+    policy, §8.5); also honour `MILPA_REQUIRE_ATTESTED_METADATA` as an
+    environment variable with the same effect. Effective strict policy =
+    logical OR of the manifest `attestation-policy "strict"` field, the
+    CLI flag, and the environment variable. The flag/env CANNOT weaken a
+    manifest-declared strict policy.
 
 ---
 
 ## 1  Invocation form
 
 ```
-milpa [--version] [-C <dir>] [-j <N>] [-s <mode>] [--frozen] [--certificate <path>] <verb> [<verb-args>]
+milpa [--version] [-C <dir>] [-j <N>] [-s <mode>] [--frozen] [--certificate <path>] [--require-attested-metadata] <verb> [<verb-args>]
 ```
 
 > NORMATIVE: The implementation MUST support the short flag `-C` (and
@@ -896,6 +902,59 @@ GitHub Actions OIDC token environment variables consumed by `publish`
 
 ### 8.4  Conformance fetch transport (normative)
 
+#### `MILPA_DEP_DECL_DIR`
+
+This is the env var that makes DepDecl artifact resolution **black-box
+testable**: it lets a language-neutral conformance harness point any impl
+at a directory of pre-authored DepDecl artifact files instead of the
+production `HttpDepDeclStore`'s network fetch. It is the DepDecl analog of
+`MILPA_MOCKED_FETCHES` for git/tarball fetches and `MILPA_INDEX_URL` for
+the tianguis index.
+
+> NORMATIVE: When `MILPA_DEP_DECL_DIR` is set to a non-empty value, it
+> MUST be the path to a `dep-decl/` directory as specified in
+> `spec/conformance-fixtures.md` §2.11. The implementation MUST swap the
+> production `HttpDepDeclStore` for a `FileDepDeclStore` that satisfies
+> every DepDecl artifact lookup exclusively from that directory — no
+> network access and no HTTP client consulted. For each lookup the
+> `FileDepDeclStore` MUST:
+>
+> 1. Derive the filename from the pointer's sha256 digest:
+>    `$MILPA_DEP_DECL_DIR/<sha256_hex>.kdl` (where `<sha256_hex>` is the
+>    64-character lowercase hex from the `dep_decl` field in the index
+>    version-node, with the `sha256:` prefix stripped).
+> 2. If the file does not exist, raise `TNG-DEPDECL-FETCH-FAILED`.
+> 3. Read the file bytes, verify `sha256(bytes) == sha256_hex`; on
+>    mismatch raise `TNG-DEPDECL-HASH-MISMATCH`.
+> 4. Parse the bytes as a DepDecl artifact (`spec/dep-decl.md` §2); on
+>    parse failure raise `TNG-DEPDECL-PARSE-ERROR`.
+> 5. Return the resulting `EdgeSet`.
+
+> NORMATIVE: When `MILPA_DEP_DECL_DIR` is unset or empty, the
+> production `HttpDepDeclStore` is used; transport selection is
+> unaffected.
+
+> NORMATIVE: `MILPA_DEP_DECL_DIR` is a **conformance-only** env var —
+> like `MILPA_MOCKED_FETCHES` and `MILPA_INDEX_URL`. It MUST be honoured
+> by **all** conformant implementations. It MUST NOT affect the resolved
+> dep graph other than by substituting the DepDecl artifact source; the
+> `EdgeSet` content (requires, src_dir) is the same whether it came from
+> the network or from the local file.
+
+> NOTE: In the reference implementations the store swap is performed at
+> the CLI entry point: when `MILPA_DEP_DECL_DIR` is set, the
+> `HttpDepDeclStore` instance is replaced by `FileDepDeclStore(dir)` and
+> passed to the resolver. This is the single source of truth; the per-impl
+> in-process conformance adapters delegate to the same store, so there is
+> one code path for the directory convention. This is a testing/conformance
+> store: it is inert unless the env var is explicitly set.
+
+> NOTE: S3a (this section) specifies the env var contract and the
+> `FileDepDeclStore` behaviour. The actual store-swap implementation is
+> S3b. Until S3b lands, setting `MILPA_DEP_DECL_DIR` has no observable
+> effect on either impl; the harness runner injects the var but the impls
+> silently ignore it.
+
 #### `MILPA_MOCKED_FETCHES`
 
 This is the env var that makes the fixture corpus **black-box runnable**: it
@@ -952,6 +1011,44 @@ in-process fetcher that a per-impl test adapter would otherwise inject.
 > to the **same** implementation, so there is one source of truth for the
 > directory convention. This is a testing/conformance transport: it is inert
 > unless the env var is explicitly set.
+
+### 8.5  Attestation policy
+
+#### `MILPA_REQUIRE_ATTESTED_METADATA`
+
+> NORMATIVE: When `MILPA_REQUIRE_ATTESTED_METADATA` is set to a non-empty value
+> that is not `"0"` or `"false"`, it activates **strict attestation policy** for
+> the invocation. The effective strict policy is the logical OR of:
+>
+> 1. the manifest `attestation-policy "strict"` field (see
+>    `spec/manifest-grammar.md` §attestation-policy);
+> 2. the `--require-attested-metadata` CLI flag (§15 of the normative
+>    requirements above); and
+> 3. this environment variable.
+>
+> Setting this variable CANNOT weaken a strict policy already declared by the
+> manifest. Under strict policy, any resolved named dep whose index entry carries
+> no `dep_decl` pointer (i.e. whose `EdgeSet.source` is `NimbleFallback`) MUST
+> cause the implementation to raise `RES-UNATTESTED-METADATA` (see
+> `spec/errors.md`) and exit non-zero without writing any output files.
+>
+> Under permissive (default) policy — when none of the three sources above are
+> active — the implementation MUST emit a single human-readable summary warning
+> to stderr listing all deps resolved from un-attested `.nimble` metadata, and
+> MUST NOT fail. The warning is informational and its exact format is
+> non-normative.
+>
+> When no resolved named deps have `source == NimbleFallback`, both policies are
+> silent (no warning, no error).
+
+> NOTE: In the reference implementations the effective policy is computed as the
+> logical OR of `Manifest.attestation_policy`, `Cli.require_attested_metadata`
+> (set by either the flag or the env var), inside `enforce_attestation_policy()`
+> (Rust: `milpa-core/src/resolver.rs`; Python-ng:
+> `milpa/resolver.py::enforce_attestation_policy()`). The per-impl in-process
+> conformance adapters read `MILPA_REQUIRE_ATTESTED_METADATA` from the fixture
+> `env` file via `fixture_require_attested_metadata()` and pass it to `resolve()`
+> directly, so there is one code path for both the CLI and the conformance runner.
 
 ---
 
@@ -1019,6 +1116,8 @@ implementation-specific and not frozen by this spec.
 | `MILPA_TARGET_MILPA`              | YES       | resolved dep graph            | `milpa.__version__`                              |
 | `MILPA_INDEX_URL`                 | YES       | tianguis index URL            | `https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl` |
 | `MILPA_CACHE_DIR`                 | YES       | CAS root                      | `$XDG_CACHE_HOME/milpa/cas`                     |
+| `MILPA_MOCKED_FETCHES`            | YES       | fetch transport (conformance) | (none; real transport used)                      |
+| `MILPA_DEP_DECL_DIR`              | YES       | DepDecl store (conformance)   | (none; `HttpDepDeclStore` used)                  |
 | `XDG_CACHE_HOME`                  | NO        | CAS + index cache base        | `~/.cache`                                       |
 | `ACTIONS_ID_TOKEN_REQUEST_TOKEN`  | NO        | `publish` OIDC (out-of-scope) | —                                                |
 | `ACTIONS_ID_TOKEN_REQUEST_URL`    | NO        | `publish` OIDC (out-of-scope) | —                                                |

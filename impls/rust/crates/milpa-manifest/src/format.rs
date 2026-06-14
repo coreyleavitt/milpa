@@ -192,6 +192,7 @@ mod tests {
             cas_dir: String::new(),
             spec_version: 1,
             spec_version_explicit: false,
+            attestation_policy: crate::AttestationPolicy::Permissive,
         }
     }
 

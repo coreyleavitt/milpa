@@ -182,6 +182,10 @@ pub struct ResolvedDep {
     pub src_dir: String,
     pub requires: Vec<String>,
     pub provenance: ProvenanceRecord,
+    /// S6: dep_decl pin — `sha256:<hex>` hash of the DepDecl artifact used
+    /// during resolution (lockfile-schema §3.7).  `None` when the dep was
+    /// not resolved via a DepDecl edge source (milpa.kdl or .nimble fallback).
+    pub dep_decl: Option<String>,
 }
 
 /// The resolved dependency graph — the resolver's output, the emitters' input.
@@ -250,6 +254,10 @@ pub struct LockedDep {
     pub provenances: Vec<ProvenanceRecord>,
     pub active_flags: Vec<String>,
     pub self_mirrors: Vec<String>,
+    /// S6: dep_decl pin — `sha256:<hex>` hash of the DepDecl artifact used
+    /// during resolution (lockfile-schema §3.7).  `None` when absent (forward-
+    /// compat: older lockfile entries without this field are fine).
+    pub dep_decl: Option<String>,
 }
 
 /// The parsed `milpa.lock` as data (parse/emit logic lives in `milpa-core`).
@@ -278,6 +286,80 @@ impl Default for Lockfile {
 /// The current `milpa.lock` schema epoch (lockfile-schema §2.1). A v2 schema is
 /// a spec amendment, independent of the manifest `spec-version` epoch.
 pub const LOCKFILE_SCHEMA_VERSION: u32 = 1;
+
+// ---------------------------------------------------------------------------
+// EdgeSet — the single shared dependency-edge type (spec/dep-decl.md §1)
+// ---------------------------------------------------------------------------
+
+/// Fidelity tag for an in-memory `EdgeSet` (spec/dep-decl.md §1).
+///
+/// Identifies which source produced the `EdgeSet` so the resolver and
+/// diagnostics layer can distinguish fidelity at runtime.
+///
+/// > NORMATIVE: this field is **in-memory only**. It MUST NOT appear in any
+/// > serialized artifact (lockfile, DepDecl, index).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeSource {
+    /// Parsed from a DepDecl artifact (`milpa-core::dep_decl`).
+    DepDecl,
+    /// Parsed from a `milpa.kdl` manifest.
+    MilpaKdl,
+    /// Produced by the `.nimble` heuristic scanner.
+    NimbleFallback,
+}
+
+/// A named (registry-resolved) requires entry (spec/dep-decl.md §1 `NamedRequire`).
+///
+/// `constraint_str` is the raw declaration string, whitespace preserved verbatim
+/// (spec §2 Rule 5): `">= 0.5.0"` and `">=0.5.0"` are distinct byte sequences.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedRequire {
+    pub name: String,
+    /// Raw constraint string as declared; empty string means "any version".
+    pub constraint_str: String,
+}
+
+/// A URL-based requires entry (spec/dep-decl.md §1 `UrlRequire`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlRequire {
+    pub url: String,
+    pub ref_: String,
+}
+
+/// One entry in `EdgeSet.requires`: either a named dep or a URL dep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequireEntry {
+    Named(NamedRequire),
+    Url(UrlRequire),
+}
+
+/// Language-neutral in-memory edge type (spec/dep-decl.md §1).
+///
+/// Single shared type consumed by the resolver regardless of which source
+/// supplied the edges. There MUST NOT be a parallel type duplicating this.
+///
+/// `requires` entries MUST be maintained in authored order — the order in
+/// which they appear in the source (spec §1 NORMATIVE).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeSet {
+    /// Declared dependency edges in authored order.
+    pub requires: Vec<RequireEntry>,
+    /// Source directory; empty string when unset.
+    pub src_dir: String,
+    /// Fidelity tag — in-memory only, MUST NOT be serialized.
+    pub source: EdgeSource,
+}
+
+impl EdgeSet {
+    /// Construct a DepDecl-sourced `EdgeSet` (the common consumer-path case).
+    pub fn from_dep_decl(requires: Vec<RequireEntry>, src_dir: String) -> Self {
+        EdgeSet {
+            requires,
+            src_dir,
+            source: EdgeSource::DepDecl,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

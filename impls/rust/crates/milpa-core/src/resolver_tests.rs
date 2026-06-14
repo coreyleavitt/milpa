@@ -244,6 +244,7 @@ fn manifest_full(deps: Vec<Dep>, dev_deps: Vec<Dep>, overrides: Vec<Override>) -
         cas_dir: String::new(),
         spec_version: 1,
         spec_version_explicit: false,
+        attestation_policy: milpa_manifest::AttestationPolicy::Permissive,
     }
 }
 
@@ -284,6 +285,8 @@ fn resolve_single_url_dep_no_transitive() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap();
 
@@ -335,6 +338,8 @@ fn resolve_url_dep_with_transitive_url() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap();
     let names: Vec<&str> = graph.deps.iter().map(|d| d.name.as_str()).collect();
@@ -379,6 +384,8 @@ fn resolve_dedup_same_url_ref_fetches_once() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap();
     let shared: Vec<_> = graph.deps.iter().filter(|d| d.name == "shared").collect();
@@ -405,6 +412,8 @@ fn resolve_named_dep_strategy_selects_version() {
             ref_spec: format!("v{ver}"),
             commit_sha: None,
         }],
+        dep_decl: None,
+        dep_decl_schema_version: None,
     };
     let index = Index {
         packages: vec![Package {
@@ -425,6 +434,8 @@ fn resolve_named_dep_strategy_selects_version() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp_max),
+        None,
+        false,
     )
     .unwrap();
     let foo_max = g_max.deps.iter().find(|d| d.name == "foo").unwrap();
@@ -440,6 +451,8 @@ fn resolve_named_dep_strategy_selects_version() {
         None,
         Strategy::Minver,
         &deps_dir(&tmp_min),
+        None,
+        false,
     )
     .unwrap();
     let foo_min = g_min.deps.iter().find(|d| d.name == "foo").unwrap();
@@ -459,6 +472,8 @@ fn resolve_named_dep_without_index_errors() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap_err();
     assert_eq!(err.code(), "RES-NO-INDEX");
@@ -489,6 +504,8 @@ fn resolve_url_dep_with_override_fetches_override() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap();
     let foo = graph.deps.iter().find(|d| d.name == "foo").unwrap();
@@ -538,6 +555,8 @@ fn resolve_root_override_precedence_suppresses_transitive_provenance() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap();
     let shared: Vec<_> = graph.deps.iter().filter(|d| d.name == "shared").collect();
@@ -593,6 +612,8 @@ fn resolve_non_root_provenance_disagreement_conflicts() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap_err();
     assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
@@ -626,6 +647,8 @@ fn resolve_dev_deps_root_enrolls_transitive_excludes() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap();
     let names: Vec<&str> = graph.deps.iter().map(|d| d.name.as_str()).collect();
@@ -659,6 +682,8 @@ fn resolve_local_dep_copies_and_parses() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap();
     let dep = graph.deps.iter().find(|d| d.name == "liblocal").unwrap();
@@ -684,6 +709,8 @@ fn resolve_fetch_failure_surfaces() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap_err();
     assert_eq!(err.code(), "FETCH-ALL-FAILED");
@@ -707,6 +734,8 @@ fn resolve_malformed_nimble_constraint_is_manifest_error() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap_err();
     assert_eq!(err.code(), "MAN-NIMBLE-CONSTRAINT");
@@ -741,6 +770,7 @@ fn resolve_prior_lockfile_pin_rejects_hostile_bytes() {
             }],
             active_flags: Vec::new(),
             self_mirrors: Vec::new(),
+            dep_decl: None,
         }],
     };
     let err = resolve(
@@ -751,6 +781,8 @@ fn resolve_prior_lockfile_pin_rejects_hostile_bytes() {
         Some(&prior),
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap_err();
     assert_eq!(err.code(), "FETCH-ALL-FAILED");
@@ -780,6 +812,7 @@ fn resolve_prior_lockfile_pin_accepts_matching_bytes() {
             }],
             active_flags: Vec::new(),
             self_mirrors: Vec::new(),
+            dep_decl: None,
         }],
     };
     let graph = resolve(
@@ -790,6 +823,8 @@ fn resolve_prior_lockfile_pin_accepts_matching_bytes() {
         Some(&prior),
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap();
     let foo = graph.deps.iter().find(|d| d.name == "foo").unwrap();
@@ -822,6 +857,8 @@ fn resolve_mirror_fallback_uses_second_candidate() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap();
     assert_eq!(graph.deps.len(), 1);
@@ -850,6 +887,8 @@ fn resolve_content_hash_dedup_aliases_to_lex_min_name() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap();
     let names: Vec<&str> = graph.deps.iter().map(|d| d.name.as_str()).collect();
@@ -889,6 +928,8 @@ fn resolve_profile_excludes_platform_mismatch() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap();
     assert!(graph.deps.is_empty(), "windows-gated dep excluded on linux");
@@ -929,6 +970,8 @@ fn resolve_profile_includes_platform_match() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap();
     assert_eq!(graph.deps.len(), 1, "linux-gated dep included on linux");
@@ -965,6 +1008,8 @@ fn resolve_absent_profile_includes_platform_gated_dep() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap();
     assert_eq!(graph.deps.len(), 1, "absent profile includes all deps");
@@ -1001,6 +1046,8 @@ fn resolve_profile_filters_conditional_dep() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap();
     assert!(graph.deps.is_empty());
@@ -1037,6 +1084,8 @@ fn resolve_absent_profile_includes_conditional_dep() {
         None,
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap();
     assert_eq!(graph.deps.len(), 1);
@@ -1054,7 +1103,7 @@ fn resolve_tarball_first_fetch_records_archive_sha256() {
     let reg = tarball_reg(&[(url, tarball_mock("archivesha_aaaa", body))]);
     let tmp = tempfile::tempdir().unwrap();
     let m = manifest(vec![tarball_dep("foo", url, None)]);
-    let graph = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp)).unwrap();
+    let graph = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false).unwrap();
     let foo = graph.deps.iter().find(|d| d.name == "foo").unwrap();
     assert_eq!(
         foo.provenance,
@@ -1083,6 +1132,7 @@ fn tarball_prior(name: &str, url: &str, identity: &str, sha256: &str) -> Lockfil
             }],
             active_flags: Vec::new(),
             self_mirrors: Vec::new(),
+            dep_decl: None,
         }],
     }
 }
@@ -1110,6 +1160,8 @@ fn resolve_tarball_refetch_rejects_substituted_archive() {
         Some(&prior),
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap_err();
     assert_eq!(err.code(), "FETCH-ALL-FAILED");
@@ -1142,6 +1194,8 @@ fn resolve_tarball_refetch_preserves_pin() {
         Some(&prior),
         Strategy::Maxver,
         &deps_dir(&tmp),
+        None,
+        false,
     )
     .unwrap();
     let foo = graph.deps.iter().find(|d| d.name == "foo").unwrap();
@@ -1164,7 +1218,7 @@ fn resolve_tarball_manifest_sha256_mismatch_rejected_on_first_fetch() {
     let reg = tarball_reg(&[(url, tarball_mock("archivesha_actual", body))]);
     let tmp = tempfile::tempdir().unwrap();
     let m = manifest(vec![tarball_dep("foo", url, Some("archivesha_declared"))]);
-    let err = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp)).unwrap_err();
+    let err = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false).unwrap_err();
     assert_eq!(err.code(), "FETCH-ALL-FAILED");
     let MilpaError::Fetch(FetchError::AllFailed(msg)) = &err else {
         panic!("expected AllFailed, got {err:?}");

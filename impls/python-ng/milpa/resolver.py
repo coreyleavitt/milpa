@@ -87,6 +87,15 @@ from milpa.manifest import (
     TarballDep,
     UrlDep,
 )
+from milpa.edge_sources import (
+    DepDeclEdgeSource,
+    EdgeSourceCtx,
+    MilpaKdlEdgeSource,
+    NimbleEdgeSource,
+    edgeset_to_terms,
+    resolve_edges,
+)
+from milpa.dep_decl import EdgeSet
 from milpa.nimble import parse_nimble
 from milpa.profile import Profile
 from milpa.registry import GitIndexProvenance, Index, IndexVersion
@@ -149,6 +158,10 @@ class _Candidate:
     provenance: (
         Provenance | _LocalDepProvenance | MemberProvenanceRecord | None
     ) = None
+    # S6: the dep_decl hash this candidate's edges were sourced from.
+    # Populated from IndexVersion.dep_decl (S2) when DepDeclEdgeSource is used;
+    # None for URL/tarball/local/member deps and named deps without a dep_decl pointer.
+    dep_decl: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +190,8 @@ class _Provider:
         seen_named: set[str],
         seen_url: set[tuple[str, str]],
         provenance_gate: dict[str, tuple[tuple[object, ...], bool]],
+        edge_cache: dict[tuple[str, Version], EdgeSet] | None = None,
+        strict_attestation: bool = False,
     ) -> None:
         # name → {version → _Candidate}
         self._candidates: dict[str, dict[Version, _Candidate]] = {}
@@ -194,6 +209,21 @@ class _Provider:
         self._seen_named = seen_named
         self._seen_url = seen_url
         self._provenance_gate = provenance_gate
+
+        # Resolver-scoped edge memo (§4.2.1 resolve_edges, clause a).
+        # Owned by resolve() and shared here so _materialize can seal it.
+        self._edge_cache: dict[tuple[str, Version], EdgeSet] = (
+            edge_cache if edge_cache is not None else {}
+        )
+        # Shared edge source singletons (one per resolve() call).
+        self._nimble_source: NimbleEdgeSource = NimbleEdgeSource()
+        self._milpakdl_source: MilpaKdlEdgeSource = MilpaKdlEdgeSource()
+        # S3b: DepDeclEdgeSource; None if no dep_decl_store is configured.
+        self._dep_decl_source: DepDeclEdgeSource | None = (
+            DepDeclEdgeSource(env.dep_decl_store) if env.dep_decl_store is not None else None
+        )
+        # S5: strict attestation policy (OR of manifest + flag).
+        self._strict_attestation: bool = strict_attestation
 
     def add(self, c: _Candidate) -> None:
         """Add a candidate unconditionally (for __root__ and pre-built deps)."""
@@ -249,10 +279,42 @@ class _Provider:
             "commit_sha"
         )
 
-        # Parse deps from .nimble or milpa.kdl (transitive deps only use .deps,
-        # NOT .dev_deps — resolver-semantics §9 NORMATIVE).
-        dep_terms, requires_names, src_dir = _parse_transitive_deps(
-            result.path, name, self._overrides_by_name
+        # Resolve edges via the coordinator (§4.2.1 resolve_edges, NORMATIVE).
+        # ctx.dep_decl comes from IndexVersion.dep_decl (S2 field — may be None
+        # for old index entries).  ctx.is_overridden = False for named deps that
+        # reach materialisation (overridden named deps are coerced to URL deps
+        # before Phase A; they never become stubs).
+        has_milpa_kdl = (result.path / "milpa.kdl").exists()
+        ctx = EdgeSourceCtx(
+            dep_path=result.path,
+            dep_name=name,
+            dep_decl=iv.dep_decl,  # S2 field; None when absent
+            dep_decl_schema_version=iv.dep_decl_schema_version,  # S3b schema check
+            is_overridden=False,   # overridden named → URL coercion before Phase A
+            has_milpa_kdl=has_milpa_kdl,
+            overrides_by_name=self._overrides_by_name,
+        )
+        es = resolve_edges(
+            name,
+            stub.version,
+            ctx,
+            self._edge_cache,
+            nimble_source=self._nimble_source,
+            milpakdl_source=self._milpakdl_source,
+            dep_decl_source=self._dep_decl_source,  # S3b: wired from MilpaEnv.dep_decl_store
+            strict_attestation=self._strict_attestation,  # S5: policy-gated FETCH-FAILED fallback
+        )
+        dep_terms, requires_names = edgeset_to_terms(
+            es, self._overrides_by_name, _URL_DEP_VERSION
+        )
+        src_dir = es.src_dir
+
+        # S6: record the dep_decl hash in the candidate when edges came from DepDecl.
+        # EdgeSet.source == DEP_DECL iff DepDeclEdgeSource fired; only then is
+        # iv.dep_decl meaningful as a lockfile pin (§3.7).
+        from milpa.dep_decl import EdgeSource as _EdgeSource
+        _dep_decl_pin: str | None = (
+            iv.dep_decl if es.source == _EdgeSource.DEP_DECL else None
         )
 
         candidate = _Candidate(
@@ -267,6 +329,7 @@ class _Provider:
                 ref=prov_record.ref,
                 commit_sha=fetched_commit_sha or prov_record.commit_sha,
             ),
+            dep_decl=_dep_decl_pin,
         )
 
         # Register and clear stub.
@@ -789,6 +852,13 @@ def resolve(
     seen_local: set[str] = set()
     seen_tarball: set[str] = set()
 
+    # Resolver-scoped edge memo (§4.2.1 resolve_edges clause a).
+    # Sealed once per (name, version) — shared with provider for _materialize.
+    edge_cache: dict[tuple[str, Version], EdgeSet] = {}
+
+    from milpa.attestation import effective_strict_policy as _eff_strict
+    _is_strict_early = _eff_strict(manifest.attestation_policy, params.require_attested_metadata)
+
     provider = _Provider(
         env=env,
         deps_dir=deps_dir,
@@ -798,6 +868,8 @@ def resolve(
         seen_named=seen_named,
         seen_url=seen_url,
         provenance_gate=provenance_gate,
+        edge_cache=edge_cache,
+        strict_attestation=_is_strict_early,
     )
 
     # ------------------------------------------------------------------
@@ -1013,13 +1085,19 @@ def resolve(
                 fut_result = fut.result()  # propagates exceptions
                 kind_result = fut_result[0]
                 fetch_result = fut_result[1]
-                # Register candidate and enqueue transitives.
+                # Register candidate, seal edge_cache, and enqueue transitives.
                 if kind_result in ("url", "tarball", "local"):
-                    cand_and_deps: tuple[_Candidate, list[object]] = _cast(
-                        "tuple[_Candidate, list[object]]", fetch_result
+                    cand_and_deps: tuple[_Candidate, list[object], EdgeSet] = _cast(
+                        "tuple[_Candidate, list[object], EdgeSet]", fetch_result
                     )
-                    cand_r, transitive_deps_r = cand_and_deps
+                    cand_r, transitive_deps_r, es_r = cand_and_deps
                     provider.add(cand_r)
+                    # Seal the edge_cache for this (name, version) — clause (a).
+                    # First-encounter wins; no overwrite (worker produced the EdgeSet
+                    # deterministically from the fetched tree).
+                    cache_key_r = (cand_r.name, cand_r.version)
+                    if cache_key_r not in edge_cache:
+                        edge_cache[cache_key_r] = es_r
                     for sub_dep in transitive_deps_r:
                         _enqueue_dep(sub_dep, overrides_by_name, bfs_queue)
 
@@ -1061,6 +1139,27 @@ def resolve(
     # Step 9: build the ResolvedGraph (attach cert for CLI §2.5)
     # ------------------------------------------------------------------
     graph = _build_graph(solution, provider, deps_dir, params.strategy)
+
+    # ------------------------------------------------------------------
+    # Step 10: S5 attestation policy enforcement
+    #
+    # Collect the EdgeSets for all resolved non-root deps from edge_cache.
+    # The effective policy is the OR of manifest.attestation_policy and
+    # params.require_attested_metadata.  Under non-strict: emit one summary
+    # warning if any dep used NimbleFallback.  Under strict: raise
+    # RES-UNATTESTED-METADATA.
+    # ------------------------------------------------------------------
+    from milpa.attestation import enforce_attestation_policy
+    is_strict = _is_strict_early  # already computed above
+    # edge_cache holds (name, version) → EdgeSet for all deps seen during BFS.
+    # We exclude __root__ (it has no EdgeSet in the cache).
+    resolved_edge_map: dict[str, EdgeSet] = {
+        name: es
+        for (name, _ver), es in edge_cache.items()
+        if name != "__root__"
+    }
+    enforce_attestation_policy(resolved_edge_map, is_strict)
+
     from dataclasses import replace as _replace
     return _replace(graph, cert=cert)
 
@@ -1118,12 +1217,13 @@ def _process_url_worker(
     env: MilpaEnv,
     params: ResolveParams,
     overrides_by_name: dict[str, Override],
-) -> tuple[_Candidate, list[object]]:
+) -> tuple[_Candidate, list[object], EdgeSet]:
     """Fetch one URL dep (worker: pure I/O, no shared-state mutation).
 
-    Returns ``(_Candidate, transitive_dep_list)`` where ``transitive_dep_list``
-    is a list of raw dep objects (UrlDep, NamedDep, etc.) from the fetched tree.
-    The caller enqueues them into the BFS queue.
+    Returns ``(_Candidate, transitive_dep_list, edge_set)`` where:
+    - ``transitive_dep_list`` are raw dep objects for BFS enqueuing.
+    - ``edge_set`` is the EdgeSet produced by the appropriate source (MilpaKdl
+      or Nimble); the caller seals this into the resolver-scoped ``edge_cache``.
 
     This is the thread-pool worker body for 9b-7 parallel fetch (§4.4 NORMATIVE:
     output is deterministic regardless of -j because the lockfile is lex-sorted).
@@ -1177,10 +1277,27 @@ def _process_url_worker(
             name=dep.name,
         )
 
-    # Extract deps from the fetched tree (NORMATIVE §9: transitive .deps only).
-    dep_terms, requires_names, src_dir = _parse_transitive_deps(
-        result.path, dep.name, overrides_by_name
+    # Extract edges via the appropriate source (NORMATIVE §9: transitive .deps only).
+    # URL deps are not in the index → dep_decl=None; is_overridden reflects whether
+    # this dep's provenance was redirected by a root override.
+    has_milpa_kdl = (result.path / "milpa.kdl").exists()
+    ctx = EdgeSourceCtx(
+        dep_path=result.path,
+        dep_name=dep.name,
+        dep_decl=None,   # URL deps are not index-registered → no DepDecl
+        is_overridden=dep.name in overrides_by_name,
+        has_milpa_kdl=has_milpa_kdl,
+        overrides_by_name=overrides_by_name,
     )
+    # Call the source directly (worker thread — no shared edge_cache yet).
+    # The main thread seals edge_cache from the returned EdgeSet.
+    if has_milpa_kdl:
+        es = MilpaKdlEdgeSource().edges_for(dep.name, _URL_DEP_VERSION, ctx)
+    else:
+        es = NimbleEdgeSource().edges_for(dep.name, _URL_DEP_VERSION, ctx)
+
+    dep_terms, requires_names = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
+    src_dir = es.src_dir
 
     commit_sha: str | None = result.receipt.transport_fields().get("commit_sha")
 
@@ -1196,7 +1313,7 @@ def _process_url_worker(
 
     # Collect transitive deps for the BFS queue (returned to caller for enqueuing).
     transitive_deps = _collect_transitive_deps(result.path, dep.name, overrides_by_name)
-    return candidate, transitive_deps
+    return candidate, transitive_deps, es
 
 
 def _collect_transitive_deps(
@@ -1271,7 +1388,7 @@ def _process_tarball_worker(
     env: MilpaEnv,
     params: ResolveParams,
     overrides_by_name: dict[str, Override],
-) -> tuple[_Candidate, list[object]]:
+) -> tuple[_Candidate, list[object], EdgeSet]:
     """Fetch one tarball dep (worker: pure I/O, no shared-state mutation).
 
     Tarball TOFU re-assertion (slice 9c / RFC S9c + #116):
@@ -1285,7 +1402,8 @@ def _process_tarball_worker(
       or locked_sha256`` (manifest-declared sha256 is authoritative; receipt
       sha is used when dep.sha256 is None; falls back to locked sha on refetch).
 
-    Returns ``(_Candidate, transitive_dep_list)``.
+    Returns ``(_Candidate, transitive_dep_list, edge_set)``.
+    The caller seals ``edge_set`` into the resolver-scoped ``edge_cache``.
     """
     # Prior pin (§8): locked identity + locked archive sha256.
     tarball_pin_result = _tarball_pin(dep, params.prior)
@@ -1331,9 +1449,24 @@ def _process_tarball_worker(
         )
 
     archive_sha256: str | None = result.receipt.transport_fields().get("archive_sha256")
-    dep_terms, requires_names, src_dir = _parse_transitive_deps(
-        result.path, dep.name, overrides_by_name
+
+    # Extract edges via the appropriate source (NORMATIVE §9: transitive .deps only).
+    has_milpa_kdl = (result.path / "milpa.kdl").exists()
+    ctx = EdgeSourceCtx(
+        dep_path=result.path,
+        dep_name=dep.name,
+        dep_decl=None,   # Tarball deps are not index-registered → no DepDecl
+        is_overridden=False,  # Tarball deps cannot be overridden (no name-override mechanism)
+        has_milpa_kdl=has_milpa_kdl,
+        overrides_by_name=overrides_by_name,
     )
+    if has_milpa_kdl:
+        es = MilpaKdlEdgeSource().edges_for(dep.name, _URL_DEP_VERSION, ctx)
+    else:
+        es = NimbleEdgeSource().edges_for(dep.name, _URL_DEP_VERSION, ctx)
+
+    dep_terms, requires_names = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
+    src_dir = es.src_dir
     recorded_sha256 = dep.sha256 or archive_sha256 or locked_sha256
 
     candidate = _Candidate(
@@ -1350,7 +1483,7 @@ def _process_tarball_worker(
         ),
     )
     transitive_deps = _collect_transitive_deps(result.path, dep.name, overrides_by_name)
-    return candidate, transitive_deps
+    return candidate, transitive_deps, es
 
 
 # ---------------------------------------------------------------------------
@@ -1364,7 +1497,7 @@ def _process_local_worker(
     env: MilpaEnv,
     params: ResolveParams,
     overrides_by_name: dict[str, Override],
-) -> tuple[_Candidate, list[object]]:
+) -> tuple[_Candidate, list[object], EdgeSet]:
     """Fetch one local dep (worker: pure I/O, no shared-state mutation).
 
     Local deps resolve with NO traditional fetch (cas_admissible=False):
@@ -1375,7 +1508,8 @@ def _process_local_worker(
     Resolves it to absolute for ``LocalProvenance`` (which requires absolute),
     but records the DECLARED relative path in the lockfile (§4.3 NORMATIVE).
 
-    Returns ``(_Candidate, transitive_dep_list)``.
+    Returns ``(_Candidate, transitive_dep_list, edge_set)``.
+    The caller seals ``edge_set`` into the resolver-scoped ``edge_cache``.
     """
     declared_path_str = dep.path  # as declared in milpa.kdl (may be relative)
     if params.manifest_dir is not None:
@@ -1386,9 +1520,23 @@ def _process_local_worker(
     prov = LocalProvenance(path=abs_path)
     result = env.fetcher.fetch(dep.name, prov, dest=deps_dir / dep.name)
 
-    dep_terms, requires_names, src_dir = _parse_transitive_deps(
-        result.path, dep.name, overrides_by_name
+    # Extract edges via the appropriate source (NORMATIVE §9: transitive .deps only).
+    has_milpa_kdl = (result.path / "milpa.kdl").exists()
+    ctx = EdgeSourceCtx(
+        dep_path=result.path,
+        dep_name=dep.name,
+        dep_decl=None,   # Local deps are not index-registered → no DepDecl
+        is_overridden=False,  # Local deps are always literal paths; no override applies
+        has_milpa_kdl=has_milpa_kdl,
+        overrides_by_name=overrides_by_name,
     )
+    if has_milpa_kdl:
+        es = MilpaKdlEdgeSource().edges_for(dep.name, _URL_DEP_VERSION, ctx)
+    else:
+        es = NimbleEdgeSource().edges_for(dep.name, _URL_DEP_VERSION, ctx)
+
+    dep_terms, requires_names = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
+    src_dir = es.src_dir
 
     candidate = _Candidate(
         name=dep.name,
@@ -1400,7 +1548,7 @@ def _process_local_worker(
         provenance=_LocalDepProvenance(declared_path=declared_path_str),
     )
     transitive_deps = _collect_transitive_deps(result.path, dep.name, overrides_by_name)
-    return candidate, transitive_deps
+    return candidate, transitive_deps, es
 
 
 # ---------------------------------------------------------------------------
@@ -1467,6 +1615,9 @@ def _build_graph(
             src_dir=cand.src_dir,
             requires=tuple(cand.requires_names),
             provenance=prov_record,
+            # S6: dep_decl pin — carries the DepDecl hash from _Candidate (set in
+            # _materialize when DepDeclEdgeSource fired) to the lockfile record.
+            dep_decl=cand.dep_decl,
         )
         deps.append(resolved)
 
@@ -1557,7 +1708,7 @@ def resolve_workspace(
         Injectable seams: ``fetcher``, ``index``, ``store``.
     params:
         Per-call parameters: ``strategy``, ``max_parallel``, ``profile``,
-        ``prior``.
+        ``prior``, ``require_attested_metadata``.
 
     Returns
     -------
@@ -1570,6 +1721,14 @@ def resolve_workspace(
         RES-WS-OVERRIDE-MEMBER-COLLISION, RES-WS-MEMBER-REF-UNKNOWN,
         RES-WS-NO-INDEX, or any other MAN-*/TNG-*/FETCH-*/SOLVE-*/RES-* slug.
     """
+    # §13.1 workspace attestation policy: effective strict = OR of
+    # params.require_attested_metadata (flag/env) OR any member's
+    # attestation-policy == "strict".
+    from milpa.attestation import effective_strict_policy as _eff_strict
+    _ws_is_strict = params.require_attested_metadata or any(
+        _eff_strict(m.manifest.attestation_policy, False)
+        for m in workspace.members
+    )
     deps_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -1644,6 +1803,9 @@ def resolve_workspace(
     seen_local: set[str] = set()
     seen_tarball: set[str] = set()
 
+    # Resolver-scoped edge memo (§4.2.1 resolve_edges clause a).
+    ws_edge_cache: dict[tuple[str, Version], EdgeSet] = {}
+
     provider = _Provider(
         env=env,
         deps_dir=deps_dir,
@@ -1653,6 +1815,8 @@ def resolve_workspace(
         seen_named=seen_named,
         seen_url=seen_url,
         provenance_gate=provenance_gate,
+        edge_cache=ws_edge_cache,
+        strict_attestation=_ws_is_strict,
     )
 
     # ------------------------------------------------------------------
@@ -1840,11 +2004,15 @@ def resolve_workspace(
                 kind_result_ws = fut_result_ws[0]
                 fetch_result_ws = fut_result_ws[1]
                 if kind_result_ws in ("url", "tarball", "local"):
-                    cand_and_deps_ws: tuple[_Candidate, list[object]] = _cast2(
-                        "tuple[_Candidate, list[object]]", fetch_result_ws
+                    cand_and_deps_ws: tuple[_Candidate, list[object], EdgeSet] = _cast2(
+                        "tuple[_Candidate, list[object], EdgeSet]", fetch_result_ws
                     )
-                    cand_ws, transitive_deps_ws = cand_and_deps_ws
+                    cand_ws, transitive_deps_ws, es_ws = cand_and_deps_ws
                     provider.add(cand_ws)
+                    # Seal edge_cache (clause a).
+                    cache_key_ws = (cand_ws.name, cand_ws.version)
+                    if cache_key_ws not in ws_edge_cache:
+                        ws_edge_cache[cache_key_ws] = es_ws
                     for sub_dep_ws in transitive_deps_ws:
                         _enqueue_dep(sub_dep_ws, overrides_by_name, bfs_queue)
 
@@ -1882,5 +2050,17 @@ def resolve_workspace(
     # Build graph (attach cert for CLI §2.5)
     # ------------------------------------------------------------------
     graph = _build_graph(solution, provider, deps_dir, params.strategy)
+
+    # §13 attestation policy enforcement — mirrors single-package resolve().
+    # Effective policy: OR of flag/env (via _ws_is_strict computed above) and
+    # each member's attestation-policy "strict" declaration (§13.1 workspace rule).
+    from milpa.attestation import enforce_attestation_policy
+    resolved_edge_map: dict[str, "EdgeSet"] = {
+        name: es
+        for (name, _ver), es in ws_edge_cache.items()
+        if name != "__root__"
+    }
+    enforce_attestation_policy(resolved_edge_map, _ws_is_strict)
+
     from dataclasses import replace as _replace
     return _replace(graph, cert=cert)

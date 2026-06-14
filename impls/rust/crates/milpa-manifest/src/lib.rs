@@ -171,6 +171,17 @@ pub struct Manifest {
     pub cas_dir: String,
     pub spec_version: i64,
     pub spec_version_explicit: bool,
+    /// S5: attestation policy from `attestation-policy "strict"|"permissive"` (default: permissive).
+    pub attestation_policy: AttestationPolicy,
+}
+
+/// S5: Attestation policy — controls fallback-warning vs. hard-error behaviour
+/// for deps resolved from un-attested `.nimble` metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AttestationPolicy {
+    #[default]
+    Permissive,
+    Strict,
 }
 
 /// A parsed workspace-root `milpa.kdl` (grammar §7). Pure container: member
@@ -411,6 +422,7 @@ const PACKAGE_TOP_LEVEL: &[&str] = &[
     "mirrors",
     "cas",
     "spec-version",
+    "attestation-policy",
 ];
 const WORKSPACE_TOP_LEVEL: &[&str] = &["workspace", "name", "overrides", "spec-version"];
 
@@ -603,6 +615,7 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
     let mut cas_dir = String::new();
     let mut spec_version: i64 = 1;
     let mut spec_version_explicit = false;
+    let mut attestation_policy = AttestationPolicy::Permissive;
 
     let mut seen_names: BTreeSet<String> = BTreeSet::new();
     let mut seen_dev_dep_names: BTreeSet<String> = BTreeSet::new();
@@ -720,6 +733,29 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
                     self_mirrors.push(url_arg("top-level mirrors", "mirror", a[0])?);
                 }
             }
+            "attestation-policy" => {
+                let a = args(node);
+                let val = a.first().and_then(|e| e.value().as_string());
+                if a.len() != 1 || val.is_none() {
+                    return Err(err(
+                        "MAN-UNKNOWN-TOP-LEVEL",
+                        "'attestation-policy' takes exactly one string argument \
+                         ('permissive' or 'strict')",
+                    ));
+                }
+                attestation_policy = match val.unwrap() {
+                    "permissive" => AttestationPolicy::Permissive,
+                    "strict" => AttestationPolicy::Strict,
+                    other => {
+                        return Err(err(
+                            "MAN-UNKNOWN-TOP-LEVEL",
+                            format!(
+                                "'attestation-policy' must be 'permissive' or 'strict', got {other:?}"
+                            ),
+                        ));
+                    }
+                };
+            }
             "workspace" => {
                 return Err(err(
                     "MAN-WORKSPACE-IN-PACKAGE",
@@ -779,6 +815,7 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
         cas_dir,
         spec_version,
         spec_version_explicit,
+        attestation_policy,
     })
 }
 

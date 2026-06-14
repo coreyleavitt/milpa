@@ -26,6 +26,7 @@ from pathlib import Path
 from milpa.errors import (
     TNG_AMBIGUOUS_NAME,
     TNG_BAD_COMMIT_SHA,
+    TNG_BAD_DEP_DECL,
     TNG_BAD_OCI_DIGEST,
     TNG_NO_PROVENANCE,
     TNG_NO_SATISFYING_VERSION,
@@ -63,7 +64,12 @@ TIANGUIS_INDEX_SCHEMA_VERSION: int = 1
 # ---------------------------------------------------------------------------
 
 _RE_40HEX = re.compile(r"^[0-9a-f]{40}$")
-_RE_OCI_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+#: Single source of truth for the ``sha256:<64 lowercase hex>`` pointer format.
+#: Used by both ``_validate_oci_digest`` (TNG-BAD-OCI-DIGEST) and
+#: ``_validate_dep_decl_pointer`` (TNG-BAD-DEP-DECL) — the two differ ONLY in
+#: which error code they raise.  Also reused by ``fetchers/oci.py`` so that a
+#: future algorithm change (e.g. sha512) has exactly ONE update site.
+_RE_SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _RE_UNSAFE_NAME = re.compile(r"[/\\]|\.\.")
 
 
@@ -109,11 +115,31 @@ def _validate_commit_sha(sha: str) -> None:
 
 def _validate_oci_digest(digest: str) -> None:
     """Reject OCI digests not in ``sha256:<64-hex>`` form."""
-    if not _RE_OCI_DIGEST.fullmatch(digest):
+    if not _RE_SHA256_DIGEST.fullmatch(digest):
         raise MilpaError(
             TNG_BAD_OCI_DIGEST,
             f"OCI digest {digest!r} is not in `sha256:<64 hex>` format",
             digest=digest,
+        )
+
+
+def _validate_dep_decl_pointer(pointer: str) -> None:
+    """Reject ``dep_decl`` pointers not in ``sha256:<64 lowercase hex>`` form.
+
+    Validated at index-parse time (registry-protocol §3.2 NORMATIVE).  The
+    pointer is later used as a filesystem path component (``FileDepDeclStore``)
+    and as a URL path segment (``HttpDepDeclStore``); a malformed value
+    containing path-traversal chars (e.g. ``sha256:../../etc/passwd``) would
+    reach those sites before the hash check — the boundary validation makes
+    that structurally impossible.  Raises ``MilpaError(TNG-BAD-DEP-DECL)``
+    for any value not matching ``^sha256:[0-9a-f]{64}$``.
+    """
+    if not _RE_SHA256_DIGEST.fullmatch(pointer):
+        raise MilpaError(
+            TNG_BAD_DEP_DECL,
+            f"dep_decl pointer {pointer!r} is not in `sha256:<64 lowercase hex>` format "
+            f"— path-traversal or malformed pointer rejected at parse boundary",
+            pointer=pointer,
         )
 
 
@@ -164,11 +190,20 @@ class IndexVersion:
     is canonical, the rest mirrors.  Callers MUST NOT reorder — the identity
     gate makes any mirror yielding different bytes a hard error, so ordered
     fall-through is safe (registry-protocol §3.3).
+
+    ``dep_decl`` — optional ``sha256:``-prefixed hash pointer to the DepDecl
+    artifact for this version (registry-protocol §3.2.3).  ``None`` when
+    absent (forward-compat: old index entries omit it).
+
+    ``dep_decl_schema_version`` — the DepDecl schema version integer that
+    produced ``dep_decl`` (registry-protocol §3.2.1).  ``None`` when absent.
     """
 
     version: str
     content_hash: str = ""
     provenances: tuple[IndexProvenance, ...] = ()
+    dep_decl: str | None = None
+    dep_decl_schema_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -336,7 +371,8 @@ def parse_index(text: str) -> Index:
     Validates schema version, then every package: name safety-checked, each
     version's provenances sanitized (``TNG-UNSAFE-NAME`` / ``TNG-BAD-COMMIT-SHA``
     / ``TNG-BAD-OCI-DIGEST`` / ``TNG-UNSAFE-URL`` / ``TNG-UNSAFE-REF`` /
-    ``TNG-UNSAFE-OCI-FIELD``).
+    ``TNG-UNSAFE-OCI-FIELD``), and the ``dep_decl`` pointer validated
+    (``TNG-BAD-DEP-DECL``).
 
     Forward-compat rules (registry-protocol §1, §3 NORMATIVE):
       - Unknown top-level nodes are silently skipped.
@@ -484,18 +520,29 @@ def _parse_version_node(ver_str: str, node: KdlNode) -> IndexVersion:
     """Parse one ``version "<ver>" { … }`` node into an ``IndexVersion``."""
     content_hash = _child_scalar(node, "content_hash") or ""
     provenances: list[IndexProvenance] = []
+    dep_decl: str | None = None
+    dep_decl_schema_version: int | None = None
 
     for child in node_children(node):
-        if node_name(child) != "provenance":
-            continue
-        prov = _parse_provenance_node(child)
-        if prov is not None:
-            provenances.append(prov)
+        name = node_name(child)
+        if name == "provenance":
+            prov = _parse_provenance_node(child)
+            if prov is not None:
+                provenances.append(prov)
+        elif name == "dep_decl":
+            raw_ptr = node_arg_str(child, 0) or None
+            if raw_ptr is not None:
+                _validate_dep_decl_pointer(raw_ptr)
+            dep_decl = raw_ptr
+        elif name == "dep_decl_schema_version":
+            dep_decl_schema_version = _node_int_arg(child)
 
     return IndexVersion(
         version=ver_str,
         content_hash=content_hash,
         provenances=tuple(provenances),
+        dep_decl=dep_decl,
+        dep_decl_schema_version=dep_decl_schema_version,
     )
 
 

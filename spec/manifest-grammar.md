@@ -118,8 +118,9 @@ uses the `(url)` annotation to mark URL strings.
 
 > NORMATIVE: A package manifest MUST contain exactly one `name` node and at
 > most one each of: `kind`, `deps`, `dev-deps`, `overrides`, `src_dir`, `flags`,
-> `mirrors`, `cas`, `spec-version`. Any other top-level node name MUST raise
-> `MAN-UNKNOWN-TOP-LEVEL`. Two `name` nodes MUST raise `MAN-NAME-DUPLICATE`.
+> `mirrors`, `cas`, `spec-version`, `attestation-policy`. Any other top-level
+> node name MUST raise `MAN-UNKNOWN-TOP-LEVEL`. Two `name` nodes MUST raise
+> `MAN-NAME-DUPLICATE`.
 
 > NORMATIVE: The `name` node MUST carry exactly one positional string argument
 > (the package name). Missing `name` raises `MAN-NAME-MISSING`; wrong arity or
@@ -133,6 +134,24 @@ uses the `(url)` annotation to mark URL strings.
 > NORMATIVE: The `src_dir` node MUST carry exactly one positional string
 > argument (a relative or absolute path). Wrong arity or non-string arg raises
 > `MAN-SRC-DIR-TYPE`. When absent, `src_dir` defaults to the empty string.
+
+#### `attestation-policy` field
+
+> NORMATIVE: The `attestation-policy` node MUST carry exactly one positional
+> string argument whose value is one of `"permissive"` (default) or `"strict"`.
+> Wrong arity or a value outside the two-element set MUST raise
+> `MAN-UNKNOWN-TOP-LEVEL`. When absent, the policy defaults to `"permissive"`.
+>
+> Under `"strict"`, any resolved named dep whose index entry carries no
+> `dep_decl` pointer (and therefore falls back to un-attested `.nimble`
+> metadata) causes `resolve()` to raise `RES-UNATTESTED-METADATA`. The
+> `--require-attested-metadata` CLI flag and the `MILPA_REQUIRE_ATTESTED_METADATA`
+> environment variable also activate strict mode; effective strict = logical OR of
+> all three sources. The flag / env-var CANNOT weaken a manifest-declared strict
+> policy (OR semantics, not override semantics).
+>
+> Non-strict (`"permissive"` or flag absent): if any named dep resolved from
+> un-attested `.nimble` metadata, a single summary warning is emitted to stderr.
 
 #### `cas` block
 
@@ -496,13 +515,22 @@ Fields: `registry` (string, required), `repository` (string, required),
 
 ## 5  `.nimble` compatibility parsing
 
+> **RELOCATED:** The normative `.nimble`→`EdgeSet` heuristic — including the
+> complete line-matching predicate, multi-line continuation rules,
+> comment-line behavior, `when`-block policy, and authored-order preservation
+> — is now specified in **`spec/dep-decl.md §7`** (the joint milpa↔tianguis
+> contract). This is the single authoritative algorithm shared across all
+> implementations (Python/Rust resolvers and tianguis ingest). The summary
+> below is a cross-reference; `spec/dep-decl.md §7` is the normative source.
+
 When no `milpa.kdl` is present, milpa auto-promotes a `.nimble` file.
 `.nimble` files are NimScript (a Turing-complete Nim superset); milpa does not
-execute them. Instead it applies the heuristic described here to extract
-dependency information.
+execute them. Instead it applies the heuristic defined normatively in
+`spec/dep-decl.md §7` to extract dependency information as an `EdgeSet`.
 
 > NORMATIVE: A `.nimble` parser MUST extract `requires` and `srcDir` values
-> using a line-by-line scan. It MUST NOT execute NimScript.
+> using a line-by-line scan. It MUST NOT execute NimScript. See
+> `spec/dep-decl.md §7` for the complete normative algorithm.
 
 ### 5.1  The four `requires` forms
 

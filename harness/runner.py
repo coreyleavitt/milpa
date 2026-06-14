@@ -49,6 +49,16 @@ class RunResult:
     cas_dir: str                  # path to the isolated CAS dir
     cert_path: Optional[str] = None  # path to the emitted certificate (check-certificate only)
 
+    def cleanup(self) -> None:
+        """Remove the scratch and CAS dirs created by run_fixture.
+
+        Safe to call multiple times (ignore_errors=True).  Callers that need
+        to keep the dirs for post-run assertions must call this AFTER they are
+        done reading outputs.
+        """
+        for d in (self.scratch_dir, self.cas_dir):
+            shutil.rmtree(d, ignore_errors=True)
+
 
 def _read_cmd(fixture_dir: Path) -> str:
     """Read the optional cmd file; default 'resolve'."""
@@ -109,8 +119,9 @@ def _build_env(
       3. MILPA_CACHE_DIR=<iso cas abs path>.
       4. MILPA_INDEX_URL if scratch/index.kdl exists.
       5. MILPA_MOCKED_FETCHES if scratch/mocked-fetches exists.
-      6. Fixture env file overrides (MILPA_TARGET_* etc).
-      7. Descriptor static env.
+      6. MILPA_DEP_DECL_DIR if scratch/dep-decl exists (S3a).
+      7. Fixture env file overrides (MILPA_TARGET_* etc).
+      8. Descriptor static env.
     """
     env = {k: v for k, v in os.environ.items() if not k.startswith("MILPA_")}
     env["LC_ALL"] = "C"
@@ -123,6 +134,10 @@ def _build_env(
     mocked = scratch / "mocked-fetches"
     if mocked.exists():
         env["MILPA_MOCKED_FETCHES"] = str(mocked.resolve())
+
+    dep_decl = scratch / "dep-decl"
+    if dep_decl.exists():
+        env["MILPA_DEP_DECL_DIR"] = str(dep_decl.resolve())
 
     env.update(fixture_env)
     env.update(descriptor_env)
@@ -195,6 +210,8 @@ def _cmd_to_cli(cmd: str) -> tuple[list[str], list[str]]:
     if head == "update":
         # update | update <name>
         return [], ["update", *tokens[1:]]
+    if head == "verify":
+        return [], ["verify"]
     raise ValueError(f"Unknown fixture cmd: {cmd!r}")
 
 
@@ -259,6 +276,37 @@ def run_fixture(
         _copy_fixture_inputs(fixture_dir, scratch)
 
         env = _build_env(scratch, cas_dir, fixture_env, descriptor.env)
+
+        # For "verify" fixtures: run a regular (non-frozen) fetch first to
+        # populate _deps/ and warm the CAS, then restore the pre-authored
+        # milpa.lock (which carries the old dep_decl pins under test), then
+        # run verify.  The pre-authored lock is the fixture's supply-chain
+        # tripwire; the verify step checks it against the live index.
+        #
+        # Using a regular fetch (not frozen) avoids the need for the harness
+        # to seed the CAS itself — the CLI does it naturally during resolution.
+        if cmd == "verify":
+            # Stash the pre-authored milpa.lock before fetch overwrites it.
+            original_lock = scratch / "milpa.lock"
+            lock_backup: Optional[bytes] = None
+            if original_lock.exists():
+                lock_backup = original_lock.read_bytes()
+
+            pre_argv = descriptor.argv + ["-C", str(scratch), "fetch"]
+            cwd = descriptor.cwd if descriptor.cwd is not None else str(scratch)
+            subprocess.run(
+                pre_argv,
+                cwd=cwd,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            # Restore the pre-authored milpa.lock so verify checks the old pins.
+            if lock_backup is not None:
+                original_lock.write_bytes(lock_backup)
+            # Pre-phase outcome is ignored — if fetch fails, verify will also
+            # fail (no _deps/) with an appropriate error.
 
         argv = (
             descriptor.argv

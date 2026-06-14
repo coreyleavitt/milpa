@@ -1,0 +1,5 @@
+name "liba"
+kind "library"
+deps {
+    foo ">= 1.0.0"
+}

@@ -1,0 +1,4 @@
+name "bar"
+kind "library"
+version "2.0.0"
+src_dir "src"

@@ -1,0 +1,7 @@
+dep_decl {
+    dep_decl_schema_version 0
+    src_dir "src"
+    require "results" ">= 0.5.0"
+    require "stew" ">= 0.1 & < 1.0"
+    require (url)"https://github.com/status-im/nim-chronos.git" ref="v3.2.0"
+}

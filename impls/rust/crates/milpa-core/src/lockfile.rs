@@ -125,6 +125,7 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
     let mut requires: Vec<String> = Vec::new();
     let mut active_flags: Vec<String> = Vec::new();
     let mut self_mirrors: Vec<String> = Vec::new();
+    let mut dep_decl: Option<String> = None; // S6: additive dep_decl pin (§3.7)
     let mut provenances: Vec<ProvenanceRecord> = Vec::new();
 
     for child in children(node) {
@@ -147,6 +148,12 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
             "requires" => requires = string_args(child),
             "active_flags" => active_flags = string_args(child),
             "self_mirrors" => self_mirrors = string_args(child),
+            // S6: dep_decl pin — forward-compat: silently skip absent/malformed.
+            "dep_decl" => {
+                dep_decl = args(child)
+                    .first()
+                    .and_then(|e| e.value().as_string().map(str::to_string));
+            }
             "provenance" => provenances.push(parse_provenance(child, &name)?),
             _ => {}
         }
@@ -161,6 +168,7 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
         provenances,
         active_flags,
         self_mirrors,
+        dep_decl,
     })
 }
 
@@ -374,6 +382,10 @@ pub fn format_lockfile(lockfile: &Lockfile) -> String {
                 .join(" ");
             lines.push(format!("    self_mirrors {sm}"));
         }
+        // S6: emit dep_decl pin between self_mirrors and provenance (§3.7).
+        if let Some(dd) = &dep.dep_decl {
+            lines.push(format!("    dep_decl {}", kdl_str(dd)));
+        }
         for prov in &dep.provenances {
             lines.push("    provenance {".to_string());
             for field in format_provenance_fields(prov) {
@@ -564,6 +576,9 @@ fn locked_from_resolved(d: &ResolvedDep) -> LockedDep {
         // resolves a flag-carrying or self-mirroring dep.
         active_flags: Vec::new(),
         self_mirrors: Vec::new(),
+        // S6: carry dep_decl pin from the resolved dep (set only when
+        // the edge was sourced from a DepDecl artifact).
+        dep_decl: d.dep_decl.clone(),
     }
 }
 
@@ -887,6 +902,7 @@ mod tests {
                 }],
                 active_flags: vec!["ssl".into()],
                 self_mirrors: vec!["https://mirror.example/foo.git".into()],
+                dep_decl: None,
             }],
         }
     }
@@ -947,6 +963,7 @@ mod tests {
                 }],
                 active_flags: vec![],
                 self_mirrors: vec![],
+                dep_decl: None,
             }],
         };
         let text = format_lockfile(&lock);
@@ -978,6 +995,7 @@ mod tests {
                 }],
                 active_flags: vec![],
                 self_mirrors: vec![],
+                dep_decl: None,
             }],
         };
         let text = format_lockfile(&lock);
@@ -1036,6 +1054,7 @@ mod tests {
                     provenances: vec![prov.clone()],
                     active_flags: vec![],
                     self_mirrors: vec![],
+                    dep_decl: None,
                 }],
             };
             let reparsed = parse_lockfile(&format_lockfile(&lock)).unwrap();
@@ -1076,6 +1095,7 @@ mod tests {
             src_dir: "src".into(),
             requires: requires.into_iter().map(String::from).collect(),
             provenance: prov,
+            dep_decl: None,
         }
     }
 
@@ -1275,6 +1295,7 @@ mod tests {
                 provenances: vec![ProvenanceRecord::Local { path: "x".into() }],
                 active_flags: vec![],
                 self_mirrors: vec![],
+                dep_decl: None,
             }],
         };
         // foo is not on disk → "missing" divergence.

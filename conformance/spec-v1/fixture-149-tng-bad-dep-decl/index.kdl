@@ -1,0 +1,14 @@
+schema_version 1
+package "bar" {
+    version "1.0.0" {
+        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        dep_decl "sha256:../../etc/passwd"
+        dep_decl_schema_version 0
+        provenance {
+            kind "git"
+            url "https://github.com/example/bar.git"
+            ref "v1.0.0"
+            commit_sha "cafef00dcafef00dcafef00dcafef00dcafef00d"
+        }
+    }
+}

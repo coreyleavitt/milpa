@@ -241,6 +241,7 @@ fn resolved_from_locked(locked: &LockedDep) -> Result<ResolvedDep, MilpaError> {
         src_dir: locked.src_dir.clone(),
         requires: locked.requires.clone(),
         provenance,
+        dep_decl: locked.dep_decl.clone(), // S6: carry dep_decl pin through frozen path
     })
 }
 

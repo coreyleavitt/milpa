@@ -25,6 +25,7 @@ from hypothesis import strategies as st
 from milpa.errors import (
     TNG_AMBIGUOUS_NAME,
     TNG_BAD_COMMIT_SHA,
+    TNG_BAD_DEP_DECL,
     TNG_BAD_OCI_DIGEST,
     TNG_KDL_SYNTAX,
     TNG_NO_PROVENANCE,
@@ -45,6 +46,7 @@ from milpa.registry import (
     OciIndexProvenance,
     Package,
     _validate_commit_sha,
+    _validate_dep_decl_pointer,
     _validate_no_leading_dash,
     _validate_oci_digest,
     _validate_safe_name,
@@ -459,6 +461,81 @@ package "foo" {
     def test_valid_oci_digest_passes(self) -> None:
         _validate_oci_digest("sha256:" + "a" * 64)
 
+    # TNG-BAD-DEP-DECL
+    def test_bad_dep_decl_path_traversal(self) -> None:
+        """A dep_decl path-traversal payload is rejected at parse time (R5 fix)."""
+        text = """\
+schema_version 1
+package "bar" {
+    version "1.0.0" {
+        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        dep_decl "sha256:../../etc/passwd"
+        dep_decl_schema_version 0
+        provenance {
+            kind "git"
+            url "https://github.com/example/bar.git"
+            ref "v1.0.0"
+            commit_sha "cafef00dcafef00dcafef00dcafef00dcafef00d"
+        }
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_BAD_DEP_DECL
+
+    def test_bad_dep_decl_uppercase_hex(self) -> None:
+        """Uppercase hex in dep_decl is rejected (pointer MUST be lowercase)."""
+        pointer = "sha256:" + "A" * 64
+        with pytest.raises(MilpaError) as exc_info:
+            _validate_dep_decl_pointer(pointer)
+        assert exc_info.value.slug == TNG_BAD_DEP_DECL
+
+    def test_bad_dep_decl_too_short(self) -> None:
+        """A dep_decl with fewer than 64 hex chars is rejected."""
+        with pytest.raises(MilpaError) as exc_info:
+            _validate_dep_decl_pointer("sha256:abc123")
+        assert exc_info.value.slug == TNG_BAD_DEP_DECL
+
+    def test_bad_dep_decl_wrong_prefix(self) -> None:
+        """A dep_decl with wrong algorithm prefix is rejected."""
+        with pytest.raises(MilpaError) as exc_info:
+            _validate_dep_decl_pointer("md5:" + "a" * 32)
+        assert exc_info.value.slug == TNG_BAD_DEP_DECL
+
+    def test_bad_dep_decl_conformance_fixture(self) -> None:
+        """Conformance fixture-149: path-traversal dep_decl rejected as TNG-BAD-DEP-DECL."""
+        text = _fixture_index("fixture-149-tng-bad-dep-decl")
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_BAD_DEP_DECL
+
+    def test_valid_dep_decl_passes(self) -> None:
+        """A well-formed dep_decl pointer does not raise."""
+        _validate_dep_decl_pointer("sha256:" + "a" * 64)  # must not raise
+
+    def test_oci_digest_and_dep_decl_share_format_but_raise_distinct_codes(self) -> None:
+        """Both validators reject/accept identical strings but raise distinct error codes.
+
+        This asserts the SSOT invariant: _RE_SHA256_DIGEST is the shared
+        predicate; _validate_oci_digest raises TNG-BAD-OCI-DIGEST and
+        _validate_dep_decl_pointer raises TNG-BAD-DEP-DECL for the same bad input.
+        """
+        valid = "sha256:" + "a" * 64
+        # Both accept a valid sha256 pointer.
+        _validate_oci_digest(valid)         # must not raise
+        _validate_dep_decl_pointer(valid)   # must not raise
+
+        bad = "sha256:tooshort"
+        # Both reject the same bad string, but with their own distinct error code.
+        with pytest.raises(MilpaError) as exc_oci:
+            _validate_oci_digest(bad)
+        with pytest.raises(MilpaError) as exc_dep:
+            _validate_dep_decl_pointer(bad)
+        assert exc_oci.value.slug == TNG_BAD_OCI_DIGEST
+        assert exc_dep.value.slug == TNG_BAD_DEP_DECL
+        assert exc_oci.value.slug != exc_dep.value.slug  # codes are distinct
+
     # TNG-UNSAFE-OCI-FIELD
     def test_unsafe_oci_field_registry(self) -> None:
         text = _fixture_index("fixture-098-tng-unsafe-oci-field")
@@ -724,3 +801,80 @@ def test_leading_dash_always_raises(suffix: str) -> None:
     with pytest.raises(MilpaError) as exc_info:
         _validate_no_leading_dash(val, "field", TNG_UNSAFE_URL)
     assert exc_info.value.slug == TNG_UNSAFE_URL
+
+
+# ---------------------------------------------------------------------------
+# 10. S2 — dep_decl + dep_decl_schema_version on IndexVersion
+# ---------------------------------------------------------------------------
+
+_DEP_DECL_HASH = "sha256:" + "7f3c" * 15 + "7f3c"  # 64-hex total
+
+_INDEX_WITH_DEP_DECL = f"""\
+schema_version 1
+
+package "nkdl" {{
+    namespace "coreyleavitt"
+    version "0.2.0" {{
+        content_hash "sha256:{'0' * 64}"
+        dep_decl "{_DEP_DECL_HASH}"
+        dep_decl_schema_version 0
+        provenance {{
+            kind "git"
+            url "https://github.com/coreyleavitt/nkdl"
+            ref "v0.2.0"
+        }}
+    }}
+}}
+"""
+
+_INDEX_WITHOUT_DEP_DECL = """\
+schema_version 1
+
+package "nkdl" {
+    namespace "coreyleavitt"
+    version "0.2.0" {
+        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://github.com/coreyleavitt/nkdl"
+            ref "v0.2.0"
+        }
+    }
+}
+"""
+
+
+class TestS2DepDeclOnIndexVersion:
+    """S2: dep_decl + dep_decl_schema_version parsed from version nodes."""
+
+    def test_dep_decl_present_is_surfaced(self) -> None:
+        idx = parse_index(_INDEX_WITH_DEP_DECL)
+        pkg = next(p for p in idx.packages if p.name == "nkdl")
+        iv = pkg.versions[0]
+        assert iv.dep_decl == _DEP_DECL_HASH
+
+    def test_dep_decl_schema_version_present_is_surfaced(self) -> None:
+        idx = parse_index(_INDEX_WITH_DEP_DECL)
+        pkg = next(p for p in idx.packages if p.name == "nkdl")
+        iv = pkg.versions[0]
+        assert iv.dep_decl_schema_version == 0
+
+    def test_dep_decl_absent_yields_none(self) -> None:
+        idx = parse_index(_INDEX_WITHOUT_DEP_DECL)
+        pkg = next(p for p in idx.packages if p.name == "nkdl")
+        iv = pkg.versions[0]
+        assert iv.dep_decl is None
+
+    def test_dep_decl_schema_version_absent_yields_none(self) -> None:
+        idx = parse_index(_INDEX_WITHOUT_DEP_DECL)
+        pkg = next(p for p in idx.packages if p.name == "nkdl")
+        iv = pkg.versions[0]
+        assert iv.dep_decl_schema_version is None
+
+    def test_existing_fixture_still_parses_without_dep_decl(self) -> None:
+        """Existing index fixtures (no dep_decl) must stay green — forward-compat."""
+        idx = parse_index(MINIMAL_INDEX)
+        for pkg in idx.packages:
+            for iv in pkg.versions:
+                assert iv.dep_decl is None
+                assert iv.dep_decl_schema_version is None

@@ -104,6 +104,73 @@ def build_descriptors(repo_root: str | Path) -> list[ImplDescriptor]:
         # implement --certificate (wired at the Python rewrite #6, not now).
         "fixture-127-check-certificate-success",  # --certificate not in frozen Python
         "fixture-128-check-certificate-conflict",  # --certificate not in frozen Python
+        # S3b DepDecl fixtures — frozen Python does not implement DepDeclStore /
+        # DepDeclEdgeSource (wired in python-ng; lands in the Python rewrite #6).
+        "fixture-131-depdecl-hash-mismatch",
+        "fixture-132-depdecl-parse-error",
+        "fixture-133-depdecl-schema-mismatch",
+        "fixture-134-depdecl-schema-unsupported",
+        # S4-ii DepDecl when-attested fixture — frozen Python falls back to
+        # .nimble for qux (includes platform-conditional 'extra' unconditionally),
+        # but 'extra' is not in the index for the attested arm (the DepDecl arm
+        # intentionally excludes it). Frozen Python resolves from .nimble and
+        # fails with TNG-NOT-FOUND. Wired at the Python rewrite #6.
+        "fixture-137-depdecl-when-attested",
+        # S5 attestation-policy fixtures — frozen Python does not implement
+        # `attestation-policy` manifest field (→ MAN-UNKNOWN-TOP-LEVEL, fixture-140)
+        # or `--require-attested-metadata` / MILPA_REQUIRE_ATTESTED_METADATA
+        # flag/env-var (fixture-141 silently succeeds instead of raising
+        # RES-UNATTESTED-METADATA). Both wired at the Python rewrite #6.
+        "fixture-140-attestation-strict-manifest-fail",  # attestation-policy field unknown
+        "fixture-141-attestation-strict-flag-fail",       # flag/env not in frozen Python
+        # Workspace + strict attestation (§13.1 workspace rule) — frozen Python
+        # does not enforce attestation policy in the workspace resolve path
+        # (silently succeeds instead of raising RES-UNATTESTED-METADATA).
+        # Wired at the Python rewrite #6.
+        "fixture-145-ws-attestation-strict-flag-fail",    # workspace attestation not in frozen Python
+        # S6 dep_decl pin emission — frozen Python does not emit `dep_decl` in
+        # milpa.lock (DepDeclEdgeSource is python-ng only; lands at #6 rewrite).
+        # Expected lockfiles for these fixtures now include dep_decl pins.
+        "fixture-129-index-dep-decl-pointer",       # dep_decl pin not emitted by frozen Python
+        "fixture-135-depdecl-clean-attested",       # dep_decl pin not emitted by frozen Python
+        "fixture-136-depdecl-clean-fallback",       # dep_decl pin not emitted by frozen Python
+        "fixture-138-depdecl-when-fallback",        # dep_decl pin not emitted by frozen Python
+        # S6 verify fixtures — frozen Python's `milpa verify` does not implement
+        # dep_decl edge checking (wired at the Python rewrite #6).
+        "fixture-142-verify-edge-mismatch",         # dep_decl edge check not in frozen Python
+        "fixture-143-verify-pin-missing",           # dep_decl edge check not in frozen Python
+        "fixture-148-verify-edge-mismatch-manifest-strict",  # manifest attestation-policy "strict" not in frozen Python
+        # S7 TNG-DEPDECL-FETCH-FAILED strict fixture — frozen Python does not
+        # implement FileDepDeclStore or strict attestation policy
+        # (wired at the Python rewrite #6, not now).
+        "fixture-144-depdecl-fetch-failed",         # FileDepDeclStore not in frozen Python
+        # S7 TNG-DEPDECL-FETCH-FAILED non-strict fixture — frozen Python does not
+        # wire MILPA_DEP_DECL_DIR (FileDepDeclStore absent → fallback happens
+        # unconditionally, so expected lockfile has no dep_decl pin, which frozen
+        # Python would also produce — but the expected _deps_structure.txt uses CAS
+        # symlinks which frozen Python does not emit). Wired at the Python rewrite #6.
+        "fixture-146-depdecl-fetch-failed-nonstrict",  # FileDepDeclStore not in frozen Python
+        # R3 overflow fixture — frozen Python does not implement DepDeclEdgeSource
+        # (dep_decl field in index ignored by frozen Python → resolves successfully
+        # instead of raising TNG-DEPDECL-SCHEMA-UNSUPPORTED). Wired at #6 rewrite.
+        "fixture-147-depdecl-schema-unsupported-overflow",  # DepDeclEdgeSource not in frozen Python
+        # R5 security fix — frozen Python's tianguis_client.py does not validate
+        # dep_decl pointer format at parse time (no _validate_dep_decl_pointer
+        # call). The fix lives in python-ng registry.py. Frozen Python silently
+        # treats the malformed pointer as None (string parse falls back) and
+        # resolves successfully instead of raising TNG-BAD-DEP-DECL.
+        # Wired at the python-ng rewrite (#6).
+        "fixture-149-tng-bad-dep-decl",  # dep_decl format validation not in frozen Python
+        # --certificate + strict attestation (§2.5 + §13.1): frozen Python does not
+        # implement --certificate (CLI binary only, wired at the Python rewrite #6)
+        # and does not enforce MILPA_REQUIRE_ATTESTED_METADATA, so the cert path
+        # would silently succeed instead of raising RES-UNATTESTED-METADATA.
+        # Rust reference impl exercises this; wired at the Python rewrite (#6).
+        "fixture-150-check-certificate-strict-attestation-fail",
+        # Workspace verify + member strict (§13.1 workspace rule, Finding 2):
+        # frozen Python does not consult member attestation-policy in `milpa verify`
+        # (the fix is python-ng; wired at the Python rewrite #6).
+        "fixture-151-ws-verify-edge-mismatch-member-strict",
     }
 
     python_desc = ImplDescriptor(
@@ -178,7 +245,14 @@ def build_descriptors(repo_root: str | Path) -> list[ImplDescriptor]:
         # MILPA-INTERNAL and exit 1.  The expected outputs require a fully
         # implemented add/remove/update with mocked transport + KDL 2.0 emitter
         # (both from the Python rewrite #6 / slice 10e).
-        python_ng_known_failing: set[str] = {}
+        #
+        # --certificate fixtures (127/128/150): python-ng does not implement
+        # --certificate yet (CLI binary only; wired in a future slice).
+        python_ng_known_failing: set[str] = {
+            "fixture-127-check-certificate-success",
+            "fixture-128-check-certificate-conflict",
+            "fixture-150-check-certificate-strict-attestation-fail",
+        }
 
         python_ng_desc = ImplDescriptor(
             name="python-ng",

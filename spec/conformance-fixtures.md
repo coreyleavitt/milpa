@@ -137,6 +137,8 @@ fixture-NNN-<slug>/
   cas-seed/                    # input (optional): source trees to pre-populate CAS (frozen cmd)
     <name>/                    # one subdirectory per dep to seed
       <file> ...               # source tree bytes (identity computed from these bytes)
+  dep-decl/                    # input (optional): DepDecl artifact dir (see §2.11)
+    <sha256_hex>.kdl           # one DepDecl artifact per named-dep version-node pointer
   mocked-fetches/              # input: per-URL fake-fetcher returns
     <url-encoded-key>/
       sha                      # git commit SHA (40 hex chars)
@@ -662,6 +664,84 @@ the CAS-admission and symlink-creation steps defined in `spec/identity.md`
 > adapter and will be corrected (by using `shutil.copytree` + `admit`) in a
 > later revision.
 
+### 2.11  `dep-decl/` — DepDecl artifact directory (optional)
+
+`dep-decl/` contains pre-authored DepDecl artifact files that substitute for
+the production `HttpDepDeclStore`'s network fetches during conformance testing.
+It is a **fixture artifact directory** — not a control file — and is therefore
+copied verbatim into the per-run scratch directory (alongside `mocked-fetches/`,
+`cas-seed/`, and other artifact inputs) by `_copy_fixture_inputs`.
+
+> NORMATIVE: `dep-decl/` is a **fixture artifact dir**, not a control
+> file. It MUST be copied verbatim into the per-run scratch directory,
+> exactly like `mocked-fetches/`. It MUST NOT be treated as a harness
+> control input (i.e., it MUST appear in the copy-all set, not in the
+> `_CONTROL_FILES` exclusion set).
+
+> NORMATIVE: When `dep-decl/` is present in the scratch directory after
+> copying, the runner MUST set the environment variable
+> `MILPA_DEP_DECL_DIR=<scratch>/dep-decl/` in the subprocess environment
+> — mirroring exactly how `MILPA_MOCKED_FETCHES` is set when
+> `mocked-fetches/` is present and how `MILPA_INDEX_URL` is set when
+> `index.kdl` is present. The value MUST be the resolved absolute path to
+> `scratch/dep-decl/` (no trailing slash, per POSIX path conventions).
+
+> NORMATIVE: When `dep-decl/` is **absent** from the fixture, the runner
+> MUST NOT set `MILPA_DEP_DECL_DIR` in the subprocess environment. In
+> particular, a `MILPA_DEP_DECL_DIR` present in the host environment
+> MUST be stripped (it is a `MILPA_*` variable; the runner already strips
+> all `MILPA_*` from the host environment before constructing the
+> subprocess env — this rule is a consequence of that invariant, not an
+> additional rule).
+
+#### 2.11.1  Artifact file naming
+
+> NORMATIVE: Each file inside `dep-decl/` MUST be named
+> `<sha256_hex>.kdl`, where `<sha256_hex>` is the 64-character lowercase
+> hex encoding of the artifact's sha256 digest — i.e., the `dep_decl`
+> pointer recorded in the tianguis index version-node. The filename is
+> the key the `FileDepDeclStore` uses to look up an artifact given a
+> pointer from the index.
+
+> NOTE: The sha256 digest naming mirrors how CAS entries are named
+> (`spec/identity.md` §3.1: `<algo>/<hex>/`). The filename is derived
+> from the artifact bytes themselves: `sha256(artifact_bytes).hexdigest()`.
+> Fixture authors generate the filename by running `dep_decl_hash()` from
+> `harness/dep_decl.py` over the artifact bytes and stripping the
+> `sha256:` prefix.
+
+#### 2.11.2  Artifact file contents
+
+> NORMATIVE: Each `<sha256_hex>.kdl` file MUST be a valid DepDecl
+> artifact as specified in `spec/dep-decl.md` §2. The `FileDepDeclStore`
+> (S3b) MUST verify `sha256(bytes) == sha256_hex` before parsing — a
+> mismatch MUST raise `TNG-DEPDECL-HASH-MISMATCH` (spec/errors.md).
+
+> NOTE: The DepDecl artifact format is specified in `spec/dep-decl.md`.
+> Fixture authors generate conformant artifact bytes using
+> `make_dep_decl_fixture(EdgeSet(...))` from `harness/dep_decl.py` — the
+> same S0 helper used by the golden vector. The resulting bytes are
+> written verbatim into `dep-decl/<sha256_hex>.kdl`, with the filename
+> computed from `dep_decl_hash(bytes)[len("sha256:"):]`.
+
+#### 2.11.3  Relationship to `MILPA_MOCKED_FETCHES`
+
+`dep-decl/` and `mocked-fetches/` are **orthogonal fixture slots**: a
+fixture may contain both (when testing named deps that require both a
+mocked git/tarball fetch AND a DepDecl artifact), one or neither.
+
+> NORMATIVE: A fixture that exercises named-dep DepDecl resolution
+> MUST include `dep-decl/` with the relevant artifacts AND `index.kdl`
+> with the version-node `dep_decl` pointer. It MAY also include
+> `mocked-fetches/` for URL deps declared by the DepDecl's `require`
+> edges.
+
+> NOTE: S3a (this slice) adds the harness plumbing only. The actual
+> `FileDepDeclStore` behavior — swap-on-env-var, sha256 verify, KDL
+> parse, error codes — is implemented in S3b. Until S3b lands, setting
+> `MILPA_DEP_DECL_DIR` has no effect on either impl; the env var is
+> injected by the harness runner but is silently ignored by the impls.
+
 ---
 
 ## 3  Error fixtures
@@ -786,6 +866,63 @@ emitting `milpa.lock` and `nim.cfg`.
 > - `--path:"src"` self-path line — fixture-116: root manifest declares
 >   `src_dir "src"`; the runner now passes `self_src_dir` to `format_nimcfg()`,
 >   producing a leading self-path line before the dep paths.
+>
+> The following codes are **newly minted** for the content-addressed-metadata RFC
+> (S0–S7) and are covered by fixtures added in that revision:
+>
+> - `TNG-DEPDECL-HASH-MISMATCH` — fixture-131: `dep-decl/` artifact file is
+>   corrupted (filename sha256 ≠ sha256 of content); runner sets
+>   `MILPA_DEP_DECL_DIR` and the FileDepDeclStore rejects the mismatch.
+> - `TNG-DEPDECL-PARSE-ERROR` — fixture-132: `dep-decl/` artifact is not valid
+>   KDL 2.0 / dep_decl document shape; hash matches but parse fails.
+> - `TNG-DEPDECL-SCHEMA-MISMATCH` — fixture-133: artifact's embedded
+>   `dep_decl_schema_version` disagrees with the index pointer's version.
+> - `TNG-DEPDECL-SCHEMA-UNSUPPORTED` — fixture-134: artifact declares a
+>   `dep_decl_schema_version` higher than the implementation's maximum.
+> - `TNG-DEPDECL-FETCH-FAILED` (strict) — fixture-144: `dep-decl/` directory
+>   is present but empty (no artifact file); `MILPA_REQUIRE_ATTESTED_METADATA=1`
+>   forces a hard failure (strict policy, no nimble fallback).
+> - `RES-UNATTESTED-METADATA` — fixture-140 (manifest `attestation-policy
+>   "strict"`): named dep has no `dep_decl` pointer in the index → hard fail.
+>   fixture-141 (`MILPA_REQUIRE_ATTESTED_METADATA=1` env flag): same fail via
+>   the CLI flag path.
+> - `VERIFY-EDGE-MISMATCH` — fixture-142: `milpa verify` detects that the
+>   `dep_decl` hash recorded in `milpa.lock` differs from the live index pointer.
+> - `LOCK-DEPDECL-PIN-MISSING` — fixture-143: `milpa verify` detects that a
+>   `dep_decl` pin in `milpa.lock` has no corresponding pointer in the live index.
+
+### 4.1  Imperative cross-fixture tests (harness-level)
+
+Some conformance properties cannot be expressed as a single-fixture expected/
+comparison — they require comparing the outputs of **two different fixtures**
+against each other (a capability the per-fixture corpus runner does not provide).
+These properties are expressed as **imperative pytest tests in `harness/`**,
+not as declarative corpus directives (no new fixture-metadata format).
+
+The first imperative cross-fixture capability is the **S4-ii differential gate**
+(DepDecl translation fidelity), added in `harness/test_dep_decl.py`:
+
+> **DG1 (clean pair, fixture-135 vs fixture-136):** A package whose `.nimble`
+> is "clean" (no `when` block) is resolved two ways: once via an attested
+> DepDecl pointer in the index (fixture-135) and once with no DepDecl pointer
+> so the resolver falls back to the `.nimble` line-scan (fixture-136). The
+> two resulting `milpa.lock` files MUST be byte-identical. This proves the
+> DepDecl translation is faithful for well-formed `.nimble` inputs.
+>
+> **DG2 (when-block pair, fixture-137 vs fixture-138):** A package whose
+> `.nimble` has a `when` block is resolved via the attested DepDecl (fixture-137,
+> tianguis excluded the platform-conditional dep) and via the `.nimble` fallback
+> (fixture-138, which unconditionally includes the when-block dep). The two
+> lockfiles MAY differ; the attested arm (fixture-137) is authoritative and is
+> asserted against its own `expected/`. This proves DepDecl authority over the
+> `.nimble` heuristic for packages with conditional requires.
+
+> NOTE: Both arms of each pair are **independently valid corpus fixtures** —
+> they appear in `conformance/spec-v1/` and the normal corpus runner exercises
+> them individually. Only the **cross-fixture equality / divergence** assertion
+> lives in the imperative test. This separation keeps the corpus fixture format
+> simple (no new metadata directives) while enabling the novel cross-fixture
+> comparison capability.
 
 ---
 

@@ -62,3 +62,25 @@ PROVENANCE_CONFLICT = register(
         "(it is not declared in deps, dev-deps, or overrides)."
     ),
 )
+
+# ---------------------------------------------------------------------------
+# Attestation policy (rfc-content-addressed-metadata, S5)
+# ---------------------------------------------------------------------------
+
+UNATTESTED_METADATA = register(
+    slug="RES-UNATTESTED-METADATA", category=_CAT,
+    description=(
+        "Under strict attestation policy, one or more resolved deps used "
+        "un-attested `.nimble` metadata (no `dep_decl` pointer in the index, "
+        "or the `dep_decl` artifact was unreachable and the policy does not "
+        "allow fallback)."
+    ),
+    when=(
+        "`resolve()` completes but the effective attestation policy is strict "
+        "(either `attestation-policy \"strict\"` in `milpa.kdl` or "
+        "`--require-attested-metadata` on the CLI) and at least one dep's edges "
+        "came from the `NimbleFallback` source (no index-attested DepDecl). "
+        "Under non-strict (default permissive) policy, a summary warning is "
+        "emitted to stderr instead."
+    ),
+)

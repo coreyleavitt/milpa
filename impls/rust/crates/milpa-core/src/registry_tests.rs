@@ -225,6 +225,8 @@ fn ver(v: &str, hash: &str, provs: Vec<Provenance>) -> IndexVersion {
         version: v.into(),
         content_hash: hash.into(),
         provenances: provs,
+        dep_decl: None,
+        dep_decl_schema_version: None,
     }
 }
 
@@ -294,4 +296,75 @@ fn resolve_returns_satisfying_newest_first() {
     let got = idx.resolve_named_all("bar", &full(), None).unwrap();
     assert_eq!(got.len(), 2);
     assert_eq!(got[0].version, "2.0.0");
+}
+
+// ---------------------------------------------------------------------------
+// S2 — dep_decl + dep_decl_schema_version on IndexVersion
+// ---------------------------------------------------------------------------
+
+const DEP_DECL_HASH: &str =
+    "sha256:7f3c7f3c7f3c7f3c7f3c7f3c7f3c7f3c7f3c7f3c7f3c7f3c7f3c7f3c7f3c7f3c";
+
+fn index_with_dep_decl() -> String {
+    format!(
+        "schema_version 1\n\
+         package \"nkdl\" {{\n\
+         \x20   namespace \"coreyleavitt\"\n\
+         \x20   version \"0.2.0\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       dep_decl \"{DEP_DECL_HASH}\"\n\
+         \x20       dep_decl_schema_version 0\n\
+         \x20       provenance {{\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://github.com/coreyleavitt/nkdl\"\n\
+         \x20           ref \"v0.2.0\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n"
+    )
+}
+
+fn index_without_dep_decl() -> String {
+    format!(
+        "schema_version 1\n\
+         package \"nkdl\" {{\n\
+         \x20   namespace \"coreyleavitt\"\n\
+         \x20   version \"0.2.0\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://github.com/coreyleavitt/nkdl\"\n\
+         \x20           ref \"v0.2.0\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n"
+    )
+}
+
+#[test]
+fn s2_dep_decl_present_is_surfaced() {
+    let idx = Index::parse(&index_with_dep_decl()).unwrap();
+    let iv = &idx.packages[0].versions[0];
+    assert_eq!(iv.dep_decl.as_deref(), Some(DEP_DECL_HASH));
+}
+
+#[test]
+fn s2_dep_decl_schema_version_present_is_surfaced() {
+    let idx = Index::parse(&index_with_dep_decl()).unwrap();
+    let iv = &idx.packages[0].versions[0];
+    assert_eq!(iv.dep_decl_schema_version, Some(0));
+}
+
+#[test]
+fn s2_dep_decl_absent_yields_none() {
+    let idx = Index::parse(&index_without_dep_decl()).unwrap();
+    let iv = &idx.packages[0].versions[0];
+    assert!(iv.dep_decl.is_none());
+}
+
+#[test]
+fn s2_dep_decl_schema_version_absent_yields_none() {
+    let idx = Index::parse(&index_without_dep_decl()).unwrap();
+    let iv = &idx.packages[0].versions[0];
+    assert!(iv.dep_decl_schema_version.is_none());
 }

@@ -240,6 +240,46 @@ reference captured at publish time. Fields:
 > for this forward-compat requirement. It verifies that `IndexVersion` has no
 > `rekor` attribute after parsing.
 
+**`dep_decl`** (child node, string, optional) — a `sha256:<64-hex>` hash
+pointer to the DepDecl artifact for this version. The DepDecl artifact encodes
+the package's dependency declarations as a content-addressed blob, enabling
+verifiable dependency graphs without re-fetching source (see
+`rfc-content-addressed-metadata.md` §3 and `spec/dep-decl.md`).
+
+> NORMATIVE: When present, `dep_decl` MUST be a string in exactly
+> `sha256:[0-9a-f]{64}` form (the `sha256:` prefix followed by exactly 64
+> lowercase hexadecimal characters). A conformant milpa reader validates this
+> format at index-parse time and raises `TNG-BAD-DEP-DECL` for any value that
+> does not match — including path-traversal payloads such as
+> `sha256:../../etc/passwd`, wrong-length hex, uppercase hex, or a different
+> algorithm prefix. Validation MUST occur at the parse boundary, before the
+> value can reach any downstream consumer (filesystem path, URL path segment,
+> or hash-verify site). A conformant reader surfaces the validated value on the
+> in-memory `IndexVersion` type. It does NOT verify the hash, fetch the
+> artifact, or check schema-version agreement during index parsing — those are
+> resolver operations performed only when the version is selected (S3b and
+> later slices of the DepDecl RFC). When absent, `dep_decl` is `None` on the
+> in-memory type (forward-compat: old index entries omit it). A malformed
+> non-string value (e.g. an integer or boolean) MUST be treated with the same
+> robustness posture the parser already applies to other optional string
+> children (`attestation`, `signed_by`): silently skip / surface as absent.
+> Conformance gate: `conformance/spec-v1/fixture-149-tng-bad-dep-decl`.
+
+**`dep_decl_schema_version`** (child node, integer, optional) — the DepDecl
+schema version integer that produced the `dep_decl` hash (v0 = `{ requires,
+src_dir }`; see `rfc-content-addressed-metadata.md §3.2.1`). When present,
+must be a non-negative integer. When absent, `None` on the in-memory type.
+
+> NORMATIVE: These two fields are **forward-compat optional** under the current
+> index `schema_version`. Their addition does NOT bump the index `schema_version`
+> (that bump is deferred per `rfc-content-addressed-metadata.md §3.9 F3`). An
+> index entry that carries `dep_decl` and `dep_decl_schema_version` is valid
+> under the current schema version; a reader that does not yet use these fields
+> MUST silently skip them without error. An index entry that omits them is also
+> valid. Conformance gate: `conformance/spec-v1/fixture-129-index-dep-decl-pointer`
+> exercises a version node with both fields set; both impls must parse it and
+> produce the same resolution output as without the fields.
+
 ### 3.3  Provenance record shapes (index form)
 
 Index provenance records use the same kind-set and field shapes as the manifest
@@ -318,13 +358,14 @@ strings passing these validators are safe.
 | `TNG-UNSAFE-REF` | `ref` in a `git` provenance | Any value beginning with `-` — prevents flag injection into git subprocess argv |
 | `TNG-BAD-OCI-DIGEST` | `digest` in an `oci` provenance | Any value not matching `^sha256:[0-9a-f]{64}$` — enforces OCI digest format, prevents malformed reference string in oras argv |
 | `TNG-UNSAFE-OCI-FIELD` | `registry` and `repository` in an `oci` provenance | Any value beginning with `-` — prevents flag injection into oras subprocess argv |
+| `TNG-BAD-DEP-DECL` | `dep_decl` in a version node | Any value not matching `^sha256:[0-9a-f]{64}$` — prevents path-traversal (e.g. `sha256:../../etc/passwd`) reaching `FileDepDeclStore` (filesystem path) or `HttpDepDeclStore` (URL path segment) |
 | `TNG-SCHEMA-UNKNOWN` | Top-level `schema_version` integer | Any value strictly greater than `TIANGUIS_INDEX_SCHEMA_VERSION` |
 
-> NORMATIVE: All six field-level validators (`TNG-UNSAFE-NAME`,
+> NORMATIVE: All seven field-level validators (`TNG-UNSAFE-NAME`,
 > `TNG-BAD-COMMIT-SHA`, `TNG-UNSAFE-URL`, `TNG-UNSAFE-REF`,
-> `TNG-BAD-OCI-DIGEST`, `TNG-UNSAFE-OCI-FIELD`) MUST be applied during
-> `parse_index`, not deferred to fetch time. An index entry that fails
-> validation MUST raise the corresponding error immediately.
+> `TNG-BAD-OCI-DIGEST`, `TNG-UNSAFE-OCI-FIELD`, `TNG-BAD-DEP-DECL`) MUST be
+> applied during `parse_index`, not deferred to fetch time. An index entry that
+> fails validation MUST raise the corresponding error immediately.
 
 > NOTE: The `is_safe_name` predicate is also used by the resolver's
 > URL-derived name check (`_name_from_url`) — one predicate, two call sites.

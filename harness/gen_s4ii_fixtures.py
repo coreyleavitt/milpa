@@ -1,0 +1,655 @@
+"""S4-ii fixture generator — creates twin pairs for the differential gate.
+
+Run once to produce the four fixture directories:
+  fixture-135-depdecl-clean-attested
+  fixture-136-depdecl-clean-fallback
+  fixture-137-depdecl-when-attested
+  fixture-138-depdecl-when-fallback
+
+Do NOT import this module from test code; it is a one-shot generator for
+the committed fixture corpus.  The generator is kept in harness/ for
+provenance, but the canonical artifact is the committed fixture directory.
+
+Spec authority: rfc-content-addressed-metadata.md §S4-ii.
+"""
+
+from __future__ import annotations
+
+import shutil
+import sys
+from pathlib import Path
+
+# Allow running from repo root without installation.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from harness.dep_decl import EdgeSet, NamedRequire, dep_decl_hash, make_dep_decl_fixture
+
+# ---------------------------------------------------------------------------
+# Constants (pre-computed; verified by test_dep_decl.py DG1-DG7)
+# ---------------------------------------------------------------------------
+
+SPEC_V1 = _REPO_ROOT / "conformance" / "spec-v1"
+
+# .nim source file contents (used in content/ subdirs of mocked-fetches).
+QUX_NIM = "# qux library\nproc quxFunc*() = discard\n"
+BAR_NIM = "# bar library\nproc barFunc*() = discard\n"
+EXTRA_NIM = "# extra library\nproc extraFunc*() = discard\n"
+
+# Git commit SHAs for mocked fetches.
+QUX_SHA = "d00dd00dd00dd00dd00dd00dd00dd00dd00dd00d"
+BAR_SHA = "cafef00dcafef00dcafef00dcafef00dcafef00d"
+EXTRA_SHA = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeef"
+
+# Git URLs + refs.
+QUX_URL = "https://github.com/example/qux.git"
+QUX_REF = "v1.0.0"
+BAR_URL = "https://github.com/example/bar.git"
+BAR_REF = "v2.0.0"
+EXTRA_URL = "https://github.com/example/extra.git"
+EXTRA_REF = "v1.0.0"
+
+# Content hashes (source trees including .nimble — verified by running
+# milpa.identity.compute_content_hash on identical in-memory trees).
+#
+# qux-clean: qux.nim + qux.nimble (no when block)
+QUX_CLEAN_IDENTITY = "sha256:89f8163a90b0fec08f2a59c502ecabc053d75fa53363aa7bb9f51c9c82abf654"
+# qux-when: qux.nim + qux.nimble (with when block — different .nimble → different hash)
+QUX_WHEN_IDENTITY = "sha256:82240c317c9071f232849a5e525eb27c1e8113d05fa1db02da6f690652f0e279"
+# bar: bar.nim + bar.nimble (same across all fixtures — matches fixture-129)
+BAR_IDENTITY = "sha256:94103e1c378d5b8e034414bf69bfa128e780407aa36276f8b3dd395c1e9f4468"
+# extra: extra.nim + extra.nimble
+EXTRA_IDENTITY = "sha256:2689ab5d202e9403c19c6f8b1488c746ad755e16e16d165537390eae192688b4"
+
+# DepDecl artifact bytes (canonical_serialize — verified by make_dep_decl_fixture).
+QUX_CLEAN_DD_ES = EdgeSet(
+    requires=[NamedRequire("bar", ">= 2.0.0")],
+    src_dir="src",
+)
+# qux when-attested: DepDecl only includes bar (tianguis excluded platform-specific dep)
+QUX_WHEN_ATTEST_DD_ES = EdgeSet(
+    requires=[NamedRequire("bar", ">= 2.0.0")],
+    src_dir="src",
+)
+BAR_DD_ES = EdgeSet(requires=[], src_dir="src")
+EXTRA_DD_ES = EdgeSet(requires=[], src_dir="src")
+
+QUX_CLEAN_DD = make_dep_decl_fixture(QUX_CLEAN_DD_ES)
+QUX_WHEN_ATTEST_DD = make_dep_decl_fixture(QUX_WHEN_ATTEST_DD_ES)
+BAR_DD = make_dep_decl_fixture(BAR_DD_ES)
+EXTRA_DD = make_dep_decl_fixture(EXTRA_DD_ES)
+
+QUX_CLEAN_DD_HASH = dep_decl_hash(QUX_CLEAN_DD)
+QUX_WHEN_ATTEST_DD_HASH = dep_decl_hash(QUX_WHEN_ATTEST_DD)
+BAR_DD_HASH = dep_decl_hash(BAR_DD)
+EXTRA_DD_HASH = dep_decl_hash(EXTRA_DD)
+
+# .nimble file contents — used verbatim in mocked-fetches/<key>/<name>.nimble
+QUX_NIMBLE_CLEAN = """\
+# Package
+version = "1.0.0"
+author = "example"
+description = "qux"
+license = "MIT"
+srcDir = "src"
+
+# Deps
+requires "bar >= 2.0.0"
+"""
+
+QUX_NIMBLE_WHEN = """\
+# Package
+version = "1.0.0"
+author = "example"
+description = "qux"
+license = "MIT"
+srcDir = "src"
+
+# Deps
+requires "bar >= 2.0.0"
+when defined(linux):
+  requires "extra >= 1.0.0"
+"""
+
+BAR_NIMBLE = """\
+# Package
+version = "2.0.0"
+author = "example"
+description = "bar"
+license = "MIT"
+srcDir = "src"
+"""
+
+EXTRA_NIMBLE = """\
+# Package
+version = "1.0.0"
+author = "example"
+description = "extra"
+license = "MIT"
+srcDir = "src"
+"""
+
+# mocked-fetches key encoding (url_key rule: replace non-[A-Za-z0-9._-] with _)
+# https://github.com/example/qux.git@v1.0.0 → https___github.com_example_qux.git@v1.0.0
+QUX_KEY = "https___github.com_example_qux.git@v1.0.0"
+BAR_KEY = "https___github.com_example_bar.git@v2.0.0"
+EXTRA_KEY = "https___github.com_example_extra.git@v1.0.0"
+
+
+# ---------------------------------------------------------------------------
+# Lockfile templates (canonical format — verified against resolver output)
+# ---------------------------------------------------------------------------
+
+def _lock_clean() -> str:
+    """Expected lockfile for both arms of the clean pair.
+
+    qux (requires bar) + bar (no requires) — identical regardless of
+    whether edges came from DepDecl or .nimble fallback.
+    """
+    return (
+        "// generated by milpa; reproducible build snapshot\n"
+        "version 1\n"
+        "strategy \"maxver\"\n"
+        "\n"
+        f'dep "bar" {{\n'
+        f'    identity "{BAR_IDENTITY}"\n'
+        f'    version "2.0.0"\n'
+        f'    src_dir "src"\n'
+        f'    requires\n'
+        f'    provenance {{\n'
+        f'        kind "git"\n'
+        f'        url "{BAR_URL}"\n'
+        f'        ref "{BAR_REF}"\n'
+        f'        commit_sha "{BAR_SHA}"\n'
+        f'    }}\n'
+        f'}}\n'
+        f'\n'
+        f'dep "qux" {{\n'
+        f'    identity "{QUX_CLEAN_IDENTITY}"\n'
+        f'    version "1.0.0"\n'
+        f'    src_dir "src"\n'
+        f'    requires "bar"\n'
+        f'    provenance {{\n'
+        f'        kind "git"\n'
+        f'        url "{QUX_URL}"\n'
+        f'        ref "{QUX_REF}"\n'
+        f'        commit_sha "{QUX_SHA}"\n'
+        f'    }}\n'
+        f'}}\n'
+    )
+
+
+def _lock_when_attested() -> str:
+    """Expected lockfile for the when-block pair attested arm.
+
+    qux (DepDecl: requires only bar) + bar (no requires).
+    The DepDecl excluded the platform-specific 'extra' dep.
+    """
+    return (
+        "// generated by milpa; reproducible build snapshot\n"
+        "version 1\n"
+        "strategy \"maxver\"\n"
+        "\n"
+        f'dep "bar" {{\n'
+        f'    identity "{BAR_IDENTITY}"\n'
+        f'    version "2.0.0"\n'
+        f'    src_dir "src"\n'
+        f'    requires\n'
+        f'    provenance {{\n'
+        f'        kind "git"\n'
+        f'        url "{BAR_URL}"\n'
+        f'        ref "{BAR_REF}"\n'
+        f'        commit_sha "{BAR_SHA}"\n'
+        f'    }}\n'
+        f'}}\n'
+        f'\n'
+        f'dep "qux" {{\n'
+        f'    identity "{QUX_WHEN_IDENTITY}"\n'
+        f'    version "1.0.0"\n'
+        f'    src_dir "src"\n'
+        f'    requires "bar"\n'
+        f'    provenance {{\n'
+        f'        kind "git"\n'
+        f'        url "{QUX_URL}"\n'
+        f'        ref "{QUX_REF}"\n'
+        f'        commit_sha "{QUX_SHA}"\n'
+        f'    }}\n'
+        f'}}\n'
+    )
+
+
+def _lock_when_fallback() -> str:
+    """Expected lockfile for the when-block pair fallback arm.
+
+    qux (.nimble unconditionally includes bar + extra from when-block) +
+    bar (no requires) + extra (no requires).
+    """
+    return (
+        "// generated by milpa; reproducible build snapshot\n"
+        "version 1\n"
+        "strategy \"maxver\"\n"
+        "\n"
+        f'dep "bar" {{\n'
+        f'    identity "{BAR_IDENTITY}"\n'
+        f'    version "2.0.0"\n'
+        f'    src_dir "src"\n'
+        f'    requires\n'
+        f'    provenance {{\n'
+        f'        kind "git"\n'
+        f'        url "{BAR_URL}"\n'
+        f'        ref "{BAR_REF}"\n'
+        f'        commit_sha "{BAR_SHA}"\n'
+        f'    }}\n'
+        f'}}\n'
+        f'\n'
+        f'dep "extra" {{\n'
+        f'    identity "{EXTRA_IDENTITY}"\n'
+        f'    version "1.0.0"\n'
+        f'    src_dir "src"\n'
+        f'    requires\n'
+        f'    provenance {{\n'
+        f'        kind "git"\n'
+        f'        url "{EXTRA_URL}"\n'
+        f'        ref "{EXTRA_REF}"\n'
+        f'        commit_sha "{EXTRA_SHA}"\n'
+        f'    }}\n'
+        f'}}\n'
+        f'\n'
+        f'dep "qux" {{\n'
+        f'    identity "{QUX_WHEN_IDENTITY}"\n'
+        f'    version "1.0.0"\n'
+        f'    src_dir "src"\n'
+        f'    requires "bar" "extra"\n'
+        f'    provenance {{\n'
+        f'        kind "git"\n'
+        f'        url "{QUX_URL}"\n'
+        f'        ref "{QUX_REF}"\n'
+        f'        commit_sha "{QUX_SHA}"\n'
+        f'    }}\n'
+        f'}}\n'
+    )
+
+
+# ---------------------------------------------------------------------------
+# nim.cfg templates (format verified against Rust impl output)
+# ---------------------------------------------------------------------------
+
+_NIMCFG_HEADER = (
+    "# generated by milpa; do not edit\n"
+    "# manifest: milpa.kdl\n"
+    "# lockfile: milpa.lock\n"
+    "\n"
+)
+
+
+def _nimcfg_clean() -> str:
+    """nim.cfg for clean pair (both arms)."""
+    return (
+        _NIMCFG_HEADER
+        + '--path:"_deps/bar/src"\n'
+        + '--path:"_deps/qux/src"\n'
+    )
+
+
+def _nimcfg_when_attested() -> str:
+    """nim.cfg for when-block attested arm (bar + qux only)."""
+    return (
+        _NIMCFG_HEADER
+        + '--path:"_deps/bar/src"\n'
+        + '--path:"_deps/qux/src"\n'
+    )
+
+
+def _nimcfg_when_fallback() -> str:
+    """nim.cfg for when-block fallback arm (bar + extra + qux)."""
+    return (
+        _NIMCFG_HEADER
+        + '--path:"_deps/bar/src"\n'
+        + '--path:"_deps/extra/src"\n'
+        + '--path:"_deps/qux/src"\n'
+    )
+
+
+# ---------------------------------------------------------------------------
+# _deps_structure.txt templates (format: "<name> -> <CAS_ROOT>/sha256/<hex>/")
+# ---------------------------------------------------------------------------
+
+def _deps_structure_clean() -> str:
+    return (
+        f"bar -> <CAS_ROOT>/sha256/{BAR_IDENTITY[len('sha256:'):]}/\n"
+        f"qux -> <CAS_ROOT>/sha256/{QUX_CLEAN_IDENTITY[len('sha256:'):]}/\n"
+    )
+
+
+def _deps_structure_when_attested() -> str:
+    return (
+        f"bar -> <CAS_ROOT>/sha256/{BAR_IDENTITY[len('sha256:'):]}/\n"
+        f"qux -> <CAS_ROOT>/sha256/{QUX_WHEN_IDENTITY[len('sha256:'):]}/\n"
+    )
+
+
+def _deps_structure_when_fallback() -> str:
+    return (
+        f"bar -> <CAS_ROOT>/sha256/{BAR_IDENTITY[len('sha256:'):]}/\n"
+        f"extra -> <CAS_ROOT>/sha256/{EXTRA_IDENTITY[len('sha256:'):]}/\n"
+        f"qux -> <CAS_ROOT>/sha256/{QUX_WHEN_IDENTITY[len('sha256:'):]}/\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Index KDL templates
+# ---------------------------------------------------------------------------
+
+def _index_qux_bar_with_dep_decl(
+    *,
+    qux_identity: str,
+    qux_dd_hash: str,
+    include_extra: bool = False,
+) -> str:
+    """Index with both qux and bar, both carrying dep_decl pointers."""
+    extra_block = ""
+    if include_extra:
+        extra_block = (
+            f'package "extra" {{\n'
+            f'    version "1.0.0" {{\n'
+            f'        content_hash "{EXTRA_IDENTITY}"\n'
+            f'        dep_decl "{EXTRA_DD_HASH}"\n'
+            f'        dep_decl_schema_version 0\n'
+            f'        provenance {{\n'
+            f'            kind "git"\n'
+            f'            url "{EXTRA_URL}"\n'
+            f'            ref "{EXTRA_REF}"\n'
+            f'            commit_sha "{EXTRA_SHA}"\n'
+            f'        }}\n'
+            f'    }}\n'
+            f'}}\n'
+        )
+    return (
+        "schema_version 1\n"
+        f'package "bar" {{\n'
+        f'    version "2.0.0" {{\n'
+        f'        content_hash "{BAR_IDENTITY}"\n'
+        f'        dep_decl "{BAR_DD_HASH}"\n'
+        f'        dep_decl_schema_version 0\n'
+        f'        provenance {{\n'
+        f'            kind "git"\n'
+        f'            url "{BAR_URL}"\n'
+        f'            ref "{BAR_REF}"\n'
+        f'            commit_sha "{BAR_SHA}"\n'
+        f'        }}\n'
+        f'    }}\n'
+        f'}}\n'
+        f'{extra_block}'
+        f'package "qux" {{\n'
+        f'    version "1.0.0" {{\n'
+        f'        content_hash "{qux_identity}"\n'
+        f'        dep_decl "{qux_dd_hash}"\n'
+        f'        dep_decl_schema_version 0\n'
+        f'        provenance {{\n'
+        f'            kind "git"\n'
+        f'            url "{QUX_URL}"\n'
+        f'            ref "{QUX_REF}"\n'
+        f'            commit_sha "{QUX_SHA}"\n'
+        f'        }}\n'
+        f'    }}\n'
+        f'}}\n'
+    )
+
+
+def _index_qux_bar_no_qux_dep_decl(
+    *,
+    qux_identity: str,
+    include_extra: bool = False,
+) -> str:
+    """Index with qux (NO dep_decl) and bar (with dep_decl).
+
+    qux has no dep_decl pointer → resolver falls back to qux's .nimble.
+    bar still has dep_decl → if resolver queries bar's edges it uses DepDecl,
+    but bar has no transitive deps so this is a no-op for the lockfile.
+    """
+    extra_block = ""
+    if include_extra:
+        extra_block = (
+            f'package "extra" {{\n'
+            f'    version "1.0.0" {{\n'
+            f'        content_hash "{EXTRA_IDENTITY}"\n'
+            f'        dep_decl "{EXTRA_DD_HASH}"\n'
+            f'        dep_decl_schema_version 0\n'
+            f'        provenance {{\n'
+            f'            kind "git"\n'
+            f'            url "{EXTRA_URL}"\n'
+            f'            ref "{EXTRA_REF}"\n'
+            f'            commit_sha "{EXTRA_SHA}"\n'
+            f'        }}\n'
+            f'    }}\n'
+            f'}}\n'
+        )
+    return (
+        "schema_version 1\n"
+        f'package "bar" {{\n'
+        f'    version "2.0.0" {{\n'
+        f'        content_hash "{BAR_IDENTITY}"\n'
+        f'        dep_decl "{BAR_DD_HASH}"\n'
+        f'        dep_decl_schema_version 0\n'
+        f'        provenance {{\n'
+        f'            kind "git"\n'
+        f'            url "{BAR_URL}"\n'
+        f'            ref "{BAR_REF}"\n'
+        f'            commit_sha "{BAR_SHA}"\n'
+        f'        }}\n'
+        f'    }}\n'
+        f'}}\n'
+        f'{extra_block}'
+        f'package "qux" {{\n'
+        f'    version "1.0.0" {{\n'
+        f'        content_hash "{qux_identity}"\n'
+        f'        provenance {{\n'
+        f'            kind "git"\n'
+        f'            url "{QUX_URL}"\n'
+        f'            ref "{QUX_REF}"\n'
+        f'            commit_sha "{QUX_SHA}"\n'
+        f'        }}\n'
+        f'    }}\n'
+        f'}}\n'
+    )
+
+
+# ---------------------------------------------------------------------------
+# milpa.kdl (root manifest — same for all four fixtures)
+# ---------------------------------------------------------------------------
+
+ROOT_MILPA_KDL = (
+    'name "myapp"\n'
+    'kind "application"\n'
+    'deps {\n'
+    '    qux ">= 1.0.0"\n'
+    '}\n'
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixture builder helpers
+# ---------------------------------------------------------------------------
+
+def _write_mock_dep(
+    mocked_dir: Path,
+    key: str,
+    sha: str,
+    name: str,
+    nimble_text: str,
+    nim_content: str,
+) -> None:
+    """Write one mocked-fetches/<key>/ subtree."""
+    key_dir = mocked_dir / key
+    key_dir.mkdir(parents=True, exist_ok=True)
+    (key_dir / "sha").write_text(sha + "\n", encoding="utf-8")
+    (key_dir / f"{name}.nimble").write_text(nimble_text, encoding="utf-8")
+    content_dir = key_dir / "content"
+    content_dir.mkdir(exist_ok=True)
+    (content_dir / f"{name}.nim").write_text(nim_content, encoding="utf-8")
+
+
+def _write_dep_decl_dir(dep_decl_dir: Path, hex_hash: str, artifact_bytes: bytes) -> None:
+    """Write dep-decl/<hex>.kdl."""
+    dep_decl_dir.mkdir(parents=True, exist_ok=True)
+    (dep_decl_dir / f"{hex_hash}.kdl").write_bytes(artifact_bytes)
+
+
+def _build_fixture(
+    name: str,
+    *,
+    milpa_kdl: str,
+    index_kdl: str,
+    dep_decl_artifacts: dict[str, bytes],  # hex_hash -> bytes
+    mock_deps: list[tuple[str, str, str, str, str]],  # (key, sha, name, nimble, nim)
+    expected_lock: str,
+    expected_nimcfg: str,
+    expected_deps_structure: str,
+) -> Path:
+    """Build one fixture directory under SPEC_V1."""
+    fixture_dir = SPEC_V1 / name
+    if fixture_dir.exists():
+        shutil.rmtree(fixture_dir)
+    fixture_dir.mkdir(parents=True)
+
+    (fixture_dir / "milpa.kdl").write_text(milpa_kdl, encoding="utf-8")
+    (fixture_dir / "index.kdl").write_text(index_kdl, encoding="utf-8")
+
+    if dep_decl_artifacts:
+        dd_dir = fixture_dir / "dep-decl"
+        dd_dir.mkdir()
+        for hex_hash, artifact_bytes in dep_decl_artifacts.items():
+            (dd_dir / f"{hex_hash}.kdl").write_bytes(artifact_bytes)
+
+    mocked_dir = fixture_dir / "mocked-fetches"
+    mocked_dir.mkdir()
+    for key, sha, depname, nimble_text, nim_content in mock_deps:
+        _write_mock_dep(mocked_dir, key, sha, depname, nimble_text, nim_content)
+
+    expected_dir = fixture_dir / "expected"
+    expected_dir.mkdir()
+    (expected_dir / "milpa.lock").write_text(expected_lock, encoding="utf-8")
+    (expected_dir / "nim.cfg").write_text(expected_nimcfg, encoding="utf-8")
+    (expected_dir / "_deps_structure.txt").write_text(expected_deps_structure, encoding="utf-8")
+
+    return fixture_dir
+
+
+# ---------------------------------------------------------------------------
+# Generate all four fixtures
+# ---------------------------------------------------------------------------
+
+def generate() -> None:
+    # QUX DepDecl hex hashes (strip "sha256:" prefix)
+    qux_clean_dd_hex = QUX_CLEAN_DD_HASH[len("sha256:"):]
+    bar_dd_hex = BAR_DD_HASH[len("sha256:"):]
+    extra_dd_hex = EXTRA_DD_HASH[len("sha256:"):]
+    # Note: extra_dd_hex == bar_dd_hex (same EdgeSet: empty requires, src_dir="src")
+
+    # --- fixture-135: clean pair, attested arm ---
+    f135 = _build_fixture(
+        "fixture-135-depdecl-clean-attested",
+        milpa_kdl=ROOT_MILPA_KDL,
+        index_kdl=_index_qux_bar_with_dep_decl(
+            qux_identity=QUX_CLEAN_IDENTITY,
+            qux_dd_hash=QUX_CLEAN_DD_HASH,
+        ),
+        dep_decl_artifacts={
+            qux_clean_dd_hex: QUX_CLEAN_DD,
+            bar_dd_hex: BAR_DD,
+        },
+        mock_deps=[
+            (QUX_KEY, QUX_SHA, "qux", QUX_NIMBLE_CLEAN, QUX_NIM),
+            (BAR_KEY, BAR_SHA, "bar", BAR_NIMBLE, BAR_NIM),
+        ],
+        expected_lock=_lock_clean(),
+        expected_nimcfg=_nimcfg_clean(),
+        expected_deps_structure=_deps_structure_clean(),
+    )
+    print(f"Created {f135}")
+
+    # --- fixture-136: clean pair, fallback arm ---
+    f136 = _build_fixture(
+        "fixture-136-depdecl-clean-fallback",
+        milpa_kdl=ROOT_MILPA_KDL,
+        index_kdl=_index_qux_bar_no_qux_dep_decl(
+            qux_identity=QUX_CLEAN_IDENTITY,
+        ),
+        dep_decl_artifacts={
+            # bar still has DepDecl (but qux falls back to .nimble)
+            bar_dd_hex: BAR_DD,
+        },
+        mock_deps=[
+            (QUX_KEY, QUX_SHA, "qux", QUX_NIMBLE_CLEAN, QUX_NIM),
+            (BAR_KEY, BAR_SHA, "bar", BAR_NIMBLE, BAR_NIM),
+        ],
+        expected_lock=_lock_clean(),
+        expected_nimcfg=_nimcfg_clean(),
+        expected_deps_structure=_deps_structure_clean(),
+    )
+    print(f"Created {f136}")
+
+    # --- fixture-137: when-block pair, attested arm ---
+    # qux has a when-block .nimble but the DepDecl only includes bar
+    f137 = _build_fixture(
+        "fixture-137-depdecl-when-attested",
+        milpa_kdl=ROOT_MILPA_KDL,
+        index_kdl=_index_qux_bar_with_dep_decl(
+            qux_identity=QUX_WHEN_IDENTITY,
+            qux_dd_hash=QUX_WHEN_ATTEST_DD_HASH,
+        ),
+        dep_decl_artifacts={
+            qux_clean_dd_hex: QUX_WHEN_ATTEST_DD,  # same hash as clean: bar only
+            bar_dd_hex: BAR_DD,
+        },
+        mock_deps=[
+            (QUX_KEY, QUX_SHA, "qux", QUX_NIMBLE_WHEN, QUX_NIM),
+            (BAR_KEY, BAR_SHA, "bar", BAR_NIMBLE, BAR_NIM),
+        ],
+        expected_lock=_lock_when_attested(),
+        expected_nimcfg=_nimcfg_when_attested(),
+        expected_deps_structure=_deps_structure_when_attested(),
+    )
+    print(f"Created {f137}")
+
+    # --- fixture-138: when-block pair, fallback arm ---
+    # qux has a when-block .nimble and NO DepDecl pointer → .nimble includes extra
+    f138 = _build_fixture(
+        "fixture-138-depdecl-when-fallback",
+        milpa_kdl=ROOT_MILPA_KDL,
+        index_kdl=_index_qux_bar_no_qux_dep_decl(
+            qux_identity=QUX_WHEN_IDENTITY,
+            include_extra=True,
+        ),
+        dep_decl_artifacts={
+            bar_dd_hex: BAR_DD,
+            extra_dd_hex: EXTRA_DD,  # same hash as bar_dd (both empty requires, src="src")
+        },
+        mock_deps=[
+            (QUX_KEY, QUX_SHA, "qux", QUX_NIMBLE_WHEN, QUX_NIM),
+            (BAR_KEY, BAR_SHA, "bar", BAR_NIMBLE, BAR_NIM),
+            (EXTRA_KEY, EXTRA_SHA, "extra", EXTRA_NIMBLE, EXTRA_NIM),
+        ],
+        expected_lock=_lock_when_fallback(),
+        expected_nimcfg=_nimcfg_when_fallback(),
+        expected_deps_structure=_deps_structure_when_fallback(),
+    )
+    print(f"Created {f138}")
+
+    print()
+    print("All four S4-ii fixtures generated.")
+    print()
+    print("Key hashes (for test_dep_decl.py DG* tests):")
+    print(f"  QUX_CLEAN_IDENTITY:      {QUX_CLEAN_IDENTITY}")
+    print(f"  QUX_WHEN_IDENTITY:       {QUX_WHEN_IDENTITY}")
+    print(f"  BAR_IDENTITY:            {BAR_IDENTITY}")
+    print(f"  EXTRA_IDENTITY:          {EXTRA_IDENTITY}")
+    print(f"  QUX_CLEAN_DD_HASH:       {QUX_CLEAN_DD_HASH}")
+    print(f"  QUX_WHEN_ATTEST_DD_HASH: {QUX_WHEN_ATTEST_DD_HASH}")
+    print(f"  BAR_DD_HASH:             {BAR_DD_HASH}")
+    print(f"  EXTRA_DD_HASH:           {EXTRA_DD_HASH}")
+
+
+if __name__ == "__main__":
+    generate()

@@ -1,0 +1,577 @@
+"""Edge-sourcing seam — S4-i + S3b (RFC: Content-Addressed Attested Dependency Metadata).
+
+This module implements the resolver-level ``EdgeSource`` protocol and the
+``resolve_edges`` coordinator specified in ``spec/resolver-semantics.md §4.2.1``
+(the normative §4.2.1 amendment introduced by S4-i).
+
+Design
+------
+Edge sourcing is the decision "given a package at a fetched path, which source
+supplies its declared requires (EdgeSet)?" Three source kinds exist:
+
+1. ``DepDeclEdgeSource`` (S3b): index-attested DepDecl artifact.  Fetches bytes
+   via a ``DepDeclStore`` (hash-verified), then calls ``parse_dep_decl``.
+   Validates ``dep_decl_schema_version`` consistency (§3.2.1 / spec §5).
+2. ``MilpaKdlEdgeSource``: parses the package's ``milpa.kdl`` → transitive projection
+   → EdgeSet.  Enforces §9 (dev-deps excluded) and §10.2 (overrides dropped).
+3. ``NimbleEdgeSource``: heuristic line-scan of ``.nimble`` → EdgeSet (fallback).
+
+The coordinator ``resolve_edges`` selects the source **once per (package, version)**
+via a resolver-scoped ``edge_cache`` memo (clause a), then dispatches to the
+appropriate source (clauses b, c, d).
+
+``EdgeSourceCtx`` carries the heterogeneous inputs the sources need.  The fields are
+genuinely asymmetric — ``DepDeclEdgeSource`` uses ``dep_decl`` + ``dep_decl_schema_version``
+but no ``dep_path``; ``NimbleEdgeSource`` uses ``dep_path`` but ignores ``dep_decl``
+— which is WHY the sources are separate deep units rather than one signature pretending
+to be uniform.
+
+Spec authority: spec/resolver-semantics.md §4.2.1, §9, §10.2.
+Spec authority: spec/dep-decl.md §1 (EdgeSet single shared type), §5 (schema checks).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
+
+from milpa.dep_decl import EdgeSet, EdgeSource, NamedRequire, UrlRequire
+from milpa.errors import (
+    TNG_DEPDECL_SCHEMA_MISMATCH,
+    TNG_DEPDECL_SCHEMA_UNSUPPORTED,
+    MilpaError,
+)
+
+if TYPE_CHECKING:
+    from milpa.manifest import Override
+    from milpa.solver import Term
+    from milpa.version import Version, VersionSet
+
+
+# ---------------------------------------------------------------------------
+# EdgeSourceCtx — heterogeneous per-package context carrier
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EdgeSourceCtx:
+    """Context carrier for a single (package, version) edge-sourcing decision.
+
+    Fields
+    ------
+    dep_path:
+        Absolute path to the fetched dep tree (``_deps/<name>/``).
+        ``None`` for DepDeclEdgeSource (which needs no local tree for edges).
+    dep_name:
+        The package name (used by NimbleEdgeSource to find ``<name>.nimble``).
+    dep_decl:
+        Hash pointer from the index entry (``sha256:…``), or ``None`` if the
+        index has no DepDecl for this version.  Populated from
+        ``IndexVersion.dep_decl`` (S2 field) by the resolver's stub materialisation
+        path.  ``None`` for URL/local/tarball deps (not in the index).
+    dep_decl_schema_version:
+        The ``dep_decl_schema_version`` integer from the index entry, or ``None``
+        when absent.  Used by ``DepDeclEdgeSource`` for the schema-consistency
+        check (§3.2.1): the index pointer's schema version MUST match the artifact's
+        embedded ``dep_decl_schema_version`` (``TNG-DEPDECL-SCHEMA-MISMATCH``).
+    is_overridden:
+        True when this package's provenance was redirected by a root-manifest
+        ``overrides {}`` block (§10.1).  Overridden packages MUST fall through to
+        MilpaKdl/Nimble; the attested DepDecl describes the *original* tree and is
+        invalid for the redirected source.
+    has_milpa_kdl:
+        True when the fetched dep tree contains a ``milpa.kdl`` file.
+        Populated by the resolver after fetch (``(dep_path / "milpa.kdl").exists()``).
+    overrides_by_name:
+        Root-manifest overrides dict (name → Override); passed to MilpaKdlEdgeSource
+        and NimbleEdgeSource so they can convert an overridden NamedDep into a
+        URL-sentinel term correctly.
+    """
+
+    dep_path: Path | None
+    dep_name: str
+    dep_decl: str | None
+    is_overridden: bool
+    has_milpa_kdl: bool
+    dep_decl_schema_version: int | None = None
+    overrides_by_name: dict[str, "Override"] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# EdgeSource protocol (one deep unit per source kind)
+# ---------------------------------------------------------------------------
+
+
+class EdgeSourceProtocol(Protocol):
+    """Protocol for a single edge source kind.
+
+    ``edges_for`` is the only entry point; it returns an ``EdgeSet`` ready to
+    be consumed by the resolver's term-builder (``_edgeset_to_terms``).
+    """
+
+    def edges_for(
+        self,
+        name: str,
+        version: "Version",
+        ctx: EdgeSourceCtx,
+    ) -> EdgeSet: ...
+
+
+# ---------------------------------------------------------------------------
+# NimbleEdgeSource
+# ---------------------------------------------------------------------------
+
+
+class NimbleEdgeSource:
+    """Heuristic ``.nimble`` line-scan → EdgeSet.
+
+    Transitional fallback for packages not yet indexed (raw git-URL deps, etc.).
+    Returns an EdgeSet with ``source = EdgeSource.NIMBLE_FALLBACK``.
+    """
+
+    def edges_for(
+        self,
+        name: str,
+        version: "Version",
+        ctx: EdgeSourceCtx,
+    ) -> EdgeSet:
+        """Scan ``<ctx.dep_path>/<name>.nimble`` → EdgeSet.
+
+        Falls back gracefully: if no ``.nimble`` is found, returns an empty EdgeSet.
+        """
+        assert ctx.dep_path is not None, "NimbleEdgeSource requires dep_path"
+        requires, src_dir = _nimble_edges(ctx.dep_path, name)
+        return EdgeSet(requires=requires, src_dir=src_dir, source=EdgeSource.NIMBLE_FALLBACK)
+
+
+def _nimble_edges(dep_path: Path, dep_name: str) -> tuple[list[NamedRequire | UrlRequire], str]:
+    """Extract requires + src_dir from the ``.nimble`` file at ``dep_path``."""
+    from milpa.nimble import parse_nimble
+    from milpa.manifest import UrlDep, NamedDep
+
+    nimble_path = _find_nimble_file(dep_path, dep_name)
+    if nimble_path is None:
+        return [], ""
+
+    try:
+        text = nimble_path.read_text(encoding="utf-8")
+    except OSError:
+        return [], ""
+
+    nm = parse_nimble(text)
+    src_dir = nm.src_dir or ""
+    requires: list[NamedRequire | UrlRequire] = []
+    for dep in nm.deps:
+        if isinstance(dep, UrlDep):
+            requires.append(UrlRequire(url=dep.git, ref=dep.ref))
+        elif isinstance(dep, NamedDep):
+            if dep.name == "nim":
+                continue
+            requires.append(NamedRequire(
+                name=dep.name,
+                constraint_str=dep.constraint or "",
+            ))
+    return requires, src_dir
+
+
+def _find_nimble_file(dep_path: Path, dep_name: str) -> Path | None:
+    """Locate the ``.nimble`` file for ``dep_name`` under ``dep_path``.
+
+    Returns ``None`` if no ``.nimble`` is found (unlike the resolver's internal
+    ``_find_nimble_file`` which raises FileNotFoundError — we need graceful fallback).
+    """
+    candidate = dep_path / f"{dep_name}.nimble"
+    if candidate.is_file():
+        return candidate
+    matches = list(dep_path.glob("*.nimble"))
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        named = [m for m in matches if m.stem == dep_name]
+        if named:
+            return named[0]
+        return matches[0]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# MilpaKdlEdgeSource
+# ---------------------------------------------------------------------------
+
+
+class MilpaKdlEdgeSource:
+    """``milpa.kdl`` → transitive projection → EdgeSet.
+
+    Parses a full Manifest from ``milpa.kdl``, then projects to an EdgeSet via
+    the normative transitive-projection rules (§9 + §10.2):
+
+    - Read ONLY ``manifest.deps``; NEVER ``manifest.dev_deps``.
+    - DROP ``manifest.overrides`` entirely (a transitive dep's overrides are ignored).
+    - Map ``manifest.src_dir → EdgeSet.src_dir``.
+
+    Returns an EdgeSet with ``source = EdgeSource.MILPA_KDL``.
+    """
+
+    def edges_for(
+        self,
+        name: str,
+        version: "Version",
+        ctx: EdgeSourceCtx,
+    ) -> EdgeSet:
+        """Parse ``ctx.dep_path / "milpa.kdl"`` and project → EdgeSet.
+
+        Falls back to an empty EdgeSet if parsing fails (mirrors the existing
+        ``_parse_transitive_deps`` malformed-KDL fallback — a transitive dep's
+        parse failure is non-fatal for the root resolve).
+        """
+        assert ctx.dep_path is not None, "MilpaKdlEdgeSource requires dep_path"
+        kdl_path = ctx.dep_path / "milpa.kdl"
+
+        try:
+            text = kdl_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return EdgeSet(requires=[], src_dir="", source=EdgeSource.MILPA_KDL)
+
+        from milpa.manifest import parse_manifest
+        from milpa.errors import MilpaError
+
+        try:
+            manifest = parse_manifest(text)
+        except MilpaError:
+            # Malformed transitive milpa.kdl — return empty EdgeSet (non-fatal).
+            return EdgeSet(requires=[], src_dir="", source=EdgeSource.MILPA_KDL)
+
+        return _manifest_to_edgeset(manifest)
+
+
+def _manifest_to_edgeset(manifest: "Manifest") -> EdgeSet:  # type: ignore[name-defined]
+    """Normative transitive projection: Manifest → EdgeSet.
+
+    NORMATIVE (§9 + §10.2):
+    - Reads ONLY ``manifest.deps`` (never ``dev_deps``).
+    - Drops ``manifest.overrides`` entirely.
+    - Maps ``manifest.src_dir → EdgeSet.src_dir``.
+
+    This is the single structural guard for the transitive-exclusion rule.
+    Both the edge_cache memo and this projection ensure §9/§10.2 correctness.
+    """
+    from milpa.manifest import UrlDep, NamedDep
+
+    requires: list[NamedRequire | UrlRequire] = []
+    for dep in manifest.deps:  # NORMATIVE §9: ONLY manifest.deps
+        if isinstance(dep, UrlDep):
+            requires.append(UrlRequire(url=dep.git, ref=dep.ref))
+        elif isinstance(dep, NamedDep):
+            if dep.name == "nim":
+                continue
+            requires.append(NamedRequire(
+                name=dep.name,
+                constraint_str=dep.constraint or "",
+            ))
+        # Tarball/Local/Member from transitive milpa.kdl: out of scope (mirrors
+        # existing _parse_transitive_deps deferral; only URL + named enter the graph).
+
+    src_dir = manifest.src_dir or ""
+    # manifest.overrides dropped entirely (§10.2 NORMATIVE).
+    return EdgeSet(requires=requires, src_dir=src_dir, source=EdgeSource.MILPA_KDL)
+
+
+# ---------------------------------------------------------------------------
+# DepDeclEdgeSource (S3b)
+# ---------------------------------------------------------------------------
+
+
+class DepDeclEdgeSource:
+    """Index-attested DepDecl artifact → EdgeSet (S3b).
+
+    The SINGLE site that calls ``store.get(dep_decl_hash)`` (hash already
+    verified inside ``store.get``), then calls ``parse_dep_decl(bytes)``
+    and applies the two schema-consistency checks from spec §5:
+
+    1. ``dep_decl_schema_version`` in the **artifact** MUST match the
+       ``dep_decl_schema_version`` from the **index pointer** carried in
+       ``ctx.dep_decl_schema_version`` → ``TNG-DEPDECL-SCHEMA-MISMATCH``.
+
+    2. The artifact's ``dep_decl_schema_version`` MUST NOT exceed
+       ``MAX_DEP_DECL_SCHEMA_VERSION`` (this impl's cap) →
+       ``TNG-DEPDECL-SCHEMA-UNSUPPORTED``.
+
+    Uses NO ``dep_path`` — only ``ctx.dep_decl`` (the hash pointer) and
+    ``ctx.dep_decl_schema_version`` (the index's pointer schema version).
+
+    SECURITY: integrity failures (HASH-MISMATCH, PARSE-ERROR, SCHEMA-*)
+    are always hard errors — no fallback (NORMATIVE).  Only FETCH-FAILED
+    (unreachable artifact) is subject to strict/non-strict policy (S5).
+    """
+
+    def __init__(self, store: object) -> None:
+        """Create a DepDeclEdgeSource backed by the given DepDeclStore.
+
+        ``store`` must satisfy the ``DepDeclStore`` protocol (``get`` + ``is_cached``).
+        """
+        self._store = store
+
+    def edges_for(
+        self,
+        name: str,
+        version: "Version",
+        ctx: EdgeSourceCtx,
+    ) -> EdgeSet:
+        """Fetch artifact bytes, verify, parse, check schemas, return EdgeSet.
+
+        Raises:
+            MilpaError(TNG-DEPDECL-FETCH-FAILED):   Artifact unreachable (from store.get).
+            MilpaError(TNG-DEPDECL-HASH-MISMATCH):  Hash mismatch (from store.get — SECURITY).
+            MilpaError(TNG-DEPDECL-PARSE-ERROR):    Malformed KDL artifact.
+            MilpaError(TNG-DEPDECL-SCHEMA-MISMATCH):    Index schema version ≠ artifact schema version.
+            MilpaError(TNG-DEPDECL-SCHEMA-UNSUPPORTED): Artifact schema version > impl cap.
+        """
+        assert ctx.dep_decl is not None, "DepDeclEdgeSource requires ctx.dep_decl"
+
+        # Fetch + verify (SECURITY: hash-verify is inside store.get, not here).
+        artifact_bytes = self._store.get(ctx.dep_decl)  # type: ignore[attr-defined]
+
+        # Parse → (EdgeSet, schema_version) — DOM-sourced, no secondary text-scan.
+        # parse_dep_decl returns the schema_version from the KDL DOM node so there
+        # is a SINGLE read of the version integer (SSOT, R3 fix).
+        from milpa.dep_decl import MAX_DEP_DECL_SCHEMA_VERSION, parse_dep_decl
+        es, artifact_schema_version = parse_dep_decl(artifact_bytes)
+
+        # Check (i): artifact schema version MUST NOT exceed impl cap.
+        if artifact_schema_version > MAX_DEP_DECL_SCHEMA_VERSION:
+            raise MilpaError(
+                TNG_DEPDECL_SCHEMA_UNSUPPORTED,
+                f"DepDecl artifact for {name!r} declares "
+                f"dep_decl_schema_version {artifact_schema_version}, but this "
+                f"milpa only understands up to {MAX_DEP_DECL_SCHEMA_VERSION} "
+                f"— upgrade milpa to read this artifact",
+                name=name,
+                artifact_version=artifact_schema_version,
+                max_supported=MAX_DEP_DECL_SCHEMA_VERSION,
+            )
+
+        # Check (ii): artifact schema version MUST match index pointer version.
+        if ctx.dep_decl_schema_version is not None:
+            if artifact_schema_version != ctx.dep_decl_schema_version:
+                raise MilpaError(
+                    TNG_DEPDECL_SCHEMA_MISMATCH,
+                    f"DepDecl artifact for {name!r} embeds "
+                    f"dep_decl_schema_version {artifact_schema_version}, but the "
+                    f"index pointer says {ctx.dep_decl_schema_version} — "
+                    f"the artifact and index are out of sync",
+                    name=name,
+                    artifact_version=artifact_schema_version,
+                    index_version=ctx.dep_decl_schema_version,
+                )
+
+        return es
+
+
+# ---------------------------------------------------------------------------
+# resolve_edges coordinator + edge_cache
+# ---------------------------------------------------------------------------
+
+
+def resolve_edges(
+    name: str,
+    version: "Version",
+    ctx: EdgeSourceCtx,
+    edge_cache: dict[tuple[str, "Version"], EdgeSet],
+    *,
+    nimble_source: NimbleEdgeSource | None = None,
+    milpakdl_source: MilpaKdlEdgeSource | None = None,
+    dep_decl_source: "DepDeclEdgeSource | None" = None,
+    strict_attestation: bool = False,
+) -> EdgeSet:
+    """Decide which EdgeSource supplies edges for ``(name, version)`` — once.
+
+    Implements spec/resolver-semantics.md §4.2.1 ``resolve_edges`` (S4-i amendment):
+
+    Clause (a) — Sealed once:
+        If ``(name, version)`` is in ``edge_cache``, return the sealed EdgeSet
+        immediately.  A diamond where two BFS parents reach ``D@v`` cannot yield
+        two different EdgeSets.
+
+    Clause (b) — Override suppresses DepDecl:
+        When ``ctx.is_overridden``, the attested DepDecl describes the *original*
+        tree and is invalid for the redirected source.  Fall through to
+        MilpaKdl/Nimble.
+
+    Clause (c) — DepDecl mainline (S3b):
+        When ``ctx.dep_decl`` is set AND ``dep_decl_source`` is not None, use the
+        attested source.  The resolver injects a ``DepDeclEdgeSource`` from
+        ``MilpaEnv.dep_decl_store`` (wired at S3b — resolver.py line ~222/304).
+
+    Clause (d) — MilpaKdl / Nimble fallback:
+        ``has_milpa_kdl → MilpaKdlEdgeSource``; else ``NimbleEdgeSource``.
+
+    Parameters
+    ----------
+    name, version:
+        The package being resolved.
+    ctx:
+        Per-package context (dep_path, dep_decl, is_overridden, has_milpa_kdl, …).
+    edge_cache:
+        Resolver-scoped memo; mutated in place (caller owns).
+    nimble_source:
+        Injectable NimbleEdgeSource (default: a fresh NimbleEdgeSource()).
+    milpakdl_source:
+        Injectable MilpaKdlEdgeSource (default: a fresh MilpaKdlEdgeSource()).
+    dep_decl_source:
+        ``DepDeclEdgeSource`` instance (S3b).  ``None`` falls through to
+        MilpaKdl/Nimble (S4-i compatibility behavior).  After S3b, the
+        resolver injects a real instance from ``MilpaEnv.dep_decl_store``.
+    strict_attestation:
+        When ``True`` (strict policy from manifest OR ``--require-attested-metadata``
+        flag), ``TNG-DEPDECL-FETCH-FAILED`` from the DepDecl store is re-raised
+        as a hard error (S5 strict clause b).  When ``False`` (non-strict,
+        default), an unreachable DepDecl artifact falls through to Nimble
+        fallback so resolution can continue (S5 non-strict deferred behaviour).
+        Integrity failures (HASH-MISMATCH, PARSE-ERROR, SCHEMA-*) are ALWAYS
+        hard errors regardless of this flag.
+
+    Returns
+    -------
+    EdgeSet
+        Sealed in ``edge_cache`` on first call; returned from cache on repeat calls.
+    """
+    # Clause (a): sealed once — parent-independent.
+    cache_key = (name, version)
+    if cache_key in edge_cache:
+        return edge_cache[cache_key]
+
+    # Resolve source singletons.
+    _nimble = nimble_source if nimble_source is not None else NimbleEdgeSource()
+    _milpakdl = milpakdl_source if milpakdl_source is not None else MilpaKdlEdgeSource()
+
+    if ctx.is_overridden:
+        # Clause (b): override suppresses DepDecl — DepDecl describes original tree.
+        # Fall through to MilpaKdl or Nimble on the overridden source.
+        if ctx.has_milpa_kdl:
+            es = _milpakdl.edges_for(name, version, ctx)
+        else:
+            es = _nimble.edges_for(name, version, ctx)
+
+    elif ctx.dep_decl is not None and dep_decl_source is not None:
+        # Clause (c): index-attested DepDecl mainline (S3b).
+        # dep_decl_source is injected from MilpaEnv.dep_decl_store (wired at S3b).
+        # S5: FETCH-FAILED is policy-gated.
+        #   Non-strict: fall through to Nimble on unreachable artifact.
+        #   Strict: re-raise as hard error (clause b).
+        #   Integrity failures (HASH-MISMATCH, PARSE-ERROR, SCHEMA-*): ALWAYS hard.
+        from milpa.errors import TNG_DEPDECL_FETCH_FAILED
+        try:
+            es = dep_decl_source.edges_for(name, version, ctx)
+        except MilpaError as exc:
+            if exc.slug == TNG_DEPDECL_FETCH_FAILED and not strict_attestation:
+                # Non-strict: artifact unreachable → fall back to Nimble.
+                # The summary warning will fire at resolve-end via enforce_attestation_policy.
+                _nimble2 = nimble_source if nimble_source is not None else NimbleEdgeSource()
+                es = _nimble2.edges_for(name, version, ctx)
+            else:
+                # Strict FETCH-FAILED OR integrity failure → always hard error.
+                raise
+
+    elif ctx.has_milpa_kdl:
+        # Clause (d): package ships milpa.kdl → MilpaKdlEdgeSource.
+        es = _milpakdl.edges_for(name, version, ctx)
+
+    else:
+        # Clause (d): raw git-URL dep with no milpa.kdl → NimbleEdgeSource.
+        es = _nimble.edges_for(name, version, ctx)
+
+    # Seal in cache.
+    edge_cache[cache_key] = es
+    return es
+
+
+# ---------------------------------------------------------------------------
+# EdgeSet → (dep_terms, requires_names) converter
+# ---------------------------------------------------------------------------
+
+
+def edgeset_to_terms(
+    es: EdgeSet,
+    overrides_by_name: dict[str, "Override"],
+    url_dep_version: "Version",
+) -> tuple[list["Term"], list[str]]:
+    """Convert an ``EdgeSet`` to the solver's ``(dep_terms, requires_names)`` tuple.
+
+    This is the single source of truth for ``EdgeSet → Term`` mapping,
+    replacing the inline logic scattered across ``_parse_transitive_deps``
+    and ``_parse_from_nimble`` in the existing resolver.
+
+    NORMATIVE: applies the same override-coercion as the main BFS loop —
+    a named dep whose name is in ``overrides_by_name`` is treated as a URL
+    dep at the sentinel version.
+
+    Parameters
+    ----------
+    es:
+        The EdgeSet from any EdgeSource.
+    overrides_by_name:
+        Root-manifest overrides dict (name → Override).
+    url_dep_version:
+        The sentinel version used for URL/local/member/overridden-named deps
+        (``_URL_DEP_VERSION`` from resolver.py).
+
+    Returns
+    -------
+    (dep_terms, requires_names):
+        Ready for ``_Candidate(dep_terms=…, requires_names=…)``.
+    """
+    from milpa.solver import Term
+    from milpa.version import VersionSet, parse_version
+
+    dep_terms: list[Term] = []
+    requires_names: list[str] = []
+
+    for entry in es.requires:
+        if isinstance(entry, UrlRequire):
+            # URL requires → sentinel version.
+            dep_name = _name_from_url(entry.url)
+            if dep_name is None:
+                continue
+            dep_terms.append(Term.require(dep_name, VersionSet.eq(url_dep_version)))
+            requires_names.append(dep_name)
+
+        elif isinstance(entry, NamedRequire):
+            if entry.name == "nim":
+                continue
+            if entry.name in overrides_by_name:
+                # Named dep with override → URL at sentinel.
+                dep_terms.append(
+                    Term.require(entry.name, VersionSet.eq(url_dep_version))
+                )
+            else:
+                # Parse constraint_str → VersionSet.
+                if entry.constraint_str:
+                    from milpa.version import VersionSet as VS
+                    try:
+                        vs = VS.from_constraint(entry.constraint_str)
+                    except Exception:
+                        vs = VS.full()
+                else:
+                    from milpa.version import VersionSet as VS
+                    vs = VS.full()
+                dep_terms.append(Term.require(entry.name, vs))
+            requires_names.append(entry.name)
+
+    return dep_terms, requires_names
+
+
+def _name_from_url(url: str) -> str | None:
+    """Derive a dep name from a git URL (mirrors ``_url_to_name`` in nimble.py)."""
+    import re
+    # Strip trailing .git and take the last path component.
+    url = url.rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    m = re.search(r"/([^/]+)$", url)
+    if m:
+        name = m.group(1)
+        # Safe-name check: no / .. or absolute path.
+        if "/" not in name and ".." not in name and not name.startswith("/"):
+            return name
+    return None

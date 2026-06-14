@@ -327,6 +327,10 @@ def test_every_lock_code_has_at_least_one_test_that_triggers_it():
     KNOWN_UNTESTED: set[str] = {
         # OS-level failures; exercised in production, not unit suite.
         "LOCK-FILE-UNREADABLE",
+        # S6 (rfc-content-addressed-metadata): raised by `milpa verify`
+        # DepDecl-pin drift detection in python-ng / rust. The Python impl
+        # here is frozen; the DepDecl feature lands in the rewrite (#6).
+        "LOCK-DEPDECL-PIN-MISSING",
     }
 
     tests_dir = Path(__file__).parent
@@ -391,7 +395,12 @@ def test_every_res_code_has_at_least_one_test_that_triggers_it():
     from pathlib import Path
     from milpa.error_catalog import ERROR_CATALOG
 
-    KNOWN_UNTESTED: set[str] = set()  # all RES- codes have trigger tests
+    KNOWN_UNTESTED: set[str] = {
+        # S5 (rfc-content-addressed-metadata): raised under strict attestation
+        # policy in python-ng / rust. The Python impl here is frozen; the
+        # DepDecl/attestation feature lands in the rewrite (#6).
+        "RES-UNATTESTED-METADATA",
+    }
 
     tests_dir = Path(__file__).parent
     test_text = "\n".join(p.read_text() for p in tests_dir.rglob("test_*.py"))
@@ -1491,6 +1500,20 @@ def test_every_tng_code_has_at_least_one_test_that_triggers_it():
         # Unparseable version strings are currently silently skipped
         # (forward-compat); no raise site exists yet.
         "TNG-BAD-VERSION",
+        # TNG-DEPDECL-* codes are registered in S0 (spec/dep-decl.md §6)
+        # and gain raise-site wiring in S3b (DepDeclEdgeSource + DepDeclStore).
+        # Python impl is frozen; raise sites land in the python-ng rewrite.
+        "TNG-DEPDECL-HASH-MISMATCH",
+        "TNG-DEPDECL-FETCH-FAILED",
+        "TNG-DEPDECL-PARSE-ERROR",
+        "TNG-DEPDECL-SCHEMA-UNSUPPORTED",
+        "TNG-DEPDECL-SCHEMA-MISMATCH",
+        # TNG-BAD-DEP-DECL — dep_decl pointer format validation (R5 security fix).
+        # The frozen Python impl (tianguis_client.py) does not validate dep_decl
+        # pointer format at parse time (the validate call is in the python-ng rewrite
+        # registry.py, not in the frozen tianguis_client.py). The raise site lands
+        # in the python-ng rewrite.
+        "TNG-BAD-DEP-DECL",
     }
 
     tests_dir = Path(__file__).parent
@@ -1521,6 +1544,17 @@ def test_tng_bidirectional_bijection():
     TOMBSTONED: frozenset[str] = frozenset({
         # Reserved for a future strict-parse mode; silently skipped for now.
         "TNG-BAD-VERSION",
+        # Registered in S0 (spec/dep-decl.md §6); raise sites land in S3b.
+        # Python impl is frozen; these codes gain wiring in python-ng rewrite.
+        "TNG-DEPDECL-HASH-MISMATCH",
+        "TNG-DEPDECL-FETCH-FAILED",
+        "TNG-DEPDECL-PARSE-ERROR",
+        "TNG-DEPDECL-SCHEMA-UNSUPPORTED",
+        "TNG-DEPDECL-SCHEMA-MISMATCH",
+        # R5 security fix: dep_decl pointer format validation (registry-protocol §3.2).
+        # The validate call lives in python-ng registry.py, not the frozen
+        # tianguis_client.py. Raise site wired at the python-ng rewrite (#6).
+        "TNG-BAD-DEP-DECL",
     })
 
     in_source = _tng_slugs_in_source()
@@ -1699,8 +1733,15 @@ def test_bidirectional_validator_passes_for_all_catalogued_prefixes():
             # The CLI emission bijection is enforced by
             # test_every_emit_error_slug_literal_is_in_catalog.
             "LOCK-DEP-NOT-FOUND",
+            # S6 (rfc-content-addressed-metadata): DepDecl-pin drift; raise
+            # sites live in python-ng / rust verify. Python impl frozen (#6).
+            "LOCK-DEPDECL-PIN-MISSING",
         })),
-        ("RES-",     frozenset()),
+        ("RES-",     frozenset({
+            # S5 (rfc-content-addressed-metadata): strict-attestation failure;
+            # raise sites live in python-ng / rust. Python impl frozen (#6).
+            "RES-UNATTESTED-METADATA",
+        })),
         # SOLVE-CONFLICT is a class attribute on SolverError, not a
         # raise-site code= kwarg — acknowledged via tombstone.
         ("SOLVE-",   frozenset({"SOLVE-CONFLICT"})),
@@ -1722,6 +1763,17 @@ def test_bidirectional_validator_passes_for_all_catalogued_prefixes():
             "TNG-UNSAFE-URL",        # positional arg to _validate_no_leading_dash
             "TNG-UNSAFE-OCI-FIELD",  # positional arg to _validate_no_leading_dash
             "TNG-BAD-VERSION",       # pre-reserved, no raise site yet
+            # S0: registered in spec/dep-decl.md §6; raise sites land in
+            # S3b (DepDeclEdgeSource + DepDeclStore). Python impl is frozen.
+            "TNG-DEPDECL-HASH-MISMATCH",
+            "TNG-DEPDECL-FETCH-FAILED",
+            "TNG-DEPDECL-PARSE-ERROR",
+            "TNG-DEPDECL-SCHEMA-UNSUPPORTED",
+            "TNG-DEPDECL-SCHEMA-MISMATCH",
+            # R5 security fix: dep_decl pointer format validation.
+            # Raise site lives in python-ng registry.py (not frozen
+            # tianguis_client.py). Wired at the python-ng rewrite (#6).
+            "TNG-BAD-DEP-DECL",
         })),
     ]:
         check_catalog_orphan_slugs(prefix, tombstoned=special_tombstones)

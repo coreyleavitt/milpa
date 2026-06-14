@@ -26,3 +26,23 @@ DEPS_DIR_MISSING = register(
         "lockfile. The user is directed to run `milpa fetch` first."
     ),
 )
+
+# ---------------------------------------------------------------------------
+# Graph-edge drift (rfc-content-addressed-metadata §3.7, S6)
+# ---------------------------------------------------------------------------
+
+EDGE_MISMATCH = register(
+    slug="VERIFY-EDGE-MISMATCH", category=_CAT,
+    description=(
+        "The locked `dep_decl` pin no longer matches the current index pointer "
+        "for a dep (§3.7, RFC content-addressed-metadata)."
+    ),
+    when=(
+        "`milpa verify` loads the live index and finds that the `dep_decl` hash "
+        "recorded in `milpa.lock` for a dep differs from the `dep_decl` pointer "
+        "the index now carries for that version — the dependency graph has "
+        "drifted since the lockfile was written. Also raised when the edge "
+        "check is required but the index is offline and strict mode "
+        "(`--require-attested-metadata`) is active."
+    ),
+)

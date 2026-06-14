@@ -123,7 +123,13 @@ fn spec_error_codes() -> BTreeSet<String> {
 /// has exactly one home — implemented, deferred-to-a-known-slice, or exempt.
 /// No codes remain deferred — every spec code is implemented or exempt, so the
 /// catalog is a pure bijection (`implemented ∪ exempt == spec`).
-const DEFERRED: &[&str] = &[];
+/// Spec codes this implementation has deferred to a future slice (S3b+).
+/// S1 moved all five TNG-DEPDECL-* codes to `implemented_error_codes()` in
+/// `milpa-core::error::CoreError::all_codes()` — they are registered there
+/// as S3b targets even though not all raise sites are wired yet.
+const DEFERRED: &[&str] = &[
+    // No codes currently deferred — all spec codes are implemented or exempt.
+];
 
 /// Spec codes this implementation intentionally never emits.
 const EXEMPT: &[&str] = &[

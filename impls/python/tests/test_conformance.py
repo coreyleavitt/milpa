@@ -96,6 +96,64 @@ _TARBALL_TOFU_PYTHON_FROZEN = frozenset({
     "fixture-126-tarball-tofu-refetch-mismatch",
 })
 
+# rfc-content-addressed-metadata (DepDecl): the frozen Python impl has no
+# DepDecl support — it does not consume the index `dep_decl` pointer, fetch/
+# verify DepDecl artifacts, emit the lockfile `dep_decl` pin, enforce
+# attestation policy, or run `milpa verify` edge-drift detection. So every
+# fixture that exercises an attested DepDecl (success arms whose expected lock
+# carries a pin, and the TNG-DEPDECL-*/RES-UNATTESTED-METADATA/VERIFY-* error
+# arms) cannot pass here. Mirrors harness/descriptors.py python_known_failing;
+# the Rust reference impl and python-ng exercise them. Wired at the rewrite (#6).
+# (fixture-139 is the NON-strict summary-warn arm: it resolves via the .nimble
+#  fallback with no pin, so the frozen impl matches it and it is NOT listed.)
+_DEPDECL_PYTHON_FROZEN = frozenset({
+    "fixture-129-index-dep-decl-pointer",
+    "fixture-131-depdecl-hash-mismatch",
+    "fixture-132-depdecl-parse-error",
+    "fixture-133-depdecl-schema-mismatch",
+    "fixture-134-depdecl-schema-unsupported",
+    "fixture-135-depdecl-clean-attested",
+    "fixture-136-depdecl-clean-fallback",
+    "fixture-137-depdecl-when-attested",
+    "fixture-138-depdecl-when-fallback",
+    "fixture-140-attestation-strict-manifest-fail",
+    "fixture-141-attestation-strict-flag-fail",
+    # Workspace + strict attestation (§13.1 workspace rule): frozen Python does not
+    # enforce attestation policy in the workspace resolve path. Wired at rewrite (#6).
+    "fixture-145-ws-attestation-strict-flag-fail",
+    "fixture-142-verify-edge-mismatch",
+    "fixture-143-verify-pin-missing",
+    # R4 verify strict via manifest: frozen Python ignores manifest attestation-policy
+    # on verify (cmd_verify never loads the manifest). Wired at the Python rewrite (#6).
+    "fixture-148-verify-edge-mismatch-manifest-strict",
+    "fixture-144-depdecl-fetch-failed",
+    # S7 TNG-DEPDECL-FETCH-FAILED non-strict fixture — frozen Python does not
+    # implement FileDepDeclStore (DepDeclEdgeSource absent → fallback already
+    # happens unconditionally; expected lockfile has no dep_decl pin which frozen
+    # Python would also produce, but MILPA_DEP_DECL_DIR is not wired into the
+    # frozen CLI). Wired at the Python rewrite (#6).
+    "fixture-146-depdecl-fetch-failed-nonstrict",  # FileDepDeclStore not in frozen Python
+    # R3 overflow fixture — frozen Python ignores the dep_decl index field
+    # (DepDeclEdgeSource not implemented) → resolves successfully instead of
+    # raising TNG-DEPDECL-SCHEMA-UNSUPPORTED. Wired at the Python rewrite (#6).
+    "fixture-147-depdecl-schema-unsupported-overflow",  # DepDeclEdgeSource not in frozen Python
+    # R5 security fix — frozen Python's tianguis_client.py does not validate
+    # dep_decl pointer format at parse time. The malformed pointer is silently
+    # treated as absent and Python resolves successfully instead of raising
+    # TNG-BAD-DEP-DECL. Fix lives in python-ng registry.py; wired at rewrite (#6).
+    "fixture-149-tng-bad-dep-decl",  # dep_decl format validation not in frozen Python
+    # --certificate path with strict attestation (§2.5 + §13.1): frozen Python does
+    # not implement --certificate (CLI-only, Rust reference impl exercises it) and
+    # does not enforce MILPA_REQUIRE_ATTESTED_METADATA, so the in-process adapter
+    # would silently succeed instead of raising RES-UNATTESTED-METADATA. Both gaps
+    # wired at the Python rewrite (#6).
+    "fixture-150-check-certificate-strict-attestation-fail",
+    # Workspace verify + member strict (§13.1 workspace rule, Finding 2):
+    # frozen Python does not consult member attestation-policy in `milpa verify`
+    # (the fix is python-ng; wired at the Python rewrite #6).
+    "fixture-151-ws-verify-edge-mismatch-member-strict",
+})
+
 
 # ---------------------------------------------------------------------------
 # _build_fetcher — delegates to production MockedFetcher (SSOT: milpa/fetchers/mocked.py)
@@ -329,6 +387,12 @@ def test_conformance_fixture(fixture_dir: Path, tmp_path: Path):
         pytest.skip(
             "tarball TOFU fixture; frozen Python mocks only git provenance "
             "(tarball mock transport wired at the rewrite #6)"
+        )
+    if fixture_dir.name in _DEPDECL_PYTHON_FROZEN:
+        pytest.skip(
+            "DepDecl fixture (rfc-content-addressed-metadata); frozen Python "
+            "has no DepDecl support — Rust + python-ng exercise it; wired at "
+            "the rewrite (#6)"
         )
     """Run one conformance fixture and verify outputs against expected/.
 

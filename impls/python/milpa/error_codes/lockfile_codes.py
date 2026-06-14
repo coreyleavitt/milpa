@@ -135,3 +135,21 @@ DEP_NOT_FOUND = register(
         "on a dep that has no entry in milpa.lock."
     ),
 )
+
+# ---------------------------------------------------------------------------
+# DepDecl pin (rfc-content-addressed-metadata §3.7, S6)
+# ---------------------------------------------------------------------------
+
+DEPDECL_PIN_MISSING = register(
+    slug="LOCK-DEPDECL-PIN-MISSING", category=_CAT,
+    description=(
+        "A dep_decl pin is present in the lockfile but the live index "
+        "version-node no longer carries a dep_decl pointer for that dep@version."
+    ),
+    when=(
+        "`milpa verify` finds a `dep_decl` field on a locked dep but the current "
+        "index either does not list that package, does not have that exact "
+        "version, or that version-node has no `dep_decl` field — the DepDecl "
+        "artifact has been retracted or the index has been rolled back."
+    ),
+)

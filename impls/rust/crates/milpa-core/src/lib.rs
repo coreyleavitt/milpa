@@ -15,7 +15,10 @@ use milpa_manifest::{Manifest, Workspace};
 pub use milpa_types::Lockfile;
 use milpa_types::ResolvedGraph;
 
+pub mod dep_decl;
+pub mod dep_decl_store;
 pub mod discovery;
+pub mod edge_sources;
 pub mod error;
 pub mod fetch;
 pub mod fetchers;
@@ -31,6 +34,11 @@ pub mod safe_extract;
 pub mod store;
 pub mod workspace;
 
+pub use dep_decl::{dep_decl_hash, parse_dep_decl, MAX_DEP_DECL_SCHEMA_VERSION};
+pub use dep_decl_store::{
+    index_base_url, make_dep_decl_store, verify as verify_dep_decl_hash, DepDeclStore,
+    FileDepDeclStore, HttpDepDeclStore,
+};
 pub use discovery::{discover_manifest, load_manifest};
 pub use error::{CoreError, MilpaError};
 pub use index_cache::{index_url_from_env, load_index, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS};
@@ -52,13 +60,14 @@ pub use fetchers::{
 };
 pub use frozen::{resolve_frozen, resolve_workspace_frozen};
 pub use identity::{compute_content_hash, parse_identity, SUPPORTED_ALGORITHMS};
-pub use milpa_manifest::{parse_document, ManifestDoc, Profile};
+pub use milpa_manifest::{parse_document, AttestationPolicy, ManifestDoc, Profile};
 pub use milpa_solver::{parse_version, Strategy};
 pub use nimcfg::format_nimcfg;
 pub use nimcfg::format_workspace_nimcfgs;
 pub use registry::Index;
 pub use resolver::{
-    resolve, resolve_with_cert, resolve_workspace, FailureCert, SuccessCert, WitnessEntry,
+    effective_strict_policy, parse_env_bool, resolve, resolve_with_cert, resolve_workspace,
+    workspace_any_member_strict, FailureCert, SuccessCert, WitnessEntry,
 };
 pub use milpa_solver::RefutationEntry;
 pub use safe_extract::{extract_tar, ExtractionResult, Limits};
@@ -125,10 +134,7 @@ impl Resolver for Milpa {
     fn resolve_workspace(
         &self,
         _w: &Workspace,
-        idx: Option<&Index>,
-        f: &dyn FetcherRegistry,
-        p: Option<&Profile>,
-        prior: Option<&Lockfile>,
+        params: ResolveParams<'_>,
         deps_dir: &Path,
     ) -> Result<ResolvedGraph, MilpaError> {
         // The trait carries the *parsed* workspace, but the union resolve needs
@@ -140,12 +146,13 @@ impl Resolver for Milpa {
         let loaded = workspace::load_workspace(root)?;
         resolver::resolve_workspace(
             &loaded,
-            idx,
-            f,
-            p,
-            prior,
+            params.index,
+            params.fetcher,
+            params.profile,
+            params.prior,
             milpa_solver::Strategy::default(),
             deps_dir,
+            params.require_attested_metadata,
         )
     }
 }
@@ -176,6 +183,27 @@ impl FrozenResolver for Milpa {
     }
 }
 
+/// Inputs that configure a workspace resolution run (mirrors Python `ResolveParams`).
+///
+/// Bundles the index, fetcher, profile, prior lockfile, and attestation policy
+/// flag so that [`Resolver::resolve_workspace`] stays under the 7-arg arity limit.
+/// The workspace itself and `deps_dir` are passed as separate positional arguments
+/// because they are "what to resolve" and "where", not resolution options.
+pub struct ResolveParams<'a> {
+    /// Tianguis index for named-dep resolution; `None` ⇒ empty index (valid only
+    /// when no un-overridden named deps exist in any member, else `RES-WS-NO-INDEX`).
+    pub index: Option<&'a Index>,
+    /// Fetcher registry that materializes each dep's bytes.
+    pub fetcher: &'a dyn FetcherRegistry,
+    /// Active profile for conditional dep filtering (§6); `None` disables filtering.
+    pub profile: Option<&'a milpa_manifest::Profile>,
+    /// Prior lockfile for pin reuse (resolver-semantics §8); `None` means no pins.
+    pub prior: Option<&'a Lockfile>,
+    /// Enforces strict attestation policy (S5, §13.1) when `true`. Effective policy
+    /// is the OR of this flag and any member's `attestation-policy "strict"`.
+    pub require_attested_metadata: bool,
+}
+
 /// Full resolution (the `cmd=resolve` path). `prior` carries the previous
 /// lockfile for pin reuse (resolver-semantics §8); fixtures that don't test
 /// pin reuse pass `None`.
@@ -193,10 +221,7 @@ pub trait Resolver {
     fn resolve_workspace(
         &self,
         w: &Workspace,
-        idx: Option<&Index>,
-        f: &dyn FetcherRegistry,
-        p: Option<&Profile>,
-        prior: Option<&Lockfile>,
+        params: ResolveParams<'_>,
         deps_dir: &Path,
     ) -> Result<ResolvedGraph, MilpaError>;
 }

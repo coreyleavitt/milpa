@@ -13,13 +13,15 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use milpa_core::{
-    add_mirror, discover_manifest, fetch::FetcherRegistry, format_nimcfg, format_workspace_nimcfgs,
-    from_graph, index_url_from_env, load_index, load_lockfile, load_manifest, load_workspace,
-    mutate_manifest_file, parse_lockfile, parse_version, resolve, resolve_with_cert,
-    resolve_workspace, resolve_workspace_frozen, verify_lockfile_against_deps, write_lockfile,
-    CaStore, CasAdmittingFetcher, CoreError, DefaultRegistry, FailureCert, FrozenResolver, Index,
-    ManifestDoc, Milpa, MilpaError, MockedFetcher, Profile, Resolver, Strategy, SuccessCert,
-    DEFAULT_TTL_SECONDS,
+    add_mirror, dep_decl_store::DepDeclStore, discover_manifest, effective_strict_policy,
+    fetch::FetcherRegistry, format_nimcfg, format_workspace_nimcfgs, from_graph,
+    index_url_from_env, load_index, load_lockfile, load_manifest, load_workspace,
+    make_dep_decl_store, mutate_manifest_file, parse_env_bool, parse_lockfile, parse_version,
+    resolve, resolve_with_cert, resolve_workspace, resolve_workspace_frozen,
+    verify_lockfile_against_deps, workspace_any_member_strict, write_lockfile, CaStore,
+    CasAdmittingFetcher, CoreError, DefaultRegistry, FailureCert, FileDepDeclStore,
+    FrozenResolver, Index, ManifestDoc, Milpa, MilpaError, MockedFetcher, Profile, Resolver,
+    Strategy, SuccessCert, DEFAULT_TTL_SECONDS,
 };
 use milpa_manifest::{Dep, Manifest, UrlDep};
 
@@ -59,6 +61,11 @@ struct Cli {
     /// `--certificate` is absent; `Some(path)` when present. Only used by
     /// `fetch` and `lock`; other verbs silently ignore it.
     certificate: Option<PathBuf>,
+    /// S5: `--require-attested-metadata` flag (cli-contract §8.4).
+    /// When set, the effective attestation policy is strict (OR with
+    /// manifest `attestation-policy "strict"`). The flag CANNOT weaken a
+    /// manifest-declared strict policy.
+    require_attested_metadata: bool,
     verb: String,
     rest: Vec<String>,
 }
@@ -79,10 +86,10 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
     let cert_path = cli.certificate.as_deref();
     match cli.verb.as_str() {
         "show" => cmd_show(dir),
-        "verify" => cmd_verify(dir),
+        "verify" => cmd_verify(dir, cli.require_attested_metadata),
         "clean" => cmd_clean(dir),
-        "fetch" => cmd_fetch(dir, cli.strategy, cli.frozen, true, cert_path),
-        "lock" => cmd_fetch(dir, cli.strategy, cli.frozen, false, cert_path),
+        "fetch" => cmd_fetch(dir, cli.strategy, cli.frozen, true, cert_path, cli.require_attested_metadata),
+        "lock" => cmd_fetch(dir, cli.strategy, cli.frozen, false, cert_path, cli.require_attested_metadata),
         "update" => cmd_update(dir, cli.strategy, &cli.rest),
         "add" => cmd_add(dir, &cli.rest),
         "remove" => cmd_remove(dir, &cli.rest),
@@ -100,6 +107,11 @@ fn parse_args(args: &[String]) -> Option<Cli> {
     let mut strategy = Strategy::default();
     let mut frozen = false;
     let mut certificate: Option<PathBuf> = None;
+    // S5: `MILPA_REQUIRE_ATTESTED_METADATA` env var also activates strict policy
+    // (cli-contract §8.4). The flag OR the env var; same OR semantics as manifest.
+    let mut require_attested_metadata = std::env::var("MILPA_REQUIRE_ATTESTED_METADATA")
+        .map(|v| parse_env_bool(&v))
+        .unwrap_or(false);
     let mut i = 0;
     let verb;
     loop {
@@ -125,6 +137,10 @@ fn parse_args(args: &[String]) -> Option<Cli> {
                 certificate = Some(PathBuf::from(args.get(i + 1)?));
                 i += 2;
             }
+            "--require-attested-metadata" => {
+                require_attested_metadata = true;
+                i += 1;
+            }
             v if !v.starts_with('-') => {
                 verb = v.to_string();
                 i += 1;
@@ -138,6 +154,7 @@ fn parse_args(args: &[String]) -> Option<Cli> {
         strategy,
         frozen,
         certificate,
+        require_attested_metadata,
         verb,
         rest: args[i..].to_vec(),
     })
@@ -176,7 +193,11 @@ fn cmd_show(dir: &Path) -> Result<i32, MilpaError> {
 }
 
 /// `milpa verify` — confirm `_deps/` matches the lockfile (stderr report).
-fn cmd_verify(dir: &Path) -> Result<i32, MilpaError> {
+///
+/// `require_attested_metadata` is the parsed CLI flag (already ORed with the
+/// `MILPA_REQUIRE_ATTESTED_METADATA` env var by `parse_args` — the env parse
+/// lives there and only there, per Finding 1 SSOT).
+fn cmd_verify(dir: &Path, require_attested_metadata: bool) -> Result<i32, MilpaError> {
     // Gap-1 D: load_lockfile's `?` surfaces LOCK-FILE-NOT-FOUND via the Err path
     // in main (which now emits the milpa-error: slug automatically). No inline
     // slug needed for the missing-lockfile case.
@@ -189,18 +210,104 @@ fn cmd_verify(dir: &Path) -> Result<i32, MilpaError> {
         return Ok(1);
     }
     let divergences = verify_lockfile_against_deps(&lock, &deps_dir);
-    if divergences.is_empty() {
-        eprintln!("verified {} deps", lock.deps.len());
-        Ok(0)
-    } else {
+    if !divergences.is_empty() {
         eprintln!("verification failed — {} divergence(s):", divergences.len());
         for d in &divergences {
             eprintln!("  {d}");
         }
         // Gap-1 D: LOCK-GRAPH-MISMATCH — emitted inline (Ok(1) path).
         eprintln!("milpa-error: LOCK-GRAPH-MISMATCH");
-        Ok(1)
+        return Ok(1);
     }
+
+    // S6: dep_decl edge check — compare locked pins against the live index (§3.7.2).
+    let pinned: Vec<_> = lock.deps.iter().filter(|d| d.dep_decl.is_some()).collect();
+    if !pinned.is_empty() {
+        // §13.1: effective strict = OR(manifest/workspace-member attestation-policy "strict",
+        // require_attested_metadata).  Use the SSOT helpers (Finding 1 + Finding 2):
+        //   - Single-package: effective_strict_policy(manifest.attestation_policy, flag)
+        //   - Workspace:      workspace_any_member_strict(ws) || flag
+        // The env-var parse lives in parse_args (the one SSOT); `require_attested_metadata`
+        // already incorporates it — no inline re-read here.
+        let strict = match discover_manifest(dir) {
+            Ok(milpa_manifest::ManifestDoc::Package(m)) => {
+                effective_strict_policy(&m.attestation_policy, require_attested_metadata)
+            }
+            Ok(milpa_manifest::ManifestDoc::Workspace(_)) => {
+                // Finding 2: load the workspace and consult member policies.
+                match load_workspace(dir) {
+                    Ok(ws) => workspace_any_member_strict(&ws) || require_attested_metadata,
+                    Err(_) => require_attested_metadata,
+                }
+            }
+            Err(_) => require_attested_metadata,
+        };
+
+        // Determine online state: MILPA_INDEX_URL must be set.
+        // maybe_index() returns None when offline/unreachable (treats as absent).
+        let index_opt = maybe_index()?;
+        if index_opt.is_none() {
+            // Offline / unreachable.
+            if strict {
+                eprintln!(
+                    "dep_decl edge check requires live index — offline (strict mode)"
+                );
+                eprintln!("milpa-error: VERIFY-EDGE-MISMATCH");
+                return Ok(1);
+            }
+            eprintln!(
+                "dep_decl edge check SKIPPED for {} dep(s) — offline (network required)",
+                pinned.len()
+            );
+        } else if let Some(index) = index_opt {
+            // Online: check each pin against the live index.
+            for dep in &pinned {
+                let locked_pin = dep.dep_decl.as_deref().unwrap();
+                let iv = match index.lookup_bare(&dep.name) {
+                    milpa_core::registry::BareLookup::NotFound
+                    | milpa_core::registry::BareLookup::Ambiguous(_) => None,
+                    milpa_core::registry::BareLookup::Found(pkg) => {
+                        pkg.versions.into_iter().find(|v| v.version == dep.version)
+                    }
+                };
+                match iv {
+                    None => {
+                        eprintln!(
+                            "dep '{}@{}': dep_decl pin present in lock but \
+                             package/version not in index",
+                            dep.name, dep.version
+                        );
+                        eprintln!("milpa-error: LOCK-DEPDECL-PIN-MISSING");
+                        return Ok(1);
+                    }
+                    Some(entry) => match &entry.dep_decl {
+                        None => {
+                            eprintln!(
+                                "dep '{}@{}': dep_decl pin present in lock but \
+                                 index version-node lacks dep_decl (retracted?)",
+                                dep.name, dep.version
+                            );
+                            eprintln!("milpa-error: LOCK-DEPDECL-PIN-MISSING");
+                            return Ok(1);
+                        }
+                        Some(current) if current != locked_pin => {
+                            eprintln!(
+                                "dep '{}@{}': locked dep_decl {} != index dep_decl {} \
+                                 — dependency graph has drifted",
+                                dep.name, dep.version, locked_pin, current
+                            );
+                            eprintln!("milpa-error: VERIFY-EDGE-MISMATCH");
+                            return Ok(1);
+                        }
+                        _ => {} // match
+                    },
+                }
+            }
+        }
+    }
+
+    eprintln!("verified {} deps", lock.deps.len());
+    Ok(0)
 }
 
 /// `milpa clean` — remove `_deps/` + `nim.cfg`, keep `milpa.lock`.
@@ -354,6 +461,7 @@ fn cmd_fetch(
     frozen: bool,
     emit_nimcfg: bool,
     cert_path: Option<&Path>,
+    require_attested_metadata: bool,
 ) -> Result<i32, MilpaError> {
     let deps_dir = dir.join("_deps");
     let doc = discover_manifest(dir)?;
@@ -394,6 +502,7 @@ fn cmd_fetch(
                 prior.as_ref(),
                 strategy,
                 &deps_dir,
+                require_attested_metadata,
             )?
         };
         write_lockfile(
@@ -445,22 +554,36 @@ fn cmd_fetch(
         // are idempotent and a silently-moved ref / substituted archive is caught.
         let prior = maybe_prior_lockfile(&dir.join("milpa.lock"));
 
+        // S3b: wire dep_decl_store from environment (MILPA_DEP_DECL_DIR or MILPA_INDEX_URL).
+        // Built before the cert branch so both paths share the same store — single
+        // source of truth for DepDecl wiring (fixes Finding-High-2).
+        let dep_decl_store_owned = maybe_dep_decl_store();
+        let dep_decl_store: Option<&dyn DepDeclStore> =
+            dep_decl_store_owned.as_deref();
+
         if let Some(cert_dest) = cert_path {
             // §2.5: resolve with certificate — emit JSON regardless of success/failure,
             // then propagate the normal exit/slug outcome.
+            // Thread dep_decl_store and require_attested_metadata so the cert path is
+            // IDENTICAL to the non-cert path modulo certificate emission (fixes
+            // Finding-High-1: strict attestation; Finding-High-2: DepDecl wiring).
             return cmd_fetch_with_cert(
                 dir, &manifest, &deps_dir, index.as_ref(), registry.as_ref(),
                 profile.as_ref(), prior.as_ref(), strategy, emit_nimcfg, cert_dest,
+                dep_decl_store, require_attested_metadata,
             );
         }
 
-        Milpa.resolve(
+        resolve(
             &manifest,
             index.as_ref(),
             registry.as_ref(),
             profile.as_ref(),
             prior.as_ref(),
+            strategy,
             &deps_dir,
+            dep_decl_store,
+            require_attested_metadata,
         )?
     };
 
@@ -485,6 +608,11 @@ fn cmd_fetch(
 /// The `--certificate` sub-path for `cmd_fetch`/`cmd_lock` (single-package,
 /// non-frozen). Runs `resolve_with_cert`, writes the certificate, then applies
 /// the normal exit/slug discipline (§2.5).
+///
+/// Mirrors the non-cert path in `cmd_fetch` exactly: `dep_decl_store` and
+/// `require_attested_metadata` are threaded through to `resolve_with_cert` so
+/// that DepDecl wiring and strict-attestation enforcement are identical to the
+/// non-cert resolve path (spec §2.5, §13.1; fixes Finding-High-1 + Finding-High-2).
 #[allow(clippy::too_many_arguments)]
 fn cmd_fetch_with_cert(
     dir: &Path,
@@ -497,8 +625,10 @@ fn cmd_fetch_with_cert(
     strategy: Strategy,
     emit_nimcfg: bool,
     cert_dest: &Path,
+    dep_decl_store: Option<&dyn DepDeclStore>,
+    require_attested_metadata: bool,
 ) -> Result<i32, MilpaError> {
-    match resolve_with_cert(manifest, index, registry, profile, prior, strategy, deps_dir) {
+    match resolve_with_cert(manifest, index, registry, profile, prior, strategy, deps_dir, dep_decl_store, require_attested_metadata) {
         Ok((graph, cert)) => {
             // Write the success certificate (best-effort; a cert write failure
             // does NOT abort the command — the lock/nim.cfg still land).
@@ -585,6 +715,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String]) -> Result<i32, Mi
             prior.as_ref(),
             strategy,
             &deps_dir,
+            false, // cmd_update does not accept --require-attested-metadata (fetch/lock only)
         )?;
         write_lockfile(&from_graph(&graph, strategy.as_str()), &lock_path)?;
         eprintln!(
@@ -600,6 +731,8 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String]) -> Result<i32, Mi
     };
     let index = maybe_index()?;
     let profile = profile_from_env();
+    let dep_decl_store_owned = maybe_dep_decl_store();
+    let dep_decl_store: Option<&dyn DepDeclStore> = dep_decl_store_owned.as_deref();
     let graph = resolve(
         &manifest,
         index.as_ref(),
@@ -608,6 +741,8 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String]) -> Result<i32, Mi
         prior.as_ref(),
         strategy,
         &deps_dir,
+        dep_decl_store,
+        false, // require_attested_metadata: not surfaced by `update` verb
     )?;
     write_lockfile(&from_graph(&graph, strategy.as_str()), &lock_path)?;
     eprintln!("updated {}", name.as_deref().unwrap_or("all deps"));
@@ -906,6 +1041,28 @@ fn profile_from_env() -> Option<Profile> {
     })
 }
 
+/// Build a `DepDeclStore` from the environment (S3b, cli-contract §8.2).
+///
+/// Priority:
+/// 1. `MILPA_DEP_DECL_DIR` set → `FileDepDeclStore` (conformance / air-gapped).
+/// 2. `MILPA_INDEX_URL` set → `HttpDepDeclStore` derived via `index_base_url` (§3.3).
+/// 3. Neither set → `None` (DepDecl branch unreachable at resolve time).
+///
+/// Returns `None` when DepDecl is not configured (the common case for URL-dep-only
+/// projects); the resolver's clause (c) is structurally present but falls through
+/// to MilpaKdl/Nimble.
+fn maybe_dep_decl_store() -> Option<Box<dyn DepDeclStore>> {
+    let dep_decl_dir = std::env::var("MILPA_DEP_DECL_DIR").unwrap_or_default();
+    if !dep_decl_dir.is_empty() {
+        return Some(Box::new(FileDepDeclStore::new(PathBuf::from(dep_decl_dir))));
+    }
+    let index_url = std::env::var("MILPA_INDEX_URL").unwrap_or_default();
+    if !index_url.is_empty() {
+        return Some(Box::new(make_dep_decl_store(&index_url)));
+    }
+    None
+}
+
 /// Load an existing `milpa.lock` as the §8 prior for pin reuse (resolver-
 /// semantics §8: the named stability guarantee that makes repeated `milpa fetch`
 /// runs idempotent for an unchanged manifest). Returns `None` when the lockfile
@@ -1059,7 +1216,7 @@ mod tests {
 
         // First, fetch to produce a baseline lockfile with both pins.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        assert_eq!(cmd_fetch(&proj, Strategy::default(), false, true, None).unwrap(), 0);
+        assert_eq!(cmd_fetch(&proj, Strategy::default(), false, true, None, false).unwrap(), 0);
         let baseline = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
         assert!(baseline.contains("\"foo\"") && baseline.contains("\"bar\""));
 
@@ -1236,7 +1393,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX; unique env var name; cleaned up after.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let result = cmd_fetch(&proj, Strategy::default(), false, true, None);
+        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert!(result.is_ok(), "expected Ok, got {result:?}");
@@ -1277,7 +1434,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let result = cmd_fetch(&proj, Strategy::default(), false, true, None);
+        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert!(result.is_err(), "expected Err, got {result:?}");

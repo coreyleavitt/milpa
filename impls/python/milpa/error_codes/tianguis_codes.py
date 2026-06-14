@@ -140,6 +140,21 @@ BAD_OCI_DIGEST = register(
     ),
 )
 
+BAD_DEP_DECL = register(
+    slug="TNG-BAD-DEP-DECL", category=_CAT,
+    description=(
+        "A `dep_decl` pointer in the index version-node is not in "
+        "`sha256:<64 lowercase hex>` format."
+    ),
+    when=(
+        "_validate_dep_decl_pointer finds the dep_decl field does not match "
+        "`^sha256:[0-9a-f]{64}$` — rejects path-traversal payloads and other "
+        "malformed pointers at the index-parse boundary (registry-protocol §3.2 "
+        "NORMATIVE). Validated before the value can reach FileDepDeclStore "
+        "(filesystem path) or HttpDepDeclStore (URL path segment)."
+    ),
+)
+
 UNSAFE_REF = register(
     slug="TNG-UNSAFE-REF", category=_CAT,
     description="A git ref begins with `-` and would be interpreted as a CLI flag.",
@@ -180,5 +195,83 @@ UNSAFE_OCI_FIELD = register(
     when=(
         "_validate_no_leading_dash finds an oci registry or repository value "
         "starting with `-` — flag-injection prevention for oras argv."
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# DepDecl (Dependency Declaration) errors — spec/dep-decl.md §6
+# Raise-site wiring lands in S3b (DepDeclEdgeSource + DepDeclStore).
+# Registered here in S0 so the catalog is aware and spec/errors.md is
+# generated correctly; TOMBSTONED in bijection tests until S3b.
+# ---------------------------------------------------------------------------
+
+DEPDECL_HASH_MISMATCH = register(
+    slug="TNG-DEPDECL-HASH-MISMATCH", category=_CAT,
+    description=(
+        "`sha256(received_bytes)` does not equal the `dep_decl` pointer "
+        "from the index version-node."
+    ),
+    when=(
+        "`DepDeclStore.get` computes sha256 of the received artifact bytes "
+        "and finds they do not match the expected hash.  The artifact is "
+        "rejected; no data from it is consumed.  Defined in "
+        "`spec/dep-decl.md §6`."
+    ),
+)
+
+DEPDECL_FETCH_FAILED = register(
+    slug="TNG-DEPDECL-FETCH-FAILED", category=_CAT,
+    description=(
+        "The DepDecl artifact is unreachable — network error or "
+        "file-not-found in the dep-decl store."
+    ),
+    when=(
+        "`DepDeclStore.get` cannot retrieve the artifact at the derived URL "
+        "or `MILPA_DEP_DECL_DIR` path.  In the non-strict path the resolver "
+        "falls through to the `.nimble` fallback with an "
+        "`RES-UNATTESTED-METADATA` warning; with `--require-attested-metadata` "
+        "this is a hard failure.  Defined in `spec/dep-decl.md §6`."
+    ),
+)
+
+DEPDECL_PARSE_ERROR = register(
+    slug="TNG-DEPDECL-PARSE-ERROR", category=_CAT,
+    description=(
+        "The DepDecl artifact bytes are not valid KDL 2.0, or the KDL "
+        "structure does not conform to `spec/dep-decl.md §2`."
+    ),
+    when=(
+        "The DepDecl parser finds invalid KDL syntax, a missing `dep_decl` "
+        "top node, missing required child fields, or malformed entry nodes.  "
+        "Defined in `spec/dep-decl.md §6`."
+    ),
+)
+
+DEPDECL_SCHEMA_UNSUPPORTED = register(
+    slug="TNG-DEPDECL-SCHEMA-UNSUPPORTED", category=_CAT,
+    description=(
+        "The DepDecl artifact declares a `dep_decl_schema_version` greater "
+        "than the implementation's maximum understood version."
+    ),
+    when=(
+        "The consumer's version-enforcement check (§4.3 of "
+        "`spec/dep-decl.md`) finds "
+        "`artifact.dep_decl_schema_version > MAX_DEP_DECL_SCHEMA_VERSION`.  "
+        "The user must upgrade their milpa installation.  "
+        "Defined in `spec/dep-decl.md §6`."
+    ),
+)
+
+DEPDECL_SCHEMA_MISMATCH = register(
+    slug="TNG-DEPDECL-SCHEMA-MISMATCH", category=_CAT,
+    description=(
+        "The DepDecl artifact's embedded `dep_decl_schema_version` does not "
+        "match the `dep_decl_schema_version` field from the index "
+        "version-node pointer."
+    ),
+    when=(
+        "The schema consistency check (§5 of `spec/dep-decl.md`) finds the "
+        "two version integers disagree — indicating a partially-applied index "
+        "update.  Defined in `spec/dep-decl.md §6`."
     ),
 )

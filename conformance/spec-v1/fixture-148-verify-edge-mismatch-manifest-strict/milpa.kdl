@@ -1,0 +1,6 @@
+name "myapp"
+kind "application"
+attestation-policy "strict"
+deps {
+    bar git="https://github.com/example/bar.git" ref="v2.0.0"
+}

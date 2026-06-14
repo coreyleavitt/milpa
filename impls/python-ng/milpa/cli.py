@@ -47,6 +47,7 @@ from milpa.errors import (
     FETCH_REF_DISCOVERY_FAILED,
     FROZEN_NO_LOCKFILE,
     LOCK_DEP_NOT_FOUND,
+    LOCK_DEPDECL_PIN_MISSING,
     LOCK_FILE_NOT_FOUND,
     LOCK_GRAPH_MISMATCH,
     MAN_ADD_DEP_EXISTS,
@@ -54,13 +55,16 @@ from milpa.errors import (
     MAN_MIRROR_EDITABLE_PROVENANCE,
     MAN_REMOVE_DEP_ABSENT,
     MILPA_INTERNAL,
+    TNG_DEPDECL_FETCH_FAILED,
     VERIFY_DEPS_DIR_MISSING,
+    VERIFY_EDGE_MISMATCH,
     MilpaError,
 )
 from milpa.fetchers import CasAdmittingFetcher, build_registry, mocked_registry
 from milpa.frozen import resolve_frozen, resolve_workspace_frozen
 from milpa.index_cache import load_default_index
 from milpa.lockfile import (
+    LockedDep,
     format_lockfile,
     from_graph,
     load_lockfile,
@@ -141,6 +145,18 @@ def _make_parser() -> argparse.ArgumentParser:
             "(applies to fetch and lock; silently ignored by other verbs)"
         ),
     )
+    parser.add_argument(
+        "--require-attested-metadata",
+        action="store_true",
+        default=False,
+        help=(
+            "require all resolved deps to have index-attested DepDecl metadata; "
+            "exit 1 with RES-UNATTESTED-METADATA if any dep falls back to "
+            "un-attested .nimble. Composites with manifest 'attestation-policy "
+            "\"strict\"' via OR: once either says strict, the policy is strict "
+            "(the flag cannot weaken a manifest-declared strict policy)."
+        ),
+    )
 
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
 
@@ -214,6 +230,11 @@ def _build_env() -> MilpaEnv:
     - otherwise → real transport.
     - store → default_store() (honours MILPA_CACHE_DIR / XDG).
     - index → None at this point; loaded eagerly per-verb when needed.
+    - dep_decl_store (S3b):
+        MILPA_DEP_DECL_DIR set → FileDepDeclStore (harness / air-gapped).
+        else → HttpDepDeclStore derived from MILPA_INDEX_URL (production).
+        ``None`` when MILPA_INDEX_URL is also absent (e.g. pure URL-dep project
+        with no index) — the DepDecl branch is unreachable in that case anyway.
     """
     store: CAStore = default_store()
 
@@ -222,11 +243,36 @@ def _build_env() -> MilpaEnv:
 
     fetcher = CasAdmittingFetcher(inner, store)
 
+    # S3b: build dep_decl_store from environment.
+    dep_decl_store: object | None = _build_dep_decl_store()
+
     return MilpaEnv(
         fetcher=fetcher,
         index=None,  # loaded eagerly per-verb
         store=store,
+        dep_decl_store=dep_decl_store,
     )
+
+
+def _build_dep_decl_store() -> object | None:
+    """Build the dep_decl_store from environment variables (S3b).
+
+    Priority:
+      1. ``MILPA_DEP_DECL_DIR`` → ``FileDepDeclStore`` (conformance / air-gapped).
+      2. ``MILPA_INDEX_URL`` set → ``HttpDepDeclStore`` derived per §3.3.
+      3. Neither set → ``None`` (DepDecl branch unreachable at resolve time).
+    """
+    from milpa.dep_decl_store import FileDepDeclStore, make_dep_decl_store
+
+    dep_decl_dir = os.environ.get("MILPA_DEP_DECL_DIR", "").strip()
+    if dep_decl_dir:
+        return FileDepDeclStore(Path(dep_decl_dir))
+
+    index_url = os.environ.get("MILPA_INDEX_URL", "").strip()
+    if index_url:
+        return make_dep_decl_store(index_url)
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +398,7 @@ def cmd_fetch(
     max_parallel: int,
     frozen: bool,
     certificate_path: Path | None = None,
+    require_attested_metadata: bool = False,
 ) -> int:
     """Resolve, fetch, emit nim.cfg + milpa.lock.
 
@@ -376,6 +423,7 @@ def cmd_fetch(
             max_parallel=max_parallel,
             frozen=frozen,
             certificate_path=certificate_path,
+            require_attested_metadata=require_attested_metadata,
         )
 
     # --- Single-package path ---
@@ -439,6 +487,7 @@ def cmd_fetch(
         profile=profile,
         prior=prior,  # type: ignore[arg-type]
         manifest_dir=project_dir,
+        require_attested_metadata=require_attested_metadata,
     )
 
     # Resolve — intercept SOLVE_CONFLICT to write the failure certificate.
@@ -477,6 +526,7 @@ def _cmd_fetch_workspace(
     max_parallel: int,
     frozen: bool,
     certificate_path: Path | None = None,
+    require_attested_metadata: bool = False,
 ) -> int:
     """Workspace variant of cmd_fetch."""
     from milpa.workspace import LoadedWorkspace
@@ -528,6 +578,7 @@ def _cmd_fetch_workspace(
         profile=profile,
         prior=prior,  # type: ignore[arg-type]
         manifest_dir=ws_root,
+        require_attested_metadata=require_attested_metadata,
     )
 
     # Resolve — intercept SOLVE_CONFLICT to write the failure certificate.
@@ -573,6 +624,7 @@ def cmd_lock(
     strategy: Strategy,
     max_parallel: int,
     certificate_path: Path | None = None,
+    require_attested_metadata: bool = False,
 ) -> int:
     """Resolve + write milpa.lock; do NOT emit nim.cfg or populate _deps/.
 
@@ -587,6 +639,7 @@ def cmd_lock(
             strategy=strategy,
             max_parallel=max_parallel,
             certificate_path=certificate_path,
+            require_attested_metadata=require_attested_metadata,
         )
 
     manifest = load_or_discover_manifest(project_dir)
@@ -602,6 +655,7 @@ def cmd_lock(
         profile=profile,
         prior=prior,  # type: ignore[arg-type]
         manifest_dir=project_dir,
+        require_attested_metadata=require_attested_metadata,
     )
 
     # Resolve — intercept SOLVE_CONFLICT to write the failure certificate.
@@ -631,6 +685,7 @@ def _cmd_lock_workspace(
     strategy: Strategy,
     max_parallel: int,
     certificate_path: Path | None = None,
+    require_attested_metadata: bool = False,
 ) -> int:
     from milpa.workspace import LoadedWorkspace
     assert isinstance(workspace, LoadedWorkspace)
@@ -648,6 +703,7 @@ def _cmd_lock_workspace(
         profile=profile,
         prior=prior,  # type: ignore[arg-type]
         manifest_dir=ws_root,
+        require_attested_metadata=require_attested_metadata,
     )
 
     # Resolve — intercept SOLVE_CONFLICT to write the failure certificate.
@@ -748,12 +804,27 @@ def _format_provenance(p: object) -> str:
 # ---------------------------------------------------------------------------
 
 
-def cmd_verify(project_dir: Path) -> int:
+def cmd_verify(
+    project_dir: Path,
+    env: "MilpaEnv | None" = None,
+    *,
+    require_attested_metadata: bool = False,
+) -> int:
     """Recheck every dep in _deps/ against milpa.lock.
+
+    S6: also checks dep_decl pins in the lockfile against the live index
+    (§3.7.2).  Offline → edge check is skipped (not passed); under effective
+    strict mode (manifest attestation-policy "strict" OR --require-attested-metadata
+    OR MILPA_REQUIRE_ATTESTED_METADATA) → hard-fail with VERIFY-EDGE-MISMATCH.
+
+    Effective strict policy (§13.1): OR of manifest field + flag.  The flag
+    MUST NOT weaken a manifest-declared strict policy.
 
     stdout: none.
     stderr: diagnostics + summary.
     """
+    from milpa.attestation import effective_strict_policy
+
     ws = find_workspace_root(project_dir)
     lock_path: Path
     deps_dir: Path
@@ -763,9 +834,25 @@ def cmd_verify(project_dir: Path) -> int:
         assert isinstance(ws, LoadedWorkspace)
         lock_path = ws.root_dir / "milpa.lock"
         deps_dir = ws.root_dir / "_deps"
+        # §13.1 workspace attestation rule: strict if ANY member is strict.
+        effective_strict = require_attested_metadata or any(
+            effective_strict_policy(m.manifest.attestation_policy, False)
+            for m in ws.members
+        )
     else:
         lock_path = project_dir / "milpa.lock"
         deps_dir = project_dir / "_deps"
+        # Load manifest to read attestation-policy (may be absent / .nimble fallback).
+        try:
+            manifest = load_or_discover_manifest(project_dir)
+            effective_strict = effective_strict_policy(
+                manifest.attestation_policy, require_attested_metadata
+            )
+        except MilpaError:
+            # Manifest unreadable — fall back to flag-only policy (same as pre-fix
+            # behavior; the lock-vs-_deps check below will likely surface the real
+            # error anyway).
+            effective_strict = require_attested_metadata
 
     if not lock_path.exists():
         print(
@@ -801,6 +888,19 @@ def cmd_verify(project_dir: Path) -> int:
         _emit_slug(LOCK_GRAPH_MISMATCH)
         return 1
 
+    # -------------------------------------------------------------------------
+    # S6: dep_decl pin check (§3.7.2)
+    # -------------------------------------------------------------------------
+    pinned_deps = [d for d in lockfile.deps if d.dep_decl is not None]
+    if pinned_deps:
+        result = _verify_dep_decl_pins(
+            pinned_deps,
+            env=env,
+            strict=effective_strict,
+        )
+        if result != 0:
+            return result
+
     if ws is not None:
         from milpa.workspace import LoadedWorkspace
         assert isinstance(ws, LoadedWorkspace)
@@ -811,6 +911,126 @@ def cmd_verify(project_dir: Path) -> int:
         )
     else:
         print(f"verified {len(lockfile.deps)} deps", file=sys.stderr)
+    return 0
+
+
+def _verify_dep_decl_pins(
+    pinned_deps: "list[LockedDep]",
+    env: "MilpaEnv | None",
+    *,
+    strict: bool,
+) -> int:
+    """Check each locked dep_decl pin against the live index.
+
+    ``strict`` is the EFFECTIVE strict policy — the OR of manifest
+    ``attestation-policy "strict"`` and the ``--require-attested-metadata``
+    flag / ``MILPA_REQUIRE_ATTESTED_METADATA`` env (computed by the caller
+    via ``attestation.effective_strict_policy``).
+
+    §3.7.2 semantics:
+    - Offline (no dep_decl_store or no MILPA_INDEX_URL):
+        - Non-strict: skip edge check, warn to stderr.
+        - Strict: hard-fail VERIFY-EDGE-MISMATCH.
+    - Online:
+        - Pin matches index → OK.
+        - Index version-node lacks dep_decl → LOCK-DEPDECL-PIN-MISSING.
+        - Index dep_decl differs from pin → VERIFY-EDGE-MISMATCH.
+
+    Returns 0 on success; emits slug and returns 1 on failure.
+    """
+    # Determine offline state: dep_decl_store must exist AND MILPA_INDEX_URL set.
+    dep_decl_store = env.dep_decl_store if env is not None else None
+    index_url = os.environ.get("MILPA_INDEX_URL", "").strip()
+    offline = dep_decl_store is None or not index_url
+
+    if offline:
+        if strict:
+            print(
+                "dep_decl edge check requires live index — "
+                "network not available (strict mode → VERIFY-EDGE-MISMATCH)",
+                file=sys.stderr,
+            )
+            _emit_slug(VERIFY_EDGE_MISMATCH)
+            return 1
+        # Non-strict: skip and warn.
+        print(
+            f"dep_decl edge check SKIPPED for {len(pinned_deps)} dep(s) "
+            "(offline — network required for drift detection; "
+            "run connected to verify edge integrity)",
+            file=sys.stderr,
+        )
+        return 0
+
+    # Load the live index (same pattern as _load_index_for_verb).
+    from milpa.errors import MILPA_INDEX_UNREACHABLE
+
+    try:
+        index = load_default_index()
+    except MilpaError as exc:
+        if exc.slug == MILPA_INDEX_UNREACHABLE:
+            if strict:
+                print(
+                    f"index unreachable — cannot verify dep_decl pins "
+                    f"(strict mode): {exc.message}",
+                    file=sys.stderr,
+                )
+                _emit_slug(VERIFY_EDGE_MISMATCH)
+                return 1
+            print(
+                f"dep_decl edge check SKIPPED — index unreachable: {exc.message}",
+                file=sys.stderr,
+            )
+            return 0
+        # TNG-* parse errors propagate — real malformation, not just offline.
+        print(f"failed to load index: {exc.message}", file=sys.stderr)
+        _emit_slug(exc.slug)
+        return 1
+
+    # Per-dep check.
+    for dep in pinned_deps:
+        assert dep.dep_decl is not None  # narrowed above
+        locked_pin = dep.dep_decl
+
+        # Find the version-node in the live index.
+        pkg = index.lookup_bare(dep.name)
+        if pkg is None or hasattr(pkg, "namespaces"):
+            # Not found / ambiguous: treat as LOCK-DEPDECL-PIN-MISSING
+            # (the pin records a dep_decl but the index no longer has it).
+            print(
+                f"dep '{dep.name}': dep_decl pin {locked_pin!r} present in lock "
+                f"but package is no longer in the index",
+                file=sys.stderr,
+            )
+            _emit_slug(LOCK_DEPDECL_PIN_MISSING)
+            return 1
+
+        # Find the exact version-node.
+        iv = next(
+            (iv for iv in pkg.versions if iv.version == dep.version),
+            None,
+        )
+
+        if iv is None or iv.dep_decl is None:
+            # Version-node not found OR dep_decl field absent → pin is orphaned.
+            print(
+                f"dep '{dep.name}@{dep.version}': dep_decl pin {locked_pin!r} "
+                f"present in lock but the index version-node no longer carries "
+                f"a dep_decl pointer — the DepDecl may have been retracted",
+                file=sys.stderr,
+            )
+            _emit_slug(LOCK_DEPDECL_PIN_MISSING)
+            return 1
+
+        if iv.dep_decl != locked_pin:
+            print(
+                f"dep '{dep.name}@{dep.version}': locked dep_decl {locked_pin!r} "
+                f"does not match index current dep_decl {iv.dep_decl!r} — "
+                f"the dependency graph has drifted",
+                file=sys.stderr,
+            )
+            _emit_slug(VERIFY_EDGE_MISMATCH)
+            return 1
+
     return 0
 
 
@@ -1365,6 +1585,15 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.certificate).resolve() if args.certificate is not None else None
     )
 
+    # S5: effective require_attested_metadata = CLI flag OR env var
+    # (same OR semantics as manifest-strict OR flag; the env var cannot weaken
+    # a manifest-declared strict policy either — all three are OR'd).
+    _env_require_attested = os.environ.get("MILPA_REQUIRE_ATTESTED_METADATA", "")
+    _env_require_attested_bool = bool(
+        _env_require_attested and _env_require_attested not in ("0", "false")
+    )
+    effective_require_attested = args.require_attested_metadata or _env_require_attested_bool
+
     # Dispatch.
     try:
         if args.command == "fetch":
@@ -1375,6 +1604,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_parallel=args.parallel,
                 frozen=args.frozen,
                 certificate_path=certificate_path,
+                require_attested_metadata=effective_require_attested,
             )
         elif args.command == "lock":
             return cmd_lock(
@@ -1383,11 +1613,16 @@ def main(argv: list[str] | None = None) -> int:
                 strategy=strategy,
                 max_parallel=args.parallel,
                 certificate_path=certificate_path,
+                require_attested_metadata=effective_require_attested,
             )
         elif args.command == "show":
             return cmd_show(project_dir)
         elif args.command == "verify":
-            return cmd_verify(project_dir)
+            return cmd_verify(
+                project_dir,
+                env,
+                require_attested_metadata=effective_require_attested,
+            )
         elif args.command == "clean":
             return cmd_clean(project_dir)
         elif args.command == "add":

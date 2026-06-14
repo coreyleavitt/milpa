@@ -104,6 +104,31 @@ fn validate_oci_digest(digest: &str) -> Result<(), CoreError> {
     }
 }
 
+/// Validate a `dep_decl` pointer from the index version-node.
+///
+/// The pointer MUST be `sha256:` followed by exactly 64 lowercase hex
+/// characters (registry-protocol §3.2 NORMATIVE).  Anything else —
+/// including path-traversal payloads like `sha256:../../etc/passwd` or
+/// abbreviated / uppercase hex — is rejected here at parse time before the
+/// value can reach `FileDepDeclStore` (filesystem path) or `HttpDepDeclStore`
+/// (URL path segment).
+fn validate_dep_decl_pointer(pointer: &str) -> Result<(), CoreError> {
+    let ok = pointer
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| is_lower_hex(hex, 64));
+    if ok {
+        Ok(())
+    } else {
+        Err(tng(
+            "TNG-BAD-DEP-DECL",
+            format!(
+                "dep_decl pointer {pointer:?} is not in `sha256:<64 lowercase hex>` format \
+                 — path-traversal or malformed pointer rejected at parse boundary"
+            ),
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Data model
 // ---------------------------------------------------------------------------
@@ -119,6 +144,13 @@ pub struct IndexVersion {
     /// `TNG-NO-IDENTITY` when such a version is selected, never silently).
     pub content_hash: String,
     pub provenances: Vec<Provenance>,
+    /// Optional hash pointer (`sha256:…`) to the DepDecl artifact for this
+    /// version (registry-protocol §3.2.3).  `None` when absent (forward-compat:
+    /// old index entries omit it).
+    pub dep_decl: Option<String>,
+    /// The DepDecl schema version integer that produced `dep_decl`
+    /// (registry-protocol §3.2.1).  `None` when absent.
+    pub dep_decl_schema_version: Option<i64>,
 }
 
 /// A package: a `(namespace, name)` identity plus its versions (newest-first).
@@ -343,6 +375,12 @@ fn check_schema_version(doc: &KdlDocument) -> Result<(), CoreError> {
 
 fn parse_version_node(ver: &str, node: &KdlNode) -> Result<IndexVersion, CoreError> {
     let content_hash = child_arg_str(node, "content_hash").unwrap_or_default();
+    let dep_decl_raw = child_arg_str(node, "dep_decl").filter(|s| !s.is_empty());
+    if let Some(ref ptr) = dep_decl_raw {
+        validate_dep_decl_pointer(ptr)?;
+    }
+    let dep_decl = dep_decl_raw;
+    let dep_decl_schema_version = child_arg_i64(node, "dep_decl_schema_version");
     let mut provenances: Vec<Provenance> = Vec::new();
     for child in children(node) {
         if child.name().value() != "provenance" {
@@ -385,6 +423,8 @@ fn parse_version_node(ver: &str, node: &KdlNode) -> Result<IndexVersion, CoreErr
         version: ver.to_string(),
         content_hash,
         provenances,
+        dep_decl,
+        dep_decl_schema_version,
     })
 }
 
@@ -405,6 +445,25 @@ fn child_arg_str(node: &KdlNode, child_name: &str) -> Option<String> {
         .into_iter()
         .find(|c| c.name().value() == child_name)
         .and_then(first_arg_str)
+}
+
+/// First positional arg (integer) of `node`'s child named `child_name`, or
+/// `None` when the child is absent or its first arg is not an integer.
+/// `kdl-rs` returns integers as `i128`; we narrow to `i64` (all valid
+/// schema version values fit; `dep_decl_schema_version` is a small non-negative
+/// integer per registry-protocol §3.2.1).
+fn child_arg_i64(node: &KdlNode, child_name: &str) -> Option<i64> {
+    children(node)
+        .into_iter()
+        .find(|c| c.name().value() == child_name)
+        .and_then(|child| {
+            child
+                .entries()
+                .iter()
+                .find(|e| e.name().is_none())
+                .and_then(|e| e.value().as_integer())
+                .and_then(|v| i64::try_from(v).ok())
+        })
 }
 
 fn children(node: &KdlNode) -> Vec<&KdlNode> {

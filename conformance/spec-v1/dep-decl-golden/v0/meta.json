@@ -1,0 +1,13 @@
+{
+  "dep_decl_hash": "sha256:34a91f93fc03cadbd69379b97cdbac82110070ead8595038f0cc203e72d346bd",
+  "dep_decl_schema_version": 0,
+  "description": "Hand-authored v0 golden vector per spec/dep-decl.md §2. Three-requires EdgeSet: two named (results, stew), one URL (nim-chronos). src_dir = \"src\". Constraint whitespace preserved as authored.",
+  "expected_edge_set": {
+    "src_dir": "src",
+    "requires": [
+      {"name": "results", "constraint": ">= 0.5.0"},
+      {"name": "stew",    "constraint": ">= 0.1 & < 1.0"},
+      {"url": "https://github.com/status-im/nim-chronos.git", "ref": "v3.2.0"}
+    ]
+  }
+}

@@ -176,6 +176,7 @@ pub fn manifest_from_nimble(nm: &NimbleManifest, name: &str) -> Manifest {
         cas_dir: String::new(),
         spec_version: 1,
         spec_version_explicit: false,
+        attestation_policy: milpa_manifest::AttestationPolicy::Permissive,
     }
 }
 

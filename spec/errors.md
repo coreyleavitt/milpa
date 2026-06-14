@@ -297,6 +297,12 @@ A named dep is absent from the lockfile.
 
 **Triggered:** `milpa update <dep>` or `milpa add --mirror <dep>` is asked to act on a dep that has no entry in milpa.lock.
 
+### `LOCK-DEPDECL-PIN-MISSING`
+
+A dep_decl pin is present in the lockfile but the live index version-node no longer carries a dep_decl pointer for that dep@version.
+
+**Triggered:** `milpa verify` finds a `dep_decl` field on a locked dep but the current index either does not list that package, does not have that exact version, or that version-node has no `dep_decl` field — the DepDecl artifact has been retracted or the index has been rolled back.
+
 ### `LOCK-FIELD-ARITY`
 
 A lockfile scalar field takes exactly one value.
@@ -843,6 +849,12 @@ Two transitive deps declare different provenance (source) for the same package n
 
 **Triggered:** A package name is first encountered via one transport (URL/local/named) and then a transitive dep requests it via a different, incompatible transport/URL, and the root manifest has no authority over that name (it is not declared in deps, dev-deps, or overrides).
 
+### `RES-UNATTESTED-METADATA`
+
+Under strict attestation policy, one or more resolved deps used un-attested `.nimble` metadata (no `dep_decl` pointer in the index, or the `dep_decl` artifact was unreachable and the policy does not allow fallback).
+
+**Triggered:** `resolve()` completes but the effective attestation policy is strict (either `attestation-policy "strict"` in `milpa.kdl` or `--require-attested-metadata` on the CLI) and at least one dep's edges came from the `NimbleFallback` source (no index-attested DepDecl). Under non-strict (default permissive) policy, a summary warning is emitted to stderr instead.
+
 ### `RES-WS-MEMBER-REF-UNKNOWN`
 
 A workspace member references a `member "X"` dep that doesn't exist.
@@ -883,6 +895,12 @@ A git provenance commit_sha is not a valid 40-character lowercase hex SHA1.
 
 **Triggered:** _validate_commit_sha finds the commit_sha field does not match `^[0-9a-f]{40}$` — rejects abbreviated SHAs and flag-injection vectors.
 
+### `TNG-BAD-DEP-DECL`
+
+A `dep_decl` pointer in the index version-node is not in `sha256:<64 lowercase hex>` format.
+
+**Triggered:** _validate_dep_decl_pointer finds the dep_decl field does not match `^sha256:[0-9a-f]{64}$` — rejects path-traversal payloads and other malformed pointers at the index-parse boundary (registry-protocol §3.2 NORMATIVE). Validated before the value can reach FileDepDeclStore (filesystem path) or HttpDepDeclStore (URL path segment).
+
 ### `TNG-BAD-OCI-DIGEST`
 
 An OCI provenance digest is not in `sha256:<64 lowercase hex>` format.
@@ -894,6 +912,36 @@ An OCI provenance digest is not in `sha256:<64 lowercase hex>` format.
 An index version string is not a parseable X.Y.Z semver.
 
 **Triggered:** Reserved for a future strict-parse pass.  Currently unparseable version strings are silently skipped (forward-compat); this code will be raised when a strict mode is enabled.
+
+### `TNG-DEPDECL-FETCH-FAILED`
+
+The DepDecl artifact is unreachable — network error or file-not-found in the dep-decl store.
+
+**Triggered:** `DepDeclStore.get` cannot retrieve the artifact at the derived URL or `MILPA_DEP_DECL_DIR` path.  In the non-strict path the resolver falls through to the `.nimble` fallback with an `RES-UNATTESTED-METADATA` warning; with `--require-attested-metadata` this is a hard failure.  Defined in `spec/dep-decl.md §6`.
+
+### `TNG-DEPDECL-HASH-MISMATCH`
+
+`sha256(received_bytes)` does not equal the `dep_decl` pointer from the index version-node.
+
+**Triggered:** `DepDeclStore.get` computes sha256 of the received artifact bytes and finds they do not match the expected hash.  The artifact is rejected; no data from it is consumed.  Defined in `spec/dep-decl.md §6`.
+
+### `TNG-DEPDECL-PARSE-ERROR`
+
+The DepDecl artifact bytes are not valid KDL 2.0, or the KDL structure does not conform to `spec/dep-decl.md §2`.
+
+**Triggered:** The DepDecl parser finds invalid KDL syntax, a missing `dep_decl` top node, missing required child fields, or malformed entry nodes.  Defined in `spec/dep-decl.md §6`.
+
+### `TNG-DEPDECL-SCHEMA-MISMATCH`
+
+The DepDecl artifact's embedded `dep_decl_schema_version` does not match the `dep_decl_schema_version` field from the index version-node pointer.
+
+**Triggered:** The schema consistency check (§5 of `spec/dep-decl.md`) finds the two version integers disagree — indicating a partially-applied index update.  Defined in `spec/dep-decl.md §6`.
+
+### `TNG-DEPDECL-SCHEMA-UNSUPPORTED`
+
+The DepDecl artifact declares a `dep_decl_schema_version` greater than the implementation's maximum understood version.
+
+**Triggered:** The consumer's version-enforcement check (§4.3 of `spec/dep-decl.md`) finds `artifact.dep_decl_schema_version > MAX_DEP_DECL_SCHEMA_VERSION`.  The user must upgrade their milpa installation.  Defined in `spec/dep-decl.md §6`.
 
 ### `TNG-KDL-SYNTAX`
 
@@ -962,6 +1010,12 @@ A git URL begins with `-` and would be interpreted as a CLI flag.
 `milpa verify` cannot run: there is no _deps/ directory.
 
 **Triggered:** cmd_verify finds no _deps/ under the project (or workspace) root — nothing has been fetched, so there is nothing to verify against the lockfile. The user is directed to run `milpa fetch` first.
+
+### `VERIFY-EDGE-MISMATCH`
+
+The locked `dep_decl` pin no longer matches the current index pointer for a dep (§3.7, RFC content-addressed-metadata).
+
+**Triggered:** `milpa verify` loads the live index and finds that the `dep_decl` hash recorded in `milpa.lock` for a dep differs from the `dep_decl` pointer the index now carries for that version — the dependency graph has drifted since the lockfile was written. Also raised when the edge check is required but the index is offline and strict mode (`--require-attested-metadata`) is active.
 
 ## WS
 

@@ -196,6 +196,7 @@ mod tests {
                 ref_spec: Some("main".into()),
                 commit_sha: None,
             },
+            dep_decl: None,
         }
     }
 

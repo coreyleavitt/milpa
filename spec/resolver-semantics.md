@@ -911,6 +911,70 @@ MUST be byte-identical.
 
 ---
 
+## 13  Attestation policy
+
+The resolver classifies each named dep's edge source as one of:
+
+- **`MilpaKdl`** — dep declared in `milpa.kdl` with an explicit URL (no index lookup).
+- **`DepDecl`** — dep resolved via a `dep_decl` pointer in the tianguis index entry.
+- **`NimbleFallback`** — dep resolved from the `.nimble` metadata embedded in the
+  tianguis index entry, with no `dep_decl` attestation.
+
+Attestation policy governs how the resolver handles `NimbleFallback` deps.
+
+### 13.1  Effective policy
+
+> NORMATIVE: The **effective attestation policy** for a resolve invocation is the
+> logical OR of the following three sources:
+>
+> 1. The manifest `attestation-policy` field equals `"strict"` (see
+>    `spec/manifest-grammar.md` §attestation-policy). For a **workspace resolve**,
+>    source 1 is active when **any** workspace member's package manifest declares
+>    `attestation-policy "strict"` — the OR is taken across all members (a workspace
+>    is strict if any member is strict).
+> 2. The `--require-attested-metadata` CLI flag is present.
+> 3. The `MILPA_REQUIRE_ATTESTED_METADATA` environment variable is set to a
+>    non-empty value that is not `"0"` or `"false"`.
+>
+> A `"strict"` policy derived from the manifest CANNOT be weakened by the other
+> two sources; they can only add strictness. The effective policy is therefore
+> `strict` if any of the three sources is active, and `permissive` otherwise.
+>
+> **Workspace note:** Sources 2 and 3 (flag and env-var) apply equally to
+> workspace and single-package resolves. An implementation MUST NOT silently
+> drop the flag or env-var when routing to the workspace resolve path.
+> `enforce_attestation_policy` MUST be called after the workspace solve completes,
+> exactly as for single-package mode.
+
+### 13.2  Permissive policy (default)
+
+> NORMATIVE: Under permissive policy, if one or more resolved named deps have
+> `source == NimbleFallback`, the implementation MUST emit exactly one
+> human-readable summary warning to stderr listing those deps by name. The
+> warning MUST NOT cause the implementation to exit non-zero, and MUST NOT
+> prevent any output file from being written. The exact format of the warning
+> is non-normative.
+>
+> If no resolved named deps have `source == NimbleFallback`, no warning is
+> emitted.
+
+### 13.3  Strict policy
+
+> NORMATIVE: Under strict policy, if one or more resolved named deps have
+> `source == NimbleFallback`, the implementation MUST raise
+> `RES-UNATTESTED-METADATA` and exit non-zero without writing any output files.
+>
+> If no resolved named deps have `source == NimbleFallback`, the invocation
+> succeeds normally.
+
+> NOTE: `MilpaKdl` and `DepDecl` deps are never subject to attestation policy
+> enforcement — `MilpaKdl` deps are declared by the user directly in `milpa.kdl`
+> (no index lookup), and `DepDecl` deps carry an explicit attestation pointer.
+> Only `NimbleFallback` deps (index entries without a `dep_decl` pointer) trigger
+> the policy.
+
+---
+
 ## 12  Python backjumping gap (tracked-incidental)
 
 > NOTE: The reference Python implementation omits conflict-driven
@@ -946,3 +1010,4 @@ All codes are defined in `spec/errors.md`.
 | `FETCH-ALL-FAILED` | Every mirror candidate failed (network error or identity mismatch) (§8a) |
 | `RES-PROVENANCE-CONFLICT` | Two transitive deps declare different provenances for the same name (§10.3) |
 | `MAN-PREDICATE-MIXED-NEGATION` | Predicate mixes negated and non-negated values (manifest-grammar §6) |
+| `RES-UNATTESTED-METADATA` | Strict policy: ≥1 named dep resolved from un-attested `.nimble` metadata (§13.3) |

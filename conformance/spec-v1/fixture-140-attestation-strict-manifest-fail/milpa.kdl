@@ -1,0 +1,6 @@
+name "myapp"
+kind "application"
+attestation-policy "strict"
+deps {
+    foo ">= 1.0.0"
+}

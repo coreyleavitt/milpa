@@ -1,0 +1,5 @@
+name "myapp"
+kind "application"
+deps {
+    pkg git=(url)"https://example.com/pkg.git" ref="main"
+}

@@ -34,7 +34,6 @@ Registry/repository safety (registry-protocol.md §4):
 
 from __future__ import annotations
 
-import re
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -57,13 +56,11 @@ from milpa.fetchers.types import (
     Provenance,
     ProvenanceReceipt,
 )
+from milpa.registry import _RE_SHA256_DIGEST
 
 # ---------------------------------------------------------------------------
 # Validators — TNG-* parse-path (registry-protocol.md §4 NORMATIVE)
 # ---------------------------------------------------------------------------
-
-#: Normative pattern: ``sha256:`` + 64 lowercase hex chars.
-_OCI_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def validate_oci_digest(digest: str) -> None:
@@ -72,8 +69,12 @@ def validate_oci_digest(digest: str) -> None:
     Registry-protocol.md §4 NORMATIVE: any ``digest`` field on an ``oci``
     provenance that does not match ``^sha256:[0-9a-f]{64}$`` MUST raise this
     error at parse time (trust boundary).
+
+    Uses ``_RE_SHA256_DIGEST`` from ``milpa.registry`` — the single source of
+    truth for the ``sha256:<64 lowercase hex>`` pointer format (shared with
+    ``_validate_dep_decl_pointer``; only the error code differs).
     """
-    if not _OCI_DIGEST_RE.match(digest):
+    if not _RE_SHA256_DIGEST.fullmatch(digest):
         raise MilpaError(
             TNG_BAD_OCI_DIGEST,
             f"OCI digest must be in sha256:<64 lowercase hex> form; got {digest!r}",

@@ -27,14 +27,14 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use milpa_manifest::nimble::{parse_nimble, NimbleRequirement};
 use milpa_manifest::{Dep, LocalDep, Manifest, Override, Predicate, Profile, TarballDep, UrlDep};
 use milpa_solver::{
     parse_version, solve, solve_with_refutation, vs_to_constraint_str, Dep as SolverDep,
     PackageProvider, RefutationEntry, Strategy, VersionSet,
 };
-use milpa_types::{Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph, Version};
+use milpa_types::{EdgeSet, Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph, Version};
 
+use crate::edge_sources::{EdgeSourceCtx, NimbleEdgeSource};
 use crate::error::{CoreError, MilpaError};
 use crate::fetch::{FetchError, FetcherRegistry, Receipt};
 use crate::identity::compute_content_hash;
@@ -67,6 +67,9 @@ const ROOT: &str = "__root__";
 /// `RES-NO-INDEX`). `fetcher` materializes each dep's bytes; `profile` (when
 /// `Some`) filters conditional deps before the solver runs (§6); `prior` enables
 /// pin reuse (§8). `strategy` governs per-package version selection (§4.3).
+/// `require_attested_metadata` enforces strict attestation policy (S5):
+/// when `true` (or when `manifest.attestation_policy == Strict`), any resolved
+/// dep sourced from un-attested `.nimble` metadata raises `RES-UNATTESTED-METADATA`.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve(
     manifest: &Manifest,
@@ -76,6 +79,8 @@ pub fn resolve(
     prior: Option<&Lockfile>,
     strategy: Strategy,
     deps_dir: &Path,
+    dep_decl_store: Option<&dyn crate::dep_decl_store::DepDeclStore>,
+    require_attested_metadata: bool,
 ) -> Result<ResolvedGraph, MilpaError> {
     // §6: filter conditional deps by the active profile before anything else.
     // An absent profile disables filtering entirely (§6 absent-profile rule).
@@ -88,53 +93,17 @@ pub fn resolve(
         None => manifest,
     };
 
-    let overrides: BTreeMap<String, Override> = manifest
-        .overrides
-        .iter()
-        .map(|ov| (ov.name.clone(), ov.clone()))
-        .collect();
-
-    // Index presence: a named dep with neither an index nor an override is
-    // unresolvable (resolver-semantics — RES-NO-INDEX).
+    // Anchor lifetime for the Index::default() fallback (build_single_provider
+    // borrows it; the provider must not outlive this frame).
     let empty_index = Index::default();
-    let index: &Index = match index {
-        Some(i) => i,
-        None => {
-            let unresolvable: Vec<&str> = manifest
-                .deps
-                .iter()
-                .chain(manifest.dev_deps.iter())
-                .filter(|d| matches!(d, Dep::Named(_)) && !overrides.contains_key(d.name()))
-                .map(|d| d.name())
-                .collect();
-            if !unresolvable.is_empty() {
-                return Err(res_err(
-                    "RES-NO-INDEX",
-                    format!(
-                        "manifest has named dep(s) {unresolvable:?} but no tianguis index \
-                         was provided — pass an index to resolve named deps"
-                    ),
-                ));
-            }
-            &empty_index
-        }
-    };
-
-    std::fs::create_dir_all(deps_dir).map_err(io_err)?;
-
-    let project_root = deps_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let mut provider = ResolveProvider::new(
-        fetcher,
+    let (mut provider, _strict) = build_single_provider(
+        manifest,
         index,
-        deps_dir.to_path_buf(),
-        project_root,
-        overrides,
-        prior,
-    );
+        fetcher,
+        deps_dir,
+        ProviderOpts { prior, dep_decl_store, require_attested_metadata },
+        &empty_index,
+    )?;
 
     // Build the synthetic root candidate (requires every manifest dep) and the
     // BFS queue. dev_deps for the ROOT are enrolled here alongside deps (§9);
@@ -153,6 +122,11 @@ pub fn resolve(
     if let Some(e) = provider.take_error() {
         return Err(e);
     }
+
+    // S5: attestation-policy enforcement. Effective policy is the OR of the
+    // manifest-declared `attestation-policy "strict"` and the
+    // `--require-attested-metadata` CLI flag (flag cannot weaken manifest-strict).
+    enforce_attestation_policy(&provider, manifest, require_attested_metadata)?;
 
     Ok(provider.build_graph(&solution))
 }
@@ -176,6 +150,8 @@ pub(crate) fn resolve_default_strategy(
         prior,
         Strategy::default(),
         deps_dir,
+        None, // dep_decl_store: None (trait path, no dep-decl support)
+        false, // require_attested_metadata: false (trait path, no S5 flag)
     )
 }
 
@@ -187,6 +163,10 @@ pub(crate) fn resolve_default_strategy(
 /// member-named dep (direct `member "X"` or a bare named dep matching a member)
 /// auto-coerces to the in-tree member. Workspace-level checks: `RES-WS-NO-INDEX`,
 /// `RES-WS-OVERRIDE-MEMBER-COLLISION`, `RES-WS-MEMBER-REF-UNKNOWN`.
+///
+/// `require_attested_metadata` activates strict attestation policy (S5, §13.1).
+/// Effective workspace policy = logical OR of `require_attested_metadata` and any
+/// member manifest's `attestation-policy "strict"` declaration (§13.1 workspace rule).
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_workspace(
     workspace: &LoadedWorkspace,
@@ -196,6 +176,7 @@ pub fn resolve_workspace(
     prior: Option<&Lockfile>,
     strategy: Strategy,
     deps_dir: &Path,
+    require_attested_metadata: bool,
 ) -> Result<ResolvedGraph, MilpaError> {
     let overrides: BTreeMap<String, Override> = workspace
         .overrides
@@ -271,18 +252,20 @@ pub fn resolve_workspace(
     };
 
     std::fs::create_dir_all(deps_dir).map_err(io_err)?;
-    let project_root = deps_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+
+    // S5 workspace: effective strict = OR of flag/env and any member's
+    // attestation-policy "strict" (§13.1 workspace rule). Computed ONCE via the
+    // SSOT helpers (Finding 1) and reused for both the provider and enforcement.
+    let ws_is_strict = workspace_any_member_strict(workspace) || require_attested_metadata;
 
     let mut provider = ResolveProvider::new(
         fetcher,
         index,
         deps_dir.to_path_buf(),
-        project_root,
         overrides,
         prior,
+        None, // dep_decl_store: workspace path does not support DepDecl (S3b not yet wired for workspace)
+        ws_is_strict,
     );
     let queue = provider.seed_workspace(workspace, profile)?;
     provider.process_items(queue)?;
@@ -291,6 +274,11 @@ pub fn resolve_workspace(
     if let Some(e) = provider.take_error() {
         return Err(e);
     }
+
+    // §13.1 workspace attestation policy enforcement — reuse the pre-computed
+    // ws_is_strict (single computation, no duplicate any_member_strict loop).
+    enforce_attestation_policy_strict(&provider, ws_is_strict)?;
+
     Ok(provider.build_graph(&solution))
 }
 
@@ -346,9 +334,25 @@ enum PKey {
     Tarball(String),
 }
 
-/// What `extract_requires` / `build_from_*` return: solver edges, the require
-/// names (for the graph), the dep's `src_dir`, and the sub-items to enqueue.
-type Extracted = (Vec<SolverDep>, Vec<String>, String, Vec<Item>);
+/// What `extract_requires` returns after converting an `EdgeSet` to solver
+/// edges, require names, src_dir, and sub-items.  Carries the full `EdgeSet`
+/// so callers can inspect `edge_set.source` (e.g. to gate the DepDecl pin at
+/// the use-site rather than via a lossy `bool`).
+///
+/// Replaces the previous `(Vec<SolverDep>, Vec<String>, String, Vec<Item>, bool)`
+/// 5-tuple: the `bool` was `matches!(es.source, EdgeSource::DepDecl)` — lossy
+/// and positional.  The struct lets each field be named and the `EdgeSource`
+/// preserved.
+struct Extracted {
+    deps: Vec<SolverDep>,
+    requires_names: Vec<String>,
+    src_dir: String,
+    sub_items: Vec<Item>,
+    /// The full `EdgeSet` produced by `edgeset_to_extracted` (memoised in
+    /// `edge_cache`).  The dep_decl pin is derived from
+    /// `edge_set.source == EdgeSource::DepDecl` at the call-site.
+    edge_set: EdgeSet,
+}
 
 // ---------------------------------------------------------------------------
 // Materialized candidate
@@ -369,6 +373,10 @@ struct Candidate {
     /// fetched dep + workspace member. The resolver maps its internal transport
     /// [`Provenance`] → [`ProvenanceRecord`] here so the graph is emission-ready.
     provenance: Option<ProvenanceRecord>,
+    /// S6: dep_decl pin — the `sha256:<hex>` hash of the DepDecl artifact used
+    /// during resolution. Set only when the edge was sourced from a DepDecl
+    /// artifact (`EdgeSource::DepDecl`). `None` for milpa.kdl / nimble fallback.
+    dep_decl: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +403,12 @@ struct ResolveProvider<'a> {
     candidates: RefCell<BTreeMap<String, BTreeMap<Version, Candidate>>>,
     stubs: RefCell<BTreeMap<String, BTreeMap<Version, IndexVersion>>>,
 
+    /// Resolver-scoped edge memo (§4.2.1 clause a): sealed once per
+    /// `(name, version)` — parent-independent (diamond deps get identical
+    /// `EdgeSet`). Only modified from transport workers (eager) and
+    /// `materialize_named` (lazy); never from solver callbacks.
+    edge_cache: RefCell<BTreeMap<(String, Version), EdgeSet>>,
+
     seen_url: RefCell<BTreeSet<(String, String)>>,
     seen_named: RefCell<BTreeSet<String>>,
     seen_local: RefCell<BTreeSet<String>>,
@@ -402,6 +416,17 @@ struct ResolveProvider<'a> {
     seen_by_name: RefCell<BTreeMap<String, (PKey, bool)>>,
 
     error: RefCell<Option<MilpaError>>,
+
+    /// S3b: DepDecl store for index-attested metadata. `None` disables the
+    /// DepDecl mainline path (falls through to MilpaKdl/Nimble — S4-i compat).
+    dep_decl_store: Option<&'a dyn crate::dep_decl_store::DepDeclStore>,
+
+    /// S5 effective strict attestation policy: logical OR of
+    /// `manifest.attestation_policy == Strict` and `--require-attested-metadata`
+    /// flag/env. Pre-computed at construction so `extract_requires` can gate
+    /// `TNG-DEPDECL-FETCH-FAILED` fallback without re-reading the manifest
+    /// (spec §13.1; Python: `edge_sources.py` `strict_attestation` param).
+    strict_attestation: bool,
 }
 
 /// The cross-name gate's verdict for an item (§10).
@@ -412,14 +437,20 @@ enum Gate {
 }
 
 impl<'a> ResolveProvider<'a> {
+    /// `project_root` is always `deps_dir.parent()` — callers need not compute it.
     fn new(
         fetcher: &'a dyn FetcherRegistry,
         index: &'a Index,
         deps_dir: PathBuf,
-        project_root: PathBuf,
         overrides: BTreeMap<String, Override>,
         prior: Option<&'a Lockfile>,
+        dep_decl_store: Option<&'a dyn crate::dep_decl_store::DepDeclStore>,
+        strict_attestation: bool,
     ) -> Self {
+        let project_root = deps_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
         ResolveProvider {
             fetcher,
             index,
@@ -431,12 +462,15 @@ impl<'a> ResolveProvider<'a> {
             member_names: BTreeSet::new(),
             candidates: RefCell::new(BTreeMap::new()),
             stubs: RefCell::new(BTreeMap::new()),
+            edge_cache: RefCell::new(BTreeMap::new()),
             seen_url: RefCell::new(BTreeSet::new()),
             seen_named: RefCell::new(BTreeSet::new()),
             seen_local: RefCell::new(BTreeSet::new()),
             seen_tarball: RefCell::new(BTreeSet::new()),
             seen_by_name: RefCell::new(BTreeMap::new()),
             error: RefCell::new(None),
+            dep_decl_store,
+            strict_attestation,
         }
     }
 
@@ -532,6 +566,7 @@ impl<'a> ResolveProvider<'a> {
             requires_names: root_requires,
             deps: root_deps,
             provenance: None,
+            dep_decl: None,
         };
         self.store_candidate(root);
         Ok(queue)
@@ -661,6 +696,7 @@ impl<'a> ResolveProvider<'a> {
                 provenance: Some(ProvenanceRecord::Member {
                     name: member.name.clone(),
                 }),
+                dep_decl: None, // workspace members never resolved via DepDecl
             });
             root_deps.push(SolverDep::new(member.name.clone(), eq_sentinel()));
             root_requires.push(member.name.clone());
@@ -677,6 +713,7 @@ impl<'a> ResolveProvider<'a> {
             requires_names: root_requires,
             deps: root_deps,
             provenance: None,
+            dep_decl: None,
         };
         self.store_candidate(root);
         Ok(queue)
@@ -800,7 +837,8 @@ impl<'a> ResolveProvider<'a> {
         let (identity, receipt) =
             self.fetch_any(&dep.name, &provs, &dest, expected_identity.as_deref())?;
 
-        let (deps, requires, src_dir, sub_items) = self.extract_requires(&dest, &dep.name)?;
+        let ex =
+            self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None)?;
 
         // Record the declared primary provenance; carry the resolved commit
         // (preferring the freshly-resolved SHA over a pin) for emission.
@@ -809,17 +847,18 @@ impl<'a> ResolveProvider<'a> {
             name: dep.name.clone(),
             version: url_dep_version(),
             identity,
-            src_dir,
-            requires_names: requires,
-            deps,
+            src_dir: ex.src_dir,
+            requires_names: ex.requires_names,
+            deps: ex.deps,
             provenance: Some(ProvenanceRecord::Git {
                 url: dep.git.clone(),
                 ref_spec: opt(&dep.git_ref),
                 commit_sha: commit,
             }),
+            dep_decl: None, // URL deps not in the index; no DepDecl pin
         });
 
-        self.process_items(sub_items)?;
+        self.process_items(ex.sub_items)?;
         Ok(())
     }
 
@@ -839,21 +878,23 @@ impl<'a> ResolveProvider<'a> {
             .fetch(&dep.name, &prov, &dest)
             .map_err(MilpaError::from)?;
         let identity = compute_content_hash(&dest)?;
-        let (deps, requires, src_dir, sub_items) = self.extract_requires(&dest, &dep.name)?;
+        let ex =
+            self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None)?;
         self.store_candidate(Candidate {
             name: dep.name.clone(),
             version: url_dep_version(),
             identity,
-            src_dir,
-            requires_names: requires,
-            deps,
+            src_dir: ex.src_dir,
+            requires_names: ex.requires_names,
+            deps: ex.deps,
             provenance: Some(ProvenanceRecord::Local {
                 // The recorded path is the *declared relative* path (portable),
                 // not the absolute fetch path.
                 path: dep.path.clone(),
             }),
+            dep_decl: None, // local deps not in the index; no DepDecl pin
         });
-        self.process_items(sub_items)?;
+        self.process_items(ex.sub_items)?;
         Ok(())
     }
 
@@ -879,7 +920,8 @@ impl<'a> ResolveProvider<'a> {
             &dest,
             expected_identity.as_deref(),
         )?;
-        let (deps, requires, src_dir, sub_items) = self.extract_requires(&dest, &dep.name)?;
+        let ex =
+            self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None)?;
         // §5: record the TOFU pin. A manifest `sha256=` is authoritative; else
         // capture the digest the fetcher just computed (first fetch), falling
         // back to the prior lock's pin (refetch preserves it).
@@ -892,15 +934,16 @@ impl<'a> ResolveProvider<'a> {
             name: dep.name.clone(),
             version: url_dep_version(),
             identity,
-            src_dir,
-            requires_names: requires,
-            deps,
+            src_dir: ex.src_dir,
+            requires_names: ex.requires_names,
+            deps: ex.deps,
+            dep_decl: None, // tarball deps not in the index; no DepDecl pin
             provenance: Some(ProvenanceRecord::Tarball {
                 url: dep.url.clone(),
                 sha256: recorded_sha256,
             }),
         });
-        self.process_items(sub_items)?;
+        self.process_items(ex.sub_items)?;
         Ok(())
     }
 
@@ -975,17 +1018,29 @@ impl<'a> ResolveProvider<'a> {
             &dest,
             Some(entry.content_hash.as_str()),
         )?;
-        let (deps, requires, src_dir, sub_items) = self.extract_requires(&dest, name)?;
+        let ex = self.extract_requires(&dest, name, version, false,
+                entry.dep_decl.as_deref(),
+                entry.dep_decl_schema_version)?;
+        // S6: dep_decl pin records the artifact hash only when DepDeclEdgeSource was
+        // actually used (edge_set.source == DepDecl). If we fell back to milpa.kdl or
+        // nimble (e.g. non-strict FETCH-FAILED), the pin is None — matching Python:
+        // `iv.dep_decl if es.source == EdgeSource.DEP_DECL else None`.
+        let dep_decl_pin = if matches!(ex.edge_set.source, milpa_types::EdgeSource::DepDecl) {
+            entry.dep_decl.clone()
+        } else {
+            None
+        };
         let candidate = Candidate {
             name: name.to_string(),
             version: version.clone(),
             identity,
-            src_dir,
-            requires_names: requires,
-            deps: deps.clone(),
+            src_dir: ex.src_dir,
+            requires_names: ex.requires_names,
+            deps: ex.deps.clone(),
             // Record the canonical (first) provenance for emission, mapped to
             // the emission-level record.
             provenance: entry.provenances.first().map(transport_to_record),
+            dep_decl: dep_decl_pin,
         };
         self.store_candidate(candidate);
         self.stubs
@@ -994,8 +1049,8 @@ impl<'a> ResolveProvider<'a> {
             .map(|m| m.remove(version));
         // Enroll transitives discovered in this named dep (URL fetched eagerly;
         // named enrolled as stubs) so the solver can continue without a restart.
-        self.process_items(sub_items)?;
-        Ok(deps)
+        self.process_items(ex.sub_items)?;
+        Ok(ex.deps)
     }
 
     // --- fetch + extract ---------------------------------------------------
@@ -1041,116 +1096,278 @@ impl<'a> ResolveProvider<'a> {
         ))))
     }
 
-    /// Read a fetched dep's transitive requires. Prefers `milpa.kdl`; falls
-    /// back to `.nimble` for legacy Nim packages. Returns
-    /// `(solver deps, requires names, src_dir, sub-items)`.
-    fn extract_requires(&self, dest: &Path, name: &str) -> Result<Extracted, MilpaError> {
-        let milpa_kdl = dest.join("milpa.kdl");
-        if milpa_kdl.is_file() {
-            let text = std::fs::read_to_string(&milpa_kdl).map_err(io_err)?;
+    /// Read a fetched dep's transitive requires via the `EdgeSource` seam
+    /// (§4.2.1). Implements the priority-ordered sourcing decision and memoizes
+    /// the result in `edge_cache` (clause a). `version` is the solver-facing
+    /// version (`url_dep_version()` for eager URL/local/tarball deps; the index
+    /// version for named deps). `is_overridden` suppresses DepDecl (clause b).
+    ///
+    /// `dep_decl` and `dep_decl_schema_version` carry the index-attested DepDecl
+    /// pointer for named deps (S3b clause c). Both are `None` for URL/local/tarball
+    /// deps (not in the index).
+    ///
+    /// Returns `(solver deps, requires names, src_dir, sub-items)`.
+    fn extract_requires(
+        &self,
+        dest: &Path,
+        name: &str,
+        version: &Version,
+        is_overridden: bool,
+        dep_decl: Option<&str>,
+        dep_decl_schema_version: Option<i64>,
+    ) -> Result<Extracted, MilpaError> {
+        let has_milpa_kdl = dest.join("milpa.kdl").is_file();
+
+        // Clause (a): cache hit → reconstruct Extracted from cached EdgeSet
+        let cache_key = (name.to_string(), version.clone());
+        {
+            let cache = self.edge_cache.borrow();
+            if let Some(es) = cache.get(&cache_key) {
+                return self.edgeset_to_extracted(es, name);
+            }
+        }
+
+        // Cache miss: dispatch to appropriate source (clauses b/c/d).
+        let es: EdgeSet = if is_overridden {
+            // Clause (b): is_overridden suppresses DepDecl — use milpa.kdl or nimble.
+            if has_milpa_kdl {
+                let text =
+                    std::fs::read_to_string(dest.join("milpa.kdl")).map_err(io_err)?;
+                let manifest = milpa_manifest::parse_manifest(&text)?;
+                self.build_edgeset_from_manifest(&manifest)
+            } else {
+                let ctx = EdgeSourceCtx {
+                    dep_path: Some(dest),
+                    dep_name: name,
+                    dep_decl: None,
+                    is_overridden,
+                    has_milpa_kdl: false,
+                    dep_decl_schema_version: None,
+                    overrides_by_name: &self.overrides,
+                };
+                let src = NimbleEdgeSource;
+                src.edges_for(name, version, &ctx)
+            }
+        } else if dep_decl.is_some() {
+            if let Some(store) = self.dep_decl_store {
+                // Clause (c): index-attested DepDecl mainline (S3b).
+                //
+                // S5 policy gate (spec §6 / resolver-semantics §13; Python edge_sources.py:488-500):
+                //   TNG-DEPDECL-FETCH-FAILED: policy-gated.
+                //     Non-strict → fall through to milpa.kdl / nimble (NimbleFallback).
+                //     Strict     → hard error (propagate).
+                //   Integrity failures (HASH-MISMATCH, PARSE-ERROR, SCHEMA-*):
+                //     ALWAYS hard regardless of policy — supply-chain invariant.
+                let source = crate::edge_sources::DepDeclEdgeSource::new(store);
+                let ctx = EdgeSourceCtx {
+                    dep_path: Some(dest),
+                    dep_name: name,
+                    dep_decl,
+                    is_overridden: false,
+                    has_milpa_kdl,
+                    dep_decl_schema_version,
+                    overrides_by_name: &self.overrides,
+                };
+                match source.edges_for_result(name, &ctx) {
+                    Ok(es) => es,
+                    Err(ref e) if e.code() == "TNG-DEPDECL-FETCH-FAILED" && !self.strict_attestation => {
+                        // Non-strict: artifact unreachable → fall through to milpa.kdl / nimble.
+                        // The attestation-policy summary warning fires after solve() via
+                        // enforce_attestation_policy (same path as any NimbleFallback dep).
+                        if has_milpa_kdl {
+                            let text =
+                                std::fs::read_to_string(dest.join("milpa.kdl")).map_err(io_err)?;
+                            let manifest = milpa_manifest::parse_manifest(&text)?;
+                            self.build_edgeset_from_manifest(&manifest)
+                        } else {
+                            let fallback_ctx = EdgeSourceCtx {
+                                dep_path: Some(dest),
+                                dep_name: name,
+                                dep_decl: None,
+                                is_overridden: false,
+                                has_milpa_kdl: false,
+                                dep_decl_schema_version: None,
+                                overrides_by_name: &self.overrides,
+                            };
+                            let src = NimbleEdgeSource;
+                            src.edges_for(name, version, &fallback_ctx)
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                // dep_decl_store=None (S4-i compat): fall through to milpa.kdl / nimble.
+                if has_milpa_kdl {
+                    let text =
+                        std::fs::read_to_string(dest.join("milpa.kdl")).map_err(io_err)?;
+                    let manifest = milpa_manifest::parse_manifest(&text)?;
+                    self.build_edgeset_from_manifest(&manifest)
+                } else {
+                    let ctx = EdgeSourceCtx {
+                        dep_path: Some(dest),
+                        dep_name: name,
+                        dep_decl,
+                        is_overridden: false,
+                        has_milpa_kdl: false,
+                        dep_decl_schema_version,
+                        overrides_by_name: &self.overrides,
+                    };
+                    let src = NimbleEdgeSource;
+                    src.edges_for(name, version, &ctx)
+                }
+            }
+        } else if has_milpa_kdl {
+            // Clause (d): milpa.kdl present — parse with flag-predicate filtering.
+            // For milpa.kdl, parse the manifest here so we can apply flag-predicate
+            // filtering (§6 transitive: each dep evaluates against its own default
+            // flags). Flag filtering is resolver-local and not part of the EdgeSource
+            // seam's normative projection; it happens before constructing the EdgeSet.
+            let text = std::fs::read_to_string(dest.join("milpa.kdl")).map_err(io_err)?;
             let manifest = milpa_manifest::parse_manifest(&text)?;
-            return self.build_from_manifest(&manifest);
-        }
-        if let Some(nimble) = find_nimble(dest, name) {
-            let text = std::fs::read_to_string(&nimble).map_err(io_err)?;
-            let nm = parse_nimble(&text);
-            return self.build_from_nimble(&nm);
-        }
-        Ok((Vec::new(), Vec::new(), String::new(), Vec::new()))
+            self.build_edgeset_from_manifest(&manifest)
+        } else {
+            // Clause (d/else): nimble fallback.
+            let ctx = EdgeSourceCtx {
+                dep_path: Some(dest),
+                dep_name: name,
+                dep_decl: None,
+                is_overridden: false,
+                has_milpa_kdl: false,
+                dep_decl_schema_version: None,
+                overrides_by_name: &self.overrides,
+            };
+            let src = NimbleEdgeSource;
+            src.edges_for(name, version, &ctx)
+        };
+
+        // Seal cache (clause a) then convert to Extracted
+        let extracted = self.edgeset_to_extracted(&es, name)?;
+        self.edge_cache.borrow_mut().insert(cache_key, es);
+        Ok(extracted)
     }
 
-    /// Build solver deps from a transitive dep's `milpa.kdl`. Only `manifest.deps`
-    /// is read — **never** `dev_deps` (the §9 transitive-exclusion guard) — and
-    /// deps are filtered by `when flag=` predicates against this dep's own
-    /// default flags.
-    fn build_from_manifest(&self, manifest: &Manifest) -> Result<Extracted, MilpaError> {
+    /// Build an `EdgeSet` from a parsed `milpa.kdl` manifest, applying flag-
+    /// predicate filtering (§6 transitive: each dep evaluates against its own
+    /// default flags). Only `manifest.deps` is included — **never** `dev_deps`
+    /// (§9) — and `overrides` are dropped entirely (§10.2).
+    ///
+    /// Flag filtering is applied here (resolver-local) rather than in
+    /// `edge_sources::manifest_to_edgeset` (which is the pure normative
+    /// projection used by tests that don't need flag filtering).
+    fn build_edgeset_from_manifest(&self, manifest: &Manifest) -> EdgeSet {
+        use milpa_types::{NamedRequire, RequireEntry, UrlRequire};
         let active: BTreeSet<&str> = manifest
             .flags
             .iter()
             .filter(|f| f.default)
             .map(|f| f.name.as_str())
             .collect();
-
-        let mut deps = Vec::new();
-        let mut names = Vec::new();
-        let mut items = Vec::new();
+        let mut requires = Vec::new();
         for d in &manifest.deps {
             if !dep_passes_flag_predicates(d, &active) {
                 continue;
             }
             match d {
                 Dep::Url(u) => {
-                    deps.push(SolverDep::new(u.name.clone(), eq_sentinel()));
-                    names.push(u.name.clone());
-                    items.push(Item::Url(u.clone()));
+                    requires.push(RequireEntry::Url(UrlRequire {
+                        url: u.git.clone(),
+                        ref_: u.git_ref.clone(),
+                    }));
                 }
                 Dep::Named(n) => {
                     if n.name == "nim" {
                         continue;
                     }
-                    // Manifest-parsed: use the pre-validated VersionSet
-                    // (MAN-DEP-NAMED-CONSTRAINT raised at parse time).
+                    requires.push(RequireEntry::Named(NamedRequire {
+                        name: n.name.clone(),
+                        constraint_str: n.constraint.clone().unwrap_or_default(),
+                    }));
+                }
+                Dep::Local(_) | Dep::Tarball(_) | Dep::Member(_) => {}
+            }
+        }
+        // §10.2: manifest.overrides dropped entirely — NOT included in EdgeSet
+        EdgeSet {
+            requires,
+            src_dir: manifest.src_dir.clone(),
+            source: milpa_types::EdgeSource::MilpaKdl,
+        }
+    }
+
+    /// Convert an `EdgeSet` → `Extracted` (solver deps, names, src_dir, sub-items).
+    /// Override-aware: named transitive deps that are themselves overridden enter
+    /// as `eq_sentinel()` (§10); named deps without override use their constraint.
+    /// The original `EdgeSet` is preserved on the struct so callers can inspect
+    /// `edge_set.source` (e.g. `EdgeSource::DepDecl`) at the use-site.
+    fn edgeset_to_extracted(&self, es: &EdgeSet, _name: &str) -> Result<Extracted, MilpaError> {
+        use milpa_types::RequireEntry;
+        let mut deps: Vec<SolverDep> = Vec::new();
+        let mut requires_names: Vec<String> = Vec::new();
+        let mut items: Vec<Item> = Vec::new();
+
+        for entry in &es.requires {
+            match entry {
+                RequireEntry::Url(u) => {
+                    let dep_name = name_from_url(&u.url)?;
+                    deps.push(SolverDep::new(dep_name.clone(), eq_sentinel()));
+                    requires_names.push(dep_name.clone());
+                    items.push(Item::Url(url_dep(&dep_name, &u.url, &u.ref_)));
+                }
+                RequireEntry::Named(n) => {
+                    // Override check: a named transitive dep that is itself overridden
+                    // enters as eq_sentinel() so the resolver routes it through the
+                    // override URL fetch (§10).
                     let vs = if self.overrides.contains_key(&n.name) {
                         eq_sentinel()
                     } else {
-                        n.parsed_constraint
-                            .clone()
-                            .unwrap_or_else(VersionSet::full)
+                        // Constraint validation: milpa.kdl constraints are validated
+                        // at the manifest-parse boundary (MAN-DEP-NAMED-CONSTRAINT) and
+                        // are already valid here. Nimble constraints are validated here
+                        // for the first time → MAN-NIMBLE-CONSTRAINT on failure.
+                        let constraint_opt = if n.constraint_str.is_empty() {
+                            None
+                        } else {
+                            Some(n.constraint_str.as_str())
+                        };
+                        match VersionSet::from_constraint(constraint_opt) {
+                            Ok(vs) => vs,
+                            Err(e) => {
+                                if matches!(es.source, milpa_types::EdgeSource::NimbleFallback) {
+                                    return Err(MilpaError::Manifest(
+                                        milpa_manifest::ManifestError::new(
+                                            "MAN-NIMBLE-CONSTRAINT",
+                                            format!(
+                                                "malformed version constraint {:?}: {e}",
+                                                n.constraint_str
+                                            ),
+                                        ),
+                                    ));
+                                }
+                                VersionSet::full()
+                            }
+                        }
                     };
                     deps.push(SolverDep::new(n.name.clone(), vs.clone()));
-                    names.push(n.name.clone());
+                    requires_names.push(n.name.clone());
                     items.push(Item::Named {
                         name: n.name.clone(),
                         constraint: vs,
                     });
                 }
-                // Local/Tarball/Member from a transitive milpa.kdl are out of
-                // scope (mirrors the Python reference's deferral).
-                Dep::Local(_) | Dep::Tarball(_) | Dep::Member(_) => {}
             }
         }
-        Ok((deps, names, manifest.src_dir.clone(), items))
-    }
 
-    /// Build solver deps from a transitive dep's `.nimble` requires.
-    fn build_from_nimble(
-        &self,
-        nm: &milpa_manifest::nimble::NimbleManifest,
-    ) -> Result<Extracted, MilpaError> {
-        let mut deps = Vec::new();
-        let mut names = Vec::new();
-        let mut items = Vec::new();
-        for req in &nm.requires {
-            match req {
-                NimbleRequirement::Url { url, ref_spec, .. } => {
-                    let dep_name = name_from_url(url)?;
-                    deps.push(SolverDep::new(dep_name.clone(), eq_sentinel()));
-                    names.push(dep_name.clone());
-                    let git_ref = ref_spec.clone().unwrap_or_else(|| "main".to_string());
-                    items.push(Item::Url(url_dep(&dep_name, url, &git_ref)));
-                }
-                NimbleRequirement::Named {
-                    name, constraint, ..
-                } => {
-                    if name == "nim" {
-                        continue;
-                    }
-                    // Nimble-path: parse at the nimble boundary → MAN-NIMBLE-CONSTRAINT.
-                    let vs = if self.overrides.contains_key(name) {
-                        eq_sentinel()
-                    } else {
-                        from_nimble_constraint(constraint.as_deref())?
-                    };
-                    deps.push(SolverDep::new(name.clone(), vs.clone()));
-                    names.push(name.clone());
-                    items.push(Item::Named {
-                        name: name.clone(),
-                        constraint: vs,
-                    });
-                }
-            }
-        }
-        Ok((deps, names, nm.src_dir.clone().unwrap_or_default(), items))
+        // Carry the full EdgeSet so callers can inspect edge_set.source
+        // at the use-site (e.g. `EdgeSource::DepDecl` for the dep_decl pin).
+        // The previous lossy `bool dep_decl_used` is gone — derive it at
+        // the call-site with `matches!(x.edge_set.source, EdgeSource::DepDecl)`.
+        Ok(Extracted {
+            deps,
+            requires_names,
+            src_dir: es.src_dir.clone(),
+            sub_items: items,
+            edge_set: es.clone(),
+        })
     }
 
     // --- pin reuse (§8) ----------------------------------------------------
@@ -1307,6 +1524,7 @@ impl<'a> ResolveProvider<'a> {
                 provenance: c.provenance.clone().unwrap_or(ProvenanceRecord::Local {
                     path: String::new(),
                 }),
+                dep_decl: c.dep_decl.clone(),
             })
             .collect();
         ResolvedGraph { deps }
@@ -1408,20 +1626,6 @@ fn eq_sentinel() -> VersionSet {
     VersionSet::eq(url_dep_version())
 }
 
-/// Parse a `.nimble` requires constraint string → `VersionSet`, mapping any
-/// [`ConstraintError`](milpa_solver::ConstraintError) to `MAN-NIMBLE-CONSTRAINT`.
-/// This is the ONLY call site that should emit `MAN-NIMBLE-CONSTRAINT`; manifest
-/// named-dep constraints are validated at the manifest-parse boundary and arrive
-/// as pre-parsed `VersionSet`s on `NamedDep::parsed_constraint`.
-fn from_nimble_constraint(constraint: Option<&str>) -> Result<VersionSet, MilpaError> {
-    VersionSet::from_constraint(constraint).map_err(|e| {
-        MilpaError::Manifest(milpa_manifest::ManifestError::new(
-            "MAN-NIMBLE-CONSTRAINT",
-            format!("malformed version constraint {constraint:?}: {e}"),
-        ))
-    })
-}
-
 fn git_prov(url: &str, git_ref: &str, commit_sha: Option<String>) -> Provenance {
     Provenance::Git {
         url: url.to_string(),
@@ -1502,21 +1706,6 @@ fn name_from_url(url: &str) -> Result<String, MilpaError> {
         ));
     }
     Ok(name.to_string())
-}
-
-fn find_nimble(dir: &Path, hint: &str) -> Option<PathBuf> {
-    let by_hint = dir.join(format!("{hint}.nimble"));
-    if by_hint.is_file() {
-        return Some(by_hint);
-    }
-    let entries = std::fs::read_dir(dir).ok()?;
-    let mut found: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "nimble"))
-        .collect();
-    found.sort();
-    found.into_iter().next()
 }
 
 /// Filter conditional deps by the active profile (§6). Flag predicates evaluate
@@ -1607,6 +1796,218 @@ fn res_err(code: &'static str, msg: String) -> MilpaError {
     MilpaError::Core(CoreError::Resolver(code, msg))
 }
 
+// ---------------------------------------------------------------------------
+// Attestation-policy SSOT helpers (Finding 1)
+// ---------------------------------------------------------------------------
+
+/// Compute the effective strict attestation policy (S5, §13.1).
+///
+/// The rule is the logical OR of:
+///   - `manifest_policy == AttestationPolicy::Strict` (project-wide)
+///   - `flag` (CLI `--require-attested-metadata` / `MILPA_REQUIRE_ATTESTED_METADATA`)
+///
+/// The flag CANNOT weaken a manifest-declared strict policy (OR semantics).
+///
+/// This is the single source of truth for the effective-policy predicate.
+/// Mirrors `attestation.py::effective_strict_policy`.
+pub fn effective_strict_policy(manifest_policy: &milpa_manifest::AttestationPolicy, flag: bool) -> bool {
+    use milpa_manifest::AttestationPolicy;
+    *manifest_policy == AttestationPolicy::Strict || flag
+}
+
+/// Parse a truthy env-var value (D-F3 SSOT).
+///
+/// Mirrors the conventional shell/CI interpretation: a variable is "set to true"
+/// when it is non-empty AND is not `"0"` or `"false"`. The complement values
+/// (`""`, `"0"`, `"false"`) are all treated as false/unset. Used by both the CLI
+/// and the conformance runner for `MILPA_REQUIRE_ATTESTED_METADATA`.
+pub fn parse_env_bool(value: &str) -> bool {
+    !value.is_empty() && value != "0" && value != "false"
+}
+
+/// Compute whether any workspace member declares `attestation-policy "strict"`
+/// (§13.1 workspace rule).
+///
+/// Returns `true` iff at least one member manifest has a strict policy.
+/// Combine with the CLI flag via OR:
+/// `workspace_any_member_strict(ws) || flag`.
+pub fn workspace_any_member_strict(workspace: &LoadedWorkspace) -> bool {
+    use milpa_manifest::AttestationPolicy;
+    workspace
+        .members
+        .iter()
+        .any(|m| m.manifest.attestation_policy == AttestationPolicy::Strict)
+}
+
+/// S5: attestation-policy enforcement (spec/resolver-semantics.md §S5).
+///
+/// Called once after `solve()` completes. Effective strict policy = logical OR of:
+///   - `manifest.attestation_policy == AttestationPolicy::Strict` (project-wide)
+///   - `require_attested_metadata` flag (CLI `--require-attested-metadata`)
+///
+/// Non-strict: emit ONE summary warning to stderr for all NimbleFallback deps.
+/// Strict: return `Err(RES-UNATTESTED-METADATA)` if any dep used NimbleFallback.
+///
+/// The flag CANNOT weaken a manifest-declared strict policy (OR semantics).
+/// Integrity failures (TNG-DEPDECL-HASH-MISMATCH etc.) are hard errors wired
+/// at the DepDecl source — not here; they are never policy-gated.
+fn enforce_attestation_policy(
+    provider: &ResolveProvider<'_>,
+    manifest: &Manifest,
+    require_attested_metadata: bool,
+) -> Result<(), MilpaError> {
+    let is_strict = effective_strict_policy(&manifest.attestation_policy, require_attested_metadata);
+    enforce_attestation_policy_strict(provider, is_strict)
+}
+
+/// Core enforcement logic shared by single-package and workspace paths.
+///
+/// `is_strict` is the pre-computed effective policy (OR of all sources per §13.1).
+/// For single-package mode, compute `is_strict` from manifest + flag before calling.
+/// For workspace mode (§13.1 workspace rule), compute `is_strict` as the OR of the
+/// flag/env and any member manifest's `attestation-policy "strict"` declaration.
+fn enforce_attestation_policy_strict(
+    provider: &ResolveProvider<'_>,
+    is_strict: bool,
+) -> Result<(), MilpaError> {
+    use milpa_types::EdgeSource;
+
+    // Collect NimbleFallback dep names from the edge_cache (excluding __root__).
+    let edge_cache = provider.edge_cache.borrow();
+    let mut nimble_fallback_names: Vec<String> = edge_cache
+        .iter()
+        .filter(|((name, _ver), es)| {
+            name != ROOT && es.source == EdgeSource::NimbleFallback
+        })
+        .map(|((name, _ver), _es)| name.clone())
+        .collect();
+    nimble_fallback_names.sort();
+    nimble_fallback_names.dedup();
+
+    if nimble_fallback_names.is_empty() {
+        return Ok(());
+    }
+
+    if is_strict {
+        return Err(MilpaError::Core(CoreError::Resolver(
+            "RES-UNATTESTED-METADATA",
+            format!(
+                "strict attestation policy: {} dep(s) resolved from un-attested \
+                 .nimble metadata: {}. Ensure all deps are indexed with a dep_decl \
+                 pointer, or relax 'attestation-policy' to 'permissive' in milpa.kdl.",
+                nimble_fallback_names.len(),
+                nimble_fallback_names
+                    .iter()
+                    .map(|n| format!("{n:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )));
+    }
+
+    // Non-strict: single summary warning to stderr.
+    eprintln!(
+        "[milpa] warning: {} dep(s) resolved from un-attested .nimble metadata: {}; \
+         see spec §4.1 (attestation-policy / --require-attested-metadata).",
+        nimble_fallback_names.len(),
+        nimble_fallback_names.join(", "),
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared single-package setup helper (D-F2 SSOT)
+// ---------------------------------------------------------------------------
+
+/// Optional resolve knobs bundled to stay within clippy's argument-count limit.
+///
+/// `prior` enables §8 pin reuse; `dep_decl_store` drives S3b DepDecl; `require_attested_metadata`
+/// is the CLI/env strict-attestation flag (combined with the manifest policy via
+/// `effective_strict_policy` — §13.1 OR rule).
+struct ProviderOpts<'a> {
+    prior: Option<&'a Lockfile>,
+    dep_decl_store: Option<&'a dyn crate::dep_decl_store::DepDeclStore>,
+    require_attested_metadata: bool,
+}
+
+/// Build the [`ResolveProvider`] for a single-package resolve (both the
+/// non-cert and cert paths share identical setup; they diverge only at the
+/// solve dispatch and error-wrapping).
+///
+/// `manifest` must already be profile-filtered (callers own the
+/// `filter_manifest_by_profile` step because the filtered value needs to
+/// outlive this call). `empty_index` is a caller-owned `Index::default()`
+/// whose lifetime anchors the borrow in the returned provider.
+///
+/// Returns `(provider, strict_attestation)` on success.
+/// Returns `Err(MilpaError)` on `RES-NO-INDEX` or `create_dir_all` failure.
+///
+/// SSOT notes:
+///   - All three inline OR expressions (`resolve`, `resolve_with_cert`,
+///     `enforce_attestation_policy`) are now replaced by `effective_strict_policy`.
+///   - The `overrides` collection, named-dep/no-index check, `create_dir_all`,
+///     strict computation, and `ResolveProvider::new` live here exactly once.
+fn build_single_provider<'a>(
+    manifest: &'a Manifest,
+    index: Option<&'a Index>,
+    fetcher: &'a dyn FetcherRegistry,
+    deps_dir: &Path,
+    opts: ProviderOpts<'a>,
+    empty_index: &'a Index,
+) -> Result<(ResolveProvider<'a>, bool), MilpaError> {
+    let ProviderOpts { prior, dep_decl_store, require_attested_metadata } = opts;
+    let overrides: BTreeMap<String, Override> = manifest
+        .overrides
+        .iter()
+        .map(|ov| (ov.name.clone(), ov.clone()))
+        .collect();
+
+    // Index presence: a named dep with neither an index nor an override is
+    // unresolvable (resolver-semantics — RES-NO-INDEX).
+    let index: &'a Index = match index {
+        Some(i) => i,
+        None => {
+            let unresolvable: Vec<&str> = manifest
+                .deps
+                .iter()
+                .chain(manifest.dev_deps.iter())
+                .filter(|d| matches!(d, Dep::Named(_)) && !overrides.contains_key(d.name()))
+                .map(|d| d.name())
+                .collect();
+            if !unresolvable.is_empty() {
+                return Err(res_err(
+                    "RES-NO-INDEX",
+                    format!(
+                        "manifest has named dep(s) {unresolvable:?} but no tianguis index \
+                         was provided — pass an index to resolve named deps"
+                    ),
+                ));
+            }
+            empty_index
+        }
+    };
+
+    std::fs::create_dir_all(deps_dir).map_err(io_err)?;
+
+    // S5: effective strict policy is the SSOT OR of manifest policy and the
+    // CLI flag (resolver-semantics §13.1; OR semantics — flag cannot weaken
+    // manifest-strict).
+    let strict_attestation =
+        effective_strict_policy(&manifest.attestation_policy, require_attested_metadata);
+
+    let provider = ResolveProvider::new(
+        fetcher,
+        index,
+        deps_dir.to_path_buf(),
+        overrides,
+        prior,
+        dep_decl_store,
+        strict_attestation,
+    );
+
+    Ok((provider, strict_attestation))
+}
+
 /// Filesystem failures during resolution are uncoded in the spec (§5 leaves
 /// them to the host), rendered as the non-catalog `MILPA-INTERNAL-IO` sentinel
 /// (kept out of `all_codes()`, same as the identity/CAS I/O sentinel).
@@ -1665,8 +2066,15 @@ pub struct FailureCert {
 
 /// Resolve and also build a §5 result certificate.
 ///
+/// Mirrors `resolve` exactly — same `dep_decl_store` and `require_attested_metadata`
+/// wiring, same `enforce_attestation_policy` call after the solve — with the addition
+/// that every outcome (success, SOLVE-CONFLICT, strict-attestation failure, or any other
+/// error) also produces the appropriate certificate so §2.5 "cert written regardless of
+/// success/failure" is honoured.
+///
 /// On success returns `Ok((graph, cert))`.
-/// On SOLVE-CONFLICT returns `Err((err, failure_cert))`.
+/// On SOLVE-CONFLICT returns `Err((err, failure_cert))` with a populated refutation.
+/// On strict-attestation failure returns `Err((err, failure_cert))` with empty refutation.
 /// On any other error (manifest/fetch/index) returns `Err((err, failure_cert))` with
 /// an empty refutation (the certificate is only written when the resolver ran).
 #[allow(clippy::too_many_arguments)]
@@ -1678,8 +2086,11 @@ pub fn resolve_with_cert(
     prior: Option<&Lockfile>,
     strategy: Strategy,
     deps_dir: &std::path::Path,
+    dep_decl_store: Option<&dyn crate::dep_decl_store::DepDeclStore>,
+    require_attested_metadata: bool,
 ) -> Result<(ResolvedGraph, SuccessCert), (MilpaError, FailureCert)> {
-    // All the same setup as `resolve`, but delegates to `solve_with_refutation`.
+    // Delegates to `solve_with_refutation` instead of `solve`; all setup is
+    // identical to `resolve` — factored through `build_single_provider` (D-F2).
     let filtered;
     let manifest = match profile {
         Some(p) => {
@@ -1689,53 +2100,18 @@ pub fn resolve_with_cert(
         None => manifest,
     };
 
-    let overrides: BTreeMap<String, Override> = manifest
-        .overrides
-        .iter()
-        .map(|ov| (ov.name.clone(), ov.clone()))
-        .collect();
-
     let empty_index = Index::default();
-    let index: &Index = match index {
-        Some(i) => i,
-        None => {
-            let unresolvable: Vec<&str> = manifest
-                .deps
-                .iter()
-                .chain(manifest.dev_deps.iter())
-                .filter(|d| matches!(d, Dep::Named(_)) && !overrides.contains_key(d.name()))
-                .map(|d| d.name())
-                .collect();
-            if !unresolvable.is_empty() {
-                let err = res_err(
-                    "RES-NO-INDEX",
-                    format!(
-                        "manifest has named dep(s) {unresolvable:?} but no tianguis index was provided"
-                    ),
-                );
-                return Err((err, FailureCert { message: String::new(), refutation: Vec::new() }));
-            }
-            &empty_index
-        }
-    };
-
-    if let Err(e) = std::fs::create_dir_all(deps_dir).map_err(io_err) {
-        return Err((e, FailureCert { message: String::new(), refutation: Vec::new() }));
-    }
-
-    let project_root = deps_dir
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-
-    let mut provider = ResolveProvider::new(
-        fetcher,
+    let (mut provider, _strict) = match build_single_provider(
+        manifest,
         index,
-        deps_dir.to_path_buf(),
-        project_root,
-        overrides,
-        prior,
-    );
+        fetcher,
+        deps_dir,
+        ProviderOpts { prior, dep_decl_store, require_attested_metadata },
+        &empty_index,
+    ) {
+        Ok(r) => r,
+        Err(e) => return Err((e, FailureCert { message: String::new(), refutation: Vec::new() })),
+    };
 
     let queue = match provider.seed_root(manifest) {
         Ok(q) => q,
@@ -1749,6 +2125,13 @@ pub fn resolve_with_cert(
     match solve_with_refutation(&provider, ROOT, root_version(), strategy) {
         Ok(solution) => {
             if let Some(e) = provider.take_error() {
+                return Err((e, FailureCert { message: String::new(), refutation: Vec::new() }));
+            }
+            // Mirror `resolve`: enforce attestation policy after the solve.
+            // On strict failure, produce a FAILURE certificate (empty refutation —
+            // this is not a SOLVE-CONFLICT) and propagate the error. §2.5 requires
+            // the cert to be written on both success and failure paths.
+            if let Err(e) = enforce_attestation_policy(&provider, manifest, require_attested_metadata) {
                 return Err((e, FailureCert { message: String::new(), refutation: Vec::new() }));
             }
             let cert = provider.build_success_cert(&solution);

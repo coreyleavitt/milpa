@@ -203,6 +203,27 @@ def _fixture_profile(fixture_dir: Path) -> Profile | None:
     )
 
 
+def _fixture_require_attested_metadata(fixture_dir: Path) -> bool:
+    """Return True when MILPA_REQUIRE_ATTESTED_METADATA is set in the fixture env file.
+
+    Mirrors the Rust runner's fixture_require_attested_metadata() function.
+    The truthy values are any non-empty string that is not "0" or "false".
+    """
+    env_file = fixture_dir / "env"
+    if not env_file.exists():
+        return False
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, _, value = line.partition("=")
+            if key.strip() == "MILPA_REQUIRE_ATTESTED_METADATA":
+                v = value.strip()
+                return bool(v and v not in ("0", "false"))
+    return False
+
+
 # ---------------------------------------------------------------------------
 # MilpaEnv construction for in-process conformance
 # ---------------------------------------------------------------------------
@@ -243,10 +264,21 @@ def _build_env(fixture_dir: Path, tmp_dir: Path) -> MilpaEnv:
         except Exception:
             index = None
 
+    # S3b: when the fixture ships a ``dep-decl/`` artifact dir, build a
+    # ``FileDepDeclStore`` over it — the in-process mirror of the harness
+    # injecting ``MILPA_DEP_DECL_DIR`` (S3a, conformance-fixtures.md §2.11).
+    # Without this the DepDecl edge-source branch is never reached and an
+    # attested-metadata fixture would silently resolve from .nimble/milpa.kdl.
+    from milpa.dep_decl_store import FileDepDeclStore
+
+    dep_decl_dir = fixture_dir / "dep-decl"
+    dep_decl_store = FileDepDeclStore(dep_decl_dir) if dep_decl_dir.is_dir() else None
+
     return MilpaEnv(
         fetcher=fetcher,
         index=index,
         store=store,
+        dep_decl_store=dep_decl_store,
     )
 
 
@@ -407,6 +439,13 @@ def _execute_fixture(
         return _execute_check_certificate(fixture, tmp_dir, env)
 
     # ------------------------------------------------------------------
+    # verify: frozen-fetch to populate _deps/, then run verify in-process
+    # (S6 / spec §3.7.2)
+    # ------------------------------------------------------------------
+    if cmd == "verify":
+        return _execute_verify(fixture, tmp_dir, env)
+
+    # ------------------------------------------------------------------
     # resolve / frozen: read milpa.kdl + dispatch
     # ------------------------------------------------------------------
     kdl_path = fixture_dir / "milpa.kdl"
@@ -484,6 +523,7 @@ def _execute_fixture(
         max_parallel=1,
         profile=profile,
         prior=prior,
+        require_attested_metadata=_fixture_require_attested_metadata(fixture_dir),
     )
 
     try:
@@ -560,6 +600,7 @@ def _execute_check_certificate(
         max_parallel=1,
         profile=profile,
         prior=prior,
+        require_attested_metadata=_fixture_require_attested_metadata(fixture_dir),
     )
 
     # Expected certificate
@@ -622,6 +663,172 @@ def _execute_check_certificate(
     # For 'fetch', assert lock + nim.cfg + _deps_structure.txt.
     # For 'lock', assert only milpa.lock.
     return _diff_success(fixture, graph, doc, tmp_dir, deps_dir)
+
+
+# ---------------------------------------------------------------------------
+# verify execution (S6 / spec §3.7.2)
+# ---------------------------------------------------------------------------
+
+
+def _execute_verify(
+    fixture: Fixture,
+    tmp_dir: Path,
+    env: MilpaEnv,
+) -> tuple[Literal["pass", "fail", "skip"], str]:
+    """Execute a verify fixture in-process.
+
+    Two-phase — mirrors the harness black-box approach exactly:
+    1. Regular (non-frozen) resolve to populate _deps/ and warm the CAS.
+       This uses the fixture's milpa.kdl + mocked-fetches/ + index.kdl.
+       The newly-generated milpa.lock is discarded; the pre-authored fixture
+       milpa.lock (with the old dep_decl pins under test) is used for verify.
+    2. In-process verify: disk check + dep_decl edge check vs live index.
+
+    The verify fixture ships:
+    - milpa.kdl      — the project manifest
+    - milpa.lock     — pre-authored lockfile with old dep_decl pins (the tripwire)
+    - mocked-fetches/ — dep artifacts for the regular pre-phase fetch
+    - dep-decl/      — DepDecl artifacts (injected into env.dep_decl_store)
+    - index.kdl      — live (drifted) index for dep_decl edge check
+    - expected/error — expected error slug (all S6 verify fixtures are error-class)
+    """
+    from milpa.lockfile import parse_lockfile, verify_lockfile_against_deps
+
+    fixture_dir = fixture.dir
+    deps_dir = tmp_dir / "_deps"
+    deps_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = fixture_dir / "milpa.lock"
+
+    # Stash the pre-authored milpa.lock (with the old dep_decl pins).
+    try:
+        lock_text = lock_path.read_text(encoding="utf-8")
+        lockfile = parse_lockfile(lock_text)
+    except MilpaError as e:
+        return ("fail", f"verify: failed to parse fixture milpa.lock: {e.slug!r}")
+    except OSError as e:
+        return ("fail", f"verify: fixture milpa.lock unreadable: {e}")
+
+    # Phase 1: regular (non-frozen) resolve to populate _deps/ and warm the CAS.
+    kdl_path = fixture_dir / "milpa.kdl"
+    try:
+        kdl_text = kdl_path.read_text(encoding="utf-8")
+    except OSError as e:
+        return ("fail", f"E2E-MANIFEST-UNREADABLE: {e}")
+    try:
+        doc = parse_workspace_or_manifest(kdl_text)
+    except MilpaError as e:
+        return ("fail", f"verify: manifest parse failed: {e.slug!r}")
+
+    try:
+        if isinstance(doc, WorkspaceManifest):
+            try:
+                loaded_ws = load_workspace(fixture_dir)
+            except MilpaError as e:
+                return ("fail", f"verify: workspace load failed: {e.slug!r}")
+            resolve_workspace(loaded_ws, deps_dir, env, ResolveParams())
+        else:
+            assert isinstance(doc, Manifest)
+            resolve(doc, deps_dir, env, ResolveParams())
+    except MilpaError as e:
+        # Regular resolve failed — _deps/ not populated; verify will fail too.
+        # For S6 fixtures, the pre-phase resolve should always succeed.
+        return ("fail", f"verify: pre-phase resolve failed: {e.slug!r}")
+
+    # The pre-phase resolve generated a new milpa.lock (with the new dep_decl
+    # hash from the drifted index).  We ignore it and use the pre-authored lock
+    # (with the old pin) — that's the supply-chain tripwire under test.
+    # Write the pre-authored lockfile into tmp_dir for the disk check below.
+    (tmp_dir / "milpa.lock").write_text(lock_text, encoding="utf-8")
+
+    # Phase 2: in-process verify.
+    # We reproduce cmd_verify's logic in-process rather than calling cmd_verify
+    # directly (which would re-load env from os.environ, not the fixture env).
+    from milpa.registry import parse_index
+
+    flag_require_attested = _fixture_require_attested_metadata(fixture_dir)
+
+    # §13.1: effective strict = OR(manifest attestation-policy "strict", flag).
+    # Reuse the same SSOT helper as the CLI cmd_verify.
+    from milpa.attestation import effective_strict_policy
+    if isinstance(doc, WorkspaceManifest):
+        # Workspace: OR across all members (same rule as resolve_workspace).
+        try:
+            loaded_ws_for_policy = load_workspace(fixture_dir)
+            _strict = flag_require_attested or any(
+                effective_strict_policy(m.manifest.attestation_policy, False)
+                for m in loaded_ws_for_policy.members
+            )
+        except MilpaError:
+            _strict = flag_require_attested
+    else:
+        assert isinstance(doc, Manifest)
+        _strict = effective_strict_policy(doc.attestation_policy, flag_require_attested)
+
+    # Disk check.
+    divergences = verify_lockfile_against_deps(lockfile, deps_dir)
+    if divergences:
+        slug = "LOCK-GRAPH-MISMATCH"
+        if fixture.expected_error is not None and fixture.expected_error == slug:
+            return ("pass", "")
+        return ("fail", f"verify: disk check failed (expected {fixture.expected_error!r}): {divergences}")
+
+    # Edge check: dep_decl pins vs live index.
+    pinned_deps = [d for d in lockfile.deps if d.dep_decl is not None]
+    if not pinned_deps:
+        # No pins → verify passes; S6 error fixtures always have pins.
+        if fixture.expected_error is not None:
+            return ("fail", f"verify: expected error {fixture.expected_error!r} but no dep_decl pins to check")
+        return ("pass", "")
+
+    index_path = fixture_dir / "index.kdl"
+    if not index_path.exists():
+        # Offline: no index available.
+        if _strict:
+            slug = "VERIFY-EDGE-MISMATCH"
+        else:
+            # Edge check skipped (offline) — treat as pass for fixture purposes.
+            if fixture.expected_error is not None:
+                return ("fail", f"verify: offline — edge check skipped but expected error {fixture.expected_error!r}")
+            return ("pass", "")
+        if fixture.expected_error is not None and fixture.expected_error == slug:
+            return ("pass", "")
+        return ("fail", f"verify: offline strict failed with {slug!r} (expected {fixture.expected_error!r})")
+
+    # Load index.
+    try:
+        index = parse_index(index_path.read_text(encoding="utf-8"))
+    except MilpaError as e:
+        return ("fail", f"verify: index parse failed: {e.slug!r}")
+
+    # Per-dep edge check.
+    for dep in pinned_deps:
+        assert dep.dep_decl is not None
+        locked_pin = dep.dep_decl
+
+        pkg = index.lookup_bare(dep.name)
+        if pkg is None or hasattr(pkg, "namespaces"):
+            slug = "LOCK-DEPDECL-PIN-MISSING"
+            if fixture.expected_error is not None and fixture.expected_error == slug:
+                return ("pass", "")
+            return ("fail", f"verify: dep '{dep.name}' not in index — expected {fixture.expected_error!r}, got {slug!r}")
+
+        iv = next((iv for iv in pkg.versions if iv.version == dep.version), None)
+        if iv is None or iv.dep_decl is None:
+            slug = "LOCK-DEPDECL-PIN-MISSING"
+            if fixture.expected_error is not None and fixture.expected_error == slug:
+                return ("pass", "")
+            return ("fail", f"verify: dep '{dep.name}@{dep.version}' pin orphaned — expected {fixture.expected_error!r}, got {slug!r}")
+
+        if iv.dep_decl != locked_pin:
+            slug = "VERIFY-EDGE-MISMATCH"
+            if fixture.expected_error is not None and fixture.expected_error == slug:
+                return ("pass", "")
+            return ("fail", f"verify: dep '{dep.name}@{dep.version}' dep_decl mismatch — expected {fixture.expected_error!r}, got {slug!r}")
+
+    # All pins matched.
+    if fixture.expected_error is not None:
+        return ("fail", f"verify: expected error {fixture.expected_error!r} but all checks passed")
+    return ("pass", "")
 
 
 # ---------------------------------------------------------------------------

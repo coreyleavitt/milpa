@@ -1,0 +1,6 @@
+name "member-a"
+kind "library"
+attestation-policy "strict"
+deps {
+    bar git="https://github.com/example/bar.git" ref="v2.0.0"
+}

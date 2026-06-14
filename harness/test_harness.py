@@ -43,10 +43,129 @@ from harness.corpus import (
     run_corpus,
 )
 from harness.descriptors import ImplDescriptor, build_descriptors
-from harness.runner import run_fixture
+from harness.runner import _build_env, _copy_fixture_inputs, run_fixture
 
 _CONFORMANCE_ROOT = _REPO_ROOT / "conformance"
 _SPEC_V1 = _CONFORMANCE_ROOT / "spec-v1"
+
+
+# ---------------------------------------------------------------------------
+# B0 — S3a: dep-decl/ fixture artifact dir + MILPA_DEP_DECL_DIR injection
+# ---------------------------------------------------------------------------
+
+class TestB0DepDeclDirInjection(unittest.TestCase):
+    """B0: dep-decl/ is copied verbatim + MILPA_DEP_DECL_DIR is injected.
+
+    Mirrors how mocked-fetches/ is copied and MILPA_MOCKED_FETCHES is injected.
+    These tests target _copy_fixture_inputs and _build_env directly (unit level)
+    to verify the S3a plumbing without running a full impl subprocess.
+
+    B0-a: fixture WITH dep-decl/ → dir copied into scratch + MILPA_DEP_DECL_DIR set.
+    B0-b: fixture WITHOUT dep-decl/ → MILPA_DEP_DECL_DIR is absent from env.
+    B0-c: dep-decl/ is NOT treated as a control file (i.e. it IS copied).
+    B0-d: MILPA_DEP_DECL_DIR value points to scratch/dep-decl/ (absolute resolved path).
+    B0-e: MILPA_DEP_DECL_DIR not leaked from host env when fixture lacks dep-decl/.
+    """
+
+    def setUp(self) -> None:
+        self._fixture_dir = Path(tempfile.mkdtemp(prefix="milpa-b0-fixture-"))
+        self._scratch_dir = Path(tempfile.mkdtemp(prefix="milpa-b0-scratch-"))
+        self._cas_dir = Path(tempfile.mkdtemp(prefix="milpa-b0-cas-"))
+
+    def tearDown(self) -> None:
+        for d in (self._fixture_dir, self._scratch_dir, self._cas_dir):
+            shutil.rmtree(d, ignore_errors=True)
+
+    def _make_fixture_with_dep_decl(self) -> None:
+        """Populate self._fixture_dir with a dep-decl/ subdirectory + minimal milpa.kdl."""
+        (self._fixture_dir / "milpa.kdl").write_text('name "test"\nkind "application"\n')
+        dep_decl_dir = self._fixture_dir / "dep-decl"
+        dep_decl_dir.mkdir()
+        # Write a synthetic artifact file (sha256 hex name, .kdl contents).
+        (dep_decl_dir / ("a" * 64 + ".kdl")).write_text("dep_decl {\n    dep_decl_schema_version 0\n}\n")
+
+    def _make_fixture_without_dep_decl(self) -> None:
+        """Populate self._fixture_dir WITHOUT dep-decl/ (baseline fixture)."""
+        (self._fixture_dir / "milpa.kdl").write_text('name "test"\nkind "application"\n')
+
+    def test_b0a_dep_decl_dir_copied_into_scratch(self) -> None:
+        """B0-a: when dep-decl/ is present it is copied verbatim into scratch."""
+        self._make_fixture_with_dep_decl()
+        _copy_fixture_inputs(self._fixture_dir, self._scratch_dir)
+        self.assertTrue(
+            (self._scratch_dir / "dep-decl").is_dir(),
+            "dep-decl/ must be copied into scratch when present in the fixture",
+        )
+
+    def test_b0a_dep_decl_contents_copied(self) -> None:
+        """B0-a: artifact files inside dep-decl/ are preserved byte-for-byte."""
+        self._make_fixture_with_dep_decl()
+        _copy_fixture_inputs(self._fixture_dir, self._scratch_dir)
+        artifact_name = "a" * 64 + ".kdl"
+        artifact = self._scratch_dir / "dep-decl" / artifact_name  # noqa: E501
+        self.assertTrue(artifact.exists(), f"Artifact {artifact_name} must be copied")
+        original = (self._fixture_dir / "dep-decl" / artifact_name).read_bytes()
+        self.assertEqual(artifact.read_bytes(), original)
+
+    def test_b0b_milpa_dep_decl_dir_injected_when_present(self) -> None:
+        """B0-b: MILPA_DEP_DECL_DIR is set when scratch/dep-decl/ exists."""
+        self._make_fixture_with_dep_decl()
+        _copy_fixture_inputs(self._fixture_dir, self._scratch_dir)
+        env = _build_env(self._scratch_dir, self._cas_dir, {}, {})
+        self.assertIn(
+            "MILPA_DEP_DECL_DIR", env,
+            "MILPA_DEP_DECL_DIR must be injected when dep-decl/ is present",
+        )
+
+    def test_b0b_milpa_dep_decl_dir_absent_when_not_present(self) -> None:
+        """B0-b: MILPA_DEP_DECL_DIR is NOT set when fixture lacks dep-decl/."""
+        self._make_fixture_without_dep_decl()
+        _copy_fixture_inputs(self._fixture_dir, self._scratch_dir)
+        # Ensure host env can't leak in (strip MILPA_* as the runner does).
+        env = _build_env(self._scratch_dir, self._cas_dir, {}, {})
+        self.assertNotIn(
+            "MILPA_DEP_DECL_DIR", env,
+            "MILPA_DEP_DECL_DIR must NOT be injected when dep-decl/ is absent",
+        )
+
+    def test_b0c_dep_decl_not_in_control_files(self) -> None:
+        """B0-c: dep-decl/ is a fixture artifact dir, not a control file (it IS copied)."""
+        # The control files are: expected, cmd, env.
+        # dep-decl/ must NOT be in _CONTROL_FILES.
+        from harness.runner import _CONTROL_FILES
+        self.assertNotIn("dep-decl", _CONTROL_FILES)
+
+    def test_b0d_milpa_dep_decl_dir_value_is_absolute_scratch_subdir(self) -> None:
+        """B0-d: MILPA_DEP_DECL_DIR value is the resolved absolute path scratch/dep-decl/."""
+        self._make_fixture_with_dep_decl()
+        _copy_fixture_inputs(self._fixture_dir, self._scratch_dir)
+        env = _build_env(self._scratch_dir, self._cas_dir, {}, {})
+        expected = str((self._scratch_dir / "dep-decl").resolve())
+        self.assertEqual(
+            env.get("MILPA_DEP_DECL_DIR"), expected,
+            f"MILPA_DEP_DECL_DIR must be the resolved scratch/dep-decl/ path: {expected}",
+        )
+
+    def test_b0e_host_milpa_dep_decl_dir_stripped(self) -> None:
+        """B0-e: a MILPA_DEP_DECL_DIR on the host env does NOT leak when fixture lacks dep-decl/."""
+        self._make_fixture_without_dep_decl()
+        _copy_fixture_inputs(self._fixture_dir, self._scratch_dir)
+        # Inject a fake host MILPA_DEP_DECL_DIR and verify it is stripped.
+        # _build_env already strips all MILPA_* from os.environ; we test that
+        # the stripped baseline does not re-add an absent dep-decl/ entry.
+        original = os.environ.copy()
+        os.environ["MILPA_DEP_DECL_DIR"] = "/some/host/path"
+        try:
+            env = _build_env(self._scratch_dir, self._cas_dir, {}, {})
+        finally:
+            if "MILPA_DEP_DECL_DIR" in original:
+                os.environ["MILPA_DEP_DECL_DIR"] = original["MILPA_DEP_DECL_DIR"]
+            else:
+                os.environ.pop("MILPA_DEP_DECL_DIR", None)
+        self.assertNotIn(
+            "MILPA_DEP_DECL_DIR", env,
+            "Host MILPA_DEP_DECL_DIR must be stripped when fixture lacks dep-decl/",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -72,9 +191,8 @@ class TestB1FixtureRunner(unittest.TestCase):
         run = run_fixture(fixture_dir, desc)
         result = assert_conformance(run, fixture_dir)
 
-        # Clean up scratch + CAS after asserting.
-        for d in (run.scratch_dir, run.cas_dir):
-            shutil.rmtree(d, ignore_errors=True)
+        # Clean up scratch + CAS after asserting (SSOT via RunResult.cleanup).
+        run.cleanup()
 
         self.assertTrue(
             result.passed,
@@ -94,8 +212,8 @@ class TestB1FixtureRunner(unittest.TestCase):
         run = run_fixture(fixture_dir, desc)
         result = assert_conformance(run, fixture_dir)
 
-        for d in (run.scratch_dir, run.cas_dir):
-            shutil.rmtree(d, ignore_errors=True)
+        # Clean up scratch + CAS after asserting (SSOT via RunResult.cleanup).
+        run.cleanup()
 
         self.assertTrue(
             result.passed,
