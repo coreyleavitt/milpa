@@ -59,22 +59,37 @@ The Python implementation (uv-managed) lives in `impls/python/`; its package is
 
 | Module | Role |
 |---|---|
-| `manifest.py` | `milpa.kdl` parse + format + auto-discovery (`.nimble` fallback) |
-| `nimble_parse.py` | `.nimble` line-form parser (no nimscript eval) |
-| `identity.py` | `compute_content_hash(path)` — sha256 of source tree per spec |
-| `fetcher.py` | git clone + content hash via `fetch_url_dep(name, git, ref, deps_dir)` |
-| `tianguis_client.py` | tianguis `index.kdl` reader — named-dep resolution (identity + provenance + version set); replaced `registry.py`/nim-lang per #97 |
-| `solver.py` | **PubGrub** (teaching-clean form) + `VersionSet` algebra + `Strategy` enum |
-| `resolver.py` | top-level glue: manifest → fetch + parse + solve → `ResolvedGraph` |
-| `lockfile.py` | `milpa.lock` parse + format + verification (`verify_against_graph`, `verify_lockfile_against_deps`) |
+| `manifest.py` | `milpa.kdl` data model and parser; auto-discovery (`.nimble` fallback) |
+| `nimble.py` | heuristic line-scanner for `.nimble` files (no nimscript eval) |
+| `identity.py` | `compute_content_hash(path)` — sha256 of source tree per `spec/identity.md` |
+| `kdl_io.py` | KDL 2.0 façade over kdl-py |
+| `version.py` | `Version` type + version algebra — single source of truth for version semantics |
+| `solver.py` | **PubGrub** (teaching-clean port) + `VersionSet` algebra + `Strategy` enum |
+| `dep_decl.py` | `DepDecl` artifact parser and `EdgeSet` type (S1 consumer side) |
+| `dep_decl_store.py` | `DepDeclStore` protocol + `FileDepDeclStore` + `HttpDepDeclStore` (S3b) |
+| `edge_sources.py` | edge-sourcing seam — S4-i + S3b (RFC: Content-Addressed Attested Dependency Metadata) |
+| `registry.py` | tianguis `index.kdl` reader — named-dep resolution (S8a) |
+| `index_cache.py` | tianguis index acquisition — four-state freshness cache (S8b) |
+| `attestation.py` | attestation-policy helpers (S5 — RFC: Content-Addressed Attested Dependency Metadata) |
+| `context.py` | execution-context seam — `MilpaEnv` + `ResolveParams` |
+| `profile.py` | `Profile` data types — runtime resolution context |
+| `resolver.py` | top-level glue: manifest → fetch + solve → `ResolvedGraph` |
+| `frozen.py` | lockfile-backed graph reconstruction (no fetcher invocation) |
+| `workspace.py` | workspace loading and manifest discovery — all filesystem I/O |
+| `lockfile.py` | `milpa.lock` parse + format + verification |
 | `nimcfg.py` | `nim.cfg` emission from `ResolvedGraph` |
-| `cli.py` | argparse + the 5 subcommands (`fetch`/`lock`/`show`/`verify`/`clean`) |
+| `cas.py` | content-addressed store per `spec/identity.md §3` |
+| `manifest_writer.py` | atomic mutation of `milpa.kdl` |
+| `errors.py` | error slug constants + `MilpaError` exception |
+| `cli.py` | CLI entry point — all subcommands (`fetch`/`lock`/`show`/`verify`/`clean`/`add`/`remove`/`update`) |
+| `fetchers/` | pluggable fetcher subpackage: `types.py` (protocol + registry), `git.py`, `tarball.py`, `local.py`, `oci.py`, `mocked.py` (conformance fakes), `cas_admitting.py` (CAS wrapper), `safe_extract.py` |
 
 The package boundary lines up with conceptual responsibility. There's
 **one source of truth** for each cross-cutting concern:
-- `Version` type + `parse_version` → `solver.py` only
+- `Version` type + version algebra → `version.py` only
 - Content hash algorithm → `identity.py` only
-- Constraint matching → `VersionSet.from_constraint(c).contains(v)` only
+- Constraint matching → `VersionSet.from_constraint(c).contains(v)` in `solver.py` only
+- Error slugs → `errors.py` only (`spec/errors.md` is spec-owned, NOT generated from impl)
 
 If you find yourself implementing something that already exists in
 another module, stop. There's an audit-for-duplication discipline
@@ -259,27 +274,12 @@ in the corresponding `test_*.py` file (per
 v1.5 spec extraction lands, those pinned counterexamples get promoted
 to JSON fixtures in the conformance test suite.
 
-## Status snapshot (2026-05-22)
+## Status snapshot (2026-06-14)
 
-- **Suite**: 220 unit tests + 4 gated integration tests (all passing)
-- **Commits since v0**: significant (Tier 1 + Tier 2 partial + property
-  tests A-C + audit cleanups + RFC commits)
-- **Open milestones**:
-  - v0.x — ergonomic CLI + manifest editing (9 open)
-  - backlog — unscheduled (5 open)
-  - content-addressed identity (8 open — Phase B-E)
-  - pluggable fetchers (9 open — F1-F8 + SafeExtractor)
-  - property-based testing (4 open — research + infrastructure)
-  - research roadmap (3 open)
-  - v2 toolchain (8 open)
-  - v1.5 spec extraction (1 open — error catalog #14)
-- **Bugs found by Hypothesis this session** (good kind of finding):
-  2 (VersionSet `_normalize_intervals` lo=None merge gap; lockfile
-  format silently dropping `tag` field). Both fixed + pinned as
-  regression tests.
-- **Code quality cleanups this session**: 4 unifications (`match_constraint`
-  → VersionSet, duplicate `Version` type, duplicate `parse_version`,
-  `_content_hash` thin alias)
+#6 (clean-room Python rewrite, RFC `rfc-python-clean-room-rewrite`) fully complete and
+swapped in: `impls/python/` IS the rewrite; the frozen design-vehicle impl is deleted;
+`spec/errors.md` is spec-owned (not generated from any impl); harness runs `python` +
+`rust` with zero cross-impl divergence.
 
 ## Real fresco verification
 
