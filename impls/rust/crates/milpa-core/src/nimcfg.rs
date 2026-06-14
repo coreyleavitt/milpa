@@ -197,6 +197,7 @@ mod tests {
                 commit_sha: None,
             },
             dep_decl: None,
+            cond_requires: vec![],
         }
     }
 

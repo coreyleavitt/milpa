@@ -520,8 +520,8 @@ def edgeset_to_terms(
     es: EdgeSet,
     overrides_by_name: dict[str, "Override"],
     url_dep_version: "Version",
-) -> tuple[list["Term"], list[str]]:
-    """Convert an ``EdgeSet`` to the solver's ``(dep_terms, requires_names)`` tuple.
+) -> tuple[list["Term"], list[str], dict[str, "tuple[object, ...]"]]:
+    """Convert an ``EdgeSet`` to the solver's ``(dep_terms, requires_names, requires_predicates)`` tuple.
 
     This is the single source of truth for ``EdgeSet → Term`` mapping,
     replacing the inline logic scattered across ``_parse_transitive_deps``
@@ -543,14 +543,20 @@ def edgeset_to_terms(
 
     Returns
     -------
-    (dep_terms, requires_names):
-        Ready for ``_Candidate(dep_terms=…, requires_names=…)``.
+    (dep_terms, requires_names, requires_predicates):
+        ``dep_terms`` and ``requires_names`` are ready for
+        ``_Candidate(dep_terms=…, requires_names=…)``.
+        ``requires_predicates`` maps dep-name → predicate tuple for entries
+        whose ``RequireEntry.predicates`` is non-empty.  Advisory metadata only
+        — never consulted for selection/solving (S4, RFC §3.4.3 option a).
     """
+    from milpa.predicate import Predicate as _Predicate
     from milpa.solver import Term
     from milpa.version import VersionSet, parse_version
 
     dep_terms: list[Term] = []
     requires_names: list[str] = []
+    requires_predicates: dict[str, tuple[_Predicate, ...]] = {}
 
     for entry in es.requires:
         if isinstance(entry, UrlRequire):
@@ -560,6 +566,8 @@ def edgeset_to_terms(
                 continue
             dep_terms.append(Term.require(dep_name, VersionSet.eq(url_dep_version)))
             requires_names.append(dep_name)
+            if entry.predicates:
+                requires_predicates[dep_name] = entry.predicates
 
         elif isinstance(entry, NamedRequire):
             if entry.name == "nim":
@@ -582,8 +590,10 @@ def edgeset_to_terms(
                     vs = VS.full()
                 dep_terms.append(Term.require(entry.name, vs))
             requires_names.append(entry.name)
+            if entry.predicates:
+                requires_predicates[entry.name] = entry.predicates
 
-    return dep_terms, requires_names
+    return dep_terms, requires_names, requires_predicates
 
 
 def _name_from_url(url: str) -> str | None:

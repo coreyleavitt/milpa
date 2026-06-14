@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from milpa.predicate import Predicate
 from milpa.errors import (
     LOCK_DEP_FIELD_ARITY,
     LOCK_DEP_IDENTITY_INVALID,
@@ -57,6 +58,9 @@ from milpa.kdl_io import (
     node_args,
     node_children,
     node_name,
+    node_prop_str,
+    node_prop_tag,
+    node_props,
     nodes,
     parse_kdl,
     value_as_int,
@@ -165,6 +169,28 @@ ProvenanceRecord = (
 )
 
 # ---------------------------------------------------------------------------
+# CondRequire — conditional-require annotation (S4, RFC cond-requires §3.4)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CondRequire:
+    """One conditional require annotation on a locked dep (additive, §3.4.1).
+
+    ``name`` is the require name (must also appear in ``LockedDep.requires``).
+    ``predicates`` is the non-empty ordered tuple of Predicate clauses (AND).
+    Sorted by name across all cond_requires on a dep (lexicographic).
+
+    Never consulted by ``frozen``/``verify``/``nimcfg`` — they read
+    ``requires`` only.  Present so #110 can read the annotation for
+    build-time activation.
+    """
+
+    name: str
+    predicates: tuple[Predicate, ...]
+
+
+# ---------------------------------------------------------------------------
 # Lockfile data model
 # ---------------------------------------------------------------------------
 
@@ -197,6 +223,9 @@ class LockedDep:
     # via DepDeclEdgeSource). Forward-compat: older/absent = None = fine; no
     # lockfile schema bump (lockfile-schema.md §3.7).
     dep_decl: str | None = None
+    # S4: additive cond-require annotations (RFC cond-requires §3.4.1).
+    # Sorted by name. Never consulted by frozen/verify/nimcfg. Omitted when empty.
+    cond_requires: tuple[CondRequire, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -250,6 +279,9 @@ class ResolvedDep:
     # None for non-indexed deps (URL/tarball/local/member) and for named deps
     # whose index entry has no dep_decl pointer yet.
     dep_decl: str | None = None
+    # S4: conditional require annotations propagated from edgeset_to_terms
+    # requires_predicates dict (RFC cond-requires §3.4.3). Sorted by name.
+    cond_requires: tuple[CondRequire, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -417,6 +449,7 @@ def _parse_dep(node: KdlNode) -> LockedDep:
     self_mirrors: tuple[str, ...] = ()
     provenances: list[ProvenanceRecord] = []
     dep_decl: str | None = None  # S6: additive dep_decl pin (§3.7)
+    cond_requires: list[CondRequire] = []  # S4: additive cond-require annotations
 
     for child in node_children(node):
         cname = node_name(child)
@@ -439,6 +472,11 @@ def _parse_dep(node: KdlNode) -> LockedDep:
             args = node_args(child)
             if len(args) == 1:
                 dep_decl = value_as_str(args[0])
+        elif cname == "cond-require":
+            # S4: parse additive cond-require annotation (RFC §3.4).
+            cr = _parse_cond_require(child)
+            if cr is not None:
+                cond_requires.append(cr)
         # other unknown child nodes are silently skipped (forward compat)
 
     return LockedDep(
@@ -451,6 +489,7 @@ def _parse_dep(node: KdlNode) -> LockedDep:
         active_flags=active_flags,
         self_mirrors=self_mirrors,
         dep_decl=dep_decl,
+        cond_requires=tuple(cond_requires),
     )
 
 
@@ -526,6 +565,61 @@ def _parse_dep_self_mirrors(node: KdlNode) -> tuple[str, ...]:
     which strips annotations — both forms return a str through value_as_str.
     """
     return tuple(s for a in node_args(node) if (s := value_as_str(a)) is not None)
+
+
+def _parse_cond_require(node: KdlNode) -> "CondRequire | None":
+    """Parse a ``cond-require`` child node (RFC §3.4 / S4).
+
+    Inline form (single predicate as props):
+        ``cond-require "name" platform="linux"``
+        ``cond-require "name" platform=(not)"linux"``
+
+    Block form (≥2 predicates as ``when`` children):
+        ``cond-require "name" { when platform="macosx" when platform=(not)"linux" }``
+
+    Returns ``None`` (lenient/forward-compat) if the node is malformed
+    (missing name arg, unknown shape).  Unknown extra fields are skipped.
+    """
+    # arg0 = require name
+    args = node_args(node)
+    if not args:
+        return None
+    name = value_as_str(args[0])
+    if name is None:
+        return None
+
+    predicates: list[Predicate] = []
+
+    children = node_children(node)
+    if children:
+        # Block form: each child MUST be a "when" node with exactly one prop.
+        for child in children:
+            if node_name(child) != "when":
+                continue  # skip unknown child nodes (forward compat)
+            props = node_props(child)
+            for key in props:
+                val = node_prop_str(child, key)
+                if val is None:
+                    continue
+                tag = node_prop_tag(child, key)
+                predicates.append(
+                    Predicate(name=key, values=(val,), negated=(tag == "not"))
+                )
+    else:
+        # Inline form: each prop is one predicate.
+        props = node_props(node)
+        for key in props:
+            val = node_prop_str(node, key)
+            if val is None:
+                continue
+            tag = node_prop_tag(node, key)
+            predicates.append(
+                Predicate(name=key, values=(val,), negated=(tag == "not"))
+            )
+
+    if not predicates:
+        return None
+    return CondRequire(name=name, predicates=tuple(predicates))
 
 
 def _parse_provenance_block(node: KdlNode, dep_name: str) -> ProvenanceRecord:
@@ -656,6 +750,8 @@ def _locked_from_resolved(d: ResolvedDep) -> LockedDep:
         self_mirrors=d.self_mirrors,
         # S6: carry the dep_decl hash from the resolver through to the lockfile pin.
         dep_decl=d.dep_decl,
+        # S4: carry cond_requires (already sorted by name on ResolvedDep).
+        cond_requires=d.cond_requires,
     )
 
 
@@ -698,6 +794,44 @@ def _kdl_str(s: str) -> str:
     return '"' + "".join(out) + '"'
 
 
+def _format_predicate_prop(pred: Predicate) -> str:
+    """Emit one predicate as ``key="value"`` or ``key=(not)"value"`` (RFC §3.4.1).
+
+    The prop key is ``pred.name``; value is ``pred.values[0]`` (every predicate
+    produced by this pipeline is single-value).  Negation uses the KDL type-
+    annotation form ``(not)"value"`` — verbatim from ``manifest-grammar.md §6``.
+    """
+    val = _kdl_str(pred.values[0])
+    if pred.negated:
+        return f'{pred.name}=(not){val}'
+    return f'{pred.name}={val}'
+
+
+def _format_cond_require(cr: "CondRequire") -> list[str]:
+    """Emit a ``cond-require`` node (RFC §3.4.1).
+
+    Single predicate → inline property form:
+        ``    cond-require "name" key="value"``
+
+    Multiple predicates (AND) → block form:
+        ``    cond-require "name" {``
+        ``        when key="value"``
+        ``        ...``
+        ``    }``
+    """
+    name_str = _kdl_str(cr.name)
+    if len(cr.predicates) == 1:
+        prop = _format_predicate_prop(cr.predicates[0])
+        return [f"    cond-require {name_str} {prop}"]
+    else:
+        out = [f"    cond-require {name_str} {{"]
+        for pred in cr.predicates:
+            prop = _format_predicate_prop(pred)
+            out.append(f"        when {prop}")
+        out.append("    }")
+        return out
+
+
 def format_lockfile(lockfile: Lockfile) -> str:
     """Render a ``Lockfile`` to byte-exact KDL 2.0 text.
 
@@ -731,6 +865,12 @@ def format_lockfile(lockfile: Lockfile) -> str:
             lines.append(f"    requires {req_args}")
         else:
             lines.append("    requires")
+        # cond-require — S4: additive annotation nodes, sorted by name.
+        # Emitted immediately after requires. Omitted when empty (byte-identical
+        # for deps with no conditional requires). Sort at emission for
+        # determinism (lockfile-schema.md §2.4 / RFC §3.4.1).
+        for cr in sorted(dep.cond_requires, key=lambda c: c.name):
+            lines.extend(_format_cond_require(cr))
         # active_flags — omitted when empty
         if dep.active_flags:
             flag_args = " ".join(_kdl_str(f) for f in dep.active_flags)

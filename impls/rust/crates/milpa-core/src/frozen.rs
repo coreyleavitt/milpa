@@ -242,6 +242,9 @@ fn resolved_from_locked(locked: &LockedDep) -> Result<ResolvedDep, MilpaError> {
         requires: locked.requires.clone(),
         provenance,
         dep_decl: locked.dep_decl.clone(), // S6: carry dep_decl pin through frozen path
+        // S4: frozen path reconstructs from lockfile; cond_requires are lockfile
+        // annotations only — not needed for frozen graph reconstruction.
+        cond_requires: Vec::new(),
     })
 }
 

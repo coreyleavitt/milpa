@@ -483,13 +483,14 @@ def test_edgeset_to_terms_named_require() -> None:
         src_dir="",
         source=EdgeSource.MILPA_KDL,
     )
-    dep_terms, requires_names = edgeset_to_terms(es, {}, _V)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, _V)
 
     assert requires_names == ["stew"]
     assert len(dep_terms) == 1
     t = dep_terms[0]
     assert t.package == "stew"
     assert t.positive
+    assert requires_predicates == {}
 
 
 def test_edgeset_to_terms_overridden_named_becomes_url_sentinel() -> None:
@@ -502,7 +503,7 @@ def test_edgeset_to_terms_overridden_named_becomes_url_sentinel() -> None:
         src_dir="",
         source=EdgeSource.MILPA_KDL,
     )
-    dep_terms, requires_names = edgeset_to_terms(es, {"stew": ov}, _V)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {"stew": ov}, _V)
 
     assert requires_names == ["stew"]
     assert len(dep_terms) == 1
@@ -510,6 +511,7 @@ def test_edgeset_to_terms_overridden_named_becomes_url_sentinel() -> None:
     assert t.package == "stew"
     # Should require exactly the sentinel version.
     assert t.versions.contains(_V)
+    assert requires_predicates == {}
 
 
 def test_edgeset_to_terms_nim_excluded() -> None:
@@ -522,10 +524,11 @@ def test_edgeset_to_terms_nim_excluded() -> None:
         src_dir="",
         source=EdgeSource.NIMBLE_FALLBACK,
     )
-    dep_terms, requires_names = edgeset_to_terms(es, {}, _V)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, _V)
 
     assert "nim" not in requires_names
     assert "stew" in requires_names
+    assert requires_predicates == {}
 
 
 def test_edgeset_to_terms_url_require() -> None:
@@ -537,11 +540,12 @@ def test_edgeset_to_terms_url_require() -> None:
         src_dir="",
         source=EdgeSource.DEP_DECL,
     )
-    dep_terms, requires_names = edgeset_to_terms(es, {}, _V)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, _V)
 
     assert "nim-chronos" in requires_names
     assert len(dep_terms) == 1
     assert dep_terms[0].versions.contains(_V)
+    assert requires_predicates == {}
 
 
 # ---------------------------------------------------------------------------

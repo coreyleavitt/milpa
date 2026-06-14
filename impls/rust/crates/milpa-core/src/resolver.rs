@@ -352,6 +352,9 @@ struct Extracted {
     /// `edge_cache`).  The dep_decl pin is derived from
     /// `edge_set.source == EdgeSource::DepDecl` at the call-site.
     edge_set: EdgeSet,
+    /// S4: advisory predicate metadata (RFC cond-requires §3.4.3 option a).
+    /// Maps dep-name → predicates for require entries with non-empty predicates.
+    requires_predicates: std::collections::BTreeMap<String, Vec<milpa_types::Predicate>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +380,10 @@ struct Candidate {
     /// during resolution. Set only when the edge was sourced from a DepDecl
     /// artifact (`EdgeSource::DepDecl`). `None` for milpa.kdl / nimble fallback.
     dep_decl: Option<String>,
+    /// S4: advisory predicate metadata from `edgeset_to_extracted` (RFC §3.4.3 option a).
+    /// Maps dep-name → predicates for require entries with non-empty predicates.
+    /// Never consulted for selection/solving. Empty for root/synthetic candidates.
+    requires_predicates: std::collections::BTreeMap<String, Vec<milpa_types::Predicate>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +574,7 @@ impl<'a> ResolveProvider<'a> {
             deps: root_deps,
             provenance: None,
             dep_decl: None,
+            requires_predicates: std::collections::BTreeMap::new(),
         };
         self.store_candidate(root);
         Ok(queue)
@@ -697,6 +705,7 @@ impl<'a> ResolveProvider<'a> {
                     name: member.name.clone(),
                 }),
                 dep_decl: None, // workspace members never resolved via DepDecl
+                requires_predicates: std::collections::BTreeMap::new(),
             });
             root_deps.push(SolverDep::new(member.name.clone(), eq_sentinel()));
             root_requires.push(member.name.clone());
@@ -714,6 +723,7 @@ impl<'a> ResolveProvider<'a> {
             deps: root_deps,
             provenance: None,
             dep_decl: None,
+            requires_predicates: std::collections::BTreeMap::new(),
         };
         self.store_candidate(root);
         Ok(queue)
@@ -856,6 +866,7 @@ impl<'a> ResolveProvider<'a> {
                 commit_sha: commit,
             }),
             dep_decl: None, // URL deps not in the index; no DepDecl pin
+            requires_predicates: ex.requires_predicates,
         });
 
         self.process_items(ex.sub_items)?;
@@ -893,6 +904,7 @@ impl<'a> ResolveProvider<'a> {
                 path: dep.path.clone(),
             }),
             dep_decl: None, // local deps not in the index; no DepDecl pin
+            requires_predicates: ex.requires_predicates,
         });
         self.process_items(ex.sub_items)?;
         Ok(())
@@ -942,6 +954,7 @@ impl<'a> ResolveProvider<'a> {
                 url: dep.url.clone(),
                 sha256: recorded_sha256,
             }),
+            requires_predicates: ex.requires_predicates,
         });
         self.process_items(ex.sub_items)?;
         Ok(())
@@ -1041,6 +1054,7 @@ impl<'a> ResolveProvider<'a> {
             // the emission-level record.
             provenance: entry.provenances.first().map(transport_to_record),
             dep_decl: dep_decl_pin,
+            requires_predicates: ex.requires_predicates,
         };
         self.store_candidate(candidate);
         self.stubs
@@ -1306,6 +1320,8 @@ impl<'a> ResolveProvider<'a> {
         let mut deps: Vec<SolverDep> = Vec::new();
         let mut requires_names: Vec<String> = Vec::new();
         let mut items: Vec<Item> = Vec::new();
+        let mut requires_predicates: std::collections::BTreeMap<String, Vec<milpa_types::Predicate>> =
+            std::collections::BTreeMap::new();
 
         for entry in &es.requires {
             match entry {
@@ -1314,6 +1330,10 @@ impl<'a> ResolveProvider<'a> {
                     deps.push(SolverDep::new(dep_name.clone(), eq_sentinel()));
                     requires_names.push(dep_name.clone());
                     items.push(Item::Url(url_dep(&dep_name, &u.url, &u.ref_)));
+                    // S4: record predicates if non-empty.
+                    if !u.predicates.is_empty() {
+                        requires_predicates.insert(dep_name, u.predicates.clone());
+                    }
                 }
                 RequireEntry::Named(n) => {
                     // Override check: a named transitive dep that is itself overridden
@@ -1355,6 +1375,10 @@ impl<'a> ResolveProvider<'a> {
                         name: n.name.clone(),
                         constraint: vs,
                     });
+                    // S4: record predicates if non-empty.
+                    if !n.predicates.is_empty() {
+                        requires_predicates.insert(n.name.clone(), n.predicates.clone());
+                    }
                 }
             }
         }
@@ -1369,6 +1393,7 @@ impl<'a> ResolveProvider<'a> {
             src_dir: es.src_dir.clone(),
             sub_items: items,
             edge_set: es.clone(),
+            requires_predicates,
         })
     }
 
@@ -1515,18 +1540,32 @@ impl<'a> ResolveProvider<'a> {
         let deps = ordered
             .into_iter()
             .filter_map(|n| chosen.get(&n))
-            .map(|c| ResolvedDep {
-                name: c.name.clone(),
-                identity: c.identity.clone(),
-                version: c.version.clone(),
-                src_dir: c.src_dir.clone(),
-                requires: c.requires_names.clone(),
-                // Every non-root candidate carries a provenance; default
-                // defensively (unreachable — root is excluded above).
-                provenance: c.provenance.clone().unwrap_or(ProvenanceRecord::Local {
-                    path: String::new(),
-                }),
-                dep_decl: c.dep_decl.clone(),
+            .map(|c| {
+                // S4: build cond_requires from requires_predicates, sorted by name.
+                let mut cond_requires: Vec<milpa_types::CondRequire> = c
+                    .requires_predicates
+                    .iter()
+                    .filter(|(_, preds)| !preds.is_empty())
+                    .map(|(rname, preds)| milpa_types::CondRequire {
+                        name: rname.clone(),
+                        predicates: preds.clone(),
+                    })
+                    .collect();
+                cond_requires.sort_by(|a, b| a.name.cmp(&b.name));
+                ResolvedDep {
+                    name: c.name.clone(),
+                    identity: c.identity.clone(),
+                    version: c.version.clone(),
+                    src_dir: c.src_dir.clone(),
+                    requires: c.requires_names.clone(),
+                    // Every non-root candidate carries a provenance; default
+                    // defensively (unreachable — root is excluded above).
+                    provenance: c.provenance.clone().unwrap_or(ProvenanceRecord::Local {
+                        path: String::new(),
+                    }),
+                    dep_decl: c.dep_decl.clone(),
+                    cond_requires,
+                }
             })
             .collect();
         ResolvedGraph { deps }

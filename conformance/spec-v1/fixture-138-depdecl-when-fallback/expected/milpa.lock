@@ -35,6 +35,7 @@ dep "qux" {
     version "1.0.0"
     src_dir "src"
     requires "bar" "extra"
+    cond-require "extra" platform="linux"
     provenance {
         kind "git"
         url "https://github.com/example/qux.git"

@@ -802,6 +802,13 @@ def cmd_show(project_dir: Path) -> int:
             print(f"  provenance  {_format_provenance(prov)}")
         if dep.requires:
             print(f"  requires    {', '.join(dep.requires)}")
+        # S4: display cond_requires (one line per conditional require).
+        for cr in dep.cond_requires:
+            preds_str = ", ".join(
+                f"{p.name}{'!=' if p.negated else '='}{p.values[0]}"
+                for p in cr.predicates
+            )
+            print(f"  cond-req    {cr.name} [{preds_str}]")
     return 0
 
 

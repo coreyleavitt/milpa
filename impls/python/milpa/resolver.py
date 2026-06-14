@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -162,6 +162,10 @@ class _Candidate:
     # Populated from IndexVersion.dep_decl (S2) when DepDeclEdgeSource is used;
     # None for URL/tarball/local/member deps and named deps without a dep_decl pointer.
     dep_decl: str | None = None
+    # S4: advisory predicate metadata from edgeset_to_terms (RFC §3.4.3 option a).
+    # Maps dep-name → predicate tuple for require entries with non-empty predicates.
+    # Never consulted for selection/solving. Empty for root/synthetic candidates.
+    requires_predicates: dict[str, tuple[object, ...]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +308,7 @@ class _Provider:
             dep_decl_source=self._dep_decl_source,  # S3b: wired from MilpaEnv.dep_decl_store
             strict_attestation=self._strict_attestation,  # S5: policy-gated FETCH-FAILED fallback
         )
-        dep_terms, requires_names = edgeset_to_terms(
+        dep_terms, requires_names, requires_predicates = edgeset_to_terms(
             es, self._overrides_by_name, _URL_DEP_VERSION
         )
         src_dir = es.src_dir
@@ -330,6 +334,7 @@ class _Provider:
                 commit_sha=fetched_commit_sha or prov_record.commit_sha,
             ),
             dep_decl=_dep_decl_pin,
+            requires_predicates=requires_predicates,
         )
 
         # Register and clear stub.
@@ -1296,7 +1301,7 @@ def _process_url_worker(
     else:
         es = NimbleEdgeSource().edges_for(dep.name, _URL_DEP_VERSION, ctx)
 
-    dep_terms, requires_names = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
     src_dir = es.src_dir
 
     commit_sha: str | None = result.receipt.transport_fields().get("commit_sha")
@@ -1309,6 +1314,7 @@ def _process_url_worker(
         dep_terms=dep_terms,
         requires_names=requires_names,
         provenance=GitProvenance(url=dep.git, ref=dep.ref, commit_sha=commit_sha),
+        requires_predicates=requires_predicates,
     )
 
     # Collect transitive deps for the BFS queue (returned to caller for enqueuing).
@@ -1465,7 +1471,7 @@ def _process_tarball_worker(
     else:
         es = NimbleEdgeSource().edges_for(dep.name, _URL_DEP_VERSION, ctx)
 
-    dep_terms, requires_names = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
     src_dir = es.src_dir
     recorded_sha256 = dep.sha256 or archive_sha256 or locked_sha256
 
@@ -1481,6 +1487,7 @@ def _process_tarball_worker(
             expected_sha256=recorded_sha256,
             strip_components=dep.strip_components,
         ),
+        requires_predicates=requires_predicates,
     )
     transitive_deps = _collect_transitive_deps(result.path, dep.name, overrides_by_name)
     return candidate, transitive_deps, es
@@ -1535,7 +1542,7 @@ def _process_local_worker(
     else:
         es = NimbleEdgeSource().edges_for(dep.name, _URL_DEP_VERSION, ctx)
 
-    dep_terms, requires_names = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
     src_dir = es.src_dir
 
     candidate = _Candidate(
@@ -1546,6 +1553,7 @@ def _process_local_worker(
         dep_terms=dep_terms,
         requires_names=requires_names,
         provenance=_LocalDepProvenance(declared_path=declared_path_str),
+        requires_predicates=requires_predicates,
     )
     transitive_deps = _collect_transitive_deps(result.path, dep.name, overrides_by_name)
     return candidate, transitive_deps, es
@@ -1608,6 +1616,22 @@ def _build_graph(
 
         version_str = format_version_str(version)
 
+        # S4: build cond_requires from the candidate's requires_predicates dict.
+        # For each require name with non-empty predicates, make a CondRequire;
+        # collect sorted by name (RFC §3.4.3 option a).
+        from milpa.lockfile import CondRequire as _CondRequire
+        from milpa.predicate import Predicate as _Predicate
+        _cond_requires: tuple[_CondRequire, ...] = tuple(
+            sorted(
+                (
+                    _CondRequire(name=rname, predicates=preds)  # type: ignore[arg-type]
+                    for rname, preds in cand.requires_predicates.items()
+                    if preds
+                ),
+                key=lambda cr: cr.name,
+            )
+        )
+
         resolved = ResolvedDep(
             name=name,
             identity=cand.identity,
@@ -1618,6 +1642,8 @@ def _build_graph(
             # S6: dep_decl pin — carries the DepDecl hash from _Candidate (set in
             # _materialize when DepDeclEdgeSource fired) to the lockfile record.
             dep_decl=cand.dep_decl,
+            # S4: conditional require annotations (already sorted by name).
+            cond_requires=_cond_requires,
         )
         deps.append(resolved)
 

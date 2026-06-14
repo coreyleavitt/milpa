@@ -53,6 +53,7 @@ fn locked(name: &str, version: &str, identity: Option<&str>, prov: ProvenanceRec
         active_flags: vec![],
         self_mirrors: vec![],
         dep_decl: None,
+        cond_requires: vec![],
     }
 }
 

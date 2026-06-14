@@ -771,6 +771,7 @@ fn resolve_prior_lockfile_pin_rejects_hostile_bytes() {
             active_flags: Vec::new(),
             self_mirrors: Vec::new(),
             dep_decl: None,
+            cond_requires: Vec::new(),
         }],
     };
     let err = resolve(
@@ -813,6 +814,7 @@ fn resolve_prior_lockfile_pin_accepts_matching_bytes() {
             active_flags: Vec::new(),
             self_mirrors: Vec::new(),
             dep_decl: None,
+            cond_requires: Vec::new(),
         }],
     };
     let graph = resolve(
@@ -1133,6 +1135,7 @@ fn tarball_prior(name: &str, url: &str, identity: &str, sha256: &str) -> Lockfil
             active_flags: Vec::new(),
             self_mirrors: Vec::new(),
             dep_decl: None,
+            cond_requires: Vec::new(),
         }],
     }
 }

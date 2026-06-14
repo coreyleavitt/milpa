@@ -186,6 +186,9 @@ pub struct ResolvedDep {
     /// during resolution (lockfile-schema §3.7).  `None` when the dep was
     /// not resolved via a DepDecl edge source (milpa.kdl or .nimble fallback).
     pub dep_decl: Option<String>,
+    /// S4: conditional require annotations propagated from `EdgeSetTerms.requires_predicates`
+    /// (RFC cond-requires §3.4.3). Sorted by name.
+    pub cond_requires: Vec<CondRequire>,
 }
 
 /// The resolved dependency graph — the resolver's output, the emitters' input.
@@ -237,6 +240,21 @@ pub enum ProvenanceRecord {
     },
 }
 
+/// One conditional-require annotation on a locked dep (S4 — RFC
+/// `rfc-conditional-requires.md` §3.4.1 / §3.4.2).
+///
+/// `name` is the require name (MUST also appear in `LockedDep.requires`).
+/// `predicates` is the non-empty ordered `Vec` of `Predicate` clauses (AND).
+/// Stored sorted by name across all `cond_requires` on a dep (lexicographic).
+///
+/// Never consulted by `frozen` / `verify` / `nimcfg` — they read `requires` only.
+/// Present so `#110` can read the annotation for build-time activation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CondRequire {
+    pub name: String,
+    pub predicates: Vec<Predicate>,
+}
+
 /// A single dep entry in a `milpa.lock` (lockfile-schema §3).
 ///
 /// Structurally distinct from [`ResolvedDep`]: the lockfile records `identity`
@@ -258,6 +276,9 @@ pub struct LockedDep {
     /// during resolution (lockfile-schema §3.7).  `None` when absent (forward-
     /// compat: older lockfile entries without this field are fine).
     pub dep_decl: Option<String>,
+    /// S4: additive cond-require annotations (RFC cond-requires §3.4.1).
+    /// Sorted by name. Never consulted by frozen/verify/nimcfg.
+    pub cond_requires: Vec<CondRequire>,
 }
 
 /// The parsed `milpa.lock` as data (parse/emit logic lives in `milpa-core`).

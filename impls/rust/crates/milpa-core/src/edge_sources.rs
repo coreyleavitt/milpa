@@ -383,6 +383,8 @@ pub fn edgeset_to_terms(
     let mut requires_names: Vec<String> = Vec::new();
     let mut url_requires: Vec<(String, String)> = Vec::new(); // (url, ref_)
     let mut named_requires: Vec<(String, VersionSet)> = Vec::new(); // (name, vs)
+    let mut requires_predicates: std::collections::BTreeMap<String, Vec<milpa_types::Predicate>> =
+        std::collections::BTreeMap::new();
 
     for entry in &es.requires {
         match entry {
@@ -395,6 +397,10 @@ pub fn edgeset_to_terms(
                 deps.push(SolverDep::new(name.clone(), VersionSet::eq(url_dep_version.clone())));
                 requires_names.push(name.clone());
                 url_requires.push((u.url.clone(), u.ref_.clone()));
+                // S4: record predicates if non-empty.
+                if !u.predicates.is_empty() {
+                    requires_predicates.insert(name, u.predicates.clone());
+                }
             }
             RequireEntry::Named(n) => {
                 let vs = if overrides_by_name.contains_key(&n.name) {
@@ -411,6 +417,10 @@ pub fn edgeset_to_terms(
                 deps.push(SolverDep::new(n.name.clone(), vs.clone()));
                 requires_names.push(n.name.clone());
                 named_requires.push((n.name.clone(), vs));
+                // S4: record predicates if non-empty.
+                if !n.predicates.is_empty() {
+                    requires_predicates.insert(n.name.clone(), n.predicates.clone());
+                }
             }
         }
     }
@@ -420,6 +430,7 @@ pub fn edgeset_to_terms(
         requires_names,
         url_requires,
         named_requires,
+        requires_predicates,
     }
 }
 
@@ -434,6 +445,10 @@ pub struct EdgeSetTerms {
     pub url_requires: Vec<(String, String)>,
     /// (name, vs) pairs for Named requires — caller constructs `Item::Named`.
     pub named_requires: Vec<(String, VersionSet)>,
+    /// S4: advisory predicate metadata (RFC cond-requires §3.4.3 option a).
+    /// Maps dep-name → predicates for require entries with non-empty predicates.
+    /// Never consulted for selection/solving — purely for lockfile annotation.
+    pub requires_predicates: std::collections::BTreeMap<String, Vec<milpa_types::Predicate>>,
 }
 
 // ---------------------------------------------------------------------------

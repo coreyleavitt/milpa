@@ -126,6 +126,7 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
     let mut active_flags: Vec<String> = Vec::new();
     let mut self_mirrors: Vec<String> = Vec::new();
     let mut dep_decl: Option<String> = None; // S6: additive dep_decl pin (§3.7)
+    let mut cond_requires: Vec<milpa_types::CondRequire> = Vec::new(); // S4
     let mut provenances: Vec<ProvenanceRecord> = Vec::new();
 
     for child in children(node) {
@@ -154,6 +155,12 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
                     .first()
                     .and_then(|e| e.value().as_string().map(str::to_string));
             }
+            // S4: cond-require annotation — lenient/forward-compat parse.
+            "cond-require" => {
+                if let Some(cr) = parse_cond_require(child) {
+                    cond_requires.push(cr);
+                }
+            }
             "provenance" => provenances.push(parse_provenance(child, &name)?),
             _ => {}
         }
@@ -169,7 +176,56 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
         active_flags,
         self_mirrors,
         dep_decl,
+        cond_requires,
     })
+}
+
+/// Parse a `cond-require` child node into a [`milpa_types::CondRequire`] (RFC §3.4 / S4).
+///
+/// Inline form (props): `cond-require "name" platform="linux"`.
+/// Block form (when children): `cond-require "name" { when platform="macosx" when ... }`.
+/// Returns `None` (lenient/forward-compat) for malformed nodes.
+fn parse_cond_require(node: &KdlNode) -> Option<milpa_types::CondRequire> {
+    // arg0 = require name
+    let name = args(node).first()?.value().as_string()?.to_string();
+    let mut predicates: Vec<milpa_types::Predicate> = Vec::new();
+    let child_nodes: Vec<&KdlNode> = node.children().map(|d| d.nodes()).into_iter().flatten().collect();
+
+    if !child_nodes.is_empty() {
+        // Block form: each child must be a "when" node with exactly one prop.
+        for child in child_nodes {
+            if child.name().value() != "when" {
+                continue; // skip unknown children (forward compat)
+            }
+            for entry in child.entries() {
+                let Some(key) = entry.name() else { continue };
+                let Some(val) = entry.value().as_string() else { continue };
+                let tag = entry.ty().map(|t| t.value());
+                predicates.push(milpa_types::Predicate {
+                    name: key.value().to_string(),
+                    values: vec![val.to_string()],
+                    negated: tag == Some("not"),
+                });
+            }
+        }
+    } else {
+        // Inline form: props on the node itself.
+        for entry in node.entries() {
+            let Some(key) = entry.name() else { continue };
+            let Some(val) = entry.value().as_string() else { continue };
+            let tag = entry.ty().map(|t| t.value());
+            predicates.push(milpa_types::Predicate {
+                name: key.value().to_string(),
+                values: vec![val.to_string()],
+                negated: tag == Some("not"),
+            });
+        }
+    }
+
+    if predicates.is_empty() {
+        return None;
+    }
+    Some(milpa_types::CondRequire { name, predicates })
 }
 
 /// Parse a `provenance { kind "…" … }` block (lockfile-schema §4). Each child
@@ -370,6 +426,16 @@ pub fn format_lockfile(lockfile: &Lockfile) -> String {
         } else {
             lines.push(format!("    requires {}", join_kdl(&dep.requires)));
         }
+        // S4: cond-require — additive annotation nodes, sorted by name.
+        // Emitted immediately after requires. Omitted when empty (byte-identical
+        // for deps with no conditional requires).
+        let mut sorted_cond: Vec<&milpa_types::CondRequire> = dep.cond_requires.iter().collect();
+        sorted_cond.sort_by(|a, b| a.name.cmp(&b.name));
+        for cr in sorted_cond {
+            for line in format_cond_require(cr) {
+                lines.push(line);
+            }
+        }
         if !dep.active_flags.is_empty() {
             lines.push(format!("    active_flags {}", join_kdl(&dep.active_flags)));
         }
@@ -397,6 +463,45 @@ pub fn format_lockfile(lockfile: &Lockfile) -> String {
         lines.push(String::new());
     }
     lines.join("\n")
+}
+
+/// Emit a single predicate as `key="value"` or `key=(not)"value"` (RFC §3.4.1).
+/// The value is `pred.values[0]` (every predicate produced by this pipeline is
+/// single-value). Negation uses the KDL type-annotation form `(not)"value"` —
+/// verbatim from `manifest-grammar.md §6`.
+fn format_predicate_prop(pred: &milpa_types::Predicate) -> String {
+    let val = kdl_str(&pred.values[0]);
+    if pred.negated {
+        format!("{}=(not){}", pred.name, val)
+    } else {
+        format!("{}={}", pred.name, val)
+    }
+}
+
+/// Emit a `cond-require` node (RFC §3.4.1).
+///
+/// Single predicate → inline property form:
+///     `    cond-require "name" key="value"`
+///
+/// Multiple predicates (AND) → block form:
+///     `    cond-require "name" {`
+///     `        when key="value"`
+///     `        ...`
+///     `    }`
+fn format_cond_require(cr: &milpa_types::CondRequire) -> Vec<String> {
+    let name_str = kdl_str(&cr.name);
+    if cr.predicates.len() == 1 {
+        let prop = format_predicate_prop(&cr.predicates[0]);
+        vec![format!("    cond-require {name_str} {prop}")]
+    } else {
+        let mut out = vec![format!("    cond-require {name_str} {{")];
+        for pred in &cr.predicates {
+            let prop = format_predicate_prop(pred);
+            out.push(format!("        when {prop}"));
+        }
+        out.push("    }".to_string());
+        out
+    }
 }
 
 /// The `kind` discriminator + kind-specific fields for one provenance block,
@@ -557,6 +662,9 @@ pub fn from_graph(graph: &ResolvedGraph, strategy: &str) -> Lockfile {
 fn locked_from_resolved(d: &ResolvedDep) -> LockedDep {
     let mut requires = d.requires.clone();
     requires.sort();
+    // S4: carry cond_requires (already sorted by name on ResolvedDep).
+    let mut cond_requires = d.cond_requires.clone();
+    cond_requires.sort_by(|a, b| a.name.cmp(&b.name));
     LockedDep {
         name: d.name.clone(),
         // Every dep in a resolved graph is content-hashed; an empty identity
@@ -579,6 +687,8 @@ fn locked_from_resolved(d: &ResolvedDep) -> LockedDep {
         // S6: carry dep_decl pin from the resolved dep (set only when
         // the edge was sourced from a DepDecl artifact).
         dep_decl: d.dep_decl.clone(),
+        // S4: carry cond_requires (sorted by name).
+        cond_requires,
     }
 }
 
@@ -903,6 +1013,7 @@ mod tests {
                 active_flags: vec!["ssl".into()],
                 self_mirrors: vec!["https://mirror.example/foo.git".into()],
                 dep_decl: None,
+                cond_requires: vec![],
             }],
         }
     }
@@ -964,6 +1075,7 @@ mod tests {
                 active_flags: vec![],
                 self_mirrors: vec![],
                 dep_decl: None,
+                cond_requires: vec![],
             }],
         };
         let text = format_lockfile(&lock);
@@ -996,6 +1108,7 @@ mod tests {
                 active_flags: vec![],
                 self_mirrors: vec![],
                 dep_decl: None,
+                cond_requires: vec![],
             }],
         };
         let text = format_lockfile(&lock);
@@ -1055,6 +1168,7 @@ mod tests {
                     active_flags: vec![],
                     self_mirrors: vec![],
                     dep_decl: None,
+                    cond_requires: vec![],
                 }],
             };
             let reparsed = parse_lockfile(&format_lockfile(&lock)).unwrap();
@@ -1096,6 +1210,7 @@ mod tests {
             requires: requires.into_iter().map(String::from).collect(),
             provenance: prov,
             dep_decl: None,
+            cond_requires: vec![],
         }
     }
 
@@ -1296,6 +1411,7 @@ mod tests {
                 active_flags: vec![],
                 self_mirrors: vec![],
                 dep_decl: None,
+                cond_requires: vec![],
             }],
         };
         // foo is not on disk → "missing" divergence.
@@ -1327,5 +1443,275 @@ mod tests {
         assert_eq!(reparsed, lock);
         // Canonical: deps sorted, so alpha precedes beta in the emitted text.
         assert!(text.find("dep \"alpha\"").unwrap() < text.find("dep \"beta\"").unwrap());
+    }
+
+    // -------------------------------------------------------------------------
+    // S4 — CondRequire data model + formatter + parser + round-trip
+    // (RFC rfc-conditional-requires.md §3.4 / §3.4.1 / §3.4.2)
+    // -------------------------------------------------------------------------
+
+    fn make_locked(cond_requires: Vec<milpa_types::CondRequire>) -> LockedDep {
+        LockedDep {
+            name: "qux".into(),
+            identity: Some(VALID_ID.into()),
+            version: "1.0.0".into(),
+            src_dir: "src".into(),
+            requires: vec!["bar".into(), "extra".into()],
+            provenances: vec![ProvenanceRecord::Git {
+                url: "https://example.com/qux.git".into(),
+                ref_spec: None,
+                commit_sha: None,
+            }],
+            active_flags: vec![],
+            self_mirrors: vec![],
+            dep_decl: None,
+            cond_requires,
+        }
+    }
+
+    fn pred(name: &str, value: &str, negated: bool) -> milpa_types::Predicate {
+        milpa_types::Predicate {
+            name: name.into(),
+            values: vec![value.into()],
+            negated,
+        }
+    }
+
+    fn cr(name: &str, predicates: Vec<milpa_types::Predicate>) -> milpa_types::CondRequire {
+        milpa_types::CondRequire {
+            name: name.into(),
+            predicates,
+        }
+    }
+
+    #[test]
+    fn s4_no_cond_requires_emits_nothing_new() {
+        let dep = make_locked(vec![]);
+        let lf = Lockfile {
+            version: 1,
+            strategy: "maxver".into(),
+            deps: vec![dep],
+        };
+        let text = format_lockfile(&lf);
+        assert!(!text.contains("cond-require"));
+        // requires line unchanged
+        assert!(text.contains("    requires \"bar\" \"extra\""));
+    }
+
+    #[test]
+    fn s4_single_predicate_inline_not_negated() {
+        let dep = make_locked(vec![cr("extra", vec![pred("platform", "linux", false)])]);
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let text = format_lockfile(&lf);
+        assert!(text.contains("    cond-require \"extra\" platform=\"linux\""), "got:\n{text}");
+    }
+
+    #[test]
+    fn s4_single_predicate_inline_negated() {
+        let dep = make_locked(vec![cr("extra", vec![pred("platform", "linux", true)])]);
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let text = format_lockfile(&lf);
+        assert!(text.contains("    cond-require \"extra\" platform=(not)\"linux\""), "got:\n{text}");
+    }
+
+    #[test]
+    fn s4_multi_predicate_block_form_byte_exact() {
+        // Pinned canonical block form per RFC §3.4.1.
+        let dep = make_locked(vec![cr(
+            "macstuff",
+            vec![
+                pred("platform", "macosx", false),
+                pred("platform", "linux", true),
+            ],
+        )]);
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let text = format_lockfile(&lf);
+        let expected_block = "    cond-require \"macstuff\" {\n        when platform=\"macosx\"\n        when platform=(not)\"linux\"\n    }";
+        assert!(text.contains(expected_block), "got:\n{text}");
+    }
+
+    #[test]
+    fn s4_cond_require_after_requires_line() {
+        let dep = make_locked(vec![cr("extra", vec![pred("platform", "linux", false)])]);
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let text = format_lockfile(&lf);
+        let req_pos = text.find("    requires \"bar\" \"extra\"").unwrap();
+        let cr_pos = text.find("    cond-require \"extra\"").unwrap();
+        assert!(cr_pos > req_pos);
+    }
+
+    #[test]
+    fn s4_parse_inline_not_negated() {
+        let sample = format!(
+            "// generated by milpa; reproducible build snapshot\n\
+             version 1\n\
+             strategy \"maxver\"\n\
+             \n\
+             dep \"qux\" {{\n\
+             \x20   identity \"{VALID_ID}\"\n\
+             \x20   version \"1.0.0\"\n\
+             \x20   src_dir \"src\"\n\
+             \x20   requires \"bar\" \"extra\"\n\
+             \x20   cond-require \"extra\" platform=\"linux\"\n\
+             \x20   provenance {{\n\
+             \x20       kind \"git\"\n\
+             \x20       url \"https://example.com/qux.git\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&sample).unwrap();
+        let dep = &lf.deps[0];
+        assert_eq!(dep.cond_requires.len(), 1);
+        let cr = &dep.cond_requires[0];
+        assert_eq!(cr.name, "extra");
+        assert_eq!(cr.predicates.len(), 1);
+        assert_eq!(cr.predicates[0].name, "platform");
+        assert_eq!(cr.predicates[0].values, vec!["linux".to_string()]);
+        assert!(!cr.predicates[0].negated);
+    }
+
+    #[test]
+    fn s4_parse_inline_negated() {
+        let sample = format!(
+            "// generated by milpa; reproducible build snapshot\n\
+             version 1\n\
+             strategy \"maxver\"\n\
+             \n\
+             dep \"qux\" {{\n\
+             \x20   identity \"{VALID_ID}\"\n\
+             \x20   version \"1.0.0\"\n\
+             \x20   src_dir \"src\"\n\
+             \x20   requires \"bar\" \"extra\"\n\
+             \x20   cond-require \"extra\" platform=(not)\"linux\"\n\
+             \x20   provenance {{\n\
+             \x20       kind \"git\"\n\
+             \x20       url \"https://example.com/qux.git\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&sample).unwrap();
+        assert!(lf.deps[0].cond_requires[0].predicates[0].negated);
+    }
+
+    #[test]
+    fn s4_parse_block_multi_clause() {
+        let sample = format!(
+            "// generated by milpa; reproducible build snapshot\n\
+             version 1\n\
+             strategy \"maxver\"\n\
+             \n\
+             dep \"qux\" {{\n\
+             \x20   identity \"{VALID_ID}\"\n\
+             \x20   version \"1.0.0\"\n\
+             \x20   src_dir \"src\"\n\
+             \x20   requires \"bar\" \"macstuff\"\n\
+             \x20   cond-require \"macstuff\" {{\n\
+             \x20       when platform=\"macosx\"\n\
+             \x20       when platform=(not)\"linux\"\n\
+             \x20   }}\n\
+             \x20   provenance {{\n\
+             \x20       kind \"git\"\n\
+             \x20       url \"https://example.com/qux.git\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&sample).unwrap();
+        let cr = &lf.deps[0].cond_requires[0];
+        assert_eq!(cr.name, "macstuff");
+        assert_eq!(cr.predicates.len(), 2);
+        assert_eq!(cr.predicates[0], milpa_types::Predicate { name: "platform".into(), values: vec!["macosx".into()], negated: false });
+        assert_eq!(cr.predicates[1], milpa_types::Predicate { name: "platform".into(), values: vec!["linux".into()], negated: true });
+    }
+
+    #[test]
+    fn s4_round_trip_inline_single() {
+        let dep = make_locked(vec![cr("extra", vec![pred("platform", "linux", false)])]);
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let reparsed = parse_lockfile(&format_lockfile(&lf)).unwrap();
+        assert_eq!(reparsed.deps[0].cond_requires, lf.deps[0].cond_requires);
+    }
+
+    #[test]
+    fn s4_round_trip_negated() {
+        let dep = make_locked(vec![cr("extra", vec![pred("platform", "linux", true)])]);
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let reparsed = parse_lockfile(&format_lockfile(&lf)).unwrap();
+        assert!(reparsed.deps[0].cond_requires[0].predicates[0].negated);
+    }
+
+    #[test]
+    fn s4_round_trip_block_multi() {
+        let dep = make_locked(vec![cr(
+            "macstuff",
+            vec![
+                pred("platform", "macosx", false),
+                pred("platform", "linux", true),
+            ],
+        )]);
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let reparsed = parse_lockfile(&format_lockfile(&lf)).unwrap();
+        assert_eq!(reparsed.deps[0].cond_requires, lf.deps[0].cond_requires);
+    }
+
+    #[test]
+    fn s4_format_parse_format_identity_inline() {
+        // format(parse(text)) == text for the pinned canonical inline sample.
+        let sample = format!(
+            "// generated by milpa; reproducible build snapshot\n\
+             version 1\n\
+             strategy \"maxver\"\n\
+             \n\
+             dep \"qux\" {{\n\
+             \x20   identity \"{VALID_ID}\"\n\
+             \x20   version \"1.0.0\"\n\
+             \x20   src_dir \"src\"\n\
+             \x20   requires \"bar\" \"extra\"\n\
+             \x20   cond-require \"extra\" platform=\"linux\"\n\
+             \x20   provenance {{\n\
+             \x20       kind \"git\"\n\
+             \x20       url \"https://example.com/qux.git\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&sample).unwrap();
+        assert_eq!(format_lockfile(&lf), sample);
+    }
+
+    #[test]
+    fn s4_format_parse_format_identity_block() {
+        // format(parse(text)) == text for the pinned canonical block sample.
+        let sample = format!(
+            "// generated by milpa; reproducible build snapshot\n\
+             version 1\n\
+             strategy \"maxver\"\n\
+             \n\
+             dep \"qux\" {{\n\
+             \x20   identity \"{VALID_ID}\"\n\
+             \x20   version \"1.0.0\"\n\
+             \x20   src_dir \"src\"\n\
+             \x20   requires \"bar\" \"macstuff\"\n\
+             \x20   cond-require \"macstuff\" {{\n\
+             \x20       when platform=\"macosx\"\n\
+             \x20       when platform=(not)\"linux\"\n\
+             \x20   }}\n\
+             \x20   provenance {{\n\
+             \x20       kind \"git\"\n\
+             \x20       url \"https://example.com/qux.git\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&sample).unwrap();
+        assert_eq!(format_lockfile(&lf), sample);
+    }
+
+    #[test]
+    fn s4_requires_line_unchanged_with_cond() {
+        // requires line must be byte-identical with or without cond_requires.
+        let dep_no_cond = make_locked(vec![]);
+        let dep_with_cond = make_locked(vec![cr("extra", vec![pred("platform", "linux", false)])]);
+        let text_no = format_lockfile(&Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep_no_cond] });
+        let text_with = format_lockfile(&Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep_with_cond] });
+        assert!(text_no.contains("    requires \"bar\" \"extra\""));
+        assert!(text_with.contains("    requires \"bar\" \"extra\""));
     }
 }

@@ -36,6 +36,7 @@ from milpa.errors import (
 )
 from milpa.lockfile import (
     LOCKFILE_SCHEMA_VERSION,
+    CondRequire,
     GitProvenanceRecord,
     LocalProvenanceRecord,
     LockedDep,
@@ -53,6 +54,7 @@ from milpa.lockfile import (
     verify_against_graph,
     verify_lockfile_against_deps,
 )
+from milpa.predicate import Predicate
 
 # ---------------------------------------------------------------------------
 # Fixture paths
@@ -1523,3 +1525,425 @@ class TestVerifyLockfileAgainstDeps:
         names_in_report = {r.split(":")[0] for r in result}
         assert "foo" in names_in_report
         assert "bar" in names_in_report
+
+
+# ---------------------------------------------------------------------------
+# S4 — CondRequire data model + formatter + parser + round-trip
+# (RFC rfc-conditional-requires.md §3.4 / §3.4.1 / §3.4.2 / §3.4.3)
+# ---------------------------------------------------------------------------
+
+
+def _make_prov() -> GitProvenanceRecord:
+    return GitProvenanceRecord(url="https://example.com/foo.git")
+
+
+def _make_dep_with_cond(
+    name: str = "qux",
+    requires: tuple[str, ...] = ("bar", "extra"),
+    cond_requires: tuple[CondRequire, ...] = (),
+) -> LockedDep:
+    return LockedDep(
+        name=name,
+        identity=_VALID_IDENTITY,
+        version="1.0.0",
+        src_dir="src",
+        requires=requires,
+        provenances=(_make_prov(),),
+        cond_requires=cond_requires,
+    )
+
+
+class TestCondRequireDataModel:
+    """Cycle 1: CondRequire / LockedDep.cond_requires data model + equality."""
+
+    def test_cond_require_equality(self) -> None:
+        p = Predicate(name="platform", values=("linux",), negated=False)
+        cr1 = CondRequire(name="extra", predicates=(p,))
+        cr2 = CondRequire(name="extra", predicates=(p,))
+        assert cr1 == cr2
+
+    def test_cond_require_inequality_name(self) -> None:
+        p = Predicate(name="platform", values=("linux",), negated=False)
+        cr1 = CondRequire(name="extra", predicates=(p,))
+        cr2 = CondRequire(name="other", predicates=(p,))
+        assert cr1 != cr2
+
+    def test_cond_require_inequality_predicates(self) -> None:
+        p1 = Predicate(name="platform", values=("linux",), negated=False)
+        p2 = Predicate(name="platform", values=("macosx",), negated=False)
+        cr1 = CondRequire(name="extra", predicates=(p1,))
+        cr2 = CondRequire(name="extra", predicates=(p2,))
+        assert cr1 != cr2
+
+    def test_locked_dep_cond_requires_default_empty(self) -> None:
+        dep = _make_dep_with_cond()
+        assert dep.cond_requires == ()
+
+    def test_locked_dep_cond_requires_set(self) -> None:
+        p = Predicate(name="platform", values=("linux",), negated=False)
+        cr = CondRequire(name="extra", predicates=(p,))
+        dep = _make_dep_with_cond(cond_requires=(cr,))
+        assert dep.cond_requires == (cr,)
+
+    def test_locked_dep_equality_respects_cond_requires(self) -> None:
+        p = Predicate(name="platform", values=("linux",), negated=False)
+        cr = CondRequire(name="extra", predicates=(p,))
+        dep1 = _make_dep_with_cond(cond_requires=(cr,))
+        dep2 = _make_dep_with_cond(cond_requires=())
+        assert dep1 != dep2
+
+    def test_resolved_dep_cond_requires_default_empty(self) -> None:
+        rd = ResolvedDep(
+            name="foo",
+            identity=_VALID_IDENTITY,
+            version="1.0.0",
+            src_dir="",
+            requires=(),
+        )
+        assert rd.cond_requires == ()
+
+
+class TestCondRequireFormatter:
+    """Cycle 2: byte-exact emission of each canonical cond-require shape."""
+
+    def test_no_cond_requires_emits_nothing_new(self) -> None:
+        """Dep with empty cond_requires → output identical to pre-S4 (requires line unchanged)."""
+        dep = _make_dep_with_cond(requires=("bar",), cond_requires=())
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        assert "cond-require" not in text
+        assert '    requires "bar"' in text
+
+    def test_single_predicate_inline_not_negated(self) -> None:
+        """cond-require "extra" platform="linux" — inline form."""
+        p = Predicate(name="platform", values=("linux",), negated=False)
+        cr = CondRequire(name="extra", predicates=(p,))
+        dep = _make_dep_with_cond(cond_requires=(cr,))
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        assert '    cond-require "extra" platform="linux"' in text
+
+    def test_single_predicate_inline_negated(self) -> None:
+        """cond-require "extra" platform=(not)"linux" — negated form."""
+        p = Predicate(name="platform", values=("linux",), negated=True)
+        cr = CondRequire(name="extra", predicates=(p,))
+        dep = _make_dep_with_cond(cond_requires=(cr,))
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        assert '    cond-require "extra" platform=(not)"linux"' in text
+
+    def test_single_nim_predicate(self) -> None:
+        """cond-require "extra" nim=">=1.4.0" — nim version predicate."""
+        p = Predicate(name="nim", values=(">=1.4.0",), negated=False)
+        cr = CondRequire(name="extra", predicates=(p,))
+        dep = _make_dep_with_cond(cond_requires=(cr,))
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        assert '    cond-require "extra" nim=">=1.4.0"' in text
+
+    def test_multi_predicate_block_form(self) -> None:
+        """Multiple predicates → { when … } block form (pinned byte-exact)."""
+        p1 = Predicate(name="platform", values=("macosx",), negated=False)
+        p2 = Predicate(name="platform", values=("linux",), negated=True)
+        cr = CondRequire(name="macstuff", predicates=(p1, p2))
+        dep = _make_dep_with_cond(requires=("bar", "macstuff"), cond_requires=(cr,))
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        # Pinned exact block (RFC §3.4.1 canonical shape)
+        expected_block = (
+            '    cond-require "macstuff" {\n'
+            '        when platform="macosx"\n'
+            '        when platform=(not)"linux"\n'
+            '    }'
+        )
+        assert expected_block in text
+
+    def test_cond_require_after_requires_line(self) -> None:
+        """cond-require nodes appear immediately after the requires line."""
+        p = Predicate(name="platform", values=("linux",), negated=False)
+        cr = CondRequire(name="extra", predicates=(p,))
+        dep = _make_dep_with_cond(requires=("bar", "extra"), cond_requires=(cr,))
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        req_pos = text.index('    requires "bar" "extra"')
+        cr_pos = text.index('    cond-require "extra"')
+        assert cr_pos > req_pos
+
+    def test_requires_line_unchanged_with_cond(self) -> None:
+        """requires line is byte-identical whether or not cond_requires is set."""
+        dep_no_cond = _make_dep_with_cond(requires=("bar", "extra"), cond_requires=())
+        dep_with_cond = _make_dep_with_cond(
+            requires=("bar", "extra"),
+            cond_requires=(CondRequire(
+                name="extra",
+                predicates=(Predicate(name="platform", values=("linux",), negated=False),),
+            ),),
+        )
+        text_no = format_lockfile(Lockfile(deps=(dep_no_cond,)))
+        text_with = format_lockfile(Lockfile(deps=(dep_with_cond,)))
+        # Both must contain the same requires line
+        assert '    requires "bar" "extra"' in text_no
+        assert '    requires "bar" "extra"' in text_with
+
+    def test_multiple_cond_requires_sorted_by_name(self) -> None:
+        """Multiple cond-requires are emitted in lexicographic name order."""
+        pz = Predicate(name="platform", values=("linux",), negated=False)
+        pa = Predicate(name="arch", values=("amd64",), negated=False)
+        cr_z = CondRequire(name="zlib", predicates=(pz,))
+        cr_a = CondRequire(name="asm", predicates=(pa,))
+        # Pass in reverse order — emit must be sorted
+        dep = _make_dep_with_cond(
+            requires=("asm", "zlib"),
+            cond_requires=(cr_z, cr_a),
+        )
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        asm_pos = text.index('cond-require "asm"')
+        zlib_pos = text.index('cond-require "zlib"')
+        assert asm_pos < zlib_pos
+
+
+class TestCondRequireParser:
+    """Cycle 3: parse each canonical shape back to CondRequire/Predicate."""
+
+    def _lockfile_with_dep(self, dep_body: str) -> str:
+        return (
+            "// generated by milpa; reproducible build snapshot\n"
+            "version 1\n"
+            'strategy "maxver"\n'
+            "\n"
+            f'dep "qux" {{\n'
+            f"    identity \"{_VALID_IDENTITY}\"\n"
+            f'    version "1.0.0"\n'
+            f'    src_dir "src"\n'
+            f'    requires "bar" "extra"\n'
+            f"{dep_body}"
+            f"    provenance {{\n"
+            f'        kind "git"\n'
+            f'        url "https://example.com/qux.git"\n'
+            f"    }}\n"
+            f"}}\n"
+        )
+
+    def test_inline_not_negated(self) -> None:
+        """cond-require "extra" platform="linux" parses correctly."""
+        text = self._lockfile_with_dep('    cond-require "extra" platform="linux"\n')
+        lf = parse_lockfile(text)
+        dep = lf.deps[0]
+        assert len(dep.cond_requires) == 1
+        cr = dep.cond_requires[0]
+        assert cr.name == "extra"
+        assert len(cr.predicates) == 1
+        p = cr.predicates[0]
+        assert p.name == "platform"
+        assert p.values == ("linux",)
+        assert p.negated is False
+
+    def test_inline_negated(self) -> None:
+        """cond-require "extra" platform=(not)"linux" parses negated=True."""
+        text = self._lockfile_with_dep('    cond-require "extra" platform=(not)"linux"\n')
+        lf = parse_lockfile(text)
+        dep = lf.deps[0]
+        assert len(dep.cond_requires) == 1
+        cr = dep.cond_requires[0]
+        p = cr.predicates[0]
+        assert p.name == "platform"
+        assert p.values == ("linux",)
+        assert p.negated is True
+
+    def test_block_multi_clause(self) -> None:
+        """Block form with two when children parses to two-predicate CondRequire."""
+        block = (
+            '    cond-require "macstuff" {\n'
+            '        when platform="macosx"\n'
+            '        when platform=(not)"linux"\n'
+            "    }\n"
+        )
+        text = self._lockfile_with_dep(block)
+        lf = parse_lockfile(text)
+        dep = lf.deps[0]
+        assert len(dep.cond_requires) == 1
+        cr = dep.cond_requires[0]
+        assert cr.name == "macstuff"
+        assert len(cr.predicates) == 2
+        assert cr.predicates[0] == Predicate(name="platform", values=("macosx",), negated=False)
+        assert cr.predicates[1] == Predicate(name="platform", values=("linux",), negated=True)
+
+    def test_no_cond_require_nodes(self) -> None:
+        """Dep with no cond-require child nodes → cond_requires == ()."""
+        text = self._lockfile_with_dep("")
+        lf = parse_lockfile(text)
+        dep = lf.deps[0]
+        assert dep.cond_requires == ()
+
+    def test_requires_parsing_unchanged(self) -> None:
+        """requires line is parsed correctly even when cond-require is present."""
+        text = self._lockfile_with_dep('    cond-require "extra" platform="linux"\n')
+        lf = parse_lockfile(text)
+        dep = lf.deps[0]
+        assert dep.requires == ("bar", "extra")
+
+
+class TestCondRequireRoundTrip:
+    """Cycle 4: parse(format(lf)) == lf and format(parse(text)) == text."""
+
+    def test_round_trip_inline_single(self) -> None:
+        """parse_lockfile(format_lockfile(lf)) == lf for inline single predicate."""
+        p = Predicate(name="platform", values=("linux",), negated=False)
+        cr = CondRequire(name="extra", predicates=(p,))
+        dep = _make_dep_with_cond(cond_requires=(cr,))
+        lf = Lockfile(deps=(dep,))
+        parsed = parse_lockfile(format_lockfile(lf))
+        assert parsed.deps[0].cond_requires == lf.deps[0].cond_requires
+
+    def test_round_trip_negated(self) -> None:
+        """Round-trip preserves negated=True."""
+        p = Predicate(name="platform", values=("linux",), negated=True)
+        cr = CondRequire(name="extra", predicates=(p,))
+        dep = _make_dep_with_cond(cond_requires=(cr,))
+        lf = Lockfile(deps=(dep,))
+        parsed = parse_lockfile(format_lockfile(lf))
+        assert parsed.deps[0].cond_requires[0].predicates[0].negated is True
+
+    def test_round_trip_block_multi(self) -> None:
+        """Round-trip preserves multi-predicate block form."""
+        p1 = Predicate(name="platform", values=("macosx",), negated=False)
+        p2 = Predicate(name="platform", values=("linux",), negated=True)
+        cr = CondRequire(name="macstuff", predicates=(p1, p2))
+        dep = _make_dep_with_cond(requires=("bar", "macstuff"), cond_requires=(cr,))
+        lf = Lockfile(deps=(dep,))
+        parsed = parse_lockfile(format_lockfile(lf))
+        assert parsed.deps[0].cond_requires == lf.deps[0].cond_requires
+
+    def test_format_parse_format_identity(self) -> None:
+        """format(parse(text)) == text for a hand-written canonical sample."""
+        # Pin the exact canonical text from the RFC §3.4.1 example.
+        sample = (
+            "// generated by milpa; reproducible build snapshot\n"
+            "version 1\n"
+            'strategy "maxver"\n'
+            "\n"
+            'dep "qux" {\n'
+            f'    identity "{_VALID_IDENTITY}"\n'
+            '    version "1.0.0"\n'
+            '    src_dir "src"\n'
+            '    requires "bar" "extra"\n'
+            '    cond-require "extra" platform="linux"\n'
+            "    provenance {\n"
+            '        kind "git"\n'
+            '        url "https://example.com/qux.git"\n'
+            "    }\n"
+            "}\n"
+        )
+        lf = parse_lockfile(sample)
+        re_formatted = format_lockfile(lf)
+        assert re_formatted == sample
+
+    def test_format_parse_format_block_multi(self) -> None:
+        """format(parse(text)) == text for a hand-written multi-clause block sample."""
+        sample = (
+            "// generated by milpa; reproducible build snapshot\n"
+            "version 1\n"
+            'strategy "maxver"\n'
+            "\n"
+            'dep "qux" {\n'
+            f'    identity "{_VALID_IDENTITY}"\n'
+            '    version "1.0.0"\n'
+            '    src_dir "src"\n'
+            '    requires "bar" "macstuff"\n'
+            '    cond-require "macstuff" {\n'
+            '        when platform="macosx"\n'
+            '        when platform=(not)"linux"\n'
+            "    }\n"
+            "    provenance {\n"
+            '        kind "git"\n'
+            '        url "https://example.com/qux.git"\n'
+            "    }\n"
+            "}\n"
+        )
+        lf = parse_lockfile(sample)
+        re_formatted = format_lockfile(lf)
+        assert re_formatted == sample
+
+
+class TestEdgesetToTermsRequiresPredicates:
+    """Cycle 5: edgeset_to_terms propagates predicates → requires_predicates dict."""
+
+    def test_no_predicates_gives_empty_dict(self) -> None:
+        from milpa.dep_decl import EdgeSet, EdgeSource, NamedRequire
+        from milpa.edge_sources import edgeset_to_terms
+        from milpa.version import Version
+
+        V = Version(major=99, minor=0, patch=0, pre=[], build="")
+        es = EdgeSet(
+            requires=[NamedRequire(name="stew", constraint_str=">= 0.1.0")],
+            src_dir="",
+            source=EdgeSource.NIMBLE_FALLBACK,
+        )
+        _, _, requires_predicates = edgeset_to_terms(es, {}, V)
+        assert requires_predicates == {}
+
+    def test_predicate_bearing_entry_recorded(self) -> None:
+        """NamedRequire with predicates → requires_predicates carries them."""
+        from milpa.dep_decl import EdgeSet, EdgeSource, NamedRequire
+        from milpa.edge_sources import edgeset_to_terms
+        from milpa.version import Version
+
+        p = Predicate(name="platform", values=("linux",), negated=False)
+        V = Version(major=99, minor=0, patch=0, pre=[], build="")
+        es = EdgeSet(
+            requires=[NamedRequire(name="extra", constraint_str="", predicates=(p,))],
+            src_dir="",
+            source=EdgeSource.NIMBLE_FALLBACK,
+        )
+        _, _, requires_predicates = edgeset_to_terms(es, {}, V)
+        assert "extra" in requires_predicates
+        assert requires_predicates["extra"] == (p,)
+
+    def test_cond_requires_in_locked_dep_via_resolved_dep(self) -> None:
+        """_locked_from_resolved copies cond_requires from ResolvedDep."""
+        from milpa.lockfile import _locked_from_resolved
+
+        p = Predicate(name="platform", values=("linux",), negated=False)
+        cr = CondRequire(name="extra", predicates=(p,))
+        rd = ResolvedDep(
+            name="qux",
+            identity=_VALID_IDENTITY,
+            version="1.0.0",
+            src_dir="src",
+            requires=("bar", "extra"),
+            cond_requires=(cr,),
+        )
+        locked = _locked_from_resolved(rd)
+        assert locked.cond_requires == (cr,)
+
+
+class TestVerifyIgnoresCondRequires:
+    """Cycle 6: verify_against_graph does NOT consult cond_requires."""
+
+    def test_verify_passes_with_cond_require_in_lockfile(self) -> None:
+        """Lockfile with cond-require still verifies against a graph without it."""
+        p = Predicate(name="platform", values=("linux",), negated=False)
+        cr = CondRequire(name="extra", predicates=(p,))
+        prov = GitProvenanceRecord(url="https://example.com/qux.git")
+        locked = LockedDep(
+            name="qux",
+            identity=_VALID_IDENTITY,
+            version="1.0.0",
+            src_dir="src",
+            requires=("bar", "extra"),
+            provenances=(prov,),
+            cond_requires=(cr,),
+        )
+        lf = Lockfile(deps=(locked,))
+        # Graph has the dep with the same identity, no cond_requires field involved
+        graph = ResolvedGraph(
+            deps=(ResolvedDep(
+                name="qux",
+                identity=_VALID_IDENTITY,
+                version="1.0.0",
+                src_dir="src",
+                requires=("bar", "extra"),
+            ),)
+        )
+        verify_against_graph(lf, graph)  # must not raise
