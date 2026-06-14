@@ -1,6 +1,6 @@
 # RFC: Conditional (`when`-gated) requires in `.nimble` files
 
-- **Status:** Draft (Stage 1 — sliced; **architecture round 1 applied**; BLOCKED on the §8 R1 escalation before round 2). Round 1 fixes folded into §3.1/§3.2/§3.3/§3.4/§6/§9; one genuine fork (R1: host-specific vs universal lockfile, ↔ #110) awaits Corey.
+- **Status:** Draft (Stage 1 — sliced; **architecture round 1 applied + R1 resolved**; ready for round 2). R1 resolved **(c)**: #26 recognizes `when`, attaches predicates, and **records them on a universal (platform-neutral) lockfile** — it does NOT exclude deps by host. Build-time *activation* (filtering nim.cfg / the active set by profile) is deferred to **#110**. §3.4/§5/§6/§9 restructured accordingly.
 - **Scope:** milpa spec (`dep-decl.md` §1 + §7.5, `manifest-grammar.md` §5.3 + §6, `resolver-semantics.md` transitive predicate filtering) + both reference impls (nimble scanner, edge types, resolver) + conformance corpus.
 - **Milestone:** v1 Tier 2 (atlas parity — #26). Additive; no day-one breakage (unrecognized conditions keep today's over-include + warn behavior).
 - **Closes:** #26. **Files (deferred):** DepDecl artifact schema v1 carrying predicates (cross-repo tianguis) — see §8 F3.
@@ -28,11 +28,21 @@ branch unconditionally** and emits a `UserWarning` (normative: `dep-decl.md §7.
 
 This RFC makes the **fallback** path translate the *recognizable subset* of NimScript
 `when` conditions into milpa's existing `Predicate` model, attach those predicates to
-the extracted require entries, and let the resolver's **existing** profile matcher
-filter them — exactly as it already filters milpa.kdl `when`-gated deps. NimScript
-remains un-evaluated; we recognize a bounded, well-defined surface and translate it.
-Anything outside that surface falls back to **today's behavior** (include + warn) —
-so the change is strictly an improvement: never under-includes, never breaks a build.
+the extracted require entries, and **record them as annotations on the lockfile's
+`requires` edges**. NimScript remains un-evaluated; we recognize a bounded, well-defined
+surface and translate it. Anything outside that surface falls back to **today's behavior**
+(include + warn).
+
+**Scope boundary (R1 resolved — §8).** #26 does NOT exclude deps by host profile. The
+resolver still includes every branch (the lockfile stays **platform-neutral /
+universal** — milpa's reproducible-build commitment is preserved); the predicate is
+*recorded* on the locked edge, not *acted on*. The build-time **activation** (filtering
+`nim.cfg` / the active dep set by the resolving profile) is the deliberate domain of
+**#110 (universal resolution / lockfile)**. #26 is the substrate — translation, the
+in-memory predicate edge, and the lockfile annotation that #110 consumes. This keeps
+#26 bounded and correct, and avoids a silently host-specific lockfile (the Critical
+finding of round 1). Because nothing is excluded, #26 *never* under-includes — the
+graph is byte-identical in dep *set* to today; only the lockfile gains metadata.
 
 The attested DepDecl path is unchanged: a publisher still curates the artifact (the
 fixture-137 model). Carrying predicates *inside* an attested artifact (so attestation
@@ -208,42 +218,61 @@ must NOT gain predicates). So the scanner must NOT thread predicates through
   fetched*). Filtering only the first leaves the second fetching excluded deps (depth
   lens Finding 1 — the "never fetched" invariant breaks for URL transitives). The fix is
   to derive BFS enqueuing from the **same** (predicate-bearing, filtered) `EdgeSet`, so
-  there is ONE parse and ONE filter point. This removes a pre-existing duplication.
-  *(Whether filtering excludes-from-graph at all depends on the §8 R1 escalation.)*
+  there is ONE parse and ONE filter point. Under (c) nothing is excluded, so both paths
+  agree trivially; unifying them is a worthwhile cleanup but **not load-bearing for #26**
+  (no never-fetched invariant to protect). Treat it as optional refactor, not a gate.
 
-### 3.4  Resolver — extend the existing filter to transitive edges
+### 3.4  Recording predicates on the lockfile edge (NO host exclusion)
 
-> **⚠ ROUND-1 ESCALATION (R1) — this section is GATED on a Corey decision (§8).**
-> The reviews surfaced that filtering transitive edges by the *host* profile makes the
-> `milpa.lock` **platform-specific**, which collides head-on with the lockfile's stated
-> purpose ("reproducible build snapshot") and with the deferred universal-resolution
-> question **#110**. The text below describes the *host-filtering* design as drafted;
-> whether milpa does host-exclusion at all (vs. universal-lock + build-time activation)
-> is the open fork in §8 R1. Do not implement §3.4 until R1 is resolved.
+**R1 resolved (c):** #26 does **not** filter transitive edges by host profile. The
+resolver enrolls every branch exactly as today (the dep *set* is unchanged → the
+lockfile stays platform-neutral and reproducible). The predicate's only effect in #26
+is to be **recorded on the locked `requires` edge**, where #110 will later read it to
+drive build-time activation.
 
-Today `_filter_manifest_by_profile` (resolver.py) filters **root manifest** deps by
-`Profile` before the solver, using `_predicate_satisfied`. Transitive `.nimble` edges
-are not filtered because they had no predicates. The drafted design:
+This is small and additive:
+1. **Predicates flow through unchanged resolution** from the scanner-produced
+   `EdgeSet` (§3.3) into the lockfile writer. No `_filter_manifest_by_profile` change,
+   no `edgeset_to_terms` filtering, no `Profile=None` trap, no frozen interaction — the
+   resolver's dep selection is byte-identical to today.
+2. **Lockfile schema gains a predicate annotation on conditional requires**
+   (`lockfile-schema.md`). The `requires` edge, today a bare name list, gains an
+   optional predicate child for `.nimble`-derived conditional edges:
 
-1. **One matcher, in one module.** Extract `_predicate_satisfied` / `dep_matches_profile`
-   into a new `predicates.py` (SSOT) importable by both `resolver.py` (root filter) and
-   `edge_sources.py` (edge filter) without a circular import (round 1, design Finding 4).
-   Target helper: `require_matches_profile(predicates, profile, active_flags) -> bool`.
-2. **Filter inside `edgeset_to_terms`,** via a new `profile: Profile | None = None`
-   parameter — the single conversion site `EdgeSet → (terms, names)` — not a separate
-   pre-pass (round 1, design Finding 4). `active_flags = frozenset()` for transitive
-   nimble edges (a `.nimble` has no flags block; round 1, design Finding 4).
-3. **`Profile=None` guard at the call site.** `_predicate_satisfied(pred, None, …)`
-   would compute `getattr(None, name)` → `None` → exclude-everything. The new call site
-   MUST guard `if profile is None: include all` exactly as the root filter does
-   (round 1, depth Finding 3). Absent profile ≠ matches-nothing (§6 NORMATIVE).
+   ```kdl
+   dep "qux" {
+       version "1.0.0"
+       requires "bar"
+       requires "extra" {            // conditional edge from `when defined(linux)`
+           when platform="linux"     // recorded predicate (mirrors manifest §6 syntax)
+       }
+       ...
+   }
+   ```
 
-Evaluation timing matches §6: a predicate-excluded transitive require is removed
-**before** it becomes solver input. The "never fetched" guarantee holds only once the
-double-parse (§3.3) is unified — otherwise the BFS path still fetches it (depth
-Finding 1). **Frozen / prior-reuse interaction** (depth Finding 2, breadth Gap 1) is
-part of the R1 escalation: a host-specific lockfile replayed under `--frozen` on a
-different host mismatches. R1's resolution dictates the frozen contract.
+   The annotation reuses the milpa.kdl `when`-predicate surface syntax (§6) verbatim —
+   one predicate vocabulary across manifest and lockfile. Unconditional requires keep
+   the bare `requires "name"` form (back-compatible; existing lockfiles unchanged).
+3. **No new matcher call site, no `predicates.py` split required for #26** — that
+   refactor belongs to #110 when activation actually evaluates the recorded predicate.
+   #26 only *writes* the annotation; it never *reads* it to filter.
+
+> The round-1 matcher/`Profile=None`/double-parse/frozen findings were all consequences
+> of host-*exclusion*. Under (c) there is no exclusion, so they dissolve. They are
+> preserved in the §8 ledger as **#110's** concerns (activation will re-introduce a
+> filter call site, and must handle them then).
+
+### 3.5  Attested DepDecl path — unchanged (and why)
+
+A DepDecl artifact is publisher-curated: fixture-137 shows the publisher already
+resolved the `when` at publish time and emitted a flat require list. That remains
+valid and is the *higher-fidelity* path (a human/tool decided). This RFC does not
+touch artifact bytes, the index, or tianguis. The natural next step — let an artifact
+carry `require "extra" ">= 1.0.0" platform="linux"` so attestation itself is
+conditional — is a schema-v1 bump with cross-repo blast radius; filed, not built
+(§8 F3). Doing it now would violate minimal-over-completeness
+([[feedback_minimal_over_completeness]]): one proven consumer (the fallback) needs
+predicates; the attested path has a working alternative (curation).
 
 ### 3.5  Attested DepDecl path — unchanged (and why)
 
@@ -264,113 +293,97 @@ predicates; the attested path has a working alternative (curation).
 | `dep-decl.md §7.5` | "`when` ⇒ include all unconditionally + warn" | Replace with the §3.1 translation table + the UNRECOGNIZED→include+warn fallback + the §3.2 branch algebra. The warning text changes to fire only on UNRECOGNIZED conditions. |
 | `dep-decl.md §1` | `RequireEntry` = name+constraint / url+ref | Add optional `predicates` tuple (in-memory; not serialized in v0 artifacts). |
 | `manifest-grammar.md §5.3` | mirror of §7.5 | Mirror the same update (the two are kept in lockstep — they already cross-reference). |
-| `manifest-grammar.md §6` | predicate vocab + matcher | **Unchanged** — reused verbatim. The §3.1 table maps INTO this vocabulary. |
-| `resolver-semantics.md` | root-manifest predicate filtering only | Add: the same filter applies to transitive `EdgeSet` requires (§3.4), before solver input. |
+| `manifest-grammar.md §6` | predicate vocab + matcher | **Unchanged** — reused verbatim. The §3.1 table maps INTO this vocabulary; the lockfile annotation (§3.4) reuses the `when platform=…` surface syntax. |
+| `lockfile-schema.md` | `requires` = bare name list | Add the optional `requires "name" { when … }` predicate-annotation form for conditional edges (§3.4). Back-compatible; unconditional requires unchanged. |
+| `resolver-semantics.md` | — | **No change in #26.** Transitive predicate *activation* (filtering by profile) is **#110**, not here. |
 
 No error-catalog change: UNRECOGNIZED is a warning, not an error; malformed
 constraints still raise the existing `MAN-NIMBLE-CONSTRAINT`.
 
 ## 5  Transition & compatibility
 
-- **Strictly additive.** A `.nimble` with no `when` blocks: byte-identical behavior.
-- **Recognized `when`:** the gated require gains predicates; on a matching profile the
-  resolved graph is **identical to today**, on a non-matching profile the dep is now
-  (correctly) excluded. The only observable change is *fewer* deps on some platforms.
-- **Unrecognized `when`:** identical to today (include + warn).
-- **Default profile:** when no `MILPA_TARGET_*` is set, `Profile.from_environment()`
-  supplies the host platform/arch — so a host resolve filters to the host, which is
-  what a developer expects. (`Profile=None` only inside tests that opt out.)
+- **Strictly additive, never under-includes.** Under (c) the resolved dep *set* is
+  identical to today on every platform — #26 excludes nothing. The only observable
+  change is *metadata*: conditional `.nimble`-derived edges gain a `when …` annotation
+  in `milpa.lock`.
+- **`.nimble` with no `when` blocks:** byte-identical lockfile.
+- **`.nimble` with a recognized `when`:** the conditional require is still locked
+  (universal lockfile), now annotated with its predicate. Lockfile bytes change for
+  exactly those edges; the dep set does not.
+- **Unrecognized `when`:** identical to today (include + warn), no annotation.
+- **Lockfile stays platform-neutral** → `--frozen`, prior-reuse, and cross-host sharing
+  are unaffected (the round-1 frozen/reproducibility hazard does not arise under (c)).
+- **#110 later** reads the recorded annotation to filter the active build set / `nim.cfg`
+  by the resolving profile — that is where host-specific *activation* (and any default-
+  profile / CI-diagnostic concerns from round 1) will be designed.
 
 ## 6  Conformance plan
 
-*Provisional pending R1 — exact expected-lockfiles depend on the host-filter vs
-universal-lock decision. Fixtures run across all FOUR runners (§9). The env-file
-mechanism for `MILPA_TARGET_*` already exists in both in-process runners
-(`harness/runner.py` `_read_env_file`; rust `fixture_profile` in `runner.rs`) — no new
-harness infra (round 1, feasibility RISK 6).*
+Under (c) every fixture asserts the lockfile **records** the right predicate annotation
+— never that a dep is excluded. Fixtures run across all FOUR runners (§9). No
+`MILPA_TARGET_*` env is needed (resolution is profile-independent in #26 — the
+annotation is recorded regardless of host), which also makes the fixtures
+**host-deterministic on any CI machine** (round-1 determinism concern dissolves).
 
-- **Do NOT mutate fixture-138** (round 1, depth Finding 9): `spec/conformance-fixtures.md`
-  requires existing fixtures be retained unchanged. fixture-138 (no `env`, profile=None)
-  stays as the **over-include regression guard**. Add NEW fixtures (139+) for the
-  profile-pinned variants.
-- **recognized include/exclude**: new fixtures with `env` pinning
-  `MILPA_TARGET_PLATFORM=linux` (include `extra`) vs `=windows` (exclude `extra`).
-- **else/elif chain**, **negation** (`when not defined(windows)`), **nim-version guard**
-  (`(NimMajor,NimMinor) >= (2,0)` under `MILPA_TARGET_NIM` 1.6.0 vs 2.2.0),
-  **two-sided nim range** (depth/design), **UNRECOGNIZED over-include + warn**.
-- **Missing scenarios the reviews flagged (add fixtures):** a `when`-gated **URL**
-  require (not just named — breadth Gap 4); **multiple requires in one branch** all
-  inheriting the predicate (breadth Gap 5); a **workspace member** with a `.nimble`
-  `when` fallback (breadth Gap 9); the **root package** being a `.nimble`-only project
-  with a `when` block (breadth Gap 3); **`overrides`** naming a predicate-excluded dep
-  (filter-before-override, breadth Gap 8).
+- **fixture-138 expected.lock gains the annotation** (round 1's "don't mutate" concern
+  was about changing the dep *set* via exclusion — under (c) the set is unchanged;
+  `extra` is still locked, now as `requires "extra" { when platform="linux" }`). This is
+  an additive format evolution, not a contract weakening. Update its expected bytes.
+- **recognized translation** (one fixture per §3.1 family): `defined(linux)`,
+  `defined(win)`, `defined(amd64)`, `not defined(windows)`, nim-version (two-tuple,
+  three-tuple, **two-sided range**) → assert the exact recorded `when …` annotation.
+- **else/elif chain** → assert each branch's require carries its canonical predicate
+  tuple (incl. the negation conjunction).
+- **UNRECOGNIZED** (`defined(release)`, compound `or`) → no annotation, require still
+  locked, warning fires.
+- **Scenarios the reviews flagged (add fixtures):** a `when`-gated **URL** require
+  (breadth Gap 4); **multiple requires in one branch** each annotated (breadth Gap 5);
+  a **workspace member** `.nimble` `when` fallback (breadth Gap 9); a **root** `.nimble`-
+  only project with a `when` block (breadth Gap 3). *(`overrides` interaction — breadth
+  Gap 8 — is moot under (c): nothing is filtered, so override coercion is unchanged.)*
 - **attested unchanged**: fixture-137 stays green untouched (regression guard).
-- **coverage clauses (add atomically with the fixtures — feasibility RISK 5):**
+- **coverage clauses (add atomically with fixtures — feasibility RISK 5):**
   `nimble.when-translate`, `nimble.when-negation`, `nimble.when-nim-version`,
-  `nimble.when-unrecognized-over-include`, and (if R1 ≠ pure-(c)) `resolver.transitive-predicate-filter`.
+  `nimble.when-unrecognized-over-include`, `lockfile.requires-when-annotation`.
 
 ## 7  Threat model
 
-The translation only ever *removes* edges that a recognized, negation-sound condition
-proves inapplicable to the target profile. A maliciously crafted `.nimble` cannot use
-this to hide a dep on the *target* platform: on that platform the predicate matches and
-the dep is included. Cross-platform under-inclusion is impossible because UNRECOGNIZED
-and any negation-unsound chain degrade to over-include. No new trust is placed in
-`.nimble` bytes that wasn't already (the fallback path is already TOFU; this is why the
-attested path remains the recommended, higher-trust route).
+Under (c), #26 changes no dep selection — it only *records* metadata — so it cannot
+cause under- or over-inclusion at all relative to today (over-inclusion of unrecognized
+`when` blocks is preserved exactly). A malicious `.nimble` cannot use the annotation to
+hide a dep, because #26 never acts on it (that is #110's surface, where the threat model
+for *activation* belongs). No new trust is placed in `.nimble` bytes that wasn't already
+(the fallback path is already TOFU; the attested path remains the higher-trust route).
 
 ## 8  Open forks (for architecture review / Corey)
 
-### R1 — THE escalation: does #26 make the lockfile platform-specific? (BLOCKING)
+### R1 — lockfile platform-specificity — RESOLVED (c)
 
-*Surfaced by round 1 (depth Finding 2 + breadth Gap 1), severity Critical. This is a
-genuine fork — it depends on milpa's reproducibility philosophy and the relationship to
-#110, not on a goal-determined answer.*
-
-Host-filtering transitive edges (§3.4 as drafted) means `milpa fetch` on linux and on
-windows produce **different `milpa.lock` files** — breaking the lockfile's stated
-purpose ("reproducible build snapshot") and `--frozen` replay across hosts. milpa
-already has a filed home for exactly this tension: **#110 (universal / cross-platform
-resolution & lockfile — uv-parity)**. The options:
-
-- **(a) Host-specific lockfiles now.** Ship §3.4 as drafted; the lockfile reflects the
-  resolving host; `--frozen` needs a profile-stamp or re-filter. *Cost:* abandons the
-  portable-lockfile commitment until #110; sharp edge for CI/cross-compile.
-- **(b) Universal lockfile, build-time activation (uv model).** Resolve & lock ALL
-  conditional branches (lockfile stays platform-neutral); record each conditional edge
-  WITH its predicate; filter only at `nim.cfg`/active-build emission. *Cost:* needs a
-  lockfile-schema change (predicate on the locked edge) — squarely #110 territory;
-  bigger; arguably #26 ⊂ #110.
-- **(c) Reduce #26.** Land recognize + attach + (universal) lockfile annotation now;
-  defer the actual *activation/exclusion* semantics to #110. #26 becomes the
-  translation + data-model substrate; #110 decides what filtering means.
-
-*My recommendation:* **not (a).** The reproducible-build lockfile is a milpa
-non-negotiable; a silently host-specific lockfile violates it. Prefer **(c)** — it
-keeps #26 bounded and correct (universal lockfile, predicates recorded), unblocks the
-genuinely-useful translation/scanner work, and hands the philosophical filtering
-decision to #110 where it belongs. (b) is the eventual end-state; (c) is the right
-increment toward it. **This decision reshapes §3.4 / §5 / §6 / §9 — those sections are
-provisional until R1 is resolved, and round 2 should review the restructured RFC.**
+*Surfaced by round 1 (depth Finding 2 + breadth Gap 1), Critical. **Corey chose (c).***
+Host-filtering would have made `milpa.lock` host-specific, breaking the reproducible
+lockfile + `--frozen` cross-host and colliding with **#110**. Resolution: **#26
+recognizes + attaches predicates + records them on a universal (platform-neutral)
+lockfile; it excludes nothing. Build-time activation moves to #110.** §3.4/§5/§6/§9
+restructured accordingly. The round-1 host-exclusion findings (matcher/`Profile=None`/
+double-parse/frozen/CI-diagnostic — depth 1/2/3/11, breadth 1/7) are **transferred to
+#110** as its design constraints; they do not arise in #26.
 
 ### Resolved this round (folded into §3)
-- **F1 subset boundary / F6 `posix`** — *resolved:* table is closed as written; added
-  `win`, three-tuple + operator + two-sided `nim` forms; **dropped `posix`** to
-  UNRECOGNIZED (under-include risk on out-of-vocab POSIX platforms — depth Finding 4).
-- **F4 `defined(release/js/custom)`** — *resolved:* UNRECOGNIZED; `flag`-mapping waits
-  on #23. Unchanged.
-- **F5 one matcher** — *resolved:* extract `predicates.py` SSOT; filter inside
-  `edgeset_to_terms(profile=…)`; `active_flags=frozenset()` for nimble edges (§3.4).
+- **F1 / F6 `posix`** — table closed as written; added `win`, three-tuple + operator +
+  two-sided `nim` forms; **dropped `posix`** to UNRECOGNIZED (depth Finding 4).
+- **F4 `defined(release/js/custom)`** — UNRECOGNIZED; `flag`-mapping waits on #23.
+- **F5 one matcher** — moot in #26 (no filter call site under (c)); becomes #110's when
+  activation introduces the evaluator.
 
 ### Still open (non-blocking, recommendations stand)
 - **F2 — nesting depth.** Flat chains only; nested `when` ⇒ UNRECOGNIZED subtree.
   *Recommend:* yes.
 - **F3 — attested DepDecl predicates (schema v1).** *Recommend:* defer — filed as **#134**.
-- **F7 — silent under-inclusion diagnostic (round 1, depth Finding 11 / breadth Gap 7).**
-  When a recognized `when` drops a transitive dep, emit a stderr diagnostic naming the
-  dep + the predicate that excluded it (over-inclusion was visible in the lockfile;
-  exclusion must not be silent). *Recommend:* yes — mandate it in §3.4/spec. (Final
-  shape depends on R1: under (c) nothing is excluded yet, so this lands with #110.)
+
+### Transferred to #110 (activation — round-1 findings that only arise when filtering)
+- Matcher SSOT (`predicates.py`) + single call site; `Profile=None` guard;
+  double-parse unification; `--frozen` profile contract; default-profile / CI
+  under-inclusion diagnostic. **A comment summarizing these should be added to #110.**
 
 ## 9  Slices (Stage-1 breakdown → `/tdd`-sized)
 
@@ -379,10 +392,10 @@ from the pre-Nim handoff: python CLI, rust CLI, python in-process, rust in-proce
 and rebuild the rust *release* binary before `python3 -m harness`). Slices are ordered
 so each is independently testable and leaves the tree green.
 
-*S1–S3 are R1-independent (translation + data model + scanner produce predicates
-regardless of what filtering means). S4+ are gated on R1 — under recommendation (c) S4
-becomes "record predicates in the (universal) lockfile" rather than "exclude from
-graph," and the exclusion/activation work moves to #110.*
+*R1 resolved (c): #26 records predicates on the universal lockfile; it never excludes.
+S4 is the lockfile recorder, not a filter. No `resolver-semantics.md` change, no graph
+behavior change — only metadata. Each slice lands both impls + spec + fixtures together;
+rebuild the rust **release** binary before `python3 -m harness`.*
 
 - **S1 — translation function.** `parse_when_condition(cond)` pure function in both
   impls (the §3.1 table; returns `None`/`Option::None` for UNRECOGNIZED; never empty).
@@ -400,19 +413,22 @@ graph," and the exclusion/activation work moves to #110.*
   warning now fires only on UNRECOGNIZED — feasibility RISK 1; do NOT defer to S5).
 - **S3b — scanner wiring.** Thread `parse_when_branches` + `parse_when_condition` into
   `parse_nimble`; carry predicates across the `edge_sources._nimble_edges` bridge onto
-  `NamedRequire`/`UrlRequire` **without** touching the shared `NamedDep`/`UrlDep`
-  (§3.3); unify the double-parse. RED: §1 example → `extra` carries `platform="linux"`;
-  UNRECOGNIZED still over-includes + warns; fixture-138 stays green (profile=None).
-- **S4 — (GATED on R1) filtering / lockfile recording.** Under (c): extract
-  `predicates.py` SSOT; record predicates on universal lockfile edges. Under (a)/(b):
-  the §3.4 transitive filter. RED depends on R1.
+  `NamedRequire`/`UrlRequire` **without** touching the shared `NamedDep`/`UrlDep` (§3.3).
+  RED: §1 example → the `extra` EdgeSet entry carries `platform="linux"`; UNRECOGNIZED
+  still over-includes + warns. (Lockfile unchanged this slice — recording is S4.)
+- **S4 — lockfile recorder.** Extend `lockfile.py` writer + `lockfile-schema.md` to emit
+  `requires "name" { when … }` for predicate-bearing edges; parser round-trips it.
+  Predicates flow scanner → EdgeSet → resolved graph → lockfile. NO graph/selection
+  change. RED: resolve the §1 example → `milpa.lock` records the annotation on `extra`;
+  unconditional requires unchanged; round-trip parse=format. Both impls. Rebuild rust
+  release before harness.
 - **S5 — spec.** `dep-decl.md §7.5` (table + algebra + warning-on-UNRECOGNIZED),
-  `dep-decl.md §1` (predicates field), `manifest-grammar.md §5.3` (mirror), and (R1-
-  dependent) `resolver-semantics.md`. Note: **no spec-version bump** — no serialized
-  artifact format changes (breadth Gap 12); the predicates field is in-memory (and, under
-  (c), a lockfile-schema question owned by #110).
-- **S6 — conformance corpus.** Author §6 fixtures; add coverage clauses **atomically**
-  with fixture dirs (feasibility RISK 5 — else `test_inventory_fully_covered` reddens).
+  `dep-decl.md §1` (predicates field), `manifest-grammar.md §5.3` (mirror),
+  `lockfile-schema.md` (the `requires { when … }` annotation). Update in-code warning
+  text. **No spec-version bump** (additive, pre-stabilization — `spec_versioning_deferred`).
+- **S6 — conformance corpus.** Author §6 fixtures; **update fixture-138 expected.lock**
+  (additive annotation, dep set unchanged); add coverage clauses **atomically** with
+  fixture dirs (feasibility RISK 5 — else `test_inventory_fully_covered` reddens).
   Verify all four runners + zero divergence + coverage stays 100%. Rebuild rust RELEASE
   binary before `python3 -m harness` (feasibility RISK 7).
 

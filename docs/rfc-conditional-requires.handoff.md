@@ -1,14 +1,17 @@
 # rfc-conditional-requires (#26) — handoff
 
-- **Stage:** 2 (architect) — **round 1 applied**; BLOCKED on R1 fork → Corey   •   **Round:** 1 done
-- **Resume (after R1 decided):** apply R1 resolution to §3.4/§5/§6/§9, then `/architect docs/rfc-conditional-requires.md round 2`
+- **Stage:** 2 (architect) — round 1 applied + **R1 resolved (c)** + RFC restructured   •   **Round:** ready for 2
+- **Resume:** `/architect docs/rfc-conditional-requires.md round 2`
 
-## ⚠ BLOCKING FORK — R1 (§8 of the RFC)
-Host-filtering transitive edges makes `milpa.lock` platform-specific → breaks the
-reproducible-build lockfile + `--frozen` cross-host + collides with **#110** (universal
-resolution). Options: (a) host-specific lockfiles now; (b) universal lockfile +
-build-time activation (uv model, = #110 scope); (c) reduce #26 to recognize+attach+
-annotate, defer activation to #110. **Recommend (c).** Awaiting Corey.
+## R1 RESOLVED — (c): reduce #26, defer activation to #110
+#26 = recognize `when` + attach predicates + **record them on a universal (platform-
+neutral) lockfile** (`requires "x" { when platform="linux" }`). It EXCLUDES NOTHING —
+dep set unchanged, lockfile stays reproducible. Build-time *activation* (filter nim.cfg /
+active set by profile) → **#110**. Round-1 host-exclusion findings (matcher SSOT,
+Profile=None guard, double-parse, frozen contract, CI under-include diagnostic)
+**transferred to #110** — TODO: add a summary comment to #110.
+RFC §1/§3.4/§5/§6/§8/§9 restructured (commit pending). New slice S4 = lockfile recorder
+(lockfile-schema.md + writer/parser round-trip), NOT a filter.
 
 ## Round 1 — applied fixes (fork-independent)
 - §3.1 table: +`win`, +three-tuple/operator/two-sided `nim` forms; **dropped `posix`**
