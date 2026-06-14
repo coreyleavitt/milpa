@@ -168,11 +168,8 @@ CLAUSE_INVENTORY: list[SpecClause] = [
         id="cli.verify-no-lock",
         spec_ref="cli-contract.md §5.4",
         description="verify MUST exit 1 with LOCK-FILE-NOT-FOUND when milpa.lock absent",
-        covering_fixtures=(),
+        covering_fixtures=("fixture-164-verify-no-lock",),
         covering_tiers=(),
-        # GAP: no corpus fixture exercises verify with a missing milpa.lock
-        # (fixture-157 covers the show verb; a separate verify+no-lock fixture
-        # would need cmd=verify without milpa.lock — not yet authored)
     ),
     SpecClause(
         id="cli.verify-graph-drift",
@@ -333,9 +330,36 @@ CLAUSE_INVENTORY: list[SpecClause] = [
         id="resolver.dev-deps-root-only",
         spec_ref="resolver-semantics.md §10",
         description="dev-deps MUST be enrolled only at the root; transitive dev-deps MUST be ignored",
+        # fixture-064: root dep `a` declares its own dev-dep `e` — `e` is
+        # absent from the expected lockfile (never fetched). fixture-130: dep
+        # `pkg` declares dev-dep `devtool` — also absent. Both prove the rule.
+        covering_fixtures=("fixture-064-dev-deps",
+                           "fixture-130-transitive-projection-dev-deps-overrides"),
+        covering_tiers=(),
+    ),
+    # The two `no index configured` clauses are normative and observable in
+    # principle, but the black-box harness cannot currently drive them: the CLI
+    # always loads *some* index (MILPA_INDEX_URL or the default), and an empty
+    # index.kdl means 'index present, zero packages' — a different condition.
+    # Tracked as honest open gaps (fixtures 112/113 sit in corpus
+    # KNOWN_LIMITATIONS) pending the #120 contract decision (--no-index surface
+    # vs. accept as in-process-only). Listing them here keeps the coverage
+    # report truthful rather than reporting 'all observable clauses covered'.
+    SpecClause(
+        id="resolver.no-index",
+        spec_ref="errors.md §RES-NO-INDEX; resolver-semantics.md §8",
+        description="resolve() with named dep(s) and no index MUST raise RES-NO-INDEX",
         covering_fixtures=(),
         covering_tiers=(),
-        # GAP: no corpus fixture currently covers this directly
+        # GAP (#120): not black-box expressible — CLI always loads an index.
+    ),
+    SpecClause(
+        id="resolver.ws-no-index",
+        spec_ref="errors.md §RES-WS-NO-INDEX; resolver-semantics.md §8",
+        description="resolve_workspace() with named member dep(s) and no index MUST raise RES-WS-NO-INDEX",
+        covering_fixtures=(),
+        covering_tiers=(),
+        # GAP (#120): same structural limitation as resolver.no-index.
     ),
 
     # -----------------------------------------------------------------------

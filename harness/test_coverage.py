@@ -187,25 +187,29 @@ class TestCoverageReport(unittest.TestCase):
             "Either the corpus is smaller than expected or the inventory is wrong.",
         )
 
-        # cli.add-git, cli.remove, cli.update are now covered by corpus fixtures
-        # (120/121/123/124/160/161/162) — they must NOT be in gap_ids.
-        now_covered = {"cli.add-git", "cli.remove", "cli.update"}
+        # These clauses are now covered by corpus fixtures — incl.
+        # cli.verify-no-lock (fixture-164) and resolver.dev-deps-root-only
+        # (fixtures 064/130), closed under #125. They must NOT be in gap_ids.
+        now_covered = {
+            "cli.add-git", "cli.remove", "cli.update",
+            "cli.verify-no-lock", "resolver.dev-deps-root-only",
+        }
         for clause_id in now_covered:
             self.assertNotIn(
                 clause_id, report.gap_ids,
-                f"Clause {clause_id!r} should be covered by corpus fixtures "
-                "(fixtures 120/121/123/124/160/161/162 are present in spec-v1/)",
+                f"Clause {clause_id!r} should be covered by corpus fixtures",
             )
 
-        # The still-open gap clauses must remain in gap_ids
-        still_open = {"cli.verify-no-lock", "resolver.dev-deps-root-only"}
+        # The remaining observable gaps are the #120 'no index configured'
+        # clauses, which are not black-box expressible until the --no-index
+        # contract decision lands. They MUST remain in gap_ids (honest report).
+        still_open = {"resolver.no-index", "resolver.ws-no-index"}
         for gap_id in still_open:
             clause = next((c for c in CLAUSE_INVENTORY if c.id == gap_id), None)
             if clause is not None and clause.observable:
                 self.assertIn(
                     gap_id, report.gap_ids,
-                    f"Clause {gap_id!r} must remain in gaps "
-                    "(no fixture covers it yet)",
+                    f"Clause {gap_id!r} must remain in gaps (blocked on #120)",
                 )
 
     def test_c4_log_output_structure(self) -> None:

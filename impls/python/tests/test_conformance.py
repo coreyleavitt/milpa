@@ -718,6 +718,20 @@ def _execute_verify(
     deps_dir.mkdir(parents=True, exist_ok=True)
     lock_path = fixture_dir / "milpa.lock"
 
+    # Missing lock → LOCK-FILE-NOT-FOUND, mirroring cmd_verify's first check
+    # (cli.py: `if not lock_path.exists()`, before any _deps/ work). The S6
+    # tripwire path below assumes a pre-authored lock; fixture-164 (#125)
+    # exercises the no-lock branch the CLI handles up front.
+    if not lock_path.exists():
+        from milpa.errors import LOCK_FILE_NOT_FOUND
+        if fixture.expected_error == LOCK_FILE_NOT_FOUND:
+            return ("pass", "")
+        return (
+            "fail",
+            f"verify: no milpa.lock yields {LOCK_FILE_NOT_FOUND}, "
+            f"but fixture expected {fixture.expected_error!r}",
+        )
+
     # Stash the pre-authored milpa.lock (with the old dep_decl pins).
     try:
         lock_text = lock_path.read_text(encoding="utf-8")
