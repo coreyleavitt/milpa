@@ -337,29 +337,23 @@ CLAUSE_INVENTORY: list[SpecClause] = [
                            "fixture-130-transitive-projection-dev-deps-overrides"),
         covering_tiers=(),
     ),
-    # The two `no index configured` clauses are normative and observable in
-    # principle, but the black-box harness cannot currently drive them: the CLI
-    # always loads *some* index (MILPA_INDEX_URL or the default), and an empty
-    # index.kdl means 'index present, zero packages' — a different condition.
-    # Tracked as honest open gaps (fixtures 112/113 sit in corpus
-    # KNOWN_LIMITATIONS) pending the #120 contract decision (--no-index surface
-    # vs. accept as in-process-only). Listing them here keeps the coverage
-    # report truthful rather than reporting 'all observable clauses covered'.
+    # The two `no index configured` clauses ARE black-box drivable via the
+    # three-way MILPA_INDEX_URL semantics (empty == explicitly no index,
+    # cli-contract §8.1 NORMATIVE) — run_fixture sets MILPA_INDEX_URL="" for
+    # fixtures with no index.kdl, and both impls honor it. (#120)
     SpecClause(
         id="resolver.no-index",
-        spec_ref="errors.md §RES-NO-INDEX; resolver-semantics.md §8",
+        spec_ref="errors.md §RES-NO-INDEX; cli-contract.md §8.1",
         description="resolve() with named dep(s) and no index MUST raise RES-NO-INDEX",
-        covering_fixtures=(),
+        covering_fixtures=("fixture-112-res-no-index",),
         covering_tiers=(),
-        # GAP (#120): not black-box expressible — CLI always loads an index.
     ),
     SpecClause(
         id="resolver.ws-no-index",
-        spec_ref="errors.md §RES-WS-NO-INDEX; resolver-semantics.md §8",
+        spec_ref="errors.md §RES-WS-NO-INDEX; cli-contract.md §8.1",
         description="resolve_workspace() with named member dep(s) and no index MUST raise RES-WS-NO-INDEX",
-        covering_fixtures=(),
+        covering_fixtures=("fixture-113-res-ws-no-index",),
         covering_tiers=(),
-        # GAP (#120): same structural limitation as resolver.no-index.
     ),
 
     # -----------------------------------------------------------------------

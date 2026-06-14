@@ -66,18 +66,27 @@ class TestCoverageInventory(unittest.TestCase):
         observable = [c for c in CLAUSE_INVENTORY if c.observable]
         self.assertGreater(len(observable), 5, "Expected ≥5 observable clauses")
 
-    def test_inventory_has_gap_clauses(self) -> None:
-        """Inventory must contain at least one known gap clause (drives future work)."""
+    def test_inventory_fully_covered(self) -> None:
+        """Every observable MUST-clause has a covering fixture/tier (0 gaps).
+
+        Reached after #125+#120: the last black-box gaps (verify-no-lock,
+        dev-deps-root-only, no-index, ws-no-index) are now covered. This asserts
+        the milestone holds — a NEW uncovered observable clause (a freshly added
+        normative requirement with no fixture yet) breaks this and must be
+        closed. The gap-DETECTION machinery itself is guarded by
+        test_c3_uncovered_clause_is_a_gap, independent of whether a real gap
+        currently exists.
+        """
         gaps = [
             c for c in CLAUSE_INVENTORY
             if c.observable
             and not c.covering_fixtures
             and not (set(c.covering_tiers) & ACTIVE_TIERS)
         ]
-        self.assertGreater(
-            len(gaps), 0,
-            "Expected at least one observable gap clause in the inventory — "
-            "gaps are the main value of the coverage map."
+        self.assertEqual(
+            gaps, [],
+            "Observable MUST-clauses without coverage: "
+            + str([c.id for c in gaps]),
         )
 
 
@@ -187,30 +196,25 @@ class TestCoverageReport(unittest.TestCase):
             "Either the corpus is smaller than expected or the inventory is wrong.",
         )
 
-        # These clauses are now covered by corpus fixtures — incl.
-        # cli.verify-no-lock (fixture-164) and resolver.dev-deps-root-only
-        # (fixtures 064/130), closed under #125. They must NOT be in gap_ids.
+        # All observable clauses are now covered by corpus fixtures, including
+        # the formerly-open gaps: cli.verify-no-lock (fixture-164),
+        # resolver.dev-deps-root-only (064/130) under #125, and
+        # resolver.no-index / resolver.ws-no-index (fixtures 112/113, driven by
+        # the empty MILPA_INDEX_URL three-way semantics) under #120.
         now_covered = {
             "cli.add-git", "cli.remove", "cli.update",
             "cli.verify-no-lock", "resolver.dev-deps-root-only",
+            "resolver.no-index", "resolver.ws-no-index",
         }
         for clause_id in now_covered:
             self.assertNotIn(
                 clause_id, report.gap_ids,
                 f"Clause {clause_id!r} should be covered by corpus fixtures",
             )
-
-        # The remaining observable gaps are the #120 'no index configured'
-        # clauses, which are not black-box expressible until the --no-index
-        # contract decision lands. They MUST remain in gap_ids (honest report).
-        still_open = {"resolver.no-index", "resolver.ws-no-index"}
-        for gap_id in still_open:
-            clause = next((c for c in CLAUSE_INVENTORY if c.id == gap_id), None)
-            if clause is not None and clause.observable:
-                self.assertIn(
-                    gap_id, report.gap_ids,
-                    f"Clause {gap_id!r} must remain in gaps (blocked on #120)",
-                )
+        self.assertEqual(
+            report.gap_ids, (),
+            f"Expected zero observable gaps; got {report.gap_ids}",
+        )
 
     def test_c4_log_output_structure(self) -> None:
         """3e-C4 supplemental: log output has COVERED + GAP lines + SUMMARY."""

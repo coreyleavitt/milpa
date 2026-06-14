@@ -46,20 +46,14 @@ KNOWN_LIMITATIONS: dict[str, str] = {
         "paths are relative to each member's dir; deferred pending §2.5 "
         "workspace fixture verification in the harness"
     ),
-    "fixture-112-res-no-index": (
-        "RES-NO-INDEX requires the resolver to receive index=None; "
-        "the CLI always loads an index (default MILPA_INDEX_URL) and cannot "
-        "be told 'no index' via env — this is an in-process-only code path. "
-        "SPEC GAP: no CLI-level 'no index' mode exists. "
-        "Tracked as a blocker for black-box harness coverage."
-    ),
-    "fixture-113-res-ws-no-index": (
-        "RES-WS-NO-INDEX requires the resolver to receive index=None; "
-        "same structural gap as fixture-112: the CLI always loads an index. "
-        "With no MILPA_INDEX_URL set the CLI hits the real network and may succeed. "
-        "SPEC GAP: no CLI-level 'no index' mode exists. "
-        "Tracked as a blocker for black-box harness coverage."
-    ),
+    # NOTE (#120): fixtures 112/113 were previously quarantined here on the
+    # belief that "no index configured" had no CLI surface. That is stale: the
+    # three-way MILPA_INDEX_URL semantics (cli-contract §8.1 NORMATIVE) make
+    # empty == explicitly no index, honored by BOTH impls' CLI path
+    # (`_load_index_for_verb` / `maybe_index`), and run_fixture already sets
+    # MILPA_INDEX_URL="" for fixtures with no index.kdl. Both fixtures pass
+    # black-box on python+rust with zero divergence, so they are no longer
+    # limitations.
 }
 
 

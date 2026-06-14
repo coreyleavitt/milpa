@@ -5,8 +5,8 @@ once against a tight, frozen contract instead of chasing a churning spec.
 
 Decided 2026-06-14 (this session): do **both** halves below, then Nim.
 
-- **Stage:** Half A → Stage 3 (/tdd, no RFC needed)   •   **Round:** —
-- **Resume:** `/loop close the harness blind spots — work issues #130, #125, #120 each with /tdd following the standing rules, then close #128 (errors.md already spec-owned); after each report one progress line; stop when all four are done`
+- **Stage:** Half A → 3/4 done; #120 awaiting Corey's contract decision   •   **Round:** —
+- **Resume:** after #120 decision, implement the chosen option; then Half B (start with #26 when-blocks RFC)
 
 ## Why this ordering
 Spec + 161-fixture corpus + harness (python+rust, zero divergence) is the contract
@@ -19,8 +19,13 @@ Tier 2/3 spec features so the surface is frozen before Nim transcribes it. See
 Hygiene backed by `rfc-differential-conformance-harness.md` + `spec/conformance-fixtures.md`.
 - [ ] **#130** — harness compares only certificate `kind`, not content
 - [ ] **#125** — 3 uncovered black-box MUST clauses (missing fixtures)
-- [ ] **#120** — RES-NO-INDEX / RES-WS-NO-INDEX not black-box expressible (fixtures 112/113)
-- [ ] **#128** — close: `spec/errors.md` already spec-owned ("do not generate from any implementation"); no impl generates it. Verify + close.
+- [x] **#128** — closed: `spec/errors.md` already spec-owned; no generator path remains.
+- [x] **#130** — fixed (a354c41): `_canonical_certificate()` is the single source for both fixture comparison + divergence token.
+- [x] **#125** — fixed (19e39ca): fixture-164 (verify-no-lock); registered 064/130 for dev-deps-root-only; RES-NO-INDEX clauses now documented gaps (44/46 honest).
+- [ ] **#120** — AWAITING CONTRACT DECISION. The two RES-NO-INDEX clauses are the last black-box gaps. Options:
+      1. `MILPA_INDEX_URL=none` sentinel — magic string, overloads empty semantics. Rejected (hack).
+      2. **`--no-index` flag (recommended)** — explicit CLI surface; matches pip/uv `--no-index`, cargo `--offline`; makes 112/113 real corpus fixtures; delivers a real offline/air-gapped resolution feature. BUT: cross-impl change (cli-contract.md + python + rust + fixtures) — bigger than hygiene, touches spec surface.
+      3. Accept in-process-only; mark 112/113 `observable=False`. Cheapest; accepts a permanent harness blind spot for two normative codes.
 
 ## Half B — Tier 2/3 spec features (enter flow at Stage 1, RFC each)
 Each is genuine design → RFC + slicing + two architect rounds before /tdd.
