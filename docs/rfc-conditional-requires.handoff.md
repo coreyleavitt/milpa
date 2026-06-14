@@ -1,10 +1,11 @@
 # rfc-conditional-requires (#26) — handoff
 
-- **Stage:** 3 (/tdd grind) — **S1 done; S2 next**   •   **Round:** —
+- **Stage:** 3 (/tdd grind) — **S1+S2 done; S3a next**   •   **Round:** —
 - **Resume:** `/loop implement the next unimplemented RFC slice (docs/rfc-conditional-requires.md §9) with /tdd following the standing rules; after each slice report one progress line; stop when every slice is implemented`
 
 ## Stage-3 progress
 - [x] **S1** (commit after `d53d600`) — `parse_when_condition` pure fn, both impls; 62 unit tests each; both gates green. Canonical nim value space-free (`">=1.4.0"`). **Confirm at S5:** single-`NimMajor` form accepts all 5 operators (`>=,>,<,<=,==`), generalizing the table's `>=`-only example — fold into the §3.1 normative table / dep-decl §7.5 when writing the spec slice.
+- [x] **S2** — `Predicate` moved to leaf `milpa/predicate.py` (Python) + `milpa-types` (Rust), re-exported from prior home (SSOT, import cycle broken); `predicates` field on `NamedRequire`/`UrlRequire`, EdgeSet round-trips it; 15 Rust ctor sites updated; 14 Py + 3 Rust tests; green.
 
 ## Round 2 outcome — additive `cond-require` (NO genuine forks)
 The round-2 depth agent edited the RFC toward an *overloaded* `requires { when }` form;

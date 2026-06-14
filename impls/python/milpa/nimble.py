@@ -496,3 +496,367 @@ def _split_on_and(cond: str) -> tuple[str, str] | None:
         if left and right:
             return left, right
     return None
+
+
+# ---------------------------------------------------------------------------
+# parse_when_branches — RFC §3.2 S3a
+# ---------------------------------------------------------------------------
+
+# Header patterns (after comment-stripping).
+_WHEN_HEADER_RE: re.Pattern[str] = re.compile(r"^(\s*)when\s+(.*?)\s*:\s*(.*?)\s*$")
+_ELIF_HEADER_RE: re.Pattern[str] = re.compile(r"^(\s*)elif\s+(.*?)\s*:\s*(.*?)\s*$")
+_ELSE_HEADER_RE: re.Pattern[str] = re.compile(r"^(\s*)else\s*:\s*(.*?)\s*$")
+
+# Detects a ``requires`` keyword at the start of a (stripped) line.
+_BRANCH_REQUIRES_RE: re.Pattern[str] = re.compile(r"^\s*requires\b")
+
+# Detects a ``requires`` keyword appearing in the post-colon tail of a header.
+_TAIL_REQUIRES_RE: re.Pattern[str] = re.compile(r"\brequires\b")
+
+
+@dataclass(frozen=True)
+class WhenBranch:
+    """One branch of a ``when``/``elif``/``else`` chain that contains requires.
+
+    ``predicates`` is the tuple of ``Predicate`` instances that apply to every
+    ``requires`` in this branch.  ``None`` means the branch is UNRECOGNIZED
+    (over-include + warn): either the chain was poisoned (unrecognized condition
+    or multi-pred condition with siblings) or the branch is inside a nested
+    ``when`` block (depth ≥ 1).
+
+    ``require_lines`` is the tuple of 0-based line indices (into the input
+    ``lines`` list) of the STARTING line of each ``requires`` statement in this
+    branch.  For the single-line colon form (``when … : requires …``), the index
+    is the header line itself.
+    """
+
+    predicates: tuple[Predicate, ...] | None
+    require_lines: tuple[int, ...]
+
+
+def _negate_predicate(p: Predicate) -> Predicate:
+    """Return p with the ``negated`` flag flipped (RFC §3.2 negation rule)."""
+    return Predicate(name=p.name, values=p.values, negated=not p.negated)
+
+
+def _leading_spaces(line: str) -> int:
+    """Count leading space characters (tabs count as one character each)."""
+    count = 0
+    for ch in line:
+        if ch in (" ", "\t"):
+            count += 1
+        else:
+            break
+    return count
+
+
+def parse_when_branches(lines: list[str]) -> list[WhenBranch]:
+    """Parse ``when``/``elif``/``else`` chains from ``.nimble`` file lines.
+
+    Returns a list of :class:`WhenBranch` instances, one per branch that
+    contains at least one direct ``requires`` statement.  Branches with no
+    direct requires are omitted.  ``requires`` outside any ``when`` chain are
+    NOT reported.
+
+    This function is **total**: it never raises on malformed or unexpected input.
+
+    Semantics (RFC §3.2):
+    - An indentation-aware state machine identifies chain headers (``when``,
+      ``elif``, ``else``) and their body lines.
+    - A chain is a ``when`` header followed by zero or more ``elif``/``else``
+      headers at the SAME indent level.
+    - Predicate computation per chain:
+      - If ANY condition is unrecognized OR (the chain has >1 branch AND any
+        condition has >1 predicate), the entire chain is poisoned: every branch
+        gets ``predicates=None``.
+      - Otherwise: ``when`` branch → its own predicates; ``elif`` → its
+        predicates AND negations of all prior conditions; ``else`` → negations
+        of all preceding conditions.
+    - Branches inside a nested ``when`` block (depth ≥ 1) get ``predicates=None``
+      regardless of their conditions.
+    - Report order: branches in order of their header line index.
+    """
+    result: list[WhenBranch] = []
+
+    # We collect chains level by level.  The outer loop scans for ``when``
+    # headers; for each one it reads the full chain (``elif``/``else`` at the
+    # same indent) and dispatches branches recursively for nested whens.
+    _scan_region(lines, 0, len(lines), depth=0, result=result)
+    # Sort by the header line of each branch's first require (already insertion-
+    # ordered, but confirm stability across nested paths).
+    # The recursive traversal already visits lines top-to-bottom; no re-sort
+    # needed.
+    return result
+
+
+def _scan_region(
+    lines: list[str],
+    start: int,
+    end: int,
+    *,
+    depth: int,
+    result: list[WhenBranch],
+) -> None:
+    """Scan lines[start:end] for ``when`` chains, appending to ``result``.
+
+    ``depth`` is the nesting level (0 = top-level scan).  Any chain found
+    at depth ≥ 1 has all its branches forced to ``predicates=None``.
+    """
+    i = start
+    while i < end:
+        raw = lines[i]
+        stripped = _strip_comment(raw)
+
+        m = _WHEN_HEADER_RE.match(stripped)
+        if m is None:
+            i += 1
+            continue
+
+        # Found a ``when`` header at this level.
+        header_indent = len(m.group(1))
+        when_cond = m.group(2).strip()
+        when_tail = m.group(3).strip()
+        when_line = i
+
+        # Collect the full chain: this branch's body + any elif/else at same indent.
+        # A "branch" is (kind, cond_or_None, tail, header_line, body_start, body_end).
+        # kind: "when" | "elif" | "else"
+        branches_raw: list[tuple[str, str | None, str, int, int, int]] = []
+
+        # Body of the ``when`` branch: lines strictly more indented than header.
+        body_start = i + 1
+        j = body_start
+        while j < end:
+            braw = lines[j]
+            bstripped = _strip_comment(braw)
+            if bstripped == "":
+                j += 1
+                continue
+            b_indent = _leading_spaces(bstripped)
+            if b_indent <= header_indent:
+                break
+            j += 1
+        body_end = j
+
+        branches_raw.append(("when", when_cond, when_tail, when_line, body_start, body_end))
+
+        # Now scan for elif/else at the same indent immediately after.
+        k = body_end
+        while k < end:
+            kraw = lines[k]
+            kstripped = _strip_comment(kraw)
+            if kstripped == "":
+                k += 1
+                continue
+            k_indent = _leading_spaces(kstripped)
+            if k_indent != header_indent:
+                break
+
+            em = _ELIF_HEADER_RE.match(kstripped)
+            if em:
+                elif_cond = em.group(2).strip()
+                elif_tail = em.group(3).strip()
+                elif_line = k
+                eb_start = k + 1
+                ej = eb_start
+                while ej < end:
+                    ejraw = lines[ej]
+                    ejstripped = _strip_comment(ejraw)
+                    if ejstripped == "":
+                        ej += 1
+                        continue
+                    ej_indent = _leading_spaces(ejstripped)
+                    if ej_indent <= header_indent:
+                        break
+                    ej += 1
+                eb_end = ej
+                branches_raw.append(("elif", elif_cond, elif_tail, elif_line, eb_start, eb_end))
+                k = eb_end
+                continue
+
+            esm = _ELSE_HEADER_RE.match(kstripped)
+            if esm:
+                else_tail = esm.group(2).strip() if esm.lastindex and esm.lastindex >= 2 else ""
+                # else_tail: the remainder after "else:" on the same line
+                # group(2) if the pattern has a capture for it
+                else_line = k
+                es_start = k + 1
+                esj = es_start
+                while esj < end:
+                    esjraw = lines[esj]
+                    esjstripped = _strip_comment(esjraw)
+                    if esjstripped == "":
+                        esj += 1
+                        continue
+                    esj_indent = _leading_spaces(esjstripped)
+                    if esj_indent <= header_indent:
+                        break
+                    esj += 1
+                es_end = esj
+                branches_raw.append(("else", None, else_tail, else_line, es_start, es_end))
+                k = es_end
+                break  # ``else`` terminates the chain
+
+            # Non-elif/else at the same indent → chain ends.
+            break
+
+        # Advance outer scan past the full chain.
+        i = k
+
+        # --- Predicate computation ---
+        # Compute recognized predicates for each when/elif condition.
+        conditions: list[tuple[Predicate, ...] | None] = []
+        for kind, cond, _, _, _, _ in branches_raw:
+            if kind in ("when", "elif") and cond is not None:
+                conditions.append(parse_when_condition(cond))
+            else:
+                conditions.append(None)  # else has no condition
+
+        # Poison test:
+        # (a) any recognized condition is None → poison
+        # (b) chain has >1 branch AND any recognized condition has >1 predicate → poison
+        chain_has_siblings = len(branches_raw) > 1
+        poisoned = False
+        for idx, (kind, cond, _, _, _, _) in enumerate(branches_raw):
+            if kind in ("when", "elif"):
+                pk = conditions[idx]
+                if pk is None:
+                    poisoned = True
+                    break
+                if chain_has_siblings and len(pk) > 1:
+                    poisoned = True
+                    break
+
+        # Assign per-branch predicates.
+        branch_predicates: list[tuple[Predicate, ...] | None] = []
+        if poisoned or depth >= 1:
+            for _ in branches_raw:
+                branch_predicates.append(None)
+        else:
+            # Accumulate negations of prior conditions.
+            prior_negations: list[Predicate] = []
+            for idx, (kind, cond, _, _, _, _) in enumerate(branches_raw):
+                if kind == "when":
+                    pk = conditions[idx]
+                    assert pk is not None
+                    branch_predicates.append(pk)
+                    # Store negations for subsequent elif/else.
+                    # Each predicate in pk negates independently (RFC §3.2).
+                    # Since chain is non-poisoned and has siblings → each pk is
+                    # exactly 1 predicate (guaranteed by the poison check above).
+                    # For solo ``when`` (no siblings), negation is never needed.
+                    for p in pk:
+                        prior_negations.append(_negate_predicate(p))
+                elif kind == "elif":
+                    pk = conditions[idx]
+                    assert pk is not None
+                    # elif branch: (pk) + (negations of all prior conditions)
+                    branch_predicates.append(pk + tuple(prior_negations))
+                    for p in pk:
+                        prior_negations.append(_negate_predicate(p))
+                else:  # else
+                    branch_predicates.append(tuple(prior_negations))
+
+        # Collect direct requires from each branch's body and tail.
+        for b_idx, (kind, cond, tail, header_line, body_start, body_end) in enumerate(
+            branches_raw
+        ):
+            req_indices: list[int] = []
+
+            # Single-line colon form: check the tail (text after "when …:").
+            if tail and _TAIL_REQUIRES_RE.search(tail):
+                req_indices.append(header_line)
+
+            # Body: collect direct requires (skip nested when blocks).
+            _collect_direct_requires(
+                lines, body_start, body_end, header_indent, req_indices
+            )
+
+            if req_indices:
+                result.append(
+                    WhenBranch(
+                        predicates=branch_predicates[b_idx],
+                        require_lines=tuple(req_indices),
+                    )
+                )
+
+            # Recurse into the body for nested ``when`` blocks.
+            _scan_region(
+                lines, body_start, body_end, depth=depth + 1, result=result
+            )
+
+
+def _collect_direct_requires(
+    lines: list[str],
+    start: int,
+    end: int,
+    outer_indent: int,
+    out: list[int],
+) -> None:
+    """Collect line indices of ``requires`` statements in lines[start:end].
+
+    Only collects requires that are NOT inside a deeper nested ``when`` block
+    (i.e., direct requires of the enclosing branch).
+
+    ``outer_indent`` is the indent of the enclosing ``when``/``elif``/``else``
+    header.  Lines in this region are strictly more indented than ``outer_indent``.
+
+    Multi-line continuation: only the starting line is recorded.
+    """
+    i = start
+    while i < end:
+        raw = lines[i]
+        stripped = _strip_comment(raw)
+        if stripped == "":
+            i += 1
+            continue
+
+        line_indent = _leading_spaces(stripped)
+
+        # If we hit a nested ``when``, skip its entire body.
+        wm = _WHEN_HEADER_RE.match(stripped)
+        if wm:
+            nested_indent = len(wm.group(1))
+            # Skip body lines of the nested when (and its elif/else).
+            j = i + 1
+            while j < end:
+                js = _strip_comment(lines[j])
+                if js == "":
+                    j += 1
+                    continue
+                if _leading_spaces(js) <= nested_indent:
+                    # Could be elif/else of the nested when — skip those too.
+                    em = _ELIF_HEADER_RE.match(js)
+                    esm = _ELSE_HEADER_RE.match(js)
+                    if (em or esm) and _leading_spaces(js) == nested_indent:
+                        # Skip this elif/else header and its body.
+                        j += 1
+                        while j < end:
+                            ejs = _strip_comment(lines[j])
+                            if ejs == "":
+                                j += 1
+                                continue
+                            if _leading_spaces(ejs) <= nested_indent:
+                                break
+                            j += 1
+                        continue
+                    break
+                j += 1
+            i = j
+            continue
+
+        # Check for requires.
+        if _BRANCH_REQUIRES_RE.match(stripped):
+            req_start = i
+            out.append(req_start)
+            # Skip multi-line continuation.
+            tail = stripped.rstrip()
+            while tail.endswith(","):
+                i += 1
+                if i >= end:
+                    break
+                tail = _strip_comment(lines[i]).strip()
+            i += 1
+            continue
+
+        i += 1

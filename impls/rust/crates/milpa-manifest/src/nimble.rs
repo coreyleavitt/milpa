@@ -741,3 +741,689 @@ mod when_condition_tests {
         assert_eq!(result[0].name, "arch");
     }
 }
+
+// ---------------------------------------------------------------------------
+// parse_when_branches — RFC §3.2 S3a
+// ---------------------------------------------------------------------------
+
+/// One branch of a `when`/`elif`/`else` chain that contains `requires` statements.
+///
+/// `predicates` is `Some(vec)` when the branch has a recognized, non-poisoned
+/// predicate tuple; `None` when the branch is UNRECOGNIZED (over-include + warn):
+/// either the chain was poisoned or the branch is inside a nested `when` block.
+///
+/// `require_lines` holds the 0-based indices (into the input `lines` slice) of
+/// the starting line of each `requires` statement in this branch.  For the
+/// single-line colon form the index is the header line itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhenBranch {
+    pub predicates: Option<Vec<crate::Predicate>>,
+    pub require_lines: Vec<usize>,
+}
+
+/// Parse `when`/`elif`/`else` chains from `.nimble` file lines.
+///
+/// Returns one [`WhenBranch`] per chain-branch that contains at least one
+/// direct `requires` statement.  Branches with no direct requires are omitted.
+/// `requires` outside any `when` chain are NOT reported.
+///
+/// This function is **total**: it never panics on malformed input.
+pub fn parse_when_branches(lines: &[&str]) -> Vec<WhenBranch> {
+    let mut result = Vec::new();
+    scan_region(lines, 0, lines.len(), 0, &mut result);
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Internal state machine
+// ---------------------------------------------------------------------------
+
+/// Count leading space/tab characters.
+fn leading_spaces(s: &str) -> usize {
+    s.chars().take_while(|c| *c == ' ' || *c == '\t').count()
+}
+
+/// Detect a `when <cond>:` header.  Returns `(indent, cond, tail)` or None.
+fn match_when_header(s: &str) -> Option<(usize, &str, &str)> {
+    let indent = leading_spaces(s);
+    let rest = s.trim_start().strip_prefix("when")?;
+    // Must be followed by whitespace (not `whenever`).
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    // Find the first top-level ':'.
+    let colon = rest.find(':')?;
+    let cond = rest[..colon].trim();
+    let tail = rest[colon + 1..].trim();
+    Some((indent, cond, tail))
+}
+
+/// Detect an `elif <cond>:` header.  Returns `(indent, cond, tail)` or None.
+fn match_elif_header(s: &str) -> Option<(usize, &str, &str)> {
+    let indent = leading_spaces(s);
+    let rest = s.trim_start().strip_prefix("elif")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let colon = rest.find(':')?;
+    let cond = rest[..colon].trim();
+    let tail = rest[colon + 1..].trim();
+    Some((indent, cond, tail))
+}
+
+/// Detect an `else:` header.  Returns `(indent, tail)` or None.
+fn match_else_header(s: &str) -> Option<(usize, &str)> {
+    let indent = leading_spaces(s);
+    let rest = s.trim_start().strip_prefix("else")?;
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix(':')?;
+    let tail = rest.trim();
+    Some((indent, tail))
+}
+
+/// Return true if `s` (comment-stripped) starts with `requires` followed by
+/// whitespace (i.e. is a requires statement).
+fn is_requires_line(s: &str) -> bool {
+    let t = s.trim_start();
+    if let Some(rest) = t.strip_prefix("requires") {
+        rest.starts_with(char::is_whitespace)
+    } else {
+        false
+    }
+}
+
+/// Return true if `tail` (post-colon part of a single-line header) contains
+/// a `requires` keyword.
+fn tail_has_requires(tail: &str) -> bool {
+    // Simple word-boundary check: find "requires" not glued to surrounding word chars.
+    let b = tail.as_bytes();
+    let needle = b"requires";
+    let nlen = needle.len();
+    let mut i = 0;
+    while i + nlen <= b.len() {
+        if &b[i..i + nlen] == needle {
+            let left_ok = i == 0 || !b[i - 1].is_ascii_alphanumeric() && b[i - 1] != b'_';
+            let right_ok = i + nlen >= b.len()
+                || (!b[i + nlen].is_ascii_alphanumeric() && b[i + nlen] != b'_');
+            if left_ok && right_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Find the end of a block whose body lines are strictly more indented than `header_indent`.
+/// Blank/comment-only lines are skipped.
+fn find_body_end(lines: &[&str], start: usize, end: usize, header_indent: usize) -> usize {
+    let mut j = start;
+    while j < end {
+        let s = strip_comment(lines[j]);
+        if s.trim().is_empty() {
+            j += 1;
+            continue;
+        }
+        if leading_spaces(&s) <= header_indent {
+            break;
+        }
+        j += 1;
+    }
+    j
+}
+
+/// Negate a predicate by flipping the `negated` flag.
+fn negate_pred(p: &crate::Predicate) -> crate::Predicate {
+    crate::Predicate {
+        name: p.name.clone(),
+        values: p.values.clone(),
+        negated: !p.negated,
+    }
+}
+
+/// Enum for branch kind used internally.
+enum BranchKind {
+    When,
+    Elif,
+    Else,
+}
+
+struct BranchRaw {
+    kind: BranchKind,
+    /// Condition string for when/elif; empty for else.
+    cond: String,
+    /// Text after "when/elif/else …:" on the header line.
+    tail: String,
+    header_line: usize,
+    body_start: usize,
+    body_end: usize,
+}
+
+fn scan_region(
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    depth: usize,
+    result: &mut Vec<WhenBranch>,
+) {
+    let mut i = start;
+    while i < end {
+        let s = strip_comment(lines[i]);
+        if s.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Look for a `when` header.
+        let Some((header_indent, when_cond, when_tail)) = match_when_header(&s) else {
+            i += 1;
+            continue;
+        };
+        let when_cond = when_cond.to_string();
+        let when_tail = when_tail.to_string();
+        let when_line = i;
+
+        // Collect the when body.
+        let body_start = i + 1;
+        let body_end = find_body_end(lines, body_start, end, header_indent);
+
+        let mut branches: Vec<BranchRaw> = vec![BranchRaw {
+            kind: BranchKind::When,
+            cond: when_cond,
+            tail: when_tail,
+            header_line: when_line,
+            body_start,
+            body_end,
+        }];
+
+        // Scan for elif/else at the same indent.
+        let mut k = body_end;
+        'chain: loop {
+            // Skip blanks.
+            while k < end {
+                let ks = strip_comment(lines[k]);
+                if !ks.trim().is_empty() {
+                    break;
+                }
+                k += 1;
+            }
+            if k >= end {
+                break;
+            }
+            let ks = strip_comment(lines[k]);
+            let k_indent = leading_spaces(&ks);
+            if k_indent != header_indent {
+                break;
+            }
+
+            if let Some((_, cond, tail)) = match_elif_header(&ks) {
+                let cond = cond.to_string();
+                let tail = tail.to_string();
+                let elif_line = k;
+                let eb_start = k + 1;
+                let eb_end = find_body_end(lines, eb_start, end, header_indent);
+                branches.push(BranchRaw {
+                    kind: BranchKind::Elif,
+                    cond,
+                    tail,
+                    header_line: elif_line,
+                    body_start: eb_start,
+                    body_end: eb_end,
+                });
+                k = eb_end;
+                continue 'chain;
+            }
+
+            if let Some((_, tail)) = match_else_header(&ks) {
+                let tail = tail.to_string();
+                let else_line = k;
+                let es_start = k + 1;
+                let es_end = find_body_end(lines, es_start, end, header_indent);
+                branches.push(BranchRaw {
+                    kind: BranchKind::Else,
+                    cond: String::new(),
+                    tail,
+                    header_line: else_line,
+                    body_start: es_start,
+                    body_end: es_end,
+                });
+                k = es_end;
+                break 'chain; // else terminates the chain
+            }
+
+            // Neither elif nor else → chain ends.
+            break 'chain;
+        }
+
+        i = k;
+
+        // --- Predicate computation ---
+        let conditions: Vec<Option<Vec<crate::Predicate>>> = branches
+            .iter()
+            .map(|b| match b.kind {
+                BranchKind::When | BranchKind::Elif => {
+                    parse_when_condition(&b.cond)
+                }
+                BranchKind::Else => None,
+            })
+            .collect();
+
+        let chain_has_siblings = branches.len() > 1;
+        let mut poisoned = false;
+        for (idx, b) in branches.iter().enumerate() {
+            match b.kind {
+                BranchKind::When | BranchKind::Elif => {
+                    match &conditions[idx] {
+                        None => { poisoned = true; break; }
+                        Some(pk) if chain_has_siblings && pk.len() > 1 => {
+                            poisoned = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                BranchKind::Else => {}
+            }
+        }
+
+        // Assign per-branch predicates.
+        let branch_predicates: Vec<Option<Vec<crate::Predicate>>> = if poisoned || depth >= 1 {
+            branches.iter().map(|_| None).collect()
+        } else {
+            let mut preds = Vec::new();
+            let mut prior_negations: Vec<crate::Predicate> = Vec::new();
+            for (idx, b) in branches.iter().enumerate() {
+                match b.kind {
+                    BranchKind::When => {
+                        let pk = conditions[idx].as_ref().unwrap().clone();
+                        // Store negations for subsequent branches.
+                        let negs: Vec<_> = pk.iter().map(negate_pred).collect();
+                        preds.push(Some(pk));
+                        prior_negations.extend(negs);
+                    }
+                    BranchKind::Elif => {
+                        let pk = conditions[idx].as_ref().unwrap().clone();
+                        let negs: Vec<_> = pk.iter().map(negate_pred).collect();
+                        let mut combined = pk.clone();
+                        combined.extend(prior_negations.iter().cloned());
+                        preds.push(Some(combined));
+                        prior_negations.extend(negs);
+                    }
+                    BranchKind::Else => {
+                        preds.push(Some(prior_negations.clone()));
+                    }
+                }
+            }
+            preds
+        };
+
+        // Collect direct requires from each branch.
+        for (b_idx, b) in branches.iter().enumerate() {
+            let mut req_indices: Vec<usize> = Vec::new();
+
+            // Single-line colon form: check the tail.
+            if !b.tail.is_empty() && tail_has_requires(&b.tail) {
+                req_indices.push(b.header_line);
+            }
+
+            // Body: collect direct requires (skip nested when blocks).
+            collect_direct_requires(lines, b.body_start, b.body_end, header_indent, &mut req_indices);
+
+            if !req_indices.is_empty() {
+                result.push(WhenBranch {
+                    predicates: branch_predicates[b_idx].clone(),
+                    require_lines: req_indices,
+                });
+            }
+
+            // Recurse into the body for nested when blocks.
+            scan_region(lines, b.body_start, b.body_end, depth + 1, result);
+        }
+    }
+}
+
+/// Collect line indices of `requires` statements in lines[start..end] that are
+/// NOT inside a deeper nested `when` block.
+fn collect_direct_requires(
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    outer_indent: usize,
+    out: &mut Vec<usize>,
+) {
+    let _ = outer_indent; // used conceptually; body lines are already bounded
+    let mut i = start;
+    while i < end {
+        let s = strip_comment(lines[i]);
+        if s.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Skip nested when blocks entirely (their requires are reported via recursion).
+        if match_when_header(&s).is_some() {
+            let nested_indent = leading_spaces(&s);
+            // Skip the body.
+            let mut j = i + 1;
+            j = find_body_end(lines, j, end, nested_indent);
+            // Skip any elif/else at the same nested indent.
+            loop {
+                // Skip blanks.
+                while j < end {
+                    let js = strip_comment(lines[j]);
+                    if !js.trim().is_empty() {
+                        break;
+                    }
+                    j += 1;
+                }
+                if j >= end {
+                    break;
+                }
+                let js = strip_comment(lines[j]);
+                if leading_spaces(&js) != nested_indent {
+                    break;
+                }
+                if match_elif_header(&js).is_some() {
+                    j += 1;
+                    j = find_body_end(lines, j, end, nested_indent);
+                    continue;
+                }
+                if match_else_header(&js).is_some() {
+                    j += 1;
+                    j = find_body_end(lines, j, end, nested_indent);
+                    break;
+                }
+                break;
+            }
+            i = j;
+            continue;
+        }
+
+        if is_requires_line(&s) {
+            let req_start = i;
+            out.push(req_start);
+            // Skip multi-line continuation.
+            let mut tail = s.trim_end().to_string();
+            while tail.ends_with(',') {
+                i += 1;
+                if i >= end {
+                    break;
+                }
+                tail = strip_comment(lines[i]).trim().to_string();
+            }
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+#[cfg(test)]
+mod when_branches_tests {
+    use super::{parse_when_branches, WhenBranch};
+    use crate::Predicate;
+
+    // ----- helpers -----
+
+    fn plat(name: &str) -> Predicate {
+        Predicate { name: "platform".into(), values: vec![name.into()], negated: false }
+    }
+    fn notplat(name: &str) -> Predicate {
+        Predicate { name: "platform".into(), values: vec![name.into()], negated: true }
+    }
+    fn arch(name: &str) -> Predicate {
+        Predicate { name: "arch".into(), values: vec![name.into()], negated: false }
+    }
+    fn nim(c: &str) -> Predicate {
+        Predicate { name: "nim".into(), values: vec![c.into()], negated: false }
+    }
+
+    fn wb(predicates: Option<Vec<Predicate>>, require_lines: Vec<usize>) -> WhenBranch {
+        WhenBranch { predicates, require_lines }
+    }
+
+    fn lines(s: &str) -> Vec<&str> {
+        s.split('\n').collect()
+    }
+
+    // ----- C1: simple when -----
+
+    #[test]
+    fn case_1_single_require() {
+        let input = lines("when defined(linux):\n  requires \"a\"");
+        assert_eq!(
+            parse_when_branches(&input),
+            vec![wb(Some(vec![plat("linux")]), vec![1])]
+        );
+    }
+
+    #[test]
+    fn case_2_multi_require() {
+        let input = lines("when defined(linux):\n  requires \"a\"\n  requires \"b >= 1.0\"");
+        assert_eq!(
+            parse_when_branches(&input),
+            vec![wb(Some(vec![plat("linux")]), vec![1, 2])]
+        );
+    }
+
+    // ----- C2: elif/else negation -----
+
+    #[test]
+    fn case_3_when_elif_else() {
+        let input = lines(
+            "when defined(linux):\n  requires \"a\"\nelif defined(macosx):\n  requires \"b\"\nelse:\n  requires \"c\""
+        );
+        assert_eq!(
+            parse_when_branches(&input),
+            vec![
+                wb(Some(vec![plat("linux")]), vec![1]),
+                wb(Some(vec![plat("macosx"), notplat("linux")]), vec![3]),
+                wb(Some(vec![notplat("linux"), notplat("macosx")]), vec![5]),
+            ]
+        );
+    }
+
+    #[test]
+    fn case_10_else_after_single_when() {
+        let input = lines("when defined(windows):\n  requires \"a\"\nelse:\n  requires \"b\"");
+        assert_eq!(
+            parse_when_branches(&input),
+            vec![
+                wb(Some(vec![plat("windows")]), vec![1]),
+                wb(Some(vec![notplat("windows")]), vec![3]),
+            ]
+        );
+    }
+
+    // ----- C3: single-line colon form -----
+
+    #[test]
+    fn case_4_single_line_colon() {
+        let input = lines("when defined(arm64): requires \"neon\"");
+        assert_eq!(
+            parse_when_branches(&input),
+            vec![wb(Some(vec![arch("arm64")]), vec![0])]
+        );
+    }
+
+    // ----- C4: poison -----
+
+    #[test]
+    fn case_5_unrecognized_condition_poisons_chain() {
+        let input = lines(
+            "when defined(linux) or defined(macosx):\n  requires \"a\"\nelif defined(windows):\n  requires \"b\""
+        );
+        assert_eq!(
+            parse_when_branches(&input),
+            vec![
+                wb(None, vec![1]),
+                wb(None, vec![3]),
+            ]
+        );
+    }
+
+    // ----- C5: nested when -----
+
+    #[test]
+    fn case_6_nested_when() {
+        let input = lines(
+            "when defined(linux):\n  requires \"a\"\n  when defined(arm64):\n    requires \"b\""
+        );
+        assert_eq!(
+            parse_when_branches(&input),
+            vec![
+                wb(Some(vec![plat("linux")]), vec![1]),
+                wb(None, vec![3]),
+            ]
+        );
+    }
+
+    // ----- C6: requires outside when -----
+
+    #[test]
+    fn case_7_requires_outside_when_not_reported() {
+        let input = lines("requires \"a\"\nwhen defined(linux):\n  requires \"b\"");
+        assert_eq!(
+            parse_when_branches(&input),
+            vec![wb(Some(vec![plat("linux")]), vec![2])]
+        );
+    }
+
+    // ----- C7: nim range (multi-pred, no negation) -----
+
+    #[test]
+    fn case_8_two_sided_nim_range() {
+        let input = lines(
+            "when (NimMajor, NimMinor) >= (1, 4) and (NimMajor, NimMinor) < (2, 0):\n  requires \"a\""
+        );
+        assert_eq!(
+            parse_when_branches(&input),
+            vec![wb(Some(vec![nim(">=1.4.0"), nim("<2.0.0")]), vec![1])]
+        );
+    }
+
+    // ----- C8: elif after multi-pred when → poison -----
+
+    #[test]
+    fn case_9_elif_after_multi_pred_when() {
+        let input = lines(
+            "when (NimMajor, NimMinor) >= (1, 4) and (NimMajor, NimMinor) < (2, 0):\n  requires \"a\"\nelif defined(linux):\n  requires \"b\""
+        );
+        assert_eq!(
+            parse_when_branches(&input),
+            vec![
+                wb(None, vec![1]),
+                wb(None, vec![3]),
+            ]
+        );
+    }
+
+    // ----- C9: solo multi-pred when (no elif) — not poisoned -----
+
+    #[test]
+    fn solo_multi_pred_when_not_poisoned() {
+        let input = lines(
+            "when (NimMajor, NimMinor) >= (1, 4) and (NimMajor, NimMinor) < (2, 0):\n  requires \"a\""
+        );
+        assert_eq!(
+            parse_when_branches(&input),
+            vec![wb(Some(vec![nim(">=1.4.0"), nim("<2.0.0")]), vec![1])]
+        );
+    }
+
+    // ----- C10: when with no requires -----
+
+    #[test]
+    fn case_11_when_no_requires_omitted() {
+        let input = lines("when defined(linux):\n  srcDir = \"src\"");
+        assert_eq!(parse_when_branches(&input), vec![]);
+    }
+
+    // ----- C11: comments stripped -----
+
+    #[test]
+    fn case_13_comments_stripped() {
+        let input = lines("when defined(linux):  # only linux\n  requires \"a\"  # dep");
+        assert_eq!(
+            parse_when_branches(&input),
+            vec![wb(Some(vec![plat("linux")]), vec![1])]
+        );
+    }
+
+    // ----- C12: not defined -----
+
+    #[test]
+    fn case_12_not_defined() {
+        let input = lines("when not defined(windows):\n  requires \"a\"");
+        let expected_pred = Predicate { name: "platform".into(), values: vec!["windows".into()], negated: true };
+        assert_eq!(
+            parse_when_branches(&input),
+            vec![wb(Some(vec![expected_pred]), vec![1])]
+        );
+    }
+
+    // ----- total function / edge cases -----
+
+    #[test]
+    fn empty_input() {
+        assert_eq!(parse_when_branches(&[]), vec![]);
+    }
+
+    #[test]
+    fn requires_outside_only_yields_empty() {
+        let input = lines("requires \"a\"\nrequires \"b\"");
+        assert_eq!(parse_when_branches(&input), vec![]);
+    }
+
+    #[test]
+    fn two_independent_when_chains() {
+        let input = lines(
+            "when defined(linux):\n  requires \"a\"\nwhen defined(macosx):\n  requires \"b\""
+        );
+        assert_eq!(
+            parse_when_branches(&input),
+            vec![
+                wb(Some(vec![plat("linux")]), vec![1]),
+                wb(Some(vec![plat("macosx")]), vec![3]),
+            ]
+        );
+    }
+
+    #[test]
+    fn multiline_continuation_start_index_recorded() {
+        let input = lines(
+            "when defined(linux):\n  requires \"a\",\n    \"b\"\n  requires \"c\""
+        );
+        assert_eq!(
+            parse_when_branches(&input),
+            vec![wb(Some(vec![plat("linux")]), vec![1, 3])]
+        );
+    }
+
+    #[test]
+    fn bare_elif_no_matching_when_ignored() {
+        let input = lines("elif defined(linux):\n  requires \"a\"");
+        assert_eq!(parse_when_branches(&input), vec![]);
+    }
+
+    #[test]
+    fn bare_else_no_matching_when_ignored() {
+        let input = lines("else:\n  requires \"a\"");
+        assert_eq!(parse_when_branches(&input), vec![]);
+    }
+
+    #[test]
+    fn nested_outer_unaffected_by_nested_when() {
+        let input = lines(
+            "when defined(linux):\n  requires \"outer\"\n  when defined(arm64):\n    requires \"inner\""
+        );
+        let result = parse_when_branches(&input);
+        let outer = &result[0];
+        let inner = &result[1];
+        assert_eq!(outer.predicates, Some(vec![plat("linux")]));
+        assert!(inner.predicates.is_none());
+    }
+}
