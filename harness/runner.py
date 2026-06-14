@@ -185,10 +185,32 @@ def _cmd_to_cli(cmd: str) -> tuple[list[str], list[str]]:
       update <name>                   → ["update", <name>]
       show                            → ["show"]
       --version                       → []  (global flag; see note below)
+
+    Global flags that may appear inline in the cmd (e.g. `resolve --no-index`)
+    are extracted here and prepended to the returned global_flags, independent
+    of the verb dispatch below.
     """
     tokens = cmd.split()
     if not tokens:
         raise ValueError("empty fixture cmd")
+
+    # Extract recognized inline global flags (cli-contract §2). `--no-index`
+    # (§2.6) can prefix any resolution cmd; it maps straight through.
+    inline_global: list[str] = []
+    rest: list[str] = []
+    for t in tokens:
+        if t == "--no-index":
+            inline_global.append("--no-index")
+        else:
+            rest.append(t)
+    if not rest:
+        raise ValueError(f"fixture cmd has no verb: {cmd!r}")
+    global_flags, verb_argv = _dispatch_cmd(rest, cmd)
+    return inline_global + global_flags, verb_argv
+
+
+def _dispatch_cmd(tokens: list[str], cmd: str) -> tuple[list[str], list[str]]:
+    """Dispatch the verb tokens (inline global flags already stripped)."""
     head = tokens[0]
 
     if head == "resolve":

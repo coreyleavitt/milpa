@@ -309,9 +309,13 @@ impl Target for MilpaTarget {
                     .map_err(|e| format!("E2E-MANIFEST-UNREADABLE: {e}"))?;
                 // Optional tianguis index for named-dep resolution. The parser
                 // surfaces TNG-* trust-boundary errors (schema/unsafe/bad-*).
+                // --no-index (cli-contract §2.6) overrides any present index.kdl,
+                // forcing index=None so a named dep raises RES-NO-INDEX.
                 let index = {
                     let p = fx.dir.join("index.kdl");
-                    if p.is_file() {
+                    if fx.no_index {
+                        None
+                    } else if p.is_file() {
                         let itext = std::fs::read_to_string(&p)
                             .map_err(|e| format!("E2E-INDEX-UNREADABLE: {e}"))?;
                         match milpa_core::Index::parse(&itext) {
@@ -502,7 +506,14 @@ impl Target for MilpaTarget {
                     Ok(d) => d,
                     Err(e) => return Err(e.code().to_string()),
                 };
-                let ltext = std::fs::read_to_string(fx.dir.join("milpa.lock"))
+                // Missing lock → LOCK-FILE-NOT-FOUND, mirroring cmd_verify's
+                // first check (before any _deps/ work). fixture-164 (#125)
+                // exercises the no-lock branch.
+                let lock_path = fx.dir.join("milpa.lock");
+                if !lock_path.is_file() {
+                    return Err("LOCK-FILE-NOT-FOUND".to_string());
+                }
+                let ltext = std::fs::read_to_string(&lock_path)
                     .map_err(|e| format!("E2E-LOCKFILE-UNREADABLE: {e}"))?;
                 let lock = match milpa_core::parse_lockfile(&ltext) {
                     Ok(l) => l,
@@ -818,6 +829,7 @@ mod tests {
             id: "synthetic/probe".into(),
             dir: tmp.path().to_path_buf(),
             cmd: Cmd::Resolve,
+            no_index: false,
             expected: Expected::Success,
         };
         match MilpaTarget.execute(&fx, &scratch) {
@@ -839,6 +851,7 @@ mod tests {
             id: "synthetic/probe".into(),
             dir: tmp.path().to_path_buf(),
             cmd: Cmd::Resolve,
+            no_index: false,
             expected: Expected::Error("MAN-NAME-MISSING".into()),
         };
         assert_eq!(
@@ -867,6 +880,7 @@ mod tests {
             id: "synthetic/probe".into(),
             dir: tmp.path().to_path_buf(),
             cmd: Cmd::Frozen,
+            no_index: false,
             expected: Expected::Success,
         };
         match MilpaTarget.execute(&fx, &scratch) {
@@ -894,6 +908,7 @@ mod tests {
             id: "synthetic/probe".into(),
             dir: tmp.path().to_path_buf(),
             cmd: Cmd::Frozen,
+            no_index: false,
             expected: Expected::Error("FROZEN-STRATEGY-MISMATCH".into()),
         };
         assert_eq!(

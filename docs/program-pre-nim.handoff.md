@@ -5,8 +5,8 @@ once against a tight, frozen contract instead of chasing a churning spec.
 
 Decided 2026-06-14 (this session): do **both** halves below, then Nim.
 
-- **Stage:** Half A → 3/4 done; #120 awaiting Corey's contract decision   •   **Round:** —
-- **Resume:** after #120 decision, implement the chosen option; then Half B (start with #26 when-blocks RFC)
+- **Stage:** Half A COMPLETE (4/4) — coverage 46/46, zero divergence   •   **Round:** —
+- **Resume:** decide `--no-index` flag (optional UX, NOT a coverage blocker — see below); then Half B (start with #26 when-blocks RFC)
 
 ## Why this ordering
 Spec + 161-fixture corpus + harness (python+rust, zero divergence) is the contract
@@ -22,10 +22,20 @@ Hygiene backed by `rfc-differential-conformance-harness.md` + `spec/conformance-
 - [x] **#128** — closed: `spec/errors.md` already spec-owned; no generator path remains.
 - [x] **#130** — fixed (a354c41): `_canonical_certificate()` is the single source for both fixture comparison + divergence token.
 - [x] **#125** — fixed (19e39ca): fixture-164 (verify-no-lock); registered 064/130 for dev-deps-root-only; RES-NO-INDEX clauses now documented gaps (44/46 honest).
-- [ ] **#120** — AWAITING CONTRACT DECISION. The two RES-NO-INDEX clauses are the last black-box gaps. Options:
-      1. `MILPA_INDEX_URL=none` sentinel — magic string, overloads empty semantics. Rejected (hack).
-      2. **`--no-index` flag (recommended)** — explicit CLI surface; matches pip/uv `--no-index`, cargo `--offline`; makes 112/113 real corpus fixtures; delivers a real offline/air-gapped resolution feature. BUT: cross-impl change (cli-contract.md + python + rust + fixtures) — bigger than hygiene, touches spec surface.
-      3. Accept in-process-only; mark 112/113 `observable=False`. Cheapest; accepts a permanent harness blind spot for two normative codes.
+- [x] **#120** — RESOLVED (20f7b1c) with ZERO new production code. The "no CLI
+      surface for no-index" premise was STALE: empty `MILPA_INDEX_URL` already
+      means "explicitly no index" (cli-contract §8.1 NORMATIVE), honored by both
+      impls' CLI path, and the runner already sets it for no-index.kdl fixtures.
+      Un-quarantined 112/113 → pass both impls, zero divergence → coverage 46/46.
+      Corey's earlier "build `--no-index`" choice was made on my wrong framing;
+      corrected. The flag is now an OPTIONAL UX enhancement (empty-env works but
+      isn't discoverable), NOT a coverage blocker. Decision pending.
+
+### `--no-index` flag — optional follow-up (re-posed honestly)
+The discoverable flag would alias the existing empty-`MILPA_INDEX_URL` behavior.
+Pro: pip/uv `--no-index` parity, discoverable offline mode. Con: cross-impl
+spec+code surface for a capability that already exists. Options: build now as a
+small feature / file as its own issue for Half B / skip (env-var is enough).
 
 ## Half B — Tier 2/3 spec features (enter flow at Stage 1, RFC each)
 Each is genuine design → RFC + slicing + two architect rounds before /tdd.

@@ -130,7 +130,20 @@ class Fixture:
         self.id = fixture_id          # e.g. "spec-v1/fixture-003-single-url-dep"
         self.dir = fixture_dir        # absolute path to the fixture directory
         self.cmd: str = self._read_cmd()
+        self.no_index: bool = self._read_no_index()
         self.expected_error: str | None = self._read_expected_error()
+
+    def _read_no_index(self) -> bool:
+        """Whether the fixture cmd carries the ``--no-index`` global flag.
+
+        The in-process adapter must honor it exactly as the CLI does
+        (cli-contract §2.6): suppress the index so a named dep raises
+        RES-NO-INDEX even when index.kdl is present.
+        """
+        cmd_file = self.dir / "cmd"
+        if not cmd_file.exists():
+            return False
+        return "--no-index" in cmd_file.read_text(encoding="utf-8").split()
 
     def _read_cmd(self) -> str:
         cmd_file = self.dir / "cmd"
@@ -248,7 +261,7 @@ def _fixture_require_attested_metadata(fixture_dir: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _build_env(fixture_dir: Path, tmp_dir: Path) -> MilpaEnv:
+def _build_env(fixture_dir: Path, tmp_dir: Path, no_index: bool = False) -> MilpaEnv:
     """Build a ``MilpaEnv`` for the fixture's in-process run.
 
     Uses ``mocked_registry(mocked_dir)`` wrapped in ``CasAdmittingFetcher``,
@@ -257,6 +270,10 @@ def _build_env(fixture_dir: Path, tmp_dir: Path) -> MilpaEnv:
     The ``index`` field is loaded from ``fixture_dir/index.kdl`` when present
     (required for named-dep fixtures, slice 9b-3a+).  ``None`` when absent
     (URL-only and error fixtures do not need an index).
+
+    ``no_index`` mirrors the CLI ``--no-index`` flag (cli-contract §2.6): when
+    set, the index and dep_decl_store are suppressed (``None``) even if
+    ``index.kdl`` is present — the flag overrides a configured index.
     """
     from milpa.registry import parse_index
 
@@ -270,7 +287,7 @@ def _build_env(fixture_dir: Path, tmp_dir: Path) -> MilpaEnv:
 
     index_path = fixture_dir / "index.kdl"
     index = None
-    if index_path.exists():
+    if not no_index and index_path.exists():
         # Let MilpaError propagate — TNG-* parse errors from index.kdl must
         # surface as the fixture's expected error (not be swallowed).
         # Non-MilpaError exceptions (e.g. KDL syntax error not yet typed)
@@ -291,13 +308,17 @@ def _build_env(fixture_dir: Path, tmp_dir: Path) -> MilpaEnv:
     from milpa.dep_decl_store import FileDepDeclStore
 
     dep_decl_dir = fixture_dir / "dep-decl"
-    dep_decl_store = FileDepDeclStore(dep_decl_dir) if dep_decl_dir.is_dir() else None
+    dep_decl_store = (
+        None if no_index
+        else FileDepDeclStore(dep_decl_dir) if dep_decl_dir.is_dir() else None
+    )
 
     return MilpaEnv(
         fetcher=fetcher,
         index=index,
         store=store,
         dep_decl_store=dep_decl_store,
+        no_index=no_index,
     )
 
 
@@ -408,7 +429,7 @@ def _execute_fixture(
     deps_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        env = _build_env(fixture_dir, tmp_dir)
+        env = _build_env(fixture_dir, tmp_dir, no_index=fixture.no_index)
     except MilpaError as e:
         # TNG-* parse errors from index.kdl surface here (before any resolve).
         if fixture.expected_error is not None and e.slug == fixture.expected_error:

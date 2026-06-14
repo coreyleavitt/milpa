@@ -273,6 +273,26 @@ a solve result. All other verbs silently ignore it.
 > NOT count as the `milpa-error:` line. R2 still requires exactly one
 > `milpa-error:` line on stderr.
 
+### 2.6  `--no-index`
+
+> NORMATIVE: `--no-index` resolves with **no tianguis index** (offline /
+> air-gapped). URL and local deps resolve normally; any named dep that would
+> require the index MUST raise `RES-NO-INDEX` (a named dep in a workspace
+> member raises `RES-WS-NO-INDEX`). It is the explicit, discoverable spelling
+> of an empty `MILPA_INDEX_URL` (§8.1, the "present but empty" state) and MUST
+> behave identically to it.
+
+> NORMATIVE: `--no-index` **overrides any configured index** — it takes
+> precedence over a non-empty `MILPA_INDEX_URL` and over the default index URL.
+> The flag can only ADD the no-index condition; a configured index MUST NOT
+> silently re-enable index resolution when `--no-index` is given. Equivalently,
+> the effective "no index" condition is `--no-index` **OR** empty
+> `MILPA_INDEX_URL`.
+
+> NOTE: `--no-index` is parsed as a global flag and applies to any verb that
+> performs resolution (`fetch`, `lock`, `add`, `remove`, `update`, `verify`).
+> Verbs that never consult the index are unaffected.
+
 ---
 
 ## 3  Exit-code taxonomy

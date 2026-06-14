@@ -355,6 +355,15 @@ CLAUSE_INVENTORY: list[SpecClause] = [
         covering_fixtures=("fixture-113-res-ws-no-index",),
         covering_tiers=(),
     ),
+    SpecClause(
+        id="cli.no-index-flag",
+        spec_ref="cli-contract.md §2.6",
+        description="--no-index resolves with no index, OVERRIDING a configured index → named dep raises RES-NO-INDEX",
+        # fixture-165 ships a PRESENT index.kdl (harness sets a file:// URL),
+        # yet --no-index still forces RES-NO-INDEX — proving flag precedence.
+        covering_fixtures=("fixture-165-no-index-flag",),
+        covering_tiers=(),
+    ),
 
     # -----------------------------------------------------------------------
     # lockfile-schema.md

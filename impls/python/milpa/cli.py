@@ -146,6 +146,17 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--no-index",
+        action="store_true",
+        default=False,
+        help=(
+            "resolve with no tianguis index (offline / air-gapped): URL and "
+            "local deps resolve normally; any named dep raises RES-NO-INDEX. "
+            "Explicit form of an empty MILPA_INDEX_URL; OVERRIDES a configured "
+            "index (env or default)."
+        ),
+    )
+    parser.add_argument(
         "--require-attested-metadata",
         action="store_true",
         default=False,
@@ -223,7 +234,21 @@ def _make_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
-def _build_env() -> MilpaEnv:
+def _no_index_requested(no_index_flag: bool) -> bool:
+    """Single source of truth for "the user wants no index".
+
+    True iff ``--no-index`` was passed OR ``MILPA_INDEX_URL`` is present-but-empty
+    (cli-contract §8.1 three-way semantics). The flag takes precedence over any
+    env value — it can only ADD the no-index request, never a configured index
+    silently re-enabling it.
+    """
+    if no_index_flag:
+        return True
+    raw = os.environ.get("MILPA_INDEX_URL")  # None if absent, str if set
+    return raw is not None and raw.strip() == ""
+
+
+def _build_env(no_index: bool = False) -> MilpaEnv:
     """Build the MilpaEnv seam from the process environment.
 
     - MILPA_MOCKED_FETCHES set → mocked transport (conformance mode).
@@ -235,6 +260,7 @@ def _build_env() -> MilpaEnv:
         else → HttpDepDeclStore derived from MILPA_INDEX_URL (production).
         ``None`` when MILPA_INDEX_URL is also absent (e.g. pure URL-dep project
         with no index) — the DepDecl branch is unreachable in that case anyway.
+    - no_index (``--no-index``) → suppress index + dep_decl_store entirely.
     """
     store: CAStore = default_store()
 
@@ -243,21 +269,23 @@ def _build_env() -> MilpaEnv:
 
     fetcher = CasAdmittingFetcher(inner, store)
 
-    # S3b: build dep_decl_store from environment.
-    dep_decl_store: object | None = _build_dep_decl_store()
+    # S3b: build dep_decl_store from environment — suppressed under no-index.
+    dep_decl_store: object | None = _build_dep_decl_store(no_index=no_index)
 
     return MilpaEnv(
         fetcher=fetcher,
         index=None,  # loaded eagerly per-verb
         store=store,
         dep_decl_store=dep_decl_store,
+        no_index=no_index,
     )
 
 
-def _build_dep_decl_store() -> object | None:
+def _build_dep_decl_store(no_index: bool = False) -> object | None:
     """Build the dep_decl_store from environment variables (S3b).
 
     Priority:
+      0. ``--no-index`` → ``None`` (no index ⇒ DepDecl path unreachable).
       1. ``MILPA_DEP_DECL_DIR`` → ``FileDepDeclStore`` (conformance / air-gapped).
       2. ``MILPA_INDEX_URL`` **absent** → ``HttpDepDeclStore`` from ``DEFAULT_INDEX_URL``.
       3. ``MILPA_INDEX_URL`` **present and non-empty** → ``HttpDepDeclStore`` from that URL.
@@ -265,19 +293,21 @@ def _build_dep_decl_store() -> object | None:
          DepDecl branch unreachable).
 
     Three-way env semantics match ``_load_index_for_verb``:
-    absent → default, empty → no-index, non-empty → that URL.
+    absent → default, empty → no-index, non-empty → that URL. The ``--no-index``
+    flag forces case 4 regardless of env.
     """
     from milpa.dep_decl_store import FileDepDeclStore, make_dep_decl_store
     from milpa.index_cache import DEFAULT_INDEX_URL
+
+    if _no_index_requested(no_index):
+        # Explicitly no index → DepDecl branch unreachable.
+        return None
 
     dep_decl_dir = os.environ.get("MILPA_DEP_DECL_DIR", "").strip()
     if dep_decl_dir:
         return FileDepDeclStore(Path(dep_decl_dir))
 
     raw = os.environ.get("MILPA_INDEX_URL")  # None if absent, str if set
-    if raw is not None and raw.strip() == "":
-        # Explicitly no index → DepDecl branch unreachable.
-        return None
 
     # Absent → DEFAULT_INDEX_URL; non-empty → that URL.
     index_url = raw.strip() if raw is not None else DEFAULT_INDEX_URL
@@ -312,11 +342,9 @@ def _load_index_for_verb(env: MilpaEnv) -> MilpaEnv:
 
     from milpa.errors import MILPA_INDEX_UNREACHABLE
 
-    # Three-way semantics: distinguish absent (→ default URL) from
-    # present-but-empty (→ explicitly no index).
-    raw = os.environ.get("MILPA_INDEX_URL")  # None if absent, str if set
-    if raw is not None and raw.strip() == "":
-        # Explicitly no index (e.g. harness air-gapped fixture).
+    # --no-index flag OR present-but-empty MILPA_INDEX_URL → explicitly no
+    # index (the flag overrides any configured index). Absent → default URL.
+    if _no_index_requested(env.no_index):
         return replace(env, index=None)
 
     # Absent → DEFAULT_INDEX_URL; non-empty → that URL.
@@ -1587,7 +1615,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Build the MilpaEnv seam ONCE per process.
     try:
-        env = _build_env()
+        env = _build_env(no_index=args.no_index)
     except Exception as exc:
         print(f"milpa: failed to initialise environment: {exc}", file=sys.stderr)
         _emit_slug(MILPA_INTERNAL)

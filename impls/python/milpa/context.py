@@ -79,6 +79,12 @@ class MilpaEnv:
     store: CAStore
     dep_decl_store: object | None = None  # DepDeclStore protocol (S3b)
 
+    #: True when the user explicitly requested no index (``--no-index`` flag).
+    #: An explicit alias of empty ``MILPA_INDEX_URL`` that OVERRIDES any
+    #: configured index (env or default). Read by ``_load_index_for_verb`` and
+    #: ``_build_dep_decl_store`` to suppress index loading. (cli-contract §8.1)
+    no_index: bool = False
+
 
 @dataclass(frozen=True)
 class ResolveParams:

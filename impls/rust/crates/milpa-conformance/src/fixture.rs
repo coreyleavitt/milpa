@@ -74,6 +74,10 @@ pub struct Fixture {
     /// The fixture directory (inputs + `expected/`).
     pub dir: PathBuf,
     pub cmd: Cmd,
+    /// `--no-index` global flag present in the `cmd` (cli-contract §2.6): the
+    /// in-process `Target` must resolve with NO index, overriding any
+    /// `index.kdl`, so a named dep raises `RES-NO-INDEX`.
+    pub no_index: bool,
     pub expected: Expected,
 }
 
@@ -86,10 +90,14 @@ impl Fixture {
             Ok(slug) => Expected::Error(slug.trim().to_string()),
             Err(_) => Expected::Success,
         };
+        let no_index = std::fs::read_to_string(dir.join("cmd"))
+            .map(|t| t.split_whitespace().any(|w| w == "--no-index"))
+            .unwrap_or(false);
         Fixture {
             id: id.into(),
             dir: dir.to_path_buf(),
             cmd: Cmd::from_dir(dir),
+            no_index,
             expected,
         }
     }
