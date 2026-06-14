@@ -1,7 +1,25 @@
 # rfc-conditional-requires (#26) — handoff
 
-- **Stage:** 1 (RFC drafted + sliced) → next is **Stage 2 architect round 1**   •   **Round:** —
-- **Resume:** `/architect docs/rfc-conditional-requires.md round 1`
+- **Stage:** 2 (architect) — **round 1 applied**; BLOCKED on R1 fork → Corey   •   **Round:** 1 done
+- **Resume (after R1 decided):** apply R1 resolution to §3.4/§5/§6/§9, then `/architect docs/rfc-conditional-requires.md round 2`
+
+## ⚠ BLOCKING FORK — R1 (§8 of the RFC)
+Host-filtering transitive edges makes `milpa.lock` platform-specific → breaks the
+reproducible-build lockfile + `--frozen` cross-host + collides with **#110** (universal
+resolution). Options: (a) host-specific lockfiles now; (b) universal lockfile +
+build-time activation (uv model, = #110 scope); (c) reduce #26 to recognize+attach+
+annotate, defer activation to #110. **Recommend (c).** Awaiting Corey.
+
+## Round 1 — applied fixes (fork-independent)
+- §3.1 table: +`win`, +three-tuple/operator/two-sided `nim` forms; **dropped `posix`**
+  (under-include risk); renamed fn `parse_when_condition`, `None`=UNRECOGNIZED + never-empty postcondition.
+- §3.2: real state machine (not regex), single-line-colon form, multiple-requires/branch,
+  chain-poisoning, `parse_when_branches` standalone.
+- §3.3: predicates on `RequireEntry` via `_nimble_edges` bridge (NOT shared NamedDep/UrlDep); eliminate double-parse.
+- §3.4: `predicates.py` SSOT, filter in `edgeset_to_terms(profile=)`, `Profile=None` guard, `active_flags=frozenset()`.
+- §6: do NOT mutate fixture-138 (retained-unchanged rule) — new fixtures 139+; added URL/dev-deps/workspace/overrides/multi-require scenarios; coverage clauses atomic.
+- §9: split S3→S3a (state machine, updates TestWhenBlockPolicy IN-slice) + S3b (wiring); S4+ gated on R1; no spec-version bump.
+- Resolved forks: F1/F6 (table closed), F4 (unrecognized), F5 (one matcher). Open: F2, F3(#134), F7(diagnostic).
 
 ## Core design (one-line)
 Route `.nimble` `when` blocks into milpa's EXISTING `Predicate`/`Profile` matcher —
