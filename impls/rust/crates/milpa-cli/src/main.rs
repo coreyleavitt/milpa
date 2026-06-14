@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use milpa_core::{
     add_mirror, dep_decl_store::DepDeclStore, discover_manifest, effective_strict_policy,
-    fetch::FetcherRegistry, format_nimcfg, format_workspace_nimcfgs, from_graph,
+    fetch::{FetchError, FetcherRegistry}, format_nimcfg, format_workspace_nimcfgs, from_graph,
     load_index, load_lockfile, load_manifest, load_workspace,
     make_dep_decl_store, mutate_manifest_file, parse_env_bool, parse_lockfile, parse_version,
     resolve, resolve_with_cert, resolve_workspace, resolve_workspace_frozen,
@@ -369,7 +369,7 @@ fn success_cert_to_json(cert: &SuccessCert) -> String {
 
 /// Build the §2.5.2 JSON string for a failure certificate.
 fn failure_cert_to_json(cert: &FailureCert) -> String {
-    // message: null when empty (python-ng convention; not byte-normative).
+    // message: null when empty (Python impl convention; not byte-normative).
     let message_val = if cert.message.is_empty() {
         "null".to_string()
     } else {
@@ -788,17 +788,16 @@ fn cmd_add(dir: &Path, rest: &[String]) -> Result<i32, MilpaError> {
     // Ref discovery (cli-contract §5.6): if --ref is omitted, discover the
     // default branch. Under MILPA_MOCKED_FETCHES this is answered from the mock
     // tree (no network, conformance-fixtures §2.3.3); otherwise via
-    // `git ls-remote --symref HEAD`. Discovery failure → exit 1 (no slug).
+    // `git ls-remote --symref HEAD`. Discovery failure → FETCH-REF-DISCOVERY-FAILED.
     let git_ref = match flag_value(rest, "--ref") {
         Some(r) => r,
         None => match discover_default_branch(&url) {
             Ok(r) => r,
             Err(msg) => {
-                eprintln!(
-                    "add: could not discover default branch for {url}: {msg}; \
-                     pass --ref explicitly"
-                );
-                return Ok(1);
+                return Err(MilpaError::Fetch(FetchError::Transport(
+                    "FETCH-REF-DISCOVERY-FAILED",
+                    format!("could not discover default branch for {url}: {msg}; pass --ref explicitly"),
+                )));
             }
         },
     };
@@ -849,8 +848,8 @@ fn cmd_add(dir: &Path, rest: &[String]) -> Result<i32, MilpaError> {
 /// Discover a remote's default branch. Under `MILPA_MOCKED_FETCHES` this is the
 /// mocked ref-resolution path (conformance-fixtures §2.3.3) — no network.
 /// Otherwise it runs `git ls-remote --symref HEAD`. Returns the branch name or
-/// a human-readable error string (the caller maps it to exit 1, cli-contract
-/// §5.6 — a discovery failure carries no catalog slug).
+/// a human-readable error string (the caller maps it to FETCH-REF-DISCOVERY-FAILED,
+/// cli-contract §5.6).
 fn discover_default_branch(url: &str) -> Result<String, String> {
     if let Some(mocked) = mocked_fetches_dir() {
         return match milpa_core::mocked_default_branch(&mocked, url) {

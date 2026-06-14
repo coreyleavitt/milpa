@@ -7,7 +7,7 @@
 //! SECURITY: `TNG-DEPDECL-HASH-MISMATCH` is raised in exactly ONE place
 //! (`verify()`) — inside `get()`. This invariant MUST NOT be moved to callers.
 //!
-//! Mirrors `milpa/dep_decl_store.py` in `impls/python-ng`.
+//! Mirrors `milpa/dep_decl_store.py` in `impls/python`.
 
 use std::path::{Path, PathBuf};
 

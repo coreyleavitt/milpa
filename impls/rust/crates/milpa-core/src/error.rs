@@ -187,6 +187,11 @@ impl CoreError {
             // the outermost catch-all; INTERNAL-PANIC fires from the panic hook.
             "MILPA-INTERNAL",
             "INTERNAL-PANIC",
+            // index unreachable (registry-protocol §6 / §4 swallow-exemption):
+            // network failure with no cached fallback. Emitted by load_index /
+            // index_cache; swallowed by maybe_index (→ treat index as absent).
+            // Catalog entry satisfies the bijection invariant; no terminal fixture.
+            "MILPA-INDEX-UNREACHABLE",
         ]
     }
 }

@@ -5,7 +5,8 @@ Normative spec of every error milpa can produce. Each entry's
 scripts, IDE integrations, alternate implementations) MAY rely
 on slugs but MUST NOT rely on message wording.
 
-Generated from `milpa/error_catalog.py` — do not edit by hand.
+Spec-owned — do not generate from any implementation. Implementations
+bijection-check their catalogs against this file.
 
 ---
 
@@ -139,6 +140,12 @@ A fetcher returned a receipt whose transport_fields() is empty — no provenance
 
 **Triggered:** FetcherRegistry.fetch calls receipt.transport_fields() after a successful fetch and the returned dict is empty, violating the spec §3.2 non-empty-receipt contract.
 
+### `FETCH-REF-DISCOVERY-FAILED`
+
+`milpa add <name> git=<url>` (no `ref=`) failed to auto-discover the remote's default branch.
+
+**Triggered:** `cmd_add` omits `--ref` and the ref auto-discovery path (via `git ls-remote --symref HEAD` on a live transport, or the mocked-fetches fixture tree on a mocked transport) returns no branch name — either the remote is unreachable, the URL is invalid, or the mocked fixture directory has no entry for this URL.  The command exits 1 without modifying `milpa.kdl` or `milpa.lock`.
+
 ### `FETCH-SHA256-MISMATCH`
 
 Downloaded archive sha256 does not match the declared expected_sha256.
@@ -264,6 +271,12 @@ Digest component has the wrong number of hex characters.
 A Rust implementation's top-level panic handler fired — an internal failure that reached the panic boundary.
 
 **Triggered:** A Rust impl installs a top-level panic handler that emits this slug to stderr before exiting 1.  An unhandled `panic!()` that exits 101 is a crash verdict under Gap-1 R4, not this coded error.
+
+### `MILPA-INDEX-UNREACHABLE`
+
+The tianguis index URL is unreachable (network failure) and no cached copy is available to fall back to.
+
+**Triggered:** The index-loading layer (`load_index` / `load_cached_index`) exhausts all fetch attempts, finds no usable cached file on disk, and raises this code.  At the CLI boundary this is a §4 swallow-exemption: `maybe_index` catches the error and treats the index as absent rather than emitting a terminal slug, so the resolver will surface `RES-NO-INDEX` only if a named dep actually requires the index.  No conformance fixture exercises the terminal form; the entry exists to satisfy the bijection invariant and to name the internal condition precisely.
 
 ### `MILPA-INTERNAL`
 

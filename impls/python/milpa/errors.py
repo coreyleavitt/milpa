@@ -5,14 +5,13 @@ The constant name IS the slug with hyphens replaced by underscores (SCREAMING_SN
 so a typo at a raise site produces a load-time NameError rather than a runtime
 bijection miss.
 
-This module becomes the SSOT generator for ``spec/errors.md`` at swap (S11c),
-replacing the frozen impl's ``error_catalog.py``.  Until then, two codes are
-marked PENDING_SPEC_INCLUSION — they exist in this module but not yet in errors.md;
-at swap they enter errors.md simultaneously with the Rust DEFERRED→implemented
-companion and the raise sites.
+``spec/errors.md`` is the spec-owned SSOT for the error catalog.  This module
+bijection-checks against it: every slug constant here must appear in errors.md,
+and every slug in errors.md must appear here.  The check is enforced by
+``tests/test_errors.py``.
 
 Bijection invariant (enforced by tests/test_errors.py):
-    ALL_SLUGS == (spec/errors.md slugs) ∪ PENDING_SPEC_INCLUSION
+    ALL_SLUGS == (spec/errors.md slugs)
 """
 
 from __future__ import annotations
@@ -54,8 +53,6 @@ FETCH_OCI_PULL_FAILED = "FETCH-OCI-PULL-FAILED"
 FETCH_RECEIPT_EMPTY = "FETCH-RECEIPT-EMPTY"
 FETCH_SHA256_MISMATCH = "FETCH-SHA256-MISMATCH"
 
-# Pending spec inclusion (enters errors.md at swap S11c alongside Rust companion + raise sites).
-# Raised at S10e's ``milpa add --git`` non-mocked path when ref auto-discovery fails.
 FETCH_REF_DISCOVERY_FAILED = "FETCH-REF-DISCOVERY-FAILED"
 
 # ---------------------------------------------------------------------------
@@ -197,9 +194,6 @@ MAN_WORKSPACE_UNKNOWN_TOP_LEVEL = "MAN-WORKSPACE-UNKNOWN-TOP-LEVEL"
 # MILPA — top-level / index-cache
 # ---------------------------------------------------------------------------
 
-# Pending spec inclusion (enters errors.md at swap S11c alongside Rust catalog entry move).
-# Raised at S8b for the network-failure-with-no-cache state per registry-protocol.md §6.
-# (Rust already emits this sentinel but keeps it outside its catalog list.)
 MILPA_INDEX_UNREACHABLE = "MILPA-INDEX-UNREACHABLE"
 
 # ---------------------------------------------------------------------------
@@ -280,13 +274,8 @@ WS_NOT_A_WORKSPACE = "WS-NOT-A-WORKSPACE"
 # ---------------------------------------------------------------------------
 
 #: Slugs defined in this module but not yet in spec/errors.md.
-#: At swap (S11c) these enter errors.md and this set is emptied.
-PENDING_SPEC_INCLUSION: frozenset[str] = frozenset(
-    {
-        FETCH_REF_DISCOVERY_FAILED,
-        MILPA_INDEX_UNREACHABLE,
-    }
-)
+#: Empty post-swap (S11c): all codes are now in spec/errors.md.
+PENDING_SPEC_INCLUSION: frozenset[str] = frozenset()
 
 #: Complete set of all slug string values declared in this module.
 #: Built by introspecting module globals so it stays in sync automatically.

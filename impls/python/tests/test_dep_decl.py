@@ -29,7 +29,7 @@ from milpa.dep_decl import (
 # ---------------------------------------------------------------------------
 
 _THIS_FILE = Path(__file__).resolve()
-_REPO_ROOT = _THIS_FILE.parents[3]  # impls/python-ng/tests → repo root
+_REPO_ROOT = _THIS_FILE.parents[3]  # impls/python/tests → repo root
 _GOLDEN_DIR = _REPO_ROOT / "conformance" / "spec-v1" / "dep-decl-golden" / "v0"
 _EXAMPLE_KDL = _GOLDEN_DIR / "example.kdl"
 _META_JSON = _GOLDEN_DIR / "meta.json"

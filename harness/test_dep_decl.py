@@ -27,7 +27,7 @@ S4-ii — Differential gate (imperative cross-fixture lockfile equality):
 
   DG1: clean pair (fixture-135 vs fixture-136) — the DepDecl-attested arm and
        the .nimble-fallback arm of a package with a clean .nimble resolve to
-       BYTE-IDENTICAL lockfiles under both impls (Rust required; python-ng
+       BYTE-IDENTICAL lockfiles under both impls (Rust required; Python
        included). Proves DepDecl translation is faithful for clean inputs.
 
   DG2: when-block pair (fixture-137 vs fixture-138) — the DepDecl-attested arm
@@ -390,10 +390,8 @@ class TestDifferentialGate(unittest.TestCase):
     expected/); the fallback arm unconditionally includes the when-block dep.
     Divergence proves DepDecl authority over the .nimble heuristic.
 
-    Impls covered: Rust (reference, required) and python-ng (active rewrite,
-    included).  Frozen Python is excluded from fixture-137 (known-failing:
-    it falls back to .nimble and fails with TNG-NOT-FOUND because the
-    attested arm's index has no 'extra' entry).
+    Impls covered: Rust (reference, required) and Python (active impl,
+    included).
     """
 
     # -----------------------------------------------------------------------
@@ -454,9 +452,9 @@ class TestDifferentialGate(unittest.TestCase):
         """DG1 (Rust): DepDecl-attested and .nimble-fallback arms → identical lockfile."""
         self._assert_clean_pair_identical("rust")
 
-    def test_dg1_clean_pair_python_ng(self) -> None:
-        """DG1 (python-ng): DepDecl-attested and .nimble-fallback arms → identical lockfile."""
-        self._assert_clean_pair_identical("python-ng")
+    def test_dg1_clean_pair_python(self) -> None:
+        """DG1 (python): DepDecl-attested and .nimble-fallback arms → identical lockfile."""
+        self._assert_clean_pair_identical("python")
 
     # -----------------------------------------------------------------------
     # DG2: when-block pair — DepDecl arm is authoritative; divergence allowed
@@ -505,7 +503,7 @@ class TestDifferentialGate(unittest.TestCase):
         for when-block packages.
 
         NOTE: frozen Python is excluded from this test (known-failing on fixture-137).
-        Only Rust and python-ng are tested here.
+        Only Rust and Python are tested here.
         """
         lock_137 = _resolve_lockfile(_F137, impl_name)
         lock_138 = _resolve_lockfile(_F138, impl_name)
@@ -557,14 +555,14 @@ class TestDifferentialGate(unittest.TestCase):
         """DG2a (Rust): DepDecl-attested arm lockfile matches expected/ (bar only, no extra)."""
         self._assert_when_attested_correctness("rust")
 
-    def test_dg2a_when_attested_correctness_python_ng(self) -> None:
-        """DG2a (python-ng): DepDecl-attested arm lockfile matches expected/ (bar only, no extra)."""
-        self._assert_when_attested_correctness("python-ng")
+    def test_dg2a_when_attested_correctness_python(self) -> None:
+        """DG2a (python): DepDecl-attested arm lockfile matches expected/ (bar only, no extra)."""
+        self._assert_when_attested_correctness("python")
 
     def test_dg2b_when_pair_diverges_rust(self) -> None:
         """DG2b (Rust): when-block pair lockfiles differ; extra absent from attested, present in fallback."""
         self._assert_when_pair_diverges("rust")
 
-    def test_dg2b_when_pair_diverges_python_ng(self) -> None:
-        """DG2b (python-ng): when-block pair lockfiles differ; extra absent from attested, present in fallback."""
-        self._assert_when_pair_diverges("python-ng")
+    def test_dg2b_when_pair_diverges_python(self) -> None:
+        """DG2b (python): when-block pair lockfiles differ; extra absent from attested, present in fallback."""
+        self._assert_when_pair_diverges("python")

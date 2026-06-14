@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "milpa-fetcher-stub"
 version = "0.1.0"
-description = "Stub fetcher plugin for milpa S11 discovery tests."
+description = "Stub fetcher plugin for milpa S7a entry-point discovery tests."
 requires-python = ">=3.11"
 dependencies = []
 

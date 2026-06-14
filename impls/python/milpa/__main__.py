@@ -1,8 +1,8 @@
-"""`python -m milpa` entry."""
+"""Entry point — delegates to milpa.cli.main()."""
 
 import sys
 
-from .cli import main
+from milpa.cli import main
 
 if __name__ == "__main__":
     sys.exit(main())

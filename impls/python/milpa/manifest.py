@@ -1,103 +1,303 @@
-"""milpa.kdl parser, formatter, and discovery.
+"""milpa.kdl manifest data model and parser.
 
-Public surface, by intended use:
-  - parse_manifest(text) / format_manifest(m) — pure text↔value pair
-  - load_or_discover_manifest(project_dir) — entry point for the CLI;
-    prefers milpa.kdl, falls back to <name>.nimble auto-promotion
-  - load_manifest(path) — explicit-path loader (used internally by
-    discover; exposed for tools that know exactly which file to read)
-  - Value types: Manifest, UrlDep, NamedDep, Dep, ManifestError
-  - manifest_from_nimble(nm) — convert a parsed NimbleManifest to a
-    milpa Manifest (used by load_or_discover_manifest on the
-    .nimble fallback path)
+NO FILESYSTEM I/O.  This module is pure text↔value.  All file-loading
+(``load_or_discover_manifest``, ``.nimble`` fallback discovery) lives in
+``workspace.py`` / a loader helper.
 
-kdl-py is an internal detail; callers see only the typed values.
+Entry points:
+  ``parse_manifest(text) -> Manifest``
+      Parse a KDL 2.0 string into a typed ``Manifest``.
+  ``parse_workspace_or_manifest(text) -> Manifest | WorkspaceManifest``
+      Auto-detect role and dispatch to the appropriate parser.
+  ``format_manifest(manifest) -> str``
+      Serialize a ``Manifest`` to a KDL 2.0 string (fresh AST, not a round-trip).
+      URL fields are emitted with ``(url)`` annotation (§2).
+      ``spec-version`` is present/absent per §4.4.
+      If the manifest had comments (``manifest.had_comments``), a warning is
+      emitted to stderr (§8).
+
+Data model (slices 3a–3c-4):
+  ``Predicate``    — one conditional clause (inline or child-node form)
+  ``FlagRequest``  — consumer flag request on a UrlDep child
+  ``UrlDep``       — git + ref (+ optional mirrors / predicates / flags)
+  ``NamedDep``     — registry-resolved dep; constraint pre-typed at parse
+  ``LocalDep``     — local filesystem path dep
+  ``TarballDep``   — tarball URL dep with optional sha256 / strip_components
+  ``MemberDep``    — workspace-internal member reference
+  ``Override``     — pkg-form override (name → git + ref)
+  ``FlagDecl``     — named feature flag declared by a package
+  ``Manifest``     — top-level package manifest
+  ``WorkspaceManifest`` — workspace container
+
+Later slices (3c-5..3d, 3e) slot in via the dispatch seam in
+``_parse_dep_block`` / ``_parse_manifest_doc`` without touching this
+skeleton.
+
+Boundary criteria (RFC §4.2):
+  - Imports ``kdl_io`` (the only kdl-py importer) via its typed façade.
+  - Imports ``version.py`` for ``VersionSet.from_constraint``.
+  - Imports ``errors.py`` for slug constants + ``MilpaError``.
+  - NO ``kdl.*`` types cross the module boundary.
 """
 
+from __future__ import annotations
+
+import sys
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Literal
-from urllib.parse import ParseResult, urlparse
+from urllib.parse import urlparse
 
-import kdl
+from milpa.errors import (
+    MAN_CAS_DIR_MISSING,
+    MAN_CAS_DIR_TYPE,
+    MAN_DEP_DUPLICATE,
+    MAN_DEP_FLAG_BOOL,
+    MAN_DEP_FLAG_NAME_MISSING,
+    MAN_DEP_FLAG_TOO_MANY_ARGS,
+    MAN_DEP_LOCAL_PATH,
+    MAN_DEP_MEMBER_ARITY,
+    MAN_DEP_MEMBER_PROPS,
+    MAN_DEP_MIRROR_ARITY,
+    MAN_DEP_NAMED_ARITY,
+    MAN_DEP_NAMED_CONSTRAINT,
+    MAN_DEP_NAMED_PROPS,
+    MAN_DEP_REF_MISSING,
+    MAN_DEP_TARBALL_SHA,
+    MAN_DEP_TARBALL_STRIP,
+    MAN_DEP_TARBALL_URL,
+    MAN_DEP_UNKNOWN_CHILD,
+    MAN_DEP_UNKNOWN_PROPS,
+    MAN_FLAG_DEFAULT_TYPE,
+    MAN_FLAG_DEFINES_ARG_TYPE,
+    MAN_FLAG_DESCRIPTION_TYPE,
+    MAN_FLAG_DUPLICATE,
+    MAN_FLAG_POS_ARGS,
+    MAN_FLAG_UNDECLARED_REFERENCE,
+    MAN_FLAG_UNKNOWN_CHILD,
+    MAN_FLAG_UNKNOWN_PROPS,
+    MAN_GIT_URL_BAD_SCHEME,
+    MAN_GIT_URL_NO_SCHEME,
+    MAN_KIND_ARITY,
+    MAN_KIND_INVALID,
+    MAN_MIRRORS_ARITY,
+    MAN_MIRRORS_UNKNOWN_CHILD,
+    MAN_NAME_DUPLICATE,
+    MAN_NAME_MISSING,
+    MAN_NAME_TYPE,
+    MAN_OVERRIDE_ARITY,
+    MAN_OVERRIDE_DUPLICATE,
+    MAN_OVERRIDE_GIT_MISSING,
+    MAN_OVERRIDE_KIND,
+    MAN_OVERRIDE_REF_MISSING,
+    MAN_OVERRIDE_UNKNOWN_PROPS,
+    MAN_PREDICATE_CHILD_ARG_TYPE,
+    MAN_PREDICATE_CHILD_NO_ARGS,
+    MAN_PREDICATE_FORM_CONFLICT,
+    MAN_PREDICATE_MIXED_NEGATION,
+    MAN_PREDICATE_UNKNOWN,
+    MAN_PREDICATE_UNSUPPORTED_ANNOTATION,
+    MAN_PREDICATE_VALUE_TYPE,
+    MAN_SPEC_VERSION_TYPE,
+    MAN_SPEC_VERSION_UNSUPPORTED,
+    MAN_SRC_DIR_TYPE,
+    MAN_UNKNOWN_TOP_LEVEL,
+    MAN_URL_ARG_TYPE,
+    MAN_WORKSPACE_HAS_DEPS_OR_KIND,
+    MAN_WORKSPACE_MEMBER_ARITY,
+    MAN_WORKSPACE_MEMBER_DUPLICATE,
+    MAN_WORKSPACE_UNKNOWN_NODE,
+    MAN_WORKSPACE_UNKNOWN_TOP_LEVEL,
+    MilpaError,
+)
+from milpa.kdl_io import (
+    KdlDocument,
+    KdlNode,
+    has_kdl_comments,
+    node_arg_str,
+    node_arg_tag,
+    node_arg_url,
+    node_args,
+    node_children,
+    node_name,
+    node_prop_bool,
+    node_prop_int,
+    node_prop_str,
+    node_prop_tag,
+    node_prop_url,
+    node_props,
+    nodes,
+    parse_kdl,
+)
+from milpa.version import VersionSet
 
-from .solver import VersionSet
-
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 Kind = Literal["library", "application"]
+AttestationPolicy = Literal["permissive", "strict"]
+
+MANIFEST_SPEC_VERSION: int = 1
+"""Highest manifest spec-version epoch this implementation understands.
+
+Bumped only for breaking semantic changes; additive changes stay within
+the current epoch (P3 forward-unknown, §4.1).
+"""
+
+_VALID_KINDS: tuple[Kind, ...] = ("library", "application")
+_VALID_GIT_SCHEMES: frozenset[str] = frozenset({"https", "http", "ssh", "git"})
+
+# All recognized top-level node names for a package manifest (§3.1).
+_PACKAGE_TOP_LEVEL: frozenset[str] = frozenset(
+    {
+        "name",
+        "kind",
+        "deps",
+        "dev-deps",
+        "overrides",
+        "src_dir",
+        "flags",
+        "mirrors",
+        "cas",
+        "spec-version",
+        "attestation-policy",
+    }
+)
+
+# Property names recognized on a UrlDep node (dispatched to UrlDep, not NamedDep).
+_URL_DEP_KNOWN_PROPS: frozenset[str] = frozenset(
+    {"git", "ref", "platform", "arch", "nim", "milpa", "flag"}
+)
+
+# Recognized predicate property names.
+_PREDICATE_PROPS: frozenset[str] = frozenset({"platform", "arch", "nim", "milpa", "flag"})
+
+# Top-level nodes permitted in a workspace manifest.
+_WORKSPACE_TOP_LEVEL: frozenset[str] = frozenset(
+    {"workspace", "name", "overrides", "spec-version"}
+)
+
+
+# ---------------------------------------------------------------------------
+# Data model — 3a
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class Predicate:
     """One conditional clause on a dep.
 
-    `values` is the set of literal values the predicate is checked
-    against. `negated=False` means the predicate is satisfied if the
-    profile's value MATCHES any of `values` (OR semantics — #88).
-    `negated=True` means the predicate is satisfied if the profile
-    MATCHES NONE — equivalent to the (not) annotation applied to every
-    value (De Morgan: NOT (a OR b) = NOT a AND NOT b).
+    ``name`` is the predicate key (``platform``, ``arch``, ``nim``,
+    ``milpa``, ``flag``).  ``values`` is the tuple of match tokens.
+    ``negated=False`` → satisfied if ANY value matches (OR); ``negated=True``
+    → satisfied if NO value matches.
 
-    A mixed-negation clause (some args (not), some bare in a child
-    node) is rejected at parse time as ambiguous."""
-    name: str                    # one of: platform, arch, nim, milpa
+    Both inline form (single-value property on the dep node) and child-node
+    form (multi-value child node, OR semantics) are represented identically
+    here — the distinction is erased at parse time.
+    """
+
+    name: str
     values: tuple[str, ...]
     negated: bool = False
 
 
 @dataclass(frozen=True)
 class FlagRequest:
-    """A consumer's request for a specific flag state on a dep (#23).
+    """A consumer's request for a specific flag state on a UrlDep.
 
-    `enabled=True` turns the flag on; `enabled=False` explicitly opts
-    out (overrides the dep's default-true)."""
+    ``enabled=True`` turns the flag on (default); ``enabled=False``
+    explicitly opts out (overrides a ``default=true`` declaration).
+    """
+
     name: str
     enabled: bool = True
 
 
 @dataclass(frozen=True)
 class UrlDep:
+    """A dep declared by git URL and ref.
+
+    Grammar: ``<name> git=(url)"<URL>" ref="<git-ref>" [predicates] [{ … }]``
+
+    ``mirrors`` are fallback URLs tried in order after ``git`` fails.
+    ``predicates`` are evaluated before the dep is passed to the solver.
+    ``flag_requests`` are consumer feature-flag requests to the dep.
+    """
+
     name: str
     git: str
     ref: str
-    mirrors: tuple[str, ...] = ()    # fall-back URLs tried in order (#37)
-    predicates: tuple[Predicate, ...] = ()    # conditional gates (#26)
-    flag_requests: tuple[FlagRequest, ...] = ()    # consumer feature requests (#23)
+    mirrors: tuple[str, ...] = ()
+    predicates: tuple[Predicate, ...] = ()
+    flag_requests: tuple[FlagRequest, ...] = ()
 
 
 @dataclass(frozen=True)
-class MemberDep:
-    """A dep declared as a workspace-internal reference.
+class NamedDep:
+    """A dep resolved against the tianguis index.
 
-    Resolved through the workspace's member table by `name` — not
-    a fetch, not a filesystem path. Members live in their declared
-    location within the workspace; they are NOT copied into `_deps/`.
+    Grammar: ``<name>`` or ``<name> "<version-constraint>"``
 
-    Grammar: `intonaco member` (bare keyword `member`, no value, no
-    other properties). Valid only inside a workspace member's manifest;
-    structural validation (member exists, name matches) happens at
-    workspace-load time (W2).
+    ``constraint`` is the raw string from the manifest (or ``None``
+    when absent).  ``constraint_set`` is a pre-typed ``VersionSet``
+    parsed at construction time (the #121 design: parse-to-typed-value
+    once at the manifest parse boundary; illegal states unrepresentable).
 
-    See #25 (umbrella) and W1 (#73).
+    A malformed ``constraint`` string raises
+    ``MilpaError(MAN_DEP_NAMED_CONSTRAINT)`` at construction time.
     """
+
     name: str
+    constraint: str | None  # e.g. ">= 0.5.0" or None for any version
+    constraint_set: VersionSet | None = field(default=None, compare=False, hash=False)
+
+    def __post_init__(self) -> None:
+        """Pre-type the constraint at construction time.
+
+        Uses ``object.__setattr__`` because the dataclass is frozen.
+        """
+        if self.constraint is not None and self.constraint_set is None:
+            try:
+                parsed = VersionSet.from_constraint(self.constraint)
+            except ValueError as exc:
+                raise MilpaError(
+                    MAN_DEP_NAMED_CONSTRAINT,
+                    f"dep {self.name!r}: invalid version constraint "
+                    f"{self.constraint!r}: {exc}",
+                    dep=self.name,
+                    constraint=self.constraint,
+                ) from exc
+            object.__setattr__(self, "constraint_set", parsed)
+
+
+@dataclass(frozen=True)
+class LocalDep:
+    """A dep declared by local filesystem path.
+
+    Grammar: ``<name> local="<path>"``
+
+    ``path`` is the literal user-supplied string; the resolver lifts it
+    to an absolute Path against the project root before constructing a
+    provenance record.  LocalDep is NOT CAS-admissible.
+    """
+
+    name: str
+    path: str
 
 
 @dataclass(frozen=True)
 class TarballDep:
-    """A dep declared by tarball URL (F2 / #41).
+    """A dep declared by tarball URL.
 
-    `sha256` is optional — when set, the fetcher verifies the
-    archive's hash BEFORE extraction (strictly stronger than git's
-    "clone and hope"). When absent, the fetcher trusts the URL on
-    first fetch and records the actual hash on the TarballReceipt
-    so the lockfile can pin it for subsequent fetches (TOFU model).
+    Grammar:
+        ``<name> tarball=(url)"<URL>" [sha256="<hex>"] [strip_components=<N>]``
 
-    `strip_components` defaults to 0; the github-tarball idiom of
-    "everything under <repo>-<sha>/" needs 1.
-
-    See docs/rfc-pluggable-fetchers.md Phase F2.
+    ``sha256`` is optional (TOFU when absent).  ``strip_components``
+    stripping is applied BEFORE ``content_hash`` computation.
+    TarballDep IS CAS-admissible.
     """
+
     name: str
     url: str
     sha256: str | None = None
@@ -105,89 +305,31 @@ class TarballDep:
 
 
 @dataclass(frozen=True)
-class LocalDep:
-    """A dep declared by local filesystem path.
+class MemberDep:
+    """A workspace-internal member reference.
 
-    `path` is the literal user-supplied string (relative-to-project
-    or absolute). The resolver lifts it to an absolute Path against
-    the project root before constructing a LocalProvenance — keeping
-    the string intent here means the lockfile can record portable
-    workspace-relative provenance instead of machine-specific
-    absolute paths.
+    Grammar: ``member "<member-name>"``
 
-    Grammar: `intonaco local="../intonaco"`.
-
-    See docs/rfc-pluggable-fetchers.md Phase F3.
+    The node name is the literal keyword ``member`` (not the package
+    name).  The positional arg is the workspace member's intrinsic name.
+    MemberDep is NOT CAS-admissible.
     """
+
     name: str
-    path: str
 
 
-@dataclass(frozen=True)
-class NamedDep:
-    """A dep declared by name (resolved via the registry).
-
-    Appears in manifests promoted from .nimble files that have
-    `requires "results"` or `requires "stew >= 0.5.0"` style lines,
-    and in milpa.kdl-authored manifests.
-
-    Two fields capture the constraint:
-      constraint     — the raw string from the manifest (preserved for
-                       faithful round-trip formatting; None if absent)
-      constraint_set — the pre-parsed VersionSet (None when constraint
-                       is None). Parsed at construction time by
-                       __post_init__ — every NamedDep with a constraint
-                       carries a valid parsed set, making the illegal
-                       state (constraint set, constraint_set None)
-                       unrepresentable.
-    """
-    name: str
-    constraint: str | None       # e.g. ">= 0.5.0" or None for any version
-    constraint_set: VersionSet | None = field(default=None, compare=False, hash=False)
-
-    def __post_init__(self) -> None:
-        """Guarantee: if constraint is set, constraint_set is populated.
-
-        Parses constraint_set from constraint when it is not supplied.
-        Raises ManifestError(code="MAN-DEP-NAMED-CONSTRAINT") on a
-        malformed constraint string — whether the NamedDep is built by
-        the manifest parser or constructed directly in code or tests.
-
-        The manifest parser (_parse_named_dep) catches that error and
-        re-raises enriched with the KDL node's line/col.
-
-        Uses object.__setattr__ because the dataclass is frozen.
-        ManifestError is defined later in this module; Python resolves
-        it at call time (not at class-definition time), so this works.
-        """
-        if self.constraint is not None and self.constraint_set is None:
-            try:
-                parsed = VersionSet.from_constraint(self.constraint)
-            except ValueError as exc:
-                raise ManifestError(  # noqa: F821 — defined later in this module
-                    f"dep {self.name!r}: invalid version constraint "
-                    f"{self.constraint!r}: {exc}",
-                    code="MAN-DEP-NAMED-CONSTRAINT",
-                ) from exc
-            object.__setattr__(self, "constraint_set", parsed)
-
-
+# Union of all dep forms.
 Dep = UrlDep | NamedDep | LocalDep | TarballDep | MemberDep
 
 
 @dataclass(frozen=True)
 class Override:
-    """A pkg-form override: any dep with this name resolves to this
-    URL+ref instead of whatever the manifest or transitive resolution
-    would otherwise produce.
+    """A pkg-form override: any dep matching ``name`` resolves to this
+    git URL + ref instead of the manifest or transitive result.
 
-    Project-wide scope: applies to manifest-direct deps, transitive
-    URL deps, and named (registry-resolved) deps with the same name.
-    Does not propagate to downstream consumers of this project.
-
-    See docs/identity-and-provenance.md — overrides change provenance,
-    identity follows whatever the override's content hashes to.
+    Project-wide scope.  Does not propagate to downstream consumers.
     """
+
     name: str
     git: str
     ref: str
@@ -195,213 +337,135 @@ class Override:
 
 @dataclass(frozen=True)
 class FlagDecl:
-    """A named feature flag declared by a package (#23).
+    """A named feature flag declared by a package.
 
-    `default` is the flag's value when no consumer explicitly requests
-    otherwise. `description` is human-facing documentation. `defines`
-    are explicit `-d:` flags to pass to the Nim compiler when this
-    flag is active; empty tuple means use the convention
-    `-d:<package_name>_<flag_name>`."""
+    ``default`` is the flag's value when no consumer requests otherwise.
+    ``description`` is human-facing documentation.
+    ``defines`` are explicit ``-d:`` flags for the Nim compiler when
+    active; empty tuple uses the convention ``-d:<pkg>_<flag>``.
+    """
+
     name: str
     default: bool = False
     description: str = ""
     defines: tuple[str, ...] = ()
 
 
-MANIFEST_SPEC_VERSION = 1
-"""The highest manifest spec-version epoch this implementation understands.
-
-Bumped only for breaking semantic changes to the manifest grammar;
-additive grammar evolution stays within an epoch (handled by the P3
-forward-unknown properties). See §4.4 of spec/manifest-grammar.md.
-
-Distinct namespace from LOCKFILE_SCHEMA_VERSION (lockfile.py) and
-TIANGUIS_INDEX_SCHEMA_VERSION (tianguis_client.py).
-"""
-
-
 @dataclass(frozen=True)
 class Manifest:
+    """A parsed package manifest (milpa.kdl in package role).
+
+    ``deps`` and ``dev_deps`` are both tuples of ``Dep`` values.
+    ``spec_version_explicit`` is ``True`` iff the source declared a
+    ``spec-version`` node (absent-stays-absent serialization rule, §4.4).
+    ``had_comments`` is ``True`` iff the source text contained any KDL
+    comments (``//``, ``/*``, or ``/-``).  When ``True``, ``format_manifest``
+    emits a stderr warning (§8) because comments are dropped by the fresh-AST
+    serializer.
+    """
+
+    name: str
     deps: tuple[Dep, ...]
-    kind: Kind
-    name: str | None = None
+    kind: Kind = "library"
     src_dir: str = ""
     overrides: tuple[Override, ...] = ()
     flags: tuple[FlagDecl, ...] = ()
-    self_mirrors: tuple[str, ...] = ()    # alternative URLs where THIS package is hosted (#79)
-    cas_dir: str = ""                     # project-level CAS override (env var > this > XDG default)
-    spec_version: int = 1                 # epoch declared by spec-version node (default 1 = absent)
-    spec_version_explicit: bool = False   # True iff spec-version was declared in source
-    dev_deps: tuple[Dep, ...] = ()        # deps needed only when building/testing this package;
-                                          # NOT propagated to downstream consumers (Cargo model)
+    self_mirrors: tuple[str, ...] = ()
+    cas_dir: str = ""
+    spec_version: int = 1
+    spec_version_explicit: bool = False
+    dev_deps: tuple[Dep, ...] = ()
+    had_comments: bool = False
+    attestation_policy: AttestationPolicy = "permissive"
 
 
 @dataclass(frozen=True)
 class WorkspaceManifest:
-    """A workspace-root manifest. Pure container — declares member
-    package paths and (optionally) workspace-level overrides that
-    apply to every member's resolution (W5 #77 wires the application).
+    """A workspace-root manifest.
 
-    Virtual-workspace-only: a workspace manifest may NOT carry deps
-    or kind. To make the workspace root also be a package, put the
-    package at a subdirectory and list it as a member.
-
-    See #25 and W1 (#73) for the design.
+    Pure container: declares member package paths and optional
+    workspace-level overrides.  A workspace manifest MUST NOT declare
+    ``deps`` or ``kind`` (``MAN-WORKSPACE-HAS-DEPS-OR-KIND``).
     """
+
     members: tuple[str, ...]
-    overrides: tuple["Override", ...] = ()
+    overrides: tuple[Override, ...] = ()
+    name: str | None = None
 
 
-class ManifestError(Exception):
-    """Raised when milpa.kdl is malformed or violates the schema.
-
-    `code` is the stable error-catalog identifier (#14). New raise
-    sites should always pass it; legacy single-arg raises remain
-    valid (code is None) during the gradual instrumentation."""
-
-    def __init__(self, message: str, *, code: str | None = None) -> None:
-        super().__init__(message)
-        self.code = code
+# ---------------------------------------------------------------------------
+# Public parse entry points
+# ---------------------------------------------------------------------------
 
 
-# What the parser accepts. These are the source of truth for validation;
-# the schema doc at milpa/schema/milpa.schema.kdl documents the same shape
-# for humans. Drift between the two is checked indirectly via tests against
-# example manifests.
-_PACKAGE_TOP_LEVEL = frozenset({"deps", "dev-deps", "kind", "overrides", "name", "src_dir", "flags", "mirrors", "cas", "spec-version"})
-_PREDICATE_PROPS = frozenset({"platform", "arch", "nim", "milpa", "flag"})
-_URL_DEP_PROPS = frozenset({"git", "ref"}) | _PREDICATE_PROPS
-_VALID_KINDS: tuple[Kind, ...] = ("library", "application")
-_VALID_GIT_SCHEMES = frozenset({"https", "http", "ssh", "git"})
+def parse_manifest(text: str) -> Manifest:
+    """Parse a KDL 2.0 string into a typed ``Manifest``.
 
+    Raises ``MilpaError`` with the appropriate ``MAN-*`` slug on any
+    structural or semantic error.  No filesystem I/O.
 
-def kdl_has_workspace_block(text: str) -> bool:
-    """Return True iff `text` is valid KDL that contains a `workspace` node.
-
-    Silently returns False on any KDL parse error (caller treats the file
-    as not-a-workspace and keeps walking). This is intentionally a
-    lightweight probe used only by discovery (find_workspace_root) to
-    decide whether a ManifestError from full parsing should propagate or
-    be swallowed as "not a workspace here".
+    Sets ``manifest.had_comments = True`` when the source text contains any
+    KDL comments, so that ``format_manifest`` can warn on the comment-drop
+    (§8).
     """
-    try:
-        doc = kdl.parse(text)
-    except kdl.errors.ParseError:
-        return False
-    return any(node.name == "workspace" for node in doc.nodes)
+    comments_present = has_kdl_comments(text)
+    doc = parse_kdl(text, context="manifest")
+    m = _parse_manifest_doc(doc)
+    if comments_present:
+        # had_comments is frozen; use object.__setattr__ to set post-construction.
+        object.__setattr__(m, "had_comments", True)
+    return m
 
 
-def parse_workspace_or_manifest(
-    text: str, *, source: str | None = None,
-) -> "WorkspaceManifest | Manifest":
-    """Parse a milpa.kdl source string into either a WorkspaceManifest (if it
-    declares a `workspace { ... }` block) or a Manifest (package form).
+def parse_workspace_or_manifest(text: str) -> Manifest | WorkspaceManifest:
+    """Auto-detect document role and parse accordingly.
 
-    Virtual-workspace-only: the two roles are disjoint. A document
-    with a `workspace` block is a workspace; one with `deps`/`kind`
-    is a package. Mixing is rejected (see W1).
+    Returns ``WorkspaceManifest`` if a top-level ``workspace { }`` node
+    is present; otherwise returns ``Manifest`` (package form).
     """
-    try:
-        doc = kdl.parse(text)
-    except kdl.errors.ParseError as e:
-        raise ManifestError(
-            f"KDL syntax error: {e}", code="MAN-KDL-SYNTAX",
-        ) from e
-    has_workspace = any(node.name == "workspace" for node in doc.nodes)
+    doc = parse_kdl(text, context="manifest")
+    has_workspace = any(node_name(n) == "workspace" for n in nodes(doc))
     if has_workspace:
         return _parse_workspace_doc(doc)
-    return _parse_manifest_doc(doc)
+    comments_present = has_kdl_comments(text)
+    m = _parse_manifest_doc(doc)
+    if comments_present:
+        object.__setattr__(m, "had_comments", True)
+    return m
 
 
-_WORKSPACE_TOP_LEVEL = frozenset({"workspace", "name", "overrides", "spec-version"})
+# ---------------------------------------------------------------------------
+# Internal — manifest doc parser
+# ---------------------------------------------------------------------------
 
 
-def _parse_workspace_doc(doc) -> "WorkspaceManifest":
-    members: list[str] = []
-    overrides: list[Override] = []
-    seen_override_names: set[str] = set()
-    for node in doc.nodes:
-        if node.name == "spec-version":
-            epoch = _parse_spec_version_node(node)
-            if epoch > MANIFEST_SPEC_VERSION:
-                raise ManifestError(
-                    f"manifest declares spec-version {epoch} but this "
-                    f"implementation only supports up to "
-                    f"spec-version {MANIFEST_SPEC_VERSION}",
-                    code="MAN-SPEC-VERSION-UNSUPPORTED",
-                )
-            continue
-        if node.name in {"deps", "kind"}:
-            raise ManifestError(
-                f"a workspace manifest must not declare {node.name!r} — "
-                f"workspaces are pure containers, not packages "
-                f"(virtual-workspace-only); to make the root also a "
-                f"package, declare `member \".\"` and put deps/kind in "
-                f"the root member's milpa.kdl",
-                code="MAN-WORKSPACE-HAS-DEPS-OR-KIND",
-            )
-        if node.name == "workspace":
-            for child in node.nodes:
-                if child.name != "member":
-                    raise ManifestError(
-                        f"unknown node {child.name!r} in workspace block "
-                        f"(allowed: 'member')",
-                        code="MAN-WORKSPACE-UNKNOWN-NODE",
-                    )
-                if len(child.args) != 1 or not isinstance(child.args[0], str):
-                    raise ManifestError(
-                        "workspace 'member' takes exactly one positional "
-                        "string argument (the member directory path)",
-                        code="MAN-WORKSPACE-MEMBER-ARITY",
-                    )
-                path = child.args[0]
-                if path in members:
-                    raise ManifestError(
-                        f"duplicate workspace member {path!r}",
-                        code="MAN-WORKSPACE-MEMBER-DUPLICATE",
-                    )
-                members.append(path)
-        elif node.name == "overrides":
-            for child in node.nodes:
-                ov = _parse_override(child)
-                if ov.name in seen_override_names:
-                    raise ManifestError(
-                        f"duplicate override for {ov.name!r}",
-                        code="MAN-OVERRIDE-DUPLICATE",
-                    )
-                seen_override_names.add(ov.name)
-                overrides.append(ov)
-        elif node.name not in _WORKSPACE_TOP_LEVEL:
-            allowed = ", ".join(sorted(_WORKSPACE_TOP_LEVEL))
-            raise ManifestError(
-                f"unknown top-level node {node.name!r} in workspace "
-                f"manifest (allowed: {allowed})",
-                code="MAN-WORKSPACE-UNKNOWN-TOP-LEVEL",
-            )
-    return WorkspaceManifest(
-        members=tuple(members),
-        overrides=tuple(overrides),
-    )
+def _check_flag_predicate_references(
+    deps: list[Dep], declared_flag_names: frozenset[str]
+) -> None:
+    """Validate that all ``flag=`` predicate values name a declared flag.
 
-
-def parse_manifest(text: str, *, source: str | None = None) -> Manifest:
-    """Parse a milpa.kdl source string into a typed Manifest.
-
-    `source` is the file path (or other identifier) used in error
-    messages; presently reserved for future use (error catalog work,
-    issue #14). Raises `ManifestError` on malformed input or schema
-    violations.
+    Walks ``UrlDep.predicates``; any ``Predicate(name='flag')`` whose
+    values reference an undeclared flag name raises
+    ``MAN-FLAG-UNDECLARED-REFERENCE``.
     """
-    try:
-        doc = kdl.parse(text)
-    except kdl.errors.ParseError as e:
-        raise ManifestError(
-            f"KDL syntax error: {e}", code="MAN-KDL-SYNTAX",
-        ) from e
-    return _parse_manifest_doc(doc)
+    for dep in deps:
+        if not isinstance(dep, UrlDep):
+            continue
+        for pred in dep.predicates:
+            if pred.name != "flag":
+                continue
+            for value in pred.values:
+                if value not in declared_flag_names:
+                    raise MilpaError(
+                        MAN_FLAG_UNDECLARED_REFERENCE,
+                        f"dep {dep.name!r}: predicate references undeclared flag "
+                        f"{value!r} — declare it in the 'flags' block first",
+                        dep=dep.name,
+                        flag=value,
+                    )
 
 
-def _parse_manifest_doc(doc) -> Manifest:
+def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
     deps: list[Dep] = []
     dev_deps: list[Dep] = []
     overrides: list[Override] = []
@@ -413,167 +477,150 @@ def _parse_manifest_doc(doc) -> Manifest:
     cas_dir: str = ""
     spec_version: int = 1
     spec_version_explicit: bool = False
-    seen_names: set[str] = set()
-    seen_dev_dep_names: set[str] = set()
-    seen_override_names: set[str] = set()
-    seen_flag_names: set[str] = set()
-    for node in doc.nodes:
-        if node.name == "spec-version":
-            epoch = _parse_spec_version_node(node)
-            if epoch > MANIFEST_SPEC_VERSION:
-                raise ManifestError(
-                    f"manifest declares spec-version {epoch} but this "
-                    f"implementation only supports up to "
-                    f"spec-version {MANIFEST_SPEC_VERSION}",
-                    code="MAN-SPEC-VERSION-UNSUPPORTED",
-                )
+    attestation_policy: AttestationPolicy = "permissive"
+    seen_top_level: set[str] = set()
+
+    for n in nodes(doc):
+        nm = node_name(n)
+
+        # --- spec-version ---
+        if nm == "spec-version":
+            epoch = _parse_spec_version_node(n)
             spec_version = epoch
             spec_version_explicit = True
             continue
-        if node.name == "name":
+
+        # --- workspace in a package manifest ---
+        if nm == "workspace":
+            raise MilpaError(
+                MAN_WORKSPACE_HAS_DEPS_OR_KIND,
+                "a workspace manifest must not declare 'kind' or 'deps' — "
+                "and a package manifest must not declare 'workspace'",
+            )
+
+        # --- unknown top-level ---
+        if nm not in _PACKAGE_TOP_LEVEL:
+            raise MilpaError(
+                MAN_UNKNOWN_TOP_LEVEL,
+                f"unknown top-level node {nm!r} in package manifest "
+                f"(allowed: {', '.join(sorted(_PACKAGE_TOP_LEVEL))})",
+                node=nm,
+            )
+
+        # --- duplicate top-level ---
+        if nm in seen_top_level and nm not in ("deps", "dev-deps"):
+            pass  # handled per-node below for name/kind/src_dir
+        seen_top_level.add(nm)
+
+        if nm == "name":
             if name is not None:
-                raise ManifestError(
+                raise MilpaError(
+                    MAN_NAME_DUPLICATE,
                     "duplicate top-level 'name' node — only one allowed",
-                    code="MAN-NAME-DUPLICATE",
                 )
-            if len(node.args) != 1 or not isinstance(node.args[0], str):
-                raise ManifestError(
-                    "'name' takes exactly one positional string argument",
-                    code="MAN-NAME-TYPE",
+            v = node_arg_str(n, 0)
+            if v is None:
+                # Present but wrong type or missing
+                raw_args = node_args(n)
+                if len(raw_args) == 0:
+                    raise MilpaError(
+                        MAN_NAME_TYPE,
+                        "'name' takes exactly one positional string argument",
+                    )
+                raise MilpaError(
+                    MAN_NAME_TYPE,
+                    f"'name' argument must be a string, got {type(raw_args[0]).__name__!r}",
                 )
-            name = node.args[0]
-            continue
-        if node.name == "src_dir":
-            if len(node.args) != 1 or not isinstance(node.args[0], str):
-                raise ManifestError(
+            name = v
+
+        elif nm == "kind":
+            raw_args = node_args(n)
+            if len(raw_args) != 1:
+                raise MilpaError(
+                    MAN_KIND_ARITY,
+                    "'kind' takes exactly one positional string argument "
+                    "('library' or 'application')",
+                )
+            if not isinstance(raw_args[0], str):
+                raise MilpaError(
+                    MAN_KIND_ARITY,
+                    "'kind' argument must be a string",
+                )
+            if raw_args[0] not in _VALID_KINDS:
+                raise MilpaError(
+                    MAN_KIND_INVALID,
+                    f"'kind' must be 'library' or 'application', got {raw_args[0]!r}",
+                    value=raw_args[0],
+                )
+            # raw_args[0] is in _VALID_KINDS so it is a Kind literal
+            kind = raw_args[0] if raw_args[0] == "application" else "library"
+
+        elif nm == "src_dir":
+            v = node_arg_str(n, 0)
+            if v is None:
+                raise MilpaError(
+                    MAN_SRC_DIR_TYPE,
                     "'src_dir' takes exactly one positional string argument",
-                    code="MAN-SRC-DIR-TYPE",
                 )
-            src_dir = node.args[0]
-            continue
-        if node.name == "cas":
-            dir_node = next(
-                (c for c in node.nodes if c.name == "dir"), None,
-            )
-            if dir_node is None:
-                raise ManifestError(
-                    "'cas' block requires a 'dir' child node",
-                    code="MAN-CAS-DIR-MISSING",
+            src_dir = v
+
+        elif nm == "cas":
+            cas_dir = _parse_cas_block(n)
+
+        elif nm == "deps":
+            block_deps = _parse_dep_block(n, block_name="deps")
+            deps.extend(block_deps)
+
+        elif nm == "dev-deps":
+            block_deps = _parse_dep_block(n, block_name="dev-deps")
+            dev_deps.extend(block_deps)
+
+        elif nm == "overrides":
+            overrides = _parse_overrides_block(n)
+
+        elif nm == "mirrors":
+            self_mirrors = _parse_mirrors_block(n)
+
+        elif nm == "attestation-policy":
+            raw_args = node_args(n)
+            if len(raw_args) != 1 or not isinstance(raw_args[0], str):
+                raise MilpaError(
+                    MAN_UNKNOWN_TOP_LEVEL,
+                    "'attestation-policy' takes exactly one string argument "
+                    "('permissive' or 'strict')",
+                    node="attestation-policy",
                 )
-            if (len(dir_node.args) != 1
-                    or not isinstance(dir_node.args[0], str)):
-                raise ManifestError(
-                    "'cas.dir' takes exactly one positional string argument",
-                    code="MAN-CAS-DIR-TYPE",
+            policy_val = raw_args[0]
+            if policy_val not in ("permissive", "strict"):
+                raise MilpaError(
+                    MAN_UNKNOWN_TOP_LEVEL,
+                    f"'attestation-policy' must be 'permissive' or 'strict', "
+                    f"got {policy_val!r}",
+                    node="attestation-policy",
+                    value=policy_val,
                 )
-            cas_dir = dir_node.args[0]
-            continue
-        if node.name == "deps":
-            for child in node.nodes:
-                for dep in _expand_dep_child(child, inherited_preds=()):
-                    if dep.name in seen_names:
-                        raise ManifestError(
-                            f"duplicate dep {dep.name!r} in manifest",
-                            code="MAN-DEP-DUPLICATE",
-                        )
-                    seen_names.add(dep.name)
-                    deps.append(dep)
-        elif node.name == "dev-deps":
-            # dev-deps: same dep forms as `deps`; same error codes for
-            # malformed entries (MAN-DEP-*). NOT propagated to downstream
-            # consumers — resolved only when this package is the root.
-            for child in node.nodes:
-                for dep in _expand_dep_child(child, inherited_preds=()):
-                    if dep.name in seen_dev_dep_names:
-                        raise ManifestError(
-                            f"duplicate dep {dep.name!r} in manifest",
-                            code="MAN-DEP-DUPLICATE",
-                        )
-                    seen_dev_dep_names.add(dep.name)
-                    dev_deps.append(dep)
-        elif node.name == "kind":
-            kind = _parse_kind(node)
-        elif node.name == "overrides":
-            for child in node.nodes:
-                ov = _parse_override(child)
-                if ov.name in seen_override_names:
-                    raise ManifestError(
-                        f"duplicate override for {ov.name!r}",
-                        code="MAN-OVERRIDE-DUPLICATE",
-                    )
-                seen_override_names.add(ov.name)
-                overrides.append(ov)
-        elif node.name == "flags":
-            for child in node.nodes:
-                fd = _parse_flag_decl(child)
-                if fd.name in seen_flag_names:
-                    raise ManifestError(
-                        f"duplicate flag declaration {fd.name!r}",
-                        code="MAN-FLAG-DUPLICATE",
-                    )
-                seen_flag_names.add(fd.name)
-                flags.append(fd)
-        elif node.name == "mirrors":
-            # Top-level mirrors {} block declares URLs where THIS
-            # package is hosted (#79). Each child is `mirror (url)"X"`.
-            for child in node.nodes:
-                if child.name != "mirror":
-                    raise ManifestError(
-                        f"unknown child node {child.name!r} in mirrors "
-                        f"block (allowed: 'mirror')",
-                        code="MAN-MIRRORS-UNKNOWN-CHILD",
-                    )
-                if len(child.args) != 1:
-                    raise ManifestError(
-                        "top-level 'mirror' takes exactly one positional "
-                        "URL argument",
-                        code="MAN-MIRRORS-ARITY",
-                    )
-                self_mirrors.append(
-                    _url_arg("top-level mirrors", "mirror", child.args[0]),
-                )
-        elif node.name == "workspace":
-            raise ManifestError(
-                "'workspace' block found in a package manifest — "
-                "workspace and package roles are disjoint "
-                "(virtual-workspace-only). Use parse_workspace_or_manifest "
-                "if you want to accept either kind.",
-                code="MAN-WORKSPACE-IN-PACKAGE",
-            )
-        else:
-            allowed = ", ".join(sorted(_PACKAGE_TOP_LEVEL))
-            raise ManifestError(
-                f"unknown top-level node {node.name!r} "
-                f"(allowed: {allowed})",
-                code="MAN-UNKNOWN-TOP-LEVEL",
-            )
+            attestation_policy = policy_val  # type: ignore[assignment]
+
+        elif nm == "flags":
+            flags = _parse_flags_block(n)
+
     if name is None:
-        raise ManifestError(
-            "package manifest is missing required top-level 'name' node "
-            "(every package must self-identify; add: `name \"<your-name>\"`)",
-            code="MAN-NAME-MISSING",
+        raise MilpaError(
+            MAN_NAME_MISSING,
+            "manifest is missing required 'name' node",
         )
-    # Validate flag predicates against declared flags (#23/#90):
-    # `when flag="X"` must reference a declared flag, else it's a typo.
-    # Applies to both deps and dev-deps.
-    declared_flag_names = {fd.name for fd in flags}
-    for dep in deps + dev_deps:
-        for pred in getattr(dep, "predicates", ()):
-            if pred.name != "flag":
-                continue
-            for v in pred.values:
-                if v not in declared_flag_names:
-                    allowed = ", ".join(repr(n) for n in sorted(declared_flag_names)) or "<none declared>"
-                    raise ManifestError(
-                        f"dep {dep.name!r}: `when flag={v!r}` references "
-                        f"an undeclared flag (declared flags: {allowed})",
-                        code="MAN-FLAG-UNDECLARED-REFERENCE",
-                    )
+
+    # 3c-8 post-parse: check that all 'flag' predicate references name a
+    # declared flag (MAN-FLAG-UNDECLARED-REFERENCE).
+    declared_flag_names = frozenset(f.name for f in flags)
+    _check_flag_predicate_references(
+        list(deps) + list(dev_deps), declared_flag_names
+    )
+
     return Manifest(
-        deps=tuple(deps),
-        dev_deps=tuple(dev_deps),
-        kind=kind,
         name=name,
+        deps=tuple(deps),
+        kind=kind,
         src_dir=src_dir,
         overrides=tuple(overrides),
         flags=tuple(flags),
@@ -581,915 +628,1199 @@ def _parse_manifest_doc(doc) -> Manifest:
         cas_dir=cas_dir,
         spec_version=spec_version,
         spec_version_explicit=spec_version_explicit,
+        dev_deps=tuple(dev_deps),
+        attestation_policy=attestation_policy,
     )
 
 
-def load_manifest(path: Path) -> Manifest:
-    """Read milpa.kdl from `path` and parse it.
+def _parse_cas_block(n: KdlNode) -> str:
+    """Parse a ``cas { dir "<path>" }`` block and return the dir string."""
+    children = node_children(n)
+    dir_children = [c for c in children if node_name(c) == "dir"]
+    if not dir_children:
+        raise MilpaError(
+            MAN_CAS_DIR_MISSING,
+            "cas block is missing required 'dir' child node",
+        )
+    dir_node = dir_children[0]
+    v = node_arg_str(dir_node, 0)
+    if v is None:
+        raise MilpaError(
+            MAN_CAS_DIR_TYPE,
+            "'cas.dir' takes exactly one positional string argument",
+        )
+    return v
 
-    Raises `ManifestError` if the file is missing, unreadable, or
-    malformed. The error message includes the path so the user can
-    locate the offending file quickly.
+
+# ---------------------------------------------------------------------------
+# Internal — workspace doc parser
+# ---------------------------------------------------------------------------
+
+
+def _parse_workspace_doc(doc: KdlDocument) -> WorkspaceManifest:
+    members: list[str] = []
+    overrides: list[Override] = []
+    ws_name: str | None = None
+
+    for n in nodes(doc):
+        nm = node_name(n)
+
+        if nm == "spec-version":
+            epoch = _parse_spec_version_node(n)
+            if epoch > MANIFEST_SPEC_VERSION:
+                raise MilpaError(
+                    MAN_SPEC_VERSION_UNSUPPORTED,
+                    f"manifest declares spec-version {epoch} but this "
+                    f"implementation only supports up to "
+                    f"spec-version {MANIFEST_SPEC_VERSION}",
+                    declared=epoch,
+                    supported=MANIFEST_SPEC_VERSION,
+                )
+            continue
+
+        if nm in {"deps", "kind"}:
+            raise MilpaError(
+                MAN_WORKSPACE_HAS_DEPS_OR_KIND,
+                f"a workspace manifest must not declare {nm!r} — "
+                "workspaces are pure containers, not packages",
+                node=nm,
+            )
+
+        if nm not in _WORKSPACE_TOP_LEVEL:
+            raise MilpaError(
+                MAN_WORKSPACE_UNKNOWN_TOP_LEVEL,
+                f"unknown top-level node {nm!r} in workspace manifest "
+                f"(allowed: {', '.join(sorted(_WORKSPACE_TOP_LEVEL))})",
+                node=nm,
+            )
+
+        if nm == "name":
+            v = node_arg_str(n, 0)
+            if v is not None:
+                ws_name = v
+
+        elif nm == "workspace":
+            for child in node_children(n):
+                child_nm = node_name(child)
+                if child_nm != "member":
+                    raise MilpaError(
+                        MAN_WORKSPACE_UNKNOWN_NODE,
+                        f"unknown node {child_nm!r} in workspace block "
+                        "(allowed: 'member')",
+                        node=child_nm,
+                    )
+                raw_child_args = node_args(child)
+                if len(raw_child_args) != 1 or not isinstance(raw_child_args[0], str):
+                    raise MilpaError(
+                        MAN_WORKSPACE_MEMBER_ARITY,
+                        "workspace 'member' takes exactly one positional "
+                        "string argument (the member directory path)",
+                    )
+                path = raw_child_args[0]
+                if path in members:
+                    raise MilpaError(
+                        MAN_WORKSPACE_MEMBER_DUPLICATE,
+                        f"duplicate workspace member {path!r}",
+                        path=path,
+                    )
+                members.append(path)
+
+        elif nm == "overrides":
+            overrides = _parse_overrides_block(n)
+
+    return WorkspaceManifest(
+        members=tuple(members),
+        overrides=tuple(overrides),
+        name=ws_name,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Internal — dep block parser
+# ---------------------------------------------------------------------------
+
+
+def _parse_dep_block(
+    block: KdlNode,
+    *,
+    block_name: str,
+    outer_predicates: tuple[Predicate, ...] = (),
+) -> list[Dep]:
+    """Parse all dep declarations inside a ``deps { }`` or ``dev-deps { }`` block.
+
+    Handles ``when { }`` grouping sub-blocks (§6.3): predicates on the ``when``
+    node are inherited by every dep inside it (AND semantics with any
+    dep-own predicates).
     """
-    try:
-        text = path.read_text()
-    except FileNotFoundError as e:
-        raise ManifestError(
-            f"manifest file not found: {path}", code="MAN-FILE-NOT-FOUND",
-        ) from e
-    except OSError as e:
-        raise ManifestError(
-            f"cannot read manifest {path}: {e}", code="MAN-FILE-UNREADABLE",
-        ) from e
-    return parse_manifest(text, source=str(path))
+    deps: list[Dep] = []
+    seen_names: set[str] = set()
+
+    for child in node_children(block):
+        child_nm = node_name(child)
+
+        if child_nm == "when":
+            # Parse inline predicates from the `when` node's properties.
+            when_predicates = _parse_inline_predicates_from_node(
+                child, dep_name="when"
+            )
+            # Recurse: every dep inside the when-block inherits the combined set.
+            sub_deps = _parse_dep_block(
+                child,
+                block_name=block_name,
+                outer_predicates=outer_predicates + tuple(when_predicates),
+            )
+            for dep in sub_deps:
+                if dep.name in seen_names:
+                    raise MilpaError(
+                        MAN_DEP_DUPLICATE,
+                        f"duplicate dep {dep.name!r} in {block_name!r} block",
+                        dep=dep.name,
+                        block=block_name,
+                    )
+                seen_names.add(dep.name)
+                deps.append(dep)
+            continue
+
+        dep = _parse_dep_node(
+            child, block_name=block_name, outer_predicates=outer_predicates
+        )
+        dep_name = dep.name
+
+        if dep_name in seen_names:
+            raise MilpaError(
+                MAN_DEP_DUPLICATE,
+                f"duplicate dep {dep_name!r} in {block_name!r} block",
+                dep=dep_name,
+                block=block_name,
+            )
+        seen_names.add(dep_name)
+        deps.append(dep)
+
+    return deps
 
 
-_MANIFEST_HEADER = "// generated by milpa; edit by hand or via `milpa add` / `milpa remove`"
+def _parse_dep_node(
+    n: KdlNode,
+    *,
+    block_name: str,
+    outer_predicates: tuple[Predicate, ...] = (),
+) -> Dep:
+    """Disambiguate and parse a single dep node.
 
-
-def format_manifest(m: Manifest) -> str:
-    """Render a Manifest to milpa.kdl text.
-
-    Emits a deps {...} block (omitted if no deps) plus the kind line.
-    UrlDeps use the recommended `(url)` annotation on the git value;
-    NamedDeps emit as `name` alone or `name "<constraint>"`.
-
-    Output is deterministic but does NOT preserve hand-written
-    comments — comment-preserving serialization is #15's deliverable.
+    Disambiguation order (§3.2):
+      1. node name is ``member``   → MemberDep
+      2. has ``git=`` property     → UrlDep
+      3. has ``local=`` property   → LocalDep
+      4. has ``tarball=`` property → TarballDep
+      5. otherwise                 → NamedDep
     """
+    nm = node_name(n)
+    props = node_props(n)
+
+    if nm == "member":
+        return _parse_member_dep(n)
+    if "git" in props:
+        return _parse_url_dep(n, dep_name=nm, outer_predicates=outer_predicates)
+    if "local" in props:
+        return _parse_local_dep(n, dep_name=nm)
+    if "tarball" in props:
+        return _parse_tarball_dep(n, dep_name=nm)
+    return _parse_named_dep(n, dep_name=nm)
+
+
+# ---------------------------------------------------------------------------
+# Internal — individual dep form parsers
+# ---------------------------------------------------------------------------
+
+
+def _parse_url_dep(
+    n: KdlNode,
+    *,
+    dep_name: str,
+    outer_predicates: tuple[Predicate, ...] = (),
+) -> UrlDep:
+    """Parse a UrlDep node.
+
+    Requires ``git=`` (URL) and ``ref=`` properties.  Permitted additional
+    properties: ``platform``, ``arch``, ``nim``, ``milpa``, ``flag``
+    (inline predicate form).  Children: ``mirror``, ``flag``, predicate
+    child nodes.
+
+    ``outer_predicates`` are inherited predicates from an enclosing ``when``
+    block (§6.3); they are prepended to the dep's own predicates (AND semantics).
+    """
+    # --- git= URL ---
+    git_url_v = node_prop_url(n, "git")
+    if git_url_v is None:
+        raise MilpaError(
+            MAN_URL_ARG_TYPE,
+            f"dep {dep_name!r}: 'git=' value must be a URL string",
+            dep=dep_name,
+        )
+    git_url = str(git_url_v)
+    _validate_git_url(git_url, dep_name)
+
+    # --- ref= ---
+    ref = node_prop_str(n, "ref")
+    if ref is None:
+        raise MilpaError(
+            MAN_DEP_REF_MISSING,
+            f"dep {dep_name!r}: UrlDep requires a 'ref=' property",
+            dep=dep_name,
+        )
+
+    # --- validate no unknown properties ---
+    for prop_key in node_props(n):
+        if prop_key not in _URL_DEP_KNOWN_PROPS:
+            raise MilpaError(
+                MAN_DEP_UNKNOWN_PROPS,
+                f"dep {dep_name!r}: unknown property {prop_key!r}",
+                dep=dep_name,
+                prop=prop_key,
+            )
+
+    # --- inline predicate properties (single-value form) ---
+    # Collect first so form-conflict check can compare with child-node predicates.
+    inline_pred_keys: set[str] = set()
+    inline_predicates: list[Predicate] = []
+    for prop_key in node_props(n):
+        if prop_key in _PREDICATE_PROPS:
+            inline_predicates.append(
+                _parse_inline_predicate(n, prop_key, dep_name=dep_name)
+            )
+            inline_pred_keys.add(prop_key)
+
+    # --- children: mirror, flag, predicate child nodes ---
+    mirrors: list[str] = []
+    flag_requests: list[FlagRequest] = []
+    child_predicates: list[Predicate] = []
+
+    for child in node_children(n):
+        child_nm = node_name(child)
+        if child_nm == "mirror":
+            mirrors.append(_parse_mirror_child(child, dep_name=dep_name))
+        elif child_nm == "flag":
+            flag_requests.append(_parse_flag_request_child(child, dep_name=dep_name))
+        elif child_nm in _PREDICATE_PROPS:
+            # Check form-conflict: same key already present as inline prop.
+            if child_nm in inline_pred_keys:
+                raise MilpaError(
+                    MAN_PREDICATE_FORM_CONFLICT,
+                    f"dep {dep_name!r}: predicate {child_nm!r} appears both as "
+                    "an inline property and as a child node — use one form only",
+                    dep=dep_name,
+                    predicate=child_nm,
+                )
+            child_predicates.append(
+                _parse_predicate_child(child, dep_name=dep_name)
+            )
+        else:
+            raise MilpaError(
+                MAN_DEP_UNKNOWN_CHILD,
+                f"dep {dep_name!r}: unknown child node {child_nm!r} "
+                "(allowed: 'mirror', 'flag', predicate names)",
+                dep=dep_name,
+                child=child_nm,
+            )
+
+    all_predicates = (
+        list(outer_predicates) + inline_predicates + child_predicates
+    )
+
+    return UrlDep(
+        name=dep_name,
+        git=git_url,
+        ref=ref,
+        mirrors=tuple(mirrors),
+        predicates=tuple(all_predicates),
+        flag_requests=tuple(flag_requests),
+    )
+
+
+def _validate_git_url(url: str, dep_name: str) -> None:
+    """Validate that ``url`` has a recognized git scheme."""
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        raise MilpaError(
+            MAN_GIT_URL_NO_SCHEME,
+            f"dep {dep_name!r}: git URL {url!r} has no scheme "
+            "(expected https://, http://, ssh://, or git://)",
+            dep=dep_name,
+            url=url,
+        )
+    if parsed.scheme not in _VALID_GIT_SCHEMES:
+        raise MilpaError(
+            MAN_GIT_URL_BAD_SCHEME,
+            f"dep {dep_name!r}: git URL scheme {parsed.scheme!r} is not supported "
+            f"(allowed: {', '.join(sorted(_VALID_GIT_SCHEMES))})",
+            dep=dep_name,
+            scheme=parsed.scheme,
+        )
+
+
+def _parse_mirror_child(n: KdlNode, *, dep_name: str) -> str:
+    """Parse a ``mirror (url)"<URL>"`` child node.  Returns the URL string.
+
+    - No argument → ``MAN-DEP-MIRROR-ARITY``
+    - Argument present but not a string → ``MAN-URL-ARG-TYPE``
+    """
+    raw_args = node_args(n)
+    if not raw_args:
+        raise MilpaError(
+            MAN_DEP_MIRROR_ARITY,
+            f"dep {dep_name!r}: 'mirror' requires exactly one URL argument",
+            dep=dep_name,
+        )
+    url_v = node_arg_url(n, 0)
+    if url_v is None:
+        raise MilpaError(
+            MAN_URL_ARG_TYPE,
+            f"dep {dep_name!r}: 'mirror' URL argument must be a string, "
+            f"got {type(raw_args[0]).__name__!r}",
+            dep=dep_name,
+        )
+    return str(url_v)
+
+
+def _parse_flag_request_child(n: KdlNode, *, dep_name: str) -> FlagRequest:
+    """Parse a ``flag "<name>" [<bool>]`` child node on a UrlDep."""
+    raw_args = node_args(n)
+
+    if len(raw_args) == 0:
+        raise MilpaError(
+            MAN_DEP_FLAG_NAME_MISSING,
+            f"dep {dep_name!r}: 'flag' child requires a name argument",
+            dep=dep_name,
+        )
+
+    if len(raw_args) > 2:
+        raise MilpaError(
+            MAN_DEP_FLAG_TOO_MANY_ARGS,
+            f"dep {dep_name!r}: 'flag' takes at most two arguments "
+            "(name and optional bool)",
+            dep=dep_name,
+        )
+
+    flag_name = raw_args[0]
+    if not isinstance(flag_name, str):
+        raise MilpaError(
+            MAN_DEP_FLAG_NAME_MISSING,
+            f"dep {dep_name!r}: 'flag' first argument must be a string name",
+            dep=dep_name,
+        )
+
+    if len(raw_args) == 1:
+        return FlagRequest(name=flag_name, enabled=True)
+
+    # Second arg must be bool
+    second = raw_args[1]
+    if not isinstance(second, bool):
+        raise MilpaError(
+            MAN_DEP_FLAG_BOOL,
+            f"dep {dep_name!r}: 'flag' second argument must be a boolean "
+            f"(#true or #false), got {second!r}",
+            dep=dep_name,
+            flag=flag_name,
+        )
+    return FlagRequest(name=flag_name, enabled=second)
+
+
+def _parse_predicate_child(n: KdlNode, *, dep_name: str) -> Predicate:
+    """Parse a predicate child-node (multi-value OR form, §6.2).
+
+    All positional args MUST be strings; each MAY carry the ``(not)``
+    annotation (negation).  All args MUST agree on negation — mixing bare
+    and ``(not)``-annotated values raises ``MAN-PREDICATE-MIXED-NEGATION``.
+    A child node with NO args raises ``MAN-PREDICATE-CHILD-NO-ARGS``.
+    A non-string arg raises ``MAN-PREDICATE-CHILD-ARG-TYPE``.
+    """
+    pred_name = node_name(n)
+    raw_args = node_args(n)
+
+    if not raw_args:
+        raise MilpaError(
+            MAN_PREDICATE_CHILD_NO_ARGS,
+            f"dep {dep_name!r}: predicate child node {pred_name!r} "
+            "requires at least one value argument",
+            dep=dep_name,
+            predicate=pred_name,
+        )
+
+    values: list[str] = []
+    negation_flags: list[bool] = []
+
+    for i, v in enumerate(raw_args):
+        if not isinstance(v, str):
+            raise MilpaError(
+                MAN_PREDICATE_CHILD_ARG_TYPE,
+                f"dep {dep_name!r}: predicate {pred_name!r} arg {i} "
+                f"must be a string, got {type(v).__name__!r}",
+                dep=dep_name,
+                predicate=pred_name,
+            )
+        tag = node_arg_tag(n, i)
+        if tag is not None and tag != "not":
+            raise MilpaError(
+                MAN_PREDICATE_UNSUPPORTED_ANNOTATION,
+                f"dep {dep_name!r}: predicate {pred_name!r} arg {i} "
+                f"has unsupported type annotation {tag!r} (only '(not)' is allowed)",
+                dep=dep_name,
+                predicate=pred_name,
+            )
+        negation_flags.append(tag == "not")
+        values.append(v)
+
+    # Mixed-negation check: all must agree.
+    if len(set(negation_flags)) > 1:
+        raise MilpaError(
+            MAN_PREDICATE_MIXED_NEGATION,
+            f"dep {dep_name!r}: predicate {pred_name!r} mixes bare and "
+            "'(not)'-annotated values — all must be bare or all negated",
+            dep=dep_name,
+            predicate=pred_name,
+        )
+
+    return Predicate(
+        name=pred_name,
+        values=tuple(values),
+        negated=negation_flags[0],
+    )
+
+
+def _parse_inline_predicate(
+    n: KdlNode, prop_key: str, *, dep_name: str
+) -> Predicate:
+    """Parse an inline predicate property (single-value form, §6.1).
+
+    The value MUST be a string (bare or ``(not)``-annotated).  A non-string
+    value raises ``MAN-PREDICATE-VALUE-TYPE``.  An unsupported annotation
+    (anything other than ``(not)``) raises
+    ``MAN-PREDICATE-UNSUPPORTED-ANNOTATION``.
+    """
+    raw = node_props(n).get(prop_key)
+
+    # Check type annotation before checking value type.
+    tag = node_prop_tag(n, prop_key)
+    if tag is not None and tag != "not":
+        raise MilpaError(
+            MAN_PREDICATE_UNSUPPORTED_ANNOTATION,
+            f"dep {dep_name!r}: predicate property {prop_key!r} has "
+            f"unsupported type annotation {tag!r} (only '(not)' is allowed)",
+            dep=dep_name,
+            predicate=prop_key,
+        )
+
+    if not isinstance(raw, str):
+        raise MilpaError(
+            MAN_PREDICATE_VALUE_TYPE,
+            f"dep {dep_name!r}: predicate {prop_key!r} value must be a string, "
+            f"got {type(raw).__name__!r}",
+            dep=dep_name,
+            predicate=prop_key,
+        )
+
+    negated = tag == "not"
+    return Predicate(name=prop_key, values=(raw,), negated=negated)
+
+
+def _parse_inline_predicates_from_node(
+    n: KdlNode, *, dep_name: str
+) -> list[Predicate]:
+    """Parse all predicate properties from a node (e.g., a ``when`` node).
+
+    Validates predicate keys — unknown keys raise ``MAN-PREDICATE-UNKNOWN``.
+    Returns the list of parsed ``Predicate`` objects.
+    """
+    predicates: list[Predicate] = []
+    for prop_key in node_props(n):
+        if prop_key not in _PREDICATE_PROPS:
+            raise MilpaError(
+                MAN_PREDICATE_UNKNOWN,
+                f"dep {dep_name!r}: unknown predicate key {prop_key!r} "
+                f"(allowed: {', '.join(sorted(_PREDICATE_PROPS))})",
+                predicate=prop_key,
+            )
+        predicates.append(_parse_inline_predicate(n, prop_key, dep_name=dep_name))
+    return predicates
+
+
+def _parse_named_dep(n: KdlNode, *, dep_name: str) -> NamedDep:
+    """Parse a NamedDep (registry-resolved).
+
+    Grammar: ``<name>`` or ``<name> "<version-constraint>"``
+
+    The constraint string is pre-typed to ``VersionSet`` at this boundary.
+    """
+    raw_args = node_args(n)
+    props = node_props(n)
+
+    # Any property (other than git= which routes to UrlDep) is an error.
+    if props:
+        for prop_key in props:
+            raise MilpaError(
+                MAN_DEP_NAMED_PROPS,
+                f"dep {dep_name!r}: NamedDep does not accept properties "
+                f"(got {prop_key!r}); use 'git=' for a UrlDep",
+                dep=dep_name,
+                prop=prop_key,
+            )
+
+    if len(raw_args) > 1:
+        raise MilpaError(
+            MAN_DEP_NAMED_ARITY,
+            f"dep {dep_name!r}: NamedDep takes at most one positional argument "
+            "(the version constraint string)",
+            dep=dep_name,
+        )
+
+    if len(raw_args) == 0:
+        # No constraint — any version
+        return NamedDep(name=dep_name, constraint=None, constraint_set=None)
+
+    # Exactly one arg — must be a string constraint.
+    # A non-string arg (int, bool, etc.) → MAN-DEP-NAMED-CONSTRAINT.
+    arg = raw_args[0]
+    if not isinstance(arg, str):
+        raise MilpaError(
+            MAN_DEP_NAMED_CONSTRAINT,
+            f"dep {dep_name!r}: version constraint must be a string, "
+            f"got {type(arg).__name__!r}",
+            dep=dep_name,
+        )
+
+    # Pre-type: MilpaError(MAN_DEP_NAMED_CONSTRAINT) raised by __post_init__
+    # if the string is malformed.
+    return NamedDep(name=dep_name, constraint=arg)
+
+
+def _parse_local_dep(n: KdlNode, *, dep_name: str) -> LocalDep:
+    """Parse a LocalDep node.
+
+    Grammar: ``<name> local="<path>"``
+
+    The ``local=`` value must be a non-empty string.
+    No other properties are permitted.
+    """
+    props = node_props(n)
+
+    # Check for unknown properties (anything except "local")
+    for prop_key in props:
+        if prop_key != "local":
+            raise MilpaError(
+                MAN_DEP_UNKNOWN_PROPS,
+                f"dep {dep_name!r}: LocalDep does not accept property {prop_key!r}",
+                dep=dep_name,
+                prop=prop_key,
+            )
+
+    path = node_prop_str(n, "local")
+    if not path:
+        # Either absent (shouldn't happen — we checked), wrong type, or empty string.
+        raw = props.get("local")
+        if not isinstance(raw, str):
+            raise MilpaError(
+                MAN_DEP_LOCAL_PATH,
+                f"dep {dep_name!r}: 'local=' must be a non-empty string path",
+                dep=dep_name,
+            )
+        raise MilpaError(
+            MAN_DEP_LOCAL_PATH,
+            f"dep {dep_name!r}: 'local=' path must not be empty",
+            dep=dep_name,
+        )
+
+    return LocalDep(name=dep_name, path=path)
+
+
+def _parse_tarball_dep(n: KdlNode, *, dep_name: str) -> TarballDep:
+    """Parse a TarballDep node.
+
+    Grammar:
+        ``<name> tarball=(url)"<URL>" [sha256="<hex>"] [strip_components=<N>]``
+
+    ``tarball=`` must be a non-empty URL string (plain or ``(url)``-annotated).
+    ``sha256`` optional string; non-string raises MAN-DEP-TARBALL-SHA.
+    ``strip_components`` optional non-negative int; negative/non-int/bool
+    raises MAN-DEP-TARBALL-STRIP.
+    """
+    props = node_props(n)
+
+    # --- tarball= URL ---
+    tarball_url_v = node_prop_url(n, "tarball")
+    if tarball_url_v is None:
+        # Present but wrong type
+        raw = props.get("tarball")
+        if raw is not None:
+            raise MilpaError(
+                MAN_DEP_TARBALL_URL,
+                f"dep {dep_name!r}: 'tarball=' must be a URL string",
+                dep=dep_name,
+            )
+        raise MilpaError(
+            MAN_DEP_TARBALL_URL,
+            f"dep {dep_name!r}: 'tarball=' URL is missing",
+            dep=dep_name,
+        )
+    url = str(tarball_url_v)
+    if not url:
+        raise MilpaError(
+            MAN_DEP_TARBALL_URL,
+            f"dep {dep_name!r}: 'tarball=' URL must not be empty",
+            dep=dep_name,
+        )
+
+    # --- sha256 (optional) ---
+    sha256: str | None = None
+    if "sha256" in props:
+        sha256 = node_prop_str(n, "sha256")
+        if sha256 is None:
+            raise MilpaError(
+                MAN_DEP_TARBALL_SHA,
+                f"dep {dep_name!r}: 'sha256=' must be a string",
+                dep=dep_name,
+            )
+
+    # --- strip_components (optional, non-negative int) ---
+    strip_components: int = 0
+    if "strip_components" in props:
+        raw_strip = props.get("strip_components")
+        # Must NOT be a bool (bool is a subclass of int in Python).
+        if isinstance(raw_strip, bool):
+            raise MilpaError(
+                MAN_DEP_TARBALL_STRIP,
+                f"dep {dep_name!r}: 'strip_components=' must be a non-negative integer",
+                dep=dep_name,
+            )
+        strip_v = node_prop_int(n, "strip_components")
+        if strip_v is None:
+            raise MilpaError(
+                MAN_DEP_TARBALL_STRIP,
+                f"dep {dep_name!r}: 'strip_components=' must be a non-negative integer",
+                dep=dep_name,
+            )
+        if strip_v < 0:
+            raise MilpaError(
+                MAN_DEP_TARBALL_STRIP,
+                f"dep {dep_name!r}: 'strip_components=' must be non-negative, "
+                f"got {strip_v}",
+                dep=dep_name,
+                value=strip_v,
+            )
+        strip_components = strip_v
+
+    return TarballDep(
+        name=dep_name,
+        url=url,
+        sha256=sha256,
+        strip_components=strip_components,
+    )
+
+
+def _parse_overrides_block(block: KdlNode) -> list[Override]:
+    """Parse an ``overrides { }`` block.
+
+    Each child MUST be named ``pkg``.  Grammar:
+        ``pkg "<name>" git=(url)"<URL>" ref="<ref>"``
+
+    Error codes:
+    - Unknown child name → ``MAN-OVERRIDE-KIND``
+    - ``pkg`` with no positional arg (arity 0) or non-string arg → ``MAN-OVERRIDE-ARITY``
+    - Missing ``git=`` → ``MAN-OVERRIDE-GIT-MISSING``
+    - Missing ``ref=`` → ``MAN-OVERRIDE-REF-MISSING``
+    - Unknown property → ``MAN-OVERRIDE-UNKNOWN-PROPS``
+    - Duplicate name → ``MAN-OVERRIDE-DUPLICATE``
+    """
+    overrides: list[Override] = []
+    seen_names: set[str] = set()
+
+    for child in node_children(block):
+        child_nm = node_name(child)
+        if child_nm != "pkg":
+            raise MilpaError(
+                MAN_OVERRIDE_KIND,
+                f"unknown override kind {child_nm!r} — only 'pkg' is supported",
+                kind=child_nm,
+            )
+
+        raw_args = node_args(child)
+        if len(raw_args) != 1 or not isinstance(raw_args[0], str):
+            raise MilpaError(
+                MAN_OVERRIDE_ARITY,
+                "'pkg' override requires exactly one positional string argument "
+                "(the package name to match)",
+            )
+        pkg_name: str = raw_args[0]
+
+        # Check for unknown properties (only git= and ref= are allowed).
+        _OVERRIDE_KNOWN_PROPS = frozenset({"git", "ref"})
+        for prop_key in node_props(child):
+            if prop_key not in _OVERRIDE_KNOWN_PROPS:
+                raise MilpaError(
+                    MAN_OVERRIDE_UNKNOWN_PROPS,
+                    f"override for {pkg_name!r}: unknown property {prop_key!r} "
+                    "(allowed: 'git', 'ref')",
+                    name=pkg_name,
+                    prop=prop_key,
+                )
+
+        git_url_v = node_prop_url(child, "git")
+        if git_url_v is None:
+            raise MilpaError(
+                MAN_OVERRIDE_GIT_MISSING,
+                f"override for {pkg_name!r}: missing required 'git=' property",
+                name=pkg_name,
+            )
+        git_url = str(git_url_v)
+        _validate_git_url(git_url, pkg_name)
+
+        ref = node_prop_str(child, "ref")
+        if ref is None:
+            raise MilpaError(
+                MAN_OVERRIDE_REF_MISSING,
+                f"override for {pkg_name!r}: missing required 'ref=' property",
+                name=pkg_name,
+            )
+
+        if pkg_name in seen_names:
+            raise MilpaError(
+                MAN_OVERRIDE_DUPLICATE,
+                f"duplicate override for {pkg_name!r}",
+                name=pkg_name,
+            )
+        seen_names.add(pkg_name)
+        overrides.append(Override(name=pkg_name, git=git_url, ref=ref))
+
+    return overrides
+
+
+def _parse_mirrors_block(block: KdlNode) -> list[str]:
+    """Parse a top-level ``mirrors { }`` block.
+
+    Each child MUST be named ``mirror`` and carry exactly one URL argument.
+
+    Error codes:
+    - Unknown child name → ``MAN-MIRRORS-UNKNOWN-CHILD``
+    - Wrong arity or non-URL arg → ``MAN-MIRRORS-ARITY`` / ``MAN-URL-ARG-TYPE``
+    """
+    mirrors: list[str] = []
+
+    for child in node_children(block):
+        child_nm = node_name(child)
+        if child_nm != "mirror":
+            raise MilpaError(
+                MAN_MIRRORS_UNKNOWN_CHILD,
+                f"unknown child {child_nm!r} in 'mirrors' block "
+                "(only 'mirror' is allowed)",
+                child=child_nm,
+            )
+        raw_args = node_args(child)
+        if not raw_args:
+            raise MilpaError(
+                MAN_MIRRORS_ARITY,
+                "'mirrors.mirror' requires exactly one URL argument",
+            )
+        url_v = node_arg_url(child, 0)
+        if url_v is None:
+            raise MilpaError(
+                MAN_URL_ARG_TYPE,
+                f"'mirrors.mirror' URL argument must be a string, "
+                f"got {type(raw_args[0]).__name__!r}",
+            )
+        mirrors.append(str(url_v))
+
+    return mirrors
+
+
+def _parse_flags_block(block: KdlNode) -> list[FlagDecl]:
+    """Parse a ``flags { }`` block.
+
+    Each child is a flag declaration; the KDL identifier is the flag name.
+    Permitted properties: ``default`` (bool), ``description`` (string).
+    Optional child node: ``defines`` with one or more string args.
+
+    Error codes:
+    - Positional args on flag node → ``MAN-FLAG-POS-ARGS``
+    - ``default=`` non-bool → ``MAN-FLAG-DEFAULT-TYPE``
+    - ``description=`` non-string → ``MAN-FLAG-DESCRIPTION-TYPE``
+    - Unknown property → ``MAN-FLAG-UNKNOWN-PROPS``
+    - Unknown child node → ``MAN-FLAG-UNKNOWN-CHILD``
+    - Non-string ``defines`` arg → ``MAN-FLAG-DEFINES-ARG-TYPE``
+    - Duplicate flag name → ``MAN-FLAG-DUPLICATE``
+    """
+    flags: list[FlagDecl] = []
+    seen_names: set[str] = set()
+
+    for child in node_children(block):
+        flag_name = node_name(child)
+
+        # No positional args allowed on a flag node.
+        raw_args = node_args(child)
+        if raw_args:
+            raise MilpaError(
+                MAN_FLAG_POS_ARGS,
+                f"flag {flag_name!r}: flag declarations do not accept "
+                "positional arguments",
+                flag=flag_name,
+            )
+
+        # Validate properties.
+        _FLAG_KNOWN_PROPS = frozenset({"default", "description"})
+        for prop_key in node_props(child):
+            if prop_key not in _FLAG_KNOWN_PROPS:
+                raise MilpaError(
+                    MAN_FLAG_UNKNOWN_PROPS,
+                    f"flag {flag_name!r}: unknown property {prop_key!r} "
+                    "(allowed: 'default', 'description')",
+                    flag=flag_name,
+                    prop=prop_key,
+                )
+
+        # default= (optional bool, default False).
+        default: bool = False
+        if "default" in node_props(child):
+            default_v = node_prop_bool(child, "default")
+            if default_v is None:
+                raise MilpaError(
+                    MAN_FLAG_DEFAULT_TYPE,
+                    f"flag {flag_name!r}: 'default=' must be a boolean "
+                    "value (#true or #false)",
+                    flag=flag_name,
+                )
+            default = default_v
+
+        # description= (optional string).
+        description: str = ""
+        if "description" in node_props(child):
+            desc_v = node_prop_str(child, "description")
+            if desc_v is None:
+                raise MilpaError(
+                    MAN_FLAG_DESCRIPTION_TYPE,
+                    f"flag {flag_name!r}: 'description=' must be a string",
+                    flag=flag_name,
+                )
+            description = desc_v
+
+        # Child nodes: only ``defines`` is allowed.
+        defines: list[str] = []
+        for sub_child in node_children(child):
+            sub_nm = node_name(sub_child)
+            if sub_nm != "defines":
+                raise MilpaError(
+                    MAN_FLAG_UNKNOWN_CHILD,
+                    f"flag {flag_name!r}: unknown child node {sub_nm!r} "
+                    "(only 'defines' is allowed)",
+                    flag=flag_name,
+                    child=sub_nm,
+                )
+            for i, define_arg in enumerate(node_args(sub_child)):
+                if not isinstance(define_arg, str):
+                    raise MilpaError(
+                        MAN_FLAG_DEFINES_ARG_TYPE,
+                        f"flag {flag_name!r}: 'defines' argument {i} must be "
+                        f"a string, got {type(define_arg).__name__!r}",
+                        flag=flag_name,
+                    )
+                defines.append(define_arg)
+
+        # Duplicate check.
+        if flag_name in seen_names:
+            raise MilpaError(
+                MAN_FLAG_DUPLICATE,
+                f"duplicate flag declaration {flag_name!r}",
+                flag=flag_name,
+            )
+        seen_names.add(flag_name)
+        flags.append(
+            FlagDecl(
+                name=flag_name,
+                default=default,
+                description=description,
+                defines=tuple(defines),
+            )
+        )
+
+    return flags
+
+
+def _parse_member_dep(n: KdlNode) -> MemberDep:
+    """Parse a ``member "<name>"`` node.
+
+    The node name is the literal keyword ``member``.  Requires exactly
+    one positional string argument (the member's intrinsic name).
+    Properties are not allowed.
+    """
+    props = node_props(n)
+    if props:
+        first_prop = next(iter(props))
+        raise MilpaError(
+            MAN_DEP_MEMBER_PROPS,
+            f"'member' node does not accept properties (got {first_prop!r})",
+            prop=first_prop,
+        )
+
+    raw_args = node_args(n)
+    if len(raw_args) != 1 or not isinstance(raw_args[0], str):
+        raise MilpaError(
+            MAN_DEP_MEMBER_ARITY,
+            "'member' takes exactly one positional string argument "
+            "(the workspace member's intrinsic name)",
+        )
+
+    return MemberDep(name=raw_args[0])
+
+
+# ---------------------------------------------------------------------------
+# Internal — spec-version node parser (shared by package + workspace)
+# ---------------------------------------------------------------------------
+
+
+def _parse_spec_version_node(n: KdlNode) -> int:
+    """Parse a ``spec-version <int>`` node and return the epoch integer.
+
+    Validates arity and type per §4.4.  Does NOT enforce the
+    MANIFEST_SPEC_VERSION ceiling — callers do that after receiving the
+    epoch.
+    """
+    raw_args = node_args(n)
+    if len(raw_args) != 1:
+        raise MilpaError(
+            MAN_SPEC_VERSION_TYPE,
+            "'spec-version' takes exactly one positive integer argument",
+        )
+    epoch = raw_args[0]
+    # Must be an integer (not bool, not float that's non-integer)
+    if isinstance(epoch, bool):
+        raise MilpaError(
+            MAN_SPEC_VERSION_TYPE,
+            f"'spec-version' argument must be a positive integer, got bool {epoch!r}",
+        )
+    if isinstance(epoch, float) and epoch == int(epoch):
+        epoch = int(epoch)
+    if not isinstance(epoch, int) or isinstance(epoch, bool):
+        raise MilpaError(
+            MAN_SPEC_VERSION_TYPE,
+            f"'spec-version' argument must be a positive integer, "
+            f"got {type(epoch).__name__!r}",
+        )
+    if epoch < 1:
+        raise MilpaError(
+            MAN_SPEC_VERSION_TYPE,
+            f"'spec-version' must be >= 1, got {epoch}",
+            value=epoch,
+        )
+    if epoch > MANIFEST_SPEC_VERSION:
+        raise MilpaError(
+            MAN_SPEC_VERSION_UNSUPPORTED,
+            f"manifest declares spec-version {epoch} but this "
+            f"implementation only supports up to "
+            f"spec-version {MANIFEST_SPEC_VERSION}",
+            declared=epoch,
+            supported=MANIFEST_SPEC_VERSION,
+        )
+    return epoch
+
+
+# ---------------------------------------------------------------------------
+# Serializer — format_manifest (hand-rolled canonical KDL 2.0)
+# ---------------------------------------------------------------------------
+
+_COMMENT_WARNING = (
+    "warning: milpa.kdl comments are not preserved when the manifest is rewritten\n"
+)
+
+_MANIFEST_HEADER = (
+    "// generated by milpa; edit by hand or via `milpa add` / `milpa remove`"
+)
+
+
+def _kdl_str(s: str) -> str:
+    """Escape a string for KDL 2.0 double-quoted form.
+
+    Handles the characters that KDL requires escaping inside double-quoted
+    strings: backslash, double-quote, and the C0 control characters that
+    appear in practice.
+    """
+    return (
+        s
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+
+
+def format_manifest(manifest: Manifest) -> str:
+    """Serialize a ``Manifest`` to a KDL 2.0 string.
+
+    Hand-rolled canonical format — byte-identical to the Rust
+    ``milpa-manifest::format_manifest``.
+
+    Spec requirements (§8 + §2 + §4.4):
+    - Starts with ``// generated by milpa; edit by hand or via ...`` header.
+    - All URL-valued fields carry the ``(url)`` type annotation (§2).
+    - ``spec-version`` is emitted iff ``manifest.spec_version_explicit``
+      (§4.4 present-stays-present / absent-stays-absent).
+    - Dep-entry order is insertion-stable (§8).
+    - ``kind`` is always last (Rust canonical ordering).
+    - If ``manifest.had_comments`` is ``True``, a warning is emitted to
+      stderr before returning (§8).
+
+    Returns the serialized KDL 2.0 string (always ends with a newline).
+    """
+    if manifest.had_comments:
+        sys.stderr.write(_COMMENT_WARNING)
+
     lines: list[str] = [_MANIFEST_HEADER, ""]
-    if m.spec_version_explicit:
-        lines.append(f"spec-version {m.spec_version}")
+
+    # spec-version — present/absent round-trip (§4.4).
+    if manifest.spec_version_explicit:
+        lines.append(f"spec-version {manifest.spec_version}")
         lines.append("")
-    if m.name is not None:
-        lines.append(f'name "{m.name}"')
+
+    # name (required)
+    lines.append(f'name "{_kdl_str(manifest.name)}"')
+    lines.append("")
+
+    # src_dir (only when non-empty)
+    if manifest.src_dir:
+        lines.append(f'src_dir "{_kdl_str(manifest.src_dir)}"')
         lines.append("")
-    if m.src_dir:
-        lines.append(f'src_dir "{m.src_dir}"')
-        lines.append("")
-    if m.cas_dir:
+
+    # cas { dir "..." }
+    if manifest.cas_dir:
         lines.append("cas {")
-        lines.append(f'    dir "{m.cas_dir}"')
+        lines.append(f'    dir "{_kdl_str(manifest.cas_dir)}"')
         lines.append("}")
         lines.append("")
-    if m.deps:
+
+    # deps { ... }
+    if manifest.deps:
         lines.append("deps {")
-        for dep in m.deps:
+        for dep in manifest.deps:
             lines.append(_format_dep_line(dep))
         lines.append("}")
         lines.append("")
-    if m.dev_deps:
+
+    # dev-deps { ... }
+    if manifest.dev_deps:
         lines.append("dev-deps {")
-        for dep in m.dev_deps:
+        for dep in manifest.dev_deps:
             lines.append(_format_dep_line(dep))
         lines.append("}")
         lines.append("")
-    if m.overrides:
+
+    # overrides { pkg "name" git=(url)"..." ref="..." }
+    if manifest.overrides:
         lines.append("overrides {")
-        for ov in m.overrides:
+        for ov in manifest.overrides:
             lines.append(
-                f'    pkg {_quote_name(ov.name)} '
-                f'git=(url)"{ov.git}" ref="{ov.ref}"'
+                f'    pkg "{_kdl_str(ov.name)}"'
+                f' git=(url)"{_kdl_str(ov.git)}"'
+                f' ref="{_kdl_str(ov.ref)}"'
             )
         lines.append("}")
         lines.append("")
-    if m.self_mirrors:
+
+    # mirrors { mirror (url)"..." ... }
+    if manifest.self_mirrors:
         lines.append("mirrors {")
-        for url in m.self_mirrors:
-            lines.append(f'    mirror (url)"{url}"')
+        for url in manifest.self_mirrors:
+            lines.append(f'    mirror (url)"{_kdl_str(url)}"')
         lines.append("}")
         lines.append("")
-    if m.flags:
+
+    # flags { "<name>" default=#true/#false ... }
+    if manifest.flags:
         lines.append("flags {")
-        for fd in m.flags:
-            parts = [f'    {_quote_name(fd.name)}']
-            if fd.default:
-                parts.append("default=true")
-            else:
-                parts.append("default=false")
+        for fd in manifest.flags:
+            default_kw = "#true" if fd.default else "#false"
+            head = f'    "{_kdl_str(fd.name)}" default={default_kw}'
             if fd.description:
-                parts.append(f'description="{fd.description}"')
-            if fd.defines:
-                # Multi-line: head then defines child node
-                lines.append(" ".join(parts) + " {")
-                args = " ".join(f'"{d}"' for d in fd.defines)
-                lines.append(f"        defines {args}")
-                lines.append("    }")
+                head += f' description="{_kdl_str(fd.description)}"'
+            if not fd.defines:
+                lines.append(head)
             else:
-                lines.append(" ".join(parts))
+                defines_args = " ".join(f'"{_kdl_str(d)}"' for d in fd.defines)
+                lines.append(f"{head} {{")
+                lines.append(f"        defines {defines_args}")
+                lines.append("    }")
         lines.append("}")
         lines.append("")
-    lines.append(f'kind "{m.kind}"')
+
+    # kind — always last (Rust canonical ordering)
+    lines.append(f'kind "{_kdl_str(manifest.kind)}"')
+
     return "\n".join(lines) + "\n"
 
 
 def _format_dep_line(dep: Dep) -> str:
-    """One deps-block child as a single KDL line (or multi-line block
-    when the dep has children — e.g. mirrors on a UrlDep)."""
-    if isinstance(dep, UrlDep):
-        head = (
-            f'    {_quote_name(dep.name)} '
-            f'git=(url)"{dep.git}" ref="{dep.ref}"'
-        )
-        # Single-value predicates emit inline; multi-value predicates
-        # emit as child nodes (#88). Negation: (not) annotation on the
-        # value (inline) or on every arg (child).
-        inline_preds = [p for p in dep.predicates if len(p.values) == 1]
-        child_preds = [p for p in dep.predicates if len(p.values) > 1]
-        for pred in inline_preds:
-            v = pred.values[0]
-            if pred.negated:
-                head += f' {pred.name}=(not)"{v}"'
-            else:
-                head += f' {pred.name}="{v}"'
+    """Render one dep as a KDL line (or multi-line block) inside a deps { } block.
 
-        if not dep.mirrors and not child_preds and not dep.flag_requests:
-            return head
+    Matches the Rust ``format_dep_line`` byte-for-byte.
 
-        lines = [head + " {"]
-        for pred in child_preds:
-            args = " ".join(
-                f'(not)"{v}"' if pred.negated else f'"{v}"'
-                for v in pred.values
-            )
-            lines.append(f'        {pred.name} {args}')
-        for url in dep.mirrors:
-            lines.append(f'        mirror (url)"{url}"')
-        for fr in dep.flag_requests:
-            if fr.enabled:
-                lines.append(f'        flag "{fr.name}"')
-            else:
-                lines.append(f'        flag "{fr.name}" false')
-        lines.append("    }")
-        return "\n".join(lines)
-    if isinstance(dep, LocalDep):
-        return f'    {_quote_name(dep.name)} local="{dep.path}"'
+    Indentation: 4 spaces for dep-level, 8 spaces for child nodes inside a
+    URL dep block.
+    """
     if isinstance(dep, MemberDep):
-        return f'    member "{dep.name}"'
+        return f'    member "{_kdl_str(dep.name)}"'
+
+    if isinstance(dep, NamedDep):
+        if dep.constraint is None:
+            return f'    "{_kdl_str(dep.name)}"'
+        return f'    "{_kdl_str(dep.name)}" "{_kdl_str(dep.constraint)}"'
+
+    if isinstance(dep, LocalDep):
+        return f'    "{_kdl_str(dep.name)}" local="{_kdl_str(dep.path)}"'
+
     if isinstance(dep, TarballDep):
-        # Only emit non-default properties — keeps minimal-form
-        # manifests round-trip-stable without sha256/strip noise.
         parts = [
-            f'    {_quote_name(dep.name)}',
-            f'tarball=(url)"{dep.url}"',
+            f'    "{_kdl_str(dep.name)}"',
+            f'tarball=(url)"{_kdl_str(dep.url)}"',
         ]
         if dep.sha256 is not None:
-            parts.append(f'sha256="{dep.sha256}"')
+            parts.append(f'sha256="{_kdl_str(dep.sha256)}"')
         if dep.strip_components != 0:
-            parts.append(f'strip_components={dep.strip_components}')
+            parts.append(f"strip_components={dep.strip_components}")
         return " ".join(parts)
-    # NamedDep
-    if dep.constraint is None:
-        return f'    {_quote_name(dep.name)}'
-    return f'    {_quote_name(dep.name)} "{dep.constraint}"'
 
+    # UrlDep
+    assert isinstance(dep, UrlDep)
 
-def format_workspace(w: WorkspaceManifest) -> str:
-    """Render a WorkspaceManifest to milpa.kdl text. Counterpart of
-    parse_workspace_or_manifest for the workspace branch."""
-    lines: list[str] = [_MANIFEST_HEADER, ""]
-    lines.append("workspace {")
-    for member in w.members:
-        lines.append(f'    member "{member}"')
-    lines.append("}")
-    return "\n".join(lines) + "\n"
+    # Split predicates: inline (single value) vs child-node (multi-value).
+    inline_preds = [p for p in dep.predicates if len(p.values) == 1]
+    child_preds = [p for p in dep.predicates if len(p.values) > 1]
 
-
-def _quote_name(name: str) -> str:
-    """Names always emitted as quoted strings — safe for any value
-    (alphanumeric stays parseable as a bare identifier OR a quoted
-    string, so we pick quoted for uniformity)."""
-    return f'"{name}"'
-
-
-def _parse_dep(node: kdl.Node) -> Dep:
-    """Validate and convert one child of the `deps` block.
-
-    Disambiguation: a child with `git=` property is a UrlDep; without
-    it, it's a NamedDep (registry-resolved). Named deps may carry zero
-    or one positional string argument for the version constraint.
-
-    Examples:
-        chronos git=(url)"..." ref="main"   → UrlDep
-        results                              → NamedDep(name, constraint=None)
-        stew ">= 0.5.0"                      → NamedDep(name, constraint=">= 0.5.0")
-    """
-    # `member "<name>"` is the workspace-internal dep form (symmetric
-    # with `pkg "<name>"` in overrides). KDL doesn't allow bare-
-    # identifier args, so a reserved leading keyword is the cleanest
-    # way to disambiguate from NamedDep.
-    if node.name == "member":
-        return _parse_member_dep(node)
-    if "git" in node.props:
-        return _parse_url_dep(node)
-    if "local" in node.props:
-        return _parse_local_dep(node)
-    if "tarball" in node.props:
-        return _parse_tarball_dep(node)
-    return _parse_named_dep(node)
-
-
-def _parse_url_dep(node: kdl.Node) -> UrlDep:
-    """Validate and convert a URL-shaped dep child."""
-    name = node.name
-    extra = set(node.props.keys()) - _URL_DEP_PROPS
-    if extra:
-        unknown = ", ".join(repr(p) for p in sorted(extra))
-        allowed = ", ".join(sorted(_URL_DEP_PROPS))
-        raise ManifestError(
-            f"dep {name!r}: unknown property/properties {unknown} "
-            f"(allowed: {allowed})",
-            code="MAN-DEP-UNKNOWN-PROPS",
-        )
-    if "ref" not in node.props:
-        raise ManifestError(
-            f"dep {name!r}: missing required property 'ref'",
-            code="MAN-DEP-REF-MISSING",
-        )
-    # `git` may be a plain str or a ParseResult (when written with the
-    # `(url)` KDL type annotation, kdl-py auto-converts). Normalize to
-    # str via the strict helper so UrlDep is shape-stable regardless of
-    # annotation choice; an unexpected type raises ManifestError.
-    git = _url_arg(f"dep {name!r}", "git", node.props["git"])
-    _validate_git_url(name, git)
-    mirrors, child_preds, flag_requests = _parse_url_dep_children(name, node)
-    inline_preds = _parse_predicates(name, node)
-    predicates = _merge_predicates(name, inline_preds, child_preds)
-    return UrlDep(
-        name=name, git=git, ref=node.props["ref"],
-        mirrors=mirrors, predicates=predicates,
-        flag_requests=flag_requests,
+    head = (
+        f'    "{_kdl_str(dep.name)}"'
+        f' git=(url)"{_kdl_str(dep.git)}"'
+        f' ref="{_kdl_str(dep.ref)}"'
     )
-
-
-def _url_arg(context: str, field: str, raw) -> str:
-    """Normalize a URL argument: accepts either a bare string (legacy)
-    or a urllib ParseResult (from KDL's `(url)` type annotation).
-    Always returns the URL as a string."""
-    if isinstance(raw, ParseResult):
-        return raw.geturl()
-    if isinstance(raw, str):
-        return raw
-    raise ManifestError(
-        f"{context}: {field!r} expects a URL string "
-        f"(plain or (url)-annotated); got {type(raw).__name__}",
-        code="MAN-URL-ARG-TYPE",
-    )
-
-
-def _parse_url_dep_children(
-    dep_name: str, node: kdl.Node,
-) -> tuple[tuple[str, ...], tuple[Predicate, ...], tuple[FlagRequest, ...]]:
-    """Split a UrlDep's child nodes into (mirror URLs, predicate
-    child nodes, flag requests). Unknown children raise."""
-    mirrors: list[str] = []
-    child_preds: list[Predicate] = []
-    flag_requests: list[FlagRequest] = []
-    for child in node.nodes:
-        if child.name == "mirror":
-            if len(child.args) != 1:
-                raise ManifestError(
-                    f"dep {dep_name!r}: 'mirror' takes exactly one "
-                    f"positional argument (the URL)",
-                    code="MAN-DEP-MIRROR-ARITY",
-                )
-            mirrors.append(_url_arg(dep_name, "mirror", child.args[0]))
-        elif child.name == "flag":
-            flag_requests.append(_parse_flag_request(dep_name, child))
-        elif child.name in _PREDICATE_PROPS:
-            child_preds.append(
-                _parse_predicate_child_node(f"dep {dep_name!r}", child),
-            )
+    for pred in inline_preds:
+        val = pred.values[0]
+        if pred.negated:
+            head += f' {pred.name}=(not)"{_kdl_str(val)}"'
         else:
-            raise ManifestError(
-                f"dep {dep_name!r}: unknown child node {child.name!r} "
-                f"(allowed: 'mirror', 'flag', or a predicate child node — "
-                f"{', '.join(sorted(_PREDICATE_PROPS))})",
-                code="MAN-DEP-UNKNOWN-CHILD",
-            )
-    return tuple(mirrors), tuple(child_preds), tuple(flag_requests)
-
-
-def _parse_flag_request(dep_name: str, node: kdl.Node) -> FlagRequest:
-    """Parse a consumer flag request on a dep.
-
-    Grammar:
-      flag "name"           # enable
-      flag "name" true      # enable (explicit)
-      flag "name" false     # opt out (overrides default-true)
-    """
-    if len(node.args) < 1 or not isinstance(node.args[0], str):
-        raise ManifestError(
-            f"dep {dep_name!r}: 'flag' requires a quoted name as the "
-            f"first positional argument",
-            code="MAN-DEP-FLAG-NAME-MISSING",
-        )
-    if len(node.args) > 2:
-        raise ManifestError(
-            f"dep {dep_name!r}: 'flag' takes at most two args "
-            f"(name, optional bool)",
-            code="MAN-DEP-FLAG-TOO-MANY-ARGS",
-        )
-    name = node.args[0]
-    enabled = True
-    if len(node.args) == 2:
-        v = node.args[1]
-        if not isinstance(v, bool):
-            raise ManifestError(
-                f"dep {dep_name!r}: 'flag {name!r}' second arg must be "
-                f"a boolean",
-                code="MAN-DEP-FLAG-BOOL",
-            )
-        enabled = v
-    return FlagRequest(name=name, enabled=enabled)
-
-
-def _merge_predicates(
-    dep_name: str,
-    inline: tuple[Predicate, ...],
-    child: tuple[Predicate, ...],
-) -> tuple[Predicate, ...]:
-    """Combine inline-form + child-node-form predicates. Reject if the
-    same predicate name appears in BOTH forms — that's ambiguous; the
-    user should pick one form per predicate."""
-    inline_names = {p.name for p in inline}
-    child_names = {p.name for p in child}
-    overlap = inline_names & child_names
-    if overlap:
-        names = ", ".join(sorted(overlap))
-        raise ManifestError(
-            f"dep {dep_name!r}: predicate(s) {names} declared in both "
-            f"inline form (e.g. {next(iter(overlap))}=\"...\") and "
-            f"child-node form ({{ {next(iter(overlap))} ... }}) — "
-            f"pick one form per predicate",
-            code="MAN-PREDICATE-FORM-CONFLICT",
-        )
-    # Canonical order: sort by predicate name so structural equality
-    # holds regardless of which form (inline / child) the user chose
-    # for each predicate.
-    return tuple(sorted(inline + child, key=lambda p: p.name))
-
-
-def _expand_dep_child(child: kdl.Node, *, inherited_preds: tuple[Predicate, ...]):
-    """Yield one or more Dep values from a child of the `deps {}` block.
-
-    A plain dep node yields itself (with inherited predicates appended).
-    A `when` block yields each of its children with the block's
-    predicates added to those inherited from any outer context.
-    Block + inline predicates compose with AND."""
-    if child.name == "when":
-        block_preds = _parse_predicates_from_props(
-            "<when block>", child.props,
-        )
-        all_preds = inherited_preds + block_preds
-        for grandchild in child.nodes:
-            yield from _expand_dep_child(grandchild, inherited_preds=all_preds)
-        return
-    dep = _parse_dep(child)
-    if inherited_preds and isinstance(dep, UrlDep):
-        from dataclasses import replace as dc_replace
-        dep = dc_replace(dep, predicates=inherited_preds + dep.predicates)
-    yield dep
-
-
-def _parse_predicates_from_props(
-    context: str, props,
-) -> tuple[Predicate, ...]:
-    """Shared predicate parser — works on a kdl.Node's props OR any
-    mapping. Used by both inline dep predicates and when blocks.
-
-    Single value per prop (KDL has no array value type). For OR
-    semantics use the child-node form (#88) which goes through
-    _parse_predicate_child_node."""
-    preds: list[Predicate] = []
-    for key, val in props.items():
-        if key not in _PREDICATE_PROPS:
-            raise ManifestError(
-                f"{context}: unknown predicate {key!r} "
-                f"(allowed: {', '.join(sorted(_PREDICATE_PROPS))})",
-                code="MAN-PREDICATE-UNKNOWN",
-            )
-        tag = getattr(val, "tag", None)
-        actual = getattr(val, "value", val)
-        if not isinstance(actual, str):
-            raise ManifestError(
-                f"{context}: predicate {key!r} value must be a string",
-                code="MAN-PREDICATE-VALUE-TYPE",
-            )
-        negated = (tag == "not")
-        if tag is not None and not negated:
-            raise ManifestError(
-                f"{context}: predicate {key!r} unsupported "
-                f"type annotation ({tag!r}); only (not) is recognized",
-                code="MAN-PREDICATE-UNSUPPORTED-ANNOTATION",
-            )
-        preds.append(Predicate(name=key, values=(actual,), negated=negated))
-    return tuple(preds)
-
-
-def _parse_predicate_child_node(
-    context: str, child: kdl.Node,
-) -> Predicate:
-    """Parse a predicate expressed as a child node with positional args
-    (e.g., `platform \"linux\" \"macosx\"` ≡ OR over those values).
-
-    Per-arg (not) annotations are honored: ALL args must agree on
-    negation. Mixing (some bare, some (not)) is rejected as ambiguous."""
-    if child.name not in _PREDICATE_PROPS:
-        raise ManifestError(
-            f"{context}: unknown predicate {child.name!r} as child node "
-            f"(allowed: {', '.join(sorted(_PREDICATE_PROPS))})",
-            code="MAN-PREDICATE-UNKNOWN",
-        )
-    if not child.args:
-        raise ManifestError(
-            f"{context}: predicate child node {child.name!r} requires "
-            f"at least one positional argument",
-            code="MAN-PREDICATE-CHILD-NO-ARGS",
-        )
-    values: list[str] = []
-    negations: list[bool] = []
-    for a in child.args:
-        tag = getattr(a, "tag", None)
-        actual = getattr(a, "value", a)
-        if not isinstance(actual, str):
-            raise ManifestError(
-                f"{context}: predicate {child.name!r} arg must be a string",
-                code="MAN-PREDICATE-CHILD-ARG-TYPE",
-            )
-        neg = (tag == "not")
-        if tag is not None and not neg:
-            raise ManifestError(
-                f"{context}: predicate {child.name!r} unsupported "
-                f"type annotation ({tag!r}); only (not) is recognized",
-                code="MAN-PREDICATE-UNSUPPORTED-ANNOTATION",
-            )
-        values.append(actual)
-        negations.append(neg)
-    if len(set(negations)) > 1:
-        raise ManifestError(
-            f"{context}: predicate {child.name!r} mixes (not) and bare "
-            f"args — all args must agree on negation",
-            code="MAN-PREDICATE-MIXED-NEGATION",
-        )
-    return Predicate(
-        name=child.name, values=tuple(values), negated=negations[0],
-    )
-
-
-def _parse_predicates(dep_name: str, node: kdl.Node) -> tuple[Predicate, ...]:
-    """Extract predicate props from a UrlDep node. Predicates are the
-    subset of props whose names are in _PREDICATE_PROPS; non-predicate
-    props (git, ref) are silently ignored here (they're handled
-    separately)."""
-    pred_props = {k: v for k, v in node.props.items() if k in _PREDICATE_PROPS}
-    return _parse_predicates_from_props(f"dep {dep_name!r}", pred_props)
-
-
-_LOCAL_DEP_PROPS = frozenset({"local"})
-
-
-def _parse_local_dep(node: kdl.Node) -> LocalDep:
-    """Validate and convert a local-path dep child.
-
-    Grammar: `<name> local="<path>"`. The path string is preserved
-    verbatim; relative-to-project resolution happens in the resolver.
-    """
-    name = node.name
-    extra = set(node.props.keys()) - _LOCAL_DEP_PROPS
-    if extra:
-        unknown = ", ".join(repr(p) for p in sorted(extra))
-        raise ManifestError(
-            f"dep {name!r}: unknown property/properties {unknown} "
-            f"on a local dep (allowed: 'local')",
-            code="MAN-DEP-UNKNOWN-PROPS",
-        )
-    path = node.props["local"]
-    if not isinstance(path, str) or not path:
-        raise ManifestError(
-            f"dep {name!r}: 'local' property must be a non-empty string path",
-            code="MAN-DEP-LOCAL-PATH",
-        )
-    return LocalDep(name=name, path=path)
-
-
-_TARBALL_DEP_PROPS = frozenset({"tarball", "sha256", "strip_components"})
-
-
-def _parse_tarball_dep(node: kdl.Node) -> TarballDep:
-    """Validate and convert a tarball-form dep child.
-
-    Grammar: `<name> tarball="<URL>" [sha256="<hex>"] [strip_components=<N>]`
-
-    `sha256` is optional (TOFU on first fetch; lockfile pins
-    thereafter). `strip_components` defaults to 0; set to 1 for
-    GitHub-auto-generated tarballs that wrap content in `<repo>-<sha>/`.
-    """
-    name = node.name
-    extra = set(node.props.keys()) - _TARBALL_DEP_PROPS
-    if extra:
-        unknown = ", ".join(repr(p) for p in sorted(extra))
-        allowed = ", ".join(sorted(_TARBALL_DEP_PROPS))
-        raise ManifestError(
-            f"dep {name!r}: unknown property/properties {unknown} "
-            f"on a tarball dep (allowed: {allowed})",
-            code="MAN-DEP-UNKNOWN-PROPS",
-        )
-    # `tarball` may be a plain str or a (url)-annotated ParseResult;
-    # _url_arg normalizes and raises ManifestError on unexpected types.
-    url = _url_arg(f"dep {name!r}", "tarball", node.props["tarball"])
-    if not url:
-        raise ManifestError(
-            f"dep {name!r}: 'tarball' must be a non-empty URL string",
-            code="MAN-DEP-TARBALL-URL",
-        )
-
-    sha256 = node.props.get("sha256")
-    if sha256 is not None and not isinstance(sha256, str):
-        raise ManifestError(
-            f"dep {name!r}: 'sha256' must be a string when provided",
-            code="MAN-DEP-TARBALL-SHA",
-        )
-
-    strip_raw = node.props.get("strip_components", 0)
-    # kdl-py parses bare numeric literals as float; accept ints or
-    # integer-valued floats.
-    if isinstance(strip_raw, float) and strip_raw.is_integer():
-        strip_raw = int(strip_raw)
-    if not isinstance(strip_raw, int) or isinstance(strip_raw, bool) or strip_raw < 0:
-        raise ManifestError(
-            f"dep {name!r}: 'strip_components' must be a non-negative integer",
-            code="MAN-DEP-TARBALL-STRIP",
-        )
-
-    return TarballDep(
-        name=name,
-        url=url,
-        sha256=sha256,
-        strip_components=strip_raw,
-    )
-
-
-def _parse_member_dep(node: kdl.Node) -> MemberDep:
-    """Validate and convert a workspace-internal member dep.
-
-    Grammar: `member "<name>"`. Exactly one positional string
-    argument (the member name); no properties.
-    """
-    if node.props:
-        unknown = ", ".join(repr(p) for p in sorted(node.props.keys()))
-        raise ManifestError(
-            f"'member' dep takes no properties (got {unknown})",
-            code="MAN-DEP-MEMBER-PROPS",
-        )
-    if len(node.args) != 1 or not isinstance(node.args[0], str):
-        raise ManifestError(
-            "'member' dep takes exactly one positional string argument "
-            "(the workspace-member name)",
-            code="MAN-DEP-MEMBER-ARITY",
-        )
-    return MemberDep(name=node.args[0])
-
-
-def _parse_named_dep(node: kdl.Node) -> NamedDep:
-    """Validate and convert a named (registry-resolved) dep child.
-
-    Grammar: `<name> [<constraint-string>]`. Zero or one positional
-    string argument. No properties (any property other than `git=`,
-    which would route to URL path, is an error).
-    """
-    name = node.name
-    if node.props:
-        unknown = ", ".join(repr(p) for p in sorted(node.props.keys()))
-        raise ManifestError(
-            f"dep {name!r}: unknown property/properties {unknown} "
-            f"on a named dep (a URL dep must declare 'git=...'; "
-            f"a named dep takes only a positional version constraint)",
-            code="MAN-DEP-NAMED-PROPS",
-        )
-    if len(node.args) == 0:
-        return NamedDep(name=name, constraint=None)
-    if len(node.args) == 1:
-        constraint = node.args[0]
-        if not isinstance(constraint, str):
-            raise ManifestError(
-                f"dep {name!r}: version constraint must be a quoted string",
-                code="MAN-DEP-NAMED-CONSTRAINT",
-            )
-        # __post_init__ parses the constraint and raises ManifestError on
-        # malformed input; no duplicate parse here. Construction is the single
-        # source of truth for validation.
-        return NamedDep(name=name, constraint=constraint)
-    raise ManifestError(
-        f"dep {name!r}: named deps take at most one positional argument "
-        f"(the version constraint); got {len(node.args)}",
-        code="MAN-DEP-NAMED-ARITY",
-    )
-
-
-_FLAG_DECL_PROPS = frozenset({"default", "description"})
-
-
-def _parse_flag_decl(node: kdl.Node) -> FlagDecl:
-    """Parse one child of the `flags { ... }` block.
-
-    Grammar:
-      <name> [default=<bool>] [description="..."] [{ defines "X" "Y" }]
-
-    The node's identifier is the flag name. `defines` (a child node)
-    overrides the convention `-d:<package>_<flag>` emission."""
-    name = node.name
-    if node.args:
-        raise ManifestError(
-            f"flag {name!r}: positional args not allowed "
-            f"(use props: default=<bool>, description=\"...\")",
-            code="MAN-FLAG-POS-ARGS",
-        )
-    extra = set(node.props.keys()) - _FLAG_DECL_PROPS
-    if extra:
-        unknown = ", ".join(repr(p) for p in sorted(extra))
-        allowed = ", ".join(sorted(_FLAG_DECL_PROPS))
-        raise ManifestError(
-            f"flag {name!r}: unknown property/properties {unknown} "
-            f"(allowed: {allowed})",
-            code="MAN-FLAG-UNKNOWN-PROPS",
-        )
-    default_raw = node.props.get("default", False)
-    if not isinstance(default_raw, bool):
-        raise ManifestError(
-            f"flag {name!r}: 'default' must be a boolean",
-            code="MAN-FLAG-DEFAULT-TYPE",
-        )
-    description_raw = node.props.get("description", "")
-    if not isinstance(description_raw, str):
-        raise ManifestError(
-            f"flag {name!r}: 'description' must be a string",
-            code="MAN-FLAG-DESCRIPTION-TYPE",
-        )
-    defines: list[str] = []
-    for child in node.nodes:
-        if child.name != "defines":
-            raise ManifestError(
-                f"flag {name!r}: unknown child node {child.name!r} "
-                f"(allowed: 'defines')",
-                code="MAN-FLAG-UNKNOWN-CHILD",
-            )
-        for a in child.args:
-            if not isinstance(a, str):
-                raise ManifestError(
-                    f"flag {name!r}: 'defines' args must be strings",
-                    code="MAN-FLAG-DEFINES-ARG-TYPE",
-                )
-            defines.append(a)
-    return FlagDecl(
-        name=name,
-        default=default_raw,
-        description=description_raw,
-        defines=tuple(defines),
-    )
-
-
-def _parse_override(node: kdl.Node) -> Override:
-    """Validate and convert one child of the `overrides` block.
-
-    Grammar (v0.x — pkg form only):
-      pkg "<name>" git=(url)"<URL>" ref="<git-ref>"
-
-    The first positional arg is the match name. The git= and ref=
-    properties carry the substitute provenance.
-    """
-    if node.name != "pkg":
-        raise ManifestError(
-            f"unknown override kind {node.name!r} "
-            f"(supported: 'pkg')",
-            code="MAN-OVERRIDE-KIND",
-        )
-    if len(node.args) != 1 or not isinstance(node.args[0], str):
-        raise ManifestError(
-            "pkg override takes one positional argument (the dep name)",
-            code="MAN-OVERRIDE-ARITY",
-        )
-    name = node.args[0]
-    extra = set(node.props.keys()) - _URL_DEP_PROPS
-    if extra:
-        unknown = ", ".join(repr(p) for p in sorted(extra))
-        allowed = ", ".join(sorted(_URL_DEP_PROPS))
-        raise ManifestError(
-            f"override for {name!r}: unknown property/properties {unknown} "
-            f"(allowed: {allowed})",
-            code="MAN-OVERRIDE-UNKNOWN-PROPS",
-        )
-    if "git" not in node.props:
-        raise ManifestError(
-            f"override for {name!r}: missing required property 'git'",
-            code="MAN-OVERRIDE-GIT-MISSING",
-        )
-    if "ref" not in node.props:
-        raise ManifestError(
-            f"override for {name!r}: missing required property 'ref'",
-            code="MAN-OVERRIDE-REF-MISSING",
-        )
-    git = _url_arg(f"override {name!r}", "git", node.props["git"])
-    _validate_git_url(name, git)
-    return Override(name=name, git=git, ref=node.props["ref"])
-
-
-def _parse_spec_version_node(node: kdl.Node) -> int:
-    """Parse a `spec-version <int>` top-level node.
-
-    Returns the declared epoch (a positive integer). Validates arity,
-    type, and value range; raises ManifestError on any violation.
-    The caller is responsible for checking that the epoch is within the
-    supported range (MANIFEST_SPEC_VERSION) and raising
-    MAN-SPEC-VERSION-UNSUPPORTED if not.
-    """
-    if len(node.args) != 1:
-        raise ManifestError(
-            f"'spec-version' takes exactly one positional integer argument "
-            f"(got {len(node.args)} args)",
-            code="MAN-SPEC-VERSION-TYPE",
-        )
-    raw = node.args[0]
-    # kdl-py parses bare numeric literals as float; accept ints or
-    # integer-valued floats (same pattern as strip_components).
-    if isinstance(raw, float) and raw.is_integer():
-        raw = int(raw)
-    if not isinstance(raw, int) or isinstance(raw, bool):
-        raise ManifestError(
-            f"'spec-version' argument must be an integer; got {type(raw).__name__}",
-            code="MAN-SPEC-VERSION-TYPE",
-        )
-    if raw < 1:
-        raise ManifestError(
-            f"'spec-version' must be >= 1; got {raw}",
-            code="MAN-SPEC-VERSION-TYPE",
-        )
-    return raw
-
-
-def _parse_kind(node: kdl.Node) -> Kind:
-    if len(node.args) != 1:
-        raise ManifestError(
-            f"'kind' takes exactly one value (got {len(node.args)})",
-            code="MAN-KIND-ARITY",
-        )
-    value = node.args[0]
-    if value not in _VALID_KINDS:
-        allowed = ", ".join(repr(k) for k in _VALID_KINDS)
-        raise ManifestError(
-            f"invalid kind {value!r} (allowed: {allowed})",
-            code="MAN-KIND-INVALID",
-        )
-    return value
-
-
-def _validate_git_url(dep_name: str, url: str) -> None:
-    parsed = urlparse(url)
-    if not parsed.scheme:
-        raise ManifestError(
-            f"dep {dep_name!r}: git URL {url!r} has no scheme "
-            f"(expected one of: {', '.join(sorted(_VALID_GIT_SCHEMES))})",
-            code="MAN-GIT-URL-NO-SCHEME",
-        )
-    if parsed.scheme not in _VALID_GIT_SCHEMES:
-        raise ManifestError(
-            f"dep {dep_name!r}: git URL {url!r} has unsupported scheme "
-            f"{parsed.scheme!r} "
-            f"(expected one of: {', '.join(sorted(_VALID_GIT_SCHEMES))})",
-            code="MAN-GIT-URL-BAD-SCHEME",
-        )
-
-
-# ---------------------------------------------------------------------------
-# .nimble compatibility — auto-promote a .nimble file when no milpa.kdl exists
-# ---------------------------------------------------------------------------
-
-def manifest_from_nimble(nm, *, name: str) -> "Manifest":  # nm: NimbleManifest
-    """Convert a parsed NimbleManifest to a milpa Manifest.
-
-    `name` is the package's intrinsic identity (W1, #73). For a .nimble
-    auto-promotion, callers pass the stem of the .nimble filename (Nim
-    convention — `myproject.nimble` is the manifest for package
-    `myproject`).
-
-    Mapping:
-      - UrlRequirement   → UrlDep (name derived from URL last segment)
-      - NamedRequirement → NamedDep (constraint preserved)
-      - `nim` requirements are dropped — the compiler version is the
-        v2 toolchain RFC's territory, not source-dep resolution.
-
-    `kind` defaults to "library" since .nimble has no equivalent
-    concept. Consumers who want the library/application distinction
-    write milpa.kdl.
-    """
-    # Imported here to avoid a circular import at module load.
-    from .nimble_parse import NamedRequirement, UrlRequirement
-
-    deps: list[Dep] = []
-    for req in nm.requires:
-        if isinstance(req, UrlRequirement):
-            dep_name = _name_from_url(req.url)
-            deps.append(UrlDep(name=dep_name, git=req.url, ref=req.ref or "main"))
-        elif isinstance(req, NamedRequirement):
-            if req.name == "nim":
-                continue
-            # Pre-parse to carry a typed VersionSet. A bad constraint from
-            # a .nimble file raises ValueError here, which propagates up to
-            # manifest_from_nimble's callers; in practice the resolver's
-            # _build_terms_for_nimble_dep catches it as MAN-NIMBLE-CONSTRAINT
-            # (resolver.py ~1980 handles NamedRequirement directly, not
-            # NamedDep). The NamedDep objects produced here go through the
-            # standard resolver paths (sites 519/1216/1702) which expect a
-            # pre-parsed constraint_set.
-            _cs: VersionSet | None = (
-                VersionSet.from_constraint(req.constraint)
-                if req.constraint else None
-            )
-            deps.append(NamedDep(name=req.name, constraint=req.constraint, constraint_set=_cs))
-    return Manifest(deps=tuple(deps), kind="library", name=name)
-
-
-def _name_from_url(url: str) -> str:
-    """Derive a package name from a git URL.
-
-    `https://github.com/x/foo.git` → `foo`
-    `https://github.com/x/foo`     → `foo`
-    """
-    tail = url.rstrip("/").rsplit("/", 1)[-1]
-    if tail.endswith(".git"):
-        tail = tail[:-4]
-    return tail
-
-
-def load_or_discover_manifest(project_dir: Path) -> Manifest:
-    """Load milpa.kdl if present; otherwise auto-promote a .nimble file.
-
-    Discovery order:
-      1. <project_dir>/milpa.kdl — preferred. If present, wins regardless
-         of any .nimble files present.
-      2. <project_dir>/<project_dir_basename>.nimble — matches Nim
-         convention of naming the .nimble after the project.
-      3. Any single <project_dir>/*.nimble file — fallback when the
-         project dir name doesn't match a .nimble. Ambiguous (multiple
-         .nimble files) raises ManifestError.
-
-    Raises ManifestError if no manifest source can be found or if the
-    discovered source has parse errors.
-    """
-    milpa_kdl = project_dir / "milpa.kdl"
-    if milpa_kdl.exists():
-        return load_manifest(milpa_kdl)
-
-    # Try <project_name>.nimble first
-    project_name = project_dir.name
-    primary = project_dir / f"{project_name}.nimble"
-    if primary.exists():
-        return _load_manifest_from_nimble(primary)
-
-    # Fallback: any *.nimble
-    candidates = sorted(project_dir.glob("*.nimble"))
-    if len(candidates) == 1:
-        return _load_manifest_from_nimble(candidates[0])
-    if len(candidates) > 1:
-        names = ", ".join(c.name for c in candidates)
-        raise ManifestError(
-            f"multiple .nimble files in {project_dir} ({names}); "
-            f"either rename one to match the project directory "
-            f"({project_name}.nimble) or add a milpa.kdl",
-            code="MAN-NIMBLE-AMBIGUOUS",
-        )
-
-    raise ManifestError(
-        f"no manifest found in {project_dir} — looked for "
-        f"milpa.kdl, {project_name}.nimble, and any *.nimble",
-        code="MAN-NO-MANIFEST",
-    )
-
-
-def _load_manifest_from_nimble(path: Path) -> Manifest:
-    """Read a .nimble file and convert it to a milpa Manifest.
-
-    Delegates the file read + heuristic parse to `load_nimble` — the single
-    .nimble reader (SSOT); this function does NOT read the file itself.
-    `load_nimble` owns the nimble-layer error codes (NIMBLE-FILE-*); the
-    discovery layer translates them into its own ManifestError contract so
-    CLI callers can keep catching `except ManifestError`:
-      - file-IO failure (NIMBLE-FILE-NOT-FOUND / -UNREADABLE) → MAN-FILE-UNREADABLE,
-        the same generic 'manifest unreadable' code milpa.kdl reads use;
-      - any other NimbleParseError (reserved for future content-level
-        validation) → MAN-NIMBLE-PARSE.
-    """
-    from .nimble_parse import NimbleParseError, load_nimble
-    _IO_CODES = {"NIMBLE-FILE-NOT-FOUND", "NIMBLE-FILE-UNREADABLE"}
-    try:
-        nm = load_nimble(path)
-    except NimbleParseError as e:
-        if e.code in _IO_CODES:
-            raise ManifestError(
-                f"cannot read {path}: {e}", code="MAN-FILE-UNREADABLE",
-            ) from e
-        raise ManifestError(
-            f"failed to parse {path} as a nimble manifest: {e}",
-            code="MAN-NIMBLE-PARSE",
-        ) from e
-    return manifest_from_nimble(nm, name=path.stem)
+            head += f' {pred.name}="{_kdl_str(val)}"'
+
+    # If no children, emit as single line.
+    if not dep.mirrors and not child_preds and not dep.flag_requests:
+        return head
+
+    # Multi-line block form.
+    block: list[str] = [f"{head} {{"]
+    for pred in child_preds:
+        if pred.negated:
+            args_str = " ".join(f'(not)"{_kdl_str(v)}"' for v in pred.values)
+        else:
+            args_str = " ".join(f'"{_kdl_str(v)}"' for v in pred.values)
+        block.append(f"        {pred.name} {args_str}")
+    for mirror_url in dep.mirrors:
+        block.append(f'        mirror (url)"{_kdl_str(mirror_url)}"')
+    for fr in dep.flag_requests:
+        if fr.enabled:
+            block.append(f'        flag "{_kdl_str(fr.name)}"')
+        else:
+            block.append(f'        flag "{_kdl_str(fr.name)}" #false')
+    block.append("    }")
+    return "\n".join(block)

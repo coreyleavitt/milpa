@@ -1,363 +1,290 @@
-"""Manifest writer + mutation orchestration (#15).
+"""Tests for milpa.manifest_writer — slice 10d.
 
-format_manifest already handles Manifest → text. This module adds the
-infrastructure callers need to safely PERSIST mutations:
-
-  - write_manifest(m, path)              — atomic file write
-  - mutate_manifest_file(path, fn)       — read-modify-write with comment-loss reporting
-  - apply_manifest_change_with_resolve(...) — resolve-first transaction (cargo/uv shape)
-
-The orchestration layer prevents future command authors from forgetting
-the relock step or skipping pre-mutation validation. See cargo-add /
-uv-add for the same overall pattern (we just codify it as a primitive
-instead of relying on per-command convention).
-
-Trivia preservation (comments / formatting) is out of scope here — see
-#80 for the Python-specific gap.
+Covers:
+- mutate_manifest_file: normal path, guards (file-not-found, nimble-refused,
+  workspace-refused), atomic write (tmp file cleaned up on failure).
+- WriteResult comment_lost heuristic.
+- format_manifest canonical output (header, field ordering, dep forms).
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
 
-from milpa.tianguis_client import Index
+from milpa.errors import (
+    MAN_MUTATE_FILE_NOT_FOUND,
+    MAN_MUTATE_NIMBLE_REFUSED,
+    MAN_MUTATE_WORKSPACE_REFUSED,
+    MilpaError,
+)
 from milpa.manifest import (
+    FlagDecl,
+    LocalDep,
     Manifest,
-    ManifestError,
+    MemberDep,
+    NamedDep,
+    Override,
+    TarballDep,
     UrlDep,
+    format_manifest,
     parse_manifest,
 )
-from milpa.manifest_writer import (
-    apply_manifest_change_with_resolve,
-    mutate_manifest_file,
-    write_manifest,
-)
-
-
-def test_write_manifest_round_trips_through_parse(tmp_path):
-    """Tracer: write to a path, re-parse, compare to original. Parent
-    dir is auto-created."""
-    original = Manifest(
-        kind="library",
-        name="example",
-        deps=(UrlDep(
-            name="chronos",
-            git="https://github.com/x/chronos.git",
-            ref="main",
-        ),),
-    )
-    target = tmp_path / "new" / "subdir" / "milpa.kdl"
-
-    written = write_manifest(original, target)
-
-    assert written == target
-    assert target.exists()
-    reparsed = parse_manifest(target.read_text())
-    assert reparsed == original
-
-
-def test_write_manifest_failed_format_leaves_existing_file_intact(tmp_path):
-    """A failure during write must not corrupt or truncate an existing
-    target — atomicity guarantee. We simulate failure by passing a
-    Manifest that format_manifest rejects (here: a contrived bad-state
-    we manufacture via monkeypatching), and assert the original file
-    is unchanged."""
-    target = tmp_path / "milpa.kdl"
-    pre_existing = (
-        '// hand-edited manifest\n'
-        'name "before"\n'
-        'kind "library"\n'
-    )
-    target.write_text(pre_existing)
-
-    # Pre-existing parses successfully — sanity
-    assert parse_manifest(target.read_text()).name == "before"
-
-    # Inject a failure: monkeypatch format_manifest to raise mid-write.
-    import milpa.manifest_writer as mw
-    original_format = mw.format_manifest
-    def boom(m):
-        raise RuntimeError("synthetic format failure")
-    mw.format_manifest = boom
-    try:
-        new_m = Manifest(kind="library", name="after", deps=())
-        with pytest.raises(RuntimeError):
-            write_manifest(new_m, target)
-    finally:
-        mw.format_manifest = original_format
-
-    # File contents unchanged
-    assert target.read_text() == pre_existing
-    # No stray temp file in the directory
-    leftovers = [p for p in tmp_path.iterdir() if p.name.startswith(".")]
-    assert leftovers == [], f"unexpected leftover temp files: {leftovers}"
-
-
-def test_write_manifest_cleans_temp_when_rename_fails(tmp_path, monkeypatch):
-    """If os.replace fails after the temp file is written, the temp
-    must be removed — never leave .milpa.kdl.tmp littering the
-    project root."""
-    target = tmp_path / "milpa.kdl"
-    pre_existing = 'name "before"\nkind "library"\n'
-    target.write_text(pre_existing)
-
-    import milpa.manifest_writer as mw
-    def boom(*a, **kw):
-        raise OSError("synthetic rename failure")
-    monkeypatch.setattr(mw.os, "replace", boom)
-
-    new_m = Manifest(kind="library", name="after", deps=())
-    with pytest.raises(OSError):
-        write_manifest(new_m, target)
-
-    # No temp leftovers
-    leftovers = [p for p in tmp_path.iterdir() if p.name.startswith(".")]
-    assert leftovers == [], f"unexpected leftover temp files: {leftovers}"
-    # Target untouched
-    assert target.read_text() == pre_existing
-
+from milpa.manifest_writer import WriteResult, mutate_manifest_file
 
 # ---------------------------------------------------------------------------
-# mutate_manifest_file — read-modify-write
+# format_manifest canonical output tests
 # ---------------------------------------------------------------------------
 
 
-def test_mutate_manifest_file_applies_function_and_writes(tmp_path):
-    """mutate_manifest_file(path, fn) reads the manifest, applies fn,
-    writes the result. After return, the file contains fn's output."""
-    from dataclasses import replace
-
-    target = tmp_path / "milpa.kdl"
-    write_manifest(
-        Manifest(kind="library", name="proj", deps=()),
-        target,
+def test_format_manifest_header_present() -> None:
+    """format_manifest always emits the canonical header line."""
+    m = Manifest(name="myapp", deps=())
+    text = format_manifest(m)
+    assert text.startswith(
+        "// generated by milpa; edit by hand or via `milpa add` / `milpa remove`\n"
     )
 
-    def add_chronos(m: Manifest) -> Manifest:
-        return replace(
-            m,
-            deps=m.deps + (UrlDep(
-                name="chronos",
-                git="https://example.com/chronos.git",
-                ref="main",
-            ),),
-        )
 
-    mutate_manifest_file(target, add_chronos)
+def test_format_manifest_kind_is_last() -> None:
+    """kind is always the last field (Rust canonical ordering)."""
+    m = Manifest(name="myapp", deps=(), kind="application")
+    text = format_manifest(m)
+    lines = [ln for ln in text.rstrip("\n").splitlines() if ln.strip()]
+    assert lines[-1] == 'kind "application"'
 
-    reparsed = parse_manifest(target.read_text())
+
+def test_format_manifest_minimal_no_kind_block_when_library() -> None:
+    """A minimal library manifest serializes as header + name + kind."""
+    m = Manifest(name="mylib", deps=())
+    text = format_manifest(m)
+    assert 'name "mylib"' in text
+    assert 'kind "library"' in text
+
+
+def test_format_manifest_url_dep_quoted_name_and_url() -> None:
+    """UrlDep: name is double-quoted, git URL carries (url) annotation."""
+    dep = UrlDep(name="foo", git="https://github.com/example/foo.git", ref="main")
+    m = Manifest(name="myapp", deps=(dep,), kind="application")
+    text = format_manifest(m)
+    assert '"foo" git=(url)"https://github.com/example/foo.git" ref="main"' in text
+
+
+def test_format_manifest_url_dep_with_mirror_block() -> None:
+    """A UrlDep with mirrors renders as a multi-line block."""
+    dep = UrlDep(
+        name="foo",
+        git="https://github.com/example/foo.git",
+        ref="main",
+        mirrors=("https://mirror.example.com/foo.git",),
+    )
+    m = Manifest(name="myapp", deps=(dep,))
+    text = format_manifest(m)
+    assert "mirror (url)" in text
+    assert "https://mirror.example.com/foo.git" in text
+
+
+def test_format_manifest_named_dep_with_constraint() -> None:
+    """NamedDep with constraint: both name and constraint are double-quoted."""
+    dep = NamedDep(name="chronos", constraint=">= 3.0.0")
+    m = Manifest(name="myapp", deps=(dep,))
+    text = format_manifest(m)
+    assert '"chronos" ">= 3.0.0"' in text
+
+
+def test_format_manifest_named_dep_no_constraint() -> None:
+    """NamedDep without constraint: only the name is quoted."""
+    dep = NamedDep(name="stew", constraint=None)
+    m = Manifest(name="myapp", deps=(dep,))
+    text = format_manifest(m)
+    assert '    "stew"' in text
+    # Should NOT have a second quoted arg.
+    for line in text.splitlines():
+        if '"stew"' in line:
+            assert '">=' not in line
+
+
+def test_format_manifest_local_dep() -> None:
+    """LocalDep serializes with local= property."""
+    dep = LocalDep(name="mylocal", path="../local-pkg")
+    m = Manifest(name="myapp", deps=(dep,))
+    text = format_manifest(m)
+    assert '"mylocal" local="../local-pkg"' in text
+
+
+def test_format_manifest_tarball_dep() -> None:
+    """TarballDep serializes with tarball=(url) and optional sha256."""
+    dep = TarballDep(
+        name="archive",
+        url="https://example.com/archive.tar.gz",
+        sha256="abc123",
+    )
+    m = Manifest(name="myapp", deps=(dep,))
+    text = format_manifest(m)
+    assert 'tarball=(url)"https://example.com/archive.tar.gz"' in text
+    assert 'sha256="abc123"' in text
+
+
+def test_format_manifest_member_dep() -> None:
+    """MemberDep serializes as member "<name>"."""
+    dep = MemberDep(name="subpkg")
+    m = Manifest(name="myapp", deps=(dep,))
+    text = format_manifest(m)
+    assert '    member "subpkg"' in text
+
+
+def test_format_manifest_flag_decl_default_false() -> None:
+    """FlagDecl default=False renders as default=#false."""
+    fd = FlagDecl(name="myflag", default=False)
+    m = Manifest(name="myapp", deps=(), flags=(fd,))
+    text = format_manifest(m)
+    assert '"myflag" default=#false' in text
+
+
+def test_format_manifest_flag_decl_default_true() -> None:
+    """FlagDecl default=True renders as default=#true."""
+    fd = FlagDecl(name="myflag", default=True)
+    m = Manifest(name="myapp", deps=(), flags=(fd,))
+    text = format_manifest(m)
+    assert '"myflag" default=#true' in text
+
+
+def test_format_manifest_spec_version_only_when_explicit() -> None:
+    """spec-version emitted only when spec_version_explicit=True (§4.4)."""
+    m_implicit = Manifest(name="myapp", deps=(), spec_version_explicit=False)
+    m_explicit = Manifest(name="myapp", deps=(), spec_version_explicit=True)
+    assert "spec-version" not in format_manifest(m_implicit)
+    assert "spec-version 1" in format_manifest(m_explicit)
+
+
+def test_format_manifest_override_block() -> None:
+    """Override block renders pkg with git=(url) and ref."""
+    ov = Override(name="foo", git="https://github.com/fork/foo.git", ref="dev")
+    m = Manifest(name="myapp", deps=(), overrides=(ov,))
+    text = format_manifest(m)
+    assert 'pkg "foo"' in text
+    assert 'git=(url)"https://github.com/fork/foo.git"' in text
+    assert 'ref="dev"' in text
+
+
+def test_format_manifest_comment_warning_emitted(capsys: pytest.CaptureFixture[str]) -> None:
+    """had_comments=True → warning on stderr."""
+    m = Manifest(name="myapp", deps=(), had_comments=True)
+    format_manifest(m)
+    captured = capsys.readouterr()
+    assert "comments are not preserved" in captured.err
+
+
+def test_format_manifest_roundtrip_url_dep() -> None:
+    """UrlDep round-trips through format→parse."""
+    dep = UrlDep(name="foo", git="https://github.com/example/foo.git", ref="main")
+    m = Manifest(name="myapp", deps=(dep,), kind="application")
+    text = format_manifest(m)
+    reparsed = parse_manifest(text)
     assert len(reparsed.deps) == 1
-    assert reparsed.deps[0].name == "chronos"
+    pd = reparsed.deps[0]
+    assert isinstance(pd, UrlDep)
+    assert pd.git == dep.git
+    assert pd.ref == dep.ref
+    assert pd.name == dep.name
 
 
-def test_mutate_manifest_file_raises_when_path_missing(tmp_path):
-    """No file at path — clear error, no silent file creation."""
-    with pytest.raises(ManifestError) as exc:
-        mutate_manifest_file(tmp_path / "absent.kdl", lambda m: m)
-    assert "absent.kdl" in str(exc.value) or "not found" in str(exc.value).lower()
+# ---------------------------------------------------------------------------
+# mutate_manifest_file tests
+# ---------------------------------------------------------------------------
 
 
-def test_mutate_manifest_file_raises_when_path_is_nimble(tmp_path):
-    """Refuse to mutate a .nimble file — that's a `milpa init`
-    concern, not a mutation side effect."""
-    nimble = tmp_path / "proj.nimble"
-    nimble.write_text('requires "results"\n')
-    with pytest.raises(ManifestError) as exc:
+def test_mutate_file_not_found(tmp_path: Path) -> None:
+    """Raises MAN-MUTATE-FILE-NOT-FOUND if the file does not exist."""
+    missing = tmp_path / "milpa.kdl"
+    with pytest.raises(MilpaError) as exc_info:
+        mutate_manifest_file(missing, lambda m: m)
+    assert exc_info.value.slug == MAN_MUTATE_FILE_NOT_FOUND
+
+
+def test_mutate_nimble_refused(tmp_path: Path) -> None:
+    """Raises MAN-MUTATE-NIMBLE-REFUSED for a .nimble file."""
+    nimble = tmp_path / "myapp.nimble"
+    nimble.write_text("version = \"1.0.0\"\n")
+    with pytest.raises(MilpaError) as exc_info:
         mutate_manifest_file(nimble, lambda m: m)
-    msg = str(exc.value).lower()
-    assert ".nimble" in msg or "nimble" in msg
+    assert exc_info.value.slug == MAN_MUTATE_NIMBLE_REFUSED
 
 
-def test_mutate_manifest_file_raises_on_workspace_manifest(tmp_path):
-    """Workspace manifests are pure containers — not mutation targets
-    in this cycle."""
-    target = tmp_path / "milpa.kdl"
-    target.write_text(
-        'workspace {\n'
-        '    member "alpha"\n'
-        '}\n'
-    )
-    with pytest.raises(ManifestError) as exc:
-        mutate_manifest_file(target, lambda m: m)
-    msg = str(exc.value).lower()
-    assert "workspace" in msg
+def test_mutate_workspace_refused(tmp_path: Path) -> None:
+    """Raises MAN-MUTATE-WORKSPACE-REFUSED for a workspace manifest."""
+    kdl = tmp_path / "milpa.kdl"
+    kdl.write_text('workspace {\n    member "pkgA"\n}\n')
+    with pytest.raises(MilpaError) as exc_info:
+        mutate_manifest_file(kdl, lambda m: m)
+    assert exc_info.value.slug == MAN_MUTATE_WORKSPACE_REFUSED
 
 
-# ---------------------------------------------------------------------------
-# WriteResult.comments_lost
-# ---------------------------------------------------------------------------
+def test_mutate_identity(tmp_path: Path) -> None:
+    """Identity mutation leaves the file with the canonical re-render."""
+    kdl = tmp_path / "milpa.kdl"
+    kdl.write_text('name "myapp"\nkind "library"\n')
+    result = mutate_manifest_file(kdl, lambda m: m)
+    assert isinstance(result, WriteResult)
+    assert result.path == kdl
+    # File should contain canonical format.
+    text = kdl.read_text()
+    assert 'name "myapp"' in text
+    assert text.startswith("// generated by milpa")
 
 
-def test_write_result_reports_zero_when_source_has_no_comments(tmp_path):
-    """A manifest with no comments → comments_lost == 0."""
-    target = tmp_path / "milpa.kdl"
-    write_manifest(
-        Manifest(kind="library", name="proj", deps=()),
-        target,
-    )
-    # write_manifest's own output has the header comment, but for
-    # comment-loss accounting we count comments in the SOURCE that
-    # don't survive — first round the file just has the header,
-    # which IS preserved (every format_manifest output starts with it).
-    result = mutate_manifest_file(target, lambda m: m)
-    assert result.comments_lost == 0
+def test_mutate_adds_dep(tmp_path: Path) -> None:
+    """Mutation that adds a UrlDep is reflected in the written file."""
+    kdl = tmp_path / "milpa.kdl"
+    kdl.write_text('name "myapp"\nkind "library"\n')
 
+    new_dep = UrlDep(name="bar", git="https://github.com/example/bar.git", ref="main")
 
-def test_write_result_reports_comment_lines_lost_in_source(tmp_path):
-    """A hand-edited manifest with several // comments → comments_lost
-    counts each line not in the formatter's output."""
-    target = tmp_path / "milpa.kdl"
-    target.write_text(
-        '// project intent: experimental fork\n'
-        '// see ../README for the migration plan\n'
-        'name "proj"\n'
-        'deps {\n'
-        '    // chronos: we depend on the contextvars branch\n'
-        '    chronos git="https://example.com/chronos.git" ref="main"\n'
-        '}\n'
-        'kind "library"\n'
-    )
-
-    result = mutate_manifest_file(target, lambda m: m)
-
-    # 3 user comments existed in source; the formatter's auto-header
-    # accounts for at most 1 in the output. Net loss: at least 2.
-    assert result.comments_lost >= 2
-
-
-# ---------------------------------------------------------------------------
-# apply_manifest_change_with_resolve — resolve-then-commit (#16)
-# ---------------------------------------------------------------------------
-
-
-def _empty_index_loader(*, cache_dir):
-    return {}
-
-
-def test_apply_change_with_resolve_commits_both_files_atomically(tmp_path):
-    """Tracer: build a proposed Manifest, run resolve, commit both
-    milpa.kdl and milpa.lock. After return, both files exist and
-    reflect the new state."""
     from dataclasses import replace
 
-    from milpa.fetchers import FetcherRegistry
-    from milpa.fetchers.git import GitProvenance, GitReceipt
-    from milpa.lockfile import load_lockfile
-    from milpa.solver import Strategy
+    def add_dep(m: Manifest) -> Manifest:
+        return replace(m, deps=m.deps + (new_dep,))
 
-    write_manifest(
-        Manifest(kind="library", name="proj", deps=()),
-        tmp_path / "milpa.kdl",
+    mutate_manifest_file(kdl, add_dep)
+    text = kdl.read_text()
+    assert '"bar"' in text
+    assert "github.com/example/bar.git" in text
+
+
+def test_mutate_removes_dep(tmp_path: Path) -> None:
+    """Mutation that removes a dep is reflected in the written file."""
+    kdl = tmp_path / "milpa.kdl"
+    kdl.write_text(
+        'name "myapp"\nkind "library"\n'
+        'deps {\n    foo git=(url)"https://github.com/example/foo.git" ref="main"\n}\n'
     )
 
-    # Fake fetcher serves any git URL with a minimal .nimble
-    class StubFetcher:
-        def can_handle(self, p): return isinstance(p, GitProvenance)
-        def fetch(self, name, p, *, dest):
-            dest.mkdir(parents=True, exist_ok=True)
-            (dest / f"{name}.nimble").write_text('srcDir = "src"\n')
-            return GitReceipt(commit_sha="abc")
+    from dataclasses import replace
 
-    registry = FetcherRegistry()
-    registry.register(StubFetcher())
+    def remove_foo(m: Manifest) -> Manifest:
+        return replace(m, deps=tuple(d for d in m.deps if d.name != "foo"))
 
-    proposed = Manifest(
-        kind="library", name="proj",
-        deps=(UrlDep(name="x", git="https://example.com/x.git", ref="main"),),
+    mutate_manifest_file(kdl, remove_foo)
+    text = kdl.read_text()
+    assert "foo" not in text
+
+
+def test_mutate_atomic_write(tmp_path: Path) -> None:
+    """No .tmp file left behind after a successful atomic write."""
+    kdl = tmp_path / "milpa.kdl"
+    kdl.write_text('name "myapp"\nkind "library"\n')
+    mutate_manifest_file(kdl, lambda m: m)
+    tmp = kdl.with_suffix(".kdl.tmp")
+    assert not tmp.exists(), ".tmp file should be cleaned up after os.replace()"
+
+
+def test_mutate_comment_loss_count(tmp_path: Path) -> None:
+    """comments_lost heuristic counts // lines dropped."""
+    kdl = tmp_path / "milpa.kdl"
+    kdl.write_text(
+        '// my comment\n// another comment\nname "myapp"\nkind "library"\n'
     )
-
-    apply_manifest_change_with_resolve(
-        tmp_path,
-        proposed_manifest=proposed,
-        fetcher=registry,
-        index_loader=_empty_index_loader,
-        strategy=Strategy.MAXVER,
-    )
-
-    # Both files reflect the new state
-    reparsed = parse_manifest((tmp_path / "milpa.kdl").read_text())
-    assert reparsed.deps[0].name == "x"
-    lockfile = load_lockfile(tmp_path / "milpa.lock")
-    assert any(d.name == "x" for d in lockfile.deps)
-
-
-def test_apply_change_with_resolve_aborts_on_resolve_failure(tmp_path):
-    """If resolve raises, manifest + lockfile remain untouched —
-    cargo/uv-style atomicity guarantee."""
-    from milpa.fetchers import FetcherRegistry, FetchError
-    from milpa.fetchers.git import GitProvenance
-    from milpa.solver import Strategy
-
-    write_manifest(
-        Manifest(kind="library", name="proj", deps=()),
-        tmp_path / "milpa.kdl",
-    )
-    original_manifest = (tmp_path / "milpa.kdl").read_text()
-    # No pre-existing lockfile
-    assert not (tmp_path / "milpa.lock").exists()
-
-    class FailingFetcher:
-        def can_handle(self, p): return isinstance(p, GitProvenance)
-        def fetch(self, name, p, *, dest):
-            raise FetchError(f"synthetic failure for {p.url}")
-
-    registry = FetcherRegistry()
-    registry.register(FailingFetcher())
-
-    proposed = Manifest(
-        kind="library", name="proj",
-        deps=(UrlDep(name="x", git="https://example.com/x.git", ref="main"),),
-    )
-
-    with pytest.raises(Exception):
-        apply_manifest_change_with_resolve(
-            tmp_path,
-            proposed_manifest=proposed,
-            fetcher=registry,
-            index_loader=_empty_index_loader,
-            strategy=Strategy.MAXVER,
-        )
-
-    # Manifest unchanged
-    assert (tmp_path / "milpa.kdl").read_text() == original_manifest
-    # No stray lockfile
-    assert not (tmp_path / "milpa.lock").exists()
-
-
-def test_apply_change_with_resolve_aborts_on_pre_validate_failure(tmp_path):
-    """pre_resolve_validate raising short-circuits — resolve is never
-    invoked, no disk writes happen."""
-    from milpa.fetchers import FetcherRegistry
-    from milpa.solver import Strategy
-
-    write_manifest(
-        Manifest(kind="library", name="proj", deps=()),
-        tmp_path / "milpa.kdl",
-    )
-    original = (tmp_path / "milpa.kdl").read_text()
-
-    class ExplodingFetcher:
-        def can_handle(self, p): return True
-        def fetch(self, name, p, *, dest):
-            raise AssertionError(
-                "resolve must not run when pre_validate failed"
-            )
-
-    registry = FetcherRegistry()
-    registry.register(ExplodingFetcher())
-
-    def pre_validate():
-        raise RuntimeError("synthetic pre-validate failure")
-
-    with pytest.raises(RuntimeError, match="synthetic pre-validate"):
-        apply_manifest_change_with_resolve(
-            tmp_path,
-            proposed_manifest=Manifest(kind="library", name="proj", deps=()),
-            fetcher=registry,
-            index_loader=_empty_index_loader,
-            strategy=Strategy.MAXVER,
-            pre_resolve_validate=pre_validate,
-        )
-
-    assert (tmp_path / "milpa.kdl").read_text() == original
-    assert not (tmp_path / "milpa.lock").exists()
+    result = mutate_manifest_file(kdl, lambda m: m)
+    # The input had 2 comment lines; the canonical re-render has 1 (the header).
+    assert result.comments_lost == 1

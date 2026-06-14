@@ -88,6 +88,9 @@ impl FetchError {
             // the env-var-activated mocked fetcher (`MILPA_MOCKED_FETCHES`) found
             // no fixture directory for the requested `(url, ref)` key.
             "FETCH-MOCK-MISSING",
+            // ref auto-discovery failure (cli-contract §5.6): `milpa add` without
+            // `--ref` failed to discover the remote's default branch (real or mocked).
+            "FETCH-REF-DISCOVERY-FAILED",
         ]
     }
 }

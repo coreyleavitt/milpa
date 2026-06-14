@@ -1,193 +1,185 @@
-"""Manifest writer + mutation orchestration (#15, #16).
+"""milpa manifest writer — atomic mutation of milpa.kdl.
 
-format_manifest already handles Manifest → text. This module adds:
+Slice 10d per docs/rfc-python-clean-room-rewrite.md.
 
-  - write_manifest(m, path)              — atomic file write (temp + rename)
-  - mutate_manifest_file(path, fn)       — read-modify-write with comment reporting
-  - apply_manifest_change_with_resolve(...) — resolve-first orchestration:
-      run a full resolve on the proposed manifest; only if resolution
-      succeeds, atomically commit manifest + lockfile. cargo/uv-shape
-      transaction. Single canonical entry point for every command that
-      edits milpa.kdl (cmd_add, cmd_add_mirror, future cmd_remove, etc.).
+Provides:
+  ``mutate_manifest_file(path, mutator)`` — read milpa.kdl, apply a pure
+      ``Manifest → Manifest`` transform, then write the canonical re-render
+      atomically.  ``format_manifest`` is the SSOT serializer; this module
+      does ZERO KDL-AST construction — it handles file I/O only.
 
-Trivia preservation is out of scope here — see #80 for the Python-
-specific limitation. Mutations DROP comments; callers warn the user
-via WriteResult.comments_lost.
+  ``WriteResult`` — what a mutation did to disk.
+
+Atomic write contract (cli-contract.md §5.6):
+  Writes are performed via a sibling tmp file + ``os.replace()``.  A
+  mid-write kill leaves the file unmodified.
+
+Comment-dropped warning:
+  Detected by ``format_manifest`` via ``Manifest.had_comments`` — the warning
+  is emitted to stderr by ``format_manifest`` itself (§3), not by this module.
+
+Refuses:
+  - Missing file → ``MAN-MUTATE-FILE-NOT-FOUND``
+  - ``.nimble`` file → ``MAN-MUTATE-NIMBLE-REFUSED``
+  - Workspace manifest → ``MAN-MUTATE-WORKSPACE-REFUSED``
+  - Malformed manifest → the ``MAN-*`` parse code surfaces unchanged.
+
+Spec authority: spec/cli-contract.md §5.6, spec/manifest-grammar.md §8.
 """
 
+from __future__ import annotations
+
+import contextlib
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .manifest import Manifest, ManifestError, format_manifest, parse_manifest
-from .tianguis_client import IndexLoader
+from milpa.errors import (
+    MAN_MUTATE_FILE_NOT_FOUND,
+    MAN_MUTATE_NIMBLE_REFUSED,
+    MAN_MUTATE_WORKSPACE_REFUSED,
+    MilpaError,
+)
+from milpa.manifest import (
+    Manifest,
+    WorkspaceManifest,
+    format_manifest,
+    parse_workspace_or_manifest,
+)
+
+# ---------------------------------------------------------------------------
+# WriteResult
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class WriteResult:
-    """Outcome of a manifest mutation. `comments_lost` is the count of
-    // comments present in the source but absent from the output —
-    callers should warn the user when nonzero (#80 tracks the
-    Python-specific gap)."""
+    """Outcome of a manifest mutation + write.
+
+    ``path``           — absolute path of the (re)written milpa.kdl.
+    ``comments_lost``  — number of ``//``-comment lines dropped by the
+                         declarative re-render (heuristic count; matches the
+                         Rust ``WriteResult.comments_lost`` semantics).
+    """
+
     path: Path
     comments_lost: int
 
 
-def write_manifest(m: Manifest, path: Path) -> Path:
-    """Write `m` to `path` atomically.
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-    Parent directory is auto-created. The write is staged via a temp
-    file in the same directory and committed via os.replace (POSIX
-    rename semantics — also atomic on Windows). Returns the path.
+
+def _count_comments(text: str) -> int:
+    """Count ``//``-prefixed lines (after stripping leading whitespace).
+
+    Conservative heuristic — matches the Rust ``count_comments``.
     """
-    text = format_manifest(m)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(text)
+    return sum(1 for line in text.splitlines() if line.lstrip().startswith("//"))
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write *text* to *path* atomically (sibling tmp + os.replace).
+
+    The tmp file is a sibling of *path* so the rename is always on the same
+    filesystem (required for POSIX atomic rename).
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
     try:
+        tmp.write_text(text, encoding="utf-8")
         os.replace(tmp, path)
-    except BaseException:
-        if tmp.exists():
-            tmp.unlink()
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
         raise
-    return path
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def mutate_manifest_file(
     path: Path,
     mutator: Callable[[Manifest], Manifest],
 ) -> WriteResult:
-    """Read milpa.kdl at `path`, apply `mutator`, write the result
-    atomically. Returns a WriteResult describing what changed on disk.
+    """Read ``milpa.kdl`` at *path*, apply *mutator*, and write the canonical
+    re-render atomically.
 
-    Comments in the source file are LOST on rewrite (#80 tracks the
-    upstream limitation in kdl-py). WriteResult.comments_lost lets
-    callers surface this to the user.
+    Parameters
+    ----------
+    path:
+        Absolute path to the ``milpa.kdl`` to mutate.  Must be a plain
+        package manifest (not a ``.nimble`` or a workspace manifest).
+    mutator:
+        A pure ``Manifest → Manifest`` function.  Called with the parsed
+        manifest; its return value is serialized via ``format_manifest`` and
+        written atomically.  Mutator MUST NOT perform I/O.
+
+    Returns
+    -------
+    WriteResult
+        Contains the path written and the heuristic comment-loss count.
+
+    Raises
+    ------
+    MilpaError(MAN-MUTATE-FILE-NOT-FOUND)
+        If *path* does not exist or cannot be read.
+    MilpaError(MAN-MUTATE-NIMBLE-REFUSED)
+        If *path* has a ``.nimble`` extension.
+    MilpaError(MAN-MUTATE-WORKSPACE-REFUSED)
+        If *path* is a workspace manifest.
+    MilpaError(MAN-*)
+        If the manifest is malformed (parse error surfaces unchanged).
     """
-    if not path.exists():
-        raise ManifestError(
-            f"manifest file not found: {path} — "
-            f"create a milpa.kdl before mutating",
-            code="MAN-MUTATE-FILE-NOT-FOUND",
-        )
+    # Guard 1: .nimble refused (cannot safely round-trip NimScript).
     if path.suffix == ".nimble":
-        raise ManifestError(
+        raise MilpaError(
+            MAN_MUTATE_NIMBLE_REFUSED,
             f"refusing to mutate a .nimble file ({path}); "
-            f"promote to milpa.kdl first (`milpa init` — TBD)",
-            code="MAN-MUTATE-NIMBLE-REFUSED",
+            "promote to milpa.kdl first",
+            path=str(path),
         )
-    text = path.read_text()
-    if "workspace" in text and _has_workspace_block(text):
-        raise ManifestError(
-            f"{path}: workspace manifests are pure containers and "
-            f"cannot be mutated by this helper",
-            code="MAN-MUTATE-WORKSPACE-REFUSED",
+
+    # Guard 2: file must exist and be readable.
+    if not path.exists():
+        raise MilpaError(
+            MAN_MUTATE_FILE_NOT_FOUND,
+            f"manifest file not found: {path} — create a milpa.kdl first",
+            path=str(path),
         )
-    m = parse_manifest(text)
-    new_m = mutator(m)
-    before_comments = _count_line_comments(text)
-    write_manifest(new_m, path)
-    after_comments = _count_line_comments(path.read_text())
-    lost = max(0, before_comments - after_comments)
-    return WriteResult(path=path, comments_lost=lost)
-
-
-def apply_manifest_change_with_resolve(
-    project_dir: Path,
-    *,
-    proposed_manifest: Manifest,
-    fetcher,                              # FetcherRegistry
-    index_loader: IndexLoader,
-    strategy,                             # Strategy enum
-    pre_resolve_validate: "Callable[[], None] | None" = None,
-) -> WriteResult:
-    """Resolve proposed_manifest in full; on success atomically commit
-    milpa.kdl and milpa.lock.
-
-    Sequence:
-      1. pre_resolve_validate() (optional) — transport-specific checks
-         that the resolver won't do (e.g., probe a mirror URL).
-      2. resolve(proposed_manifest) — full graph including any new dep.
-         If resolution raises, NEITHER file is written.
-      3. Atomic commit: write milpa.lock first, then milpa.kdl.
-         Lockfile-first ordering means a mid-sequence crash leaves a
-         self-healing state — next `milpa fetch` sees a lockfile
-         "ahead" of the manifest and runs slow path to reconcile.
-
-    Single point of orchestration for every manifest mutation that
-    changes resolution: cmd_add, cmd_add_mirror, future cmd_remove,
-    cmd_update, etc.
-    """
-    from .lockfile import from_graph, load_lockfile, write_lockfile
-    from .profile import Profile
-    from .resolver import resolve
-
-    if pre_resolve_validate is not None:
-        pre_resolve_validate()
-
-    # Pick up the prior lockfile (if any) so existing deps inherit
-    # identity-pin protection during the proposed-manifest resolve.
-    # New deps in the proposed manifest have no entry yet — no pin
-    # is enforced for them (consistent with _pin_for_*_dep returning
-    # None when the name isn't in the lockfile).
-    prior_lockfile_path = project_dir / "milpa.lock"
-    prior_lockfile = None
-    if prior_lockfile_path.exists():
-        try:
-            prior_lockfile = load_lockfile(prior_lockfile_path)
-        except Exception:
-            prior_lockfile = None
-
-    deps_dir = project_dir / "_deps"
-    deps_dir.mkdir(parents=True, exist_ok=True)
-    from .tianguis_client import default_index_cache_dir
-    index = index_loader(cache_dir=default_index_cache_dir())
-
-    graph = resolve(
-        proposed_manifest,
-        deps_dir=deps_dir,
-        index=index,
-        fetcher=fetcher,
-        strategy=strategy,
-        prior_lockfile=prior_lockfile,
-        profile=Profile.from_environment(),
-    )
-    new_lockfile = from_graph(graph, strategy=str(strategy))
-
-    write_lockfile(new_lockfile, project_dir / "milpa.lock")
-    return _commit_manifest(project_dir / "milpa.kdl", proposed_manifest)
-
-
-def _commit_manifest(path: Path, m: Manifest) -> WriteResult:
-    """Write a manifest atomically; report comment loss vs prior text
-    if file existed."""
-    before_comments = 0
-    if path.exists():
-        before_comments = _count_line_comments(path.read_text())
-    write_manifest(m, path)
-    after_comments = _count_line_comments(path.read_text())
-    return WriteResult(path=path, comments_lost=max(0, before_comments - after_comments))
-
-
-def _count_line_comments(text: str) -> int:
-    """Count line-comment lines (// or #) — naive line scan. Block
-    comments (/* */) are ignored; they're rare in milpa manifests
-    and out of scope for the warning surface (#80)."""
-    n = 0
-    for line in text.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("//") or stripped.startswith("#"):
-            n += 1
-    return n
-
-
-def _has_workspace_block(text: str) -> bool:
-    """Cheap pre-parse detector — true if the source declares a
-    `workspace { ... }` block at the top level."""
-    import kdl
     try:
-        doc = kdl.parse(text)
-    except Exception:
-        return False
-    return any(node.name == "workspace" for node in doc.nodes)
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise MilpaError(
+            MAN_MUTATE_FILE_NOT_FOUND,
+            f"cannot read {path}: {exc}",
+            path=str(path),
+        ) from exc
+
+    # Guard 3: parse; refuse workspace manifests.
+    doc = parse_workspace_or_manifest(text)
+    if isinstance(doc, WorkspaceManifest):
+        raise MilpaError(
+            MAN_MUTATE_WORKSPACE_REFUSED,
+            f"{path}: workspace manifests are pure containers and cannot be mutated",
+            path=str(path),
+        )
+
+    assert isinstance(doc, Manifest)
+
+    # Apply the mutation (pure transform).
+    new_manifest = mutator(doc)
+
+    # Render and write atomically.
+    rendered = format_manifest(new_manifest)
+    before = _count_comments(text)
+    after = _count_comments(rendered)
+    _atomic_write_text(path, rendered)
+
+    return WriteResult(
+        path=path,
+        comments_lost=max(0, before - after),
+    )

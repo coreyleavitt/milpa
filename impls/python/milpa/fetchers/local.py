@@ -1,60 +1,111 @@
-"""LocalFetcher — copies a local-filesystem source tree into dest.
+"""LocalFetcher — local filesystem source tree delivery (slice 7d-4).
 
-For workspace use cases (e.g. fresco depending on intonaco at
-`../intonaco` during development) the manifest declares the dep with
-`local="../intonaco"`. The resolver resolves the path against project
-root and constructs a LocalProvenance with an absolute Path.
+Handles ``LocalProvenance(path)`` where ``path`` is an absolute filesystem
+path to an existing source tree.
 
-Copy semantics: dest is a snapshot taken at fetch time. Identity is
-stable until the next `milpa fetch`. If source drifts between fetches,
-re-running `milpa fetch` updates dest (and lockfile); `milpa verify`
-flags the mismatch as drift, same as any other transport.
+Design:
+  - ``cas_admissible = False``: local trees are editable; admitting them to
+    the CAS would silently freeze user edits (plugin-contract.md §4 NORMATIVE).
+    ``CasAdmittingFetcher`` reads this flag and skips CAS admission, keeping
+    the dep pointed at the live source directory.
+  - **No copy**: the source tree stays in place.  ``dest`` is made to point at
+    the source directory via a symlink so the registry can compute identity from
+    the materialized path.  Moving or copying would be wrong — the user expects
+    to edit the source in-place and have ``milpa fetch`` pick up changes.
+  - **No network**: entirely local filesystem I/O.
 
-Symlink semantics (live view of source) is deferred — see issue #42
-and rfc-pluggable-fetchers.md.
+Receipt:
+  ``LocalReceipt.resolved_path`` — the absolute source path used for this
+  fetch.  It identifies the transport artifact (the filesystem path), not the
+  source-tree hash (plugin-contract.md §3.1 NORMATIVE).
+
+Error mapping:
+  - source path does not exist → MilpaError(FETCH_LOCAL_PATH_NOT_FOUND)
+  - source path exists but is not a directory → MilpaError(FETCH_LOCAL_PATH_NOT_DIR)
 """
 
+from __future__ import annotations
+
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
-import shutil
+from typing import ClassVar
 
-from ..fsutil import clear_dest
-from .types import FetchError, Provenance, ProvenanceReceipt
+from milpa.errors import (
+    FETCH_LOCAL_PATH_NOT_DIR,
+    FETCH_LOCAL_PATH_NOT_FOUND,
+    MilpaError,
+)
+from milpa.fetchers.types import Fetcher, Provenance, ProvenanceReceipt
+
+# ---------------------------------------------------------------------------
+# LocalProvenance
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class LocalProvenance(Provenance):
-    """Source tree at an absolute filesystem path.
+    """Provenance descriptor for a local-filesystem source tree.
 
-    Relative paths are rejected at construction — relative-to-project
-    resolution is the caller's responsibility (typically the resolver,
-    which knows the project root). Keeping provenance values
-    file-system-truthful prevents transport-time ambiguity about
-    'relative to what'.
+    ``path`` must be an absolute path; relative paths are rejected at
+    construction — relative-to-project resolution is the caller's
+    responsibility (typically the resolver, which knows the project root).
+
+    ``cas_admissible = False`` (NORMATIVE, §4): local trees are editable
+    sources.  Admitting them to the CAS would silently freeze user edits;
+    the CAS entry would be immutable while the user's source continues to
+    change.
     """
-    path: Path
-    cas_admissible = False     # local trees stay editable (#35)
 
-    def __post_init__(self):
+    path: Path
+    cas_admissible: ClassVar[bool] = False  # noqa: RUF012  # editable source; override default True
+
+    def __post_init__(self) -> None:
         if not self.path.is_absolute():
             raise ValueError(
                 f"LocalProvenance.path must be absolute, got {self.path!r}"
             )
 
 
+# ---------------------------------------------------------------------------
+# LocalReceipt
+# ---------------------------------------------------------------------------
+
+
 @dataclass(frozen=True)
 class LocalReceipt(ProvenanceReceipt):
-    """What LocalFetcher recorded about a fetch: the absolute source
-    path the tree was copied from."""
-    source_path: Path
+    """Transport receipt for a successful local-path fetch.
+
+    ``resolved_path`` — the absolute source directory path.  This identifies
+    the transport artifact (filesystem path), NOT the source-tree identity hash
+    (plugin-contract.md §3.1 NORMATIVE: tree hashes are forbidden in receipts).
+    """
+
+    resolved_path: Path
 
     def transport_fields(self) -> dict[str, str]:
-        return {"source_path": str(self.source_path)}
+        return {"resolved_path": str(self.resolved_path)}
 
 
-class LocalFetcher:
-    """Copies LocalProvenance.path into dest. Identity computed by the
-    registry post-copy from the materialized tree."""
+# ---------------------------------------------------------------------------
+# LocalFetcher
+# ---------------------------------------------------------------------------
+
+
+class LocalFetcher(Fetcher):
+    """Expose a local filesystem source tree under ``dest/`` without copying it.
+
+    Satisfies the three plugin-contract obligations (§1):
+      1. Claim: ``can_handle`` returns ``True`` for ``LocalProvenance`` only.
+      2. Materialize: ``fetch`` makes ``dest`` point at the source directory
+         (via symlink) so the registry can compute identity on the materialized
+         path.  The source directory is NOT moved or copied.
+      3. Receipt: returns ``LocalReceipt(resolved_path=<absolute source path>)``
+         recording the filesystem path, not a tree hash.
+
+    ``cas_admissible = False`` on ``LocalProvenance`` tells ``CasAdmittingFetcher``
+    to skip CAS admission — the dep stays as a live pointer to the source tree.
+    """
 
     def can_handle(self, p: Provenance) -> bool:
         return isinstance(p, LocalProvenance)
@@ -67,21 +118,31 @@ class LocalFetcher:
         dest: Path,
     ) -> LocalReceipt:
         assert isinstance(p, LocalProvenance)
+
+        # --- validate source ----------------------------------------------
         if not p.path.exists():
-            raise FetchError(
+            raise MilpaError(
+                FETCH_LOCAL_PATH_NOT_FOUND,
                 f"fetching {name!r}: local source path does not exist: {p.path}",
-                code="FETCH-LOCAL-PATH-NOT-FOUND",
+                dep=name,
+                path=str(p.path),
             )
         if not p.path.is_dir():
-            raise FetchError(
+            raise MilpaError(
+                FETCH_LOCAL_PATH_NOT_DIR,
                 f"fetching {name!r}: local source path is not a directory: {p.path}",
-                code="FETCH-LOCAL-PATH-NOT-DIR",
+                dep=name,
+                path=str(p.path),
             )
-        # dest may be a stale symlink (e.g. proptest was a CAS-routed
-        # url/git dep before the manifest switched it to local=, leaving
-        # `_deps/proptest` pointing into the CAS). clear_dest unlinks it
-        # without following into the CAS, where a plain rmtree would
-        # raise on the symlink (#112).
-        clear_dest(dest)
-        shutil.copytree(p.path, dest, symlinks=True)
-        return LocalReceipt(source_path=p.path)
+
+        # --- expose source tree under dest --------------------------------
+        # Remove dest if it already exists (stale dir / stale symlink from a
+        # previous fetch run) so we can create a fresh symlink.
+        if dest.exists() or dest.is_symlink():
+            if dest.is_symlink():
+                dest.unlink()
+            else:
+                shutil.rmtree(dest)
+        dest.symlink_to(p.path.resolve())
+
+        return LocalReceipt(resolved_path=p.path)

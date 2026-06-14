@@ -1,47 +1,100 @@
-"""GitFetcher — clone-based source tree delivery via git subprocess.
+"""GitFetcher — subprocess git clone transport (slice 7d-1).
 
-Handles `GitProvenance(url, ref)`. URL can be any scheme git understands
-(https://, ssh://, git://, file://). Returns a GitReceipt with the
-resolved commit SHA.
+Handles ``GitProvenance(url, ref, commit_sha=None)``.
 
-Idempotent: re-fetching the same provenance at the same dest is a
-no-op beyond a `git fetch` + `git checkout`. On failure, leaves no
-partial clone behind (only if WE created the dest dir — if it
-pre-existed, the user's state is theirs).
+URL can be any scheme git understands (https://, ssh://, git://, file://,
+or a bare filesystem path that git accepts directly).
 
-Subprocess-based; libgit2 isn't a dep. Tests exercise this against
-local fixture repos via file:// URLs.
+On success the source tree is materialized under ``dest/`` and a
+``GitReceipt`` carrying the resolved commit SHA is returned.  The receipt
+records the transport artifact's own identifier (commit SHA) — never the
+source-tree identity hash (forbidden per plugin-contract.md §3.1).
+
+Error mapping:
+  - git exits non-zero (clone/checkout/fetch)  → MilpaError(FETCH_GIT_FAILED)
+  - commit_sha not found after exhaustive fetch → MilpaError(FETCH_GIT_COMMIT_ABSENT)
+
+``cas_admissible = True`` (inherited default): all git provenances are
+CAS-admissible; safety comes from the post-fetch identity gate in the
+registry, not from restricting which git refs may be admitted
+(plugin-contract.md §4 NORMATIVE rationale).
 """
 
+from __future__ import annotations
+
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-import shutil
-import subprocess
 
-from .types import FetchError, Provenance, ProvenanceReceipt
+from milpa.errors import FETCH_GIT_COMMIT_ABSENT, FETCH_GIT_FAILED, MilpaError
+from milpa.fetchers.types import Fetcher, Provenance, ProvenanceReceipt
+
+# ---------------------------------------------------------------------------
+# GitProvenance
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class GitProvenance(Provenance):
+    """Provenance descriptor for a git-backed source tree.
+
+    ``url``        — any URL scheme git understands (https, ssh, git, file,
+                     or bare filesystem path).
+    ``ref``        — branch, tag, or HEAD; always recorded for provenance
+                     and human debuggability.
+    ``commit_sha`` — optional exact-commit pin.  When set the fetcher checks
+                     out this SHA instead of the mutable ref tip; the ref is
+                     kept for display/lockfile provenance only.
+
+    ``cas_admissible = True`` (inherited from ``Provenance`` base):
+    CAS admission safety is guaranteed by the post-fetch identity gate in the
+    registry, not by restricting which refs may be admitted (§4 NORMATIVE).
+    """
+
     url: str
     ref: str
-    # Immutable commit pin (milpa#97). When set, GitFetcher checks out
-    # this exact commit rather than the (mutable) `ref` tip — `ref` is
-    # retained for provenance/debuggability. None preserves the legacy
-    # tip-checkout behavior for every existing caller (additive default).
     commit_sha: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# GitReceipt
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class GitReceipt(ProvenanceReceipt):
+    """Transport receipt for a successful git fetch.
+
+    ``commit_sha`` — the SHA of HEAD after clone/checkout.  This identifies
+    the git object that was materialized, NOT the source-tree identity hash
+    (plugin-contract.md §3.1 NORMATIVE: tree hashes are forbidden in receipts).
+    """
+
     commit_sha: str
 
     def transport_fields(self) -> dict[str, str]:
         return {"commit_sha": self.commit_sha}
 
 
-class GitFetcher:
-    """Fetcher for GitProvenance — clones the URL at the ref into dest."""
+# ---------------------------------------------------------------------------
+# GitFetcher
+# ---------------------------------------------------------------------------
+
+
+class GitFetcher(Fetcher):
+    """Clone a git repository into ``dest/`` and return the commit SHA.
+
+    Satisfies the three plugin-contract obligations (§1):
+      1. Claim: ``can_handle`` returns ``True`` for ``GitProvenance`` only.
+      2. Materialize: ``fetch`` runs ``git clone`` (+ optional ``git checkout``
+         to pin an exact commit) and populates ``dest/``.
+      3. Receipt: returns ``GitReceipt(commit_sha=<HEAD SHA>)``; the SHA
+         identifies the transport artifact, not the materialized tree.
+
+    Failure is signalled by raising ``MilpaError`` with a coded slug
+    (plugin-contract.md §2 NORMATIVE).  Cleanup of ``dest`` is the
+    registry's responsibility.
+    """
 
     def can_handle(self, p: Provenance) -> bool:
         return isinstance(p, GitProvenance)
@@ -54,95 +107,121 @@ class GitFetcher:
         dest: Path,
     ) -> GitReceipt:
         assert isinstance(p, GitProvenance)
-        pre_existed = dest.exists()
-        try:
-            if not pre_existed:
-                _run_git(name, p,
-                         ["git", "clone", "-q", p.url, str(dest)])
-            if p.commit_sha:
-                # Exact-commit pin (Invariant 2): the index records an
-                # immutable commit_sha which may NOT be the branch tip.
-                # Ensure it's present (a plain clone of a small repo
-                # usually has it), then check out that exact commit —
-                # `ref` is recorded for provenance but never determines
-                # the working tree here.
-                _ensure_commit_present(name, p, dest)
-                _run_git(name, p,
-                         ["git", "-C", str(dest), "checkout", "-q",
-                          p.commit_sha])
-            else:
-                # Legacy tip behavior: fetch latest then check out the ref.
-                if pre_existed:
-                    _run_git(name, p,
-                             ["git", "-C", str(dest), "fetch", "-q", "origin"])
-                _run_git(name, p,
-                         ["git", "-C", str(dest), "checkout", "-q", p.ref])
-        except FetchError:
-            if not pre_existed and dest.exists():
-                shutil.rmtree(dest, ignore_errors=True)
-            raise
+
+        # --- clone --------------------------------------------------------
+        _run_git(
+            name,
+            p,
+            ["git", "clone", "-q", p.url, str(dest)],
+        )
+
+        # --- checkout / pin -----------------------------------------------
+        if p.commit_sha is not None:
+            # Exact-commit pin: ensure the commit is present then check it out.
+            _ensure_commit_present(name, p, dest)
+            _run_git(
+                name,
+                p,
+                ["git", "-C", str(dest), "checkout", "-q", p.commit_sha],
+            )
+        else:
+            # Mutable-ref tip: check out the declared ref.
+            _run_git(
+                name,
+                p,
+                ["git", "-C", str(dest), "checkout", "-q", p.ref],
+            )
+
         return GitReceipt(commit_sha=_git_head_sha(dest))
 
 
-def _ensure_commit_present(name: str, p: GitProvenance, dest: Path) -> None:
-    """Make `p.commit_sha` available in `dest` so it can be checked out.
-
-    A plain clone of a small repo usually already has every commit, so the
-    cheap `cat-file -e` check short-circuits the common case. Otherwise try
-    a targeted `git fetch origin <sha>` (needs the server's
-    `uploadpack.allowReachableSHA1InWant`; GitHub/GitLab enable it). If the
-    server rejects bare-SHA requests or the clone was shallow, fall back to
-    a full history fetch (`--unshallow` when shallow, else a plain fetch).
-    """
-    have = subprocess.run(
-        ["git", "-C", str(dest), "cat-file", "-e",
-         f"{p.commit_sha}^{{commit}}"],
-        capture_output=True, text=True,
-    )
-    if have.returncode == 0:
-        return
-    targeted = subprocess.run(
-        ["git", "-C", str(dest), "fetch", "-q", "origin", p.commit_sha],
-        capture_output=True, text=True,
-    )
-    if targeted.returncode == 0:
-        return
-    # Fallback: deepen/complete history. --unshallow errors on a complete
-    # clone, so ignore its result and follow with a plain full fetch.
-    subprocess.run(
-        ["git", "-C", str(dest), "fetch", "-q", "--unshallow", "origin"],
-        capture_output=True, text=True,
-    )
-    _run_git(name, p, ["git", "-C", str(dest), "fetch", "-q", "origin"])
-    # L10: re-check after the full history fetch. If the commit is still
-    # absent, raise a clear error rather than letting `git checkout` fail
-    # with an opaque "fatal: unable to read tree" message.
-    recheck = subprocess.run(
-        ["git", "-C", str(dest), "cat-file", "-e",
-         f"{p.commit_sha}^{{commit}}"],
-        capture_output=True, text=True,
-    )
-    if recheck.returncode != 0:
-        raise FetchError(
-            f"commit {p.commit_sha!r} not found in {p.url!r} even after "
-            f"full history fetch — the index pin may be stale or the commit "
-            f"was force-pushed away",
-            code="FETCH-GIT-COMMIT-ABSENT",
-        )
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 
 def _run_git(name: str, p: GitProvenance, argv: list[str]) -> None:
+    """Run a git subprocess; raise ``MilpaError(FETCH_GIT_FAILED)`` on non-zero exit."""
     result = subprocess.run(argv, capture_output=True, text=True)
     if result.returncode != 0:
-        raise FetchError(
-            f"fetching {name!r} from {p.url} at {p.ref!r} failed: "
-            f"{result.stderr.strip() or result.stdout.strip() or 'git exited non-zero'}",
-            code="FETCH-GIT-FAILED",
+        stderr = result.stderr.strip()
+        stdout = result.stdout.strip()
+        detail = stderr or stdout or "git exited non-zero"
+        raise MilpaError(
+            FETCH_GIT_FAILED,
+            f"fetching {name!r} from {p.url!r} at {p.ref!r} failed: {detail}",
+            dep=name,
+            url=p.url,
+            ref=p.ref,
         )
 
 
-def _git_head_sha(path: Path) -> str:
+def _git_head_sha(dest: Path) -> str:
+    """Return the current HEAD commit SHA in the repository at ``dest``."""
     return subprocess.run(
-        ["git", "-C", str(path), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
+        ["git", "-C", str(dest), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
+
+
+def _ensure_commit_present(name: str, p: GitProvenance, dest: Path) -> None:
+    """Ensure ``p.commit_sha`` is reachable in ``dest``.
+
+    Strategy (mirrors the frozen impl's _ensure_commit_present):
+      1. ``git cat-file -e <sha>^{commit}`` — cheap local check.
+      2. Targeted ``git fetch origin <sha>`` — works when the server
+         supports ``uploadpack.allowReachableSHA1InWant`` (GitHub / GitLab).
+      3. Full history fetch (``--unshallow`` for shallow clones, then plain
+         ``fetch``).
+      4. Re-check; if still absent raise ``FETCH-GIT-COMMIT-ABSENT``.
+    """
+    assert p.commit_sha is not None
+
+    # Step 1: cheap local presence check.
+    have = subprocess.run(
+        ["git", "-C", str(dest), "cat-file", "-e", f"{p.commit_sha}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    if have.returncode == 0:
+        return
+
+    # Step 2: targeted fetch (server-side reachable SHA support).
+    targeted = subprocess.run(
+        ["git", "-C", str(dest), "fetch", "-q", "origin", p.commit_sha],
+        capture_output=True,
+        text=True,
+    )
+    if targeted.returncode == 0:
+        return
+
+    # Step 3: full history fetch (handles shallow clones).
+    subprocess.run(
+        ["git", "-C", str(dest), "fetch", "-q", "--unshallow", "origin"],
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(dest), "fetch", "-q", "origin"],
+        capture_output=True,
+        text=True,
+    )
+
+    # Step 4: re-check after full history fetch.
+    recheck = subprocess.run(
+        ["git", "-C", str(dest), "cat-file", "-e", f"{p.commit_sha}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    if recheck.returncode != 0:
+        raise MilpaError(
+            FETCH_GIT_COMMIT_ABSENT,
+            f"commit {p.commit_sha!r} not found in {p.url!r} even after "
+            f"full history fetch — the pin may be stale or the commit was "
+            f"force-pushed away",
+            dep=name,
+            url=p.url,
+            commit_sha=p.commit_sha,
+        )

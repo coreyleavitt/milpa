@@ -27,7 +27,27 @@ All 11b items done, all gates green, zero divergence (see consolidated gate). Su
 **Candidate follow-ups (non-blocking):** workspace `milpa add` UX (gets MAN-WORKSPACE-HAS-DEPS-OR-KIND, not a
 clear refused-message); coverage gaps cli.verify-no-lock + resolver.dev-deps-root-only.
 
-## ⏭ 11c — THE SWAP (Corey-gated, irreversible — needs explicit go). One atomic commit (RFC §6 checklist):
+## ⏳ 11c — THE SWAP: EXECUTED (uncommitted, awaiting Corey diff-review + commit) — 2026-06-14
+Corey gave the go. errors.md = SPEC-OWNED (closes #128; chosen over python-ng-as-generator —
+discovered python-ng errors.py is slug-only, no metadata/generator). Done (all staged, NOT committed):
+- `impls/python-ng` → `impls/python` (git mv, 27 renames); FROZEN impl deleted (127 files incl.
+  error_catalog.py + test_error_catalog.py). impls/ now = {python (rewrite), rust}.
+- `spec/errors.md` hand-added FETCH-REF-DISCOVERY-FAILED (FETCH) + MILPA-INDEX-UNREACHABLE (INTERNAL,
+  §4 swallow-exempt); header changed to "spec-owned, do not generate from any impl; impls bijection-check".
+- Rust companion: both slugs in catalogs (fetch.rs/error.rs); FETCH-REF-DISCOVERY-FAILED raise site in
+  cmd_add → fixture-163 PASSES Rust (out of known_failing); MILPA-INDEX-UNREACHABLE catalog-only/swallow.
+- `impls/python/milpa/errors.py`: PENDING_SPEC_INCLUSION=∅; test_errors.py bijection = ALL_SLUGS==errors.md.
+- harness/descriptors.py: "python" = the rewrite; MILPA_PYTHON_NG gate + python-ng descriptor REMOVED;
+  python known_failing shrunk to 3 cert fixtures; rust ref-discovery known_failing emptied.
+- VERIFIED (independent): impls/python-ng gone, no .venv/junk staged, error_catalog.py gone. Gate re-run
+  in flight. Subagent reported: python 1293, rust --workspace green + clippy clean, bijection 8/8,
+  `python3 -m harness` (NO gate) OVERALL PASS / Python 154 / Rust 157 / ZERO divergence / fixture-163 both.
+- **REMAINING before commit:** (a) my independent gate confirmation; (b) update CLAUDE.md (architecture
+  table: impls/python IS the rewrite, drop frozen/python-ng + MILPA_PYTHON_NG; dev workflow uv from
+  impls/python) + MEMORY.md/memory files; (c) show Corey the diff; (d) commit as ONE atomic swap commit;
+  (e) hold push until Corey confirms. REVERSIBLE until commit: `git reset --hard 408b063 && git clean -fd`.
+
+## (historical) ⏭ 11c — THE SWAP — original checklist (RFC §6):
 1. `git mv impls/python-ng → impls/python` (frozen impl moves out / is replaced).
 2. Regenerate `spec/errors.md` FROM the new `errors.py` (now the generator) — gains FETCH-REF-DISCOVERY-FAILED +
    MILPA-INDEX-UNREACHABLE + the DepDecl codes.

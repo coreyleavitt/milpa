@@ -563,7 +563,9 @@ milpa add <dep> --mirror <url>
 > - Reject if `<dep>` is already declared in `milpa.kdl`
 >   (`dep <name> already declared`; exit 1).
 > - If `--ref` is omitted, discover the remote's default branch via
->   `git ls-remote --symref HEAD`; exit 1 if discovery fails.
+>   `git ls-remote --symref HEAD` (or the mocked-fetches tree under
+>   `MILPA_MOCKED_FETCHES`); if discovery fails, fail with
+>   `FETCH-REF-DISCOVERY-FAILED` (exit 1).
 > - Run a full resolve over the proposed manifest (manifest + new dep).
 > - On successful resolve, atomically write the updated `milpa.kdl` and
 >   `milpa.lock`.

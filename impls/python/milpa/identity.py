@@ -1,125 +1,167 @@
-"""Identity computation — sha256 of a source tree per milpa's spec.
+"""Content-addressed identity — sha256 of a source tree per spec/identity.md.
 
-milpa's *identity* of a dep is the sha256 hash of its source tree,
-computed by walking every entry under the tree root and feeding a
-canonical stream of bytes into sha256. The output is the same
-regardless of which transport delivered the bytes (git, tarball,
-mercurial, OCI, IPFS, local copy) — identity is provenance-
-independent.
+milpa's *identity* of a dep is the sha256 hash of its source tree, computed by
+walking every file and symlink entry under the tree root and feeding a canonical
+byte stream into sha256. The hash is transport-independent, provenance-independent,
+and recomputable from the bytes on disk alone.
 
-See docs/identity-and-provenance.md for the conceptual model.
-See docs/rfc-content-addressed-identity.md §"What exactly is 'content'"
-for the bytes-level spec this module implements.
+Canonical byte stream (identity.md §1.2):
+    For each entry under `path` (excluding .git/ at any depth, §1.4):
+        <relpath-bytes> 0x00 <mode-marker> 0x00 <content-bytes> 0x00
+    Entries sorted by raw UTF-8 byte-order of their relpath (§1.3).
+    mode-marker is a single byte:
+        0x00 — regular file, non-executable (owner-execute bit NOT set)
+        0x01 — regular file, executable (owner-execute bit set, S_IXUSR)
+        0x80 — symbolic link (content-bytes = link-target UTF-8)
+    Empty directories contribute no bytes (§1.2).
 
-Algorithm (canonical):
+Identity string (identity.md §2.1):
+    sha256:<64-lowercase-hex-chars>
 
-  For each entry under `path` (excluding `.git/`):
-      relpath_bytes + 0x00 + mode_marker + 0x00 + entry_content + 0x00
-
-  Entries sorted by POSIX relpath. mode_marker is a single byte:
-      0x00 — regular file, non-executable
-      0x01 — regular file, executable (owner-execute bit set)
-      0x80 — symlink (entry_content is the link target string as UTF-8)
-
-  Empty directories are not hashed (no entry contributes for them).
-
-  Final output: hex digest of the accumulator.
+parse_identity five ordered checks (identity.md §2.2):
+    1. Must be a string              → ID-NOT-A-STRING
+    2. Must contain ':'              → ID-NO-ALGORITHM-PREFIX
+    3. Algorithm in supported set    → ID-UNSUPPORTED-ALGORITHM
+    4. Digest length correct         → ID-WRONG-DIGEST-LENGTH
+    5. Digest all lowercase hex      → ID-NON-HEX-DIGEST
 """
 
-from hashlib import sha256
-from pathlib import Path
+from __future__ import annotations
+
 import os
 import stat
+from dataclasses import dataclass
+from hashlib import sha256
+from pathlib import Path
+from typing import Any
 
+from milpa.errors import (
+    ID_NO_ALGORITHM_PREFIX,
+    ID_NON_HEX_DIGEST,
+    ID_NON_UTF8_SYMLINK_TARGET,
+    ID_NOT_A_STRING,
+    ID_UNSUPPORTED_ALGORITHM,
+    ID_WRONG_DIGEST_LENGTH,
+    MilpaError,
+)
 
-MODE_REGULAR = b"\x00"
-MODE_EXECUTABLE = b"\x01"
-MODE_SYMLINK = b"\x80"
+# ---------------------------------------------------------------------------
+# Algorithm table (identity.md §2.3 algorithm-agility dispatch)
+# ---------------------------------------------------------------------------
 
-
-# Multihash-encoded identity (#34) — the canonical in-memory and on-
-# disk form for milpa identity strings is `<algorithm>:<digest-hex>`.
-# Currently only sha256 is supported. Adding a future algorithm:
-#   1. Add to SUPPORTED_ALGORITHMS with its digest length
-#   2. Update compute_content_hash branch (or add a sibling function)
-#   3. During the migration window, lockfiles may carry BOTH the old
-#      and new algorithm per dep; both are written, only the new one
-#      is required to match for verification. (Not yet implemented;
-#      content_hash today is a single string, not a list.)
-
+#: The set of algorithm prefixes milpa currently accepts in identity strings.
+#: Adding a new algorithm: add it here and to _DIGEST_HEX_LEN below; no other
+#: changes required in this module.
 SUPPORTED_ALGORITHMS: frozenset[str] = frozenset({"sha256"})
 
-# Digest length in hex characters per algorithm
+#: Expected hex-character length of the digest part for each algorithm.
 _DIGEST_HEX_LEN: dict[str, int] = {"sha256": 64}
 
+# ---------------------------------------------------------------------------
+# Mode markers (identity.md §1.2 / §1.7)
+# ---------------------------------------------------------------------------
 
-class IdentityError(ValueError):
-    """Raised by parse_identity when an identity string is malformed
-    or uses an unsupported algorithm."""
-
-    def __init__(self, message: str = "", *, code: str | None = None) -> None:
-        super().__init__(message)
-        self.code = code
+_MODE_REGULAR: bytes = b"\x00"
+_MODE_EXECUTABLE: bytes = b"\x01"
+_MODE_SYMLINK: bytes = b"\x80"
 
 
-def parse_identity(s: str) -> str:
+# ---------------------------------------------------------------------------
+# parse_identity — 5 ordered checks (identity.md §2.2)
+# ---------------------------------------------------------------------------
+
+
+def parse_identity(s: Any) -> str:
     """Validate a multihash-encoded identity string.
 
-    Accepts: `<algorithm>:<digest-hex>` where algorithm is in
-    SUPPORTED_ALGORITHMS and the digest is the right length of
-    lowercase hex characters.
+    Applies the five ordered checks from identity.md §2.2 in order.
+    Returns the input string unchanged when valid (the canonical form IS the
+    input itself).
 
-    Returns the input string unchanged when valid (canonical form).
-    Raises IdentityError naming the specific failure mode otherwise.
+    Raises:
+        MilpaError(ID_NOT_A_STRING)            — input is not a str
+        MilpaError(ID_NO_ALGORITHM_PREFIX)     — no ':' separator
+        MilpaError(ID_UNSUPPORTED_ALGORITHM)   — algorithm not in SUPPORTED_ALGORITHMS
+        MilpaError(ID_WRONG_DIGEST_LENGTH)     — digest length wrong for algorithm
+        MilpaError(ID_NON_HEX_DIGEST)         — digest contains non-lowercase-hex chars
     """
+    # Check 1: must be a string (identity.md §2.2 rule 1)
     if not isinstance(s, str):
-        raise IdentityError(
-            f"identity must be a string, got {type(s).__name__}",
-            code="ID-NOT-A-STRING",
+        raise MilpaError(
+            ID_NOT_A_STRING,
+            f"identity must be a string, got {type(s).__name__!r}",
+            got_type=type(s).__name__,
         )
+
+    # Check 2: must contain ':' separator (identity.md §2.2 rule 2)
     if ":" not in s:
-        raise IdentityError(
+        raise MilpaError(
+            ID_NO_ALGORITHM_PREFIX,
             f"identity {s!r} is missing the algorithm prefix; "
             f"expected '<algorithm>:<digest>' (e.g. 'sha256:abc...')",
-            code="ID-NO-ALGORITHM-PREFIX",
+            identity=s,
         )
+
     algorithm, _, digest = s.partition(":")
+
+    # Check 3: algorithm must be supported (identity.md §2.2 rule 3)
     if algorithm not in SUPPORTED_ALGORITHMS:
         allowed = ", ".join(sorted(SUPPORTED_ALGORITHMS))
-        raise IdentityError(
+        raise MilpaError(
+            ID_UNSUPPORTED_ALGORITHM,
             f"identity {s!r} uses unsupported algorithm {algorithm!r} "
             f"(supported: {allowed})",
-            code="ID-UNSUPPORTED-ALGORITHM",
+            algorithm=algorithm,
+            identity=s,
         )
+
     expected_len = _DIGEST_HEX_LEN[algorithm]
+
+    # Check 4: digest length must be correct (identity.md §2.2 rule 4)
     if len(digest) != expected_len:
-        raise IdentityError(
+        raise MilpaError(
+            ID_WRONG_DIGEST_LENGTH,
             f"identity {s!r}: {algorithm} digest must be exactly "
             f"{expected_len} hex characters, got {len(digest)}",
-            code="ID-WRONG-DIGEST-LENGTH",
+            algorithm=algorithm,
+            expected=expected_len,
+            got=len(digest),
+            identity=s,
         )
+
+    # Check 5: digest must be lowercase hex only (identity.md §2.2 rule 5)
     if not all(c in "0123456789abcdef" for c in digest):
-        raise IdentityError(
-            f"identity {s!r}: digest must be lowercase hex characters "
-            f"(0-9, a-f)",
-            code="ID-NON-HEX-DIGEST",
+        raise MilpaError(
+            ID_NON_HEX_DIGEST,
+            f"identity {s!r}: digest must be lowercase hex characters (0-9, a-f)",
+            identity=s,
         )
+
     return s
+
+
+# ---------------------------------------------------------------------------
+# compute_content_hash (identity.md §1)
+# ---------------------------------------------------------------------------
 
 
 def compute_content_hash(path: Path) -> str:
     """Compute the sha256 content hash of the source tree at `path`.
 
-    Returns the multihash-encoded identity string `sha256:<64-hex>`.
-    Same input bytes always produce the same hash, regardless of
-    host filesystem, clone location, or transport. The `sha256:`
-    prefix is part of the canonical form (#34) — every layer that
-    handles identity in milpa expects the prefix to be present.
+    Returns the multihash-encoded identity string ``sha256:<64-hex>``.
+    The ``sha256:`` prefix is the canonical form (identity.md §2.1).
+
+    Same source bytes always produce the same hash regardless of how the tree
+    was obtained (git, tarball, OCI, local copy) — identity is transport- and
+    provenance-independent.
+
+    Raises:
+        MilpaError(ID_NON_UTF8_SYMLINK_TARGET) — a symlink's target cannot be
+            encoded as UTF-8 (identity.md §1.5).
     """
     h = sha256()
     for entry in _enumerate_entries(path):
-        relpath_bytes = entry.relpath.encode("utf-8")
-        h.update(relpath_bytes)
+        h.update(entry.relpath.encode("utf-8"))
         h.update(b"\x00")
         h.update(entry.mode_marker)
         h.update(b"\x00")
@@ -128,63 +170,81 @@ def compute_content_hash(path: Path) -> str:
     return f"sha256:{h.hexdigest()}"
 
 
-class _Entry:
-    """Internal: one tree entry to be hashed."""
-    __slots__ = ("relpath", "mode_marker", "content")
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-    def __init__(self, relpath: str, mode_marker: bytes, content: bytes):
-        self.relpath = relpath
-        self.mode_marker = mode_marker
-        self.content = content
+
+@dataclass(slots=True)
+class _Entry:
+    """One file/symlink tree entry destined for the hash accumulator."""
+
+    relpath: str     # POSIX relative path from tree root, UTF-8
+    mode_marker: bytes  # one of _MODE_REGULAR / _MODE_EXECUTABLE / _MODE_SYMLINK
+    content: bytes   # file bytes, or symlink-target UTF-8 bytes
 
 
 def _enumerate_entries(root: Path) -> list[_Entry]:
-    """Walk `root`, yielding canonical _Entry records.
+    """Walk `root`, collecting one _Entry per file and symlink.
 
-    Skips:
-      - .git/ directories at any depth (provenance, not content)
-      - directories themselves (only their file/symlink entries count)
-      - empty directories (silently)
+    Exclusions (identity.md §1.4):
+      - Any path component named ``.git`` at any depth.
+      - Directories themselves (only their file/symlink children contribute).
+      - Empty directories (implicitly — they have no children to collect).
 
-    Symlinks are NOT followed; their target string is hashed as content
-    with the symlink mode marker.
+    Symlinks are NOT followed (identity.md §1.5): a symlink-to-directory is
+    a leaf entry, not a recursion point.
+
+    Entries are returned sorted by raw UTF-8 byte-order of their relpath
+    (identity.md §1.3).
     """
     entries: list[_Entry] = []
     for p in root.rglob("*"):
-        # Exclude anything under .git/
+        # §1.4: exclude .git and everything beneath it at any depth.
         if ".git" in p.parts:
             continue
 
         if p.is_symlink():
-            # Hash the link target string as content; don't follow.
+            # §1.5: hash the link-target string as UTF-8; do not follow.
+            raw_target = os.readlink(p)
             try:
-                target = os.readlink(p).encode("utf-8")
-            except UnicodeEncodeError as e:
-                # os.readlink surrogate-escapes undecodable bytes on POSIX;
-                # re-encoding to UTF-8 then fails. A non-UTF-8 symlink target
-                # is not representable in the content-hash algorithm.
-                raise IdentityError(
+                content = raw_target.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                # os.readlink() surrogate-escapes non-UTF-8 bytes on POSIX;
+                # re-encoding to UTF-8 then fails.  A non-UTF-8 symlink target
+                # cannot be represented in the canonical byte stream (§1.5 /
+                # Normative surface rule 12).
+                raise MilpaError(
+                    ID_NON_UTF8_SYMLINK_TARGET,
                     f"symlink target at "
-                    f"{p.relative_to(root).as_posix()!r} is not valid "
-                    f"UTF-8 — cannot compute a content hash",
-                    code="ID-NON-UTF8-SYMLINK-TARGET",
-                ) from e
-            entries.append(_Entry(
-                relpath=p.relative_to(root).as_posix(),
-                mode_marker=MODE_SYMLINK,
-                content=target,
-            ))
-        elif p.is_file():
-            mode = p.stat().st_mode
-            marker = (
-                MODE_EXECUTABLE if mode & stat.S_IXUSR else MODE_REGULAR
+                    f"{p.relative_to(root).as_posix()!r} is not valid UTF-8 "
+                    f"— cannot compute a content hash",
+                    relpath=p.relative_to(root).as_posix(),
+                ) from exc
+            entries.append(
+                _Entry(
+                    relpath=p.relative_to(root).as_posix(),
+                    mode_marker=_MODE_SYMLINK,
+                    content=content,
+                )
             )
-            entries.append(_Entry(
-                relpath=p.relative_to(root).as_posix(),
-                mode_marker=marker,
-                content=p.read_bytes(),
-            ))
-        # else: directory (skipped — only file/symlink entries contribute)
+        elif p.is_file():
+            # §1.7: only the owner-execute bit (S_IXUSR) selects the
+            # executable marker; all other permission bits are ignored.
+            mode = p.stat().st_mode
+            marker = _MODE_EXECUTABLE if (mode & stat.S_IXUSR) else _MODE_REGULAR
+            entries.append(
+                _Entry(
+                    relpath=p.relative_to(root).as_posix(),
+                    mode_marker=marker,
+                    content=p.read_bytes(),  # §1.6: raw bytes, no line-ending normalisation
+                )
+            )
+        # else: directory — skip; empty dirs contribute nothing (§1.2).
 
+    # §1.3: sort by raw UTF-8 byte-order of relpath.
+    # Python's default str sort is lexicographic on Unicode code points.
+    # For valid POSIX paths (which are pure ASCII or valid UTF-8 sequences)
+    # this is equivalent to raw-byte order.
     entries.sort(key=lambda e: e.relpath)
     return entries

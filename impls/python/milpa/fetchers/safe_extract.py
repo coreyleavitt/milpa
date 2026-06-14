@@ -1,164 +1,242 @@
-"""Sandboxed archive extraction.
+"""Safe tar extraction — standalone utility (spec §plugin-contract.md §2.1).
 
-Defends against the standard archive-extraction attack classes:
+Guards against:
+  - EXTRACT-ZIP-SLIP: entry path escapes dest via ``..`` or absolute paths.
+  - EXTRACT-SYMLINK-ESCAPE: symlink target resolves outside dest.
+  - EXTRACT-SIZE-LIMIT: per-file / total-bytes / file-count caps (decompression-bomb defence).
 
-  - Zip-slip: entries whose resolved path escapes the destination
-    directory (`../../etc/passwd`, absolute paths)
-  - Symlink-escape: symlink entries whose target resolves outside
-    the destination tree
-  - Decompression bombs: archives whose decompressed size vastly
-    exceeds compressed size (billion laughs-style)
-  - Excessive file count: archives creating millions of tiny files
+No dependency on the fetcher protocol.  This module is a pure filesystem utility;
+callers are responsible for cleaning up a partially-extracted ``dest`` on error.
 
-Used by TarballFetcher (F2) and any future fetcher that handles
-extractable archives (F6 OCI, F7 IPFS). See
-docs/rfc-pluggable-fetchers.md §Sandboxing fetcher execution.
-
-The module exports `extract_tar` as the primary entry point. Caps
-are passed as kwargs so callers can tune per use case (e.g., the
-toolchain RFC's compiler-binary extraction might allow larger
-total size).
+All size limits are applied **during** extraction (streaming); path-escape checks
+run **per-entry before any write**.  Device nodes, FIFOs, and other non-regular,
+non-symlink, non-directory entry types are silently skipped.
 """
+
+from __future__ import annotations
 
 import os
 import tarfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import IO
+
+from milpa.errors import (
+    EXTRACT_SIZE_LIMIT,
+    EXTRACT_SYMLINK_ESCAPE,
+    EXTRACT_ZIP_SLIP,
+    MilpaError,
+)
+
+# ---------------------------------------------------------------------------
+# Limits
+# ---------------------------------------------------------------------------
 
 
-class ExtractionError(Exception):
-    """Base class for archive-extraction failures."""
+@dataclass(frozen=True)
+class Limits:
+    """Extraction caps.  Defaults are normative per plugin-contract.md §2.1.
 
-    def __init__(self, message: str = "", *, code: str | None = None) -> None:
-        super().__init__(message)
-        self.code = code
+    Args:
+        max_total_size:  Maximum total uncompressed bytes across all entries.  Default 1 GiB.
+        max_file_size:   Maximum uncompressed bytes for a single entry.  Default 256 MiB.
+        max_file_count:  Maximum number of regular files + symlinks.  Default 100 000.
+    """
+
+    max_total_size: int = field(default=1 << 30)   # 1 GiB
+    max_file_size: int = field(default=1 << 28)    # 256 MiB
+    max_file_count: int = field(default=100_000)
 
 
-class ZipSlipError(ExtractionError):
-    """An entry's path resolves outside the destination directory."""
-
-
-class SymlinkEscapeError(ExtractionError):
-    """A symlink entry's target resolves outside the destination tree."""
-
-
-class SizeLimitError(ExtractionError):
-    """The archive exceeds a configured size or file-count limit."""
+# ---------------------------------------------------------------------------
+# ExtractionResult
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class ExtractionResult:
-    """What extract_tar reports back.
+    """Counts produced by a successful extraction."""
 
-    Counts files actually written (post-strip_components filtering)
-    and the total uncompressed bytes those files contained.
-    """
     file_count: int
     total_bytes: int
 
 
+# ---------------------------------------------------------------------------
+# Lexical path normalisation (no filesystem access)
+# ---------------------------------------------------------------------------
+
+
+def _normalize_lexical(path: Path) -> Path:
+    """Resolve ``.`` and ``..`` components without touching the filesystem.
+
+    ``..`` pops the last *normal* component; if the stack is empty the ``..``
+    is kept (mirrors Rust ``normalize_lexical``).
+    """
+    parts: list[str] = []
+    for part in path.parts:
+        if part == "..":
+            if parts and parts[-1] not in ("", ".."):
+                parts.pop()
+            else:
+                parts.append(part)
+        elif part == ".":
+            pass
+        else:
+            parts.append(part)
+    if not parts:
+        return Path(".")
+    return Path(*parts)
+
+
+# ---------------------------------------------------------------------------
+# Core extraction
+# ---------------------------------------------------------------------------
+
+
+#: Singleton used as the ``extract_tar`` default so ruff B008 (no call in
+#: default position) is satisfied while preserving the normative defaults.
+_DEFAULT_LIMITS = Limits()
+
+
 def extract_tar(
-    archive_path: Path,
-    dest: Path,
+    archive: str | Path | IO[bytes],
+    dest: str | Path,
     *,
     strip_components: int = 0,
-    max_total_size: int = 1 << 30,      # 1 GiB
-    max_file_size: int = 1 << 28,       # 256 MiB
-    max_file_count: int = 100_000,
+    limits: Limits = _DEFAULT_LIMITS,
 ) -> ExtractionResult:
-    """Extract a tar archive (any compression tarfile supports) to dest.
+    """Extract a tar archive (any compression tarfile supports) into *dest*.
 
-    `strip_components` removes the first N path components from each
-    entry (like `tar --strip-components=N`). Entries with fewer than
-    N path components are skipped (they're parents we're stripping).
+    Args:
+        archive:          Path or file-object for the archive.
+        dest:             Directory into which entries are extracted (created if absent).
+        strip_components: Drop this many leading path components per entry
+                          (like ``tar --strip-components=N``).  Entries with
+                          fewer components are silently skipped.
+        limits:           Extraction caps.  Defaults are normative.
 
-    Defends against the attack classes documented at module level.
-    Raises ExtractionError subclasses on violations; the partial
-    extraction state at dest is the caller's problem to clean up
-    (typically: rmtree dest on any failure).
+    Returns:
+        :class:`ExtractionResult` with ``file_count`` and ``total_bytes``.
+
+    Raises:
+        MilpaError: with slug ``EXTRACT-ZIP-SLIP``, ``EXTRACT-SYMLINK-ESCAPE``,
+                    or ``EXTRACT-SIZE-LIMIT`` on the matching attack class.
     """
+    dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
-    dest_resolved = dest.resolve()
+    # Canonicalise dest so prefix comparisons are reliable even when the
+    # caller passed a symlink-containing path.
+    dest_root = dest.resolve()
 
     total_bytes = 0
     file_count = 0
 
-    with tarfile.open(archive_path, "r:*") as tf:
-        for member in tf:
-            # Apply strip_components: split the entry's path and skip
-            # the first N components. Entries with too few components
-            # are dropped silently (they're the parents we're stripping).
-            parts = member.name.split("/")
-            parts = [p for p in parts if p not in ("", ".")]
-            if len(parts) <= strip_components:
-                continue
-            stripped_name = "/".join(parts[strip_components:])
-
-            # Resolve the target path under dest. Catch zip-slip:
-            # any entry whose resolved path escapes dest is malicious.
-            target = (dest / stripped_name).resolve()
-            try:
-                target.relative_to(dest_resolved)
-            except ValueError:
-                raise ZipSlipError(
-                    f"archive entry {member.name!r} resolves outside "
-                    f"destination: {target} not under {dest_resolved}",
-                    code="EXTRACT-ZIP-SLIP",
+    # Open with mode "r:*" so tarfile handles gz/bz2/xz automatically.
+    with tarfile.open(fileobj=archive if not isinstance(archive, (str, Path)) else None,
+                      name=archive if isinstance(archive, (str, Path)) else None,
+                      mode="r:*") as tf:
+        for member in tf.getmembers():
+            # --- absolute-path check (zip-slip variant) ----------------------
+            # An entry whose name starts with "/" is an absolute path traversal.
+            # We reject it before stripping, because stripping the empty leading
+            # component would silently "fix" it and let /etc/passwd land at
+            # dest/etc/passwd rather than escaping — but the spec requires
+            # EXTRACT-ZIP-SLIP for any absolute-path entry.
+            if member.name.startswith("/"):
+                raise MilpaError(
+                    EXTRACT_ZIP_SLIP,
+                    f"archive entry {member.name!r} has an absolute path",
+                    entry=member.name,
+                    dest=str(dest_root),
                 )
 
-            if member.issym() or member.islnk():
-                # Symlink targets are evaluated relative to the symlink's
-                # parent directory; resolve to check the eventual target.
-                link_target = (target.parent / member.linkname).resolve()
-                try:
-                    link_target.relative_to(dest_resolved)
-                except ValueError:
-                    raise SymlinkEscapeError(
-                        f"symlink {member.name!r} → {member.linkname!r} "
-                        f"resolves outside destination: {link_target} "
-                        f"not under {dest_resolved}",
-                        code="EXTRACT-SYMLINK-ESCAPE",
-                    )
-                target.parent.mkdir(parents=True, exist_ok=True)
-                os.symlink(member.linkname, target)
-                file_count += 1
+            # --- strip_components -------------------------------------------
+            raw_parts = [p for p in member.name.split("/") if p and p != "."]
+            if len(raw_parts) <= strip_components:
                 continue
+            stripped_name = "/".join(raw_parts[strip_components:])
 
+            # --- zip-slip check (lexical, target doesn't exist yet) ----------
+            candidate = _normalize_lexical(dest_root / stripped_name)
+            if not str(candidate).startswith(str(dest_root) + os.sep) and candidate != dest_root:
+                raise MilpaError(
+                    EXTRACT_ZIP_SLIP,
+                    f"archive entry {member.name!r} resolves outside destination: "
+                    f"{candidate} not under {dest_root}",
+                    entry=member.name,
+                    dest=str(dest_root),
+                )
+
+            # --- dispatch by type -------------------------------------------
             if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
-                continue
+                candidate.mkdir(parents=True, exist_ok=True)
 
-            if not member.isfile():
-                # Skip char/block devices, fifos, etc. — never legitimate
-                # in a source archive.
-                continue
+            elif member.issym() or member.islnk():
+                # symlink-escape: resolve target relative to its parent
+                link_target_raw = member.linkname
+                parent = candidate.parent
+                resolved_target = _normalize_lexical(parent / link_target_raw)
+                under_dest = (
+                    str(resolved_target).startswith(str(dest_root) + os.sep)
+                    or resolved_target == dest_root
+                )
+                if not under_dest:
+                    raise MilpaError(
+                        EXTRACT_SYMLINK_ESCAPE,
+                        f"symlink {member.name!r} → {link_target_raw!r} resolves outside "
+                        f"destination: {resolved_target} not under {dest_root}",
+                        entry=member.name,
+                        link_target=link_target_raw,
+                        dest=str(dest_root),
+                    )
+                file_count += 1
+                if file_count > limits.max_file_count:
+                    raise MilpaError(
+                        EXTRACT_SIZE_LIMIT,
+                        f"archive file count exceeds cap "
+                        f"({file_count} > {limits.max_file_count})",
+                        file_count=file_count,
+                        cap=limits.max_file_count,
+                    )
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                if candidate.exists() or candidate.is_symlink():
+                    candidate.unlink()
+                candidate.symlink_to(link_target_raw)
 
-            if member.size > max_file_size:
-                raise SizeLimitError(
-                    f"archive entry {member.name!r} exceeds per-file "
-                    f"size cap ({member.size} > {max_file_size})",
-                    code="EXTRACT-SIZE-LIMIT",
-                )
-            total_bytes += member.size
-            if total_bytes > max_total_size:
-                raise SizeLimitError(
-                    f"archive total decompressed size exceeds cap "
-                    f"({total_bytes} > {max_total_size})",
-                    code="EXTRACT-SIZE-LIMIT",
-                )
-            file_count += 1
-            if file_count > max_file_count:
-                raise SizeLimitError(
-                    f"archive file count exceeds cap "
-                    f"({file_count} > {max_file_count})",
-                    code="EXTRACT-SIZE-LIMIT",
-                )
+            elif member.isfile():
+                # per-file size cap (checked before writing)
+                if member.size > limits.max_file_size:
+                    raise MilpaError(
+                        EXTRACT_SIZE_LIMIT,
+                        f"entry {member.name!r} exceeds per-file cap "
+                        f"({member.size} > {limits.max_file_size})",
+                        entry=member.name,
+                        size=member.size,
+                        cap=limits.max_file_size,
+                    )
+                total_bytes += member.size
+                if total_bytes > limits.max_total_size:
+                    raise MilpaError(
+                        EXTRACT_SIZE_LIMIT,
+                        f"archive total size exceeds cap "
+                        f"({total_bytes} > {limits.max_total_size})",
+                        total_bytes=total_bytes,
+                        cap=limits.max_total_size,
+                    )
+                file_count += 1
+                if file_count > limits.max_file_count:
+                    raise MilpaError(
+                        EXTRACT_SIZE_LIMIT,
+                        f"archive file count exceeds cap "
+                        f"({file_count} > {limits.max_file_count})",
+                        file_count=file_count,
+                        cap=limits.max_file_count,
+                    )
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                fobj = tf.extractfile(member)
+                if fobj is not None:
+                    candidate.write_bytes(fobj.read())
 
-            target.parent.mkdir(parents=True, exist_ok=True)
-            extracted = tf.extractfile(member)
-            if extracted is None:
-                # Should not happen for regular files; guard defensively.
-                continue
-            target.write_bytes(extracted.read())
+            # device nodes, FIFOs, etc. — silently skip (never legitimate in source)
 
     return ExtractionResult(file_count=file_count, total_bytes=total_bytes)

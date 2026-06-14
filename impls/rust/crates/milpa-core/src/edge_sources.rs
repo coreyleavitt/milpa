@@ -22,7 +22,7 @@
 //! `(Vec<SolverDep>, Vec<String>, Vec<Item>)` triple (mirrors `Extracted`
 //! without `src_dir`, which flows through `EdgeSet.src_dir` directly).
 //!
-//! Mirrors `milpa/edge_sources.py` in `impls/python-ng`.
+//! Mirrors `milpa/edge_sources.py` in `impls/python`.
 
 use std::collections::BTreeMap;
 use std::path::Path;

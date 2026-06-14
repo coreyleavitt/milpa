@@ -1,110 +1,120 @@
-"""Host / target profile for conditional dep resolution (#26).
+"""Profile data types — runtime resolution context.
 
-A Profile carries the values the resolver evaluates per-dep predicates
-against: target platform, target arch, available Nim version, milpa's
-own version. Profiles can be constructed from the host environment or
-overridden via env vars for cross-resolution.
+DATA TYPES ONLY.  No predicate evaluation, no subprocess, no I/O.
+
+``Profile.from_environment`` takes the Nim version as an injected string
+(default ``"0.0.0"``); it NEVER spawns ``nim --version``.  The subprocess
+that queries the live Nim version lives in ``cli.py`` and is passed in.
+
+Predicate evaluation (``_filter_manifest_by_profile``) is a resolver step
+(Stage 9), run before the solver input is built.  This module represents
+predicates as data only.
+
+RFC §4.2 boundary criteria:
+  - No imports from ``manifest.py``, ``solver.py``, or any I/O layer.
+  - Importable in tests without a Nim toolchain present.
+  - ``Profile.from_environment`` reads env vars ``MILPA_TARGET_*``
+    (§6.6) in exactly one place.
 """
 
+from __future__ import annotations
+
 import os
-import platform as _stdlib_platform
-import re
-import subprocess
-from collections.abc import Callable
-from dataclasses import dataclass
+import platform as _platform
+from dataclasses import dataclass, field
+
+# ---------------------------------------------------------------------------
+# Platform / arch normalization
+# ---------------------------------------------------------------------------
+
+_OS_MAP: dict[str, str] = {
+    "darwin": "macosx",
+    "windows": "windows",
+    "linux": "linux",
+    "freebsd": "freebsd",
+    "openbsd": "openbsd",
+    "netbsd": "netbsd",
+}
+
+_ARCH_MAP: dict[str, str] = {
+    "x86_64": "amd64",
+    "amd64": "amd64",
+    "aarch64": "arm64",
+    "arm64": "arm64",
+    "i386": "i386",
+    "i686": "i386",
+}
+
+
+def _detect_platform() -> str:
+    raw = _platform.system().lower()
+    return _OS_MAP.get(raw, raw)
+
+
+def _detect_arch() -> str:
+    raw = _platform.machine().lower()
+    return _ARCH_MAP.get(raw, raw)
+
+
+# ---------------------------------------------------------------------------
+# Profile
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class Profile:
-    """The target context that conditional dep predicates evaluate
-    against. Single source of truth — no scattered globals."""
-    platform: str          # e.g. "linux", "macosx", "windows"
-    arch: str              # e.g. "amd64", "arm64", "i386"
-    nim: str               # semver version of the target nim ("2.0.4")
-    milpa: str             # semver version of milpa itself
+    """Runtime profile against which predicates are evaluated.
+
+    Fields:
+      platform: Nim ``hostOS`` token (e.g. ``"linux"``, ``"macosx"``).
+      arch:     Nim ``hostCPU`` token (e.g. ``"amd64"``, ``"arm64"``).
+      nim:      Nim version string (e.g. ``"2.0.0"``).  Injected, never
+                queried via subprocess here.
+      milpa:    milpa version string.  Overridable via
+                ``MILPA_TARGET_MILPA`` env var.
+      flags:    Frozenset of active feature flag names (default-true +
+                explicitly enabled).  Empty set at manifest-parse time;
+                the resolver populates this after reading the ``flags``
+                block.
+    """
+
+    platform: str
+    arch: str
+    nim: str
+    milpa: str
+    flags: frozenset[str] = field(default_factory=frozenset)
 
     @classmethod
     def from_environment(
         cls,
         *,
-        nim_version_query: Callable[[], str] | None = None,
-        milpa_version: str | None = None,
-    ) -> "Profile":
-        """Detect the host profile.
+        nim_version: str | None = None,
+        milpa_version: str = "0.0.0",
+        flags: frozenset[str] | None = None,
+    ) -> Profile:
+        """Construct a ``Profile`` from the current environment.
 
-        OS + arch normalized to Nim conventions; Nim version queried
-        via the injected callable (defaults to `nim --version`).
-        Env vars override individual fields:
-            MILPA_TARGET_PLATFORM, MILPA_TARGET_ARCH, MILPA_TARGET_NIM,
-            MILPA_TARGET_MILPA
-        The `milpa` field defaults to this implementation's own version
-        (milpa.__version__) when neither the env var nor an explicit
-        `milpa_version` argument is supplied.
+        ``nim_version`` is an injected string (default ``"0.0.0"``).
+        The subprocess that queries ``nim --version`` lives in
+        ``cli.py`` — never here.
+
+        Environment variable overrides (§6.6):
+          ``MILPA_TARGET_PLATFORM``  → ``platform``
+          ``MILPA_TARGET_ARCH``      → ``arch``
+          ``MILPA_TARGET_NIM``       → ``nim``
+          ``MILPA_TARGET_MILPA``     → ``milpa``
         """
-        plat = os.environ.get("MILPA_TARGET_PLATFORM") or _detect_platform()
-        arch = os.environ.get("MILPA_TARGET_ARCH") or _detect_arch()
-        nim_v = os.environ.get("MILPA_TARGET_NIM")
-        if nim_v is None:
-            q = nim_version_query or _query_nim_version
-            try:
-                nim_v = q()
-            except Exception:
-                nim_v = "0.0.0"     # unknown; conditional deps on `nim` won't match
-        milpa_v = (
-            os.environ.get("MILPA_TARGET_MILPA")
-            or milpa_version
-            or _milpa_version()
+        effective_platform = (
+            os.environ.get("MILPA_TARGET_PLATFORM") or _detect_platform()
         )
-        return cls(platform=plat, arch=arch, nim=nim_v, milpa=milpa_v)
+        effective_arch = os.environ.get("MILPA_TARGET_ARCH") or _detect_arch()
+        effective_nim = os.environ.get("MILPA_TARGET_NIM") or nim_version or "0.0.0"
+        effective_milpa = os.environ.get("MILPA_TARGET_MILPA") or milpa_version
 
-
-def _milpa_version() -> str:
-    """This implementation's own version, for the `milpa` predicate.
-
-    Reads `milpa.__version__` (the single source of truth, also surfaced
-    by `milpa --version`). Falls back to "0.0.0" if it cannot be
-    imported, so conditional deps gated on `milpa` simply won't match
-    rather than crashing.
-    """
-    try:
-        from . import __version__
-        return __version__
-    except Exception:
-        return "0.0.0"
-
-
-def _detect_platform() -> str:
-    """Map Python platform.system() to Nim's `hostOS` vocabulary."""
-    sys = _stdlib_platform.system().lower()
-    return {
-        "darwin": "macosx",
-        "windows": "windows",
-        "linux": "linux",
-        "freebsd": "freebsd",
-        "openbsd": "openbsd",
-        "netbsd": "netbsd",
-    }.get(sys, sys)
-
-
-def _detect_arch() -> str:
-    """Map Python platform.machine() to Nim's `hostCPU` vocabulary."""
-    m = _stdlib_platform.machine().lower()
-    return {
-        "x86_64": "amd64",
-        "amd64": "amd64",
-        "aarch64": "arm64",
-        "arm64": "arm64",
-        "i386": "i386",
-        "i686": "i386",
-    }.get(m, m)
-
-
-def _query_nim_version() -> str:
-    out = subprocess.run(
-        ["nim", "--version"],
-        capture_output=True, text=True, check=True,
-    ).stdout
-    m = re.search(r"Version (\d+\.\d+\.\d+)", out)
-    if not m:
-        raise RuntimeError(f"could not parse nim version from: {out!r}")
-    return m.group(1)
+        return cls(
+            platform=effective_platform,
+            arch=effective_arch,
+            nim=effective_nim,
+            milpa=effective_milpa,
+            flags=flags if flags is not None else frozenset(),
+        )

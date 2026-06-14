@@ -8,11 +8,11 @@ version = "0.0.1"
 description = "Nim dependency resolver — reads milpa.kdl, emits nim.cfg, bypasses nimble's broken SAT solver."
 authors = [{name = "Corey Leavitt", email = "corey@knurl.io"}]
 license = "Apache-2.0"
-readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "kdl-py >= 1.2",       # KDL v2 parser (tabatkins/kdlpy)
-    "requests >= 2.31",    # HTTP for packages_official.json
+    # KDL 2.0 parser (tabatkins/kdlpy); pinned to exact SHA — swap to kdl-py>=2.0
+    # when it publishes to PyPI.  SHA verified 2026-06-12 as main HEAD.
+    "kdl-py @ git+https://github.com/tabatkins/kdlpy.git@d9a220762fb9f55e4f59296256221084c26f54da",
 ]
 
 [project.scripts]
@@ -21,17 +21,19 @@ milpa = "milpa.cli:main"
 [project.urls]
 Homepage = "https://github.com/coreyleavitt/milpa"
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["milpa"]
-
-[tool.hatch.build.targets.wheel.shared-data]
-"milpa/schema" = "milpa/schema"
 
 [dependency-groups]
 dev = [
     "pytest >= 8",
     "hypothesis >= 6",
-    # S11 reference-plugin fixture — installed so its entry point populates
+    "mypy >= 1.10",
+    "ruff >= 0.4",
+    # S7a reference-plugin fixture — installed so its entry point populates
     # importlib.metadata and exercises the real discovery path in tests.
     # Source is mapped to the local path via [tool.uv.sources] below.
     "milpa-fetcher-stub",
@@ -46,3 +48,15 @@ addopts = "-q"
 markers = [
     "integration: end-to-end test using real network access. Opt-in via MILPA_INTEGRATION_TESTS=1.",
 ]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = []

@@ -1,12 +1,10 @@
-"""Stage 1a: errors.py bijection + MilpaError shape tests.
+"""errors.py bijection + MilpaError shape tests.
 
-Bijection invariant:
-    errors.py slug-constant set == (spec/errors.md slugs) ∪ {FETCH-REF-DISCOVERY-FAILED,
-                                                              MILPA-INDEX-UNREACHABLE}
+Bijection invariant (post-swap S11c):
+    errors.py slug-constant set == spec/errors.md slugs (exactly)
 
-At swap (S11c): errors.md is regenerated FROM errors.py (gaining the two pending codes),
-the Rust DEFERRED→implemented companion lands alongside raise sites, and the ∪ {pending}
-term is deleted so this reduces to: errors.py == errors.md exactly.
+spec/errors.md is the spec-owned SSOT.  errors.py bijection-checks against it.
+PENDING_SPEC_INCLUSION is empty post-swap.
 """
 
 from __future__ import annotations
@@ -20,11 +18,8 @@ import milpa.errors as errors_mod
 # Helpers
 # ---------------------------------------------------------------------------
 
-REPO_ROOT = Path(__file__).resolve().parents[3]  # impls/python-ng/tests → repo root
+REPO_ROOT = Path(__file__).resolve().parents[3]  # impls/python/tests → repo root
 ERRORS_MD = REPO_ROOT / "spec" / "errors.md"
-
-# Two codes pending spec inclusion (added to errors.py now; enter errors.md at swap S11c).
-PENDING_SPEC_INCLUSION = {"FETCH-REF-DISCOVERY-FAILED", "MILPA-INDEX-UNREACHABLE"}
 
 
 def _parse_spec_slugs() -> frozenset[str]:
@@ -64,20 +59,19 @@ def _module_slug_constants() -> frozenset[str]:
 
 
 def test_bijection_with_spec_errors_md() -> None:
-    """errors.py slug set == spec/errors.md slugs ∪ PENDING_SPEC_INCLUSION."""
+    """errors.py slug set == spec/errors.md slugs exactly (PENDING_SPEC_INCLUSION is empty)."""
     spec_slugs = _parse_spec_slugs()
     module_slugs = _module_slug_constants()
-    expected = spec_slugs | PENDING_SPEC_INCLUSION
 
-    missing_from_module = expected - module_slugs
-    extra_in_module = module_slugs - expected
+    missing_from_module = spec_slugs - module_slugs
+    extra_in_module = module_slugs - spec_slugs
 
     assert not missing_from_module, (
-        "Slugs in spec/errors.md (or pending) but ABSENT from errors.py:\n"
+        "Slugs in spec/errors.md but ABSENT from errors.py:\n"
         + "\n".join(sorted(missing_from_module))
     )
     assert not extra_in_module, (
-        "Slugs in errors.py but NOT in spec/errors.md and NOT pending:\n"
+        "Slugs in errors.py but NOT in spec/errors.md:\n"
         + "\n".join(sorted(extra_in_module))
     )
 
@@ -87,14 +81,9 @@ def test_all_slugs_frozenset_matches_module_constants() -> None:
     assert _module_slug_constants() == errors_mod.ALL_SLUGS
 
 
-def test_pending_spec_inclusion_is_subset_of_all_slugs() -> None:
-    """PENDING_SPEC_INCLUSION slugs are present in errors.py."""
-    assert PENDING_SPEC_INCLUSION <= errors_mod.ALL_SLUGS
-
-
-def test_pending_spec_inclusion_constant_matches() -> None:
-    """The PENDING_SPEC_INCLUSION constant in errors.py matches the test's expectation."""
-    assert frozenset(PENDING_SPEC_INCLUSION) == errors_mod.PENDING_SPEC_INCLUSION
+def test_pending_spec_inclusion_is_empty() -> None:
+    """PENDING_SPEC_INCLUSION is empty post-swap: all codes are in spec/errors.md."""
+    assert errors_mod.PENDING_SPEC_INCLUSION == frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -141,9 +130,9 @@ def test_named_constant_value_matches_slug() -> None:
 
     # MAN_DEP_REF_MISSING → "MAN-DEP-REF-MISSING"
     assert errors.MAN_DEP_REF_MISSING == "MAN-DEP-REF-MISSING"
-    # FETCH_REF_DISCOVERY_FAILED → "FETCH-REF-DISCOVERY-FAILED" (pending)
+    # FETCH_REF_DISCOVERY_FAILED → "FETCH-REF-DISCOVERY-FAILED"
     assert errors.FETCH_REF_DISCOVERY_FAILED == "FETCH-REF-DISCOVERY-FAILED"
-    # MILPA_INDEX_UNREACHABLE → "MILPA-INDEX-UNREACHABLE" (pending)
+    # MILPA_INDEX_UNREACHABLE → "MILPA-INDEX-UNREACHABLE"
     assert errors.MILPA_INDEX_UNREACHABLE == "MILPA-INDEX-UNREACHABLE"
 
 

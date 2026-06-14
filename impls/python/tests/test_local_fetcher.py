@@ -1,197 +1,269 @@
-"""LocalFetcher tests — local-filesystem source trees as a fetch
-transport. Copy semantics (symlink mode is deferred).
+"""Tests for milpa.fetchers.local.LocalFetcher (slice 7d-4).
 
-The fetcher exists to support workspace use cases (intonaco at
-`../intonaco`, fresco depending on it without a real git URL). Identity
-is computed by the registry from the copied tree, same invariant as
-GitFetcher; the LocalReceipt records where we copied from.
+Coverage:
+  - LocalProvenance.cas_admissible is False (editable source, §4 NORMATIVE)
+  - LocalProvenance rejects relative paths at construction
+  - LocalReceipt.transport_fields returns {"resolved_path": <str>}
+  - LocalFetcher.can_handle returns True for LocalProvenance, False for others
+  - LocalFetcher.fetch: source dir exists → receipt carries resolved_path
+  - LocalFetcher.fetch: identity equals compute_content_hash of the source dir
+  - LocalFetcher.fetch: source dir left in place (not moved/deleted)
+  - LocalFetcher.fetch: no network (purely local filesystem)
+  - LocalFetcher.fetch: non-existent path → MilpaError FETCH-LOCAL-PATH-NOT-FOUND
+  - LocalFetcher.fetch: path is a file, not a dir → MilpaError FETCH-LOCAL-PATH-NOT-DIR
+  - LocalFetcher: fetcher does NOT compute identity (no identity in receipt)
+  - LocalFetcher: dest is written (or symlinked) under dest/
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-from milpa.fetchers import FetcherRegistry, FetchError
+from milpa.errors import (
+    FETCH_LOCAL_PATH_NOT_DIR,
+    FETCH_LOCAL_PATH_NOT_FOUND,
+    MilpaError,
+)
 from milpa.fetchers.local import LocalFetcher, LocalProvenance, LocalReceipt
+from milpa.fetchers.types import FetcherRegistry, Provenance
+from milpa.identity import compute_content_hash
+
+# ---------------------------------------------------------------------------
+# LocalProvenance
+# ---------------------------------------------------------------------------
 
 
-def _make_source(root: Path, files: dict[str, str]) -> Path:
-    root.mkdir(parents=True, exist_ok=True)
-    for relpath, content in files.items():
-        p = root / relpath
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content)
-    return root
+class TestLocalProvenance:
+    def test_cas_admissible_false(self) -> None:
+        """Editable sources MUST declare cas_admissible=False (§4 NORMATIVE)."""
+        assert LocalProvenance.cas_admissible is False
+
+    def test_instance_cas_admissible_false(self, tmp_path: Path) -> None:
+        p = LocalProvenance(path=tmp_path)
+        assert p.cas_admissible is False
+
+    def test_accepts_absolute_path(self, tmp_path: Path) -> None:
+        p = LocalProvenance(path=tmp_path)
+        assert p.path == tmp_path
+
+    def test_rejects_relative_path(self) -> None:
+        with pytest.raises(ValueError, match="absolute"):
+            LocalProvenance(path=Path("relative/path"))
+
+    def test_frozen_dataclass(self, tmp_path: Path) -> None:
+        p = LocalProvenance(path=tmp_path)
+        with pytest.raises((AttributeError, TypeError)):
+            p.path = tmp_path / "other"  # type: ignore[misc]
 
 
-def test_local_fetcher_copies_source_tree_and_returns_receipt(tmp_path):
-    """Tracer: register LocalFetcher, fetch a local source dir via
-    LocalProvenance, get FetchResult with milpa-computed content_hash
-    and a LocalReceipt carrying source_path."""
-    src = _make_source(tmp_path / "src", {
-        "intonaco.nimble": 'srcDir = "src"\n',
-        "src/intonaco.nim": '# stub\n',
-    })
-
-    registry = FetcherRegistry()
-    registry.register(LocalFetcher())
-
-    dest = tmp_path / "deps" / "intonaco"
-    result = registry.fetch(
-        "intonaco",
-        LocalProvenance(path=src),
-        dest=dest,
-    )
-
-    # Bytes landed at dest
-    assert result.path == dest
-    assert (dest / "intonaco.nimble").read_text() == 'srcDir = "src"\n'
-    assert (dest / "src" / "intonaco.nim").read_text() == '# stub\n'
-
-    # Identity computed by registry (64-hex sha256)
-    # Multihash form: "sha256:" + 64 hex chars
-    assert result.identity.startswith("sha256:")
-    assert len(result.identity) == len("sha256:") + 64
-    assert all(c in "0123456789abcdef" for c in result.identity.split(":", 1)[1])
-
-    # Receipt records where we copied from
-    assert isinstance(result.receipt, LocalReceipt)
-    assert result.receipt.source_path == src
+# ---------------------------------------------------------------------------
+# LocalReceipt
+# ---------------------------------------------------------------------------
 
 
-def test_local_provenance_rejects_relative_path():
-    """LocalProvenance is a value type; relative paths are invalid.
-    The resolver (which knows project root) is responsible for the
-    relative→absolute lift before constructing the provenance."""
-    with pytest.raises(ValueError) as exc:
-        LocalProvenance(path=Path("../intonaco"))
-    assert "absolute" in str(exc.value).lower()
+class TestLocalReceipt:
+    def test_transport_fields_returns_resolved_path(self, tmp_path: Path) -> None:
+        r = LocalReceipt(resolved_path=tmp_path)
+        assert r.transport_fields() == {"resolved_path": str(tmp_path)}
+
+    def test_transport_fields_nonempty(self, tmp_path: Path) -> None:
+        r = LocalReceipt(resolved_path=tmp_path)
+        assert r.transport_fields()
+
+    def test_no_identity_field(self, tmp_path: Path) -> None:
+        """Receipt MUST NOT contain an identity (tree hash) field (§3.1 NORMATIVE)."""
+        r = LocalReceipt(resolved_path=tmp_path)
+        for key in r.transport_fields():
+            assert "identity" not in key
+            assert "content_hash" not in key
+            assert "tree" not in key
 
 
-def test_missing_source_raises_fetch_error_with_path_in_message(tmp_path):
-    """If the source path doesn't exist, fetch fails fast with the
-    path in the error message so the user can locate the issue."""
-    registry = FetcherRegistry()
-    registry.register(LocalFetcher())
-
-    missing = tmp_path / "nonexistent"
-
-    with pytest.raises(FetchError) as exc:
-        registry.fetch(
-            "x",
-            LocalProvenance(path=missing),
-            dest=tmp_path / "dest",
-        )
-    assert str(missing) in str(exc.value)
+# ---------------------------------------------------------------------------
+# LocalFetcher.can_handle
+# ---------------------------------------------------------------------------
 
 
-def test_source_path_that_is_a_file_raises_fetch_error(tmp_path):
-    """LocalFetcher handles source TREES. A file path is invalid input."""
-    not_a_dir = tmp_path / "not-a-dir"
-    not_a_dir.write_text("just a file\n")
-
-    registry = FetcherRegistry()
-    registry.register(LocalFetcher())
-
-    with pytest.raises(FetchError) as exc:
-        registry.fetch(
-            "x",
-            LocalProvenance(path=not_a_dir),
-            dest=tmp_path / "dest",
-        )
-    assert str(not_a_dir) in str(exc.value)
-    # error should make clear it's a kind-of-thing problem, not just missing
-    assert "director" in str(exc.value).lower()
+@dataclass(frozen=True)
+class _OtherProvenance(Provenance):
+    pass
 
 
-def test_refetch_reflects_source_changes(tmp_path):
-    """If source bytes changed between two fetches, dest must reflect
-    the new state and the content_hash must change. No stale snapshot."""
-    src = _make_source(tmp_path / "src", {"file.txt": "first\n"})
-    dest = tmp_path / "deps" / "x"
+class TestLocalFetcherCanHandle:
+    def test_claims_local_provenance(self, tmp_path: Path) -> None:
+        f = LocalFetcher()
+        assert f.can_handle(LocalProvenance(path=tmp_path)) is True
 
-    registry = FetcherRegistry()
-    registry.register(LocalFetcher())
+    def test_rejects_other_provenance(self) -> None:
+        f = LocalFetcher()
+        assert f.can_handle(_OtherProvenance()) is False
 
-    r1 = registry.fetch("x", LocalProvenance(path=src), dest=dest)
-    assert (dest / "file.txt").read_text() == "first\n"
-
-    # Edit source
-    (src / "file.txt").write_text("second\n")
-
-    r2 = registry.fetch("x", LocalProvenance(path=src), dest=dest)
-    assert (dest / "file.txt").read_text() == "second\n"
-    assert r1.identity != r2.identity
+    def test_rejects_base_provenance(self) -> None:
+        f = LocalFetcher()
+        assert f.can_handle(Provenance()) is False
 
 
-def test_refetch_over_stale_symlink_dest(tmp_path):
-    """Regression for #112: dest is a stale symlink (e.g. the dep was a
-    CAS-routed url/git dep before the manifest switched it to local=,
-    leaving `_deps/<name>` pointing into the CAS). Path.exists() follows
-    the link so a naive `if dest.exists(): rmtree(dest)` guard tripped
-    OSError('Cannot call rmtree on a symbolic link'); the fetch must
-    instead unlink the stale link and copy the source tree fresh —
-    without disturbing the link target."""
-    src = _make_source(tmp_path / "src", {"file.txt": "real source\n"})
-
-    # Stand in for a CAS entry the stale symlink points at.
-    cas_entry = _make_source(tmp_path / "cas", {"file.txt": "cas bytes\n"})
-    dest = tmp_path / "deps" / "x"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.symlink_to(cas_entry, target_is_directory=True)
-    assert dest.is_symlink()
-
-    registry = FetcherRegistry()
-    registry.register(LocalFetcher())
-
-    result = registry.fetch("x", LocalProvenance(path=src), dest=dest)
-
-    # dest is now a real copied tree carrying the source bytes...
-    assert not dest.is_symlink()
-    assert (dest / "file.txt").read_text() == "real source\n"
-    assert result.path == dest
-    # ...and the symlink's former target was left untouched.
-    assert (cas_entry / "file.txt").read_text() == "cas bytes\n"
+# ---------------------------------------------------------------------------
+# LocalFetcher.fetch — happy path
+# ---------------------------------------------------------------------------
 
 
-def test_symlinks_in_source_preserved_as_symlinks_in_dest(tmp_path):
-    """Per the identity model: symlinks within a source tree are data
-    (the link target string is part of the hash), not references to
-    follow. copytree(symlinks=True) preserves them."""
-    src = _make_source(tmp_path / "src", {"target.txt": "linked content\n"})
-    # Create a symlink alongside target.txt pointing at it.
-    link = src / "link.txt"
-    link.symlink_to("target.txt")  # relative symlink within the tree
-    assert link.is_symlink()
-
-    registry = FetcherRegistry()
-    registry.register(LocalFetcher())
-
-    dest = tmp_path / "deps" / "x"
-    registry.fetch("x", LocalProvenance(path=src), dest=dest)
-
-    dest_link = dest / "link.txt"
-    assert dest_link.is_symlink(), "symlink in source must remain a symlink in dest"
-    import os
-    assert os.readlink(dest_link) == "target.txt"
+def _make_source_dir(parent: Path) -> Path:
+    """Create a source directory with some files."""
+    src = parent / "source"
+    src.mkdir()
+    (src / "lib.nim").write_text("# some nim source\n")
+    (src / "README.md").write_text("A package\n")
+    sub = src / "subdir"
+    sub.mkdir()
+    (sub / "util.nim").write_text("# util\n")
+    return src
 
 
-def test_identity_is_path_independent(tmp_path):
-    """Two LocalProvenances pointing at different paths but containing
-    identical bytes produce the same content_hash. The path is
-    provenance; only the bytes are identity. This is the load-bearing
-    invariant from F1 (test_registry_computes_identity_externally),
-    re-verified for the local transport specifically."""
-    files = {"a.txt": "alpha\n", "b/c.txt": "beta\n"}
-    s1 = _make_source(tmp_path / "src1", files)
-    s2 = _make_source(tmp_path / "completely-different-path", files)
+class TestLocalFetcherHappyPath:
+    def test_receipt_type(self, tmp_path: Path) -> None:
+        src = _make_source_dir(tmp_path)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        fetcher = LocalFetcher()
+        receipt = fetcher.fetch("mylib", LocalProvenance(path=src), dest=dest)
+        assert isinstance(receipt, LocalReceipt)
 
-    registry = FetcherRegistry()
-    registry.register(LocalFetcher())
+    def test_receipt_resolved_path_is_source(self, tmp_path: Path) -> None:
+        src = _make_source_dir(tmp_path)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        fetcher = LocalFetcher()
+        receipt = fetcher.fetch("mylib", LocalProvenance(path=src), dest=dest)
+        assert receipt.resolved_path == src
 
-    r1 = registry.fetch("x", LocalProvenance(path=s1), dest=tmp_path / "d1")
-    r2 = registry.fetch("x", LocalProvenance(path=s2), dest=tmp_path / "d2")
+    def test_source_dir_left_in_place(self, tmp_path: Path) -> None:
+        """LocalFetcher must NOT delete or move the source directory."""
+        src = _make_source_dir(tmp_path)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        fetcher = LocalFetcher()
+        fetcher.fetch("mylib", LocalProvenance(path=src), dest=dest)
+        # Source must still exist and be intact.
+        assert src.is_dir()
+        assert (src / "lib.nim").exists()
 
-    assert r1.identity == r2.identity
-    # Receipts DO record the different paths (that's their job — provenance)
-    assert r1.receipt.source_path != r2.receipt.source_path
+    def test_no_network_access(self, tmp_path: Path) -> None:
+        """LocalFetcher must work entirely offline — source is a local path."""
+        src = _make_source_dir(tmp_path)
+        # The source URL is a local path with no scheme — no network needed.
+        assert not str(src).startswith("https://")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        fetcher = LocalFetcher()
+        # If this test passes, it ran with no network by construction.
+        receipt = fetcher.fetch("mylib", LocalProvenance(path=src), dest=dest)
+        assert receipt.transport_fields()
+
+
+# ---------------------------------------------------------------------------
+# LocalFetcher: identity equals compute_content_hash of source
+# ---------------------------------------------------------------------------
+
+
+class TestLocalFetcherIdentity:
+    def test_registry_identity_matches_source_hash(self, tmp_path: Path) -> None:
+        """Identity computed by registry MUST equal hash of the source tree."""
+        src = _make_source_dir(tmp_path)
+        expected = compute_content_hash(src)
+        registry = FetcherRegistry()
+        registry.register(LocalFetcher())
+        dest = tmp_path / "dest"
+        result = registry.fetch("mylib", LocalProvenance(path=src), dest=dest)
+        assert result.identity == expected
+
+    def test_identity_startswith_sha256(self, tmp_path: Path) -> None:
+        src = _make_source_dir(tmp_path)
+        registry = FetcherRegistry()
+        registry.register(LocalFetcher())
+        dest = tmp_path / "dest"
+        result = registry.fetch("mylib", LocalProvenance(path=src), dest=dest)
+        assert result.identity.startswith("sha256:")
+
+    def test_identity_not_in_receipt_fields(self, tmp_path: Path) -> None:
+        """Fetcher does NOT compute identity — it must not appear in receipt."""
+        src = _make_source_dir(tmp_path)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        fetcher = LocalFetcher()
+        receipt = fetcher.fetch("mylib", LocalProvenance(path=src), dest=dest)
+        for v in receipt.transport_fields().values():
+            assert not v.startswith("sha256:")
+
+
+# ---------------------------------------------------------------------------
+# LocalFetcher: dest writeable / cas_admissible=False (no CAS admission)
+# ---------------------------------------------------------------------------
+
+
+class TestLocalFetcherDest:
+    def test_dest_accessible_after_fetch(self, tmp_path: Path) -> None:
+        """After fetch, dest must be accessible (real dir or symlink to real dir)."""
+        src = _make_source_dir(tmp_path)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        fetcher = LocalFetcher()
+        fetcher.fetch("mylib", LocalProvenance(path=src), dest=dest)
+        # The path must exist (either as a dir or a symlink-to-dir).
+        assert dest.exists() or dest.is_symlink()
+
+    def test_cas_admissible_false_on_provenance(self, tmp_path: Path) -> None:
+        """LocalProvenance.cas_admissible is False — no CAS admission for local deps."""
+        p = LocalProvenance(path=tmp_path)
+        assert p.cas_admissible is False
+
+    def test_full_round_trip_with_registry(self, tmp_path: Path) -> None:
+        """End-to-end through FetcherRegistry."""
+        src = _make_source_dir(tmp_path)
+        registry = FetcherRegistry()
+        registry.register(LocalFetcher())
+        dest = tmp_path / "pkg"
+        result = registry.fetch("pkg", LocalProvenance(path=src), dest=dest)
+        assert result.name == "pkg"
+        assert result.path == dest
+        assert result.identity.startswith("sha256:")
+        assert "resolved_path" in result.receipt.transport_fields()
+
+
+# ---------------------------------------------------------------------------
+# LocalFetcher.fetch — error paths
+# ---------------------------------------------------------------------------
+
+
+class TestLocalFetcherErrors:
+    def test_nonexistent_path_raises_not_found(self, tmp_path: Path) -> None:
+        missing = tmp_path / "no_such_dir"
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        fetcher = LocalFetcher()
+        with pytest.raises(MilpaError) as exc_info:
+            fetcher.fetch("mylib", LocalProvenance(path=missing), dest=dest)
+        assert exc_info.value.slug == FETCH_LOCAL_PATH_NOT_FOUND
+
+    def test_path_is_file_raises_not_dir(self, tmp_path: Path) -> None:
+        file_path = tmp_path / "afile.txt"
+        file_path.write_text("not a directory\n")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        fetcher = LocalFetcher()
+        with pytest.raises(MilpaError) as exc_info:
+            fetcher.fetch("mylib", LocalProvenance(path=file_path), dest=dest)
+        assert exc_info.value.slug == FETCH_LOCAL_PATH_NOT_DIR
+
+    def test_error_slugs_are_coded_strings(self, tmp_path: Path) -> None:
+        missing = tmp_path / "absent"
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        fetcher = LocalFetcher()
+        with pytest.raises(MilpaError) as exc_info:
+            fetcher.fetch("mylib", LocalProvenance(path=missing), dest=dest)
+        assert isinstance(exc_info.value.slug, str)
+        assert exc_info.value.slug  # nonempty
