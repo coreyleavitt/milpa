@@ -5,8 +5,8 @@ once against a tight, frozen contract instead of chasing a churning spec.
 
 Decided 2026-06-14 (this session): do **both** halves below, then Nim.
 
-- **Stage:** Half A COMPLETE (4/4) — coverage 46/46, zero divergence   •   **Round:** —
-- **Resume:** decide `--no-index` flag (optional UX, NOT a coverage blocker — see below); then Half B (start with #26 when-blocks RFC)
+- **Stage:** Half A COMPLETE (4/4 + `--no-index` shipped) — coverage 47/47, zero divergence   •   **Round:** —
+- **Resume:** Half B — start with #26 when-blocks RFC (Stage 1: draft `docs/rfc-conditional-requires.md`, slice, then `/architect ... round 1/2`)
 
 ## Why this ordering
 Spec + 161-fixture corpus + harness (python+rust, zero divergence) is the contract
@@ -31,11 +31,19 @@ Hygiene backed by `rfc-differential-conformance-harness.md` + `spec/conformance-
       corrected. The flag is now an OPTIONAL UX enhancement (empty-env works but
       isn't discoverable), NOT a coverage blocker. Decision pending.
 
-### `--no-index` flag — optional follow-up (re-posed honestly)
-The discoverable flag would alias the existing empty-`MILPA_INDEX_URL` behavior.
-Pro: pip/uv `--no-index` parity, discoverable offline mode. Con: cross-impl
-spec+code surface for a capability that already exists. Options: build now as a
-small feature / file as its own issue for Half B / skip (env-var is enough).
+- [x] **`--no-index` flag** — SHIPPED (9d68b61). Corey chose to build it. Spec §2.6 +
+      both impls + fixture-165 + all four conformance runners. coverage 47/47.
+
+## Half A retro (lessons for Half B)
+- **Four runners, not two.** Every fixture must pass: python CLI, rust CLI
+  (both via `python3 -m harness`), python in-process (`test_conformance.py`),
+  AND rust in-process (`milpa-conformance/tests/corpus.rs`). The last lags most;
+  gate with `cd impls/python && uv run pytest` AND `./dev-rust test --workspace`.
+- **Rebuild the rust RELEASE binary** (`./dev-rust build --release -p milpa-cli`)
+  before `python3 -m harness` — it runs `target/release/milpa`, not the debug
+  test binary. A stale binary silently fails fixtures.
+- Validate stale-issue premises empirically before building (#120 was already
+  solved; saved a redundant flag justification — see [[feedback_validate_diagnosis_first]]).
 
 ## Half B — Tier 2/3 spec features (enter flow at Stage 1, RFC each)
 Each is genuine design → RFC + slicing + two architect rounds before /tdd.
