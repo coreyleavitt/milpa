@@ -444,3 +444,29 @@ fn kdl2_quarter_fraction_is_unknown_top_level() {
         "¼ should be a valid KDL 2.0 ident, rejected as unknown top-level by milpa"
     );
 }
+
+// ---------------------------------------------------------------------------
+// S2 — `milpa_manifest::Predicate` is a re-export of `milpa_types::Predicate`
+// (RFC rfc-conditional-requires.md §3.3 / Part A).
+// ---------------------------------------------------------------------------
+
+/// Verify that `crate::Predicate` (the milpa-manifest re-export) and
+/// `milpa_types::Predicate` (the SSOT) are the same type.  A function that
+/// accepts `crate::Predicate` must also accept a `milpa_types::Predicate`
+/// value without any cast — re-export identity holds.  If these were separate
+/// types this function would not compile.
+#[test]
+fn manifest_predicate_is_types_predicate_reexport() {
+    fn accepts(p: crate::Predicate) -> String {
+        p.name
+    }
+    let p: milpa_types::Predicate = milpa_types::Predicate {
+        name: "platform".into(),
+        values: vec!["linux".into()],
+        negated: false,
+    };
+    // Compiles iff `crate::Predicate` == `milpa_types::Predicate`.
+    let name = accepts(p);
+    assert_eq!(name, "platform");
+}
+

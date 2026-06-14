@@ -128,7 +128,12 @@ from milpa.kdl_io import (
     nodes,
     parse_kdl,
 )
+from milpa.predicate import Predicate  # SSOT for Predicate; re-exported below
 from milpa.version import VersionSet
+
+# Re-export so ``milpa.manifest.Predicate`` still resolves for all existing
+# importers (back-compat; the new SSOT is ``milpa.predicate``).
+__all__ = ["Predicate"]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -181,25 +186,6 @@ _WORKSPACE_TOP_LEVEL: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 # Data model — 3a
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Predicate:
-    """One conditional clause on a dep.
-
-    ``name`` is the predicate key (``platform``, ``arch``, ``nim``,
-    ``milpa``, ``flag``).  ``values`` is the tuple of match tokens.
-    ``negated=False`` → satisfied if ANY value matches (OR); ``negated=True``
-    → satisfied if NO value matches.
-
-    Both inline form (single-value property on the dep node) and child-node
-    form (multi-value child node, OR semantics) are represented identically
-    here — the distinction is erased at parse time.
-    """
-
-    name: str
-    values: tuple[str, ...]
-    negated: bool = False
 
 
 @dataclass(frozen=True)

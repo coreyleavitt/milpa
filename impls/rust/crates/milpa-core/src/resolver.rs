@@ -1272,6 +1272,7 @@ impl<'a> ResolveProvider<'a> {
                     requires.push(RequireEntry::Url(UrlRequire {
                         url: u.git.clone(),
                         ref_: u.git_ref.clone(),
+                        predicates: Vec::new(),
                     }));
                 }
                 Dep::Named(n) => {
@@ -1281,6 +1282,7 @@ impl<'a> ResolveProvider<'a> {
                     requires.push(RequireEntry::Named(NamedRequire {
                         name: n.name.clone(),
                         constraint_str: n.constraint.clone().unwrap_or_default(),
+                        predicates: Vec::new(),
                     }));
                 }
                 Dep::Local(_) | Dep::Tarball(_) | Dep::Member(_) => {}

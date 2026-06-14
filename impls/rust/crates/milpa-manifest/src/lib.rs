@@ -21,6 +21,10 @@ pub mod format;
 pub mod nimble;
 
 pub use format::format_manifest;
+// Re-export Predicate from milpa-types (the new SSOT) so all existing
+// references to `milpa_manifest::Predicate` and `crate::Predicate` compile
+// unchanged.
+pub use milpa_types::Predicate;
 
 /// Highest manifest spec-version epoch this implementation understands
 /// (grammar §4.4). Bumped only for breaking semantic changes; additive
@@ -30,16 +34,6 @@ pub const MANIFEST_SPEC_VERSION: i64 = 1;
 // ---------------------------------------------------------------------------
 // Data model — mirrors `milpa/manifest.py` (one design, two impls).
 // ---------------------------------------------------------------------------
-
-/// One conditional clause on a dep (grammar §6). `negated` applies De Morgan
-/// across `values`: `negated=false` is satisfied if the profile matches ANY
-/// value (OR); `negated=true` if it matches NONE.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Predicate {
-    pub name: String,
-    pub values: Vec<String>,
-    pub negated: bool,
-}
 
 /// A consumer's request for a specific flag state on a dep (grammar §3.6).
 #[derive(Debug, Clone, PartialEq, Eq)]

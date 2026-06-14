@@ -219,7 +219,7 @@ fn parse_require_node(node: &KdlNode) -> Option<RequireEntry> {
             .and_then(|e| e.value().as_string())
             .unwrap_or("")
             .to_string();
-        Some(RequireEntry::Url(UrlRequire { url, ref_ }))
+        Some(RequireEntry::Url(UrlRequire { url, ref_, predicates: Vec::new() }))
     } else {
         // Named form: require "<name>" "<constraint>"
         let name = first.value().as_string()?.to_string();
@@ -228,7 +228,7 @@ fn parse_require_node(node: &KdlNode) -> Option<RequireEntry> {
             .and_then(|e| e.value().as_string())
             .unwrap_or("")
             .to_string();
-        Some(RequireEntry::Named(NamedRequire { name, constraint_str }))
+        Some(RequireEntry::Named(NamedRequire { name, constraint_str, predicates: Vec::new() }))
     }
 }
 
@@ -279,14 +279,17 @@ mod tests {
                 RequireEntry::Named(NamedRequire {
                     name: "results".to_string(),
                     constraint_str: ">= 0.5.0".to_string(),
+                    predicates: Vec::new(),
                 }),
                 RequireEntry::Named(NamedRequire {
                     name: "stew".to_string(),
                     constraint_str: ">= 0.1 & < 1.0".to_string(),
+                    predicates: Vec::new(),
                 }),
                 RequireEntry::Url(UrlRequire {
                     url: "https://github.com/status-im/nim-chronos.git".to_string(),
                     ref_: "v3.2.0".to_string(),
+                    predicates: Vec::new(),
                 }),
             ],
             "src".to_string(),
@@ -381,10 +384,12 @@ mod tests {
                 RequireEntry::Named(NamedRequire {
                     name: "foo".into(),
                     constraint_str: ">= 1.0.0".into(),
+                    predicates: Vec::new(),
                 }),
                 RequireEntry::Named(NamedRequire {
                     name: "bar".into(),
                     constraint_str: "".into(),
+                    predicates: Vec::new(),
                 }),
             ]
         );
@@ -399,6 +404,7 @@ mod tests {
             vec![RequireEntry::Url(UrlRequire {
                 url: "https://example.com/pkg.git".into(),
                 ref_: "main".into(),
+                predicates: Vec::new(),
             })]
         );
     }

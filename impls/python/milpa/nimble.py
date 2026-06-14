@@ -51,7 +51,8 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
-from milpa.manifest import NamedDep, Predicate, UrlDep
+from milpa.manifest import NamedDep, UrlDep
+from milpa.predicate import Predicate
 from milpa.version import VersionSet
 
 # ---------------------------------------------------------------------------

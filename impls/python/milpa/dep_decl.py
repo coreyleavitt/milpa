@@ -44,6 +44,7 @@ from milpa.kdl_io import (
     parse_kdl,
     value_as_int,
 )
+from milpa.predicate import Predicate
 
 # ---------------------------------------------------------------------------
 # EdgeSource fidelity tag (spec/dep-decl.md §1)
@@ -79,18 +80,31 @@ class NamedRequire:
 
     `constraint_str` is the raw declaration string, whitespace preserved
     verbatim (spec §2 Rule 5). `">= 0.5.0"` and `">=0.5.0"` are distinct.
+
+    `predicates` carries optional ``when``-gate annotations (S2 — RFC
+    ``rfc-conditional-requires.md`` §3.3).  Defaults to an empty tuple
+    (back-compat: unconditional requires are unaffected).  Nothing populates
+    the field until S3b; ``frozen=True`` dataclass auto-derives ``__eq__``
+    and ``__repr__`` that include it for free.
     """
 
     name: str
     constraint_str: str
+    predicates: tuple[Predicate, ...] = ()
 
 
 @dataclass(frozen=True)
 class UrlRequire:
-    """A URL-based requires entry (transport-resolved dep)."""
+    """A URL-based requires entry (transport-resolved dep).
+
+    `predicates` carries optional ``when``-gate annotations (S2 — RFC
+    ``rfc-conditional-requires.md`` §3.3).  Defaults to an empty tuple
+    (back-compat).
+    """
 
     url: str
     ref: str
+    predicates: tuple[Predicate, ...] = ()
 
 
 RequireEntry = Union[NamedRequire, UrlRequire]

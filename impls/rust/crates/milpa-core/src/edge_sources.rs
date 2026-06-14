@@ -100,6 +100,7 @@ impl NimbleEdgeSource {
                     requires.push(RequireEntry::Url(UrlRequire {
                         url: url.clone(),
                         ref_,
+                        predicates: Vec::new(),
                     }));
                 }
                 NimbleRequirement::Named { name, constraint, .. } => {
@@ -109,6 +110,7 @@ impl NimbleEdgeSource {
                     requires.push(RequireEntry::Named(NamedRequire {
                         name: name.clone(),
                         constraint_str: constraint.clone().unwrap_or_default(),
+                        predicates: Vec::new(),
                     }));
                 }
             }
@@ -180,6 +182,7 @@ pub fn manifest_to_edgeset(manifest: &Manifest) -> EdgeSet {
                 requires.push(RequireEntry::Url(UrlRequire {
                     url: u.git.clone(),
                     ref_: u.git_ref.clone(),
+                    predicates: Vec::new(),
                 }));
             }
             Dep::Named(n) => {
@@ -189,6 +192,7 @@ pub fn manifest_to_edgeset(manifest: &Manifest) -> EdgeSet {
                 requires.push(RequireEntry::Named(NamedRequire {
                     name: n.name.clone(),
                     constraint_str: n.constraint.clone().unwrap_or_default(),
+                    predicates: Vec::new(),
                 }));
             }
             // Local/Tarball/Member from a transitive milpa.kdl are out of
@@ -787,6 +791,7 @@ overrides {
             requires: vec![RequireEntry::Url(UrlRequire {
                 url: "https://example.com/foo.git".to_string(),
                 ref_: "main".to_string(),
+                predicates: Vec::new(),
             })],
             src_dir: String::new(),
             source: EdgeSource::MilpaKdl,
@@ -803,6 +808,7 @@ overrides {
             requires: vec![RequireEntry::Named(NamedRequire {
                 name: "bar".to_string(),
                 constraint_str: ">= 1.0.0".to_string(),
+                predicates: Vec::new(),
             })],
             src_dir: String::new(),
             source: EdgeSource::MilpaKdl,

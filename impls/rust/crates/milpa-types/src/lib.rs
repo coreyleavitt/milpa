@@ -288,6 +288,26 @@ impl Default for Lockfile {
 pub const LOCKFILE_SCHEMA_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
+// Predicate — one conditional clause (grammar §6; dep-decl.md S2)
+// ---------------------------------------------------------------------------
+
+/// One conditional clause on a dep (grammar §6). `negated` applies De Morgan
+/// across `values`: `negated=false` is satisfied if the profile matches ANY
+/// value (OR); `negated=true` if it matches NONE.
+///
+/// Extracted here (milpa-types) so `dep_decl.py`-analog types (`NamedRequire` /
+/// `UrlRequire`) can carry predicates without a circular crate dependency.
+/// `milpa-manifest` re-exports this as `pub use milpa_types::Predicate` for
+/// back-compat (all existing `milpa_manifest::Predicate` references compile
+/// unchanged).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Predicate {
+    pub name: String,
+    pub values: Vec<String>,
+    pub negated: bool,
+}
+
+// ---------------------------------------------------------------------------
 // EdgeSet — the single shared dependency-edge type (spec/dep-decl.md §1)
 // ---------------------------------------------------------------------------
 
@@ -312,18 +332,29 @@ pub enum EdgeSource {
 ///
 /// `constraint_str` is the raw declaration string, whitespace preserved verbatim
 /// (spec §2 Rule 5): `">= 0.5.0"` and `">=0.5.0"` are distinct byte sequences.
+///
+/// `predicates` carries optional `when`-gate annotations (S2 — RFC
+/// `rfc-conditional-requires.md` §3.3). Defaults to an empty `Vec` (back-compat:
+/// unconditional requires are unaffected). Nothing populates it until S3b.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamedRequire {
     pub name: String,
     /// Raw constraint string as declared; empty string means "any version".
     pub constraint_str: String,
+    /// Optional `when`-gate predicates (S2; empty = unconditional).
+    pub predicates: Vec<Predicate>,
 }
 
 /// A URL-based requires entry (spec/dep-decl.md §1 `UrlRequire`).
+///
+/// `predicates` carries optional `when`-gate annotations (S2 — RFC
+/// `rfc-conditional-requires.md` §3.3). Defaults to an empty `Vec` (back-compat).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UrlRequire {
     pub url: String,
     pub ref_: String,
+    /// Optional `when`-gate predicates (S2; empty = unconditional).
+    pub predicates: Vec<Predicate>,
 }
 
 /// One entry in `EdgeSet.requires`: either a named dep or a URL dep.
@@ -432,4 +463,51 @@ mod tests {
         // semver §11.4.3: numeric identifiers < alphanumeric.
         assert!(PreId::Numeric(99) < PreId::Alpha("0".into()));
     }
+
+    // -----------------------------------------------------------------------
+    // S2 — RequireEntry.predicates (RFC rfc-conditional-requires.md §3.3)
+    // -----------------------------------------------------------------------
+
+    /// A `NamedRequire` with a non-empty `predicates` vec must NOT equal one
+    /// with an empty vec (field participates in derived `PartialEq`).
+    #[test]
+    fn named_require_predicate_field_participates_in_equality() {
+        let plain = NamedRequire {
+            name: "foo".into(),
+            constraint_str: "".into(),
+            predicates: Vec::new(),
+        };
+        let predicated = NamedRequire {
+            name: "foo".into(),
+            constraint_str: "".into(),
+            predicates: vec![Predicate {
+                name: "platform".into(),
+                values: vec!["linux".into()],
+                negated: false,
+            }],
+        };
+        assert_ne!(plain, predicated);
+    }
+
+    /// A `UrlRequire` with a non-empty `predicates` vec must NOT equal one
+    /// with an empty vec.
+    #[test]
+    fn url_require_predicate_field_participates_in_equality() {
+        let plain = UrlRequire {
+            url: "https://example.com/foo.git".into(),
+            ref_: "main".into(),
+            predicates: Vec::new(),
+        };
+        let predicated = UrlRequire {
+            url: "https://example.com/foo.git".into(),
+            ref_: "main".into(),
+            predicates: vec![Predicate {
+                name: "arch".into(),
+                values: vec!["amd64".into()],
+                negated: false,
+            }],
+        };
+        assert_ne!(plain, predicated);
+    }
+
 }
