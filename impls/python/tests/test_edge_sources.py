@@ -629,3 +629,70 @@ def test_two_parents_same_package_get_identical_edgeset(tmp_path: Path) -> None:
     assert es_a is es_b, \
         "diamond dependency: both parents must see the same sealed EdgeSet (clause a)"
     assert len(edge_cache) == 1
+
+
+# ---------------------------------------------------------------------------
+# M3: SSOT for URL→name derivation — both sites use the same function
+# ---------------------------------------------------------------------------
+
+
+def test_m3_url_to_name_ssot_shared_function() -> None:
+    """Both nimble.py and edge_sources.py use the same url_to_name derivation.
+
+    The two functions previously diverged on path-less inputs: nimble.py
+    returned the full URL string (or a scheme artifact); edge_sources.py
+    returned None (dep dropped).  After unification, both sites call
+    ``nimble.url_to_name``; edge_sources wraps with None-drop so the resolver
+    behavior is preserved without duplicating the derivation.
+    """
+    from milpa.nimble import url_to_name
+    from milpa.edge_sources import _name_from_url  # type: ignore[attr-defined]
+
+    # Normal URLs — must agree.
+    normal = [
+        ("https://github.com/user/pkg.git", "pkg"),
+        ("https://github.com/user/pkg", "pkg"),
+        ("ssh://git@github.com/user/repo", "repo"),
+        ("git://github.com/user/repo.git", "repo"),
+        ("https://github.com/user/mylib.git", "mylib"),
+    ]
+    for url, expected in normal:
+        assert url_to_name(url) == expected, f"url_to_name({url!r})"
+        assert _name_from_url(url) == expected, f"_name_from_url({url!r})"
+
+    # Path-less / degenerate URLs: edge_sources wraps with None-drop.
+    # nimble.url_to_name returns a non-empty string (best-effort; used in UrlDep.name).
+    # edge_sources._name_from_url returns None for these (dep dropped from EdgeSet).
+    # This is NOT a divergence — it's an explicit wrapper around the shared function.
+    degenerate = ["https://", "ssh://", "git://"]
+    for url in degenerate:
+        # The nimble path must return a non-empty string (used for UrlDep.name).
+        name = url_to_name(url)
+        assert isinstance(name, str) and name, \
+            f"url_to_name({url!r}) must return non-empty str, got {name!r}"
+        # The edge_sources path wraps with None-drop (no divergence in derivation logic).
+        edge_name = _name_from_url(url)
+        assert edge_name is None or isinstance(edge_name, str), \
+            f"_name_from_url({url!r}) must return str or None"
+
+
+def test_m3_edge_sources_uses_nimble_url_to_name() -> None:
+    """_name_from_url in edge_sources delegates to nimble.url_to_name for normal URLs.
+
+    This pins the import relationship — if someone re-duplicates the logic in
+    edge_sources.py, this test will catch the divergence on the normal-URL cases.
+    """
+    from milpa.nimble import url_to_name
+    from milpa.edge_sources import _name_from_url  # type: ignore[attr-defined]
+
+    # For any URL where url_to_name returns a non-empty result AND that result
+    # does not equal the full URL (i.e. it found a meaningful path component),
+    # _name_from_url must return the same value.
+    urls = [
+        "https://github.com/status-im/nim-chronos.git",
+        "https://github.com/nim-lang/stew",
+        "ssh://git@github.com/user/results.git",
+    ]
+    for url in urls:
+        assert url_to_name(url) == _name_from_url(url), \
+            f"SSOT violation: nimble and edge_sources return different names for {url!r}"

@@ -233,10 +233,15 @@ class TestSrcDir:
         m = parse_nimble('\tsrcDir\t=\t"lib"')
         assert m.src_dir == "lib"
 
-    def test_srcdir_first_match_wins(self) -> None:
-        """When srcDir appears twice, the first value is kept."""
+    def test_srcdir_last_assignment_wins(self) -> None:
+        """When srcDir appears twice, the LAST value wins (NimScript assignment semantics).
+
+        Spec §7.3: "Only the last srcDir assignment is used (NimScript assignment
+        semantics: a later assignment overwrites an earlier one)."
+        Rust already implements last-wins; Python must match.
+        """
         m = parse_nimble('srcDir = "first"\nsrcDir = "second"\n')
-        assert m.src_dir == "first"
+        assert m.src_dir == "second"
 
     def test_no_srcdir_is_none(self) -> None:
         m = parse_nimble('requires "foo"\n')
@@ -415,6 +420,74 @@ class TestWhenBlockPolicy:
         assert len(user_warnings) == 0
         assert _preds(m, "foo") == ()
 
+    # T7: same dep in two when branches — spec §7.1 no-dedup rule (C1 fix)
+    def test_t7_same_dep_two_branches_both_included(self) -> None:
+        """Same dep name in two independent when blocks → both entries present.
+
+        Spec §7.1: 'no deduplication is performed'.  The scanner MUST include
+        'foo' twice — once with platform=linux, once with platform=macosx.
+        Python dedup (seen_named set) was silently dropping the second entry.
+        """
+        text = (
+            'when defined(linux):\n'
+            '  requires "foo"\n'
+            'when defined(macosx):\n'
+            '  requires "foo"\n'
+        )
+        m = parse_nimble(text)
+        # Both entries must be present (no dedup)
+        assert len(m.deps) == 2
+        assert m.deps[0].name == "foo"
+        assert m.deps[1].name == "foo"
+        assert len(m.dep_predicates) == 2
+        # First entry: linux predicate; second: macosx predicate
+        assert m.dep_predicates[0] == (_plat("linux"),)
+        assert m.dep_predicates[1] == (_plat("macosx"),)
+
+    def test_t8_mixed_conditional_unconditional_alignment(self) -> None:
+        """Mixed conditional + unconditional; dep_predicates stays index-aligned.
+
+        Exercises the coverage agent's case:
+          requires "common1"
+          when defined(linux):  requires "x"
+          requires "common2"
+          when defined(macosx): requires "y"
+        Each dep must get the right predicate set.
+        """
+        text = (
+            'requires "common1"\n'
+            'when defined(linux):\n'
+            '  requires "x"\n'
+            'requires "common2"\n'
+            'when defined(macosx):\n'
+            '  requires "y"\n'
+        )
+        m = parse_nimble(text)
+        names = _names(m)
+        assert names == ["common1", "x", "common2", "y"]
+        assert _preds(m, "common1") == ()
+        assert _preds(m, "x") == (_plat("linux"),)
+        assert _preds(m, "common2") == ()
+        assert _preds(m, "y") == (_plat("macosx"),)
+
+    def test_t9_same_url_dep_two_branches_both_included(self) -> None:
+        """Same URL dep in two when branches → both entries present (no URL dedup).
+
+        Spec §7.1 applies to URL deps as well.
+        """
+        url = "https://github.com/example/foo.git"
+        text = (
+            f'when defined(linux):\n'
+            f'  requires "{url}#v1"\n'
+            f'when defined(macosx):\n'
+            f'  requires "{url}#v1"\n'
+        )
+        m = parse_nimble(text)
+        assert len(m.deps) == 2
+        assert all(isinstance(d, UrlDep) for d in m.deps)
+        assert m.dep_predicates[0] == (_plat("linux"),)
+        assert m.dep_predicates[1] == (_plat("macosx"),)
+
 
 # ---------------------------------------------------------------------------
 # §5.4 ``nim`` requirement filtering
@@ -499,15 +572,21 @@ class TestTotalNeverRaises:
         m = parse_nimble('requires "foo" # this is a comment\n')
         assert _names(m) == ["foo"]
 
-    def test_deduplication_first_wins(self) -> None:
+    def test_no_deduplication_both_occurrences_preserved(self) -> None:
+        """Spec §7.1: no deduplication — same name in two requires → both kept.
+
+        Each occurrence is preserved in authored file order, carrying its own
+        constraint and predicate annotation.  The old 'first-wins' dedup was
+        a spec violation (C1 bug fix).
+        """
         text = 'requires "foo >= 1.0.0"\nrequires "foo >= 2.0.0"\n'
         m = parse_nimble(text)
         names = _names(m)
-        assert names.count("foo") == 1
-        # First occurrence wins
-        dep = m.deps[0]
-        assert isinstance(dep, NamedDep)
-        assert dep.constraint == ">= 1.0.0"
+        assert names.count("foo") == 2
+        assert isinstance(m.deps[0], NamedDep)
+        assert m.deps[0].constraint == ">= 1.0.0"
+        assert isinstance(m.deps[1], NamedDep)
+        assert m.deps[1].constraint == ">= 2.0.0"
 
     def test_whitespace_only_spec_ignored(self) -> None:
         m = parse_nimble('requires "  "\n')

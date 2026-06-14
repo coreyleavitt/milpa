@@ -516,7 +516,19 @@ CLAUSE_INVENTORY: list[SpecClause] = [
             "fixture-166-nimble-when-translate",
             "fixture-167-nimble-when-negation",
             "fixture-168-nimble-when-nim-version",
+            "fixture-171-nimble-when-same-name-multi-branch",
         ),
+        covering_tiers=(),
+    ),
+    SpecClause(
+        id="dep-decl.nimble-no-dedup",
+        spec_ref="dep-decl.md §7.1; rfc-conditional-requires.md §3.4.3",
+        description=(
+            "When the same dep name appears in ≥2 when branches, "
+            "NO deduplication is performed — ALL occurrences MUST be preserved "
+            "in authored file order, each carrying its own predicate annotation"
+        ),
+        covering_fixtures=("fixture-171-nimble-when-same-name-multi-branch",),
         covering_tiers=(),
     ),
 

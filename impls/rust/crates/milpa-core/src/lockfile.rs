@@ -180,11 +180,27 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
     })
 }
 
+/// Known predicate-name vocabulary (M1: whitelist for untrusted lockfile input).
+///
+/// On PARSE, any `cond-require` prop key that is NOT in this set is silently
+/// dropped (forward-compat lenient — same spirit as "skip unknown child nodes").
+/// This closes the injection path: a crafted key with spaces, control chars, or
+/// ANSI sequences could otherwise round-trip into the lockfile or terminal.
+/// Mirrors `lockfile.py:_KNOWN_PREDICATE_NAMES`.
+const KNOWN_PREDICATE_NAMES: &[&str] = &["platform", "arch", "nim", "milpa", "flag"];
+
+fn is_known_predicate(name: &str) -> bool {
+    KNOWN_PREDICATE_NAMES.contains(&name)
+}
+
 /// Parse a `cond-require` child node into a [`milpa_types::CondRequire`] (RFC §3.4 / S4).
 ///
 /// Inline form (props): `cond-require "name" platform="linux"`.
 /// Block form (when children): `cond-require "name" { when platform="macosx" when ... }`.
 /// Returns `None` (lenient/forward-compat) for malformed nodes.
+///
+/// M1: predicate prop keys are whitelist-validated against `KNOWN_PREDICATE_NAMES`
+/// before being accepted — unknown keys are silently dropped.
 fn parse_cond_require(node: &KdlNode) -> Option<milpa_types::CondRequire> {
     // arg0 = require name
     let name = args(node).first()?.value().as_string()?.to_string();
@@ -199,6 +215,10 @@ fn parse_cond_require(node: &KdlNode) -> Option<milpa_types::CondRequire> {
             }
             for entry in child.entries() {
                 let Some(key) = entry.name() else { continue };
+                // M1: whitelist-validate the predicate name.
+                if !is_known_predicate(key.value()) {
+                    continue;
+                }
                 let Some(val) = entry.value().as_string() else { continue };
                 let tag = entry.ty().map(|t| t.value());
                 predicates.push(milpa_types::Predicate {
@@ -212,6 +232,10 @@ fn parse_cond_require(node: &KdlNode) -> Option<milpa_types::CondRequire> {
         // Inline form: props on the node itself.
         for entry in node.entries() {
             let Some(key) = entry.name() else { continue };
+            // M1: whitelist-validate the predicate name.
+            if !is_known_predicate(key.value()) {
+                continue;
+            }
             let Some(val) = entry.value().as_string() else { continue };
             let tag = entry.ty().map(|t| t.value());
             predicates.push(milpa_types::Predicate {
@@ -429,8 +453,11 @@ pub fn format_lockfile(lockfile: &Lockfile) -> String {
         // S4: cond-require — additive annotation nodes, sorted by name.
         // Emitted immediately after requires. Omitted when empty (byte-identical
         // for deps with no conditional requires).
+        // C1 fix: sort by (name, predicate-string) for a total order — same-name
+        // entries (dep in ≥2 when-branches) are deterministically ordered by their
+        // canonical predicate string, giving byte-identical output across impls.
         let mut sorted_cond: Vec<&milpa_types::CondRequire> = dep.cond_requires.iter().collect();
-        sorted_cond.sort_by(|a, b| a.name.cmp(&b.name));
+        sorted_cond.sort_by_key(|cr| cond_require_sort_key(cr));
         for cr in sorted_cond {
             for line in format_cond_require(cr) {
                 lines.push(line);
@@ -465,11 +492,44 @@ pub fn format_lockfile(lockfile: &Lockfile) -> String {
     lines.join("\n")
 }
 
+/// Total sort key for a `CondRequire`: `(name, canonical-predicate-string)`.
+///
+/// Using name alone is NOT a total order when same-name entries exist (a dep
+/// in ≥2 when-branches).  The predicate string makes the key total and
+/// deterministic across impls regardless of source order (C1 fix, §2.4).
+///
+/// Delegates to `format_predicate_prop` so KDL string escaping is shared with
+/// the emitter — sort order cannot drift from emission order even if a value
+/// ever contains `"` or `\`.  `pub(crate)` so `resolver.rs` can reuse the
+/// same SSOT instead of reimplementing (C1 fix).
+pub(crate) fn cond_require_sort_key(cr: &milpa_types::CondRequire) -> (String, String) {
+    let pred_str = cr
+        .predicates
+        .iter()
+        .map(|p| format_predicate_prop(p))
+        .collect::<Vec<_>>()
+        .join(",");
+    (cr.name.clone(), pred_str)
+}
+
 /// Emit a single predicate as `key="value"` or `key=(not)"value"` (RFC §3.4.1).
-/// The value is `pred.values[0]` (every predicate produced by this pipeline is
-/// single-value). Negation uses the KDL type-annotation form `(not)"value"` —
-/// verbatim from `manifest-grammar.md §6`.
+///
+/// The value is `pred.values[0]` — every predicate produced by this pipeline is
+/// single-value (v0 invariant per spec §3.5 / lockfile-schema §3.5). Multi-value
+/// (OR) predicates are not supported in v0; the guard below panics on violation
+/// so it surfaces early rather than silently truncating values[1:] (M4 fix).
+/// Negation uses the KDL type-annotation form `(not)"value"` — verbatim from
+/// `manifest-grammar.md §6`.
 fn format_predicate_prop(pred: &milpa_types::Predicate) -> String {
+    if pred.values.len() != 1 {
+        panic!(
+            "format_predicate_prop: predicate {:?} has {} values but only single-value \
+             predicates are supported in v0 (spec §3.5). Multi-value (OR) emission is not \
+             implemented.",
+            pred.name,
+            pred.values.len()
+        );
+    }
     let val = kdl_str(&pred.values[0]);
     if pred.negated {
         format!("{}=(not){}", pred.name, val)
@@ -579,8 +639,13 @@ fn join_kdl(values: &[String]) -> String {
 /// Return `s` as a double-quoted, KDL-escaped string literal (R11,
 /// lockfile-schema §7 / errors.md). The single source of truth for emitting a
 /// KDL string value — the parser unescapes on read, so the writer MUST escape
-/// on write or the round-trip breaks. Mirrors `lockfile.py:_kdl_str` exactly:
-/// the named escapes, then `\u{..}` for any remaining control char.
+/// on write or the round-trip breaks.
+///
+/// Mirrors `lockfile.py:_kdl_str` exactly:
+///   `\\` → `\\\\`, `"` → `\\"`, U+0000–U+001F → `\u{N}` (hex, no named
+///   escapes). All other code points are emitted verbatim. No named escapes
+///   (`\n`, `\t`, `\r`, `\b`, `\f`) — using `\u{..}` for ALL control chars
+///   keeps the Python and Rust outputs byte-identical (lockfile-schema §2.4).
 fn kdl_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -588,11 +653,6 @@ fn kdl_str(s: &str) -> String {
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
             c => out.push(c),
         }
@@ -662,9 +722,10 @@ pub fn from_graph(graph: &ResolvedGraph, strategy: &str) -> Lockfile {
 fn locked_from_resolved(d: &ResolvedDep) -> LockedDep {
     let mut requires = d.requires.clone();
     requires.sort();
-    // S4: carry cond_requires (already sorted by name on ResolvedDep).
+    // S4: carry cond_requires; sort by total key (name, predicate-string) for
+    // byte-exact determinism when same-name entries exist (C1 fix).
     let mut cond_requires = d.cond_requires.clone();
-    cond_requires.sort_by(|a, b| a.name.cmp(&b.name));
+    cond_requires.sort_by_key(|cr| cond_require_sort_key(cr));
     LockedDep {
         name: d.name.clone(),
         // Every dep in a resolved graph is content-hashed; an empty identity
@@ -687,7 +748,7 @@ fn locked_from_resolved(d: &ResolvedDep) -> LockedDep {
         // S6: carry dep_decl pin from the resolved dep (set only when
         // the edge was sourced from a DepDecl artifact).
         dep_decl: d.dep_decl.clone(),
-        // S4: carry cond_requires (sorted by name).
+        // S4: carry cond_requires (sorted by (name, canonical-predicate-string)).
         cond_requires,
     }
 }
@@ -1088,8 +1149,10 @@ mod tests {
 
     #[test]
     fn kdl_escaping_round_trips() {
-        // Every escape class: quote, backslash, the named control chars, and a
-        // bare control char that must become \u{..}.
+        // Every escape class: quote, backslash, and control chars.
+        // All control chars U+0000–U+001F must become \u{N} — NO named escapes
+        // (\n, \t, \r, \b, \f). This mirrors lockfile.py:_kdl_str exactly
+        // (lockfile-schema §2.4 / H3 fix).
         let nasty = "a\"b\\c\nd\re\tf\x08g\x0ch\x01i";
         let lock = Lockfile {
             version: 1,
@@ -1112,15 +1175,67 @@ mod tests {
             }],
         };
         let text = format_lockfile(&lock);
-        assert!(text.contains("\\u{1}"));
-        assert!(text.contains("\\b"));
-        assert!(text.contains("\\f"));
+        // All control chars go through \u{..}, never named escapes.
+        assert!(text.contains("\\u{1}"),  "SOH must be \\u{{1}}: {text:?}");
+        assert!(text.contains("\\u{8}"),  "BS must be \\u{{8}}: {text:?}");
+        assert!(text.contains("\\u{9}"),  "HT must be \\u{{9}}: {text:?}");
+        assert!(text.contains("\\u{a}"),  "LF must be \\u{{a}}: {text:?}");
+        assert!(text.contains("\\u{c}"),  "FF must be \\u{{c}}: {text:?}");
+        assert!(text.contains("\\u{d}"),  "CR must be \\u{{d}}: {text:?}");
+        // Named escapes must NOT appear (byte-identity with Python).
+        assert!(!text.contains("\\n"),  "must not emit \\n: {text:?}");
+        assert!(!text.contains("\\t"),  "must not emit \\t: {text:?}");
+        assert!(!text.contains("\\r"),  "must not emit \\r: {text:?}");
+        assert!(!text.contains("\\b"),  "must not emit \\b: {text:?}");
+        assert!(!text.contains("\\f"),  "must not emit \\f: {text:?}");
         // The emitted text is valid KDL that parses back to the same data.
         let reparsed = parse_lockfile(&text).unwrap();
         assert_eq!(reparsed.deps[0].name, nasty);
         assert_eq!(reparsed.deps[0].version, nasty);
         assert_eq!(reparsed.deps[0].src_dir, nasty);
         assert_eq!(reparsed.deps[0].requires, vec![nasty.to_string()]);
+    }
+
+    #[test]
+    fn kdl_str_control_chars_match_python_newline_and_tab() {
+        // H3 regression: \n must emit \u{a}, \t must emit \u{9} (matching
+        // lockfile.py:_kdl_str). The previous Rust impl emitted \\n / \\t,
+        // breaking byte-identity with Python.
+        let with_newline_and_tab = "ref\nwith\ttabs";
+        let lock = Lockfile {
+            version: 1,
+            strategy: "maxver".into(),
+            deps: vec![LockedDep {
+                name: "foo".into(),
+                identity: None,
+                version: "0.0.1".into(),
+                src_dir: String::new(),
+                requires: vec![],
+                provenances: vec![ProvenanceRecord::Git {
+                    url: "https://example.com/foo.git".into(),
+                    ref_spec: Some(with_newline_and_tab.into()),
+                    commit_sha: None,
+                }],
+                active_flags: vec![],
+                self_mirrors: vec![],
+                dep_decl: None,
+                cond_requires: vec![],
+            }],
+        };
+        let text = format_lockfile(&lock);
+        // Must use \u{a} for \n and \u{9} for \t — matching Python's _kdl_str.
+        assert!(text.contains("\\u{a}"), "newline must be \\u{{a}}: {text:?}");
+        assert!(text.contains("\\u{9}"), "tab must be \\u{{9}}: {text:?}");
+        assert!(!text.contains("\\n"),   "must not emit \\n: {text:?}");
+        assert!(!text.contains("\\t"),   "must not emit \\t: {text:?}");
+        // Round-trip: the emitted KDL must parse back to the original ref.
+        let reparsed = parse_lockfile(&text).unwrap();
+        let prov = &reparsed.deps[0].provenances[0];
+        if let ProvenanceRecord::Git { ref_spec, .. } = prov {
+            assert_eq!(ref_spec.as_deref(), Some(with_newline_and_tab));
+        } else {
+            panic!("expected git provenance");
+        }
     }
 
     #[test]
@@ -1713,5 +1828,190 @@ mod tests {
         let text_with = format_lockfile(&Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep_with_cond] });
         assert!(text_no.contains("    requires \"bar\" \"extra\""));
         assert!(text_with.contains("    requires \"bar\" \"extra\""));
+    }
+
+    // -------------------------------------------------------------------------
+    // M1 — predicate name whitelist on parse
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn m1_unknown_predicate_key_dropped_inline() {
+        // A crafted cond-require with an unknown key must be dropped (the whole
+        // predicate is dropped; if it was the only predicate, the CondRequire is
+        // None → not appended).
+        let sample = format!(
+            "version 1\n\
+             dep \"foo\" {{\n\
+             \x20   version \"0.0.1\"\n\
+             \x20   src_dir \"\"\n\
+             \x20   requires\n\
+             \x20   cond-require \"bar\" evilkey=\"value\"\n\
+             \x20   provenance {{\n\
+             \x20       kind \"local\"\n\
+             \x20       path \"../foo\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&sample).unwrap();
+        // evilkey is outside the whitelist → predicate dropped → cond_requires empty
+        assert!(
+            lf.deps[0].cond_requires.is_empty(),
+            "unknown predicate key must be dropped: {:?}",
+            lf.deps[0].cond_requires
+        );
+    }
+
+    #[test]
+    fn m1_unknown_predicate_key_dropped_block_form() {
+        // Block-form when-child with an unknown key is also dropped.
+        let sample = format!(
+            "version 1\n\
+             dep \"foo\" {{\n\
+             \x20   version \"0.0.1\"\n\
+             \x20   src_dir \"\"\n\
+             \x20   requires\n\
+             \x20   cond-require \"bar\" {{\n\
+             \x20       when evilkey=\"value\"\n\
+             \x20   }}\n\
+             \x20   provenance {{\n\
+             \x20       kind \"local\"\n\
+             \x20       path \"../foo\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&sample).unwrap();
+        assert!(
+            lf.deps[0].cond_requires.is_empty(),
+            "unknown predicate key in block form must be dropped: {:?}",
+            lf.deps[0].cond_requires
+        );
+    }
+
+    #[test]
+    fn m1_known_predicate_key_kept() {
+        // A cond-require with a known key (platform) must be accepted.
+        let sample = format!(
+            "version 1\n\
+             dep \"foo\" {{\n\
+             \x20   version \"0.0.1\"\n\
+             \x20   src_dir \"\"\n\
+             \x20   requires\n\
+             \x20   cond-require \"bar\" platform=\"linux\"\n\
+             \x20   provenance {{\n\
+             \x20       kind \"local\"\n\
+             \x20       path \"../foo\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&sample).unwrap();
+        assert_eq!(lf.deps[0].cond_requires.len(), 1);
+        assert_eq!(lf.deps[0].cond_requires[0].predicates[0].name, "platform");
+    }
+
+    // -------------------------------------------------------------------------
+    // M7 — multiple cond-require records emit in deterministic sorted order
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn m7_multiple_cond_requires_sorted_by_name() {
+        // Mirrors test_multiple_cond_requires_sorted_by_name in Python.
+        // Insert in reverse order (zlib before asm) — emit must be sorted (asm before zlib).
+        let cr_zlib = cr("zlib", vec![pred("platform", "linux", false)]);
+        let cr_asm  = cr("asm",  vec![pred("arch", "amd64", false)]);
+        let dep = make_locked(vec![cr_zlib, cr_asm]);
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let text = format_lockfile(&lf);
+        let asm_pos  = text.find("cond-require \"asm\"").expect("asm not found");
+        let zlib_pos = text.find("cond-require \"zlib\"").expect("zlib not found");
+        assert!(asm_pos < zlib_pos, "asm must precede zlib (sorted by name):\n{text}");
+    }
+
+    #[test]
+    fn m7_same_name_two_entries_sorted_by_predicate_string() {
+        // Same name (C1 fix): two entries for "foo" — one platform=linux, one
+        // platform=macosx.  The (name, pred-string) total order must be stable
+        // regardless of insertion order.
+        let cr_mac   = cr("foo", vec![pred("platform", "macosx", false)]);
+        let cr_linux = cr("foo", vec![pred("platform", "linux",  false)]);
+        let dep1 = make_locked(vec![cr_mac.clone(), cr_linux.clone()]);
+        let dep2 = make_locked(vec![cr_linux, cr_mac]);
+        let text1 = format_lockfile(&Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep1] });
+        let text2 = format_lockfile(&Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep2] });
+        assert_eq!(text1, text2, "insertion-order must not affect output");
+    }
+
+    // -------------------------------------------------------------------------
+    // M7 — malformed cond-require: robust parse, no panic
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn m7_malformed_no_name_arg() {
+        // cond-require node with no positional arg → None → not appended.
+        let sample = format!(
+            "version 1\n\
+             dep \"foo\" {{\n\
+             \x20   version \"0.0.1\"\n\
+             \x20   src_dir \"\"\n\
+             \x20   requires\n\
+             \x20   cond-require platform=\"linux\"\n\
+             \x20   provenance {{\n\
+             \x20       kind \"local\"\n\
+             \x20       path \"../foo\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&sample).unwrap();
+        // No name arg → the whole cond-require is skipped gracefully.
+        assert!(lf.deps[0].cond_requires.is_empty());
+    }
+
+    #[test]
+    fn m7_malformed_block_non_when_child_skipped() {
+        // A block child that is NOT "when" must be silently skipped (forward compat).
+        let sample = format!(
+            "version 1\n\
+             dep \"foo\" {{\n\
+             \x20   version \"0.0.1\"\n\
+             \x20   src_dir \"\"\n\
+             \x20   requires\n\
+             \x20   cond-require \"bar\" {{\n\
+             \x20       unknown-child platform=\"linux\"\n\
+             \x20       when platform=\"macosx\"\n\
+             \x20   }}\n\
+             \x20   provenance {{\n\
+             \x20       kind \"local\"\n\
+             \x20       path \"../foo\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&sample).unwrap();
+        // unknown-child skipped; when platform=macosx accepted.
+        assert_eq!(lf.deps[0].cond_requires.len(), 1);
+        assert_eq!(lf.deps[0].cond_requires[0].predicates.len(), 1);
+        assert_eq!(lf.deps[0].cond_requires[0].predicates[0].name, "platform");
+        assert_eq!(lf.deps[0].cond_requires[0].predicates[0].values, vec!["macosx"]);
+    }
+
+    #[test]
+    fn m7_malformed_when_child_with_no_props_yields_no_predicate() {
+        // A "when" child with no recognised props → empty predicates → CondRequire is None.
+        let sample = format!(
+            "version 1\n\
+             dep \"foo\" {{\n\
+             \x20   version \"0.0.1\"\n\
+             \x20   src_dir \"\"\n\
+             \x20   requires\n\
+             \x20   cond-require \"bar\" {{\n\
+             \x20       when\n\
+             \x20   }}\n\
+             \x20   provenance {{\n\
+             \x20       kind \"local\"\n\
+             \x20       path \"../foo\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&sample).unwrap();
+        // No predicates → None → not appended.
+        assert!(lf.deps[0].cond_requires.is_empty());
     }
 }

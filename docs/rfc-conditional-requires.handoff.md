@@ -1,6 +1,41 @@
 # rfc-conditional-requires (#26) — handoff
 
-- **Stage:** 3 COMPLETE — **all slices S1–S6 done + committed.** Next: Stage 4 `/code-review`.   •   **Round:** —
+- **Stage:** 4 `/code-review` COMPLETE — fix loop hit the FLOOR (0 Critical/High/Medium open) after R1 fixes + R2 re-review/fix + R3 re-review/fix. Four-runner green, harness ZERO cross-impl divergence, coverage 53/53. AWAITING Corey: commit approval.   •   **Round:** R3 clean
+- **R1 status:** C1✓ H1✓ H2✓(HEAD) H3✓ H4✓ M1✓ M2✓ M3✓ M4✓ M5✓ M6✓ M7✓ ; M8 deferred→#110 ; L1✓(via M1) L2 wontfix(by-design) L3✓(via M5).
+- **R2 (fixes introduced new findings, all fixed):** M2-rust (HIGH, Rust scan_region stack-overflow DoS — depth guard added, mirrors Python) ✓ ; C1-ssot (MED, sort-key SSOT unify → cond_require_sort_key delegating to formatter, both impls) ✓ ; M2-dup (MED, _skip_continuation helper) ✓ ; M4(→ValueError/panic!+spec) ✓ ; M3-alias✓ M2-asym(comment+Rust note+spec)✓.
+- **R3 (re-review of R2; all fixed inline):** DES-1 (MED, spec self-contradiction lockfile-schema §3.5 'lexicographic by name' vs new total-order — reworded) ✓ ; DES-2 (LOW, _cond_require_sort_key→public cond_require_sort_key) ✓ ; DES-3 (LOW, 3 stale 'sorted by name' comments) ✓ ; all R3 security CLEAN, cross-impl parity CLEAN (depth-guard path verified by inspection — no fixture nests ≥8 deep).
+- **New fixture-171** (same-name multi-branch) added; corpus 169 fixtures.
+- **Deferred→filed:** C1-shape (Vec<Vec>/list[tuple] named-wrapper polish) → NEW issue ; cmd_show predicate-VALUE ANSI injection (pre-existing, Low) → NEW issue ; M8 (resolver predicate-matching reimplements VersionSet, pre-existing) → #110 comment. #135 already open (show fixture).
+- **Pre-existing failures (stash-verified, NOT #26):** Rust fixture-099 (RES-PROVENANCE-CONFLICT vs FETCH-ALL-FAILED) + fixture-144 (TNG-DEPDECL-FETCH-FAILED vs RES-UNATTESTED-METADATA). Untracked as GH issues — surfaced to Corey.
+- **NOT committed** (commit after Corey approval).
+
+## Stage-4 review ledger (R1) — 5 agents (correctness, cross-impl, security, design, coverage), findings adversarially verified
+Status legend: open / fixed / deferred / wontfix / refuted. Severity in caps.
+
+| id | sev | status | file:line | issue / verifying note |
+|----|-----|--------|-----------|------------------------|
+| C1 | CRITICAL | open | nimble.py:213-241 + edge_sources.py requires_predicates dict + lockfile both impls | Same-name dep across ≥2 `when` branches collapses: Python dedups (keeps FIRST predicate), Rust `requires_predicates.insert` keeps LAST → divergent lockfile bytes + data loss. Violates spec §7.1 (MUST NOT dedup, verified line 518). Surfaced by Design-F1, Ximpl-D3, Correct-F1, Cover-gap2. Fix is non-trivial: remove Python dedup AND fix the `dict[name→preds]` seam (same name in 2 branches needs ≥2 cond-require records) in BOTH impls. |
+| H1 | HIGH | open | nimble.py:168 vs nimble.rs:91 | `srcDir` first-wins (Python) vs last-wins (Rust). Spec §7.3 (verified line 573) mandates LAST. Fix Python: drop `if src_dir is None` guard. |
+| H2 | HIGH | open(fork) | nimble.py:299 (HEAD) vs edge_sources.rs:99 (main) | Bare URL require (no `#ref`) defaults to different ref → different commit/identity/lockfile. Spec silent. Pre-existing. NEEDS DECISION: HEAD (nimble-compat) vs main; then pin in spec. |
+| H3 | HIGH | open | lockfile.rs:584-599 vs lockfile.py:767-794 | Rust `kdl_str` emits named escapes (`\n \r \t \b \f`); Python emits `\u{N}` for all ctrl chars. Breaks byte-identity on ctrl chars in string fields. Spec §2.4 names PYTHON as reference (line 187) → fix Rust (drop named escapes). Comment falsely claims "Mirrors lockfile.py exactly". |
+| H4 | HIGH | open | tests/test_lockfile.py | No property/round-trip PBT generating `CondRequire`-bearing deps (existing roundtrip strategy always sets cond_requires=()). Violates PBT discipline. Add `@given` cond-require strategy, assert format→parse→format byte-identical. |
+| M1 | MEDIUM | open | lockfile.py:_format_predicate_prop + lockfile.rs parse_cond_require | `pred.name` from untrusted lockfile accepted unvalidated, re-emitted as unescaped KDL identifier (both impls). Fix: whitelist `{platform,arch,nim,milpa,flag}` on parse, drop unknown. (Verifier ceiling: cond_requires advisory-only; can't alter resolution.) |
+| M2 | MEDIUM | open | nimble.py:_scan_region/_collect_direct_requires | O(n³) CPU DoS on deeply-nested `when` (measured depth300=2.2s, depth500=18.6s). Python only (Rust unaffected). Fix: depth guard (depth≥1 already→None) or iterate. |
+| M3 | MEDIUM | open | nimble.py:370 vs edge_sources.py:599 | `_url_to_name` / `_name_from_url` duplicated, divergent on no-path URLs (full-string vs None-drop). SSOT violation. Unify. |
+| M4 | MEDIUM | open | lockfile.py:804 `_format_predicate_prop` | Silently emits only `values[0]`; multi-value (OR) `Predicate` drops `values[1:]`. Invariant (cond-require preds always single-value) undocumented/unenforced. Assert + document, or handle. |
+| M5 | MEDIUM | open | resolver.py:582-643 | `_parse_transitive_deps`/`_parse_from_nimble` DEAD (zero external callers, verified) — superseded by edge_sources. Would strip predicates if reactivated. Delete both; KEEP `_dep_to_term` (live @1695). |
+| M6 | MEDIUM | open | resolver.py:168 | `_Candidate.requires_predicates` typed `dict[str,tuple[object,...]]` + `type:ignore` @1627; no real cycle blocks importing `Predicate` from leaf `predicate.py`. Use concrete type, drop ignore. |
+| M7 | MEDIUM | open | rust lockfile tests + both parsers | Missing: Rust multi-cond-require sort-order test; malformed `cond-require` parse test (no-name / non-`when` child / propless `when`) both impls. |
+| M8 | MEDIUM | deferred→#110 | resolver.py:460-500 | `_value_matches`/`_version_satisfies`/`_normalize_constraint` reimplement `VersionSet` SSOT. PRE-EXISTING (commit 9de7a90), part of deferred #110 activation path. Fold into #110, not #26. |
+| L1 | LOW | open | cli.py:807 cmd_show | `pred.name`/`values[0]` printed raw → ANSI/terminal injection from untrusted lockfile. Fold into M1 vocab check. |
+| L2 | LOW | wontfix? | nimble.py:536-546 | `_split_on_and` returns None (no fallthrough to single-pred) when one side non-nim, e.g. `NimMajor>=1 and defined(linux)`. By-design per spec (nim-and-nim only); both impls agree. Note only. |
+| L3 | LOW | open | resolver.py:563 vs edge_sources.py:203 | `_find_nimble_file` duplicated (raise vs None). Resolved by M5 deletion. |
+| L4 | LOW | open | tests + conformance | Gaps: tabs-indent in when-body, two consecutive when-blocks (first no requires), NimMajor single-form conformance fixture, Rust require_lines tracking, huge-version robustness. |
+
+## Cross-cutting note
+The dedup cluster (C1) + M3 + M5 + M6 are all SSOT/duplication smells in the .nimble→edge pipeline; several pre-date #26 but #26's S5 spec newly pins the correct behavior (no-dedup, last-wins srcDir), making C1/H1 in-scope to fix now. H2/M8/L2 are pre-existing/by-design.
+
+
 - **Resume:** `/clear` first (between-stage), then `/code-review #26` (RFC `docs/rfc-conditional-requires.md`; scope = the 8 commits S1→S6).
 - **Deferred + filed:** `milpa show` CLI-only cond_requires conformance fixture → **#135** (cmd_show is unit-tested; corpus completeness only).
 - **Resume:** `/loop implement the next unimplemented RFC slice (docs/rfc-conditional-requires.md §9) with /tdd following the standing rules; after each slice report one progress line; stop when every slice is implemented`

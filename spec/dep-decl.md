@@ -551,7 +551,10 @@ edge cases.
 >    (case-sensitive prefix match on the scheme).
 >    A `#ref` suffix (if present) is split off as the `ref` component;
 >    the remainder (before `#`) is the `url` component. This produces a
->    `UrlRequire`. If no `#` is present, `ref` is the empty string `""`.
+>    `UrlRequire`. If no `#ref` fragment is present, `ref` defaults to
+>    `"HEAD"` (the remote's default branch), matching nimble's behavior.
+>    The empty string `""` MUST NOT be used as the default; `"HEAD"` is
+>    the sole conformant default.
 >
 > 2. **Named requirement** — all other strings. The first whitespace-delimited
 >    token (splitting on space, tab) is the `name` component; the remainder

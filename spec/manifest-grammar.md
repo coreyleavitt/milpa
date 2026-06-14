@@ -551,7 +551,11 @@ execute them. Instead it applies the heuristic defined normatively in
 >
 > - If it starts with one of `http://`, `https://`, `ssh://`, `git://`,
 >   `file://` → **URL requirement**. A `#ref` suffix (if present) is split off
->   as the ref; the remainder is the URL.
+>   as the ref; the remainder is the URL. If no `#ref` fragment is present,
+>   `ref` defaults to `"HEAD"` (the remote's default branch), matching
+>   nimble's behavior. The empty string `""` MUST NOT be used as the default;
+>   `"HEAD"` is the sole conformant default. (Normative definition:
+>   `spec/dep-decl.md §7.2`.)
 > - Otherwise → **named requirement**. The first whitespace-separated token is
 >   the package name; any remainder is the version constraint string.
 >

@@ -344,10 +344,34 @@ resolving profile) is deferred to #110.
 > this space-free form when emitting `cond-require` nodes.
 
 > NORMATIVE: `cond-require` nodes MUST appear **immediately after** the
-> `requires` node, in lexicographic order by name (byte-stable across impls).
+> `requires` node, sorted by the total order `(name, canonical-predicate-string)`
+> defined below (byte-stable across impls). For the common case of distinct
+> names this reduces to lexicographic order by name; the predicate-string
+> component is the tie-breaker that keeps emission deterministic when the same
+> name appears in more than one branch (see below).
 > Within a single block form, the `when` children preserve **predicate-tuple
 > order** — the order in which predicates were produced by the §7.5.2 branch
 > algebra — and MUST NOT be re-sorted.
+>
+> When the same dep name appears in two or more `when` branches (a dep that is
+> required under distinct platform conditions), each branch yields a separate
+> `cond-require` entry with the same name but different predicates. Sorting is
+> by `(name, canonical-predicate-string)` — a total order that is
+> byte-deterministic even when multiple entries share the same name. The
+> per-predicate string MUST be formed using the same KDL string-escaping rules
+> as the emitter (i.e., `_kdl_str`/`kdl_str` in the respective impl) so that
+> sort order and emission order cannot diverge if a value ever contains `"`,
+> `\`, or a control character.
+
+> NORMATIVE: **Single-value invariant (v0).** Every `Predicate` stored in a
+> `cond-require` entry carries **exactly one** value (i.e., `values.len() == 1`).
+> Multi-value OR predicates (`values.len() > 1`) are not supported in v0; they
+> are a forward-version concern. An emitter that encounters a predicate with any
+> number of values other than one MUST raise an explicit error (not silently
+> truncate or continue). This invariant is specific to the `cond-require`
+> pipeline; the `Predicate` type itself may carry multiple values in other
+> contexts (e.g., manifest-grammar `when` parsing where multi-value OR semantics
+> are legitimate). The guard belongs at the emit boundary, not in the type.
 
 > NORMATIVE: `cond-require` is **omitted entirely** for deps that have no
 > conditional require annotations (i.e., deps with no recognized `when`

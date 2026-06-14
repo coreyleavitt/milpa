@@ -163,9 +163,10 @@ class _Candidate:
     # None for URL/tarball/local/member deps and named deps without a dep_decl pointer.
     dep_decl: str | None = None
     # S4: advisory predicate metadata from edgeset_to_terms (RFC §3.4.3 option a).
-    # Maps dep-name → predicate tuple for require entries with non-empty predicates.
+    # Maps dep-name → LIST of predicate-tuples, one per occurrence with non-empty
+    # predicates (a dep in ≥2 when-branches yields ≥2 list entries).
     # Never consulted for selection/solving. Empty for root/synthetic candidates.
-    requires_predicates: dict[str, tuple[object, ...]] = field(default_factory=dict)
+    requires_predicates: dict[str, list[tuple[Predicate, ...]]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -577,70 +578,6 @@ def _find_nimble_file(dep_path: Path, name: str) -> Path:
             return named[0]
         return matches[0]
     raise FileNotFoundError(f"no .nimble file found under {dep_path}")
-
-
-def _parse_transitive_deps(
-    dep_path: Path,
-    dep_name: str,
-    overrides_by_name: dict[str, Override],
-) -> tuple[list[Term], list[str], str]:
-    """Extract solver terms + require names + src_dir from a fetched dep tree.
-
-    Reads ``milpa.kdl`` if present (preferred); falls back to ``<name>.nimble``.
-    NORMATIVE (§9): reads ONLY ``manifest.deps``, NEVER ``manifest.dev_deps``
-    — a transitive dep's dev-deps MUST NOT enter the resolved graph.
-    This is the single structural guard that enforces the transitive-exclusion
-    rule.
-    """
-    milpa_kdl = dep_path / "milpa.kdl"
-    if milpa_kdl.exists():
-        from milpa.manifest import parse_manifest
-
-        try:
-            m = parse_manifest(milpa_kdl.read_text(encoding="utf-8"))
-        except MilpaError:
-            # Malformed transitive milpa.kdl — fall back to .nimble.
-            return _parse_from_nimble(dep_path, dep_name, overrides_by_name)
-
-        src_dir = m.src_dir or ""
-        terms: list[Term] = []
-        requires_names: list[str] = []
-
-        # NORMATIVE §9: only m.deps, not m.dev_deps.
-        for d in m.deps:
-            t, r = _dep_to_term(d, overrides_by_name)
-            if t is not None and r is not None:
-                terms.append(t)
-                requires_names.append(r)
-
-        return terms, requires_names, src_dir
-
-    return _parse_from_nimble(dep_path, dep_name, overrides_by_name)
-
-
-def _parse_from_nimble(
-    dep_path: Path,
-    dep_name: str,
-    overrides_by_name: dict[str, Override],
-) -> tuple[list[Term], list[str], str]:
-    """Extract solver terms from a ``.nimble`` file."""
-    try:
-        nimble_path = _find_nimble_file(dep_path, dep_name)
-        nm = parse_nimble(nimble_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return [], [], ""
-
-    src_dir = nm.src_dir or ""
-    terms: list[Term] = []
-    requires_names: list[str] = []
-
-    for dep in nm.deps:
-        t, r = _dep_to_term(dep, overrides_by_name)
-        if t is not None and r is not None:
-            terms.append(t)
-            requires_names.append(r)
-
-    return terms, requires_names, src_dir
 
 
 def _dep_to_term(
@@ -1617,19 +1554,20 @@ def _build_graph(
         version_str = format_version_str(version)
 
         # S4: build cond_requires from the candidate's requires_predicates dict.
-        # For each require name with non-empty predicates, make a CondRequire;
-        # collect sorted by name (RFC §3.4.3 option a).
-        from milpa.lockfile import CondRequire as _CondRequire
-        from milpa.predicate import Predicate as _Predicate
+        # requires_predicates maps name → list[predicate_tuple]; a dep in ≥2
+        # when-branches yields ≥2 entries per name, each becoming one CondRequire.
+        # Sort delegates to cond_require_sort_key (lockfile SSOT) so the sort
+        # key uses the same escaping as the emitter — cannot drift (C1 fix).
+        from milpa.lockfile import CondRequire as _CondRequire, cond_require_sort_key
+
+        _raw_cond: list[_CondRequire] = [
+            _CondRequire(name=rname, predicates=preds)
+            for rname, pred_list in cand.requires_predicates.items()
+            for preds in pred_list
+            if preds
+        ]
         _cond_requires: tuple[_CondRequire, ...] = tuple(
-            sorted(
-                (
-                    _CondRequire(name=rname, predicates=preds)  # type: ignore[arg-type]
-                    for rname, preds in cand.requires_predicates.items()
-                    if preds
-                ),
-                key=lambda cr: cr.name,
-            )
+            sorted(_raw_cond, key=cond_require_sort_key)
         )
 
         resolved = ResolvedDep(
@@ -1642,7 +1580,7 @@ def _build_graph(
             # S6: dep_decl pin — carries the DepDecl hash from _Candidate (set in
             # _materialize when DepDeclEdgeSource fired) to the lockfile record.
             dep_decl=cand.dep_decl,
-            # S4: conditional require annotations (already sorted by name).
+            # S4: conditional require annotations (sorted by (name, canonical-predicate-string)).
             cond_requires=_cond_requires,
         )
         deps.append(resolved)

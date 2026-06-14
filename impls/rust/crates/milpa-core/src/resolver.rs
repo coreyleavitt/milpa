@@ -38,6 +38,7 @@ use crate::edge_sources::{EdgeSourceCtx, NimbleEdgeSource};
 use crate::error::{CoreError, MilpaError};
 use crate::fetch::{FetchError, FetcherRegistry, Receipt};
 use crate::identity::compute_content_hash;
+use crate::lockfile::cond_require_sort_key;
 use crate::registry::{Index, IndexVersion};
 use crate::workspace::LoadedWorkspace;
 
@@ -353,8 +354,10 @@ struct Extracted {
     /// `edge_set.source == EdgeSource::DepDecl` at the call-site.
     edge_set: EdgeSet,
     /// S4: advisory predicate metadata (RFC cond-requires §3.4.3 option a).
-    /// Maps dep-name → predicates for require entries with non-empty predicates.
-    requires_predicates: std::collections::BTreeMap<String, Vec<milpa_types::Predicate>>,
+    /// Maps dep-name → ALL predicate-vecs collected across ALL occurrences.
+    /// A dep appearing in ≥2 `when` branches yields ≥2 inner `Vec<Predicate>`
+    /// entries (C1 fix — accumulate, not overwrite).
+    requires_predicates: std::collections::BTreeMap<String, Vec<Vec<milpa_types::Predicate>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -381,9 +384,9 @@ struct Candidate {
     /// artifact (`EdgeSource::DepDecl`). `None` for milpa.kdl / nimble fallback.
     dep_decl: Option<String>,
     /// S4: advisory predicate metadata from `edgeset_to_extracted` (RFC §3.4.3 option a).
-    /// Maps dep-name → predicates for require entries with non-empty predicates.
+    /// Maps dep-name → ALL predicate-vecs across ALL occurrences (C1 fix).
     /// Never consulted for selection/solving. Empty for root/synthetic candidates.
-    requires_predicates: std::collections::BTreeMap<String, Vec<milpa_types::Predicate>>,
+    requires_predicates: std::collections::BTreeMap<String, Vec<Vec<milpa_types::Predicate>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,64 +1323,73 @@ impl<'a> ResolveProvider<'a> {
         let mut deps: Vec<SolverDep> = Vec::new();
         let mut requires_names: Vec<String> = Vec::new();
         let mut items: Vec<Item> = Vec::new();
-        let mut requires_predicates: std::collections::BTreeMap<String, Vec<milpa_types::Predicate>> =
+        // S4 (C1 fix): accumulate all predicate-vecs per name; do NOT overwrite.
+        let mut requires_predicates: std::collections::BTreeMap<String, Vec<Vec<milpa_types::Predicate>>> =
             std::collections::BTreeMap::new();
+        // Dedup for solver terms (dep name must appear exactly once as a Term).
+        let mut seen_dep_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
         for entry in &es.requires {
             match entry {
                 RequireEntry::Url(u) => {
                     let dep_name = name_from_url(&u.url)?;
-                    deps.push(SolverDep::new(dep_name.clone(), eq_sentinel()));
-                    requires_names.push(dep_name.clone());
-                    items.push(Item::Url(url_dep(&dep_name, &u.url, &u.ref_)));
-                    // S4: record predicates if non-empty.
+                    if !seen_dep_names.contains(&dep_name) {
+                        deps.push(SolverDep::new(dep_name.clone(), eq_sentinel()));
+                        requires_names.push(dep_name.clone());
+                        items.push(Item::Url(url_dep(&dep_name, &u.url, &u.ref_)));
+                        seen_dep_names.insert(dep_name.clone());
+                    }
+                    // S4: accumulate predicates if non-empty (do not overwrite).
                     if !u.predicates.is_empty() {
-                        requires_predicates.insert(dep_name, u.predicates.clone());
+                        requires_predicates.entry(dep_name).or_default().push(u.predicates.clone());
                     }
                 }
                 RequireEntry::Named(n) => {
-                    // Override check: a named transitive dep that is itself overridden
-                    // enters as eq_sentinel() so the resolver routes it through the
-                    // override URL fetch (§10).
-                    let vs = if self.overrides.contains_key(&n.name) {
-                        eq_sentinel()
-                    } else {
-                        // Constraint validation: milpa.kdl constraints are validated
-                        // at the manifest-parse boundary (MAN-DEP-NAMED-CONSTRAINT) and
-                        // are already valid here. Nimble constraints are validated here
-                        // for the first time → MAN-NIMBLE-CONSTRAINT on failure.
-                        let constraint_opt = if n.constraint_str.is_empty() {
-                            None
+                    if !seen_dep_names.contains(&n.name) {
+                        // Override check: a named transitive dep that is itself overridden
+                        // enters as eq_sentinel() so the resolver routes it through the
+                        // override URL fetch (§10).
+                        let vs = if self.overrides.contains_key(&n.name) {
+                            eq_sentinel()
                         } else {
-                            Some(n.constraint_str.as_str())
-                        };
-                        match VersionSet::from_constraint(constraint_opt) {
-                            Ok(vs) => vs,
-                            Err(e) => {
-                                if matches!(es.source, milpa_types::EdgeSource::NimbleFallback) {
-                                    return Err(MilpaError::Manifest(
-                                        milpa_manifest::ManifestError::new(
-                                            "MAN-NIMBLE-CONSTRAINT",
-                                            format!(
-                                                "malformed version constraint {:?}: {e}",
-                                                n.constraint_str
+                            // Constraint validation: milpa.kdl constraints are validated
+                            // at the manifest-parse boundary (MAN-DEP-NAMED-CONSTRAINT) and
+                            // are already valid here. Nimble constraints are validated here
+                            // for the first time → MAN-NIMBLE-CONSTRAINT on failure.
+                            let constraint_opt = if n.constraint_str.is_empty() {
+                                None
+                            } else {
+                                Some(n.constraint_str.as_str())
+                            };
+                            match VersionSet::from_constraint(constraint_opt) {
+                                Ok(vs) => vs,
+                                Err(e) => {
+                                    if matches!(es.source, milpa_types::EdgeSource::NimbleFallback) {
+                                        return Err(MilpaError::Manifest(
+                                            milpa_manifest::ManifestError::new(
+                                                "MAN-NIMBLE-CONSTRAINT",
+                                                format!(
+                                                    "malformed version constraint {:?}: {e}",
+                                                    n.constraint_str
+                                                ),
                                             ),
-                                        ),
-                                    ));
+                                        ));
+                                    }
+                                    VersionSet::full()
                                 }
-                                VersionSet::full()
                             }
-                        }
-                    };
-                    deps.push(SolverDep::new(n.name.clone(), vs.clone()));
-                    requires_names.push(n.name.clone());
-                    items.push(Item::Named {
-                        name: n.name.clone(),
-                        constraint: vs,
-                    });
-                    // S4: record predicates if non-empty.
+                        };
+                        deps.push(SolverDep::new(n.name.clone(), vs.clone()));
+                        requires_names.push(n.name.clone());
+                        items.push(Item::Named {
+                            name: n.name.clone(),
+                            constraint: vs,
+                        });
+                        seen_dep_names.insert(n.name.clone());
+                    }
+                    // S4: accumulate predicates if non-empty (do not overwrite).
                     if !n.predicates.is_empty() {
-                        requires_predicates.insert(n.name.clone(), n.predicates.clone());
+                        requires_predicates.entry(n.name.clone()).or_default().push(n.predicates.clone());
                     }
                 }
             }
@@ -1541,17 +1553,26 @@ impl<'a> ResolveProvider<'a> {
             .into_iter()
             .filter_map(|n| chosen.get(&n))
             .map(|c| {
-                // S4: build cond_requires from requires_predicates, sorted by name.
+                // S4: build cond_requires from requires_predicates.
+                // Each (name, pred_vecs) entry may have ≥1 inner Vec<Predicate>
+                // (one per when-branch occurrence — C1 fix).  Emit one CondRequire
+                // per inner entry.  Sort by (name, canonical-predicate-string) for
+                // a total order that is byte-deterministic across impls (§2.4).
                 let mut cond_requires: Vec<milpa_types::CondRequire> = c
                     .requires_predicates
                     .iter()
-                    .filter(|(_, preds)| !preds.is_empty())
-                    .map(|(rname, preds)| milpa_types::CondRequire {
-                        name: rname.clone(),
-                        predicates: preds.clone(),
+                    .flat_map(|(rname, pred_vecs)| {
+                        pred_vecs.iter().filter(|pv| !pv.is_empty()).map(move |preds| {
+                            milpa_types::CondRequire {
+                                name: rname.clone(),
+                                predicates: preds.clone(),
+                            }
+                        })
                     })
                     .collect();
-                cond_requires.sort_by(|a, b| a.name.cmp(&b.name));
+                // Delegates to lockfile::cond_require_sort_key (SSOT) so
+                // escaping is shared with the emitter — cannot drift (C1 fix).
+                cond_requires.sort_by_key(|cr| cond_require_sort_key(cr));
                 ResolvedDep {
                     name: c.name.clone(),
                     identity: c.identity.clone(),

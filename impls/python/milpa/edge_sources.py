@@ -520,7 +520,7 @@ def edgeset_to_terms(
     es: EdgeSet,
     overrides_by_name: dict[str, "Override"],
     url_dep_version: "Version",
-) -> tuple[list["Term"], list[str], dict[str, "tuple[object, ...]"]]:
+) -> tuple[list["Term"], list[str], dict[str, "list[tuple[object, ...]]"]]:
     """Convert an ``EdgeSet`` to the solver's ``(dep_terms, requires_names, requires_predicates)`` tuple.
 
     This is the single source of truth for ``EdgeSet → Term`` mapping,
@@ -546,9 +546,12 @@ def edgeset_to_terms(
     (dep_terms, requires_names, requires_predicates):
         ``dep_terms`` and ``requires_names`` are ready for
         ``_Candidate(dep_terms=…, requires_names=…)``.
-        ``requires_predicates`` maps dep-name → predicate tuple for entries
-        whose ``RequireEntry.predicates`` is non-empty.  Advisory metadata only
-        — never consulted for selection/solving (S4, RFC §3.4.3 option a).
+        ``requires_predicates`` maps dep-name → LIST of predicate-tuples,
+        one entry per occurrence of that dep name with non-empty predicates.
+        A dep appearing in ≥2 recognized ``when`` branches yields ≥2 list
+        entries; each entry becomes one ``CondRequire`` in the lockfile (§3.5).
+        Advisory metadata only — never consulted for selection/solving
+        (S4, RFC §3.4.3 option a).
     """
     from milpa.predicate import Predicate as _Predicate
     from milpa.solver import Term
@@ -556,7 +559,18 @@ def edgeset_to_terms(
 
     dep_terms: list[Term] = []
     requires_names: list[str] = []
-    requires_predicates: dict[str, tuple[_Predicate, ...]] = {}
+    # S4: maps dep-name → ALL predicate-tuples collected across ALL occurrences.
+    # A dep appearing in ≥2 ``when`` branches yields ≥2 entries in this list,
+    # each carrying the branch's own predicate set.  One CondRequire is emitted
+    # per entry (§3.5, lockfile-schema.md).  The dict is keyed by name to keep
+    # ordering stable; we accumulate into a list rather than overwriting.
+    # Spec §7.1: no dedup at the scanner level; the dep name may appear more
+    # than once in ``es.requires`` with different predicate sets.
+    requires_predicates: dict[str, list[tuple[_Predicate, ...]]] = {}
+    # Track names already added to dep_terms/requires_names to avoid solver
+    # duplicates (the solver needs each dep name exactly once as a Term).
+    # Dedup is correct HERE (resolved dep set, not the raw scanner output).
+    seen_dep_names: set[str] = set()
 
     for entry in es.requires:
         if isinstance(entry, UrlRequire):
@@ -564,49 +578,64 @@ def edgeset_to_terms(
             dep_name = _name_from_url(entry.url)
             if dep_name is None:
                 continue
-            dep_terms.append(Term.require(dep_name, VersionSet.eq(url_dep_version)))
-            requires_names.append(dep_name)
+            if dep_name not in seen_dep_names:
+                dep_terms.append(Term.require(dep_name, VersionSet.eq(url_dep_version)))
+                requires_names.append(dep_name)
+                seen_dep_names.add(dep_name)
             if entry.predicates:
-                requires_predicates[dep_name] = entry.predicates
+                requires_predicates.setdefault(dep_name, []).append(entry.predicates)
 
         elif isinstance(entry, NamedRequire):
             if entry.name == "nim":
                 continue
-            if entry.name in overrides_by_name:
-                # Named dep with override → URL at sentinel.
-                dep_terms.append(
-                    Term.require(entry.name, VersionSet.eq(url_dep_version))
-                )
-            else:
-                # Parse constraint_str → VersionSet.
-                if entry.constraint_str:
-                    from milpa.version import VersionSet as VS
-                    try:
-                        vs = VS.from_constraint(entry.constraint_str)
-                    except Exception:
-                        vs = VS.full()
+            if entry.name not in seen_dep_names:
+                if entry.name in overrides_by_name:
+                    # Named dep with override → URL at sentinel.
+                    dep_terms.append(
+                        Term.require(entry.name, VersionSet.eq(url_dep_version))
+                    )
                 else:
-                    from milpa.version import VersionSet as VS
-                    vs = VS.full()
-                dep_terms.append(Term.require(entry.name, vs))
-            requires_names.append(entry.name)
+                    # Parse constraint_str → VersionSet.
+                    if entry.constraint_str:
+                        from milpa.version import VersionSet as VS
+                        try:
+                            vs = VS.from_constraint(entry.constraint_str)
+                        except Exception:
+                            vs = VS.full()
+                    else:
+                        from milpa.version import VersionSet as VS
+                        vs = VS.full()
+                    dep_terms.append(Term.require(entry.name, vs))
+                requires_names.append(entry.name)
+                seen_dep_names.add(entry.name)
             if entry.predicates:
-                requires_predicates[entry.name] = entry.predicates
+                requires_predicates.setdefault(entry.name, []).append(entry.predicates)
 
     return dep_terms, requires_names, requires_predicates
 
 
 def _name_from_url(url: str) -> str | None:
-    """Derive a dep name from a git URL (mirrors ``_url_to_name`` in nimble.py)."""
-    import re
-    # Strip trailing .git and take the last path component.
-    url = url.rstrip("/")
-    if url.endswith(".git"):
-        url = url[:-4]
-    m = re.search(r"/([^/]+)$", url)
-    if m:
-        name = m.group(1)
-        # Safe-name check: no / .. or absolute path.
-        if "/" not in name and ".." not in name and not name.startswith("/"):
-            return name
-    return None
+    """Derive a dep name from a git URL — wraps ``nimble.url_to_name`` (M3 SSOT).
+
+    Uses ``nimble.url_to_name`` as the single derivation logic, then applies the
+    None-drop guard for degenerate inputs where no meaningful path component
+    exists (e.g. bare scheme-only URLs).  The None return causes the dep to be
+    silently dropped from the EdgeSet, which is the correct EdgeSet-level behavior.
+
+    Callers in ``edgeset_to_terms`` use ``continue`` on None (dep dropped).
+    Callers in the ``nimble`` module use ``url_to_name`` directly (returns a
+    non-empty string even for degenerate inputs, which is correct for UrlDep.name).
+    """
+    from milpa.nimble import url_to_name as _url_to_name
+    name = _url_to_name(url)
+    # None-drop guard: if the "name" equals the full URL (no path component found
+    # by url_to_name's fallback), or contains path separators / bad chars, drop it.
+    # url_to_name returns the full URL as fallback; detect this by checking that the
+    # result is not the same as the stripped URL and has no path separators.
+    stripped = url.rstrip("/")
+    if stripped.endswith(".git"):
+        stripped = stripped[:-4]
+    # A meaningful name must differ from the full stripped URL and contain no "/"
+    if name == stripped or "/" in name or ".." in name or name.startswith("/"):
+        return None
+    return name

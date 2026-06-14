@@ -800,6 +800,92 @@ mod tests {
             ]);
         } else { panic!("c not found"); }
     }
+
+    // ----- C1: same dep name in two when branches — no dedup (spec §7.1) -----
+
+    fn plat(name: &str) -> crate::Predicate {
+        crate::Predicate { name: "platform".to_string(), values: vec![name.to_string()], negated: false }
+    }
+
+    #[test]
+    fn c1_same_named_dep_two_independent_when_blocks_both_present() {
+        // Spec §7.1: no dedup — same name in two independent when blocks must produce
+        // two entries, each carrying its own predicate annotation.
+        let text = concat!(
+            "when defined(linux):\n  requires \"foo\"\n",
+            "when defined(macosx):\n  requires \"foo\"\n",
+        );
+        let nm = parse_nimble(text);
+        // Both entries must be present (no dedup)
+        assert_eq!(nm.requires.len(), 2, "both occurrences must be present");
+        let preds_0 = match &nm.requires[0] {
+            NimbleRequirement::Named { predicates, name, .. } => {
+                assert_eq!(name, "foo");
+                predicates.clone()
+            }
+            _ => panic!("expected Named"),
+        };
+        let preds_1 = match &nm.requires[1] {
+            NimbleRequirement::Named { predicates, name, .. } => {
+                assert_eq!(name, "foo");
+                predicates.clone()
+            }
+            _ => panic!("expected Named"),
+        };
+        assert_eq!(preds_0, vec![plat("linux")], "first occurrence must carry linux predicate");
+        assert_eq!(preds_1, vec![plat("macosx")], "second occurrence must carry macosx predicate");
+    }
+
+    #[test]
+    fn c1_mixed_conditional_unconditional_alignment() {
+        // Each dep must carry the right predicate set.
+        let text = concat!(
+            "requires \"common1\"\n",
+            "when defined(linux):\n  requires \"x\"\n",
+            "requires \"common2\"\n",
+            "when defined(macosx):\n  requires \"y\"\n",
+        );
+        let nm = parse_nimble(text);
+        assert_eq!(nm.requires.len(), 4);
+        let find_first = |n: &str| {
+            nm.requires.iter().find(|r| match r {
+                NimbleRequirement::Named { name, .. } => name == n,
+                _ => false,
+            })
+        };
+        if let Some(NimbleRequirement::Named { predicates, .. }) = find_first("common1") {
+            assert!(predicates.is_empty(), "common1 must be unconditional");
+        } else { panic!("common1 not found"); }
+        if let Some(NimbleRequirement::Named { predicates, .. }) = find_first("x") {
+            assert_eq!(predicates, &vec![plat("linux")]);
+        } else { panic!("x not found"); }
+        if let Some(NimbleRequirement::Named { predicates, .. }) = find_first("common2") {
+            assert!(predicates.is_empty(), "common2 must be unconditional");
+        } else { panic!("common2 not found"); }
+        if let Some(NimbleRequirement::Named { predicates, .. }) = find_first("y") {
+            assert_eq!(predicates, &vec![plat("macosx")]);
+        } else { panic!("y not found"); }
+    }
+
+    #[test]
+    fn c1_same_url_dep_two_branches_both_present() {
+        let url = "https://github.com/example/foo.git";
+        let text = format!(
+            "when defined(linux):\n  requires \"{url}#v1\"\nwhen defined(macosx):\n  requires \"{url}#v1\"\n"
+        );
+        let nm = parse_nimble(&text);
+        assert_eq!(nm.requires.len(), 2, "both url occurrences must be present");
+        let preds_0 = match &nm.requires[0] {
+            NimbleRequirement::Url { predicates, .. } => predicates.clone(),
+            _ => panic!("expected Url"),
+        };
+        let preds_1 = match &nm.requires[1] {
+            NimbleRequirement::Url { predicates, .. } => predicates.clone(),
+            _ => panic!("expected Url"),
+        };
+        assert_eq!(preds_0, vec![plat("linux")]);
+        assert_eq!(preds_1, vec![plat("macosx")]);
+    }
 }
 
 #[cfg(test)]

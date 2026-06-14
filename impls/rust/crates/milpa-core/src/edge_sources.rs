@@ -96,7 +96,9 @@ impl NimbleEdgeSource {
         for req in &nm.requires {
             match req {
                 NimbleRequirement::Url { url, ref_spec, predicates, .. } => {
-                    let ref_ = ref_spec.clone().unwrap_or_else(|| "main".to_string());
+                    // §7.2 normative: bare URL with no `#ref` defaults to HEAD
+                    // (the remote's default branch), matching nimble's behavior.
+                    let ref_ = ref_spec.clone().unwrap_or_else(|| "HEAD".to_string());
                     requires.push(RequireEntry::Url(UrlRequire {
                         url: url.clone(),
                         ref_,
@@ -383,8 +385,17 @@ pub fn edgeset_to_terms(
     let mut requires_names: Vec<String> = Vec::new();
     let mut url_requires: Vec<(String, String)> = Vec::new(); // (url, ref_)
     let mut named_requires: Vec<(String, VersionSet)> = Vec::new(); // (name, vs)
-    let mut requires_predicates: std::collections::BTreeMap<String, Vec<milpa_types::Predicate>> =
+    // S4 (C1 fix): maps dep-name → ALL predicate-vecs collected across ALL occurrences.
+    // A dep appearing in ≥2 `when` branches yields ≥2 entries in the inner Vec,
+    // each carrying that branch's own predicate set.  One CondRequire is emitted
+    // per inner entry (§3.5, lockfile-schema.md).  Using `.entry().or_default().push()`
+    // instead of `.insert()` so same-name occurrences accumulate rather than overwrite.
+    let mut requires_predicates: std::collections::BTreeMap<String, Vec<Vec<milpa_types::Predicate>>> =
         std::collections::BTreeMap::new();
+    // Track names already added to deps/requires_names to avoid solver duplicates
+    // (the solver needs each dep name exactly once as a Term).  Dedup is correct
+    // HERE (resolved dep set); the raw scanner (nimble.py/nimble.rs) no longer dedupes.
+    let mut seen_dep_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for entry in &es.requires {
         match entry {
@@ -394,32 +405,38 @@ pub fn edgeset_to_terms(
                     Some(n) => n,
                     None => continue, // malformed URL; skip silently (resolver handles error paths)
                 };
-                deps.push(SolverDep::new(name.clone(), VersionSet::eq(url_dep_version.clone())));
-                requires_names.push(name.clone());
-                url_requires.push((u.url.clone(), u.ref_.clone()));
-                // S4: record predicates if non-empty.
+                if !seen_dep_names.contains(&name) {
+                    deps.push(SolverDep::new(name.clone(), VersionSet::eq(url_dep_version.clone())));
+                    requires_names.push(name.clone());
+                    url_requires.push((u.url.clone(), u.ref_.clone()));
+                    seen_dep_names.insert(name.clone());
+                }
+                // S4: record predicates if non-empty (accumulate, do not overwrite).
                 if !u.predicates.is_empty() {
-                    requires_predicates.insert(name, u.predicates.clone());
+                    requires_predicates.entry(name).or_default().push(u.predicates.clone());
                 }
             }
             RequireEntry::Named(n) => {
-                let vs = if overrides_by_name.contains_key(&n.name) {
-                    // Overridden named dep → enters as eq_sentinel (§10)
-                    VersionSet::eq(url_dep_version.clone())
-                } else {
-                    // Constraint already validated at parse boundary; re-parse here
-                    // is safe (the string came from a correctly-parsed manifest).
-                    // Map parse errors to full (any) to avoid silent drops — a
-                    // malformed constraint is already caught at manifest parse time.
-                    VersionSet::from_constraint(Some(&n.constraint_str))
-                        .unwrap_or_else(|_| VersionSet::full())
-                };
-                deps.push(SolverDep::new(n.name.clone(), vs.clone()));
-                requires_names.push(n.name.clone());
-                named_requires.push((n.name.clone(), vs));
-                // S4: record predicates if non-empty.
+                if !seen_dep_names.contains(&n.name) {
+                    let vs = if overrides_by_name.contains_key(&n.name) {
+                        // Overridden named dep → enters as eq_sentinel (§10)
+                        VersionSet::eq(url_dep_version.clone())
+                    } else {
+                        // Constraint already validated at parse boundary; re-parse here
+                        // is safe (the string came from a correctly-parsed manifest).
+                        // Map parse errors to full (any) to avoid silent drops — a
+                        // malformed constraint is already caught at manifest parse time.
+                        VersionSet::from_constraint(Some(&n.constraint_str))
+                            .unwrap_or_else(|_| VersionSet::full())
+                    };
+                    deps.push(SolverDep::new(n.name.clone(), vs.clone()));
+                    requires_names.push(n.name.clone());
+                    named_requires.push((n.name.clone(), vs));
+                    seen_dep_names.insert(n.name.clone());
+                }
+                // S4: record predicates if non-empty (accumulate, do not overwrite).
                 if !n.predicates.is_empty() {
-                    requires_predicates.insert(n.name.clone(), n.predicates.clone());
+                    requires_predicates.entry(n.name.clone()).or_default().push(n.predicates.clone());
                 }
             }
         }
@@ -446,9 +463,11 @@ pub struct EdgeSetTerms {
     /// (name, vs) pairs for Named requires — caller constructs `Item::Named`.
     pub named_requires: Vec<(String, VersionSet)>,
     /// S4: advisory predicate metadata (RFC cond-requires §3.4.3 option a).
-    /// Maps dep-name → predicates for require entries with non-empty predicates.
+    /// Maps dep-name → ALL predicate-vecs collected across ALL occurrences.
+    /// A dep appearing in ≥2 `when` branches yields ≥2 inner `Vec<Predicate>`
+    /// entries; each becomes one `CondRequire` in the lockfile (§3.5, C1 fix).
     /// Never consulted for selection/solving — purely for lockfile annotation.
-    pub requires_predicates: std::collections::BTreeMap<String, Vec<milpa_types::Predicate>>,
+    pub requires_predicates: std::collections::BTreeMap<String, Vec<Vec<milpa_types::Predicate>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -832,5 +851,166 @@ overrides {
         assert_eq!(terms.requires_names, vec!["bar"]);
         assert_eq!(terms.named_requires.len(), 1);
         assert_eq!(terms.named_requires[0].0, "bar");
+    }
+
+    // C1: same dep name in two when branches — accumulates, does not overwrite.
+
+    fn plat(name: &str) -> milpa_types::Predicate {
+        milpa_types::Predicate {
+            name: "platform".to_string(),
+            values: vec![name.to_string()],
+            negated: false,
+        }
+    }
+
+    #[test]
+    fn c1_same_named_dep_two_branches_accumulates_predicates() {
+        // Same dep name "foo" in two when-branches (linux vs macosx).
+        // requires_predicates["foo"] must have BOTH predicate-vecs, not just last.
+        let p_linux = plat("linux");
+        let p_mac = plat("macosx");
+        let es = EdgeSet {
+            requires: vec![
+                RequireEntry::Named(NamedRequire {
+                    name: "foo".to_string(),
+                    constraint_str: String::new(),
+                    predicates: vec![p_linux.clone()],
+                }),
+                RequireEntry::Named(NamedRequire {
+                    name: "foo".to_string(),
+                    constraint_str: String::new(),
+                    predicates: vec![p_mac.clone()],
+                }),
+            ],
+            src_dir: String::new(),
+            source: EdgeSource::NimbleFallback,
+        };
+        let terms = edgeset_to_terms(&es, &no_overrides(), url_ver());
+        // Dep appears exactly once in the solver (one requires_name)
+        assert_eq!(terms.requires_names.iter().filter(|n| n.as_str() == "foo").count(), 1);
+        // Both predicate-vecs must be recorded
+        let preds = terms.requires_predicates.get("foo").expect("foo must be in requires_predicates");
+        assert_eq!(preds.len(), 2, "both branches must accumulate");
+        assert!(preds.contains(&vec![p_linux]), "linux branch must be present");
+        assert!(preds.contains(&vec![p_mac]), "macosx branch must be present");
+    }
+
+    #[test]
+    fn c1_same_url_dep_two_branches_accumulates_predicates() {
+        // Same URL dep appearing in two when-branches.
+        let p_linux = plat("linux");
+        let p_mac = plat("macosx");
+        let url = "https://example.com/foo.git";
+        let es = EdgeSet {
+            requires: vec![
+                RequireEntry::Url(UrlRequire {
+                    url: url.to_string(),
+                    ref_: "main".to_string(),
+                    predicates: vec![p_linux.clone()],
+                }),
+                RequireEntry::Url(UrlRequire {
+                    url: url.to_string(),
+                    ref_: "main".to_string(),
+                    predicates: vec![p_mac.clone()],
+                }),
+            ],
+            src_dir: String::new(),
+            source: EdgeSource::NimbleFallback,
+        };
+        let terms = edgeset_to_terms(&es, &no_overrides(), url_ver());
+        // Dep appears exactly once in requires_names
+        assert_eq!(terms.requires_names.iter().filter(|n| n.as_str() == "foo").count(), 1);
+        // Both predicate-vecs recorded
+        let preds = terms.requires_predicates.get("foo").expect("foo must be in requires_predicates");
+        assert_eq!(preds.len(), 2, "both branches must accumulate");
+        assert!(preds.contains(&vec![p_linux]));
+        assert!(preds.contains(&vec![p_mac]));
+    }
+
+    #[test]
+    fn c1_single_occurrence_still_works() {
+        // Single occurrence with predicate → list with one entry.
+        let p = plat("linux");
+        let es = EdgeSet {
+            requires: vec![RequireEntry::Named(NamedRequire {
+                name: "extra".to_string(),
+                constraint_str: String::new(),
+                predicates: vec![p.clone()],
+            })],
+            src_dir: String::new(),
+            source: EdgeSource::NimbleFallback,
+        };
+        let terms = edgeset_to_terms(&es, &no_overrides(), url_ver());
+        let preds = terms.requires_predicates.get("extra").unwrap();
+        assert_eq!(preds.len(), 1);
+        assert_eq!(preds[0], vec![p]);
+    }
+
+    // -----------------------------------------------------------------------
+    // §7.2 normative: bare URL with no `#ref` defaults to HEAD
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn nimble_bare_url_no_ref_defaults_to_head() {
+        // A .nimble `requires "https://github.com/user/pkg.git"` with no `#ref`
+        // fragment MUST resolve ref_ == "HEAD" (spec/dep-decl.md §7.2 normative).
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = make_nimble_tree(
+            tmp.path(),
+            "pkg",
+            r#"requires "https://github.com/user/pkg.git""#,
+        );
+        let overrides = no_overrides();
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "pkg",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: false,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+        };
+        let version = url_ver();
+        let mut cache = BTreeMap::new();
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None);
+        assert_eq!(es.source, EdgeSource::NimbleFallback);
+        assert_eq!(es.requires.len(), 1);
+        match &es.requires[0] {
+            RequireEntry::Url(u) => {
+                assert_eq!(u.url, "https://github.com/user/pkg.git");
+                assert_eq!(u.ref_, "HEAD", "bare URL with no #ref must default to HEAD per §7.2");
+            }
+            other => panic!("expected UrlRequire, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nimble_url_with_explicit_ref_uses_that_ref() {
+        // A `#ref` fragment MUST be honored as-is, not overridden with HEAD.
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = make_nimble_tree(
+            tmp.path(),
+            "pkg",
+            r#"requires "https://github.com/user/pkg.git#v1.2.3""#,
+        );
+        let overrides = no_overrides();
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "pkg",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: false,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+        };
+        let version = url_ver();
+        let mut cache = BTreeMap::new();
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None);
+        match &es.requires[0] {
+            RequireEntry::Url(u) => {
+                assert_eq!(u.ref_, "v1.2.3", "explicit #ref must be preserved");
+            }
+            other => panic!("expected UrlRequire, got {other:?}"),
+        }
     }
 }

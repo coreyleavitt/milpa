@@ -1866,6 +1866,51 @@ class TestCondRequireRoundTrip:
         assert re_formatted == sample
 
 
+    def test_same_name_two_cond_requires_round_trips(self) -> None:
+        """LockedDep with two CondRequire of same name round-trips byte-identically.
+
+        C1 fix: same dep in ≥2 when-branches → two CondRequire entries with the
+        same name.  They must sort deterministically (by predicate string, not just
+        name) and parse back to exactly the same two entries.
+        """
+        p_linux = Predicate(name="platform", values=("linux",), negated=False)
+        p_mac = Predicate(name="platform", values=("macosx",), negated=False)
+        cr_linux = CondRequire(name="foo", predicates=(p_linux,))
+        cr_mac = CondRequire(name="foo", predicates=(p_mac,))
+        dep = _make_dep_with_cond(
+            requires=("foo",),
+            # Pass in reverse order to verify sort is applied
+            cond_requires=(cr_mac, cr_linux),
+        )
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        # Both entries must appear
+        assert text.count('cond-require "foo"') == 2
+        # Round-trip: parse(format) must re-produce both CondRequire entries.
+        # The emitter sorts by (name, predicate-string), so we compare against
+        # the sorted order (not the original insertion order in lf.deps[0]).
+        parsed = parse_lockfile(text)
+        assert len(parsed.deps[0].cond_requires) == 2
+        assert set(parsed.deps[0].cond_requires) == {cr_linux, cr_mac}
+
+    def test_same_name_two_cond_requires_deterministic_sort(self) -> None:
+        """Same-name CondRequire entries emit in predicate-string order (total sort key).
+
+        Verifies that regardless of insertion order, the emitter always produces
+        the same byte sequence when the logical content is identical.
+        """
+        p_linux = Predicate(name="platform", values=("linux",), negated=False)
+        p_mac = Predicate(name="platform", values=("macosx",), negated=False)
+        cr_linux = CondRequire(name="foo", predicates=(p_linux,))
+        cr_mac = CondRequire(name="foo", predicates=(p_mac,))
+        dep_order1 = _make_dep_with_cond(requires=("foo",), cond_requires=(cr_linux, cr_mac))
+        dep_order2 = _make_dep_with_cond(requires=("foo",), cond_requires=(cr_mac, cr_linux))
+        text1 = format_lockfile(Lockfile(deps=(dep_order1,)))
+        text2 = format_lockfile(Lockfile(deps=(dep_order2,)))
+        # Same logical content → byte-identical output regardless of cond_requires order
+        assert text1 == text2
+
+
 class TestEdgesetToTermsRequiresPredicates:
     """Cycle 5: edgeset_to_terms propagates predicates → requires_predicates dict."""
 
@@ -1884,7 +1929,11 @@ class TestEdgesetToTermsRequiresPredicates:
         assert requires_predicates == {}
 
     def test_predicate_bearing_entry_recorded(self) -> None:
-        """NamedRequire with predicates → requires_predicates carries them."""
+        """NamedRequire with predicates → requires_predicates carries them.
+
+        New shape (C1 fix): requires_predicates maps name → list[tuple[Predicate,...]]
+        so that same-name entries in ≥2 branches accumulate rather than overwrite.
+        """
         from milpa.dep_decl import EdgeSet, EdgeSource, NamedRequire
         from milpa.edge_sources import edgeset_to_terms
         from milpa.version import Version
@@ -1898,7 +1947,39 @@ class TestEdgesetToTermsRequiresPredicates:
         )
         _, _, requires_predicates = edgeset_to_terms(es, {}, V)
         assert "extra" in requires_predicates
-        assert requires_predicates["extra"] == (p,)
+        # New shape: list of tuples (one per occurrence)
+        assert requires_predicates["extra"] == [(p,)]
+
+    def test_predicate_same_name_two_branches_accumulates(self) -> None:
+        """Same dep name in two when branches → two predicate-tuples in the list.
+
+        C1 root-cause fix: requires_predicates[name] is now a list so that
+        same-name deps in different when-branches both record their predicates.
+        """
+        from milpa.dep_decl import EdgeSet, EdgeSource, NamedRequire
+        from milpa.edge_sources import edgeset_to_terms
+        from milpa.version import Version
+
+        p_linux = Predicate(name="platform", values=("linux",), negated=False)
+        p_mac = Predicate(name="platform", values=("macosx",), negated=False)
+        V = Version(major=99, minor=0, patch=0, pre=[], build="")
+        # Same dep name "foo" appearing in two branches
+        es = EdgeSet(
+            requires=[
+                NamedRequire(name="foo", constraint_str="", predicates=(p_linux,)),
+                NamedRequire(name="foo", constraint_str="", predicates=(p_mac,)),
+            ],
+            src_dir="",
+            source=EdgeSource.NIMBLE_FALLBACK,
+        )
+        dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, V)
+        # Dep appears once in the solver (one term, one requires_name)
+        assert requires_names.count("foo") == 1
+        # Both predicate sets are recorded
+        assert "foo" in requires_predicates
+        assert len(requires_predicates["foo"]) == 2
+        assert (p_linux,) in requires_predicates["foo"]
+        assert (p_mac,) in requires_predicates["foo"]
 
     def test_cond_requires_in_locked_dep_via_resolved_dep(self) -> None:
         """_locked_from_resolved copies cond_requires from ResolvedDep."""
@@ -1947,3 +2028,321 @@ class TestVerifyIgnoresCondRequires:
             ),)
         )
         verify_against_graph(lf, graph)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# C1-ssot — cond_require_sort_key is the single SSOT for sort order
+# ---------------------------------------------------------------------------
+
+
+class TestCondRequireSortKeySsot:
+    """C1-ssot: unified sort key helper; fixture-171 ordering preserved.
+
+    cond_require_sort_key delegates to _format_predicate_prop so the sort
+    string cannot drift from the emitted string even if a value contains
+    characters that need KDL escaping.
+    """
+
+    def _make_cr(self, name: str, pred_name: str, value: str) -> CondRequire:
+        p = Predicate(name=pred_name, values=(value,), negated=False)
+        return CondRequire(name=name, predicates=(p,))
+
+    def test_sort_key_delegates_to_format_predicate_prop(self) -> None:
+        """Sort key string matches what _format_predicate_prop would emit."""
+        from milpa.lockfile import cond_require_sort_key, _format_predicate_prop
+
+        cr = self._make_cr("bar", "platform", "linux")
+        name_key, pred_key = cond_require_sort_key(cr)
+        assert name_key == "bar"
+        # pred_key must equal the formatter output (including KDL quoting)
+        assert pred_key == _format_predicate_prop(cr.predicates[0])
+
+    def test_fixture_171_linux_before_macosx(self) -> None:
+        """fixture-171: same-name bar entries sort linux before macosx (C1 fix)."""
+        from milpa.lockfile import cond_require_sort_key
+
+        cr_linux = self._make_cr("bar", "platform", "linux")
+        cr_macosx = self._make_cr("bar", "platform", "macosx")
+        key_linux = cond_require_sort_key(cr_linux)
+        key_macosx = cond_require_sort_key(cr_macosx)
+        assert key_linux < key_macosx, (
+            f"linux sort key {key_linux!r} must precede macosx {key_macosx!r}"
+        )
+
+    def test_fixture_171_bytes_unchanged(self) -> None:
+        """format_lockfile produces the fixture-171 expected bytes unchanged."""
+        import pathlib
+
+        fixture = pathlib.Path(__file__).parent.parent.parent.parent / (
+            "conformance/spec-v1/fixture-171-nimble-when-same-name-multi-branch"
+            "/expected/milpa.lock"
+        )
+        expected = fixture.read_text()
+        lf = parse_lockfile(expected)
+        assert format_lockfile(lf) == expected
+
+
+# ---------------------------------------------------------------------------
+# M1 — predicate name whitelist on parse
+# ---------------------------------------------------------------------------
+
+
+class TestCondRequirePredicateWhitelist:
+    """M1: unknown predicate keys in cond-require are dropped on parse."""
+
+    def _lockfile_with_cr(self, cr_body: str) -> str:
+        return (
+            "// generated by milpa; reproducible build snapshot\n"
+            "version 1\n"
+            'strategy "maxver"\n'
+            "\n"
+            'dep "foo" {\n'
+            '    version "0.0.1"\n'
+            '    src_dir ""\n'
+            "    requires\n"
+            f"{cr_body}"
+            "    provenance {\n"
+            '        kind "local"\n'
+            '        path "../foo"\n'
+            "    }\n"
+            "}\n"
+        )
+
+    def test_unknown_key_dropped_inline(self) -> None:
+        """cond-require with unknown key → predicate dropped → cond_requires empty."""
+        text = self._lockfile_with_cr('    cond-require "bar" evilkey="value"\n')
+        lf = parse_lockfile(text)
+        # evilkey is outside the whitelist → predicate dropped → CondRequire has no
+        # predicates → entire CondRequire is skipped (returns None).
+        assert lf.deps[0].cond_requires == ()
+
+    def test_known_key_kept_inline(self) -> None:
+        """cond-require with known key → predicate accepted."""
+        text = self._lockfile_with_cr('    cond-require "bar" platform="linux"\n')
+        lf = parse_lockfile(text)
+        assert len(lf.deps[0].cond_requires) == 1
+        assert lf.deps[0].cond_requires[0].predicates[0].name == "platform"
+
+    def test_unknown_key_dropped_block_form(self) -> None:
+        """Block-form when with unknown key → predicate dropped → CondRequire skipped."""
+        text = self._lockfile_with_cr(
+            '    cond-require "bar" {\n'
+            '        when evilkey="value"\n'
+            "    }\n"
+        )
+        lf = parse_lockfile(text)
+        assert lf.deps[0].cond_requires == ()
+
+    def test_mixed_block_form_unknown_dropped_known_kept(self) -> None:
+        """Block form with one unknown + one known key: only known predicate accepted."""
+        text = self._lockfile_with_cr(
+            '    cond-require "bar" {\n'
+            '        when evilkey="bad"\n'
+            '        when platform="linux"\n'
+            "    }\n"
+        )
+        lf = parse_lockfile(text)
+        assert len(lf.deps[0].cond_requires) == 1
+        preds = lf.deps[0].cond_requires[0].predicates
+        assert len(preds) == 1
+        assert preds[0].name == "platform"
+
+    def test_all_five_known_keys_accepted(self) -> None:
+        """All five whitelist members are accepted: platform, arch, nim, milpa, flag."""
+        for key in ("platform", "arch", "nim", "milpa", "flag"):
+            text = self._lockfile_with_cr(f'    cond-require "bar" {key}="value"\n')
+            lf = parse_lockfile(text)
+            assert len(lf.deps[0].cond_requires) == 1, f"{key!r} should be accepted"
+            assert lf.deps[0].cond_requires[0].predicates[0].name == key
+
+
+# ---------------------------------------------------------------------------
+# M4 — single-value invariant enforced at emit time
+# ---------------------------------------------------------------------------
+
+
+class TestCondRequireSingleValueInvariant:
+    """M4: _format_predicate_prop raises ValueError (not bare assert) on bad arity.
+
+    A bare ``assert`` is stripped under ``python -O`` and gives a silent wrong
+    result.  The guard is a real ``ValueError`` so it fires in all execution
+    modes (M4 fix).
+    """
+
+    def test_single_value_ok(self) -> None:
+        """Normal single-value predicate does not raise."""
+        from milpa.lockfile import _format_predicate_prop
+        p = Predicate(name="platform", values=("linux",), negated=False)
+        result = _format_predicate_prop(p)
+        assert result == 'platform="linux"'
+
+    def test_multi_value_raises_value_error(self) -> None:
+        """Multi-value predicate raises ValueError (not AssertionError) — M4 fix."""
+        from milpa.lockfile import _format_predicate_prop
+        p = Predicate(name="platform", values=("linux", "macosx"), negated=False)
+        with pytest.raises(ValueError, match="single-value"):
+            _format_predicate_prop(p)
+
+    def test_zero_value_raises_value_error(self) -> None:
+        """Zero-value predicate raises ValueError (not AssertionError) — M4 fix."""
+        from milpa.lockfile import _format_predicate_prop
+        p = Predicate(name="platform", values=(), negated=False)
+        with pytest.raises(ValueError, match="single-value"):
+            _format_predicate_prop(p)
+
+
+# ---------------------------------------------------------------------------
+# M7 — malformed cond-require parse: no panic / crash
+# ---------------------------------------------------------------------------
+
+
+class TestCondRequireMalformedParse:
+    """M7: robust handling of malformed cond-require nodes on parse."""
+
+    def _lockfile_with_cr(self, cr_body: str) -> str:
+        return (
+            "// generated by milpa; reproducible build snapshot\n"
+            "version 1\n"
+            'strategy "maxver"\n'
+            "\n"
+            'dep "foo" {\n'
+            '    version "0.0.1"\n'
+            '    src_dir ""\n'
+            "    requires\n"
+            f"{cr_body}"
+            "    provenance {\n"
+            '        kind "local"\n'
+            '        path "../foo"\n'
+            "    }\n"
+            "}\n"
+        )
+
+    def test_no_name_arg_skipped(self) -> None:
+        """cond-require with no positional name arg → skipped, no crash."""
+        # KDL: `cond-require platform="linux"` has no positional arg before the prop.
+        text = self._lockfile_with_cr('    cond-require platform="linux"\n')
+        lf = parse_lockfile(text)
+        assert lf.deps[0].cond_requires == ()
+
+    def test_block_non_when_child_skipped(self) -> None:
+        """Block-form child node that is not 'when' is silently skipped."""
+        text = self._lockfile_with_cr(
+            '    cond-require "bar" {\n'
+            '        totally-unknown platform="linux"\n'
+            '        when platform="macosx"\n'
+            "    }\n"
+        )
+        lf = parse_lockfile(text)
+        assert len(lf.deps[0].cond_requires) == 1
+        assert lf.deps[0].cond_requires[0].predicates[0].values == ("macosx",)
+
+    def test_when_with_no_props_yields_no_predicate(self) -> None:
+        """Block-form 'when' child with no props → empty predicates → CondRequire skipped."""
+        text = self._lockfile_with_cr(
+            '    cond-require "bar" {\n'
+            "        when\n"
+            "    }\n"
+        )
+        lf = parse_lockfile(text)
+        assert lf.deps[0].cond_requires == ()
+
+
+# ---------------------------------------------------------------------------
+# H4 — Hypothesis PBT: cond-require round-trip (format → parse → format)
+# ---------------------------------------------------------------------------
+
+# Predicate-name alphabet: only known whitelisted keys.
+_pred_name_st = st.sampled_from(["platform", "arch", "nim", "milpa", "flag"])
+
+# Values: KDL-safe text (no control chars, no quotes/backslash that would
+# confuse the comparison, just alphanumeric + safe punctuation).
+_pred_value_st = st.text(
+    alphabet=st.characters(
+        whitelist_categories=("Lu", "Ll", "Nd"),
+        whitelist_characters="._-+",
+    ),
+    min_size=1,
+    max_size=16,
+)
+
+_predicate_st = st.builds(
+    Predicate,
+    name=_pred_name_st,
+    values=st.builds(tuple, st.lists(_pred_value_st, min_size=1, max_size=1)),
+    negated=st.booleans(),
+)
+
+_cond_require_st = st.builds(
+    CondRequire,
+    name=_dep_name_st,
+    predicates=st.builds(
+        tuple,
+        st.lists(_predicate_st, min_size=1, max_size=3),
+    ),
+)
+
+
+def _make_dep_with_cond_requires(
+    dep_name: str,
+    cond_requires: tuple[CondRequire, ...],
+) -> LockedDep:
+    return LockedDep(
+        name=dep_name,
+        identity=_VALID_IDENTITY,
+        version="1.0.0",
+        src_dir="src",
+        requires=tuple(sorted({cr.name for cr in cond_requires})),
+        provenances=(GitProvenanceRecord(url="https://example.com/foo.git"),),
+        cond_requires=cond_requires,
+    )
+
+
+@given(
+    dep_name=_dep_name_st,
+    cond_requires=st.lists(
+        _cond_require_st, min_size=0, max_size=4
+    ).map(tuple),
+)
+@settings(max_examples=100)
+def test_cond_require_format_parse_format_roundtrip(
+    dep_name: str,
+    cond_requires: tuple[CondRequire, ...],
+) -> None:
+    """format(parse(format(lf))) == format(lf) — cond-require round-trip.
+
+    H4: the format → parse → format path must be byte-identical for any
+    CondRequire-bearing LockedDep.  Single-value predicates only (v0 invariant).
+    """
+    dep = _make_dep_with_cond_requires(dep_name, cond_requires)
+    lf = Lockfile(deps=(dep,))
+    text1 = format_lockfile(lf)
+    lf2 = parse_lockfile(text1)
+    text2 = format_lockfile(lf2)
+    assert text1 == text2, (
+        f"Round-trip not byte-identical.\n"
+        f"text1:\n{text1!r}\n\ntext2:\n{text2!r}"
+    )
+
+
+@given(
+    deps=st.lists(
+        st.builds(
+            lambda name, crs: _make_dep_with_cond_requires(name, crs),
+            name=_dep_name_st,
+            crs=st.lists(_cond_require_st, min_size=1, max_size=3).map(tuple),
+        ),
+        min_size=1,
+        max_size=3,
+        unique_by=lambda d: d.name,
+    )
+)
+@settings(max_examples=60)
+def test_cond_require_format_parse_format_multiple_deps(
+    deps: list[LockedDep],
+) -> None:
+    """Multiple deps with cond_requires: format → parse → format is byte-identical."""
+    lf = Lockfile(deps=tuple(sorted(deps, key=lambda d: d.name)))
+    text1 = format_lockfile(lf)
+    lf2 = parse_lockfile(text1)
+    text2 = format_lockfile(lf2)
+    assert text1 == text2

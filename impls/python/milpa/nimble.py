@@ -163,6 +163,7 @@ def parse_nimble(
             line_preds[ln] = branch.predicates  # None = unrecognized
 
     # --- Step 2: scan for srcDir + collect (spec, line_index) pairs ---
+    # srcDir: last assignment wins (spec §7.3 / dep-decl.md; NimScript semantics).
     # We need to track which source line each spec came from so we can look up
     # predicates.  For indented-block requires and the plain form the source
     # line is the ``requires`` keyword line.  For the colon-form tail
@@ -174,11 +175,11 @@ def parse_nimble(
     while i < len(lines):
         line = _strip_comment(lines[i])
 
-        # §5.2: ``srcDir`` — first match wins; single-line.
+        # §5.2: ``srcDir`` — last assignment wins (NimScript assignment semantics;
+        # spec §7.3 / dep-decl.md).  Rust implements last-wins; Python must match.
         srcdir_m = _SRCDIR_RE.match(line)
         if srcdir_m:
-            if src_dir is None:  # first occurrence wins
-                src_dir = srcdir_m.group(1)
+            src_dir = srcdir_m.group(1)  # overwrite on every match (last wins)
             i += 1
             continue
 
@@ -221,11 +222,12 @@ def parse_nimble(
 
     # --- Step 3: build typed deps with aligned predicates ---
     # §5.4: drop ``"nim"`` requirements silently.
-    # Dedup key depends on dep kind (first occurrence wins).
+    # §7.1 (spec/dep-decl.md): NO deduplication — when the same dep name
+    # appears in ≥2 ``when`` branches, ALL occurrences are preserved in
+    # authored file order so that each carries its own predicate annotation.
+    # Over-inclusion is safe; under-inclusion silently drops a dep or predicate.
     deps: list[UrlDep | NamedDep] = []
     dep_predicates: list[tuple[Predicate, ...]] = []
-    seen_named: set[str] = set()
-    seen_url: set[tuple[str, str, str]] = set()
 
     for spec, source_line in raw_specs_with_lines:
         dep = _build_dep(spec)
@@ -234,15 +236,6 @@ def parse_nimble(
         if isinstance(dep, NamedDep) and dep.name == "nim":
             # §5.4: Nim compiler is v2 toolchain territory; drop.
             continue
-        if isinstance(dep, NamedDep):
-            if dep.name in seen_named:
-                continue
-            seen_named.add(dep.name)
-        else:
-            url_key = (dep.name, dep.git, dep.ref)
-            if url_key in seen_url:
-                continue
-            seen_url.add(url_key)
 
         # Predicate lookup: recognized branch → its predicates; unrecognized /
         # unconditional → empty tuple (over-include with no annotation).
@@ -306,7 +299,7 @@ def _build_dep(spec: str) -> UrlDep | NamedDep | None:
     if any(spec.startswith(scheme) for scheme in _URL_SCHEMES):
         url, _, ref = spec.partition("#")
         return UrlDep(
-            name=_url_to_name(url),
+            name=url_to_name(url),
             git=url,
             ref=ref if ref else "HEAD",
         )
@@ -379,12 +372,20 @@ def _extract_colon_form_requires(line: str, line_idx: int) -> list[tuple[str, in
     return [(spec, line_idx) for spec in specs]
 
 
-def _url_to_name(url: str) -> str:
+def url_to_name(url: str) -> str:
     """Derive a package name from a git URL.
 
     Strips the scheme, takes the last path component, and removes
     ``.git`` suffix if present.  This mirrors the convention used by
     nimble itself.  The result is the dep's logical name in ``NimbleManifest``.
+
+    This is the **single source of truth** for URL→name derivation (M3 SSOT).
+    ``edge_sources._name_from_url`` wraps this function to add the None-drop
+    behavior needed at the EdgeSet level.
+
+    Returns a non-empty string on all inputs (worst-case: the full URL string
+    is returned if no path component can be extracted — this preserves UrlDep
+    round-trips even for degenerate inputs).
     """
     # e.g. "https://github.com/user/pkg.git" → "pkg"
     # e.g. "ssh://github.com/user/repo" → "repo"
@@ -392,6 +393,7 @@ def _url_to_name(url: str) -> str:
     if last.endswith(".git"):
         last = last[:-4]
     return last if last else url
+
 
 
 # ---------------------------------------------------------------------------

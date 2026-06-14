@@ -139,7 +139,9 @@ pub fn manifest_from_nimble(nm: &NimbleManifest, name: &str) -> Manifest {
                 deps.push(Dep::Url(UrlDep {
                     name: name_from_url(url),
                     git: url.clone(),
-                    git_ref: ref_spec.clone().unwrap_or_else(|| "main".to_string()),
+                    // §7.2 normative: bare URL with no `#ref` defaults to HEAD
+                    // (the remote's default branch), matching nimble's behavior.
+                    git_ref: ref_spec.clone().unwrap_or_else(|| "HEAD".to_string()),
                     mirrors: Vec::new(),
                     predicates: Vec::new(),
                     flag_requests: Vec::new(),

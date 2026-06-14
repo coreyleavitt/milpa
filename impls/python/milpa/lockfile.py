@@ -598,6 +598,11 @@ def _parse_cond_require(node: KdlNode) -> "CondRequire | None":
                 continue  # skip unknown child nodes (forward compat)
             props = node_props(child)
             for key in props:
+                # M1: whitelist-validate the predicate name from untrusted input.
+                # Keys outside the known vocabulary are silently dropped
+                # (forward-compat lenient — same as "skip unknown nodes").
+                if key not in _KNOWN_PREDICATE_NAMES:
+                    continue
                 val = node_prop_str(child, key)
                 if val is None:
                     continue
@@ -609,6 +614,9 @@ def _parse_cond_require(node: KdlNode) -> "CondRequire | None":
         # Inline form: each prop is one predicate.
         props = node_props(node)
         for key in props:
+            # M1: whitelist-validate the predicate name from untrusted input.
+            if key not in _KNOWN_PREDICATE_NAMES:
+                continue
             val = node_prop_str(node, key)
             if val is None:
                 continue
@@ -750,10 +758,22 @@ def _locked_from_resolved(d: ResolvedDep) -> LockedDep:
         self_mirrors=d.self_mirrors,
         # S6: carry the dep_decl hash from the resolver through to the lockfile pin.
         dep_decl=d.dep_decl,
-        # S4: carry cond_requires (already sorted by name on ResolvedDep).
+        # S4: carry cond_requires (sorted by (name, canonical-predicate-string)).
         cond_requires=d.cond_requires,
     )
 
+
+# ---------------------------------------------------------------------------
+# Predicate-name whitelist (M1: validate untrusted lockfile keys)
+#
+# Only these keys are accepted when PARSING a cond-require node from a
+# (potentially attacker-controlled) lockfile.  Keys outside the set are
+# silently dropped (forward-compat lenient, same spirit as "skip unknown
+# child nodes").  The whitelist must stay in sync with spec/lockfile-schema.md
+# §3.5 and manifest-grammar.md §6.
+_KNOWN_PREDICATE_NAMES: frozenset[str] = frozenset(
+    {"platform", "arch", "nim", "milpa", "flag"}
+)
 
 # ---------------------------------------------------------------------------
 # _kdl_str — SSOT for string escaping (lockfile-schema.md §2.4)
@@ -798,13 +818,39 @@ def _format_predicate_prop(pred: Predicate) -> str:
     """Emit one predicate as ``key="value"`` or ``key=(not)"value"`` (RFC §3.4.1).
 
     The prop key is ``pred.name``; value is ``pred.values[0]`` (every predicate
-    produced by this pipeline is single-value).  Negation uses the KDL type-
-    annotation form ``(not)"value"`` — verbatim from ``manifest-grammar.md §6``.
+    produced by this pipeline is single-value — v0 invariant per spec §3.5 /
+    lockfile-schema §3.5). Multi-value (OR) predicates are not supported in v0;
+    the guard below enforces the invariant so violations surface as an explicit
+    error rather than silently truncating values[1:] (and are not stripped under
+    ``python -O`` as a bare ``assert`` would be).
+    Negation uses the KDL type-annotation form ``(not)"value"`` — verbatim from
+    ``manifest-grammar.md §6``.
     """
+    if len(pred.values) != 1:
+        raise ValueError(
+            f"_format_predicate_prop: predicate {pred.name!r} has {len(pred.values)} values "
+            f"but only single-value predicates are supported in v0 (spec §3.5). "
+            f"Multi-value (OR) emission is not implemented."
+        )
     val = _kdl_str(pred.values[0])
     if pred.negated:
         return f'{pred.name}=(not){val}'
     return f'{pred.name}={val}'
+
+
+def cond_require_sort_key(cr: "CondRequire") -> "tuple[str, str]":
+    """Total sort key for a ``CondRequire``: ``(name, canonical-predicate-string)``.
+
+    Using name alone is NOT a total order when same-name entries exist (a dep in
+    ≥2 when-branches).  The predicate string makes the key total and deterministic
+    across impls regardless of source order (C1 fix, §2.4).
+
+    The per-predicate string is built by calling ``_format_predicate_prop`` so
+    that KDL string escaping is shared with the emitter — sort order cannot drift
+    from emission order even if a predicate value ever contains ``"`` or ``\\``.
+    """
+    pred_strs = ",".join(_format_predicate_prop(p) for p in cr.predicates)
+    return (cr.name, pred_strs)
 
 
 def _format_cond_require(cr: "CondRequire") -> list[str]:
@@ -865,11 +911,13 @@ def format_lockfile(lockfile: Lockfile) -> str:
             lines.append(f"    requires {req_args}")
         else:
             lines.append("    requires")
-        # cond-require — S4: additive annotation nodes, sorted by name.
+        # cond-require — S4: additive annotation nodes.
         # Emitted immediately after requires. Omitted when empty (byte-identical
         # for deps with no conditional requires). Sort at emission for
         # determinism (lockfile-schema.md §2.4 / RFC §3.4.1).
-        for cr in sorted(dep.cond_requires, key=lambda c: c.name):
+        # Delegates to cond_require_sort_key (module-level SSOT) so escaping
+        # is shared with _format_predicate_prop and cannot drift (C1 fix).
+        for cr in sorted(dep.cond_requires, key=cond_require_sort_key):
             lines.extend(_format_cond_require(cr))
         # active_flags — omitted when empty
         if dep.active_flags:
