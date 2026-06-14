@@ -98,6 +98,18 @@ _URL_SCHEMES: tuple[str, ...] = (
     "file://",
 )
 
+# Maximum nesting depth for recursive ``when`` processing (M2 depth-DoS guard).
+#
+# IMPLEMENTATION NOTE — this is an impl-quality bound shared by the Python and
+# Rust impls for DoS-bounding, NOT a normative spec cap on how deep a user is
+# allowed to nest ``when`` blocks.  At depth ≥ _MAX_WHEN_DEPTH every branch is
+# already forced to predicates=None (over-include) regardless, so further
+# structure recognition carries zero predicate information.  Beyond this depth
+# we switch to a linear scan (_linear_scan_requires) that collects all
+# ``requires`` without structure recognition.  Value of 8 is conservative:
+# real .nimble files rarely exceed 2-3 levels of nesting.
+_MAX_WHEN_DEPTH: int = 8
+
 # Spec §5.3: any line matching this pattern triggers the ``when`` warning.
 _WHEN_RE: re.Pattern[str] = re.compile(r"^\s*when\b")
 
@@ -665,6 +677,59 @@ def parse_when_branches(lines: list[str]) -> list[WhenBranch]:
     return result
 
 
+def _skip_continuation(lines: list[str], i: int, end: int, first_tail: str) -> int:
+    """Advance ``i`` past a multi-line ``requires`` continuation, return new index.
+
+    A continuation is a sequence of lines where the current accumulated tail
+    ends with a comma — identical logic used by both ``_linear_scan_requires``
+    and ``_collect_direct_requires``.
+
+    ``first_tail`` is the already-stripped text of the current (starting) line.
+    Returns the index of the LAST line consumed (the caller should then
+    ``i += 1`` to move to the next statement).
+
+    Only the STARTING line of the continuation is recorded as the require's
+    source line; callers must append ``i`` to ``out``/``req_indices`` BEFORE
+    calling this helper.
+    """
+    tail = first_tail.rstrip()
+    while tail.endswith(","):
+        i += 1
+        if i >= end:
+            break
+        tail = _strip_comment(lines[i]).strip()
+    return i
+
+
+def _linear_scan_requires(
+    lines: list[str],
+    start: int,
+    end: int,
+    result: list[WhenBranch],
+) -> None:
+    """Collect ALL ``requires`` in lines[start:end] with ``predicates=None``.
+
+    This is the depth-guard fallback: once nesting depth exceeds ``_MAX_WHEN_DEPTH``
+    there is zero predicate information to carry, so we abandon structure recognition
+    entirely and do a single linear pass.  This keeps M2 O(n) in the pathological case.
+
+    All discovered requires are reported as a single ``WhenBranch(predicates=None)``.
+    The ``require_lines`` list records the starting line of each ``requires`` statement
+    in the same manner as ``_collect_direct_requires``.
+    """
+    req_indices: list[int] = []
+    i = start
+    while i < end:
+        stripped = _strip_comment(lines[i])
+        if stripped and _BRANCH_REQUIRES_RE.match(stripped):
+            req_indices.append(i)
+            # Skip multi-line continuation (shared helper; only start line recorded).
+            i = _skip_continuation(lines, i, end, stripped)
+        i += 1
+    if req_indices:
+        result.append(WhenBranch(predicates=None, require_lines=tuple(req_indices)))
+
+
 def _scan_region(
     lines: list[str],
     start: int,
@@ -677,7 +742,18 @@ def _scan_region(
 
     ``depth`` is the nesting level (0 = top-level scan).  Any chain found
     at depth ≥ 1 has all its branches forced to ``predicates=None``.
+
+    M2 depth guard: when ``depth >= _MAX_WHEN_DEPTH``, every nested branch
+    already carries ``predicates=None`` and further structure recognition only
+    adds O(n²) overhead per level.  Instead, do a single linear scan for
+    ``requires`` statements (over-include with no annotation) and return.
+    This bounds pathological worst-case from O(n³) to O(n).
     """
+    # M2: depth guard — bail to linear scan for deep nesting.
+    if depth >= _MAX_WHEN_DEPTH:
+        _linear_scan_requires(lines, start, end, result)
+        return
+
     i = start
     while i < end:
         raw = lines[i]
@@ -923,15 +999,9 @@ def _collect_direct_requires(
 
         # Check for requires.
         if _BRANCH_REQUIRES_RE.match(stripped):
-            req_start = i
-            out.append(req_start)
-            # Skip multi-line continuation.
-            tail = stripped.rstrip()
-            while tail.endswith(","):
-                i += 1
-                if i >= end:
-                    break
-                tail = _strip_comment(lines[i]).strip()
+            out.append(i)
+            # Skip multi-line continuation (shared helper; only start line recorded).
+            i = _skip_continuation(lines, i, end, stripped)
             i += 1
             continue
 

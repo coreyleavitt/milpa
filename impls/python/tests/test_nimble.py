@@ -29,6 +29,8 @@ from milpa.errors import MilpaError
 from milpa.manifest import NamedDep, UrlDep
 from milpa.nimble import (
     NimbleManifest,
+    _collect_direct_requires,
+    _skip_continuation,
     parse_nimble,
 )
 from milpa.predicate import Predicate
@@ -548,6 +550,145 @@ requires "https://github.com/user/mylib.git#v1.0"
         url_deps = [d for d in m.deps if isinstance(d, UrlDep)]
         assert len(url_deps) == 1
         assert url_deps[0].ref == "v1.0"
+
+
+# ---------------------------------------------------------------------------
+# M2: depth-DoS regression — deeply-nested when blocks must complete fast
+# ---------------------------------------------------------------------------
+
+
+def test_deep_when_nesting_completes_fast() -> None:
+    """Depth-400 nested when blocks complete in well under 1 second.
+
+    Without the depth guard, depth-300 ≈ 2.2 s, depth-500 ≈ 18.6 s (O(n³)).
+    With the guard (bail-out at MAX_DEPTH, linear scan below), depth-400 < 0.1 s.
+
+    The inner ``requires "inner"`` must still appear in the output (over-include
+    rule: all requires are recorded, predicates are None for deep nesting).
+    """
+    import time
+
+    DEPTH = 400
+    # Build: when defined(linux):\n  when defined(linux):\n    ... requires "inner"
+    lines = []
+    for d in range(DEPTH):
+        lines.append("  " * d + "when defined(linux):")
+    lines.append("  " * DEPTH + 'requires "inner"')
+    text = "\n".join(lines)
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        t0 = time.monotonic()
+        m = parse_nimble(text)
+        elapsed = time.monotonic() - t0
+
+    assert elapsed < 1.0, f"depth-{DEPTH} took {elapsed:.2f}s — O(n³) regression"
+    # Over-include: "inner" must still be in the dep set
+    assert "inner" in _names(m), "inner requires must survive the depth guard"
+    # Deep nesting → predicates must be None/empty (unrecognized / over-include)
+    inner_idx = _names(m).index("inner")
+    assert m.dep_predicates[inner_idx] == (), \
+        "deeply-nested dep must have empty predicates (over-include annotation)"
+
+
+# ---------------------------------------------------------------------------
+# _skip_continuation — unit tests for the shared continuation helper
+# ---------------------------------------------------------------------------
+
+
+class TestSkipContinuation:
+    """_skip_continuation is the single source of truth for multi-line requires.
+
+    Both ``_linear_scan_requires`` (depth-guard fallback) and
+    ``_collect_direct_requires`` (per-branch collector) delegate to it.
+    These tests verify the shared helper directly AND via both call sites
+    so that any future drift is caught immediately.
+    """
+
+    def test_no_continuation_returns_same_index(self) -> None:
+        """A line with no trailing comma: helper returns the same index."""
+        lines = ['requires "a"']
+        assert _skip_continuation(lines, 0, len(lines), lines[0]) == 0
+
+    def test_single_continuation_advances_index(self) -> None:
+        """One trailing comma: helper advances to index 1."""
+        lines = ['requires "a",', '  "b"']
+        result = _skip_continuation(lines, 0, len(lines), lines[0])
+        assert result == 1
+
+    def test_two_continuations_advance_to_index_2(self) -> None:
+        """Two trailing commas: helper advances to index 2."""
+        lines = ['requires "a",', '  "b",', '  "c"']
+        result = _skip_continuation(lines, 0, len(lines), lines[0])
+        assert result == 2
+
+    def test_continuation_clamps_at_end(self) -> None:
+        """Trailing comma on the last line: helper clamps at end, does not raise."""
+        lines = ['requires "a",']
+        result = _skip_continuation(lines, 0, len(lines), lines[0])
+        assert result >= len(lines) - 1  # did not go negative or raise
+
+    def test_via_linear_scan_when_body_multi_line(self) -> None:
+        """_skip_continuation path via _linear_scan_requires (depth-guard fallback).
+
+        A deeply-nested ``requires "a", "b"`` continuation inside a ``when``
+        body must collect "a" as the start-line AND skip the continuation so
+        that "b" (on the continuation line) does NOT create a spurious
+        second require entry.
+
+        The result set must be the same as a shallow (non-deep) block: both
+        "a" and "b" are in the dep set, appearing exactly once each (they are
+        on the same logical requires statement; only the start line is recorded
+        per ``_collect_direct_requires`` / ``_linear_scan_requires`` contract).
+        """
+        DEPTH = 400  # forces depth guard → _linear_scan_requires path
+        lines = []
+        for d in range(DEPTH):
+            lines.append("  " * d + "when defined(linux):")
+        # Multi-line continuation at the innermost level
+        lines.append("  " * DEPTH + 'requires "a",')
+        lines.append("  " * DEPTH + '  "b"')
+        text = "\n".join(lines)
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            m = parse_nimble(text)
+
+        names = _names(m)
+        assert "a" in names, "continuation start dep must be present"
+        assert "b" in names, "continuation dep must be present"
+        # "b" is on the continuation line — parse_nimble collects it via
+        # the outer _QUOTED_RE scan in parse_nimble itself (the start line
+        # recorded by _linear_scan_requires spans both "a" and "b").
+        # Verify no duplicate entries for a/b via the branch tracker.
+        assert names.count("a") == 1
+        assert names.count("b") == 1
+
+    def test_via_collect_direct_requires_when_body_multi_line(self) -> None:
+        """_skip_continuation path via _collect_direct_requires (shallow when body).
+
+        A shallow ``when defined(linux):`` block containing a multi-line
+        ``requires "a", \\n "b"`` continuation must yield the same result
+        as if written on a single line.  The start line is recorded once;
+        the continuation line is skipped by _skip_continuation so it is not
+        re-examined as a new requires statement.
+        """
+        text = (
+            'when defined(linux):\n'
+            '  requires "a",\n'
+            '    "b"\n'
+            'requires "c"\n'
+        )
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            m = parse_nimble(text)
+
+        names = _names(m)
+        assert "a" in names
+        assert "b" in names
+        assert "c" in names
+        assert names.count("a") == 1
+        assert names.count("b") == 1
 
 
 # ---------------------------------------------------------------------------

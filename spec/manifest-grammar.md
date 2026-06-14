@@ -598,6 +598,21 @@ execute them. Instead it applies the heuristic defined normatively in
 > recognized conditions; the `requires` line is byte-identical to today for any
 > given dep's transitive set.
 
+> IMPLEMENTATION NOTE (non-normative): Conforming implementations MAY bound the
+> recursive traversal depth of nested `when` blocks for DoS resistance.  The
+> reference value is **8** levels.  Beyond this bound the implementation MUST
+> treat all branches as UNRECOGNIZED — that is, include every `requires` found in
+> the sub-tree unconditionally with no predicate annotation.  This is the same
+> over-include policy already applied to unrecognized conditions (§7.5.2), so the
+> observable dep set is UNCHANGED: the bound does not alter which `requires`
+> entries are resolved, only whether they carry predicate metadata.  Real
+> `.nimble` files rarely exceed 2–3 levels of nesting; the bound is conservative
+> enough to never fire in practice.  An attacker-crafted `.nimble` with thousands
+> of nested `when` levels would otherwise cause unbounded stack growth (stack
+> overflow) in a naive recursive implementation.  This note applies equally to
+> the `spec/dep-decl.md §7.5` normative algorithm: implementations of that
+> algorithm SHOULD apply the same bound.
+
 ### 5.4  `nim` requirement filtering
 
 > NORMATIVE: When converting a `.nimble` file to a milpa `Manifest`, any

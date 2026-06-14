@@ -15,6 +15,18 @@
 /// URL requirement schemes recognised by `_parse_spec` (nimble_parse.py).
 const URL_SCHEMES: [&str; 5] = ["http://", "https://", "ssh://", "git://", "file://"];
 
+/// Maximum `when`-block nesting depth before switching to iterative scan
+/// (M2 depth-DoS guard — mirrors Python `_MAX_WHEN_DEPTH = 8`).
+///
+/// This is a shared cross-impl IMPLEMENTATION limit for DoS-bounding, NOT a
+/// spec-normative nesting cap.  At `depth >= MAX_WHEN_DEPTH` every branch is
+/// already forced to `predicates: None` (over-include), so further recursive
+/// structure recognition carries zero predicate information and only multiplies
+/// traversal cost.  Beyond this depth `linear_scan_requires` does a single
+/// flat O(n) pass collecting every `requires` with `predicates: None`.
+/// Value 8 is conservative: real `.nimble` files rarely exceed 2-3 levels.
+const MAX_WHEN_DEPTH: usize = 8;
+
 /// One `requires` entry parsed from a `.nimble` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NimbleRequirement {
@@ -1115,6 +1127,42 @@ struct BranchRaw {
     body_end: usize,
 }
 
+/// Collect ALL `requires` lines in `lines[start..end]` with `predicates: None`.
+///
+/// This is the M2 depth-guard fallback (mirrors Python `_linear_scan_requires`).
+/// Once nesting depth exceeds [`MAX_WHEN_DEPTH`] there is zero predicate
+/// information to carry, so we abandon structure recognition entirely and do a
+/// single linear O(n) pass.  All discovered requires are appended as one
+/// `WhenBranch { predicates: None, require_lines }` (matching Python behaviour).
+/// Multi-line continuation: only the starting line index is recorded (same rule
+/// as the normal path).
+fn linear_scan_requires(lines: &[&str], start: usize, end: usize, result: &mut Vec<WhenBranch>) {
+    let mut req_indices: Vec<usize> = Vec::new();
+    let mut i = start;
+    while i < end {
+        let s = strip_comment(lines[i]);
+        if is_requires_line(&s) {
+            req_indices.push(i);
+            // Skip multi-line continuation (trailing comma).
+            let mut tail = s.trim_end().to_string();
+            while tail.ends_with(',') {
+                i += 1;
+                if i >= end {
+                    break;
+                }
+                tail = strip_comment(lines[i]).trim().to_string();
+            }
+        }
+        i += 1;
+    }
+    if !req_indices.is_empty() {
+        result.push(WhenBranch {
+            predicates: None,
+            require_lines: req_indices,
+        });
+    }
+}
+
 fn scan_region(
     lines: &[&str],
     start: usize,
@@ -1122,6 +1170,15 @@ fn scan_region(
     depth: usize,
     result: &mut Vec<WhenBranch>,
 ) {
+    // M2: depth guard — bail to iterative scan for deep nesting.
+    // At depth >= MAX_WHEN_DEPTH every branch is already predicates=None
+    // (no annotation), so further recursive traversal only wastes stack and
+    // CPU.  Mirror Python _scan_region's identical guard.
+    if depth >= MAX_WHEN_DEPTH {
+        linear_scan_requires(lines, start, end, result);
+        return;
+    }
+
     let mut i = start;
     while i < end {
         let s = strip_comment(lines[i]);
@@ -1639,5 +1696,55 @@ mod when_branches_tests {
         let inner = &result[1];
         assert_eq!(outer.predicates, Some(vec![plat("linux")]));
         assert!(inner.predicates.is_none());
+    }
+
+    // ----- M2: depth-DoS guard -----
+
+    /// Build a `.nimble`-like text with `depth` levels of nested `when` blocks,
+    /// each indented by 2 spaces per level, and an innermost `requires "inner"`.
+    /// Returns the text as a `String`.
+    fn make_deep_when(depth: usize) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        for d in 0..depth {
+            let indent = "  ".repeat(d);
+            lines.push(format!("{}when defined(linux):", indent));
+        }
+        let inner_indent = "  ".repeat(depth);
+        lines.push(format!("{}requires \"inner\"", inner_indent));
+        lines.join("\n")
+    }
+
+    #[test]
+    fn deep_when_nesting_no_stack_overflow_and_inner_requires_present() {
+        // Mirrors Python test_deep_when_nesting_completes_fast.
+        // At depth 400 the recursive scan_region hits MAX_WHEN_DEPTH (8) quickly
+        // and delegates to linear_scan_requires — no stack overflow, and the
+        // innermost `requires "inner"` must still be captured (over-include with
+        // predicates=None).
+        let text = make_deep_when(400);
+        let input_lines: Vec<&str> = text.lines().collect();
+        let result = parse_when_branches(&input_lines);
+
+        // The innermost requires must appear somewhere in the result set.
+        let found_inner = result.iter().any(|b| {
+            // All branches at depth >= 1 have predicates=None.
+            b.predicates.is_none() && !b.require_lines.is_empty()
+        });
+        assert!(
+            found_inner,
+            "innermost requires must be captured (over-include) even at depth 400; got: {:?}",
+            result
+        );
+
+        // Additionally verify that parse_nimble produces the NimbleRequirement.
+        let nm = super::parse_nimble(&text);
+        assert!(
+            nm.requires.iter().any(|r| match r {
+                super::NimbleRequirement::Named { name, predicates, .. } =>
+                    name == "inner" && predicates.is_empty(),
+                _ => false,
+            }),
+            "parse_nimble must find 'inner' with empty predicates at depth 400"
+        );
     }
 }
