@@ -1,8 +1,10 @@
 # pluggable-fetchers (Tier 3, F1–F3) — handoff
 
-- **Stage:** 4 (/code-review) — **COMPLETE: FLOOR REACHED (0 Crit/High/Med open) after 4 fix rounds + 3 re-review rounds.**   •   Mandate was: fix through Medium, leave Lows.
-- **Resume:** stage 4 done. Remaining = Lows (left per mandate) + deferred issues #146/#148/#149. **Still outstanding: commit the uncommitted tree (content-addressed-identity Phase B–D + ALL pluggable-fetchers stage 3+4 work + spec edits) — ONLY when Corey asks.** Recommend committing Phase B–D separately for a clean boundary.
-- **Round 3 (R19+R21+R5-1+doc) → re-review clean (0 Crit/High/Med) EXCEPT R5-1 self-inflicted digest slug divergence → Round 4 reverted (Rust digest now format-validated like Python). #147 closed-invalid.**
+- **Stage:** 4 (/code-review) — ✅ **COMPLETE + SHIPPED.** Floor reached (0 Crit/High/Med) after 4 fix rounds + 3 re-review rounds; Lows then fixed (R12/R15/R7-1/FetchOne-Protocol/R17 both impls); R11/R13/R14 + compressed_cap left with rationale (no-new-slug / readability-vs-divergence-risk). **RFC DONE — `/rfc-flow` for both Tier-3 RFCs complete.**
+- **Resume:** nothing — both Tier-3 RFCs (content-addressed identity B–D + pluggable fetchers F1–F3) are implemented, reviewed, and **committed + pushed to main** (2026-06-15, `f366e26..cddc0cb`, 4 concern-grouped commits: spec / feat / test(conformance) / docs; author corey@leavitt.dev). Working tree clean; main in sync with origin.
+- **Final gate:** Python fails only fixture-144; Rust fails only fixture-099 + fixture-144 (accepted baseline); ZERO cross-impl divergence.
+- **Deferred (open) follow-ups:** #146 (bz2 + mixed-case-sha corpus fixtures — blocked: no pure-Rust bz2 encoder + text-only corpus), #148 (corrupt-archive cross-impl divergence — Rust strict vs Python tarfile lenient; needs deliberate slice + blob fixture), #149 (download-cap streaming DoS — bounded-read fix). #147 closed-invalid (no Member variant on Rust transport Provenance enum).
+- **Round 3 (R19+R21+R5-1+doc) → re-review clean EXCEPT R5-1 self-inflicted digest slug divergence → Round 4 reverted (Rust digest now format-validated like Python).**
 - **Round-1 fixes (all at baseline, both suites green):** R1+R1b+R7 (G1 Python `_fetch_any` SSOT+None-guard+_clear_dest symlink), R2+R6 (G2 Rust `decompress_capped`+`DECOMP_CAP_OVERHEAD`+USTAR checksum), R10 (G5 spec §4.1 SSOT, Opus-corrected member two-axis), R4+R5 (G3 download-cap + git `--end-of-options`), R9+R16 (G4 stale-sweep regression + bz2/xz bomb tests). R3/R8→#146, R18→#147.
 - **R3/R8 DEFERRED → issue #146** (bz2 + mixed-case-sha corpus fixtures infeasible under option-B text-only corpus + no pure-Rust bz2 encoder; mitigated by mirrored per-impl tests; R16 keeps them mirrored).
 
