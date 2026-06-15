@@ -36,7 +36,8 @@ A conformant implementation of this spec MUST:
    rejecting unknown algorithms and wrong digest lengths.
 7. Lay out the CAS as `<root>/<algorithm>/<hex-digest>/` (§3).
 8. Admit trees atomically via `rename(2)`; treat duplicate admission as a
-   no-op (§3.3).
+   successful no-op returning the existing entry — the store is never
+   overwritten (C-admit-idem, §3.3).
 9. Create `_deps/<name>` as a **relative** symlink into the CAS entry (§3.5).
 10. NOT silently evict a CAS entry that a lockfile still references (§3.7).
 11. Use a per-fetch unique scratch subdirectory under `<root>/_scratch/` and
@@ -80,12 +81,10 @@ The hash is:
 >   without a leading `/` or `./`. Example: `src/foo.nim`.
 > - `0x00` is a single null byte used as a field separator.
 > - `<mode-marker>` is exactly one byte:
->   - `0x00` — regular file, non-executable (owner-execute bit not set)
->   - `0x01` — regular file, executable (owner-execute bit set,
->     `stat.S_IXUSR`)
+>   - `0x00` — regular file
 >   - `0x80` — symbolic link
 > - `<content-bytes>` is:
->   - For a regular file (`0x00` or `0x01`): the raw file contents, byte for
+>   - For a regular file (`0x00`): the raw file contents, byte for
 >     byte. Line endings are NOT normalized; CRLF and LF are distinct.
 >   - For a symlink (`0x80`): the link-target string encoded as UTF-8.
 >     The symlink is NOT followed; its target path is hashed as-is.
@@ -161,16 +160,19 @@ The hash is:
 > NOTE: The reference implementation reads files with `p.read_bytes()`
 > (`identity.py:174`), which returns the exact bytes on disk.
 
-### 1.7  Mode bit: executable
+### 1.7  Git transport normalization
 
-> NORMATIVE: A regular file's mode marker is `0x01` if and only if the
-> owner-execute bit (`stat.S_IXUSR`, octal `0o100`) is set in the file's
-> mode. All other permission bits are ignored. A file without the
-> owner-execute bit set uses marker `0x00` regardless of group-execute or
-> world-execute bits.
+> NORMATIVE: The git fetcher MUST invoke git with
+> `-c core.autocrlf=false -c core.filemode=false` so that host git
+> configuration (autocrlf rewriting `LF`→`CRLF`, filemode tracking the
+> executable bit) cannot perturb the materialized byte stream and thus
+> the identity hash. Identity is transport-independent only if the
+> materialized bytes are identical regardless of host git config.
 
-> NOTE: The reference implementation evaluates `mode & stat.S_IXUSR`
-> (`identity.py:169`).
+> NOTE: `core.filemode=false` keeps the working tree stable even though
+> the executable bit is no longer part of the identity byte stream
+> (Resolved Decision 1). `core.autocrlf=false` is independently required
+> by §1.6.
 
 ---
 
@@ -282,14 +284,27 @@ The hash is:
 >    If they differ, raise `CAS-IDENTITY-MISMATCH` and leave the source tree
 >    in place for the caller to inspect. The store MUST NOT be modified on a
 >    mismatch.
-> 3. Create the canonical path `<root>/<algorithm>/<hex-digest>/` if it does
+> 3. **Idempotency (C-admit-idem)**: if the canonical path
+>    `<root>/<algorithm>/<hex-digest>/` already exists, the source tree MUST
+>    be removed and the existing canonical path returned immediately. This is a
+>    successful no-op — the store already holds the content under this identity.
+>    The store MUST NOT be overwritten. A conformant implementation MUST NOT
+>    attempt a rename(2) in this case. Implementations SHOULD check for the
+>    canonical path's existence before attempting the rename to make CAS hits
+>    O(1).
+>    Rationale: content-addressing guarantees byte-identity — same identity
+>    implies same bytes by construction. No byte comparison is needed on a hit.
+>    This is the foundation for cross-project dedup (two projects fetching the
+>    same content share one store entry) and makes repeated fetches safe.
+> 4. Create the canonical path `<root>/<algorithm>/<hex-digest>/` if it does
 >    not exist.
-> 4. Move the source tree to the canonical path via `rename(2)`.
->    If the rename fails because the canonical path already exists (a
->    concurrent admit of the same identity), the source tree MUST be removed
->    and the existing canonical path returned. This is the **duplicate
->    admission = no-op** rule.
-> 5. Return the canonical path.
+> 5. Move the source tree to the canonical path via `rename(2)`.
+>    **TOCTOU race guard**: if the rename fails because the canonical path
+>    appeared between step 3 and step 5 (a concurrent admit of the same
+>    identity), the source tree MUST be removed and the existing canonical path
+>    returned. This is the same no-op as step 3 — content-addressing guarantees
+>    the bytes are identical, so no corruption can occur.
+> 6. Return the canonical path.
 
 > NORMATIVE: The rename MUST be to a path on the same filesystem as the
 > source tree to guarantee atomicity. Implementations using a CAS that
@@ -299,10 +314,11 @@ The hash is:
 > NOTE: The reference implementation fetches into a scratch directory under
 > `<root>/_scratch/` for exactly this reason: the scratch dir and the CAS
 > entries share the same filesystem mount, so `src.rename(canonical)`
-> (`cas.py:68`) is a POSIX rename(2) and is atomic. The `FetcherRegistry`
-> creates the scratch dir at `self._store.root / "_scratch"` (`types.py:161`).
+> (`cas.py`) is a POSIX rename(2) and is atomic. `CAStore.scratch()`
+> (Python `cas.py`; Rust `store.rs`) allocates a unique subdir under
+> `<root>/_scratch/` and is the sole owner of this transient staging area.
 
-> NOTE: The reference implementation's OSError catch (`cas.py:69–75`) handles
+> NOTE: The reference implementation's OSError catch (`cas.py`) handles
 > the race where two processes admit the same identity concurrently: the
 > loser's rename fails, it verifies the canonical dir exists, removes its
 > scratch, and returns the canonical path. If the canonical dir is absent
@@ -323,26 +339,46 @@ The hash is:
 > MAY remain on disk. The spec v1.0 reference implementation provides no
 > automatic GC for these entries.
 
-> NOTE: The reference implementation uses `try: ... except BaseException:
-> shutil.rmtree(scratch, ignore_errors=True); raise` (`fetchers/types.py:211–219`).
-> `BaseException` catches both normal exceptions and `KeyboardInterrupt` /
-> `SystemExit`, so all foreground-signal-safe termination paths clean up.
-> Only `SIGKILL` (which terminates the process immediately, bypassing Python)
-> can leave orphaned entries.
+> NOTE: The Python reference implementation uses `CAStore.scratch()` as a
+> context manager (`cas.py`) that runs `shutil.rmtree` in its `except
+> BaseException` branch, catching both normal exceptions and
+> `KeyboardInterrupt` / `SystemExit`, so all foreground-signal-safe
+> termination paths clean up. The Rust implementation cleans up the
+> `ScratchDir` path explicitly on both success and failure paths in
+> `CasAdmittingFetcher::fetch` (`fetchers.rs`). Only `SIGKILL` (which
+> terminates the process immediately, bypassing cleanup handlers) can leave
+> orphaned entries.
 
 > NOTE: An automatic startup GC (scan and remove stale `_scratch/` entries
 > older than a threshold) is the intended remedy for orphaned entries but is
-> NOT implemented in spec v1.0. A future spec amendment MUST specify the GC
-> policy (staleness threshold, locking protocol, safe-to-remove heuristic)
-> before any implementation may remove entries from `_scratch/`.
+> NOT implemented in spec v1.0. The GC design — liveness predicate
+> (`projects.kdl` watched-project registry), sentinel-before-admit
+> concurrency protocol, and the `_scratch/` staleness age T — is settled in
+> `docs/rfc-store-gc.md`. A spec amendment adding the `STORE-GC-ENTRY-IN-USE`
+> error code and the `milpa store gc` command lands with the implementation
+> (tracked in issue #141). No implementation may remove entries from
+> `_scratch/` or `sha256/` before that amendment is applied.
 
 ### 3.5  The `_deps/<name>` symlink convention
 
-> NORMATIVE: After a successful admit, `_deps/<name>` in the project
-> directory MUST be a symlink pointing to the CAS entry for that dep's
-> identity. The symlink target MUST be a **relative** path from the
-> `_deps/<name>` symlink's parent directory to the CAS entry. Absolute
-> symlinks are non-conformant.
+> NORMATIVE: After a successful fetch, `_deps/<name>` in the project
+> directory MUST be a symlink. Two distinct cases:
+>
+> - **CAS-admissible deps** (`cas_admissible = True`: git, tarball, oci):
+>   `_deps/<name>` MUST be a symlink pointing to the CAS entry for that dep's
+>   identity. The symlink target MUST be a **relative** path from the
+>   `_deps/<name>` symlink's parent directory to the CAS entry. Absolute
+>   symlinks are non-conformant.
+>
+> - **Non-admissible (editable) deps** (`cas_admissible = False`: local,
+>   member): `_deps/<name>` MUST be a symlink pointing **directly to the source
+>   directory** (the `local=` path, or the workspace member directory). The
+>   target is an **absolute** path to the source tree. There is no CAS entry.
+>   The user can edit the source in-place and changes are immediately visible
+>   through `_deps/<name>` without a re-fetch.
+>
+> Implementations MUST NOT copy or move the tree for non-admissible deps.
+> The `milpa verify` command distinguishes the two cases by provenance kind.
 
 > NORMATIVE: The `nim.cfg --path:` entries emitted by milpa (S5) reference
 > `_deps/<name>/<src_dir>`. Conformant `nim.cfg` emission MUST assume the
@@ -406,6 +442,73 @@ treatment is in `docs/identity-and-provenance.md`.
 > (`types.py:152–153`, `types.py:167`). The fetcher's `fetch()` method
 > returns `ProvenanceReceipt`, which is explicitly described as "descriptive,
 > not identity-bearing" (`types.py:63–64`).
+
+### 4.1  Identity-bearing vs. CAS-admissible — two orthogonal axes (normative SSOT)
+
+milpa has **two distinct per-provenance predicates** that are easily conflated
+but are NOT the same. This subsection is the single normative source of truth
+for both; every layer that needs either predicate MUST derive it from here, and
+MUST select the axis that matches its concern — it MUST NOT use one axis as a
+proxy for the other.
+
+- **identity-bearing** — the dep carries a recorded `content_hash` / `identity`
+  that is hash-compared during `verify` and frozen reconstruction. Governs
+  lockfile `identity` emission and verify dispatch.
+- **CAS-admissible** (`cas_admissible`) — the materialized tree is admitted into
+  the content-addressed store and `_deps/<name>` points at the CAS entry, rather
+  than being a direct symlink to an editable source (see §3.5). Governs CAS
+  admission, content-dedup, and the deps-view stale-entry sweep.
+
+> NORMATIVE: The canonical enumeration. The two axes coincide for `git` /
+> `tarball` / `oci` and for `local`, but **diverge for `member`**: a workspace
+> member is identity-bearing (its content is hashed and drift-detected) yet not
+> CAS-admissible (it is symlinked to the editable member directory, never copied
+> into the CAS).
+>
+> | Kind      | identity-bearing? | `cas_admissible`? | Notes                                                           |
+> |-----------|-------------------|-------------------|-----------------------------------------------------------------|
+> | `git`     | YES               | YES               | Immutable once pinned to commit SHA; admitted to CAS            |
+> | `tarball` | YES               | YES               | Immutable; pinned by archive sha256; admitted to CAS           |
+> | `oci`     | YES               | YES               | Immutable; pinned by OCI digest; admitted to CAS               |
+> | `member`  | YES               | NO                | Workspace member: content hashed + drift-detected, but symlinked to the editable member dir (not copied into CAS) |
+> | `local`   | NO                | NO                | Editable external source: no stable identity; liveness-only    |
+>
+> A named / registry dep resolves to one of the concrete transports above and
+> inherits that transport's status on both axes. Any future provenance kind MUST
+> declare both predicates explicitly (`cas_admissible` is a fetcher-protocol
+> contract — see `spec/plugin-contract.md §4` and `spec/manifest-grammar.md §4.3`);
+> the reference default is identity-bearing **and** CAS-admissible
+> (immutable-by-default).
+
+The downstream consequences, each keyed to the axis it actually depends on:
+
+> NORMATIVE: **(a) Lockfile emission — IDENTITY-BEARING axis.** The `identity`
+> field in a `dep` block MUST be emitted if and only if the dep is
+> identity-bearing. It is therefore present for `git` / `tarball` / `oci` /
+> `member` and absent **only** for `local`. A conformant parser MUST treat a
+> present `identity` field on a non-identity-bearing dep (`local`) as an error
+> (`LOCK-DEP-IDENTITY-INVALID`).
+
+> NORMATIVE: **(b) Verify dispatch — IDENTITY-BEARING axis.** `milpa verify`
+> MUST apply liveness-only checking (no content-hash comparison) for every
+> non-identity-bearing dep (`local` only). It MUST apply the four-state
+> structural check plus identity hash-compare for every identity-bearing dep
+> (`git` / `tarball` / `oci` / `member`). The dispatch criterion is
+> identity-bearing status, not a per-kind enumeration in the verify code. See
+> `spec/lockfile-schema.md §6.2` for the normative verify procedure.
+
+> NORMATIVE: **(c) CAS admission and content-dedup — CAS-ADMISSIBLE axis.**
+> Non-CAS-admissible deps (`local` **and** `member`) MUST NOT be passed to
+> `CASStore.admit()` and MUST NOT be included in any content-dedup pass (e.g.,
+> alias detection in Phase B). They are editable sources symlinked in place;
+> admitting them would silently freeze user edits.
+
+> NORMATIVE: **(d) Deps-view rebuild (stale-entry sweep) — CAS-ADMISSIBLE axis.**
+> When rebuilding the `_deps/` symlink view (e.g., `milpa fetch` or
+> `milpa clean`), the stale-entry sweep MUST NOT evict symlinks for
+> non-CAS-admissible deps (`local` **and** `member`) based on a missing CAS
+> entry — their symlinks point directly to the live source tree and are valid
+> regardless of CAS state.
 
 ---
 

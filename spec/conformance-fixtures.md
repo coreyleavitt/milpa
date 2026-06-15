@@ -471,6 +471,11 @@ the CAS-admission and symlink-creation steps defined in `spec/identity.md`
 >   `milpa.kdl`, `index.kdl`, or `mocked-fetches/` are read. Used exclusively for
 >   `LOCK-*` error fixtures. This entry point has no success variant (no output
 >   files); every `parse-lockfile` fixture is an error fixture.
+> - `lock-roundtrip` — parse the fixture's `milpa.lock` input, re-emit it via
+>   the canonical emitter, and byte-compare against `expected/milpa.lock`. No
+>   `milpa.kdl`, `index.kdl`, or `mocked-fetches/` are read. Tests parse+format
+>   for lockfile fields not produced by the resolver pipeline (e.g. Phase B
+>   `aliases`). MUST be a success fixture; error cases belong in `parse-lockfile`.
 > - `frozen` — exercise the no-network frozen fast path: parse `milpa.kdl` and
 >   `milpa.lock`, optionally seed the CAS from `cas-seed/`, then resolve without
 >   fetching. Used for `FROZEN-*` fixtures; MAY be a success or error fixture.
@@ -944,14 +949,11 @@ emitting `milpa.lock` and `nim.cfg`.
 > - `MAN-MUTATE-FILE-NOT-FOUND` — raised by `mutate_manifest_file()` when the
 >   target file is absent; in practice the mutation verbs always operate on a
 >   manifest the CLI has already successfully parsed from disk.
-> - `MAN-ADD-MIRROR-IDENTITY-MISMATCH` — raised by `cmd_add_mirror()` when
->   the proposed mirror URL serves bytes that don't hash to the locked
->   identity; requires a live network round-trip to a mismatched server, which
->   no fixture-format transport slot expresses.
-> - `MAN-MIRROR-EDITABLE-PROVENANCE` — raised by `cmd_add_mirror()` for local
->   or member provenance; constructible only when a lockfile has a
->   local/member entry, which the `add --mirror` cmd token does not combine
->   with (local deps have no tarball-sha to mirror).
+> - `MAN-MIRROR-EDITABLE-PROVENANCE` — raised by `cmd_add_mirror()` when the
+>   dep is not a git URL dep (local, member, named, or tarball deps cannot
+>   carry mirrors). The `add --mirror` verb is CliOnly (pure manifest
+>   mutation; no in-process resolver path), so this code is covered by
+>   per-impl CLI tests, not corpus fixtures.
 >
 > The following codes were previously listed as unreachable but are now covered
 > by fixtures added in this revision:

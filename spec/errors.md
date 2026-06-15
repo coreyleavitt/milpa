@@ -44,7 +44,19 @@ Source tree bytes do not hash to the claimed identity string.
 
 The requested identity is not present in the CAS.
 
-**Triggered:** CAStore.link is called for an identity that has no entry under <root>/<algorithm>/<hex>/.
+**Triggered:** CAStore.link is called for an identity that has no entry under <root>/<algorithm>/<hex>/. Also raised by `milpa store path <identity>` when the exact identity is absent.
+
+### `CAS-STORE-IO-ERROR`
+
+A `_deps/<name>` symlink resolves to a CAS store entry but reading that entry raises an I/O error (e.g. network mount offline). Distinct from a dangling symlink (where the target is gone entirely) and from identity mismatch (where the content is corrupt).
+
+**Triggered:** `verify_lockfile_against_deps` finds `_deps/<name>` is a symlink that resolves (`exists()` is true) but `compute_content_hash` raises an `OSError` (e.g. permission denied, network mount offline) rather than completing normally.
+
+### `STORE-AMBIGUOUS-PREFIX`
+
+`milpa store path <prefix>` matches more than one store entry, or the supplied prefix is shorter than the 16-hex-character minimum required to safely pin a single entry.
+
+**Triggered:** `milpa store path` is called with a hex-digest prefix that resolves to zero or more than one store entries, or with a prefix whose hex portion is fewer than 16 characters.
 
 ## EXTRACT
 
@@ -72,7 +84,7 @@ An archive entry's resolved path escapes the destination directory (zip-slip att
 
 Every candidate provenance failed — the dep cannot be fetched.
 
-**Triggered:** fetch_any() tries all candidate provenances in order and every one either raises or produces a mismatched identity.  Identity-mismatch candidates are folded into the composite failure message.
+**Triggered:** The per-candidate fallback loop tries all candidate provenances in order and every one raises a transport error (network failure, git non-zero exit, dead mirror, etc.).  For the tarball path, a sha256 archive-pin mismatch is also folded in.  Identity divergence (fetched bytes ≠ locked hash) is a distinct condition raised as `FETCH-PROVENANCE-DIVERGENCE`, not folded here.
 
 ### `FETCH-DOWNLOAD-FAILED`
 
@@ -133,6 +145,14 @@ OCI artifact contained no *.tar.gz blob.
 oras pull exited non-zero.
 
 **Triggered:** OciFetcher.fetch runs `oras pull` and receives a non-zero exit code.
+
+### `FETCH-PROVENANCE-DIVERGENCE`
+
+A candidate provenance successfully fetched a tree but its content hash does not match the locked identity — a supply-chain signal.
+
+**Triggered:** The per-candidate fallback loop in the URL-dep resolver path calls `fetcher.fetch()` successfully (no transport error), computes the content hash of the materialized tree, and finds it differs from the `expected_identity` carried from the prior lockfile.  This is distinct from a transport failure (which is silently skipped to the next candidate) and from `FETCH-ALL-FAILED` (which fires when every candidate transport-fails).  A divergence is raised immediately and loudly — it MUST NOT fall through to the next candidate, because a mirror serving different bytes than the lock pinned is an active supply-chain signal that must not be silently worked around.
+
+**Boundary:** `FETCH-PROVENANCE-DIVERGENCE` is raised only when `expected_identity` is set (i.e. a prior lockfile pin exists).  On a fresh resolve with no prior lock, no identity gate is applied and this code is never raised.
 
 ### `FETCH-RECEIPT-EMPTY`
 
@@ -239,6 +259,12 @@ Identity string is missing the `<algorithm>:` prefix (expected `<algorithm>:<dig
 Digest component contains non-lowercase-hex characters.
 
 **Triggered:** parse_identity finds characters outside `0-9`, `a-f` in the digest.
+
+### `ID-NON-UTF8-RELPATH`
+
+A file or directory's relative path within the source tree cannot be encoded as UTF-8, so it cannot be included in the canonical byte stream of the content-hash algorithm. Distinct from `ID-NON-UTF8-SYMLINK-TARGET`, which covers non-UTF-8 symlink *targets* rather than non-UTF-8 *path components*.
+
+**Triggered:** compute_content_hash encounters a file or symlink whose relative path (as an OS byte string) contains non-UTF-8 byte sequences — only possible on POSIX systems where filenames are byte sequences with no UTF-8 requirement.
 
 ### `ID-NON-UTF8-SYMLINK-TARGET`
 
@@ -395,12 +421,6 @@ Lockfile schema version is not supported by this milpa.
 `milpa add --git` rejected: the dep is already declared in milpa.kdl.
 
 **Triggered:** cmd_add finds <dep> is already present in the manifest's deps block.
-
-### `MAN-ADD-MIRROR-IDENTITY-MISMATCH`
-
-`milpa add --mirror` rejected: the URL's bytes don't hash to the locked identity.
-
-**Triggered:** The proposed mirror URL serves bytes that differ from what the lockfile pinned.
 
 ### `MAN-CAS-DIR-MISSING`
 
@@ -1023,6 +1043,12 @@ A git URL begins with `-` and would be interpreted as a CLI flag.
 `milpa verify` cannot run: there is no _deps/ directory.
 
 **Triggered:** cmd_verify finds no _deps/ under the project (or workspace) root — nothing has been fetched, so there is nothing to verify against the lockfile. The user is directed to run `milpa fetch` first.
+
+### `VERIFY-ALIAS-SYMLINK-MISSING`
+
+An alias `_deps/<alias>` symlink is absent, dangling, or points to a different store entry than its canonical `_deps/<name>` symlink.
+
+**Triggered:** `verify_lockfile_against_deps` iterates a dep's `aliases` list and finds that `_deps/<alias>` either does not exist, is a dangling symlink, or resolves to a different path than `_deps/<canonical>`. Each failing alias produces one divergence carrying this slug.
 
 ### `VERIFY-EDGE-MISMATCH`
 

@@ -552,6 +552,14 @@ local-source drift warnings are printed regardless of exit code.
 > `<dir>/nim.cfg` if they exist. It MUST leave `milpa.lock` untouched.
 > It MUST exit 0 even if `_deps/` or `nim.cfg` do not exist (idempotent).
 
+> NORMATIVE: When removing `_deps/` recursively, implementations MUST NOT
+> follow symlinks into their targets.  Only the symlink entries themselves
+> (and any non-symlink content directly under `_deps/`) are removed.  This
+> rule protects both local-dep source trees (which are live, user-owned
+> directories outside the project) and CAS store entries (which are shared
+> across projects).  A correct implementation uses `rm -rf _deps/` or an
+> equivalent that removes the symlinks themselves, not their targets.
+
 > NORMATIVE: In workspace mode, `clean` MUST remove `<ws_root>/_deps/`
 > and each member's `nim.cfg`.
 
@@ -567,9 +575,10 @@ local-source drift warnings are printed regardless of exit code.
 
 ### 5.6  `add`
 
-**Purpose:** Add a new dep to `milpa.kdl` (with `--git`) or add a
-mirror provenance to an existing dep (with `--mirror`). Validates by
-running a full resolve before writing.
+**Purpose:** Add a new dep to `milpa.kdl` (with `--git`), or record a
+declared mirror URL on an existing dep (with `--mirror`). `--git`
+validates by running a full resolve before writing. `--mirror` is a pure
+manifest mutation — no network fetch, no lockfile write.
 
 **Arguments:**
 
@@ -594,17 +603,24 @@ milpa add <dep> --mirror <url>
 
 > NORMATIVE: `add` with `--mirror` MUST:
 >
-> - Reject if the lockfile does not exist (exit 1).
-> - Reject if `<dep>` is not in the lockfile (exit 1).
-> - Reject if `<dep>` has a local or member provenance (cannot mirror
->   editable sources; exit 1).
-> - Fetch `<url>` and verify that its bytes hash to the locked identity
->   for `<dep>`; reject with `MAN-ADD-MIRROR-IDENTITY-MISMATCH` if not.
-> - Run a full resolve over the proposed manifest.
-> - On successful resolve, atomically write the updated `milpa.kdl` and
->   `milpa.lock`.
-> - Exit 0 if `<url>` is already a mirror for `<dep>` (idempotent).
-> - On any failure, leave `milpa.kdl` and `milpa.lock` unmodified.
+> - Reject if `<dep>` is not declared in `milpa.kdl`; exit 1.
+> - Reject if `<dep>` is not a URL dep (git-backed `UrlDep`) — local,
+>   member, named, or tarball deps cannot carry mirrors; emit
+>   `MAN-MIRROR-EDITABLE-PROVENANCE` and exit 1.
+> - Exit 0 without rewriting `milpa.kdl` if `<url>` is already a mirror
+>   for `<dep>` (idempotent).
+> - Otherwise atomically append `<url>` to the dep's `mirrors` block in
+>   `milpa.kdl` ONLY. MUST NOT fetch `<url>`, MUST NOT verify bytes, and
+>   MUST NOT write `milpa.lock`.
+> - Print `added mirror <url> for <dep>` to stderr and exit 0.
+> - On any failure, leave `milpa.kdl` unmodified.
+>
+> NOTE: The declared mirror is an author CLAIM. It is written into the
+> lockfile as a `declared` provenance block on the next `milpa lock`
+> (see D-lifecycle slice) and is verified against the locked identity at
+> USE time (D-fallback). This two-phase design preserves the
+> observed/declared provenance model: an unverified record is never
+> written directly into `milpa.lock`.
 
 > NORMATIVE: `add` without `--git` or `--mirror` MUST print a usage
 > error to stderr and exit 2 (a usage/crash-class verdict per §3.1 R4;
@@ -628,11 +644,17 @@ milpa remove <dep>
 
 > NORMATIVE: `remove` MUST:
 >
-> - Reject if `<dep>` is not declared in `milpa.kdl` (exit 1).
+> - If `<dep>` matches a `dep.aliases` entry in the prior lockfile (not a
+>   top-level lockfile dep name), resolve it to the canonical dep name before
+>   any manifest check (alias→canonical resolution).
+> - Reject if the canonical dep name is not declared in `milpa.kdl` (exit 1).
+> - If the prior lockfile recorded `aliases` for the removed canonical dep,
+>   emit a warning to stderr per alias (whether or not the alias is still
+>   required transitively). Removal still proceeds (warning, not error).
 > - Run a full resolve over the proposed manifest (manifest minus `<dep>`).
 > - On successful resolve, atomically write the updated `milpa.kdl` and
 >   `milpa.lock`.
-> - Print `removed <name>` to stderr and exit 0.
+> - Print `removed <canonical-name>` to stderr and exit 0.
 > - On any failure, leave `milpa.kdl` and `milpa.lock` unmodified.
 
 > NOTE: Orphaned transitives that were only required by `<dep>` disappear
@@ -647,7 +669,9 @@ milpa remove <dep>
 
 **stdout:** none.
 
-**stderr:** `removed <name>` on success; diagnostic on failure.
+**stderr:** `removed <name>` on success; per-alias warning(s) before the
+success line when the removed dep had prior lockfile aliases; diagnostic on
+failure.
 
 ### 5.8  `update`
 
@@ -666,9 +690,18 @@ milpa update [<dep>]
 
 > NORMATIVE: `update <dep>` MUST:
 >
-> - Reject if `<dep>` is not in the lockfile (exit 1).
-> - Drop only `<dep>`'s pin; all other pins are retained as a prior
->   lockfile (passed to the resolver as `prior_lockfile`).
+> - If `<dep>` matches a `dep.aliases` entry in the lockfile (not a top-level
+>   dep name), resolve it to the canonical dep name before the guard (alias→
+>   canonical resolution). The check "is `<dep>` in the lockfile" MUST match
+>   both canonical names and aliases.
+> - Reject if neither `<dep>` nor any dep's alias matches (exit 1).
+> - Carry forward the updated dep's prior **declared** mirror provenances
+>   (those with `origin="declared"` in the prior lockfile entry), filtered to
+>   URLs still declared in `milpa.kdl`; drop any declared URL whose mirror
+>   entry was removed from the manifest. Concretely: the dep's filtered-prior
+>   entry has `identity=None` (forces fresh re-resolve) and retains only its
+>   declared provenances (no observed/commit pin).
+> - All other deps' pins are retained as a prior lockfile.
 > - Re-resolve; all other deps are stable unless their provenance changes.
 > - Write the new `milpa.lock`.
 > - Print `updated <name>` to stderr and exit 0.

@@ -229,8 +229,11 @@ Grammar: `<name> local="<path>"`
 > Empty or non-string value raises `MAN-DEP-LOCAL-PATH`. No other properties
 > are permitted (`MAN-DEP-UNKNOWN-PROPS`).
 
-> NORMATIVE: LocalDep is NOT CAS-admissible. The fetcher MUST copy the source
-> tree into `_deps/<name>/` as a snapshot; the copy is not stored in the
+> NORMATIVE: LocalDep is NOT CAS-admissible. The fetcher MUST expose the
+> source tree at `_deps/<name>` via a **symlink** to the source path; it MUST
+> NOT copy or move the tree. Symlink semantics give the user edit-in-place
+> behaviour: changes to the source tree are immediately visible through
+> `_deps/<name>` without a re-fetch. The tree is not stored in the
 > content-addressed store. See §4.3 and `spec/plugin-contract.md` (S10).
 
 #### TarballDep
@@ -243,6 +246,22 @@ Grammar: `<name> tarball=(url)"<URL>" [sha256="<hex>"] [strip_components=<N>]`
 > `MAN-DEP-TARBALL-SHA` if non-string when present) and `strip_components`
 > (optional non-negative integer; raises `MAN-DEP-TARBALL-STRIP` if negative,
 > non-numeric, or boolean). Default `strip_components` is `0`.
+
+> NORMATIVE: A conformant tarball fetcher MUST support the following compression
+> formats, detected by magic bytes on the downloaded archive before extraction:
+>
+> | Format | Magic bytes (hex) | Extension(s) |
+> |--------|------------------|--------------|
+> | gzip   | `1f 8b`          | `.tar.gz`, `.tgz` |
+> | bzip2  | `42 5a 68`       | `.tar.bz2`, `.tbz2` |
+> | xz     | `fd 37 7a 58 5a 00` | `.tar.xz` |
+> | uncompressed tar | (no magic match) | `.tar` |
+>
+> Compression format detection MUST be based on magic bytes, not file-name
+> extension. An archive in any of these formats MUST produce the same
+> `content_hash` for the same extracted source tree (independent of compression
+> format). Each decompressor MUST be wrapped in the same decompression-bomb size
+> cap as the gzip path (`max_total_size` per `spec/plugin-contract.md` §2.1).
 
 > NORMATIVE: `strip_components` MUST be applied **before** `content_hash`
 > computation. The identity of a tarball dep is the sha256 of the
@@ -428,7 +447,11 @@ Fields: `path` (string, required — absolute path after resolver normalization)
 
 > NORMATIVE: `local` is **NOT CAS-admissible** (`cas_admissible = False`).
 > Implementations MUST NOT admit a local source tree into the content-addressed
-> store. The motivation: admitting a local tree would silently freeze user edits.
+> store. The fetcher MUST expose the source tree via a **symlink** at
+> `_deps/<name>` pointing directly to the source directory (no copy, no snapshot).
+> This gives the user edit-in-place semantics: changes to the source directory
+> are immediately visible through `_deps/<name>` without a re-fetch. See
+> `spec/identity.md` §3.5 and `spec/plugin-contract.md` (S10) §1.2.
 
 #### `tarball`
 
@@ -469,11 +492,19 @@ Fields: `registry` (string, required), `repository` (string, required),
 > | `git`     | `True`          | Immutable once ref is pinned to commit SHA     |
 > | `tarball` | `True`          | Immutable; pinned by archive sha256            |
 > | `oci`     | `True`          | Immutable; pinned by digest                    |
-> | `local`   | `False`         | Editable source — admitting would freeze edits |
+> | `local`   | `False`         | Editable source — symlinked in-place; admitting would freeze edits |
 > | `member`  | `False`         | Workspace-internal; resolved by path, not fetch|
 >
 > The `FetcherRegistry` MUST check `cas_admissible` before calling `admit()`.
 > See `spec/plugin-contract.md` (S10) for the full backend contract.
+
+> NOTE: `cas_admissible` is **not** the same axis as *identity-bearing* (whether a
+> dep carries a recorded content `identity` that is hash-compared on verify). The
+> two coincide for `git` / `tarball` / `oci` and for `local`, but **diverge for
+> `member`**: a `member` is `cas_admissible = False` (symlinked to the editable
+> member directory, never admitted to the CAS) yet **identity-bearing** (its
+> content is hashed and drift-detected). The single normative definition of both
+> axes — and the per-axis consequences — is `spec/identity.md §4.1`.
 
 ### 4.4  Spec-version epoch field
 

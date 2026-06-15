@@ -72,17 +72,28 @@ The return value is the fetcher's sole dispatch signal. The registry calls
 ### 1.2  Materialize
 
 > NORMATIVE: A fetcher MUST implement `fetch(name, provenance, *, dest) ->
-> ProvenanceReceipt`. On success, the materialized source tree MUST be present
-> under `dest/` when the method returns.
+> ProvenanceReceipt`. On success, the materialized source tree MUST be
+> accessible at `dest` when the method returns. Two forms are conformant:
+>
+> - **CAS-admissible fetchers** (git, tarball, oci): MUST materialize the tree
+>   as a real directory at `dest/`. The registry then admits the directory into
+>   the CAS and replaces `dest` with a relative CAS symlink (§3.5).
+>
+> - **Non-admissible (editable) fetchers** (local, member): MUST create a
+>   **symlink** at `dest` pointing to the source directory. MUST NOT copy,
+>   move, or snapshot the tree. The symlink gives the user edit-in-place
+>   semantics: changes to the source are immediately visible through `dest`
+>   without a re-fetch. The registry does NOT create a CAS entry for this dep.
 
 > NORMATIVE: The fetcher MUST NOT compute, hash, or assert identity — it must
 > not call the milpa identity algorithm (`compute_content_hash` or equivalent)
 > anywhere in its `fetch` implementation. Identity is computed by the registry
 > post-fetch (§3).
 
-> NORMATIVE: `dest` is provided by the registry. The fetcher MUST write the
-> tree under `dest/`; it MUST NOT create a parallel path or rename `dest` to a
-> different location.
+> NORMATIVE: `dest` is provided by the registry. For admissible fetchers, the
+> fetcher MUST write the tree into the directory at `dest/`. For non-admissible
+> fetchers, the fetcher MUST create a symlink at `dest` (not a parallel path or
+> a renamed location).
 
 ### 1.3  Receipt
 
@@ -146,9 +157,9 @@ See `spec/errors.md` §FETCH for the full list.
 > | Symlink-escape (symlink target resolves outside `dest/`) | `EXTRACT-SYMLINK-ESCAPE` |
 >
 > All five checks MUST be applied to every extraction. The size checks run
-> during extraction (streaming); the path-escape checks run per-entry before
-> any write. A failure MUST abort the extraction immediately and raise
-> `FetchError` with the matching code.
+> during extraction (streaming); the path-escape checks run
+> per-entry before any write. A failure MUST abort the extraction immediately
+> and raise `FetchError` with the matching code.
 
 > NOTE: The reference implementation's defaults are declared as keyword
 > arguments on `extract_tar` in `milpa/fetchers/safe_extract.py`:
@@ -263,6 +274,17 @@ be admitted.
 > immutability the default. `LocalProvenance` overrides with `cas_admissible =
 > False`. Subclasses MUST override the default explicitly if they represent an
 > editable source.
+
+> NOTE: Workspace **members** are a special case. The reference impls do **not**
+> model a member as a transport `Provenance` subclass/variant at all — members
+> are resolved inline by the resolver (against the workspace member table), not
+> fetched through the `FetcherRegistry`. The `cas_admissible = False` requirement
+> above is therefore conceptual for `member`: a member is structurally never
+> passed to `admit()` because it never enters the fetcher protocol. Note also
+> that `member` — unlike `local` — **is identity-bearing**: its content is hashed
+> and drift-detected even though it is not CAS-admissible. See
+> `spec/identity.md §4.1` for the two orthogonal axes (identity-bearing vs
+> CAS-admissible) and why they diverge on `member`.
 
 **Why this is part of the protocol:** `cas_admissible` is a contract
 declaration, not an implementation detail. The registry in any conformant

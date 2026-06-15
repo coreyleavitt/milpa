@@ -150,7 +150,9 @@ dep "depname2" { ... }
 >
 > **Dep-block child field layout (4-space indent):**
 >
-> - `    identity "<sha256:64hex>"` — emitted only when `identity` is not null.
+> - `    identity "<sha256:64hex>"` — emitted only for identity-bearing dep kinds
+>   (`git` / `tarball` / `oci` / `member`; see §3.1 and `spec/identity.md §4.1`);
+>   absent **only** for `local` deps.
 > - `    version "<semver>"` — always emitted.
 > - `    src_dir "<path>"` — always emitted (empty string → `src_dir ""`).
 > - `    requires` (bare, no arguments) when the dep has no transitive deps;
@@ -159,23 +161,25 @@ dep "depname2" { ... }
 > - Zero or more `    cond-require ...` nodes (§3.5) — emitted immediately
 >   after `requires`, sorted lexicographically by name; omitted entirely when
 >   the dep has no conditional require annotations.
+> - `    aliases "<a1>" "<a2>" ...` (§3.8) — emitted only when non-empty; args
+>   are double-quoted, space-separated, and lexicographically sorted; omitted
+>   entirely when the dep has no alternate names.
 > - `    active_flags "<f1>" "<f2>" ...` — emitted only when non-empty; args
 >   are double-quoted and space-separated.
-> - `    self_mirrors (url)"<url1>" (url)"<url2>" ...` — emitted only when
->   non-empty; each URL is `(url)`-annotated and double-quoted (the `(url)`
->   annotation is NOT used for other URL-valued fields such as git `url`,
->   tarball `url`, or OCI `registry`/`repository`/`digest`).
-> - `    provenance {` — the provenance block open.
-> - Provenance child fields at **8-space indent** (see below).
-> - `    }` — the provenance block close.
+> - One or more `    provenance {` blocks — emitted in canonical sorted order
+>   (see §4 for the sort key). The emitter MUST NOT write a `self_mirrors`
+>   node; the parser MUST convert any legacy `self_mirrors` node to declared
+>   provenance records (see §3.7 read-compat).
 >
 > **Provenance child field layout (8-space indent):**
 >
 > - All provenance field values are double-quoted strings.
-> - `kind` is always first.
-> - Fields are emitted in the order defined per kind in §4 (git: kind/url/ref/
->   commit_sha; tarball: kind/url/sha256; local: kind/path; member: kind/name;
->   oci: kind/registry/repository/digest).
+> - `origin` is always first (before `kind`). Value is `"observed"` or
+>   `"declared"`. MUST be emitted always (never omitted).
+> - `kind` is second.
+> - Fields are emitted in the order defined per kind in §4 (git: origin/kind/url/ref/
+>   commit_sha; tarball: origin/kind/url/sha256; local: origin/kind/path; member:
+>   origin/kind/name; oci: origin/kind/registry/repository/digest).
 > - Optional fields (`ref`, `commit_sha`, `sha256`) are omitted entirely when
 >   null — no null literal, no empty string.
 >
@@ -211,6 +215,7 @@ dep "depname" {
     src_dir "src"
     requires "dep1" "dep2"
     cond-require "dep2" platform="linux"  // additive; omitted when empty (§3.5)
+    aliases "alt-name" "other-name"       // omitted when empty (§3.8)
     active_flags "flag1"                  // omitted when empty
     self_mirrors (url)"https://..."       // omitted when empty
     provenance {
@@ -233,9 +238,17 @@ dep "depname" {
 > source tree, independent of how or where it was fetched. It is the field
 > consumers verify against. It MUST NOT encode provenance information.
 
-> NOTE: `identity` may be `null` / absent for deps that have not yet been
-> content-hashed (Phase A partial). The reference parser accepts absent or
-> `None` values and stores `None` in `LockedDep.identity`.
+> NORMATIVE: The `identity` field MUST be emitted if and only if the dep's
+> provenance kind is identity-bearing (`git` / `tarball` / `oci` / `member`).
+> For the sole non-identity-bearing kind (`local`), this field MUST be absent.
+> Note that `member` is identity-bearing (its content is hashed and
+> drift-detected) even though it is not CAS-admissible. The single normative
+> definition of which kinds are identity-bearing — and how that axis differs
+> from CAS-admissibility — is in `spec/identity.md §4.1`.
+
+> NOTE: `identity` may be `null` / absent for identity-bearing deps that have
+> not yet been content-hashed (Phase A partial). The reference parser accepts
+> absent or `None` values and stores `None` in `LockedDep.identity`.
 
 > NOTE: The identity algorithm (canonical byte stream, POSIX relpath sort, mode
 > encoding, `.git/` exclusion, multihash prefix) is specified in
@@ -454,25 +467,62 @@ dep "pkg" {
 > graph. MUST be omitted from the emitted KDL when no flags are active, to
 > keep diffs minimal.
 
-### 3.7  `self_mirrors` field (optional)
+### 3.7  `self_mirrors` field (read-compat only; removed from schema)
 
-> NORMATIVE: `self_mirrors` carries zero or more URL arguments. Each URL MAY
-> be either a plain string or a `(url)`-annotated value; both forms MUST be
-> accepted on parse and normalized to plain URL strings. MUST be omitted from
-> the emitted KDL when empty.
+> NORMATIVE: The `self_mirrors` field was removed from the lockfile schema in
+> Phase D (D-provenance). Self-mirror URLs are now stored as provenance records
+> with `origin "declared"` (see §4). The emitter MUST NOT write a `self_mirrors`
+> node. On parse, if a dep block contains an old `self_mirrors` node (legacy
+> lockfiles), the parser MUST convert each URL to a `GitProvenanceRecord` with
+> `origin="declared"`, `url=<the url>`, `ref=None`, `commit_sha=None`, and append
+> it to the dep's `provenances` list. This conversion is transparent — the
+> re-emitted lockfile has no `self_mirrors` node and instead has declared
+> provenance blocks in canonical sort order.
 
-> NOTE: Self-mirrors are URLs declared by the dep's own `milpa.kdl` as
-> alternative fetch locations (issue #79). They are cached in the lockfile so
-> subsequent resolves can fall back to them even when the primary fetch fails
-> before discovery.
+> NOTE: This read-compat conversion requires no schema version bump (purely
+> additive parse-path; no emitter changes beyond "never write self_mirrors").
+
+### 3.8  `aliases` field (optional, Phase B)
+
+> NORMATIVE: `aliases` carries zero or more positional string arguments, each
+> being an alternate dep name by which this dep was also referenced in the
+> manifest (i.e. another manifest dep name that resolved to the same
+> content-identity). MUST be omitted from the emitted KDL when empty, to keep
+> diffs minimal for deps with no alternate names. When present, arguments MUST
+> be emitted in lexicographically sorted order.
+
+> NOTE: `aliases` is populated by the Phase B dedup pass (#??) when two or
+> more manifest dep names resolve to the same `identity` (same source tree).
+> The canonical dep entry carries the primary name; all alternate names appear
+> as `aliases` args. Parsers MUST accept and round-trip `aliases` silently —
+> an older milpa that does not understand the field MUST skip it (KDL 2.0
+> unknown-node skip behavior) and continue. No lockfile schema version bump is
+> required because the field is purely additive.
+
+> NOTE: The conformance fixture `fixture-172-lock-aliases-field` exercises a
+> dep block with `aliases "alpha" "beta"` and pins the byte-exact canonical
+> form via a `lock-roundtrip` round-trip.
 
 ---
 
 ## 4  Provenance block
 
-Each dep contains exactly one `provenance { }` block (multi-provenance per
-issue #37 is reserved for a future amendment). The block's children are scalar
-fields.
+Each dep contains one or more `provenance { }` blocks. Multiple provenances
+represent alternate locations where the same content-identity can be fetched.
+The blocks' children are scalar fields.
+
+> NORMATIVE: Every provenance block MUST contain an `origin` child node
+> (first) and a `kind` child node (second). `origin` MUST be either
+> `"observed"` (milpa fetched these bytes and verified they hash to the
+> recorded identity) or `"declared"` (an author-claimed mirror location,
+> unverified until first use). Absent `origin` on parse MUST default to
+> `"observed"` (back-compat: existing lockfiles without `origin` are all
+> observed). `origin` MUST be emitted always — never omitted.
+
+> NORMATIVE: `observed` / `declared` is a **per-lockfile annotation**, never
+> a CAS-entry property. The CAS holds bytes only. Concurrent projects sharing
+> the same content identity may record different provenance lists without
+> affecting the shared store.
 
 > NORMATIVE: Every provenance block MUST contain a `kind` child node carrying
 > exactly one string argument — the provenance kind discriminator. A missing
@@ -483,6 +533,58 @@ fields.
 > value. Wrong arity raises `LOCK-PROV-FIELD-ARITY`. A required field absent
 > from a block raises `LOCK-PROV-FIELD-MISSING`.
 
+### 4.0a  D-lifecycle assembly rule
+
+When a resolver runs the fetch stage for a URL dep, it builds an ordered
+candidate list: `[primary_url, mirror₁, mirror₂, …]` (from the manifest
+`git=` + `mirror` children, deduplicated, with any declared mirrors from the
+prior lockfile appended). It tries candidates in order until one succeeds.
+
+> NORMATIVE (D-lifecycle): After a successful fetch, the resolver MUST record
+> provenance as follows:
+>
+> - **Exactly one** `origin "observed"` block for the candidate URL that
+>   actually succeeded (i.e. the one fetched and identity-verified).
+> - **One** `origin "declared"` block for **each** other candidate URL in the
+>   ordered list that is NOT the observed URL. Declared records carry no
+>   `commit_sha` (unknown until verified); `ref` is carried from the manifest
+>   when available.
+> - If a mirror was the candidate that succeeded (primary failed), it becomes
+>   the `"observed"` block and the primary URL becomes `"declared"`. This is
+>   **mirror promotion** — the observed provenance tracks the actual fetch, not
+>   the manifest's declared primary.
+> - Declared mirror URLs from a prior lockfile MUST be preserved across
+>   re-locks: append them (deduplicated) to the candidate list before computing
+>   the declared set.
+> - If the observed URL is also present in the declared set (dedup failure
+>   from prior lockfile), the duplicate MUST be dropped — the observed block
+>   subsumes it.
+
+> NORMATIVE: A dep with no mirrors and no prior declared provenances MUST have
+> exactly one provenance block (`origin "observed"`). A dep with N mirrors MUST
+> have at most N+1 provenance blocks (observed + up to N declared).
+
+### 4.0  Provenance sort key (canonical order)
+
+> NORMATIVE: When a dep has multiple provenance blocks, the emitter MUST sort
+> them in a canonical total order before emission. Both impls MUST use the
+> identical sort key to guarantee zero cross-impl divergence.
+>
+> **Sort key: `(origin_rank, kind_rank, primary, secondary)`** where:
+>
+> - `origin_rank`: `"declared"` → 0, `"observed"` → 1 (declared before observed)
+> - `kind_rank`: `"git"` → 0, `"tarball"` → 1, `"oci"` → 2, `"local"` → 3,
+>   `"member"` → 4, `"registry"` → 5, any future kind appended after 5
+> - `(primary, secondary)` per kind (bytewise over the post-escape KDL string form):
+>   - `git`: `(url, ref or "")`
+>   - `tarball`: `(url, "")`
+>   - `oci`: `(registry + "/" + repository, digest)`
+>   - `local`: `(path, "")`
+>   - `member`: `(name, "")`
+>   - `registry`: `(name, tag or "")`
+>
+> All string comparisons are bytewise (lexicographic over UTF-8 bytes).
+
 The following subsections define each provenance kind. Fields listed as
 *required* MUST be present; fields listed as *optional* MAY be absent and
 default to `null`.
@@ -490,10 +592,12 @@ default to `null`.
 ### 4.1  `git` provenance
 
 Used for `git=...` URL deps and named deps resolved via the tianguis index to a
-git URL.
+git URL. Also used for self-mirrors converted from legacy `self_mirrors` nodes
+(origin `"declared"`, ref/commit_sha empty/absent).
 
 | Field | Required | Type | Semantics |
 |---|---|---|---|
+| `origin` | yes | `"observed"` or `"declared"` | fetch-verification status |
 | `kind` | yes | `"git"` | discriminator |
 | `url` | yes | string | git remote URL |
 | `ref` | no | string | branch/tag/ref as declared in the manifest |
@@ -502,6 +606,8 @@ git URL.
 > NORMATIVE: `url` is required; its absence raises `LOCK-PROV-FIELD-MISSING`.
 > `ref` and `commit_sha` are optional and MUST be omitted from the emitted KDL
 > when `null`.
+> Declared self-mirror provenances have `origin "declared"` and no `ref` or
+> `commit_sha` (unknown until first fetch).
 
 > NOTE: `commit_sha` is the resolved SHA from the fetch receipt (`d.sha`), not
 > the manifest's declared ref. It may be `null` for deps that were not actually
@@ -513,6 +619,7 @@ Used for `tarball=...` deps.
 
 | Field | Required | Type | Semantics |
 |---|---|---|---|
+| `origin` | yes | `"observed"` or `"declared"` | fetch-verification status |
 | `kind` | yes | `"tarball"` | discriminator |
 | `url` | yes | string | archive download URL |
 | `sha256` | no | string | archive sha256 hex digest (TOFU receipt) |
@@ -527,6 +634,7 @@ Used for `local=...` deps (local filesystem path).
 
 | Field | Required | Type | Semantics |
 |---|---|---|---|
+| `origin` | yes | `"observed"` or `"declared"` | fetch-verification status |
 | `kind` | yes | `"local"` | discriminator |
 | `path` | yes | string | as-declared relative path from project root |
 
@@ -541,6 +649,7 @@ Used for workspace-internal member references (`member "name"` dep form).
 
 | Field | Required | Type | Semantics |
 |---|---|---|---|
+| `origin` | yes | `"observed"` or `"declared"` | fetch-verification status |
 | `kind` | yes | `"member"` | discriminator |
 | `name` | yes | string | workspace member name |
 
@@ -550,6 +659,7 @@ Used for OCI-artifact deps resolved via the tianguis index to an OCI registry.
 
 | Field | Required | Type | Semantics |
 |---|---|---|---|
+| `origin` | yes | `"observed"` or `"declared"` | fetch-verification status |
 | `kind` | yes | `"oci"` | discriminator |
 | `registry` | yes | string | OCI registry hostname |
 | `repository` | yes | string | repository path within the registry |
@@ -642,29 +752,130 @@ at the contract level; implementation detail is incidental.
 
 ### 6.2  Disk-vs-lockfile verification (`verify_lockfile_against_deps`)
 
-> NORMATIVE: The `milpa verify` command MUST check that every dep in the
-> lockfile is present on disk under `_deps/<name>/` and that its content hash
-> matches the lockfile's recorded `identity`. For each dep:
+> NORMATIVE: `milpa verify` MUST dispatch on the identity-bearing status of
+> each lockfile dep **before** applying any structural check. The single
+> normative definition of identity-bearing status is in
+> `spec/identity.md §4.1`; this section derives its dispatch rule from that
+> definition:
 >
-> - If `_deps/<name>/` is absent: report a divergence.
-> - If `_deps/<name>/` is not a directory: report a divergence.
-> - If the computed `content_hash(_deps/<name>/)` differs from the lockfile's
->   `identity`: report a divergence.
+> - **Non-identity-bearing provenance** (`kind = "local"` — the only
+>   non-identity-bearing kind): check liveness only — see §6.2.1 below. There is
+>   NO content hash comparison for `local` deps.
+> - **Identity-bearing provenance** (`git`, `tarball`, `oci`, `member`,
+>   `registry`): apply the four-state structural check and identity hash-compare
+>   described in §6.2.2 below. Note `member` is identity-bearing despite not being
+>   CAS-admissible — see `spec/identity.md §4.1` and §6.3 for its routing.
+
+#### 6.2.1  Non-identity-bearing dep liveness check
+
+> NORMATIVE: For a dep whose provenance kind is **not** identity-bearing
+> (`"local"` only), the only valid disk state is a **symlink at
+> `_deps/<name>`** whose target resolves to an existing directory (the live
+> source tree). The check proceeds as follows:
 >
-> Additionally, any directory under `_deps/` (excluding hidden entries starting
-> with `.`) that has no corresponding lockfile entry MUST be reported as an
-> extra dep.
+> **(a) pass:** `lstat` shows `_deps/<name>` is a symlink AND `stat` on its
+> target succeeds.  Report no divergence.  Do NOT compute or compare any
+> content hash — non-identity-bearing sources are editable live trees and a
+> hash at verify time would be meaningless.
+>
+> **(b) dangling symlink:** `lstat` shows a symlink but `stat` on the target
+> fails (source tree deleted or moved, or workspace member directory missing).
+> Report a "dangling" divergence.
+>
+> **(c) plain directory (not a symlink):** `lstat` shows `_deps/<name>` exists
+> but is NOT a symlink (e.g. a regular directory).  Report a divergence: "expected
+> symlink, found directory".  This state indicates the dep was overwritten
+> (e.g. by a git fetch or a manual copy) and the live-edit invariant is broken.
+>
+> **(d) genuinely missing:** `lstat` shows no entry at `_deps/<name>` at all.
+> Report a "missing from" divergence.
+
+#### 6.2.2  Identity-bearing dep four-state structural check
+
+> NORMATIVE: The `milpa verify` command MUST check that every identity-bearing dep
+> in the lockfile is present on disk under `_deps/<name>/` and that its content hash
+> matches the lockfile's recorded `identity`. For each such dep, the implementation
+> MUST distinguish four distinct states using `lstat` (does not follow symlinks)
+> and `stat` (follows symlinks):
+>
+> **(a) pass:** `_deps/<name>` is a symlink AND its target is reachable
+> (`stat` succeeds). For CAS-admissible deps (`git` / `tarball` / `oci`) the
+> target is a CAS store entry; for `member` deps the target is the workspace
+> member directory (see §6.3). Proceed to identity-hash check.
+>
+> **(b) dangling symlink:** `lstat` shows `_deps/<name>` is a symlink, but
+> `stat` on the target fails (CAS entry GC'd, store not mounted, or source
+> directory deleted). Report a distinct "dangling" divergence. Must NOT be
+> conflated with state (d).
+>
+> **(c) I/O error:** `_deps/<name>` is a symlink that resolves (`stat`
+> succeeds), but reading the target to compute the content hash raises an
+> I/O error (e.g. network mount offline, permission denied). Report a
+> divergence carrying the `CAS-STORE-IO-ERROR` slug. Distinct from
+> identity-mismatch (corrupt) and from dangling. (The slug name refers to
+> any target I/O error, not exclusively CAS I/O.)
+>
+> **(d) genuinely missing:** `lstat` shows no entry at `_deps/<name>` at all
+> (neither file, directory, nor symlink). Report a "missing from" divergence.
+>
+> For state (a) after a successful hash: if the computed `content_hash` differs
+> from the lockfile's recorded `identity`, report an identity-mismatch
+> divergence.
+>
+> Additionally, any entry under `_deps/` (excluding hidden entries starting with
+> `.` and any declared alias names — see §6.4) that has no corresponding
+> lockfile entry MUST be reported as an extra dep.
 
 > NORMATIVE: Divergences MUST be collected and returned as a list; verification
 > MUST NOT stop at the first mismatch. The caller decides whether to treat
 > divergences as a hard error.
 
+> NORMATIVE (D-verify-note): For identity-bearing deps, verification checks
+> **identity only** — the content hash of the bytes on disk against the `identity`
+> field in the lockfile. A conformant implementation MUST NOT inspect, compare, or
+> gate pass/fail on any provenance field (`kind`, `url`, `ref`, `commit_sha`,
+> `origin`, etc.) for the purpose of determining whether an identity-bearing dep
+> passes verification. Two deps whose on-disk bytes hash to the same identity are
+> interchangeable and MUST both pass, regardless of which provenance delivered
+> the bytes, what origin label the lockfile records (`observed` vs `declared`),
+> or what the provenance URL or commit history is. Provenance fields are
+> descriptive metadata — they identify *how the bytes were obtained*, not
+> *whether the bytes are correct*. The identity field is the sole correctness
+> criterion for identity-bearing deps. The sole non-identity-bearing dep kind
+> (`local`) has no `identity` field; liveness is its sole correctness
+> criterion. See `spec/identity.md §4.1` for the single normative definition of
+> which provenance kinds are identity-bearing (and how that axis differs from
+> CAS-admissibility — `member` is identity-bearing but not CAS-admissible).
+
 ### 6.3  Workspace-aware verification
 
-> NORMATIVE: In a workspace context, deps with `member` provenance route to the
-> workspace member's directory for identity verification (not to
-> `_deps/<name>/`). All other dep kinds route to `_deps/<name>/` in the
-> workspace root.
+> NORMATIVE: In a workspace context, a `member` dep is verified **via its
+> `_deps/<name>` symlink, which points at the workspace member directory** (not
+> at a CAS entry). `member` is identity-bearing (see `spec/identity.md §4.1`):
+> verification applies the four-state structural check plus identity hash-compare
+> of §6.2.2, and because `_deps/<name>` resolves to the member directory, the
+> hash is computed over that directory's contents. (`member` is not
+> CAS-admissible, so its symlink targets the editable member directory rather
+> than a CAS entry — the two axes are distinct.) Implementations MUST NOT special-
+> case the verify *path* for members — every dep, member or not, is checked at
+> `_deps/<name>` in the workspace root; what differs for `member` is only the
+> symlink *target* (member directory vs CAS entry).
+
+### 6.4  Alias verification
+
+> NORMATIVE: For each dep that carries an `aliases` list (§3.8), for every
+> alias name `a` in that list:
+>
+> - `_deps/<a>` MUST exist as a symlink pointing to the SAME store entry as
+>   the canonical `_deps/<name>` symlink. Equivalence is determined by
+>   resolving both symlinks to their real path (`realpath`/`canonicalize`) and
+>   comparing byte-for-byte.
+> - If `_deps/<a>` is absent, is a dangling symlink, or points to a different
+>   store entry than `_deps/<name>`: report a divergence carrying the slug
+>   `VERIFY-ALIAS-SYMLINK-MISSING`.
+>
+> Alias names declared in any dep's `aliases` list MUST NOT be reported as
+> "extra" entries in `_deps/` (the extra-dep scan MUST exclude them).
 
 ---
 
@@ -800,6 +1011,7 @@ dep "chronos" {
     src_dir "chronos"
     requires "results" "stew"
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/status-im/nim-chronos.git"
         ref "v3.2.0"
@@ -812,8 +1024,13 @@ dep "intonaco" {
     version "0.1.0"
     src_dir "src"
     requires "chronos"
-    self_mirrors (url)"https://mirror.example.com/intonaco.git"
     provenance {
+        origin "declared"
+        kind "git"
+        url "https://mirror.example.com/intonaco.git"
+    }
+    provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/coreyalph/intonaco.git"
         ref "main"
@@ -827,6 +1044,7 @@ dep "zlib" {
     src_dir ""
     requires
     provenance {
+        origin "observed"
         kind "tarball"
         url "https://example.com/zlib-1.3.tar.gz"
         sha256 "abcdef..."
