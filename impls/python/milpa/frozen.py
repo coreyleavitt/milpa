@@ -125,17 +125,26 @@ def _check_member_provenance_in_single_package(locked: LockedDep) -> None:
 
 
 def _reconstruct_from_locked(locked: LockedDep) -> ResolvedDep:
-    """Reconstruct a ResolvedDep from a LockedDep (frozen path reconstruction)."""
-    prov_record = locked.provenances[0] if locked.provenances else None
+    """Reconstruct a ResolvedDep from a LockedDep (frozen path reconstruction).
+
+    D-lifecycle: carry all provenances through (observed + declared mirrors).
+    The frozen path reads the lockfile's full tuple so D-frozen can later use
+    the plural model without a data-model change.
+    """
     return ResolvedDep(
         name=locked.name,
         identity=locked.identity,
         version=locked.version,
         src_dir=locked.src_dir,
         requires=locked.requires,
-        provenance=prov_record,
+        provenances=locked.provenances,
         active_flags=locked.active_flags,
-        self_mirrors=locked.self_mirrors,
+        dep_decl=locked.dep_decl,
+        # cond_requires intentionally empty: frozen path reconstructs from
+        # lockfile; cond_requires are lockfile annotations only — not needed
+        # for frozen graph reconstruction (mirrors Rust: Vec::new()).
+        cond_requires=(),
+        aliases=locked.aliases,
     )
 
 
@@ -252,17 +261,18 @@ def resolve_frozen(
             )
 
     # All preconditions passed — reconstruct the graph.
-    # Symlink CAS entries into deps_dir.
+    # B-nimcfg: use rebuild_deps_view (SSOT) to create canonical + alias symlinks
+    # and remove stale entries.  The old per-dep link() calls are replaced by the
+    # atomic rebuild (no partial/stale residue after this point).
     deps_dir.mkdir(parents=True, exist_ok=True)
     resolved: list[ResolvedDep] = []
     for locked in lockfile.deps:
-        if locked.identity is not None:
-            link_target = deps_dir / locked.name
-            if not link_target.exists():
-                env.store.link(locked.identity, link_target)
         resolved.append(_reconstruct_from_locked(locked))
 
-    return ResolvedGraph(deps=tuple(resolved))
+    graph = ResolvedGraph(deps=tuple(resolved))
+    from milpa.resolver import rebuild_deps_view
+    rebuild_deps_view(graph, deps_dir, env.store)
+    return graph
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +320,51 @@ def resolve_workspace_frozen(
             lockfile_strategy=lockfile.strategy,
             requested_strategy=_DEFAULT_STRATEGY,
         )
+
+    locked_by_name = {d.name: d for d in lockfile.deps}
+
+    # Conditions 2-4: per-member manifest alignment (mirrors Rust check_manifest_alignment).
+    # Each member manifest's deps are checked against the lockfile exactly as in the
+    # single-package path: condition 2 (dep not in lock), 3 (bad version), 4 (constraint).
+    for member in workspace.members:
+        all_member_deps = list(member.manifest.deps) + list(member.manifest.dev_deps)
+        for dep in all_member_deps:
+            # Condition 2: FROZEN-MANIFEST-DEP-NOT-IN-LOCK
+            if dep.name not in locked_by_name:
+                raise MilpaError(
+                    FROZEN_MANIFEST_DEP_NOT_IN_LOCK,
+                    f"member {member.manifest.name!r}: dep {dep.name!r} has no entry "
+                    f"in the lockfile; run 'milpa fetch' to regenerate the lockfile",
+                    name=dep.name,
+                )
+            locked = locked_by_name[dep.name]
+            # Condition 3: FROZEN-LOCKED-VERSION-UNPARSEABLE
+            parsed = parse_version(locked.version)
+            if parsed is None:
+                raise MilpaError(
+                    FROZEN_LOCKED_VERSION_UNPARSEABLE,
+                    f"dep {dep.name!r}: locked version {locked.version!r} is not "
+                    f"a valid semver string; re-run 'milpa fetch' to regenerate",
+                    name=dep.name,
+                    version=locked.version,
+                )
+            # Condition 4: FROZEN-CONSTRAINT-UNSATISFIED (named deps only)
+            if isinstance(dep, NamedDep):
+                vs = (
+                    dep.constraint_set
+                    if dep.constraint_set is not None
+                    else VersionSet.full()
+                )
+                if not vs.contains(parsed):
+                    raise MilpaError(
+                        FROZEN_CONSTRAINT_UNSATISFIED,
+                        f"dep {dep.name!r}: locked version {locked.version!r} does not "
+                        f"satisfy manifest constraint {dep.constraint!r}; "
+                        f"re-run 'milpa fetch' to regenerate the lockfile",
+                        name=dep.name,
+                        version=locked.version,
+                        constraint=dep.constraint,
+                    )
 
     members_by_name = {m.manifest.name: m for m in workspace.members}
 
@@ -359,16 +414,14 @@ def resolve_workspace_frozen(
                 )
 
     # All preconditions passed — reconstruct the graph.
+    # B-nimcfg: use rebuild_deps_view (SSOT) for atomic _deps/ rebuild
+    # (canonical + alias symlinks, stale removal).
     deps_dir.mkdir(parents=True, exist_ok=True)
     resolved: list[ResolvedDep] = []
     for locked in lockfile.deps:
-        is_member = any(
-            isinstance(p, MemberProvenanceRecord) for p in locked.provenances
-        )
-        if not is_member and locked.identity is not None:
-            link_target = deps_dir / locked.name
-            if not link_target.exists():
-                env.store.link(locked.identity, link_target)
         resolved.append(_reconstruct_from_locked(locked))
 
-    return ResolvedGraph(deps=tuple(resolved))
+    graph = ResolvedGraph(deps=tuple(resolved))
+    from milpa.resolver import rebuild_deps_view
+    rebuild_deps_view(graph, deps_dir, env.store)
+    return graph

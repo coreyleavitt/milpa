@@ -51,24 +51,28 @@ from milpa.errors import (
     LOCK_FILE_NOT_FOUND,
     LOCK_GRAPH_MISMATCH,
     MAN_ADD_DEP_EXISTS,
-    MAN_ADD_MIRROR_IDENTITY_MISMATCH,
     MAN_MIRROR_EDITABLE_PROVENANCE,
+    MAN_MUTATE_FILE_NOT_FOUND,
     MAN_REMOVE_DEP_ABSENT,
     MILPA_INTERNAL,
     TNG_DEPDECL_FETCH_FAILED,
     VERIFY_DEPS_DIR_MISSING,
     VERIFY_EDGE_MISMATCH,
     MilpaError,
+    STORE_AMBIGUOUS_PREFIX,
+    CAS_NOT_IN_STORE,
 )
 from milpa.fetchers import CasAdmittingFetcher, build_registry, mocked_registry
 from milpa.frozen import resolve_frozen, resolve_workspace_frozen
 from milpa.index_cache import load_default_index
 from milpa.lockfile import (
+    GitProvenanceRecord,
     LockedDep,
-    format_lockfile,
+    Lockfile,
     from_graph,
     load_lockfile,
     verify_lockfile_against_deps,
+    write_lockfile,
 )
 from milpa.nimcfg import format_nimcfg, format_workspace_nimcfgs
 from milpa.profile import Profile
@@ -225,6 +229,29 @@ def _make_parser() -> argparse.ArgumentParser:
         help="re-resolve and refresh the lockfile (10e, not yet implemented)",
     )
     sp_update.add_argument("dep_name", metavar="<dep>", nargs="?", default=None)
+
+    # store — read-only CAS inspection (C-store-ro slice, Phase C)
+    sp_store = subparsers.add_parser(
+        "store",
+        help="inspect the content-addressed store (read-only)",
+    )
+    store_sub = sp_store.add_subparsers(dest="store_command", metavar="<store-command>")
+    store_sub.add_parser(
+        "ls",
+        help="list all identities in the CAS store (lexicographic order)",
+    )
+    sp_store_path = store_sub.add_parser(
+        "path",
+        help="resolve an identity or prefix to its absolute store path",
+    )
+    sp_store_path.add_argument(
+        "identity_or_prefix",
+        metavar="<identity-or-prefix>",
+        help=(
+            "full identity (sha256:<64hex> or bare 64-hex) or a hex-digest prefix "
+            "(≥16 hex chars, with or without the 'sha256:' algorithm prefix)"
+        ),
+    )
 
     return parser
 
@@ -546,13 +573,12 @@ def cmd_fetch(
         _write_certificate(certificate_path, graph.cert)
 
     lockfile = from_graph(graph, strategy=str(strategy))
-    lock_text = format_lockfile(lockfile)
     nim_cfg_text = format_nimcfg(
         graph,
         deps_dir=_DEPS_RELATIVE,
         self_src_dir=self_src_dir,
     )
-    _atomic_write(lock_path, lock_text)
+    write_lockfile(lockfile, lock_path)
     _atomic_write(project_dir / "nim.cfg", nim_cfg_text)
     print(f"resolved {len(graph.deps)} deps", file=sys.stderr)
     return 0
@@ -637,10 +663,9 @@ def _cmd_fetch_workspace(
         _write_certificate(certificate_path, graph.cert)
 
     lockfile = from_graph(graph, strategy=str(strategy))
-    lock_text = format_lockfile(lockfile)
     per_member = format_workspace_nimcfgs(workspace, graph)
 
-    _atomic_write(lock_path, lock_text)
+    write_lockfile(lockfile, lock_path)
     for rel_path, nim_cfg_text in per_member.items():
         _atomic_write(ws_root / rel_path / "nim.cfg", nim_cfg_text)
 
@@ -714,7 +739,7 @@ def cmd_lock(
         _write_certificate(certificate_path, graph.cert)
 
     lockfile = from_graph(graph, strategy=str(strategy))
-    _atomic_write(lock_path, format_lockfile(lockfile))
+    write_lockfile(lockfile, lock_path)
     print(f"locked {len(graph.deps)} deps", file=sys.stderr)
     return 0
 
@@ -762,7 +787,7 @@ def _cmd_lock_workspace(
         _write_certificate(certificate_path, graph.cert)
 
     lockfile = from_graph(graph, strategy=str(strategy))
-    _atomic_write(lock_path, format_lockfile(lockfile))
+    write_lockfile(lockfile, lock_path)
     print(f"locked {len(graph.deps)} deps", file=sys.stderr)
     return 0
 
@@ -1162,6 +1187,46 @@ def _mocked_default_branch(mocked_dir: str, git_url: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# cmd_store_ls / cmd_store_path  (C-store-ro slice, Phase C)
+# ---------------------------------------------------------------------------
+
+
+def cmd_store_ls(store: "CAStore") -> int:
+    """``milpa store ls`` — list all identities in the CAS store, lex-sorted.
+
+    Prints one ``sha256:<64hex>`` per line to stdout.  Empty store → no output,
+    exit 0.  Never mutates the store.
+    """
+    for identity in store.list_identities():
+        print(identity)
+    return 0
+
+
+def cmd_store_path(store: "CAStore", identity_or_prefix: str) -> int:
+    """``milpa store path <identity-or-prefix>`` — resolve to an absolute path.
+
+    Prints the absolute canonical path to stdout (machine-readable, for
+    ``$(milpa store path ...)``).  On any error (not in store, ambiguous
+    prefix) prints to stderr and emits the slug, exit 1.
+
+    Resolution rules:
+    - Full identity (64-hex bare or ``sha256:<64hex>``) → exact lookup.
+    - Prefix (≥16 hex chars, with or without algorithm prefix) → unique-prefix
+      match across store entries.
+    - Prefix < 16 hex chars → ``STORE-AMBIGUOUS-PREFIX`` (too weak to be safe).
+    """
+    try:
+        identity = store.resolve_prefix(identity_or_prefix)
+    except MilpaError as exc:
+        print(f"milpa store path: {exc.message}", file=sys.stderr)
+        _emit_slug(exc.slug)
+        return 1
+
+    print(str(store.path_for(identity)))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # cmd_add (10e)
 # ---------------------------------------------------------------------------
 
@@ -1301,11 +1366,10 @@ def _cmd_add_git(
 
     graph = resolve(proposed_manifest, deps_dir, env_with_index, params)
     lockfile_val = from_graph(graph, strategy=str(strategy))
-    lock_text = format_lockfile(lockfile_val)
 
     # Atomic write: manifest first, then lock.
     mutate_manifest_file(manifest_path, lambda _m: proposed_manifest)
-    _atomic_write(lock_path, lock_text)
+    write_lockfile(lockfile_val, lock_path)
 
     print(f"added {dep_name} (git={git_url} ref={ref})", file=sys.stderr)
     return 0
@@ -1349,63 +1413,59 @@ def _cmd_add_mirror(
     strategy: Strategy,
     max_parallel: int,
 ) -> int:
-    """Implement ``milpa add <dep> --mirror <url>``."""
-    from milpa.manifest import LocalDep, Manifest, MemberDep, UrlDep
+    """Implement ``milpa add <dep> --mirror <url>``.
+
+    Pure manifest mutation — no fetch, no verify, no lockfile write.
+
+    The mirror is recorded as an author CLAIM (a "declared" mirror) in
+    ``milpa.kdl``.  It becomes a ``declared`` provenance in the lockfile on
+    the next ``milpa lock`` (the D-lifecycle slice) and is verified at USE
+    time (D-fallback).
+
+    spec/cli-contract.md §5.6 (amended for D-add).
+    """
+    from milpa.manifest import Manifest, UrlDep
     from milpa.manifest_writer import mutate_manifest_file
 
-    # Lock must exist.
-    if not lock_path.exists():
+    # Parse manifest — dep must be declared here (NOT in the lockfile).
+    try:
+        from milpa.manifest import parse_manifest
+        manifest_text = manifest_path.read_text(encoding="utf-8")
+        manifest = parse_manifest(manifest_text)
+    except FileNotFoundError:
         print(
-            f"milpa add --mirror: no lockfile at {lock_path} — run `milpa fetch` first",
+            f"milpa add --mirror: manifest not found at {manifest_path}",
             file=sys.stderr,
         )
-        _emit_slug(LOCK_FILE_NOT_FOUND)
+        _emit_slug(MAN_MUTATE_FILE_NOT_FOUND)
         return 1
-
-    lockfile_val = load_lockfile(lock_path)
-
-    # Dep must be in lockfile.
-    locked_dep = next((d for d in lockfile_val.deps if d.name == dep_name), None)
-    if locked_dep is None:
-        print(
-            f"milpa add --mirror: {dep_name!r} not found in lockfile",
-            file=sys.stderr,
-        )
-        _emit_slug(MAN_ADD_MIRROR_IDENTITY_MISMATCH)
-        return 1
-
-    # Parse manifest to validate the dep form.
-    from milpa.manifest import parse_manifest
-    manifest_text = manifest_path.read_text(encoding="utf-8")
-    manifest = parse_manifest(manifest_text)
 
     dep_in_manifest = next((d for d in manifest.deps if d.name == dep_name), None)
 
-    # Reject non-URL deps (local / member provenance — not mirrorable).
-    if dep_in_manifest is not None and isinstance(dep_in_manifest, (LocalDep, MemberDep)):
+    # Reject: dep not declared in milpa.kdl.
+    if dep_in_manifest is None:
         print(
-            f"milpa add --mirror: {dep_name!r} has local/member provenance — "
-            "cannot add a mirror to an editable source dep",
+            f"milpa add --mirror: dep {dep_name!r} not declared in milpa.kdl",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Reject non-URL deps (local / member / named / tarball — not mirrorable).
+    if not isinstance(dep_in_manifest, UrlDep):
+        print(
+            f"milpa add --mirror: {dep_name!r} is not a git URL dep — "
+            "only URL deps (git=...) can carry mirrors",
             file=sys.stderr,
         )
         _emit_slug(MAN_MIRROR_EDITABLE_PROVENANCE)
         return 1
 
-    # Fetch mirror and verify identity.
-    # (Full identity verification requires fetching the mirror URL — deferred to
-    # a future slice; for the conformance fixtures the dep is a UrlDep so we
-    # proceed to the identity check via the resolver.)
-    locked_identity = locked_dep.identity
-    if locked_identity is None:
-        print(
-            f"milpa add --mirror: {dep_name!r} has no locked identity — "
-            "run `milpa fetch` first",
-            file=sys.stderr,
-        )
-        _emit_slug(MAN_ADD_MIRROR_IDENTITY_MISMATCH)
-        return 1
+    # Idempotent: URL already a mirror → exit 0 without rewriting.
+    if mirror_url in dep_in_manifest.mirrors:
+        print(f"added mirror {mirror_url} for {dep_name}", file=sys.stderr)
+        return 0
 
-    # Add mirror to the dep in the manifest.
+    # Append mirror to the dep in milpa.kdl — NO fetch, NO lockfile write.
     def _add_mirror_to_dep(m: Manifest) -> Manifest:
         from dataclasses import replace as _r
         new_deps = tuple(
@@ -1417,28 +1477,34 @@ def _cmd_add_mirror(
         )
         return _r(m, deps=new_deps)
 
-    # Re-resolve over proposed manifest.
-    proposed_manifest = _add_mirror_to_dep(manifest)
-    env_with_index = _load_index_for_verb(env)
-    deps_dir = project_dir / "_deps"
-    profile = Profile.from_environment()
-    params = ResolveParams(
-        strategy=strategy,
-        max_parallel=max_parallel,
-        profile=profile,
-        prior=lockfile_val,
-        manifest_dir=project_dir,
-    )
-
-    graph = resolve(proposed_manifest, deps_dir, env_with_index, params)
-    new_lockfile_val = from_graph(graph, strategy=str(strategy))
-    lock_text = format_lockfile(new_lockfile_val)
-
     mutate_manifest_file(manifest_path, _add_mirror_to_dep)
-    _atomic_write(lock_path, lock_text)
 
     print(f"added mirror {mirror_url} for {dep_name}", file=sys.stderr)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Alias→canonical resolution (D-update-remove, Phase D item 5)
+# ---------------------------------------------------------------------------
+
+
+def resolve_alias_to_canonical(name: str, lockfile: Lockfile) -> str:
+    """Return the canonical dep name for ``name``.
+
+    If ``name`` is already a canonical lockfile dep name, return it unchanged.
+    If ``name`` matches a dep's ``aliases`` entry, return that dep's canonical
+    name.  If ``name`` is not found as either, return ``name`` unchanged (the
+    caller's guard will handle the not-found case).
+
+    SSOT: used by both cmd_update and cmd_remove so alias→canonical logic
+    lives in exactly one place per the SSOT principle.
+    """
+    for dep in lockfile.deps:
+        if dep.name == name:
+            return name
+        if name in dep.aliases:
+            return dep.name
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -1467,9 +1533,18 @@ def cmd_remove(
     manifest_text = manifest_path.read_text(encoding="utf-8")
     manifest = parse_manifest(manifest_text)
 
-    # Guard: dep must be declared in milpa.kdl.
+    # D-update-remove: alias→canonical resolution (Phase D item 5).
+    # If dep_name is an alias of a canonical lockfile dep, resolve to the
+    # canonical manifest name so the guard and manifest mutation operate correctly.
+    prior_for_alias = _maybe_load_prior_lockfile(lock_path)
+    if prior_for_alias is not None:
+        canonical_name = resolve_alias_to_canonical(dep_name, prior_for_alias)
+    else:
+        canonical_name = dep_name
+
+    # Guard: dep must be declared in milpa.kdl (using canonical name).
     existing_names = {dep.name for dep in manifest.deps}
-    if dep_name not in existing_names:
+    if canonical_name not in existing_names:
         print(
             f"milpa remove: dep {dep_name!r} is not declared in milpa.kdl",
             file=sys.stderr,
@@ -1477,33 +1552,61 @@ def cmd_remove(
         _emit_slug(MAN_REMOVE_DEP_ABSENT)
         return 1
 
+    # Collect prior aliases for the dep being removed, so we can warn if any
+    # alias is still required by transitives after re-resolve.
+    prior_aliases: tuple[str, ...] = ()
+    if prior_for_alias is not None:
+        for locked in prior_for_alias.deps:
+            if locked.name == canonical_name:
+                prior_aliases = locked.aliases
+                break
+
     # Build proposed manifest without the dep.
     from dataclasses import replace as _replace
-    new_deps = tuple(d for d in manifest.deps if d.name != dep_name)
+    new_deps = tuple(d for d in manifest.deps if d.name != canonical_name)
     proposed_manifest = _replace(manifest, deps=new_deps)
 
     # Re-resolve.
     env_with_index = _load_index_for_verb(env)
     deps_dir = project_dir / "_deps"
     profile = Profile.from_environment()
-    prior = _maybe_load_prior_lockfile(lock_path)
     params = ResolveParams(
         strategy=strategy,
         max_parallel=max_parallel,
         profile=profile,
-        prior=prior,  # type: ignore[arg-type]
+        prior=prior_for_alias,  # type: ignore[arg-type]
         manifest_dir=project_dir,
     )
 
     graph = resolve(proposed_manifest, deps_dir, env_with_index, params)
     lockfile_val = from_graph(graph, strategy=str(strategy))
-    lock_text = format_lockfile(lockfile_val)
+
+    # D-update-remove Phase D item 5: warn per alias (Phase D item 5).
+    # If the removed canonical had aliases in the prior lockfile, warn about
+    # each one so the user knows that _deps/<alias> will be cleaned up.
+    # This also covers the "alias still required by a transitive" case: if the
+    # new graph still contains the canonical (pulled in transitively via another
+    # dep), the alias symlink remains live and the warning is especially important.
+    new_canonical_names = {d.name for d in graph.deps}
+    for alias in prior_aliases:
+        if canonical_name in new_canonical_names:
+            print(
+                f"warning: alias {alias!r} of removed dep {canonical_name!r} "
+                f"is still required transitively; _deps/{alias} remains live",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"warning: removing dep {canonical_name!r} also removes alias "
+                f"{alias!r} (_deps/{alias} will be cleaned up)",
+                file=sys.stderr,
+            )
 
     # Atomic write.
     mutate_manifest_file(manifest_path, lambda _m: proposed_manifest)
-    _atomic_write(lock_path, lock_text)
+    write_lockfile(lockfile_val, lock_path)
 
-    print(f"removed {dep_name}", file=sys.stderr)
+    print(f"removed {canonical_name}", file=sys.stderr)
     return 0
 
 
@@ -1542,7 +1645,7 @@ def cmd_update(
         )
         graph = resolve(manifest, deps_dir, env_with_index, params)
         lockfile_val = from_graph(graph, strategy=str(strategy))
-        _atomic_write(lock_path, format_lockfile(lockfile_val))
+        write_lockfile(lockfile_val, lock_path)
         print("updated all deps", file=sys.stderr)
         return 0
 
@@ -1557,8 +1660,12 @@ def cmd_update(
 
     prior_lock = load_lockfile(lock_path)
 
-    # Guard: dep must be in the lockfile.
-    if not any(d.name == dep_name for d in prior_lock.deps):
+    # D-update-remove: alias→canonical resolution (Phase D item 5).
+    # If dep_name matches an alias in the lockfile, operate on the canonical dep.
+    canonical_name = resolve_alias_to_canonical(dep_name, prior_lock)
+
+    # Guard: dep (or its canonical) must be in the lockfile.
+    if not any(d.name == canonical_name for d in prior_lock.deps):
         print(
             f"milpa update: {dep_name!r} not found in lockfile",
             file=sys.stderr,
@@ -1566,9 +1673,29 @@ def cmd_update(
         _emit_slug(LOCK_DEP_NOT_FOUND)
         return 1
 
-    # Build a filtered prior: keep all deps EXCEPT the one being updated.
+    # Build a filtered prior: keep all deps EXCEPT the canonical being updated,
+    # then add back a "pin-stripped" entry for it that retains its declared
+    # mirror provenances (Phase D item 5: explicit provenance preservation).
+    # Stripping identity=None means _git_pin_for_url_dep returns None (no pin),
+    # so the dep re-resolves fresh. The declared provenances survive so
+    # _prior_declared_mirror_urls can carry them forward. URLs that are no
+    # longer in milpa.kdl mirrors are naturally dropped by the D-lifecycle
+    # dedup logic (only manifest_mirror_urls + primary make it into declared).
     from dataclasses import replace as _replace
-    filtered_deps = tuple(d for d in prior_lock.deps if d.name != dep_name)
+    updated_locked = next(d for d in prior_lock.deps if d.name == canonical_name)
+    # Keep only declared provenance records (drop observed — those carry the commit pin).
+    declared_provenances = tuple(
+        p for p in updated_locked.provenances
+        if isinstance(p, GitProvenanceRecord) and p.origin == "declared"
+    )
+    pin_stripped = _replace(
+        updated_locked,
+        identity=None,
+        provenances=declared_provenances,
+    )
+    filtered_deps = tuple(
+        d for d in prior_lock.deps if d.name != canonical_name
+    ) + (pin_stripped,)
     filtered_prior = _replace(prior_lock, deps=filtered_deps)
 
     params = ResolveParams(
@@ -1581,7 +1708,7 @@ def cmd_update(
 
     graph = resolve(manifest, deps_dir, env_with_index, params)
     lockfile_val = from_graph(graph, strategy=str(strategy))
-    _atomic_write(lock_path, format_lockfile(lockfile_val))
+    write_lockfile(lockfile_val, lock_path)
     print(f"updated {dep_name}", file=sys.stderr)
     return 0
 
@@ -1703,6 +1830,18 @@ def main(argv: list[str] | None = None) -> int:
                 strategy=strategy,
                 max_parallel=args.parallel,
             )
+        elif args.command == "store":
+            store_cmd = getattr(args, "store_command", None)
+            if store_cmd == "ls":
+                return cmd_store_ls(env.store)
+            elif store_cmd == "path":
+                return cmd_store_path(env.store, args.identity_or_prefix)
+            else:
+                # No sub-command → print store help, exit 0.
+                # (argparse doesn't expose the subparser directly from args,
+                # so we re-parse to trigger help.)
+                print("usage: milpa store <ls|path> [args]", file=sys.stderr)
+                return 2
         else:
             # Should not happen — argparse validates the command.
             print(f"milpa: unknown command {args.command!r}", file=sys.stderr)

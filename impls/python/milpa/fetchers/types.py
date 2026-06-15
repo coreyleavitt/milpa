@@ -47,7 +47,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
 from milpa.errors import FETCH_ALL_FAILED, FETCH_RECEIPT_EMPTY, MilpaError
 from milpa.identity import compute_content_hash
@@ -171,12 +171,18 @@ class FetchResult:
     registry from the materialized tree at ``dest``; the fetcher never
     sees or influences it — plugin-contract.md §3.3 NORMATIVE).
 
+    For CAS-admissible provenances (git, tarball, oci) ``identity`` is a
+    ``sha256:<hex>`` string.  For non-admissible (local/member) provenances
+    ``identity`` is ``None`` — local trees are live and editable; hashing them
+    at fetch time would produce a snapshot that is immediately stale
+    (lockfile-schema.md §4.3 NORMATIVE: local records carry no identity field).
+
     ``receipt`` is the transport-specific record the fetcher returned.
     """
 
     name: str
     path: Path
-    identity: str          # sha256:<hex> — computed by registry, never by fetcher
+    identity: str | None    # sha256:<hex> for CAS deps; None for local/member
     receipt: ProvenanceReceipt
 
 
@@ -331,7 +337,15 @@ class FetcherRegistry:
         fetcher = self._select(provenance)
         receipt = fetcher.fetch(name, provenance, dest=dest)
         self._validate_receipt(name, receipt)
-        identity = compute_content_hash(dest)
+        # Local (non-admissible) provenances carry no identity: they are live,
+        # editable source trees. Hashing them at fetch time would produce a
+        # snapshot that is immediately stale and meaningless as a pinning anchor.
+        # The lockfile §4.3 NORMATIVE: local records have no identity field.
+        # CAS-admissible provenances (git, tarball, oci) always get a hash.
+        if provenance.cas_admissible:
+            identity: str | None = compute_content_hash(dest)
+        else:
+            identity = None
         return FetchResult(name=name, path=dest, identity=identity, receipt=receipt)
 
     def fetch_any(
@@ -348,7 +362,7 @@ class FetcherRegistry:
         supplies the three-part ordered candidate list already flattened:
           1. Primary provenance (from the manifest dep block)
           2. Dep-block mirrors (``mirror`` entries from the dep block)
-          3. Prior-lockfile self-mirrors (``self_mirrors`` from the prior lock)
+          3. Prior-lockfile declared mirror provenances (origin="declared" from the prior lock)
 
         When ``expected_identity`` is set, each candidate's materialized tree
         MUST hash to it.  A candidate producing different bytes is skipped
@@ -366,53 +380,7 @@ class FetcherRegistry:
         The "no candidates provided" path is a programmer-invariant (call-site
         bug; not user-reachable) — raises uncoded ``FetchError`` (§5.1).
         """
-        if not candidates:
-            # Programmer-invariant: callers must supply at least one candidate.
-            raise FetchError(
-                f"fetch_any({name!r}): no candidates provided",
-                code=None,
-            )
-
-        failures: list[str] = []
-        for i, p in enumerate(candidates):
-            # Clean dest before each candidate (except the first — it arrives clean).
-            if i > 0:
-                _clear_dest(dest)
-            try:
-                result = self.fetch(name, p, dest=dest)
-            except (MilpaError, FetchError, Exception) as exc:
-                failures.append(f"{type(p).__name__}: {exc}")
-                continue
-
-            if expected_identity is not None and result.identity != expected_identity:
-                failures.append(
-                    f"{type(p).__name__}: identity mismatch "
-                    f"(expected {expected_identity[:23]}..., "
-                    f"got {result.identity[:23]}...)"
-                )
-                # Warn loudly: a primary delivering substituted content is a
-                # supply-chain signal; falling through to a mirror silently would
-                # mask it.  Log to stderr, drop the result, try next candidate.
-                print(
-                    f"warning: {name}: provenance {type(p).__name__} returned "
-                    f"bytes that do not match the expected identity "
-                    f"(expected {expected_identity[:23]}..., "
-                    f"got {result.identity[:23]}...); "
-                    f"discarding and trying the next candidate",
-                    file=sys.stderr,
-                )
-                continue
-
-            return result
-
-        raise MilpaError(
-            FETCH_ALL_FAILED,
-            f"fetch_any({name!r}): all {len(candidates)} candidates failed:\n  "
-            + "\n  ".join(failures),
-            dep=name,
-            candidate_count=len(candidates),
-            failures=failures,
-        )
+        return _fetch_any(name, candidates, dest=dest, expected_identity=expected_identity, fetch_one=self.fetch)
 
 
 # ---------------------------------------------------------------------------
@@ -441,9 +409,140 @@ class FetchError(Exception):
 
 
 def _clear_dest(dest: Path) -> None:
-    """Remove and recreate ``dest/`` so the next candidate sees a clean directory."""
+    """Remove and recreate ``dest/`` so the next candidate sees a clean directory.
+
+    Symlink safety: if ``dest`` is a symlink (e.g. a prior CAS symlink or a
+    local-path link), only the symlink itself is removed — never the target
+    directory.  ``dest.exists()`` follows symlinks, so using ``rmtree`` on a
+    symlink-to-dir would destroy the user's source tree.  We guard with
+    ``dest.is_symlink()`` first (lstat semantics, does NOT follow).
+    """
     import shutil
 
-    if dest.exists():
-        shutil.rmtree(dest, ignore_errors=True)
+    if dest.is_symlink():
+        dest.unlink()
+    elif dest.exists():
+        # Do NOT ignore errors: a failed rmtree leaves stale content that the
+        # next candidate would write on top of — silent corruption.  Propagate
+        # so the caller can surface it.  Matches Rust clear_dest behaviour.
+        shutil.rmtree(dest)
     dest.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# FetchOneProtocol — typed seam for the fetch_one callable
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class FetchOneProtocol(Protocol):
+    """Protocol for the ``fetch_one`` callable accepted by ``_fetch_any``.
+
+    Captures the exact argument shape of ``FetcherRegistry.fetch`` (and
+    ``CasAdmittingFetcher.fetch``): ``(name, provenance, *, dest) -> FetchResult``.
+
+    Using a typed Protocol instead of ``Callable[..., FetchResult]`` makes the
+    seam explicit — a caller passing a wrong callable is caught at static
+    analysis time rather than at CAS-corruption time.
+    """
+
+    def __call__(
+        self,
+        name: str,
+        provenance: Provenance,
+        *,
+        dest: Path,
+    ) -> FetchResult: ...
+
+
+# ---------------------------------------------------------------------------
+# _fetch_any — shared candidate-loop (single source of truth)
+# ---------------------------------------------------------------------------
+
+def _fetch_any(
+    name: str,
+    candidates: Sequence[Provenance],
+    *,
+    dest: Path,
+    expected_identity: str | None = None,
+    fetch_one: FetchOneProtocol,
+) -> FetchResult:
+    """Ordered-candidate loop shared by ``FetcherRegistry`` and ``CasAdmittingFetcher``.
+
+    SSOT for the mirror-fallback algorithm (resolver-semantics.md §8a).
+    Both callers pass their own ``fetch_one`` callable (``registry.fetch`` or
+    ``cas_admitting_fetcher.fetch``); the loop body is identical for both.
+
+    Parameters
+    ----------
+    name:
+        Dependency name (used in error messages).
+    candidates:
+        Non-empty ordered list of provenances to try.  Programmer-invariant:
+        callers MUST supply at least one candidate.
+    dest:
+        Target path.  Must be clean on entry; cleared between candidates
+        by this function via ``_clear_dest``.
+    expected_identity:
+        When set, each successful fetch is compared against this hash.
+        A mismatch is treated as a failure (warning to stderr; try next).
+        ``None`` disables the identity gate.
+    fetch_one:
+        Callable with signature ``(name, provenance, dest) -> FetchResult``.
+        Receives the same ``name`` and ``dest`` on each iteration; the
+        provenance cycles through ``candidates``.
+
+    Raises
+    ------
+    FetchError (code=None):
+        ``candidates`` is empty — programmer-invariant, no catalog slug.
+    MilpaError(FETCH_ALL_FAILED):
+        Every candidate failed (network error or identity mismatch).
+    """
+    if not candidates:
+        raise FetchError(
+            f"fetch_any({name!r}): no candidates provided",
+            code=None,
+        )
+
+    failures: list[str] = []
+    for i, p in enumerate(candidates):
+        # Clean dest before each candidate (except the first — arrives clean).
+        if i > 0:
+            _clear_dest(dest)
+        try:
+            result = fetch_one(name, p, dest=dest)
+        except (MilpaError, FetchError, Exception) as exc:
+            failures.append(f"{type(p).__name__}: {exc}")
+            continue
+
+        if expected_identity is not None and result.identity != expected_identity:
+            got_prefix = (result.identity or "<none>")[:23]
+            failures.append(
+                f"{type(p).__name__}: identity mismatch "
+                f"(expected {expected_identity[:23]}..., "
+                f"got {got_prefix}...)"
+            )
+            # Warn loudly: a primary delivering substituted content is a
+            # supply-chain signal; falling through to a mirror silently would
+            # mask it.  Log to stderr, drop the result, try next candidate.
+            print(
+                f"warning: {name}: provenance {type(p).__name__} returned "
+                f"bytes that do not match the expected identity "
+                f"(expected {expected_identity[:23]}..., "
+                f"got {got_prefix}...); "
+                f"discarding and trying the next candidate",
+                file=sys.stderr,
+            )
+            continue
+
+        return result
+
+    raise MilpaError(
+        FETCH_ALL_FAILED,
+        f"fetch_any({name!r}): all {len(candidates)} candidates failed:\n  "
+        + "\n  ".join(failures),
+        dep=name,
+        candidate_count=len(candidates),
+        failures=failures,
+    )

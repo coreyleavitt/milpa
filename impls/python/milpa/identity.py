@@ -10,8 +10,7 @@ Canonical byte stream (identity.md §1.2):
         <relpath-bytes> 0x00 <mode-marker> 0x00 <content-bytes> 0x00
     Entries sorted by raw UTF-8 byte-order of their relpath (§1.3).
     mode-marker is a single byte:
-        0x00 — regular file, non-executable (owner-execute bit NOT set)
-        0x01 — regular file, executable (owner-execute bit set, S_IXUSR)
+        0x00 — regular file (Resolved Decision 1: exec bit excluded from identity)
         0x80 — symbolic link (content-bytes = link-target UTF-8)
     Empty directories contribute no bytes (§1.2).
 
@@ -29,7 +28,6 @@ parse_identity five ordered checks (identity.md §2.2):
 from __future__ import annotations
 
 import os
-import stat
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -38,6 +36,7 @@ from typing import Any
 from milpa.errors import (
     ID_NO_ALGORITHM_PREFIX,
     ID_NON_HEX_DIGEST,
+    ID_NON_UTF8_RELPATH,
     ID_NON_UTF8_SYMLINK_TARGET,
     ID_NOT_A_STRING,
     ID_UNSUPPORTED_ALGORITHM,
@@ -58,11 +57,10 @@ SUPPORTED_ALGORITHMS: frozenset[str] = frozenset({"sha256"})
 _DIGEST_HEX_LEN: dict[str, int] = {"sha256": 64}
 
 # ---------------------------------------------------------------------------
-# Mode markers (identity.md §1.2 / §1.7)
+# Mode markers (identity.md §1.2)
 # ---------------------------------------------------------------------------
 
-_MODE_REGULAR: bytes = b"\x00"
-_MODE_EXECUTABLE: bytes = b"\x01"
+_MODE_REGULAR: bytes = b"\x00"   # regular file — exec bit excluded (Resolved Decision 1)
 _MODE_SYMLINK: bytes = b"\x80"
 
 
@@ -180,7 +178,7 @@ class _Entry:
     """One file/symlink tree entry destined for the hash accumulator."""
 
     relpath: str     # POSIX relative path from tree root, UTF-8
-    mode_marker: bytes  # one of _MODE_REGULAR / _MODE_EXECUTABLE / _MODE_SYMLINK
+    mode_marker: bytes  # one of _MODE_REGULAR / _MODE_SYMLINK
     content: bytes   # file bytes, or symlink-target UTF-8 bytes
 
 
@@ -204,6 +202,23 @@ def _enumerate_entries(root: Path) -> list[_Entry]:
         if ".git" in p.parts:
             continue
 
+        # §1.3 / spec/errors.md ID-NON-UTF8-RELPATH: the relpath is encoded
+        # as UTF-8 in the canonical byte stream.  On POSIX, filenames are raw
+        # byte sequences; Python surrogate-escapes non-UTF-8 bytes in the str
+        # representation.  Pre-check that the relpath encodes cleanly; raise a
+        # coded MilpaError instead of letting UnicodeEncodeError escape from
+        # compute_content_hash (mirrors the ID-NON-UTF8-SYMLINK-TARGET pattern).
+        relpath_str = p.relative_to(root).as_posix()
+        try:
+            relpath_str.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise MilpaError(
+                ID_NON_UTF8_RELPATH,
+                f"file path {relpath_str!r} is not valid UTF-8 "
+                f"— cannot compute a content hash",
+                relpath=relpath_str,
+            ) from exc
+
         if p.is_symlink():
             # §1.5: hash the link-target string as UTF-8; do not follow.
             raw_target = os.readlink(p)
@@ -216,27 +231,24 @@ def _enumerate_entries(root: Path) -> list[_Entry]:
                 # Normative surface rule 12).
                 raise MilpaError(
                     ID_NON_UTF8_SYMLINK_TARGET,
-                    f"symlink target at "
-                    f"{p.relative_to(root).as_posix()!r} is not valid UTF-8 "
+                    f"symlink target at {relpath_str!r} is not valid UTF-8 "
                     f"— cannot compute a content hash",
-                    relpath=p.relative_to(root).as_posix(),
+                    relpath=relpath_str,
                 ) from exc
             entries.append(
                 _Entry(
-                    relpath=p.relative_to(root).as_posix(),
+                    relpath=relpath_str,
                     mode_marker=_MODE_SYMLINK,
                     content=content,
                 )
             )
         elif p.is_file():
-            # §1.7: only the owner-execute bit (S_IXUSR) selects the
-            # executable marker; all other permission bits are ignored.
-            mode = p.stat().st_mode
-            marker = _MODE_EXECUTABLE if (mode & stat.S_IXUSR) else _MODE_REGULAR
+            # Resolved Decision 1: exec bit is NOT part of identity.
+            # Regular files always use _MODE_REGULAR (0x00).
             entries.append(
                 _Entry(
-                    relpath=p.relative_to(root).as_posix(),
-                    mode_marker=marker,
+                    relpath=relpath_str,
+                    mode_marker=_MODE_REGULAR,
                     content=p.read_bytes(),  # §1.6: raw bytes, no line-ending normalisation
                 )
             )

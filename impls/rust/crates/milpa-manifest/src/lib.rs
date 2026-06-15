@@ -242,8 +242,8 @@ impl ManifestError {
     /// `code()`, read by the conformance subset/bijection check). Every entry
     /// MUST be a real slug in `spec/errors.md`. The file-I/O, mutation,
     /// and `.nimble`-IO codes (`MAN-FILE-*`, `MAN-NO-MANIFEST`,
-    /// `MAN-NIMBLE-AMBIGUOUS`, `MAN-MUTATE-*`, `MAN-ADD-MIRROR-*`) are NOT
-    /// listed: they are raised by the CLI discovery / mutation layers (S13),
+    /// `MAN-NIMBLE-AMBIGUOUS`, `MAN-MUTATE-*`, `MAN-MIRROR-EDITABLE-PROVENANCE`) are NOT
+    /// listed: they are raised by the CLI discovery / mutation layers (S13/D-add),
     /// not by the pure-text parser, and are unit-test-only (not
     /// fixture-expressible).
     pub fn all_codes() -> &'static [&'static str] {
@@ -282,10 +282,8 @@ const MAN_CODES: &[&str] = &[
     "MAN-ADD-DEP-EXISTS",
     // `milpa remove` absent-dep guard (CLI cmd_remove) — Gap-1/S1c.
     "MAN-REMOVE-DEP-ABSENT",
-    // `milpa add --mirror` editable-provenance guard (CLI cmd_add) — S14/CLI.
+    // `milpa add --mirror` editable-provenance guard (CLI cmd_add) — D-add.
     "MAN-MIRROR-EDITABLE-PROVENANCE",
-    // `milpa add --mirror` identity gate (milpa-core `add_mirror`) — S14/CLI.
-    "MAN-ADD-MIRROR-IDENTITY-MISMATCH",
     "MAN-URL-ARG-TYPE",
     "MAN-UNKNOWN-TOP-LEVEL",
     "MAN-NAME-MISSING",

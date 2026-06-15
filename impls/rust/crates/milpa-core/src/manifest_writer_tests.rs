@@ -79,101 +79,114 @@ fn add_dep_rewrites_canonically_and_reports_comment_loss() {
     }
 }
 
-/// Make a throwaway git repo at `dir` containing `files` (name→bytes); return
-/// HEAD sha. `-c user.*` is safe here (disposable fixture, not the milpa repo).
-fn make_repo(dir: &std::path::Path, files: &[(&str, &[u8])]) -> Option<String> {
-    std::fs::create_dir_all(dir).ok()?;
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["init", "-q", "-b", "main"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    for (name, data) in files {
-        std::fs::write(dir.join(name), data).ok()?;
-    }
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
-            .args(args)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-    };
-    git(&["add", "."])?;
-    git(&["commit", "-q", "-m", "c"])?;
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
+// ---------------------------------------------------------------------------
+// add_mirror (D-add slice) — pure manifest mutation, no fetch/verify/lockfile
+// ---------------------------------------------------------------------------
 
-/// Build a project (milpa.kdl with a url dep + a milpa.lock pinning its identity
-/// to `identity`) so `add_mirror` has something to validate against.
-fn project_with_dep(dir: &std::path::Path, canonical_url: &str, identity: &str) {
+const CANON_URL: &str = "https://example.com/foo.git";
+const MIRROR_URL: &str = "https://mirror.example.com/foo.git";
+
+/// Write a minimal milpa.kdl with a URL dep named `dep_name`.
+fn write_url_dep_manifest(dir: &std::path::Path, dep_name: &str, git_url: &str) {
     std::fs::write(
         dir.join("milpa.kdl"),
         format!(
-            "name \"app\"\nkind \"application\"\ndeps {{\n    foo git=(url)\"{canonical_url}\" ref=\"main\"\n}}\n"
-        ),
-    )
-    .unwrap();
-    std::fs::write(
-        dir.join("milpa.lock"),
-        format!(
-            "version 1\nstrategy \"maxver\"\ndep \"foo\" {{\n    identity \"{identity}\"\n    version \"0.0.1\"\n    \
-             provenance {{\n        kind \"git\"\n        url \"{canonical_url}\"\n        ref \"main\"\n    }}\n}}\n"
+            "name \"app\"\nkind \"application\"\ndeps {{\n    {dep_name} git=(url)\"{git_url}\" ref=\"main\"\n}}\n"
         ),
     )
     .unwrap();
 }
 
-// The manifest's *canonical* URL only needs to parse (a valid scheme); add_mirror
-// fetches the MIRROR URL, where a `file://` local repo is fine for git clone.
-const CANON_URL: &str = "https://example.com/foo.git";
-
 #[test]
-fn add_mirror_accepts_identical_content_and_records_it() {
+fn add_mirror_appends_to_kdl_no_lockfile_needed() {
+    // D-add: pure manifest mutation — no milpa.lock required.
     let d = tmp();
-    let mirror = d.path().join("mirror");
-    if make_repo(&mirror, &[("foo.nim", b"echo 1")]).is_none() {
-        eprintln!("skipping: git unavailable");
-        return;
-    }
-    // Lock the dep at the mirror's own content hash → the fetch must match.
-    let identity = crate::compute_content_hash(&mirror).unwrap();
-    let proj = d.path().join("proj");
-    std::fs::create_dir_all(&proj).unwrap();
-    project_with_dep(&proj, CANON_URL, &identity);
+    let proj = d.path();
+    write_url_dep_manifest(proj, "foo", CANON_URL);
+    // No milpa.lock written.
 
-    let mirror_url = format!("file://{}", mirror.display());
-    add_mirror(&proj, "foo", &mirror_url).unwrap();
+    add_mirror(proj, "foo", MIRROR_URL).unwrap();
+
     let written = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
-    assert!(written.contains(&format!("mirror (url)\"{mirror_url}\"")));
+    assert!(written.contains(&format!("mirror (url)\"{MIRROR_URL}\"")));
+    // milpa.lock must NOT exist.
+    assert!(!proj.join("milpa.lock").exists());
 }
 
 #[test]
-fn add_mirror_rejects_divergent_content() {
+fn add_mirror_round_trip_parser() {
+    // Written milpa.kdl re-parses with the mirror present on the dep.
     let d = tmp();
-    let mirror = d.path().join("mirror");
-    if make_repo(&mirror, &[("foo.nim", b"echo 1")]).is_none() {
-        eprintln!("skipping: git unavailable");
-        return;
-    }
-    // Lock the dep at a DIFFERENT identity → the mirror's content won't match.
-    let bogus = format!("sha256:{}", "0".repeat(64));
-    let proj = d.path().join("proj");
-    std::fs::create_dir_all(&proj).unwrap();
-    project_with_dep(&proj, CANON_URL, &bogus);
+    let proj = d.path();
+    write_url_dep_manifest(proj, "foo", CANON_URL);
 
-    let err = add_mirror(&proj, "foo", &format!("file://{}", mirror.display())).unwrap_err();
-    assert_eq!(err.code(), "MAN-ADD-MIRROR-IDENTITY-MISMATCH");
+    add_mirror(proj, "foo", MIRROR_URL).unwrap();
+
+    let written = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+    let manifest = match milpa_manifest::parse_document(&written).unwrap() {
+        milpa_manifest::ManifestDoc::Package(m) => m,
+        other => panic!("expected package, got {other:?}"),
+    };
+    let foo = manifest
+        .deps
+        .iter()
+        .find(|d| d.name() == "foo")
+        .expect("foo dep must exist");
+    match foo {
+        milpa_manifest::Dep::Url(u) => {
+            assert!(u.mirrors.contains(&MIRROR_URL.to_string()));
+        }
+        other => panic!("expected UrlDep, got {other:?}"),
+    }
+}
+
+#[test]
+fn add_mirror_idempotent() {
+    // Running add_mirror twice: second call returns Ok(()), no duplicate mirror.
+    let d = tmp();
+    let proj = d.path();
+    write_url_dep_manifest(proj, "foo", CANON_URL);
+
+    add_mirror(proj, "foo", MIRROR_URL).unwrap();
+    add_mirror(proj, "foo", MIRROR_URL).unwrap(); // second — must not error
+
+    let written = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+    let count = written.matches(MIRROR_URL).count();
+    assert_eq!(count, 1, "mirror URL must appear exactly once");
+}
+
+#[test]
+fn add_mirror_dep_not_declared_is_error() {
+    // `dep_name` absent from milpa.kdl → MAN-MIRROR-EDITABLE-PROVENANCE.
+    let d = tmp();
+    let proj = d.path();
+    write_url_dep_manifest(proj, "foo", CANON_URL);
+
+    let err = add_mirror(proj, "nosuchdep", MIRROR_URL).unwrap_err();
+    assert_eq!(err.code(), "MAN-MIRROR-EDITABLE-PROVENANCE");
+    // milpa.kdl must be unmodified.
+    let kdl = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+    assert!(!kdl.contains(MIRROR_URL));
+}
+
+#[test]
+fn add_mirror_local_dep_rejected() {
+    // A local dep cannot carry mirrors → MAN-MIRROR-EDITABLE-PROVENANCE.
+    let d = tmp();
+    let proj = d.path();
+    let local_dir = d.path().join("local_pkg");
+    std::fs::create_dir_all(&local_dir).unwrap();
+    std::fs::write(
+        proj.join("milpa.kdl"),
+        format!(
+            "name \"app\"\nkind \"application\"\ndeps {{\n    localpkg local=\"{}\"\n}}\n",
+            local_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let err = add_mirror(proj, "localpkg", MIRROR_URL).unwrap_err();
+    assert_eq!(err.code(), "MAN-MIRROR-EDITABLE-PROVENANCE");
 }
 
 #[test]

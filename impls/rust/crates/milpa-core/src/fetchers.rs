@@ -18,7 +18,107 @@ use std::process::Command;
 
 use flate2::read::GzDecoder;
 use milpa_types::Provenance;
+
+/// Magic-byte signatures for compressed archive formats
+/// (spec/manifest-grammar.md §TarballDep).
+const MAGIC_GZIP: &[u8] = &[0x1f, 0x8b];
+const MAGIC_BZ2: &[u8] = &[0x42, 0x5a, 0x68]; // "BZh"
+const MAGIC_XZ: &[u8] = &[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00];
 use sha2::{Digest, Sha256};
+
+/// Overhead added to `Limits::max_total_size` to compute the decompression-bomb
+/// cap — one tar header block (512 B) to leave room for tar framing around file
+/// data (SA-1). This is the single definition; both `fetch_tarball` and
+/// `fetch_oci` derive their cap from it via `decompress_capped`.
+const DECOMP_CAP_OVERHEAD: u64 = 512;
+
+/// Maximum compressed bytes accepted from a single HTTP download before the
+/// request is rejected (R4 — finding: uncapped compressed download DoS).
+///
+/// Set to `Limits::max_total_size * 4` (4 GiB) — a conservative upper bound
+/// given typical archive compression ratios.  Both impls use the SAME value
+/// for cross-impl byte-identity (Python `MAX_COMPRESSED_BYTES` = same formula).
+///
+/// Enforced by `fetch_tarball` (and its `_with_cap` variant) after the
+/// transport call: if `len(bytes) > MAX_COMPRESSED_BYTES`, raises
+/// `FETCH-DOWNLOAD-FAILED` before any decompression or extraction.
+///
+/// The mocked / build-mode fetchers bypass `http_get` entirely and are
+/// unaffected.
+pub const MAX_COMPRESSED_BYTES: u64 = crate::safe_extract::Limits::DEFAULT_MAX_TOTAL_SIZE * 4;
+
+/// Decompress `src` using `decoder` (any `Read`) into a `Vec<u8>`, enforcing
+/// the SA-1 decompression-bomb cap (`Limits::max_total_size + DECOMP_CAP_OVERHEAD`).
+///
+/// Returns `Ok(bytes)` or a transport-coded `FetchError`. This is the single
+/// source of truth for the cap formula and the `EXTRACT-SIZE-LIMIT` raise on
+/// cap breach — both `fetch_tarball` (gzip / bzip2) and `fetch_oci` (gzip) call
+/// this instead of maintaining parallel inline copies.
+fn decompress_capped(
+    decoder: impl Read,
+    decomp_cap: u64,
+    name: &str,
+    format: &str,
+) -> Result<Vec<u8>, FetchError> {
+    let mut out = Vec::new();
+    let n = decoder
+        .take(decomp_cap)
+        .read_to_end(&mut out)
+        .map_err(|e| {
+            FetchError::Transport(
+                "FETCH-EXTRACT-FAILED",
+                format!("fetching {name:?}: {format} decompress: {e}"),
+            )
+        })?;
+    if n as u64 >= decomp_cap {
+        return Err(size_limit_error(name, decomp_cap));
+    }
+    Ok(out)
+}
+
+/// Construct the canonical `EXTRACT-SIZE-LIMIT` error for a decompression-bomb
+/// cap breach. Single definition shared by `decompress_capped` (Read-based) and
+/// `decompress_capped_write` (Write-based) so the slug and message format are
+/// identical regardless of which codec path triggered the cap.
+#[inline]
+fn size_limit_error(name: &str, decomp_cap: u64) -> FetchError {
+    FetchError::Transport(
+        "EXTRACT-SIZE-LIMIT",
+        format!(
+            "fetching {name:?}: decompressed archive exceeds cap ({decomp_cap} bytes); \
+             possible decompression bomb"
+        ),
+    )
+}
+
+/// Write-based sibling of `decompress_capped` for the xz/lzma path.
+///
+/// lzma-rs's `xz_decompress` requires a `Sized + BufRead` source and returns
+/// `lzma_rs::error::Error` (not `std::io::Error`), so a generic closure
+/// approach would not unify the signatures cleanly.  Instead this function
+/// hard-wires the lzma-rs call while sharing the SAME cap constant
+/// (`decomp_cap`), the SAME `EXTRACT-SIZE-LIMIT` slug, and the SAME error
+/// message template as `decompress_capped` via `size_limit_error` — eliminating
+/// the three parallel inline copies that R19 flagged.
+fn decompress_capped_xz(
+    src: &[u8],
+    decomp_cap: u64,
+    name: &str,
+) -> Result<Vec<u8>, FetchError> {
+    let mut buf = Vec::new();
+    let mut limited = LimitedWriter::new(&mut buf, decomp_cap);
+    let result = lzma_rs::xz_decompress(&mut std::io::BufReader::new(src), &mut limited);
+    if limited.limit_hit() {
+        return Err(size_limit_error(name, decomp_cap));
+    }
+    result.map_err(|e| {
+        FetchError::Transport(
+            "FETCH-EXTRACT-FAILED",
+            format!("fetching {name:?}: xz decompress: {e}"),
+        )
+    })?;
+    Ok(buf)
+}
 
 use crate::fetch::{FetchError, FetcherRegistry, Receipt};
 use crate::safe_extract::{extract_tar, Limits};
@@ -47,10 +147,14 @@ impl DefaultRegistry {
     }
 
     /// The production registry: tarball downloads shell out to `curl -fsSL`.
+    ///
+    /// R4: `--max-filesize` is passed to curl so the server cannot force a
+    /// download larger than `MAX_COMPRESSED_BYTES` before the compressed-body
+    /// cap check in `fetch_tarball_with_cap` fires.
     pub fn with_curl() -> Self {
         DefaultRegistry::new(|url| {
             let out = Command::new("curl")
-                .args(["-fsSL", url])
+                .args(["-fsSL", &format!("--max-filesize={MAX_COMPRESSED_BYTES}"), url])
                 .output()
                 .map_err(|e| format!("cannot run curl: {e}"))?;
             if out.status.success() {
@@ -95,19 +199,23 @@ impl FetcherRegistry for DefaultRegistry {
     }
 }
 
-/// Copy a local source tree into `dest` (mirrors `LocalFetcher`).
+/// Create a live symlink at `dest` pointing at the absolute resolved source
+/// directory (mirrors `LocalFetcher.fetch → dest.symlink_to(p.path.resolve())`).
+/// Plugin-contract §1.2 (non-admissible): local deps MUST NOT be copied —
+/// `dest` is a symlink so the user's in-progress edits remain live.
 /// `FETCH-LOCAL-PATH-NOT-FOUND` / `FETCH-LOCAL-PATH-NOT-DIR` on a bad source.
 pub fn fetch_local(name: &str, src: &Path, dest: &Path) -> Result<Receipt, FetchError> {
-    if !src.exists() {
-        return Err(transport(
+    // Resolve to absolute before checking, so relative paths work.
+    let abs_src = src.canonicalize().map_err(|_| {
+        transport(
             "FETCH-LOCAL-PATH-NOT-FOUND",
             format!(
                 "fetching {name:?}: local source path does not exist: {}",
                 src.display()
             ),
-        ));
-    }
-    if !src.is_dir() {
+        )
+    })?;
+    if !abs_src.is_dir() {
         return Err(transport(
             "FETCH-LOCAL-PATH-NOT-DIR",
             format!(
@@ -116,11 +224,18 @@ pub fn fetch_local(name: &str, src: &Path, dest: &Path) -> Result<Receipt, Fetch
             ),
         ));
     }
+    // Remove any stale entry at dest (symlink, file, or directory).
     clear_dest(dest).map_err(|e| transport("FETCH-LOCAL-PATH-NOT-DIR", e))?;
-    copy_tree(src, dest)
-        .map_err(|e| transport("FETCH-LOCAL-PATH-NOT-DIR", format!("copying {name:?}: {e}")))?;
-    // A local copy carries no resolved ref; its provenance evidence is the
-    // declared path, recorded by the resolver.
+    // Create a fresh symlink: dest → abs_src (absolute, so it is stable
+    // regardless of the working directory at access time).
+    std::os::unix::fs::symlink(&abs_src, dest).map_err(|e| {
+        transport(
+            "FETCH-LOCAL-PATH-NOT-DIR",
+            format!("fetching {name:?}: cannot create symlink {dest:?} → {abs_src:?}: {e}"),
+        )
+    })?;
+    // A local symlink carries no resolved ref and no identity; its provenance
+    // evidence is the declared path, recorded by the resolver.
     Ok(Receipt {
         resolved_ref: None,
         archive_sha256: None,
@@ -138,7 +253,9 @@ pub fn fetch_git(
     dest: &Path,
 ) -> Result<Receipt, FetchError> {
     clear_dest(dest).map_err(|e| transport("FETCH-GIT-FAILED", e))?;
-    run_git(name, &["clone", "-q", url, &dest.to_string_lossy()])?;
+    // R5: --end-of-options before the URL so a URL starting with '-' cannot
+    // be misinterpreted as an option flag (git clone >= 2.24).
+    run_git(name, &["clone", "-q", "--end-of-options", url, &dest.to_string_lossy()])?;
 
     match commit_sha {
         Some(sha) => {
@@ -151,10 +268,14 @@ pub fn fetch_git(
                     format!("fetching {name:?}: pinned commit {sha} not present in {url}"),
                 ));
             }
-            run_git_in(name, dest, &["checkout", "-q", sha])?;
+            // R5: --end-of-options before commit SHA so a SHA starting with '-'
+            // is not parsed as an option flag (git checkout >= 2.24).
+            run_git_in(name, dest, &["checkout", "-q", "--end-of-options", sha])?;
         }
         None => {
-            run_git_in(name, dest, &["checkout", "-q", ref_spec])?;
+            // R5: --end-of-options before ref so a ref like '-evil' or '--detach'
+            // is treated as a ref name, not a flag (git checkout >= 2.24).
+            run_git_in(name, dest, &["checkout", "-q", "--end-of-options", ref_spec])?;
         }
     }
 
@@ -164,12 +285,28 @@ pub fn fetch_git(
     })
 }
 
+/// Transport flags injected into every git invocation that materializes or
+/// checks out content (spec/identity.md §1.7 NORMATIVE MUST): prevents the host
+/// git config from perturbing the materialized bytes or the resulting identity
+/// hash regardless of OS/user settings.
+pub(crate) const GIT_TRANSPORT_FLAGS: &[&str] = &[
+    "-c", "core.autocrlf=false",
+    "-c", "core.filemode=false",
+];
+
 fn run_git(name: &str, args: &[&str]) -> Result<(), FetchError> {
-    git_status(name, Command::new("git").args(args))
+    git_status(name, Command::new("git").args(GIT_TRANSPORT_FLAGS).args(args))
 }
 
 fn run_git_in(name: &str, dir: &Path, args: &[&str]) -> Result<(), FetchError> {
-    git_status(name, Command::new("git").arg("-C").arg(dir).args(args))
+    git_status(
+        name,
+        Command::new("git")
+            .args(GIT_TRANSPORT_FLAGS)
+            .arg("-C")
+            .arg(dir)
+            .args(args),
+    )
 }
 
 fn git_status(name: &str, cmd: &mut Command) -> Result<(), FetchError> {
@@ -193,11 +330,13 @@ fn git_status(name: &str, cmd: &mut Command) -> Result<(), FetchError> {
 }
 
 /// `git cat-file -e <sha>^{commit}` — true iff the commit object exists.
+/// R5: `--end-of-options` is inserted before the object spec for consistency,
+/// even though the `^{commit}` suffix makes it unparseable as a flag.
 fn commit_present(dir: &Path, sha: &str) -> bool {
     Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+        .args(["cat-file", "-e", "--end-of-options", &format!("{sha}^{{commit}}")])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -217,11 +356,57 @@ fn git_head_sha(dir: &Path) -> Option<String> {
     }
 }
 
+/// A `Write` adapter that stops accepting bytes once `limit` is reached.
+/// Used by the xz decompression path for SA-1 bomb-guard (lzma-rs uses a
+/// Write-based API rather than a Read-based decoder).
+struct LimitedWriter<'a> {
+    inner: &'a mut Vec<u8>,
+    limit: u64,
+    written: u64,
+    hit: bool,
+}
+
+impl<'a> LimitedWriter<'a> {
+    fn new(inner: &'a mut Vec<u8>, limit: u64) -> Self {
+        LimitedWriter { inner, limit, written: 0, hit: false }
+    }
+    fn limit_hit(&self) -> bool {
+        self.hit
+    }
+}
+
+impl std::io::Write for LimitedWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.written);
+        if remaining == 0 {
+            self.hit = true;
+            // Return a write error to abort lzma_rs mid-stream.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "decompression cap exceeded",
+            ));
+        }
+        let n = (buf.len() as u64).min(remaining) as usize;
+        self.inner.extend_from_slice(&buf[..n]);
+        self.written += n as u64;
+        if n < buf.len() {
+            self.hit = true;
+        }
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Download a tarball, verify its sha256 (before extraction), gunzip if needed,
 /// and safe-extract into `dest` (mirrors `TarballFetcher`). `FETCH-DOWNLOAD-FAILED`
 /// on transport error; `FETCH-SHA256-MISMATCH` if the declared hash differs (the
 /// archive is rejected BEFORE any extraction); `FETCH-EXTRACT-FAILED` wrapping any
 /// `safe_extract` violation.
+///
+/// Uses `MAX_COMPRESSED_BYTES` as the download cap. For testing with a custom
+/// cap, use [`fetch_tarball_with_cap`].
 pub fn fetch_tarball(
     name: &str,
     url: &str,
@@ -230,6 +415,20 @@ pub fn fetch_tarball(
     dest: &Path,
     http_get: &dyn Fn(&str) -> Result<Vec<u8>, String>,
 ) -> Result<Receipt, FetchError> {
+    fetch_tarball_with_cap(name, url, expected_sha256, strip_components, dest, http_get, MAX_COMPRESSED_BYTES)
+}
+
+/// Like [`fetch_tarball`] but with an explicit `compressed_cap` (R4 — allows
+/// tests to inject a tiny cap without requiring a 4 GiB download).
+pub fn fetch_tarball_with_cap(
+    name: &str,
+    url: &str,
+    expected_sha256: Option<&str>,
+    strip_components: u32,
+    dest: &Path,
+    http_get: &dyn Fn(&str) -> Result<Vec<u8>, String>,
+    compressed_cap: u64,
+) -> Result<Receipt, FetchError> {
     let bytes = http_get(url).map_err(|e| {
         transport(
             "FETCH-DOWNLOAD-FAILED",
@@ -237,14 +436,32 @@ pub fn fetch_tarball(
         )
     })?;
 
+    // R4: cap the compressed body before decompression.  The production http_get
+    // (curl) already enforces this via --max-filesize; the cap here catches
+    // injected transports (tests, mocked fetchers that return bytes directly)
+    // and serves as a safety net if the transport doesn't self-limit.
+    if bytes.len() as u64 > compressed_cap {
+        return Err(transport(
+            "FETCH-DOWNLOAD-FAILED",
+            format!(
+                "fetching {name:?} from {url}: compressed body ({} bytes) exceeds \
+                 download cap ({compressed_cap} bytes); possible oversized mirror",
+                bytes.len()
+            ),
+        ));
+    }
+
     // Compute the archive digest once: it gates an existing pin (below) AND is
     // returned as the TOFU receipt so the resolver can record/preserve it
     // (`lockfile-schema.md §5`).
     let actual_sha = sha256_hex(&bytes);
 
     if let Some(expected) = expected_sha256 {
-        // Accept a bare hex digest or a `sha256:`-prefixed one.
-        let want = expected.strip_prefix("sha256:").unwrap_or(expected);
+        // Accept a bare hex digest or a `sha256:`-prefixed one; normalize to
+        // lowercase so UPPERCASE or mixed-case pins from the manifest/lockfile
+        // are accepted (case-insensitive comparison, both sides already lowercase
+        // from sha256_hex, so only `want` needs lowercasing).
+        let want = expected.strip_prefix("sha256:").unwrap_or(expected).to_lowercase();
         if actual_sha != want {
             return Err(transport(
                 "FETCH-SHA256-MISMATCH",
@@ -256,18 +473,36 @@ pub fn fetch_tarball(
         }
     }
 
-    // gzip magic (1f 8b) → decompress; else treat the bytes as a raw tar.
-    let tar_bytes = if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
-        let mut out = Vec::new();
-        GzDecoder::new(&bytes[..])
-            .read_to_end(&mut out)
-            .map_err(|e| {
-                transport(
-                    "FETCH-EXTRACT-FAILED",
-                    format!("fetching {name:?}: gunzip: {e}"),
-                )
-            })?;
-        out
+    // Detect compression format by magic bytes, decompress with a size cap,
+    // then feed the raw tar bytes to extract_tar.
+    //
+    // Supported formats (spec/manifest-grammar.md §TarballDep):
+    //   gzip  — magic 1f 8b
+    //   bzip2 — magic 42 5a 68 ("BZh")
+    //   xz    — magic fd 37 7a 58 5a 00
+    //   uncompressed tar — no magic match (fall through)
+    //
+    // SA-1 decompression-bomb guard: all decoders go through `decompress_capped`
+    // (the module-level SSOT) which wraps the decoder in `.take(decomp_cap)`.
+    // The cap formula (max_total_size + DECOMP_CAP_OVERHEAD) lives in exactly one
+    // place; fetch_oci uses the same helper so there is no parallel copy.
+    let decomp_cap: u64 = Limits::default().max_total_size + DECOMP_CAP_OVERHEAD;
+
+    let tar_bytes = if bytes.starts_with(MAGIC_GZIP) {
+        decompress_capped(GzDecoder::new(&bytes[..]), decomp_cap, name, "gzip")?
+    } else if bytes.starts_with(MAGIC_BZ2) {
+        decompress_capped(
+            bzip2_rs::DecoderReader::new(&bytes[..]),
+            decomp_cap,
+            name,
+            "bzip2",
+        )?
+    } else if bytes.starts_with(MAGIC_XZ) {
+        // lzma-rs uses a Write-based API (xz_decompress) rather than a Read-based
+        // decoder; route through decompress_capped_xz so cap constant, slug, and
+        // error message are the same SSOT as gzip/bzip2 — eliminating the parallel
+        // inline copy that R19 flagged.
+        decompress_capped_xz(&bytes[..], decomp_cap, name)?
     } else {
         bytes
     };
@@ -297,6 +532,25 @@ pub fn fetch_oci(
     digest: &str,
     dest: &Path,
 ) -> Result<Receipt, FetchError> {
+    // R5: validate that registry and repository do not start with '-' so they
+    // cannot be interpreted as option flags by oras.  oras does not document
+    // --end-of-options, so we use an input-validation guard (mirrors
+    // Python's validate_oci_field / TNG-UNSAFE-OCI-FIELD).
+    // NOTE: `digest` is deliberately NOT checked here — it is format-validated
+    // (`sha256:<64 hex>`) at the registry layer (`validate_oci_digest` →
+    // TNG-BAD-OCI-DIGEST), which already rejects any `-`-prefixed or malformed
+    // value, exactly as the Python impl does. Adding a leading-`-` check here
+    // would diverge from Python (it would fire TNG-UNSAFE-OCI-FIELD instead of
+    // TNG-BAD-OCI-DIGEST for a `-`-prefixed digest).
+    for (field_name, field_val) in [("registry", registry), ("repository", repository)] {
+        if field_val.starts_with('-') {
+            return Err(transport(
+                "TNG-UNSAFE-OCI-FIELD",
+                format!("fetching {name:?}: OCI {field_name} {field_val:?} starts with '-'; rejected as potentially malicious"),
+            ));
+        }
+    }
+
     let oci_ref = format!("{registry}/{repository}@{digest}");
     let scratch = dest
         .parent()
@@ -344,10 +598,15 @@ pub fn fetch_oci(
                     format!("reading pulled tarball: {e}"),
                 )
             })?;
-            let mut tar = Vec::new();
-            GzDecoder::new(&bytes[..])
-                .read_to_end(&mut tar)
-                .map_err(|e| transport("FETCH-EXTRACT-FAILED", format!("gunzip: {e}")))?;
+            // SA-1: use the shared decompress_capped helper — same cap formula
+            // (DECOMP_CAP_OVERHEAD) and same EXTRACT-SIZE-LIMIT slug as fetch_tarball.
+            // This is the fix for R2: no parallel inline copy of the cap logic.
+            let oci_decomp_cap: u64 = Limits::default().max_total_size + DECOMP_CAP_OVERHEAD;
+            let tar = decompress_capped(GzDecoder::new(&bytes[..]), oci_decomp_cap, name, "gunzip")
+                .map_err(|e| {
+                    let _ = std::fs::remove_dir_all(&scratch);
+                    e
+                })?;
             clear_dest(dest).map_err(|e| transport("FETCH-EXTRACT-FAILED", e))?;
             extract_tar(&tar, dest, 0, Limits::default())
                 .map(|_| Receipt {
@@ -375,12 +634,20 @@ pub fn fetch_oci(
 /// A [`FetcherRegistry`] wrapper that admits every fetched tree into a
 /// [`CaStore`] and replaces `dest` with a relative CAS symlink.
 ///
-/// The inner registry materializes content into a staging directory; the
-/// wrapper then:
-///   1. Computes the content hash of the staged tree.
-///   2. Admits the staging tree into `store` (move-via-rename, duplicate is no-op).
-///   3. Removes any stale `dest` and creates a relative symlink at `dest` →
+/// The inner registry materializes content into a scratch directory allocated
+/// via [`CaStore::scratch`] (C-stage, identity.md §3.4); the wrapper then:
+///   1. Allocates a unique scratch subdir via `store.scratch()` under
+///      `<cas_root>/_scratch/<uuid>/` — same filesystem as `sha256/`, so the
+///      subsequent rename(2) in `admit()` is atomic (no EXDEV).
+///   2. Fetches content into the scratch subdir.
+///   3. Computes the content hash of the scratch tree.
+///   4. Admits the scratch tree into `store` (move-via-rename, duplicate is no-op).
+///   5. Removes any stale `dest` and creates a relative symlink at `dest` →
 ///      the store entry.
+///   6. Cleans up the scratch subdir (admit moves it on success; we remove any remnant).
+///
+/// `CaStore::scratch()` is the sole owner of transient pre-admission space.
+/// No external `staging_root` parameter is needed or accepted (C-stage SSOT).
 ///
 /// This is the CAS layer used by the CLI when `MILPA_MOCKED_FETCHES` is set,
 /// producing the same `_deps/<name>` → CAS symlink structure that the
@@ -389,51 +656,51 @@ pub fn fetch_oci(
 pub struct CasAdmittingFetcher<R> {
     inner: R,
     store: crate::store::CaStore,
-    staging_root: std::path::PathBuf,
 }
 
 impl<R: FetcherRegistry> CasAdmittingFetcher<R> {
     /// Wrap `inner` so every successful fetch is admitted into `store`.
-    /// `staging_root` is a directory on the same filesystem as the CAS root;
-    /// staging sub-dirs are created there so `rename(2)` into the store is atomic.
-    pub fn new(
-        inner: R,
-        store: crate::store::CaStore,
-        staging_root: impl Into<std::path::PathBuf>,
-    ) -> Self {
-        CasAdmittingFetcher {
-            inner,
-            store,
-            staging_root: staging_root.into(),
-        }
+    ///
+    /// Staging is handled internally via [`CaStore::scratch`] — no external
+    /// `staging_root` parameter is required (C-stage: CaStore owns staging).
+    pub fn new(inner: R, store: crate::store::CaStore) -> Self {
+        CasAdmittingFetcher { inner, store }
     }
 }
 
 impl<R: FetcherRegistry> FetcherRegistry for CasAdmittingFetcher<R> {
     fn fetch(&self, name: &str, p: &milpa_types::Provenance, dest: &Path) -> Result<Receipt, FetchError> {
         if p.cas_admissible() {
-            // Immutable source (Git / Tarball / OCI): fetch into a staging directory
-            // on the same filesystem as the CAS (for atomic rename(2) during admit),
-            // then admit + create a relative CAS symlink at `dest`.
-            // spec/plugin-contract.md §4; spec/identity.md §3.5.
-            let staging = self.staging_root.join(".milpa-cas-stage").join(name);
-            let _ = std::fs::remove_dir_all(&staging);
-            std::fs::create_dir_all(&staging).map_err(|e| {
-                FetchError::Failed(format!("CasAdmittingFetcher: cannot create staging dir: {e}"))
+            // Immutable source (Git / Tarball / OCI): allocate a scratch subdir
+            // via CaStore::scratch() — under <cas_root>/_scratch/<uuid>/ — which is
+            // on the same filesystem as sha256/, guaranteeing atomic rename(2) in admit().
+            // spec/plugin-contract.md §4; spec/identity.md §3.4, §3.5; C-stage.
+            let scratch = self.store.scratch().map_err(|e| {
+                FetchError::Failed(format!("CasAdmittingFetcher: allocate scratch: {}", e.message()))
             })?;
 
-            let receipt = self.inner.fetch(name, p, &staging)?;
+            let receipt = match self.inner.fetch(name, p, &scratch.path) {
+                Ok(r) => r,
+                Err(e) => {
+                    // Clean up scratch on fetch failure (C-stage: no leaked dirs).
+                    let _ = std::fs::remove_dir_all(&scratch.path);
+                    return Err(e);
+                }
+            };
 
             // Compute the identity and admit to the CAS.
             use crate::identity::compute_content_hash;
-            let identity = compute_content_hash(&staging).map_err(|e| {
-                FetchError::Failed(format!("CasAdmittingFetcher: hash staged tree: {}", e.message()))
+            let identity = compute_content_hash(&scratch.path).map_err(|e| {
+                let _ = std::fs::remove_dir_all(&scratch.path);
+                FetchError::Failed(format!("CasAdmittingFetcher: hash scratch tree: {}", e.message()))
             })?;
-            self.store.admit(&staging, &identity).map_err(|e| {
+            let admit_result = self.store.admit(&scratch.path, &identity).map_err(|e| {
+                let _ = std::fs::remove_dir_all(&scratch.path);
                 FetchError::Failed(format!("CasAdmittingFetcher: admit to CAS: {}", e.message()))
             })?;
-            // `admit` moves staging on success; clean up defensively.
-            let _ = std::fs::remove_dir_all(&staging);
+            // `admit` moves the scratch dir on success (rename); clean up any remnant.
+            let _ = std::fs::remove_dir_all(&scratch.path);
+            drop(admit_result);
 
             // Create the relative CAS symlink at dest.
             self.store.link(&identity, dest).map_err(|e| {
@@ -527,12 +794,47 @@ impl FetcherRegistry for MockedFetcher {
             Provenance::Tarball {
                 url,
                 expected_sha256,
-                ..
+                strip_components,
             } => {
-                let (archive_sha, key_dir) =
-                    resolve_tarball_mock_key(&self.mocked_fetches_dir, url)?;
+                let (_, key_dir) =
+                    resolve_tarball_mock_key_dir(&self.mocked_fetches_dir, url)?;
+
+                // Build-mode: when a ``format`` file is present, build a real
+                // archive from ``content/`` and run it through the REAL
+                // ``fetch_tarball`` decode path (SSOT: production extractor, not a
+                // parallel copy).  The encoder-dependent archive sha256 is NOT
+                // gated against ``expected_sha256`` here — build-mode fixtures
+                // never have a prior pin (they are first-fetch).  The lockfile
+                // comparison redacts the pin field via TARBALL_SHA256_PLACEHOLDER
+                // to keep expected/ stable across Python (zlib) and Rust
+                // (flate2/lzma-rs) encoders.
+                let fmt_path = key_dir.join("format");
+                if fmt_path.is_file() {
+                    let fmt = std::fs::read_to_string(&fmt_path)
+                        .map_err(|e| FetchError::Failed(format!("build-mode: read format: {e}")))?;
+                    let fmt = fmt.trim().to_string();
+                    let archive_bytes = build_archive_bytes(&key_dir, &fmt)?;
+                    let url_str = url.clone();
+                    return fetch_tarball(
+                        name,
+                        &url_str,
+                        expected_sha256.as_deref(),
+                        *strip_components,
+                        dest,
+                        &move |_: &str| Ok(archive_bytes.clone()),
+                    );
+                }
+
+                // Normal (copy) mode.
+                let archive_sha = std::fs::read_to_string(key_dir.join("archive_sha256"))
+                    .map_err(|e| FetchError::Failed(format!(
+                        "mock fixture: cannot read {}/archive_sha256: {e}",
+                        key_dir.display()
+                    )))?
+                    .trim()
+                    .to_lowercase();
                 if let Some(expected) = expected_sha256 {
-                    let want = expected.strip_prefix("sha256:").unwrap_or(expected);
+                    let want = expected.strip_prefix("sha256:").unwrap_or(expected).to_lowercase();
                     if want != archive_sha {
                         return Err(FetchError::Transport(
                             "FETCH-SHA256-MISMATCH",
@@ -628,8 +930,133 @@ pub fn resolve_tarball_mock_key(
             ))
         })?
         .trim()
-        .to_string();
+        .to_lowercase();
     Ok((archive_sha, key_dir))
+}
+
+/// Resolve a tarball URL to its `mocked-fetches/<url_key(url, "")>/` directory
+/// WITHOUT reading `archive_sha256`. Returns `((), key_dir)` for uniformity with
+/// [`resolve_tarball_mock_key`]. Used by the build-mode path in [`MockedFetcher`]
+/// where the archive sha256 is computed at build time, not read from disk.
+///
+/// `FETCH-MOCK-MISSING` if the key directory does not exist.
+fn resolve_tarball_mock_key_dir(
+    mocked_fetches_dir: &Path,
+    url: &str,
+) -> Result<((), std::path::PathBuf), FetchError> {
+    let key_dir = mocked_fetches_dir.join(url_key(url, ""));
+    if !key_dir.is_dir() {
+        return Err(FetchError::Transport(
+            "FETCH-MOCK-MISSING",
+            format!(
+                "mocked fetch: no tarball fixture for {url:?} \
+                 (expected dir: {})",
+                key_dir.display()
+            ),
+        ));
+    }
+    Ok(((), key_dir))
+}
+
+/// Build a real tar archive from ``key_dir/content/`` (and sibling ``*.nimble``
+/// files) in the given compression format (``gz`` or ``xz``).
+///
+/// This is **test infra** — the ENCODER lives here.  The DECODER is the
+/// production ``fetch_tarball`` path (SSOT per standing rules).
+///
+/// Returns the raw archive bytes.
+fn build_archive_bytes(key_dir: &Path, fmt: &str) -> Result<Vec<u8>, FetchError> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    let content_dir = key_dir.join("content");
+    let buf: Vec<u8> = Vec::new();
+
+    // Helper: collect files to archive = content/* sorted + sibling *.nimble
+    let mut entries: Vec<(std::path::PathBuf, String)> = Vec::new();
+    if content_dir.is_dir() {
+        collect_tree_entries(&content_dir, &content_dir, &mut entries)
+            .map_err(|e| FetchError::Failed(format!("build-mode: walk content: {e}")))?;
+    }
+    // Sibling *.nimble files
+    if let Ok(rd) = std::fs::read_dir(key_dir) {
+        let mut nimble_entries: Vec<_> = rd
+            .flatten()
+            .filter(|e| {
+                e.path().extension().and_then(|s| s.to_str()) == Some("nimble")
+            })
+            .collect();
+        nimble_entries.sort_by_key(|e| e.file_name());
+        for entry in nimble_entries {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            entries.push((path, name));
+        }
+    }
+
+    match fmt {
+        "gz" => {
+            let mut compressed = Vec::new();
+            {
+                let enc = GzEncoder::new(&mut compressed, Compression::default());
+                let mut ar = tar::Builder::new(enc);
+                for (src, arcname) in &entries {
+                    ar.append_path_with_name(src, arcname)
+                        .map_err(|e| FetchError::Failed(format!("build-mode gz: append {arcname}: {e}")))?;
+                }
+                ar.finish()
+                    .map_err(|e| FetchError::Failed(format!("build-mode gz: finish: {e}")))?;
+            }
+            drop(buf);
+            Ok(compressed)
+        }
+        "xz" => {
+            // Build uncompressed tar first, then compress with lzma-rs.
+            let mut tar_bytes = Vec::new();
+            {
+                let mut ar = tar::Builder::new(&mut tar_bytes);
+                for (src, arcname) in &entries {
+                    ar.append_path_with_name(src, arcname)
+                        .map_err(|e| FetchError::Failed(format!("build-mode xz: append {arcname}: {e}")))?;
+                }
+                ar.finish()
+                    .map_err(|e| FetchError::Failed(format!("build-mode xz: finish: {e}")))?;
+            }
+            let mut compressed = Vec::new();
+            lzma_rs::xz_compress(
+                &mut std::io::BufReader::new(tar_bytes.as_slice()),
+                &mut compressed,
+            )
+            .map_err(|e| FetchError::Failed(format!("build-mode xz: compress: {e}")))?;
+            drop(buf);
+            Ok(compressed)
+        }
+        other => Err(FetchError::Failed(format!(
+            "build-mode: unsupported format {other:?}; expected gz or xz"
+        ))),
+    }
+}
+
+/// Recursively collect (absolute_path, archive_name) pairs from `root`,
+/// sorted lexicographically by archive name.
+fn collect_tree_entries(
+    root: &Path,
+    base: &Path,
+    out: &mut Vec<(std::path::PathBuf, String)>,
+) -> std::io::Result<()> {
+    let mut entries: Vec<_> = std::fs::read_dir(root)?.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let rel = path.strip_prefix(base).unwrap_or(&path);
+        let arcname = rel.to_string_lossy().into_owned();
+        if path.is_dir() {
+            collect_tree_entries(&path, base, out)?;
+        } else if path.is_file() {
+            out.push((path, arcname));
+        }
+    }
+    Ok(())
 }
 
 /// Stage the mocked bytes from `key_dir` into `dest`: copy `content/` verbatim,

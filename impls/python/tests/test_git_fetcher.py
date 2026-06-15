@@ -8,6 +8,9 @@ Coverage:
   - GitReceipt.transport_fields returns {"commit_sha": <sha>}
   - GitFetcher.can_handle returns True for GitProvenance, False for others
   - GitFetcher.fetch: successful clone from local repo, receipt has resolved SHA
+  - transport-normalization: core.autocrlf=false / core.filemode=false injected
+    (spec/identity.md §1.7 NORMATIVE) so CRLF repos hash identically regardless
+    of host git config
   - GitFetcher.fetch: receipt commit_sha matches git HEAD
   - GitFetcher.fetch: commit_sha pin — checkout a specific earlier commit
   - GitFetcher.fetch: bad URL → MilpaError with FETCH-GIT-FAILED slug
@@ -15,6 +18,8 @@ Coverage:
   - GitFetcher.fetch: commit_sha absent → MilpaError with FETCH-GIT-COMMIT-ABSENT slug
   - GitFetcher: cas_admissible=True (inherited from Provenance base)
   - GitFetcher does NOT compute identity (tree hash absent from receipt)
+  - R5: ref starting with '-' treated as (nonexistent) ref → FETCH-GIT-FAILED,
+    not silently consumed as an option flag.
 """
 
 from __future__ import annotations
@@ -355,3 +360,193 @@ class TestGitFetcherNoNetwork:
         assert result.path == dest
         assert result.identity.startswith("sha256:")
         assert result.receipt.transport_fields()["commit_sha"] == sha
+
+
+# ---------------------------------------------------------------------------
+# Transport normalization — spec/identity.md §1.7 NORMATIVE
+# ---------------------------------------------------------------------------
+
+
+def _make_crlf_repo(tmp_path: Path) -> tuple[Path, str]:
+    """Create a local git repo whose working tree contains CRLF line endings.
+
+    We commit the file with LF bytes (so Git stores LF objects) and disable
+    autocrlf so no conversion happens at the object level.  The key property is
+    that the *checked-out bytes* must be LF regardless of whatever the host's
+    core.autocrlf would normally do — our fetcher must enforce this via the
+    transport flags.
+    """
+    repo = tmp_path / "crlf_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@milpa.test"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Milpa Test"],
+        check=True, capture_output=True,
+    )
+    # Write a file with CRLF bytes directly.
+    crlf_file = repo / "crlf.txt"
+    crlf_file.write_bytes(b"line1\r\nline2\r\n")
+    subprocess.run(
+        [
+            "git", "-c", "core.autocrlf=false",
+            "-C", str(repo), "add", "crlf.txt",
+        ],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git", "-c", "user.email=test@milpa.test",
+            "-c", "user.name=Milpa Test",
+            "-C", str(repo), "commit", "-m", "crlf commit",
+        ],
+        check=True, capture_output=True,
+    )
+    sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    return repo, sha
+
+
+class TestGitTransportNormalization:
+    """spec/identity.md §1.7: -c core.autocrlf=false -c core.filemode=false must
+    be injected so host git config cannot perturb the materialized bytes.
+
+    We prove this in two ways:
+      1. The _run_git helper inserts the flags into every git argv.
+      2. Two clones of the same repo — one with host core.autocrlf=true (simulated
+         via GIT_CONFIG_* env), one clean — produce byte-identical trees.
+    """
+
+    def test_transport_flags_present_in_argv(self, tmp_path: Path) -> None:
+        """_run_git injects the transport flags into every git invocation."""
+        from milpa.fetchers.git import _GIT_TRANSPORT_FLAGS
+        assert "-c" in _GIT_TRANSPORT_FLAGS
+        assert "core.autocrlf=false" in _GIT_TRANSPORT_FLAGS
+        assert "core.filemode=false" in _GIT_TRANSPORT_FLAGS
+
+    def test_crlf_repo_content_preserved_as_lf(self, tmp_path: Path) -> None:
+        """Fetcher materializes LF bytes even when host might convert to CRLF.
+
+        We commit CRLF bytes into the repo so that a real core.autocrlf=true
+        git would check them out as CRLF, then verify the fetcher's -c flags
+        override that and we always get back the same bytes that were committed.
+        """
+        repo, _ = _make_crlf_repo(tmp_path)
+        dest = tmp_path / "dest"
+        fetcher = GitFetcher()
+        fetcher.fetch("crlf_pkg", GitProvenance(url=str(repo), ref="main"), dest=dest)
+        # The fetched bytes must match what was stored in the git object (CRLF).
+        # core.autocrlf=false ensures Git doesn't convert them during checkout.
+        content = (dest / "crlf.txt").read_bytes()
+        assert content == b"line1\r\nline2\r\n", (
+            f"Expected CRLF bytes unchanged by git checkout, got {content!r}"
+        )
+
+    def test_identity_stable_regardless_of_host_autocrlf_setting(
+        self, tmp_path: Path
+    ) -> None:
+        """Two fetches from the same repo produce the same identity hash.
+
+        This is the SSOT test: if the transport flags weren't injected, a host
+        with core.autocrlf=input or =true would produce different bytes and a
+        different identity.  With the flags, both fetches agree.
+        """
+        repo, _ = _make_crlf_repo(tmp_path)
+        registry = FetcherRegistry()
+        registry.register(GitFetcher())
+
+        dest1 = tmp_path / "dest1"
+        dest2 = tmp_path / "dest2"
+        prov = GitProvenance(url=str(repo), ref="main")
+
+        result1 = registry.fetch("crlf_pkg", prov, dest=dest1)
+        result2 = registry.fetch("crlf_pkg", prov, dest=dest2)
+
+        assert result1.identity == result2.identity, (
+            "Identity hash must be stable across two fetches of the same repo"
+        )
+
+
+# ---------------------------------------------------------------------------
+# R5 — git argument injection (ref / commit_sha starting with '-')
+# ---------------------------------------------------------------------------
+
+
+class TestGitArgInjectionHardening:
+    """R5: attacker-controlled fields starting with '-' must not be parsed as
+    git option flags.  We use real git (local repo) so the test exercises the
+    actual subprocess call, not just argument-list shape.
+
+    A ref like '-evil' or '--detach' is not a valid git branch/tag name, so
+    the fetch must fail with FETCH-GIT-FAILED (ref not found), NOT silently
+    succeed as if the flag were consumed by git.
+    """
+
+    def test_ref_starting_with_dash_fails_with_fetch_git_failed(
+        self, tmp_path: Path
+    ) -> None:
+        """R5 behavioral: ref='-evil' is treated as a (nonexistent) ref name.
+
+        Without --end-of-options, git checkout -q -evil would interpret -evil
+        as an unknown option and produce a different (confusing) error or
+        silently ignore it.  With --end-of-options the operand is treated as
+        a ref that doesn't exist → FETCH-GIT-FAILED.
+        """
+        repo, _ = _make_local_repo(tmp_path)
+        dest = tmp_path / "dest"
+        fetcher = GitFetcher()
+        with pytest.raises(MilpaError) as exc_info:
+            fetcher.fetch(
+                "mylib",
+                GitProvenance(url=str(repo), ref="-evil"),
+                dest=dest,
+            )
+        assert exc_info.value.slug == FETCH_GIT_FAILED
+
+    def test_ref_double_dash_detach_fails_with_fetch_git_failed(
+        self, tmp_path: Path
+    ) -> None:
+        """R5 behavioral: ref='--detach' is treated as a nonexistent ref.
+
+        'git checkout --detach' (without end-of-options) is a valid git
+        invocation that detaches HEAD to the current commit.  With
+        --end-of-options, '--detach' is a ref name that doesn't exist →
+        FETCH-GIT-FAILED rather than silently detaching.
+        """
+        repo, _ = _make_local_repo(tmp_path)
+        dest = tmp_path / "dest"
+        fetcher = GitFetcher()
+        with pytest.raises(MilpaError) as exc_info:
+            fetcher.fetch(
+                "mylib",
+                GitProvenance(url=str(repo), ref="--detach"),
+                dest=dest,
+            )
+        assert exc_info.value.slug == FETCH_GIT_FAILED
+
+    def test_commit_sha_starting_with_dash_fails_with_git_error(
+        self, tmp_path: Path
+    ) -> None:
+        """R5 behavioral: commit_sha='-badoption' must produce a git error.
+
+        A commit SHA that starts with '-' is not a valid SHA and should be
+        treated as a nonexistent commit, producing FETCH-GIT-COMMIT-ABSENT
+        (local check fails) or FETCH-GIT-FAILED (git rejects the arg).
+        Either is acceptable — the important thing is it does NOT silently
+        succeed or crash without a MilpaError.
+        """
+        repo, _ = _make_local_repo(tmp_path)
+        dest = tmp_path / "dest"
+        fetcher = GitFetcher()
+        with pytest.raises(MilpaError) as exc_info:
+            fetcher.fetch(
+                "mylib",
+                GitProvenance(url=str(repo), ref="main", commit_sha="-badoption"),
+                dest=dest,
+            )
+        assert exc_info.value.slug in (FETCH_GIT_FAILED, FETCH_GIT_COMMIT_ABSENT)

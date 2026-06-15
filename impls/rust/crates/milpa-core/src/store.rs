@@ -13,6 +13,23 @@ use crate::error::CoreError;
 // store-side I/O failures (mkdir / rename / symlink) the spec also leaves uncoded.
 use crate::identity::{compute_content_hash, parse_identity, INTERNAL_IO};
 
+// ---------------------------------------------------------------------------
+// §3.4 — ScratchDir (C-stage)
+// ---------------------------------------------------------------------------
+
+/// Handle for a live scratch subdirectory under ``<root>/_scratch/<uuid>/``.
+///
+/// Obtained via [`CaStore::scratch`]; the caller is responsible for cleanup
+/// (drop the path after admit, or after an error).  The parent `_scratch/`
+/// dir is created lazily.
+///
+/// The scratch dir is always on the same filesystem mount as the CAS
+/// ``sha256/`` entries, so the rename(2) in [`CaStore::admit`] is atomic.
+#[derive(Debug)]
+pub struct ScratchDir {
+    pub path: PathBuf,
+}
+
 /// A handle to the on-disk content-addressed store rooted at `root`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaStore {
@@ -36,11 +53,125 @@ impl CaStore {
         Ok(self.path_for(identity)?.is_dir())
     }
 
+    /// Return a lexicographically sorted list of all identities in the store.
+    ///
+    /// Scans `<root>/sha256/*/` directories (only the `sha256` algorithm
+    /// directory is expected per spec/identity.md §3). Non-directory entries
+    /// and names starting with `_` (scratch) are ignored.  Empty store → empty
+    /// list.  Identities are returned in `sha256:<64hex>` canonical form.
+    pub fn list_identities(&self) -> Vec<String> {
+        let sha256_dir = self.root.join("sha256");
+        let mut identities: Vec<String> = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&sha256_dir) else {
+            return identities;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            // Skip scratch dirs and non-directory entries.
+            if name_str.starts_with('_') {
+                continue;
+            }
+            if entry.path().is_dir() {
+                identities.push(format!("sha256:{name_str}"));
+            }
+        }
+        identities.sort();
+        identities
+    }
+
+    /// Resolve a hex-digest prefix (with or without `sha256:` algorithm prefix)
+    /// to a full identity string.
+    ///
+    /// Rules (spec/identity.md §3, C-store-ro slice):
+    /// - Full identity (64-hex bare or `sha256:<64hex>`) → exact lookup.
+    ///   Present → return the full identity.  Absent → `CAS-NOT-IN-STORE`.
+    /// - Prefix whose hex portion is ≥16 chars → unique-prefix match.
+    ///   Exactly 1 match → return the identity.  0 → `CAS-NOT-IN-STORE`.
+    ///   >1 → `STORE-AMBIGUOUS-PREFIX`.
+    /// - Prefix whose hex portion is <16 chars → `STORE-AMBIGUOUS-PREFIX`.
+    ///   A <16-char prefix is by definition too weak to safely pin one entry;
+    ///   we reuse this one named code rather than inventing another to keep
+    ///   the error catalog minimal.
+    pub fn resolve_prefix(&self, prefix: &str) -> Result<String, CoreError> {
+        // Strip optional algorithm prefix to get the raw hex portion.
+        let hex_part = if let Some(rest) = prefix.strip_prefix("sha256:") {
+            rest
+        } else {
+            prefix
+        };
+
+        // Exact match: 64-hex digest → direct lookup.
+        if hex_part.len() == 64 {
+            let full_identity = format!("sha256:{hex_part}");
+            if self.path_for(&full_identity)?.is_dir() {
+                return Ok(full_identity);
+            }
+            return Err(CoreError::Identity(
+                "CAS-NOT-IN-STORE",
+                format!("identity not in store: {full_identity:?}"),
+            ));
+        }
+
+        // Prefix match: enforce the 16-char minimum.
+        // A prefix shorter than 16 hex chars is by definition too weak to
+        // safely identify a single entry — reject immediately as
+        // STORE-AMBIGUOUS-PREFIX rather than introducing a separate code
+        // (catalog-minimal rule).
+        if hex_part.len() < 16 {
+            return Err(CoreError::Identity(
+                "STORE-AMBIGUOUS-PREFIX",
+                format!(
+                    "prefix {prefix:?} is shorter than the 16-hex-character minimum \
+                     required to safely identify a single store entry \
+                     (got {} hex chars)",
+                    hex_part.len()
+                ),
+            ));
+        }
+
+        // Scan all identities and collect those whose hex digest starts with the prefix.
+        let matches: Vec<String> = self
+            .list_identities()
+            .into_iter()
+            .filter(|id| {
+                id.strip_prefix("sha256:")
+                    .map(|h| h.starts_with(hex_part))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        match matches.len() {
+            1 => Ok(matches.into_iter().next().unwrap()),
+            0 => Err(CoreError::Identity(
+                "CAS-NOT-IN-STORE",
+                format!("no store entry matches prefix {prefix:?}"),
+            )),
+            n => Err(CoreError::Identity(
+                "STORE-AMBIGUOUS-PREFIX",
+                format!(
+                    "prefix {prefix:?} matches {n} store entries \
+                     (need a longer prefix to disambiguate)"
+                ),
+            )),
+        }
+    }
+
     /// Move `src` into the store under `identity`, returning the canonical path
     /// (identity.md §3.3). Verifies `src`'s bytes hash to `identity` first;
-    /// raises `CAS-IDENTITY-MISMATCH` on mismatch, leaving `src` in place and the
-    /// store unmodified. Duplicate admission is a no-op: if the canonical entry
-    /// already exists, `src` is removed and the existing path returned.
+    /// raises `CAS-IDENTITY-MISMATCH` on mismatch, leaving `src` in place and
+    /// the store unmodified.
+    ///
+    /// **Idempotency (C-admit-idem)**: admitting content whose identity is
+    /// already in the store is a successful no-op.  The pre-check below makes
+    /// this O(1) — no rename attempted on a CAS hit.  We trust identity =
+    /// content hash: same identity ⟹ same bytes; no byte comparison on a hit.
+    ///
+    /// **TOCTOU race guard**: if two processes admit the same identity
+    /// concurrently, the loser's rename(2) will fail because the winner already
+    /// created the canonical dir.  That failure folds into the CAS-hit path —
+    /// remove src, return the winner's canonical path.  Content-addressing
+    /// guarantees the bytes are identical, so no corruption can occur.
     pub fn admit(&self, src: &Path, identity: &str) -> Result<PathBuf, CoreError> {
         let actual = compute_content_hash(src)?;
         if actual != identity {
@@ -50,6 +181,17 @@ impl CaStore {
             ));
         }
         let canonical = self.path_for(identity)?;
+
+        // CAS-hit pre-check (C-admit-idem): if the canonical entry already
+        // exists, this is a successful no-op — the store already holds these
+        // bytes under this identity.  Drop src and return the existing path.
+        // O(1): no rename attempted.  We trust identity = content hash; no
+        // byte comparison needed (same identity ⟹ same bytes by construction).
+        if canonical.is_dir() {
+            let _ = std::fs::remove_dir_all(src);
+            return Ok(canonical);
+        }
+
         if let Some(parent) = canonical.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 CoreError::Identity(
@@ -59,8 +201,8 @@ impl CaStore {
             })?;
         }
         // POSIX rename(2): atomic on the same filesystem (scratch + CAS share a
-        // mount). On failure, the canonical entry may already exist from a
-        // concurrent admit of the same identity — that is the duplicate-no-op.
+        // mount). On failure, canonical may have appeared between the pre-check
+        // and this rename (TOCTOU race) — that is still the duplicate-no-op.
         if std::fs::rename(src, &canonical).is_err() {
             if canonical.is_dir() {
                 let _ = std::fs::remove_dir_all(src);
@@ -76,6 +218,57 @@ impl CaStore {
             }
         }
         Ok(canonical)
+    }
+
+    // ------------------------------------------------------------------
+    // §3.4 — scratch lifecycle (C-stage)
+    // ------------------------------------------------------------------
+
+    /// Allocate a fresh unique scratch subdirectory under `<root>/_scratch/<uuid>/`.
+    ///
+    /// The `_scratch/` parent is created lazily on first use.  The returned
+    /// [`ScratchDir`] contains the path to the new empty directory.  The caller
+    /// is responsible for cleanup:
+    /// - On **success** the caller passes `sd.path` to [`CaStore::admit`], which
+    ///   renames it into the store atomically; any remnant must then be removed.
+    /// - On **failure** the caller removes `sd.path` to avoid leaking scratch dirs.
+    ///   (A future C-gc slice will age out any SIGKILL survivors under `_scratch/`.)
+    ///
+    /// Both `_scratch/` and `sha256/` live directly under `root`, so the
+    /// rename(2) in `admit()` is guaranteed same-filesystem (no EXDEV).
+    pub fn scratch(&self) -> Result<ScratchDir, CoreError> {
+        let scratch_root = self.root.join("_scratch");
+        std::fs::create_dir_all(&scratch_root).map_err(|e| {
+            CoreError::Identity(
+                INTERNAL_IO,
+                format!("cannot create scratch root {}: {e}", scratch_root.display()),
+            )
+        })?;
+        // Use a UUID-style unique name so concurrent fetches never collide.
+        let unique: String = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            use std::time::{SystemTime, UNIX_EPOCH};
+            static COUNTER: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos();
+            let pid = std::process::id();
+            let mut h = DefaultHasher::new();
+            (ts, pid, seq).hash(&mut h);
+            format!("{:016x}{:08x}{:08x}", h.finish(), pid, seq)
+        };
+        let path = scratch_root.join(unique);
+        std::fs::create_dir(&path).map_err(|e| {
+            CoreError::Identity(
+                INTERNAL_IO,
+                format!("cannot create scratch dir {}: {e}", path.display()),
+            )
+        })?;
+        Ok(ScratchDir { path })
     }
 
     /// Create a symlink at `target` resolving to the CAS entry for `identity`
@@ -240,6 +433,106 @@ mod tests {
         assert!(!second.exists());
     }
 
+    // -----------------------------------------------------------------------
+    // C-admit-idem: idempotency invariants
+    // -----------------------------------------------------------------------
+
+    /// C-admit-idem: two admits of identical content leave exactly ONE store entry.
+    ///
+    /// Content-addressing guarantees byte-identity: same identity = same bytes.
+    /// The store is append-only; duplicate admission must not create a second entry.
+    #[test]
+    fn admit_idempotent_store_has_exactly_one_entry() {
+        let root = tmp();
+        let store = CaStore::new(root.join("cas"));
+        let first = scratch_tree(&root, "first", "same-bytes");
+        let second = scratch_tree(&root, "second", "same-bytes");
+        let identity = compute_content_hash(&first).unwrap();
+        assert_eq!(identity, compute_content_hash(&second).unwrap(), "test setup");
+
+        store.admit(&first, &identity).unwrap();
+        store.admit(&second, &identity).unwrap();
+
+        let identities = store.list_identities();
+        assert_eq!(
+            identities.len(),
+            1,
+            "expected exactly 1 store entry after two identical admits, got {}: {:?}",
+            identities.len(),
+            identities
+        );
+        assert_eq!(identities[0], identity);
+    }
+
+    /// C-admit-idem: CAS hit returns the SAME path as the original admit.
+    ///
+    /// We trust identity = content hash; we do NOT re-copy or compare bytes on a
+    /// hit.  admit() on a CAS hit is O(1): check canonical exists → return it.
+    #[test]
+    fn admit_cas_hit_returns_same_path_as_original() {
+        let root = tmp();
+        let store = CaStore::new(root.join("cas"));
+        let first = scratch_tree(&root, "first", "deterministic");
+        let identity = compute_content_hash(&first).unwrap();
+        let original_path = store.admit(&first, &identity).unwrap();
+
+        let second = scratch_tree(&root, "second", "deterministic");
+        let hit_path = store.admit(&second, &identity).unwrap();
+
+        assert_eq!(
+            hit_path, original_path,
+            "CAS hit must return the original canonical path, not a new one"
+        );
+        assert_eq!(
+            fs::read_to_string(original_path.join("file.txt")).unwrap(),
+            "deterministic"
+        );
+    }
+
+    /// C-admit-idem: CAS hit removes src (no leak), canonical untouched.
+    #[test]
+    fn admit_cas_hit_src_is_removed_no_leak() {
+        let root = tmp();
+        let store = CaStore::new(root.join("cas"));
+        let first = scratch_tree(&root, "first", "idempotent");
+        let identity = compute_content_hash(&first).unwrap();
+        store.admit(&first, &identity).unwrap();
+
+        // Second admit from a fresh scratch tree — simulates what CasAdmittingFetcher does
+        let second = scratch_tree(&root, "second", "idempotent");
+        let result = store.admit(&second, &identity).unwrap();
+
+        // src must be removed on CAS hit (no _scratch/ leak)
+        assert!(!second.exists(), "CAS hit must remove src to prevent scratch leak");
+        // Return value is the canonical path
+        assert!(result.is_dir());
+        assert_eq!(
+            fs::read_to_string(result.join("file.txt")).unwrap(),
+            "idempotent"
+        );
+    }
+
+    /// C-admit-idem: two distinct contents → two distinct entries, both present.
+    #[test]
+    fn admit_different_contents_produce_distinct_entries() {
+        let root = tmp();
+        let store = CaStore::new(root.join("cas"));
+        let alpha = scratch_tree(&root, "alpha", "content-alpha");
+        let beta = scratch_tree(&root, "beta", "content-beta");
+        let id_alpha = compute_content_hash(&alpha).unwrap();
+        let id_beta = compute_content_hash(&beta).unwrap();
+        assert_ne!(id_alpha, id_beta, "test setup: distinct content must differ");
+
+        let path_a = store.admit(&alpha, &id_alpha).unwrap();
+        let path_b = store.admit(&beta, &id_beta).unwrap();
+
+        assert_ne!(path_a, path_b);
+        assert!(store.contains(&id_alpha).unwrap());
+        assert!(store.contains(&id_beta).unwrap());
+        let identities = store.list_identities();
+        assert_eq!(identities.len(), 2);
+    }
+
     #[test]
     fn admit_rejects_src_whose_bytes_dont_match_claimed_identity() {
         let root = tmp();
@@ -349,5 +642,45 @@ mod tests {
             return CaStore::new(PathBuf::from(x).join("milpa").join("cas"));
         }
         CaStore::new(PathBuf::from(home).join(".cache").join("milpa").join("cas"))
+    }
+
+    // -----------------------------------------------------------------------
+    // §3.4 — scratch lifecycle (C-stage)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scratch_returns_path_under_scratch_root() {
+        let root = tmp();
+        let store = CaStore::new(root.join("cas"));
+        let sd = store.scratch().unwrap();
+        let expected_parent = root.join("cas").join("_scratch");
+        assert_eq!(sd.path.parent().unwrap(), expected_parent);
+        assert!(sd.path.is_dir(), "scratch subdir must exist after scratch()");
+    }
+
+    #[test]
+    fn scratch_creates_unique_subdirs_per_call() {
+        let root = tmp();
+        let store = CaStore::new(root.join("cas"));
+        let s1 = store.scratch().unwrap();
+        let s2 = store.scratch().unwrap();
+        assert_ne!(s1.path, s2.path, "each scratch() call must return a distinct subdir");
+        // clean up
+        let _ = std::fs::remove_dir_all(&s1.path);
+        let _ = std::fs::remove_dir_all(&s2.path);
+    }
+
+    #[test]
+    fn scratch_is_sibling_of_sha256() {
+        let root = tmp();
+        let store = CaStore::new(root.join("cas"));
+        let sd = store.scratch().unwrap();
+        // <cas_root>/_scratch/ must be a sibling of <cas_root>/sha256/
+        assert_eq!(
+            sd.path.parent().unwrap().parent().unwrap(),
+            root.join("cas"),
+            "_scratch/ must be a direct child of cas_root"
+        );
+        let _ = std::fs::remove_dir_all(&sd.path);
     }
 }

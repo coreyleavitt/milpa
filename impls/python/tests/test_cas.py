@@ -111,6 +111,101 @@ def test_admit_duplicate_is_noop(store: CAStore, tmp: Path) -> None:
     assert not second.exists()  # removed after duplicate detect
 
 
+# ---------------------------------------------------------------------------
+# C-admit-idem: idempotency invariants (CAS hit path)
+# ---------------------------------------------------------------------------
+
+
+def test_admit_idempotent_store_has_exactly_one_entry(store: CAStore, tmp: Path) -> None:
+    """Admitting the same content twice must leave exactly ONE entry in the store.
+
+    Content-addressing guarantees byte-identity: same identity = same bytes.
+    The store is append-only; duplicate admission must not create a second entry.
+    """
+    first = _tree(tmp, "first", "same-bytes")
+    second = _tree(tmp, "second", "same-bytes")
+    identity = compute_content_hash(first)
+    assert identity == compute_content_hash(second), "test setup: both must hash identically"
+
+    store.admit(first, identity)
+    store.admit(second, identity)
+
+    identities = store.list_identities()
+    assert len(identities) == 1, (
+        f"expected exactly 1 store entry after two identical admits, got {len(identities)}: {identities}"
+    )
+    assert identities[0] == identity
+
+
+def test_admit_cas_hit_src_removed_no_scratch_leak(store: CAStore, tmp: Path) -> None:
+    """CAS hit via admit() inside scratch() context: scratch is cleaned, no _scratch/ leak.
+
+    This verifies the CAS-hit path in the context of the C-stage scratch lifecycle:
+    admit() removes src on CAS hit, scratch() cleanup then finds it already gone
+    (ignore_errors=True handles the no-op cleanly) — no orphaned _scratch/ entries.
+    """
+    # First: establish a CAS entry
+    first = _tree(tmp, "first", "idempotent")
+    identity = compute_content_hash(first)
+    store.admit(first, identity)
+
+    # Second: use scratch() context (as CasAdmittingFetcher does), trigger CAS hit
+    with store.scratch() as scratch:
+        # Write same content into scratch
+        (scratch.path / "file.txt").write_text("idempotent", encoding="utf-8")
+        # admit() detects canonical already exists → CAS hit → removes scratch.path
+        result = store.admit(scratch.path, identity)
+        assert result == store.path_for(identity), "CAS hit must return existing canonical"
+        # scratch.path was removed by admit(); context manager cleanup is a harmless no-op
+
+    # After context exit: no orphaned _scratch/ entries
+    scratch_root = store.root / "_scratch"
+    if scratch_root.is_dir():
+        remaining = [p for p in scratch_root.iterdir()]
+        assert remaining == [], (
+            f"orphaned _scratch/ entries after CAS hit: {remaining}"
+        )
+
+
+def test_admit_cas_hit_returns_same_path_as_original(store: CAStore, tmp: Path) -> None:
+    """CAS hit returns the SAME path as the original admit (byte-identity guarantee).
+
+    We trust identity = content hash; we do NOT re-copy or compare bytes on a hit.
+    admit() on a CAS hit is O(1): check canonical exists → return it.
+    """
+    tree = _tree(tmp, "src", "deterministic")
+    identity = compute_content_hash(tree)
+    original_path = store.admit(tree, identity)
+
+    # Second admit from a fresh scratch tree
+    second = _tree(tmp, "second", "deterministic")
+    hit_path = store.admit(second, identity)
+
+    assert hit_path == original_path, (
+        "CAS hit must return the original canonical path, not a new one"
+    )
+    # Original entry is untouched
+    assert (original_path / "file.txt").read_text() == "deterministic"
+
+
+def test_admit_different_contents_produce_distinct_entries(store: CAStore, tmp: Path) -> None:
+    """Two distinct contents → two distinct CAS entries, both present after both admits."""
+    alpha = _tree(tmp, "alpha", "content-alpha")
+    beta = _tree(tmp, "beta", "content-beta")
+    id_alpha = compute_content_hash(alpha)
+    id_beta = compute_content_hash(beta)
+    assert id_alpha != id_beta, "test setup: distinct content must have distinct identities"
+
+    path_a = store.admit(alpha, id_alpha)
+    path_b = store.admit(beta, id_beta)
+
+    assert path_a != path_b
+    assert store.contains(id_alpha)
+    assert store.contains(id_beta)
+    identities = store.list_identities()
+    assert len(identities) == 2
+
+
 def test_admit_returns_existing_canonical_if_race(store: CAStore, tmp: Path) -> None:
     """Manual race simulation: manually move tree to canonical first, then admit."""
     tree1 = _tree(tmp, "t1", "race")

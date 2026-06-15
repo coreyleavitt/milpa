@@ -17,6 +17,7 @@ import pytest
 from milpa.errors import (
     ID_NO_ALGORITHM_PREFIX,
     ID_NON_HEX_DIGEST,
+    ID_NON_UTF8_RELPATH,
     ID_NON_UTF8_SYMLINK_TARGET,
     ID_NOT_A_STRING,
     ID_UNSUPPORTED_ALGORITHM,
@@ -227,37 +228,41 @@ def test_adding_files_under_git_does_not_change_hash(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# compute_content_hash — mode bits matter (identity.md §1.7)
+# compute_content_hash — exec bit excluded from identity (Resolved Decision 1)
 # ---------------------------------------------------------------------------
 
 
-def test_executable_bit_changes_hash(tmp_path: Path) -> None:
-    """Toggling the owner-execute bit changes the hash (§1.7)."""
+def test_executable_bit_does_not_change_hash(tmp_path: Path) -> None:
+    """Toggling the owner-execute bit does NOT change the hash (Resolved Decision 1).
+
+    The mode-marker byte stays in the byte stream to distinguish symlinks (0x80)
+    from regular files (0x00), but the 0x01 'executable' value and all S_IXUSR
+    selection logic are removed. Regular files always emit 0x00.
+    """
     content = "#!/bin/sh\necho hi\n"
     tree_non_exec = make_tree({"script.sh": (content, False)}, tmp_path / "non_exec")
     tree_exec = make_tree({"script.sh": (content, True)}, tmp_path / "exec")
-    assert compute_content_hash(tree_non_exec) != compute_content_hash(tree_exec)
+    assert compute_content_hash(tree_non_exec) == compute_content_hash(tree_exec)
 
 
-def test_only_owner_execute_bit_is_significant(tmp_path: Path) -> None:
-    """Group/world execute bits do NOT affect the hash; only S_IXUSR does (§1.7)."""
+def test_no_execute_bit_affects_hash(tmp_path: Path) -> None:
+    """Owner, group, and world execute bits each leave the hash unchanged (Resolved Decision 1)."""
     tree = make_tree({"f.sh": ("#!/bin/sh\n", False)}, tmp_path / "t")
     fpath = tree / "f.sh"
 
-    # Start with no execute bits.
     base_hash = compute_content_hash(tree)
 
-    # Set group-execute only (S_IXGRP = 0o010) — should NOT change the hash.
+    # Set owner-execute (S_IXUSR = 0o100) — must NOT change the hash.
+    fpath.chmod(fpath.stat().st_mode | 0o100)
+    assert compute_content_hash(tree) == base_hash
+
+    # Set group-execute (S_IXGRP = 0o010) — must NOT change the hash.
     fpath.chmod(fpath.stat().st_mode | 0o010)
     assert compute_content_hash(tree) == base_hash
 
-    # Set world-execute only (S_IXOTH = 0o001) — should NOT change the hash.
+    # Set world-execute (S_IXOTH = 0o001) — must NOT change the hash.
     fpath.chmod(fpath.stat().st_mode | 0o001)
     assert compute_content_hash(tree) == base_hash
-
-    # Now set owner-execute (S_IXUSR = 0o100) — MUST change the hash.
-    fpath.chmod(fpath.stat().st_mode | stat.S_IXUSR)
-    assert compute_content_hash(tree) != base_hash
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +360,7 @@ def test_output_is_valid_per_parse_identity(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 RUST_ORACLE_HASH = (
-    "sha256:efa2102677df3bf6ffee86e2503f78e1467ecca8de4ea1a1f79762b2011c60b9"
+    "sha256:85f2eb93585a6870b118351b14b8e32a4f55d61809f1612aaca5bae3c3db61cd"
 )
 
 
@@ -421,3 +426,41 @@ def test_non_utf8_symlink_target_raises_error(tmp_path: Path) -> None:
     with pytest.raises(MilpaError) as exc_info:
         compute_content_hash(tmp)
     assert exc_info.value.slug == ID_NON_UTF8_SYMLINK_TARGET
+
+
+# ---------------------------------------------------------------------------
+# compute_content_hash — ID-NON-UTF8-RELPATH (spec/errors.md; distinct from
+# ID-NON-UTF8-SYMLINK-TARGET which covers non-UTF-8 symlink *targets*)
+# ---------------------------------------------------------------------------
+
+
+def test_non_utf8_relpath_raises_error(tmp_path: Path) -> None:
+    """A file whose name contains non-UTF-8 bytes raises ID-NON-UTF8-RELPATH.
+
+    Mirrors the ID-NON-UTF8-SYMLINK-TARGET test: create a real filesystem entry
+    whose *name* (not target) is non-UTF-8, then verify compute_content_hash
+    raises the coded MilpaError rather than an uncoded UnicodeEncodeError crash.
+
+    Skipped gracefully if the OS/filesystem rejects the filename.
+    """
+    tmp = tmp_path / "t"
+    tmp.mkdir()
+    # Construct a directory whose byte name is non-UTF-8.
+    # Use bytes API to create a path component with raw 0xff byte.
+    bad_name = b"\xff\xfe"  # not valid UTF-8
+    bad_dir_bytes = os.fsencode(tmp) + b"/" + bad_name
+    try:
+        os.mkdir(bad_dir_bytes)
+        # Place a regular file inside the non-UTF-8-named directory so rglob
+        # encounters the bad relpath.
+        child = bad_dir_bytes + b"/file.txt"
+        with open(child, "wb") as f:
+            f.write(b"hello")
+    except OSError:
+        # Some filesystems (vfat, certain WSL mounts) reject non-UTF-8 byte
+        # sequences in filenames; skip gracefully.
+        pytest.skip("filesystem rejected non-UTF-8 filename bytes")
+
+    with pytest.raises(MilpaError) as exc_info:
+        compute_content_hash(tmp)
+    assert exc_info.value.slug == ID_NON_UTF8_RELPATH

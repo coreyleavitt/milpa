@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use milpa_manifest::{Manifest, Workspace};
-pub use milpa_types::Lockfile;
+pub use milpa_types::{LockedDep, Lockfile, ProvenanceRecord};
 use milpa_types::ResolvedGraph;
 
 pub mod dep_decl;
@@ -58,7 +58,7 @@ pub use fetchers::{
     mocked_default_branch, resolve_mock_key, stage_mock_content, url_key, CasAdmittingFetcher,
     DefaultRegistry, MockedFetcher,
 };
-pub use frozen::{resolve_frozen, resolve_workspace_frozen};
+pub use frozen::{rebuild_deps_view, resolve_frozen, resolve_workspace_frozen};
 pub use identity::{compute_content_hash, parse_identity, SUPPORTED_ALGORITHMS};
 pub use milpa_manifest::{parse_document, AttestationPolicy, ManifestDoc, Profile};
 pub use milpa_solver::{parse_version, Strategy};
@@ -127,8 +127,9 @@ impl Resolver for Milpa {
         p: Option<&Profile>,
         prior: Option<&Lockfile>,
         deps_dir: &Path,
+        store: &CaStore,
     ) -> Result<ResolvedGraph, MilpaError> {
-        resolver::resolve_default_strategy(m, idx, f, p, prior, deps_dir)
+        resolver::resolve_default_strategy(m, idx, f, p, prior, deps_dir, store)
     }
 
     fn resolve_workspace(
@@ -136,6 +137,7 @@ impl Resolver for Milpa {
         _w: &Workspace,
         params: ResolveParams<'_>,
         deps_dir: &Path,
+        store: &CaStore,
     ) -> Result<ResolvedGraph, MilpaError> {
         // The trait carries the *parsed* workspace, but the union resolve needs
         // each member's loaded manifest + directory. In a real project layout the
@@ -153,6 +155,7 @@ impl Resolver for Milpa {
             milpa_solver::Strategy::default(),
             deps_dir,
             params.require_attested_metadata,
+            store,
         )
     }
 }
@@ -207,6 +210,9 @@ pub struct ResolveParams<'a> {
 /// Full resolution (the `cmd=resolve` path). `prior` carries the previous
 /// lockfile for pin reuse (resolver-semantics §8); fixtures that don't test
 /// pin reuse pass `None`.
+///
+/// `store` is the content-addressed store used to rebuild `_deps/` after
+/// resolution completes (B-nimcfg SSOT: alias symlinks + stale-entry removal).
 pub trait Resolver {
     fn resolve(
         &self,
@@ -216,6 +222,7 @@ pub trait Resolver {
         p: Option<&Profile>,
         prior: Option<&Lockfile>,
         deps_dir: &Path,
+        store: &CaStore,
     ) -> Result<ResolvedGraph, MilpaError>;
 
     fn resolve_workspace(
@@ -223,6 +230,7 @@ pub trait Resolver {
         w: &Workspace,
         params: ResolveParams<'_>,
         deps_dir: &Path,
+        store: &CaStore,
     ) -> Result<ResolvedGraph, MilpaError>;
 }
 

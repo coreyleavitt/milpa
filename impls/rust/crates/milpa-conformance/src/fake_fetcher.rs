@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use milpa_core::{
     CaStore, CasAdmittingFetcher, FetchError, FetcherRegistry, MockedFetcher, Receipt,
 };
+use milpa_core::fetchers::fetch_local;
 use milpa_types::Provenance;
 
 /// Records each `(name, url, ref)` call so a fixture can assert fetch behavior
@@ -30,29 +31,39 @@ pub struct FetchCall {
 /// `_deps/<name>` → the store entry. Call recording is the only responsibility
 /// of this type; the transport + CAS orchestration delegates to the inner
 /// `CasAdmittingFetcher<MockedFetcher>` (single source of truth).
+///
+/// Local deps are NOT mocked — the real `fetch_local` is used with the path
+/// rebased from `scratch_root` to `fixture_dir` (where the source tree lives).
 pub struct FakeFetcher {
     inner: CasAdmittingFetcher<MockedFetcher>,
     calls: RefCell<Vec<FetchCall>>,
+    /// The fixture directory: source trees for local deps live here.
+    fixture_dir: PathBuf,
+    /// The scratch root: the resolver computes local paths relative to
+    /// `deps_dir.parent()` = scratch root. We rebase to `fixture_dir`.
+    scratch_root: PathBuf,
 }
 
 impl FakeFetcher {
-    pub fn new(mocked_fetches_dir: impl Into<PathBuf>, cas_root: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        mocked_fetches_dir: impl Into<PathBuf>,
+        cas_root: impl Into<PathBuf>,
+        fixture_dir: impl Into<PathBuf>,
+        scratch_root: impl Into<PathBuf>,
+    ) -> Self {
         let mocked_fetches_dir = mocked_fetches_dir.into();
         let cas_root = cas_root.into();
-        // staging_root: parent of cas_root keeps staging on the same filesystem
-        // as the CAS so that admit()'s rename(2) is atomic.
-        let staging_root = cas_root
-            .parent()
-            .unwrap_or(&cas_root)
-            .to_path_buf();
+        // C-stage: CasAdmittingFetcher owns staging via CaStore::scratch() —
+        // no external staging_root parameter needed.
         let inner = CasAdmittingFetcher::new(
             MockedFetcher::new(&mocked_fetches_dir),
             CaStore::new(cas_root),
-            staging_root,
         );
         FakeFetcher {
             inner,
             calls: RefCell::new(Vec::new()),
+            fixture_dir: fixture_dir.into(),
+            scratch_root: scratch_root.into(),
         }
     }
 
@@ -64,31 +75,49 @@ impl FakeFetcher {
 
 impl FetcherRegistry for FakeFetcher {
     fn fetch(&self, name: &str, p: &Provenance, dest: &Path) -> Result<Receipt, FetchError> {
-        // The conformance corpus mocks git and tarball provenance (§2.3). The
-        // (url, ref) pair is only for the call record; the transport + CAS admit
-        // are delegated to the inner fetcher below (single source of truth).
-        let (url, ref_spec) = match p {
-            Provenance::Git { url, ref_spec, .. } => (url.as_str(), ref_spec.as_str()),
-            Provenance::Tarball { url, .. } => (url.as_str(), ""),
-            other => {
-                return Err(FetchError::Failed(format!(
-                    "FakeFetcher: unmocked provenance kind: {other:?}"
-                )));
+        match p {
+            // Local deps: use the REAL fetch_local (no mock, no CAS admission).
+            // The resolver already resolved the relative path against scratch_root;
+            // rebase it to fixture_dir so it points at the in-fixture source tree.
+            Provenance::Local { path } => {
+                let abs_path = Path::new(path);
+                // The resolver computes: project_root.join(dep.path) where
+                // project_root = deps_dir.parent() = scratch_root.  Strip the
+                // scratch_root prefix and re-join under fixture_dir.
+                let rebased = if let Ok(rel) = abs_path.strip_prefix(&self.scratch_root) {
+                    self.fixture_dir.join(rel)
+                } else {
+                    // Path was already absolute and not under scratch_root
+                    // (e.g. someone passed an absolute fixture path directly).
+                    abs_path.to_path_buf()
+                };
+                fetch_local(name, &rebased, dest)
             }
-        };
 
-        // Delegate the full stage → hash → admit → link orchestration to the
-        // inner CasAdmittingFetcher<MockedFetcher> (single source of truth).
-        // Record the call only on success so that missing-key errors (which
-        // the inner fetcher will surface as FETCH-MOCK-MISSING) don't produce
-        // a spurious call record — mirrors the old FakeFetcher behaviour.
-        let receipt = self.inner.fetch(name, p, dest)?;
-        self.calls.borrow_mut().push(FetchCall {
-            name: name.to_string(),
-            url: url.to_string(),
-            ref_spec: ref_spec.to_string(),
-        });
-        Ok(receipt)
+            // Git and tarball: delegate to the inner CasAdmittingFetcher<MockedFetcher>.
+            // Record call only on success (mirrors old behaviour).
+            Provenance::Git { url, ref_spec, .. } => {
+                let receipt = self.inner.fetch(name, p, dest)?;
+                self.calls.borrow_mut().push(FetchCall {
+                    name: name.to_string(),
+                    url: url.clone(),
+                    ref_spec: ref_spec.clone(),
+                });
+                Ok(receipt)
+            }
+            Provenance::Tarball { url, .. } => {
+                let receipt = self.inner.fetch(name, p, dest)?;
+                self.calls.borrow_mut().push(FetchCall {
+                    name: name.to_string(),
+                    url: url.clone(),
+                    ref_spec: String::new(),
+                });
+                Ok(receipt)
+            }
+            other => Err(FetchError::Failed(format!(
+                "FakeFetcher: unmocked provenance kind: {other:?}"
+            ))),
+        }
     }
 }
 
@@ -112,7 +141,7 @@ mod tests {
         std::fs::write(key_dir.join("content").join("foo.nim"), b"# src").unwrap();
         std::fs::write(key_dir.join("foo.nimble"), b"version = \"1.0.0\"").unwrap();
 
-        let fetcher = FakeFetcher::new(&mocked, tmp.path().join(".cas"));
+        let fetcher = FakeFetcher::new(&mocked, tmp.path().join(".cas"), tmp.path(), tmp.path());
         // The resolver guarantees `_deps/` exists before fetch; mirror that.
         std::fs::create_dir_all(tmp.path().join("_deps")).unwrap();
         let dest = tmp.path().join("_deps").join("foo");
@@ -142,7 +171,7 @@ mod tests {
     #[test]
     fn missing_mock_is_fetch_mock_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let fetcher = FakeFetcher::new(tmp.path().join("mocked-fetches"), tmp.path().join(".cas"));
+        let fetcher = FakeFetcher::new(tmp.path().join("mocked-fetches"), tmp.path().join(".cas"), tmp.path(), tmp.path());
         let p = Provenance::Git {
             url: "https://example.com/x.git".into(),
             ref_spec: "main".into(),
@@ -166,7 +195,7 @@ mod tests {
         let mocked = tmp.path().join("mocked-fetches");
         let url = "https://example.com/foo.tar.gz";
         stage_tarball_mock(&mocked, url, "abc123");
-        let fetcher = FakeFetcher::new(&mocked, tmp.path().join(".cas"));
+        let fetcher = FakeFetcher::new(&mocked, tmp.path().join(".cas"), tmp.path(), tmp.path());
         std::fs::create_dir_all(tmp.path().join("_deps")).unwrap();
         let dest = tmp.path().join("_deps").join("foo");
         let p = Provenance::Tarball {
@@ -186,7 +215,7 @@ mod tests {
         let mocked = tmp.path().join("mocked-fetches");
         let url = "https://example.com/foo.tar.gz";
         stage_tarball_mock(&mocked, url, "actual_sha");
-        let fetcher = FakeFetcher::new(&mocked, tmp.path().join(".cas"));
+        let fetcher = FakeFetcher::new(&mocked, tmp.path().join(".cas"), tmp.path(), tmp.path());
         std::fs::create_dir_all(tmp.path().join("_deps")).unwrap();
         let dest = tmp.path().join("_deps").join("foo");
         let p = Provenance::Tarball {

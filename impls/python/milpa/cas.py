@@ -27,7 +27,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from milpa.errors import CAS_IDENTITY_MISMATCH, CAS_NOT_IN_STORE, MilpaError
+from milpa.errors import CAS_IDENTITY_MISMATCH, CAS_NOT_IN_STORE, STORE_AMBIGUOUS_PREFIX, MilpaError
 from milpa.identity import compute_content_hash, parse_identity
 
 # ---------------------------------------------------------------------------
@@ -108,6 +108,97 @@ class CAStore:
         """``True`` iff the store already holds an entry for *identity*."""
         return self.path_for(identity).is_dir()
 
+    def list_identities(self) -> list[str]:
+        """Return a lexicographically sorted list of all identities in the store.
+
+        Scans ``<root>/<algorithm>/<hex-digest>/`` directories.  Only the
+        ``sha256`` algorithm directory is expected per spec/identity.md §3.
+        Empty store → empty list.  Entries are returned in the canonical
+        ``sha256:<64hex>`` form.
+        """
+        identities: list[str] = []
+        sha256_dir = self.root / "sha256"
+        if sha256_dir.is_dir():
+            for entry in sha256_dir.iterdir():
+                if entry.is_dir() and not entry.name.startswith("_"):
+                    identities.append(f"sha256:{entry.name}")
+        identities.sort()
+        return identities
+
+    def resolve_prefix(self, prefix: str) -> str:
+        """Resolve a hex-digest prefix (with or without ``sha256:`` algorithm prefix)
+        to a full identity string.
+
+        Rules (spec/identity.md §3, C-store-ro slice):
+        - A complete identity (``sha256:<64hex>`` or bare 64-hex) → exact lookup.
+          Present → return the full identity.  Absent → raise ``CAS-NOT-IN-STORE``.
+        - Else treat as a prefix of the hex digest.  The hex portion of the prefix
+          MUST be at least 16 characters; anything shorter is rejected as
+          ``STORE-AMBIGUOUS-PREFIX`` (a <16-char prefix is by definition too weak
+          to safely pin one entry; we reuse the ambiguous-prefix code rather than
+          inventing a separate "too short" code to keep the error catalog minimal).
+        - Exactly 1 match → return the full identity.
+        - 0 matches → raise ``CAS-NOT-IN-STORE``.
+        - >1 match → raise ``STORE-AMBIGUOUS-PREFIX``.
+
+        The caller may then use ``path_for(identity)`` on the returned identity.
+        """
+        # Strip optional algorithm prefix to get the raw hex portion of the arg.
+        if prefix.startswith("sha256:"):
+            hex_part = prefix[len("sha256:"):]
+        else:
+            hex_part = prefix
+
+        # Exact match: 64-hex digest → direct lookup.
+        if len(hex_part) == 64:
+            full_identity = f"sha256:{hex_part}"
+            if self.contains(full_identity):
+                return full_identity
+            raise MilpaError(
+                CAS_NOT_IN_STORE,
+                f"identity not in store: {full_identity!r}",
+                identity=full_identity,
+            )
+
+        # Prefix match: enforce the 16-char minimum.
+        # A prefix shorter than 16 hex chars is by definition too weak to
+        # safely identify a single entry — reject immediately as STORE-AMBIGUOUS-PREFIX
+        # rather than introducing a separate "too short" error code (catalog-minimal rule).
+        if len(hex_part) < 16:
+            raise MilpaError(
+                STORE_AMBIGUOUS_PREFIX,
+                f"prefix {prefix!r} is shorter than the 16-hex-character minimum "
+                f"required to safely identify a single store entry "
+                f"(got {len(hex_part)} hex chars)",
+                prefix=prefix,
+                hex_length=len(hex_part),
+            )
+
+        # Scan all identities and collect those whose hex digest starts with the prefix.
+        matches = [
+            identity
+            for identity in self.list_identities()
+            if identity[len("sha256:"):].startswith(hex_part)
+        ]
+
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) == 0:
+            raise MilpaError(
+                CAS_NOT_IN_STORE,
+                f"no store entry matches prefix {prefix!r}",
+                prefix=prefix,
+            )
+        # >1 match → ambiguous
+        raise MilpaError(
+            STORE_AMBIGUOUS_PREFIX,
+            f"prefix {prefix!r} matches {len(matches)} store entries "
+            f"(need a longer prefix to disambiguate): "
+            + ", ".join(m[:20] + "…" for m in matches[:4]),
+            prefix=prefix,
+            matches=[m for m in matches],
+        )
+
     # ------------------------------------------------------------------
     # §3.3 — admit
     # ------------------------------------------------------------------
@@ -119,12 +210,20 @@ class CAStore:
         1. Compute the content hash of *src* and compare to *identity*.
            On mismatch, raise ``CAS-IDENTITY-MISMATCH`` and leave *src* in
            place (store is NOT modified).
-        2. ``mkdir -p <root>/<algorithm>/`` (the parent of the canonical entry).
-        3. Atomic ``rename(2)`` of *src* to the canonical path.
-        4. If rename fails because the canonical path already exists (concurrent
-           admit of the same identity), remove *src* and return the existing
-           canonical path — the **duplicate-admission = no-op** rule.
-        5. Return the canonical path.
+        2. **CAS-hit pre-check (idempotency)**: if the canonical entry already
+           exists, drop *src* and return the existing path immediately — O(1),
+           no rename attempted.  This is the **duplicate-admission = no-op** rule
+           (identity.md §3.3 / C-admit-idem).
+           We trust identity = content hash: same identity ⟹ same bytes, so
+           we never re-copy or compare bytes on a hit.
+        3. ``mkdir -p <root>/<algorithm>/`` (the parent of the canonical entry).
+        4. Atomic ``rename(2)`` of *src* to the canonical path.
+        5. TOCTOU race guard: if the rename raises ``OSError`` because another
+           process admitted the same identity between step 2 and step 4, fold
+           into the CAS-hit path — remove *src*, return existing canonical.
+           If the canonical entry is NOT present after the rename fails, a
+           genuine I/O error occurred; re-raise.
+        6. Return the canonical path.
 
         The rename is atomic because *src* MUST reside under
         ``<root>/_scratch/`` (same filesystem mount as the CAS entries).  See
@@ -140,15 +239,24 @@ class CAStore:
             )
 
         canonical = self.path_for(identity)
+
+        # CAS-hit pre-check (C-admit-idem): if the canonical entry already exists,
+        # this is a successful no-op — the store already holds these bytes under
+        # this identity.  Drop src and return the existing path.  O(1): no rename
+        # attempted.  We trust identity = content hash; no byte comparison needed.
+        if canonical.is_dir():
+            shutil.rmtree(src, ignore_errors=True)
+            return canonical
+
         canonical.parent.mkdir(parents=True, exist_ok=True)
 
         try:
             src.rename(canonical)
         except OSError:
-            # Lost the race: another process admitted the same identity concurrently.
-            # If the canonical entry is now present, our src is redundant — remove it
-            # and return the winner's canonical path.  If the canonical entry is NOT
-            # present, a different OS error caused the rename to fail; re-raise.
+            # TOCTOU race: another process admitted the same identity between the
+            # pre-check above and this rename.  If canonical is now present, our
+            # src is redundant — fold into the CAS-hit path.  If canonical is
+            # still absent, a genuine I/O error occurred; re-raise.
             if canonical.is_dir():
                 shutil.rmtree(src, ignore_errors=True)
             else:

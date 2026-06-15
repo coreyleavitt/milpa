@@ -11,6 +11,16 @@ callers are responsible for cleaning up a partially-extracted ``dest`` on error.
 All size limits are applied **during** extraction (streaming); path-escape checks
 run **per-entry before any write**.  Device nodes, FIFOs, and other non-regular,
 non-symlink, non-directory entry types are silently skipped.
+
+SA-1 decompression-bomb guard (Python path):
+Python's ``tarfile`` reads ``member.size`` (uncompressed size) from each tar
+header *before* extracting the entry's data.  The per-file and total-size checks
+below operate on ``member.size`` and are therefore effective decompression-bomb
+defenses: the cap fires before any compressed bytes are decompressed and written
+to disk.  The Rust path uses a ``.take(decomp_cap)`` wrapper on the GzDecoder
+because Rust decompresses the whole stream up-front before calling
+``extract_tar``; that early abort is not needed here because Python's tarfile
+decompresses lazily per-entry.
 """
 
 from __future__ import annotations
@@ -130,6 +140,16 @@ def extract_tar(
 
     total_bytes = 0
     file_count = 0
+
+    # SA-1 decompression-bomb guard (Python path):
+    # Python's tarfile decompresses lazily: it reads member headers (which
+    # record the *uncompressed* size in member.size) and decompresses each
+    # entry's data only when it is extracted.  The per-file and total-size
+    # checks below operate on member.size (uncompressed) and are therefore
+    # effective decompression-bomb defenses — no additional wrapping needed.
+    # The Rust path uses a `.take(decomp_cap)` on the GzDecoder to catch
+    # bombs before any bytes are written to disk; in Python the equivalent
+    # is the per-entry size check that fires before the fobj.read() call.
 
     # Open with mode "r:*" so tarfile handles gz/bz2/xz automatically.
     with tarfile.open(fileobj=archive if not isinstance(archive, (str, Path)) else None,

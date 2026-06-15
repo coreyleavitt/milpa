@@ -42,6 +42,22 @@ from milpa.fetchers.types import (
 )
 
 # ---------------------------------------------------------------------------
+# R4 — compressed-download cap
+# ---------------------------------------------------------------------------
+
+#: Maximum compressed bytes accepted from a single HTTP download before the
+#: request is rejected.  Set to 4 × Limits.max_total_size (4 GiB) — a
+#: conservative upper bound given typical archive compression ratios.
+#:
+#: Both impls (Python and Rust) use the SAME numeric value so the transport
+#: hardening is cross-impl byte-identical (finding R4).
+#:
+#: The cap is enforced by reading at most ``MAX_COMPRESSED_BYTES`` bytes from
+#: the transport; if the response exceeds the cap, ``FETCH-DOWNLOAD-FAILED``
+#: is raised before any bytes are buffered beyond the cap.
+MAX_COMPRESSED_BYTES: int = _DEFAULT_LIMITS.max_total_size * 4  # 4 GiB
+
+# ---------------------------------------------------------------------------
 # TarballProvenance
 # ---------------------------------------------------------------------------
 
@@ -107,12 +123,17 @@ class TarballReceipt(ProvenanceReceipt):
 HttpGet = Callable[[str], bytes]
 
 
-def make_http_get() -> HttpGet:
-    """Return a production ``HttpGet`` backed by ``curl -fsSL``."""
+def make_http_get(compressed_cap: int = MAX_COMPRESSED_BYTES) -> HttpGet:
+    """Return a production ``HttpGet`` backed by ``curl -fsSL``.
+
+    ``compressed_cap`` is passed to curl as ``--max-filesize`` (R4: cap the
+    compressed download before decompression so a malicious mirror cannot OOM
+    the process before the decompression-bomb guard fires).
+    """
 
     def _curl(url: str) -> bytes:
         result = subprocess.run(
-            ["curl", "-fsSL", url],
+            ["curl", "-fsSL", f"--max-filesize={compressed_cap}", url],
             capture_output=True,
         )
         if result.returncode != 0:
@@ -154,9 +175,11 @@ class TarballFetcher(Fetcher):
         self,
         http_get: HttpGet | None = None,
         limits: Limits = _DEFAULT_LIMITS,
+        compressed_cap: int = MAX_COMPRESSED_BYTES,
     ) -> None:
         self._http_get: HttpGet = http_get if http_get is not None else make_http_get()
         self._limits = limits
+        self._compressed_cap = compressed_cap
 
     def can_handle(self, p: Provenance) -> bool:
         return isinstance(p, TarballProvenance)
@@ -172,7 +195,7 @@ class TarballFetcher(Fetcher):
             # Programmer-invariant: only called after can_handle → True.
             raise TypeError(f"TarballFetcher.fetch called with {type(p).__name__!r}")
 
-        # 1. Download.
+        # 1. Download (R4: compressed-download cap).
         try:
             raw_bytes = self._http_get(p.url)
         except MilpaError:
@@ -185,13 +208,26 @@ class TarballFetcher(Fetcher):
                 url=p.url,
             ) from exc
 
+        # R4: enforce the compressed-body cap.  The production transport uses
+        # curl --max-filesize to abort early; injected transports (tests, mocks)
+        # return bytes directly, so we check len() here as a safety net.
+        if len(raw_bytes) > self._compressed_cap:
+            raise MilpaError(
+                FETCH_DOWNLOAD_FAILED,
+                f"fetching {name!r} from {p.url!r}: compressed body "
+                f"({len(raw_bytes)} bytes) exceeds download cap "
+                f"({self._compressed_cap} bytes); possible oversized mirror",
+                dep=name,
+                url=p.url,
+            )
+
         # 2. Compute archive SHA-256 (always — needed for TOFU recording even on
         #    first-use when expected_sha256 is None).
         actual_sha = hashlib.sha256(raw_bytes).hexdigest()
 
         # 3. Verify against expected (refetch + prior lock path).
         if p.expected_sha256 is not None:
-            want = p.expected_sha256.removeprefix("sha256:")
+            want = p.expected_sha256.removeprefix("sha256:").lower()
             if actual_sha != want:
                 raise MilpaError(
                     FETCH_SHA256_MISMATCH,

@@ -69,12 +69,32 @@ pub fn resolve_frozen(
                     ),
                 ));
             }
-            _ => {}
+            _ => {
+                // Pre-validate CAS presence for each dep before rebuilding.
+                // This ensures FROZEN-IDENTITY-NOT-IN-STORE is raised eagerly.
+                let in_store = match &locked.identity {
+                    Some(id) if !id.is_empty() => store.contains(id).unwrap_or(false),
+                    _ => false,
+                };
+                if !in_store {
+                    return Err(frozen(
+                        "FROZEN-IDENTITY-NOT-IN-STORE",
+                        format!(
+                            "dep {:?} identity {} not in store",
+                            locked.name,
+                            locked.identity.as_deref().unwrap_or("<none>")
+                        ),
+                    ));
+                }
+            }
         }
-        link_external(locked, deps_dir, store)?;
         resolved.push(resolved_from_locked(locked)?);
     }
-    Ok(ResolvedGraph { deps: resolved })
+    // B-nimcfg: use rebuild_deps_view (SSOT) to create canonical + alias symlinks
+    // and remove stale entries atomically.
+    let graph = ResolvedGraph { deps: resolved };
+    rebuild_deps_view(&graph, deps_dir, store);
+    Ok(graph)
 }
 
 /// Workspace analog of [`resolve_frozen`] (mirrors `frozen.py:resolve_workspace_frozen`).
@@ -105,7 +125,7 @@ pub fn resolve_workspace_frozen(
     let mut resolved: Vec<ResolvedDep> = Vec::new();
     for locked in &lock.deps {
         match locked.provenances.first() {
-            Some(ProvenanceRecord::Member { name }) => {
+            Some(ProvenanceRecord::Member { name, .. }) => {
                 let Some(member) = workspace.members.iter().find(|m| &m.name == name) else {
                     return Err(frozen(
                         "FROZEN-MEMBER-NOT-IN-WORKSPACE",
@@ -131,12 +151,118 @@ pub fn resolve_workspace_frozen(
                 ));
             }
             _ => {
-                link_external(locked, deps_dir, store)?;
+                // Pre-validate CAS presence before rebuilding.
+                let in_store = match &locked.identity {
+                    Some(id) if !id.is_empty() => store.contains(id).unwrap_or(false),
+                    _ => false,
+                };
+                if !in_store {
+                    return Err(frozen(
+                        "FROZEN-IDENTITY-NOT-IN-STORE",
+                        format!(
+                            "dep {:?} identity {} not in store",
+                            locked.name,
+                            locked.identity.as_deref().unwrap_or("<none>")
+                        ),
+                    ));
+                }
                 resolved.push(resolved_from_locked(locked)?);
             }
         }
     }
-    Ok(ResolvedGraph { deps: resolved })
+    // B-nimcfg: use rebuild_deps_view (SSOT) for atomic _deps/ rebuild.
+    let graph = ResolvedGraph { deps: resolved };
+    rebuild_deps_view(&graph, deps_dir, store);
+    Ok(graph)
+}
+
+// ---------------------------------------------------------------------------
+// B-nimcfg: atomic _deps/ view rebuild (Phase B, rfc-content-addressed-identity.md)
+// ---------------------------------------------------------------------------
+
+/// Rebuild `_deps/` as a pure function of `graph` (B-nimcfg slice).
+///
+/// This is the SINGLE SOURCE OF TRUTH for `_deps/` contents in the Rust impl.
+/// Called from both `resolve_frozen` / `resolve_workspace_frozen` (frozen paths)
+/// AND from the resolver's `resolve()` / `resolve_workspace()` (live paths).
+///
+/// Algorithm:
+/// 1. Compute the expected entry set: for each dep in `graph.deps` that has
+///    a non-empty CAS identity, record `{canonical_name: identity}` PLUS
+///    `{alias: identity}` for each alias. Member/local deps are excluded
+///    (they don't live in `_deps/`).
+/// 2. Remove any `_deps/<x>` NOT in the expected set (symlinks via `remove_file`,
+///    real dirs via `remove_dir_all`).
+/// 3. Create/refresh each expected entry as a relative CAS symlink via
+///    `store.link(identity, deps_dir/<name>)`. `link()` is idempotent
+///    (clears any existing entry before re-linking).
+///
+/// "Atomic" here = end state is exactly the expected set with no partial/stale
+/// residue. Cross-process transactional atomicity is NOT guaranteed (out of scope).
+pub fn rebuild_deps_view(
+    graph: &milpa_types::ResolvedGraph,
+    deps_dir: &Path,
+    store: &CaStore,
+) {
+    use milpa_types::ProvenanceRecord;
+
+    if !deps_dir.is_dir() {
+        return;
+    }
+
+    // Step 1: compute expected entry set (name → identity) for CAS entries only.
+    // Also collect local dep names to PRESERVE in _deps/ (fetch_local created
+    // their symlinks; rebuild_deps_view must not remove them as stale).
+    let mut expected: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut local_names: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for dep in &graph.deps {
+        // Skip member deps (they live in the workspace tree, not _deps/).
+        // Check the observed (first) provenance — declared mirrors do not change kind.
+        if dep.provenances.first().map_or(false, |p| matches!(p, ProvenanceRecord::Member { .. })) {
+            continue;
+        }
+        // Local deps have no CAS identity (cas_admissible=false); fetch_local
+        // creates their _deps/<name> symlink.  Add to local_names so Step 2
+        // does NOT remove them as stale entries.
+        if dep.provenances.first().map_or(false, |p| matches!(p, ProvenanceRecord::Local { .. })) {
+            local_names.insert(dep.name.clone());
+            continue;
+        }
+        if dep.identity.is_empty() {
+            continue;
+        }
+        expected.insert(dep.name.clone(), dep.identity.clone());
+        for alias in &dep.aliases {
+            expected.insert(alias.clone(), dep.identity.clone());
+        }
+    }
+
+    // Step 2: remove stale entries (not in expected set, and not a preserved local dep).
+    if let Ok(read_dir) = std::fs::read_dir(deps_dir) {
+        for entry in read_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !expected.contains_key(&name) && !local_names.contains(&name) {
+                let path = entry.path();
+                let meta = std::fs::symlink_metadata(&path);
+                if let Ok(m) = meta {
+                    let ft = m.file_type();
+                    let _ = if ft.is_symlink() || ft.is_file() {
+                        std::fs::remove_file(&path)
+                    } else {
+                        std::fs::remove_dir_all(&path)
+                    };
+                }
+            }
+        }
+    }
+
+    // Step 3: create/refresh expected CAS symlinks.
+    // store.link() clears any existing entry before creating the new symlink.
+    for (name, identity) in &expected {
+        let _ = store.link(identity, &deps_dir.join(name));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -197,29 +323,6 @@ fn check_manifest_alignment(manifest: &Manifest, lock: &Lockfile) -> Result<(), 
     Ok(())
 }
 
-/// Link a CAS-resident external dep into `deps_dir/<name>`. `FROZEN-IDENTITY-NOT-IN-STORE`
-/// if its identity is absent or unknown to the store.
-fn link_external(locked: &LockedDep, deps_dir: &Path, store: &CaStore) -> Result<(), MilpaError> {
-    let in_store = match &locked.identity {
-        Some(id) if !id.is_empty() => store.contains(id).unwrap_or(false),
-        _ => false,
-    };
-    if !in_store {
-        return Err(frozen(
-            "FROZEN-IDENTITY-NOT-IN-STORE",
-            format!(
-                "dep {:?} identity {} not in store",
-                locked.name,
-                locked.identity.as_deref().unwrap_or("<none>")
-            ),
-        ));
-    }
-    let identity = locked.identity.as_deref().unwrap();
-    store
-        .link(identity, &deps_dir.join(&locked.name))
-        .map_err(MilpaError::from)
-}
-
 /// Rebuild a [`ResolvedDep`] from a [`LockedDep`], deriving the transport
 /// provenance from the first record. A `Registry` record is the legacy
 /// disqualification; `Member`/`Local` are unreachable here (they bail above).
@@ -233,18 +336,25 @@ fn resolved_from_locked(locked: &LockedDep) -> Result<ResolvedDep, MilpaError> {
             ),
         ));
     };
-    let provenance = provenance_from_record(locked.provenances.first(), &locked.name)?;
+    // D-lifecycle: validate the first provenance (observed), then carry ALL provenances.
+    // The first provenance is still checked for registry/missing guards; all are carried.
+    let _check = provenance_from_record(locked.provenances.first(), &locked.name)?;
     Ok(ResolvedDep {
         name: locked.name.clone(),
         identity: locked.identity.clone().unwrap_or_default(),
         version,
         src_dir: locked.src_dir.clone(),
         requires: locked.requires.clone(),
-        provenance,
+        // D-lifecycle: carry all provenances (observed + declared mirrors) through
+        // the frozen path so D-frozen can use the plural model without data-model change.
+        provenances: locked.provenances.clone(),
         dep_decl: locked.dep_decl.clone(), // S6: carry dep_decl pin through frozen path
         // S4: frozen path reconstructs from lockfile; cond_requires are lockfile
         // annotations only — not needed for frozen graph reconstruction.
         cond_requires: Vec::new(),
+        // Phase B: frozen path carries aliases from the lockfile for verification.
+        // The aliases are read back from LockedDep.aliases during verify.
+        aliases: locked.aliases.clone(),
     })
 }
 

@@ -16,6 +16,10 @@ pub enum Cmd {
     /// `parse-lockfile`: parse the fixture's `milpa.lock` input only. Always an
     /// error fixture (no success variant).
     ParseLockfile,
+    /// `lock-roundtrip`: parse `milpa.lock`, re-emit via `format_lockfile`, and
+    /// byte-compare against `expected/milpa.lock`. Tests parse+format without
+    /// the resolver pipeline (e.g. Phase B `aliases` field).
+    LockRoundtrip,
     /// `frozen`: no-network frozen path against `milpa.kdl` + `milpa.lock`,
     /// optionally CAS-seeded from `cas-seed/`.
     Frozen,
@@ -38,6 +42,7 @@ impl Cmd {
                 let head = text.trim().split_whitespace().next().unwrap_or("");
                 match head {
                     "parse-lockfile" => Cmd::ParseLockfile,
+                    "lock-roundtrip" => Cmd::LockRoundtrip,
                     "frozen" => Cmd::Frozen,
                     "verify" => Cmd::Verify,
                     "resolve" | "" => Cmd::Resolve,

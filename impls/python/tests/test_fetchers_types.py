@@ -547,3 +547,114 @@ class TestEntryPointDiscovery:
         assert (dest / "stub.txt").read_text() == "stub content\n"
         assert result.identity.startswith("sha256:")
         assert result.receipt.transport_fields()["stub_marker"] == "stub-v1"
+
+
+# ---------------------------------------------------------------------------
+# R1b: identity=None must not crash fetch_any identity-gate (latent TypeError fix)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _NonAdmissibleProvenance(Provenance):
+    """Non-admissible provenance — cas_admissible=False → identity=None."""
+    cas_admissible: bool = False  # type: ignore[assignment]  # ClassVar override
+
+
+class _NonAdmissibleFetcher(Fetcher):
+    """Handles _NonAdmissibleProvenance. Writes a file; identity=None because non-admissible."""
+
+    def can_handle(self, p: Provenance) -> bool:
+        return isinstance(p, _NonAdmissibleProvenance)
+
+    def fetch(self, name: str, p: Provenance, *, dest: Path) -> _GoodReceipt:
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "local.txt").write_text(f"local-{name}\n")
+        return _GoodReceipt(marker="local-ok")
+
+
+class TestFetchAnyIdentityNoneNoCrash:
+    """R1b: fetch_any with identity=None on a candidate and expected_identity set
+    must NOT raise TypeError — it should record a failure and continue."""
+
+    def test_identity_none_with_expected_identity_does_not_raise_type_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Non-admissible candidate returns FetchResult(identity=None).
+        fetch_any must NOT crash with TypeError when slicing None."""
+        r = FetcherRegistry()
+        r.register(_NonAdmissibleFetcher())
+        expected = "sha256:" + "a" * 64  # some expected hash that won't match None
+
+        # Must not raise TypeError; must raise FETCH-ALL-FAILED (identity mismatch
+        # counted as a failure, not a crash).
+        with pytest.raises(MilpaError) as exc_info:
+            r.fetch_any(
+                "pkg",
+                [_NonAdmissibleProvenance()],
+                dest=tmp_path / "pkg",
+                expected_identity=expected,
+            )
+        assert exc_info.value.slug == FETCH_ALL_FAILED
+
+    def test_identity_none_without_expected_identity_succeeds(
+        self, tmp_path: Path
+    ) -> None:
+        """Non-admissible candidate with no expected_identity gate must succeed normally."""
+        r = FetcherRegistry()
+        r.register(_NonAdmissibleFetcher())
+        result = r.fetch_any(
+            "pkg",
+            [_NonAdmissibleProvenance()],
+            dest=tmp_path / "pkg",
+        )
+        assert result.identity is None
+        assert result.name == "pkg"
+
+
+# ---------------------------------------------------------------------------
+# R7: _clear_dest must not follow / destroy a symlink target
+# ---------------------------------------------------------------------------
+
+
+class TestClearDestSymlinkSafety:
+    """R7: _clear_dest on a symlink-to-dir must unlink only the symlink,
+    leaving the target directory and its contents intact."""
+
+    def test_clear_dest_symlink_removes_only_link(self, tmp_path: Path) -> None:
+        from milpa.fetchers.types import _clear_dest
+
+        # Create a target directory with real content.
+        target = tmp_path / "real_source"
+        target.mkdir()
+        (target / "precious.nim").write_text("# do not delete me\n")
+
+        # Create a symlink at dest pointing to the target.
+        dest = tmp_path / "link_dest"
+        dest.symlink_to(target)
+        assert dest.is_symlink()
+        assert (dest / "precious.nim").exists()
+
+        # _clear_dest should remove only the symlink.
+        _clear_dest(dest)
+
+        # Symlink is gone; dest is now a clean real directory (recreated).
+        assert not dest.is_symlink()
+        assert dest.is_dir()
+
+        # Target directory and its contents are UNTOUCHED.
+        assert target.is_dir()
+        assert (target / "precious.nim").exists()
+        assert (target / "precious.nim").read_text() == "# do not delete me\n"
+
+    def test_clear_dest_real_dir_still_removed(self, tmp_path: Path) -> None:
+        """Sanity: _clear_dest on a real (non-symlink) directory still works."""
+        from milpa.fetchers.types import _clear_dest
+
+        dest = tmp_path / "real_dest"
+        dest.mkdir()
+        (dest / "file.nim").write_text("old content\n")
+
+        _clear_dest(dest)
+
+        assert dest.is_dir()
+        assert not (dest / "file.nim").exists()

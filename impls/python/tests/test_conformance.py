@@ -62,7 +62,15 @@ from milpa.cas import CAStore
 from milpa.context import MilpaEnv, ResolveParams
 from milpa.errors import SOLVE_CONFLICT, MilpaError
 from milpa.fetchers.cas_admitting import CasAdmittingFetcher
-from milpa.fetchers.mocked import mocked_registry
+from milpa.fetchers.local import LocalFetcher
+from milpa.fetchers.mocked import (
+    MockedGitFetcher,
+    MockedOciFetcher,
+    MockedTarballFetcher,
+    TARBALL_SHA256_PLACEHOLDER,
+    mocked_registry,
+)
+from milpa.fetchers.types import FetcherRegistry
 from milpa.lockfile import Lockfile, parse_lockfile
 from milpa.manifest import (
     Manifest,
@@ -281,8 +289,16 @@ def _build_env(fixture_dir: Path, tmp_dir: Path, no_index: bool = False) -> Milp
     cas_root.mkdir(parents=True, exist_ok=True)
     store = CAStore(cas_root)
 
+    # Build a FetcherRegistry with the REAL LocalFetcher (not mocked).
+    # Local deps are filesystem-native — the fixture already contains the source
+    # tree on disk, and the real LocalFetcher symlinks to it without any network.
+    # Git and tarball transports are mocked via mocked-fetches/ for hermeticity.
     mocked_dir = fixture_dir / "mocked-fetches"
-    inner_registry = mocked_registry(mocked_dir)
+    inner_registry = FetcherRegistry()
+    inner_registry.register(MockedGitFetcher(mocked_dir))
+    inner_registry.register(MockedTarballFetcher(mocked_dir))
+    inner_registry.register(LocalFetcher())
+    inner_registry.register(MockedOciFetcher(mocked_dir))
     fetcher = CasAdmittingFetcher(inner_registry, store)
 
     index_path = fixture_dir / "index.kdl"
@@ -473,6 +489,45 @@ def _execute_fixture(
                 return ("fail", f"expected success but got error {e.slug!r}")
 
     # ------------------------------------------------------------------
+    # lock-roundtrip: parse milpa.lock then re-emit; byte-compare against
+    # expected/milpa.lock. Tests parse+format without going through the
+    # resolver pipeline (used for fields not populated by fetch, e.g.
+    # Phase B aliases). No mocked-fetches/, index.kdl, or milpa.kdl needed.
+    # ------------------------------------------------------------------
+    if cmd == "lock-roundtrip":
+        from milpa.lockfile import format_lockfile, parse_lockfile as _parse_lf
+        lock_path = fixture_dir / "milpa.lock"
+        try:
+            lock_text = lock_path.read_text(encoding="utf-8")
+        except OSError as e:
+            return ("fail", f"E2E-LOCKFILE-UNREADABLE: {e}")
+        try:
+            lock_obj = _parse_lf(lock_text)
+        except MilpaError as e:
+            if fixture.expected_error is not None and e.slug == fixture.expected_error:
+                return ("pass", "")
+            return ("fail", f"lock-roundtrip: unexpected parse error {e.slug!r}: {e}")
+        # Re-emit and byte-compare
+        emitted = format_lockfile(lock_obj)
+        expected_lock_path = fixture_dir / "expected" / "milpa.lock"
+        try:
+            expected = expected_lock_path.read_text(encoding="utf-8")
+        except OSError as e:
+            return ("fail", f"lock-roundtrip: cannot read expected/milpa.lock: {e}")
+        if emitted != expected:
+            # Show a diff-style excerpt
+            emit_lines = emitted.splitlines()
+            exp_lines = expected.splitlines()
+            diffs = [
+                f"  emitted: {el!r}"
+                for el, exl in zip(emit_lines, exp_lines)
+                if el != exl
+            ]
+            return ("fail", f"lock-roundtrip: byte mismatch vs expected/milpa.lock\n" +
+                    "\n".join(diffs[:5]))
+        return ("pass", "")
+
+    # ------------------------------------------------------------------
     # check-certificate: resolve + assert certificate JSON (§2.7.3)
     # ------------------------------------------------------------------
     if cmd == "check-certificate":
@@ -564,6 +619,7 @@ def _execute_fixture(
         profile=profile,
         prior=prior,
         require_attested_metadata=_fixture_require_attested_metadata(fixture_dir),
+        manifest_dir=fixture_dir,  # so local="./src-tree" resolves against fixture dir
     )
 
     try:
@@ -641,6 +697,7 @@ def _execute_check_certificate(
         profile=profile,
         prior=prior,
         require_attested_metadata=_fixture_require_attested_metadata(fixture_dir),
+        manifest_dir=fixture_dir,  # so local="./src-tree" resolves against fixture dir
     )
 
     # Expected certificate
@@ -779,10 +836,10 @@ def _execute_verify(
                 loaded_ws = load_workspace(fixture_dir)
             except MilpaError as e:
                 return ("fail", f"verify: workspace load failed: {e.slug!r}")
-            resolve_workspace(loaded_ws, deps_dir, env, ResolveParams())
+            resolve_workspace(loaded_ws, deps_dir, env, ResolveParams(manifest_dir=fixture_dir))
         else:
             assert isinstance(doc, Manifest)
-            resolve(doc, deps_dir, env, ResolveParams())
+            resolve(doc, deps_dir, env, ResolveParams(manifest_dir=fixture_dir))
     except MilpaError as e:
         # Regular resolve failed — _deps/ not populated; verify will fail too.
         # For S6 fixtures, the pre-phase resolve should always succeed.
@@ -913,6 +970,11 @@ def _diff_success(
     except Exception as e:
         return ("fail", f"from_graph/format_lockfile failed: {e}")
 
+    # Build-mode: redact the encoder-dependent tarball sha256 so the lockfile
+    # diff is stable across Python (zlib) and Rust (flate2/lzma-rs) encoders.
+    if _is_build_mode_fixture(fixture.dir):
+        lock_text = _redact_tarball_sha256(lock_text)
+
     # workspace vs single-package nim.cfg
     if isinstance(doc, WorkspaceManifest):
         try:
@@ -957,6 +1019,59 @@ def _diff_success(
         return fail
 
     return ("pass", "")
+
+
+def _is_build_mode_fixture(fixture_dir: Path) -> bool:
+    """Return True when any mocked-fetches entry has a ``format`` file.
+
+    Build-mode fixtures build real archives at test time; their lockfile's
+    tarball ``sha256`` field is encoder-dependent and MUST be redacted before
+    the byte-diff (conformance-fixtures.md §2.3.4 build-mode extension).
+    """
+    mocked_dir = fixture_dir / "mocked-fetches"
+    if not mocked_dir.is_dir():
+        return False
+    return any(
+        (entry / "format").is_file()
+        for entry in mocked_dir.iterdir()
+        if entry.is_dir()
+    )
+
+
+import re as _re
+
+# Pattern matching the encoder-dependent sha256 line inside a tarball
+# provenance block.  We redact only the ``sha256 "…"`` lines that appear
+# inside a ``provenance { kind "tarball" … }`` block.  To keep the regex
+# simple and correct across fixtures, we match the bare sha256 line and
+# replace the value with the stable placeholder.
+#
+# Lockfile tarball provenance shape (lockfile-schema.md §5):
+#   provenance {
+#       origin "observed"
+#       kind "tarball"
+#       url "https://…"
+#       sha256 "<hex>"     ← this line is encoder-dependent in build-mode
+#   }
+_TARBALL_SHA256_LINE = _re.compile(
+    r'^(\s+sha256 )"[0-9a-f]{64}"$',
+    _re.MULTILINE,
+)
+
+
+def _redact_tarball_sha256(lock_text: str) -> str:
+    """Replace the encoder-dependent sha256 value inside tarball provenance
+    blocks with ``TARBALL_SHA256_PLACEHOLDER``.
+
+    Only called for build-mode fixtures (``_is_build_mode_fixture`` true).
+    The placeholder is the same string the fixture author uses in
+    ``expected/milpa.lock``; after redaction the byte-diff is stable across
+    Python (zlib) and Rust (flate2/lzma-rs) encoders.
+    """
+    return _TARBALL_SHA256_LINE.sub(
+        rf'\g<1>"{TARBALL_SHA256_PLACEHOLDER}"',
+        lock_text,
+    )
 
 
 def _diff_file(
@@ -1009,8 +1124,16 @@ def _read_deps_structure(deps_dir: Path, cas_root: Path) -> str:
     for name, link in entries:
         try:
             resolved = link.resolve()
-            normalized = str(resolved).replace(cas_prefix, "<CAS_ROOT>")
-            lines.append(f"{name} -> {normalized}/\n")
+            resolved_str = str(resolved)
+            if resolved_str.startswith(cas_prefix):
+                # CAS-backed dep (git/tarball/oci): normalize the CAS root prefix.
+                normalized = resolved_str.replace(cas_prefix, "<CAS_ROOT>")
+                lines.append(f"{name} -> {normalized}/\n")
+            else:
+                # Local dep: symlink points outside the CAS (live source tree).
+                # Emit a portable sentinel — the absolute target path is
+                # machine-specific and must NOT be recorded in the fixture.
+                lines.append(f"{name} -> (symlink)\n")
         except OSError:
             pass
     return "".join(lines)

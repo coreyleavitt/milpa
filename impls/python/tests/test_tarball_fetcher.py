@@ -12,6 +12,7 @@ Coverage:
   - Download failure: transport raises → FETCH-DOWNLOAD-FAILED.
   - Extraction failure: corrupt archive → FETCH-EXTRACT-FAILED.
   - Receipt non-empty: transport_fields() carries archive_sha256.
+  - R4: oversized compressed body capped before buffering → FETCH-DOWNLOAD-FAILED.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from milpa.errors import (
     MilpaError,
 )
 from milpa.fetchers.tarball import (
+    MAX_COMPRESSED_BYTES,
     TarballFetcher,
     TarballProvenance,
     TarballReceipt,
@@ -253,6 +255,36 @@ def test_sha256_mismatch_prefixed_raises() -> None:
     assert exc_info.value.slug == FETCH_SHA256_MISMATCH
 
 
+def test_expected_sha256_uppercase_bare_hex_matches() -> None:
+    """Uppercase (or mixed-case) expected sha256 must match the lowercase computed digest."""
+    archive = _build_tar_gz({"f.nim": b"case"})
+    sha_lower = _sha256(archive)
+    sha_upper = sha_lower.upper()
+
+    fetcher = TarballFetcher(http_get=_make_transport(archive))
+    prov = TarballProvenance(url="https://host/pkg.tar.gz", expected_sha256=sha_upper)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "pkg"
+        receipt = fetcher.fetch("pkg", prov, dest=dest)
+    assert receipt.archive_sha256 == sha_lower
+
+
+def test_expected_sha256_uppercase_prefixed_matches() -> None:
+    """sha256:-prefixed UPPERCASE expected digest must match the lowercase computed digest."""
+    archive = _build_tar_gz({"f.nim": b"caseprefix"})
+    sha_lower = _sha256(archive)
+    sha_upper_prefixed = f"sha256:{sha_lower.upper()}"
+
+    fetcher = TarballFetcher(http_get=_make_transport(archive))
+    prov = TarballProvenance(url="https://host/pkg.tar.gz", expected_sha256=sha_upper_prefixed)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "pkg"
+        receipt = fetcher.fetch("pkg", prov, dest=dest)
+    assert receipt.archive_sha256 == sha_lower
+
+
 # ---------------------------------------------------------------------------
 # strip_components
 # ---------------------------------------------------------------------------
@@ -386,3 +418,102 @@ def test_receipt_transport_fields_non_empty() -> None:
     assert fields
     assert "archive_sha256" in fields
     assert fields["archive_sha256"] == _sha256(archive)
+
+
+# ---------------------------------------------------------------------------
+# bz2 (bzip2) — decoder coverage (bz2 is excluded from the conformance corpus
+# because there is no pure-Rust bz2 encoder; this per-impl unit test pins the
+# Python decoder path against the bz2 magic bytes).
+# ---------------------------------------------------------------------------
+
+
+def test_bzip2_archive_extracted() -> None:
+    """TarballFetcher decompresses and extracts a bzip2-compressed archive.
+
+    Python's ``tarfile`` module natively supports bzip2 (``w:bz2`` / ``r:bz2``).
+    This test ensures the ``MAGIC_BZ2`` detection path in the production fetcher
+    is exercised (milpa.fetchers.safe_extract reads the magic bytes and passes
+    the decompressed stream to ``extract_tar``).
+    """
+    files = {"src/lib.nim": b"# bz2 source"}
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:bz2") as tf:
+        for name, content in files.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            tf.addfile(info, io.BytesIO(content))
+    archive = buf.getvalue()
+
+    # Verify the bz2 magic bytes are present (defensive check for the test itself).
+    assert archive[:3] == b"BZh", "archive must start with bz2 magic 'BZh'"
+
+    fetcher = TarballFetcher(http_get=_make_transport(archive))
+    prov = TarballProvenance(url="https://host/pkg.tar.bz2")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "pkg"
+        receipt = fetcher.fetch("pkg", prov, dest=dest)
+        assert (dest / "src" / "lib.nim").read_bytes() == b"# bz2 source"
+
+    assert receipt.archive_sha256 == _sha256(archive)
+
+
+# ---------------------------------------------------------------------------
+# R4 — compressed download cap (FETCH-DOWNLOAD-FAILED before buffering)
+# ---------------------------------------------------------------------------
+
+
+def test_max_compressed_bytes_constant_is_positive() -> None:
+    """MAX_COMPRESSED_BYTES must be a positive integer (sanity)."""
+    assert isinstance(MAX_COMPRESSED_BYTES, int)
+    assert MAX_COMPRESSED_BYTES > 0
+
+
+def test_oversized_compressed_body_raises_fetch_download_failed() -> None:
+    """R4: a transport that returns more bytes than the compressed cap must
+    raise FETCH-DOWNLOAD-FAILED without buffering the full body.
+
+    We use a tiny cap (16 bytes) via a custom TarballFetcher so the test is
+    fast.  The injected transport returns cap+1 bytes which exceeds the limit.
+    The fetcher must detect this and raise FETCH-DOWNLOAD-FAILED.
+    """
+    tiny_cap = 16
+    oversized = b"x" * (tiny_cap + 1)
+
+    def _oversized_transport(url: str) -> bytes:
+        return oversized
+
+    fetcher = TarballFetcher(http_get=_oversized_transport, compressed_cap=tiny_cap)
+    prov = TarballProvenance(url="https://host/large.tar.gz")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "pkg"
+        with pytest.raises(MilpaError) as exc_info:
+            fetcher.fetch("pkg", prov, dest=dest)
+    assert exc_info.value.slug == FETCH_DOWNLOAD_FAILED
+
+
+def test_body_at_exactly_cap_is_accepted() -> None:
+    """R4: a body of exactly cap bytes must be accepted (boundary check).
+
+    We use a tiny cap (16 bytes) and a transport that returns exactly 16 bytes
+    of garbage.  This is below the forbidden threshold, so the fetcher proceeds
+    to the (expected) extraction failure.
+    """
+    tiny_cap = 16
+    exactly_cap = b"x" * tiny_cap
+
+    def _exact_transport(url: str) -> bytes:
+        return exactly_cap
+
+    fetcher = TarballFetcher(http_get=_exact_transport, compressed_cap=tiny_cap)
+    prov = TarballProvenance(url="https://host/exact.tar.gz")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "pkg"
+        # Body is garbage (not a real archive), so extraction fails — but NOT
+        # with FETCH-DOWNLOAD-FAILED (the cap did not fire).
+        with pytest.raises(MilpaError) as exc_info:
+            fetcher.fetch("pkg", prov, dest=dest)
+    assert exc_info.value.slug != FETCH_DOWNLOAD_FAILED

@@ -36,15 +36,17 @@ Spec authority: spec/conformance-fixtures.md §2.3, spec/plugin-contract.md §4.
 
 from __future__ import annotations
 
+import io
 import re
 import shutil
+import tarfile
 from pathlib import Path
 
 from milpa.errors import FETCH_MOCK_MISSING, FETCH_SHA256_MISMATCH, MilpaError
 from milpa.fetchers.git import GitProvenance, GitReceipt
 from milpa.fetchers.local import LocalProvenance, LocalReceipt
 from milpa.fetchers.oci import OciProvenance, OciReceipt
-from milpa.fetchers.tarball import TarballProvenance, TarballReceipt
+from milpa.fetchers.tarball import TarballFetcher, TarballProvenance, TarballReceipt
 from milpa.fetchers.types import (
     Fetcher,
     FetcherRegistry,
@@ -83,6 +85,46 @@ def url_key(url: str, ref_spec: str) -> str:
         →  "https___example.com_pkg.tar.gz@"   # tarball: empty ref slot
     """
     return f"{_SAFE_CHARS.sub('_', url)}@{_SAFE_CHARS.sub('_', ref_spec)}"
+
+
+# ---------------------------------------------------------------------------
+# Build-mode archive helper — test infra only, not production code
+# ---------------------------------------------------------------------------
+
+#: Placeholder recorded in the expected lockfile for the encoder-dependent
+#: archive sha256 when a fixture uses build-mode compression.  MUST be
+#: identical in the Python and Rust runners (SSOT: conformance-fixtures.md
+#: §2.3.4 + this build-mode extension).
+TARBALL_SHA256_PLACEHOLDER = "<TARBALL-SHA256>"
+
+
+def _build_archive_from_content(key_dir: Path, fmt: str) -> bytes:
+    """Build a real tar archive from ``key_dir/content/`` (and the sibling
+    ``<name>.nimble`` if present) in the given compression format.
+
+    This is **test infra** — the ENCODER lives here.  The DECODER is the
+    production ``TarballFetcher`` path (SSOT per standing rules).
+
+    Supported formats: ``gz``, ``xz``.
+
+    Returns the raw archive bytes.
+    """
+    if fmt not in ("gz", "xz"):
+        raise ValueError(f"_build_archive_from_content: unsupported format {fmt!r}")
+
+    content_dir = key_dir / "content"
+    buf = io.BytesIO()
+    mode = f"w:{fmt}"
+    with tarfile.open(fileobj=buf, mode=mode) as tf:  # type: ignore[call-overload]
+        if content_dir.is_dir():
+            for src in sorted(content_dir.rglob("*")):
+                if src.is_file():
+                    arcname = str(src.relative_to(content_dir))
+                    tf.add(src, arcname=arcname)
+        # Add any sibling <name>.nimble files (identified by .nimble extension)
+        for nimble in sorted(key_dir.glob("*.nimble")):
+            tf.add(nimble, arcname=nimble.name)
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +241,29 @@ class MockedTarballFetcher(Fetcher):
                 url=p.url,
             )
 
+        # Build-mode: when a ``format`` file is present, build a real archive
+        # from ``content/`` and run it through the REAL TarballFetcher decode
+        # path (SSOT: production extractor, not a parallel copy).  The
+        # encoder-dependent archive sha256 is NOT gated against
+        # ``expected_sha256`` here — build-mode fixtures never have a prior
+        # pin (they are first-fetch).  The lockfile comparison redacts the pin
+        # field via TARBALL_SHA256_PLACEHOLDER to keep expected/ stable across
+        # encoders.
+        fmt_file = key_dir / "format"
+        if fmt_file.is_file():
+            fmt = fmt_file.read_text(encoding="utf-8").strip()
+            archive_bytes = _build_archive_from_content(key_dir, fmt)
+
+            def _http_get_from_bytes(_url: str) -> bytes:
+                return archive_bytes
+
+            fetcher = TarballFetcher(http_get=_http_get_from_bytes)
+            receipt = fetcher.fetch(name, TarballProvenance(url=p.url), dest=dest)
+            assert isinstance(receipt, TarballReceipt)
+            return receipt
+
+        # Normal (copy) mode: read the pre-recorded archive sha256 and stage
+        # content/ verbatim — no real decompressor runs.
         sha_file = key_dir / "archive_sha256"
         if not sha_file.is_file():
             raise MilpaError(
@@ -206,12 +271,15 @@ class MockedTarballFetcher(Fetcher):
                 f"mock fixture: cannot read {sha_file}: file not found",
                 dep=name,
             )
-        archive_sha = sha_file.read_text(encoding="utf-8").strip()
+        archive_sha = sha_file.read_text(encoding="utf-8").strip().lower()
 
         # TOFU pin re-assertion: if a prior lock recorded an expected sha256,
         # compare before staging (conformance-fixtures.md §2.3.4 NORMATIVE).
+        # Both sides are lowercased: ``want`` strips the "sha256:" prefix and
+        # lowercases; ``archive_sha`` is lowercased on read above.  Mirrors
+        # the Rust side which applies .trim() + to_lowercase() on both.
         if p.expected_sha256 is not None:
-            want = p.expected_sha256.removeprefix("sha256:")
+            want = p.expected_sha256.removeprefix("sha256:").lower()
             if want != archive_sha:
                 raise MilpaError(
                     FETCH_SHA256_MISMATCH,
@@ -334,6 +402,8 @@ def mocked_registry(mocked_dir: Path) -> FetcherRegistry:
 __all__ = [
     # SSOT key encoder
     "url_key",
+    # Build-mode placeholder (cross-runner stable)
+    "TARBALL_SHA256_PLACEHOLDER",
     # Provenance kinds (re-exported from canonical transport modules)
     "GitProvenance",
     "TarballProvenance",

@@ -37,9 +37,11 @@ use milpa_types::{EdgeSet, Lockfile, Provenance, ProvenanceRecord, ResolvedDep, 
 use crate::edge_sources::{EdgeSourceCtx, NimbleEdgeSource};
 use crate::error::{CoreError, MilpaError};
 use crate::fetch::{FetchError, FetcherRegistry, Receipt};
+use crate::frozen::rebuild_deps_view;
 use crate::identity::compute_content_hash;
 use crate::lockfile::cond_require_sort_key;
 use crate::registry::{Index, IndexVersion};
+use crate::store::CaStore;
 use crate::workspace::LoadedWorkspace;
 
 /// Canonical version for URL/local/tarball/member deps (resolver-semantics §3):
@@ -71,6 +73,9 @@ const ROOT: &str = "__root__";
 /// `require_attested_metadata` enforces strict attestation policy (S5):
 /// when `true` (or when `manifest.attestation_policy == Strict`), any resolved
 /// dep sourced from un-attested `.nimble` metadata raises `RES-UNATTESTED-METADATA`.
+///
+/// `store` is the content-addressed store used to rebuild `_deps/` after
+/// resolution completes (B-nimcfg SSOT: alias symlinks + stale-entry removal).
 #[allow(clippy::too_many_arguments)]
 pub fn resolve(
     manifest: &Manifest,
@@ -82,6 +87,7 @@ pub fn resolve(
     deps_dir: &Path,
     dep_decl_store: Option<&dyn crate::dep_decl_store::DepDeclStore>,
     require_attested_metadata: bool,
+    store: &CaStore,
 ) -> Result<ResolvedGraph, MilpaError> {
     // §6: filter conditional deps by the active profile before anything else.
     // An absent profile disables filtering entirely (§6 absent-profile rule).
@@ -113,7 +119,8 @@ pub fn resolve(
     provider.process_items(queue)?;
 
     // Content-hash dedup/alias for eagerly-materialized candidates (Phase B, #32).
-    provider.finalize();
+    // Returns canonical → sorted-aliases map for populating ResolvedDep.aliases.
+    let canonical_aliases = provider.finalize();
 
     // Solve over the materialized + stubbed candidate universe.
     let solution = solve(&provider, ROOT, root_version(), strategy)?;
@@ -129,7 +136,12 @@ pub fn resolve(
     // `--require-attested-metadata` CLI flag (flag cannot weaken manifest-strict).
     enforce_attestation_policy(&provider, manifest, require_attested_metadata)?;
 
-    Ok(provider.build_graph(&solution))
+    let graph = provider.build_graph(&solution, &canonical_aliases);
+    // B-nimcfg SSOT: rebuild _deps/ view (alias symlinks + stale-entry removal).
+    // Mirrors resolve_frozen (frozen.rs:96) — the live path now owns the rebuild
+    // internally, symmetric with the frozen path and Python's resolver.resolve().
+    rebuild_deps_view(&graph, deps_dir, store);
+    Ok(graph)
 }
 
 /// The reference [`Resolver`](crate::Resolver) entry point delegates here with
@@ -142,6 +154,7 @@ pub(crate) fn resolve_default_strategy(
     profile: Option<&Profile>,
     prior: Option<&Lockfile>,
     deps_dir: &Path,
+    store: &CaStore,
 ) -> Result<ResolvedGraph, MilpaError> {
     resolve(
         manifest,
@@ -153,6 +166,7 @@ pub(crate) fn resolve_default_strategy(
         deps_dir,
         None, // dep_decl_store: None (trait path, no dep-decl support)
         false, // require_attested_metadata: false (trait path, no S5 flag)
+        store,
     )
 }
 
@@ -168,6 +182,9 @@ pub(crate) fn resolve_default_strategy(
 /// `require_attested_metadata` activates strict attestation policy (S5, §13.1).
 /// Effective workspace policy = logical OR of `require_attested_metadata` and any
 /// member manifest's `attestation-policy "strict"` declaration (§13.1 workspace rule).
+///
+/// `store` is the content-addressed store used to rebuild `_deps/` after
+/// resolution completes (B-nimcfg SSOT: alias symlinks + stale-entry removal).
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_workspace(
     workspace: &LoadedWorkspace,
@@ -178,6 +195,7 @@ pub fn resolve_workspace(
     strategy: Strategy,
     deps_dir: &Path,
     require_attested_metadata: bool,
+    store: &CaStore,
 ) -> Result<ResolvedGraph, MilpaError> {
     let overrides: BTreeMap<String, Override> = workspace
         .overrides
@@ -270,7 +288,7 @@ pub fn resolve_workspace(
     );
     let queue = provider.seed_workspace(workspace, profile)?;
     provider.process_items(queue)?;
-    provider.finalize();
+    let canonical_aliases_ws = provider.finalize();
     let solution = solve(&provider, ROOT, root_version(), strategy)?;
     if let Some(e) = provider.take_error() {
         return Err(e);
@@ -280,7 +298,12 @@ pub fn resolve_workspace(
     // ws_is_strict (single computation, no duplicate any_member_strict loop).
     enforce_attestation_policy_strict(&provider, ws_is_strict)?;
 
-    Ok(provider.build_graph(&solution))
+    let graph = provider.build_graph(&solution, &canonical_aliases_ws);
+    // B-nimcfg SSOT: rebuild _deps/ view (alias symlinks + stale-entry removal).
+    // Mirrors resolve_workspace_frozen (frozen.rs:175) — the live path now owns
+    // the rebuild internally, symmetric with the frozen path.
+    rebuild_deps_view(&graph, deps_dir, store);
+    Ok(graph)
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +402,10 @@ struct Candidate {
     /// fetched dep + workspace member. The resolver maps its internal transport
     /// [`Provenance`] → [`ProvenanceRecord`] here so the graph is emission-ready.
     provenance: Option<ProvenanceRecord>,
+    /// D-lifecycle: declared mirror URLs (manifest mirrors + prior declared) that
+    /// were NOT the observed candidate. Stored so `build_graph` can assemble the
+    /// full provenances tuple (observed + declared). Empty for non-git deps.
+    declared_mirror_urls: Vec<String>,
     /// S6: dep_decl pin — the `sha256:<hex>` hash of the DepDecl artifact used
     /// during resolution. Set only when the edge was sourced from a DepDecl
     /// artifact (`EdgeSource::DepDecl`). `None` for milpa.kdl / nimble fallback.
@@ -424,6 +451,12 @@ struct ResolveProvider<'a> {
     seen_local: RefCell<BTreeSet<String>>,
     seen_tarball: RefCell<BTreeSet<String>>,
     seen_by_name: RefCell<BTreeMap<String, (PKey, bool)>>,
+
+    /// Phase B: BFS-insertion discovery order — dep names in the order they are
+    /// first enqueued (root deps in declaration order, then transitives in first-
+    /// occurrence order). Used by `finalize()` to pick the canonical name in each
+    /// dedup group (earliest-discovered wins over lex-min).
+    discovery_order: RefCell<Vec<String>>,
 
     error: RefCell<Option<MilpaError>>,
 
@@ -478,6 +511,7 @@ impl<'a> ResolveProvider<'a> {
             seen_local: RefCell::new(BTreeSet::new()),
             seen_tarball: RefCell::new(BTreeSet::new()),
             seen_by_name: RefCell::new(BTreeMap::new()),
+            discovery_order: RefCell::new(Vec::new()),
             error: RefCell::new(None),
             dep_decl_store,
             strict_attestation,
@@ -502,13 +536,15 @@ impl<'a> ResolveProvider<'a> {
                 Dep::Tarball(t) => {
                     root_deps.push(SolverDep::new(name.clone(), eq_sentinel()));
                     root_requires.push(name.clone());
-                    seen_by_name.insert(name, (PKey::Tarball(t.url.clone()), true));
+                    seen_by_name.insert(name.clone(), (PKey::Tarball(t.url.clone()), true));
+                    self.discovery_order.borrow_mut().push(name); // Phase B: root deps in declaration order
                     queue.push(Item::Tarball(t.clone()));
                 }
                 Dep::Local(l) => {
                     root_deps.push(SolverDep::new(name.clone(), eq_sentinel()));
                     root_requires.push(name.clone());
-                    seen_by_name.insert(name, (PKey::Local(l.path.clone()), true));
+                    seen_by_name.insert(name.clone(), (PKey::Local(l.path.clone()), true));
+                    self.discovery_order.borrow_mut().push(name); // Phase B: root deps in declaration order
                     queue.push(Item::Local(l.clone()));
                 }
                 Dep::Url(u) => {
@@ -518,7 +554,8 @@ impl<'a> ResolveProvider<'a> {
                         Some(ov) => PKey::Url(ov.git.clone(), ov.git_ref.clone()),
                         None => PKey::Url(u.git.clone(), u.git_ref.clone()),
                     };
-                    seen_by_name.insert(name, (pkey, true));
+                    seen_by_name.insert(name.clone(), (pkey, true));
+                    self.discovery_order.borrow_mut().push(name); // Phase B: root deps in declaration order
                     queue.push(Item::Url(u.clone()));
                 }
                 Dep::Named(n) => {
@@ -541,6 +578,7 @@ impl<'a> ResolveProvider<'a> {
                         seen_by_name.insert(name.clone(), (PKey::Named(name.clone()), true));
                     }
                     root_requires.push(name.clone());
+                    self.discovery_order.borrow_mut().push(name.clone()); // Phase B: root deps in declaration order
                     queue.push(Item::Named {
                         name,
                         constraint: vs,
@@ -554,6 +592,7 @@ impl<'a> ResolveProvider<'a> {
                     // dropping it.
                     root_deps.push(SolverDep::new(name.clone(), eq_sentinel()));
                     root_requires.push(name);
+                    // Members are never fetched → no dedup participation; no discovery record needed.
                 }
             }
         }
@@ -576,6 +615,7 @@ impl<'a> ResolveProvider<'a> {
             requires_names: root_requires,
             deps: root_deps,
             provenance: None,
+            declared_mirror_urls: Vec::new(),
             dep_decl: None,
             requires_predicates: std::collections::BTreeMap::new(),
         };
@@ -654,9 +694,14 @@ impl<'a> ResolveProvider<'a> {
                     Dep::Url(u) => {
                         terms.push(SolverDep::new(name.clone(), eq_sentinel()));
                         requires.push(name.clone());
-                        seen_by_name
+                        let entry = seen_by_name
                             .entry(name.clone())
                             .or_insert((PKey::Url(u.git.clone(), u.git_ref.clone()), true));
+                        // Phase B: record first-insertion in discovery order (workspace deps).
+                        let _ = entry; // or_insert returns &mut; just track first-time by checking the queue
+                        if !self.discovery_order.borrow().contains(&name) {
+                            self.discovery_order.borrow_mut().push(name.clone());
+                        }
                         queue.push(Item::Url(u.clone()));
                     }
                     Dep::Local(l) => {
@@ -665,6 +710,9 @@ impl<'a> ResolveProvider<'a> {
                         seen_by_name
                             .entry(name.clone())
                             .or_insert((PKey::Local(l.path.clone()), true));
+                        if !self.discovery_order.borrow().contains(&name) {
+                            self.discovery_order.borrow_mut().push(name.clone());
+                        }
                         queue.push(Item::Local(l.clone()));
                     }
                     Dep::Tarball(t) => {
@@ -673,6 +721,9 @@ impl<'a> ResolveProvider<'a> {
                         seen_by_name
                             .entry(name.clone())
                             .or_insert((PKey::Tarball(t.url.clone()), true));
+                        if !self.discovery_order.borrow().contains(&name) {
+                            self.discovery_order.borrow_mut().push(name.clone());
+                        }
                         queue.push(Item::Tarball(t.clone()));
                     }
                     Dep::Named(n) => {
@@ -687,6 +738,9 @@ impl<'a> ResolveProvider<'a> {
                         seen_by_name
                             .entry(name.clone())
                             .or_insert((PKey::Named(name.clone()), true));
+                        if !self.discovery_order.borrow().contains(&name) {
+                            self.discovery_order.borrow_mut().push(name.clone());
+                        }
                         queue.push(Item::Named {
                             name,
                             constraint: vs,
@@ -706,7 +760,9 @@ impl<'a> ResolveProvider<'a> {
                 deps: terms,
                 provenance: Some(ProvenanceRecord::Member {
                     name: member.name.clone(),
+                    origin: "observed".to_string(),
                 }),
+                declared_mirror_urls: Vec::new(), // workspace members have no mirrors
                 dep_decl: None, // workspace members never resolved via DepDecl
                 requires_predicates: std::collections::BTreeMap::new(),
             });
@@ -725,6 +781,7 @@ impl<'a> ResolveProvider<'a> {
             requires_names: root_requires,
             deps: root_deps,
             provenance: None,
+            declared_mirror_urls: Vec::new(),
             dep_decl: None,
             requires_predicates: std::collections::BTreeMap::new(),
         };
@@ -795,6 +852,9 @@ impl<'a> ResolveProvider<'a> {
         match seen.get(name) {
             None => {
                 seen.insert(name.to_string(), (pkey, false));
+                // Phase B: record transitive dep first-enqueue (BFS-insertion order).
+                // Root deps are recorded in seed_root(); transitive deps land here.
+                self.discovery_order.borrow_mut().push(name.to_string());
                 Gate::Proceed
             }
             Some((prior_key, is_root)) => {
@@ -835,25 +895,51 @@ impl<'a> ResolveProvider<'a> {
 
         let (expected_identity, pinned_sha) = self.git_pin(&dep);
 
-        // Ordered candidate list (§8a): primary, dep-block mirrors, prior
-        // self-mirrors — all carrying the pinned commit (same commit ⇒ same
-        // bytes ⇒ same identity).
-        let mut provs = vec![git_prov(&dep.git, &dep.git_ref, pinned_sha.clone())];
-        for m in &dep.mirrors {
-            provs.push(git_prov(m, &dep.git_ref, pinned_sha.clone()));
-        }
-        for sm in self.prior_self_mirrors(&dep.name) {
-            provs.push(git_prov(&sm, &dep.git_ref, pinned_sha.clone()));
+        // D-lifecycle: collect ALL candidate URLs (primary + manifest mirrors + prior
+        // declared) in order, deduped. Whichever succeeds becomes "observed";
+        // the rest become "declared" provenances in the lockfile.
+        //
+        // D-update-remove (Phase D item 5): filter prior declared URLs to only
+        // those still present in the manifest mirror set. URLs removed from
+        // milpa.kdl are dropped ("drop only those whose URL left the manifest").
+        let manifest_mirror_set: std::collections::HashSet<&str> =
+            dep.mirrors.iter().map(|s| s.as_str()).collect();
+        let prior_declared_raw = self.prior_declared_mirror_urls(&dep.name);
+        let prior_declared: Vec<String> = prior_declared_raw
+            .into_iter()
+            .filter(|u| manifest_mirror_set.contains(u.as_str()))
+            .collect();
+        let mut seen_urls: BTreeSet<String> = BTreeSet::new();
+        let mut all_candidate_urls: Vec<String> = Vec::new();
+        for url in std::iter::once(dep.git.as_str())
+            .chain(dep.mirrors.iter().map(|s| s.as_str()))
+            .chain(prior_declared.iter().map(|s| s.as_str()))
+        {
+            if seen_urls.insert(url.to_string()) {
+                all_candidate_urls.push(url.to_string());
+            }
         }
 
+        let provs: Vec<Provenance> = all_candidate_urls
+            .iter()
+            .map(|url| git_prov(url, &dep.git_ref, pinned_sha.clone()))
+            .collect();
+
         let dest = self.deps_dir.join(&dep.name);
-        let (identity, receipt) =
-            self.fetch_any(&dep.name, &provs, &dest, expected_identity.as_deref())?;
+        let (identity, receipt, observed_idx) =
+            self.fetch_any_tracked(&dep.name, &provs, &dest, expected_identity.as_deref())?;
+
+        let observed_url = &all_candidate_urls[observed_idx];
+        let declared_mirror_urls: Vec<String> = all_candidate_urls
+            .iter()
+            .filter(|u| *u != observed_url)
+            .cloned()
+            .collect();
 
         let ex =
             self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None)?;
 
-        // Record the declared primary provenance; carry the resolved commit
+        // Record the observed provenance with the resolved commit SHA.
         // (preferring the freshly-resolved SHA over a pin) for emission.
         let commit = receipt.resolved_ref.or(pinned_sha);
         self.store_candidate(Candidate {
@@ -864,10 +950,13 @@ impl<'a> ResolveProvider<'a> {
             requires_names: ex.requires_names,
             deps: ex.deps,
             provenance: Some(ProvenanceRecord::Git {
-                url: dep.git.clone(),
+                url: observed_url.clone(),
                 ref_spec: opt(&dep.git_ref),
                 commit_sha: commit,
+                origin: "observed".to_string(),
             }),
+            // D-lifecycle: all candidate URLs except the observed one.
+            declared_mirror_urls,
             dep_decl: None, // URL deps not in the index; no DepDecl pin
             requires_predicates: ex.requires_predicates,
         });
@@ -882,16 +971,27 @@ impl<'a> ResolveProvider<'a> {
         }
         let abs = self.project_root.join(&dep.path);
         let dest = self.deps_dir.join(&dep.name);
-        clear_dir(&dest)?;
+        // clear_dir uses exists() which does not follow dangling symlinks; use
+        // clear_dest-equivalent logic (symlink-aware) by letting the fetcher
+        // handle stale cleanup via clear_dest inside fetch_local.
+        // Still need to ensure parent dir exists before fetching.
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(io_err)?;
+        }
         let prov = Provenance::Local {
-            // The fetcher copies from the absolute path; the recorded
+            // The fetcher symlinks from the absolute path; the recorded
             // provenance keeps the *declared* relative path (portable).
             path: abs.to_string_lossy().into_owned(),
         };
         self.fetcher
             .fetch(&dep.name, &prov, &dest)
             .map_err(MilpaError::from)?;
-        let identity = compute_content_hash(&dest)?;
+        // LOCAL deps carry NO identity (cas_admissible = false, lockfile-schema
+        // §4.3 NORMATIVE). The empty string is the "no identity" sentinel in
+        // Candidate (same as the synthetic root). finalize() and build_graph()
+        // both skip empty-identity entries, so local deps bypass content-hash
+        // dedup (which is CAS-only). Mirrors Python FetcherRegistry → identity=None.
+        let identity = String::new();
         let ex =
             self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None)?;
         self.store_candidate(Candidate {
@@ -905,7 +1005,9 @@ impl<'a> ResolveProvider<'a> {
                 // The recorded path is the *declared relative* path (portable),
                 // not the absolute fetch path.
                 path: dep.path.clone(),
+                origin: "observed".to_string(),
             }),
+            declared_mirror_urls: Vec::new(), // local deps have no mirrors
             dep_decl: None, // local deps not in the index; no DepDecl pin
             requires_predicates: ex.requires_predicates,
         });
@@ -956,7 +1058,9 @@ impl<'a> ResolveProvider<'a> {
             provenance: Some(ProvenanceRecord::Tarball {
                 url: dep.url.clone(),
                 sha256: recorded_sha256,
+                origin: "observed".to_string(),
             }),
+            declared_mirror_urls: Vec::new(), // tarball deps have no mirrors
             requires_predicates: ex.requires_predicates,
         });
         self.process_items(ex.sub_items)?;
@@ -1056,6 +1160,9 @@ impl<'a> ResolveProvider<'a> {
             // Record the canonical (first) provenance for emission, mapped to
             // the emission-level record.
             provenance: entry.provenances.first().map(transport_to_record),
+            // Named deps resolved via the index: declared mirror URLs are not
+            // tracked here (D-lifecycle covers URL/git deps with manifest mirrors).
+            declared_mirror_urls: Vec::new(),
             dep_decl: dep_decl_pin,
             requires_predicates: ex.requires_predicates,
         };
@@ -1083,33 +1190,60 @@ impl<'a> ResolveProvider<'a> {
         dest: &Path,
         expected_identity: Option<&str>,
     ) -> Result<(String, Receipt), MilpaError> {
-        let mut last_err: Option<String> = None;
-        for prov in candidates {
+        let (identity, receipt, _idx) =
+            self.fetch_any_tracked(name, candidates, dest, expected_identity)?;
+        Ok((identity, receipt))
+    }
+
+    /// D-lifecycle variant of [`fetch_any`]: also returns the index of the
+    /// successful candidate so the caller can identify the observed URL.
+    ///
+    /// Distinguishes two failure modes (RFC Phase D item 3):
+    /// - **Transport failure** (network error, git non-zero, dead mirror): record
+    ///   and try the next candidate.  `FETCH-ALL-FAILED` when every candidate fails.
+    /// - **Fetch succeeds but identity ≠ locked pin**: supply-chain signal — raise
+    ///   `FETCH-PROVENANCE-DIVERGENCE` **immediately**.  Must NOT fall through to the
+    ///   next candidate; a mirror serving different bytes than the lock pinned must
+    ///   not be silently worked around.
+    fn fetch_any_tracked(
+        &self,
+        name: &str,
+        candidates: &[Provenance],
+        dest: &Path,
+        expected_identity: Option<&str>,
+    ) -> Result<(String, Receipt, usize), MilpaError> {
+        let mut last_transport_err: Option<String> = None;
+        for (idx, prov) in candidates.iter().enumerate() {
             clear_dir(dest)?;
-            match self.fetcher.fetch(name, prov, dest) {
-                Ok(receipt) => {
-                    let identity = compute_content_hash(dest)?;
-                    match expected_identity {
-                        Some(exp) if exp != identity => {
-                            last_err = Some(format!(
-                                "identity mismatch (expected {exp}, got {identity})"
-                            ));
-                            continue;
-                        }
-                        _ => return Ok((identity, receipt)),
-                    }
-                }
+            let receipt = match self.fetcher.fetch(name, prov, dest) {
+                Ok(r) => r,
                 Err(e) => {
-                    last_err = Some(format!("{}: {}", e.code(), fetch_msg(&e)));
+                    // Transport failure: record and try the next candidate.
+                    last_transport_err = Some(format!("{}: {}", e.code(), fetch_msg(&e)));
                     continue;
                 }
+            };
+            // Fetch succeeded — validate identity gate when prior pin is set.
+            let identity = compute_content_hash(dest)?;
+            if let Some(exp) = expected_identity {
+                if exp != identity {
+                    // Supply-chain signal: raise loudly, do NOT try next candidate.
+                    let prov_url = prov_url_str(prov);
+                    return Err(MilpaError::Fetch(FetchError::ProvenanceDivergence(
+                        format!(
+                            "{name:?}: provenance {prov_url:?} succeeded but delivered \
+                             divergent bytes — expected {exp}, got {identity}"
+                        ),
+                    )));
+                }
             }
+            return Ok((identity, receipt, idx));
         }
         clear_dir(dest)?;
         Err(MilpaError::Fetch(FetchError::AllFailed(format!(
-            "all {} candidate(s) failed for {name:?}: {}",
+            "all {} candidate(s) transport-failed for {name:?}: {}",
             candidates.len(),
-            last_err.unwrap_or_else(|| "no candidates".into())
+            last_transport_err.unwrap_or_else(|| "no candidates".into())
         ))))
     }
 
@@ -1424,17 +1558,21 @@ impl<'a> ResolveProvider<'a> {
         let Some(identity) = locked.identity.clone().filter(|s| !s.is_empty()) else {
             return (None, None);
         };
+        // Search ALL GitProvenanceRecords for one matching (url, ref) so that
+        // a declared mirror record appearing before the observed record in the
+        // sorted provenances list does not shadow it (§8 pin-reuse,
+        // D-provenance ordering — mirrors Python _git_pin_for_url_dep fix).
         for p in &locked.provenances {
             if let ProvenanceRecord::Git {
                 url,
                 ref_spec,
                 commit_sha,
+                ..
             } = p
             {
                 if url == &dep.git && ref_spec.as_deref() == Some(dep.git_ref.as_str()) {
                     return (Some(identity), commit_sha.clone());
                 }
-                break; // primary git record only
             }
         }
         (None, None)
@@ -1454,7 +1592,7 @@ impl<'a> ResolveProvider<'a> {
             return (None, None);
         };
         for p in &locked.provenances {
-            if let ProvenanceRecord::Tarball { url, sha256 } = p {
+            if let ProvenanceRecord::Tarball { url, sha256, .. } = p {
                 if url == &dep.url {
                     return (Some(identity), sha256.clone());
                 }
@@ -1463,21 +1601,43 @@ impl<'a> ResolveProvider<'a> {
         (None, None)
     }
 
-    fn prior_self_mirrors(&self, name: &str) -> Vec<String> {
+    /// D-provenance: extract URLs from prior lockfile's declared-origin
+    /// GitProvenanceRecords for `name`. These feed the fallback candidate list
+    /// during fetch (same role as the old `self_mirrors` field).
+    fn prior_declared_mirror_urls(&self, name: &str) -> Vec<String> {
         self.prior
             .and_then(|p| p.deps.iter().find(|d| d.name == name))
-            .map(|d| d.self_mirrors.clone())
+            .map(|d| {
+                d.provenances
+                    .iter()
+                    .filter_map(|p| {
+                        if let milpa_types::ProvenanceRecord::Git { url, origin, .. } = p {
+                            if origin == "declared" {
+                                return Some(url.clone());
+                            }
+                        }
+                        None
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
     // --- finalize / graph --------------------------------------------------
 
     /// Content-hash dedup/alias (Phase B, #32): eagerly-materialized candidates
-    /// sharing an identity collapse to the lexicographically-smallest name; the
-    /// duplicates' `_deps/<name>` dirs are removed and every candidate's deps +
-    /// requires are rewritten to the canonical name. Named candidates are
-    /// materialized after this point and bypass dedup (matching the reference).
-    fn finalize(&self) {
+    /// sharing an identity collapse to ONE canonical node. The canonical name is
+    /// the group member discovered EARLIEST in BFS-insertion order (NOT the
+    /// lexicographically-smallest name — BFS-first beats lex-min so that root-
+    /// declared names win over alphabetically-earlier transitive aliases).
+    ///
+    /// Duplicates' `_deps/<name>` dirs are removed and every surviving
+    /// candidate's deps + requires_names are rewritten to the canonical name.
+    /// Named candidates are materialized after this point and bypass dedup.
+    ///
+    /// Returns a map from canonical name → sorted list of aliases, for
+    /// `build_graph` to populate `ResolvedDep.aliases` / lockfile emission.
+    fn finalize(&self) -> BTreeMap<String, Vec<String>> {
         let mut cands = self.candidates.borrow_mut();
         let mut by_hash: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (name, versions) in cands.iter() {
@@ -1492,43 +1652,80 @@ impl<'a> ResolveProvider<'a> {
             }
         }
 
-        let mut aliases: BTreeMap<String, String> = BTreeMap::new();
+        // Build a discovery-order index for fast lookup.
+        let discovery_index: BTreeMap<String, usize>;
+        let large: usize;
+        {
+            let discovery = self.discovery_order.borrow();
+            large = discovery.len(); // sentinel for names not in discovery_order
+            discovery_index = discovery
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.clone(), i))
+                .collect();
+        }
+
+        // aliases_map: non-canonical → canonical name.
+        let mut aliases_map: BTreeMap<String, String> = BTreeMap::new();
+        // canonical_aliases: canonical → sorted list of non-canonical aliases.
+        let mut canonical_aliases: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
         for (_hash, mut group) in by_hash {
             if group.len() < 2 {
                 continue;
             }
-            group.sort();
+            // Pick canonical = group member with smallest BFS-insertion index.
+            // Ties (not expected in practice) fall back to lex order for determinism.
+            group.sort_by(|a, b| {
+                let ia = discovery_index.get(a).copied().unwrap_or(large);
+                let ib = discovery_index.get(b).copied().unwrap_or(large);
+                ia.cmp(&ib).then_with(|| a.cmp(b))
+            });
             let canonical = group[0].clone();
-            for other in &group[1..] {
-                aliases.insert(other.clone(), canonical.clone());
+            let mut aliases: Vec<String> = group[1..].to_vec();
+            aliases.sort(); // lex-sort the alias list for deterministic output
+            for other in &aliases {
+                aliases_map.insert(other.clone(), canonical.clone());
                 cands.remove(other);
-                let _ = std::fs::remove_dir_all(self.deps_dir.join(other));
+                // NOTE: _deps/<other> cleanup is intentionally OMITTED here.
+                // rebuild_deps_view (B-nimcfg SSOT) owns _deps/ contents and will
+                // remove stale non-canonical dirs and create alias symlinks atomically.
             }
+            canonical_aliases.insert(canonical, aliases);
         }
 
-        if aliases.is_empty() {
-            return;
+        if aliases_map.is_empty() {
+            return canonical_aliases; // empty
         }
         for versions in cands.values_mut() {
             for c in versions.values_mut() {
                 for d in &mut c.deps {
-                    if let Some(can) = aliases.get(&d.package) {
+                    if let Some(can) = aliases_map.get(&d.package) {
                         d.package = can.clone();
                     }
                 }
                 for r in &mut c.requires_names {
-                    if let Some(can) = aliases.get(r) {
+                    if let Some(can) = aliases_map.get(r) {
                         *r = can.clone();
                     }
                 }
             }
         }
+
+        canonical_aliases
     }
 
     /// Map the solver solution → a topologically-ordered [`ResolvedGraph`]
     /// (deps before dependents), excluding the synthetic root. Canonical
     /// lexicographic *emission* order is applied later (S7c).
-    fn build_graph(&self, solution: &BTreeMap<String, Version>) -> ResolvedGraph {
+    ///
+    /// `canonical_aliases` maps canonical name → lex-sorted list of aliases
+    /// (from the Phase B dedup pass); used to populate `ResolvedDep.aliases`.
+    fn build_graph(
+        &self,
+        solution: &BTreeMap<String, Version>,
+        canonical_aliases: &BTreeMap<String, Vec<String>>,
+    ) -> ResolvedGraph {
         let cands = self.candidates.borrow();
         let mut chosen: BTreeMap<String, Candidate> = BTreeMap::new();
         for (name, version) in solution {
@@ -1579,13 +1776,40 @@ impl<'a> ResolveProvider<'a> {
                     version: c.version.clone(),
                     src_dir: c.src_dir.clone(),
                     requires: c.requires_names.clone(),
-                    // Every non-root candidate carries a provenance; default
-                    // defensively (unreachable — root is excluded above).
-                    provenance: c.provenance.clone().unwrap_or(ProvenanceRecord::Local {
-                        path: String::new(),
-                    }),
+                    // D-lifecycle: assemble provenances = observed + declared mirrors.
+                    // The observed record is the one that was fetched+verified.
+                    // Declared records are all candidate URLs that were NOT the
+                    // observed one (manifest mirrors + prior declared).
+                    provenances: {
+                        let observed = c.provenance.clone().unwrap_or(ProvenanceRecord::Local {
+                            path: String::new(),
+                            origin: "observed".to_string(),
+                        });
+                        // Derive ref from the observed record for declared records.
+                        let ref_spec: Option<String> = match &observed {
+                            ProvenanceRecord::Git { ref_spec, .. } => ref_spec.clone(),
+                            _ => None,
+                        };
+                        let mut provs = vec![observed];
+                        // Add one declared GitProvenanceRecord per declared mirror URL.
+                        for mirror_url in &c.declared_mirror_urls {
+                            provs.push(ProvenanceRecord::Git {
+                                url: mirror_url.clone(),
+                                ref_spec: ref_spec.clone(),
+                                commit_sha: None, // declared = unverified
+                                origin: "declared".to_string(),
+                            });
+                        }
+                        provs
+                    },
                     dep_decl: c.dep_decl.clone(),
                     cond_requires,
+                    // Phase B: lex-sorted alias list for this canonical dep.
+                    // Empty for non-deduped deps.
+                    aliases: canonical_aliases
+                        .get(&c.name)
+                        .cloned()
+                        .unwrap_or_default(),
                 }
             })
             .collect();
@@ -1712,6 +1936,7 @@ fn transport_to_record(p: &Provenance) -> ProvenanceRecord {
             url: url.clone(),
             ref_spec: opt(ref_spec),
             commit_sha: commit_sha.clone(),
+            origin: "observed".to_string(),
         },
         Provenance::Tarball {
             url,
@@ -1720,8 +1945,12 @@ fn transport_to_record(p: &Provenance) -> ProvenanceRecord {
         } => ProvenanceRecord::Tarball {
             url: url.clone(),
             sha256: expected_sha256.clone(),
+            origin: "observed".to_string(),
         },
-        Provenance::Local { path } => ProvenanceRecord::Local { path: path.clone() },
+        Provenance::Local { path } => ProvenanceRecord::Local {
+            path: path.clone(),
+            origin: "observed".to_string(),
+        },
         Provenance::Oci {
             registry,
             repository,
@@ -1730,6 +1959,7 @@ fn transport_to_record(p: &Provenance) -> ProvenanceRecord {
             registry: registry.clone(),
             repository: repository.clone(),
             digest: digest.clone(),
+            origin: "observed".to_string(),
         },
     }
 }
@@ -2081,8 +2311,19 @@ fn fetch_msg(e: &FetchError) -> String {
     match e {
         FetchError::Failed(m)
         | FetchError::AllFailed(m)
+        | FetchError::ProvenanceDivergence(m)
         | FetchError::Extract(_, m)
         | FetchError::Transport(_, m) => m.clone(),
+    }
+}
+
+/// Extract a human-readable identifier from a `Provenance` for diagnostics.
+fn prov_url_str(p: &Provenance) -> &str {
+    match p {
+        Provenance::Git { url, .. } => url,
+        Provenance::Tarball { url, .. } => url,
+        Provenance::Local { path } => path,
+        Provenance::Oci { registry, .. } => registry,
     }
 }
 
@@ -2139,6 +2380,9 @@ pub struct FailureCert {
 /// On strict-attestation failure returns `Err((err, failure_cert))` with empty refutation.
 /// On any other error (manifest/fetch/index) returns `Err((err, failure_cert))` with
 /// an empty refutation (the certificate is only written when the resolver ran).
+///
+/// `store` is the content-addressed store used to rebuild `_deps/` after
+/// resolution completes (B-nimcfg SSOT: alias symlinks + stale-entry removal).
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_with_cert(
     manifest: &milpa_manifest::Manifest,
@@ -2150,6 +2394,7 @@ pub fn resolve_with_cert(
     deps_dir: &std::path::Path,
     dep_decl_store: Option<&dyn crate::dep_decl_store::DepDeclStore>,
     require_attested_metadata: bool,
+    store: &CaStore,
 ) -> Result<(ResolvedGraph, SuccessCert), (MilpaError, FailureCert)> {
     // Delegates to `solve_with_refutation` instead of `solve`; all setup is
     // identical to `resolve` — factored through `build_single_provider` (D-F2).
@@ -2182,7 +2427,7 @@ pub fn resolve_with_cert(
     if let Err(e) = provider.process_items(queue) {
         return Err((e, FailureCert { message: String::new(), refutation: Vec::new() }));
     }
-    provider.finalize();
+    let canonical_aliases_cert = provider.finalize();
 
     match solve_with_refutation(&provider, ROOT, root_version(), strategy) {
         Ok(solution) => {
@@ -2197,7 +2442,10 @@ pub fn resolve_with_cert(
                 return Err((e, FailureCert { message: String::new(), refutation: Vec::new() }));
             }
             let cert = provider.build_success_cert(&solution);
-            let graph = provider.build_graph(&solution);
+            let graph = provider.build_graph(&solution, &canonical_aliases_cert);
+            // B-nimcfg SSOT: rebuild _deps/ view (alias symlinks + stale-entry removal).
+            // Mirrors resolve() — the cert path must also own the rebuild.
+            rebuild_deps_view(&graph, deps_dir, store);
             Ok((graph, cert))
         }
         Err((solver_err, refutation)) => {

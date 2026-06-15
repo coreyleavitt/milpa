@@ -37,11 +37,17 @@ pub struct Receipt {
 pub enum FetchError {
     /// Placeholder transport failure (see type docs). Carries no catalog code.
     Failed(String),
-    /// Every mirror candidate failed — network error or identity mismatch on
-    /// all of `fetch_any`'s ordered candidate list (`FETCH-ALL-FAILED`,
-    /// resolver-semantics §8a). Raised by the resolver (S7b), which owns the
-    /// candidate-list construction, but it is a *fetch*-domain outcome.
+    /// Every mirror candidate transport-failed — dep cannot be fetched.
+    /// (`FETCH-ALL-FAILED`, resolver-semantics §8a). Raised by the resolver
+    /// (S7b), which owns the candidate-list construction.  Identity divergence
+    /// (`FETCH-PROVENANCE-DIVERGENCE`) is a separate, distinct error and is
+    /// never folded into this variant.
     AllFailed(String),
+    /// A candidate provenance fetched successfully but its content hash does
+    /// not match the locked identity — a supply-chain signal.
+    /// (`FETCH-PROVENANCE-DIVERGENCE`, RFC Phase D item 3).  Raised immediately
+    /// and loudly; MUST NOT fall through to the next candidate.
+    ProvenanceDivergence(String),
     /// Archive extraction failed / unsafe (`EXTRACT-*`), wired in S14.
     Extract(&'static str, String),
     /// A coded transport failure from a real fetcher (`FETCH-LOCAL-*` /
@@ -56,6 +62,7 @@ impl FetchError {
             // Non-catalog placeholder (see type docs); never satisfies a fixture.
             FetchError::Failed(_) => "FETCH-FAILED",
             FetchError::AllFailed(_) => "FETCH-ALL-FAILED",
+            FetchError::ProvenanceDivergence(_) => "FETCH-PROVENANCE-DIVERGENCE",
             FetchError::Extract(c, _) | FetchError::Transport(c, _) => c,
         }
     }
@@ -67,6 +74,8 @@ impl FetchError {
     pub fn all_codes() -> &'static [&'static str] {
         &[
             "FETCH-ALL-FAILED",
+            // D-fallback: supply-chain signal (RFC Phase D item 3).
+            "FETCH-PROVENANCE-DIVERGENCE",
             // safe tar extraction (S14b) — carried by the Extract variant.
             "EXTRACT-ZIP-SLIP",
             "EXTRACT-SYMLINK-ESCAPE",

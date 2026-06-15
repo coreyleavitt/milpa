@@ -157,21 +157,25 @@ pub enum Provenance {
 
 impl Provenance {
     /// Whether this dep may be admitted into the content-addressed store.
-    /// `Local` is never CAS-admissible, so `milpa fetch` on a workspace member
-    /// (local path) does not freeze the user's in-progress edits (RFC §4.6).
+    /// `Local` deps (local-path sources) are never CAS-admissible so that
+    /// `milpa fetch` does not freeze the user's in-progress edits (RFC §4.6).
+    ///
+    /// Workspace members (`ProvenanceRecord::Member` at the lockfile layer) are
+    /// handled entirely outside the transport enum and never reach this method;
+    /// they are non-CAS-admissible by virtue of not appearing here at all
+    /// (see `spec/identity.md §4.1` for the two-axis model).
     pub fn cas_admissible(&self) -> bool {
         !matches!(self, Provenance::Local { .. })
     }
 }
 
-/// One dep after resolution: identity (content hash) ⊥ provenance.
+/// One dep after resolution: identity (content hash) ⊥ provenances.
 ///
-/// `provenance` is the emission-level [`ProvenanceRecord`] (6 kinds), **not** the
-/// 4-kind transport [`Provenance`]: a resolved dep is post-fetch, so what matters
-/// downstream (lockfile emission, frozen rebuild) is *what to record about where
-/// the bytes came from* — including the non-transport `Member` (workspace) and
-/// `Registry` (legacy) kinds a workspace resolve / lockfile read produce. The
-/// resolver maps its internal transport `Provenance` → `ProvenanceRecord` when
+/// `provenances` is a `Vec` of emission-level [`ProvenanceRecord`]s (6 kinds each),
+/// **not** the 4-kind transport [`Provenance`]. D-lifecycle: there is now at least
+/// one "observed" record (the fetched+verified candidate) plus zero or more "declared"
+/// records (manifest mirrors + prior declared mirrors, deduped vs observed). The
+/// resolver maps its internal transport `Provenance` → `ProvenanceRecord`s when
 /// building the graph; `from_graph` is then a near-trivial clone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDep {
@@ -181,7 +185,9 @@ pub struct ResolvedDep {
     pub version: Version,
     pub src_dir: String,
     pub requires: Vec<String>,
-    pub provenance: ProvenanceRecord,
+    /// D-lifecycle: one observed provenance + zero or more declared mirror provenances.
+    /// Empty only for the synthetic root (excluded from the graph before emission).
+    pub provenances: Vec<ProvenanceRecord>,
     /// S6: dep_decl pin — `sha256:<hex>` hash of the DepDecl artifact used
     /// during resolution (lockfile-schema §3.7).  `None` when the dep was
     /// not resolved via a DepDecl edge source (milpa.kdl or .nimble fallback).
@@ -189,6 +195,12 @@ pub struct ResolvedDep {
     /// S4: conditional require annotations propagated from `EdgeSetTerms.requires_predicates`
     /// (RFC cond-requires §3.4.3). Sorted by name.
     pub cond_requires: Vec<CondRequire>,
+    /// Phase B: alternate dep names when one content-identity is reached via
+    /// multiple manifest names (dedup). Lexicographically sorted. Empty for
+    /// non-deduped deps. The canonical name is the BFS-insertion-order earliest.
+    /// Populated by the resolver's `finalize()` dedup pass; carried through
+    /// `from_graph` → `LockedDep.aliases` → lockfile emission.
+    pub aliases: Vec<String>,
 }
 
 /// The resolved dependency graph — the resolver's output, the emitters' input.
@@ -207,29 +219,43 @@ pub struct ResolvedGraph {
 /// They are different sets by design, so they are different types (mirrors the
 /// Python `ProvenanceRecord` union in `lockfile.py`). Optional fields are `None`
 /// when omitted from the KDL — never an empty string.
+///
+/// `origin`: `"observed"` (milpa fetched+verified these bytes) or `"declared"`
+/// (author-claimed mirror, unverified until first use). Per-lockfile annotation —
+/// never a CAS-entry property. Default `"observed"`. D-provenance (lockfile-schema §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProvenanceRecord {
     Git {
         url: String,
         ref_spec: Option<String>,
         commit_sha: Option<String>,
+        /// "observed" or "declared". Default "observed".
+        origin: String,
     },
     Tarball {
         url: String,
         /// Archive sha256 (transport receipt, NOT identity); `None` pre-TOFU.
         sha256: Option<String>,
+        /// "observed" or "declared". Default "observed".
+        origin: String,
     },
     Local {
         /// As-declared relative path from the project root (never absolutized).
         path: String,
+        /// "observed" or "declared". Default "observed".
+        origin: String,
     },
     Member {
         name: String,
+        /// "observed" or "declared". Default "observed".
+        origin: String,
     },
     Oci {
         registry: String,
         repository: String,
         digest: String,
+        /// "observed" or "declared". Default "observed".
+        origin: String,
     },
     /// Read-compat only (milpa#97): the writer never emits this; the parser
     /// still accepts it so pre-#97 lockfiles round-trip.
@@ -237,7 +263,35 @@ pub enum ProvenanceRecord {
         name: String,
         tag: Option<String>,
         commit_sha: Option<String>,
+        /// "observed" or "declared". Default "observed".
+        origin: String,
     },
+}
+
+impl ProvenanceRecord {
+    /// Return the `origin` field for this record ("observed" or "declared").
+    pub fn origin(&self) -> &str {
+        match self {
+            ProvenanceRecord::Git { origin, .. } => origin,
+            ProvenanceRecord::Tarball { origin, .. } => origin,
+            ProvenanceRecord::Local { origin, .. } => origin,
+            ProvenanceRecord::Member { origin, .. } => origin,
+            ProvenanceRecord::Oci { origin, .. } => origin,
+            ProvenanceRecord::Registry { origin, .. } => origin,
+        }
+    }
+
+    /// Return the kind discriminator string for this record.
+    pub fn kind(&self) -> &str {
+        match self {
+            ProvenanceRecord::Git { .. } => "git",
+            ProvenanceRecord::Tarball { .. } => "tarball",
+            ProvenanceRecord::Local { .. } => "local",
+            ProvenanceRecord::Member { .. } => "member",
+            ProvenanceRecord::Oci { .. } => "oci",
+            ProvenanceRecord::Registry { .. } => "registry",
+        }
+    }
 }
 
 /// One conditional-require annotation on a locked dep (S4 — RFC
@@ -259,9 +313,9 @@ pub struct CondRequire {
 ///
 /// Structurally distinct from [`ResolvedDep`]: the lockfile records `identity`
 /// as **optional** (Phase A partial — a dep not yet content-hashed stores
-/// `None`), carries `ProvenanceRecord`s (the metadata model) rather than a
-/// transport `Provenance`, and adds `active_flags` / `self_mirrors`. Mirrors the
-/// Python `LockedDep`.
+/// `None`), carries `ProvenanceRecord`s (the metadata model). Mirrors the
+/// Python `LockedDep`. D-provenance: `self_mirrors` removed; declared mirrors
+/// are stored as `ProvenanceRecord` with `origin="declared"`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockedDep {
     pub name: String,
@@ -271,7 +325,6 @@ pub struct LockedDep {
     pub requires: Vec<String>,
     pub provenances: Vec<ProvenanceRecord>,
     pub active_flags: Vec<String>,
-    pub self_mirrors: Vec<String>,
     /// S6: dep_decl pin — `sha256:<hex>` hash of the DepDecl artifact used
     /// during resolution (lockfile-schema §3.7).  `None` when absent (forward-
     /// compat: older lockfile entries without this field are fine).
@@ -279,6 +332,10 @@ pub struct LockedDep {
     /// S4: additive cond-require annotations (RFC cond-requires §3.4.1).
     /// Sorted by name. Never consulted by frozen/verify/nimcfg.
     pub cond_requires: Vec<CondRequire>,
+    /// Phase B: alternate dep names when one content-identity is reached via
+    /// multiple manifest names (dedup). Lexicographically sorted. Omitted from
+    /// KDL entirely when empty. See lockfile-schema §3.8.
+    pub aliases: Vec<String>,
 }
 
 /// The parsed `milpa.lock` as data (parse/emit logic lives in `milpa-core`).

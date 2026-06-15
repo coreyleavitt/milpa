@@ -21,6 +21,7 @@ use crate::fetch::{FetchError, FetcherRegistry, Receipt};
 use crate::identity::compute_content_hash;
 use crate::registry::{Index, IndexVersion, Package};
 use crate::resolver::resolve;
+use crate::store::CaStore;
 
 // --- fake fetcher ----------------------------------------------------------
 
@@ -252,6 +253,14 @@ fn deps_dir(tmp: &tempfile::TempDir) -> std::path::PathBuf {
     tmp.path().join("_deps")
 }
 
+/// A no-op CaStore for resolver tests: points to a temp dir inside `tmp`
+/// so `rebuild_deps_view`'s `store.link()` calls are valid (it just won't
+/// find real CAS entries, which is fine — the fake fetcher never admits into
+/// a CAS and the resolver's own _deps/ already has the materialized dirs).
+fn cas_store(tmp: &tempfile::TempDir) -> CaStore {
+    CaStore::new(tmp.path().join("cas"))
+}
+
 /// Real content hash of a tree containing only `<name>.nimble = body` — used so
 /// an index entry's `content_hash` matches what the resolver computes (the
 /// identity gate then passes).
@@ -287,6 +296,7 @@ fn resolve_single_url_dep_no_transitive() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap();
 
@@ -296,11 +306,12 @@ fn resolve_single_url_dep_no_transitive() {
     assert_eq!(foo.src_dir, "src");
     assert!(foo.identity.starts_with("sha256:"));
     assert_eq!(foo.identity.len(), "sha256:".len() + 64);
-    match &foo.provenance {
+    match foo.provenances.first().expect("at least one provenance") {
         ProvenanceRecord::Git {
             url,
             ref_spec,
             commit_sha,
+            ..
         } => {
             assert_eq!(url, "https://example.com/foo.git");
             assert_eq!(ref_spec.as_deref(), Some("main"));
@@ -308,6 +319,8 @@ fn resolve_single_url_dep_no_transitive() {
         }
         other => panic!("expected git provenance, got {other:?}"),
     }
+    // D-lifecycle: no mirrors declared → single observed provenance.
+    assert_eq!(foo.provenances.len(), 1);
 }
 
 #[test]
@@ -340,6 +353,7 @@ fn resolve_url_dep_with_transitive_url() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap();
     let names: Vec<&str> = graph.deps.iter().map(|d| d.name.as_str()).collect();
@@ -386,6 +400,7 @@ fn resolve_dedup_same_url_ref_fetches_once() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap();
     let shared: Vec<_> = graph.deps.iter().filter(|d| d.name == "shared").collect();
@@ -436,6 +451,7 @@ fn resolve_named_dep_strategy_selects_version() {
         &deps_dir(&tmp_max),
         None,
         false,
+        &cas_store(&tmp_max),
     )
     .unwrap();
     let foo_max = g_max.deps.iter().find(|d| d.name == "foo").unwrap();
@@ -453,6 +469,7 @@ fn resolve_named_dep_strategy_selects_version() {
         &deps_dir(&tmp_min),
         None,
         false,
+        &cas_store(&tmp_min),
     )
     .unwrap();
     let foo_min = g_min.deps.iter().find(|d| d.name == "foo").unwrap();
@@ -474,6 +491,7 @@ fn resolve_named_dep_without_index_errors() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap_err();
     assert_eq!(err.code(), "RES-NO-INDEX");
@@ -506,10 +524,11 @@ fn resolve_url_dep_with_override_fetches_override() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap();
     let foo = graph.deps.iter().find(|d| d.name == "foo").unwrap();
-    match &foo.provenance {
+    match foo.provenances.first().expect("provenance") {
         ProvenanceRecord::Git { url, ref_spec, .. } => {
             assert_eq!(url, "https://fork.example.com/foo.git");
             assert_eq!(ref_spec.as_deref(), Some("patched"));
@@ -557,11 +576,12 @@ fn resolve_root_override_precedence_suppresses_transitive_provenance() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap();
     let shared: Vec<_> = graph.deps.iter().filter(|d| d.name == "shared").collect();
     assert_eq!(shared.len(), 1);
-    match &shared[0].provenance {
+    match shared[0].provenances.first().expect("provenance") {
         ProvenanceRecord::Git { url, .. } => assert_eq!(url, "https://fork.example.com/shared.git"),
         other => panic!("expected git, got {other:?}"),
     }
@@ -614,6 +634,7 @@ fn resolve_non_root_provenance_disagreement_conflicts() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap_err();
     assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
@@ -649,6 +670,7 @@ fn resolve_dev_deps_root_enrolls_transitive_excludes() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap();
     let names: Vec<&str> = graph.deps.iter().map(|d| d.name.as_str()).collect();
@@ -684,13 +706,14 @@ fn resolve_local_dep_copies_and_parses() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap();
     let dep = graph.deps.iter().find(|d| d.name == "liblocal").unwrap();
     assert_eq!(dep.src_dir, "src");
-    match &dep.provenance {
+    match dep.provenances.first().expect("provenance") {
         // The recorded path is the declared relative path, not the absolute copy.
-        ProvenanceRecord::Local { path } => assert_eq!(path, "liblocal"),
+        ProvenanceRecord::Local { path, .. } => assert_eq!(path, "liblocal"),
         other => panic!("expected local, got {other:?}"),
     }
 }
@@ -711,6 +734,7 @@ fn resolve_fetch_failure_surfaces() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap_err();
     assert_eq!(err.code(), "FETCH-ALL-FAILED");
@@ -736,6 +760,7 @@ fn resolve_malformed_nimble_constraint_is_manifest_error() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap_err();
     assert_eq!(err.code(), "MAN-NIMBLE-CONSTRAINT");
@@ -743,8 +768,9 @@ fn resolve_malformed_nimble_constraint_is_manifest_error() {
 
 #[test]
 fn resolve_prior_lockfile_pin_rejects_hostile_bytes() {
-    // §8: the prior lockfile pins an identity that does NOT match the bytes the
-    // fetch delivers → every candidate fails the identity gate → FETCH-ALL-FAILED.
+    // §8 / Phase D item 3: the prior lockfile pins an identity that does NOT
+    // match the bytes the fetch delivers → supply-chain signal →
+    // FETCH-PROVENANCE-DIVERGENCE (raised immediately, not folded into FETCH-ALL-FAILED).
     let reg = FakeReg::git(&[(
         "https://example.com/foo.git",
         "main",
@@ -767,11 +793,12 @@ fn resolve_prior_lockfile_pin_rejects_hostile_bytes() {
                 url: "https://example.com/foo.git".into(),
                 ref_spec: Some("main".into()),
                 commit_sha: None,
+                origin: "observed".into(),
             }],
             active_flags: Vec::new(),
-            self_mirrors: Vec::new(),
             dep_decl: None,
             cond_requires: Vec::new(),
+            aliases: Vec::new(),
         }],
     };
     let err = resolve(
@@ -784,9 +811,10 @@ fn resolve_prior_lockfile_pin_rejects_hostile_bytes() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap_err();
-    assert_eq!(err.code(), "FETCH-ALL-FAILED");
+    assert_eq!(err.code(), "FETCH-PROVENANCE-DIVERGENCE");
 }
 
 #[test]
@@ -810,11 +838,12 @@ fn resolve_prior_lockfile_pin_accepts_matching_bytes() {
                 url: "https://example.com/foo.git".into(),
                 ref_spec: Some("main".into()),
                 commit_sha: None,
+                origin: "observed".into(),
             }],
             active_flags: Vec::new(),
-            self_mirrors: Vec::new(),
             dep_decl: None,
             cond_requires: Vec::new(),
+            aliases: Vec::new(),
         }],
     };
     let graph = resolve(
@@ -827,10 +856,171 @@ fn resolve_prior_lockfile_pin_accepts_matching_bytes() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap();
     let foo = graph.deps.iter().find(|d| d.name == "foo").unwrap();
     assert_eq!(foo.identity, identity);
+}
+
+// ---------------------------------------------------------------------------
+// D-fallback tests (RFC Phase D item 3): transport-failure vs identity-divergence
+// ---------------------------------------------------------------------------
+
+fn url_dep_with_mirrors(name: &str, git: &str, refp: &str, mirrors: Vec<&str>) -> Dep {
+    Dep::Url(UrlDep {
+        name: name.to_string(),
+        git: git.to_string(),
+        git_ref: refp.to_string(),
+        mirrors: mirrors.iter().map(|s| s.to_string()).collect(),
+        predicates: Vec::new(),
+        flag_requests: Vec::new(),
+    })
+}
+
+fn prior_with_zero_identity(dep_name: &str, url: &str) -> Lockfile {
+    Lockfile {
+        version: LOCKFILE_SCHEMA_VERSION,
+        strategy: "maxver".into(),
+        deps: vec![LockedDep {
+            name: dep_name.into(),
+            identity: Some(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
+            ),
+            version: "0.0.1".into(),
+            src_dir: "src".into(),
+            requires: Vec::new(),
+            provenances: vec![ProvenanceRecord::Git {
+                url: url.into(),
+                ref_spec: Some("main".into()),
+                commit_sha: None,
+                origin: "observed".into(),
+            }],
+            active_flags: Vec::new(),
+            dep_decl: None,
+            cond_requires: Vec::new(),
+            aliases: Vec::new(),
+        }],
+    }
+}
+
+/// DF-1: primary transport-fails, mirror succeeds → mirror becomes observed.
+#[test]
+fn resolve_df1_transport_fail_falls_through_to_mirror() {
+    // Primary has no mock (transport fail); mirror has a mock (succeeds).
+    let primary = "https://primary.example.com/foo.git";
+    let mirror = "https://mirror.example.com/foo.git";
+    let reg = FakeReg::git(&[(mirror, "main", nimble("m", "srcDir = \"src\"\n"))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep_with_mirrors("foo", primary, "main", vec![mirror])]);
+    let graph = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap();
+    assert_eq!(graph.deps.len(), 1);
+    // Mirror becomes observed.
+    let foo = &graph.deps[0];
+    let observed: Vec<_> = foo.provenances.iter().filter(|p| {
+        matches!(p, ProvenanceRecord::Git { origin, .. } if origin == "observed")
+    }).collect();
+    assert_eq!(observed.len(), 1);
+    if let ProvenanceRecord::Git { url, .. } = observed[0] {
+        assert_eq!(url, mirror, "mirror must be the observed provenance");
+    }
+    // Primary was also contacted (transport-fail) and is now declared.
+    let called = reg.calls();
+    assert!(called.iter().any(|(_, u, _)| u == primary), "primary must have been tried");
+    assert!(called.iter().any(|(_, u, _)| u == mirror), "mirror must have been tried");
+}
+
+/// DF-2a: primary fetch SUCCEEDS but returns WRONG identity → FETCH-PROVENANCE-DIVERGENCE.
+#[test]
+fn resolve_df2_identity_divergence_raises_immediately() {
+    // Primary has a mock (succeeds) but the prior pin is an all-zeros identity
+    // that will never match → supply-chain signal → FETCH-PROVENANCE-DIVERGENCE.
+    let primary = "https://example.com/foo.git";
+    let reg = FakeReg::git(&[(primary, "main", nimble("f", "srcDir = \"src\"\n"))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("foo", primary, "main")]);
+    let prior = prior_with_zero_identity("foo", primary);
+    let err = resolve(
+        &m, None, &reg, None, Some(&prior), Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.code(), "FETCH-PROVENANCE-DIVERGENCE",
+        "identity mismatch must raise FETCH-PROVENANCE-DIVERGENCE, not be swallowed"
+    );
+}
+
+/// DF-2b: divergence must NOT fall through to the mirror — mirror is never contacted.
+#[test]
+fn resolve_df2_divergence_does_not_try_mirror() {
+    let primary = "https://primary.example.com/foo.git";
+    let mirror = "https://mirror.example.com/foo.git";
+    // Both primary and mirror have mocks so if mirror were contacted it would succeed.
+    // The prior pins an all-zeros identity that won't match → divergence on primary.
+    let reg = FakeReg::git(&[
+        (primary, "main", nimble("p", "srcDir = \"src\"\n")),
+        (mirror, "main", nimble("m", "srcDir = \"src\"\n")),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep_with_mirrors("foo", primary, "main", vec![mirror])]);
+    let prior = prior_with_zero_identity("foo", primary);
+    let err = resolve(
+        &m, None, &reg, None, Some(&prior), Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "FETCH-PROVENANCE-DIVERGENCE");
+    // Mirror must NOT have been contacted.
+    let called = reg.calls();
+    assert!(
+        !called.iter().any(|(_, u, _)| u == mirror),
+        "mirror must NOT be contacted after primary diverged; calls: {called:?}"
+    );
+}
+
+/// DF-3: ALL candidates transport-fail → FETCH-ALL-FAILED (preserved behavior).
+#[test]
+fn resolve_df3_all_transport_fail_raises_fetch_all_failed() {
+    // Neither primary nor mirror has a mock → all transport-fail.
+    let primary = "https://primary.example.com/foo.git";
+    let mirror = "https://mirror.example.com/foo.git";
+    let reg = FakeReg::default(); // no mocks
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep_with_mirrors("foo", primary, "main", vec![mirror])]);
+    let err = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "FETCH-ALL-FAILED");
+    // Both candidates must have been tried.
+    let called = reg.calls();
+    assert!(called.iter().any(|(_, u, _)| u == primary), "primary must be tried");
+    assert!(called.iter().any(|(_, u, _)| u == mirror), "mirror must be tried");
+}
+
+/// DF-4: fresh resolve, no prior pin → no identity gate, first candidate adopted.
+#[test]
+fn resolve_df4_fresh_resolve_no_prior_no_divergence_check() {
+    let primary = "https://example.com/foo.git";
+    let reg = FakeReg::git(&[(primary, "main", nimble("f", "srcDir = \"src\"\n"))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("foo", primary, "main")]);
+    // No prior lockfile → no expected_identity → no gate.
+    let graph = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap();
+    assert_eq!(graph.deps.len(), 1);
+    let foo = &graph.deps[0];
+    let observed: Vec<_> = foo.provenances.iter().filter(|p| {
+        matches!(p, ProvenanceRecord::Git { origin, .. } if origin == "observed")
+    }).collect();
+    assert_eq!(observed.len(), 1);
+    if let ProvenanceRecord::Git { url, .. } = observed[0] {
+        assert_eq!(url, primary);
+    }
 }
 
 #[test]
@@ -861,22 +1051,25 @@ fn resolve_mirror_fallback_uses_second_candidate() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap();
     assert_eq!(graph.deps.len(), 1);
     assert_eq!(graph.deps[0].name, "foo");
 }
 
+/// Phase B tracer bullet: two URL deps, identical content → one node.
+/// Canonical = BFS-insertion order (first DECLARED), not lex-min.
+/// `foo` is declared first → canonical is "foo"; alias is "bar".
 #[test]
-fn resolve_content_hash_dedup_aliases_to_lex_min_name() {
-    // Two URL deps deliver byte-identical trees (same single file) → they
-    // collapse to the lexicographically-smallest name ("bar").
+fn resolve_content_hash_dedup_bfs_first_wins() {
     let identical = milpa_kdl("x", "name \"shared\"\nkind \"library\"\nsrc_dir \"src\"\n");
     let reg = FakeReg::git(&[
         ("https://example.com/foo.git", "main", identical.clone()),
         ("https://example.com/bar.git", "main", identical),
     ]);
     let tmp = tempfile::tempdir().unwrap();
+    // Declared order: foo first, bar second → BFS canonical = foo.
     let m = manifest(vec![
         url_dep("foo", "https://example.com/foo.git", "main"),
         url_dep("bar", "https://example.com/bar.git", "main"),
@@ -891,10 +1084,159 @@ fn resolve_content_hash_dedup_aliases_to_lex_min_name() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+    assert_eq!(graph.deps.len(), 1, "deduped to one node");
+    assert_eq!(graph.deps[0].name, "foo", "BFS-first declared wins (not lex-min)");
+    assert_eq!(
+        graph.deps[0].aliases,
+        vec!["bar".to_string()],
+        "alias should be 'bar'"
+    );
+}
+
+/// Phase B BFS-beats-lex: root-declared 'zlib' + root-declared 'aaa-zlib' (lex-earlier)
+/// with identical content → canonical must be 'zlib' (BFS-first), not 'aaa-zlib' (lex-min).
+#[test]
+fn resolve_content_hash_dedup_bfs_order_beats_lex_min() {
+    let identical = milpa_kdl("x", "name \"shared\"\nkind \"library\"\nsrc_dir \"src\"\n");
+    let reg = FakeReg::git(&[
+        ("https://example.com/zlib.git", "main", identical.clone()),
+        ("https://example.com/aaa-zlib.git", "main", identical),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    // Declared order: zlib first, aaa-zlib second.
+    // Lex-min would be 'aaa-zlib'. BFS-first is 'zlib'. BFS must win.
+    let m = manifest(vec![
+        url_dep("zlib", "https://example.com/zlib.git", "main"),
+        url_dep("aaa-zlib", "https://example.com/aaa-zlib.git", "main"),
+    ]);
+    let graph = resolve(
+        &m,
+        None,
+        &reg,
+        None,
+        None,
+        Strategy::Maxver,
+        &deps_dir(&tmp),
+        None,
+        false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+    assert_eq!(graph.deps.len(), 1, "deduped to one node");
+    assert_eq!(
+        graph.deps[0].name, "zlib",
+        "BFS-first canonical should be 'zlib', not lex-min 'aaa-zlib'"
+    );
+    assert_eq!(
+        graph.deps[0].aliases,
+        vec!["aaa-zlib".to_string()],
+        "alias should be 'aaa-zlib'"
+    );
+}
+
+/// Phase B: a dep that `requires` an aliased name has its requires rewritten to canonical.
+/// baz requires bar; bar is an alias of foo (same content) → baz.requires = [foo].
+#[test]
+fn resolve_dedup_requires_rewritten_to_canonical() {
+    let shared = milpa_kdl("x", "name \"shared\"\nkind \"library\"\nsrc_dir \"src\"\n");
+    // baz declares 'bar' as a dep
+    let baz_kdl_body = concat!(
+        "name \"baz\"\nkind \"library\"\nsrc_dir \"src\"\n",
+        "deps {\n    bar git=(url)\"https://example.com/bar.git\" ref=\"main\"\n}\n"
+    );
+    let baz_mock = milpa_kdl("x", baz_kdl_body);
+    let reg = FakeReg::git(&[
+        ("https://example.com/foo.git", "main", shared.clone()),
+        ("https://example.com/bar.git", "main", shared),
+        ("https://example.com/baz.git", "main", baz_mock),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![
+        url_dep("foo", "https://example.com/foo.git", "main"),
+        url_dep("bar", "https://example.com/bar.git", "main"),
+        url_dep("baz", "https://example.com/baz.git", "main"),
+    ]);
+    let graph = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false,
+        &cas_store(&tmp),
     )
     .unwrap();
     let names: Vec<&str> = graph.deps.iter().map(|d| d.name.as_str()).collect();
-    assert_eq!(names, vec!["bar"], "deduped to lex-min canonical");
+    assert!(!names.contains(&"bar"), "'bar' must be deduped away: {names:?}");
+    assert!(names.contains(&"foo"), "'foo' must be canonical: {names:?}");
+    assert!(names.contains(&"baz"), "'baz' must survive: {names:?}");
+
+    let baz_dep = graph.deps.iter().find(|d| d.name == "baz").unwrap();
+    assert!(
+        baz_dep.requires.contains(&"foo".to_string()),
+        "baz.requires must contain 'foo' after rewrite: {:?}",
+        baz_dep.requires
+    );
+    assert!(
+        !baz_dep.requires.contains(&"bar".to_string()),
+        "baz.requires must NOT contain 'bar' after rewrite: {:?}",
+        baz_dep.requires
+    );
+}
+
+/// Phase B: two deps with DIFFERENT content must NOT be merged.
+#[test]
+fn resolve_dedup_different_content_not_merged() {
+    let alpha = milpa_kdl("x", "name \"alpha\"\nkind \"library\"\nsrc_dir \"src\"\n");
+    let beta = milpa_kdl("x", "name \"beta\"\nkind \"library\"\nsrc_dir \"lib\"\n");
+    let reg = FakeReg::git(&[
+        ("https://example.com/alpha.git", "main", alpha),
+        ("https://example.com/beta.git", "main", beta),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![
+        url_dep("alpha", "https://example.com/alpha.git", "main"),
+        url_dep("beta", "https://example.com/beta.git", "main"),
+    ]);
+    let graph = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+    assert_eq!(graph.deps.len(), 2, "different-content deps must not be merged");
+    let names: Vec<&str> = graph.deps.iter().map(|d| d.name.as_str()).collect();
+    assert!(names.contains(&"alpha") && names.contains(&"beta"), "both must survive: {names:?}");
+    for dep in &graph.deps {
+        assert!(dep.aliases.is_empty(), "no aliases for non-deduped dep {:?}", dep.name);
+    }
+}
+
+/// Phase B: three deps with identical content → one canonical + two lex-sorted aliases.
+#[test]
+fn resolve_dedup_three_way_one_canonical_two_aliases() {
+    let shared = milpa_kdl("x", "name \"shared\"\nkind \"library\"\nsrc_dir \"src\"\n");
+    let reg = FakeReg::git(&[
+        ("https://example.com/foo.git", "main", shared.clone()),
+        ("https://example.com/bar.git", "main", shared.clone()),
+        ("https://example.com/baz.git", "main", shared),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    // Declared: foo, bar, baz → BFS canonical = foo (declared first).
+    let m = manifest(vec![
+        url_dep("foo", "https://example.com/foo.git", "main"),
+        url_dep("bar", "https://example.com/bar.git", "main"),
+        url_dep("baz", "https://example.com/baz.git", "main"),
+    ]);
+    let graph = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+    assert_eq!(graph.deps.len(), 1, "three-way dedup → one node");
+    assert_eq!(graph.deps[0].name, "foo", "BFS-first canonical");
+    assert_eq!(
+        graph.deps[0].aliases,
+        vec!["bar".to_string(), "baz".to_string()],
+        "aliases must be lex-sorted"
+    );
 }
 
 /// Regression: fixture-115 — dep with `platform "windows"` child-node predicate
@@ -932,6 +1274,7 @@ fn resolve_profile_excludes_platform_mismatch() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap();
     assert!(graph.deps.is_empty(), "windows-gated dep excluded on linux");
@@ -974,6 +1317,7 @@ fn resolve_profile_includes_platform_match() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap();
     assert_eq!(graph.deps.len(), 1, "linux-gated dep included on linux");
@@ -1012,6 +1356,7 @@ fn resolve_absent_profile_includes_platform_gated_dep() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap();
     assert_eq!(graph.deps.len(), 1, "absent profile includes all deps");
@@ -1050,6 +1395,7 @@ fn resolve_profile_filters_conditional_dep() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap();
     assert!(graph.deps.is_empty());
@@ -1088,6 +1434,7 @@ fn resolve_absent_profile_includes_conditional_dep() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap();
     assert_eq!(graph.deps.len(), 1);
@@ -1105,15 +1452,18 @@ fn resolve_tarball_first_fetch_records_archive_sha256() {
     let reg = tarball_reg(&[(url, tarball_mock("archivesha_aaaa", body))]);
     let tmp = tempfile::tempdir().unwrap();
     let m = manifest(vec![tarball_dep("foo", url, None)]);
-    let graph = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false).unwrap();
+    let graph = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp)).unwrap();
     let foo = graph.deps.iter().find(|d| d.name == "foo").unwrap();
     assert_eq!(
-        foo.provenance,
-        ProvenanceRecord::Tarball {
+        foo.provenances.first().cloned(),
+        Some(ProvenanceRecord::Tarball {
             url: url.into(),
             sha256: Some("archivesha_aaaa".into()),
-        }
+            origin: "observed".into(),
+        })
     );
+    // D-lifecycle: tarball deps have no mirrors → single observed provenance.
+    assert_eq!(foo.provenances.len(), 1);
 }
 
 /// Build a prior lockfile pinning `name` to `identity` with a tarball provenance
@@ -1131,11 +1481,12 @@ fn tarball_prior(name: &str, url: &str, identity: &str, sha256: &str) -> Lockfil
             provenances: vec![ProvenanceRecord::Tarball {
                 url: url.into(),
                 sha256: Some(sha256.into()),
+                origin: "observed".into(),
             }],
             active_flags: Vec::new(),
-            self_mirrors: Vec::new(),
             dep_decl: None,
             cond_requires: Vec::new(),
+            aliases: Vec::new(),
         }],
     }
 }
@@ -1165,6 +1516,7 @@ fn resolve_tarball_refetch_rejects_substituted_archive() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap_err();
     assert_eq!(err.code(), "FETCH-ALL-FAILED");
@@ -1199,15 +1551,17 @@ fn resolve_tarball_refetch_preserves_pin() {
         &deps_dir(&tmp),
         None,
         false,
+        &cas_store(&tmp),
     )
     .unwrap();
     let foo = graph.deps.iter().find(|d| d.name == "foo").unwrap();
     assert_eq!(
-        foo.provenance,
-        ProvenanceRecord::Tarball {
+        foo.provenances.first().cloned(),
+        Some(ProvenanceRecord::Tarball {
             url: url.into(),
             sha256: Some("archivesha_AAAA".into()),
-        }
+            origin: "observed".into(),
+        })
     );
 }
 
@@ -1221,7 +1575,7 @@ fn resolve_tarball_manifest_sha256_mismatch_rejected_on_first_fetch() {
     let reg = tarball_reg(&[(url, tarball_mock("archivesha_actual", body))]);
     let tmp = tempfile::tempdir().unwrap();
     let m = manifest(vec![tarball_dep("foo", url, Some("archivesha_declared"))]);
-    let err = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false).unwrap_err();
+    let err = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp)).unwrap_err();
     assert_eq!(err.code(), "FETCH-ALL-FAILED");
     let MilpaError::Fetch(FetchError::AllFailed(msg)) = &err else {
         panic!("expected AllFailed, got {err:?}");

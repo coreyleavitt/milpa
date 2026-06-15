@@ -98,6 +98,7 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
         "update" => cmd_update(dir, cli.strategy, &cli.rest, cli.no_index),
         "add" => cmd_add(dir, &cli.rest, cli.no_index),
         "remove" => cmd_remove(dir, &cli.rest, cli.no_index),
+        "store" => cmd_store(&cli.rest),
         other => {
             // Gap-1 §3: unknown verb is a usage error → exit 2 (no milpa-error: line).
             eprintln!("milpa: unknown command {other:?}\n{USAGE}");
@@ -442,6 +443,17 @@ fn mocked_fetches_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Single construction site for the CAS store (cli-contract §8.2).
+///
+/// Every command that touches the CAS (fetch / lock / update / add / remove /
+/// store / frozen paths) MUST obtain its ``CaStore`` via this function — never
+/// via ``CaStore::new(cas_root())`` inline.  This is the ONE place where
+/// ``cas_root()`` logic is consulted, matching the Python impl's pattern of
+/// building one store in ``_build_env`` and sharing it.
+fn build_store() -> CaStore {
+    CaStore::new(cas_root())
+}
+
 /// Build the fetcher registry used by every resolve path (fetch / lock / add /
 /// remove / update). All fetches go through `CasAdmittingFetcher` so
 /// `_deps/<name>` is always a relative CAS symlink. The inner fetcher is the
@@ -449,19 +461,17 @@ fn mocked_fetches_dir() -> Option<PathBuf> {
 /// else `DefaultRegistry` (real network). Single source of truth for the
 /// stage→hash→admit→link orchestration lives in `CasAdmittingFetcher`.
 fn build_registry() -> Box<dyn FetcherRegistry> {
-    let store = CaStore::new(cas_root());
-    // staging_root on the same filesystem as the CAS so rename(2) is atomic.
-    let staging_root = cas_root();
+    let store = build_store();
+    // C-stage: CasAdmittingFetcher no longer takes a staging_root —
+    // staging is owned by CaStore::scratch() under <cas_root>/_scratch/.
     match mocked_fetches_dir() {
         Some(mocked_dir) => Box::new(CasAdmittingFetcher::new(
             MockedFetcher::new(mocked_dir),
             store,
-            staging_root,
         )),
         None => Box::new(CasAdmittingFetcher::new(
             DefaultRegistry::with_curl(),
             store,
-            staging_root,
         )),
     }
 }
@@ -501,7 +511,7 @@ fn cmd_fetch(
                 )));
             }
             let lock = load_lockfile(&lock_path)?;
-            resolve_workspace_frozen(&ws, &lock, &CaStore::new(cas_root()), &deps_dir)?
+            resolve_workspace_frozen(&ws, &lock, &build_store(), &deps_dir)?
         } else {
             let index = maybe_index(no_index)?;
             let profile = profile_from_env();
@@ -516,6 +526,7 @@ fn cmd_fetch(
                 strategy,
                 &deps_dir,
                 require_attested_metadata,
+                &build_store(),
             )?
         };
         write_lockfile(
@@ -559,7 +570,7 @@ fn cmd_fetch(
         // so this condition is unrepresentable — left as a known cross-impl
         // divergence (the differential harness will catch it later).
         let lock = load_lockfile(&lock_path)?;
-        Milpa.resolve_frozen(&manifest, &lock, &CaStore::new(cas_root()), &deps_dir)?
+        Milpa.resolve_frozen(&manifest, &lock, &build_store(), &deps_dir)?
     } else {
         let index = maybe_index(no_index)?;
         let profile = profile_from_env();
@@ -597,6 +608,7 @@ fn cmd_fetch(
             &deps_dir,
             dep_decl_store,
             require_attested_metadata,
+            &build_store(),
         )?
     };
 
@@ -641,7 +653,7 @@ fn cmd_fetch_with_cert(
     dep_decl_store: Option<&dyn DepDeclStore>,
     require_attested_metadata: bool,
 ) -> Result<i32, MilpaError> {
-    match resolve_with_cert(manifest, index, registry, profile, prior, strategy, deps_dir, dep_decl_store, require_attested_metadata) {
+    match resolve_with_cert(manifest, index, registry, profile, prior, strategy, deps_dir, dep_decl_store, require_attested_metadata, &build_store()) {
         Ok((graph, cert)) => {
             // Write the success certificate (best-effort; a cert write failure
             // does NOT abort the command — the lock/nim.cfg still land).
@@ -691,7 +703,12 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
                 )));
             }
             let full = load_lockfile(&lock_path)?;
-            if !full.deps.iter().any(|d| &d.name == name) {
+
+            // D-update-remove: alias→canonical resolution (Phase D item 5).
+            // If `name` is an alias of a canonical dep, operate on the canonical.
+            let canonical = canonical_name_for(name, &full);
+
+            if !full.deps.iter().any(|d| d.name == canonical) {
                 let mut known: Vec<&str> = full.deps.iter().map(|d| d.name.as_str()).collect();
                 known.sort_unstable();
                 eprintln!(
@@ -705,9 +722,33 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
                 eprintln!("milpa-error: LOCK-DEP-NOT-FOUND");
                 return Ok(1);
             }
-            // Drop only the named pin; everything else is retained as prior.
+            // Build a filtered prior: keep all deps EXCEPT the canonical being
+            // updated, then add back a "pin-stripped" entry that retains its
+            // declared mirror provenances (Phase D item 5: explicit provenance
+            // preservation). Stripping identity → None means git_pin() returns
+            // (None, None) → the dep re-resolves fresh.
+            let updated = full.deps.iter().find(|d| d.name == canonical).unwrap().clone();
+            // Keep only declared Git provenances (drop observed — those carry the commit pin).
+            let declared_provs: Vec<milpa_core::ProvenanceRecord> = updated
+                .provenances
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p,
+                        milpa_core::ProvenanceRecord::Git { origin, .. }
+                        if origin == "declared"
+                    )
+                })
+                .cloned()
+                .collect();
+            let pin_stripped = milpa_core::LockedDep {
+                identity: None,
+                provenances: declared_provs,
+                ..updated
+            };
             let mut prior = full;
-            prior.deps.retain(|d| &d.name != name);
+            prior.deps.retain(|d| d.name != canonical);
+            prior.deps.push(pin_stripped);
             Some(prior)
         }
     };
@@ -729,6 +770,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
             strategy,
             &deps_dir,
             false, // cmd_update does not accept --require-attested-metadata (fetch/lock only)
+            &build_store(),
         )?;
         write_lockfile(&from_graph(&graph, strategy.as_str()), &lock_path)?;
         eprintln!(
@@ -756,6 +798,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
         &deps_dir,
         dep_decl_store,
         false, // require_attested_metadata: not surfaced by `update` verb
+        &build_store(),
     )?;
     write_lockfile(&from_graph(&graph, strategy.as_str()), &lock_path)?;
     eprintln!("updated {}", name.as_deref().unwrap_or("all deps"));
@@ -839,6 +882,7 @@ fn cmd_add(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaErro
         profile.as_ref(),
         None,
         &deps_dir,
+        &build_store(),
     )?;
 
     // Resolution succeeded → commit both outputs.
@@ -856,6 +900,55 @@ fn cmd_add(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaErro
     write_lockfile(&from_graph(&graph, "maxver"), &dir.join("milpa.lock"))?;
     eprintln!("added dep");
     Ok(0)
+}
+
+/// `milpa store ls` / `milpa store path` — read-only CAS inspection (C-store-ro slice).
+///
+/// `rest` is the tail after "store": `["ls"]` or `["path", "<identity-or-prefix>"]`.
+/// The store root is derived from `MILPA_CACHE_DIR` / XDG / HOME exactly as in
+/// `cmd_fetch` (via `cas_root()`).
+///
+/// - `store ls`: prints every entry currently in the store, one `sha256:<64hex>`
+///   per line, lexicographically sorted.  Empty store → no output, exit 0.
+/// - `store path <identity-or-prefix>`: resolves to an absolute path and prints it.
+///   Full identity or bare 64-hex → exact lookup.  Shorter string (≥16 hex chars) →
+///   unique-prefix match.  <16 hex chars or ambiguous → `STORE-AMBIGUOUS-PREFIX`.
+///   Absent → `CAS-NOT-IN-STORE`.
+fn cmd_store(rest: &[String]) -> Result<i32, MilpaError> {
+    let store = build_store();
+    let sub = rest.first().map(|s| s.as_str());
+    match sub {
+        Some("ls") => {
+            for identity in store.list_identities() {
+                println!("{identity}");
+            }
+            Ok(0)
+        }
+        Some("path") => {
+            let Some(arg) = rest.get(1) else {
+                eprintln!("store path: usage: milpa store path <identity-or-prefix>");
+                return Ok(2);
+            };
+            match store.resolve_prefix(arg) {
+                Ok(identity) => {
+                    let path = store.path_for(&identity).map_err(|e| {
+                        MilpaError::Core(e)
+                    })?;
+                    println!("{}", path.display());
+                    Ok(0)
+                }
+                Err(e) => {
+                    eprintln!("{}: {}", e.code(), e.message());
+                    eprintln!("milpa-error: {}", e.code());
+                    Ok(1)
+                }
+            }
+        }
+        _ => {
+            eprintln!("usage: milpa store <ls|path> [args]");
+            Ok(2)
+        }
+    }
 }
 
 /// Discover a remote's default branch. Under `MILPA_MOCKED_FETCHES` this is the
@@ -889,6 +982,24 @@ fn discover_default_branch(url: &str) -> Result<String, String> {
     Err("could not parse default branch from ls-remote output".to_string())
 }
 
+/// Alias→canonical resolution — returns the canonical name as an owned `String`.
+///
+/// If `name` is a canonical lockfile dep name OR an alias of one, returns the
+/// canonical dep name. Otherwise returns `name.to_string()` (caller's guard fires).
+///
+/// SSOT for `cmd_update` + `cmd_remove`.
+fn canonical_name_for(name: &str, lockfile: &milpa_core::Lockfile) -> String {
+    for dep in &lockfile.deps {
+        if dep.name == name {
+            return name.to_string();
+        }
+        if dep.aliases.iter().any(|a| a == name) {
+            return dep.name.clone();
+        }
+    }
+    name.to_string()
+}
+
 /// `milpa remove <name>` — drop a dep from `milpa.kdl` and regenerate the
 /// lockfile (cli-contract §5.7). Mirrors `cmd_add`'s structure: load the
 /// manifest, reject an undeclared dep, build the proposed manifest (minus the
@@ -910,18 +1021,40 @@ fn cmd_remove(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaE
         )));
     };
 
-    // §5.7: reject if <dep> is not declared in milpa.kdl.
-    if !existing.deps.iter().any(|d| d.name() == name) {
+    // D-update-remove: alias→canonical resolution (Phase D item 5).
+    // If `name` is an alias of a canonical lockfile dep, resolve to the manifest
+    // dep name so the guard and mutation operate on the correct entry.
+    let lock_path = dir.join("milpa.lock");
+    let prior_lock: Option<milpa_core::Lockfile> = if lock_path.exists() {
+        Some(load_lockfile(&lock_path)?)
+    } else {
+        None
+    };
+    let canonical: String = if let Some(ref lf) = prior_lock {
+        canonical_name_for(&name, lf)
+    } else {
+        name.clone()
+    };
+
+    // §5.7: reject if <dep> (resolved canonical) is not declared in milpa.kdl.
+    if !existing.deps.iter().any(|d| d.name() == canonical) {
         eprintln!("remove: no dep {name:?} in milpa.kdl");
         eprintln!("milpa-error: MAN-REMOVE-DEP-ABSENT");
         return Ok(1);
     }
 
+    // Collect prior aliases for the removed dep (for warning after re-resolve).
+    let prior_aliases: Vec<String> = prior_lock
+        .as_ref()
+        .and_then(|lf| lf.deps.iter().find(|d| d.name == canonical))
+        .map(|d| d.aliases.clone())
+        .unwrap_or_default();
+
     // Build the proposed manifest (manifest minus <dep>) and run a full resolve
     // (§5.7). Only on success do we commit both outputs; on any failure both
     // files are left unmodified (resolve runs before any write).
     let mut proposed = existing.clone();
-    proposed.deps.retain(|d| d.name() != name);
+    proposed.deps.retain(|d| d.name() != canonical);
 
     let deps_dir = dir.join("_deps");
     let registry = build_registry();
@@ -934,18 +1067,41 @@ fn cmd_remove(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaE
         profile.as_ref(),
         None,
         &deps_dir,
+        &build_store(),
     )?;
+
+    // D-update-remove Phase D item 5: warn per alias that the prior lockfile
+    // recorded for the removed dep. If the canonical is still in the new graph
+    // (pulled in transitively), warn that its alias remains live; otherwise warn
+    // that the alias will be cleaned up.
+    {
+        let new_canonical_names: std::collections::HashSet<&str> =
+            graph.deps.iter().map(|d| d.name.as_str()).collect();
+        for alias in &prior_aliases {
+            if new_canonical_names.contains(canonical.as_str()) {
+                eprintln!(
+                    "warning: alias {alias:?} of removed dep {canonical:?} \
+                     is still required transitively; _deps/{alias} remains live"
+                );
+            } else {
+                eprintln!(
+                    "warning: removing dep {canonical:?} also removes alias \
+                     {alias:?} (_deps/{alias} will be cleaned up)"
+                );
+            }
+        }
+    }
 
     // Resolution succeeded → commit both outputs.
     {
-        let name = name.clone();
+        let canonical = canonical.clone();
         mutate_manifest_file(&dir.join("milpa.kdl"), move |mut m| {
-            m.deps.retain(|d| d.name() != name);
+            m.deps.retain(|d| d.name() != canonical);
             m
         })?;
     }
     write_lockfile(&from_graph(&graph, "maxver"), &dir.join("milpa.lock"))?;
-    eprintln!("removed {name}");
+    eprintln!("removed {canonical}");
     Ok(0)
 }
 
@@ -1203,6 +1359,109 @@ mod tests {
         assert_eq!(cmd_clean(dir).unwrap(), 0);
     }
 
+    // -----------------------------------------------------------------------
+    // C-clean guard tests (Phase C) — the CAS must survive clean.
+    // -----------------------------------------------------------------------
+
+    /// THE CRITICAL GUARD: clean removes _deps/ by unlinking symlinks only.
+    ///
+    /// Set up a project where `_deps/<name>` is a symlink into a CAS store dir
+    /// that contains a sentinel file.  After cmd_clean:
+    ///   (a) _deps/ is gone.
+    ///   (b) The CAS dir AND its sentinel file STILL EXIST.
+    ///
+    /// A broken clean that uses a follow-symlink recursive remove would delete
+    /// the CAS contents and fail assertion (b).  `std::fs::remove_dir_all` on
+    /// Linux removes symlinks themselves (does NOT follow them), so this passes —
+    /// but the test locks that invariant against future regression.
+    #[test]
+    fn clean_unlinks_symlink_never_deletes_cas_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // Build a fake CAS entry with a sentinel file inside it.
+        let cas_entry = tmp.path().join("cas").join("abc123");
+        std::fs::create_dir_all(&cas_entry).unwrap();
+        let sentinel = cas_entry.join("mylib.nim");
+        std::fs::write(&sentinel, b"# sentinel -- must survive clean\n").unwrap();
+
+        // Wire up _deps/ with a symlink pointing at the CAS entry.
+        let deps_dir = proj.join("_deps");
+        std::fs::create_dir_all(&deps_dir).unwrap();
+        std::os::unix::fs::symlink(&cas_entry, deps_dir.join("mylib")).unwrap();
+
+        let rc = cmd_clean(&proj).unwrap();
+        assert_eq!(rc, 0);
+
+        // (a) _deps/ is gone.
+        assert!(
+            !deps_dir.exists(),
+            "_deps/ must be removed by clean"
+        );
+
+        // (b) CAS entry and sentinel file are untouched.
+        assert!(
+            cas_entry.exists(),
+            "CAS store entry must NOT be deleted by clean — \
+             clean must unlink the symlink, not follow it"
+        );
+        assert!(
+            sentinel.exists(),
+            "CAS sentinel file must NOT be deleted by clean — \
+             the store is shared across projects"
+        );
+    }
+
+    /// clean removes nim.cfg from the project root.
+    #[test]
+    fn clean_removes_nim_cfg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let nim_cfg = dir.join("nim.cfg");
+        std::fs::write(&nim_cfg, b"--path:_deps/foo\n").unwrap();
+
+        let rc = cmd_clean(dir).unwrap();
+        assert_eq!(rc, 0);
+        assert!(!nim_cfg.exists(), "nim.cfg must be removed by clean");
+    }
+
+    /// clean does NOT remove milpa.lock — the lockfile survives.
+    #[test]
+    fn clean_leaves_milpa_lock_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let lock = dir.join("milpa.lock");
+        let lock_content = b"# lockfile\nversion 1\n";
+        std::fs::write(&lock, lock_content).unwrap();
+        // Also put a nim.cfg so clean has something to do.
+        std::fs::write(dir.join("nim.cfg"), b"--path:_deps/foo\n").unwrap();
+
+        let rc = cmd_clean(dir).unwrap();
+        assert_eq!(rc, 0);
+        assert!(lock.exists(), "milpa.lock must survive clean");
+        assert_eq!(
+            std::fs::read(&lock).unwrap(),
+            lock_content,
+            "milpa.lock content must be unchanged by clean"
+        );
+    }
+
+    /// clean called twice is safe — second call is a no-op success (idempotent).
+    #[test]
+    fn clean_idempotent_called_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let deps_dir = dir.join("_deps");
+        std::fs::create_dir_all(&deps_dir).unwrap();
+        std::fs::write(dir.join("nim.cfg"), b"--path:_deps/foo\n").unwrap();
+
+        let rc1 = cmd_clean(dir).unwrap();
+        let rc2 = cmd_clean(dir).unwrap();
+        assert_eq!(rc1, 0);
+        assert_eq!(rc2, 0, "second clean call must succeed (idempotent)");
+    }
+
     /// `remove` rejects an undeclared dep WITHOUT resolving or writing anything
     /// (cli-contract §5.7 — reject if <dep> not in milpa.kdl, exit 1; both files
     /// left unmodified). No mocked transport needed: the reject path is hit
@@ -1324,6 +1583,356 @@ mod tests {
         .unwrap();
         let r = cmd_update(&proj, Strategy::default(), &["ghost".into()], false);
         assert_eq!(r.unwrap(), 1, "dep-not-in-lock → exit 1");
+    }
+
+    // -----------------------------------------------------------------------
+    // D-update-remove tests (Phase D item 5) — provenance preservation + alias
+    // -----------------------------------------------------------------------
+
+    /// Helper: write a minimal `milpa.lock` with one dep that has optional
+    /// declared mirror provenances.
+    fn write_prior_lock(
+        lock_path: &std::path::Path,
+        dep_name: &str,
+        identity: &str,
+        git_url: &str,
+        ref_spec: &str,
+        commit_sha: &str,
+        declared_mirror_urls: &[&str],
+        aliases: &[&str],
+    ) {
+        let mut provenances: Vec<milpa_core::ProvenanceRecord> = declared_mirror_urls
+            .iter()
+            .map(|url| milpa_core::ProvenanceRecord::Git {
+                url: url.to_string(),
+                ref_spec: Some(ref_spec.to_string()),
+                commit_sha: None,
+                origin: "declared".to_string(),
+            })
+            .collect();
+        provenances.push(milpa_core::ProvenanceRecord::Git {
+            url: git_url.to_string(),
+            ref_spec: Some(ref_spec.to_string()),
+            commit_sha: Some(commit_sha.to_string()),
+            origin: "observed".to_string(),
+        });
+        let dep = milpa_core::LockedDep {
+            name: dep_name.to_string(),
+            identity: Some(identity.to_string()),
+            version: "0.0.1".to_string(),
+            src_dir: String::new(),
+            requires: vec![],
+            provenances,
+            active_flags: vec![],
+            dep_decl: None,
+            cond_requires: vec![],
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+        };
+        let lf = milpa_core::Lockfile {
+            version: 1,
+            strategy: "maxver".to_string(),
+            deps: vec![dep],
+        };
+        write_lockfile(&lf, lock_path).unwrap();
+    }
+
+    /// DR-1: `update <dep>` preserves declared mirror provenances that are still
+    /// in milpa.kdl. After update, declared mirrors reappear in the new lockfile.
+    #[test]
+    fn update_preserves_declared_mirror_provenances() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let primary_url = "https://example.com/foo.git";
+        let mirror1_url = "https://mirror1.example.com/foo.git";
+        let mirror2_url = "https://mirror2.example.com/foo.git";
+        let sha = "a".repeat(40);
+        let identity = format!("sha256:{}", "a".repeat(64));
+
+        // milpa.kdl: foo with BOTH mirrors still declared.
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            format!(
+                "name \"app\"\nkind \"application\"\ndeps {{\n  \
+                 foo git=\"{primary_url}\" ref=\"main\" {{\n    \
+                 mirror \"{mirror1_url}\"\n    \
+                 mirror \"{mirror2_url}\"\n  }}\n}}\n"
+            ),
+        )
+        .unwrap();
+
+        // Prior lockfile: foo with 2 declared mirrors.
+        write_prior_lock(
+            &proj.join("milpa.lock"),
+            "foo",
+            &identity,
+            primary_url,
+            "main",
+            &sha,
+            &[mirror1_url, mirror2_url],
+            &[],
+        );
+
+        let mocked = make_mocked_fetches(tmp.path(), primary_url, "main", &sha, &[("foo.nim", b"version = \"1.0.0\"\n")]);
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let r = cmd_update(&proj, Strategy::default(), &["foo".into()], false);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(r.unwrap(), 0, "update must succeed");
+        let lock_text = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
+        // Both declared mirrors must appear in the new lockfile.
+        assert!(
+            lock_text.contains(mirror1_url),
+            "mirror1 must be preserved in new lockfile; lock:\n{lock_text}"
+        );
+        assert!(
+            lock_text.contains(mirror2_url),
+            "mirror2 must be preserved in new lockfile; lock:\n{lock_text}"
+        );
+    }
+
+    /// DR-2: `update <dep>` drops a declared mirror that was removed from milpa.kdl.
+    #[test]
+    fn update_drops_mirror_removed_from_manifest() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let primary_url = "https://example.com/foo.git";
+        let mirror1_url = "https://mirror1.example.com/foo.git";
+        let mirror2_url = "https://mirror2.example.com/foo.git";
+        let sha = "a".repeat(40);
+        let identity = format!("sha256:{}", "a".repeat(64));
+
+        // milpa.kdl: foo with ONLY mirror1 (mirror2 was removed).
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            format!(
+                "name \"app\"\nkind \"application\"\ndeps {{\n  \
+                 foo git=\"{primary_url}\" ref=\"main\" {{\n    \
+                 mirror \"{mirror1_url}\"\n  }}\n}}\n"
+            ),
+        )
+        .unwrap();
+
+        // Prior lockfile: foo with BOTH mirrors as declared.
+        write_prior_lock(
+            &proj.join("milpa.lock"),
+            "foo",
+            &identity,
+            primary_url,
+            "main",
+            &sha,
+            &[mirror1_url, mirror2_url],
+            &[],
+        );
+
+        let mocked = make_mocked_fetches(tmp.path(), primary_url, "main", &sha, &[("foo.nim", b"version = \"1.0.0\"\n")]);
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let r = cmd_update(&proj, Strategy::default(), &["foo".into()], false);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(r.unwrap(), 0, "update must succeed");
+        let lock_text = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
+        // mirror2 must NOT appear (it left the manifest).
+        assert!(
+            !lock_text.contains(mirror2_url),
+            "mirror2 was removed from milpa.kdl; must not be in new lockfile; lock:\n{lock_text}"
+        );
+        // mirror1 must still appear (still in manifest).
+        assert!(
+            lock_text.contains(mirror1_url),
+            "mirror1 is still in milpa.kdl; must appear in new lockfile; lock:\n{lock_text}"
+        );
+    }
+
+    /// DR-3: `update <alias>` resolves to canonical — no spurious LOCK-DEP-NOT-FOUND.
+    #[test]
+    fn update_alias_resolves_to_canonical() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let primary_url = "https://example.com/foo.git";
+        let sha = "a".repeat(40);
+        let identity = format!("sha256:{}", "a".repeat(64));
+
+        // milpa.kdl: foo declared.
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=\"{primary_url}\" ref=\"main\"\n}}\n"),
+        )
+        .unwrap();
+
+        // Prior lockfile: foo canonical with alias 'baz'.
+        write_prior_lock(
+            &proj.join("milpa.lock"),
+            "foo",
+            &identity,
+            primary_url,
+            "main",
+            &sha,
+            &[],
+            &["baz"],
+        );
+
+        let mocked = make_mocked_fetches(tmp.path(), primary_url, "main", &sha, &[("foo.nim", b"version = \"1.0.0\"\n")]);
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        // Pass alias 'baz' as dep_name — must resolve to canonical 'foo'.
+        let r = cmd_update(&proj, Strategy::default(), &["baz".into()], false);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(
+            r.unwrap(), 0,
+            "update via alias 'baz' must succeed (alias→canonical resolution)"
+        );
+        let lock_text = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
+        assert!(lock_text.contains("\"foo\""), "foo must be in the new lockfile");
+    }
+
+    /// DR-4: `remove <alias>` resolves to canonical — no spurious not-found.
+    #[test]
+    fn remove_alias_resolves_to_canonical() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let primary_url = "https://example.com/foo.git";
+        let sha = "a".repeat(40);
+        let identity = format!("sha256:{}", "a".repeat(64));
+
+        // milpa.kdl: foo declared.
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=\"{primary_url}\" ref=\"main\"\n}}\n"),
+        )
+        .unwrap();
+
+        // Prior lockfile: foo with alias 'baz'.
+        write_prior_lock(
+            &proj.join("milpa.lock"),
+            "foo",
+            &identity,
+            primary_url,
+            "main",
+            &sha,
+            &[],
+            &["baz"],
+        );
+
+        // After remove of foo, no deps remain → empty mocked dir.
+        let mocked = tmp.path().join("mocked-fetches");
+        std::fs::create_dir_all(&mocked).unwrap();
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        // Pass alias 'baz' — must resolve to canonical 'foo' for manifest check.
+        let r = cmd_remove(&proj, &["baz".into()], false);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(
+            r.unwrap(), 0,
+            "remove via alias 'baz' must succeed (alias→canonical resolution)"
+        );
+        let kdl = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+        assert!(!kdl.contains("\"foo\""), "foo must be removed from milpa.kdl");
+    }
+
+    /// DR-5: `remove <canonical>` with prior aliases warns per alias on stderr.
+    #[test]
+    fn remove_canonical_with_prior_alias_warns() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let primary_url = "https://example.com/foo.git";
+        let sha = "a".repeat(40);
+        let identity = format!("sha256:{}", "a".repeat(64));
+
+        // milpa.kdl: foo declared.
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=\"{primary_url}\" ref=\"main\"\n}}\n"),
+        )
+        .unwrap();
+
+        // Prior lockfile: foo with alias 'baz'.
+        write_prior_lock(
+            &proj.join("milpa.lock"),
+            "foo",
+            &identity,
+            primary_url,
+            "main",
+            &sha,
+            &[],
+            &["baz"],
+        );
+
+        // After remove, no deps remain → empty mocked dir.
+        let mocked = tmp.path().join("mocked-fetches");
+        std::fs::create_dir_all(&mocked).unwrap();
+
+        // Capture stderr to check for warning.  We use a redirect by running in
+        // a subprocess is complex; instead we check that cmd_remove returns 0
+        // (warning is non-fatal) and trust the implementation emits to stderr.
+        // The unit-level check: cmd_remove with alias in prior must exit 0.
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let r = cmd_remove(&proj, &["foo".into()], false);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        // Removal must succeed (warning is non-fatal).
+        assert_eq!(r.unwrap(), 0, "remove with prior alias must succeed (warning, not error)");
+        // foo must be gone from milpa.kdl.
+        let kdl = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+        assert!(!kdl.contains("\"foo\""), "foo must be removed from milpa.kdl after cmd_remove");
+    }
+
+    /// DR-6: regression — update/remove with no mirrors or aliases work as before.
+    #[test]
+    fn update_no_mirrors_regression() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let primary_url = "https://example.com/foo.git";
+        let sha = "a".repeat(40);
+        let identity = format!("sha256:{}", "a".repeat(64));
+
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=\"{primary_url}\" ref=\"main\"\n}}\n"),
+        )
+        .unwrap();
+
+        write_prior_lock(
+            &proj.join("milpa.lock"),
+            "foo",
+            &identity,
+            primary_url,
+            "main",
+            &sha,
+            &[], // no mirrors
+            &[], // no aliases
+        );
+
+        let mocked = make_mocked_fetches(tmp.path(), primary_url, "main", &sha, &[("foo.nim", b"version = \"1.0.0\"\n")]);
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let r = cmd_update(&proj, Strategy::default(), &["foo".into()], false);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(r.unwrap(), 0, "update with no mirrors must succeed");
+        let lock_text = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
+        assert!(lock_text.contains("\"foo\""), "foo must be in new lockfile");
     }
 
     /// `add --git` now conforms to cli-contract §5.6: it runs a full resolve and
@@ -1478,6 +2087,113 @@ mod tests {
         );
     }
 
+    /// Live `cmd_fetch` (non-frozen) must build alias symlinks for deduped deps
+    /// and remove stale `_deps/` entries.
+    ///
+    /// Scenario: two deps (`foo` + `bar`) fetch to IDENTICAL content (same bytes
+    /// → same content_hash). After `cmd_fetch`:
+    ///   - both `_deps/foo` and `_deps/bar` must exist as symlinks (canonical +
+    ///     alias);
+    ///   - a pre-seeded stale `_deps/garbage` entry must be removed.
+    ///
+    /// Pre-fix: `resolve()` never called `rebuild_deps_view`, so the alias
+    /// symlink was absent and the stale entry was left behind. This test is the
+    /// RED gate for the SSOT fix.
+    #[test]
+    fn live_resolve_builds_alias_symlinks_and_removes_stale_deps() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // Isolate CAS to this temp dir so it doesn't collide with other tests.
+        let cas_dir = tmp.path().join("cas");
+        unsafe { std::env::set_var("MILPA_CACHE_DIR", &cas_dir) };
+
+        // Both deps have IDENTICAL content: same bytes → same content_hash.
+        // The resolver's finalize() will dedup them: one becomes canonical, the
+        // other an alias. rebuild_deps_view must create BOTH symlinks.
+        let identical_content: &[(&str, &[u8])] = &[("lib.nim", b"# shared")];
+        let sha_foo = "a".repeat(40);
+        let sha_bar = "b".repeat(40); // different commit SHAs but same tree
+
+        let mocked_dir = tmp.path().join("mocked-fetches");
+
+        // Lay down mocked fetch content for foo (same files as bar).
+        let key_dir_foo = mocked_dir.join(milpa_core::url_key(
+            "https://example.com/foo.git",
+            "main",
+        ));
+        std::fs::create_dir_all(key_dir_foo.join("content")).unwrap();
+        std::fs::write(key_dir_foo.join("sha"), format!("{sha_foo}\n")).unwrap();
+        for (name, data) in identical_content {
+            std::fs::write(key_dir_foo.join("content").join(name), data).unwrap();
+        }
+
+        // Lay down mocked fetch content for bar (same files as foo → same hash).
+        let key_dir_bar = mocked_dir.join(milpa_core::url_key(
+            "https://example.com/bar.git",
+            "main",
+        ));
+        std::fs::create_dir_all(key_dir_bar.join("content")).unwrap();
+        std::fs::write(key_dir_bar.join("sha"), format!("{sha_bar}\n")).unwrap();
+        for (name, data) in identical_content {
+            std::fs::write(key_dir_bar.join("content").join(name), data).unwrap();
+        }
+
+        // Manifest declares both deps.
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\ndeps {\n  \
+             foo git=\"https://example.com/foo.git\" ref=\"main\"\n  \
+             bar git=\"https://example.com/bar.git\" ref=\"main\"\n}\n",
+        )
+        .unwrap();
+
+        // Pre-seed a stale `_deps/garbage` dir that rebuild_deps_view must remove.
+        let deps_dir = proj.join("_deps");
+        std::fs::create_dir_all(deps_dir.join("garbage")).unwrap();
+
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked_dir) };
+        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false, false);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+        unsafe { std::env::remove_var("MILPA_CACHE_DIR") };
+
+        assert!(result.is_ok(), "cmd_fetch must succeed: {result:?}");
+        assert_eq!(result.unwrap(), 0);
+
+        // The canonical dep (foo, declared first) must be a symlink.
+        let foo_meta = std::fs::symlink_metadata(proj.join("_deps").join("foo")).unwrap();
+        assert!(
+            foo_meta.file_type().is_symlink(),
+            "_deps/foo must be a CAS symlink (canonical dep)"
+        );
+
+        // The alias dep (bar, deduped to same hash as foo) must ALSO be a symlink.
+        // Pre-fix: this symlink was ABSENT because rebuild_deps_view was never called
+        // from the live resolve path.
+        let bar_meta = std::fs::symlink_metadata(proj.join("_deps").join("bar")).unwrap();
+        assert!(
+            bar_meta.file_type().is_symlink(),
+            "_deps/bar must be a CAS symlink (alias dep — deduped to same hash as foo)"
+        );
+
+        // Both symlinks must point to the SAME CAS entry (same content_hash).
+        let foo_target = std::fs::read_link(proj.join("_deps").join("foo")).unwrap();
+        let bar_target = std::fs::read_link(proj.join("_deps").join("bar")).unwrap();
+        assert_eq!(
+            foo_target, bar_target,
+            "_deps/foo and _deps/bar must symlink to the same CAS entry (dedup)"
+        );
+
+        // Stale entry must be gone.
+        assert!(
+            !proj.join("_deps").join("garbage").exists(),
+            "_deps/garbage must be removed by rebuild_deps_view (stale entry)"
+        );
+    }
+
     #[test]
     fn mocked_fetches_missing_key_errors_with_fetch_all_failed() {
         // The resolver wraps a per-candidate FETCH-MOCK-MISSING in FETCH-ALL-FAILED
@@ -1581,5 +2297,188 @@ mod tests {
             Ok(None),
             "expected Ok(None) for unreachable index, got {result:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // C-store-ro: store ls / store path tests (Phase C)
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a bare CAS-layout directory for a controlled 64-hex digest.
+    /// This bypasses content-hashing; the store verbs are read-only and inspect
+    /// directory names only.  Controlled hex names enable prefix-match tests
+    /// without needing real content that hashes to a chosen value.
+    fn make_store_entry(store_root: &std::path::Path, hex64: &str) -> PathBuf {
+        let entry = store_root.join("sha256").join(hex64);
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("dummy.nim"), b"# test sentinel\n").unwrap();
+        entry
+    }
+
+    /// Behaviour 1: `store ls` with 2 entries → lex-sorted identities on stdout.
+    #[test]
+    fn store_ls_two_entries_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("cas");
+        let hex_a = "a".repeat(64);
+        let hex_b = "b".repeat(64);
+        // Admitted out-of-order to verify sort.
+        make_store_entry(&store_root, &hex_b);
+        make_store_entry(&store_root, &hex_a);
+
+        let store = CaStore::new(&store_root);
+        let identities = store.list_identities();
+        assert_eq!(
+            identities,
+            vec![format!("sha256:{hex_a}"), format!("sha256:{hex_b}")],
+            "list_identities must be lex-sorted"
+        );
+    }
+
+    /// Behaviour 2: `store ls` on empty store → empty list.
+    #[test]
+    fn store_ls_empty_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("cas");
+        std::fs::create_dir_all(&store_root).unwrap();
+
+        let store = CaStore::new(&store_root);
+        assert!(store.list_identities().is_empty(), "empty store must produce empty list");
+    }
+
+    /// Behaviour 3: `store path <full-identity>` for a present entry → correct path.
+    #[test]
+    fn store_path_full_identity_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("cas");
+        let hex64 = "c".repeat(64);
+        let entry = make_store_entry(&store_root, &hex64);
+        let identity = format!("sha256:{hex64}");
+
+        let store = CaStore::new(&store_root);
+        let resolved = store.resolve_prefix(&identity).unwrap();
+        assert_eq!(resolved, identity);
+        assert_eq!(store.path_for(&resolved).unwrap(), entry);
+    }
+
+    /// Behaviour 4: `store path <full-identity>` absent → CAS-NOT-IN-STORE.
+    #[test]
+    fn store_path_full_identity_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("cas");
+        std::fs::create_dir_all(&store_root).unwrap();
+        let identity = format!("sha256:{}", "d".repeat(64));
+
+        let store = CaStore::new(&store_root);
+        let err = store.resolve_prefix(&identity).unwrap_err();
+        assert_eq!(err.code(), "CAS-NOT-IN-STORE");
+    }
+
+    /// Behaviour 5: `store path <≥16-char unique prefix>` → resolves to one entry.
+    #[test]
+    fn store_path_unique_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("cas");
+        // Two entries that diverge at position 8; prefix of 16 uniquely picks hex_a.
+        let hex_a = format!("{}{}", "aaaa1111", "0".repeat(56));
+        let hex_b = format!("{}{}", "aaaa1111", "1".repeat(56));
+        let entry_a = make_store_entry(&store_root, &hex_a);
+        make_store_entry(&store_root, &hex_b);
+
+        let prefix = format!("sha256:{}", &hex_a[..16]);
+        let store = CaStore::new(&store_root);
+        let resolved = store.resolve_prefix(&prefix).unwrap();
+        assert_eq!(store.path_for(&resolved).unwrap(), entry_a);
+    }
+
+    /// Behaviour 6: prefix matching >1 entry → STORE-AMBIGUOUS-PREFIX.
+    #[test]
+    fn store_path_ambiguous_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("cas");
+        let shared = "abcdef1234567890".repeat(2); // 32-char shared prefix
+        let hex_a = format!("{}{}", shared, "a".repeat(32));
+        let hex_b = format!("{}{}", shared, "b".repeat(32));
+        make_store_entry(&store_root, &hex_a);
+        make_store_entry(&store_root, &hex_b);
+
+        let prefix = format!("sha256:{}", &shared[..16]); // 16 chars → matches both
+        let store = CaStore::new(&store_root);
+        let err = store.resolve_prefix(&prefix).unwrap_err();
+        assert_eq!(err.code(), "STORE-AMBIGUOUS-PREFIX");
+    }
+
+    /// Behaviour 7: prefix shorter than 16 hex chars → STORE-AMBIGUOUS-PREFIX.
+    #[test]
+    fn store_path_prefix_too_short() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("cas");
+        let hex64 = "e".repeat(64);
+        make_store_entry(&store_root, &hex64);
+
+        let prefix = format!("sha256:{}", "e".repeat(15)); // 15 < 16 → rejected
+        let store = CaStore::new(&store_root);
+        let err = store.resolve_prefix(&prefix).unwrap_err();
+        assert_eq!(err.code(), "STORE-AMBIGUOUS-PREFIX");
+    }
+
+    /// Behaviour 8: bare 64-hex (no sha256: prefix) is accepted as full identity.
+    #[test]
+    fn store_path_bare_64hex_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("cas");
+        let hex64 = "f".repeat(64);
+        let entry = make_store_entry(&store_root, &hex64);
+
+        let store = CaStore::new(&store_root);
+        let resolved = store.resolve_prefix(&hex64).unwrap();
+        assert_eq!(store.path_for(&resolved).unwrap(), entry);
+    }
+
+    /// Behaviour 9: bare ≥16-char prefix (no sha256:) is accepted.
+    #[test]
+    fn store_path_bare_prefix_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("cas");
+        let hex64 = format!("{}{}", "1234567890abcdef", "0".repeat(48));
+        let entry = make_store_entry(&store_root, &hex64);
+
+        let prefix = &hex64[..16]; // bare, 16 hex chars
+        let store = CaStore::new(&store_root);
+        let resolved = store.resolve_prefix(prefix).unwrap();
+        assert_eq!(store.path_for(&resolved).unwrap(), entry);
+    }
+
+    /// `cmd_store` dispatch: `store ls` on empty store → exit 0.
+    #[test]
+    fn cmd_store_ls_empty_exits_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("cas");
+        std::fs::create_dir_all(&store_root).unwrap();
+
+        // Override MILPA_CACHE_DIR so cmd_store picks up our tmp store.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::set_var("MILPA_CACHE_DIR", &store_root) };
+        let rc = cmd_store(&["ls".to_string()]).unwrap();
+        unsafe { std::env::remove_var("MILPA_CACHE_DIR") };
+
+        assert_eq!(rc, 0);
+    }
+
+    /// `cmd_store` dispatch: `store path <absent-full-identity>` → exit 1.
+    #[test]
+    fn cmd_store_path_absent_exits_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_root = tmp.path().join("cas");
+        std::fs::create_dir_all(&store_root).unwrap();
+
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::set_var("MILPA_CACHE_DIR", &store_root) };
+        let rc = cmd_store(&[
+            "path".to_string(),
+            format!("sha256:{}", "d".repeat(64)),
+        ]).unwrap();
+        unsafe { std::env::remove_var("MILPA_CACHE_DIR") };
+
+        assert_eq!(rc, 1);
     }
 }

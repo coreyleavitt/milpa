@@ -6,7 +6,7 @@ Coverage:
   - LocalReceipt.transport_fields returns {"resolved_path": <str>}
   - LocalFetcher.can_handle returns True for LocalProvenance, False for others
   - LocalFetcher.fetch: source dir exists → receipt carries resolved_path
-  - LocalFetcher.fetch: identity equals compute_content_hash of the source dir
+  - LocalFetcher.fetch: registry returns identity=None (local deps carry no identity)
   - LocalFetcher.fetch: source dir left in place (not moved/deleted)
   - LocalFetcher.fetch: no network (purely local filesystem)
   - LocalFetcher.fetch: non-existent path → MilpaError FETCH-LOCAL-PATH-NOT-FOUND
@@ -29,7 +29,6 @@ from milpa.errors import (
 )
 from milpa.fetchers.local import LocalFetcher, LocalProvenance, LocalReceipt
 from milpa.fetchers.types import FetcherRegistry, Provenance
-from milpa.identity import compute_content_hash
 
 # ---------------------------------------------------------------------------
 # LocalProvenance
@@ -165,28 +164,24 @@ class TestLocalFetcherHappyPath:
 
 
 # ---------------------------------------------------------------------------
-# LocalFetcher: identity equals compute_content_hash of source
+# LocalFetcher: registry returns identity=None (local deps carry no identity)
 # ---------------------------------------------------------------------------
 
 
 class TestLocalFetcherIdentity:
-    def test_registry_identity_matches_source_hash(self, tmp_path: Path) -> None:
-        """Identity computed by registry MUST equal hash of the source tree."""
-        src = _make_source_dir(tmp_path)
-        expected = compute_content_hash(src)
-        registry = FetcherRegistry()
-        registry.register(LocalFetcher())
-        dest = tmp_path / "dest"
-        result = registry.fetch("mylib", LocalProvenance(path=src), dest=dest)
-        assert result.identity == expected
+    def test_registry_identity_is_none_for_local_dep(self, tmp_path: Path) -> None:
+        """Registry MUST NOT compute identity for a local dep (§4.3 NORMATIVE).
 
-    def test_identity_startswith_sha256(self, tmp_path: Path) -> None:
+        Local trees are live and editable; a hash at fetch time is a snapshot
+        that is immediately stale. The lockfile §4.3 NORMATIVE: local records
+        carry no identity field. verify dispatches to liveness-only for local deps.
+        """
         src = _make_source_dir(tmp_path)
         registry = FetcherRegistry()
         registry.register(LocalFetcher())
         dest = tmp_path / "dest"
         result = registry.fetch("mylib", LocalProvenance(path=src), dest=dest)
-        assert result.identity.startswith("sha256:")
+        assert result.identity is None
 
     def test_identity_not_in_receipt_fields(self, tmp_path: Path) -> None:
         """Fetcher does NOT compute identity — it must not appear in receipt."""
@@ -221,7 +216,7 @@ class TestLocalFetcherDest:
         assert p.cas_admissible is False
 
     def test_full_round_trip_with_registry(self, tmp_path: Path) -> None:
-        """End-to-end through FetcherRegistry."""
+        """End-to-end through FetcherRegistry — identity is None for local deps."""
         src = _make_source_dir(tmp_path)
         registry = FetcherRegistry()
         registry.register(LocalFetcher())
@@ -229,7 +224,7 @@ class TestLocalFetcherDest:
         result = registry.fetch("pkg", LocalProvenance(path=src), dest=dest)
         assert result.name == "pkg"
         assert result.path == dest
-        assert result.identity.startswith("sha256:")
+        assert result.identity is None  # local deps carry no identity (§4.3)
         assert "resolved_path" in result.receipt.transport_fields()
 
 

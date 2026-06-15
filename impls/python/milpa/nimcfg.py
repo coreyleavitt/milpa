@@ -80,6 +80,13 @@ def format_nimcfg(
     ordered = sorted(graph.deps, key=lambda d: d.name)
     for dep in ordered:
         path_lines.append(f'--path:"{_path_for(dep, deps_dir)}"')
+        # B-nimcfg: emit one --path: per alias (lex-sorted, already sorted on dep).
+        # Each alias path mirrors the canonical: _deps/<alias>[/<src_dir>].
+        for alias in dep.aliases:
+            alias_path = deps_dir.as_posix() + "/" + alias
+            if dep.src_dir:
+                alias_path += "/" + dep.src_dir
+            path_lines.append(f'--path:"{alias_path}"')
 
     # §7.5 feature-flag defines — DEFERRED (#23). When implemented, a
     # separate block separated by a blank line will be appended here for
@@ -197,7 +204,7 @@ def _dep_target(
 
 def _is_member_dep(dep: ResolvedDep) -> bool:
     """True when the dep has a MemberProvenanceRecord (workspace member)."""
-    return isinstance(dep.provenance, MemberProvenanceRecord)
+    return any(isinstance(p, MemberProvenanceRecord) for p in dep.provenances)
 
 
 def _member_dep_closure(

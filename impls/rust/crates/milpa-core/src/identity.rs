@@ -9,7 +9,6 @@
 //! in ascending raw-byte relpath order, fed to a single live sha256 accumulator.
 
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -20,14 +19,9 @@ use crate::error::CoreError;
 /// algorithms are added here and nowhere else.
 pub const SUPPORTED_ALGORITHMS: &[(&str, usize)] = &[("sha256", 64)];
 
-// Mode markers — one byte per entry (identity.md §1.2 / §1.7).
-const MODE_REGULAR: u8 = 0x00;
-const MODE_EXECUTABLE: u8 = 0x01;
+// Mode markers — one byte per entry (identity.md §1.2).
+const MODE_REGULAR: u8 = 0x00; // regular file — exec bit excluded (Resolved Decision 1)
 const MODE_SYMLINK: u8 = 0x80;
-
-// The owner-execute bit (`stat.S_IXUSR`, octal 0o100). Only this bit selects
-// the executable marker; group/other execute bits are ignored (§1.7).
-const S_IXUSR: u32 = 0o100;
 
 /// Non-catalog sentinel for filesystem I/O failures encountered while walking a
 /// tree to hash it. identity.md §5 catalogs no code for this: the Python
@@ -153,20 +147,33 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Entry>) -> Result<(), CoreError> 
         } else if ft.is_dir() {
             walk(root, &path, out)?;
         } else if ft.is_file() {
+            // §1.3 / spec/errors.md ID-NON-UTF8-RELPATH: the relpath is
+            // encoded as UTF-8 in the canonical byte stream (cross-impl
+            // contract with the Python reference). On Linux, filenames are raw
+            // byte sequences; validate before hashing so both impls raise the
+            // same coded error rather than silently diverging on non-UTF-8
+            // byte sequences (mirrors the ID-NON-UTF8-SYMLINK-TARGET pattern).
+            let rb = relpath_bytes(root, &path);
+            if std::str::from_utf8(&rb).is_err() {
+                return Err(CoreError::Identity(
+                    "ID-NON-UTF8-RELPATH",
+                    format!(
+                        "file path {:?} is not valid UTF-8 — cannot compute a content hash",
+                        String::from_utf8_lossy(&rb)
+                    ),
+                ));
+            }
             let content = std::fs::read(&path).map_err(|e| {
                 CoreError::Identity(
                     INTERNAL_IO,
                     format!("cannot read file {}: {e}", path.display()),
                 )
             })?;
-            let marker = if ft.permissions().mode() & S_IXUSR != 0 {
-                MODE_EXECUTABLE
-            } else {
-                MODE_REGULAR
-            };
+            // Resolved Decision 1: exec bit is NOT part of identity.
+            // Regular files always use MODE_REGULAR (0x00).
             out.push(Entry {
-                relpath: relpath_bytes(root, &path),
-                mode_marker: marker,
+                relpath: rb,
+                mode_marker: MODE_REGULAR,
                 content,
             });
         }
@@ -177,6 +184,19 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Entry>) -> Result<(), CoreError> 
 }
 
 fn symlink_entry(root: &Path, path: &Path) -> Result<Entry, CoreError> {
+    // §1.3 / spec/errors.md ID-NON-UTF8-RELPATH: validate the symlink's own
+    // relpath is UTF-8 before hashing (cross-impl contract; mirrors the
+    // ID-NON-UTF8-RELPATH check for regular files).
+    let rb = relpath_bytes(root, path);
+    if std::str::from_utf8(&rb).is_err() {
+        return Err(CoreError::Identity(
+            "ID-NON-UTF8-RELPATH",
+            format!(
+                "file path {:?} is not valid UTF-8 — cannot compute a content hash",
+                String::from_utf8_lossy(&rb)
+            ),
+        ));
+    }
     // §1.5: hash the link-target string as UTF-8 bytes; do not follow. A target
     // that is not valid UTF-8 is unrepresentable in the canonical byte stream.
     let target = std::fs::read_link(path).map_err(|e| {
@@ -190,12 +210,12 @@ fn symlink_entry(root: &Path, path: &Path) -> Result<Entry, CoreError> {
             "ID-NON-UTF8-SYMLINK-TARGET",
             format!(
                 "symlink target at {:?} is not valid UTF-8 — cannot compute a content hash",
-                String::from_utf8_lossy(&relpath_bytes(root, path))
+                String::from_utf8_lossy(&rb)
             ),
         )
     })?;
     Ok(Entry {
-        relpath: relpath_bytes(root, path),
+        relpath: rb,
         mode_marker: MODE_SYMLINK,
         content: target_str.into_bytes(),
     })
@@ -215,6 +235,11 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    // Owner-execute bit — used only by test helper `write` to create fixture
+    // files with the exec bit set; the bit itself is no longer part of identity
+    // (Resolved Decision 1).
+    const S_IXUSR: u32 = 0o100;
 
     #[test]
     fn sha256_is_supported_with_64_hex_chars() {
@@ -282,12 +307,14 @@ mod tests {
     }
 
     #[test]
-    fn executable_bit_changes_content_hash() {
+    fn executable_bit_does_not_change_content_hash() {
+        // Resolved Decision 1: exec bit is excluded from identity. Toggling
+        // S_IXUSR must NOT change the hash.
         let root = tmp();
         let (a, b) = (root.join("a"), root.join("b"));
         write(&a.join("script.sh"), "#!/bin/sh\necho hi\n", false);
         write(&b.join("script.sh"), "#!/bin/sh\necho hi\n", true);
-        assert_ne!(
+        assert_eq!(
             compute_content_hash(&a).unwrap(),
             compute_content_hash(&b).unwrap()
         );
@@ -401,7 +428,7 @@ mod tests {
         write(&a.join(".git/HEAD"), "junk\n", false);
         assert_eq!(
             compute_content_hash(&a).unwrap(),
-            "sha256:efa2102677df3bf6ffee86e2503f78e1467ecca8de4ea1a1f79762b2011c60b9"
+            "sha256:85f2eb93585a6870b118351b14b8e32a4f55d61809f1612aaca5bae3c3db61cd"
         );
     }
 
@@ -414,6 +441,104 @@ mod tests {
         assert_eq!(
             compute_content_hash(&a).unwrap(),
             "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    // --- ID-NON-UTF8-RELPATH (spec/errors.md; distinct from
+    // --- ID-NON-UTF8-SYMLINK-TARGET which covers symlink *targets*)
+
+    #[test]
+    fn non_utf8_relpath_in_regular_file_raises_coded_error() {
+        // A source tree containing a file whose *name* (not content) contains
+        // non-UTF-8 bytes must raise ID-NON-UTF8-RELPATH, not panic or silently
+        // produce a wrong hash.  Mirrors the Python test and the
+        // ID-NON-UTF8-SYMLINK-TARGET test pattern.
+        //
+        // This test creates a file via raw OS bytes (std::fs + OsStr::from_bytes).
+        // Skip gracefully if the filesystem rejects the bytes (vfat, some WSL
+        // mounts), analogous to the Python "pytest.skip" branch.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root = tmp();
+        let a = root.join("a");
+        fs::create_dir_all(&a).unwrap();
+
+        // Build a file path with a raw non-UTF-8 byte (0xff) in the name.
+        let bad_name = OsStr::from_bytes(b"\xff\xfe");
+        let bad_path = a.join(bad_name);
+        match fs::write(&bad_path, b"content") {
+            Err(_) => {
+                // Filesystem rejected the non-UTF-8 name — skip gracefully.
+                return;
+            }
+            Ok(()) => {}
+        }
+
+        let err = compute_content_hash(&a).unwrap_err();
+        assert_eq!(
+            err.code(),
+            "ID-NON-UTF8-RELPATH",
+            "expected ID-NON-UTF8-RELPATH, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn non_utf8_relpath_in_symlink_name_raises_coded_error() {
+        // A symlink whose *name* (not target) contains non-UTF-8 bytes must also
+        // raise ID-NON-UTF8-RELPATH.  The relpath check fires before the
+        // symlink-target check, so the symlink-target itself is irrelevant here.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root = tmp();
+        let a = root.join("a");
+        fs::create_dir_all(&a).unwrap();
+
+        let bad_name = OsStr::from_bytes(b"\xff\xfe");
+        let bad_link_path = a.join(bad_name);
+        match symlink("some_target", &bad_link_path) {
+            Err(_) => {
+                // Filesystem rejected the non-UTF-8 name — skip gracefully.
+                return;
+            }
+            Ok(()) => {}
+        }
+
+        let err = compute_content_hash(&a).unwrap_err();
+        assert_eq!(
+            err.code(),
+            "ID-NON-UTF8-RELPATH",
+            "expected ID-NON-UTF8-RELPATH, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn non_utf8_symlink_target_still_raises_symlink_target_code() {
+        // Sanity: a symlink with a VALID UTF-8 name but a NON-UTF-8 target
+        // still raises ID-NON-UTF8-SYMLINK-TARGET (not ID-NON-UTF8-RELPATH),
+        // confirming the two codes are distinct and the right one fires first.
+        let root = tmp();
+        let a = root.join("a");
+        fs::create_dir_all(&a).unwrap();
+
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+        let bad_target = OsStr::from_bytes(b"\xff\xfe");
+        // valid UTF-8 link name, non-UTF-8 target
+        match std::os::unix::fs::symlink(bad_target, a.join("valid_name_link")) {
+            Err(_) => return, // filesystem rejected the target bytes — skip
+            Ok(()) => {}
+        }
+
+        let err = compute_content_hash(&a).unwrap_err();
+        assert_eq!(
+            err.code(),
+            "ID-NON-UTF8-SYMLINK-TARGET",
+            "expected ID-NON-UTF8-SYMLINK-TARGET for non-UTF-8 target, got {:?}",
+            err
         );
     }
 }

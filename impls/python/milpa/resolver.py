@@ -55,6 +55,9 @@ from typing import TYPE_CHECKING
 
 from milpa.context import MilpaEnv, ResolveParams
 from milpa.errors import (
+    FETCH_ALL_FAILED,
+    FETCH_PROVENANCE_DIVERGENCE,
+    MILPA_INTERNAL,
     RES_NO_INDEX,
     RES_PROVENANCE_CONFLICT,
     RES_WS_MEMBER_REF_UNKNOWN,
@@ -72,6 +75,7 @@ from milpa.lockfile import (
     GitProvenanceRecord,
     LocalProvenanceRecord,
     MemberProvenanceRecord,
+    ProvenanceRecord,
     ResolvedDep,
     ResolvedGraph,
     TarballProvenanceRecord,
@@ -158,6 +162,11 @@ class _Candidate:
     provenance: (
         Provenance | _LocalDepProvenance | MemberProvenanceRecord | None
     ) = None
+    # D-lifecycle: declared mirror URLs (manifest mirrors + prior declared) that
+    # were NOT the observed candidate. Stored by _process_url_worker so
+    # _build_graph can assemble observed + declared ProvenanceRecords.
+    # Empty for non-git deps (local, tarball, member) that have no mirrors.
+    declared_mirror_urls: tuple[str, ...] = ()
     # S6: the dep_decl hash this candidate's edges were sourced from.
     # Populated from IndexVersion.dep_decl (S2) when DepDeclEdgeSource is used;
     # None for URL/tarball/local/member deps and named deps without a dep_decl pointer.
@@ -511,22 +520,21 @@ def _git_pin_for_url_dep(
     prior: Lockfile | None,
 ) -> tuple[str, str | None] | None:
     """Return ``(identity, commit_sha)`` from the prior lockfile iff the
-    manifest's ``(git, ref)`` still matches the locked ``GitProvenanceRecord``.
+    manifest's ``(git, ref)`` still matches a locked ``GitProvenanceRecord``.
     Returns ``None`` when no prior, no matching entry, or provenance changed.
+
+    Searches ALL GitProvenanceRecords (not just the first) so that a declared
+    mirror record appearing before the observed record in the sorted provenances
+    list does not shadow the observed record (§8 pin-reuse, D-provenance ordering).
     """
     if prior is None:
         return None
     locked = next((d for d in prior.deps if d.name == dep.name), None)
     if locked is None or not locked.identity:
         return None
-    primary = next(
-        (p for p in locked.provenances if isinstance(p, GitProvenanceRecord)),
-        None,
-    )
-    if primary is None:
-        return None
-    if primary.url == dep.git and primary.ref == dep.ref:
-        return (locked.identity, primary.commit_sha)
+    for p in locked.provenances:
+        if isinstance(p, GitProvenanceRecord) and p.url == dep.git and p.ref == dep.ref:
+            return (locked.identity, p.commit_sha)
     return None
 
 
@@ -548,12 +556,24 @@ def _tarball_pin(
     return None
 
 
-def _prior_self_mirrors(name: str, prior: Lockfile | None) -> tuple[str, ...]:
-    """Return ``self_mirrors`` recorded in the prior lockfile for ``name``."""
+def _prior_declared_mirror_urls(name: str, prior: Lockfile | None) -> tuple[str, ...]:
+    """Return declared-mirror URLs from the prior lockfile for ``name``.
+
+    D-provenance: self_mirrors removed from LockedDep. Declared mirrors are now
+    stored as GitProvenanceRecord(origin="declared") entries in the provenances
+    list. This function extracts those URLs for fallback fetch ordering (§8a).
+    """
+    from milpa.lockfile import GitProvenanceRecord as _GPR  # noqa: PLC0415
     if prior is None:
         return ()
     locked = next((d for d in prior.deps if d.name == name), None)
-    return locked.self_mirrors if locked is not None else ()
+    if locked is None:
+        return ()
+    return tuple(
+        p.url
+        for p in locked.provenances
+        if isinstance(p, _GPR) and p.origin == "declared"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +720,172 @@ def _terms_to_named_reqs(
 
 
 # ---------------------------------------------------------------------------
+# BFS wave-drain loop — shared by resolve() and resolve_workspace()
+# ---------------------------------------------------------------------------
+
+
+def _run_bfs_wave_loop(
+    bfs_queue: list[object],
+    executor: object,
+    seen_named: set[str],
+    seen_url: set[tuple[str, str]],
+    seen_tarball: set[str],
+    seen_local: set[str],
+    edge_cache: "dict[tuple[str, Version], EdgeSet]",
+    provider: "_Provider",
+    overrides_by_name: "dict[str, Override]",
+    deps_dir: Path,
+    env: "MilpaEnv",
+    params: "ResolveParams",
+    index: "Index",
+    provenance_gate: "dict[str, tuple[tuple[object, ...], bool]]",
+    root_authority: "set[str]",
+    record_discovery: "Callable[[str], None]",
+) -> None:
+    """BFS wave-drain loop — runs in-place on *bfs_queue*.
+
+    Processes the queue in waves of parallel I/O-bound items (URL / tarball /
+    local) interleaved with synchronous named-dep enumeration.  All mutable
+    state (seen_* sets, edge_cache, provider, bfs_queue) is updated in-place.
+
+    Parameters mirror the closed-over locals in the old per-function copies
+    except ``record_discovery``, which is the only thing that differed between
+    the single-package and workspace copies.
+    """
+    from concurrent.futures import Future as _Future
+    from typing import cast as _cast
+
+    i = 0
+    while i < len(bfs_queue):
+        # --- Collect the next wave of I/O-bound items -------------------
+        # A wave ends when we hit a "named" item (synchronous) or the
+        # queue runs out of new I/O items (all remaining are named or
+        # already-seen URL/tarball/local).
+        wave_futures: list[object] = []
+
+        j = i
+        while j < len(bfs_queue):
+            item = bfs_queue[j]
+            j += 1
+            if not isinstance(item, tuple):
+                continue
+            kind: str = item[0]
+
+            if kind == "named":
+                # Named items are synchronous (Phase A enumeration, no I/O).
+                # Process them inline now; they may add more items to the queue.
+                name_str: str = item[1]
+                constraint_str: str | None = item[2] if len(item) > 2 else None
+                if name_str not in seen_named and name_str != "nim":
+                    seen_named.add(name_str)
+                    record_discovery(name_str)  # Phase B: transitive named dep
+                    # Satisfiability pre-check (TNG-NO-SATISFYING-VERSION):
+                    # verify at least one index version satisfies the
+                    # declared constraint BEFORE enrolling stubs.  This
+                    # surfaces TNG-NO-SATISFYING-VERSION eagerly rather
+                    # than letting the solver raise SOLVE-CONFLICT.
+                    # resolver-semantics §4.2.1 + registry-protocol §5.5.
+                    if constraint_str is not None:
+                        index.resolve_named_all(name_str, constraint_str)
+                    _enumerate_named_stubs(name_str, None, index, provider, deps_dir, env)
+                # Named items are always processed inline, not as futures.
+                continue
+
+            # URL/tarball/local — determine if this item is new (not seen).
+            if kind == "url":
+                dep_u: UrlDep = item[1]
+                if dep_u.name in overrides_by_name:
+                    ov = overrides_by_name[dep_u.name]
+                    dep_u = UrlDep(name=dep_u.name, git=ov.git, ref=ov.ref)
+                pkey_u = ("url", dep_u.git, dep_u.ref)
+                if not _check_provenance_gate(
+                    dep_u.name, pkey_u, provenance_gate, root_authority
+                ):
+                    continue
+                url_key_u = (dep_u.git, dep_u.ref)
+                if url_key_u in seen_url:
+                    continue
+                seen_url.add(url_key_u)
+                record_discovery(dep_u.name)  # Phase B: transitive URL dep first-enqueue
+                # Submit to thread pool — captures dep_u by value (closure).
+                def _url_worker(
+                    _dep: UrlDep = dep_u,
+                ) -> tuple[str, object]:  # (kind, result)
+                    return ("url", _process_url_worker(
+                        _dep,
+                        deps_dir=deps_dir,
+                        env=env,
+                        params=params,
+                        overrides_by_name=overrides_by_name,
+                    ))
+                wave_futures.append(executor.submit(_url_worker))  # type: ignore[union-attr]
+
+            elif kind == "tarball":
+                dep_t: TarballDep = item[1]
+                if dep_t.url in seen_tarball:
+                    continue
+                seen_tarball.add(dep_t.url)
+                record_discovery(dep_t.name)  # Phase B: transitive tarball dep first-enqueue
+                def _tarball_worker(
+                    _dep: TarballDep = dep_t,
+                ) -> tuple[str, object]:
+                    return ("tarball", _process_tarball_worker(
+                        _dep,
+                        deps_dir=deps_dir,
+                        env=env,
+                        params=params,
+                        overrides_by_name=overrides_by_name,
+                    ))
+                wave_futures.append(executor.submit(_tarball_worker))  # type: ignore[union-attr]
+
+            elif kind == "local":
+                dep_l: LocalDep = item[1]
+                if dep_l.path in seen_local:
+                    continue
+                seen_local.add(dep_l.path)
+                record_discovery(dep_l.name)  # Phase B: transitive local dep first-enqueue
+                def _local_worker(
+                    _dep: LocalDep = dep_l,
+                ) -> tuple[str, object]:
+                    return ("local", _process_local_worker(
+                        _dep,
+                        deps_dir=deps_dir,
+                        env=env,
+                        params=params,
+                        overrides_by_name=overrides_by_name,
+                    ))
+                wave_futures.append(executor.submit(_local_worker))  # type: ignore[union-attr]
+
+        i = j  # advance read head past all items we just processed
+
+        # --- Drain wave futures in any order ----------------------------
+        # Result-collection order doesn't affect lockfile bytes
+        # (lockfile is lex-sorted, not BFS-order-sorted).
+        completed_futs: list[_Future[tuple[str, object]]] = list(
+            as_completed(wave_futures)  # type: ignore[arg-type]
+        )
+        for fut in completed_futs:
+            fut_result = fut.result()  # propagates exceptions
+            kind_result = fut_result[0]
+            fetch_result = fut_result[1]
+            # Register candidate, seal edge_cache, and enqueue transitives.
+            if kind_result in ("url", "tarball", "local"):
+                cand_and_deps: tuple[_Candidate, list[object], EdgeSet] = _cast(
+                    "tuple[_Candidate, list[object], EdgeSet]", fetch_result
+                )
+                cand_r, transitive_deps_r, es_r = cand_and_deps
+                provider.add(cand_r)
+                # Seal the edge_cache for this (name, version) — clause (a).
+                # First-encounter wins; no overwrite (worker produced the EdgeSet
+                # deterministically from the fetched tree).
+                cache_key_r = (cand_r.name, cand_r.version)
+                if cache_key_r not in edge_cache:
+                    edge_cache[cache_key_r] = es_r
+                for sub_dep in transitive_deps_r:
+                    _enqueue_dep(sub_dep, overrides_by_name, bfs_queue)
+
+
+# ---------------------------------------------------------------------------
 # Core resolve() implementation
 # ---------------------------------------------------------------------------
 
@@ -794,6 +980,19 @@ def resolve(
     seen_local: set[str] = set()
     seen_tarball: set[str] = set()
 
+    # Phase B dedup: BFS-insertion discovery order (list of dep names in first-
+    # enqueue order).  Root deps in declaration order first; transitive deps in
+    # first-occurrence-enqueue order.  Canonical name = group member with the
+    # smallest discovery_order index (BFS-first, not lex-min).
+    discovery_order: list[str] = []
+    _discovery_seen: set[str] = set()
+
+    def _record_discovery(name: str) -> None:
+        """Record a name in BFS-insertion discovery order (idempotent)."""
+        if name not in _discovery_seen:
+            _discovery_seen.add(name)
+            discovery_order.append(name)
+
     # Resolver-scoped edge memo (§4.2.1 resolve_edges clause a).
     # Sealed once per (name, version) — shared with provider for _materialize.
     edge_cache: dict[tuple[str, Version], EdgeSet] = {}
@@ -843,6 +1042,7 @@ def resolve(
             root_terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
             root_requires.append(dep.name)
             bfs_queue.append(("url", effective_dep))
+            _record_discovery(dep.name)  # Phase B: root URL deps in declaration order
 
         elif isinstance(dep, NamedDep):
             if dep.name == "nim":
@@ -856,21 +1056,25 @@ def resolve(
                 )
                 root_requires.append(dep.name)
                 bfs_queue.append(("url", effective_dep))
+                _record_discovery(dep.name)  # Phase B: overridden named → URL
             else:
                 vs = dep.constraint_set if dep.constraint_set is not None else VersionSet.full()
                 root_terms.append(Term.require(dep.name, vs))
                 root_requires.append(dep.name)
                 bfs_queue.append(("named", dep.name, dep.constraint))
+                _record_discovery(dep.name)  # Phase B: named deps in declaration order
 
         elif isinstance(dep, TarballDep):
             root_terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
             root_requires.append(dep.name)
             bfs_queue.append(("tarball", dep))
+            _record_discovery(dep.name)  # Phase B: root tarball deps in declaration order
 
         elif isinstance(dep, LocalDep):
             root_terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
             root_requires.append(dep.name)
             bfs_queue.append(("local", dep))
+            _record_discovery(dep.name)  # Phase B: root local deps in declaration order
 
         elif isinstance(dep, MemberDep):
             # Member deps in a single-package manifest are out of scope (slice 9d).
@@ -890,7 +1094,8 @@ def resolve(
     # ------------------------------------------------------------------
     # Step 6: BFS materialisation loop (slice 9b-7: parallel fetch)
     #
-    # The BFS queue is processed in waves:
+    # The BFS queue is processed in waves (see _run_bfs_wave_loop for the
+    # full wave-processing spec and ordering invariant commentary).
     #
     # ORDERING INVARIANT (§4.2.1 NORMATIVE, §4.4 NORMATIVE):
     # The lockfile output MUST be identical regardless of ``params.max_parallel``
@@ -903,145 +1108,43 @@ def resolve(
     #       output bytes.
     #   (c) Named dep enumeration (Phase A) is synchronous — the thread pool
     #       only executes URL/tarball/local fetches (I/O-bound).
-    #
-    # Wave processing:
-    # 1. Scan bfs_queue from the current read head until a "named" item or
-    #    the end of the queue.  Collect all independent URL/tarball/local
-    #    items in this wave (those not yet seen).
-    # 2. Submit the wave's items to the thread pool concurrently.
-    # 3. Collect futures as they complete (any order — output is still
-    #    deterministic because lockfile is lex-sorted, not BFS-sorted).
-    # 4. Each completed fetch appends transitive deps to bfs_queue;
-    #    advance the read head past the wave and repeat.
     # ------------------------------------------------------------------
     workers = max(1, params.max_parallel)
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        i = 0
-        while i < len(bfs_queue):
-            # --- Collect the next wave of I/O-bound items ---------------
-            # A wave ends when we hit a "named" item (synchronous) or the
-            # queue runs out of new I/O items (all remaining are named or
-            # already-seen URL/tarball/local).
-            wave_futures: list[object] = []
+        _run_bfs_wave_loop(
+            bfs_queue=bfs_queue,
+            executor=executor,
+            seen_named=seen_named,
+            seen_url=seen_url,
+            seen_tarball=seen_tarball,
+            seen_local=seen_local,
+            edge_cache=edge_cache,
+            provider=provider,
+            overrides_by_name=overrides_by_name,
+            deps_dir=deps_dir,
+            env=env,
+            params=params,
+            index=index,
+            provenance_gate=provenance_gate,
+            root_authority=root_authority,
+            record_discovery=_record_discovery,
+        )
 
-            j = i
-            while j < len(bfs_queue):
-                item = bfs_queue[j]
-                j += 1
-                if not isinstance(item, tuple):
-                    continue
-                kind: str = item[0]
-
-                if kind == "named":
-                    # Named items are synchronous (Phase A enumeration, no I/O).
-                    # Process them inline now; they may add more items to the queue.
-                    name_str: str = item[1]
-                    constraint_str: str | None = item[2] if len(item) > 2 else None
-                    if name_str not in seen_named and name_str != "nim":
-                        seen_named.add(name_str)
-                        # Satisfiability pre-check (TNG-NO-SATISFYING-VERSION):
-                        # verify at least one index version satisfies the
-                        # declared constraint BEFORE enrolling stubs.  This
-                        # surfaces TNG-NO-SATISFYING-VERSION eagerly rather
-                        # than letting the solver raise SOLVE-CONFLICT.
-                        # resolver-semantics §4.2.1 + registry-protocol §5.5.
-                        if constraint_str is not None:
-                            index.resolve_named_all(name_str, constraint_str)
-                        _enumerate_named_stubs(name_str, None, index, provider, deps_dir, env)
-                    # Named items are always processed inline, not as futures.
-                    continue
-
-                # URL/tarball/local — determine if this item is new (not seen).
-                if kind == "url":
-                    dep_u: UrlDep = item[1]
-                    if dep_u.name in overrides_by_name:
-                        ov = overrides_by_name[dep_u.name]
-                        dep_u = UrlDep(name=dep_u.name, git=ov.git, ref=ov.ref)
-                    pkey_u = ("url", dep_u.git, dep_u.ref)
-                    if not _check_provenance_gate(
-                        dep_u.name, pkey_u, provenance_gate, root_authority
-                    ):
-                        continue
-                    url_key_u = (dep_u.git, dep_u.ref)
-                    if url_key_u in seen_url:
-                        continue
-                    seen_url.add(url_key_u)
-                    # Submit to thread pool — captures dep_u by value (closure).
-                    def _url_worker(
-                        _dep: UrlDep = dep_u,
-                    ) -> tuple[str, object]:  # (kind, result)
-                        return ("url", _process_url_worker(
-                            _dep,
-                            deps_dir=deps_dir,
-                            env=env,
-                            params=params,
-                            overrides_by_name=overrides_by_name,
-                        ))
-                    wave_futures.append(executor.submit(_url_worker))
-
-                elif kind == "tarball":
-                    dep_t: TarballDep = item[1]
-                    if dep_t.url in seen_tarball:
-                        continue
-                    seen_tarball.add(dep_t.url)
-                    def _tarball_worker(
-                        _dep: TarballDep = dep_t,
-                    ) -> tuple[str, object]:
-                        return ("tarball", _process_tarball_worker(
-                            _dep,
-                            deps_dir=deps_dir,
-                            env=env,
-                            params=params,
-                            overrides_by_name=overrides_by_name,
-                        ))
-                    wave_futures.append(executor.submit(_tarball_worker))
-
-                elif kind == "local":
-                    dep_l: LocalDep = item[1]
-                    if dep_l.path in seen_local:
-                        continue
-                    seen_local.add(dep_l.path)
-                    def _local_worker(
-                        _dep: LocalDep = dep_l,
-                    ) -> tuple[str, object]:
-                        return ("local", _process_local_worker(
-                            _dep,
-                            deps_dir=deps_dir,
-                            env=env,
-                            params=params,
-                            overrides_by_name=overrides_by_name,
-                        ))
-                    wave_futures.append(executor.submit(_local_worker))
-
-            i = j  # advance read head past all items we just processed
-
-            # --- Drain wave futures in any order -------------------------
-            # Result-collection order doesn't affect lockfile bytes
-            # (lockfile is lex-sorted, not BFS-order-sorted).
-            from concurrent.futures import Future as _Future
-            from typing import cast as _cast
-            completed_futs: list[_Future[tuple[str, object]]] = list(
-                as_completed(wave_futures)  # type: ignore[arg-type]
-            )
-            for fut in completed_futs:
-                fut_result = fut.result()  # propagates exceptions
-                kind_result = fut_result[0]
-                fetch_result = fut_result[1]
-                # Register candidate, seal edge_cache, and enqueue transitives.
-                if kind_result in ("url", "tarball", "local"):
-                    cand_and_deps: tuple[_Candidate, list[object], EdgeSet] = _cast(
-                        "tuple[_Candidate, list[object], EdgeSet]", fetch_result
-                    )
-                    cand_r, transitive_deps_r, es_r = cand_and_deps
-                    provider.add(cand_r)
-                    # Seal the edge_cache for this (name, version) — clause (a).
-                    # First-encounter wins; no overwrite (worker produced the EdgeSet
-                    # deterministically from the fetched tree).
-                    cache_key_r = (cand_r.name, cand_r.version)
-                    if cache_key_r not in edge_cache:
-                        edge_cache[cache_key_r] = es_r
-                    for sub_dep in transitive_deps_r:
-                        _enqueue_dep(sub_dep, overrides_by_name, bfs_queue)
+    # ------------------------------------------------------------------
+    # Step 6b: Phase B content-hash dedup/alias
+    #
+    # After all eager deps are fetched, group candidates by identity.
+    # Groups of size ≥ 2 share a content hash → collapse to one canonical
+    # candidate.  Canonical = group member earliest in BFS-insertion order
+    # (discovery_order list).  Non-canonical candidates are removed from
+    # the provider's candidate set and their _deps/<name> dirs are removed.
+    # All dep_terms / requires_names in surviving candidates pointing to a
+    # non-canonical name are rewritten to the canonical name.
+    # The canonical candidate gains an 'aliases' set for _build_graph.
+    # ------------------------------------------------------------------
+    aliases_map: dict[str, str] = _dedup_candidates(
+        provider, deps_dir, discovery_order, overrides_by_name
+    )
 
     # ------------------------------------------------------------------
     # Step 7: wire Phase B transitive callback BEFORE solve
@@ -1080,7 +1183,7 @@ def resolve(
     # ------------------------------------------------------------------
     # Step 9: build the ResolvedGraph (attach cert for CLI §2.5)
     # ------------------------------------------------------------------
-    graph = _build_graph(solution, provider, deps_dir, params.strategy)
+    graph = _build_graph(solution, provider, deps_dir, params.strategy, aliases_map=aliases_map)
 
     # ------------------------------------------------------------------
     # Step 10: S5 attestation policy enforcement
@@ -1103,7 +1206,15 @@ def resolve(
     enforce_attestation_policy(resolved_edge_map, is_strict)
 
     from dataclasses import replace as _replace
-    return _replace(graph, cert=cert)
+    graph = _replace(graph, cert=cert)
+
+    # B-nimcfg: rebuild the _deps/ view as a pure function of the resolved graph.
+    # This creates alias symlinks and removes stale entries from prior resolves.
+    # SSOT: rebuild_deps_view is the single place that decides _deps/ contents.
+    # MilpaEnv.store is typed CAStore (non-Optional); the None guard was dead code.
+    rebuild_deps_view(graph, deps_dir, env.store)
+
+    return graph
 
 
 # ---------------------------------------------------------------------------
@@ -1153,6 +1264,29 @@ def _check_provenance_gate(
     )
 
 
+def _pick_edges(
+    dep_name: str,
+    version: "Version",
+    ctx: EdgeSourceCtx,
+    milpakdl_source: MilpaKdlEdgeSource,
+    nimble_source: NimbleEdgeSource,
+) -> EdgeSet:
+    """Dispatch to the correct EdgeSource for a single (dep, version) — no cache.
+
+    Single source of truth for the ``has_milpa_kdl`` branching used by the
+    three per-transport worker functions (_process_url_worker,
+    _process_tarball_worker, _process_local_worker).  Workers call this instead
+    of duplicating the two-branch ``if has_milpa_kdl`` block inline.
+
+    Workers do NOT use the ``resolve_edges`` coordinator here because they run
+    on worker threads before the edge_cache is available; the main thread seals
+    the cache from the returned EdgeSet after the worker returns.
+    """
+    if ctx.has_milpa_kdl:
+        return milpakdl_source.edges_for(dep_name, version, ctx)
+    return nimble_source.edges_for(dep_name, version, ctx)
+
+
 def _process_url_worker(
     dep: UrlDep,
     deps_dir: Path,
@@ -1180,44 +1314,88 @@ def _process_url_worker(
         expected_identity, pinned_commit_sha = None, None
 
     # Build ordered candidate list (§8a).
+    # D-lifecycle: track ALL candidate URLs (primary + manifest mirrors + prior
+    # declared) so we know which one became observed and which are declared.
+    primary_url = dep.git
+    manifest_mirror_urls: tuple[str, ...] = tuple(dep.mirrors)
+    # D-update-remove (Phase D item 5): filter prior declared URLs to only those
+    # still in the manifest mirror set. URLs removed from milpa.kdl are dropped
+    # ("drop only those whose URL left the manifest" per RFC §D.5).
+    _manifest_mirror_set: frozenset[str] = frozenset(manifest_mirror_urls)
+    prior_declared_urls: tuple[str, ...] = tuple(
+        u for u in _prior_declared_mirror_urls(dep.name, params.prior)
+        if u in _manifest_mirror_set
+    )
+
+    # Ordered deduped set of ALL candidate URLs: primary first, then manifest
+    # mirrors, then prior declared (manifest-filtered). Whichever succeeds becomes
+    # "observed"; the rest become "declared" provenances in the lockfile.
+    _seen_all: set[str] = set()
+    _all_candidate_urls: list[str] = []
+    for _u in (primary_url, *manifest_mirror_urls, *prior_declared_urls):
+        if _u not in _seen_all:
+            _seen_all.add(_u)
+            _all_candidate_urls.append(_u)
+
     candidates: list[Provenance] = [
-        GitProvenance(url=dep.git, ref=dep.ref, commit_sha=pinned_commit_sha)
+        GitProvenance(url=url, ref=dep.ref, commit_sha=pinned_commit_sha)
+        for url in _all_candidate_urls
     ]
-    for mirror_url in dep.mirrors:
-        candidates.append(GitProvenance(url=mirror_url, ref=dep.ref, commit_sha=pinned_commit_sha))
-    for sm_url in _prior_self_mirrors(dep.name, params.prior):
-        candidates.append(GitProvenance(url=sm_url, ref=dep.ref, commit_sha=pinned_commit_sha))
 
     dest = deps_dir / dep.name
-    last_exc: Exception | None = None
+    last_transport_exc: Exception | None = None
     result = None
+    observed_prov: GitProvenance | None = None
     for prov in candidates:
         try:
             result = env.fetcher.fetch(dep.name, prov, dest=dest)
-            # Validate identity gate when prior pin is set.
-            if expected_identity is not None and result.identity != expected_identity:
-                last_exc = MilpaError(
-                    "FETCH-IDENTITY-MISMATCH",
-                    f"fetching {dep.name!r}: identity mismatch — "
-                    f"expected {expected_identity[:23]}..., "
-                    f"got {result.identity[:23]}...",
-                    name=dep.name,
-                )
-                result = None
-                continue
-            break
         except Exception as exc:
-            last_exc = exc
+            # Transport failure (network error, git non-zero, dead mirror, etc.):
+            # record and try the next candidate.  Do NOT persist any "failed"
+            # state — the lockfile is a build artifact, not a retry log.
+            last_transport_exc = exc
             result = None
+            continue
 
-    if result is None:
-        if last_exc is not None:
-            raise last_exc
-        raise MilpaError(
-            "FETCH-ALL-FAILED",
-            f"all candidates for {dep.name!r} failed",
-            name=dep.name,
+        # Fetch succeeded — validate identity gate when prior pin is set.
+        # A mismatch is a SUPPLY-CHAIN SIGNAL: raise loudly, do NOT try the
+        # next candidate.  A mirror serving different bytes than the lock
+        # pinned must not be silently worked around.
+        if expected_identity is not None and result.identity != expected_identity:
+            raise MilpaError(
+                FETCH_PROVENANCE_DIVERGENCE,
+                f"fetching {dep.name!r}: provenance {prov.url!r} succeeded but "  # type: ignore[union-attr]
+                f"delivered divergent bytes — "
+                f"expected {expected_identity[:23]}..., "
+                f"got {result.identity[:23]}...",
+                name=dep.name,
+                expected_identity=expected_identity,
+                got_identity=result.identity,
+                url=prov.url,  # type: ignore[union-attr]
+            )
+
+        assert isinstance(prov, GitProvenance)
+        observed_prov = prov
+        break
+
+    if result is None or observed_prov is None:
+        # Every candidate transport-failed.  Wrap the last transport error in
+        # FETCH-ALL-FAILED so the caller sees a uniform slug.
+        msg = (
+            str(last_transport_exc)
+            if last_transport_exc is not None
+            else "no candidates"
         )
+        raise MilpaError(
+            FETCH_ALL_FAILED,
+            f"all candidates for {dep.name!r} failed: {msg}",
+            name=dep.name,
+        ) from last_transport_exc
+
+    # D-lifecycle: collect declared mirror URLs — all candidate URLs except the one
+    # that was observed (dedup vs observed URL, no self-reference).
+    observed_url = observed_prov.url
+    declared_mirror_urls = tuple(u for u in _all_candidate_urls if u != observed_url)
 
     # Extract edges via the appropriate source (NORMATIVE §9: transitive .deps only).
     # URL deps are not in the index → dep_decl=None; is_overridden reflects whether
@@ -1233,10 +1411,7 @@ def _process_url_worker(
     )
     # Call the source directly (worker thread — no shared edge_cache yet).
     # The main thread seals edge_cache from the returned EdgeSet.
-    if has_milpa_kdl:
-        es = MilpaKdlEdgeSource().edges_for(dep.name, _URL_DEP_VERSION, ctx)
-    else:
-        es = NimbleEdgeSource().edges_for(dep.name, _URL_DEP_VERSION, ctx)
+    es = _pick_edges(dep.name, _URL_DEP_VERSION, ctx, MilpaKdlEdgeSource(), NimbleEdgeSource())
 
     dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
     src_dir = es.src_dir
@@ -1250,7 +1425,10 @@ def _process_url_worker(
         src_dir=src_dir,
         dep_terms=dep_terms,
         requires_names=requires_names,
-        provenance=GitProvenance(url=dep.git, ref=dep.ref, commit_sha=commit_sha),
+        # D-lifecycle: provenance is the OBSERVED candidate (the one that succeeded).
+        provenance=GitProvenance(url=observed_url, ref=dep.ref, commit_sha=commit_sha),
+        # D-lifecycle: declared mirrors (all manifest+prior declared URLs != observed).
+        declared_mirror_urls=declared_mirror_urls,
         requires_predicates=requires_predicates,
     )
 
@@ -1382,12 +1560,16 @@ def _process_tarball_worker(
             name=dep.name,
         ) from exc
 
-    # Identity gate (§8).
+    # Identity gate (§8): tarball fetched successfully but delivered divergent
+    # bytes vs. the prior lockfile pin — this is a supply-chain signal, not a
+    # generic fetch failure.  Raise FETCH-PROVENANCE-DIVERGENCE (matches Rust
+    # fetch_any_tracked and the D-fallback spec intent).
     if expected_identity is not None and result.identity != expected_identity:
         raise MilpaError(
-            "FETCH-ALL-FAILED",
-            f"all candidates for {dep.name!r} failed: identity mismatch — "
-            f"expected {expected_identity[:23]}..., got {result.identity[:23]}...",
+            FETCH_PROVENANCE_DIVERGENCE,
+            f"{dep.name!r}: tarball at {dep.url!r} succeeded but delivered "
+            f"divergent bytes — expected {expected_identity[:23]}..., "
+            f"got {result.identity[:23]}...",
             name=dep.name,
         )
 
@@ -1403,10 +1585,7 @@ def _process_tarball_worker(
         has_milpa_kdl=has_milpa_kdl,
         overrides_by_name=overrides_by_name,
     )
-    if has_milpa_kdl:
-        es = MilpaKdlEdgeSource().edges_for(dep.name, _URL_DEP_VERSION, ctx)
-    else:
-        es = NimbleEdgeSource().edges_for(dep.name, _URL_DEP_VERSION, ctx)
+    es = _pick_edges(dep.name, _URL_DEP_VERSION, ctx, MilpaKdlEdgeSource(), NimbleEdgeSource())
 
     dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
     src_dir = es.src_dir
@@ -1474,10 +1653,7 @@ def _process_local_worker(
         has_milpa_kdl=has_milpa_kdl,
         overrides_by_name=overrides_by_name,
     )
-    if has_milpa_kdl:
-        es = MilpaKdlEdgeSource().edges_for(dep.name, _URL_DEP_VERSION, ctx)
-    else:
-        es = NimbleEdgeSource().edges_for(dep.name, _URL_DEP_VERSION, ctx)
+    es = _pick_edges(dep.name, _URL_DEP_VERSION, ctx, MilpaKdlEdgeSource(), NimbleEdgeSource())
 
     dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
     src_dir = es.src_dir
@@ -1497,6 +1673,225 @@ def _process_local_worker(
 
 
 # ---------------------------------------------------------------------------
+# Phase B: content-hash dedup/alias
+# ---------------------------------------------------------------------------
+
+
+def _dedup_candidates(
+    provider: _Provider,
+    deps_dir: Path,
+    discovery_order: list[str],
+    overrides_by_name: dict[str, Override],
+) -> dict[str, str]:
+    """Collapse eagerly-fetched candidates that share a content identity.
+
+    Returns ``aliases_map``: a dict mapping non-canonical name → canonical name.
+    Empty when no dedup occurred.
+
+    Algorithm (Phase B, spec/resolver-semantics.md Phase B):
+    1. Group all non-root candidates by their content identity (``identity`` field).
+    2. For each group of size ≥ 2: pick the canonical member as the one with the
+       smallest index in ``discovery_order`` (BFS-insertion order, NOT lex).
+    3. For non-canonical members: remove from provider._candidates and remove
+       their ``_deps/<name>`` dir (B-nimcfg will later replace this with the
+       proper atomic alias-symlink view).
+    4. Rewrite all surviving candidates' ``dep_terms[i].package`` and
+       ``requires_names`` entries that reference a non-canonical name to the
+       canonical name.
+    5. Invariant guard (requires-equality): for each dedup group, re-derive
+       each member's requires from its fetched tree and assert they are equal
+       after alias-rewriting (identical content ⇒ identical tree ⇒ identical
+       requires; any mismatch is a bug, not a user error).
+
+    Named candidates (stubs, not fetched yet) are NOT deduped — they are
+    materialized lazily by the solver after this pass.
+    """
+    candidates = provider._candidates  # type: ignore[attr-defined]  # dict[str, dict[Version, _Candidate]]
+
+    # Step 1: group by identity.
+    by_identity: dict[str, list[str]] = {}
+    for name, versions in candidates.items():
+        if name == "__root__":
+            continue
+        for c in versions.values():
+            if not c.identity:
+                continue
+            by_identity.setdefault(c.identity, []).append(name)
+
+    aliases_map: dict[str, str] = {}  # non-canonical → canonical
+
+    # Build a fast index for discovery_order lookup.
+    discovery_index: dict[str, int] = {n: i for i, n in enumerate(discovery_order)}
+    _LARGE = len(discovery_order)
+
+    for identity, group in by_identity.items():
+        if len(group) < 2:
+            continue
+
+        # Step 2: pick canonical = group member with smallest discovery_order index.
+        # Names NOT in discovery_order get _LARGE (should not happen for non-root
+        # URL/tarball/local deps, but guard defensively).
+        canonical = min(group, key=lambda n: discovery_index.get(n, _LARGE))
+
+        non_canonicals = [n for n in group if n != canonical]
+
+        # Step 5: invariant guard — re-derive requires from fetched tree.
+        # Identical content ⇒ identical tree ⇒ identical requires. Any mismatch
+        # is a bug, not a user error → MILPA-INTERNAL.
+        all_requires: list[frozenset[str]] = []
+        for member_name in group:
+            dep_path = deps_dir / member_name
+            raw_deps = _collect_transitive_deps(dep_path, member_name, overrides_by_name)
+            # Canonicalize dep names through the alias map (partially built so far
+            # — for same-group members: no alias yet; across-group: alias may exist).
+            req_names: frozenset[str] = frozenset(
+                aliases_map.get(getattr(d, "name", ""), getattr(d, "name", ""))
+                for d in raw_deps
+                if hasattr(d, "name")
+            )
+            all_requires.append(req_names)
+
+        # Check all members' requires sets equal the first (invariant guard).
+        first_req = all_requires[0]
+        for i, req in enumerate(all_requires[1:], 1):
+            if req != first_req:
+                member_name_i = group[i]
+                raise MilpaError(
+                    MILPA_INTERNAL,
+                    f"dedup invariant violated: deps {group[0]!r} and "
+                    f"{member_name_i!r} share identity {identity!r} but have "
+                    f"different requires: {first_req!r} vs {req!r}. "
+                    f"This is a bug — identical content must imply identical requires.",
+                    identity=identity,
+                    group=group,
+                )
+
+        # Step 3: remove non-canonical candidates from the provider.
+        # NOTE: _deps/<other> dir removal is intentionally OMITTED here —
+        # rebuild_deps_view (B-nimcfg SSOT) owns _deps/ contents and will
+        # remove stale non-canonical dirs and create alias symlinks atomically
+        # after the graph is assembled. The stopgap inline removal is gone.
+        for other in non_canonicals:
+            candidates.pop(other, None)
+            aliases_map[other] = canonical
+
+    if not aliases_map:
+        return aliases_map
+
+    # Step 4: rewrite dep_terms and requires_names in all surviving candidates.
+    for versions in candidates.values():
+        for c in versions.values():
+            # Rewrite requires_names (parallel to dep_terms).
+            c.requires_names = [
+                aliases_map.get(r, r) for r in c.requires_names
+            ]
+            # Rewrite solver dep_terms (frozen Terms — create new instances).
+            from milpa.solver import Term as _Term
+            new_dep_terms = []
+            for term in c.dep_terms:
+                can = aliases_map.get(term.package)
+                if can is not None:
+                    # Preserve positive/negative polarity.
+                    new_dep_terms.append(
+                        _Term(package=can, positive=term.positive, versions=term.versions)
+                    )
+                else:
+                    new_dep_terms.append(term)
+            c.dep_terms = new_dep_terms
+
+    return aliases_map
+
+
+# ---------------------------------------------------------------------------
+# B-nimcfg: atomic _deps/ view rebuild (Phase B, rfc-content-addressed-identity.md)
+# ---------------------------------------------------------------------------
+
+
+def rebuild_deps_view(
+    graph: ResolvedGraph,
+    deps_dir: Path,
+    store: object,  # CAStore — typed as object to avoid circular import
+) -> None:
+    """Rebuild ``_deps/`` as a pure function of ``graph`` (B-nimcfg slice).
+
+    This is the SINGLE SOURCE OF TRUTH for ``_deps/`` contents in the Python
+    impl. Called from both ``resolve()`` and ``resolve_frozen``/``resolve_workspace_frozen``
+    (via frozen.py import).
+
+    Algorithm:
+    1. Compute the EXPECTED entry set: for each dep in ``graph.deps`` that has
+       a CAS identity, record ``{canonical_name: identity}`` PLUS
+       ``{alias: identity}`` for each alias.  Non-CAS deps (local, member) are
+       excluded from the rebuild loop — their ``_deps/<name>`` are managed by
+       the fetcher/frozen path directly (e.g. LocalFetcher creates a real dir).
+    2. Remove any ``_deps/<x>`` NOT in the expected set:
+       - symlinks → os.unlink  (shutil.rmtree refuses symlinks)
+       - real dirs → shutil.rmtree
+    3. Create/refresh each expected CAS entry as a relative symlink via
+       ``store.link(identity, deps_dir / name)``.  ``link()`` is idempotent
+       (it clears any existing entry before re-linking).
+
+    "Atomic" here = the rebuild leaves ``_deps/`` in the fully-correct state
+    with no partial/stale residue.  Cross-process transactional atomicity is
+    NOT guaranteed (out of scope for B-nimcfg).
+    """
+    import os
+    import shutil
+    import stat as _stat
+
+    from milpa.lockfile import MemberProvenanceRecord, LocalProvenanceRecord
+
+    # Step 1: compute expected entry set (name → identity) for CAS entries only.
+    # Also collect local dep names to PRESERVE in _deps/ (LocalFetcher created
+    # their symlinks; rebuild_deps_view must not remove them as stale).
+    expected: dict[str, str] = {}
+    local_names: set[str] = set()
+    for dep in graph.deps:
+        # Skip member deps — their dirs are not in _deps/ (they live in the ws tree).
+        if any(isinstance(p, MemberProvenanceRecord) for p in dep.provenances):
+            continue
+        # Local deps have no CAS identity (cas_admissible=False); LocalFetcher
+        # creates their _deps/<name> symlink.  Add to local_names so Step 2
+        # does NOT remove them as stale entries.
+        if any(isinstance(p, LocalProvenanceRecord) for p in dep.provenances):
+            local_names.add(dep.name)
+            continue
+        # Skip deps without a CAS identity (should not occur for non-local/member).
+        if not dep.identity:
+            continue
+        expected[dep.name] = dep.identity
+        for alias in dep.aliases:
+            expected[alias] = dep.identity
+
+    if not deps_dir.is_dir():
+        return  # nothing to rebuild
+
+    # Step 2: remove stale entries (not in expected set, and not a preserved local dep).
+    for child in list(deps_dir.iterdir()):
+        if child.name not in expected and child.name not in local_names:
+            try:
+                st = os.lstat(child)
+                if _stat.S_ISLNK(st.st_mode):
+                    os.unlink(child)
+                else:
+                    shutil.rmtree(child, ignore_errors=True)
+            except FileNotFoundError:
+                pass
+
+    # Step 3: create/refresh expected CAS symlinks.
+    # store.link(identity, target) creates a relative symlink; it is idempotent
+    # (clears any existing entry first).
+    _store = store  # type: ignore[assignment]
+    for name, identity in expected.items():
+        try:
+            _store.link(identity, deps_dir / name)
+        except Exception:
+            # CAS entry missing for this identity — the resolver already validated
+            # presence (FROZEN-IDENTITY-NOT-IN-STORE); treat as non-fatal here.
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Graph assembly
 # ---------------------------------------------------------------------------
 
@@ -1506,12 +1901,26 @@ def _build_graph(
     provider: _Provider,
     deps_dir: Path,
     strategy: Strategy,
+    aliases_map: dict[str, str] | None = None,
 ) -> ResolvedGraph:
-    """Map ``solve()``'s solution dict to a ``ResolvedGraph``."""
+    """Map ``solve()``'s solution dict to a ``ResolvedGraph``.
+
+    ``aliases_map`` maps non-canonical name → canonical name (populated by
+    the Phase B dedup pass).  Used to populate ``ResolvedDep.aliases`` on
+    the surviving canonical dep.
+    """
     GP = GitProvenance
     LP = LocalProvenance
     TP = TarballProvenance
     MP = MemberProvenanceRecord
+
+    # Build reverse map: canonical → sorted list of aliases.
+    canonical_to_aliases: dict[str, list[str]] = {}
+    if aliases_map:
+        for alias, canonical in aliases_map.items():
+            canonical_to_aliases.setdefault(canonical, []).append(alias)
+        for lst in canonical_to_aliases.values():
+            lst.sort()
 
     deps: list[ResolvedDep] = []
     for name, version in solution.items():
@@ -1522,8 +1931,8 @@ def _build_graph(
         except KeyError:
             continue
 
-        # Map fetcher provenance → lockfile ProvenanceRecord.
-        prov_record: (
+        # Map fetcher provenance → lockfile ProvenanceRecord (observed).
+        observed_record: (
             GitProvenanceRecord
             | LocalProvenanceRecord
             | TarballProvenanceRecord
@@ -1531,25 +1940,61 @@ def _build_graph(
             | None
         ) = None
         if isinstance(cand.provenance, GP):
-            prov_record = GitProvenanceRecord(
+            observed_record = GitProvenanceRecord(
                 url=cand.provenance.url,
                 ref=cand.provenance.ref,
                 commit_sha=cand.provenance.commit_sha,
+                origin="observed",
             )
         elif isinstance(cand.provenance, LP):
-            # LocalProvenance stores the ABSOLUTE resolved path; lockfile needs declared.
-            prov_record = LocalProvenanceRecord(path=str(cand.provenance.path))
+            # Dead branch: _process_local_worker always wraps local deps in
+            # _LocalDepProvenance (the declared relative path) before storing
+            # them in _Candidate.provenance, so a raw LocalProvenance (which
+            # carries the ABSOLUTE resolved path) is never stored here.
+            # If this fires, the caller wired a LocalProvenance directly into
+            # _Candidate — that would silently write an absolute path to the
+            # lockfile, violating lockfile-schema §4.3.  Raise hard.
+            raise AssertionError(
+                f"_build_graph: _Candidate for {cand.name!r} carries a raw "
+                f"LocalProvenance (absolute path={cand.provenance.path!r}); "
+                f"local deps must use _LocalDepProvenance so the declared "
+                f"relative path is written to the lockfile (§4.3)."
+            )
         elif isinstance(cand.provenance, _LocalDepProvenance):
             # _LocalDepProvenance stores the DECLARED (relative) path — correct for lockfile.
-            prov_record = LocalProvenanceRecord(path=cand.provenance.declared_path)
+            observed_record = LocalProvenanceRecord(path=cand.provenance.declared_path, origin="observed")
         elif isinstance(cand.provenance, TP):
-            prov_record = TarballProvenanceRecord(
+            observed_record = TarballProvenanceRecord(
                 url=cand.provenance.url,
                 sha256=cand.provenance.expected_sha256,
+                origin="observed",
             )
         elif isinstance(cand.provenance, MP):
             # Member candidate — provenance record already typed correctly.
-            prov_record = cand.provenance
+            observed_record = cand.provenance
+
+        # D-lifecycle: build declared provenance records for each mirror URL that
+        # was NOT the observed candidate. Declared = unverified (no commit_sha,
+        # ref preserved from the manifest dep). Mirrors are always git provenances.
+        # Use the ref from the observed GitProvenance (which carries dep.ref).
+        declared_ref: str | None = cand.provenance.ref if isinstance(cand.provenance, GP) else None
+        declared_records: list[GitProvenanceRecord] = [
+            GitProvenanceRecord(
+                url=mirror_url,
+                ref=declared_ref,
+                commit_sha=None,
+                origin="declared",
+            )
+            for mirror_url in cand.declared_mirror_urls
+        ]
+
+        # Assemble the full provenances tuple: observed first (before sorting), then
+        # declared. The emitter sorts them canonically (declared < observed by rank).
+        _all_provs: list[ProvenanceRecord] = []
+        if observed_record is not None:
+            _all_provs.append(observed_record)
+        _all_provs.extend(declared_records)
+        all_provenances: tuple[ProvenanceRecord, ...] = tuple(_all_provs)
 
         version_str = format_version_str(version)
 
@@ -1576,12 +2021,16 @@ def _build_graph(
             version=version_str,
             src_dir=cand.src_dir,
             requires=tuple(cand.requires_names),
-            provenance=prov_record,
+            # D-lifecycle: full provenances tuple (observed + declared mirrors).
+            provenances=all_provenances,
             # S6: dep_decl pin — carries the DepDecl hash from _Candidate (set in
             # _materialize when DepDeclEdgeSource fired) to the lockfile record.
             dep_decl=cand.dep_decl,
             # S4: conditional require annotations (sorted by (name, canonical-predicate-string)).
             cond_requires=_cond_requires,
+            # Phase B: aliases — lex-sorted list of non-canonical names that share
+            # this dep's content identity.  Empty for non-deduped deps.
+            aliases=tuple(canonical_to_aliases.get(name, [])),
         )
         deps.append(resolved)
 
@@ -1767,6 +2216,18 @@ def resolve_workspace(
     seen_local: set[str] = set()
     seen_tarball: set[str] = set()
 
+    # Phase B dedup: BFS-insertion discovery order (mirrors resolve()).
+    # Members are pre-registered and NOT in discovery_order (they are
+    # workspace-local, not external deps subject to content-hash dedup).
+    ws_discovery_order: list[str] = []
+    _ws_discovery_seen: set[str] = set()
+
+    def _ws_record_discovery(name: str) -> None:
+        """Record a name in BFS-insertion discovery order (idempotent)."""
+        if name not in _ws_discovery_seen:
+            _ws_discovery_seen.add(name)
+            ws_discovery_order.append(name)
+
     # Resolver-scoped edge memo (§4.2.1 resolve_edges clause a).
     ws_edge_cache: dict[tuple[str, Version], EdgeSet] = {}
 
@@ -1855,130 +2316,48 @@ def resolve_workspace(
                 ov = overrides_by_name[name]
                 effective_dep = UrlDep(name=name, git=ov.git, ref=ov.ref)
                 bfs_queue.append(("url", effective_dep))
+                _ws_record_discovery(name)  # Phase B: overridden dep in seed order
                 continue
             # Queue external deps.
             if isinstance(dep, UrlDep):
                 bfs_queue.append(("url", dep))
+                _ws_record_discovery(name)  # Phase B: URL dep in seed order
             elif isinstance(dep, NamedDep):
                 if name == "nim":
                     continue
                 bfs_queue.append(("named", name, dep.constraint))
+                _ws_record_discovery(name)  # Phase B: named dep in seed order
             elif isinstance(dep, TarballDep):
                 bfs_queue.append(("tarball", dep))
+                _ws_record_discovery(name)  # Phase B: tarball dep in seed order
             elif isinstance(dep, LocalDep):
                 bfs_queue.append(("local", dep))
+                _ws_record_discovery(name)  # Phase B: local dep in seed order
 
     # ------------------------------------------------------------------
-    # BFS materialisation loop (parallel, mirrors resolve())
+    # BFS materialisation loop (parallel) — shared helper, see resolve()
+    # for full ordering-invariant commentary.
     # ------------------------------------------------------------------
     workers = max(1, params.max_parallel)
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        i = 0
-        while i < len(bfs_queue):
-            wave_futures: list[object] = []
-
-            j = i
-            while j < len(bfs_queue):
-                item = bfs_queue[j]
-                j += 1
-                if not isinstance(item, tuple):
-                    continue
-                kind: str = item[0]
-
-                if kind == "named":
-                    name_str: str = item[1]
-                    constraint_str: str | None = item[2] if len(item) > 2 else None
-                    if name_str not in seen_named and name_str != "nim":
-                        seen_named.add(name_str)
-                        # Satisfiability pre-check (TNG-NO-SATISFYING-VERSION).
-                        if constraint_str is not None:
-                            index.resolve_named_all(name_str, constraint_str)
-                        _enumerate_named_stubs(name_str, None, index, provider, deps_dir, env)
-                    continue
-
-                if kind == "url":
-                    dep_u: UrlDep = item[1]
-                    if dep_u.name in overrides_by_name:
-                        ov = overrides_by_name[dep_u.name]
-                        dep_u = UrlDep(name=dep_u.name, git=ov.git, ref=ov.ref)
-                    pkey_u = ("url", dep_u.git, dep_u.ref)
-                    if not _check_provenance_gate(
-                        dep_u.name, pkey_u, provenance_gate, root_authority
-                    ):
-                        continue
-                    url_key_u = (dep_u.git, dep_u.ref)
-                    if url_key_u in seen_url:
-                        continue
-                    seen_url.add(url_key_u)
-                    def _url_worker(
-                        _dep: UrlDep = dep_u,
-                    ) -> tuple[str, object]:
-                        return ("url", _process_url_worker(
-                            _dep,
-                            deps_dir=deps_dir,
-                            env=env,
-                            params=params,
-                            overrides_by_name=overrides_by_name,
-                        ))
-                    wave_futures.append(executor.submit(_url_worker))
-
-                elif kind == "tarball":
-                    dep_t: TarballDep = item[1]
-                    if dep_t.url in seen_tarball:
-                        continue
-                    seen_tarball.add(dep_t.url)
-                    def _tarball_worker(
-                        _dep: TarballDep = dep_t,
-                    ) -> tuple[str, object]:
-                        return ("tarball", _process_tarball_worker(
-                            _dep,
-                            deps_dir=deps_dir,
-                            env=env,
-                            params=params,
-                            overrides_by_name=overrides_by_name,
-                        ))
-                    wave_futures.append(executor.submit(_tarball_worker))
-
-                elif kind == "local":
-                    dep_l: LocalDep = item[1]
-                    if dep_l.path in seen_local:
-                        continue
-                    seen_local.add(dep_l.path)
-                    def _local_worker(
-                        _dep: LocalDep = dep_l,
-                    ) -> tuple[str, object]:
-                        return ("local", _process_local_worker(
-                            _dep,
-                            deps_dir=deps_dir,
-                            env=env,
-                            params=params,
-                            overrides_by_name=overrides_by_name,
-                        ))
-                    wave_futures.append(executor.submit(_local_worker))
-
-            i = j
-
-            from concurrent.futures import Future as _Future2
-            from typing import cast as _cast2
-            completed_ws_futs: list[_Future2[tuple[str, object]]] = list(
-                as_completed(wave_futures)  # type: ignore[arg-type]
-            )
-            for fut in completed_ws_futs:
-                fut_result_ws = fut.result()
-                kind_result_ws = fut_result_ws[0]
-                fetch_result_ws = fut_result_ws[1]
-                if kind_result_ws in ("url", "tarball", "local"):
-                    cand_and_deps_ws: tuple[_Candidate, list[object], EdgeSet] = _cast2(
-                        "tuple[_Candidate, list[object], EdgeSet]", fetch_result_ws
-                    )
-                    cand_ws, transitive_deps_ws, es_ws = cand_and_deps_ws
-                    provider.add(cand_ws)
-                    # Seal edge_cache (clause a).
-                    cache_key_ws = (cand_ws.name, cand_ws.version)
-                    if cache_key_ws not in ws_edge_cache:
-                        ws_edge_cache[cache_key_ws] = es_ws
-                    for sub_dep_ws in transitive_deps_ws:
-                        _enqueue_dep(sub_dep_ws, overrides_by_name, bfs_queue)
+        _run_bfs_wave_loop(
+            bfs_queue=bfs_queue,
+            executor=executor,
+            seen_named=seen_named,
+            seen_url=seen_url,
+            seen_tarball=seen_tarball,
+            seen_local=seen_local,
+            edge_cache=ws_edge_cache,
+            provider=provider,
+            overrides_by_name=overrides_by_name,
+            deps_dir=deps_dir,
+            env=env,
+            params=params,
+            index=index,
+            provenance_gate=provenance_gate,
+            root_authority=root_authority,
+            record_discovery=_ws_record_discovery,
+        )
 
     # ------------------------------------------------------------------
     # Wire Phase B transitive callback BEFORE solve
@@ -1987,9 +2366,21 @@ def resolve_workspace(
         if name in seen_named or name == "nim":
             return
         seen_named.add(name)
+        _ws_record_discovery(name)  # Phase B: lazy-materialized named dep
         _enumerate_named_stubs(name, None, index, provider, deps_dir, env)
 
     provider.set_transitive_callback(_on_transitive_named)
+
+    # ------------------------------------------------------------------
+    # Step 6b (workspace): Phase B content-hash dedup/alias
+    #
+    # Mirrors resolve() step 6b: group external candidates by identity,
+    # collapse groups of size ≥ 2 to ONE canonical node.  Member candidates
+    # are never in ws_discovery_order so they are never deduplicated.
+    # ------------------------------------------------------------------
+    ws_aliases_map: dict[str, str] = _dedup_candidates(
+        provider, deps_dir, ws_discovery_order, overrides_by_name
+    )
 
     # ------------------------------------------------------------------
     # Solve (+ build §5.1 certificate for --certificate flag)
@@ -2013,7 +2404,7 @@ def resolve_workspace(
     # ------------------------------------------------------------------
     # Build graph (attach cert for CLI §2.5)
     # ------------------------------------------------------------------
-    graph = _build_graph(solution, provider, deps_dir, params.strategy)
+    graph = _build_graph(solution, provider, deps_dir, params.strategy, aliases_map=ws_aliases_map)
 
     # §13 attestation policy enforcement — mirrors single-package resolve().
     # Effective policy: OR of flag/env (via _ws_is_strict computed above) and
@@ -2027,4 +2418,9 @@ def resolve_workspace(
     enforce_attestation_policy(resolved_edge_map, _ws_is_strict)
 
     from dataclasses import replace as _replace
-    return _replace(graph, cert=cert)
+    graph = _replace(graph, cert=cert)
+
+    # B-nimcfg: rebuild _deps/ view (alias symlinks + stale removal).
+    rebuild_deps_view(graph, deps_dir, env.store)
+
+    return graph

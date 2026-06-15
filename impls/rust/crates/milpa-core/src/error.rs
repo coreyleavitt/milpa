@@ -81,10 +81,16 @@ impl CoreError {
             "ID-UNSUPPORTED-ALGORITHM",
             "ID-WRONG-DIGEST-LENGTH",
             "ID-NON-HEX-DIGEST",
+            "ID-NON-UTF8-RELPATH",
             "ID-NON-UTF8-SYMLINK-TARGET",
             // CAS (identity.md §3.3 / §3.6)
             "CAS-IDENTITY-MISMATCH",
             "CAS-NOT-IN-STORE",
+            // CAS store inspection (C-store-ro slice, Phase C)
+            "STORE-AMBIGUOUS-PREFIX",
+            // C-verify: symlink-state classification (RFC Phase C §6 item 6 + §6.4)
+            "CAS-STORE-IO-ERROR",
+            "VERIFY-ALIAS-SYMLINK-MISSING",
             // lockfile parse (lockfile-schema §2–§4) — S5a. The two file-IO
             // codes (LOCK-FILE-NOT-FOUND / LOCK-FILE-UNREADABLE) are emitted by
             // `load_lockfile`, the disk wrapper, and are included here too. The

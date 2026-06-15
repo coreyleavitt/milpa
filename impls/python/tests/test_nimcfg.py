@@ -269,6 +269,17 @@ class TestCorpusFixtures:
         expected = _expected_nimcfg("fixture-063-canonical-selection")
         assert format_nimcfg(graph) == expected
 
+    def test_fixture_180_src_dir_no_deps(self) -> None:
+        """fixture-180: src_dir 'src' with zero deps → header + blank + path + trailing \\n.
+
+        Regression for cross-impl byte divergence: Rust guarded the trailing
+        newline on `graph.deps.is_empty()` instead of whether any --path: line
+        was emitted (self_src_dir alone must also produce the trailing \\n).
+        """
+        graph = ResolvedGraph(deps=())
+        expected = _expected_nimcfg("fixture-180-nimcfg-src-dir-no-deps")
+        assert format_nimcfg(graph, self_src_dir="src") == expected
+
 
 # ---------------------------------------------------------------------------
 # §7.5  Feature-flag defines — DEFERRED (#23)
@@ -352,7 +363,7 @@ class TestWorkspaceNimcfgs:
                 version="0.0.1",
                 src_dir="src",
                 requires=(),
-                provenance=MemberProvenanceRecord(name="liba"),
+                provenances=(MemberProvenanceRecord(name="liba"),),
             ),
         ))
         result = format_workspace_nimcfgs(ws, graph)
@@ -383,7 +394,7 @@ class TestWorkspaceNimcfgs:
                 version="0.0.1",
                 src_dir="src",
                 requires=(),
-                provenance=MemberProvenanceRecord(name="liba"),
+                provenances=(MemberProvenanceRecord(name="liba"),),
             ),
             ResolvedDep(
                 name="libb",
@@ -391,7 +402,7 @@ class TestWorkspaceNimcfgs:
                 version="0.0.1",
                 src_dir="src",
                 requires=("liba",),
-                provenance=MemberProvenanceRecord(name="libb"),
+                provenances=(MemberProvenanceRecord(name="libb"),),
             ),
         ))
         result = format_workspace_nimcfgs(ws, graph)
@@ -414,7 +425,7 @@ class TestWorkspaceNimcfgs:
                 version="0.0.1",
                 src_dir="",
                 requires=(),
-                provenance=MemberProvenanceRecord(name="liba"),
+                provenances=(MemberProvenanceRecord(name="liba"),),
             ),
             ResolvedDep(
                 name="libb",
@@ -422,7 +433,7 @@ class TestWorkspaceNimcfgs:
                 version="0.0.1",
                 src_dir="",
                 requires=(),
-                provenance=MemberProvenanceRecord(name="libb"),
+                provenances=(MemberProvenanceRecord(name="libb"),),
             ),
         ))
         result = format_workspace_nimcfgs(ws, graph)
@@ -450,3 +461,100 @@ class TestDeterminism:
         result = format_nimcfg(g1)
         assert format_nimcfg(g2) == result
         assert format_nimcfg(g3) == result
+
+
+# ---------------------------------------------------------------------------
+# B-nimcfg: alias --path: lines (Phase B, rfc-content-addressed-identity.md)
+# ---------------------------------------------------------------------------
+
+
+def _dep_with_aliases(
+    name: str,
+    src_dir: str = "",
+    aliases: tuple[str, ...] = (),
+) -> ResolvedDep:
+    """Build a minimal ResolvedDep with aliases for B-nimcfg tests."""
+    return ResolvedDep(
+        name=name,
+        identity=None,
+        version="0.0.1",
+        src_dir=src_dir,
+        requires=(),
+        aliases=aliases,
+    )
+
+
+class TestAliasPathLines:
+    """B-nimcfg: each alias emits its own --path: line (Phase B)."""
+
+    def test_single_alias_emits_two_path_lines(self) -> None:
+        """A dep with one alias → canonical --path: + alias --path:, canonical first."""
+        graph = ResolvedGraph(deps=(_dep_with_aliases("foo", "src", aliases=("bar",)),))
+        out = format_nimcfg(graph)
+        path_lines = [ln for ln in out.splitlines() if ln.startswith("--path:")]
+        assert '--path:"_deps/foo/src"' in path_lines
+        assert '--path:"_deps/bar/src"' in path_lines
+        # canonical first
+        foo_idx = path_lines.index('--path:"_deps/foo/src"')
+        bar_idx = path_lines.index('--path:"_deps/bar/src"')
+        assert foo_idx < bar_idx, "canonical --path: must come before alias --path:"
+
+    def test_two_aliases_lex_ordered_after_canonical(self) -> None:
+        """Two aliases: canonical first, then aliases lex-sorted."""
+        graph = ResolvedGraph(
+            deps=(_dep_with_aliases("foo", "src", aliases=("bar", "qux")),)
+        )
+        out = format_nimcfg(graph)
+        path_lines = [ln for ln in out.splitlines() if ln.startswith("--path:")]
+        assert path_lines[0] == '--path:"_deps/foo/src"'
+        assert path_lines[1] == '--path:"_deps/bar/src"'
+        assert path_lines[2] == '--path:"_deps/qux/src"'
+
+    def test_alias_path_uses_same_src_dir_as_canonical(self) -> None:
+        """Alias --path: uses the canonical dep's src_dir."""
+        graph = ResolvedGraph(
+            deps=(_dep_with_aliases("mylib", "mylib", aliases=("legacy-mylib",)),)
+        )
+        out = format_nimcfg(graph)
+        assert '--path:"_deps/legacy-mylib/mylib"' in out
+
+    def test_no_alias_unchanged_behavior(self) -> None:
+        """A dep with no aliases emits exactly one --path: line (unchanged)."""
+        graph = ResolvedGraph(deps=(_dep_with_aliases("foo", "src"),))
+        out = format_nimcfg(graph)
+        path_lines = [ln for ln in out.splitlines() if ln.startswith("--path:")]
+        assert path_lines == ['--path:"_deps/foo/src"']
+
+    def test_multiple_deps_aliases_interleaved_correctly(self) -> None:
+        """Two non-aliased deps + one aliased dep: ordering is correct overall.
+
+        Lex order of canonical names first, then for each canonical: canonical
+        --path: immediately followed by alias --path: lines (lex-sorted aliases).
+        But wait: the spec says overall dep iteration is lex by canonical name;
+        within each dep we emit canonical then aliases in lex order.
+        So the overall output for deps [foo(aliases=bar), zzz] should be:
+          --path:"_deps/foo/..."
+          --path:"_deps/bar/..."   ← alias of foo
+          --path:"_deps/zzz"
+        """
+        graph = ResolvedGraph(deps=(
+            _dep_with_aliases("zzz", ""),
+            _dep_with_aliases("foo", "src", aliases=("bar",)),
+        ))
+        out = format_nimcfg(graph)
+        path_lines = [ln for ln in out.splitlines() if ln.startswith("--path:")]
+        # lex order: foo before zzz; bar is foo's alias (after foo's canonical)
+        assert path_lines == [
+            '--path:"_deps/foo/src"',
+            '--path:"_deps/bar/src"',
+            '--path:"_deps/zzz"',
+        ]
+
+    def test_fixture_173_nim_cfg(self) -> None:
+        """fixture-173: dedup of foo+bar → nim.cfg has both --path: lines."""
+        # foo is canonical (aliases=("bar",)), bar is the alias.
+        graph = ResolvedGraph(
+            deps=(_dep_with_aliases("foo", "src", aliases=("bar",)),)
+        )
+        expected = _expected_nimcfg("fixture-173-dedup-same-content-aliases")
+        assert format_nimcfg(graph) == expected

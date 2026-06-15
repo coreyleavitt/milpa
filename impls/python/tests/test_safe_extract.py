@@ -370,3 +370,173 @@ def test_default_limits_are_normative() -> None:
     assert lim.max_total_size == 1 << 30
     assert lim.max_file_size == 1 << 28
     assert lim.max_file_count == 100_000
+
+
+# ---------------------------------------------------------------------------
+# SA-1 — decompression-bomb guard (gzip expansion cap)
+# ---------------------------------------------------------------------------
+
+
+def _make_compressible_tar(size: int) -> io.BytesIO:
+    """Return a gzip-compressed tar archive containing one file of ``size`` zero bytes.
+
+    Zero bytes compress very well: the compressed payload is tiny while the
+    declared member.size is ``size``.  Python's tarfile reads member.size from
+    the header (uncompressed size) before extracting, so the per-file and
+    total-size caps fire on the header-declared size, not the compressed size.
+    This makes tarfile's existing per-entry size check the decompression-bomb
+    defense for the Python path (unlike Rust, which must wrap the GzDecoder).
+    """
+    import gzip
+
+    # Build a raw tar first.
+    raw_buf = io.BytesIO()
+    with tarfile.open(fileobj=raw_buf, mode="w:") as tf:
+        data = bytes(size)
+        info = tarfile.TarInfo(name="bomb.bin")
+        info.size = size
+        tf.addfile(info, io.BytesIO(data))
+    raw_buf.seek(0)
+
+    # Gzip-compress the tar.
+    gz_buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=gz_buf, mode="wb") as gz:
+        gz.write(raw_buf.read())
+    gz_buf.seek(0)
+    return gz_buf
+
+
+def test_decompression_bomb_exceeding_cap_raises_size_limit() -> None:
+    """A gzip-compressed tar whose member.size exceeds max_total_size raises EXTRACT-SIZE-LIMIT.
+
+    SA-1 guard (Python path): Python's tarfile reads member.size (uncompressed
+    size) from the tar header before extracting.  The per-file and total-size
+    checks in extract_tar operate on member.size and therefore fire before any
+    decompressed bytes are written to disk.  This test confirms the guard works
+    against a gzip-compressed bomb (tiny compressed payload, large declared size).
+    """
+    bomb_size = 5_000  # bytes declared in tar header (uncompressed)
+    gz = _make_compressible_tar(bomb_size)
+    # Set max_total_size = 100 bytes so the 5 KB declared payload exceeds it.
+    limits = Limits(max_total_size=100, max_file_size=10_000)
+    with tempfile.TemporaryDirectory() as dest_str:
+        with pytest.raises(MilpaError) as exc_info:
+            extract_tar(gz, Path(dest_str), limits=limits)
+    assert exc_info.value.slug == EXTRACT_SIZE_LIMIT
+
+
+def test_decompression_within_cap_succeeds() -> None:
+    """A gzip tar whose member.size is within max_total_size extracts normally."""
+    small_size = 50
+    gz = _make_compressible_tar(small_size)
+    limits = Limits(max_total_size=1_000, max_file_size=1_000)
+    with tempfile.TemporaryDirectory() as dest_str:
+        result = extract_tar(gz, Path(dest_str), limits=limits)
+    assert result.file_count == 1
+    assert result.total_bytes == small_size
+
+
+# ---------------------------------------------------------------------------
+# SA-1 (R16): decompression-bomb guard — bz2 and xz formats (lockstep with gzip)
+# ---------------------------------------------------------------------------
+#
+# Python's tarfile reads member.size (uncompressed size) from the tar header
+# BEFORE extracting bytes, regardless of the outer compression format (gz/bz2/xz).
+# That is the decompression-bomb guard for ALL three formats on the Python path:
+# the per-entry size check fires before any compressed bytes are decoded.
+# These tests use the same low-cap Limits as the gzip test above to stay small.
+
+
+def _make_bz2_compressible_tar(size: int) -> io.BytesIO:
+    """Return a bzip2-compressed tar containing one file of ``size`` zero bytes.
+
+    Zero bytes compress well so the compressed payload is small while the
+    declared member.size is ``size``.  Python's tarfile reads member.size from
+    the tar header (uncompressed) so the total-size cap fires before extraction.
+    """
+    import bz2
+
+    raw_buf = io.BytesIO()
+    with tarfile.open(fileobj=raw_buf, mode="w:") as tf:
+        data = bytes(size)
+        info = tarfile.TarInfo(name="bomb.bin")
+        info.size = size
+        tf.addfile(info, io.BytesIO(data))
+    raw_buf.seek(0)
+
+    bz2_buf = io.BytesIO(bz2.compress(raw_buf.read()))
+    bz2_buf.seek(0)
+    return bz2_buf
+
+
+def _make_xz_compressible_tar(size: int) -> io.BytesIO:
+    """Return an xz-compressed tar containing one file of ``size`` zero bytes."""
+    import lzma
+
+    raw_buf = io.BytesIO()
+    with tarfile.open(fileobj=raw_buf, mode="w:") as tf:
+        data = bytes(size)
+        info = tarfile.TarInfo(name="bomb.bin")
+        info.size = size
+        tf.addfile(info, io.BytesIO(data))
+    raw_buf.seek(0)
+
+    xz_buf = io.BytesIO(lzma.compress(raw_buf.read(), format=lzma.FORMAT_XZ))
+    xz_buf.seek(0)
+    return xz_buf
+
+
+def test_bz2_decompression_bomb_exceeding_cap_raises_size_limit() -> None:
+    """A bz2-compressed tar whose member.size exceeds max_total_size raises EXTRACT-SIZE-LIMIT.
+
+    SA-1 guard (R16): Python's tarfile reads member.size (uncompressed) from the
+    tar header regardless of outer compression format.  The total-size check in
+    extract_tar operates on member.size and therefore fires before any compressed
+    bytes are decoded and written to disk.  This is lockstep with the gzip test
+    (test_decompression_bomb_exceeding_cap_raises_size_limit) above.
+    """
+    bomb_size = 5_000  # bytes declared in tar header (uncompressed)
+    bz2_archive = _make_bz2_compressible_tar(bomb_size)
+    limits = Limits(max_total_size=100, max_file_size=10_000)
+    with tempfile.TemporaryDirectory() as dest_str:
+        with pytest.raises(MilpaError) as exc_info:
+            extract_tar(bz2_archive, Path(dest_str), limits=limits)
+    assert exc_info.value.slug == EXTRACT_SIZE_LIMIT
+
+
+def test_bz2_decompression_within_cap_succeeds() -> None:
+    """A bz2 tar whose member.size is within max_total_size extracts normally."""
+    small_size = 50
+    bz2_archive = _make_bz2_compressible_tar(small_size)
+    limits = Limits(max_total_size=1_000, max_file_size=1_000)
+    with tempfile.TemporaryDirectory() as dest_str:
+        result = extract_tar(bz2_archive, Path(dest_str), limits=limits)
+    assert result.file_count == 1
+    assert result.total_bytes == small_size
+
+
+def test_xz_decompression_bomb_exceeding_cap_raises_size_limit() -> None:
+    """An xz-compressed tar whose member.size exceeds max_total_size raises EXTRACT-SIZE-LIMIT.
+
+    SA-1 guard (R16): lockstep with the gzip and bz2 bomb tests — same
+    observable slug (EXTRACT-SIZE-LIMIT) from the same per-entry size check
+    path in extract_tar, regardless of outer compression.
+    """
+    bomb_size = 5_000  # bytes declared in tar header (uncompressed)
+    xz_archive = _make_xz_compressible_tar(bomb_size)
+    limits = Limits(max_total_size=100, max_file_size=10_000)
+    with tempfile.TemporaryDirectory() as dest_str:
+        with pytest.raises(MilpaError) as exc_info:
+            extract_tar(xz_archive, Path(dest_str), limits=limits)
+    assert exc_info.value.slug == EXTRACT_SIZE_LIMIT
+
+
+def test_xz_decompression_within_cap_succeeds() -> None:
+    """An xz tar whose member.size is within max_total_size extracts normally."""
+    small_size = 50
+    xz_archive = _make_xz_compressible_tar(small_size)
+    limits = Limits(max_total_size=1_000, max_file_size=1_000)
+    with tempfile.TemporaryDirectory() as dest_str:
+        result = extract_tar(xz_archive, Path(dest_str), limits=limits)
+    assert result.file_count == 1
+    assert result.total_bytes == small_size

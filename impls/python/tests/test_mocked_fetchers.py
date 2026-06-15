@@ -424,6 +424,33 @@ class TestMockedTarballFetcher:
         assert key.endswith("@"), f"tarball key {key!r} must end with '@'"
         assert (mocked_dir / key).is_dir()
 
+    def test_pin_uppercase_bare_hex_matches(self, tmp_path: Path) -> None:
+        """UPPERCASE expected_sha256 must match the lowercase fixture archive_sha256."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        _make_tarball_fixture(mocked_dir, self.URL, self.ARCHIVE_SHA)
+        fetcher = self._fetcher(mocked_dir)
+        prov = TarballProvenance(url=self.URL, expected_sha256=self.ARCHIVE_SHA.upper())
+        dest = tmp_path / "_deps" / "pkg"
+
+        receipt = fetcher.fetch("pkg", prov, dest=dest)
+        assert receipt.archive_sha256 == self.ARCHIVE_SHA
+
+    def test_pin_uppercase_prefixed_matches(self, tmp_path: Path) -> None:
+        """sha256:<UPPERCASE-HEX> expected form must match the lowercase fixture sha256."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        _make_tarball_fixture(mocked_dir, self.URL, self.ARCHIVE_SHA)
+        fetcher = self._fetcher(mocked_dir)
+        prov = TarballProvenance(
+            url=self.URL,
+            expected_sha256=f"sha256:{self.ARCHIVE_SHA.upper()}",
+        )
+        dest = tmp_path / "_deps" / "pkg"
+
+        receipt = fetcher.fetch("pkg", prov, dest=dest)
+        assert receipt.archive_sha256 == self.ARCHIVE_SHA
+
 
 # ---------------------------------------------------------------------------
 # MockedLocalFetcher

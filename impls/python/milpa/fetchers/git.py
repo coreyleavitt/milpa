@@ -109,27 +109,33 @@ class GitFetcher(Fetcher):
         assert isinstance(p, GitProvenance)
 
         # --- clone --------------------------------------------------------
+        # R5: use --end-of-options before the URL so a URL starting with '-'
+        # cannot be misinterpreted as an option flag (git clone >= 2.24).
         _run_git(
             name,
             p,
-            ["git", "clone", "-q", p.url, str(dest)],
+            ["git", "clone", "-q", "--end-of-options", p.url, str(dest)],
         )
 
         # --- checkout / pin -----------------------------------------------
         if p.commit_sha is not None:
             # Exact-commit pin: ensure the commit is present then check it out.
             _ensure_commit_present(name, p, dest)
+            # R5: --end-of-options before commit_sha so a SHA starting with '-'
+            # is not parsed as an option flag (git checkout >= 2.24).
             _run_git(
                 name,
                 p,
-                ["git", "-C", str(dest), "checkout", "-q", p.commit_sha],
+                ["git", "-C", str(dest), "checkout", "-q", "--end-of-options", p.commit_sha],
             )
         else:
             # Mutable-ref tip: check out the declared ref.
+            # R5: --end-of-options before ref so a ref like '-evil' or '--detach'
+            # is treated as a ref name, not a flag (git checkout >= 2.24).
             _run_git(
                 name,
                 p,
-                ["git", "-C", str(dest), "checkout", "-q", p.ref],
+                ["git", "-C", str(dest), "checkout", "-q", "--end-of-options", p.ref],
             )
 
         return GitReceipt(commit_sha=_git_head_sha(dest))
@@ -140,9 +146,26 @@ class GitFetcher(Fetcher):
 # ---------------------------------------------------------------------------
 
 
+_GIT_TRANSPORT_FLAGS: list[str] = [
+    # spec/identity.md §1.7 NORMATIVE MUST: inject these into every git invocation
+    # that materialises or checks out content so the host git config cannot perturb
+    # the byte stream or the resulting identity hash regardless of OS/user settings.
+    "-c", "core.autocrlf=false",
+    "-c", "core.filemode=false",
+]
+
+
 def _run_git(name: str, p: GitProvenance, argv: list[str]) -> None:
-    """Run a git subprocess; raise ``MilpaError(FETCH_GIT_FAILED)`` on non-zero exit."""
-    result = subprocess.run(argv, capture_output=True, text=True)
+    """Run a git subprocess; raise ``MilpaError(FETCH_GIT_FAILED)`` on non-zero exit.
+
+    The first two positional args after ``git`` receive the transport flags
+    (``-c core.autocrlf=false -c core.filemode=false``) so host config cannot
+    perturb the materialized bytes or identity hash (spec/identity.md §1.7).
+    """
+    # Insert transport flags immediately after the leading ``git`` token,
+    # preserving any ``-C <dir>`` global-option that may follow.
+    patched = [argv[0]] + _GIT_TRANSPORT_FLAGS + argv[1:]
+    result = subprocess.run(patched, capture_output=True, text=True)
     if result.returncode != 0:
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()
@@ -180,8 +203,12 @@ def _ensure_commit_present(name: str, p: GitProvenance, dest: Path) -> None:
     assert p.commit_sha is not None
 
     # Step 1: cheap local presence check.
+    # R5: cat-file -e uses the SHA in an ^{commit} suffix — the object arg is
+    # not a bare operand that could be parsed as a flag, but we use
+    # --end-of-options for consistency and future-proofing.
     have = subprocess.run(
-        ["git", "-C", str(dest), "cat-file", "-e", f"{p.commit_sha}^{{commit}}"],
+        ["git", "-C", str(dest), "cat-file", "-e",
+         "--end-of-options", f"{p.commit_sha}^{{commit}}"],
         capture_output=True,
         text=True,
     )
@@ -189,8 +216,10 @@ def _ensure_commit_present(name: str, p: GitProvenance, dest: Path) -> None:
         return
 
     # Step 2: targeted fetch (server-side reachable SHA support).
+    # R5: --end-of-options before the SHA refspec.
     targeted = subprocess.run(
-        ["git", "-C", str(dest), "fetch", "-q", "origin", p.commit_sha],
+        ["git", "-C", str(dest), "fetch", "-q", "origin",
+         "--end-of-options", p.commit_sha],
         capture_output=True,
         text=True,
     )
@@ -211,7 +240,8 @@ def _ensure_commit_present(name: str, p: GitProvenance, dest: Path) -> None:
 
     # Step 4: re-check after full history fetch.
     recheck = subprocess.run(
-        ["git", "-C", str(dest), "cat-file", "-e", f"{p.commit_sha}^{{commit}}"],
+        ["git", "-C", str(dest), "cat-file", "-e",
+         "--end-of-options", f"{p.commit_sha}^{{commit}}"],
         capture_output=True,
         text=True,
     )
