@@ -8,6 +8,7 @@ dep "extra" {
     src_dir "src"
     requires
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/example/extra.git"
         ref "v1.0.0"
@@ -22,6 +23,7 @@ dep "foo" {
     requires "extra"
     cond-require "extra" platform="linux"
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/example/foo.git"
         ref "main"

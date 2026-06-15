@@ -8,6 +8,7 @@ dep "libfoo" {
     src_dir ""
     requires
     provenance {
+        origin "observed"
         kind "member"
         name "libfoo"
     }

@@ -8,6 +8,7 @@ dep "libbar" {
     src_dir ""
     requires
     provenance {
+        origin "observed"
         kind "member"
         name "libbar"
     }
@@ -18,6 +19,7 @@ dep "libfoo" {
     src_dir ""
     requires
     provenance {
+        origin "observed"
         kind "member"
         name "libfoo"
     }

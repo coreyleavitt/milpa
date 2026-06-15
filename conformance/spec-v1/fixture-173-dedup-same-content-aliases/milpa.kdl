@@ -1,0 +1,6 @@
+name "testapp"
+kind "application"
+deps {
+    foo git=(url)"https://example.com/foo.git" ref="main"
+    bar git=(url)"https://example.com/bar.git" ref="main"
+}

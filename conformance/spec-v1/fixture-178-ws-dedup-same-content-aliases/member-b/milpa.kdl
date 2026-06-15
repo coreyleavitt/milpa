@@ -1,0 +1,6 @@
+name "pkg-b"
+kind "library"
+src_dir "src"
+deps {
+    bar git=(url)"https://example.com/bar.git" ref="main"
+}

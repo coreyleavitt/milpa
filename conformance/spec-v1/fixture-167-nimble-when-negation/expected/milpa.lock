@@ -8,6 +8,7 @@ dep "extra_a" {
     src_dir "src"
     requires
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/example/extra_a.git"
         ref "v1.0.0"
@@ -21,6 +22,7 @@ dep "extra_b" {
     src_dir "src"
     requires
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/example/extra_b.git"
         ref "v1.0.0"
@@ -34,6 +36,7 @@ dep "extra_c" {
     src_dir "src"
     requires
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/example/extra_c.git"
         ref "v1.0.0"
@@ -56,6 +59,7 @@ dep "foo" {
         when platform=(not)"macosx"
     }
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/example/foo.git"
         ref "main"

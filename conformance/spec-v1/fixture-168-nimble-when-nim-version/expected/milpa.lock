@@ -12,6 +12,7 @@ dep "foo" {
         when nim="<2.0.0"
     }
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/example/foo.git"
         ref "main"
@@ -25,6 +26,7 @@ dep "nimcompat" {
     src_dir "src"
     requires
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/example/nimcompat.git"
         ref "v1.0.0"

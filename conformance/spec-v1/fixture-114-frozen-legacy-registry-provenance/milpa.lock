@@ -8,6 +8,7 @@ dep "foo" {
     src_dir ""
     requires
     provenance {
+        origin "observed"
         kind "registry"
         name "foo"
         tag "v1.0.0"

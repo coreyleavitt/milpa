@@ -8,6 +8,7 @@ dep "alpha" {
     src_dir ""
     requires
     provenance {
+        origin "observed"
         kind "git"
         url "https://example.com/alpha.git"
         ref "main"
@@ -21,6 +22,7 @@ dep "beta" {
     src_dir ""
     requires
     provenance {
+        origin "observed"
         kind "git"
         url "https://example.com/beta.git"
         ref "v1"

@@ -8,6 +8,7 @@ dep "bar" {
     src_dir ""
     requires
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/example/bar.git"
         ref "v1.0.0"

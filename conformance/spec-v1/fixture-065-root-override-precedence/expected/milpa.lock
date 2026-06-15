@@ -8,6 +8,7 @@ dep "shared" {
     src_dir "src"
     requires
     provenance {
+        origin "observed"
         kind "git"
         url "https://our-fork.example.com/shared.git"
         ref "main"
@@ -21,6 +22,7 @@ dep "translib" {
     src_dir "src"
     requires "shared"
     provenance {
+        origin "observed"
         kind "git"
         url "https://example.com/translib.git"
         ref "main"

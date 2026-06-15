@@ -8,6 +8,7 @@ dep "depx" {
     src_dir "src"
     requires
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/example/depx.git"
         ref "v1.0.0"
@@ -21,6 +22,7 @@ dep "depy" {
     src_dir "src"
     requires
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/example/depy.git"
         ref "v1.0.0"
@@ -36,6 +38,7 @@ dep "foo" {
     cond-require "depx" platform="linux"
     cond-require "depy" platform="linux"
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/example/foo.git"
         ref "main"

@@ -1,0 +1,6 @@
+name "myapp"
+kind "application"
+deps {
+    dep-git git=(url)"https://example.com/shared.git" ref="main"
+    dep-tarball tarball=(url)"https://example.com/shared.tar.gz"
+}

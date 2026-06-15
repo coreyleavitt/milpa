@@ -8,6 +8,7 @@ dep "bar" {
     src_dir "src"
     requires
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/example/bar.git"
         ref "v1.0.0"
@@ -23,6 +24,7 @@ dep "foo" {
     cond-require "bar" platform="linux"
     cond-require "bar" platform="macosx"
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/example/foo.git"
         ref "main"

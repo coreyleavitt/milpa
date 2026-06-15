@@ -1,0 +1,3 @@
+name "myapp"
+kind "application"
+src_dir "src"

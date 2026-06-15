@@ -9,6 +9,7 @@ dep "bar" {
     requires
     dep_decl "sha256:8c2f20b957c5a16fe803caa5b0d3d4997b500549cae95d5716ded986d1c5ed22"
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/example/bar.git"
         ref "v2.0.0"
@@ -22,6 +23,7 @@ dep "qux" {
     src_dir "src"
     requires "bar"
     provenance {
+        origin "observed"
         kind "git"
         url "https://github.com/example/qux.git"
         ref "v1.0.0"
