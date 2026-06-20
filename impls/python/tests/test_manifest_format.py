@@ -946,19 +946,26 @@ class TestConditionalDepRoundTrip:
         assert d.predicates[0].name == "platform"
         assert d.predicates[0].values == ("linux",)
 
-    def test_member_dep_with_platform_predicate_round_trips(self) -> None:
+    def test_member_dep_with_platform_predicate_parse_error(self) -> None:
+        """S1b: MemberDep with predicates formats into a when-gated member node,
+        which is a parse-time category error (MAN-MEMBER-WHEN-GATED).
+
+        The data model allows constructing a MemberDep with predicates (for
+        internal consistency), but the parser rejects any member inside a when
+        block.  format_manifest still emits the when-wrapped form; round-tripping
+        through the parser raises MAN-MEMBER-WHEN-GATED rather than succeeding.
+        """
+        from milpa.errors import MAN_MEMBER_WHEN_GATED, MilpaError
+
         dep = MemberDep(
             name="submember",
             predicates=(Predicate(name="platform", values=("linux",), negated=False),),
         )
         m = Manifest(name="pkg", deps=(dep,))
-        reparsed = parse_manifest(format_manifest(m))
-        d = reparsed.deps[0]
-        assert isinstance(d, MemberDep)
-        assert d.name == "submember"
-        assert len(d.predicates) == 1
-        assert d.predicates[0].name == "platform"
-        assert d.predicates[0].values == ("linux",)
+        formatted = format_manifest(m)
+        with pytest.raises(MilpaError) as exc_info:
+            parse_manifest(formatted)
+        assert exc_info.value.slug == MAN_MEMBER_WHEN_GATED
 
     def test_negated_predicate_survives_round_trip_local_dep(self) -> None:
         dep = LocalDep(
@@ -1077,8 +1084,12 @@ def _predicate_strategy(draw: st.DrawFn) -> Predicate:
 
 
 @st.composite
-def _conditional_dep(draw: st.DrawFn) -> "LocalDep | TarballDep | MemberDep":
-    """Generate one of LocalDep/TarballDep/MemberDep with 1..3 unique-name predicates.
+def _conditional_dep(draw: st.DrawFn) -> "LocalDep | TarballDep":
+    """Generate one of LocalDep/TarballDep with 1..3 unique-name predicates.
+
+    MemberDep is excluded: S1b makes a member inside a when block a parse-time
+    category error (MAN-MEMBER-WHEN-GATED) — members are unconditional workspace
+    topology and predicates on them are structurally forbidden.
 
     Predicates must have unique names: KDL §5.5 last-wins means duplicate
     property keys on a `when` node would be deduplicated at parse time, so the
@@ -1104,23 +1115,20 @@ def _conditional_dep(draw: st.DrawFn) -> "LocalDep | TarballDep | MemberDep":
         for pname in pred_names
     )
     name = draw(_DEP_NAME)
-    form = draw(st.integers(min_value=0, max_value=2))
-    if form == 0:
+    if draw(st.booleans()):
         return LocalDep(name=name, path=draw(_PATH_ALPHA), predicates=preds)
-    elif form == 1:
+    else:
         return TarballDep(
             name=name,
             url=draw(_TARBALL_URL),
             predicates=preds,
         )
-    else:
-        return MemberDep(name=name, predicates=preds)
 
 
 @given(dep=_conditional_dep())
 @settings(max_examples=150)
 def test_conditional_dep_predicates_survive_round_trip(
-    dep: "LocalDep | TarballDep | MemberDep",
+    dep: "LocalDep | TarballDep",
 ) -> None:
     """parse(format(parse(src))) == parse(src): predicates survive for non-URL dep forms.
 

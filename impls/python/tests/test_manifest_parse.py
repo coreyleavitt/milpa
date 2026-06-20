@@ -591,6 +591,30 @@ class TestMemberDepParse:
         text = 'name "x"\ndeps {\n    member "a" "b"\n}\n'
         assert_slug(text, E.MAN_DEP_MEMBER_ARITY)
 
+    def test_member_dep_when_gated_raises_man_member_when_gated(self) -> None:
+        """S1b: a member node inside a when block is a parse-time category error.
+
+        Members are workspace topology — unconditionally present in every
+        resolution — so a `when`-gated member is structurally contradictory.
+        Parser MUST raise MAN-MEMBER-WHEN-GATED rather than silently accepting
+        or dropping the predicate.
+        """
+        text = textwrap.dedent("""\
+            name "x"
+            deps {
+                when platform="linux" {
+                    member "intonaco"
+                }
+            }
+        """)
+        assert_slug(text, E.MAN_MEMBER_WHEN_GATED)
+
+    def test_member_dep_when_gated_corpus(self) -> None:
+        """Corpus fixture: MAN-MEMBER-WHEN-GATED (member inside when block)."""
+        text = fixture_kdl("fixture-190-man-member-when-gated")
+        expected = fixture_error("fixture-190-man-member-when-gated")
+        assert_slug(text, expected)
+
 
 # ---------------------------------------------------------------------------
 # Top-level manifest errors (covered here as they're needed for full fixture

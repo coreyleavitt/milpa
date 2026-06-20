@@ -721,6 +721,14 @@ The manifest file is not valid KDL.
 
 **Triggered:** cmd_add_mirror finds the locked dep's provenance is local or member; a mirror would contradict the editable, mutable-by-design source.
 
+### `MAN-MEMBER-WHEN-GATED`
+
+A `member` dep node is declared inside a `when { … }` block, which is a category error. Workspace members are unconditional topology — every member is present in every resolution regardless of platform, arch, or flag predicates. Placing a `member` inside a `when` block either silently drops the predicates (producing an unconditional member, contradicting the author's apparent intent) or silently honors them (breaking the workspace invariant that every member is always resolved). The parser MUST reject this form rather than silently doing either.
+
+**Triggered:** The manifest parser encounters a `member` node as a direct child of a `when` block inside a `deps` or `dev-deps` section. Raised at parse time before any resolution occurs.
+
+**Fix:** Move the `member` declaration outside the `when` block. If conditional membership is intended, use a workspace-level mechanism rather than a dep-level predicate.
+
 ### `MAN-MIRRORS-ARITY`
 
 Top-level `mirror` takes exactly one positional URL argument.

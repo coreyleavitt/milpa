@@ -1,0 +1,6 @@
+name "x"
+deps {
+    when platform="linux" {
+        member "intonaco"
+    }
+}

@@ -546,7 +546,11 @@ mod tests {
     }
 
     #[test]
-    fn member_dep_with_predicate_round_trips() {
+    fn member_dep_with_predicate_parse_error() {
+        // S1b: MemberDep with predicates formats into a when-gated member node,
+        // which is a parse-time category error (MAN-MEMBER-WHEN-GATED).
+        // The formatter still emits the when-wrapped form; re-parsing raises the
+        // new error rather than succeeding.
         let mut m = base();
         m.deps = vec![Dep::Member(crate::MemberDep {
             name: "submember".into(),
@@ -555,15 +559,8 @@ mod tests {
         let text = format_manifest(&m);
         assert!(text.contains("when"), "expected when-block in:\n{text}");
         assert!(text.contains("member \"submember\""), "expected member node in:\n{text}");
-        let reparsed = pkg(&text);
-        assert_eq!(reparsed.deps.len(), 1);
-        let dep = match &reparsed.deps[0] {
-            Dep::Member(mem) => mem,
-            other => panic!("expected Member dep, got {other:?}"),
-        };
-        assert_eq!(dep.name, "submember");
-        assert_eq!(dep.predicates.len(), 1);
-        assert_eq!(dep.predicates[0].name, "platform");
+        let err = crate::parse_manifest(&text).unwrap_err();
+        assert_eq!(err.code(), "MAN-MEMBER-WHEN-GATED");
     }
 
     #[test]

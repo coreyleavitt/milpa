@@ -392,6 +392,7 @@ const MAN_CODES: &[&str] = &[
     "MAN-DEP-TARBALL-STRIP",
     "MAN-DEP-MEMBER-PROPS",
     "MAN-DEP-MEMBER-ARITY",
+    "MAN-MEMBER-WHEN-GATED",
     "MAN-DEP-NAMED-PROPS",
     "MAN-DEP-NAMED-CONSTRAINT",
     "MAN-DEP-NAMED-ARITY",
@@ -1347,12 +1348,25 @@ fn expand_dep_child(child: &KdlNode, inherited: &[Predicate]) -> Result<Vec<Dep>
         }
         return Ok(out);
     }
+    // S1b: reject a `member` node nested inside a `when` block.
+    // Members are unconditional workspace topology — their presence cannot be
+    // conditional on platform, arch, flags, or any other predicate.  Silently
+    // dropping or honoring the predicates would violate user intent; reject at
+    // parse time with MAN-MEMBER-WHEN-GATED instead.
+    if !inherited.is_empty() && child.name().value() == "member" {
+        return Err(err(
+            "MAN-MEMBER-WHEN-GATED",
+            "'member' dep cannot be placed inside a 'when' block — workspace \
+             members are unconditional topology present in every resolution; \
+             move the 'member' declaration outside the 'when' block",
+        ));
+    }
     let mut dep = parse_dep(child)?;
     if !inherited.is_empty() {
-        // Thread inherited when-block predicates into all five dep forms.
-        // §6.3 NORMATIVE: all five forms (UrlDep, NamedDep, LocalDep, TarballDep,
-        // MemberDep) support when-conditional syntax.  Inherited predicates are
-        // prepended (outer predicates come first; dep's own predicates follow).
+        // Thread inherited when-block predicates into the four dep forms that
+        // support when-conditional syntax.
+        // §6.3 NORMATIVE: UrlDep, NamedDep, LocalDep, TarballDep support
+        // when-conditional syntax.  MemberDep is rejected above.
         match dep {
             Dep::Url(ref mut u) => {
                 let mut merged = inherited.to_vec();
@@ -1374,10 +1388,9 @@ fn expand_dep_child(child: &KdlNode, inherited: &[Predicate]) -> Result<Vec<Dep>
                 merged.append(&mut t.predicates);
                 t.predicates = merged;
             }
-            Dep::Member(ref mut m) => {
-                let mut merged = inherited.to_vec();
-                merged.append(&mut m.predicates);
-                m.predicates = merged;
+            Dep::Member(_) => {
+                // Unreachable: member inside a when block is rejected above.
+                unreachable!("MAN-MEMBER-WHEN-GATED should have been raised");
             }
         }
     }

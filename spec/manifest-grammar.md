@@ -851,6 +851,14 @@ when platform="linux" {
 > Each dep declared inside the `when` block inherits those predicates, combined
 > with AND semantics with any predicates already on the dep itself.
 
+> NORMATIVE: A `member` dep node MUST NOT appear inside a `when` block.
+> Workspace members are unconditional topology — they are present in every
+> resolution regardless of platform, arch, nim version, or flag predicates.
+> A `member` inside a `when` block is a category error; the parser MUST raise
+> `MAN-MEMBER-WHEN-GATED` rather than silently accepting or dropping the
+> predicates. The four dep forms that DO support `when`-conditional syntax are:
+> UrlDep, NamedDep, LocalDep, and TarballDep.
+
 > NOTE: `when` blocks and inline predicates compose with AND: a dep must
 > satisfy ALL predicates from outer `when` blocks AND its own inline/child
 > predicates to be included.

@@ -87,6 +87,7 @@ from milpa.errors import (
     MAN_GIT_URL_NO_SCHEME,
     MAN_KIND_ARITY,
     MAN_KIND_INVALID,
+    MAN_MEMBER_WHEN_GATED,
     MAN_MIRRORS_ARITY,
     MAN_MIRRORS_UNKNOWN_CHILD,
     MAN_NAME_DUPLICATE,
@@ -2291,6 +2292,17 @@ def _parse_member_dep(
     ``outer_predicates`` are inherited predicates from an enclosing ``when``
     block (§6.3); they are stored on the MemberDep for filter-before-solve.
     """
+    # S1b: members are unconditional workspace topology — a `member` inside a
+    # `when` block is a category error.  Reject at parse time rather than
+    # silently dropping or silently honoring the enclosing predicates.
+    if outer_predicates:
+        raise MilpaError(
+            MAN_MEMBER_WHEN_GATED,
+            "'member' dep cannot be placed inside a 'when' block — workspace "
+            "members are unconditional topology present in every resolution; "
+            "move the 'member' declaration outside the 'when' block",
+        )
+
     props = node_props(n)
     if props:
         first_prop = next(iter(props))
