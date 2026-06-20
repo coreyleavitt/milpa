@@ -1,0 +1,16 @@
+// fixture-256: S4 (#159) — partial profile, NEGATED predicate over absent axis → dep excluded
+//
+// A partial profile has MILPA_TARGET_PLATFORM=linux but NO MILPA_TARGET_ARCH.
+// Member `member-a` declares a dep `archlib` gated on `when arch=(not)"arm64"`.
+//
+// Without the fix (Rust pre-S4): `any_match=false` for absent axis, then
+// `!false = true` → dep INCORRECTLY INCLUDED.
+//
+// After the fix (both impls): absent axis is indeterminate ⇒ false for BOTH
+// positive and negated predicates (resolver-semantics §3.C / §6).
+//
+// This is the NEGATED-predicate case and the cross-impl divergence guard.
+// The positive-predicate case is in fixture-255.
+workspace {
+    member "member-a"
+}

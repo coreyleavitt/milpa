@@ -1,0 +1,7 @@
+name "member-a"
+kind "library"
+deps {
+    when arch="amd64" {
+        archlib git=(url)"https://example.com/archlib.git" ref="main"
+    }
+}

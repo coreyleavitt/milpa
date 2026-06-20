@@ -258,9 +258,17 @@ def _fixture_profile(fixture_dir: Path) -> Profile | None:
     if not _PROFILE_TARGET_KEYS.intersection(env_vars):
         return None
 
-    return Profile.from_environment(
-        nim_version=env_vars.get("MILPA_TARGET_NIM"),
-        milpa_version=env_vars.get("MILPA_TARGET_MILPA", "0.0.0"),
+    # Use Profile.partial(...) so that only axes explicitly set in the fixture's
+    # env file are non-None.  This mirrors the Rust runner (runner.rs:891-914)
+    # which builds Profile { platform: Option<String>, … } directly from the env
+    # vars — missing axes remain None (partial profile semantics, §3.C).
+    # Profile.from_environment() must NOT be used here because it host-defaults
+    # every absent axis, making partial-profile fixtures host-dependent.
+    return Profile.partial(
+        platform=env_vars.get("MILPA_TARGET_PLATFORM") or None,
+        arch=env_vars.get("MILPA_TARGET_ARCH") or None,
+        nim=env_vars.get("MILPA_TARGET_NIM") or None,
+        milpa=env_vars.get("MILPA_TARGET_MILPA") or None,
     )
 
 

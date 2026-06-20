@@ -478,6 +478,27 @@ error `MAN-PREDICATE-MIXED-NEGATION`) is defined in
 > CLI-only behavior (cli-contract §8) not exercised by the host-independent
 > corpus. See `conformance-fixtures.md` §2.8.)
 
+> NORMATIVE (§3.C — S4, #159): **Absent-axis predicate semantics.** A
+> profile MAY be **partial** — one or more of its axes (`platform`, `arch`,
+> `nim`, `milpa`) may be absent (None/null) while the profile as a whole is
+> present (i.e., at least one axis is set, so §470 "absent profile ⇒ passthrough"
+> does NOT apply). An absent axis is **indeterminate**: every predicate over
+> that axis MUST evaluate to `false` regardless of the predicate's negation.
+> Concretely:
+>
+> - `when arch="amd64"` with `arch=None` → `false` (dep excluded).
+> - `when arch=(not)"arm64"` with `arch=None` → `false` (dep excluded).
+>
+> Rationale: if we cannot evaluate whether the dep applies to this target
+> axis, we cannot deterministically include it (conservative three-valued
+> collapse). This is distinct from an absent *whole* profile — the CLI
+> host-defaults every axis (cli-contract §8), so a partial profile only
+> arises in the conformance runner and library API, never the default CLI
+> path. Implementations MUST NOT flip the negation after an absent-axis
+> short-circuit (i.e., absent-axis ⇒ `!false = true` is non-conformant).
+> Conformance fixtures: `fixture-255` (positive) and `fixture-256`
+> (negated, the cross-impl divergence guard).
+
 > NORMATIVE: Evaluation order within a single dep's predicate list is
 > conjunction: ALL predicates on a dep must match. Evaluation across
 > values within one predicate is disjunction (OR semantics): the

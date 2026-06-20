@@ -3585,6 +3585,19 @@ pub fn filter_manifest(manifest: &Manifest, ctx: &FilterCtx) -> Manifest {
 /// Called exclusively from the profile gate in [`filter_manifest`].
 /// Callers MUST NOT pass flag predicates here (Depth-F7).
 fn predicate_satisfied_profile_only(pred: &Predicate, profile: &Profile) -> bool {
+    // §3.C / §6: an absent axis is indeterminate → the predicate evaluates to false
+    // regardless of negation.  Check for absence BEFORE applying negation so that
+    // `when arch != "arm64"` with arch=None yields false, not true.
+    let axis_present = match pred.name.as_str() {
+        "platform" => profile.platform.is_some(),
+        "arch" => profile.arch.is_some(),
+        "nim" => profile.nim_version.is_some(),
+        "milpa" => profile.milpa_version.is_some(),
+        _ => false, // Unknown axis (e.g., "flag" — should never reach here)
+    };
+    if !axis_present {
+        return false;
+    }
     let any_match = match pred.name.as_str() {
         "platform" => match &profile.platform {
             Some(actual) => pred.values.iter().any(|v| v == actual),
@@ -3602,7 +3615,6 @@ fn predicate_satisfied_profile_only(pred: &Predicate, profile: &Profile) -> bool
             Some(actual) => pred.values.iter().any(|v| version_satisfies(actual, v)),
             None => false,
         },
-        // Unknown axis (e.g., "flag" — should never reach here, "os", etc.) → false.
         _ => false,
     };
     if pred.negated { !any_match } else { any_match }
@@ -3628,6 +3640,22 @@ fn dep_matches_profile(dep: &Dep, profile: &Profile) -> bool {
 }
 
 fn predicate_satisfied(pred: &Predicate, profile: &Profile) -> bool {
+    // §3.C / §6: an absent axis is indeterminate → the predicate evaluates to false
+    // regardless of negation.  Check for absence BEFORE applying negation so that
+    // `when arch != "arm64"` with arch=None yields false, not true.
+    // (Flag predicates are never "absent" — an empty flag set means no flag is active,
+    // which is handled below as any_match=false with negated=false ⟹ false.)
+    let axis_present = match pred.name.as_str() {
+        "flag" => true, // flags are always "present" (an empty set is valid)
+        "platform" => profile.platform.is_some(),
+        "arch" => profile.arch.is_some(),
+        "nim" => profile.nim_version.is_some(),
+        "milpa" => profile.milpa_version.is_some(),
+        _ => false,
+    };
+    if !axis_present {
+        return false;
+    }
     let any_match = match pred.name.as_str() {
         "flag" => pred.values.iter().any(|v| profile.flags.contains(v)),
         // platform / arch are plain string-equality axes (Nim's hostOS / hostCPU

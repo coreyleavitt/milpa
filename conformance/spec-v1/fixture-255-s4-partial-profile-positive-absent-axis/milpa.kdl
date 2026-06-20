@@ -1,0 +1,13 @@
+// fixture-255: S4 (#159) — partial profile, positive predicate over absent axis → dep excluded
+//
+// A partial profile has MILPA_TARGET_PLATFORM=linux but NO MILPA_TARGET_ARCH.
+// Member `member-a` declares a dep `archlib` gated on `when arch="amd64"`.
+//
+// Since `arch` is absent (the axis is None in the partial profile), the
+// predicate is indeterminate ⇒ excluded (resolver-semantics §3.C / §6).
+//
+// This is the positive-predicate case of the absent-axis rule (#159).
+// The negated-predicate case is in fixture-256.
+workspace {
+    member "member-a"
+}

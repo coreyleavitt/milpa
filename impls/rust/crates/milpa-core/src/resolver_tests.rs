@@ -1338,6 +1338,105 @@ fn resolve_profile_includes_platform_match() {
     assert_eq!(graph.deps[0].name, "linuxonly");
 }
 
+/// S4 / §3.C — a NEGATED predicate over an ABSENT axis must EXCLUDE the dep.
+///
+/// `when arch != "arm64"` with `arch=None` is indeterminate ⇒ false, NOT true.
+/// Before the fix, `any_match=false` for absent axis, then `!false = true` ⟹ dep included.
+/// After the fix, absent axis short-circuits to `false` regardless of `negated`.
+#[test]
+fn resolve_partial_profile_negated_absent_axis_excludes() {
+    let reg = FakeReg::default(); // dep must not be fetched
+    let tmp = tempfile::tempdir().unwrap();
+    let dep = Dep::Url(UrlDep {
+        name: "archlib".into(),
+        git: "https://github.com/example/archlib.git".into(),
+        git_ref: "main".into(),
+        mirrors: Vec::new(),
+        predicates: vec![Predicate {
+            name: "arch".into(),
+            values: vec!["arm64".into()],
+            negated: true, // `when arch != "arm64"` — true on amd64, but arch is absent
+        }],
+        flag_requests: Vec::new(),
+        optional: false,
+    });
+    let m = manifest(vec![dep]);
+    // Partial profile: platform known, arch absent.
+    let profile = Profile {
+        platform: Some("linux".into()),
+        arch: None, // absent axis
+        nim_version: None,
+        milpa_version: None,
+        flags: Vec::new(),
+    };
+    let graph = resolve(
+        &m,
+        None,
+        &reg,
+        Some(&profile),
+        None,
+        Strategy::Maxver,
+        &deps_dir(&tmp),
+        None,
+        false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+    // Absent axis ⇒ indeterminate ⇒ excluded regardless of negation (§3.C / §6).
+    assert!(
+        graph.deps.is_empty(),
+        "negated predicate over absent axis must EXCLUDE the dep, not include it"
+    );
+    assert!(reg.calls().is_empty(), "excluded dep must never be fetched");
+}
+
+/// S4 / §3.C — a POSITIVE predicate over an ABSENT axis also EXCLUDES the dep.
+/// (This already worked before S4; verifying it stays correct after the fix.)
+#[test]
+fn resolve_partial_profile_positive_absent_axis_excludes() {
+    let reg = FakeReg::default();
+    let tmp = tempfile::tempdir().unwrap();
+    let dep = Dep::Url(UrlDep {
+        name: "amdlib".into(),
+        git: "https://github.com/example/amdlib.git".into(),
+        git_ref: "main".into(),
+        mirrors: Vec::new(),
+        predicates: vec![Predicate {
+            name: "arch".into(),
+            values: vec!["amd64".into()],
+            negated: false, // `when arch == "amd64"` — arch is absent
+        }],
+        flag_requests: Vec::new(),
+        optional: false,
+    });
+    let m = manifest(vec![dep]);
+    let profile = Profile {
+        platform: Some("linux".into()),
+        arch: None,
+        nim_version: None,
+        milpa_version: None,
+        flags: Vec::new(),
+    };
+    let graph = resolve(
+        &m,
+        None,
+        &reg,
+        Some(&profile),
+        None,
+        Strategy::Maxver,
+        &deps_dir(&tmp),
+        None,
+        false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+    assert!(
+        graph.deps.is_empty(),
+        "positive predicate over absent axis must EXCLUDE the dep"
+    );
+    assert!(reg.calls().is_empty());
+}
+
 /// Absent profile includes deps regardless of predicates (§6 absent-profile rule).
 #[test]
 fn resolve_absent_profile_includes_platform_gated_dep() {

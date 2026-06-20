@@ -294,7 +294,7 @@ class TestFilterManifestProfile:
     def test_platform_gated_dep_pruned_wrong_platform(self):
         from milpa.resolver import FilterContext, filter_manifest
         from milpa.profile import Profile
-        p = Profile(platform="windows", arch="amd64", nim="2.0.0", milpa="0.0.0")
+        p = Profile.partial(platform="windows", arch="amd64", nim="2.0.0", milpa="0.0.0")
         m = _make_manifest(
             url_deps_with_platform_pred=[("linuxonly", "linux")],
         )
@@ -306,7 +306,7 @@ class TestFilterManifestProfile:
     def test_platform_gated_dep_retained_right_platform(self):
         from milpa.resolver import FilterContext, filter_manifest
         from milpa.profile import Profile
-        p = Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.0.0")
+        p = Profile.partial(platform="linux", arch="amd64", nim="2.0.0", milpa="0.0.0")
         m = _make_manifest(
             url_deps_with_platform_pred=[("linuxonly", "linux")],
         )
@@ -442,7 +442,7 @@ class TestFilterManifestProfileSkipsFlagPredicates:
         """
         from milpa.resolver import FilterContext, filter_manifest
         from milpa.profile import Profile
-        p = Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.0.0")
+        p = Profile.partial(platform="linux", arch="amd64", nim="2.0.0", milpa="0.0.0")
         m = _make_manifest(
             flag_names=[("tls", False)],
             url_deps_with_flag_pred=[("tlslib", "tls")],
@@ -457,7 +457,7 @@ class TestFilterManifestProfileSkipsFlagPredicates:
         """Profile gate + active_flags has OTHER flag: flag-gated dep is pruned by flag gate."""
         from milpa.resolver import FilterContext, filter_manifest
         from milpa.profile import Profile
-        p = Profile(platform="linux", arch="amd64", nim="2.0.0", milpa="0.0.0")
+        p = Profile.partial(platform="linux", arch="amd64", nim="2.0.0", milpa="0.0.0")
         m = _make_manifest(
             flag_names=[("tls", False), ("other", False)],
             url_deps_with_flag_pred=[("tlslib", "tls")],
@@ -498,3 +498,140 @@ class TestFilterManifestDevDeps:
         result = filter_manifest(m, ctx)
         dev_names = {d.name for d in result.dev_deps}
         assert "tlsdev" in dev_names
+
+
+# ---------------------------------------------------------------------------
+# C12 — S4 (#159): Profile.partial + absent-axis predicate semantics (§3.C)
+# ---------------------------------------------------------------------------
+
+
+class TestProfilePartialConstructor:
+    """Profile.partial() builds a partial profile with None axes."""
+
+    def test_partial_all_none_by_default(self):
+        from milpa.profile import Profile
+        p = Profile.partial()
+        assert p.platform is None
+        assert p.arch is None
+        assert p.nim is None
+        assert p.milpa is None
+        assert p.flags == frozenset()
+
+    def test_partial_one_axis_set(self):
+        from milpa.profile import Profile
+        p = Profile.partial(platform="linux")
+        assert p.platform == "linux"
+        assert p.arch is None
+        assert p.nim is None
+        assert p.milpa is None
+
+    def test_partial_all_axes_set(self):
+        from milpa.profile import Profile
+        p = Profile.partial(platform="linux", arch="amd64", nim="2.0.0", milpa="0.1.0")
+        assert p.platform == "linux"
+        assert p.arch == "amd64"
+        assert p.nim == "2.0.0"
+        assert p.milpa == "0.1.0"
+
+    def test_partial_flags_propagated(self):
+        from milpa.profile import Profile
+        p = Profile.partial(platform="linux", flags=frozenset({"tls"}))
+        assert p.flags == frozenset({"tls"})
+
+    def test_from_environment_no_env_coupling(self):
+        """Profile.partial has no env-var coupling; Profile.from_environment does."""
+        from milpa.profile import Profile
+        import os
+        # from_environment defaults every axis from the host
+        p_env = Profile.from_environment()
+        assert p_env.platform is not None  # host-defaulted
+        assert p_env.arch is not None
+
+        # partial() leaves unset axes as None regardless of env
+        p_partial = Profile.partial(platform="linux")
+        assert p_partial.platform == "linux"
+        assert p_partial.arch is None
+
+
+class TestAbsentAxisPredicateSemantics:
+    """§3.C: absent axis ⇒ predicate evaluates to false for BOTH positive and negated forms."""
+
+    def test_positive_predicate_over_absent_axis_excludes(self):
+        """when arch == "amd64" with arch=None → dep excluded (§3.C)."""
+        from milpa.resolver import FilterContext, filter_manifest
+        from milpa.profile import Profile
+        # Partial profile: platform known, arch absent
+        p = Profile.partial(platform="linux")
+        m = _make_manifest(
+            url_deps_with_platform_pred=[],  # we need arch pred; use _make_manifest directly
+        )
+        # Build a manifest with an arch predicate via KDL
+        from milpa.manifest import parse_manifest
+        kdl = (
+            'name "mypkg"\nkind "library"\n'
+            'deps {\n'
+            '    when arch="amd64" {\n'
+            '        archlib git=(url)"https://example.com/archlib.git" ref="main"\n'
+            '    }\n'
+            '}\n'
+        )
+        m = parse_manifest(kdl)
+        ctx = FilterContext(profile=p, active_flags=frozenset())
+        result = filter_manifest(m, ctx)
+        names = {d.name for d in result.deps}
+        assert "archlib" not in names, (
+            "positive predicate over absent arch axis must exclude the dep"
+        )
+
+    def test_negated_predicate_over_absent_axis_excludes(self):
+        """when arch != "arm64" with arch=None → dep ALSO excluded (§3.C).
+
+        This is the load-bearing cross-impl divergence guard.  Python already
+        returned False for absent axes (the early return before negation check
+        in _predicate_satisfied_profile_only).  This test pins that it stays
+        correct after making the axes str | None.
+        """
+        from milpa.resolver import FilterContext, filter_manifest
+        from milpa.profile import Profile
+        from milpa.manifest import parse_manifest
+        # Partial profile: platform known, arch absent
+        p = Profile.partial(platform="linux")
+        # Dep gated on `when arch != "arm64"` — would be true on amd64,
+        # but arch is absent → indeterminate → excluded.
+        kdl = (
+            'name "mypkg"\nkind "library"\n'
+            'deps {\n'
+            '    when arch=(not)"arm64" {\n'
+            '        archlib git=(url)"https://example.com/archlib.git" ref="main"\n'
+            '    }\n'
+            '}\n'
+        )
+        m = parse_manifest(kdl)
+        ctx = FilterContext(profile=p, active_flags=frozenset())
+        result = filter_manifest(m, ctx)
+        names = {d.name for d in result.deps}
+        assert "archlib" not in names, (
+            "negated predicate over absent arch axis must also exclude the dep "
+            "(indeterminate ⇒ false, not true)"
+        )
+
+    def test_absent_whole_profile_is_passthrough(self):
+        """Absent *whole* profile (profile=None) → passthrough, not exclusion (§470)."""
+        from milpa.resolver import FilterContext, filter_manifest
+        from milpa.manifest import parse_manifest
+        kdl = (
+            'name "mypkg"\nkind "library"\n'
+            'deps {\n'
+            '    when arch=(not)"arm64" {\n'
+            '        archlib git=(url)"https://example.com/archlib.git" ref="main"\n'
+            '    }\n'
+            '}\n'
+        )
+        m = parse_manifest(kdl)
+        # profile=None → platform-filtering disabled entirely
+        ctx = FilterContext(profile=None, active_flags=frozenset())
+        result = filter_manifest(m, ctx)
+        names = {d.name for d in result.deps}
+        assert "archlib" in names, (
+            "absent *whole* profile must include all deps regardless of predicates (§470)"
+        )
