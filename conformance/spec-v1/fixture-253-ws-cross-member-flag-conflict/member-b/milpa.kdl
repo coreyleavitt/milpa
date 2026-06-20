@@ -1,0 +1,7 @@
+name "member-b"
+kind "library"
+deps {
+    lib-net git=(url)"https://example.com/lib-net.git" ref="main" {
+        flag "sync"
+    }
+}

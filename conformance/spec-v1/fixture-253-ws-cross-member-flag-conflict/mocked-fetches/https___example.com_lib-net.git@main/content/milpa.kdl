@@ -1,0 +1,12 @@
+name "lib-net"
+kind "library"
+flags {
+    async default=#false {
+        defines "asyncMode"
+        conflicts "sync"
+    }
+    sync default=#false {
+        defines "syncMode"
+        conflicts "async"
+    }
+}

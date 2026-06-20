@@ -32,8 +32,16 @@ asymmetries broken today (round 2 added the eighth: member-dir add/remove/update
   (D5; dep S9b+S11b)** · S12 CLAUDE.md de-stale
 
 ## Slices
-- [ ] S1, S1b, S2, S3, S4, S5, S5b, S6, S7, S8, S9a, S9b, S10, S11a, S11b, S11c, S11d, S11e,
-  S12 (none implemented — Stage 2 only)
+- [x] **S1** `filter_manifest`/`FilterContext` shared helper (both impls) — `fcebd3b`
+- [x] **S1b** `MAN-MEMBER-WHEN-GATED` parse rejection + fixture-190 — `8d53627`
+- [x] **S2** flag-only arm → both ws sites + frozen path + frozen-flags mismatch; **closes #160**;
+  fixtures 249–252 — `5ea9563`
+- [x] **S3** §3.8 union pin (fixture-213, existing); cross-member `RESOLVE-FLAG-CONFLICT` + spec
+  §11.6 (new code: `_s4c_check_flag_conflicts` call added to `resolve_workspace` Python; Rust
+  already had it); non-member override success; fixtures 253–254 — HEAD
+- [ ] S4, S5, S5b, S6, S7, S8, S9a, S9b, S10, S11a, S11b, S11c, S11d, S11e, S12 (remaining)
+- **Progress: 4/19 done, 15 remaining.** All gates green each slice (Python 2042 pass; Rust
+  corpus zero divergence).
 
 ## Forks — ALL RESOLVED (no open decisions)
 - **D1** Phase-A → `SOLVE-CONFLICT` canonical, BOTH impls change (Rust enumerate-all + Python

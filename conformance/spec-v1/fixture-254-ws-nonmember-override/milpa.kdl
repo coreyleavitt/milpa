@@ -1,0 +1,23 @@
+// fixture-254: S3 — workspace root overrides a member's transitive dep to a
+// non-member git URL (Breadth-P2b — corpus-untested resolver path).
+//
+// Scenario:
+//   workspace root declares:
+//     member "member-a"
+//     overrides { shared git=<our-org fork> ref="main" }
+//   member-a → translib (URL dep)
+//   translib → shared git=<upstream> (transitive, suppressed by override)
+//
+// The workspace-root override takes precedence (resolver-semantics §10.1):
+// translib's declared provenance for `shared` is suppressed; the workspace
+// root's override URL is used instead.
+//
+// `shared` is NOT a workspace member — it is a regular URL dep redirected by
+// the workspace-level overrides block.  This exercises the overrides code path
+// in resolve_workspace() that was previously corpus-untested (Breadth-P2b).
+workspace {
+    member "member-a"
+}
+overrides {
+    pkg "shared" git=(url)"https://our-org.example.com/shared.git" ref="main"
+}

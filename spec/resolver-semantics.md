@@ -913,6 +913,49 @@ MUST be byte-identical.
 > over the combined provider; `_build_graph` assembles the
 > `ResolvedGraph`.
 
+### 11.6  Cross-member flag-conflict validation (§3.8-conflict)
+
+A workspace resolution accumulates flag requests from **all members** into
+each dep's unified `active_flags` set (the workspace-wide union). This union
+is then subject to the same post-fixpoint flag-conflict validation that
+applies to single-package resolutions (§6 / RFC #23 §3.1.4).
+
+> NORMATIVE: After the dep×flag fixpoint has converged across all workspace
+> members — and therefore after the cross-member union is fully accumulated
+> in each dep's `active_flags` — a conformant implementation MUST run the
+> flag-conflict validation pass (§6) over the converged `active_flags` for
+> every dep. This pass MUST NOT be scoped to individual members; it MUST
+> operate on the fully-unioned set.
+
+> NORMATIVE: If any dep D has two flags `f` and `g` both present in D's
+> converged `active_flags`, and D's manifest declares `f conflicts g` (or
+> equivalently `g conflicts f`), the resolver MUST raise
+> `RESOLVE-FLAG-CONFLICT`. The source of the conflicting activations
+> (which member requested which flag) is included in the error payload for
+> diagnostics but does not affect the validation rule: the union itself is
+> invalid regardless of which member contributed each flag.
+
+> NORMATIVE: This validation runs **before** the solver is entered and
+> **after** the dep×flag fixpoint converges. It reads the converged
+> `active_flags` monotonically (never retracts). The check is therefore
+> order-independent: the same union produces the same validation outcome
+> regardless of member declaration order or BFS traversal order.
+
+The conformance fixture `conformance/spec-v1/fixture-253-ws-cross-member-flag-conflict`
+pins this behavior: member-a requests flag `async` and member-b requests
+flag `sync` on the same shared dep `lib-net`, where `lib-net` declares
+`async conflicts sync`. The workspace resolve raises `RESOLVE-FLAG-CONFLICT`
+because the cross-member union produces `active_flags = {async, sync}` for
+`lib-net`, triggering the conflict check.
+
+> NOTE: The reference Python implementation adds `_s4c_check_flag_conflicts`
+> after the workspace BFS completes, before the solve step in `resolve_workspace`
+> (mirroring the identical call in single-package `resolve()`). The Rust
+> reference implementation calls `provider.check_s4c_flag_conflicts(deps_dir)`
+> at the same position in `seed_workspace` / `resolve_workspace`. Both impls
+> read `dep_active_flags` which already stores the cross-member union at this
+> point, so no additional union step is required.
+
 ---
 
 ## 13  Attestation policy

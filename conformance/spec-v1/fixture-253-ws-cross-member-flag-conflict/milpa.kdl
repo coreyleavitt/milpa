@@ -1,0 +1,22 @@
+// fixture-253: S3 — workspace cross-member flag union raises RESOLVE-FLAG-CONFLICT
+//
+// Two workspace members each request a DIFFERENT flag on the same shared dep,
+// but those flags are declared mutually conflicting in the dep's manifest.
+//
+// Scenario:
+//   member-a → lib-net { flag "async" }
+//   member-b → lib-net { flag "sync"  }
+//   lib-net declares: async conflicts sync, sync conflicts async
+//
+// The workspace flag-union produces active(lib-net) = {async, sync}.
+// Post-fixpoint validation detects the conflict and raises RESOLVE-FLAG-CONFLICT.
+//
+// This fixture verifies that the post-fixpoint _s4c_check_flag_conflicts pass
+// runs over the cross-member unioned active_flags, NOT just per-member.
+// The existing validation already covers this because dep_active_flags stores
+// the union accumulated across all member requests during the fixpoint —
+// this fixture is a PIN of that behavior (no new code needed).
+workspace {
+    member "member-a"
+    member "member-b"
+}

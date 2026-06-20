@@ -3900,6 +3900,18 @@ def resolve_workspace(
     provider.set_transitive_callback(_on_transitive_named)
 
     # ------------------------------------------------------------------
+    # Step 6b-pre (workspace): S4c post-fixpoint flag-conflict validation
+    #
+    # Mirrors resolve() step 6b-pre: runs AFTER the dep×flag fixpoint
+    # converges across ALL members (the union is already in dep_active_flags),
+    # BEFORE solver entry.  The cross-member union is subject to the same
+    # flag-conflict validation as a single-package resolve — a dep with
+    # conflicting flags co-active from different members raises
+    # RESOLVE-FLAG-CONFLICT (resolver-semantics §3.8-conflict).
+    # ------------------------------------------------------------------
+    _s4c_check_flag_conflicts(provider, deps_dir)
+
+    # ------------------------------------------------------------------
     # Step 6b (workspace): Phase B content-hash dedup/alias
     #
     # Mirrors resolve() step 6b: group external candidates by identity,
