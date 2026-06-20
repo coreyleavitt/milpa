@@ -47,8 +47,14 @@ asymmetries broken today (round 2 added the eighth: member-dir add/remove/update
   fix (both impls + fixture-258) + named-dep→member constraint check `RES-WS-MEMBER-VERSION-CONSTRAINT`
   (new slug, both impls + fixture-259 + spec update) + named-dep-via-index success
   (fixture-260); Python 2056 pass; Rust corpus zero divergence — HEAD
-- [ ] S5b, S6, S7, S8, S9a, S9b, S10, S11a, S11b, S11c, S11d, S11e, S12 (remaining)
-- **Progress: 6/19 done, 13 remaining.** All gates green each slice (Python 2056 pass; Rust
+- [x] **S5b** Phase-A error-slug divergence spike (loop-safe): Rust unit test +
+  Python unit test both confirmed `TNG-NO-SATISFYING-VERSION` pre-S6 baseline — `224c4da`
+- [x] **S6** enumerate-all Phase-A normative: Rust `process_named` passes `VersionSet::full()`
+  to `resolve_named_all`; Python drops BFS pre-check at resolver.py:1372-1379; spec
+  `resolver-semantics §2.1` new normative note; fixture-261 + fixture-090 updated to
+  `SOLVE-CONFLICT`; Python 2058 pass; Rust 384 corpus pass, zero divergence — `78da655`
+- [ ] S7, S8, S9a, S9b, S10, S11a, S11b, S11c, S11d, S11e, S12 (remaining)
+- **Progress: 8/19 done, 11 remaining.** All gates green each slice (Python 2058 pass; Rust
   corpus zero divergence).
 
 ## Forks — ALL RESOLVED (no open decisions)
