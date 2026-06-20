@@ -459,8 +459,13 @@ impl Target for MilpaTarget {
                         // S5: read MILPA_REQUIRE_ATTESTED_METADATA from the fixture env
                         // and thread it to the workspace resolve path (§13.1 workspace rule).
                         let ws_require_attested = fixture_require_attested_metadata(&fx.dir);
+                        // S1 (RFC: workspace-completion §3.A): read CLI feature-selection
+                        // inputs from fixture env and pass to the extended workspace signature.
+                        let ws_cli_features = fixture_cli_features(&fx.dir);
+                        let ws_cli_no_default = fixture_no_default_features(&fx.dir);
+                        let ws_cli_all_features = fixture_all_features(&fx.dir);
                         let store = milpa_core::CaStore::new(&scratch.cas_root);
-                        return match milpa_core::resolve_workspace(
+                        return match milpa_core::resolve_workspace_with_features(
                             &loaded,
                             index.as_ref(),
                             &fetcher,
@@ -470,6 +475,9 @@ impl Target for MilpaTarget {
                             &scratch.deps_dir,
                             ws_require_attested,
                             &store,
+                            &ws_cli_features,
+                            ws_cli_no_default,
+                            ws_cli_all_features,
                         ) {
                             Ok(graph) => {
                                 // B-nimcfg: _deps/ view rebuilt internally by resolve_workspace
@@ -711,7 +719,10 @@ impl Target for MilpaTarget {
                             Ok(w) => w,
                             Err(e) => return Err(e.code().to_string()),
                         };
-                        milpa_core::resolve_workspace(
+                        let verify_cli_features = fixture_cli_features(&fx.dir);
+                        let verify_cli_no_default = fixture_no_default_features(&fx.dir);
+                        let verify_cli_all_features = fixture_all_features(&fx.dir);
+                        milpa_core::resolve_workspace_with_features(
                             &loaded,
                             verify_index.as_ref(),
                             &fetcher,
@@ -721,6 +732,9 @@ impl Target for MilpaTarget {
                             &scratch.deps_dir,
                             false, // verify pre-phase: no attestation flag
                             &store,
+                            &verify_cli_features,
+                            verify_cli_no_default,
+                            verify_cli_all_features,
                         ).map_err(|e| e.code().to_string())
                     }
                     ManifestDoc::Package(ref manifest) => {

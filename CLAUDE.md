@@ -185,9 +185,10 @@ Short version:
 
 - **Tier 1 — adoption blockers**: ✓ DONE (.nimble compat, parallel
   fetch, content-addressing Phase A)
-- **Tier 2 — atlas parity**: 2/5 done (#49 strategies, #50 overrides);
-  open: #25 workspace (re-scope pending — see open question below),
-  #23 features, #26 conditional `when` blocks
+- **Tier 2 — atlas parity**: ✓ DONE (#49 strategies, #50 overrides,
+  #25 cargo-style workspace W1–W5, #23 per-dep features/optional/patch,
+  #26 conditional `when` blocks). Residual workspace polish is tracked by
+  the workspace-completion RFC (see below).
 - **Tier 3 — structural differentiation**: content-addressing Phase B-C
   (dedup, global store, multihash), pluggable fetchers F1-F3, multi-
   provenance
@@ -201,19 +202,28 @@ extensibility, or supply-chain integrity.
 After Tier 4: milpa contributes to dep-resolution-as-a-field, not just
 Nim tooling.
 
-## Open question: #25 workspace re-scoping
+## Workspace status (#25 — SHIPPED) + completion RFC
 
-At session end (2026-05-22), unresolved: should #25 (workspace) be:
+#25 shipped as cargo-style true workspace: W1–W5 (#73–#77) landed in both
+impls (`1a395b3`→`2a43755`, Rust `S11a/S11b`). A workspace root carries a
+`workspace { member … }` block, members self-identify with `name`,
+member-to-member edges use the `member "<name>"` reserved-keyword dep kind,
+resolution produces one shared graph + `<root>/milpa.lock`, and per-member
+`nim.cfg` points at a shared `<root>/_deps/`. Cross-repo dev linking is the
+separate `local=` / LocalFetcher path (#42, also shipped). The old
+"re-scope pending" question is resolved — this is the framing that shipped.
 
-- **Best-dep-manager framing**: keep #25 as cargo-style true workspace
-  (monorepo, shared lockfile, member-by-name resolution). Build the
-  cross-repo dev linking via #42 (local-path provenance / LocalFetcher)
-  separately. Both ship.
-
-This is the framing the user landed on at session end (correcting an
-earlier session-internal mistake of letting fresco's needs frame the
-issue). #25's body still needs sharpening to reflect this. **Sharpen
-#25's body before implementing.**
+The **workspace-completion RFC** (`docs/rfc-workspace-completion.md`, Stage
+1 drafted 2026-06-20) organizes the workspace work the features RFC (#23)
+deferred *until #25 landed*, plus adjacent single-package/workspace
+asymmetries. Thesis: every milpa capability should behave identically on a
+standalone package or a workspace member. Three buckets: A) features×workspace
+(#160 seed-path flag-filter arm, #159 Profile optional axes); B) resolver
+parity (verify/close #109 — Python already done; resolve the Rust Phase-A
+constraint question); C) CLI symmetry (#93 member `self_src_dir`, #129 Rust
+workspace `--certificate`, #81 workspace manifest mutation +
+`milpa workspace add-member/remove-member`, `milpa update` workspace-awareness).
+See the RFC + `.handoff.md` for slices S1–S12.
 
 ## Dev workflow
 
@@ -310,13 +320,14 @@ Things that are NOT milpa's job and resist scope creep into:
 
 Sequenced from most actionable to most exploratory:
 
-1. **Sharpen #25's body** with the cargo-style workspace framing from
-   the open-question section above. Then start implementing it.
-2. **Tier 2 remaining items**: #23 features, #26 conditional requires
-3. **Tier 3 structural work**: Phase B content-addressing (#32, #33, #34)
-4. **Pluggable fetchers**: F1 protocol refactor (#40), then F2 tarball
-   (#41), F3 local-path (#42 — also unblocks workspace use cases)
-5. **v1.5 prep**: when Tier 2+3 are done, the spec extraction (#14
+1. **Workspace-completion RFC** (`docs/rfc-workspace-completion.md`):
+   Stage 1 drafted + sliced (S1–S12). Next command:
+   `/architect docs/rfc-workspace-completion.md round 1` (two architect
+   rounds required before `/tdd`). Closes #160, #159, #109, #93, #129, #81.
+2. **Tier 3 structural work**: Phase B content-addressing (#32, #33, #34)
+3. **Pluggable fetchers**: F4 HgFetcher (#43), F5 FossilFetcher (#44),
+   then research-tier F6/F7 (#45/#46). (F1–F3 + tarball + local shipped.)
+4. **v1.5 prep**: when Tier 3 is done, the spec extraction (#14
    error catalog is filed there as the first deliverable)
 
 Read `docs/comparison-vs-nimble-atlas.md` for the full picture before

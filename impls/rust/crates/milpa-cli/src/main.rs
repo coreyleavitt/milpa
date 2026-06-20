@@ -19,6 +19,7 @@ use milpa_core::{
     load_index, load_lockfile, load_manifest, load_workspace,
     make_dep_decl_store, mutate_manifest_file, parse_env_bool, parse_lockfile, parse_version,
     resolve, resolve_with_cert, resolve_workspace, resolve_workspace_frozen,
+    resolve_workspace_with_features,
     verify_lockfile_against_deps, workspace_any_member_strict, write_lockfile, CaStore,
     CasAdmittingFetcher, CoreError, DefaultRegistry, FailureCert, FileDepDeclStore,
     FrozenResolver, Index, ManifestDoc, Milpa, MilpaError, MockedFetcher, Profile, Resolver,
@@ -562,7 +563,9 @@ fn cmd_fetch(
             let profile = profile_from_env();
             // §8: reuse existing pins (idempotent repeated fetch — see single-pkg path).
             let prior = maybe_prior_lockfile(&dir.join("milpa.lock"));
-            resolve_workspace(
+            // S1 (workspace-completion): CLI feature-selection forwarded to workspace
+            // resolver. Empty defaults for now — wired to real CLI args in S2.
+            resolve_workspace_with_features(
                 &ws,
                 index.as_ref(),
                 registry.as_ref(),
@@ -572,6 +575,9 @@ fn cmd_fetch(
                 &deps_dir,
                 require_attested_metadata,
                 &build_store(),
+                &std::collections::BTreeSet::new(),
+                false,
+                false,
             )?
         };
         write_lockfile(
@@ -810,7 +816,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
         let ws = load_workspace(dir)?;
         let index = maybe_index(no_index)?;
         let profile = profile_from_env();
-        let graph = resolve_workspace(
+        let graph = resolve_workspace_with_features(
             &ws,
             index.as_ref(),
             registry.as_ref(),
@@ -820,6 +826,9 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
             &deps_dir,
             false, // cmd_update does not accept --require-attested-metadata (fetch/lock only)
             &build_store(),
+            &std::collections::BTreeSet::new(),
+            false,
+            false,
         )?;
         write_lockfile(&from_graph(&graph, strategy.as_str()), &lock_path)?;
         eprintln!(

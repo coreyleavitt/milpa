@@ -508,6 +508,76 @@ pub fn check_frozen_active_flags_mismatch(
 /// `store` is the content-addressed store used to rebuild `_deps/` after
 /// resolution completes (B-nimcfg SSOT: alias symlinks + stale-entry removal).
 #[allow(clippy::too_many_arguments)]
+/// Resolve a workspace with optional S9 CLI feature-selection inputs.
+///
+/// S1 (RFC: workspace-completion §3.A): `features` / `no_default_features` /
+/// `all_features` compute the workspace-root active-flag seed that will be
+/// threaded into `seed_workspace`.  Today (S1) these are plumbed through the
+/// call chain to make the workspace seed-path arm reachable; S2 wires the arm
+/// into the member-dep filter.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_workspace_with_features(
+    workspace: &LoadedWorkspace,
+    index: Option<&Index>,
+    fetcher: &dyn FetcherRegistry,
+    profile: Option<&Profile>,
+    prior: Option<&Lockfile>,
+    strategy: Strategy,
+    deps_dir: &Path,
+    require_attested_metadata: bool,
+    store: &CaStore,
+    features: &std::collections::BTreeSet<String>,
+    no_default_features: bool,
+    all_features: bool,
+) -> Result<ResolvedGraph, MilpaError> {
+    // Compute workspace-root cli_seed (mirrors resolve_with_features logic).
+    use std::collections::HashSet;
+    let has_ws_cli_features = !features.is_empty() || no_default_features || all_features;
+    let ws_cli_seed: Option<HashSet<String>> = if has_ws_cli_features {
+        let all_declared: HashSet<String> = workspace
+            .flags
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        // Validate feature names against workspace root flags.
+        for feat in features.iter() {
+            if !all_declared.contains(feat.as_str()) {
+                return Err(crate::error::CoreError::Frozen(
+                    "FROZEN-ACTIVE-FLAGS-MISMATCH",
+                    format!("feature {feat:?} not declared in workspace root flags block"),
+                )
+                .into());
+            }
+        }
+        let seed: HashSet<String> = if all_features {
+            all_declared
+        } else if no_default_features {
+            features.iter().cloned().collect()
+        } else {
+            let mut s: HashSet<String> = workspace
+                .flags
+                .iter()
+                .filter(|f| f.default)
+                .map(|f| f.name.clone())
+                .collect();
+            s.extend(features.iter().cloned());
+            s
+        };
+        Some(seed)
+    } else {
+        None
+    };
+
+    resolve_workspace_inner(
+        workspace, index, fetcher, profile, prior, strategy, deps_dir,
+        require_attested_metadata, store, ws_cli_seed.as_ref(),
+    )
+}
+
+/// `resolve_workspace` without feature-selection inputs (backward-compat wrapper).
+///
+/// Delegates to [`resolve_workspace_with_features`] with all feature inputs zeroed.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_workspace(
     workspace: &LoadedWorkspace,
     index: Option<&Index>,
@@ -518,6 +588,32 @@ pub fn resolve_workspace(
     deps_dir: &Path,
     require_attested_metadata: bool,
     store: &CaStore,
+) -> Result<ResolvedGraph, MilpaError> {
+    resolve_workspace_inner(
+        workspace, index, fetcher, profile, prior, strategy, deps_dir,
+        require_attested_metadata, store,
+        None, // ws_cli_seed: no feature selection inputs
+    )
+}
+
+/// Inner implementation for both `resolve_workspace` and
+/// `resolve_workspace_with_features`.
+///
+/// `ws_cli_seed`: workspace-root active-flag seed (pre-computed by the
+/// `_with_features` wrapper from CLI inputs); `None` = no CLI features.
+/// Threaded into `seed_workspace` so S2 can wire the flag-only arm.
+#[allow(clippy::too_many_arguments)]
+fn resolve_workspace_inner(
+    workspace: &LoadedWorkspace,
+    index: Option<&Index>,
+    fetcher: &dyn FetcherRegistry,
+    profile: Option<&Profile>,
+    prior: Option<&Lockfile>,
+    strategy: Strategy,
+    deps_dir: &Path,
+    require_attested_metadata: bool,
+    store: &CaStore,
+    ws_cli_seed: Option<&std::collections::HashSet<String>>,
 ) -> Result<ResolvedGraph, MilpaError> {
     let overrides: BTreeMap<String, Override> = workspace
         .overrides
@@ -613,7 +709,7 @@ pub fn resolve_workspace(
         None, // dep_decl_store: workspace path does not support DepDecl (S3b not yet wired for workspace)
         ws_is_strict,
     );
-    let queue = provider.seed_workspace(workspace, profile)?;
+    let queue = provider.seed_workspace(workspace, profile, ws_cli_seed)?;
     provider.process_items(queue)?;
     // S4a fixpoint for workspace resolve (same algorithm as single-package).
     provider.run_s4a_fixpoint()?;
@@ -1033,10 +1129,15 @@ impl<'a> ResolveProvider<'a> {
     /// build the synthetic root requiring each member. Members' external deps
     /// seed the BFS queue; member-named deps coerce to the in-tree member.
     /// Returns the initial external-dep queue.
+    /// S1 (RFC: workspace-completion §3.A): `ws_cli_seed` is the workspace-root
+    /// active-flag seed from CLI inputs (pre-computed by `resolve_workspace_inner`).
+    /// `None` = no CLI feature selection.  The parameter is accepted here to make
+    /// S2's flag-only arm reachable; the arm itself is wired in S2.
     fn seed_workspace(
         &mut self,
         workspace: &LoadedWorkspace,
         profile: Option<&Profile>,
+        _ws_cli_seed: Option<&std::collections::HashSet<String>>,
     ) -> Result<Vec<Item>, MilpaError> {
         let members_by_name: BTreeSet<String> =
             workspace.members.iter().map(|m| m.name.clone()).collect();
@@ -3266,8 +3367,154 @@ fn name_from_url(url: &str) -> Result<String, MilpaError> {
     Ok(name.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// S1 (RFC: workspace-completion §3.A): FilterCtx + filter_manifest
+//
+// Two independent predicates encoded as a value type, matching Python's
+// FilterContext.  The profile gate evaluates platform/arch/nim/milpa predicates
+// only (Depth-F7: skips flag predicates).  The flag gate evaluates flag
+// predicates via dep_passes_flag_predicates.
+//
+// Passthrough: profile=None AND active_flags empty → both gates are no-ops.
+// Flag gate runs when: profile is Some (Row-1 parity) OR active_flags nonempty
+// (Row-2 flag-only path).  Same semantics as Python filter_manifest.
+// ---------------------------------------------------------------------------
+
+/// Value type encoding the two independent filter predicates (resolver-semantics §3.A).
+///
+/// Mirror of Python `FilterContext`.  Always construct via [`FilterCtx::build`]
+/// in production code; the raw struct fields are public for Rust symmetry with
+/// Python.
+#[derive(Clone, Debug)]
+pub struct FilterCtx {
+    /// `None` ⟺ platform/arch/nim/milpa-predicate filtering disabled (§470).
+    pub profile: Option<Profile>,
+    /// Already-closed flag set.  Empty means "no flag filtering unless profile
+    /// is present" (see passthrough condition above).
+    pub active_flags: BTreeSet<String>,
+}
+
+impl FilterCtx {
+    /// Smart constructor — computes the flag closure from *manifest's* flags.
+    ///
+    /// Design-F1: the closure runs against `manifest.flags` (the manifest being
+    /// filtered), NOT any root manifest's flags.  At a workspace member site the
+    /// caller passes the member's manifest so the member's flags block determines
+    /// which enables-chains fire.
+    ///
+    /// `cli_seed`: `None` ⟺ use manifest's default-true flags as seed.
+    pub fn build(
+        manifest: &Manifest,
+        profile: Option<Profile>,
+        cli_seed: Option<&std::collections::HashSet<String>>,
+    ) -> Self {
+        use milpa_manifest::flag_enables_closure;
+        use std::collections::HashSet;
+
+        let seed: HashSet<String> = match cli_seed {
+            Some(s) => s.clone(),
+            None => manifest
+                .flags
+                .iter()
+                .filter(|f| f.default)
+                .map(|f| f.name.clone())
+                .collect(),
+        };
+        let active_flags: BTreeSet<String> = if seed.is_empty() {
+            BTreeSet::new()
+        } else {
+            flag_enables_closure(&manifest.flags, &seed)
+                .into_iter()
+                .collect()
+        };
+        FilterCtx { profile, active_flags }
+    }
+}
+
+/// Return a filtered copy of `manifest` applying the two independent predicates.
+///
+/// Mirror of Python `filter_manifest` (resolver-semantics §3.A).
+///
+/// - **Profile gate** (iff `ctx.profile is Some`): keeps deps whose non-flag
+///   predicates match the profile.  Flag predicates are SKIPPED (Depth-F7).
+/// - **Flag gate**: keeps deps whose flag predicates are satisfied by
+///   `ctx.active_flags`.  Runs when profile is Some (Row-1 parity) OR when
+///   active_flags is nonempty (Row-2 flag-only path).
+/// - **Passthrough**: profile=None AND active_flags empty → all deps retained.
+pub fn filter_manifest(manifest: &Manifest, ctx: &FilterCtx) -> Manifest {
+    // Fast path: neither gate is active.
+    if ctx.profile.is_none() && ctx.active_flags.is_empty() {
+        return manifest.clone();
+    }
+
+    let active_refs: BTreeSet<&str> = ctx.active_flags.iter().map(|s| s.as_str()).collect();
+    // Flag gate runs when profile is Some (Row-1) OR active_flags nonempty (Row-2).
+    let run_flag_gate = true; // reached only after the fast-path check above
+
+    let dep_passes = |dep: &Dep| -> bool {
+        let preds = dep.predicates();
+
+        // Profile gate: evaluate non-flag predicates only.
+        if let Some(ref profile) = ctx.profile {
+            for pred in preds.iter() {
+                if pred.name == "flag" {
+                    // Depth-F7: flag predicates owned by flag gate; skip here.
+                    continue;
+                }
+                if !predicate_satisfied_profile_only(pred, profile) {
+                    return false;
+                }
+            }
+        }
+
+        // Flag gate: evaluate flag predicates.
+        if run_flag_gate && !dep_passes_flag_predicates(dep, &active_refs) {
+            return false;
+        }
+
+        true
+    };
+
+    let mut out = manifest.clone();
+    out.deps.retain(|d| dep_passes(d));
+    out.dev_deps.retain(|d| dep_passes(d));
+    out
+}
+
+/// Evaluate a single NON-FLAG predicate against `profile`.
+///
+/// Called exclusively from the profile gate in [`filter_manifest`].
+/// Callers MUST NOT pass flag predicates here (Depth-F7).
+fn predicate_satisfied_profile_only(pred: &Predicate, profile: &Profile) -> bool {
+    let any_match = match pred.name.as_str() {
+        "platform" => match &profile.platform {
+            Some(actual) => pred.values.iter().any(|v| v == actual),
+            None => false,
+        },
+        "arch" => match &profile.arch {
+            Some(actual) => pred.values.iter().any(|v| v == actual),
+            None => false,
+        },
+        "nim" => match &profile.nim_version {
+            Some(actual) => pred.values.iter().any(|v| version_satisfies(actual, v)),
+            None => false,
+        },
+        "milpa" => match &profile.milpa_version {
+            Some(actual) => pred.values.iter().any(|v| version_satisfies(actual, v)),
+            None => false,
+        },
+        // Unknown axis (e.g., "flag" — should never reach here, "os", etc.) → false.
+        _ => false,
+    };
+    if pred.negated { !any_match } else { any_match }
+}
+
 /// Filter conditional deps by the active profile (§6). Flag predicates evaluate
 /// against `profile.flags`; `nim` predicates against `profile.nim_version`.
+///
+/// Legacy helper: kept for [`seed_workspace`] call-sites not yet migrated to
+/// [`FilterCtx`] + [`filter_manifest`] (S2 wires those).  New call-sites should
+/// use [`filter_manifest`] instead.
 fn filter_manifest_by_profile(manifest: &Manifest, profile: &Profile) -> Manifest {
     let mut out = manifest.clone();
     out.deps.retain(|d| dep_matches_profile(d, profile));
@@ -3741,14 +3988,14 @@ pub fn resolve_with_cert(
 ) -> Result<(ResolvedGraph, SuccessCert), (MilpaError, FailureCert)> {
     // Delegates to `solve_with_refutation` instead of `solve`; all setup is
     // identical to `resolve` — factored through `build_single_provider` (D-F2).
-    let filtered;
-    let manifest = match profile {
-        Some(p) => {
-            filtered = filter_manifest_by_profile(manifest, p);
-            &filtered
-        }
-        None => manifest,
-    };
+    //
+    // S1 (RFC: workspace-completion §3.A): route through the shared FilterCtx +
+    // filter_manifest so resolve_with_cert cannot develop a divergent filter
+    // path (Feasibility-F9).  No feature-selection params on this entry point
+    // today; cli_seed=None uses manifest default flags.
+    let cert_filter_ctx = FilterCtx::build(manifest, profile.cloned(), None);
+    let filtered_cert = filter_manifest(manifest, &cert_filter_ctx);
+    let manifest = &filtered_cert;
 
     let empty_index = Index::default();
     let (mut provider, _strict) = match build_single_provider(

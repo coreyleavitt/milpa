@@ -651,97 +651,240 @@ def _compute_root_active_seed(
 
 
 # ---------------------------------------------------------------------------
-# Manifest filtering — two intentionally distinct functions (resolver-semantics §470)
+# Manifest filtering — FilterContext + filter_manifest (resolver-semantics §3.A)
 #
-# DO NOT collapse these into a single function or route the absent-profile case
-# through a synthetic Profile with all-None axes.  resolver-semantics §470 is
-# NORMATIVE: an absent/None profile disables platform/arch/nim/milpa-predicate
-# filtering entirely — every dep is included regardless of those predicates.
-# Flag predicates are a SEPARATE axis (§489): they apply based on the active
-# flag set, independent of profile presence.
+# The three-row dispatch is encoded as TWO INDEPENDENT PREDICATES in FilterContext:
 #
-# Correct dispatch (also enforced in Rust resolver.rs — keep in sync):
-#   profile present  → _filter_manifest_by_profile  (evaluates ALL predicates)
-#   profile absent, features active → _filter_manifest_by_flags_only
-#                                      (flag predicates only; non-flag = pass)
-#   profile absent, no features    → no filtering (all deps included)
+#   profile present              → profile gate evaluates platform/arch/nim/milpa
+#   active_flags nonempty        → flag gate evaluates flag predicates
+#   profile absent + flags empty → passthrough (both gates are no-ops)
 #
-# A "SSOT unification" that synthesises Profile{platform=None, ...} and calls
-# _filter_manifest_by_profile would silently re-introduce the §470 violation
-# because _predicate_satisfied returns False for platform/arch/nim/milpa when
-# the profile axis is None.  The two functions are the correct SSOT boundary.
+# The two predicates are INDEPENDENT (Depth-F7):
+#   - Profile gate evaluates ONLY platform/arch/nim/milpa predicates; it
+#     SKIPS pred.name == "flag" (returns True for flag preds, leaving them to
+#     the flag gate).  This prevents double-evaluation and ensures a single
+#     owner for each predicate kind.
+#   - Flag gate evaluates ONLY flag predicates via dep_passes_flag_predicates.
+#
+# Construction discipline (Design-F1):
+#   Always build FilterContext via FilterContext.build(manifest, profile, *,
+#   cli_seed), which runs flag_enables_closure against the *passed manifest's*
+#   flags block.  At a workspace member site the passed manifest is the member's
+#   manifest — not the root's — so the closure uses the right flags block.
+#   Raw FilterContext(profile, active_flags) is public for Rust symmetry and
+#   unit tests; all production call-sites use build().
+#
+# resolver-semantics §470 NORMATIVE: absent profile disables platform/arch/nim/
+# milpa-predicate filtering entirely.  Do NOT synthesise a Profile{platform=None}
+# and call filter_manifest — that would violate §470 via _predicate_satisfied
+# returning False for absent axes (silent prune instead of pass).
 # ---------------------------------------------------------------------------
+
+
+def _manifest_flag_seed(manifest: Manifest) -> frozenset[str]:
+    """Default flag seed: names of default-true flags in *manifest*.
+
+    SSOT for the "no CLI seed → use manifest defaults" path.  Called by
+    FilterContext.build when cli_seed is None.
+    """
+    return frozenset(fd.name for fd in manifest.flags if fd.default)
+
+
+@dataclass(frozen=True)
+class FilterContext:
+    """Value type encoding both independent filter predicates (resolver-semantics §3.A).
+
+    Fields
+    ------
+    profile:
+        ``None`` ⟺ platform/arch/nim/milpa-predicate filtering disabled (§470).
+    active_flags:
+        Already-closed flag set.  Empty ⟺ no flag filtering (passthrough for
+        flag predicates).
+
+    Construction
+    ------------
+    Always use ``FilterContext.build(manifest, profile, *, cli_seed)`` in
+    production code.  The raw constructor is public for Rust symmetry and for
+    unit tests that need an exact active_flags value.
+    """
+
+    profile: Profile | None
+    active_flags: frozenset[str]
+
+    @classmethod
+    def build(
+        cls,
+        manifest: Manifest,
+        profile: Profile | None,
+        *,
+        cli_seed: frozenset[str] | None,
+    ) -> "FilterContext":
+        """Smart constructor — computes the flag closure from *manifest's* flags.
+
+        Design-F1: the closure runs against ``manifest.flags`` (the manifest
+        being filtered), NOT any root manifest's flags.  At a workspace member
+        site the caller passes the member's manifest; the member's flags block
+        determines which flags are declared and what enables-chains fire.
+
+        Parameters
+        ----------
+        manifest:
+            The manifest that will be passed to ``filter_manifest``.
+        profile:
+            Active platform profile, or ``None`` to disable platform filtering.
+        cli_seed:
+            Explicit CLI-selected flag seed (pre-validated; ``None`` ⟺ use
+            manifest's default-true flags as seed).
+        """
+        seed = cli_seed if cli_seed is not None else _manifest_flag_seed(manifest)
+        active = flag_enables_closure(manifest.flags, seed) if seed else frozenset()
+        return cls(profile=profile, active_flags=active)
+
+
+def filter_manifest(manifest: Manifest, ctx: FilterContext) -> Manifest:
+    """Return a ``Manifest`` with deps filtered by the two independent predicates.
+
+    Applies two INDEPENDENT predicates (resolver-semantics §3.A):
+
+    1. **Profile gate** (iff ``ctx.profile is not None``): keep deps whose
+       non-flag predicates match ``ctx.profile``.  Flag predicates are owned
+       exclusively by the flag gate and are SKIPPED here (Depth-F7).
+
+    2. **Flag gate**: keep deps whose flag predicates are satisfied by
+       ``ctx.active_flags``.  Runs when either (a) profile is present — the
+       old Row-1 path always evaluated flag predicates — or (b) active_flags
+       is nonempty (the flag-only Row-2 path).  When both profile and
+       active_flags are absent, the flag gate is a no-op (Row-3 passthrough).
+
+    **Passthrough condition**: ``ctx.profile is None`` AND
+    ``ctx.active_flags`` is empty → every dep is retained (§470 / §489
+    NORMATIVE).  This corresponds to "profile absent + no feature selection"
+    in the original three-row dispatch.
+
+    When both gates are active, a dep must pass BOTH (conjunction).
+
+    Parameters
+    ----------
+    manifest:
+        The manifest to filter (deps + dev_deps).  Not mutated.
+    ctx:
+        Pre-built filter context (use ``FilterContext.build`` in production).
+
+    Returns
+    -------
+    The same ``manifest`` object when no filtering changes anything, or a
+    new ``Manifest`` with the filtered ``deps`` / ``dev_deps`` tuples.
+    """
+    from dataclasses import replace as _dc_replace
+
+    # Fast path: neither gate is active → return unchanged.
+    if ctx.profile is None and not ctx.active_flags:
+        return manifest
+
+    # Determine whether the flag gate runs.
+    # The flag gate evaluates flag predicates when:
+    #   - profile is present (Row-1 parity: profile path always evaluated flags), OR
+    #   - active_flags is nonempty (Row-2 flag-only path).
+    # Both cases reduce to: run the flag gate unless (profile=None AND active_flags empty).
+    # That condition is already handled by the fast path above, so here we always run.
+    _run_flag_gate = True  # reached only when profile is not None OR active_flags nonempty
+
+    def _dep_passes(dep: Dep) -> bool:
+        preds: tuple[Predicate, ...] = dep.predicates
+
+        # --- Profile gate (platform/arch/nim/milpa predicates only) ---
+        if ctx.profile is not None:
+            for pred in preds:
+                if pred.name == "flag":
+                    # Depth-F7: flag predicates owned by flag gate; skip here.
+                    continue
+                if not _predicate_satisfied_profile_only(pred, ctx.profile):
+                    return False
+
+        # --- Flag gate (flag predicates) ---
+        if _run_flag_gate:
+            if not dep_passes_flag_predicates(preds, ctx.active_flags):
+                return False
+
+        return True
+
+    kept = tuple(d for d in manifest.deps if _dep_passes(d))
+    kept_dev = tuple(d for d in manifest.dev_deps if _dep_passes(d))
+    if len(kept) == len(manifest.deps) and len(kept_dev) == len(manifest.dev_deps):
+        return manifest
+    return _dc_replace(manifest, deps=kept, dev_deps=kept_dev)
+
+
+def _predicate_satisfied_profile_only(
+    pred: Predicate,
+    profile: Profile,
+) -> bool:
+    """Evaluate a single NON-FLAG predicate against ``profile``.
+
+    Called exclusively from the profile gate in ``filter_manifest``.
+    Callers MUST NOT pass flag predicates here (Depth-F7: flag gate owns them).
+
+    OR semantics within a predicate's values (§6 NORMATIVE).
+    Negation inverts the OR result.
+    """
+    actual: str | None = getattr(profile, pred.name, None)
+    if actual is None:
+        return False
+
+    any_match = any(_value_matches(pred.name, actual, v) for v in pred.values)
+    return (not any_match) if pred.negated else any_match
+
+
+# ---------------------------------------------------------------------------
+# Legacy internal helpers — kept as thin wrappers that delegate to filter_manifest.
+#
+# These were the single-package dispatch functions before S1.  They are now
+# implemented in terms of FilterContext + filter_manifest to avoid duplicating
+# the filter decision.  They remain to support the resolve_workspace call sites
+# that have not been migrated to FilterContext yet (S2 wires those).
+#
+# DO NOT add new call-sites for _filter_manifest_by_profile or
+# _filter_manifest_by_flags_only; call filter_manifest(manifest, ctx) instead.
+# ---------------------------------------------------------------------------
+
 
 def _filter_manifest_by_profile(
     manifest: Manifest,
     profile: Profile,
     cli_active_seed: frozenset[str] | None = None,
 ) -> Manifest:
-    """Return a ``Manifest`` with only the deps whose predicates match ``profile``.
+    """Legacy wrapper: filter by profile (+ optional flag seed).
 
-    Called at the start of ``resolve()`` BEFORE any BFS or solver input.
-    When ``profile`` is ``None``, filtering is disabled and all deps are
-    included (§6 NORMATIVE: absent profile ≠ profile that matches nothing).
-
-    ``active_flags`` is the enables-closure of the manifest's default-true flags
-    (S2 same-package closure via ``flag_enables_closure``).  This is the
-    SSOT for root-dep flag-predicate evaluation; transitive deps are handled
-    by the S4a fixpoint loop in ``_run_bfs_wave_loop``.
-
-    S9: when ``cli_active_seed`` is provided (computed by
-    ``_compute_root_active_seed`` from CLI feature inputs), it overrides the
-    default-true-flag seed so the enables-closure starts from the CLI-selected
-    root set instead of just the defaults.
+    Delegates to ``filter_manifest`` with a ``FilterContext`` built from the
+    profile and ``cli_active_seed``.  Kept for the resolve_workspace call-sites
+    that have not been migrated to FilterContext yet (S2).
     """
-    if cli_active_seed is not None:
-        seed: frozenset[str] = cli_active_seed
-    else:
-        seed = frozenset(
-            fd.name for fd in manifest.flags if fd.default
-        )
-    active_flags: frozenset[str] = flag_enables_closure(manifest.flags, seed)
-    kept = tuple(
-        d for d in manifest.deps
-        if _dep_matches_profile(d, profile, active_flags)
+    ctx = FilterContext(
+        profile=profile,
+        active_flags=(
+            flag_enables_closure(manifest.flags, cli_active_seed)
+            if cli_active_seed is not None
+            else flag_enables_closure(manifest.flags, _manifest_flag_seed(manifest))
+        ),
     )
-    kept_dev = tuple(
-        d for d in manifest.dev_deps
-        if _dep_matches_profile(d, profile, active_flags)
-    )
-    if len(kept) == len(manifest.deps) and len(kept_dev) == len(manifest.dev_deps):
-        return manifest
-    from dataclasses import replace as dc_replace
-    return dc_replace(manifest, deps=kept, dev_deps=kept_dev)
+    return filter_manifest(manifest, ctx)
 
 
 def _filter_manifest_by_flags_only(
     manifest: Manifest,
     cli_active_seed: frozenset[str],
 ) -> Manifest:
-    """Filter manifest deps by flag predicates only (S9 — no platform profile).
+    """Legacy wrapper: filter by flag predicates only (no profile).
 
-    Called when CLI features are active but no platform/nim profile exists.
-    Non-flag predicates are not filtered (absent profile = all platform values
-    pass, §6 NORMATIVE).  Only deps whose flag predicates are satisfied by
-    the enables-closure of ``cli_active_seed`` are retained.
-
-    A dep with NO flag predicates is always retained (the predicate conjunction
-    over an empty set is vacuously true — no constraint, no prune).
+    Delegates to ``filter_manifest`` with a flag-only ``FilterContext``.
+    Kept for symmetry; single-package resolve() now goes through FilterContext.
     """
-    active_flags: frozenset[str] = flag_enables_closure(manifest.flags, cli_active_seed)
-
-    kept = tuple(
-        d for d in manifest.deps
-        if dep_passes_flag_predicates(d.predicates, active_flags)
+    ctx = FilterContext(
+        profile=None,
+        active_flags=flag_enables_closure(manifest.flags, cli_active_seed),
     )
-    kept_dev = tuple(
-        d for d in manifest.dev_deps
-        if dep_passes_flag_predicates(d.predicates, active_flags)
-    )
-    if len(kept) == len(manifest.deps) and len(kept_dev) == len(manifest.dev_deps):
-        return manifest
-    from dataclasses import replace as dc_replace
-    return dc_replace(manifest, deps=kept, dev_deps=kept_dev)
+    return filter_manifest(manifest, ctx)
 
 
 def _dep_matches_profile(
@@ -749,12 +892,10 @@ def _dep_matches_profile(
     profile: Profile,
     active_flags: frozenset[str],
 ) -> bool:
-    """True iff ALL predicates on ``dep`` match the profile (conjunction).
+    """True iff ALL predicates on ``dep`` match the profile + active flags.
 
-    All five dep forms (UrlDep, NamedDep, LocalDep, TarballDep, MemberDep)
-    carry a ``predicates`` field (§6.3 NORMATIVE).  Direct field access is
-    intentional: a missing field is a hard error (wrong dep type), not a
-    silent admit.
+    Legacy helper used by ``_predicate_satisfied`` (workspace BFS path not yet
+    migrated to FilterContext).  Kept for call-sites in resolve_workspace (S2).
     """
     preds: tuple[Predicate, ...] = dep.predicates
     return all(_predicate_satisfied(pred, profile, active_flags) for pred in preds)
@@ -1985,18 +2126,16 @@ def resolve(
                 _root_cli_active_map[_ec_flag] = {ActivationSource.ENABLES_RULE}
             _raise_if_flag_conflicts(manifest.name, manifest.flags, _root_cli_active_map)
 
-    if params.profile is not None:
-        manifest = _filter_manifest_by_profile(
-            manifest, params.profile, cli_active_seed=_cli_active_seed
-        )
-    elif _cli_active_seed is not None:
-        # No platform profile but CLI features active: apply flag-only filtering.
-        # _filter_manifest_by_profile requires a non-None profile (non-flag
-        # predicates return False with no profile, which prunes them).  Use
-        # _filter_manifest_by_flags_only to apply only flag-predicate filtering
-        # against the CLI-computed active seed, leaving non-flag predicates
-        # unfiltered (§6 NORMATIVE: absent profile ≠ "match nothing").
-        manifest = _filter_manifest_by_flags_only(manifest, _cli_active_seed)
+    # Route through the shared FilterContext + filter_manifest (S1 §3.A).
+    # FilterContext.build computes the enables-closure from this manifest's flags;
+    # filter_manifest applies the two independent predicates (profile gate +
+    # flag gate) in a single pass with no double-evaluation (Depth-F7).
+    _filter_ctx = FilterContext.build(
+        manifest,
+        params.profile,
+        cli_seed=_cli_active_seed,
+    )
+    manifest = filter_manifest(manifest, _filter_ctx)
 
     # ------------------------------------------------------------------
     # Step 2: check index availability for named deps
