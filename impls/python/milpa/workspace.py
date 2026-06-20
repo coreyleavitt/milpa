@@ -297,6 +297,118 @@ def load_workspace(workspace_root: Path) -> LoadedWorkspace:
 
 
 # ---------------------------------------------------------------------------
+# Public: load_workspace_from_manifest
+# ---------------------------------------------------------------------------
+
+
+def load_workspace_from_manifest(
+    workspace_root: Path,
+    ws_manifest: WorkspaceManifest,
+) -> LoadedWorkspace:
+    """Build a ``LoadedWorkspace`` from an *in-memory* ``WorkspaceManifest``.
+
+    Identical to ``load_workspace`` except that the workspace manifest itself
+    is provided as an already-parsed value (not read from disk).  Member
+    manifests are still read from disk.
+
+    Used by ``apply_workspace_manifest_change`` to construct a proposed
+    ``LoadedWorkspace`` from a mutated manifest *before* any on-disk write,
+    so that resolution can fail cleanly without touching the manifest file.
+
+    Raises
+    ------
+    MilpaError
+        The same ``WS-MEMBER-*`` codes that ``load_workspace`` raises for
+        member-loading failures.
+    """
+    members: list[LoadedMember] = []
+    seen_names: dict[str, str] = {}
+    declared_abs: set[Path] = set()
+
+    for rel_path in ws_manifest.members:
+        if rel_path == "." or rel_path == "./":
+            raise MilpaError(
+                WS_MEMBER_DOT,
+                'workspace member path "." is not supported; '
+                "the workspace root cannot also be a package",
+                path=str(workspace_root),
+                member=rel_path,
+            )
+
+        abs_dir = (workspace_root / rel_path).resolve()
+        declared_abs.add(abs_dir)
+
+        if not abs_dir.is_dir():
+            raise MilpaError(
+                WS_MEMBER_DIR_MISSING,
+                f"workspace member {rel_path!r} not found at {abs_dir}",
+                member=rel_path,
+                path=str(abs_dir),
+            )
+
+        member_kdl = abs_dir / "milpa.kdl"
+        if not member_kdl.exists():
+            raise MilpaError(
+                WS_MEMBER_NO_MANIFEST,
+                f"workspace member {rel_path!r} has no milpa.kdl at {abs_dir}",
+                member=rel_path,
+                path=str(abs_dir),
+            )
+
+        member_text = _read_text(
+            member_kdl, WS_MEMBER_NO_MANIFEST, WS_MEMBER_NO_MANIFEST
+        )
+        member_doc = parse_workspace_or_manifest(member_text)
+
+        if isinstance(member_doc, WorkspaceManifest):
+            raise MilpaError(
+                WS_MEMBER_IS_WORKSPACE,
+                f"workspace member {rel_path!r} is itself a workspace; "
+                f"nested workspaces are not supported",
+                member=rel_path,
+                path=str(member_kdl),
+            )
+
+        assert isinstance(member_doc, Manifest)
+        member_manifest = member_doc
+
+        if member_manifest.overrides:
+            raise MilpaError(
+                WS_MEMBER_HAS_OVERRIDES,
+                f"workspace member {rel_path!r} declares its own overrides block; "
+                f"per-member overrides are not supported",
+                member=rel_path,
+                path=str(member_kdl),
+            )
+
+        name = member_manifest.name
+        if name in seen_names:
+            raise MilpaError(
+                WS_MEMBER_DUPLICATE_NAME,
+                f"workspace members {seen_names[name]!r} and {rel_path!r} "
+                f"both declare package name {name!r}",
+                member=rel_path,
+                name=name,
+                existing_member=seen_names[name],
+            )
+        seen_names[name] = rel_path
+
+        members.append(LoadedMember(
+            rel_path=rel_path,
+            abs_dir=abs_dir,
+            manifest=member_manifest,
+        ))
+
+    _warn_orphan_members(workspace_root, declared_abs)
+
+    return LoadedWorkspace(
+        root_dir=workspace_root,
+        workspace_manifest=ws_manifest,
+        members=tuple(members),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public: find_workspace_root
 # ---------------------------------------------------------------------------
 

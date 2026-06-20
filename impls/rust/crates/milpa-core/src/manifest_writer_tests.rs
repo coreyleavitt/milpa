@@ -329,6 +329,226 @@ fn mutate_workspace_manifest_file_not_found() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// S9b — apply_workspace_manifest_change tests
+// ---------------------------------------------------------------------------
+
+/// Write a minimal workspace milpa.kdl with the given member paths.
+fn write_workspace(root: &std::path::Path, members: &[&str]) {
+    let members_block: String = members
+        .iter()
+        .map(|m| format!("    member \"{m}\"\n"))
+        .collect();
+    std::fs::write(
+        root.join("milpa.kdl"),
+        format!("workspace {{\n{members_block}}}\n"),
+    )
+    .unwrap();
+}
+
+/// Write a minimal member milpa.kdl (no deps) in `member_dir`.
+fn write_member(member_dir: &std::path::Path, name: &str) {
+    std::fs::create_dir_all(member_dir).unwrap();
+    std::fs::write(
+        member_dir.join("milpa.kdl"),
+        format!("name \"{name}\"\nkind \"library\"\n"),
+    )
+    .unwrap();
+}
+
+/// Build a trivial empty MockedFetcher + CaStore pair for tests that resolve a
+/// workspace with no external deps.
+fn empty_registry_and_store(
+    tmp: &tempfile::TempDir,
+) -> (crate::fetchers::MockedFetcher, crate::store::CaStore) {
+    let mocked_dir = tmp.path().join("mocked-fetches");
+    std::fs::create_dir_all(&mocked_dir).unwrap();
+    let registry = crate::fetchers::MockedFetcher::new(&mocked_dir);
+    let store = crate::store::CaStore::new(tmp.path().join(".cas"));
+    (registry, store)
+}
+
+#[test]
+fn s9b_atomicity_resolution_failure_leaves_manifest_unchanged() {
+    // Atomicity guarantee: if loading the proposed workspace fails (member dir
+    // doesn't exist → WS-MEMBER-DIR-MISSING), milpa.kdl is untouched.
+    let d = tmp();
+    let root = d.path();
+
+    let member_a = root.join("member-a");
+    write_member(&member_a, "member-a");
+    write_workspace(root, &["member-a"]);
+
+    let original_kdl = std::fs::read_to_string(root.join("milpa.kdl")).unwrap();
+
+    let (registry, store) = empty_registry_and_store(&d);
+    let err = apply_workspace_manifest_change(
+        root,
+        None, // no index
+        &registry,
+        None,  // no profile
+        None,  // no prior lock
+        milpa_solver::Strategy::default(),
+        &store,
+        false,
+        |mut ws| {
+            // Add a member whose directory does NOT exist — should fail.
+            ws.members.push("ghost-does-not-exist".to_string());
+            ws
+        },
+    )
+    .unwrap_err();
+
+    // The error code must be a WS-* topology error (not a resolution error).
+    assert_eq!(err.code(), "WS-MEMBER-DIR-MISSING");
+
+    // milpa.kdl must be byte-identical to what we started with.
+    let after_kdl = std::fs::read_to_string(root.join("milpa.kdl")).unwrap();
+    assert_eq!(
+        after_kdl, original_kdl,
+        "milpa.kdl was modified despite failure; atomicity ordering violated"
+    );
+
+    // No lock must have been written.
+    assert!(
+        !root.join("milpa.lock").exists(),
+        "milpa.lock was written despite failure"
+    );
+}
+
+#[test]
+fn s9b_atomicity_existing_lock_unchanged_on_failure() {
+    // An existing milpa.lock must NOT be overwritten when the mutation fails.
+    let d = tmp();
+    let root = d.path();
+
+    let member_a = root.join("member-a");
+    write_member(&member_a, "member-a");
+    write_workspace(root, &["member-a"]);
+
+    let prior_lock_text = "strategy maxver\n";
+    std::fs::write(root.join("milpa.lock"), prior_lock_text).unwrap();
+
+    let (registry, store) = empty_registry_and_store(&d);
+    let _ = apply_workspace_manifest_change(
+        root,
+        None,
+        &registry,
+        None,
+        None,
+        milpa_solver::Strategy::default(),
+        &store,
+        false,
+        |mut ws| {
+            ws.members.push("ghost".to_string());
+            ws
+        },
+    )
+    .unwrap_err();
+
+    let after_lock = std::fs::read_to_string(root.join("milpa.lock")).unwrap();
+    assert_eq!(
+        after_lock, prior_lock_text,
+        "milpa.lock was overwritten despite failure"
+    );
+}
+
+#[test]
+fn s9b_happy_path_writes_manifest_and_lock() {
+    // A valid mutation (adding an existing member) writes both milpa.kdl and milpa.lock.
+    let d = tmp();
+    let root = d.path();
+
+    let member_a = root.join("member-a");
+    let member_b = root.join("member-b");
+    write_member(&member_a, "member-a");
+    write_member(&member_b, "member-b");
+    // Start with member-a only.
+    write_workspace(root, &["member-a"]);
+
+    let (registry, store) = empty_registry_and_store(&d);
+    let (graph, wr) = apply_workspace_manifest_change(
+        root,
+        None,
+        &registry,
+        None,
+        None,
+        milpa_solver::Strategy::default(),
+        &store,
+        false,
+        |mut ws| {
+            ws.members.push("member-b".to_string());
+            ws
+        },
+    )
+    .unwrap();
+
+    // WriteResult points at the manifest path.
+    assert_eq!(wr.path, root.join("milpa.kdl"));
+
+    // milpa.kdl now contains member-b.
+    let kdl_text = std::fs::read_to_string(root.join("milpa.kdl")).unwrap();
+    assert!(
+        kdl_text.contains("\"member-b\""),
+        "member-b missing from milpa.kdl: {kdl_text}"
+    );
+
+    // milpa.lock exists.
+    assert!(
+        root.join("milpa.lock").exists(),
+        "milpa.lock must be written on success"
+    );
+
+    // graph has deps (member graph — no external deps but the call succeeded).
+    let _ = graph;
+}
+
+#[test]
+fn s9b_package_mutate_still_refuses_workspace() {
+    // mutate_manifest_file (plain package path) still refuses a workspace doc.
+    let d = tmp();
+    let p = d.path().join("milpa.kdl");
+    std::fs::write(&p, "workspace {\n    member \"pkg\"\n}\n").unwrap();
+    assert_eq!(
+        mutate_manifest_file(&p, identity).unwrap_err().code(),
+        "MAN-MUTATE-WORKSPACE-REFUSED"
+    );
+}
+
+#[test]
+fn s9b_workspace_typed_path_not_refused() {
+    // apply_workspace_manifest_change must NOT raise MAN-MUTATE-WORKSPACE-REFUSED.
+    let d = tmp();
+    let root = d.path();
+
+    let member_a = root.join("member-a");
+    write_member(&member_a, "member-a");
+    write_workspace(root, &["member-a"]);
+
+    let (registry, store) = empty_registry_and_store(&d);
+    let result = apply_workspace_manifest_change(
+        root,
+        None,
+        &registry,
+        None,
+        None,
+        milpa_solver::Strategy::default(),
+        &store,
+        false,
+        |ws| ws, // identity
+    );
+    match &result {
+        Err(e) if e.code() == "MAN-MUTATE-WORKSPACE-REFUSED" => {
+            panic!(
+                "apply_workspace_manifest_change raised MAN-MUTATE-WORKSPACE-REFUSED; \
+                 the workspace-typed path must be allowed to mutate workspace docs"
+            );
+        }
+        _ => {} // Ok or any other error (unlikely given valid setup) is fine here.
+    }
+    result.unwrap(); // must succeed on a valid workspace.
+}
+
 #[test]
 fn format_workspace_manifest_byte_identical_to_python_fixture() {
     // Byte-identity gate: the canonical serializer must emit the same bytes as

@@ -1,6 +1,7 @@
 """milpa manifest writer — atomic mutation of milpa.kdl.
 
 Slice 10d per docs/rfc-python-clean-room-rewrite.md.
+S9b per docs/rfc-workspace-completion.md.
 
 Provides:
   ``mutate_manifest_file(path, mutator)`` — read milpa.kdl, apply a pure
@@ -8,11 +9,24 @@ Provides:
       atomically.  ``format_manifest`` is the SSOT serializer; this module
       does ZERO KDL-AST construction — it handles file I/O only.
 
+  ``mutate_workspace_manifest_file(path, mutator)`` — typed analog of
+      ``mutate_manifest_file`` for workspace manifests.
+
+  ``apply_workspace_manifest_change(root, env, params, mutate)`` — workspace
+      orchestration analog of the single-package add/remove orchestration
+      (``_cmd_add_git`` / ``cmd_remove`` in cli.py).  Implements the
+      validate→resolve-in-memory→write-manifest→write-lock atomicity ordering
+      (RFC: workspace-completion §3.F): resolves the proposed workspace in
+      memory BEFORE any on-disk write, so a network or resolution failure
+      leaves the manifest untouched.
+
   ``WriteResult`` — what a mutation did to disk.
 
 Atomic write contract (cli-contract.md §5.6):
   Writes are performed via a sibling tmp file + ``os.replace()``.  A
-  mid-write kill leaves the file unmodified.
+  mid-write kill leaves the file unmodified.  The only residual window is an
+  fs-write failure between the manifest write and the lock write — identical
+  to what single-package add/remove already accept.
 
 Comment-dropped warning:
   Detected by ``format_manifest`` via ``Manifest.had_comments`` — the warning
@@ -21,10 +35,12 @@ Comment-dropped warning:
 Refuses:
   - Missing file → ``MAN-MUTATE-FILE-NOT-FOUND``
   - ``.nimble`` file → ``MAN-MUTATE-NIMBLE-REFUSED``
-  - Workspace manifest → ``MAN-MUTATE-WORKSPACE-REFUSED``
+  - Workspace manifest → ``MAN-MUTATE-WORKSPACE-REFUSED`` (package path only;
+    workspace-typed path is explicitly allowed via ``mutate_workspace_manifest_file``
+    and ``apply_workspace_manifest_change``).
   - Malformed manifest → the ``MAN-*`` parse code surfaces unchanged.
 
-Spec authority: spec/cli-contract.md §5.6, spec/manifest-grammar.md §8.
+Spec authority: spec/cli-contract.md §5.6, §5.9, spec/manifest-grammar.md §8.
 """
 
 from __future__ import annotations
@@ -273,3 +289,118 @@ def mutate_workspace_manifest_file(
         path=path,
         comments_lost=max(0, before - after),
     )
+
+
+# ---------------------------------------------------------------------------
+# S9b: apply_workspace_manifest_change — workspace orchestration primitive
+# ---------------------------------------------------------------------------
+
+
+def apply_workspace_manifest_change(
+    root: Path,
+    env: "MilpaEnv",
+    params: "ResolveParams",
+    mutate: Callable[[WorkspaceManifest], WorkspaceManifest],
+) -> "tuple[ResolvedGraph, WriteResult]":
+    """Orchestration analog of the single-package add/remove ordering.
+
+    Atomicity ordering (RFC: workspace-completion §3.F):
+      *validate → workspace-resolve with the proposed manifest in memory →
+      write manifest → write lock.*
+
+    Resolution happens **before** any on-disk mutation, so a network or
+    resolution failure leaves the manifest (and lock) untouched.  The only
+    residual window is an fs-write failure between the manifest write and the
+    lock write — identical to what single-package add/remove already accept;
+    it is not eliminated, only minimized.
+
+    Signature symmetry (Design-F4): same shape as the inlined single-package
+    add/remove orchestration — no separate ``validate`` callable on either
+    path; validation is implicit in "the mutated doc resolves."
+
+    Parameters
+    ----------
+    root:
+        Absolute path to the workspace root directory (contains
+        ``milpa.kdl``).
+    env:
+        Injectable seams (fetcher, index, store).
+    params:
+        Per-call resolution parameters (strategy, max_parallel, profile, …).
+    mutate:
+        A pure ``WorkspaceManifest → WorkspaceManifest`` transform.  Called
+        with the parsed workspace manifest; its return value drives the
+        in-memory resolve and then is serialized + written atomically.
+        Mutator MUST NOT perform I/O.
+
+    Returns
+    -------
+    tuple[ResolvedGraph, WriteResult]
+        The resolved graph and the write result (path + comment-loss count).
+        Both are returned so the caller (e.g. ``workspace add-member``) can
+        emit progress output.
+
+    Raises
+    ------
+    MilpaError
+        Any error from workspace loading, the mutate call, member-loading, or
+        resolution.  On any raise, NO on-disk file is modified.
+    """
+    # Lazy imports to avoid circular deps (manifest_writer is imported early).
+    from milpa.lockfile import from_graph, write_lockfile
+    from milpa.resolver import resolve_workspace
+    from milpa.workspace import load_workspace, load_workspace_from_manifest
+
+    # Step 1: Load the current workspace from root (reads milpa.kdl + members).
+    current_ws = load_workspace(root)
+
+    # Step 2: Apply the mutation (pure transform on the workspace manifest).
+    proposed_ws_manifest = mutate(current_ws.workspace_manifest)
+
+    # Step 3: Build the proposed LoadedWorkspace by reading member manifests
+    # from disk for the proposed member list.  This validates member dirs exist
+    # and have milpa.kdl before we attempt resolution — load_workspace_from_manifest
+    # raises WS-MEMBER-* on any member-topology error, leaving disk untouched.
+    proposed_ws = load_workspace_from_manifest(root, proposed_ws_manifest)
+
+    # Step 4: Resolve the proposed workspace IN MEMORY.  Any resolution or
+    # network failure raises here — manifest and lock are still unmodified.
+    deps_dir = root / "_deps"
+    graph = resolve_workspace(proposed_ws, deps_dir, env, params)
+
+    # Step 5: Resolution succeeded — commit both outputs atomically.
+    # Write manifest first, then lock.  (The only residual window is an
+    # fs-write failure between the two writes — same as single-package.)
+    lockfile_val = from_graph(graph, strategy=str(params.strategy))
+    manifest_path = root / "milpa.kdl"
+    lock_path = root / "milpa.lock"
+
+    # Read the current manifest text for comment-loss counting.
+    try:
+        original_text = manifest_path.read_text(encoding="utf-8")
+    except OSError:
+        original_text = ""
+    rendered = format_workspace_manifest(proposed_ws_manifest)
+    before = _count_comments(original_text)
+    after = _count_comments(rendered)
+    _atomic_write_text(manifest_path, rendered)
+
+    write_lockfile(lockfile_val, lock_path)
+
+    wr = WriteResult(
+        path=manifest_path,
+        comments_lost=max(0, before - after),
+    )
+    return graph, wr
+
+
+# ---------------------------------------------------------------------------
+# Type stubs for forward references used in apply_workspace_manifest_change
+# ---------------------------------------------------------------------------
+# The TYPE_CHECKING guard keeps these imports from being executed at module
+# load time (avoiding circular imports), while still satisfying type checkers.
+
+from typing import TYPE_CHECKING  # noqa: E402
+if TYPE_CHECKING:
+    from milpa.context import MilpaEnv, ResolveParams  # noqa: F401
+    from milpa.resolver import ResolvedGraph  # noqa: F401

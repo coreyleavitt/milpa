@@ -148,6 +148,97 @@ pub fn load_workspace(root: &Path) -> Result<LoadedWorkspace, MilpaError> {
     })
 }
 
+/// Build a [`LoadedWorkspace`] from an already-parsed [`milpa_manifest::Workspace`]
+/// without reading the workspace manifest from disk.  Member manifests are still
+/// loaded from disk.
+///
+/// Mirrors `workspace.py:load_workspace_from_manifest` — used by
+/// [`crate::manifest_writer::apply_workspace_manifest_change`] to construct a
+/// proposed `LoadedWorkspace` from a mutated manifest *before* any on-disk write,
+/// so that resolution can fail cleanly without touching the manifest file.
+pub fn load_workspace_from_manifest(
+    root: &Path,
+    parsed: &milpa_manifest::Workspace,
+) -> Result<LoadedWorkspace, MilpaError> {
+    let mut members: Vec<LoadedMember> = Vec::new();
+    let mut seen_names: Vec<String> = Vec::new();
+    for member_path in &parsed.members {
+        if member_path == "." {
+            return Err(ws(
+                "WS-MEMBER-DOT",
+                "member \".\" is not supported — the workspace root is a pure container and \
+                 cannot also be a package; place it in a subdirectory and list that instead",
+            ));
+        }
+        let member_dir = root.join(member_path);
+        if !member_dir.is_dir() {
+            return Err(ws(
+                "WS-MEMBER-DIR-MISSING",
+                format!(
+                    "workspace member {member_path:?} has no directory at {}",
+                    member_dir.display()
+                ),
+            ));
+        }
+        let member_kdl = member_dir.join("milpa.kdl");
+        if !member_kdl.is_file() {
+            return Err(ws(
+                "WS-MEMBER-NO-MANIFEST",
+                format!(
+                    "workspace member {member_path:?} has no milpa.kdl at {}",
+                    member_kdl.display()
+                ),
+            ));
+        }
+        let member_text = std::fs::read_to_string(&member_kdl).map_err(|e| {
+            ws(
+                "WS-MEMBER-NO-MANIFEST",
+                format!("workspace member {member_path:?} milpa.kdl unreadable: {e}"),
+            )
+        })?;
+        let manifest = match milpa_manifest::parse_document(&member_text)? {
+            milpa_manifest::ManifestDoc::Workspace(_) => {
+                return Err(ws(
+                    "WS-MEMBER-IS-WORKSPACE",
+                    format!("workspace member {member_path:?} is itself a workspace — nested workspaces are not supported"),
+                ));
+            }
+            milpa_manifest::ManifestDoc::Package(m) => m,
+        };
+        if !manifest.overrides.is_empty() {
+            return Err(ws(
+                "WS-MEMBER-HAS-OVERRIDES",
+                format!(
+                    "workspace member {:?} declares its own `overrides` block — \
+                     overrides may only appear at the workspace root",
+                    manifest.name.as_deref().unwrap_or(member_path)
+                ),
+            ));
+        }
+        let name = manifest.name.clone().unwrap_or_default();
+        if seen_names.contains(&name) {
+            return Err(ws(
+                "WS-MEMBER-DUPLICATE-NAME",
+                format!("workspace has two members claiming name {name:?}"),
+            ));
+        }
+        seen_names.push(name.clone());
+        members.push(LoadedMember {
+            name,
+            path: member_path.clone(),
+            directory: member_dir,
+            manifest,
+        });
+    }
+
+    Ok(LoadedWorkspace {
+        root: root.to_path_buf(),
+        members,
+        overrides: parsed.overrides.clone(),
+        flags: parsed.flags.clone(),
+    })
+}
+
 #[cfg(test)]
 #[path = "workspace_tests.rs"]
 mod workspace_tests;
