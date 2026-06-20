@@ -16,10 +16,10 @@ use milpa_core::{
     add_mirror, build_flag_defines, check_frozen_active_flags_mismatch,
     dep_decl_store::DepDeclStore, discover_manifest, effective_strict_policy,
     fetch::{FetchError, FetcherRegistry}, format_nimcfg, format_workspace_nimcfgs, from_graph,
-    load_index, load_lockfile, load_manifest, load_workspace,
+    load_index, load_lockfile, load_manifest, load_workspace, LoadedWorkspace,
     make_dep_decl_store, mutate_manifest_file, parse_env_bool, parse_lockfile, parse_version,
     resolve, resolve_with_cert, resolve_workspace_frozen,
-    resolve_workspace_with_features,
+    resolve_workspace_with_cert, resolve_workspace_with_features,
     verify_lockfile_against_deps, workspace_any_member_strict, write_lockfile, CaStore,
     CasAdmittingFetcher, CoreError, DefaultRegistry, FailureCert, FileDepDeclStore,
     FrozenResolver, Index, ManifestDoc, Milpa, MilpaError, MockedFetcher, Profile, Resolver,
@@ -569,6 +569,20 @@ fn cmd_fetch(
             let profile = profile_from_env();
             // §8: reuse existing pins (idempotent repeated fetch — see single-pkg path).
             let prior = maybe_prior_lockfile(&dir.join("milpa.lock"));
+
+            // S8 (RFC: workspace-completion §3.E): --certificate honored in workspace
+            // mode (both fetch and lock). Mirrors cmd_fetch_with_cert for single-package.
+            if let Some(cert_dest) = cert_path {
+                return cmd_fetch_workspace_with_cert(
+                    dir, &ws, &deps_dir,
+                    index.as_ref(), registry.as_ref(),
+                    profile.as_ref(), prior.as_ref(),
+                    strategy, emit_nimcfg, cert_dest,
+                    require_attested_metadata,
+                    &cli_features, cli_no_default, cli_all_features,
+                );
+            }
+
             // S2 (workspace-completion §3.A): CLI feature-selection wired in.
             resolve_workspace_with_features(
                 &ws,
@@ -731,6 +745,67 @@ fn cmd_fetch_with_cert(
         Err((err, failure_cert)) => {
             // Write the failure certificate, then surface the error normally.
             // The normal error path (main's Err arm) emits the slug + exits 1.
+            let _ = write_failure_cert(cert_dest, &failure_cert);
+            Err(err)
+        }
+    }
+}
+
+/// The `--certificate` sub-path for workspace `cmd_fetch`/`cmd_lock` (S8,
+/// RFC: workspace-completion §3.E). Runs `resolve_workspace_with_cert`, writes
+/// the certificate on both success and failure, then applies the normal
+/// exit/slug discipline — mirroring `cmd_fetch_with_cert` for single-package.
+///
+/// Certificate content is defined by `cli-contract §2.5` over the workspace
+/// graph (the workspace resolves as one shared graph — same schema as
+/// single-package). Harness comparison is on the parsed JSON object, not bytes
+/// (`cli-contract §2.5.1 NOTE`; `conformance-fixtures §2.7.3`).
+#[allow(clippy::too_many_arguments)]
+fn cmd_fetch_workspace_with_cert(
+    dir: &Path,
+    ws: &LoadedWorkspace,
+    deps_dir: &Path,
+    index: Option<&Index>,
+    registry: &dyn FetcherRegistry,
+    profile: Option<&Profile>,
+    prior: Option<&milpa_core::Lockfile>,
+    strategy: Strategy,
+    emit_nimcfg: bool,
+    cert_dest: &Path,
+    require_attested_metadata: bool,
+    features: &std::collections::BTreeSet<String>,
+    no_default_features: bool,
+    all_features: bool,
+) -> Result<i32, MilpaError> {
+    match resolve_workspace_with_cert(
+        ws, index, registry, profile, prior, strategy, deps_dir,
+        require_attested_metadata, &build_store(),
+        features, no_default_features, all_features,
+    ) {
+        Ok((graph, cert)) => {
+            // Write success certificate (best-effort; a cert write failure does
+            // NOT abort the command — lock/nim.cfg still land).
+            let _ = write_success_cert(cert_dest, &cert);
+            write_lockfile(&from_graph(&graph, strategy.as_str()), &dir.join("milpa.lock"))?;
+            if emit_nimcfg {
+                let ws_flag_defines = milpa_core::build_flag_defines(&graph, deps_dir);
+                for (path, text) in format_workspace_nimcfgs(ws, &graph, Some(&ws_flag_defines)) {
+                    let target = dir.join(&path).join("nim.cfg");
+                    if let Some(p) = target.parent() {
+                        let _ = std::fs::create_dir_all(p);
+                    }
+                    let _ = std::fs::write(target, text);
+                }
+            }
+            eprintln!(
+                "resolved {} deps across {} members",
+                graph.deps.len(),
+                ws.members.len(),
+            );
+            Ok(0)
+        }
+        Err((err, failure_cert)) => {
+            // Write failure certificate, then surface the error normally.
             let _ = write_failure_cert(cert_dest, &failure_cert);
             Err(err)
         }

@@ -683,6 +683,198 @@ pub fn resolve_workspace(
     )
 }
 
+/// Resolve a workspace and also build a §5 result certificate (S8,
+/// RFC: workspace-completion §3.E).
+///
+/// Mirrors [`resolve_workspace_with_features`] exactly, but uses
+/// `solve_with_refutation` so both success and `SOLVE-CONFLICT` paths
+/// produce the appropriate certificate (matching the single-package
+/// [`resolve_with_cert`] pattern).
+///
+/// On success returns `Ok((graph, cert))`.
+/// On `SOLVE-CONFLICT` returns `Err((err, failure_cert))`.
+/// On any other error (seed/fetch/index/attestation) returns
+/// `Err((err, FailureCert { empty }))` — the cert is only written when the
+/// resolver ran far enough to produce one.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_workspace_with_cert(
+    workspace: &LoadedWorkspace,
+    index: Option<&Index>,
+    fetcher: &dyn FetcherRegistry,
+    profile: Option<&Profile>,
+    prior: Option<&Lockfile>,
+    strategy: Strategy,
+    deps_dir: &Path,
+    require_attested_metadata: bool,
+    store: &CaStore,
+    features: &std::collections::BTreeSet<String>,
+    no_default_features: bool,
+    all_features: bool,
+) -> Result<(ResolvedGraph, SuccessCert), (MilpaError, FailureCert)> {
+    // Macro: wrap a plain MilpaError in the cert-failure pair with an empty
+    // FailureCert (the cert only carries meaning for SOLVE-CONFLICT).
+    macro_rules! lift_err {
+        ($e:expr) => {
+            return Err(($e, FailureCert { message: String::new(), refutation: Vec::new() }))
+        };
+    }
+
+    // Compute workspace-root cli_seed (same as resolve_workspace_with_features).
+    use std::collections::HashSet;
+    let has_ws_cli_features = !features.is_empty() || no_default_features || all_features;
+    let ws_cli_seed: Option<HashSet<String>> = if has_ws_cli_features {
+        let all_declared: HashSet<String> = workspace
+            .flags
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        for feat in features.iter() {
+            if !all_declared.contains(feat.as_str()) {
+                lift_err!(crate::error::CoreError::Frozen(
+                    "FROZEN-ACTIVE-FLAGS-MISMATCH",
+                    format!("feature {feat:?} not declared in workspace root flags block"),
+                ).into());
+            }
+        }
+        let seed: HashSet<String> = if all_features {
+            all_declared
+        } else if no_default_features {
+            features.iter().cloned().collect()
+        } else {
+            let mut s: HashSet<String> = workspace
+                .flags
+                .iter()
+                .filter(|f| f.default)
+                .map(|f| f.name.clone())
+                .collect();
+            s.extend(features.iter().cloned());
+            s
+        };
+        Some(seed)
+    } else {
+        None
+    };
+
+    let overrides: BTreeMap<String, Override> = workspace
+        .overrides
+        .iter()
+        .map(|o| (o.name.clone(), o.clone()))
+        .collect();
+    let members_by_name: BTreeSet<String> =
+        workspace.members.iter().map(|m| m.name.clone()).collect();
+
+    // Pre-solve workspace validation (same as resolve_workspace_inner).
+    let mut collisions: Vec<&str> = overrides
+        .iter()
+        .filter(|(n, ov)| {
+            members_by_name.contains(n.as_str())
+                && !matches!(ov.target, OverrideTarget::Member { .. })
+        })
+        .map(|(n, _)| n.as_str())
+        .collect();
+    if !collisions.is_empty() {
+        collisions.sort();
+        lift_err!(res_err(
+            "RES-WS-OVERRIDE-MEMBER-COLLISION",
+            format!(
+                "workspace override name(s) {collisions:?} also appear as workspace member(s) \
+                 — remove either the override or the member; cannot have both"
+            ),
+        ));
+    }
+
+    for member in &workspace.members {
+        for dep in member.manifest.deps.iter().chain(member.manifest.dev_deps.iter()) {
+            if let Dep::Member(md) = dep {
+                if !members_by_name.contains(&md.name) {
+                    lift_err!(res_err(
+                        "RES-WS-MEMBER-REF-UNKNOWN",
+                        format!(
+                            "workspace member {:?} references `member {:?}` but no such member exists",
+                            member.name, md.name
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    let empty_index = Index::default();
+    let index_ref: &Index = match index {
+        Some(i) => i,
+        None => {
+            let unresolvable: Vec<&str> = workspace
+                .members
+                .iter()
+                .flat_map(|m| m.manifest.deps.iter().chain(m.manifest.dev_deps.iter()))
+                .filter(|d| {
+                    matches!(d, Dep::Named(_))
+                        && !overrides.contains_key(d.name())
+                        && !members_by_name.contains(d.name())
+                })
+                .map(Dep::name)
+                .collect();
+            if !unresolvable.is_empty() {
+                lift_err!(res_err(
+                    "RES-WS-NO-INDEX",
+                    format!(
+                        "workspace has named dep(s) {unresolvable:?} but no tianguis index \
+                         was provided"
+                    ),
+                ));
+            }
+            &empty_index
+        }
+    };
+
+    if let Err(e) = std::fs::create_dir_all(deps_dir).map_err(io_err) {
+        lift_err!(e);
+    }
+
+    let ws_is_strict = workspace_any_member_strict(workspace) || require_attested_metadata;
+
+    let mut provider = ResolveProvider::new(
+        fetcher,
+        index_ref,
+        deps_dir.to_path_buf(),
+        overrides,
+        prior,
+        None,
+        ws_is_strict,
+    );
+
+    match provider.seed_workspace(workspace, profile, ws_cli_seed.as_ref()) {
+        Ok(queue) => {
+            if let Err(e) = provider.process_items(queue) { lift_err!(e); }
+        }
+        Err(e) => lift_err!(e),
+    }
+    if let Err(e) = provider.run_s4a_fixpoint() { lift_err!(e); }
+    if let Err(e) = provider.check_s4c_flag_conflicts(deps_dir) { lift_err!(e); }
+    let canonical_aliases_ws = provider.finalize();
+
+    // Use solve_with_refutation so SOLVE-CONFLICT yields a populated FailureCert.
+    match solve_with_refutation(&provider, ROOT, root_version(), strategy) {
+        Ok(solution) => {
+            if let Some(e) = provider.take_error() { lift_err!(e); }
+            if let Err(e) = enforce_attestation_policy_strict(&provider, ws_is_strict) {
+                lift_err!(e);
+            }
+            let cert = provider.build_success_cert(&solution);
+            let graph = provider.build_graph(&solution, &canonical_aliases_ws);
+            rebuild_deps_view(&graph, deps_dir, store);
+            Ok((graph, cert))
+        }
+        Err((solver_err, refutation)) => {
+            let message = solver_err.to_string();
+            Err((
+                MilpaError::Solver(solver_err),
+                FailureCert { message, refutation },
+            ))
+        }
+    }
+}
+
 /// Inner implementation for both `resolve_workspace` and
 /// `resolve_workspace_with_features`.
 ///

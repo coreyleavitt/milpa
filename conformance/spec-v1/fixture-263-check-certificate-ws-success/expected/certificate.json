@@ -1,0 +1,51 @@
+{
+  "kind": "success",
+  "resolved": [
+    {
+      "package": "__root__",
+      "version": "0.0.0"
+    },
+    {
+      "package": "alpha",
+      "version": "0.0.1"
+    },
+    {
+      "package": "beta",
+      "version": "0.0.1"
+    },
+    {
+      "package": "lib-a",
+      "version": "0.0.1"
+    },
+    {
+      "package": "lib-b",
+      "version": "0.0.1"
+    }
+  ],
+  "witness": [
+    {
+      "package": "alpha",
+      "version": "0.0.1",
+      "constraint": ">=0.0.1 & <=0.0.1",
+      "satisfied_by": "lib-a"
+    },
+    {
+      "package": "beta",
+      "version": "0.0.1",
+      "constraint": ">=0.0.1 & <=0.0.1",
+      "satisfied_by": "lib-b"
+    },
+    {
+      "package": "lib-a",
+      "version": "0.0.1",
+      "constraint": ">=0.0.1 & <=0.0.1",
+      "satisfied_by": "__root__"
+    },
+    {
+      "package": "lib-b",
+      "version": "0.0.1",
+      "constraint": ">=0.0.1 & <=0.0.1",
+      "satisfied_by": "__root__"
+    }
+  ]
+}

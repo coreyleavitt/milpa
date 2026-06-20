@@ -1,0 +1,5 @@
+name "lib-b"
+kind "library"
+deps {
+    beta git=(url)"https://example.com/beta.git" ref="v1"
+}

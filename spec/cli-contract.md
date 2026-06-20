@@ -240,6 +240,24 @@ a solve result. All other verbs silently ignore it.
 > type (`conformance-fixtures.md` §2.7.3) compares parsed JSON objects, not
 > raw bytes.
 
+> NORMATIVE (S8, workspace-completion RFC §3.E): `--certificate` MUST be
+> honored by workspace `fetch` and workspace `lock` in **both** implementations.
+> A workspace resolves as one shared graph; the certificate schema (§2.5.1 /
+> §2.5.2) is defined over that graph and does not change for the workspace case.
+> Workspace members appear in `resolved` and `witness` under their `name` field
+> (exactly like any other dep). The workspace `__root__` package appears as the
+> top-level satisfier for direct member deps.
+>
+> Conformance check: the `check-certificate` fixture type compares parsed JSON
+> objects (NOT bytes). Python emits `json.dumps(indent=2)`; Rust hand-rolls a
+> compact layout — the bytes legitimately differ while the objects are equal.
+> The harness normalises via `_canonical_certificate` before comparing, so both
+> implementations produce a conformance-passing result from the same fixture.
+> Workspace certificate fixtures are `CliOnly` in the in-process Rust corpus
+> (same as single-package certificate fixtures); the binding gate is the
+> black-box harness (`python -m harness --fixture …`), NOT
+> `./dev-rust test --workspace` (which skips `CliOnly` fixtures).
+
 #### 2.5.2  Failure certificate JSON schema
 
 > NORMATIVE: On an UNSATISFIABLE resolve the certificate MUST be a JSON object
