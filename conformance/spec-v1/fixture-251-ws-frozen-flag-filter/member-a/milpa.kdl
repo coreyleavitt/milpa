@@ -1,0 +1,10 @@
+name "member-a"
+kind "library"
+flags {
+    tls default=#false description="enable TLS support"
+}
+deps {
+    when flag="tls" {
+        featurelib git=(url)"https://example.com/featurelib.git" ref="main"
+    }
+}

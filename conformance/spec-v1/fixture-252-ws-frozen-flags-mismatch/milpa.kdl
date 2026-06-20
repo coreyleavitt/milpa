@@ -1,0 +1,19 @@
+// fixture-252: S2 — workspace frozen-flags mismatch → FROZEN-ACTIVE-FLAGS-MISMATCH (#160)
+//
+// The workspace root declares flag `tls` (default=#false).  Member `member-a`
+// declares a dep `featurelib` gated on `when flag="tls"`.
+//
+// The lockfile was produced with --features tls (featurelib present in lock).
+// Run frozen WITHOUT --features (tls off) → the flag-only filter would exclude
+// featurelib, but it IS in the lock → FROZEN-ACTIVE-FLAGS-MISMATCH.
+//
+// Without S2's mismatch check (Breadth-P1b), this fires the wrong slug
+// FROZEN-MANIFEST-DEP-NOT-IN-LOCK (unfiltered member dep tries to look up
+// featurelib but tls=off means it shouldn't be there).
+// After S2: correctly raises FROZEN-ACTIVE-FLAGS-MISMATCH.
+workspace {
+    member "member-a"
+}
+flags {
+    tls default=#false description="enable TLS support"
+}

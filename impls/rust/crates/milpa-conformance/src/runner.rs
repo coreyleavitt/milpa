@@ -597,6 +597,22 @@ impl Target for MilpaTarget {
                         Ok(w) => w,
                         Err(e) => return Err(e.code().to_string()),
                     };
+                    // S2 (RFC: workspace-completion §3.A / Breadth-P1b):
+                    // FROZEN-ACTIVE-FLAGS-MISMATCH check for workspace frozen path.
+                    // Must run BEFORE resolve_workspace_frozen so the correct slug
+                    // fires rather than FROZEN-MANIFEST-DEP-NOT-IN-LOCK.
+                    let ws_cli_features = fixture_cli_features(&fx.dir);
+                    let ws_cli_no_default = fixture_no_default_features(&fx.dir);
+                    let ws_cli_all_features = fixture_all_features(&fx.dir);
+                    if let Err(e) = milpa_core::check_workspace_frozen_active_flags_mismatch(
+                        &loaded,
+                        &lock,
+                        &ws_cli_features,
+                        ws_cli_no_default,
+                        ws_cli_all_features,
+                    ) {
+                        return Err(e.code().to_string());
+                    }
                     return match milpa_core::resolve_workspace_frozen(
                         &loaded,
                         &lock,

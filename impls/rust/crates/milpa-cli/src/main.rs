@@ -18,7 +18,7 @@ use milpa_core::{
     fetch::{FetchError, FetcherRegistry}, format_nimcfg, format_workspace_nimcfgs, from_graph,
     load_index, load_lockfile, load_manifest, load_workspace,
     make_dep_decl_store, mutate_manifest_file, parse_env_bool, parse_lockfile, parse_version,
-    resolve, resolve_with_cert, resolve_workspace, resolve_workspace_frozen,
+    resolve, resolve_with_cert, resolve_workspace_frozen,
     resolve_workspace_with_features,
     verify_lockfile_against_deps, workspace_any_member_strict, write_lockfile, CaStore,
     CasAdmittingFetcher, CoreError, DefaultRegistry, FailureCert, FileDepDeclStore,
@@ -114,8 +114,8 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
         "show" => cmd_show(dir),
         "verify" => cmd_verify(dir, cli.require_attested_metadata, cli.no_index),
         "clean" => cmd_clean(dir),
-        "fetch" => cmd_fetch(dir, cli.strategy, cli.frozen, true, cert_path, cli.require_attested_metadata, cli.no_index),
-        "lock" => cmd_fetch(dir, cli.strategy, cli.frozen, false, cert_path, cli.require_attested_metadata, cli.no_index),
+        "fetch" => cmd_fetch(dir, cli.strategy, cli.frozen, true, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest),
+        "lock" => cmd_fetch(dir, cli.strategy, cli.frozen, false, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest),
         "update" => cmd_update(dir, cli.strategy, &cli.rest, cli.no_index),
         "add" => cmd_add(dir, &cli.rest, cli.no_index),
         "remove" => cmd_remove(dir, &cli.rest, cli.no_index),
@@ -531,9 +531,15 @@ fn cmd_fetch(
     cert_path: Option<&Path>,
     require_attested_metadata: bool,
     no_index: bool,
+    rest: &[String],
 ) -> Result<i32, MilpaError> {
     let deps_dir = dir.join("_deps");
     let doc = discover_manifest(dir)?;
+
+    // S2 (RFC: workspace-completion §3.A): parse CLI feature-selection from
+    // the verb's rest args.  Mirrors how `cmd_update` accepts --features.
+    // Needed for the workspace path's resolve_workspace_with_features call.
+    let (cli_features, cli_no_default, cli_all_features) = parse_feature_args(rest);
 
     // All fetches go through CasAdmittingFetcher so that _deps/<name> is
     // always a relative CAS symlink (matching Python's registry layer and the
@@ -563,8 +569,7 @@ fn cmd_fetch(
             let profile = profile_from_env();
             // §8: reuse existing pins (idempotent repeated fetch — see single-pkg path).
             let prior = maybe_prior_lockfile(&dir.join("milpa.lock"));
-            // S1 (workspace-completion): CLI feature-selection forwarded to workspace
-            // resolver. Empty defaults for now — wired to real CLI args in S2.
+            // S2 (workspace-completion §3.A): CLI feature-selection wired in.
             resolve_workspace_with_features(
                 &ws,
                 index.as_ref(),
@@ -575,9 +580,9 @@ fn cmd_fetch(
                 &deps_dir,
                 require_attested_metadata,
                 &build_store(),
-                &std::collections::BTreeSet::new(),
-                false,
-                false,
+                &cli_features,
+                cli_no_default,
+                cli_all_features,
             )?
         };
         write_lockfile(
@@ -1424,6 +1429,26 @@ fn maybe_prior_lockfile(path: &Path) -> Option<milpa_core::Lockfile> {
     load_lockfile(path).ok()
 }
 
+/// Parse CLI feature-selection arguments from verb-level tail args.
+///
+/// Returns `(features, no_default_features, all_features)` where `features`
+/// is the set of explicit flag names from `--features <comma-list>`.
+/// S2 (RFC: workspace-completion §3.A): used by `cmd_fetch`/`cmd_lock` to
+/// forward feature selection into `resolve_workspace_with_features`.
+fn parse_feature_args(rest: &[String]) -> (std::collections::BTreeSet<String>, bool, bool) {
+    let features_str = flag_value(rest, "--features");
+    let features: std::collections::BTreeSet<String> = features_str
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let no_default = rest.iter().any(|a| a == "--no-default-features");
+    let all_features = rest.iter().any(|a| a == "--all-features");
+    (features, no_default, all_features)
+}
+
 /// Returns `true` when both `--all-features` and `--no-default-features` are
 /// present in `rest` (the verb-level tail args).  Used to detect the
 /// mutually-exclusive combination before dispatching to the resolver.
@@ -1692,7 +1717,7 @@ mod tests {
 
         // First, fetch to produce a baseline lockfile with both pins.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        assert_eq!(cmd_fetch(&proj, Strategy::default(), false, true, None, false, false).unwrap(), 0);
+        assert_eq!(cmd_fetch(&proj, Strategy::default(), false, true, None, false, false, &[]).unwrap(), 0);
         let baseline = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
         assert!(baseline.contains("\"foo\"") && baseline.contains("\"bar\""));
 
@@ -2221,7 +2246,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX; unique env var name; cleaned up after.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false, false);
+        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false, false, &[]);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert!(result.is_ok(), "expected Ok, got {result:?}");
@@ -2308,7 +2333,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked_dir) };
-        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false, false);
+        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false, false, &[]);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
         unsafe { std::env::remove_var("MILPA_CACHE_DIR") };
 
@@ -2369,7 +2394,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false, false);
+        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false, false, &[]);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert!(result.is_err(), "expected Err, got {result:?}");

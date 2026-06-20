@@ -637,6 +637,104 @@ def _check_frozen_active_flags_mismatch(
 
 
 # ---------------------------------------------------------------------------
+# Workspace frozen active-flags mismatch check (S2 — RFC workspace-completion §3.A)
+# ---------------------------------------------------------------------------
+
+
+def _check_workspace_frozen_active_flags_mismatch(
+    workspace: object,
+    lockfile: object,
+    *,
+    features: frozenset[str],
+    no_default_features: bool,
+    all_features: bool,
+) -> None:
+    """S2 (RFC: workspace-completion §3.A / Breadth-P1b): workspace analog of
+    ``_check_frozen_active_flags_mismatch``.
+
+    For each member in the workspace, recomputes the active-flag closure using
+    the member's own flags + the CLI feature inputs (mirroring how the workspace
+    resolver builds FilterContext per member).  If a flag-gated member dep's
+    admission status disagrees with the lockfile (admitted-but-absent or
+    excluded-but-present), raises ``FROZEN-ACTIVE-FLAGS-MISMATCH``.
+
+    Called from the workspace frozen CLI path BEFORE ``resolve_workspace_frozen``
+    so the correct slug fires rather than ``FROZEN-MANIFEST-DEP-NOT-IN-LOCK``.
+    Per ``cli-contract.md:318-325``, workspaces are NOT exempt from this check.
+    """
+    from milpa.errors import FROZEN_ACTIVE_FLAGS_MISMATCH as _FAMM
+    from milpa.lockfile import Lockfile as _Lockfile
+    from milpa.workspace import LoadedWorkspace as _LoadedWorkspace
+
+    if not isinstance(workspace, _LoadedWorkspace) or not isinstance(lockfile, _Lockfile):
+        return
+
+    locked_names: set[str] = {d.name for d in lockfile.deps}
+
+    # Compute the workspace-root cli_seed (same logic as resolve_workspace S2 patch).
+    _ws_has_cli_features = bool(features) or no_default_features or all_features
+    _ws_cli_seed: frozenset[str] | None = None
+    if _ws_has_cli_features:
+        _ws_root_declared: frozenset[str] = frozenset(
+            fd.name for fd in workspace.workspace_manifest.flags
+        )
+        _unknown_feats = features - _ws_root_declared
+        if _unknown_feats:
+            raise MilpaError(
+                _FAMM,
+                f"--features names flags not declared in the workspace root flags "
+                f"block: {sorted(_unknown_feats)}",
+                unknown=sorted(_unknown_feats),
+            )
+        if all_features:
+            _ws_cli_seed = _ws_root_declared
+        elif no_default_features:
+            _ws_cli_seed = features
+        else:
+            _ws_default_seed: frozenset[str] = frozenset(
+                fd.name for fd in workspace.workspace_manifest.flags if fd.default
+            )
+            _ws_cli_seed = _ws_default_seed | features
+    else:
+        # No CLI features — use workspace root defaults as seed.
+        _ws_cli_seed = frozenset(
+            fd.name for fd in workspace.workspace_manifest.flags if fd.default
+        )
+        if not _ws_cli_seed:
+            _ws_cli_seed = None  # No root flags → no flag filtering at all.
+
+    for member in workspace.members:
+        # Compute per-member active set from member's own flags + ws_cli_seed.
+        _member_active: frozenset[str]
+        if _ws_cli_seed is not None:
+            _member_active = flag_enables_closure(member.manifest.flags, _ws_cli_seed)
+        else:
+            _member_active = frozenset()
+
+        for dep in list(member.manifest.deps) + list(member.manifest.dev_deps):
+            preds = dep.predicates
+            flag_preds = [p for p in preds if getattr(p, "name", None) == "flag"]
+            if not flag_preds:
+                continue
+            dep_name = dep.name
+            would_admit = dep_passes_flag_predicates(preds, _member_active)
+            is_locked = dep_name in locked_names
+            if would_admit != is_locked:
+                raise MilpaError(
+                    _FAMM,
+                    f"workspace member {member.manifest.name!r}: frozen lockfile "
+                    f"active-flags mismatch for dep {dep_name!r}: "
+                    f"the lock was produced under a different feature selection — "
+                    f"re-run 'milpa fetch' with the same --features flags that were "
+                    f"used to write the lock",
+                    dep=dep_name,
+                    expected_active=sorted(_member_active),
+                    locked=is_locked,
+                    would_admit=would_admit,
+                )
+
+
+# ---------------------------------------------------------------------------
 # cmd_fetch (10b)
 # ---------------------------------------------------------------------------
 
@@ -819,7 +917,32 @@ def _cmd_fetch_workspace(
     else:
         try:
             prior_lock = load_lockfile(lock_path)
-            frozen_graph = resolve_workspace_frozen(workspace, prior_lock, env, deps_dir)
+            # S2 (RFC: workspace-completion §3.A / Breadth-P1b):
+            # FROZEN-ACTIVE-FLAGS-MISMATCH check for workspaces.  Must run BEFORE
+            # resolve_workspace_frozen so the correct slug fires rather than
+            # FROZEN-MANIFEST-DEP-NOT-IN-LOCK.  Per cli-contract.md:318-325,
+            # workspaces are NOT exempt from this check.
+            _check_workspace_frozen_active_flags_mismatch(
+                workspace, prior_lock,
+                features=features,
+                no_default_features=no_default_features,
+                all_features=all_features,
+            )
+            # Compute the profile and ws_cli_seed for resolve_workspace_frozen so it
+            # can filter member deps (flag-excluded deps must not fire
+            # FROZEN-MANIFEST-DEP-NOT-IN-LOCK).
+            _frozen_profile = Profile.from_environment()
+            _frozen_cli_seed: frozenset[str] | None
+            _ws_has_feats = bool(features) or no_default_features or all_features
+            if _ws_has_feats:
+                from milpa.resolver import _compute_workspace_cli_seed as _cws
+                _frozen_cli_seed = _cws(workspace.workspace_manifest, features, no_default_features, all_features)
+            else:
+                _frozen_cli_seed = None
+            frozen_graph = resolve_workspace_frozen(
+                workspace, prior_lock, env, deps_dir,
+                profile=_frozen_profile, cli_seed=_frozen_cli_seed,
+            )
             # Emit per-member nim.cfgs.
             per_member = format_workspace_nimcfgs(workspace, frozen_graph)
             for rel_path, nim_cfg_text in per_member.items():

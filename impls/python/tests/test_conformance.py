@@ -664,7 +664,31 @@ def _execute_fixture(
                     if fixture.expected_error is not None and e.slug == fixture.expected_error:
                         return ("pass", "")
                     return ("fail", f"workspace load failed: {e.slug!r}")
-                graph = resolve_workspace_frozen(loaded_ws, lockfile, env, deps_dir)
+                # S2 (RFC: workspace-completion §3.A / Breadth-P1b):
+                # FROZEN-ACTIVE-FLAGS-MISMATCH check for workspace frozen path.
+                # Must run BEFORE resolve_workspace_frozen so the correct slug
+                # fires rather than FROZEN-MANIFEST-DEP-NOT-IN-LOCK.
+                from milpa.cli import _check_workspace_frozen_active_flags_mismatch
+                _check_workspace_frozen_active_flags_mismatch(
+                    loaded_ws, lockfile,
+                    features=_fixture_cli_features(fixture_dir),
+                    no_default_features=_fixture_no_default_features(fixture_dir),
+                    all_features=_fixture_all_features(fixture_dir),
+                )
+                # Compute cli_seed for resolve_workspace_frozen (so flag-excluded
+                # deps are skipped in the alignment check, not mis-fired as
+                # FROZEN-MANIFEST-DEP-NOT-IN-LOCK).
+                from milpa.resolver import _compute_workspace_cli_seed as _cws
+                _fx_cli_seed = _cws(
+                    loaded_ws.workspace_manifest,
+                    _fixture_cli_features(fixture_dir),
+                    _fixture_no_default_features(fixture_dir),
+                    _fixture_all_features(fixture_dir),
+                )
+                graph = resolve_workspace_frozen(
+                    loaded_ws, lockfile, env, deps_dir,
+                    cli_seed=_fx_cli_seed,
+                )
             else:
                 assert isinstance(doc, Manifest)
                 # S9 (RFC #23 §3.4): FROZEN-ACTIVE-FLAGS-MISMATCH check.

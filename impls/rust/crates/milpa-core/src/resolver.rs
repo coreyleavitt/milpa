@@ -492,6 +492,93 @@ pub fn check_frozen_active_flags_mismatch(
     Ok(())
 }
 
+/// S2 (RFC: workspace-completion §3.A / Breadth-P1b): workspace analog of
+/// [`check_frozen_active_flags_mismatch`].
+///
+/// For each member in the workspace, recomputes the active-flag closure using
+/// the member's own flags + the workspace-root CLI seed.  If a flag-gated member
+/// dep's admission status disagrees with the lockfile (admitted-but-absent or
+/// excluded-but-present), raises `FROZEN-ACTIVE-FLAGS-MISMATCH`.
+///
+/// Called from the conformance runner's workspace-frozen path BEFORE
+/// `resolve_workspace_frozen` so the correct slug fires rather than
+/// `FROZEN-MANIFEST-DEP-NOT-IN-LOCK`.  Per `cli-contract.md:318-325`,
+/// workspaces are NOT exempt from this check.
+pub fn check_workspace_frozen_active_flags_mismatch(
+    workspace: &crate::workspace::LoadedWorkspace,
+    lock: &crate::Lockfile,
+    features: &std::collections::BTreeSet<String>,
+    no_default_features: bool,
+    all_features: bool,
+) -> Result<(), MilpaError> {
+    use milpa_manifest::flag_enables_closure;
+    use std::collections::HashSet;
+
+    // Compute the workspace-root cli_seed (same logic as resolve_workspace_with_features).
+    let has_ws_cli_features = !features.is_empty() || no_default_features || all_features;
+    let ws_cli_seed: Option<HashSet<String>> = if has_ws_cli_features {
+        let all_declared: HashSet<String> = workspace.flags.iter().map(|f| f.name.clone()).collect();
+        for feat in features.iter() {
+            if !all_declared.contains(feat.as_str()) {
+                return Err(crate::error::CoreError::Frozen(
+                    "FROZEN-ACTIVE-FLAGS-MISMATCH",
+                    format!("feature {feat:?} not declared in workspace root flags block"),
+                ).into());
+            }
+        }
+        let seed: HashSet<String> = if all_features {
+            all_declared
+        } else if no_default_features {
+            features.iter().cloned().collect()
+        } else {
+            let mut s: HashSet<String> = workspace.flags.iter().filter(|f| f.default).map(|f| f.name.clone()).collect();
+            s.extend(features.iter().cloned());
+            s
+        };
+        Some(seed)
+    } else {
+        // No CLI features — use workspace root defaults as seed.
+        let default_seed: HashSet<String> = workspace.flags.iter().filter(|f| f.default).map(|f| f.name.clone()).collect();
+        if default_seed.is_empty() { None } else { Some(default_seed) }
+    };
+
+    let locked_names: HashSet<String> = lock.deps.iter().map(|d| d.name.clone()).collect();
+
+    for member in &workspace.members {
+        // Compute per-member active set from member's own flags + ws_cli_seed.
+        let member_active: HashSet<String> = if let Some(ref seed) = ws_cli_seed {
+            flag_enables_closure(&member.manifest.flags, seed)
+        } else {
+            HashSet::new()
+        };
+        let member_active_set: std::collections::BTreeSet<&str> =
+            member_active.iter().map(|s| s.as_str()).collect();
+
+        for dep in member.manifest.deps.iter().chain(member.manifest.dev_deps.iter()) {
+            let has_flag_pred = dep.predicates().iter().any(|p| p.name == "flag");
+            if !has_flag_pred {
+                continue;
+            }
+            let dep_name = dep.name();
+            let admitted = dep_passes_flag_predicates(dep, &member_active_set);
+            let in_lock = locked_names.contains(dep_name);
+            if admitted != in_lock {
+                return Err(crate::error::CoreError::Frozen(
+                    "FROZEN-ACTIVE-FLAGS-MISMATCH",
+                    format!(
+                        "workspace member {:?}: frozen lockfile active-flags mismatch \
+                         for dep {dep_name:?}: the lock was produced under a different \
+                         feature selection — re-run 'milpa fetch' with the same \
+                         --features flags that were used to write the lock",
+                        member.name,
+                    ),
+                ).into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a loaded workspace into one shared [`ResolvedGraph`] (resolver §11).
 ///
 /// Members appear as `ProvenanceRecord::Member` deps whose identity is the
@@ -1137,7 +1224,7 @@ impl<'a> ResolveProvider<'a> {
         &mut self,
         workspace: &LoadedWorkspace,
         profile: Option<&Profile>,
-        _ws_cli_seed: Option<&std::collections::HashSet<String>>,
+        ws_cli_seed: Option<&std::collections::HashSet<String>>,
     ) -> Result<Vec<Item>, MilpaError> {
         let members_by_name: BTreeSet<String> =
             workspace.members.iter().map(|m| m.name.clone()).collect();
@@ -1160,14 +1247,26 @@ impl<'a> ResolveProvider<'a> {
         }
 
         for member in &workspace.members {
-            // Per-member profile filtering (§6) when a profile is active.
-            let filtered;
-            let manifest = match profile {
-                Some(p) => {
-                    filtered = filter_manifest_by_profile(&member.manifest, p);
-                    &filtered
+            // S2 (RFC: workspace-completion §3.A): apply FilterCtx to the member
+            // manifest before building solver terms and seeding the BFS queue.
+            // This wires the flag-only arm into the workspace seed path: when
+            // ws_cli_seed is Some, FilterCtx::build runs flag_enables_closure
+            // against the *member's own* flags (Design-F1).
+            // The two application sites (solver terms + BFS queue) are fused here
+            // in seed_workspace (unlike Python which has two separate loops).
+            let filtered_storage;
+            let manifest = {
+                let ctx = FilterCtx::build(
+                    &member.manifest,
+                    profile.cloned(),
+                    ws_cli_seed,
+                );
+                if ctx.profile.is_none() && ctx.active_flags.is_empty() {
+                    &member.manifest
+                } else {
+                    filtered_storage = filter_manifest(&member.manifest, &ctx);
+                    &filtered_storage
                 }
-                None => &member.manifest,
             };
 
             let mut terms: Vec<SolverDep> = Vec::new();

@@ -1,0 +1,17 @@
+// fixture-249: S2 — workspace flag-only filter arm, included case (#160)
+//
+// The workspace root declares flag `tls` (default=#false).  Member `member-a`
+// declares a dep `featurelib` gated on `when flag="tls"`.
+//
+// Resolved with MILPA_CLI_FEATURES=tls (no profile):
+//   - the flag-only arm (§3.A S2) activates tls → featurelib IS included.
+//
+// Without S2's wiring, the middle arm is missing: the workspace seed path falls
+// through to passthrough → featurelib is OVER-INCLUDED even when tls is off.
+// This fixture (with features active) is GREEN after S2.
+workspace {
+    member "member-a"
+}
+flags {
+    tls default=#false description="enable TLS support"
+}

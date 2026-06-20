@@ -1,0 +1,17 @@
+// fixture-251: S2 — workspace frozen path with flag-only filter arm (#160)
+//
+// The workspace root declares flag `tls` (default=#false).  Member `member-a`
+// declares a dep `featurelib` gated on `when flag="tls"`.
+//
+// The lockfile was produced with --features tls (featurelib present).
+// Run frozen with MILPA_CLI_FEATURES=tls → success (featurelib found in lock).
+//
+// Without S2's filtering in resolve_workspace_frozen, the unfiltered member dep
+// list tries to look up featurelib-vs-lock — with filtering it is correctly
+// included when active.
+workspace {
+    member "member-a"
+}
+flags {
+    tls default=#false description="enable TLS support"
+}

@@ -67,7 +67,8 @@ pub use nimcfg::format_nimcfg;
 pub use nimcfg::format_workspace_nimcfgs;
 pub use registry::Index;
 pub use resolver::{
-    check_frozen_active_flags_mismatch, compute_dep_active_flags, effective_strict_policy,
+    check_frozen_active_flags_mismatch, check_workspace_frozen_active_flags_mismatch,
+    compute_dep_active_flags, effective_strict_policy,
     filter_manifest, parse_env_bool, resolve, resolve_with_cert, resolve_with_features,
     resolve_workspace, resolve_workspace_with_features,
     workspace_any_member_strict, FailureCert, FilterCtx, SuccessCert, WitnessEntry,

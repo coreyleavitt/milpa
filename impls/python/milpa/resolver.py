@@ -650,6 +650,55 @@ def _compute_root_active_seed(
     return default_seed | features
 
 
+def _compute_workspace_cli_seed(
+    workspace_manifest: object,  # WorkspaceManifest — typed at runtime
+    features: frozenset[str],
+    no_default_features: bool,
+    all_features: bool,
+) -> frozenset[str] | None:
+    """Compute the workspace-root CLI active-flag seed from CLI feature inputs.
+
+    Analogous to ``_compute_root_active_seed`` but operates on the workspace
+    root's ``WorkspaceManifest.flags`` block (not a full ``Manifest``).
+
+    Returns the raw seed ``frozenset[str]`` when CLI features are active, or
+    ``None`` when no CLI feature selection was made (passthrough).  ``None``
+    means "no flag filtering" — the flag gate is disabled.
+
+    Validates that every explicit feature name is declared in the workspace
+    root ``flags {}`` block (raises ``FROZEN-ACTIVE-FLAGS-MISMATCH`` if not).
+    """
+    from milpa.errors import FROZEN_ACTIVE_FLAGS_MISMATCH, MilpaError as _ME
+
+    has_cli_features = bool(features) or no_default_features or all_features
+    if not has_cli_features:
+        return None
+
+    declared_names: frozenset[str] = frozenset(
+        fd.name for fd in workspace_manifest.flags  # type: ignore[attr-defined]
+    )
+
+    unknown = features - declared_names
+    if unknown:
+        raise _ME(
+            FROZEN_ACTIVE_FLAGS_MISMATCH,
+            f"--features names flags not declared in the workspace root flags "
+            f"block: {sorted(unknown)} — add them to the workspace root "
+            f"'flags' block or remove them",
+            unknown=sorted(unknown),
+        )
+
+    if all_features:
+        return declared_names
+    if no_default_features:
+        return features
+    default_seed: frozenset[str] = frozenset(
+        fd.name for fd in workspace_manifest.flags  # type: ignore[attr-defined]
+        if fd.default
+    )
+    return default_seed | features
+
+
 # ---------------------------------------------------------------------------
 # Manifest filtering — FilterContext + filter_manifest (resolver-semantics §3.A)
 #
@@ -3535,6 +3584,19 @@ def resolve_workspace(
     )
     deps_dir.mkdir(parents=True, exist_ok=True)
 
+    # S2 (RFC: workspace-completion §3.A): compute workspace-root CLI seed.
+    # Delegates to _compute_workspace_cli_seed (SSOT for workspace feature
+    # validation + seed computation).  The seed is passed per-member to
+    # FilterContext.build, which runs flag_enables_closure against the
+    # *member's own* flags — that's why build() takes the member manifest.
+    # None = no CLI feature selection (passthrough for the flag gate).
+    _ws_cli_seed: frozenset[str] | None = _compute_workspace_cli_seed(
+        workspace.workspace_manifest,
+        params.features,
+        params.no_default_features,
+        params.all_features,
+    )
+
     # ------------------------------------------------------------------
     # Workspace-level checks before any resolution
     # ------------------------------------------------------------------
@@ -3655,10 +3717,17 @@ def resolve_workspace(
     # Pre-register each member as a candidate (never fetched)
     # ------------------------------------------------------------------
     for member in workspace.members:
-        if params.profile is not None:
-            member_manifest = _filter_manifest_by_profile(
-                member.manifest, params.profile
-            )
+        # S2 (RFC: workspace-completion §3.A): apply FilterContext to the member
+        # manifest before building dep_terms for the solver.  Filtering at this
+        # site ensures flag-gated deps are pruned from solver terms, preventing
+        # spurious SOLVE-CONFLICT when a gated dep version-clashes.
+        # FilterContext.build runs flag_enables_closure against the MEMBER's own
+        # flags (not the workspace root's) — this is the invariant Design-F1.
+        _member_ctx = FilterContext.build(
+            member.manifest, params.profile, cli_seed=_ws_cli_seed
+        )
+        member_manifest = filter_manifest(member.manifest, _member_ctx)
+        if member_manifest is not member.manifest:
             # Use a temporary LoadedMember-like object with the filtered manifest.
             class _FilteredMember:
                 def __init__(self, orig: object, manifest: Manifest) -> None:
@@ -3730,12 +3799,17 @@ def resolve_workspace(
                 provider._flag_requests_by_name[_target] = existing + _cpe.flag_requests
 
     for member in workspace.members:
-        if params.profile is not None:
-            member_manifest = _filter_manifest_by_profile(
-                member.manifest, params.profile
-            )
-        else:
-            member_manifest = member.manifest
+        # S2 (RFC: workspace-completion §3.A): apply FilterContext to the member
+        # manifest before seeding the BFS queue.  This is the second of two
+        # application sites (the first is in the candidate pre-registration loop
+        # above) — filtering at BOTH sites ensures the solver sees no flag-gated
+        # solver terms AND the BFS queue contains no flag-gated deps.
+        # Re-using FilterContext.build ensures the flag-only arm is identical to
+        # the single-package path (shared SSOT, no divergence).
+        _bfs_ctx = FilterContext.build(
+            member.manifest, params.profile, cli_seed=_ws_cli_seed
+        )
+        member_manifest = filter_manifest(member.manifest, _bfs_ctx)
 
         all_member_deps = list(member_manifest.deps) + list(member_manifest.dev_deps)
 

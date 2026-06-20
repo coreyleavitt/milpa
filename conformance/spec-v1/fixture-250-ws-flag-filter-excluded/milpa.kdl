@@ -1,0 +1,17 @@
+// fixture-250: S2 — workspace flag-only filter arm, excluded case (#160)
+//
+// The workspace root declares flag `tls` (default=#false).  Member `member-a`
+// declares a dep `featurelib` gated on `when flag="tls"`.
+//
+// Resolved WITHOUT --features (tls off):
+//   - featurelib is EXCLUDED (flag-only filter arm prunes it).
+//
+// Without S2's wiring, the middle arm is missing and falls through to passthrough
+// → featurelib is OVER-INCLUDED (the over-inclusion bug #160 exposes).
+// This fixture is RED before S2, GREEN after.
+workspace {
+    member "member-a"
+}
+flags {
+    tls default=#false description="enable TLS support"
+}

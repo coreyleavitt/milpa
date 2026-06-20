@@ -285,6 +285,9 @@ def resolve_workspace_frozen(
     lockfile: Lockfile,
     env: MilpaEnv,
     deps_dir: Path,
+    *,
+    profile: object = None,
+    cli_seed: frozenset[str] | None = None,
 ) -> ResolvedGraph:
     """Reconstruct a workspace ``ResolvedGraph`` from a shared lockfile (no fetch).
 
@@ -309,7 +312,19 @@ def resolve_workspace_frozen(
         Injectable seams: ``store`` for CAS presence checks.
     deps_dir:
         Where to place external dep symlinks (``<root>/_deps/``).
+    profile:
+        Optional profile for platform/arch/nim/milpa predicate filtering.
+    cli_seed:
+        Optional workspace-root CLI active-flag seed.  When non-``None``,
+        flag-gated member deps that are not active under this seed are
+        silently skipped in the manifest-vs-lock alignment check — a flag-
+        excluded dep should not trigger ``FROZEN-MANIFEST-DEP-NOT-IN-LOCK``.
+        The ``FROZEN-ACTIVE-FLAGS-MISMATCH`` check (which runs BEFORE this
+        function is called from the frozen CLI path) handles the mismatch
+        case; this filter prevents the wrong slug from firing.
     """
+    from milpa.resolver import FilterContext, filter_manifest  # avoid circular import
+
     # Condition 1: FROZEN-STRATEGY-MISMATCH
     if lockfile.strategy != _DEFAULT_STRATEGY:
         raise MilpaError(
@@ -324,10 +339,16 @@ def resolve_workspace_frozen(
     locked_by_name = {d.name: d for d in lockfile.deps}
 
     # Conditions 2-4: per-member manifest alignment (mirrors Rust check_manifest_alignment).
-    # Each member manifest's deps are checked against the lockfile exactly as in the
-    # single-package path: condition 2 (dep not in lock), 3 (bad version), 4 (constraint).
+    # S2 (RFC: workspace-completion §3.A): filter member deps via FilterContext BEFORE
+    # the "dep not in lock" check.  A flag-excluded dep must not fire
+    # FROZEN-MANIFEST-DEP-NOT-IN-LOCK — only FROZEN-ACTIVE-FLAGS-MISMATCH (raised by
+    # the caller) is the correct slug for a features-vs-lock disagreement.
     for member in workspace.members:
-        all_member_deps = list(member.manifest.deps) + list(member.manifest.dev_deps)
+        _frozen_ctx = FilterContext.build(
+            member.manifest, profile, cli_seed=cli_seed
+        )
+        filtered_member_manifest = filter_manifest(member.manifest, _frozen_ctx)
+        all_member_deps = list(filtered_member_manifest.deps) + list(filtered_member_manifest.dev_deps)
         for dep in all_member_deps:
             # Condition 2: FROZEN-MANIFEST-DEP-NOT-IN-LOCK
             if dep.name not in locked_by_name:
