@@ -56,8 +56,16 @@ asymmetries broken today (round 2 added the eighth: member-dir add/remove/update
 - [x] **S7** #93 per-member self_src_dir in `format_workspace_nimcfgs` (both impls);
   3-member fixture-262; updated fixtures 117, 178, 207, 208, 213, 214; spec §5.9 added;
   Python 2063 pass; Rust corpus zero divergence — **closes #93**
-- [ ] S8, S9a, S9b, S10, S11a, S11b, S11c, S11d, S11e, S12 (remaining)
-- **Progress: 9/19 done, 10 remaining.** All gates green each slice (Python 2063 pass; Rust
+- [x] **S8** #129 Rust workspace `--certificate` (Rust-only code; both-impl fixture):
+  `resolve_workspace_with_cert` added to `resolver.rs` + exported via `lib.rs`;
+  `cmd_fetch_workspace_with_cert` added to `main.rs`, workspace branch routes through it
+  when `cert_path` is Some; fixture-263-check-certificate-ws-success (`check-certificate`
+  harness, 2-member workspace, cert includes members as resolved/witness entries);
+  spec `cli-contract.md §2.5` new NORMATIVE paragraph; harness gate:
+  `python -m harness` → PASS both impls (parsed JSON equal); Python 2064 pass; Rust
+  384 corpus pass, zero divergence — **closes #129**
+- [ ] S9a, S9b, S10, S11a, S11b, S11c, S11d, S11e, S12 (remaining)
+- **Progress: 10/19 done, 9 remaining.** All gates green each slice (Python 2064 pass; Rust
   corpus zero divergence).
 
 ## Forks — ALL RESOLVED (no open decisions)
