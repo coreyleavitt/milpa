@@ -69,8 +69,14 @@ asymmetries broken today (round 2 added the eighth: member-dir add/remove/update
   (Hypothesis, 200 examples); `workspace-manifest-roundtrip` Cmd + fixture-264; spec §8
   byte-stability note updated; Feasibility-F4 resolved as option (i) — standalone Cmd;
   Python 2083 pass; Rust 393 corpus pass, zero divergence — `feat(manifest): canonical WorkspaceManifest serializer + roundtrip Cmd (#81)`
-- [ ] S9b, S10, S11a, S11b, S11c, S11d, S11e, S12 (remaining)
-- **Progress: 11/19 done, 8 remaining.** All gates green each slice (Python 2083 pass; Rust
+- [x] **S9b** `apply_workspace_manifest_change` orchestration (validate→resolve-in-memory→write-manifest→write-lock);
+  `load_workspace_from_manifest` helper (both impls); Design-F4 signature symmetry (no `validate`
+  callable; same shape as single-package add/remove); refusal-lift scope (workspace-typed path
+  allowed; package-typed path still refuses with MAN-MUTATE-WORKSPACE-REFUSED); 8 Python tests
+  + 5 Rust tests covering atomicity (resolution failure → manifest/lock untouched), happy path,
+  refusal-lift scoping; Python 2091 pass; Rust 398 unit pass + corpus zero divergence — `6868370`
+- [ ] S10, S11a, S11b, S11c, S11d, S11e, S12 (remaining)
+- **Progress: 12/19 done, 7 remaining.** All gates green each slice (Python 2091 pass; Rust
   corpus zero divergence).
 
 ## Forks — ALL RESOLVED (no open decisions)
