@@ -1,0 +1,12 @@
+schema_version 1
+package "namedlib" {
+    version "1.0.0" {
+        content_hash "sha256:d1bfa1267396edad8cfdde906fd2e4c834c5811310bce251fdfb11e95475c0d7"
+        provenance {
+            kind "git"
+            url "https://example.com/namedlib.git"
+            ref "v1.0.0"
+            commit_sha "ff11000000000000000000000000000000000001"
+        }
+    }
+}

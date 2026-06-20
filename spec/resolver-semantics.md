@@ -925,6 +925,14 @@ MUST be byte-identical.
 > treated as requiring the already-registered member candidate rather
 > than being looked up in the tianguis index.
 
+> NORMATIVE: When a `NamedDep` auto-coerces to a member, the declared
+> version constraint MUST be checked against the member's sentinel
+> version.  If the sentinel version does not satisfy the constraint,
+> the resolver MUST raise `RES-WS-MEMBER-VERSION-CONSTRAINT`.
+> Silently discarding the consumer's declared constraint is a
+> correctness violation — the resolver is not free to ignore a `>= 2.0.0`
+> constraint simply because the target is a workspace member.
+
 > NOTE: The reference implementation is `resolve_workspace` in
 > `resolver.py`. Members are iterated in `workspace.members` order;
 > each member's `_terms_from_member_manifest` produces solver `Term`s

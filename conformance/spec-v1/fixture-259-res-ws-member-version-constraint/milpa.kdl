@@ -1,0 +1,14 @@
+// fixture-259: S5 — named-dep→member auto-coerce drops version constraint (Breadth-P1c)
+//
+// member-a declares a named dep "member-b" with constraint ">= 2.0.0".
+// member-b is a workspace member at sentinel version 0.0.1.
+//
+// The auto-coercion silently used to discard the constraint.  The fix checks:
+// if the member's sentinel version does not satisfy the declared constraint,
+// raise RES-WS-MEMBER-VERSION-CONSTRAINT.
+//
+// Spec: resolver-semantics §11.1 (updated in S5).
+workspace {
+    member "member-a"
+    member "member-b"
+}

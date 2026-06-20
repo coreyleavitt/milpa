@@ -1,0 +1,11 @@
+// fixture-258: S5 — RES-WS-MEMBER-REF-UNKNOWN blind spot: dev_deps not checked
+//
+// member-a declares a member "nonexistent" in its dev-deps — not in deps.
+// The validator MUST check both deps AND dev_deps for dangling member refs
+// (Depth-F3, resolver.py:3628 / resolver.rs:738).
+//
+// Before the fix: the validator only iterates deps → dangling ref is UNDETECTED.
+// After the fix: dev_deps iterated too → RES-WS-MEMBER-REF-UNKNOWN raised.
+workspace {
+    member "member-a"
+}

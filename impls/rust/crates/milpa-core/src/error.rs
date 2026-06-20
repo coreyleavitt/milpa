@@ -146,6 +146,8 @@ impl CoreError {
             "RES-WS-NO-INDEX",
             "RES-WS-OVERRIDE-MEMBER-COLLISION",
             "RES-WS-MEMBER-REF-UNKNOWN",
+            // S5: named-dep → member auto-coerce constraint check (Breadth-P1c).
+            "RES-WS-MEMBER-VERSION-CONSTRAINT",
             // tianguis index reader (registry-protocol §2–§4) — S8. The parse-
             // time validators + the resolve-time policy. TNG-BAD-VERSION is in
             // the catalog but unraised by both impls (reserved); not listed here

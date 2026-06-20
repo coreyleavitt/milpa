@@ -1,0 +1,6 @@
+name "member-a"
+kind "library"
+deps {
+    extlib git=(url)"https://example.com/extlib.git" ref="main"
+    member "member-b"
+}

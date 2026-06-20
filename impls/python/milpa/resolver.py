@@ -62,6 +62,7 @@ from milpa.errors import (
     RES_NO_INDEX,
     RES_PROVENANCE_CONFLICT,
     RES_WS_MEMBER_REF_UNKNOWN,
+    RES_WS_MEMBER_VERSION_CONSTRAINT,
     RES_WS_NO_INDEX,
     RES_WS_OVERRIDE_MEMBER_COLLISION,
     TNG_NO_IDENTITY,
@@ -3510,6 +3511,24 @@ def _build_member_candidate(
         name = dep.name
         # Auto-coerce: MemberDep or named dep matching a member name → sentinel.
         if isinstance(dep, MemberDep) or name in members_by_name:
+            # Breadth-P1c (S5): when a NamedDep auto-coerces to a member, check
+            # that the member's sentinel version satisfies the declared constraint.
+            # Silently discarding the constraint is a correctness hole — the
+            # consumer said ">= 2.0.0" but the member is at sentinel 0.0.1.
+            if isinstance(dep, NamedDep) and dep.constraint_set is not None:
+                if not dep.constraint_set.contains(_URL_DEP_VERSION):
+                    raise MilpaError(
+                        RES_WS_MEMBER_VERSION_CONSTRAINT,
+                        f"named dep {name!r} auto-coerces to workspace member "
+                        f"{name!r} but the declared constraint "
+                        f"{dep.constraint!r} is not satisfied by the member's "
+                        f"sentinel version {_URL_DEP_VERSION} "
+                        f"(member deps carry version {_URL_DEP_VERSION}; "
+                        f"declared constraint must match)",
+                        dep=name,
+                        constraint=dep.constraint,
+                        member=manifest.name,
+                    )
             dep_terms.append(Term.require(name, VersionSet.eq(_URL_DEP_VERSION)))
             requires_names.append(name)
             continue
@@ -3625,8 +3644,10 @@ def resolve_workspace(
         )
 
     # RES-WS-MEMBER-REF-UNKNOWN: a member "X" dep with no such workspace member.
+    # Must check BOTH deps AND dev_deps — a dangling member ref in dev_deps is
+    # equally invalid (Depth-F3, S5 fix).
     for member in workspace.members:
-        for dep in member.manifest.deps:
+        for dep in list(member.manifest.deps) + list(member.manifest.dev_deps):
             if isinstance(dep, MemberDep) and dep.name not in members_by_name:
                 raise MilpaError(
                     RES_WS_MEMBER_REF_UNKNOWN,

@@ -1,0 +1,10 @@
+// fixture-260: S5 — workspace member with a named dep resolved via mocked index (Breadth-P2a)
+//
+// The resolver.py:3440-3460 path (workspace named-dep via index) was corpus-untested.
+// This fixture exercises it.  Complements fixture-113-res-ws-no-index (error case).
+//
+// member-a declares a named dep "namedlib".  The fixture ships an index.kdl that
+// lists namedlib version 1.0.0.  Resolution succeeds and the lockfile is pinned.
+workspace {
+    member "member-a"
+}

@@ -43,8 +43,12 @@ asymmetries broken today (round 2 added the eighth: member-dir add/remove/update
   fix (`predicate_satisfied` + `predicate_satisfied_profile_only`); conformance runner uses
   `Profile.partial(...)` (not `from_environment`); all 4 `Profile(...)` test call sites →
   `Profile.partial(...)`; spec `resolver-semantics §3.C` normative note; fixtures 255–256; **closes #159** — `1e935ba`
-- [ ] S5, S5b, S6, S7, S8, S9a, S9b, S10, S11a, S11b, S11c, S11d, S11e, S12 (remaining)
-- **Progress: 5/19 done, 14 remaining.** All gates green each slice (Python 2052 pass; Rust
+- [x] **S5** ws==union parity (fixture-257, closes #109) + `RES-WS-MEMBER-REF-UNKNOWN` dev_deps
+  fix (both impls + fixture-258) + named-dep→member constraint check `RES-WS-MEMBER-VERSION-CONSTRAINT`
+  (new slug, both impls + fixture-259 + spec update) + named-dep-via-index success
+  (fixture-260); Python 2056 pass; Rust corpus zero divergence — HEAD
+- [ ] S5b, S6, S7, S8, S9a, S9b, S10, S11a, S11b, S11c, S11d, S11e, S12 (remaining)
+- **Progress: 6/19 done, 13 remaining.** All gates green each slice (Python 2056 pass; Rust
   corpus zero divergence).
 
 ## Forks — ALL RESOLVED (no open decisions)

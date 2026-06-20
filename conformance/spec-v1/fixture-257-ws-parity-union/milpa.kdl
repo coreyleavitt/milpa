@@ -1,0 +1,11 @@
+// fixture-257: S5 — workspace==union parity (§11.3, closes #109)
+//
+// A 2-member workspace where member-a declares an external URL dep (extlib)
+// and member-b has no external deps (only member-a via member ref).
+//
+// The workspace resolver shares _run_bfs_wave_loop with single-package (B-1).
+// This fixture pins the workspace lockfile as the conformance proof.
+workspace {
+    member "member-a"
+    member "member-b"
+}

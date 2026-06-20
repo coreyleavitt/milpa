@@ -1012,7 +1012,13 @@ Under strict attestation policy, one or more resolved deps used un-attested `.ni
 
 A workspace member references a `member "X"` dep that doesn't exist.
 
-**Triggered:** A MemberDep name is not in the workspace's member list.
+**Triggered:** A `MemberDep` (or a `member "X"` in `dev-deps`) name is not in the workspace's member list.  Both `deps` and `dev-deps` are checked.
+
+### `RES-WS-MEMBER-VERSION-CONSTRAINT`
+
+A named dep auto-coerced to a workspace member does not satisfy the declared version constraint.
+
+**Triggered:** A `NamedDep` whose name matches a workspace member auto-coerces to that member (resolver-semantics §11.5), but the dep's declared version constraint is not satisfied by the member's sentinel version (`0.0.1`).  The constraint is not silently discarded — a `foo >= 2.0.0` dep where member `foo` is at sentinel `0.0.1` raises this error.
 
 ### `RES-WS-NO-INDEX`
 

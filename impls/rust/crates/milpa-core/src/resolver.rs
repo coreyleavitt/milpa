@@ -734,8 +734,10 @@ fn resolve_workspace_inner(
     }
 
     // RES-WS-MEMBER-REF-UNKNOWN: a `member "X"` dep with no such member.
+    // Must check BOTH deps AND dev_deps — a dangling member ref in dev_deps is
+    // equally invalid (Depth-F3, S5 fix).
     for member in &workspace.members {
-        for dep in &member.manifest.deps {
+        for dep in member.manifest.deps.iter().chain(member.manifest.dev_deps.iter()) {
             if let Dep::Member(md) = dep {
                 if !members_by_name.contains(&md.name) {
                     return Err(res_err(
@@ -1278,6 +1280,30 @@ impl<'a> ResolveProvider<'a> {
                 // Member ref / member-named auto-coercion: satisfied by the
                 // in-tree member candidate, no fetch, no queue.
                 if matches!(dep, Dep::Member(_)) || members_by_name.contains(&name) {
+                    // Breadth-P1c (S5): when a NamedDep auto-coerces to a member,
+                    // verify the declared constraint is satisfied by the member's
+                    // sentinel version.  Silently discarding the constraint is a
+                    // correctness hole — e.g. ">= 2.0.0" vs sentinel 0.0.1.
+                    if let Dep::Named(nd) = dep {
+                        if let Some(ref vs) = nd.parsed_constraint {
+                            if !vs.contains(&url_dep_version()) {
+                                return Err(res_err(
+                                    "RES-WS-MEMBER-VERSION-CONSTRAINT",
+                                    format!(
+                                        "named dep {:?} auto-coerces to workspace member {:?} \
+                                         but the declared constraint {:?} is not satisfied by \
+                                         the member's sentinel version {} \
+                                         (member deps carry version {}; \
+                                         declared constraint must match)",
+                                        name, name,
+                                        nd.constraint.as_deref().unwrap_or(""),
+                                        url_dep_version(),
+                                        url_dep_version(),
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                     terms.push(SolverDep::new(name.clone(), eq_sentinel()));
                     requires.push(name);
                     continue;
