@@ -1,0 +1,8 @@
+name "myapp"
+kind "application"
+deps {
+    translib git=(url)"https://example.com/translib.git" ref="main"
+}
+overrides {
+    pkg "mylib" local="./mylib-fork"
+}

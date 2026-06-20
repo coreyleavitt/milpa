@@ -1,0 +1,18 @@
+// fixture-246: MAN-DEP-TARBALL-STRIP — strip_components with float literal (1.0)
+//
+// The `strip_components` property on a tarball dep requires a KDL integer
+// literal (whole number, no decimal point).  A float literal like `1.0` —
+// even though it is numerically equal to 1 — is a type error and MUST raise
+// MAN-DEP-TARBALL-STRIP.
+//
+// This distinguishes the type system from mere value equality: `1` is an
+// integer literal; `1.0` is a float literal.  The strip_components field is
+// integer-typed and float literals are rejected at parse time, not coerced.
+//
+// Previously (pre-fix) Python accepted `1.0` via whole-float coercion in
+// `value_as_int` / `node_prop_int`.  After fix, Python rejects it (matching Rust).
+name "x"
+kind "library"
+deps {
+    foo tarball=(url)"https://x/t.tar.gz" strip_components=1.0
+}

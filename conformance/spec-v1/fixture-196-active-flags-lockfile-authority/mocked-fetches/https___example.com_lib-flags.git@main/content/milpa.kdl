@@ -1,0 +1,11 @@
+name "lib-flags"
+kind "library"
+flags {
+    alpha default=#true {
+        defines "flagAlpha"
+    }
+    beta default=#true {
+        defines "flagBeta"
+    }
+    gamma default=#false
+}

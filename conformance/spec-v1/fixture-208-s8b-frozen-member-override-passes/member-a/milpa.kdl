@@ -1,0 +1,6 @@
+name "member-a"
+kind "library"
+src_dir "src"
+deps {
+    extdep git=(url)"https://example.com/extdep.git" ref="main"
+}

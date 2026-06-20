@@ -16,7 +16,7 @@
 //! dispatch to (a registry with no fetchers to resolve to is meaningless).
 
 use kdl::{KdlDocument, KdlNode};
-use milpa_manifest::{kdl_brace_depth, KDL_MAX_NESTING_DEPTH};
+use milpa_manifest::{kdl_block_comment_depth, kdl_brace_depth, KDL_MAX_NESTING_DEPTH};
 use milpa_solver::{parse_version, VersionSet};
 use milpa_types::Provenance;
 
@@ -193,10 +193,17 @@ impl Index {
     /// newest-first by semver, unparseable trailing in document order.
     pub fn parse(text: &str) -> Result<Index, CoreError> {
         // Depth guard — see milpa_manifest::KDL_MAX_NESTING_DEPTH for rationale.
+        // Both brace depth and block-comment depth are checked (mirrors Python).
         if kdl_brace_depth(text) > KDL_MAX_NESTING_DEPTH {
             return Err(tng(
                 "TNG-KDL-SYNTAX",
                 format!("KDL input exceeds maximum nesting depth ({KDL_MAX_NESTING_DEPTH})"),
+            ));
+        }
+        if kdl_block_comment_depth(text) > KDL_MAX_NESTING_DEPTH {
+            return Err(tng(
+                "TNG-KDL-SYNTAX",
+                format!("KDL input exceeds maximum block-comment nesting depth ({KDL_MAX_NESTING_DEPTH})"),
             ));
         }
         let doc = KdlDocument::parse(text)

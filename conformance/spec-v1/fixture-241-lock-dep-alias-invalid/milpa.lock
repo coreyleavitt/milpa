@@ -1,0 +1,32 @@
+// fixture-241: LOCK-DEP-NAME-INVALID — lockfile dep alias contains path traversal chars
+//
+// A dep alias containing '/' (or any character outside [A-Za-z0-9_-]) in an
+// aliases node MUST be rejected at the lockfile parse boundary with
+// LOCK-DEP-NAME-INVALID.
+//
+// Without this check, a poisoned milpa.lock with `aliases "../evil"` would flow to:
+//   - nim.cfg --path: via string concat, enabling compile-time module hijack
+//     via path traversal outside _deps/
+//   - the filesystem via deps_dir / alias (symlink escape from _deps/)
+//
+// The alias charset predicate is the same SSOT as the dep-name predicate
+// (valid_dep_name / [A-Za-z0-9_-]+) — aliases reach identical filesystem
+// and nim.cfg sinks as the primary dep name.
+//
+// Regression for R8-S1: alias validation was added symmetrically with
+// dep-name validation but had no shared corpus coverage.
+version 1
+strategy "maxver"
+
+dep "mylib" {
+    version "1.0.0"
+    src_dir ""
+    aliases "../evil"
+    requires
+    provenance {
+        origin "observed"
+        kind "git"
+        url "https://example.com/mylib.git"
+        ref "main"
+    }
+}

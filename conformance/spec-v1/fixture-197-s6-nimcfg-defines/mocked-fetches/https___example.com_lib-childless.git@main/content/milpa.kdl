@@ -1,0 +1,5 @@
+name "lib-childless"
+kind "library"
+flags {
+    http default=#true
+}

@@ -355,6 +355,8 @@ fn resolved_from_locked(locked: &LockedDep) -> Result<ResolvedDep, MilpaError> {
         // Phase B: frozen path carries aliases from the lockfile for verification.
         // The aliases are read back from LockedDep.aliases during verify.
         aliases: locked.aliases.clone(),
+        // S5: frozen path carries active_flags from the lockfile.
+        active_flags: locked.active_flags.clone(),
     })
 }
 

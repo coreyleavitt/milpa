@@ -1,0 +1,7 @@
+name "mylib"
+kind "library"
+flags {
+    openssl default=#false {
+        conflicts "bearssl"
+    }
+}

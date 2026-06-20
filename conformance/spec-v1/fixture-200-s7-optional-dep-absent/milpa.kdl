@@ -1,0 +1,13 @@
+// fixture-200: S7 — optional dep absent by default (RFC #23 §3.2)
+//
+// `optlib optional=#true` desugars to:
+//   - auto-flag `optlib default=#false`
+//   - gate predicate `when flag="optlib"` on the dep
+//
+// With a real profile and no flags activated, the dep is pruned before fetch.
+// Expected: empty resolved graph, empty lockfile.
+name "myapp"
+kind "application"
+deps {
+    optlib git=(url)"https://example.com/optlib.git" ref="main" optional=#true
+}

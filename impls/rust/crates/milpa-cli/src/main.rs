@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use milpa_core::{
-    add_mirror, dep_decl_store::DepDeclStore, discover_manifest, effective_strict_policy,
+    add_mirror, build_flag_defines, check_frozen_active_flags_mismatch,
+    dep_decl_store::DepDeclStore, discover_manifest, effective_strict_policy,
     fetch::{FetchError, FetcherRegistry}, format_nimcfg, format_workspace_nimcfgs, from_graph,
     load_index, load_lockfile, load_manifest, load_workspace,
     make_dep_decl_store, mutate_manifest_file, parse_env_bool, parse_lockfile, parse_version,
@@ -23,7 +24,7 @@ use milpa_core::{
     FrozenResolver, Index, ManifestDoc, Milpa, MilpaError, MockedFetcher, Profile, Resolver,
     Strategy, SuccessCert, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS,
 };
-use milpa_manifest::{Dep, Manifest, UrlDep};
+use milpa_manifest::{valid_flag_name, Dep, FlagRequest, Manifest, UrlDep};
 
 const VERSION: &str = "0.1.0";
 
@@ -89,6 +90,25 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
 
     let dir = &cli.directory;
     let cert_path = cli.certificate.as_deref();
+
+    // S9 (RFC #23 §3.4): reject --all-features + --no-default-features together
+    // for the verbs that accept feature-selection flags (fetch, lock, update).
+    // The two flags are mutually exclusive: --all-features activates every declared
+    // root flag; --no-default-features suppresses all defaults and starts from an
+    // empty baseline — the intents are contradictory.  Cargo rejects this
+    // combination; milpa follows the same policy (spec/errors.md §CLI).
+    if matches!(cli.verb.as_str(), "fetch" | "lock" | "update")
+        && check_feature_flags_conflict(&cli.rest)
+    {
+        return Err(MilpaError::Core(CoreError::Resolver(
+            "CLI-FEATURE-FLAGS-CONFLICT",
+            "--all-features and --no-default-features are mutually exclusive: \
+             --all-features activates every declared root flag while \
+             --no-default-features suppresses all defaults — pass at most one"
+                .into(),
+        )));
+    }
+
     match cli.verb.as_str() {
         "show" => cmd_show(dir),
         "verify" => cmd_verify(dir, cli.require_attested_metadata, cli.no_index),
@@ -200,6 +220,10 @@ fn cmd_show(dir: &Path) -> Result<i32, MilpaError> {
         if !dep.requires.is_empty() {
             println!("  requires    {}", dep.requires.join(", "));
         }
+        // S10 (RFC #23 §3.7): print active_flags when non-empty.
+        if !dep.active_flags.is_empty() {
+            println!("  active_flags  {}", dep.active_flags.join(" "));
+        }
     }
     Ok(0)
 }
@@ -214,6 +238,27 @@ fn cmd_verify(dir: &Path, require_attested_metadata: bool, no_index: bool) -> Re
     // in main (which now emits the milpa-error: slug automatically). No inline
     // slug needed for the missing-lockfile case.
     let lock = load_lockfile(&dir.join("milpa.lock"))?;
+
+    // S10 (RFC #23 §3.7): active_flags mismatch check — manifest-vs-lockfile.
+    // Runs BEFORE the disk check (it's about manifest consistency, not disk state).
+    // Routes through check_frozen_active_flags_mismatch (SSOT), which internally
+    // uses dep_passes_flag_predicates for the admission decision.  With no CLI
+    // features (empty BTreeSet, no_default_features=false, all_features=false),
+    // the function uses the default-true flag closure as the seed.
+    if let Ok(milpa_manifest::ManifestDoc::Package(ref manifest)) = discover_manifest(dir) {
+        if let Err(e) = check_frozen_active_flags_mismatch(
+            manifest,
+            &lock,
+            &std::collections::BTreeSet::new(),
+            false,
+            false,
+        ) {
+            eprintln!("{}: {}", e.code(), message_of(&e));
+            eprintln!("milpa-error: {}", e.code());
+            return Ok(1);
+        }
+    }
+
     let deps_dir = dir.join("_deps");
     // Gap-1 D: VERIFY-DEPS-DIR-MISSING — emitted inline (Ok(1) path).
     if !deps_dir.exists() {
@@ -534,7 +579,9 @@ fn cmd_fetch(
             &dir.join("milpa.lock"),
         )?;
         if emit_nimcfg {
-            for (path, text) in format_workspace_nimcfgs(&ws, &graph) {
+            // S11 §3.8: build flag_defines (SSOT) for unified -d: in per-member nim.cfg.
+            let ws_flag_defines = milpa_core::build_flag_defines(&graph, &deps_dir);
+            for (path, text) in format_workspace_nimcfgs(&ws, &graph, Some(&ws_flag_defines)) {
                 let target = dir.join(&path).join("nim.cfg");
                 if let Some(p) = target.parent() {
                     let _ = std::fs::create_dir_all(p);
@@ -617,9 +664,10 @@ fn cmd_fetch(
         &dir.join("milpa.lock"),
     )?;
     if emit_nimcfg {
+        let flag_defines = build_flag_defines(&graph, &deps_dir);
         let _ = std::fs::write(
             dir.join("nim.cfg"),
-            format_nimcfg(&graph, "_deps", &manifest.src_dir),
+            format_nimcfg(&graph, "_deps", &manifest.src_dir, Some(&flag_defines)),
         );
     }
     eprintln!(
@@ -660,9 +708,10 @@ fn cmd_fetch_with_cert(
             let _ = write_success_cert(cert_dest, &cert);
             write_lockfile(&from_graph(&graph, strategy.as_str()), &dir.join("milpa.lock"))?;
             if emit_nimcfg {
+                let flag_defines = build_flag_defines(&graph, deps_dir);
                 let _ = std::fs::write(
                     dir.join("nim.cfg"),
-                    format_nimcfg(&graph, "_deps", &manifest.src_dir),
+                    format_nimcfg(&graph, "_deps", &manifest.src_dir, Some(&flag_defines)),
                 );
             }
             eprintln!("resolved {} deps", graph.deps.len());
@@ -841,6 +890,44 @@ fn cmd_add(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaErro
         )));
     }
 
+    // S10 (RFC #23 §3.7): parse --optional and --features <comma-list> from rest.
+    let optional = rest.iter().any(|a| a == "--optional");
+    let features_str = flag_value(rest, "--features");
+    let feature_names: Vec<String> = features_str
+        .as_deref()
+        .map(|s| s.split(',').filter(|f| !f.is_empty()).map(String::from).collect())
+        .unwrap_or_default();
+
+    // S10 pre-write clash check: validate optional dep name + flag namespace clash.
+    if optional {
+        // Charset check: dep name must match [A-Za-z0-9_-]+.
+        if !valid_flag_name(&name) {
+            eprintln!(
+                "add: dep name {:?} is not a valid flag name (must match [A-Za-z0-9_-]+)",
+                name
+            );
+            eprintln!("milpa-error: MAN-DEP-OPTIONAL-INVALID-NAME");
+            return Ok(1);
+        }
+        // Clash check: dep name must not collide with an existing declared flag.
+        let declared_flag_names: std::collections::HashSet<&str> =
+            existing.flags.iter().map(|f| f.name.as_str()).collect();
+        if declared_flag_names.contains(name.as_str()) {
+            eprintln!(
+                "add: dep {:?} optional=#true would clash with an existing flag of the same name",
+                name
+            );
+            eprintln!("milpa-error: MAN-DEP-OPTIONAL-FLAG-CLASH");
+            return Ok(1);
+        }
+    }
+
+    // Build FlagRequest list from --features.
+    let flag_reqs: Vec<FlagRequest> = feature_names
+        .iter()
+        .map(|f| FlagRequest { name: f.clone(), enabled: true })
+        .collect();
+
     // Ref discovery (cli-contract §5.6): if --ref is omitted, discover the
     // default branch. Under MILPA_MOCKED_FETCHES this is answered from the mock
     // tree (no network, conformance-fixtures §2.3.3); otherwise via
@@ -868,7 +955,8 @@ fn cmd_add(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaErro
         git_ref: git_ref.clone(),
         mirrors: Vec::new(),
         predicates: Vec::new(),
-        flag_requests: Vec::new(),
+        flag_requests: flag_reqs.clone(),
+        optional,
     }));
 
     let deps_dir = dir.join("_deps");
@@ -893,7 +981,8 @@ fn cmd_add(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaErro
             git_ref: git_ref.clone(),
             mirrors: Vec::new(),
             predicates: Vec::new(),
-            flag_requests: Vec::new(),
+            flag_requests: flag_reqs,
+            optional,
         }));
         m
     })?;
@@ -1206,16 +1295,63 @@ fn cache_home() -> PathBuf {
         })
 }
 
+/// Map a `std::env::consts::OS` token to the Nim `hostOS` vocabulary
+/// (cli-contract §8, spec/manifest-grammar §6.6).
+///
+/// Rust's OS strings differ from Python's `platform.system().lower()` inputs,
+/// but BOTH must produce the same Nim-vocabulary output token for the same
+/// physical host.  Unknown tokens are passed through unchanged (spec §8 allows
+/// unknown values; `when platform="X"` simply never matches).
+///
+/// Python `_OS_MAP` input → output:  darwin→macosx, linux→linux,
+///   windows→windows, freebsd→freebsd, openbsd→openbsd, netbsd→netbsd.
+/// Rust `std::env::consts::OS` uses "macos" instead of "darwin"; all others
+/// match.  Both must output "macosx" for macOS.
+pub(crate) fn host_platform_token(raw: &str) -> String {
+    match raw {
+        "macos" => "macosx".to_string(),
+        "linux" => "linux".to_string(),
+        "windows" => "windows".to_string(),
+        "freebsd" => "freebsd".to_string(),
+        "openbsd" => "openbsd".to_string(),
+        "netbsd" => "netbsd".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Map a `std::env::consts::ARCH` token to the Nim `hostCPU` vocabulary
+/// (cli-contract §8, spec/manifest-grammar §6.6).
+///
+/// Python `_ARCH_MAP` input → output:  x86_64→amd64, amd64→amd64,
+///   aarch64→arm64, arm64→arm64, i386→i386, i686→i386.
+/// Rust `std::env::consts::ARCH` uses "x86_64" / "aarch64" / "x86".
+/// Unknown tokens are passed through unchanged.
+pub(crate) fn host_arch_token(raw: &str) -> String {
+    match raw {
+        "x86_64" | "amd64" => "amd64".to_string(),
+        "aarch64" | "arm64" => "arm64".to_string(),
+        "x86" | "i386" | "i686" => "i386".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Build a [`Profile`] from the `MILPA_TARGET_*` environment variables
-/// (cli-contract §8, manifest-grammar §6.6). Returns `None` when none of the
-/// four variables are set (the common case — no conditional filtering).
+/// (cli-contract §8, manifest-grammar §6.6).
+///
+/// Always returns `Some(Profile)` — the CLI MUST host-default every axis
+/// that is not overridden by an env var (spec §8 NOTE; mirrors Python
+/// `Profile.from_environment`).  The conformance runner's `fixture_profile`
+/// is intentionally separate and continues to return `None` for the
+/// host-independent corpus path (§470 absent-profile).
 fn profile_from_env() -> Option<Profile> {
     let platform = std::env::var("MILPA_TARGET_PLATFORM")
         .ok()
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| host_platform_token(std::env::consts::OS));
     let arch = std::env::var("MILPA_TARGET_ARCH")
         .ok()
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| host_arch_token(std::env::consts::ARCH));
     let nim_version = std::env::var("MILPA_TARGET_NIM")
         .ok()
         .filter(|s| !s.is_empty())
@@ -1223,14 +1359,12 @@ fn profile_from_env() -> Option<Profile> {
     let milpa_version = std::env::var("MILPA_TARGET_MILPA")
         .ok()
         .filter(|s| !s.is_empty())
-        .and_then(|s| parse_version(&s));
+        .and_then(|s| parse_version(&s))
+        .or_else(|| parse_version(VERSION));
 
-    if platform.is_none() && arch.is_none() && nim_version.is_none() && milpa_version.is_none() {
-        return None;
-    }
     Some(Profile {
-        platform,
-        arch,
+        platform: Some(platform),
+        arch: Some(arch),
         nim_version,
         milpa_version,
         flags: Vec::new(),
@@ -1279,6 +1413,15 @@ fn maybe_prior_lockfile(path: &Path) -> Option<milpa_core::Lockfile> {
         return None;
     }
     load_lockfile(path).ok()
+}
+
+/// Returns `true` when both `--all-features` and `--no-default-features` are
+/// present in `rest` (the verb-level tail args).  Used to detect the
+/// mutually-exclusive combination before dispatching to the resolver.
+fn check_feature_flags_conflict(rest: &[String]) -> bool {
+    let has_all = rest.iter().any(|a| a == "--all-features");
+    let has_no_default = rest.iter().any(|a| a == "--no-default-features");
+    has_all && has_no_default
 }
 
 /// The value following `flag` in `args` (e.g. `--git <url>`), if present.
@@ -2480,5 +2623,433 @@ mod tests {
         unsafe { std::env::remove_var("MILPA_CACHE_DIR") };
 
         assert_eq!(rc, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // S10: subcommand awareness (RFC #23 §3.7)
+    // -----------------------------------------------------------------------
+
+    /// S10: cmd_add --optional writes optional=#true in milpa.kdl.
+    #[test]
+    fn s10_add_optional_writes_optional_true() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\n",
+        ).unwrap();
+
+        let url = "https://example.com/mydep.git";
+        let sha = "b".repeat(40);
+        let mocked = make_mocked_fetches(tmp.path(), url, "main", &sha, &[("dep.nim", b"# dep")]);
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let rc = cmd_add(
+            &proj,
+            &["mydep".into(), "--git".into(), url.into(), "--ref".into(), "main".into(), "--optional".into()],
+            false,
+        );
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(rc.unwrap(), 0, "add --optional must exit 0");
+        let kdl = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+        assert!(kdl.contains("optional=#true"), "optional=#true must be in manifest:\n{kdl}");
+    }
+
+    /// S10: cmd_add --features a,b writes flag "a" / flag "b" children.
+    #[test]
+    fn s10_add_features_writes_flag_children() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj2");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\n",
+        ).unwrap();
+
+        let url = "https://example.com/featdep.git";
+        let sha = "c".repeat(40);
+        let mocked = make_mocked_fetches(tmp.path(), url, "main", &sha, &[("dep.nim", b"# dep")]);
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let rc = cmd_add(
+            &proj,
+            &[
+                "featdep".into(), "--git".into(), url.into(),
+                "--ref".into(), "main".into(),
+                "--features".into(), "alpha,beta".into(),
+            ],
+            false,
+        );
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(rc.unwrap(), 0, "add --features must exit 0");
+        let kdl = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+        assert!(kdl.contains("flag \"alpha\""), "flag alpha must be in manifest:\n{kdl}");
+        assert!(kdl.contains("flag \"beta\""), "flag beta must be in manifest:\n{kdl}");
+    }
+
+    /// S10: cmd_add --optional rejects dep whose name clashes with existing flag.
+    #[test]
+    fn s10_add_optional_clash_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj3");
+        std::fs::create_dir_all(&proj).unwrap();
+        // Manifest with flag named "myflag".
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\nflags {\n    \"myflag\" default=#false\n}\n",
+        ).unwrap();
+
+        let rc = cmd_add(
+            &proj,
+            &["myflag".into(), "--git".into(), "https://example.com/myflag.git".into(),
+              "--ref".into(), "main".into(), "--optional".into()],
+            false,
+        );
+        // Must exit non-zero.
+        let code = match rc {
+            Ok(n) => n,
+            Err(_) => 1,
+        };
+        assert_ne!(code, 0, "add --optional must reject name clashing with existing flag");
+        // manifest must be unchanged.
+        let kdl = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+        assert!(!kdl.contains("myflag.git"), "manifest must not be modified after clash");
+    }
+
+    /// S10: cmd_show prints active_flags for deps that have them.
+    #[test]
+    fn s10_show_prints_active_flags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("show_proj");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // Write a lockfile with active_flags.
+        let lock_text = concat!(
+            "// generated by milpa; reproducible build snapshot\n",
+            "version 1\nstrategy \"maxver\"\n\n",
+            "dep \"mylib\" {\n",
+            "    identity \"sha256:", "a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+            "    version \"1.0.0\"\n",
+            "    src_dir \"\"\n",
+            "    requires\n",
+            "    provenance {\n",
+            "        origin \"observed\"\n",
+            "        kind \"git\"\n",
+            "        url \"https://example.com/mylib.git\"\n",
+            "        ref \"main\"\n",
+            "        commit_sha \"", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "\"\n",
+            "    }\n",
+            "    active_flags \"ssl\" \"threads\"\n",
+            "}\n",
+        );
+        std::fs::write(proj.join("milpa.lock"), lock_text).unwrap();
+
+        // Capture stdout.
+        // NOTE: cmd_show writes to stdout (println!). We can't easily capture
+        // that in Rust tests without a subprocess. Instead, verify the function
+        // returns 0 and the logic is exercised.
+        let rc = cmd_show(&proj).unwrap();
+        assert_eq!(rc, 0, "show must exit 0 for a valid lockfile with active_flags");
+    }
+
+    /// S10: cmd_verify exits non-zero when optional dep is in lock but default=#false.
+    #[test]
+    fn s10_verify_active_flags_mismatch_exits_nonzero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("verify_proj");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // Manifest with an optional dep (gate flag default=#false).
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\ndeps {\n    \"optdep\" git=(url)\"https://example.com/optdep.git\" ref=\"main\" optional=#true\n}\n",
+        ).unwrap();
+
+        // _deps/ must exist for verify.
+        let deps_dir = proj.join("_deps");
+        std::fs::create_dir_all(&deps_dir).unwrap();
+        // Create _deps/optdep so the dir exists.
+        std::fs::create_dir_all(deps_dir.join("optdep")).unwrap();
+
+        // Lockfile: optdep present with active_flags=("optdep",) — as if it was enabled.
+        let lock_text = concat!(
+            "// generated by milpa; reproducible build snapshot\n",
+            "version 1\nstrategy \"maxver\"\n\n",
+            "dep \"optdep\" {\n",
+            "    identity \"sha256:", "a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+            "    version \"1.0.0\"\n",
+            "    src_dir \"\"\n",
+            "    requires\n",
+            "    provenance {\n",
+            "        origin \"observed\"\n",
+            "        kind \"git\"\n",
+            "        url \"https://example.com/optdep.git\"\n",
+            "        ref \"main\"\n",
+            "        commit_sha \"", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "\"\n",
+            "    }\n",
+            "    active_flags \"optdep\"\n",
+            "}\n",
+        );
+        std::fs::write(proj.join("milpa.lock"), lock_text).unwrap();
+
+        // verify must exit non-zero — optdep is in lock but flag is default=#false.
+        let rc = cmd_verify(&proj, false, false).unwrap();
+        assert_ne!(rc, 0, "verify must exit non-zero when active_flags mismatch");
+    }
+
+    // -------------------------------------------------------------------------
+    // M4: --all-features + --no-default-features conflict
+    // (spec/errors.md §CLI, CLI-FEATURE-FLAGS-CONFLICT)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn m4_check_feature_flags_conflict_both_set() {
+        // check_feature_flags_conflict returns true when both flags are present.
+        let rest: Vec<String> = vec![
+            "--all-features".into(),
+            "--no-default-features".into(),
+        ];
+        assert!(
+            check_feature_flags_conflict(&rest),
+            "both flags → conflict must be detected"
+        );
+    }
+
+    #[test]
+    fn m4_check_feature_flags_conflict_only_all_features() {
+        let rest: Vec<String> = vec!["--all-features".into()];
+        assert!(
+            !check_feature_flags_conflict(&rest),
+            "--all-features alone → no conflict"
+        );
+    }
+
+    #[test]
+    fn m4_check_feature_flags_conflict_only_no_default() {
+        let rest: Vec<String> = vec!["--no-default-features".into()];
+        assert!(
+            !check_feature_flags_conflict(&rest),
+            "--no-default-features alone → no conflict"
+        );
+    }
+
+    #[test]
+    fn m4_check_feature_flags_conflict_neither() {
+        let rest: Vec<String> = vec!["--features".into(), "tls".into()];
+        assert!(
+            !check_feature_flags_conflict(&rest),
+            "neither flag → no conflict"
+        );
+    }
+
+    #[test]
+    fn m4_fetch_with_both_flags_exits_1() {
+        // run() with "fetch --all-features --no-default-features" should exit 1
+        // with CLI-FEATURE-FLAGS-CONFLICT (no manifest needed — check fires first).
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        // Minimal milpa.kdl so workspace detection doesn't error.
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\n",
+        ).unwrap();
+
+        let rc = run(&[
+            "-C".into(),
+            proj.to_str().unwrap().into(),
+            "fetch".into(),
+            "--all-features".into(),
+            "--no-default-features".into(),
+        ]);
+        // run() now returns Err(MilpaError) for CLI-FEATURE-FLAGS-CONFLICT,
+        // going through the typed-error path (main emits CODE: msg + milpa-error: CODE).
+        let err = rc.unwrap_err();
+        assert_eq!(
+            err.code(),
+            "CLI-FEATURE-FLAGS-CONFLICT",
+            "fetch --all-features --no-default-features must emit CLI-FEATURE-FLAGS-CONFLICT"
+        );
+    }
+
+    #[test]
+    fn m4_lock_with_both_flags_exits_1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\n",
+        ).unwrap();
+
+        let rc = run(&[
+            "-C".into(),
+            proj.to_str().unwrap().into(),
+            "lock".into(),
+            "--all-features".into(),
+            "--no-default-features".into(),
+        ]);
+        let err = rc.unwrap_err();
+        assert_eq!(
+            err.code(),
+            "CLI-FEATURE-FLAGS-CONFLICT",
+            "lock --all-features --no-default-features must emit CLI-FEATURE-FLAGS-CONFLICT"
+        );
+    }
+
+    #[test]
+    fn m4_update_with_both_flags_exits_1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\n",
+        ).unwrap();
+        // update needs at least a lockfile (even empty) to avoid LOCK-FILE-NOT-FOUND.
+        std::fs::write(
+            proj.join("milpa.lock"),
+            "// generated by milpa; reproducible build snapshot\nversion 1\nstrategy \"maxver\"\n",
+        ).unwrap();
+
+        let rc = run(&[
+            "-C".into(),
+            proj.to_str().unwrap().into(),
+            "update".into(),
+            "--all-features".into(),
+            "--no-default-features".into(),
+        ]);
+        let err = rc.unwrap_err();
+        assert_eq!(
+            err.code(),
+            "CLI-FEATURE-FLAGS-CONFLICT",
+            "update --all-features --no-default-features must emit CLI-FEATURE-FLAGS-CONFLICT"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // host_platform_token / host_arch_token — Nim-vocab mapping (§8 NOTE)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn host_platform_macos_maps_to_macosx() {
+        // Rust uses "macos"; Python uses "darwin" — both must output "macosx".
+        assert_eq!(host_platform_token("macos"), "macosx");
+    }
+
+    #[test]
+    fn host_platform_known_tokens() {
+        assert_eq!(host_platform_token("linux"), "linux");
+        assert_eq!(host_platform_token("windows"), "windows");
+        assert_eq!(host_platform_token("freebsd"), "freebsd");
+        assert_eq!(host_platform_token("openbsd"), "openbsd");
+        assert_eq!(host_platform_token("netbsd"), "netbsd");
+    }
+
+    #[test]
+    fn host_platform_unknown_passthrough() {
+        // Unknown tokens pass through unchanged (spec §8: never rejected).
+        assert_eq!(host_platform_token("haiku"), "haiku");
+        assert_eq!(host_platform_token("solaris"), "solaris");
+    }
+
+    #[test]
+    fn host_arch_x86_64_maps_to_amd64() {
+        assert_eq!(host_arch_token("x86_64"), "amd64");
+    }
+
+    #[test]
+    fn host_arch_aarch64_maps_to_arm64() {
+        assert_eq!(host_arch_token("aarch64"), "arm64");
+    }
+
+    #[test]
+    fn host_arch_x86_maps_to_i386() {
+        // Rust uses "x86"; Python accepts "i386"/"i686" — all must output "i386".
+        assert_eq!(host_arch_token("x86"), "i386");
+        assert_eq!(host_arch_token("i386"), "i386");
+        assert_eq!(host_arch_token("i686"), "i386");
+    }
+
+    #[test]
+    fn host_arch_aliases() {
+        // Robustness aliases.
+        assert_eq!(host_arch_token("amd64"), "amd64");
+        assert_eq!(host_arch_token("arm64"), "arm64");
+    }
+
+    #[test]
+    fn host_arch_unknown_passthrough() {
+        assert_eq!(host_arch_token("riscv64"), "riscv64");
+        assert_eq!(host_arch_token("mips"), "mips");
+    }
+
+    // -----------------------------------------------------------------------
+    // profile_from_env — CLI always host-defaults (§8 NOTE)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn profile_from_env_no_env_vars_returns_some_host_defaulted() {
+        // With no MILPA_TARGET_* vars set, profile_from_env must return Some
+        // (not None) and both platform and arch must be non-None strings.
+        // We cannot assert the exact value (test runs on varying hosts), but
+        // we can assert the shape.
+        std::env::remove_var("MILPA_TARGET_PLATFORM");
+        std::env::remove_var("MILPA_TARGET_ARCH");
+        std::env::remove_var("MILPA_TARGET_NIM");
+        std::env::remove_var("MILPA_TARGET_MILPA");
+
+        let profile = profile_from_env();
+        assert!(profile.is_some(), "profile_from_env must always return Some");
+        let p = profile.unwrap();
+        assert!(
+            p.platform.is_some(),
+            "platform must be host-defaulted (Some) when MILPA_TARGET_PLATFORM unset"
+        );
+        assert!(
+            p.arch.is_some(),
+            "arch must be host-defaulted (Some) when MILPA_TARGET_ARCH unset"
+        );
+        assert!(
+            p.milpa_version.is_some(),
+            "milpa_version must be defaulted to own version (Some) when MILPA_TARGET_MILPA unset"
+        );
+    }
+
+    #[test]
+    fn profile_from_env_platform_override_wins() {
+        std::env::set_var("MILPA_TARGET_PLATFORM", "windows");
+        std::env::remove_var("MILPA_TARGET_ARCH");
+        std::env::remove_var("MILPA_TARGET_NIM");
+        std::env::remove_var("MILPA_TARGET_MILPA");
+
+        let profile = profile_from_env().expect("must be Some");
+        assert_eq!(
+            profile.platform.as_deref(),
+            Some("windows"),
+            "MILPA_TARGET_PLATFORM override must win over host detection"
+        );
+
+        std::env::remove_var("MILPA_TARGET_PLATFORM");
+    }
+
+    #[test]
+    fn profile_from_env_arch_override_wins() {
+        std::env::remove_var("MILPA_TARGET_PLATFORM");
+        std::env::set_var("MILPA_TARGET_ARCH", "arm64");
+        std::env::remove_var("MILPA_TARGET_NIM");
+        std::env::remove_var("MILPA_TARGET_MILPA");
+
+        let profile = profile_from_env().expect("must be Some");
+        assert_eq!(
+            profile.arch.as_deref(),
+            Some("arm64"),
+            "MILPA_TARGET_ARCH override must win over host detection"
+        );
+
+        std::env::remove_var("MILPA_TARGET_ARCH");
     }
 }

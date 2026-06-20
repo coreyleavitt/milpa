@@ -25,6 +25,10 @@ pub use format::format_manifest;
 // references to `milpa_manifest::Predicate` and `crate::Predicate` compile
 // unchanged.
 pub use milpa_types::Predicate;
+// Re-export FlagRequest from milpa-types (the new SSOT) so all existing
+// references to `milpa_manifest::FlagRequest` and `crate::FlagRequest`
+// compile unchanged.
+pub use milpa_types::FlagRequest;
 
 /// Highest manifest spec-version epoch this implementation understands
 /// (grammar §4.4). Bumped only for breaking semantic changes; additive
@@ -35,13 +39,6 @@ pub const MANIFEST_SPEC_VERSION: i64 = 1;
 // Data model — mirrors `milpa/manifest.py` (one design, two impls).
 // ---------------------------------------------------------------------------
 
-/// A consumer's request for a specific flag state on a dep (grammar §3.6).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlagRequest {
-    pub name: String,
-    pub enabled: bool,
-}
-
 /// A dep declared by git URL + ref (grammar §3.2 UrlDep).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UrlDep {
@@ -51,6 +48,10 @@ pub struct UrlDep {
     pub mirrors: Vec<String>,
     pub predicates: Vec<Predicate>,
     pub flag_requests: Vec<FlagRequest>,
+    /// S7 (RFC #23 §3.2): retained for round-trip serialization.
+    /// The parse-time desugar injects the auto-flag + gate predicate;
+    /// `format_manifest` emits `optional=#true` instead of the gate.
+    pub optional: bool,
 }
 
 /// A dep resolved through the tianguis index by name (grammar §3.2 NamedDep).
@@ -62,6 +63,8 @@ pub struct UrlDep {
 ///   parse time. `None` iff `constraint` is `None`. The manifest parser rejects
 ///   an unparseable string at the parse boundary with `MAN-DEP-NAMED-CONSTRAINT`;
 ///   the resolver consumes this field directly and never re-parses manifest deps.
+/// - `flag_requests` — consumer feature-flag requests (§3.1.5 S3 RFC #23),
+///   structurally identical to `UrlDep.flag_requests` (SSOT: reuses `FlagRequest`).
 #[derive(Debug, Clone)]
 pub struct NamedDep {
     pub name: String,
@@ -69,6 +72,14 @@ pub struct NamedDep {
     pub constraint: Option<String>,
     /// Pre-parsed `VersionSet`; `None` iff `constraint` is `None`.
     pub parsed_constraint: Option<VersionSet>,
+    /// Consumer feature-flag requests on this dep (§3.1.5, S3 RFC #23).
+    /// Structurally identical to `UrlDep.flag_requests` — reuses `FlagRequest` (SSOT).
+    pub flag_requests: Vec<FlagRequest>,
+    /// S7 (RFC #23 §3.2): retained for round-trip. Desugar injects gate predicate.
+    pub optional: bool,
+    /// S7: auto-injected gate predicate from optional desugaring (flag=<depname>).
+    /// The resolver uses this via `dep.predicates()` for flag-filtering.
+    pub predicates: Vec<Predicate>,
 }
 
 impl PartialEq for NamedDep {
@@ -83,25 +94,42 @@ impl PartialEq for NamedDep {
 impl Eq for NamedDep {}
 
 /// A dep declared by local filesystem path (grammar §3.2 LocalDep).
+///
+/// `predicates` are evaluated before the dep is passed to the solver
+/// (§6.3 NORMATIVE: all five dep forms support `when`-conditional syntax).
+/// Populated from enclosing `when` block predicates in `expand_dep_child`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalDep {
     pub name: String,
     pub path: String,
+    pub predicates: Vec<Predicate>,
 }
 
 /// A dep declared by tarball URL (grammar §3.2 TarballDep).
+///
+/// `predicates` are evaluated before the dep is passed to the solver
+/// (§6.3 NORMATIVE: all five dep forms support `when`-conditional syntax).
+/// Populated from enclosing `when` block predicates in `expand_dep_child`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TarballDep {
     pub name: String,
     pub url: String,
     pub sha256: Option<String>,
     pub strip_components: u32,
+    pub predicates: Vec<Predicate>,
 }
 
 /// A workspace-internal member reference (grammar §3.2 MemberDep).
+///
+/// `predicates` are evaluated before the dep is passed to the solver
+/// (§6.3 NORMATIVE: all five dep forms support `when`-conditional syntax).
+/// Populated from enclosing `when` block predicates in `expand_dep_child`.
+/// Note: MAN-DEP-MEMBER-PROPS still forbids properties directly ON the member
+/// node — predicates come exclusively from enclosing `when` blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberDep {
     pub name: String,
+    pub predicates: Vec<Predicate>,
 }
 
 /// A declared dependency edge — one of the five disjoint forms.
@@ -125,21 +153,60 @@ impl Dep {
         }
     }
 
-    /// The conditional predicates on this dep (only UrlDep carries them today).
+    /// The conditional predicates on this dep.
+    ///
+    /// All five dep forms carry predicates (§6.3 NORMATIVE: all five dep forms
+    /// support `when`-conditional syntax). Direct field access across all arms.
     pub fn predicates(&self) -> &[Predicate] {
         match self {
             Dep::Url(d) => &d.predicates,
-            _ => &[],
+            Dep::Named(d) => &d.predicates,
+            Dep::Local(d) => &d.predicates,
+            Dep::Tarball(d) => &d.predicates,
+            Dep::Member(d) => &d.predicates,
         }
     }
 }
 
-/// A `pkg`-form override (grammar §3.4).
+/// Discriminated union of override target kinds (S8, RFC #23 §3.3).
+///
+/// Exactly one variant per `pkg` rule; zero or multiple forms raise
+/// `MAN-OVERRIDE-TARGET-AMBIGUOUS`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverrideTarget {
+    /// `pkg "name" git=(url)"..." ref="..."` — git fork.
+    /// Identity-bearing; CAS-admissible.
+    Git { url: String, git_ref: String },
+    /// `pkg "name" local="<relative-path>"` — local filesystem path.
+    /// Liveness-only; NOT CAS-admissible; non-reproducible for external consumers.
+    /// Resolution wired in S8a.
+    Local { path: String },
+    /// `pkg "name" { member "<member-name>" }` — workspace member.
+    /// Identity-bearing; NOT CAS-admissible.
+    /// Resolution wired in S8b.
+    Member { member_name: String },
+}
+
+/// A `pkg`-form override (S8 discriminated union, grammar §3.4).
+///
+/// `name` is the dep to intercept; `target` is exactly one of
+/// `Git`, `Local`, or `Member`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Override {
     pub name: String,
-    pub git: String,
-    pub git_ref: String,
+    pub target: OverrideTarget,
+}
+
+/// A cross-package flag-activation entry inside an `enables` node (S1 RFC #23 §3.1.1).
+///
+/// Reuses [`FlagRequest`] for the per-flag requests (SSOT — structurally identical to
+/// the §3.6 consumer flag request form already on `UrlDep.flag_requests`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossPkgEnable {
+    /// The dep node-name (the KDL identifier naming the dependency).
+    pub dep: String,
+    /// The `flag` children on that dep node.
+    pub flag_requests: Vec<FlagRequest>,
 }
 
 /// A named feature flag declared by a package (grammar §3.5).
@@ -149,6 +216,13 @@ pub struct FlagDecl {
     pub default: bool,
     pub description: String,
     pub defines: Vec<String>,
+    /// Same-package flag names this flag enables when active (S1 RFC #23 §3.1.1).
+    /// Multiple `enables` nodes union into this vec.
+    pub enables_same_pkg: Vec<String>,
+    /// Cross-package dep→flag activation entries (S1 RFC #23 §3.1.1).
+    pub enables_cross_pkg: Vec<CrossPkgEnable>,
+    /// Same-package flag names that cannot be co-active with this flag (S1 RFC #23 §3.1.4).
+    pub conflicts: Vec<String>,
 }
 
 /// A parsed `milpa.kdl` package manifest.
@@ -167,6 +241,10 @@ pub struct Manifest {
     pub spec_version_explicit: bool,
     /// S5: attestation policy from `attestation-policy "strict"|"permissive"` (default: permissive).
     pub attestation_policy: AttestationPolicy,
+    /// S7: flag names that were auto-injected by optional-dep desugaring.
+    /// `format_manifest` skips these from the `flags {}` block (they're implied
+    /// by `optional=#true` on the dep; serializing them would cause a re-parse clash).
+    pub optional_auto_flags: std::collections::BTreeSet<String>,
 }
 
 /// S5: Attestation policy — controls fallback-warning vs. hard-error behaviour
@@ -182,10 +260,15 @@ pub enum AttestationPolicy {
 /// directory paths + optional workspace-level overrides. Member *names* are
 /// intrinsic to each member's own manifest and resolved at workspace-load
 /// time (S11) — at parse time a member is just its path.
+///
+/// S11 (RFC #23 §3.8): workspace root may carry a `flags {}` block whose
+/// default-true activations apply workspace-wide. Reuses `FlagDecl` (SSOT —
+/// no parallel flag type).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Workspace {
     pub members: Vec<String>,
     pub overrides: Vec<Override>,
+    pub flags: Vec<FlagDecl>,  // S11: workspace-root flags (§3.8)
 }
 
 /// The two disjoint manifest roles (grammar §1). Detected by the presence of a
@@ -292,11 +375,15 @@ const MAN_CODES: &[&str] = &[
     "MAN-KIND-ARITY",
     "MAN-KIND-INVALID",
     "MAN-SRC-DIR-TYPE",
+    "MAN-SRC-DIR-UNSAFE",
     "MAN-CAS-DIR-MISSING",
     "MAN-CAS-DIR-TYPE",
     "MAN-SPEC-VERSION-TYPE",
     "MAN-SPEC-VERSION-UNSUPPORTED",
     "MAN-DEP-DUPLICATE",
+    "MAN-DEP-NAME-INVALID",
+    "MAN-DEP-OPTIONAL-FLAG-CLASH",
+    "MAN-DEP-OPTIONAL-INVALID-NAME",
     "MAN-DEP-UNKNOWN-PROPS",
     "MAN-DEP-REF-MISSING",
     "MAN-DEP-LOCAL-PATH",
@@ -318,10 +405,16 @@ const MAN_CODES: &[&str] = &[
     "MAN-OVERRIDE-KIND",
     "MAN-OVERRIDE-ARITY",
     "MAN-OVERRIDE-UNKNOWN-PROPS",
+    "MAN-OVERRIDE-TARGET-AMBIGUOUS",
     "MAN-OVERRIDE-GIT-MISSING",
     "MAN-OVERRIDE-REF-MISSING",
     "MAN-OVERRIDE-DUPLICATE",
+    "MAN-FLAG-CONFLICTS-UNDECLARED",
+    "MAN-FLAG-CONFLICTS-SELF",
+    "MAN-FLAG-DEFINES-UNSAFE",
     "MAN-FLAG-DUPLICATE",
+    "MAN-FLAG-ENABLES-UNDECLARED",
+    "MAN-FLAG-NAME-INVALID",
     "MAN-FLAG-POS-ARGS",
     "MAN-FLAG-UNKNOWN-PROPS",
     "MAN-FLAG-DEFAULT-TYPE",
@@ -363,12 +456,34 @@ fn args(node: &KdlNode) -> Vec<&KdlEntry> {
         .collect()
 }
 
-/// Property entries of a node as `(key, entry)`, in source order. Duplicate
-/// keys are preserved; [`prop`] applies last-wins for lookups.
+/// Property entries of a node as `(key, entry)`, in source order with
+/// last-wins deduplication.
+///
+/// KDL 2.0 §5.5: when the same property key appears more than once on a node,
+/// the last occurrence wins; earlier occurrences are discarded.  This mirrors
+/// `kdl-py`'s dict-update semantics so both implementations produce byte-identical
+/// output for manifests with duplicate property keys.
 fn props(node: &KdlNode) -> Vec<(&str, &KdlEntry)> {
-    node.entries()
+    // Collect all property entries in source order, then keep only the last
+    // occurrence of each key (last-wins).  We walk the list twice: once
+    // forward to note which index is the last occurrence of each key, then
+    // once more to emit only those entries.
+    let all: Vec<(&str, &KdlEntry)> = node
+        .entries()
         .iter()
         .filter_map(|e| e.name().map(|n| (n.value(), e)))
+        .collect();
+    // Record the index of the last occurrence for each key.
+    let mut last_idx: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for (i, (k, _)) in all.iter().enumerate() {
+        last_idx.insert(k, i);
+    }
+    // Emit only entries whose index matches the last occurrence of their key.
+    all.into_iter()
+        .enumerate()
+        .filter(|(i, (k, _))| last_idx.get(k) == Some(i))
+        .map(|(_, pair)| pair)
         .collect()
 }
 
@@ -399,7 +514,7 @@ fn children(node: &KdlNode) -> Vec<&KdlNode> {
 }
 
 const PREDICATE_PROPS: &[&str] = &["platform", "arch", "nim", "milpa", "flag"];
-const URL_DEP_PROPS: &[&str] = &["git", "ref", "platform", "arch", "nim", "milpa", "flag"];
+const URL_DEP_PROPS: &[&str] = &["git", "ref", "platform", "arch", "nim", "milpa", "flag", "optional"];
 const FLAG_DECL_PROPS: &[&str] = &["default", "description"];
 const VALID_KINDS: &[&str] = &["library", "application"];
 const VALID_GIT_SCHEMES: &[&str] = &["https", "http", "ssh", "git"];
@@ -416,7 +531,7 @@ const PACKAGE_TOP_LEVEL: &[&str] = &[
     "spec-version",
     "attestation-policy",
 ];
-const WORKSPACE_TOP_LEVEL: &[&str] = &["workspace", "name", "overrides", "spec-version"];
+const WORKSPACE_TOP_LEVEL: &[&str] = &["workspace", "name", "overrides", "spec-version", "flags"];
 
 // ---------------------------------------------------------------------------
 // Entry points.
@@ -446,6 +561,66 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, ManifestError> {
 pub fn parse_workspace(text: &str) -> Result<Workspace, ManifestError> {
     let doc = parse_kdl(text)?;
     parse_workspace_doc(&doc)
+}
+
+/// Monotone least-fixpoint of same-package `enables` over one manifest's flag table.
+///
+/// S2 (RFC #23 §7 + §3.1.2).
+///
+/// # Arguments
+/// - `flags`: the `FlagDecl` slice from a single manifest.
+/// - `seed`: the starting active-flag-name set (e.g. default-true flags,
+///   CLI-requested flags, or a cross-package request set).
+///
+/// # Returns
+/// The closure: `seed` ∪ every same-package flag reachable by following
+/// `enables_same_pkg` edges from any active flag, to a fixed point.
+///
+/// # Properties (§3.1.2)
+/// - **Seed inclusion**: result ⊇ seed.
+/// - **Transitive**: follows multi-hop `enables` chains.
+/// - **Idempotence**: `closure(closure(S)) == closure(S)`.
+/// - **Cycle termination**: `a enables b, b enables a` → `{a, b}` in O(n).
+/// - **Order-independence**: result is independent of flag declaration order
+///   (union is commutative).
+/// - **Cross-package ignored**: `enables_cross_pkg` entries are NOT followed
+///   here — they are activated at resolve time in S3/S4a.
+/// - **Unknown targets skipped**: any `enables` target not in the flag table
+///   is silently ignored (post-parse validation ensures this is unreachable in
+///   practice, but the function is safe on partially-built tables).
+///
+/// # Design note
+/// The caller seeds from `default=true` flags
+/// (`flags.iter().filter(|f| f.default).map(|f| &f.name)`).
+/// Default-seeding is the caller's responsibility — this function is a
+/// single-responsibility SSOT for the fixpoint only.
+pub fn flag_enables_closure(
+    flags: &[FlagDecl],
+    seed: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    use std::collections::{HashMap, HashSet};
+
+    // Build a name→enables_same_pkg lookup for O(1) access.
+    let enables_by_name: HashMap<&str, &[String]> = flags
+        .iter()
+        .map(|fd| (fd.name.as_str(), fd.enables_same_pkg.as_slice()))
+        .collect();
+
+    let mut active: HashSet<String> = seed.clone();
+    let mut worklist: Vec<String> = seed.iter().cloned().collect();
+
+    while let Some(flag_name) = worklist.pop() {
+        if let Some(targets) = enables_by_name.get(flag_name.as_str()) {
+            for target in *targets {
+                // Only follow same-pkg targets that are actually declared.
+                if !active.contains(target) && enables_by_name.contains_key(target.as_str()) {
+                    active.insert(target.clone());
+                    worklist.push(target.clone());
+                }
+            }
+        }
+    }
+    active
 }
 
 /// Maximum structural `{` brace nesting depth accepted before handing input to
@@ -491,15 +666,60 @@ pub fn kdl_brace_depth(text: &str) -> usize {
     max
 }
 
+/// Return the maximum `/* */` block-comment nesting depth observed in `text`.
+///
+/// Like [`kdl_brace_depth`], this is a conservative O(n) pre-scan that counts
+/// every `/*` and `*/` byte-pair regardless of context (strings, other comments).
+/// It over-counts, so it is a safe upper bound.
+///
+/// KDL 2.0 allows nested block comments (`/* /* */ */`).  kdl-rs is
+/// recursive-descent with no internal depth limit; deeply-nested block comments
+/// cause the same stack overflow risk as deeply-nested braces.  This guard
+/// mirrors Python's `_check_nesting_depth` which tracks both vectors
+/// independently.
+pub fn kdl_block_comment_depth(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth: usize = 0;
+    let mut max: usize = 0;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            depth += 1;
+            if depth > max {
+                max = depth;
+            }
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+            depth = depth.saturating_sub(1);
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    max
+}
+
 fn parse_kdl(text: &str) -> Result<KdlDocument, ManifestError> {
     // Depth guard: kdl-rs 6.7.1 is recursive-descent with no internal stack
     // limit; deeply-nested input causes an OS stack overflow (SIGABRT — not
     // a catchable panic).  Reject before calling the parser.
+    // Both brace depth AND block-comment depth are checked, mirroring Python's
+    // `_check_nesting_depth` which tracks both vectors independently.
     if kdl_brace_depth(text) > KDL_MAX_NESTING_DEPTH {
         return Err(err(
             "MAN-KDL-SYNTAX",
             format!(
                 "KDL input exceeds maximum nesting depth ({KDL_MAX_NESTING_DEPTH})"
+            ),
+        ));
+    }
+    if kdl_block_comment_depth(text) > KDL_MAX_NESTING_DEPTH {
+        return Err(err(
+            "MAN-KDL-SYNTAX",
+            format!(
+                "KDL input exceeds maximum block-comment nesting depth ({KDL_MAX_NESTING_DEPTH})"
             ),
         ));
     }
@@ -517,6 +737,7 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
     let mut members: Vec<String> = Vec::new();
     let mut overrides: Vec<Override> = Vec::new();
     let mut seen_override_names: BTreeSet<String> = BTreeSet::new();
+    let mut ws_flags: Vec<FlagDecl> = Vec::new();
 
     for node in doc.nodes() {
         match node.name().value() {
@@ -574,6 +795,13 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
                     overrides.push(ov);
                 }
             }
+            "flags" => {
+                // S11 (RFC #23 §3.8): workspace-root flags {}.
+                // Reuses parse_flag_decl (SSOT).
+                for child in children(node) {
+                    ws_flags.push(parse_flag_decl(child)?);
+                }
+            }
             "name" => { /* informational only (grammar §7); accepted, discarded */ }
             other => {
                 return Err(err(
@@ -588,12 +816,130 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
         }
     }
 
-    Ok(Workspace { members, overrides })
+    Ok(Workspace { members, overrides, flags: ws_flags })
 }
 
 // ---------------------------------------------------------------------------
 // Package document.
 // ---------------------------------------------------------------------------
+
+/// S7 (RFC #23 §3.2): parse-time desugaring of `optional=#true` deps.
+///
+/// Desugaring rules:
+/// 1. Namespace hygiene: non-optional deps must not share a name with any
+///    declared flag (raises `MAN-DEP-OPTIONAL-FLAG-CLASH`).
+/// 2. For each optional dep:
+///    a. Clash check: name must not collide with any already-declared or
+///       already-auto-injected flag (raises `MAN-DEP-OPTIONAL-FLAG-CLASH`).
+///    b. Auto-inject a `FlagDecl { name: dep.name, default: false }`.
+///    c. Inject a gate predicate `flag=<depname>` onto the dep (idempotent).
+/// 3. Returns `(deps, dev_deps, updated_flags, auto_flag_names)`.
+///
+/// Note: charset validation (`[A-Za-z0-9_-]+`) is performed earlier by the
+/// dep-name parser (`MAN-DEP-NAME-INVALID`), which runs for ALL five dep forms
+/// (UrlDep, NamedDep, LocalDep, TarballDep, MemberDep) before optional
+/// desugaring.  `MAN-DEP-OPTIONAL-INVALID-NAME` is only raised by
+/// `milpa add --optional` when the supplied name violates the flag-name charset.
+fn desugar_optional_deps(
+    deps: Vec<Dep>,
+    dev_deps: Vec<Dep>,
+    mut flags: Vec<FlagDecl>,
+    declared: &BTreeSet<String>,
+) -> Result<(Vec<Dep>, Vec<Dep>, Vec<FlagDecl>, std::collections::BTreeSet<String>), ManifestError>
+{
+    use std::collections::BTreeSet;
+
+    // Namespace hygiene: non-optional deps must not share names with declared flags.
+    for dep in deps.iter().chain(dev_deps.iter()) {
+        let is_optional = match dep {
+            Dep::Url(u) => u.optional,
+            Dep::Named(n) => n.optional,
+            _ => false,
+        };
+        if !is_optional && declared.contains(dep.name()) {
+            return Err(err(
+                "MAN-DEP-OPTIONAL-FLAG-CLASH",
+                format!(
+                    "dep {:?} shares a name with a declared flag — rename the dep or the flag",
+                    dep.name()
+                ),
+            ));
+        }
+    }
+
+    let mut injected: BTreeSet<String> = BTreeSet::new();
+
+    let desugar_dep = |dep: Dep,
+                       flags: &mut Vec<FlagDecl>,
+                       injected: &mut BTreeSet<String>|
+     -> Result<Dep, ManifestError> {
+        let is_optional = match &dep {
+            Dep::Url(u) => u.optional,
+            Dep::Named(n) => n.optional,
+            _ => false,
+        };
+        if !is_optional {
+            return Ok(dep);
+        }
+        let dep_nm = dep.name().to_string();
+
+        // 1. Clash check.
+        if declared.contains(&dep_nm) || injected.contains(&dep_nm) {
+            return Err(err(
+                "MAN-DEP-OPTIONAL-FLAG-CLASH",
+                format!(
+                    "optional dep {dep_nm:?}: name collides with an already-declared flag"
+                ),
+            ));
+        }
+
+        // 2. Inject auto-flag.
+        injected.insert(dep_nm.clone());
+        flags.push(FlagDecl {
+            name: dep_nm.clone(),
+            default: false,
+            description: String::new(),
+            defines: Vec::new(),
+            enables_same_pkg: Vec::new(),
+            enables_cross_pkg: Vec::new(),
+            conflicts: Vec::new(),
+        });
+
+        // 3. Inject gate predicate (idempotent).
+        let gate_pred = Predicate {
+            name: "flag".to_string(),
+            values: vec![dep_nm.clone()],
+            negated: false,
+        };
+
+        match dep {
+            Dep::Url(mut u) => {
+                if !u.predicates.contains(&gate_pred) {
+                    u.predicates.push(gate_pred);
+                }
+                Ok(Dep::Url(u))
+            }
+            Dep::Named(mut n) => {
+                if !n.predicates.contains(&gate_pred) {
+                    n.predicates.push(gate_pred);
+                }
+                Ok(Dep::Named(n))
+            }
+            other => Ok(other),
+        }
+    };
+
+    let mut new_deps = Vec::with_capacity(deps.len());
+    for dep in deps {
+        new_deps.push(desugar_dep(dep, &mut flags, &mut injected)?);
+    }
+    let mut new_dev_deps = Vec::with_capacity(dev_deps.len());
+    for dep in dev_deps {
+        new_dev_deps.push(desugar_dep(dep, &mut flags, &mut injected)?);
+    }
+
+    Ok((new_deps, new_dev_deps, flags, injected))
+}
 
 fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
     let mut deps: Vec<Dep> = Vec::new();
@@ -646,7 +992,20 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
                         "'src_dir' takes exactly one positional string argument",
                     ));
                 }
-                src_dir = val.unwrap().to_string();
+                let v = val.unwrap();
+                // R2-C2 + R2-Unicode fix: reject control chars and Unicode line
+                // separators — src_dir flows verbatim to nim.cfg --path: lines.
+                if contains_unsafe_char(v) {
+                    return Err(err(
+                        "MAN-SRC-DIR-UNSAFE",
+                        format!(
+                            "'src_dir' value contains a control character or \
+                             Unicode line separator (U+2028/U+2029) — this would allow \
+                             nim.cfg injection; rejected at parse boundary"
+                        ),
+                    ));
+                }
+                src_dir = v.to_string();
             }
             "cas" => {
                 cas_dir = parse_cas(node)?;
@@ -774,8 +1133,31 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
         ));
     }
 
+    // S7 (RFC #23 §3.2): parse-time optional desugaring.
+    // Runs FIRST among the post-parse passes so auto-injected flag names are
+    // visible to the reference checks (enables, conflicts, flag predicates) below.
+    let dep_names: BTreeSet<String> = deps
+        .iter()
+        .chain(dev_deps.iter())
+        .filter_map(|d| match d {
+            Dep::Member(_) => None,
+            d => Some(d.name().to_string()),
+        })
+        .collect();
+
+    // Pre-desugar declared flag set (subset of what the desugar function needs
+    // to perform namespace-hygiene checks).
+    let pre_desugar_declared: BTreeSet<String> =
+        flags.iter().map(|f| f.name.clone()).collect();
+
+    let (deps, dev_deps, flags, optional_auto_flags) =
+        desugar_optional_deps(deps, dev_deps, flags, &pre_desugar_declared)?;
+
+    // Recompute `declared` after desugar (auto-injected flags are now visible).
+    let declared: BTreeSet<String> = flags.iter().map(|f| f.name.clone()).collect();
+
     // `when flag="X"` must reference a declared flag (grammar §3.5).
-    let declared: BTreeSet<&str> = flags.iter().map(|f| f.name.as_str()).collect();
+    // Runs AFTER desugar so auto-gate predicates don't falsely trigger this.
     for dep in deps.iter().chain(dev_deps.iter()) {
         for pred in dep.predicates() {
             if pred.name != "flag" {
@@ -795,6 +1177,55 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
         }
     }
 
+    // S1 (RFC #23 §3.1.1): Post-parse validation for `enables` bare same-pkg names.
+    // Runs AFTER desugar so `enables "optlib"` for `optlib optional=#true` dep is valid.
+    for fd in &flags {
+        for flag_name_ref in &fd.enables_same_pkg {
+            if !declared.contains(flag_name_ref.as_str()) {
+                let base = format!(
+                    "flag {:?}: enables references undeclared flag {:?}",
+                    fd.name, flag_name_ref
+                );
+                let msg = if dep_names.contains(flag_name_ref.as_str()) {
+                    format!(
+                        "{base} ({flag_name_ref:?} is a dependency, not a flag\
+                         — add optional=#true to make it a feature)"
+                    )
+                } else {
+                    base
+                };
+                return Err(err("MAN-FLAG-ENABLES-UNDECLARED", msg));
+            }
+        }
+    }
+
+    // M5: Post-parse validation for `conflicts` bare same-pkg names.
+    // Forward references are legal (we validate AFTER the full flags table is built).
+    // Same-package only — cross-package conflicts deferred (#151).
+    // Self-reference (flag conflicts with itself) is rejected first (MAN-FLAG-CONFLICTS-SELF).
+    for fd in &flags {
+        for flag_name_ref in &fd.conflicts {
+            if flag_name_ref == &fd.name {
+                return Err(err(
+                    "MAN-FLAG-CONFLICTS-SELF",
+                    format!(
+                        "flag {:?}: conflicts with itself — a flag cannot list its own name in conflicts",
+                        fd.name
+                    ),
+                ));
+            }
+            if !declared.contains(flag_name_ref.as_str()) {
+                return Err(err(
+                    "MAN-FLAG-CONFLICTS-UNDECLARED",
+                    format!(
+                        "flag {:?}: conflicts references undeclared flag {:?}",
+                        fd.name, flag_name_ref
+                    ),
+                ));
+            }
+        }
+    }
+
     Ok(Manifest {
         name,
         kind,
@@ -808,6 +1239,7 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
         spec_version,
         spec_version_explicit,
         attestation_policy,
+        optional_auto_flags,
     })
 }
 
@@ -917,10 +1349,36 @@ fn expand_dep_child(child: &KdlNode, inherited: &[Predicate]) -> Result<Vec<Dep>
     }
     let mut dep = parse_dep(child)?;
     if !inherited.is_empty() {
-        if let Dep::Url(ref mut u) = dep {
-            let mut merged = inherited.to_vec();
-            merged.append(&mut u.predicates);
-            u.predicates = merged;
+        // Thread inherited when-block predicates into all five dep forms.
+        // §6.3 NORMATIVE: all five forms (UrlDep, NamedDep, LocalDep, TarballDep,
+        // MemberDep) support when-conditional syntax.  Inherited predicates are
+        // prepended (outer predicates come first; dep's own predicates follow).
+        match dep {
+            Dep::Url(ref mut u) => {
+                let mut merged = inherited.to_vec();
+                merged.append(&mut u.predicates);
+                u.predicates = merged;
+            }
+            Dep::Named(ref mut n) => {
+                let mut merged = inherited.to_vec();
+                merged.append(&mut n.predicates);
+                n.predicates = merged;
+            }
+            Dep::Local(ref mut l) => {
+                let mut merged = inherited.to_vec();
+                merged.append(&mut l.predicates);
+                l.predicates = merged;
+            }
+            Dep::Tarball(ref mut t) => {
+                let mut merged = inherited.to_vec();
+                merged.append(&mut t.predicates);
+                t.predicates = merged;
+            }
+            Dep::Member(ref mut m) => {
+                let mut merged = inherited.to_vec();
+                merged.append(&mut m.predicates);
+                m.predicates = merged;
+            }
         }
     }
     Ok(vec![dep])
@@ -930,6 +1388,20 @@ fn expand_dep_child(child: &KdlNode, inherited: &[Predicate]) -> Result<Vec<Dep>
 fn parse_dep(node: &KdlNode) -> Result<Dep, ManifestError> {
     if node.name().value() == "member" {
         return Ok(Dep::Member(parse_member_dep(node)?));
+    }
+    // R2-C1 security fix: validate dep name charset at parse boundary.
+    // KDL 2.0 quoted node names can contain chars outside [A-Za-z0-9_-].
+    // A dep name with \n (or other nim.cfg-significant char) would inject content
+    // via --path:"_deps/<name>" and -d:<pkg>_<flag> emit lines in nimcfg.rs.
+    let dep_nm = node.name().value();
+    if !valid_flag_name(dep_nm) {
+        return Err(err(
+            "MAN-DEP-NAME-INVALID",
+            format!(
+                "dep {dep_nm:?}: dep names must match [A-Za-z0-9_-]+ \
+                 (no spaces, control characters, or nim.cfg-significant chars)"
+            ),
+        ));
     }
     let names = prop_names(node);
     if names.contains("git") {
@@ -978,6 +1450,20 @@ fn parse_url_dep(node: &KdlNode) -> Result<UrlDep, ManifestError> {
     let inline_preds = parse_predicates_subset(node, &format!("dep {name:?}"))?;
     let predicates = merge_predicates(&name, inline_preds, child_preds)?;
 
+    // optional= (bool, default false): parsed here, desugared post-parse.
+    let optional = match prop(node, "optional") {
+        None => false,
+        Some(e) => match e.value() {
+            KdlValue::Bool(b) => *b,
+            _ => {
+                return Err(err(
+                    "MAN-DEP-UNKNOWN-PROPS",
+                    format!("dep {name:?}: 'optional=' must be a boolean (#true or #false)"),
+                ));
+            }
+        },
+    };
+
     Ok(UrlDep {
         name,
         git,
@@ -985,6 +1471,7 @@ fn parse_url_dep(node: &KdlNode) -> Result<UrlDep, ManifestError> {
         mirrors,
         predicates,
         flag_requests,
+        optional,
     })
 }
 
@@ -1075,6 +1562,7 @@ fn parse_local_dep(node: &KdlNode) -> Result<LocalDep, ManifestError> {
         Some(p) if !p.is_empty() => Ok(LocalDep {
             name,
             path: p.to_string(),
+            predicates: vec![], // Populated by expand_dep_child from when-block.
         }),
         _ => Err(err(
             "MAN-DEP-LOCAL-PATH",
@@ -1141,6 +1629,7 @@ fn parse_tarball_dep(node: &KdlNode) -> Result<TarballDep, ManifestError> {
         url,
         sha256,
         strip_components,
+        predicates: vec![], // Populated by expand_dep_child from when-block.
     })
 }
 
@@ -1159,26 +1648,52 @@ fn parse_member_dep(node: &KdlNode) -> Result<MemberDep, ManifestError> {
             "'member' dep takes exactly one positional string argument",
         ));
     }
+    // R6-F3 security fix: validate member name charset at parse boundary.
+    // The name flows to ResolvedDep.name → nimcfg --path: lines, same
+    // injection class as the R2-C1 dep-name fix.  Reuse SSOT charset predicate.
+    let nm = val.unwrap();
+    if !valid_flag_name(nm) {
+        return Err(err(
+            "MAN-DEP-NAME-INVALID",
+            format!(
+                "member {nm:?}: dep names must match [A-Za-z0-9_-]+ \
+                 (no spaces, control characters, or nim.cfg-significant chars)"
+            ),
+        ));
+    }
     Ok(MemberDep {
-        name: val.unwrap().to_string(),
+        name: nm.to_string(),
+        predicates: vec![], // Populated by expand_dep_child from when-block.
     })
 }
 
 fn parse_named_dep(node: &KdlNode) -> Result<NamedDep, ManifestError> {
     let name = node.name().value().to_string();
-    if !props(node).is_empty() {
-        return Err(err(
-            "MAN-DEP-NAMED-PROPS",
-            format!("dep {name:?}: unknown property/properties on a named dep"),
-        ));
+    // Only `optional` is a valid property on NamedDep (git= routes to UrlDep).
+    let optional = match prop(node, "optional") {
+        None => false,
+        Some(e) => match e.value() {
+            KdlValue::Bool(b) => *b,
+            _ => {
+                return Err(err(
+                    "MAN-DEP-NAMED-PROPS",
+                    format!("dep {name:?}: 'optional=' must be a boolean (#true or #false)"),
+                ));
+            }
+        },
+    };
+    // Any property besides `optional` is an error.
+    for (key, _) in props(node) {
+        if key != "optional" {
+            return Err(err(
+                "MAN-DEP-NAMED-PROPS",
+                format!("dep {name:?}: unknown property/properties {key:?} on a named dep"),
+            ));
+        }
     }
     let a = args(node);
-    match a.len() {
-        0 => Ok(NamedDep {
-            name,
-            constraint: None,
-            parsed_constraint: None,
-        }),
+    let (constraint, parsed_constraint) = match a.len() {
+        0 => (None, None),
         1 => {
             let raw_str = match a[0].value().as_string() {
                 Some(c) => c.to_string(),
@@ -1197,17 +1712,36 @@ fn parse_named_dep(node: &KdlNode) -> Result<NamedDep, ManifestError> {
                     format!("dep {name:?}: invalid version constraint {raw_str:?}: {e}"),
                 )
             })?;
-            Ok(NamedDep {
-                name,
-                constraint: Some(raw_str),
-                parsed_constraint: Some(parsed),
-            })
+            (Some(raw_str), Some(parsed))
         }
-        n => Err(err(
-            "MAN-DEP-NAMED-ARITY",
-            format!("dep {name:?}: named deps take at most one positional argument; got {n}"),
-        )),
+        n => {
+            return Err(err(
+                "MAN-DEP-NAMED-ARITY",
+                format!("dep {name:?}: named deps take at most one positional argument; got {n}"),
+            ))
+        }
+    };
+    // Parse children: only ``flag`` child nodes accepted (§3.1.5, S3 RFC #23).
+    let mut flag_requests: Vec<FlagRequest> = Vec::new();
+    for child in children(node) {
+        let child_nm = child.name().value();
+        if child_nm == "flag" {
+            flag_requests.push(parse_flag_request(&name, child)?);
+        } else {
+            return Err(err(
+                "MAN-DEP-UNKNOWN-CHILD",
+                format!("dep {name:?}: unknown child node {child_nm:?}; only \"flag\" is valid on a named dep"),
+            ));
+        }
     }
+    Ok(NamedDep {
+        name,
+        constraint,
+        parsed_constraint,
+        flag_requests,
+        optional,
+        predicates: Vec::new(), // Populated by desugar pass in parse_manifest_doc.
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1349,9 +1883,12 @@ fn merge_predicates(
             format!("dep {dep_name:?}: predicate(s) {overlap:?} declared in both inline and child-node form — pick one form per predicate"),
         ));
     }
+    // Preserve source order: inline predicates first, then child predicates,
+    // each in source order.  Predicate evaluation is order-independent
+    // (conjunction), so this is for representational determinism only.
+    // spec/manifest-grammar.md §6 (NORMATIVE): predicate order is source order.
     let mut all = inline;
     all.extend(child);
-    all.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(all)
 }
 
@@ -1359,8 +1896,50 @@ fn merge_predicates(
 // Flags + overrides.
 // ---------------------------------------------------------------------------
 
+/// Regex-equivalent: [A-Za-z0-9_-]+
+pub fn valid_flag_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Returns true if `s` contains a character that must not appear in nim.cfg lines.
+///
+/// Covers:
+/// - ASCII control chars (0x00–0x1F and 0x7F) — H1 fix (original)
+/// - Unicode line separators U+2028 / U+2029 — R2-Unicode broadening
+///
+/// Used for `defines` values (H1+R2-Unicode) and `src_dir` values (R2-C2+R2-Unicode),
+/// including `.nimble`-sourced `srcDir` values validated at the edge-source boundary.
+/// Public so `milpa-core`'s `NimbleEdgeSource` can reuse without re-implementing (SSOT).
+pub fn contains_unsafe_char(s: &str) -> bool {
+    for ch in s.chars() {
+        let c = ch as u32;
+        if c < 0x20 || c == 0x7f || c == 0x2028 || c == 0x2029 {
+            return true;
+        }
+    }
+    false
+}
+
 fn parse_flag_decl(node: &KdlNode) -> Result<FlagDecl, ManifestError> {
     let name = node.name().value().to_string();
+
+    // H1 security fix: validate flag name charset at parse boundary.
+    // KDL 2.0 quoted node names can contain chars outside [A-Za-z0-9_-].
+    // A malicious dep could declare a flag with an illegal name (containing
+    // newlines or nim.cfg-significant chars) to inject content via the
+    // childless-convention emit: -d:<pkg>_<flagname>.
+    if !valid_flag_name(&name) {
+        return Err(err(
+            "MAN-FLAG-NAME-INVALID",
+            format!(
+                "flag {name:?}: flag names must match [A-Za-z0-9_-]+ \
+                 (no spaces, special characters, or control characters)"
+            ),
+        ));
+    }
+
     if !args(node).is_empty() {
         return Err(err(
             "MAN-FLAG-POS-ARGS",
@@ -1402,25 +1981,103 @@ fn parse_flag_decl(node: &KdlNode) -> Result<FlagDecl, ManifestError> {
         },
     };
     let mut defines = Vec::new();
+    let mut enables_same_pkg: Vec<String> = Vec::new();
+    let mut enables_cross_pkg: Vec<CrossPkgEnable> = Vec::new();
+    let mut conflicts: Vec<String> = Vec::new();
+
     for child in children(node) {
-        if child.name().value() != "defines" {
-            return Err(err(
-                "MAN-FLAG-UNKNOWN-CHILD",
-                format!(
-                    "flag {name:?}: unknown child node {:?} (allowed: 'defines')",
-                    child.name().value()
-                ),
-            ));
-        }
-        for entry in args(child) {
-            match entry.value().as_string() {
-                Some(s) => defines.push(s.to_string()),
-                None => {
-                    return Err(err(
-                        "MAN-FLAG-DEFINES-ARG-TYPE",
-                        format!("flag {name:?}: 'defines' args must be strings"),
-                    ));
+        match child.name().value() {
+            "defines" => {
+                for entry in args(child) {
+                    match entry.value().as_string() {
+                        Some(s) => {
+                            // H1 + R2-Unicode fix: reject control chars and Unicode line
+                            // separators at parse boundary. An embedded \n (or any control
+                            // char, or U+2028/U+2029) in a defines value would be emitted
+                            // verbatim to nim.cfg, injecting arbitrary compiler flags → code exec.
+                            if contains_unsafe_char(s) {
+                                return Err(err(
+                                    "MAN-FLAG-DEFINES-UNSAFE",
+                                    format!(
+                                        "flag {name:?}: 'defines' arg contains a control \
+                                         character or Unicode line separator (0x00–0x1F, 0x7F, \
+                                         U+2028, U+2029) \
+                                         — nim.cfg injection rejected at parse boundary"
+                                    ),
+                                ));
+                            }
+                            defines.push(s.to_string())
+                        }
+                        None => {
+                            return Err(err(
+                                "MAN-FLAG-DEFINES-ARG-TYPE",
+                                format!("flag {name:?}: 'defines' args must be strings"),
+                            ));
+                        }
+                    }
                 }
+            }
+            "enables" => {
+                // Bare string args = same-package flag names.
+                for entry in args(child) {
+                    match entry.value().as_string() {
+                        Some(s) => enables_same_pkg.push(s.to_string()),
+                        None => {
+                            return Err(err(
+                                "MAN-FLAG-UNKNOWN-CHILD",
+                                format!("flag {name:?}: 'enables' args must be strings"),
+                            ));
+                        }
+                    }
+                }
+                // Children = cross-package dep→flag entries.
+                for dep_node in children(child) {
+                    let dep_name = dep_node.name().value().to_string();
+                    let mut flag_reqs: Vec<FlagRequest> = Vec::new();
+                    for flag_child in children(dep_node) {
+                        if flag_child.name().value() != "flag" {
+                            return Err(err(
+                                "MAN-FLAG-UNKNOWN-CHILD",
+                                format!(
+                                    "flag {name:?}: enables cross-pkg dep {dep_name:?} \
+                                     has unknown child {:?} (only 'flag' is allowed)",
+                                    flag_child.name().value()
+                                ),
+                            ));
+                        }
+                        flag_reqs.push(parse_flag_request(
+                            &format!("{name}→{dep_name}"),
+                            flag_child,
+                        )?);
+                    }
+                    enables_cross_pkg.push(CrossPkgEnable {
+                        dep: dep_name,
+                        flag_requests: flag_reqs,
+                    });
+                }
+            }
+            "conflicts" => {
+                // Bare string args = same-package flag names this flag conflicts with.
+                for entry in args(child) {
+                    match entry.value().as_string() {
+                        Some(s) => conflicts.push(s.to_string()),
+                        None => {
+                            return Err(err(
+                                "MAN-FLAG-UNKNOWN-CHILD",
+                                format!("flag {name:?}: 'conflicts' args must be strings"),
+                            ));
+                        }
+                    }
+                }
+            }
+            other => {
+                return Err(err(
+                    "MAN-FLAG-UNKNOWN-CHILD",
+                    format!(
+                        "flag {name:?}: unknown child node {other:?} \
+                         (allowed: 'defines', 'enables', 'conflicts')"
+                    ),
+                ));
             }
         }
     }
@@ -1429,8 +2086,14 @@ fn parse_flag_decl(node: &KdlNode) -> Result<FlagDecl, ManifestError> {
         default,
         description,
         defines,
+        enables_same_pkg,
+        enables_cross_pkg,
+        conflicts,
     })
 }
+
+/// Known property keys on a `pkg` override node across all target forms.
+const OVERRIDE_KNOWN_PROPS: &[&str] = &["git", "ref", "local"];
 
 fn parse_override(node: &KdlNode) -> Result<Override, ManifestError> {
     if node.name().value() != "pkg" {
@@ -1451,9 +2114,11 @@ fn parse_override(node: &KdlNode) -> Result<Override, ManifestError> {
         ));
     }
     let name = name.unwrap().to_string();
+
+    // Reject unknown properties first.
     let extra: Vec<&str> = prop_names(node)
         .into_iter()
-        .filter(|p| !URL_DEP_PROPS.contains(p))
+        .filter(|p| !OVERRIDE_KNOWN_PROPS.contains(p))
         .collect();
     if !extra.is_empty() {
         return Err(err(
@@ -1461,31 +2126,90 @@ fn parse_override(node: &KdlNode) -> Result<Override, ManifestError> {
             format!("override for {name:?}: unknown property/properties {extra:?}"),
         ));
     }
-    let git_entry = prop(node, "git").ok_or_else(|| {
-        err(
-            "MAN-OVERRIDE-GIT-MISSING",
-            format!("override for {name:?}: missing required property 'git'"),
-        )
-    })?;
-    let ref_entry = prop(node, "ref").ok_or_else(|| {
-        err(
-            "MAN-OVERRIDE-REF-MISSING",
-            format!("override for {name:?}: missing required property 'ref'"),
-        )
-    })?;
-    let git = url_arg(&format!("override {name:?}"), "git", git_entry)?;
-    validate_git_url(&name, &git)?;
-    let git_ref = ref_entry
-        .value()
-        .as_string()
-        .ok_or_else(|| {
+
+    // Detect which target forms are present.
+    let has_git = prop(node, "git").is_some();
+    let has_local = prop(node, "local").is_some();
+    let child_nodes = children(node);
+    let member_children: Vec<_> = child_nodes
+        .iter()
+        .filter(|c| c.name().value() == "member")
+        .collect();
+    let has_member = !member_children.is_empty();
+
+    let target_count = [has_git, has_local, has_member]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+    if target_count != 1 {
+        return Err(err(
+            "MAN-OVERRIDE-TARGET-AMBIGUOUS",
+            format!(
+                "override for {name:?}: exactly one provenance form is required \
+                 (git, local, or member); got {} ({})",
+                target_count,
+                if target_count == 0 { "none" } else { "multiple forms mixed" }
+            ),
+        ));
+    }
+
+    let target = if has_git {
+        let git_entry = prop(node, "git").unwrap();
+        let ref_entry = prop(node, "ref").ok_or_else(|| {
             err(
                 "MAN-OVERRIDE-REF-MISSING",
-                format!("override for {name:?}: 'ref' must be a string"),
+                format!("override for {name:?}: missing required property 'ref'"),
             )
-        })?
-        .to_string();
-    Ok(Override { name, git, git_ref })
+        })?;
+        let url = url_arg(&format!("override {name:?}"), "git", git_entry)?;
+        validate_git_url(&name, &url)?;
+        let git_ref = ref_entry
+            .value()
+            .as_string()
+            .ok_or_else(|| {
+                err(
+                    "MAN-OVERRIDE-REF-MISSING",
+                    format!("override for {name:?}: 'ref' must be a string"),
+                )
+            })?
+            .to_string();
+        OverrideTarget::Git { url, git_ref }
+    } else if has_local {
+        let local_entry = prop(node, "local").unwrap();
+        let path = local_entry
+            .value()
+            .as_string()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                err(
+                    "MAN-DEP-LOCAL-PATH",
+                    format!("override for {name:?}: 'local=' must be a non-empty string path"),
+                )
+            })?
+            .to_string();
+        OverrideTarget::Local { path }
+    } else {
+        // has_member
+        let mc = member_children[0];
+        let mc_args = args(mc);
+        let member_name = mc_args
+            .first()
+            .and_then(|e| e.value().as_string())
+            .filter(|_| mc_args.len() == 1)
+            .ok_or_else(|| {
+                err(
+                    "MAN-DEP-MEMBER-ARITY",
+                    format!(
+                        "override for {name:?}: 'member' child takes exactly one \
+                         positional string argument (the workspace member name)"
+                    ),
+                )
+            })?
+            .to_string();
+        OverrideTarget::Member { member_name }
+    };
+
+    Ok(Override { name, target })
 }
 
 // ---------------------------------------------------------------------------

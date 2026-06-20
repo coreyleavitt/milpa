@@ -312,7 +312,7 @@ fn pax_path_header_overrides_name() {
     // Start with len=1 digit and iterate until stable.
     let mut len_digits = 1usize;
     loop {
-        let candidate = format!("{}{} {}", len_digits, " ".repeat(0), kv);
+        let _candidate = format!("{}{} {}", len_digits, " ".repeat(0), kv);
         // Total len: digits_len + 1 (space) + kv.len()
         let total = len_digits + 1 + kv.len();
         if total.to_string().len() == len_digits {

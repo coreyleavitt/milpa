@@ -8,10 +8,11 @@
 //! sibling tie-break is not reproducible across implementations, lexicographic
 //! is, and it matches the lockfile's own dep-entry order).
 //!
-//! Per-member workspace emission (`write_workspace_nimcfgs`) and feature-flag
-//! `-d:` defines (#23) are deferred: workspace lands in S11, and `ResolvedDep`
-//! does not yet carry `active_flags`/`flag_defines` (no success fixture resolves
-//! a flag-carrying dep — same deferral as `from_graph`'s flag fields).
+//! Feature-flag `-d:` defines (§7.5) are un-deferred by RFC #23 S6: callers
+//! pass a `flag_defines` map (`dep_name → flag_name → defines_symbols`), built
+//! from each dep's manifest (SSOT — defines live in manifests, not the lockfile).
+//! When `None`, no `-d:` lines are emitted (backward-compat for callers that do
+//! not supply the map).
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -32,7 +33,20 @@ const HEADER: &str =
 /// non-empty, adds a leading `--path:"<self_src_dir>"` for the consuming
 /// package's own source tree (emitted first so self-modules shadow same-named
 /// dep import paths).
-pub fn format_nimcfg(graph: &ResolvedGraph, deps_dir: &str, self_src_dir: &str) -> String {
+///
+/// `flag_defines` maps `dep_name → flag_name → defines_symbols`. When `Some`,
+/// active flags for each dep are looked up and their symbols emitted as `-d:` lines
+/// in a block separated from the `--path:` block by a blank line (§7.5, RFC #23 S6).
+/// Symbols are lexicographically sorted across all active flags of all deps.
+/// A flag with no explicit defines uses the childless convention: `-d:<pkg>_<flag>`.
+/// When `None`, no `-d:` lines are emitted (backward-compat for callers that do not
+/// supply manifest flag tables).
+pub fn format_nimcfg(
+    graph: &ResolvedGraph,
+    deps_dir: &str,
+    self_src_dir: &str,
+    flag_defines: Option<&HashMap<String, HashMap<String, Vec<String>>>>,
+) -> String {
     let mut lines: Vec<String> = vec![HEADER.to_string(), String::new()];
 
     if !self_src_dir.is_empty() {
@@ -55,12 +69,46 @@ pub fn format_nimcfg(graph: &ResolvedGraph, deps_dir: &str, self_src_dir: &str) 
         }
     }
 
+    // §7.5 feature-flag defines — un-deferred (RFC #23 S6).
+    // Collect all -d: symbols across all deps with active flags.
+    let mut define_symbols: Vec<String> = Vec::new();
+    if let Some(fd_map) = flag_defines {
+        for dep in &ordered {
+            if dep.active_flags.is_empty() {
+                continue;
+            }
+            let empty_map = HashMap::new();
+            let dep_flag_table = fd_map.get(&dep.name).unwrap_or(&empty_map);
+            for flag_name in &dep.active_flags {
+                if let Some(syms) = dep_flag_table.get(flag_name) {
+                    if syms.is_empty() {
+                        // Childless-convention: -d:<pkg>_<flag>
+                        define_symbols.push(format!("{}_{}", dep.name, flag_name));
+                    } else {
+                        define_symbols.extend(syms.iter().cloned());
+                    }
+                }
+                // Flag not in dep_flag_table: skip (dep has no manifest, or flag
+                // not declared — matches Python's warn-and-skip behavior).
+            }
+        }
+        // Lexicographic order across all emitted symbols (reproducibility, §3.6).
+        define_symbols.sort();
+    }
+
     // A trailing blank line (→ final newline) whenever any --path: line was
     // emitted (self_src_dir OR deps). Mirrors Python's `if path_lines:` guard —
     // keying on the dep list alone was wrong: self_src_dir alone (zero deps)
     // still needs the final \n (§7.4 NOTE: files end with a single trailing \n).
     // `lines` starts with [HEADER, ""] (length 2); any --path: push makes it > 2.
     if lines.len() > 2 {
+        if !define_symbols.is_empty() {
+            // Blank line separator between --path: block and -d: block (§7.5).
+            lines.push(String::new());
+            for sym in &define_symbols {
+                lines.push(format!("-d:{sym}"));
+            }
+        }
         lines.push(String::new());
     }
     lines.join("\n")
@@ -77,6 +125,47 @@ fn path_for(dep: &ResolvedDep, deps_dir: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// build_flag_defines — product function (RFC #23 S6 SSOT)
+// ---------------------------------------------------------------------------
+
+/// Build the `flag_defines` map for [`format_nimcfg`] (§7.5 S6, RFC #23 §3.6).
+///
+/// Reads each dep's `milpa.kdl` from `deps_dir/<name>/milpa.kdl` (SSOT —
+/// defines live in the manifest, not the lockfile).  Missing or unparseable
+/// manifests produce an empty flag table for that dep (warn-and-skip, not an
+/// error — not every dep has a `milpa.kdl`).
+///
+/// Returns `dep_name → flag_name → defines_symbols`.
+///
+/// This is the SINGLE map-builder for S6.  Both the real CLI (`milpa fetch` /
+/// `milpa lock`) and the conformance test harness call this function; there
+/// must be no parallel copy in either crate.
+pub fn build_flag_defines(
+    graph: &milpa_types::ResolvedGraph,
+    deps_dir: &std::path::Path,
+) -> HashMap<String, HashMap<String, Vec<String>>> {
+    let mut result: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+    for dep in &graph.deps {
+        let manifest_path = deps_dir.join(&dep.name).join("milpa.kdl");
+        let text = match std::fs::read_to_string(&manifest_path) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let manifest = match crate::parse_document(&text) {
+            Ok(milpa_manifest::ManifestDoc::Package(m)) => m,
+            _ => continue,
+        };
+        let flag_map: HashMap<String, Vec<String>> = manifest
+            .flags
+            .into_iter()
+            .map(|f| (f.name, f.defines))
+            .collect();
+        result.insert(dep.name.clone(), flag_map);
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Workspace: per-member nim.cfg (W4 / lockfile §7.6)
 // ---------------------------------------------------------------------------
 
@@ -86,9 +175,17 @@ fn path_for(dep: &ResolvedDep, deps_dir: &str) -> String {
 /// with POSIX-relative `--path:` lines from the member's directory — external
 /// deps under `<root>/_deps/<name>[/src]`, member refs under
 /// `<root>/<other-member-path>[/src]`. There is **no** root `nim.cfg`.
+///
+/// S11 (RFC #23 §3.8): when `flag_defines` is `Some`, each member's nim.cfg
+/// includes `-d:` defines for ALL flags active on shared deps in the workspace
+/// graph (the unified `dep.active_flags`). Symbols are lexicographically sorted
+/// across all active flags of all deps in the member's transitive closure
+/// (reproducibility, §3.6). When `None`, no `-d:` lines are emitted
+/// (backward-compat for callers that don't supply manifest flag tables).
 pub fn format_workspace_nimcfgs(
     workspace: &LoadedWorkspace,
     graph: &ResolvedGraph,
+    flag_defines: Option<&HashMap<String, HashMap<String, Vec<String>>>>,
 ) -> Vec<(String, String)> {
     let deps_dir = workspace.root.join("_deps");
     let member_dir: HashMap<&str, &Path> = workspace
@@ -107,7 +204,42 @@ pub fn format_workspace_nimcfgs(
             let rel = relpath(&target, &member.directory);
             lines.push(format!("--path:\"{}\"", posix(&rel)));
         }
+
+        // S11 §3.8: collect unified -d: defines from active_flags on closure deps.
+        // Uses the same logic as format_nimcfg §7.5 — active_flags on each dep
+        // are already the workspace-wide union (merged by the shared dep_active_flags
+        // map in the resolver).
+        let mut define_symbols: Vec<String> = Vec::new();
+        if let Some(fd_map) = flag_defines {
+            let empty_map = HashMap::new();
+            for dep in &closure {
+                if dep.active_flags.is_empty() {
+                    continue;
+                }
+                let dep_flag_table = fd_map.get(&dep.name).unwrap_or(&empty_map);
+                for flag_name in &dep.active_flags {
+                    if let Some(syms) = dep_flag_table.get(flag_name) {
+                        if syms.is_empty() {
+                            // Childless-convention: -d:<pkg>_<flag>
+                            define_symbols.push(format!("{}_{}", dep.name, flag_name));
+                        } else {
+                            define_symbols.extend(syms.iter().cloned());
+                        }
+                    }
+                    // Flag not in dep_flag_table: skip (no manifest or undeclared).
+                }
+            }
+            define_symbols.sort();
+        }
+
         if !closure.is_empty() {
+            if !define_symbols.is_empty() {
+                // Blank line separator between --path: block and -d: block (§7.5).
+                lines.push(String::new());
+                for sym in &define_symbols {
+                    lines.push(format!("-d:{sym}"));
+                }
+            }
             lines.push(String::new());
         }
         out.push((member.path.clone(), lines.join("\n")));
@@ -213,6 +345,7 @@ mod tests {
             dep_decl: None,
             cond_requires: vec![],
             aliases: vec![],
+            active_flags: vec![],
         }
     }
 
@@ -222,7 +355,7 @@ mod tests {
             deps: vec![dep("foo", "src")],
         };
         assert_eq!(
-            format_nimcfg(&graph, "_deps", ""),
+            format_nimcfg(&graph, "_deps", "", None),
             "# generated by milpa; do not edit\n\
              # manifest: milpa.kdl\n\
              # lockfile: milpa.lock\n\
@@ -236,7 +369,7 @@ mod tests {
         let graph = ResolvedGraph { deps: vec![] };
         // No self_src_dir, no deps → header only, trailing \n (no --path: block).
         assert_eq!(
-            format_nimcfg(&graph, "_deps", ""),
+            format_nimcfg(&graph, "_deps", "", None),
             "# generated by milpa; do not edit\n\
              # manifest: milpa.kdl\n\
              # lockfile: milpa.lock\n"
@@ -251,7 +384,7 @@ mod tests {
     fn self_src_dir_no_deps_has_trailing_newline() {
         let graph = ResolvedGraph { deps: vec![] };
         assert_eq!(
-            format_nimcfg(&graph, "_deps", "src"),
+            format_nimcfg(&graph, "_deps", "src", None),
             "# generated by milpa; do not edit\n\
              # manifest: milpa.kdl\n\
              # lockfile: milpa.lock\n\
@@ -265,7 +398,7 @@ mod tests {
         let graph = ResolvedGraph {
             deps: vec![dep("zlib", ""), dep("alpha", "lib")],
         };
-        let out = format_nimcfg(&graph, "_deps", "");
+        let out = format_nimcfg(&graph, "_deps", "", None);
         let a = out.find("_deps/alpha/lib").unwrap();
         let z = out.find("_deps/zlib").unwrap();
         assert!(a < z, "alpha must precede zlib");
@@ -276,7 +409,7 @@ mod tests {
         let graph = ResolvedGraph {
             deps: vec![dep("foo", "src")],
         };
-        let out = format_nimcfg(&graph, "_deps", "mysrc");
+        let out = format_nimcfg(&graph, "_deps", "mysrc", None);
         let self_idx = out.find("--path:\"mysrc\"").unwrap();
         let dep_idx = out.find("_deps/foo/src").unwrap();
         assert!(self_idx < dep_idx);
@@ -298,6 +431,7 @@ mod tests {
             dep_decl: None,
             cond_requires: vec![],
             aliases,
+            active_flags: vec![],
         }
     }
 
@@ -307,7 +441,7 @@ mod tests {
         let graph = ResolvedGraph {
             deps: vec![dep_with_aliases("foo", "src", vec!["bar".into()])],
         };
-        let out = format_nimcfg(&graph, "_deps", "");
+        let out = format_nimcfg(&graph, "_deps", "", None);
         let path_lines: Vec<&str> = out
             .lines()
             .filter(|l| l.starts_with("--path:"))
@@ -323,7 +457,7 @@ mod tests {
         let graph = ResolvedGraph {
             deps: vec![dep_with_aliases("foo", "src", vec!["bar".into(), "qux".into()])],
         };
-        let out = format_nimcfg(&graph, "_deps", "");
+        let out = format_nimcfg(&graph, "_deps", "", None);
         let path_lines: Vec<&str> = out
             .lines()
             .filter(|l| l.starts_with("--path:"))
@@ -340,7 +474,7 @@ mod tests {
         let graph = ResolvedGraph {
             deps: vec![dep_with_aliases("foo", "src", vec![])],
         };
-        let out = format_nimcfg(&graph, "_deps", "");
+        let out = format_nimcfg(&graph, "_deps", "", None);
         let path_lines: Vec<&str> = out
             .lines()
             .filter(|l| l.starts_with("--path:"))
@@ -355,7 +489,7 @@ mod tests {
         let graph = ResolvedGraph {
             deps: vec![dep_with_aliases("foo", "src", vec!["bar".into()])],
         };
-        let out = format_nimcfg(&graph, "_deps", "");
+        let out = format_nimcfg(&graph, "_deps", "", None);
         assert_eq!(
             out,
             "# generated by milpa; do not edit\n\
@@ -364,6 +498,163 @@ mod tests {
              \n\
              --path:\"_deps/foo/src\"\n\
              --path:\"_deps/bar/src\"\n"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // §7.5 S6 — feature-flag -d: defines (RFC #23 §3.6)
+    // -------------------------------------------------------------------------
+
+    fn dep_with_flags(name: &str, active_flags: Vec<String>) -> ResolvedDep {
+        ResolvedDep {
+            name: name.into(),
+            identity: "sha256:00".into(),
+            version: Version::release(0, 0, 1),
+            src_dir: String::new(),
+            requires: vec![],
+            provenances: vec![ProvenanceRecord::Git {
+                url: "https://e/x.git".into(),
+                ref_spec: Some("main".into()),
+                commit_sha: None,
+                origin: "observed".into(),
+            }],
+            dep_decl: None,
+            cond_requires: vec![],
+            aliases: vec![],
+            active_flags,
+        }
+    }
+
+    /// No flag_defines (None) → no -d: lines.
+    #[test]
+    fn no_defines_when_flag_defines_none() {
+        let graph = ResolvedGraph {
+            deps: vec![dep_with_flags("pkg", vec!["tls".into()])],
+        };
+        let out = format_nimcfg(&graph, "_deps", "", None);
+        assert!(!out.contains("-d:"));
+    }
+
+    /// Explicit defines: active flag with symbols emits -d: lines.
+    #[test]
+    fn explicit_defines_emitted() {
+        let mut fd: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        let mut flags = HashMap::new();
+        flags.insert("tls".into(), vec!["ssl".into(), "useOpenSSL".into()]);
+        fd.insert("ssl-lib".into(), flags);
+
+        let graph = ResolvedGraph {
+            deps: vec![dep_with_flags("ssl-lib", vec!["tls".into()])],
+        };
+        let out = format_nimcfg(&graph, "_deps", "", Some(&fd));
+        assert!(out.contains("-d:ssl\n"));
+        assert!(out.contains("-d:useOpenSSL\n") || out.ends_with("-d:useOpenSSL\n"));
+    }
+
+    /// Childless-convention: active flag with no defines emits -d:<pkg>_<flag>.
+    #[test]
+    fn childless_convention() {
+        let mut fd: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        let mut flags = HashMap::new();
+        flags.insert("http".into(), vec![]);
+        fd.insert("mylib".into(), flags);
+
+        let graph = ResolvedGraph {
+            deps: vec![dep_with_flags("mylib", vec!["http".into()])],
+        };
+        let out = format_nimcfg(&graph, "_deps", "", Some(&fd));
+        assert!(out.contains("-d:mylib_http"), "got: {out:?}");
+    }
+
+    /// Defines block is separated from --path: block by a blank line.
+    #[test]
+    fn defines_block_blank_line_separation() {
+        let mut fd: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        let mut flags = HashMap::new();
+        flags.insert("feat".into(), vec!["myDefine".into()]);
+        fd.insert("pkg".into(), flags);
+
+        let graph = ResolvedGraph {
+            deps: vec![dep_with_flags("pkg", vec!["feat".into()])],
+        };
+        let out = format_nimcfg(&graph, "_deps", "", Some(&fd));
+        let path_pos = out.find("--path:").unwrap();
+        let define_pos = out.find("-d:myDefine").unwrap();
+        assert!(define_pos > path_pos);
+        let between = &out[path_pos..define_pos];
+        assert!(between.contains("\n\n"), "expected blank line separator; got {between:?}");
+    }
+
+    /// All -d: symbols are lexicographically sorted across all deps.
+    #[test]
+    fn defines_lexicographically_ordered() {
+        let mut fd: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        let mut flags_a = HashMap::new();
+        flags_a.insert("feat-z".into(), vec!["zzz".into(), "aaa".into()]);
+        fd.insert("lib-a".into(), flags_a);
+        let mut flags_b = HashMap::new();
+        flags_b.insert("feat-a".into(), vec!["mmm".into()]);
+        fd.insert("lib-b".into(), flags_b);
+
+        let graph = ResolvedGraph {
+            deps: vec![
+                dep_with_flags("lib-a", vec!["feat-z".into()]),
+                dep_with_flags("lib-b", vec!["feat-a".into()]),
+            ],
+        };
+        let out = format_nimcfg(&graph, "_deps", "", Some(&fd));
+        let d_lines: Vec<&str> = out.lines().filter(|l| l.starts_with("-d:")).collect();
+        let mut expected = d_lines.clone();
+        expected.sort();
+        assert_eq!(d_lines, expected, "expected lex order; got {d_lines:?}");
+    }
+
+    /// No active flags → no -d: block even with flag_defines provided.
+    #[test]
+    fn no_active_flags_no_defines_block() {
+        let mut fd: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        let mut flags = HashMap::new();
+        flags.insert("tls".into(), vec!["ssl".into()]);
+        fd.insert("pkg".into(), flags);
+
+        let graph = ResolvedGraph {
+            deps: vec![dep("pkg", "")],  // dep() has active_flags = vec![]
+        };
+        let out = format_nimcfg(&graph, "_deps", "", Some(&fd));
+        assert!(!out.contains("-d:"));
+    }
+
+    /// fixture-197 byte-exact: two deps — one explicit defines, one childless.
+    /// Mirrors the conformance fixture-197-s6-nimcfg-defines expected/nim.cfg.
+    #[test]
+    fn fixture_197_byte_exact() {
+        let mut fd: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        let mut ssl_flags = HashMap::new();
+        ssl_flags.insert("tls".into(), vec!["ssl".into(), "useOpenSSL".into()]);
+        fd.insert("lib-ssl".into(), ssl_flags);
+        let mut childless_flags = HashMap::new();
+        childless_flags.insert("http".into(), vec![]);
+        fd.insert("lib-childless".into(), childless_flags);
+
+        let graph = ResolvedGraph {
+            deps: vec![
+                dep_with_flags("lib-childless", vec!["http".into()]),
+                dep_with_flags("lib-ssl", vec!["tls".into()]),
+            ],
+        };
+        let out = format_nimcfg(&graph, "_deps", "", Some(&fd));
+        assert_eq!(
+            out,
+            "# generated by milpa; do not edit\n\
+             # manifest: milpa.kdl\n\
+             # lockfile: milpa.lock\n\
+             \n\
+             --path:\"_deps/lib-childless\"\n\
+             --path:\"_deps/lib-ssl\"\n\
+             \n\
+             -d:lib-childless_http\n\
+             -d:ssl\n\
+             -d:useOpenSSL\n"
         );
     }
 }

@@ -24,7 +24,10 @@ Data model (slices 3a–3c-4):
   ``LocalDep``     — local filesystem path dep
   ``TarballDep``   — tarball URL dep with optional sha256 / strip_components
   ``MemberDep``    — workspace-internal member reference
-  ``Override``     — pkg-form override (name → git + ref)
+  ``GitTarget``    — override target: git URL + ref
+  ``LocalTarget``  — override target: local filesystem path
+  ``MemberTarget`` — override target: workspace member name
+  ``Override``     — pkg-form override (name + discriminated-union target)
   ``FlagDecl``     — named feature flag declared by a package
   ``Manifest``     — top-level package manifest
   ``WorkspaceManifest`` — workspace container
@@ -52,12 +55,14 @@ from milpa.errors import (
     MAN_CAS_DIR_TYPE,
     MAN_DEP_DUPLICATE,
     MAN_DEP_FLAG_BOOL,
+    MAN_DEP_OPTIONAL_FLAG_CLASH,
     MAN_DEP_FLAG_NAME_MISSING,
     MAN_DEP_FLAG_TOO_MANY_ARGS,
     MAN_DEP_LOCAL_PATH,
     MAN_DEP_MEMBER_ARITY,
     MAN_DEP_MEMBER_PROPS,
     MAN_DEP_MIRROR_ARITY,
+    MAN_DEP_NAME_INVALID,
     MAN_DEP_NAMED_ARITY,
     MAN_DEP_NAMED_CONSTRAINT,
     MAN_DEP_NAMED_PROPS,
@@ -69,8 +74,11 @@ from milpa.errors import (
     MAN_DEP_UNKNOWN_PROPS,
     MAN_FLAG_DEFAULT_TYPE,
     MAN_FLAG_DEFINES_ARG_TYPE,
+    MAN_FLAG_DEFINES_UNSAFE,
     MAN_FLAG_DESCRIPTION_TYPE,
     MAN_FLAG_DUPLICATE,
+    MAN_FLAG_ENABLES_UNDECLARED,
+    MAN_FLAG_NAME_INVALID,
     MAN_FLAG_POS_ARGS,
     MAN_FLAG_UNDECLARED_REFERENCE,
     MAN_FLAG_UNKNOWN_CHILD,
@@ -89,6 +97,7 @@ from milpa.errors import (
     MAN_OVERRIDE_GIT_MISSING,
     MAN_OVERRIDE_KIND,
     MAN_OVERRIDE_REF_MISSING,
+    MAN_OVERRIDE_TARGET_AMBIGUOUS,
     MAN_OVERRIDE_UNKNOWN_PROPS,
     MAN_PREDICATE_CHILD_ARG_TYPE,
     MAN_PREDICATE_CHILD_NO_ARGS,
@@ -100,6 +109,7 @@ from milpa.errors import (
     MAN_SPEC_VERSION_TYPE,
     MAN_SPEC_VERSION_UNSUPPORTED,
     MAN_SRC_DIR_TYPE,
+    MAN_SRC_DIR_UNSAFE,
     MAN_UNKNOWN_TOP_LEVEL,
     MAN_URL_ARG_TYPE,
     MAN_WORKSPACE_HAS_DEPS_OR_KIND,
@@ -127,6 +137,7 @@ from milpa.kdl_io import (
     node_props,
     nodes,
     parse_kdl,
+    value_as_strict_int,
 )
 from milpa.predicate import Predicate  # SSOT for Predicate; re-exported below
 from milpa.version import VersionSet
@@ -171,15 +182,52 @@ _PACKAGE_TOP_LEVEL: frozenset[str] = frozenset(
 
 # Property names recognized on a UrlDep node (dispatched to UrlDep, not NamedDep).
 _URL_DEP_KNOWN_PROPS: frozenset[str] = frozenset(
-    {"git", "ref", "platform", "arch", "nim", "milpa", "flag"}
+    {"git", "ref", "platform", "arch", "nim", "milpa", "flag", "optional"}
 )
+
+# Implementation detail of valid_dep_name — do NOT call .match() on this
+# directly outside that function.  Use valid_dep_name(s) at every call site.
+# (Valid charset for dep/flag names: [A-Za-z0-9_-]+.)
+import re as _re
+_FLAG_NAME_CHARSET_RE = _re.compile(r"^[A-Za-z0-9_\-]+$")
+
+# Unsafe strings: ASCII control chars (0x00-0x1F, 0x7F) AND Unicode line
+# separators U+2028/U+2029, which act as line breaks in some contexts.
+# (R2-Unicode fix — broadens H1 ASCII-only check.)
+# Implementation detail of contains_unsafe_char — call that function; do not
+# call _UNSAFE_STRING_RE.search() directly.
+_UNSAFE_STRING_RE = _re.compile("[\x00-\x1f\x7f  ]")
+
+def contains_unsafe_char(s: str) -> bool:
+    """Return True if ``s`` contains any unsafe character.
+
+    Unsafe characters are ASCII control chars (0x00-0x1F, 0x7F) and Unicode
+    line separators U+2028/U+2029.  These can break nim.cfg --path: lines if
+    they appear in a src_dir value.
+
+    This is the SINGLE SOURCE OF TRUTH for the unsafe-char predicate -- both
+    the milpa.kdl parse path and the .nimble fallback path import this function.
+    Mirrors ``contains_unsafe_char`` in milpa-manifest/src/lib.rs (Rust SSOT).
+    """
+    return bool(_UNSAFE_STRING_RE.search(s))
+
+def valid_dep_name(s: str) -> bool:
+    """Return True if ``s`` is a valid dep/flag name: non-empty [A-Za-z0-9_-]+.
+
+    This is the SINGLE SOURCE OF TRUTH for the dep-name charset predicate.
+    Used at the manifest parse boundary (``_parse_dep_node``) and re-exported
+    for the lockfile parse boundary (``lockfile.py``) so both callers reuse
+    this predicate without duplication.
+    Mirrors ``valid_flag_name`` in milpa-manifest/src/lib.rs (Rust SSOT).
+    """
+    return bool(_FLAG_NAME_CHARSET_RE.fullmatch(s))
 
 # Recognized predicate property names.
 _PREDICATE_PROPS: frozenset[str] = frozenset({"platform", "arch", "nim", "milpa", "flag"})
 
 # Top-level nodes permitted in a workspace manifest.
 _WORKSPACE_TOP_LEVEL: frozenset[str] = frozenset(
-    {"workspace", "name", "overrides", "spec-version"}
+    {"workspace", "name", "overrides", "spec-version", "flags"}
 )
 
 
@@ -209,6 +257,9 @@ class UrlDep:
     ``mirrors`` are fallback URLs tried in order after ``git`` fails.
     ``predicates`` are evaluated before the dep is passed to the solver.
     ``flag_requests`` are consumer feature-flag requests to the dep.
+    ``optional`` is retained for round-trip serialization; the parse-time
+    desugar pass (S7 RFC #23 §3.2) injects the auto-flag + ``flag=`` predicate
+    into the manifest, so resolution never sees this field directly.
     """
 
     name: str
@@ -217,6 +268,7 @@ class UrlDep:
     mirrors: tuple[str, ...] = ()
     predicates: tuple[Predicate, ...] = ()
     flag_requests: tuple[FlagRequest, ...] = ()
+    optional: bool = False
 
 
 @dataclass(frozen=True)
@@ -224,11 +276,17 @@ class NamedDep:
     """A dep resolved against the tianguis index.
 
     Grammar: ``<name>`` or ``<name> "<version-constraint>"``
+    Optionally with a ``{ flag "x" }`` child block (§3.1.5, S3).
 
     ``constraint`` is the raw string from the manifest (or ``None``
     when absent).  ``constraint_set`` is a pre-typed ``VersionSet``
     parsed at construction time (the #121 design: parse-to-typed-value
     once at the manifest parse boundary; illegal states unrepresentable).
+    ``flag_requests`` are consumer feature-flag requests to this dep
+    (structurally identical to ``UrlDep.flag_requests`` — SSOT).
+    ``optional`` is retained for round-trip serialization; the parse-time
+    desugar pass (S7 RFC #23 §3.2) injects the auto-flag + ``flag=`` predicate
+    into the manifest, so resolution never sees this field directly.
 
     A malformed ``constraint`` string raises
     ``MilpaError(MAN_DEP_NAMED_CONSTRAINT)`` at construction time.
@@ -237,6 +295,9 @@ class NamedDep:
     name: str
     constraint: str | None  # e.g. ">= 0.5.0" or None for any version
     constraint_set: VersionSet | None = field(default=None, compare=False, hash=False)
+    flag_requests: tuple[FlagRequest, ...] = ()
+    optional: bool = False
+    predicates: tuple[Predicate, ...] = ()  # S7: auto-injected gate for optional
 
     def __post_init__(self) -> None:
         """Pre-type the constraint at construction time.
@@ -266,10 +327,15 @@ class LocalDep:
     ``path`` is the literal user-supplied string; the resolver lifts it
     to an absolute Path against the project root before constructing a
     provenance record.  LocalDep is NOT CAS-admissible.
+
+    ``predicates`` are evaluated before the dep is passed to the solver
+    (§6.3 NORMATIVE: all five dep forms support ``when``-conditional syntax).
+    Populated from enclosing ``when`` block predicates by ``_parse_local_dep``.
     """
 
     name: str
     path: str
+    predicates: tuple[Predicate, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -282,12 +348,17 @@ class TarballDep:
     ``sha256`` is optional (TOFU when absent).  ``strip_components``
     stripping is applied BEFORE ``content_hash`` computation.
     TarballDep IS CAS-admissible.
+
+    ``predicates`` are evaluated before the dep is passed to the solver
+    (§6.3 NORMATIVE: all five dep forms support ``when``-conditional syntax).
+    Populated from enclosing ``when`` block predicates by ``_parse_tarball_dep``.
     """
 
     name: str
     url: str
     sha256: str | None = None
     strip_components: int = 0
+    predicates: tuple[Predicate, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -299,9 +370,16 @@ class MemberDep:
     The node name is the literal keyword ``member`` (not the package
     name).  The positional arg is the workspace member's intrinsic name.
     MemberDep is NOT CAS-admissible.
+
+    ``predicates`` are evaluated before the dep is passed to the solver
+    (§6.3 NORMATIVE: all five dep forms support ``when``-conditional syntax).
+    Populated from enclosing ``when`` block predicates by ``_parse_member_dep``.
+    Note: MAN-DEP-MEMBER-PROPS still forbids properties directly ON the member
+    node — predicates come exclusively from enclosing ``when`` blocks.
     """
 
     name: str
+    predicates: tuple[Predicate, ...] = ()
 
 
 # Union of all dep forms.
@@ -309,16 +387,73 @@ Dep = UrlDep | NamedDep | LocalDep | TarballDep | MemberDep
 
 
 @dataclass(frozen=True)
+class GitTarget:
+    """Override target: replace a dep with a git fork URL + ref.
+
+    Corresponds to ``pkg "name" git=(url)"..." ref="..."`` (the original
+    git form, unchanged behavior).  Identity-bearing; CAS-admissible.
+    """
+
+    git: str
+    ref: str
+
+
+@dataclass(frozen=True)
+class LocalTarget:
+    """Override target: replace a dep with a local filesystem path.
+
+    Corresponds to ``pkg "name" local="<relative-path>"``.
+    Liveness-only; NOT CAS-admissible; non-reproducible for external
+    consumers (§3.3 carve-out).  Resolution wired in S8a.
+    """
+
+    path: str
+
+
+@dataclass(frozen=True)
+class MemberTarget:
+    """Override target: replace a dep with a workspace member.
+
+    Corresponds to ``pkg "name" { member "<member-name>" }``.
+    Identity-bearing; NOT CAS-admissible.  Resolution wired in S8b.
+    """
+
+    member_name: str
+
+
+# Discriminated union of all override target kinds (S8, RFC #23 §3.3).
+OverrideTarget = GitTarget | LocalTarget | MemberTarget
+
+
+@dataclass(frozen=True)
 class Override:
-    """A pkg-form override: any dep matching ``name`` resolves to this
-    git URL + ref instead of the manifest or transitive result.
+    """A pkg-form override (S8 discriminated union, RFC #23 §3.3).
+
+    ``name`` is the dep name to intercept.  ``target`` is exactly one of
+    ``GitTarget``, ``LocalTarget``, or ``MemberTarget`` — never a mix.
+    Zero or multiple targets in the same ``pkg`` rule raise
+    ``MAN-OVERRIDE-TARGET-AMBIGUOUS``.
 
     Project-wide scope.  Does not propagate to downstream consumers.
     """
 
     name: str
-    git: str
-    ref: str
+    target: OverrideTarget
+
+
+@dataclass(frozen=True)
+class CrossPkgEnable:
+    """A cross-package enable entry inside an ``enables`` node.
+
+    Reuses ``FlagRequest`` for the per-flag requests (SSOT).
+
+    ``dep`` is the dep node-name (validated as a KDL identifier at parse
+    time).  ``flag_requests`` are the ``flag`` children of that dep node,
+    structurally identical to ``UrlDep.flag_requests``.
+    """
+
+    dep: str
+    flag_requests: tuple[FlagRequest, ...]
 
 
 @dataclass(frozen=True)
@@ -329,12 +464,21 @@ class FlagDecl:
     ``description`` is human-facing documentation.
     ``defines`` are explicit ``-d:`` flags for the Nim compiler when
     active; empty tuple uses the convention ``-d:<pkg>_<flag>``.
+
+    S1 (RFC #23 §3.1.1 / §3.1.4):
+    ``enables_same_pkg`` — same-package flag names this flag enables when active.
+    ``enables_cross_pkg`` — cross-package dep→flag activation entries.
+    Multiple ``enables`` nodes union together (§3.1.1).
+    ``conflicts`` — same-package flag names that cannot be co-active (§3.1.4).
     """
 
     name: str
     default: bool = False
     description: str = ""
     defines: tuple[str, ...] = ()
+    enables_same_pkg: tuple[str, ...] = ()
+    enables_cross_pkg: tuple[CrossPkgEnable, ...] = ()
+    conflicts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -348,6 +492,10 @@ class Manifest:
     comments (``//``, ``/*``, or ``/-``).  When ``True``, ``format_manifest``
     emits a stderr warning (§8) because comments are dropped by the fresh-AST
     serializer.
+    ``optional_auto_flags`` is the set of flag names that were auto-injected
+    by the parse-time optional desugaring (S7 RFC #23 §3.2).  These are
+    implied by ``optional=#true`` on the dep and must NOT be serialized in
+    the ``flags {}`` block (they'd cause a clash on re-parse).
     """
 
     name: str
@@ -363,6 +511,7 @@ class Manifest:
     dev_deps: tuple[Dep, ...] = ()
     had_comments: bool = False
     attestation_policy: AttestationPolicy = "permissive"
+    optional_auto_flags: frozenset[str] = frozenset()  # S7: not serialized
 
 
 @dataclass(frozen=True)
@@ -372,11 +521,16 @@ class WorkspaceManifest:
     Pure container: declares member package paths and optional
     workspace-level overrides.  A workspace manifest MUST NOT declare
     ``deps`` or ``kind`` (``MAN-WORKSPACE-HAS-DEPS-OR-KIND``).
+
+    S11 (RFC #23 §3.8): workspace root may carry a ``flags {}`` block whose
+    default-true activations apply workspace-wide.  Reuses ``FlagDecl`` — no
+    parallel flag type.
     """
 
     members: tuple[str, ...]
     overrides: tuple[Override, ...] = ()
     name: str | None = None
+    flags: tuple["FlagDecl", ...] = ()  # S11: workspace-root flags (§3.8)
 
 
 # ---------------------------------------------------------------------------
@@ -430,13 +584,12 @@ def _check_flag_predicate_references(
 ) -> None:
     """Validate that all ``flag=`` predicate values name a declared flag.
 
-    Walks ``UrlDep.predicates``; any ``Predicate(name='flag')`` whose
+    Walks ``dep.predicates`` for ALL five dep forms (UrlDep, NamedDep,
+    LocalDep, TarballDep, MemberDep); any ``Predicate(name='flag')`` whose
     values reference an undeclared flag name raises
     ``MAN-FLAG-UNDECLARED-REFERENCE``.
     """
     for dep in deps:
-        if not isinstance(dep, UrlDep):
-            continue
         for pred in dep.predicates:
             if pred.name != "flag":
                 continue
@@ -449,6 +602,268 @@ def _check_flag_predicate_references(
                         dep=dep.name,
                         flag=value,
                     )
+
+
+def _check_flag_conflicts_references(
+    flags: list["FlagDecl"],
+    declared_flag_names: frozenset[str],
+) -> None:
+    """Post-parse validation for ``conflicts`` bare same-package names.
+
+    Walks every ``FlagDecl.conflicts``; any name not present in
+    ``declared_flag_names`` raises ``MAN-FLAG-CONFLICTS-UNDECLARED``.
+
+    Scope: same-package only (cross-package conflicts deferred, RFC #23 §3.1.4).
+    Forward references are legal — this runs after the full flags table is built.
+    """
+    from milpa.errors import MAN_FLAG_CONFLICTS_UNDECLARED, MAN_FLAG_CONFLICTS_SELF
+
+    for fd in flags:
+        for flag_name_ref in fd.conflicts:
+            if flag_name_ref == fd.name:
+                raise MilpaError(
+                    MAN_FLAG_CONFLICTS_SELF,
+                    f"flag {fd.name!r}: conflicts with itself — a flag cannot "
+                    f"list its own name in conflicts",
+                    flag=fd.name,
+                )
+            if flag_name_ref not in declared_flag_names:
+                raise MilpaError(
+                    MAN_FLAG_CONFLICTS_UNDECLARED,
+                    f"flag {fd.name!r}: conflicts references undeclared flag "
+                    f"{flag_name_ref!r}",
+                    flag=fd.name,
+                    conflicts=flag_name_ref,
+                )
+
+
+def _check_flag_enables_references(
+    flags: list["FlagDecl"],
+    declared_flag_names: frozenset[str],
+    dep_names: frozenset[str],
+) -> None:
+    """Post-parse validation for ``enables`` bare same-package names.
+
+    Walks every ``FlagDecl.enables_same_pkg``; any name not present in
+    ``declared_flag_names`` raises ``MAN-FLAG-ENABLES-UNDECLARED``.
+
+    When the undeclared name is also a dep name, the diagnostic adds:
+    ``"<name>" is a dependency, not a flag — add optional=#true …``
+
+    Cross-package ``enables_cross_pkg`` entries are NOT validated here.
+    """
+    for fd in flags:
+        for flag_name_ref in fd.enables_same_pkg:
+            if flag_name_ref not in declared_flag_names:
+                base_msg = (
+                    f"flag {fd.name!r}: enables references undeclared flag "
+                    f"{flag_name_ref!r}"
+                )
+                if flag_name_ref in dep_names:
+                    base_msg += (
+                        f" ({flag_name_ref!r} is a dependency, not a flag"
+                        " — add optional=#true to make it a feature)"
+                    )
+                raise MilpaError(
+                    MAN_FLAG_ENABLES_UNDECLARED,
+                    base_msg,
+                    flag=fd.name,
+                    enables=flag_name_ref,
+                )
+
+
+def flag_enables_closure(
+    flags: "tuple[FlagDecl, ...] | list[FlagDecl]",
+    seed: "frozenset[str]",
+) -> "frozenset[str]":
+    """Monotone least-fixpoint of same-package ``enables`` over one manifest's flag table.
+
+    S2 (RFC #23 §7 + §3.1.2).
+
+    Input:
+      ``flags``  — the ``FlagDecl`` tuples from a single manifest.
+      ``seed``   — the starting active-flag-name set (e.g. default-true flags,
+                   CLI-requested flags, or a cross-package request set).
+
+    Output:
+      The closure: ``seed`` ∪ every same-package flag reachable by following
+      ``enables_same_pkg`` edges from any active flag, to a fixed point.
+
+    Properties guaranteed (§3.1.2):
+      - **Seed inclusion**: result ⊇ seed.
+      - **Transitive**: follows multi-hop enables chains.
+      - **Idempotence**: ``closure(closure(S)) == closure(S)``.
+      - **Cycle termination**: ``a enables b, b enables a`` → ``{a, b}`` in O(n).
+      - **Order-independence**: result is independent of flag declaration order
+        (union is commutative).
+      - **Cross-package ignored**: ``enables_cross_pkg`` entries are NOT followed
+        here — they are activated at resolve time in S3/S4a.
+      - **Unknown targets skipped**: any enables target not in the flag table is
+        silently ignored (post-parse validation ensures this is unreachable in
+        practice, but the function is safe if called on partially-built tables).
+
+    Design note: the caller is responsible for seeding from ``default=#true``
+    flags (``frozenset(f.name for f in flags if f.default)``).  This keeps the
+    pure closure function a single-responsibility SSOT.
+    """
+    # Build a name→enables_same_pkg lookup for O(1) access.
+    enables_by_name: dict[str, tuple[str, ...]] = {
+        fd.name: fd.enables_same_pkg for fd in flags
+    }
+    active = set(seed)
+    worklist = list(seed)
+    while worklist:
+        flag_name = worklist.pop()
+        for target in enables_by_name.get(flag_name, ()):
+            if target not in active and target in enables_by_name:
+                active.add(target)
+                worklist.append(target)
+    return frozenset(active)
+
+
+def _desugar_one_dep(
+    dep: "Dep",
+    declared_flag_names: "frozenset[str]",
+    new_flags: "list[FlagDecl]",
+    injected_flag_names: "set[str]",
+) -> "Dep":
+    """Desugar one dep that carries ``optional=True``.
+
+    Returns the transformed dep (or the original if not optional).
+    Mutates ``new_flags`` and ``injected_flag_names`` in-place.
+
+    Extracted from the former nested ``_desugar_dep`` closure inside
+    ``_desugar_optional_deps`` to eliminate hidden effectful coupling.
+    """
+    if not isinstance(dep, (UrlDep, NamedDep)):
+        return dep
+    if not dep.optional:
+        return dep
+
+    dep_nm = dep.name
+
+    # 1. Clash with already-declared flags (pre-desugar) or already-injected
+    #    auto-flags from earlier optional deps in this same parse.
+    if dep_nm in declared_flag_names or dep_nm in injected_flag_names:
+        raise MilpaError(
+            MAN_DEP_OPTIONAL_FLAG_CLASH,
+            f"dep {dep_nm!r}: optional dep name {dep_nm!r} collides with an "
+            "already-declared flag of the same name — rename the flag or "
+            "the dep (RFC #23 §3.2)",
+            dep=dep_nm,
+            flag=dep_nm,
+        )
+
+    # 2. Inject auto-flag FlagDecl(name=dep_nm, default=False).
+    injected_flag_names.add(dep_nm)
+    new_flags.append(FlagDecl(name=dep_nm, default=False))
+
+    # 3. Inject flag=<depname> predicate, deduplicating if already explicit.
+    gate_pred = Predicate(name="flag", values=(dep_nm,), negated=False)
+    if isinstance(dep, UrlDep):
+        existing_preds = dep.predicates
+        # Idempotent: collapse a duplicate explicit gate, compose any others.
+        if gate_pred not in existing_preds:
+            new_preds = existing_preds + (gate_pred,)
+        else:
+            new_preds = existing_preds
+        # Return a new UrlDep with the injected predicate (frozen dataclass).
+        return UrlDep(
+            name=dep.name,
+            git=dep.git,
+            ref=dep.ref,
+            mirrors=dep.mirrors,
+            predicates=new_preds,
+            flag_requests=dep.flag_requests,
+            optional=True,  # preserve for round-trip
+        )
+    else:
+        # NamedDep: inject the gate predicate into the predicates field
+        # (same approach as UrlDep — all five dep forms carry predicates; SSOT).
+        existing_preds = dep.predicates
+        if gate_pred not in existing_preds:
+            new_preds = existing_preds + (gate_pred,)
+        else:
+            new_preds = existing_preds
+        return NamedDep(
+            name=dep.name,
+            constraint=dep.constraint,
+            constraint_set=dep.constraint_set,
+            flag_requests=dep.flag_requests,
+            optional=True,
+            predicates=new_preds,
+        )
+
+
+def _desugar_optional_deps(
+    deps: list[Dep],
+    dev_deps: list[Dep],
+    flags: list[FlagDecl],
+    declared_flag_names: frozenset[str],
+) -> tuple[list[Dep], list[Dep], list[FlagDecl], frozenset[str]]:
+    """Parse-time desugaring of ``optional=#true`` deps (S7, RFC #23 §3.2).
+
+    For each dep with ``optional=True`` in ``deps`` or ``dev_deps``:
+    1. Check no flag of that name is already declared — else
+       ``MAN-DEP-OPTIONAL-FLAG-CLASH``.
+    2. Auto-declare a ``FlagDecl(name=dep_name, default=False)`` and append
+       it to ``flags``.
+    3. Inject a ``flag=<depname>`` predicate into the dep's predicates
+       (deduplicating if an explicit identical predicate already exists).
+
+    Note: charset validation (``[A-Za-z0-9_-]+``) is performed earlier by the
+    dep-name parser (``MAN-DEP-NAME-INVALID``), which runs for ALL dep names
+    before optional desugaring.  ``MAN-DEP-OPTIONAL-INVALID-NAME`` is only
+    raised by ``milpa add --optional`` when the user supplies a name on the
+    command line that violates the flag-name charset.
+
+    Namespace hygiene (§3.2 normative): also checks that **non-optional** deps
+    do not share a name with any **explicitly declared** flag (pre-desugar).
+    This catches latent confusion where a dep name and a flag name fuse
+    unexpectedly.  Error: ``MAN-DEP-OPTIONAL-FLAG-CLASH``.
+
+    Returns the updated ``(deps, dev_deps, flags, injected_names)`` 4-tuple.
+    ``injected_names`` is the ``frozenset`` of flag names that were auto-
+    injected (needed by ``format_manifest`` to skip them in the flags block).
+    All inputs are consumed and must not be used after this call.
+    """
+    # Namespace hygiene: non-optional deps must not collide with declared flags.
+    # NORMATIVE (spec/errors.md §MAN-DEP-OPTIONAL-FLAG-CLASH): all five dep
+    # forms are checked — only UrlDep/NamedDep can carry optional=True, so
+    # LocalDep/TarballDep/MemberDep are always non-optional.
+    # Mirrors Rust desugar_optional_deps (milpa-manifest/src/lib.rs).
+    for dep in list(deps) + list(dev_deps):
+        is_optional = isinstance(dep, (UrlDep, NamedDep)) and dep.optional
+        if not is_optional and dep.name in declared_flag_names:
+            # R8-D2: only UrlDep/NamedDep support optional=#true; LocalDep,
+            # TarballDep, and MemberDep cannot be made optional, so the hint
+            # must be suppressed for those types.
+            if isinstance(dep, (UrlDep, NamedDep)):
+                hint = "rename one or mark the dep optional=#true"
+            else:
+                hint = "rename the dep or the flag"
+            raise MilpaError(
+                    MAN_DEP_OPTIONAL_FLAG_CLASH,
+                    f"dep {dep.name!r}: dep name collides with a declared flag "
+                    f"{dep.name!r} — dep and flag namespaces are fused by "
+                    f"optional deps (RFC #23 §3.2); {hint}",
+                    dep=dep.name,
+                    flag=dep.name,
+                )
+
+    # Track newly injected flags so we can detect clash among optional deps too.
+    injected_flag_names: set[str] = set()
+    new_flags: list[FlagDecl] = list(flags)
+
+    new_deps = [
+        _desugar_one_dep(d, declared_flag_names, new_flags, injected_flag_names)
+        for d in deps
+    ]
+    new_dev_deps = [
+        _desugar_one_dep(d, declared_flag_names, new_flags, injected_flag_names)
+        for d in dev_deps
+    ]
+    return new_deps, new_dev_deps, new_flags, frozenset(injected_flag_names)
 
 
 def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
@@ -548,6 +963,16 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
                     MAN_SRC_DIR_TYPE,
                     "'src_dir' takes exactly one positional string argument",
                 )
+            # R2-C2 + R2-Unicode fix: reject control chars and Unicode line
+            # separators — src_dir flows verbatim to nim.cfg --path: lines.
+            if contains_unsafe_char(v):
+                raise MilpaError(
+                    MAN_SRC_DIR_UNSAFE,
+                    f"'src_dir' value {v!r} contains a control character or "
+                    "Unicode line separator (U+2028/U+2029) — this would allow "
+                    "nim.cfg injection; rejected at parse boundary",
+                    value=repr(v),
+                )
             src_dir = v
 
         elif nm == "cas":
@@ -596,12 +1021,49 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
             "manifest is missing required 'name' node",
         )
 
+    # Collect dep_names (used both by desugar and enables-reference check).
+    dep_names = frozenset(
+        d.name for d in list(deps) + list(dev_deps)
+        if not isinstance(d, MemberDep)
+    )
+
+    # S7 (RFC #23 §3.2) parse-time optional desugaring runs FIRST among the
+    # post-parse passes so the auto-injected flag names are visible to all
+    # downstream reference checks (enables, conflicts, flag predicates).
+    # Checks namespace hygiene (non-optional dep sharing a flag name);
+    # raises MAN-DEP-OPTIONAL-FLAG-CLASH on error.  Charset validation
+    # (MAN-DEP-NAME-INVALID) runs earlier at dep-parse time.
+    declared_flag_names = frozenset(f.name for f in flags)
+    deps, dev_deps, flags, optional_auto_flags = _desugar_optional_deps(
+        deps=deps,
+        dev_deps=dev_deps,
+        flags=flags,
+        declared_flag_names=declared_flag_names,
+    )
+    # Recompute after desugar so auto-injected flag names are included.
+    declared_flag_names = frozenset(f.name for f in flags)
+
     # 3c-8 post-parse: check that all 'flag' predicate references name a
     # declared flag (MAN-FLAG-UNDECLARED-REFERENCE).
-    declared_flag_names = frozenset(f.name for f in flags)
+    # Runs AFTER desugar so the auto-injected gate predicates don't falsely
+    # trigger this check (they reference auto-injected flags that are now declared).
     _check_flag_predicate_references(
         list(deps) + list(dev_deps), declared_flag_names
     )
+
+    # S1 (RFC #23 §3.1.1) post-parse: check that all enables bare same-pkg names
+    # reference a declared flag (MAN-FLAG-ENABLES-UNDECLARED).  Forward references
+    # are legal because we do this AFTER the full flags table is built.
+    # Runs AFTER desugar so enables referencing auto-injected optional-flag names
+    # (e.g. `enables "optlib"` for an `optlib optional=#true` dep) are valid.
+    # Cross-package enables children are NOT validated here (resolve-time concern).
+    _check_flag_enables_references(flags, declared_flag_names, dep_names)
+
+    # S4c (RFC #23 §3.1.4) post-parse: check that all conflicts bare same-pkg
+    # names reference a declared flag (MAN-FLAG-CONFLICTS-UNDECLARED).  Same
+    # structure as the enables check above — post-parse, forward references legal,
+    # same-package only.
+    _check_flag_conflicts_references(flags, declared_flag_names)
 
     return Manifest(
         name=name,
@@ -616,6 +1078,7 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
         spec_version_explicit=spec_version_explicit,
         dev_deps=tuple(dev_deps),
         attestation_policy=attestation_policy,
+        optional_auto_flags=optional_auto_flags,
     )
 
 
@@ -647,6 +1110,7 @@ def _parse_workspace_doc(doc: KdlDocument) -> WorkspaceManifest:
     members: list[str] = []
     overrides: list[Override] = []
     ws_name: str | None = None
+    ws_flags: list[FlagDecl] = []
 
     for n in nodes(doc):
         nm = node_name(n)
@@ -714,10 +1178,16 @@ def _parse_workspace_doc(doc: KdlDocument) -> WorkspaceManifest:
         elif nm == "overrides":
             overrides = _parse_overrides_block(n)
 
+        elif nm == "flags":
+            # S11 (RFC #23 §3.8): workspace-root flags {}.
+            # Reuses _parse_flags_block (SSOT).
+            ws_flags = _parse_flags_block(n)
+
     return WorkspaceManifest(
         members=tuple(members),
         overrides=tuple(overrides),
         name=ws_name,
+        flags=tuple(ws_flags),  # S11
     )
 
 
@@ -804,14 +1274,27 @@ def _parse_dep_node(
     props = node_props(n)
 
     if nm == "member":
-        return _parse_member_dep(n)
+        return _parse_member_dep(n, outer_predicates=outer_predicates)
+
+    # R2-C1 security fix: validate dep name charset at parse boundary.
+    # KDL 2.0 quoted node names can contain chars outside [A-Za-z0-9_-].
+    # A dep name with \n (or other nim.cfg-significant char) would inject content
+    # via --path:"_deps/<name>" and -d:<pkg>_<flag> emit lines in nimcfg.py.
+    if not valid_dep_name(nm):
+        raise MilpaError(
+            MAN_DEP_NAME_INVALID,
+            f"dep {nm!r}: dep names must match [A-Za-z0-9_-]+ "
+            "(no spaces, control characters, or nim.cfg-significant chars)",
+            dep=nm,
+        )
+
     if "git" in props:
         return _parse_url_dep(n, dep_name=nm, outer_predicates=outer_predicates)
     if "local" in props:
-        return _parse_local_dep(n, dep_name=nm)
+        return _parse_local_dep(n, dep_name=nm, outer_predicates=outer_predicates)
     if "tarball" in props:
-        return _parse_tarball_dep(n, dep_name=nm)
-    return _parse_named_dep(n, dep_name=nm)
+        return _parse_tarball_dep(n, dep_name=nm, outer_predicates=outer_predicates)
+    return _parse_named_dep(n, dep_name=nm, outer_predicates=outer_predicates)
 
 
 # ---------------------------------------------------------------------------
@@ -909,6 +1392,25 @@ def _parse_url_dep(
                 child=child_nm,
             )
 
+    # --- optional= (bool; default False) ---
+    # Parsed here but NOT desugared here — the desugar pass in
+    # ``_parse_manifest_doc`` runs after all deps + flags are collected so it
+    # can check for name clashes.  ``optional`` is retained on the dep for
+    # round-trip serialization (``format_manifest`` emits ``optional=#true``).
+    optional: bool = False
+    if "optional" in node_props(n):
+        optional_raw = node_props(n).get("optional")
+        from milpa.kdl_io import node_prop_bool
+        optional_v = node_prop_bool(n, "optional")
+        if optional_v is None:
+            raise MilpaError(
+                MAN_DEP_UNKNOWN_PROPS,
+                f"dep {dep_name!r}: 'optional=' must be a boolean (#true or #false)",
+                dep=dep_name,
+                prop="optional",
+            )
+        optional = optional_v
+
     all_predicates = (
         list(outer_predicates) + inline_predicates + child_predicates
     )
@@ -920,6 +1422,7 @@ def _parse_url_dep(
         mirrors=tuple(mirrors),
         predicates=tuple(all_predicates),
         flag_requests=tuple(flag_requests),
+        optional=optional,
     )
 
 
@@ -1130,19 +1633,46 @@ def _parse_inline_predicates_from_node(
     return predicates
 
 
-def _parse_named_dep(n: KdlNode, *, dep_name: str) -> NamedDep:
+def _parse_named_dep(
+    n: KdlNode,
+    *,
+    dep_name: str,
+    outer_predicates: tuple[Predicate, ...] = (),
+) -> NamedDep:
     """Parse a NamedDep (registry-resolved).
 
     Grammar: ``<name>`` or ``<name> "<version-constraint>"``
+    Optionally with a ``{ flag "x" }`` child block (§3.1.5, S3 RFC #23).
+    ``optional=#true`` is permitted (S7 RFC #23 §3.2).
 
     The constraint string is pre-typed to ``VersionSet`` at this boundary.
+    Children: only ``flag`` child nodes are accepted (same parser as UrlDep).
+
+    ``outer_predicates`` are inherited predicates from an enclosing ``when``
+    block (§6.3); they are stored as the initial predicates tuple.  The
+    optional-desugar pass (S7) may extend this tuple with a flag gate.
     """
     raw_args = node_args(n)
     props = node_props(n)
 
-    # Any property (other than git= which routes to UrlDep) is an error.
-    if props:
-        for prop_key in props:
+    # --- optional= (bool; default False) ---
+    # Allowed on NamedDep (RFC #23 §3.2 covers both URL and named deps).
+    optional: bool = False
+    if "optional" in props:
+        from milpa.kdl_io import node_prop_bool
+        optional_v = node_prop_bool(n, "optional")
+        if optional_v is None:
+            raise MilpaError(
+                MAN_DEP_NAMED_PROPS,
+                f"dep {dep_name!r}: 'optional=' must be a boolean (#true or #false)",
+                dep=dep_name,
+                prop="optional",
+            )
+        optional = optional_v
+
+    # Any property other than 'optional' (and 'git=' which routes to UrlDep) is an error.
+    for prop_key in props:
+        if prop_key != "optional":
             raise MilpaError(
                 MAN_DEP_NAMED_PROPS,
                 f"dep {dep_name!r}: NamedDep does not accept properties "
@@ -1159,9 +1689,31 @@ def _parse_named_dep(n: KdlNode, *, dep_name: str) -> NamedDep:
             dep=dep_name,
         )
 
+    # Parse children: only ``flag`` child nodes accepted (§3.1.5).
+    flag_requests: list[FlagRequest] = []
+    for child in node_children(n):
+        child_nm = node_name(child)
+        if child_nm == "flag":
+            flag_requests.append(_parse_flag_request_child(child, dep_name=dep_name))
+        else:
+            raise MilpaError(
+                MAN_DEP_UNKNOWN_CHILD,
+                f"dep {dep_name!r}: unknown child node {child_nm!r} "
+                "(NamedDep accepts only 'flag' children)",
+                dep=dep_name,
+                child=child_nm,
+            )
+
     if len(raw_args) == 0:
         # No constraint — any version
-        return NamedDep(name=dep_name, constraint=None, constraint_set=None)
+        return NamedDep(
+            name=dep_name,
+            constraint=None,
+            constraint_set=None,
+            flag_requests=tuple(flag_requests),
+            optional=optional,
+            predicates=outer_predicates,
+        )
 
     # Exactly one arg — must be a string constraint.
     # A non-string arg (int, bool, etc.) → MAN-DEP-NAMED-CONSTRAINT.
@@ -1176,16 +1728,30 @@ def _parse_named_dep(n: KdlNode, *, dep_name: str) -> NamedDep:
 
     # Pre-type: MilpaError(MAN_DEP_NAMED_CONSTRAINT) raised by __post_init__
     # if the string is malformed.
-    return NamedDep(name=dep_name, constraint=arg)
+    return NamedDep(
+        name=dep_name,
+        constraint=arg,
+        flag_requests=tuple(flag_requests),
+        optional=optional,
+        predicates=outer_predicates,
+    )
 
 
-def _parse_local_dep(n: KdlNode, *, dep_name: str) -> LocalDep:
+def _parse_local_dep(
+    n: KdlNode,
+    *,
+    dep_name: str,
+    outer_predicates: tuple[Predicate, ...] = (),
+) -> LocalDep:
     """Parse a LocalDep node.
 
     Grammar: ``<name> local="<path>"``
 
     The ``local=`` value must be a non-empty string.
     No other properties are permitted.
+
+    ``outer_predicates`` are inherited predicates from an enclosing ``when``
+    block (§6.3); they are stored on the LocalDep for filter-before-solve.
     """
     props = node_props(n)
 
@@ -1215,10 +1781,15 @@ def _parse_local_dep(n: KdlNode, *, dep_name: str) -> LocalDep:
             dep=dep_name,
         )
 
-    return LocalDep(name=dep_name, path=path)
+    return LocalDep(name=dep_name, path=path, predicates=outer_predicates)
 
 
-def _parse_tarball_dep(n: KdlNode, *, dep_name: str) -> TarballDep:
+def _parse_tarball_dep(
+    n: KdlNode,
+    *,
+    dep_name: str,
+    outer_predicates: tuple[Predicate, ...] = (),
+) -> TarballDep:
     """Parse a TarballDep node.
 
     Grammar:
@@ -1228,6 +1799,9 @@ def _parse_tarball_dep(n: KdlNode, *, dep_name: str) -> TarballDep:
     ``sha256`` optional string; non-string raises MAN-DEP-TARBALL-SHA.
     ``strip_components`` optional non-negative int; negative/non-int/bool
     raises MAN-DEP-TARBALL-STRIP.
+
+    ``outer_predicates`` are inherited predicates from an enclosing ``when``
+    block (§6.3); they are stored on the TarballDep for filter-before-solve.
     """
     props = node_props(n)
 
@@ -1277,6 +1851,17 @@ def _parse_tarball_dep(n: KdlNode, *, dep_name: str) -> TarballDep:
                 f"dep {dep_name!r}: 'strip_components=' must be a non-negative integer",
                 dep=dep_name,
             )
+        # Must NOT be a float literal (including whole floats like 1.0).
+        # KDL 2.0 distinguishes integer literals from float literals at the type
+        # level; 1.0 is a float literal and is rejected here to match Rust
+        # (kdl-rs typed API rejects Float at integer-typed fields).
+        if isinstance(raw_strip, float):
+            raise MilpaError(
+                MAN_DEP_TARBALL_STRIP,
+                f"dep {dep_name!r}: 'strip_components=' must be an integer literal, "
+                f"got float {raw_strip!r}",
+                dep=dep_name,
+            )
         strip_v = node_prop_int(n, "strip_components")
         if strip_v is None:
             raise MilpaError(
@@ -1299,20 +1884,26 @@ def _parse_tarball_dep(n: KdlNode, *, dep_name: str) -> TarballDep:
         url=url,
         sha256=sha256,
         strip_components=strip_components,
+        predicates=outer_predicates,
     )
 
 
 def _parse_overrides_block(block: KdlNode) -> list[Override]:
     """Parse an ``overrides { }`` block.
 
-    Each child MUST be named ``pkg``.  Grammar:
-        ``pkg "<name>" git=(url)"<URL>" ref="<ref>"``
+    Each child MUST be named ``pkg``.  S8 grammar (RFC #23 §3.3):
+        git form:    ``pkg "<name>" git=(url)"<URL>" ref="<ref>"``
+        local form:  ``pkg "<name>" local="<relative-path>"``
+        member form: ``pkg "<name>" { member "<member-name>" }``
+
+    Exactly one provenance target per ``pkg`` rule; zero or multiple targets
+    raises ``MAN-OVERRIDE-TARGET-AMBIGUOUS``.
 
     Error codes:
     - Unknown child name → ``MAN-OVERRIDE-KIND``
     - ``pkg`` with no positional arg (arity 0) or non-string arg → ``MAN-OVERRIDE-ARITY``
-    - Missing ``git=`` → ``MAN-OVERRIDE-GIT-MISSING``
-    - Missing ``ref=`` → ``MAN-OVERRIDE-REF-MISSING``
+    - Zero or multiple target forms → ``MAN-OVERRIDE-TARGET-AMBIGUOUS``
+    - Missing ``ref=`` on git form → ``MAN-OVERRIDE-REF-MISSING``
     - Unknown property → ``MAN-OVERRIDE-UNKNOWN-PROPS``
     - Duplicate name → ``MAN-OVERRIDE-DUPLICATE``
     """
@@ -1337,35 +1928,84 @@ def _parse_overrides_block(block: KdlNode) -> list[Override]:
             )
         pkg_name: str = raw_args[0]
 
-        # Check for unknown properties (only git= and ref= are allowed).
-        _OVERRIDE_KNOWN_PROPS = frozenset({"git", "ref"})
-        for prop_key in node_props(child):
+        # --- Detect which target forms are present ---
+        props = node_props(child)
+        children = node_children(child)
+
+        # Known properties across all forms; validate unknowns first.
+        _OVERRIDE_KNOWN_PROPS = frozenset({"git", "ref", "local"})
+        for prop_key in props:
             if prop_key not in _OVERRIDE_KNOWN_PROPS:
                 raise MilpaError(
                     MAN_OVERRIDE_UNKNOWN_PROPS,
                     f"override for {pkg_name!r}: unknown property {prop_key!r} "
-                    "(allowed: 'git', 'ref')",
+                    "(allowed: 'git', 'ref', 'local')",
                     name=pkg_name,
                     prop=prop_key,
                 )
 
-        git_url_v = node_prop_url(child, "git")
-        if git_url_v is None:
-            raise MilpaError(
-                MAN_OVERRIDE_GIT_MISSING,
-                f"override for {pkg_name!r}: missing required 'git=' property",
-                name=pkg_name,
-            )
-        git_url = str(git_url_v)
-        _validate_git_url(git_url, pkg_name)
+        has_git = "git" in props
+        has_local = "local" in props
+        # member form: a single child node named "member"
+        member_children = [c for c in children if node_name(c) == "member"]
+        has_member = len(member_children) > 0
 
-        ref = node_prop_str(child, "ref")
-        if ref is None:
+        # Count target forms (exactly one required).
+        target_count = sum([has_git, has_local, has_member])
+        if target_count != 1:
             raise MilpaError(
-                MAN_OVERRIDE_REF_MISSING,
-                f"override for {pkg_name!r}: missing required 'ref=' property",
+                MAN_OVERRIDE_TARGET_AMBIGUOUS,
+                f"override for {pkg_name!r}: exactly one provenance form is required "
+                f"(git, local, or member); got {target_count} "
+                f"({'none' if target_count == 0 else 'multiple forms mixed'})",
                 name=pkg_name,
             )
+
+        # --- Parse the selected target form ---
+        target: OverrideTarget
+        if has_git:
+            git_url_v = node_prop_url(child, "git")
+            if git_url_v is None:
+                # git= present but not a URL value — url_arg already rejected it above;
+                # treat as missing for error consistency.
+                raise MilpaError(
+                    MAN_OVERRIDE_GIT_MISSING,
+                    f"override for {pkg_name!r}: 'git=' must be a URL string",
+                    name=pkg_name,
+                )
+            git_url = str(git_url_v)
+            _validate_git_url(git_url, pkg_name)
+
+            ref = node_prop_str(child, "ref")
+            if ref is None:
+                raise MilpaError(
+                    MAN_OVERRIDE_REF_MISSING,
+                    f"override for {pkg_name!r}: missing required 'ref=' property",
+                    name=pkg_name,
+                )
+            target = GitTarget(git=git_url, ref=ref)
+
+        elif has_local:
+            local_path = node_prop_str(child, "local")
+            if not local_path:
+                raise MilpaError(
+                    MAN_DEP_LOCAL_PATH,
+                    f"override for {pkg_name!r}: 'local=' must be a non-empty string path",
+                    name=pkg_name,
+                )
+            target = LocalTarget(path=local_path)
+
+        else:  # has_member
+            mc = member_children[0]
+            member_args = node_args(mc)
+            if len(member_args) != 1 or not isinstance(member_args[0], str):
+                raise MilpaError(
+                    MAN_DEP_MEMBER_ARITY,
+                    f"override for {pkg_name!r}: 'member' child takes exactly one "
+                    "positional string argument (the workspace member name)",
+                    name=pkg_name,
+                )
+            target = MemberTarget(member_name=member_args[0])
 
         if pkg_name in seen_names:
             raise MilpaError(
@@ -1374,7 +2014,7 @@ def _parse_overrides_block(block: KdlNode) -> list[Override]:
                 name=pkg_name,
             )
         seen_names.add(pkg_name)
-        overrides.append(Override(name=pkg_name, git=git_url, ref=ref))
+        overrides.append(Override(name=pkg_name, target=target))
 
     return overrides
 
@@ -1417,12 +2057,61 @@ def _parse_mirrors_block(block: KdlNode) -> list[str]:
     return mirrors
 
 
+def _parse_enables_node(
+    node: KdlNode,
+    *,
+    flag_name: str,
+    enables_same_pkg: list[str],
+    enables_cross_pkg: list[CrossPkgEnable],
+) -> None:
+    """Parse one ``enables`` node into same-pkg names and cross-pkg entries.
+
+    A single ``enables`` node may carry BOTH bare string args (same-package
+    flag names) AND child nodes (cross-package dep→flag requests).  Multiple
+    ``enables`` nodes union into the same lists (callers pass shared lists).
+
+    Cross-package child form: ``<dep-name> { flag "<flag>" [#false] }``
+    Reuses ``_parse_flag_request_child`` for the flag children (SSOT).
+    """
+    # Bare string args = same-package flag names.
+    for i, arg in enumerate(node_args(node)):
+        if not isinstance(arg, str):
+            raise MilpaError(
+                MAN_FLAG_UNKNOWN_CHILD,
+                f"flag {flag_name!r}: 'enables' argument {i} must be a "
+                f"string flag name, got {type(arg).__name__!r}",
+                flag=flag_name,
+                child="enables",
+            )
+        enables_same_pkg.append(arg)
+
+    # Children = cross-package dep→flag entries.
+    for dep_node in node_children(node):
+        dep_nm = node_name(dep_node)
+        # The dep node may have flag children.
+        flag_reqs: list[FlagRequest] = []
+        for flag_child in node_children(dep_node):
+            child_nm = node_name(flag_child)
+            if child_nm != "flag":
+                raise MilpaError(
+                    MAN_FLAG_UNKNOWN_CHILD,
+                    f"flag {flag_name!r}: enables cross-pkg dep {dep_nm!r} "
+                    f"has unknown child {child_nm!r} (only 'flag' is allowed)",
+                    flag=flag_name,
+                    child=child_nm,
+                )
+            flag_reqs.append(
+                _parse_flag_request_child(flag_child, dep_name=f"{flag_name}→{dep_nm}")
+            )
+        enables_cross_pkg.append(CrossPkgEnable(dep=dep_nm, flag_requests=tuple(flag_reqs)))
+
+
 def _parse_flags_block(block: KdlNode) -> list[FlagDecl]:
     """Parse a ``flags { }`` block.
 
     Each child is a flag declaration; the KDL identifier is the flag name.
     Permitted properties: ``default`` (bool), ``description`` (string).
-    Optional child node: ``defines`` with one or more string args.
+    Optional child nodes: ``defines``, ``enables``, ``conflicts``.
 
     Error codes:
     - Positional args on flag node → ``MAN-FLAG-POS-ARGS``
@@ -1438,6 +2127,18 @@ def _parse_flags_block(block: KdlNode) -> list[FlagDecl]:
 
     for child in node_children(block):
         flag_name = node_name(child)
+
+        # H1 security fix: validate flag name charset at parse boundary.
+        # KDL 2.0 quoted node names can contain chars outside [A-Za-z0-9_-].
+        # A malicious dep could declare a flag named "x\n--passC:..." to inject
+        # nim.cfg lines via the childless-convention emit: -d:<pkg>_<flagname>.
+        if not valid_dep_name(flag_name):
+            raise MilpaError(
+                MAN_FLAG_NAME_INVALID,
+                f"flag name {flag_name!r} is not valid — flag names must match "
+                "[A-Za-z0-9_-]+ (no spaces, special characters, or control characters)",
+                flag=flag_name,
+            )
 
         # No positional args allowed on a flag node.
         raw_args = node_args(child)
@@ -1486,27 +2187,70 @@ def _parse_flags_block(block: KdlNode) -> list[FlagDecl]:
                 )
             description = desc_v
 
-        # Child nodes: only ``defines`` is allowed.
+        # Child nodes: ``defines``, ``enables``, ``conflicts`` are allowed.
+        # (S1 RFC #23 §3.1.1 / §3.1.4 adds ``enables`` and ``conflicts``.)
         defines: list[str] = []
+        enables_same_pkg: list[str] = []
+        enables_cross_pkg: list[CrossPkgEnable] = []
+        conflicts_names: list[str] = []
+
         for sub_child in node_children(child):
             sub_nm = node_name(sub_child)
-            if sub_nm != "defines":
+            if sub_nm == "defines":
+                for i, define_arg in enumerate(node_args(sub_child)):
+                    if not isinstance(define_arg, str):
+                        raise MilpaError(
+                            MAN_FLAG_DEFINES_ARG_TYPE,
+                            f"flag {flag_name!r}: 'defines' argument {i} must be "
+                            f"a string, got {type(define_arg).__name__!r}",
+                            flag=flag_name,
+                        )
+                    # H1 + R2-Unicode fix: reject control chars and Unicode line
+                    # separators at parse boundary. An embedded \n (or any control
+                    # char, or U+2028/U+2029) in a defines value would be emitted
+                    # verbatim to nim.cfg, injecting arbitrary compiler flags → code exec.
+                    if contains_unsafe_char(define_arg):
+                        raise MilpaError(
+                            MAN_FLAG_DEFINES_UNSAFE,
+                            f"flag {flag_name!r}: 'defines' argument {i} contains "
+                            f"a control character or Unicode line separator "
+                            f"(0x00–0x1F, 0x7F, U+2028, U+2029) — this would allow "
+                            f"nim.cfg injection; rejected at parse boundary",
+                            flag=flag_name,
+                            arg_index=i,
+                            value=repr(define_arg),
+                        )
+                    defines.append(define_arg)
+            elif sub_nm == "enables":
+                # Bare string args = same-package flag names.
+                # Children = cross-package dep→flag entries.
+                # Multiple enables nodes union together.
+                _parse_enables_node(
+                    sub_child,
+                    flag_name=flag_name,
+                    enables_same_pkg=enables_same_pkg,
+                    enables_cross_pkg=enables_cross_pkg,
+                )
+            elif sub_nm == "conflicts":
+                # Bare string args = same-package flag names this flag conflicts with.
+                for i, arg in enumerate(node_args(sub_child)):
+                    if not isinstance(arg, str):
+                        raise MilpaError(
+                            MAN_FLAG_UNKNOWN_CHILD,
+                            f"flag {flag_name!r}: 'conflicts' argument {i} must be "
+                            f"a string flag name",
+                            flag=flag_name,
+                            child=sub_nm,
+                        )
+                    conflicts_names.append(arg)
+            else:
                 raise MilpaError(
                     MAN_FLAG_UNKNOWN_CHILD,
                     f"flag {flag_name!r}: unknown child node {sub_nm!r} "
-                    "(only 'defines' is allowed)",
+                    "(allowed: 'defines', 'enables', 'conflicts')",
                     flag=flag_name,
                     child=sub_nm,
                 )
-            for i, define_arg in enumerate(node_args(sub_child)):
-                if not isinstance(define_arg, str):
-                    raise MilpaError(
-                        MAN_FLAG_DEFINES_ARG_TYPE,
-                        f"flag {flag_name!r}: 'defines' argument {i} must be "
-                        f"a string, got {type(define_arg).__name__!r}",
-                        flag=flag_name,
-                    )
-                defines.append(define_arg)
 
         # Duplicate check.
         if flag_name in seen_names:
@@ -1522,18 +2266,30 @@ def _parse_flags_block(block: KdlNode) -> list[FlagDecl]:
                 default=default,
                 description=description,
                 defines=tuple(defines),
+                enables_same_pkg=tuple(enables_same_pkg),
+                enables_cross_pkg=tuple(enables_cross_pkg),
+                conflicts=tuple(conflicts_names),
             )
         )
 
     return flags
 
 
-def _parse_member_dep(n: KdlNode) -> MemberDep:
+def _parse_member_dep(
+    n: KdlNode,
+    *,
+    outer_predicates: tuple[Predicate, ...] = (),
+) -> MemberDep:
     """Parse a ``member "<name>"`` node.
 
     The node name is the literal keyword ``member``.  Requires exactly
     one positional string argument (the member's intrinsic name).
-    Properties are not allowed.
+    Properties are not allowed (MAN-DEP-MEMBER-PROPS still forbids them —
+    predicates come exclusively from enclosing ``when`` blocks, not as
+    direct properties on the member node).
+
+    ``outer_predicates`` are inherited predicates from an enclosing ``when``
+    block (§6.3); they are stored on the MemberDep for filter-before-solve.
     """
     props = node_props(n)
     if props:
@@ -1552,7 +2308,19 @@ def _parse_member_dep(n: KdlNode) -> MemberDep:
             "(the workspace member's intrinsic name)",
         )
 
-    return MemberDep(name=raw_args[0])
+    # R6-F3 security fix: validate member name charset at parse boundary.
+    # The name flows to ResolvedDep.name → nimcfg --path: lines, same
+    # injection class as the R2-C1 dep-name fix.  Reuse SSOT charset predicate.
+    nm = raw_args[0]
+    if not valid_dep_name(nm):
+        raise MilpaError(
+            MAN_DEP_NAME_INVALID,
+            f"member {nm!r}: dep names must match [A-Za-z0-9_-]+ "
+            "(no spaces, control characters, or nim.cfg-significant chars)",
+            dep=nm,
+        )
+
+    return MemberDep(name=nm, predicates=outer_predicates)
 
 
 # ---------------------------------------------------------------------------
@@ -1574,14 +2342,20 @@ def _parse_spec_version_node(n: KdlNode) -> int:
             "'spec-version' takes exactly one positive integer argument",
         )
     epoch = raw_args[0]
-    # Must be an integer (not bool, not float that's non-integer)
+    # Must be an integer literal (not bool, not float — including whole floats
+    # like 1.0).  KDL 2.0 distinguishes integer literals from float literals at
+    # the type level; accepting 1.0 as "1" would be a type coercion that Rust
+    # (kdl-rs typed API) rejects.  We match the stricter behavior here.
     if isinstance(epoch, bool):
         raise MilpaError(
             MAN_SPEC_VERSION_TYPE,
             f"'spec-version' argument must be a positive integer, got bool {epoch!r}",
         )
-    if isinstance(epoch, float) and epoch == int(epoch):
-        epoch = int(epoch)
+    if isinstance(epoch, float):
+        raise MilpaError(
+            MAN_SPEC_VERSION_TYPE,
+            f"'spec-version' argument must be an integer literal, got float {epoch!r}",
+        )
     if not isinstance(epoch, int) or isinstance(epoch, bool):
         raise MilpaError(
             MAN_SPEC_VERSION_TYPE,
@@ -1697,14 +2471,31 @@ def format_manifest(manifest: Manifest) -> str:
         lines.append("")
 
     # overrides { pkg "name" git=(url)"..." ref="..." }
+    #              pkg "name" local="<path>"
+    #              pkg "name" { member "<name>" }
     if manifest.overrides:
         lines.append("overrides {")
         for ov in manifest.overrides:
-            lines.append(
-                f'    pkg "{_kdl_str(ov.name)}"'
-                f' git=(url)"{_kdl_str(ov.git)}"'
-                f' ref="{_kdl_str(ov.ref)}"'
-            )
+            t = ov.target
+            if isinstance(t, GitTarget):
+                lines.append(
+                    f'    pkg "{_kdl_str(ov.name)}"'
+                    f' git=(url)"{_kdl_str(t.git)}"'
+                    f' ref="{_kdl_str(t.ref)}"'
+                )
+            elif isinstance(t, LocalTarget):
+                lines.append(
+                    f'    pkg "{_kdl_str(ov.name)}"'
+                    f' local="{_kdl_str(t.path)}"'
+                )
+            elif isinstance(t, MemberTarget):
+                lines.append(
+                    f'    pkg "{_kdl_str(ov.name)}" {{'
+                )
+                lines.append(
+                    f'        member "{_kdl_str(t.member_name)}"'
+                )
+                lines.append("    }")
         lines.append("}")
         lines.append("")
 
@@ -1717,19 +2508,57 @@ def format_manifest(manifest: Manifest) -> str:
         lines.append("")
 
     # flags { "<name>" default=#true/#false ... }
-    if manifest.flags:
+    # Skip auto-injected flags (from optional=#true desugaring — they're implied
+    # by the dep's optional=#true and must not be serialized, else re-parse clashes).
+    explicit_flags = [
+        fd for fd in manifest.flags
+        if fd.name not in manifest.optional_auto_flags
+    ]
+    if explicit_flags:
         lines.append("flags {")
-        for fd in manifest.flags:
+        for fd in explicit_flags:
             default_kw = "#true" if fd.default else "#false"
             head = f'    "{_kdl_str(fd.name)}" default={default_kw}'
             if fd.description:
                 head += f' description="{_kdl_str(fd.description)}"'
-            if not fd.defines:
+            # Gather child nodes: defines, enables (canonical single-node form), conflicts.
+            # A block is needed iff at least one child is non-empty.
+            has_block = bool(fd.defines or fd.enables_same_pkg or fd.enables_cross_pkg or fd.conflicts)
+            if not has_block:
                 lines.append(head)
             else:
-                defines_args = " ".join(f'"{_kdl_str(d)}"' for d in fd.defines)
                 lines.append(f"{head} {{")
-                lines.append(f"        defines {defines_args}")
+                if fd.defines:
+                    defines_args = " ".join(f'"{_kdl_str(d)}"' for d in fd.defines)
+                    lines.append(f"        defines {defines_args}")
+                # enables — canonical single-node form (RFC §3.1.1).
+                if fd.enables_same_pkg or fd.enables_cross_pkg:
+                    same_pkg_args = " ".join(f'"{_kdl_str(n)}"' for n in fd.enables_same_pkg)
+                    if not fd.enables_cross_pkg:
+                        # No cross-pkg: single-line form.
+                        lines.append(f"        enables {same_pkg_args}")
+                    else:
+                        # Cross-pkg children present: block form.
+                        enables_head = f"        enables"
+                        if same_pkg_args:
+                            enables_head += f" {same_pkg_args}"
+                        lines.append(f"{enables_head} {{")
+                        for cpe in fd.enables_cross_pkg:
+                            # Each cross-pkg dep: <dep-name> { flag "<f>" [#false] }
+                            if cpe.flag_requests:
+                                lines.append(f"            {_kdl_str(cpe.dep)} {{")
+                                for fr in cpe.flag_requests:
+                                    if fr.enabled:
+                                        lines.append(f'                flag "{_kdl_str(fr.name)}"')
+                                    else:
+                                        lines.append(f'                flag "{_kdl_str(fr.name)}" #false')
+                                lines.append("            }")
+                            else:
+                                lines.append(f"            {_kdl_str(cpe.dep)}")
+                        lines.append("        }")
+                if fd.conflicts:
+                    conflicts_args = " ".join(f'"{_kdl_str(n)}"' for n in fd.conflicts)
+                    lines.append(f"        conflicts {conflicts_args}")
                 lines.append("    }")
         lines.append("}")
         lines.append("")
@@ -1740,6 +2569,33 @@ def format_manifest(manifest: Manifest) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _format_predicate_props(preds: "tuple[Predicate, ...] | list[Predicate]") -> str:
+    """Render a sequence of single-value predicates as inline KDL properties.
+
+    Used to build the property string for a ``when`` node header.
+    All predicates MUST have exactly one value (multi-value predicates can only
+    appear on UrlDep child nodes, never on ``when`` node headers).
+
+    Returns a space-prefixed string like `` platform="linux" flag="extras"``
+    or an empty string when ``preds`` is empty.
+    """
+    parts: list[str] = []
+    for pred in preds:
+        assert len(pred.values) == 1, (
+            f"_format_predicate_props: predicate {pred.name!r} has "
+            f"{len(pred.values)} values — only single-value predicates are "
+            "valid on `when` node headers"
+        )
+        val = pred.values[0]
+        if pred.negated:
+            parts.append(f'{pred.name}=(not)"{_kdl_str(val)}"')
+        else:
+            parts.append(f'{pred.name}="{_kdl_str(val)}"')
+    if not parts:
+        return ""
+    return " " + " ".join(parts)
+
+
 def _format_dep_line(dep: Dep) -> str:
     """Render one dep as a KDL line (or multi-line block) inside a deps { } block.
 
@@ -1747,41 +2603,119 @@ def _format_dep_line(dep: Dep) -> str:
 
     Indentation: 4 spaces for dep-level, 8 spaces for child nodes inside a
     URL dep block.
+
+    §8 round-trip: deps with explicit when-predicates are wrapped in a
+    ``when <preds> { <dep-node> }`` grouping block so their predicates survive
+    a format → parse cycle.  UrlDep predicates are emitted inline/as child-nodes
+    on the dep node itself (existing behaviour preserved).  For NamedDep,
+    LocalDep, TarballDep, and MemberDep the wrapping form is the only valid
+    form because those node types do not accept predicate properties directly.
     """
     if isinstance(dep, MemberDep):
+        # MemberDep predicates come exclusively from enclosing when blocks
+        # (MAN-DEP-MEMBER-PROPS forbids inline properties).  Wrap if non-empty.
+        if dep.predicates:
+            inner = f'        member "{_kdl_str(dep.name)}"'
+            when_props = _format_predicate_props(dep.predicates)
+            return f"    when{when_props} {{\n{inner}\n    }}"
         return f'    member "{_kdl_str(dep.name)}"'
 
     if isinstance(dep, NamedDep):
+        # S7: strip the auto-injected gate predicate (flag=<depname>) — it's
+        # implied by optional=#true and must not be double-emitted as a when-block
+        # predicate.  All other predicates (from outer when blocks) ARE serialized.
+        if dep.optional:
+            auto_gate = Predicate(name="flag", values=(dep.name,), negated=False)
+            when_preds = tuple(p for p in dep.predicates if p != auto_gate)
+        else:
+            when_preds = dep.predicates
+
+        # Build the dep node body (without leading indentation — added below).
         if dep.constraint is None:
-            return f'    "{_kdl_str(dep.name)}"'
-        return f'    "{_kdl_str(dep.name)}" "{_kdl_str(dep.constraint)}"'
+            head = f'"{_kdl_str(dep.name)}"'
+        else:
+            head = f'"{_kdl_str(dep.name)}" "{_kdl_str(dep.constraint)}"'
+        # optional=#true — round-trip preservation (S7 RFC #23 §3.2).
+        if dep.optional:
+            head += " optional=#true"
+
+        if dep.flag_requests:
+            # Multi-line block form for flag_requests (§3.1.5 S3 RFC #23).
+            if when_preds:
+                inner_lines = [f"        {head} {{"]
+                for fr in dep.flag_requests:
+                    if fr.enabled:
+                        inner_lines.append(f'            flag "{_kdl_str(fr.name)}"')
+                    else:
+                        inner_lines.append(f'            flag "{_kdl_str(fr.name)}" #false')
+                inner_lines.append("        }")
+                inner = "\n".join(inner_lines)
+                when_props = _format_predicate_props(when_preds)
+                return f"    when{when_props} {{\n{inner}\n    }}"
+            else:
+                block: list[str] = [f"    {head} {{"]
+                for fr in dep.flag_requests:
+                    if fr.enabled:
+                        block.append(f'        flag "{_kdl_str(fr.name)}"')
+                    else:
+                        block.append(f'        flag "{_kdl_str(fr.name)}" #false')
+                block.append("    }")
+                return "\n".join(block)
+        else:
+            if when_preds:
+                inner = f"        {head}"
+                when_props = _format_predicate_props(when_preds)
+                return f"    when{when_props} {{\n{inner}\n    }}"
+            return f"    {head}"
 
     if isinstance(dep, LocalDep):
-        return f'    "{_kdl_str(dep.name)}" local="{_kdl_str(dep.path)}"'
+        node_body = f'"{_kdl_str(dep.name)}" local="{_kdl_str(dep.path)}"'
+        if dep.predicates:
+            inner = f"        {node_body}"
+            when_props = _format_predicate_props(dep.predicates)
+            return f"    when{when_props} {{\n{inner}\n    }}"
+        return f"    {node_body}"
 
     if isinstance(dep, TarballDep):
         parts = [
-            f'    "{_kdl_str(dep.name)}"',
+            f'"{_kdl_str(dep.name)}"',
             f'tarball=(url)"{_kdl_str(dep.url)}"',
         ]
         if dep.sha256 is not None:
             parts.append(f'sha256="{_kdl_str(dep.sha256)}"')
         if dep.strip_components != 0:
             parts.append(f"strip_components={dep.strip_components}")
-        return " ".join(parts)
+        node_body = " ".join(parts)
+        if dep.predicates:
+            inner = f"        {node_body}"
+            when_props = _format_predicate_props(dep.predicates)
+            return f"    when{when_props} {{\n{inner}\n    }}"
+        return f"    {node_body}"
 
-    # UrlDep
+    # UrlDep — predicates emitted inline / as child-nodes on the dep node itself
+    # (existing behaviour unchanged).
     assert isinstance(dep, UrlDep)
 
     # Split predicates: inline (single value) vs child-node (multi-value).
-    inline_preds = [p for p in dep.predicates if len(p.values) == 1]
-    child_preds = [p for p in dep.predicates if len(p.values) > 1]
+    # For serialization, exclude the auto-injected flag=<depname> predicate when
+    # optional=True — it's implied by optional=#true and must not be double-emitted.
+    # Any OTHER flag predicates or non-flag predicates are serialized normally.
+    if dep.optional:
+        auto_gate = Predicate(name="flag", values=(dep.name,), negated=False)
+        serializable_preds = tuple(p for p in dep.predicates if p != auto_gate)
+    else:
+        serializable_preds = dep.predicates
+    inline_preds = [p for p in serializable_preds if len(p.values) == 1]
+    child_preds = [p for p in serializable_preds if len(p.values) > 1]
 
     head = (
         f'    "{_kdl_str(dep.name)}"'
         f' git=(url)"{_kdl_str(dep.git)}"'
         f' ref="{_kdl_str(dep.ref)}"'
     )
+    # optional=#true — round-trip preservation (S7 RFC #23 §3.2).
+    if dep.optional:
+        head += " optional=#true"
     for pred in inline_preds:
         val = pred.values[0]
         if pred.negated:
@@ -1794,7 +2728,7 @@ def _format_dep_line(dep: Dep) -> str:
         return head
 
     # Multi-line block form.
-    block: list[str] = [f"{head} {{"]
+    block = [f"{head} {{"]
     for pred in child_preds:
         if pred.negated:
             args_str = " ".join(f'(not)"{_kdl_str(v)}"' for v in pred.values)

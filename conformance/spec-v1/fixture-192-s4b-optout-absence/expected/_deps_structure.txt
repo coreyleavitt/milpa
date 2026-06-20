@@ -1,0 +1,4 @@
+lib-a -> <CAS_ROOT>/sha256/47b35f38cd5746555751313a65031be451995cca3ddc06eca781cd35d1f3213d/
+lib-b -> <CAS_ROOT>/sha256/ad400916f60b143cf1bc6d8457d6d8f9b3d9daac12aed480e6af73994b493dca/
+lib-e -> <CAS_ROOT>/sha256/e49b02e09cfcadda0054ba6785f3e96ea1fec6124e07f71bd683cb1b4f9db070/
+lib-shared -> <CAS_ROOT>/sha256/838c929e365594ccee9428e0fc1d7bc580e51bf1d568b82b36f8768476c5ddbb/

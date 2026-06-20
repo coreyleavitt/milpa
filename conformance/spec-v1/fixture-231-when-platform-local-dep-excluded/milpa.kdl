@@ -1,0 +1,19 @@
+// fixture-231: §6.3 when-block — platform-gated LocalDep EXCLUDED on non-matching platform
+//
+// A LocalDep inside a `when platform="windows"` block MUST NOT appear in the
+// resolved graph when MILPA_TARGET_PLATFORM=linux (non-matching platform).
+//
+// spec/manifest-grammar.md §3.2/§3.3 (NORMATIVE): all five dep forms support
+// the same `when`-conditional syntax (§6).  The env file sets
+// MILPA_TARGET_PLATFORM=linux explicitly so this fixture is host-independent.
+//
+// Before fix (both impls): LocalDep carries no predicates field; outer_predicates
+// from the when block are silently dropped; winlib is included on all platforms.
+// After fix: LocalDep carries predicates=((platform, "windows"),); excluded on linux.
+name "myapp"
+kind "application"
+deps {
+    when platform="windows" {
+        winlib local="./src-tree"
+    }
+}

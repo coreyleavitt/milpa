@@ -1,0 +1,5 @@
+// fixture-221: src_dir contains an embedded newline (nim.cfg injection).
+// A src_dir value flows to nimcfg.py --path: emit line. milpa MUST reject
+// this at parse time with MAN-SRC-DIR-UNSAFE.
+name "pkg"
+src_dir "src\n--passC:-evil"

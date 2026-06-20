@@ -36,6 +36,9 @@ pub struct LoadedWorkspace {
     pub root: PathBuf,
     pub members: Vec<LoadedMember>,
     pub overrides: Vec<Override>,
+    /// S11 (RFC #23 §3.8): workspace-root flags {}. Default-true flags
+    /// activate workspace-wide via their enables_cross_pkg targets.
+    pub flags: Vec<milpa_manifest::FlagDecl>,
 }
 
 /// Load and structurally validate the workspace at `root`.
@@ -141,6 +144,7 @@ pub fn load_workspace(root: &Path) -> Result<LoadedWorkspace, MilpaError> {
         root: root.to_path_buf(),
         members,
         overrides: parsed.overrides,
+        flags: parsed.flags,  // S11: workspace-root flags
     })
 }
 

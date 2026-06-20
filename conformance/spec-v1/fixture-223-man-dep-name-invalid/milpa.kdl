@@ -1,0 +1,7 @@
+// fixture-220: dep node name contains an embedded newline (nim.cfg injection).
+// A KDL quoted node name can embed \n; a dep name flows to nimcfg.py --path:
+// and -d: emit lines. milpa MUST reject this at parse time with MAN-DEP-NAME-INVALID.
+name "pkg"
+deps {
+    "foo\n--passC:-evil" git=(url)"https://github.com/example/foo" ref="main"
+}

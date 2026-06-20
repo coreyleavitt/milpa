@@ -1,0 +1,15 @@
+name "lib-a"
+kind "library"
+flags {
+    tls default=#false
+    http default=#true
+}
+deps {
+    when flag="tls" {
+        lib-b git=(url)"https://example.com/lib-b.git" ref="main"
+    }
+    when flag="http" {
+        lib-c git=(url)"https://example.com/lib-c.git" ref="main"
+    }
+    lib-d git=(url)"https://example.com/lib-d.git" ref="main"
+}

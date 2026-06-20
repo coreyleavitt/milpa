@@ -1,0 +1,5 @@
+// fixture-222: src_dir contains U+2028 LINE SEPARATOR (nim.cfg injection).
+// Unicode line separators can act as line breaks in some contexts.
+// milpa MUST reject this at parse time with MAN-SRC-DIR-UNSAFE.
+name "pkg"
+src_dir "src\u{2028}--passC:-evil"

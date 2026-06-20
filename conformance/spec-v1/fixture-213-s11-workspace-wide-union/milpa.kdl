@@ -1,0 +1,21 @@
+// fixture-213: S11 — workspace-wide flag union (RFC #23 §3.8)
+//
+// Two workspace members each request a DIFFERENT flag on the same shared URL dep.
+// The dep is resolved ONCE with the UNION of both members' flag_requests.
+// Both members' nim.cfg files include the unified -d: defines.
+//
+// Scenario:
+//   alpha → lib-shared { flag "feat-x" }    (feat-x has defines "SHARED_X")
+//   beta  → lib-shared { flag "feat-y" }    (feat-y is childless → -d:lib-shared_feat-y)
+//
+// With workspace-wide union (S11):
+//   active(lib-shared) = {feat-x, feat-y}
+//   alpha/nim.cfg includes -d:SHARED_X and -d:lib-shared_feat-y
+//   beta/nim.cfg  includes -d:SHARED_X and -d:lib-shared_feat-y
+//
+// Without union (first-member-wins bug):
+//   only one of feat-x or feat-y active → only one -d: symbol emitted.
+workspace {
+    member "alpha"
+    member "beta"
+}

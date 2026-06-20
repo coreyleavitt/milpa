@@ -1,0 +1,7 @@
+name "netlib"
+kind "library"
+flags {
+    tls default=#false {
+        defines "USE_TLS"
+    }
+}

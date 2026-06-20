@@ -1,0 +1,22 @@
+// fixture-192: S4b — opt-out as absence-of-request (RFC #23 §3.1.3)
+//
+// One consumer opts out with flag "feat-x" #false; another requests feat-x
+// positively.  §3.1.3 normative: opt-out is absence-of-request (NOT a veto).
+// The positive request from lib-b wins; feat-x is active → lib-e admitted.
+//
+// Scenario:
+//   Root → lib-a → lib-shared { flag "feat-x" #false }   (opts out)
+//   Root → lib-b → lib-shared { flag "feat-x" }           (positive request)
+//
+//   lib-shared declares:
+//     feat-x (default=#false) gates lib-e
+//
+// Expected resolved graph: lib-a + lib-b + lib-shared + lib-e.
+// lib-e MUST be admitted despite lib-a's opt-out because union semantics
+// says absence-of-request never cancels another edge's positive request.
+name "myapp"
+kind "application"
+deps {
+    lib-a git=(url)"https://example.com/lib-a.git" ref="main"
+    lib-b git=(url)"https://example.com/lib-b.git" ref="main"
+}

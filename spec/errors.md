@@ -58,6 +58,16 @@ A `_deps/<name>` symlink resolves to a CAS store entry but reading that entry ra
 
 **Triggered:** `milpa store path` is called with a hex-digest prefix that resolves to zero or more than one store entries, or with a prefix whose hex portion is fewer than 16 characters.
 
+## CLI
+
+### `CLI-FEATURE-FLAGS-CONFLICT`
+
+`--all-features` and `--no-default-features` are mutually exclusive and were both supplied on the same invocation.
+
+**Triggered:** The CLI layer detects that `--all-features` and `--no-default-features` are both active (whether via command-line flags or the equivalent env vars `MILPA_ALL_FEATURES` + `MILPA_NO_DEFAULT_FEATURES` in the conformance harness). `--all-features` activates every declared root flag; `--no-default-features` suppresses all defaults and starts from an empty baseline — the two intents are contradictory. Cargo rejects this combination and milpa follows the same policy. Exit code 1 (diagnosed failure, single `milpa-error:` line on stderr).
+
+**Fix:** Pass at most one of `--all-features` or `--no-default-features` per invocation.
+
 ## EXTRACT
 
 ### `EXTRACT-SIZE-LIMIT`
@@ -173,6 +183,14 @@ Downloaded archive sha256 does not match the declared expected_sha256.
 **Triggered:** TarballFetcher compares the archive's actual sha256 against TarballProvenance.expected_sha256 and finds a mismatch.
 
 ## FROZEN
+
+### `FROZEN-ACTIVE-FLAGS-MISMATCH`
+
+The CLI feature selection (``--features``, ``--no-default-features``, ``--all-features``) produces a root active-flag closure that does not match what the lockfile was produced under, or names a flag not declared in the root manifest.
+
+**Triggered:** S9 (RFC #23 §3.4) — under ``--frozen``, the recomputed root active-flag closure differs from the lockfile (a flag-gated root dep is admitted by the closure but absent from the lock, or vice versa); OR ``--features`` names a flag not declared in the root manifest's ``flags {}`` block.
+
+**Fix:** Re-run ``milpa fetch`` with the desired feature selection to regenerate the lockfile.
 
 ### `FROZEN-CONSTRAINT-UNSATISFIED`
 
@@ -330,6 +348,12 @@ A `dep` node requires exactly one string argument (the name).
 
 **Triggered:** A `dep` node has wrong arity or a non-string arg.
 
+### `LOCK-DEP-NAME-INVALID`
+
+A dep's `name` or an entry in its `aliases` list in the lockfile contains characters outside the dep-name charset `[A-Za-z0-9_-]+`.
+
+**Triggered:** The lockfile parse boundary validates the dep name and every alias against the same charset predicate as the manifest parse (`MAN-DEP-NAME-INVALID`; Python `_FLAG_NAME_CHARSET_RE`, Rust `valid_flag_name`).  A poisoned `milpa.lock` with a name like `../evil` (containing `/`) would otherwise flow to `nim.cfg --path:` via string concat and to the filesystem via `deps_dir / name`, enabling path traversal outside `_deps/`.  The charset predicate (not `contains_unsafe_char`) is used because `/` and `.` are not control characters.  Both impls validate at the lockfile parse boundary so all consumers (`verify`, `frozen`, `show`) are covered.
+
 ### `LOCK-DEP-NOT-FOUND`
 
 A named dep is absent from the lockfile.
@@ -402,6 +426,12 @@ Unknown provenance `kind` value.
 
 **Triggered:** The `kind` field is not one of: git, tarball, local, member, oci, registry.
 
+### `LOCK-SRC-DIR-UNSAFE`
+
+A dep's `src_dir` value in the lockfile contains an unsafe character (ASCII control character 0x00–0x1F, 0x7F, or Unicode line separator U+2028/U+2029).
+
+**Triggered:** The lockfile parse boundary validates `src_dir` against the same unsafe-char predicate as the manifest parse (`MAN-SRC-DIR-UNSAFE`).  A poisoned `milpa.lock` with a newline or control character in `src_dir` would otherwise flow to `nim.cfg --path:` on frozen reconstruction.  Both impls validate at the lockfile parse boundary so all consumers (`verify`, `frozen`, `show`) are covered.
+
 ### `LOCK-VERSION-MISSING`
 
 Lockfile is missing the required top-level `version` node.
@@ -440,6 +470,29 @@ A dep name appears more than once in the deps block.
 
 **Triggered:** Two dep declarations resolve to the same name.
 
+### `MAN-DEP-OPTIONAL-FLAG-CLASH`
+
+An `optional=#true` dep's name collides with an already-declared flag, OR a
+non-optional dep shares a name with a declared flag (namespace hygiene).
+
+**Triggered:** During manifest validation, when an `optional=#true` dep's name
+matches a flag already declared in the `flags` block (the auto-flag synthesized
+from the dep name would collide with an explicitly-declared flag), OR when a
+non-optional dep's name matches a declared flag name (fusing the dep and flag
+namespaces in a confusing way).
+
+### `MAN-DEP-OPTIONAL-INVALID-NAME`
+
+An `optional=#true` dep's name contains characters not allowed in flag names
+(must match `[A-Za-z0-9_-]+`).
+
+**Triggered:** By `milpa add --optional <name>` when the supplied name contains
+characters outside the flag-name charset (`[A-Za-z0-9_-]+`).  During manifest
+parsing this error is not raised: the dep-name parser fires `MAN-DEP-NAME-INVALID`
+first for any dep name that violates the charset, regardless of whether the dep
+is optional, so `MAN-DEP-OPTIONAL-INVALID-NAME` is unreachable from the parse
+path.
+
 ### `MAN-DEP-FLAG-BOOL`
 
 A consumer `flag` child node's second arg must be a boolean.
@@ -475,6 +528,12 @@ MemberDep takes exactly one positional string argument.
 MemberDep takes no properties.
 
 **Triggered:** `member "name"` has any property.
+
+### `MAN-DEP-NAME-INVALID`
+
+A dep node name contains characters not allowed in the dep-name charset `[A-Za-z0-9_-]+`.
+
+**Triggered:** A dep declaration's KDL node name contains characters outside `[A-Za-z0-9_-]+`. KDL 2.0 quoted node names can contain spaces, `\n`, `!`, and other characters not permitted in milpa dep names. Because dep names flow to nim.cfg path emission (`--path:"_deps/<name>"`) and feature-flag defines (`-d:<pkg>_<flag>`), the parse boundary MUST validate every dep name against the dep-name charset and reject invalid names before they can propagate. Alias names (derived from dep names via the optional desugar pass) inherit this protection automatically.
 
 ### `MAN-DEP-MIRROR-ARITY`
 
@@ -560,6 +619,12 @@ Flag `default` must be a boolean.
 
 **Triggered:** A `defines` child has a non-string arg.
 
+### `MAN-FLAG-DEFINES-UNSAFE`
+
+A `defines` string value contains a control character or Unicode line separator that would allow nim.cfg injection.
+
+**Triggered:** A `defines` child has a string arg containing `\n`, `\r`, any other ASCII control character (codepoints 0x00–0x1F and 0x7F), or a Unicode line separator (U+2028 or U+2029). Parse-boundary validation: the data model must not be able to represent an unsafe defines value.
+
 ### `MAN-FLAG-DESCRIPTION-TYPE`
 
 Flag `description` must be a string.
@@ -571,6 +636,30 @@ Flag `description` must be a string.
 Duplicate flag declaration.
 
 **Triggered:** Two flags in `flags { }` have the same name.
+
+### `MAN-FLAG-CONFLICTS-UNDECLARED`
+
+A `conflicts` bare-name argument names a flag that is not declared in the same manifest's `flags {}` block.
+
+**Triggered:** Post-parse pass over the fully-built flags table finds a same-package name in any `conflicts` node that has no matching declared flag. Forward references (flag declared later in the block) are legal. Scope: same-package only (cross-package `conflicts` is deferred, S4c RFC #23 §3.1.4).
+
+### `MAN-FLAG-CONFLICTS-SELF`
+
+A flag names itself in its own `conflicts` list.
+
+**Triggered:** Post-parse pass finds a `conflicts` entry whose value equals the enclosing flag's own name. A flag cannot conflict with itself; this is always a manifest authoring error. Rejected before the conflict enters the solver or S4c validation.
+
+### `MAN-FLAG-ENABLES-UNDECLARED`
+
+An `enables` bare-name argument names a flag that is not declared in the same manifest's `flags {}` block.
+
+**Triggered:** Post-parse pass over the fully-built flags table finds a same-package name in any `enables` node that has no matching declared flag. Forward references (flag declared later in the block) are legal. When the undeclared name is also a non-optional dep name in the same manifest, the diagnostic must add: `"<name>" is a dependency, not a flag — add optional=#true to make it a feature.` Cross-package `enables` children (dep-name child nodes) are not validated at parse time.
+
+### `MAN-FLAG-NAME-INVALID`
+
+A flag name declared in the `flags {}` block does not match the required charset `[A-Za-z0-9_-]+`.
+
+**Triggered:** A flag node's KDL identifier (the name) contains characters outside `[A-Za-z0-9_-]+`. KDL 2.0 quoted node names can contain spaces, `!`, `\n`, and other characters not permitted in milpa flag names. The parse boundary MUST validate every declared flag name against the flag-name charset and reject invalid names before they can propagate to nim.cfg emission.
 
 ### `MAN-FLAG-POS-ARGS`
 
@@ -734,11 +823,20 @@ pkg override is missing required `ref` property.
 
 **Triggered:** `pkg "..."` has no `ref=...`.
 
+### `MAN-OVERRIDE-TARGET-AMBIGUOUS`
+
+A `pkg` override rule must have exactly one provenance target form.
+
+**Triggered:** A `pkg` override has zero target forms (no `git=`, `local=`, or
+`member` child), or has multiple forms simultaneously (e.g. both `local=` and
+`git=`). Exactly one of `git=(url)"..." ref="..."`, `local="<path>"`, or a
+`{ member "<name>" }` child is required per `pkg` rule.
+
 ### `MAN-OVERRIDE-UNKNOWN-PROPS`
 
 Unknown property on a pkg override.
 
-**Triggered:** A pkg override has a property not in {git, ref}.
+**Triggered:** A pkg override has a property not in {git, ref, local}.
 
 ### `MAN-PREDICATE-CHILD-ARG-TYPE`
 
@@ -805,6 +903,12 @@ Manifest declares a spec-version epoch greater than this implementation supports
 `src_dir` must take exactly one positional string argument.
 
 **Triggered:** `src_dir` node has wrong arity or non-string arg.
+
+### `MAN-SRC-DIR-UNSAFE`
+
+A `src_dir` value contains a control character or Unicode line separator that would allow nim.cfg injection.
+
+**Triggered:** The string value of a `src_dir` node (either the top-level package `src_dir` or a dep-level `src_dir`) contains `\n`, `\r`, any other ASCII control character (codepoints 0x00–0x1F and 0x7F), or a Unicode line separator (U+2028 or U+2029). Because `src_dir` is incorporated verbatim into nim.cfg `--path:` lines, the parse boundary MUST validate the value and reject any string that could inject new nim.cfg directives.
 
 ### `MAN-UNKNOWN-TOP-LEVEL`
 
@@ -875,6 +979,14 @@ The .nimble file cannot be read (permissions, OS error).
 Manifest has named dep(s) but no tianguis index was provided.
 
 **Triggered:** resolve() is called without index= when the manifest has NamedDep entries.
+
+### `RESOLVE-FLAG-CONFLICT`
+
+Two flags declared mutually-exclusive via `conflicts` are both active on the same dep after the dep×flag fixpoint converges.
+
+**Triggered:** Post-fixpoint validation pass (S4c RFC #23 §3.1.4): for each dep D, for each flag `f ∈ active(D)`, for each `g` in `f.conflicts`: if `g ∈ active(D)`, raise `RESOLVE-FLAG-CONFLICT`. The pass only reads the converged set and never retracts; monotonicity is untouched. This is the ONLY source of this error — opt-out (`flag "x" #false`) never raises it.
+
+**Payload (normative, required):** `{dep, flag_a, flag_b, sources_a, sources_b}` where `dep` is the dep name, `flag_a`/`flag_b` are the conflicting flag names (lexicographic order), and `sources_a`/`sources_b` are the activation-source sets for each flag. Source sets are serialized as a sorted list of source names using enum declaration order: `"default"`, `"edge_request"`, `"enables_rule"` (the three `ActivationSource` variants). The payload must be byte-identical across both impls.
 
 ### `RES-PROVENANCE-CONFLICT`
 

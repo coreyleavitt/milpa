@@ -1,0 +1,18 @@
+// fixture-215: S4a — default-true flag on source dep fires cross-pkg enables (C1 fix)
+//
+// The root requests lib-a WITHOUT any flag requests.  lib-a declares flag "f1"
+// with default=#true and enables { lib-b { flag "g1" } }.  lib-b gates lib-c
+// behind `when flag="g1"`.
+//
+// Bug repro (pre-C1-fix): because no consumer requests lib-a's flags, dep_active_flags
+// was never seeded for lib-a.  The S4a fixpoint read an empty active(lib-a) and did
+// not fire the cross-pkg enables rule.  Result: lib-c was absent from the lockfile.
+//
+// After C1 fix: dep_active_flags is seeded unconditionally from the dep's own
+// default-true flags (here: f1).  The fixpoint fires lib-a.f1 → lib-b.g1 →
+// lib-c is admitted.
+name "myapp"
+kind "application"
+deps {
+    lib-a git=(url)"https://example.com/lib-a.git" ref="main"
+}

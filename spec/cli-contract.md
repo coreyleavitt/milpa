@@ -59,6 +59,11 @@ A conformant implementation of this spec MUST:
     logical OR of the manifest `attestation-policy "strict"` field, the
     CLI flag, and the environment variable. The flag/env CANNOT weaken a
     manifest-declared strict policy.
+16. Accept `--features <list>`, `--no-default-features`, and `--all-features`
+    on `fetch`, `lock`, and `update` (S9, §2.7); also honour
+    `MILPA_CLI_FEATURES`, `MILPA_NO_DEFAULT_FEATURES`, and `MILPA_ALL_FEATURES`
+    as the corresponding environment-variable forms used by the conformance
+    harness.
 
 ---
 
@@ -292,6 +297,40 @@ a solve result. All other verbs silently ignore it.
 > NOTE: `--no-index` is parsed as a global flag and applies to any verb that
 > performs resolution (`fetch`, `lock`, `add`, `remove`, `update`, `verify`).
 > Verbs that never consult the index are unaffected.
+
+### 2.7  `--features <list>` / `--no-default-features` / `--all-features` (S9)
+
+These three verb-level flags select which root-manifest feature flags are active
+during resolution (RFC #23 §3.4). They apply to `fetch`, `lock`, and `update`.
+
+> NORMATIVE: `--features <list>` accepts a comma-separated list of flag names
+> declared in the root manifest's `flags {}` block. Each named flag is activated
+> on the root manifest for the duration of the resolve. Names MUST be declared;
+> an undeclared name MUST raise `FROZEN-ACTIVE-FLAGS-MISMATCH`.
+
+> NORMATIVE: `--no-default-features` suppresses all flags whose `default=#true`
+> in the root manifest. Only flags named in `--features` are then active.
+
+> NORMATIVE: `--all-features` activates every flag declared in the root manifest's
+> `flags {}` block, regardless of their `default` value. When both
+> `--all-features` and `--features` are given, `--all-features` takes precedence
+> and all flags are activated.
+
+> NORMATIVE: Under `--frozen`, the implementation MUST recompute the root
+> active-flag closure from the manifest + CLI inputs, then verify it matches
+> the lockfile (i.e., every flag-gated root dep admitted by the closure appears
+> in the lock, and no flag-gated root dep absent from the closure appears in
+> the lock). A mismatch MUST raise `FROZEN-ACTIVE-FLAGS-MISMATCH`.
+
+> NORMATIVE: The feature-selection flags are root-manifest-only; they do not
+> propagate to transitive deps. Cross-package flag propagation uses the
+> edge-request mechanism (RFC #23 §3.1 S3, `flag "x"` child on a dep
+> declaration).
+
+> NOTE: `MILPA_CLI_FEATURES` (comma-separated), `MILPA_NO_DEFAULT_FEATURES`
+> (non-empty non-false value), and `MILPA_ALL_FEATURES` (non-empty non-false
+> value) are the corresponding environment-variable forms, used by the
+> conformance harness to drive these flags via the fixture `env` file.
 
 ---
 

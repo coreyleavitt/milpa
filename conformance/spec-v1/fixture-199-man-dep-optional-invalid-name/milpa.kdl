@@ -1,0 +1,11 @@
+// fixture-199: dep name charset validation — MAN-DEP-NAME-INVALID
+//
+// An optional dep whose name contains characters outside [A-Za-z0-9_-]+.
+// Previously raised MAN-DEP-OPTIONAL-INVALID-NAME from the desugar pass;
+// now raised as MAN-DEP-NAME-INVALID at the parse boundary (R2-C1 fix),
+// which validates all dep names regardless of optional status.
+name "myapp"
+kind "application"
+deps {
+    "opt.lib" git=(url)"https://example.com/optlib.git" ref="main" optional=#true
+}

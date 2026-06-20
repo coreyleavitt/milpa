@@ -23,7 +23,7 @@
 //! as `CoreError::DepDecl("TNG-DEPDECL-PARSE-ERROR", …)`.
 
 use kdl::{KdlDocument, KdlNode};
-use milpa_manifest::{kdl_brace_depth, KDL_MAX_NESTING_DEPTH};
+use milpa_manifest::{kdl_block_comment_depth, kdl_brace_depth, KDL_MAX_NESTING_DEPTH};
 use milpa_types::{EdgeSet, NamedRequire, RequireEntry, UrlRequire};
 use sha2::{Digest, Sha256};
 
@@ -108,10 +108,17 @@ pub fn parse_dep_decl(artifact_bytes: &[u8]) -> Result<(EdgeSet, i64), CoreError
 
     // Depth guard (mirrors milpa-manifest's parse_kdl): kdl-rs is recursive-
     // descent with no internal stack limit; deeply-nested input causes SIGABRT.
+    // Both brace depth and block-comment depth are checked (mirrors Python).
     if kdl_brace_depth(text) > KDL_MAX_NESTING_DEPTH {
         return Err(CoreError::DepDecl(
             "TNG-DEPDECL-PARSE-ERROR",
             format!("KDL input exceeds maximum nesting depth ({KDL_MAX_NESTING_DEPTH})"),
+        ));
+    }
+    if kdl_block_comment_depth(text) > KDL_MAX_NESTING_DEPTH {
+        return Err(CoreError::DepDecl(
+            "TNG-DEPDECL-PARSE-ERROR",
+            format!("KDL input exceeds maximum block-comment nesting depth ({KDL_MAX_NESTING_DEPTH})"),
         ));
     }
 
@@ -219,7 +226,7 @@ fn parse_require_node(node: &KdlNode) -> Option<RequireEntry> {
             .and_then(|e| e.value().as_string())
             .unwrap_or("")
             .to_string();
-        Some(RequireEntry::Url(UrlRequire { url, ref_, predicates: Vec::new() }))
+        Some(RequireEntry::Url(UrlRequire { url, ref_, predicates: Vec::new(), flag_requests: Vec::new() }))
     } else {
         // Named form: require "<name>" "<constraint>"
         let name = first.value().as_string()?.to_string();
@@ -290,6 +297,7 @@ mod tests {
                     url: "https://github.com/status-im/nim-chronos.git".to_string(),
                     ref_: "v3.2.0".to_string(),
                     predicates: Vec::new(),
+                    flag_requests: Vec::new(),
                 }),
             ],
             "src".to_string(),
@@ -405,6 +413,7 @@ mod tests {
                 url: "https://example.com/pkg.git".into(),
                 ref_: "main".into(),
                 predicates: Vec::new(),
+                flag_requests: Vec::new(),
             })]
         );
     }

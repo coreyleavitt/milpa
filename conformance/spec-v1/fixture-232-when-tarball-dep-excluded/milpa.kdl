@@ -1,0 +1,23 @@
+// fixture-232: §6.3 when-block — flag-gated TarballDep EXCLUDED when flag inactive
+//
+// A TarballDep inside a `when flag="extras"` block MUST NOT appear in the
+// resolved graph when the `extras` flag is inactive (default=#false and not
+// activated via --features).
+//
+// spec/manifest-grammar.md §3.2/§3.3 (NORMATIVE): all five dep forms —
+// UrlDep, NamedDep, LocalDep, TarballDep, MemberDep — support the same
+// `when`-conditional syntax (§6).
+//
+// Before fix (both impls): TarballDep carries no predicates field; outer_predicates
+// from the when block are silently dropped; extralib is included on all platforms.
+// After fix: TarballDep carries predicates=((flag, "extras"),); excluded when inactive.
+name "myapp"
+kind "application"
+flags {
+    extras default=#false description="enable extra dependencies"
+}
+deps {
+    when flag="extras" {
+        extralib tarball=(url)"https://example.com/extralib-0.1.0.tar.gz" sha256="0000000000000000000000000000000000000000000000000000000000000001"
+    }
+}

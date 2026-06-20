@@ -1,0 +1,24 @@
+// fixture-229: §6.3 when-block — flag-gated LocalDep EXCLUDED when flag inactive
+//
+// A LocalDep inside a `when flag="extras"` block MUST NOT appear in the
+// resolved graph when the `extras` flag is inactive (default=#false and not
+// activated via --features).
+//
+// spec/manifest-grammar.md §3.2/§3.3 (NORMATIVE): all five dep forms —
+// UrlDep, NamedDep, LocalDep, TarballDep, MemberDep — support the same
+// `when`-conditional syntax (§6).  resolver-semantics.md §463-468 (NORMATIVE):
+// a dep whose predicates do not all match MUST NOT enter the candidate set.
+//
+// Before fix (both impls): LocalDep carries no predicates field; outer_predicates
+// from the when block are silently dropped; winlib is included on all platforms.
+// After fix: LocalDep carries predicates=((flag, "extras"),); winlib is excluded.
+name "myapp"
+kind "application"
+flags {
+    extras default=#false description="enable extra dependencies"
+}
+deps {
+    when flag="extras" {
+        extralib local="./src-tree"
+    }
+}

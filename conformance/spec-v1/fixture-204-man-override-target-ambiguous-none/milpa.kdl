@@ -1,0 +1,6 @@
+// S8: MAN-OVERRIDE-TARGET-AMBIGUOUS — pkg rule with no target form at all.
+name "myapp"
+kind "application"
+overrides {
+    pkg "mylib"
+}

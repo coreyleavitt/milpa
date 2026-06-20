@@ -1,0 +1,9 @@
+name "lib-a"
+kind "library"
+flags {
+    f1 default=#true {
+        enables {
+            lib-b { flag "g1" }
+        }
+    }
+}

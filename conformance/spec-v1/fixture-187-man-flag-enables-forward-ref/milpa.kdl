@@ -1,0 +1,8 @@
+name "mylib"
+flags {
+    full {
+        enables "tls"
+    }
+    tls default=#false
+}
+kind "library"

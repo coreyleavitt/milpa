@@ -465,7 +465,8 @@ dep "pkg" {
 > NORMATIVE: `active_flags` carries zero or more positional string arguments,
 > each being the name of a feature flag active for this dep in the resolved
 > graph. MUST be omitted from the emitted KDL when no flags are active, to
-> keep diffs minimal.
+> keep diffs minimal. When present, arguments MUST be emitted in
+> lexicographically sorted order (Unicode codepoint order).
 
 ### 3.7  `self_mirrors` field (read-compat only; removed from schema)
 

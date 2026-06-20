@@ -1,0 +1,12 @@
+// fixture-198: S7 — MAN-DEP-OPTIONAL-FLAG-CLASH
+//
+// An optional dep's name collides with an explicitly-declared flag.
+// The desugar pass detects the collision and raises MAN-DEP-OPTIONAL-FLAG-CLASH.
+name "myapp"
+kind "application"
+flags {
+    optlib default=#false
+}
+deps {
+    optlib git=(url)"https://example.com/optlib.git" ref="main" optional=#true
+}

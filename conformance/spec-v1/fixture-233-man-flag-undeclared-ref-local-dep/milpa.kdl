@@ -1,0 +1,19 @@
+// fixture-233: §6.3 when-block — flag= predicate references undeclared flag on LocalDep
+//
+// MAN-FLAG-UNDECLARED-REFERENCE MUST be raised for ALL five dep forms, not
+// only UrlDep.  Here a LocalDep inside `when flag="undeclared"` references a
+// flag that does not exist in the `flags` block.
+//
+// Regression for R6-F1: Python _check_flag_predicate_references had an
+// `isinstance(dep, UrlDep)` guard that silently skipped NamedDep, LocalDep,
+// TarballDep, and MemberDep.  Rust was already correct (walks all five forms).
+name "myapp"
+kind "application"
+flags {
+    base default=#false
+}
+deps {
+    when flag="undeclared" {
+        mylib local="../mylib"
+    }
+}

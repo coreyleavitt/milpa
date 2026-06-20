@@ -1,0 +1,33 @@
+// fixture-228: §470 absent-profile + CLI features — platform dep MUST be included
+//
+// resolver-semantics.md §470 (NORMATIVE): when NO profile is supplied, predicate
+// filtering is DISABLED for platform/arch/nim/milpa axes — every dep is included
+// regardless of those predicates.  Flag predicates are a SEPARATE axis (§489):
+// they still apply based on the active flag set, independent of profile.
+//
+// This fixture exercises row 2 of the matrix:
+//   profile=absent, features=active → platform/arch filtering DISABLED, flag filtering ENABLED
+//
+// The env file carries MILPA_CLI_FEATURES=extras but NO MILPA_TARGET_* keys.
+// Correct behaviour (both impls):
+//   - platformlib (when platform="linux") → INCLUDED  (absent profile ⇒ no platform filtering)
+//   - flaglib (when flag="extras")        → INCLUDED  (extras activated via --features)
+//
+// Before fix: Rust synthesises a Profile{platform:None,...} and calls
+// filter_manifest_by_profile; predicate_satisfied returns false for platform=linux
+// with a None axis → platformlib PRUNED (§470 violation + Python divergence).
+// After fix: Rust `None if has_cli_features` arm uses dep_passes_flag_predicates
+// only → platform dep included, matching Python.
+name "myapp"
+kind "application"
+flags {
+    extras default=#false description="enable extras"
+}
+deps {
+    when platform="linux" {
+        platformlib git=(url)"https://example.com/platformlib.git" ref="main"
+    }
+    when flag="extras" {
+        flaglib git=(url)"https://example.com/flaglib.git" ref="main"
+    }
+}

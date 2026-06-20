@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use milpa_manifest::{Manifest, Workspace};
-pub use milpa_types::{LockedDep, Lockfile, ProvenanceRecord};
+pub use milpa_types::{ActivationSource, LockedDep, Lockfile, ProvenanceRecord};
 use milpa_types::ResolvedGraph;
 
 pub mod dep_decl;
@@ -62,11 +62,13 @@ pub use frozen::{rebuild_deps_view, resolve_frozen, resolve_workspace_frozen};
 pub use identity::{compute_content_hash, parse_identity, SUPPORTED_ALGORITHMS};
 pub use milpa_manifest::{parse_document, AttestationPolicy, ManifestDoc, Profile};
 pub use milpa_solver::{parse_version, Strategy};
+pub use nimcfg::build_flag_defines;
 pub use nimcfg::format_nimcfg;
 pub use nimcfg::format_workspace_nimcfgs;
 pub use registry::Index;
 pub use resolver::{
-    effective_strict_policy, parse_env_bool, resolve, resolve_with_cert, resolve_workspace,
+    check_frozen_active_flags_mismatch, compute_dep_active_flags, effective_strict_policy,
+    parse_env_bool, resolve, resolve_with_cert, resolve_with_features, resolve_workspace,
     workspace_any_member_strict, FailureCert, SuccessCert, WitnessEntry,
 };
 pub use milpa_solver::RefutationEntry;
@@ -205,6 +207,13 @@ pub struct ResolveParams<'a> {
     /// Enforces strict attestation policy (S5, §13.1) when `true`. Effective policy
     /// is the OR of this flag and any member's `attestation-policy "strict"`.
     pub require_attested_metadata: bool,
+    // S9 (RFC #23 §3.4): CLI feature-selection. Mirrors Python ResolveParams.
+    /// Explicit feature names to activate on the root manifest (``--features``).
+    pub features: std::collections::BTreeSet<String>,
+    /// When true, suppresses all default-true root flags (``--no-default-features``).
+    pub no_default_features: bool,
+    /// When true, activates all declared root flags (``--all-features``).
+    pub all_features: bool,
 }
 
 /// Full resolution (the `cmd=resolve` path). `prior` carries the previous

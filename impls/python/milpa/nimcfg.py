@@ -6,12 +6,12 @@ automatically when invoked from the project directory and adds the
 listed paths to its import search — no nimble involvement needed.
 
 Owns:
-  - format_nimcfg(graph, *, deps_dir, self_src_dir) -> str
-  - format_workspace_nimcfgs(workspace, graph) -> dict[str, str]  [S9d]
+  - format_nimcfg(graph, *, deps_dir, self_src_dir, flag_defines) -> str
+  - format_workspace_nimcfgs(workspace, graph, flag_defines) -> dict[str, str]  [S9d/S11]
 
-Spec references: lockfile-schema.md §7.1–7.4 (normative); §7.5 deferred
-(feature-flag -d: defines, tracked at #23); §7.6 (workspace per-member
-emission).
+Spec references: lockfile-schema.md §7.1–7.4 (normative); §7.5 (feature-flag
+-d: defines, un-deferred by RFC #23 S6); §7.6 (workspace per-member emission);
+§3.8 (workspace feature unification — S11).
 """
 
 from __future__ import annotations
@@ -48,10 +48,11 @@ def format_nimcfg(
     *,
     deps_dir: Path = Path("_deps"),
     self_src_dir: str = "",
+    flag_defines: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ) -> str:
-    """Render *graph* into ``nim.cfg`` text (lockfile-schema.md §7.1–7.4).
+    """Render *graph* into ``nim.cfg`` text (lockfile-schema.md §7.1–7.5).
 
-    Emission order (§7.4):
+    Emission order (§7.4 / §7.5):
 
     1. File-level header comment (§7.1) — always present, even for an empty
        graph.
@@ -61,15 +62,23 @@ def format_nimcfg(
     3. Dep ``--path:`` lines — one per dep, sorted lexicographically by dep name
        (resolver-semantics.md §4.4 — the single canonical ordering rule; a
        toposort's sibling tie-break is not reproducible across implementations).
-    4. Feature-flag ``-d:`` defines (§7.5) — **DEFERRED** (#23). No active flag
-       emit here. ``ResolvedDep`` carries ``active_flags`` but no corpus fixture
-       exercises it and the Rust reference defers it too.
+    4. Feature-flag ``-d:`` defines (§7.5) — emitted when *flag_defines* is
+       provided. The block is separated from the ``--path:`` block by a blank
+       line; ``-d:`` symbols are lexicographically ordered across all active
+       flags of all deps (reproducibility). Defines come from the manifest, not
+       the lockfile (SSOT — see RFC #23 §3.6). Callers must pre-compute
+       *flag_defines* from each dep's manifest: ``dep_name → flag_name →
+       defines_symbols``. When a flag has no explicit ``defines``, the
+       childless convention applies: ``-d:<pkg>_<flag>`` (RFC §3.6, normative).
 
     When groups (2)+(3) are both empty the file contains only the header
     (§7.4: "Groups (1) and (2) are omitted when empty"). The file ends with a
     single trailing ``\\n`` — not a blank line (§7.4 NOTE).
 
     All paths use POSIX separators regardless of host OS (§7.2).
+
+    *flag_defines* is ``None`` (default) for callers that do not yet supply
+    manifest flag tables; no ``-d:`` lines are emitted in that case.
     """
     path_lines: list[str] = []
 
@@ -88,16 +97,63 @@ def format_nimcfg(
                 alias_path += "/" + dep.src_dir
             path_lines.append(f'--path:"{alias_path}"')
 
-    # §7.5 feature-flag defines — DEFERRED (#23). When implemented, a
-    # separate block separated by a blank line will be appended here for
-    # each dep.active_flags entry.
+    # §7.5 feature-flag defines — un-deferred (RFC #23 S6).
+    # Collect all -d: symbols across all deps with active flags.
+    define_symbols: list[str] = []
+    if flag_defines is not None:
+        for dep in ordered:
+            if not dep.active_flags:
+                continue
+            dep_flag_table = flag_defines.get(dep.name, {})
+            for flag_name in dep.active_flags:
+                if flag_name in dep_flag_table:
+                    syms = dep_flag_table[flag_name]
+                    if syms:
+                        define_symbols.extend(syms)
+                    else:
+                        # Childless-convention: -d:<pkg>_<flag>
+                        define_symbols.append(f"{dep.name}_{flag_name}")
+    # Lexicographic order across all emitted symbols (reproducibility, §3.6).
+    define_symbols.sort()
 
     if path_lines:
-        # Header + blank line separator + path block + trailing newline.
-        return "\n".join([*_HEADER_LINES, "", *path_lines]) + "\n"
+        parts = [*_HEADER_LINES, "", *path_lines]
+        if define_symbols:
+            # Blank line separator between --path: block and -d: block (§7.5).
+            parts.append("")
+            parts.extend(f"-d:{sym}" for sym in define_symbols)
+        return "\n".join(parts) + "\n"
     else:
         # No deps, no self src-dir: header only, trailing newline (§7.4).
         return "\n".join(_HEADER_LINES) + "\n"
+
+
+def build_flag_defines(
+    graph: ResolvedGraph,
+    deps_dir: Path,
+) -> dict[str, dict[str, tuple[str, ...]]]:
+    """Build the ``flag_defines`` map for :func:`format_nimcfg` (§7.5 S6, RFC #23 §3.6).
+
+    Reads each dep's ``milpa.kdl`` from ``deps_dir/<name>/milpa.kdl`` (SSOT —
+    defines live in the manifest, not the lockfile).  Missing or unparseable
+    manifests produce an empty flag table for that dep (warn-and-skip, not an
+    error — not every dep has a ``milpa.kdl``).
+
+    Returns ``dep_name → flag_name → defines_symbols``.
+    """
+    from milpa.manifest import parse_manifest  # local import to avoid circular dependency
+
+    result: dict[str, dict[str, tuple[str, ...]]] = {}
+    for dep in graph.deps:
+        dep_manifest = deps_dir / dep.name / "milpa.kdl"
+        if not dep_manifest.is_file():
+            continue
+        try:
+            dm = parse_manifest(dep_manifest.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        result[dep.name] = {f.name: f.defines for f in dm.flags}
+    return result
 
 
 def _path_for(dep: ResolvedDep, deps_dir: Path) -> str:
@@ -120,8 +176,9 @@ def _path_for(dep: ResolvedDep, deps_dir: Path) -> str:
 def format_workspace_nimcfgs(
     workspace: LoadedWorkspace,
     graph: ResolvedGraph,
+    flag_defines: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ) -> dict[str, str]:
-    """Per-member ``nim.cfg`` emitter for workspace projects (§7.6).
+    """Per-member ``nim.cfg`` emitter for workspace projects (§7.6 / S11 §3.8).
 
     Returns a ``dict`` mapping each member's as-declared workspace-relative
     ``rel_path`` to its ``nim.cfg`` text.
@@ -136,6 +193,12 @@ def format_workspace_nimcfgs(
     - Deps are sorted lexicographically by dep name (same as single-package).
     - No self src-dir emit in workspace members (each member is a library
       peer, not a "consuming project" from the workspace root's perspective).
+
+    S11 (RFC #23 §3.8): workspace feature unification — each member's nim.cfg
+    includes the ``-d:`` defines for ALL flags active on shared deps in the
+    workspace graph (the unified ``dep.active_flags``), not only that member's
+    own requests.  Pass ``flag_defines`` (built by ``build_flag_defines``) to
+    enable this; the map is the same SSOT used for single-package emission.
 
     ``workspace`` is a ``LoadedWorkspace``; typed as ``object`` to avoid
     circular imports (nimcfg.py must not import workspace.py).
@@ -172,8 +235,32 @@ def format_workspace_nimcfgs(
             rel = _relpath_posix(target, member_abs_dir)
             path_lines.append(f'--path:"{rel}"')
 
+        # S11 §3.8: compute unified -d: defines from active_flags on closure deps.
+        # Uses the same logic as format_nimcfg §7.5 — active_flags on each dep
+        # are already the workspace-wide union (all members' requests merged by
+        # the resolver's shared dep_active_flags map).
+        define_symbols: list[str] = []
+        if flag_defines is not None:
+            for dep in closure_sorted:
+                if not dep.active_flags:
+                    continue
+                dep_flag_table = flag_defines.get(dep.name, {})
+                for flag_name in dep.active_flags:
+                    if flag_name in dep_flag_table:
+                        syms = dep_flag_table[flag_name]
+                        if syms:
+                            define_symbols.extend(syms)
+                        else:
+                            # Childless-convention: -d:<pkg>_<flag>
+                            define_symbols.append(f"{dep.name}_{flag_name}")
+            define_symbols.sort()
+
         if path_lines:
-            text = "\n".join([*_HEADER_LINES, "", *path_lines]) + "\n"
+            parts = [*_HEADER_LINES, "", *path_lines]
+            if define_symbols:
+                parts.append("")
+                parts.extend(f"-d:{sym}" for sym in define_symbols)
+            text = "\n".join(parts) + "\n"
         else:
             text = "\n".join(_HEADER_LINES) + "\n"
 

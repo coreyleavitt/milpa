@@ -155,6 +155,16 @@ Content addressing wins on cases commit SHA misses:
   The data is recorded today; the dedup logic that uses it is the
   next phase.
 
+- **It's not affected by feature flags (`active_flags`).** A dep's
+  `active_flags` — the set of feature flags active at resolution time,
+  recorded in `milpa.lock` — are *build configuration*, not source
+  bytes. Two resolutions of the same dep that differ only in their
+  active feature set produce the **same `content_hash`** and the same
+  CAS key (`spec/identity.md §3.2`). Active flags determine which
+  `-d:` defines are emitted in `nim.cfg` and which optional deps are
+  present in the graph; they do not alter source identity. There is
+  no per-feature-set CAS fan-out.
+
 ## Org renames and registry identity (tianguis #36)
 
 The tianguis registry derives a package's identity — `(namespace, name)` where

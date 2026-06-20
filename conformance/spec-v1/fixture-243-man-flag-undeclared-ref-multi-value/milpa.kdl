@@ -1,0 +1,28 @@
+// fixture-243: MAN-FLAG-UNDECLARED-REFERENCE via a multi-value (stacked when) flag predicate
+//
+// spec/manifest-grammar.md §6.4 (NORMATIVE): any `when flag="<name>"` predicate
+// that references a flag name not declared in the `flags` block MUST raise
+// MAN-FLAG-UNDECLARED-REFERENCE.
+//
+// A dep can accumulate multiple flag predicates from nested `when` blocks (AND
+// semantics).  Each predicate's `values` tuple is checked independently; the
+// SECOND predicate here references an undeclared flag `b` (only `a` is declared).
+//
+// This exercises _check_flag_predicate_references iterating over MULTIPLE
+// Predicate objects on a single dep, verifying that all values in all predicates
+// are checked — not just the first predicate.
+//
+// Regression coverage: ensures the dep-predicate-reference check walks the
+// entire predicates tuple, not only pred[0].
+name "myapp"
+kind "application"
+flags {
+    a default=#false
+}
+deps {
+    when flag="a" {
+        when flag="b" {
+            mylib git=(url)"https://example.com/mylib.git" ref="main"
+        }
+    }
+}

@@ -1,0 +1,18 @@
+// fixture-210: S9 — --no-default-features suppresses a root default-true flag (RFC #23 §3.4)
+//
+// The manifest declares a flag `tls default=#true` and a flag-gated dep
+// `tlslib` guarded by `when flag="tls"`.
+//
+// Normally (default on) tlslib would be admitted.
+// With MILPA_NO_DEFAULT_FEATURES=1, the tls flag is suppressed and tlslib is pruned.
+// Result: empty resolved graph.
+name "myapp"
+kind "application"
+flags {
+    tls default=#true description="enable TLS support"
+}
+deps {
+    when flag="tls" {
+        tlslib git=(url)"https://example.com/tlslib.git" ref="main"
+    }
+}

@@ -22,6 +22,7 @@ from milpa.errors import (
 from milpa.manifest import (
     FlagDecl,
     LocalDep,
+    GitTarget,
     Manifest,
     MemberDep,
     NamedDep,
@@ -160,7 +161,7 @@ def test_format_manifest_spec_version_only_when_explicit() -> None:
 
 def test_format_manifest_override_block() -> None:
     """Override block renders pkg with git=(url) and ref."""
-    ov = Override(name="foo", git="https://github.com/fork/foo.git", ref="dev")
+    ov = Override(name="foo", target=GitTarget(git="https://github.com/fork/foo.git", ref="dev"))
     m = Manifest(name="myapp", deps=(), overrides=(ov,))
     text = format_manifest(m)
     assert 'pkg "foo"' in text

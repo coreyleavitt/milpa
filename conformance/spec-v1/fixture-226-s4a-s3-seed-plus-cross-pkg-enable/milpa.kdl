@@ -1,0 +1,31 @@
+// fixture-226: S4a — S3 seed plus cross-pkg enable convergence (R3-C regression)
+//
+// Tests that the S4a fixpoint converges correctly when a dep (lib-target) has
+// flags seeded via BOTH:
+//   - S3 consumer-side flag request: lib-consumer depends on lib-target with
+//     { flag "feat-x" }, which seeds dep_active_flags[lib-target]={feat-x}
+//     during the initial BFS fetch phase.
+//   - S4a cross-pkg enable: lib-enabler has enabler-flag (default=true) that
+//     fires enables { lib-target { flag "feat-y" } }.
+//
+// The bug (R3-C): the S4a convergence check compared new_active.keys() (only
+// the current iteration's flags, e.g. {feat-y}) against old_flag_names (the
+// full union from the store, e.g. {feat-x, feat-y}).  Since {feat-y} != {feat-x,
+// feat-y} every iteration, the fixpoint never converged → MILPA-INTERNAL crash.
+//
+// Python was correct: it computed merged = old ∪ new_active FIRST, then compared
+// frozenset(merged.keys()) == old_flag_names (the POST-UNION set both sides).
+//
+// After fix: Rust mirrors Python — compute the union locally (old_flag_names ∪
+// new_active.keys()), use the union for convergence check AND edge admission
+// (removing the R2 read-back-from-store smell, Finding-5).
+//
+// lib-target admits lib-end only when BOTH feat-x AND feat-y are active.
+// Expected resolved graph: lib-consumer + lib-enabler + lib-target + lib-end.
+// lib-target.active_flags must include both "feat-x" and "feat-y".
+name "myapp"
+kind "application"
+deps {
+    lib-consumer git=(url)"https://example.com/lib-consumer.git" ref="main"
+    lib-enabler git=(url)"https://example.com/lib-enabler.git" ref="main"
+}

@@ -1,0 +1,7 @@
+name "lib-ssl"
+kind "library"
+flags {
+    tls default=#true {
+        defines "ssl" "useOpenSSL"
+    }
+}

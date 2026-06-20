@@ -1,0 +1,17 @@
+// fixture-247: MAN-KDL-SYNTAX — 33 nested block comments exceed max nesting depth
+//
+// KDL 2.0 allows nested block comments (`/* /* */ */`).  The milpa depth guard
+// tracks block-comment depth independently of brace depth, both capped at
+// KDL_MAX_NESTING_DEPTH=32.  Input with 33 nested block comments (and ≤32 braces)
+// MUST raise MAN-KDL-SYNTAX in BOTH implementations.
+//
+// Before fix (Rust-only): Rust's `kdl_brace_depth` guard only counted `{` / `}`;
+// 33 block comments with no deep braces slipped past the guard → Rust parsed OK.
+// Python's `_check_nesting_depth` already tracked both vectors → Python raised
+// MAN-KDL-SYNTAX.  This was a cross-impl divergence.
+//
+// After fix: Rust's `kdl_block_comment_depth` guard is added alongside the brace
+// guard; 33 nested block comments raise MAN-KDL-SYNTAX in both implementations.
+name "x"
+/* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* /* 33 nested block comments */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */ */
+kind "library"

@@ -27,12 +27,12 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use milpa_manifest::{Dep, LocalDep, Manifest, Override, Predicate, Profile, TarballDep, UrlDep};
+use milpa_manifest::{Dep, LocalDep, Manifest, Override, OverrideTarget, Predicate, Profile, TarballDep, UrlDep};
 use milpa_solver::{
     parse_version, solve, solve_with_refutation, vs_to_constraint_str, Dep as SolverDep,
     PackageProvider, RefutationEntry, Strategy, VersionSet,
 };
-use milpa_types::{EdgeSet, Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph, Version};
+use milpa_types::{EdgeSet, FlagRequest, Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph, Version};
 
 use crate::edge_sources::{EdgeSourceCtx, NimbleEdgeSource};
 use crate::error::{CoreError, MilpaError};
@@ -89,12 +89,164 @@ pub fn resolve(
     require_attested_metadata: bool,
     store: &CaStore,
 ) -> Result<ResolvedGraph, MilpaError> {
+    resolve_with_features(
+        manifest, index, fetcher, profile, prior, strategy, deps_dir,
+        dep_decl_store, require_attested_metadata, store,
+        &std::collections::BTreeSet::new(), false, false,
+    )
+}
+
+/// Internal: full resolution with optional S9 CLI feature-selection inputs.
+///
+/// S9 (RFC #23 §3.4): `features` / `no_default_features` / `all_features`
+/// compute the root active-flag seed that overrides the default-flag seed when
+/// any CLI selection is present.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_with_features(
+    manifest: &Manifest,
+    index: Option<&Index>,
+    fetcher: &dyn FetcherRegistry,
+    profile: Option<&Profile>,
+    prior: Option<&Lockfile>,
+    strategy: Strategy,
+    deps_dir: &Path,
+    dep_decl_store: Option<&dyn crate::dep_decl_store::DepDeclStore>,
+    require_attested_metadata: bool,
+    store: &CaStore,
+    features: &std::collections::BTreeSet<String>,
+    no_default_features: bool,
+    all_features: bool,
+) -> Result<ResolvedGraph, MilpaError> {
+    // S9 (RFC #23 §3.4): compute root CLI active-flag seed when any CLI
+    // feature-selection is present. Mirrors Python's _compute_root_active_seed.
+    let has_cli_features = !features.is_empty() || no_default_features || all_features;
+    let cli_seed: std::collections::HashSet<String> = if has_cli_features {
+        let all_declared: std::collections::BTreeSet<String> =
+            manifest.flags.iter().map(|f| f.name.clone()).collect();
+        // C2 / S9 (spec/cli-contract.md §3.4): validate --features names on the
+        // LIVE path too. Mirrors check_frozen_active_flags_mismatch lines 329-336.
+        // An undeclared flag name raises FROZEN-ACTIVE-FLAGS-MISMATCH regardless
+        // of whether --frozen is set (Python _compute_root_active_seed does this).
+        for feat in features.iter() {
+            if !all_declared.contains(feat.as_str()) {
+                return Err(crate::error::CoreError::Frozen(
+                    "FROZEN-ACTIVE-FLAGS-MISMATCH",
+                    format!("feature {feat:?} not declared in root manifest's flags block"),
+                )
+                .into());
+            }
+        }
+        if all_features {
+            all_declared.into_iter().collect()
+        } else if no_default_features {
+            features.iter().cloned().collect()
+        } else {
+            // defaults ∪ explicit features
+            let mut seed: std::collections::HashSet<String> = manifest
+                .flags
+                .iter()
+                .filter(|f| f.default)
+                .map(|f| f.name.clone())
+                .collect();
+            seed.extend(features.iter().cloned());
+            seed
+        }
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    // C1b-completion: root CLI-selected flags participate in conflict detection
+    // (RFC #23 §3.1.4).  The root has no fetched identity so it bypasses the
+    // dep_active_flags machinery; use raise_if_flag_conflicts directly with a
+    // synthetic active_map where every CLI-active flag has source Cli.  Mirrors
+    // Python's root-level check in resolver.py immediately after _cli_active_seed.
+    //
+    // R2-M C1b fix: apply same-package enables-closure BEFORE the conflict check
+    // so that flags enabled transitively by CLI-active root flags are included.
+    // Without this, a CLI-active flag A that enables B where B conflicts C
+    // (also CLI-active) would be silently missed.  Mirrors Python fix.
+    if has_cli_features && !cli_seed.is_empty() && !manifest.flags.is_empty() {
+        use milpa_manifest::flag_enables_closure;
+        use milpa_types::ActivationSource;
+        // Expand cli_seed via same-package enables-closure.
+        let cli_closed = flag_enables_closure(&manifest.flags, &cli_seed);
+        let mut root_cli_active_map: BTreeMap<String, BTreeSet<ActivationSource>> = cli_seed
+            .iter()
+            .map(|f| (f.clone(), [ActivationSource::Cli].into_iter().collect()))
+            .collect();
+        // Flags added only by enables-closure get source EnablesRule.
+        for ec_flag in &cli_closed {
+            if !cli_seed.contains(ec_flag.as_str()) {
+                root_cli_active_map
+                    .entry(ec_flag.clone())
+                    .or_default()
+                    .insert(ActivationSource::EnablesRule);
+            }
+        }
+        let root_name = manifest.name.as_deref().unwrap_or("__root__");
+        raise_if_flag_conflicts(root_name, &manifest.flags, &root_cli_active_map)?;
+    }
+
     // §6: filter conditional deps by the active profile before anything else.
     // An absent profile disables filtering entirely (§6 absent-profile rule).
+    //
+    // S7 (RFC #23 §3.2 + §3.1.2): before filtering, expand `profile.flags`
+    // by running flag_enables_closure over the manifest's default-true flags.
+    // This ensures optional deps activated via `enables` are visible to the
+    // profile's flag predicate check — mirrors Python's _filter_manifest_by_profile.
     let filtered;
+    let enriched_profile_storage;
     let manifest = match profile {
         Some(p) => {
-            filtered = filter_manifest_by_profile(manifest, p);
+            use milpa_manifest::flag_enables_closure;
+            use std::collections::HashSet;
+            // S9: when CLI features present, override the default seed.
+            let seed: HashSet<String> = if has_cli_features {
+                cli_seed.clone()
+            } else {
+                manifest
+                    .flags
+                    .iter()
+                    .filter(|f| f.default)
+                    .map(|f| f.name.clone())
+                    .collect()
+            };
+            let active = flag_enables_closure(&manifest.flags, &seed);
+            // Merge existing profile.flags with the closure result.
+            let mut merged_flags: Vec<String> = p.flags.clone();
+            for flag in &active {
+                if !merged_flags.contains(flag) {
+                    merged_flags.push(flag.clone());
+                }
+            }
+            let mut ep = p.clone();
+            ep.flags = merged_flags;
+            enriched_profile_storage = ep;
+            filtered = filter_manifest_by_profile(manifest, &enriched_profile_storage);
+            &filtered
+        }
+        None if has_cli_features => {
+            // resolver-semantics §470 NORMATIVE: when NO profile is supplied,
+            // platform/arch/nim/milpa-predicate filtering is DISABLED — every dep
+            // is included regardless of those predicates.  Flag predicates are a
+            // SEPARATE axis (§489): they still apply based on the active flag set.
+            //
+            // Previous code synthesised a Profile{platform:None,...} and called
+            // filter_manifest_by_profile; predicate_satisfied returns false for
+            // platform/arch/nim/milpa when the axis is None ("an absent axis
+            // matches nothing"), which PRUNES those deps — a §470 violation.
+            //
+            // Correct fix: use dep_passes_flag_predicates (SSOT) directly.
+            // Non-flag predicates are not evaluated (absent profile = include all).
+            // Mirrors Python's _filter_manifest_by_flags_only.
+            use milpa_manifest::flag_enables_closure;
+            use std::collections::BTreeSet;
+            let active_set = flag_enables_closure(&manifest.flags, &cli_seed);
+            let active: BTreeSet<&str> = active_set.iter().map(|s| s.as_str()).collect();
+            let mut m = manifest.clone();
+            m.deps.retain(|d| dep_passes_flag_predicates(d, &active));
+            m.dev_deps.retain(|d| dep_passes_flag_predicates(d, &active));
+            filtered = m;
             &filtered
         }
         None => manifest,
@@ -112,11 +264,43 @@ pub fn resolve(
         &empty_index,
     )?;
 
+    // M7: warn early about member= overrides in a single-package manifest.
+    // These silently no-op (member overrides require a workspace context); warn
+    // before the BFS so the user gets feedback even if resolution fails.
+    {
+        use milpa_manifest::OverrideTarget as OT;
+        let member_override_names: Vec<&str> = manifest
+            .overrides
+            .iter()
+            .filter(|ov| matches!(ov.target, OT::Member { .. }))
+            .map(|ov| ov.name.as_str())
+            .collect();
+        if !member_override_names.is_empty() {
+            eprintln!(
+                "[milpa] warning: member override(s) {:?} have no effect in a \
+                 single-package manifest (member= overrides require a workspace context)",
+                member_override_names
+            );
+        }
+    }
+
     // Build the synthetic root candidate (requires every manifest dep) and the
     // BFS queue. dev_deps for the ROOT are enrolled here alongside deps (§9);
     // transitive deps never read dev_deps.
     let queue = provider.seed_root(manifest)?;
     provider.process_items(queue)?;
+
+    // S4a (RFC #23 §3.1.2 + §7 S4a): outer dep×flag fixpoint.
+    // Iterates until neither the dep set nor active_flags grows.
+    // PubGrub runs exactly ONCE, after convergence (§3.1.2 NORMATIVE).
+    provider.run_s4a_fixpoint()?;
+
+    // S4c (RFC #23 §3.1.4): post-fixpoint flag-conflict validation.
+    // Runs AFTER the fixpoint converges, BEFORE finalize/solver entry.
+    // Only reads the converged dep_active_flags — never retracts.
+    // Raises RESOLVE-FLAG-CONFLICT if any dep has two mutually-exclusive
+    // flags co-active in the final converged set.
+    provider.check_s4c_flag_conflicts(deps_dir)?;
 
     // Content-hash dedup/alias for eagerly-materialized candidates (Phase B, #32).
     // Returns canonical → sorted-aliases map for populating ResolvedDep.aliases.
@@ -137,6 +321,49 @@ pub fn resolve(
     enforce_attestation_policy(&provider, manifest, require_attested_metadata)?;
 
     let graph = provider.build_graph(&solution, &canonical_aliases);
+
+    // S8a: non-reproducible override warning (RFC #23 §3.3 reproducibility carve-out).
+    // A local= override produces a LocalProvenanceRecord for a dep that was declared
+    // as git/named — non-reproducible for anyone without the same sibling checkout.
+    {
+        use milpa_manifest::OverrideTarget as OT;
+        let local_override_names: Vec<&str> = manifest
+            .overrides
+            .iter()
+            .filter(|ov| matches!(ov.target, OT::Local { .. }))
+            .filter(|ov| graph.deps.iter().any(|d| d.name == ov.name))
+            .map(|ov| ov.name.as_str())
+            .collect();
+        if !local_override_names.is_empty() {
+            eprintln!(
+                "[milpa] warning: non-reproducible local override(s): {} — \
+                 lockfile will not reproduce on machines without the same local \
+                 checkouts at the declared relative paths (RFC #23 §3.3 reproducibility carve-out)",
+                local_override_names.join(", ")
+            );
+        }
+    }
+
+    // M6: warn about overrides that name a dep not in the resolved graph.
+    // A typo in an override name silently no-ops without this check.
+    {
+        let resolved_dep_names: std::collections::BTreeSet<&str> =
+            graph.deps.iter().map(|d| d.name.as_str()).collect();
+        let dead_override_names: Vec<&str> = manifest
+            .overrides
+            .iter()
+            .filter(|ov| !resolved_dep_names.contains(ov.name.as_str()))
+            .map(|ov| ov.name.as_str())
+            .collect();
+        if !dead_override_names.is_empty() {
+            eprintln!(
+                "[milpa] warning: override(s) {:?} name dep(s) not present in the \
+                 resolved graph — check for typos in override names",
+                dead_override_names
+            );
+        }
+    }
+
     // B-nimcfg SSOT: rebuild _deps/ view (alias symlinks + stale-entry removal).
     // Mirrors resolve_frozen (frozen.rs:96) — the live path now owns the rebuild
     // internally, symmetric with the frozen path and Python's resolver.resolve().
@@ -168,6 +395,101 @@ pub(crate) fn resolve_default_strategy(
         false, // require_attested_metadata: false (trait path, no S5 flag)
         store,
     )
+}
+
+/// S9 (RFC #23 §3.4): FROZEN-ACTIVE-FLAGS-MISMATCH check.
+///
+/// Recomputes the root active-flag closure from `manifest` + CLI inputs
+/// (`features`, `no_default_features`, `all_features`).  Then checks whether
+/// any flag-gated root dep is admitted by the computed closure but absent from
+/// the lockfile, or vice-versa.  Raises `FROZEN-ACTIVE-FLAGS-MISMATCH` on
+/// mismatch or when a `--features` name is not declared in the manifest.
+///
+/// Mirrors Python `cli._check_frozen_active_flags_mismatch`.
+///
+/// Computes the active-flag closure from `manifest` + CLI inputs and compares it
+/// against the lockfile: if a flag-gated root dep is admitted by the computed
+/// closure but absent from the lock (or vice versa), returns
+/// `FROZEN-ACTIVE-FLAGS-MISMATCH`.
+///
+/// When no CLI features are supplied (empty `features`, `no_default_features=false`,
+/// `all_features=false`), the default-true flag set is used as the seed — this
+/// catches the case where manifest defaults changed since the lock was written.
+/// The flag-admission decision is routed through `dep_passes_flag_predicates`
+/// (the SSOT for flag-predicate evaluation).
+pub fn check_frozen_active_flags_mismatch(
+    manifest: &Manifest,
+    lock: &Lockfile,
+    features: &std::collections::BTreeSet<String>,
+    no_default_features: bool,
+    all_features: bool,
+) -> Result<(), MilpaError> {
+    use milpa_manifest::flag_enables_closure;
+    use std::collections::{BTreeSet, HashSet};
+
+    // Compute the CLI active-flag seed (same logic as _compute_root_active_seed).
+    let all_declared: HashSet<String> = manifest.flags.iter().map(|f| f.name.clone()).collect();
+
+    // Validate that every explicit feature name is declared in the manifest.
+    for feat in features.iter() {
+        if !all_declared.contains(feat) {
+            return Err(crate::error::CoreError::Frozen(
+                "FROZEN-ACTIVE-FLAGS-MISMATCH",
+                format!("feature {feat:?} not declared in root manifest's flags block"),
+            ).into());
+        }
+    }
+
+    // Compute the seed: CLI-supplied features override defaults; absent CLI
+    // selection falls back to default-true flags (catches manifest-default changes).
+    let seed: HashSet<String> = if all_features {
+        all_declared.clone()
+    } else if no_default_features {
+        features.iter().cloned().collect()
+    } else {
+        // Default seed: default-true flags ∪ explicit CLI features.
+        let mut s: HashSet<String> = manifest
+            .flags
+            .iter()
+            .filter(|f| f.default)
+            .map(|f| f.name.clone())
+            .collect();
+        s.extend(features.iter().cloned());
+        s
+    };
+
+    let active_set: HashSet<String> = flag_enables_closure(&manifest.flags, &seed);
+    // Convert to BTreeSet<&str> for dep_passes_flag_predicates (SSOT).
+    let active: BTreeSet<&str> = active_set.iter().map(|s| s.as_str()).collect();
+
+    // Build the set of names in the lockfile.
+    let locked_names: HashSet<String> = lock.deps.iter().map(|d| d.name.clone()).collect();
+
+    // Check each root dep — route admission decision through the SSOT.
+    for dep in &manifest.deps {
+        // dep_passes_flag_predicates skips non-flag predicates; deps with no
+        // flag predicates always pass (vacuously true conjunction).
+        let has_flag_pred = dep.predicates().iter().any(|p| p.name == "flag");
+        if !has_flag_pred {
+            continue;
+        }
+        let admitted = dep_passes_flag_predicates(dep, &active);
+        let in_lock = locked_names.contains(dep.name());
+        if admitted != in_lock {
+            return Err(crate::error::CoreError::Frozen(
+                "FROZEN-ACTIVE-FLAGS-MISMATCH",
+                format!(
+                    "frozen: lockfile active-flags mismatch for dep {:?}: \
+                     the lock was produced under a different feature selection \
+                     — re-run 'milpa fetch' with the same --features / \
+                     --no-default-features / --all-features flags that were used \
+                     to write the lock",
+                    dep.name()
+                ),
+            ).into());
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a loaded workspace into one shared [`ResolvedGraph`] (resolver §11).
@@ -205,12 +527,17 @@ pub fn resolve_workspace(
     let members_by_name: BTreeSet<String> =
         workspace.members.iter().map(|m| m.name.clone()).collect();
 
-    // RES-WS-OVERRIDE-MEMBER-COLLISION: a name cannot be both an external
-    // override and an in-tree member.
+    // RES-WS-OVERRIDE-MEMBER-COLLISION: a non-member-target override name cannot
+    // also be a member name.  MemberTarget overrides (pkg "X" { member "X" }) are
+    // the intended S8b patch form and are explicitly exempted — they redirect a
+    // transitive dep to the pre-registered member candidate.
     let mut collisions: Vec<&str> = overrides
-        .keys()
-        .filter(|n| members_by_name.contains(n.as_str()))
-        .map(String::as_str)
+        .iter()
+        .filter(|(n, ov)| {
+            members_by_name.contains(n.as_str())
+                && !matches!(ov.target, OverrideTarget::Member { .. })
+        })
+        .map(|(n, _)| n.as_str())
         .collect();
     if !collisions.is_empty() {
         collisions.sort();
@@ -288,6 +615,10 @@ pub fn resolve_workspace(
     );
     let queue = provider.seed_workspace(workspace, profile)?;
     provider.process_items(queue)?;
+    // S4a fixpoint for workspace resolve (same algorithm as single-package).
+    provider.run_s4a_fixpoint()?;
+    // S4c post-fixpoint flag-conflict validation (same algorithm as single-package).
+    provider.check_s4c_flag_conflicts(deps_dir)?;
     let canonical_aliases_ws = provider.finalize();
     let solution = solve(&provider, ROOT, root_version(), strategy)?;
     if let Some(e) = provider.take_error() {
@@ -356,6 +687,9 @@ enum PKey {
     Named(String),
     Local(String),
     Tarball(String),
+    /// S8b: sentinel for a MemberTarget override — the dep is satisfied by a
+    /// pre-registered workspace member candidate, no external fetch.
+    Member(String),
 }
 
 /// What `extract_requires` returns after converting an `EdgeSet` to solver
@@ -452,6 +786,12 @@ struct ResolveProvider<'a> {
     seen_tarball: RefCell<BTreeSet<String>>,
     seen_by_name: RefCell<BTreeMap<String, (PKey, bool)>>,
 
+    /// S3 RFC #23: resolver-scoped map of dep_name → flag_requests from the ROOT
+    /// manifest's named dep declarations. Populated during `seed_root`; consumed
+    /// in `materialize_named` to pass `active_flags` to `extract_requires`.
+    /// Mirrors Python `_Provider._flag_requests_by_name`.
+    flag_requests_by_name: RefCell<BTreeMap<String, Vec<FlagRequest>>>,
+
     /// Phase B: BFS-insertion discovery order — dep names in the order they are
     /// first enqueued (root deps in declaration order, then transitives in first-
     /// occurrence order). Used by `finalize()` to pick the canonical name in each
@@ -470,6 +810,13 @@ struct ResolveProvider<'a> {
     /// `TNG-DEPDECL-FETCH-FAILED` fallback without re-reading the manifest
     /// (spec §13.1; Python: `edge_sources.py` `strict_attestation` param).
     strict_attestation: bool,
+
+    /// S4a (RFC #23 §3.1.2): resolver-scoped dep_active_flags map.
+    /// Maps identity (content_hash) → (flag_name → BTreeSet<ActivationSource>).
+    /// Mirrors Python `_Provider.dep_active_flags` — keying by identity is NORMATIVE
+    /// per spec/identity.md §3.1.2 ("Keying (normative)").
+    /// Populated during `process_url`/`materialize_named` and extended by `run_s4a_fixpoint`.
+    dep_active_flags: RefCell<BTreeMap<String, BTreeMap<String, BTreeSet<milpa_types::ActivationSource>>>>,
 }
 
 /// The cross-name gate's verdict for an item (§10).
@@ -515,6 +862,8 @@ impl<'a> ResolveProvider<'a> {
             error: RefCell::new(None),
             dep_decl_store,
             strict_attestation,
+            flag_requests_by_name: RefCell::new(BTreeMap::new()),
+            dep_active_flags: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -550,8 +899,30 @@ impl<'a> ResolveProvider<'a> {
                 Dep::Url(u) => {
                     root_deps.push(SolverDep::new(name.clone(), eq_sentinel()));
                     root_requires.push(name.clone());
+                    // S8a: LocalTarget override on root UrlDep → local pkey + local item.
+                    if let Some(ov) = self.overrides.get(&name) {
+                        if let OverrideTarget::Local { path } = &ov.target {
+                            seen_by_name.insert(name.clone(), (PKey::Local(path.clone()), true));
+                            self.discovery_order.borrow_mut().push(name.clone());
+                            queue.push(Item::Local(LocalDep { name, path: path.clone(), predicates: vec![] }));
+                            continue;
+                        }
+                        // S8b: MemberTarget on a root UrlDep in single-package manifest is a
+                        // no-op (no workspace member to resolve to); treat as the original URL.
+                        if let OverrideTarget::Member { member_name } = &ov.target {
+                            let _ = member_name;
+                            let pkey = PKey::Url(u.git.clone(), u.git_ref.clone());
+                            seen_by_name.insert(name.clone(), (pkey, true));
+                            self.discovery_order.borrow_mut().push(name);
+                            queue.push(Item::Url(u.clone()));
+                            continue;
+                        }
+                    }
                     let pkey = match self.overrides.get(&name) {
-                        Some(ov) => PKey::Url(ov.git.clone(), ov.git_ref.clone()),
+                        Some(ov) => {
+                            let (url, r) = override_git_url_ref(ov);
+                            PKey::Url(url.to_owned(), r.to_owned())
+                        }
                         None => PKey::Url(u.git.clone(), u.git_ref.clone()),
                     };
                     seen_by_name.insert(name.clone(), (pkey, true));
@@ -565,14 +936,45 @@ impl<'a> ResolveProvider<'a> {
                         .parsed_constraint
                         .clone()
                         .unwrap_or_else(VersionSet::full);
+                    // S3: store flag_requests for use during materialize_named.
+                    if !n.flag_requests.is_empty() {
+                        self.flag_requests_by_name
+                            .borrow_mut()
+                            .insert(name.clone(), n.flag_requests.clone());
+                    }
                     if self.overrides.contains_key(&name) {
-                        // Override routes a named dep to a URL fetch → singleton.
+                        // Override routes a named dep to a URL/local fetch → singleton.
                         let ov = &self.overrides[&name];
                         root_deps.push(SolverDep::new(name.clone(), eq_sentinel()));
-                        seen_by_name.insert(
-                            name.clone(),
-                            (PKey::Url(ov.git.clone(), ov.git_ref.clone()), true),
-                        );
+                        match &ov.target {
+                            // S8a: LocalTarget override on root NamedDep → local pkey + item.
+                            OverrideTarget::Local { path } => {
+                                seen_by_name.insert(
+                                    name.clone(),
+                                    (PKey::Local(path.clone()), true),
+                                );
+                                root_requires.push(name.clone());
+                                self.discovery_order.borrow_mut().push(name.clone());
+                                queue.push(Item::Local(LocalDep { name, path: path.clone(), predicates: vec![] }));
+                                continue;
+                            }
+                            OverrideTarget::Member { .. } => {
+                                // S8b: MemberTarget in a single-package manifest is a no-op
+                                // (no workspace context; no member candidate pre-registered).
+                                // Treat as if the override were absent: resolve as named dep.
+                                // Revert to named-dep solver term (already pushed as sentinel above).
+                                // We drop the sentinel we pushed and push the real constraint term.
+                                root_deps.pop(); // undo the sentinel push
+                                root_deps.push(SolverDep::new(name.clone(), vs.clone()));
+                                seen_by_name.insert(name.clone(), (PKey::Named(name.clone()), true));
+                            }
+                            OverrideTarget::Git { url, git_ref } => {
+                                seen_by_name.insert(
+                                    name.clone(),
+                                    (PKey::Url(url.clone(), git_ref.clone()), true),
+                                );
+                            }
+                        }
                     } else {
                         root_deps.push(SolverDep::new(name.clone(), vs.clone()));
                         seen_by_name.insert(name.clone(), (PKey::Named(name.clone()), true));
@@ -599,9 +1001,13 @@ impl<'a> ResolveProvider<'a> {
 
         for ov in &manifest.overrides {
             authority.insert(ov.name.clone());
+            // S8: pre-seed the gate for each override kind via the SSOT helper.
+            // S8a: LocalTarget → PKey::Local; S8b: MemberTarget → PKey::Member
+            // (no-op in single-package context, but gate is pre-seeded for consistency).
+            let pk = override_target_to_pkey(&ov.target);
             seen_by_name
                 .entry(ov.name.clone())
-                .or_insert_with(|| (PKey::Url(ov.git.clone(), ov.git_ref.clone()), true));
+                .or_insert_with(|| (pk, true));
         }
 
         self.root_authority = authority;
@@ -644,10 +1050,12 @@ impl<'a> ResolveProvider<'a> {
 
         for ov in &workspace.overrides {
             authority.insert(ov.name.clone());
-            seen_by_name.insert(
-                ov.name.clone(),
-                (PKey::Url(ov.git.clone(), ov.git_ref.clone()), true),
-            );
+            // S8: pre-seed the gate for each override kind via the SSOT helper.
+            // S8a: LocalTarget → PKey::Local; S8b: MemberTarget → PKey::Member.
+            // Pre-seeding with is_root=true means any transitive dep claiming this
+            // name via a different pkey is suppressed by the gate (root wins).
+            let pk = override_target_to_pkey(&ov.target);
+            seen_by_name.insert(ov.name.clone(), (pk, true));
         }
 
         for member in &workspace.members {
@@ -679,14 +1087,36 @@ impl<'a> ResolveProvider<'a> {
                     let ov = &self.overrides[&name];
                     terms.push(SolverDep::new(name.clone(), eq_sentinel()));
                     requires.push(name.clone());
-                    seen_by_name
-                        .entry(name.clone())
-                        .or_insert((PKey::Url(ov.git.clone(), ov.git_ref.clone()), true));
-                    // Override converts Named→Url at dispatch; constraint is unused.
-                    queue.push(Item::Named {
-                        name,
-                        constraint: VersionSet::full(),
-                    });
+                    // S8a: LocalTarget override → local item; S8b: MemberTarget → no-op
+                    // (member already pre-registered; gate was pre-seeded above); git → url.
+                    match &ov.target {
+                        OverrideTarget::Local { path } => {
+                            let pkey = PKey::Local(path.clone());
+                            seen_by_name.entry(name.clone()).or_insert((pkey, true));
+                            if !self.discovery_order.borrow().contains(&name) {
+                                self.discovery_order.borrow_mut().push(name.clone());
+                            }
+                            queue.push(Item::Local(LocalDep { name: name.clone(), path: path.clone(), predicates: vec![] }));
+                        }
+                        OverrideTarget::Member { member_name } => {
+                            // S8b: member already pre-registered; gate pre-seeded with
+                            // PKey::Member in the overrides loop above.  No external queue
+                            // entry needed; do NOT add to discovery_order (member is not an
+                            // external dep subject to content-hash dedup).
+                            let _ = member_name; // name used only for gate; no fetch
+                        }
+                        OverrideTarget::Git { url, git_ref } => {
+                            seen_by_name
+                                .entry(name.clone())
+                                .or_insert((PKey::Url(url.clone(), git_ref.clone()), true));
+                            // Override converts Named→Url at dispatch; constraint is unused.
+                            queue.push(Item::Named {
+                                name: name.clone(),
+                                constraint: VersionSet::full(),
+                            });
+                        }
+                    }
+                    let _ = name; // suppress move-after-use warning (consumed in match arms above)
                     continue;
                 }
 
@@ -741,6 +1171,16 @@ impl<'a> ResolveProvider<'a> {
                         if !self.discovery_order.borrow().contains(&name) {
                             self.discovery_order.borrow_mut().push(name.clone());
                         }
+                        // S11 (RFC #23 §3.8): accumulate flag_requests from ALL members
+                        // (workspace-wide union). Union via extend — monotone; duplicate
+                        // positive requests are idempotent for union semantics.
+                        if !n.flag_requests.is_empty() {
+                            self.flag_requests_by_name
+                                .borrow_mut()
+                                .entry(name.clone())
+                                .or_default()
+                                .extend(n.flag_requests.iter().cloned());
+                        }
                         queue.push(Item::Named {
                             name,
                             constraint: vs,
@@ -768,6 +1208,39 @@ impl<'a> ResolveProvider<'a> {
             });
             root_deps.push(SolverDep::new(member.name.clone(), eq_sentinel()));
             root_requires.push(member.name.clone());
+        }
+
+        // S11 (RFC #23 §3.8): workspace-root flags {} — seed workspace-wide active
+        // flags from workspace-root default-true flags.  Compute the enables-closure
+        // (same-package closure via flag_enables_closure) then extract cross-pkg
+        // enables and pre-seed flag_requests_by_name.
+        if !workspace.flags.is_empty() {
+            use std::collections::HashSet as HSet;
+            use milpa_manifest::flag_enables_closure;
+            let ws_root_flags = &workspace.flags;
+            // Compute which workspace-root flags are default-active.
+            let ws_root_active_seed: HSet<String> = ws_root_flags
+                .iter()
+                .filter(|f| f.default)
+                .map(|f| f.name.clone())
+                .collect();
+            let ws_root_active = flag_enables_closure(ws_root_flags, &ws_root_active_seed);
+            // Build flag-name → FlagDecl lookup.
+            let ws_flag_by_name: std::collections::HashMap<&str, &milpa_manifest::FlagDecl> =
+                ws_root_flags.iter().map(|f| (f.name.as_str(), f)).collect();
+            // Extract cross-pkg enables from root-active flags.
+            for flag_name in &ws_root_active {
+                if let Some(fd) = ws_flag_by_name.get(flag_name.as_str()) {
+                    for cpe in &fd.enables_cross_pkg {
+                        // Accumulate (union) into flag_requests_by_name.
+                        self.flag_requests_by_name
+                            .borrow_mut()
+                            .entry(cpe.dep.clone())
+                            .or_default()
+                            .extend(cpe.flag_requests.iter().cloned());
+                    }
+                }
+            }
         }
 
         self.root_authority = authority;
@@ -872,11 +1345,39 @@ impl<'a> ResolveProvider<'a> {
     fn apply_override(&self, item: Item) -> Item {
         match &item {
             Item::Url(d) => match self.overrides.get(&d.name) {
-                Some(ov) => Item::Url(url_dep(&d.name, &ov.git, &ov.git_ref)),
+                Some(ov) => match &ov.target {
+                    // S8a: LocalTarget override → route to local transport.
+                    OverrideTarget::Local { path } => {
+                        Item::Local(LocalDep { name: d.name.clone(), path: path.clone(), predicates: vec![] })
+                    }
+                    // S8b: MemberTarget — member already pre-registered; gate was pre-seeded
+                    // with PKey::Member(member_name) + is_root=true in seed_workspace.
+                    // Return the item unchanged; the gate will suppress it (root wins over
+                    // any non-matching pkey).
+                    OverrideTarget::Member { .. } => item,
+                    // Existing git path.
+                    OverrideTarget::Git { url, git_ref } => {
+                        Item::Url(url_dep(&d.name, url, git_ref))
+                    }
+                },
                 None => item,
             },
             Item::Named { name, .. } => match self.overrides.get(name) {
-                Some(ov) => Item::Url(url_dep(name, &ov.git, &ov.git_ref)),
+                Some(ov) => match &ov.target {
+                    // S8a: LocalTarget override → route to local transport.
+                    OverrideTarget::Local { path } => {
+                        Item::Local(LocalDep { name: name.clone(), path: path.clone(), predicates: vec![] })
+                    }
+                    // S8b: MemberTarget — member already pre-registered; gate was pre-seeded
+                    // with PKey::Member(member_name) + is_root=true in seed_workspace.
+                    // Return the item unchanged; the gate will suppress it (root wins over
+                    // any non-matching pkey).
+                    OverrideTarget::Member { .. } => item,
+                    // Existing git path.
+                    OverrideTarget::Git { url, git_ref } => {
+                        Item::Url(url_dep(name, url, git_ref))
+                    }
+                },
                 None => item,
             },
             // `local`/`tarball` are themselves explicit transport specs;
@@ -890,6 +1391,145 @@ impl<'a> ResolveProvider<'a> {
     fn process_url(&self, dep: UrlDep) -> Result<(), MilpaError> {
         let key = (dep.git.clone(), dep.git_ref.clone());
         if !self.seen_url.borrow_mut().insert(key) {
+            // S4b: multi-consumer union (RFC #23 §3.1.3).
+            // A second (or later) consumer of the same URL dep — same (git, ref) key.
+            // The dep has already been fetched and its candidate registered.  Any
+            // positive flag_requests from THIS consumer must be unioned into the dep's
+            // active_flags (monotone — never subtract).  Negative requests (opt-out,
+            // §3.1.3) contribute nothing; `compute_dep_active_flags` ignores them.
+            //
+            // If the union admits new flags, fire the same newly-admitted-dep logic
+            // as S4a fixpoint steps 4-5: extend the candidate's deps/requires_names
+            // and enqueue sub-deps for fetch (if not already seen).
+            let positive_reqs: Vec<FlagRequest> = dep
+                .flag_requests
+                .iter()
+                .filter(|fr| fr.enabled)
+                .cloned()
+                .collect();
+            if !positive_reqs.is_empty() {
+                let dest = self.deps_dir.join(&dep.name);
+                let kdl_path = dest.join("milpa.kdl");
+                if kdl_path.is_file() {
+                    if let Ok(text) = std::fs::read_to_string(&kdl_path) {
+                        if let Ok(manifest) = milpa_manifest::parse_manifest(&text) {
+                            // Compute new active flags from this consumer's requests.
+                            let new_active = compute_dep_active_flags(&manifest.flags, &positive_reqs);
+                            // Resolve identity for this dep (H3: key by identity, not dep_name).
+                            let dep_identity: String = self.candidates.borrow()
+                                .get(&dep.name)
+                                .and_then(|m| m.values().next())
+                                .map(|c| c.identity.clone())
+                                .unwrap_or_default();
+                            if !new_active.is_empty() && !dep_identity.is_empty() {
+                                let old_flag_names: BTreeSet<String> = self
+                                    .dep_active_flags
+                                    .borrow()
+                                    .get(&dep_identity)
+                                    .map(|m| m.keys().cloned().collect())
+                                    .unwrap_or_default();
+
+                                // Union into dep_active_flags (monotone).
+                                {
+                                    let mut daf = self.dep_active_flags.borrow_mut();
+                                    let entry = daf.entry(dep_identity.clone()).or_default();
+                                    for (flag_name, sources) in &new_active {
+                                        entry
+                                            .entry(flag_name.clone())
+                                            .or_default()
+                                            .extend(sources.iter().cloned());
+                                    }
+                                }
+
+                                let new_flag_names: BTreeSet<String> = self
+                                    .dep_active_flags
+                                    .borrow()
+                                    .get(&dep_identity)
+                                    .map(|m| m.keys().cloned().collect())
+                                    .unwrap_or_default();
+
+                                if new_flag_names != old_flag_names {
+                                    // Find newly admitted deps and process them (S4b steps 4-5).
+                                    let old_active_set: BTreeSet<&str> =
+                                        old_flag_names.iter().map(|s| s.as_str()).collect();
+                                    let new_active_set: BTreeSet<&str> =
+                                        new_flag_names.iter().map(|s| s.as_str()).collect();
+                                    let mut new_items: Vec<Item> = Vec::new();
+
+                                    for sub_dep in &manifest.deps {
+                                        let was_admitted = dep_passes_flag_predicates(sub_dep, &old_active_set);
+                                        let is_admitted = dep_passes_flag_predicates(sub_dep, &new_active_set);
+                                        if is_admitted && !was_admitted {
+                                            // Extend the parent candidate's deps/requires_names.
+                                            let sub_name = sub_dep.name().to_string();
+                                            {
+                                                let mut cands = self.candidates.borrow_mut();
+                                                if let Some(version_map) = cands.get_mut(&dep.name) {
+                                                    if let Some(cand) = version_map.values_mut().next() {
+                                                        if !cand.requires_names.contains(&sub_name) {
+                                                            let vs = match sub_dep {
+                                                                Dep::Url(_) | Dep::Local(_) | Dep::Tarball(_) | Dep::Member(_) => eq_sentinel(),
+                                                                Dep::Named(n) => {
+                                                                    if self.overrides.contains_key(&n.name) {
+                                                                        eq_sentinel()
+                                                                    } else {
+                                                                        let c = n.constraint.as_deref().filter(|s| !s.is_empty());
+                                                                        VersionSet::from_constraint(c).unwrap_or_else(|_| VersionSet::full())
+                                                                    }
+                                                                }
+                                                            };
+                                                            cand.deps.push(SolverDep::new(sub_name.clone(), vs));
+                                                            cand.requires_names.push(sub_name.clone());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Enqueue for fetch if not already seen.
+                                            match sub_dep {
+                                                Dep::Url(u) => {
+                                                    let k = (u.git.clone(), u.git_ref.clone());
+                                                    if !self.seen_url.borrow().contains(&k) {
+                                                        new_items.push(Item::Url(u.clone()));
+                                                    }
+                                                }
+                                                Dep::Named(n) => {
+                                                    if !self.seen_named.borrow().contains(&n.name) {
+                                                        let constraint = if self.overrides.contains_key(&n.name) {
+                                                            eq_sentinel()
+                                                        } else {
+                                                            let c = n.constraint.as_deref().filter(|s| !s.is_empty());
+                                                            VersionSet::from_constraint(c).unwrap_or_else(|_| VersionSet::full())
+                                                        };
+                                                        new_items.push(Item::Named {
+                                                            name: n.name.clone(),
+                                                            constraint,
+                                                        });
+                                                    }
+                                                }
+                                                Dep::Local(l) => {
+                                                    if !self.seen_local.borrow().contains(&l.path) {
+                                                        new_items.push(Item::Local(l.clone()));
+                                                    }
+                                                }
+                                                Dep::Tarball(t) => {
+                                                    if !self.seen_tarball.borrow().contains(&t.url) {
+                                                        new_items.push(Item::Tarball(t.clone()));
+                                                    }
+                                                }
+                                                Dep::Member(_) => {}
+                                            }
+                                        }
+                                    }
+
+                                    if !new_items.is_empty() {
+                                        self.process_items(new_items)?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             return Ok(());
         }
 
@@ -936,12 +1576,21 @@ impl<'a> ResolveProvider<'a> {
             .cloned()
             .collect();
 
+        // S3 RFC #23: collect positive flag requests from the dep declaration.
+        // These activate flags in the fetched dep's milpa.kdl (single-hop only).
+        let requested_flags: BTreeSet<String> = dep
+            .flag_requests
+            .iter()
+            .filter(|fr| fr.enabled)
+            .map(|fr| fr.name.clone())
+            .collect();
         let ex =
-            self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None)?;
+            self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None, requested_flags.clone())?;
 
         // Record the observed provenance with the resolved commit SHA.
         // (preferring the freshly-resolved SHA over a pin) for emission.
         let commit = receipt.resolved_ref.or(pinned_sha);
+        let identity_str = identity.clone(); // save before move into Candidate
         self.store_candidate(Candidate {
             name: dep.name.clone(),
             version: url_dep_version(),
@@ -960,6 +1609,31 @@ impl<'a> ResolveProvider<'a> {
             dep_decl: None, // URL deps not in the index; no DepDecl pin
             requires_predicates: ex.requires_predicates,
         });
+
+        // S3 / S4a / C1: unconditionally seed dep_active_flags for this URL dep so that
+        // default-true flags are visible to the S4a fixpoint even when no consumer
+        // flag_requests exist.  Keyed by identity (content_hash) — NORMATIVE per
+        // spec/identity.md §3.1.2.
+        if !identity_str.is_empty() {
+            let kdl_path = dest.join("milpa.kdl");
+            if kdl_path.is_file() {
+                if let Ok(text) = std::fs::read_to_string(&kdl_path) {
+                    if let Ok(manifest) = milpa_manifest::parse_manifest(&text) {
+                        let frs: Vec<FlagRequest> = dep
+                            .flag_requests
+                            .iter()
+                            .cloned()
+                            .collect();
+                        let active = compute_dep_active_flags(&manifest.flags, &frs);
+                        if !active.is_empty() {
+                            self.dep_active_flags
+                                .borrow_mut()
+                                .insert(identity_str.clone(), active);
+                        }
+                    }
+                }
+            }
+        }
 
         self.process_items(ex.sub_items)?;
         Ok(())
@@ -993,7 +1667,7 @@ impl<'a> ResolveProvider<'a> {
         // dedup (which is CAS-only). Mirrors Python FetcherRegistry → identity=None.
         let identity = String::new();
         let ex =
-            self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None)?;
+            self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None, BTreeSet::new())?;
         self.store_candidate(Candidate {
             name: dep.name.clone(),
             version: url_dep_version(),
@@ -1038,7 +1712,7 @@ impl<'a> ResolveProvider<'a> {
             expected_identity.as_deref(),
         )?;
         let ex =
-            self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None)?;
+            self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None, BTreeSet::new())?;
         // §5: record the TOFU pin. A manifest `sha256=` is authoritative; else
         // capture the digest the fetcher just computed (first fetch), falling
         // back to the prior lock's pin (refetch preserves it).
@@ -1138,9 +1812,22 @@ impl<'a> ResolveProvider<'a> {
             &dest,
             Some(entry.content_hash.as_str()),
         )?;
+        // S3: look up flag_requests stored during seed_root for this named dep.
+        let named_active_flags: BTreeSet<String> = self
+            .flag_requests_by_name
+            .borrow()
+            .get(name)
+            .map(|frs| {
+                frs.iter()
+                    .filter(|fr| fr.enabled)
+                    .map(|fr| fr.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         let ex = self.extract_requires(&dest, name, version, false,
                 entry.dep_decl.as_deref(),
-                entry.dep_decl_schema_version)?;
+                entry.dep_decl_schema_version,
+                named_active_flags)?;
         // S6: dep_decl pin records the artifact hash only when DepDeclEdgeSource was
         // actually used (edge_set.source == DepDecl). If we fell back to milpa.kdl or
         // nimble (e.g. non-strict FETCH-FAILED), the pin is None — matching Python:
@@ -1150,6 +1837,7 @@ impl<'a> ResolveProvider<'a> {
         } else {
             None
         };
+        let identity_str = identity.clone(); // save before move into Candidate (H3 key)
         let candidate = Candidate {
             name: name.to_string(),
             version: version.clone(),
@@ -1171,6 +1859,32 @@ impl<'a> ResolveProvider<'a> {
             .borrow_mut()
             .get_mut(name)
             .map(|m| m.remove(version));
+
+        // S3 / S11 / C1: unconditionally seed dep_active_flags for this named dep so
+        // that default-true flags are visible to the S4a fixpoint even when no
+        // consumer flag_requests exist.  Keyed by identity (content_hash) — NORMATIVE
+        // per spec/identity.md §3.1.2.  Mirrors Python _materialize_candidate_named
+        // lines 578-581 (which already seeds unconditionally via flag_requests_by_name
+        // returning () when absent).
+        if !identity_str.is_empty() {
+            let kdl_path = dest.join("milpa.kdl");
+            if kdl_path.is_file() {
+                if let Ok(txt) = std::fs::read_to_string(&kdl_path) {
+                    if let Ok(mf) = milpa_manifest::parse_manifest(&txt) {
+                        let frs_guard = self.flag_requests_by_name.borrow();
+                        let reqs: &[FlagRequest] =
+                            frs_guard.get(name).map(|v| v.as_slice()).unwrap_or(&[]);
+                        let active = compute_dep_active_flags(&mf.flags, reqs);
+                        if !active.is_empty() {
+                            self.dep_active_flags
+                                .borrow_mut()
+                                .insert(identity_str.clone(), active);
+                        }
+                    }
+                }
+            }
+        }
+
         // Enroll transitives discovered in this named dep (URL fetched eagerly;
         // named enrolled as stubs) so the solver can continue without a restart.
         self.process_items(ex.sub_items)?;
@@ -1266,26 +1980,32 @@ impl<'a> ResolveProvider<'a> {
         is_overridden: bool,
         dep_decl: Option<&str>,
         dep_decl_schema_version: Option<i64>,
+        // S3 RFC #23: active flags from the consumer's flag_requests. Non-empty
+        // only for direct (root) URL deps — transitive hops pass `BTreeSet::new()`.
+        // When non-empty, the edge_cache is bypassed (flag-parameterized EdgeSets
+        // are not cached; S4a multi-hop fixpoint will handle caching).
+        active_flags: BTreeSet<String>,
     ) -> Result<Extracted, MilpaError> {
         let has_milpa_kdl = dest.join("milpa.kdl").is_file();
 
-        // Clause (a): cache hit → reconstruct Extracted from cached EdgeSet
+        // Clause (a): cache hit → reconstruct Extracted from cached EdgeSet.
+        // Bypass when active_flags is non-empty (S3: consumer-specific, not sharable).
         let cache_key = (name.to_string(), version.clone());
-        {
+        if active_flags.is_empty() {
             let cache = self.edge_cache.borrow();
             if let Some(es) = cache.get(&cache_key) {
                 return self.edgeset_to_extracted(es, name);
             }
         }
 
-        // Cache miss: dispatch to appropriate source (clauses b/c/d).
+        // Cache miss (or active_flags bypass): dispatch to appropriate source (clauses b/c/d).
         let es: EdgeSet = if is_overridden {
             // Clause (b): is_overridden suppresses DepDecl — use milpa.kdl or nimble.
             if has_milpa_kdl {
                 let text =
                     std::fs::read_to_string(dest.join("milpa.kdl")).map_err(io_err)?;
                 let manifest = milpa_manifest::parse_manifest(&text)?;
-                self.build_edgeset_from_manifest(&manifest)
+                self.build_edgeset_from_manifest(&manifest, &BTreeSet::new())
             } else {
                 let ctx = EdgeSourceCtx {
                     dep_path: Some(dest),
@@ -1295,9 +2015,10 @@ impl<'a> ResolveProvider<'a> {
                     has_milpa_kdl: false,
                     dep_decl_schema_version: None,
                     overrides_by_name: &self.overrides,
+                    active_flags: BTreeSet::new(),
                 };
                 let src = NimbleEdgeSource;
-                src.edges_for(name, version, &ctx)
+                src.edges_for(name, version, &ctx)?
             }
         } else if dep_decl.is_some() {
             if let Some(store) = self.dep_decl_store {
@@ -1318,6 +2039,7 @@ impl<'a> ResolveProvider<'a> {
                     has_milpa_kdl,
                     dep_decl_schema_version,
                     overrides_by_name: &self.overrides,
+                    active_flags: BTreeSet::new(),
                 };
                 match source.edges_for_result(name, &ctx) {
                     Ok(es) => es,
@@ -1329,7 +2051,7 @@ impl<'a> ResolveProvider<'a> {
                             let text =
                                 std::fs::read_to_string(dest.join("milpa.kdl")).map_err(io_err)?;
                             let manifest = milpa_manifest::parse_manifest(&text)?;
-                            self.build_edgeset_from_manifest(&manifest)
+                            self.build_edgeset_from_manifest(&manifest, &BTreeSet::new())
                         } else {
                             let fallback_ctx = EdgeSourceCtx {
                                 dep_path: Some(dest),
@@ -1339,9 +2061,10 @@ impl<'a> ResolveProvider<'a> {
                                 has_milpa_kdl: false,
                                 dep_decl_schema_version: None,
                                 overrides_by_name: &self.overrides,
+                                active_flags: BTreeSet::new(),
                             };
                             let src = NimbleEdgeSource;
-                            src.edges_for(name, version, &fallback_ctx)
+                            src.edges_for(name, version, &fallback_ctx)?
                         }
                     }
                     Err(e) => return Err(e),
@@ -1352,7 +2075,7 @@ impl<'a> ResolveProvider<'a> {
                     let text =
                         std::fs::read_to_string(dest.join("milpa.kdl")).map_err(io_err)?;
                     let manifest = milpa_manifest::parse_manifest(&text)?;
-                    self.build_edgeset_from_manifest(&manifest)
+                    self.build_edgeset_from_manifest(&manifest, &BTreeSet::new())
                 } else {
                     let ctx = EdgeSourceCtx {
                         dep_path: Some(dest),
@@ -1362,20 +2085,22 @@ impl<'a> ResolveProvider<'a> {
                         has_milpa_kdl: false,
                         dep_decl_schema_version,
                         overrides_by_name: &self.overrides,
+                        active_flags: BTreeSet::new(),
                     };
                     let src = NimbleEdgeSource;
-                    src.edges_for(name, version, &ctx)
+                    src.edges_for(name, version, &ctx)?
                 }
             }
         } else if has_milpa_kdl {
             // Clause (d): milpa.kdl present — parse with flag-predicate filtering.
             // For milpa.kdl, parse the manifest here so we can apply flag-predicate
             // filtering (§6 transitive: each dep evaluates against its own default
-            // flags). Flag filtering is resolver-local and not part of the EdgeSource
+            // flags, merged with S3 active_flags from the consumer's flag_requests).
+            // Flag filtering is resolver-local and not part of the EdgeSource
             // seam's normative projection; it happens before constructing the EdgeSet.
             let text = std::fs::read_to_string(dest.join("milpa.kdl")).map_err(io_err)?;
             let manifest = milpa_manifest::parse_manifest(&text)?;
-            self.build_edgeset_from_manifest(&manifest)
+            self.build_edgeset_from_manifest(&manifest, &active_flags)
         } else {
             // Clause (d/else): nimble fallback.
             let ctx = EdgeSourceCtx {
@@ -1386,33 +2111,45 @@ impl<'a> ResolveProvider<'a> {
                 has_milpa_kdl: false,
                 dep_decl_schema_version: None,
                 overrides_by_name: &self.overrides,
+                active_flags: BTreeSet::new(),
             };
             let src = NimbleEdgeSource;
-            src.edges_for(name, version, &ctx)
+            src.edges_for(name, version, &ctx)?
         };
 
-        // Seal cache (clause a) then convert to Extracted
+        // Seal cache (clause a) — skip when active_flags was non-empty (S3 bypass).
         let extracted = self.edgeset_to_extracted(&es, name)?;
-        self.edge_cache.borrow_mut().insert(cache_key, es);
+        if active_flags.is_empty() {
+            self.edge_cache.borrow_mut().insert(cache_key, es);
+        }
         Ok(extracted)
     }
 
     /// Build an `EdgeSet` from a parsed `milpa.kdl` manifest, applying flag-
     /// predicate filtering (§6 transitive: each dep evaluates against its own
-    /// default flags). Only `manifest.deps` is included — **never** `dev_deps`
-    /// (§9) — and `overrides` are dropped entirely (§10.2).
+    /// default flags, merged with `active_flags` from S3 consumer requests).
+    /// Only `manifest.deps` is included — **never** `dev_deps` (§9) — and
+    /// `overrides` are dropped entirely (§10.2).
+    ///
+    /// `active_flags`: S3 RFC #23 cross-package requests from the consumer's dep
+    /// declaration. Merged with the manifest's own defaults before filtering.
+    /// Pass `&BTreeSet::new()` for transitive hops (single-hop S3 scope).
     ///
     /// Flag filtering is applied here (resolver-local) rather than in
     /// `edge_sources::manifest_to_edgeset` (which is the pure normative
     /// projection used by tests that don't need flag filtering).
-    fn build_edgeset_from_manifest(&self, manifest: &Manifest) -> EdgeSet {
+    fn build_edgeset_from_manifest(&self, manifest: &Manifest, active_flags: &BTreeSet<String>) -> EdgeSet {
         use milpa_types::{NamedRequire, RequireEntry, UrlRequire};
-        let active: BTreeSet<&str> = manifest
+        // Merge manifest defaults with S3 consumer requests.
+        let mut active: BTreeSet<&str> = manifest
             .flags
             .iter()
             .filter(|f| f.default)
             .map(|f| f.name.as_str())
             .collect();
+        for flag in active_flags {
+            active.insert(flag.as_str());
+        }
         let mut requires = Vec::new();
         for d in &manifest.deps {
             if !dep_passes_flag_predicates(d, &active) {
@@ -1420,10 +2157,16 @@ impl<'a> ResolveProvider<'a> {
             }
             match d {
                 Dep::Url(u) => {
+                    // S4b: carry flag_requests from the dep declaration so that
+                    // `edgeset_to_extracted` can reconstruct them in the Item::Url.
+                    // This is the only UrlRequire construction site where flag_requests
+                    // may be non-empty (direct milpa.kdl dep entries with `flag` children).
+                    // FlagRequest is the SSOT (milpa-types); no conversion needed.
                     requires.push(RequireEntry::Url(UrlRequire {
                         url: u.git.clone(),
                         ref_: u.git_ref.clone(),
                         predicates: Vec::new(),
+                        flag_requests: u.flag_requests.clone(),
                     }));
                 }
                 Dep::Named(n) => {
@@ -1470,7 +2213,12 @@ impl<'a> ResolveProvider<'a> {
                     if !seen_dep_names.contains(&dep_name) {
                         deps.push(SolverDep::new(dep_name.clone(), eq_sentinel()));
                         requires_names.push(dep_name.clone());
-                        items.push(Item::Url(url_dep(&dep_name, &u.url, &u.ref_)));
+                        // S4b: reconstruct flag_requests from UrlRequire so
+                        // process_url sees them for multi-consumer union (§3.1.3).
+                        // FlagRequest is the SSOT (milpa-types); no conversion needed.
+                        let mut url_d = url_dep(&dep_name, &u.url, &u.ref_);
+                        url_d.flag_requests = u.flag_requests.clone();
+                        items.push(Item::Url(url_d));
                         seen_dep_names.insert(dep_name.clone());
                     }
                     // S4: accumulate predicates if non-empty (do not overwrite).
@@ -1810,6 +2558,37 @@ impl<'a> ResolveProvider<'a> {
                         .get(&c.name)
                         .cloned()
                         .unwrap_or_default(),
+                    // S5 (RFC #23 §4): populate active_flags from the converged
+                    // dep_active_flags map, keyed by identity (content_hash) — NORMATIVE
+                    // per spec/identity.md §3.1.2.  For deps with no consumer flag
+                    // requests, fall back to computing defaults-only active set from
+                    // the dep's manifest.  Lexicographically sorted (normative).
+                    active_flags: {
+                        use milpa_manifest::parse_manifest as parse_mf;
+                        let active_map: std::collections::BTreeMap<String, _> = {
+                            let daf = self.dep_active_flags.borrow();
+                            // H3: key by identity, not dep_name.
+                            match daf.get(c.identity.as_str()).filter(|m| !m.is_empty()) {
+                                Some(m) => m.clone(),
+                                None => {
+                                    // No entry — compute defaults-only from manifest.
+                                    drop(daf);
+                                    let kdl_path = self.deps_dir.join(&c.name).join("milpa.kdl");
+                                    if let Ok(txt) = std::fs::read_to_string(&kdl_path) {
+                                        if let Ok(mf) = parse_mf(&txt) {
+                                            compute_dep_active_flags(&mf.flags, &[])
+                                        } else {
+                                            Default::default()
+                                        }
+                                    } else {
+                                        Default::default()
+                                    }
+                                }
+                            }
+                        };
+                        // Lex-sorted — BTreeMap keys are already sorted.
+                        active_map.into_keys().collect()
+                    },
                 }
             })
             .collect();
@@ -1835,6 +2614,383 @@ impl<'a> ResolveProvider<'a> {
 
     fn take_error(&self) -> Option<MilpaError> {
         self.error.borrow_mut().take()
+    }
+
+    /// S4a (RFC #23 §3.1.2 + §7 S4a): outer dep×flag fixpoint.
+    ///
+    /// Iterates until neither `dep_active_flags` nor the admitted dep set grows:
+    ///   1. Scan all known candidate dep names and load their milpa.kdl manifests.
+    ///   2. For each dep with active flags, fire `enables_cross_pkg` to generate
+    ///      new `FlagRequest`s for target deps.
+    ///   3. Recompute `active(target)` for each target; detect changes (monotone).
+    ///   4. For deps with updated active_flags, find newly-admitted edges.
+    ///   5. Extend the parent candidate's `deps`/`requires_names`; enqueue new items.
+    ///   6. Re-run `process_items` for newly-admitted deps.
+    ///   7. Repeat until stable.
+    ///
+    /// **PubGrub runs exactly once**, after this fixpoint converges.
+    /// **Termination**: bounded by finite (deps × flags per dep) universe.
+    fn run_s4a_fixpoint(&self) -> Result<(), MilpaError> {
+        const MAX_ITERS: usize = 50; // safety belt; termination rests on monotonicity
+        // R2-M DoS hardening: absolute bound on total (dep,flag) activations across
+        // the whole fixpoint.  10_000 is far above any realistic graph and far below a
+        // crafted-wide DoS attempt.  Must match Python _MAX_TOTAL_ACTIVATIONS.
+        const MAX_TOTAL_ACTIVATIONS: usize = 10_000;
+        let mut total_activations: usize = 0;
+        let mut converged = false;
+
+        for _ in 0..MAX_ITERS {
+            // ----------------------------------------------------------------
+            // Step 1: collect known dep names and their manifests.
+            // ----------------------------------------------------------------
+            let dep_names: Vec<String> = self.candidates
+                .borrow()
+                .keys()
+                .filter(|n| n.as_str() != "__root__")
+                .cloned()
+                .collect();
+
+            // dep_name → parsed Manifest
+            let mut dep_manifests: BTreeMap<String, milpa_manifest::Manifest> = BTreeMap::new();
+            for name in &dep_names {
+                let kdl_path = self.deps_dir.join(name).join("milpa.kdl");
+                if kdl_path.is_file() {
+                    if let Ok(text) = std::fs::read_to_string(&kdl_path) {
+                        if let Ok(manifest) = milpa_manifest::parse_manifest(&text) {
+                            dep_manifests.insert(name.clone(), manifest);
+                        }
+                    }
+                }
+            }
+
+            // ----------------------------------------------------------------
+            // Step 2: compute cross-pkg enables from all active flags.
+            // ----------------------------------------------------------------
+            // Maps target_dep_name → Vec<FlagRequest> to merge into active(target).
+            let mut additional_requests: BTreeMap<String, Vec<FlagRequest>> =
+                BTreeMap::new();
+
+            {
+                // H3: build dep_name → identity map for identity-keyed lookups.
+                let dep_identities: BTreeMap<String, String> = {
+                    let cands = self.candidates.borrow();
+                    dep_names.iter()
+                        .filter_map(|n| {
+                            cands.get(n)
+                                .and_then(|m| m.values().next())
+                                .map(|c| (n.clone(), c.identity.clone()))
+                        })
+                        .filter(|(_, id)| !id.is_empty())
+                        .collect()
+                };
+                let daf = self.dep_active_flags.borrow();
+                for (dep_name, manifest) in &dep_manifests {
+                    // H3: look up by identity, not dep_name.
+                    let identity = match dep_identities.get(dep_name) {
+                        Some(id) => id,
+                        None => continue,
+                    };
+                    let active_now = match daf.get(identity) {
+                        Some(m) => m,
+                        None => continue,
+                    };
+                    // For each active flag, fire its enables_cross_pkg.
+                    for flag_decl in &manifest.flags {
+                        if !active_now.contains_key(&flag_decl.name) {
+                            continue;
+                        }
+                        for cpe in &flag_decl.enables_cross_pkg {
+                            additional_requests
+                                .entry(cpe.dep.clone())
+                                .or_default()
+                                .extend(cpe.flag_requests.iter().cloned());
+                        }
+                    }
+                }
+            }
+
+            if additional_requests.is_empty() {
+                converged = true;
+                break; // No cross-pkg enables fired — stable.
+            }
+
+            // ----------------------------------------------------------------
+            // Step 3: recompute active(target) for each target dep.
+            // ----------------------------------------------------------------
+            let mut any_change = false;
+            let mut new_items: Vec<Item> = Vec::new();
+
+            for (target_name, new_reqs) in &additional_requests {
+                let target_manifest = match dep_manifests.get(target_name) {
+                    Some(m) => m,
+                    None => continue, // target not yet fetched
+                };
+
+                // H3: look up target identity for identity-keyed dep_active_flags access.
+                let target_identity: String = self.candidates.borrow()
+                    .get(target_name)
+                    .and_then(|m| m.values().next())
+                    .map(|c| c.identity.clone())
+                    .unwrap_or_default();
+                if target_identity.is_empty() {
+                    continue; // no identity (local dep) — skip
+                }
+
+                // Previous active_flags (keyed by identity).
+                let old_flag_names: BTreeSet<String> = self
+                    .dep_active_flags
+                    .borrow()
+                    .get(&target_identity)
+                    .map(|m| m.keys().cloned().collect())
+                    .unwrap_or_default();
+
+                // Recompute active via SSOT.
+                let new_active = compute_dep_active_flags(&target_manifest.flags, new_reqs);
+
+                // R3-C fix: compute the UNION of old flags and this iteration's
+                // new flags LOCALLY (mirrors Python: `merged = dict(prev_active);
+                // merged.update(new_active); new_flag_names = frozenset(merged.keys())`).
+                // Using new_active.keys() alone for convergence was wrong: when old
+                // flags come from an S3 seed (e.g. {feat-x}) and the current
+                // iteration only contributes {feat-y}, new_active.keys()={feat-y}
+                // never equals old_flag_names={feat-x, feat-y} → infinite loop.
+                // This also removes the R2 read-back-from-store smell (Finding-5):
+                // the locally-computed union serves both convergence check AND edge
+                // admission, with no need to re-borrow dep_active_flags after write.
+                let merged_flag_names: BTreeSet<String> = old_flag_names
+                    .iter()
+                    .cloned()
+                    .chain(new_active.keys().cloned())
+                    .collect();
+
+                if merged_flag_names == old_flag_names {
+                    continue; // No change — union equals old set; already converged.
+                }
+                any_change = true;
+
+                // R2-M DoS hardening: count newly-added (dep,flag) activations
+                // (union-minus-old, consistent with Python's len(new_flag_names - old_flag_names)).
+                let newly_added_count = merged_flag_names.difference(&old_flag_names).count();
+                total_activations = total_activations.saturating_add(newly_added_count);
+                if total_activations > MAX_TOTAL_ACTIVATIONS {
+                    return Err(MilpaError::Core(CoreError::Resolver(
+                        "MILPA-INTERNAL",
+                        format!(
+                            "S4a flag fixpoint exceeded {} total (dep,flag) activations — \
+                             this is an internal milpa bug or a pathologically wide manifest; \
+                             please report it",
+                            MAX_TOTAL_ACTIVATIONS
+                        ),
+                    )));
+                }
+
+                // Union with previous (monotone — never subtract), keyed by identity.
+                {
+                    let mut daf = self.dep_active_flags.borrow_mut();
+                    let entry = daf.entry(target_identity.clone()).or_default();
+                    for (flag_name, sources) in &new_active {
+                        entry
+                            .entry(flag_name.clone())
+                            .or_default()
+                            .extend(sources.iter().cloned());
+                    }
+                }
+
+                // ----------------------------------------------------------------
+                // Step 4: find newly-admitted deps for the target.
+                // ----------------------------------------------------------------
+                // Use the locally-computed union (merged_flag_names) for edge
+                // admission — same value used for convergence above.  This avoids
+                // the Finding-5 read-back-from-store: no second borrow of
+                // dep_active_flags needed; the union is already in hand.
+                let old_active_set: BTreeSet<&str> =
+                    old_flag_names.iter().map(|s| s.as_str()).collect();
+                let new_active_set: BTreeSet<&str> =
+                    merged_flag_names.iter().map(|s| s.as_str()).collect();
+
+                for dep in &target_manifest.deps {
+                    let was_admitted = dep_passes_flag_predicates(dep, &old_active_set);
+                    let is_admitted = dep_passes_flag_predicates(dep, &new_active_set);
+                    if is_admitted && !was_admitted {
+                        // ----------------------------------------------------------------
+                        // Step 5a: extend the parent (target) candidate's deps/requires_names.
+                        // ----------------------------------------------------------------
+                        let sub_name = dep.name().to_string();
+                        {
+                            let mut cands = self.candidates.borrow_mut();
+                            if let Some(version_map) = cands.get_mut(target_name) {
+                                if let Some(cand) = version_map.values_mut().next() {
+                                    if !cand.requires_names.contains(&sub_name) {
+                                        let vs = match dep {
+                                            Dep::Url(_) | Dep::Local(_) | Dep::Tarball(_) | Dep::Member(_) => eq_sentinel(),
+                                            Dep::Named(n) => {
+                                                if self.overrides.contains_key(&n.name) {
+                                                    eq_sentinel()
+                                                } else {
+                                                    let constraint_opt = n.constraint.as_deref().filter(|s| !s.is_empty());
+                                                    VersionSet::from_constraint(constraint_opt).unwrap_or_else(|_| VersionSet::full())
+                                                }
+                                            }
+                                        };
+                                        cand.deps.push(SolverDep::new(sub_name.clone(), vs));
+                                        cand.requires_names.push(sub_name.clone());
+                                    }
+                                }
+                            }
+                        }
+
+                        // ----------------------------------------------------------------
+                        // Step 5b: enqueue for fetch if not already seen.
+                        // ----------------------------------------------------------------
+                        match dep {
+                            Dep::Url(u) => {
+                                let key = (u.git.clone(), u.git_ref.clone());
+                                if !self.seen_url.borrow().contains(&key) {
+                                    new_items.push(Item::Url(u.clone()));
+                                }
+                            }
+                            Dep::Named(n) => {
+                                if !self.seen_named.borrow().contains(&n.name) {
+                                    let constraint = if self.overrides.contains_key(&n.name) {
+                                        eq_sentinel()
+                                    } else {
+                                        let c = n.constraint.as_deref().filter(|s| !s.is_empty());
+                                        VersionSet::from_constraint(c).unwrap_or_else(|_| VersionSet::full())
+                                    };
+                                    new_items.push(Item::Named {
+                                        name: n.name.clone(),
+                                        constraint,
+                                    });
+                                }
+                            }
+                            Dep::Local(l) => {
+                                if !self.seen_local.borrow().contains(&l.path) {
+                                    new_items.push(Item::Local(l.clone()));
+                                }
+                            }
+                            Dep::Tarball(t) => {
+                                if !self.seen_tarball.borrow().contains(&t.url) {
+                                    new_items.push(Item::Tarball(t.clone()));
+                                }
+                            }
+                            Dep::Member(_) => {} // not handled in fixpoint
+                        }
+                    }
+                }
+            }
+
+            if !any_change {
+                converged = true;
+                break;
+            }
+
+            // ----------------------------------------------------------------
+            // Step 6: process newly-enqueued items.
+            // ----------------------------------------------------------------
+            if !new_items.is_empty() {
+                self.process_items(new_items)?;
+            }
+        }
+
+        // M3: cap exhaustion is a bug — fail loud rather than silently truncating.
+        // Monotonicity guarantees convergence in O(|deps|×max_flags) well under MAX_ITERS.
+        if !converged {
+            return Err(MilpaError::Core(CoreError::Resolver(
+                "MILPA-INTERNAL",
+                format!(
+                    "S4a flag fixpoint did not converge in {} iterations — \
+                     this is an internal milpa bug; please report it",
+                    MAX_ITERS
+                ),
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// S4c (RFC #23 §3.1.4): post-fixpoint flag-conflict validation.
+    ///
+    /// Runs AFTER the dep×flag fixpoint (`run_s4a_fixpoint`) fully converges,
+    /// BEFORE `finalize()` and solver entry. Only *reads* the converged
+    /// `dep_active_flags` — never retracts, so monotonicity is untouched and
+    /// the check is order-independent (both impls see the same converged set).
+    ///
+    /// Algorithm (normative):
+    ///   for each dep D,
+    ///   for each flag f ∈ active(D),
+    ///   for each g in f.conflicts:
+    ///       if g ∈ active(D): raise RESOLVE-FLAG-CONFLICT.
+    ///
+    /// Same-package only — cross-package conflicts deferred (#151).
+    /// Mirrors `resolver.py:_s4c_check_flag_conflicts` (SSOT pair).
+    fn check_s4c_flag_conflicts(&self, deps_dir: &Path) -> Result<(), MilpaError> {
+        use milpa_manifest::parse_manifest;
+        use milpa_types::ActivationSource;
+
+        let candidate_names: Vec<String> = self
+            .candidates
+            .borrow()
+            .keys()
+            .filter(|n| n.as_str() != ROOT)
+            .cloned()
+            .collect();
+
+        for dep_name in &candidate_names {
+            // Ensure we have a materialized candidate (not just a stub).
+            if self.candidates.borrow().get(dep_name).map_or(true, |m| m.is_empty()) {
+                continue;
+            }
+
+            // Load the dep's manifest to get flag declarations (conflicts field).
+            let kdl_path = deps_dir.join(dep_name).join("milpa.kdl");
+            if !kdl_path.exists() {
+                continue;
+            }
+            let kdl_text = match std::fs::read_to_string(&kdl_path) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let manifest = match parse_manifest(&kdl_text) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            // Skip if the manifest declares no flags (nothing to conflict).
+            if manifest.flags.is_empty() {
+                continue;
+            }
+
+            // Get or derive the active_map.
+            // H3: look up dep_active_flags by identity (content_hash), not dep_name.
+            // dep_active_flags may not have an entry if the dep had no consumer
+            // flag requests (no one requested flags on it) and no default-true flags;
+            // in that case derive active from defaults only (§3.1.2 rule 1).
+            let dep_identity: String = self.candidates.borrow()
+                .get(dep_name)
+                .and_then(|m| m.values().next())
+                .map(|c| c.identity.clone())
+                .unwrap_or_default();
+            let active_map: BTreeMap<String, BTreeSet<ActivationSource>> = {
+                let daf = self.dep_active_flags.borrow();
+                match daf.get(&dep_identity).filter(|m| !m.is_empty()) {
+                    Some(m) => m.clone(),
+                    None => {
+                        // No entry (or empty) — compute defaults-only active set.
+                        drop(daf);
+                        compute_dep_active_flags(&manifest.flags, &[])
+                    }
+                }
+            };
+
+            if active_map.is_empty() {
+                continue; // no active flags — nothing to check
+            }
+
+            // Delegate to the SSOT helper (also used for root CLI flag check).
+            raise_if_flag_conflicts(dep_name, &manifest.flags, &active_map)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -1981,6 +3137,116 @@ fn url_dep(name: &str, git: &str, git_ref: &str) -> UrlDep {
         mirrors: Vec::new(),
         predicates: Vec::new(),
         flag_requests: Vec::new(),
+        optional: false,
+    }
+}
+
+/// Extract the git URL and ref from a git-form override target (S8).
+///
+/// Panics with `todo!()` for `LocalTarget` / `MemberTarget` —
+/// the resolver interception sites for those kinds are wired in S8a / S8b.
+/// This keeps the existing git override path intact while non-git kinds are
+/// unreachable (no conformance fixture exercises them at resolve time yet).
+fn override_git_url_ref(ov: &Override) -> (&str, &str) {
+    match &ov.target {
+        OverrideTarget::Git { url, git_ref } => (url.as_str(), git_ref.as_str()),
+        OverrideTarget::Local { .. } => {
+            todo!(
+                "LocalTarget override for {:?} is not yet wired \
+                 (S8a — resolver interception sites for local= targets)",
+                ov.name
+            )
+        }
+        OverrideTarget::Member { .. } => {
+            todo!(
+                "MemberTarget override for {:?} is not yet wired \
+                 (S8b — resolver interception sites for member targets)",
+                ov.name
+            )
+        }
+    }
+}
+
+/// SSOT inner conflict check: raise `RESOLVE-FLAG-CONFLICT` if any pair conflicts.
+///
+/// Algorithm (normative, RFC §3.1.4):
+///   for each flag f ∈ active_map,
+///   for each g in f.conflicts:
+///       if g ∈ active_map: raise RESOLVE-FLAG-CONFLICT.
+///
+/// Used by both `check_s4c_flag_conflicts` (transitive deps) and the root
+/// CLI-flag conflict check (C1b-completion).  The error payload is byte-identical
+/// regardless of call site.  Mirrors Python's `_raise_if_flag_conflicts`.
+fn raise_if_flag_conflicts(
+    dep_name: &str,
+    flag_decls: &[milpa_manifest::FlagDecl],
+    active_map: &BTreeMap<String, BTreeSet<milpa_types::ActivationSource>>,
+) -> Result<(), MilpaError> {
+    use milpa_types::ActivationSource;
+
+    fn serialize_sources(s: &BTreeSet<ActivationSource>) -> Vec<String> {
+        s.iter()
+            .map(|src| match src {
+                ActivationSource::Default => "default",
+                ActivationSource::EdgeRequest => "edge_request",
+                ActivationSource::EnablesRule => "enables_rule",
+                ActivationSource::Cli => "cli",
+            })
+            .map(String::from)
+            .collect()
+    }
+
+    let flag_by_name: std::collections::BTreeMap<&str, &milpa_manifest::FlagDecl> =
+        flag_decls.iter().map(|fd| (fd.name.as_str(), fd)).collect();
+    let active_flag_names: BTreeSet<&str> =
+        active_map.keys().map(|s| s.as_str()).collect();
+
+    for (flag_name, _sources) in active_map.iter() {
+        let fd = match flag_by_name.get(flag_name.as_str()) {
+            Some(fd) => fd,
+            None => continue,
+        };
+        for conflict_name in &fd.conflicts {
+            if !active_flag_names.contains(conflict_name.as_str()) {
+                continue; // conflict partner not active
+            }
+
+            // Both flags are active — raise RESOLVE-FLAG-CONFLICT.
+            // Canonical ordering: lexicographic on flag names.
+            let (fa, fb) = if flag_name.as_str() <= conflict_name.as_str() {
+                (flag_name.as_str(), conflict_name.as_str())
+            } else {
+                (conflict_name.as_str(), flag_name.as_str())
+            };
+
+            let sources_a = active_map.get(fa).cloned().unwrap_or_default();
+            let sources_b = active_map.get(fb).cloned().unwrap_or_default();
+            let sa = serialize_sources(&sources_a);
+            let sb = serialize_sources(&sources_b);
+
+            return Err(MilpaError::Core(CoreError::FlagConflict {
+                dep: dep_name.to_string(),
+                flag_a: fa.to_string(),
+                flag_b: fb.to_string(),
+                sources_a: sa,
+                sources_b: sb,
+            }));
+        }
+    }
+
+    Ok(())
+}
+
+/// Map an `OverrideTarget` to the `PKey` used for gate pre-seeding (S8).
+///
+/// Centralises the one-to-one mapping so `seed_root` and `seed_workspace`
+/// do not each inline an identical `match` block.  Mirrors Python's
+/// `_provenance_key_for_url_dep` / `_apply_override` dispatch.
+fn override_target_to_pkey(target: &OverrideTarget) -> PKey {
+    match target {
+        OverrideTarget::Git { url, git_ref } => PKey::Url(url.clone(), git_ref.clone()),
+        OverrideTarget::Local { path } => PKey::Local(path.clone()),
+        OverrideTarget::Member { member_name } => PKey::Member(member_name.clone()),
     }
 }
 
@@ -2082,6 +3348,83 @@ fn dep_passes_flag_predicates(dep: &Dep, active: &BTreeSet<&str>) -> bool {
         }
     }
     true
+}
+
+/// Compute the set of active flags for a dep, given its declared flags and the
+/// consumer's flag requests (S3 RFC #23 §3.1.1).
+///
+/// Rules (in order):
+/// 1. `DEFAULT`:      flags with `default=#true` in the dep's `flags` block.
+/// 2. `EDGE_REQUEST`: positive `flag "x"` requests from the consumer's dep
+///    declaration, but ONLY for flags that are declared in the dep's `flags`
+///    block (unknown flag names are silently ignored per §3.1.1
+///    RESOLVE-FLAG-UNKNOWN-ON-TARGET).  Negative requests (`flag "x" #false`)
+///    are absence-of-request — they do NOT remove DEFAULT-activated flags
+///    (§3.1.3 opt-out semantics).
+/// 3. `ENABLES_RULE`: same-package `enables` closure (S2 monotone closure):
+///    for each newly-active flag, if its `enables_same_pkg` list contains flags
+///    not yet active, those are added with `ENABLES_RULE`.
+///
+/// Returns a map `flag_name → BTreeSet<ActivationSource>`.
+/// Mirrors `resolver.py:compute_dep_active_flags` (SSOT pair).
+pub fn compute_dep_active_flags(
+    flags: &[milpa_manifest::FlagDecl],
+    requested: &[FlagRequest],
+) -> BTreeMap<String, BTreeSet<milpa_types::ActivationSource>> {
+    use milpa_types::ActivationSource;
+
+    let mut active: BTreeMap<String, BTreeSet<ActivationSource>> = BTreeMap::new();
+
+    // Rule 1: defaults.
+    for fd in flags {
+        if fd.default {
+            active
+                .entry(fd.name.clone())
+                .or_default()
+                .insert(ActivationSource::Default);
+        }
+    }
+
+    // Build name→FlagDecl for lookup.
+    let flag_by_name: BTreeMap<&str, &milpa_manifest::FlagDecl> =
+        flags.iter().map(|f| (f.name.as_str(), f)).collect();
+
+    // Rule 2: positive edge requests (unknown flags silently ignored).
+    for fr in requested {
+        if !fr.enabled {
+            continue; // negative request = absence-of-request (§3.1.3)
+        }
+        if flag_by_name.contains_key(fr.name.as_str()) {
+            active
+                .entry(fr.name.clone())
+                .or_default()
+                .insert(ActivationSource::EdgeRequest);
+        }
+    }
+
+    // Rule 3: same-package enables closure (S2 monotone, fixed-point).
+    loop {
+        let currently_active: Vec<String> = active.keys().cloned().collect();
+        let mut added = false;
+        for name in &currently_active {
+            if let Some(fd) = flag_by_name.get(name.as_str()) {
+                for enabled_name in &fd.enables_same_pkg {
+                    if !active.contains_key(enabled_name.as_str()) {
+                        active
+                            .entry(enabled_name.clone())
+                            .or_default()
+                            .insert(ActivationSource::EnablesRule);
+                        added = true;
+                    }
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+
+    active
 }
 
 fn res_err(code: &'static str, msg: String) -> MilpaError {
@@ -2425,6 +3768,14 @@ pub fn resolve_with_cert(
         Err(e) => return Err((e, FailureCert { message: String::new(), refutation: Vec::new() })),
     };
     if let Err(e) = provider.process_items(queue) {
+        return Err((e, FailureCert { message: String::new(), refutation: Vec::new() }));
+    }
+    // S4a fixpoint (cert path mirrors the resolve path).
+    if let Err(e) = provider.run_s4a_fixpoint() {
+        return Err((e, FailureCert { message: String::new(), refutation: Vec::new() }));
+    }
+    // S4c post-fixpoint flag-conflict validation (cert path mirrors resolve path).
+    if let Err(e) = provider.check_s4c_flag_conflicts(deps_dir) {
         return Err((e, FailureCert { message: String::new(), refutation: Vec::new() }));
     }
     let canonical_aliases_cert = provider.finalize();

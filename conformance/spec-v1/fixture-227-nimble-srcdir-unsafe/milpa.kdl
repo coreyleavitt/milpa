@@ -1,0 +1,9 @@
+// fixture-227: transitive dep ships a .nimble with an unsafe srcDir (embedded
+// newline). The newline flows nimble→EdgeSet.src_dir→nim.cfg --path: line and
+// would break out of the string, injecting an arbitrary nim.cfg directive.
+// milpa MUST reject this at the edge-source boundary with MAN-SRC-DIR-UNSAFE.
+name "myapp"
+kind "application"
+deps {
+    evil git=(url)"https://github.com/example/evil.git" ref="main"
+}

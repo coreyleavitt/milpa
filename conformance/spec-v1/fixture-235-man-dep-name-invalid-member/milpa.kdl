@@ -1,0 +1,13 @@
+// fixture-235: §3.2 member dep — name charset validation at parse boundary
+//
+// MAN-DEP-NAME-INVALID MUST be raised when a `member` dep's positional-arg
+// name contains characters outside [A-Za-z0-9_-].  The name flows to
+// ResolvedDep.name → nimcfg --path: lines; an embedded newline is an
+// injection vector identical to the R2-C1 dep-name fix.
+//
+// Regression for R6-F3: both Python _parse_member_dep and Rust parse_member_dep
+// returned early before the dep-name charset check, accepting any string.
+name "myapp"
+deps {
+    member "bad\nnewline"
+}

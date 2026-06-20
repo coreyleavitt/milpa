@@ -1,0 +1,17 @@
+// fixture-230: §6.3 when-block — flag-gated LocalDep INCLUDED when flag active
+//
+// A LocalDep inside a `when flag="extras"` block MUST appear in the resolved
+// graph when the `extras` flag is activated via MILPA_CLI_FEATURES.
+//
+// Paired with fixture-229 (excluded): same manifest, different env (flag active).
+// Both fixtures together prove the predicate gates correctly.
+name "myapp"
+kind "application"
+flags {
+    extras default=#false description="enable extra dependencies"
+}
+deps {
+    when flag="extras" {
+        extralib local="./src-tree"
+    }
+}

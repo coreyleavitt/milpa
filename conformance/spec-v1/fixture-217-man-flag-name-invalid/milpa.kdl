@@ -1,0 +1,9 @@
+// fixture-215: flag name in flags{} contains illegal character (newline injection)
+// A KDL quoted node name can embed characters outside [A-Za-z0-9_-].
+// milpa MUST reject this at parse time with MAN-FLAG-NAME-INVALID.
+name "evil"
+flags {
+    "bad name!" {
+        defines "innocent"
+    }
+}

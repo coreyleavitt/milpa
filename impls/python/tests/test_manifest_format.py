@@ -23,9 +23,12 @@ from hypothesis import strategies as st
 from milpa.manifest import (
     FlagDecl,
     FlagRequest,
+    GitTarget,
     LocalDep,
+    LocalTarget,
     Manifest,
     MemberDep,
+    MemberTarget,
     NamedDep,
     Override,
     Predicate,
@@ -276,7 +279,7 @@ class TestUrlAnnotation:
         m = Manifest(
             name="pkg",
             deps=(),
-            overrides=(Override(name="foo", git="https://github.com/alt/foo.git", ref="v2"),),
+            overrides=(Override(name="foo", target=GitTarget(git="https://github.com/alt/foo.git", ref="v2")),),
         )
         out = format_manifest(m)
         assert '(url)"https://github.com/alt/foo.git"' in out
@@ -433,13 +436,32 @@ class TestOverrides:
     """Overrides round-trip correctly with (url) annotation."""
 
     def test_override_round_trip(self) -> None:
-        ov = Override(name="foo", git="https://github.com/alt/foo.git", ref="v2")
+        ov = Override(name="foo", target=GitTarget(git="https://github.com/alt/foo.git", ref="v2"))
         m = Manifest(name="pkg", deps=(), overrides=(ov,))
         reparsed = parse_manifest(format_manifest(m))
         assert len(reparsed.overrides) == 1
         assert reparsed.overrides[0].name == "foo"
-        assert reparsed.overrides[0].git == "https://github.com/alt/foo.git"
-        assert reparsed.overrides[0].ref == "v2"
+        assert isinstance(reparsed.overrides[0].target, GitTarget)
+        assert reparsed.overrides[0].target.git == "https://github.com/alt/foo.git"
+        assert reparsed.overrides[0].target.ref == "v2"
+
+    def test_override_local_round_trip(self) -> None:
+        ov = Override(name="mylib", target=LocalTarget(path="../mylib-fork"))
+        m = Manifest(name="pkg", deps=(), overrides=(ov,))
+        reparsed = parse_manifest(format_manifest(m))
+        assert len(reparsed.overrides) == 1
+        assert reparsed.overrides[0].name == "mylib"
+        assert isinstance(reparsed.overrides[0].target, LocalTarget)
+        assert reparsed.overrides[0].target.path == "../mylib-fork"
+
+    def test_override_member_round_trip(self) -> None:
+        ov = Override(name="shared", target=MemberTarget(member_name="shared"))
+        m = Manifest(name="pkg", deps=(), overrides=(ov,))
+        reparsed = parse_manifest(format_manifest(m))
+        assert len(reparsed.overrides) == 1
+        assert reparsed.overrides[0].name == "shared"
+        assert isinstance(reparsed.overrides[0].target, MemberTarget)
+        assert reparsed.overrides[0].target.member_name == "shared"
 
 
 class TestFlags:
@@ -604,6 +626,134 @@ class TestPredicates:
         assert d.flag_requests[0].name == "ssl"
         assert d.flag_requests[0].enabled is True
 
+    def test_enables_same_pkg_round_trips(self) -> None:
+        """FlagDecl.enables_same_pkg serializes and parses back correctly (S1)."""
+        from milpa.manifest import CrossPkgEnable
+        m = Manifest(
+            name="pkg",
+            deps=(),
+            flags=(
+                FlagDecl(name="tls"),
+                FlagDecl(name="http"),
+                FlagDecl(name="full", enables_same_pkg=("tls", "http")),
+            ),
+        )
+        text = format_manifest(m)
+        assert 'enables "tls" "http"' in text
+        reparsed = parse_manifest(text)
+        full = next(f for f in reparsed.flags if f.name == "full")
+        assert full.enables_same_pkg == ("tls", "http")
+        assert full.enables_cross_pkg == ()
+
+    def test_enables_cross_pkg_round_trips(self) -> None:
+        """FlagDecl.enables_cross_pkg serializes and parses back correctly (S1)."""
+        from milpa.manifest import CrossPkgEnable
+        m = Manifest(
+            name="pkg",
+            deps=(),
+            flags=(
+                FlagDecl(
+                    name="full",
+                    enables_same_pkg=(),
+                    enables_cross_pkg=(
+                        CrossPkgEnable(
+                            dep="chronos",
+                            flag_requests=(FlagRequest(name="tls", enabled=True),),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        text = format_manifest(m)
+        assert "enables" in text
+        assert "chronos" in text
+        reparsed = parse_manifest(text)
+        full = reparsed.flags[0]
+        assert len(full.enables_cross_pkg) == 1
+        cpe = full.enables_cross_pkg[0]
+        assert cpe.dep == "chronos"
+        assert cpe.flag_requests[0].name == "tls"
+
+    def test_enables_mixed_round_trips(self) -> None:
+        """Mixed enables (same-pkg args + cross-pkg children) canonical single-node form."""
+        from milpa.manifest import CrossPkgEnable
+        m = Manifest(
+            name="pkg",
+            deps=(),
+            flags=(
+                FlagDecl(name="tls"),
+                FlagDecl(name="http"),
+                FlagDecl(
+                    name="full",
+                    enables_same_pkg=("tls", "http"),
+                    enables_cross_pkg=(
+                        CrossPkgEnable(
+                            dep="chronos",
+                            flag_requests=(FlagRequest(name="tls", enabled=True),),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        text = format_manifest(m)
+        reparsed = parse_manifest(text)
+        full = next(f for f in reparsed.flags if f.name == "full")
+        assert full.enables_same_pkg == ("tls", "http")
+        assert len(full.enables_cross_pkg) == 1
+        assert full.enables_cross_pkg[0].dep == "chronos"
+
+    def test_conflicts_round_trips(self) -> None:
+        """FlagDecl.conflicts serializes and parses back correctly (S1)."""
+        m = Manifest(
+            name="pkg",
+            deps=(),
+            flags=(
+                FlagDecl(name="openssl", conflicts=("bearssl",)),
+                FlagDecl(name="bearssl"),
+            ),
+        )
+        text = format_manifest(m)
+        assert 'conflicts "bearssl"' in text
+        reparsed = parse_manifest(text)
+        openssl = next(f for f in reparsed.flags if f.name == "openssl")
+        assert openssl.conflicts == ("bearssl",)
+
+    def test_enables_and_defines_together_round_trip(self) -> None:
+        """A flag with both defines and enables serializes with a block for both."""
+        m = Manifest(
+            name="pkg",
+            deps=(),
+            flags=(
+                FlagDecl(name="tls"),
+                FlagDecl(
+                    name="full",
+                    defines=("fullEnabled",),
+                    enables_same_pkg=("tls",),
+                ),
+            ),
+        )
+        text = format_manifest(m)
+        reparsed = parse_manifest(text)
+        full = next(f for f in reparsed.flags if f.name == "full")
+        assert full.defines == ("fullEnabled",)
+        assert full.enables_same_pkg == ("tls",)
+
+    def test_corpus_185_enables_accept_round_trip(self) -> None:
+        """Corpus fixture 185: parse → format → parse gives the same enables/conflicts."""
+        import pathlib
+        conformance = pathlib.Path(__file__).parent.parent.parent.parent / "conformance"
+        text = (conformance / "spec-v1/fixture-185-man-flag-enables-accept/milpa.kdl").read_text()
+        m = parse_manifest(text)
+        full = next(f for f in m.flags if f.name == "full")
+        assert full.enables_same_pkg == ("tls", "http")
+        assert len(full.enables_cross_pkg) == 1
+        assert full.enables_cross_pkg[0].dep == "chronos"
+        # Format and re-parse — should be identical
+        m2 = parse_manifest(format_manifest(m))
+        full2 = next(f for f in m2.flags if f.name == "full")
+        assert full2.enables_same_pkg == full.enables_same_pkg
+        assert full2.enables_cross_pkg == full.enables_cross_pkg
+
 
 class TestCommentDropWarning:
     """§8: stderr warning emitted when had_comments=True."""
@@ -739,3 +889,250 @@ def test_format_manifest_round_trips(
             assert orig.strip_components == got.strip_components
         elif isinstance(orig, MemberDep):
             assert isinstance(got, MemberDep)
+
+
+# ---------------------------------------------------------------------------
+# Conditional-dep round-trip tests (§8 / #163)
+# Predicates must survive format → parse for ALL 5 dep forms.
+# ---------------------------------------------------------------------------
+
+
+class TestConditionalDepRoundTrip:
+    """§8 / #163: when-block predicates survive format → parse for all dep forms."""
+
+    def test_named_dep_with_platform_predicate_round_trips(self) -> None:
+        dep = NamedDep(
+            name="mylib",
+            constraint=None,
+            predicates=(Predicate(name="platform", values=("linux",), negated=False),),
+        )
+        m = Manifest(name="pkg", deps=(dep,))
+        reparsed = parse_manifest(format_manifest(m))
+        d = reparsed.deps[0]
+        assert isinstance(d, NamedDep)
+        assert d.name == "mylib"
+        assert len(d.predicates) == 1
+        assert d.predicates[0].name == "platform"
+        assert d.predicates[0].values == ("linux",)
+        assert d.predicates[0].negated is False
+
+    def test_local_dep_with_platform_predicate_round_trips(self) -> None:
+        dep = LocalDep(
+            name="locallib",
+            path="../locallib",
+            predicates=(Predicate(name="platform", values=("macosx",), negated=False),),
+        )
+        m = Manifest(name="pkg", deps=(dep,))
+        reparsed = parse_manifest(format_manifest(m))
+        d = reparsed.deps[0]
+        assert isinstance(d, LocalDep)
+        assert d.path == "../locallib"
+        assert len(d.predicates) == 1
+        assert d.predicates[0].name == "platform"
+        assert d.predicates[0].values == ("macosx",)
+
+    def test_tarball_dep_with_platform_predicate_round_trips(self) -> None:
+        dep = TarballDep(
+            name="tarlib",
+            url="https://example.com/tarlib.tar.gz",
+            predicates=(Predicate(name="platform", values=("linux",), negated=False),),
+        )
+        m = Manifest(name="pkg", deps=(dep,))
+        reparsed = parse_manifest(format_manifest(m))
+        d = reparsed.deps[0]
+        assert isinstance(d, TarballDep)
+        assert d.url == "https://example.com/tarlib.tar.gz"
+        assert len(d.predicates) == 1
+        assert d.predicates[0].name == "platform"
+        assert d.predicates[0].values == ("linux",)
+
+    def test_member_dep_with_platform_predicate_round_trips(self) -> None:
+        dep = MemberDep(
+            name="submember",
+            predicates=(Predicate(name="platform", values=("linux",), negated=False),),
+        )
+        m = Manifest(name="pkg", deps=(dep,))
+        reparsed = parse_manifest(format_manifest(m))
+        d = reparsed.deps[0]
+        assert isinstance(d, MemberDep)
+        assert d.name == "submember"
+        assert len(d.predicates) == 1
+        assert d.predicates[0].name == "platform"
+        assert d.predicates[0].values == ("linux",)
+
+    def test_negated_predicate_survives_round_trip_local_dep(self) -> None:
+        dep = LocalDep(
+            name="nonwin",
+            path="./nonwin",
+            predicates=(Predicate(name="platform", values=("windows",), negated=True),),
+        )
+        m = Manifest(name="pkg", deps=(dep,))
+        reparsed = parse_manifest(format_manifest(m))
+        d = reparsed.deps[0]
+        assert isinstance(d, LocalDep)
+        assert len(d.predicates) == 1
+        assert d.predicates[0].negated is True
+        assert d.predicates[0].values == ("windows",)
+
+    def test_multi_predicate_named_dep_round_trips(self) -> None:
+        """Multiple predicates (flag + platform) survive round-trip for NamedDep."""
+        dep = NamedDep(
+            name="condlib",
+            constraint=">= 1.0.0",
+            predicates=(
+                Predicate(name="platform", values=("linux",), negated=False),
+                Predicate(name="flag", values=("extras",), negated=False),
+            ),
+        )
+        m = Manifest(
+            name="pkg",
+            deps=(dep,),
+            flags=(FlagDecl(name="extras", default=False),),
+        )
+        reparsed = parse_manifest(format_manifest(m))
+        d = reparsed.deps[0]
+        assert isinstance(d, NamedDep)
+        assert d.constraint == ">= 1.0.0"
+        assert len(d.predicates) == 2
+        pred_map = {p.name: p for p in d.predicates}
+        assert pred_map["platform"].values == ("linux",)
+        assert pred_map["flag"].values == ("extras",)
+
+    def test_url_dep_predicates_unchanged(self) -> None:
+        """UrlDep predicates continue to be emitted inline (not in when block)."""
+        dep = UrlDep(
+            name="gitdep",
+            git="https://github.com/foo/bar.git",
+            ref="main",
+            predicates=(Predicate(name="platform", values=("linux",), negated=False),),
+        )
+        m = Manifest(name="pkg", deps=(dep,))
+        out = format_manifest(m)
+        # Inline form: platform="linux" on the dep node directly, NOT in a when block
+        assert 'platform="linux"' in out
+        assert "when" not in out
+        reparsed = parse_manifest(out)
+        d = reparsed.deps[0]
+        assert isinstance(d, UrlDep)
+        assert len(d.predicates) == 1
+        assert d.predicates[0].name == "platform"
+
+    def test_named_dep_flag_requests_with_predicates_round_trips(self) -> None:
+        """NamedDep with both flag_requests and when-predicates survives round-trip."""
+        dep = NamedDep(
+            name="platformlib",
+            constraint=None,
+            flag_requests=(FlagRequest(name="ssl", enabled=True),),
+            predicates=(Predicate(name="platform", values=("linux",), negated=False),),
+        )
+        m = Manifest(
+            name="pkg",
+            deps=(dep,),
+            flags=(FlagDecl(name="ssl", default=False),),
+        )
+        reparsed = parse_manifest(format_manifest(m))
+        d = reparsed.deps[0]
+        assert isinstance(d, NamedDep)
+        assert len(d.flag_requests) == 1
+        assert d.flag_requests[0].name == "ssl"
+        assert len(d.predicates) == 1
+        assert d.predicates[0].name == "platform"
+
+    def test_predicate_survives_parse_format_parse_cycle(self) -> None:
+        """parse(format(parse(src))) == parse(src) — full cycle for conditional NamedDep."""
+        src = (
+            'name "mypkg"\n'
+            "deps {\n"
+            '    when platform="linux" {\n'
+            '        "linux-only" ">= 1.0.0"\n'
+            "    }\n"
+            "}\n"
+            'kind "library"\n'
+        )
+        m1 = parse_manifest(src)
+        m2 = parse_manifest(format_manifest(m1))
+        assert m2.name == m1.name
+        assert len(m2.deps) == len(m1.deps)
+        d1 = m1.deps[0]
+        d2 = m2.deps[0]
+        assert type(d1) is type(d2)
+        assert d1.name == d2.name
+        assert d1.predicates == d2.predicates  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# Hypothesis property test: predicates survive round-trip for all dep forms
+# ---------------------------------------------------------------------------
+
+_PRED_NAME = st.sampled_from(["platform", "arch", "nim", "milpa"])
+_PRED_VALUE = st.text(alphabet=_SAFE_CHARS, min_size=1, max_size=12)
+
+
+@st.composite
+def _predicate_strategy(draw: st.DrawFn) -> Predicate:
+    name = draw(_PRED_NAME)
+    value = draw(_PRED_VALUE)
+    negated = draw(st.booleans())
+    return Predicate(name=name, values=(value,), negated=negated)
+
+
+@st.composite
+def _conditional_dep(draw: st.DrawFn) -> "LocalDep | TarballDep | MemberDep":
+    """Generate one of LocalDep/TarballDep/MemberDep with 1..3 unique-name predicates.
+
+    Predicates must have unique names: KDL §5.5 last-wins means duplicate
+    property keys on a `when` node would be deduplicated at parse time, so the
+    round-trip cannot preserve inputs with duplicate predicate names.
+    """
+    # Draw unique predicate names (no repeats — KDL deduplicates same-named props).
+    n_preds = draw(st.integers(min_value=1, max_value=3))
+    available_names = ["platform", "arch", "nim", "milpa"]
+    pred_names = draw(
+        st.lists(
+            st.sampled_from(available_names),
+            min_size=n_preds,
+            max_size=n_preds,
+            unique=True,
+        )
+    )
+    preds = tuple(
+        Predicate(
+            name=pname,
+            values=(draw(_PRED_VALUE),),
+            negated=draw(st.booleans()),
+        )
+        for pname in pred_names
+    )
+    name = draw(_DEP_NAME)
+    form = draw(st.integers(min_value=0, max_value=2))
+    if form == 0:
+        return LocalDep(name=name, path=draw(_PATH_ALPHA), predicates=preds)
+    elif form == 1:
+        return TarballDep(
+            name=name,
+            url=draw(_TARBALL_URL),
+            predicates=preds,
+        )
+    else:
+        return MemberDep(name=name, predicates=preds)
+
+
+@given(dep=_conditional_dep())
+@settings(max_examples=150)
+def test_conditional_dep_predicates_survive_round_trip(
+    dep: "LocalDep | TarballDep | MemberDep",
+) -> None:
+    """parse(format(parse(src))) == parse(src): predicates survive for non-URL dep forms.
+
+    This is the core #163 regression property: a conditional LocalDep/TarballDep/
+    MemberDep must have its predicates preserved through a format → parse cycle.
+    """
+    m = Manifest(name="mypkg", deps=(dep,))
+    out = format_manifest(m)
+    reparsed = parse_manifest(out)
+    assert len(reparsed.deps) == 1
+    got = reparsed.deps[0]
+    assert type(got) is type(dep)
+    assert got.name == dep.name
+    # The key assertion: predicates must be identical after format → parse.
+    assert got.predicates == dep.predicates  # type: ignore[union-attr]

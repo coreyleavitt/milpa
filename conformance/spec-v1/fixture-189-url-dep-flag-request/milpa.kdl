@@ -1,0 +1,17 @@
+// fixture-189: S3 — cross-package flag-request activation, single-hop (RFC #23 §7 S3)
+//
+// Root depends on lib-b with flag "tls" requested.
+// lib-b declares tls (default=#false) gating lib-c, and lib-d unconditionally.
+// Because the root requests flag "tls" on lib-b, lib-c is admitted.
+//
+// Single-hop only: lib-c's own flag_requests (if any) do NOT propagate further.
+// Multi-hop arrives in S4a.
+//
+// Observable without S5 lockfile active_flags: lib-c appears in requires/graph.
+name "myapp"
+kind "application"
+deps {
+    lib-b git=(url)"https://example.com/lib-b.git" ref="main" {
+        flag "tls"
+    }
+}

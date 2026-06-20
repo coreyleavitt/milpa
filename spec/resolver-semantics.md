@@ -471,8 +471,12 @@ error `MAN-PREDICATE-MIXED-NEGATION`) is defined in
 > to a profile with unset fields), predicate filtering is **disabled**: every
 > dep is included regardless of its predicates, exactly as if no predicates were
 > declared. An absent profile is not the same as a profile that matches nothing.
-> (The conformance runner passes an absent profile when a fixture has no `env`
-> file — see `conformance-fixtures.md` §2.8.)
+> (The conformance runner passes an absent profile when **no `MILPA_TARGET_*`
+> axis is set** — independent of whether an `env` file exists for other keys
+> such as `MILPA_CLI_FEATURES`. The runner builds a Profile only from explicit
+> `MILPA_TARGET_{PLATFORM,ARCH,NIM,MILPA}` values; host-defaulting is a
+> CLI-only behavior (cli-contract §8) not exercised by the host-independent
+> corpus. See `conformance-fixtures.md` §2.8.)
 
 > NORMATIVE: Evaluation order within a single dep's predicate list is
 > conjunction: ALL predicates on a dep must match. Evaluation across

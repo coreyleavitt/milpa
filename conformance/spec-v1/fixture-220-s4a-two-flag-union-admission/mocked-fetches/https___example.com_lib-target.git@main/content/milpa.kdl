@@ -1,0 +1,13 @@
+name "lib-target"
+kind "library"
+flags {
+    flag-x default=#false
+    flag-y default=#false
+}
+deps {
+    when flag="flag-x" {
+        when flag="flag-y" {
+            lib-end git=(url)"https://example.com/lib-end.git" ref="main"
+        }
+    }
+}

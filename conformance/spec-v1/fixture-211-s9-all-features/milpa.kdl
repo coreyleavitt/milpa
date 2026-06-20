@@ -1,0 +1,21 @@
+// fixture-211: S9 — --all-features activates all root flags (RFC #23 §3.4)
+//
+// The manifest declares two flags both default=#false: `tls` and `debug`.
+// Two deps are gated behind those flags respectively.
+//
+// Without --all-features, both deps are pruned (both flags default off).
+// With MILPA_ALL_FEATURES=1, both flags are activated and both deps are admitted.
+name "myapp"
+kind "application"
+flags {
+    tls default=#false description="enable TLS support"
+    debug default=#false description="enable debug mode"
+}
+deps {
+    when flag="tls" {
+        tlslib git=(url)"https://example.com/tlslib.git" ref="main"
+    }
+    when flag="debug" {
+        debuglib git=(url)"https://example.com/debuglib.git" ref="main"
+    }
+}

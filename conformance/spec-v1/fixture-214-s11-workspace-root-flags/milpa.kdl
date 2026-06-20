@@ -1,0 +1,26 @@
+// fixture-214: S11 — workspace-root flags {} (RFC #23 §3.8)
+//
+// A workspace-root `flags {}` block with a default-true flag `global-net`
+// that cross-pkg-enables `tls` on the shared named dep `netlib`.
+//
+// Both members `alpha` and `beta` depend on `netlib >= 1.0.0` (no per-member
+// flag_requests). The workspace root's `global-net` flag (default=#true) seeds
+// `tls` onto `netlib` workspace-wide via its `enables` block.
+//
+// `netlib` declares `tls default=#false` with `defines "USE_TLS"`.
+// With workspace-root seeding: active(netlib) = {tls} → lockfile records
+// `active_flags "tls"`, and both member nim.cfgs emit `-d:USE_TLS`.
+//
+// Without workspace-root seeding: no member requests `tls` on netlib, so
+// tls is never activated, -d:USE_TLS is never emitted.
+workspace {
+    member "alpha"
+    member "beta"
+}
+flags {
+    global-net default=#true {
+        enables {
+            netlib { flag "tls" }
+        }
+    }
+}

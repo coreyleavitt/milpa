@@ -142,7 +142,16 @@ _CONTEXT_SLUG: dict[str, str] = {
     "dep_decl": TNG_DEPDECL_PARSE_ERROR,
 }
 
-_PARSE_CONFIG = _kdl.ParseConfig(nativeTaggedValues=False)
+_PARSE_CONFIG = _kdl.ParseConfig(
+    nativeTaggedValues=False,
+    # Keep numeric values as kdl.Decimal (not native Python float) so that the
+    # integer-vs-float KDL literal distinction is preserved at the type level.
+    # Without this, both `1` and `1.0` arrive as Python float(1.0), making
+    # strict integer-literal fields (spec-version, strip_components) unable to
+    # reject float literals.  `_kdl_val_to_milpa` converts Decimal to int or
+    # float based on the mantissa type, preserving the distinction downstream.
+    nativeUntaggedValues=False,
+)
 
 
 def _check_nesting_depth(text: str, slug: str) -> None:
@@ -373,8 +382,18 @@ def value_as_str(v: KdlValue) -> str | None:
 def value_as_int(v: KdlValue) -> int | None:
     """Return *v* as ``int``, or ``None`` if it is not a numeric integer.
 
-    kdl-py returns all KDL numeric literals as ``float``.  This function
-    converts whole-number floats to ``int`` (e.g. ``42.0 → 42``).
+    With ``nativeUntaggedValues=False``, ``_kdl_val_to_milpa`` now returns
+    Python ``int`` for KDL integer literals and ``float`` for KDL float literals.
+    Both paths are handled:
+
+    * ``int`` (from integer literal ``1``, ``42``) → returned as-is.
+    * ``float`` with no fractional part (e.g. ``1.0``) → coerced to ``int``.
+      The float path is kept for callers that legitimately accept whole floats
+      (e.g. dep_decl schema-version, lockfile version) and for belt-and-suspenders
+      compatibility with any remaining float paths.
+
+    Callers that must REJECT float literals (``spec-version``, ``strip_components``)
+    use ``value_as_strict_int`` instead.
     """
     if isinstance(v, bool):  # bool is a subclass of int — must check first
         return None
@@ -382,6 +401,26 @@ def value_as_int(v: KdlValue) -> int | None:
         return v
     if isinstance(v, float) and v == int(v):
         return int(v)
+    return None
+
+
+def value_as_strict_int(v: KdlValue) -> int | None:
+    """Return *v* as ``int`` iff it arrived as a KDL **integer literal**, else ``None``.
+
+    Unlike ``value_as_int``, this function does NOT coerce float values — a KDL
+    float literal like ``1.0`` (Python ``float``) returns ``None`` even when its
+    value is a whole number.  Use this for fields that must be integer-typed per
+    the spec (e.g. ``spec-version``, ``strip_components``).
+
+    Requires ``_PARSE_CONFIG`` to use ``nativeUntaggedValues=False`` so that
+    ``_kdl_val_to_milpa`` returns ``int`` for integer literals and ``float`` for
+    float literals — otherwise both literals arrive as ``float`` and cannot be
+    distinguished.
+    """
+    if isinstance(v, bool):  # bool is a subclass of int — must check first
+        return None
+    if isinstance(v, int):
+        return v
     return None
 
 
@@ -436,16 +475,44 @@ def has_kdl_comments(text: str) -> bool:
 def _kdl_val_to_milpa(val: object) -> KdlValue:
     """Convert a raw kdl-py entry value to a ``KdlValue``.
 
-    With ``nativeTaggedValues=False``, tagged scalars arrive as
-    ``kdl.types.String`` (etc.) with ``.tag`` and ``.value``.  Untagged
-    scalars arrive as Python builtins (``str``, ``float``, ``bool``, ``None``).
+    With ``nativeTaggedValues=False`` and ``nativeUntaggedValues=False``, ALL
+    scalars arrive as typed kdl-py objects:
+
+    * ``kdl.String``  — string literals (tagged or untagged); ``.tag`` carries
+                         the annotation (``"url"``), ``.value`` the string.
+    * ``kdl.Decimal`` — numeric literals (integer OR float); ``.mantissa`` is
+                         Python ``int`` for integer literals (``1``, ``42``) and
+                         Python ``float`` for float literals (``1.0``, ``3.14``).
+    * ``kdl.Bool``    — ``#true`` / ``#false``; ``.value`` is Python ``bool``.
+    * ``kdl.Null``    — ``#null``; ``.value`` is Python ``None``.
+
+    The integer-vs-float distinction is deliberately preserved: ``_kdl_val_to_milpa``
+    returns ``int`` for integer literals and ``float`` for float literals.
+    Callers that must reject float literals in integer-typed fields (e.g.
+    ``spec-version``, ``strip_components``) use ``value_as_strict_int`` instead
+    of ``value_as_int``.
 
     Tagged strings (including ``(url)``-annotated ones) are stripped to their
-    raw string value here — the tag information is only preserved via the
-    ``_kdl_entry_as_url`` path used by ``node_*_url`` and ``value_as_url``.
+    raw string value here — the tag is only preserved via the ``_kdl_entry_as_url``
+    path used by ``node_*_url`` and ``value_as_url``.
     """
+    # Numeric literal: Decimal.mantissa is int for `1` / `42`, float for `1.0`.
+    if isinstance(val, _kdl.Decimal):
+        m = val.mantissa
+        if isinstance(m, int):
+            return int(m)
+        return float(m)
+    # String (tagged or untagged).
     if isinstance(val, _kdl.types.String):
         return val.value
+    # Boolean (#true / #false) — kdl.Bool has a .value Python bool.
+    if isinstance(val, _kdl.Bool):
+        return bool(val.value)
+    # Null (#null).
+    if isinstance(val, _kdl.Null):
+        return None
+    # Native Python types (kept for belt-and-suspenders in case kdl-py's
+    # nativeUntaggedValues behaviour changes in a future release).
     if isinstance(val, bool):
         return val
     if isinstance(val, (int, float)):

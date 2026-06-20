@@ -1,0 +1,14 @@
+// fixture-188: S2.5 — transitive flag-predicate filtering (RFC #23 §2.6)
+//
+// Root depends on lib-a, which declares two flags in its own milpa.kdl:
+//   - tls  (default=#false) gates lib-b  → lib-b must be ABSENT from resolved graph
+//   - http (default=#true)  gates lib-c  → lib-c must be PRESENT in resolved graph
+//   - lib-d is unconditional              → lib-d must be PRESENT
+//
+// This pins the cross-impl divergence closed: Python _manifest_to_edgeset and
+// Rust build_edgeset_from_manifest must produce byte-identical requires arrays.
+name "myapp"
+kind "application"
+deps {
+    lib-a git=(url)"https://example.com/lib-a.git" ref="main"
+}

@@ -1,0 +1,9 @@
+// fixture-219: M5 — a flag that lists itself in its own conflicts list.
+// A flag cannot conflict with itself; this is a manifest authoring error.
+// Both impls must reject this at parse time with MAN-FLAG-CONFLICTS-SELF.
+name "evil"
+flags {
+    f1 {
+        conflicts "f1"
+    }
+}

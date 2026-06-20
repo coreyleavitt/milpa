@@ -1,0 +1,7 @@
+name "lib-a"
+kind "library"
+deps {
+    lib-shared git=(url)"https://example.com/lib-shared.git" ref="main" {
+        flag "feat-x" #false
+    }
+}

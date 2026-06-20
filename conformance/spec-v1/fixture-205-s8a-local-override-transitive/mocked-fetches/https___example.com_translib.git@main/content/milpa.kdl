@@ -1,0 +1,6 @@
+name "translib"
+kind "library"
+src_dir "src"
+deps {
+    mylib git=(url)"https://upstream.example.com/mylib.git" ref="main"
+}

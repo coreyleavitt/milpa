@@ -145,6 +145,7 @@ pub fn manifest_from_nimble(nm: &NimbleManifest, name: &str) -> Manifest {
                     mirrors: Vec::new(),
                     predicates: Vec::new(),
                     flag_requests: Vec::new(),
+                    optional: false,
                 }));
             }
             NimbleRequirement::Named {
@@ -162,6 +163,9 @@ pub fn manifest_from_nimble(nm: &NimbleManifest, name: &str) -> Manifest {
                     name: dep_name.clone(),
                     constraint: constraint.clone(),
                     parsed_constraint: None,
+                    flag_requests: Vec::new(),
+                    optional: false,
+                    predicates: Vec::new(),
                 }));
             }
         }
@@ -179,6 +183,7 @@ pub fn manifest_from_nimble(nm: &NimbleManifest, name: &str) -> Manifest {
         spec_version: 1,
         spec_version_explicit: false,
         attestation_policy: milpa_manifest::AttestationPolicy::Permissive,
+        optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }
 

@@ -1,0 +1,21 @@
+// fixture-197: S6 — nim.cfg -d: defines emission (RFC #23 §3.6)
+//
+// Covers BOTH normative cases for -d: emission:
+//
+// 1. EXPLICIT defines: lib-ssl has a default-true flag "tls" with
+//    defines "ssl" "useOpenSSL" → nim.cfg emits -d:ssl and -d:useOpenSSL.
+//
+// 2. CHILDLESS convention: lib-childless has a default-true flag "http"
+//    with NO defines → nim.cfg emits -d:lib-childless_http (§3.6 convention).
+//
+// The -d: block is separated from the --path: block by a blank line.
+// Symbols are lexicographically ordered: lib-childless_http, ssl, useOpenSSL.
+//
+// Active flags: tls active on lib-ssl (default=#true), http active on
+// lib-childless (default=#true). Lockfile records active_flags accordingly.
+name "myapp"
+kind "application"
+deps {
+    lib-ssl git=(url)"https://example.com/lib-ssl.git" ref="main"
+    lib-childless git=(url)"https://example.com/lib-childless.git" ref="main"
+}

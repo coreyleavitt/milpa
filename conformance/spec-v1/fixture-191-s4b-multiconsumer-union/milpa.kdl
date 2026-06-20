@@ -1,0 +1,26 @@
+// fixture-191: S4b — multi-consumer union via direct flag_requests (RFC #23 §7 S4b)
+//
+// Two separate parents each request a DIFFERENT flag on the same shared dep.
+// The shared dep is resolved ONCE with the UNION of all requested flags.
+//
+// Scenario:
+//   Root → lib-a (unconditional) → lib-shared { flag "feat-x" }
+//   Root → lib-b (unconditional) → lib-shared { flag "feat-y" }
+//
+//   lib-shared declares:
+//     feat-x (default=#false) gates lib-e
+//     feat-y (default=#false) gates lib-f
+//
+// With union semantics (S4b):
+//   active(lib-shared) = {feat-x, feat-y} → lib-e AND lib-f both admitted.
+//
+// Without union (first-consumer-wins bug):
+//   only one of feat-x or feat-y active → only lib-e OR lib-f admitted.
+//
+// Expected resolved graph: lib-a + lib-b + lib-shared + lib-e + lib-f.
+name "myapp"
+kind "application"
+deps {
+    lib-a git=(url)"https://example.com/lib-a.git" ref="main"
+    lib-b git=(url)"https://example.com/lib-b.git" ref="main"
+}

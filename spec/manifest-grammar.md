@@ -56,7 +56,7 @@ A conformant implementation of this spec MUST:
     context rule: root's dev-deps ARE resolved; a transitive dep's dev-deps
     MUST NOT enter the graph. Cross-reference resolver-semantics.md §9.
 15. Honor `MILPA_TARGET_MILPA` as an override for the `milpa` predicate field
-    (§6.6); default to the implementation's own version (`milpa.__version__`).
+    (§6.7); default to the implementation's own version (`milpa.__version__`).
 16. When serializing the manifest (§8): emit valid KDL 2.0; warn to stderr
     when comments are dropped; preserve dep-entry insertion order; emit
     `(url)` annotations on all URL fields.
@@ -136,6 +136,13 @@ uses the `(url)` annotation to mark URL strings.
 > NORMATIVE: The `src_dir` node MUST carry exactly one positional string
 > argument (a relative or absolute path). Wrong arity or non-string arg raises
 > `MAN-SRC-DIR-TYPE`. When absent, `src_dir` defaults to the empty string.
+>
+> NORMATIVE (R2-C2 + R2-Unicode security): **src_dir value safety.** The
+> `src_dir` string MUST NOT contain ASCII control characters (codepoints
+> 0x00–0x1F or 0x7F) or Unicode line separators (U+2028 or U+2029). These
+> characters would inject extra lines into nim.cfg `--path:` directives when
+> the value is incorporated verbatim. A parser MUST validate the value at parse
+> time and raise `MAN-SRC-DIR-UNSAFE` if any forbidden character is present.
 
 #### `attestation-policy` field
 
@@ -175,6 +182,17 @@ uses the `(url)` annotation to mark URL strings.
 > NORMATIVE: The `deps` block contains zero or more dep declarations.
 > Dep names MUST be unique within the manifest; duplicates raise
 > `MAN-DEP-DUPLICATE`.
+>
+> NORMATIVE (R2-C1 security): **Dep name charset.** Every dep node name (the
+> KDL node identifier, which becomes the dep's canonical name) MUST match
+> `[A-Za-z0-9_-]+`. The `member` node is exempt (it is a keyword, not a dep
+> name). KDL 2.0 quoted identifiers can contain characters outside this set;
+> a parser MUST validate every dep name at parse time and raise
+> `MAN-DEP-NAME-INVALID` if the name contains any disallowed character. Dep
+> names flow to nim.cfg `--path:` lines and feature-flag defines
+> (`-d:<pkg>_<flag>`); an injection character in the name would produce
+> extra nim.cfg lines. Alias names (derived from dep names by the optional
+> desugar pass) inherit this protection automatically.
 
 > NORMATIVE: Dep disambiguation uses the following ordered rules on the dep's
 > child KDL node:
@@ -324,18 +342,42 @@ Grammar: `member "<name>"`
 
 ### 3.4  The `overrides` block
 
-> NORMATIVE: The `overrides` block contains zero or more override rules.
-> Each child MUST be named `pkg`. In `pkg "<name>" git=(url)"<URL>" ref="<ref>"`:
-> the positional arg is the match name; `git=` and `ref=` are both required.
-> Unknown override kind raises `MAN-OVERRIDE-KIND`; wrong arity raises
-> `MAN-OVERRIDE-ARITY`; missing `git=` raises `MAN-OVERRIDE-GIT-MISSING`;
-> missing `ref=` raises `MAN-OVERRIDE-REF-MISSING`; duplicates raise
-> `MAN-OVERRIDE-DUPLICATE`; unknown properties raise `MAN-OVERRIDE-UNKNOWN-PROPS`.
+> NORMATIVE (S8 — RFC #23 §3.3): The `overrides` block contains zero or more
+> override rules. Each child MUST be named `pkg`. The positional argument is the
+> match name. Each `pkg` rule MUST carry **exactly one** provenance target form
+> from the following three:
+>
+> - **Git form:** `pkg "<name>" git=(url)"<URL>" ref="<ref>"` — redirect to a git
+>   fork. `git=` (URL-annotated string) and `ref=` (string) are both required.
+>   Missing `ref=` raises `MAN-OVERRIDE-REF-MISSING`.
+> - **Local form:** `pkg "<name>" local="<relative-path>"` — redirect to a local
+>   filesystem path (non-reproducible; see §3.3 carve-out in RFC #23).
+> - **Member form:** `pkg "<name>" { member "<member-name>" }` — redirect to a
+>   workspace member. The `member` child takes exactly one positional string
+>   argument (the member name).
+>
+> Zero target forms, or more than one form simultaneously (e.g. both `local=` and
+> `git=`), raise `MAN-OVERRIDE-TARGET-AMBIGUOUS`.
+>
+> Other error codes: unknown override kind → `MAN-OVERRIDE-KIND`; wrong arity →
+> `MAN-OVERRIDE-ARITY`; duplicate name → `MAN-OVERRIDE-DUPLICATE`; unknown property
+> → `MAN-OVERRIDE-UNKNOWN-PROPS` (known properties: `git`, `ref`, `local`).
+>
+> ```kdl
+> overrides {
+>     pkg "chronos" git=(url)"https://github.com/example/chronos.git" ref="patched"
+>     pkg "results" local="../results-fork"
+>     pkg "stew" {
+>         member "stew"
+>     }
+> }
+> ```
 
 > NORMATIVE: An override applies project-wide (manifest-direct deps, transitive
 > URL deps, and named deps with the matching name). It does NOT propagate to
 > downstream consumers of this project. Overrides change provenance; identity
-> follows the override's actual content hash.
+> follows the target kind's rules (git: identity-bearing + CAS-admissible; local:
+> liveness-only; member: identity-bearing, not CAS-admissible).
 
 ### 3.5  The `flags` block
 
@@ -346,10 +388,98 @@ Grammar: `member "<name>"`
 > arguments are allowed (`MAN-FLAG-POS-ARGS`). Unknown properties raise
 > `MAN-FLAG-UNKNOWN-PROPS`; duplicate flag names raise `MAN-FLAG-DUPLICATE`.
 
+> NORMATIVE (H1 security): **Flag name charset.** Every flag name declared in
+> the `flags {}` block MUST match `[A-Za-z0-9_-]+`. KDL 2.0 quoted node names
+> can contain characters outside that set (spaces, `!`, control characters, etc.).
+> A parser MUST validate every declared flag name against this charset and raise
+> `MAN-FLAG-NAME-INVALID` for any name that fails. This is a parse-boundary check;
+> the data model MUST NOT admit a flag with an illegal name.
+
 > NORMATIVE: A flag MAY carry a single child node named `defines` with one or
 > more positional string arguments (the `-d:` Nim compiler flags to pass when
 > the flag is active). Unknown child names raise `MAN-FLAG-UNKNOWN-CHILD`; non-
 > string `defines` args raise `MAN-FLAG-DEFINES-ARG-TYPE`.
+
+> NORMATIVE (H1 + R2-Unicode security): **Defines value safety.** Every string
+> argument to a `defines` node MUST NOT contain any ASCII control character
+> (codepoints 0x00–0x1F and 0x7F), in particular `\n` (0x0A) and `\r` (0x0D),
+> NOR the Unicode line separators U+2028 (LINE SEPARATOR) or U+2029 (PARAGRAPH
+> SEPARATOR). KDL 2.0 string escapes allow `\n` and `\u{2028}` inside
+> double-quoted strings; a manifest from a malicious transitive dep can exploit
+> this to inject arbitrary `nim.cfg` lines (e.g. `--passC:…`, `--passL:…`)
+> leading to code execution at the next `nim c` invocation. A parser MUST reject
+> any `defines` string containing any of these characters with
+> `MAN-FLAG-DEFINES-UNSAFE`. This is a parse-boundary check; the emission layer
+> (nimcfg.py / nimcfg.rs) MUST NOT receive defines values that contain these
+> characters.
+
+> NORMATIVE (S1 — RFC #23 §3.1.1): **Name charset (cross-reference).** Flag names and dep names
+> that participate in `enables`, optional-dep desugaring, or `when flag=`
+> predicates MUST match `[A-Za-z0-9_-]+` (the KDL bare-identifier charset already
+> used for dep names). The `MAN-FLAG-NAME-INVALID` check (above) supersedes the
+> narrower S1 requirement for the `flags {}` block.
+
+> NORMATIVE (S1 — RFC #23 §3.1.1): A flag MAY carry one or more `enables` child
+> nodes. Each `enables` node may carry:
+>
+> - **Bare string positional arguments** — same-package flag names activated when
+>   this flag is active.
+> - **Child nodes** — cross-package activation: each child's KDL node-name is a
+>   dep name; that dep's children are `flag "<name>" [#false]` requests,
+>   structurally identical to the §3.6 consumer flag request form.
+>
+> A single `enables` node may carry both args and children. Multiple `enables`
+> nodes union together. The canonical serialization form is a single `enables`
+> node with all same-package names as positional args and all cross-package deps
+> as children.
+>
+> ```kdl
+> flags {
+>     tls  default=#false
+>     http default=#false
+>     full default=#false {
+>         enables "tls" "http" {          // same-package flags = bare string args
+>             chronos { flag "tls" }      // cross-package = child node
+>         }
+>     }
+> }
+> ```
+>
+> **Validation (post-parse, normative).** After the full `flags` table is built,
+> each bare same-package name in any `enables` MUST match a declared flag in the
+> same manifest. Forward references (flag declared later in the block) are **legal**
+> because validation is post-parse. An unmatched bare name raises
+> `MAN-FLAG-ENABLES-UNDECLARED`. When the unmatched name is also a non-optional dep
+> name in the same manifest, the diagnostic MUST add:
+> `"<name>" is a dependency, not a flag — add optional=#true to make it a feature.`
+>
+> Cross-package `enables` children (dep-name node-names) are **not** validated at
+> parse time — the dep may be conditionally absent; validation is resolve-time.
+
+> NORMATIVE: **Flag activation fixpoint.** The `enables` relation defines a
+> monotone propagation: activating a flag may activate additional flags (via
+> same-package `enables` args) or request flags on deps (via cross-package
+> `enables` children). Conformant implementations MUST compute the **least
+> fixpoint** of this propagation — the unique smallest set of active flags
+> consistent with all `enables` rules and the initial active set. Because the
+> propagation only adds flags (never removes them) and the flag set is finite,
+> the least fixpoint always exists and is unique. The normative output is the
+> converged `active_flags` set; any internal iteration strategy (repeated
+> forward pass, worklist, etc.) is an implementation detail. Implementations
+> MUST NOT expose or document an iteration count as a convergence criterion;
+> any internal safety cap MUST be set high enough that it can never truncate
+> a real convergence on a valid manifest (a cap below the number of declared
+> flags in the manifest would be incorrect). Two conforming implementations
+> with different internal caps MUST produce byte-identical `active_flags`
+> output for the same manifest and initial flag set.
+
+> NORMATIVE (S1 — RFC #23 §3.1.4): A flag MAY carry a `conflicts` child node
+> with one or more positional string args naming same-package flags that MUST NOT
+> be co-active with this flag. The bare names in `conflicts` follow the same
+> post-parse validation rule as `enables` same-pkg names — unmatched names raise
+> `MAN-FLAG-CONFLICTS-UNDECLARED` (deferred to slice S4c; parsing and data-model
+> round-trip of `conflicts` is S1). Symmetric: `openssl conflicts bearssl` implies
+> `bearssl conflicts openssl`; declare once.
 
 > NORMATIVE: Any `when flag="<name>"` predicate (§6) that references a flag name
 > not present in the `flags { }` block MUST raise `MAN-FLAG-UNDECLARED-REFERENCE`.
@@ -783,7 +913,28 @@ The profile fields are normalized to Nim's `hostOS` / `hostCPU` vocabulary.
 > `"arm64"`, `"arm64"` → `"arm64"`, `"i386"` → `"i386"`, `"i686"` → `"i386"`.
 > Other values pass through unchanged.
 
-### 6.6  Profile environment overrides
+### 6.6  Predicate ordering (representational determinism)
+
+> NORMATIVE: The predicate list attached to a parsed dep MUST preserve
+> **source order**: outer `when`-block predicates first (outermost block
+> first), followed by inline (node-property) predicates in source order,
+> followed by child-node predicates in source order.  If a dep appears
+> inside nested `when` blocks, the predicates from the outermost block
+> are prepended before those of the next block, and so on.
+
+> NORMATIVE: Predicate evaluation is **order-independent** (conjunction:
+> all predicates must be satisfied).  Source order is preserved for
+> representational determinism — so that equivalent manifests produce
+> identical in-memory representations across implementations — not
+> because order affects evaluation semantics.
+
+> NORMATIVE: Implementations MUST NOT sort, deduplicate, or otherwise
+> reorder predicates during parsing or merging.  Sorting is forbidden
+> because it breaks cross-implementation byte-identity of any output
+> that serializes predicate lists (e.g. lockfile `requires_predicates`
+> entries, `CondRequire` blocks).
+
+### 6.7  Profile environment overrides
 
 > NORMATIVE: The following environment variables MUST override the detected
 > profile fields when set and non-empty:

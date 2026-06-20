@@ -1,0 +1,15 @@
+name "mylib"
+flags {
+    tls default=#false
+    http default=#false
+    openssl default=#false {
+        conflicts "bearssl"
+    }
+    bearssl default=#false
+    full default=#false {
+        enables "tls" "http" {
+            chronos { flag "tls" }
+        }
+    }
+}
+kind "library"

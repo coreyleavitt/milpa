@@ -1,0 +1,18 @@
+// fixture-209: S9 — --features activates a root flag-gated dep (RFC #23 §3.4)
+//
+// The manifest declares a flag `tls default=#false` and a flag-gated dep
+// `featurelib` guarded by `when flag="tls"`.
+//
+// Without --features, the dep is pruned (default off).
+// With MILPA_CLI_FEATURES=tls, the flag is activated via --features and the
+// dep is admitted into the resolved graph.
+name "myapp"
+kind "application"
+flags {
+    tls default=#false description="enable TLS support"
+}
+deps {
+    when flag="tls" {
+        featurelib git=(url)"https://example.com/featurelib.git" ref="main"
+    }
+}

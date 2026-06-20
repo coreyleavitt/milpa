@@ -1,0 +1,23 @@
+// fixture-190: S4a — interleaved dep×flag fixpoint, multi-hop (RFC #23 §7 S4a)
+//
+// Single-consumer only; multi-consumer union is S4b.
+//
+// Activation chain:
+//   Root requests flag "feat" on lib-a.
+//   lib-a.feat has enables_cross_pkg → lib-b.flag "extra".
+//   lib-b declares "extra" (default=#false) gating lib-c.
+//   lib-c has no further flags.
+//
+// Without the outer fixpoint (S3 only): lib-c is NOT admitted
+//   (lib-b's active_flags would be empty at first BFS wave).
+// With S4a fixpoint: lib-a.feat cross-pkg enables lib-b.extra →
+//   lib-b's active_flags = {extra} → lib-c is admitted.
+//
+// Expected resolved graph: lib-a + lib-b + lib-c (multi-hop).
+name "myapp"
+kind "application"
+deps {
+    lib-a git=(url)"https://example.com/lib-a.git" ref="main" {
+        flag "feat"
+    }
+}

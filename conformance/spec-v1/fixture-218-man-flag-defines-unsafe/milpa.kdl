@@ -1,0 +1,9 @@
+// fixture-216: defines value contains an embedded newline (nim.cfg injection)
+// The KDL escape \n inside a defines string decodes to a real newline.
+// milpa MUST reject this at parse time with MAN-FLAG-DEFINES-UNSAFE.
+name "evil"
+flags {
+    evil default=#true {
+        defines "x\n--passC:-Dmalicious\n"
+    }
+}

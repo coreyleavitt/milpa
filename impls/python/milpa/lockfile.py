@@ -40,6 +40,7 @@ from milpa.errors import (
     LOCK_DEP_FIELD_ARITY,
     LOCK_DEP_IDENTITY_INVALID,
     LOCK_DEP_NAME_ARITY,
+    LOCK_DEP_NAME_INVALID,
     LOCK_DEPDECL_PIN_MISSING,
     LOCK_FIELD_ARITY,
     LOCK_FIELD_TYPE,
@@ -48,6 +49,7 @@ from milpa.errors import (
     LOCK_PROV_FIELD_MISSING,
     LOCK_PROV_KIND_MISSING,
     LOCK_PROV_KIND_UNKNOWN,
+    LOCK_SRC_DIR_UNSAFE,
     LOCK_VERSION_MISSING,
     LOCK_VERSION_UNSUPPORTED,
     VERIFY_ALIAS_SYMLINK_MISSING,
@@ -55,6 +57,7 @@ from milpa.errors import (
     MilpaError,
 )
 from milpa.identity import compute_content_hash, parse_identity
+from milpa.manifest import contains_unsafe_char, valid_dep_name
 from milpa.kdl_io import (
     KdlNode,
     node_args,
@@ -511,6 +514,18 @@ def _parse_dep(node: KdlNode) -> LockedDep:
             version = _parse_dep_scalar_str(child, dep_name, "version")
         elif cname == "src_dir":
             src_dir = _parse_dep_scalar_str(child, dep_name, "src_dir")
+            # Security: validate src_dir at the lockfile parse boundary.
+            # A poisoned milpa.lock with unsafe chars in src_dir would flow to
+            # nim.cfg --path: on frozen reconstruction.  Reuse the SSOT predicate
+            # (contains_unsafe_char from manifest.py); mirrors Rust lockfile.rs.
+            if src_dir and contains_unsafe_char(src_dir):
+                raise MilpaError(
+                    LOCK_SRC_DIR_UNSAFE,
+                    f"dep {dep_name!r}: lockfile 'src_dir' value contains a "
+                    f"control character or line separator — rejected to prevent "
+                    f"nim.cfg injection via a poisoned milpa.lock",
+                    dep=dep_name,
+                )
         elif cname == "requires":
             requires = _parse_dep_requires(child)
         elif cname == "aliases":
@@ -556,7 +571,15 @@ def _parse_dep(node: KdlNode) -> LockedDep:
 
 
 def _require_dep_name(node: KdlNode) -> str:
-    """Extract the dep name from the positional arg of a ``dep`` node."""
+    """Extract the dep name from the positional arg of a ``dep`` node.
+
+    Validates the name against the dep-name charset [A-Za-z0-9_-]+ (SSOT:
+    ``manifest.valid_dep_name``).  A poisoned
+    lockfile with a name like ``../evil`` (containing ``/``) would otherwise
+    flow to ``nim.cfg --path:`` and ``deps_dir / name``.  We use the charset
+    predicate here, NOT ``contains_unsafe_char``, because ``/`` and ``.`` are
+    not control characters.
+    """
     args = node_args(node)
     if len(args) != 1:
         raise MilpaError(
@@ -569,6 +592,16 @@ def _require_dep_name(node: KdlNode) -> str:
         raise MilpaError(
             LOCK_DEP_NAME_ARITY,
             f"dep node name argument must be a string, got {args[0]!r}",
+        )
+    # R8-S1 security fix: validate dep name charset at the lockfile parse
+    # boundary.  Mirrors the manifest parse boundary check (MAN-DEP-NAME-INVALID).
+    if not valid_dep_name(name):
+        raise MilpaError(
+            LOCK_DEP_NAME_INVALID,
+            f"dep name {name!r} contains characters outside [A-Za-z0-9_-] — "
+            "rejected to prevent path traversal and nim.cfg injection via a "
+            "poisoned milpa.lock",
+            name=name,
         )
     return name
 
@@ -623,10 +656,26 @@ def _parse_dep_aliases(node: KdlNode) -> tuple[str, ...]:
     """Parse the ``aliases`` child node — zero or more string args.
 
     Returned tuple is lexicographically sorted (canonical form per §3.8).
+
+    Each alias is validated against the dep-name charset [A-Za-z0-9_-]+
+    (same SSOT predicate as dep names — R8-S1 security fix).  Aliases reach
+    the same filesystem and nim.cfg sinks as the primary dep name.
     """
-    return tuple(sorted(
-        s for a in node_args(node) if (s := value_as_str(a)) is not None
-    ))
+    aliases = []
+    for a in node_args(node):
+        s = value_as_str(a)
+        if s is None:
+            continue
+        if not valid_dep_name(s):
+            raise MilpaError(
+                LOCK_DEP_NAME_INVALID,
+                f"dep alias {s!r} contains characters outside [A-Za-z0-9_-] — "
+                "rejected to prevent path traversal and nim.cfg injection via a "
+                "poisoned milpa.lock",
+                name=s,
+            )
+        aliases.append(s)
+    return tuple(sorted(aliases))
 
 
 def _parse_dep_self_mirrors(node: KdlNode) -> tuple[str, ...]:

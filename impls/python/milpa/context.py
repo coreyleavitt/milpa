@@ -120,3 +120,10 @@ class ResolveParams:
     prior: Lockfile | None = None
     manifest_dir: Path | None = None  # project root; used by resolver to resolve local dep paths
     require_attested_metadata: bool = False  # S5: --require-attested-metadata CLI flag
+    # S9 (RFC #23 §3.4 / §7 S9): CLI feature selection.
+    # features: additional root flags to activate (beyond defaults/all).
+    # no_default_features: suppress root default-true flags (absence-of-request, §3.1.3).
+    # all_features: activate every declared root flag.
+    features: frozenset[str] = frozenset()
+    no_default_features: bool = False
+    all_features: bool = False

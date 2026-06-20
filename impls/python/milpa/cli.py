@@ -44,7 +44,9 @@ from milpa import __version__
 from milpa.cas import CAStore, default_store
 from milpa.context import MilpaEnv, ResolveParams
 from milpa.errors import (
+    CLI_FEATURE_FLAGS_CONFLICT,
     FETCH_REF_DISCOVERY_FAILED,
+    FROZEN_ACTIVE_FLAGS_MISMATCH,
     FROZEN_NO_LOCKFILE,
     LOCK_DEP_NOT_FOUND,
     LOCK_DEPDECL_PIN_MISSING,
@@ -74,7 +76,9 @@ from milpa.lockfile import (
     verify_lockfile_against_deps,
     write_lockfile,
 )
-from milpa.nimcfg import format_nimcfg, format_workspace_nimcfgs
+from milpa.manifest import Manifest, flag_enables_closure
+from milpa.nimcfg import build_flag_defines, format_nimcfg, format_workspace_nimcfgs
+from milpa.predicate import dep_passes_flag_predicates
 from milpa.profile import Profile
 from milpa.resolver import resolve, resolve_workspace
 from milpa.solver import SolverError, SolveSuccess, certificate_to_json
@@ -97,6 +101,59 @@ def _emit_slug(slug: str) -> None:
 # ---------------------------------------------------------------------------
 # Argparse
 # ---------------------------------------------------------------------------
+
+
+def _add_feature_args(sp: argparse.ArgumentParser) -> None:
+    """Add the S9 (RFC #23 §3.4) feature-selection flags to a subparser.
+
+    Three flags, Cargo-parity (spec/cli-contract.md §2.7 S9):
+    - ``--features <comma-list>`` — additional root flags to activate.
+    - ``--no-default-features``  — suppress root default-true flags.
+    - ``--all-features``         — activate all declared root flags.
+
+    Applicable to ``fetch``, ``lock``, and ``update``.
+    """
+    sp.add_argument(
+        "--features",
+        metavar="<flags>",
+        default="",
+        help=(
+            "comma-separated list of root flags to activate in addition to defaults "
+            "(root-only: cannot name a transitive dep's flag directly; use an "
+            "'enables { dep { flag } }' on a root flag for that). "
+            "Naming a flag not declared in the root manifest is an error."
+        ),
+    )
+    sp.add_argument(
+        "--no-default-features",
+        action="store_true",
+        default=False,
+        help=(
+            "suppress the implicit activation of the root manifest's default=true flags; "
+            "the resolve starts from a zero-default root baseline and is purely additive "
+            "via --features. Per §3.1.3 this is absence-of-request, not an error; "
+            "a default-true flag still activates if another active edge requests it."
+        ),
+    )
+    sp.add_argument(
+        "--all-features",
+        action="store_true",
+        default=False,
+        help="activate every flag declared in the root manifest",
+    )
+
+
+def _parse_features(raw: str) -> frozenset[str]:
+    """Parse the ``--features`` comma-list into a frozenset of flag names.
+
+    Empty strings and whitespace-only tokens are dropped.  Strips leading/
+    trailing whitespace from each name.
+
+    Example: ``"tls, http"`` → ``frozenset({"tls", "http"})``
+    """
+    if not raw or not raw.strip():
+        return frozenset()
+    return frozenset(name.strip() for name in raw.split(",") if name.strip())
 
 
 def _make_parser() -> argparse.ArgumentParser:
@@ -176,16 +233,18 @@ def _make_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
 
     # fetch
-    subparsers.add_parser(
+    sp_fetch = subparsers.add_parser(
         "fetch",
         help="resolve manifest, clone deps, emit nim.cfg, write lockfile",
     )
+    _add_feature_args(sp_fetch)
 
     # lock
-    subparsers.add_parser(
+    sp_lock = subparsers.add_parser(
         "lock",
         help="resolve manifest and write lockfile (no nim.cfg, no _deps/)",
     )
+    _add_feature_args(sp_lock)
 
     # show
     subparsers.add_parser(
@@ -205,16 +264,35 @@ def _make_parser() -> argparse.ArgumentParser:
         help="remove _deps/ and nim.cfg (keeps milpa.lock)",
     )
 
-    # add (stub — 10e)
+    # add (10e + S10)
     sp_add = subparsers.add_parser(
         "add",
-        help="add a new dep or mirror (10e, not yet implemented)",
+        help="add a new dep or mirror provenance to milpa.kdl",
     )
     sp_add.add_argument("dep_name", metavar="<dep>")
     mode = sp_add.add_mutually_exclusive_group()
     mode.add_argument("--git", metavar="<url>")
     mode.add_argument("--mirror", metavar="<url>")
     sp_add.add_argument("--ref", metavar="<ref>")
+    # S10 (RFC #23 §3.7): optional + features flags for `add`.
+    sp_add.add_argument(
+        "--optional",
+        action="store_true",
+        default=False,
+        help=(
+            "mark the dep as optional=#true (RFC #23 §3.2): the dep is only "
+            "fetched when its auto-declared feature flag is enabled"
+        ),
+    )
+    sp_add.add_argument(
+        "--features",
+        metavar="<features>",
+        default="",
+        help=(
+            "comma-separated list of feature flags to request on this dep "
+            "(written as `flag` children on the dep node, RFC #23 §3.7)"
+        ),
+    )
 
     # remove (stub — 10e)
     sp_remove = subparsers.add_parser(
@@ -229,6 +307,7 @@ def _make_parser() -> argparse.ArgumentParser:
         help="re-resolve and refresh the lockfile (10e, not yet implemented)",
     )
     sp_update.add_argument("dep_name", metavar="<dep>", nargs="?", default=None)
+    _add_feature_args(sp_update)
 
     # store — read-only CAS inspection (C-store-ro slice, Phase C)
     sp_store = subparsers.add_parser(
@@ -454,6 +533,110 @@ def _write_certificate(
 
 
 # ---------------------------------------------------------------------------
+# S9: frozen active-flags mismatch check (RFC #23 §3.4 + §4)
+# ---------------------------------------------------------------------------
+
+
+def _check_frozen_active_flags_mismatch(
+    manifest: object,
+    lockfile: object,
+    *,
+    features: frozenset[str],
+    no_default_features: bool,
+    all_features: bool,
+) -> None:
+    """S9 (RFC #23 §3.4 + §4): FROZEN-ACTIVE-FLAGS-MISMATCH check.
+
+    Under ``--frozen``, recompute the active-flag closure from the current
+    manifest + CLI feature inputs and compare to the lockfile's stored
+    ``active_flags`` per dep.  A mismatch raises ``FROZEN-ACTIVE-FLAGS-MISMATCH``.
+
+    Per RFC §4: "The frozen check recomputes the active closure from the
+    **current manifest + the CLI feature inputs supplied now**" and compares
+    it to the lockfile.  It must NOT re-derive from the stored flags (that is
+    circular and would pass a pre-RFC lock vacuously).
+
+    When no CLI feature flags are active (no --features/--no-default-features/
+    --all-features), the check computes the closure from manifest defaults —
+    this catches the case where manifest defaults changed since the lock was
+    written.
+
+    Implementation note: the per-dep active_flags in the lockfile are the
+    *union* of all consumers' requests after fixpoint convergence; the root-level
+    closure we compute here is only the ROOT manifest's active set.  We compare
+    the ROOT's computed active_flags to the ROOT's deps' active_flags as stored
+    in the lockfile.  A full dep×flag fixpoint recomputation would require a
+    live fetch (which frozen forbids); therefore the check is limited to the root
+    manifest's own flags vs. the locked root-dep set.  This is the de-circularized
+    check from §4: recompute from manifest+CLI, NOT from stored flags.
+    """
+    from milpa.lockfile import Lockfile as _Lockfile
+    from milpa.resolver import _compute_root_active_seed
+
+    if not isinstance(manifest, Manifest) or not isinstance(lockfile, _Lockfile):
+        return  # defensive: skip if types don't match (workspace path)
+
+    # Compute the expected root active-flag closure from manifest + CLI inputs.
+    has_cli_features = bool(features) or no_default_features or all_features
+    try:
+        if has_cli_features:
+            seed = _compute_root_active_seed(
+                manifest,
+                features=features,
+                no_default_features=no_default_features,
+                all_features=all_features,
+            )
+        else:
+            # Default: default-true flags.
+            seed = frozenset(fd.name for fd in manifest.flags if fd.default)
+    except MilpaError:
+        raise  # FROZEN-ACTIVE-FLAGS-MISMATCH from _compute_root_active_seed
+
+    expected_active: frozenset[str] = flag_enables_closure(manifest.flags, seed)
+
+    # NOTE: heuristic — lockfile schema v1 has no root_active_flags field, so
+    # we detect drift via flag-gated root-dep admission.  Exact check tracked
+    # in gh #158.
+    locked_names: set[str] = {d.name for d in lockfile.deps}
+    root_dep_names: set[str] = {
+        getattr(d, "name", None)
+        for d in list(getattr(manifest, "deps", [])) + list(getattr(manifest, "dev_deps", []))
+        if getattr(d, "name", None)
+    }
+
+    # For each root dep, check if it has a flag predicate.  If its gate flag
+    # is NOT in expected_active but the dep IS in the lock → stale lock.
+    # If its gate flag IS in expected_active but the dep is NOT in the lock →
+    # stale lock.
+    for dep in list(getattr(manifest, "deps", [])) + list(getattr(manifest, "dev_deps", [])):
+        preds: tuple = dep.predicates
+        flag_preds = [p for p in preds if getattr(p, "name", None) == "flag"]
+        if not flag_preds:
+            continue  # Not flag-gated — no mismatch from feature selection.
+        dep_name = getattr(dep, "name", None)
+        if dep_name is None:
+            continue
+
+        # Route through SSOT: dep_passes_flag_predicates evaluates all flag
+        # predicates (OR-within-values, negation, conjunction across predicates).
+        would_admit = dep_passes_flag_predicates(preds, expected_active)
+        is_locked = dep_name in locked_names
+
+        if would_admit != is_locked:
+            raise MilpaError(
+                FROZEN_ACTIVE_FLAGS_MISMATCH,
+                f"lockfile active-flags mismatch for dep {dep_name!r}: "
+                f"the lock was produced under a different feature selection — "
+                f"re-run 'milpa fetch' with the same --features / --no-default-features "
+                f"/ --all-features flags that were used to write the lock",
+                dep=dep_name,
+                expected_active=sorted(expected_active),
+                locked=is_locked,
+                would_admit=would_admit,
+            )
+
+
+# ---------------------------------------------------------------------------
 # cmd_fetch (10b)
 # ---------------------------------------------------------------------------
 
@@ -467,6 +650,9 @@ def cmd_fetch(
     frozen: bool,
     certificate_path: Path | None = None,
     require_attested_metadata: bool = False,
+    features: frozenset[str] = frozenset(),
+    no_default_features: bool = False,
+    all_features: bool = False,
 ) -> int:
     """Resolve, fetch, emit nim.cfg + milpa.lock.
 
@@ -492,6 +678,9 @@ def cmd_fetch(
             frozen=frozen,
             certificate_path=certificate_path,
             require_attested_metadata=require_attested_metadata,
+            features=features,
+            no_default_features=no_default_features,
+            all_features=all_features,
         )
 
     # --- Single-package path ---
@@ -518,12 +707,23 @@ def cmd_fetch(
         # no entry.  FROZEN-NO-CAS would apply if store=None, which never happens.
         try:
             prior_lock = load_lockfile(lock_path)
+            # S9 (RFC #23 §3.4): FROZEN-ACTIVE-FLAGS-MISMATCH check.
+            # Recompute the active-flag closure from the current manifest + CLI
+            # feature inputs; compare to the lockfile's stored active_flags.
+            # A mismatch means the lock was produced under a different selection.
+            _check_frozen_active_flags_mismatch(
+                manifest, prior_lock,
+                features=features,
+                no_default_features=no_default_features,
+                all_features=all_features,
+            )
             frozen_graph = resolve_frozen(manifest, prior_lock, env, deps_dir)
             # Frozen path succeeded.
             nim_cfg_text = format_nimcfg(
                 frozen_graph,
                 deps_dir=_DEPS_RELATIVE,
                 self_src_dir=self_src_dir,
+                flag_defines=build_flag_defines(frozen_graph, deps_dir),
             )
             _atomic_write(project_dir / "nim.cfg", nim_cfg_text)
             print(
@@ -556,6 +756,9 @@ def cmd_fetch(
         prior=prior,  # type: ignore[arg-type]
         manifest_dir=project_dir,
         require_attested_metadata=require_attested_metadata,
+        features=features,
+        no_default_features=no_default_features,
+        all_features=all_features,
     )
 
     # Resolve — intercept SOLVE_CONFLICT to write the failure certificate.
@@ -577,6 +780,7 @@ def cmd_fetch(
         graph,
         deps_dir=_DEPS_RELATIVE,
         self_src_dir=self_src_dir,
+        flag_defines=build_flag_defines(graph, deps_dir),
     )
     write_lockfile(lockfile, lock_path)
     _atomic_write(project_dir / "nim.cfg", nim_cfg_text)
@@ -594,6 +798,9 @@ def _cmd_fetch_workspace(
     frozen: bool,
     certificate_path: Path | None = None,
     require_attested_metadata: bool = False,
+    features: frozenset[str] = frozenset(),
+    no_default_features: bool = False,
+    all_features: bool = False,
 ) -> int:
     """Workspace variant of cmd_fetch."""
     from milpa.workspace import LoadedWorkspace
@@ -646,6 +853,9 @@ def _cmd_fetch_workspace(
         prior=prior,  # type: ignore[arg-type]
         manifest_dir=ws_root,
         require_attested_metadata=require_attested_metadata,
+        features=features,
+        no_default_features=no_default_features,
+        all_features=all_features,
     )
 
     # Resolve — intercept SOLVE_CONFLICT to write the failure certificate.
@@ -691,6 +901,9 @@ def cmd_lock(
     max_parallel: int,
     certificate_path: Path | None = None,
     require_attested_metadata: bool = False,
+    features: frozenset[str] = frozenset(),
+    no_default_features: bool = False,
+    all_features: bool = False,
 ) -> int:
     """Resolve + write milpa.lock; do NOT emit nim.cfg or populate _deps/.
 
@@ -706,6 +919,9 @@ def cmd_lock(
             max_parallel=max_parallel,
             certificate_path=certificate_path,
             require_attested_metadata=require_attested_metadata,
+            features=features,
+            no_default_features=no_default_features,
+            all_features=all_features,
         )
 
     manifest = load_or_discover_manifest(project_dir)
@@ -722,6 +938,9 @@ def cmd_lock(
         prior=prior,  # type: ignore[arg-type]
         manifest_dir=project_dir,
         require_attested_metadata=require_attested_metadata,
+        features=features,
+        no_default_features=no_default_features,
+        all_features=all_features,
     )
 
     # Resolve — intercept SOLVE_CONFLICT to write the failure certificate.
@@ -752,6 +971,9 @@ def _cmd_lock_workspace(
     max_parallel: int,
     certificate_path: Path | None = None,
     require_attested_metadata: bool = False,
+    features: frozenset[str] = frozenset(),
+    no_default_features: bool = False,
+    all_features: bool = False,
 ) -> int:
     from milpa.workspace import LoadedWorkspace
     assert isinstance(workspace, LoadedWorkspace)
@@ -770,6 +992,9 @@ def _cmd_lock_workspace(
         prior=prior,  # type: ignore[arg-type]
         manifest_dir=ws_root,
         require_attested_metadata=require_attested_metadata,
+        features=features,
+        no_default_features=no_default_features,
+        all_features=all_features,
     )
 
     # Resolve — intercept SOLVE_CONFLICT to write the failure certificate.
@@ -834,6 +1059,10 @@ def cmd_show(project_dir: Path) -> int:
                 for p in cr.predicates
             )
             print(f"  cond-req    {cr.name} [{preds_str}]")
+        # S10 (RFC #23 §3.7): print per-dep active_flags so a user can see
+        # that a transitive optional dep is present (the `cargo tree -e features` need).
+        if dep.active_flags:
+            print(f"  active_flags {' '.join(dep.active_flags)}")
     return 0
 
 
@@ -949,6 +1178,35 @@ def cmd_verify(
         print(f"failed to read lockfile: {exc.message}", file=sys.stderr)
         _emit_slug(exc.slug)
         return 1
+
+    # -------------------------------------------------------------------------
+    # S10: active_flags mismatch check (RFC #23 §3.7 — flag MEMBERSHIP only,
+    # not defines content, §3.6).  Reuses _check_frozen_active_flags_mismatch
+    # (SSOT) with no CLI feature overrides — "manifest defaults + no selection".
+    # A mismatch means the lockfile was produced under a different feature
+    # selection; the user must re-run `milpa fetch`.
+    # Runs BEFORE the disk-state check because it's a manifest-vs-lockfile
+    # consistency check (not a disk-vs-lockfile check), and should fire even
+    # if _deps/ has stale content.
+    # Scope: single-package manifests only (workspace mismatch checks are a
+    # workspace-feature-unification concern, S11).
+    # -------------------------------------------------------------------------
+    if ws is None:
+        try:
+            verify_manifest = load_or_discover_manifest(project_dir)
+            _check_frozen_active_flags_mismatch(
+                verify_manifest,
+                lockfile,
+                features=frozenset(),
+                no_default_features=False,
+                all_features=False,
+            )
+        except MilpaError as exc:
+            print(f"milpa verify: {exc.message}", file=sys.stderr)
+            _emit_slug(exc.slug)
+            return 1
+        except Exception:
+            pass  # manifest unreadable — skip; identity check below will catch real issues
 
     divergences = verify_lockfile_against_deps(lockfile, deps_dir)
     if divergences:
@@ -1241,8 +1499,13 @@ def cmd_add(
     ref: str | None,
     strategy: Strategy,
     max_parallel: int,
+    optional: bool = False,
+    features: "tuple[str, ...] | frozenset[str]" = (),
 ) -> int:
     """Add a new dep (--git) or mirror provenance (--mirror) to milpa.kdl.
+
+    S10 (RFC #23 §3.7): ``--optional`` writes ``optional=#true`` on the dep node;
+    ``--features a,b`` writes ``flag "a"`` / ``flag "b"`` children.
 
     spec/cli-contract.md §5.6.
     """
@@ -1260,6 +1523,8 @@ def cmd_add(
             ref=ref,
             strategy=strategy,
             max_parallel=max_parallel,
+            optional=optional,
+            features=features,
         )
 
     if mirror_url is not None:
@@ -1293,9 +1558,23 @@ def _cmd_add_git(
     ref: str | None,
     strategy: Strategy,
     max_parallel: int,
+    optional: bool = False,
+    features: "tuple[str, ...] | frozenset[str]" = (),
 ) -> int:
-    """Implement ``milpa add <dep> --git <url> [--ref <ref>]``."""
-    from milpa.manifest import UrlDep
+    """Implement ``milpa add <dep> --git <url> [--ref <ref>] [--optional] [--features f1,f2]``.
+
+    S10 (RFC #23 §3.7):
+    - ``optional=True`` → ``UrlDep.optional = True``; ``format_manifest`` serializes
+      ``optional=#true`` on the dep node.
+    - ``features=(...)`` → ``UrlDep.flag_requests`` with the named flags; serialized
+      as ``flag "<name>"`` children on the dep block.
+    - Pre-write clash check (normative): if ``optional=True`` and the dep name would
+      clash with an existing declared flag, raise ``MAN-DEP-OPTIONAL-FLAG-CLASH``
+      BEFORE writing — reuses the S7 ``_desugar_optional_deps`` validation so the
+      writer never produces an unparseable manifest. SSOT: the same code path that
+      runs at parse time also runs here at add-time.
+    """
+    from milpa.manifest import FlagRequest, UrlDep
     from milpa.manifest_writer import mutate_manifest_file
 
     # Ref discovery: if --ref omitted, discover default branch.
@@ -1348,8 +1627,45 @@ def _cmd_add_git(
         _emit_slug(MAN_ADD_DEP_EXISTS)
         return 1
 
+    # S10 pre-write clash check (§3.7 normative): if optional=True, the dep name
+    # becomes a flag name at parse time.  Validate NOW, before writing, so the
+    # writer never produces an unparseable manifest.  SSOT: re-use the same
+    # _desugar_optional_deps path that parse_manifest calls — we build the
+    # proposed manifest first, then re-parse it to run the full S7 validation.
+    if optional:
+        from milpa.manifest import valid_dep_name
+        from milpa.errors import MAN_DEP_OPTIONAL_FLAG_CLASH, MAN_DEP_OPTIONAL_INVALID_NAME
+        # Validate charset: dep name must match the flag-name charset.
+        if not valid_dep_name(dep_name):
+            print(
+                f"milpa add: dep name {dep_name!r} is not a valid flag name "
+                "(must match [A-Za-z0-9_-]+) — required for optional=#true",
+                file=sys.stderr,
+            )
+            _emit_slug(MAN_DEP_OPTIONAL_INVALID_NAME)
+            return 1
+        # Namespace clash: check if the dep name collides with an existing declared flag.
+        declared_flag_names: frozenset[str] = frozenset(fd.name for fd in manifest.flags)
+        if dep_name in declared_flag_names:
+            print(
+                f"milpa add: dep {dep_name!r} optional=#true would clash with the "
+                f"existing flag {dep_name!r} — rename one or mark the dep non-optional",
+                file=sys.stderr,
+            )
+            _emit_slug(MAN_DEP_OPTIONAL_FLAG_CLASH)
+            return 1
+
     # Build the new dep + resolve.
-    new_dep = UrlDep(name=dep_name, git=git_url, ref=ref)
+    flag_reqs: tuple[FlagRequest, ...] = tuple(
+        FlagRequest(name=f, enabled=True) for f in features
+    )
+    new_dep = UrlDep(
+        name=dep_name,
+        git=git_url,
+        ref=ref,
+        optional=optional,
+        flag_requests=flag_reqs,
+    )
     from dataclasses import replace as _replace
     proposed_manifest = _replace(manifest, deps=manifest.deps + (new_dep,))
 
@@ -1622,6 +1938,9 @@ def cmd_update(
     dep_name: str | None,
     strategy: Strategy,
     max_parallel: int,
+    features: frozenset[str] = frozenset(),
+    no_default_features: bool = False,
+    all_features: bool = False,
 ) -> int:
     """Re-resolve and refresh milpa.lock; optionally scoped to one dep.
 
@@ -1642,6 +1961,9 @@ def cmd_update(
             profile=profile,
             prior=None,
             manifest_dir=project_dir,
+            features=features,
+            no_default_features=no_default_features,
+            all_features=all_features,
         )
         graph = resolve(manifest, deps_dir, env_with_index, params)
         lockfile_val = from_graph(graph, strategy=str(strategy))
@@ -1698,12 +2020,23 @@ def cmd_update(
     ) + (pin_stripped,)
     filtered_prior = _replace(prior_lock, deps=filtered_deps)
 
+    # S10 (RFC #23 §3.7): re-resolve with the lockfile's recorded active_flags
+    # for reproducibility.  "Re-resolves with the lockfile's recorded active_flags"
+    # means the same CLI feature selection used when the lock was written is used
+    # again — NOT that we reset to all-features-off.  The resolver correctly
+    # recomputes dep-level active_flags from the dep's own flag tables (default-true
+    # flags, cross-package requests via enables); that is the reproduction mechanism.
+    # For root-level CLI features the user must pass --features explicitly; the
+    # lockfile does not store the prior --features invocation (§3.4 normative).
     params = ResolveParams(
         strategy=strategy,
         max_parallel=max_parallel,
         profile=profile,
         prior=filtered_prior,
         manifest_dir=project_dir,
+        features=features,
+        no_default_features=no_default_features,
+        all_features=all_features,
     )
 
     graph = resolve(manifest, deps_dir, env_with_index, params)
@@ -1774,6 +2107,28 @@ def main(argv: list[str] | None = None) -> int:
 
     # Dispatch.
     try:
+        # S9 (RFC #23 §3.4): extract CLI feature-selection flags.
+        # These are per-verb (fetch/lock/update) — only present when those
+        # verbs are active; getattr with default handles other verbs safely.
+        _cli_features = _parse_features(getattr(args, "features", "") or "")
+        _cli_no_default = getattr(args, "no_default_features", False)
+        _cli_all_features = getattr(args, "all_features", False)
+
+        # S9 (RFC #23 §3.4): reject the mutually-exclusive combination
+        # --all-features + --no-default-features (spec/errors.md §CLI).
+        # --all-features activates every declared root flag; --no-default-features
+        # suppresses all defaults and starts from an empty baseline — the two
+        # intents are contradictory.  Cargo rejects this combination; milpa does
+        # too.  Check here, before any resolver call, so the error surfaces
+        # immediately (exit 1 + CLI-FEATURE-FLAGS-CONFLICT slug).
+        if _cli_all_features and _cli_no_default:
+            raise MilpaError(
+                CLI_FEATURE_FLAGS_CONFLICT,
+                "--all-features and --no-default-features are mutually exclusive: "
+                "--all-features activates every declared root flag while "
+                "--no-default-features suppresses all defaults — pass at most one",
+            )
+
         if args.command == "fetch":
             return cmd_fetch(
                 project_dir,
@@ -1783,6 +2138,9 @@ def main(argv: list[str] | None = None) -> int:
                 frozen=args.frozen,
                 certificate_path=certificate_path,
                 require_attested_metadata=effective_require_attested,
+                features=_cli_features,
+                no_default_features=_cli_no_default,
+                all_features=_cli_all_features,
             )
         elif args.command == "lock":
             return cmd_lock(
@@ -1792,6 +2150,9 @@ def main(argv: list[str] | None = None) -> int:
                 max_parallel=args.parallel,
                 certificate_path=certificate_path,
                 require_attested_metadata=effective_require_attested,
+                features=_cli_features,
+                no_default_features=_cli_no_default,
+                all_features=_cli_all_features,
             )
         elif args.command == "show":
             return cmd_show(project_dir)
@@ -1804,6 +2165,13 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "clean":
             return cmd_clean(project_dir)
         elif args.command == "add":
+            # S10 (RFC #23 §3.7): extract --optional and --features for add verb.
+            # --features on `add` is a dep-level flag_requests list (distinct from
+            # the resolve-level --features on fetch/lock/update).
+            _add_optional = getattr(args, "optional", False)
+            _add_features_raw = getattr(args, "features", "") or ""
+            # Use _parse_features for comma-list → frozenset, then to tuple for UrlDep.
+            _add_features: tuple[str, ...] = tuple(sorted(_parse_features(_add_features_raw)))
             return cmd_add(
                 project_dir,
                 env,
@@ -1813,6 +2181,8 @@ def main(argv: list[str] | None = None) -> int:
                 ref=args.ref,
                 strategy=strategy,
                 max_parallel=args.parallel,
+                optional=_add_optional,
+                features=_add_features,
             )
         elif args.command == "remove":
             return cmd_remove(
@@ -1829,6 +2199,9 @@ def main(argv: list[str] | None = None) -> int:
                 dep_name=args.dep_name,
                 strategy=strategy,
                 max_parallel=args.parallel,
+                features=_cli_features,
+                no_default_features=_cli_no_default,
+                all_features=_cli_all_features,
             )
         elif args.command == "store":
             store_cmd = getattr(args, "store_command", None)

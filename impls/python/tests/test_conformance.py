@@ -218,11 +218,25 @@ def _discover_fixtures(corpus_root: Path) -> list[Fixture]:
 # ---------------------------------------------------------------------------
 
 
+_PROFILE_TARGET_KEYS = frozenset(
+    {
+        "MILPA_TARGET_PLATFORM",
+        "MILPA_TARGET_ARCH",
+        "MILPA_TARGET_NIM",
+        "MILPA_TARGET_MILPA",
+    }
+)
+
+
 def _fixture_profile(fixture_dir: Path) -> Profile | None:
     """Build a ``Profile`` from the fixture's optional ``env`` file.
 
-    Returns ``None`` when the file is absent (predicate filtering disabled).
-    This mirrors the Rust runner's ``fixture_profile`` function.
+    Returns ``None`` when no ``MILPA_TARGET_*`` axis is present — even if
+    an ``env`` file exists for other keys such as ``MILPA_CLI_FEATURES``.
+    This mirrors the Rust runner's ``fixture_profile`` (runner.rs ~861-885):
+    an absent profile means predicate filtering is disabled (resolver-semantics
+    §470); host-defaulting belongs to the CLI, not the host-independent corpus
+    runner.
     """
     env_file = fixture_dir / "env"
     if not env_file.exists():
@@ -236,6 +250,13 @@ def _fixture_profile(fixture_dir: Path) -> Profile | None:
         if "=" in line:
             key, _, value = line.partition("=")
             env_vars[key.strip()] = value.strip()
+
+    # Mirror the Rust runner: return None when no MILPA_TARGET_* axis is set.
+    # An env file carrying only MILPA_CLI_FEATURES (or other non-target keys)
+    # must yield None so that resolver-semantics §470 "absent profile ⇒
+    # platform filtering disabled" is exercised, not a host-defaulted Profile.
+    if not _PROFILE_TARGET_KEYS.intersection(env_vars):
+        return None
 
     return Profile.from_environment(
         nim_version=env_vars.get("MILPA_TARGET_NIM"),
@@ -262,6 +283,59 @@ def _fixture_require_attested_metadata(fixture_dir: Path) -> bool:
                 v = value.strip()
                 return bool(v and v not in ("0", "false"))
     return False
+
+
+def _fixture_env_vars(fixture_dir: Path) -> dict[str, str]:
+    """Parse the fixture's optional ``env`` file into a dict of KEY=VALUE pairs.
+
+    Returns an empty dict when the file is absent.  Skips blank lines and
+    comment lines (starting with ``#``).
+    """
+    env_file = fixture_dir / "env"
+    if not env_file.exists():
+        return {}
+    result: dict[str, str] = {}
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, _, value = line.partition("=")
+            result[key.strip()] = value.strip()
+    return result
+
+
+def _fixture_cli_features(fixture_dir: Path) -> frozenset[str]:
+    """Return the ``--features`` flag set from the fixture env file.
+
+    Reads ``MILPA_CLI_FEATURES`` (comma-separated flag names).
+    S9: mirrors CLI's _parse_features(args.features).
+    """
+    env = _fixture_env_vars(fixture_dir)
+    raw = env.get("MILPA_CLI_FEATURES", "")
+    if not raw:
+        return frozenset()
+    return frozenset(name.strip() for name in raw.split(",") if name.strip())
+
+
+def _fixture_no_default_features(fixture_dir: Path) -> bool:
+    """Return True when MILPA_NO_DEFAULT_FEATURES is set in the fixture env file.
+
+    S9: mirrors CLI's --no-default-features.
+    """
+    env = _fixture_env_vars(fixture_dir)
+    v = env.get("MILPA_NO_DEFAULT_FEATURES", "")
+    return bool(v and v not in ("0", "false"))
+
+
+def _fixture_all_features(fixture_dir: Path) -> bool:
+    """Return True when MILPA_ALL_FEATURES is set in the fixture env file.
+
+    S9: mirrors CLI's --all-features.
+    """
+    env = _fixture_env_vars(fixture_dir)
+    v = env.get("MILPA_ALL_FEATURES", "")
+    return bool(v and v not in ("0", "false"))
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +667,15 @@ def _execute_fixture(
                 graph = resolve_workspace_frozen(loaded_ws, lockfile, env, deps_dir)
             else:
                 assert isinstance(doc, Manifest)
+                # S9 (RFC #23 §3.4): FROZEN-ACTIVE-FLAGS-MISMATCH check.
+                # Mirrors CLI's _check_frozen_active_flags_mismatch call.
+                from milpa.cli import _check_frozen_active_flags_mismatch
+                _check_frozen_active_flags_mismatch(
+                    doc, lockfile,
+                    features=_fixture_cli_features(fixture_dir),
+                    no_default_features=_fixture_no_default_features(fixture_dir),
+                    all_features=_fixture_all_features(fixture_dir),
+                )
                 graph = resolve_frozen(doc, lockfile, env, deps_dir)
         except MilpaError as e:
             if fixture.expected_error is not None and e.slug == fixture.expected_error:
@@ -620,6 +703,10 @@ def _execute_fixture(
         prior=prior,
         require_attested_metadata=_fixture_require_attested_metadata(fixture_dir),
         manifest_dir=fixture_dir,  # so local="./src-tree" resolves against fixture dir
+        # S9 (RFC #23 §3.4): CLI feature-selection from fixture env file.
+        features=_fixture_cli_features(fixture_dir),
+        no_default_features=_fixture_no_default_features(fixture_dir),
+        all_features=_fixture_all_features(fixture_dir),
     )
 
     try:
@@ -956,7 +1043,7 @@ def _diff_success(
 ) -> tuple[Literal["pass", "fail", "skip"], str]:
     """Byte-diff the produced outputs against expected/."""
     from milpa.lockfile import format_lockfile, from_graph
-    from milpa.nimcfg import format_nimcfg, format_workspace_nimcfgs
+    from milpa.nimcfg import build_flag_defines, format_nimcfg, format_workspace_nimcfgs
     from milpa.workspace import load_workspace
 
     if fixture.expected_error is not None:
@@ -979,8 +1066,11 @@ def _diff_success(
     if isinstance(doc, WorkspaceManifest):
         try:
             loaded_ws = load_workspace(fixture.dir)
+            # S11 (RFC #23 §3.8): pass flag_defines so each member's nim.cfg
+            # includes the unified -d: defines for shared deps (SSOT).
+            ws_flag_defines = build_flag_defines(graph, deps_dir)  # type: ignore[arg-type]
             member_nimcfgs: dict[str, str] = format_workspace_nimcfgs(
-                loaded_ws, graph  # type: ignore[arg-type]
+                loaded_ws, graph, flag_defines=ws_flag_defines  # type: ignore[arg-type]
             )
         except Exception as e:
             return ("fail", f"format_workspace_nimcfgs failed: {e}")
@@ -997,10 +1087,14 @@ def _diff_success(
     else:
         assert isinstance(doc, Manifest)
         try:
+            # §7.5 S6: compute flag_defines from each dep's manifest (SSOT —
+            # defines live in manifests, not the lockfile; RFC #23 §3.6).
+            flag_defines = build_flag_defines(graph, deps_dir)  # type: ignore[arg-type]
             nimcfg_text = format_nimcfg(
                 graph,  # type: ignore[arg-type]
                 deps_dir=Path("_deps"),
                 self_src_dir=doc.src_dir,
+                flag_defines=flag_defines,
             )
         except Exception as e:
             return ("fail", f"format_nimcfg failed: {e}")
@@ -1262,6 +1356,12 @@ _NOT_YET_WIRED_FIXTURE_NAMES: frozenset[str] = frozenset(
         # Remaining xfail: none for error fixtures.
         # (RES-WS-*, FETCH-ALL-FAILED tarball, workspace success fixtures
         # remain parked under their own xfail entries — see below.)
+        #
+        # Pre-existing baseline red (NOT #23) — tracked, parked to xfail so the
+        # suite stays green per this file's policy (mirrors Rust known_failing.txt):
+        # fixture-144: depdecl fetch-failed maps to RES-UNATTESTED-METADATA instead
+        #   of TNG-DEPDECL-FETCH-FAILED — see gh #153.
+        "fixture-144-depdecl-fetch-failed",
     }
 )
 
@@ -1394,6 +1494,18 @@ class TestConformanceAdapterMachinery:
 
     def test_profile_absent_env_file(self, tmp_path: Path) -> None:
         """Profile is None when no env file exists (predicate filtering disabled)."""
+        profile = _fixture_profile(tmp_path)
+        assert profile is None
+
+    def test_profile_none_when_no_target_axes(self, tmp_path: Path) -> None:
+        """Profile is None when env file has no MILPA_TARGET_* keys.
+
+        An env file carrying only MILPA_CLI_FEATURES (or other non-target keys)
+        must yield None, mirroring the Rust runner and resolver-semantics §470.
+        Host-defaulting is CLI-only behavior.
+        """
+        env_file = tmp_path / "env"
+        env_file.write_text("MILPA_CLI_FEATURES=extras\n", encoding="utf-8")
         profile = _fixture_profile(tmp_path)
         assert profile is None
 

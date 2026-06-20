@@ -1,0 +1,8 @@
+name "beta"
+kind "library"
+src_dir "src"
+deps {
+    lib-shared git=(url)"https://example.com/lib-shared.git" ref="main" {
+        flag "feat-y"
+    }
+}

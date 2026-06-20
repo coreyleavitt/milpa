@@ -1,0 +1,18 @@
+// fixture-239: MAN-FLAG-UNDECLARED-REFERENCE via the dev-deps path
+//
+// spec/manifest-grammar.md §6.4 (NORMATIVE): any `when flag="<name>"` predicate
+// that references a flag name not declared in the `flags` block MUST raise
+// MAN-FLAG-UNDECLARED-REFERENCE.  This applies to BOTH `deps` and `dev-deps`.
+//
+// Coverage fixture: closes the round-7 blind-spot gap for MAN-FLAG-UNDECLARED-
+// REFERENCE raised through the dev-deps code path.  The R6 fix already walked
+// dev_deps; this fixture confirms both impls raise the error on dev-deps too.
+//
+// No `flags` block → any flag= reference is undeclared.
+name "myapp"
+kind "application"
+dev-deps {
+    when flag="undeclared" {
+        testlib local="../t"
+    }
+}

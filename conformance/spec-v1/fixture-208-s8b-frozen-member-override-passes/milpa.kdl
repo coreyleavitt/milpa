@@ -1,0 +1,9 @@
+workspace {
+    member "member-a"
+    member "innerlib"
+}
+overrides {
+    pkg "innerlib" {
+        member "innerlib"
+    }
+}

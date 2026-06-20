@@ -116,7 +116,9 @@ fn error_codes_match_fixtures() {
         ),
         (
             "name \"x\"\noverrides {\n  pkg \"a\" ref=\"m\"\n}\n",
-            "MAN-OVERRIDE-GIT-MISSING",
+            // S8: `ref=` alone is zero-form → MAN-OVERRIDE-TARGET-AMBIGUOUS
+            // (the old MAN-OVERRIDE-GIT-MISSING is superseded for the zero-form case)
+            "MAN-OVERRIDE-TARGET-AMBIGUOUS",
         ),
         (
             "name \"x\"\noverrides {\n  pkg \"a\" git=(url)\"https://a/f.git\"\n}\n",
@@ -359,7 +361,10 @@ fn cas_and_mirrors_and_overrides() {
     assert_eq!(m.self_mirrors, vec!["https://m/a.git"]);
     assert_eq!(m.overrides.len(), 1);
     assert_eq!(m.overrides[0].name, "x");
-    assert_eq!(m.overrides[0].git_ref, "v1");
+    match &m.overrides[0].target {
+        crate::OverrideTarget::Git { git_ref, .. } => assert_eq!(git_ref, "v1"),
+        other => panic!("expected GitTarget, got {:?}", other),
+    }
 }
 
 #[test]
@@ -470,3 +475,335 @@ fn manifest_predicate_is_types_predicate_reexport() {
     assert_eq!(name, "platform");
 }
 
+// ---------------------------------------------------------------------------
+// S2 (RFC #23 §7 + §3.1.2) — same-package `enables` closure unit tests.
+//
+// Conformance note: S2's pure closure is NOT observable through the
+// conformance runner's `resolve` command because active_flags in the lockfile
+// are only populated when S3/S4a wire cross-package flag activation through
+// the resolver.  These tests mirror the Python tests/test_flag_closure.py
+// exactly so both impls assert identical closure results on identical inputs.
+// ---------------------------------------------------------------------------
+
+/// Build a simple `FlagDecl` with a name and same-pkg enables list.
+fn flag_decl(name: &str, enables: &[&str]) -> FlagDecl {
+    FlagDecl {
+        name: name.to_string(),
+        default: false,
+        description: String::new(),
+        defines: vec![],
+        enables_same_pkg: enables.iter().map(|s| s.to_string()).collect(),
+        enables_cross_pkg: vec![],
+        conflicts: vec![],
+    }
+}
+
+fn set(names: &[&str]) -> std::collections::HashSet<String> {
+    names.iter().map(|s| s.to_string()).collect()
+}
+
+// --- Property 1: Seed inclusion ---
+
+#[test]
+fn s2_empty_seed_returns_empty() {
+    let flags = vec![flag_decl("tls", &[]), flag_decl("http", &[])];
+    let result = flag_enables_closure(&flags, &set(&[]));
+    assert!(result.is_empty());
+}
+
+#[test]
+fn s2_seed_with_no_enables() {
+    let flags = vec![flag_decl("tls", &[]), flag_decl("http", &[])];
+    let result = flag_enables_closure(&flags, &set(&["tls"]));
+    assert!(result.contains("tls"));
+}
+
+#[test]
+fn s2_full_seed_preserved() {
+    let flags = vec![flag_decl("tls", &[]), flag_decl("http", &[])];
+    let seed = set(&["tls", "http"]);
+    let result = flag_enables_closure(&flags, &seed);
+    assert!(result.contains("tls") && result.contains("http"));
+}
+
+// --- Property 2: One-hop enable ---
+
+#[test]
+fn s2_one_hop() {
+    // seed {full} where full enables "tls" "http" → result ⊇ {full, tls, http}
+    let flags = vec![
+        flag_decl("tls", &[]),
+        flag_decl("http", &[]),
+        flag_decl("full", &["tls", "http"]),
+    ];
+    let result = flag_enables_closure(&flags, &set(&["full"]));
+    assert_eq!(result, set(&["full", "tls", "http"]));
+}
+
+#[test]
+fn s2_inactive_flag_does_not_propagate() {
+    let flags = vec![flag_decl("tls", &[]), flag_decl("full", &["tls"])];
+    // seed does NOT include "full"
+    let result = flag_enables_closure(&flags, &set(&["tls"]));
+    assert_eq!(result, set(&["tls"]));
+}
+
+#[test]
+fn s2_enables_multiple_targets() {
+    let flags = vec![
+        flag_decl("a", &[]),
+        flag_decl("b", &[]),
+        flag_decl("c", &[]),
+        flag_decl("meta", &["a", "b", "c"]),
+    ];
+    let result = flag_enables_closure(&flags, &set(&["meta"]));
+    assert_eq!(result, set(&["meta", "a", "b", "c"]));
+}
+
+// --- Property 3: Transitive (multi-hop) ---
+
+#[test]
+fn s2_two_hop() {
+    // a enables b, b enables c, seed {a} → {a, b, c}
+    let flags = vec![
+        flag_decl("c", &[]),
+        flag_decl("b", &["c"]),
+        flag_decl("a", &["b"]),
+    ];
+    let result = flag_enables_closure(&flags, &set(&["a"]));
+    assert_eq!(result, set(&["a", "b", "c"]));
+}
+
+#[test]
+fn s2_three_hop() {
+    // a→b→c→d chain from seed {a}
+    let flags = vec![
+        flag_decl("d", &[]),
+        flag_decl("c", &["d"]),
+        flag_decl("b", &["c"]),
+        flag_decl("a", &["b"]),
+    ];
+    let result = flag_enables_closure(&flags, &set(&["a"]));
+    assert_eq!(result, set(&["a", "b", "c", "d"]));
+}
+
+#[test]
+fn s2_diamond() {
+    // Diamond: a→{b,c}, b→d, c→d. result is {a,b,c,d}
+    let flags = vec![
+        flag_decl("d", &[]),
+        flag_decl("b", &["d"]),
+        flag_decl("c", &["d"]),
+        flag_decl("a", &["b", "c"]),
+    ];
+    let result = flag_enables_closure(&flags, &set(&["a"]));
+    assert_eq!(result, set(&["a", "b", "c", "d"]));
+}
+
+// --- Property 4: Idempotence ---
+
+#[test]
+fn s2_closure_is_idempotent() {
+    let flags = vec![
+        flag_decl("c", &[]),
+        flag_decl("b", &["c"]),
+        flag_decl("a", &["b"]),
+    ];
+    let seed = set(&["a"]);
+    let first = flag_enables_closure(&flags, &seed);
+    let second = flag_enables_closure(&flags, &first);
+    assert_eq!(first, second);
+}
+
+#[test]
+fn s2_idempotent_no_enables() {
+    let flags = vec![flag_decl("x", &[]), flag_decl("y", &[])];
+    let seed = set(&["x", "y"]);
+    let first = flag_enables_closure(&flags, &seed);
+    let second = flag_enables_closure(&flags, &first);
+    assert_eq!(first, second);
+}
+
+// --- Property 5: Cycle termination ---
+
+#[test]
+fn s2_two_cycle() {
+    // a enables b, b enables a, seed {a} → {a, b}; function terminates
+    let flags = vec![flag_decl("b", &["a"]), flag_decl("a", &["b"])];
+    let result = flag_enables_closure(&flags, &set(&["a"]));
+    assert_eq!(result, set(&["a", "b"]));
+}
+
+#[test]
+fn s2_self_enable() {
+    // A flag that enables itself is a trivial cycle; still terminates
+    let flags = vec![flag_decl("a", &["a"])];
+    let result = flag_enables_closure(&flags, &set(&["a"]));
+    assert_eq!(result, set(&["a"]));
+}
+
+#[test]
+fn s2_three_cycle() {
+    // a→b→c→a cycle; seed {a} → {a, b, c}
+    let flags = vec![
+        flag_decl("c", &["a"]),
+        flag_decl("b", &["c"]),
+        flag_decl("a", &["b"]),
+    ];
+    let result = flag_enables_closure(&flags, &set(&["a"]));
+    assert_eq!(result, set(&["a", "b", "c"]));
+}
+
+#[test]
+fn s2_cycle_plus_tail() {
+    // a→b→a cycle, a also enables d; seed {a} → {a, b, d}
+    let flags = vec![
+        flag_decl("d", &[]),
+        flag_decl("b", &["a"]),
+        flag_decl("a", &["b", "d"]),
+    ];
+    let result = flag_enables_closure(&flags, &set(&["a"]));
+    assert_eq!(result, set(&["a", "b", "d"]));
+}
+
+// --- Property 6: Order-independence ---
+
+#[test]
+fn s2_flag_table_order_does_not_affect_result() {
+    let seed = set(&["meta"]);
+    // Order A: meta last
+    let flags_a = vec![
+        flag_decl("a", &[]),
+        flag_decl("b", &[]),
+        flag_decl("meta", &["a", "b"]),
+    ];
+    // Order B: meta first
+    let flags_b = vec![
+        flag_decl("meta", &["a", "b"]),
+        flag_decl("b", &[]),
+        flag_decl("a", &[]),
+    ];
+    assert_eq!(
+        flag_enables_closure(&flags_a, &seed),
+        flag_enables_closure(&flags_b, &seed)
+    );
+}
+
+#[test]
+fn s2_union_is_commutative() {
+    let flags = vec![
+        flag_decl("x", &[]),
+        flag_decl("y", &[]),
+        flag_decl("fa", &["x"]),
+        flag_decl("fb", &["y"]),
+    ];
+    let r1 = flag_enables_closure(&flags, &set(&["fa", "fb"]));
+    let r2 = flag_enables_closure(&flags, &set(&["fb", "fa"]));
+    assert_eq!(r1, r2);
+    assert_eq!(r1, set(&["fa", "fb", "x", "y"]));
+}
+
+// --- Property 7: Cross-package entries are ignored ---
+
+#[test]
+fn s2_cross_pkg_entries_not_followed() {
+    // cross-package enables are ignored in S2 (resolve-time concern, S3/S4a)
+    let flags = vec![
+        flag_decl("tls", &[]),
+        FlagDecl {
+            name: "full".to_string(),
+            default: false,
+            description: String::new(),
+            defines: vec![],
+            enables_same_pkg: vec!["tls".to_string()],
+            enables_cross_pkg: vec![CrossPkgEnable {
+                dep: "chronos".to_string(),
+                flag_requests: vec![FlagRequest {
+                    name: "tls".to_string(),
+                    enabled: true,
+                }],
+            }],
+            conflicts: vec![],
+        },
+    ];
+    let result = flag_enables_closure(&flags, &set(&["full"]));
+    assert!(result.contains("tls"), "'tls' (same-pkg) must be reached");
+    assert!(!result.contains("chronos"), "'chronos' is cross-pkg, not a flag");
+}
+
+// --- Unknown targets graceful ---
+
+#[test]
+fn s2_closure_skips_unknown_enables_targets() {
+    // enables targets not in the flag table are silently ignored
+    let flags = vec![flag_decl("a", &["nonexistent"])];
+    let result = flag_enables_closure(&flags, &set(&["a"]));
+    assert!(result.contains("a"));
+    assert!(!result.contains("nonexistent"));
+}
+
+// --- Default-seeding is caller's responsibility ---
+
+#[test]
+fn s2_default_seeding_is_callers_responsibility() {
+    let flags = vec![
+        FlagDecl {
+            name: "ssl".to_string(),
+            default: true,
+            description: String::new(),
+            defines: vec![],
+            enables_same_pkg: vec![],
+            enables_cross_pkg: vec![],
+            conflicts: vec![],
+        },
+        flag_decl("debug", &[]),
+        FlagDecl {
+            name: "net".to_string(),
+            default: true,
+            description: String::new(),
+            defines: vec![],
+            enables_same_pkg: vec!["ssl".to_string()],
+            enables_cross_pkg: vec![],
+            conflicts: vec![],
+        },
+    ];
+    // Caller seeds from default-true flags
+    let defaults_seed: std::collections::HashSet<String> = flags
+        .iter()
+        .filter(|f| f.default)
+        .map(|f| f.name.clone())
+        .collect();
+    assert_eq!(defaults_seed, set(&["ssl", "net"]));
+    let result = flag_enables_closure(&flags, &defaults_seed);
+    assert!(result.contains("ssl"));
+    assert!(result.contains("net"));
+    assert!(!result.contains("debug"));
+}
+
+// --- RFC §3.1.1 example ---
+
+#[test]
+fn s2_rfc_full_flag_example() {
+    // RFC §3.1.1: tls, http, full enables {tls, http}; cross-pkg (chronos) ignored.
+    let flags = vec![
+        flag_decl("tls", &[]),
+        flag_decl("http", &[]),
+        FlagDecl {
+            name: "full".to_string(),
+            default: false,
+            description: String::new(),
+            defines: vec![],
+            enables_same_pkg: vec!["tls".to_string(), "http".to_string()],
+            enables_cross_pkg: vec![CrossPkgEnable {
+                dep: "chronos".to_string(),
+                flag_requests: vec![FlagRequest {
+                    name: "tls".to_string(),
+                    enabled: true,
+                }],
+            }],
+            conflicts: vec![],
+        },
+    ];
+    let result = flag_enables_closure(&flags, &set(&["full"]));
+    assert_eq!(result, set(&["full", "tls", "http"]));
+}

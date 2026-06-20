@@ -1,0 +1,2 @@
+mylib -> (symlink)
+translib -> <CAS_ROOT>/sha256/f089c68be5b441fb11822b4696d764030fae65631fefed440d378de62d1738e7/

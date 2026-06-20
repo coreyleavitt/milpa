@@ -1,0 +1,12 @@
+name "lib-enabler"
+kind "library"
+flags {
+    enabler-flag default=#true {
+        enables {
+            lib-target { flag "feat-y" }
+        }
+    }
+}
+deps {
+    lib-target git=(url)"https://example.com/lib-target.git" ref="main"
+}

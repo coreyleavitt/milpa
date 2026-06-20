@@ -50,6 +50,7 @@ from __future__ import annotations
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -82,15 +83,22 @@ from milpa.lockfile import (
 )
 from milpa.manifest import (
     Dep,
+    FlagDecl,
+    FlagRequest,
+    GitTarget,
     LocalDep,
+    LocalTarget,
     Manifest,
     MemberDep,
+    MemberTarget,
     NamedDep,
     Override,
     Predicate,
     TarballDep,
     UrlDep,
+    flag_enables_closure,
 )
+from milpa.predicate import dep_passes_flag_predicates
 from milpa.edge_sources import (
     DepDeclEdgeSource,
     EdgeSourceCtx,
@@ -118,6 +126,148 @@ if TYPE_CHECKING:
 # URL deps, local deps, and member deps have exactly one canonical version.
 # The exact sentinel value is an incidental implementation detail (§3 NOTE).
 _URL_DEP_VERSION: Version = Version(0, 0, 1)
+
+
+# ---------------------------------------------------------------------------
+# S3 (RFC #23 §7 + §3.1.2): Activation source enumeration
+# ---------------------------------------------------------------------------
+
+
+class ActivationSource(Enum):
+    """Source of a flag activation in active(D).
+
+    Defined identically in both Python and Rust impls (SSOT for cross-impl
+    divergence prevention — §5 RFC #23).  Sources are tracked per activated
+    flag to support RESOLVE-FLAG-CONFLICT payloads (§3.1.4) and the future
+    ``milpa features`` trace (§3.7).
+
+    Variants:
+      DEFAULT       — flag is active because its manifest declares ``default=#true``.
+      EDGE_REQUEST  — flag is active because an edge ``dep { flag "x" }`` requested it.
+      ENABLES_RULE  — flag is active because an active flag's ``enables`` targets it
+                      (same-package enables closure, S2 + S3).
+      CLI           — flag is active because the user passed ``--features``/``--all-features``
+                      on the command line (S9, RFC #23 §3.4).
+
+    Variant ORDER is normative (both impls must use the same declaration order):
+    DEFAULT / EDGE_REQUEST / ENABLES_RULE / CLI — serialized names must match
+    the Rust ActivationSource variant names exactly for RESOLVE-FLAG-CONFLICT
+    payload byte-identity.
+    """
+
+    DEFAULT = auto()
+    EDGE_REQUEST = auto()
+    ENABLES_RULE = auto()
+    CLI = auto()
+
+
+def compute_dep_active_flags(
+    flags: tuple[FlagDecl, ...],
+    requested: tuple[FlagRequest, ...],
+) -> dict[str, set[ActivationSource]]:
+    """Compute active(D) for a dep with the given flag declarations and consumer requests.
+
+    S3 (RFC #23 §3.1.2 + §7 S3): single-hop seeding.
+
+    Returns a dict mapping active flag name → set of ActivationSource values.
+    This is the source-tracked set; the flag-name projection is ``set(result)``.
+
+    Rules applied (monotone):
+      1. ``active(D) ⊇ { f ∈ D.flags : f.default }`` — seed from default-true flags.
+      2. ``active(D) ⊇ { f : requested[f].enabled }`` — seed from edge requests
+         (only for flags actually declared in D.flags; unknown flag names are
+         silently ignored per RESOLVE-FLAG-UNKNOWN-ON-TARGET warn-and-ignore).
+      3. ``active(D) ⊇ enables-closure within D`` — propagate via same-package
+         ``enables_same_pkg`` (S2 ``flag_enables_closure``), tagging new entries
+         with ENABLES_RULE.
+
+    Negative requests (``flag "x" #false``) are absence-of-request (§3.1.3):
+    they are NOT subtracted from the active set.  If the DEFAULT source activates
+    a flag, a negative request does not remove it.
+
+    ``requested`` that name flags not declared in ``flags`` are silently ignored
+    (RESOLVE-FLAG-UNKNOWN-ON-TARGET, §3.1.1, warn-and-ignore; warnings not yet
+    emitted — observability via future S3.1 warning infrastructure).
+    """
+    flag_by_name: dict[str, FlagDecl] = {fd.name: fd for fd in flags}
+
+    # Result: flag name → set of sources that activated it.
+    active: dict[str, set[ActivationSource]] = {}
+
+    # Rule 1: default-true flags.
+    for fd in flags:
+        if fd.default:
+            if fd.name not in active:
+                active[fd.name] = set()
+            active[fd.name].add(ActivationSource.DEFAULT)
+
+    # Rule 2: edge requests (positive only; negative = absence-of-request).
+    for fr in requested:
+        if fr.enabled and fr.name in flag_by_name:
+            if fr.name not in active:
+                active[fr.name] = set()
+            active[fr.name].add(ActivationSource.EDGE_REQUEST)
+        # Negative or unknown: silently ignored (absence-of-request / warn-and-ignore).
+
+    # Rule 3: same-package enables closure over the current active seed.
+    seed = frozenset(active.keys())
+    closed = flag_enables_closure(flags, seed)
+    # New entries from closure (not already in active) get ENABLES_RULE source.
+    for flag_name in closed:
+        if flag_name not in active:
+            active[flag_name] = {ActivationSource.ENABLES_RULE}
+
+    return active
+
+
+# ---------------------------------------------------------------------------
+# S4a (RFC #23 §7 + §3.1.2): cross-package enables propagation helpers
+# ---------------------------------------------------------------------------
+
+
+def compute_cross_pkg_enables(
+    flags: "tuple[FlagDecl, ...]",
+    active_flag_names: "frozenset[str]",
+) -> "dict[str, list[FlagRequest]]":
+    """Compute cross-package flag requests generated by dep's currently-active flags.
+
+    S4a (RFC #23 §3.1.2 "Activation = a monotone closure"): for each active flag
+    in ``active_flag_names``, inspect its ``enables_cross_pkg`` entries and
+    emit FlagRequest objects for the target deps.
+
+    Parameters
+    ----------
+    flags:
+        The ``FlagDecl`` tuple from the dep's parsed manifest (``Manifest.flags``).
+    active_flag_names:
+        The name-projection of the current ``active(D)`` map — i.e.
+        ``frozenset(active_map.keys())`` where ``active_map`` is the
+        ``dict[str, set[ActivationSource]]`` returned by
+        ``compute_dep_active_flags``.
+
+    Returns
+    -------
+    dict[str, list[FlagRequest]]
+        Maps target dep name → list of FlagRequest objects generated by cross-pkg
+        enables from active flags of this dep.  Empty dict if no enables fire.
+    """
+    # Build a name→FlagDecl lookup for O(1) access.
+    flag_by_name: dict[str, FlagDecl] = {fd.name: fd for fd in flags}
+
+    result: dict[str, list[FlagRequest]] = {}
+    for flag_name in active_flag_names:
+        fd = flag_by_name.get(flag_name)
+        if fd is None:
+            continue
+        for cpe in fd.enables_cross_pkg:
+            # cpe: CrossPkgEnable(dep=str, flag_requests=tuple[FlagRequest])
+            target = cpe.dep
+            if target not in result:
+                result[target] = []
+            result[target].extend(cpe.flag_requests)
+
+    return result
+
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +368,12 @@ class _Provider:
         self._params = params
         self._overrides_by_name = overrides_by_name
 
+        # S3 (RFC #23 §3.1.2 + §7 S3): consumer-side flag requests for named deps.
+        # name → tuple[FlagRequest, ...]; populated from the root manifest's
+        # NamedDep.flag_requests at queue-seeding time (step 5 in resolve()).
+        # Used by _materialize to seed ctx.active_flags for the dep's edge resolve.
+        self._flag_requests_by_name: dict[str, tuple[FlagRequest, ...]] = {}
+
         # Shared dedup sets (owned by resolve(), borrowed here for callbacks)
         self._root_authority = root_authority
         self._seen_named = seen_named
@@ -238,6 +394,15 @@ class _Provider:
         )
         # S5: strict attestation policy (OR of manifest + flag).
         self._strict_attestation: bool = strict_attestation
+
+        # S3 (RFC #23 §3.1.2 + §7 S3): resolver-scoped dep_active_flags map.
+        # Maps resolved dep identity → dict[flag_name, set[ActivationSource]].
+        # Keyed by resolved identity after override application (§3.1.2 "Keying
+        # (normative)") so alias folding and dedup work correctly in S4a.
+        # Populated incrementally: named deps from _materialize; URL deps populated
+        # from the resolver main thread after workers return (S3 single-hop scope).
+        # Full fixpoint iteration (S4a) will expand this to multi-hop.
+        self.dep_active_flags: dict[str, dict[str, set[ActivationSource]]] = {}
 
     def add(self, c: _Candidate) -> None:
         """Add a candidate unconditionally (for __root__ and pre-built deps)."""
@@ -299,6 +464,12 @@ class _Provider:
         # reach materialisation (overridden named deps are coerced to URL deps
         # before Phase A; they never become stubs).
         has_milpa_kdl = (result.path / "milpa.kdl").exists()
+        # S3 (RFC #23 §3.1.2 + §7 S3): seed active_flags from positive flag
+        # requests stored at queue-seeding time (step 5 in resolve()).
+        _name_flag_reqs = self._flag_requests_by_name.get(name, ())
+        _requested_flags: frozenset[str] = frozenset(
+            fr.name for fr in _name_flag_reqs if fr.enabled
+        )
         ctx = EdgeSourceCtx(
             dep_path=result.path,
             dep_name=name,
@@ -307,6 +478,7 @@ class _Provider:
             is_overridden=False,   # overridden named → URL coercion before Phase A
             has_milpa_kdl=has_milpa_kdl,
             overrides_by_name=self._overrides_by_name,
+            active_flags=_requested_flags,  # S3: consumer-requested flags
         )
         es = resolve_edges(
             name,
@@ -346,6 +518,25 @@ class _Provider:
             dep_decl=_dep_decl_pin,
             requires_predicates=requires_predicates,
         )
+
+        # S3: compute and store dep_active_flags for this named dep.
+        # The dep's manifest flags are available from the fetched tree.
+        # Identity key: iv.content_hash (resolved identity after override
+        # application — §3.1.2 "Keying (normative)").
+        if iv.content_hash and result.path is not None:
+            dep_manifest_flags: tuple[FlagDecl, ...] = ()
+            _kdl_path = result.path / "milpa.kdl"
+            if _kdl_path.exists():
+                try:
+                    from milpa.manifest import parse_manifest as _pm
+                    _dep_m = _pm(_kdl_path.read_text(encoding="utf-8"))
+                    dep_manifest_flags = _dep_m.flags
+                except Exception:
+                    pass  # non-fatal; flags remain empty
+            _flag_reqs = self._flag_requests_by_name.get(name, ())
+            _active_entry = compute_dep_active_flags(dep_manifest_flags, _flag_reqs)
+            if _active_entry:
+                self.dep_active_flags[iv.content_hash] = _active_entry
 
         # Register and clear stub.
         self._candidates.setdefault(name, {})[stub.version] = candidate
@@ -408,19 +599,107 @@ class _NamedStub:
 # ---------------------------------------------------------------------------
 
 
+def _compute_root_active_seed(
+    manifest: Manifest,
+    features: frozenset[str],
+    no_default_features: bool,
+    all_features: bool,
+) -> frozenset[str]:
+    """Compute the root-level active-flag seed from CLI feature inputs (S9).
+
+    Applies the three CLI feature-selection inputs (RFC #23 §3.4) to produce
+    the root manifest's initial active-flag seed BEFORE the enables-closure:
+
+    - ``all_features=True``: seed = all declared flag names.
+    - ``no_default_features=True``: seed = ``features`` only (no defaults).
+    - Neither: seed = default-true flags ∪ ``features``.
+
+    ``features`` naming a flag the root manifest does not declare raises
+    ``MilpaError(FROZEN_ACTIVE_FLAGS_MISMATCH, ...)`` — surface-don't-hide
+    (spec §3.4: "a --features naming a flag the root doesn't declare → error").
+
+    Returns the raw seed (before enables-closure); caller applies
+    ``flag_enables_closure`` over this seed.
+    """
+    from milpa.errors import FROZEN_ACTIVE_FLAGS_MISMATCH, MilpaError as _MilpaError
+
+    declared_names: frozenset[str] = frozenset(fd.name for fd in manifest.flags)
+
+    # Validate: --features names must be declared in the root manifest.
+    unknown = features - declared_names
+    if unknown:
+        raise _MilpaError(
+            FROZEN_ACTIVE_FLAGS_MISMATCH,
+            f"--features names flags not declared in the root manifest: "
+            f"{sorted(unknown)} — add them to the 'flags' block or remove them",
+            unknown=sorted(unknown),
+        )
+
+    if all_features:
+        # All declared flags active.
+        return declared_names
+
+    if no_default_features:
+        # No defaults; only explicit --features additions.
+        return features
+
+    # Default: default-true flags ∪ --features.
+    default_seed: frozenset[str] = frozenset(
+        fd.name for fd in manifest.flags if fd.default
+    )
+    return default_seed | features
+
+
+# ---------------------------------------------------------------------------
+# Manifest filtering — two intentionally distinct functions (resolver-semantics §470)
+#
+# DO NOT collapse these into a single function or route the absent-profile case
+# through a synthetic Profile with all-None axes.  resolver-semantics §470 is
+# NORMATIVE: an absent/None profile disables platform/arch/nim/milpa-predicate
+# filtering entirely — every dep is included regardless of those predicates.
+# Flag predicates are a SEPARATE axis (§489): they apply based on the active
+# flag set, independent of profile presence.
+#
+# Correct dispatch (also enforced in Rust resolver.rs — keep in sync):
+#   profile present  → _filter_manifest_by_profile  (evaluates ALL predicates)
+#   profile absent, features active → _filter_manifest_by_flags_only
+#                                      (flag predicates only; non-flag = pass)
+#   profile absent, no features    → no filtering (all deps included)
+#
+# A "SSOT unification" that synthesises Profile{platform=None, ...} and calls
+# _filter_manifest_by_profile would silently re-introduce the §470 violation
+# because _predicate_satisfied returns False for platform/arch/nim/milpa when
+# the profile axis is None.  The two functions are the correct SSOT boundary.
+# ---------------------------------------------------------------------------
+
 def _filter_manifest_by_profile(
     manifest: Manifest,
     profile: Profile,
+    cli_active_seed: frozenset[str] | None = None,
 ) -> Manifest:
     """Return a ``Manifest`` with only the deps whose predicates match ``profile``.
 
     Called at the start of ``resolve()`` BEFORE any BFS or solver input.
     When ``profile`` is ``None``, filtering is disabled and all deps are
     included (§6 NORMATIVE: absent profile ≠ profile that matches nothing).
+
+    ``active_flags`` is the enables-closure of the manifest's default-true flags
+    (S2 same-package closure via ``flag_enables_closure``).  This is the
+    SSOT for root-dep flag-predicate evaluation; transitive deps are handled
+    by the S4a fixpoint loop in ``_run_bfs_wave_loop``.
+
+    S9: when ``cli_active_seed`` is provided (computed by
+    ``_compute_root_active_seed`` from CLI feature inputs), it overrides the
+    default-true-flag seed so the enables-closure starts from the CLI-selected
+    root set instead of just the defaults.
     """
-    active_flags: frozenset[str] = frozenset(
-        fd.name for fd in manifest.flags if fd.default
-    )
+    if cli_active_seed is not None:
+        seed: frozenset[str] = cli_active_seed
+    else:
+        seed = frozenset(
+            fd.name for fd in manifest.flags if fd.default
+        )
+    active_flags: frozenset[str] = flag_enables_closure(manifest.flags, seed)
     kept = tuple(
         d for d in manifest.deps
         if _dep_matches_profile(d, profile, active_flags)
@@ -435,13 +714,49 @@ def _filter_manifest_by_profile(
     return dc_replace(manifest, deps=kept, dev_deps=kept_dev)
 
 
+def _filter_manifest_by_flags_only(
+    manifest: Manifest,
+    cli_active_seed: frozenset[str],
+) -> Manifest:
+    """Filter manifest deps by flag predicates only (S9 — no platform profile).
+
+    Called when CLI features are active but no platform/nim profile exists.
+    Non-flag predicates are not filtered (absent profile = all platform values
+    pass, §6 NORMATIVE).  Only deps whose flag predicates are satisfied by
+    the enables-closure of ``cli_active_seed`` are retained.
+
+    A dep with NO flag predicates is always retained (the predicate conjunction
+    over an empty set is vacuously true — no constraint, no prune).
+    """
+    active_flags: frozenset[str] = flag_enables_closure(manifest.flags, cli_active_seed)
+
+    kept = tuple(
+        d for d in manifest.deps
+        if dep_passes_flag_predicates(d.predicates, active_flags)
+    )
+    kept_dev = tuple(
+        d for d in manifest.dev_deps
+        if dep_passes_flag_predicates(d.predicates, active_flags)
+    )
+    if len(kept) == len(manifest.deps) and len(kept_dev) == len(manifest.dev_deps):
+        return manifest
+    from dataclasses import replace as dc_replace
+    return dc_replace(manifest, deps=kept, dev_deps=kept_dev)
+
+
 def _dep_matches_profile(
     dep: Dep,
     profile: Profile,
     active_flags: frozenset[str],
 ) -> bool:
-    """True iff ALL predicates on ``dep`` match the profile (conjunction)."""
-    preds: tuple[Predicate, ...] = getattr(dep, "predicates", ())
+    """True iff ALL predicates on ``dep`` match the profile (conjunction).
+
+    All five dep forms (UrlDep, NamedDep, LocalDep, TarballDep, MemberDep)
+    carry a ``predicates`` field (§6.3 NORMATIVE).  Direct field access is
+    intentional: a missing field is a hard error (wrong dep type), not a
+    silent admit.
+    """
+    preds: tuple[Predicate, ...] = dep.predicates
     return all(_predicate_satisfied(pred, profile, active_flags) for pred in preds)
 
 
@@ -456,8 +771,7 @@ def _predicate_satisfied(
     Negation inverts the OR result.
     """
     if pred.name == "flag":
-        any_match = any(v in active_flags for v in pred.values)
-        return (not any_match) if pred.negated else any_match
+        return dep_passes_flag_predicates((pred,), active_flags)
 
     actual: str | None = getattr(profile, pred.name, None)
     if actual is None:
@@ -600,6 +914,75 @@ def _find_nimble_file(dep_path: Path, name: str) -> Path:
     raise FileNotFoundError(f"no .nimble file found under {dep_path}")
 
 
+def _apply_git_override_to_url_dep(dep: UrlDep, ov: Override) -> UrlDep:
+    """Apply a git-form override to a UrlDep, returning the overridden dep.
+
+    S8 dispatch: GitTarget → rewrite URL.  MemberTarget raises NotImplementedError
+    (S8b).  LocalTarget is NOT handled here — callers that accept the override
+    result must use ``_apply_override`` to get the correct ``Dep`` union type.
+    This function is kept for existing git-path callers that return ``UrlDep``.
+    """
+    if isinstance(ov.target, GitTarget):
+        return UrlDep(name=dep.name, git=ov.target.git, ref=ov.target.ref)
+    if isinstance(ov.target, LocalTarget):
+        raise NotImplementedError(
+            f"LocalTarget override for {dep.name!r} is not yet wired "
+            "(S8a — resolver interception sites for local= targets)"
+        )
+    if isinstance(ov.target, MemberTarget):
+        raise NotImplementedError(
+            f"MemberTarget override for {dep.name!r} is not yet wired "
+            "(S8b — resolver interception sites for member targets)"
+        )
+    raise NotImplementedError(f"Unknown override target kind: {type(ov.target)}")
+
+
+def _override_target_to_pkey(ov: Override) -> "tuple[object, ...]":
+    """Map an Override target to the provenance-gate key used for pre-seeding (S8).
+
+    Centralises the OverrideTarget → pkey mapping so ``resolve`` and
+    ``resolve_workspace`` don't each inline an identical match.  Mirrors Rust's
+    ``override_target_to_pkey`` (M9 SSOT).
+
+    Git   → ("url", git, ref)
+    Local → ("local-override", path)
+    Member → ("member-override", member_name)
+    """
+    if isinstance(ov.target, GitTarget):
+        return ("url", ov.target.git, ov.target.ref)
+    if isinstance(ov.target, LocalTarget):
+        return ("local-override", ov.target.path)
+    if isinstance(ov.target, MemberTarget):
+        return ("member-override", ov.target.member_name)
+    raise NotImplementedError(f"Unknown override target kind: {type(ov.target)}")
+
+
+def _apply_override(name: str, ov: Override) -> "UrlDep | LocalDep":
+    """Apply an override to a dep by name, returning the effective dep.
+
+    S8a: GitTarget → UrlDep (existing path); LocalTarget → LocalDep (new, S8a).
+    S8b: MemberTarget — callers must handle MemberTarget BEFORE calling this
+    function (workspace BFS seed, _enqueue_dep, BFS wave loop).  This function
+    is only reached for Git/Local targets; MemberTarget is pre-intercepted.
+
+    Returns ``UrlDep`` for git-form overrides and ``LocalDep`` for local-form
+    overrides.  The caller is responsible for routing to the correct BFS queue
+    slot (``("url", dep)`` vs ``("local", dep)``).
+    """
+    if isinstance(ov.target, GitTarget):
+        return UrlDep(name=name, git=ov.target.git, ref=ov.target.ref)
+    if isinstance(ov.target, LocalTarget):
+        return LocalDep(name=name, path=ov.target.path)
+    if isinstance(ov.target, MemberTarget):
+        # Should not reach here — callers intercept MemberTarget before _apply_override.
+        # If this fires, a new call-site was added without handling S8b.
+        raise AssertionError(
+            f"_apply_override reached MemberTarget for {name!r}; callers must "
+            "intercept MemberTarget before calling _apply_override (S8b)"
+        )
+    raise NotImplementedError(f"Unknown override target kind: {type(ov.target)}")
+
+
 def _dep_to_term(
     dep: Dep,
     overrides_by_name: dict[str, Override],
@@ -686,7 +1069,16 @@ def _provenance_key_for_url_dep(
 ) -> tuple[object, ...]:
     if dep.name in overrides_by_name:
         ov = overrides_by_name[dep.name]
-        return ("url", ov.git, ov.ref)
+        from milpa.manifest import GitTarget as _GitTarget
+        if isinstance(ov.target, _GitTarget):
+            return ("url", ov.target.git, ov.target.ref)
+        # LocalTarget / MemberTarget: provenance key uses the target kind.
+        # (Resolution wired in S8a/S8b; key is distinct from any git URL.)
+        from milpa.manifest import LocalTarget as _LocalTarget, MemberTarget as _MemberTarget
+        if isinstance(ov.target, _LocalTarget):
+            return ("local-override", ov.target.path)
+        if isinstance(ov.target, _MemberTarget):
+            return ("member-override", ov.target.member_name)
     return ("url", dep.git, dep.ref)
 
 
@@ -762,6 +1154,13 @@ def _run_bfs_wave_loop(
         # queue runs out of new I/O items (all remaining are named or
         # already-seen URL/tarball/local).
         wave_futures: list[object] = []
+        # S3: track which UrlDep each future corresponds to, for dep_active_flags
+        # population in the result-drain phase (keyed by future identity).
+        future_to_url_dep: dict[int, UrlDep] = {}
+        # S4b: accumulate flag_requests from ADDITIONAL consumers of an already-seen
+        # URL dep (multi-consumer union, §3.1.3).  Keyed by dep name; applied after
+        # the wave drain so the dep's identity is confirmed.
+        wave_pending_flag_reqs: dict[str, list[FlagRequest]] = {}
 
         j = i
         while j < len(bfs_queue):
@@ -796,14 +1195,61 @@ def _run_bfs_wave_loop(
                 dep_u: UrlDep = item[1]
                 if dep_u.name in overrides_by_name:
                     ov = overrides_by_name[dep_u.name]
-                    dep_u = UrlDep(name=dep_u.name, git=ov.git, ref=ov.ref)
+                    # S8a: LocalTarget override → route to the "local" BFS slot.
+                    if isinstance(ov.target, LocalTarget):
+                        _local_ov = LocalDep(name=dep_u.name, path=ov.target.path)
+                        if _local_ov.path not in seen_local:
+                            seen_local.add(_local_ov.path)
+                            record_discovery(_local_ov.name)
+                            def _local_ov_worker(
+                                _dep: LocalDep = _local_ov,
+                            ) -> tuple[str, object]:
+                                return ("local", _process_local_worker(
+                                    _dep,
+                                    deps_dir=deps_dir,
+                                    env=env,
+                                    params=params,
+                                    overrides_by_name=overrides_by_name,
+                                ))
+                            wave_futures.append(executor.submit(_local_ov_worker))  # type: ignore[union-attr]
+                        continue
+                    # S8b: MemberTarget override — member already pre-registered.
+                    # The provenance gate was pre-seeded with root authority, so any
+                    # transitive dep claiming this name externally is suppressed below.
+                    # We skip external queueing here.
+                    if isinstance(ov.target, MemberTarget):
+                        continue
+                    dep_u = _apply_git_override_to_url_dep(dep_u, ov)
                 pkey_u = ("url", dep_u.git, dep_u.ref)
+                # S4b: record the prior provenance entry BEFORE calling the gate,
+                # so we can distinguish same-provenance dedup from root-suppression.
+                # Same-provenance dedup (prior[0] == pkey_u) = additional consumer of
+                # the same dep → accumulate flag_requests for the union (§3.1.3).
+                # Root-suppression (different pkey) = dep overridden by root → skip.
+                _prior_prov_u = provenance_gate.get(dep_u.name)
                 if not _check_provenance_gate(
                     dep_u.name, pkey_u, provenance_gate, root_authority
                 ):
+                    # S4b: if this is a same-provenance dedup, the current item is
+                    # a second (or later) consumer of the same dep.  Accumulate its
+                    # flag_requests so the union is computed in the S4b block below.
+                    if (
+                        _prior_prov_u is not None
+                        and _prior_prov_u[0] == pkey_u
+                        and dep_u.flag_requests
+                    ):
+                        wave_pending_flag_reqs.setdefault(dep_u.name, []).extend(
+                            dep_u.flag_requests
+                        )
                     continue
                 url_key_u = (dep_u.git, dep_u.ref)
                 if url_key_u in seen_url:
+                    # Same URL already submitted in a prior wave (cross-wave dup).
+                    # Accumulate flag_requests for multi-consumer union (§3.1.3).
+                    if dep_u.flag_requests:
+                        wave_pending_flag_reqs.setdefault(dep_u.name, []).extend(
+                            dep_u.flag_requests
+                        )
                     continue
                 seen_url.add(url_key_u)
                 record_discovery(dep_u.name)  # Phase B: transitive URL dep first-enqueue
@@ -818,7 +1264,10 @@ def _run_bfs_wave_loop(
                         params=params,
                         overrides_by_name=overrides_by_name,
                     ))
-                wave_futures.append(executor.submit(_url_worker))  # type: ignore[union-attr]
+                _url_fut = executor.submit(_url_worker)  # type: ignore[union-attr]
+                wave_futures.append(_url_fut)
+                # S3: record dep reference so result-drain can compute dep_active_flags.
+                future_to_url_dep[id(_url_fut)] = dep_u
 
             elif kind == "tarball":
                 dep_t: TarballDep = item[1]
@@ -881,8 +1330,575 @@ def _run_bfs_wave_loop(
                 cache_key_r = (cand_r.name, cand_r.version)
                 if cache_key_r not in edge_cache:
                     edge_cache[cache_key_r] = es_r
+
+                # S3 / C1: unconditionally seed dep_active_flags for URL deps so
+                # that default-true flags are visible to the S4a fixpoint even
+                # when no consumer flag_requests exist.  Keyed by identity
+                # (content_hash) — NORMATIVE per spec/identity.md §3.1.2.
+                if kind_result == "url" and cand_r.identity is not None:
+                    _orig_url_dep = future_to_url_dep.get(id(fut))
+                    _url_flag_reqs: tuple[FlagRequest, ...] = (
+                        _orig_url_dep.flag_requests
+                        if _orig_url_dep is not None
+                        else ()
+                    )
+                    _dep_kdl = deps_dir / cand_r.name / "milpa.kdl"
+                    _url_manifest_flags: tuple[FlagDecl, ...] = ()
+                    if _dep_kdl.exists():
+                        try:
+                            from milpa.manifest import parse_manifest as _pm2
+                            _udm = _pm2(_dep_kdl.read_text(encoding="utf-8"))
+                            _url_manifest_flags = _udm.flags
+                        except Exception:
+                            pass  # non-fatal
+                    _url_active = compute_dep_active_flags(
+                        _url_manifest_flags, _url_flag_reqs
+                    )
+                    if _url_active:
+                        provider.dep_active_flags[cand_r.identity] = _url_active
+
                 for sub_dep in transitive_deps_r:
                     _enqueue_dep(sub_dep, overrides_by_name, bfs_queue)
+
+        # S4b: apply pending flag_requests from additional consumers of already-seen
+        # URL deps (multi-consumer union, §3.1.3).  All wave futures are drained above,
+        # so every dep in wave_pending_flag_reqs is now registered as a candidate.
+        #
+        # After merging active_flags, call find_newly_admitted_deps to admit any
+        # subdeps that are now unblocked — exactly the same step as in the S4a
+        # fixpoint (steps 4–5).  Newly admitted subdeps are enqueued into bfs_queue
+        # for the next BFS wave; the outer while-loop picks them up automatically.
+        if wave_pending_flag_reqs:
+            from milpa.manifest import parse_manifest as _s4b_pm
+            for _pname, _preqs in wave_pending_flag_reqs.items():
+                _pcand_map = provider._candidates.get(_pname, {})
+                for _pcand in _pcand_map.values():
+                    if _pcand.identity is None:
+                        continue
+                    # Load the dep's manifest (already on disk from BFS fetch).
+                    _pkdl = deps_dir / _pname / "milpa.kdl"
+                    _pmf: tuple[FlagDecl, ...] = ()
+                    _pmanifest = None
+                    if _pkdl.exists():
+                        try:
+                            _pmanifest = _s4b_pm(_pkdl.read_text(encoding="utf-8"))
+                            _pmf = _pmanifest.flags
+                        except Exception:
+                            pass  # non-fatal; remain with empty flag table
+                    # Compute additional active flags from the pending requests.
+                    # Uses the SSOT compute_dep_active_flags: negative requests are
+                    # treated as absence-of-request (§3.1.3), never subtracted.
+                    _pnew = compute_dep_active_flags(_pmf, tuple(_preqs))
+                    # Union with existing dep_active_flags (monotone — never subtract).
+                    _pprev = provider.dep_active_flags.get(_pcand.identity, {})
+                    _old_flag_names = frozenset(_pprev.keys())
+                    _pmerged: dict[str, set[ActivationSource]] = dict(_pprev)
+                    for _pfn, _psrcs in _pnew.items():
+                        if _pfn not in _pmerged:
+                            _pmerged[_pfn] = set()
+                        _pmerged[_pfn].update(_psrcs)
+                    _new_flag_names = frozenset(_pmerged.keys())
+                    if _new_flag_names != _old_flag_names:
+                        provider.dep_active_flags[_pcand.identity] = _pmerged
+                        # S4b steps 4+5 (one-pass): check admission and extend/enqueue
+                        # in the same loop — matches Rust's inlined single-pass in
+                        # process_url S4b (~1444-1496).
+                        if _pmanifest is not None:
+                            from milpa.solver import Term as _S4bTerm
+                            from milpa.version import VersionSet as _S4bVS
+                            for _nsub in _pmanifest.deps:
+                                _npreds = _nsub.predicates
+                                if not (
+                                    dep_passes_flag_predicates(_npreds, _new_flag_names)
+                                    and not dep_passes_flag_predicates(_npreds, _old_flag_names)
+                                ):
+                                    continue
+                                # Newly admitted — extend parent dep_terms and enqueue.
+                                _nsub_name = getattr(_nsub, "name", None)
+                                if _nsub_name and _nsub_name not in _pcand.requires_names:
+                                    if isinstance(_nsub, UrlDep):
+                                        _pcand.dep_terms.append(
+                                            _S4bTerm.require(_nsub_name, _S4bVS.eq(_URL_DEP_VERSION))
+                                        )
+                                    else:
+                                        _vs_sub = getattr(_nsub, "constraint_set", None) or _S4bVS.full()
+                                        _pcand.dep_terms.append(
+                                            _S4bTerm.require(_nsub_name, _vs_sub)
+                                        )
+                                    _pcand.requires_names.append(_nsub_name)
+                                _enqueue_dep(_nsub, overrides_by_name, bfs_queue)
+                    break  # only one candidate per name at any time
+
+
+# ---------------------------------------------------------------------------
+# S4a (RFC #23 §7 §3.1.2): outer dep×flag fixpoint
+# ---------------------------------------------------------------------------
+
+def _s4a_run_fixpoint(
+    *,
+    provider: "_Provider",
+    bfs_queue: "list[object]",
+    executor: object,
+    seen_named: "set[str]",
+    seen_url: "set[tuple[str, str]]",
+    seen_tarball: "set[str]",
+    seen_local: "set[str]",
+    edge_cache: "dict[tuple[str, Version], EdgeSet]",
+    overrides_by_name: "dict[str, Override]",
+    deps_dir: Path,
+    env: "MilpaEnv",
+    params: "ResolveParams",
+    index: "Index",
+    provenance_gate: "dict[str, tuple[tuple[object, ...], bool]]",
+    root_authority: "set[str]",
+    record_discovery: "Callable[[str], None]",
+) -> None:
+    """S4a outer dep×flag fixpoint loop.
+
+    Iterates until neither ``dep_active_flags`` nor the admitted dep set grows:
+      1. Load manifests for all known fetched URL deps (from ``deps_dir``).
+      2. Compute cross-pkg enables from every dep's current active flags:
+         for each active flag f on dep D, f.enables_cross_pkg generates
+         FlagRequest(s) for target deps.
+      3. Recompute ``active(target)`` for each target dep that received new
+         FlagRequest(s), using the SSOT ``compute_dep_active_flags``.
+      4. For deps with updated ``active_flags``, find newly-admitted edges
+         (deps whose flag predicates now pass but didn't before).
+      5. For each newly-admitted dep:
+         a. Enqueue into BFS for fetch (if not already seen).
+         b. Extend the parent dep's candidate ``dep_terms`` / ``requires_names``
+            so the solver sees the new edge.
+      6. Re-run ``_run_bfs_wave_loop`` to fetch newly-admitted deps.
+      7. Repeat until stable (no new deps or active_flags changes).
+
+    **Thread-safety**: this function runs entirely in the main thread between
+    BFS waves.  The BFS executor is idle during fixpoint computation; shared
+    state (``provider.dep_active_flags``, candidate ``dep_terms``) is only
+    read/written from the main thread here.  This is safe — the GIL and the
+    executor quiescence guarantee mutual exclusion without additional locking.
+
+    **Sealed-edge invariant preserved**: ``edge_cache`` entries are NEVER
+    invalidated or replaced here.  Newly-admitted deps get new entries on first
+    fetch; existing EdgeSets stay immutably sealed.  Candidate ``dep_terms``
+    lists are EXTENDED (append), not replaced.
+
+    **PubGrub runs exactly once**: this function is called BEFORE the solver.
+    The fixpoint is a pre-solver / edge-admission concern (RFC §3.1.2).
+
+    **Termination**: bounded by the finite union of (deps reachable from root)
+    × (flags declared per dep) — both finite in milpa (no dep cycles).  Union
+    is monotone (sets only grow); fixpoint exists in O(|deps|×max_flags) iters.
+    """
+    from milpa.manifest import parse_manifest as _parse_manifest
+    from milpa.manifest import UrlDep as _UrlDep, NamedDep as _NamedDep
+
+    # Max guard: in the extremely unlikely event of a logic bug leading to a
+    # non-converging loop, cap iterations.  This is a safety belt, not the
+    # termination argument (that rests on monotonicity + finite universe).
+    # M3: cap exhaustion is a bug — fail loud rather than silently truncating.
+    # Monotonicity guarantees convergence well under 50 for any valid input.
+    _MAX_ITERS = 50
+    # R2-M DoS hardening: absolute bound on total (dep,flag) activations across
+    # the whole fixpoint.  Monotonicity bounds this by |deps|×max_flags; a
+    # generous cap makes pathological-width manifests fail-loud instead of
+    # hanging.  10_000 is far above any realistic graph and far below a
+    # crafted-wide DoS attempt.  Must match Rust MAX_TOTAL_ACTIVATIONS.
+    _MAX_TOTAL_ACTIVATIONS = 10_000
+    _total_activations = 0
+    _converged = False
+
+    for _iter in range(_MAX_ITERS):
+        # ---------------------------------------------------------------
+        # Step 1: build name→manifest map for all fetched URL deps.
+        # We use deps_dir as the source of truth (manifests are already on
+        # disk from the BFS wave; re-parsing is non-blocking).
+        # ---------------------------------------------------------------
+        dep_manifests: dict[str, "Manifest"] = {}
+        # Collect all known dep names from the candidate map.
+        for dep_name_k in list(provider._candidates.keys()):
+            if dep_name_k == "__root__":
+                continue
+            kdl_path = deps_dir / dep_name_k / "milpa.kdl"
+            if kdl_path.exists():
+                try:
+                    dm = _parse_manifest(kdl_path.read_text(encoding="utf-8"))
+                    dep_manifests[dep_name_k] = dm
+                except Exception:
+                    pass  # non-fatal
+
+        # ---------------------------------------------------------------
+        # Step 2: compute cross-pkg enables from all currently-active flags.
+        # Collect additional FlagRequest(s) for each target dep.
+        # ---------------------------------------------------------------
+        # Maps target_dep_name → list[FlagRequest] to MERGE into active(target).
+        additional_requests: dict[str, list] = {}
+
+        for dep_name_k, dm in dep_manifests.items():
+            # Look up this dep's current active flags.
+            cand_map = provider._candidates.get(dep_name_k, {})
+            identity_for_dep: str | None = None
+            for cand in cand_map.values():
+                if cand.identity is not None:
+                    identity_for_dep = cand.identity
+                    break
+
+            active_now = (
+                provider.dep_active_flags.get(identity_for_dep, {})
+                if identity_for_dep is not None
+                else {}
+            )
+
+            cross_pkg = compute_cross_pkg_enables(
+                flags=dm.flags,
+                active_flag_names=frozenset(active_now.keys()),
+            )
+            for target_name, flag_reqs in cross_pkg.items():
+                if target_name not in additional_requests:
+                    additional_requests[target_name] = []
+                additional_requests[target_name].extend(flag_reqs)
+
+        if not additional_requests:
+            _converged = True
+            break  # No cross-pkg enables fired — stable.
+
+        # ---------------------------------------------------------------
+        # Step 3: recompute active(target) for each target that received
+        # new flag requests.  Detect changes to trigger more iterations.
+        # ---------------------------------------------------------------
+        any_change = False
+
+        for target_name, new_reqs in additional_requests.items():
+            # M1 security gate: cross-pkg enables may only affect deps that are
+            # ALREADY in the graph (already fetched and in dep_manifests).
+            # A cross-pkg enable from ANY source (root OR transitive) MUST NOT
+            # force-admit a brand-new dep T that was not already reachable from
+            # the root's declared dep closure.  Only T's *sub-deps* (admitted
+            # naturally when T's active_flags grow) can be newly enqueued — and
+            # only because T was already legitimately admitted.
+            target_manifest = dep_manifests.get(target_name)
+            if target_manifest is None:
+                continue  # T not yet fetched — do NOT admit via cross-pkg enable.
+
+            # Find the target's identity (for dep_active_flags keying).
+            target_cand_map = provider._candidates.get(target_name, {})
+            target_identity: str | None = None
+            for cand in target_cand_map.values():
+                if cand.identity is not None:
+                    target_identity = cand.identity
+                    break
+
+            # Previous active_flags for this target.
+            prev_active = (
+                provider.dep_active_flags.get(target_identity, {})
+                if target_identity is not None
+                else {}
+            )
+            old_flag_names = frozenset(prev_active.keys())
+
+            # Merge the new requests with the target's existing flag_requests.
+            # The SSOT is compute_dep_active_flags — don't reimplement.
+            # We convert new_reqs into a tuple of FlagRequest for the SSOT.
+            all_reqs = tuple(new_reqs)
+            new_active = compute_dep_active_flags(target_manifest.flags, all_reqs)
+
+            # Union with the previous active set (monotone — never subtract).
+            merged: dict[str, set[ActivationSource]] = dict(prev_active)
+            for flag_name_v, sources_v in new_active.items():
+                if flag_name_v not in merged:
+                    merged[flag_name_v] = set()
+                    any_change = True
+                merged[flag_name_v].update(sources_v)
+
+            new_flag_names = frozenset(merged.keys())
+            if new_flag_names == old_flag_names:
+                continue  # No change for this dep.
+
+            any_change = True
+
+            # R2-M DoS hardening: count newly-added (dep,flag) activations.
+            _total_activations += len(new_flag_names - old_flag_names)
+            if _total_activations > _MAX_TOTAL_ACTIVATIONS:
+                raise MilpaError(
+                    MILPA_INTERNAL,
+                    f"S4a flag fixpoint exceeded {_MAX_TOTAL_ACTIVATIONS} total "
+                    "(dep,flag) activations — this is an internal milpa bug or a "
+                    "pathologically wide manifest; please report it",
+                )
+
+            # Update dep_active_flags.
+            if target_identity is not None:
+                provider.dep_active_flags[target_identity] = merged
+
+            # ---------------------------------------------------------------
+            # Steps 4+5 (one-pass): for each dep in the target manifest, check
+            # if it is newly admitted by the updated active_flags and if so
+            # extend the parent's dep_terms + enqueue into BFS.  Mirrors
+            # Rust's inlined single-pass in run_s4a_fixpoint (~2803-2870).
+            # ---------------------------------------------------------------
+            target_cand = (
+                next(iter(target_cand_map.values()), None)
+                if target_cand_map
+                else None
+            )
+
+            for sub_dep in target_manifest.deps:
+                _preds_s4a = sub_dep.predicates
+                if not (
+                    dep_passes_flag_predicates(_preds_s4a, new_flag_names)
+                    and not dep_passes_flag_predicates(_preds_s4a, old_flag_names)
+                ):
+                    continue
+                if isinstance(sub_dep, _UrlDep):
+                    dep_key = (sub_dep.git, sub_dep.ref)
+                    if dep_key in seen_url:
+                        # Already fetched — just extend the parent's terms if needed.
+                        if target_cand is not None:
+                            if sub_dep.name not in target_cand.requires_names:
+                                from milpa.solver import Term as _Term
+                                from milpa.version import VersionSet as _VS
+                                target_cand.dep_terms.append(
+                                    _Term.require(sub_dep.name, _VS.eq(_URL_DEP_VERSION))
+                                )
+                                target_cand.requires_names.append(sub_dep.name)
+                        continue
+
+                    # Not yet fetched — extend terms AND enqueue.
+                    if target_cand is not None:
+                        if sub_dep.name not in target_cand.requires_names:
+                            from milpa.solver import Term as _Term
+                            from milpa.version import VersionSet as _VS
+                            target_cand.dep_terms.append(
+                                _Term.require(sub_dep.name, _VS.eq(_URL_DEP_VERSION))
+                            )
+                            target_cand.requires_names.append(sub_dep.name)
+                    _enqueue_dep(sub_dep, overrides_by_name, bfs_queue)
+
+                elif isinstance(sub_dep, _NamedDep):
+                    if sub_dep.name in seen_named:
+                        if target_cand is not None:
+                            if sub_dep.name not in target_cand.requires_names:
+                                from milpa.solver import Term as _Term
+                                from milpa.version import VersionSet as _VS
+                                vs = (
+                                    sub_dep.constraint_set
+                                    if sub_dep.constraint_set is not None
+                                    else _VS.full()
+                                )
+                                target_cand.dep_terms.append(
+                                    _Term.require(sub_dep.name, vs)
+                                )
+                                target_cand.requires_names.append(sub_dep.name)
+                        continue
+                    if target_cand is not None:
+                        if sub_dep.name not in target_cand.requires_names:
+                            from milpa.solver import Term as _Term
+                            from milpa.version import VersionSet as _VS
+                            vs = (
+                                sub_dep.constraint_set
+                                if sub_dep.constraint_set is not None
+                                else _VS.full()
+                            )
+                            target_cand.dep_terms.append(
+                                _Term.require(sub_dep.name, vs)
+                            )
+                            target_cand.requires_names.append(sub_dep.name)
+                    _enqueue_dep(sub_dep, overrides_by_name, bfs_queue)
+
+        if not any_change:
+            _converged = True
+            break
+
+        # ---------------------------------------------------------------
+        # Step 6: re-run BFS for newly-enqueued items.
+        # The executor is passed in; it remains open for the fixpoint duration.
+        # ---------------------------------------------------------------
+        _run_bfs_wave_loop(
+            bfs_queue=bfs_queue,
+            executor=executor,
+            seen_named=seen_named,
+            seen_url=seen_url,
+            seen_tarball=seen_tarball,
+            seen_local=seen_local,
+            edge_cache=edge_cache,
+            provider=provider,
+            overrides_by_name=overrides_by_name,
+            deps_dir=deps_dir,
+            env=env,
+            params=params,
+            index=index,
+            provenance_gate=provenance_gate,
+            root_authority=root_authority,
+            record_discovery=record_discovery,
+        )
+
+        # After each BFS wave we loop back to step 1 to re-check if the newly-
+        # fetched deps' manifests generate further cross-pkg enables.
+
+    # M3: if the loop exhausted MAX_ITERS without converging, it's a bug.
+    # Monotonicity guarantees convergence in O(|deps|×max_flags) — well under 50.
+    if not _converged:
+        raise MilpaError(
+            MILPA_INTERNAL,
+            f"S4a flag fixpoint did not converge in {_MAX_ITERS} iterations — "
+            "this is an internal milpa bug; please report it",
+        )
+
+
+# ---------------------------------------------------------------------------
+# S4c (RFC #23 §3.1.4): post-fixpoint flag-conflict validation
+# ---------------------------------------------------------------------------
+
+#: Canonical serialization order for ActivationSource variants (normative —
+#: matches enum declaration order: DEFAULT, EDGE_REQUEST, ENABLES_RULE, CLI).
+#: Both impls must serialize source sets using this ordering so that the
+#: ``RESOLVE-FLAG-CONFLICT`` payload is byte-identical cross-impl (§5 risk #3).
+_ACTIVATION_SOURCE_ORDER: "dict[ActivationSource, int]" = {
+    ActivationSource.DEFAULT: 0,
+    ActivationSource.EDGE_REQUEST: 1,
+    ActivationSource.ENABLES_RULE: 2,
+    ActivationSource.CLI: 3,
+}
+
+#: Canonical string names for ActivationSource variants in the error payload.
+_ACTIVATION_SOURCE_NAMES: "dict[ActivationSource, str]" = {
+    ActivationSource.DEFAULT: "default",
+    ActivationSource.EDGE_REQUEST: "edge_request",
+    ActivationSource.ENABLES_RULE: "enables_rule",
+    ActivationSource.CLI: "cli",
+}
+
+
+def _serialize_sources(sources: "set[ActivationSource]") -> "list[str]":
+    """Serialize an ActivationSource set to a sorted list of string names.
+
+    Normative ordering: enum declaration order (DEFAULT < EDGE_REQUEST <
+    ENABLES_RULE).  Both impls apply this ordering so the payload is
+    byte-identical cross-impl (RFC #23 §5 risk #3).
+    """
+    return [
+        _ACTIVATION_SOURCE_NAMES[s]
+        for s in sorted(sources, key=lambda s: _ACTIVATION_SOURCE_ORDER[s])
+    ]
+
+
+def _raise_if_flag_conflicts(
+    dep_name: str,
+    flag_decls: "Sequence[FlagDecl]",
+    active_map: "dict[str, set[ActivationSource]]",
+) -> None:
+    """SSOT inner conflict check: raise RESOLVE-FLAG-CONFLICT if any pair conflicts.
+
+    Algorithm (normative, RFC §3.1.4):
+        for each flag f ∈ active_map,
+        for each g in f.conflicts:
+            if g ∈ active_map: raise RESOLVE-FLAG-CONFLICT.
+
+    Used by both ``_s4c_check_flag_conflicts`` (transitive deps) and the root
+    CLI-flag conflict check (C1b-completion).  The error payload is byte-identical
+    regardless of call site: ``{dep, flag_a, flag_b, sources_a, sources_b}``.
+    """
+    from milpa.errors import RESOLVE_FLAG_CONFLICT
+
+    flag_by_name: "dict[str, FlagDecl]" = {fd.name: fd for fd in flag_decls}
+    active_flag_names: "frozenset[str]" = frozenset(active_map.keys())
+
+    for flag_name, sources in active_map.items():
+        fd = flag_by_name.get(flag_name)
+        if fd is None:
+            continue
+        for conflict_name in fd.conflicts:
+            if conflict_name not in active_flag_names:
+                continue
+
+            # Both flags are active.  Canonical ordering: lex on names.
+            if flag_name <= conflict_name:
+                fa, fb = flag_name, conflict_name
+            else:
+                fa, fb = conflict_name, flag_name
+
+            sources_a = active_map.get(fa, set())
+            sources_b = active_map.get(fb, set())
+            raise MilpaError(
+                RESOLVE_FLAG_CONFLICT,
+                f"dep {dep_name!r}: flags {fa!r} and {fb!r} are declared "
+                f"mutually exclusive (conflicts) but both are active",
+                dep=dep_name,
+                flag_a=fa,
+                flag_b=fb,
+                sources_a=_serialize_sources(sources_a),
+                sources_b=_serialize_sources(sources_b),
+            )
+
+
+def _s4c_check_flag_conflicts(
+    provider: "_Provider",
+    deps_dir: "Path",
+) -> None:
+    """S4c post-fixpoint validation pass (RFC #23 §3.1.4).
+
+    Runs AFTER the dep×flag fixpoint (``_s4a_run_fixpoint``) fully converges
+    and BEFORE the solver.  Only *reads* the converged ``dep_active_flags`` —
+    never retracts, so monotonicity is untouched and the check is
+    order-independent (both impls see the same converged set).
+
+    Algorithm (normative, RFC §3.1.4):
+        for each dep D,
+        for each flag f ∈ active(D),
+        for each g in f.conflicts:
+            if g ∈ active(D): raise RESOLVE-FLAG-CONFLICT.
+
+    Same-package only — cross-package conflicts are deferred (#151).
+
+    The error carries ``{dep, flag_a, flag_b, sources_a, sources_b}`` where:
+      - dep     — the dep name (string)
+      - flag_a  — the lexicographically smaller conflicting flag name
+      - flag_b  — the lexicographically larger conflicting flag name
+      - sources_a / sources_b — ActivationSource sets for flag_a / flag_b,
+                  serialized as sorted lists using _ACTIVATION_SOURCE_ORDER
+                  (enum declaration order, identical in both impls — §5 risk #3)
+    """
+    from milpa.manifest import parse_manifest as _pm
+
+    for dep_name in list(provider._candidates.keys()):
+        if dep_name == "__root__":
+            continue
+
+        # Find the candidate's identity (dep_active_flags is keyed by identity).
+        cand_map = provider._candidates.get(dep_name, {})
+        identity: str | None = None
+        for cand in cand_map.values():
+            if cand.identity is not None:
+                identity = cand.identity
+                break
+
+        if identity is None:
+            continue  # no materialised candidate (e.g. named stub not yet fetched)
+
+        # Load the dep's manifest to get its flag declarations (for conflicts).
+        # We need this regardless of whether dep_active_flags has an entry,
+        # because a dep with no consumer requests may still have default=#true
+        # flags that conflict.
+        kdl_path = deps_dir / dep_name / "milpa.kdl"
+        if not kdl_path.exists():
+            continue
+        try:
+            dm = _pm(kdl_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue  # non-fatal: can't load manifest → skip conflict check
+
+        # Get or derive the active_map.
+        # dep_active_flags may not have an entry if the dep had no consumer
+        # flag requests.  In that case, derive active from defaults only (§3.1.2
+        # rule 1: active(D) ⊇ { f ∈ D.flags : f.default }).
+        active_map = provider.dep_active_flags.get(identity)
+        if not active_map:
+            # Compute defaults-only active set.
+            active_map = compute_dep_active_flags(dm.flags, ())
+            if not active_map:
+                continue  # no active flags — nothing to check
+
+        # Delegate to the SSOT helper (also used for root CLI flag check).
+        _raise_if_flag_conflicts(dep_name, dm.flags, active_map)
 
 
 # ---------------------------------------------------------------------------
@@ -927,14 +1943,81 @@ def resolve(
     #
     # Run BEFORE any BFS or solver input construction.
     # Profile=None → no filtering (§6 NORMATIVE).
+    #
+    # S9 (RFC #23 §3.4): CLI feature inputs override root flag seeding.
+    # Compute the cli_active_seed from ResolveParams.features /
+    # no_default_features / all_features; pass it into the filter so that
+    # flag-predicated deps are admitted/pruned based on the CLI selection.
+    # An unknown --features flag name raises FROZEN-ACTIVE-FLAGS-MISMATCH
+    # (surface-don't-hide: the user named a non-existent root flag).
     # ------------------------------------------------------------------
+    _has_cli_features = (
+        bool(params.features) or params.no_default_features or params.all_features
+    )
+    _cli_active_seed: frozenset[str] | None = None
+    if _has_cli_features:
+        _cli_active_seed = _compute_root_active_seed(
+            manifest,
+            features=params.features,
+            no_default_features=params.no_default_features,
+            all_features=params.all_features,
+        )
+        # C1b-completion: root CLI-selected flags participate in conflict
+        # detection (RFC #23 §3.1.4).  The root has no fetched identity so
+        # it bypasses the dep_active_flags machinery; use the SSOT helper
+        # directly with a synthetic active_map where every flag in the CLI
+        # seed has source CLI.  Mirrors the Rust check_s4c_flag_conflicts
+        # root path (both impls do this check at the same point: immediately
+        # after _cli_active_seed is finalised, before BFS).
+        #
+        # R2-M C1b fix: apply same-package enables-closure BEFORE the conflict
+        # check so that flags enabled transitively by CLI-active root flags are
+        # included.  Without this, a CLI-active flag A that enables B where B
+        # conflicts C (also CLI-active) would be silently missed.
+        if manifest.flags and _cli_active_seed:
+            _cli_closed: frozenset[str] = flag_enables_closure(manifest.flags, _cli_active_seed)
+            _root_cli_active_map: dict[str, set[ActivationSource]] = {
+                flag_name: {ActivationSource.CLI}
+                for flag_name in _cli_active_seed
+            }
+            # Flags added by enables-closure get source ENABLES_RULE (not CLI).
+            for _ec_flag in _cli_closed - _cli_active_seed:
+                _root_cli_active_map[_ec_flag] = {ActivationSource.ENABLES_RULE}
+            _raise_if_flag_conflicts(manifest.name, manifest.flags, _root_cli_active_map)
+
     if params.profile is not None:
-        manifest = _filter_manifest_by_profile(manifest, params.profile)
+        manifest = _filter_manifest_by_profile(
+            manifest, params.profile, cli_active_seed=_cli_active_seed
+        )
+    elif _cli_active_seed is not None:
+        # No platform profile but CLI features active: apply flag-only filtering.
+        # _filter_manifest_by_profile requires a non-None profile (non-flag
+        # predicates return False with no profile, which prunes them).  Use
+        # _filter_manifest_by_flags_only to apply only flag-predicate filtering
+        # against the CLI-computed active seed, leaving non-flag predicates
+        # unfiltered (§6 NORMATIVE: absent profile ≠ "match nothing").
+        manifest = _filter_manifest_by_flags_only(manifest, _cli_active_seed)
 
     # ------------------------------------------------------------------
     # Step 2: check index availability for named deps
     # ------------------------------------------------------------------
     overrides_by_name: dict[str, Override] = {ov.name: ov for ov in manifest.overrides}
+
+    # M7: warn early about member= overrides in a single-package manifest.
+    # These silently no-op (member overrides require a workspace context); warn
+    # before the BFS so the user gets feedback even if resolution fails.
+    import warnings as _warnings_early
+    _member_override_names_early = sorted(
+        ov.name for ov in manifest.overrides
+        if isinstance(ov.target, MemberTarget)
+    )
+    if _member_override_names_early:
+        _warnings_early.warn(
+            f"member override(s) {', '.join(_member_override_names_early)!r} have no effect in a "
+            f"single-package manifest (member= overrides require a workspace context)",
+            UserWarning,
+            stacklevel=4,
+        )
 
     # Collect all deps (regular + dev-deps; dev-deps are enrolled for the root
     # per §9 NORMATIVE).
@@ -1032,11 +2115,25 @@ def resolve(
 
     for dep in all_root_deps:
         # Apply overrides: a named dep whose name is in overrides_by_name
-        # is treated as a URL dep at the sentinel version.
+        # is treated as a URL dep at the sentinel version (git form),
+        # or as local (S8a) / member (S8b).
         if isinstance(dep, UrlDep):
             if dep.name in overrides_by_name:
                 ov = overrides_by_name[dep.name]
-                effective_dep = UrlDep(name=dep.name, git=ov.git, ref=ov.ref)
+                # S8a: LocalTarget override on a root UrlDep → local BFS slot.
+                if isinstance(ov.target, LocalTarget):
+                    root_terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
+                    root_requires.append(dep.name)
+                    bfs_queue.append(("local", LocalDep(name=dep.name, path=ov.target.path)))
+                    _record_discovery(dep.name)
+                    continue
+                # S8b: MemberTarget in a single-package manifest is a no-op (no
+                # workspace context; member candidates are never pre-registered
+                # for single-package resolve).  Treat as if the override were absent.
+                if isinstance(ov.target, MemberTarget):
+                    effective_dep = dep
+                else:
+                    effective_dep = _apply_git_override_to_url_dep(dep, ov)
             else:
                 effective_dep = dep
             root_terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
@@ -1048,9 +2145,29 @@ def resolve(
             if dep.name == "nim":
                 continue
             if dep.name in overrides_by_name:
-                # Named dep with override → URL fetch at sentinel version.
+                # Named dep with override → URL fetch or local (S8a).
                 ov = overrides_by_name[dep.name]
-                effective_dep = UrlDep(name=dep.name, git=ov.git, ref=ov.ref)
+                # S8a: LocalTarget override on a root NamedDep → local BFS slot.
+                if isinstance(ov.target, LocalTarget):
+                    root_terms.append(
+                        Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION))
+                    )
+                    root_requires.append(dep.name)
+                    bfs_queue.append(("local", LocalDep(name=dep.name, path=ov.target.path)))
+                    _record_discovery(dep.name)  # Phase B: overridden named → local
+                    continue
+                # S8b: MemberTarget in a single-package manifest is a no-op;
+                # fall through to named-dep handling (no workspace member to resolve to).
+                if isinstance(ov.target, MemberTarget):
+                    vs = dep.constraint_set if dep.constraint_set is not None else VersionSet.full()
+                    root_terms.append(Term.require(dep.name, vs))
+                    root_requires.append(dep.name)
+                    bfs_queue.append(("named", dep.name, dep.constraint))
+                    _record_discovery(dep.name)
+                    continue
+                effective_dep = _apply_git_override_to_url_dep(
+                    UrlDep(name=dep.name, git="", ref=""), ov
+                )
                 root_terms.append(
                     Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION))
                 )
@@ -1063,6 +2180,9 @@ def resolve(
                 root_requires.append(dep.name)
                 bfs_queue.append(("named", dep.name, dep.constraint))
                 _record_discovery(dep.name)  # Phase B: named deps in declaration order
+                # S3: store flag_requests for named deps so _materialize can use them.
+                if dep.flag_requests:
+                    provider._flag_requests_by_name[dep.name] = dep.flag_requests
 
         elif isinstance(dep, TarballDep):
             root_terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
@@ -1129,6 +2249,47 @@ def resolve(
             root_authority=root_authority,
             record_discovery=_record_discovery,
         )
+
+        # ------------------------------------------------------------------
+        # Step 6a: S4a dep×flag fixpoint (RFC #23 §3.1.2 + §7 S4a)
+        #
+        # After the initial BFS wave, iterate until neither the admitted dep
+        # set nor the active-flag set grows.  The executor remains open so
+        # newly-admitted deps can be fetched in parallel within the fixpoint.
+        #
+        # PubGrub runs exactly ONCE, AFTER this fixpoint converges (§3.1.2
+        # "PubGrub runs exactly once, after the dep×flag fixpoint fully
+        # converges").  Feature activation is a pre-solver / edge-admission
+        # concern, never interleaved with unit-propagation.
+        # ------------------------------------------------------------------
+        _s4a_run_fixpoint(
+            provider=provider,
+            bfs_queue=bfs_queue,
+            executor=executor,
+            seen_named=seen_named,
+            seen_url=seen_url,
+            seen_tarball=seen_tarball,
+            seen_local=seen_local,
+            edge_cache=edge_cache,
+            overrides_by_name=overrides_by_name,
+            deps_dir=deps_dir,
+            env=env,
+            params=params,
+            index=index,
+            provenance_gate=provenance_gate,
+            root_authority=root_authority,
+            record_discovery=_record_discovery,
+        )
+
+    # ------------------------------------------------------------------
+    # Step 6b-pre: S4c post-fixpoint flag-conflict validation
+    #
+    # Runs AFTER the dep×flag fixpoint converges, BEFORE solver entry.
+    # Only reads the converged dep_active_flags — never retracts.
+    # Raises RESOLVE-FLAG-CONFLICT if any dep has two mutually-exclusive
+    # flags co-active in the final converged set (RFC #23 §3.1.4).
+    # ------------------------------------------------------------------
+    _s4c_check_flag_conflicts(provider, deps_dir)
 
     # ------------------------------------------------------------------
     # Step 6b: Phase B content-hash dedup/alias
@@ -1207,6 +2368,42 @@ def resolve(
 
     from dataclasses import replace as _replace
     graph = _replace(graph, cert=cert)
+
+    # S8a: non-reproducible override warning (RFC #23 §3.3 reproducibility carve-out).
+    # A local= override produces a LocalProvenanceRecord for a dep that was originally
+    # declared as a git/named dep — it is non-reproducible for anyone without the same
+    # sibling checkout at the same relative path.  Warn once per affected dep name.
+    import warnings as _warnings
+    from milpa.lockfile import LocalProvenanceRecord as _LPR
+    _local_override_names = sorted(
+        dep.name for dep in graph.deps
+        if dep.name in overrides_by_name
+        and isinstance(overrides_by_name[dep.name].target, LocalTarget)
+        and any(isinstance(p, _LPR) for p in dep.provenances)
+    )
+    if _local_override_names:
+        _warnings.warn(
+            f"non-reproducible local override(s): {', '.join(_local_override_names)} — "
+            f"lockfile will not reproduce on machines without the same local checkouts "
+            f"at the declared relative paths (RFC #23 §3.3 reproducibility carve-out)",
+            UserWarning,
+            stacklevel=4,
+        )
+
+    # M6: warn about overrides that name a dep not in the resolved graph.
+    # A typo in an override name silently no-ops without this check.
+    _resolved_dep_names = {dep.name for dep in graph.deps}
+    _dead_override_names = sorted(
+        ov.name for ov in manifest.overrides
+        if ov.name not in _resolved_dep_names
+    )
+    if _dead_override_names:
+        _warnings.warn(
+            f"override(s) {', '.join(_dead_override_names)!r} name dep(s) not present in the "
+            f"resolved graph — check for typos in override names",
+            UserWarning,
+            stacklevel=4,
+        )
 
     # B-nimcfg: rebuild the _deps/ view as a pure function of the resolved graph.
     # This creates alias symlinks and removes stale entries from prior resolves.
@@ -1401,6 +2598,14 @@ def _process_url_worker(
     # URL deps are not in the index → dep_decl=None; is_overridden reflects whether
     # this dep's provenance was redirected by a root override.
     has_milpa_kdl = (result.path / "milpa.kdl").exists()
+    # S3 (RFC #23 §3.1.2 + §7 S3): seed active_flags from positive flag requests
+    # on the dep declaration (single-hop; consumer-side requests only).
+    # Positive requests (enabled=True) are passed as frozenset; the merge with
+    # the dep's own default-true flags and enables closure happens inside
+    # _manifest_to_edgeset (via EdgeSourceCtx.active_flags → MilpaKdlEdgeSource).
+    requested_flags: frozenset[str] = frozenset(
+        fr.name for fr in dep.flag_requests if fr.enabled
+    )
     ctx = EdgeSourceCtx(
         dep_path=result.path,
         dep_name=dep.name,
@@ -1408,6 +2613,7 @@ def _process_url_worker(
         is_overridden=dep.name in overrides_by_name,
         has_milpa_kdl=has_milpa_kdl,
         overrides_by_name=overrides_by_name,
+        active_flags=requested_flags,  # S3: consumer-requested flags
     )
     # Call the source directly (worker thread — no shared edge_cache yet).
     # The main thread seals edge_cache from the returned EdgeSet.
@@ -1482,20 +2688,46 @@ def _enqueue_dep(
     if isinstance(dep, UrlDep):
         if dep.name in overrides_by_name:
             ov = overrides_by_name[dep.name]
-            dep = UrlDep(name=dep.name, git=ov.git, ref=ov.ref)
+            # S8a: LocalTarget override → route to local BFS slot.
+            if isinstance(ov.target, LocalTarget):
+                bfs_queue.append(("local", LocalDep(name=dep.name, path=ov.target.path)))
+                return
+            # S8b: MemberTarget override — member already pre-registered in workspace;
+            # no external queue entry (provenance gate suppresses any stale git claim).
+            if isinstance(ov.target, MemberTarget):
+                return
+            dep = _apply_git_override_to_url_dep(dep, ov)
         bfs_queue.append(("url", dep))
     elif isinstance(dep, NamedDep):
         if dep.name == "nim":
             return
         if dep.name in overrides_by_name:
             ov = overrides_by_name[dep.name]
-            bfs_queue.append(("url", UrlDep(name=dep.name, git=ov.git, ref=ov.ref)))
+            # S8a: LocalTarget override → route to local BFS slot.
+            if isinstance(ov.target, LocalTarget):
+                bfs_queue.append(("local", LocalDep(name=dep.name, path=ov.target.path)))
+                return
+            # S8b: MemberTarget override — member already pre-registered in workspace.
+            if isinstance(ov.target, MemberTarget):
+                return
+            bfs_queue.append(("url", _apply_git_override_to_url_dep(
+                UrlDep(name=dep.name, git="", ref=""), ov
+            )))
         else:
             bfs_queue.append(("named", dep.name, dep.constraint))
     elif isinstance(dep, TarballDep):
-        bfs_queue.append(("tarball", dep))
+        # M2: TarballDep from transitive manifests is out of scope —
+        # only root-declared tarball deps are admitted (mirrors edge_sources.py:333).
+        pass
     elif isinstance(dep, LocalDep):
-        bfs_queue.append(("local", dep))
+        # M2: LocalDep from transitive manifests is DROPPED here (security gate).
+        # A transitive dep's local= path could point to an arbitrary location on
+        # the filesystem — allowing it would let an attacker-controlled manifest
+        # symlink _deps/<name> to any path.  Only root-declared local deps (enqueued
+        # directly via bfs_queue.append, not through _enqueue_dep) are admitted.
+        # This mirrors edge_sources.py:333 (Local/Tarball/Member out of scope) and
+        # the Rust impl's edgeset_to_extracted filter (Dep::Local | Dep::Tarball | Dep::Member => {}).
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -2015,6 +3247,24 @@ def _build_graph(
             sorted(_raw_cond, key=cond_require_sort_key)
         )
 
+        # S5 (RFC #23 §4): populate active_flags from the converged dep_active_flags
+        # map, keyed by resolved identity.  Lexicographically sorted (normative).
+        # dep_active_flags is seeded only when the dep has consumer flag requests
+        # (S3/S4a).  For deps with no requests but default=#true flags, derive the
+        # defaults-only active set from the dep's manifest (same fallback as S4c).
+        _active_map = provider.dep_active_flags.get(cand.identity if cand.identity else "", {})
+        if not _active_map and cand.identity:
+            # No consumer requests — derive defaults only.
+            _kdl_path = deps_dir / name / "milpa.kdl"
+            if _kdl_path.exists():
+                try:
+                    from milpa.manifest import parse_manifest as _pm_s5
+                    _dm_s5 = _pm_s5(_kdl_path.read_text(encoding="utf-8"))
+                    _active_map = compute_dep_active_flags(_dm_s5.flags, ())
+                except Exception:
+                    pass  # non-fatal: manifest unreadable → empty active_flags
+        _active_flags_sorted: tuple[str, ...] = tuple(sorted(_active_map.keys()))
+
         resolved = ResolvedDep(
             name=name,
             identity=cand.identity,
@@ -2023,6 +3273,8 @@ def _build_graph(
             requires=tuple(cand.requires_names),
             # D-lifecycle: full provenances tuple (observed + declared mirrors).
             provenances=all_provenances,
+            # S5: unified per-dep active flag set, lex-sorted (RFC #23 §4).
+            active_flags=_active_flags_sorted,
             # S6: dep_decl pin — carries the DepDecl hash from _Candidate (set in
             # _materialize when DepDeclEdgeSource fired) to the lockfile record.
             dep_decl=cand.dep_decl,
@@ -2154,9 +3406,14 @@ def resolve_workspace(
         m.manifest.name for m in workspace.members
     )
 
-    # RES-WS-OVERRIDE-MEMBER-COLLISION: name cannot be both override and member.
+    # RES-WS-OVERRIDE-MEMBER-COLLISION: a non-member-target override name cannot
+    # also be a member name.  MemberTarget overrides (pkg "X" { member "X" }) are
+    # the INTENDED form of S8b patch and are explicitly exempted — they redirect a
+    # transitive dep to the pre-registered member candidate.
     collisions = sorted(
-        n for n in overrides_by_name if n in members_by_name
+        n for n in overrides_by_name
+        if n in members_by_name
+        and not isinstance(overrides_by_name[n].target, MemberTarget)
     )
     if collisions:
         raise MilpaError(
@@ -2215,6 +3472,17 @@ def resolve_workspace(
     seen_named: set[str] = set()
     seen_local: set[str] = set()
     seen_tarball: set[str] = set()
+
+    # S8b: pre-seed the provenance gate for MemberTarget overrides (root authority,
+    # is_root=True).  Any transitive dep that arrives with the same name but a
+    # different provenance key (e.g. a git URL) will be suppressed by the gate
+    # because the root authority wins.  This ensures that even if an external
+    # package declares a dep on "innerlib" as a git URL, we never fetch it when
+    # an override says { member "innerlib" }.
+    for _ov in workspace.workspace_manifest.overrides:
+        if isinstance(_ov.target, MemberTarget):
+            # Use the SSOT helper to map OverrideTarget → pkey (M9).
+            provenance_gate[_ov.name] = (_override_target_to_pkey(_ov), True)
 
     # Phase B dedup: BFS-insertion discovery order (mirrors resolve()).
     # Members are pre-registered and NOT in discovery_order (they are
@@ -2296,6 +3564,32 @@ def resolve_workspace(
     # ------------------------------------------------------------------
     bfs_queue: list[object] = []
 
+    # S11 (RFC #23 §3.8): workspace-root flags {} — seed workspace-wide active
+    # flags from workspace-root default-true flags.  Compute the enables-closure
+    # (same-package closure via _flag_enables_closure) then extract cross-pkg
+    # enables and pre-seed provider._flag_requests_by_name.
+    if workspace.workspace_manifest.flags:
+        _ws_root_flags = workspace.workspace_manifest.flags
+        # Compute which workspace-root flags are default-active (or always-active).
+        _ws_root_active_seed: frozenset[str] = frozenset(
+            f.name for f in _ws_root_flags if f.default
+        )
+        _ws_root_active: frozenset[str] = flag_enables_closure(
+            _ws_root_flags, _ws_root_active_seed
+        )
+        # Build a flag-name → FlagDecl lookup.
+        _ws_flag_by_name = {fd.name: fd for fd in _ws_root_flags}
+        # Extract cross-pkg enables from root-active flags.
+        for _ws_flag_name in _ws_root_active:
+            _ws_fd = _ws_flag_by_name.get(_ws_flag_name)
+            if _ws_fd is None:
+                continue
+            for _cpe in _ws_fd.enables_cross_pkg:  # CrossPkgEnable(dep, flag_requests)
+                _target = _cpe.dep
+                # Accumulate (union) into provider._flag_requests_by_name.
+                existing = provider._flag_requests_by_name.get(_target, ())
+                provider._flag_requests_by_name[_target] = existing + _cpe.flag_requests
+
     for member in workspace.members:
         if params.profile is not None:
             member_manifest = _filter_manifest_by_profile(
@@ -2311,12 +3605,26 @@ def resolve_workspace(
             # Members and member-named refs are pre-registered → skip queueing.
             if isinstance(dep, MemberDep) or name in members_by_name:
                 continue
-            # Override: named → URL override.
+            # Override: named → URL, local (S8a), or member (S8b) override.
             if name in overrides_by_name:
                 ov = overrides_by_name[name]
-                effective_dep = UrlDep(name=name, git=ov.git, ref=ov.ref)
-                bfs_queue.append(("url", effective_dep))
-                _ws_record_discovery(name)  # Phase B: overridden dep in seed order
+                # S8a: LocalTarget override → route to local BFS slot.
+                if isinstance(ov.target, LocalTarget):
+                    bfs_queue.append(("local", LocalDep(name=name, path=ov.target.path)))
+                    _ws_record_discovery(name)  # Phase B: overridden dep in seed order
+                elif isinstance(ov.target, MemberTarget):
+                    # S8b: MemberTarget override — member already pre-registered.
+                    # No external queue entry needed; provenance gate was pre-seeded
+                    # above.  Don't call _ws_record_discovery — the member candidate
+                    # is not an external dep and is never in ws_discovery_order.
+                    pass
+                else:
+                    effective_dep = _apply_override(name, ov)
+                    if isinstance(effective_dep, UrlDep):
+                        bfs_queue.append(("url", effective_dep))
+                    else:
+                        bfs_queue.append(("local", effective_dep))
+                    _ws_record_discovery(name)  # Phase B: overridden dep in seed order
                 continue
             # Queue external deps.
             if isinstance(dep, UrlDep):
@@ -2327,6 +3635,13 @@ def resolve_workspace(
                     continue
                 bfs_queue.append(("named", name, dep.constraint))
                 _ws_record_discovery(name)  # Phase B: named dep in seed order
+                # S11 (RFC #23 §3.8): accumulate flag_requests from ALL members
+                # (workspace-wide union).  Union via concatenation — monotone;
+                # compute_dep_active_flags sees all requests, dedup is not needed
+                # (duplicate positive requests are idempotent for union semantics).
+                if dep.flag_requests:
+                    existing_named = provider._flag_requests_by_name.get(name, ())
+                    provider._flag_requests_by_name[name] = existing_named + dep.flag_requests
             elif isinstance(dep, TarballDep):
                 bfs_queue.append(("tarball", dep))
                 _ws_record_discovery(name)  # Phase B: tarball dep in seed order

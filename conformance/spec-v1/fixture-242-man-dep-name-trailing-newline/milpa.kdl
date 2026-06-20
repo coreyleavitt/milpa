@@ -1,0 +1,23 @@
+// fixture-242: MAN-DEP-NAME-INVALID — dep name with trailing newline.
+//
+// A KDL quoted string node name whose last character is a newline escape (\n)
+// MUST be rejected with MAN-DEP-NAME-INVALID.
+//
+// Python's `re.match(r"^[A-Za-z0-9_\-]+$")` incorrectly accepts a trailing
+// newline because `$` matches before a trailing \n in Python's regex engine.
+// Rust's `valid_flag_name` (byte-by-byte check) correctly rejects it.
+//
+// Without this fix, a dep named "validname\n" passes Python's guard and
+// reaches nim.cfg `--path:` / `-d:` emission, injecting an extra newline and
+// potentially arbitrary subsequent nim.cfg directives if the name contains
+// additional content after the newline.
+//
+// Fix: use `_FLAG_NAME_CHARSET_RE.fullmatch(s)` (or `\Z` anchor) so the
+// trailing newline is NOT silently swallowed by `$`.
+//
+// Cross-impl divergence: RED in Python before fix, GREEN after fix;
+// already GREEN in Rust (valid_flag_name checks every byte).
+name "pkg"
+deps {
+    "validname\n" git=(url)"https://github.com/example/foo" ref="main"
+}

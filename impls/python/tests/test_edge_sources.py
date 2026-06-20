@@ -497,7 +497,8 @@ def test_edgeset_to_terms_overridden_named_becomes_url_sentinel() -> None:
     """A named require whose name is in overrides_by_name gets the URL sentinel version."""
     from milpa.manifest import Override
 
-    ov = Override(name="stew", git="https://github.com/example/stew.git", ref="main")
+    from milpa.manifest import GitTarget
+    ov = Override(name="stew", target=GitTarget(git="https://github.com/example/stew.git", ref="main"))
     es = EdgeSet(
         requires=[NamedRequire(name="stew", constraint_str=">= 0.1.0")],
         src_dir="",
@@ -696,3 +697,119 @@ def test_m3_edge_sources_uses_nimble_url_to_name() -> None:
     for url in urls:
         assert url_to_name(url) == _name_from_url(url), \
             f"SSOT violation: nimble and edge_sources return different names for {url!r}"
+
+
+# ---------------------------------------------------------------------------
+# S2.5: transitive flag-predicate filtering (§2.6 divergence fix)
+# ---------------------------------------------------------------------------
+
+
+def test_s25_flag_gated_dep_excluded_when_flag_default_off(tmp_path: Path) -> None:
+    """S2.5: a dep gated by flag=X is EXCLUDED when X is default=#false.
+
+    Rust ``build_edgeset_from_manifest`` filters using ``dep_passes_flag_predicates``
+    against the manifest's own default-true flags.  Python ``_manifest_to_edgeset``
+    must do the same.  This test was RED before the fix (Python included every dep
+    unconditionally).
+
+    Flag predicates on a dep are expressed via the ``when flag="x" { ... }``
+    block syntax (§6.3), NOT via ``flag "x"`` child nodes inside the dep block
+    (the latter are cross-package FlagRequests, a distinct concept).
+    """
+    # A transitive milpa.kdl with:
+    #   - "stew" (unconditional) — must appear
+    #   - "chronos" gated by flag="tls" where tls is default=#false — must be ABSENT
+    kdl_content = (
+        'name "mylib"\n'
+        'kind "library"\n'
+        'flags {\n'
+        '    tls default=#false\n'
+        '}\n'
+        'deps {\n'
+        '    stew ">= 0.1.0"\n'
+        '    when flag="tls" {\n'
+        '        chronos git=(url)"https://github.com/status-im/nim-chronos.git" ref="main"\n'
+        '    }\n'
+        '}\n'
+    )
+    dep_path = _make_dep_tree(tmp_path, "mylib", kdl_content)
+    ctx = _ctx(dep_path=dep_path, dep_name="mylib", has_milpa_kdl=True)
+    edge_cache: dict = {}
+    es = resolve_edges("mylib", _V, ctx, edge_cache)
+
+    all_names = [r.name for r in es.requires if isinstance(r, NamedRequire)]
+    all_urls = [r.url for r in es.requires if isinstance(r, UrlRequire)]
+
+    assert "stew" in all_names, "unconditional dep must appear in EdgeSet"
+    assert not any("chronos" in u for u in all_urls), (
+        "flag-gated dep (flag=tls, default=#false) must be EXCLUDED from transitive EdgeSet"
+    )
+
+
+def test_s25_flag_gated_dep_included_when_flag_default_on(tmp_path: Path) -> None:
+    """S2.5: a dep gated by flag=X IS included when X is default=#true.
+
+    Pins the positive direction: Rust admits the dep because the flag is active
+    by default; Python must match.
+    """
+    kdl_content = (
+        'name "mylib"\n'
+        'kind "library"\n'
+        'flags {\n'
+        '    tls default=#true\n'
+        '}\n'
+        'deps {\n'
+        '    stew ">= 0.1.0"\n'
+        '    when flag="tls" {\n'
+        '        chronos git=(url)"https://github.com/status-im/nim-chronos.git" ref="main"\n'
+        '    }\n'
+        '}\n'
+    )
+    dep_path = _make_dep_tree(tmp_path, "mylib", kdl_content)
+    ctx = _ctx(dep_path=dep_path, dep_name="mylib", has_milpa_kdl=True)
+    edge_cache: dict = {}
+    es = resolve_edges("mylib", _V, ctx, edge_cache)
+
+    all_urls = [r.url for r in es.requires if isinstance(r, UrlRequire)]
+    assert any("chronos" in u for u in all_urls), (
+        "flag-gated dep (flag=tls, default=#true) must be INCLUDED in transitive EdgeSet"
+    )
+
+
+def test_s25_negated_flag_predicate_url_dep_excluded_when_flag_default_on(
+    tmp_path: Path,
+) -> None:
+    """S2.5: a UrlDep gated by NOT flag=X is EXCLUDED when X is default=#true.
+
+    Pins the negated-predicate case for UrlDep: Rust's ``dep_passes_flag_predicates``
+    handles negation; Python must match.
+
+    Negation inline form on a UrlDep: ``dep ... flag=(not)"ssl"``
+    NamedDep does NOT carry predicates in either impl (Rust ``dep.predicates()``
+    returns ``[]`` for NamedDep; Python ``getattr(named_dep, 'predicates', ())``
+    returns ``()`` — both impls agree, no fix needed for NamedDep).
+    """
+    kdl_content = (
+        'name "mylib"\n'
+        'kind "library"\n'
+        'flags {\n'
+        '    ssl default=#true\n'
+        '}\n'
+        'deps {\n'
+        '    stew ">= 0.1.0"\n'
+        '    when flag=(not)"ssl" {\n'
+        '        extra git=(url)"https://github.com/example/extra.git" ref="main"\n'
+        '    }\n'
+        '}\n'
+    )
+    dep_path = _make_dep_tree(tmp_path, "mylib", kdl_content)
+    ctx = _ctx(dep_path=dep_path, dep_name="mylib", has_milpa_kdl=True)
+    edge_cache: dict = {}
+    es = resolve_edges("mylib", _V, ctx, edge_cache)
+
+    all_names = [r.name for r in es.requires if isinstance(r, NamedRequire)]
+    all_urls = [r.url for r in es.requires if isinstance(r, UrlRequire)]
+    assert "stew" in all_names, "unconditional dep must appear"
+    assert not any("extra" in u for u in all_urls), (
+        "UrlDep gated by NOT flag=ssl (ssl is default=#true) must be EXCLUDED"
+    )

@@ -1,0 +1,27 @@
+// fixture-244: KDL 2.0 last-wins — duplicate property key on `when` node
+//
+// KDL 2.0 §5.5 (properties): when the same property key appears more than once
+// on a node, the LAST occurrence wins; earlier occurrences are discarded.
+//
+// `when flag="a" flag="b"` has two occurrences of the `flag` key.  Last-wins
+// means only `flag="b"` survives — the `when` block's effective predicate is
+// `flag="b"` only, NOT the conjunction `flag="a" AND flag="b"`.
+//
+// With flag "b" active (MILPA_CLI_FEATURES=b) and flag "a" inactive (default):
+//   - last-wins (correct): dep included  — predicate is flag="b", b is active
+//   - preserve-both (wrong): dep excluded — needs flag="a" AND flag="b" both active
+//
+// Both implementations MUST produce byte-identical output (dep included).
+// RED in Rust before fix (preserves both keys, AND-semantics excludes dep);
+// GREEN in Rust after fix (last-wins, dep included).
+name "myapp"
+kind "application"
+flags {
+    a default=#false
+    b default=#false
+}
+deps {
+    when flag="a" flag="b" {
+        extralib local="./src-tree"
+    }
+}

@@ -1,0 +1,6 @@
+name "extdep"
+kind "library"
+src_dir "src"
+deps {
+    innerlib git=(url)"https://example.com/innerlib.git" ref="main"
+}

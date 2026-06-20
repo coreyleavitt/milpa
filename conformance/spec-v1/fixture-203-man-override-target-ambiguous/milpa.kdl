@@ -1,0 +1,6 @@
+// S8: MAN-OVERRIDE-TARGET-AMBIGUOUS — both local= and git= on same pkg rule.
+name "myapp"
+kind "application"
+overrides {
+    pkg "mylib" local="../mylib" git=(url)"https://github.com/example/mylib.git" ref="main"
+}

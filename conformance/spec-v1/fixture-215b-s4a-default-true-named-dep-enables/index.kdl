@@ -1,0 +1,12 @@
+schema_version 1
+package "lib-a" {
+    version "1.0.0" {
+        content_hash "sha256:636bb281ad6bbb5f74ef43e02b5090edb502d35224ca86cccdc18c725c1d5739"
+        provenance {
+            kind "git"
+            url "https://example.com/lib-a.git"
+            ref "v1.0.0"
+            commit_sha "aaaa2222aaaa2222aaaa2222aaaa2222aaaa2222"
+        }
+    }
+}

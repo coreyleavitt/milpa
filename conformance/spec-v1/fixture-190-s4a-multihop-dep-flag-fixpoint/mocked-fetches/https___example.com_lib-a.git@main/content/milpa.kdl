@@ -1,0 +1,12 @@
+name "lib-a"
+kind "library"
+flags {
+    feat default=#false {
+        enables {
+            lib-b { flag "extra" }
+        }
+    }
+}
+deps {
+    lib-b git=(url)"https://example.com/lib-b.git" ref="main"
+}

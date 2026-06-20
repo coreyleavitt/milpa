@@ -201,6 +201,11 @@ pub struct ResolvedDep {
     /// Populated by the resolver's `finalize()` dedup pass; carried through
     /// `from_graph` → `LockedDep.aliases` → lockfile emission.
     pub aliases: Vec<String>,
+    /// S5 (RFC #23 §4): unified per-dep active flag set, lexicographically sorted.
+    /// Authoritative: populated from the converged `dep_active_flags` map after
+    /// the S4a fixpoint; carried through `build_graph` → lockfile emission.
+    /// Empty when no flags are declared or none are active.
+    pub active_flags: Vec<String>,
 }
 
 /// The resolved dependency graph — the resolver's output, the emitters' input.
@@ -423,16 +428,37 @@ pub struct NamedRequire {
     pub predicates: Vec<Predicate>,
 }
 
+/// S4b (RFC #23 §3.1.3): a consumer-side flag request carried in a dep
+/// declaration (grammar §3.6).  Lives here (milpa-types) so both
+/// `milpa-manifest` (parse output) and `milpa-types` (EdgeSet/UrlRequire)
+/// share one definition without a circular crate dependency.
+/// `milpa-manifest` re-exports this as `pub use milpa_types::FlagRequest`
+/// for back-compat — all `milpa_manifest::FlagRequest` references compile
+/// unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlagRequest {
+    pub name: String,
+    pub enabled: bool,
+}
+
 /// A URL-based requires entry (spec/dep-decl.md §1 `UrlRequire`).
 ///
 /// `predicates` carries optional `when`-gate annotations (S2 — RFC
 /// `rfc-conditional-requires.md` §3.3). Defaults to an empty `Vec` (back-compat).
+///
+/// `flag_requests` carries S4b consumer-side flag requests (RFC #23 §3.1.3).
+/// Non-empty only when the dep declaration in a transitive milpa.kdl uses
+/// `flag "..."` children — so the resolver can propagate them to
+/// `process_url` for union semantics.  Empty for all non-flag-parameterised
+/// transitive deps and for all DepDecl / Nimble / edge_source paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UrlRequire {
     pub url: String,
     pub ref_: String,
     /// Optional `when`-gate predicates (S2; empty = unconditional).
     pub predicates: Vec<Predicate>,
+    /// S4b: consumer-side flag requests (RFC #23 §3.1.3); empty by default.
+    pub flag_requests: Vec<FlagRequest>,
 }
 
 /// One entry in `EdgeSet.requires`: either a named dep or a URL dep.
@@ -468,6 +494,30 @@ impl EdgeSet {
             source: EdgeSource::DepDecl,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ActivationSource — S3 RFC #23 (cross-package flag-request activation)
+// ---------------------------------------------------------------------------
+
+/// Why a flag is active on a dep after S3 activation.
+///
+/// Mirrors `resolver.py:ActivationSource` — identical variants required for
+/// cross-impl byte-identity. Names are normative (RFC #23 §3.1.2).
+///
+/// `DEFAULT`       — flag is `default=#true` in the dep's own `flags` block.
+/// `EDGE_REQUEST`  — consumer dep-declaration requested this flag
+///                   (positive `flag "x"` in the dep's deps block).
+/// `ENABLES_RULE`  — flag was activated transitively by same-package `enables`
+///                   closure (S2 monotone closure, single-package scope).
+/// `CLI`           — flag was activated by the CLI `--features` / `--all-features`
+///                   selection on the root manifest (S9, RFC #23 §3.4).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ActivationSource {
+    Default,
+    EdgeRequest,
+    EnablesRule,
+    Cli,
 }
 
 #[cfg(test)]
@@ -575,6 +625,7 @@ mod tests {
             url: "https://example.com/foo.git".into(),
             ref_: "main".into(),
             predicates: Vec::new(),
+            flag_requests: Vec::new(),
         };
         let predicated = UrlRequire {
             url: "https://example.com/foo.git".into(),
@@ -584,6 +635,7 @@ mod tests {
                 values: vec!["amd64".into()],
                 negated: false,
             }],
+            flag_requests: Vec::new(),
         };
         assert_ne!(plain, predicated);
     }

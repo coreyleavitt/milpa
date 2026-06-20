@@ -1,0 +1,25 @@
+// fixture-236: MAN-DEP-OPTIONAL-FLAG-CLASH — non-optional LocalDep named same as declared flag
+//
+// spec/errors.md §MAN-DEP-OPTIONAL-FLAG-CLASH (NORMATIVE): a non-optional dep
+// whose name collides with an already-declared flag MUST raise
+// MAN-DEP-OPTIONAL-FLAG-CLASH.  The spec says "AN optional=#true dep's name
+// collides with a declared flag, OR a non-optional dep shares a name with a
+// declared flag" — NO restriction to dep form.  All five dep forms apply.
+//
+// This fixture uses a LocalDep (non-optional by definition — only UrlDep and
+// NamedDep carry the optional field) named "mylib" which collides with the
+// declared flag "mylib".
+//
+// Regression for R7-D1: Python _desugar_optional_deps (manifest.py) had an
+// isinstance(dep, (UrlDep, NamedDep)) guard on the namespace-hygiene check,
+// silently accepting a LocalDep/TarballDep/MemberDep that shares a flag name.
+// Rust checks all five forms and raises MAN-DEP-OPTIONAL-FLAG-CLASH correctly.
+// After fix: Python broadens the check to all dep forms; both impls raise.
+name "myapp"
+kind "application"
+flags {
+    mylib default=#false
+}
+deps {
+    mylib local="../mylib"
+}

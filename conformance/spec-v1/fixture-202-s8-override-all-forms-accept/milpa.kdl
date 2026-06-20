@@ -1,0 +1,10 @@
+// S8 (RFC #23 §3.3): all three override target forms parse without error.
+name "myapp"
+kind "application"
+overrides {
+    pkg "chronos" git=(url)"https://github.com/example/chronos.git" ref="patched"
+    pkg "results" local="../results-fork"
+    pkg "stew" {
+        member "stew"
+    }
+}

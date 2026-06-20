@@ -39,10 +39,13 @@ from typing import TYPE_CHECKING, Protocol
 from milpa.dep_decl import EdgeSet, EdgeSource, NamedRequire, UrlRequire
 from milpa.errors import (
     MAN_NIMBLE_CONSTRAINT,
+    MAN_SRC_DIR_UNSAFE,
     TNG_DEPDECL_SCHEMA_MISMATCH,
     TNG_DEPDECL_SCHEMA_UNSUPPORTED,
     MilpaError,
 )
+from milpa.manifest import contains_unsafe_char
+from milpa.predicate import dep_passes_flag_predicates
 
 if TYPE_CHECKING:
     from milpa.manifest import Override
@@ -97,6 +100,13 @@ class EdgeSourceCtx:
     has_milpa_kdl: bool
     dep_decl_schema_version: int | None = None
     overrides_by_name: dict[str, "Override"] = field(default_factory=dict)
+    # S3 (RFC #23 §7 + §3.1.2): per-dep active flags seeded by cross-package
+    # requests from the consumer.  Used by MilpaKdlEdgeSource to filter
+    # flag-predicated transitive deps against the consumer's requested-flag set
+    # (in addition to the dep's own default-true flags from S2.5).
+    # Single-hop scope: set by the resolver for DIRECT deps only in S3;
+    # the full fixpoint arrives in S4a.
+    active_flags: frozenset[str] = field(default_factory=frozenset)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +180,20 @@ def _nimble_edges(dep_path: Path, dep_name: str) -> tuple[list[NamedRequire | Ur
 
     nm = parse_nimble(text)
     src_dir = nm.src_dir or ""
+    # Security: validate src_dir at the earliest boundary where nimble-sourced
+    # values are materialized.  Mirrors the milpa.kdl parse path (manifest.py
+    # line ~903) which rejects unsafe src_dir at parse time.  The same
+    # contains_unsafe_char predicate (SSOT in manifest.py) is used here so
+    # both paths are byte-identical in what they reject.
+    if src_dir and contains_unsafe_char(src_dir):
+        raise MilpaError(
+            MAN_SRC_DIR_UNSAFE,
+            f"dep {dep_name!r}: 'srcDir' value {src_dir!r} from .nimble "
+            f"contains a control character or Unicode line separator "
+            f"(U+2028/U+2029) — possible nim.cfg injection attack",
+            name=dep_name,
+            src_dir=src_dir,
+        )
     requires: list[NamedRequire | UrlRequire] = []
     for i, dep in enumerate(nm.deps):
         # Aligned predicates: dep_predicates is a tuple aligned with nm.deps.
@@ -267,24 +291,52 @@ class MilpaKdlEdgeSource:
             # Malformed transitive milpa.kdl — return empty EdgeSet (non-fatal).
             return EdgeSet(requires=[], src_dir="", source=EdgeSource.MILPA_KDL)
 
-        return _manifest_to_edgeset(manifest)
+        # S3: pass ctx.active_flags so consumer-requested flags extend the
+        # default-true filter (single-hop; full fixpoint arrives in S4a).
+        return _manifest_to_edgeset(manifest, active_flags=ctx.active_flags)
 
 
-def _manifest_to_edgeset(manifest: "Manifest") -> EdgeSet:  # type: ignore[name-defined]
+def _manifest_to_edgeset(
+    manifest: "Manifest",  # type: ignore[name-defined]
+    *,
+    active_flags: frozenset[str] = frozenset(),
+) -> EdgeSet:
     """Normative transitive projection: Manifest → EdgeSet.
 
-    NORMATIVE (§9 + §10.2):
+    NORMATIVE (§9 + §10.2 + S2.5 + S3 RFC #23 §2.6 + §3.1.2):
     - Reads ONLY ``manifest.deps`` (never ``dev_deps``).
     - Drops ``manifest.overrides`` entirely.
     - Maps ``manifest.src_dir → EdgeSet.src_dir``.
+    - Filters flag-predicated deps by the UNION of:
+        (a) the manifest's own default-true flags (S2.5),
+        (b) ``active_flags`` — flags seeded by cross-package consumer requests
+            (S3: single-hop, set by resolver for direct deps).
+      Non-flag predicates (platform/arch/nim/milpa) are passed through — they
+      are evaluated at root-resolve time by ``_filter_manifest_by_profile``,
+      not here (same as Rust).
 
     This is the single structural guard for the transitive-exclusion rule.
     Both the edge_cache memo and this projection ensure §9/§10.2 correctness.
+
+    ``active_flags`` is the caller-supplied set of externally-activated flags;
+    defaults to frozenset() (no external activation, same as S2.5 baseline).
     """
     from milpa.manifest import UrlDep, NamedDep
 
+    # S2.5 + S3: seed active flags from the dep-manifest's own default-true flags
+    # (S2.5, matching Rust ``build_edgeset_from_manifest``) UNION the consumer's
+    # requested flags threaded in via ctx.active_flags (S3).
+    effective_flags: frozenset[str] = frozenset(
+        fd.name for fd in manifest.flags if fd.default
+    ) | active_flags
+
     requires: list[NamedRequire | UrlRequire] = []
     for dep in manifest.deps:  # NORMATIVE §9: ONLY manifest.deps
+        # S2.5 + S3: filter by the dep's flag predicates against the effective set.
+        # Non-flag predicates are skipped (Rust parity).
+        predicates = dep.predicates
+        if not dep_passes_flag_predicates(predicates, effective_flags):
+            continue
         if isinstance(dep, UrlDep):
             requires.append(UrlRequire(url=dep.git, ref=dep.ref))
         elif isinstance(dep, NamedDep):

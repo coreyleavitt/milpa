@@ -1,0 +1,29 @@
+// fixture-248: §6.3 when-block — flag-gated NamedDep EXCLUDED when flag inactive
+//
+// A NamedDep inside a `when flag="extras"` block MUST NOT appear in the
+// resolved graph when the `extras` flag is inactive (default=#false and not
+// activated via --features).
+//
+// spec/manifest-grammar.md §3.2/§3.3 (NORMATIVE): all five dep forms —
+// UrlDep, NamedDep, LocalDep, TarballDep, MemberDep — support the same
+// `when`-conditional syntax (§6).
+//
+// #163: format_manifest (Python) and the Rust serializer silently dropped
+// `when`-block predicates for NamedDep/LocalDep/TarballDep/MemberDep on
+// rewrite, so `milpa add`/`remove`/`update` (which go through format_manifest)
+// would un-condition a dep after the first mutation.
+//
+// Before fix: NamedDep carries no predicates field; outer_predicates from the
+// when block are silently dropped; extras-named-dep is included unconditionally
+// (because it has no predicates, the resolver admits it regardless of flag state).
+// After fix: NamedDep carries predicates=((flag, "extras"),); excluded when inactive.
+name "myapp"
+kind "application"
+flags {
+    extras default=#false description="enable extra named dependencies"
+}
+deps {
+    when flag="extras" {
+        extras-named-dep ">= 1.0.0"
+    }
+}

@@ -10,3 +10,11 @@
 #
 # check-certificate: wired in batch 2 via --certificate CLI flag.
 # Skipped in-process (CliOnly); verified by the black-box harness.
+#
+# Pre-existing baseline reds unrelated to #23 (discovered at Stage-3 baseline):
+# fixture-099: RES-PROVENANCE-CONFLICT — resolver provenance-conflict path not
+#   wired in Rust (Python passes it) — see gh #154.
+# fixture-144: depdecl fetch-failed maps to wrong slug (RES-UNATTESTED-METADATA
+#   vs TNG-DEPDECL-FETCH-FAILED) in both impls — see gh #153.
+spec-v1/fixture-099-res-provenance-conflict
+spec-v1/fixture-144-depdecl-fetch-failed

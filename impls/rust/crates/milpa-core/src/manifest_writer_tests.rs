@@ -58,6 +58,9 @@ fn add_dep_rewrites_canonically_and_reports_comment_loss() {
                 name: "newdep".into(),
                 constraint: None,
                 parsed_constraint: None,
+                flag_requests: Vec::new(),
+                optional: false,
+                predicates: Vec::new(),
             }));
         m
     })

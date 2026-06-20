@@ -1,0 +1,7 @@
+name "mylib"
+flags {
+    full {
+        enables "missing"
+    }
+}
+kind "library"

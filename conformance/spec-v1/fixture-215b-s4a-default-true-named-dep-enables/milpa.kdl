@@ -1,0 +1,17 @@
+// fixture-215b: S5 — named dep with default-true flag emits active_flags in lockfile (C1 fix)
+//
+// Root declares lib-a (named, no flag request).  lib-a declares flag "f1"
+// with default=#true.  No consumer requests any flags.
+//
+// Before C1 fix (Rust): dep_active_flags for named deps was only seeded when
+// flag_requests_by_name had an entry for the dep name.  With no consumer
+// requests, active_flags would be empty in the lockfile.
+//
+// After C1 fix: dep_active_flags is seeded unconditionally via
+// compute_dep_active_flags(flags, []) for both impls, so default-true flags
+// appear in the lockfile's active_flags field — byte-identical cross-impl.
+name "myapp"
+kind "application"
+deps {
+    lib-a
+}

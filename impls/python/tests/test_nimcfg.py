@@ -9,7 +9,7 @@ Coverage:
   - §7.4  emission order: self src-dir first, then deps lexicographic
   - §7.4  no-deps → header only, trailing \\n
   - §7.4  self src-dir only (no deps) → header + blank + self path
-  - §7.5  feature-flag defines DEFERRED — documented test
+  - §7.5  feature-flag -d: defines — S6 (#23)
   - §7.6  format_workspace_nimcfgs: per-member relative paths
 
 Corpus fixtures:
@@ -18,12 +18,14 @@ Corpus fixtures:
   - fixture-063  three named deps sorted lexicographically (X/Y/Z)
   - fixture-115  no deps — header-only nim.cfg
   - fixture-117  workspace two-member success: member-b depends on member-a
+  - fixture-197  S6 explicit defines: dep with active flag + explicit defines
+  - fixture-198  S6 childless-convention: dep with active flag + no defines
 """
 
 from pathlib import Path
 
 from milpa.lockfile import ResolvedDep, ResolvedGraph
-from milpa.nimcfg import format_nimcfg, format_workspace_nimcfgs
+from milpa.nimcfg import build_flag_defines, format_nimcfg, format_workspace_nimcfgs
 
 # ---------------------------------------------------------------------------
 # Fixtures helpers
@@ -282,24 +284,90 @@ class TestCorpusFixtures:
 
 
 # ---------------------------------------------------------------------------
-# §7.5  Feature-flag defines — DEFERRED (#23)
+# §7.5  Feature-flag -d: defines — S6 (#23, un-deferred)
 # ---------------------------------------------------------------------------
 
 
-class TestFeatureFlagsDeferral:
-    """§7.5 defines are deferred — no -d: output regardless of active_flags."""
+class TestFeatureDefines:
+    """§7.5 -d: defines emitted for active flags when flag_defines is provided.
 
-    def test_active_flags_not_emitted(self) -> None:
-        """Active flags on a dep MUST NOT produce -d: output until #23 is done."""
+    RFC #23 §3.6 normative rules:
+    - Defines block separated from --path: block by a blank line.
+    - -d: lines are lexicographically ordered across all active flags of all deps.
+    - Explicit defines: active flag with defines=("ssl", "useOpenSSL") emits
+      -d:ssl and -d:useOpenSSL.
+    - Childless-convention: active flag with defines=() emits -d:<pkg>_<flag>.
+    - No -d: block when no active flags have defines (empty flag_defines or
+      no active flags in graph).
+    - --path: lines unchanged (defines do not affect path output).
+    """
+
+    def test_no_defines_when_flag_defines_absent(self) -> None:
+        """No flag_defines arg → no -d: lines (backward compat)."""
         graph = ResolvedGraph(
-            deps=(_dep("pkg", "src", active_flags=("feature_x", "feature_y")),)
+            deps=(_dep("pkg", "src", active_flags=("tls",)),)
         )
         out = format_nimcfg(graph)
-        assert "-d:" not in out, (
-            "§7.5 feature-flag emission is deferred (#23); "
-            "if this test starts failing the deferral has been lifted "
-            "and the test should be replaced with correct -d: assertions"
+        assert "-d:" not in out
+
+    def test_no_defines_when_flag_defines_empty(self) -> None:
+        """flag_defines={} → no -d: lines (dep has no flag table)."""
+        graph = ResolvedGraph(
+            deps=(_dep("pkg", "src", active_flags=("tls",)),)
         )
+        out = format_nimcfg(graph, flag_defines={})
+        assert "-d:" not in out
+
+    def test_explicit_defines_emitted(self) -> None:
+        """Active flag with explicit defines emits its symbols as -d: lines."""
+        graph = ResolvedGraph(
+            deps=(_dep("ssl-lib", "src", active_flags=("tls",)),)
+        )
+        flag_defines = {"ssl-lib": {"tls": ("ssl", "useOpenSSL")}}
+        out = format_nimcfg(graph, flag_defines=flag_defines)
+        assert "-d:ssl\n" in out or out.endswith("-d:ssl")
+        assert "-d:useOpenSSL" in out
+
+    def test_childless_convention(self) -> None:
+        """Active flag with no defines emits -d:<pkg>_<flag>."""
+        graph = ResolvedGraph(
+            deps=(_dep("mylib", "src", active_flags=("http",)),)
+        )
+        flag_defines = {"mylib": {"http": ()}}
+        out = format_nimcfg(graph, flag_defines=flag_defines)
+        assert "-d:mylib_http" in out
+
+    def test_defines_block_separated_by_blank_line(self) -> None:
+        """The -d: block is separated from the --path: block by a blank line."""
+        graph = ResolvedGraph(
+            deps=(_dep("pkg", "src", active_flags=("feat",)),)
+        )
+        flag_defines = {"pkg": {"feat": ("myDefine",)}}
+        out = format_nimcfg(graph, flag_defines=flag_defines)
+        # Verify: --path: line appears before a blank line before -d: line
+        assert "--path:" in out
+        assert "-d:myDefine" in out
+        path_pos = out.index("--path:")
+        define_pos = out.index("-d:myDefine")
+        assert define_pos > path_pos, "-d: block must come after --path: block"
+        between = out[path_pos:define_pos]
+        assert "\n\n" in between, "-d: block must be separated by blank line"
+
+    def test_defines_lexicographically_ordered(self) -> None:
+        """All emitted -d: symbols are lexicographically sorted across all deps."""
+        graph = ResolvedGraph(
+            deps=(
+                _dep("lib-a", "src", active_flags=("feat-z",)),
+                _dep("lib-b", "src", active_flags=("feat-a",)),
+            )
+        )
+        flag_defines = {
+            "lib-a": {"feat-z": ("zzz", "aaa")},
+            "lib-b": {"feat-a": ("mmm",)},
+        }
+        out = format_nimcfg(graph, flag_defines=flag_defines)
+        d_lines = [l for l in out.splitlines() if l.startswith("-d:")]
+        assert d_lines == sorted(d_lines), f"expected lex order, got {d_lines}"
 
     def test_active_flags_do_not_affect_path_output(self) -> None:
         """Flags on a dep must not alter the --path: lines."""
@@ -307,7 +375,166 @@ class TestFeatureFlagsDeferral:
         graph_with_flags = ResolvedGraph(
             deps=(_dep("pkg", "src", active_flags=("flag",)),)
         )
+        # Without flag_defines, both produce identical output.
         assert format_nimcfg(graph_no_flags) == format_nimcfg(graph_with_flags)
+
+    def test_no_defines_block_when_no_active_flags(self) -> None:
+        """When no deps have active flags, no blank line + -d: block appended."""
+        graph = ResolvedGraph(
+            deps=(_dep("pkg", "src"),)
+        )
+        flag_defines = {"pkg": {"tls": ("ssl",)}}
+        out = format_nimcfg(graph, flag_defines=flag_defines)
+        assert "-d:" not in out
+        # File ends with single trailing newline (§7.4 NOTE).
+        assert out.endswith("\n")
+        assert not out.endswith("\n\n")
+
+    def test_inactive_flag_not_emitted(self) -> None:
+        """A flag present in flag_defines but NOT in dep.active_flags is not emitted."""
+        graph = ResolvedGraph(
+            deps=(_dep("pkg", "src", active_flags=("active-feat",)),)
+        )
+        flag_defines = {
+            "pkg": {
+                "active-feat": ("emitted",),
+                "inactive-feat": ("not-emitted",),
+            }
+        }
+        out = format_nimcfg(graph, flag_defines=flag_defines)
+        assert "-d:emitted" in out
+        assert "-d:not-emitted" not in out
+
+    def test_multiple_flags_same_dep(self) -> None:
+        """Multiple active flags on one dep all have their defines emitted."""
+        graph = ResolvedGraph(
+            deps=(_dep("pkg", "src", active_flags=("feat-a", "feat-b")),)
+        )
+        flag_defines = {
+            "pkg": {
+                "feat-a": ("symbolA",),
+                "feat-b": ("symbolB",),
+            }
+        }
+        out = format_nimcfg(graph, flag_defines=flag_defines)
+        assert "-d:symbolA" in out
+        assert "-d:symbolB" in out
+
+    def test_no_deps_no_defines_block(self) -> None:
+        """Zero-dep graph produces header only (no -d: block even with flag_defines)."""
+        graph = ResolvedGraph(deps=())
+        out = format_nimcfg(graph, flag_defines={"some-dep": {"f": ("x",)}})
+        assert "-d:" not in out
+
+    def test_path_only_fixture_unchanged(self) -> None:
+        """Existing --path:-only fixture output is byte-identical with flag_defines=None."""
+        graph = ResolvedGraph(
+            deps=(
+                _dep("alpha"),
+                _dep("beta", "src"),
+            )
+        )
+        out_before = format_nimcfg(graph)
+        out_after = format_nimcfg(graph, flag_defines=None)
+        assert out_before == out_after
+
+
+# ---------------------------------------------------------------------------
+# §7.5  build_flag_defines — product function (RFC #23 S6 SSOT)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildFlagDefines:
+    """build_flag_defines is a PRODUCT function in milpa.nimcfg (not a test helper).
+
+    These tests exercise the real map-builder against on-disk dep manifests so
+    that any future regression where the CLI stops building the map is caught
+    at this layer — not discovered from a missing -d: line in a released binary.
+
+    S6 anti-regression: the CLI calls build_flag_defines (not None), so if this
+    function regresses the corpus tests AND the CLI both break.  Having a
+    dedicated unit test here pins the product behaviour independent of the corpus.
+    """
+
+    def test_returns_empty_for_dep_with_no_manifest(self, tmp_path: Path) -> None:
+        """A dep whose _deps/<name>/milpa.kdl does not exist → empty map (warn-and-skip)."""
+        deps_dir = tmp_path / "_deps"
+        deps_dir.mkdir()
+        graph = ResolvedGraph(deps=(_dep("somelib", active_flags=("tls",)),))
+        result = build_flag_defines(graph, deps_dir)
+        # No milpa.kdl for somelib → not in result.
+        assert result == {}
+
+    def test_returns_flag_table_for_dep_with_manifest(self, tmp_path: Path) -> None:
+        """A dep with a milpa.kdl that declares flags → flag_name → defines tuple."""
+        deps_dir = tmp_path / "_deps"
+        (deps_dir / "chronos").mkdir(parents=True)
+        (deps_dir / "chronos" / "milpa.kdl").write_text(
+            'name "chronos"\n'
+            'kind "library"\n'
+            "flags {\n"
+            '    tls default=#false {\n'
+            '        defines "ssl" "useOpenSSL"\n'
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        graph = ResolvedGraph(deps=(_dep("chronos", active_flags=("tls",)),))
+        result = build_flag_defines(graph, deps_dir)
+        assert "chronos" in result
+        assert result["chronos"]["tls"] == ("ssl", "useOpenSSL")
+
+    def test_childless_flag_returns_empty_tuple(self, tmp_path: Path) -> None:
+        """A flag with no defines child → empty tuple (childless-convention)."""
+        deps_dir = tmp_path / "_deps"
+        (deps_dir / "mylib").mkdir(parents=True)
+        (deps_dir / "mylib" / "milpa.kdl").write_text(
+            'name "mylib"\n'
+            'kind "library"\n'
+            "flags {\n"
+            '    http default=#false\n'
+            "}\n",
+            encoding="utf-8",
+        )
+        graph = ResolvedGraph(deps=(_dep("mylib", active_flags=("http",)),))
+        result = build_flag_defines(graph, deps_dir)
+        assert result["mylib"]["http"] == ()
+
+    def test_cli_path_emits_defines_not_none(self, tmp_path: Path) -> None:
+        """Anti-regression: the same call-chain the CLI uses must emit -d: lines.
+
+        This test replicates the CLI's logic (build_flag_defines → format_nimcfg)
+        so that if either step regresses (e.g. someone reintroduces flag_defines=None
+        in cli.py) this test fails before the user notices missing -d: lines.
+        """
+        deps_dir = tmp_path / "_deps"
+        (deps_dir / "bearssl").mkdir(parents=True)
+        (deps_dir / "bearssl" / "milpa.kdl").write_text(
+            'name "bearssl"\n'
+            'kind "library"\n'
+            "flags {\n"
+            '    ssl default=#false {\n'
+            '        defines "ssl"\n'
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        graph = ResolvedGraph(deps=(_dep("bearssl", active_flags=("ssl",)),))
+
+        # This is the exact call sequence the CLI uses (cli.py fetch/lock path).
+        flag_defines = build_flag_defines(graph, deps_dir)
+        nimcfg_text = format_nimcfg(
+            graph,
+            deps_dir=Path("_deps"),
+            self_src_dir="",
+            flag_defines=flag_defines,
+        )
+
+        assert "-d:ssl" in nimcfg_text, (
+            "CLI-path emission must include -d: defines for active flags; "
+            "check that cli.py passes build_flag_defines(graph, deps_dir) "
+            "and not None to format_nimcfg"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +665,208 @@ class TestWorkspaceNimcfgs:
         ))
         result = format_workspace_nimcfgs(ws, graph)
         assert set(result.keys()) == {"member-a", "member-b"}
+
+    # S11 §3.8: workspace feature unification — unified -d: defines in per-member nim.cfg
+    # -------------------------------------------------------------------------------------
+
+    def test_s11_unified_defines_both_members_see_shared_dep_flag(
+        self, tmp_path: Path
+    ) -> None:
+        """S11: both members see the unified -d: defines for a shared external dep.
+
+        When depX has active_flags=("tls",) and the flag_defines map is provided,
+        EVERY member that includes depX in its transitive closure emits -d:ssl.
+        The active_flags are workspace-wide union (from the shared dep_active_flags
+        map in the resolver), not per-member.
+        """
+        from milpa.lockfile import MemberProvenanceRecord
+        ws = self._make_workspace(tmp_path, [
+            ("liba", "member-a", "src"),
+            ("libb", "member-b", "src"),
+        ])
+        # Both members depend on the same external dep "extlib" with active flags.
+        extlib = ResolvedDep(
+            name="extlib",
+            identity="sha256:" + "e" * 64,
+            version="0.0.1",
+            src_dir="src",
+            requires=(),
+            active_flags=("tls",),  # workspace-wide union
+        )
+        liba_dep = ResolvedDep(
+            name="liba",
+            identity="sha256:" + "a" * 64,
+            version="0.0.1",
+            src_dir="src",
+            requires=("extlib",),
+            provenances=(MemberProvenanceRecord(name="liba"),),
+        )
+        libb_dep = ResolvedDep(
+            name="libb",
+            identity="sha256:" + "b" * 64,
+            version="0.0.1",
+            src_dir="src",
+            requires=("extlib",),
+            provenances=(MemberProvenanceRecord(name="libb"),),
+        )
+        graph = ResolvedGraph(deps=(extlib, liba_dep, libb_dep))
+        # Unified flag_defines map (SSOT — built from dep manifests).
+        flag_defines = {"extlib": {"tls": ("ssl", "useOpenSSL")}}
+
+        result = format_workspace_nimcfgs(ws, graph, flag_defines=flag_defines)
+
+        # member-a: depends on extlib → sees -d:ssl and -d:useOpenSSL
+        assert "-d:ssl" in result["member-a"]
+        assert "-d:useOpenSSL" in result["member-a"]
+        # member-b: depends on extlib → same unified defines
+        assert "-d:ssl" in result["member-b"]
+        assert "-d:useOpenSSL" in result["member-b"]
+
+    def test_s11_no_defines_when_no_flag_defines(self, tmp_path: Path) -> None:
+        """Without flag_defines arg, no -d: lines emitted (backward compat)."""
+        from milpa.lockfile import MemberProvenanceRecord
+        ws = self._make_workspace(tmp_path, [("liba", "member-a", "")])
+        extlib = ResolvedDep(
+            name="extlib",
+            identity="sha256:" + "e" * 64,
+            version="0.0.1",
+            src_dir="",
+            requires=(),
+            active_flags=("tls",),
+        )
+        liba_dep = ResolvedDep(
+            name="liba",
+            identity="sha256:" + "a" * 64,
+            version="0.0.1",
+            src_dir="",
+            requires=("extlib",),
+            provenances=(MemberProvenanceRecord(name="liba"),),
+        )
+        graph = ResolvedGraph(deps=(extlib, liba_dep))
+        result = format_workspace_nimcfgs(ws, graph)  # no flag_defines
+        assert "-d:" not in result["member-a"]
+
+    def test_s11_childless_convention_in_workspace(self, tmp_path: Path) -> None:
+        """S11: childless-convention (-d:<pkg>_<flag>) applies in workspace nim.cfg."""
+        from milpa.lockfile import MemberProvenanceRecord
+        ws = self._make_workspace(tmp_path, [("liba", "member-a", "")])
+        extlib = ResolvedDep(
+            name="extlib",
+            identity="sha256:" + "e" * 64,
+            version="0.0.1",
+            src_dir="",
+            requires=(),
+            active_flags=("http",),
+        )
+        liba_dep = ResolvedDep(
+            name="liba",
+            identity="sha256:" + "a" * 64,
+            version="0.0.1",
+            src_dir="",
+            requires=("extlib",),
+            provenances=(MemberProvenanceRecord(name="liba"),),
+        )
+        graph = ResolvedGraph(deps=(extlib, liba_dep))
+        flag_defines = {"extlib": {"http": ()}}  # childless — no explicit defines
+        result = format_workspace_nimcfgs(ws, graph, flag_defines=flag_defines)
+        assert "-d:extlib_http" in result["member-a"]
+
+    def test_s11_defines_lexicographically_sorted(self, tmp_path: Path) -> None:
+        """S11: -d: symbols in workspace nim.cfg are lexicographically sorted."""
+        from milpa.lockfile import MemberProvenanceRecord
+        ws = self._make_workspace(tmp_path, [("liba", "member-a", "")])
+        extlib = ResolvedDep(
+            name="extlib",
+            identity="sha256:" + "e" * 64,
+            version="0.0.1",
+            src_dir="",
+            requires=(),
+            active_flags=("feat",),
+        )
+        liba_dep = ResolvedDep(
+            name="liba",
+            identity="sha256:" + "a" * 64,
+            version="0.0.1",
+            src_dir="",
+            requires=("extlib",),
+            provenances=(MemberProvenanceRecord(name="liba"),),
+        )
+        graph = ResolvedGraph(deps=(extlib, liba_dep))
+        # Multiple symbols — must be lex-sorted in output
+        flag_defines = {"extlib": {"feat": ("zzz", "aaa", "mmm")}}
+        result = format_workspace_nimcfgs(ws, graph, flag_defines=flag_defines)
+        d_lines = [l for l in result["member-a"].splitlines() if l.startswith("-d:")]
+        assert d_lines == sorted(d_lines)
+
+    def test_s11_member_not_in_closure_doesnt_see_other_members_flags(
+        self, tmp_path: Path
+    ) -> None:
+        """A member that doesn't depend on extlib doesn't see its -d: lines."""
+        from milpa.lockfile import MemberProvenanceRecord
+        ws = self._make_workspace(tmp_path, [
+            ("liba", "member-a", ""),  # depends on extlib
+            ("libb", "member-b", ""),  # does NOT depend on extlib
+        ])
+        extlib = ResolvedDep(
+            name="extlib",
+            identity="sha256:" + "e" * 64,
+            version="0.0.1",
+            src_dir="",
+            requires=(),
+            active_flags=("tls",),
+        )
+        liba_dep = ResolvedDep(
+            name="liba",
+            identity="sha256:" + "a" * 64,
+            version="0.0.1",
+            src_dir="",
+            requires=("extlib",),
+            provenances=(MemberProvenanceRecord(name="liba"),),
+        )
+        libb_dep = ResolvedDep(
+            name="libb",
+            identity="sha256:" + "b" * 64,
+            version="0.0.1",
+            src_dir="",
+            requires=(),  # no extlib dependency
+            provenances=(MemberProvenanceRecord(name="libb"),),
+        )
+        graph = ResolvedGraph(deps=(extlib, liba_dep, libb_dep))
+        flag_defines = {"extlib": {"tls": ("ssl",)}}
+        result = format_workspace_nimcfgs(ws, graph, flag_defines=flag_defines)
+        # member-a sees -d:ssl (extlib in its closure)
+        assert "-d:ssl" in result["member-a"]
+        # member-b does NOT see -d:ssl (extlib not in its closure)
+        assert "-d:ssl" not in result["member-b"]
+
+    def test_s11_defines_block_separated_by_blank_line(self, tmp_path: Path) -> None:
+        """S11: -d: block in workspace nim.cfg is separated from --path: by blank line."""
+        from milpa.lockfile import MemberProvenanceRecord
+        ws = self._make_workspace(tmp_path, [("liba", "member-a", "src")])
+        extlib = ResolvedDep(
+            name="extlib",
+            identity="sha256:" + "e" * 64,
+            version="0.0.1",
+            src_dir="src",
+            requires=(),
+            active_flags=("feat",),
+        )
+        liba_dep = ResolvedDep(
+            name="liba",
+            identity="sha256:" + "a" * 64,
+            version="0.0.1",
+            src_dir="src",
+            requires=("extlib",),
+            provenances=(MemberProvenanceRecord(name="liba"),),
+        )
+        graph = ResolvedGraph(deps=(extlib, liba_dep))
+        flag_defines = {"extlib": {"feat": ("myDefine",)}}
+        result = format_workspace_nimcfgs(ws, graph, flag_defines=flag_defines)
+        nimcfg = result["member-a"]
+        path_pos = nimcfg.index("--path:")
+        define_pos = nimcfg.index("-d:myDefine")
+        between = nimcfg[path_pos:define_pos]
+        assert "\n\n" in between, "-d: block must be separated from --path: by blank line"
 
 
 # ---------------------------------------------------------------------------

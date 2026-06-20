@@ -1,0 +1,11 @@
+name "lib-tls"
+kind "library"
+flags {
+    openssl default=#true {
+        defines "ssl" "useOpenSSL"
+        conflicts "bearssl"
+    }
+    bearssl default=#true {
+        defines "ssl"
+    }
+}

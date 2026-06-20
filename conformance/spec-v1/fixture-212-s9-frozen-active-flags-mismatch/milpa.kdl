@@ -1,0 +1,19 @@
+// fixture-212: S9 — --frozen + feature mismatch → FROZEN-ACTIVE-FLAGS-MISMATCH (RFC #23 §3.4 / §4)
+//
+// The manifest declares a flag `tls default=#false` and a flag-gated dep
+// `featurelib`. The lockfile was produced without --features (tls off), so
+// featurelib is absent from the lock.
+//
+// When --frozen is run with MILPA_CLI_FEATURES=tls, the recomputed root
+// active-flag closure includes tls, which would admit featurelib — but it
+// is absent from the lockfile. This is a mismatch → FROZEN-ACTIVE-FLAGS-MISMATCH.
+name "myapp"
+kind "application"
+flags {
+    tls default=#false description="enable TLS support"
+}
+deps {
+    when flag="tls" {
+        featurelib git=(url)"https://example.com/featurelib.git" ref="main"
+    }
+}

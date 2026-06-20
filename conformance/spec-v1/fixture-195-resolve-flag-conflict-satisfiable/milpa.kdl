@@ -1,0 +1,11 @@
+// fixture-195: S4c — satisfiable selection with conflicts declared (no error)
+//
+// lib-tls declares openssl (default=#true) and bearssl (default=#false)
+// with openssl conflicts bearssl.  Only openssl is active by default → no conflict.
+//
+// This confirms no false positive: conflicts declared but only one side active.
+name "myapp"
+kind "application"
+deps {
+    lib-tls git=(url)"https://example.com/lib-tls.git" ref="main"
+}

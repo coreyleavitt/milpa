@@ -1,0 +1,29 @@
+// fixture-237: LOCK-SRC-DIR-UNSAFE — lockfile src_dir contains an unsafe char
+//
+// A `src_dir` value containing a newline (ASCII 0x0A) in a dep block MUST be
+// rejected at the lockfile parse boundary with LOCK-SRC-DIR-UNSAFE.
+//
+// Without this check, a poisoned milpa.lock with a control character in src_dir
+// would flow to nim.cfg --path: on frozen reconstruction (nim.cfg injection).
+//
+// The check reuses the SSOT unsafe-char predicate (contains_unsafe_char /
+// manifest.py / milpa-manifest::lib.rs) — no new regex or char-set definition.
+// Validation happens at parse time so both `verify` and the frozen fast-path
+// are protected.
+//
+// Regression for R7-S1: both impls accepted a lockfile with unsafe src_dir;
+// the manifest parse path validated it, but the lockfile parse path did not.
+version 1
+strategy "maxver"
+
+dep "foo" {
+    version "0.0.1"
+    src_dir "src\n--passC:-evil"
+    requires
+    provenance {
+        origin "observed"
+        kind "git"
+        url "https://example.com/foo.git"
+        ref "main"
+    }
+}

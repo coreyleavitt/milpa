@@ -24,11 +24,11 @@
 //!
 //! Mirrors `milpa/edge_sources.py` in `impls/python`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use milpa_manifest::nimble::{parse_nimble, NimbleRequirement};
-use milpa_manifest::{Dep, Manifest, Override};
+use milpa_manifest::{contains_unsafe_char, Dep, Manifest, ManifestError, Override};
 use milpa_solver::{Dep as SolverDep, VersionSet};
 use milpa_types::{EdgeSet, EdgeSource, NamedRequire, RequireEntry, UrlRequire, Version};
 
@@ -67,6 +67,10 @@ pub struct EdgeSourceCtx<'a> {
     /// Overrides map from the root manifest (used to detect when a transitive
     /// named dep is itself overridden, so it enters as an eq_sentinel).
     pub overrides_by_name: &'a BTreeMap<String, Override>,
+    /// S3 RFC #23: flags requested by the consumer's dep declaration (single-hop
+    /// activation). Merged with the dep's own defaults by `build_edgeset_from_manifest`
+    /// before filtering. Empty for transitive hops (S4a multi-hop is separate).
+    pub active_flags: BTreeSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -80,18 +84,44 @@ pub struct EdgeSourceCtx<'a> {
 pub struct NimbleEdgeSource;
 
 impl NimbleEdgeSource {
-    pub fn edges_for(&self, _name: &str, _version: &Version, ctx: &EdgeSourceCtx) -> EdgeSet {
+    /// Parse the `.nimble` file at `ctx.dep_path` and return the `EdgeSet`.
+    ///
+    /// Returns `Ok(empty)` when no `.nimble` is found (graceful fallback).
+    /// Returns `Err(ManifestError)` when the nimble-sourced `srcDir` contains
+    /// an unsafe character (MAN-SRC-DIR-UNSAFE) -- the same check applied to
+    /// milpa.kdl `src_dir` at parse time (SSOT: `milpa_manifest::contains_unsafe_char`).
+    pub fn edges_for(
+        &self,
+        _name: &str,
+        _version: &Version,
+        ctx: &EdgeSourceCtx,
+    ) -> Result<EdgeSet, ManifestError> {
         let Some(dep_path) = ctx.dep_path else {
-            return empty_nimble();
+            return Ok(empty_nimble());
         };
         let Some(nimble_path) = find_nimble(dep_path, ctx.dep_name) else {
-            return empty_nimble();
+            return Ok(empty_nimble());
         };
         let text = match std::fs::read_to_string(&nimble_path) {
             Ok(t) => t,
-            Err(_) => return empty_nimble(),
+            Err(_) => return Ok(empty_nimble()),
         };
         let nm = parse_nimble(&text);
+
+        // Security: validate src_dir at the earliest boundary where nimble-sourced
+        // values are materialized -- mirrors the milpa.kdl parse path.
+        // `contains_unsafe_char` is the SSOT predicate (milpa_manifest::lib.rs).
+        let src_dir = nm.src_dir.unwrap_or_default();
+        if !src_dir.is_empty() && contains_unsafe_char(&src_dir) {
+            return Err(ManifestError::new(
+                "MAN-SRC-DIR-UNSAFE",
+                format!(
+                    "dep {:?}: 'srcDir' value {:?} from .nimble contains a control character                      or Unicode line separator (U+2028/U+2029) -- possible nim.cfg injection attack",
+                    ctx.dep_name, src_dir
+                ),
+            ));
+        }
+
         let mut requires = Vec::new();
         for req in &nm.requires {
             match req {
@@ -103,6 +133,7 @@ impl NimbleEdgeSource {
                         url: url.clone(),
                         ref_,
                         predicates: predicates.clone(),
+                        flag_requests: Vec::new(),
                     }));
                 }
                 NimbleRequirement::Named { name, constraint, predicates, .. } => {
@@ -117,11 +148,11 @@ impl NimbleEdgeSource {
                 }
             }
         }
-        EdgeSet {
+        Ok(EdgeSet {
             requires,
-            src_dir: nm.src_dir.unwrap_or_default(),
+            src_dir,
             source: EdgeSource::NimbleFallback,
-        }
+        })
     }
 }
 
@@ -185,6 +216,7 @@ pub fn manifest_to_edgeset(manifest: &Manifest) -> EdgeSet {
                     url: u.git.clone(),
                     ref_: u.git_ref.clone(),
                     predicates: Vec::new(),
+                    flag_requests: Vec::new(),
                 }));
             }
             Dep::Named(n) => {
@@ -234,11 +266,11 @@ pub fn resolve_edges<'cache>(
     milpakdl_source: Option<&MilpaKdlEdgeSource>,
     // dep_decl_source: S3b injection point (wired from DepDeclStore in resolver.rs L1200+).
     dep_decl_source: Option<&dyn DepDeclSource>,
-) -> &'cache EdgeSet {
+) -> Result<&'cache EdgeSet, ManifestError> {
     let cache_key = (name.to_string(), version.clone());
     // Clause (a): sealed once per (name, version) — parent-independent
     if edge_cache.contains_key(&cache_key) {
-        return &edge_cache[&cache_key];
+        return Ok(&edge_cache[&cache_key]);
     }
 
     let default_nimble = NimbleEdgeSource;
@@ -251,7 +283,7 @@ pub fn resolve_edges<'cache>(
         if ctx.has_milpa_kdl {
             milpa.edges_for(name, version, ctx)
         } else {
-            nimble.edges_for(name, version, ctx)
+            nimble.edges_for(name, version, ctx)?
         }
     } else if ctx.dep_decl.is_some() {
         if let Some(dds) = dep_decl_source {
@@ -262,18 +294,18 @@ pub fn resolve_edges<'cache>(
             if ctx.has_milpa_kdl {
                 milpa.edges_for(name, version, ctx)
             } else {
-                nimble.edges_for(name, version, ctx)
+                nimble.edges_for(name, version, ctx)?
             }
         }
     } else if ctx.has_milpa_kdl {
         // Clause (d): milpa.kdl present
         milpa.edges_for(name, version, ctx)
     } else {
-        nimble.edges_for(name, version, ctx)
+        nimble.edges_for(name, version, ctx)?
     };
 
     edge_cache.insert(cache_key.clone(), es);
-    &edge_cache[&cache_key]
+    Ok(&edge_cache[&cache_key])
 }
 
 // ---------------------------------------------------------------------------
@@ -554,14 +586,15 @@ mod tests {
             has_milpa_kdl: true,
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
         };
         let version = url_ver();
         let mut cache: BTreeMap<(String, Version), EdgeSet> = BTreeMap::new();
 
         // First call populates cache
-        let es1_src = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).source.clone();
+        let es1_src = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap().source.clone();
         // Second call returns cached value
-        let es2_src = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).source.clone();
+        let es2_src = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap().source.clone();
         assert_eq!(es1_src, EdgeSource::MilpaKdl);
         assert_eq!(es2_src, EdgeSource::MilpaKdl);
         assert_eq!(cache.len(), 1);
@@ -594,9 +627,10 @@ mod tests {
             has_milpa_kdl: false,
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
         };
         // Even though has_milpa_kdl=false → nimble path, cache returns pre-populated value.
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None);
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
         assert_eq!(es.source, EdgeSource::NimbleFallback);
         assert_eq!(es.src_dir, "pre-cached");
     }
@@ -622,10 +656,11 @@ mod tests {
             has_milpa_kdl: true,
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
         };
         let version = url_ver();
         let mut cache = BTreeMap::new();
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None);
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
         assert_eq!(es.source, EdgeSource::MilpaKdl, "overridden+milpa.kdl → MilpaKdl");
     }
 
@@ -646,10 +681,11 @@ mod tests {
             has_milpa_kdl: false,
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
         };
         let version = url_ver();
         let mut cache = BTreeMap::new();
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None);
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
         assert_eq!(es.source, EdgeSource::NimbleFallback, "overridden+no milpa.kdl → NimbleFallback");
     }
 
@@ -674,11 +710,12 @@ mod tests {
             has_milpa_kdl: true,
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
         };
         let version = url_ver();
         let mut cache = BTreeMap::new();
         // dep_decl_source=None → should fall through to milpa.kdl
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None);
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
         assert_eq!(es.source, EdgeSource::MilpaKdl);
     }
 
@@ -711,10 +748,11 @@ mod tests {
             has_milpa_kdl: true,
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
         };
         let version = url_ver();
         let mut cache = BTreeMap::new();
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None);
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
         assert_eq!(es.source, EdgeSource::MilpaKdl);
         // Only foo should appear — devtool must be excluded
         let names: Vec<&str> = es.requires.iter().filter_map(|r| {
@@ -745,10 +783,11 @@ mod tests {
             has_milpa_kdl: true,
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
         };
         let version = url_ver();
         let mut cache = BTreeMap::new();
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None);
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
         // overrides must not appear in requires
         let url_names: Vec<String> = es.requires.iter().filter_map(|r| {
             if let RequireEntry::Url(u) = r { url_tail_name(&u.url) } else { None }
@@ -774,10 +813,11 @@ mod tests {
             has_milpa_kdl: true,
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
         };
         let version = url_ver();
         let mut cache = BTreeMap::new();
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None);
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
         assert_eq!(es.src_dir, "src");
     }
 
@@ -826,6 +866,7 @@ overrides {
                 url: "https://example.com/foo.git".to_string(),
                 ref_: "main".to_string(),
                 predicates: Vec::new(),
+                flag_requests: Vec::new(),
             })],
             src_dir: String::new(),
             source: EdgeSource::MilpaKdl,
@@ -907,11 +948,13 @@ overrides {
                     url: url.to_string(),
                     ref_: "main".to_string(),
                     predicates: vec![p_linux.clone()],
+                    flag_requests: Vec::new(),
                 }),
                 RequireEntry::Url(UrlRequire {
                     url: url.to_string(),
                     ref_: "main".to_string(),
                     predicates: vec![p_mac.clone()],
+                    flag_requests: Vec::new(),
                 }),
             ],
             src_dir: String::new(),
@@ -969,10 +1012,11 @@ overrides {
             has_milpa_kdl: false,
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
         };
         let version = url_ver();
         let mut cache = BTreeMap::new();
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None);
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
         assert_eq!(es.source, EdgeSource::NimbleFallback);
         assert_eq!(es.requires.len(), 1);
         match &es.requires[0] {
@@ -1002,10 +1046,11 @@ overrides {
             has_milpa_kdl: false,
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
         };
         let version = url_ver();
         let mut cache = BTreeMap::new();
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None);
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
         match &es.requires[0] {
             RequireEntry::Url(u) => {
                 assert_eq!(u.ref_, "v1.2.3", "explicit #ref must be preserved");

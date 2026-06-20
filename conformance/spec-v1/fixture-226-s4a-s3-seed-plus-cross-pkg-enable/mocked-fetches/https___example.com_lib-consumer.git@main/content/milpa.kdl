@@ -1,0 +1,7 @@
+name "lib-consumer"
+kind "library"
+deps {
+    lib-target git=(url)"https://example.com/lib-target.git" ref="main" {
+        flag "feat-x"
+    }
+}

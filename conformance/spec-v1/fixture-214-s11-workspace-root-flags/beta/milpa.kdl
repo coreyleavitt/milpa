@@ -1,0 +1,6 @@
+name "beta"
+kind "library"
+src_dir "src"
+deps {
+    netlib ">= 1.0.0"
+}

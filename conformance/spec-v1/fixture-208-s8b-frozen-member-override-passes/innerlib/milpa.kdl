@@ -1,0 +1,3 @@
+name "innerlib"
+kind "library"
+src_dir "src"

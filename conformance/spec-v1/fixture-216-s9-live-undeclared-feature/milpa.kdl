@@ -1,0 +1,16 @@
+// fixture-216: S9 — live fetch with undeclared --features name → FROZEN-ACTIVE-FLAGS-MISMATCH
+//              (spec/cli-contract.md §3.4 / RFC #23 §4)
+//
+// The manifest declares a single flag `tls`, but the consumer passes
+// MILPA_CLI_FEATURES=bogus (not declared in the manifest).
+//
+// Spec §3.4: undeclared flag names in --features MUST raise
+// FROZEN-ACTIVE-FLAGS-MISMATCH regardless of whether --frozen is set.
+// This fixture exercises the LIVE resolve path (no milpa.lock present).
+name "myapp"
+kind "application"
+flags {
+    tls default=#false description="enable TLS support"
+}
+deps {
+}

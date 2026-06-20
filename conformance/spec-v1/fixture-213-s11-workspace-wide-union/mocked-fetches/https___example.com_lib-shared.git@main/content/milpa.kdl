@@ -1,0 +1,8 @@
+name "lib-shared"
+kind "library"
+flags {
+    feat-x default=#false {
+        defines "SHARED_X"
+    }
+    feat-y default=#false
+}

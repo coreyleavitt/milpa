@@ -20,6 +20,7 @@ fn manifest(deps: Vec<Dep>) -> Manifest {
         spec_version: 1,
         spec_version_explicit: false,
         attestation_policy: milpa_manifest::AttestationPolicy::Permissive,
+        optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }
 
@@ -31,6 +32,9 @@ fn named(name: &str, constraint: Option<&str>) -> Dep {
             milpa_solver::VersionSet::from_constraint(Some(c))
                 .expect("test constraint must be valid")
         }),
+        flag_requests: Vec::new(),
+        optional: false,
+        predicates: Vec::new(),
     })
 }
 
@@ -485,6 +489,7 @@ fn local_dep(name: &str, path: &str) -> milpa_types::ResolvedDep {
         dep_decl: None,
         cond_requires: vec![],
         aliases: vec![],
+        active_flags: vec![],
     }
 }
 
@@ -586,6 +591,7 @@ fn rebuild_deps_view_preserves_local_symlink_alongside_cas_dep() {
         dep_decl: None,
         cond_requires: vec![],
         aliases: vec![],
+        active_flags: vec![],
     };
     let graph = milpa_types::ResolvedGraph { deps: vec![local, git] };
 

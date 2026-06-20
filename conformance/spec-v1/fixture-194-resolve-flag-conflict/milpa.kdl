@@ -1,0 +1,14 @@
+// fixture-194: S4c — RESOLVE-FLAG-CONFLICT (RFC #23 §3.1.4)
+//
+// lib-tls declares two TLS backend flags, openssl and bearssl, both default=#true,
+// with openssl conflicting bearssl.  Both are forced active by defaults → conflict.
+//
+// Post-fixpoint validation must detect the co-active conflict and raise
+// RESOLVE-FLAG-CONFLICT with payload {dep, flag_a, flag_b, sources_a, sources_b}.
+// flag_a="bearssl", flag_b="openssl" (lexicographic order).
+// sources_a=["default"], sources_b=["default"].
+name "myapp"
+kind "application"
+deps {
+    lib-tls git=(url)"https://example.com/lib-tls.git" ref="main"
+}

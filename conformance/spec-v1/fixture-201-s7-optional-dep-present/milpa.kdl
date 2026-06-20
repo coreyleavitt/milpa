@@ -1,0 +1,18 @@
+// fixture-201: S7 — optional dep present when enabled via enables (RFC #23 §3.2)
+//
+// `optlib optional=#true` desugars to:
+//   - auto-flag `optlib default=#false`
+//   - gate predicate `when flag="optlib"` on the dep
+//
+// `net default=#true { enables "optlib" }` → enables closure activates `optlib`
+// via the S4a fixpoint, making the dep present in the resolved graph.
+name "myapp"
+kind "application"
+flags {
+    net default=#true {
+        enables "optlib"
+    }
+}
+deps {
+    optlib git=(url)"https://example.com/optlib.git" ref="main" optional=#true
+}

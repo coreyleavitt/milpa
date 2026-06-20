@@ -29,8 +29,11 @@ Corpus fixtures exercised (read directly from conformance/):
   029-man-dep-unknown-child, 030-man-git-url-no-scheme,
   031-man-git-url-bad-scheme, 032-man-override-kind,
   033-man-override-arity, 034-man-override-unknown-props,
-  035-man-override-git-missing, 036-man-override-ref-missing,
-  037-man-override-duplicate, 038-man-flag-duplicate,
+  035-man-override-git-missing (now → MAN-OVERRIDE-TARGET-AMBIGUOUS in S8),
+  036-man-override-ref-missing, 037-man-override-duplicate,
+  202-s8-override-all-forms-accept, 203-man-override-target-ambiguous,
+  204-man-override-target-ambiguous-none,
+  038-man-flag-duplicate,
   039-man-flag-pos-args, 040-man-flag-unknown-props,
   041-man-flag-default-type, 042-man-flag-description-type,
   043-man-flag-unknown-child, 044-man-flag-defines-arg-type,
@@ -65,9 +68,12 @@ from milpa.errors import MilpaError
 from milpa.manifest import (
     FlagDecl,
     FlagRequest,
+    GitTarget,
     LocalDep,
+    LocalTarget,
     Manifest,
     MemberDep,
+    MemberTarget,
     NamedDep,
     Override,
     Predicate,
@@ -887,8 +893,9 @@ class TestOverridesParse:
         ov = m.overrides[0]
         assert isinstance(ov, Override)
         assert ov.name == "somelib"
-        assert ov.git == "https://our-fork.example.com/somelib.git"
-        assert ov.ref == "main"
+        assert isinstance(ov.target, GitTarget)
+        assert ov.target.git == "https://our-fork.example.com/somelib.git"
+        assert ov.target.ref == "main"
 
     def test_multiple_overrides(self) -> None:
         text = textwrap.dedent("""\
@@ -902,6 +909,60 @@ class TestOverridesParse:
         assert len(m.overrides) == 2
         assert m.overrides[0].name == "a"
         assert m.overrides[1].name == "b"
+
+    def test_valid_local_override(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            overrides {
+                pkg "results" local="../results-fork"
+            }
+        """)
+        m = parse_manifest(text)
+        assert len(m.overrides) == 1
+        ov = m.overrides[0]
+        assert ov.name == "results"
+        assert isinstance(ov.target, LocalTarget)
+        assert ov.target.path == "../results-fork"
+
+    def test_valid_member_override(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            overrides {
+                pkg "stew" {
+                    member "stew"
+                }
+            }
+        """)
+        m = parse_manifest(text)
+        assert len(m.overrides) == 1
+        ov = m.overrides[0]
+        assert ov.name == "stew"
+        assert isinstance(ov.target, MemberTarget)
+        assert ov.target.member_name == "stew"
+
+    def test_override_target_ambiguous_mixed(self) -> None:
+        """MAN-OVERRIDE-TARGET-AMBIGUOUS when local= and git= both present."""
+        text = textwrap.dedent("""\
+            name "x"
+            overrides {
+                pkg "mylib" local="../mylib" git=(url)"https://example.com/mylib.git" ref="main"
+            }
+        """)
+        with pytest.raises(MilpaError) as exc_info:
+            parse_manifest(text)
+        assert exc_info.value.slug == "MAN-OVERRIDE-TARGET-AMBIGUOUS"
+
+    def test_override_target_ambiguous_none(self) -> None:
+        """MAN-OVERRIDE-TARGET-AMBIGUOUS when no target form is present."""
+        text = textwrap.dedent("""\
+            name "x"
+            overrides {
+                pkg "mylib"
+            }
+        """)
+        with pytest.raises(MilpaError) as exc_info:
+            parse_manifest(text)
+        assert exc_info.value.slug == "MAN-OVERRIDE-TARGET-AMBIGUOUS"
 
     def test_empty_overrides_block(self) -> None:
         text = 'name "x"\noverrides {\n}\n'
@@ -942,6 +1003,18 @@ class TestOverridesParse:
         """Corpus fixture 037: MAN-OVERRIDE-DUPLICATE."""
         text = fixture_kdl("fixture-037-man-override-duplicate")
         expected = fixture_error("fixture-037-man-override-duplicate")
+        assert_slug(text, expected)
+
+    def test_override_target_ambiguous_corpus_mixed(self) -> None:
+        """Corpus fixture 203: MAN-OVERRIDE-TARGET-AMBIGUOUS (mixed forms)."""
+        text = fixture_kdl("fixture-203-man-override-target-ambiguous")
+        expected = fixture_error("fixture-203-man-override-target-ambiguous")
+        assert_slug(text, expected)
+
+    def test_override_target_ambiguous_corpus_none(self) -> None:
+        """Corpus fixture 204: MAN-OVERRIDE-TARGET-AMBIGUOUS (zero forms)."""
+        text = fixture_kdl("fixture-204-man-override-target-ambiguous-none")
+        expected = fixture_error("fixture-204-man-override-target-ambiguous-none")
         assert_slug(text, expected)
 
     def test_workspace_overrides_valid(self) -> None:
@@ -1580,3 +1653,300 @@ class TestWorkspaceManifestParse:
             }
         """)
         assert_slug(text, E.MAN_WORKSPACE_HAS_DEPS_OR_KIND)
+
+    # S11 (RFC #23 §3.8): workspace-root flags {} ------------------------------------------
+
+    def test_workspace_flags_field_exists_default_empty(self) -> None:
+        """WorkspaceManifest.flags defaults to () — backward compatible."""
+        text = 'workspace {\n    member "pkgA"\n}\n'
+        result = parse_workspace_or_manifest(text)
+        assert isinstance(result, WorkspaceManifest)
+        assert result.flags == ()
+
+    def test_workspace_flags_parsed(self) -> None:
+        """Workspace root may declare a flags {} block (S11 §3.8)."""
+        text = textwrap.dedent("""\
+            workspace {
+                member "pkgA"
+            }
+            flags {
+                tls default=#true {
+                    enables {
+                        chronos { flag "tls" }
+                    }
+                }
+            }
+        """)
+        result = parse_workspace_or_manifest(text)
+        assert isinstance(result, WorkspaceManifest)
+        assert len(result.flags) == 1
+        fd = result.flags[0]
+        assert fd.name == "tls"
+        assert fd.default is True
+
+    def test_workspace_flags_reuses_flag_decl_type(self) -> None:
+        """WorkspaceManifest.flags elements are FlagDecl (SSOT — no parallel type)."""
+        from milpa.manifest import FlagDecl
+        text = textwrap.dedent("""\
+            workspace {
+                member "m"
+            }
+            flags {
+                http default=#false
+            }
+        """)
+        result = parse_workspace_or_manifest(text)
+        assert isinstance(result, WorkspaceManifest)
+        assert len(result.flags) == 1
+        assert isinstance(result.flags[0], FlagDecl)
+
+    def test_workspace_flags_enables_cross_pkg(self) -> None:
+        """Workspace-root flag enables cross-pkg requests are parsed correctly."""
+        text = textwrap.dedent("""\
+            workspace {
+                member "pkgA"
+            }
+            flags {
+                full default=#true {
+                    enables {
+                        chronos { flag "tls" }
+                    }
+                }
+            }
+        """)
+        result = parse_workspace_or_manifest(text)
+        assert isinstance(result, WorkspaceManifest)
+        fd = result.flags[0]
+        assert fd.name == "full"
+        assert len(fd.enables_cross_pkg) == 1
+        assert fd.enables_cross_pkg[0].dep == "chronos"
+
+    def test_workspace_flags_round_trip_via_package_parser(self) -> None:
+        """flags {} in a workspace is parsed by the same _parse_flags_block as package manifests."""
+        # This test verifies SSOT: no parallel parser for workspace flags.
+        text = textwrap.dedent("""\
+            workspace {
+                member "m"
+            }
+            flags {
+                opt default=#false { defines "OPT" }
+            }
+        """)
+        result = parse_workspace_or_manifest(text)
+        assert isinstance(result, WorkspaceManifest)
+        assert result.flags[0].defines == ("OPT",)
+
+
+# ---------------------------------------------------------------------------
+# S1 — enables/conflicts grammar (RFC #23 §3.1.1 and §3.1.4)
+# ---------------------------------------------------------------------------
+
+
+class TestFlagEnablesConflicts:
+    """S1: FlagDecl.enables (same-pkg + cross-pkg) and FlagDecl.conflicts parsing."""
+
+    def test_flag_decl_has_enables_field(self) -> None:
+        """FlagDecl gains enables_same_pkg + enables_cross_pkg + conflicts fields."""
+        text = 'name "x"\nflags {\n    tls\n}\n'
+        m = parse_manifest(text)
+        fd = m.flags[0]
+        assert hasattr(fd, "enables_same_pkg")
+        assert hasattr(fd, "enables_cross_pkg")
+        assert hasattr(fd, "conflicts")
+        assert fd.enables_same_pkg == ()
+        assert fd.enables_cross_pkg == ()
+        assert fd.conflicts == ()
+
+    def test_enables_same_pkg_bare_string_args(self) -> None:
+        """enables "tls" "http" → enables_same_pkg == ("tls", "http")."""
+        text = textwrap.dedent("""\
+            name "x"
+            flags {
+                tls
+                http
+                full {
+                    enables "tls" "http"
+                }
+            }
+        """)
+        m = parse_manifest(text)
+        full = next(f for f in m.flags if f.name == "full")
+        assert full.enables_same_pkg == ("tls", "http")
+        assert full.enables_cross_pkg == ()
+
+    def test_enables_cross_pkg_child_node(self) -> None:
+        """enables { chronos { flag "tls" } } → enables_cross_pkg has one entry."""
+        text = textwrap.dedent("""\
+            name "x"
+            flags {
+                full {
+                    enables {
+                        chronos { flag "tls" }
+                    }
+                }
+            }
+        """)
+        m = parse_manifest(text)
+        full = m.flags[0]
+        assert full.enables_same_pkg == ()
+        assert len(full.enables_cross_pkg) == 1
+        cross = full.enables_cross_pkg[0]
+        assert cross.dep == "chronos"
+        assert len(cross.flag_requests) == 1
+        assert cross.flag_requests[0].name == "tls"
+        assert cross.flag_requests[0].enabled is True
+
+    def test_enables_mixed_args_and_children(self) -> None:
+        """enables "tls" "http" { chronos { flag "tls" } } — one node, both scopes."""
+        text = textwrap.dedent("""\
+            name "x"
+            flags {
+                tls
+                http
+                full {
+                    enables "tls" "http" {
+                        chronos { flag "tls" }
+                    }
+                }
+            }
+        """)
+        m = parse_manifest(text)
+        full = next(f for f in m.flags if f.name == "full")
+        assert full.enables_same_pkg == ("tls", "http")
+        assert len(full.enables_cross_pkg) == 1
+        assert full.enables_cross_pkg[0].dep == "chronos"
+
+    def test_enables_repeated_nodes_union(self) -> None:
+        """Two enables nodes union together into one same_pkg set (no dedup required for tuple)."""
+        text = textwrap.dedent("""\
+            name "x"
+            flags {
+                tls
+                http
+                full {
+                    enables "tls"
+                    enables "http"
+                }
+            }
+        """)
+        m = parse_manifest(text)
+        full = next(f for f in m.flags if f.name == "full")
+        # Union — order preserved across both nodes
+        assert "tls" in full.enables_same_pkg
+        assert "http" in full.enables_same_pkg
+
+    def test_conflicts_bare_string_args(self) -> None:
+        """conflicts "bearssl" → conflicts == ("bearssl",)."""
+        text = textwrap.dedent("""\
+            name "x"
+            flags {
+                openssl {
+                    conflicts "bearssl"
+                }
+                bearssl
+            }
+        """)
+        m = parse_manifest(text)
+        openssl = next(f for f in m.flags if f.name == "openssl")
+        assert openssl.conflicts == ("bearssl",)
+
+    def test_enables_undeclared_same_pkg_raises(self) -> None:
+        """enables names a flag not declared in this manifest → MAN-FLAG-ENABLES-UNDECLARED."""
+        text = textwrap.dedent("""\
+            name "x"
+            flags {
+                full {
+                    enables "missing"
+                }
+            }
+        """)
+        assert_slug(text, E.MAN_FLAG_ENABLES_UNDECLARED)
+
+    def test_enables_undeclared_dep_name_hint(self) -> None:
+        """When the undeclared enables name matches a dep name, diagnostic hints at optional."""
+        text = textwrap.dedent("""\
+            name "x"
+            flags {
+                full {
+                    enables "chronos"
+                }
+            }
+            deps {
+                chronos git=(url)"https://github.com/status-im/nim-chronos.git" ref="master"
+            }
+        """)
+        with pytest.raises(E.MilpaError) as exc_info:
+            parse_manifest(text)
+        err = exc_info.value
+        assert err.slug == E.MAN_FLAG_ENABLES_UNDECLARED
+        # The message must mention the dep-name hint
+        assert "dependency" in err.message or "optional" in err.message
+
+    def test_enables_forward_reference_is_legal(self) -> None:
+        """enables may name a flag declared LATER in the flags block (forward ref OK)."""
+        text = textwrap.dedent("""\
+            name "x"
+            flags {
+                full {
+                    enables "tls"
+                }
+                tls
+            }
+        """)
+        m = parse_manifest(text)  # must not raise
+        full = m.flags[0]
+        assert "tls" in full.enables_same_pkg
+
+    def test_enables_cross_pkg_not_validated_at_parse(self) -> None:
+        """Cross-package enables child dep names are NOT checked at parse time."""
+        text = textwrap.dedent("""\
+            name "x"
+            flags {
+                full {
+                    enables {
+                        unknown_dep { flag "tls" }
+                    }
+                }
+            }
+        """)
+        m = parse_manifest(text)  # must not raise
+        full = m.flags[0]
+        assert full.enables_cross_pkg[0].dep == "unknown_dep"
+
+    def test_flag_decl_with_enables_and_defines(self) -> None:
+        """A flag may carry both defines and enables child nodes."""
+        text = textwrap.dedent("""\
+            name "x"
+            flags {
+                tls
+                full {
+                    defines "fullEnabled"
+                    enables "tls"
+                }
+            }
+        """)
+        m = parse_manifest(text)
+        full = next(f for f in m.flags if f.name == "full")
+        assert full.defines == ("fullEnabled",)
+        assert full.enables_same_pkg == ("tls",)
+
+    def test_corpus_enables_accept(self) -> None:
+        """Corpus fixture for parse-accept with enables + conflicts."""
+        text = fixture_kdl("fixture-185-man-flag-enables-accept")
+        m = parse_manifest(text)
+        full = next(f for f in m.flags if f.name == "full")
+        assert "tls" in full.enables_same_pkg
+        assert len(full.enables_cross_pkg) == 1
+
+    def test_corpus_enables_undeclared_error(self) -> None:
+        """Corpus fixture for MAN-FLAG-ENABLES-UNDECLARED."""
+        text = fixture_kdl("fixture-186-man-flag-enables-undeclared")
+        expected = fixture_error("fixture-186-man-flag-enables-undeclared")
+        assert_slug(text, expected)
+
+    def test_corpus_enables_forward_reference(self) -> None:
+        """Corpus fixture: forward reference in enables → accepted."""
+        text = fixture_kdl("fixture-187-man-flag-enables-forward-ref")
+        m = parse_manifest(text)  # must not raise
+        full = next(f for f in m.flags if f.name == "full")
+        assert "tls" in full.enables_same_pkg

@@ -1,0 +1,10 @@
+name "lib-shared"
+kind "library"
+flags {
+    feat-x default=#false
+}
+deps {
+    when flag="feat-x" {
+        lib-e git=(url)"https://example.com/lib-e.git" ref="main"
+    }
+}

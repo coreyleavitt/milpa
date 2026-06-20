@@ -10,7 +10,7 @@
 //! and defined in `spec/errors.md`.
 
 use kdl::{KdlDocument, KdlNode, KdlValue};
-use milpa_manifest::{kdl_brace_depth, KDL_MAX_NESTING_DEPTH};
+use milpa_manifest::{contains_unsafe_char, valid_flag_name, kdl_block_comment_depth, kdl_brace_depth, KDL_MAX_NESTING_DEPTH};
 use milpa_types::{
     LockedDep, Lockfile, ProvenanceRecord, ResolvedDep, ResolvedGraph, LOCKFILE_SCHEMA_VERSION,
 };
@@ -33,10 +33,17 @@ fn err(code: &'static str, message: impl Into<String>) -> CoreError {
 /// lockfiles that predate the always-emitted node).
 pub fn parse_lockfile(text: &str) -> LockResult<Lockfile> {
     // Depth guard — see milpa_manifest::KDL_MAX_NESTING_DEPTH for rationale.
+    // Both brace depth and block-comment depth are checked (mirrors Python).
     if kdl_brace_depth(text) > KDL_MAX_NESTING_DEPTH {
         return Err(err(
             "LOCK-KDL-SYNTAX",
             format!("KDL input exceeds maximum nesting depth ({KDL_MAX_NESTING_DEPTH})"),
+        ));
+    }
+    if kdl_block_comment_depth(text) > KDL_MAX_NESTING_DEPTH {
+        return Err(err(
+            "LOCK-KDL-SYNTAX",
+            format!("KDL input exceeds maximum block-comment nesting depth ({KDL_MAX_NESTING_DEPTH})"),
         ));
     }
     let doc = KdlDocument::parse(text)
@@ -146,10 +153,43 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
                 identity = Some(val);
             }
             "version" => version = scalar_str(child, &name, "version")?,
-            "src_dir" => src_dir = scalar_str(child, &name, "src_dir")?,
+            "src_dir" => {
+                let s = scalar_str(child, &name, "src_dir")?;
+                // Security: validate src_dir at the lockfile parse boundary.
+                // A poisoned milpa.lock with unsafe chars in src_dir would flow
+                // to nim.cfg --path: on frozen reconstruction.  Reuse SSOT
+                // predicate (contains_unsafe_char from milpa-manifest); mirrors
+                // Python lockfile.py.
+                if !s.is_empty() && contains_unsafe_char(&s) {
+                    return Err(err(
+                        "LOCK-SRC-DIR-UNSAFE",
+                        format!(
+                            "dep {name:?}: lockfile 'src_dir' value contains a \
+                             control character or line separator — rejected to \
+                             prevent nim.cfg injection via a poisoned milpa.lock"
+                        ),
+                    ));
+                }
+                src_dir = s;
+            }
             "requires" => requires = string_args(child),
             "aliases" => {
                 let mut v = string_args(child);
+                // R8-S1 security fix: validate each alias against dep-name charset.
+                // Aliases reach the same filesystem and nim.cfg sinks as the primary name.
+                for alias in &v {
+                    if !valid_flag_name(alias) {
+                        return Err(err(
+                            "LOCK-DEP-NAME-INVALID",
+                            format!(
+                                "dep alias {:?} contains characters outside [A-Za-z0-9_-] — \
+                                 rejected to prevent path traversal and nim.cfg injection via a \
+                                 poisoned milpa.lock",
+                                alias
+                            ),
+                        ));
+                    }
+                }
                 v.sort();
                 aliases = v;
             }
@@ -365,9 +405,17 @@ fn parse_provenance(node: &KdlNode, dep_name: &str) -> LockResult<ProvenanceReco
 }
 
 /// The single positional string name of a `dep` node (`LOCK-DEP-NAME-ARITY`).
+///
+/// After extracting the string, validates it against the dep-name charset
+/// `[A-Za-z0-9_-]+` (SSOT: `valid_flag_name` in `milpa-manifest`).  A poisoned
+/// lockfile with `dep "../evil"` (containing `/`) would otherwise flow to
+/// `nim.cfg --path:` via string concat and to the filesystem via
+/// `deps_dir / name`.  The charset predicate (not `contains_unsafe_char`) is
+/// used because `/` and `.` are not control characters.
+/// Mirrors the Python `lockfile.py::_require_dep_name` R8-S1 fix.
 fn dep_name(node: &KdlNode) -> LockResult<String> {
     let a = args(node);
-    match a.as_slice() {
+    let name = match a.as_slice() {
         [entry] => entry
             .value()
             .as_string()
@@ -377,12 +425,27 @@ fn dep_name(node: &KdlNode) -> LockResult<String> {
                     "LOCK-DEP-NAME-ARITY",
                     "dep node requires exactly one string argument (the name)",
                 )
-            }),
-        _ => Err(err(
-            "LOCK-DEP-NAME-ARITY",
-            "dep node requires exactly one string argument (the name)",
-        )),
+            })?,
+        _ => {
+            return Err(err(
+                "LOCK-DEP-NAME-ARITY",
+                "dep node requires exactly one string argument (the name)",
+            ))
+        }
+    };
+    // R8-S1 security fix: validate dep name charset at the lockfile parse boundary.
+    if !valid_flag_name(&name) {
+        return Err(err(
+            "LOCK-DEP-NAME-INVALID",
+            format!(
+                "dep name {:?} contains characters outside [A-Za-z0-9_-] — \
+                 rejected to prevent path traversal and nim.cfg injection via a \
+                 poisoned milpa.lock",
+                name
+            ),
+        ));
     }
+    Ok(name)
 }
 
 /// A dep-child scalar string field (`identity`/`version`/`src_dir`).
@@ -860,11 +923,9 @@ fn locked_from_resolved(d: &ResolvedDep) -> LockedDep {
         // D-lifecycle: `ResolvedDep.provenances` is already the full set of
         // emission-level records (observed + declared mirrors). Direct clone.
         provenances: d.provenances.clone(),
-        // #23 active feature flags are a resolver-enrichment concern not yet
-        // carried on `ResolvedDep`; emitted empty (the Python default for deps
-        // that declare none). Threading them through lands with the feature-flag
-        // work that exercises them — no current fixture resolves a flag-carrying dep.
-        active_flags: Vec::new(),
+        // S5 (RFC #23 §4): carry active_flags from the resolved dep (populated by
+        // build_graph from the converged dep_active_flags map). Already lex-sorted.
+        active_flags: d.active_flags.clone(),
         // S6: carry dep_decl pin from the resolved dep (set only when
         // the edge was sourced from a DepDecl artifact).
         dep_decl: d.dep_decl.clone(),
@@ -1487,15 +1548,21 @@ mod tests {
         // All control chars U+0000–U+001F must become \u{N} — NO named escapes
         // (\n, \t, \r, \b, \f). This mirrors lockfile.py:_kdl_str exactly
         // (lockfile-schema §2.4 / H3 fix).
+        //
+        // name must be clean (valid charset [A-Za-z0-9_-]+): LOCK-DEP-NAME-INVALID
+        // now rejects any dep name containing chars outside the charset at parse time.
+        // src_dir must be clean (empty): LOCK-SRC-DIR-UNSAFE rejects control chars.
+        // KDL escaping for control chars is exercised through version/url/requires,
+        // which are not validated against a charset restriction.
         let nasty = "a\"b\\c\nd\re\tf\x08g\x0ch\x01i";
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
             deps: vec![LockedDep {
-                name: nasty.into(),
+                name: "safe-name".into(),  // must be clean: LOCK-DEP-NAME-INVALID rejects non-charset chars
                 identity: None,
                 version: nasty.into(),
-                src_dir: nasty.into(),
+                src_dir: String::new(), // must be clean: LOCK-SRC-DIR-UNSAFE rejects control chars
                 requires: vec![nasty.into()],
                 provenances: vec![ProvenanceRecord::Git {
                     url: nasty.into(),
@@ -1525,9 +1592,9 @@ mod tests {
         assert!(!text.contains("\\f"),  "must not emit \\f: {text:?}");
         // The emitted text is valid KDL that parses back to the same data.
         let reparsed = parse_lockfile(&text).unwrap();
-        assert_eq!(reparsed.deps[0].name, nasty);
+        assert_eq!(reparsed.deps[0].name, "safe-name");
         assert_eq!(reparsed.deps[0].version, nasty);
-        assert_eq!(reparsed.deps[0].src_dir, nasty);
+        assert_eq!(reparsed.deps[0].src_dir, ""); // src_dir was kept clean
         assert_eq!(reparsed.deps[0].requires, vec![nasty.to_string()]);
     }
 
@@ -1668,6 +1735,7 @@ mod tests {
             dep_decl: None,
             cond_requires: vec![],
             aliases: vec![],
+            active_flags: vec![],
         }
     }
 

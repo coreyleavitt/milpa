@@ -1,0 +1,11 @@
+// fixture-196: S5 — active_flags lockfile authority
+//
+// lib-flags declares alpha (default=#true), beta (default=#true), gamma (default=#false).
+// After resolve: alpha and beta are active → lockfile records active_flags "alpha" "beta"
+// (lexicographic order, normative per RFC #23 §4).
+// gamma is inactive (default=#false, no consumer request) → not in active_flags.
+name "myapp"
+kind "application"
+deps {
+    lib-flags git=(url)"https://example.com/lib-flags.git" ref="main"
+}

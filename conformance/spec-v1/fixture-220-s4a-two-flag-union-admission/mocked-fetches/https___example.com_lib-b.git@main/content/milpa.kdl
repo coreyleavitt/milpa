@@ -1,0 +1,12 @@
+name "lib-b"
+kind "library"
+flags {
+    feat-b default=#false {
+        enables {
+            lib-target { flag "flag-y" }
+        }
+    }
+}
+deps {
+    lib-target git=(url)"https://example.com/lib-target.git" ref="main"
+}

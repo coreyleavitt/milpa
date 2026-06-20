@@ -1,0 +1,25 @@
+// fixture-238: §6.3 when-block — negated flag predicate on LocalDep EXCLUDED
+//
+// A LocalDep inside a `when (not)flag="extras"` block MUST NOT appear in the
+// resolved graph when the `extras` flag IS active.
+//
+// The `(not)` annotation on the flag value negates the predicate: the dep is
+// included only when `extras` is NOT active.  When `extras` IS active (here:
+// default=#true), the negated predicate is unsatisfied → dep excluded.
+//
+// spec/manifest-grammar.md §6: `(not)` negation applies to ALL predicate keys
+// including `flag`.  All five dep forms support `when` blocks (§6.3 NORMATIVE).
+//
+// Coverage fixture: both impls should already handle this correctly (no code
+// change expected).  Closes the round-7 blind-spot gap for negated flag
+// predicates on non-UrlDep forms.
+name "myapp"
+kind "application"
+flags {
+    extras default=#true
+}
+deps {
+    when flag=(not)"extras" {
+        mylib local="./src-tree"
+    }
+}

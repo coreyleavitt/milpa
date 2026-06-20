@@ -1,0 +1,20 @@
+// fixture-234: §6 predicates — source order preserved (platform= before arch=)
+//
+// A UrlDep with two inline predicates in non-alphabetical order (platform= before
+// arch=, i.e. 'p' > 'a') MUST parse and resolve identically in all impls.
+//
+// NORMATIVE (spec/manifest-grammar.md §6): predicate order in a parsed dep is
+// source order.  Predicate evaluation is order-independent (conjunction), so
+// order is for representational determinism only.
+//
+// Regression for R6-F2: Rust merge_predicates called .sort_by(|a,b| a.name.cmp(&b.name))
+// on inline+child predicates, giving [arch, platform] instead of Python's source
+// order [platform, arch].  After fix: Rust uses source order, byte-identical output.
+//
+// This fixture resolves on linux/amd64 (predicates match) → dep appears in lockfile.
+// The same lockfile must be produced by both impls after the Rust sort is removed.
+name "myapp"
+kind "application"
+deps {
+    foo git=(url)"https://github.com/example/foo.git" ref="main" platform="linux" arch="amd64"
+}

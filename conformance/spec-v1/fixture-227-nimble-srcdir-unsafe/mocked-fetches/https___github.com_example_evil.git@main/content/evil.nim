@@ -1,0 +1,1 @@
+proc evil*(): string = "evil"

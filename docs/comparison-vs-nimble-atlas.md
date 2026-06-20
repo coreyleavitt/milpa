@@ -1,6 +1,6 @@
 # milpa vs nimble vs atlas — full feature comparison
 
-**Last updated**: 2026-05-22
+**Last updated**: 2026-06-19
 
 This document compares milpa against the two existing Nim dependency
 resolvers (nimble v0.22.3, atlas v0.14.2). The milpa column reflects
@@ -84,10 +84,10 @@ deliberate scope-out.
 | Feature | nimble v0.22.3 | atlas v0.14.2 | milpa (post-RFC) |
 |---|---|---|---|
 | Direct deps | yes | yes | yes |
-| Features / optional deps | no | yes | yes |
+| Features / optional deps | no | yes | **yes — exceeds atlas: Cargo-style union semantics, cross-package `enables`, same-package `conflicts` (mutual exclusion), KDL-native grammar, monotone fixpoint; optional deps pruned (never fetched) when disabled (#23 ✓)** |
 | Conditional deps (`when`) | yes (nimscript) | yes (nimscript) | yes (declarative `when` syntax) |
 | Dev / test deps | basic | yes (feature blocks) | yes |
-| Patch / override section | no | yes | yes |
+| Patch / override section | no | yes | **yes — exceeds atlas: three-form discriminated union (`git=` / `local=` / `member`); `member` patches are identity-bearing + drift-detected; `local=` patches trip `FROZEN-LOCAL-DEP` under `--frozen` (#23 ✓)** |
 | Fork management | no | yes (auto remote) | yes (subsumed by overrides) |
 | Workspace linking | basic | yes | yes |
 
@@ -162,11 +162,19 @@ Each of these would require ground-up redesign for nimble or atlas to
 match. They aren't features to add; they're commitments embedded in
 the data model.
 
-### Where milpa matches
+### Where milpa matches (and often exceeds)
 
 Every feature atlas has that nimble lacks, milpa has too: workspaces,
 features, parallel fetch, overrides, resolution strategies. milpa
 doesn't cede ground on capability.
+
+On features/optional/patch (#23 shipped): milpa now exceeds atlas.
+Cargo-style union semantics, same-package `conflicts` (mutual exclusion —
+a Cargo gap), cross-package `enables` with a KDL-native child-node
+grammar (no opaque `"dep:flag"` strings), a monotone fixpoint
+activation algorithm, and a three-form `overrides` discriminated union
+(`git=` / `local=` / workspace `member`) where `member` patches carry
+full content-hash identity and drift detection.
 
 ### Where milpa intentionally cedes
 

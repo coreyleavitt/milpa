@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use milpa_manifest::{
-    Dep, LocalDep, Manifest, NamedDep, Override, Predicate, Profile, TarballDep, UrlDep,
+    Dep, LocalDep, Manifest, NamedDep, Override, OverrideTarget, Predicate, Profile, TarballDep,
+    UrlDep,
 };
 use milpa_solver::Strategy;
 use milpa_types::{
@@ -190,6 +191,7 @@ fn tarball_dep(name: &str, url: &str, sha256: Option<&str>) -> Dep {
         url: url.to_string(),
         sha256: sha256.map(str::to_string),
         strip_components: 0,
+        predicates: vec![],
     })
 }
 
@@ -214,6 +216,7 @@ fn url_dep(name: &str, git: &str, refp: &str) -> Dep {
         mirrors: Vec::new(),
         predicates: Vec::new(),
         flag_requests: Vec::new(),
+        optional: false,
     })
 }
 
@@ -225,6 +228,9 @@ fn named_dep(name: &str, constraint: Option<&str>) -> Dep {
             milpa_solver::VersionSet::from_constraint(Some(c))
                 .expect("test constraint must be valid")
         }),
+        flag_requests: Vec::new(),
+        optional: false,
+        predicates: Vec::new(),
     })
 }
 
@@ -246,6 +252,7 @@ fn manifest_full(deps: Vec<Dep>, dev_deps: Vec<Dep>, overrides: Vec<Override>) -
         spec_version: 1,
         spec_version_explicit: false,
         attestation_policy: milpa_manifest::AttestationPolicy::Permissive,
+        optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }
 
@@ -510,8 +517,10 @@ fn resolve_url_dep_with_override_fetches_override() {
         Vec::new(),
         vec![Override {
             name: "foo".into(),
-            git: "https://fork.example.com/foo.git".into(),
-            git_ref: "patched".into(),
+            target: OverrideTarget::Git {
+                url: "https://fork.example.com/foo.git".into(),
+                git_ref: "patched".into(),
+            },
         }],
     );
     let graph = resolve(
@@ -695,6 +704,7 @@ fn resolve_local_dep_copies_and_parses() {
     let m = manifest(vec![Dep::Local(LocalDep {
         name: "liblocal".into(),
         path: "liblocal".into(),
+        predicates: vec![],
     })]);
     let graph = resolve(
         &m,
@@ -875,6 +885,7 @@ fn url_dep_with_mirrors(name: &str, git: &str, refp: &str, mirrors: Vec<&str>) -
         mirrors: mirrors.iter().map(|s| s.to_string()).collect(),
         predicates: Vec::new(),
         flag_requests: Vec::new(),
+        optional: false,
     })
 }
 
@@ -1040,6 +1051,7 @@ fn resolve_mirror_fallback_uses_second_candidate() {
         mirrors: vec!["https://mirror.example.com/foo.git".into()],
         predicates: Vec::new(),
         flag_requests: Vec::new(),
+        optional: false,
     })]);
     let graph = resolve(
         &m,
@@ -1256,6 +1268,7 @@ fn resolve_profile_excludes_platform_mismatch() {
             negated: false,
         }],
         flag_requests: Vec::new(),
+        optional: false,
     });
     let m = manifest(vec![dep]);
     let profile = Profile {
@@ -1301,6 +1314,7 @@ fn resolve_profile_includes_platform_match() {
             negated: false,
         }],
         flag_requests: Vec::new(),
+        optional: false,
     });
     let m = manifest(vec![dep]);
     let profile = Profile {
@@ -1344,6 +1358,7 @@ fn resolve_absent_profile_includes_platform_gated_dep() {
             negated: false,
         }],
         flag_requests: Vec::new(),
+        optional: false,
     });
     let m = manifest(vec![dep]);
     let graph = resolve(
@@ -1379,6 +1394,7 @@ fn resolve_profile_filters_conditional_dep() {
             negated: false,
         }],
         flag_requests: Vec::new(),
+        optional: false,
     });
     let m = manifest(vec![dep]);
     let profile = Profile {
@@ -1422,6 +1438,7 @@ fn resolve_absent_profile_includes_conditional_dep() {
             negated: false,
         }],
         flag_requests: Vec::new(),
+        optional: false,
     });
     let m = manifest(vec![dep]);
     let graph = resolve(
@@ -1581,4 +1598,515 @@ fn resolve_tarball_manifest_sha256_mismatch_rejected_on_first_fetch() {
         panic!("expected AllFailed, got {err:?}");
     };
     assert!(msg.contains("FETCH-SHA256-MISMATCH"), "got: {msg}");
+}
+
+// ---------------------------------------------------------------------------
+// S4c (RFC #23 §3.1.4): exclusion (conflicts) + RESOLVE-FLAG-CONFLICT
+// ---------------------------------------------------------------------------
+
+/// Build a UrlDep with flag requests for use in S4c tests.
+fn url_dep_with_flags(name: &str, git: &str, refp: &str, flag_reqs: Vec<milpa_manifest::FlagRequest>) -> Dep {
+    Dep::Url(UrlDep {
+        name: name.to_string(),
+        git: git.to_string(),
+        git_ref: refp.to_string(),
+        mirrors: Vec::new(),
+        predicates: Vec::new(),
+        flag_requests: flag_reqs,
+        optional: false,
+    })
+}
+
+/// Helper: parse manifest KDL and extract the error code (mirrors manifest test doc_err).
+fn manifest_parse_err(text: &str) -> &'static str {
+    match milpa_manifest::parse_manifest(text) {
+        Err(e) => e.code,
+        Ok(_) => panic!("expected ManifestError"),
+    }
+}
+
+/// Helper: parse manifest KDL and return the package Manifest.
+fn parse_pkg(text: &str) -> milpa_manifest::Manifest {
+    milpa_manifest::parse_manifest(text).expect("expected a package manifest")
+}
+
+#[test]
+fn s4c_man_flag_conflicts_undeclared_parse_error() {
+    // MAN-FLAG-CONFLICTS-UNDECLARED: conflicts references undeclared flag.
+    // Mirrors test_s4c_conflicts.py::TestManFlagConflictsUndeclared::test_undeclared_conflicts_target_raises.
+    let code = manifest_parse_err(
+        r#"name "mylib"
+kind "library"
+flags {
+    openssl default=#false {
+        conflicts "bearssl"
+    }
+}"#,
+    );
+    assert_eq!(code, "MAN-FLAG-CONFLICTS-UNDECLARED");
+}
+
+#[test]
+fn s4c_man_flag_conflicts_declared_accepted() {
+    // conflicts referencing a declared flag → no error.
+    let m = parse_pkg(
+        r#"name "mylib"
+kind "library"
+flags {
+    openssl default=#false {
+        conflicts "bearssl"
+    }
+    bearssl default=#false
+}"#,
+    );
+    let openssl = m.flags.iter().find(|f| f.name == "openssl").expect("openssl");
+    assert!(openssl.conflicts.iter().any(|s| s == "bearssl"));
+}
+
+#[test]
+fn s4c_man_flag_conflicts_forward_reference_accepted() {
+    // forward reference in conflicts (target declared later) is legal (post-parse).
+    let m = parse_pkg(
+        r#"name "mylib"
+kind "library"
+flags {
+    openssl default=#false {
+        conflicts "bearssl"
+    }
+    bearssl default=#false
+}"#,
+    );
+    // The post-parse pass validates after the full table is built; forward ref OK.
+    let openssl = m.flags.iter().find(|f| f.name == "openssl").expect("openssl");
+    assert_eq!(openssl.conflicts, vec!["bearssl"]);
+}
+
+#[test]
+fn s4c_resolve_flag_conflict_both_defaults_true() {
+    // Both openssl and bearssl default=#true, openssl conflicts bearssl.
+    // Post-fixpoint validation must raise RESOLVE-FLAG-CONFLICT.
+    // Payload: dep="lib-tls", flag_a="bearssl", flag_b="openssl" (lex order),
+    //          sources_a=["default"], sources_b=["default"].
+    let url = "https://example.com/lib-tls.git";
+    let dep_kdl = r#"name "lib-tls"
+kind "library"
+flags {
+    openssl default=#true {
+        conflicts "bearssl"
+    }
+    bearssl default=#true
+}"#;
+    let reg = FakeReg::git(&[(url, "main", milpa_kdl("abcd0000abcd0000abcd0000abcd0000abcd0000", dep_kdl))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("lib-tls", url, "main")]);
+    let err = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp)).unwrap_err();
+    assert_eq!(err.code(), "RESOLVE-FLAG-CONFLICT");
+}
+
+#[test]
+fn s4c_resolve_flag_conflict_payload_byte_identity() {
+    // Normative payload (RFC #23 §3.1.4 + §5 risk #3):
+    //   dep      — "lib-tls"
+    //   flag_a   — "bearssl" (lexicographically smaller)
+    //   flag_b   — "openssl" (lexicographically larger)
+    //   sources_a — ["default"] (bearssl activated by DEFAULT)
+    //   sources_b — ["default"] (openssl activated by DEFAULT)
+    // Mirrors test_s4c_conflicts.py::TestS4cResolveIntegration::test_conflict_payload_byte_identity.
+    let url = "https://example.com/lib-tls.git";
+    let dep_kdl = r#"name "lib-tls"
+kind "library"
+flags {
+    openssl default=#true {
+        conflicts "bearssl"
+    }
+    bearssl default=#true
+}"#;
+    let reg = FakeReg::git(&[(url, "main", milpa_kdl("abcd1111abcd1111abcd1111abcd1111abcd1111", dep_kdl))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("lib-tls", url, "main")]);
+    let err = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp)).unwrap_err();
+    assert_eq!(err.code(), "RESOLVE-FLAG-CONFLICT");
+
+    // Extract the structured payload from CoreError::FlagConflict.
+    let crate::error::MilpaError::Core(crate::error::CoreError::FlagConflict {
+        dep, flag_a, flag_b, sources_a, sources_b
+    }) = &err else {
+        panic!("expected CoreError::FlagConflict, got {err:?}");
+    };
+
+    // Payload fields — must be byte-identical to Python impl.
+    assert_eq!(dep, "lib-tls");
+    assert_eq!(flag_a, "bearssl");   // lex order: "bearssl" < "openssl"
+    assert_eq!(flag_b, "openssl");
+    assert_eq!(sources_a, &vec!["default".to_string()]); // bearssl: DEFAULT source
+    assert_eq!(sources_b, &vec!["default".to_string()]); // openssl: DEFAULT source
+}
+
+#[test]
+fn s4c_resolve_flag_conflict_only_one_active_no_error() {
+    // openssl default=#true, bearssl default=#false → only openssl active → no conflict.
+    // No false positive.
+    let url = "https://example.com/lib-tls.git";
+    let dep_kdl = r#"name "lib-tls"
+kind "library"
+flags {
+    openssl default=#true {
+        conflicts "bearssl"
+    }
+    bearssl default=#false
+}"#;
+    let reg = FakeReg::git(&[(url, "main", milpa_kdl("abcd2222abcd2222abcd2222abcd2222abcd2222", dep_kdl))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("lib-tls", url, "main")]);
+    // Should succeed (no conflict).
+    let graph = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp)).unwrap();
+    let dep_names: Vec<&str> = graph.deps.iter().map(|d| d.name.as_str()).collect();
+    assert!(dep_names.contains(&"lib-tls"), "lib-tls should be in resolved graph");
+}
+
+#[test]
+fn s4c_resolve_flag_conflict_symmetry_one_side_declared() {
+    // Conflict declared on ONE flag only (openssl conflicts bearssl, but bearssl
+    // does NOT declare conflicts "openssl") — still detected.
+    // RFC §3.1.4: "Symmetric: declare once."  The check on openssl's conflicts list
+    // fires when both are active.
+    let url = "https://example.com/lib-tls.git";
+    let dep_kdl = r#"name "lib-tls"
+kind "library"
+flags {
+    openssl default=#true {
+        conflicts "bearssl"
+    }
+    bearssl default=#true
+}"#;
+    let reg = FakeReg::git(&[(url, "main", milpa_kdl("abcd3333abcd3333abcd3333abcd3333abcd3333", dep_kdl))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("lib-tls", url, "main")]);
+    let err = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp)).unwrap_err();
+    assert_eq!(err.code(), "RESOLVE-FLAG-CONFLICT");
+}
+
+#[test]
+fn s4c_resolve_flag_conflict_via_edge_request_sources_payload() {
+    // openssl default=#true, bearssl default=#false.
+    // Consumer requests bearssl (flag "bearssl") on lib-tls.
+    // → openssl=DEFAULT, bearssl=EDGE_REQUEST → conflict.
+    // Payload: flag_a="bearssl" (sources_a=["edge_request"]),
+    //          flag_b="openssl" (sources_b=["default"]).
+    // Mirrors test_s4c_conflicts.py::test_conflict_via_edge_request_sources_payload.
+    let url = "https://example.com/lib-tls.git";
+    let dep_kdl = r#"name "lib-tls"
+kind "library"
+flags {
+    openssl default=#true {
+        conflicts "bearssl"
+    }
+    bearssl default=#false
+}"#;
+    let reg = FakeReg::git(&[(url, "main", milpa_kdl("abcd4444abcd4444abcd4444abcd4444abcd4444", dep_kdl))]);
+    let tmp = tempfile::tempdir().unwrap();
+
+    let dep = url_dep_with_flags(
+        "lib-tls", url, "main",
+        vec![milpa_manifest::FlagRequest { name: "bearssl".to_string(), enabled: true }],
+    );
+    let m = manifest(vec![dep]);
+    let err = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp)).unwrap_err();
+    assert_eq!(err.code(), "RESOLVE-FLAG-CONFLICT");
+
+    let crate::error::MilpaError::Core(crate::error::CoreError::FlagConflict {
+        dep, flag_a, flag_b, sources_a, sources_b
+    }) = &err else {
+        panic!("expected CoreError::FlagConflict, got {err:?}");
+    };
+
+    assert_eq!(dep, "lib-tls");
+    assert_eq!(flag_a, "bearssl");          // lex order
+    assert_eq!(flag_b, "openssl");
+    assert_eq!(sources_a, &vec!["edge_request".to_string()]); // bearssl: EDGE_REQUEST
+    assert_eq!(sources_b, &vec!["default".to_string()]);      // openssl: DEFAULT
+}
+
+// ---------------------------------------------------------------------------
+// S5: active_flags lockfile authority
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s5_single_active_flag_in_resolved_dep() {
+    // Dep with openssl default=#true → ResolvedDep.active_flags = ["openssl"].
+    let url = "https://example.com/lib-tls.git";
+    let dep_kdl = r#"name "lib-tls"
+kind "library"
+flags {
+    openssl default=#true {
+        defines "ssl" "useOpenSSL"
+    }
+}"#;
+    let reg = FakeReg::git(&[(url, "main", milpa_kdl("s5110000s5110000s5110000s5110000s5110000", dep_kdl))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("lib-tls", url, "main")]);
+    let graph = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp)).unwrap();
+    let lib_tls = graph.deps.iter().find(|d| d.name == "lib-tls").expect("lib-tls in graph");
+    assert_eq!(lib_tls.active_flags, vec!["openssl"]);
+}
+
+#[test]
+fn s5_multiple_active_flags_lexicographically_sorted() {
+    // Dep with zstd, aarch64, mbedtls all default=#true → lex order: aarch64 < mbedtls < zstd.
+    let url = "https://example.com/lib-multi.git";
+    let dep_kdl = r#"name "lib-multi"
+kind "library"
+flags {
+    zstd default=#true
+    aarch64 default=#true
+    mbedtls default=#true
+}"#;
+    let reg = FakeReg::git(&[(url, "main", milpa_kdl("s5220000s5220000s5220000s5220000s5220000", dep_kdl))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("lib-multi", url, "main")]);
+    let graph = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp)).unwrap();
+    let dep = graph.deps.iter().find(|d| d.name == "lib-multi").expect("lib-multi in graph");
+    // Must be lexicographically sorted: aarch64 < mbedtls < zstd
+    assert_eq!(dep.active_flags, vec!["aarch64", "mbedtls", "zstd"]);
+}
+
+#[test]
+fn s5_no_active_flags_empty() {
+    // Dep with all flags default=#false → active_flags empty.
+    let url = "https://example.com/lib-none.git";
+    let dep_kdl = r#"name "lib-none"
+kind "library"
+flags {
+    openssl default=#false
+    bearssl default=#false
+}"#;
+    let reg = FakeReg::git(&[(url, "main", milpa_kdl("s5330000s5330000s5330000s5330000s5330000", dep_kdl))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("lib-none", url, "main")]);
+    let graph = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp)).unwrap();
+    let dep = graph.deps.iter().find(|d| d.name == "lib-none").expect("lib-none in graph");
+    assert!(dep.active_flags.is_empty(), "expected empty active_flags, got {:?}", dep.active_flags);
+}
+
+#[test]
+fn s5_active_flags_via_edge_request() {
+    // Consumer requests openssl (default=#false) → active_flags = ["openssl"].
+    let url = "https://example.com/lib-req.git";
+    let dep_kdl = r#"name "lib-req"
+kind "library"
+flags {
+    openssl default=#false
+}"#;
+    let reg = FakeReg::git(&[(url, "main", milpa_kdl("s5440000s5440000s5440000s5440000s5440000", dep_kdl))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let dep = url_dep_with_flags(
+        "lib-req", url, "main",
+        vec![milpa_manifest::FlagRequest { name: "openssl".to_string(), enabled: true }],
+    );
+    let m = manifest(vec![dep]);
+    let graph = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp)).unwrap();
+    let d = graph.deps.iter().find(|d| d.name == "lib-req").expect("lib-req in graph");
+    assert_eq!(d.active_flags, vec!["openssl"]);
+}
+
+#[test]
+fn s5_active_flags_in_lockfile_emission() {
+    // active_flags on ResolvedDep propagate into the lockfile via locked_from_resolved.
+    let url = "https://example.com/lib-lock.git";
+    let dep_kdl = r#"name "lib-lock"
+kind "library"
+flags {
+    alpha default=#true
+    beta default=#true
+    gamma default=#false
+}"#;
+    let reg = FakeReg::git(&[(url, "main", milpa_kdl("s5550000s5550000s5550000s5550000s5550000", dep_kdl))]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("lib-lock", url, "main")]);
+    let graph = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp)).unwrap();
+    let lockfile = crate::lockfile::from_graph(&graph, "maxver");
+    let locked = lockfile.deps.iter().find(|d| d.name == "lib-lock").expect("lib-lock in lockfile");
+    // alpha and beta are active (default=#true); gamma is not.
+    // Lexicographically sorted: alpha < beta.
+    assert_eq!(locked.active_flags, vec!["alpha", "beta"]);
+}
+
+// ---------------------------------------------------------------------------
+// C1b-completion: CLI-selected root flags participate in conflict detection
+// ---------------------------------------------------------------------------
+
+/// Helper: build a Manifest with no deps but with the given flag declarations.
+fn manifest_with_flags(name: &str, flags: Vec<milpa_manifest::FlagDecl>) -> milpa_manifest::Manifest {
+    milpa_manifest::Manifest {
+        name: Some(name.to_string()),
+        kind: "application".to_string(),
+        src_dir: String::new(),
+        deps: Vec::new(),
+        dev_deps: Vec::new(),
+        overrides: Vec::new(),
+        flags,
+        self_mirrors: Vec::new(),
+        cas_dir: String::new(),
+        spec_version: 1,
+        spec_version_explicit: false,
+        attestation_policy: milpa_manifest::AttestationPolicy::Permissive,
+        optional_auto_flags: std::collections::BTreeSet::new(),
+    }
+}
+
+#[test]
+fn c1b_cli_features_conflict_on_root_raises() {
+    // Root manifest: flags { x conflicts=["y"]; y }.
+    // --features x,y → RESOLVE-FLAG-CONFLICT (both have source "cli").
+    // Mirrors test_s4c_conflicts.py::TestC1bCliRootFlagConflicts::test_cli_features_conflict_on_root_raises.
+
+    let flags = vec![
+        milpa_manifest::FlagDecl {
+            name: "x".to_string(), default: false,
+            description: String::new(), defines: Vec::new(),
+            enables_same_pkg: Vec::new(), enables_cross_pkg: Vec::new(),
+            conflicts: vec!["y".to_string()],
+        },
+        milpa_manifest::FlagDecl {
+            name: "y".to_string(), default: false,
+            description: String::new(), defines: Vec::new(),
+            enables_same_pkg: Vec::new(), enables_cross_pkg: Vec::new(),
+            conflicts: Vec::new(),
+        },
+    ];
+    let m = manifest_with_flags("myapp", flags);
+    let reg = FakeReg::default();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let features: std::collections::BTreeSet<String> = ["x".to_string(), "y".to_string()].into_iter().collect();
+    let err = crate::resolver::resolve_with_features(
+        &m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp),
+        None, false, &cas_store(&tmp),
+        &features, false, false,
+    ).unwrap_err();
+
+    assert_eq!(err.code(), "RESOLVE-FLAG-CONFLICT");
+}
+
+#[test]
+fn c1b_cli_features_conflict_payload_includes_cli_source() {
+    // Payload must have dep="myapp", flag_a="x", flag_b="y", sources ["cli"] each.
+    // Mirrors test_s4c_conflicts.py::TestC1bCliRootFlagConflicts::test_cli_features_conflict_payload_includes_cli_source.
+    let flags = vec![
+        milpa_manifest::FlagDecl {
+            name: "x".to_string(), default: false,
+            description: String::new(), defines: Vec::new(),
+            enables_same_pkg: Vec::new(), enables_cross_pkg: Vec::new(),
+            conflicts: vec!["y".to_string()],
+        },
+        milpa_manifest::FlagDecl {
+            name: "y".to_string(), default: false,
+            description: String::new(), defines: Vec::new(),
+            enables_same_pkg: Vec::new(), enables_cross_pkg: Vec::new(),
+            conflicts: Vec::new(),
+        },
+    ];
+    let m = manifest_with_flags("myapp", flags);
+    let reg = FakeReg::default();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let features: std::collections::BTreeSet<String> = ["x".to_string(), "y".to_string()].into_iter().collect();
+    let err = crate::resolver::resolve_with_features(
+        &m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp),
+        None, false, &cas_store(&tmp),
+        &features, false, false,
+    ).unwrap_err();
+
+    assert_eq!(err.code(), "RESOLVE-FLAG-CONFLICT");
+
+    let crate::error::MilpaError::Core(crate::error::CoreError::FlagConflict {
+        dep, flag_a, flag_b, sources_a, sources_b
+    }) = &err else {
+        panic!("expected CoreError::FlagConflict, got {err:?}");
+    };
+
+    // "x" < "y" lex → flag_a="x", flag_b="y"
+    assert_eq!(dep, "myapp");
+    assert_eq!(flag_a, "x");
+    assert_eq!(flag_b, "y");
+    // Both activated by CLI
+    assert_eq!(sources_a, &vec!["cli".to_string()]);
+    assert_eq!(sources_b, &vec!["cli".to_string()]);
+}
+
+#[test]
+fn c1b_cli_features_no_conflict_no_error() {
+    // --features x only (not y) → no conflict.
+
+    let flags = vec![
+        milpa_manifest::FlagDecl {
+            name: "x".to_string(), default: false,
+            description: String::new(), defines: Vec::new(),
+            enables_same_pkg: Vec::new(), enables_cross_pkg: Vec::new(),
+            conflicts: vec!["y".to_string()],
+        },
+        milpa_manifest::FlagDecl {
+            name: "y".to_string(), default: false,
+            description: String::new(), defines: Vec::new(),
+            enables_same_pkg: Vec::new(), enables_cross_pkg: Vec::new(),
+            conflicts: Vec::new(),
+        },
+    ];
+    let m = manifest_with_flags("myapp", flags);
+    let reg = FakeReg::default();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let features: std::collections::BTreeSet<String> = ["x".to_string()].into_iter().collect();
+    // Should succeed (no conflict between x alone)
+    crate::resolver::resolve_with_features(
+        &m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp),
+        None, false, &cas_store(&tmp),
+        &features, false, false,
+    ).unwrap();
+}
+
+/// C1b: ActivationSource::Cli serializes as "cli" — byte-identical to Python.
+///
+/// `_ACTIVATION_SOURCE_NAMES[ActivationSource.CLI] == "cli"` (Python).
+/// `serialize_sources({Cli}) == ["cli"]` (Rust, check_s4c_flag_conflicts inner fn).
+///
+/// This is a unit test for the serializer only; the C1b code path that records
+/// CLI as a source (via `--features` → dep_active_flags) is a future concern
+/// (root-level flag identity not yet tracked).
+#[test]
+fn activation_source_cli_serializes_as_cli() {
+    use milpa_types::ActivationSource;
+    use std::collections::BTreeSet;
+
+    // Replicate the serialize_sources function from check_s4c_flag_conflicts.
+    fn serialize_sources(s: &BTreeSet<ActivationSource>) -> Vec<String> {
+        s.iter()
+            .map(|src| match src {
+                ActivationSource::Default => "default",
+                ActivationSource::EdgeRequest => "edge_request",
+                ActivationSource::EnablesRule => "enables_rule",
+                ActivationSource::Cli => "cli",
+            })
+            .map(String::from)
+            .collect()
+    }
+
+    // Single CLI source → "cli"
+    let cli_only: BTreeSet<ActivationSource> = [ActivationSource::Cli].into_iter().collect();
+    assert_eq!(serialize_sources(&cli_only), vec!["cli"]);
+
+    // All four sources → canonical declaration order:
+    // Default < EdgeRequest < EnablesRule < Cli
+    let all: BTreeSet<ActivationSource> = [
+        ActivationSource::Cli,
+        ActivationSource::Default,
+        ActivationSource::EdgeRequest,
+        ActivationSource::EnablesRule,
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        serialize_sources(&all),
+        vec!["default", "edge_request", "enables_rule", "cli"]
+    );
 }

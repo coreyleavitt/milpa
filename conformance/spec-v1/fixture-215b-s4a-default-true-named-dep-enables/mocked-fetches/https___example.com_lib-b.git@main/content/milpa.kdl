@@ -1,0 +1,10 @@
+name "lib-b"
+kind "library"
+flags {
+    g1 default=#false
+}
+deps {
+    when flag="g1" {
+        lib-c git=(url)"https://example.com/lib-c.git" ref="main"
+    }
+}

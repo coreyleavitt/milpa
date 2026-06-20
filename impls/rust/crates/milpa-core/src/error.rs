@@ -33,6 +33,17 @@ pub enum CoreError {
     /// Raise sites for all five codes are S3b; S1 only wires `TNG-DEPDECL-PARSE-ERROR`
     /// (propagated from `parse_dep_decl` for KDL syntax / structural errors).
     DepDecl(&'static str, String),
+    /// S4c: post-fixpoint mutual-exclusion conflict (`RESOLVE-FLAG-CONFLICT`).
+    /// Carries structured payload for byte-identity unit tests (RFC #23 §5 risk #3):
+    ///   dep, flag_a, flag_b (lexicographic order), sources_a, sources_b
+    ///   (sorted by enum declaration order: default, edge_request, enables_rule).
+    FlagConflict {
+        dep: String,
+        flag_a: String,
+        flag_b: String,
+        sources_a: Vec<String>,
+        sources_b: Vec<String>,
+    },
 }
 
 impl CoreError {
@@ -45,6 +56,7 @@ impl CoreError {
             | CoreError::Frozen(c, _)
             | CoreError::Workspace(c, _)
             | CoreError::DepDecl(c, _) => c,
+            CoreError::FlagConflict { .. } => "RESOLVE-FLAG-CONFLICT",
         }
     }
 
@@ -59,6 +71,11 @@ impl CoreError {
             | CoreError::Frozen(_, m)
             | CoreError::Workspace(_, m)
             | CoreError::DepDecl(_, m) => m,
+            CoreError::FlagConflict { .. } => {
+                // The payload fields (dep, flag_a, flag_b, sources_*) carry
+                // all diagnostic info; conformance only checks code(), not message.
+                "mutually exclusive flags co-active after fixpoint"
+            }
         }
     }
 
@@ -107,6 +124,11 @@ impl CoreError {
             "LOCK-PROV-KIND-MISSING",
             "LOCK-PROV-KIND-UNKNOWN",
             "LOCK-PROV-FIELD-MISSING",
+            // lockfile dep name/alias charset validation (mirrors MAN-DEP-NAME-INVALID;
+            // R8-S1 security fix — path traversal + nim.cfg injection via poisoned lock).
+            "LOCK-DEP-NAME-INVALID",
+            // lockfile src_dir unsafe-char validation (mirrors MAN-SRC-DIR-UNSAFE).
+            "LOCK-SRC-DIR-UNSAFE",
             "LOCK-FILE-NOT-FOUND",
             "LOCK-FILE-UNREADABLE",
             // verify path (lockfile ⟷ resolved graph) — S13.
@@ -115,6 +137,8 @@ impl CoreError {
             // workspace RES-WS-* codes wire with the workspace path in S11.
             "RES-NO-INDEX",
             "RES-PROVENANCE-CONFLICT",
+            // S4c: post-fixpoint mutual-exclusion check (RFC #23 §3.1.4).
+            "RESOLVE-FLAG-CONFLICT",
             // S5: attestation policy enforcement — strict mode raises this when
             // any resolved dep fell back to un-attested .nimble metadata.
             "RES-UNATTESTED-METADATA",
@@ -145,6 +169,7 @@ impl CoreError {
             // FROZEN-MEMBER-IDENTITY-DRIFT) are raised only by
             // resolve_workspace_frozen, which lands with the workspace member
             // loader in S11 — added then (subset rule: list only codes emitted).
+            "FROZEN-ACTIVE-FLAGS-MISMATCH",
             "FROZEN-STRATEGY-MISMATCH",
             "FROZEN-MANIFEST-DEP-NOT-IN-LOCK",
             "FROZEN-LOCKED-VERSION-UNPARSEABLE",
@@ -189,6 +214,11 @@ impl CoreError {
             "TNG-DEPDECL-FETCH-FAILED",
             "TNG-DEPDECL-SCHEMA-MISMATCH",
             "TNG-DEPDECL-SCHEMA-UNSUPPORTED",
+            // CLI-layer argument-validation error (spec/errors.md §CLI).
+            // Raised when --all-features and --no-default-features are both
+            // supplied; the combination is contradictory and is rejected before
+            // the resolver is called.
+            "CLI-FEATURE-FLAGS-CONFLICT",
             // internal / panic sentinels (Gap-1 R4 / S1c). MILPA-INTERNAL is
             // the outermost catch-all; INTERNAL-PANIC fires from the panic hook.
             "MILPA-INTERNAL",

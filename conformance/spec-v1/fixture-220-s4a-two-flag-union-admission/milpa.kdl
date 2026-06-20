@@ -1,0 +1,31 @@
+// fixture-220: S4a — two-flag union admission (R2-H1 regression)
+//
+// Tests that the S4a fixpoint evaluates edge admission against the UNION of
+// old and new active flags, not just the new flags from the current iteration.
+//
+// Activation chain:
+//   Root requests flag "feat-a" on lib-a and flag "feat-b" on lib-b.
+//   lib-a declares feat-a; enables_cross_pkg → lib-target.flag-x.
+//   lib-b declares feat-b; enables_cross_pkg → lib-target.flag-y.
+//   lib-target gating: when flag="flag-x" { when flag="flag-y" { lib-end ... } }
+//
+// lib-a and lib-b are both fetched in the first BFS wave along with lib-target.
+// In fixpoint iteration 1, lib-target receives flag-x from lib-a.feat-a.
+// In fixpoint iteration 2, lib-target receives flag-y from lib-b.feat-b.
+// At the point lib-end is evaluated (iteration 2), the active set must be the
+// UNION {flag-x, flag-y} — not just {flag-y} (the new flags from iteration 2).
+//
+// Before R2-H1 fix: Rust evaluates against {flag-y} only → lib-end NOT admitted.
+// After R2-H1 fix: both impls evaluate against {flag-x, flag-y} → lib-end admitted.
+//
+// Expected resolved graph: lib-a + lib-b + lib-target + lib-end.
+name "myapp"
+kind "application"
+deps {
+    lib-a git=(url)"https://example.com/lib-a.git" ref="main" {
+        flag "feat-a"
+    }
+    lib-b git=(url)"https://example.com/lib-b.git" ref="main" {
+        flag "feat-b"
+    }
+}

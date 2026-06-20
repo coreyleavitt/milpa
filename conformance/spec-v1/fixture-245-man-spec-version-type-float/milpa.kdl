@@ -1,0 +1,16 @@
+// fixture-245: MAN-SPEC-VERSION-TYPE — spec-version with float literal (1.0)
+//
+// KDL 2.0 allows both integer and float numeric literals.  The `spec-version`
+// field requires a KDL integer literal (whole number, no decimal point).  A
+// float literal like `1.0` — even though it is numerically equal to 1 — is
+// a type error and MUST raise MAN-SPEC-VERSION-TYPE.
+//
+// This distinguishes the type system from mere value equality: `1` is an
+// integer literal; `1.0` is a float literal.  The spec-version field is
+// integer-typed and float literals are rejected at parse time, not coerced.
+//
+// Previously (pre-fix) Python accepted `1.0` via whole-float coercion in
+// `_parse_spec_version_node`.  After fix, Python rejects it (matching Rust).
+spec-version 1.0
+name "myapp"
+kind "application"

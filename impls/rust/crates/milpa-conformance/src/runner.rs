@@ -474,12 +474,14 @@ impl Target for MilpaTarget {
                             Ok(graph) => {
                                 // B-nimcfg: _deps/ view rebuilt internally by resolve_workspace
                                 // (alias symlinks + stale removal). No external call needed.
+                                // S11 §3.8: build flag_defines (SSOT) for unified -d: in per-member nim.cfg.
+                                let ws_flag_defines = milpa_core::build_flag_defines(&graph, &scratch.deps_dir);
                                 Ok(Produced::WorkspaceOutputs {
                                     lock_text: milpa_core::format_lockfile(&milpa_core::from_graph(
                                         &graph, "maxver",
                                     )),
                                     member_nimcfgs: milpa_core::format_workspace_nimcfgs(
-                                        &loaded, &graph,
+                                        &loaded, &graph, Some(&ws_flag_defines),
                                     ),
                                 })
                             }
@@ -516,9 +518,13 @@ impl Target for MilpaTarget {
 
                 // S5: read MILPA_REQUIRE_ATTESTED_METADATA from the fixture env.
                 let require_attested_metadata = fixture_require_attested_metadata(&fx.dir);
+                // S9 (RFC #23 §3.4): read CLI feature-selection from fixture env.
+                let cli_features = fixture_cli_features(&fx.dir);
+                let cli_no_default = fixture_no_default_features(&fx.dir);
+                let cli_all_features = fixture_all_features(&fx.dir);
 
                 let store = milpa_core::CaStore::new(&scratch.cas_root);
-                match milpa_core::resolve(
+                match milpa_core::resolve_with_features(
                     &manifest,
                     index.as_ref(),
                     &fetcher,
@@ -529,6 +535,9 @@ impl Target for MilpaTarget {
                     dep_decl_store,
                     require_attested_metadata,
                     &store,
+                    &cli_features,
+                    cli_no_default,
+                    cli_all_features,
                 ) {
                     // S9: emit the byte-diff outputs. `_deps_structure.txt` is read
                     // by the harness from the materialized (symlinked) `_deps/`.
@@ -537,8 +546,10 @@ impl Target for MilpaTarget {
                         // (alias symlinks + stale removal). No external call needed.
                         let lock_text =
                             milpa_core::format_lockfile(&milpa_core::from_graph(&graph, "maxver"));
+                        // §7.5 S6: compute flag_defines from dep manifests (SSOT).
+                        let flag_defines = milpa_core::build_flag_defines(&graph, &scratch.deps_dir);
                         let nimcfg_text =
-                            milpa_core::format_nimcfg(&graph, "_deps", &manifest.src_dir);
+                            milpa_core::format_nimcfg(&graph, "_deps", &manifest.src_dir, Some(&flag_defines));
                         Ok(Produced::Outputs(Outputs {
                             lock_text,
                             nimcfg_text,
@@ -584,12 +595,16 @@ impl Target for MilpaTarget {
                         &store,
                         &scratch.deps_dir,
                     ) {
-                        Ok(graph) => Ok(Produced::WorkspaceOutputs {
-                            lock_text: milpa_core::format_lockfile(&milpa_core::from_graph(
-                                &graph, "maxver",
-                            )),
-                            member_nimcfgs: milpa_core::format_workspace_nimcfgs(&loaded, &graph),
-                        }),
+                        Ok(graph) => {
+                            // S11 §3.8: build flag_defines (SSOT) for unified -d: in per-member nim.cfg.
+                            let ws_flag_defines = milpa_core::build_flag_defines(&graph, &scratch.deps_dir);
+                            Ok(Produced::WorkspaceOutputs {
+                                lock_text: milpa_core::format_lockfile(&milpa_core::from_graph(
+                                    &graph, "maxver",
+                                )),
+                                member_nimcfgs: milpa_core::format_workspace_nimcfgs(&loaded, &graph, Some(&ws_flag_defines)),
+                            })
+                        }
                         Err(e) => Err(e.code().to_string()),
                     };
                 }
@@ -598,13 +613,32 @@ impl Target for MilpaTarget {
                     ManifestDoc::Workspace(_) => unreachable!("handled above"),
                 };
 
+                // S9 (RFC #23 §3.4): FROZEN-ACTIVE-FLAGS-MISMATCH check.
+                // Recompute root active-flag closure from manifest + CLI inputs;
+                // compare to lockfile: if a flag-gated root dep is admitted by the
+                // CLI seed but absent from lock (or vice versa), raise the error.
+                let cli_features = fixture_cli_features(&fx.dir);
+                let cli_no_default = fixture_no_default_features(&fx.dir);
+                let cli_all_features_flag = fixture_all_features(&fx.dir);
+                if let Err(e) = milpa_core::check_frozen_active_flags_mismatch(
+                    &manifest,
+                    &lock,
+                    &cli_features,
+                    cli_no_default,
+                    cli_all_features_flag,
+                ) {
+                    return Err(e.code().to_string());
+                }
+
                 match milpa_core::Milpa.resolve_frozen(&manifest, &lock, &store, &scratch.deps_dir)
                 {
                     Ok(graph) => {
                         let lock_text =
                             milpa_core::format_lockfile(&milpa_core::from_graph(&graph, "maxver"));
+                        // §7.5 S6: compute flag_defines from dep manifests (SSOT).
+                        let flag_defines = milpa_core::build_flag_defines(&graph, &scratch.deps_dir);
                         let nimcfg_text =
-                            milpa_core::format_nimcfg(&graph, "_deps", &manifest.src_dir);
+                            milpa_core::format_nimcfg(&graph, "_deps", &manifest.src_dir, Some(&flag_defines));
                         Ok(Produced::Outputs(Outputs {
                             lock_text,
                             nimcfg_text,
@@ -821,21 +855,31 @@ fn fixture_env(dir: &Path) -> std::collections::HashMap<String, String> {
 /// Build a [`Profile`] from a fixture's optional `env` file (KEY=VALUE per line,
 /// the `MILPA_TARGET_*` axes — conformance-fixtures §2). Returns `None` when the
 /// file is absent or carries no `MILPA_TARGET_*` keys (no predicate filtering —
-/// the common case). Mirrors the Python harness's `_fixture_profile`.
+/// the common case). Mirrors the Python harness's `_fixture_profile` AND the
+/// CLI's `profile_from_env()`: both return `None` when no target axes are set,
+/// regardless of whether other env vars (e.g. `MILPA_CLI_FEATURES`) are present.
 fn fixture_profile(dir: &Path) -> Option<milpa_core::Profile> {
     let env = fixture_env(dir);
-    if env.is_empty() {
+    let platform = env.get("MILPA_TARGET_PLATFORM").cloned();
+    let arch = env.get("MILPA_TARGET_ARCH").cloned();
+    let nim_version = env
+        .get("MILPA_TARGET_NIM")
+        .and_then(|s| milpa_core::parse_version(s));
+    let milpa_version = env
+        .get("MILPA_TARGET_MILPA")
+        .and_then(|s| milpa_core::parse_version(s));
+    // Absent profile = no MILPA_TARGET_* axes present — mirrors CLI profile_from_env().
+    // An env file carrying only MILPA_CLI_FEATURES (no target axes) must yield None
+    // so that resolver-semantics §470 "absent profile ⇒ platform filtering disabled"
+    // is exercised, not the Some(profile-with-all-None-axes) path.
+    if platform.is_none() && arch.is_none() && nim_version.is_none() && milpa_version.is_none() {
         return None;
     }
     Some(milpa_core::Profile {
-        platform: env.get("MILPA_TARGET_PLATFORM").cloned(),
-        arch: env.get("MILPA_TARGET_ARCH").cloned(),
-        nim_version: env
-            .get("MILPA_TARGET_NIM")
-            .and_then(|s| milpa_core::parse_version(s)),
-        milpa_version: env
-            .get("MILPA_TARGET_MILPA")
-            .and_then(|s| milpa_core::parse_version(s)),
+        platform,
+        arch,
+        nim_version,
+        milpa_version,
         flags: Vec::new(),
     })
 }
@@ -845,6 +889,37 @@ fn fixture_profile(dir: &Path) -> Option<milpa_core::Profile> {
 fn fixture_require_attested_metadata(dir: &Path) -> bool {
     let env = fixture_env(dir);
     env.get("MILPA_REQUIRE_ATTESTED_METADATA")
+        .map(|v| parse_env_bool(v))
+        .unwrap_or(false)
+}
+
+/// S9 (RFC #23 §3.4): read `MILPA_CLI_FEATURES` from the fixture's `env` file.
+/// Returns a BTreeSet of feature names (comma-separated). Mirrors Python's
+/// `_fixture_cli_features`.
+fn fixture_cli_features(dir: &Path) -> std::collections::BTreeSet<String> {
+    let env = fixture_env(dir);
+    match env.get("MILPA_CLI_FEATURES") {
+        Some(raw) if !raw.is_empty() => raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => std::collections::BTreeSet::new(),
+    }
+}
+
+/// S9 (RFC #23 §3.4): read `MILPA_NO_DEFAULT_FEATURES` from the fixture env.
+fn fixture_no_default_features(dir: &Path) -> bool {
+    let env = fixture_env(dir);
+    env.get("MILPA_NO_DEFAULT_FEATURES")
+        .map(|v| parse_env_bool(v))
+        .unwrap_or(false)
+}
+
+/// S9 (RFC #23 §3.4): read `MILPA_ALL_FEATURES` from the fixture env.
+fn fixture_all_features(dir: &Path) -> bool {
+    let env = fixture_env(dir);
+    env.get("MILPA_ALL_FEATURES")
         .map(|v| parse_env_bool(v))
         .unwrap_or(false)
 }

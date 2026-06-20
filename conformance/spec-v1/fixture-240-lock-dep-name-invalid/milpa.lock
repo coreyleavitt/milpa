@@ -1,0 +1,37 @@
+// fixture-240: LOCK-DEP-NAME-INVALID — lockfile dep name contains path traversal chars
+//
+// A dep name containing '/' (or any character outside [A-Za-z0-9_-]) in a
+// dep block MUST be rejected at the lockfile parse boundary with
+// LOCK-DEP-NAME-INVALID.
+//
+// Without this check, a poisoned milpa.lock with `dep "../evil"` would flow to:
+//   - nim.cfg --path: via string concat (_path_for), enabling compile-time
+//     module hijack via path traversal outside _deps/
+//   - the filesystem via deps_dir / name (symlink escape from _deps/)
+//
+// The check reuses the dep-name charset SSOT predicate ([A-Za-z0-9_-]+):
+// Python _FLAG_NAME_CHARSET_RE (manifest.py); Rust valid_flag_name
+// (milpa-manifest/src/lib.rs). Using the charset predicate (not
+// contains_unsafe_char) is critical: '/' and '.' are NOT control chars,
+// so contains_unsafe_char would NOT catch `../evil`.
+//
+// Validation happens at the lockfile parse boundary so both the `verify`
+// path and the frozen fast-path are protected.
+//
+// Regression for R8-S1: both impls accepted a lockfile with a path-traversal
+// dep name; the manifest parse path validated dep names, but the lockfile
+// parse path did not.
+version 1
+strategy "maxver"
+
+dep "../evil" {
+    version "0.0.1"
+    src_dir ""
+    requires
+    provenance {
+        origin "observed"
+        kind "git"
+        url "https://example.com/evil.git"
+        ref "main"
+    }
+}
