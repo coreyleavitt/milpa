@@ -504,6 +504,70 @@ fn resolve_named_dep_without_index_errors() {
     assert_eq!(err.code(), "RES-NO-INDEX");
 }
 
+/// S5b spike — §3.B error-slug divergence diagnostic (workspace-completion RFC).
+///
+/// Constructs the §3.B error-path case: dep requires `foo >= 2.0.0`, index has
+/// only `foo` 1.x.  Records the observed error slug and **passes** — proving
+/// the current behaviour without breaking the loop's green gate.
+///
+/// Expected (pre-S6): Rust emits `TNG-NO-SATISFYING-VERSION` because
+/// `process_named` passes the constraint to `resolve_named_all` at Phase A,
+/// and the index rejects it eagerly before the solver sees it.
+///
+/// After S6 this assertion flips to `SOLVE-CONFLICT` (enumerate-all normative,
+/// solver owns satisfiability).  At that point the spike test is superseded by
+/// the corpus fixture; update or remove accordingly.
+#[test]
+fn s5b_phase_a_error_slug_divergence_spike() {
+    // Index: foo exists, but only at 1.0.0.
+    let index = Index {
+        packages: vec![Package {
+            name: "foo".to_string(),
+            namespace: String::new(),
+            versions: vec![IndexVersion {
+                version: "1.0.0".to_string(),
+                content_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+                    .to_string(),
+                provenances: vec![Provenance::Git {
+                    url: "https://example.com/foo.git".into(),
+                    ref_spec: "v1.0.0".into(),
+                    commit_sha: None,
+                }],
+                dep_decl: None,
+                dep_decl_schema_version: None,
+            }],
+        }],
+    };
+    // Manifest: requires foo >= 2.0.0 — unsatisfiable given the index.
+    let m = manifest(vec![named_dep("foo", Some(">= 2.0.0"))]);
+    let reg = FakeReg::default(); // no fetch mocks needed; Phase A errors before fetch
+    let tmp = tempfile::tempdir().unwrap();
+
+    let err = resolve(
+        &m,
+        Some(&index),
+        &reg,
+        None,
+        None,
+        Strategy::Maxver,
+        &deps_dir(&tmp),
+        None,
+        false,
+        &cas_store(&tmp),
+    )
+    .unwrap_err();
+
+    // S5b baseline: Rust currently emits TNG-NO-SATISFYING-VERSION (pre-filter at Phase A).
+    // After S6 (enumerate-all), this must become SOLVE-CONFLICT.
+    // The assertion documents the pre-S6 state; S6 updates it to "SOLVE-CONFLICT".
+    assert_eq!(
+        err.code(),
+        "TNG-NO-SATISFYING-VERSION",
+        "S5b spike: Rust Phase-A pre-filter emits TNG-NO-SATISFYING-VERSION \
+         (diverges from Python's SOLVE-CONFLICT path; S6 unifies both to SOLVE-CONFLICT)"
+    );
+}
+
 #[test]
 fn resolve_url_dep_with_override_fetches_override() {
     let reg = FakeReg::git(&[(
