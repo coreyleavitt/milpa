@@ -762,6 +762,37 @@ on failure.
 
 ---
 
+### 5.9  Workspace per-member `nim.cfg` — `self_src_dir` ordering (normative)
+
+**Context:** `fetch` and `lock` in workspace mode write a `nim.cfg` for each
+member (§5.1 NOTE, §5.2). The emission ordering rule below applies to every
+workspace nim.cfg written by these commands.
+
+**Normative ordering:** For each workspace member, the implementation MUST
+emit `--path:` lines in the following order:
+
+1. **Self-src-dir (self-first, mandatory):** If the member's manifest declares
+   a `src_dir`, the implementation MUST emit `--path:"<src_dir>"` as the
+   **first** `--path:` line in that member's `nim.cfg`. This gives the
+   member's own source tree shadowing priority over all dep import paths —
+   the same rule as single-package emission (`format_nimcfg` self-first rule).
+   If the member has no `src_dir`, no self-path line is emitted.
+2. **Dep paths, lex-sorted:** All dep paths (member-to-member references and
+   external deps) are emitted after the self-src-dir line, sorted
+   lexicographically by dep name — the same single canonical ordering rule
+   as single-package emission (resolver-semantics §4.4).
+
+The trailing `nim.cfg` header logic is unchanged: a member with only a
+self-src-dir and no deps still receives the full `nim.cfg` header + the
+self-src-dir `--path:` line (not header-only).
+
+> NOTE: This ordering is byte-normative across implementations.
+> `conformance/spec-v1/fixture-262-s7-ws-member-self-src-dir` is the
+> canonical 3-member fixture (A→B, B→C; A has `src_dir "src"`) that pins
+> A's self-first + lex-sort ordering.
+
+---
+
 ## 6  `--frozen` flag/exit semantics (normative)
 
 This section specifies the CLI-level semantics of `--frozen`. The

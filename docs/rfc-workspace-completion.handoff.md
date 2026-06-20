@@ -53,8 +53,11 @@ asymmetries broken today (round 2 added the eighth: member-dir add/remove/update
   to `resolve_named_all`; Python drops BFS pre-check at resolver.py:1372-1379; spec
   `resolver-semantics §2.1` new normative note; fixture-261 + fixture-090 updated to
   `SOLVE-CONFLICT`; Python 2058 pass; Rust 384 corpus pass, zero divergence — `78da655`
-- [ ] S7, S8, S9a, S9b, S10, S11a, S11b, S11c, S11d, S11e, S12 (remaining)
-- **Progress: 8/19 done, 11 remaining.** All gates green each slice (Python 2058 pass; Rust
+- [x] **S7** #93 per-member self_src_dir in `format_workspace_nimcfgs` (both impls);
+  3-member fixture-262; updated fixtures 117, 178, 207, 208, 213, 214; spec §5.9 added;
+  Python 2063 pass; Rust corpus zero divergence — **closes #93**
+- [ ] S8, S9a, S9b, S10, S11a, S11b, S11c, S11d, S11e, S12 (remaining)
+- **Progress: 9/19 done, 10 remaining.** All gates green each slice (Python 2063 pass; Rust
   corpus zero divergence).
 
 ## Forks — ALL RESOLVED (no open decisions)

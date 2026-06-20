@@ -197,6 +197,14 @@ pub fn format_workspace_nimcfgs(
     let mut out: Vec<(String, String)> = Vec::new();
     for member in &workspace.members {
         let mut lines: Vec<String> = vec![HEADER.to_string(), String::new()];
+
+        // S7 (#93): emit member's own src_dir FIRST (self-module shadowing
+        // priority) — mirrors format_nimcfg's self-first rule (nimcfg.rs:52-54).
+        // Only emitted when the member itself has a src_dir declared.
+        if !member.manifest.src_dir.is_empty() {
+            lines.push(format!("--path:\"{}\"", member.manifest.src_dir));
+        }
+
         let mut closure = member_dep_closure(graph, &member.name);
         closure.sort_by(|a, b| a.name.cmp(&b.name));
         for dep in &closure {
@@ -232,7 +240,12 @@ pub fn format_workspace_nimcfgs(
             define_symbols.sort();
         }
 
-        if !closure.is_empty() {
+        // Trailing newline whenever any --path: line was emitted (self_src_dir OR
+        // closure deps). `lines` starts with [HEADER, ""] (length 2); any --path:
+        // push makes it > 2. Mirrors single-package format_nimcfg's `if path_lines:`
+        // guard — keying on closure alone was wrong: self_src_dir alone (zero closure)
+        // still needs the final \n (S7 #93).
+        if lines.len() > 2 {
             if !define_symbols.is_empty() {
                 // Blank line separator between --path: block and -d: block (§7.5).
                 lines.push(String::new());

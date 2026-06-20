@@ -1,0 +1,16 @@
+// fixture-262: S7 (#93) — per-member self_src_dir in workspace nim.cfg
+//
+// 3-member chain: A→B, B→C.  Only A has src_dir="src".
+//
+// Normative ordering (Breadth-P3d, workspace-completion RFC §3.D):
+//   A's nim.cfg: --path:"src" FIRST (self-src-dir), then dep paths lex-sorted
+//   B's nim.cfg: no self src-dir; only --path:"../member-c" (C dep)
+//   C's nim.cfg: header-only (no deps, no src_dir)
+//
+// This fixture pins that the self-first + lex-sort order is specified,
+// not incidental.
+workspace {
+    member "member-a"
+    member "member-b"
+    member "member-c"
+}

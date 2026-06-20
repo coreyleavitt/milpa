@@ -1,0 +1,5 @@
+# Conformance fixtures include expected/nim.cfg files that must be version-controlled.
+# The root .gitignore excludes nim.cfg (milpa's own generated output), but the
+# expected/ subdirectories in this corpus are *checked-in oracle data*, not generated
+# output — negate the exclusion here.
+!**/nim.cfg

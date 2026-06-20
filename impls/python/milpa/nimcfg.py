@@ -185,14 +185,14 @@ def format_workspace_nimcfgs(
 
     Per-member layout (§7.6):
     - Each member receives only the deps in its transitive closure.
-    - Dep paths are relative from the member's directory:
-        - External deps (git/tarball/named): ``<root_to_member>/_deps/<name>[/src]``
-          expressed as relative from the member dir.
-        - Member deps: relative from the member dir to the other member's dir
-          (plus any src_dir suffix).
-    - Deps are sorted lexicographically by dep name (same as single-package).
-    - No self src-dir emit in workspace members (each member is a library
-      peer, not a "consuming project" from the workspace root's perspective).
+    - Emission order per member (S7, §5.9 / Breadth-P3d):
+        1. **Self src-dir first**: if the member's manifest has ``src_dir`` set,
+           ``--path:"<src_dir>"`` is emitted FIRST (self-module shadowing priority
+           — same rule as single-package ``format_nimcfg``).
+        2. **Dep paths lex-sorted by name**: external deps (git/tarball/named) via
+           ``<root_to_member>/_deps/<name>[/src]`` and member-to-member references
+           ``<rel_to_other_member>[/src_dir]``, both expressed relative from the
+           member dir.
 
     S11 (RFC #23 §3.8): workspace feature unification — each member's nim.cfg
     includes the ``-d:`` defines for ALL flags active on shared deps in the
@@ -228,6 +228,14 @@ def format_workspace_nimcfgs(
         closure_sorted = sorted(closure, key=lambda d: d.name)
 
         path_lines: list[str] = []
+
+        # S7 (#93): emit member's own src_dir FIRST (self-module shadowing
+        # priority) — mirrors format_nimcfg's self-first rule (nimcfg.py:85-86).
+        # Only emitted when the member itself has a src_dir declared.
+        member_src_dir: str = member.manifest.src_dir  # "" when absent
+        if member_src_dir:
+            path_lines.append(f'--path:"{member_src_dir}"')
+
         for dep in closure_sorted:
             target = _dep_target(
                 dep, workspace_root, member_by_name
