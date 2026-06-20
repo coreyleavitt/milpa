@@ -45,6 +45,7 @@ from milpa.manifest import (
     Manifest,
     WorkspaceManifest,
     format_manifest,
+    format_workspace_manifest,
     parse_workspace_or_manifest,
 )
 
@@ -175,6 +176,95 @@ def mutate_manifest_file(
 
     # Render and write atomically.
     rendered = format_manifest(new_manifest)
+    before = _count_comments(text)
+    after = _count_comments(rendered)
+    _atomic_write_text(path, rendered)
+
+    return WriteResult(
+        path=path,
+        comments_lost=max(0, before - after),
+    )
+
+
+def mutate_workspace_manifest_file(
+    path: Path,
+    mutator: Callable[[WorkspaceManifest], WorkspaceManifest],
+) -> WriteResult:
+    """Read a workspace ``milpa.kdl`` at *path*, apply *mutator*, and write the
+    canonical re-render atomically.
+
+    Typed analog of ``mutate_manifest_file`` for the workspace role.
+    The serializer is ``format_workspace_manifest``; the write primitive
+    is the existing ``_atomic_write_text``.
+
+    Parameters
+    ----------
+    path:
+        Absolute path to the workspace ``milpa.kdl`` to mutate.  Must be a
+        workspace manifest (not a package manifest or ``.nimble``).
+    mutator:
+        A pure ``WorkspaceManifest → WorkspaceManifest`` function.  Mutator
+        MUST NOT perform I/O.
+
+    Returns
+    -------
+    WriteResult
+        Contains the path written and the heuristic comment-loss count.
+
+    Raises
+    ------
+    MilpaError(MAN-MUTATE-FILE-NOT-FOUND)
+        If *path* does not exist or cannot be read.
+    MilpaError(MAN-MUTATE-NIMBLE-REFUSED)
+        If *path* has a ``.nimble`` extension.
+    MilpaError(MAN-MUTATE-WORKSPACE-REFUSED)
+        If the file is a package manifest (not a workspace).
+    MilpaError(MAN-*)
+        If the manifest is malformed (parse error surfaces unchanged).
+    """
+    from milpa.errors import MAN_MUTATE_WORKSPACE_REFUSED as _WS_REFUSED
+
+    # Guard 1: .nimble refused.
+    if path.suffix == ".nimble":
+        raise MilpaError(
+            MAN_MUTATE_NIMBLE_REFUSED,
+            f"refusing to mutate a .nimble file ({path}); "
+            "promote to milpa.kdl first",
+            path=str(path),
+        )
+
+    # Guard 2: file must exist and be readable.
+    if not path.exists():
+        raise MilpaError(
+            MAN_MUTATE_FILE_NOT_FOUND,
+            f"manifest file not found: {path} — create a milpa.kdl first",
+            path=str(path),
+        )
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise MilpaError(
+            MAN_MUTATE_FILE_NOT_FOUND,
+            f"cannot read {path}: {exc}",
+            path=str(path),
+        ) from exc
+
+    # Guard 3: parse; require a workspace manifest.
+    doc = parse_workspace_or_manifest(text)
+    if isinstance(doc, Manifest):
+        raise MilpaError(
+            _WS_REFUSED,
+            f"{path}: not a workspace manifest — use mutate_manifest_file for package manifests",
+            path=str(path),
+        )
+
+    assert isinstance(doc, WorkspaceManifest)
+
+    # Apply the mutation (pure transform).
+    new_ws = mutator(doc)
+
+    # Render and write atomically.
+    rendered = format_workspace_manifest(new_ws)
     before = _count_comments(text)
     after = _count_comments(rendered)
     _atomic_write_text(path, rendered)

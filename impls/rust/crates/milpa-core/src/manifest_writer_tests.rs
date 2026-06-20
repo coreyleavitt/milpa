@@ -202,3 +202,154 @@ fn malformed_package_surfaces_its_parse_code() {
         "MAN-NAME-MISSING"
     );
 }
+
+// ---------------------------------------------------------------------------
+// S9a — format_workspace_manifest + mutate_workspace_manifest_file tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn format_workspace_manifest_minimal_two_members() {
+    let ws = milpa_manifest::Workspace {
+        members: vec!["member-a".into(), "member-b".into()],
+        overrides: Vec::new(),
+        flags: Vec::new(),
+        name: None,
+    };
+    let out = milpa_manifest::format_workspace_manifest(&ws);
+    assert!(out.contains("member \"member-a\""), "output:\n{out}");
+    assert!(out.contains("member \"member-b\""), "output:\n{out}");
+    assert!(out.ends_with('\n'));
+}
+
+#[test]
+fn format_workspace_manifest_name_emitted_when_some() {
+    let ws = milpa_manifest::Workspace {
+        members: vec!["pkg".into()],
+        overrides: Vec::new(),
+        flags: Vec::new(),
+        name: Some("my-workspace".into()),
+    };
+    let out = milpa_manifest::format_workspace_manifest(&ws);
+    assert!(out.contains("name \"my-workspace\""), "output:\n{out}");
+}
+
+#[test]
+fn format_workspace_manifest_name_absent_when_none() {
+    let ws = milpa_manifest::Workspace {
+        members: vec!["pkg".into()],
+        overrides: Vec::new(),
+        flags: Vec::new(),
+        name: None,
+    };
+    let out = milpa_manifest::format_workspace_manifest(&ws);
+    // No standalone name= line (only the header comment)
+    let name_lines: Vec<_> = out.lines().filter(|l| l.starts_with("name ")).collect();
+    assert!(name_lines.is_empty(), "unexpected name line: {name_lines:?}");
+}
+
+#[test]
+fn format_workspace_manifest_url_annotation_on_git_override() {
+    let ws = milpa_manifest::Workspace {
+        members: vec!["pkg".into()],
+        overrides: vec![milpa_manifest::Override {
+            name: "dep-x".into(),
+            target: milpa_manifest::OverrideTarget::Git {
+                url: "https://github.com/example/dep-x.git".into(),
+                git_ref: "main".into(),
+            },
+        }],
+        flags: Vec::new(),
+        name: None,
+    };
+    let out = milpa_manifest::format_workspace_manifest(&ws);
+    assert!(out.contains("git=(url)\"https://github.com/example/dep-x.git\""), "output:\n{out}");
+}
+
+#[test]
+fn format_workspace_manifest_idempotent() {
+    // format(parse(format(ws))) == format(ws): byte-stable canonical serializer.
+    let ws = milpa_manifest::Workspace {
+        members: vec!["member-a".into(), "member-b".into()],
+        overrides: vec![milpa_manifest::Override {
+            name: "dep-x".into(),
+            target: milpa_manifest::OverrideTarget::Git {
+                url: "https://github.com/example/dep-x.git".into(),
+                git_ref: "main".into(),
+            },
+        }],
+        flags: vec![milpa_manifest::FlagDecl {
+            name: "extras".into(),
+            default: false,
+            description: String::new(),
+            defines: Vec::new(),
+            enables_same_pkg: Vec::new(),
+            enables_cross_pkg: Vec::new(),
+            conflicts: Vec::new(),
+        }],
+        name: Some("root".into()),
+    };
+    let first = milpa_manifest::format_workspace_manifest(&ws);
+    let reparsed = match milpa_manifest::parse_document(&first).unwrap() {
+        milpa_manifest::ManifestDoc::Workspace(w) => w,
+        other => panic!("expected Workspace, got {other:?}"),
+    };
+    let second = milpa_manifest::format_workspace_manifest(&reparsed);
+    assert_eq!(first, second, "idempotence violated");
+}
+
+#[test]
+fn mutate_workspace_manifest_file_identity() {
+    let d = tmp();
+    let p = d.path().join("milpa.kdl");
+    std::fs::write(&p, "workspace {\n    member \"member-a\"\n}\n").unwrap();
+    let result = mutate_workspace_manifest_file(&p, |ws| ws).unwrap();
+    assert_eq!(result.path, p);
+    let text = std::fs::read_to_string(&p).unwrap();
+    assert!(text.contains("member \"member-a\""), "output:\n{text}");
+}
+
+#[test]
+fn mutate_workspace_manifest_file_refused_on_package() {
+    let d = tmp();
+    let p = d.path().join("milpa.kdl");
+    std::fs::write(&p, "name \"mypkg\"\nkind \"library\"\n").unwrap();
+    assert_eq!(
+        mutate_workspace_manifest_file(&p, |ws| ws).unwrap_err().code(),
+        "MAN-MUTATE-WORKSPACE-REFUSED"
+    );
+}
+
+#[test]
+fn mutate_workspace_manifest_file_not_found() {
+    let d = tmp();
+    let p = d.path().join("no-such.kdl");
+    assert_eq!(
+        mutate_workspace_manifest_file(&p, |ws| ws).unwrap_err().code(),
+        "MAN-MUTATE-FILE-NOT-FOUND"
+    );
+}
+
+#[test]
+fn format_workspace_manifest_byte_identical_to_python_fixture() {
+    // Byte-identity gate: the canonical serializer must emit the same bytes as
+    // the Python impl produced for fixture-264. Read the fixture's expected output
+    // and compare byte-for-byte.
+    let fixture_expected = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../conformance/spec-v1/fixture-264-s9a-workspace-manifest-roundtrip/expected/milpa.kdl");
+    let expected = match std::fs::read_to_string(&fixture_expected) {
+        Ok(t) => t,
+        Err(e) => panic!("cannot read fixture-264 expected/milpa.kdl: {e}"),
+    };
+    let fixture_input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../conformance/spec-v1/fixture-264-s9a-workspace-manifest-roundtrip/milpa.kdl");
+    let input = std::fs::read_to_string(&fixture_input).unwrap();
+    let ws = match milpa_manifest::parse_document(&input).unwrap() {
+        milpa_manifest::ManifestDoc::Workspace(w) => w,
+        other => panic!("expected Workspace, got {other:?}"),
+    };
+    let produced = milpa_manifest::format_workspace_manifest(&ws);
+    assert_eq!(
+        produced, expected,
+        "Rust serializer output differs from Python fixture-264 expected/milpa.kdl"
+    );
+}

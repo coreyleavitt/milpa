@@ -26,6 +26,11 @@ pub enum Cmd {
     /// `verify`: frozen-fetch to populate `_deps/`, then run `cmd_verify`.
     /// S6 dep_decl edge-drift fixtures (§3.7.2).
     Verify,
+    /// `workspace-manifest-roundtrip` (S9a): parse `milpa.kdl` as a workspace
+    /// manifest, re-emit via `format_workspace_manifest`, and byte-compare
+    /// against `expected/milpa.kdl`. Proves the canonical serializer is
+    /// byte-stable across both impls (Depth-F6).
+    WorkspaceManifestRoundtrip,
     /// A CLI-only verb fixture (§2.7.1 mutation `add`/`remove`/`update` or
     /// §2.7.2 liveness `show`/`--version`). These exercise the CLI binary and
     /// its argv/output contract, which the in-process library [`Target`] does
@@ -43,6 +48,7 @@ impl Cmd {
                 match head {
                     "parse-lockfile" => Cmd::ParseLockfile,
                     "lock-roundtrip" => Cmd::LockRoundtrip,
+                    "workspace-manifest-roundtrip" => Cmd::WorkspaceManifestRoundtrip,
                     "frozen" => Cmd::Frozen,
                     "verify" => Cmd::Verify,
                     "resolve" | "" => Cmd::Resolve,

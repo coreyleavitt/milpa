@@ -1001,9 +1001,21 @@ verb that mutates the manifest), it produces a serialized KDL 2.0 document.
 This section specifies the normative constraints on that output.
 
 > NORMATIVE: A serializer MUST produce a valid KDL 2.0 document. The output
-> MUST parse back to the same logical `Manifest` value as the input (semantic
-> round-trip), but it is NOT required to be byte-identical to the original
-> source (this output is **not byte-normative**, unlike the lockfile).
+> MUST parse back to the same logical `Manifest` (or `WorkspaceManifest`) value
+> as the input (semantic round-trip). The canonical serializer's output IS
+> **byte-stable**: `format(parse(format(m))) == format(m)` for all valid manifests
+> and workspace manifests. This is distinct from "round-trips the original source"
+> (which it does NOT — comments and trivia are dropped). The canonical serializer's
+> byte-stability is pinned by conformance fixtures (fixture-264 for workspace
+> manifests; `add`/`remove` output fixtures for package manifests) and MUST be
+> preserved. `format_workspace_manifest` inherits this byte-stability guarantee.
+>
+> NOTE: Earlier drafts of this section said the output was "not byte-normative,
+> unlike the lockfile." That framing was imprecise. The correct statement is:
+> the output is NOT byte-normative with respect to the *original source* (it does
+> not preserve comments, trivia, or original formatting), but the *canonical
+> serializer* is byte-stable with respect to itself — repeated application
+> produces the same bytes.
 
 > NORMATIVE: Comments from the original `milpa.kdl` are NOT preserved by the
 > serializer. When any comment is dropped, the implementation MUST emit a

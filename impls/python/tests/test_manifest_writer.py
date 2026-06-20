@@ -289,3 +289,68 @@ def test_mutate_comment_loss_count(tmp_path: Path) -> None:
     result = mutate_manifest_file(kdl, lambda m: m)
     # The input had 2 comment lines; the canonical re-render has 1 (the header).
     assert result.comments_lost == 1
+
+
+# ---------------------------------------------------------------------------
+# S9a: mutate_workspace_manifest_file tests
+# ---------------------------------------------------------------------------
+
+from milpa.manifest import WorkspaceManifest
+from milpa.manifest_writer import mutate_workspace_manifest_file
+
+
+_WS_KDL = 'workspace {\n    member "member-a"\n    member "member-b"\n}\n'
+
+
+def test_mutate_workspace_identity(tmp_path: Path) -> None:
+    """Identity mutator round-trips a workspace manifest."""
+    kdl = tmp_path / "milpa.kdl"
+    kdl.write_text(_WS_KDL)
+    result = mutate_workspace_manifest_file(kdl, lambda ws: ws)
+    assert result.path == kdl
+    reparsed = __import__("milpa.manifest", fromlist=["parse_workspace_or_manifest"]).parse_workspace_or_manifest(
+        kdl.read_text()
+    )
+    assert isinstance(reparsed, WorkspaceManifest)
+    assert reparsed.members == ("member-a", "member-b")
+
+
+def test_mutate_workspace_add_member(tmp_path: Path) -> None:
+    """Mutator can add a new member to the workspace manifest."""
+    from dataclasses import replace
+    kdl = tmp_path / "milpa.kdl"
+    kdl.write_text(_WS_KDL)
+
+    def add_member(ws: WorkspaceManifest) -> WorkspaceManifest:
+        return replace(ws, members=ws.members + ("member-c",))
+
+    result = mutate_workspace_manifest_file(kdl, add_member)
+    assert result.path == kdl
+    text = kdl.read_text()
+    assert '"member-c"' in text
+
+
+def test_mutate_workspace_refused_on_package(tmp_path: Path) -> None:
+    """mutate_workspace_manifest_file refuses a plain package manifest."""
+    kdl = tmp_path / "milpa.kdl"
+    kdl.write_text('name "mypkg"\nkind "library"\n')
+    with pytest.raises(MilpaError) as exc_info:
+        mutate_workspace_manifest_file(kdl, lambda ws: ws)
+    assert exc_info.value.slug == MAN_MUTATE_WORKSPACE_REFUSED
+
+
+def test_mutate_workspace_file_not_found(tmp_path: Path) -> None:
+    """mutate_workspace_manifest_file raises MAN-MUTATE-FILE-NOT-FOUND for missing path."""
+    missing = tmp_path / "no-such.kdl"
+    with pytest.raises(MilpaError) as exc_info:
+        mutate_workspace_manifest_file(missing, lambda ws: ws)
+    assert exc_info.value.slug == MAN_MUTATE_FILE_NOT_FOUND
+
+
+def test_mutate_workspace_atomic_write(tmp_path: Path) -> None:
+    """No .tmp file left behind after a successful atomic write."""
+    kdl = tmp_path / "milpa.kdl"
+    kdl.write_text(_WS_KDL)
+    mutate_workspace_manifest_file(kdl, lambda ws: ws)
+    tmp = kdl.with_suffix(".kdl.tmp")
+    assert not tmp.exists(), ".tmp file should be cleaned up after os.replace()"

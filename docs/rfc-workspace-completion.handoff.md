@@ -64,8 +64,13 @@ asymmetries broken today (round 2 added the eighth: member-dir add/remove/update
   spec `cli-contract.md §2.5` new NORMATIVE paragraph; harness gate:
   `python -m harness` → PASS both impls (parsed JSON equal); Python 2064 pass; Rust
   384 corpus pass, zero divergence — **closes #129**
-- [ ] S9a, S9b, S10, S11a, S11b, S11c, S11d, S11e, S12 (remaining)
-- **Progress: 10/19 done, 9 remaining.** All gates green each slice (Python 2064 pass; Rust
+- [x] **S9a** `format_workspace_manifest` canonical serializer (both impls, byte-identical);
+  `mutate_workspace_manifest_file` typed mutator (both impls); idempotence property test
+  (Hypothesis, 200 examples); `workspace-manifest-roundtrip` Cmd + fixture-264; spec §8
+  byte-stability note updated; Feasibility-F4 resolved as option (i) — standalone Cmd;
+  Python 2083 pass; Rust 393 corpus pass, zero divergence — `feat(manifest): canonical WorkspaceManifest serializer + roundtrip Cmd (#81)`
+- [ ] S9b, S10, S11a, S11b, S11c, S11d, S11e, S12 (remaining)
+- **Progress: 11/19 done, 8 remaining.** All gates green each slice (Python 2083 pass; Rust
   corpus zero divergence).
 
 ## Forks — ALL RESOLVED (no open decisions)

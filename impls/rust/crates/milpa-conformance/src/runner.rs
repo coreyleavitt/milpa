@@ -67,6 +67,9 @@ pub enum Produced {
     /// A `cmd=lock-roundtrip` success: only `milpa.lock` is byte-compared.
     /// No `nim.cfg` or `_deps_structure.txt` are checked.
     LockOnly(String),
+    /// A `cmd=workspace-manifest-roundtrip` (S9a) success: only
+    /// `expected/milpa.kdl` is byte-compared against the re-emitted KDL.
+    WorkspaceKdl(String),
 }
 
 /// The implementation under test. The `Err` payload is the error **code**
@@ -170,6 +173,13 @@ pub fn run_fixture(fx: &Fixture, target: &dyn Target, scratch: &Scratch) -> Verd
         (Expected::Success, Ok(Produced::LockOnly(lock_text))) => {
             let expected = fx.dir.join("expected");
             match diff_file(&expected.join("milpa.lock"), &lock_text, "milpa.lock") {
+                Some(fail) => fail,
+                None => Verdict::Pass,
+            }
+        }
+        (Expected::Success, Ok(Produced::WorkspaceKdl(kdl_text))) => {
+            let expected = fx.dir.join("expected");
+            match diff_file(&expected.join("milpa.kdl"), &kdl_text, "milpa.kdl") {
                 Some(fail) => fail,
                 None => Verdict::Pass,
             }
@@ -401,6 +411,23 @@ impl Target for MilpaTarget {
                     Err(e) => return Err(e.code().to_string()),
                 };
                 Ok(Produced::LockOnly(milpa_core::format_lockfile(&lock)))
+            }
+            // workspace-manifest-roundtrip (S9a): parse milpa.kdl as a workspace
+            // manifest → re-emit via format_workspace_manifest → byte-compare vs
+            // expected/milpa.kdl. Proves the canonical serializer is byte-stable
+            // across both impls (Depth-F6).
+            Cmd::WorkspaceManifestRoundtrip => {
+                use milpa_core::ManifestDoc;
+                let text = std::fs::read_to_string(fx.dir.join("milpa.kdl"))
+                    .map_err(|e| format!("E2E-MANIFEST-UNREADABLE: {e}"))?;
+                let ws = match milpa_core::parse_document(&text) {
+                    Ok(ManifestDoc::Workspace(w)) => w,
+                    Ok(ManifestDoc::Package(_)) => {
+                        return Err("E2E-WORKSPACE-MANIFEST-ROUNDTRIP-PACKAGE-DOC".to_string());
+                    }
+                    Err(e) => return Err(e.code().to_string()),
+                };
+                Ok(Produced::WorkspaceKdl(milpa_core::format_workspace_manifest(&ws)))
             }
             // The resolve path: parse `milpa.kdl` (MAN-* on malformed), parse the
             // optional `index.kdl` (TNG-* parse validators), then resolve against

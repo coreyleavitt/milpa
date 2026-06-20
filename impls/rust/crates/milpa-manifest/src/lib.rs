@@ -20,7 +20,7 @@ use milpa_types::Version;
 pub mod format;
 pub mod nimble;
 
-pub use format::format_manifest;
+pub use format::{format_manifest, format_workspace_manifest};
 // Re-export Predicate from milpa-types (the new SSOT) so all existing
 // references to `milpa_manifest::Predicate` and `crate::Predicate` compile
 // unchanged.
@@ -269,6 +269,9 @@ pub struct Workspace {
     pub members: Vec<String>,
     pub overrides: Vec<Override>,
     pub flags: Vec<FlagDecl>,  // S11: workspace-root flags (§3.8)
+    /// Optional workspace root name (grammar §7 `name` node).
+    /// `None` when absent; `Some(name)` when declared.
+    pub name: Option<String>,
 }
 
 /// The two disjoint manifest roles (grammar §1). Detected by the presence of a
@@ -739,6 +742,7 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
     let mut overrides: Vec<Override> = Vec::new();
     let mut seen_override_names: BTreeSet<String> = BTreeSet::new();
     let mut ws_flags: Vec<FlagDecl> = Vec::new();
+    let mut ws_name: Option<String> = None;
 
     for node in doc.nodes() {
         match node.name().value() {
@@ -803,7 +807,15 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
                     ws_flags.push(parse_flag_decl(child)?);
                 }
             }
-            "name" => { /* informational only (grammar §7); accepted, discarded */ }
+            "name" => {
+                // grammar §7: optional workspace root name.
+                let a = args(node);
+                if !a.is_empty() {
+                    if let Some(s) = a[0].value().as_string() {
+                        ws_name = Some(s.to_string());
+                    }
+                }
+            }
             other => {
                 return Err(err(
                     "MAN-WORKSPACE-UNKNOWN-TOP-LEVEL",
@@ -817,7 +829,7 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
         }
     }
 
-    Ok(Workspace { members, overrides, flags: ws_flags })
+    Ok(Workspace { members, overrides, flags: ws_flags, name: ws_name })
 }
 
 // ---------------------------------------------------------------------------

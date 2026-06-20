@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use milpa_manifest::{format_manifest, Manifest, ManifestDoc};
+use milpa_manifest::{format_manifest, format_workspace_manifest, Manifest, ManifestDoc, Workspace};
 
 use crate::error::MilpaError;
 
@@ -179,6 +179,72 @@ pub fn add_mirror(project_dir: &Path, dep_name: &str, mirror_url: &str) -> Resul
         m
     })?;
     Ok(())
+}
+
+/// Read a **workspace** `milpa.kdl` at `path`, apply `mutator`, and write the
+/// canonical re-render atomically (typed analog of [`mutate_manifest_file`] for
+/// the workspace role — mirrors `manifest_writer.py:mutate_workspace_manifest_file`).
+///
+/// Refuses: a missing file (`MAN-MUTATE-FILE-NOT-FOUND`), a `.nimble`
+/// (`MAN-MUTATE-NIMBLE-REFUSED`), and a *package* manifest
+/// (`MAN-MUTATE-WORKSPACE-REFUSED`). A malformed workspace manifest surfaces
+/// its `MAN-*` parse code.
+pub fn mutate_workspace_manifest_file<F>(path: &Path, mutator: F) -> Result<WriteResult, MilpaError>
+where
+    F: FnOnce(Workspace) -> Workspace,
+{
+    if !path.exists() {
+        return Err(man(
+            "MAN-MUTATE-FILE-NOT-FOUND",
+            format!(
+                "manifest file not found: {} — create a milpa.kdl first",
+                path.display()
+            ),
+        ));
+    }
+    if path.extension().is_some_and(|e| e == "nimble") {
+        return Err(man(
+            "MAN-MUTATE-NIMBLE-REFUSED",
+            format!(
+                "refusing to mutate a .nimble file ({}); promote to milpa.kdl first",
+                path.display()
+            ),
+        ));
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        man(
+            "MAN-MUTATE-FILE-NOT-FOUND",
+            format!("cannot read {}: {e}", path.display()),
+        )
+    })?;
+    let ws = match milpa_manifest::parse_document(&text)? {
+        ManifestDoc::Package(_) => {
+            return Err(man(
+                "MAN-MUTATE-WORKSPACE-REFUSED",
+                format!(
+                    "{}: not a workspace manifest — use mutate_manifest_file for package manifests",
+                    path.display()
+                ),
+            ));
+        }
+        ManifestDoc::Workspace(w) => w,
+    };
+
+    let new_ws = mutator(ws);
+    let rendered = format_workspace_manifest(&new_ws);
+    let before = count_comments(&text);
+    let tmp = path.with_extension("kdl.tmp");
+    std::fs::write(&tmp, &rendered).map_err(|e| io_err(&tmp, e))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        io_err(path, e)
+    })?;
+    let after = count_comments(&rendered);
+
+    Ok(WriteResult {
+        path: path.to_path_buf(),
+        comments_lost: before.saturating_sub(after),
+    })
 }
 
 /// Count `//`-comment lines (trimmed-leading), the comment-loss heuristic.

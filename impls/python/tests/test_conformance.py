@@ -610,6 +610,51 @@ def _execute_fixture(
         return ("pass", "")
 
     # ------------------------------------------------------------------
+    # workspace-manifest-roundtrip (S9a): parse milpa.kdl as a workspace
+    # manifest → re-emit via format_workspace_manifest → byte-compare vs
+    # expected/milpa.kdl. Proves the canonical serializer is byte-stable
+    # across impls (manifest-grammar §8 Depth-F6).
+    # ------------------------------------------------------------------
+    if cmd == "workspace-manifest-roundtrip":
+        from milpa.manifest import (
+            WorkspaceManifest as _WsManifest,
+            format_workspace_manifest as _fmt_ws,
+            parse_workspace_or_manifest as _parse_ws_or_pkg,
+        )
+        kdl_path = fixture_dir / "milpa.kdl"
+        try:
+            kdl_text = kdl_path.read_text(encoding="utf-8")
+        except OSError as e:
+            return ("fail", f"E2E-MANIFEST-UNREADABLE: {e}")
+        try:
+            doc = _parse_ws_or_pkg(kdl_text)
+        except MilpaError as e:
+            if fixture.expected_error is not None and e.slug == fixture.expected_error:
+                return ("pass", "")
+            return ("fail", f"workspace-manifest-roundtrip: unexpected parse error {e.slug!r}: {e}")
+        if not isinstance(doc, _WsManifest):
+            return ("fail", "workspace-manifest-roundtrip: milpa.kdl is a package manifest, not a workspace")
+        # Re-emit and byte-compare
+        emitted = _fmt_ws(doc)
+        expected_kdl_path = fixture_dir / "expected" / "milpa.kdl"
+        try:
+            expected = expected_kdl_path.read_text(encoding="utf-8")
+        except OSError as e:
+            return ("fail", f"workspace-manifest-roundtrip: cannot read expected/milpa.kdl: {e}")
+        if emitted != expected:
+            emit_lines = emitted.splitlines()
+            exp_lines = expected.splitlines()
+            diffs = []
+            for i, (el, exl) in enumerate(zip(emit_lines, exp_lines)):
+                if el != exl:
+                    diffs.append(f"  line {i+1}: emitted {el!r} vs expected {exl!r}")
+            if len(emit_lines) != len(exp_lines):
+                diffs.append(f"  line count: emitted {len(emit_lines)} vs expected {len(exp_lines)}")
+            return ("fail", "workspace-manifest-roundtrip: byte mismatch vs expected/milpa.kdl\n" +
+                    "\n".join(diffs[:5]))
+        return ("pass", "")
+
+    # ------------------------------------------------------------------
     # check-certificate: resolve + assert certificate JSON (§2.7.3)
     # ------------------------------------------------------------------
     if cmd == "check-certificate":
