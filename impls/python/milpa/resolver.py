@@ -1369,14 +1369,11 @@ def _run_bfs_wave_loop(
                 if name_str not in seen_named and name_str != "nim":
                     seen_named.add(name_str)
                     record_discovery(name_str)  # Phase B: transitive named dep
-                    # Satisfiability pre-check (TNG-NO-SATISFYING-VERSION):
-                    # verify at least one index version satisfies the
-                    # declared constraint BEFORE enrolling stubs.  This
-                    # surfaces TNG-NO-SATISFYING-VERSION eagerly rather
-                    # than letting the solver raise SOLVE-CONFLICT.
-                    # resolver-semantics §4.2.1 + registry-protocol §5.5.
-                    if constraint_str is not None:
-                        index.resolve_named_all(name_str, constraint_str)
+                    # Enumerate-all normative (resolver-semantics §2.1):
+                    # do NOT pre-filter by constraint_str here.  The solver
+                    # owns satisfiability via incompatibility accumulation;
+                    # pre-filtering would emit TNG-NO-SATISFYING-VERSION
+                    # instead of the canonical SOLVE-CONFLICT on the error path.
                     _enumerate_named_stubs(name_str, None, index, provider, deps_dir, env)
                 # Named items are always processed inline, not as futures.
                 continue

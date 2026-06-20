@@ -115,6 +115,28 @@ both.
 > any decision is made. `VersionSet.intersect` is the single source of
 > truth for constraint intersection (`solver.py`).
 
+### 2.1  Error-slug ownership — `SOLVE-CONFLICT` is canonical for unsatisfiable constraints
+
+> NORMATIVE: **Enumerate-all is normative for named-dep Phase-A enumeration.**
+> When enumerating available versions of a named dep at Phase A, a conformant
+> implementation MUST enumerate ALL known versions from the index for that
+> package (i.e. pass no constraint filter to the index lookup). The solver,
+> via incompatibility accumulation, owns the satisfiability verdict.
+>
+> Consequence: when the index has at least one version of a package but none
+> satisfies the declared constraint, the canonical error is `SOLVE-CONFLICT`
+> (the solver's failure refutation), NOT `TNG-NO-SATISFYING-VERSION` (an
+> eager enumerator pre-filter). `TNG-NO-SATISFYING-VERSION` is reserved for
+> the case where the package is absent from the index entirely after
+> enumeration yields zero candidates with provenance.
+>
+> A conformant implementation MUST NOT short-circuit Phase-A enumeration by
+> pre-filtering against the declared constraint. Pre-filtering produces the
+> correct selected version on the happy path (PubGrub accumulates the
+> constraint independently via `Term.require` before solving), but emits the
+> wrong error slug on the failure path — a cross-impl divergence that makes
+> error messages implementation-dependent.
+
 ---
 
 ## 3  Identity-constraint convention for non-indexed deps

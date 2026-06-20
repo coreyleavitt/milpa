@@ -557,14 +557,14 @@ fn s5b_phase_a_error_slug_divergence_spike() {
     )
     .unwrap_err();
 
-    // S5b baseline: Rust currently emits TNG-NO-SATISFYING-VERSION (pre-filter at Phase A).
-    // After S6 (enumerate-all), this must become SOLVE-CONFLICT.
-    // The assertion documents the pre-S6 state; S6 updates it to "SOLVE-CONFLICT".
+    // S6 (enumerate-all normative, resolver-semantics §2.1): both impls now emit
+    // SOLVE-CONFLICT.  The solver owns satisfiability; the enumerator no longer
+    // pre-filters by constraint.  See corpus fixture-261 for the canonical assertion.
     assert_eq!(
         err.code(),
-        "TNG-NO-SATISFYING-VERSION",
-        "S5b spike: Rust Phase-A pre-filter emits TNG-NO-SATISFYING-VERSION \
-         (diverges from Python's SOLVE-CONFLICT path; S6 unifies both to SOLVE-CONFLICT)"
+        "SOLVE-CONFLICT",
+        "S6: enumerate-all normative — SOLVE-CONFLICT is the canonical slug \
+         when the index has versions but none satisfy the declared constraint"
     );
 }
 

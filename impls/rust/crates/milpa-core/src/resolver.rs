@@ -1984,14 +1984,19 @@ impl<'a> ResolveProvider<'a> {
         if !self.seen_named.borrow_mut().insert(name.to_string()) {
             return Ok(());
         }
-        // Phase A enumerate: the index applies the full resolve-time policy
-        // (TNG-NOT-FOUND / TNG-AMBIGUOUS-NAME / TNG-NO-SATISFYING-VERSION /
-        // TNG-NO-PROVENANCE) and returns every satisfying version newest-first.
-        let vs = &constraint;
-        let raw_str: Option<&str> = None; // display hint only; constraint is pre-parsed
+        // Phase A enumerate: enumerate ALL versions from the index (enumerate-all
+        // normative per resolver-semantics §2.1).  The solver owns satisfiability
+        // via Term::require/incompatibility accumulation; the enumerator MUST NOT
+        // pre-filter by the declared constraint.  Pre-filtering produces the
+        // correct selected version on the happy path but emits TNG-NO-SATISFYING-VERSION
+        // instead of the canonical SOLVE-CONFLICT on the error path.
+        // TNG-NOT-FOUND / TNG-AMBIGUOUS-NAME / TNG-NO-PROVENANCE can still fire
+        // (package absent, ambiguous namespace, or all versions lack provenance).
+        let enumerate_all = VersionSet::full();
+        let raw_str: Option<&str> = None;
         let versions = self
             .index
-            .resolve_named_all(name, vs, raw_str)
+            .resolve_named_all(name, &enumerate_all, raw_str)
             .map_err(MilpaError::from)?;
         let mut by_ver: BTreeMap<Version, IndexVersion> = BTreeMap::new();
         for e in versions {
