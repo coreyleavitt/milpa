@@ -3,11 +3,12 @@
 - **Stage:** 3 (tdd / implement slices)   •   **Round:** —
 - **Resume:** `/loop implement the next unimplemented RFC slice from docs/rfc-conformance-parity.md with /tdd …` (PAUSED on a scope escalation — see Open forks)
 
-Corpus state after Slice F: `python PASS=274 FAIL=1 (3 cert SKIP)`,
-`rust PASS=277 FAIL=1`, **CROSS-IMPL DIVERGENCES = NONE**
-(`/tmp/harness_after_F.txt`). Both impls now fail ONLY fixture-205 (local
-override, symmetric — not a divergence). Remaining non-205: 3 parked cert
-fixtures (127/128/150 = Python --certificate not implemented; rust passes them).
+Corpus state after Slice C "205": **BLACK-BOX HARNESS GREEN** (`HARNESS_EXIT=0`).
+`python PASS=275 FAIL=0 (3 cert SKIP)`, `rust PASS=278 FAIL=0 SKIP=0`,
+CROSS-IMPL DIVERGENCES = NONE (`/tmp/harness_after_205.txt`). The only remaining
+parked items are 3 cert fixtures (127/128/150 = Python --certificate
+unimplemented). Phase 1's primary exit criterion (harness green for both impls)
+is MET; remaining = in-process adapter alignment (Slices 2/3) + the cert scope call.
 
 ## Slices
 - [x] Slice 0 — baseline protocol (`f0fc3e7`).
@@ -31,13 +32,11 @@ fixtures (127/128/150 = Python --certificate not implemented; rust passes them).
 - [x] Slice D — fixture-252 + 212 frozen active-flags-check ordering (`e59e6a1`).
 - [x] Slice F — single-package fetch honors --features (`d238a5d`); greened
       209/210/211/216/228/230/244. **Divergences → NONE.**
-- [ ] **Slice C "205"** — local-override transitive (py✗ rust✗, both-fail). The
-      LAST black-box failure. MockedLocalFetcher requires a mocked-fetches entry;
-      fixture supplies the override target as a real dir (mylib-fork/). Passes
-      in-process. Likely fix: MockedLocalFetcher (both impls) falls back to reading
-      the real path when it exists. Verify the in-process path first. *(Python+Rust impl.)*
-- [ ] Slice 2 — fixture-144 in-process adapters (rust + python). (Black-box already
-      passes it; this fixes the two in-process adapters per RFC §4 Slice 2.)
+- [x] Slice C "205" — local deps use real LocalFetcher in mock mode, both impls
+      (`2578076`); removed dead MockedLocalFetcher (py) + its tests. **Black-box GREEN.**
+- [ ] Slice 2 — fixture-144 in-process adapters (rust + python). Black-box already
+      passes it; align the two in-process adapters to the CLI's
+      MILPA_INDEX_URL→HttpDepDeclStore logic (RFC §4 Slice 2). *(Not a black-box failure.)*
 - [ ] Slice 3 — `project-dir` control file (#167) — spec it + teach both in-process adapters.
 - [ ] cert fixtures 127/128/150 — Python `--certificate` not implemented (parked in
       descriptors.py python_known_failing). Separate Python feature; decide if in-scope.
