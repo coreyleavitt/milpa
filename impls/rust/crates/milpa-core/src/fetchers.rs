@@ -853,10 +853,17 @@ impl FetcherRegistry for MockedFetcher {
                     },
                 )
             }
+            Provenance::Local { path } => {
+                // Local deps are filesystem-native: the fixture ships the target
+                // dir on disk (e.g. fixture-205's mylib-fork/), so delegate to the
+                // REAL fetch_local (symlink) — mirrors the production dispatch and
+                // Python's mocked_registry. There is nothing to mock. (Slice C "205".)
+                return fetch_local(name, Path::new(path), dest);
+            }
             other => {
                 return Err(FetchError::Failed(format!(
                     "MockedFetcher: unsupported provenance kind: {other:?}; \
-                     only Git and Tarball provenance are mocked"
+                     only Git, Tarball, and Local provenance are handled"
                 )));
             }
         };

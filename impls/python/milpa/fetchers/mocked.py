@@ -44,7 +44,7 @@ from pathlib import Path
 
 from milpa.errors import FETCH_MOCK_MISSING, FETCH_SHA256_MISMATCH, MilpaError
 from milpa.fetchers.git import GitProvenance, GitReceipt
-from milpa.fetchers.local import LocalProvenance, LocalReceipt
+from milpa.fetchers.local import LocalFetcher, LocalProvenance, LocalReceipt
 from milpa.fetchers.oci import OciProvenance, OciReceipt
 from milpa.fetchers.tarball import TarballFetcher, TarballProvenance, TarballReceipt
 from milpa.fetchers.types import (
@@ -296,43 +296,12 @@ class MockedTarballFetcher(Fetcher):
 
 
 # ---------------------------------------------------------------------------
-# MockedLocalFetcher
+# (No mocked local fetcher: local deps are filesystem-native and handled by the
+# real LocalFetcher in mocked_registry — see the note there. The former
+# MockedLocalFetcher required a mocked-fetches/<key>/ entry the corpus never
+# used and diverged the CLI mock path from the in-process adapter, breaking
+# fixture-205. Removed in rfc-conformance-parity Slice C "205".)
 # ---------------------------------------------------------------------------
-
-
-class MockedLocalFetcher(Fetcher):
-    """Mocked local-path fetcher — stages content from the fixture tree.
-
-    Local deps are identified by their path.  The mock key is
-    ``url_key(path, "")`` (local paths have no ref; the ``path`` value is used
-    as the ``url`` slot in the key encoder).
-
-    Note: local fetches are NOT CAS-admitted (``LocalProvenance.cas_admissible
-    = False``); ``CasAdmittingFetcher`` passes them through to a real directory.
-    """
-
-    def __init__(self, mocked_dir: Path) -> None:
-        self._dir = mocked_dir
-
-    def can_handle(self, p: Provenance) -> bool:
-        return isinstance(p, LocalProvenance)
-
-    def fetch(self, name: str, p: Provenance, *, dest: Path) -> LocalReceipt:
-        assert isinstance(p, LocalProvenance)  # narrowing
-
-        key_dir = self._dir / url_key(str(p.path), "")
-        if not key_dir.is_dir():
-            raise MilpaError(
-                FETCH_MOCK_MISSING,
-                f"mocked fetch: no local fixture for path {p.path!r} "
-                f"(expected dir: {key_dir})",
-                dep=name,
-                path=str(p.path),
-            )
-
-        dest.mkdir(parents=True, exist_ok=True)
-        _stage_mock_content(name, key_dir, dest)
-        return LocalReceipt(resolved_path=p.path)
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +363,13 @@ def mocked_registry(mocked_dir: Path) -> FetcherRegistry:
     registry = FetcherRegistry()
     registry.register(MockedGitFetcher(mocked_dir))
     registry.register(MockedTarballFetcher(mocked_dir))
-    registry.register(MockedLocalFetcher(mocked_dir))
+    # Local deps are filesystem-native: the fixture ships the dep/override target
+    # as a real dir on disk (e.g. fixture-205's mylib-fork/), so the REAL
+    # LocalFetcher symlinks to it with no network — there is nothing to mock. This
+    # matches the in-process adapter (test_conformance._build_env), which also
+    # registers the real LocalFetcher; MockedLocalFetcher's mocked-fetches/<key>/
+    # convention was never used by the corpus and diverged the CLI from in-process.
+    registry.register(LocalFetcher())
     registry.register(MockedOciFetcher(mocked_dir))
     return registry
 
@@ -417,7 +392,6 @@ __all__ = [
     # Mocked fetchers
     "MockedGitFetcher",
     "MockedTarballFetcher",
-    "MockedLocalFetcher",
     "MockedOciFetcher",
     # Factory
     "mocked_registry",

@@ -6,9 +6,9 @@ Coverage:
   - MockedGitFetcher: staged content from fixture dir; commit SHA from 'sha' file.
   - MockedTarballFetcher: staged content; archive_sha256 from fixture; TOFU pin
     re-assertion (FETCH-SHA256-MISMATCH on mismatch); first-fetch (no prior pin) succeeds.
-  - MockedLocalFetcher: staged content from fixture dir; resolved_path in receipt.
   - MockedOciFetcher: stub raises FETCH-MOCK-MISSING.
-  - mocked_registry factory: all four kinds claimed; exclusive dispatch (no ambiguity).
+  - mocked_registry factory: all four kinds claimed; exclusive dispatch (no
+    ambiguity). Local deps use the REAL LocalFetcher (filesystem-native).
   - cas_admissible per kind: Git/Tarball/OCI = True; Local = False.
   - receipt transport_fields non-empty for all concrete receipts.
 
@@ -26,9 +26,7 @@ from milpa.fetchers.mocked import (
     GitProvenance,
     GitReceipt,
     LocalProvenance,
-    LocalReceipt,
     MockedGitFetcher,
-    MockedLocalFetcher,
     MockedOciFetcher,
     MockedTarballFetcher,
     OciProvenance,
@@ -37,6 +35,7 @@ from milpa.fetchers.mocked import (
     mocked_registry,
     url_key,
 )
+from milpa.fetchers.local import LocalFetcher
 from milpa.fetchers.types import FetcherRegistry
 
 # ---------------------------------------------------------------------------
@@ -141,24 +140,6 @@ def _make_tarball_fixture(
     key_dir = mocked_dir / url_key(url, "")
     key_dir.mkdir(parents=True)
     (key_dir / "archive_sha256").write_text(archive_sha256 + "\n", encoding="utf-8")
-    content = key_dir / "content"
-    content.mkdir()
-    if files:
-        for rel, data in files.items():
-            fp = content / rel
-            fp.parent.mkdir(parents=True, exist_ok=True)
-            fp.write_bytes(data)
-    return key_dir
-
-
-def _make_local_fixture(
-    mocked_dir: Path,
-    path: str,
-    files: dict[str, bytes] | None = None,
-) -> Path:
-    """Create a local mock fixture directory under mocked_dir."""
-    key_dir = mocked_dir / url_key(path, "")
-    key_dir.mkdir(parents=True)
     content = key_dir / "content"
     content.mkdir()
     if files:
@@ -453,75 +434,6 @@ class TestMockedTarballFetcher:
 
 
 # ---------------------------------------------------------------------------
-# MockedLocalFetcher
-# ---------------------------------------------------------------------------
-
-
-class TestMockedLocalFetcher:
-    PATH = "/home/user/mylib"
-
-    def _fetcher(self, mocked_dir: Path) -> MockedLocalFetcher:
-        return MockedLocalFetcher(mocked_dir)
-
-    def test_stages_content_files(self, tmp_path: Path) -> None:
-        mocked_dir = tmp_path / "mocked-fetches"
-        mocked_dir.mkdir()
-        files = {"mylib.nim": b"# mylib"}
-        _make_local_fixture(mocked_dir, self.PATH, files=files)
-        fetcher = self._fetcher(mocked_dir)
-        prov = LocalProvenance(path=Path(self.PATH))
-        dest = tmp_path / "_deps" / "mylib"
-
-        fetcher.fetch("mylib", prov, dest=dest)
-
-        assert (dest / "mylib.nim").read_bytes() == b"# mylib"
-
-    def test_returns_resolved_path_in_receipt(self, tmp_path: Path) -> None:
-        mocked_dir = tmp_path / "mocked-fetches"
-        mocked_dir.mkdir()
-        _make_local_fixture(mocked_dir, self.PATH)
-        fetcher = self._fetcher(mocked_dir)
-        prov = LocalProvenance(path=Path(self.PATH))
-        dest = tmp_path / "_deps" / "mylib"
-
-        receipt = fetcher.fetch("mylib", prov, dest=dest)
-
-        assert isinstance(receipt, LocalReceipt)
-        assert receipt.resolved_path == Path(self.PATH)
-
-    def test_missing_fixture_raises_fetch_mock_missing(self, tmp_path: Path) -> None:
-        mocked_dir = tmp_path / "mocked-fetches"
-        mocked_dir.mkdir()
-        fetcher = self._fetcher(mocked_dir)
-        prov = LocalProvenance(path=Path(self.PATH))
-        dest = tmp_path / "_deps" / "mylib"
-
-        with pytest.raises(MilpaError) as exc_info:
-            fetcher.fetch("mylib", prov, dest=dest)
-
-        assert exc_info.value.slug == FETCH_MOCK_MISSING
-
-    def test_can_handle_local_provenance(self, tmp_path: Path) -> None:
-        fetcher = self._fetcher(tmp_path)
-        assert fetcher.can_handle(LocalProvenance(path=Path("/some/path")))
-
-    def test_cannot_handle_git_provenance(self, tmp_path: Path) -> None:
-        fetcher = self._fetcher(tmp_path)
-        assert not fetcher.can_handle(GitProvenance(url="https://x.com/a.git", ref="main"))
-
-    def test_receipt_transport_fields_non_empty(self, tmp_path: Path) -> None:
-        mocked_dir = tmp_path / "mocked-fetches"
-        mocked_dir.mkdir()
-        _make_local_fixture(mocked_dir, self.PATH)
-        fetcher = self._fetcher(mocked_dir)
-        prov = LocalProvenance(path=Path(self.PATH))
-        dest = tmp_path / "_deps" / "mylib"
-
-        receipt = fetcher.fetch("mylib", prov, dest=dest)
-        assert receipt.transport_fields()
-
-
-# ---------------------------------------------------------------------------
 # MockedOciFetcher (stub)
 # ---------------------------------------------------------------------------
 
@@ -589,7 +501,9 @@ class TestMockedRegistry:
         prov = LocalProvenance(path=Path("/some/path"))
         claims = [f for f in registry.fetchers if f.can_handle(prov)]
         assert len(claims) == 1
-        assert isinstance(claims[0], MockedLocalFetcher)
+        # Local deps are filesystem-native: mocked_registry uses the REAL
+        # LocalFetcher (Slice C "205"), matching the in-process adapter.
+        assert isinstance(claims[0], LocalFetcher)
 
     def test_oci_dispatch_unique(self, tmp_path: Path) -> None:
         registry = mocked_registry(tmp_path)
