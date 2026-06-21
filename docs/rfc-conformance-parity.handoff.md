@@ -1,9 +1,27 @@
 # rfc-conformance-parity — handoff
 
-- **Stage:** 3 (tdd / implement slices)   •   **Round:** —
-- **Resume:** `/loop implement the next unimplemented RFC slice from docs/rfc-conformance-parity.md with /tdd …` (PAUSED on a scope escalation — see Open forks)
+- **Stage:** 3 (tdd) COMPLETE for all implementable slices → ready for stage 4 (/code-review)
+- **Resume:** `/code-review docs/rfc-conformance-parity.md` (Phase 1 done; remaining = forks below + gated Phase 2)
 
-Corpus state after Slice C "205": **BLACK-BOX HARNESS GREEN** (`HARNESS_EXIT=0`).
+## PHASE 1 COMPLETE (2026-06-21)
+
+Black-box differential harness GREEN: `python PASS=276 FAIL=0`, `rust PASS=279
+FAIL=0`, cross-impl divergences NONE. Both in-process adapters' skip/known-failing
+sets reduced to genuine CLI-only + spec-deferred items. All implementable Phase-1
+slices landed: 0, A, B, C(c1–c4 + 205), E, 1, D, F, 2, 3, + fixture-114
+un-quarantine. Commits f0fc3e7 → c77cfd3.
+
+Remaining (NOT implementable autonomously — forks/gated):
+1. **cert fixtures 127/128/150** — Python `--certificate` unimplemented (rust passes
+   them black-box). A real feature, not a parity bug. Scope fork: implement in this
+   RFC, or file as a separate Python-feature issue? (parked in descriptors.py
+   python_known_failing.)
+2. **c4 spec fork** (#159/#160/#110) — should the CLI express an explicitly-absent
+   profile axis? (255/256 deferred to KNOWN_LIMITATIONS.) See RFC §4 c4.
+3. **Phase 2** (S4a/S4/S5/S6/S7) — gated on the differential-harness RFC + S4a
+   raw-bytes mock mode.
+
+Older state (Slice C "205"): **BLACK-BOX HARNESS GREEN** (`HARNESS_EXIT=0`).
 `python PASS=275 FAIL=0 (3 cert SKIP)`, `rust PASS=278 FAIL=0 SKIP=0`,
 CROSS-IMPL DIVERGENCES = NONE (`/tmp/harness_after_205.txt`). The only remaining
 parked items are 3 cert fixtures (127/128/150 = Python --certificate
