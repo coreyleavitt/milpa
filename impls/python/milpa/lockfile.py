@@ -1435,3 +1435,50 @@ def verify_lockfile_against_deps(
                 )
 
     return divergences
+
+
+# ---------------------------------------------------------------------------
+# strip_dep_pin — SSOT for the "drop one dep's pin" operation (F12)
+# ---------------------------------------------------------------------------
+
+
+def strip_dep_pin(lockfile: Lockfile, canonical_name: str) -> Lockfile:
+    """Return a copy of *lockfile* with the named dep's pin stripped.
+
+    The stripped entry retains only ``GitProvenanceRecord`` entries with
+    ``origin == "declared"`` (declared mirrors).  ``identity`` is set to
+    ``None`` so the resolver treats the dep as un-pinned and re-resolves it
+    fresh.  The declared provenances survive so ``_prior_declared_mirror_urls``
+    can carry them forward (Phase D item 5).
+
+    The dep at *canonical_name* MUST already exist in *lockfile.deps*; the
+    caller is responsible for the alias→canonical resolution and the "not
+    found" guard (both call sites already perform these steps before invoking
+    this function).
+
+    Parameters
+    ----------
+    lockfile:
+        The prior lockfile to modify.
+    canonical_name:
+        The canonical dep name (post-alias resolution) whose pin is to be
+        stripped.
+
+    Returns
+    -------
+    Lockfile
+        A new lockfile value with the matching dep's pin stripped and all
+        other deps unchanged.
+    """
+    from dataclasses import replace as _replace
+
+    updated = next(d for d in lockfile.deps if d.name == canonical_name)
+    declared_provs = tuple(
+        p for p in updated.provenances
+        if isinstance(p, GitProvenanceRecord) and p.origin == "declared"
+    )
+    pin_stripped = _replace(updated, identity=None, provenances=declared_provs)
+    new_deps = tuple(
+        d for d in lockfile.deps if d.name != canonical_name
+    ) + (pin_stripped,)
+    return _replace(lockfile, deps=new_deps)

@@ -395,7 +395,121 @@ def apply_workspace_manifest_change(
 
 
 # ---------------------------------------------------------------------------
+# S11e: apply_member_manifest_change — member-dir orchestration primitive (F11)
+# ---------------------------------------------------------------------------
+
+
+def apply_member_manifest_change(
+    workspace_root: Path,
+    env: "MilpaEnv",
+    params: "ResolveParams",
+    member_dir: Path,
+    mutate_member_manifest: "Callable[[Manifest], Manifest]",
+) -> "tuple[ResolvedGraph, WriteResult]":
+    """Orchestration primitive for ``add``/``remove`` invoked from a member dir.
+
+    Mirrors the validate→resolve-in-memory→write-manifest→write-lock ordering
+    of ``apply_workspace_manifest_change``, but targets ONE member's manifest
+    rather than the workspace manifest.
+
+    Atomicity ordering (spec/cli-contract.md §5.6–5.7):
+      *reload-workspace → apply mutator to member manifest → resolve-in-memory
+      → write member manifest → write shared lock.*
+
+    Resolution happens **before** any on-disk write, so a network or resolution
+    failure leaves both the member manifest and the shared lock untouched.
+
+    The workspace is re-loaded from root (step 1) so that a member dir deleted
+    since the command started is caught by ``load_workspace`` before we attempt
+    resolution — identical validation rigor to ``apply_workspace_manifest_change``.
+
+    Parameters
+    ----------
+    workspace_root:
+        Absolute path to the workspace root directory.
+    env:
+        Injectable seams (fetcher, index, store).
+    params:
+        Per-call resolution parameters (strategy, max_parallel, profile, prior,
+        manifest_dir, …).  Caller must set ``params.manifest_dir = workspace_root``.
+    member_dir:
+        Absolute path to the member directory whose manifest is being mutated.
+        Must resolve to a declared member of the workspace.
+    mutate_member_manifest:
+        A pure ``Manifest → Manifest`` transform applied to the member's
+        current on-disk manifest.  Mutator MUST NOT perform I/O.
+
+    Returns
+    -------
+    tuple[ResolvedGraph, WriteResult]
+        The resolved graph and the write result (path to the member manifest
+        + comment-loss count).
+
+    Raises
+    ------
+    MilpaError
+        Any error from workspace loading, the mutate call, or resolution.
+        On any raise, NO on-disk file is modified.
+    """
+    from milpa.lockfile import from_graph, write_lockfile
+    from milpa.manifest import parse_manifest
+    from milpa.resolver import resolve_workspace
+    from milpa.workspace import load_workspace, load_workspace_with_member_override
+
+    # Step 1: Re-load the workspace from root.  This re-validates that all
+    # declared member dirs still exist and have milpa.kdl — catching the
+    # "member dir deleted since last load" case before any resolution attempt.
+    current_ws = load_workspace(workspace_root)
+
+    # Step 2: Read and parse the target member's current manifest.
+    member_dir_resolved = member_dir.resolve()
+    member_manifest_path = member_dir_resolved / "milpa.kdl"
+    try:
+        member_text = member_manifest_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise MilpaError(
+            MAN_MUTATE_FILE_NOT_FOUND,
+            f"cannot read member manifest at {member_manifest_path}: {exc}",
+            path=str(member_manifest_path),
+        ) from exc
+    member_manifest = parse_manifest(member_text)
+
+    # Step 3: Apply the mutator (pure transform on the member manifest).
+    proposed_member_manifest = mutate_member_manifest(member_manifest)
+
+    # Step 4: Build the proposed LoadedWorkspace with the mutated member manifest.
+    proposed_ws = load_workspace_with_member_override(
+        current_ws, member_dir_resolved, proposed_member_manifest
+    )
+
+    # Step 5: Resolve the proposed workspace IN MEMORY.  Any resolution or
+    # network failure raises here — member manifest and shared lock are still
+    # unmodified.
+    deps_dir = workspace_root / "_deps"
+    graph = resolve_workspace(proposed_ws, deps_dir, env, params)
+
+    # Step 6: Resolution succeeded — commit both outputs atomically.
+    # Write member manifest first, then shared lock.
+    lockfile_val = from_graph(graph, strategy=str(params.strategy))
+    lock_path = workspace_root / "milpa.lock"
+
+    before = _count_comments(member_text)
+    rendered = format_manifest(proposed_member_manifest)
+    after = _count_comments(rendered)
+    _atomic_write_text(member_manifest_path, rendered)
+
+    write_lockfile(lockfile_val, lock_path)
+
+    wr = WriteResult(
+        path=member_manifest_path,
+        comments_lost=max(0, before - after),
+    )
+    return graph, wr
+
+
+# ---------------------------------------------------------------------------
 # Type stubs for forward references used in apply_workspace_manifest_change
+# and apply_member_manifest_change
 # ---------------------------------------------------------------------------
 # The TYPE_CHECKING guard keeps these imports from being executed at module
 # load time (avoiding circular imports), while still satisfying type checkers.

@@ -58,6 +58,7 @@ from milpa.lockfile import (
     format_lockfile,
     from_graph,
     parse_lockfile,
+    strip_dep_pin,
     verify_against_graph,
     verify_lockfile_against_deps,
     write_lockfile,
@@ -3761,3 +3762,106 @@ class TestVerifyLocalDepLivenessOnly:
 
         result = verify_lockfile_against_deps(lf, deps_dir)
         assert result == [], f"Expected no divergences for matching git dep, got: {result}"
+
+
+# ---------------------------------------------------------------------------
+# F12: strip_dep_pin — SSOT for update's pin-stripping operation
+# ---------------------------------------------------------------------------
+
+
+def _make_git_locked_dep(
+    name: str,
+    identity: str | None = "sha256:" + "a" * 64,
+    *,
+    observed_url: str = "https://github.com/example/repo",
+    declared_url: str | None = None,
+    tarball_prov: bool = False,
+) -> LockedDep:
+    """Build a LockedDep with git provenances for strip_dep_pin tests."""
+    provs: list = [
+        GitProvenanceRecord(url=observed_url, ref="main", commit_sha="abc123", origin="observed")
+    ]
+    if declared_url is not None:
+        provs.append(GitProvenanceRecord(url=declared_url, origin="declared"))
+    if tarball_prov:
+        from milpa.lockfile import TarballProvenanceRecord
+        provs.append(TarballProvenanceRecord(url="https://cdn.example.com/repo.tar.gz", origin="observed"))
+    return LockedDep(
+        name=name,
+        identity=identity,
+        version="1.0.0",
+        src_dir="src",
+        requires=(),
+        provenances=tuple(provs),
+    )
+
+
+class TestStripDepPin:
+    """Unit tests for lockfile.strip_dep_pin (F12 — SSOT extraction)."""
+
+    def test_strips_identity_to_none(self) -> None:
+        """identity is cleared so the resolver re-resolves fresh."""
+        dep = _make_git_locked_dep("mylib", identity="sha256:" + "b" * 64)
+        lf = Lockfile(deps=(dep,))
+        result = strip_dep_pin(lf, "mylib")
+        stripped = next(d for d in result.deps if d.name == "mylib")
+        assert stripped.identity is None
+
+    def test_drops_observed_provenances(self) -> None:
+        """Observed provenances (carry the commit pin) are dropped."""
+        dep = _make_git_locked_dep("mylib", observed_url="https://github.com/example/repo")
+        lf = Lockfile(deps=(dep,))
+        result = strip_dep_pin(lf, "mylib")
+        stripped = next(d for d in result.deps if d.name == "mylib")
+        assert not any(p.origin == "observed" for p in stripped.provenances)
+
+    def test_retains_declared_git_provenances(self) -> None:
+        """Declared git provenances (mirror claims) are preserved."""
+        dep = _make_git_locked_dep(
+            "mylib",
+            declared_url="https://mirror.example.com/repo",
+        )
+        lf = Lockfile(deps=(dep,))
+        result = strip_dep_pin(lf, "mylib")
+        stripped = next(d for d in result.deps if d.name == "mylib")
+        declared = [p for p in stripped.provenances if isinstance(p, GitProvenanceRecord) and p.origin == "declared"]
+        assert len(declared) == 1
+        assert declared[0].url == "https://mirror.example.com/repo"
+
+    def test_drops_non_git_provenances(self) -> None:
+        """Non-git provenances (e.g. tarball) are also dropped — only declared git survives."""
+        dep = _make_git_locked_dep("mylib", tarball_prov=True)
+        lf = Lockfile(deps=(dep,))
+        result = strip_dep_pin(lf, "mylib")
+        stripped = next(d for d in result.deps if d.name == "mylib")
+        assert all(isinstance(p, GitProvenanceRecord) and p.origin == "declared"
+                   for p in stripped.provenances)
+
+    def test_other_deps_unchanged(self) -> None:
+        """Deps other than the target are returned unmodified."""
+        dep_a = _make_git_locked_dep("alpha")
+        dep_b = _make_git_locked_dep("beta")
+        lf = Lockfile(deps=(dep_a, dep_b))
+        result = strip_dep_pin(lf, "alpha")
+        beta = next(d for d in result.deps if d.name == "beta")
+        assert beta == dep_b
+
+    def test_returns_new_lockfile_not_mutates(self) -> None:
+        """strip_dep_pin returns a new Lockfile; the original is unchanged."""
+        dep = _make_git_locked_dep("mylib", identity="sha256:" + "c" * 64)
+        lf = Lockfile(deps=(dep,))
+        result = strip_dep_pin(lf, "mylib")
+        # Original lockfile dep identity unchanged.
+        original_dep = next(d for d in lf.deps if d.name == "mylib")
+        assert original_dep.identity == "sha256:" + "c" * 64
+        # Result has None identity.
+        stripped = next(d for d in result.deps if d.name == "mylib")
+        assert stripped.identity is None
+
+    def test_no_declared_mirrors_yields_empty_provenances(self) -> None:
+        """With no declared mirrors, the stripped dep has empty provenances."""
+        dep = _make_git_locked_dep("mylib")  # only observed
+        lf = Lockfile(deps=(dep,))
+        result = strip_dep_pin(lf, "mylib")
+        stripped = next(d for d in result.deps if d.name == "mylib")
+        assert stripped.provenances == ()

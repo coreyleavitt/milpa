@@ -74,6 +74,7 @@ from milpa.lockfile import (
     Lockfile,
     from_graph,
     load_lockfile,
+    strip_dep_pin,
     verify_lockfile_against_deps,
     write_lockfile,
 )
@@ -2251,22 +2252,7 @@ def cmd_update(
     # _prior_declared_mirror_urls can carry them forward. URLs that are no
     # longer in milpa.kdl mirrors are naturally dropped by the D-lifecycle
     # dedup logic (only manifest_mirror_urls + primary make it into declared).
-    from dataclasses import replace as _replace
-    updated_locked = next(d for d in prior_lock.deps if d.name == canonical_name)
-    # Keep only declared provenance records (drop observed — those carry the commit pin).
-    declared_provenances = tuple(
-        p for p in updated_locked.provenances
-        if isinstance(p, GitProvenanceRecord) and p.origin == "declared"
-    )
-    pin_stripped = _replace(
-        updated_locked,
-        identity=None,
-        provenances=declared_provenances,
-    )
-    filtered_deps = tuple(
-        d for d in prior_lock.deps if d.name != canonical_name
-    ) + (pin_stripped,)
-    filtered_prior = _replace(prior_lock, deps=filtered_deps)
+    filtered_prior = strip_dep_pin(prior_lock, canonical_name)
 
     # S10 (RFC #23 §3.7): re-resolve with the lockfile's recorded active_flags
     # for reproducibility.  "Re-resolves with the lockfile's recorded active_flags"
@@ -2342,7 +2328,6 @@ def _cmd_update_workspace(
         prior = None  # Full drop — re-resolve from scratch.
     elif prior is not None:
         # Scoped: drop only this dep's pin from the prior.
-        from dataclasses import replace as _replace
         canonical_name = resolve_alias_to_canonical(dep_name, prior)
         if not any(d.name == canonical_name for d in prior.deps):
             print(
@@ -2351,14 +2336,7 @@ def _cmd_update_workspace(
             )
             _emit_slug(LOCK_DEP_NOT_FOUND)
             return 1
-        updated_locked = next(d for d in prior.deps if d.name == canonical_name)
-        declared_provs = tuple(
-            p for p in updated_locked.provenances
-            if isinstance(p, GitProvenanceRecord) and p.origin == "declared"
-        )
-        pin_stripped = _replace(updated_locked, identity=None, provenances=declared_provs)
-        filtered_deps = tuple(d for d in prior.deps if d.name != canonical_name) + (pin_stripped,)
-        prior = _replace(prior, deps=filtered_deps)
+        prior = strip_dep_pin(prior, canonical_name)
 
     env_with_index = _load_index_for_verb(env)
     profile = Profile.from_environment()
@@ -2423,11 +2401,14 @@ def _cmd_add_from_member_dir(
 
     if git_url is None:
         # mirror_url path: pure manifest mutation on the member, no workspace relock.
-        # Delegate to the single-package mirror path on the member dir.
+        # _cmd_add_mirror is manifest-only today (no lock write), but pass the shared
+        # workspace lock so a future lock-writing mirror path writes the right file.
+        # No relock is needed on this path: adding a mirror is a provenance annotation,
+        # not a new dep resolution.
         return _cmd_add_mirror(
             project_dir=member_dir,
             manifest_path=member_dir / "milpa.kdl",
-            lock_path=member_dir / "milpa.lock",
+            lock_path=ws_root / "milpa.lock",
             env=env,
             dep_name=dep_name,
             mirror_url=mirror_url or "",
@@ -2436,8 +2417,8 @@ def _cmd_add_from_member_dir(
         )
 
     # --- git URL add path ---
-    from milpa.manifest import FlagRequest, UrlDep, parse_manifest
-    from milpa.manifest_writer import mutate_manifest_file
+    from milpa.manifest import FlagRequest, UrlDep
+    from milpa.manifest_writer import apply_member_manifest_change
 
     # Ref discovery — same logic as _cmd_add_git.
     mocked_dir = os.environ.get("MILPA_MOCKED_FETCHES", "").strip()
@@ -2464,7 +2445,10 @@ def _cmd_add_from_member_dir(
                 return 1
             ref = discovered_ref
 
-    # Parse the MEMBER's manifest.
+    # Pre-flight validations against the current member manifest (read once
+    # before the orchestration; apply_member_manifest_change will re-read it
+    # atomically, but we need these checks to produce user-friendly errors
+    # before attempting resolution).
     member_manifest_path = member_dir / "milpa.kdl"
     if not member_manifest_path.exists():
         print(
@@ -2474,10 +2458,10 @@ def _cmd_add_from_member_dir(
         _emit_slug(MILPA_INTERNAL)
         return 1
 
-    member_text = member_manifest_path.read_text(encoding="utf-8")
-    member_manifest = parse_manifest(member_text)
+    from milpa.manifest import parse_manifest
+    preflight_manifest = parse_manifest(member_manifest_path.read_text(encoding="utf-8"))
 
-    existing_names = {dep.name for dep in member_manifest.deps}
+    existing_names = {dep.name for dep in preflight_manifest.deps}
     if dep_name in existing_names:
         print(
             f"milpa add: dep {dep_name!r} already declared in milpa.kdl",
@@ -2486,7 +2470,6 @@ def _cmd_add_from_member_dir(
         _emit_slug(MAN_ADD_DEP_EXISTS)
         return 1
 
-    # Optional dep clash check.
     if optional:
         from milpa.manifest import valid_dep_name
         from milpa.errors import MAN_DEP_OPTIONAL_FLAG_CLASH, MAN_DEP_OPTIONAL_INVALID_NAME
@@ -2498,7 +2481,7 @@ def _cmd_add_from_member_dir(
             )
             _emit_slug(MAN_DEP_OPTIONAL_INVALID_NAME)
             return 1
-        declared_flag_names: frozenset[str] = frozenset(fd.name for fd in member_manifest.flags)
+        declared_flag_names: frozenset[str] = frozenset(fd.name for fd in preflight_manifest.flags)
         if dep_name in declared_flag_names:
             print(
                 f"milpa add: dep {dep_name!r} optional=#true would clash with the "
@@ -2508,7 +2491,7 @@ def _cmd_add_from_member_dir(
             _emit_slug(MAN_DEP_OPTIONAL_FLAG_CLASH)
             return 1
 
-    # Build the proposed member manifest with the new dep.
+    # Build the mutator: adds the new dep to whatever manifest the primitive reads.
     flag_reqs: tuple[FlagRequest, ...] = tuple(
         FlagRequest(name=f, enabled=True) for f in features
     )
@@ -2519,15 +2502,14 @@ def _cmd_add_from_member_dir(
         optional=optional,
         flag_requests=flag_reqs,
     )
-    proposed_member_manifest = _replace(
-        member_manifest, deps=member_manifest.deps + (new_dep,)
-    )
 
-    # Re-resolve the WHOLE workspace using the proposed member manifest.
-    # We rebuild the LoadedWorkspace with the proposed member manifest so the
-    # resolver sees the updated deps.
+    def _mutate_add(m: "Manifest") -> "Manifest":
+        return _replace(m, deps=m.deps + (new_dep,))
+
+    # Re-resolve the WHOLE workspace via the SSOT orchestration primitive.
+    # apply_member_manifest_change: reload-workspace → apply mutator → resolve
+    # in-memory → write member manifest → write shared lock.
     env_with_index = _load_index_for_verb(env)
-    deps_dir = ws_root / "_deps"
     profile = Profile.from_environment()
     params = ResolveParams(
         strategy=strategy,
@@ -2537,14 +2519,14 @@ def _cmd_add_from_member_dir(
         manifest_dir=ws_root,
     )
 
-    proposed_ws = load_workspace_with_member_override(workspace, member_dir, proposed_member_manifest)
-    graph = resolve_workspace(proposed_ws, deps_dir, env_with_index, params)
-    lockfile_val = from_graph(graph, strategy=str(strategy))
-
-    # Atomic write: member manifest first, then shared workspace lock.
-    # NO member-local lock is written (D5 correctness point).
-    mutate_manifest_file(member_manifest_path, lambda _m: proposed_member_manifest)
-    write_lockfile(lockfile_val, ws_root / "milpa.lock")
+    try:
+        _graph, _wr = apply_member_manifest_change(
+            ws_root, env_with_index, params, member_dir, _mutate_add
+        )
+    except MilpaError as exc:
+        print(f"milpa add: {exc.message}", file=sys.stderr)
+        _emit_slug(exc.slug)
+        return 1
 
     print(f"added {dep_name} (git={git_url} ref={ref})", file=sys.stderr)
     return 0
@@ -2568,18 +2550,13 @@ def _cmd_remove_from_member_dir(
     spec/cli-contract.md §5.7 member-dir behavior.
     """
     from dataclasses import replace as _replace
-    from milpa.manifest import parse_manifest
-    from milpa.manifest_writer import mutate_manifest_file
+    from milpa.manifest import Manifest as _Manifest, parse_manifest
+    from milpa.manifest_writer import apply_member_manifest_change
     from milpa.workspace import LoadedWorkspace
 
     assert isinstance(workspace, LoadedWorkspace)
     ws_root = workspace.root_dir
     member_dir = member_dir.resolve()
-
-    # Parse the MEMBER's manifest.
-    member_manifest_path = member_dir / "milpa.kdl"
-    member_text = member_manifest_path.read_text(encoding="utf-8")
-    member_manifest = parse_manifest(member_text)
 
     # Alias→canonical resolution against the SHARED lockfile (not the member lock).
     shared_lock_path = ws_root / "milpa.lock"
@@ -2589,8 +2566,10 @@ def _cmd_remove_from_member_dir(
     else:
         canonical_name = dep_name
 
-    # Guard: dep must be declared in the MEMBER's milpa.kdl.
-    existing_names = {dep.name for dep in member_manifest.deps}
+    # Pre-flight: dep must be declared in the MEMBER's milpa.kdl.
+    member_manifest_path = member_dir / "milpa.kdl"
+    preflight_manifest = parse_manifest(member_manifest_path.read_text(encoding="utf-8"))
+    existing_names = {dep.name for dep in preflight_manifest.deps}
     if canonical_name not in existing_names:
         print(
             f"milpa remove: dep {dep_name!r} is not declared in milpa.kdl",
@@ -2599,13 +2578,12 @@ def _cmd_remove_from_member_dir(
         _emit_slug(MAN_REMOVE_DEP_ABSENT)
         return 1
 
-    # Build proposed member manifest without the dep.
-    new_deps = tuple(d for d in member_manifest.deps if d.name != canonical_name)
-    proposed_member_manifest = _replace(member_manifest, deps=new_deps)
+    def _mutate_remove(m: _Manifest) -> _Manifest:
+        new_deps = tuple(d for d in m.deps if d.name != canonical_name)
+        return _replace(m, deps=new_deps)
 
-    # Re-resolve the WHOLE workspace with the proposed member manifest.
+    # Re-resolve the WHOLE workspace via the SSOT orchestration primitive.
     env_with_index = _load_index_for_verb(env)
-    deps_dir = ws_root / "_deps"
     profile = Profile.from_environment()
     params = ResolveParams(
         strategy=strategy,
@@ -2615,14 +2593,14 @@ def _cmd_remove_from_member_dir(
         manifest_dir=ws_root,
     )
 
-    proposed_ws = load_workspace_with_member_override(workspace, member_dir, proposed_member_manifest)
-    graph = resolve_workspace(proposed_ws, deps_dir, env_with_index, params)
-    lockfile_val = from_graph(graph, strategy=str(strategy))
-
-    # Atomic write: member manifest first, then shared workspace lock.
-    # NO member-local lock is written (D5 correctness point).
-    mutate_manifest_file(member_manifest_path, lambda _m: proposed_member_manifest)
-    write_lockfile(lockfile_val, shared_lock_path)
+    try:
+        _graph, _wr = apply_member_manifest_change(
+            ws_root, env_with_index, params, member_dir, _mutate_remove
+        )
+    except MilpaError as exc:
+        print(f"milpa remove: {exc.message}", file=sys.stderr)
+        _emit_slug(exc.slug)
+        return 1
 
     print(f"removed {canonical_name}", file=sys.stderr)
     return 0
@@ -2661,7 +2639,6 @@ def cmd_workspace_add_member(
         parse_workspace_or_manifest,
     )
     from milpa.manifest_writer import apply_workspace_manifest_change
-    from milpa.workspace import load_workspace
 
     # Resolve the member path relative to the workspace root.
     member_abs = (root / member_path).resolve()
@@ -2716,28 +2693,10 @@ def cmd_workspace_add_member(
         _emit_slug("MAN-NAME-MISSING")
         return 1
 
-    new_member_name = member_doc.name
-
-    # Guard 4: name-unique among existing members.
-    # Load the workspace to check existing member names.
-    try:
-        current_ws = load_workspace(root)
-    except MilpaError as exc:
-        print(f"milpa workspace add-member: {exc.message}", file=sys.stderr)
-        _emit_slug(exc.slug)
-        return 1
-
-    for existing_member in current_ws.members:
-        if existing_member.manifest.name == new_member_name:
-            print(
-                f"milpa workspace add-member: a member named {new_member_name!r} "
-                "already exists in the workspace",
-                file=sys.stderr,
-            )
-            _emit_slug("WS-MEMBER-DUPLICATE-NAME")
-            return 1
-
     # Determine the member path to record in the manifest (relative to root).
+    # Duplicate-name detection is handled by load_workspace_from_manifest inside
+    # apply_workspace_manifest_change, which raises WS-MEMBER-DUPLICATE-NAME
+    # before any on-disk mutation occurs.
     # Use the canonical relative path (member_abs relative to root).
     try:
         rel_path = str(member_abs.relative_to(root.resolve()))
