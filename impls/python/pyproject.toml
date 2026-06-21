@@ -21,6 +21,17 @@ milpa = "milpa.cli:main"
 [project.urls]
 Homepage = "https://github.com/coreyleavitt/milpa"
 
+[tool.milpa]
+# Conformance declaration (rfc-conformance-parity §3.5 / spec §1.4 NORMATIVE).
+# Mirrors the Rust impl's [package.metadata.milpa] in
+# crates/milpa-conformance/Cargo.toml. spec-version is the epoch this impl
+# claims (the §3.4 multi-epoch filter); corpus names the fixture tree under
+# the repo-root conformance/. The Python impl's per-fixture known-failing set
+# is maintained in tests/test_conformance.py (_NOT_YET_WIRED_FIXTURE_NAMES)
+# and harness/descriptors.py rather than a standalone file.
+spec-version = "1.0"
+corpus = "spec-v1"
+
 [tool.hatch.metadata]
 allow-direct-references = true
 
