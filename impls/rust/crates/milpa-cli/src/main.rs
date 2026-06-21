@@ -19,7 +19,7 @@ use milpa_core::{
     fetch::{FetchError, FetcherRegistry}, format_nimcfg, format_workspace_nimcfgs, from_graph,
     load_index, load_lockfile, load_manifest, load_workspace, LoadedMember, LoadedWorkspace,
     make_dep_decl_store, mutate_manifest_file, parse_env_bool, parse_lockfile, parse_version,
-    resolve, resolve_with_cert, resolve_workspace_frozen,
+    resolve, resolve_with_cert, resolve_with_features, resolve_workspace_frozen,
     resolve_workspace_with_cert, resolve_workspace_with_features,
     verify_lockfile_against_deps, workspace_any_member_strict, write_lockfile, CaStore,
     CasAdmittingFetcher, CoreError, DefaultRegistry, FailureCert, FileDepDeclStore,
@@ -720,7 +720,11 @@ fn cmd_fetch(
             );
         }
 
-        resolve(
+        // S9: honor CLI feature-selection on the single-package path too (the
+        // workspace path already does via resolve_workspace_with_features). The
+        // bare resolve() ignored --features, so feature/profile fixtures passed
+        // in-process but diverged black-box (Slice F, fixture-209/210/211/...).
+        resolve_with_features(
             &manifest,
             index.as_ref(),
             registry.as_ref(),
@@ -731,6 +735,9 @@ fn cmd_fetch(
             dep_decl_store,
             require_attested_metadata,
             &build_store(),
+            &cli_features,
+            cli_no_default,
+            cli_all_features,
         )?
     };
 
