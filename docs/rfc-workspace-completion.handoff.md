@@ -26,15 +26,16 @@
   `load_workspace_from_manifest` symlinked-root test. Design `a024ea00a6dbff4f2`: deep-helper goal MET;
   confirmed mid-path dangling Medium (I verified empirically: Python follows mid-path dangling →
   PATH-ESCAPE, Rust → DIR-MISSING); 2 Lows (unwrap_or comment, redundant symlink_metadata syscall).
-- **R4 FOLLOW-UP IN FLIGHT** (agent `ae8798e10c0567be5`): one-line fix — ancestor-walk branch of
-  `best_effort_resolve` delegates to `best_effort_resolve(&ancestor)` instead of direct canonicalize,
-  closing the GENERAL single-hop dangling case (mid-path + final) and unifying the dual-mechanism.
-  +mid-path parity test both impls, +from_manifest Rust symlinked-root test (closes the Low), +unwrap_or
-  comment, +spec generalized (dangling anywhere, single-hop; multi-hop/cycles = #168). Terminates
-  (ancestor strictly shorter). After agent: verify+commit; run FINAL re-review R5 (Security+Design
-  +Correctness, scoped to the one-line diff) — should be clean → FLOOR → report Lows + STOP.
+- **R4 FOLLOW-UP COMMITTED** (`92440d3`): one-line fix — ancestor-walk branch of `best_effort_resolve`
+  delegates to `best_effort_resolve(&ancestor)`, closing the GENERAL single-hop dangling case (mid-path
+  + final) and unifying the dual-mechanism. +mid-path parity test both impls, +from_manifest Rust
+  symlinked-root test, +unwrap_or comment, +spec generalized. Py 2137, Rust 699 zero divergence, bijection 8.
+- **ROUND 5 final re-review IN FLIGHT** (Security `a2d974c1c81ef316c`, Correctness `a92748f33467d3e93`,
+  Design `aa8a8a633965b3981`) — scoped to `git show 92440d3` (the one-line recursion): stack-DoS from
+  deep member paths, new mid-path divergence, design unification. If clean → **FLOOR REACHED** →
+  report Lows + STOP. If C/H/M → one more iter.
 - **Commits this code-review (Stage 4):** R1 `d4f5024`,`5d536d5`,`c051bd4`,`5004632`,`c6e174b`,`bd9d3e7`,
-  `3803418` · R2 `0237166`,`8cd9ca6` · R3 `e40c99d` · R4-followup (pending). Issues filed: #167, #168.
+  `3803418` · R2 `0237166`,`8cd9ca6` · R3 `e40c99d` · R4 `92440d3`. Issues filed: #167, #168.
 - **Remaining Lows to report at floor:** F22–F29 (R1 deferred), R2 L1–L3 (fixpoint-param/atomically-
   comment/strip_dep_pin-docstring), R4 Lows (unwrap_or comment [being added], redundant syscall in
   ancestor-walk loop start). Mandate = "fix through Medium, leave Lows."
