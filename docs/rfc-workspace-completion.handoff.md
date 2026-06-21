@@ -85,8 +85,20 @@ asymmetries broken today (round 2 added the eighth: member-dir add/remove/update
   11 Python unit tests + Rust CLI functions; Python 2102 pass; Rust 398+ unit pass + corpus
   zero divergence; black-box harness PASS on both impls (fixtures 265–272 all green) —
   `feat(cli): milpa workspace add-member/remove-member verbs (closes #81)`
-- [ ] S11a, S11b, S11c, S11d, S11e, S12 (remaining)
-- **Progress: 13/19 done, 6 remaining.** All gates green each slice (Python 2102 pass; Rust
+- [x] **S11a** ws-root `add`/`remove` → canonical `MAN-MUTATE-WORKSPACE-REFUSED` slug (both impls);
+  spec §5.6 + §5.7 normative notes; fixtures 273–274 (error, CliOnly, harness PASS both impls);
+  Python 2102 pass; Rust corpus zero divergence — `713278c`
+- [x] **S11b** Python `cmd_update` workspace re-resolve parity + `cmd_verify` frozen-flags check
+  (Breadth-P2c); Rust `cmd_verify` workspace frozen-flags check; both in-process runners updated;
+  spec §5.4 + §5.8 normative notes; fixtures 275–276 (CliOnly update + verify frozen-flags);
+  Python 2103 pass; Rust corpus zero divergence — `d39a0b3`
+- [x] **S11c** Rust `clean` per-member nim.cfg in workspace mode (Python already correct);
+  `cmd_clean` calls `load_workspace` → removes `<ws.root>/_deps/` + each member nim.cfg;
+  `clean` → Cmd::CliOnly in fixture.rs; `_assert_clean_fixture` in harness/assertions.py;
+  fixture-277 (two-member workspace, pre-seeded nim.cfg); Python 2103 pass; Rust corpus zero
+  divergence; harness PASS both impls — `a9ab0d1`
+- [ ] S11d, S11e, S12 (remaining)
+- **Progress: 16/19 done, 3 remaining.** All gates green each slice (Python 2103 pass; Rust
   corpus zero divergence).
 
 ## Forks — ALL RESOLVED (no open decisions)
