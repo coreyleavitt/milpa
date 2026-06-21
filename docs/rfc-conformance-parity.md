@@ -3,7 +3,7 @@
 Status: **design draft** — architect round 1 applied (2026-06-21). Was a triage
 stub; round 1 gave it a spine (the parity invariant), corrected three misdiagnosed
 issues, removed two that don't belong, and split finite cleanup from standing
-discipline. One scope fork remains open (see §8).
+discipline. Scope resolved to option (a) — one RFC, two phases (§8).
 Umbrella: #169. Milestone: *v1.5 — spec extraction + cross-impl hardening*.
 
 ## 1  The invariant
@@ -207,10 +207,10 @@ construction. Mitigations this RFC adopts:
   previously-unreachable code observable); whoever changes it must add the
   now-reachable fixture.
 
-## 8  Open fork (awaiting Corey)
+## 8  Scope decision (resolved 2026-06-21 → option a)
 
 **Scope boundary vs `rfc-differential-conformance-harness.md`.** With #124 moved out,
-the remaining work cleanly bifurcates. Three framings:
+the remaining work cleanly bifurcates. Three framings were weighed:
 - **(a) one RFC, two phases (recommended):** Phase 1 baseline restoration + Phase 2
   coverage discipline live here; generation is a declared dependency on the
   differential-harness RFC. Keeps the parity *discipline* in one place.
@@ -221,5 +221,7 @@ the remaining work cleanly bifurcates. Three framings:
 - **(c) three-way split** by kind (bug-fix / widening / spec-amendment). Maximal
   separation; likely over-fragmented.
 
-Recommendation: **(a)**. The bug fixes are the motivating examples of the discipline
-the RFC defines, and keeping them together preserves a single coherent done-state.
+**Decision: (a)** — one RFC, two phases. The bug fixes are the motivating examples of
+the discipline the RFC defines, and keeping them together preserves a single coherent
+done-state. Generation remains owned by the differential-harness RFC and is a declared
+dependency of Phase 2.
