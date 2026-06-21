@@ -111,16 +111,9 @@ const CLI_DISCOVERY_GUARD: &[&str] = &[
     "fixture-156-frozen-no-lockfile",
     // LOCK-FILE-NOT-FOUND via show: cmd:show is CliOnly but listed for completeness.
     "fixture-157-lock-file-not-found",
-    // WS-MEMBER-PATH-ESCAPE (symlink case): workspace root is a *subdirectory*
-    // of the fixture tree (project-dir=workspace-root control file).  The
-    // black-box CLI harness IS project-dir-aware and drives this fixture correctly
-    // (both impls pass, zero divergence — fixture-288 removed from harness/corpus.py
-    // KNOWN_LIMITATIONS).  The in-process runner always reads milpa.kdl from
-    // fx.dir directly and gets E2E-MANIFEST-UNREADABLE, so it stays in this guard.
-    // Symlink escape behavior is also covered by impl-internal unit tests in both impls
-    // (workspace_tests::member_symlink_escaping_root_yields_path_escape and
-    // workspace_tests::dangling_symlink_outside_root_yields_path_escape).
-    "fixture-288-ws-member-symlink-escape",
+    // (fixture-288 un-parked: the runner is now project-dir-aware (§2.8.1), so it
+    // reads milpa.kdl + loads the workspace from <fixture>/workspace-root and
+    // raises WS-MEMBER-PATH-ESCAPE like the CLI — rfc-conformance-parity Slice 3.)
 ];
 
 /// Run one fixture against `target` in `scratch` and return the verdict.
@@ -446,7 +439,13 @@ impl Target for MilpaTarget {
             // outputs), so success fixtures stay parked until S9; resolve-time
             // error fixtures (TNG-*/RES-*/SOLVE-*) green here.
             Cmd::Resolve => {
-                let text = std::fs::read_to_string(fx.dir.join("milpa.kdl"))
+                // §2.8.1: project-dir selects the project root (the -C dir). All
+                // other control inputs (mocked-fetches/, index.kdl, cas-seed/,
+                // dep-decl/, expected/) stay rooted at fx.dir; only the
+                // manifest/workspace load uses project_root. Mirrors the black-box
+                // harness and the Python adapter.
+                let project_root = fixture_project_root(fx);
+                let text = std::fs::read_to_string(project_root.join("milpa.kdl"))
                     .map_err(|e| format!("E2E-MANIFEST-UNREADABLE: {e}"))?;
                 // Optional tianguis index for named-dep resolution. The parser
                 // surfaces TNG-* trust-boundary errors (schema/unsafe/bad-*).
@@ -483,7 +482,7 @@ impl Target for MilpaTarget {
                     // Workspace: load (WS-* topology) → multi-member union resolve
                     // (RES-WS-*) → shared milpa.lock + per-member nim.cfg.
                     Ok(ManifestDoc::Workspace(_)) => {
-                        let loaded = match milpa_core::load_workspace(&fx.dir) {
+                        let loaded = match milpa_core::load_workspace(&project_root) {
                             Ok(w) => w,
                             Err(e) => return Err(e.code().to_string()),
                         };
@@ -999,6 +998,16 @@ fn fixture_require_attested_metadata(dir: &Path) -> bool {
     env.get("MILPA_REQUIRE_ATTESTED_METADATA")
         .map(|v| parse_env_bool(v))
         .unwrap_or(false)
+}
+
+/// §2.8.1: resolve the fixture's project root. When a `project-dir` control file
+/// is present, the root is `<fixture>/<trimmed contents>`; otherwise it is the
+/// fixture dir itself. Mirrors the black-box harness and the Python adapter.
+fn fixture_project_root(fx: &Fixture) -> PathBuf {
+    match std::fs::read_to_string(fx.dir.join("project-dir")) {
+        Ok(s) if !s.trim().is_empty() => fx.dir.join(s.trim()),
+        _ => fx.dir.clone(),
+    }
 }
 
 /// S9 (RFC #23 §3.4): read `MILPA_CLI_FEATURES` from the fixture's `env` file.

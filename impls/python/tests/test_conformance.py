@@ -125,16 +125,9 @@ _CLI_DISCOVERY_GUARD_NAMES: frozenset[str] = frozenset({
     # FROZEN-NO-LOCKFILE: cmd:frozen but no milpa.lock; CLI guard checks existence
     # before calling resolve_frozen; the in-process adapter returns E2E-LOCKFILE-UNREADABLE.
     "fixture-156-frozen-no-lockfile",
-    # WS-MEMBER-PATH-ESCAPE (symlink case): fixture uses project-dir=workspace-root
-    # so the workspace root is a subdirectory of the fixture tree.  The black-box
-    # CLI harness IS project-dir-aware and drives this fixture correctly (both
-    # impls pass, zero divergence — fixture-288 removed from harness/corpus.py
-    # KNOWN_LIMITATIONS).  The in-process adapter always reads milpa.kdl from
-    # fixture_dir directly and gets E2E-MANIFEST-UNREADABLE (no milpa.kdl at the
-    # fixture root), so it stays in this guard.  The symlink escape behavior is
-    # also covered by impl-internal unit tests in both impls
-    # (test_ws_security_parity.py + workspace_tests.rs).
-    "fixture-288-ws-member-symlink-escape",
+    # (fixture-288 un-parked: the adapter is now project-dir-aware (§2.8.1), so it
+    # loads the workspace from <fixture>/workspace-root and raises
+    # WS-MEMBER-PATH-ESCAPE like the CLI — rfc-conformance-parity Slice 3.)
 })
 
 
@@ -549,6 +542,16 @@ def _execute_fixture(
     from milpa.workspace import load_workspace
 
     fixture_dir = fixture.dir
+    # §2.8.1: project-dir selects the project root (the dir passed as -C). All
+    # other control inputs (mocked-fetches/, index.kdl, cas-seed/, dep-decl/,
+    # expected/) stay rooted at fixture_dir; only the manifest/workspace load
+    # uses project_root. Mirrors the black-box harness (runner.py).
+    _pd_file = fixture_dir / "project-dir"
+    project_root = (
+        fixture_dir / _pd_file.read_text(encoding="utf-8").strip()
+        if _pd_file.is_file()
+        else fixture_dir
+    )
     deps_dir = tmp_dir / "_deps"
     deps_dir.mkdir(parents=True, exist_ok=True)
 
@@ -696,7 +699,7 @@ def _execute_fixture(
     # ------------------------------------------------------------------
     # resolve / frozen: read milpa.kdl + dispatch
     # ------------------------------------------------------------------
-    kdl_path = fixture_dir / "milpa.kdl"
+    kdl_path = project_root / "milpa.kdl"
     try:
         kdl_text = kdl_path.read_text(encoding="utf-8")
     except OSError as e:
@@ -815,7 +818,7 @@ def _execute_fixture(
     try:
         if isinstance(doc, WorkspaceManifest):
             try:
-                loaded_ws = load_workspace(fixture_dir)
+                loaded_ws = load_workspace(project_root)
             except MilpaError as e:
                 if fixture.expected_error is not None and e.slug == fixture.expected_error:
                     return ("pass", "")

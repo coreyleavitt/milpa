@@ -133,6 +133,7 @@ fixture-NNN-<slug>/
   index.kdl                    # input (optional): frozen tianguis index snapshot
   cmd                          # input (optional): entry-point selector (see §2.7)
   env                          # input (optional): MILPA_TARGET_* overrides (see §2.8)
+  project-dir                  # input (optional): project-root subpath (see §2.8.1)
   milpa.lock                   # input (optional): lockfile for parse-lockfile / frozen cmds
   cas-seed/                    # input (optional): source trees to pre-populate CAS (frozen cmd)
     <name>/                    # one subdirectory per dep to seed
@@ -643,6 +644,31 @@ the CAS-admission and symlink-creation steps defined in `spec/identity.md`
 > `expected/nim.cfg`, proving the predicate filter is applied before the fetch
 > phase (the dep is never fetched and no `mocked-fetches/` entry is required
 > for it). See fixture-115-conditional-dep-excluded for the canonical example.
+
+### 2.8.1  `project-dir` — project-root subpath (optional)
+
+> NORMATIVE: If present, `project-dir` MUST be a plain text file whose single
+> trimmed line names a path **relative to the fixture root**. The runner MUST use
+> `<fixture-root>/<project-dir>` as the project root for the run — i.e. the
+> directory it passes to the implementation as `-C <dir>` (`spec/cli-contract.md`
+> §2.1). When `project-dir` is absent, the project root is the fixture root
+> itself. This lets a fixture place the project under a subdirectory of the
+> fixture tree — required when the manifest or workspace root must be nested (for
+> example, to test member-relative invocation, or a containment/symlink-escape
+> case where the fixture root must sit *above* the workspace root).
+
+> NORMATIVE: `project-dir` selects only the project root; all other control
+> inputs (`mocked-fetches/`, `index.kdl`, `cas-seed/`, `dep-decl/`, `env`) and
+> the `expected/` tree remain rooted at the fixture root. Every runner — the
+> black-box CLI harness **and** each in-process adapter — MUST honor
+> `project-dir` identically; an adapter that ignores it would resolve a different
+> project root than the CLI and so produce a different normative output for the
+> same fixture (the cross-runner consistency rule, §1).
+
+> NOTE: Canonical examples — fixture-278/279/280 (`project-dir=member-a`, member
+> -directory `add`/`remove`/`update`) and fixture-288 (`project-dir=workspace-root`,
+> a member-symlink-escape case where the fixture root must be the parent of the
+> workspace root).
 
 ### 2.9  `milpa.lock` — lockfile input (required for `parse-lockfile` and `frozen`)
 
