@@ -554,6 +554,18 @@ stdout. Does not resolve or fetch.
 
 **stderr:** diagnostic on failure only.
 
+> NOTE (workspace behavior — current, pending #165): `show` does **not**
+> perform workspace detection. At a **workspace root**, `show` reads the
+> shared `milpa.lock` from that directory and prints a flat shared-graph
+> dump with no member attribution (the lockfile contains the entire
+> resolved graph as a flat dep list). From a **workspace member directory**
+> that has no member-local lockfile (the shared lock lives at the workspace
+> root, not inside the member), `show` raises `LOCK-FILE-NOT-FOUND` because
+> no `milpa.lock` exists at the `-C` directory. To show the shared graph
+> from a member dir, use `milpa -C <workspace-root> show`. Member-scoped
+> output (attributing each dep to its originating member) is tracked as a
+> future enhancement in issue #165.
+
 ### 5.4  `verify`
 
 **Purpose:** Recheck every dep in `_deps/` against `milpa.lock` using
