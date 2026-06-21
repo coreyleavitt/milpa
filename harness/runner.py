@@ -188,6 +188,50 @@ def _extract_slug(stderr: str) -> tuple[Optional[str], Optional[str]]:
 # _add_feature_args is applied to fetch/lock/update).
 _FEATURE_VERBS = frozenset({"fetch", "lock", "update"})
 
+# Pairs each `dep "<name>"` with the first identity in its block. Non-greedy so a
+# dep binds to ITS own identity (identity is the first field in each dep block).
+_DEP_IDENTITY_RE = re.compile(
+    r'dep "([^"]+)"\s*\{.*?identity "(sha256:[0-9a-f]{64})"',
+    re.DOTALL,
+)
+
+
+def _parse_lock_identities(lock_text: str) -> dict[str, str]:
+    """Map each lockfile dep name to its recorded content identity."""
+    return {m.group(1): m.group(2) for m in _DEP_IDENTITY_RE.finditer(lock_text)}
+
+
+def _seed_cas_from_lock(scratch: Path, cas_dir: Path) -> None:
+    """Seed the CAS for frozen fixtures, impl-neutrally (Slice C c3).
+
+    Frozen fixtures ship a ``cas-seed/<name>/`` tree whose content the frozen
+    path expects to find already in the store. The in-process adapter admits it
+    via the impl's content-hash function; the black-box harness must not
+    re-implement that algorithm (SSOT). Instead it places each seed tree at the
+    spec-normative layout path ``<root>/sha256/<hex>/`` (spec/identity.md §3),
+    using the identity the fixture's own ``milpa.lock`` records for that dep name.
+    This is faithful: a correctly-authored fixture's seed tree hashes to exactly
+    the recorded identity (verified for the corpus). No-op when ``cas-seed/`` or
+    ``milpa.lock`` is absent, or a seed name has no lock identity.
+    """
+    seed_root = scratch / "cas-seed"
+    lock = scratch / "milpa.lock"
+    if not seed_root.is_dir() or not lock.exists():
+        return
+    name_to_identity = _parse_lock_identities(lock.read_text())
+    for child in sorted(seed_root.iterdir()):
+        if not child.is_dir():
+            continue
+        identity = name_to_identity.get(child.name)
+        if not identity:
+            continue
+        hex_digest = identity.split(":", 1)[1]
+        dest = cas_dir / "sha256" / hex_digest
+        if dest.exists():
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(child, dest)
+
 
 def _feature_argv(fixture_env: dict[str, str]) -> list[str]:
     """Translate the MILPA_CLI_FEATURES family into verb-level CLI flags.
@@ -375,6 +419,12 @@ def run_fixture(
         _copy_fixture_inputs(fixture_dir, scratch)
 
         env = _build_env(scratch, cas_dir, fixture_env, descriptor.env)
+
+        # Slice C c3: seed the CAS from cas-seed/ (frozen fixtures) before the run.
+        # Verify fixtures warm the CAS via their own pre-fetch below, so an
+        # explicit seed would mask the supply-chain mismatch they test for.
+        if cmd != "verify":
+            _seed_cas_from_lock(scratch, cas_dir)
 
         # For "verify" fixtures: run a regular (non-frozen) fetch first to
         # populate _deps/ and warm the CAS, then restore the pre-authored
