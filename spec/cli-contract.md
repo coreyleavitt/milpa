@@ -811,6 +811,67 @@ self-src-dir `--path:` line (not header-only).
 
 ---
 
+### 5.10  `workspace add-member` / `workspace remove-member` (D4)
+
+Two grouped verbs under the `workspace` subcommand that mutate the workspace
+manifest's `member` list. Both follow the same validate→resolve-in-memory→
+write-manifest→write-lock atomicity contract as `add` and `remove` (§5.6/§5.7):
+the workspace manifest and lockfile are only written on a successful in-memory
+resolution of the modified workspace. On any failure both files are left
+unmodified.
+
+#### `milpa workspace add-member <path>`
+
+Adds a workspace member at `<path>` (relative to the workspace root supplied
+by `-C`).
+
+**Validation rules (in order; checked before any mutation):**
+
+1. `<path>` must be an existing directory → `WS-MEMBER-DIR-MISSING`
+2. `<path>/milpa.kdl` must exist → `WS-MEMBER-NO-MANIFEST`
+3. `<path>/milpa.kdl` must be a **package** manifest (not a workspace manifest)
+   → `WS-MEMBER-IS-WORKSPACE`
+4. The package manifest must declare a `name` → `MAN-NAME-MISSING`
+5. No existing workspace member may share that name → `WS-MEMBER-DUPLICATE-NAME`
+
+On success: the member's relative path is appended to the `workspace { member …
+}` block; the workspace is re-resolved in memory; `milpa.kdl` (updated member
+list) and `milpa.lock` are written atomically. Exit 0. Diagnostic: `added
+member "<name>"` to stderr.
+
+#### `milpa workspace remove-member <name|path>`
+
+Removes a workspace member identified by its declared package name, relative
+path, or absolute path.
+
+**Validation rules (in order; checked before any mutation):**
+
+1. `<name|path>` must match a declared member → `WS-REMOVE-MEMBER-NOT-FOUND`
+2. The workspace root's `overrides {}` block must contain no `pkg { member
+   "<name>" }` rule targeting the member being removed →
+   `WS-REMOVE-MEMBER-TARGET-EXISTS`
+3. No remaining workspace member's `deps` or `dev_deps` may carry a `member
+   "<name>"` edge pointing at the member being removed →
+   `WS-REMOVE-MEMBER-REFERENCED`
+
+On success: the member's entry is removed from the `workspace { member … }`
+block; the workspace is re-resolved in memory; `milpa.kdl` (updated member
+list) and `milpa.lock` are written atomically. Exit 0. Diagnostic: `removed
+member "<name>"` to stderr.
+
+> NORMATIVE (D4): Both verbs MUST be grouped under the `workspace`
+> subcommand — i.e. invoked as `milpa workspace add-member` / `milpa workspace
+> remove-member`, not as top-level verbs. A conformant implementation MUST
+> route the verb `workspace` to the subcommand dispatcher; an unrecognised
+> sub-verb under `workspace` exits 2.
+
+> NOTE: These verbs are `cmd=workspace` fixtures in the conformance corpus
+> (`fixture-265` through `fixture-272`). They are `CliOnly` from the
+> in-process conformance runner's perspective (no library entry point), driven
+> exclusively by the black-box harness.
+
+---
+
 ## 6  `--frozen` flag/exit semantics (normative)
 
 This section specifies the CLI-level semantics of `--frozen`. The

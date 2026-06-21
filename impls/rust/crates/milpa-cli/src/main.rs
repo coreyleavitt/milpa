@@ -13,10 +13,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use milpa_core::{
-    add_mirror, build_flag_defines, check_frozen_active_flags_mismatch,
+    add_mirror, apply_workspace_manifest_change, build_flag_defines, check_frozen_active_flags_mismatch,
     dep_decl_store::DepDeclStore, discover_manifest, effective_strict_policy,
     fetch::{FetchError, FetcherRegistry}, format_nimcfg, format_workspace_nimcfgs, from_graph,
-    load_index, load_lockfile, load_manifest, load_workspace, LoadedWorkspace,
+    load_index, load_lockfile, load_manifest, load_workspace, LoadedMember, LoadedWorkspace,
     make_dep_decl_store, mutate_manifest_file, parse_env_bool, parse_lockfile, parse_version,
     resolve, resolve_with_cert, resolve_workspace_frozen,
     resolve_workspace_with_cert, resolve_workspace_with_features,
@@ -25,7 +25,7 @@ use milpa_core::{
     FrozenResolver, Index, ManifestDoc, Milpa, MilpaError, MockedFetcher, Profile, Resolver,
     Strategy, SuccessCert, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS,
 };
-use milpa_manifest::{valid_flag_name, Dep, FlagRequest, Manifest, UrlDep};
+use milpa_manifest::{valid_flag_name, Dep, FlagRequest, Manifest, OverrideTarget, UrlDep, Workspace};
 
 const VERSION: &str = "0.1.0";
 
@@ -120,6 +120,7 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
         "add" => cmd_add(dir, &cli.rest, cli.no_index),
         "remove" => cmd_remove(dir, &cli.rest, cli.no_index),
         "store" => cmd_store(&cli.rest),
+        "workspace" => cmd_workspace(dir, &cli.rest, cli.strategy, cli.no_index),
         other => {
             // Gap-1 §3: unknown verb is a usage error → exit 2 (no milpa-error: line).
             eprintln!("milpa: unknown command {other:?}\n{USAGE}");
@@ -1077,6 +1078,274 @@ fn cmd_add(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaErro
     })?;
     write_lockfile(&from_graph(&graph, "maxver"), &dir.join("milpa.lock"))?;
     eprintln!("added dep");
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// cmd_workspace — workspace add-member / remove-member (S10, D4)
+// ---------------------------------------------------------------------------
+
+/// `milpa workspace add-member <path>` / `milpa workspace remove-member <name|path>`
+///
+/// S10 (RFC: workspace-completion §3.F / D4): grouped under a `workspace`
+/// subcommand.  Both verbs delegate to `apply_workspace_manifest_change` for
+/// the validate→resolve-in-memory→write-manifest→write-lock atomicity ordering.
+///
+/// Validation rules (before any on-disk mutation):
+///   `add-member <path>`:
+///     - dir must exist          → `WS-MEMBER-DIR-MISSING`
+///     - dir must contain milpa.kdl → `WS-MEMBER-NO-MANIFEST`
+///     - milpa.kdl must have a `name` → `MAN-NAME-MISSING`
+///     - member must not be a workspace → `WS-MEMBER-IS-WORKSPACE`
+///     - name-unique among existing members → `WS-MEMBER-DUPLICATE-NAME`
+///   `remove-member <name|path>`:
+///     - name/path must match a declared member → `WS-REMOVE-MEMBER-NOT-FOUND`
+///     - no dangling root MemberTarget override → `WS-REMOVE-MEMBER-TARGET-EXISTS`
+///     - no dangling member-edge in other members' deps/dev_deps → `WS-REMOVE-MEMBER-REFERENCED`
+fn cmd_workspace(
+    dir: &Path,
+    rest: &[String],
+    strategy: Strategy,
+    no_index: bool,
+) -> Result<i32, MilpaError> {
+    let sub = rest.first().map(|s| s.as_str());
+    match sub {
+        Some("add-member") => cmd_workspace_add_member(dir, &rest[1..], strategy, no_index),
+        Some("remove-member") => cmd_workspace_remove_member(dir, &rest[1..], strategy, no_index),
+        _ => {
+            eprintln!("workspace: usage: milpa workspace <add-member|remove-member> [args]");
+            Ok(2)
+        }
+    }
+}
+
+fn cmd_workspace_add_member(
+    dir: &Path,
+    rest: &[String],
+    strategy: Strategy,
+    no_index: bool,
+) -> Result<i32, MilpaError> {
+    let Some(member_path_str) = rest.first() else {
+        eprintln!("workspace add-member: usage: milpa workspace add-member <path>");
+        return Ok(2);
+    };
+
+    let member_abs = dir.join(member_path_str).canonicalize().unwrap_or_else(|_| dir.join(member_path_str));
+
+    // Guard 1: directory must exist.
+    if !member_abs.is_dir() {
+        eprintln!(
+            "workspace add-member: {:?}: directory does not exist",
+            member_path_str
+        );
+        eprintln!("milpa-error: WS-MEMBER-DIR-MISSING");
+        return Ok(1);
+    }
+
+    // Guard 2: must contain milpa.kdl.
+    let kdl_path = member_abs.join("milpa.kdl");
+    if !kdl_path.exists() {
+        eprintln!(
+            "workspace add-member: {:?}: no milpa.kdl found",
+            member_path_str
+        );
+        eprintln!("milpa-error: WS-MEMBER-NO-MANIFEST");
+        return Ok(1);
+    }
+
+    // Guard 3: parse member manifest; check name + no-nesting.
+    let member_text = std::fs::read_to_string(&kdl_path).map_err(|e| {
+        MilpaError::Manifest(milpa_manifest::ManifestError::new(
+            "MAN-FILE-UNREADABLE",
+            format!("cannot read {}: {}", kdl_path.display(), e),
+        ))
+    })?;
+    let member_doc = milpa_manifest::parse_document(&member_text)?;
+    let member_manifest = match member_doc {
+        ManifestDoc::Workspace(_) => {
+            eprintln!(
+                "workspace add-member: {:?} is itself a workspace; nested workspaces are not supported",
+                member_path_str
+            );
+            eprintln!("milpa-error: WS-MEMBER-IS-WORKSPACE");
+            return Ok(1);
+        }
+        ManifestDoc::Package(m) => m,
+    };
+    let new_member_name = match &member_manifest.name {
+        None => {
+            return Err(MilpaError::Manifest(milpa_manifest::ManifestError::new(
+                "MAN-NAME-MISSING",
+                format!(
+                    "{}: milpa.kdl has no name — add a `name \"...\"` declaration",
+                    member_path_str
+                ),
+            )));
+        }
+        Some(n) => n.clone(),
+    };
+
+    // Guard 4: name-unique among existing members.
+    let current_ws = load_workspace(dir)?;
+    for existing_member in &current_ws.members {
+        if existing_member.name == new_member_name {
+            return Err(MilpaError::Core(CoreError::Workspace(
+                "WS-MEMBER-DUPLICATE-NAME",
+                format!("a member named {:?} already exists in the workspace", new_member_name),
+            )));
+        }
+    }
+
+    // Determine the member path to record: relative to the workspace root.
+    let rel_path = if let Ok(canonical_dir) = dir.canonicalize() {
+        if let Ok(rel) = member_abs.strip_prefix(&canonical_dir) {
+            rel.to_string_lossy().to_string()
+        } else {
+            member_path_str.to_string()
+        }
+    } else {
+        member_path_str.to_string()
+    };
+
+    // Delegate to apply_workspace_manifest_change.
+    let registry = build_registry();
+    let index = maybe_index(no_index)?;
+    let profile = profile_from_env();
+    let _rel_path = rel_path.clone();
+    apply_workspace_manifest_change(
+        dir,
+        index.as_ref(),
+        registry.as_ref(),
+        profile.as_ref(),
+        None,
+        strategy,
+        &build_store(),
+        false,
+        move |mut ws: Workspace| {
+            ws.members.push(_rel_path.clone());
+            ws
+        },
+    )?;
+
+    eprintln!("added member {:?}", rel_path);
+    Ok(0)
+}
+
+fn cmd_workspace_remove_member(
+    dir: &Path,
+    rest: &[String],
+    strategy: Strategy,
+    no_index: bool,
+) -> Result<i32, MilpaError> {
+    let Some(name_or_path) = rest.first() else {
+        eprintln!("workspace remove-member: usage: milpa workspace remove-member <name|path>");
+        return Ok(2);
+    };
+
+    // Load the current workspace (validates topology; raises WS-* on errors).
+    let current_ws = load_workspace(dir)?;
+    let ws_doc_text = std::fs::read_to_string(dir.join("milpa.kdl")).map_err(|_| {
+        MilpaError::Core(CoreError::Workspace(
+            "WS-NO-MANIFEST",
+            format!("no milpa.kdl at {}", dir.display()),
+        ))
+    })?;
+    let parsed_ws = match milpa_manifest::parse_document(&ws_doc_text)? {
+        ManifestDoc::Workspace(w) => w,
+        ManifestDoc::Package(_) => {
+            return Err(MilpaError::Core(CoreError::Workspace(
+                "WS-NOT-A-WORKSPACE",
+                "not a workspace manifest".into(),
+            )));
+        }
+    };
+
+    // Resolve name_or_path to a matched member.
+    let matched: Option<&LoadedMember> = current_ws.members.iter().find(|m| {
+        m.name == *name_or_path
+            || m.path == *name_or_path
+            || m.directory.to_string_lossy() == name_or_path.as_str()
+    });
+
+    // Guard 1: member must exist.
+    let matched = match matched {
+        None => {
+            eprintln!(
+                "workspace remove-member: {:?} is not a member of this workspace",
+                name_or_path
+            );
+            eprintln!("milpa-error: WS-REMOVE-MEMBER-NOT-FOUND");
+            return Ok(1);
+        }
+        Some(m) => m,
+    };
+    let matched_path = matched.path.clone();
+    let matched_name = matched.name.clone();
+
+    // Guard 2 (class-1): check for dangling root MemberTarget overrides.
+    for ov in &parsed_ws.overrides {
+        if let OverrideTarget::Member { member_name } = &ov.target {
+            if *member_name == matched_name {
+                eprintln!(
+                    "workspace remove-member: cannot remove member {:?}: \
+                    the workspace root's overrides block has a MemberTarget entry for {:?} \
+                    (pkg {:?} → member {:?}); remove or update the override first",
+                    matched_name, matched_name, ov.name, matched_name
+                );
+                eprintln!("milpa-error: WS-REMOVE-MEMBER-TARGET-EXISTS");
+                return Ok(1);
+            }
+        }
+    }
+
+    // Guard 3 (class-2): check for dangling member-edges in other members'
+    // deps AND dev_deps.
+    let mut referencing: Vec<String> = Vec::new();
+    for m in &current_ws.members {
+        if m.path == matched_path {
+            continue;
+        }
+        let has_ref = m.manifest.deps.iter().chain(m.manifest.dev_deps.iter()).any(|dep| {
+            matches!(dep, Dep::Member(d) if d.name == matched_name)
+        });
+        if has_ref {
+            referencing.push(if m.name.is_empty() { m.path.clone() } else { m.name.clone() });
+        }
+    }
+    if !referencing.is_empty() {
+        referencing.sort();
+        let refs_str: Vec<_> = referencing.iter().map(|r| format!("{:?}", r)).collect();
+        eprintln!(
+            "workspace remove-member: cannot remove member {:?}: \
+            it is referenced by member-dep edges in: {}; remove those deps first",
+            matched_name,
+            refs_str.join(", ")
+        );
+        eprintln!("milpa-error: WS-REMOVE-MEMBER-REFERENCED");
+        return Ok(1);
+    }
+
+    // Delegate to apply_workspace_manifest_change.
+    let registry = build_registry();
+    let index = maybe_index(no_index)?;
+    let profile = profile_from_env();
+    let _matched_path = matched_path.clone();
+    apply_workspace_manifest_change(
+        dir,
+        index.as_ref(),
+        registry.as_ref(),
+        profile.as_ref(),
+        None,
+        strategy,
+        &build_store(),
+        false,
+        move |mut ws: Workspace| {
+            ws.members.retain(|p| p != &_matched_path);
+            ws
+        },
+    )?;
+
+    eprintln!("removed member {:?}", matched_name);
     Ok(0)
 }
 

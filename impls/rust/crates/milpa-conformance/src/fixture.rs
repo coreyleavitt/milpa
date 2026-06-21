@@ -54,8 +54,9 @@ impl Cmd {
                     "resolve" | "" => Cmd::Resolve,
                     // Mutation (§2.7.1) + liveness (§2.7.2) selectors: CLI-only.
                     // check-certificate (§2.7.3): also CLI-only (--certificate flag).
+                    // workspace (S10 D4): add-member/remove-member are CLI-only.
                     "add" | "remove" | "update" | "show" | "--version"
-                    | "check-certificate" => Cmd::CliOnly,
+                    | "check-certificate" | "workspace" => Cmd::CliOnly,
                     // Unknown selector defaults to resolve (back-compat).
                     _ => Cmd::Resolve,
                 }

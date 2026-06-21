@@ -104,7 +104,7 @@ _CORPUS_ROOT = _REPO_ROOT / "conformance"
 # ---------------------------------------------------------------------------
 
 # CLI-only verb selectors: handled exclusively by the black-box CLI harness.
-_CLI_ONLY_VERBS = frozenset({"add", "remove", "update", "show", "--version"})
+_CLI_ONLY_VERBS = frozenset({"add", "remove", "update", "show", "--version", "workspace"})
 
 # CLI-level filesystem-discovery guard fixtures: these error codes are raised by
 # the CLI's file-discovery layer (load_or_discover_manifest, frozen lockfile guard)

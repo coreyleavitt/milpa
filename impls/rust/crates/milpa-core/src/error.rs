@@ -194,6 +194,12 @@ impl CoreError {
             "WS-MEMBER-IS-WORKSPACE",
             "WS-MEMBER-HAS-OVERRIDES",
             "WS-MEMBER-DUPLICATE-NAME",
+            // S10 (workspace-completion §3.F): workspace add-member/remove-member
+            // refusal slugs.  Raised by the CLI mutation path (not by the workspace
+            // loader or resolver — those are topology errors above).
+            "WS-REMOVE-MEMBER-NOT-FOUND",
+            "WS-REMOVE-MEMBER-TARGET-EXISTS",
+            "WS-REMOVE-MEMBER-REFERENCED",
             // frozen fast-path precondition failures (Gap-1 / S1c). These are
             // the two missing-precondition codes: no lockfile and no CAS.
             "FROZEN-NO-LOCKFILE",

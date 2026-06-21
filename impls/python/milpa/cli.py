@@ -83,7 +83,7 @@ from milpa.profile import Profile
 from milpa.resolver import resolve, resolve_workspace
 from milpa.solver import SolverError, SolveSuccess, certificate_to_json
 from milpa.version import Strategy
-from milpa.workspace import find_workspace_root, load_or_discover_manifest
+from milpa.workspace import find_workspace_root, load_or_discover_manifest, load_workspace
 
 # ---------------------------------------------------------------------------
 # R1–R4 error channel
@@ -308,6 +308,33 @@ def _make_parser() -> argparse.ArgumentParser:
     )
     sp_update.add_argument("dep_name", metavar="<dep>", nargs="?", default=None)
     _add_feature_args(sp_update)
+
+    # workspace — workspace management subcommands (S10, D4)
+    sp_workspace = subparsers.add_parser(
+        "workspace",
+        help="workspace management (add-member, remove-member)",
+    )
+    ws_sub = sp_workspace.add_subparsers(dest="workspace_command", metavar="<workspace-command>")
+
+    sp_ws_add = ws_sub.add_parser(
+        "add-member",
+        help="append a new member to the workspace (appends a member node, then relocks)",
+    )
+    sp_ws_add.add_argument(
+        "member_path",
+        metavar="<path>",
+        help="path to the member directory (relative to the workspace root)",
+    )
+
+    sp_ws_remove = ws_sub.add_parser(
+        "remove-member",
+        help="remove a member from the workspace (drops the member node, then relocks)",
+    )
+    sp_ws_remove.add_argument(
+        "name_or_path",
+        metavar="<name|path>",
+        help="member package name or path to remove",
+    )
 
     # store — read-only CAS inspection (C-store-ro slice, Phase C)
     sp_store = subparsers.add_parser(
@@ -2170,6 +2197,270 @@ def cmd_update(
 
 
 # ---------------------------------------------------------------------------
+# cmd_workspace_add_member / cmd_workspace_remove_member (S10)
+# ---------------------------------------------------------------------------
+
+
+def cmd_workspace_add_member(
+    root: Path,
+    env: MilpaEnv,
+    *,
+    member_path: str,
+    strategy: Strategy,
+    max_parallel: int,
+) -> int:
+    """Append a member node to the workspace manifest and relock.
+
+    Validation (before any on-disk mutation):
+      - dir exists and contains milpa.kdl (→ WS-MEMBER-NO-MANIFEST / WS-MEMBER-DIR-MISSING)
+      - milpa.kdl has a ``name`` (→ MAN-NAME-MISSING)
+      - name is unique among existing members (→ WS-MEMBER-DUPLICATE-NAME)
+      - member is not itself a workspace (→ WS-MEMBER-IS-WORKSPACE)
+
+    Then delegates to apply_workspace_manifest_change for the atomic
+    validate→resolve→write-manifest→write-lock ordering.
+
+    spec/cli-contract.md §5.9.
+    """
+    from dataclasses import replace as _replace
+    from milpa.manifest import (
+        MAN_NAME_MISSING,
+        WorkspaceManifest,
+        parse_workspace_or_manifest,
+    )
+    from milpa.manifest_writer import apply_workspace_manifest_change
+    from milpa.workspace import load_workspace
+
+    # Resolve the member path relative to the workspace root.
+    member_abs = (root / member_path).resolve()
+
+    # Guard 1: directory must exist.
+    if not member_abs.is_dir():
+        print(
+            f"milpa workspace add-member: {member_path!r}: "
+            "directory does not exist",
+            file=sys.stderr,
+        )
+        _emit_slug("WS-MEMBER-DIR-MISSING")
+        return 1
+
+    # Guard 2: must contain a milpa.kdl.
+    kdl_path = member_abs / "milpa.kdl"
+    if not kdl_path.exists():
+        print(
+            f"milpa workspace add-member: {member_path!r}: "
+            "no milpa.kdl found",
+            file=sys.stderr,
+        )
+        _emit_slug("WS-MEMBER-NO-MANIFEST")
+        return 1
+
+    # Guard 3: parse the member manifest; check for name (MAN-NAME-MISSING)
+    # and no-nesting (WS-MEMBER-IS-WORKSPACE).
+    try:
+        member_text = kdl_path.read_text(encoding="utf-8")
+        member_doc = parse_workspace_or_manifest(member_text)
+    except MilpaError as exc:
+        print(f"milpa workspace add-member: {exc.message}", file=sys.stderr)
+        _emit_slug(exc.slug)
+        return 1
+
+    if isinstance(member_doc, WorkspaceManifest):
+        print(
+            f"milpa workspace add-member: {member_path!r} is itself a workspace; "
+            "nested workspaces are not supported",
+            file=sys.stderr,
+        )
+        _emit_slug("WS-MEMBER-IS-WORKSPACE")
+        return 1
+
+    # member_doc is a Manifest here.
+    if member_doc.name is None:
+        print(
+            f"milpa workspace add-member: {member_path!r}: "
+            "milpa.kdl has no name — add a `name \"...\"` declaration",
+            file=sys.stderr,
+        )
+        _emit_slug("MAN-NAME-MISSING")
+        return 1
+
+    new_member_name = member_doc.name
+
+    # Guard 4: name-unique among existing members.
+    # Load the workspace to check existing member names.
+    try:
+        current_ws = load_workspace(root)
+    except MilpaError as exc:
+        print(f"milpa workspace add-member: {exc.message}", file=sys.stderr)
+        _emit_slug(exc.slug)
+        return 1
+
+    for existing_member in current_ws.members:
+        if existing_member.manifest.name == new_member_name:
+            print(
+                f"milpa workspace add-member: a member named {new_member_name!r} "
+                "already exists in the workspace",
+                file=sys.stderr,
+            )
+            _emit_slug("WS-MEMBER-DUPLICATE-NAME")
+            return 1
+
+    # Determine the member path to record in the manifest (relative to root).
+    # Use the canonical relative path (member_abs relative to root).
+    try:
+        rel_path = str(member_abs.relative_to(root.resolve()))
+    except ValueError:
+        rel_path = member_path  # fallback: use as given
+
+    # Delegate to apply_workspace_manifest_change (atomic validate→resolve→write).
+    profile = Profile.from_environment()
+    params = ResolveParams(
+        strategy=strategy,
+        max_parallel=max_parallel,
+        profile=profile,
+        prior=None,
+    )
+    env_with_index = _load_index_for_verb(env)
+
+    def _mutate(ws: WorkspaceManifest) -> WorkspaceManifest:
+        return _replace(ws, members=ws.members + (rel_path,))
+
+    try:
+        _graph, _wr = apply_workspace_manifest_change(root, env_with_index, params, _mutate)
+    except MilpaError as exc:
+        print(f"milpa workspace add-member: {exc.message}", file=sys.stderr)
+        _emit_slug(exc.slug)
+        return 1
+
+    print(f"added member {rel_path!r}", file=sys.stderr)
+    return 0
+
+
+def cmd_workspace_remove_member(
+    root: Path,
+    env: MilpaEnv,
+    *,
+    name_or_path: str,
+    strategy: Strategy,
+    max_parallel: int,
+) -> int:
+    """Drop a member node from the workspace manifest and relock.
+
+    Validates BEFORE mutation (two symmetric dangling-reference refusal classes):
+      - member not found (→ WS-REMOVE-MEMBER-NOT-FOUND)
+      - dangling root override (→ WS-REMOVE-MEMBER-TARGET-EXISTS)
+      - dangling member-edge in another member's deps/dev_deps
+        (→ WS-REMOVE-MEMBER-REFERENCED)
+
+    Then delegates to apply_workspace_manifest_change for the atomic ordering.
+
+    spec/cli-contract.md §5.9.
+    """
+    from dataclasses import replace as _replace
+    from milpa.manifest import MemberDep, MemberTarget, WorkspaceManifest
+    from milpa.manifest_writer import apply_workspace_manifest_change
+    from milpa.workspace import load_workspace
+
+    # Load the current workspace (validates topology, raises WS-* on errors).
+    try:
+        current_ws = load_workspace(root)
+    except MilpaError as exc:
+        print(f"milpa workspace remove-member: {exc.message}", file=sys.stderr)
+        _emit_slug(exc.slug)
+        return 1
+
+    ws_manifest = current_ws.workspace_manifest
+
+    # Resolve name_or_path to a member declaration path in the workspace manifest.
+    # Accept both a member package NAME (e.g. "liba") and a member PATH
+    # (e.g. "member-a" or relative path).
+    matched_path: str | None = None
+    matched_name: str | None = None
+    for m in current_ws.members:
+        candidate_paths = {m.rel_path, str(m.abs_dir), str(m.abs_dir.relative_to(root.resolve()) if m.abs_dir.is_relative_to(root.resolve()) else m.abs_dir)}
+        if name_or_path == m.manifest.name or name_or_path in candidate_paths or name_or_path == m.rel_path:
+            matched_path = m.rel_path
+            matched_name = m.manifest.name
+            break
+
+    # Guard 1: member must exist.
+    if matched_path is None:
+        print(
+            f"milpa workspace remove-member: {name_or_path!r} is not a member "
+            "of this workspace",
+            file=sys.stderr,
+        )
+        _emit_slug("WS-REMOVE-MEMBER-NOT-FOUND")
+        return 1
+
+    # Guard 2 (class-1): check for dangling root overrides (MemberTarget).
+    if matched_name is not None:
+        for ov in ws_manifest.overrides:
+            if isinstance(ov.target, MemberTarget) and ov.target.member_name == matched_name:
+                print(
+                    f"milpa workspace remove-member: cannot remove member "
+                    f"{matched_name!r}: the workspace root's overrides block "
+                    f"has a MemberTarget entry for {matched_name!r} "
+                    f"(pkg {ov.name!r} → member {matched_name!r}); "
+                    "remove or update the override first",
+                    file=sys.stderr,
+                )
+                _emit_slug("WS-REMOVE-MEMBER-TARGET-EXISTS")
+                return 1
+
+    # Guard 3 (class-2): check for dangling member-edges in other members'
+    # deps AND dev_deps.
+    referencing: list[str] = []
+    if matched_name is not None:
+        for m in current_ws.members:
+            if m.rel_path == matched_path:
+                continue  # skip the member being removed
+            for dep in list(m.manifest.deps) + list(m.manifest.dev_deps):
+                if isinstance(dep, MemberDep) and dep.name == matched_name:
+                    if m.manifest.name:
+                        referencing.append(m.manifest.name)
+                    else:
+                        referencing.append(m.rel_path)
+                    break
+
+    if referencing:
+        referencing_str = ", ".join(repr(r) for r in sorted(referencing))
+        print(
+            f"milpa workspace remove-member: cannot remove member "
+            f"{matched_name!r}: it is referenced by member-dep edges in: "
+            f"{referencing_str}; remove those deps first",
+            file=sys.stderr,
+        )
+        _emit_slug("WS-REMOVE-MEMBER-REFERENCED")
+        return 1
+
+    # Delegate to apply_workspace_manifest_change (atomic validate→resolve→write).
+    profile = Profile.from_environment()
+    params = ResolveParams(
+        strategy=strategy,
+        max_parallel=max_parallel,
+        profile=profile,
+        prior=None,
+    )
+    env_with_index = _load_index_for_verb(env)
+
+    _matched_path = matched_path  # capture for closure
+
+    def _mutate(ws: WorkspaceManifest) -> WorkspaceManifest:
+        return _replace(ws, members=tuple(p for p in ws.members if p != _matched_path))
+
+    try:
+        _graph, _wr = apply_workspace_manifest_change(root, env_with_index, params, _mutate)
+    except MilpaError as exc:
+        print(f"milpa workspace remove-member: {exc.message}", file=sys.stderr)
+        _emit_slug(exc.slug)
+        return 1
+
+    print(f"removed member {matched_name or matched_path!r}", file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # main()
 # ---------------------------------------------------------------------------
 
@@ -2326,6 +2617,27 @@ def main(argv: list[str] | None = None) -> int:
                 no_default_features=_cli_no_default,
                 all_features=_cli_all_features,
             )
+        elif args.command == "workspace":
+            ws_cmd = getattr(args, "workspace_command", None)
+            if ws_cmd == "add-member":
+                return cmd_workspace_add_member(
+                    project_dir,
+                    env,
+                    member_path=args.member_path,
+                    strategy=strategy,
+                    max_parallel=args.parallel,
+                )
+            elif ws_cmd == "remove-member":
+                return cmd_workspace_remove_member(
+                    project_dir,
+                    env,
+                    name_or_path=args.name_or_path,
+                    strategy=strategy,
+                    max_parallel=args.parallel,
+                )
+            else:
+                print("usage: milpa workspace <add-member|remove-member> [args]", file=sys.stderr)
+                return 2
         elif args.command == "store":
             store_cmd = getattr(args, "store_command", None)
             if store_cmd == "ls":

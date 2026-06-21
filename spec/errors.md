@@ -1231,3 +1231,21 @@ No milpa.kdl found at the expected workspace root.
 The milpa.kdl at the root is a package manifest, not a workspace.
 
 **Triggered:** load_workspace parses the root milpa.kdl and finds a Manifest, not WorkspaceManifest.
+
+### `WS-REMOVE-MEMBER-NOT-FOUND`
+
+The name or path given to `milpa workspace remove-member` does not match any declared workspace member.
+
+**Triggered:** `cmd_workspace_remove_member` searches the workspace manifest's member list for the given name or path and finds no match. The user is directed to run `milpa show` or inspect the workspace `milpa.kdl` to see the current member list.
+
+### `WS-REMOVE-MEMBER-TARGET-EXISTS`
+
+The workspace root's `overrides {}` block contains a `MemberTarget` entry that points at the member being removed; removing the member would leave a dangling override reference.
+
+**Triggered:** `cmd_workspace_remove_member` scans the root manifest's `overrides` for any `pkg { member "<name>" }` rule targeting the member to be removed and finds one. The user must update or remove the override before removing the member. (Distinct from `WS-MEMBER-HAS-OVERRIDES`, which fires when a member declares its *own* overrides block.)
+
+### `WS-REMOVE-MEMBER-REFERENCED`
+
+Another workspace member's `deps` or `dev_deps` carries a `member "<removed>"` edge; removing the member would leave a dangling member-dep reference.
+
+**Triggered:** `cmd_workspace_remove_member` scans all remaining members' `deps` and `dev_deps` for a `member "<name>"` dep matching the member to be removed and finds one or more such references. The referencing member name(s) are included in the error message. The user must remove or replace the `member` dep in the referencing member(s) before removing the workspace member.

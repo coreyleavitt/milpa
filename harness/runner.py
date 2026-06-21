@@ -241,6 +241,17 @@ def _dispatch_cmd(tokens: list[str], cmd: str) -> tuple[list[str], list[str]]:
         return [], ["update", *tokens[1:]]
     if head == "verify":
         return [], ["verify"]
+    if head == "workspace":
+        # workspace add-member <path>
+        # workspace remove-member <name|path>
+        if len(tokens) < 3:
+            raise ValueError(f"workspace cmd needs sub-verb and argument: {cmd!r}")
+        sub = tokens[1]
+        if sub == "add-member":
+            return [], ["workspace", "add-member", tokens[2]]
+        if sub == "remove-member":
+            return [], ["workspace", "remove-member", tokens[2]]
+        raise ValueError(f"Unknown workspace sub-verb: {sub!r}")
     raise ValueError(f"Unknown fixture cmd: {cmd!r}")
 
 

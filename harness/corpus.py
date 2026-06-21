@@ -46,6 +46,20 @@ KNOWN_LIMITATIONS: dict[str, str] = {
         "paths are relative to each member's dir; deferred pending §2.5 "
         "workspace fixture verification in the harness"
     ),
+    # In-process-only verbs: lock-roundtrip and workspace-manifest-roundtrip
+    # exercise parse+format pipelines inside the impl with no CLI surface.
+    # The black-box harness cannot drive them (there is no CLI verb that maps
+    # to these cmds); they are covered exclusively by each impl's internal test
+    # suite (pytest / cargo test).
+    "fixture-172-lock-aliases-field": (
+        "cmd=lock-roundtrip has no CLI surface — covered by impl-internal "
+        "tests only (pytest / cargo test); black-box harness cannot drive it"
+    ),
+    "fixture-264-s9a-workspace-manifest-roundtrip": (
+        "cmd=workspace-manifest-roundtrip has no CLI surface — covered by "
+        "impl-internal tests only (pytest / cargo test); black-box harness "
+        "cannot drive it"
+    ),
     # NOTE (#120): fixtures 112/113 were previously quarantined here on the
     # belief that "no index configured" had no CLI surface. That is stale: the
     # three-way MILPA_INDEX_URL semantics (cli-contract §8.1 NORMATIVE) make

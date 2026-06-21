@@ -75,8 +75,18 @@ asymmetries broken today (round 2 added the eighth: member-dir add/remove/update
   allowed; package-typed path still refuses with MAN-MUTATE-WORKSPACE-REFUSED); 8 Python tests
   + 5 Rust tests covering atomicity (resolution failure → manifest/lock untouched), happy path,
   refusal-lift scoping; Python 2091 pass; Rust 398 unit pass + corpus zero divergence — `6868370`
-- [ ] S10, S11a, S11b, S11c, S11d, S11e, S12 (remaining)
-- **Progress: 12/19 done, 7 remaining.** All gates green each slice (Python 2091 pass; Rust
+- [x] **S10** `milpa workspace add-member <path>` / `milpa workspace remove-member <name|path>`
+  (D4 grouped under `workspace` subcommand, both impls); 3 new error slugs
+  (`WS-REMOVE-MEMBER-NOT-FOUND`, `WS-REMOVE-MEMBER-TARGET-EXISTS`, `WS-REMOVE-MEMBER-REFERENCED`)
+  with full bijection sync (spec/errors.md + errors.py + Rust all_codes()); spec §5.10
+  (cli-contract.md); 8 conformance fixtures (fixture-265 through fixture-272: 2 happy paths +
+  6 failure paths); harness `_dispatch_cmd` workspace dispatch; fixture-172/fixture-264
+  KNOWN_LIMITATIONS entries (lock-roundtrip/workspace-manifest-roundtrip have no CLI surface);
+  11 Python unit tests + Rust CLI functions; Python 2102 pass; Rust 398+ unit pass + corpus
+  zero divergence; black-box harness PASS on both impls (fixtures 265–272 all green) —
+  `feat(cli): milpa workspace add-member/remove-member verbs (closes #81)`
+- [ ] S11a, S11b, S11c, S11d, S11e, S12 (remaining)
+- **Progress: 13/19 done, 6 remaining.** All gates green each slice (Python 2102 pass; Rust
   corpus zero divergence).
 
 ## Forks — ALL RESOLVED (no open decisions)
