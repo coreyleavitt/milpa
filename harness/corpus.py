@@ -60,6 +60,11 @@ KNOWN_LIMITATIONS: dict[str, str] = {
         "impl-internal tests only (pytest / cargo test); black-box harness "
         "cannot drive it"
     ),
+    "fixture-283-ws-manifest-roundtrip-special-chars": (
+        "cmd=workspace-manifest-roundtrip has no CLI surface — covered by "
+        "impl-internal tests only (pytest / cargo test); black-box harness "
+        "cannot drive it"
+    ),
     # NOTE (#120): fixtures 112/113 were previously quarantined here on the
     # belief that "no index configured" had no CLI surface. That is stale: the
     # three-way MILPA_INDEX_URL semantics (cli-contract §8.1 NORMATIVE) make
