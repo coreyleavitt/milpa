@@ -258,6 +258,14 @@ class TestDerivationFromSurfaces(unittest.TestCase):
 
         Patch it to 42 and verify a returncode=42 error fixture passes;
         returncode=1 (the old value) must fail.
+
+        NORMATIVE_EXIT_CODES must also be patched to include 42 so the
+        baseline normative-range check (wired in assert_conformance, S-A1b)
+        does not catch 42 before the per-class check can exercise it.  Both
+        patches are applied together; that is the correct framing for a
+        hypothetical impl that redefines the exit-code set globally — if you
+        change EXPECTED_EXIT_CODE you must also change NORMATIVE_EXIT_CODES,
+        and the module-load invariant in surfaces.py enforces exactly that.
         """
         import harness.surfaces as surf_mod
         from harness.assertions import assert_conformance
@@ -273,7 +281,11 @@ class TestDerivationFromSurfaces(unittest.TestCase):
 
         patched_codes = dict(surf_mod.EXPECTED_EXIT_CODE)
         patched_codes["error"] = 42
-        with patch.object(surf_mod, "EXPECTED_EXIT_CODE", patched_codes):
+        patched_normative = frozenset(surf_mod.NORMATIVE_EXIT_CODES | {42})
+        with (
+            patch.object(surf_mod, "EXPECTED_EXIT_CODE", patched_codes),
+            patch.object(surf_mod, "NORMATIVE_EXIT_CODES", patched_normative),
+        ):
             result42 = assert_conformance(run42, fx_dir)
 
         self.assertTrue(
@@ -282,7 +294,8 @@ class TestDerivationFromSurfaces(unittest.TestCase):
             f"failures: {[f.detail for f in result42.failures]}",
         )
 
-        # Without patch: returncode=42 must fail (expected exit 1).
+        # Without patch: returncode=42 must fail (both the normative-range
+        # baseline and the per-class check catch it).
         result_no_patch = assert_conformance(run42, fx_dir)
         self.assertFalse(
             result_no_patch.passed,

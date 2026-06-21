@@ -1,4 +1,4 @@
-"""Normative surface set — single source of truth (S-A1).
+"""Normative surface set — single source of truth (S-A1 / S-A1b).
 
 This module declares the closed set of outputs that conformant milpa
 implementations MUST match, per ``spec/conformance-fixtures.md`` §Normative
@@ -11,13 +11,22 @@ normative-surface literal is restated inline in the runner.  A third impl
 (e.g. the planned Nim dogfood) inherits an unambiguous, machine-checkable
 statement of what it must match and what it is free to vary.
 
-Scope of this module (S-A1)
------------------------------
-This module covers only the surfaces the harness CURRENTLY enforces.
-``EMPTY_STDOUT_VERBS`` and a precise ``NORMATIVE_EXIT_CODES`` set (covering
-exit code 2) are intentionally absent — those are added in S-A1b, which
-also wires the corresponding enforcement in ``assertions.py``.  Adding them
-here before the enforcement exists would be dead constants.
+Scope of this module
+---------------------
+S-A1 extracted the comparison-surface declarations and named FileSurface
+constants from ``assertions.py`` into this module.  S-A1b adds
+``EMPTY_STDOUT_VERBS`` and ``NORMATIVE_EXIT_CODES`` — both are live
+enforcement constants:
+
+- ``EMPTY_STDOUT_VERBS`` is checked by ``assertions.assert_conformance`` for
+  every success/clean fixture (``cli-contract §4`` NORMATIVE).
+- ``NORMATIVE_EXIT_CODES`` is checked by ``assertions.assert_conformance`` as a
+  baseline across ALL fixture classes: any returncode outside this set is a
+  conformance violation naming the code and citing ``cli-contract §3``
+  (``rfc-conformance-parity.md §2`` warns against declaring constants that
+  nothing wires).  A module-load invariant below also guarantees that every
+  value in ``EXPECTED_EXIT_CODE`` is a member of ``NORMATIVE_EXIT_CODES``,
+  preventing per-class expected codes from drifting outside the declared range.
 
 Non-normative surfaces (explicitly excluded)
 --------------------------------------------
@@ -140,21 +149,69 @@ LIVENESS_CMDS: FrozenSet[str] = frozenset({"show", "--version"})
 
 
 # ---------------------------------------------------------------------------
+# EMPTY_STDOUT_VERBS (S-A1b)
+# ---------------------------------------------------------------------------
+
+# Verbs that MUST produce NO output on stdout on a successful run
+# (``cli-contract.md §4`` NORMATIVE).  The harness asserts ``stdout == ""``
+# for any run whose command verb (the first whitespace-delimited token) is in
+# this set AND whose outcome class is "success" or "clean".
+#
+# Liveness verbs (``LIVENESS_CMDS``) are explicitly excluded: ``show`` is the
+# only verb with machine-readable stdout output; ``--version`` prints a
+# human-readable version string.  ``check-certificate`` is also excluded
+# because it writes the certificate to a *file* path (not stdout).
+EMPTY_STDOUT_VERBS: FrozenSet[str] = frozenset({
+    "fetch", "lock", "verify", "clean", "add", "remove", "update",
+})
+
+
+# ---------------------------------------------------------------------------
+# NORMATIVE_EXIT_CODES (S-A1b)
+# ---------------------------------------------------------------------------
+
+# The complete set of defined exit codes for spec v1.0
+# (``cli-contract.md §3`` NORMATIVE).  No other exit codes are defined;
+# anything outside this set is a crash-class verdict (R4).
+#
+# - 0: success (all verbs on a successful run)
+# - 1: diagnosed failure (any condition with an ``errors.md`` slug)
+# - 2: argument-parse / usage error (invalid flag value, unrecognized flag)
+#
+# An impl exiting 2 where another exits 1 is a divergence (previously
+# invisible because the harness only compared zero-vs-nonzero).  After
+# S-A1b the mismatch message names the actual vs expected code explicitly.
+NORMATIVE_EXIT_CODES: FrozenSet[int] = frozenset({0, 1, 2})
+
+
+# ---------------------------------------------------------------------------
 # EXPECTED_EXIT_CODE
 # ---------------------------------------------------------------------------
 
 # The exact process exit code each command class MUST produce on its primary
-# path.  These are the codes currently enforced by assertions.py.
-#
-# S-A1b will add enforcement for exit code 2 (e.g. usage errors) and wire the
-# full ``{0, 1, 2}`` set from ``cli-contract.md §3``.  Until then this mapping
-# covers only the codes the harness actively asserts.
+# path.  ``assertions.py`` compares run.returncode against this mapping and
+# names both the actual and expected codes in any mismatch message (S-A1b).
 EXPECTED_EXIT_CODE: Mapping[str, int] = {
     "success": 0,
     "liveness": 0,
     "clean": 0,
     "error": 1,
 }
+
+
+# Module-load invariant: every per-class expected code must be within the
+# normative range.  A plain assert is correct here — this is a programming
+# error (a developer added an out-of-range value to EXPECTED_EXIT_CODE), not
+# a runtime condition, so a hard failure at import time is the right signal.
+assert all(code in NORMATIVE_EXIT_CODES for code in EXPECTED_EXIT_CODE.values()), (
+    f"EXPECTED_EXIT_CODE contains a value outside NORMATIVE_EXIT_CODES "
+    f"{NORMATIVE_EXIT_CODES}: "
+    + ", ".join(
+        f"{cls!r}={code}"
+        for cls, code in EXPECTED_EXIT_CODE.items()
+        if code not in NORMATIVE_EXIT_CODES
+    )
+)
 
 
 # ---------------------------------------------------------------------------

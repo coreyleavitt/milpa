@@ -227,6 +227,25 @@ def assert_conformance(
         return ConformanceResult(run=run, passed=False, failures=failures,
                                  normalized_outputs={})
 
+    # Baseline normative-range check (cli-contract §3 NORMATIVE, S-A1b).
+    # NORMATIVE_EXIT_CODES = {0, 1, 2} is the complete set of defined exit codes
+    # for spec v1.0.  Any other code is crash-class (e.g. 127 = command-not-found,
+    # 139 = SIGSEGV) and is a conformance violation regardless of fixture class.
+    # This check is NON-SHORT-CIRCUITING: it accumulates into failures and then
+    # falls through to the per-class dispatch so other diagnostics still surface.
+    if run.returncode not in surfaces.NORMATIVE_EXIT_CODES:
+        failures.append(AssertionFailure(
+            fixture_name=run.fixture_name,
+            impl_name=run.impl_name,
+            kind="error-fixture",
+            detail=(
+                f"exit code {run.returncode} is outside the normative set "
+                f"{sorted(surfaces.NORMATIVE_EXIT_CODES)} "
+                f"(cli-contract §3 NORMATIVE: only 0, 1, 2 are defined; "
+                f"any other code is a crash-class conformance violation)"
+            ),
+        ))
+
     expected_dir = fixture_dir / "expected"
     error_file = expected_dir / "error"
     is_error_fixture = error_file.exists()
@@ -473,6 +492,50 @@ def _is_liveness_cmd(cmd: str) -> bool:
     return head in surfaces.LIVENESS_CMDS
 
 
+def _is_empty_stdout_verb(cmd: str) -> bool:
+    """True when the verb MUST produce no stdout on a successful run.
+
+    The authoritative set is ``harness.surfaces.EMPTY_STDOUT_VERBS``
+    (``cli-contract.md §4`` NORMATIVE, S-A1b).  The verb is the first
+    whitespace-delimited token in the fixture's cmd file.
+    """
+    head = cmd.split()[0] if cmd.split() else ""
+    return head in surfaces.EMPTY_STDOUT_VERBS
+
+
+def _assert_empty_stdout(
+    run: "RunResult",
+    cmd: str,
+    failures: list[AssertionFailure],
+) -> bool:
+    """Assert stdout is empty when the verb requires it (S-A1b).
+
+    Returns True if the check passed (stdout is empty or verb is not in
+    EMPTY_STDOUT_VERBS), False if a failure was appended.
+
+    The check is a STRICT ``stdout == ""`` per ``cli-contract.md §4``
+    NORMATIVE: verbs that produce no machine-readable output MUST produce
+    no stdout.  A trailing newline alone (``stdout == "\\n"``) is still a
+    violation — the spec says "no output on stdout", not "no non-newline
+    output".
+    """
+    if not _is_empty_stdout_verb(cmd):
+        return True
+    if run.stdout == "":
+        return True
+    verb = cmd.split()[0] if cmd.split() else cmd
+    failures.append(AssertionFailure(
+        fixture_name=run.fixture_name,
+        impl_name=run.impl_name,
+        kind="success-fixture",
+        detail=(
+            f"stdout must be empty for verb '{verb}' on success "
+            f"(cli-contract §4 NORMATIVE), but got: {run.stdout!r}"
+        ),
+    ))
+    return False
+
+
 def _assert_liveness_fixture(
     run: RunResult,
     failures: list[AssertionFailure],
@@ -555,6 +618,9 @@ def _assert_clean_fixture(
         ))
         return
 
+    # Empty-stdout enforcement (S-A1b): clean is in EMPTY_STDOUT_VERBS.
+    _assert_empty_stdout(run, "clean", failures)
+
     scratch = Path(run.scratch_dir)
 
     # _deps/ must be absent.
@@ -617,7 +683,7 @@ def _assert_success_fixture(
     failures: list[AssertionFailure],
     normalized_outputs: dict[str, str],
 ) -> None:
-    """Assert success fixture: exit 0, no slug, byte-diff outputs."""
+    """Assert success fixture: exit 0, no slug, empty stdout (if applicable), byte-diff outputs."""
     expected_code = surfaces.EXPECTED_EXIT_CODE["success"]
     if run.returncode != expected_code:
         failures.append(AssertionFailure(
@@ -639,6 +705,11 @@ def _assert_success_fixture(
             detail=f"exit 0 but milpa-error: line found: {run.slug!r}",
         ))
         return
+
+    # Empty-stdout enforcement (S-A1b): cli-contract §4 NORMATIVE.
+    # Non-liveness verbs MUST emit no stdout on success.  We do not short-circuit
+    # on this failure — continue to collect file-diff failures as well.
+    _assert_empty_stdout(run, cmd, failures)
 
     scratch = Path(run.scratch_dir)
 

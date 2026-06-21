@@ -5,7 +5,7 @@
 
 ## Phase 2 Layer A — slices (chosen direction; recorded 2026-06-21)
 - [x] **S-A1** — D1 normative-surfaces SSOT: `harness/surfaces.py` (FileSurface + named role constants LOCK_FILE/ROOT_NIMCFG/MANIFEST_FILE/DEPS_STRUCTURE_FILE/CERTIFICATE_FILE; NORMATIVE_FILES built from them; LIVENESS_CMDS/EXPECTED_EXIT_CODE/ABSENT_PATHS_SURFACE) + assertions.py derives (no surface literal inline) + test_surfaces.py SSOT proof + spec prose normative block strengthened. Pure refactor; harness 279/279 both impls div NONE, py 2149 pass, harness 196 pass. DONE.
-- [ ] **S-A1b** — D1 new enforcement: wire EMPTY_STDOUT_VERBS + exact exit-code (incl. 2). CAN change corpus results (by design); re-run harness, treat asymmetry per Slice A.
+- [x] **S-A1b** — D1 new enforcement: EMPTY_STDOUT_VERBS (7 verbs, strict stdout=="") + NORMATIVE_EXIT_CODES {0,1,2} wired as baseline range-check at the assert_conformance chokepoint + module-load invariant (EXPECTED_EXIT_CODE ⊆ NORMATIVE_EXIT_CODES). Both impls already conform — harness stayed 279/279 div NONE (no new divergence surfaced). Spec prose now asserts both normatively. py 2149 pass, harness 224 pass. DONE.
 - [ ] **S-A2** — `certificate.json` JCS (RFC 8785) canonicalization: spec it; verify both impls already JCS-equal (150 passes) else align serializers; compare canonically.
 - [ ] **S-A3** — static corpus lint (fixture-rot guard): slug∈errors.md + dir-name match; runs without impls; wire into §3.6 CI job.
 - [ ] **S-A4** — `pin.py` ergonomics: `python3 -m harness pin <dir>` one-command flow.

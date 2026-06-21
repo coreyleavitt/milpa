@@ -64,7 +64,8 @@ of normative surfaces** per command class. All other output is explicitly
 | `expected/certificate.json` | `check-certificate` fixtures | canonical JSON comparison (see §2.7.3) |
 | `expected/error` (the slug on the `milpa-error: <SLUG>` line) | error fixtures | exact slug string (`spec/errors.md` catalog) |
 | `expected/absent` (paths listed MUST NOT exist post-run) | success fixtures | existence check per listed path |
-| Process exit code (`0` for success/liveness/clean, `1` for error) | all fixtures | exact integer |
+| Process exit code | all fixtures | exact integer; valid range `{0, 1, 2}` per `cli-contract.md §3` — `0` success/liveness/clean, `1` error, `2` usage error. Any code outside the range is a conformance violation. |
+| Empty stdout on success | `fetch`/`lock`/`verify`/`clean`/`add`/`remove`/`update` (non-liveness verbs) | stdout MUST be empty (`cli-contract.md §4`) |
 
 > NOTE: `expected/milpa.kdl` is also compared byte-exact for mutation fixtures
 > (`add`/`remove` subcommands). Per-member `expected/<member>/milpa.kdl` follows
@@ -76,12 +77,9 @@ of normative surfaces** per command class. All other output is explicitly
   (Python `milpa:` vs Rust `<CODE>:`) — `cli-contract.md §3.1` makes this
   non-normative by design.
 - Stdout prose for liveness commands (`show`, `--version`) — only exit-0 +
-  non-empty stdout is asserted (see §2.7.2).
+  non-empty stdout is asserted (see §2.7.2). (Non-liveness verbs, by contrast,
+  MUST emit *empty* stdout on success — that is parity-normative, above.)
 - Ordering and timing of progress output.
-
-> NOTE: S-A1b (a later slice) will additionally enforce empty stdout on
-> success for non-liveness verbs (`cli-contract.md §4`) and exact exit-code-2
-> for usage errors (`cli-contract.md §3`). Those are not yet asserted.
 
 **Arbitration rule:** the spec is the arbiter. Impls agreeing is evidence, not
 proof; impls disagreeing is a bug in one impl **or** a hole in the spec — never
