@@ -1,9 +1,14 @@
 # RFC: Cross-impl conformance parity & corpus widening
 
-Status: **design draft** — architect round 1 applied (2026-06-21). Was a triage
-stub; round 1 gave it a spine (the parity invariant), corrected three misdiagnosed
-issues, removed two that don't belong, and split finite cleanup from standing
-discipline. Scope resolved to option (a) — one RFC, two phases (§8).
+Status: **design draft** — architect round 2 applied (2026-06-21). Round 1 gave the
+stub a spine (the parity invariant), corrected three misdiagnosed issues, removed two
+that don't belong, and split finite cleanup from standing discipline. Round 2
+**reversed the round-1 fixture-144 diagnosis** (it passes the normative black-box gate
+— the divergence is an in-process adapter bug, verified empirically), closed the
+normative-surface set (exit code, empty-stdout, `expected/absent`), corrected the D1
+landing point (the proposed `§5` already exists), named the CI enforcement gap, added
+the new-impl onboarding + multi-epoch protocol, and re-sliced Phase 2. Scope is
+option (a) — one RFC, two phases (§8).
 Umbrella: #169. Milestone: *v1.5 — spec extraction + cross-impl hardening*.
 
 ## 1  The invariant
@@ -11,18 +16,25 @@ Umbrella: #169. Milestone: *v1.5 — spec extraction + cross-impl hardening*.
 This RFC exists to establish and maintain one invariant:
 
 > **Parity.** For every input in `conformance/spec-v<N>/`, every implementation
-> that claims conformance to spec version `N` produces identical output on all
+> that **claims conformance to spec version `N`** produces identical output on all
 > **normative surfaces**, as determined by the differential corpus runner.
 
-"Normative surfaces" is a precise, closed set (§2). Everything else — human-readable
-diagnostic prose, log phrasing, progress lines — is explicitly **non-normative** and
-MAY differ per impl by design (`spec/cli-contract.md §3.1`). A parity RFC that does
-not pin down this normative/non-normative boundary will chase cosmetic differences
-(this is exactly what sank the original #156 framing — see §6).
+Two qualifiers carry weight:
+
+- **"Normative surfaces"** is a precise, closed set (§2). Everything else —
+  human-readable diagnostic prose, log phrasing, progress lines — is explicitly
+  **non-normative** and MAY differ per impl by design (`spec/cli-contract.md §3.1`). A
+  parity RFC that does not pin down this boundary will chase cosmetic differences
+  (this is exactly what sank the original #156 framing — see §6).
+- **"that claims conformance to spec version `N`"** is the *epoch filter* (§3.4). The
+  corpus is versioned (`spec-v1/`, future `spec-v2/`); an impl is only held to the
+  epochs it declares. The runner MUST run an impl against exactly its declared epochs,
+  never all discovered ones — otherwise a v2 impl that intentionally breaks a v1
+  behavior is falsely flagged. This is currently unimplemented (§3.4).
 
 The RFC has three jobs, in order:
-1. **Make the boundary normative and durable** — hoist the surface list into `spec/`
-   (§2, deliverable D1).
+1. **Make the boundary normative and durable** — declare the surface set as a single
+   machine-readable source of truth and hoist its prose into `spec/` (§2, deliverable D1).
 2. **Restore the baseline** — close the finite set of current parity violations
    (Phase 1, §4).
 3. **Widen coverage as a standing discipline** — every discovered divergence becomes
@@ -30,33 +42,82 @@ The RFC has three jobs, in order:
 
 ## 2  Normative surfaces (deliverable D1)
 
-The single most valuable artifact this RFC produces is a normative section — proposed
-as a new **`spec/conformance-fixtures.md §5 — Normative surfaces`** (it sits naturally
-above the existing §4 coverage floor) — stating, once and authoritatively:
+The single most valuable artifact this RFC produces is an authoritative, **closed**
+statement of what impls must match — expressed once, in *two coupled forms* that
+cannot drift:
+
+**(D1-a) Machine-readable source of truth — `harness/surfaces.py`.** A small module
+the runner imports, declaring the comparison set per command class:
+
+```python
+NORMATIVE_FILES = {            # byte-exact (or canonical-equal) per command class
+    "success": ["milpa.lock", "nim.cfg", "_deps_structure.txt"],  # + per-member nim.cfg
+    "check-certificate": ["certificate.json"],   # canonical-JSON comparison (see below)
+    "error": [],                                  # slug only; no file diff
+}
+LIVENESS_CMDS = {"show", "--version"}  # assert exit-0 + non-empty stdout only
+EMPTY_STDOUT_VERBS = {"fetch", "lock", "verify", "clean", "add", "remove", "update"}
+NORMATIVE_EXIT_CODES = {0, 1, 2}       # cli-contract §3; the *code* is compared, not just 0/≠0
+ABSENT_PATHS_SURFACE = "expected/absent"  # listed paths MUST NOT exist post-run
+```
+
+`assertions.py` derives its comparison logic from this module; nothing in the runner
+re-states the set inline. (Today `assertions.py` hard-codes it — collapsing the two is
+the first task of D1.)
+
+**(D1-b) Spec prose.** Strengthen the existing **"Normative surface" summary block**
+near the top of `spec/conformance-fixtures.md` (it already names the MUST outputs) so
+it formally enumerates the normative/non-normative split and cites
+`cli-contract.md §3.1`. **Do NOT create a new `§5`** — `conformance-fixtures.md §5`
+already exists ("Black-box diff semantics", the *protocol* for running the check);
+D1 declares *what* is compared, which belongs in the top-of-doc normative block, not
+buried after §4's coverage-floor appendix. At stabilization, a lint test asserts the
+prose enumeration and `harness/surfaces.py` agree.
+
+### The closed surface set
 
 **Parity-normative (byte-exact or canonical-equal across impls):**
 - `expected/milpa.lock` — byte-exact (`spec/lockfile-schema.md`)
 - `expected/nim.cfg` (or per-member `expected/<path>/nim.cfg`) — byte-exact, POSIX
   separators
-- `expected/_deps_structure.txt` — byte-exact after `<CAS_ROOT>` substitution (§2.6)
+- `expected/_deps_structure.txt` — byte-exact after `<CAS_ROOT>` substitution
 - the error slug on the `milpa-error: <SLUG>` line (`spec/cli-contract.md §3.1`,
   R1–R4) — the sole normative error-identity surface
-- `expected/certificate.json` — canonical JSON comparison (§2.7.3)
+- `expected/certificate.json` — **canonical JSON comparison.** *The canonicalization
+  is not yet defined anywhere* (round-2 gap). D1 MUST specify it (proposed: RFC 8785
+  JCS — sorted keys, no insignificant whitespace, fixed number formatting) or the
+  "canonical-equal" claim is hand-waved.
+- **process exit code** — the exact code (0/1/2 per `cli-contract.md §3`), not merely
+  zero-vs-nonzero. An impl exiting 2 where another exits 1 is a divergence today
+  invisible to the corpus.
+- **empty stdout on success** for the non-liveness verbs (`cli-contract.md §4`
+  NORMATIVE). The harness does not assert this today; D1 makes it normative and the
+  runner enforces `stdout == ""` for `EMPTY_STDOUT_VERBS`.
+- **`expected/absent`** — paths that MUST NOT exist after the run (harness-enforced
+  today, e.g. S11e member-local `milpa.lock`; spec-invisible). D1 documents it.
 
 **Explicitly NON-normative (MAY differ per impl):**
 - the human-readable diagnostic line(s) on stderr, including any prefix
   (Python `milpa:` vs Rust `<CODE>:`) — `cli-contract.md §3.1` says this "differs
   per impl by design"
 - stdout prose for liveness commands (`show`, `--version`) — only exit-0 +
-  non-empty is asserted (§2.7.2)
+  non-empty is asserted
 - ordering/timing of progress output
 
 D1 also restates the **arbitration rule**: the spec is the arbiter. Impls agreeing is
 *evidence*, not proof; impls disagreeing is a bug in one impl **or** a hole in the
 spec — never resolved by "whatever the impls happen to do."
 
-Once D1 lands, a third impl (the planned Nim dogfood) inherits an unambiguous
-statement of what it must match and what it is free to vary.
+**Platform scope (round-2 addition).** The corpus is **Linux/POSIX for spec v1** —
+state this explicitly. Windows support would require additional normalization rules
+the corpus does not yet carry: path-separator normalization inside
+`_deps_structure.txt`, case-collision handling for `mocked-fetches/<url-key>/` and
+`cas-seed/` on case-insensitive filesystems, and CRLF/LF normalization (git
+`autocrlf`) for the single-line control files (`error`, `cmd`, `env`, `sha`). Enumerate
+these as the v2-platform checklist; do not silently assume cross-platform parity.
+
+Once D1 lands, a third impl (the planned Nim dogfood) inherits an unambiguous,
+machine-checkable statement of what it must match and what it is free to vary.
 
 ## 3  Machinery (current state — verified 2026-06-21)
 
@@ -64,120 +125,274 @@ statement of what it must match and what it is free to vary.
   `runner.py`, `assertions.py`, `descriptors.py`, `pin.py`, `spec.py`) runs all
   fixtures × all registered impls as black-box subprocesses and diffs normative
   outputs. Entry point: `python3 -m harness` from the repo root. `descriptors.py`
-  registers `[python, rust]`; each carries a `known_failing` list. This is the
+  registers `[python, rust]`; each carries a `known_failing` set. The Rust descriptor
+  needs `impls/rust/target/release/milpa` (a *release* binary). This runner is the
   enforcement gate for the invariant.
 - **Generative layer (tier-1/tier-2 input generators) — DELETED, owned elsewhere.**
   The Hypothesis generator (`impls/python/tests/differential/strategies.py`,
   symbol `unsatisfiable_graph_st`) was removed in commit `5ae87ad` (clean-room
   swap); only `__pycache__` remains. `harness/spec.py` carries the `FixtureSpec`
-  *serializer* but its generator is a documented TODO ("slice 3b: will generate
-  FixtureSpec values"). **Generative coverage is owned by
-  `docs/rfc-differential-conformance-harness.md`** (draft, round 2 applied — its
+  *serializer* but its generator is a documented TODO. **Generative coverage is owned
+  by `docs/rfc-differential-conformance-harness.md`** (draft, round 2 applied — its
   §2c defines the tier-1/tier-2 generators and the saturation bar). This RFC depends
   on that runner; it does not re-implement generation.
 - **In-process adapters — a divergence seam, not a normative gate.** `test_conformance.py`
-  (pytest) and the Rust in-process runner are developer conveniences that call
+  (pytest) and the Rust in-process runner (`milpa-conformance/src/runner.rs`) call
   resolver APIs directly, bypassing CLI routing. Per `cli-contract.md §3.1 NOTE` the
   **black-box CLI path is the normative gate**. A fixture reachable only via an
   in-process adapter is a per-impl unit test, NOT a cross-impl conformance fixture
   (relevant to #167 and to `lock-roundtrip`/`workspace-manifest-roundtrip`, which
-  today have no CLI surface and are never cross-impl compared).
+  have no CLI surface and are never cross-impl compared).
+  - **Long-term disposition (round-2 decision — Option A):** the two in-process
+    adapters are **permanent fast inner-loop dev tools**, not phased out. They are
+    never normative. This matches the repo's testing philosophy (fast unit feedback +
+    a separate cross-impl gate). The corollary (newly enforced below): **an in-process
+    adapter that produces a *different normative output* than its own CLI is itself a
+    bug** — the adapter must mirror the CLI's env/configuration logic, not a simplified
+    proxy of it. fixture-144 (§4 Slice 2) is exactly this bug.
+
+### 3.4  Multi-epoch handling (round-2 gap — currently unimplemented)
+
+The invariant is scoped to "the spec version an impl claims." The runner does not honor
+this: `corpus.py::_discover_fixtures()` discovers **every** `spec-v<N>/` directory and
+runs all of them against all impls; `known_failing` is a flat basename set with no
+version dimension. When `spec-v2/` exists, a v2-only impl that intentionally changes a
+v1 behavior will be flagged as a parity violation, and `_all_fixture_names()` would
+wrongly enrol every v1 fixture as "known failing" (those are *intentional
+non-conformance*, not regressions).
+
+D1 specifies the mechanism (build now is deferred per
+[[spec_versioning_deferred]] — there is no v2 yet — but the design is fixed so a future
+bump cannot be dodged by an ad-hoc workaround):
+- Each impl declares its conformed epoch set in its conformance metadata
+  (`spec-version`, see §3.5).
+- The runner filters discovered fixtures to the intersection of (declared epochs) ×
+  (discovered corpus epochs) per impl. An impl is held to **exactly** its declared
+  epochs.
+- Parity is compared **only among impls that share a declared epoch**, on that epoch's
+  corpus. Two impls on disjoint epochs are never diffed.
+
+### 3.5  New-impl onboarding protocol (round-2 gap — the Nim dogfood gate)
+
+D1's entire justification is the *third* impl, yet nothing today specifies how one
+registers. Make this normative:
+- **Conformance declaration (`spec/conformance-fixtures.md §1.4` NORMATIVE).** Each
+  impl declares `spec-version`, `corpus`, and `known-failing` in its project metadata.
+  Rust has it (`crates/milpa-conformance/Cargo.toml [package.metadata.milpa]`);
+  **Python is missing `[tool.milpa]` in `pyproject.toml`** — add it (§4 Slice 0).
+  The Nim impl declares the equivalent in its build manifest.
+- **Harness registration.** A new impl adds an `ImplDescriptor` to
+  `descriptors.py::build_descriptors()`. Required fields: binary path convention,
+  `invoke_via` (`Subprocess` today; `Container` is a documented extension point that
+  currently raises `NotImplementedError` — onboarding a containerized impl must
+  implement it).
+- **Partial-conformance onboarding.** A new impl starts with
+  `known_failing = _all_fixture_names(corpus)` (the existing helper) and greens
+  fixtures incrementally. "Registered but partial" (non-empty `known_failing`) is a
+  legitimate merged state; "conformant" means empty `known_failing` for its declared
+  epochs. The onboarding gate is therefore *registration*, not *full green*.
+
+### 3.6  Enforcement status — the CI gap (round-2 finding; name it, don't hide it)
+
+The invariant's enforcement gate (`python3 -m harness`) is **not run in CI today**.
+`.github/workflows/ci.yaml` runs `uv run pytest` (Python in-process) and
+`./dev-rust test --workspace` (Rust in-process) — both *in-process adapters*, never the
+black-box differential runner. The Rust CI job builds debug, not the
+`target/release/milpa` the harness needs; `harness/test_coverage.py` (the coverage-floor
+enforcer) is outside `impls/python/tests/` and so is also never run in CI. **An
+invariant nobody enforces automatically is aspirational.**
+
+A full CI redesign (matrix + differential harness) is deliberately deferred (a large
+rewrite is pending; see [[feedback_commit_cadence_ci_defer]]). Until then this RFC
+adopts a **transitional enforcement protocol**:
+1. A documented pre-merge step: contributors run `./dev-rust build --release` then
+   `python3 -m harness` locally and confirm green before merging corpus/resolver
+   changes.
+2. A non-blocking CI job that runs the harness (best-effort; may skip if the release
+   binary is unavailable) so divergence is at least *visible* on PRs.
+3. The coverage-floor test (`harness/test_coverage.py`) is added to the same job.
+
+This is a stopgap, explicitly named so the deferral is a decision, not an omission.
 
 ## 4  Phase 1 — baseline restoration (finite)
 
-Exit criterion: `python3 -m harness` is green for both impls with empty
-`known_failing` lists for the fixtures below, and each fix is pinned as a fixture.
+Exit criterion: `python3 -m harness` is green for both impls **and** every impl's
+`known_failing` set is empty for the fixtures below, with each fix pinned as a fixture.
+Note (round-2): `overall_passed()` checks only `failed == 0 and divergences == 0` — it
+does **not** assert `known_failing` is empty. Either add that assertion (preferred:
+a `--require-empty-known-failing` harness mode) or treat "zero SKIP(known-failing)
+lines" as a manually-checked criterion. State which; do not leave it implicit.
 
-### Slice 0 — formal baseline protocol (blocks everything)
+### Slice 0 — formal baseline protocol (blocks Slices 1–2; see §4 note on Slice 3)
 
 Not an informal re-run. Produce a checked-in baseline record by:
-1. Running the black-box harness against both impls (`python3 -m harness`).
-2. Running the Rust in-process suite (`./dev-rust test -p milpa-conformance`, inside
-   the pinned container — requires podman/docker + the
-   `ghcr.io/coreyleavitt/milpa-rust` image; verify pullable first).
-3. Diffing in-process vs black-box per impl: any fixture that passes in-process but
-   fails black-box (or vice versa) is an **adapter/runner gap**, not an impl bug —
-   classify it as such, do not "fix" it as a parity violation.
-4. Recording the result as a versioned text artifact in the repo so later slices can
+1. Building the Rust release binary (`./dev-rust build --release`) so the black-box
+   harness can invoke it (the harness skips Rust otherwise).
+2. Running the black-box harness against both impls (`python3 -m harness`). **This run
+   will exit nonzero** (fixture-099 is Rust-red today; see Slice 1). The *failing
+   output is the baseline artifact* — Slice 0 records reality, it does not produce a
+   green run.
+3. Running each in-process suite (`uv run pytest`; `./dev-rust test -p milpa-conformance`
+   inside the pinned container — image `ghcr.io/coreyleavitt/milpa-rust`, verified
+   locally pullable).
+4. **Diffing in-process vs black-box per impl and classifying each mismatch:**
+   - passes black-box, fails in-process → **in-process adapter gap** (the adapter
+     diverges from the CLI). Fix the adapter. *fixture-144 is this case (Slice 2).*
+   - fails black-box, passes in-process → **either** an adapter gap (the adapter
+     bypasses a layer the CLI exercises) **or** a CLI-wiring bug (library correct, CLI
+     misroutes). The latter **is** an impl bug at the CLI layer — do not auto-classify
+     this direction as "adapter gap, don't fix." Decide by checking whether the CLI
+     exercises a code path the adapter skips.
+   - fails both → impl bug or fixture error (diagnose per case).
+5. Adding `[tool.milpa]` to `impls/python/pyproject.toml` (§3.5) so Python satisfies
+   the §1.4 NORMATIVE conformance declaration.
+6. Recording the result as a versioned text artifact in the repo so later slices can
    legitimately claim to "fix a red."
 
 ### Slice 1 — fixture-099 (#154), Rust-only red
 
 Python passes; Rust emits `FETCH-ALL-FAILED` where the corpus expects
 `RES-PROVENANCE-CONFLICT`. The Rust provenance gate **is** implemented and unit-tested
-— so "not wired" is the wrong diagnosis. **Candidate root cause (round-1 trace, to
-confirm at fix time):** `edgeset_to_extracted` deduplicates URL requires by *derived
-dep name* before enqueueing, so two requires with different URLs that strip to the
-same name collapse to one `Item::Url`; the gate never sees both provenances and cannot
-raise the conflict. Fix direction: enqueue both URL items and let the gate handle
-same-name suppression/conflict — not "add a missing code path."
+— "not wired" is the wrong diagnosis. **Root cause (verified in source, round 2):**
+`edgeset_to_extracted` (`impls/rust/crates/milpa-core/src/resolver.rs`, ~L2717–2731)
+deduplicates URL requires by *derived dep name* (`seen_dep_names`) **before** creating
+`Item::Url`, so two requires with different URLs that strip to the same name
+(`sharedlib` from both `…/example/sharedlib.git` and `…/other/sharedlib.git`) collapse
+to one item; the gate never sees both provenances and cannot raise the conflict.
+Python's BFS checks the provenance gate *before* its URL-key dedup, so it sees both.
 
-### Slice 2 — fixture-144 (#153), a fixture authoring error (BOTH impls)
+**Fix direction (confirmed safe):** remove the `seen_dep_names` guard for
+`RequireEntry::Url`; enqueue both items and let `gate()` handle it —
+`prior_key == pkey` → `Gate::Suppress` (legitimate same-provenance duplicate),
+different pkey → `Gate::Conflict`. The gate already distinguishes these, so dedup is
+not lost.
+- **Second bug site (round-2 finding):** `edgeset_to_terms`
+  (`edge_sources.rs` ~L440–445) carries the *same* `seen_dep_names` dedup. It is only
+  called from `edge_sources.rs` tests today (not the transitive path), so it does not
+  cause the current violation — but it is a latent copy. Patch both sites, or add a
+  `// INVARIANT: only safe when a gate is downstream` comment to `edgeset_to_terms`.
+- **/tdd gate (round-2 finding):** this is a **Rust-only** fix. The standard
+  `cd impls/python && uv run pytest` gate is always green here and would mask the red.
+  Drive this slice with: RED = `./dev-rust test -p milpa-conformance` fails on
+  fixture-099; GREEN = it passes **and** `fixture-099` is removed from
+  `known_failing.txt` (which uses the `spec-v1/fixture-099-…` prefixed form).
 
-Both impls emit `RES-UNATTESTED-METADATA`; the corpus expects
-`TNG-DEPDECL-FETCH-FAILED`. This is **not** an impl bug and **not** "Python pending a
-resolver slice." **Verified 2026-06-21:** the fixture directory has *no* `dep-decl/`
-subdirectory, so the harness never sets `MILPA_DEP_DECL_DIR` (§2.11), `FileDepDeclStore`
-never activates, resolution falls through to the nimble path, and the attestation
-policy raises `RES-UNATTESTED-METADATA`. The code path that raises
-`TNG-DEPDECL-FETCH-FAILED` requires `MILPA_DEP_DECL_DIR` set to a dir lacking the
-artifact. **Fix the fixture** (add the `dep-decl/` directory per `§2.11` / the §4
-coverage-floor note), not the impls. Then remove `fixture-144` from Python's
-`_NOT_YET_WIRED_FIXTURE_NAMES` and Rust's `known_failing.txt` together (a strict
-xfail→pass transition).
+### Slice 2 — fixture-144 (#153): an IN-PROCESS ADAPTER bug (round-2 reversal)
 
-### Slice 3 — `project-dir` control file: spec-first (#167)
+**The round-1 diagnosis ("fixture authoring error — add a `dep-decl/` dir") was wrong.
+Do not add a `dep-decl/` directory.** Empirically verified 2026-06-21:
+
+- **Black-box CLI — already correct.** With `index.kdl` present the harness sets
+  `MILPA_INDEX_URL=file://…/index.kdl` and (no `dep-decl/`) leaves `MILPA_DEP_DECL_DIR`
+  unset. The CLI's `_build_dep_decl_store` then takes case 3 → `HttpDepDeclStore` over
+  the `file://` index base → looks up the missing
+  `dep-decl/8345eab….kdl` → raises `TNG-DEPDECL-FETCH-FAILED`; strict mode
+  (`MILPA_REQUIRE_ATTESTED_METADATA=1`) re-raises. Confirmed by running the Python CLI
+  directly: `milpa-error: TNG-DEPDECL-FETCH-FAILED`, exit 1 — **matches
+  `expected/error`.** fixture-144 **passes the normative gate.**
+- **In-process adapters — diverge.** Both the Rust in-process runner
+  (`runner.rs` ~L554–558: `if dep_decl_dir.is_dir() { … } else { None }`) and the
+  Python `test_conformance.py` gate the `dep_decl_store` on the **physical presence of
+  a `dep-decl/` directory** rather than on the `MILPA_INDEX_URL`→`HttpDepDeclStore`
+  logic the CLI uses. With no dir, the store is `None`, resolution falls through to
+  nimble, and the attestation policy raises `RES-UNATTESTED-METADATA` — a mismatch the
+  adapters park in their `known_failing` lists.
+
+**Fix:** make the in-process adapters mirror the CLI — when `dep-decl/` is absent but
+an index is configured, build an `HttpDepDeclStore` from the index URL (as the CLI
+does), instead of forcing `None`. This is the §3 corollary in action: an adapter must
+not produce a different normative output than its own CLI. After the fix, remove
+`fixture-144` from Python's `_NOT_YET_WIRED_FIXTURE_NAMES` and Rust's
+`known_failing.txt`. (Black-box `descriptors.py` has **no** fixture-144 parking — by
+design, since the CLI already passes it. The cleanup touches the **two in-process**
+lists only.)
+
+**Spec reconciliation:** `conformance-fixtures.md` (~L1009) says "fixture-144:
+`dep-decl/` directory is present but empty." The fixture has *no* `dep-decl/` dir at
+all, and the correct behavior (per the verified CLI trace) is the *absent*-dir +
+`file://` index path. Correct the spec note to describe the actual mechanism (absent
+dir → `HttpDepDeclStore` miss), not an empty dir.
+
+### Slice 3 — `project-dir` control file: spec-first (#167) — independent of 0–2
 
 `project-dir` is used by `fixture-288` but appears **nowhere in `spec/`** (verified).
 It is an unspecced control file the CLI harness honors and the in-process adapters
-ignore — a two-tier corpus. Fix order: (1) add `project-dir` to
-`spec/conformance-fixtures.md` as a normative control input (semantics: the project
+ignore — a two-tier corpus. Note (round-2): fixture-288 **already passes both impls
+black-box** with zero divergence, so this slice does **not** perturb the Slice-0
+baseline and can be done in any order relative to 1–2. Fix order: (1) add `project-dir`
+to `spec/conformance-fixtures.md` as a normative control input (semantics: the project
 root is `<fixture-root>/<value>`, i.e. the dir passed as `-C` to the impl); (2) teach
-both in-process adapters to honor it. Per §3, fixtures that remain reachable only via
-an adapter are not cross-impl fixtures.
+both in-process adapters to honor it. Per §3, fixtures reachable only via an adapter
+are not cross-impl fixtures.
 
 ## 5  Phase 2 — corpus coverage discipline (ongoing)
 
 Governed by the saturation bar in `rfc-differential-conformance-harness.md`
 (every normative MUST-clause maps to ≥1 fixture; a tier-2 generator run produces no
 new divergence). This RFC contributes the **promotion workflow** and the specific
-hand-authored fixtures below.
+hand-authored fixtures below, now sliced (S4–S7).
 
-**Promotion workflow (the violation→fixture loop).** When Python≠Rust (found by the
-harness, the generator, or by hand):
-1. Read the spec to determine the correct behavior (spec is arbiter). If the spec is
-   silent, file a spec-sharpening issue and **defer** the fixture until resolved.
-2. Shrink the input to minimal form.
-3. Emit a candidate via `harness/pin.py` (writes a fixture dir *without* `expected/`
-   plus `divergence.json`).
-4. **Human-bless `expected/`** from the spec-correct impl's output (lockfile: against
-   the canonical sort; nim.cfg: against `lockfile-schema.md`; slug: against
-   `errors.md`).
-5. Merge into `conformance/spec-v1/`; remove any `known_failing` parking.
+**Promotion workflow.** The generate→disagree→shrink→bless→pin loop is defined in
+`rfc-differential-conformance-harness.md §2c`; do not re-state it here. This RFC adds
+two constraints on top of §2c:
+1. **Field-level spec derivation when blessing `expected/` (anti-circularity).** §2c's
+   "bless from the spec-correct impl" is circular when the spec is ambiguous — blessing
+   from one impl's output can encode an impl artifact (e.g. dict iteration order) as
+   normative. Rule: each field of a blessed `expected/` MUST be derivable from a
+   specific normative clause (lockfile → canonical sort in `lockfile-schema.md`;
+   nim.cfg → emission order in its spec; slug → `errors.md`). **Any field not derivable
+   from the spec is a spec hole — file a spec-sharpening issue and defer the fixture**
+   rather than blessing an impl-specific value.
+2. **Every fix lands as a pinned corpus fixture** (policy, see §8): not merely a
+   `known_failing` edit or an in-process unit test. A fix without a pinned fixture
+   leaves every future impl (Nim) unguarded against the same regression.
 
-**Policy (recommended, see §8):** every fix in this RFC MUST land as a pinned corpus
-fixture, not merely a `known_failing` edit or an in-process unit test. A fix without a
-pinned fixture leaves every future impl (Nim) unguarded against the same regression.
+**`harness/pin.py` interface (specify before Phase 2 is actionable).** Today the RFC
+treats `pin.py` as a black box ("writes a fixture dir without `expected/` plus
+`divergence.json`"). Target ergonomics — one command:
+`python3 -m harness pin <fixture-or-input-dir>` that (a) runs both impls, (b) emits a
+candidate fixture dir + `divergence.json`, (c) takes a single interactive gate — which
+impl is spec-correct (subject to the field-level derivation rule above) — and (d)
+re-runs the harness to confirm the pinned fixture passes for the winning impl. Document
+`pin.py`'s actual current arguments so the gap to this target is explicit.
 
-**Hand-authored fixtures:**
-- **#148 — adversarial corrupt tar archives** (mid-archive bad checksum; GNU base-256
-  checksum). Ship a *pre-built* corrupt archive in `mocked-fetches/` (no `format`
-  file ⇒ pre-built mode); both impls must surface the same terminal slug. Note: the
-  inner extract/fetch codes are fetch-wrapped to `FETCH-ALL-FAILED` at the black-box
-  boundary (§7), so the fixture asserts the wrapper slug, not the inner code.
-- **#146 — tarball bz2-identity + mixed-case sha256.** Reframed: this is a
-  **success-path byte-equality** gap (does each impl extract+hash a bz2 archive to
-  the same `content_hash`?), not an error-code-floor gap. The "encoder determinism"
-  blocker only applies to *build-mode* fixtures; authoring a **pre-built** bz2 archive
-  with a fixed `archive_sha256` sidesteps it entirely. Prefer pre-built mode unless
-  the suite must also prove the impls can *build* bz2 (a separate concern).
-- **#166 — workspace + dev-deps resolve fixture.** Pure addition; the workspace
-  resolver already seeds member dev-deps. Confirm `fixture-064-dev-deps` (single-pkg)
-  and the workspace baseline are green first.
-- **#135 — `milpa show` surfacing cond_requires.** `show` output is non-frozen in
-  spec v1.0 (§2.7.2), so this is a **liveness** fixture (exit-0 + non-empty stdout),
-  not a byte-compare. Byte-comparing `show` output would require first freezing its
-  format — out of scope here; file separately if wanted.
+**Static corpus lint (round-2 addition — fixture-rot guard).** fixture-144 was wrong
+for an unknown period because nothing checks fixtures statically. Add a lint
+(runnable without executing any impl) that asserts, for every fixture: (a) `expected/error`
+(when present) contains a slug that exists in `spec/errors.md`; (b) the slug in the
+fixture **directory name** is semantically consistent with `expected/error`. Run it in
+the §3.6 harness CI job.
+
+### Phase 2 slices
+
+- **S4 — adversarial corrupt tar archives (#148).** **Blocked on a mechanism gap
+  (round-2 finding):** the RFC's "ship a pre-built corrupt archive (no `format` file ⇒
+  pre-built mode)" is **mechanically impossible today** — pre-built/copy mode
+  (`mocked.py` ~L265–295) copies `content/` verbatim and **never invokes the
+  extractor**, so a corrupt blob is never read; build mode only ever builds *valid*
+  archives. There is no path that pipes raw fixture bytes through the *real*
+  `TarballFetcher`. **Prerequisite slice S4a:** design+spec a mocked-fetcher "raw
+  bytes" mode (an `archive` file fed through the real extractor) in both impls, then
+  S4 authors the fixture. Entry: S4a landed in both impls. Done: both impls surface
+  the same terminal slug; per §7 the inner extract code is fetch-wrapped to
+  `FETCH-ALL-FAILED` at the boundary, so the fixture asserts the wrapper slug.
+- **S5 — tarball bz2 byte-equality (#146).** Reframed as a **success-path
+  byte-equality** gap (do both impls extract+hash a bz2 archive to the same
+  `content_hash`?). **Caveat (round-2):** bz2 is **not currently supported** in either
+  impl (Python ~L112, Rust ~L1034) and pre-built copy mode doesn't extract — so this
+  fixture needs the S4a raw-bytes mode *and* bz2 decompression support. Sequence S5
+  after S4a; if bz2 support is out of scope, descope S5 to a filed issue rather than
+  authoring a fixture that can't run. Entry: S4a + bz2 decode landed. Done:
+  byte-identical `content_hash` in both impls' lockfiles.
+- **S6 — workspace + dev-deps resolve fixture (#166).** Pure addition; the workspace
+  resolver already seeds member dev-deps. Entry: `fixture-064-dev-deps` (single-pkg)
+  and the workspace baseline are green. Done: cross-impl byte-identical resolve, pinned.
+- **S7 — `milpa show` surfacing cond_requires (#135) — LIVENESS, not byte-compare.**
+  `show` output is non-frozen in spec v1.0, so this is a **liveness** fixture (exit-0 +
+  non-empty stdout), a different exit criterion from S4–S6. Byte-comparing `show`
+  output would require first freezing its format — out of scope; file separately if
+  wanted. Entry: a `show` invocation exercises `cond_requires`. Done: liveness fixture
+  green for both impls.
 
 ## 6  Removed from scope (round 1)
 
@@ -185,13 +400,12 @@ pinned fixture leaves every future impl (Nim) unguarded against the same regress
   `cli-contract.md §3.1` makes the human diagnostic line non-normative by design and
   the normative `milpa-error: <SLUG>` line is already byte-identical across impls (all
   error fixtures pass). Standardizing the human prefix would *amend a deliberate
-  design decision* for zero conformance value. If UX consistency is still wanted, it
-  is a cosmetic concern for the diagnostics RFC (#106), not parity. Recommend closing
-  #156 as "non-normative by design."
+  design decision* for zero conformance value. Recommend closing #156 as
+  "non-normative by design"; UX consistency, if wanted, is the diagnostics RFC (#106).
 - **#124 — widen tier-2 unsatisfiable generator diversity.** Belongs to
   `rfc-differential-conformance-harness.md` (it owns tier-1/tier-2 generators), and
   as written it references deleted code (`unsatisfiable_graph_st`, removed in
-  `5ae87ad`). Move the issue under the differential-harness umbrella; it is blocked on
+  `5ae87ad`). Move the issue under the differential-harness umbrella; blocked on
   re-landing the generator there.
 
 ## 7  Known blind spot — wrapping boundaries
@@ -201,8 +415,20 @@ they are wrapped at a boundary (fetcher inner codes → `FETCH-ALL-FAILED`; iden
 codes → `LOCK-DEP-IDENTITY-INVALID`). Two impls can wrap **differently** and still
 agree on the observable wrapper slug — a divergence the corpus cannot catch by
 construction. Mitigations this RFC adopts:
-- The inner-code→wrapper *mapping* MUST be unit-tested within each impl (not only at
-  the black-box boundary).
+- The inner-code→wrapper *mapping* MUST be unit-tested within each impl. **But this is
+  insufficient alone (round-2):** per-impl unit tests catch *within-impl* regression,
+  not *cross-impl* divergence — Python and Nim can each pass their own mapping tests
+  while mapping the same inner condition to different wrappers, both emitting the same
+  boundary slug. Two additional mitigations:
+  - **Every wrapped code MUST have ≥1 black-box fixture that exercises an inner code
+    path through its wrapper** (e.g. S4 drives a real extract failure to
+    `FETCH-ALL-FAILED`), so the boundary mapping is observed cross-impl for at least
+    one path per wrapper.
+  - **Cross-impl root-cause substring check:** when both impls emit the same wrapper
+    slug for a fixture, their (non-normative) diagnostic messages MUST each contain a
+    shared root-cause token (a digest, a URL) identifying the *same* underlying cause.
+    This is a weaker-than-byte but stronger-than-slug cross-check that catches
+    divergent wrapping without freezing the human line.
 - Changing a wrapping boundary is a **spec-level event** (it can make a
   previously-unreachable code observable); whoever changes it must add the
   now-reachable fixture.
@@ -211,17 +437,15 @@ construction. Mitigations this RFC adopts:
 
 **Scope boundary vs `rfc-differential-conformance-harness.md`.** With #124 moved out,
 the remaining work cleanly bifurcates. Three framings were weighed:
-- **(a) one RFC, two phases (recommended):** Phase 1 baseline restoration + Phase 2
+- **(a) one RFC, two phases (chosen):** Phase 1 baseline restoration + Phase 2
   coverage discipline live here; generation is a declared dependency on the
   differential-harness RFC. Keeps the parity *discipline* in one place.
-- **(b) narrow this RFC to baseline + D1 only:** keep #154, #153, #167 and the
-  normative-surfaces spec section here; move all corpus-widening (#146, #148, #166,
-  #135) to the differential-harness RFC, which already owns generative coverage.
-  Cleaner ownership; more cross-RFC coordination.
-- **(c) three-way split** by kind (bug-fix / widening / spec-amendment). Maximal
-  separation; likely over-fragmented.
+- **(b) narrow to baseline + D1 only:** move all corpus-widening to the
+  differential-harness RFC. Cleaner ownership; more cross-RFC coordination.
+- **(c) three-way split** by kind. Maximal separation; over-fragmented.
 
 **Decision: (a)** — one RFC, two phases. The bug fixes are the motivating examples of
 the discipline the RFC defines, and keeping them together preserves a single coherent
 done-state. Generation remains owned by the differential-harness RFC and is a declared
-dependency of Phase 2.
+dependency of Phase 2 (S4a's raw-bytes mode and the generator are the real gates for
+the bulk of Phase 2).
