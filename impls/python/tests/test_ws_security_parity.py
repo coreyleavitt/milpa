@@ -329,6 +329,49 @@ def test_member_resolves_to_root_via_symlinked_ws_root_from_manifest(
 
 
 # ---------------------------------------------------------------------------
+# Mid-path dangling symlink parity (new — matches Rust workspace_tests.rs
+# `mid_path_dangling_symlink_outside_root_yields_path_escape`)
+#
+# Python `resolve(strict=False)` follows a mid-path dangling symlink to its
+# (nonexistent) target, so `is_relative_to(root)` catches outside escapes even
+# when the symlink is NOT the final path component.
+# ---------------------------------------------------------------------------
+
+
+def test_mid_path_dangling_symlink_outside_root_yields_path_escape(
+    tmp_path: Path,
+) -> None:
+    """Member 'danglink/pkg' where 'danglink' is a dangling symlink outside root.
+
+    Layout::
+
+      tmp_path/
+        workspace-root/
+          milpa.kdl      (workspace declaring member "danglink/pkg")
+          danglink -> ../../outside-nonexistent   (dangling: target absent, outside root)
+
+    Python ``Path.resolve(strict=False)`` reads danglink's target and resolves
+    ``outside-nonexistent/pkg``.  ``is_relative_to(root)`` is False →
+    WS-MEMBER-PATH-ESCAPE.  Pins parity with Rust after the ancestor-walk fix.
+    """
+    ws_root = tmp_path / "workspace-root"
+    ws_root.mkdir()
+    _write_workspace(ws_root, ["danglink/pkg"])
+    # Create a dangling symlink at ws_root/danglink pointing outside the root.
+    # Target does NOT exist.
+    (ws_root / "danglink").symlink_to("../../outside-nonexistent")
+    assert not (ws_root / "danglink").exists(), "danglink target must be absent"
+    assert not (ws_root / "danglink" / "pkg").exists(), "mid-path must be unreachable"
+
+    with pytest.raises(MilpaError) as exc_info:
+        load_workspace(ws_root)
+    assert exc_info.value.slug == WS_MEMBER_PATH_ESCAPE, (
+        f"Expected WS-MEMBER-PATH-ESCAPE, got {exc_info.value.slug!r} — "
+        "mid-path dangling symlink outside root must be detected as an escape"
+    )
+
+
+# ---------------------------------------------------------------------------
 # F7: load_workspace_with_member_override must raise MilpaError, not AssertionError
 # ---------------------------------------------------------------------------
 

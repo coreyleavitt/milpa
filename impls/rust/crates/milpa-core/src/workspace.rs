@@ -85,6 +85,9 @@ fn best_effort_resolve(path: &std::path::Path) -> std::path::PathBuf {
         // normalize lexically.  This is how Python resolve(strict=False) handles
         // dangling symlinks: it reads the link and appends the target to the
         // resolved parent, even though the target doesn't exist.
+        // parent() is None only for "/" or a bare filename; a dangling-symlink
+        // member path always has a real parent component, so the fallback is
+        // unreachable in practice.
         let parent = path.parent().unwrap_or(path);
         let real_parent = best_effort_resolve(parent);
         let joined = if link_target.is_absolute() {
@@ -116,10 +119,17 @@ fn best_effort_resolve(path: &std::path::Path) -> std::path::PathBuf {
 
     match found {
         Some((ancestor, prefix_len)) => {
-            // Canonicalize the existing prefix (follows all symlinks in it).
-            let real_prefix = ancestor
-                .canonicalize()
-                .unwrap_or_else(|_| normalize_lexically(&ancestor));
+            // Recursively resolve the existing ancestor prefix.  This handles
+            // mid-path dangling symlinks: if `ancestor` itself is a dangling
+            // symlink, `canonicalize()` fails and the old
+            // `unwrap_or_else(normalize_lexically)` fallback returned the
+            // lexical path WITHOUT following the link — producing the wrong
+            // result.  Delegating back to `best_effort_resolve` re-enters the
+            // dangling-symlink branch above, which reads the link target and
+            // resolves correctly.  Termination is guaranteed because `ancestor`
+            // is a STRICT prefix of `path` (strictly fewer components), so
+            // each recursive call operates on a strictly shorter path.
+            let real_prefix = best_effort_resolve(&ancestor);
             // Re-append the non-existent suffix components.
             let suffix: std::path::PathBuf = components[prefix_len..].iter().collect();
             normalize_lexically(&real_prefix.join(suffix))

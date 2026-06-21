@@ -182,6 +182,58 @@ fn dangling_symlink_inside_root_yields_dir_missing() {
     assert_eq!(result.code(), "WS-MEMBER-DIR-MISSING");
 }
 
+/// Mid-path dangling symlink: member "danglink/pkg" where "danglink" is a
+/// dangling symlink pointing outside the workspace root.
+///
+/// Python: `(root / "danglink/pkg").resolve(strict=False)` reads danglink's
+/// target, resolves it relative to root → outside path →
+/// `is_relative_to(root)` False → WS-MEMBER-PATH-ESCAPE.
+///
+/// Rust before the fix: `symlink_metadata("danglink/pkg")` fails (parent
+/// dangling) → ancestor-walk finds `danglink` → `ancestor.canonicalize()`
+/// fails (dangling) → `normalize_lexically("root/danglink")` (does NOT follow
+/// link) → `root/danglink/pkg` starts_with(root) True → WS-MEMBER-DIR-MISSING.
+/// WRONG slug — divergence from Python.
+///
+/// After the fix: ancestor-walk finds `danglink` → `best_effort_resolve(danglink)`
+/// → dangling branch → reads link target `../../outside-nonexistent` → resolves
+/// outside root → `outside/pkg` starts_with(root) False → WS-MEMBER-PATH-ESCAPE.
+/// CORRECT — parity with Python.
+#[test]
+#[cfg(unix)]
+fn mid_path_dangling_symlink_outside_root_yields_path_escape() {
+    use std::os::unix::fs::symlink;
+
+    // Layout:
+    //   <outer>/
+    //     workspace-root/
+    //       milpa.kdl      (workspace declaring member "danglink/pkg")
+    //       danglink -> ../../outside-nonexistent  (dangling: target absent)
+    //   (no "outside-nonexistent" directory — the link is dangling)
+    let outer = tempfile::tempdir().unwrap();
+    let ws_root = outer.path().join("workspace-root");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    std::fs::write(
+        ws_root.join("milpa.kdl"),
+        "workspace {\n    member \"danglink/pkg\"\n}\n",
+    ).unwrap();
+    // Create dangling symlink at ws_root/danglink → ../../outside-nonexistent
+    // The target does NOT exist; danglink/pkg is a mid-path dangling case.
+    symlink("../../outside-nonexistent", ws_root.join("danglink")).unwrap();
+    // Confirm the member path is truly unreachable (stat fails on danglink/pkg).
+    assert!(!ws_root.join("danglink").exists(), "danglink target must be absent");
+    assert!(!ws_root.join("danglink/pkg").exists(), "mid-path must be unreachable");
+
+    let result = load_workspace(&ws_root).unwrap_err();
+    assert_eq!(
+        result.code(),
+        "WS-MEMBER-PATH-ESCAPE",
+        "mid-path dangling symlink pointing outside root must yield \
+         WS-MEMBER-PATH-ESCAPE (not WS-MEMBER-DIR-MISSING) — got {:?}",
+        result.code()
+    );
+}
+
 #[test]
 fn member_dir_missing() {
     // member "a" declared but no `a/` directory created.
@@ -273,6 +325,53 @@ fn member_resolves_to_root_via_symlinked_ws_root_yields_is_workspace() {
     assert_eq!(result.code(), "WS-MEMBER-IS-WORKSPACE",
         "loading workspace via symlinked root with member 'pkg/..' should yield \
          WS-MEMBER-IS-WORKSPACE, not PATH-ESCAPE — got code {:?}", result.code());
+}
+
+/// Symlinked workspace root, via load_workspace_from_manifest: member "pkg/.." → WS-MEMBER-IS-WORKSPACE.
+///
+/// Mirrors the existing `member_resolves_to_root_via_symlinked_ws_root_yields_is_workspace`
+/// test above, but exercises `load_workspace_from_manifest` instead of `load_workspace`.
+/// Python already tests both paths (test_ws_security_parity.py:
+/// `test_member_resolves_to_root_via_symlinked_ws_root_from_manifest`); this closes the
+/// corresponding Rust gap.
+#[test]
+#[cfg(unix)]
+fn member_resolves_to_root_via_symlinked_ws_root_from_manifest_yields_is_workspace() {
+    use std::os::unix::fs::symlink;
+
+    // Layout:
+    //   <outer>/
+    //     realroot/
+    //       milpa.kdl    (workspace declaring member "pkg/..")
+    //     link -> realroot   (symlink)
+    let outer = tempfile::tempdir().unwrap();
+    let realroot = outer.path().join("realroot");
+    std::fs::create_dir_all(&realroot).unwrap();
+    std::fs::write(
+        realroot.join("milpa.kdl"),
+        "workspace {\n    member \"pkg/..\"\n}\n",
+    ).unwrap();
+    let link = outer.path().join("link");
+    symlink("realroot", &link).unwrap();
+
+    // Construct the Workspace struct directly (bypassing manifest file read).
+    let parsed = milpa_manifest::Workspace {
+        members: vec!["pkg/..".to_string()],
+        overrides: vec![],
+        flags: vec![],
+        name: None,
+    };
+
+    // Load workspace from the SYMLINK path with a pre-parsed manifest.
+    // "pkg/.." lexically resolves to the workspace root — should be WS-MEMBER-IS-WORKSPACE.
+    let result = load_workspace_from_manifest(&link, &parsed).unwrap_err();
+    assert_eq!(
+        result.code(),
+        "WS-MEMBER-IS-WORKSPACE",
+        "load_workspace_from_manifest via symlinked root with member 'pkg/..' \
+         should yield WS-MEMBER-IS-WORKSPACE, not PATH-ESCAPE — got {:?}",
+        result.code()
+    );
 }
 
 #[test]
