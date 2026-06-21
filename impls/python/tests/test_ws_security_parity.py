@@ -257,6 +257,78 @@ def test_dangling_symlink_inside_root_yields_dir_missing(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
+# Symlinked-workspace-root divergence (Linux parity — Rust fix verification)
+#
+# Bug: Rust branch-(c) of old is_under_root used normalize_lexically on the
+# non-existent candidate, which does NOT canonicalize symlinks in the prefix.
+# So if root is accessed via a symlink:
+#   - real_root = canonicalize(link) = realroot
+#   - real_cand = normalize_lexically(link/pkg/..) = link  (symlink NOT followed)
+#   - link.starts_with(realroot) = False → WS-MEMBER-PATH-ESCAPE (WRONG)
+#
+# Python already gets this right: (link / "pkg/..").resolve() canonicalizes
+# the existing "link" prefix to "realroot" before applying "pkg/.." lexically.
+#
+# These tests pin the correct Python behavior; the matching Rust test is
+# member_resolves_to_root_via_symlinked_ws_root_yields_is_workspace in
+# workspace_tests.rs.
+# ---------------------------------------------------------------------------
+
+
+def test_member_resolves_to_root_via_symlinked_ws_root_load_workspace(
+    tmp_path: Path,
+) -> None:
+    """load_workspace via a symlink-accessed root: member 'pkg/..' → WS-MEMBER-IS-WORKSPACE.
+
+    Layout::
+
+      tmp_path/
+        realroot/
+          milpa.kdl    (workspace declaring member "pkg/..")
+        link -> realroot   (symlink)
+
+    Python ``Path.resolve(strict=False)`` canonicalizes the existing "link" prefix
+    to "realroot" before normalizing "pkg/.." → "realroot".  ``is_relative_to``
+    is True (inclusive) → WS-MEMBER-IS-WORKSPACE, not WS-MEMBER-PATH-ESCAPE.
+    """
+    realroot = tmp_path / "realroot"
+    realroot.mkdir()
+    (realroot / "milpa.kdl").write_text(
+        'workspace {\n    member "pkg/.."\n}\n', encoding="utf-8"
+    )
+    link = tmp_path / "link"
+    link.symlink_to("realroot")
+
+    with pytest.raises(MilpaError) as exc_info:
+        load_workspace(link)
+    assert exc_info.value.slug == WS_MEMBER_IS_WORKSPACE, (
+        f"Expected WS-MEMBER-IS-WORKSPACE, got {exc_info.value.slug!r} — "
+        "symlinked root with member 'pkg/..' should resolve to root"
+    )
+
+
+def test_member_resolves_to_root_via_symlinked_ws_root_from_manifest(
+    tmp_path: Path,
+) -> None:
+    """load_workspace_from_manifest via a symlink-accessed root: same semantics."""
+    realroot = tmp_path / "realroot"
+    realroot.mkdir()
+    (realroot / "milpa.kdl").write_text(
+        'workspace {\n    member "pkg/.."\n}\n', encoding="utf-8"
+    )
+    link = tmp_path / "link"
+    link.symlink_to("realroot")
+
+    ws_manifest = WorkspaceManifest(members=("pkg/..",))
+    with pytest.raises(MilpaError) as exc_info:
+        load_workspace_from_manifest(link, ws_manifest)
+    assert exc_info.value.slug == WS_MEMBER_IS_WORKSPACE, (
+        f"Expected WS-MEMBER-IS-WORKSPACE, got {exc_info.value.slug!r} — "
+        "symlinked root with member 'pkg/..' should resolve to root"
+    )
+
+
+# ---------------------------------------------------------------------------
 # F7: load_workspace_with_member_override must raise MilpaError, not AssertionError
 # ---------------------------------------------------------------------------
 

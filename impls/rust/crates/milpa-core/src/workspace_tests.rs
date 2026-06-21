@@ -231,6 +231,50 @@ fn member_duplicate_name() {
     assert_eq!(code(&tmp), "WS-MEMBER-DUPLICATE-NAME");
 }
 
+/// Symlinked workspace root: member "pkg/.." resolves to root → WS-MEMBER-IS-WORKSPACE.
+///
+/// Scenario: the workspace root is accessed via a symlink path (like macOS /tmp → /private/tmp,
+/// or any dev setup using symlinked project directories).  With the old branch-(c) path,
+/// `is_under_root` would:
+///   - canonicalize root → <realroot>   (follows symlink)
+///   - normalize_lexically(link/pkg/..) → <link>   (does NOT follow symlink)
+///   - <link>.starts_with(<realroot>) → false → WS-MEMBER-PATH-ESCAPE  (WRONG)
+///
+/// After the fix (best_effort_resolve), the non-existent "pkg/.." suffix is appended
+/// to the canonicalized link parent → <realroot>/pkg/.. → normalize lexically → <realroot>
+/// → starts_with(<realroot>) → true → WS-MEMBER-IS-WORKSPACE  (CORRECT).
+#[test]
+#[cfg(unix)]
+fn member_resolves_to_root_via_symlinked_ws_root_yields_is_workspace() {
+    use std::os::unix::fs::symlink;
+
+    // Layout:
+    //   <outer>/
+    //     realroot/
+    //       milpa.kdl    (workspace declaring member "pkg/..")
+    //     link -> realroot   (symlink)
+    let outer = tempfile::tempdir().unwrap();
+    let realroot = outer.path().join("realroot");
+    std::fs::create_dir_all(&realroot).unwrap();
+    std::fs::write(
+        realroot.join("milpa.kdl"),
+        "workspace {\n    member \"pkg/..\"\n}\n",
+    ).unwrap();
+    let link = outer.path().join("link");
+    symlink("realroot", &link).unwrap();
+
+    // Load workspace via the SYMLINK path, not the real path.
+    // "pkg/.." lexically resolves to the workspace root.
+    // Python: (link / "pkg/..").resolve() → realroot  (follows symlink through link)
+    // Rust after fix: best_effort_resolve(link/pkg/..) → canonicalize(link) + normalize(..)
+    //                                                   = realroot
+    // Result must be WS-MEMBER-IS-WORKSPACE (not WS-MEMBER-PATH-ESCAPE).
+    let result = load_workspace(&link).unwrap_err();
+    assert_eq!(result.code(), "WS-MEMBER-IS-WORKSPACE",
+        "loading workspace via symlinked root with member 'pkg/..' should yield \
+         WS-MEMBER-IS-WORKSPACE, not PATH-ESCAPE — got code {:?}", result.code());
+}
+
 #[test]
 fn loads_a_valid_two_member_workspace() {
     let tmp = workspace_dir(

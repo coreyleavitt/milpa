@@ -42,75 +42,120 @@ fn normalize_lexically(path: &std::path::Path) -> std::path::PathBuf {
     normalized
 }
 
+/// Best-effort path resolution mirroring Python `Path.resolve(strict=False)`.
+///
+/// Finds the **longest existing ancestor prefix** of `path`, canonicalizes it
+/// (following all symlinks via `fs::canonicalize`), then appends the remaining
+/// non-existent suffix and normalizes lexically.  For a final component that is
+/// a **dangling symlink** (lstat succeeds, stat fails), the symlink target is
+/// read, joined onto the canonicalized parent, and normalized lexically —
+/// matching Python's behaviour of following dangling links to their (absent)
+/// targets so that an outside-pointing dangling symlink is still detected as an
+/// escape.
+///
+/// Key correctness property: the existing portion of the path is **always**
+/// canonicalized (all symlinks resolved), so any symlinks in intermediate
+/// components of `path` are followed through.  This is what Python's `resolve()`
+/// does, and it is why `best_effort_resolve(root/pkg/..)` yields the same
+/// canonical root that `canonicalize(root)` yields even when `root` is a
+/// symlink.
+fn best_effort_resolve(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+
+    // Fast path: path exists (stat succeeds, symlinks followed).
+    if path.exists() {
+        return path.canonicalize().unwrap_or_else(|_| normalize_lexically(path));
+    }
+
+    // Walk ancestors from `path` upward to find the longest prefix that exists.
+    // `path.ancestors()` yields path, parent, grandparent, …, root.
+    // The first ancestor for which `symlink_metadata` succeeds (i.e. exists on
+    // disk, even as a dangling symlink) is our split point.
+    //
+    // We need to be careful: `path.ancestors()` starts at `path` itself.
+    // We already know `path` doesn't exist via stat, but its lstat might succeed
+    // (dangling symlink case).  Handle that first.
+    let dangling = path
+        .symlink_metadata()
+        .ok()
+        .filter(|m| m.file_type().is_symlink())
+        .and_then(|_| std::fs::read_link(path).ok());
+    if let Some(link_target) = dangling {
+        // Dangling symlink: canonicalize the real parent, join the link target,
+        // normalize lexically.  This is how Python resolve(strict=False) handles
+        // dangling symlinks: it reads the link and appends the target to the
+        // resolved parent, even though the target doesn't exist.
+        let parent = path.parent().unwrap_or(path);
+        let real_parent = best_effort_resolve(parent);
+        let joined = if link_target.is_absolute() {
+            link_target
+        } else {
+            real_parent.join(link_target)
+        };
+        return normalize_lexically(&joined);
+    }
+
+    // Ordinary non-existent path: find the longest existing ancestor prefix.
+    // Collect ancestor components so we can reconstruct the suffix.
+    let components: Vec<Component> = path.components().collect();
+    // Try progressively shorter prefixes (from full path down to root).
+    // `path.ancestors()` gives us the prefix paths in descending length order.
+    // We pair each with the number of components that it has, so we know how
+    // many trailing components to re-append.
+    let mut found: Option<(std::path::PathBuf, usize)> = None;
+    for ancestor in path.ancestors() {
+        // Check whether this ancestor exists (lstat is enough — we just need to
+        // know if the path node exists on the inode table).
+        if ancestor.symlink_metadata().is_ok() {
+            let ancestor_components: Vec<Component> = ancestor.components().collect();
+            let prefix_len = ancestor_components.len();
+            found = Some((ancestor.to_path_buf(), prefix_len));
+            break;
+        }
+    }
+
+    match found {
+        Some((ancestor, prefix_len)) => {
+            // Canonicalize the existing prefix (follows all symlinks in it).
+            let real_prefix = ancestor
+                .canonicalize()
+                .unwrap_or_else(|_| normalize_lexically(&ancestor));
+            // Re-append the non-existent suffix components.
+            let suffix: std::path::PathBuf = components[prefix_len..].iter().collect();
+            normalize_lexically(&real_prefix.join(suffix))
+        }
+        None => {
+            // No ancestor exists at all (e.g. /nonexistent/a/b on a system where
+            // /nonexistent doesn't exist).  Fall back to pure lexical normalization.
+            normalize_lexically(path)
+        }
+    }
+}
+
 /// Return true if `candidate` is at or within `root` — inclusive (equal-to-root
 /// returns true, letting the caller fall through to the `WS-MEMBER-IS-WORKSPACE`
 /// check).
 ///
-/// Algorithm (Option A — matches Python `workspace.py` `resolve(strict=False)`):
-///   1. Canonicalize `root` (root always exists at load time).
-///   2. Resolve `candidate` to a real path via one of three strategies:
-///      a. `candidate.exists()` (follows symlinks) → true: the target is reachable,
-///         use `canonicalize()` which follows all symlinks to the true location.
-///      b. `candidate` is a **dangling symlink** (lstat succeeds; stat fails):
-///         read the link target, canonicalize the parent dir (lexical fallback if
-///         the parent also doesn't exist), join the target, normalize lexically.
-///         This mirrors Python's `resolve(strict=False)` which follows symlinks for
-///         existing portions and normalises `..` lexically for the rest — a dangling
-///         `link -> ../../outside-nonexistent` still resolves to a path outside the
-///         root and must yield WS-MEMBER-PATH-ESCAPE, not WS-MEMBER-DIR-MISSING.
-///      c. Neither (ordinary non-existent path): `normalize_lexically` so that
-///         `../../escape` is still caught and a non-existent normal path inside the
-///         workspace is NOT a false escape (it proceeds to `WS-MEMBER-DIR-MISSING`).
+/// Algorithm (Option A — mirrors Python `workspace.py` `_member_path_is_under_root`
+/// which calls `Path.resolve(strict=False)`):
+///   1. `best_effort_resolve(root)` — root always exists, so this equals `canonicalize(root)`.
+///   2. `best_effort_resolve(candidate)` — canonicalizes the longest existing
+///      prefix of candidate (following symlinks in it), then appends the remaining
+///      non-existent components and normalizes lexically.  This is the structural
+///      mirror of Python's `(root / rel).resolve()`.
 ///   3. Return `real_cand.starts_with(real_root)` — inclusive.
+///
+/// Correctness for the symlinked-root case: if `root` is a symlink to `realroot`
+/// and candidate = `root/pkg/..`, then:
+///   - `best_effort_resolve(root)` = `canonicalize(root)` = `realroot`
+///   - `best_effort_resolve(root/pkg/..)`: `root` is the longest existing prefix
+///     (pkg does not exist), so prefix is canonicalized to `realroot`, suffix is
+///     `pkg/..`, joined → `realroot/pkg/..`, normalized → `realroot`.
+///   - `realroot.starts_with(realroot)` → true → NOT an escape.
 fn is_under_root(root: &std::path::Path, candidate: &std::path::PathBuf) -> bool {
-    // Step 1: canonicalize root (always exists).
-    let real_root = match root.canonicalize() {
-        Ok(r) => r,
-        // If root itself can't be canonicalized (extremely unusual in practice),
-        // fall back to lexical comparison against the original root path.
-        Err(_) => normalize_lexically(root),
-    };
-
-    // Step 2: resolve candidate.
-    let real_cand = if candidate.exists() {
-        // (a) Existing target (follows symlinks through the whole chain).
-        match candidate.canonicalize() {
-            Ok(c) => c,
-            Err(_) => normalize_lexically(candidate),
-        }
-    } else {
-        // `candidate.exists()` uses stat (follows symlinks).  If it returned
-        // false, the path either doesn't exist at all OR is a dangling symlink
-        // (lstat would succeed; stat fails because the target is absent).
-        // Dangling symlink: read the link, resolve its target relative to the
-        // canonicalized parent, normalise lexically.  This mirrors Python's
-        // `resolve(strict=False)` so that a dangling `link -> ../../outside`
-        // resolves outside the root and is correctly rejected.
-        let dangling_resolved = candidate
-            .symlink_metadata()  // lstat — succeeds even when target is missing
-            .ok()
-            .filter(|m| m.file_type().is_symlink())
-            .and_then(|_| std::fs::read_link(candidate).ok())
-            .map(|link_target| {
-                // The link target may be relative — it must be resolved relative
-                // to the symlink's own parent directory.
-                let parent = candidate.parent().unwrap_or(candidate.as_path());
-                let real_parent = match parent.canonicalize() {
-                    Ok(p) => p,
-                    Err(_) => normalize_lexically(parent),
-                };
-                normalize_lexically(&real_parent.join(&link_target))
-            });
-
-        match dangling_resolved {
-            Some(r) => r,
-            // (c) Ordinary non-existent path: lexical normalization only.
-            None => normalize_lexically(candidate),
-        }
-    };
-
-    // Step 3: inclusive starts_with (equal-to-root → true → NOT an escape;
-    // falls through to the WS-MEMBER-IS-WORKSPACE manifest-parse check).
+    let real_root = best_effort_resolve(root);
+    let real_cand = best_effort_resolve(candidate);
+    // Inclusive: equal-to-root is NOT an escape; falls through to WS-MEMBER-IS-WORKSPACE.
     real_cand.starts_with(&real_root)
 }
 
