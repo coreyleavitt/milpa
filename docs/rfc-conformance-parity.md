@@ -281,6 +281,20 @@ Rust work.
   (c4) profile-axis parity for partial-profile absent-axis fixtures (255/256;
   coordinates with #159/#160). Each c-gap is independently testable; split as
   needed during /tdd.
+  - **c4 resolution (2026-06-21): DEFERRED to a known-limitation.** The CLI builds
+    its Profile via `from_environment()`, host-defaulting every absent axis
+    (`cli-contract §8`), so a partial profile (e.g. PLATFORM set, ARCH absent →
+    None) is not expressible via the CLI on *either* impl — both produce a
+    host-defaulted resolution, so 255/256 fail black-box symmetrically (not a
+    divergence). The partial-profile resolver behavior is covered in-process.
+    255/256 are marked `KNOWN_LIMITATIONS` pending an open spec decision:
+    **should the CLI express an explicitly-absent axis** (#159/#160 Profile
+    optional axes) — which interacts with **#110 universal cross-platform
+    resolution**? **Open fork for Corey** (lean: change `cli-contract §8` so a
+    *partially*-specified `MILPA_TARGET_*` leaves unset axes `None` instead of
+    host-defaulting — host-defaulting a build-host arch while targeting another
+    platform is arguably a bug — but this is a cross-impl spec change tied to #110
+    governance, so it is escalated rather than made unilaterally).
 - **Slice D — fixture-252 rust frozen-slug (Finding 2).** Rust emits
   `FROZEN-IDENTITY-NOT-IN-STORE` where the corpus expects
   `FROZEN-ACTIVE-FLAGS-MISMATCH`: the active-flags check must run before the

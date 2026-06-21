@@ -40,6 +40,26 @@ KNOWN_LIMITATIONS: dict[str, str] = {
         "requires CAS pre-seeding from cas-seed/ — a stdlib harness cannot "
         "compute the identity hash without reimplementing spec/identity.md; deferred"
     ),
+    # Slice C c4 (rfc-conformance-parity §4): partial-profile absent-axis fixtures.
+    # The CLI builds its Profile via Profile.from_environment(), which host-defaults
+    # every absent MILPA_TARGET_* axis (cli-contract §8) — so a partial profile
+    # (e.g. PLATFORM set, ARCH absent → None) is not expressible through the CLI on
+    # EITHER impl, and both produce a host-defaulted resolution. The partial-profile
+    # resolver behavior (absent axis ⇒ indeterminate predicate ⇒ excluded,
+    # resolver-semantics §3.C) is covered by each impl's in-process suite. Making
+    # this black-box-testable requires the CLI to express an explicitly-absent axis
+    # — an open spec decision tied to #159/#160 (Profile optional axes) and #110
+    # (universal cross-platform resolution). Deferred pending that governance call.
+    "fixture-255-s4-partial-profile-positive-absent-axis": (
+        "partial-profile absent-axis not expressible via the CLI (from_environment "
+        "host-defaults absent axes, cli-contract §8); covered in-process. Deferred "
+        "pending #159/#160/#110 — see RFC §4 Slice C c4"
+    ),
+    "fixture-256-s4-partial-profile-negated-absent-axis": (
+        "partial-profile absent-axis not expressible via the CLI (from_environment "
+        "host-defaults absent axes, cli-contract §8); covered in-process. Deferred "
+        "pending #159/#160/#110 — see RFC §4 Slice C c4"
+    ),
     "fixture-117-ws-two-member-success": (
         "workspace multi-member expected/member-*/nim.cfg layout — "
         "black-box check is structurally possible but workspace nim.cfg "
