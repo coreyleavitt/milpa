@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -75,12 +76,47 @@ def _normalize_deps_structure(scratch_dir: str, cas_dir: str) -> Optional[str]:
         if entry.is_symlink():
             target = entry.resolve()
             target_str = str(target)
-            normalized = target_str.replace(canonical_cas, "<CAS_ROOT>")
-            lines.append(f"{entry.name} -> {normalized}/")
+            if target_str.startswith(canonical_cas):
+                normalized = target_str.replace(canonical_cas, "<CAS_ROOT>")
+                lines.append(f"{entry.name} -> {normalized}/")
+            else:
+                # Slice C c2: a local dep symlinks directly to a working tree
+                # outside the CAS; its absolute path is non-reproducible, so the
+                # normative surface is just "(symlink)" (spec §2.6 / fixture-181).
+                lines.append(f"{entry.name} -> (symlink)")
 
     if not lines:
         return ""
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# milpa.lock placeholder normalization (Slice C c1)
+# ---------------------------------------------------------------------------
+
+# Non-reproducible provenance fields a fixture may pin as a placeholder token in
+# expected/milpa.lock. Each entry is (token, regex matching the actual form).
+# The substitution is opt-in: it only applies when the token appears in the
+# expected file, so fixtures that pin a concrete value are unaffected.
+#
+# <TARBALL-SHA256>: the provenance `sha256 "<64-hex>"` field — the archive bytes'
+# hash, which is not reproducible across impls/runs (gzip/xz container metadata).
+# The pattern deliberately matches `sha256 "<hex>"` (a space before the quote),
+# never `identity "sha256:<hex>"` (the content-addressed identity, which IS
+# reproducible and must keep its real value).
+_LOCK_PLACEHOLDERS: list[tuple[str, "re.Pattern[str]"]] = [
+    ("<TARBALL-SHA256>", re.compile(r'sha256 "[0-9a-f]{64}"')),
+]
+
+
+def _apply_lock_placeholders(expected: str, actual: str) -> str:
+    """Normalize non-reproducible fields in ``actual`` to the placeholder tokens
+    used by ``expected`` (only for tokens that ``expected`` actually contains)."""
+    out = actual
+    for token, pattern in _LOCK_PLACEHOLDERS:
+        if token in expected:
+            out = pattern.sub(f'sha256 "{token}"', out)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -619,8 +655,11 @@ def _assert_success_fixture(
                 detail="milpa.lock not produced by impl",
             ))
         else:
-            actual = actual_lock_path.read_text()
             expected = expected_lock.read_text()
+            # Slice C c1: normalize non-reproducible provenance fields (e.g. the
+            # tarball archive sha) to the placeholder tokens expected uses, before
+            # diffing AND before storing the cross-impl value.
+            actual = _apply_lock_placeholders(expected, actual_lock_path.read_text())
             if actual != expected:
                 failures.append(AssertionFailure(
                     fixture_name=run.fixture_name,
