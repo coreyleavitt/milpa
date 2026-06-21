@@ -104,9 +104,18 @@ asymmetries broken today (round 2 added the eighth: member-dir add/remove/update
   control file + `expected/absent` assertion; spec §5.6/§5.7/§5.8 S11e NORMATIVE notes;
   fixtures 278–280 (add/remove/update from member dir, harness PASS both impls, member-local
   lock absent); Python 2103 pass; Rust corpus zero divergence — `feat(cli): add/remove/update from a member dir detect-and-delegate to the workspace (the eighth asymmetry)`
-- [ ] S11d, S12 (remaining)
-- **Progress: 17/19 done, 2 remaining.** All gates green each slice (Python 2103 pass; Rust
-  corpus zero divergence).
+- [x] **S11d** `milpa show` workspace behavior documented in `spec/cli-contract.md` §5.3:
+  flat shared-graph dump at ws root; `LOCK-FILE-NOT-FOUND` from a lockless member dir.
+  Actual code matches RFC description exactly (no discrepancy). Member-scoped output
+  deferred to #165. Python 2103 pass; Rust corpus zero divergence — `f953538`
+- [x] **S12** CLAUDE.md workspace-completion RFC section rewritten as COMPLETE (all 19 slices,
+  both impls; #160/#159/#109/#93/#129/#81 closed; S11e eighth asymmetry closed; show
+  member-scoping → #165); "Where to start" repointed to Tier 3 (#32-34) + F4+ (#43-46);
+  `docs/comparison-vs-nimble-atlas.md` caveat updated (Tier 1+2 shipped). Python 2103 pass;
+  Rust corpus zero divergence — `d81c3d2`
+- **Progress: 19/19 done — ALL SLICES COMPLETE.**
+
+**ALL SLICES COMPLETE — ready for Stage 4 /code-review**
 
 ## Forks — ALL RESOLVED (no open decisions)
 - **D1** Phase-A → `SOLVE-CONFLICT` canonical, BOTH impls change (Rust enumerate-all + Python
