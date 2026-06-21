@@ -978,8 +978,12 @@ def _cmd_fetch_workspace(
                 workspace, prior_lock, env, deps_dir,
                 profile=_frozen_profile, cli_seed=_frozen_cli_seed,
             )
-            # Emit per-member nim.cfgs.
-            per_member = format_workspace_nimcfgs(workspace, frozen_graph)
+            # Emit per-member nim.cfgs. flag_defines carries the workspace-wide
+            # flag-union -d: defines (§3.8); without it members lose their defines.
+            per_member = format_workspace_nimcfgs(
+                workspace, frozen_graph,
+                flag_defines=build_flag_defines(frozen_graph, deps_dir),
+            )
             for rel_path, nim_cfg_text in per_member.items():
                 _atomic_write(ws_root / rel_path / "nim.cfg", nim_cfg_text)
             print(
@@ -1031,7 +1035,9 @@ def _cmd_fetch_workspace(
         _write_certificate(certificate_path, graph.cert)
 
     lockfile = from_graph(graph, strategy=str(strategy))
-    per_member = format_workspace_nimcfgs(workspace, graph)
+    per_member = format_workspace_nimcfgs(
+        workspace, graph, flag_defines=build_flag_defines(graph, deps_dir),
+    )
 
     write_lockfile(lockfile, lock_path)
     for rel_path, nim_cfg_text in per_member.items():
