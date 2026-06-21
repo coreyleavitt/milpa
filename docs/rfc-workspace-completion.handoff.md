@@ -1,15 +1,21 @@
 # Workspace completion RFC — handoff
 
-- **Stage:** 4 code-review — **ROUND 1 fix-loop IN PROGRESS** under mandate "fix through
-  Medium, leave Lows" (Corey: "follow /rfc-flow as always"). Wave A done; Wave B in flight.
-- **Resume (Stage 4):** after Wave B agents return → run authoritative clean gate
-  (`cd impls/python && uv run pytest` + `./dev-rust test --workspace`), review diffs, commit
-  per-finding; then Wave C (Rust+parity: F5,F7,F9,F10,F16,F18,F19 + F20 rename/F21 fixture,
-  serialized — share main.rs/workspace.rs); re-review changed scope; loop to floor (0 C/H/M);
-  then report Lows F22–F29. NOT committed yet — all fixes staged in working tree.
-- **Fix waves:** A = F1✅ F3✅ F4✅ (verified, green). B (running) = F2 (Rust escaping),
-  F13/F14 (resolver.py), F8/F11/F12/F17 (cli/manifest_writer/lockfile), F6/F15 (frozen/profile).
-  Pre-allocated fixtures: 281=F20rename 282=F1✅ 283=F2 284=F18 285=F19 286=F21 287=F16.
+- **Stage:** 4 code-review — **ROUND 1 fix-loop COMPLETE; RE-REVIEW ROUND 2 launching** under
+  mandate "fix through Medium, leave Lows" (Corey: "follow /rfc-flow as always").
+- **Resume (Stage 4):** re-review round running over full R1 changed scope (16 source files,
+  both impls + spec) — Security + Design + correctness; flagged item: Python `resolve()`
+  (symlink-following) vs Rust `normalize_lexically` (lexical-only) F16 containment parity gap.
+  After re-review: verify any new findings (Step 4), fix to floor (0 C/H/M), then report Lows.
+- **Fix waves (ROUND 1 — all committed, 7 commits `d4f5024`..`3803418`):**
+  - A+B (5 commits `d4f5024`..`c6e174b`, Py 2118): F1✅ F2✅ F3✅ F4✅ F6✅ F8✅ F11✅ F12✅ F13✅ F14✅ F15✅ F17✅.
+  - C-A (`bd9d3e7`, Py 2127, bijection lints green): F16✅ (new slug `WS-MEMBER-PATH-ESCAPE`,
+    both impls + fixture-287), F7✅, F18✅ (fixture-284).
+  - C-B (`3803418`, Py 2127, Rust corpus zero divergence): F5✅ (Rust frozen default-seed),
+    F9✅ (strategy threading, incl. pre-existing single-pkg half), F10✅ (find_parent_workspace
+    canonicalize continue), F19✅ (remove-member CWD-relative, BOTH impls + fixture-285),
+    F20✅ (fixture-190→281 rename), F21✅ (TNG unreachable via CLI — investigated, no fixture forced).
+  - **ALL 21 mandated findings (F1–F21, through Medium) fixed + committed.** Remaining: Lows F22–F29.
+    Pre-allocated fixtures used: 282✅ 283✅ 284✅ 285✅ 287✅ (286 not needed — F21 report-back).
   Prior: all 19 slices complete (S1–S12, both impls, zero corpus divergence) + corpus-integrity
   fix `f5eec92` (72 un-ignored `expected/nim.cfg` oracles).
 - **Closed:** #160, #159, #109, #93, #129, #81 (5 `closes #` commits + #109 via fixture).
