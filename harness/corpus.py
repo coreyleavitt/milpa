@@ -36,10 +36,6 @@ from harness.runner import RunResult, run_fixture
 # milpa internals.  Document the reason clearly.  If either actually passes
 # black-box, remove it from this set.
 KNOWN_LIMITATIONS: dict[str, str] = {
-    "fixture-114-frozen-legacy-registry-provenance": (
-        "requires CAS pre-seeding from cas-seed/ — a stdlib harness cannot "
-        "compute the identity hash without reimplementing spec/identity.md; deferred"
-    ),
     # Slice C c4 (rfc-conformance-parity §4): partial-profile absent-axis fixtures.
     # The CLI builds its Profile via Profile.from_environment(), which host-defaults
     # every absent MILPA_TARGET_* axis (cli-contract §8) — so a partial profile
