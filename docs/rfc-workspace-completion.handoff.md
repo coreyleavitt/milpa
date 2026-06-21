@@ -1,10 +1,60 @@
 # Workspace completion RFC — handoff
 
-- **Stage:** 2 architect — **rounds 1 + 2 DONE** (4-lens team each round, fixes applied;
-  D1/D2/D3 round 1, D4/D5 round 2, all confirmed by Corey) → **ready for Stage 3 `/tdd`**
-- **Resume:** `/loop implement the next unimplemented RFC slice with /tdd, following the
-  standing rules; after each slice report one progress line (e.g. "slice 4/8 done, 4
-  remaining"); stop when every slice is implemented`
+- **Stage:** 4 code-review — **ROUND 1 fix-loop IN PROGRESS** under mandate "fix through
+  Medium, leave Lows" (Corey: "follow /rfc-flow as always"). Wave A done; Wave B in flight.
+- **Resume (Stage 4):** after Wave B agents return → run authoritative clean gate
+  (`cd impls/python && uv run pytest` + `./dev-rust test --workspace`), review diffs, commit
+  per-finding; then Wave C (Rust+parity: F5,F7,F9,F10,F16,F18,F19 + F20 rename/F21 fixture,
+  serialized — share main.rs/workspace.rs); re-review changed scope; loop to floor (0 C/H/M);
+  then report Lows F22–F29. NOT committed yet — all fixes staged in working tree.
+- **Fix waves:** A = F1✅ F3✅ F4✅ (verified, green). B (running) = F2 (Rust escaping),
+  F13/F14 (resolver.py), F8/F11/F12/F17 (cli/manifest_writer/lockfile), F6/F15 (frozen/profile).
+  Pre-allocated fixtures: 281=F20rename 282=F1✅ 283=F2 284=F18 285=F19 286=F21 287=F16.
+  Prior: all 19 slices complete (S1–S12, both impls, zero corpus divergence) + corpus-integrity
+  fix `f5eec92` (72 un-ignored `expected/nim.cfg` oracles).
+- **Closed:** #160, #159, #109, #93, #129, #81 (5 `closes #` commits + #109 via fixture).
+  Deferred: #165 (`milpa show` member-scoping), #166 (ws+dev-deps fixture).
+- **Commits (in order):** S1 `fcebd3b` · S1b `8d53627` · S2 `5ea9563` · S3 `15aaf6b` ·
+  S4 `1e935ba` · S5 `8688cab` · S5b `224c4da` · S6 `78da655` · S7 `b8edcf5` · S8 `b6d731a` ·
+  S9a `bcce03b` · S9b `6868370` · S10 `b994079` · S11a `713278c` · S11b `d39a0b3` ·
+  S11c `a9ab0d1` · S11e `7b85e71` · S11d `f953538` · S12 `d81c3d2` · corpus-fix `f5eec92`
+
+## Review ledger (Stage 4, round 1) — diff `8d53627^..f5eec92`
+Severity after adversarial verification. Status: open until fix mandate.
+
+| id | sev | finding | status | proof / reason |
+|----|-----|---------|--------|----------------|
+| F1 | **C** | Py `resolve_workspace` omits `_s4a_run_fixpoint`. Deeper root cause: fixpoint scanned only `deps_dir/*/milpa.kdl`, so member-declared cross-pkg enables invisible in BOTH impls. Fixed: ws calls fixpoint (resolver.py:4001) + member manifests injected via `extra_manifests`/`member_manifests`, both impls; fixture-282; 0 oracle churn; gate green | **fixed** | resolver.py:4001 + resolver.rs seed_workspace; fixture-282; verified by control loop |
+| F2 | **H** | Rust `format.rs` serializers write KDL strings raw (`format!("name \"{name}\"")`, member/url/ref) — no escaping; Python uses `_kdl_str`. `"`/`\`/ctrl char → malformed KDL from Rust only, re-parses wrong next load | open | VERIFIED: format.rs:23,69,81,192 |
+| F3 | **H** | `spec/errors.md` TNG-NO-SATISFYING-VERSION trigger text (line 1125) contradicts resolver-semantics §2.1 enumerate-all — describes forbidden constraint pre-filter; 3rd impl would build wrong behavior | **fixed** | errors.md:1123 reworded to §2.1 enumerate-all semantics (inline) |
+| F4 | **H** | SSOT: `_compute_root_active_seed` vs `_compute_workspace_cli_seed` (resolver.py:603–700) near-duplicate validate+seed with divergent error messages | **fixed** | `_compute_cli_active_seed` SSOT in resolver.py; both wrappers delegate; gate green |
+| F5 | M | Rust ws frozen-flags check uses `{}` not member default-true closure when no CLI seed (resolver.rs:539–553) — misses member-default mismatch; diverges from `FilterCtx::build` | open | Rust-corr#1 |
+| F6 | M | Py frozen alignment check iterates `MemberDep` entries (frozen.py:351) → misleading FROZEN-MANIFEST-DEP-NOT-IN-LOCK; should `continue` on MemberDep | open | Py-corr#4 |
+| F7 | M | `load_workspace_with_member_override` uses `AssertionError` (workspace.py:462) — stripped by `-O`, untyped | open | Py-corr#5 |
+| F8 | M | TOCTOU: `add-member` duplicate-name guard (cli.py:2722) racy vs inner `apply_workspace_manifest_change` reload; redundant double-load (Rust same, main.rs:1452) | open | Py-corr#6 + Rust-corr#5 |
+| F9 | M | Rust `cmd_add`/`cmd_remove` hardcode `"maxver"` (main.rs:1184,1737) ignoring `--strategy` (also pre-existing single-pkg) | open | Rust-corr#2 |
+| F10 | M | Rust `find_parent_workspace` early-returns None on a single member `canonicalize()` failure (main.rs:2102–2110) → member command silently runs standalone | open | Rust-corr#3 |
+| F11 | M | Two ws-mutation orchestrations diverging atomicity: `apply_workspace_manifest_change` validates member dirs; `_cmd_{add,remove}_from_member_dir` (cli.py) skip that | open | design#5 |
+| F12 | M | Pin-stripping dup across `cmd_update` paths (cli.py:2255,2354) — belongs as `lockfile.strip_dep_pin` | open | design#6 |
+| F13 | M | `_FilteredMember` inline adapter + `type: ignore` (resolver.py:3749) papers over `_build_member_candidate` taking a bag not (manifest, abs_dir) | open | design#7 |
+| F14 | M | Dead code: `_filter_manifest_by_profile`/`_filter_manifest_by_flags_only`/`_dep_matches_profile`/`_predicate_satisfied` + `_run_flag_gate` var (resolver.py:890–975) unreachable post-S2; docstrings ref them | open | VERIFIED: zero callers (design#3 rated H) |
+| F15 | M | `Profile.flags` field (profile.py:99) read by nothing; docstring falsely claims resolver populates it | open | VERIFIED: zero readers (design#4 rated H) |
+| F16 | M | Member path traversal: `member "../../x"` resolved (workspace.py:217) with no `is_relative_to(root)` containment → read any reachable `milpa.kdl`, poison shared lock | open | VERIFIED: security#1 |
+| F17 | M | Py `_cmd_add_from_member_dir` mirror path passes member-local lock to `_cmd_add_mirror` (cli.py:2427) — safe today (no lock write) but latent D5 break | open | Py-corr#2 (latent) |
+| F18 | M | Rust WS-MEMBER-DOT misses `"./"` (workspace.rs:75) → different slug than Py WS-MEMBER-DOT | open | DIV-2 |
+| F19 | M | Rust `cmd_workspace_remove_member` lacks CWD-relative path arm Py has → WS-REMOVE-MEMBER-NOT-FOUND divergence | open | DIV-3 |
+| F20 | M | fixture-190 sequence number reused (man-member-when-gated + s4a-multihop) — corpus uniqueness broken; renumber to 281 | open | VERIFIED: 2 dirs |
+| F21 | M | `TNG-NO-SATISFYING-VERSION` has zero fixtures after §2.1 narrowed its trigger; residual (all-provenance-less) path unpinned | open | spec#3-C |
+| F22 | L | Rust add-member MAN-NAME-MISSING/DUPLICATE-NAME use `return Err` not exit-1 `Ok(1)` pattern (main.rs:1378,1398) | open | Rust-corr#4 |
+| F23 | L | Rust `resolve_workspace_with_cert` duplicates ws-validation/seed from `_inner` (resolver.rs:700–876) | open | Rust-corr#6 |
+| F24 | L | Py `cpe.dep` emitted as unquoted KDL ident with misapplied `_kdl_str` (manifest.py:2561) — latent if charset relaxes | open | security#2 |
+| F25 | L | Rust `clean` `remove_file(member/nim.cfg)` symlink/portability (main.rs:403) | open | security#3 |
+| F26 | L | Rust missing orphan-member stderr warning Py emits (workspace.rs) | open | DIV-4 |
+| F27 | L | WS-MEMBER-DUPLICATE-NAME payload asymmetry (Rust lacks `existing_member`) | open | DIV-5 |
+| F28 | L | Stale spec cross-refs: resolver-semantics `§470` (now §492); fixture-259 comment `§11.1`→§11.5 | open | spec#2-B/3-D |
+| F29 | L | `harness/corpus.py` fixture-117 KNOWN_LIMITATIONS skip stale — assertion infra now handles ws per-member nim.cfg; 2 oracles unverified black-box | open | spec#3-F (pre-existing) |
+
+Verified-correct (dropped/non-findings): error-slug bijection CLEAN (5 new slugs in all 3 places); `.gitignore` oracle fix complete (91 tracked, 0 untracked); enumerate-all/SOLVE-CONFLICT parity; fixture-090 TNG→SOLVE-CONFLICT flip correct; absent-axis predicate parity; ActivationSource/RESOLVE-FLAG-CONFLICT payload parity; apply_workspace_manifest_change atomicity ordering; nimcfg self-src-dir ordering; fixture-172/264 KNOWN_LIMITATIONS skips legitimate (in-process-only verbs).
 
 ## Context (why this RFC exists)
 #25 (workspace W1–W5) **already shipped** — CLAUDE.md's "Open question: #25 re-scoping"

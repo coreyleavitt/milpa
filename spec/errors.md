@@ -1122,9 +1122,17 @@ A package version has no fetchable provenance in the index.
 
 ### `TNG-NO-SATISFYING-VERSION`
 
-No version of the requested package satisfies the declared constraint.
+A named package is present in the index but enumerate-all Phase-A yields no
+usable (provenance-bearing) candidate. This slug does NOT fire on constraint
+incompatibility: per `resolver-semantics.md §2.1`, Phase-A enumeration MUST NOT
+pre-filter by the declared constraint — the solver owns the satisfiability
+verdict and emits `SOLVE-CONFLICT` when no enumerated version satisfies it.
 
-**Triggered:** resolve_named_all applies VersionSet.from_constraint to every IndexVersion and finds none satisfying — the constraint is incompatible with all available versions.
+**Triggered:** after enumerate-all Phase-A (no constraint filter), every
+enumerated version of the package is discarded for lack of provenance (or has an
+unparseable version string), leaving zero candidates to hand to the solver. When
+at least one provenance-bearing candidate exists, an unsatisfiable constraint
+surfaces as `SOLVE-CONFLICT` (the solver's refutation), not this slug.
 
 ### `TNG-NOT-FOUND`
 
