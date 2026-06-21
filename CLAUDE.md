@@ -202,7 +202,7 @@ extensibility, or supply-chain integrity.
 After Tier 4: milpa contributes to dep-resolution-as-a-field, not just
 Nim tooling.
 
-## Workspace status (#25 — SHIPPED) + completion RFC
+## Workspace status (#25 — SHIPPED) + completion RFC (COMPLETE)
 
 #25 shipped as cargo-style true workspace: W1–W5 (#73–#77) landed in both
 impls (`1a395b3`→`2a43755`, Rust `S11a/S11b`). A workspace root carries a
@@ -210,20 +210,15 @@ impls (`1a395b3`→`2a43755`, Rust `S11a/S11b`). A workspace root carries a
 member-to-member edges use the `member "<name>"` reserved-keyword dep kind,
 resolution produces one shared graph + `<root>/milpa.lock`, and per-member
 `nim.cfg` points at a shared `<root>/_deps/`. Cross-repo dev linking is the
-separate `local=` / LocalFetcher path (#42, also shipped). The old
-"re-scope pending" question is resolved — this is the framing that shipped.
+separate `local=` / LocalFetcher path (#42, also shipped).
 
-The **workspace-completion RFC** (`docs/rfc-workspace-completion.md`, Stage
-1 drafted 2026-06-20) organizes the workspace work the features RFC (#23)
-deferred *until #25 landed*, plus adjacent single-package/workspace
-asymmetries. Thesis: every milpa capability should behave identically on a
-standalone package or a workspace member. Three buckets: A) features×workspace
-(#160 seed-path flag-filter arm, #159 Profile optional axes); B) resolver
-parity (verify/close #109 — Python already done; resolve the Rust Phase-A
-constraint question); C) CLI symmetry (#93 member `self_src_dir`, #129 Rust
-workspace `--certificate`, #81 workspace manifest mutation +
-`milpa workspace add-member/remove-member`, `milpa update` workspace-awareness).
-See the RFC + `.handoff.md` for slices S1–S12.
+The **workspace-completion RFC** (`docs/rfc-workspace-completion.md`) is
+**COMPLETE** — all 19 slices (S1–S12, including S5b, S9a/S9b, S11a–e)
+implemented and gated across both impls. Issues closed: #160, #159, #109,
+#93, #129, #81, plus the eighth asymmetry (member-dir `add`/`remove`/`update`
+detect-and-delegate, S11e). `milpa show` member-scoped output is deferred to
+#165. The workspace symmetry thesis is now total: every milpa capability
+behaves identically on a standalone package or a workspace member.
 
 ## Dev workflow
 
@@ -320,13 +315,12 @@ Things that are NOT milpa's job and resist scope creep into:
 
 Sequenced from most actionable to most exploratory:
 
-1. **Workspace-completion RFC** (`docs/rfc-workspace-completion.md`):
-   Stage 1 drafted + sliced (S1–S12). Next command:
-   `/architect docs/rfc-workspace-completion.md round 1` (two architect
-   rounds required before `/tdd`). Closes #160, #159, #109, #93, #129, #81.
-2. **Tier 3 structural work**: Phase B content-addressing (#32, #33, #34)
-3. **Pluggable fetchers**: F4 HgFetcher (#43), F5 FossilFetcher (#44),
+1. **Tier 3 structural work**: Phase B content-addressing (#32, #33, #34).
+   Global CAS dedup, multihash encoding, and the store-gc mini-RFC.
+2. **Pluggable fetchers**: F4 HgFetcher (#43), F5 FossilFetcher (#44),
    then research-tier F6/F7 (#45/#46). (F1–F3 + tarball + local shipped.)
+3. **`milpa show` member-scoping** (#165): follow-up from the
+   workspace-completion RFC — attribute each dep to its originating member.
 4. **v1.5 prep**: when Tier 3 is done, the spec extraction (#14
    error catalog is filed there as the first deliverable)
 

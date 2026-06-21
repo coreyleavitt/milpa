@@ -213,10 +213,12 @@ transport dep delivery."
 
 ## Caveats and honest disclaimers
 
-- **All currently shipped milpa is a research prototype.** Today
-  ≠ post-RFC. The 124 unit tests + 3 gated integration tests cover
-  v0; everything in this matrix labeled differentiating-exclusive is
-  in RFC form, not in code.
+- **Tier 1 (adoption blockers) and Tier 2 (atlas parity) are shipped.**
+  Both reference impls (Python + Rust) pass the shared conformance corpus
+  with zero divergence. Tier 3 (structural differentiation — Phase B
+  content-addressing, pluggable fetchers F4+) is the active frontier.
+  Tier 4 items (proof certificates, compile-time graphs, effect-typed deps,
+  refinement types, OCI/IPFS, sigstore) remain in RFC form.
 - **nimble and atlas don't stand still.** They could add features
   during milpa's roadmap window. The structural exclusives in §"milpa's
   structural exclusives" are the slowest-to-close gaps; the
