@@ -63,6 +63,7 @@ from milpa.errors import (
     WS_MEMBER_HAS_OVERRIDES,
     WS_MEMBER_IS_WORKSPACE,
     WS_MEMBER_NO_MANIFEST,
+    WS_MEMBER_PATH_ESCAPE,
     WS_NO_MANIFEST,
     WS_NOT_A_WORKSPACE,
     MilpaError,
@@ -215,6 +216,21 @@ def load_workspace(workspace_root: Path) -> LoadedWorkspace:
             )
 
         abs_dir = (workspace_root / rel_path).resolve()
+
+        # §WS-MEMBER-PATH-ESCAPE: member path must not resolve outside the workspace root.
+        # Checked before dir-existence so an escaping path always yields this slug,
+        # regardless of whether the target dir exists.
+        resolved_root = workspace_root.resolve()
+        if not abs_dir.is_relative_to(resolved_root):
+            raise MilpaError(
+                WS_MEMBER_PATH_ESCAPE,
+                f"workspace member {rel_path!r} resolves outside the workspace root "
+                f"({abs_dir} is not under {resolved_root})",
+                member=rel_path,
+                path=str(abs_dir),
+                workspace_root=str(resolved_root),
+            )
+
         declared_abs.add(abs_dir)
 
         # §WS-MEMBER-DIR-MISSING: member directory must exist
@@ -336,6 +352,19 @@ def load_workspace_from_manifest(
             )
 
         abs_dir = (workspace_root / rel_path).resolve()
+
+        # §WS-MEMBER-PATH-ESCAPE: containment check before dir-existence check.
+        resolved_root = workspace_root.resolve()
+        if not abs_dir.is_relative_to(resolved_root):
+            raise MilpaError(
+                WS_MEMBER_PATH_ESCAPE,
+                f"workspace member {rel_path!r} resolves outside the workspace root "
+                f"({abs_dir} is not under {resolved_root})",
+                member=rel_path,
+                path=str(abs_dir),
+                workspace_root=str(resolved_root),
+            )
+
         declared_abs.add(abs_dir)
 
         if not abs_dir.is_dir():
@@ -459,10 +488,13 @@ def load_workspace_with_member_override(
             found = True
         else:
             new_members.append(m)
-    assert found, (
-        f"load_workspace_with_member_override: member dir {member_dir_resolved} "
-        f"not found in workspace members"
-    )
+    if not found:
+        raise MilpaError(
+            WS_MEMBER_DIR_MISSING,
+            f"load_workspace_with_member_override: member dir {member_dir_resolved} "
+            f"not found in workspace members",
+            path=str(member_dir_resolved),
+        )
     return LoadedWorkspace(
         root_dir=workspace.root_dir,
         workspace_manifest=workspace.workspace_manifest,

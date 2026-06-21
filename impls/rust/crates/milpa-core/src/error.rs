@@ -194,6 +194,7 @@ impl CoreError {
             "WS-MEMBER-IS-WORKSPACE",
             "WS-MEMBER-HAS-OVERRIDES",
             "WS-MEMBER-DUPLICATE-NAME",
+            "WS-MEMBER-PATH-ESCAPE",
             // S10 (workspace-completion §3.F): workspace add-member/remove-member
             // refusal slugs.  Raised by the CLI mutation path (not by the workspace
             // loader or resolver — those are topology errors above).

@@ -46,6 +46,28 @@ fn member_dot_is_rejected() {
     assert_eq!(code(&tmp), "WS-MEMBER-DOT");
 }
 
+/// F18: Rust must also reject "./" with WS-MEMBER-DOT (not WS-MEMBER-PATH-ESCAPE).
+#[test]
+fn member_dot_slash_is_rejected_with_dot_code() {
+    let tmp = workspace_dir("workspace {\n    member \"./\"\n}\n", &[]);
+    assert_eq!(code(&tmp), "WS-MEMBER-DOT");
+}
+
+/// F16: A path traversal escaping the workspace root raises WS-MEMBER-PATH-ESCAPE.
+#[test]
+fn member_path_escape_is_rejected() {
+    let tmp = workspace_dir("workspace {\n    member \"../../escape\"\n}\n", &[]);
+    assert_eq!(code(&tmp), "WS-MEMBER-PATH-ESCAPE");
+}
+
+/// F16: The dot-check runs before the escape check: "." yields WS-MEMBER-DOT,
+/// not WS-MEMBER-PATH-ESCAPE.
+#[test]
+fn dot_before_escape_check_ordering() {
+    let tmp = workspace_dir("workspace {\n    member \".\"\n}\n", &[]);
+    assert_eq!(code(&tmp), "WS-MEMBER-DOT");
+}
+
 #[test]
 fn member_dir_missing() {
     // member "a" declared but no `a/` directory created.

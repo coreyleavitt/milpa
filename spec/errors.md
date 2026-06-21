@@ -1228,6 +1228,12 @@ A workspace member directory has no milpa.kdl.
 
 **Triggered:** load_workspace finds the member directory but no milpa.kdl inside it.
 
+### `WS-MEMBER-PATH-ESCAPE`
+
+A workspace member path resolves outside the workspace root.
+
+**Triggered:** load_workspace resolves a member path (after normalizing `..` components) and finds it escapes the workspace root directory. This is a security boundary: a workspace must not be able to read or incorporate manifests from arbitrary locations on the filesystem. The check runs after the dot-path check (so `"."` yields `WS-MEMBER-DOT`, not `WS-MEMBER-PATH-ESCAPE`) and before the directory-existence check (so an escaping path yields `WS-MEMBER-PATH-ESCAPE` regardless of whether the target directory exists).
+
 ### `WS-NO-MANIFEST`
 
 No milpa.kdl found at the expected workspace root.

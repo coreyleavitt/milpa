@@ -19,6 +19,39 @@ fn ws(code: &'static str, message: impl Into<String>) -> MilpaError {
     MilpaError::Core(CoreError::Workspace(code, message.into()))
 }
 
+/// Lexically normalize a path by resolving `..` and `.` components without
+/// touching the filesystem (unlike `canonicalize`, which requires paths to exist).
+/// Used for the `WS-MEMBER-PATH-ESCAPE` containment check.
+fn normalize_lexically(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                // Pop only if the last component is a normal segment (not root/prefix).
+                match normalized.components().next_back() {
+                    Some(Component::Normal(_)) => { normalized.pop(); }
+                    _ => { normalized.push(".."); }
+                }
+            }
+            Component::CurDir => {} // skip "."
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
+/// Return true if `candidate` is contained within `root` (lexically, after
+/// normalizing both paths).  A path that *equals* the root (same directory)
+/// is NOT considered contained — workspace root cannot be a member.
+fn is_under_root(root: &std::path::Path, candidate: &std::path::PathBuf) -> bool {
+    let norm_root = normalize_lexically(root);
+    let norm_cand = normalize_lexically(candidate);
+    // starts_with checks every component, so /a/b starts_with /a/b is true (same dir).
+    // We want strict containment: candidate must have at least one extra component.
+    norm_cand != norm_root && norm_cand.starts_with(&norm_root)
+}
+
 /// A workspace member as it exists on disk: its intrinsic `name` (from the
 /// member's manifest), the as-declared workspace-relative `path` (preserved for
 /// lockfile portability), the absolute `directory`, and the loaded `manifest`.
@@ -72,7 +105,8 @@ pub fn load_workspace(root: &Path) -> Result<LoadedWorkspace, MilpaError> {
     let mut members: Vec<LoadedMember> = Vec::new();
     let mut seen_names: Vec<String> = Vec::new();
     for member_path in &parsed.members {
-        if member_path == "." {
+        // §WS-MEMBER-DOT: reject "." and "./" before the containment check.
+        if member_path == "." || member_path == "./" {
             return Err(ws(
                 "WS-MEMBER-DOT",
                 "member \".\" is not supported — the workspace root is a pure container and \
@@ -80,6 +114,15 @@ pub fn load_workspace(root: &Path) -> Result<LoadedWorkspace, MilpaError> {
             ));
         }
         let member_dir = root.join(member_path);
+        // §WS-MEMBER-PATH-ESCAPE: lexical containment check before dir-existence.
+        if !is_under_root(root, &member_dir) {
+            return Err(ws(
+                "WS-MEMBER-PATH-ESCAPE",
+                format!(
+                    "workspace member {member_path:?} resolves outside the workspace root",
+                ),
+            ));
+        }
         if !member_dir.is_dir() {
             return Err(ws(
                 "WS-MEMBER-DIR-MISSING",
@@ -163,7 +206,8 @@ pub fn load_workspace_from_manifest(
     let mut members: Vec<LoadedMember> = Vec::new();
     let mut seen_names: Vec<String> = Vec::new();
     for member_path in &parsed.members {
-        if member_path == "." {
+        // §WS-MEMBER-DOT: reject "." and "./" before the containment check.
+        if member_path == "." || member_path == "./" {
             return Err(ws(
                 "WS-MEMBER-DOT",
                 "member \".\" is not supported — the workspace root is a pure container and \
@@ -171,6 +215,15 @@ pub fn load_workspace_from_manifest(
             ));
         }
         let member_dir = root.join(member_path);
+        // §WS-MEMBER-PATH-ESCAPE: lexical containment check before dir-existence.
+        if !is_under_root(root, &member_dir) {
+            return Err(ws(
+                "WS-MEMBER-PATH-ESCAPE",
+                format!(
+                    "workspace member {member_path:?} resolves outside the workspace root",
+                ),
+            ));
+        }
         if !member_dir.is_dir() {
             return Err(ws(
                 "WS-MEMBER-DIR-MISSING",
