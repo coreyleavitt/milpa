@@ -10,7 +10,7 @@ Coverage:
   3. ``--all-features``: all root flags active; all gated deps admitted.
   4. ``_parse_features``: comma-separated parsing edge cases.
   5. Unknown feature name → FROZEN-ACTIVE-FLAGS-MISMATCH (validation in
-     ``_compute_root_active_seed``).
+     ``_compute_cli_active_seed``).
   6. FROZEN-ACTIVE-FLAGS-MISMATCH: frozen + CLI features clash with lockfile.
 """
 
@@ -63,12 +63,83 @@ class TestParseFeatures:
 
 
 # ---------------------------------------------------------------------------
-# _compute_root_active_seed unit tests (pure)
+# _compute_cli_active_seed unit tests (pure — SSOT)
 # ---------------------------------------------------------------------------
 
 
-class TestComputeRootActiveSeed:
-    """Unit tests for ``_compute_root_active_seed`` in resolver.py."""
+class TestComputeCliActiveSeed:
+    """Unit tests for ``_compute_cli_active_seed`` in resolver.py (S9 SSOT)."""
+
+    def _flags(self, *flag_specs: tuple[str, bool]) -> tuple:
+        """Build a tuple of FlagDecl from (name, default) pairs."""
+        from milpa.manifest import parse_manifest
+
+        flags_block = "\n".join(
+            f'    {name} default=#{str(default).lower()}'
+            for name, default in flag_specs
+        )
+        m = parse_manifest(
+            f'name "myapp"\nkind "application"\nflags {{\n{flags_block}\n}}\n'
+        )
+        return m.flags
+
+    def test_default_seed_includes_default_true_flags(self):
+        from milpa.resolver import _compute_cli_active_seed
+
+        flags = self._flags(("tls", False), ("debug", True))
+        seed = _compute_cli_active_seed(flags, frozenset(), False, False)
+        assert "debug" in seed
+        assert "tls" not in seed
+
+    def test_features_adds_to_defaults(self):
+        from milpa.resolver import _compute_cli_active_seed
+
+        flags = self._flags(("tls", False), ("debug", True))
+        seed = _compute_cli_active_seed(flags, frozenset({"tls"}), False, False)
+        assert "tls" in seed
+        assert "debug" in seed
+
+    def test_no_default_features_suppresses_defaults(self):
+        from milpa.resolver import _compute_cli_active_seed
+
+        flags = self._flags(("tls", False), ("debug", True))
+        seed = _compute_cli_active_seed(flags, frozenset(), True, False)
+        assert "debug" not in seed
+        assert "tls" not in seed
+
+    def test_no_default_features_with_explicit_features(self):
+        from milpa.resolver import _compute_cli_active_seed
+
+        flags = self._flags(("tls", False), ("debug", True))
+        seed = _compute_cli_active_seed(flags, frozenset({"tls"}), True, False)
+        assert "tls" in seed
+        assert "debug" not in seed
+
+    def test_all_features_activates_everything(self):
+        from milpa.resolver import _compute_cli_active_seed
+
+        flags = self._flags(("tls", False), ("debug", False))
+        seed = _compute_cli_active_seed(flags, frozenset(), False, True)
+        assert "tls" in seed
+        assert "debug" in seed
+
+    def test_unknown_feature_raises_mismatch(self):
+        from milpa.resolver import _compute_cli_active_seed
+        from milpa.errors import MilpaError, FROZEN_ACTIVE_FLAGS_MISMATCH
+
+        flags = self._flags(("tls", False),)
+        with pytest.raises(MilpaError) as exc_info:
+            _compute_cli_active_seed(flags, frozenset({"nonexistent"}), False, False)
+        assert exc_info.value.slug == FROZEN_ACTIVE_FLAGS_MISMATCH
+
+
+# ---------------------------------------------------------------------------
+# _compute_root_active_seed backward-compat wrapper tests
+# ---------------------------------------------------------------------------
+
+
+class TestComputeRootActiveSeedWrapper:
+    """Verify the thin wrapper still delegates correctly to the SSOT."""
 
     def _manifest_with_flags(self, *flag_specs: tuple[str, bool]) -> object:
         """Build a minimal manifest with the given (name, default) flag pairs."""
@@ -89,38 +160,6 @@ class TestComputeRootActiveSeed:
         seed = _compute_root_active_seed(m, frozenset(), False, False)
         assert "debug" in seed
         assert "tls" not in seed
-
-    def test_features_adds_to_defaults(self):
-        from milpa.resolver import _compute_root_active_seed
-
-        m = self._manifest_with_flags(("tls", False), ("debug", True))
-        seed = _compute_root_active_seed(m, frozenset({"tls"}), False, False)
-        assert "tls" in seed
-        assert "debug" in seed
-
-    def test_no_default_features_suppresses_defaults(self):
-        from milpa.resolver import _compute_root_active_seed
-
-        m = self._manifest_with_flags(("tls", False), ("debug", True))
-        seed = _compute_root_active_seed(m, frozenset(), True, False)
-        assert "debug" not in seed
-        assert "tls" not in seed
-
-    def test_no_default_features_with_explicit_features(self):
-        from milpa.resolver import _compute_root_active_seed
-
-        m = self._manifest_with_flags(("tls", False), ("debug", True))
-        seed = _compute_root_active_seed(m, frozenset({"tls"}), True, False)
-        assert "tls" in seed
-        assert "debug" not in seed
-
-    def test_all_features_activates_everything(self):
-        from milpa.resolver import _compute_root_active_seed
-
-        m = self._manifest_with_flags(("tls", False), ("debug", False))
-        seed = _compute_root_active_seed(m, frozenset(), False, True)
-        assert "tls" in seed
-        assert "debug" in seed
 
     def test_unknown_feature_raises_mismatch(self):
         from milpa.resolver import _compute_root_active_seed

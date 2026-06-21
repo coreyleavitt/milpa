@@ -1194,6 +1194,14 @@ struct ResolveProvider<'a> {
     /// per spec/identity.md §3.1.2 ("Keying (normative)").
     /// Populated during `process_url`/`materialize_named` and extended by `run_s4a_fixpoint`.
     dep_active_flags: RefCell<BTreeMap<String, BTreeMap<String, BTreeSet<milpa_types::ActivationSource>>>>,
+
+    /// S4a workspace: member manifests injected into the fixpoint's dep_manifests
+    /// scan so that member-flag enables_cross_pkg rules fire.  Members are NOT in
+    /// deps_dir, so their manifests would be invisible to the standard
+    /// deps_dir-scan in `run_s4a_fixpoint` step 1.  Populated by `seed_workspace`
+    /// after pre-seeding each member's default-active flags into `dep_active_flags`.
+    /// Empty in single-package mode.
+    member_manifests: RefCell<BTreeMap<String, milpa_manifest::Manifest>>,
 }
 
 /// The cross-name gate's verdict for an item (§10).
@@ -1241,6 +1249,7 @@ impl<'a> ResolveProvider<'a> {
             strict_attestation,
             flag_requests_by_name: RefCell::new(BTreeMap::new()),
             dep_active_flags: RefCell::new(BTreeMap::new()),
+            member_manifests: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -1658,6 +1667,68 @@ impl<'a> ResolveProvider<'a> {
                             .extend(cpe.flag_requests.iter().cloned());
                     }
                 }
+            }
+        }
+
+        // S4a workspace: pre-seed member dep_active_flags and populate member_manifests.
+        //
+        // Workspace members are not fetched into deps_dir, so their milpa.kdl files
+        // are invisible to run_s4a_fixpoint's deps_dir-based scan (step 1).  To make
+        // member-flag enables_cross_pkg rules fire in the fixpoint:
+        //
+        // 1. Compute each member's default-active flag seed (default=true flags +
+        //    same-pkg enables-closure) — mirrors process_url's unconditional
+        //    dep_active_flags seeding (S3/C1) for URL deps.
+        // 2. Seed dep_active_flags[member_identity] with those active flags so the
+        //    fixpoint's step 2 can inspect the member's active flags.
+        // 3. Store the member manifest in self.member_manifests so the fixpoint's
+        //    step 1 can inject it into dep_manifests alongside fetched URL deps.
+        //
+        // Mirrors Python's resolve_workspace pre-seeding block (same commit).
+        {
+            use milpa_manifest::flag_enables_closure;
+            use milpa_types::ActivationSource;
+
+            for member in &workspace.members {
+                let member_flags = &member.manifest.flags;
+                if member_flags.is_empty() {
+                    continue;
+                }
+                // Compute member's default-active flags (same-pkg closure).
+                let seed: std::collections::HashSet<String> = member_flags
+                    .iter()
+                    .filter(|f| f.default)
+                    .map(|f| f.name.clone())
+                    .collect();
+                let active = flag_enables_closure(member_flags, &seed);
+                if active.is_empty() {
+                    continue;
+                }
+                // Get the member's identity from the pre-registered candidate.
+                let member_identity: String = self
+                    .candidates
+                    .borrow()
+                    .get(&member.name)
+                    .and_then(|m| m.values().next())
+                    .map(|c| c.identity.clone())
+                    .unwrap_or_default();
+                if member_identity.is_empty() {
+                    continue;
+                }
+                // Seed dep_active_flags for this member (monotone union).
+                let mut daf = self.dep_active_flags.borrow_mut();
+                let entry = daf.entry(member_identity).or_default();
+                for flag_name in &active {
+                    entry
+                        .entry(flag_name.clone())
+                        .or_default()
+                        .insert(ActivationSource::Default);
+                }
+                drop(daf);
+                // Store the member manifest for the fixpoint.
+                self.member_manifests
+                    .borrow_mut()
+                    .insert(member.name.clone(), member.manifest.clone());
             }
         }
 
@@ -2986,31 +3057,44 @@ impl<'a> ResolveProvider<'a> {
                     // per spec/identity.md §3.1.2.  For deps with no consumer flag
                     // requests, fall back to computing defaults-only active set from
                     // the dep's manifest.  Lexicographically sorted (normative).
+                    //
+                    // Workspace members are excluded: their active_flags are an internal
+                    // resolver concern (used to fire cross-pkg enables) and MUST NOT
+                    // appear in the lockfile.  Mirrors Python _build_graph's _is_member
+                    // guard (same commit).
                     active_flags: {
-                        use milpa_manifest::parse_manifest as parse_mf;
-                        let active_map: std::collections::BTreeMap<String, _> = {
-                            let daf = self.dep_active_flags.borrow();
-                            // H3: key by identity, not dep_name.
-                            match daf.get(c.identity.as_str()).filter(|m| !m.is_empty()) {
-                                Some(m) => m.clone(),
-                                None => {
-                                    // No entry — compute defaults-only from manifest.
-                                    drop(daf);
-                                    let kdl_path = self.deps_dir.join(&c.name).join("milpa.kdl");
-                                    if let Ok(txt) = std::fs::read_to_string(&kdl_path) {
-                                        if let Ok(mf) = parse_mf(&txt) {
-                                            compute_dep_active_flags(&mf.flags, &[])
+                        let is_member = matches!(
+                            c.provenance,
+                            Some(ProvenanceRecord::Member { .. })
+                        );
+                        if is_member {
+                            Vec::new()
+                        } else {
+                            use milpa_manifest::parse_manifest as parse_mf;
+                            let active_map: std::collections::BTreeMap<String, _> = {
+                                let daf = self.dep_active_flags.borrow();
+                                // H3: key by identity, not dep_name.
+                                match daf.get(c.identity.as_str()).filter(|m| !m.is_empty()) {
+                                    Some(m) => m.clone(),
+                                    None => {
+                                        // No entry — compute defaults-only from manifest.
+                                        drop(daf);
+                                        let kdl_path = self.deps_dir.join(&c.name).join("milpa.kdl");
+                                        if let Ok(txt) = std::fs::read_to_string(&kdl_path) {
+                                            if let Ok(mf) = parse_mf(&txt) {
+                                                compute_dep_active_flags(&mf.flags, &[])
+                                            } else {
+                                                Default::default()
+                                            }
                                         } else {
                                             Default::default()
                                         }
-                                    } else {
-                                        Default::default()
                                     }
                                 }
-                            }
-                        };
-                        // Lex-sorted — BTreeMap keys are already sorted.
-                        active_map.into_keys().collect()
+                            };
+                            // Lex-sorted — BTreeMap keys are already sorted.
+                            active_map.into_keys().collect()
+                        }
                     },
                 }
             })
@@ -3083,6 +3167,13 @@ impl<'a> ResolveProvider<'a> {
                             dep_manifests.insert(name.clone(), manifest);
                         }
                     }
+                }
+            }
+            // Merge member_manifests (workspace members not in deps_dir).
+            // deps_dir entries take precedence (already inserted above).
+            for (name, manifest) in self.member_manifests.borrow().iter() {
+                if !dep_manifests.contains_key(name) {
+                    dep_manifests.insert(name.clone(), manifest.clone());
                 }
             }
 

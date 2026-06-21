@@ -26,6 +26,7 @@ from milpa.manifest import (
     UrlDep,
     NamedDep,
     Dep,
+    parse_manifest,
 )
 from milpa.resolver import resolve, resolve_workspace
 from milpa.version import Strategy
@@ -505,4 +506,148 @@ class TestWorkspaceDedupSameContent:
         )
         assert "bar" not in pkg_b.requires, (
             f"pkg-b.requires should NOT contain 'bar' (aliased), got {pkg_b.requires!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 7: workspace S4a fixpoint — cross-package flag enables (F1 regression)
+#
+# When a workspace member has a flag with enables_cross_pkg pointing at a
+# dep's flag, and that dep's flag gates a sub-dep behind a `when`, the S4a
+# fixpoint must fire in resolve_workspace() so the sub-dep is admitted.
+#
+# Regression: resolve_workspace() was missing the _s4a_run_fixpoint call.
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceCrossPkgEnableFixpoint:
+    """resolve_workspace() fires the S4a dep×flag fixpoint for member enables."""
+
+    def _make_workspace(self, tmp_path: Path, mocked_dir: Path) -> "object":
+        """Build a workspace where member-a.f1 enables lib-b.g1, which gates lib-c."""
+        from milpa.workspace import LoadedMember, LoadedWorkspace, WorkspaceManifest
+
+        # lib-c: a plain library with no deps
+        lib_c_kdl = 'name "lib-c"\nkind "library"\n'
+        _write_mock_fetch_milpa_kdl(
+            mocked_dir,
+            "https://example.com/lib-c.git",
+            "main",
+            "lib-c",
+            lib_c_kdl,
+            "cccc1111cccc1111cccc1111cccc1111cccc1111",
+        )
+
+        # lib-b: has flag g1 (default=false); when g1 is active, requires lib-c
+        lib_b_kdl = (
+            'name "lib-b"\nkind "library"\n'
+            'flags {\n'
+            '    g1 default=#false\n'
+            '}\n'
+            'deps {\n'
+            '    when flag="g1" {\n'
+            '        lib-c git="https://example.com/lib-c.git" ref="main"\n'
+            '    }\n'
+            '}\n'
+        )
+        _write_mock_fetch_milpa_kdl(
+            mocked_dir,
+            "https://example.com/lib-b.git",
+            "main",
+            "lib-b",
+            lib_b_kdl,
+            "bbbb1111bbbb1111bbbb1111bbbb1111bbbb1111",
+        )
+
+        # member-a: has flag f1 (default=true) that enables lib-b.g1 cross-pkg;
+        # declares dep on lib-b
+        member_a_dir = tmp_path / "member-a"
+        member_a_dir.mkdir()
+
+        member_a_manifest = parse_manifest(
+            'name "member-a"\nkind "library"\n'
+            'flags {\n'
+            '    f1 default=#true {\n'
+            '        enables {\n'
+            '            lib-b { flag "g1" }\n'
+            '        }\n'
+            '    }\n'
+            '}\n'
+            'deps {\n'
+            '    lib-b git="https://example.com/lib-b.git" ref="main"\n'
+            '}\n'
+        )
+        (member_a_dir / "milpa.kdl").write_text(
+            'name "member-a"\nkind "library"\n'
+            'flags {\n'
+            '    f1 default=#true {\n'
+            '        enables {\n'
+            '            lib-b { flag "g1" }\n'
+            '        }\n'
+            '    }\n'
+            '}\n'
+            'deps {\n'
+            '    lib-b git="https://example.com/lib-b.git" ref="main"\n'
+            '}\n',
+            encoding="utf-8",
+        )
+
+        ws_manifest = WorkspaceManifest(members=("member-a",), overrides=())
+        members = (
+            LoadedMember(
+                rel_path="member-a",
+                abs_dir=member_a_dir,
+                manifest=member_a_manifest,
+            ),
+        )
+        return LoadedWorkspace(
+            root_dir=tmp_path,
+            workspace_manifest=ws_manifest,
+            members=members,
+        )
+
+    def test_cross_pkg_enable_admits_gated_dep(self, tmp_path: Path) -> None:
+        """member-a.f1 (default=true) enables lib-b.g1 → lib-c is admitted."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        ws = self._make_workspace(tmp_path, mocked_dir)
+        env = _make_env(mocked_dir, tmp_path)
+        deps_dir = tmp_path / "_deps"
+
+        graph = resolve_workspace(ws, deps_dir, env, ResolveParams())  # type: ignore[arg-type]
+
+        names = {d.name for d in graph.deps}
+        assert "lib-b" in names, f"lib-b must be in graph; got {names}"
+        assert "lib-c" in names, (
+            f"lib-c must be admitted by cross-pkg enable fixpoint; got {names}"
+        )
+
+    def test_lib_b_active_flags_contains_g1(self, tmp_path: Path) -> None:
+        """lib-b's active_flags must include 'g1' (fired by member-a.f1 enables)."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        ws = self._make_workspace(tmp_path, mocked_dir)
+        env = _make_env(mocked_dir, tmp_path)
+        deps_dir = tmp_path / "_deps"
+
+        graph = resolve_workspace(ws, deps_dir, env, ResolveParams())  # type: ignore[arg-type]
+
+        lib_b = next((d for d in graph.deps if d.name == "lib-b"), None)
+        assert lib_b is not None, "lib-b must be in graph"
+        assert "g1" in lib_b.active_flags, (
+            f"lib-b.active_flags must contain 'g1'; got {lib_b.active_flags!r}"
+        )
+
+    def test_member_active_flags_not_in_lockfile(self, tmp_path: Path) -> None:
+        """member-a's active_flags must NOT appear in the resolved graph (internal state)."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        ws = self._make_workspace(tmp_path, mocked_dir)
+        env = _make_env(mocked_dir, tmp_path)
+        deps_dir = tmp_path / "_deps"
+
+        graph = resolve_workspace(ws, deps_dir, env, ResolveParams())  # type: ignore[arg-type]
+
+        member_a = next((d for d in graph.deps if d.name == "member-a"), None)
+        assert member_a is not None, "member-a must be in graph"
+        assert not member_a.active_flags, (
+            f"member-a.active_flags must be empty (internal resolver state, not lockfile-pinnable); "
+            f"got {member_a.active_flags!r}"
         )

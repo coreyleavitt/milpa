@@ -312,7 +312,7 @@ def _manifest_to_edgeset(
         (b) ``active_flags`` — flags seeded by cross-package consumer requests
             (S3: single-hop, set by resolver for direct deps).
       Non-flag predicates (platform/arch/nim/milpa) are passed through — they
-      are evaluated at root-resolve time by ``_filter_manifest_by_profile``,
+      are evaluated at root-resolve time by ``filter_manifest``,
       not here (same as Rust).
 
     This is the single structural guard for the transitive-exclusion rule.

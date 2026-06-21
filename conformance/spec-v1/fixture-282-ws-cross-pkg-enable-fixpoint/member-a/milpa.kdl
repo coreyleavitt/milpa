@@ -1,0 +1,12 @@
+name "member-a"
+kind "library"
+flags {
+    f1 default=#true {
+        enables {
+            lib-b { flag "g1" }
+        }
+    }
+}
+deps {
+    lib-b git=(url)"https://example.com/lib-b.git" ref="main"
+}

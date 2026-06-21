@@ -1,0 +1,18 @@
+// fixture-282: S4a fixpoint missing from resolve_workspace (F1 regression)
+//
+// A workspace where a member (member-a) declares flag "f1" with default=#true
+// and enables { lib-b { flag "g1" } }.  lib-b gates lib-c behind when flag="g1".
+//
+// Before the fix: resolve_workspace() never calls _s4a_run_fixpoint after
+// _run_bfs_wave_loop.  The cross-pkg enables from member-a.f1 never fire, so
+// lib-b.g1 stays unset and lib-c is absent from the lockfile.
+//
+// After the fix: _s4a_run_fixpoint runs inside the ThreadPoolExecutor block,
+// member-a.f1 (default-true) fires → lib-b.g1 enabled → lib-c admitted.
+//
+// Workspace symmetry: a standalone package with the same dep graph would
+// produce lib-c via the single-package S4a fixpoint path.  The workspace path
+// must produce the identical lockfile (workspace-symmetry thesis).
+workspace {
+    member "member-a"
+}

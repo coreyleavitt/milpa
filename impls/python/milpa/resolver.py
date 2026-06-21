@@ -7,7 +7,7 @@ Architecture
 ------------
 ``resolve()`` drives a BFS over the dep graph:
 
-1. **Profile filtering** (§6, slice 9b-2): ``_filter_manifest_by_profile``
+1. **Profile filtering** (§6, slice 9b-2): ``filter_manifest``
    strips deps whose predicates don't match the active profile BEFORE any
    fetch or solver input is built.  No-profile → all deps included.
 
@@ -600,38 +600,46 @@ class _NamedStub:
 # ---------------------------------------------------------------------------
 
 
-def _compute_root_active_seed(
-    manifest: Manifest,
+def _compute_cli_active_seed(
+    flags: "tuple[FlagDecl, ...]",
     features: frozenset[str],
     no_default_features: bool,
     all_features: bool,
 ) -> frozenset[str]:
-    """Compute the root-level active-flag seed from CLI feature inputs (S9).
+    """Compute the active-flag seed from CLI feature inputs (S9 SSOT).
 
-    Applies the three CLI feature-selection inputs (RFC #23 §3.4) to produce
-    the root manifest's initial active-flag seed BEFORE the enables-closure:
+    Single source of truth for both single-package and workspace CLI feature
+    validation + seed computation.  Takes only what it needs — the ``flags``
+    sequence — not a full manifest or workspace-manifest object.
+
+    Applies the three CLI feature-selection inputs (RFC #23 §3.4):
 
     - ``all_features=True``: seed = all declared flag names.
     - ``no_default_features=True``: seed = ``features`` only (no defaults).
     - Neither: seed = default-true flags ∪ ``features``.
 
-    ``features`` naming a flag the root manifest does not declare raises
+    ``features`` naming a flag not in ``flags`` raises
     ``MilpaError(FROZEN_ACTIVE_FLAGS_MISMATCH, ...)`` — surface-don't-hide
     (spec §3.4: "a --features naming a flag the root doesn't declare → error").
 
-    Returns the raw seed (before enables-closure); caller applies
+    Returns the raw seed BEFORE enables-closure; caller applies
     ``flag_enables_closure`` over this seed.
+
+    **Callers are responsible for the "no CLI features active" guard**
+    (i.e. checking ``bool(features) or no_default_features or all_features``
+    before calling).  This function always returns a ``frozenset`` — it does
+    NOT return ``None`` for the passthrough case.
     """
     from milpa.errors import FROZEN_ACTIVE_FLAGS_MISMATCH, MilpaError as _MilpaError
 
-    declared_names: frozenset[str] = frozenset(fd.name for fd in manifest.flags)
+    declared_names: frozenset[str] = frozenset(fd.name for fd in flags)
 
-    # Validate: --features names must be declared in the root manifest.
+    # Validate: --features names must be declared in the flags block.
     unknown = features - declared_names
     if unknown:
         raise _MilpaError(
             FROZEN_ACTIVE_FLAGS_MISMATCH,
-            f"--features names flags not declared in the root manifest: "
+            f"--features names flags not declared in the manifest flags block: "
             f"{sorted(unknown)} — add them to the 'flags' block or remove them",
             unknown=sorted(unknown),
         )
@@ -645,10 +653,26 @@ def _compute_root_active_seed(
         return features
 
     # Default: default-true flags ∪ --features.
-    default_seed: frozenset[str] = frozenset(
-        fd.name for fd in manifest.flags if fd.default
-    )
+    default_seed: frozenset[str] = frozenset(fd.name for fd in flags if fd.default)
     return default_seed | features
+
+
+def _compute_root_active_seed(
+    manifest: Manifest,
+    features: frozenset[str],
+    no_default_features: bool,
+    all_features: bool,
+) -> frozenset[str]:
+    """Thin wrapper for backward-compat: delegates to ``_compute_cli_active_seed``.
+
+    Single-package call site — passes ``manifest.flags`` to the SSOT.
+    """
+    return _compute_cli_active_seed(
+        manifest.flags,
+        features=features,
+        no_default_features=no_default_features,
+        all_features=all_features,
+    )
 
 
 def _compute_workspace_cli_seed(
@@ -657,47 +681,21 @@ def _compute_workspace_cli_seed(
     no_default_features: bool,
     all_features: bool,
 ) -> frozenset[str] | None:
-    """Compute the workspace-root CLI active-flag seed from CLI feature inputs.
+    """Thin wrapper for backward-compat: delegates to ``_compute_cli_active_seed``.
 
-    Analogous to ``_compute_root_active_seed`` but operates on the workspace
-    root's ``WorkspaceManifest.flags`` block (not a full ``Manifest``).
-
-    Returns the raw seed ``frozenset[str]`` when CLI features are active, or
-    ``None`` when no CLI feature selection was made (passthrough).  ``None``
-    means "no flag filtering" — the flag gate is disabled.
-
-    Validates that every explicit feature name is declared in the workspace
-    root ``flags {}`` block (raises ``FROZEN-ACTIVE-FLAGS-MISMATCH`` if not).
+    Workspace call site — passes ``workspace_manifest.flags`` to the SSOT.
+    Returns ``None`` when no CLI feature selection is active (passthrough
+    semantics for the workspace flag gate).
     """
-    from milpa.errors import FROZEN_ACTIVE_FLAGS_MISMATCH, MilpaError as _ME
-
     has_cli_features = bool(features) or no_default_features or all_features
     if not has_cli_features:
         return None
-
-    declared_names: frozenset[str] = frozenset(
-        fd.name for fd in workspace_manifest.flags  # type: ignore[attr-defined]
+    return _compute_cli_active_seed(
+        workspace_manifest.flags,  # type: ignore[attr-defined]
+        features=features,
+        no_default_features=no_default_features,
+        all_features=all_features,
     )
-
-    unknown = features - declared_names
-    if unknown:
-        raise _ME(
-            FROZEN_ACTIVE_FLAGS_MISMATCH,
-            f"--features names flags not declared in the workspace root flags "
-            f"block: {sorted(unknown)} — add them to the workspace root "
-            f"'flags' block or remove them",
-            unknown=sorted(unknown),
-        )
-
-    if all_features:
-        return declared_names
-    if no_default_features:
-        return features
-    default_seed: frozenset[str] = frozenset(
-        fd.name for fd in workspace_manifest.flags  # type: ignore[attr-defined]
-        if fd.default
-    )
-    return default_seed | features
 
 
 # ---------------------------------------------------------------------------
@@ -726,7 +724,7 @@ def _compute_workspace_cli_seed(
 #
 # resolver-semantics §470 NORMATIVE: absent profile disables platform/arch/nim/
 # milpa-predicate filtering entirely.  Do NOT synthesise a Profile{platform=None}
-# and call filter_manifest — that would violate §470 via _predicate_satisfied
+# and call filter_manifest — that would violate §470 via _predicate_satisfied_profile_only
 # returning False for absent axes (silent prune instead of pass).
 # ---------------------------------------------------------------------------
 
@@ -832,14 +830,6 @@ def filter_manifest(manifest: Manifest, ctx: FilterContext) -> Manifest:
     if ctx.profile is None and not ctx.active_flags:
         return manifest
 
-    # Determine whether the flag gate runs.
-    # The flag gate evaluates flag predicates when:
-    #   - profile is present (Row-1 parity: profile path always evaluated flags), OR
-    #   - active_flags is nonempty (Row-2 flag-only path).
-    # Both cases reduce to: run the flag gate unless (profile=None AND active_flags empty).
-    # That condition is already handled by the fast path above, so here we always run.
-    _run_flag_gate = True  # reached only when profile is not None OR active_flags nonempty
-
     def _dep_passes(dep: Dep) -> bool:
         preds: tuple[Predicate, ...] = dep.predicates
 
@@ -853,9 +843,9 @@ def filter_manifest(manifest: Manifest, ctx: FilterContext) -> Manifest:
                     return False
 
         # --- Flag gate (flag predicates) ---
-        if _run_flag_gate:
-            if not dep_passes_flag_predicates(preds, ctx.active_flags):
-                return False
+        # Reached only when profile is not None OR active_flags nonempty (fast path above).
+        if not dep_passes_flag_predicates(preds, ctx.active_flags):
+            return False
 
         return True
 
@@ -878,92 +868,6 @@ def _predicate_satisfied_profile_only(
     OR semantics within a predicate's values (§6 NORMATIVE).
     Negation inverts the OR result.
     """
-    actual: str | None = getattr(profile, pred.name, None)
-    if actual is None:
-        return False
-
-    any_match = any(_value_matches(pred.name, actual, v) for v in pred.values)
-    return (not any_match) if pred.negated else any_match
-
-
-# ---------------------------------------------------------------------------
-# Legacy internal helpers — kept as thin wrappers that delegate to filter_manifest.
-#
-# These were the single-package dispatch functions before S1.  They are now
-# implemented in terms of FilterContext + filter_manifest to avoid duplicating
-# the filter decision.  They remain to support the resolve_workspace call sites
-# that have not been migrated to FilterContext yet (S2 wires those).
-#
-# DO NOT add new call-sites for _filter_manifest_by_profile or
-# _filter_manifest_by_flags_only; call filter_manifest(manifest, ctx) instead.
-# ---------------------------------------------------------------------------
-
-
-def _filter_manifest_by_profile(
-    manifest: Manifest,
-    profile: Profile,
-    cli_active_seed: frozenset[str] | None = None,
-) -> Manifest:
-    """Legacy wrapper: filter by profile (+ optional flag seed).
-
-    Delegates to ``filter_manifest`` with a ``FilterContext`` built from the
-    profile and ``cli_active_seed``.  Kept for the resolve_workspace call-sites
-    that have not been migrated to FilterContext yet (S2).
-    """
-    ctx = FilterContext(
-        profile=profile,
-        active_flags=(
-            flag_enables_closure(manifest.flags, cli_active_seed)
-            if cli_active_seed is not None
-            else flag_enables_closure(manifest.flags, _manifest_flag_seed(manifest))
-        ),
-    )
-    return filter_manifest(manifest, ctx)
-
-
-def _filter_manifest_by_flags_only(
-    manifest: Manifest,
-    cli_active_seed: frozenset[str],
-) -> Manifest:
-    """Legacy wrapper: filter by flag predicates only (no profile).
-
-    Delegates to ``filter_manifest`` with a flag-only ``FilterContext``.
-    Kept for symmetry; single-package resolve() now goes through FilterContext.
-    """
-    ctx = FilterContext(
-        profile=None,
-        active_flags=flag_enables_closure(manifest.flags, cli_active_seed),
-    )
-    return filter_manifest(manifest, ctx)
-
-
-def _dep_matches_profile(
-    dep: Dep,
-    profile: Profile,
-    active_flags: frozenset[str],
-) -> bool:
-    """True iff ALL predicates on ``dep`` match the profile + active flags.
-
-    Legacy helper used by ``_predicate_satisfied`` (workspace BFS path not yet
-    migrated to FilterContext).  Kept for call-sites in resolve_workspace (S2).
-    """
-    preds: tuple[Predicate, ...] = dep.predicates
-    return all(_predicate_satisfied(pred, profile, active_flags) for pred in preds)
-
-
-def _predicate_satisfied(
-    pred: Predicate,
-    profile: Profile,
-    active_flags: frozenset[str],
-) -> bool:
-    """Evaluate a single predicate against profile + active flags.
-
-    OR semantics within a predicate's values (§6 NORMATIVE).
-    Negation inverts the OR result.
-    """
-    if pred.name == "flag":
-        return dep_passes_flag_predicates((pred,), active_flags)
-
     actual: str | None = getattr(profile, pred.name, None)
     if actual is None:
         return False
@@ -1640,11 +1544,14 @@ def _s4a_run_fixpoint(
     provenance_gate: "dict[str, tuple[tuple[object, ...], bool]]",
     root_authority: "set[str]",
     record_discovery: "Callable[[str], None]",
+    extra_manifests: "dict[str, object] | None" = None,
 ) -> None:
     """S4a outer dep×flag fixpoint loop.
 
     Iterates until neither ``dep_active_flags`` nor the admitted dep set grows:
       1. Load manifests for all known fetched URL deps (from ``deps_dir``).
+         ``extra_manifests`` (optional) injects pre-loaded manifests for deps
+         whose files live outside ``deps_dir`` (e.g. workspace members).
       2. Compute cross-pkg enables from every dep's current active flags:
          for each active flag f on dep D, f.enables_cross_pkg generates
          FlagRequest(s) for target deps.
@@ -1713,6 +1620,15 @@ def _s4a_run_fixpoint(
                     dep_manifests[dep_name_k] = dm
                 except Exception:
                     pass  # non-fatal
+
+        # Merge extra_manifests (e.g. workspace members not in deps_dir).
+        # extra_manifests takes lower precedence — only inject names not
+        # already loaded from deps_dir (deps_dir is the authoritative source
+        # for fetched content; members are injected for enables propagation).
+        if extra_manifests:
+            for _em_name, _em_manifest in extra_manifests.items():
+                if _em_name not in dep_manifests:
+                    dep_manifests[_em_name] = _em_manifest  # type: ignore[assignment]
 
         # ---------------------------------------------------------------
         # Step 2: compute cross-pkg enables from all currently-active flags.
@@ -2144,8 +2060,8 @@ def resolve(
     )
     _cli_active_seed: frozenset[str] | None = None
     if _has_cli_features:
-        _cli_active_seed = _compute_root_active_seed(
-            manifest,
+        _cli_active_seed = _compute_cli_active_seed(
+            manifest.flags,
             features=params.features,
             no_default_features=params.no_default_features,
             all_features=params.all_features,
@@ -3438,8 +3354,19 @@ def _build_graph(
         # dep_active_flags is seeded only when the dep has consumer flag requests
         # (S3/S4a).  For deps with no requests but default=#true flags, derive the
         # defaults-only active set from the dep's manifest (same fallback as S4c).
-        _active_map = provider.dep_active_flags.get(cand.identity if cand.identity else "", {})
-        if not _active_map and cand.identity:
+        #
+        # Workspace members are excluded: their active_flags are an internal
+        # resolver concern (used to fire cross-pkg enables on external deps)
+        # and MUST NOT appear in the lockfile.  Members carry no pinnable
+        # flag state — every consumer already knows the member's flags by
+        # reading the member's milpa.kdl directly.
+        _is_member = isinstance(cand.provenance, MP)
+        _active_map = (
+            {}
+            if _is_member
+            else provider.dep_active_flags.get(cand.identity if cand.identity else "", {})
+        )
+        if not _active_map and cand.identity and not _is_member:
             # No consumer requests — derive defaults only.
             _kdl_path = deps_dir / name / "milpa.kdl"
             if _kdl_path.exists():
@@ -3481,7 +3408,8 @@ def _build_graph(
 
 
 def _build_member_candidate(
-    member: object,  # LoadedMember — typed at runtime to avoid early import
+    manifest: Manifest,
+    abs_dir: Path,
     overrides_by_name: dict[str, Override],
     members_by_name: frozenset[str],
 ) -> tuple[_Candidate, list[object]]:
@@ -3490,10 +3418,6 @@ def _build_member_candidate(
     Returns ``(_Candidate, [])`` — members have no external transitive deps to
     enqueue (their deps are seeded explicitly in resolve_workspace).
     """
-    # member is a LoadedMember — access fields dynamically to avoid circular import.
-    manifest = member.manifest  # type: ignore[attr-defined]
-    abs_dir: Path = member.abs_dir  # type: ignore[attr-defined]
-
     identity = compute_content_hash(abs_dir)
 
     # Build solver terms from ALL member deps (regular + dev-deps, per §11).
@@ -3601,16 +3525,23 @@ def resolve_workspace(
     deps_dir.mkdir(parents=True, exist_ok=True)
 
     # S2 (RFC: workspace-completion §3.A): compute workspace-root CLI seed.
-    # Delegates to _compute_workspace_cli_seed (SSOT for workspace feature
-    # validation + seed computation).  The seed is passed per-member to
-    # FilterContext.build, which runs flag_enables_closure against the
-    # *member's own* flags — that's why build() takes the member manifest.
+    # Uses _compute_cli_active_seed (SSOT) with workspace_manifest.flags.
+    # The seed is passed per-member to FilterContext.build, which runs
+    # flag_enables_closure against the *member's own* flags — that's why
+    # build() takes the member manifest.
     # None = no CLI feature selection (passthrough for the flag gate).
-    _ws_cli_seed: frozenset[str] | None = _compute_workspace_cli_seed(
-        workspace.workspace_manifest,
-        params.features,
-        params.no_default_features,
-        params.all_features,
+    _ws_has_cli_features = (
+        bool(params.features) or params.no_default_features or params.all_features
+    )
+    _ws_cli_seed: frozenset[str] | None = (
+        _compute_cli_active_seed(
+            workspace.workspace_manifest.flags,
+            features=params.features,
+            no_default_features=params.no_default_features,
+            all_features=params.all_features,
+        )
+        if _ws_has_cli_features
+        else None
     )
 
     # ------------------------------------------------------------------
@@ -3745,19 +3676,9 @@ def resolve_workspace(
             member.manifest, params.profile, cli_seed=_ws_cli_seed
         )
         member_manifest = filter_manifest(member.manifest, _member_ctx)
-        if member_manifest is not member.manifest:
-            # Use a temporary LoadedMember-like object with the filtered manifest.
-            class _FilteredMember:
-                def __init__(self, orig: object, manifest: Manifest) -> None:
-                    self.manifest = manifest
-                    self.abs_dir = orig.abs_dir  # type: ignore[attr-defined]
-                    self.rel_path = orig.rel_path  # type: ignore[attr-defined]
-            effective = _FilteredMember(member, member_manifest)
-        else:
-            effective = member  # type: ignore[assignment]
 
         cand, _ = _build_member_candidate(
-            effective, overrides_by_name, members_by_name
+            member_manifest, member.abs_dir, overrides_by_name, members_by_name
         )
         provider.add(cand)
 
@@ -3881,6 +3802,59 @@ def resolve_workspace(
                 _ws_record_discovery(name)  # Phase B: local dep in seed order
 
     # ------------------------------------------------------------------
+    # S4a (workspace): pre-seed member dep_active_flags and build the
+    # extra_manifests dict so the fixpoint can fire member-flag enables.
+    #
+    # Workspace members live in their source dirs (member.abs_dir), NOT
+    # in deps_dir.  The standard S4a fixpoint reads manifests from
+    # deps_dir/<name>/milpa.kdl — members are invisible to it.  To fix:
+    #
+    # 1. Compute each member's default-active flag seed (default=true
+    #    flags + same-pkg enables-closure, same algorithm as the
+    #    workspace-root-flags seeding above).
+    # 2. Seed provider.dep_active_flags[member_identity] with those
+    #    active flags so the fixpoint's step 2 can fire their
+    #    enables_cross_pkg rules.
+    # 3. Pass the member manifests as extra_manifests to the fixpoint so
+    #    they appear in dep_manifests alongside fetched URL deps.
+    #
+    # This mirrors what process_url (line ~1522-1546) does for URL deps:
+    # unconditionally seed dep_active_flags so default-true flags are
+    # visible to the fixpoint even without an explicit flag_request.
+    # ------------------------------------------------------------------
+    _member_manifests_for_fixpoint: dict[str, object] = {}
+    for _seed_member in workspace.members:
+        _seed_manifest = _seed_member.manifest
+        if not _seed_manifest.flags:
+            continue
+        # Compute the member's default-active flags (same-pkg closure).
+        _seed_active: frozenset[str] = frozenset(
+            f.name for f in _seed_manifest.flags if f.default
+        )
+        _seed_active = flag_enables_closure(_seed_manifest.flags, _seed_active)
+        if not _seed_active:
+            continue
+        # Get the member's identity from its candidate.
+        _seed_cand_map = provider._candidates.get(_seed_manifest.name, {})
+        _seed_identity: str | None = None
+        for _sc in _seed_cand_map.values():
+            if _sc.identity:
+                _seed_identity = _sc.identity
+                break
+        if _seed_identity is None:
+            continue
+        # Seed dep_active_flags for this member (monotone union with any existing).
+        _seed_existing = provider.dep_active_flags.get(_seed_identity, {})
+        _seed_merged: dict[str, set[ActivationSource]] = dict(_seed_existing)
+        for _sfn in _seed_active:
+            if _sfn not in _seed_merged:
+                _seed_merged[_sfn] = set()
+            _seed_merged[_sfn].add(ActivationSource.DEFAULT)
+        provider.dep_active_flags[_seed_identity] = _seed_merged
+        # Include this member's manifest in the fixpoint's dep_manifests.
+        _member_manifests_for_fixpoint[_seed_manifest.name] = _seed_manifest
+
+    # ------------------------------------------------------------------
     # BFS materialisation loop (parallel) — shared helper, see resolve()
     # for full ordering-invariant commentary.
     # ------------------------------------------------------------------
@@ -3903,6 +3877,38 @@ def resolve_workspace(
             provenance_gate=provenance_gate,
             root_authority=root_authority,
             record_discovery=_ws_record_discovery,
+        )
+
+        # ------------------------------------------------------------------
+        # Step 6a (workspace): S4a dep×flag fixpoint (RFC #23 §3.1.2 + §7 S4a)
+        #
+        # Mirrors resolve() step 6a.  After the initial BFS wave, iterate
+        # until neither the admitted dep set nor the active-flag set grows.
+        # The executor remains open so newly-admitted deps can be fetched.
+        #
+        # extra_manifests supplies workspace member manifests (not in deps_dir)
+        # so member-flag enables_cross_pkg rules fire during the fixpoint.
+        # Member dep_active_flags were pre-seeded above so the fixpoint's
+        # step 2 sees each member's default-active flags on the first iteration.
+        # ------------------------------------------------------------------
+        _s4a_run_fixpoint(
+            provider=provider,
+            bfs_queue=bfs_queue,
+            executor=executor,
+            seen_named=seen_named,
+            seen_url=seen_url,
+            seen_tarball=seen_tarball,
+            seen_local=seen_local,
+            edge_cache=ws_edge_cache,
+            overrides_by_name=overrides_by_name,
+            deps_dir=deps_dir,
+            env=env,
+            params=params,
+            index=index,
+            provenance_gate=provenance_gate,
+            root_authority=root_authority,
+            record_discovery=_ws_record_discovery,
+            extra_manifests=_member_manifests_for_fixpoint,
         )
 
     # ------------------------------------------------------------------
