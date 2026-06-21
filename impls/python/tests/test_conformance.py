@@ -415,13 +415,27 @@ def _build_env(fixture_dir: Path, tmp_dir: Path, no_index: bool = False) -> Milp
     # injecting ``MILPA_DEP_DECL_DIR`` (S3a, conformance-fixtures.md §2.11).
     # Without this the DepDecl edge-source branch is never reached and an
     # attested-metadata fixture would silently resolve from .nimble/milpa.kdl.
-    from milpa.dep_decl_store import FileDepDeclStore
+    # Mirror the CLI's _build_dep_decl_store (cli.py) exactly — an in-process
+    # adapter that produces a different normative output than its own CLI is a
+    # bug (rfc-conformance-parity §3 corollary). Priority:
+    #   no_index → None;
+    #   dep-decl/ dir present → FileDepDeclStore (MILPA_DEP_DECL_DIR analogue);
+    #   else index.kdl present → HttpDepDeclStore over the index base (the CLI's
+    #     MILPA_INDEX_URL→HttpDepDeclStore path); a missing dep-decl/<hash>.kdl
+    #     then raises TNG-DEPDECL-FETCH-FAILED, as the CLI does (fixture-144);
+    #   else None.
+    from milpa.dep_decl_store import FileDepDeclStore, make_dep_decl_store
 
     dep_decl_dir = fixture_dir / "dep-decl"
-    dep_decl_store = (
-        None if no_index
-        else FileDepDeclStore(dep_decl_dir) if dep_decl_dir.is_dir() else None
-    )
+    index_path_for_decl = fixture_dir / "index.kdl"
+    if no_index:
+        dep_decl_store = None
+    elif dep_decl_dir.is_dir():
+        dep_decl_store = FileDepDeclStore(dep_decl_dir)
+    elif index_path_for_decl.exists():
+        dep_decl_store = make_dep_decl_store(f"file://{index_path_for_decl.resolve()}")
+    else:
+        dep_decl_store = None
 
     return MilpaEnv(
         fetcher=fetcher,
@@ -1467,11 +1481,10 @@ _NOT_YET_WIRED_FIXTURE_NAMES: frozenset[str] = frozenset(
         # (RES-WS-*, FETCH-ALL-FAILED tarball, workspace success fixtures
         # remain parked under their own xfail entries — see below.)
         #
-        # Pre-existing baseline red (NOT #23) — tracked, parked to xfail so the
-        # suite stays green per this file's policy (mirrors Rust known_failing.txt):
-        # fixture-144: depdecl fetch-failed maps to RES-UNATTESTED-METADATA instead
-        #   of TNG-DEPDECL-FETCH-FAILED — see gh #153.
-        "fixture-144-depdecl-fetch-failed",
+        # (fixture-144 un-parked: the adapter now mirrors the CLI's
+        # MILPA_INDEX_URL→HttpDepDeclStore path, so an absent dep-decl/ with an
+        # index present raises TNG-DEPDECL-FETCH-FAILED — rfc-conformance-parity
+        # Slice 2. No remaining in-process xfails.)
     }
 )
 

@@ -547,16 +547,32 @@ impl Target for MilpaTarget {
                     scratch.root.clone(),
                 );
 
-                // S3b: if the fixture ships a `dep-decl/` directory, wire a
-                // `FileDepDeclStore` so clause (c) of the EdgeSource coordinator
-                // is reachable. Mirrors the harness runner's MILPA_DEP_DECL_DIR
-                // injection (harness/runner.py:128–130).
+                // S3b / Slice 2: mirror the CLI's maybe_dep_decl_store exactly —
+                // an in-process adapter that produces a different normative output
+                // than its own CLI is a bug (rfc-conformance-parity §3 corollary).
+                //   --no-index → None;
+                //   dep-decl/ dir present → FileDepDeclStore (MILPA_DEP_DECL_DIR analogue);
+                //   else index.kdl present → HttpDepDeclStore over the index base
+                //     (the CLI's MILPA_INDEX_URL→HttpDepDeclStore path); a missing
+                //     dep-decl/<hash>.kdl then raises TNG-DEPDECL-FETCH-FAILED
+                //     (fixture-144), matching the black-box CLI;
+                //   else None.
                 let dep_decl_dir = fx.dir.join("dep-decl");
+                let index_kdl = fx.dir.join("index.kdl");
                 let file_store;
+                let http_store;
                 let dep_decl_store: Option<&dyn milpa_core::dep_decl_store::DepDeclStore> =
-                    if dep_decl_dir.is_dir() {
+                    if fx.no_index {
+                        None
+                    } else if dep_decl_dir.is_dir() {
                         file_store = milpa_core::FileDepDeclStore::new(&dep_decl_dir);
                         Some(&file_store)
+                    } else if index_kdl.is_file() {
+                        http_store = milpa_core::make_dep_decl_store(&format!(
+                            "file://{}",
+                            index_kdl.display()
+                        ));
+                        Some(&http_store)
                     } else {
                         None
                     };
