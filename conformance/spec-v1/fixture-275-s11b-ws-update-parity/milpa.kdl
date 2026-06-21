@@ -1,0 +1,8 @@
+// fixture-275: S11b — workspace update parity
+//
+// update at a workspace root (Python was broken, Rust already correct).
+// Drops all pins → full workspace re-resolve → refreshes shared milpa.lock.
+// No nim.cfg emitted by update in either impl.
+workspace {
+    member "member-a"
+}

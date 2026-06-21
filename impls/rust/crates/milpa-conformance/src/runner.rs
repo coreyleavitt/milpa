@@ -807,6 +807,31 @@ impl Target for MilpaTarget {
                 std::fs::write(scratch.root.join("milpa.lock"), &ltext)
                     .map_err(|e| format!("E2E-LOCKFILE-WRITE: {e}"))?;
 
+                // S11b (Breadth-P2c): workspace frozen-flags mismatch check.
+                // Runs BEFORE disk check, matching cmd_verify's ordering.
+                if let ManifestDoc::Workspace(_) = doc {
+                    let loaded_verify = match milpa_core::load_workspace(&fx.dir) {
+                        Ok(w) => w,
+                        Err(_) => {
+                            // workspace load failed — fall through to disk check
+                            let divergences = milpa_core::verify_lockfile_against_deps(&lock, &scratch.deps_dir);
+                            if !divergences.is_empty() {
+                                return Err("LOCK-GRAPH-MISMATCH".to_string());
+                            }
+                            return Ok(Produced::NoByteDiff);
+                        }
+                    };
+                    if let Err(e) = milpa_core::check_workspace_frozen_active_flags_mismatch(
+                        &loaded_verify,
+                        &lock,
+                        &std::collections::BTreeSet::new(),
+                        false,
+                        false,
+                    ) {
+                        return Err(e.code().to_string());
+                    }
+                }
+
                 // Phase 2: disk check.
                 let divergences =
                     milpa_core::verify_lockfile_against_deps(&lock, &scratch.deps_dir);

@@ -1339,8 +1339,6 @@ def cmd_verify(
     # Runs BEFORE the disk-state check because it's a manifest-vs-lockfile
     # consistency check (not a disk-vs-lockfile check), and should fire even
     # if _deps/ has stale content.
-    # Scope: single-package manifests only (workspace mismatch checks are a
-    # workspace-feature-unification concern, S11).
     # -------------------------------------------------------------------------
     if ws is None:
         try:
@@ -1358,6 +1356,23 @@ def cmd_verify(
             return 1
         except Exception:
             pass  # manifest unreadable — skip; identity check below will catch real issues
+    else:
+        # S11b (Breadth-P2c): workspace frozen-flags mismatch check.
+        # Reuses _check_workspace_frozen_active_flags_mismatch (SSOT) — no
+        # CLI feature overrides at verify time (verify checks manifest defaults).
+        # Complements S2's fetch --frozen path.
+        try:
+            _check_workspace_frozen_active_flags_mismatch(
+                ws,
+                lockfile,
+                features=frozenset(),
+                no_default_features=False,
+                all_features=False,
+            )
+        except MilpaError as exc:
+            print(f"milpa verify: {exc.message}", file=sys.stderr)
+            _emit_slug(exc.slug)
+            return 1
 
     divergences = verify_lockfile_against_deps(lockfile, deps_dir)
     if divergences:
@@ -2123,6 +2138,25 @@ def cmd_update(
     """
     lock_path = project_dir / "milpa.lock"
 
+    # S11b (RFC: workspace-completion §3.G): workspace parity.
+    # Rust is already workspace-aware; bring Python to parity.
+    # From a workspace root, update does the full workspace re-resolve
+    # (drop pins → re-resolve shared graph → refresh shared lock).
+    # update writes no nim.cfg in either impl — keep that.
+    ws = find_workspace_root(project_dir)
+    if ws is not None:
+        return _cmd_update_workspace(
+            project_dir=project_dir,
+            workspace=ws,
+            env=env,
+            dep_name=dep_name,
+            strategy=strategy,
+            max_parallel=max_parallel,
+            features=features,
+            no_default_features=no_default_features,
+            all_features=all_features,
+        )
+
     manifest = load_or_discover_manifest(project_dir)
     env_with_index = _load_index_for_verb(env)
     deps_dir = project_dir / "_deps"
@@ -2218,6 +2252,95 @@ def cmd_update(
     lockfile_val = from_graph(graph, strategy=str(strategy))
     write_lockfile(lockfile_val, lock_path)
     print(f"updated {dep_name}", file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# _cmd_update_workspace (S11b)
+# ---------------------------------------------------------------------------
+
+
+def _cmd_update_workspace(
+    project_dir: Path,
+    workspace: object,
+    env: MilpaEnv,
+    *,
+    dep_name: str | None,
+    strategy: Strategy,
+    max_parallel: int,
+    features: frozenset[str] = frozenset(),
+    no_default_features: bool = False,
+    all_features: bool = False,
+) -> int:
+    """Workspace variant of cmd_update.
+
+    S11b (RFC: workspace-completion §3.G): full workspace re-resolve.
+    Drops ALL pins (prior=None) → re-resolves the shared graph → refreshes
+    the shared lock.  Mirrors what Rust already does in cmd_update.
+    NOTE: update writes no nim.cfg in either impl — keep that.
+    """
+    from milpa.workspace import LoadedWorkspace
+    assert isinstance(workspace, LoadedWorkspace)
+
+    ws_root = workspace.root_dir
+    lock_path = ws_root / "milpa.lock"
+    deps_dir = ws_root / "_deps"
+
+    # Scoped update (dep_name given) requires the lockfile.
+    if dep_name is not None and not lock_path.exists():
+        print(
+            f"milpa update: no lockfile at {lock_path} — run `milpa fetch` first",
+            file=sys.stderr,
+        )
+        _emit_slug(LOCK_FILE_NOT_FOUND)
+        return 1
+
+    # Build the prior for the workspace resolve.
+    # update with no arg: drop ALL pins (prior=None).
+    # update <dep>: drop only that dep's pin.
+    prior = _maybe_load_prior_lockfile(lock_path)
+    if dep_name is None:
+        prior = None  # Full drop — re-resolve from scratch.
+    elif prior is not None:
+        # Scoped: drop only this dep's pin from the prior.
+        from dataclasses import replace as _replace
+        canonical_name = resolve_alias_to_canonical(dep_name, prior)
+        if not any(d.name == canonical_name for d in prior.deps):
+            print(
+                f"milpa update: {dep_name!r} not found in lockfile",
+                file=sys.stderr,
+            )
+            _emit_slug(LOCK_DEP_NOT_FOUND)
+            return 1
+        updated_locked = next(d for d in prior.deps if d.name == canonical_name)
+        declared_provs = tuple(
+            p for p in updated_locked.provenances
+            if isinstance(p, GitProvenanceRecord) and p.origin == "declared"
+        )
+        pin_stripped = _replace(updated_locked, identity=None, provenances=declared_provs)
+        filtered_deps = tuple(d for d in prior.deps if d.name != canonical_name) + (pin_stripped,)
+        prior = _replace(prior, deps=filtered_deps)
+
+    env_with_index = _load_index_for_verb(env)
+    profile = Profile.from_environment()
+    params = ResolveParams(
+        strategy=strategy,
+        max_parallel=max_parallel,
+        profile=profile,
+        prior=prior,  # type: ignore[arg-type]
+        manifest_dir=ws_root,
+        features=features,
+        no_default_features=no_default_features,
+        all_features=all_features,
+    )
+
+    graph = resolve_workspace(workspace, deps_dir, env_with_index, params)
+    lockfile_val = from_graph(graph, strategy=str(strategy))
+    write_lockfile(lockfile_val, lock_path)
+    print(
+        f"updated {dep_name or 'all deps'} across {len(workspace.members)} members",
+        file=sys.stderr,
+    )
     return 0
 
 

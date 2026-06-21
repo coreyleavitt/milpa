@@ -589,6 +589,14 @@ content hashes. Does not fetch.
 > `<ws_root>/_deps/` against the shared lockfile and reports across all
 > members.
 
+> NORMATIVE (S11b / Breadth-P2c): `verify` MUST run the
+> `FROZEN-ACTIVE-FLAGS-MISMATCH` check for **both** single-package and
+> workspace manifests. The workspace frozen-flags check reuses the same
+> SSOT helper as the `fetch --frozen` path (S2); it runs with manifest
+> defaults (no CLI feature overrides at verify time) BEFORE the disk-state
+> check, so the correct slug fires when the lockfile was produced under a
+> different feature selection.
+
 **Exit codes:** 0 success (all hashes match), 1 failure (any divergence,
 missing lockfile, or missing `_deps/`).
 
@@ -776,12 +784,20 @@ milpa update [<dep>]
 > - Print `updated <name>` to stderr and exit 0.
 
 > NORMATIVE: `update` MUST NOT mutate `milpa.kdl`; only `milpa.lock`
-> and `_deps/` change.
+> and `_deps/` change. `update` MUST NOT emit `nim.cfg` in either
+> single-package or workspace mode.
 
 > NORMATIVE: If `<dep>` is provided but `milpa.lock` does not exist,
 > `update` MUST print a diagnostic to stderr and exit 1 (no lockfile
 > means no prior pins to drop selectively; a full `milpa fetch` is the
 > correct action).
+
+> NORMATIVE (S11b): `update` invoked at a **workspace root** MUST perform
+> the full workspace re-resolve: drop the specified dep's pin (or ALL pins
+> when no dep is named) → re-resolve the shared graph across all members →
+> refresh the shared `<ws_root>/milpa.lock`. The behavior mirrors the
+> single-package path; no verb emits a confusing internal error at a
+> workspace root.
 
 **Exit codes:** 0 success, 1 failure.
 

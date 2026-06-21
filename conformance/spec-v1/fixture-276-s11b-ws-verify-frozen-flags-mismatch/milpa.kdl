@@ -1,0 +1,16 @@
+// fixture-276: S11b — workspace verify FROZEN-ACTIVE-FLAGS-MISMATCH (Breadth-P2c)
+//
+// The lockfile was produced with --features tls (featurelib present in lock).
+// Running verify WITHOUT --features (tls off by default) should detect that
+// the lockfile was produced under a different feature selection and raise
+// FROZEN-ACTIVE-FLAGS-MISMATCH.
+//
+// The harness runs fetch first (populates _deps/ with tls=off → no featurelib),
+// then restores this milpa.lock (has featurelib), then runs verify.
+// verify detects the mismatch before disk-state checking → FROZEN-ACTIVE-FLAGS-MISMATCH.
+workspace {
+    member "member-a"
+}
+flags {
+    tls default=#false description="enable TLS support"
+}

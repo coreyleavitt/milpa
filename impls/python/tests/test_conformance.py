@@ -665,7 +665,7 @@ def _execute_fixture(
     # (S6 / spec §3.7.2)
     # ------------------------------------------------------------------
     if cmd == "verify":
-        return _execute_verify(fixture, tmp_dir, env)
+        return _execute_verify(fixture, tmp_dir, env, profile=profile)
 
     # ------------------------------------------------------------------
     # resolve / frozen: read milpa.kdl + dispatch
@@ -935,6 +935,8 @@ def _execute_verify(
     fixture: Fixture,
     tmp_dir: Path,
     env: MilpaEnv,
+    *,
+    profile: "Profile | None" = None,
 ) -> tuple[Literal["pass", "fail", "skip"], str]:
     """Execute a verify fixture in-process.
 
@@ -1000,10 +1002,10 @@ def _execute_verify(
                 loaded_ws = load_workspace(fixture_dir)
             except MilpaError as e:
                 return ("fail", f"verify: workspace load failed: {e.slug!r}")
-            resolve_workspace(loaded_ws, deps_dir, env, ResolveParams(manifest_dir=fixture_dir))
+            resolve_workspace(loaded_ws, deps_dir, env, ResolveParams(manifest_dir=fixture_dir, profile=profile))
         else:
             assert isinstance(doc, Manifest)
-            resolve(doc, deps_dir, env, ResolveParams(manifest_dir=fixture_dir))
+            resolve(doc, deps_dir, env, ResolveParams(manifest_dir=fixture_dir, profile=profile))
     except MilpaError as e:
         # Regular resolve failed — _deps/ not populated; verify will fail too.
         # For S6 fixtures, the pre-phase resolve should always succeed.
@@ -1038,6 +1040,25 @@ def _execute_verify(
     else:
         assert isinstance(doc, Manifest)
         _strict = effective_strict_policy(doc.attestation_policy, flag_require_attested)
+
+    # S11b (Breadth-P2c): workspace frozen-flags mismatch check.
+    # Runs BEFORE disk check (same as cmd_verify's ordering); uses manifest
+    # defaults (no CLI feature overrides at verify time).
+    if isinstance(doc, WorkspaceManifest):
+        try:
+            loaded_ws_verify = load_workspace(fixture_dir)
+            from milpa.cli import _check_workspace_frozen_active_flags_mismatch
+            _check_workspace_frozen_active_flags_mismatch(
+                loaded_ws_verify,
+                lockfile,
+                features=frozenset(),
+                no_default_features=False,
+                all_features=False,
+            )
+        except MilpaError as e:
+            if fixture.expected_error is not None and e.slug == fixture.expected_error:
+                return ("pass", "")
+            return ("fail", f"verify: workspace frozen-flags check raised {e.slug!r} (expected {fixture.expected_error!r})")
 
     # Disk check.
     divergences = verify_lockfile_against_deps(lockfile, deps_dir)

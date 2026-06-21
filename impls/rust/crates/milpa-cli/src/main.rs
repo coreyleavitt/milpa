@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use milpa_core::{
     add_mirror, apply_workspace_manifest_change, build_flag_defines, check_frozen_active_flags_mismatch,
+    check_workspace_frozen_active_flags_mismatch,
     dep_decl_store::DepDeclStore, discover_manifest, effective_strict_policy,
     fetch::{FetchError, FetcherRegistry}, format_nimcfg, format_workspace_nimcfgs, from_graph,
     load_index, load_lockfile, load_manifest, load_workspace, LoadedMember, LoadedWorkspace,
@@ -247,18 +248,38 @@ fn cmd_verify(dir: &Path, require_attested_metadata: bool, no_index: bool) -> Re
     // uses dep_passes_flag_predicates for the admission decision.  With no CLI
     // features (empty BTreeSet, no_default_features=false, all_features=false),
     // the function uses the default-true flag closure as the seed.
-    if let Ok(milpa_manifest::ManifestDoc::Package(ref manifest)) = discover_manifest(dir) {
-        if let Err(e) = check_frozen_active_flags_mismatch(
-            manifest,
-            &lock,
-            &std::collections::BTreeSet::new(),
-            false,
-            false,
-        ) {
-            eprintln!("{}: {}", e.code(), message_of(&e));
-            eprintln!("milpa-error: {}", e.code());
-            return Ok(1);
+    match discover_manifest(dir) {
+        Ok(milpa_manifest::ManifestDoc::Package(ref manifest)) => {
+            if let Err(e) = check_frozen_active_flags_mismatch(
+                manifest,
+                &lock,
+                &std::collections::BTreeSet::new(),
+                false,
+                false,
+            ) {
+                eprintln!("{}: {}", e.code(), message_of(&e));
+                eprintln!("milpa-error: {}", e.code());
+                return Ok(1);
+            }
         }
+        Ok(milpa_manifest::ManifestDoc::Workspace(_)) => {
+            // S11b (Breadth-P2c): workspace frozen-flags mismatch check.
+            // Runs BEFORE disk-state check; uses manifest defaults (no CLI features at verify time).
+            if let Ok(ws) = load_workspace(dir) {
+                if let Err(e) = check_workspace_frozen_active_flags_mismatch(
+                    &ws,
+                    &lock,
+                    &std::collections::BTreeSet::new(),
+                    false,
+                    false,
+                ) {
+                    eprintln!("{}: {}", e.code(), message_of(&e));
+                    eprintln!("milpa-error: {}", e.code());
+                    return Ok(1);
+                }
+            }
+        }
+        Err(_) => {}
     }
 
     let deps_dir = dir.join("_deps");
