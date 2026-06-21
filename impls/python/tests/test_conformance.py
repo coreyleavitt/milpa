@@ -53,10 +53,30 @@ Spec authority: spec/conformance-fixtures.md, RFC §4.4/§4.5.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any, Literal
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# Harness imports — stdlib-only; no milpa import at module level.
+# The harness package lives at the repo root (parents[3] from this test file).
+# ---------------------------------------------------------------------------
+_REPO_ROOT_FOR_HARNESS = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT_FOR_HARNESS) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT_FOR_HARNESS))
+
+from harness.assertions import (  # noqa: E402
+    apply_lock_placeholders,
+    compare_certificate_json,
+    normalize_deps_structure,
+)
+from harness.inputs import (  # noqa: E402
+    env_flag,
+    parse_cli_features,
+    read_env_file,
+)
 
 from milpa.cas import CAStore
 from milpa.context import MilpaEnv, ResolveParams
@@ -67,7 +87,6 @@ from milpa.fetchers.mocked import (
     MockedGitFetcher,
     MockedOciFetcher,
     MockedTarballFetcher,
-    TARBALL_SHA256_PLACEHOLDER,
     mocked_registry,
 )
 from milpa.fetchers.types import FetcherRegistry
@@ -243,18 +262,9 @@ def _fixture_profile(fixture_dir: Path) -> Profile | None:
     §470); host-defaulting belongs to the CLI, not the host-independent corpus
     runner.
     """
-    env_file = fixture_dir / "env"
-    if not env_file.exists():
+    env_vars = _fixture_env_vars(fixture_dir)
+    if not env_vars:
         return None
-
-    env_vars: dict[str, str] = {}
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" in line:
-            key, _, value = line.partition("=")
-            env_vars[key.strip()] = value.strip()
 
     # Mirror the Rust runner: return None when no MILPA_TARGET_* axis is set.
     # An env file carrying only MILPA_CLI_FEATURES (or other non-target keys)
@@ -281,41 +291,20 @@ def _fixture_require_attested_metadata(fixture_dir: Path) -> bool:
     """Return True when MILPA_REQUIRE_ATTESTED_METADATA is set in the fixture env file.
 
     Mirrors the Rust runner's fixture_require_attested_metadata() function.
-    The truthy values are any non-empty string that is not "0" or "false".
+    Delegates to _fixture_env_vars (the canonical env-file parser) and
+    env_flag (the canonical boolean-flag interpreter from harness/inputs.py).
     """
-    env_file = fixture_dir / "env"
-    if not env_file.exists():
-        return False
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" in line:
-            key, _, value = line.partition("=")
-            if key.strip() == "MILPA_REQUIRE_ATTESTED_METADATA":
-                v = value.strip()
-                return bool(v and v not in ("0", "false"))
-    return False
+    env = _fixture_env_vars(fixture_dir)
+    return env_flag(env, "MILPA_REQUIRE_ATTESTED_METADATA")
 
 
 def _fixture_env_vars(fixture_dir: Path) -> dict[str, str]:
     """Parse the fixture's optional ``env`` file into a dict of KEY=VALUE pairs.
 
-    Returns an empty dict when the file is absent.  Skips blank lines and
-    comment lines (starting with ``#``).
+    One-line delegate to ``harness.inputs.read_env_file`` — the SINGLE
+    DEFINITION of fixture env-file parsing (D1 unification).
     """
-    env_file = fixture_dir / "env"
-    if not env_file.exists():
-        return {}
-    result: dict[str, str] = {}
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" in line:
-            key, _, value = line.partition("=")
-            result[key.strip()] = value.strip()
-    return result
+    return read_env_file(fixture_dir)
 
 
 def _fixture_cli_features(fixture_dir: Path) -> frozenset[str]:
@@ -323,32 +312,29 @@ def _fixture_cli_features(fixture_dir: Path) -> frozenset[str]:
 
     Reads ``MILPA_CLI_FEATURES`` (comma-separated flag names).
     S9: mirrors CLI's _parse_features(args.features).
+
+    Delegates to ``parse_cli_features`` from harness/inputs.py —
+    the SINGLE DEFINITION of fixture feature-flag semantics (M1 unification).
     """
-    env = _fixture_env_vars(fixture_dir)
-    raw = env.get("MILPA_CLI_FEATURES", "")
-    if not raw:
-        return frozenset()
-    return frozenset(name.strip() for name in raw.split(",") if name.strip())
+    return parse_cli_features(_fixture_env_vars(fixture_dir))
 
 
 def _fixture_no_default_features(fixture_dir: Path) -> bool:
     """Return True when MILPA_NO_DEFAULT_FEATURES is set in the fixture env file.
 
     S9: mirrors CLI's --no-default-features.
+    Delegates to ``env_flag`` from harness/inputs.py (M1 unification).
     """
-    env = _fixture_env_vars(fixture_dir)
-    v = env.get("MILPA_NO_DEFAULT_FEATURES", "")
-    return bool(v and v not in ("0", "false"))
+    return env_flag(_fixture_env_vars(fixture_dir), "MILPA_NO_DEFAULT_FEATURES")
 
 
 def _fixture_all_features(fixture_dir: Path) -> bool:
     """Return True when MILPA_ALL_FEATURES is set in the fixture env file.
 
     S9: mirrors CLI's --all-features.
+    Delegates to ``env_flag`` from harness/inputs.py (M1 unification).
     """
-    env = _fixture_env_vars(fixture_dir)
-    v = env.get("MILPA_ALL_FEATURES", "")
-    return bool(v and v not in ("0", "false"))
+    return env_flag(_fixture_env_vars(fixture_dir), "MILPA_ALL_FEATURES")
 
 
 # ---------------------------------------------------------------------------
@@ -406,29 +392,24 @@ def _build_env(fixture_dir: Path, tmp_dir: Path, no_index: bool = False) -> Milp
     # S3b: when the fixture ships a ``dep-decl/`` artifact dir, build a
     # ``FileDepDeclStore`` over it — the in-process mirror of the harness
     # injecting ``MILPA_DEP_DECL_DIR`` (S3a, conformance-fixtures.md §2.11).
-    # Without this the DepDecl edge-source branch is never reached and an
-    # attested-metadata fixture would silently resolve from .nimble/milpa.kdl.
-    # Mirror the CLI's _build_dep_decl_store (cli.py) exactly — an in-process
-    # adapter that produces a different normative output than its own CLI is a
-    # bug (rfc-conformance-parity §3 corollary). Priority:
-    #   no_index → None;
-    #   dep-decl/ dir present → FileDepDeclStore (MILPA_DEP_DECL_DIR analogue);
-    #   else index.kdl present → HttpDepDeclStore over the index base (the CLI's
-    #     MILPA_INDEX_URL→HttpDepDeclStore path); a missing dep-decl/<hash>.kdl
-    #     then raises TNG-DEPDECL-FETCH-FAILED, as the CLI does (fixture-144);
-    #   else None.
-    from milpa.dep_decl_store import FileDepDeclStore, make_dep_decl_store
+    # Delegates to ``dep_decl_store_from_paths`` — the SINGLE priority definition
+    # shared with the CLI (H1 unification: one function, two call sites).
+    from milpa.dep_decl_store import dep_decl_store_from_paths
 
     dep_decl_dir = fixture_dir / "dep-decl"
     index_path_for_decl = fixture_dir / "index.kdl"
-    if no_index:
-        dep_decl_store = None
-    elif dep_decl_dir.is_dir():
-        dep_decl_store = FileDepDeclStore(dep_decl_dir)
-    elif index_path_for_decl.exists():
-        dep_decl_store = make_dep_decl_store(f"file://{index_path_for_decl.resolve()}")
-    else:
-        dep_decl_store = None
+    # Derive the index URL for the dep-decl store: file:// when index.kdl exists,
+    # None when absent (dep_decl_store_from_paths → None in that branch).
+    index_url_for_decl = (
+        f"file://{index_path_for_decl.resolve()}"
+        if index_path_for_decl.exists()
+        else None
+    )
+    dep_decl_store = dep_decl_store_from_paths(
+        dep_decl_dir=dep_decl_dir if dep_decl_dir.is_dir() else None,
+        index_url=index_url_for_decl,
+        no_index=no_index,
+    )
 
     return MilpaEnv(
         fetcher=fetcher,
@@ -462,57 +443,9 @@ def _load_prior_lockfile(fixture_dir: Path) -> Lockfile | None:
 # ---------------------------------------------------------------------------
 # Certificate JSON comparison (cli-contract.md §2.5 / conformance-fixtures §2.7.3)
 # ---------------------------------------------------------------------------
-
-
-def _compare_certificate_json(
-    got: dict[str, Any],
-    expected: dict[str, Any],
-) -> str | None:
-    """Canonical JSON comparison for certificates per conformance-fixtures §2.7.3.
-
-    - Object comparison is key-order-independent (dicts already handle this).
-    - ``resolved`` and ``witness`` arrays are order-sensitive.
-    - ``message`` field is EXCLUDED from comparison.
-    - ``refutation`` is set-equality: sort both by (package, constraint).
-
-    Returns None on match, or a human-readable mismatch string.
-    """
-    if got.get("kind") != expected.get("kind"):
-        return f"kind mismatch: expected {expected.get('kind')!r}, got {got.get('kind')!r}"
-
-    if got["kind"] == "success":
-        # resolved: order-sensitive
-        if got.get("resolved") != expected.get("resolved"):
-            return (
-                f"resolved mismatch:\n"
-                f"  expected: {json.dumps(expected.get('resolved'), indent=2)}\n"
-                f"  got:      {json.dumps(got.get('resolved'), indent=2)}"
-            )
-        # witness: order-sensitive
-        if got.get("witness") != expected.get("witness"):
-            return (
-                f"witness mismatch:\n"
-                f"  expected: {json.dumps(expected.get('witness'), indent=2)}\n"
-                f"  got:      {json.dumps(got.get('witness'), indent=2)}"
-            )
-    elif got["kind"] == "failure":
-        # message: EXCLUDED from comparison
-        # refutation: set-equality (sort by (package, constraint))
-        def _sort_refutation(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            return sorted(entries, key=lambda e: (e.get("package", ""), e.get("constraint", "")))
-
-        got_ref = _sort_refutation(got.get("refutation", []))
-        exp_ref = _sort_refutation(expected.get("refutation", []))
-        if got_ref != exp_ref:
-            return (
-                f"refutation set mismatch:\n"
-                f"  expected (sorted): {json.dumps(exp_ref, indent=2)}\n"
-                f"  got (sorted):      {json.dumps(got_ref, indent=2)}"
-            )
-    else:
-        return f"unknown certificate kind: {got.get('kind')!r}"
-
-    return None
+# compare_certificate_json is imported from harness.assertions at the top of
+# this module (H2 unification).  The single definition lives there; using it
+# here prevents the in-process adapter and the black-box harness from drifting.
 
 
 # ---------------------------------------------------------------------------
@@ -741,7 +674,9 @@ def _execute_fixture(
         try:
             if isinstance(doc, WorkspaceManifest):
                 try:
-                    loaded_ws = load_workspace(fixture_dir)
+                    # M6: use project_root (from the project-dir control file),
+                    # not fixture_dir — mirrors the resolve path and the CLI.
+                    loaded_ws = load_workspace(project_root)
                 except MilpaError as e:
                     if fixture.expected_error is not None and e.slug == fixture.expected_error:
                         return ("pass", "")
@@ -925,7 +860,7 @@ def _execute_check_certificate(
                 assert isinstance(solver_err, SolverError)
                 cert_json_str = certificate_to_json(solver_err)
                 got_cert = json.loads(cert_json_str)
-                mismatch = _compare_certificate_json(got_cert, expected_cert)
+                mismatch = compare_certificate_json(got_cert, expected_cert)
                 if mismatch:
                     return ("fail", f"failure certificate mismatch: {mismatch}")
             return ("pass", "")
@@ -945,7 +880,7 @@ def _execute_check_certificate(
     got_cert_str = certificate_to_json(cert_obj)
     got_cert = json.loads(got_cert_str)
 
-    mismatch = _compare_certificate_json(got_cert, expected_cert)
+    mismatch = compare_certificate_json(got_cert, expected_cert)
     if mismatch:
         return ("fail", f"success certificate mismatch: {mismatch}")
 
@@ -987,6 +922,14 @@ def _execute_verify(
     from milpa.lockfile import parse_lockfile, verify_lockfile_against_deps
 
     fixture_dir = fixture.dir
+    # M6: compute project_root from the project-dir control file, mirroring
+    # the resolve path and the black-box harness (runner.py §2.8.1).
+    _pd_file = fixture_dir / "project-dir"
+    project_root = (
+        fixture_dir / _pd_file.read_text(encoding="utf-8").strip()
+        if _pd_file.is_file()
+        else fixture_dir
+    )
     deps_dir = tmp_dir / "_deps"
     deps_dir.mkdir(parents=True, exist_ok=True)
     lock_path = fixture_dir / "milpa.lock"
@@ -1015,7 +958,9 @@ def _execute_verify(
         return ("fail", f"verify: fixture milpa.lock unreadable: {e}")
 
     # Phase 1: regular (non-frozen) resolve to populate _deps/ and warm the CAS.
-    kdl_path = fixture_dir / "milpa.kdl"
+    # M6: read milpa.kdl from project_root (not fixture_dir), mirroring the
+    # resolve path and the black-box harness.
+    kdl_path = project_root / "milpa.kdl"
     try:
         kdl_text = kdl_path.read_text(encoding="utf-8")
     except OSError as e:
@@ -1028,7 +973,8 @@ def _execute_verify(
     try:
         if isinstance(doc, WorkspaceManifest):
             try:
-                loaded_ws = load_workspace(fixture_dir)
+                # M6: use project_root (from the project-dir control file).
+                loaded_ws = load_workspace(project_root)
             except MilpaError as e:
                 return ("fail", f"verify: workspace load failed: {e.slug!r}")
             resolve_workspace(loaded_ws, deps_dir, env, ResolveParams(manifest_dir=fixture_dir, profile=profile))
@@ -1059,7 +1005,8 @@ def _execute_verify(
     if isinstance(doc, WorkspaceManifest):
         # Workspace: OR across all members (same rule as resolve_workspace).
         try:
-            loaded_ws_for_policy = load_workspace(fixture_dir)
+            # M6: use project_root for all workspace loads in verify path.
+            loaded_ws_for_policy = load_workspace(project_root)
             _strict = flag_require_attested or any(
                 effective_strict_policy(m.manifest.attestation_policy, False)
                 for m in loaded_ws_for_policy.members
@@ -1075,7 +1022,8 @@ def _execute_verify(
     # defaults (no CLI feature overrides at verify time).
     if isinstance(doc, WorkspaceManifest):
         try:
-            loaded_ws_verify = load_workspace(fixture_dir)
+            # M6: use project_root for all workspace loads in verify path.
+            loaded_ws_verify = load_workspace(project_root)
             from milpa.cli import _check_workspace_frozen_active_flags_mismatch
             _check_workspace_frozen_active_flags_mismatch(
                 loaded_ws_verify,
@@ -1184,10 +1132,18 @@ def _diff_success(
     except Exception as e:
         return ("fail", f"from_graph/format_lockfile failed: {e}")
 
-    # Build-mode: redact the encoder-dependent tarball sha256 so the lockfile
-    # diff is stable across Python (zlib) and Rust (flate2/lzma-rs) encoders.
+    # Build-mode: normalize the encoder-dependent tarball sha256 using the
+    # harness's apply_lock_placeholders (M3 unification: opt-in only when
+    # the expected file contains the placeholder token — strictly safer than
+    # the old unconditional line-anchored redaction).  We read the expected
+    # milpa.lock to discover which tokens to substitute.
     if _is_build_mode_fixture(fixture.dir):
-        lock_text = _redact_tarball_sha256(lock_text)
+        expected_lock_path = fixture.dir / "expected" / "milpa.lock"
+        try:
+            expected_lock_text = expected_lock_path.read_text(encoding="utf-8")
+        except OSError:
+            expected_lock_text = ""
+        lock_text = apply_lock_placeholders(expected_lock_text, lock_text)
 
     # workspace vs single-package nim.cfg
     if isinstance(doc, WorkspaceManifest):
@@ -1231,9 +1187,12 @@ def _diff_success(
         if fail := _diff_file(expected_dir / "nim.cfg", nimcfg_text, "nim.cfg"):
             return fail
 
-    # _deps_structure.txt
+    # _deps_structure.txt — normalized via normalize_deps_structure from
+    # harness/assertions.py (M2 unification: single definition, both call sites
+    # import it; the harness expects scratch_dir/cas_dir, so we pass tmp_dir/.cas).
     cas_root = tmp_dir / ".cas"
-    got_structure = _read_deps_structure(deps_dir, cas_root)
+    raw_structure = normalize_deps_structure(str(tmp_dir), str(cas_root))
+    got_structure = raw_structure if raw_structure is not None else ""
     if fail := _diff_file(
         expected_dir / "_deps_structure.txt", got_structure, "_deps_structure.txt"
     ):
@@ -1259,40 +1218,10 @@ def _is_build_mode_fixture(fixture_dir: Path) -> bool:
     )
 
 
-import re as _re
-
-# Pattern matching the encoder-dependent sha256 line inside a tarball
-# provenance block.  We redact only the ``sha256 "…"`` lines that appear
-# inside a ``provenance { kind "tarball" … }`` block.  To keep the regex
-# simple and correct across fixtures, we match the bare sha256 line and
-# replace the value with the stable placeholder.
-#
-# Lockfile tarball provenance shape (lockfile-schema.md §5):
-#   provenance {
-#       origin "observed"
-#       kind "tarball"
-#       url "https://…"
-#       sha256 "<hex>"     ← this line is encoder-dependent in build-mode
-#   }
-_TARBALL_SHA256_LINE = _re.compile(
-    r'^(\s+sha256 )"[0-9a-f]{64}"$',
-    _re.MULTILINE,
-)
-
-
-def _redact_tarball_sha256(lock_text: str) -> str:
-    """Replace the encoder-dependent sha256 value inside tarball provenance
-    blocks with ``TARBALL_SHA256_PLACEHOLDER``.
-
-    Only called for build-mode fixtures (``_is_build_mode_fixture`` true).
-    The placeholder is the same string the fixture author uses in
-    ``expected/milpa.lock``; after redaction the byte-diff is stable across
-    Python (zlib) and Rust (flate2/lzma-rs) encoders.
-    """
-    return _TARBALL_SHA256_LINE.sub(
-        rf'\g<1>"{TARBALL_SHA256_PLACEHOLDER}"',
-        lock_text,
-    )
+# _TARBALL_SHA256_LINE and _redact_tarball_sha256 deleted (M3 unification):
+# the call site uses apply_lock_placeholders from harness/assertions.py,
+# which is opt-in (only when the placeholder token appears in expected) and
+# uses a non-anchored pattern that never matches the identity field.
 
 
 def _diff_file(
@@ -1315,49 +1244,8 @@ def _diff_file(
     return ("fail", f"{label} mismatch:\n--- expected ---\n{want}\n--- actual ---\n{got}")
 
 
-def _read_deps_structure(deps_dir: Path, cas_root: Path) -> str:
-    """Build the ``_deps_structure.txt`` body from the materialized ``_deps/``
-    (conformance-fixtures.md §2.6).
-
-    Each ``_deps/<name>`` symlink is resolved (``canonicalize``), then the
-    canonical CAS-root prefix is replaced with ``<CAS_ROOT>``.  Lines are
-    sorted by name; body ends with a trailing newline (empty string if no deps).
-    """
-    if not deps_dir.is_dir():
-        return ""
-
-    try:
-        cas_prefix = str(cas_root.resolve())
-    except OSError:
-        cas_prefix = str(cas_root)
-
-    entries: list[tuple[str, Path]] = []
-    try:
-        for entry in deps_dir.iterdir():
-            if entry.is_symlink():
-                entries.append((entry.name, entry))
-    except OSError:
-        return ""
-
-    entries.sort(key=lambda e: e[0])
-
-    lines: list[str] = []
-    for name, link in entries:
-        try:
-            resolved = link.resolve()
-            resolved_str = str(resolved)
-            if resolved_str.startswith(cas_prefix):
-                # CAS-backed dep (git/tarball/oci): normalize the CAS root prefix.
-                normalized = resolved_str.replace(cas_prefix, "<CAS_ROOT>")
-                lines.append(f"{name} -> {normalized}/\n")
-            else:
-                # Local dep: symlink points outside the CAS (live source tree).
-                # Emit a portable sentinel — the absolute target path is
-                # machine-specific and must NOT be recorded in the fixture.
-                lines.append(f"{name} -> (symlink)\n")
-        except OSError:
-            pass
-    return "".join(lines)
+# _read_deps_structure deleted (M2 unification): the call site above uses
+# normalize_deps_structure from harness/assertions.py directly.
 
 
 # ---------------------------------------------------------------------------

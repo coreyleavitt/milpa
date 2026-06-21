@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from harness.descriptors import ImplDescriptor
+from harness.inputs import env_flag, read_env_file
 
 
 # ---------------------------------------------------------------------------
@@ -84,21 +85,6 @@ def _read_project_dir_suffix(fixture_dir: Path) -> Optional[str]:
         return pd_file.read_text().strip() or None
     return None
 
-
-def _read_env_file(fixture_dir: Path) -> dict[str, str]:
-    """Parse the optional `env` file into a dict (KEY=VALUE lines, # comments ignored)."""
-    env_file = fixture_dir / "env"
-    if not env_file.exists():
-        return {}
-    result: dict[str, str] = {}
-    for raw_line in env_file.read_text().splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" in line:
-            key, _, value = line.partition("=")
-            result[key.strip()] = value.strip()
-    return result
 
 
 # Files / dirs that are harness control inputs, not fixture inputs to copy.
@@ -236,29 +222,29 @@ def _seed_cas_from_lock(scratch: Path, cas_dir: Path) -> None:
 def _feature_argv(fixture_env: dict[str, str]) -> list[str]:
     """Translate the MILPA_CLI_FEATURES family into verb-level CLI flags.
 
-    Mirrors the in-process adapter (test_conformance.py::_fixture_cli_features /
-    _fixture_no_default_features / _fixture_all_features) so the black-box runner
-    drives the CLI with the same declared feature inputs. The CLI reads these as
+    The black-box runner calls this to drive the CLI with the same declared
+    feature inputs that the in-process adapter reads.  The CLI reads these as
     ``--features`` / ``--no-default-features`` / ``--all-features`` on the
     fetch/lock/update subparser, NOT as environment variables — without this
     translation the env keys are set but silently ignored (Finding 3,
     docs/rfc-conformance-parity.baseline.md, RFC §4 Slice B).
+
+    Uses ``env_flag`` from ``harness.inputs`` (the single definition of
+    fixture env-flag semantics) for the two boolean flags.  ``MILPA_CLI_FEATURES``
+    is read as a raw comma-string and forwarded verbatim — the CLI's
+    ``--features`` expects ``a,b,c``, not a parsed set, so this path
+    deliberately does NOT use ``parse_cli_features`` (that is for the
+    in-process adapter, which needs a frozenset).
     """
     argv: list[str] = []
     feats = fixture_env.get("MILPA_CLI_FEATURES", "").strip()
     if feats:
         argv += ["--features", feats]
-    if _env_flag(fixture_env, "MILPA_NO_DEFAULT_FEATURES"):
+    if env_flag(fixture_env, "MILPA_NO_DEFAULT_FEATURES"):
         argv.append("--no-default-features")
-    if _env_flag(fixture_env, "MILPA_ALL_FEATURES"):
+    if env_flag(fixture_env, "MILPA_ALL_FEATURES"):
         argv.append("--all-features")
     return argv
-
-
-def _env_flag(fixture_env: dict[str, str], key: str) -> bool:
-    """A boolean env flag is true when present and not '0'/'false' (adapter parity)."""
-    v = fixture_env.get(key, "")
-    return bool(v and v not in ("0", "false"))
 
 
 def _cmd_to_cli(cmd: str) -> tuple[list[str], list[str]]:
@@ -394,7 +380,7 @@ def run_fixture(
 
     fixture_name = fixture_dir.name
     cmd = _read_cmd(fixture_dir)
-    fixture_env = _read_env_file(fixture_dir)
+    fixture_env = read_env_file(fixture_dir)
     project_dir_suffix = _read_project_dir_suffix(fixture_dir)
     global_flags, verb_argv = _cmd_to_cli(cmd)
 

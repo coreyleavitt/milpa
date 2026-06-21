@@ -18,9 +18,9 @@ import tempfile
 from pathlib import Path
 
 from harness.assertions import (
-    _apply_lock_placeholders,
-    _normalize_deps_structure,
+    apply_lock_placeholders,
     assert_conformance,
+    normalize_deps_structure,
 )
 from harness.descriptors import build_descriptors
 from harness.runner import run_fixture
@@ -36,21 +36,21 @@ _SHA = "e47338bef4b540c8ed1c0295ac19b2779e1d0838a2456c4f374f570ddb2232d0"
 def test_tarball_sha_placeholder_applied_when_expected_uses_it() -> None:
     expected = '    provenance {\n        sha256 "<TARBALL-SHA256>"\n    }\n'
     actual = f'    provenance {{\n        sha256 "{_SHA}"\n    }}\n'
-    assert _apply_lock_placeholders(expected, actual) == expected
+    assert apply_lock_placeholders(expected, actual) == expected
 
 
 def test_placeholder_not_applied_when_expected_pins_real_sha() -> None:
     expected = f'        sha256 "{_SHA}"\n'
     actual = f'        sha256 "{_SHA}"\n'
     # No placeholder token in expected → actual returned unchanged.
-    assert _apply_lock_placeholders(expected, actual) == actual
+    assert apply_lock_placeholders(expected, actual) == actual
 
 
 def test_identity_line_is_not_substituted() -> None:
     # The identity field (`identity "sha256:<hex>"`) must never be normalized.
     expected = 'sha256 "<TARBALL-SHA256>"'
     actual = f'identity "sha256:{_SHA}"\nsha256 "{_SHA}"'
-    out = _apply_lock_placeholders(expected, actual)
+    out = apply_lock_placeholders(expected, actual)
     assert f'identity "sha256:{_SHA}"' in out
     assert 'sha256 "<TARBALL-SHA256>"' in out
 
@@ -68,7 +68,7 @@ def test_deps_structure_local_symlink_renders_as_symlink_token() -> None:
         deps = root / "scratch" / "_deps"
         deps.mkdir(parents=True)
         os.symlink(worktree, deps / "mylib")
-        out = _normalize_deps_structure(str(root / "scratch"), str(cas))
+        out = normalize_deps_structure(str(root / "scratch"), str(cas))
         assert out == "mylib -> (symlink)\n"
 
 
@@ -81,7 +81,7 @@ def test_deps_structure_cas_symlink_still_renders_cas_root() -> None:
         deps = root / "scratch" / "_deps"
         deps.mkdir(parents=True)
         os.symlink(target, deps / "foo")
-        out = _normalize_deps_structure(str(root / "scratch"), str(cas))
+        out = normalize_deps_structure(str(root / "scratch"), str(cas))
         assert out == "foo -> <CAS_ROOT>/sha256/abc/\n"
 
 

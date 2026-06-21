@@ -420,3 +420,35 @@ def make_dep_decl_store(milpa_index_url: str | None = None) -> "HttpDepDeclStore
         index_url = DEFAULT_INDEX_URL
     base = index_base_url(index_url)
     return HttpDepDeclStore(base_url=base)
+
+
+def dep_decl_store_from_paths(
+    dep_decl_dir: "Path | None",
+    index_url: "str | None",
+    no_index: bool = False,
+) -> "FileDepDeclStore | HttpDepDeclStore | None":
+    """Select the DepDeclStore given resolved paths/URLs — the SINGLE priority
+    definition shared by the CLI and the in-process conformance adapter.
+
+    Priority (matches cli.py::_build_dep_decl_store and
+    test_conformance::_build_env, H1 unification):
+
+    0. ``no_index`` → ``None`` (no index ⇒ DepDecl path unreachable).
+    1. ``dep_decl_dir`` not None and is_dir → ``FileDepDeclStore(dep_decl_dir)``.
+    2. ``index_url`` non-empty → ``HttpDepDeclStore`` derived via ``index_base_url``.
+    3. ``index_url`` is ``None`` or empty → ``None`` (no index configured).
+
+    Callers are responsible for resolving their inputs to canonical form:
+    - CLI: reads MILPA_DEP_DECL_DIR / MILPA_INDEX_URL from env; passes absent
+      MILPA_INDEX_URL as ``DEFAULT_INDEX_URL`` (three-way semantics).
+    - Conformance adapter: checks fixture_dir/dep-decl/ and fixture_dir/index.kdl;
+      passes the file:// URL for the index or None when absent.
+    """
+    if no_index:
+        return None
+    if dep_decl_dir is not None and dep_decl_dir.is_dir():
+        return FileDepDeclStore(dep_decl_dir)
+    if index_url:
+        base = index_base_url(index_url)
+        return HttpDepDeclStore(base_url=base)
+    return None

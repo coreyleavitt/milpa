@@ -49,7 +49,7 @@ class ConformanceResult:
 # _deps_structure.txt normalization (spec §2.6)
 # ---------------------------------------------------------------------------
 
-def _normalize_deps_structure(scratch_dir: str, cas_dir: str) -> Optional[str]:
+def normalize_deps_structure(scratch_dir: str, cas_dir: str) -> Optional[str]:
     """Read _deps/ symlinks from scratch and produce the normalized text.
 
     Format per spec §2.6:
@@ -109,7 +109,7 @@ _LOCK_PLACEHOLDERS: list[tuple[str, "re.Pattern[str]"]] = [
 ]
 
 
-def _apply_lock_placeholders(expected: str, actual: str) -> str:
+def apply_lock_placeholders(expected: str, actual: str) -> str:
     """Normalize non-reproducible fields in ``actual`` to the placeholder tokens
     used by ``expected`` (only for tokens that ``expected`` actually contains)."""
     out = actual
@@ -134,7 +134,7 @@ def _canonical_certificate(cert: dict[str, Any]) -> dict[str, Any]:
 
     The SINGLE definition of "what content is significant in a certificate"
     (conformance-fixtures §2.7.3), shared by BOTH the fixture-vs-impl
-    assertion (`_compare_certificate_json`) and the cross-impl divergence
+    assertion (`compare_certificate_json`) and the cross-impl divergence
     token (`_assert_check_certificate_fixture`). Keeping these in lockstep is
     the whole point: a kind-only token (#130) was blind to body divergence.
 
@@ -158,7 +158,7 @@ def _canonical_certificate(cert: dict[str, Any]) -> dict[str, Any]:
     return {"kind": kind}
 
 
-def _compare_certificate_json(
+def compare_certificate_json(
     got: dict[str, Any],
     expected: dict[str, Any],
 ) -> Optional[str]:
@@ -291,7 +291,7 @@ def _assert_check_certificate_fixture(
             try:
                 got_cert = json.loads(cert_file.read_text(encoding="utf-8"))
                 expected_cert = json.loads(expected_cert_path.read_text(encoding="utf-8"))
-                mismatch = _compare_certificate_json(got_cert, expected_cert)
+                mismatch = compare_certificate_json(got_cert, expected_cert)
                 if mismatch:
                     failures.append(AssertionFailure(
                         fixture_name=run.fixture_name,
@@ -659,7 +659,7 @@ def _assert_success_fixture(
             # Slice C c1: normalize non-reproducible provenance fields (e.g. the
             # tarball archive sha) to the placeholder tokens expected uses, before
             # diffing AND before storing the cross-impl value.
-            actual = _apply_lock_placeholders(expected, actual_lock_path.read_text())
+            actual = apply_lock_placeholders(expected, actual_lock_path.read_text())
             if actual != expected:
                 failures.append(AssertionFailure(
                     fixture_name=run.fixture_name,
@@ -757,7 +757,7 @@ def _assert_success_fixture(
     # _deps_structure.txt — normalize CAS paths before comparing.
     expected_deps = expected_dir / "_deps_structure.txt"
     if expected_deps.exists():
-        normalized = _normalize_deps_structure(run.scratch_dir, run.cas_dir)
+        normalized = normalize_deps_structure(run.scratch_dir, run.cas_dir)
         if normalized is None:
             # _deps/ doesn't exist but fixture expects it.
             normalized = ""

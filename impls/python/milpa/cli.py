@@ -425,6 +425,10 @@ def _build_env(no_index: bool = False) -> MilpaEnv:
 def _build_dep_decl_store(no_index: bool = False) -> object | None:
     """Build the dep_decl_store from environment variables (S3b).
 
+    Resolves env vars to canonical paths/URLs, then delegates to the SINGLE
+    priority definition ``dep_decl_store_from_paths`` in dep_decl_store.py
+    (H1 unification — CLI and in-process conformance adapter share one path).
+
     Priority:
       0. ``--no-index`` → ``None`` (no index ⇒ DepDecl path unreachable).
       1. ``MILPA_DEP_DECL_DIR`` → ``FileDepDeclStore`` (conformance / air-gapped).
@@ -437,22 +441,27 @@ def _build_dep_decl_store(no_index: bool = False) -> object | None:
     absent → default, empty → no-index, non-empty → that URL. The ``--no-index``
     flag forces case 4 regardless of env.
     """
-    from milpa.dep_decl_store import FileDepDeclStore, make_dep_decl_store
+    from milpa.dep_decl_store import dep_decl_store_from_paths
     from milpa.index_cache import DEFAULT_INDEX_URL
 
-    if _no_index_requested(no_index):
-        # Explicitly no index → DepDecl branch unreachable.
-        return None
-
-    dep_decl_dir = os.environ.get("MILPA_DEP_DECL_DIR", "").strip()
-    if dep_decl_dir:
-        return FileDepDeclStore(Path(dep_decl_dir))
+    # Resolve env vars to canonical values before handing to the shared helper.
+    dep_decl_dir_str = os.environ.get("MILPA_DEP_DECL_DIR", "").strip()
+    dep_decl_dir = Path(dep_decl_dir_str) if dep_decl_dir_str else None
 
     raw = os.environ.get("MILPA_INDEX_URL")  # None if absent, str if set
+    # Three-way semantics: absent → DEFAULT_INDEX_URL; empty → None (no index);
+    # non-empty → that URL.
+    if raw is None:
+        index_url: str | None = DEFAULT_INDEX_URL
+    else:
+        stripped = raw.strip()
+        index_url = stripped if stripped else None  # empty → explicitly no index
 
-    # Absent → DEFAULT_INDEX_URL; non-empty → that URL.
-    index_url = raw.strip() if raw is not None else DEFAULT_INDEX_URL
-    return make_dep_decl_store(index_url)
+    return dep_decl_store_from_paths(
+        dep_decl_dir=dep_decl_dir,
+        index_url=index_url,
+        no_index=_no_index_requested(no_index),
+    )
 
 
 # ---------------------------------------------------------------------------

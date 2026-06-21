@@ -547,34 +547,10 @@ impl Target for MilpaTarget {
                 );
 
                 // S3b / Slice 2: mirror the CLI's maybe_dep_decl_store exactly —
-                // an in-process adapter that produces a different normative output
-                // than its own CLI is a bug (rfc-conformance-parity §3 corollary).
-                //   --no-index → None;
-                //   dep-decl/ dir present → FileDepDeclStore (MILPA_DEP_DECL_DIR analogue);
-                //   else index.kdl present → HttpDepDeclStore over the index base
-                //     (the CLI's MILPA_INDEX_URL→HttpDepDeclStore path); a missing
-                //     dep-decl/<hash>.kdl then raises TNG-DEPDECL-FETCH-FAILED
-                //     (fixture-144), matching the black-box CLI;
-                //   else None.
-                let dep_decl_dir = fx.dir.join("dep-decl");
-                let index_kdl = fx.dir.join("index.kdl");
-                let file_store;
-                let http_store;
+                // three-way logic lives in fixture_dep_decl_store (M5 SSOT).
+                let dep_decl_store_box = fixture_dep_decl_store(fx);
                 let dep_decl_store: Option<&dyn milpa_core::dep_decl_store::DepDeclStore> =
-                    if fx.no_index {
-                        None
-                    } else if dep_decl_dir.is_dir() {
-                        file_store = milpa_core::FileDepDeclStore::new(&dep_decl_dir);
-                        Some(&file_store)
-                    } else if index_kdl.is_file() {
-                        http_store = milpa_core::make_dep_decl_store(&format!(
-                            "file://{}",
-                            index_kdl.display()
-                        ));
-                        Some(&http_store)
-                    } else {
-                        None
-                    };
+                    dep_decl_store_box.as_deref();
 
                 // S5: read MILPA_REQUIRE_ATTESTED_METADATA from the fixture env.
                 let require_attested_metadata = fixture_require_attested_metadata(&fx.dir);
@@ -623,13 +599,16 @@ impl Target for MilpaTarget {
             // fetch/solve). Surfaces FROZEN-* disqualifications. Workspace-frozen
             // (per-member identity checks) is S11.
             Cmd::Frozen => {
-                let mtext = std::fs::read_to_string(fx.dir.join("milpa.kdl"))
+                // M6: use project_root (not fx.dir) for manifest/lock/workspace loads,
+                // matching the resolve path's §2.8.1 project-dir logic.
+                let project_root = fixture_project_root(fx);
+                let mtext = std::fs::read_to_string(project_root.join("milpa.kdl"))
                     .map_err(|e| format!("E2E-MANIFEST-UNREADABLE: {e}"))?;
                 let doc = match milpa_core::parse_document(&mtext) {
                     Ok(d) => d,
                     Err(e) => return Err(e.code().to_string()),
                 };
-                let ltext = std::fs::read_to_string(fx.dir.join("milpa.lock"))
+                let ltext = std::fs::read_to_string(project_root.join("milpa.lock"))
                     .map_err(|e| format!("E2E-LOCKFILE-UNREADABLE: {e}"))?;
                 let lock = match milpa_core::parse_lockfile(&ltext) {
                     Ok(l) => l,
@@ -645,7 +624,7 @@ impl Target for MilpaTarget {
                 // Workspace-frozen: members are verified by on-disk identity (no
                 // `_deps` symlink), externals come from the CAS.
                 if matches!(doc, ManifestDoc::Workspace(_)) {
-                    let loaded = match milpa_core::load_workspace(&fx.dir) {
+                    let loaded = match milpa_core::load_workspace(&project_root) {
                         Ok(w) => w,
                         Err(e) => return Err(e.code().to_string()),
                     };
@@ -728,7 +707,10 @@ impl Target for MilpaTarget {
             // dep_decl pins against the live index (§3.7.2).
             // This mirrors the harness black-box approach exactly.
             Cmd::Verify => {
-                let mtext = std::fs::read_to_string(fx.dir.join("milpa.kdl"))
+                // M6: use project_root (not fx.dir) for manifest/lock/workspace loads,
+                // matching the resolve path's §2.8.1 project-dir logic.
+                let project_root = fixture_project_root(fx);
+                let mtext = std::fs::read_to_string(project_root.join("milpa.kdl"))
                     .map_err(|e| format!("E2E-MANIFEST-UNREADABLE: {e}"))?;
                 let doc = match milpa_core::parse_document(&mtext) {
                     Ok(d) => d,
@@ -737,7 +719,7 @@ impl Target for MilpaTarget {
                 // Missing lock → LOCK-FILE-NOT-FOUND, mirroring cmd_verify's
                 // first check (before any _deps/ work). fixture-164 (#125)
                 // exercises the no-lock branch.
-                let lock_path = fx.dir.join("milpa.lock");
+                let lock_path = project_root.join("milpa.lock");
                 if !lock_path.is_file() {
                     return Err("LOCK-FILE-NOT-FOUND".to_string());
                 }
@@ -757,15 +739,12 @@ impl Target for MilpaTarget {
                     fx.dir.clone(),
                     scratch.root.clone(),
                 );
-                let dep_decl_dir = fx.dir.join("dep-decl");
-                let file_store;
+                // S3b / Slice 2: three-way dep_decl_store selection — now uses the
+                // same SSOT helper as the resolve path (M5), so fx.no_index and the
+                // index.kdl→Http branch are both honored here (parity gap closed).
+                let dep_decl_store_box = fixture_dep_decl_store(fx);
                 let dep_decl_store: Option<&dyn milpa_core::dep_decl_store::DepDeclStore> =
-                    if dep_decl_dir.is_dir() {
-                        file_store = milpa_core::FileDepDeclStore::new(&dep_decl_dir);
-                        Some(&file_store)
-                    } else {
-                        None
-                    };
+                    dep_decl_store_box.as_deref();
                 let verify_index = {
                     let p = fx.dir.join("index.kdl");
                     if p.is_file() {
@@ -783,7 +762,7 @@ impl Target for MilpaTarget {
 
                 let _pre_phase_result = match doc {
                     ManifestDoc::Workspace(_) => {
-                        let loaded = match milpa_core::load_workspace(&fx.dir) {
+                        let loaded = match milpa_core::load_workspace(&project_root) {
                             Ok(w) => w,
                             Err(e) => return Err(e.code().to_string()),
                         };
@@ -835,7 +814,7 @@ impl Target for MilpaTarget {
                 // S11b (Breadth-P2c): workspace frozen-flags mismatch check.
                 // Runs BEFORE disk check, matching cmd_verify's ordering.
                 if let ManifestDoc::Workspace(_) = doc {
-                    let loaded_verify = match milpa_core::load_workspace(&fx.dir) {
+                    let loaded_verify = match milpa_core::load_workspace(&project_root) {
                         Ok(w) => w,
                         Err(_) => {
                             // workspace load failed — fall through to disk check
@@ -886,7 +865,7 @@ impl Target for MilpaTarget {
                     }
                     ManifestDoc::Workspace(_) => {
                         // Workspace: OR across all members (+ flag).
-                        match milpa_core::load_workspace(&fx.dir) {
+                        match milpa_core::load_workspace(&project_root) {
                             Ok(ws) => milpa_core::workspace_any_member_strict(&ws) || flag_strict,
                             Err(_) => flag_strict,
                         }
@@ -1008,6 +987,38 @@ fn fixture_project_root(fx: &Fixture) -> PathBuf {
         Ok(s) if !s.trim().is_empty() => fx.dir.join(s.trim()),
         _ => fx.dir.clone(),
     }
+}
+
+/// S3b / Slice 2 — SSOT for dep_decl_store selection (M5).
+///
+/// Implements the three-way CLI-mirror logic exactly once, called from BOTH the
+/// resolve path and the verify pre-phase:
+///   --no-index (fx.no_index) → None;
+///   dep-decl/ dir present   → FileDepDeclStore (MILPA_DEP_DECL_DIR analogue);
+///   index.kdl present       → HttpDepDeclStore over the file:// base URL
+///                             (MILPA_INDEX_URL→HttpDepDeclStore path);
+///   else                    → None.
+///
+/// Returns a boxed store so the helper owns the value; callers unwrap with
+/// `.as_deref()` to get `Option<&dyn DepDeclStore>` for the resolve/resolve_with_features APIs.
+fn fixture_dep_decl_store(
+    fx: &Fixture,
+) -> Option<Box<dyn milpa_core::dep_decl_store::DepDeclStore>> {
+    if fx.no_index {
+        return None;
+    }
+    let dep_decl_dir = fx.dir.join("dep-decl");
+    if dep_decl_dir.is_dir() {
+        return Some(Box::new(milpa_core::FileDepDeclStore::new(&dep_decl_dir)));
+    }
+    let index_kdl = fx.dir.join("index.kdl");
+    if index_kdl.is_file() {
+        return Some(Box::new(milpa_core::make_dep_decl_store(&format!(
+            "file://{}",
+            index_kdl.display()
+        ))));
+    }
+    None
 }
 
 /// S9 (RFC #23 §3.4): read `MILPA_CLI_FEATURES` from the fixture's `env` file.
@@ -1230,5 +1241,95 @@ mod tests {
             MilpaTarget.execute(&fx, &scratch),
             Err("FROZEN-STRATEGY-MISMATCH".into())
         );
+    }
+
+    // M5 regression: fixture_dep_decl_store implements the full three-way logic
+    // (no_index → None; dep-decl/ → File; index.kdl → Http; else → None).
+    // Both the resolve path and the verify pre-phase call this helper, so the
+    // parity gap (verify was two-way only) cannot recur.
+    #[test]
+    fn fixture_dep_decl_store_three_way_logic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let make_fx = |dir: std::path::PathBuf, no_index: bool| Fixture {
+            id: "synthetic/probe".into(),
+            dir,
+            cmd: Cmd::Resolve,
+            no_index,
+            expected: Expected::Success,
+        };
+
+        // Arm 1: no_index=true → always None, even if dep-decl/ exists.
+        let dir1 = tmp.path().join("arm1");
+        std::fs::create_dir_all(dir1.join("dep-decl")).unwrap();
+        let fx1 = make_fx(dir1, true);
+        assert!(
+            fixture_dep_decl_store(&fx1).is_none(),
+            "no_index=true must return None regardless of dep-decl/"
+        );
+
+        // Arm 2: dep-decl/ dir present → FileDepDeclStore (Some).
+        let dir2 = tmp.path().join("arm2");
+        std::fs::create_dir_all(dir2.join("dep-decl")).unwrap();
+        let fx2 = make_fx(dir2, false);
+        assert!(
+            fixture_dep_decl_store(&fx2).is_some(),
+            "dep-decl/ dir present must return Some(FileDepDeclStore)"
+        );
+
+        // Arm 3: index.kdl present (no dep-decl/) → HttpDepDeclStore (Some).
+        let dir3 = tmp.path().join("arm3");
+        std::fs::create_dir_all(&dir3).unwrap();
+        // Write a minimal valid index.kdl so the file exists (content doesn't
+        // matter for the store-selection predicate; the store is only queried
+        // during resolve, not during construction).
+        std::fs::write(dir3.join("index.kdl"), "").unwrap();
+        let fx3 = make_fx(dir3, false);
+        assert!(
+            fixture_dep_decl_store(&fx3).is_some(),
+            "index.kdl present must return Some(HttpDepDeclStore)"
+        );
+
+        // Arm 4: nothing present → None.
+        let dir4 = tmp.path().join("arm4");
+        std::fs::create_dir_all(&dir4).unwrap();
+        let fx4 = make_fx(dir4, false);
+        assert!(
+            fixture_dep_decl_store(&fx4).is_none(),
+            "neither dep-decl/ nor index.kdl → None"
+        );
+    }
+
+    // M6 regression: Frozen and Verify use fixture_project_root, not fx.dir, for
+    // manifest/lock/workspace loads. A `project-dir` control file that points to a
+    // subdir must allow the fixture to find milpa.kdl + milpa.lock there.
+    #[test]
+    fn milpa_target_frozen_respects_project_dir_control_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = Scratch::new(tmp.path()).unwrap();
+        // The subdir that is the actual project root.
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("milpa.kdl"), "name \"probe\"\nkind \"library\"\n").unwrap();
+        std::fs::write(sub.join("milpa.lock"), "version 1\nstrategy \"maxver\"\n").unwrap();
+        // project-dir control file: contents = "sub"
+        std::fs::write(tmp.path().join("project-dir"), "sub").unwrap();
+        // Note: NO milpa.kdl at tmp.path() itself — if the runner used fx.dir it
+        // would surface E2E-MANIFEST-UNREADABLE, proving the fix.
+        let fx = Fixture {
+            id: "synthetic/probe-project-dir".into(),
+            dir: tmp.path().to_path_buf(),
+            cmd: Cmd::Frozen,
+            no_index: false,
+            expected: Expected::Success,
+        };
+        match MilpaTarget.execute(&fx, &scratch) {
+            Ok(Produced::Outputs(out)) => {
+                assert!(
+                    out.lock_text.contains("strategy \"maxver\""),
+                    "Frozen with project-dir must load manifest from the subdir"
+                );
+            }
+            other => panic!("expected Outputs, got {other:?}"),
+        }
     }
 }
