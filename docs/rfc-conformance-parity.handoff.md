@@ -3,11 +3,11 @@
 - **Stage:** 3 (tdd / implement slices)   •   **Round:** —
 - **Resume:** `/loop implement the next unimplemented RFC slice from docs/rfc-conformance-parity.md with /tdd …` (PAUSED on a scope escalation — see Open forks)
 
-Corpus state after Slice E: `python PASS=274 FAIL=1 (3 cert SKIP)`,
-`rust PASS=267 FAIL=11`, 10 divergences (`/tmp/harness_after_E.txt`).
-Python real failures (1): **205 only** (+ 3 parked cert: 127/128/150 = Python
---certificate not implemented). All 10 divergences are now RUST-side:
-099 (Slice 1), 252 (Slice D), 209/210/211/212/216/228/230/244 (Slice F).
+Corpus state after Slice F: `python PASS=274 FAIL=1 (3 cert SKIP)`,
+`rust PASS=277 FAIL=1`, **CROSS-IMPL DIVERGENCES = NONE**
+(`/tmp/harness_after_F.txt`). Both impls now fail ONLY fixture-205 (local
+override, symmetric — not a divergence). Remaining non-205: 3 parked cert
+fixtures (127/128/150 = Python --certificate not implemented; rust passes them).
 
 ## Slices
 - [x] Slice 0 — baseline protocol (`f0fc3e7`).
@@ -27,16 +27,20 @@ Python real failures (1): **205 only** (+ 3 parked cert: 127/128/150 = Python
       Likely fix: MockedLocalFetcher falls back to reading the real path when
       `Path(p.path).is_dir()` and no mock entry exists. Verify the in-process path
       first to converge both. Needs care (don't rush). *(Python/impl.)*
-- [ ] Slice 1 — fixture-099 rust (root-caused in RFC §4 — remove `seen_dep_names`
-      guard for `RequireEntry::Url` in `edgeset_to_extracted`, resolver.rs ~L2717;
-      patch the latent copy in `edgeset_to_terms` edge_sources.rs ~L440). *(Rust; container.)*
-- [ ] Slice D — fixture-252 rust frozen-slug: run active-flags check before
-      in-store check on frozen ws path. *(Rust; container.)*
-- [ ] Slice F — Rust CLI honors `--features` family (209/210/211/212/216/228/230/244;
-      py✓ rust✗). Rust CLI must apply --features/--no-default-features/--all-features
-      to resolution like Python does. *(Rust; container.)*
-- [ ] Slice 2 — fixture-144 in-process adapters (rust + python).
-- [ ] Slice 3 — `project-dir` control file (#167).
+- [x] Slice 1 — fixture-099 rust RES-PROVENANCE-CONFLICT (`f766d78`); closes #154.
+- [x] Slice D — fixture-252 + 212 frozen active-flags-check ordering (`e59e6a1`).
+- [x] Slice F — single-package fetch honors --features (`d238a5d`); greened
+      209/210/211/216/228/230/244. **Divergences → NONE.**
+- [ ] **Slice C "205"** — local-override transitive (py✗ rust✗, both-fail). The
+      LAST black-box failure. MockedLocalFetcher requires a mocked-fetches entry;
+      fixture supplies the override target as a real dir (mylib-fork/). Passes
+      in-process. Likely fix: MockedLocalFetcher (both impls) falls back to reading
+      the real path when it exists. Verify the in-process path first. *(Python+Rust impl.)*
+- [ ] Slice 2 — fixture-144 in-process adapters (rust + python). (Black-box already
+      passes it; this fixes the two in-process adapters per RFC §4 Slice 2.)
+- [ ] Slice 3 — `project-dir` control file (#167) — spec it + teach both in-process adapters.
+- [ ] cert fixtures 127/128/150 — Python `--certificate` not implemented (parked in
+      descriptors.py python_known_failing). Separate Python feature; decide if in-scope.
 - [ ] Phase 2: S4a/S4/S5/S6/S7 (gated on differential-harness RFC).
 
 NOTE: fixture-114's KNOWN_LIMITATIONS reason ("stdlib harness cannot compute the
