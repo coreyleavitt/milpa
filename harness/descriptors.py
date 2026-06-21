@@ -64,13 +64,12 @@ def build_descriptors(repo_root: str | Path) -> list[ImplDescriptor]:
 
     # known_failing: real, reported Python CLI gaps not yet fixed.
     #
-    # --certificate fixtures (127/128/150): Python does not implement
-    # --certificate (CLI binary only; not yet wired in the Python impl).
-    python_known_failing: set[str] = {
-        "fixture-127-check-certificate-success",
-        "fixture-128-check-certificate-conflict",
-        "fixture-150-check-certificate-strict-attestation-fail",
-    }
+    # (127/128 previously listed here were stale — Python passes them.)
+    # fixture-150 (check-certificate-strict-attestation-fail): FIXED — Python
+    # cert-write intercept now writes kind:failure with empty refutation for
+    # non-solver MilpaError failures (e.g. RES-UNATTESTED-METADATA), matching
+    # Rust's FailureCert { message: "", refutation: [] } shape.
+    python_known_failing: set[str] = set()
 
     python_desc = ImplDescriptor(
         name="python",

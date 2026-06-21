@@ -559,9 +559,13 @@ def _write_certificate(
 ) -> None:
     """Atomically write the solve result certificate to *cert_path*.
 
-    ``result`` must be a ``SolveSuccess`` (success) or ``SolverError``
-    (failure) from ``milpa.solver``.  Uses ``certificate_to_json`` as the
-    SSOT serialiser.  No-op when ``cert_path`` is None.
+    ``result`` must be a ``SolveSuccess`` (success), ``SolverError``
+    (solver failure), or ``None`` (non-solver MilpaError failure such as
+    RES-UNATTESTED-METADATA — emits kind:failure with empty refutation, matching
+    Rust's FailureCert { message: "", refutation: [] } shape).
+
+    Uses ``certificate_to_json`` as the SSOT serialiser.  No-op when
+    ``cert_path`` is None.
 
     Atomic discipline: write to a sibling tmp, then os.replace.  If the
     serialisation or write fails, the file at cert_path is left absent or
@@ -569,10 +573,10 @@ def _write_certificate(
     """
     if cert_path is None:
         return
-    assert isinstance(result, (SolveSuccess, SolverError)), (
-        f"_write_certificate: expected SolveSuccess or SolverError, got {type(result)!r}"
+    assert result is None or isinstance(result, (SolveSuccess, SolverError)), (
+        f"_write_certificate: expected SolveSuccess, SolverError, or None, got {type(result)!r}"
     )
-    cert_json = certificate_to_json(result)
+    cert_json = certificate_to_json(result)  # type: ignore[arg-type]
     _atomic_write(cert_path, cert_json)
 
 
@@ -903,14 +907,19 @@ def cmd_fetch(
         all_features=all_features,
     )
 
-    # Resolve — intercept SOLVE_CONFLICT to write the failure certificate.
+    # Resolve — intercept any MilpaError to write a failure certificate when
+    # --certificate is set (cli-contract §2.5.2).  SOLVE-CONFLICT carries a
+    # populated SolverError; all other MilpaError failures get an empty cert
+    # (kind:failure, message:null, refutation:[]) matching Rust's behaviour.
     try:
         graph = resolve(manifest, deps_dir, env_with_index, params)
     except MilpaError as exc:
-        if exc.slug == "SOLVE-CONFLICT" and certificate_path is not None:
-            solver_err = exc.context.get("solver_error")
-            if solver_err is not None:
+        if certificate_path is not None:
+            if exc.slug == "SOLVE-CONFLICT":
+                solver_err = exc.context.get("solver_error")
                 _write_certificate(certificate_path, solver_err)
+            else:
+                _write_certificate(certificate_path, None)
         raise
 
     # Success: write the certificate (built by the resolver, attached to graph).
@@ -1029,14 +1038,17 @@ def _cmd_fetch_workspace(
         all_features=all_features,
     )
 
-    # Resolve — intercept SOLVE_CONFLICT to write the failure certificate.
+    # Resolve — intercept any MilpaError to write a failure certificate when
+    # --certificate is set (cli-contract §2.5.2).  Mirrors the single-package path.
     try:
         graph = resolve_workspace(workspace, deps_dir, env_with_index, params)
     except MilpaError as exc:
-        if exc.slug == "SOLVE-CONFLICT" and certificate_path is not None:
-            solver_err = exc.context.get("solver_error")
-            if solver_err is not None:
+        if certificate_path is not None:
+            if exc.slug == "SOLVE-CONFLICT":
+                solver_err = exc.context.get("solver_error")
                 _write_certificate(certificate_path, solver_err)
+            else:
+                _write_certificate(certificate_path, None)
         raise
 
     # Success: write the certificate (built by the resolver, attached to graph).
@@ -1116,14 +1128,17 @@ def cmd_lock(
         all_features=all_features,
     )
 
-    # Resolve — intercept SOLVE_CONFLICT to write the failure certificate.
+    # Resolve — intercept any MilpaError to write a failure certificate when
+    # --certificate is set (cli-contract §2.5.2).  Mirrors the fetch path.
     try:
         graph = resolve(manifest, deps_dir, env_with_index, params)
     except MilpaError as exc:
-        if exc.slug == "SOLVE-CONFLICT" and certificate_path is not None:
-            solver_err = exc.context.get("solver_error")
-            if solver_err is not None:
+        if certificate_path is not None:
+            if exc.slug == "SOLVE-CONFLICT":
+                solver_err = exc.context.get("solver_error")
                 _write_certificate(certificate_path, solver_err)
+            else:
+                _write_certificate(certificate_path, None)
         raise
 
     # Success: write the certificate (built by the resolver, attached to graph).
@@ -1170,14 +1185,17 @@ def _cmd_lock_workspace(
         all_features=all_features,
     )
 
-    # Resolve — intercept SOLVE_CONFLICT to write the failure certificate.
+    # Resolve — intercept any MilpaError to write a failure certificate when
+    # --certificate is set (cli-contract §2.5.2).  Mirrors the fetch path.
     try:
         graph = resolve_workspace(workspace, deps_dir, env_with_index, params)
     except MilpaError as exc:
-        if exc.slug == "SOLVE-CONFLICT" and certificate_path is not None:
-            solver_err = exc.context.get("solver_error")
-            if solver_err is not None:
+        if certificate_path is not None:
+            if exc.slug == "SOLVE-CONFLICT":
+                solver_err = exc.context.get("solver_error")
                 _write_certificate(certificate_path, solver_err)
+            else:
+                _write_certificate(certificate_path, None)
         raise
 
     # Success: write the certificate (built by the resolver, attached to graph).

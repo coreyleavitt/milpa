@@ -1042,7 +1042,7 @@ def _v(v: Version | tuple[int, int, int]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def certificate_to_json(result: SolveSuccess | SolverError) -> str:
+def certificate_to_json(result: SolveSuccess | SolverError | None) -> str:
     """Serialise a solve result to the §5 certificate JSON schema.
 
     Success schema::
@@ -1058,15 +1058,32 @@ def certificate_to_json(result: SolveSuccess | SolverError) -> str:
 
         {
           "kind": "failure",
-          "message": str,          # human-readable prose (NOT byte-normative)
+          "message": str | null,   # human-readable prose (NOT byte-normative);
+                                   # null for non-solver failures (e.g. RES-UNATTESTED-METADATA)
           "refutation": [{"package": str, "constraint": str}, ...]
         }
 
+    ``result=None`` is the sentinel for a non-solver MilpaError failure
+    (e.g. RES-UNATTESTED-METADATA).  Rust emits ``FailureCert { message: "",
+    refutation: [] }`` for these cases, which serialises as
+    ``{"kind": "failure", "message": null, "refutation": []}``.  Pass None
+    when the error is not a SOLVE-CONFLICT and no solver-level refutation is
+    available.
+
     This function is the single serialisation point used by both the
-    in-process conformance adapter (S10b) and the future ``--certificate``
-    CLI flag (S10b / cli-contract.md §8).  Do not duplicate serialisation
-    logic elsewhere.
+    in-process conformance adapter (S10b) and the ``--certificate`` CLI flag
+    (cli-contract.md §2.5).  Do not duplicate serialisation logic elsewhere.
     """
+    if result is None:
+        # Non-solver failure: kind:failure, message:null, empty refutation.
+        # Matches Rust resolve_with_cert's FailureCert { message: "", refutation: [] }
+        # which serialises message as null when the string is empty.
+        doc: dict[str, object] = {
+            "kind": "failure",
+            "message": None,
+            "refutation": [],
+        }
+        return json.dumps(doc, indent=2)
     if isinstance(result, SolveSuccess):
         doc: dict[str, object] = {
             "kind": "success",

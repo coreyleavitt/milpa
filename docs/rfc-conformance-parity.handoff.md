@@ -1,7 +1,26 @@
 # rfc-conformance-parity — handoff
 
-- **Stage:** 3 (tdd) COMPLETE for all implementable slices → ready for stage 4 (/code-review)
-- **Resume:** `/code-review docs/rfc-conformance-parity.md` (Phase 1 done; remaining = forks below + gated Phase 2)
+- **Stage:** 4 (/code-review) COMPLETE — 3 rounds to floor + Low pass committed; forks resolved.
+- **Resume:** stage 4 done. Remaining = Phase 2 (gated on differential-harness RFC) + the deferred D4 Low. If the in-flight fixture-150 fix agent landed, commit it.
+
+## Stage-4 OUTCOME (2026-06-21)
+Code review: 5 lenses + adversarial verify, 3 fix rounds to floor, Low pass. Commits:
+`ea136d0` (SSOT seam: H1/H2/M1-M6 unified), `1fcca68` (Lows: project-dir confine,
+lock-regex tighten, dead-code). Both "active divergence" candidates REFUTED. All gates
+green. D4 (harness→pyproject path-dep) deferred — premature vs unstable harness.
+
+**Forks resolved:**
+- Fork 1 (cert 127/128/150): handoff's "Python --certificate unimplemented" was STALE.
+  Python has the full cert stack. 127/128 PASS today (stale skip — REMOVED from
+  known_failing, verified). 150 = small real parity bug (Python doesn't write a
+  kind:failure cert for non-solver RES-UNATTESTED-METADATA; Rust does). DECISION: fix now.
+  **Fix agent IN FLIGHT** (a91a115c...): implements non-solver-failure cert write in
+  cli.py, un-skips 150, target python PASS=279/0 known_failing empty. NOT yet committed.
+- Fork 2 (c4 partial-profile 255/256): genuine spec fork. CLI host-defaults absent axes
+  by deliberate §8/§3.C design. DECISION: routed to #110 (universal-resolution RFC) —
+  comment posted (issue #110 comment 4763087221) capturing the absent-axis CLI surface +
+  the conservative empty-string=None three-way option. 255/256 stay in-process-deferred
+  until #110 decides. No code pending.
 
 ## PHASE 1 COMPLETE (2026-06-21)
 

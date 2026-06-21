@@ -798,6 +798,16 @@ class TestCertificateJson:
             assert "package" in r
             assert "constraint" in r
 
+    def test_none_yields_empty_failure_cert(self) -> None:
+        """certificate_to_json(None) emits a kind:failure cert with message:null
+        and an empty refutation array — the shape Rust emits for non-solver
+        MilpaError failures (e.g. RES-UNATTESTED-METADATA) when --certificate
+        is set (cli-contract §2.5.2)."""
+        doc = json.loads(certificate_to_json(None))
+        assert doc["kind"] == "failure"
+        assert doc["message"] is None
+        assert doc["refutation"] == []
+
 
 # ---------------------------------------------------------------------------
 # Integration: solve + certificate roundtrip

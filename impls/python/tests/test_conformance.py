@@ -849,10 +849,14 @@ def _execute_check_certificate(
                     return ("fail", "SOLVE_CONFLICT MilpaError missing solver_error in context")
                 assert isinstance(solver_err, SolverError)
                 cert_json_str = certificate_to_json(solver_err)
-                got_cert = json.loads(cert_json_str)
-                mismatch = compare_certificate_json(got_cert, expected_cert)
-                if mismatch:
-                    return ("fail", f"failure certificate mismatch: {mismatch}")
+            else:
+                # Non-solver MilpaError (e.g. RES-UNATTESTED-METADATA): emit the
+                # empty failure cert that Rust emits for these cases (cli-contract §2.5.2).
+                cert_json_str = certificate_to_json(None)
+            got_cert = json.loads(cert_json_str)
+            mismatch = compare_certificate_json(got_cert, expected_cert)
+            if mismatch:
+                return ("fail", f"failure certificate mismatch: {mismatch}")
             return ("pass", "")
         elif fixture.expected_error is not None:
             return ("fail", f"expected error {fixture.expected_error!r}, got {e.slug!r}")
