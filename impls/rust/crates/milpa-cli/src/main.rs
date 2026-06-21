@@ -391,9 +391,22 @@ fn cmd_verify(dir: &Path, require_attested_metadata: bool, no_index: bool) -> Re
 }
 
 /// `milpa clean` — remove `_deps/` + `nim.cfg`, keep `milpa.lock`.
+///
+/// In workspace mode (cli-contract §5.5): remove `<ws_root>/_deps/` and each
+/// member's `nim.cfg`.  The root-level `nim.cfg` is never present in workspace
+/// mode (workspaces use per-member nim.cfg), so we skip it.
 fn cmd_clean(dir: &Path) -> Result<i32, MilpaError> {
-    let _ = std::fs::remove_dir_all(dir.join("_deps"));
-    let _ = std::fs::remove_file(dir.join("nim.cfg"));
+    if let Ok(ws) = load_workspace(dir) {
+        // Workspace mode: remove root _deps/ + per-member nim.cfg.
+        let _ = std::fs::remove_dir_all(ws.root.join("_deps"));
+        for member in &ws.members {
+            let _ = std::fs::remove_file(member.directory.join("nim.cfg"));
+        }
+    } else {
+        // Single-package mode.
+        let _ = std::fs::remove_dir_all(dir.join("_deps"));
+        let _ = std::fs::remove_file(dir.join("nim.cfg"));
+    }
     Ok(0)
 }
 

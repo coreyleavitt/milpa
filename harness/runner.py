@@ -239,6 +239,8 @@ def _dispatch_cmd(tokens: list[str], cmd: str) -> tuple[list[str], list[str]]:
     if head == "update":
         # update | update <name>
         return [], ["update", *tokens[1:]]
+    if head == "clean":
+        return [], ["clean"]
     if head == "verify":
         return [], ["verify"]
     if head == "workspace":

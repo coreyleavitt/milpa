@@ -200,6 +200,8 @@ def assert_conformance(
         _assert_error_fixture(run, fixture_dir, expected_dir, cmd, failures, normalized_outputs)
     elif _is_liveness_cmd(cmd):
         _assert_liveness_fixture(run, failures, normalized_outputs)
+    elif cmd.split()[0] == "clean":
+        _assert_clean_fixture(run, fixture_dir, failures, normalized_outputs)
     else:
         _assert_success_fixture(run, expected_dir, cmd, failures, normalized_outputs)
 
@@ -458,6 +460,91 @@ def _assert_liveness_fixture(
     # Liveness passed; record a stable marker (NOT the stdout bytes, which are
     # non-frozen and would create spurious cross-impl divergences).
     normalized_outputs["<liveness>"] = "exit0+nonempty-stdout"
+
+
+# ---------------------------------------------------------------------------
+# Clean fixture assertions (S11c, cli-contract §5.5 workspace mode)
+# ---------------------------------------------------------------------------
+
+def _assert_clean_fixture(
+    run: RunResult,
+    fixture_dir: Path,
+    failures: list[AssertionFailure],
+    normalized_outputs: dict[str, str],
+) -> None:
+    """Assert a clean fixture: exit 0, no slug, _deps/ absent, no per-member nim.cfg.
+
+    The fixture may pre-seed ``<member>/nim.cfg`` files as inputs (they must be
+    absent after clean).  For workspaces the root-level ``nim.cfg`` is never
+    present (workspaces use per-member nim.cfg), so only member subdirectories
+    are checked.  For single-package projects the root ``nim.cfg`` is checked.
+    """
+    if run.returncode != 0:
+        failures.append(AssertionFailure(
+            fixture_name=run.fixture_name,
+            impl_name=run.impl_name,
+            kind="success-fixture",
+            detail=(
+                f"clean fixture: expected exit 0, got {run.returncode}; "
+                f"stderr: {run.stderr!r}"
+            ),
+        ))
+        return
+
+    if run.slug is not None:
+        failures.append(AssertionFailure(
+            fixture_name=run.fixture_name,
+            impl_name=run.impl_name,
+            kind="success-fixture",
+            detail=f"clean fixture: exit 0 but milpa-error: line found: {run.slug!r}",
+        ))
+        return
+
+    scratch = Path(run.scratch_dir)
+
+    # _deps/ must be absent.
+    deps_dir = scratch / "_deps"
+    if deps_dir.exists():
+        failures.append(AssertionFailure(
+            fixture_name=run.fixture_name,
+            impl_name=run.impl_name,
+            kind="success-fixture",
+            detail="clean left '_deps/' in scratch (expected it removed)",
+        ))
+
+    # Root nim.cfg must be absent (single-package case).
+    root_nimcfg = scratch / "nim.cfg"
+    if root_nimcfg.exists():
+        failures.append(AssertionFailure(
+            fixture_name=run.fixture_name,
+            impl_name=run.impl_name,
+            kind="success-fixture",
+            detail="clean left 'nim.cfg' at project root (expected it removed)",
+        ))
+
+    # Per-member nim.cfg must be absent (workspace case).
+    # Walk fixture_dir for subdirectories with milpa.kdl (member dirs).
+    for subdir in sorted(fixture_dir.iterdir()):
+        if not subdir.is_dir():
+            continue
+        if subdir.name in ("expected", "mocked-fetches", "cas-seed"):
+            continue
+        if not (subdir / "milpa.kdl").exists():
+            continue
+        member_nimcfg = scratch / subdir.name / "nim.cfg"
+        if member_nimcfg.exists():
+            failures.append(AssertionFailure(
+                fixture_name=run.fixture_name,
+                impl_name=run.impl_name,
+                kind="success-fixture",
+                detail=(
+                    f"clean left '{subdir.name}/nim.cfg' in scratch "
+                    f"(expected it removed for workspace member)"
+                ),
+            ))
+
+    if not failures:
+        normalized_outputs["<clean>"] = "exit0+no-artifacts"
 
 
 # ---------------------------------------------------------------------------
