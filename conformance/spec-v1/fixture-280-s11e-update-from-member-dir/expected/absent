@@ -1,0 +1,2 @@
+# S11e correctness assertion: no member-local lock must be written.
+member-a/milpa.lock

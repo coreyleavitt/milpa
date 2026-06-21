@@ -697,6 +697,14 @@ milpa add <dep> --mirror <url>
 > `milpa workspace add-member`"*. It MUST NOT attempt to parse the
 > manifest as a package manifest.
 
+> NORMATIVE (S11e): `add` invoked from a **workspace member directory**
+> (a directory that is a declared member of a parent workspace) MUST
+> detect the parent workspace, mutate the **member's** `milpa.kdl` to
+> add the new dep, then re-resolve the **entire workspace** (all
+> members), writing the shared `<ws_root>/milpa.lock` and shared
+> `<ws_root>/_deps/`. A member-local `milpa.lock` MUST NOT be written.
+> The success message is the same as for single-package `add`.
+
 **Exit codes:** 0 success, 1 failure.
 
 **stdout:** none.
@@ -741,6 +749,14 @@ milpa remove <dep>
 > *"to remove a dep, `cd` to a member; to remove a member, use
 > `milpa workspace remove-member`"*. It MUST NOT attempt to parse the
 > manifest as a package manifest.
+
+> NORMATIVE (S11e): `remove` invoked from a **workspace member directory**
+> MUST detect the parent workspace, resolve any alias against the
+> **shared** `<ws_root>/milpa.lock`, mutate the **member's** `milpa.kdl`
+> to remove the dep, then re-resolve the **entire workspace**, writing
+> the shared `<ws_root>/milpa.lock` and shared `<ws_root>/_deps/`. A
+> member-local `milpa.lock` MUST NOT be written. The success message is
+> the same as for single-package `remove`.
 
 **Exit codes:** 0 success, 1 failure.
 
@@ -798,6 +814,12 @@ milpa update [<dep>]
 > refresh the shared `<ws_root>/milpa.lock`. The behavior mirrors the
 > single-package path; no verb emits a confusing internal error at a
 > workspace root.
+
+> NORMATIVE (S11e): `update` invoked from a **workspace member directory**
+> MUST detect the parent workspace and delegate entirely to the workspace
+> re-resolve path (identical behavior to S11b above). The shared
+> `<ws_root>/milpa.lock` is written; a member-local `milpa.lock` MUST NOT
+> be written.
 
 **Exit codes:** 0 success, 1 failure.
 

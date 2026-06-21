@@ -97,8 +97,15 @@ asymmetries broken today (round 2 added the eighth: member-dir add/remove/update
   `clean` → Cmd::CliOnly in fixture.rs; `_assert_clean_fixture` in harness/assertions.py;
   fixture-277 (two-member workspace, pre-seeded nim.cfg); Python 2103 pass; Rust corpus zero
   divergence; harness PASS both impls — `a9ab0d1`
-- [ ] S11d, S11e, S12 (remaining)
-- **Progress: 16/19 done, 3 remaining.** All gates green each slice (Python 2103 pass; Rust
+- [x] **S11e** member-dir `add`/`remove`/`update` → detect-and-delegate (D5; dep S9b+S11b);
+  `load_workspace_with_member_override` (Python workspace.py) + `ws_with_member_override` /
+  `find_parent_workspace` (Rust main.rs); `_cmd_add_from_member_dir` + `_cmd_remove_from_member_dir`
+  (Python cli.py); Rust `cmd_add`/`cmd_remove`/`cmd_update` S11e branches; harness `project-dir`
+  control file + `expected/absent` assertion; spec §5.6/§5.7/§5.8 S11e NORMATIVE notes;
+  fixtures 278–280 (add/remove/update from member dir, harness PASS both impls, member-local
+  lock absent); Python 2103 pass; Rust corpus zero divergence — `feat(cli): add/remove/update from a member dir detect-and-delegate to the workspace (the eighth asymmetry)`
+- [ ] S11d, S12 (remaining)
+- **Progress: 17/19 done, 2 remaining.** All gates green each slice (Python 2103 pass; Rust
   corpus zero divergence).
 
 ## Forks — ALL RESOLVED (no open decisions)

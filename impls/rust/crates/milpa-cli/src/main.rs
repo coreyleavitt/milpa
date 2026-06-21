@@ -931,6 +931,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
         let ws = load_workspace(dir)?;
         let index = maybe_index(no_index)?;
         let profile = profile_from_env();
+        let ws_deps_dir = dir.join("_deps");
         let graph = resolve_workspace_with_features(
             &ws,
             index.as_ref(),
@@ -938,7 +939,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
             profile.as_ref(),
             prior.as_ref(),
             strategy,
-            &deps_dir,
+            &ws_deps_dir,
             false, // cmd_update does not accept --require-attested-metadata (fetch/lock only)
             &build_store(),
             &std::collections::BTreeSet::new(),
@@ -946,6 +947,71 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
             false,
         )?;
         write_lockfile(&from_graph(&graph, strategy.as_str()), &lock_path)?;
+        eprintln!(
+            "updated {} across {} members",
+            name.as_deref().unwrap_or("all deps"),
+            ws.members.len()
+        );
+        return Ok(0);
+    }
+
+    // S11e: member-dir detect-and-delegate for `update`.
+    // If dir is a member of a parent workspace, delegate the full workspace re-resolve
+    // to the workspace root (shared milpa.lock + shared _deps/), NOT a member-local lock.
+    if let Some((ws_root, ws)) = find_parent_workspace(dir) {
+        let ws_lock_path = ws_root.join("milpa.lock");
+        let ws_deps_dir = ws_root.join("_deps");
+        let index = maybe_index(no_index)?;
+        let profile = profile_from_env();
+        // Re-build prior against the SHARED lockfile, not a member-local one.
+        let ws_prior: Option<milpa_core::Lockfile> = match &name {
+            None => None,
+            Some(_) => {
+                if !ws_lock_path.exists() {
+                    eprintln!("update: no milpa.lock at {} — run `milpa fetch` first", ws_lock_path.display());
+                    eprintln!("milpa-error: LOCK-FILE-NOT-FOUND");
+                    return Ok(1);
+                }
+                let full = load_lockfile(&ws_lock_path)?;
+                let canonical = canonical_name_for(name.as_ref().unwrap(), &full);
+                if !full.deps.iter().any(|d| d.name == canonical) {
+                    eprintln!("update: no dep {:?} in lockfile", name.as_ref().unwrap());
+                    eprintln!("milpa-error: LOCK-DEP-NOT-FOUND");
+                    return Ok(1);
+                }
+                let updated = full.deps.iter().find(|d| d.name == canonical).unwrap().clone();
+                let declared_provs: Vec<milpa_core::ProvenanceRecord> = updated
+                    .provenances
+                    .iter()
+                    .filter(|p| matches!(p, milpa_core::ProvenanceRecord::Git { origin, .. } if origin == "declared"))
+                    .cloned()
+                    .collect();
+                let pin_stripped = milpa_core::LockedDep {
+                    identity: None,
+                    provenances: declared_provs,
+                    ..updated
+                };
+                let mut prior = full;
+                prior.deps.retain(|d| d.name != canonical);
+                prior.deps.push(pin_stripped);
+                Some(prior)
+            }
+        };
+        let graph = resolve_workspace_with_features(
+            &ws,
+            index.as_ref(),
+            registry.as_ref(),
+            profile.as_ref(),
+            ws_prior.as_ref(),
+            strategy,
+            &ws_deps_dir,
+            false,
+            &build_store(),
+            &std::collections::BTreeSet::new(),
+            false,
+            false,
+        )?;
+        write_lockfile(&from_graph(&graph, strategy.as_str()), &ws_lock_path)?;
         eprintln!(
             "updated {} across {} members",
             name.as_deref().unwrap_or("all deps"),
@@ -1016,6 +1082,108 @@ fn cmd_add(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaErro
             "MAN-ADD-DEP-EXISTS",
             format!("dep {name:?} is already declared in milpa.kdl"),
         )));
+    }
+
+    // S11e: if this is a member dir (has a parent workspace), delegate to
+    // workspace-level add: mutate the MEMBER's manifest + re-resolve the WHOLE
+    // workspace.  The shared lock must be written; NO member-local lock.
+    if let Some((ws_root, ws)) = find_parent_workspace(dir) {
+        // Re-use `existing` (already loaded from dir/milpa.kdl) for the member manifest.
+        // S10 (RFC #23 §3.7): parse --optional and --features from rest.
+        let optional_flag = rest.iter().any(|a| a == "--optional");
+        let feat_str = flag_value(rest, "--features");
+        let feat_names: Vec<String> = feat_str
+            .as_deref()
+            .map(|s| s.split(',').filter(|f| !f.is_empty()).map(String::from).collect())
+            .unwrap_or_default();
+
+        if optional_flag {
+            if !valid_flag_name(&name) {
+                eprintln!("add: dep name {:?} is not a valid flag name (must match [A-Za-z0-9_-]+)", name);
+                eprintln!("milpa-error: MAN-DEP-OPTIONAL-INVALID-NAME");
+                return Ok(1);
+            }
+            let declared_flag_names: std::collections::HashSet<&str> =
+                existing.flags.iter().map(|f| f.name.as_str()).collect();
+            if declared_flag_names.contains(name.as_str()) {
+                eprintln!("add: dep {:?} optional=#true would clash with an existing flag of the same name", name);
+                eprintln!("milpa-error: MAN-DEP-OPTIONAL-FLAG-CLASH");
+                return Ok(1);
+            }
+        }
+
+        let flag_reqs_ws: Vec<FlagRequest> = feat_names
+            .iter()
+            .map(|f| FlagRequest { name: f.clone(), enabled: true })
+            .collect();
+
+        // Ref discovery — same as the single-package path.
+        let git_ref_ws = match flag_value(rest, "--ref") {
+            Some(r) => r,
+            None => match discover_default_branch(&url) {
+                Ok(r) => r,
+                Err(msg) => {
+                    return Err(MilpaError::Fetch(FetchError::Transport(
+                        "FETCH-REF-DISCOVERY-FAILED",
+                        format!("could not discover default branch for {url}: {msg}; pass --ref explicitly"),
+                    )));
+                }
+            },
+        };
+
+        // Build proposed MEMBER manifest with the new dep.
+        let mut proposed_member = existing.clone();
+        proposed_member.deps.push(Dep::Url(UrlDep {
+            name: name.clone(),
+            git: url.clone(),
+            git_ref: git_ref_ws.clone(),
+            mirrors: Vec::new(),
+            predicates: Vec::new(),
+            flag_requests: flag_reqs_ws.clone(),
+            optional: optional_flag,
+        }));
+
+        // Rebuild the workspace with the proposed member manifest.
+        let ws_with_override = ws_with_member_override(&ws, dir, proposed_member.clone());
+        let ws_deps_dir = ws_root.join("_deps");
+        let ws_lock_path = ws_root.join("milpa.lock");
+        let index = maybe_index(no_index)?;
+        let profile = profile_from_env();
+        let graph = resolve_workspace_with_features(
+            &ws_with_override,
+            index.as_ref(),
+            build_registry().as_ref(),
+            profile.as_ref(),
+            None,
+            Strategy::default(),
+            &ws_deps_dir,
+            false,
+            &build_store(),
+            &std::collections::BTreeSet::new(),
+            false,
+            false,
+        )?;
+
+        // Atomic write: member manifest first, then shared workspace lock.
+        // NO member-local lock written (D5 correctness point).
+        let name_c = name.clone();
+        let url_c = url.clone();
+        let git_ref_c = git_ref_ws.clone();
+        mutate_manifest_file(&dir.join("milpa.kdl"), move |mut m| {
+            m.deps.push(Dep::Url(UrlDep {
+                name: name_c,
+                git: url_c,
+                git_ref: git_ref_c,
+                mirrors: Vec::new(),
+                predicates: Vec::new(),
+                flag_requests: flag_reqs_ws,
+                optional: optional_flag,
+            }));
+            m
+        })?;
+        write_lockfile(&from_graph(&graph, "maxver"), &ws_lock_path)?;
+        eprintln!("added dep");
+        return Ok(0);
     }
 
     // S10 (RFC #23 §3.7): parse --optional and --features <comma-list> from rest.
@@ -1510,6 +1678,67 @@ fn cmd_remove(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaE
         return Ok(1);
     };
 
+    // S11e: if this is a member dir (has a parent workspace), delegate to
+    // workspace-level remove: mutate the MEMBER's manifest + re-resolve the WHOLE
+    // workspace.  The shared lock must be written; NO member-local lock.
+    if let Some((ws_root, ws)) = find_parent_workspace(dir) {
+        let ws_lock_path = ws_root.join("milpa.lock");
+
+        // Alias→canonical resolution against the SHARED lockfile.
+        let shared_prior: Option<milpa_core::Lockfile> = if ws_lock_path.exists() {
+            load_lockfile(&ws_lock_path).ok()
+        } else {
+            None
+        };
+        let canonical_ws: String = if let Some(ref lf) = shared_prior {
+            canonical_name_for(&name, lf)
+        } else {
+            name.clone()
+        };
+
+        // Guard: dep must be declared in the MEMBER's milpa.kdl.
+        if !existing.deps.iter().any(|d| d.name() == canonical_ws) {
+            eprintln!("remove: no dep {name:?} in milpa.kdl");
+            eprintln!("milpa-error: MAN-REMOVE-DEP-ABSENT");
+            return Ok(1);
+        }
+
+        // Build proposed member manifest without the dep.
+        let mut proposed_member = existing.clone();
+        proposed_member.deps.retain(|d| d.name() != canonical_ws.as_str());
+
+        // Rebuild workspace with proposed member manifest and resolve.
+        let ws_with_override = ws_with_member_override(&ws, dir, proposed_member.clone());
+        let ws_deps_dir = ws_root.join("_deps");
+        let index = maybe_index(no_index)?;
+        let profile = profile_from_env();
+        let graph = resolve_workspace_with_features(
+            &ws_with_override,
+            index.as_ref(),
+            build_registry().as_ref(),
+            profile.as_ref(),
+            shared_prior.as_ref(),
+            Strategy::default(),
+            &ws_deps_dir,
+            false,
+            &build_store(),
+            &std::collections::BTreeSet::new(),
+            false,
+            false,
+        )?;
+
+        // Atomic write: member manifest first, then shared workspace lock.
+        // NO member-local lock written (D5 correctness point).
+        let canonical_c = canonical_ws.clone();
+        mutate_manifest_file(&dir.join("milpa.kdl"), move |mut m| {
+            m.deps.retain(|d| d.name() != canonical_c.as_str());
+            m
+        })?;
+        write_lockfile(&from_graph(&graph, "maxver"), &ws_lock_path)?;
+        eprintln!("removed {canonical_ws}");
+        return Ok(0);
+    }
+
     // D-update-remove: alias→canonical resolution (Phase D item 5).
     // If `name` is an alias of a canonical lockfile dep, resolve to the manifest
     // dep name so the guard and mutation operate on the correct entry.
@@ -1813,6 +2042,75 @@ fn maybe_prior_lockfile(path: &Path) -> Option<milpa_core::Lockfile> {
         return None;
     }
     load_lockfile(path).ok()
+}
+
+/// S11e: rebuild a `LoadedWorkspace` with one member's manifest replaced.
+///
+/// Mirrors `workspace.py:load_workspace_with_member_override`.
+/// Returns a new `LoadedWorkspace` identical to `ws` except the member whose
+/// directory matches `member_dir` (canonicalized) has its manifest replaced
+/// with `proposed_manifest`.
+fn ws_with_member_override(ws: &LoadedWorkspace, member_dir: &Path, proposed_manifest: milpa_manifest::Manifest) -> LoadedWorkspace {
+    let member_dir_abs = member_dir.canonicalize().unwrap_or_else(|_| member_dir.to_path_buf());
+    let new_members: Vec<milpa_core::LoadedMember> = ws.members.iter().map(|m| {
+        let m_abs = m.directory.canonicalize().unwrap_or_else(|_| m.directory.clone());
+        if m_abs == member_dir_abs {
+            milpa_core::LoadedMember {
+                name: m.name.clone(),
+                path: m.path.clone(),
+                directory: m.directory.clone(),
+                manifest: proposed_manifest.clone(),
+            }
+        } else {
+            m.clone()
+        }
+    }).collect();
+    LoadedWorkspace {
+        root: ws.root.clone(),
+        members: new_members,
+        overrides: ws.overrides.clone(),
+        flags: ws.flags.clone(),
+    }
+}
+
+/// S11e (RFC: workspace-completion §3.G / D5): walk upward from `start_dir`
+/// looking for a parent workspace that contains `start_dir` as a member.
+///
+/// Mirrors `workspace.py:find_workspace_root`.  Returns `Some((root, ws))` if
+/// a workspace root is found AND `start_dir` is one of its declared members;
+/// returns `None` otherwise (standalone-package or not-a-declared-member).
+///
+/// Algorithm:
+/// 1. Walk up one directory at a time.
+/// 2. At each level, try to load `milpa.kdl` as a workspace (`load_workspace`).
+/// 3. If that succeeds, check that `start_dir` is the resolved directory of
+///    one of the workspace's declared members.
+/// 4. If so, return `(root, ws)`.  Otherwise continue walking.
+/// 5. Return `None` at the filesystem root.
+fn find_parent_workspace(start_dir: &Path) -> Option<(PathBuf, LoadedWorkspace)> {
+    let start_resolved = start_dir.canonicalize().ok()?;
+    let mut current = start_resolved.clone();
+    // Walk upward — skip `current` itself (that's start_dir, the member dir).
+    loop {
+        match current.parent() {
+            None => return None, // filesystem root reached
+            Some(parent) => current = parent.to_path_buf(),
+        }
+        // Try to load a workspace at `current`.
+        if let Ok(ws) = load_workspace(&current) {
+            // Check if start_dir is a declared member.
+            for member in &ws.members {
+                if let Ok(member_abs) = member.directory.canonicalize() {
+                    if member_abs == start_resolved {
+                        return Some((current.clone(), ws));
+                    }
+                }
+            }
+            // Found a workspace but start_dir is not a member — stop searching.
+            return None;
+        }
+        // Not a workspace root (or load failed) → continue upward.
+    }
 }
 
 /// Parse CLI feature-selection arguments from verb-level tail args.

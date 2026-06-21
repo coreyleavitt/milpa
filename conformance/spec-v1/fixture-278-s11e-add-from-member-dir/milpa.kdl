@@ -1,0 +1,8 @@
+// fixture-278: S11e — add from a member dir
+//
+// Workspace with one member. `milpa add` is invoked from the member dir
+// (project-dir: member-a). Expected: member's milpa.kdl gains the dep;
+// shared <root>/milpa.lock is updated; NO member-local milpa.lock written.
+workspace {
+    member "member-a"
+}

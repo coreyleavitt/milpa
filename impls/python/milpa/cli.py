@@ -84,7 +84,13 @@ from milpa.profile import Profile
 from milpa.resolver import resolve, resolve_workspace
 from milpa.solver import SolverError, SolveSuccess, certificate_to_json
 from milpa.version import Strategy
-from milpa.workspace import find_workspace_root, load_or_discover_manifest, load_workspace
+from milpa.workspace import (
+    LoadedWorkspace,
+    find_workspace_root,
+    load_or_discover_manifest,
+    load_workspace,
+    load_workspace_with_member_override,
+)
 
 # ---------------------------------------------------------------------------
 # R1–R4 error channel
@@ -1678,17 +1684,37 @@ def cmd_add(
     manifest_path = project_dir / "milpa.kdl"
     lock_path = project_dir / "milpa.lock"
 
-    # S11a: add at a workspace root is refused with the canonical directive slug.
+    # S11a/S11e: workspace detection — distinguish root vs member dir.
     ws = find_workspace_root(project_dir)
     if ws is not None:
-        print(
-            "milpa add: cannot add a dep to a workspace root — "
-            "to add a dep, `cd` to a member; "
-            "to add a member, use `milpa workspace add-member`",
-            file=sys.stderr,
+        from milpa.workspace import LoadedWorkspace
+        assert isinstance(ws, LoadedWorkspace)
+        if ws.root_dir == project_dir.resolve():
+            # S11a: at the workspace root — refuse with the canonical directive slug.
+            print(
+                "milpa add: cannot add a dep to a workspace root — "
+                "to add a dep, `cd` to a member; "
+                "to add a member, use `milpa workspace add-member`",
+                file=sys.stderr,
+            )
+            _emit_slug(MAN_MUTATE_WORKSPACE_REFUSED)
+            return 1
+        # S11e: invoked from a member dir — detect-and-delegate (D5).
+        # Mutate the MEMBER's manifest; re-resolve the WHOLE workspace.
+        # The member-local lock must NOT be written.
+        return _cmd_add_from_member_dir(
+            member_dir=project_dir,
+            workspace=ws,
+            env=env,
+            dep_name=dep_name,
+            git_url=git_url,
+            mirror_url=mirror_url,
+            ref=ref,
+            strategy=strategy,
+            max_parallel=max_parallel,
+            optional=optional,
+            features=features,
         )
-        _emit_slug(MAN_MUTATE_WORKSPACE_REFUSED)
-        return 1
 
     if git_url is not None:
         return _cmd_add_git(
@@ -2024,17 +2050,30 @@ def cmd_remove(
     manifest_path = project_dir / "milpa.kdl"
     lock_path = project_dir / "milpa.lock"
 
-    # S11a: remove at a workspace root is refused with the canonical directive slug.
+    # S11a/S11e: workspace detection — distinguish root vs member dir.
     ws_check = find_workspace_root(project_dir)
     if ws_check is not None:
-        print(
-            "milpa remove: cannot remove a dep from a workspace root — "
-            "to remove a dep, `cd` to a member; "
-            "to remove a member, use `milpa workspace remove-member`",
-            file=sys.stderr,
+        from milpa.workspace import LoadedWorkspace
+        assert isinstance(ws_check, LoadedWorkspace)
+        if ws_check.root_dir == project_dir.resolve():
+            # S11a: at the workspace root — refuse with the canonical directive slug.
+            print(
+                "milpa remove: cannot remove a dep from a workspace root — "
+                "to remove a dep, `cd` to a member; "
+                "to remove a member, use `milpa workspace remove-member`",
+                file=sys.stderr,
+            )
+            _emit_slug(MAN_MUTATE_WORKSPACE_REFUSED)
+            return 1
+        # S11e: invoked from a member dir — detect-and-delegate (D5).
+        return _cmd_remove_from_member_dir(
+            member_dir=project_dir,
+            workspace=ws_check,
+            env=env,
+            dep_name=dep_name,
+            strategy=strategy,
+            max_parallel=max_parallel,
         )
-        _emit_slug(MAN_MUTATE_WORKSPACE_REFUSED)
-        return 1
 
     manifest_text = manifest_path.read_text(encoding="utf-8")
     manifest = parse_manifest(manifest_text)
@@ -2138,10 +2177,10 @@ def cmd_update(
     """
     lock_path = project_dir / "milpa.lock"
 
-    # S11b (RFC: workspace-completion §3.G): workspace parity.
-    # Rust is already workspace-aware; bring Python to parity.
+    # S11b/S11e (RFC: workspace-completion §3.G): workspace parity.
     # From a workspace root, update does the full workspace re-resolve
     # (drop pins → re-resolve shared graph → refresh shared lock).
+    # S11e: from a member dir, detect the parent workspace and delegate there.
     # update writes no nim.cfg in either impl — keep that.
     ws = find_workspace_root(project_dir)
     if ws is not None:
@@ -2341,6 +2380,251 @@ def _cmd_update_workspace(
         f"updated {dep_name or 'all deps'} across {len(workspace.members)} members",
         file=sys.stderr,
     )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# _cmd_add_from_member_dir / _cmd_remove_from_member_dir (S11e)
+#
+# Detect-and-delegate: invoked from a member dir, mutate the MEMBER's manifest
+# and re-resolve the WHOLE workspace (shared lock + shared _deps/).
+# The member-local lock must NOT be written (D5, cli-contract §5.6-5.8).
+# ---------------------------------------------------------------------------
+
+
+def _cmd_add_from_member_dir(
+    member_dir: Path,
+    workspace: object,
+    env: MilpaEnv,
+    *,
+    dep_name: str,
+    git_url: str | None,
+    mirror_url: str | None,
+    ref: str | None,
+    strategy: Strategy,
+    max_parallel: int,
+    optional: bool = False,
+    features: "tuple[str, ...] | frozenset[str]" = (),
+) -> int:
+    """S11e: ``milpa add`` invoked from a member dir.
+
+    Mutates the MEMBER's ``milpa.kdl``; re-resolves the WHOLE workspace
+    (shared ``<root>/milpa.lock`` + shared ``<root>/_deps/``).
+    No member-local lock is written.
+
+    spec/cli-contract.md §5.6 member-dir behavior.
+    """
+    from dataclasses import replace as _replace
+    from milpa.workspace import LoadedWorkspace
+
+    assert isinstance(workspace, LoadedWorkspace)
+    ws_root = workspace.root_dir
+    member_dir = member_dir.resolve()
+
+    if git_url is None:
+        # mirror_url path: pure manifest mutation on the member, no workspace relock.
+        # Delegate to the single-package mirror path on the member dir.
+        return _cmd_add_mirror(
+            project_dir=member_dir,
+            manifest_path=member_dir / "milpa.kdl",
+            lock_path=member_dir / "milpa.lock",
+            env=env,
+            dep_name=dep_name,
+            mirror_url=mirror_url or "",
+            strategy=strategy,
+            max_parallel=max_parallel,
+        )
+
+    # --- git URL add path ---
+    from milpa.manifest import FlagRequest, UrlDep, parse_manifest
+    from milpa.manifest_writer import mutate_manifest_file
+
+    # Ref discovery — same logic as _cmd_add_git.
+    mocked_dir = os.environ.get("MILPA_MOCKED_FETCHES", "").strip()
+    if ref is None:
+        if mocked_dir:
+            discovered = _mocked_default_branch(mocked_dir, git_url)
+            if discovered is None:
+                print(
+                    f"milpa add: ref discovery failed for {git_url!r} "
+                    "(no mocked fixture found)",
+                    file=sys.stderr,
+                )
+                _emit_slug(FETCH_REF_DISCOVERY_FAILED)
+                return 1
+            ref = discovered
+        else:
+            discovered_ref = _git_discover_default_branch(git_url)
+            if discovered_ref is None:
+                print(
+                    f"milpa add: failed to discover default branch for {git_url!r}",
+                    file=sys.stderr,
+                )
+                _emit_slug(FETCH_REF_DISCOVERY_FAILED)
+                return 1
+            ref = discovered_ref
+
+    # Parse the MEMBER's manifest.
+    member_manifest_path = member_dir / "milpa.kdl"
+    if not member_manifest_path.exists():
+        print(
+            f"milpa add: no milpa.kdl found at {member_manifest_path}",
+            file=sys.stderr,
+        )
+        _emit_slug(MILPA_INTERNAL)
+        return 1
+
+    member_text = member_manifest_path.read_text(encoding="utf-8")
+    member_manifest = parse_manifest(member_text)
+
+    existing_names = {dep.name for dep in member_manifest.deps}
+    if dep_name in existing_names:
+        print(
+            f"milpa add: dep {dep_name!r} already declared in milpa.kdl",
+            file=sys.stderr,
+        )
+        _emit_slug(MAN_ADD_DEP_EXISTS)
+        return 1
+
+    # Optional dep clash check.
+    if optional:
+        from milpa.manifest import valid_dep_name
+        from milpa.errors import MAN_DEP_OPTIONAL_FLAG_CLASH, MAN_DEP_OPTIONAL_INVALID_NAME
+        if not valid_dep_name(dep_name):
+            print(
+                f"milpa add: dep name {dep_name!r} is not a valid flag name "
+                "(must match [A-Za-z0-9_-]+) — required for optional=#true",
+                file=sys.stderr,
+            )
+            _emit_slug(MAN_DEP_OPTIONAL_INVALID_NAME)
+            return 1
+        declared_flag_names: frozenset[str] = frozenset(fd.name for fd in member_manifest.flags)
+        if dep_name in declared_flag_names:
+            print(
+                f"milpa add: dep {dep_name!r} optional=#true would clash with the "
+                f"existing flag {dep_name!r} — rename one or mark the dep non-optional",
+                file=sys.stderr,
+            )
+            _emit_slug(MAN_DEP_OPTIONAL_FLAG_CLASH)
+            return 1
+
+    # Build the proposed member manifest with the new dep.
+    flag_reqs: tuple[FlagRequest, ...] = tuple(
+        FlagRequest(name=f, enabled=True) for f in features
+    )
+    new_dep = UrlDep(
+        name=dep_name,
+        git=git_url,
+        ref=ref,
+        optional=optional,
+        flag_requests=flag_reqs,
+    )
+    proposed_member_manifest = _replace(
+        member_manifest, deps=member_manifest.deps + (new_dep,)
+    )
+
+    # Re-resolve the WHOLE workspace using the proposed member manifest.
+    # We rebuild the LoadedWorkspace with the proposed member manifest so the
+    # resolver sees the updated deps.
+    env_with_index = _load_index_for_verb(env)
+    deps_dir = ws_root / "_deps"
+    profile = Profile.from_environment()
+    params = ResolveParams(
+        strategy=strategy,
+        max_parallel=max_parallel,
+        profile=profile,
+        prior=None,
+        manifest_dir=ws_root,
+    )
+
+    proposed_ws = load_workspace_with_member_override(workspace, member_dir, proposed_member_manifest)
+    graph = resolve_workspace(proposed_ws, deps_dir, env_with_index, params)
+    lockfile_val = from_graph(graph, strategy=str(strategy))
+
+    # Atomic write: member manifest first, then shared workspace lock.
+    # NO member-local lock is written (D5 correctness point).
+    mutate_manifest_file(member_manifest_path, lambda _m: proposed_member_manifest)
+    write_lockfile(lockfile_val, ws_root / "milpa.lock")
+
+    print(f"added {dep_name} (git={git_url} ref={ref})", file=sys.stderr)
+    return 0
+
+
+def _cmd_remove_from_member_dir(
+    member_dir: Path,
+    workspace: object,
+    env: MilpaEnv,
+    *,
+    dep_name: str,
+    strategy: Strategy,
+    max_parallel: int,
+) -> int:
+    """S11e: ``milpa remove`` invoked from a member dir.
+
+    Mutates the MEMBER's ``milpa.kdl``; re-resolves the WHOLE workspace
+    (shared ``<root>/milpa.lock`` + shared ``<root>/_deps/``).
+    No member-local lock is written.
+
+    spec/cli-contract.md §5.7 member-dir behavior.
+    """
+    from dataclasses import replace as _replace
+    from milpa.manifest import parse_manifest
+    from milpa.manifest_writer import mutate_manifest_file
+    from milpa.workspace import LoadedWorkspace
+
+    assert isinstance(workspace, LoadedWorkspace)
+    ws_root = workspace.root_dir
+    member_dir = member_dir.resolve()
+
+    # Parse the MEMBER's manifest.
+    member_manifest_path = member_dir / "milpa.kdl"
+    member_text = member_manifest_path.read_text(encoding="utf-8")
+    member_manifest = parse_manifest(member_text)
+
+    # Alias→canonical resolution against the SHARED lockfile (not the member lock).
+    shared_lock_path = ws_root / "milpa.lock"
+    prior_for_alias = _maybe_load_prior_lockfile(shared_lock_path)
+    if prior_for_alias is not None:
+        canonical_name = resolve_alias_to_canonical(dep_name, prior_for_alias)
+    else:
+        canonical_name = dep_name
+
+    # Guard: dep must be declared in the MEMBER's milpa.kdl.
+    existing_names = {dep.name for dep in member_manifest.deps}
+    if canonical_name not in existing_names:
+        print(
+            f"milpa remove: dep {dep_name!r} is not declared in milpa.kdl",
+            file=sys.stderr,
+        )
+        _emit_slug(MAN_REMOVE_DEP_ABSENT)
+        return 1
+
+    # Build proposed member manifest without the dep.
+    new_deps = tuple(d for d in member_manifest.deps if d.name != canonical_name)
+    proposed_member_manifest = _replace(member_manifest, deps=new_deps)
+
+    # Re-resolve the WHOLE workspace with the proposed member manifest.
+    env_with_index = _load_index_for_verb(env)
+    deps_dir = ws_root / "_deps"
+    profile = Profile.from_environment()
+    params = ResolveParams(
+        strategy=strategy,
+        max_parallel=max_parallel,
+        profile=profile,
+        prior=prior_for_alias,  # type: ignore[arg-type]
+        manifest_dir=ws_root,
+    )
+
+    proposed_ws = load_workspace_with_member_override(workspace, member_dir, proposed_member_manifest)
+    graph = resolve_workspace(proposed_ws, deps_dir, env_with_index, params)
+    lockfile_val = from_graph(graph, strategy=str(strategy))
+
+    # Atomic write: member manifest first, then shared workspace lock.
+    # NO member-local lock is written (D5 correctness point).
+    mutate_manifest_file(member_manifest_path, lambda _m: proposed_member_manifest)
+    write_lockfile(lockfile_val, shared_lock_path)
+
+    print(f"removed {canonical_name}", file=sys.stderr)
     return 0
 
 

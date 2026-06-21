@@ -656,16 +656,43 @@ def _assert_success_fixture(
             else:
                 normalized_outputs["expected/nim.cfg"] = actual
 
-    # Workspace per-member nim.cfg: for each <member>/ subdir in expected_dir
-    # that contains a nim.cfg.
+    # Workspace per-member outputs: for each <member>/ subdir in expected_dir,
+    # check nim.cfg and/or milpa.kdl (mutation fixtures).
     for member_dir in sorted(expected_dir.iterdir()):
         if not member_dir.is_dir():
             continue
+        rel = member_dir.name
+
+        # Per-member milpa.kdl — S11e: add/remove from a member dir mutates the
+        # MEMBER's milpa.kdl (not the workspace root's).
+        member_kdl_expected = member_dir / "milpa.kdl"
+        if member_kdl_expected.exists():
+            actual_member_kdl = scratch / rel / "milpa.kdl"
+            if not actual_member_kdl.exists():
+                failures.append(AssertionFailure(
+                    fixture_name=run.fixture_name,
+                    impl_name=run.impl_name,
+                    kind="success-fixture",
+                    detail=f"member milpa.kdl not present in scratch: {rel}/milpa.kdl",
+                ))
+            else:
+                actual = actual_member_kdl.read_text()
+                expected_text = member_kdl_expected.read_text()
+                if actual != expected_text:
+                    failures.append(AssertionFailure(
+                        fixture_name=run.fixture_name,
+                        impl_name=run.impl_name,
+                        kind="success-fixture",
+                        detail=_diff_summary(f"{rel}/milpa.kdl", expected_text, actual),
+                    ))
+                else:
+                    normalized_outputs[f"expected/{rel}/milpa.kdl"] = actual
+
+        # Per-member nim.cfg.
         member_nimcfg = member_dir / "nim.cfg"
         if not member_nimcfg.exists():
             continue
         # This is a workspace member nim.cfg.
-        rel = member_dir.name
         actual_member_nimcfg = scratch / rel / "nim.cfg"
         if not actual_member_nimcfg.exists():
             failures.append(AssertionFailure(
@@ -705,6 +732,28 @@ def _assert_success_fixture(
             ))
         else:
             normalized_outputs["expected/_deps_structure.txt"] = normalized
+
+    # absent — list of scratch-relative paths that must NOT exist after the run.
+    # S11e: asserts that no member-local milpa.lock was written.
+    # Each non-empty, non-comment line is a path relative to scratch root.
+    absent_file = expected_dir / "absent"
+    if absent_file.exists():
+        for raw_line in absent_file.read_text().splitlines():
+            rel_path = raw_line.strip()
+            if not rel_path or rel_path.startswith("#"):
+                continue
+            actual_path = scratch / rel_path
+            if actual_path.exists():
+                failures.append(AssertionFailure(
+                    fixture_name=run.fixture_name,
+                    impl_name=run.impl_name,
+                    kind="success-fixture",
+                    detail=(
+                        f"expected {rel_path!r} to be absent in scratch "
+                        f"(D5: member-local lock must not be written), "
+                        f"but it exists"
+                    ),
+                ))
 
 
 # ---------------------------------------------------------------------------

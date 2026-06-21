@@ -1,0 +1,3 @@
+# S11e correctness assertion: no member-local lock must be written.
+# The shared lock lives at <workspace-root>/milpa.lock, NOT at member-a/milpa.lock.
+member-a/milpa.lock

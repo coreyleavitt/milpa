@@ -409,6 +409,68 @@ def load_workspace_from_manifest(
 
 
 # ---------------------------------------------------------------------------
+# Public: load_workspace_with_member_override
+# ---------------------------------------------------------------------------
+
+
+def load_workspace_with_member_override(
+    workspace: LoadedWorkspace,
+    member_dir: Path,
+    proposed_manifest: Manifest,
+) -> LoadedWorkspace:
+    """Return a new ``LoadedWorkspace`` with one member's manifest replaced.
+
+    S11e (RFC: workspace-completion §3.G / D5): used by ``add``/``remove``
+    invoked from a member dir to build the proposed workspace for resolution
+    *before* any on-disk write.  The resolver sees the updated member manifest
+    while the workspace topology (root, other members) remains unchanged.
+
+    Parameters
+    ----------
+    workspace:
+        The current loaded workspace (from disk).
+    member_dir:
+        The absolute path of the member whose manifest is being replaced.
+        Must match one of ``workspace.members[i].abs_dir``.
+    proposed_manifest:
+        The in-memory manifest to substitute for that member.
+
+    Returns
+    -------
+    LoadedWorkspace
+        Structurally identical to ``workspace`` except the matching member's
+        ``manifest`` field is replaced with ``proposed_manifest``.
+
+    Raises
+    ------
+    AssertionError
+        If ``member_dir`` (resolved) does not match any declared member.
+    """
+    member_dir_resolved = member_dir.resolve()
+    new_members: list[LoadedMember] = []
+    found = False
+    for m in workspace.members:
+        if m.abs_dir == member_dir_resolved:
+            new_members.append(LoadedMember(
+                rel_path=m.rel_path,
+                abs_dir=m.abs_dir,
+                manifest=proposed_manifest,
+            ))
+            found = True
+        else:
+            new_members.append(m)
+    assert found, (
+        f"load_workspace_with_member_override: member dir {member_dir_resolved} "
+        f"not found in workspace members"
+    )
+    return LoadedWorkspace(
+        root_dir=workspace.root_dir,
+        workspace_manifest=workspace.workspace_manifest,
+        members=tuple(new_members),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public: find_workspace_root
 # ---------------------------------------------------------------------------
 

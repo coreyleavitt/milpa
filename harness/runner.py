@@ -68,6 +68,23 @@ def _read_cmd(fixture_dir: Path) -> str:
     return "resolve"
 
 
+def _read_project_dir_suffix(fixture_dir: Path) -> Optional[str]:
+    """Read the optional ``project-dir`` file.
+
+    S11e (RFC: workspace-completion §3.G / D5): some fixtures invoke the
+    CLI from a *sub-directory* of the scratch tree (e.g. a workspace member
+    dir) rather than from the scratch root.  The ``project-dir`` control file
+    contains a path *relative to scratch* (e.g. ``member-a``) that overrides
+    the ``-C`` flag passed to the impl.
+
+    Returns ``None`` when the file is absent (default: use scratch root).
+    """
+    pd_file = fixture_dir / "project-dir"
+    if pd_file.exists():
+        return pd_file.read_text().strip() or None
+    return None
+
+
 def _read_env_file(fixture_dir: Path) -> dict[str, str]:
     """Parse the optional `env` file into a dict (KEY=VALUE lines, # comments ignored)."""
     env_file = fixture_dir / "env"
@@ -85,7 +102,7 @@ def _read_env_file(fixture_dir: Path) -> dict[str, str]:
 
 
 # Files / dirs that are harness control inputs, not fixture inputs to copy.
-_CONTROL_FILES = frozenset({"expected", "cmd", "env"})
+_CONTROL_FILES = frozenset({"expected", "cmd", "env", "project-dir"})
 
 
 def _copy_fixture_inputs(fixture_dir: Path, scratch: Path) -> None:
@@ -301,6 +318,7 @@ def run_fixture(
     fixture_name = fixture_dir.name
     cmd = _read_cmd(fixture_dir)
     fixture_env = _read_env_file(fixture_dir)
+    project_dir_suffix = _read_project_dir_suffix(fixture_dir)
     global_flags, verb_argv = _cmd_to_cli(cmd)
 
     # Create isolated scratch + CAS dirs.
@@ -350,9 +368,16 @@ def run_fixture(
             # Pre-phase outcome is ignored — if fetch fails, verify will also
             # fail (no _deps/) with an appropriate error.
 
+        # S11e: if the fixture specifies a project-dir sub-path, use it as
+        # the -C argument (e.g. "member-a" → -C <scratch>/member-a).
+        if project_dir_suffix:
+            project_path = str(scratch / project_dir_suffix)
+        else:
+            project_path = str(scratch)
+
         argv = (
             descriptor.argv
-            + ["-C", str(scratch)]
+            + ["-C", project_path]
             + global_flags
             + verb_argv
         )

@@ -1,0 +1,8 @@
+// fixture-279: S11e — remove from a member dir
+//
+// Workspace with one member that declares foo. `milpa remove` is invoked from
+// the member dir (project-dir: member-a). Expected: member's milpa.kdl drops
+// foo; shared <root>/milpa.lock updated (no foo); NO member-local lock written.
+workspace {
+    member "member-a"
+}

@@ -1,0 +1,8 @@
+// fixture-280: S11e — update from a member dir
+//
+// Workspace with one member. `milpa update` is invoked from the member dir
+// (project-dir: member-a). Expected: shared <root>/milpa.lock refreshed;
+// NO member-local lock written.
+workspace {
+    member "member-a"
+}
