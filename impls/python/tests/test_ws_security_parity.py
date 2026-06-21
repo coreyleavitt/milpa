@@ -1,9 +1,14 @@
-"""Tests for F7, F16, F18 workspace security/parity fixes.
+"""Tests for F7, F16, F18, R2-1, R2-2 workspace security/parity fixes.
 
 F7:  load_workspace_with_member_override assert → MilpaError (WS-MEMBER-DIR-MISSING).
 F16: Path traversal containment check (WS-MEMBER-PATH-ESCAPE).
 F18: Python already rejects "./"; new fixture-284 confirms Rust parity only.
      Python unit tests here just confirm the existing Python behavior is stable.
+R2-1: Symlink member whose real target escapes the workspace root → PATH-ESCAPE.
+      (Uses actual symlinks in tmp_path; covers the Option-A canonicalize path.)
+R2-2: Member "pkg/.." resolves lexically to the workspace root → IS-WORKSPACE,
+      not PATH-ESCAPE (inclusive containment check; parity with Python guaranteed
+      by the _member_path_is_under_root dedup; fixture-286 corpus counterpart).
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ from milpa.errors import (
     MilpaError,
     WS_MEMBER_DIR_MISSING,
     WS_MEMBER_DOT,
+    WS_MEMBER_IS_WORKSPACE,
     WS_MEMBER_PATH_ESCAPE,
 )
 from milpa.manifest import WorkspaceManifest
@@ -109,6 +115,145 @@ def test_path_escape_existing_dir(tmp_path: Path) -> None:
     with pytest.raises(MilpaError) as exc_info:
         load_workspace(tmp_path)
     assert exc_info.value.slug == WS_MEMBER_PATH_ESCAPE
+
+
+# ---------------------------------------------------------------------------
+# R2-2: "pkg/.." resolves lexically to root → WS-MEMBER-IS-WORKSPACE, not PATH-ESCAPE
+#
+# Fixture-286 is the corpus counterpart.  These unit tests pin the Python behavior
+# and confirm it matches the now-fixed Rust.
+# ---------------------------------------------------------------------------
+
+
+def test_member_resolves_to_root_yields_is_workspace_load_workspace(tmp_path: Path) -> None:
+    """load_workspace: member 'pkg/..' reduces to workspace root → WS-MEMBER-IS-WORKSPACE.
+
+    'pkg' doesn't exist; Path.resolve() normalizes '..' lexically and returns
+    the root.  is_relative_to(root) is True (inclusive), so it is NOT a PATH-ESCAPE;
+    it falls through to the manifest-parse check which sees a workspace document.
+    """
+    _write_workspace(tmp_path, ["pkg/.."])
+    with pytest.raises(MilpaError) as exc_info:
+        load_workspace(tmp_path)
+    assert exc_info.value.slug == WS_MEMBER_IS_WORKSPACE
+
+
+def test_member_resolves_to_root_yields_is_workspace_from_manifest(tmp_path: Path) -> None:
+    """load_workspace_from_manifest: same semantics as load_workspace for 'pkg/..'.
+
+    The workspace manifest is written to disk so that when 'pkg/..' resolves to
+    the root and load_workspace_from_manifest reads root/milpa.kdl, it finds a
+    workspace document and raises WS-MEMBER-IS-WORKSPACE.
+    """
+    _write_workspace(tmp_path, ["pkg/.."])
+    ws_manifest = WorkspaceManifest(members=("pkg/..",))
+    with pytest.raises(MilpaError) as exc_info:
+        load_workspace_from_manifest(tmp_path, ws_manifest)
+    assert exc_info.value.slug == WS_MEMBER_IS_WORKSPACE
+
+
+# ---------------------------------------------------------------------------
+# R2-1: Existing symlink whose real target escapes workspace root → PATH-ESCAPE
+#
+# Builds a real symlink in tmp_path so Path.resolve() follows it.
+# This pins the Option-A canonicalize behavior.
+# ---------------------------------------------------------------------------
+
+
+def test_symlink_member_escaping_root_yields_path_escape(tmp_path: Path) -> None:
+    """A member dir that is a symlink pointing outside the workspace root → WS-MEMBER-PATH-ESCAPE.
+
+    Layout:
+      tmp_path/
+        workspace-root/
+          milpa.kdl         (workspace declaring member "symlink-member")
+          symlink-member -> ../outside-root
+        outside-root/       (real dir with a package milpa.kdl)
+
+    Path.resolve() follows the symlink → outside-root → not under workspace-root.
+    """
+    ws_root = tmp_path / "workspace-root"
+    outside = tmp_path / "outside-root"
+    ws_root.mkdir()
+    outside.mkdir()
+    (outside / "milpa.kdl").write_text('name "escaped"\nkind "library"\n', encoding="utf-8")
+    _write_workspace(ws_root, ["symlink-member"])
+    # Create symlink: workspace-root/symlink-member → ../outside-root
+    (ws_root / "symlink-member").symlink_to("../outside-root")
+    with pytest.raises(MilpaError) as exc_info:
+        load_workspace(ws_root)
+    assert exc_info.value.slug == WS_MEMBER_PATH_ESCAPE
+
+
+def test_symlink_member_escaping_root_from_manifest(tmp_path: Path) -> None:
+    """Same as above but through load_workspace_from_manifest."""
+    ws_root = tmp_path / "workspace-root"
+    outside = tmp_path / "outside-root"
+    ws_root.mkdir()
+    outside.mkdir()
+    (outside / "milpa.kdl").write_text('name "escaped"\nkind "library"\n', encoding="utf-8")
+    # Write workspace milpa.kdl (needed so ws_root.resolve() works)
+    _write_workspace(ws_root, ["symlink-member"])
+    (ws_root / "symlink-member").symlink_to("../outside-root")
+    ws_manifest = WorkspaceManifest(members=("symlink-member",))
+    with pytest.raises(MilpaError) as exc_info:
+        load_workspace_from_manifest(ws_root, ws_manifest)
+    assert exc_info.value.slug == WS_MEMBER_PATH_ESCAPE
+
+
+# ---------------------------------------------------------------------------
+# Dangling-symlink parity (Item 1 — matches Rust workspace_tests.rs)
+#
+# Python `resolve(strict=False)` follows dangling symlinks to the (nonexistent)
+# target, so `is_relative_to(root)` correctly catches outside-escaping danglers.
+# These tests pin that behavior against regression and document parity with Rust.
+# ---------------------------------------------------------------------------
+
+
+def test_dangling_symlink_outside_root_yields_path_escape(tmp_path: Path) -> None:
+    """A dangling symlink whose target is outside the workspace root → WS-MEMBER-PATH-ESCAPE.
+
+    Layout::
+
+      tmp_path/
+        workspace-root/
+          milpa.kdl      (workspace declaring member "dangle-out")
+          dangle-out -> ../../outside-nonexistent   (dangling: target absent)
+
+    Python ``Path.resolve(strict=False)`` follows the symlink to the nonexistent
+    outside target; ``is_relative_to(root)`` is False → WS-MEMBER-PATH-ESCAPE.
+    (Rust: before the dangling-symlink fix, ``candidate.exists()`` was False →
+    ``normalize_lexically`` treated the symlink as a normal dir → wrong slug.)
+    """
+    ws_root = tmp_path / "workspace-root"
+    ws_root.mkdir()
+    _write_workspace(ws_root, ["dangle-out"])
+    (ws_root / "dangle-out").symlink_to("../../outside-nonexistent")
+    assert not (ws_root / "dangle-out").exists(), "target must be absent"
+
+    with pytest.raises(MilpaError) as exc_info:
+        load_workspace(ws_root)
+    assert exc_info.value.slug == WS_MEMBER_PATH_ESCAPE
+
+
+def test_dangling_symlink_inside_root_yields_dir_missing(tmp_path: Path) -> None:
+    """A dangling symlink whose target resolves inside the workspace root → WS-MEMBER-DIR-MISSING.
+
+    When the dangling link target is inside the root (e.g. ``link -> nonexistent-inside``),
+    the containment check passes (not an escape) and the missing-dir check triggers.
+    Parity: Rust ``is_under_root`` lexically resolves the dangling link target to
+    ``ws_root/nonexistent-inside`` which starts_with(ws_root) → True → not an escape →
+    proceeds to dir-existence → WS-MEMBER-DIR-MISSING.
+    """
+    ws_root = tmp_path / "workspace-root"
+    ws_root.mkdir()
+    _write_workspace(ws_root, ["dangle-in"])
+    (ws_root / "dangle-in").symlink_to("nonexistent-inside")
+    assert not (ws_root / "dangle-in").exists(), "target must be absent"
+
+    with pytest.raises(MilpaError) as exc_info:
+        load_workspace(ws_root)
+    assert exc_info.value.slug == WS_MEMBER_DIR_MISSING
 
 
 # ---------------------------------------------------------------------------

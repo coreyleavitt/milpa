@@ -163,6 +163,40 @@ def load_or_discover_manifest(project_dir: Path) -> Manifest:
 
 
 # ---------------------------------------------------------------------------
+# Internal helper: member-path containment check (Option A — follows symlinks)
+# ---------------------------------------------------------------------------
+
+
+def _member_path_is_under_root(workspace_root: Path, rel_path: str) -> bool:
+    """Return True if the member path resolves to within the workspace root.
+
+    Implements the Option-A semantics shared with the Rust impl:
+      1. Resolve ``workspace_root`` (always exists) to its real path.
+      2. Resolve the candidate using ``Path.resolve(strict=False)`` —
+         ``strict=False`` follows symlinks for the portions that exist and
+         normalizes ``..`` components lexically for the rest.  This means:
+         - An existing member symlink whose target is outside the root is
+           caught because ``resolve()`` follows it to the real location.
+         - A non-existent path like ``../../escape`` is still caught because
+           the lexical ``..``-normalization escapes the root.
+         - A non-existent path like ``pkg`` (inside the workspace) is NOT a
+           false escape — it proceeds to ``WS-MEMBER-DIR-MISSING``.
+      3. Return ``real_cand.is_relative_to(real_root)`` — **inclusive**:
+         a path that resolves TO the root returns True (not an escape),
+         which lets it fall through to the ``WS-MEMBER-IS-WORKSPACE``
+         manifest-parse check.
+
+    Note: ``Path.resolve()`` without ``strict`` (Python 3.6+) is equivalent
+    to ``resolve(strict=False)`` — it never raises even for non-existent paths.
+    """
+    real_root = workspace_root.resolve()
+    # (workspace_root / rel_path).resolve() follows symlinks for extant parts
+    # and normalizes ".." lexically for non-existent parts — exactly what we want.
+    real_cand = (workspace_root / rel_path).resolve()
+    return real_cand.is_relative_to(real_root)
+
+
+# ---------------------------------------------------------------------------
 # Public: load_workspace
 # ---------------------------------------------------------------------------
 
@@ -215,13 +249,12 @@ def load_workspace(workspace_root: Path) -> LoadedWorkspace:
                 member=rel_path,
             )
 
-        abs_dir = (workspace_root / rel_path).resolve()
-
         # §WS-MEMBER-PATH-ESCAPE: member path must not resolve outside the workspace root.
         # Checked before dir-existence so an escaping path always yields this slug,
         # regardless of whether the target dir exists.
-        resolved_root = workspace_root.resolve()
-        if not abs_dir.is_relative_to(resolved_root):
+        if not _member_path_is_under_root(workspace_root, rel_path):
+            abs_dir = (workspace_root / rel_path).resolve()
+            resolved_root = workspace_root.resolve()
             raise MilpaError(
                 WS_MEMBER_PATH_ESCAPE,
                 f"workspace member {rel_path!r} resolves outside the workspace root "
@@ -231,6 +264,7 @@ def load_workspace(workspace_root: Path) -> LoadedWorkspace:
                 workspace_root=str(resolved_root),
             )
 
+        abs_dir = (workspace_root / rel_path).resolve()
         declared_abs.add(abs_dir)
 
         # §WS-MEMBER-DIR-MISSING: member directory must exist
@@ -351,11 +385,10 @@ def load_workspace_from_manifest(
                 member=rel_path,
             )
 
-        abs_dir = (workspace_root / rel_path).resolve()
-
         # §WS-MEMBER-PATH-ESCAPE: containment check before dir-existence check.
-        resolved_root = workspace_root.resolve()
-        if not abs_dir.is_relative_to(resolved_root):
+        if not _member_path_is_under_root(workspace_root, rel_path):
+            abs_dir = (workspace_root / rel_path).resolve()
+            resolved_root = workspace_root.resolve()
             raise MilpaError(
                 WS_MEMBER_PATH_ESCAPE,
                 f"workspace member {rel_path!r} resolves outside the workspace root "
@@ -365,6 +398,7 @@ def load_workspace_from_manifest(
                 workspace_root=str(resolved_root),
             )
 
+        abs_dir = (workspace_root / rel_path).resolve()
         declared_abs.add(abs_dir)
 
         if not abs_dir.is_dir():

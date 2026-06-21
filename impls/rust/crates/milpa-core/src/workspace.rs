@@ -21,7 +21,8 @@ fn ws(code: &'static str, message: impl Into<String>) -> MilpaError {
 
 /// Lexically normalize a path by resolving `..` and `.` components without
 /// touching the filesystem (unlike `canonicalize`, which requires paths to exist).
-/// Used for the `WS-MEMBER-PATH-ESCAPE` containment check.
+/// Used as the fallback for non-existent paths in the `WS-MEMBER-PATH-ESCAPE`
+/// containment check.
 fn normalize_lexically(path: &std::path::Path) -> std::path::PathBuf {
     use std::path::Component;
     let mut normalized = std::path::PathBuf::new();
@@ -41,15 +42,76 @@ fn normalize_lexically(path: &std::path::Path) -> std::path::PathBuf {
     normalized
 }
 
-/// Return true if `candidate` is contained within `root` (lexically, after
-/// normalizing both paths).  A path that *equals* the root (same directory)
-/// is NOT considered contained — workspace root cannot be a member.
+/// Return true if `candidate` is at or within `root` — inclusive (equal-to-root
+/// returns true, letting the caller fall through to the `WS-MEMBER-IS-WORKSPACE`
+/// check).
+///
+/// Algorithm (Option A — matches Python `workspace.py` `resolve(strict=False)`):
+///   1. Canonicalize `root` (root always exists at load time).
+///   2. Resolve `candidate` to a real path via one of three strategies:
+///      a. `candidate.exists()` (follows symlinks) → true: the target is reachable,
+///         use `canonicalize()` which follows all symlinks to the true location.
+///      b. `candidate` is a **dangling symlink** (lstat succeeds; stat fails):
+///         read the link target, canonicalize the parent dir (lexical fallback if
+///         the parent also doesn't exist), join the target, normalize lexically.
+///         This mirrors Python's `resolve(strict=False)` which follows symlinks for
+///         existing portions and normalises `..` lexically for the rest — a dangling
+///         `link -> ../../outside-nonexistent` still resolves to a path outside the
+///         root and must yield WS-MEMBER-PATH-ESCAPE, not WS-MEMBER-DIR-MISSING.
+///      c. Neither (ordinary non-existent path): `normalize_lexically` so that
+///         `../../escape` is still caught and a non-existent normal path inside the
+///         workspace is NOT a false escape (it proceeds to `WS-MEMBER-DIR-MISSING`).
+///   3. Return `real_cand.starts_with(real_root)` — inclusive.
 fn is_under_root(root: &std::path::Path, candidate: &std::path::PathBuf) -> bool {
-    let norm_root = normalize_lexically(root);
-    let norm_cand = normalize_lexically(candidate);
-    // starts_with checks every component, so /a/b starts_with /a/b is true (same dir).
-    // We want strict containment: candidate must have at least one extra component.
-    norm_cand != norm_root && norm_cand.starts_with(&norm_root)
+    // Step 1: canonicalize root (always exists).
+    let real_root = match root.canonicalize() {
+        Ok(r) => r,
+        // If root itself can't be canonicalized (extremely unusual in practice),
+        // fall back to lexical comparison against the original root path.
+        Err(_) => normalize_lexically(root),
+    };
+
+    // Step 2: resolve candidate.
+    let real_cand = if candidate.exists() {
+        // (a) Existing target (follows symlinks through the whole chain).
+        match candidate.canonicalize() {
+            Ok(c) => c,
+            Err(_) => normalize_lexically(candidate),
+        }
+    } else {
+        // `candidate.exists()` uses stat (follows symlinks).  If it returned
+        // false, the path either doesn't exist at all OR is a dangling symlink
+        // (lstat would succeed; stat fails because the target is absent).
+        // Dangling symlink: read the link, resolve its target relative to the
+        // canonicalized parent, normalise lexically.  This mirrors Python's
+        // `resolve(strict=False)` so that a dangling `link -> ../../outside`
+        // resolves outside the root and is correctly rejected.
+        let dangling_resolved = candidate
+            .symlink_metadata()  // lstat — succeeds even when target is missing
+            .ok()
+            .filter(|m| m.file_type().is_symlink())
+            .and_then(|_| std::fs::read_link(candidate).ok())
+            .map(|link_target| {
+                // The link target may be relative — it must be resolved relative
+                // to the symlink's own parent directory.
+                let parent = candidate.parent().unwrap_or(candidate.as_path());
+                let real_parent = match parent.canonicalize() {
+                    Ok(p) => p,
+                    Err(_) => normalize_lexically(parent),
+                };
+                normalize_lexically(&real_parent.join(&link_target))
+            });
+
+        match dangling_resolved {
+            Some(r) => r,
+            // (c) Ordinary non-existent path: lexical normalization only.
+            None => normalize_lexically(candidate),
+        }
+    };
+
+    // Step 3: inclusive starts_with (equal-to-root → true → NOT an escape;
+    // falls through to the WS-MEMBER-IS-WORKSPACE manifest-parse check).
+    real_cand.starts_with(&real_root)
 }
 
 /// A workspace member as it exists on disk: its intrinsic `name` (from the
@@ -114,7 +176,11 @@ pub fn load_workspace(root: &Path) -> Result<LoadedWorkspace, MilpaError> {
             ));
         }
         let member_dir = root.join(member_path);
-        // §WS-MEMBER-PATH-ESCAPE: lexical containment check before dir-existence.
+        // §WS-MEMBER-PATH-ESCAPE: canonicalize-based containment check before
+        // dir-existence.  is_under_root uses canonicalize (follows symlinks for
+        // existing paths, lexical fallback for non-existent paths) and returns
+        // true when candidate == root (inclusive), letting root-resolving paths
+        // fall through to the WS-MEMBER-IS-WORKSPACE manifest-parse check.
         if !is_under_root(root, &member_dir) {
             return Err(ws(
                 "WS-MEMBER-PATH-ESCAPE",
@@ -123,16 +189,24 @@ pub fn load_workspace(root: &Path) -> Result<LoadedWorkspace, MilpaError> {
                 ),
             ));
         }
-        if !member_dir.is_dir() {
+        // Use a lexically-normalized path for filesystem operations (is_dir,
+        // milpa.kdl discovery).  This handles "pkg/.." style paths where "pkg"
+        // may not exist on disk — the raw join fails is_dir() because the OS
+        // can't traverse a non-existent intermediate component.
+        //
+        // The stored `directory` in LoadedMember keeps the original raw join so
+        // nim.cfg generation is not affected.
+        let effective_dir = normalize_lexically(&member_dir);
+        if !effective_dir.is_dir() {
             return Err(ws(
                 "WS-MEMBER-DIR-MISSING",
                 format!(
                     "workspace member {member_path:?} has no directory at {}",
-                    member_dir.display()
+                    effective_dir.display()
                 ),
             ));
         }
-        let member_kdl = member_dir.join("milpa.kdl");
+        let member_kdl = effective_dir.join("milpa.kdl");
         if !member_kdl.is_file() {
             return Err(ws(
                 "WS-MEMBER-NO-MANIFEST",
@@ -215,7 +289,7 @@ pub fn load_workspace_from_manifest(
             ));
         }
         let member_dir = root.join(member_path);
-        // §WS-MEMBER-PATH-ESCAPE: lexical containment check before dir-existence.
+        // §WS-MEMBER-PATH-ESCAPE: canonicalize-based containment check before dir-existence.
         if !is_under_root(root, &member_dir) {
             return Err(ws(
                 "WS-MEMBER-PATH-ESCAPE",
@@ -224,16 +298,18 @@ pub fn load_workspace_from_manifest(
                 ),
             ));
         }
-        if !member_dir.is_dir() {
+        // Lexically normalize for filesystem operations only (see load_workspace above).
+        let effective_dir = normalize_lexically(&member_dir);
+        if !effective_dir.is_dir() {
             return Err(ws(
                 "WS-MEMBER-DIR-MISSING",
                 format!(
                     "workspace member {member_path:?} has no directory at {}",
-                    member_dir.display()
+                    effective_dir.display()
                 ),
             ));
         }
-        let member_kdl = member_dir.join("milpa.kdl");
+        let member_kdl = effective_dir.join("milpa.kdl");
         if !member_kdl.is_file() {
             return Err(ws(
                 "WS-MEMBER-NO-MANIFEST",

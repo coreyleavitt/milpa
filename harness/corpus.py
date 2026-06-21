@@ -73,6 +73,14 @@ KNOWN_LIMITATIONS: dict[str, str] = {
     # MILPA_INDEX_URL="" for fixtures with no index.kdl. Both fixtures pass
     # black-box on python+rust with zero divergence, so they are no longer
     # limitations.
+    #
+    # NOTE: fixture-288-ws-member-symlink-escape was previously listed here.
+    # It is now REMOVED — the black-box CLI harness drives it correctly (both
+    # python + rust CLI pass WS-MEMBER-PATH-ESCAPE with zero divergence).
+    # The in-process guards in test_conformance.py and milpa-conformance/runner.rs
+    # remain (those adapters read milpa.kdl from fx.dir directly and do not
+    # honour the project-dir control file — they are covered by impl-internal
+    # unit tests instead).
 }
 
 

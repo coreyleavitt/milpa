@@ -111,6 +111,16 @@ const CLI_DISCOVERY_GUARD: &[&str] = &[
     "fixture-156-frozen-no-lockfile",
     // LOCK-FILE-NOT-FOUND via show: cmd:show is CliOnly but listed for completeness.
     "fixture-157-lock-file-not-found",
+    // WS-MEMBER-PATH-ESCAPE (symlink case): workspace root is a *subdirectory*
+    // of the fixture tree (project-dir=workspace-root control file).  The
+    // black-box CLI harness IS project-dir-aware and drives this fixture correctly
+    // (both impls pass, zero divergence — fixture-288 removed from harness/corpus.py
+    // KNOWN_LIMITATIONS).  The in-process runner always reads milpa.kdl from
+    // fx.dir directly and gets E2E-MANIFEST-UNREADABLE, so it stays in this guard.
+    // Symlink escape behavior is also covered by impl-internal unit tests in both impls
+    // (workspace_tests::member_symlink_escaping_root_yields_path_escape and
+    // workspace_tests::dangling_symlink_outside_root_yields_path_escape).
+    "fixture-288-ws-member-symlink-escape",
 ];
 
 /// Run one fixture against `target` in `scratch` and return the verdict.

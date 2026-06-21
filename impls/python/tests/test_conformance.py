@@ -125,6 +125,16 @@ _CLI_DISCOVERY_GUARD_NAMES: frozenset[str] = frozenset({
     # FROZEN-NO-LOCKFILE: cmd:frozen but no milpa.lock; CLI guard checks existence
     # before calling resolve_frozen; the in-process adapter returns E2E-LOCKFILE-UNREADABLE.
     "fixture-156-frozen-no-lockfile",
+    # WS-MEMBER-PATH-ESCAPE (symlink case): fixture uses project-dir=workspace-root
+    # so the workspace root is a subdirectory of the fixture tree.  The black-box
+    # CLI harness IS project-dir-aware and drives this fixture correctly (both
+    # impls pass, zero divergence — fixture-288 removed from harness/corpus.py
+    # KNOWN_LIMITATIONS).  The in-process adapter always reads milpa.kdl from
+    # fixture_dir directly and gets E2E-MANIFEST-UNREADABLE (no milpa.kdl at the
+    # fixture root), so it stays in this guard.  The symlink escape behavior is
+    # also covered by impl-internal unit tests in both impls
+    # (test_ws_security_parity.py + workspace_tests.rs).
+    "fixture-288-ws-member-symlink-escape",
 })
 
 

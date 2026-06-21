@@ -68,6 +68,120 @@ fn dot_before_escape_check_ordering() {
     assert_eq!(code(&tmp), "WS-MEMBER-DOT");
 }
 
+/// R2-2: A member path "pkg/.." resolves lexically to the workspace root.
+/// The inclusive containment check must NOT treat this as PATH-ESCAPE; it must
+/// fall through to WS-MEMBER-IS-WORKSPACE (because root/milpa.kdl is a workspace).
+///
+/// Previously the old `is_under_root` returned false for equal-to-root (strict
+/// `!=` guard), producing WS-MEMBER-PATH-ESCAPE.  After the fix it returns true
+/// (inclusive `starts_with`), matching Python behavior.
+#[test]
+fn member_resolves_to_root_yields_is_workspace() {
+    // "pkg/.." — lexically reduces to root; "pkg" dir may or may not exist.
+    let tmp = workspace_dir("workspace {\n    member \"pkg/..\"\n}\n", &[]);
+    assert_eq!(code(&tmp), "WS-MEMBER-IS-WORKSPACE");
+}
+
+/// R2-1: A member that is an existing symlink whose real target escapes the
+/// workspace root raises WS-MEMBER-PATH-ESCAPE.
+///
+/// This requires filesystem support for symlinks.  Uses std::os::unix::fs::symlink.
+#[test]
+#[cfg(unix)]
+fn member_symlink_escaping_root_yields_path_escape() {
+    use std::os::unix::fs::symlink;
+
+    // Layout:
+    //   <tmp>/
+    //     workspace-root/
+    //       milpa.kdl      (workspace declaring member "symlink-member")
+    //       symlink-member -> ../outside-root  (symlink)
+    //     outside-root/    (real directory outside workspace-root)
+    let outer = tempfile::tempdir().unwrap();
+    let ws_root = outer.path().join("workspace-root");
+    let outside = outer.path().join("outside-root");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(
+        outside.join("milpa.kdl"),
+        "name \"escaped\"\nkind \"library\"\n",
+    ).unwrap();
+    std::fs::write(
+        ws_root.join("milpa.kdl"),
+        "workspace {\n    member \"symlink-member\"\n}\n",
+    ).unwrap();
+    // Create symlink: workspace-root/symlink-member -> ../outside-root
+    symlink("../outside-root", ws_root.join("symlink-member")).unwrap();
+
+    let result = load_workspace(&ws_root).unwrap_err();
+    assert_eq!(result.code(), "WS-MEMBER-PATH-ESCAPE");
+}
+
+/// Dangling-symlink OUTSIDE root → WS-MEMBER-PATH-ESCAPE.
+///
+/// A member dir that is a symlink pointing to a nonexistent path OUTSIDE the
+/// workspace root must yield WS-MEMBER-PATH-ESCAPE, not WS-MEMBER-DIR-MISSING.
+/// Python's `resolve(strict=False)` follows the dangling link and resolves to
+/// the (nonexistent) outside target; `is_relative_to(root)` is False →
+/// WS-MEMBER-PATH-ESCAPE.  Rust must match: before this fix, `candidate.exists()`
+/// returned false (stat follows the dead link) → fell to `normalize_lexically` →
+/// treated the symlink as a plain dir → starts_with(root) true → WRONG slug.
+#[test]
+#[cfg(unix)]
+fn dangling_symlink_outside_root_yields_path_escape() {
+    use std::os::unix::fs::symlink;
+
+    // Layout:
+    //   <tmp>/
+    //     workspace-root/
+    //       milpa.kdl      (workspace declaring member "dangle-out")
+    //       dangle-out -> ../../outside-nonexistent  (dangling: target absent)
+    let outer = tempfile::tempdir().unwrap();
+    let ws_root = outer.path().join("workspace-root");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    std::fs::write(
+        ws_root.join("milpa.kdl"),
+        "workspace {\n    member \"dangle-out\"\n}\n",
+    ).unwrap();
+    // Create dangling symlink: target does NOT exist.
+    symlink("../../outside-nonexistent", ws_root.join("dangle-out")).unwrap();
+    // Confirm the target really is missing (so candidate.exists() returns false).
+    assert!(!ws_root.join("dangle-out").exists(), "target must be absent for this test to be meaningful");
+
+    let result = load_workspace(&ws_root).unwrap_err();
+    assert_eq!(result.code(), "WS-MEMBER-PATH-ESCAPE");
+}
+
+/// Dangling-symlink INSIDE root → WS-MEMBER-DIR-MISSING (not PATH-ESCAPE).
+///
+/// When the dangling symlink's target resolves lexically to a path INSIDE the
+/// workspace root (e.g. `link -> nonexistent-subdir`), the containment check
+/// passes (not an escape) and the caller proceeds to the dir-existence check,
+/// which sees a missing directory and raises WS-MEMBER-DIR-MISSING.
+#[test]
+#[cfg(unix)]
+fn dangling_symlink_inside_root_yields_dir_missing() {
+    use std::os::unix::fs::symlink;
+
+    // Layout:
+    //   <tmp>/
+    //     workspace-root/
+    //       milpa.kdl    (workspace declaring member "dangle-in")
+    //       dangle-in -> nonexistent-inside  (dangling: target absent but INSIDE root)
+    let outer = tempfile::tempdir().unwrap();
+    let ws_root = outer.path().join("workspace-root");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    std::fs::write(
+        ws_root.join("milpa.kdl"),
+        "workspace {\n    member \"dangle-in\"\n}\n",
+    ).unwrap();
+    symlink("nonexistent-inside", ws_root.join("dangle-in")).unwrap();
+    assert!(!ws_root.join("dangle-in").exists(), "target must be absent");
+
+    let result = load_workspace(&ws_root).unwrap_err();
+    assert_eq!(result.code(), "WS-MEMBER-DIR-MISSING");
+}
+
 #[test]
 fn member_dir_missing() {
     // member "a" declared but no `a/` directory created.

@@ -1232,7 +1232,11 @@ A workspace member directory has no milpa.kdl.
 
 A workspace member path resolves outside the workspace root.
 
-**Triggered:** load_workspace resolves a member path (after normalizing `..` components) and finds it escapes the workspace root directory. This is a security boundary: a workspace must not be able to read or incorporate manifests from arbitrary locations on the filesystem. The check runs after the dot-path check (so `"."` yields `WS-MEMBER-DOT`, not `WS-MEMBER-PATH-ESCAPE`) and before the directory-existence check (so an escaping path yields `WS-MEMBER-PATH-ESCAPE` regardless of whether the target directory exists).
+**Triggered:** load_workspace resolves a member path and finds it escapes the workspace root directory. This is a security boundary: a workspace must not be able to read or incorporate manifests from arbitrary locations on the filesystem.
+
+Resolution algorithm (Option A): the workspace root is canonicalized (symlinks followed). For the candidate member path, if the path exists on disk it is canonicalized (symlinks followed) to its real location; if it does not yet exist, `..` components are normalized lexically without filesystem access. The resolved candidate is an escape iff it does not start with the resolved root — this comparison is **inclusive**: a candidate that resolves to exactly the root is NOT an escape (it falls through to the `WS-MEMBER-IS-WORKSPACE` manifest-parse check, which fires because the root's own `milpa.kdl` is a workspace document). This inclusive semantics is what ensures `"pkg/.."` (which lexically reduces to the root) yields `WS-MEMBER-IS-WORKSPACE`, not `WS-MEMBER-PATH-ESCAPE`.
+
+The check runs after the dot-path check (so `"."` yields `WS-MEMBER-DOT`, not `WS-MEMBER-PATH-ESCAPE`) and before the directory-existence check (so an escaping path yields `WS-MEMBER-PATH-ESCAPE` regardless of whether the target directory exists).
 
 ### `WS-NO-MANIFEST`
 
