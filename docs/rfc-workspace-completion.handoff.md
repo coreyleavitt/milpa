@@ -10,10 +10,34 @@
   `8cd9ca6` (containment Option A: R2-1 symlink incl. dangling, R2-2 equal-to-root→IS-WORKSPACE,
   D-3 Python helper dedup, spec rewrite, fixtures 286+288). Gates: Py 2134, Rust green zero divergence,
   fixture-288 differential both-pass, bijection green.
-- **ROUND 3 re-review IN FLIGHT** (agents Security `a192aeaec0930b418`, Correctness `a461e127205993322`,
-  Design `a6b19a2fabf940d4c`) — scoped to `git diff 3803418..HEAD`, containment logic flagged for
-  hardest scrutiny (dangling-symlink branch edge cases: multi-level chains, absolute targets, TOCTOU).
-  After R3: verify any C/H/M (Step 4), fix to floor, else report Lows F22–F29 + R2 L1–L3 and STOP.
+- **ROUND 3 re-review DONE — 0 Critical/High.** Security: containment SOUND, 8 vectors verified, no
+  bypass. Correctness: all clean; found case-(c) symlinked-root divergence (Rust lexical cand vs
+  canonical root → false PATH-ESCAPE for `pkg/..` under a symlinked root; Python correct → real
+  cross-impl divergence, Linux-reproducible). Design: 0 bugs; asked for one deep `best_effort_resolve`
+  helper + spec resolve-semantics + in-process project-dir coverage.
+- **R3 FOLLOW-UP COMMITTED** (`e40c99d`): `best_effort_resolve` deep helper (canonicalize longest
+  existing prefix + lexical remainder ≡ Python resolve(strict=False)); fixes symlinked-root divergence;
+  +Linux-reproducible parity tests both impls; +normative spec sentence. Filed #167. Gates: Py 2136,
+  Rust green zero divergence, bijection 8/8.
+- **ROUND 4 final verify DONE — 0 Critical/High.** Security `a31c83a79ad101b93`: SOUND (cycle
+  terminates depth-1, unwrap_or unreachable, all escape vectors → PATH-ESCAPE, starts_with
+  component-wise). Correctness `a979765bfcb511fff`: 6 main cases correct; negligible cyclic-symlink
+  slug divergence (FILED #168 — both reject, Rust safer, can't be milpa-created); Low: Rust lacks a
+  `load_workspace_from_manifest` symlinked-root test. Design `a024ea00a6dbff4f2`: deep-helper goal MET;
+  confirmed mid-path dangling Medium (I verified empirically: Python follows mid-path dangling →
+  PATH-ESCAPE, Rust → DIR-MISSING); 2 Lows (unwrap_or comment, redundant symlink_metadata syscall).
+- **R4 FOLLOW-UP IN FLIGHT** (agent `ae8798e10c0567be5`): one-line fix — ancestor-walk branch of
+  `best_effort_resolve` delegates to `best_effort_resolve(&ancestor)` instead of direct canonicalize,
+  closing the GENERAL single-hop dangling case (mid-path + final) and unifying the dual-mechanism.
+  +mid-path parity test both impls, +from_manifest Rust symlinked-root test (closes the Low), +unwrap_or
+  comment, +spec generalized (dangling anywhere, single-hop; multi-hop/cycles = #168). Terminates
+  (ancestor strictly shorter). After agent: verify+commit; run FINAL re-review R5 (Security+Design
+  +Correctness, scoped to the one-line diff) — should be clean → FLOOR → report Lows + STOP.
+- **Commits this code-review (Stage 4):** R1 `d4f5024`,`5d536d5`,`c051bd4`,`5004632`,`c6e174b`,`bd9d3e7`,
+  `3803418` · R2 `0237166`,`8cd9ca6` · R3 `e40c99d` · R4-followup (pending). Issues filed: #167, #168.
+- **Remaining Lows to report at floor:** F22–F29 (R1 deferred), R2 L1–L3 (fixpoint-param/atomically-
+  comment/strip_dep_pin-docstring), R4 Lows (unwrap_or comment [being added], redundant syscall in
+  ancestor-walk loop start). Mandate = "fix through Medium, leave Lows."
 - **(historical) Resume (Stage 4):** containment-unification agent `a515848642724bbdd` DONE —
   Rust `is_under_root`→canonicalize+inclusive starts_with; Python D-3 helper dedup; spec normative
   rewrite; fixture-286 (equal-to-root→IS-WORKSPACE, differentially gated); fixture-288 symlink-escape
