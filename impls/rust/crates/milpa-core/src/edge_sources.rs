@@ -437,12 +437,18 @@ pub fn edgeset_to_terms(
                     Some(n) => n,
                     None => continue, // malformed URL; skip silently (resolver handles error paths)
                 };
+                // Dedup the SOLVER TERM only (one Term per name).
                 if !seen_dep_names.contains(&name) {
                     deps.push(SolverDep::new(name.clone(), VersionSet::eq(url_dep_version.clone())));
                     requires_names.push(name.clone());
-                    url_requires.push((u.url.clone(), u.ref_.clone()));
                     seen_dep_names.insert(name.clone());
                 }
+                // ALWAYS record the url_require so the caller reconstructs an
+                // Item::Url per distinct provenance — two URLs stripping to the
+                // same name must both reach the provenance gate downstream
+                // (RES-PROVENANCE-CONFLICT). Mirrors edgeset_to_extracted; the
+                // gate (not this dedup) decides suppress-vs-conflict.
+                url_requires.push((u.url.clone(), u.ref_.clone()));
                 // S4: record predicates if non-empty (accumulate, do not overwrite).
                 if !u.predicates.is_empty() {
                     requires_predicates.entry(name).or_default().push(u.predicates.clone());

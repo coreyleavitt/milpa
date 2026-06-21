@@ -2718,17 +2718,26 @@ impl<'a> ResolveProvider<'a> {
             match entry {
                 RequireEntry::Url(u) => {
                     let dep_name = name_from_url(&u.url)?;
+                    // Dedup the SOLVER TERM only — a dep name must appear exactly
+                    // once as a Term.
                     if !seen_dep_names.contains(&dep_name) {
                         deps.push(SolverDep::new(dep_name.clone(), eq_sentinel()));
                         requires_names.push(dep_name.clone());
-                        // S4b: reconstruct flag_requests from UrlRequire so
-                        // process_url sees them for multi-consumer union (§3.1.3).
-                        // FlagRequest is the SSOT (milpa-types); no conversion needed.
-                        let mut url_d = url_dep(&dep_name, &u.url, &u.ref_);
-                        url_d.flag_requests = u.flag_requests.clone();
-                        items.push(Item::Url(url_d));
                         seen_dep_names.insert(dep_name.clone());
                     }
+                    // ALWAYS enqueue the Item::Url so the provenance gate
+                    // (process_url) sees every distinct provenance. Two URLs that
+                    // strip to the same dep name must both reach gate(): same
+                    // provenance → Gate::Suppress, different provenance →
+                    // Gate::Conflict (RES-PROVENANCE-CONFLICT, fixture-099).
+                    // Deduping the item here hid the second provenance and
+                    // suppressed the conflict (parity bug vs Python's BFS).
+                    // S4b: reconstruct flag_requests from UrlRequire so process_url
+                    // sees them for multi-consumer union (§3.1.3). FlagRequest is the
+                    // SSOT (milpa-types); no conversion needed.
+                    let mut url_d = url_dep(&dep_name, &u.url, &u.ref_);
+                    url_d.flag_requests = u.flag_requests.clone();
+                    items.push(Item::Url(url_d));
                     // S4: accumulate predicates if non-empty (do not overwrite).
                     if !u.predicates.is_empty() {
                         requires_predicates.entry(dep_name).or_default().push(u.predicates.clone());
