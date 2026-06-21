@@ -64,7 +64,7 @@ from milpa.lockfile import (
     ResolvedDep,
     ResolvedGraph,
 )
-from milpa.manifest import Manifest, NamedDep
+from milpa.manifest import Manifest, MemberDep, NamedDep
 from milpa.version import VersionSet, parse_version
 from milpa.workspace import LoadedWorkspace
 
@@ -350,6 +350,14 @@ def resolve_workspace_frozen(
         filtered_member_manifest = filter_manifest(member.manifest, _frozen_ctx)
         all_member_deps = list(filtered_member_manifest.deps) + list(filtered_member_manifest.dev_deps)
         for dep in all_member_deps:
+            # MemberDep entries are workspace-topology edges validated by
+            # conditions 9 (FROZEN-MEMBER-NOT-IN-WORKSPACE) and 10
+            # (FROZEN-MEMBER-IDENTITY-DRIFT) on the lockfile side.  Including
+            # them here would fire FROZEN-MANIFEST-DEP-NOT-IN-LOCK with a
+            # misleading "dep '<name>' has no entry in lockfile" message that
+            # looks like a missing external dep (F6 fix).
+            if isinstance(dep, MemberDep):
+                continue
             # Condition 2: FROZEN-MANIFEST-DEP-NOT-IN-LOCK
             if dep.name not in locked_by_name:
                 raise MilpaError(

@@ -217,7 +217,6 @@ class TestDataModel:
         p = Profile.from_environment(nim_version="2.0.8", milpa_version="0.1.0")
         assert p.nim == "2.0.8"
         assert p.milpa == "0.1.0"
-        assert isinstance(p.flags, frozenset)
 
     def test_workspace_manifest_dataclass(self) -> None:
         wm = WorkspaceManifest(members=("a", "b"))

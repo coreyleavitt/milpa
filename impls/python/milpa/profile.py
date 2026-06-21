@@ -6,9 +6,9 @@ DATA TYPES ONLY.  No predicate evaluation, no subprocess, no I/O.
 (default ``"0.0.0"``); it NEVER spawns ``nim --version``.  The subprocess
 that queries the live Nim version lives in ``cli.py`` and is passed in.
 
-Predicate evaluation (``_filter_manifest_by_profile``) is a resolver step
-(Stage 9), run before the solver input is built.  This module represents
-predicates as data only.
+Predicate evaluation (``filter_manifest``) is a resolver step (Stage 9),
+run before the solver input is built.  This module represents predicates
+as data only.
 
 RFC §4.2 boundary criteria:
   - No imports from ``manifest.py``, ``solver.py``, or any I/O layer.
@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 import platform as _platform
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
 # Platform / arch normalization
@@ -74,10 +74,6 @@ class Profile:
                 Injected, never queried via subprocess here.
       milpa:    milpa version string, or ``None``.  Overridable via
                 ``MILPA_TARGET_MILPA`` env var.
-      flags:    Frozenset of active feature flag names (default-true +
-                explicitly enabled).  Empty set at manifest-parse time;
-                the resolver populates this after reading the ``flags``
-                block.
 
     An absent axis (``None``) means every predicate over that axis evaluates
     to ``false`` regardless of negation (§3.C / §6 resolver-semantics).
@@ -96,7 +92,6 @@ class Profile:
     arch: str | None
     nim: str | None
     milpa: str | None
-    flags: frozenset[str] = field(default_factory=frozenset)
 
     @classmethod
     def partial(
@@ -106,7 +101,6 @@ class Profile:
         arch: str | None = None,
         nim: str | None = None,
         milpa: str | None = None,
-        flags: frozenset[str] | None = None,
     ) -> "Profile":
         """Explicit partial constructor — any axis not provided is ``None``.
 
@@ -123,7 +117,6 @@ class Profile:
             arch=arch,
             nim=nim,
             milpa=milpa,
-            flags=flags if flags is not None else frozenset(),
         )
 
     @classmethod
@@ -132,7 +125,6 @@ class Profile:
         *,
         nim_version: str | None = None,
         milpa_version: str = "0.0.0",
-        flags: frozenset[str] | None = None,
     ) -> "Profile":
         """Construct a ``Profile`` from the current environment.
 
@@ -159,5 +151,4 @@ class Profile:
             arch=effective_arch,
             nim=effective_nim,
             milpa=effective_milpa,
-            flags=flags if flags is not None else frozenset(),
         )

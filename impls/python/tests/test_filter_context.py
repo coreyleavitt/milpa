@@ -515,7 +515,6 @@ class TestProfilePartialConstructor:
         assert p.arch is None
         assert p.nim is None
         assert p.milpa is None
-        assert p.flags == frozenset()
 
     def test_partial_one_axis_set(self):
         from milpa.profile import Profile
@@ -532,11 +531,6 @@ class TestProfilePartialConstructor:
         assert p.arch == "amd64"
         assert p.nim == "2.0.0"
         assert p.milpa == "0.1.0"
-
-    def test_partial_flags_propagated(self):
-        from milpa.profile import Profile
-        p = Profile.partial(platform="linux", flags=frozenset({"tls"}))
-        assert p.flags == frozenset({"tls"})
 
     def test_from_environment_no_env_coupling(self):
         """Profile.partial has no env-var coupling; Profile.from_environment does."""
