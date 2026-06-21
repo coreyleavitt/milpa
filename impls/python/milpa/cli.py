@@ -2764,11 +2764,30 @@ def cmd_workspace_remove_member(
 
     # Resolve name_or_path to a member declaration path in the workspace manifest.
     # Accept both a member package NAME (e.g. "liba") and a member PATH
-    # (e.g. "member-a" or relative path).
+    # (e.g. "member-a", "./member-a", or an absolute path).
+    #
+    # F19: also handle CWD-relative paths (e.g. "./member-b") by resolving against
+    # root so that `milpa workspace remove-member ./member-b` works identically
+    # to `milpa workspace remove-member member-b`.
     matched_path: str | None = None
     matched_name: str | None = None
+
+    # Pre-compute the CWD-resolved abs path for relative args (e.g. "./member-b").
+    _nop = Path(name_or_path)
+    _cwd_resolved: Path | None = None
+    if not _nop.is_absolute():
+        try:
+            _cwd_resolved = (root.resolve() / _nop).resolve()
+        except (OSError, ValueError):
+            _cwd_resolved = None
+
     for m in current_ws.members:
         candidate_paths = {m.rel_path, str(m.abs_dir), str(m.abs_dir.relative_to(root.resolve()) if m.abs_dir.is_relative_to(root.resolve()) else m.abs_dir)}
+        # CWD-relative arm: if name_or_path resolves (via root) to this member's abs dir, accept it.
+        if _cwd_resolved is not None and _cwd_resolved == m.abs_dir.resolve():
+            matched_path = m.rel_path
+            matched_name = m.manifest.name
+            break
         if name_or_path == m.manifest.name or name_or_path in candidate_paths or name_or_path == m.rel_path:
             matched_path = m.rel_path
             matched_name = m.manifest.name

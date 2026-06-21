@@ -549,7 +549,21 @@ pub fn check_workspace_frozen_active_flags_mismatch(
         let member_active: HashSet<String> = if let Some(ref seed) = ws_cli_seed {
             flag_enables_closure(&member.manifest.flags, seed)
         } else {
-            HashSet::new()
+            // No workspace CLI seed: fall back to the MEMBER's own default-true
+            // flags as seed — mirrors FilterCtx::build's None branch so that a
+            // member whose default-true flag gates a dep is checked correctly.
+            let member_default_seed: HashSet<String> = member
+                .manifest
+                .flags
+                .iter()
+                .filter(|f| f.default)
+                .map(|f| f.name.clone())
+                .collect();
+            if member_default_seed.is_empty() {
+                HashSet::new()
+            } else {
+                flag_enables_closure(&member.manifest.flags, &member_default_seed)
+            }
         };
         let member_active_set: std::collections::BTreeSet<&str> =
             member_active.iter().map(|s| s.as_str()).collect();

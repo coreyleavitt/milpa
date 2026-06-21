@@ -2273,3 +2273,124 @@ fn activation_source_cli_serializes_as_cli() {
         vec!["default", "edge_request", "enables_rule", "cli"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// F5: check_workspace_frozen_active_flags_mismatch — member default-seed
+// ---------------------------------------------------------------------------
+
+/// Helper: build a LoadedWorkspace on disk with one member whose milpa.kdl is
+/// `member_kdl`.  Returns (TempDir, LoadedWorkspace).
+fn ws_with_one_member(
+    member_name: &str,
+    member_kdl: &str,
+) -> (tempfile::TempDir, crate::workspace::LoadedWorkspace) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("milpa.kdl"),
+        format!("workspace {{\n    member \"{member_name}\"\n}}\n"),
+    )
+    .unwrap();
+    let member_dir = root.join(member_name);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    std::fs::write(member_dir.join("milpa.kdl"), member_kdl).unwrap();
+    let ws = crate::workspace::load_workspace(root).unwrap();
+    (tmp, ws)
+}
+
+/// F5 regression: when no workspace-root CLI seed is supplied, the per-member
+/// loop must use the MEMBER's own default-true flags as seed (mirrors
+/// FilterCtx::build).  A member with `flags { extra default=#true }` and a dep
+/// `{ flag "extra" }` should be detected as mismatching when the lockfile omits
+/// that dep.
+///
+/// Previously the loop fell through to `HashSet::new()` (empty active set),
+/// meaning the dep was treated as not-admitted → no mismatch detected even
+/// though the default-true flag activates it.
+#[test]
+fn f5_workspace_frozen_member_default_seed_detected() {
+    // Member manifest: flag "extra" default=#true, dep "optfoo" gated by `when flag="extra"`.
+    // The correct KDL syntax for flag-gated deps is the `when` block form
+    // (§6.3 NORMATIVE); `flag "extra"` as a child node on a dep is a FlagRequest,
+    // not a predicate gate.
+    let member_kdl = r#"name "memb"
+kind "library"
+flags {
+    extra default=#true
+}
+deps {
+    when flag="extra" {
+        optfoo git=(url)"https://example.com/optfoo.git" ref="main"
+    }
+}
+"#;
+    let (_tmp, ws) = ws_with_one_member("memb", member_kdl);
+
+    // Lockfile does NOT include "optfoo" — mismatches the default-true activation.
+    let lock = Lockfile {
+        version: milpa_types::LOCKFILE_SCHEMA_VERSION,
+        strategy: "maxver".into(),
+        deps: vec![], // optfoo absent
+    };
+
+    let features = std::collections::BTreeSet::new();
+    let err = crate::resolver::check_workspace_frozen_active_flags_mismatch(
+        &ws, &lock, &features, false, false,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        "FROZEN-ACTIVE-FLAGS-MISMATCH",
+        "F5: member default-seed mismatch must be detected when ws CLI seed is absent"
+    );
+}
+
+/// F5 inverse: when the lockfile INCLUDES the flag-gated dep (consistent with
+/// member's default-true activation), no mismatch should be raised.
+#[test]
+fn f5_workspace_frozen_member_default_seed_consistent() {
+    let member_kdl = r#"name "memb"
+kind "library"
+flags {
+    extra default=#true
+}
+deps {
+    when flag="extra" {
+        optfoo git=(url)"https://example.com/optfoo.git" ref="main"
+    }
+}
+"#;
+    let (_tmp, ws) = ws_with_one_member("memb", member_kdl);
+
+    // Lockfile INCLUDES "optfoo" — consistent with default-true activation.
+    let lock = Lockfile {
+        version: milpa_types::LOCKFILE_SCHEMA_VERSION,
+        strategy: "maxver".into(),
+        deps: vec![
+            milpa_types::LockedDep {
+                name: "optfoo".into(),
+                identity: None,
+                version: "0.1.0".into(),
+                src_dir: "src".into(),
+                requires: vec![],
+                provenances: vec![milpa_types::ProvenanceRecord::Git {
+                    url: "https://example.com/optfoo.git".into(),
+                    ref_spec: Some("main".into()),
+                    commit_sha: Some("abc123".into()),
+                    origin: "observed".into(),
+                }],
+                active_flags: vec![],
+                dep_decl: None,
+                cond_requires: vec![],
+                aliases: vec![],
+            },
+        ],
+    };
+
+    let features = std::collections::BTreeSet::new();
+    crate::resolver::check_workspace_frozen_active_flags_mismatch(
+        &ws, &lock, &features, false, false,
+    )
+    .expect("F5: consistent lock must pass frozen check");
+}

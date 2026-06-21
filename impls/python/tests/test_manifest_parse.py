@@ -610,8 +610,8 @@ class TestMemberDepParse:
 
     def test_member_dep_when_gated_corpus(self) -> None:
         """Corpus fixture: MAN-MEMBER-WHEN-GATED (member inside when block)."""
-        text = fixture_kdl("fixture-190-man-member-when-gated")
-        expected = fixture_error("fixture-190-man-member-when-gated")
+        text = fixture_kdl("fixture-281-man-member-when-gated")
+        expected = fixture_error("fixture-281-man-member-when-gated")
         assert_slug(text, expected)
 
 

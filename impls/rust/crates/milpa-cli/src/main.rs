@@ -23,7 +23,7 @@ use milpa_core::{
     resolve_workspace_with_cert, resolve_workspace_with_features,
     verify_lockfile_against_deps, workspace_any_member_strict, write_lockfile, CaStore,
     CasAdmittingFetcher, CoreError, DefaultRegistry, FailureCert, FileDepDeclStore,
-    FrozenResolver, Index, ManifestDoc, Milpa, MilpaError, MockedFetcher, Profile, Resolver,
+    FrozenResolver, Index, ManifestDoc, Milpa, MilpaError, MockedFetcher, Profile,
     Strategy, SuccessCert, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS,
 };
 use milpa_manifest::{valid_flag_name, Dep, FlagRequest, Manifest, OverrideTarget, UrlDep, Workspace};
@@ -118,8 +118,8 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
         "fetch" => cmd_fetch(dir, cli.strategy, cli.frozen, true, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest),
         "lock" => cmd_fetch(dir, cli.strategy, cli.frozen, false, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest),
         "update" => cmd_update(dir, cli.strategy, &cli.rest, cli.no_index),
-        "add" => cmd_add(dir, &cli.rest, cli.no_index),
-        "remove" => cmd_remove(dir, &cli.rest, cli.no_index),
+        "add" => cmd_add(dir, cli.strategy, &cli.rest, cli.no_index),
+        "remove" => cmd_remove(dir, cli.strategy, &cli.rest, cli.no_index),
         "store" => cmd_store(&cli.rest),
         "workspace" => cmd_workspace(dir, &cli.rest, cli.strategy, cli.no_index),
         other => {
@@ -1045,7 +1045,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
 }
 
 /// `milpa add <name> --git <url> [--ref <r>]` / `add <name> --mirror <url>`.
-fn cmd_add(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaError> {
+fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -> Result<i32, MilpaError> {
     let Some(name) = rest.first().cloned().filter(|n| !n.starts_with('-')) else {
         // Gap-1 C: no-name → usage error → exit 2 (no milpa-error: line).
         eprintln!("add: usage: milpa add <name> --git <url> [--ref <r>] | --mirror <url>");
@@ -1155,7 +1155,7 @@ fn cmd_add(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaErro
             build_registry().as_ref(),
             profile.as_ref(),
             None,
-            Strategy::default(),
+            strategy,
             &ws_deps_dir,
             false,
             &build_store(),
@@ -1181,7 +1181,7 @@ fn cmd_add(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaErro
             }));
             m
         })?;
-        write_lockfile(&from_graph(&graph, "maxver"), &ws_lock_path)?;
+        write_lockfile(&from_graph(&graph, strategy.as_str()), &ws_lock_path)?;
         eprintln!("added dep");
         return Ok(0);
     }
@@ -1259,13 +1259,16 @@ fn cmd_add(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaErro
     let registry = build_registry();
     let index = maybe_index(no_index)?;
     let profile = profile_from_env();
-    let graph = Milpa.resolve(
+    let graph = resolve(
         &proposed,
         index.as_ref(),
         registry.as_ref(),
         profile.as_ref(),
         None,
+        strategy,
         &deps_dir,
+        None,
+        false,
         &build_store(),
     )?;
 
@@ -1282,7 +1285,7 @@ fn cmd_add(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaErro
         }));
         m
     })?;
-    write_lockfile(&from_graph(&graph, "maxver"), &dir.join("milpa.lock"))?;
+    write_lockfile(&from_graph(&graph, strategy.as_str()), &dir.join("milpa.lock"))?;
     eprintln!("added dep");
     Ok(0)
 }
@@ -1466,11 +1469,37 @@ fn cmd_workspace_remove_member(
         }
     };
 
+    // F19: resolve name_or_path relative to the workspace root (dir) so that a
+    // root-relative path (e.g. "./member-b") is accepted.  Mirrors Python's
+    // `_cwd_resolved = (root.resolve() / Path(name_or_path)).resolve()` arm.
+    let root_resolved: Option<PathBuf> = {
+        let p = std::path::Path::new(name_or_path);
+        // Only attempt resolution for non-absolute paths (abs paths are already
+        // covered by the m.directory.to_string_lossy() arm below).
+        if p.is_relative() {
+            dir.join(p).canonicalize().ok()
+        } else {
+            None
+        }
+    };
+
     // Resolve name_or_path to a matched member.
     let matched: Option<&LoadedMember> = current_ws.members.iter().find(|m| {
-        m.name == *name_or_path
+        if m.name == *name_or_path
             || m.path == *name_or_path
             || m.directory.to_string_lossy() == name_or_path.as_str()
+        {
+            return true;
+        }
+        // Root-relative arm: if the user supplied a path relative to the
+        // workspace root (e.g. "./member-b") and it resolves to this member's
+        // directory, accept it.
+        if let Some(ref root_abs) = root_resolved {
+            if let Ok(member_abs) = m.directory.canonicalize() {
+                return member_abs == *root_abs;
+            }
+        }
+        false
     });
 
     // Guard 1: member must exist.
@@ -1658,7 +1687,7 @@ fn canonical_name_for(name: &str, lockfile: &milpa_core::Lockfile) -> String {
 /// manifest, reject an undeclared dep, build the proposed manifest (minus the
 /// dep), run a FULL resolve, and only on success atomically write BOTH
 /// `milpa.kdl` and `milpa.lock`. On any failure both files are left unmodified.
-fn cmd_remove(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaError> {
+fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -> Result<i32, MilpaError> {
     let Some(name) = rest.first().cloned() else {
         // Gap-1 C: no-name → usage error → exit 2 (no milpa-error: line).
         eprintln!("remove: usage: milpa remove <name>");
@@ -1718,7 +1747,7 @@ fn cmd_remove(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaE
             build_registry().as_ref(),
             profile.as_ref(),
             shared_prior.as_ref(),
-            Strategy::default(),
+            strategy,
             &ws_deps_dir,
             false,
             &build_store(),
@@ -1734,7 +1763,7 @@ fn cmd_remove(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaE
             m.deps.retain(|d| d.name() != canonical_c.as_str());
             m
         })?;
-        write_lockfile(&from_graph(&graph, "maxver"), &ws_lock_path)?;
+        write_lockfile(&from_graph(&graph, strategy.as_str()), &ws_lock_path)?;
         eprintln!("removed {canonical_ws}");
         return Ok(0);
     }
@@ -1778,13 +1807,16 @@ fn cmd_remove(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaE
     let registry = build_registry();
     let index = maybe_index(no_index)?;
     let profile = profile_from_env();
-    let graph = Milpa.resolve(
+    let graph = resolve(
         &proposed,
         index.as_ref(),
         registry.as_ref(),
         profile.as_ref(),
         None,
+        strategy,
         &deps_dir,
+        None,
+        false,
         &build_store(),
     )?;
 
@@ -1818,7 +1850,7 @@ fn cmd_remove(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaE
             m
         })?;
     }
-    write_lockfile(&from_graph(&graph, "maxver"), &dir.join("milpa.lock"))?;
+    write_lockfile(&from_graph(&graph, strategy.as_str()), &dir.join("milpa.lock"))?;
     eprintln!("removed {canonical}");
     Ok(0)
 }
@@ -2100,10 +2132,15 @@ fn find_parent_workspace(start_dir: &Path) -> Option<(PathBuf, LoadedWorkspace)>
         if let Ok(ws) = load_workspace(&current) {
             // Check if start_dir is a declared member.
             for member in &ws.members {
-                if let Ok(member_abs) = member.directory.canonicalize() {
-                    if member_abs == start_resolved {
-                        return Some((current.clone(), ws));
-                    }
+                // F10: if THIS member's directory is uncanonicalizable (e.g. the
+                // member dir was deleted), skip it and continue checking the rest.
+                // Only conclude "not a member" after ALL members have been checked.
+                let member_abs = match member.directory.canonicalize() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if member_abs == start_resolved {
+                    return Some((current.clone(), ws));
                 }
             }
             // Found a workspace but start_dir is not a member — stop searching.
@@ -2334,7 +2371,7 @@ mod tests {
         let manifest = "name \"app\"\nkind \"application\"\ndeps {\n  foo git=\"https://e/foo.git\" ref=\"main\"\n}\n";
         std::fs::write(dir.join("milpa.kdl"), manifest).unwrap();
         // remove of an absent dep → exit 1 (MAN-REMOVE-DEP-ABSENT).
-        assert_eq!(cmd_remove(dir, &["ghost".into()], false).unwrap(), 1);
+        assert_eq!(cmd_remove(dir, Strategy::default(), &["ghost".into()], false).unwrap(), 1);
         // manifest is unmodified; no lockfile was written.
         assert_eq!(std::fs::read_to_string(dir.join("milpa.kdl")).unwrap(), manifest);
         assert!(!dir.join("milpa.lock").exists());
@@ -2367,7 +2404,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let r = cmd_remove(&proj, &["foo".into()], false);
+        let r = cmd_remove(&proj, Strategy::default(), &["foo".into()], false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(r.unwrap(), 0, "remove should resolve + write both files");
@@ -2695,7 +2732,7 @@ mod tests {
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         // Pass alias 'baz' — must resolve to canonical 'foo' for manifest check.
-        let r = cmd_remove(&proj, &["baz".into()], false);
+        let r = cmd_remove(&proj, Strategy::default(), &["baz".into()], false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(
@@ -2746,7 +2783,7 @@ mod tests {
         // (warning is non-fatal) and trust the implementation emits to stderr.
         // The unit-level check: cmd_remove with alias in prior must exit 0.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let r = cmd_remove(&proj, &["foo".into()], false);
+        let r = cmd_remove(&proj, Strategy::default(), &["foo".into()], false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         // Removal must succeed (warning is non-fatal).
@@ -2822,6 +2859,7 @@ mod tests {
         // (1) add with explicit --ref → resolve + write both files.
         let r = cmd_add(
             &proj,
+            Strategy::default(),
             &["foo".into(), "--git".into(), url.into(), "--ref".into(), "main".into()],
             false,
         );
@@ -2831,6 +2869,7 @@ mod tests {
         // (2) duplicate guard.
         let dup = cmd_add(
             &proj,
+            Strategy::default(),
             &["foo".into(), "--git".into(), url.into(), "--ref".into(), "main".into()],
             false,
         );
@@ -2838,7 +2877,7 @@ mod tests {
         // (3) add a second dep with NO --ref → mocked default-branch discovery.
         let url2 = "https://example.com/bar.git";
         let _ = make_mocked_fetches(tmp.path(), url2, "trunk", &"c".repeat(40), &[("bar.nim", b"# bar")]);
-        let r2 = cmd_add(&proj, &["bar".into(), "--git".into(), url2.into()], false);
+        let r2 = cmd_add(&proj, Strategy::default(), &["bar".into(), "--git".into(), url2.into()], false);
         let after_add2 = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
 
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
@@ -2872,11 +2911,11 @@ mod tests {
     fn usage_subcmds_return_exit_2() {
         // remove with no name → exit 2.
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(cmd_remove(tmp.path(), &[], false).unwrap(), 2);
+        assert_eq!(cmd_remove(tmp.path(), Strategy::default(), &[], false).unwrap(), 2);
         // add with no name → exit 2.
-        assert_eq!(cmd_add(tmp.path(), &[], false).unwrap(), 2);
+        assert_eq!(cmd_add(tmp.path(), Strategy::default(), &[], false).unwrap(), 2);
         // add with no --git/--mirror → exit 2.
-        assert_eq!(cmd_add(tmp.path(), &["foo".into()], false).unwrap(), 2);
+        assert_eq!(cmd_add(tmp.path(), Strategy::default(), &["foo".into()], false).unwrap(), 2);
     }
 
     // --- MILPA_MOCKED_FETCHES integration -----------------------------------
@@ -3365,6 +3404,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         let rc = cmd_add(
             &proj,
+            Strategy::default(),
             &["mydep".into(), "--git".into(), url.into(), "--ref".into(), "main".into(), "--optional".into()],
             false,
         );
@@ -3393,6 +3433,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         let rc = cmd_add(
             &proj,
+            Strategy::default(),
             &[
                 "featdep".into(), "--git".into(), url.into(),
                 "--ref".into(), "main".into(),
@@ -3422,6 +3463,7 @@ mod tests {
 
         let rc = cmd_add(
             &proj,
+            Strategy::default(),
             &["myflag".into(), "--git".into(), "https://example.com/myflag.git".into(),
               "--ref".into(), "main".into(), "--optional".into()],
             false,
@@ -3754,6 +3796,16 @@ mod tests {
         std::env::remove_var("MILPA_TARGET_PLATFORM");
     }
 
+    // F10: find_parent_workspace skips members whose directory is uncanonicalizable.
+    //
+    // A full unit test would require a workspace where one member's directory is
+    // a broken symlink (present enough for is_dir() to pass during load_workspace
+    // but unresolvable for canonicalize()).  That setup is impractical portably and
+    // requires a race between load_workspace and the canonicalize call.  The fix
+    // (continue instead of fall-through) is covered by code-inspection and by the
+    // conformance corpus end-to-end (workspace S11e fixtures exercise the full
+    // find_parent_workspace path).  No isolated unit test is added for F10.
+
     #[test]
     fn profile_from_env_arch_override_wins() {
         std::env::remove_var("MILPA_TARGET_PLATFORM");
@@ -3769,5 +3821,100 @@ mod tests {
         );
 
         std::env::remove_var("MILPA_TARGET_ARCH");
+    }
+
+    // -----------------------------------------------------------------------
+    // F9: cmd_add / cmd_remove thread --strategy into the lockfile
+    // -----------------------------------------------------------------------
+
+    /// F9: cmd_add with Strategy::Minver writes `strategy "minver"` to the lock.
+    ///
+    /// Previously cmd_add hardcoded `from_graph(&graph, "maxver")` regardless of
+    /// the --strategy flag. This test catches a regression where the strategy is
+    /// ignored and the lockfile records "maxver" instead of "minver".
+    #[test]
+    fn f9_add_respects_strategy_minver() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("f9_add_proj");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let url = "https://example.com/dep9.git";
+        let sha = "9".repeat(40);
+        let mocked = make_mocked_fetches(tmp.path(), url, "main", &sha, &[("dep9.nim", b"# dep9")]);
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\n",
+        ).unwrap();
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let rc = cmd_add(
+            &proj,
+            Strategy::Minver,
+            &["dep9".into(), "--git".into(), url.into(), "--ref".into(), "main".into()],
+            false,
+        );
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(rc.unwrap(), 0, "cmd_add --strategy minver must succeed");
+        let lock = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
+        assert!(
+            lock.contains("strategy \"minver\""),
+            "lockfile must record strategy minver (F9); got:\n{lock}"
+        );
+    }
+
+    /// F9: cmd_remove with Strategy::Minver writes `strategy "minver"` to the lock.
+    ///
+    /// Previously cmd_remove hardcoded `from_graph(&graph, "maxver")` regardless.
+    #[test]
+    fn f9_remove_respects_strategy_minver() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("f9_rm_proj");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // Start with two deps; remove one; check the lock has minver strategy.
+        let url_a = "https://example.com/dpa.git";
+        let url_b = "https://example.com/dpb.git";
+        let sha_a = "a".repeat(40);
+        let sha_b = "b".repeat(40);
+        let mocked = tmp.path().join("mocked-fetches");
+        // Seed mocked fetches for both deps.
+        for (u, ref_s, sha) in [
+            (url_a, "main", sha_a.as_str()),
+            (url_b, "main", sha_b.as_str()),
+        ] {
+            let key_dir = mocked.join(milpa_core::url_key(u, ref_s));
+            std::fs::create_dir_all(key_dir.join("content")).unwrap();
+            std::fs::write(key_dir.join("sha"), format!("{sha}\n")).unwrap();
+            std::fs::write(key_dir.join("content").join("dep.nim"), b"# dep").unwrap();
+        }
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            format!(
+                "name \"app\"\nkind \"application\"\ndeps {{\n  dpa git=\"{url_a}\" ref=\"main\"\n  dpb git=\"{url_b}\" ref=\"main\"\n}}\n"
+            ),
+        ).unwrap();
+
+        // Fetch first so there's a lockfile and _deps/ to satisfy remove's resolve.
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        cmd_fetch(&proj, Strategy::Minver, false, true, None, false, false, &[]).unwrap();
+
+        // Remove dpa with minver strategy.
+        let rc = cmd_remove(
+            &proj,
+            Strategy::Minver,
+            &["dpa".into()],
+            false,
+        );
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(rc.unwrap(), 0, "cmd_remove --strategy minver must succeed");
+        let lock = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
+        assert!(
+            lock.contains("strategy \"minver\""),
+            "lockfile must record strategy minver after remove (F9); got:\n{lock}"
+        );
     }
 }
