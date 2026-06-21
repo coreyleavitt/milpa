@@ -296,6 +296,15 @@ fixtures may surface *new* cross-impl divergences (previously masked by both
 impls failing identically). Re-run the harness after each and treat any residual
 asymmetry per Slice A.
 
+- **Slice F — Rust CLI honors `--features` family (exposed by Slice B).** After
+  Slice B fed both impls `--features` on the black-box path, 209/210/211/212/216/228
+  flipped from both-fail to **python✓ / rust✗** divergences: the Rust CLI does not
+  apply the feature-selection flags the way Python does (the runner is
+  impl-agnostic, so both receive identical argv). Rust-only resolver/CLI fix;
+  gate via `./dev-rust test -p milpa-conformance`. This is a substantive new
+  finding — the feature fixtures' black-box reds were a runner gap *masking* a
+  Rust CLI gap, not a pure runner gap.
+
 ### Slice 1 — fixture-099 (#154), Rust-only red
 
 Python passes; Rust emits `FETCH-ALL-FAILED` where the corpus expects

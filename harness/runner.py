@@ -184,6 +184,39 @@ def _extract_slug(stderr: str) -> tuple[Optional[str], Optional[str]]:
     return None, f"protocol violation: {len(matches)} milpa-error lines: {matches!r}"
 
 
+# Verbs whose subparser accepts the S9 feature-selection flags (cli.py
+# _add_feature_args is applied to fetch/lock/update).
+_FEATURE_VERBS = frozenset({"fetch", "lock", "update"})
+
+
+def _feature_argv(fixture_env: dict[str, str]) -> list[str]:
+    """Translate the MILPA_CLI_FEATURES family into verb-level CLI flags.
+
+    Mirrors the in-process adapter (test_conformance.py::_fixture_cli_features /
+    _fixture_no_default_features / _fixture_all_features) so the black-box runner
+    drives the CLI with the same declared feature inputs. The CLI reads these as
+    ``--features`` / ``--no-default-features`` / ``--all-features`` on the
+    fetch/lock/update subparser, NOT as environment variables — without this
+    translation the env keys are set but silently ignored (Finding 3,
+    docs/rfc-conformance-parity.baseline.md, RFC §4 Slice B).
+    """
+    argv: list[str] = []
+    feats = fixture_env.get("MILPA_CLI_FEATURES", "").strip()
+    if feats:
+        argv += ["--features", feats]
+    if _env_flag(fixture_env, "MILPA_NO_DEFAULT_FEATURES"):
+        argv.append("--no-default-features")
+    if _env_flag(fixture_env, "MILPA_ALL_FEATURES"):
+        argv.append("--all-features")
+    return argv
+
+
+def _env_flag(fixture_env: dict[str, str], key: str) -> bool:
+    """A boolean env flag is true when present and not '0'/'false' (adapter parity)."""
+    v = fixture_env.get(key, "")
+    return bool(v and v not in ("0", "false"))
+
+
 def _cmd_to_cli(cmd: str) -> tuple[list[str], list[str]]:
     """Map a fixture cmd string to (global_flags, verb_argv).
 
@@ -320,6 +353,12 @@ def run_fixture(
     fixture_env = _read_env_file(fixture_dir)
     project_dir_suffix = _read_project_dir_suffix(fixture_dir)
     global_flags, verb_argv = _cmd_to_cli(cmd)
+
+    # Slice B: translate the MILPA_CLI_FEATURES family into the verb-level
+    # feature flags the CLI reads (fetch/lock/update only). The flags must
+    # follow the verb (they live on the verb subparser), so append to verb_argv.
+    if verb_argv and verb_argv[0] in _FEATURE_VERBS:
+        verb_argv = verb_argv + _feature_argv(fixture_env)
 
     # Create isolated scratch + CAS dirs.
     scratch = Path(tempfile.mkdtemp(prefix=f"milpa-harness-{descriptor.name}-"))
