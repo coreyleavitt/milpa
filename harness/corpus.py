@@ -155,37 +155,67 @@ def _detect_divergences(
     cmd: str,
     results_by_impl: dict[str, ConformanceResult],
 ) -> list[DivergenceRecord]:
-    """Compare normalized outputs across all impls that passed.
+    """Detect cross-impl parity violations for one fixture.
 
-    Only compares impls that passed their individual conformance check.
-    An impl that failed its individual check is excluded from cross-impl diff
-    (we already have a per-impl failure recorded for it).
+    A divergence is EITHER:
+      (1) a pass/fail asymmetry — the impls disagree on whether the run conforms
+          to ``expected/`` (one matches, another does not). This is the textbook
+          cross-impl divergence and was previously invisible: the old detector
+          compared only impls that BOTH passed, and two co-passers both equal
+          ``expected/`` by construction, so it could never fire on a fixture that
+          carries an ``expected/`` (Finding 1, docs/rfc-conformance-parity.baseline.md).
+      (2) a normative-surface disagreement among impls that both passed — kept for
+          fixtures without an ``expected/`` (pinned-divergence inputs) and as a
+          belt-and-suspenders check.
+
+    Impls parked in ``known_failing`` are excluded upstream (never enter
+    ``results_by_impl``), so an intentional per-impl gap is not flagged here.
+    A both-fail case is symmetric (not an asymmetry) and is reported only as the
+    two per-impl failures it already is — typically a shared runner/fixture-input
+    gap rather than a parity violation.
     """
+    if len(results_by_impl) < 2:
+        return []
+
+    divergences: list[DivergenceRecord] = []
+
+    # (1) Pass/fail asymmetry vs expected/.
+    verdicts = {name: r.passed for name, r in results_by_impl.items()}
+    if len(set(verdicts.values())) > 1:
+        impls_view: dict[str, str] = {}
+        for name, r in results_by_impl.items():
+            if r.passed:
+                impls_view[name] = "PASS"
+            else:
+                detail = r.failures[0].detail if r.failures else "FAIL"
+                impls_view[name] = f"FAIL: {detail}"
+        divergences.append(DivergenceRecord(
+            fixture_name=fixture_name,
+            cmd=cmd,
+            output_file="<conformance-verdict>",
+            impls=impls_view,
+        ))
+
+    # (2) Normative-surface disagreement among co-passers.
     passed_results = {
         name: r for name, r in results_by_impl.items() if r.passed
     }
-    if len(passed_results) < 2:
-        return []
-
-    # Collect all output keys emitted by any impl.
-    all_keys: set[str] = set()
-    for r in passed_results.values():
-        all_keys.update(r.normalized_outputs.keys())
-
-    divergences: list[DivergenceRecord] = []
-    for key in sorted(all_keys):
-        values_by_impl = {
-            name: r.normalized_outputs.get(key, "<MISSING>")
-            for name, r in passed_results.items()
-        }
-        distinct_values = set(values_by_impl.values())
-        if len(distinct_values) > 1:
-            divergences.append(DivergenceRecord(
-                fixture_name=fixture_name,
-                cmd=cmd,
-                output_file=key,
-                impls=values_by_impl,
-            ))
+    if len(passed_results) >= 2:
+        all_keys: set[str] = set()
+        for r in passed_results.values():
+            all_keys.update(r.normalized_outputs.keys())
+        for key in sorted(all_keys):
+            values_by_impl = {
+                name: r.normalized_outputs.get(key, "<MISSING>")
+                for name, r in passed_results.items()
+            }
+            if len(set(values_by_impl.values())) > 1:
+                divergences.append(DivergenceRecord(
+                    fixture_name=fixture_name,
+                    cmd=cmd,
+                    output_file=key,
+                    impls=values_by_impl,
+                ))
     return divergences
 
 

@@ -249,6 +249,53 @@ Not an informal re-run. Produce a checked-in baseline record by:
 6. Recording the result as a versioned text artifact in the repo so later slices can
    legitimately claim to "fix a red."
 
+### Slice 0 findings — folded Phase-1 work (2026-06-21, "fold everything here")
+
+Slice 0's recorded baseline (`docs/rfc-conformance-parity.baseline.md`) proved the
+"only fixture-099 is red" premise wrong. The findings are folded into Phase 1 as
+the slices below (Corey decision 2026-06-21). Ordering is dependency-driven: the
+divergence-detector fix (Slice A) comes first because the invariant is otherwise
+unenforceable; the fast Python runner/harness slices precede the container-gated
+Rust work.
+
+- **Slice A — fix the harness divergence detector (Finding 1).**
+  `harness/corpus.py::_detect_divergences` only diffs impls that **both passed**,
+  so for any `expected/`-bearing fixture two passers are both equal to `expected/`
+  (never divergent) and an asymmetric fixture (one passes, one fails) is skipped
+  (`len < 2`). Result: `Cross-impl divergences: NONE` is structurally vacuous for
+  the static corpus. Fix: a divergence is **any normative-surface disagreement
+  across impls that both produced an output**, OR a pass/fail asymmetry vs
+  `expected/`. RED = a harness unit test asserting that an asymmetric fixture is
+  reported as a divergence; GREEN = detector flags 099/252/213/214/282.
+- **Slice B — black-box runner honors the `MILPA_CLI_FEATURES` family
+  (Finding 3).** Teach `harness/runner.py` to translate the fixture `env` keys
+  `MILPA_CLI_FEATURES` / `MILPA_NO_DEFAULT_FEATURES` / `MILPA_ALL_FEATURES` into
+  `--features` / `--no-default-features` / `--all-features` argv (mirroring the
+  in-process adapter), so these are CLI inputs, not ignored env. Greens 10
+  fixtures (209/210/211/212/216/228/230/244/249/251).
+- **Slice C — black-box runner normalization/seeding (Finding 4).** Per-gap:
+  (c1) substitute the `<TARBALL-SHA256>` placeholder before diffing (182/183);
+  (c2) normalize a local-dep symlink target to `(symlink)` in
+  `_deps_structure.txt` (181); (c3) seed `cas-seed/` content for frozen fixtures
+  so `FROZEN-IDENTITY-NOT-IN-STORE` does not spuriously fire (177/208/205);
+  (c4) profile-axis parity for partial-profile absent-axis fixtures (255/256;
+  coordinates with #159/#160). Each c-gap is independently testable; split as
+  needed during /tdd.
+- **Slice D — fixture-252 rust frozen-slug (Finding 2).** Rust emits
+  `FROZEN-IDENTITY-NOT-IN-STORE` where the corpus expects
+  `FROZEN-ACTIVE-FLAGS-MISMATCH`: the active-flags check must run before the
+  in-store check on the frozen workspace path. Rust-only; gate via
+  `./dev-rust test -p milpa-conformance`.
+- **Slice E — python workspace flag-union into member `nim.cfg` (Finding 2).**
+  213/214/282: Python emits member `nim.cfg` short by the workspace-wide /
+  root-flag / cross-pkg-enable lines Rust includes. Python resolver gap; gate via
+  `cd impls/python && uv run pytest`.
+
+Note (Slices B/C): once the runner honors these inputs, the corresponding
+fixtures may surface *new* cross-impl divergences (previously masked by both
+impls failing identically). Re-run the harness after each and treat any residual
+asymmetry per Slice A.
+
 ### Slice 1 — fixture-099 (#154), Rust-only red
 
 Python passes; Rust emits `FETCH-ALL-FAILED` where the corpus expects
