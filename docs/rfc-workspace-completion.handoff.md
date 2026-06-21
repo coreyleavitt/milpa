@@ -1,7 +1,7 @@
 # Workspace completion RFC — handoff
 
-- **Stage:** 4 code-review — **ROUND 2: D-1/D-2 committed; containment unification IN FLIGHT**
-  under mandate "fix through Medium, leave Lows" (Corey: "follow /rfc-flow as always").
+- **Stage:** 4 code-review — **✅ COMPLETE (floor reached, R5 clean).** RFC fully shipped: all 19
+  slices implemented + 5 code-review rounds to the floor. See "STAGE 4 CODE-REVIEW COMPLETE" below.
 - **FORK RESOLVED:** Corey approved **Option A** — canonicalize-based containment (follow symlinks,
   require member's REAL location under root). Security rationale: following symlinks MITIGATES the
   escape vector; the dangerous symlink case (untrusted fetched content) is the separate, already-
@@ -30,10 +30,24 @@
   delegates to `best_effort_resolve(&ancestor)`, closing the GENERAL single-hop dangling case (mid-path
   + final) and unifying the dual-mechanism. +mid-path parity test both impls, +from_manifest Rust
   symlinked-root test, +unwrap_or comment, +spec generalized. Py 2137, Rust 699 zero divergence, bijection 8.
-- **ROUND 5 final re-review IN FLIGHT** (Security `a2d974c1c81ef316c`, Correctness `a92748f33467d3e93`,
-  Design `aa8a8a633965b3981`) — scoped to `git show 92440d3` (the one-line recursion): stack-DoS from
-  deep member paths, new mid-path divergence, design unification. If clean → **FLOOR REACHED** →
-  report Lows + STOP. If C/H/M → one more iter.
+- **ROUND 5 final re-review DONE — FLOOR REACHED (0 Critical/High/Medium).** Correctness: CLEAN
+  (mid-path fix verified, 7 cases, multi-hop=#168). Design: CLEAN (unification met, 0 fix-now).
+  Security: claimed a HIGH (symlink-cycle infinite recursion DoS) → **REFUTED** (validate-diagnosis-
+  first): the agent misread the dangling branch as recursing on the link TARGET; it recurses on
+  `path.parent()`/`&ancestor` (strictly shorter) → terminates by construction; target is only
+  join+normalize, never recursed. Empirically confirmed on freshly-rebuilt release binary: self/2/3-
+  cycle, mid-path cycle, 500-segment deep path ALL terminate cleanly (DIR-MISSING, exit 0, no SIGSEGV).
+  Depth O(path components), PATH_MAX-bounded, not exploitable. fixture-286/288 differential re-verified
+  zero divergence with fresh binary.
+- **STAGE 4 CODE-REVIEW COMPLETE.** 11 fix commits over 5 rounds (R1 7, R2 2, R3 1, R4 1) + 3 handoff
+  checkpoints. All gates green (Python 2137, Rust 699 tests zero divergence, bijection 8/8). Floor =
+  only Lows remain (see below). Issues filed: #167 (in-process project-dir), #168 (cyclic-symlink slug).
+- **Remaining Lows (left per mandate "fix through Medium, leave Lows"):** R1 F22–F29 (see R1 ledger
+  below); R2 L1 `_s4a_run_fixpoint` 19-arg vs provider-encapsulation (Python vs Rust pattern);
+  R2 L2 `apply_member_manifest_change` "atomically" docstring (TOCTOU window); R2 L3 `strip_dep_pin`
+  docstring silent on tarball/OCI declared-mirror drop; R4 redundant `symlink_metadata` at ancestor-
+  walk loop start; R5 could flatten best_effort_resolve to pure recursive descent (not worth it).
+  (R4 unwrap_or-comment Low was fixed in `92440d3`.)
 - **Commits this code-review (Stage 4):** R1 `d4f5024`,`5d536d5`,`c051bd4`,`5004632`,`c6e174b`,`bd9d3e7`,
   `3803418` · R2 `0237166`,`8cd9ca6` · R3 `e40c99d` · R4 `92440d3`. Issues filed: #167, #168.
 - **Remaining Lows to report at floor:** F22–F29 (R1 deferred), R2 L1–L3 (fixpoint-param/atomically-
