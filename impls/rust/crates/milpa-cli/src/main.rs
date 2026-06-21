@@ -598,6 +598,14 @@ fn cmd_fetch(
                 )));
             }
             let lock = load_lockfile(&lock_path)?;
+            // S11b: the active-flags mismatch check MUST run before the
+            // in-store/disk check inside resolve_workspace_frozen, so a
+            // feature-selection change surfaces as FROZEN-ACTIVE-FLAGS-MISMATCH
+            // rather than FROZEN-IDENTITY-NOT-IN-STORE (fixture-252). Mirrors the
+            // verify path; uses the actual CLI features (not empty like verify).
+            check_workspace_frozen_active_flags_mismatch(
+                &ws, &lock, &cli_features, cli_no_default, cli_all_features,
+            )?;
             resolve_workspace_frozen(&ws, &lock, &build_store(), &deps_dir)?
         } else {
             let index = maybe_index(no_index)?;
@@ -677,6 +685,13 @@ fn cmd_fetch(
         // so this condition is unrepresentable — left as a known cross-impl
         // divergence (the differential harness will catch it later).
         let lock = load_lockfile(&lock_path)?;
+        // Same ordering rule as the workspace path: active-flags mismatch check
+        // runs before the in-store check so a feature-selection change surfaces
+        // as FROZEN-ACTIVE-FLAGS-MISMATCH, not FROZEN-IDENTITY-NOT-IN-STORE
+        // (fixture-212). Mirrors the verify path.
+        check_frozen_active_flags_mismatch(
+            &manifest, &lock, &cli_features, cli_no_default, cli_all_features,
+        )?;
         Milpa.resolve_frozen(&manifest, &lock, &build_store(), &deps_dir)?
     } else {
         let index = maybe_index(no_index)?;
