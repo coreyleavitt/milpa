@@ -683,6 +683,12 @@ milpa add <dep> --mirror <url>
 > error to stderr and exit 2 (a usage/crash-class verdict per §3.1 R4;
 > no `milpa-error:` slug line, like any argument-parse failure).
 
+> NORMATIVE (S11a): `add` invoked at a **workspace root** MUST emit
+> `MAN-MUTATE-WORKSPACE-REFUSED` (exit 1) with a directive message:
+> *"to add a dep, `cd` to a member; to add a member, use
+> `milpa workspace add-member`"*. It MUST NOT attempt to parse the
+> manifest as a package manifest.
+
 **Exit codes:** 0 success, 1 failure.
 
 **stdout:** none.
@@ -721,6 +727,12 @@ milpa remove <dep>
 > The manifest MUST NOT be modified in this case — if the dep is still
 > in the graph it was never a top-level dep requiring removal from
 > `milpa.kdl`.
+
+> NORMATIVE (S11a): `remove` invoked at a **workspace root** MUST emit
+> `MAN-MUTATE-WORKSPACE-REFUSED` (exit 1) with a directive message:
+> *"to remove a dep, `cd` to a member; to remove a member, use
+> `milpa workspace remove-member`"*. It MUST NOT attempt to parse the
+> manifest as a package manifest.
 
 **Exit codes:** 0 success, 1 failure.
 

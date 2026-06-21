@@ -55,6 +55,7 @@ from milpa.errors import (
     MAN_ADD_DEP_EXISTS,
     MAN_MIRROR_EDITABLE_PROVENANCE,
     MAN_MUTATE_FILE_NOT_FOUND,
+    MAN_MUTATE_WORKSPACE_REFUSED,
     MAN_REMOVE_DEP_ABSENT,
     MILPA_INTERNAL,
     TNG_DEPDECL_FETCH_FAILED,
@@ -1662,6 +1663,18 @@ def cmd_add(
     manifest_path = project_dir / "milpa.kdl"
     lock_path = project_dir / "milpa.lock"
 
+    # S11a: add at a workspace root is refused with the canonical directive slug.
+    ws = find_workspace_root(project_dir)
+    if ws is not None:
+        print(
+            "milpa add: cannot add a dep to a workspace root — "
+            "to add a dep, `cd` to a member; "
+            "to add a member, use `milpa workspace add-member`",
+            file=sys.stderr,
+        )
+        _emit_slug(MAN_MUTATE_WORKSPACE_REFUSED)
+        return 1
+
     if git_url is not None:
         return _cmd_add_git(
             project_dir=project_dir,
@@ -1995,6 +2008,18 @@ def cmd_remove(
 
     manifest_path = project_dir / "milpa.kdl"
     lock_path = project_dir / "milpa.lock"
+
+    # S11a: remove at a workspace root is refused with the canonical directive slug.
+    ws_check = find_workspace_root(project_dir)
+    if ws_check is not None:
+        print(
+            "milpa remove: cannot remove a dep from a workspace root — "
+            "to remove a dep, `cd` to a member; "
+            "to remove a member, use `milpa workspace remove-member`",
+            file=sys.stderr,
+        )
+        _emit_slug(MAN_MUTATE_WORKSPACE_REFUSED)
+        return 1
 
     manifest_text = manifest_path.read_text(encoding="utf-8")
     manifest = parse_manifest(manifest_text)

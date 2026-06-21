@@ -968,10 +968,14 @@ fn cmd_add(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaErro
     // MAN-ADD-DEP-EXISTS via Err (which main's Err path will slug-print).
     let existing_doc = load_manifest(&dir.join("milpa.kdl"))?;
     let ManifestDoc::Package(existing) = existing_doc else {
-        return Err(MilpaError::Manifest(milpa_manifest::ManifestError::new(
-            "MAN-ADD-DEP-EXISTS",
-            "add: cannot add a dep to a workspace root manifest".to_string(),
-        )));
+        // S11a: add at a workspace root emits the canonical directive slug.
+        eprintln!(
+            "add: cannot add a dep to a workspace root — \
+             to add a dep, `cd` to a member; \
+             to add a member, use `milpa workspace add-member`"
+        );
+        eprintln!("milpa-error: MAN-MUTATE-WORKSPACE-REFUSED");
+        return Ok(1);
     };
     if existing.deps.iter().any(|d| d.name() == name) {
         return Err(MilpaError::Manifest(milpa_manifest::ManifestError::new(
@@ -1462,10 +1466,14 @@ fn cmd_remove(dir: &Path, rest: &[String], no_index: bool) -> Result<i32, MilpaE
     // Load the current manifest. Parse failures propagate via `?` (MAN-* slug).
     let existing_doc = load_manifest(&dir.join("milpa.kdl"))?;
     let ManifestDoc::Package(existing) = existing_doc else {
-        return Err(MilpaError::Manifest(milpa_manifest::ManifestError::new(
-            "MAN-REMOVE-DEP-ABSENT",
-            "remove: cannot remove a dep from a workspace root manifest".to_string(),
-        )));
+        // S11a: remove at a workspace root emits the canonical directive slug.
+        eprintln!(
+            "remove: cannot remove a dep from a workspace root — \
+             to remove a dep, `cd` to a member; \
+             to remove a member, use `milpa workspace remove-member`"
+        );
+        eprintln!("milpa-error: MAN-MUTATE-WORKSPACE-REFUSED");
+        return Ok(1);
     };
 
     // D-update-remove: alias→canonical resolution (Phase D item 5).
