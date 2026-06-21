@@ -1,11 +1,49 @@
 # Workspace completion RFC — handoff
 
-- **Stage:** 4 code-review — **ROUND 1 fix-loop COMPLETE; RE-REVIEW ROUND 2 launching** under
-  mandate "fix through Medium, leave Lows" (Corey: "follow /rfc-flow as always").
-- **Resume (Stage 4):** re-review round running over full R1 changed scope (16 source files,
-  both impls + spec) — Security + Design + correctness; flagged item: Python `resolve()`
-  (symlink-following) vs Rust `normalize_lexically` (lexical-only) F16 containment parity gap.
-  After re-review: verify any new findings (Step 4), fix to floor (0 C/H/M), then report Lows.
+- **Stage:** 4 code-review — **ROUND 2: D-1/D-2 committed; containment unification IN FLIGHT**
+  under mandate "fix through Medium, leave Lows" (Corey: "follow /rfc-flow as always").
+- **FORK RESOLVED:** Corey approved **Option A** — canonicalize-based containment (follow symlinks,
+  require member's REAL location under root). Security rationale: following symlinks MITIGATES the
+  escape vector; the dangerous symlink case (untrusted fetched content) is the separate, already-
+  hardened safe_extract path. Spec updated normatively; Python already did Option A, Rust brought up.
+- **R2 FULLY COMMITTED:** `0237166` (D-1 Rust strip_dep_pin SSOT + D-2 Python cli-seed wrapper),
+  `8cd9ca6` (containment Option A: R2-1 symlink incl. dangling, R2-2 equal-to-root→IS-WORKSPACE,
+  D-3 Python helper dedup, spec rewrite, fixtures 286+288). Gates: Py 2134, Rust green zero divergence,
+  fixture-288 differential both-pass, bijection green.
+- **ROUND 3 re-review IN FLIGHT** (agents Security `a192aeaec0930b418`, Correctness `a461e127205993322`,
+  Design `a6b19a2fabf940d4c`) — scoped to `git diff 3803418..HEAD`, containment logic flagged for
+  hardest scrutiny (dangling-symlink branch edge cases: multi-level chains, absolute targets, TOCTOU).
+  After R3: verify any C/H/M (Step 4), fix to floor, else report Lows F22–F29 + R2 L1–L3 and STOP.
+- **(historical) Resume (Stage 4):** containment-unification agent `a515848642724bbdd` DONE —
+  Rust `is_under_root`→canonicalize+inclusive starts_with; Python D-3 helper dedup; spec normative
+  rewrite; fixture-286 (equal-to-root→IS-WORKSPACE, differentially gated); fixture-288 symlink-escape
+  (skipped 3× — see below); unit tests both impls. **Validate-diagnosis-first caught a residual
+  divergence** → follow-up agent `a96cb02e2dc0ca115` IN FLIGHT:
+    - ITEM 1: dangling member symlink (target outside root, nonexistent) → Python `resolve()` follows
+      it → PATH-ESCAPE; Rust `candidate.exists()`=false → lexical → DIR-MISSING. DIVERGENCE. Fix:
+      Rust read_link the dangling final component (lstat via symlink_metadata) to mirror Python;
+      +parity tests both impls (dangling-outside→PATH-ESCAPE, dangling-inside→DIR-MISSING).
+    - ITEM 2: fixture-288 was skipped in ALL 3 suites (corpus.py KNOWN_LIMITATIONS + 2 in-process
+      guards). The differential harness (corpus.py→runner.py is project-dir-aware, black-box subproc)
+      SHOULD drive it — agent verifying; if so, remove the corpus.py skip (keep 2 in-process guards).
+  - After agent returns: verify+commit the whole containment pass; (b) final re-review round to floor
+    (0 C/H/M); (c) then report Lows F22–F29 + R2 Lows L1–L3.
+- **ROUND 2 re-review findings (3 agents: Security, Design, Correctness — 0 Critical/High):**
+  - R2-1 (Sec+Design, Med): F16 containment DIVERGES — Python `(root/p).resolve()` follows
+    symlinks (workspace.py:218/354) → rejects member symlink pointing outside; Rust
+    `normalize_lexically` lexical-only (workspace.rs:48-49) → accepts. **= the FORK.**
+  - R2-2 (Correctness, Med): `a/..`→root emits different slugs — Rust line 52 `!= norm_root`
+    → PATH-ESCAPE; Python `is_relative_to` equal-as-inside → proceeds (→ IS-WORKSPACE/load-root).
+    Clear-best: unify (lexically-equal-to-root → not an ESCAPE; route to IS-WORKSPACE/DOT). Lands w/ fork.
+  - D-1 (Design, Med): Rust `strip_dep_pin` NOT extracted. **FIXED+COMMITTED** (`0237166`):
+    extracted to milpa-core::lockfile, both cmd_update sites call it, +4 tests.
+  - D-2 (Design, Med): Python `_compute_workspace_cli_seed` wrapper bypassed by `resolve_workspace`.
+    **FIXED+COMMITTED** (`0237166`): routed through the wrapper, one SSOT route.
+  - D-3 (Design, Med): Python containment block duplicated verbatim (workspace.py:211-252 & 347-388),
+    no shared helper (Rust has `is_under_root`). Lands w/ containment unification.
+  - R2 Lows (leave per mandate): L1 `_s4a_run_fixpoint` 19th param vs provider-encapsulation
+    (Rust cleaner); L2 `apply_member_manifest_change` docstring says "atomically" (TOCTOU window);
+    L3 `strip_dep_pin` docstring silent on tarball/OCI declared-mirror drop.
 - **Fix waves (ROUND 1 — all committed, 7 commits `d4f5024`..`3803418`):**
   - A+B (5 commits `d4f5024`..`c6e174b`, Py 2118): F1✅ F2✅ F3✅ F4✅ F6✅ F8✅ F11✅ F12✅ F13✅ F14✅ F15✅ F17✅.
   - C-A (`bd9d3e7`, Py 2127, bijection lints green): F16✅ (new slug `WS-MEMBER-PATH-ESCAPE`,
