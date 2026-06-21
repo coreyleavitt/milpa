@@ -3525,23 +3525,16 @@ def resolve_workspace(
     deps_dir.mkdir(parents=True, exist_ok=True)
 
     # S2 (RFC: workspace-completion §3.A): compute workspace-root CLI seed.
-    # Uses _compute_cli_active_seed (SSOT) with workspace_manifest.flags.
+    # Uses _compute_workspace_cli_seed (SSOT wrapper) with workspace_manifest.flags.
     # The seed is passed per-member to FilterContext.build, which runs
     # flag_enables_closure against the *member's own* flags — that's why
     # build() takes the member manifest.
     # None = no CLI feature selection (passthrough for the flag gate).
-    _ws_has_cli_features = (
-        bool(params.features) or params.no_default_features or params.all_features
-    )
-    _ws_cli_seed: frozenset[str] | None = (
-        _compute_cli_active_seed(
-            workspace.workspace_manifest.flags,
-            features=params.features,
-            no_default_features=params.no_default_features,
-            all_features=params.all_features,
-        )
-        if _ws_has_cli_features
-        else None
+    _ws_cli_seed: frozenset[str] | None = _compute_workspace_cli_seed(
+        workspace.workspace_manifest,
+        features=params.features,
+        no_default_features=params.no_default_features,
+        all_features=params.all_features,
     )
 
     # ------------------------------------------------------------------

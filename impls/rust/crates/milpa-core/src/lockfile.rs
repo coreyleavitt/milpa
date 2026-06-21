@@ -1260,6 +1260,54 @@ fn children(node: &KdlNode) -> Vec<&KdlNode> {
         .unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// strip_dep_pin — SSOT for the "drop one dep's pin" operation (F12)
+// ---------------------------------------------------------------------------
+
+/// Return a copy of `lockfile` with the named dep's pin stripped.
+///
+/// The stripped entry retains only `ProvenanceRecord::Git` entries with
+/// `origin == "declared"` (declared mirrors).  `identity` is set to `None`
+/// so the resolver treats the dep as un-pinned and re-resolves it fresh.
+/// The declared provenances survive so `_prior_declared_mirror_urls` can
+/// carry them forward (Phase D item 5).
+///
+/// The dep at `canonical_name` MUST already exist in `lockfile.deps`; the
+/// caller is responsible for alias→canonical resolution and the "not found"
+/// guard (both call sites already perform these steps before invoking this
+/// function).
+///
+/// Mirrors `lockfile.py:strip_dep_pin`.
+pub fn strip_dep_pin(lockfile: Lockfile, canonical_name: &str) -> Lockfile {
+    let updated = lockfile
+        .deps
+        .iter()
+        .find(|d| d.name == canonical_name)
+        .expect("strip_dep_pin: caller must ensure dep exists in lockfile")
+        .clone();
+    let declared_provs: Vec<ProvenanceRecord> = updated
+        .provenances
+        .iter()
+        .filter(|p| matches!(p, ProvenanceRecord::Git { origin, .. } if origin == "declared"))
+        .cloned()
+        .collect();
+    let pin_stripped = LockedDep {
+        identity: None,
+        provenances: declared_provs,
+        ..updated
+    };
+    let mut new_deps: Vec<LockedDep> = lockfile
+        .deps
+        .into_iter()
+        .filter(|d| d.name != canonical_name)
+        .collect();
+    new_deps.push(pin_stripped);
+    Lockfile {
+        deps: new_deps,
+        ..lockfile
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3293,5 +3341,116 @@ mod tests {
             divs.is_empty(),
             "local dep verify must be liveness-only, not hash-compare: {divs:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // strip_dep_pin tests
+    // ---------------------------------------------------------------------------
+
+    fn make_git_prov(origin: &str) -> ProvenanceRecord {
+        ProvenanceRecord::Git {
+            url: "https://example.com/foo.git".into(),
+            ref_spec: Some("main".into()),
+            commit_sha: Some("abc123".into()),
+            origin: origin.into(),
+        }
+    }
+
+    fn make_locked_dep(name: &str, identity: Option<&str>, provs: Vec<ProvenanceRecord>) -> LockedDep {
+        LockedDep {
+            name: name.into(),
+            version: "1.0.0".into(),
+            src_dir: "src".into(),
+            requires: vec![],
+            aliases: vec![],
+            identity: identity.map(String::from),
+            active_flags: vec![],
+            dep_decl: None,
+            cond_requires: vec![],
+            provenances: provs,
+        }
+    }
+
+    /// A dep with a declared Git provenance keeps only that declared record after
+    /// strip_dep_pin; identity is cleared.
+    #[test]
+    fn strip_dep_pin_keeps_declared_provenance_clears_identity() {
+        let declared = make_git_prov("declared");
+        let dep = make_locked_dep("foo", Some(VALID_ID), vec![declared.clone()]);
+        let lf = Lockfile {
+            version: 1,
+            strategy: "maxver".into(),
+            deps: vec![dep],
+        };
+
+        let result = strip_dep_pin(lf, "foo");
+
+        assert_eq!(result.deps.len(), 1);
+        let stripped = &result.deps[0];
+        assert_eq!(stripped.name, "foo");
+        assert!(stripped.identity.is_none(), "identity must be cleared");
+        assert_eq!(stripped.provenances.len(), 1);
+        assert_eq!(stripped.provenances[0], declared);
+    }
+
+    /// A dep with only a resolved/non-declared Git provenance has it dropped;
+    /// identity is cleared and no provenances survive.
+    #[test]
+    fn strip_dep_pin_drops_resolved_provenances() {
+        let resolved = make_git_prov("resolved");
+        let dep = make_locked_dep("bar", Some(VALID_ID), vec![resolved]);
+        let lf = Lockfile {
+            version: 1,
+            strategy: "maxver".into(),
+            deps: vec![dep],
+        };
+
+        let result = strip_dep_pin(lf, "bar");
+
+        let stripped = &result.deps[0];
+        assert!(stripped.identity.is_none(), "identity must be cleared");
+        assert!(
+            stripped.provenances.is_empty(),
+            "non-declared provenance must be dropped: {:?}",
+            stripped.provenances
+        );
+    }
+
+    /// Mixed declared + resolved provenances: only declared Git records survive.
+    #[test]
+    fn strip_dep_pin_keeps_declared_drops_resolved_mixed() {
+        let declared = make_git_prov("declared");
+        let resolved = make_git_prov("resolved");
+        let dep = make_locked_dep("baz", Some(VALID_ID), vec![declared.clone(), resolved]);
+        let lf = Lockfile {
+            version: 1,
+            strategy: "maxver".into(),
+            deps: vec![dep],
+        };
+
+        let result = strip_dep_pin(lf, "baz");
+
+        let stripped = &result.deps[0];
+        assert!(stripped.identity.is_none());
+        assert_eq!(stripped.provenances, vec![declared]);
+    }
+
+    /// Other deps in the lockfile are unchanged after stripping one dep's pin.
+    #[test]
+    fn strip_dep_pin_leaves_other_deps_unchanged() {
+        let dep_a = make_locked_dep("a", Some(VALID_ID), vec![make_git_prov("resolved")]);
+        let dep_b = make_locked_dep("b", Some(VALID_ID), vec![make_git_prov("declared")]);
+        let lf = Lockfile {
+            version: 1,
+            strategy: "maxver".into(),
+            deps: vec![dep_a, dep_b.clone()],
+        };
+
+        let result = strip_dep_pin(lf, "a");
+
+        // dep_b must be entirely unchanged
+        let b = result.deps.iter().find(|d| d.name == "b").unwrap();
+        assert_eq!(b.identity.as_deref(), Some(VALID_ID));
+        assert_eq!(b.provenances, dep_b.provenances);
     }
 }

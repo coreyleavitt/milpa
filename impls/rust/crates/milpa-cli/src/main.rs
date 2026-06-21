@@ -892,34 +892,9 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
                 eprintln!("milpa-error: LOCK-DEP-NOT-FOUND");
                 return Ok(1);
             }
-            // Build a filtered prior: keep all deps EXCEPT the canonical being
-            // updated, then add back a "pin-stripped" entry that retains its
-            // declared mirror provenances (Phase D item 5: explicit provenance
-            // preservation). Stripping identity → None means git_pin() returns
-            // (None, None) → the dep re-resolves fresh.
-            let updated = full.deps.iter().find(|d| d.name == canonical).unwrap().clone();
-            // Keep only declared Git provenances (drop observed — those carry the commit pin).
-            let declared_provs: Vec<milpa_core::ProvenanceRecord> = updated
-                .provenances
-                .iter()
-                .filter(|p| {
-                    matches!(
-                        p,
-                        milpa_core::ProvenanceRecord::Git { origin, .. }
-                        if origin == "declared"
-                    )
-                })
-                .cloned()
-                .collect();
-            let pin_stripped = milpa_core::LockedDep {
-                identity: None,
-                provenances: declared_provs,
-                ..updated
-            };
-            let mut prior = full;
-            prior.deps.retain(|d| d.name != canonical);
-            prior.deps.push(pin_stripped);
-            Some(prior)
+            // Strip the pin for the canonical dep: retains declared Git provenances
+            // (Phase D item 5) and clears identity → dep re-resolves fresh.
+            Some(milpa_core::strip_dep_pin(full, &canonical))
         }
     };
 
@@ -979,22 +954,9 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
                     eprintln!("milpa-error: LOCK-DEP-NOT-FOUND");
                     return Ok(1);
                 }
-                let updated = full.deps.iter().find(|d| d.name == canonical).unwrap().clone();
-                let declared_provs: Vec<milpa_core::ProvenanceRecord> = updated
-                    .provenances
-                    .iter()
-                    .filter(|p| matches!(p, milpa_core::ProvenanceRecord::Git { origin, .. } if origin == "declared"))
-                    .cloned()
-                    .collect();
-                let pin_stripped = milpa_core::LockedDep {
-                    identity: None,
-                    provenances: declared_provs,
-                    ..updated
-                };
-                let mut prior = full;
-                prior.deps.retain(|d| d.name != canonical);
-                prior.deps.push(pin_stripped);
-                Some(prior)
+                // Strip the pin for the canonical dep: retains declared Git provenances
+                // (Phase D item 5) and clears identity → dep re-resolves fresh.
+                Some(milpa_core::strip_dep_pin(full, &canonical))
             }
         };
         let graph = resolve_workspace_with_features(
