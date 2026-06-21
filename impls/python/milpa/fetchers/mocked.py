@@ -12,7 +12,6 @@ This module provides:
 2. **Per-kind mocked fetchers**:
    - ``MockedGitFetcher``     — reads sha + content from ``mocked-fetches/<url_key>/``
    - ``MockedTarballFetcher`` — reads archive_sha256 + content (§2.3.4)
-   - ``MockedLocalFetcher``   — copies content from ``mocked-fetches/<url_key>/``
    - ``MockedOciFetcher``     — stub (no OCI fixtures defined at v1)
 
    Each implements ``can_handle`` + ``fetch`` once; the ``FetcherRegistry``'s

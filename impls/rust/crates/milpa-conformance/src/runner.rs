@@ -811,11 +811,31 @@ impl Target for MilpaTarget {
                 std::fs::write(scratch.root.join("milpa.lock"), &ltext)
                     .map_err(|e| format!("E2E-LOCKFILE-WRITE: {e}"))?;
 
+                // Load the workspace once for both the frozen-flags mismatch check
+                // (S11b, Breadth-P2c) and the §13.1 strict-policy derivation.
+                // A single load is sufficient — both checks read the same on-disk
+                // state and neither mutates it.
+                let ws_loaded_for_verify = if matches!(doc, ManifestDoc::Workspace(_)) {
+                    Some(milpa_core::load_workspace(&project_root))
+                } else {
+                    None
+                };
+
                 // S11b (Breadth-P2c): workspace frozen-flags mismatch check.
                 // Runs BEFORE disk check, matching cmd_verify's ordering.
-                if let ManifestDoc::Workspace(_) = doc {
-                    let loaded_verify = match milpa_core::load_workspace(&project_root) {
-                        Ok(w) => w,
+                if let Some(ref ws_result) = ws_loaded_for_verify {
+                    match ws_result {
+                        Ok(loaded_verify) => {
+                            if let Err(e) = milpa_core::check_workspace_frozen_active_flags_mismatch(
+                                loaded_verify,
+                                &lock,
+                                &std::collections::BTreeSet::new(),
+                                false,
+                                false,
+                            ) {
+                                return Err(e.code().to_string());
+                            }
+                        }
                         Err(_) => {
                             // workspace load failed — fall through to disk check
                             let divergences = milpa_core::verify_lockfile_against_deps(&lock, &scratch.deps_dir);
@@ -824,15 +844,6 @@ impl Target for MilpaTarget {
                             }
                             return Ok(Produced::NoByteDiff);
                         }
-                    };
-                    if let Err(e) = milpa_core::check_workspace_frozen_active_flags_mismatch(
-                        &loaded_verify,
-                        &lock,
-                        &std::collections::BTreeSet::new(),
-                        false,
-                        false,
-                    ) {
-                        return Err(e.code().to_string());
                     }
                 }
 
@@ -864,10 +875,11 @@ impl Target for MilpaTarget {
                         milpa_core::effective_strict_policy(&m.attestation_policy, flag_strict)
                     }
                     ManifestDoc::Workspace(_) => {
-                        // Workspace: OR across all members (+ flag).
-                        match milpa_core::load_workspace(&project_root) {
-                            Ok(ws) => milpa_core::workspace_any_member_strict(&ws) || flag_strict,
-                            Err(_) => flag_strict,
+                        // Workspace: OR across all members (+ flag). Reuse the
+                        // single load from ws_loaded_for_verify (no second I/O).
+                        match ws_loaded_for_verify.as_ref().and_then(|r| r.as_ref().ok()) {
+                            Some(ws) => milpa_core::workspace_any_member_strict(ws) || flag_strict,
+                            None => flag_strict,
                         }
                     }
                 };
@@ -982,9 +994,53 @@ fn fixture_require_attested_metadata(dir: &Path) -> bool {
 /// §2.8.1: resolve the fixture's project root. When a `project-dir` control file
 /// is present, the root is `<fixture>/<trimmed contents>`; otherwise it is the
 /// fixture dir itself. Mirrors the black-box harness and the Python adapter.
+///
+/// Confinement: the suffix MUST be relative (not absolute) and MUST NOT escape
+/// the fixture root after path normalization. An absolute suffix would let
+/// `Path::join` silently discard `fx.dir`, and `..` components could escape the
+/// fixture sandbox. Either condition is a fixture-authoring error; panic with a
+/// clear message rather than silently reading from an unintended location.
 fn fixture_project_root(fx: &Fixture) -> PathBuf {
     match std::fs::read_to_string(fx.dir.join("project-dir")) {
-        Ok(s) if !s.trim().is_empty() => fx.dir.join(s.trim()),
+        Ok(s) if !s.trim().is_empty() => {
+            let suffix = Path::new(s.trim());
+            assert!(
+                !suffix.is_absolute(),
+                "project-dir must be a relative path, got absolute: {:?}",
+                suffix
+            );
+            let joined = fx.dir.join(suffix);
+            // Normalize by resolving `.` and `..` lexically without requiring
+            // the path to exist on disk (canonicalize would fail for non-existent
+            // paths). We walk the components and track whether we would escape
+            // fx.dir.
+            let mut components: Vec<std::ffi::OsString> = fx
+                .dir
+                .components()
+                .map(|c| c.as_os_str().to_os_string())
+                .collect();
+            let base_depth = components.len();
+            for component in suffix.components() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        assert!(
+                            components.len() > base_depth,
+                            "project-dir escapes fixture root: {:?} applied to {:?}",
+                            suffix,
+                            fx.dir
+                        );
+                        components.pop();
+                    }
+                    std::path::Component::CurDir => {} // skip `.`
+                    std::path::Component::Normal(part) => components.push(part.to_os_string()),
+                    other => panic!(
+                        "unexpected path component {:?} in project-dir {:?}",
+                        other, suffix
+                    ),
+                }
+            }
+            joined
+        }
         _ => fx.dir.clone(),
     }
 }

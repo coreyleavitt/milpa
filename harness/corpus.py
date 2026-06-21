@@ -115,8 +115,9 @@ class SkipRecord:
 class DivergenceRecord:
     fixture_name: str
     cmd: str
-    output_file: str                      # e.g. "expected/milpa.lock"
+    output_file: str                      # e.g. "expected/milpa.lock"; "<conformance-verdict>" for verdict asymmetries
     impls: dict[str, str]                 # impl_name -> normalized content/slug
+    is_verdict_asymmetry: bool = False    # True when impls disagree on pass/fail, not on output bytes
 
 
 @dataclass
@@ -210,6 +211,7 @@ def _detect_divergences(
             cmd=cmd,
             output_file="<conformance-verdict>",
             impls=impls_view,
+            is_verdict_asymmetry=True,
         ))
 
     # (2) Normative-surface disagreement among co-passers.

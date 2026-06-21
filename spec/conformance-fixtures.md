@@ -648,14 +648,18 @@ the CAS-admission and symlink-creation steps defined in `spec/identity.md`
 ### 2.8.1  `project-dir` — project-root subpath (optional)
 
 > NORMATIVE: If present, `project-dir` MUST be a plain text file whose single
-> trimmed line names a path **relative to the fixture root**. The runner MUST use
-> `<fixture-root>/<project-dir>` as the project root for the run — i.e. the
-> directory it passes to the implementation as `-C <dir>` (`spec/cli-contract.md`
-> §2.1). When `project-dir` is absent, the project root is the fixture root
-> itself. This lets a fixture place the project under a subdirectory of the
-> fixture tree — required when the manifest or workspace root must be nested (for
-> example, to test member-relative invocation, or a containment/symlink-escape
-> case where the fixture root must sit *above* the workspace root).
+> trimmed line names a path **relative to the fixture root**. The path MUST be
+> relative (no leading `/`) and MUST NOT escape the fixture root after
+> normalization (no `..` components that resolve above the fixture root). A
+> runner MUST reject a `project-dir` value that violates either constraint. The
+> runner MUST use `<fixture-root>/<project-dir>` as the project root for the
+> run — i.e. the directory it passes to the implementation as `-C <dir>`
+> (`spec/cli-contract.md` §2.1). When `project-dir` is absent, the project root
+> is the fixture root itself. This lets a fixture place the project under a
+> subdirectory of the fixture tree — required when the manifest or workspace root
+> must be nested (for example, to test member-relative invocation, or a
+> containment/symlink-escape case where the fixture root must sit *above* the
+> workspace root).
 
 > NORMATIVE: `project-dir` selects only the project root; all other control
 > inputs (`mocked-fetches/`, `index.kdl`, `cas-seed/`, `dep-decl/`, `env`) and

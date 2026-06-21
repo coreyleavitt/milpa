@@ -124,4 +124,20 @@ D1/D2/D3 → new `harness/inputs.py` owns `read_env_file`/`env_flag`/`parse_cli_
 | — | — | R3 design re-review | clean | SSOT chain complete; no remaining dup defs; deps sane; no circular |
 | — | — | R3 security re-review | clean | pure move+rename; no new surface; pre-existing 2 Lows untouched |
 
-**FLOOR:** Round 3 found 0 Critical/High/Medium. Remaining open = Lows only: D6 (pass-through wrapper), L1 (regex brittle/quadratic, harness-only), L2 (project-dir scratch confinement + spec wording), L3 (`<conformance-verdict>` sentinel typing), L4 (mocked.py stale docstring), L5 (double load_workspace in verify), L6 (redundant cmd read), D4 (sys.path→pyproject). All harness/test-scope or cosmetic. Two pre-existing parked forks unchanged: cert fixtures 127/128/150 (Python `--certificate`), c4 partial-profile (#159/#160/#110).
+**FLOOR:** Round 3 found 0 Critical/High/Medium.
+
+### Low cleanup pass (all fixed except D4, uncommitted→committed)
+| id | finding | status | proof |
+|----|---------|--------|-------|
+| D6 | `_fixture_env_vars` pass-through wrapper | fixed | deleted; 5 call sites → `read_env_file` directly |
+| L1 | `_DEP_IDENTITY_RE` brittle/quadratic | fixed | `[^}]*?` (no DOTALL); spec-grounded (lockfile-schema §2.4: identity first, provenance last); ALSO fixed a real latent mispairing (old `.*?` crossed blocks, masked because unused) |
+| L2 | project-dir not confined | fixed | `harness/inputs.py::resolve_project_dir` (SSOT) rejects absolute/escape; py runner+adapter + rust `fixture_project_root` call it; spec §2.8.1 normative sentence added |
+| L3 | `<conformance-verdict>` sentinel | fixed | `DivergenceRecord.is_verdict_asymmetry: bool` discriminant |
+| L4 | mocked.py stale docstring | fixed | MockedLocalFetcher bullet removed |
+| L5 | double load_workspace in verify | fixed | load once, reuse (py + rust) |
+| L6 | redundant cmd read | fixed | `Fixture.__init__` parses cmd once |
+| D4 | sys.path→pyproject harness dep | DEFERRED | packaging change against unstable harness; reviewer-flagged premature; revisit at harness stabilization |
+
+GATES after Low pass: py 2148 pass/0 fail; rust conformance ok; black-box harness OVERALL PASS, divergences NONE.
+
+**Two pre-existing parked FORKS (awaiting Corey — next topic):** cert fixtures 127/128/150 (Python `--certificate` unimplemented), c4 partial-profile absent-axis (#159/#160/#110).

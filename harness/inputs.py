@@ -7,6 +7,7 @@ Public API:
   read_env_file(fixture_dir) -> dict[str, str]
   env_flag(env, key) -> bool
   parse_cli_features(env) -> frozenset[str]
+  resolve_project_dir(root, suffix) -> Path
 """
 
 from __future__ import annotations
@@ -46,6 +47,37 @@ def env_flag(env: dict[str, str], key: str) -> bool:
     """
     v = env.get(key, "")
     return bool(v and v not in ("0", "false"))
+
+
+def resolve_project_dir(root: Path, suffix: str) -> Path:
+    """Resolve and confine a project-dir suffix to within ``root``.
+
+    SINGLE DEFINITION for the confinement logic used by the black-box harness
+    (runner.py) and the in-process adapter (test_conformance.py).
+
+    Rules (spec/conformance-fixtures.md §2.8.1 NORMATIVE):
+    - ``suffix`` MUST be relative (not an absolute path).
+    - After joining and normalising, the result MUST NOT escape ``root``
+      (no ``..`` traversal above the root).
+
+    Raises ``ValueError`` on any violation.  Callers handle the "absent →
+    use root" fallback before calling this function.
+    """
+    p = Path(suffix)
+    if p.is_absolute():
+        raise ValueError(
+            f"project-dir MUST be relative, got absolute path: {suffix!r}"
+        )
+    resolved = (root / p).resolve()
+    root_resolved = root.resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError:
+        raise ValueError(
+            f"project-dir escapes fixture root: {suffix!r} resolves to "
+            f"{resolved} which is outside {root_resolved}"
+        )
+    return resolved
 
 
 def parse_cli_features(env: dict[str, str]) -> frozenset[str]:

@@ -76,6 +76,7 @@ from harness.inputs import (  # noqa: E402
     env_flag,
     parse_cli_features,
     read_env_file,
+    resolve_project_dir,
 )
 
 from milpa.cas import CAStore
@@ -161,29 +162,26 @@ class Fixture:
     def __init__(self, fixture_id: str, fixture_dir: Path) -> None:
         self.id = fixture_id          # e.g. "spec-v1/fixture-003-single-url-dep"
         self.dir = fixture_dir        # absolute path to the fixture directory
-        self.cmd: str = self._read_cmd()
-        self.no_index: bool = self._read_no_index()
+        # Parse the cmd file once; derive both self.cmd and self.no_index from
+        # the same text (L6: avoid reading the file twice).
+        cmd_file = fixture_dir / "cmd"
+        if cmd_file.exists():
+            _cmd_text = cmd_file.read_text(encoding="utf-8")
+        else:
+            _cmd_text = ""
+        self.cmd: str = self._parse_cmd(_cmd_text)
+        self.no_index: bool = "--no-index" in _cmd_text.split()
         self.expected_error: str | None = self._read_expected_error()
 
-    def _read_no_index(self) -> bool:
-        """Whether the fixture cmd carries the ``--no-index`` global flag.
+    @staticmethod
+    def _parse_cmd(text: str) -> str:
+        """Derive the cmd selector from the raw cmd file text (or empty string).
 
-        The in-process adapter must honor it exactly as the CLI does
-        (cli-contract §2.6): suppress the index so a named dep raises
-        RES-NO-INDEX even when index.kdl is present.
+        The first whitespace-separated token is the selector; absent or
+        ``resolve`` → ``"resolve"``.
         """
-        cmd_file = self.dir / "cmd"
-        if not cmd_file.exists():
-            return False
-        return "--no-index" in cmd_file.read_text(encoding="utf-8").split()
-
-    def _read_cmd(self) -> str:
-        cmd_file = self.dir / "cmd"
-        if not cmd_file.exists():
-            return "resolve"
-        text = cmd_file.read_text(encoding="utf-8").strip()
-        # First whitespace-separated token is the selector.
-        head = text.split()[0] if text else ""
+        stripped = text.strip()
+        head = stripped.split()[0] if stripped else ""
         if not head or head == "resolve":
             return "resolve"
         return head
@@ -262,7 +260,7 @@ def _fixture_profile(fixture_dir: Path) -> Profile | None:
     §470); host-defaulting belongs to the CLI, not the host-independent corpus
     runner.
     """
-    env_vars = _fixture_env_vars(fixture_dir)
+    env_vars = read_env_file(fixture_dir)
     if not env_vars:
         return None
 
@@ -291,20 +289,11 @@ def _fixture_require_attested_metadata(fixture_dir: Path) -> bool:
     """Return True when MILPA_REQUIRE_ATTESTED_METADATA is set in the fixture env file.
 
     Mirrors the Rust runner's fixture_require_attested_metadata() function.
-    Delegates to _fixture_env_vars (the canonical env-file parser) and
-    env_flag (the canonical boolean-flag interpreter from harness/inputs.py).
+    Delegates to ``read_env_file`` (the canonical env-file parser from
+    harness/inputs.py) and ``env_flag`` (the canonical boolean-flag interpreter).
     """
-    env = _fixture_env_vars(fixture_dir)
+    env = read_env_file(fixture_dir)
     return env_flag(env, "MILPA_REQUIRE_ATTESTED_METADATA")
-
-
-def _fixture_env_vars(fixture_dir: Path) -> dict[str, str]:
-    """Parse the fixture's optional ``env`` file into a dict of KEY=VALUE pairs.
-
-    One-line delegate to ``harness.inputs.read_env_file`` — the SINGLE
-    DEFINITION of fixture env-file parsing (D1 unification).
-    """
-    return read_env_file(fixture_dir)
 
 
 def _fixture_cli_features(fixture_dir: Path) -> frozenset[str]:
@@ -316,7 +305,7 @@ def _fixture_cli_features(fixture_dir: Path) -> frozenset[str]:
     Delegates to ``parse_cli_features`` from harness/inputs.py —
     the SINGLE DEFINITION of fixture feature-flag semantics (M1 unification).
     """
-    return parse_cli_features(_fixture_env_vars(fixture_dir))
+    return parse_cli_features(read_env_file(fixture_dir))
 
 
 def _fixture_no_default_features(fixture_dir: Path) -> bool:
@@ -325,7 +314,7 @@ def _fixture_no_default_features(fixture_dir: Path) -> bool:
     S9: mirrors CLI's --no-default-features.
     Delegates to ``env_flag`` from harness/inputs.py (M1 unification).
     """
-    return env_flag(_fixture_env_vars(fixture_dir), "MILPA_NO_DEFAULT_FEATURES")
+    return env_flag(read_env_file(fixture_dir), "MILPA_NO_DEFAULT_FEATURES")
 
 
 def _fixture_all_features(fixture_dir: Path) -> bool:
@@ -334,7 +323,7 @@ def _fixture_all_features(fixture_dir: Path) -> bool:
     S9: mirrors CLI's --all-features.
     Delegates to ``env_flag`` from harness/inputs.py (M1 unification).
     """
-    return env_flag(_fixture_env_vars(fixture_dir), "MILPA_ALL_FEATURES")
+    return env_flag(read_env_file(fixture_dir), "MILPA_ALL_FEATURES")
 
 
 # ---------------------------------------------------------------------------
@@ -479,9 +468,10 @@ def _execute_fixture(
     # other control inputs (mocked-fetches/, index.kdl, cas-seed/, dep-decl/,
     # expected/) stay rooted at fixture_dir; only the manifest/workspace load
     # uses project_root. Mirrors the black-box harness (runner.py).
+    # resolve_project_dir confines the suffix to within fixture_dir (L2).
     _pd_file = fixture_dir / "project-dir"
     project_root = (
-        fixture_dir / _pd_file.read_text(encoding="utf-8").strip()
+        resolve_project_dir(fixture_dir, _pd_file.read_text(encoding="utf-8").strip())
         if _pd_file.is_file()
         else fixture_dir
     )
@@ -924,9 +914,10 @@ def _execute_verify(
     fixture_dir = fixture.dir
     # M6: compute project_root from the project-dir control file, mirroring
     # the resolve path and the black-box harness (runner.py §2.8.1).
+    # resolve_project_dir confines the suffix to within fixture_dir (L2).
     _pd_file = fixture_dir / "project-dir"
     project_root = (
-        fixture_dir / _pd_file.read_text(encoding="utf-8").strip()
+        resolve_project_dir(fixture_dir, _pd_file.read_text(encoding="utf-8").strip())
         if _pd_file.is_file()
         else fixture_dir
     )
@@ -1001,15 +992,18 @@ def _execute_verify(
 
     # §13.1: effective strict = OR(manifest attestation-policy "strict", flag).
     # Reuse the same SSOT helper as the CLI cmd_verify.
+    # Load workspace once and reuse for both the attestation-policy check and
+    # the frozen-flags mismatch check below (L5: avoid double load_workspace).
     from milpa.attestation import effective_strict_policy
+    loaded_ws_verify = None
     if isinstance(doc, WorkspaceManifest):
         # Workspace: OR across all members (same rule as resolve_workspace).
         try:
             # M6: use project_root for all workspace loads in verify path.
-            loaded_ws_for_policy = load_workspace(project_root)
+            loaded_ws_verify = load_workspace(project_root)
             _strict = flag_require_attested or any(
                 effective_strict_policy(m.manifest.attestation_policy, False)
-                for m in loaded_ws_for_policy.members
+                for m in loaded_ws_verify.members
             )
         except MilpaError:
             _strict = flag_require_attested
@@ -1022,8 +1016,9 @@ def _execute_verify(
     # defaults (no CLI feature overrides at verify time).
     if isinstance(doc, WorkspaceManifest):
         try:
-            # M6: use project_root for all workspace loads in verify path.
-            loaded_ws_verify = load_workspace(project_root)
+            # Reuse loaded_ws_verify from above (loaded once for this verify path).
+            if loaded_ws_verify is None:
+                loaded_ws_verify = load_workspace(project_root)
             from milpa.cli import _check_workspace_frozen_active_flags_mismatch
             _check_workspace_frozen_active_flags_mismatch(
                 loaded_ws_verify,

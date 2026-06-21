@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from harness.descriptors import ImplDescriptor
-from harness.inputs import env_flag, read_env_file
+from harness.inputs import env_flag, read_env_file, resolve_project_dir
 
 
 # ---------------------------------------------------------------------------
@@ -174,11 +174,14 @@ def _extract_slug(stderr: str) -> tuple[Optional[str], Optional[str]]:
 # _add_feature_args is applied to fetch/lock/update).
 _FEATURE_VERBS = frozenset({"fetch", "lock", "update"})
 
-# Pairs each `dep "<name>"` with the first identity in its block. Non-greedy so a
-# dep binds to ITS own identity (identity is the first field in each dep block).
+# Pairs each `dep "<name>"` with its identity field.
+# [^}]*? stays within the current dep block — never crosses the closing `}` into
+# the next block. This is safe because the lockfile format places `identity` as a
+# single-line field inside its dep block, and nested blocks (provenance { })
+# contain no `}` that would prematurely close the outer match. Deps that have no
+# identity field (e.g. local deps) simply produce no match, which is correct.
 _DEP_IDENTITY_RE = re.compile(
-    r'dep "([^"]+)"\s*\{.*?identity "(sha256:[0-9a-f]{64})"',
-    re.DOTALL,
+    r'dep "([^"]+)"\s*\{[^}]*?identity "(sha256:[0-9a-f]{64})"',
 )
 
 
@@ -445,8 +448,9 @@ def run_fixture(
 
         # S11e: if the fixture specifies a project-dir sub-path, use it as
         # the -C argument (e.g. "member-a" → -C <scratch>/member-a).
+        # resolve_project_dir confines the suffix to within scratch (L2).
         if project_dir_suffix:
-            project_path = str(scratch / project_dir_suffix)
+            project_path = str(resolve_project_dir(scratch, project_dir_suffix))
         else:
             project_path = str(scratch)
 
