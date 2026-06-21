@@ -433,7 +433,62 @@ for an unknown period because nothing checks fixtures statically. Add a lint
 fixture **directory name** is semantically consistent with `expected/error`. Run it in
 the §3.6 harness CI job.
 
-### Phase 2 slices
+### Phase 2 Layer A slices — infra (do FIRST; not gated)
+
+Layer A makes the parity machinery itself trustworthy before any new fixtures land.
+The three deliverables of §2/§5 above (D1 SSOT, the static lint, the `pin.py`
+ergonomics) are sliced here. None depend on S4a; all are mechanical-to-moderate.
+
+- **S-A1 — D1 normative-surfaces SSOT (`harness/surfaces.py`).** Extract the
+  comparison set (`NORMATIVE_FILES` / `LIVENESS_CMDS` / `EMPTY_STDOUT_VERBS` /
+  `NORMATIVE_EXIT_CODES` / `ABSENT_PATHS_SURFACE`) out of `assertions.py` into a new
+  `harness/surfaces.py`; `assertions.py` derives its logic from it (nothing re-states
+  the set inline). Strengthen the top-of-doc **Normative surface** block in
+  `spec/conformance-fixtures.md` to formally enumerate the normative/non-normative
+  split and cite `cli-contract.md §3.1` (do NOT create a new `§5`). RED = a harness
+  unit test asserting `assertions.py`'s surface set is sourced from `surfaces.py`
+  (e.g. monkder/patch the module and observe the comparison change), plus a lint test
+  asserting the spec prose enumeration and `surfaces.py` agree. No behavior change to
+  the corpus run. *(Python/harness.)*
+- **S-A1b — D1 new enforcement (empty-stdout + exact exit code).** Wire the two
+  surfaces D1 declares but the harness does NOT enforce today: `EMPTY_STDOUT_VERBS`
+  (`fetch`/`lock`/`verify`/`clean`/`add`/`remove`/`update` MUST emit empty stdout on
+  success, `cli-contract §4`) and the **exact** process exit code (0/1/2 per
+  `cli-contract §3`, not merely zero-vs-nonzero, incl. surfacing an impl that exits 2
+  where another exits 1). Both constants live in `surfaces.py` (from S-A1) and are
+  wired here alongside their assertions — no dead constants. RED = a harness unit test
+  that a success fixture emitting non-empty stdout on a non-liveness verb is flagged;
+  GREEN = it is. **This slice CAN change corpus results** (by design — it catches
+  divergences invisible today); re-run `python3 -m harness` after and treat any
+  residual asymmetry per Slice A. *(Python/harness.)*
+- **S-A2 — `certificate.json` canonicalization = RFC 8785 JCS.** Define the
+  canonicalization normatively in `spec/conformance-fixtures.md` (sorted keys, no
+  insignificant whitespace, fixed number formatting per JCS) so the "canonical-equal"
+  claim is no longer hand-waved. First verify whether both impls already emit
+  JCS-equal output (fixture-150 passes today); if so the slice is spec-+-assertion
+  (`compare_certificate_json` canonicalizes per JCS before diffing) — if not, align
+  both impls' cert serializers to emit JCS. RED = a test feeding two
+  key-order-permuted-but-equal certs and asserting `compare_certificate_json` treats
+  them equal, plus a per-impl test that emitted output is JCS-canonical. Gate Python
+  via `uv run pytest`; Rust via `./dev-rust test -p milpa-conformance` if the Rust
+  serializer changes. *(Cross-impl if serializers change; else Python/harness + spec.)*
+- **S-A3 — static corpus lint (fixture-rot guard).** A lint runnable without
+  executing any impl asserting, for every fixture: (a) `expected/error` (when present)
+  contains a slug that exists in `spec/errors.md`; (b) the slug in the fixture
+  **directory name** is semantically consistent with `expected/error`. RED = the lint
+  fails on a deliberately-corrupted temp fixture (unknown slug / name mismatch);
+  GREEN = it passes the real corpus. Wire it into the §3.6 harness CI job.
+  *(Python/harness.)*
+- **S-A4 — `pin.py` ergonomics (`python3 -m harness pin <dir>`).** One command that
+  (a) runs both impls, (b) emits a candidate fixture dir + `divergence.json`, (c)
+  takes a single interactive gate — which impl is spec-correct (subject to the
+  field-level derivation rule, §5) — and (d) re-runs the harness to confirm the pinned
+  fixture passes for the winning impl. Document `pin.py`'s current arguments so the gap
+  is explicit. RED = a test driving the non-interactive core of the flow on a synthetic
+  divergence and asserting the emitted fixture dir shape; GREEN = it produces a
+  harness-passing fixture. *(Python/harness.)*
+
+### Phase 2 Layer B / C slices — fixtures (after Layer A; C is gated)
 
 - **S4 — adversarial corrupt tar archives (#148).** **Blocked on a mechanism gap
   (round-2 finding):** the RFC's "ship a pre-built corrupt archive (no `format` file ⇒

@@ -1,7 +1,41 @@
 # rfc-conformance-parity — handoff
 
-- **Stage:** 4 (/code-review) COMPLETE — 3 rounds to floor + Low pass committed; forks resolved.
-- **Resume:** stage 4 done. Remaining = Phase 2 (gated on differential-harness RFC) + the deferred D4 Low. If the in-flight fixture-150 fix agent landed, commit it.
+- **Stage:** 3 (/tdd) — Phase 2 Layer A. SLICED (S-A1..S-A4 in RFC §5). Grinding.
+- **Resume:** `/tdd slice S-A1` (D1 surfaces SSOT) → S-A2 (cert JCS) → S-A3 (corpus lint) → S-A4 (pin.py). Then Layer B (S6 #166, S7 #135); Layer C gated (S4a→S4 #148). D4 Low + S5 (#146) stay deferred.
+
+## Phase 2 Layer A — slices (chosen direction; recorded 2026-06-21)
+- [x] **S-A1** — D1 normative-surfaces SSOT: `harness/surfaces.py` (FileSurface + named role constants LOCK_FILE/ROOT_NIMCFG/MANIFEST_FILE/DEPS_STRUCTURE_FILE/CERTIFICATE_FILE; NORMATIVE_FILES built from them; LIVENESS_CMDS/EXPECTED_EXIT_CODE/ABSENT_PATHS_SURFACE) + assertions.py derives (no surface literal inline) + test_surfaces.py SSOT proof + spec prose normative block strengthened. Pure refactor; harness 279/279 both impls div NONE, py 2149 pass, harness 196 pass. DONE.
+- [ ] **S-A1b** — D1 new enforcement: wire EMPTY_STDOUT_VERBS + exact exit-code (incl. 2). CAN change corpus results (by design); re-run harness, treat asymmetry per Slice A.
+- [ ] **S-A2** — `certificate.json` JCS (RFC 8785) canonicalization: spec it; verify both impls already JCS-equal (150 passes) else align serializers; compare canonically.
+- [ ] **S-A3** — static corpus lint (fixture-rot guard): slug∈errors.md + dir-name match; runs without impls; wire into §3.6 CI job.
+- [ ] **S-A4** — `pin.py` ergonomics: `python3 -m harness pin <dir>` one-command flow.
+
+## CURRENT STATE (2026-06-21) — BLACK-BOX HARNESS FULLY GREEN
+`python PASS=279 FAIL=0 known_failing=EMPTY`, `rust PASS=279 FAIL=0 known_failing=EMPTY`,
+cross-impl divergences NONE. Every black-box fixture passes for both impls with ZERO
+per-impl skips. Only 6 structural KNOWN_LIMITATIONS remain (cmd has no CLI surface:
+roundtrip fixtures; ws member nim.cfg layout; + c4 255/256 routed to #110).
+Commits this arc: ea136d0 (SSOT seam) · 1fcca68 (Lows) · 4c5d4fc (fixture-150 cert parity).
+
+### Forks — RESOLVED
+- Fork 1 (cert): 127/128 were stale skips (Python passes). 150 = real parity bug, FIXED
+  (4c5d4fc) — Python writes kind:failure cert for non-solver failures. known_failing empty.
+- Fork 2 (c4 partial-profile 255/256): routed to #110 (comment 4763087221). CLI host-defaults
+  absent axes by deliberate §8 design; conservative fix = empty-string=None three-way, awaits
+  #110 decision. 255/256 stay in-process-deferred.
+
+### Phase 2 — direction decided
+- **Layer A (infra) FIRST** — chosen. Three pieces: (1) D1 normative-surfaces SSOT
+  (`harness/surfaces.py` + spec prose; assertions.py hard-codes it today) INCLUDING the
+  open cert-JSON canonicalization gap (propose RFC 8785 JCS — now extra-relevant post-150);
+  (2) static corpus lint (fixture-rot guard: slug exists in errors.md + matches dir name);
+  (3) pin.py ergonomics (`python3 -m harness pin <dir>`). NOT gated.
+- **Layer B** (unblocked, deferred to after A): S6 ws+dev-deps fixture (#166), S7 show-liveness (#135).
+- **Layer C** (genuinely gated): S4a raw-bytes mock mode → S4 corrupt-tar (#148).
+- **S5 bz2 byte-equality — DESCOPED** to #146 (comment 4763536040); needs S4a + bz2 decode
+  (neither impl has bz2; not a real Nim need). S4a still wanted for S4.
+- NEXT ACTION: slice Layer A into /tdd slices (architect rounds already done for the whole RFC),
+  then grind. Layer A start point: D1 surfaces SSOT extraction is the mechanical, highest-leverage first slice.
 
 ## Stage-4 OUTCOME (2026-06-21)
 Code review: 5 lenses + adversarial verify, 3 fix rounds to floor, Low pass. Commits:

@@ -7,6 +7,12 @@ Design constraints:
 - Normalization of _deps_structure.txt per spec §2.6.
 - Error fixture check: §3 of spec/conformance-fixtures.md.
 - Success fixture check: §2.4/2.5/2.6.
+
+Normative surface set
+---------------------
+All comparison-surface declarations live in ``harness.surfaces`` (S-A1).
+This module imports them and derives its dispatch logic from those constants.
+No normative-surface literal is re-stated here.
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from harness import surfaces
 from harness.runner import RunResult
 
 
@@ -273,7 +280,9 @@ def _assert_check_certificate_fixture(
     # Step 1: certificate file must exist (unless the resolver never ran —
     # a non-resolver error like MAN-KDL-SYNTAX won't have a cert).
     cert_file = Path(run.cert_path) if run.cert_path else None
-    expected_cert_path = expected_dir / "certificate.json"
+    # The authoritative filename comes from the named constant — the SSOT for
+    # the certificate output file (surfaces.CERTIFICATE_FILE).
+    expected_cert_path = expected_dir / surfaces.CERTIFICATE_FILE.name
 
     if expected_cert_path.exists():
         # Fixture declares a certificate — impl must have written one.
@@ -304,7 +313,7 @@ def _assert_check_certificate_fixture(
                     # body (#130), not just kind — two impls that each match
                     # their fixture can still differ from each other in
                     # witness/resolved/refutation, and that must surface.
-                    normalized_outputs["expected/certificate.json"] = json.dumps(
+                    normalized_outputs[f"expected/{surfaces.CERTIFICATE_FILE.name}"] = json.dumps(
                         _canonical_certificate(got_cert), sort_keys=True
                     )
             except Exception as e:
@@ -347,13 +356,14 @@ def _assert_error_fixture(
     error_file = expected_dir / "error"
     expected_slug = error_file.read_text().strip()
 
-    if run.returncode != 1:
+    expected_code = surfaces.EXPECTED_EXIT_CODE["error"]
+    if run.returncode != expected_code:
         failures.append(AssertionFailure(
             fixture_name=run.fixture_name,
             impl_name=run.impl_name,
             kind="error-fixture",
             detail=(
-                f"expected exit 1, got {run.returncode}; "
+                f"expected exit {expected_code}, got {run.returncode}; "
                 f"stderr: {run.stderr!r}"
             ),
         ))
@@ -388,20 +398,24 @@ def _assert_error_fixture(
     # For frozen: milpa.lock is an INPUT (copied to scratch before the run), so its
     #   presence is expected and must NOT be checked. Only nim.cfg is an output here.
     # For parse-lockfile: no scratch output files to check (we skip entirely).
+    #
+    # The filenames are authoritative from the named surface constants.
+    _fn_nimcfg = surfaces.ROOT_NIMCFG.name
+    _fn_lock = surfaces.LOCK_FILE.name
     if cmd == "resolve":
         scratch = Path(run.scratch_dir)
-        if (scratch / "nim.cfg").exists():
+        if (scratch / _fn_nimcfg).exists():
             failures.append(AssertionFailure(
                 fixture_name=run.fixture_name,
                 impl_name=run.impl_name,
                 kind="error-fixture",
                 detail=(
-                    "error fixture left 'nim.cfg' in scratch "
+                    f"error fixture left '{_fn_nimcfg}' in scratch "
                     "(expected atomic-write-on-failure to suppress it)"
                 ),
             ))
-        input_lock = fixture_dir / "milpa.lock"
-        scratch_lock = scratch / "milpa.lock"
+        input_lock = fixture_dir / _fn_lock
+        scratch_lock = scratch / _fn_lock
         if input_lock.exists():
             # §8 refetch fixture: the prior lock must be left untouched on failure.
             if not scratch_lock.exists():
@@ -409,7 +423,7 @@ def _assert_error_fixture(
                     fixture_name=run.fixture_name,
                     impl_name=run.impl_name,
                     kind="error-fixture",
-                    detail="error fixture removed the input 'milpa.lock' (expected it left unchanged)",
+                    detail=f"error fixture removed the input '{_fn_lock}' (expected it left unchanged)",
                 ))
             elif scratch_lock.read_text() != input_lock.read_text():
                 failures.append(AssertionFailure(
@@ -417,7 +431,7 @@ def _assert_error_fixture(
                     impl_name=run.impl_name,
                     kind="error-fixture",
                     detail=(
-                        "error fixture modified 'milpa.lock' "
+                        f"error fixture modified '{_fn_lock}' "
                         "(expected atomic-write-on-failure to leave the prior lock unchanged)"
                     ),
                 ))
@@ -427,20 +441,20 @@ def _assert_error_fixture(
                 impl_name=run.impl_name,
                 kind="error-fixture",
                 detail=(
-                    "error fixture left 'milpa.lock' in scratch "
+                    f"error fixture left '{_fn_lock}' in scratch "
                     "(expected atomic-write-on-failure to suppress it)"
                 ),
             ))
     elif cmd == "frozen":
         scratch = Path(run.scratch_dir)
         # milpa.lock is the INPUT for frozen — skip it.
-        if (scratch / "nim.cfg").exists():
+        if (scratch / _fn_nimcfg).exists():
             failures.append(AssertionFailure(
                 fixture_name=run.fixture_name,
                 impl_name=run.impl_name,
                 kind="error-fixture",
                 detail=(
-                    "error fixture left 'nim.cfg' in scratch "
+                    f"error fixture left '{_fn_nimcfg}' in scratch "
                     "(expected atomic-write-on-failure to suppress it)"
                 ),
             ))
@@ -451,9 +465,12 @@ def _assert_error_fixture(
 # ---------------------------------------------------------------------------
 
 def _is_liveness_cmd(cmd: str) -> bool:
-    """True for cmds whose stdout format is non-frozen (show, --version)."""
+    """True for cmds whose stdout format is non-frozen.
+
+    The authoritative set is ``harness.surfaces.LIVENESS_CMDS``.
+    """
     head = cmd.split()[0] if cmd.split() else ""
-    return head in ("show", "--version")
+    return head in surfaces.LIVENESS_CMDS
 
 
 def _assert_liveness_fixture(
@@ -466,13 +483,14 @@ def _assert_liveness_fixture(
     Per conformance-fixtures §2.7.2: show / --version output format is
     non-frozen for spec v1.0, so the harness checks liveness only.
     """
-    if run.returncode != 0:
+    expected_code = surfaces.EXPECTED_EXIT_CODE["liveness"]
+    if run.returncode != expected_code:
         failures.append(AssertionFailure(
             fixture_name=run.fixture_name,
             impl_name=run.impl_name,
             kind="success-fixture",
             detail=(
-                f"liveness fixture: expected exit 0, got {run.returncode}; "
+                f"liveness fixture: expected exit {expected_code}, got {run.returncode}; "
                 f"stderr: {run.stderr!r}"
             ),
         ))
@@ -515,13 +533,14 @@ def _assert_clean_fixture(
     present (workspaces use per-member nim.cfg), so only member subdirectories
     are checked.  For single-package projects the root ``nim.cfg`` is checked.
     """
-    if run.returncode != 0:
+    expected_code = surfaces.EXPECTED_EXIT_CODE["clean"]
+    if run.returncode != expected_code:
         failures.append(AssertionFailure(
             fixture_name=run.fixture_name,
             impl_name=run.impl_name,
             kind="success-fixture",
             detail=(
-                f"clean fixture: expected exit 0, got {run.returncode}; "
+                f"clean fixture: expected exit {expected_code}, got {run.returncode}; "
                 f"stderr: {run.stderr!r}"
             ),
         ))
@@ -548,14 +567,18 @@ def _assert_clean_fixture(
             detail="clean left '_deps/' in scratch (expected it removed)",
         ))
 
+    # The output filenames are authoritative from the named surface constants.
+    _fn_nimcfg = surfaces.ROOT_NIMCFG.name
+    _fn_manifest = surfaces.MANIFEST_FILE.name
+
     # Root nim.cfg must be absent (single-package case).
-    root_nimcfg = scratch / "nim.cfg"
+    root_nimcfg = scratch / _fn_nimcfg
     if root_nimcfg.exists():
         failures.append(AssertionFailure(
             fixture_name=run.fixture_name,
             impl_name=run.impl_name,
             kind="success-fixture",
-            detail="clean left 'nim.cfg' at project root (expected it removed)",
+            detail=f"clean left '{_fn_nimcfg}' at project root (expected it removed)",
         ))
 
     # Per-member nim.cfg must be absent (workspace case).
@@ -565,16 +588,16 @@ def _assert_clean_fixture(
             continue
         if subdir.name in ("expected", "mocked-fetches", "cas-seed"):
             continue
-        if not (subdir / "milpa.kdl").exists():
+        if not (subdir / _fn_manifest).exists():
             continue
-        member_nimcfg = scratch / subdir.name / "nim.cfg"
+        member_nimcfg = scratch / subdir.name / _fn_nimcfg
         if member_nimcfg.exists():
             failures.append(AssertionFailure(
                 fixture_name=run.fixture_name,
                 impl_name=run.impl_name,
                 kind="success-fixture",
                 detail=(
-                    f"clean left '{subdir.name}/nim.cfg' in scratch "
+                    f"clean left '{subdir.name}/{_fn_nimcfg}' in scratch "
                     f"(expected it removed for workspace member)"
                 ),
             ))
@@ -595,13 +618,14 @@ def _assert_success_fixture(
     normalized_outputs: dict[str, str],
 ) -> None:
     """Assert success fixture: exit 0, no slug, byte-diff outputs."""
-    if run.returncode != 0:
+    expected_code = surfaces.EXPECTED_EXIT_CODE["success"]
+    if run.returncode != expected_code:
         failures.append(AssertionFailure(
             fixture_name=run.fixture_name,
             impl_name=run.impl_name,
             kind="success-fixture",
             detail=(
-                f"expected exit 0, got {run.returncode}; "
+                f"expected exit {expected_code}, got {run.returncode}; "
                 f"stderr: {run.stderr!r}"
             ),
         ))
@@ -618,17 +642,24 @@ def _assert_success_fixture(
 
     scratch = Path(run.scratch_dir)
 
+    # Resolve the normative output filenames from the named surface constants.
+    # These are the single source of truth for which files are compared here.
+    _fn_lock = surfaces.LOCK_FILE.name
+    _fn_nimcfg = surfaces.ROOT_NIMCFG.name
+    _fn_manifest = surfaces.MANIFEST_FILE.name
+    _fn_deps = surfaces.DEPS_STRUCTURE_FILE.name
+
     # milpa.kdl — mutation fixtures (add/remove) byte-compare the post-mutation
     # manifest (conformance-fixtures §2.4.1). Verbatim byte-diff like milpa.lock.
-    expected_manifest = expected_dir / "milpa.kdl"
+    expected_manifest = expected_dir / _fn_manifest
     if expected_manifest.exists():
-        actual_manifest_path = scratch / "milpa.kdl"
+        actual_manifest_path = scratch / _fn_manifest
         if not actual_manifest_path.exists():
             failures.append(AssertionFailure(
                 fixture_name=run.fixture_name,
                 impl_name=run.impl_name,
                 kind="success-fixture",
-                detail="milpa.kdl not present in scratch after mutation",
+                detail=f"{_fn_manifest} not present in scratch after mutation",
             ))
         else:
             actual = actual_manifest_path.read_text()
@@ -638,21 +669,21 @@ def _assert_success_fixture(
                     fixture_name=run.fixture_name,
                     impl_name=run.impl_name,
                     kind="success-fixture",
-                    detail=_diff_summary("milpa.kdl", expected, actual),
+                    detail=_diff_summary(_fn_manifest, expected, actual),
                 ))
             else:
-                normalized_outputs["expected/milpa.kdl"] = actual
+                normalized_outputs[f"expected/{_fn_manifest}"] = actual
 
     # milpa.lock — required for success fixtures that produce it.
-    expected_lock = expected_dir / "milpa.lock"
+    expected_lock = expected_dir / _fn_lock
     if expected_lock.exists():
-        actual_lock_path = scratch / "milpa.lock"
+        actual_lock_path = scratch / _fn_lock
         if not actual_lock_path.exists():
             failures.append(AssertionFailure(
                 fixture_name=run.fixture_name,
                 impl_name=run.impl_name,
                 kind="success-fixture",
-                detail="milpa.lock not produced by impl",
+                detail=f"{_fn_lock} not produced by impl",
             ))
         else:
             expected = expected_lock.read_text()
@@ -665,22 +696,22 @@ def _assert_success_fixture(
                     fixture_name=run.fixture_name,
                     impl_name=run.impl_name,
                     kind="success-fixture",
-                    detail=_diff_summary("milpa.lock", expected, actual),
+                    detail=_diff_summary(_fn_lock, expected, actual),
                 ))
             else:
-                normalized_outputs["expected/milpa.lock"] = actual
+                normalized_outputs[f"expected/{_fn_lock}"] = actual
 
     # nim.cfg — single-package: expected/nim.cfg; workspace: expected/<member>/nim.cfg
     # Check if there's a root expected/nim.cfg (single-package case).
-    expected_nimcfg = expected_dir / "nim.cfg"
+    expected_nimcfg = expected_dir / _fn_nimcfg
     if expected_nimcfg.exists():
-        actual_nimcfg_path = scratch / "nim.cfg"
+        actual_nimcfg_path = scratch / _fn_nimcfg
         if not actual_nimcfg_path.exists():
             failures.append(AssertionFailure(
                 fixture_name=run.fixture_name,
                 impl_name=run.impl_name,
                 kind="success-fixture",
-                detail="nim.cfg not produced by impl",
+                detail=f"{_fn_nimcfg} not produced by impl",
             ))
         else:
             actual = actual_nimcfg_path.read_text()
@@ -690,10 +721,10 @@ def _assert_success_fixture(
                     fixture_name=run.fixture_name,
                     impl_name=run.impl_name,
                     kind="success-fixture",
-                    detail=_diff_summary("nim.cfg", expected, actual),
+                    detail=_diff_summary(_fn_nimcfg, expected, actual),
                 ))
             else:
-                normalized_outputs["expected/nim.cfg"] = actual
+                normalized_outputs[f"expected/{_fn_nimcfg}"] = actual
 
     # Workspace per-member outputs: for each <member>/ subdir in expected_dir,
     # check nim.cfg and/or milpa.kdl (mutation fixtures).
@@ -704,15 +735,15 @@ def _assert_success_fixture(
 
         # Per-member milpa.kdl — S11e: add/remove from a member dir mutates the
         # MEMBER's milpa.kdl (not the workspace root's).
-        member_kdl_expected = member_dir / "milpa.kdl"
+        member_kdl_expected = member_dir / _fn_manifest
         if member_kdl_expected.exists():
-            actual_member_kdl = scratch / rel / "milpa.kdl"
+            actual_member_kdl = scratch / rel / _fn_manifest
             if not actual_member_kdl.exists():
                 failures.append(AssertionFailure(
                     fixture_name=run.fixture_name,
                     impl_name=run.impl_name,
                     kind="success-fixture",
-                    detail=f"member milpa.kdl not present in scratch: {rel}/milpa.kdl",
+                    detail=f"member {_fn_manifest} not present in scratch: {rel}/{_fn_manifest}",
                 ))
             else:
                 actual = actual_member_kdl.read_text()
@@ -722,40 +753,40 @@ def _assert_success_fixture(
                         fixture_name=run.fixture_name,
                         impl_name=run.impl_name,
                         kind="success-fixture",
-                        detail=_diff_summary(f"{rel}/milpa.kdl", expected_text, actual),
+                        detail=_diff_summary(f"{rel}/{_fn_manifest}", expected_text, actual),
                     ))
                 else:
-                    normalized_outputs[f"expected/{rel}/milpa.kdl"] = actual
+                    normalized_outputs[f"expected/{rel}/{_fn_manifest}"] = actual
 
         # Per-member nim.cfg.
-        member_nimcfg = member_dir / "nim.cfg"
+        member_nimcfg = member_dir / _fn_nimcfg
         if not member_nimcfg.exists():
             continue
         # This is a workspace member nim.cfg.
-        actual_member_nimcfg = scratch / rel / "nim.cfg"
+        actual_member_nimcfg = scratch / rel / _fn_nimcfg
         if not actual_member_nimcfg.exists():
             failures.append(AssertionFailure(
                 fixture_name=run.fixture_name,
                 impl_name=run.impl_name,
                 kind="success-fixture",
-                detail=f"workspace member nim.cfg not produced: {rel}/nim.cfg",
+                detail=f"workspace member {_fn_nimcfg} not produced: {rel}/{_fn_nimcfg}",
             ))
         else:
             actual = actual_member_nimcfg.read_text()
             expected_text = member_nimcfg.read_text()
-            key = f"expected/{rel}/nim.cfg"
+            key = f"expected/{rel}/{_fn_nimcfg}"
             if actual != expected_text:
                 failures.append(AssertionFailure(
                     fixture_name=run.fixture_name,
                     impl_name=run.impl_name,
                     kind="success-fixture",
-                    detail=_diff_summary(f"{rel}/nim.cfg", expected_text, actual),
+                    detail=_diff_summary(f"{rel}/{_fn_nimcfg}", expected_text, actual),
                 ))
             else:
                 normalized_outputs[key] = actual
 
     # _deps_structure.txt — normalize CAS paths before comparing.
-    expected_deps = expected_dir / "_deps_structure.txt"
+    expected_deps = expected_dir / _fn_deps
     if expected_deps.exists():
         normalized = normalize_deps_structure(run.scratch_dir, run.cas_dir)
         if normalized is None:
@@ -767,15 +798,16 @@ def _assert_success_fixture(
                 fixture_name=run.fixture_name,
                 impl_name=run.impl_name,
                 kind="success-fixture",
-                detail=_diff_summary("_deps_structure.txt", expected_text, normalized),
+                detail=_diff_summary(_fn_deps, expected_text, normalized),
             ))
         else:
-            normalized_outputs["expected/_deps_structure.txt"] = normalized
+            normalized_outputs[f"expected/{_fn_deps}"] = normalized
 
     # absent — list of scratch-relative paths that must NOT exist after the run.
     # S11e: asserts that no member-local milpa.lock was written.
     # Each non-empty, non-comment line is a path relative to scratch root.
-    absent_file = expected_dir / "absent"
+    # The filename is authoritative from surfaces.ABSENT_PATHS_SURFACE.
+    absent_file = expected_dir / surfaces.ABSENT_PATHS_SURFACE
     if absent_file.exists():
         for raw_line in absent_file.read_text().splitlines():
             rel_path = raw_line.strip()

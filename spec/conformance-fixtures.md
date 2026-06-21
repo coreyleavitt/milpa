@@ -45,6 +45,53 @@ A conformant implementation of this spec MUST:
    fixtures in place.
 7. Include at least one normative fixture per MUST-clause across the spec docs.
 
+### Normative vs non-normative surface enumeration
+
+The conformance gate compares implementations on a **closed, enumerated set
+of normative surfaces** per command class. All other output is explicitly
+**non-normative** and MAY differ per implementation by design
+(`cli-contract.md §3.1`). The machine-readable source of truth is
+`harness/surfaces.py` (S-A1); this prose enumerates the same set.
+
+**Parity-normative — impls MUST agree on these (byte-exact or canonical-equal):**
+
+| Surface | Scope | Comparison |
+|---|---|---|
+| `expected/milpa.lock` | success fixtures | byte-exact |
+| `expected/nim.cfg` (root) | success fixtures, single-package | byte-exact, POSIX separators |
+| `expected/<member>/nim.cfg` | success fixtures, workspace members | byte-exact, POSIX separators |
+| `expected/_deps_structure.txt` | success fixtures with `_deps/` | byte-exact after `<CAS_ROOT>` substitution |
+| `expected/certificate.json` | `check-certificate` fixtures | canonical JSON comparison (see §2.7.3) |
+| `expected/error` (the slug on the `milpa-error: <SLUG>` line) | error fixtures | exact slug string (`spec/errors.md` catalog) |
+| `expected/absent` (paths listed MUST NOT exist post-run) | success fixtures | existence check per listed path |
+| Process exit code (`0` for success/liveness/clean, `1` for error) | all fixtures | exact integer |
+
+> NOTE: `expected/milpa.kdl` is also compared byte-exact for mutation fixtures
+> (`add`/`remove` subcommands). Per-member `expected/<member>/milpa.kdl` follows
+> the same rule for workspace member mutations.
+
+**Explicitly non-normative — MAY differ per impl:**
+
+- The human-readable diagnostic line(s) on stderr, including any prefix
+  (Python `milpa:` vs Rust `<CODE>:`) — `cli-contract.md §3.1` makes this
+  non-normative by design.
+- Stdout prose for liveness commands (`show`, `--version`) — only exit-0 +
+  non-empty stdout is asserted (see §2.7.2).
+- Ordering and timing of progress output.
+
+> NOTE: S-A1b (a later slice) will additionally enforce empty stdout on
+> success for non-liveness verbs (`cli-contract.md §4`) and exact exit-code-2
+> for usage errors (`cli-contract.md §3`). Those are not yet asserted.
+
+**Arbitration rule:** the spec is the arbiter. Impls agreeing is evidence, not
+proof; impls disagreeing is a bug in one impl **or** a hole in the spec — never
+resolved by "whatever the impls happen to do."
+
+**Platform scope (spec v1):** this corpus is Linux/POSIX. Windows support
+requires additional normalization (`_deps_structure.txt` path separators,
+case-collision handling for `mocked-fetches/`, CRLF/LF for control files) and
+is deferred to a future spec version.
+
 ---
 
 ## 1  Location and versioning
