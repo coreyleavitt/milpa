@@ -1,0 +1,24 @@
+// fixture-290: S7 — `milpa show` surfaces cond_requires (liveness fixture)
+//
+// A resolved project with a conditional dep (`when` block / platform predicate).
+// `milpa show` reads the lockfile and MUST surface the cond-require annotation
+// in its output (exit-0 + non-empty stdout).
+//
+// This is a LIVENESS fixture (conformance-fixtures §2.7.2): `show` output is
+// non-frozen for spec v1.0, so the harness checks exit-0 + non-empty stdout
+// only.  No expected/milpa.lock or expected/error is provided.
+//
+// The lockfile (pre-seeded at fixture root) records:
+//   dep "extra" — the conditional dep (included unconditionally in the lock)
+//   dep "foo"   — requires "extra" conditionally (cond-require "extra" platform="linux")
+//
+// No env is needed: `show` reads the lockfile directly without evaluating
+// predicates — the cond-require annotation is always present in the lock.
+name "myapp"
+kind "application"
+deps {
+    foo git=(url)"https://github.com/example/foo.git" ref="main"
+    when platform="linux" {
+        extra git=(url)"https://github.com/example/extra.git" ref="v1.0.0"
+    }
+}

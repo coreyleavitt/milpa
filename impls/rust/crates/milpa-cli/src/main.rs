@@ -223,6 +223,19 @@ fn cmd_show(dir: &Path) -> Result<i32, MilpaError> {
         if !dep.requires.is_empty() {
             println!("  requires    {}", dep.requires.join(", "));
         }
+        // S7 (#135): surface cond_requires — one line per conditional require.
+        for cr in &dep.cond_requires {
+            let preds_str = cr
+                .predicates
+                .iter()
+                .map(|p| {
+                    let op = if p.negated { "!=" } else { "=" };
+                    format!("{}{}{}", p.name, op, p.values.first().map(|s| s.as_str()).unwrap_or(""))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("  cond-req    {} [{}]", cr.name, preds_str);
+        }
         // S10 (RFC #23 §3.7): print active_flags when non-empty.
         if !dep.active_flags.is_empty() {
             println!("  active_flags  {}", dep.active_flags.join(" "));
