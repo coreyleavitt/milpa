@@ -632,7 +632,7 @@ package "bar" {
 
     def test_tng_not_found_conformance(self) -> None:
         """Conformance fixture for TNG-NOT-FOUND."""
-        text = _fixture_index("fixture-090-tng-no-satisfying-version")  # reuse: just a present pkg
+        text = _fixture_index("fixture-090-solve-conflict-index-no-version")  # reuse: just a present pkg
         idx = parse_index(text)
         with pytest.raises(MilpaError) as exc_info:
             idx.resolve_named("nonexistent", None)
@@ -646,7 +646,7 @@ package "bar" {
         assert exc_info.value.slug == TNG_AMBIGUOUS_NAME
 
     def test_tng_no_satisfying_version(self) -> None:
-        text = _fixture_index("fixture-090-tng-no-satisfying-version")
+        text = _fixture_index("fixture-090-solve-conflict-index-no-version")
         idx = parse_index(text)
         with pytest.raises(MilpaError) as exc_info:
             idx.resolve_named("bar", ">=9.0.0")

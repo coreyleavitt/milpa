@@ -1011,9 +1011,9 @@ class TestOverridesParse:
         assert_slug(text, expected)
 
     def test_override_git_missing_corpus(self) -> None:
-        """Corpus fixture 035: MAN-OVERRIDE-GIT-MISSING."""
-        text = fixture_kdl("fixture-035-man-override-git-missing")
-        expected = fixture_error("fixture-035-man-override-git-missing")
+        """Corpus fixture 035: MAN-OVERRIDE-TARGET-AMBIGUOUS."""
+        text = fixture_kdl("fixture-035-man-override-target-ambiguous")
+        expected = fixture_error("fixture-035-man-override-target-ambiguous")
         assert_slug(text, expected)
 
     def test_override_ref_missing_corpus(self) -> None:
