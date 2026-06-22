@@ -423,6 +423,34 @@ A tarball subdirectory under `mocked-fetches/<key>/` MUST contain:
 > inner `FETCH-SHA256-MISMATCH`. On that failure the prior `milpa.lock` is left
 > unchanged (atomic-write-on-failure).
 
+**`archive`** (optional — raw-bytes mode; S4a)
+
+> NORMATIVE: When present, `archive` is a raw binary file whose bytes are fed
+> directly to the **real extractor** (the production `TarballFetcher` decode path,
+> including magic-byte decompression auto-detect, decompression-bomb guard, and
+> `safe_extract`). This mode takes **PRECEDENCE** over `format` (build mode) and
+> `archive_sha256` (copy mode) — conformant implementations MUST check for
+> `archive` first.
+>
+> On success, the receipt's `archive_sha256` MUST equal `sha256(raw bytes)`,
+> identical to what the real `TarballFetcher` would compute for the same bytes.
+> The content is extracted via the real extractor, not copied verbatim from
+> `content/`; a `content/` directory or `format` file in the same key dir is
+> ignored.
+>
+> On failure (corrupt or malformed archive), the real extractor raises the inner
+> extract failure (Python: `FETCH-EXTRACT-FAILED` via `tarball.py`; Rust:
+> `FETCH-EXTRACT-FAILED` via `fetchers.rs`). The mocked fetcher MUST NOT
+> pre-validate or swallow errors — raw bytes go straight to the real extractor.
+> At the resolver boundary, `FETCH-EXTRACT-FAILED` is wrapped to `FETCH-ALL-FAILED`
+> (`resolver-semantics.md §8a`); fixtures that exercise this path assert the
+> wrapper slug.
+>
+> This mode is the mechanism for adversarial corrupt-archive fixtures (S4 in
+> `docs/rfc-conformance-parity.md §5`). The `archive` file has no TOFU pin
+> re-assertion — it is treated as a first-fetch; the `expected_sha256` pin on the
+> provenance is not consulted.
+
 ### 2.4  `expected/milpa.lock` — expected lockfile
 
 > NORMATIVE: For a success fixture, `expected/milpa.lock` MUST be a valid

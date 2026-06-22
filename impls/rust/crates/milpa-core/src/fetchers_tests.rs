@@ -1488,3 +1488,124 @@ fn r5_commit_sha_starting_with_dash_fails_with_git_error() {
         err.code()
     );
 }
+
+// --- S4a: raw-bytes mode ("archive" file) ----------------------------------
+
+/// Build a minimal valid .tar.gz in memory with a single file `name`/`data`.
+fn single_file_tgz(name: &str, data: &[u8]) -> Vec<u8> {
+    gzip(&single_file_tar(name, data))
+}
+
+#[test]
+fn s4a_raw_bytes_mode_valid_archive_extracted_via_real_extractor() {
+    // S4a Test 1: a valid .tar.gz in the ``archive`` file is fed through the
+    // REAL extractor (not a verbatim copy), content is extracted, and the
+    // receipt's archive_sha256 == sha256(raw bytes).
+    let d = tmp();
+    let mocked = d.path().join("mocked-fetches");
+    let url = "https://releases.example.com/s4a/pkg.tar.gz";
+    let key_dir = mocked.join(super::url_key(url, ""));
+    std::fs::create_dir_all(&key_dir).unwrap();
+
+    let archive_bytes = single_file_tgz("lib.nim", b"# s4a raw-bytes test");
+    let expected_sha = super::sha256_hex(&archive_bytes);
+    std::fs::write(key_dir.join("archive"), &archive_bytes).unwrap();
+
+    let fetcher = super::MockedFetcher::new(&mocked);
+    std::fs::create_dir_all(d.path().join("_deps")).unwrap();
+    let dest = d.path().join("_deps/pkg");
+    let p = milpa_types::Provenance::Tarball {
+        url: url.into(),
+        expected_sha256: None,
+        strip_components: 0,
+    };
+    let receipt = FetcherRegistry::fetch(&fetcher, "pkg", &p, &dest).unwrap();
+
+    // Content was extracted by the REAL extractor (not copied verbatim).
+    assert_eq!(
+        std::fs::read(dest.join("lib.nim")).unwrap(),
+        b"# s4a raw-bytes test"
+    );
+    // archive_sha256 in receipt == sha256(raw bytes) — same as the real fetcher.
+    assert_eq!(
+        receipt.archive_sha256.as_deref(),
+        Some(expected_sha.as_str())
+    );
+}
+
+#[test]
+fn s4a_raw_bytes_mode_corrupt_archive_raises_fetch_extract_failed() {
+    // S4a Test 2: garbage bytes in the ``archive`` file → the REAL extractor
+    // raises FETCH-EXTRACT-FAILED (the mocked fetcher does NOT pre-validate or
+    // swallow — corruption propagates through the real extractor).
+    let d = tmp();
+    let mocked = d.path().join("mocked-fetches");
+    let url = "https://releases.example.com/s4a/corrupt.tar.gz";
+    let key_dir = mocked.join(super::url_key(url, ""));
+    std::fs::create_dir_all(&key_dir).unwrap();
+
+    // Write bytes that start with gzip magic but are corrupt (not a valid gzip stream).
+    // The real decompressor will fail at the gzip decode stage → FETCH-EXTRACT-FAILED.
+    let corrupt = {
+        let mut b = vec![0x1f, 0x8b]; // gzip magic
+        b.extend_from_slice(b"this is not a valid gzip stream at all");
+        b
+    };
+    std::fs::write(key_dir.join("archive"), &corrupt).unwrap();
+
+    let fetcher = super::MockedFetcher::new(&mocked);
+    std::fs::create_dir_all(d.path().join("_deps")).unwrap();
+    let dest = d.path().join("_deps/corrupt");
+    let p = milpa_types::Provenance::Tarball {
+        url: url.into(),
+        expected_sha256: None,
+        strip_components: 0,
+    };
+    let err = FetcherRegistry::fetch(&fetcher, "corrupt", &p, &dest).unwrap_err();
+    assert_eq!(
+        err.code(),
+        "FETCH-EXTRACT-FAILED",
+        "corrupt archive must raise FETCH-EXTRACT-FAILED via the real extractor"
+    );
+}
+
+#[test]
+fn s4a_archive_takes_precedence_over_format_and_content() {
+    // S4a Test 3: when both ``archive`` and ``format``/``content/`` are present,
+    // the ``archive`` file wins — extracted content matches the archive, not the
+    // content/ build.
+    let d = tmp();
+    let mocked = d.path().join("mocked-fetches");
+    let url = "https://releases.example.com/s4a/precedence.tar.gz";
+    let key_dir = mocked.join(super::url_key(url, ""));
+    std::fs::create_dir_all(&key_dir).unwrap();
+
+    // archive file: extracts "from_archive.nim"
+    let archive_bytes = single_file_tgz("from_archive.nim", b"archive-wins");
+    std::fs::write(key_dir.join("archive"), &archive_bytes).unwrap();
+
+    // format + content/: would extract "from_content.nim" if chosen
+    std::fs::write(key_dir.join("format"), "gz").unwrap();
+    std::fs::create_dir_all(key_dir.join("content")).unwrap();
+    std::fs::write(key_dir.join("content").join("from_content.nim"), b"content-loses").unwrap();
+
+    let fetcher = super::MockedFetcher::new(&mocked);
+    std::fs::create_dir_all(d.path().join("_deps")).unwrap();
+    let dest = d.path().join("_deps/precedence");
+    let p = milpa_types::Provenance::Tarball {
+        url: url.into(),
+        expected_sha256: None,
+        strip_components: 0,
+    };
+    FetcherRegistry::fetch(&fetcher, "precedence", &p, &dest).unwrap();
+
+    // archive wins: from_archive.nim present, from_content.nim absent
+    assert_eq!(
+        std::fs::read(dest.join("from_archive.nim")).unwrap(),
+        b"archive-wins"
+    );
+    assert!(
+        !dest.join("from_content.nim").exists(),
+        "from_content.nim must not exist when archive takes precedence"
+    );
+}

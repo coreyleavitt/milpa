@@ -799,6 +799,44 @@ impl FetcherRegistry for MockedFetcher {
                 let (_, key_dir) =
                     resolve_tarball_mock_key_dir(&self.mocked_fetches_dir, url)?;
 
+                // S4a (rfc-conformance-parity.md) — shared real-extractor injection.
+                // Both raw-bytes mode and build-mode call ``fetch_tarball`` with an
+                // injected closure; this inner macro captures the shared call site so
+                // neither branch duplicates the injection pattern.
+                macro_rules! run_archive_bytes_through_real_fetcher {
+                    ($bytes:expr) => {{
+                        let archive_bytes: Vec<u8> = $bytes;
+                        let url_str = url.clone();
+                        return fetch_tarball(
+                            name,
+                            &url_str,
+                            None, // raw-bytes / build mode: no prior pin (first-fetch)
+                            *strip_components,
+                            dest,
+                            &move |_: &str| Ok(archive_bytes.clone()),
+                        );
+                    }};
+                }
+
+                // Raw-bytes mode: when an ``archive`` file is present, feed its
+                // raw bytes through the REAL ``fetch_tarball`` decode path —
+                // enabling tests that supply a corrupt or crafted archive and need
+                // the real extractor to handle (or reject) it.  Takes PRECEDENCE
+                // over ``format`` (build mode) and ``archive_sha256`` (copy mode)
+                // — checked FIRST.  The mocked fetcher does NOT pre-validate or
+                // swallow — raw bytes go straight to the real extractor, which
+                // raises FETCH-EXTRACT-FAILED on corruption.
+                let archive_path = key_dir.join("archive");
+                if archive_path.is_file() {
+                    let bytes = std::fs::read(&archive_path).map_err(|e| {
+                        FetchError::Failed(format!(
+                            "raw-bytes mode: cannot read {}: {e}",
+                            archive_path.display()
+                        ))
+                    })?;
+                    run_archive_bytes_through_real_fetcher!(bytes);
+                }
+
                 // Build-mode: when a ``format`` file is present, build a real
                 // archive from ``content/`` and run it through the REAL
                 // ``fetch_tarball`` decode path (SSOT: production extractor, not a
@@ -814,15 +852,7 @@ impl FetcherRegistry for MockedFetcher {
                         .map_err(|e| FetchError::Failed(format!("build-mode: read format: {e}")))?;
                     let fmt = fmt.trim().to_string();
                     let archive_bytes = build_archive_bytes(&key_dir, &fmt)?;
-                    let url_str = url.clone();
-                    return fetch_tarball(
-                        name,
-                        &url_str,
-                        expected_sha256.as_deref(),
-                        *strip_components,
-                        dest,
-                        &move |_: &str| Ok(archive_bytes.clone()),
-                    );
+                    run_archive_bytes_through_real_fetcher!(archive_bytes);
                 }
 
                 // Normal (copy) mode.

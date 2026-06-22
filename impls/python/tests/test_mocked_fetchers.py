@@ -17,11 +17,15 @@ Spec authority: spec/conformance-fixtures.md §2.3, spec/plugin-contract.md §4.
 
 from __future__ import annotations
 
+import gzip
+import hashlib
+import io
+import tarfile
 from pathlib import Path
 
 import pytest
 
-from milpa.errors import FETCH_MOCK_MISSING, FETCH_SHA256_MISMATCH, MilpaError
+from milpa.errors import FETCH_EXTRACT_FAILED, FETCH_MOCK_MISSING, FETCH_SHA256_MISMATCH, MilpaError
 from milpa.fetchers.mocked import (
     GitProvenance,
     GitReceipt,
@@ -431,6 +435,111 @@ class TestMockedTarballFetcher:
 
         receipt = fetcher.fetch("pkg", prov, dest=dest)
         assert receipt.archive_sha256 == self.ARCHIVE_SHA
+
+
+# ---------------------------------------------------------------------------
+# S4a — raw-bytes mode ("archive" file) tests
+# ---------------------------------------------------------------------------
+
+
+def _make_valid_tgz(files: dict[str, bytes]) -> bytes:
+    """Build a real .tar.gz in memory from a dict of {name: bytes}."""
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
+        inner = io.BytesIO()
+        with tarfile.open(fileobj=inner, mode="w") as tf:
+            for name, data in files.items():
+                info = tarfile.TarInfo(name=name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+        gz.write(inner.getvalue())
+    return buf.getvalue()
+
+
+class TestMockedTarballFetcherRawBytesMode:
+    """S4a: raw-bytes mode — ``archive`` file fed through the REAL extractor."""
+
+    URL = "https://releases.example.com/s4a/pkg.tar.gz"
+
+    def _fetcher(self, mocked_dir: Path) -> MockedTarballFetcher:
+        return MockedTarballFetcher(mocked_dir)
+
+    def _key_dir(self, mocked_dir: Path) -> Path:
+        key_dir = mocked_dir / url_key(self.URL, "")
+        key_dir.mkdir(parents=True, exist_ok=True)
+        return key_dir
+
+    def test_valid_archive_extracted_via_real_extractor(self, tmp_path: Path) -> None:
+        """Test 1 (S4a): valid .tar.gz in ``archive`` → real decompressor runs,
+        content is extracted, receipt.archive_sha256 == sha256(raw bytes)."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        key_dir = self._key_dir(mocked_dir)
+
+        archive_bytes = _make_valid_tgz({"lib.nim": b"# s4a raw-bytes test"})
+        expected_sha = hashlib.sha256(archive_bytes).hexdigest()
+        (key_dir / "archive").write_bytes(archive_bytes)
+
+        fetcher = self._fetcher(mocked_dir)
+        prov = TarballProvenance(url=self.URL)
+        dest = tmp_path / "_deps" / "pkg"
+
+        receipt = fetcher.fetch("pkg", prov, dest=dest)
+
+        # Content was extracted (real extractor ran, not a verbatim copy).
+        assert isinstance(receipt, TarballReceipt)
+        assert (dest / "lib.nim").read_bytes() == b"# s4a raw-bytes test"
+        # archive_sha256 in receipt == sha256(raw bytes) — same as real fetcher.
+        assert receipt.archive_sha256 == expected_sha
+
+    def test_corrupt_archive_raises_fetch_extract_failed(self, tmp_path: Path) -> None:
+        """Test 2 (S4a): garbage bytes in ``archive`` → real extractor raises
+        FETCH-EXTRACT-FAILED (corruption propagates; mocked fetcher does NOT swallow)."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        key_dir = self._key_dir(mocked_dir)
+
+        # Bytes that start with gzip magic but are corrupt (not a valid gzip stream).
+        # The real gzip decompressor fails → FETCH-EXTRACT-FAILED.
+        corrupt = b"\x1f\x8b" + b"this is not a valid gzip stream at all"
+        (key_dir / "archive").write_bytes(corrupt)
+
+        fetcher = self._fetcher(mocked_dir)
+        prov = TarballProvenance(url=self.URL)
+        dest = tmp_path / "_deps" / "pkg"
+
+        with pytest.raises(MilpaError) as exc_info:
+            fetcher.fetch("pkg", prov, dest=dest)
+
+        assert exc_info.value.slug == FETCH_EXTRACT_FAILED
+
+    def test_archive_takes_precedence_over_format_and_content(self, tmp_path: Path) -> None:
+        """Test 3 (S4a): ``archive`` file wins when both ``archive`` and
+        ``format``/``content/`` are present — extracted content matches the archive,
+        not the content/ build."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        key_dir = self._key_dir(mocked_dir)
+
+        # archive file: extracts "from_archive.nim"
+        archive_bytes = _make_valid_tgz({"from_archive.nim": b"archive-wins"})
+        (key_dir / "archive").write_bytes(archive_bytes)
+
+        # format + content/: would extract "from_content.nim" if chosen
+        (key_dir / "format").write_text("gz", encoding="utf-8")
+        content_dir = key_dir / "content"
+        content_dir.mkdir()
+        (content_dir / "from_content.nim").write_bytes(b"content-loses")
+
+        fetcher = self._fetcher(mocked_dir)
+        prov = TarballProvenance(url=self.URL)
+        dest = tmp_path / "_deps" / "pkg"
+
+        fetcher.fetch("pkg", prov, dest=dest)
+
+        # archive wins: from_archive.nim present, from_content.nim absent
+        assert (dest / "from_archive.nim").read_bytes() == b"archive-wins"
+        assert not (dest / "from_content.nim").exists()
 
 
 # ---------------------------------------------------------------------------

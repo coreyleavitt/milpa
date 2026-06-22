@@ -204,6 +204,39 @@ class MockedGitFetcher(Fetcher):
 
 
 # ---------------------------------------------------------------------------
+# Shared real-extractor helper — S4a SSOT
+# ---------------------------------------------------------------------------
+
+
+def _run_bytes_through_real_fetcher(
+    name: str, url: str, archive_bytes: bytes, dest: "Path"
+) -> "TarballReceipt":
+    """Feed ``archive_bytes`` through the REAL ``TarballFetcher`` decode path.
+
+    This is the **single source of truth** for "run raw bytes through the
+    real extractor" (S4a, rfc-conformance-parity.md).  Both the raw-bytes
+    mode (``archive`` file) and the build mode (``format`` file) in
+    ``MockedTarballFetcher`` share this helper — no copy-paste of the
+    injection pattern.
+
+    A valid archive → real decompression auto-detect + extract_tar run;
+    receipt carries ``archive_sha256 = sha256(raw bytes)`` (same as the
+    real fetcher computes).  A corrupt archive → the real extract path raises
+    ``FETCH-EXTRACT-FAILED`` (``tarball.py``), which propagates up unchanged.
+    The mocked fetcher does NOT pre-validate or swallow — raw bytes go
+    straight to the real extractor.
+    """
+
+    def _http_get_from_bytes(_url: str) -> bytes:
+        return archive_bytes
+
+    fetcher = TarballFetcher(http_get=_http_get_from_bytes)
+    receipt = fetcher.fetch(name, TarballProvenance(url=url), dest=dest)
+    assert isinstance(receipt, TarballReceipt)
+    return receipt
+
+
+# ---------------------------------------------------------------------------
 # MockedTarballFetcher
 # ---------------------------------------------------------------------------
 
@@ -240,6 +273,22 @@ class MockedTarballFetcher(Fetcher):
                 url=p.url,
             )
 
+        # Raw-bytes mode: when an ``archive`` file is present, feed its raw
+        # bytes through the REAL TarballFetcher decode path — enabling tests
+        # that supply a corrupt or crafted archive and need the real extractor
+        # to handle (or reject) it.  Takes PRECEDENCE over ``format`` (build
+        # mode) and ``archive_sha256`` (copy mode) — checked FIRST.
+        #
+        # S4a (rfc-conformance-parity.md): the SSOT for "run raw bytes through
+        # the real extractor" is ``_run_bytes_through_real_fetcher``; both this
+        # branch and build-mode share it.  The mocked fetcher does NOT pre-
+        # validate or swallow errors — raw bytes go straight to the real
+        # extractor, which raises FETCH-EXTRACT-FAILED on corruption.
+        archive_file = key_dir / "archive"
+        if archive_file.is_file():
+            archive_bytes = archive_file.read_bytes()
+            return _run_bytes_through_real_fetcher(name, p.url, archive_bytes, dest)
+
         # Build-mode: when a ``format`` file is present, build a real archive
         # from ``content/`` and run it through the REAL TarballFetcher decode
         # path (SSOT: production extractor, not a parallel copy).  The
@@ -252,14 +301,7 @@ class MockedTarballFetcher(Fetcher):
         if fmt_file.is_file():
             fmt = fmt_file.read_text(encoding="utf-8").strip()
             archive_bytes = _build_archive_from_content(key_dir, fmt)
-
-            def _http_get_from_bytes(_url: str) -> bytes:
-                return archive_bytes
-
-            fetcher = TarballFetcher(http_get=_http_get_from_bytes)
-            receipt = fetcher.fetch(name, TarballProvenance(url=p.url), dest=dest)
-            assert isinstance(receipt, TarballReceipt)
-            return receipt
+            return _run_bytes_through_real_fetcher(name, p.url, archive_bytes, dest)
 
         # Normal (copy) mode: read the pre-recorded archive sha256 and stage
         # content/ verbatim — no real decompressor runs.
