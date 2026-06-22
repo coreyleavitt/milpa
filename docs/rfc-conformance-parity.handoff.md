@@ -1,7 +1,7 @@
 # rfc-conformance-parity — handoff
 
-- **Stage:** 3 (/tdd) — Phase 2 Layer A + B COMPLETE. Next: Layer C (gated).
-- **Resume:** `/tdd slice S4a` — design+spec+implement a mocked-fetcher "raw bytes" mode (an `archive` file fed through the REAL extractor, in BOTH impls; today pre-built/copy mode copies content/ verbatim & never invokes the extractor, build mode only builds VALID archives — neither pipes raw fixture bytes through the real TarballFetcher). Then S4 (corrupt-tar fixture #148). S5 (#146) DESCOPED, D4 Low deferred. NOTE: S4a is design-heavy + cross-impl (Python mocked.py + Rust mocked fetcher + spec/conformance-fixtures.md format) — deserves fresh context; start post-compact.
+- **Stage:** 3 (/tdd) **ALL SLICES IMPLEMENTED** — Phase 1 + Phase 2 (A/B/C) complete. Next stage: **4 /code-review** on the Phase 2 scope (the new work hasn't been reviewed).
+- **Resume:** `/code-review docs/rfc-conformance-parity.md` (scope = the Phase 2 commits ea136d0..24846eb, primarily harness/ + the new fixtures + the S4a fetcher changes + spec edits). S5 (#146) DESCOPED, D4 Low deferred, c4 routed to #110 (no code pending). Do NOT wrap /code-review in /loop.
 
 ## Phase 2 Layer B
 - [x] **S6** — `fixture-289-ws-dev-deps-resolve`: 2-member workspace, member-a has regular dep (extlib) + dev-dep (devtool), member-b has member ref + dev-dep (testhelper); 3 external deps via mocked-fetches. Both impls BYTE-IDENTICAL (lock alpha-sorted per lockfile-schema; member-a nim.cfg = own deps, member-b = ws-wide union per 213/214/257; _deps_structure = 3 externals). harness 280/280 div NONE, py 2150 pass (auto-discovered in-process), harness 278 pass. DONE.
@@ -120,13 +120,15 @@ is MET; remaining = in-process adapter alignment (Slices 2/3) + the cert scope c
       209/210/211/216/228/230/244. **Divergences → NONE.**
 - [x] Slice C "205" — local deps use real LocalFetcher in mock mode, both impls
       (`2578076`); removed dead MockedLocalFetcher (py) + its tests. **Black-box GREEN.**
-- [ ] Slice 2 — fixture-144 in-process adapters (rust + python). Black-box already
-      passes it; align the two in-process adapters to the CLI's
-      MILPA_INDEX_URL→HttpDepDeclStore logic (RFC §4 Slice 2). *(Not a black-box failure.)*
-- [ ] Slice 3 — `project-dir` control file (#167) — spec it + teach both in-process adapters.
-- [ ] cert fixtures 127/128/150 — Python `--certificate` not implemented (parked in
-      descriptors.py python_known_failing). Separate Python feature; decide if in-scope.
-- [ ] Phase 2: S4a/S4/S5/S6/S7 (gated on differential-harness RFC).
+- [x] Slice 2 — fixture-144 in-process adapters: DONE (code-review H1 SSOT
+      `dep_decl_store_from_paths`; `_NOT_YET_WIRED_FIXTURE_NAMES` empty; closed #153).
+- [x] Slice 3 — `project-dir` control file: DONE (spec §2.8.1 normative control input;
+      both adapters honor via `harness/inputs.py::resolve_project_dir`; closed #167).
+- [x] cert fixtures 127/128/150 — 127/128 were STALE (Python passes); 150 fixed (4c5d4fc).
+- [x] Phase 2 Layer A: S-A1/S-A1b/S-A2/S-A3/S-A4 — DONE.
+- [x] Phase 2 Layer B: S6 (#166) / S7 (#135) — DONE.
+- [x] Phase 2 Layer C: S4a / S4 (#148) — DONE.
+- [—] S5 (#146) DESCOPED; D4 (Low) DEFERRED; c4 → #110 (no code pending).
 
 NOTE: fixture-114's KNOWN_LIMITATIONS reason ("stdlib harness cannot compute the
 identity hash") is now STALE — Slice C c3 proved impl-neutral seeding via the lock
