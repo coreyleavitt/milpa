@@ -1,7 +1,7 @@
 # rfc-conformance-parity — handoff
 
-- **Stage:** 3 (/tdd) — Phase 2 Layer A COMPLETE; Layer B in progress (S6 done). Next: S7.
-- **Resume:** `/tdd slice S7` (show-liveness cond_requires #135). Then Layer C gated: S4a raw-bytes mock → S4 corrupt-tar #148. S5 (#146) + D4 Low deferred.
+- **Stage:** 3 (/tdd) — Phase 2 Layer A + B COMPLETE. Next: Layer C (gated).
+- **Resume:** `/tdd slice S4a` — design+spec+implement a mocked-fetcher "raw bytes" mode (an `archive` file fed through the REAL extractor, in BOTH impls; today pre-built/copy mode copies content/ verbatim & never invokes the extractor, build mode only builds VALID archives — neither pipes raw fixture bytes through the real TarballFetcher). Then S4 (corrupt-tar fixture #148). S5 (#146) DESCOPED, D4 Low deferred. NOTE: S4a is design-heavy + cross-impl (Python mocked.py + Rust mocked fetcher + spec/conformance-fixtures.md format) — deserves fresh context; start post-compact.
 
 ## Phase 2 Layer B
 - [x] **S6** — `fixture-289-ws-dev-deps-resolve`: 2-member workspace, member-a has regular dep (extlib) + dev-dep (devtool), member-b has member ref + dev-dep (testhelper); 3 external deps via mocked-fetches. Both impls BYTE-IDENTICAL (lock alpha-sorted per lockfile-schema; member-a nim.cfg = own deps, member-b = ws-wide union per 213/214/257; _deps_structure = 3 externals). harness 280/280 div NONE, py 2150 pass (auto-discovered in-process), harness 278 pass. DONE.
