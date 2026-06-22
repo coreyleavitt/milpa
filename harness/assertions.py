@@ -140,14 +140,22 @@ def _canonical_certificate(cert: dict[str, Any]) -> dict[str, Any]:
     """Comparison-significant canonical form of a certificate.
 
     The SINGLE definition of "what content is significant in a certificate"
-    (conformance-fixtures §2.7.3), shared by BOTH the fixture-vs-impl
-    assertion (`compare_certificate_json`) and the cross-impl divergence
-    token (`_assert_check_certificate_fixture`). Keeping these in lockstep is
-    the whole point: a kind-only token (#130) was blind to body divergence.
+    (``spec/conformance-fixtures.md §2.7.3``), shared by BOTH the
+    fixture-vs-impl assertion (``compare_certificate_json``) and the
+    cross-impl divergence token (``_assert_check_certificate_fixture``).
+    Keeping these in lockstep is the whole point: a kind-only token (#130)
+    was blind to body divergence.
 
-    - ``message`` is EXCLUDED (human-readable, impl-specific).
-    - success: ``resolved`` and ``witness`` are order-sensitive (kept as-is).
-    - failure: ``refutation`` is set-equality (sorted by package, constraint).
+    Implements the domain-specific rules from §2.7.3 on top of the RFC 8785
+    JCS primitive (parse-then-compare):
+
+    - ``message`` is EXCLUDED (human-readable, impl-specific per
+      ``cli-contract.md §3.1``).
+    - success: ``resolved`` and ``witness`` are order-sensitive (kept as-is;
+      order is mandated by ``cli-contract.md §2.5.1``).
+    - failure: ``refutation`` is set-equality (sorted by ``(package,
+      constraint)`` before comparing — order in the emitted JSON is
+      non-normative).
     """
     kind = cert.get("kind")
     if kind == "success":
@@ -171,10 +179,14 @@ def compare_certificate_json(
 ) -> Optional[str]:
     """Canonical JSON comparison for certificates (conformance-fixtures §2.7.3).
 
-    Equality is decided on the shared `_canonical_certificate` form; on
-    mismatch a field-level message is produced for the human reader.
+    Implements the RFC 8785 JCS parse-then-compare primitive (structural
+    equality, formatting-insensitive) together with the domain-specific rules
+    from §2.7.3: ``message`` excluded, ``refutation`` set-equal, ``resolved``
+    and ``witness`` order-sensitive.  Both ``got`` and ``expected`` are
+    already-parsed Python dicts (caller called ``json.loads``); this function
+    never touches raw JSON bytes.
 
-    Returns None on match, or a human-readable mismatch string.
+    Returns ``None`` on match, or a human-readable mismatch string.
     """
     if got.get("kind") != expected.get("kind"):
         return f"kind mismatch: expected {expected.get('kind')!r}, got {got.get('kind')!r}"

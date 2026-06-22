@@ -613,22 +613,51 @@ the CAS-admission and symlink-creation steps defined in `spec/identity.md`
 
 > NORMATIVE: **Canonical JSON comparison for certificates.**
 >
-> - Object comparison is **key-order-independent**: two JSON objects with the
+> The comparison is **structural** (parse-then-compare), never byte-exact.
+> The runner MUST parse both the emitted file and `expected/certificate.json`
+> as JSON before comparing; whitespace, key ordering, and number formatting in
+> the serialised bytes are not significant. The primitive layer of this
+> comparison corresponds to **RFC 8785 JSON Canonicalization Scheme (JCS)**
+> semantics: two JSON texts that serialise to the same JCS canonical form are
+> considered equal at the byte level. In practice the runner implements this by
+> parsing both texts and comparing the resulting value trees.
+>
+> The following domain-specific rules apply on top of the JCS primitive:
+>
+> - **Object comparison is key-order-independent**: two JSON objects with the
 >   same keys and values are equal regardless of their serialised key order.
-> - Array comparison is **order-sensitive** for the `resolved` and `witness`
->   arrays: entries MUST appear in the order mandated by `cli-contract.md`
->   §2.5.1 (lexicographic by `package`, then by `satisfied_by` within
->   `package`). A conformant implementation that emits a different order fails
->   the fixture.
-> - The `message` field in a failure certificate is **excluded from
->   comparison**: the runner MUST NOT compare `message` values. The expected
->   `certificate.json` for a failure fixture MUST set `message` to `null` to
->   make the exclusion explicit and machine-enforceable.
-> - The `refutation` array in a failure certificate is compared for **set
->   equality** (order-independent), not sequence equality. The runner MUST sort
->   both arrays by `(package, constraint)` before comparing. The expected
->   `certificate.json` for a failure fixture MAY list entries in any order.
-> - Numeric values and string values are compared by value, not by lexical form.
+>   (This is already implied by parse-then-compare but is stated explicitly so
+>   a third impl's fixture-authoring tool need not emit any particular key
+>   order in `expected/certificate.json`.)
+> - **Array comparison for `resolved` and `witness` is order-sensitive**: entries
+>   MUST appear in the order mandated by `cli-contract.md` §2.5.1 (lexicographic
+>   by `package`, then by `satisfied_by` within `package`). A conformant
+>   implementation that emits a different order fails the fixture.
+> - **`message` is excluded from comparison**: the runner MUST NOT compare
+>   `message` values. The `message` field is human-readable diagnostic prose
+>   (`cli-contract.md §3.1`); it is non-normative and MAY differ per
+>   implementation and per run. The expected `certificate.json` for a failure
+>   fixture MUST set `message` to `null` to make the exclusion explicit and
+>   machine-enforceable.
+> - **`refutation` is compared for set equality** (order-independent), not
+>   sequence equality. The runner MUST sort both arrays by `(package,
+>   constraint)` before comparing. The expected `certificate.json` for a failure
+>   fixture MAY list entries in any order.
+> - **Numeric and string values are compared by value**, not by lexical form
+>   (e.g. `1.0` and `1` are distinct JSON values and compare unequal).
+>
+> **Deterministic emission (SHOULD).** Implementations SHOULD emit
+> `certificate.json` with sorted object keys and no insignificant whitespace
+> variation — i.e. output that is already JCS-canonical. This is cheap to
+> implement (Python: `json.dumps(doc, sort_keys=True)`; Rust: emit keys in
+> lexicographic order in format strings) and aids debuggability, authoring of
+> `expected/certificate.json` fixtures, and future byte-exact comparison by a
+> third implementation. It is a SHOULD, not a MUST, because the normative gate
+> is the structural comparison above; an impl that emits valid JSON with
+> scrambled key order still passes the conformance check. Both current
+> implementations (Python and Rust) already happen to emit keys in a consistent
+> order matching the field declaration order in the schema — the SHOULD
+> formalises this behaviour without requiring a serialiser change in either impl.
 
 **`expected/` layout for `check-certificate` fixtures.**
 
