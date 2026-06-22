@@ -1,0 +1,5 @@
+name "myapp"
+kind "application"
+deps {
+    corrupt tarball=(url)"https://example.com/corrupt.tar.gz"
+}
