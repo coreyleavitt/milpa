@@ -1,7 +1,11 @@
 # rfc-conformance-parity — handoff
 
-- **Stage:** 3 (/tdd) — Phase 2 Layer A **COMPLETE** (5/5). Next: Layer B.
-- **Resume:** `/tdd slice S6` (ws+dev-deps fixture #166) → S7 (show-liveness #135). Then Layer C gated: S4a raw-bytes mock → S4 corrupt-tar #148. S5 (#146) + D4 Low deferred.
+- **Stage:** 3 (/tdd) — Phase 2 Layer A COMPLETE; Layer B in progress (S6 done). Next: S7.
+- **Resume:** `/tdd slice S7` (show-liveness cond_requires #135). Then Layer C gated: S4a raw-bytes mock → S4 corrupt-tar #148. S5 (#146) + D4 Low deferred.
+
+## Phase 2 Layer B
+- [x] **S6** — `fixture-289-ws-dev-deps-resolve`: 2-member workspace, member-a has regular dep (extlib) + dev-dep (devtool), member-b has member ref + dev-dep (testhelper); 3 external deps via mocked-fetches. Both impls BYTE-IDENTICAL (lock alpha-sorted per lockfile-schema; member-a nim.cfg = own deps, member-b = ws-wide union per 213/214/257; _deps_structure = 3 externals). harness 280/280 div NONE, py 2150 pass (auto-discovered in-process), harness 278 pass. DONE.
+- [ ] **S7** — `milpa show` surfacing cond_requires (#135) — LIVENESS fixture (exit-0 + non-empty stdout, NOT byte-compare; show is non-frozen in v1.0).
 
 ## Phase 2 Layer A — slices (chosen direction; recorded 2026-06-21)
 - [x] **S-A1** — D1 normative-surfaces SSOT: `harness/surfaces.py` (FileSurface + named role constants LOCK_FILE/ROOT_NIMCFG/MANIFEST_FILE/DEPS_STRUCTURE_FILE/CERTIFICATE_FILE; NORMATIVE_FILES built from them; LIVENESS_CMDS/EXPECTED_EXIT_CODE/ABSENT_PATHS_SURFACE) + assertions.py derives (no surface literal inline) + test_surfaces.py SSOT proof + spec prose normative block strengthened. Pure refactor; harness 279/279 both impls div NONE, py 2149 pass, harness 196 pass. DONE.

@@ -1,0 +1,12 @@
+// fixture-289: S6 — workspace + dev-deps resolve
+//
+// A 2-member workspace where member-a declares a regular dep (extlib) and a
+// dev-dep (devtool); member-b references member-a and declares its own dev-dep
+// (testhelper). All external deps are mocked.
+//
+// Verifies that the workspace resolver includes dev-deps from members in the
+// shared lockfile and per-member nim.cfg (byte-identical across both impls).
+workspace {
+    member "member-a"
+    member "member-b"
+}

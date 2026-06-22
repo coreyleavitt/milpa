@@ -1,0 +1,8 @@
+name "member-b"
+kind "application"
+deps {
+    member "member-a"
+}
+dev-deps {
+    testhelper git=(url)"https://example.com/testhelper.git" ref="main"
+}
