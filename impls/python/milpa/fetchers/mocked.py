@@ -209,7 +209,7 @@ class MockedGitFetcher(Fetcher):
 
 
 def _run_bytes_through_real_fetcher(
-    name: str, url: str, archive_bytes: bytes, dest: "Path"
+    name: str, url: str, archive_bytes: bytes, dest: "Path", strip_components: int = 0
 ) -> "TarballReceipt":
     """Feed ``archive_bytes`` through the REAL ``TarballFetcher`` decode path.
 
@@ -218,6 +218,12 @@ def _run_bytes_through_real_fetcher(
     mode (``archive`` file) and the build mode (``format`` file) in
     ``MockedTarballFetcher`` share this helper — no copy-paste of the
     injection pattern.
+
+    ``strip_components`` is forwarded directly to ``TarballProvenance`` so
+    the real extractor applies ``tar --strip-components=N`` semantics.  Both
+    call sites in ``MockedTarballFetcher.fetch`` must pass ``p.strip_components``
+    explicitly (P2-1: previously both defaulted to 0, silently discarding the
+    dep's declared value).
 
     A valid archive → real decompression auto-detect + extract_tar run;
     receipt carries ``archive_sha256 = sha256(raw bytes)`` (same as the
@@ -231,7 +237,11 @@ def _run_bytes_through_real_fetcher(
         return archive_bytes
 
     fetcher = TarballFetcher(http_get=_http_get_from_bytes)
-    receipt = fetcher.fetch(name, TarballProvenance(url=url), dest=dest)
+    receipt = fetcher.fetch(
+        name,
+        TarballProvenance(url=url, strip_components=strip_components),
+        dest=dest,
+    )
     assert isinstance(receipt, TarballReceipt)
     return receipt
 
@@ -287,7 +297,9 @@ class MockedTarballFetcher(Fetcher):
         archive_file = key_dir / "archive"
         if archive_file.is_file():
             archive_bytes = archive_file.read_bytes()
-            return _run_bytes_through_real_fetcher(name, p.url, archive_bytes, dest)
+            return _run_bytes_through_real_fetcher(
+                name, p.url, archive_bytes, dest, strip_components=p.strip_components
+            )
 
         # Build-mode: when a ``format`` file is present, build a real archive
         # from ``content/`` and run it through the REAL TarballFetcher decode
@@ -301,7 +313,9 @@ class MockedTarballFetcher(Fetcher):
         if fmt_file.is_file():
             fmt = fmt_file.read_text(encoding="utf-8").strip()
             archive_bytes = _build_archive_from_content(key_dir, fmt)
-            return _run_bytes_through_real_fetcher(name, p.url, archive_bytes, dest)
+            return _run_bytes_through_real_fetcher(
+                name, p.url, archive_bytes, dest, strip_components=p.strip_components
+            )
 
         # Normal (copy) mode: read the pre-recorded archive sha256 and stage
         # content/ verbatim — no real decompressor runs.
@@ -359,8 +373,8 @@ class MockedOciFetcher(Fetcher):
     invariant is satisfied for ``OciProvenance`` inputs.
     """
 
-    def __init__(self, mocked_dir: Path) -> None:
-        self._dir = mocked_dir
+    def __init__(self, mocked_dir: Path) -> None:  # noqa: ARG002
+        pass
 
     def can_handle(self, p: Provenance) -> bool:
         return isinstance(p, OciProvenance)

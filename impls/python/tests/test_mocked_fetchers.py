@@ -670,3 +670,121 @@ class TestCasAdmissiblePerKind:
     def test_local_instance_is_not_cas_admissible(self) -> None:
         p = LocalProvenance(path=Path("/tmp/x"))
         assert p.cas_admissible is False
+
+
+# ---------------------------------------------------------------------------
+# P2-1 regression — strip_components threaded through raw-bytes and build modes
+# ---------------------------------------------------------------------------
+
+
+def _make_tgz_with_prefix(prefix: str, files: dict[str, bytes]) -> bytes:
+    """Build a .tar.gz whose entries have ``prefix/`` prepended to each name.
+
+    For example, ``prefix="pkg-1.0"`` + ``files={"lib.nim": b"..."}`` produces
+    an archive entry ``pkg-1.0/lib.nim`` — the canonical top-level-dir form that
+    ``strip_components=1`` is designed to handle.
+    """
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
+        inner = io.BytesIO()
+        with tarfile.open(fileobj=inner, mode="w") as tf:
+            for name, data in files.items():
+                arcname = f"{prefix}/{name}"
+                info = tarfile.TarInfo(name=arcname)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+        gz.write(inner.getvalue())
+    return buf.getvalue()
+
+
+class TestStripComponentsThreaded:
+    """Regression for P2-1: strip_components must NOT be silently dropped in
+    raw-bytes mode (``archive`` file) or build mode (``format`` file).
+
+    Before the fix, both call sites passed only ``p.url`` to
+    ``_run_bytes_through_real_fetcher``, so the dep's declared
+    ``strip_components`` was always discarded (defaulted to 0).  That meant
+    ``dest/`` received ``prefix/lib.nim`` instead of ``lib.nim`` when
+    strip_components=1 was declared.
+    """
+
+    URL = "https://releases.example.com/strip/pkg.tar.gz"
+
+    def _fetcher(self, mocked_dir: Path) -> MockedTarballFetcher:
+        return MockedTarballFetcher(mocked_dir)
+
+    def _key_dir(self, mocked_dir: Path) -> Path:
+        key_dir = mocked_dir / url_key(self.URL, "")
+        key_dir.mkdir(parents=True, exist_ok=True)
+        return key_dir
+
+    # -- raw-bytes mode (``archive`` file) --
+
+    def test_raw_bytes_strip_components_applied(self, tmp_path: Path) -> None:
+        """P2-1 raw-bytes path: strip_components=1 from provenance must be
+        forwarded to the real extractor so the leading path component is stripped."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        key_dir = self._key_dir(mocked_dir)
+
+        # Archive has entries like ``pkg-1.0/lib.nim`` — strip_components=1
+        # should strip the ``pkg-1.0/`` prefix and place ``lib.nim`` at dest root.
+        archive_bytes = _make_tgz_with_prefix("pkg-1.0", {"lib.nim": b"# stripped"})
+        (key_dir / "archive").write_bytes(archive_bytes)
+
+        fetcher = self._fetcher(mocked_dir)
+        prov = TarballProvenance(url=self.URL, strip_components=1)
+        dest = tmp_path / "_deps" / "pkg"
+
+        fetcher.fetch("pkg", prov, dest=dest)
+
+        # With strip_components=1 correctly applied, lib.nim appears at dest root.
+        assert (dest / "lib.nim").read_bytes() == b"# stripped"
+        # The prefixed path must NOT exist (would appear if strip_components was dropped).
+        assert not (dest / "pkg-1.0").exists()
+
+    def test_raw_bytes_strip_components_zero_keeps_prefix(self, tmp_path: Path) -> None:
+        """Baseline: strip_components=0 (default) leaves the prefix directory."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        key_dir = self._key_dir(mocked_dir)
+
+        archive_bytes = _make_tgz_with_prefix("pkg-1.0", {"lib.nim": b"# no strip"})
+        (key_dir / "archive").write_bytes(archive_bytes)
+
+        fetcher = self._fetcher(mocked_dir)
+        prov = TarballProvenance(url=self.URL, strip_components=0)
+        dest = tmp_path / "_deps" / "pkg"
+
+        fetcher.fetch("pkg", prov, dest=dest)
+
+        # No stripping: prefix dir is present.
+        assert (dest / "pkg-1.0" / "lib.nim").read_bytes() == b"# no strip"
+
+    # -- build mode (``format`` file) --
+
+    def test_build_mode_strip_components_applied(self, tmp_path: Path) -> None:
+        """P2-1 build-mode path: strip_components=1 from provenance must be
+        forwarded when the archive is built from content/ via the ``format`` file."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+        key_dir = self._key_dir(mocked_dir)
+
+        # Build mode: format + content/ — _build_archive_from_content wraps files
+        # with NO prefix (arcname = relative path from content/), so we put the
+        # prefix directory in the content/ tree itself to simulate the real layout.
+        (key_dir / "format").write_text("gz", encoding="utf-8")
+        content_dir = key_dir / "content"
+        prefix_dir = content_dir / "pkg-1.0"
+        prefix_dir.mkdir(parents=True)
+        (prefix_dir / "lib.nim").write_bytes(b"# build strip")
+
+        fetcher = self._fetcher(mocked_dir)
+        prov = TarballProvenance(url=self.URL, strip_components=1)
+        dest = tmp_path / "_deps" / "pkg"
+
+        fetcher.fetch("pkg", prov, dest=dest)
+
+        # strip_components=1 strips ``pkg-1.0/`` → lib.nim at root.
+        assert (dest / "lib.nim").read_bytes() == b"# build strip"
+        assert not (dest / "pkg-1.0").exists()
