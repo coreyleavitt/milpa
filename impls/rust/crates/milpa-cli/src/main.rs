@@ -24,7 +24,7 @@ use milpa_core::{
     verify_lockfile_against_deps, workspace_any_member_strict, write_lockfile, CaStore,
     CasAdmittingFetcher, CoreError, DefaultRegistry, FailureCert, FileDepDeclStore,
     FrozenResolver, Index, ManifestDoc, Milpa, MilpaError, MockedFetcher, Profile,
-    Strategy, SuccessCert, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS,
+    ProvenanceRecord, Strategy, SuccessCert, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS,
 };
 use milpa_manifest::{valid_flag_name, Dep, FlagRequest, Manifest, OverrideTarget, UrlDep, Workspace};
 
@@ -206,6 +206,40 @@ fn parse_strategy(s: &str) -> Option<Strategy> {
 
 // --- verbs -----------------------------------------------------------------
 
+/// Format a single [`ProvenanceRecord`] for `milpa show` output.
+///
+/// Mirrors Python `_format_provenance` in `cli.py` exactly.
+fn format_provenance_record(p: &ProvenanceRecord) -> String {
+    match p {
+        ProvenanceRecord::Git { url, ref_spec, commit_sha, .. } => {
+            let mut parts = vec![format!("git {url}")];
+            if let Some(r) = ref_spec {
+                parts.push(format!("@ {r}"));
+            }
+            if let Some(sha) = commit_sha {
+                parts.push(format!("(sha {})", &sha[..sha.len().min(8)]));
+            }
+            parts.join(" ")
+        }
+        ProvenanceRecord::Tarball { url, .. } => format!("tarball {url}"),
+        ProvenanceRecord::Local { path, .. } => format!("local {path}"),
+        ProvenanceRecord::Member { name, .. } => format!("member {name}"),
+        ProvenanceRecord::Oci { registry, repository, digest, .. } => {
+            format!("oci {registry}/{repository}@{}", &digest[..digest.len().min(15)])
+        }
+        ProvenanceRecord::Registry { name, tag, commit_sha, .. } => {
+            let mut parts = vec![format!("registry (legacy) {name}")];
+            if let Some(t) = tag {
+                parts.push(format!("@ {t}"));
+            }
+            if let Some(sha) = commit_sha {
+                parts.push(format!("(sha {})", &sha[..sha.len().min(8)]));
+            }
+            parts.join(" ")
+        }
+    }
+}
+
 /// `milpa show` — print the locked dep graph (stdout).
 fn cmd_show(dir: &Path) -> Result<i32, MilpaError> {
     let text = std::fs::read_to_string(dir.join("milpa.lock")).map_err(|_| {
@@ -218,7 +252,15 @@ fn cmd_show(dir: &Path) -> Result<i32, MilpaError> {
     for dep in &lock.deps {
         println!("{:20} {}", dep.name, dep.version);
         if let Some(id) = &dep.identity {
-            println!("  identity    {}", &id[..id.len().min(23)]);
+            // Print algo:digest[:8] — matches Python `{algo}:{digest[:8]}`.
+            if let Some((algo, digest)) = id.split_once(':') {
+                println!("  identity    {}:{}", algo, &digest[..digest.len().min(8)]);
+            } else {
+                println!("  identity    {}", &id[..id.len().min(8)]);
+            }
+        }
+        for prov in &dep.provenances {
+            println!("  provenance  {}", format_provenance_record(prov));
         }
         if !dep.requires.is_empty() {
             println!("  requires    {}", dep.requires.join(", "));
@@ -238,7 +280,7 @@ fn cmd_show(dir: &Path) -> Result<i32, MilpaError> {
         }
         // S10 (RFC #23 §3.7): print active_flags when non-empty.
         if !dep.active_flags.is_empty() {
-            println!("  active_flags  {}", dep.active_flags.join(" "));
+            println!("  active_flags {}", dep.active_flags.join(" "));
         }
     }
     Ok(0)
