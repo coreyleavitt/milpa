@@ -446,6 +446,124 @@ class TestB3DivergenceDetection(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# P2-9 — absent-file confinement: ``..``-escape must be rejected
+# ---------------------------------------------------------------------------
+
+class TestAbsentFileConfinement(unittest.TestCase):
+    """P2-9: rel_path entries in expected/absent must not escape the scratch dir.
+
+    A ``..``-containing line in the absent file could traverse outside the
+    scratch directory and probe arbitrary host paths.  The assertion logic
+    must confine each rel_path to within scratch before calling .exists().
+    """
+
+    def setUp(self) -> None:
+        self._scratch = Path(tempfile.mkdtemp(prefix="milpa-p29-scratch-"))
+        self._cas = Path(tempfile.mkdtemp(prefix="milpa-p29-cas-"))
+        self._fixture_dir = Path(tempfile.mkdtemp(prefix="milpa-p29-fixture-"))
+        # Build a minimal expected/ directory for a success fixture.
+        expected = self._fixture_dir / "expected"
+        expected.mkdir()
+        # Write a milpa.lock so the fixture is treated as a success class.
+        (expected / "milpa.lock").write_text("# lock\n", encoding="utf-8")
+        (self._scratch / "milpa.lock").write_text("# lock\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        for d in (self._scratch, self._cas, self._fixture_dir):
+            shutil.rmtree(str(d), ignore_errors=True)
+
+    def _make_run_result(self) -> "RunResult":
+        from harness.runner import RunResult
+        return RunResult(
+            fixture_name="fixture-p29-confinement",
+            impl_name="python",
+            returncode=0,
+            stdout="",
+            stderr="",
+            slug=None,
+            slug_error=None,
+            scratch_dir=str(self._scratch),
+            cas_dir=str(self._cas),
+        )
+
+    def test_dotdot_escape_in_absent_file_is_rejected(self) -> None:
+        """A ``../escape`` line in expected/absent must produce a failure, not probe the host.
+
+        This is the RED test for P2-9: currently the code builds
+        ``actual_path = scratch / rel_path`` and calls ``.exists()`` with no
+        confinement check, so a ``..``-escape silently probes outside scratch.
+        After the fix, a violating line must result in a ConformanceResult
+        failure (or raise) — it must NOT silently succeed by probing a host path.
+        """
+        absent_file = self._fixture_dir / "expected" / "absent"
+        # Use a path that would escape scratch via ``..``.
+        absent_file.write_text("../escape\n", encoding="utf-8")
+
+        run = self._make_run_result()
+        result = assert_conformance(run, self._fixture_dir)
+
+        # The ``../escape`` line MUST trigger a conformance failure — the
+        # assertion engine must not silently probe outside the scratch dir.
+        self.assertFalse(
+            result.passed,
+            "Expected assert_conformance to FAIL when absent file contains "
+            "a path-traversal line (``../escape``), but it returned passed=True",
+        )
+        details = [f.detail for f in result.failures]
+        self.assertTrue(
+            any("escape" in d or ".." in d or "confin" in d or "escape" in d.lower() for d in details),
+            f"Expected a confinement-related failure message; got: {details}",
+        )
+
+    def test_absolute_path_in_absent_file_is_rejected(self) -> None:
+        """An absolute path that does NOT exist on the host must still be rejected.
+
+        Without confinement, the code would check the absolute host path,
+        find it absent, and silently pass — leaking that the host path is probed.
+        With confinement, the invalid path is caught before any filesystem probe.
+        We use a path that is guaranteed not to exist on the host to ensure the
+        test is not accidentally satisfied by a host-path .exists() returning True.
+        """
+        absent_file = self._fixture_dir / "expected" / "absent"
+        absent_file.write_text("/milpa_p29_nonexistent_host_path_test\n", encoding="utf-8")
+
+        run = self._make_run_result()
+        result = assert_conformance(run, self._fixture_dir)
+
+        # Without confinement: absolute path doesn't exist on host → no failure → passed=True.
+        # With confinement: the absolute path is rejected → failure → passed=False.
+        self.assertFalse(
+            result.passed,
+            "Expected assert_conformance to FAIL for an absolute path in absent file "
+            "(a non-existent absolute path silently passing is evidence of no confinement)",
+        )
+        details = [f.detail for f in result.failures]
+        self.assertTrue(
+            any("absolute" in d.lower() or "confin" in d.lower() for d in details),
+            f"Expected a confinement-related failure message; got: {details}",
+        )
+
+    def test_normal_absent_path_within_scratch_passes(self) -> None:
+        """A plain relative path that stays within scratch must still work normally."""
+        absent_file = self._fixture_dir / "expected" / "absent"
+        # This path does NOT exist in scratch → absent check should pass.
+        absent_file.write_text("member-a/milpa.lock\n", encoding="utf-8")
+
+        run = self._make_run_result()
+        result = assert_conformance(run, self._fixture_dir)
+
+        # No confinement error; the lock comparison also passes (both identical).
+        confinement_failures = [
+            f for f in result.failures
+            if "confin" in f.detail.lower() or "escape" in f.detail.lower()
+        ]
+        self.assertEqual(
+            confinement_failures, [],
+            f"Unexpected confinement failures for a safe path: {confinement_failures}",
+        )
+
+
+# ---------------------------------------------------------------------------
 # B4 — full corpus python+rust; zero divergence
 # ---------------------------------------------------------------------------
 

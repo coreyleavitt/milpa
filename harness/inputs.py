@@ -7,6 +7,7 @@ Public API:
   read_env_file(fixture_dir) -> dict[str, str]
   env_flag(env, key) -> bool
   parse_cli_features(env) -> frozenset[str]
+  confine(root, rel_path) -> Path          # SSOT for path-confinement
   resolve_project_dir(root, suffix) -> Path
 """
 
@@ -49,24 +50,28 @@ def env_flag(env: dict[str, str], key: str) -> bool:
     return bool(v and v not in ("0", "false"))
 
 
-def resolve_project_dir(root: Path, suffix: str) -> Path:
-    """Resolve and confine a project-dir suffix to within ``root``.
+def confine(root: Path, rel_path: str) -> Path:
+    """SSOT for path-confinement: resolve ``rel_path`` within ``root``.
 
-    SINGLE DEFINITION for the confinement logic used by the black-box harness
-    (runner.py) and the in-process adapter (test_conformance.py).
+    Returns the resolved ``Path`` when ``rel_path`` is safe; raises
+    ``ValueError`` otherwise.  Two invariants are enforced:
 
-    Rules (spec/conformance-fixtures.md §2.8.1 NORMATIVE):
-    - ``suffix`` MUST be relative (not an absolute path).
-    - After joining and normalising, the result MUST NOT escape ``root``
-      (no ``..`` traversal above the root).
+    1. ``rel_path`` MUST NOT be absolute.
+    2. After joining and normalising, the result MUST NOT escape ``root``
+       (no ``..`` traversal that exits the root).
 
-    Raises ``ValueError`` on any violation.  Callers handle the "absent →
-    use root" fallback before calling this function.
+    ``root`` need not exist on disk; only its resolved form is used for
+    the containment check.
+
+    This is the SINGLE DEFINITION of the confinement predicate used by
+    ``resolve_project_dir`` (project-dir suffix validation) and
+    ``harness.assertions`` (absent-paths loop).  Do not re-implement
+    the algorithm elsewhere.
     """
-    p = Path(suffix)
+    p = Path(rel_path)
     if p.is_absolute():
         raise ValueError(
-            f"project-dir MUST be relative, got absolute path: {suffix!r}"
+            f"path MUST be relative, got absolute path: {rel_path!r}"
         )
     resolved = (root / p).resolve()
     root_resolved = root.resolve()
@@ -74,10 +79,40 @@ def resolve_project_dir(root: Path, suffix: str) -> Path:
         resolved.relative_to(root_resolved)
     except ValueError:
         raise ValueError(
-            f"project-dir escapes fixture root: {suffix!r} resolves to "
+            f"path escapes root: {rel_path!r} resolves to "
             f"{resolved} which is outside {root_resolved}"
         )
     return resolved
+
+
+def resolve_project_dir(root: Path, suffix: str) -> Path:
+    """Resolve and confine a project-dir suffix to within ``root``.
+
+    Thin wrapper around ``confine`` with project-dir–specific error messages.
+    Callers handle the "absent → use root" fallback before calling this
+    function.
+
+    Rules (spec/conformance-fixtures.md §2.8.1 NORMATIVE):
+    - ``suffix`` MUST be relative (not an absolute path).
+    - After joining and normalising, the result MUST NOT escape ``root``
+      (no ``..`` traversal above the root).
+
+    Raises ``ValueError`` on any violation.
+    """
+    try:
+        return confine(root, suffix)
+    except ValueError as exc:
+        # Re-raise with project-dir–specific framing so existing callers
+        # see familiar messages.
+        msg = str(exc)
+        if "MUST be relative" in msg:
+            raise ValueError(
+                f"project-dir MUST be relative, got absolute path: {suffix!r}"
+            ) from exc
+        raise ValueError(
+            f"project-dir escapes fixture root: {suffix!r} resolves to "
+            f"{(root / suffix).resolve()} which is outside {root.resolve()}"
+        ) from exc
 
 
 def parse_cli_features(env: dict[str, str]) -> frozenset[str]:

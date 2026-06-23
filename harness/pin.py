@@ -52,7 +52,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -61,6 +60,7 @@ from harness.runner import RunResult, run_fixture
 from harness.assertions import assert_conformance, ConformanceResult
 from harness.corpus import _detect_divergences, DivergenceRecord
 from harness.descriptors import ImplDescriptor
+from harness import surfaces
 
 
 # ---------------------------------------------------------------------------
@@ -136,26 +136,6 @@ def _run_both_impls(
         run = run_fixture(fixture_dir, desc, timeout=timeout)
         results[desc.name] = run
     return results
-
-
-def _divergence_records_from_runs(
-    fixture_name: str,
-    run_results: dict[str, RunResult],
-    conformance_results: dict[str, ConformanceResult],
-) -> list[DivergenceRecord]:
-    """Detect divergences from run results, mirroring corpus.py logic."""
-    # Read cmd from the fixture (default "resolve")
-    fixture_dir = Path(next(iter(run_results.values())).scratch_dir).parent
-    # The cmd is on the RunResult itself via the fixture runner's internal read,
-    # but RunResult doesn't expose it.  Re-read from conformance_results' fixture.
-    # We can infer from the first result's fixture_name — but cmd is not stored.
-    # Fall back to reading from any available scratch_dir's parent isn't reliable
-    # because scratch is a temp copy.  Instead we accept cmd as a parameter via
-    # the caller who already knows it, OR we compute from the conformance results.
-    # Use a simple heuristic: the cmd is in the fixture's cmd file, but we don't
-    # pass fixture_dir here.  The _detect_divergences signature needs cmd; pass
-    # "resolve" as a safe default since pin_flow always reads from the original dir.
-    return _detect_divergences(fixture_name, "resolve", conformance_results)
 
 
 def _build_divergence_dict(
@@ -244,31 +224,38 @@ def _write_expected_from_run(
         (expected_dir / "error").write_text(run.slug + "\n", encoding="utf-8")
         return
 
+    # check-certificate fixtures: copy the certificate to expected/certificate.json.
+    # The impl writes the cert to run.cert_path (scratch/_milpa_certificate.json);
+    # _write_expected_from_run must mirror it so _confirm_fixture_passes can diff it.
+    if run.cert_path is not None:
+        cert_src = Path(run.cert_path)
+        if cert_src.exists():
+            shutil.copy2(cert_src, expected_dir / surfaces.CERTIFICATE_FILE.name)
+
     # Success fixtures: copy the normative output files that exist in scratch
-    for fname in ("milpa.lock", "nim.cfg", "milpa.kdl"):
-        src = scratch / fname
+    for surf in (surfaces.LOCK_FILE, surfaces.ROOT_NIMCFG, surfaces.MANIFEST_FILE):
+        src = scratch / surf.name
         if src.exists():
-            shutil.copy2(src, expected_dir / fname)
+            shutil.copy2(src, expected_dir / surf.name)
 
     # _deps_structure.txt: generate normalized form
     from harness.assertions import normalize_deps_structure
     deps_text = normalize_deps_structure(run.scratch_dir, run.cas_dir)
     if deps_text is not None:
-        (expected_dir / "_deps_structure.txt").write_text(deps_text, encoding="utf-8")
+        (expected_dir / surfaces.DEPS_STRUCTURE_FILE.name).write_text(deps_text, encoding="utf-8")
 
     # Per-member nim.cfg for workspace fixtures
-    deps_dir = scratch / "_deps"
     # Walk scratch for member dirs (subdirs with milpa.kdl)
     for subdir in sorted(scratch.iterdir()):
         if not subdir.is_dir():
             continue
         if subdir.name.startswith("_") or subdir.name in ("mocked-fetches", "cas-seed"):
             continue
-        member_nimcfg = subdir / "nim.cfg"
+        member_nimcfg = subdir / surfaces.ROOT_NIMCFG.name
         if member_nimcfg.exists():
             member_exp = expected_dir / subdir.name
             member_exp.mkdir(exist_ok=True)
-            shutil.copy2(member_nimcfg, member_exp / "nim.cfg")
+            shutil.copy2(member_nimcfg, member_exp / surfaces.ROOT_NIMCFG.name)
 
 
 def _confirm_fixture_passes(
@@ -434,8 +421,8 @@ def _stdin_chooser(impl_names: list[str], run_results: dict[str, RunResult]) -> 
         if run.returncode == 0:
             outcome = "exit 0 (success)"
         else:
-            from harness.runner import _extract_slug
-            slug, _ = _extract_slug(run.stderr)
+            from harness.runner import extract_slug
+            slug, _ = extract_slug(run.stderr)
             outcome = f"exit {run.returncode}" + (f" slug={slug}" if slug else "")
         print(f"  [{name}] {outcome}")
     print()

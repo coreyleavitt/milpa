@@ -10,6 +10,7 @@ PENDING_SPEC_INCLUSION is empty post-swap.
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 import milpa.errors as errors_mod
@@ -21,23 +22,18 @@ import milpa.errors as errors_mod
 REPO_ROOT = Path(__file__).resolve().parents[3]  # impls/python/tests → repo root
 ERRORS_MD = REPO_ROOT / "spec" / "errors.md"
 
+# Import the single authoritative slug parser from the harness.
+# harness/ lives at the repo root; add it to sys.path if needed.
+_REPO_ROOT_STR = str(REPO_ROOT)
+if _REPO_ROOT_STR not in sys.path:
+    sys.path.insert(0, _REPO_ROOT_STR)
+
+from harness.errors_md import parse_spec_slugs as _parse_spec_slugs_from_md  # noqa: E402
+
 
 def _parse_spec_slugs() -> frozenset[str]:
-    """Parse spec/errors.md using the same logic as the Rust corpus test.
-
-    The Rust test (corpus.rs::spec_error_codes) strips the prefix ``### \\`````
-    and takes up to the next backtick.  We mirror that exactly.
-    """
-    text = ERRORS_MD.read_text(encoding="utf-8")
-    slugs: set[str] = set()
-    for line in text.splitlines():
-        if line.startswith("### `"):
-            # strip "### `", take up to next "`"
-            rest = line[5:]
-            end = rest.find("`")
-            if end != -1:
-                slugs.add(rest[:end])
-    return frozenset(slugs)
+    """Return slugs from spec/errors.md via the SSOT parser in harness/errors_md.py."""
+    return _parse_spec_slugs_from_md(ERRORS_MD)
 
 
 def _module_slug_constants() -> frozenset[str]:

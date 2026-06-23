@@ -41,32 +41,17 @@ class TestSurfaceValues(unittest.TestCase):
     def test_lock_file_name(self) -> None:
         self.assertEqual(surfaces.LOCK_FILE.name, "milpa.lock")
 
-    def test_lock_file_is_required(self) -> None:
-        self.assertTrue(surfaces.LOCK_FILE.required, "LOCK_FILE must be required=True")
-
     def test_root_nimcfg_name(self) -> None:
         self.assertEqual(surfaces.ROOT_NIMCFG.name, "nim.cfg")
-
-    def test_root_nimcfg_is_optional(self) -> None:
-        self.assertFalse(surfaces.ROOT_NIMCFG.required, "ROOT_NIMCFG must be required=False")
 
     def test_manifest_file_name(self) -> None:
         self.assertEqual(surfaces.MANIFEST_FILE.name, "milpa.kdl")
 
-    def test_manifest_file_is_optional(self) -> None:
-        self.assertFalse(surfaces.MANIFEST_FILE.required, "MANIFEST_FILE must be required=False")
-
     def test_deps_structure_file_name(self) -> None:
         self.assertEqual(surfaces.DEPS_STRUCTURE_FILE.name, "_deps_structure.txt")
 
-    def test_deps_structure_file_is_optional(self) -> None:
-        self.assertFalse(surfaces.DEPS_STRUCTURE_FILE.required, "DEPS_STRUCTURE_FILE must be required=False")
-
     def test_certificate_file_name(self) -> None:
         self.assertEqual(surfaces.CERTIFICATE_FILE.name, "certificate.json")
-
-    def test_certificate_file_is_required(self) -> None:
-        self.assertTrue(surfaces.CERTIFICATE_FILE.required, "CERTIFICATE_FILE must be required=True")
 
     # NORMATIVE_FILES derived from named constants --------------------------------
     # These tests verify that NORMATIVE_FILES is constructed FROM the named
@@ -96,21 +81,9 @@ class TestSurfaceValues(unittest.TestCase):
         self.assertIn("_deps_structure.txt", names)
         self.assertIn("milpa.kdl", names)
 
-    def test_milpa_lock_is_required(self) -> None:
-        self.assertTrue(surfaces.LOCK_FILE.required, "milpa.lock must be marked required=True")
-
-    def test_nim_cfg_is_optional(self) -> None:
-        self.assertFalse(surfaces.ROOT_NIMCFG.required, "nim.cfg must be marked required=False")
-
-    def test_deps_structure_is_optional(self) -> None:
-        self.assertFalse(surfaces.DEPS_STRUCTURE_FILE.required)
-
     def test_check_certificate_has_certificate_json(self) -> None:
         names = {f.name for f in surfaces.NORMATIVE_FILES["check-certificate"]}
         self.assertIn("certificate.json", names)
-
-    def test_certificate_json_is_required(self) -> None:
-        self.assertTrue(surfaces.CERTIFICATE_FILE.required)
 
     def test_error_has_no_files(self) -> None:
         self.assertEqual(surfaces.NORMATIVE_FILES["error"], ())
@@ -347,7 +320,7 @@ class TestDerivationFromSurfaces(unittest.TestCase):
         expected = fx_dir / "expected"
         expected.mkdir()
 
-        sentinel_lock = surfaces.FileSurface("sentinel.lock", required=True)
+        sentinel_lock = surfaces.FileSurface("sentinel.lock")
         (expected / sentinel_lock.name).write_text("expected-content\n")
 
         run = self._minimal_run(returncode=0, stdout="")
@@ -393,7 +366,7 @@ class TestDerivationFromSurfaces(unittest.TestCase):
         expected = fx_dir / "expected"
         expected.mkdir()
 
-        sentinel_cert = surfaces.FileSurface("sentinel.cert.json", required=True)
+        sentinel_cert = surfaces.FileSurface("sentinel.cert.json")
         expected_cert_data = {"kind": "success", "resolved": [], "witness": []}
         (expected / sentinel_cert.name).write_text(json.dumps(expected_cert_data))
 

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from harness import surfaces
+from harness.inputs import confine
 from harness.runner import RunResult
 
 
@@ -274,7 +275,7 @@ def assert_conformance(
         _assert_error_fixture(run, fixture_dir, expected_dir, cmd, failures, normalized_outputs)
     elif _is_liveness_cmd(cmd):
         _assert_liveness_fixture(run, failures, normalized_outputs)
-    elif cmd.split()[0] == "clean":
+    elif cmd.split()[0] == surfaces.CLEAN_CMD:
         _assert_clean_fixture(run, fixture_dir, failures, normalized_outputs)
     else:
         _assert_success_fixture(run, expected_dir, cmd, failures, normalized_outputs)
@@ -608,7 +609,7 @@ def _assert_clean_fixture(
     present (workspaces use per-member nim.cfg), so only member subdirectories
     are checked.  For single-package projects the root ``nim.cfg`` is checked.
     """
-    expected_code = surfaces.EXPECTED_EXIT_CODE["clean"]
+    expected_code = surfaces.EXPECTED_EXIT_CODE[surfaces.CLEAN_CMD]
     if run.returncode != expected_code:
         failures.append(AssertionFailure(
             fixture_name=run.fixture_name,
@@ -631,7 +632,7 @@ def _assert_clean_fixture(
         return
 
     # Empty-stdout enforcement (S-A1b): clean is in EMPTY_STDOUT_VERBS.
-    _assert_empty_stdout(run, "clean", failures)
+    _assert_empty_stdout(run, surfaces.CLEAN_CMD, failures)
 
     scratch = Path(run.scratch_dir)
 
@@ -890,13 +891,41 @@ def _assert_success_fixture(
     # S11e: asserts that no member-local milpa.lock was written.
     # Each non-empty, non-comment line is a path relative to scratch root.
     # The filename is authoritative from surfaces.ABSENT_PATHS_SURFACE.
+    #
+    # Confinement (P2-9): each rel_path MUST be relative and MUST NOT resolve
+    # outside scratch.  inputs.confine is the SSOT for this predicate.
+    # A violating line is itself a fixture-authoring error and must produce an
+    # AssertionFailure rather than silently probing host paths.
     absent_file = expected_dir / surfaces.ABSENT_PATHS_SURFACE
     if absent_file.exists():
         for raw_line in absent_file.read_text().splitlines():
             rel_path = raw_line.strip()
             if not rel_path or rel_path.startswith("#"):
                 continue
-            actual_path = scratch / rel_path
+            try:
+                actual_path = confine(scratch, rel_path)
+            except ValueError:
+                # Classify by the input itself, not by parsing confine's
+                # message (which is not a stable contract).
+                if Path(rel_path).is_absolute():
+                    detail = (
+                        f"absent entry {rel_path!r} is an absolute path — "
+                        f"absent entries must be relative to scratch "
+                        f"(confinement violation)"
+                    )
+                else:
+                    detail = (
+                        f"absent entry {rel_path!r} escapes scratch dir "
+                        f"(resolves outside {scratch.resolve()}) — "
+                        f"confinement violation"
+                    )
+                failures.append(AssertionFailure(
+                    fixture_name=run.fixture_name,
+                    impl_name=run.impl_name,
+                    kind="success-fixture",
+                    detail=detail,
+                ))
+                continue
             if actual_path.exists():
                 failures.append(AssertionFailure(
                     fixture_name=run.fixture_name,

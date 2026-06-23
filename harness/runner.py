@@ -154,7 +154,7 @@ def _build_env(
     return env
 
 
-def _extract_slug(stderr: str) -> tuple[Optional[str], Optional[str]]:
+def extract_slug(stderr: str) -> tuple[Optional[str], Optional[str]]:
     """Extract the milpa-error slug from stderr.
 
     Returns (slug, error):
@@ -487,7 +487,7 @@ def run_fixture(
             cert_path=cert_path,
         )
 
-    slug, slug_error = _extract_slug(proc.stderr)
+    slug, slug_error = extract_slug(proc.stderr)
 
     return RunResult(
         fixture_name=fixture_name,

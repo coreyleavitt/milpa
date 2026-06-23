@@ -633,5 +633,108 @@ class TestChooserArguments(unittest.TestCase):
         shutil.rmtree(str(rust_cas), ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# P2-12 — _write_expected_from_run scaffolds certificate.json
+# ---------------------------------------------------------------------------
+
+class TestWriteExpectedCertificate(unittest.TestCase):
+    """P2-12: pinning a check-certificate run copies the cert into expected/."""
+
+    def setUp(self) -> None:
+        self._tmp = Path(tempfile.mkdtemp(prefix="milpa-pin-p2-12-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_certificate_scaffolded_in_expected_on_pin(self) -> None:
+        """When the winning impl wrote a cert (run.cert_path is set and exists),
+        _write_expected_from_run copies it to expected/certificate.json using
+        the CERTIFICATE_FILE SSOT constant (not a literal string)."""
+        from harness.pin import _write_expected_from_run
+        from harness import surfaces
+
+        # Build a synthetic RunResult that carries a cert_path.
+        scratch_dir = self._tmp / "scratch"
+        scratch_dir.mkdir()
+        cas_dir = self._tmp / "cas"
+        cas_dir.mkdir()
+
+        # Simulate the impl writing its certificate to the runner-assigned path.
+        cert_path = scratch_dir / "_milpa_certificate.json"
+        cert_data = {"kind": "success", "resolved": [{"pkg": "foo", "version": "1.0.0"}], "witness": []}
+        cert_path.write_text(json.dumps(cert_data), encoding="utf-8")
+
+        # Also write a milpa.lock so the success-fixture path has something to copy.
+        (scratch_dir / "milpa.lock").write_text("lock_version 1\n", encoding="utf-8")
+
+        run = RunResult(
+            fixture_name="check-cert-fixture",
+            impl_name="python",
+            returncode=0,
+            stdout="",
+            stderr="",
+            slug=None,
+            slug_error=None,
+            scratch_dir=str(scratch_dir),
+            cas_dir=str(cas_dir),
+            cert_path=str(cert_path),
+        )
+
+        from harness.assertions import ConformanceResult
+        cr = ConformanceResult(run=run, passed=True, failures=[], normalized_outputs={})
+
+        dest_dir = self._tmp / "candidate"
+        dest_dir.mkdir()
+
+        _write_expected_from_run("python", run, cr, dest_dir)
+
+        # The SSOT constant must be used — derive the expected filename from it.
+        expected_cert = dest_dir / "expected" / surfaces.CERTIFICATE_FILE.name
+        self.assertTrue(
+            expected_cert.exists(),
+            f"expected/{surfaces.CERTIFICATE_FILE.name} not scaffolded in candidate; "
+            f"expected/ contents: {list((dest_dir / 'expected').iterdir()) if (dest_dir / 'expected').exists() else 'dir missing'}",
+        )
+        # Content must match what the impl wrote.
+        written = json.loads(expected_cert.read_text(encoding="utf-8"))
+        self.assertEqual(written, cert_data)
+
+    def test_no_certificate_when_cert_path_absent(self) -> None:
+        """When run.cert_path is None (not a check-certificate fixture),
+        expected/certificate.json must NOT be written."""
+        from harness.pin import _write_expected_from_run
+        from harness import surfaces
+
+        scratch_dir = self._tmp / "scratch-no-cert"
+        scratch_dir.mkdir()
+        cas_dir = self._tmp / "cas-no-cert"
+        cas_dir.mkdir()
+        (scratch_dir / "milpa.lock").write_text("lock_version 1\n", encoding="utf-8")
+
+        run = RunResult(
+            fixture_name="normal-fixture",
+            impl_name="python",
+            returncode=0,
+            stdout="", stderr="", slug=None, slug_error=None,
+            scratch_dir=str(scratch_dir),
+            cas_dir=str(cas_dir),
+            cert_path=None,  # not a check-certificate run
+        )
+
+        from harness.assertions import ConformanceResult
+        cr = ConformanceResult(run=run, passed=True, failures=[], normalized_outputs={})
+
+        dest_dir = self._tmp / "candidate-no-cert"
+        dest_dir.mkdir()
+
+        _write_expected_from_run("python", run, cr, dest_dir)
+
+        unexpected = dest_dir / "expected" / surfaces.CERTIFICATE_FILE.name
+        self.assertFalse(
+            unexpected.exists(),
+            f"expected/{surfaces.CERTIFICATE_FILE.name} must not appear for non-cert fixtures",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

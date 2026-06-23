@@ -57,20 +57,14 @@ class FileSurface:
     ----------
     name:
         Relative path of the file within ``expected/`` (e.g. ``"milpa.lock"``).
-    required:
-        When ``True`` the file MUST be present in the impl's output whenever
-        the fixture includes it in ``expected/``; a missing file is a failure.
-        When ``False`` the file is compared only if the fixture provides it —
-        the impl is not penalised for omitting it *unless* the fixture expects it.
 
-    Note: all fixtures presently use "compare if the fixture provides it" logic,
-    but ``milpa.lock`` on a resolve-success fixture is effectively required
-    because every resolve-success fixture ships an ``expected/milpa.lock``.
-    The distinction is preserved here because it is *structurally* different
-    from "file is optional in the fixture corpus".
+    The harness uses an opt-in comparison model: a fixture opts a file into
+    comparison by placing it in ``expected/``.  There is no per-file
+    ``required`` flag — whether a file is "effectively required" is a corpus
+    convention (every resolve-success fixture ships ``expected/milpa.lock``),
+    not an enforcement knob on FileSurface.
     """
     name: str
-    required: bool
 
 
 # ---------------------------------------------------------------------------
@@ -81,22 +75,22 @@ class FileSurface:
 # NORMATIVE_FILES["success"] is built FROM these so a name change here
 # propagates everywhere; nothing in assertions.py restates the literal string.
 
-LOCK_FILE: FileSurface = FileSurface("milpa.lock", required=True)
+LOCK_FILE: FileSurface = FileSurface("milpa.lock")
 """The lockfile written on every successful resolve."""
 
-ROOT_NIMCFG: FileSurface = FileSurface("nim.cfg", required=False)
+ROOT_NIMCFG: FileSurface = FileSurface("nim.cfg")
 """The root-level nim.cfg emitted after resolution (single-package case;
 per-member nim.cfg files are discovered dynamically from the fixture tree)."""
 
-MANIFEST_FILE: FileSurface = FileSurface("milpa.kdl", required=False)
+MANIFEST_FILE: FileSurface = FileSurface("milpa.kdl")
 """The manifest — compared on mutation fixtures (add/remove) that pin the
 post-mutation manifest in expected/."""
 
-DEPS_STRUCTURE_FILE: FileSurface = FileSurface("_deps_structure.txt", required=False)
+DEPS_STRUCTURE_FILE: FileSurface = FileSurface("_deps_structure.txt")
 """The CAS-normalized _deps/ symlink listing (spec §2.6)."""
 
 # check-certificate output
-CERTIFICATE_FILE: FileSurface = FileSurface("certificate.json", required=True)
+CERTIFICATE_FILE: FileSurface = FileSurface("certificate.json")
 """The proof certificate emitted by check-certificate."""
 
 
@@ -212,6 +206,16 @@ assert all(code in NORMATIVE_EXIT_CODES for code in EXPECTED_EXIT_CODE.values())
         if code not in NORMATIVE_EXIT_CODES
     )
 )
+
+
+# ---------------------------------------------------------------------------
+# CLEAN_CMD
+# ---------------------------------------------------------------------------
+
+# The fixture cmd verb that triggers the clean assertion path.
+# Mirrors the pattern of LIVENESS_CMDS (authoritative SSOT for the dispatch
+# string; assertions.py imports this constant rather than inlining "clean").
+CLEAN_CMD: str = "clean"
 
 
 # ---------------------------------------------------------------------------

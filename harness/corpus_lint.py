@@ -21,7 +21,7 @@ Design:
   - ``lint_corpus()`` is a pure function: takes the conformance root Path
     and the errors.md Path; returns a list of ``LintViolation`` records.
     Filesystem I/O is confined to this one function.
-  - Fixture discovery reuses ``harness.corpus._discover_fixtures`` (SSOT).
+  - Fixture discovery reuses ``harness.corpus.discover_fixtures`` (SSOT).
   - Slug parsing reuses the same line-scan logic as
     ``impls/python/tests/test_errors.py`` — no second errors.md parser.
 
@@ -35,29 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-# ---------------------------------------------------------------------------
-# Slug parser — mirrors test_errors.py::_parse_spec_slugs exactly.
-# The regex ``### `<SLUG>``` is the normative line form in spec/errors.md.
-# ---------------------------------------------------------------------------
-
-_SLUG_HEADER_RE = re.compile(r"^### `([^`]+)`")
-
-
-def parse_spec_slugs(errors_md: Path) -> frozenset[str]:
-    """Parse every slug defined in *errors_md* (``spec/errors.md``).
-
-    Mirrors the logic in ``impls/python/tests/test_errors.py::_parse_spec_slugs``
-    exactly: strip ``### \\```, take up to the next backtick.  Returns a
-    frozenset of slug strings.
-    """
-    text = errors_md.read_text(encoding="utf-8")
-    slugs: set[str] = set()
-    for line in text.splitlines():
-        m = _SLUG_HEADER_RE.match(line)
-        if m:
-            slugs.add(m.group(1))
-    return frozenset(slugs)
-
+from harness.errors_md import parse_spec_slugs  # noqa: F401  (re-exported for callers)
 
 # ---------------------------------------------------------------------------
 # Dir-name slug extraction
@@ -122,10 +100,10 @@ def lint_corpus(
     """
     # Reuse SSOT fixture discovery from harness.corpus (avoids duplicating
     # the spec-v<N>/fixture-* glob logic).
-    from harness.corpus import _discover_fixtures  # noqa: PLC0415
+    from harness.corpus import discover_fixtures  # noqa: PLC0415
 
     known_slugs = parse_spec_slugs(errors_md)
-    fixtures = _discover_fixtures(conformance_root)
+    fixtures = discover_fixtures(conformance_root)
     violations: list[LintViolation] = []
 
     for fixture_dir in fixtures:

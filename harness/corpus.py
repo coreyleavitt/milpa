@@ -148,7 +148,7 @@ class CorpusReport:
 # Fixture discovery
 # ---------------------------------------------------------------------------
 
-def _discover_fixtures(conformance_root: Path) -> list[Path]:
+def discover_fixtures(conformance_root: Path) -> list[Path]:
     """Discover all spec-v<N>/fixture-NNN-* directories, sorted."""
     fixtures: list[Path] = []
     if not conformance_root.is_dir():
@@ -250,7 +250,7 @@ def run_corpus(
 
     Prints progress to stdout as it runs (one line per fixture per impl).
     """
-    fixtures = _discover_fixtures(conformance_root)
+    fixtures = discover_fixtures(conformance_root)
     impl_names = [d.name for d in descriptors]
 
     report = CorpusReport(
