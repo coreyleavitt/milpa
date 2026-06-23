@@ -1,7 +1,7 @@
 # rfc-conformance-parity — handoff
 
-- **Stage:** 3 (/tdd) **ALL SLICES IMPLEMENTED** — Phase 1 + Phase 2 (A/B/C) complete. Next stage: **4 /code-review** on the Phase 2 scope (the new work hasn't been reviewed).
-- **Resume:** `/code-review docs/rfc-conformance-parity.md` (scope = the Phase 2 commits ea136d0..24846eb, primarily harness/ + the new fixtures + the S4a fetcher changes + spec edits). S5 (#146) DESCOPED, D4 Low deferred, c4 routed to #110 (no code pending). Do NOT wrap /code-review in /loop.
+- **Stage:** 4 (/code-review) **ROUND 1 IN FLIGHT** — Phase 2 scope (commits 077093e..24846eb). 5 review agents launched (correctness/quality/security/design/parity) on harness/ + new fixtures 289/290/291 + S4a fetcher changes (mocked.py, fetchers.rs) + cmd_show change + spec edits. Awaiting agent completion → adversarial verify → consolidate → present.
+- **Resume:** if interrupted, re-run `/code-review docs/rfc-conformance-parity.md` (scope = Phase 2 commits 077093e..24846eb). Phase-1 ledger below is COMPLETE (floor reached prior session). S5 (#146) DESCOPED, D4 Low deferred, c4 routed to #110 (no code pending). Do NOT wrap /code-review in /loop.
 
 ## Phase 2 Layer B
 - [x] **S6** — `fixture-289-ws-dev-deps-resolve`: 2-member workspace, member-a has regular dep (extlib) + dev-dep (devtool), member-b has member ref + dev-dep (testhelper); 3 external deps via mocked-fetches. Both impls BYTE-IDENTICAL (lock alpha-sorted per lockfile-schema; member-a nim.cfg = own deps, member-b = ws-wide union per 213/214/257; _deps_structure = 3 externals). harness 280/280 div NONE, py 2150 pass (auto-discovered in-process), harness 278 pass. DONE.
@@ -211,3 +211,74 @@ D1/D2/D3 → new `harness/inputs.py` owns `read_env_file`/`env_flag`/`parse_cli_
 GATES after Low pass: py 2148 pass/0 fail; rust conformance ok; black-box harness OVERALL PASS, divergences NONE.
 
 **Two pre-existing parked FORKS (awaiting Corey — next topic):** cert fixtures 127/128/150 (Python `--certificate` unimplemented), c4 partial-profile absent-axis (#159/#160/#110).
+
+---
+
+## Review ledger — STAGE 4 PHASE 2 (Round 1)
+Scope: Phase 2 commits 077093e..24846eb (harness/ + fixtures 289/290/291 + S4a fetcher changes + cmd_show + spec). 5 lenses (correctness/quality/security/design/parity) + direct adversarial verification of every C/H/M against the cited code.
+
+| id | sev | finding | status | proof / reason |
+|----|-----|---------|--------|----------------|
+| P2-1 | Med | Python `_run_bytes_through_real_fetcher` (mocked.py:234) builds `TarballProvenance(url=url)` → drops `strip_components`; Rust macro (fetchers.rs:814) threads `*strip_components`. Latent cross-impl divergence in NEW S4a code | open | VERIFIED: both py call sites (290,304) pass only `p.url`; Rust passes `*strip_components`. No current fixture sets strip_components>0, so harness green today |
+| P2-2 | Med | `_divergence_records_from_runs` (pin.py:141) dead + hardcodes cmd="resolve" fallback (would misclassify show/add fixtures if ever called) | open | VERIFIED dead: zero call sites; pin_flow uses `_detect_divergences(_read_cmd(...))` directly. 3-lens converge (quality/correctness/design) |
+| P2-3 | Med | `_write_expected_from_run` (pin.py:248) hardcodes ("milpa.lock","nim.cfg","milpa.kdl") + "_deps_structure.txt" — bypasses surfaces.py SSOT (the very thing S-A1 built) | open | VERIFIED: literals present; surfaces.LOCK_FILE.name etc. exist. 2-lens converge (quality/design) |
+| P2-4 | Med | Rust `resolve_tarball_mock_key` (fetchers.rs:947) dead `pub fn`, near-duplicate of `resolve_tarball_mock_key_dir` (980); duplicated FETCH-MOCK-MISSING error path | open | VERIFIED: only `_dir` variant called (800); not re-exported in lib.rs; no test calls it. 2-lens converge |
+| P2-5 | Med | `parse_spec_slugs` (corpus_lint.py:46) re-implements `test_errors.py::_parse_spec_slugs` (regex vs startswith) — two parsers for errors.md slug header; docstring falsely claims "mirrors exactly" | open | VERIFIED both exist; SSOT split |
+| P2-6 | Low | pin.py:55 dead `import tempfile` | open | VERIFIED never used (colocated w/ P2-2/P2-3) |
+| P2-7 | Low | fetchers.rs:1010 dead `let buf: Vec<u8>` + drop(buf) at 1047/1068 | open | VERIFIED vestigial (colocated w/ P2-4) |
+| P2-8 | Low | surfaces.py:73 `FileSurface.required` field never read by any enforcement path (false-SSOT signal) | open | VERIFIED only in def+docstring; assertions.py has parallel per-file logic |
+| P2-9 | Low | assertions.py:899 `expected/absent` paths not confined to scratch — `scratch/rel_path` w/ `..` probes host paths (harness-only; corpus trusted; 1-line fix mirrors resolve_project_dir) | open | VERIFIED no guard; security lens, harness-side only |
+| P2-10 | Low | assertions.py:277,634,611 `clean` verb as inline literal while liveness derives from surfaces.LIVENESS_CMDS — dispatch asymmetry | open | VERIFIED; minor SSOT-consistency |
+| P2-11 | Low | `milpa show` format drift py↔rust (identity char count; Rust omits provenance line; active_flags spacing 1 vs 2). NON-NORMATIVE surface (won't break harness); #135 cond-req line itself IS byte-identical | open | VERIFIED by parity lens; show is non-normative for v1.0 |
+| P2-12 | Low | pin.py `_write_expected_from_run` doesn't scaffold `certificate.json` for check-certificate fixtures → pin on such a fixture aborts unhelpfully | open | correctness lens; pin ergonomics gap |
+| P2-13 | Low | spec/conformance-fixtures.md: cas-seed §2.10 NOTE documents a known impl BUG as spec behavior; `expected/milpa.kdl` only in NOTE not the normative surface table; `update` MUST-NOT-mutate buried in compound sentence | open | design lens; spec-prose polish |
+| P2-14 | Low | mocked.py MockedOciFetcher stores `self._dir` but fetch() unconditionally raises (dead field); corpus_lint/pin deferred private imports (`_discover_fixtures`,`_extract_slug`) | open | quality/design; minor |
+| I-1 | Med→issue | LATENT: pure-garbage archive bytes <512B with NO compression magic → Rust extractor returns Ok(empty dir), Python raises FETCH-EXTRACT-FAILED. fixture-291 SIDESTEPS (uses gzip magic + garbage). Underlying Rust extractor robustness gap, arguably pre-existing | open | VERIFIED by parity lens + handoff prior warning; FILE ISSUE not fix-in-loop (Rust safe_extract hardening, separable) |
+| S-pre | — | OCI compressed body read into memory before cap (fetchers.rs:595) | wontfix-here | PRE-EXISTING, not Phase 2; OCI Tier-3 |
+
+**Refuted/SAFE (recorded, not presented):** security verified the PRODUCTION raw-bytes→real-extractor path preserves ALL protections (size caps, zip-slip, symlink-escape, decompression-bomb via member.size) identically in both impls; corrupt-archive→FETCH-ALL-FAILED chain correct both impls; url_key byte-identical; precedence (archive>format>archive_sha256) holds both impls; archive_sha256 computation identical; fixture-289 semantically correct + both impls agree (lock alpha-sort, dev-dep merge, CAS omits members); fixture-290/291 sound; no command/flag injection (--end-of-options + leading-dash guards).
+
+**Severity calls:** reviewers graded several dead-code/SSOT items "High"; downgraded to Medium — none cause incorrect runtime behavior on the current corpus (all are latent / dead / harness-only). No Critical/High after verification.
+
+### Round 1 fixes (mandate: fix through Med + colocated Lows P2-6/P2-7 + security P2-9; file I-1)
+Applied via 3 parallel sonnet agents (disjoint files). Status updates:
+- **P2-1** fixed — `mocked.py::_run_bytes_through_real_fetcher` gained `strip_components` param; both call sites pass `p.strip_components`; 2 regression tests (raw-bytes + build mode) RED→GREEN. Now symmetric w/ Rust.
+- **P2-2** fixed — deleted dead `_divergence_records_from_runs` (pin.py); zero refs remain.
+- **P2-3** fixed — `_write_expected_from_run` now derives all surface names from `surfaces.LOCK_FILE/ROOT_NIMCFG/MANIFEST_FILE/DEPS_STRUCTURE_FILE` (.name byte-identical).
+- **P2-4** fixed — deleted dead `pub fn resolve_tarball_mock_key` (fetchers.rs) + stale doc xref.
+- **P2-5** fixed — new `harness/errors_md.py` is the single home for `parse_spec_slugs`; corpus_lint.py + test_errors.py both import it; second parser removed.
+- **P2-6** fixed — removed dead `import tempfile` (pin.py).
+- **P2-7** fixed — removed dead `buf` var + `drop(buf)` (fetchers.rs build_archive_bytes).
+- **P2-9** fixed — assertions.py absent-loop now rejects absolute + `..`-escape before `.exists()` (mirrors inputs.py::resolve_project_dir SSOT); 3 new tests (2 RED→GREEN).
+- **I-1** → filed as **#175** (Rust extractor pure-garbage <512B robustness; separable, not fixed in-loop).
+- **DEFERRED Lows (left per mandate):** P2-8 FileSurface.required dead field, P2-10 clean-dispatch literal, P2-11 show drift (non-normative), P2-12 cert scaffold in pin, P2-13 spec prose polish, P2-14 OciFetcher dead field / deferred private imports. S-pre OCI mem-cap pre-existing.
+
+GATES after Round 1: harness unit **281 pass**; impls/python pytest **2157 pass / 30 skip**; rust milpa-core **417 pass**; **black-box differential harness OVERALL PASS — python 282/0, rust 282/0, divergences NONE** (Rust release binary rebuilt before the run).
+
+### Round 2 re-review (FLOOR REACHED — 0 C/H/M)
+3 lenses on the changed scope (design/quality + security + correctness/parity).
+- **Correctness/parity: CLEAN.** Empirically verified: slug parser identical 195-slug set (old vs new); strip_components now symmetric py↔rust in both raw-bytes + build modes; absent-confinement no false-positive on real corpus (fixture-278/279/280 `member-a/milpa.lock` still passes); regression tests non-tautological.
+- **Security: CLEAN.** P2-9 correctly closed; validate-then-probe ordering; no TOCTOU/symlink bypass; safe_extract validates absolute paths BEFORE stripping so strip_components threading can't bypass path-escape. No new surface.
+- **Design/quality:** 0 C/H/M; **2 new Lows, both residue of Round-1 fixes → fixed (not deferred):**
+  - **R2-L1** assertions.py re-implemented the inputs.py confinement algorithm → unified into `inputs.confine(root, rel_path)->Path` SSOT; resolve_project_dir + absent-loop both delegate. *(One brittle sub-pattern the agent introduced — branching on confine's exception message string — fixed inline: classify by `Path(rel_path).is_absolute()`, not message text.)*
+  - **R2-L2** Rust `resolve_tarball_mock_key_dir` returned vestigial `Result<((),PathBuf)>` (symmetry residue of deleted P2-4 sibling) → now `Result<PathBuf>`; call site updated.
+
+**FLOOR:** Round 2 found 0 Critical/High/Medium. Remaining items are all deferred Lows (P2-8, P2-10, P2-11 non-normative, P2-12, P2-13, P2-14) + I-1→#175 + S-pre OCI pre-existing.
+
+GATES after Round 2 (FINAL): harness unit **281 pass**; impls/python pytest **2157 pass / 30 skip**; rust milpa-core **417 pass**; **black-box differential harness OVERALL PASS — python 282/0, rust 282/0, divergences NONE** (Rust release binary rebuilt against final source).
+
+### Low cleanup pass (all remaining deferred Lows — DONE, via 4 parallel agents)
+- **P2-8** — dropped dead `FileSurface.required` field (surfaces.py): never read by any enforcement path (fixtures opt in via expected/<file>); removed from dataclass + 5 constructions + 7 test assertions. (harness tests 281→274 = the 7 dead-field tests.)
+- **P2-10** — added `surfaces.CLEAN_CMD` constant; replaced 3 inline `"clean"` literals in assertions.py (dispatch, EXPECTED_EXIT_CODE key, _assert_empty_stdout). Symmetric w/ LIVENESS_CMDS.
+- **P2-11** — aligned Rust `show` → Python (reference): identity `algo:digest[:8]`, added per-record provenance lines (`format_provenance_record`, all 6 variants), active_flags spacing 1-space. No Rust model change (provenances already in LockedDep). milpa-cli 64 pass.
+- **P2-12** — pin.py `_write_expected_from_run` now scaffolds `expected/certificate.json` from `run.cert_path` (→ `surfaces.CERTIFICATE_FILE.name`); +2 tests.
+- **P2-13 a/b/c** — spec prose: cas-seed §2.10 NOTE → NORMATIVE idempotency contract + points to **#176**; `expected/milpa.kdl` promoted to the surface table; `update` MUST-NOT-mutate is its own NORMATIVE paragraph.
+- **P2-14** — dropped dead `MockedOciFetcher._dir`; promoted deferred private imports to public (`_discover_fixtures`→`discover_fixtures` in corpus.py; `_extract_slug`→`extract_slug` in runner.py) — deferred-import-in-function-body pattern gone.
+- **#176** filed (cas-seed move-not-copy adapter bug; Low/latent).
+
+### STAGE-4 PHASE-2 OUTCOME — COMPLETE
+Code review complete: 5 lenses + adversarial verify (Round 1) → 1 fix round (3 agents) → fix-completion round (2 agents) → FLOOR (0 C/H/M, Round 2) → full Low cleanup pass (4 agents). All 14 P2 findings resolved (5 Med, 9 Low) + 2 round-2 residue Lows (R2-L1/L2) + 1 inline brittle-pattern fix. Issues filed: **#175** (Rust pure-garbage extractor, deferred), **#176** (cas-seed copy-not-move, deferred). S-pre (OCI mem-cap) pre-existing, out of scope.
+
+**FINAL GATES:** harness unit **274 pass**; impls/python pytest **2157 pass / 30 skip**; rust **milpa-cli 64 + milpa-core 417**; **black-box differential harness OVERALL PASS — python 282/0, rust 282/0, divergences NONE** (binary rebuilt against final source).
+
+**No commits yet — awaiting Corey's approval to commit.** Working tree (17 files): harness/{assertions,corpus,corpus_lint,inputs,pin,runner,surfaces,test_harness,test_pin_flow,test_surfaces}.py + NEW harness/errors_md.py; impls/python/milpa/fetchers/mocked.py + tests/{test_errors,test_mocked_fetchers}.py; impls/rust/crates/milpa-{cli/src/main.rs,core/src/fetchers.rs}; spec/conformance-fixtures.md; + handoff doc.

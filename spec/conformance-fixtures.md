@@ -65,11 +65,8 @@ of normative surfaces** per command class. All other output is explicitly
 | `expected/error` (the slug on the `milpa-error: <SLUG>` line) | error fixtures | exact slug string (`spec/errors.md` catalog) |
 | `expected/absent` (paths listed MUST NOT exist post-run) | success fixtures | existence check per listed path |
 | Process exit code | all fixtures | exact integer; valid range `{0, 1, 2}` per `cli-contract.md §3` — `0` success/liveness/clean, `1` error, `2` usage error. Any code outside the range is a conformance violation. |
+| `expected/milpa.kdl` | mutation fixtures (`add`/`remove`); per-member as `expected/<member>/milpa.kdl` | byte-exact |
 | Empty stdout on success | `fetch`/`lock`/`verify`/`clean`/`add`/`remove`/`update` (non-liveness verbs) | stdout MUST be empty (`cli-contract.md §4`) |
-
-> NOTE: `expected/milpa.kdl` is also compared byte-exact for mutation fixtures
-> (`add`/`remove` subcommands). Per-member `expected/<member>/milpa.kdl` follows
-> the same rule for workspace member mutations.
 
 **Explicitly non-normative — MAY differ per impl:**
 
@@ -469,7 +466,9 @@ A tarball subdirectory under `mocked-fetches/<key>/` MUST contain:
 > (`add`, `remove`), `expected/milpa.kdl` MUST be the exact bytes of the
 > rewritten `milpa.kdl` the verb leaves in the project directory. A conformant
 > implementation's post-run `milpa.kdl` MUST be byte-identical after the §2.6
-> normalization rules. The `update` verb MUST NOT mutate `milpa.kdl`, so an
+> normalization rules.
+
+> NORMATIVE: The `update` verb MUST NOT mutate `milpa.kdl`. Therefore an
 > `update` fixture MUST NOT contain `expected/milpa.kdl`.
 
 ### 2.5  `expected/nim.cfg` — expected compiler path config
@@ -804,13 +803,16 @@ the CAS-admission and symlink-creation steps defined in `spec/identity.md`
 > the CAS resolves correctly without a network fetch. The fixture's `milpa.lock`
 > MUST pin the matching `sha256:...` identity for each seeded dep.
 
-> NOTE: The reference Python adapter seeds the CAS by calling
-> `store.admit(tree, identity)` which currently moves (not copies) the seed
-> tree. This means `cas-seed/` trees are consumed on the first run and absent on
-> subsequent runs. Fixture authors relying on `cas-seed/` for success fixtures
-> should be aware of this behavior; it is a known limitation of the Python
-> adapter and will be corrected (by using `shutil.copytree` + `admit`) in a
-> later revision.
+> NORMATIVE: The runner MUST seed the CAS in a way that leaves the `cas-seed/`
+> fixture input intact after the run. Seeding MUST admit a copy of each tree,
+> not move the original, so that repeated harness runs against the same fixture
+> directory produce identical results.
+
+> NOTE: The current Python adapter calls `store.admit(tree, identity)` which
+> moves rather than copies the seed tree, consuming `cas-seed/` on the first
+> run. This violates the idempotency requirement above. Tracked in #176;
+> the fix is to copy each subdirectory (e.g. `shutil.copytree`) before
+> calling `admit`.
 
 ### 2.11  `dep-decl/` — DepDecl artifact directory (optional)
 
