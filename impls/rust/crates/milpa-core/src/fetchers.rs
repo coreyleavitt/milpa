@@ -796,7 +796,7 @@ impl FetcherRegistry for MockedFetcher {
                 expected_sha256,
                 strip_components,
             } => {
-                let (_, key_dir) =
+                let key_dir =
                     resolve_tarball_mock_key_dir(&self.mocked_fetches_dir, url)?;
 
                 // S4a (rfc-conformance-parity.md) — shared real-extractor injection.
@@ -937,50 +937,15 @@ pub fn resolve_mock_key(
     Ok((sha, key_dir))
 }
 
-/// Resolve a tarball URL to its `mocked-fetches/<url_key(url, "")>/` directory
-/// and read its `archive_sha256` file (the sha256 the transport reports for the
-/// downloaded archive — conformance-fixtures.md §2.3.4). Returns
-/// `(archive_sha256, key_dir)`. Tarballs have no ref, so the key's ref slot is
-/// empty (`<san(url)>@`), matching [`mocked_default_branch`]'s URL-prefix match.
-///
-/// `FETCH-MOCK-MISSING` if the key directory does not exist.
-pub fn resolve_tarball_mock_key(
-    mocked_fetches_dir: &Path,
-    url: &str,
-) -> Result<(String, std::path::PathBuf), FetchError> {
-    let key_dir = mocked_fetches_dir.join(url_key(url, ""));
-    if !key_dir.is_dir() {
-        return Err(FetchError::Transport(
-            "FETCH-MOCK-MISSING",
-            format!(
-                "mocked fetch: no tarball fixture for {url:?} \
-                 (expected dir: {})",
-                key_dir.display()
-            ),
-        ));
-    }
-    let archive_sha = std::fs::read_to_string(key_dir.join("archive_sha256"))
-        .map_err(|e| {
-            FetchError::Failed(format!(
-                "mock fixture: cannot read {}/archive_sha256: {e}",
-                key_dir.display()
-            ))
-        })?
-        .trim()
-        .to_lowercase();
-    Ok((archive_sha, key_dir))
-}
-
-/// Resolve a tarball URL to its `mocked-fetches/<url_key(url, "")>/` directory
-/// WITHOUT reading `archive_sha256`. Returns `((), key_dir)` for uniformity with
-/// [`resolve_tarball_mock_key`]. Used by the build-mode path in [`MockedFetcher`]
-/// where the archive sha256 is computed at build time, not read from disk.
+/// Resolve a tarball URL to its `mocked-fetches/<url_key(url, "")>/` directory.
+/// Used by the build-mode path in [`MockedFetcher`] where the archive sha256
+/// is computed at build time, not read from disk.
 ///
 /// `FETCH-MOCK-MISSING` if the key directory does not exist.
 fn resolve_tarball_mock_key_dir(
     mocked_fetches_dir: &Path,
     url: &str,
-) -> Result<((), std::path::PathBuf), FetchError> {
+) -> Result<std::path::PathBuf, FetchError> {
     let key_dir = mocked_fetches_dir.join(url_key(url, ""));
     if !key_dir.is_dir() {
         return Err(FetchError::Transport(
@@ -992,7 +957,7 @@ fn resolve_tarball_mock_key_dir(
             ),
         ));
     }
-    Ok(((), key_dir))
+    Ok(key_dir)
 }
 
 /// Build a real tar archive from ``key_dir/content/`` (and sibling ``*.nimble``
@@ -1007,7 +972,6 @@ fn build_archive_bytes(key_dir: &Path, fmt: &str) -> Result<Vec<u8>, FetchError>
     use flate2::Compression;
 
     let content_dir = key_dir.join("content");
-    let buf: Vec<u8> = Vec::new();
 
     // Helper: collect files to archive = content/* sorted + sibling *.nimble
     let mut entries: Vec<(std::path::PathBuf, String)> = Vec::new();
@@ -1044,7 +1008,6 @@ fn build_archive_bytes(key_dir: &Path, fmt: &str) -> Result<Vec<u8>, FetchError>
                 ar.finish()
                     .map_err(|e| FetchError::Failed(format!("build-mode gz: finish: {e}")))?;
             }
-            drop(buf);
             Ok(compressed)
         }
         "xz" => {
@@ -1065,7 +1028,6 @@ fn build_archive_bytes(key_dir: &Path, fmt: &str) -> Result<Vec<u8>, FetchError>
                 &mut compressed,
             )
             .map_err(|e| FetchError::Failed(format!("build-mode xz: compress: {e}")))?;
-            drop(buf);
             Ok(compressed)
         }
         other => Err(FetchError::Failed(format!(
