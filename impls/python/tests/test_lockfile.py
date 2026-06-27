@@ -34,6 +34,7 @@ from milpa.errors import (
     LOCK_KDL_SYNTAX,
     LOCK_PROV_FIELD_ARITY,
     LOCK_PROV_FIELD_MISSING,
+    LOCK_SUBMODULE_FIELD_INVALID,
     LOCK_PROV_KIND_MISSING,
     LOCK_PROV_KIND_UNKNOWN,
     LOCK_VERSION_MISSING,
@@ -3865,3 +3866,172 @@ class TestStripDepPin:
         result = strip_dep_pin(lf, "mylib")
         stripped = next(d for d in result.deps if d.name == "mylib")
         assert stripped.provenances == ()
+
+
+# ---------------------------------------------------------------------------
+# H5: submodule_shas lockfile round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestSubmoduleShasLockfileRoundTrip:
+    """H5-c: GitProvenanceRecord with submodule_shas round-trips through lockfile."""
+
+    def test_submodule_shas_emitted_in_format(self) -> None:
+        """format_lockfile emits submodule child nodes path-sorted."""
+        prov = GitProvenanceRecord(
+            url="https://example.com/super.git",
+            ref="main",
+            commit_sha="a" * 40,
+            submodule_shas={
+                "libs/foo": "b" * 40,
+                "libs/bar": "c" * 40,
+            },
+        )
+        dep = LockedDep(
+            name="super",
+            identity=_VALID_IDENTITY,
+            version="1.0.0",
+            src_dir="",
+            requires=(),
+            provenances=(prov,),
+        )
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        # Both submodule nodes must appear.
+        assert 'submodule "libs/bar" sha="' + "c" * 40 + '"' in text
+        assert 'submodule "libs/foo" sha="' + "b" * 40 + '"' in text
+        # Path-sorted: libs/bar before libs/foo.
+        assert text.index('"libs/bar"') < text.index('"libs/foo"')
+
+    def test_submodule_shas_round_trip(self) -> None:
+        """parse_lockfile(format_lockfile(lf)) preserves submodule_shas."""
+        prov = GitProvenanceRecord(
+            url="https://example.com/super.git",
+            ref="main",
+            commit_sha="a" * 40,
+            submodule_shas={
+                "libs/foo": "b" * 40,
+                "libs/bar": "c" * 40,
+            },
+        )
+        dep = LockedDep(
+            name="super",
+            identity=_VALID_IDENTITY,
+            version="1.0.0",
+            src_dir="",
+            requires=(),
+            provenances=(prov,),
+        )
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        parsed = parse_lockfile(text)
+        assert len(parsed.deps) == 1
+        parsed_dep = parsed.deps[0]
+        assert len(parsed_dep.provenances) == 1
+        parsed_prov = parsed_dep.provenances[0]
+        assert isinstance(parsed_prov, GitProvenanceRecord)
+        assert parsed_prov.submodule_shas == {
+            "libs/foo": "b" * 40,
+            "libs/bar": "c" * 40,
+        }
+
+    def test_empty_submodule_shas_not_emitted(self) -> None:
+        """GitProvenanceRecord with empty submodule_shas emits no submodule nodes."""
+        prov = GitProvenanceRecord(
+            url="https://example.com/no-sub.git",
+            commit_sha="d" * 40,
+        )
+        dep = LockedDep(
+            name="nosub",
+            identity=_VALID_IDENTITY,
+            version="1.0.0",
+            src_dir="",
+            requires=(),
+            provenances=(prov,),
+        )
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        assert "submodule" not in text
+
+    def test_gitreceipt_submodule_shas_propagate_to_lockfile_via_resolve(
+        self,
+        tmp_path: "Path",
+    ) -> None:
+        """GitReceipt.submodule_shas flow into the lockfile via the resolver.
+
+        This is a structural test: we verify that GitReceipt with non-empty
+        submodule_shas has the field available (not that the full resolver
+        pipeline emits it — that's integration test territory).
+        """
+        from milpa.fetchers.git import GitReceipt
+        receipt = GitReceipt(
+            commit_sha="e" * 40,
+            submodule_shas={"libs/x": "f" * 40},
+        )
+        assert receipt.submodule_shas == {"libs/x": "f" * 40}
+        assert receipt.transport_fields() == {"commit_sha": "e" * 40}
+
+
+# ---------------------------------------------------------------------------
+# R1-17: LOCK-SUBMODULE-FIELD-INVALID — malformed submodule node parse errors
+# ---------------------------------------------------------------------------
+
+
+def _lockfile_with_submodule_block(submodule_line: str) -> str:
+    """Build a minimal lockfile whose git provenance block has a custom submodule line."""
+    return f"""\
+version 1
+strategy "maxver"
+
+dep "foo" {{
+    version "1.0.0"
+    src_dir ""
+    requires
+    identity "sha256:{"a" * 64}"
+    provenance {{
+        kind "git"
+        url "https://example.com/foo.git"
+        ref "main"
+        commit_sha "{"b" * 40}"
+        {submodule_line}
+    }}
+}}
+"""
+
+
+class TestSubmoduleFieldInvalid:
+    """R1-17: malformed submodule node raises LOCK-SUBMODULE-FIELD-INVALID, not LOCK-PROV-FIELD-ARITY."""
+
+    def _raises(self, text: str) -> None:
+        with pytest.raises(MilpaError) as exc_info:
+            parse_lockfile(text)
+        assert exc_info.value.slug == LOCK_SUBMODULE_FIELD_INVALID
+
+    def test_submodule_no_args_raises_submodule_invalid(self) -> None:
+        """submodule node with zero positional args → LOCK-SUBMODULE-FIELD-INVALID."""
+        self._raises(_lockfile_with_submodule_block('submodule sha="' + "c" * 40 + '"'))
+
+    def test_submodule_missing_sha_property_raises_submodule_invalid(self) -> None:
+        """submodule node missing sha= property → LOCK-SUBMODULE-FIELD-INVALID."""
+        self._raises(_lockfile_with_submodule_block('submodule "libs/foo"'))
+
+    def test_scalar_field_arity_still_raises_prov_field_arity(self) -> None:
+        """A scalar provenance field with wrong arity still raises LOCK-PROV-FIELD-ARITY (not changed)."""
+        text = """\
+version 1
+strategy "maxver"
+
+dep "foo" {
+    version "1.0.0"
+    src_dir ""
+    requires
+    identity "sha256:""" + "a" * 64 + """"
+    provenance {
+        kind "git" "extra"
+        url "https://example.com/foo.git"
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_lockfile(text)
+        assert exc_info.value.slug == LOCK_PROV_FIELD_ARITY

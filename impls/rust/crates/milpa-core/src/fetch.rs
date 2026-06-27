@@ -14,7 +14,7 @@ use milpa_types::Provenance;
 
 /// What a fetcher reports after materializing bytes into `dest`. Deliberately
 /// not an identity — identity is computed by the caller from the bytes on disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Receipt {
     /// Resolved concrete reference (e.g. the commit SHA a ref pinned to).
     pub resolved_ref: Option<String>,
@@ -22,6 +22,12 @@ pub struct Receipt {
     /// `Some` only for the tarball transport, where it is the value recorded as
     /// the TOFU pin (`lockfile-schema.md §5`); `None` for git/local/oci.
     pub archive_sha256: Option<String>,
+    /// R1-04: submodule path → 40-hex gitlink SHA, path-sorted.
+    /// Populated by the git fetcher from `materialize_git_tree`'s return value.
+    /// Empty for non-git transports or repos with no submodules.
+    /// Used by `transport_to_record` / `resolver.rs` to populate
+    /// `ProvenanceRecord::Git { submodule_shas, .. }` in the lockfile.
+    pub submodule_shas: Vec<(String, String)>,
 }
 
 /// Fetch errors.
@@ -80,14 +86,27 @@ impl FetchError {
             "EXTRACT-ZIP-SLIP",
             "EXTRACT-SYMLINK-ESCAPE",
             "EXTRACT-SIZE-LIMIT",
+            // genuine filesystem I/O failure during extraction (not a security-escape
+            // slug): hardlink-target read, and write/mkdir I/O errors.
+            "EXTRACT-IO-ERROR",
             // real transport fetchers (S14c). Local + Git land first (offline-
             // testable); tarball/oci codes are added as those fetchers wire.
             "FETCH-LOCAL-PATH-NOT-FOUND",
             "FETCH-LOCAL-PATH-NOT-DIR",
             "FETCH-GIT-FAILED",
             "FETCH-GIT-COMMIT-ABSENT",
+            // H3c: object-store materialization detects LFS pointer blobs (first-line
+            // exact match) and raises this rather than hashing the pointer text
+            // (which would make content_hash cover incomplete content).
+            "FETCH-GIT-LFS-POINTER",
+            // H5: a .gitmodules submodule entry could not be resolved or fetched.
+            // Carries submodule_path= and submodule_url= context fields.
+            "FETCH-GIT-SUBMODULE-FAILED",
             // tarball + oci (S14c-2).
             "FETCH-DOWNLOAD-FAILED",
+            // H1: security-distinct slug for compressed-body cap breach; distinct from
+            // FETCH-DOWNLOAD-FAILED (network error) so a consumer can tell the difference.
+            "FETCH-DOWNLOAD-SIZE-EXCEEDED",
             "FETCH-EXTRACT-FAILED",
             "FETCH-SHA256-MISMATCH",
             "FETCH-OCI-PULL-FAILED",

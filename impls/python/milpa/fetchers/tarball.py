@@ -28,8 +28,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
+#: Chunk size for streaming reads in `make_http_get`.  64 KiB balances
+#: syscall overhead against bounded-memory granularity: the process never
+#: buffers more than compressed_cap + _CHUNK_SIZE bytes from a response that
+#: exceeds the cap.
+_CHUNK_SIZE: int = 65_536  # 64 KiB
+
+#: ZIP local-file-header magic bytes (PK\x03\x04).  Used to detect and reject
+#: ZIP archives early with a clear error (H0 §zip-guard).  Promoted to module
+#: level alongside _CHUNK_SIZE for consistency with other format-magic constants.
+_MAGIC_ZIP: bytes = b"\x50\x4b\x03\x04"
+
 from milpa.errors import (
     FETCH_DOWNLOAD_FAILED,
+    FETCH_DOWNLOAD_SIZE_EXCEEDED,
     FETCH_EXTRACT_FAILED,
     FETCH_SHA256_MISMATCH,
     MilpaError,
@@ -52,8 +64,8 @@ from milpa.fetchers.types import (
 #: Both impls (Python and Rust) use the SAME numeric value so the transport
 #: hardening is cross-impl byte-identical (finding R4).
 #:
-#: The cap is enforced by reading at most ``MAX_COMPRESSED_BYTES`` bytes from
-#: the transport; if the response exceeds the cap, ``FETCH-DOWNLOAD-FAILED``
+#: The cap is enforced by streaming at most ``MAX_COMPRESSED_BYTES`` bytes from
+#: the transport; if the response exceeds the cap, ``FETCH-DOWNLOAD-SIZE-EXCEEDED``
 #: is raised before any bytes are buffered beyond the cap.
 MAX_COMPRESSED_BYTES: int = _DEFAULT_LIMITS.max_total_size * 4  # 4 GiB
 
@@ -126,24 +138,77 @@ HttpGet = Callable[[str], bytes]
 def make_http_get(compressed_cap: int = MAX_COMPRESSED_BYTES) -> HttpGet:
     """Return a production ``HttpGet`` backed by ``curl -fsSL``.
 
-    ``compressed_cap`` is passed to curl as ``--max-filesize`` (R4: cap the
-    compressed download before decompression so a malicious mirror cannot OOM
-    the process before the decompression-bomb guard fires).
+    H1 — streaming bounded read: uses ``subprocess.Popen`` to read curl's
+    stdout in ``_CHUNK_SIZE`` chunks and aborts (kills curl) as soon as the
+    cumulative byte count exceeds ``compressed_cap``.  This bounds the process
+    memory to at most ``compressed_cap + _CHUNK_SIZE`` bytes regardless of how
+    large the server's response is — the full response is never buffered before
+    the cap check fires.
+
+    Raises:
+        MilpaError(FETCH_DOWNLOAD_SIZE_EXCEEDED): compressed body exceeded cap.
+        MilpaError(FETCH_DOWNLOAD_FAILED): curl exited non-zero (network error).
     """
 
     def _curl(url: str) -> bytes:
-        result = subprocess.run(
-            ["curl", "-fsSL", f"--max-filesize={compressed_cap}", url],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            detail = result.stderr.decode(errors="replace").strip()
-            raise MilpaError(
-                FETCH_DOWNLOAD_FAILED,
-                f"curl failed for {url!r}: {detail}",
-                url=url,
-            )
-        return result.stdout
+        # R1-13: wrap Popen in `with proc:` so stdout and stderr are always
+        # closed and the process is always reaped across every exit path
+        # (cap-exceeded, read exception, curl failure, success).
+        # R2-05: single coherent cleanup discipline — use communicate() once on
+        # the non-streaming paths; on kill paths, kill then raise and let
+        # __exit__ do the final reap via communicate().  No manual close/wait
+        # before or after communicate(); double-drain confuses Popen.__exit__.
+        with subprocess.Popen(
+            ["curl", "-fsSL", url],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as proc:
+            assert proc.stdout is not None
+            chunks: list[bytes] = []
+            total = 0
+            try:
+                while True:
+                    chunk = proc.stdout.read(_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > compressed_cap:
+                        # Abort: kill curl and raise.  Popen.__exit__ handles
+                        # the final reap via communicate() — do NOT manually
+                        # close stdout or call wait() here (that would cause a
+                        # double-drain in __exit__).
+                        proc.kill()
+                        raise MilpaError(
+                            FETCH_DOWNLOAD_SIZE_EXCEEDED,
+                            f"curl response for {url!r} exceeded download cap "
+                            f"({compressed_cap} bytes); request aborted",
+                            url=url,
+                            cap=compressed_cap,
+                        )
+                    chunks.append(chunk)
+            except MilpaError:
+                raise
+            except Exception as exc:
+                proc.kill()
+                raise MilpaError(
+                    FETCH_DOWNLOAD_FAILED,
+                    f"curl read error for {url!r}: {exc}",
+                    url=url,
+                ) from exc
+
+            # Stdout is now fully drained (the read loop exited cleanly).
+            # Use communicate() to drain stderr and reap the process in one call.
+            # communicate() will also close both pipes.
+            _, stderr_bytes = proc.communicate()
+            returncode = proc.returncode
+            if returncode != 0:
+                stderr = stderr_bytes.decode(errors="replace").strip() if stderr_bytes else ""
+                raise MilpaError(
+                    FETCH_DOWNLOAD_FAILED,
+                    f"curl failed for {url!r}: {stderr}",
+                    url=url,
+                )
+            return b"".join(chunks)
 
     return _curl
 
@@ -166,9 +231,10 @@ class TarballFetcher(Fetcher):
         3. Receipt carries ``archive_sha256`` (transport-pinning field).
 
     Failure codes:
-        ``FETCH-DOWNLOAD-FAILED``   — HTTP transport error.
-        ``FETCH-SHA256-MISMATCH``   — archive sha mismatch (refetch + prior lock).
-        ``FETCH-EXTRACT-FAILED``    — safe_extract raised (zip-slip, size cap, …).
+        ``FETCH-DOWNLOAD-FAILED``        — HTTP transport error (network failure).
+        ``FETCH-DOWNLOAD-SIZE-EXCEEDED`` — compressed body exceeded the download cap.
+        ``FETCH-SHA256-MISMATCH``        — archive sha mismatch (refetch + prior lock).
+        ``FETCH-EXTRACT-FAILED``         — safe_extract raised (zip-slip, size cap, …).
     """
 
     def __init__(
@@ -208,15 +274,35 @@ class TarballFetcher(Fetcher):
                 url=p.url,
             ) from exc
 
-        # R4: enforce the compressed-body cap.  The production transport uses
-        # curl --max-filesize to abort early; injected transports (tests, mocks)
-        # return bytes directly, so we check len() here as a safety net.
+        # H1: enforce the compressed-body cap.  The production transport streams
+        # and aborts early, raising FETCH_DOWNLOAD_SIZE_EXCEEDED itself.
+        # This safety-net check catches injected transports (tests, mocks) that
+        # return bytes directly without streaming — they return a full blob and
+        # the fetcher must still raise the security slug (not FETCH-DOWNLOAD-FAILED)
+        # so the distinction between "network error" and "size cap exceeded" is
+        # preserved regardless of which transport path is in use.
         if len(raw_bytes) > self._compressed_cap:
             raise MilpaError(
-                FETCH_DOWNLOAD_FAILED,
+                FETCH_DOWNLOAD_SIZE_EXCEEDED,
                 f"fetching {name!r} from {p.url!r}: compressed body "
                 f"({len(raw_bytes)} bytes) exceeds download cap "
                 f"({self._compressed_cap} bytes); possible oversized mirror",
+                dep=name,
+                url=p.url,
+                cap=self._compressed_cap,
+            )
+
+        # 1b. Unsupported-format guard: ZIP archives are not supported by
+        #     TarballFetcher.  A .zip URL with Python's tarfile produces an
+        #     obscure multi-method ReadError; detect the ZIP magic bytes early
+        #     and raise FETCH-EXTRACT-FAILED with an actionable message (H0
+        #     §zip-guard).  Uses the module-level _MAGIC_ZIP constant.
+        if raw_bytes[:4] == _MAGIC_ZIP:
+            raise MilpaError(
+                FETCH_EXTRACT_FAILED,
+                f"fetching {name!r}: unsupported archive format: .zip "
+                f"(TarballFetcher accepts .tar.gz / .tar.bz2 / .tar.xz / .tar only; "
+                f"use a tarball URL or a git= dep)",
                 dep=name,
                 url=p.url,
             )

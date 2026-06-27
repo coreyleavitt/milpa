@@ -160,19 +160,111 @@ The hash is:
 > NOTE: The reference implementation reads files with `p.read_bytes()`
 > (`identity.py:174`), which returns the exact bytes on disk.
 
-### 1.7  Git transport normalization
+### 1.7  Git-dep identity: object-store materialization
 
-> NORMATIVE: The git fetcher MUST invoke git with
-> `-c core.autocrlf=false -c core.filemode=false` so that host git
-> configuration (autocrlf rewriting `LF`→`CRLF`, filemode tracking the
-> executable bit) cannot perturb the materialized byte stream and thus
-> the identity hash. Identity is transport-independent only if the
-> materialized bytes are identical regardless of host git config.
+The identity of a git dep is the hash of the **object-store tree**, not the
+working-tree checkout.
 
-> NOTE: `core.filemode=false` keeps the working tree stable even though
-> the executable bit is no longer part of the identity byte stream
-> (Resolved Decision 1). `core.autocrlf=false` is independently required
-> by §1.6.
+**Why object-store, not checkout.** A `git checkout` is the *smudge output*:
+git applies `core.autocrlf`, then per-path `.gitattributes` directives
+(`eol=`, `filter=`, `ident`, `working-tree-encoding=`) at checkout time.
+These transformations are host-config-dependent (LFS installation, libiconv
+version, git version), making the working-tree checkout a non-deterministic
+function of the pin. Object-store blobs are the *clean* side — the exact
+bytes committed, pre-smudge by construction. No checkout runs, so no smudge
+filter can apply.
+
+#### 1.7.1  Clone discipline
+
+> NORMATIVE: The clone that backs object-store reading MUST be created with
+> `--no-checkout` (or as a bare repository). A default `git clone` creates a
+> working tree and runs smudge filters at checkout time; this defeats the
+> object-store mechanism. Conformant implementations MUST NOT perform a
+> working-tree checkout before or during the identity-computation pass.
+
+> NORMATIVE: The output tree written to `dest/` MUST NOT contain a `.git`
+> directory. The clone scratch (which holds the object store) and the output
+> tree MUST be distinct directories. The clone scratch MUST be removed after
+> the `cat-file` pass completes, regardless of whether CAS admission succeeds.
+
+#### 1.7.2  Enumeration and bulk blob reading
+
+> NORMATIVE: Blob enumeration MUST use `git ls-tree -r <commit>`, which
+> produces one `(mode, type, sha, path)` record per blob and gitlink in the
+> committed tree. Implementations MUST stream the stored bytes for every
+> enumerated blob through a single `git cat-file --batch` subprocess invocation
+> (SHAs supplied on stdin, headers and raw bytes returned on stdout). A
+> per-blob `cat-file` subprocess invocation is NOT conformant: a 10 000-file
+> dep would spawn 10 000 processes, exhausting OS process limits in constrained
+> environments.
+
+#### 1.7.3  Empty directories
+
+> NORMATIVE: `git ls-tree -r` emits only blobs (regular files and symlinks)
+> and gitlinks (submodule references); git does not track empty directories.
+> VCS materialization MUST NOT synthesize empty directories. The absence of
+> empty directories from the output tree is consistent with §1.2 (empty
+> directories contribute no bytes to the hash), and is normative for the VCS
+> path: the hash MUST be computed over exactly the blobs emitted by
+> `ls-tree -r`, not over a filesystem walk that may include synthesized
+> directories.
+
+#### 1.7.4  On-disk mode for materialized blobs
+
+Identity ignores the exec bit (§1.2), so the on-disk mode of materialized
+files does not affect the hash. However, to keep `milpa verify`
+re-hashing byte-identically across hosts, conformant implementations MUST
+write materialized blobs with the following fixed modes:
+
+> NORMATIVE:
+>
+> | `ls-tree` mode | On-disk permission |
+> |---|---|
+> | `100644` — regular blob | `0o644` |
+> | `100755` — executable blob | `0o755` |
+> | `120000` — symlink blob | (materialized as a symlink; mode is the OS default) |
+> | Directory entries | `0o755` |
+>
+> Any `ls-tree` mode not listed above (e.g. `160000` gitlink — handled by
+> §1.7.5) MUST be processed by the submodule recursion path, not written
+> as a plain blob.
+
+#### 1.7.5  Submodules: identity/provenance split and always-on recursion
+
+> NORMATIVE: A mode-160000 gitlink entry in `ls-tree -r` output records a
+> **submodule reference**. Submodule *source bytes* are content — the build
+> needs them for a complete dependency closure — and therefore MUST be
+> included in the `content_hash`. Submodule *URLs and pinned commit SHAs*
+> are **provenance** and MUST be recorded separately (in the lockfile's
+> provenance block for the dep, not in the identity field). These two kinds
+> of information MUST NOT be conflated.
+
+> NORMATIVE: Submodule recursion is **always-on**. Implementations MUST
+> recurse into every mode-160000 gitlink entry via the same `materialize-git-tree`
+> primitive (see `spec/plugin-contract.md §2.3`). An opt-in recursion flag
+> would make `content_hash` cover the full source closure in some invocations
+> and a strict subset in others — a hash whose meaning varies by flag, which
+> violates the transport-independence and recomputability requirements of §1.1.
+> The detailed mechanics of submodule URL resolution, `.gitmodules` parsing,
+> and relative-URL handling are specified in `spec/plugin-contract.md §2.3`
+> and land with H5.
+
+#### 1.7.6  Migration note
+
+Object-store materialization changes the `content_hash` for any git dep where
+the working-tree checkout bytes differed from the object-store blob bytes (e.g.
+repos with `autocrlf`- or `filter=`-affected content). This is a one-time hash
+churn.
+
+**Scope.** The conformance corpus is **not affected**: `MockedGitFetcher` stages
+fixture content verbatim with no git invocation, so every corpus git-dep
+`content_hash` is the hash of pre-baked bytes and is unchanged. The churn
+lands exclusively on the **real-network integration fixture** (`fresco`,
+`MILPA_INTEGRATION_TESTS=1`), which must be re-locked after H3b/H3c land.
+
+Per `spec_versioning_deferred`: milpa is pre-1.0 with no external consumers;
+the spec is mutated in place. The pre-fix hashes were incorrect (they captured
+smudge output, not object-store bytes) and carry no compatibility obligation.
 
 ---
 
@@ -523,5 +615,9 @@ All identity and CAS errors are defined in `spec/errors.md`. Summary:
 | `ID-UNSUPPORTED-ALGORITHM` | algorithm prefix not in supported set |
 | `ID-WRONG-DIGEST-LENGTH` | digest length wrong for algorithm |
 | `ID-NON-HEX-DIGEST` | digest contains non-lowercase-hex chars |
+| `ID-NON-UTF8-RELPATH` | a source-tree relative path is not valid UTF-8 (§1.3) |
+| `ID-NON-UTF8-SYMLINK-TARGET` | a symlink target string is not valid UTF-8 (§1.5) |
 | `CAS-IDENTITY-MISMATCH` | `admit()` computed hash ≠ claimed identity |
 | `CAS-NOT-IN-STORE` | `link()` called for an identity not in store |
+| `CAS-STORE-IO-ERROR` | a CAS store filesystem operation failed with an I/O error |
+| `STORE-AMBIGUOUS-PREFIX` | a short content-hash prefix matches more than one stored object |

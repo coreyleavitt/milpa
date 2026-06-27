@@ -47,6 +47,7 @@ from milpa.errors import (
     LOCK_GRAPH_MISMATCH,
     LOCK_PROV_FIELD_ARITY,
     LOCK_PROV_FIELD_MISSING,
+    LOCK_SUBMODULE_FIELD_INVALID,
     LOCK_PROV_KIND_MISSING,
     LOCK_PROV_KIND_UNKNOWN,
     LOCK_SRC_DIR_UNSAFE,
@@ -93,11 +94,16 @@ class GitProvenanceRecord:
     origin: "observed" (milpa fetched+verified) or "declared" (claimed mirror,
     unverified until first use). Default "observed". Per-lockfile annotation —
     never a CAS-entry property.
+
+    submodule_shas: H5 provenance — {path → sha} for each recursed submodule
+    (lockfile-schema.md §4.1). Empty dict when no submodules. These are KDL
+    child nodes ``submodule "<path>" sha="<40hex>"``, path-sorted.
     """
 
     url: str
     ref: str | None = None
     commit_sha: str | None = None
+    submodule_shas: dict[str, str] = field(default_factory=dict)
     origin: str = "observed"
     kind: str = field(default="git", init=False)
 
@@ -753,10 +759,43 @@ def _parse_cond_require(node: KdlNode) -> "CondRequire | None":
 
 def _parse_provenance_block(node: KdlNode, dep_name: str) -> ProvenanceRecord:
     """Parse a ``provenance { ... }`` block into a ProvenanceRecord."""
-    # Collect all scalar child fields into a dict
+    # Collect all scalar child fields into a dict; handle submodule nodes specially.
     fields: dict[str, str] = {}
+    submodule_shas: dict[str, str] = {}
     for child in node_children(node):
         cname = node_name(child)
+        # H5: submodule nodes have the form:
+        #   submodule "<path>" sha="<40hex>"
+        # They have ONE positional arg (path) and ONE property (sha).
+        if cname == "submodule":
+            child_args = node_args(child)
+            if len(child_args) != 1:
+                raise MilpaError(
+                    LOCK_SUBMODULE_FIELD_INVALID,
+                    f"dep {dep_name!r}: submodule node must have exactly one "
+                    f"positional arg (path), got {len(child_args)}",
+                    dep=dep_name,
+                    field="submodule",
+                )
+            sub_path = value_as_str(child_args[0])
+            if sub_path is None:
+                raise MilpaError(
+                    LOCK_SUBMODULE_FIELD_INVALID,
+                    f"dep {dep_name!r}: submodule path must be a string",
+                    dep=dep_name,
+                    field="submodule",
+                )
+            sub_sha = node_prop_str(child, "sha")
+            if sub_sha is None:
+                raise MilpaError(
+                    LOCK_SUBMODULE_FIELD_INVALID,
+                    f"dep {dep_name!r}: submodule {sub_path!r} missing required sha= property",
+                    dep=dep_name,
+                    field="submodule",
+                )
+            submodule_shas[sub_path] = sub_sha
+            continue
+
         child_args = node_args(child)
         if len(child_args) != 1:
             raise MilpaError(
@@ -796,6 +835,7 @@ def _parse_provenance_block(node: KdlNode, dep_name: str) -> ProvenanceRecord:
             url=_req_field(fields, "url", dep_name),
             ref=fields.get("ref"),
             commit_sha=fields.get("commit_sha"),
+            submodule_shas=submodule_shas,
             origin=origin,
         )
     if kind == "tarball":
@@ -1099,6 +1139,9 @@ def _format_provenance_fields(p: ProvenanceRecord) -> list[str]:
             out.append(f"ref {_kdl_str(p.ref)}")
         if p.commit_sha is not None:
             out.append(f"commit_sha {_kdl_str(p.commit_sha)}")
+        # H5: emit submodule child nodes (path-sorted for deterministic diffs).
+        for sub_path, sub_sha in sorted(p.submodule_shas.items()):
+            out.append(f"submodule {_kdl_str(sub_path)} sha={_kdl_str(sub_sha)}")
     elif isinstance(p, TarballProvenanceRecord):
         out.append(f"url {_kdl_str(p.url)}")
         if p.sha256 is not None:

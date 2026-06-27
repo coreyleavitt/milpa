@@ -602,3 +602,135 @@ fn hardlink_count_cap_trips() {
         "hardlink count over max_file_count must raise EXTRACT-SIZE-LIMIT; got: {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// H2 — hardlink geometry (spec/plugin-contract.md §2.2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hardlink_materialised_as_file_copy() {
+    // H2a: hardlink entry is extracted as a real file (not a symlink or filesystem hardlink).
+    let mut tar = Vec::new();
+    tar.extend(entry("a/foo.txt", b'0', "", b"hello hardlink"));
+    tar.extend(entry("a/bar.txt", b'1', "a/foo.txt", b""));
+    let tar = finish(tar);
+    let d = tmp();
+    let res = extract_tar(&tar, d.path(), 0, Limits::default()).unwrap();
+    // bar.txt must be a real regular file with identical bytes
+    let bar = d.path().join("a/bar.txt");
+    assert!(bar.is_file(), "bar.txt must be a regular file");
+    assert!(
+        !std::fs::symlink_metadata(&bar).unwrap().file_type().is_symlink(),
+        "bar.txt must NOT be a symlink"
+    );
+    assert_eq!(std::fs::read(&bar).unwrap(), b"hello hardlink");
+    assert_eq!(res.file_count, 2, "foo.txt + bar.txt (hardlink) = 2 files");
+}
+
+#[test]
+fn hardlink_strip_components_applied_to_linkname() {
+    // H2b: strip_components is applied to linkname (POSIX '/' split), not just the entry name.
+    // Archive: a/foo.txt (regular) + a/bar.txt → a/foo.txt (hardlink).
+    // With strip_components=1 the leading "a/" is stripped from BOTH names.
+    let mut tar = Vec::new();
+    tar.extend(entry("a/foo.txt", b'0', "", b"stripped link"));
+    tar.extend(entry("a/bar.txt", b'1', "a/foo.txt", b""));
+    let tar = finish(tar);
+    let d = tmp();
+    extract_tar(&tar, d.path(), 1, Limits::default()).unwrap();
+    let foo = d.path().join("foo.txt");
+    let bar = d.path().join("bar.txt");
+    assert!(foo.is_file(), "foo.txt must exist after strip");
+    assert!(bar.is_file(), "bar.txt must exist after strip (hardlink target also stripped)");
+    assert_eq!(std::fs::read(&bar).unwrap(), b"stripped link");
+    assert!(
+        !std::fs::symlink_metadata(&bar).unwrap().file_type().is_symlink(),
+        "bar.txt must be a real file, not a symlink"
+    );
+}
+
+#[test]
+fn hardlink_forward_reference_two_pass() {
+    // H2c: hardlink BEFORE its target in archive order must still resolve (two-pass).
+    // Archive order: hardlink first, regular file second.
+    let mut tar = Vec::new();
+    tar.extend(entry("a/bar.txt", b'1', "a/foo.txt", b"")); // hardlink FIRST
+    tar.extend(entry("a/foo.txt", b'0', "", b"forward ref")); // file SECOND
+    let tar = finish(tar);
+    let d = tmp();
+    let res = extract_tar(&tar, d.path(), 0, Limits::default()).unwrap();
+    let bar = d.path().join("a/bar.txt");
+    assert!(bar.is_file(), "bar.txt must exist even though hardlink was listed first");
+    assert_eq!(std::fs::read(&bar).unwrap(), b"forward ref");
+    assert_eq!(res.file_count, 2);
+}
+
+#[test]
+fn hardlink_escape_raises_zip_slip() {
+    // H2d: hardlink whose linkname (after strip) escapes dest_root → EXTRACT-ZIP-SLIP.
+    // No new slug — same code as a regular path-traversal escape.
+    let tar = finish(entry("a/evil.txt", b'1', "../../etc/passwd", b""));
+    let d = tmp();
+    let err = extract_tar(&tar, d.path(), 0, Limits::default()).unwrap_err();
+    assert_eq!(
+        err.code(),
+        "EXTRACT-ZIP-SLIP",
+        "hardlink escape must raise EXTRACT-ZIP-SLIP, not a new slug; got: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R1-18: EXTRACT-IO-ERROR — genuine I/O failures after path-validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn write_failure_after_validation_raises_io_error() {
+    // R1-18: a genuine filesystem I/O error (not a path-escape) during extraction
+    // must raise EXTRACT-IO-ERROR, not EXTRACT-ZIP-SLIP.
+    //
+    // We induce the failure by making the destination directory read-only so that
+    // fs::write (which is called AFTER all containment checks pass) returns EPERM.
+    // This proves that io_err (not io_zip) is used for post-validation I/O.
+    let mut tar = Vec::new();
+    tar.extend(entry("ok.nim", b'0', "", b"content"));
+    let tar = finish(tar);
+
+    let d = tmp();
+    // Make dest read-only: create_dir_all succeeds (dest exists), but any file
+    // write inside it will fail with EACCES/EPERM.
+    std::fs::set_permissions(d.path(), std::os::unix::fs::PermissionsExt::from_mode(0o555)).unwrap();
+
+    // Probe whether we are actually restricted: try writing a probe file.
+    // Running as root (or in some CI setups) ignores permissions — skip if so.
+    let probe = d.path().join(".probe");
+    let is_restricted = std::fs::write(&probe, b"x").is_err();
+    if !is_restricted {
+        std::fs::set_permissions(d.path(), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        return; // running as root or in a permissionless FS — can't induce failure
+    }
+
+    let result = extract_tar(&tar, d.path(), 0, Limits::default());
+    std::fs::set_permissions(d.path(), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    let err = result.unwrap_err();
+    assert_eq!(
+        err.code(),
+        "EXTRACT-IO-ERROR",
+        "write failure after path validation must raise EXTRACT-IO-ERROR; got: {err:?}"
+    );
+}
+
+#[test]
+fn zip_slip_via_parent_dir_still_raises_zip_slip_not_io_error() {
+    // R1-18 regression guard: path-escape detection must keep EXTRACT-ZIP-SLIP.
+    // This is the same check as the existing `zip_slip_via_parent_dir_is_rejected`
+    // test but re-stated explicitly as the EXTRACT-IO-ERROR counterpart.
+    let tar = finish(entry("../escape.txt", b'0', "", b"pwned"));
+    let d = tmp();
+    let err = extract_tar(&tar, d.path(), 0, Limits::default()).unwrap_err();
+    assert_eq!(
+        err.code(),
+        "EXTRACT-ZIP-SLIP",
+        "path escape must still raise EXTRACT-ZIP-SLIP after R1-18; got: {err:?}"
+    );
+}

@@ -13,8 +13,9 @@
 //! non-catalog placeholder until then.
 
 use std::io::Read;
-use std::path::Path;
-use std::process::Command;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use flate2::read::GzDecoder;
 use milpa_types::Provenance;
@@ -24,13 +25,15 @@ use milpa_types::Provenance;
 const MAGIC_GZIP: &[u8] = &[0x1f, 0x8b];
 const MAGIC_BZ2: &[u8] = &[0x42, 0x5a, 0x68]; // "BZh"
 const MAGIC_XZ: &[u8] = &[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00];
+/// ZIP local-file-header magic (`PK\x03\x04`). `TarballFetcher` is `.tar.*`
+/// only; a ZIP archive is an unsupported format and MUST be rejected with
+/// `FETCH-EXTRACT-FAILED` rather than silently producing an empty tree.
+const MAGIC_ZIP: &[u8] = &[0x50, 0x4b, 0x03, 0x04];
 use sha2::{Digest, Sha256};
 
-/// Overhead added to `Limits::max_total_size` to compute the decompression-bomb
-/// cap — one tar header block (512 B) to leave room for tar framing around file
-/// data (SA-1). This is the single definition; both `fetch_tarball` and
-/// `fetch_oci` derive their cap from it via `decompress_capped`.
-const DECOMP_CAP_OVERHEAD: u64 = 512;
+// R2-06: `DECOMP_CAP_OVERHEAD` is now defined in `safe_extract.rs` as the single
+// source of truth (pub(crate) const).  It is used here via `Limits::decomp_cap()`
+// (which adds the overhead) — there is no separate local copy in this module.
 
 /// Maximum compressed bytes accepted from a single HTTP download before the
 /// request is rejected (R4 — finding: uncapped compressed download DoS).
@@ -60,9 +63,13 @@ fn decompress_capped(
     name: &str,
     format: &str,
 ) -> Result<Vec<u8>, FetchError> {
+    // R1-08: admit a stream of EXACTLY decomp_cap bytes; reject ONLY > decomp_cap.
+    // Read up to decomp_cap+1 bytes; if we get more than decomp_cap the stream
+    // exceeded the cap. This matches Python's semantics: `read(decomp_cap+1)` then
+    // `if len > decomp_cap: raise`.  The +1 read is harmless overhead.
     let mut out = Vec::new();
     let n = decoder
-        .take(decomp_cap)
+        .take(decomp_cap + 1)
         .read_to_end(&mut out)
         .map_err(|e| {
             FetchError::Transport(
@@ -70,7 +77,7 @@ fn decompress_capped(
                 format!("fetching {name:?}: {format} decompress: {e}"),
             )
         })?;
-    if n as u64 >= decomp_cap {
+    if n as u64 > decomp_cap {
         return Err(size_limit_error(name, decomp_cap));
     }
     Ok(out)
@@ -91,15 +98,56 @@ fn size_limit_error(name: &str, decomp_cap: u64) -> FetchError {
     )
 }
 
-/// Write-based sibling of `decompress_capped` for the xz/lzma path.
+/// Decompress an lzma-alone (FORMAT_ALONE / LZMA1) stream `src` into a
+/// `Vec<u8>`, enforcing the SA-1 decompression-bomb cap.
 ///
-/// lzma-rs's `xz_decompress` requires a `Sized + BufRead` source and returns
-/// `lzma_rs::error::Error` (not `std::io::Error`), so a generic closure
-/// approach would not unify the signatures cleanly.  Instead this function
-/// hard-wires the lzma-rs call while sharing the SAME cap constant
-/// (`decomp_cap`), the SAME `EXTRACT-SIZE-LIMIT` slug, and the SAME error
-/// message template as `decompress_capped` via `size_limit_error` — eliminating
-/// the three parallel inline copies that R19 flagged.
+/// lzma-alone has NO reliable magic bytes (the first byte is a "properties"
+/// byte that varies by encoder settings).  This function is called as a
+/// FALLBACK when none of the reliable magics (gzip/bz2/xz) match: if
+/// `lzma_rs::lzma_decompress` succeeds, the result is a lzma-alone stream;
+/// if it fails, the caller falls through to plain-tar.
+///
+/// Uses the same `LimitedWriter` cap mechanism as `decompress_capped_xz`
+/// (xz uses the same lzma-rs crate; LZMA1 and XZ are sibling formats).
+///
+/// R3-design-L1 NOTE: these two functions share identical structure and differ
+/// only in the lzma-rs function called and the format label in the error
+/// message.  A clean helper-with-fn-parameter unification is blocked by
+/// lzma-rs's generic signature: both `lzma_decompress` and `xz_decompress`
+/// are generic over `R: BufRead + Sized` and `W: Write`, so they have
+/// higher-ranked lifetime requirements that prevent coercion to a concrete fn
+/// pointer type *or* to `impl FnOnce` with the concrete types we supply.
+/// Attempting to use `FnOnce(&mut BufReader<&[u8]>, &mut LimitedWriter<'_>)`
+/// fails with "implementation of FnOnce is not general enough" because the
+/// lzma-rs generics introduce additional lifetime variables.  The cleanest
+/// approach would require the lzma-rs API to expose a `dyn`-friendly trait or
+/// the functions to be concretised, neither of which we control.  The
+/// functions are kept as parallel peers — each three-line body + shared SSOT
+/// for cap/slug/message via `size_limit_error` — the duplication is minimal
+/// and the alternatives are worse.
+pub(crate) fn decompress_capped_lzma(
+    src: &[u8],
+    decomp_cap: u64,
+    name: &str,
+) -> Result<Vec<u8>, FetchError> {
+    let mut buf = Vec::new();
+    let mut limited = LimitedWriter::new(&mut buf, decomp_cap);
+    let result = lzma_rs::lzma_decompress(&mut std::io::BufReader::new(src), &mut limited);
+    if limited.limit_hit() {
+        return Err(size_limit_error(name, decomp_cap));
+    }
+    result.map_err(|e| {
+        FetchError::Transport(
+            "FETCH-EXTRACT-FAILED",
+            format!("fetching {name:?}: lzma-alone decompress: {e}"),
+        )
+    })?;
+    Ok(buf)
+}
+
+/// Decompress an xz stream `src` into a `Vec<u8>`, enforcing the SA-1
+/// decompression-bomb cap.  See `decompress_capped_lzma` for the R3-design-L1
+/// note on why these two functions remain as parallel peers.
 fn decompress_capped_xz(
     src: &[u8],
     decomp_cap: u64,
@@ -127,10 +175,27 @@ fn transport(code: &'static str, message: impl Into<String>) -> FetchError {
     FetchError::Transport(code, message.into())
 }
 
+/// Typed error for the [`HttpGet`] transport seam.
+///
+/// R1-22: replaces the string-sentinel protocol (`SIZE_EXCEEDED_PREFIX` prefix
+/// embedded in `Err(String)`) with a first-class variant.  `fetch_tarball`'s
+/// `map_err` can now pattern-match rather than doing a string-prefix check,
+/// and tests that inject errors can use `HttpGetError::Other` directly.
+#[derive(Debug, Clone)]
+pub enum HttpGetError {
+    /// The server's compressed body exceeded the download cap.  Maps to the
+    /// security-distinct `FETCH-DOWNLOAD-SIZE-EXCEEDED` slug (not the generic
+    /// network-failure `FETCH-DOWNLOAD-FAILED`).
+    SizeExceeded(String),
+    /// Any other transport failure (network error, curl non-zero exit, etc.).
+    /// Maps to `FETCH-DOWNLOAD-FAILED`.
+    Other(String),
+}
+
 /// A byte-fetching transport (an injected seam, like the index cache's): maps a
-/// URL to its bytes, or an error string. `DefaultRegistry::with_curl` uses the
-/// `curl` CLI; tests inject a closure.
-pub type HttpGet = Box<dyn Fn(&str) -> Result<Vec<u8>, String>>;
+/// URL to its bytes, or a typed [`HttpGetError`]. `DefaultRegistry::with_curl`
+/// uses the `curl` CLI; tests inject a closure.
+pub type HttpGet = Box<dyn Fn(&str) -> Result<Vec<u8>, HttpGetError>>;
 
 /// The reference [`FetcherRegistry`]: dispatch the closed `Provenance` enum to a
 /// per-transport fetch. Carries an [`HttpGet`] for the tarball transport.
@@ -140,7 +205,7 @@ pub struct DefaultRegistry {
 
 impl DefaultRegistry {
     /// A registry whose tarball downloads use a custom byte transport.
-    pub fn new(http_get: impl Fn(&str) -> Result<Vec<u8>, String> + 'static) -> Self {
+    pub fn new(http_get: impl Fn(&str) -> Result<Vec<u8>, HttpGetError> + 'static) -> Self {
         DefaultRegistry {
             http_get: Box::new(http_get),
         }
@@ -148,24 +213,79 @@ impl DefaultRegistry {
 
     /// The production registry: tarball downloads shell out to `curl -fsSL`.
     ///
-    /// R4: `--max-filesize` is passed to curl so the server cannot force a
-    /// download larger than `MAX_COMPRESSED_BYTES` before the compressed-body
-    /// cap check in `fetch_tarball_with_cap` fires.
+    /// H1 — streaming bounded read: spawns curl with `Stdio::piped()` stdout and
+    /// reads in chunks, aborting (killing curl) as soon as the cumulative byte
+    /// count exceeds `MAX_COMPRESSED_BYTES`.  The process never buffers more than
+    /// `MAX_COMPRESSED_BYTES + chunk_size` bytes from an oversized response.
+    ///
+    /// On cap breach, returns `Err(HttpGetError::SizeExceeded(...))` so
+    /// `fetch_tarball` can pattern-match the variant rather than string-matching
+    /// a prefix.
     pub fn with_curl() -> Self {
-        DefaultRegistry::new(|url| {
-            let out = Command::new("curl")
-                .args(["-fsSL", &format!("--max-filesize={MAX_COMPRESSED_BYTES}"), url])
-                .output()
-                .map_err(|e| format!("cannot run curl: {e}"))?;
-            if out.status.success() {
-                Ok(out.stdout)
-            } else {
-                Err(format!(
-                    "curl failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ))
+        DefaultRegistry::new(curl_streaming_transport(MAX_COMPRESSED_BYTES))
+    }
+}
+
+/// Chunk size for the streaming curl read (64 KiB).  Memory bound per response:
+/// at most `compressed_cap + CURL_CHUNK_SIZE` bytes before abort.
+const CURL_CHUNK_SIZE: usize = 65_536;
+
+/// Build a streaming curl transport bounded to `compressed_cap` bytes.
+///
+/// The returned closure spawns curl with a piped stdout, reads in
+/// `CURL_CHUNK_SIZE` chunks, and kills the process the moment the cumulative
+/// read exceeds `compressed_cap`.  On cap breach the closure returns
+/// `Err(HttpGetError::SizeExceeded(...))` so the call site can pattern-match
+/// the variant rather than inspect a string prefix.
+pub(crate) fn curl_streaming_transport(
+    compressed_cap: u64,
+) -> impl Fn(&str) -> Result<Vec<u8>, HttpGetError> + 'static {
+    move |url: &str| {
+        let mut child = Command::new("curl")
+            .args(["-fsSL", url])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| HttpGetError::Other(format!("cannot run curl: {e}")))?;
+
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut buf = Vec::new();
+        let mut chunk = vec![0u8; CURL_CHUNK_SIZE];
+
+        loop {
+            let n = stdout.read(&mut chunk).map_err(|e| HttpGetError::Other(format!("curl read: {e}")))?;
+            if n == 0 {
+                break;
             }
-        })
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() as u64 > compressed_cap {
+                // Kill curl immediately — no further bytes are read.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(HttpGetError::SizeExceeded(format!(
+                    "compressed body ({} bytes read so far) \
+                     exceeds download cap ({compressed_cap} bytes); request aborted",
+                    buf.len()
+                )));
+            }
+        }
+        drop(stdout);
+
+        let status = child.wait().map_err(|e| HttpGetError::Other(format!("curl wait: {e}")))?;
+        if status.success() {
+            Ok(buf)
+        } else {
+            let stderr = child
+                .stderr
+                .take()
+                .map(|mut s| {
+                    let mut v = Vec::new();
+                    let _ = s.read_to_end(&mut v);
+                    String::from_utf8_lossy(&v).trim().to_string()
+                })
+                .unwrap_or_default();
+            Err(HttpGetError::Other(format!("curl failed: {stderr}")))
+        }
     }
 }
 
@@ -236,15 +356,757 @@ pub fn fetch_local(name: &str, src: &Path, dest: &Path) -> Result<Receipt, Fetch
     })?;
     // A local symlink carries no resolved ref and no identity; its provenance
     // evidence is the declared path, recorded by the resolver.
-    Ok(Receipt {
-        resolved_ref: None,
-        archive_sha256: None,
-    })
+    Ok(Receipt::default())
 }
 
-/// Clone `url` into `dest` and check out the pinned commit (or `ref_spec`).
-/// `FETCH-GIT-FAILED` on a clone/checkout failure; `FETCH-GIT-COMMIT-ABSENT` if
-/// the pinned commit isn't present after cloning. Mirrors `GitFetcher`.
+// ---------------------------------------------------------------------------
+// Object-store materialization (H3c, spec/identity.md §1.7,
+// plugin-contract.md §2.3/§2.4)
+// ---------------------------------------------------------------------------
+
+/// The exact first line of a Git-LFS pointer file.
+/// A blob is an LFS pointer iff it starts with this exact byte sequence
+/// (plugin-contract.md §2.3.2 — first-line exact match).
+const LFS_POINTER_FIRST_LINE: &[u8] = b"version https://git-lfs.github.com/spec/v1\n";
+
+/// Materialize a git commit's tree from the object store into `dest`.
+///
+/// This is the **single chokepoint** for blob writing, fixed-mode, LFS
+/// detection, symlink-escape containment, and submodule recursion (H5).
+/// `fetch_git` produces its output tree EXCLUSIVELY via this function
+/// (plugin-contract.md §2.4.1 NORMATIVE).
+///
+/// # Arguments
+/// - `repo`             — path to the `--no-checkout` clone scratch holding
+///                        the object store (`.git/`); NOT the output tree.
+/// - `commit`           — commit SHA to materialize.
+/// - `dest`             — clean output tree directory (caller must create it);
+///                        MUST NOT contain `.git`.
+/// - `submodule_fetch`  — H5 recursion seam.  Called with `(resolved_url, sha)`
+///                        for each mode-160000 gitlink; `None` skips recursion.
+/// - `superproject_url` — H5: the remote URL of this repo (used to resolve
+///                        relative `url = ../sibling` entries in `.gitmodules`).
+///                        Required when `submodule_fetch` is `Some` and the
+///                        repo has submodules with relative URLs.
+///
+/// # Returns
+/// `Ok(path → sha)` map (submodule path relative to dest root, POSIX) for every
+/// mode-160000 gitlink recursed. Empty when no submodules or `submodule_fetch`
+/// is `None`.
+///
+/// # Errors
+/// - `FETCH-GIT-FAILED`            — `git ls-tree` or `git cat-file --batch` failed.
+/// - `EXTRACT-SYMLINK-ESCAPE`      — a committed symlink's target escapes `dest`.
+/// - `FETCH-GIT-LFS-POINTER`       — a blob is a Git-LFS pointer.
+/// - `FETCH-GIT-SUBMODULE-FAILED`  — submodule URL unresolvable or fetch failed.
+pub fn materialize_git_tree(
+    repo: &Path,
+    commit: &str,
+    dest: &Path,
+    submodule_fetch: Option<&dyn Fn(&str, &str) -> Result<PathBuf, FetchError>>,
+    superproject_url: Option<&str>,
+) -> Result<std::collections::HashMap<String, String>, FetchError> {
+    // R2-01: pass the ancestor-path visited set (empty at the root).
+    // Each child receives its OWN CLONE of the set (with the child's key added)
+    // so siblings do NOT see each other's keys — only a true ancestor repeat
+    // (same (url,sha) on the current recursion path) triggers the cycle guard.
+    materialize_git_tree_inner(repo, commit, dest, submodule_fetch, superproject_url, 0, &std::collections::HashSet::new())
+}
+
+/// R1-03: maximum submodule recursion depth (load-bearing: alternating chains
+/// use distinct SHAs, so only depth limits them — not the visited-set alone).
+const MAX_SUBMODULE_DEPTH: usize = 16;
+
+/// Internal implementation with depth and ancestor-path visited-set tracking (R1-03, R2-01).
+///
+/// `visited` is the set of `(resolved_url, commit_sha)` pairs on the CURRENT
+/// RECURSION PATH (ancestor chain).  Each child receives its OWN CLONE of the
+/// set with the child's key pre-inserted, so siblings do NOT share keys —
+/// only a repeat on the ancestor chain triggers `FETCH-GIT-SUBMODULE-FAILED`.
+/// This matches Python's `child_seen = seen | {visit_key}` pattern exactly.
+fn materialize_git_tree_inner(
+    repo: &Path,
+    commit: &str,
+    dest: &Path,
+    submodule_fetch: Option<&dyn Fn(&str, &str) -> Result<PathBuf, FetchError>>,
+    superproject_url: Option<&str>,
+    depth: usize,
+    visited: &std::collections::HashSet<(String, String)>,
+) -> Result<std::collections::HashMap<String, String>, FetchError> {
+    use crate::safe_extract::normalize_lexical;
+    use std::collections::HashMap;
+
+    // Canonicalize dest so prefix comparisons are reliable.
+    let dest_root = std::fs::canonicalize(dest)
+        .unwrap_or_else(|_| normalize_lexical(dest));
+
+    // -----------------------------------------------------------------------
+    // Step 1: ls-tree -r — enumerate (mode, type, sha, path) for every entry
+    // -----------------------------------------------------------------------
+    // R1-15: use -z (NUL-delimited) to disable C-quoting of exotic filenames.
+    // With -z each entry is "<mode> SP <type> SP <sha> TAB <path> NUL".
+    // This preserves path bytes faithfully (no C-quoting, no lossy UTF-8 round-trip).
+    let ls_out = Command::new("git")
+        .arg("-C").arg(repo)
+        .args(["ls-tree", "-r", "-z", "--end-of-options", commit])
+        .output()
+        .map_err(|e| transport("FETCH-GIT-FAILED",
+            format!("git ls-tree for commit {commit:?}: cannot spawn git: {e}")))?;
+    if !ls_out.status.success() {
+        return Err(transport(
+            "FETCH-GIT-FAILED",
+            format!(
+                "git ls-tree failed for commit {commit:?}: {}",
+                String::from_utf8_lossy(&ls_out.stderr).trim()
+            ),
+        ));
+    }
+
+    // Parse ls-tree -z output: each record is "<mode> <type> <sha>\t<path>\0"
+    // Split on NUL; each non-empty record contains a TAB separating meta from path.
+    // Path bytes are preserved as-is (no C-quoting with -z).
+    let mut blobs: Vec<(String, String, String, String)> = Vec::new(); // (mode, type, sha, path)
+    let mut gitlinks: Vec<(String, String, String, String)> = Vec::new();
+
+    for record in ls_out.stdout.split(|&b| b == b'\0') {
+        if record.is_empty() {
+            continue;
+        }
+        // Find the tab separator between meta and path.
+        let tab_pos = match record.iter().position(|&b| b == b'\t') {
+            Some(p) => p,
+            None => continue,
+        };
+        let meta_bytes = &record[..tab_pos];
+        let path_bytes = &record[tab_pos + 1..];
+        // meta is always ASCII (mode/type/sha are hex+letters).
+        let meta = match std::str::from_utf8(meta_bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // NEW-C: non-UTF-8 relpaths are rejected as errors (spec/identity.md
+        // §ID-NON-UTF8-RELPATH).  `ls-tree -z` delivers raw path bytes without
+        // C-quoting; if those bytes are not valid UTF-8 we raise the error code
+        // immediately rather than falling back to `from_utf8_lossy` (which
+        // silently substitutes U+FFFD, producing a wrong content_hash with no
+        // error).  Both impls now reject non-UTF-8 relpaths identically.
+        let entry_path = match std::str::from_utf8(path_bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                // Represent the offending bytes as escaped hex for the error message.
+                let hex: String = path_bytes
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                return Err(transport(
+                    "ID-NON-UTF8-RELPATH",
+                    format!(
+                        "git tree entry has a non-UTF-8 path (raw bytes: {hex}); \
+                         milpa requires UTF-8 relpaths for content addressing"
+                    ),
+                ));
+            }
+        };
+        let parts: Vec<&str> = meta.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let (mode, _obj_type, sha) = (parts[0], parts[1], parts[2]);
+
+        if mode == "160000" {
+            gitlinks.push((mode.to_string(), _obj_type.to_string(), sha.to_string(), entry_path));
+        } else {
+            blobs.push((mode.to_string(), _obj_type.to_string(), sha.to_string(), entry_path));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 2: cat-file --batch — ONE subprocess for ALL blobs
+    //
+    // Protocol: write newline-delimited SHAs to stdin; read back a framed
+    // stream from stdout.  Each object frame is:
+    //   "<sha> <type> <size>\n" — header line
+    //   <size bytes of content>  — raw blob content (binary-safe)
+    //   "\n"                     — trailing separator between objects
+    //
+    // We use the header's <size> field to read EXACTLY that many bytes per
+    // object, then consume the trailing "\n" separator.  This is the safe
+    // binary-correct approach — do NOT use line-by-line reading here.
+    // -----------------------------------------------------------------------
+    let mut blob_bytes: HashMap<String, Vec<u8>> = HashMap::new();
+
+    if !blobs.is_empty() {
+        let batch_shas: Vec<&str> = blobs.iter().map(|(_, _, sha, _)| sha.as_str()).collect();
+        let batch_input = {
+            let mut v = Vec::new();
+            for sha in &batch_shas {
+                v.extend_from_slice(sha.as_bytes());
+                v.push(b'\n');
+            }
+            v
+        };
+
+        // R1-02: cat-file --batch deadlock prevention.
+        // git interleaves read/write on its pipe pair; if we write ALL of stdin
+        // before draining stdout, git's stdout buffer (~64 KiB) fills and both
+        // sides block — a classic pipe deadlock that manifests at ~20-50 real
+        // source files.  Fix: write stdin on a separate thread concurrently with
+        // draining stdout via wait_with_output().  The writer thread owns the
+        // ChildStdin handle; dropping it closes the pipe, signalling EOF to git.
+        let cat_out = {
+            let mut child = Command::new("git")
+                .arg("-C").arg(repo)
+                .args(["cat-file", "--batch"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| transport("FETCH-GIT-FAILED",
+                    format!("git cat-file --batch for commit {commit:?}: spawn: {e}")))?;
+
+            // Take stdin before spawning writer thread (Option<ChildStdin>).
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            let writer_input = batch_input.clone();
+            let writer = std::thread::spawn(move || {
+                use std::io::Write as _;
+                // Write all SHAs then drop stdin — closes the pipe → git sees EOF.
+                let _ = stdin.write_all(&writer_input);
+                // Explicit drop for clarity; happens automatically when `stdin`
+                // goes out of scope.  The `move` captured the ChildStdin, so
+                // the pipe is closed when this thread exits.
+            });
+
+            // Drain stdout + stderr concurrently with the writer (the key fix).
+            let out = child.wait_with_output()
+                .map_err(|e| transport("FETCH-GIT-FAILED",
+                    format!("git cat-file --batch for commit {commit:?}: wait: {e}")))?;
+
+            // Join the writer thread and propagate any panic.  A broken-pipe
+            // write error is benign (git closed stdin after processing all SHAs)
+            // and is already covered by the exit-status check below — only a
+            // thread panic (programming error) must be surfaced here.
+            writer.join().expect("cat-file stdin writer thread panicked");
+            out
+        };
+
+        if !cat_out.status.success() {
+            return Err(transport(
+                "FETCH-GIT-FAILED",
+                format!(
+                    "git cat-file --batch failed for commit {commit:?}: {}",
+                    String::from_utf8_lossy(&cat_out.stderr).trim()
+                ),
+            ));
+        }
+
+        // Parse the framed --batch output stream.
+        // Each object: "<sha> <type> <size>\n<content bytes>\n"
+        let data = &cat_out.stdout;
+        let mut pos = 0usize;
+
+        for sha in &batch_shas {
+            // Find the newline that terminates the header line.
+            let nl = match data[pos..].iter().position(|&b| b == b'\n') {
+                Some(i) => pos + i,
+                None => {
+                    return Err(transport(
+                        "FETCH-GIT-FAILED",
+                        format!(
+                            "git cat-file --batch: truncated header for SHA {sha:?} \
+                             at byte {pos}"
+                        ),
+                    ));
+                }
+            };
+            let header = match std::str::from_utf8(&data[pos..nl]) {
+                Ok(s) => s,
+                Err(_) => return Err(transport(
+                    "FETCH-GIT-FAILED",
+                    format!("git cat-file --batch: non-UTF-8 header for SHA {sha:?}"),
+                )),
+            };
+            pos = nl + 1;
+
+            // Header format: "<sha> <type> <size>" or "<sha> missing"
+            let header_parts: Vec<&str> = header.split_whitespace().collect();
+            if header_parts.len() >= 2 && header_parts[1] == "missing" {
+                return Err(transport(
+                    "FETCH-GIT-FAILED",
+                    format!("git cat-file --batch: SHA {sha:?} reported missing"),
+                ));
+            }
+            if header_parts.len() < 3 {
+                return Err(transport(
+                    "FETCH-GIT-FAILED",
+                    format!(
+                        "git cat-file --batch: unexpected header {:?} for SHA {sha:?}",
+                        header
+                    ),
+                ));
+            }
+            // R1-19: parse size as u64 (not usize directly) so a 32-bit target
+            // cannot truncate the value before the bounds check below.  Then
+            // convert to usize via try_into(); a size that exceeds usize::MAX is
+            // impossible on any platform with a reasonable git object, so the
+            // FETCH-GIT-FAILED error is the correct response.
+            let obj_size_u64: u64 = header_parts[2].parse().map_err(|_| {
+                transport(
+                    "FETCH-GIT-FAILED",
+                    format!(
+                        "git cat-file --batch: unparseable size {:?} for SHA {sha:?}",
+                        header_parts[2]
+                    ),
+                )
+            })?;
+            let obj_size: usize = obj_size_u64.try_into().map_err(|_| {
+                transport(
+                    "FETCH-GIT-FAILED",
+                    format!(
+                        "git cat-file --batch: object size {obj_size_u64} overflows \
+                         platform usize for SHA {sha:?}"
+                    ),
+                )
+            })?;
+
+            // Read exactly obj_size bytes.
+            if pos + obj_size > data.len() {
+                return Err(transport(
+                    "FETCH-GIT-FAILED",
+                    format!(
+                        "git cat-file --batch: data for SHA {sha:?} truncated \
+                         (expected {obj_size} bytes at pos {pos}, stream has {} bytes)",
+                        data.len()
+                    ),
+                ));
+            }
+            let content = data[pos..pos + obj_size].to_vec();
+            pos += obj_size;
+            // Skip the trailing newline separator between objects.
+            if pos < data.len() && data[pos] == b'\n' {
+                pos += 1;
+            }
+            blob_bytes.insert(sha.to_string(), content);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 3: write blobs to dest with fixed modes + safety checks
+    // -----------------------------------------------------------------------
+    let mut gitlink_results: HashMap<String, String> = HashMap::new();
+
+    for (mode, _obj_type, sha, entry_path) in &blobs {
+        let content = match blob_bytes.get(sha.as_str()) {
+            Some(b) => b,
+            None => return Err(transport(
+                "FETCH-GIT-FAILED",
+                format!("cat-file result missing for SHA {sha:?} (path {entry_path:?})"),
+            )),
+        };
+
+        // R1-01: zip-slip containment — BEFORE writing any blob or symlink.
+        // Reject absolute entry paths and `..`-escape paths. Lexically normalize
+        // the joined path and require it to equal dest_root or be strictly under
+        // it (component-aware Path::starts_with).
+        {
+            let joined = dest_root.join(entry_path);
+            let normalized = normalize_lexical(&joined);
+            // An absolute entry_path (e.g. "/etc/x") would join but resolve to
+            // outside dest_root.  A ".." escape ("../../escape") would also fail.
+            if !normalized.starts_with(&dest_root) {
+                return Err(transport(
+                    "EXTRACT-ZIP-SLIP",
+                    format!(
+                        "git ls-tree entry {entry_path:?} resolves outside destination: \
+                         {} not under {} (zip-slip rejected)",
+                        normalized.display(),
+                        dest_root.display()
+                    ),
+                ));
+            }
+        }
+        let abs_dest = dest_root.join(entry_path);
+
+        if mode == "120000" {
+            // Symlink: blob bytes are the link-target string.
+            materialize_symlink(entry_path, content, &abs_dest, &dest_root)?;
+        } else if mode == "100644" || mode == "100755" {
+            // Regular or executable blob.
+            // LFS first-line detection (plugin-contract.md §2.3.2).
+            check_lfs(entry_path, content)?;
+            // Create parent dirs.
+            if let Some(parent) = abs_dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| transport(
+                    "FETCH-GIT-FAILED",
+                    format!("creating parent for {entry_path:?}: {e}"),
+                ))?;
+            }
+            std::fs::write(&abs_dest, content).map_err(|e| transport(
+                "FETCH-GIT-FAILED",
+                format!("writing {entry_path:?}: {e}"),
+            ))?;
+            // Fixed on-disk mode.
+            let on_disk_mode: u32 = if mode == "100755" { 0o755 } else { 0o644 };
+            std::fs::set_permissions(&abs_dest, std::fs::Permissions::from_mode(on_disk_mode))
+                .map_err(|e| transport(
+                    "FETCH-GIT-FAILED",
+                    format!("chmod {entry_path:?}: {e}"),
+                ))?;
+        } else {
+            // Unexpected mode (e.g. 100664 or future) — write with default.
+            // Do not raise; be permissive on unknown regular modes.
+            check_lfs(entry_path, content)?;
+            if let Some(parent) = abs_dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| transport(
+                    "FETCH-GIT-FAILED",
+                    format!("creating parent for {entry_path:?}: {e}"),
+                ))?;
+            }
+            std::fs::write(&abs_dest, content).map_err(|e| transport(
+                "FETCH-GIT-FAILED",
+                format!("writing {entry_path:?}: {e}"),
+            ))?;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 4: gitlinks — submodule recursion (H5)
+    // -----------------------------------------------------------------------
+    if !gitlinks.is_empty() {
+        if let Some(ref fetch_fn) = submodule_fetch {
+            // Parse .gitmodules from the materialized tree (written in Step 3).
+            let gitmodules_path = dest_root.join(".gitmodules");
+            let gitmodules_bytes = if gitmodules_path.exists() {
+                std::fs::read(&gitmodules_path).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let submodule_url_map = parse_gitmodules(&gitmodules_bytes);
+
+            for (_mode, _obj_type, sha, entry_path) in &gitlinks {
+                // Resolve the submodule URL from .gitmodules by path.
+                let raw_url = match submodule_url_map.get(entry_path.as_str()) {
+                    Some(u) => u.clone(),
+                    None => {
+                        return Err(transport(
+                            "FETCH-GIT-SUBMODULE-FAILED",
+                            format!(
+                                "submodule at {entry_path:?} has no entry in .gitmodules \
+                                 (or .gitmodules is absent); cannot resolve URL \
+                                 [submodule_path={entry_path:?}] [submodule_url=(unknown)]"
+                            ),
+                        ));
+                    }
+                };
+                let resolved_url = resolve_submodule_url(&raw_url, superproject_url)
+                    .map_err(|e| transport(
+                        "FETCH-GIT-SUBMODULE-FAILED",
+                        format!(
+                            "cannot resolve relative submodule URL {raw_url:?} for \
+                             {entry_path:?}: {e} \
+                             [submodule_path={entry_path:?}] [submodule_url={raw_url:?}]"
+                        ),
+                    ))?;
+
+                // R1-03: depth cap — load-bearing even when (url, sha) pairs repeat
+                // in alternating chains using distinct SHAs at each level.
+                if depth >= MAX_SUBMODULE_DEPTH {
+                    return Err(transport(
+                        "FETCH-GIT-SUBMODULE-FAILED",
+                        format!(
+                            "submodule recursion depth {depth} exceeds cap ({MAX_SUBMODULE_DEPTH}) \
+                             at {entry_path:?} [submodule_path={entry_path:?}] \
+                             [submodule_url={resolved_url:?}]"
+                        ),
+                    ));
+                }
+                // R2-01: cycle guard — detect (url, sha) repeating on the CURRENT
+                // ANCESTOR PATH only.  A sibling submodule with the same (url, sha)
+                // is legitimate (diamond pattern); an ancestor repeat is a cycle.
+                //
+                // Implementation: check whether the key is already in the ancestor set
+                // (`visited`).  If yes → cycle → reject.  If no → build a CHILD-LOCAL
+                // copy (`child_visited = visited + {visit_key}`) and pass that copy to
+                // the recursive call.  The parent's `visited` is never mutated, so the
+                // next sibling starts with the same clean ancestor set.
+                //
+                // This matches Python exactly: `child_seen = seen | {visit_key}`.
+                let visit_key = (resolved_url.clone(), sha.clone());
+                if visited.contains(&visit_key) {
+                    return Err(transport(
+                        "FETCH-GIT-SUBMODULE-FAILED",
+                        format!(
+                            "submodule cycle detected: ({resolved_url:?}, {sha:?}) already on \
+                             the ancestor path \
+                             [submodule_path={entry_path:?}] [submodule_url={resolved_url:?}]"
+                        ),
+                    ));
+                }
+                // Build the child's ancestor-path set: parent's keys + this child's key.
+                let mut child_visited = visited.clone();
+                child_visited.insert(visit_key);
+
+                let sub_scratch = fetch_fn(&resolved_url, sha)?;
+
+                // R1-01: zip-slip containment for gitlink sub_dest.
+                let sub_dest = {
+                    let joined = dest_root.join(entry_path);
+                    let normalized = normalize_lexical(&joined);
+                    if !normalized.starts_with(&dest_root) {
+                        return Err(transport(
+                            "EXTRACT-ZIP-SLIP",
+                            format!(
+                                "gitlink entry_path {entry_path:?} resolves outside destination: \
+                                 {} not under {} (zip-slip rejected)",
+                                normalized.display(),
+                                dest_root.display()
+                            ),
+                        ));
+                    }
+                    joined
+                };
+                std::fs::create_dir_all(&sub_dest).map_err(|e| transport(
+                    "FETCH-GIT-FAILED",
+                    format!("creating submodule dest {entry_path:?}: {e}"),
+                ))?;
+                let sub_results = materialize_git_tree_inner(
+                    &sub_scratch,
+                    sha,
+                    &sub_dest,
+                    submodule_fetch.as_ref().map(|f| f as &dyn Fn(&str, &str) -> Result<PathBuf, FetchError>),
+                    Some(&resolved_url),
+                    depth + 1,
+                    &child_visited,
+                )?;
+                gitlink_results.insert(entry_path.clone(), sha.clone());
+                // Accumulate nested results with prefixed paths.
+                for (nested_path, nested_sha) in sub_results {
+                    gitlink_results.insert(
+                        format!("{entry_path}/{nested_path}"),
+                        nested_sha,
+                    );
+                }
+            }
+        }
+    }
+    // If submodule_fetch is None, gitlinks are silently skipped (H3c behaviour).
+
+    Ok(gitlink_results)
+}
+
+/// Parse a `.gitmodules` blob into a `{path → url}` map.
+///
+/// `.gitmodules` uses a gitconfig-format subset:
+/// ```text
+/// [submodule "<name>"]
+///     path = <path>
+///     url = <url>
+/// ```
+/// Pure text parsing — no shell execution, no eval. Entries without both
+/// `path` and `url` are silently skipped. Mirrors Python `_parse_gitmodules`.
+pub fn parse_gitmodules(content: &[u8]) -> std::collections::HashMap<String, String> {
+    let mut result = std::collections::HashMap::new();
+    let text = String::from_utf8_lossy(content);
+
+    let mut current_path: Option<String> = None;
+    let mut current_url: Option<String> = None;
+
+    for line in text.lines() {
+        let stripped = line.trim();
+        if stripped.starts_with("[submodule ") {
+            // Flush previous section if complete.
+            if let (Some(p), Some(u)) = (current_path.take(), current_url.take()) {
+                result.insert(p, u);
+            }
+            current_path = None;
+            current_url = None;
+        } else if stripped.contains('=') && !stripped.starts_with('[') {
+            if let Some(eq_pos) = stripped.find('=') {
+                let key = stripped[..eq_pos].trim();
+                let value = stripped[eq_pos + 1..].trim();
+                if key == "path" {
+                    current_path = Some(value.to_string());
+                } else if key == "url" {
+                    current_url = Some(value.to_string());
+                }
+            }
+        }
+    }
+    // Flush final section.
+    if let (Some(p), Some(u)) = (current_path, current_url) {
+        result.insert(p, u);
+    }
+    result
+}
+
+/// Resolve a submodule URL from `.gitmodules` against the superproject URL.
+///
+/// Mirrors git-submodule.sh `resolve_relative_url`:
+/// - Absolute URLs (contain `://` or start with `/` or are SCP-style) pass through.
+/// - Relative URLs (`./` or `../`) are resolved against `dirname(superproject_url)`
+///   where dirname strips the last `/`-delimited path component.
+///   The path arithmetic is performed on the URL's path component alone (scheme
+///   and host are preserved).
+///
+/// Returns `Ok(resolved_url)` or `Err(message)` if relative and no superproject_url.
+pub fn resolve_submodule_url(
+    raw_url: &str,
+    superproject_url: Option<&str>,
+) -> Result<String, String> {
+    // Absolute URL detection.
+    let is_absolute = raw_url.contains("://")
+        || raw_url.starts_with('/')
+        || (!raw_url.starts_with("./") && !raw_url.starts_with("../")
+            && raw_url.split(':').next().map_or(false, |s| s.contains('@')));
+
+    if is_absolute {
+        return Ok(raw_url.to_string());
+    }
+
+    let superproject_url = match superproject_url {
+        Some(u) => u,
+        None => {
+            return Err(format!(
+                "Cannot resolve relative submodule URL {raw_url:?}: superproject_url is None"
+            ));
+        }
+    };
+
+    // Strip last path component from superproject_url (mirrors `${remote%/*}`).
+    let last_slash = match superproject_url.rfind('/') {
+        Some(i) => i,
+        None => {
+            return Ok(format!("{}/{}", superproject_url, raw_url));
+        }
+    };
+    let remoteurl = &superproject_url[..last_slash];
+
+    // Split scheme+host from the path component.
+    if let Some(scheme_end_pos) = remoteurl.find("://") {
+        let scheme_end = scheme_end_pos + 3;
+        let scheme_host_str = &remoteurl[..scheme_end];  // e.g. "https://"
+        let after_scheme = &remoteurl[scheme_end..];     // e.g. "github.com/org"
+        let (host_part, url_path) = match after_scheme.find('/') {
+            Some(p) => (&after_scheme[..p], &after_scheme[p..]),
+            None => (after_scheme, "/"),
+        };
+        let base = format!("{}{}", scheme_host_str, host_part);
+        // Join path with raw_url and normalize.
+        let joined = format!("{}/{}", url_path.trim_end_matches('/'), raw_url);
+        let resolved_path = normalize_url_path(&joined);
+        Ok(format!("{}{}", base, resolved_path))
+    } else {
+        // No scheme (bare path).
+        let joined = format!("{}/{}", remoteurl.trim_end_matches('/'), raw_url);
+        Ok(normalize_url_path(&joined))
+    }
+}
+
+/// POSIX-style path normalization for URL path components.
+/// Resolves `.` and `..` segments and collapses consecutive slashes,
+/// converging with Python's `posixpath.normpath` behavior (R1-16).
+fn normalize_url_path(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let absolute = path.starts_with('/');
+    for segment in path.split('/') {
+        match segment {
+            // R1-16: empty segments from consecutive slashes (e.g. "//") are
+            // collapsed by treating them the same as "." — skip.
+            "" | "." => {}
+            ".." => { parts.pop(); }
+            s => parts.push(s),
+        }
+    }
+    let result = parts.join("/");
+    if absolute {
+        format!("/{}", result)
+    } else {
+        result
+    }
+}
+
+/// Check if `content` is a Git-LFS pointer and raise `FETCH-GIT-LFS-POINTER`
+/// if so. A blob is a pointer iff its first line is exactly the LFS version
+/// header (plugin-contract.md §2.3.2).
+fn check_lfs(entry_path: &str, content: &[u8]) -> Result<(), FetchError> {
+    if content.starts_with(LFS_POINTER_FIRST_LINE) {
+        return Err(transport(
+            "FETCH-GIT-LFS-POINTER",
+            format!(
+                "dep uses Git LFS at path {entry_path:?}: milpa reads the git object \
+                 store directly and cannot fetch LFS blobs — vendor a plain-git mirror \
+                 or use a local= path"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Write a mode-120000 symlink blob to disk after lexical containment check
+/// (plugin-contract.md §2.3.3 — same containment logic as SafeExtractor).
+fn materialize_symlink(
+    entry_path: &str,
+    blob: &[u8],
+    abs_dest: &Path,
+    dest_root: &Path,
+) -> Result<(), FetchError> {
+    use crate::safe_extract::normalize_lexical;
+
+    let link_target = match std::str::from_utf8(blob) {
+        Ok(s) => s,
+        Err(_) => {
+            return Err(transport(
+                "EXTRACT-SYMLINK-ESCAPE",
+                format!(
+                    "symlink {entry_path:?} has a non-UTF-8 target; cannot check containment"
+                ),
+            ));
+        }
+    };
+
+    // Lexical containment check: parent of abs_dest joined with the link target,
+    // all `.` and `..` resolved WITHOUT following filesystem symlinks.
+    let parent = abs_dest.parent().unwrap_or(dest_root);
+    let resolved_target = normalize_lexical(&parent.join(link_target));
+    let under_dest = resolved_target.starts_with(dest_root);
+    if !under_dest {
+        return Err(transport(
+            "EXTRACT-SYMLINK-ESCAPE",
+            format!(
+                "symlink {entry_path:?} → {link_target:?} resolves outside \
+                 destination: {} not under {}",
+                resolved_target.display(),
+                dest_root.display()
+            ),
+        ));
+    }
+
+    // Write the symlink.
+    if let Some(p) = abs_dest.parent() {
+        std::fs::create_dir_all(p).map_err(|e| transport(
+            "FETCH-GIT-FAILED",
+            format!("creating parent for symlink {entry_path:?}: {e}"),
+        ))?;
+    }
+    let _ = std::fs::remove_file(abs_dest);
+    std::os::unix::fs::symlink(link_target, abs_dest).map_err(|e| transport(
+        "FETCH-GIT-FAILED",
+        format!("creating symlink {entry_path:?}: {e}"),
+    ))?;
+    Ok(())
+}
+
+/// Clone `url` into a scratch dir with `--no-checkout`, resolve the commit,
+/// materialize the object store into `dest`, then clean up the scratch.
+/// Returns a `Receipt` with `resolved_ref = Some(commit_sha)`.
+///
+/// This is the H3c object-store implementation — mirrors Python `GitFetcher.fetch`.
+/// No working-tree checkout is created; `materialize_git_tree` reads blobs
+/// directly from the `.git/` object store, so no smudge filters can apply
+/// (spec/identity.md §1.7 NORMATIVE).
+///
+/// `FETCH-GIT-FAILED` on a clone/fetch failure; `FETCH-GIT-COMMIT-ABSENT` if
+/// the pinned commit isn't present after exhaustive fetch (H4 chain).
 pub fn fetch_git(
     name: &str,
     url: &str,
@@ -253,60 +1115,252 @@ pub fn fetch_git(
     dest: &Path,
 ) -> Result<Receipt, FetchError> {
     clear_dest(dest).map_err(|e| transport("FETCH-GIT-FAILED", e))?;
-    // R5: --end-of-options before the URL so a URL starting with '-' cannot
-    // be misinterpreted as an option flag (git clone >= 2.24).
-    run_git(name, &["clone", "-q", "--end-of-options", url, &dest.to_string_lossy()])?;
 
-    match commit_sha {
+    // Allocate a clone scratch directory alongside dest.  The scratch holds
+    // `.git/` (the object store); the output tree (`dest`) is separate and
+    // MUST NOT contain `.git` (spec/identity.md §1.7.1 NORMATIVE: two distinct
+    // scratch dirs).
+    let scratch_parent = dest.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("_scratch_{}", dest.file_name().and_then(|n| n.to_str()).unwrap_or("dep")));
+    let _ = std::fs::remove_dir_all(&scratch_parent);
+    std::fs::create_dir_all(&scratch_parent).map_err(|e| transport(
+        "FETCH-GIT-FAILED",
+        format!("fetching {name:?}: cannot create clone scratch parent: {e}"),
+    ))?;
+
+    // Unique scratch dir within the parent (mirrors Python's tempfile.mkdtemp).
+    let clone_scratch = scratch_parent.join("clone");
+
+    // Cleanup guard: remove scratch on exit regardless of success or failure.
+    // (Using a struct with Drop so we don't need to duplicate cleanup on each
+    //  early-return path.)
+    struct ScratchGuard(PathBuf);
+    impl Drop for ScratchGuard {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+    let _guard = ScratchGuard(scratch_parent.clone());
+
+    // Clone --no-checkout: object store only, no working tree, no smudge.
+    // Full-depth clone (precision fix b — H4): no --depth flag.
+    // R5: --end-of-options before the URL.
+    git_status(name, Command::new("git").args([
+        "clone", "-q", "--no-checkout", "--end-of-options",
+        url, &clone_scratch.to_string_lossy(),
+    ]))?;
+
+    // Resolve the commit SHA.
+    let commit = match commit_sha {
         Some(sha) => {
-            // Exact-commit pin (Invariant 2): verify the commit is present
-            // before checkout, so an absent pin is a clear coded error.
-            if !commit_present(dest, sha) {
-                let _ = std::fs::remove_dir_all(dest);
-                return Err(transport(
-                    "FETCH-GIT-COMMIT-ABSENT",
-                    format!("fetching {name:?}: pinned commit {sha} not present in {url}"),
-                ));
-            }
-            // R5: --end-of-options before commit SHA so a SHA starting with '-'
-            // is not parsed as an option flag (git checkout >= 2.24).
-            run_git_in(name, dest, &["checkout", "-q", "--end-of-options", sha])?;
+            // Exact-commit pin: run the 4-step ensure_commit_present chain.
+            ensure_commit_present(name, url, sha, &clone_scratch)?;
+            sha.to_string()
         }
         None => {
-            // R5: --end-of-options before ref so a ref like '-evil' or '--detach'
-            // is treated as a ref name, not a flag (git checkout >= 2.24).
-            run_git_in(name, dest, &["checkout", "-q", "--end-of-options", ref_spec])?;
+            // Mutable-ref tip: fetch the ref, then resolve it.
+            git_status(name, Command::new("git").arg("-C").arg(&clone_scratch).args([
+                "fetch", "-q", "origin", "--end-of-options", ref_spec,
+            ]))?;
+            git_resolve_ref(&clone_scratch, ref_spec, name)?
         }
-    }
+    };
 
+    // Materialize the object-store tree into dest.
+    std::fs::create_dir_all(dest).map_err(|e| transport(
+        "FETCH-GIT-FAILED",
+        format!("fetching {name:?}: cannot create dest: {e}"),
+    ))?;
+
+    // H5: build the submodule_fetch closure.  For each (url, sha) pair,
+    // clone the submodule into a scratch dir under scratch_parent and return it.
+    // ScratchGuard cleans up scratch_parent (and all sub-clones) on exit.
+    let scratch_parent_for_sub = scratch_parent.clone();
+    // R1-10: use an atomic counter for unique sub-scratch dir names rather than
+    // subsec_nanos() — two submodules in the same nanosecond would collide.
+    let sub_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let submodule_fetch_fn = move |sub_url: &str, sub_sha: &str| -> Result<PathBuf, FetchError> {
+        // R1-10: guaranteed-unique dir via incrementing counter.
+        let idx = sub_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sub_scratch = scratch_parent_for_sub.join(format!("sub_{idx}"));
+        // Use git clone with --no-checkout.
+        let clone_out = std::process::Command::new("git")
+            .args(["clone", "-q", "--no-checkout", "--end-of-options",
+                   sub_url, &sub_scratch.to_string_lossy()])
+            .output()
+            .map_err(|e| transport(
+                "FETCH-GIT-SUBMODULE-FAILED",
+                format!(
+                    "submodule clone from {sub_url:?}: cannot spawn git: {e} \
+                     [submodule_url={sub_url:?}]"
+                ),
+            ))?;
+        if !clone_out.status.success() {
+            return Err(transport(
+                "FETCH-GIT-SUBMODULE-FAILED",
+                format!(
+                    "submodule clone from {sub_url:?} failed: {} \
+                     [submodule_url={sub_url:?}]",
+                    String::from_utf8_lossy(&clone_out.stderr).trim()
+                ),
+            ));
+        }
+        // R1-05: ensure the pinned submodule SHA is present after cloning.
+        // `git clone` fetches the default branch; the pinned commit may be on a
+        // non-default branch or not yet present (server requires allowReachableSHA1InWant).
+        // Raise FETCH-GIT-SUBMODULE-FAILED (not FETCH-GIT-FAILED) on genuine absence —
+        // canonical slug for submodule resolution failures.
+        if !sub_sha.is_empty() {
+            // Use a lightweight wrapper: if not present after clone, try fetching.
+            if !commit_present(&sub_scratch, sub_sha) {
+                // Try a targeted fetch first (best-effort).
+                let _ = std::process::Command::new("git")
+                    .arg("-C").arg(&sub_scratch)
+                    .args(["fetch", "-q", "origin", "--end-of-options", sub_sha])
+                    .output();
+                if !commit_present(&sub_scratch, sub_sha) {
+                    // Full fetch.
+                    let _ = std::process::Command::new("git")
+                        .arg("-C").arg(&sub_scratch)
+                        .args(["fetch", "-q", "origin"])
+                        .output();
+                }
+                if !commit_present(&sub_scratch, sub_sha) {
+                    return Err(transport(
+                        "FETCH-GIT-SUBMODULE-FAILED",
+                        format!(
+                            "submodule from {sub_url:?}: pinned commit {sub_sha} not found \
+                             even after full history fetch \
+                             [submodule_url={sub_url:?}]"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(sub_scratch)
+    };
+
+    // R1-04: capture the submodule SHAs returned by materialize_git_tree so
+    // the Receipt can carry them to transport_to_record → lockfile.
+    let raw_submodule_shas = materialize_git_tree(
+        &clone_scratch,
+        &commit,
+        dest,
+        Some(&submodule_fetch_fn),
+        Some(url),
+    )?;
+
+    // Path-sort the submodule SHAs (spec NORMATIVE: deterministic order).
+    let mut submodule_shas: Vec<(String, String)> = raw_submodule_shas.into_iter().collect();
+    submodule_shas.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Scratch is cleaned by ScratchGuard::drop.
     Ok(Receipt {
-        resolved_ref: git_head_sha(dest),
+        resolved_ref: Some(commit),
         archive_sha256: None,
+        submodule_shas,
     })
 }
 
-/// Transport flags injected into every git invocation that materializes or
-/// checks out content (spec/identity.md §1.7 NORMATIVE MUST): prevents the host
-/// git config from perturbing the materialized bytes or the resulting identity
-/// hash regardless of OS/user settings.
-pub(crate) const GIT_TRANSPORT_FLAGS: &[&str] = &[
-    "-c", "core.autocrlf=false",
-    "-c", "core.filemode=false",
-];
+/// Ensure `sha` is present in the local repo at `dest`, using a 4-step
+/// exhaustive fetch strategy that mirrors Python's `_ensure_commit_present`.
+///
+/// Steps:
+///   1. `git cat-file -e <sha>^{commit}` — cheap local check.
+///   2. Targeted `git fetch origin <sha>` — works when the server supports
+///      `uploadpack.allowReachableSHA1InWant` (GitHub / GitLab).
+///   3. Full history: `git fetch --unshallow origin` (if shallow), then
+///      `git fetch origin` to pull any remaining refs.
+///   4. Re-check; if still absent raise `FETCH-GIT-COMMIT-ABSENT`.
+///
+/// Precision fix (a) — narrow soft-fail on `--unshallow`:
+/// `git fetch --unshallow` on an already-complete (non-shallow) clone fails
+/// with a specific message ("--unshallow on a complete repository does not
+/// make sense").  That benign failure is swallowed so a full-depth clone
+/// running the fallback doesn't spuriously error.  ANY OTHER fetch failure
+/// (network error, auth failure, etc.) is propagated as `FETCH-GIT-FAILED`.
+fn ensure_commit_present(name: &str, url: &str, sha: &str, dest: &Path) -> Result<(), FetchError> {
+    // Step 1: cheap local presence check.
+    // R5: --end-of-options before the object spec for flag-injection safety.
+    if commit_present(dest, sha) {
+        return Ok(());
+    }
 
-fn run_git(name: &str, args: &[&str]) -> Result<(), FetchError> {
-    git_status(name, Command::new("git").args(GIT_TRANSPORT_FLAGS).args(args))
-}
+    // Step 2: targeted fetch (server-side reachable SHA support).
+    // R5: --end-of-options before the SHA refspec.
+    let targeted = std::process::Command::new("git")
+        .arg("-C").arg(dest)
+        .args(["fetch", "-q", "origin", "--end-of-options", sha])
+        .output();
+    if matches!(&targeted, Ok(o) if o.status.success()) {
+        // R1-14: re-verify presence after a successful step-2 fetch.
+        // `git fetch origin <sha>` can exit 0 while the server ignored the SHA
+        // (no allowReachableSHA1InWant), leaving the commit absent.  Only return
+        // Ok if the commit is actually present now; otherwise fall through to
+        // steps 3-4 which do a full unshallow+refetch.
+        if commit_present(dest, sha) {
+            return Ok(());
+        }
+    }
+    // Step 2 failure (or success-but-absent) is non-fatal (targeted SHA fetch
+    // is best-effort; many servers don't support it) — fall through to step 3.
 
-fn run_git_in(name: &str, dir: &Path, args: &[&str]) -> Result<(), FetchError> {
-    git_status(
-        name,
-        Command::new("git")
-            .args(GIT_TRANSPORT_FLAGS)
-            .arg("-C")
-            .arg(dir)
-            .args(args),
-    )
+    // Step 3a: `git fetch --unshallow origin` — expands a shallow clone to
+    // full depth.  On a non-shallow clone this fails with a specific "does not
+    // make sense" message; swallow ONLY that benign case (precision fix a).
+    let unshallow = std::process::Command::new("git")
+        .arg("-C").arg(dest)
+        .args(["fetch", "-q", "--unshallow", "origin"])
+        .output();
+    match &unshallow {
+        Ok(o) if !o.status.success() => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            // Benign case: the repo is already complete (full-depth clone).
+            // Git prints "fatal: --unshallow on a complete repository does not
+            // make sense" (or a locale variant).  Swallow this specific error.
+            let is_already_complete = stderr.contains("does not make sense")
+                || stderr.contains("complete repository");
+            if !is_already_complete {
+                // Real fetch failure (network, auth, …) — propagate it.
+                return Err(transport(
+                    "FETCH-GIT-FAILED",
+                    format!(
+                        "fetching {name:?} from {url:?}: git fetch --unshallow failed: {}",
+                        stderr.trim()
+                    ),
+                ));
+            }
+            // Already complete — fall through to step 3b.
+        }
+        Err(e) => {
+            // Could not even spawn git — propagate.
+            return Err(transport(
+                "FETCH-GIT-FAILED",
+                format!("fetching {name:?}: cannot run git fetch --unshallow: {e}"),
+            ));
+        }
+        Ok(_) => {} // --unshallow succeeded; fall through to step 3b.
+    }
+
+    // Step 3b: plain `git fetch origin` — pulls any new refs since the clone.
+    // Failure here is non-fatal (best-effort); step 4 does the definitive check.
+    let _ = std::process::Command::new("git")
+        .arg("-C").arg(dest)
+        .args(["fetch", "-q", "origin"])
+        .output();
+
+    // Step 4: re-check after full history fetch.
+    if commit_present(dest, sha) {
+        return Ok(());
+    }
+
+    Err(transport(
+        "FETCH-GIT-COMMIT-ABSENT",
+        format!(
+            "fetching {name:?}: commit {sha} not found in {url:?} even after \
+             full history fetch — the pin may be stale or the commit was \
+             force-pushed away"
+        ),
+    ))
 }
 
 fn git_status(name: &str, cmd: &mut Command) -> Result<(), FetchError> {
@@ -342,18 +1396,54 @@ fn commit_present(dir: &Path, sha: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn git_head_sha(dir: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()?;
-    if out.status.success() {
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        None
+/// Resolve a ref name to a commit SHA in the object store at `repo`.
+///
+/// Mirrors Python's `_git_resolve_ref`: tries FETCH_HEAD first (populated by
+/// the preceding `git fetch origin <ref>`), then falls back to
+/// `refs/remotes/origin/<ref>`, then a plain `rev-parse <ref>`.
+/// R5: `--end-of-options` before the ref so a ref starting with `-` is not
+/// parsed as a flag.
+fn git_resolve_ref(repo: &Path, ref_spec: &str, name: &str) -> Result<String, FetchError> {
+    // Try FETCH_HEAD first (written by the preceding git fetch).
+    let fetch_head = repo.join(".git").join("FETCH_HEAD");
+    if fetch_head.exists() {
+        if let Ok(text) = std::fs::read_to_string(&fetch_head) {
+            if let Some(line) = text.lines().next() {
+                let sha = line.split_whitespace().next().unwrap_or("");
+                if sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Ok(sha.to_string());
+                }
+            }
+        }
     }
+
+    // Fallback: refs/remotes/origin/<ref>.
+    let result = Command::new("git")
+        .arg("-C").arg(repo)
+        .args(["rev-parse", "--end-of-options",
+               &format!("refs/remotes/origin/{ref_spec}")])
+        .output();
+    if let Ok(out) = result {
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+        }
+    }
+
+    // Final fallback: try the ref name directly.
+    let result2 = Command::new("git")
+        .arg("-C").arg(repo)
+        .args(["rev-parse", "--end-of-options", ref_spec])
+        .output();
+    if let Ok(out) = result2 {
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+        }
+    }
+
+    Err(transport(
+        "FETCH-GIT-FAILED",
+        format!("fetching {name:?}: could not resolve ref {ref_spec:?} to a commit SHA"),
+    ))
 }
 
 /// A `Write` adapter that stops accepting bytes once `limit` is reached.
@@ -377,22 +1467,42 @@ impl<'a> LimitedWriter<'a> {
 
 impl std::io::Write for LimitedWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let remaining = self.limit.saturating_sub(self.written);
-        if remaining == 0 {
+        // R1-08: admit EXACTLY limit bytes; fire only when written WOULD EXCEED limit.
+        // `remaining` is how many more bytes we can accept before exceeding the cap.
+        // If `buf.len() <= remaining`: accept all bytes (even if remaining == 0 and
+        // buf is empty). If `buf.len() > remaining`: accept exactly `remaining` bytes
+        // if remaining > 0, then set limit_hit; if remaining == 0 we're already full.
+        //
+        // This matches Python: admit stream of exactly `decomp_cap` bytes, reject
+        // only `> decomp_cap`.  The old code fired at `>= limit` (off-by-one).
+        if self.written > self.limit {
+            // Already over — shouldn't happen if the logic below is correct, but
+            // guard defensively.
             self.hit = true;
-            // Return a write error to abort lzma_rs mid-stream.
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
                 "decompression cap exceeded",
             ));
         }
-        let n = (buf.len() as u64).min(remaining) as usize;
-        self.inner.extend_from_slice(&buf[..n]);
-        self.written += n as u64;
-        if n < buf.len() {
+        let remaining = self.limit - self.written; // bytes still acceptable
+        if buf.len() as u64 <= remaining {
+            // All of buf fits without exceeding the cap.
+            self.inner.extend_from_slice(buf);
+            self.written += buf.len() as u64;
+            Ok(buf.len())
+        } else {
+            // buf would push us over the cap. Accept what fits, then signal error.
+            let n = remaining as usize;
+            if n > 0 {
+                self.inner.extend_from_slice(&buf[..n]);
+                self.written += n as u64;
+            }
             self.hit = true;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "decompression cap exceeded",
+            ))
         }
-        Ok(n)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
@@ -413,7 +1523,7 @@ pub fn fetch_tarball(
     expected_sha256: Option<&str>,
     strip_components: u32,
     dest: &Path,
-    http_get: &dyn Fn(&str) -> Result<Vec<u8>, String>,
+    http_get: &dyn Fn(&str) -> Result<Vec<u8>, HttpGetError>,
 ) -> Result<Receipt, FetchError> {
     fetch_tarball_with_cap(name, url, expected_sha256, strip_components, dest, http_get, MAX_COMPRESSED_BYTES)
 }
@@ -426,23 +1536,62 @@ pub fn fetch_tarball_with_cap(
     expected_sha256: Option<&str>,
     strip_components: u32,
     dest: &Path,
-    http_get: &dyn Fn(&str) -> Result<Vec<u8>, String>,
+    http_get: &dyn Fn(&str) -> Result<Vec<u8>, HttpGetError>,
     compressed_cap: u64,
 ) -> Result<Receipt, FetchError> {
+    fetch_tarball_with_decomp_cap(
+        name,
+        url,
+        expected_sha256,
+        strip_components,
+        dest,
+        http_get,
+        compressed_cap,
+        Limits::default().decomp_cap(),
+    )
+}
+
+/// Like [`fetch_tarball_with_cap`] but also accepts an explicit `decomp_cap`
+/// (R4 / R3-02 — allows tests to trigger the lzma-alone decompressor-level
+/// size guard through the full public fetch path without needing a file that
+/// decompresses to the production cap of ~4 GiB).
+///
+/// The production path always calls this via `fetch_tarball_with_cap` with
+/// `Limits::default().decomp_cap()`; this variant is `pub(crate)` so tests
+/// can inject a tiny cap without touching the production default.
+pub(crate) fn fetch_tarball_with_decomp_cap(
+    name: &str,
+    url: &str,
+    expected_sha256: Option<&str>,
+    strip_components: u32,
+    dest: &Path,
+    http_get: &dyn Fn(&str) -> Result<Vec<u8>, HttpGetError>,
+    compressed_cap: u64,
+    decomp_cap: u64,
+) -> Result<Receipt, FetchError> {
     let bytes = http_get(url).map_err(|e| {
-        transport(
-            "FETCH-DOWNLOAD-FAILED",
-            format!("fetching {name:?} from {url}: {e}"),
-        )
+        // R1-22: match on the typed HttpGetError variant rather than a string prefix.
+        match e {
+            HttpGetError::SizeExceeded(msg) => transport(
+                "FETCH-DOWNLOAD-SIZE-EXCEEDED",
+                format!("fetching {name:?} from {url}: {msg}"),
+            ),
+            HttpGetError::Other(msg) => transport(
+                "FETCH-DOWNLOAD-FAILED",
+                format!("fetching {name:?} from {url}: {msg}"),
+            ),
+        }
     })?;
 
-    // R4: cap the compressed body before decompression.  The production http_get
-    // (curl) already enforces this via --max-filesize; the cap here catches
-    // injected transports (tests, mocked fetchers that return bytes directly)
-    // and serves as a safety net if the transport doesn't self-limit.
+    // H1: cap the compressed body before decompression.  The production http_get
+    // (curl streaming) aborts and raises FETCH-DOWNLOAD-SIZE-EXCEEDED before
+    // reading beyond the cap; this check covers injected transports (tests,
+    // mocked fetchers) that return bytes directly without streaming.
+    // FETCH-DOWNLOAD-SIZE-EXCEEDED is distinct from FETCH-DOWNLOAD-FAILED so a
+    // security size-cap rejection is not conflated with a network failure.
     if bytes.len() as u64 > compressed_cap {
         return Err(transport(
-            "FETCH-DOWNLOAD-FAILED",
+            "FETCH-DOWNLOAD-SIZE-EXCEEDED",
             format!(
                 "fetching {name:?} from {url}: compressed body ({} bytes) exceeds \
                  download cap ({compressed_cap} bytes); possible oversized mirror",
@@ -473,6 +1622,22 @@ pub fn fetch_tarball_with_cap(
         }
     }
 
+    // Unsupported-format guard: ZIP archives are not supported by TarballFetcher.
+    // A `.zip` URL today fails with an empty-extraction silent success (Rust's
+    // TarEntries sees < 512 bytes and returns zero entries → Ok-empty).  Detect
+    // the ZIP magic bytes early and raise FETCH-EXTRACT-FAILED with an actionable
+    // message rather than silently producing an empty dep tree (H0 §zip-guard).
+    if bytes.starts_with(MAGIC_ZIP) {
+        return Err(transport(
+            "FETCH-EXTRACT-FAILED",
+            format!(
+                "fetching {name:?}: unsupported archive format: .zip \
+                 (TarballFetcher accepts .tar.gz / .tar.bz2 / .tar.xz / .tar only; \
+                 use a tarball URL or a git= dep)"
+            ),
+        ));
+    }
+
     // Detect compression format by magic bytes, decompress with a size cap,
     // then feed the raw tar bytes to extract_tar.
     //
@@ -486,7 +1651,9 @@ pub fn fetch_tarball_with_cap(
     // (the module-level SSOT) which wraps the decoder in `.take(decomp_cap)`.
     // The cap formula (max_total_size + DECOMP_CAP_OVERHEAD) lives in exactly one
     // place; fetch_oci uses the same helper so there is no parallel copy.
-    let decomp_cap: u64 = Limits::default().max_total_size + DECOMP_CAP_OVERHEAD;
+    // R1-12 / R3-02: decomp_cap is a parameter (callers supply
+    // `Limits::default().decomp_cap()` for the production default; tests inject
+    // a small cap to exercise the lzma-alone decompressor guard end-to-end).
 
     let tar_bytes = if bytes.starts_with(MAGIC_GZIP) {
         decompress_capped(GzDecoder::new(&bytes[..]), decomp_cap, name, "gzip")?
@@ -504,7 +1671,21 @@ pub fn fetch_tarball_with_cap(
         // inline copy that R19 flagged.
         decompress_capped_xz(&bytes[..], decomp_cap, name)?
     } else {
-        bytes
+        // R2-02/NEW-D: lzma-alone (`.tar.lzma`, FORMAT_ALONE / LZMA1) has NO
+        // reliable magic bytes — the first 5 bytes are encoder-dependent
+        // "properties" + dictionary size.  Strategy (mirrors Python): attempt
+        // `lzma_decompress` (LZMA1/FORMAT_ALONE via lzma-rs) under the same
+        // `decomp_cap` bound.  If it decompresses → treat as lzma-alone (apply
+        // cap, raise EXTRACT-SIZE-LIMIT on breach).  If it errors → the stream
+        // is not lzma-alone → fall through to plain-tar (unchanged behavior).
+        match decompress_capped_lzma(&bytes[..], decomp_cap, name) {
+            Ok(decompressed) => decompressed,
+            Err(e) if e.code() == "EXTRACT-SIZE-LIMIT" => return Err(e),
+            Err(_) => {
+                // Not lzma-alone — treat as uncompressed tar (fall through).
+                bytes
+            }
+        }
     };
 
     clear_dest(dest).map_err(|e| transport("FETCH-EXTRACT-FAILED", e))?;
@@ -517,8 +1698,8 @@ pub fn fetch_tarball_with_cap(
         )
     })?;
     Ok(Receipt {
-        resolved_ref: None,
         archive_sha256: Some(actual_sha),
+        ..Default::default()
     })
 }
 
@@ -601,7 +1782,8 @@ pub fn fetch_oci(
             // SA-1: use the shared decompress_capped helper — same cap formula
             // (DECOMP_CAP_OVERHEAD) and same EXTRACT-SIZE-LIMIT slug as fetch_tarball.
             // This is the fix for R2: no parallel inline copy of the cap logic.
-            let oci_decomp_cap: u64 = Limits::default().max_total_size + DECOMP_CAP_OVERHEAD;
+            // R1-12: single source of truth for the decompression cap formula.
+            let oci_decomp_cap: u64 = Limits::default().decomp_cap();
             let tar = decompress_capped(GzDecoder::new(&bytes[..]), oci_decomp_cap, name, "gunzip")
                 .map_err(|e| {
                     let _ = std::fs::remove_dir_all(&scratch);
@@ -609,10 +1791,7 @@ pub fn fetch_oci(
                 })?;
             clear_dest(dest).map_err(|e| transport("FETCH-EXTRACT-FAILED", e))?;
             extract_tar(&tar, dest, 0, Limits::default())
-                .map(|_| Receipt {
-                    resolved_ref: None,
-                    archive_sha256: None,
-                })
+                .map(|_| Receipt::default())
                 .map_err(|e| transport("FETCH-EXTRACT-FAILED", e.code().to_string()))
         }
         many => Err(transport(
@@ -687,6 +1866,25 @@ impl<R: FetcherRegistry> FetcherRegistry for CasAdmittingFetcher<R> {
                     return Err(e);
                 }
             };
+
+            // R1-07: spec §2.4.2 NORMATIVE — walk the staged tree, sum regular-file
+            // sizes, and raise FETCH-DOWNLOAD-SIZE-EXCEEDED if total > cap.
+            // Cap source: Limits::default().max_total_size (uncompressed ceiling).
+            // Mirrors Python's CasAdmittingFetcher staged-tree size check.
+            {
+                let cap = Limits::default().max_total_size;
+                let total = walk_tree_size(&scratch.path);
+                if total > cap {
+                    let _ = std::fs::remove_dir_all(&scratch.path);
+                    return Err(transport(
+                        "FETCH-DOWNLOAD-SIZE-EXCEEDED",
+                        format!(
+                            "fetching {name:?}: staged tree size ({total} bytes) exceeds \
+                             uncompressed cap ({cap} bytes); possible oversized dep"
+                        ),
+                    ));
+                }
+            }
 
             // Compute the identity and admit to the CAS.
             use crate::identity::compute_content_hash;
@@ -787,7 +1985,7 @@ impl FetcherRegistry for MockedFetcher {
                     key_dir,
                     Receipt {
                         resolved_ref: Some(sha),
-                        archive_sha256: None,
+                        ..Default::default()
                     },
                 )
             }
@@ -878,8 +2076,8 @@ impl FetcherRegistry for MockedFetcher {
                 (
                     key_dir,
                     Receipt {
-                        resolved_ref: None,
                         archive_sha256: Some(archive_sha),
+                        ..Default::default()
                     },
                 )
             }
@@ -1132,6 +2330,28 @@ pub fn mocked_default_branch(mocked_fetches_dir: &Path, url: &str) -> Result<Str
              pass --ref explicitly to disambiguate"
         ))),
     }
+}
+
+/// R1-07: walk a directory tree and sum the sizes of all regular files
+/// (not following symlinks). Used by `CasAdmittingFetcher` to enforce the
+/// spec §2.4.2 NORMATIVE staged-tree size cap before CAS admission.
+pub(crate) fn walk_tree_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0; };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if meta.file_type().is_symlink() {
+            // Symlinks: count their size as 0 — they point elsewhere.
+            continue;
+        }
+        if meta.is_dir() {
+            total += walk_tree_size(&path);
+        } else if meta.is_file() {
+            total += meta.len();
+        }
+    }
+    total
 }
 
 /// Lowercase hex sha256 of `bytes` (no `sha256:` prefix).

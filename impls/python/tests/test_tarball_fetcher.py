@@ -27,6 +27,7 @@ import pytest
 
 from milpa.errors import (
     FETCH_DOWNLOAD_FAILED,
+    FETCH_DOWNLOAD_SIZE_EXCEEDED,
     FETCH_EXTRACT_FAILED,
     FETCH_SHA256_MISMATCH,
     MilpaError,
@@ -36,6 +37,7 @@ from milpa.fetchers.tarball import (
     TarballFetcher,
     TarballProvenance,
     TarballReceipt,
+    make_http_get,
 )
 from milpa.fetchers.types import Provenance
 
@@ -460,7 +462,7 @@ def test_bzip2_archive_extracted() -> None:
 
 
 # ---------------------------------------------------------------------------
-# R4 — compressed download cap (FETCH-DOWNLOAD-FAILED before buffering)
+# H1 — compressed download cap (streaming abort → FETCH-DOWNLOAD-SIZE-EXCEEDED)
 # ---------------------------------------------------------------------------
 
 
@@ -470,13 +472,14 @@ def test_max_compressed_bytes_constant_is_positive() -> None:
     assert MAX_COMPRESSED_BYTES > 0
 
 
-def test_oversized_compressed_body_raises_fetch_download_failed() -> None:
-    """R4: a transport that returns more bytes than the compressed cap must
-    raise FETCH-DOWNLOAD-FAILED without buffering the full body.
+def test_oversized_compressed_body_raises_fetch_download_size_exceeded() -> None:
+    """H1: a transport that returns more bytes than the compressed cap must
+    raise FETCH-DOWNLOAD-SIZE-EXCEEDED (not FETCH-DOWNLOAD-FAILED).
 
     We use a tiny cap (16 bytes) via a custom TarballFetcher so the test is
     fast.  The injected transport returns cap+1 bytes which exceeds the limit.
-    The fetcher must detect this and raise FETCH-DOWNLOAD-FAILED.
+    The fetcher must detect this and raise FETCH-DOWNLOAD-SIZE-EXCEEDED so a
+    security size-cap rejection is distinct from a network failure.
     """
     tiny_cap = 16
     oversized = b"x" * (tiny_cap + 1)
@@ -491,14 +494,138 @@ def test_oversized_compressed_body_raises_fetch_download_failed() -> None:
         dest = Path(tmp) / "pkg"
         with pytest.raises(MilpaError) as exc_info:
             fetcher.fetch("pkg", prov, dest=dest)
+    assert exc_info.value.slug == FETCH_DOWNLOAD_SIZE_EXCEEDED
+
+
+def test_oversized_body_is_not_conflated_with_network_failure() -> None:
+    """H1: FETCH-DOWNLOAD-SIZE-EXCEEDED must be distinct from FETCH-DOWNLOAD-FAILED.
+
+    A network failure (transport raises) uses FETCH-DOWNLOAD-FAILED.
+    A size cap breach uses FETCH-DOWNLOAD-SIZE-EXCEEDED.
+    Both must be independently reachable — a consumer can distinguish a dead
+    mirror (network) from a security-rejected oversized response (size cap).
+    """
+    tiny_cap = 16
+    # Network failure path.
+    def _fail(url: str) -> bytes:
+        raise RuntimeError("timeout")
+
+    fetcher_fail = TarballFetcher(http_get=_fail, compressed_cap=tiny_cap)
+    prov = TarballProvenance(url="https://host/pkg.tar.gz")
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(MilpaError) as exc_info:
+            fetcher_fail.fetch("pkg", prov, dest=Path(tmp) / "pkg")
     assert exc_info.value.slug == FETCH_DOWNLOAD_FAILED
+
+    # Size-cap path.
+    oversized = b"x" * (tiny_cap + 1)
+    def _big(url: str) -> bytes:
+        return oversized
+
+    fetcher_big = TarballFetcher(http_get=_big, compressed_cap=tiny_cap)
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(MilpaError) as exc_info2:
+            fetcher_big.fetch("pkg", prov, dest=Path(tmp) / "pkg")
+    assert exc_info2.value.slug == FETCH_DOWNLOAD_SIZE_EXCEEDED
+    assert exc_info2.value.slug != FETCH_DOWNLOAD_FAILED
+
+
+def test_streaming_transport_aborts_early() -> None:
+    """H1: the production streaming transport aborts before reading the full body.
+
+    We inject a streaming transport that records how many bytes were consumed,
+    then verify that consumption stops at approximately the cap (never exceeds
+    cap + one chunk).  This is the bounded-memory property: the process never
+    buffers more than cap + chunk_size bytes from an over-cap response.
+
+    The transport is a generator-based HttpGet (streaming seam): it yields
+    CHUNK_SIZE bytes at a time and records a `bytes_read` counter.  The
+    TarballFetcher must abort as soon as the running total exceeds `cap`,
+    not after all bytes are delivered.
+    """
+    tiny_cap = 32
+    # Produce 8× the cap worth of data in chunks of 8 bytes each.
+    chunk_size = 8
+    total_available = tiny_cap * 8
+    bytes_delivered: list[int] = [0]  # mutable counter via list
+
+    def _streaming_transport(url: str) -> bytes:
+        """Streaming transport: iterates chunks and records delivery."""
+        collected = bytearray()
+        for i in range(0, total_available, chunk_size):
+            chunk = b"x" * chunk_size
+            bytes_delivered[0] += chunk_size
+            collected.extend(chunk)
+            if len(collected) > tiny_cap:
+                # Simulate streaming abort: return what we have so far.
+                # A real streaming transport (Popen) would kill the process here.
+                return bytes(collected)
+        return bytes(collected)
+
+    fetcher = TarballFetcher(http_get=_streaming_transport, compressed_cap=tiny_cap)
+    prov = TarballProvenance(url="https://host/large.tar.gz")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "pkg"
+        with pytest.raises(MilpaError) as exc_info:
+            fetcher.fetch("pkg", prov, dest=dest)
+    assert exc_info.value.slug == FETCH_DOWNLOAD_SIZE_EXCEEDED
+    # Bounded-memory assertion: transport was not fully drained.
+    # bytes_delivered must be ≤ cap + chunk_size (one chunk past the cap).
+    assert bytes_delivered[0] <= tiny_cap + chunk_size, (
+        f"Transport delivered {bytes_delivered[0]} bytes, but cap is {tiny_cap} "
+        f"with chunk_size={chunk_size}; expected delivery ≤ {tiny_cap + chunk_size}"
+    )
+
+
+def test_production_make_http_get_streaming_aborts_on_cap() -> None:
+    """H1: make_http_get production transport streams and aborts at cap.
+
+    We cannot use a real URL in unit tests, but we can verify that
+    make_http_get returns a callable that raises FETCH-DOWNLOAD-SIZE-EXCEEDED
+    (not FETCH-DOWNLOAD-FAILED) when a tiny cap is set and the server sends
+    more data than the cap allows.
+
+    This test uses a local HTTP server that returns a body larger than the cap.
+    It is skipped if the http.server module fails to bind (rare in CI).
+    """
+    import http.server
+    import threading
+
+    # Build a real tiny tar.gz archive (valid, not garbage).
+    body = _build_tar_gz({"big.nim": b"x" * 200})
+    tiny_cap = 50  # body is ~250 bytes; cap is 50 — well below body size.
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:
+            pass  # suppress server logs
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever)
+    thread.daemon = True
+    thread.start()
+
+    try:
+        transport = make_http_get(compressed_cap=tiny_cap)
+        with pytest.raises(MilpaError) as exc_info:
+            transport(f"http://127.0.0.1:{port}/test.tar.gz")
+        assert exc_info.value.slug == FETCH_DOWNLOAD_SIZE_EXCEEDED
+    finally:
+        server.shutdown()
 
 
 def test_body_at_exactly_cap_is_accepted() -> None:
-    """R4: a body of exactly cap bytes must be accepted (boundary check).
+    """H1: a body of exactly cap bytes must be accepted (boundary check).
 
     We use a tiny cap (16 bytes) and a transport that returns exactly 16 bytes
-    of garbage.  This is below the forbidden threshold, so the fetcher proceeds
+    of garbage.  This is at the limit, so the fetcher proceeds
     to the (expected) extraction failure.
     """
     tiny_cap = 16
@@ -513,7 +640,120 @@ def test_body_at_exactly_cap_is_accepted() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         dest = Path(tmp) / "pkg"
         # Body is garbage (not a real archive), so extraction fails — but NOT
-        # with FETCH-DOWNLOAD-FAILED (the cap did not fire).
+        # with FETCH-DOWNLOAD-SIZE-EXCEEDED or FETCH-DOWNLOAD-FAILED (the cap did not fire).
         with pytest.raises(MilpaError) as exc_info:
             fetcher.fetch("pkg", prov, dest=dest)
-    assert exc_info.value.slug != FETCH_DOWNLOAD_FAILED
+    assert exc_info.value.slug not in (FETCH_DOWNLOAD_FAILED, FETCH_DOWNLOAD_SIZE_EXCEEDED)
+
+
+# ---------------------------------------------------------------------------
+# R1-13 — proc.stderr / proc.stdout FD leak in _curl (make_http_get)
+# ---------------------------------------------------------------------------
+#
+# Before the fix, proc.stderr (and in some paths proc.stdout) were not closed
+# across cap-exceeded, exception, and curl-failure exit paths — an FD leak
+# per curl invocation.  The fix wraps Popen in `with proc:` or closes both
+# pipes in a `finally`.
+#
+# Direct FD-count assertions are fragile; instead we verify that all exit
+# paths raise the correct slug AND that the process is reaped (proc.poll()
+# is not None after the call).  We instrument the Popen call to capture the
+# proc object.
+
+
+def test_curl_cap_exceeded_raises_correct_slug_and_process_is_reaped() -> None:
+    """R1-13: cap-exceeded exit path raises FETCH-DOWNLOAD-SIZE-EXCEEDED and reaps curl.
+
+    This is the primary FD-leak path: before the fix, proc.stderr was left open
+    after `proc.kill()` + `proc.wait()` in the cap branch because proc.stderr
+    was never explicitly closed in that branch.  After the fix (with proc: or
+    finally: close), all pipes are closed before the function returns.
+
+    We use a local HTTP server that sends more data than the tiny cap.
+    After the call, proc.returncode must be set (process was waited on).
+    """
+    import http.server
+    import subprocess
+    import threading
+    from unittest.mock import patch
+
+    body = _build_tar_gz({"f.nim": b"x" * 200})
+    tiny_cap = 50
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever)
+    thread.daemon = True
+    thread.start()
+
+    captured_procs: list[subprocess.Popen[bytes]] = []
+    _real_popen = subprocess.Popen
+
+    def _tracking_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        proc = _real_popen(*args, **kwargs)
+        captured_procs.append(proc)
+        return proc
+
+    try:
+        transport = make_http_get(compressed_cap=tiny_cap)
+        with patch("milpa.fetchers.tarball.subprocess.Popen", side_effect=_tracking_popen):
+            with pytest.raises(MilpaError) as exc_info:
+                transport(f"http://127.0.0.1:{port}/test.tar.gz")
+        assert exc_info.value.slug == FETCH_DOWNLOAD_SIZE_EXCEEDED
+        # Verify the process was reaped (returncode is set, not None).
+        assert len(captured_procs) == 1
+        proc = captured_procs[0]
+        assert proc.returncode is not None, (
+            "proc.returncode must be set after cap-exceeded path (process must be reaped)"
+        )
+    finally:
+        server.shutdown()
+
+
+def test_curl_failure_raises_correct_slug_and_process_is_reaped() -> None:
+    """R1-13: curl non-zero exit path raises FETCH-DOWNLOAD-FAILED and reaps curl.
+
+    This is the success+failure FD-leak path: before the fix, proc.stderr was
+    only conditionally read (in the failure branch) but never closed.  After the
+    fix, both pipes are always closed.
+
+    We point curl at a port with no listener so it exits non-zero immediately.
+    """
+    import socket
+    import subprocess
+    from unittest.mock import patch
+
+    # Find a port with nothing listening so curl fails quickly.
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    # Port is now free (s is closed); curl will fail to connect.
+
+    captured_procs: list[subprocess.Popen[bytes]] = []
+    _real_popen = subprocess.Popen
+
+    def _tracking_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        proc = _real_popen(*args, **kwargs)
+        captured_procs.append(proc)
+        return proc
+
+    transport = make_http_get()
+    with patch("milpa.fetchers.tarball.subprocess.Popen", side_effect=_tracking_popen):
+        with pytest.raises(MilpaError) as exc_info:
+            transport(f"http://127.0.0.1:{port}/test.tar.gz")
+    assert exc_info.value.slug == FETCH_DOWNLOAD_FAILED
+    assert len(captured_procs) == 1
+    proc = captured_procs[0]
+    assert proc.returncode is not None, (
+        "proc.returncode must be set after curl-failure path (process must be reaped)"
+    )

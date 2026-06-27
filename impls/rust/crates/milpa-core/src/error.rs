@@ -121,6 +121,9 @@ impl CoreError {
             "LOCK-DEP-FIELD-ARITY",
             "LOCK-DEP-IDENTITY-INVALID",
             "LOCK-PROV-FIELD-ARITY",
+            // submodule node structural errors (wrong arg count / non-string path /
+            // missing-or-invalid sha=); distinct from scalar-field arity.
+            "LOCK-SUBMODULE-FIELD-INVALID",
             "LOCK-PROV-KIND-MISSING",
             "LOCK-PROV-KIND-UNKNOWN",
             "LOCK-PROV-FIELD-MISSING",

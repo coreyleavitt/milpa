@@ -65,12 +65,13 @@ not real transport.
    guard as gzip; (c) note formats normatively in `spec/manifest-grammar.md`
    §TarballDep; (d) conformance fixtures: same tree as `.tar.gz`/`.tar.bz2`/
    `.tar.xz` ⇒ identical identity, both impls.
-3. **[bug, shared — file issue] Hardlink extraction.** Both impls map hardlinks
-   to symlinks with a parent-relative escape base and don't apply
-   `strip_components` to the link target (`safe_extract.py:194`,
+3. **[RESOLVED → H2 of rfc-fetch-extraction-hardening.md] Hardlink extraction.**
+   Both impls map hardlinks to symlinks with a parent-relative escape base and don't
+   apply `strip_components` to the link target (`safe_extract.py:194`,
    `safe_extract.rs:108`). Identical in both ⇒ no byte-divergence, but a latent
-   correctness bug for archives with hardlinks + strip. Either handle hardlinks
-   properly or reject with `EXTRACT-HARDLINK-UNSUPPORTED`.
+   correctness bug for archives with hardlinks + strip. **Resolved by copy-bytes
+   materialization + two-pass extraction + POSIX-`/` linkname stripping (H2); reuses
+   `EXTRACT-ZIP-SLIP` for escape; no new slug. See `spec/plugin-contract.md` §2.2.**
 4. **[divergence — file issue] git commit reachability.** Python
    `_ensure_commit_present` has a 4-step fetch/unshallow fallback; Rust
    `commit_present` does a single `cat-file -e`. Diverges on shallow-clone pins
@@ -97,7 +98,12 @@ not real transport.
      CAS entry); `CAS-STORE-IO-ERROR` slug renamed in prose to "I/O error"
    - `spec/plugin-contract.md` §1.2 Materialize: two-form obligation (admissible
      = real dir; editable = symlink)
-   - `spec/errors.md`: added `EXTRACT-HARDLINK-UNSUPPORTED`
+   - `spec/errors.md`: ~~added `EXTRACT-HARDLINK-UNSUPPORTED`~~ **SUPERSEDED** — this
+     slug was drafted here but never added to `spec/errors.md` (confirmed absent). H2 of
+     `rfc-fetch-extraction-hardening.md` resolves hardlinks via copy-bytes materialization
+     (§2.2 of `spec/plugin-contract.md`), which requires no new slug: hardlink escape reuses
+     `EXTRACT-ZIP-SLIP` (same as regular path-traversal). No new slug; bijection lint stays
+     clean.
 
 8. **[spec gap] `spec/manifest-grammar.md` §4.3 `cas_admissible` table.**
    The `local` row still says "The fetcher MUST copy the source tree into

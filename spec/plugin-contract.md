@@ -169,6 +169,287 @@ See `spec/errors.md` §FETCH for the full list.
 
 ---
 
+## 2.2  Hardlink target geometry
+
+> NORMATIVE: A tar **hardlink** entry (typeflag `1`) encodes the link target in
+> `linkname`, which is an **archive-absolute path** — not a relative symlink
+> target. A conformant extractor MUST apply `strip_components` to `linkname`
+> using the same POSIX-`/` split as to the entry name, then resolve the stripped
+> target against `dest_root` (not relative to the entry's parent directory).
+> The resolved target MUST be checked for escape: if it does not start with
+> `dest_root` the extractor MUST raise `EXTRACT-ZIP-SLIP` (the same slug as a
+> regular path-traversal escape — no new slug).
+
+> NORMATIVE: A conformant extractor MUST materialize a hardlink entry as a
+> **file copy** of the target's bytes, not as a filesystem hard link or a
+> symlink. A content-addressed store represents identical content as a copy;
+> this preserves hash-stability — two archives encoding the same logical tree
+> with a hardlink vs a plain duplicate file produce the same `content_hash`.
+
+> NORMATIVE: Extraction MUST be performed in two passes:
+>
+> 1. **First pass** — process every entry that is NOT a hardlink (regular files,
+>    directories, symlinks), in archive order.
+> 2. **Second pass** — process every hardlink entry, in archive order.
+>
+> The two-pass ordering is required because a hardlink entry MAY
+> forward-reference a target not yet written (tar ordering is arbitrary). The
+> copy-bytes strategy requires the source file to exist when the hardlink is
+> materialized; two-pass extraction guarantees this without imposing any
+> ordering constraint on archive creators.
+
+> NORMATIVE: `linkname` is split on POSIX `/` explicitly — not via the host
+> operating system's path separator. This is a no-op on spec-v1 Linux but
+> ensures geometry remains correct if future spec versions extend platform
+> support to Windows.
+
+> NOTE: `EXTRACT-HARDLINK-UNSUPPORTED` was mentioned in an earlier draft of
+> `rfc-pluggable-fetchers.md` but was never added to `spec/errors.md` (the slug
+> is absent). H2 of `rfc-fetch-extraction-hardening.md` supersedes the
+> reject-with-new-slug approach with copy-bytes materialization; no new slug is
+> needed and none may be added for this case.
+
+---
+
+## 2.3  The `materialize-git-tree` primitive
+
+VCS fetchers (git, and future Hg/Fossil fetchers) MUST produce their
+materialized tree via the impl's `materialize-git-tree` equivalent. This
+function is the single chokepoint for blob writing, LFS detection, symlink
+containment, and submodule recursion; these properties are structural (there
+is exactly one place blobs are written), not achieved by per-caller discipline.
+
+The normative contract for `materialize-git-tree`:
+
+### 2.3.1  Subprocess discipline
+
+> NORMATIVE: Blob enumeration MUST use `git ls-tree -r <commit>`, which
+> emits one `(mode, type, sha, path)` record per blob and gitlink. Blob
+> bytes MUST be streamed from the object store via a **single**
+> `git cat-file --batch` subprocess invocation (all SHAs on stdin, headers
+> and raw bytes on stdout). A per-blob `cat-file` subprocess call is NOT
+> conformant: a dep with 10 000 files would spawn 10 000 processes and may
+> exhaust OS `ulimit` ceilings in constrained CI environments.
+
+> NORMATIVE: The backing clone MUST be `--no-checkout` (or bare). A
+> default `git clone` creates a working tree and runs smudge filters at
+> checkout time, defeating the object-store mechanism. See
+> `spec/identity.md §1.7.1`.
+
+### 2.3.2  LFS pointer detection
+
+> NORMATIVE: Before writing any blob to the output tree, the implementation
+> MUST test whether the blob is a Git-LFS pointer. A blob is a Git-LFS
+> pointer if and only if its **first line** is exactly:
+>
+> ```
+> version https://git-lfs.github.com/spec/v1
+> ```
+>
+> The test MUST be applied to the first line only (the bytes up to and
+> including the first `\n`, or the entire blob if shorter than one line).
+> A large blob that contains that string elsewhere is NOT a pointer —
+> first-line exact-match eliminates documentation false-positives.
+>
+> On detection, the implementation MUST raise `FETCH-GIT-LFS-POINTER`
+> carrying `path=<relpath>` identifying the pointer file. milpa reads the
+> git object store directly and cannot fetch LFS blobs; the tree would be
+> incomplete (violating the *Complete* admission predicate). The error
+> message MUST be actionable: it MUST indicate that the dep uses Git LFS
+> and that the user should vendor a plain-git mirror or use a `local=`
+> path.
+>
+> (`FETCH-GIT-LFS-POINTER` has its `spec/errors.md` catalog entry and a raise
+> site in every conforming impl.)
+
+### 2.3.3  Per-symlink lexical-containment check
+
+> NORMATIVE: A mode-120000 blob in `ls-tree` output is a symlink; its blob
+> bytes are the link-target string. The object-store path does NOT route
+> through `SafeExtractor`, so `materialize-git-tree` MUST itself apply the
+> same lexical-containment check that `SafeExtractor` uses for archive
+> symlinks:
+>
+> 1. Decode the blob bytes as UTF-8 to obtain the link-target string `T`.
+>    (A non-UTF-8 target MUST be treated as `ID-NON-UTF8-SYMLINK-TARGET`
+>    per `spec/identity.md §1.5`.)
+> 2. Compute the normalized absolute path `P = normalize(dest_root /
+>    entry_dir / T)` where `normalize` resolves all `.` and `..` components
+>    lexically without following filesystem symlinks.
+> 3. If `P` does not start with `dest_root` the symlink escapes the dep
+>    root and the implementation MUST raise `EXTRACT-SYMLINK-ESCAPE`
+>    (the existing slug — no new slug). This is the same escape class
+>    `SafeExtractor` guards against on the tarball path.
+>
+> This check MUST be applied to every mode-120000 entry before the symlink
+> is written to disk.
+
+### 2.3.4  On-disk mode
+
+> NORMATIVE: Materialized blobs MUST be written with the fixed on-disk
+> modes specified in `spec/identity.md §1.7.4`. This ensures that
+> `milpa verify` re-hashing on a different host produces byte-identical
+> results regardless of the host `umask`.
+
+### 2.3.5  Submodule recursion
+
+> NORMATIVE: A mode-160000 entry in `ls-tree` output is a gitlink (submodule
+> reference). `materialize-git-tree` MUST recurse into every gitlink by
+> applying the same primitive to the submodule's object store with the
+> gitlink's pinned commit SHA. Recursion is always-on per
+> `spec/identity.md §1.7.5`.
+>
+> The detailed mechanics — reading `.gitmodules` from the superproject
+> object store, resolving relative `url =` values against the superproject's
+> recorded provenance URL (`GitProvenance.url`), fetching submodule objects,
+> and recording `path → SHA` pairs in `GitReceipt.submodule_shas` — are
+> specified in `spec/lockfile-schema.md §4.1`.
+>
+> NORMATIVE (recursion bound): submodule recursion MUST be bounded. A
+> conforming impl MUST reject recursion deeper than `MAX_SUBMODULE_DEPTH`
+> (16) and MUST reject a `(resolved-url, commit-sha)` pair that recurs on
+> the current recursion path (a cycle), in both cases raising
+> `FETCH-GIT-SUBMODULE-FAILED` with `submodule_path=`/`submodule_url=`
+> context. The depth bound is the load-bearing guard: an alternating
+> superproject↔submodule chain presents a distinct commit SHA at each level,
+> so the cycle set alone does not terminate it. The constant is normative so
+> that a pathologically nested input is admitted-or-rejected identically on
+> every implementation.
+
+### 2.3.6  Output-tree cleanliness
+
+> NORMATIVE: The output tree written to `dest/` MUST NOT contain a `.git`
+> directory. The function writes only the blobs and symlinks enumerated by
+> `ls-tree -r` into a clean output directory. Empty directories MUST NOT be
+> synthesized (see `spec/identity.md §1.7.3`).
+
+### 2.3.7  Entry-path containment
+
+> NORMATIVE: `ls-tree` reports the path of each tree entry verbatim from the
+> tree object. A hostile repository can encode an entry path that escapes the
+> dep root — an absolute path or one containing `..` components — because git's
+> own fsck does not run on objects produced by `git hash-object -t tree
+> --literally` / `git mktree` and `clone` transfers them faithfully. The
+> §2.3.3 containment check guards only the *target* of a mode-120000 symlink;
+> it does NOT guard the *placement* of a regular blob (modes 100644/100755)
+> or a mode-160000 gitlink sub-destination.
+>
+> Therefore, before writing any blob or creating any gitlink sub-destination,
+> `materialize-git-tree` MUST compute the normalized absolute path
+> `P = normalize(dest_root / entry_path)` (resolving `.`/`..` lexically,
+> without following filesystem symlinks) and MUST require that `P` equals
+> `dest_root` or lies strictly beneath it. An absolute `entry_path` or any
+> escape MUST raise `EXTRACT-ZIP-SLIP` (the existing slug — no new slug; this
+> is the same traversal class `SafeExtractor` guards on the archive path).
+>
+> NORMATIVE (path bytes): `ls-tree` MUST be invoked with `-z` (NUL-delimited)
+> so that exotic entry names are not C-quoted; the containment check and the
+> on-disk write operate on the true path bytes, never a C-quoted rendering. A
+> tree-entry path that is not valid UTF-8 MUST be rejected with
+> `ID-NON-UTF8-RELPATH` (the same slug `compute_content_hash` raises for a
+> non-UTF-8 relpath — see `spec/identity.md §1.3`); implementations MUST NOT
+> silently transcode it (e.g. latin-1 or `U+FFFD`-lossy decoding), because two
+> implementations choosing different transcodings would write different
+> on-disk names and diverge on `content_hash`. Non-UTF-8 source filenames are
+> never legitimate in a conforming package; rejecting uniformly is the only
+> cross-impl-deterministic behavior.
+
+---
+
+## 2.4  Structural enforcement of the admission invariants
+
+The four admission predicates (Complete, Deterministic, Normalized, Bounded)
+described in the RFC are enforced structurally — by the architecture of the
+admission path — not by per-fetcher prose MUSTs. This subsection documents
+the locus of each.
+
+### 2.4.1  Normalized, Complete, and Deterministic (VCS path)
+
+For VCS fetchers, all three predicates are structural properties of
+`materialize-git-tree` (§2.3):
+
+- **Normalized** — no checkout runs, so smudge filters (`eol=`, `filter=`,
+  `ident`, `working-tree-encoding=`) cannot apply. The output is identically
+  the object-store bytes on every conforming implementation.
+- **Complete** — submodule recursion is always-on (§2.3.5); the output tree
+  contains every blob reachable from the pinned commit.
+- **Deterministic** — object-store blobs are SHA-addressed: the same pinned
+  commit SHA always yields the same bytes, on every host and git version.
+
+These three predicates are consequences of there being exactly one place
+blobs are written (the `materialize-git-tree` function), not of per-fetcher
+discipline. A VCS fetcher that bypasses this function and performs a
+working-tree checkout instead violates all three predicates simultaneously.
+
+> NORMATIVE: VCS fetchers MUST produce their materialized output tree
+> exclusively via the impl's `materialize-git-tree` equivalent. No working-tree
+> checkout path MAY be used to produce bytes that enter the CAS.
+
+### 2.4.2  Bounded (admission chokepoint)
+
+> NORMATIVE: The registry / `CasAdmittingFetcher` MUST stat the staged tree
+> before hashing and MUST raise `FETCH-DOWNLOAD-SIZE-EXCEEDED` if the total
+> uncompressed size exceeds the configured cap. This check is applied at the
+> one point every fetcher passes through, so no fetcher can bypass it.
+
+> NORMATIVE: HTTP-backed fetchers (tarball, OCI artifact download) MUST
+> additionally enforce a compressed-byte cap at the streaming boundary, before
+> the response body is fully buffered. This bounds peak memory consumption — the
+> post-admission stat bounds disk usage, but a 4 GiB buffered response already
+> exhausts memory before the stat runs.
+
+> NORMATIVE: `OciFetcher` downloads artifacts via `oras pull`, which does not
+> route through milpa's HTTP layer. The streaming compressed-byte cap does not
+> apply to `OciFetcher`. Its bounded guarantee comes from (a) OCI
+> digest-pinning at the registry (the registry verifies the digest before
+> serving content), and (b) the admission-chokepoint stat and the
+> `extract_tar` `EXTRACT-SIZE-LIMIT` applied to the pulled artifact.
+
+### 2.4.3  Archive-extracting fetchers
+
+> NORMATIVE: Every archive-extracting fetcher (tarball and any future
+> zip/jar/whl fetcher) MUST route ALL archive content through the impl's
+> `extract_tar` / `SafeExtractor` equivalent with **default-or-stricter**
+> limits. By routing through this path the fetcher inherits, without
+> re-implementation:
+>
+> - zip-slip / path-traversal guard → `EXTRACT-ZIP-SLIP`
+> - symlink-escape guard → `EXTRACT-SYMLINK-ESCAPE`
+> - total-size, per-file-size, and file-count limits → `EXTRACT-SIZE-LIMIT`
+> - hardlink copy-bytes geometry (§2.2)
+> - decompression-bomb guard (bz2/xz/gzip stream cap)
+>
+> A fetcher that extracts archives through any other path does NOT inherit
+> these guards and is NOT conformant.
+
+### 2.4.4  Decompression stream cap
+
+> NORMATIVE: The decompression-bomb guard caps the *decompressed* byte stream
+> before the per-entry size checks run, so that a small archive declaring tiny
+> member sizes but carrying a large compressed payload cannot be expanded into
+> memory. The cap is `decomp_cap = max_total_size + 512` (the 512-byte slack
+> admits a legitimately maximal tree plus one tar trailer block). The boundary
+> is normative for cross-impl convergence: a stream that decompresses to
+> **exactly** `decomp_cap` bytes MUST be admitted; a stream exceeding
+> `decomp_cap` MUST raise `EXTRACT-SIZE-LIMIT`. (Equivalently: read
+> `decomp_cap + 1` bytes and reject iff more than `decomp_cap` were produced.)
+>
+> NORMATIVE: the guard MUST recognize and cap every compression format the
+> extractor will subsequently decompress. gzip (`1f 8b`), bzip2 (`42 5a 68`),
+> and xz (`fd 37 7a 58 5a 00`) are dispatched by their reliable leading magic.
+> **lzma-alone / `FORMAT_ALONE`** (`.tar.lzma`) has NO reliable magic — its
+> leading byte is a variable LZMA1 *properties* byte, not a fixed signature, so
+> a fixed two-byte test (e.g. `5d 00`) matches only the default encoder and
+> lets other valid property bytes slip through uncapped. A conforming impl
+> MUST therefore detect lzma-alone by *attempting* a `FORMAT_ALONE` decode
+> under the `decomp_cap` bound when no reliable magic matched: if the stream
+> decodes it is lzma-alone (and is thereby capped); if the decode errors it is
+> treated as already-decompressed plain tar. An unrecognized stream MUST NOT be
+> handed to an autodetecting tar reader that would decompress it outside the
+> cap — in particular a `.tar.lzma` stream MUST NOT reach such a reader.
+
+---
+
 ## 3  Identity contract
 
 ### 3.1  Identity is forbidden in the receipt — field-level line

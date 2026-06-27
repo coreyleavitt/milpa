@@ -603,6 +603,7 @@ git URL. Also used for self-mirrors converted from legacy `self_mirrors` nodes
 | `url` | yes | string | git remote URL |
 | `ref` | no | string | branch/tag/ref as declared in the manifest |
 | `commit_sha` | no | string | resolved commit SHA after fetch |
+| `submodule "<path>" sha="<40hex>"` | no (child nodes) | KDL child nodes | one node per recursed submodule, path-sorted |
 
 > NORMATIVE: `url` is required; its absence raises `LOCK-PROV-FIELD-MISSING`.
 > `ref` and `commit_sha` are optional and MUST be omitted from the emitted KDL
@@ -613,6 +614,29 @@ git URL. Also used for self-mirrors converted from legacy `self_mirrors` nodes
 > NOTE: `commit_sha` is the resolved SHA from the fetch receipt (`d.sha`), not
 > the manifest's declared ref. It may be `null` for deps that were not actually
 > fetched in this run (e.g., frozen fast-path cache hits).
+
+> NORMATIVE (H5 — submodule provenance): If a git dep has submodules, the
+> `git` provenance block MUST contain one `submodule "<full-path>" sha="<40hex>"`
+> child node per recursed submodule (full path relative to the superproject root,
+> POSIX separators, path-sorted lexicographically). These nodes record
+> PROVENANCE (which commit was recursed), NOT identity (they do not affect
+> the `identity` field). They are emitted after `commit_sha` (if present).
+> When no submodules are present the nodes are absent entirely.
+> `milpa verify` MUST check that each `submodule` sha node matches the gitlink
+> SHA in the live object store — a changed SHA is a supply-chain signal.
+>
+> Example:
+> ```kdl
+> provenance {
+>     origin "observed"
+>     kind "git"
+>     url "https://example.com/super.git"
+>     ref "main"
+>     commit_sha "abc123..."
+>     submodule "libs/foo" sha="deadbeef..."
+>     submodule "libs/bar" sha="cafebabe..."
+> }
+> ```
 
 ### 4.2  `tarball` provenance
 

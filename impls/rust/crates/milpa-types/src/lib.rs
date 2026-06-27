@@ -236,6 +236,9 @@ pub enum ProvenanceRecord {
         commit_sha: Option<String>,
         /// "observed" or "declared". Default "observed".
         origin: String,
+        /// H5: submodule path → 40-hex gitlink SHA, path-sorted.
+        /// Empty for deps with no submodules.
+        submodule_shas: Vec<(String, String)>,
     },
     Tarball {
         url: String,

@@ -1,0 +1,18 @@
+{
+  "repos": [
+    {
+      "name": "mylib",
+      "files": {
+        "hello.nim": "hello milpa\n",
+        "stub.nimble": "# stub\n"
+      },
+      "ref": "main"
+    }
+  ],
+  "fetch": {
+    "dep_name": "mylib",
+    "repo_name": "mylib",
+    "ref": "main",
+    "commit_sha": null
+  }
+}

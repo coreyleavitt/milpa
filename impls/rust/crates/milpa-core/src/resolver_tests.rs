@@ -92,7 +92,7 @@ impl FetcherRegistry for FakeReg {
                 self.materialize(name, &m, dest)?;
                 Ok(Receipt {
                     resolved_ref: Some(m.sha),
-                    archive_sha256: None,
+                    ..Default::default()
                 })
             }
             Provenance::Tarball {
@@ -122,8 +122,8 @@ impl FetcherRegistry for FakeReg {
                 }
                 self.materialize(name, &m, dest)?;
                 Ok(Receipt {
-                    resolved_ref: None,
                     archive_sha256: archive_sha,
+                    ..Default::default()
                 })
             }
             Provenance::Local { path } => {
@@ -132,10 +132,7 @@ impl FetcherRegistry for FakeReg {
                     .push((name.to_string(), path.clone(), String::new()));
                 copy_tree(Path::new(path), dest)
                     .map_err(|e| FetchError::Failed(format!("local copy: {e}")))?;
-                Ok(Receipt {
-                    resolved_ref: None,
-                    archive_sha256: None,
-                })
+                Ok(Receipt::default())
             }
             other => Err(FetchError::Failed(format!("unmocked: {other:?}"))),
         }
@@ -868,6 +865,7 @@ fn resolve_prior_lockfile_pin_rejects_hostile_bytes() {
                 ref_spec: Some("main".into()),
                 commit_sha: None,
                 origin: "observed".into(),
+                submodule_shas: vec![],
             }],
             active_flags: Vec::new(),
             dep_decl: None,
@@ -913,6 +911,7 @@ fn resolve_prior_lockfile_pin_accepts_matching_bytes() {
                 ref_spec: Some("main".into()),
                 commit_sha: None,
                 origin: "observed".into(),
+                submodule_shas: vec![],
             }],
             active_flags: Vec::new(),
             dep_decl: None,
@@ -970,6 +969,7 @@ fn prior_with_zero_identity(dep_name: &str, url: &str) -> Lockfile {
                 ref_spec: Some("main".into()),
                 commit_sha: None,
                 origin: "observed".into(),
+                submodule_shas: vec![],
             }],
             active_flags: Vec::new(),
             dep_decl: None,
@@ -2379,6 +2379,7 @@ deps {
                     ref_spec: Some("main".into()),
                     commit_sha: Some("abc123".into()),
                     origin: "observed".into(),
+                    submodule_shas: vec![],
                 }],
                 active_flags: vec![],
                 dep_decl: None,

@@ -67,6 +67,7 @@ fn git_rec() -> ProvenanceRecord {
         ref_spec: Some("main".into()),
         commit_sha: Some("abcdef1234567890abcdef1234567890abcdef12".into()),
         origin: "observed".into(),
+        submodule_shas: vec![],
     }
 }
 
@@ -430,12 +431,14 @@ fn frozen_carries_all_provenances() {
         ref_spec: Some("main".into()),
         commit_sha: Some("obs123".into()),
         origin: "observed".into(),
+        submodule_shas: vec![],
     };
     let declared = ProvenanceRecord::Git {
         url: "https://mirror.example.com/foo.git".into(),
         ref_spec: None,
         commit_sha: None,
         origin: "declared".into(),
+        submodule_shas: vec![],
     };
     let locked_dep = LockedDep {
         name: "foo".into(),
@@ -587,6 +590,7 @@ fn rebuild_deps_view_preserves_local_symlink_alongside_cas_dep() {
             ref_spec: Some("main".into()),
             commit_sha: None,
             origin: "observed".into(),
+            submodule_shas: vec![],
         }],
         dep_decl: None,
         cond_requires: vec![],

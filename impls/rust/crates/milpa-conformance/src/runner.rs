@@ -70,6 +70,10 @@ pub enum Produced {
     /// A `cmd=workspace-manifest-roundtrip` (S9a) success: only
     /// `expected/milpa.kdl` is byte-compared against the re-emitted KDL.
     WorkspaceKdl(String),
+    /// H-infra: a `cmd=git-protocol` run that passed the content_hash assertion.
+    /// The `content_hash` field carries the computed hash for diagnostic output.
+    /// `run_fixture` maps this to `Verdict::Pass` for success-expected fixtures.
+    GitProtocolPass { content_hash: String },
 }
 
 /// The implementation under test. The `Err` payload is the error **code**
@@ -187,6 +191,10 @@ pub fn run_fixture(fx: &Fixture, target: &dyn Target, scratch: &Scratch) -> Verd
                 None => Verdict::Pass,
             }
         }
+        // H-infra: git-protocol fixture passed the content_hash assertion (checked
+        // inside run_git_protocol_fixture and returned as GitProtocolPass).
+        // The fixture has no milpa.lock / nim.cfg / _deps_structure.txt to diff.
+        (Expected::Success, Ok(Produced::GitProtocolPass { .. })) => Verdict::Pass,
     }
 }
 
@@ -923,6 +931,15 @@ impl Target for MilpaTarget {
                 }
                 Ok(Produced::NoByteDiff)
             }
+            // H-infra: git-protocol fixtures run the REAL fetch_git against a
+            // generated local bare repo.  No milpa.kdl or mocked-fetches/ needed.
+            // Error-class fixtures (EXTRACT-SYMLINK-ESCAPE, FETCH-GIT-LFS-POINTER)
+            // return Err(slug) directly so run_fixture's verdict dispatch can match
+            // them against Expected::Error(slug).  The error string is the slug
+            // itself — no wrapping prefix — so the bijection check works cleanly.
+            Cmd::GitProtocol => {
+                run_git_protocol_fixture(fx, scratch)
+            }
             // CLI-only verbs are skipped by `run_fixture` before reaching the
             // Target; this arm exists only for match exhaustiveness.
             Cmd::CliOnly => Err(
@@ -932,6 +949,524 @@ impl Target for MilpaTarget {
             ),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// H-infra: git-protocol fixture tier
+// ---------------------------------------------------------------------------
+// H-infra runs the REAL fetch_git (not MockedFetcher) against file:// URLs
+// pointing at local bare repos generated at test time from the fixture's
+// git-protocol.json spec.  This is the only tier that can catch git-protocol
+// bugs (object-store vs smudge divergence, submodule omission, etc.) —
+// MockedFetcher stages bytes verbatim with no git invocation.
+
+/// Minimal JSON reader for the git-protocol.json fixture schema.
+/// The schema is entirely under our control (no user data), so this
+/// hand-rolled traversal is safe.  Not a general-purpose parser.
+mod serde_like {
+    /// An extremely minimal JSON value type (only what git-protocol.json uses).
+    #[derive(Debug, Clone)]
+    pub enum Val {
+        Str(String),
+        Null,
+        Arr(Vec<Val>),
+        Obj(Vec<(String, Val)>),
+    }
+
+    impl Val {
+        pub fn as_str(&self) -> Option<&str> {
+            if let Val::Str(s) = self { Some(s) } else { None }
+        }
+        pub fn as_arr(&self) -> Option<&[Val]> {
+            if let Val::Arr(a) = self { Some(a) } else { None }
+        }
+        pub fn as_obj(&self) -> Option<&[(String, Val)]> {
+            if let Val::Obj(o) = self { Some(o) } else { None }
+        }
+        pub fn is_null(&self) -> bool {
+            matches!(self, Val::Null)
+        }
+        pub fn get(&self, key: &str) -> Option<&Val> {
+            self.as_obj()?.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Val, String> {
+        let mut chars = s.chars().peekable();
+        let val = parse_val(&mut chars)?;
+        // skip trailing whitespace
+        while chars.peek().map(|c| c.is_whitespace()).unwrap_or(false) {
+            chars.next();
+        }
+        Ok(val)
+    }
+
+    fn skip_ws(it: &mut std::iter::Peekable<std::str::Chars>) {
+        while it.peek().map(|c| c.is_whitespace()).unwrap_or(false) {
+            it.next();
+        }
+    }
+
+    fn parse_val(it: &mut std::iter::Peekable<std::str::Chars>) -> Result<Val, String> {
+        skip_ws(it);
+        match it.peek().copied() {
+            Some('"') => Ok(Val::Str(parse_string(it)?)),
+            Some('{') => Ok(Val::Obj(parse_obj(it)?)),
+            Some('[') => Ok(Val::Arr(parse_arr(it)?)),
+            Some('n') => {
+                for c in ['n','u','l','l'] {
+                    if it.next() != Some(c) { return Err("expected null".into()); }
+                }
+                Ok(Val::Null)
+            }
+            other => Err(format!("unexpected char in JSON: {other:?}")),
+        }
+    }
+
+    fn parse_string(it: &mut std::iter::Peekable<std::str::Chars>) -> Result<String, String> {
+        assert_eq!(it.next(), Some('"'));
+        let mut s = String::new();
+        loop {
+            match it.next() {
+                None => return Err("unterminated string".into()),
+                Some('"') => break,
+                Some('\\') => {
+                    match it.next() {
+                        Some('"') => s.push('"'),
+                        Some('\\') => s.push('\\'),
+                        Some('n') => s.push('\n'),
+                        Some('r') => s.push('\r'),
+                        Some('t') => s.push('\t'),
+                        other => return Err(format!("unknown escape \\{other:?}")),
+                    }
+                }
+                Some(c) => s.push(c),
+            }
+        }
+        Ok(s)
+    }
+
+    fn parse_obj(it: &mut std::iter::Peekable<std::str::Chars>) -> Result<Vec<(String, Val)>, String> {
+        assert_eq!(it.next(), Some('{'));
+        let mut pairs = Vec::new();
+        skip_ws(it);
+        if it.peek() == Some(&'}') { it.next(); return Ok(pairs); }
+        loop {
+            skip_ws(it);
+            let key = parse_string(it)?;
+            skip_ws(it);
+            if it.next() != Some(':') { return Err("expected ':'".into()); }
+            skip_ws(it);
+            let val = parse_val(it)?;
+            pairs.push((key, val));
+            skip_ws(it);
+            match it.next() {
+                Some(',') => continue,
+                Some('}') => break,
+                other => return Err(format!("expected , or }}, got {other:?}")),
+            }
+        }
+        Ok(pairs)
+    }
+
+    fn parse_arr(it: &mut std::iter::Peekable<std::str::Chars>) -> Result<Vec<Val>, String> {
+        assert_eq!(it.next(), Some('['));
+        let mut items = Vec::new();
+        skip_ws(it);
+        if it.peek() == Some(&']') { it.next(); return Ok(items); }
+        loop {
+            skip_ws(it);
+            let val = parse_val(it)?;
+            items.push(val);
+            skip_ws(it);
+            match it.next() {
+                Some(',') => continue,
+                Some(']') => break,
+                other => return Err(format!("expected , or ], got {other:?}")),
+            }
+        }
+        Ok(items)
+    }
+}
+
+/// Build a local git repo from a repo spec and return its path + all commit SHAs.
+///
+/// Returns `(repo_dir, [sha_0, sha_1, ...])` in oldest-first order.
+///
+/// Two forms are supported:
+///
+/// *Single-commit form* (backward-compat): `repo_spec["files"]` is a
+/// `{relpath: content}` object.  One commit is produced; the SHA list has one element.
+///
+/// *Multi-commit form* (H4): `repo_spec["commits"]` is an array of
+/// `{"files": {relpath: content}}` objects applied sequentially.  Each dict
+/// is committed on top of the previous (files not mentioned survive — no
+/// auto-deletion).  The SHA list has one entry per commit.
+///
+/// All files are committed with fixed author identity (these are disposable
+/// test repos, not the milpa repo whose config the global git config protects).
+fn make_git_protocol_repo(
+    tmpdir: &std::path::Path,
+    repo_spec: &serde_like::Val,
+) -> Result<(std::path::PathBuf, Vec<String>), String> {
+    let name = repo_spec.get("name")
+        .and_then(|v| v.as_str())
+        .ok_or("repo_spec missing 'name'")?;
+    let ref_name = repo_spec.get("ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or("main");
+
+    let repo_dir = tmpdir.join(name);
+    std::fs::create_dir_all(&repo_dir)
+        .map_err(|e| format!("create repo dir: {e}"))?;
+
+    // git init — without -c flags (git init ignores them in some versions)
+    let out = std::process::Command::new("git")
+        .arg("-C").arg(&repo_dir)
+        .args(["init", "-q", "-b", ref_name])
+        .output()
+        .map_err(|e| format!("git init: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("git init failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+
+    // git add + commit helper (captures the SHA after each commit)
+    let git_c = |args: &[&str]| -> std::io::Result<std::process::Output> {
+        std::process::Command::new("git")
+            .arg("-C").arg(&repo_dir)
+            .args(["-c", "user.email=milpa-hinfra@test.milpa",
+                   "-c", "user.name=Milpa H-infra",
+                   "-c", "core.autocrlf=false"])
+            .args(args)
+            .output()
+    };
+    let head_sha = || -> Result<String, String> {
+        let out = std::process::Command::new("git")
+            .arg("-C").arg(&repo_dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .map_err(|e| format!("git rev-parse: {e}"))?;
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+
+    // Normalize to a list of commit specs regardless of form.
+    // Multi-commit form: use repo_spec["commits"] array.
+    // Single-commit form: wrap repo_spec["files"] in a one-element list.
+    let mut commit_shas: Vec<String> = Vec::new();
+
+    if let Some(commits_val) = repo_spec.get("commits") {
+        // Multi-commit form
+        let commits = commits_val.as_arr()
+            .ok_or("repo_spec 'commits' must be an array")?;
+        for (i, commit_spec) in commits.iter().enumerate() {
+            let files = commit_spec.get("files")
+                .and_then(|v| v.as_obj())
+                .ok_or_else(|| format!("commit[{i}] missing 'files' object"))?;
+            // Write this commit's files
+            for (relpath, val) in files {
+                let content = val.as_str()
+                    .ok_or_else(|| format!("commit[{i}] file {relpath:?} value must be a string"))?;
+                let target = repo_dir.join(relpath);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("create dir for {relpath}: {e}"))?;
+                }
+                std::fs::write(&target, content.as_bytes())
+                    .map_err(|e| format!("write {relpath}: {e}"))?;
+            }
+            let out = git_c(&["add", "."]).map_err(|e| format!("git add: {e}"))?;
+            if !out.status.success() {
+                return Err(format!("git add failed: {}", String::from_utf8_lossy(&out.stderr)));
+            }
+            let msg = if i == 0 { "H-infra initial commit".to_string() } else { format!("H-infra commit {i}") };
+            let out = git_c(&["commit", "-q", "-m", &msg])
+                .map_err(|e| format!("git commit: {e}"))?;
+            if !out.status.success() {
+                return Err(format!("git commit failed: {}", String::from_utf8_lossy(&out.stderr)));
+            }
+            commit_shas.push(head_sha()?);
+        }
+    } else {
+        // Single-commit (backward-compat) form
+        let files = repo_spec.get("files")
+            .and_then(|v| v.as_obj())
+            .ok_or("repo_spec missing 'files' (and no 'commits' array)")?;
+        for (relpath, val) in files {
+            let content = val.as_str()
+                .ok_or_else(|| format!("file {relpath:?} value must be a string"))?;
+            let target = repo_dir.join(relpath);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("create dir for {relpath}: {e}"))?;
+            }
+            std::fs::write(&target, content.as_bytes())
+                .map_err(|e| format!("write {relpath}: {e}"))?;
+        }
+        // H3d: symlinks support — commit mode-120000 blobs for escape/safe tests.
+        // The target string is committed verbatim; containment is the fetcher's job.
+        if let Some(symlinks_val) = repo_spec.get("symlinks") {
+            let symlinks = symlinks_val.as_obj()
+                .ok_or("repo_spec 'symlinks' must be an object")?;
+            for (link_path, val) in symlinks {
+                let link_target = val.as_str()
+                    .ok_or_else(|| format!("symlink {link_path:?} value must be a string"))?;
+                let link_on_disk = repo_dir.join(link_path);
+                if let Some(parent) = link_on_disk.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("create dir for symlink {link_path}: {e}"))?;
+                }
+                // Remove stale symlink/file if present (idempotent).
+                let _ = std::fs::remove_file(&link_on_disk);
+                std::os::unix::fs::symlink(link_target, &link_on_disk)
+                    .map_err(|e| format!("create symlink {link_path} -> {link_target}: {e}"))?;
+            }
+        }
+        let out = git_c(&["add", "."]).map_err(|e| format!("git add: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("git add failed: {}", String::from_utf8_lossy(&out.stderr)));
+        }
+        let out = git_c(&["commit", "-q", "-m", "H-infra initial commit"])
+            .map_err(|e| format!("git commit: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("git commit failed: {}", String::from_utf8_lossy(&out.stderr)));
+        }
+        commit_shas.push(head_sha()?);
+    }
+
+    // Optional: create an orphan tip commit and force-reset the branch to it.
+    // This simulates a force-push that makes earlier commits unreachable from
+    // any ref — so a `git clone` of this repo will NOT fetch those commits.
+    // Used by H4 to produce a non-tip commit absent after a plain clone,
+    // exposing the Rust FETCH-GIT-COMMIT-ABSENT bug before the 4-step fix.
+    if let Some(orphan_spec) = repo_spec.get("orphan_tip") {
+        let orphan_files = orphan_spec.get("files")
+            .and_then(|v| v.as_obj())
+            .ok_or("orphan_tip missing 'files' object")?;
+        let orphan_branch = "__milpa_hinfra_orphan__";
+        // Create an orphan branch
+        let out = git_c(&["checkout", "--orphan", orphan_branch])
+            .map_err(|e| format!("git checkout --orphan: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("git checkout --orphan failed: {}", String::from_utf8_lossy(&out.stderr)));
+        }
+        // Remove all tracked files so the orphan starts clean
+        let out = git_c(&["rm", "-rf", "."])
+            .map_err(|e| format!("git rm: {e}"))?;
+        // Ignore failure (empty repo rm is ok if nothing staged yet)
+        let _ = out;
+        // Write orphan files
+        for (relpath, val) in orphan_files {
+            let content = val.as_str()
+                .ok_or_else(|| format!("orphan_tip file {relpath:?} value must be a string"))?;
+            let target = repo_dir.join(relpath);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("create dir for orphan {relpath}: {e}"))?;
+            }
+            std::fs::write(&target, content.as_bytes())
+                .map_err(|e| format!("write orphan {relpath}: {e}"))?;
+        }
+        let out = git_c(&["add", "."])
+            .map_err(|e| format!("git add (orphan): {e}"))?;
+        if !out.status.success() {
+            return Err(format!("git add (orphan) failed: {}", String::from_utf8_lossy(&out.stderr)));
+        }
+        let out = git_c(&["commit", "-q", "-m", "H-infra orphan tip (simulates force-push)"])
+            .map_err(|e| format!("git commit (orphan): {e}"))?;
+        if !out.status.success() {
+            return Err(format!("git commit (orphan) failed: {}", String::from_utf8_lossy(&out.stderr)));
+        }
+        let orphan_sha = head_sha()?;
+        // Force-reset the target ref to the orphan commit
+        let out = git_c(&["branch", "-f", ref_name, &orphan_sha])
+            .map_err(|e| format!("git branch -f: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("git branch -f failed: {}", String::from_utf8_lossy(&out.stderr)));
+        }
+        // Detach HEAD so clone of the ref works cleanly
+        let out = git_c(&["checkout", "--detach", "HEAD"])
+            .map_err(|e| format!("git checkout --detach: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("git checkout --detach failed: {}", String::from_utf8_lossy(&out.stderr)));
+        }
+    }
+
+    Ok((repo_dir, commit_shas))
+}
+
+/// Execute a git-protocol fixture end-to-end using the REAL `fetch_git`.
+///
+/// H-infra flow:
+/// 1. Parse `git-protocol.json`.
+/// 2. Generate each declared repo under a tempdir.
+/// 3. Build a `file://` URL for the target repo.
+/// 4. Call `milpa_core::fetchers::fetch_git` (the REAL fetcher, not MockedFetcher).
+/// 5. Compare `compute_content_hash(dest)` to `expected/content_hash`.
+///
+/// content_hash is over the materialized source tree (file relpaths + bytes),
+/// NOT git pack objects — so it is stable across git versions and both impls.
+fn run_git_protocol_fixture(fx: &Fixture, scratch: &Scratch) -> Result<Produced, String> {
+    // Parse git-protocol.json
+    let spec_path = fx.dir.join("git-protocol.json");
+    let spec_text = std::fs::read_to_string(&spec_path)
+        .map_err(|e| format!("git-protocol.json missing or unreadable: {e}"))?;
+    let spec = serde_like::parse(&spec_text)
+        .map_err(|e| format!("git-protocol.json parse error: {e}"))?;
+
+    // Read expected outcome: either a content_hash (success) or an error slug.
+    // Error-class git-protocol fixtures (e.g. EXTRACT-SYMLINK-ESCAPE,
+    // FETCH-GIT-LFS-POINTER) expect fetch_git to raise; success-class fixtures
+    // assert the materialized tree's content_hash matches the declared value.
+    let expected_error_path = fx.dir.join("expected").join("error");
+    let expected_error: Option<String> = std::fs::read_to_string(&expected_error_path).ok()
+        .map(|s| s.trim().to_string());
+    let expected_hash_path = fx.dir.join("expected").join("content_hash");
+    let expected_hash: String = if expected_error.is_none() {
+        std::fs::read_to_string(&expected_hash_path)
+            .map_err(|e| format!("expected/content_hash missing: {e}"))?
+            .trim()
+            .to_string()
+    } else {
+        String::new()
+    };
+
+    let repos_spec = spec.get("repos")
+        .and_then(|v| v.as_arr())
+        .ok_or("git-protocol.json missing 'repos' array")?;
+    let fetch_spec = spec.get("fetch")
+        .and_then(|v| v.as_obj())
+        .ok_or("git-protocol.json missing 'fetch' object")?;
+
+    // Generate repos in a sub-tempdir of the scratch root
+    let repos_tmpdir = scratch.root.join("git-repos");
+    std::fs::create_dir_all(&repos_tmpdir)
+        .map_err(|e| format!("create repos tmpdir: {e}"))?;
+
+    let mut repo_paths: std::collections::HashMap<String, std::path::PathBuf> =
+        std::collections::HashMap::new();
+    let mut repo_commit_shas: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for repo_spec in repos_spec {
+        let name = repo_spec.get("name").and_then(|v| v.as_str())
+            .ok_or("repo spec missing 'name'")?
+            .to_string();
+        let (repo_dir, shas) = make_git_protocol_repo(&repos_tmpdir, repo_spec)?;
+        repo_paths.insert(name.clone(), repo_dir);
+        repo_commit_shas.insert(name, shas);
+    }
+
+    // Resolve fetch parameters
+    let fetch_map: std::collections::HashMap<&str, &serde_like::Val> =
+        fetch_spec.iter().map(|(k, v)| (k.as_str(), v)).collect();
+
+    let repo_name = fetch_map.get("repo_name")
+        .and_then(|v| v.as_str())
+        .ok_or("fetch missing 'repo_name'")?;
+    let dep_name = fetch_map.get("dep_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("smoke");
+    let ref_spec = fetch_map.get("ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or("main");
+
+    // H4: commit_sha may be null (no pin), a literal 40-hex SHA, or an
+    // "@repo:<name>:commit:<index>" reference resolved from the generated SHAs.
+    let raw_commit_sha: Option<&str> = fetch_map.get("commit_sha")
+        .and_then(|v| if v.is_null() { None } else { v.as_str() });
+    let commit_sha: Option<String> = match raw_commit_sha {
+        None => None,
+        Some(s) if s.starts_with("@repo:") => {
+            // Resolve "@repo:<repo_name>:commit:<index>" to the actual SHA.
+            let parts: Vec<&str> = s.splitn(4, ':').collect();
+            // parts: ["@repo", "<repo_name>", "commit", "<index>"]
+            if parts.len() == 4 && parts[0] == "@repo" && parts[2] == "commit" {
+                let ref_repo = parts[1];
+                let idx: usize = parts[3].parse()
+                    .map_err(|_| format!("commit SHA reference {s:?}: index must be an integer"))?;
+                let sha_list = repo_commit_shas.get(ref_repo)
+                    .ok_or_else(|| format!("commit SHA reference {s:?}: repo {ref_repo:?} not found"))?;
+                Some(sha_list.get(idx)
+                    .ok_or_else(|| format!("commit SHA reference {s:?}: index {idx} out of range (repo has {} commits)", sha_list.len()))?
+                    .clone())
+            } else {
+                return Err(format!("commit SHA reference {s:?}: expected format @repo:<name>:commit:<index>"));
+            }
+        }
+        Some(s) => Some(s.to_string()),
+    };
+
+    let target_repo = repo_paths.get(repo_name)
+        .ok_or_else(|| format!("fetch.repo_name {repo_name:?} not found in repos"))?;
+
+    // Build file:// URL so fetch_git exercises the real git clone path
+    let abs_repo = target_repo.canonicalize()
+        .map_err(|e| format!("canonicalize repo path: {e}"))?;
+    let file_url = format!("file://{}", abs_repo.to_string_lossy());
+
+    let dest = scratch.deps_dir.join(dep_name);
+
+    // Run the REAL fetch_git (not MockedFetcher).
+    // H3d: error-class fixtures expect fetch_git to raise the declared slug.
+    // We capture the FetchError and its slug so the verdict machinery can
+    // match it against Expected::Error(slug) in run_fixture.
+    let fetch_result = milpa_core::fetchers::fetch_git(
+        dep_name,
+        &file_url,
+        ref_spec,
+        commit_sha.as_deref(),
+        &dest,
+    );
+
+    match fetch_result {
+        Err(e) => {
+            let slug = e.code().to_string();
+            if let Some(ref expected_slug) = expected_error {
+                if &slug == expected_slug {
+                    // Error-class fixture: slug matches — report as Err(slug) so
+                    // run_fixture's (Expected::Error(slug), Err(code)) arm passes it.
+                    return Err(slug);
+                } else {
+                    return Err(format!(
+                        "expected error {expected_slug:?}, got {slug:?}: {e:?}"
+                    ));
+                }
+            }
+            // Success-class fixture but fetch raised an error.
+            return Err(format!("fetch_git failed [{}]: {:?}", slug, e));
+        }
+        Ok(receipt) => {
+            // Fetcher succeeded — if we expected an error, that's a test failure.
+            if let Some(ref expected_slug) = expected_error {
+                return Err(format!(
+                    "expected error {expected_slug:?} but fetch_git succeeded"
+                ));
+            }
+
+            // Confirm the receipt has a resolved SHA (proves git was actually invoked)
+            let resolved_sha = receipt.resolved_ref.as_deref().unwrap_or("");
+            if resolved_sha.len() != 40 {
+                return Err(format!(
+                    "fetch_git returned unexpected resolved_ref: {resolved_sha:?} \
+                     (expected 40-char hex SHA)"
+                ));
+            }
+        }
+    }
+
+    // Compute content_hash of the materialized tree
+    let got_hash = milpa_core::compute_content_hash(&dest)
+        .map_err(|e| format!("compute_content_hash failed: {e:?}"))?;
+
+    if got_hash != expected_hash {
+        return Err(format!(
+            "content_hash mismatch:\n  expected: {expected_hash}\n  actual:   {got_hash}\n  \
+             (fetch_git used file:// URL: {file_url:?})"
+        ));
+    }
+
+    // Return GitProtocolPass: git-protocol fixtures assert only content_hash.
+    // run_fixture's (Expected::Success, Ok(Produced::GitProtocolPass { .. })) arm passes it.
+    Ok(Produced::GitProtocolPass { content_hash: got_hash })
 }
 
 /// Parse the fixture's optional `env` file (KEY=VALUE per line) into a map.

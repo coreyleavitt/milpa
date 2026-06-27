@@ -26,6 +26,16 @@ use std::path::{Component, Path, PathBuf};
 use crate::error::MilpaError;
 use crate::fetch::FetchError;
 
+/// Overhead added to `max_total_size` to compute the decompression-bomb cap —
+/// one tar header block (512 B) to leave room for tar framing around file data.
+///
+/// **Single definition** (R2-06): this is the canonical source; `fetchers.rs`
+/// imports `crate::safe_extract::DECOMP_CAP_OVERHEAD` so both modules always
+/// agree.  The old `const DECOMP_CAP_OVERHEAD: u64 = 512` in `fetchers.rs` was
+/// a duplicate of the inline `const OVERHEAD: u64 = 512` previously in
+/// `Limits::decomp_cap()` — that inline copy is now removed.
+pub(crate) const DECOMP_CAP_OVERHEAD: u64 = 512;
+
 /// Decompression-bomb caps (mirror `safe_extract.py` defaults).
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -39,6 +49,17 @@ impl Limits {
     /// `fetchers.rs` can derive `MAX_COMPRESSED_BYTES` without constructing a
     /// `Limits` value at const evaluation time.
     pub const DEFAULT_MAX_TOTAL_SIZE: u64 = 1 << 30; // 1 GiB
+
+    /// R1-12 / R2-06: single source of truth for the decompression-bomb cap formula.
+    /// Cap = max_total_size + DECOMP_CAP_OVERHEAD (one tar header block = 512 B).
+    /// Both `fetch_tarball` (gzip/bz2/xz/lzma-alone) and `fetch_oci` (gzip) use this.
+    /// Mirrors Python's `Limits.decomp_cap` field.
+    ///
+    /// `DECOMP_CAP_OVERHEAD` is now defined once (above) and re-exported so
+    /// `fetchers.rs` can reference it directly — eliminating the former duplicate.
+    pub fn decomp_cap(&self) -> u64 {
+        self.max_total_size + DECOMP_CAP_OVERHEAD
+    }
 }
 
 impl Default for Limits {
@@ -73,7 +94,7 @@ pub fn extract_tar(
 ) -> Result<ExtractionResult, MilpaError> {
     std::fs::create_dir_all(dest).map_err(|e| {
         extract_err(
-            "EXTRACT-ZIP-SLIP",
+            "EXTRACT-IO-ERROR",
             format!("cannot create dest {}: {e}", dest.display()),
         )
     })?;
@@ -83,19 +104,40 @@ pub fn extract_tar(
     let mut file_count: u64 = 0;
     let strip = strip_components as usize;
 
-    for entry in TarEntries::new(tar) {
-        let entry = entry?;
+    // H2 — two-pass extraction (spec/plugin-contract.md §2.2).
+    // Hardlink entries carry an archive-absolute linkname that may
+    // forward-reference a target not yet written (tar ordering is arbitrary).
+    // All regular files, dirs, and symlinks are written in pass 1; hardlinks
+    // are resolved in pass 2 when every target is guaranteed to exist.
+    // Collect (name, linkname, target_path) for pass 2.
+    struct PendingHardlink {
+        name: String,
+        linkname: String,
+        target: PathBuf,
+    }
+    let mut hardlinks: Vec<PendingHardlink> = Vec::new();
 
-        // strip_components: split, drop empty/".", skip if too shallow.
-        let parts: Vec<&str> = entry
-            .name
+    // Helper: strip_components applied via POSIX '/' split (not host separator).
+    let strip_name = |raw: &str| -> Option<String> {
+        let parts: Vec<&str> = raw
             .split('/')
             .filter(|p| !p.is_empty() && *p != ".")
             .collect();
         if parts.len() <= strip {
-            continue;
+            None
+        } else {
+            Some(parts[strip..].join("/"))
         }
-        let stripped = parts[strip..].join("/");
+    };
+
+    // Pass 1: dirs, regular files, symlinks — everything except hardlinks.
+    for entry in TarEntries::new(tar) {
+        let entry = entry?;
+
+        let stripped = match strip_name(&entry.name) {
+            Some(s) => s,
+            None => continue,
+        };
 
         // zip-slip: the entry's lexical target must stay under dest_root.
         let target = normalize_lexical(&dest_root.join(&stripped));
@@ -112,8 +154,16 @@ pub fn extract_tar(
         }
 
         match entry.kind {
-            EntryKind::Symlink | EntryKind::HardLink => {
-                // The link target is evaluated relative to the link's parent.
+            EntryKind::HardLink => {
+                // Defer to pass 2 for forward-reference safety.
+                hardlinks.push(PendingHardlink {
+                    name: entry.name.clone(),
+                    linkname: entry.linkname.clone(),
+                    target,
+                });
+            }
+            EntryKind::Symlink => {
+                // Symlink geometry: target is relative to the link's parent dir.
                 let parent = target.parent().unwrap_or(&dest_root);
                 let link_target = normalize_lexical(&parent.join(&entry.linkname));
                 if !link_target.starts_with(&dest_root) {
@@ -129,11 +179,11 @@ pub fn extract_tar(
                     ));
                 }
                 if let Some(p) = target.parent() {
-                    std::fs::create_dir_all(p).map_err(io_zip(&entry.name))?;
+                    std::fs::create_dir_all(p).map_err(io_err(&entry.name))?;
                 }
                 let _ = std::fs::remove_file(&target);
                 std::os::unix::fs::symlink(&entry.linkname, &target)
-                    .map_err(io_zip(&entry.name))?;
+                    .map_err(io_err(&entry.name))?;
                 file_count += 1;
                 if file_count > limits.max_file_count {
                     return Err(extract_err(
@@ -146,7 +196,7 @@ pub fn extract_tar(
                 }
             }
             EntryKind::Dir => {
-                std::fs::create_dir_all(&target).map_err(io_zip(&entry.name))?;
+                std::fs::create_dir_all(&target).map_err(io_err(&entry.name))?;
             }
             EntryKind::File => {
                 if entry.size > limits.max_file_size {
@@ -179,12 +229,94 @@ pub fn extract_tar(
                     ));
                 }
                 if let Some(p) = target.parent() {
-                    std::fs::create_dir_all(p).map_err(io_zip(&entry.name))?;
+                    std::fs::create_dir_all(p).map_err(io_err(&entry.name))?;
                 }
-                std::fs::write(&target, entry.data).map_err(io_zip(&entry.name))?;
+                std::fs::write(&target, entry.data).map_err(io_err(&entry.name))?;
             }
             EntryKind::Other => {} // char/block/fifo — never legitimate in source.
         }
+    }
+
+    // Pass 2: hardlinks — copy bytes from now-guaranteed-existing targets.
+    // (spec/plugin-contract.md §2.2: copy-bytes materialisation; linkname is
+    //  archive-absolute, strip_components applied via POSIX '/' split,
+    //  resolved against dest_root — NOT relative to the link's parent dir.)
+    for hl in hardlinks {
+        // Apply strip_components to the linkname (POSIX '/' split).
+        let stripped_link = match strip_name(&hl.linkname) {
+            Some(s) => s,
+            None => {
+                // Linkname stripped away entirely → treat as escape.
+                return Err(extract_err(
+                    "EXTRACT-ZIP-SLIP",
+                    format!(
+                        "hardlink {:?} → {:?}: linkname has fewer than {} component(s); cannot strip",
+                        hl.name, hl.linkname, strip + 1
+                    ),
+                ));
+            }
+        };
+        // Resolve against dest_root (hardlink geometry).
+        let resolved_link = normalize_lexical(&dest_root.join(&stripped_link));
+        if !resolved_link.starts_with(&dest_root) {
+            return Err(extract_err(
+                "EXTRACT-ZIP-SLIP",
+                format!(
+                    "hardlink {:?} → {:?} resolves outside destination: {} not under {}",
+                    hl.name,
+                    hl.linkname,
+                    resolved_link.display(),
+                    dest_root.display()
+                ),
+            ));
+        }
+        // Copy the target's bytes.
+        let source_bytes = std::fs::read(&resolved_link).map_err(|e| {
+            extract_err(
+                "EXTRACT-IO-ERROR",
+                format!(
+                    "hardlink {:?} → {:?}: target {} cannot be read: {e}",
+                    hl.name,
+                    hl.linkname,
+                    resolved_link.display()
+                ),
+            )
+        })?;
+        // Size caps: treat the copy as if it were a regular file.
+        let copy_size = source_bytes.len() as u64;
+        if copy_size > limits.max_file_size {
+            return Err(extract_err(
+                "EXTRACT-SIZE-LIMIT",
+                format!(
+                    "hardlink {:?} target exceeds per-file cap ({copy_size} > {})",
+                    hl.name, limits.max_file_size
+                ),
+            ));
+        }
+        total_bytes += copy_size;
+        if total_bytes > limits.max_total_size {
+            return Err(extract_err(
+                "EXTRACT-SIZE-LIMIT",
+                format!(
+                    "archive total size exceeds cap ({total_bytes} > {})",
+                    limits.max_total_size
+                ),
+            ));
+        }
+        file_count += 1;
+        if file_count > limits.max_file_count {
+            return Err(extract_err(
+                "EXTRACT-SIZE-LIMIT",
+                format!(
+                    "archive file count exceeds cap ({file_count} > {})",
+                    limits.max_file_count
+                ),
+            ));
+        }
+        if let Some(p) = hl.target.parent() {
+            std::fs::create_dir_all(p).map_err(io_err(&hl.name))?;
+        }
+        std::fs::write(&hl.target, &source_bytes).map_err(io_err(&hl.name))?;
     }
 
     Ok(ExtractionResult {
@@ -193,13 +325,21 @@ pub fn extract_tar(
     })
 }
 
-fn io_zip(name: &str) -> impl Fn(std::io::Error) -> MilpaError + '_ {
-    move |e| extract_err("EXTRACT-ZIP-SLIP", format!("writing {name:?}: {e}"))
+/// Map a genuine I/O error during extraction (write/mkdir/symlink) to
+/// `EXTRACT-IO-ERROR`.  This is distinct from `EXTRACT-ZIP-SLIP` (which is
+/// reserved for security-escape failures) — callers that have already passed
+/// the containment / path-escape checks use this helper.
+fn io_err(name: &str) -> impl Fn(std::io::Error) -> MilpaError + '_ {
+    move |e| extract_err("EXTRACT-IO-ERROR", format!("writing {name:?}: {e}"))
 }
 
 /// Lexically normalize a path: resolve `.` (drop) and `..` (pop the previous
 /// `Normal` component, never above the root). No filesystem access.
-fn normalize_lexical(path: &Path) -> PathBuf {
+///
+/// `pub(crate)` so `fetchers.rs`'s `materialize_git_tree` can reuse this for
+/// the per-symlink containment check (plugin-contract.md §2.3.3) without
+/// reimplementing lexical normalization. Single source of truth.
+pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {
@@ -360,7 +500,23 @@ impl<'a> Iterator for TarEntries<'a> {
             let typeflag = header[156];
 
             let data_start = self.pos + 512;
-            let data_end = data_start + size as usize;
+            // R1-19: `size` is u64; convert to usize via checked try_into() so a
+            // 32-bit target or a maliciously crafted enormous size field does not
+            // silently truncate and bypass the subsequent bounds check.
+            let size_usize: usize = match size.try_into() {
+                Ok(n) => n,
+                Err(_) => {
+                    let name = cstr(&header[0..100]).unwrap_or_default();
+                    return Some(Err(extract_err(
+                        "EXTRACT-SIZE-LIMIT",
+                        format!(
+                            "tar entry {name:?} size {size} overflows platform usize \
+                             (archive is malformed or targets a larger address space)"
+                        ),
+                    )));
+                }
+            };
+            let data_end = data_start + size_usize;
             if data_end > self.buf.len() {
                 let name = cstr(&header[0..100]).unwrap_or_default();
                 return Some(Err(extract_err(
@@ -371,7 +527,9 @@ impl<'a> Iterator for TarEntries<'a> {
             let data = &self.buf[data_start..data_end];
             // Advance past the data, padded up to the next 512 boundary.
             let padded = size.div_ceil(512) * 512;
-            self.pos = data_start + padded as usize;
+            // R1-19: padded is derived from size (u64); checked convert for same reason.
+            let padded_usize: usize = padded.try_into().unwrap_or(usize::MAX);
+            self.pos = data_start + padded_usize;
 
             // --- GNU @LongLink (typeflag b'L' = long name, b'K' = long linkname) ---
             // The entry DATA is the NUL-terminated long name/linkname string.

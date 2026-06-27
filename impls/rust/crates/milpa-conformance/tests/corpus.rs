@@ -127,9 +127,11 @@ fn spec_error_codes() -> BTreeSet<String> {
 /// S1 moved all five TNG-DEPDECL-* codes to `implemented_error_codes()` in
 /// `milpa-core::error::CoreError::all_codes()` — they are registered there
 /// as S3b targets even though not all raise sites are wired yet.
-const DEFERRED: &[&str] = &[
-    // No codes currently deferred — all spec codes are implemented or exempt.
-];
+///
+/// H3c moved `FETCH-GIT-LFS-POINTER` from DEFERRED to `implemented_error_codes()`
+/// (now wired in `materialize_git_tree`).  This list is now empty; the catalog is
+/// a pure bijection with the spec.
+const DEFERRED: &[&str] = &[];
 
 /// Spec codes this implementation intentionally never emits.
 const EXEMPT: &[&str] = &[

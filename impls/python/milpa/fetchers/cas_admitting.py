@@ -32,6 +32,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from milpa.cas import CAStore
+from milpa.errors import FETCH_DOWNLOAD_SIZE_EXCEEDED, MilpaError
+from milpa.fetchers.safe_extract import Limits, _DEFAULT_LIMITS
 from milpa.fetchers.types import FetcherRegistry, FetchResult, Provenance, _fetch_any
 
 
@@ -57,9 +59,15 @@ class CasAdmittingFetcher:
         # result.path is a real dir for local/editable provenances
     """
 
-    def __init__(self, inner: FetcherRegistry, store: CAStore) -> None:
+    def __init__(
+        self,
+        inner: FetcherRegistry,
+        store: CAStore,
+        limits: Limits = _DEFAULT_LIMITS,
+    ) -> None:
         self._inner = inner
         self._store = store
+        self._limits = limits
 
     def fetch(
         self,
@@ -106,6 +114,29 @@ class CasAdmittingFetcher:
             # same filesystem as sha256/, guaranteeing atomic rename(2) in admit().
             with self._store.scratch() as scratch:
                 result = self._inner.fetch(name, provenance, dest=scratch.path)
+
+                # R1-07 — chokepoint stat (spec/plugin-contract.md §2.4.2 NORMATIVE):
+                # Walk the staged tree, sum regular-file sizes, and reject before
+                # hashing/admission if total exceeds the configured cap.
+                # This is the uncompressed-tree analogue of the compressed-download cap
+                # (FETCH-DOWNLOAD-SIZE-EXCEEDED is REUSED per finding R1-07: same slug,
+                # second trigger site).
+                _staged_total = sum(
+                    f.stat().st_size
+                    for f in scratch.path.rglob("*")
+                    if f.is_file() and not f.is_symlink()
+                )
+                if _staged_total > self._limits.max_total_size:
+                    raise MilpaError(
+                        FETCH_DOWNLOAD_SIZE_EXCEEDED,
+                        f"staged tree for {name!r} exceeds uncompressed size cap "
+                        f"({_staged_total} bytes > {self._limits.max_total_size} bytes); "
+                        f"rejected before CAS admission (plugin-contract.md §2.4.2)",
+                        dep=name,
+                        staged_total=_staged_total,
+                        cap=self._limits.max_total_size,
+                    )
+
                 # admit() verifies hash + moves the scratch subdir atomically.
                 # scratch() cleans up on exit (success or failure).
                 self._store.admit(scratch.path, result.identity)

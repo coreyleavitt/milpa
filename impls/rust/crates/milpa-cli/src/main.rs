@@ -2545,6 +2545,7 @@ mod tests {
                 ref_spec: Some(ref_spec.to_string()),
                 commit_sha: None,
                 origin: "declared".to_string(),
+                submodule_shas: vec![],
             })
             .collect();
         provenances.push(milpa_core::ProvenanceRecord::Git {
@@ -2552,6 +2553,7 @@ mod tests {
             ref_spec: Some(ref_spec.to_string()),
             commit_sha: Some(commit_sha.to_string()),
             origin: "observed".to_string(),
+            submodule_shas: vec![],
         });
         let dep = milpa_core::LockedDep {
             name: dep_name.to_string(),

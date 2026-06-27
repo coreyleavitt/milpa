@@ -53,7 +53,10 @@ Spec authority: spec/conformance-fixtures.md, RFC §4.4/§4.5.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
@@ -438,6 +441,321 @@ def _load_prior_lockfile(fixture_dir: Path) -> Lockfile | None:
 
 
 # ---------------------------------------------------------------------------
+# H-infra: git-protocol fixture tier
+# ---------------------------------------------------------------------------
+# H-infra builds local bare repos at test time, runs the REAL GitFetcher against
+# file:// URLs, and asserts content_hash matches expected/content_hash.
+# This is a distinct tier from the static corpus (MockedGitFetcher, no git
+# invocations) and from MILPA_INTEGRATION_TESTS=1 (real network): it uses real
+# git against generated repos with no network access.
+#
+# Fixture schema (git-protocol.json):
+#   {
+#     "repos": [
+#       {
+#         "name": "<repo-name>",
+#         "files": {"<relpath>": "<content>", ...},
+#         "ref": "<branch-name>"
+#       }
+#     ],
+#     "fetch": {
+#       "dep_name": "<dep-name>",
+#       "repo_name": "<repo-name to clone from>",
+#       "ref": "<ref to fetch>",
+#       "commit_sha": null | "<40-hex-sha>"
+#     }
+#   }
+#
+# The runner generates each repo under a tempdir, runs the REAL GitFetcher
+# (GitProvenance → GitFetcher.fetch()), and asserts:
+#   compute_content_hash(dest) == expected/content_hash (stripped)
+#
+# Determinism: content_hash is over the materialized source tree (file relpaths
+# + bytes), NOT git pack objects.  Same declared file content committed by both
+# impls → identical hash across git versions and impls.
+#
+# Auto-inserted files by git (COMMIT_EDITMSG, index, pack files) live under
+# .git/ and are excluded by identity.md §1.4 — they cannot pollute the hash.
+
+
+def _make_git_protocol_repo(
+    tmpdir: Path,
+    repo_spec: dict,  # type: ignore[type-arg]
+) -> tuple[Path, list]:  # type: ignore[type-arg]
+    """Build a local git repo from a git-protocol.json repo spec.
+
+    Returns ``(repo_path, [commit_sha_0, commit_sha_1, ...])``.
+
+    Two forms are supported:
+
+    *Single-commit form* (backward-compat): ``repo_spec["files"]`` is a
+    ``{relpath: content}`` mapping.  One commit is produced; the returned list
+    has one element.
+
+    *Multi-commit form* (H4): ``repo_spec["commits"]`` is a list of
+    ``{"files": {relpath: content}}`` dicts applied sequentially.  Each dict
+    is committed on top of the previous; files not mentioned in a later commit
+    survive (no auto-deletion).  The returned list has one SHA per commit in
+    oldest-first order.
+
+    *Symlinks* (H3d): ``repo_spec["symlinks"]`` is a ``{link_path: target}``
+    mapping of filesystem symlinks to commit alongside ``files``.  Symlinks are
+    created on disk before ``git add`` so git picks them up as mode-120000
+    blobs (committed symlinks), exactly as the H3b/H3c invariant tests do.
+    The ``target`` value is the raw link-target string (may be relative or
+    absolute, safe or escaping — the generator commits whatever the fixture
+    declares; containment-checking is the fetcher's job, not the generator's).
+
+    git user identity is overridden via ``-c`` flags (the fixture repo is
+    disposable and not constrained by the global config policy).
+    """
+    import os as _os
+
+    name = repo_spec["name"]
+    ref = repo_spec.get("ref", "main")
+
+    repo_dir = tmpdir / name
+    repo_dir.mkdir(parents=True, exist_ok=True)
+
+    def _git(args: list) -> None:  # type: ignore[type-arg]
+        result = subprocess.run(
+            ["git", "-C", str(repo_dir),
+             "-c", "user.email=milpa-hinfra@test.milpa",
+             "-c", "user.name=Milpa H-infra",
+             "-c", "core.autocrlf=false",
+             ] + args,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git {args[0]!r} failed in {repo_dir}:\n"
+                f"  stdout: {result.stdout.strip()}\n"
+                f"  stderr: {result.stderr.strip()}"
+            )
+
+    def _head_sha() -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    # init — without -c user.* (git init ignores them cleanly in some versions)
+    subprocess.run(
+        ["git", "-C", str(repo_dir), "init", "-b", ref, "-q"],
+        capture_output=True, check=True,
+    )
+
+    # Normalise to a list of commit specs regardless of form.
+    if "commits" in repo_spec:
+        # Multi-commit form: list of {"files": {...}} dicts.
+        commit_specs: list = repo_spec["commits"]
+    else:
+        # Single-commit (backward-compat): wrap the top-level "files" dict.
+        # The top-level "symlinks" map, if present, goes into this single commit.
+        commit_specs = [{"files": repo_spec.get("files", {}), "symlinks": repo_spec.get("symlinks", {})}]
+
+    commit_shas: list = []
+    for i, commit_spec in enumerate(commit_specs):
+        files: dict = commit_spec.get("files", {})
+        for relpath, content in files.items():
+            target = repo_dir / relpath
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        # H3d: symlinks support — create on-disk symlinks so git commits them
+        # as mode-120000 blobs.  The target string is committed verbatim
+        # (escaping or safe — containment is the fetcher's responsibility).
+        symlinks: dict = commit_spec.get("symlinks", {})
+        for link_path, link_target in symlinks.items():
+            link_on_disk = repo_dir / link_path
+            link_on_disk.parent.mkdir(parents=True, exist_ok=True)
+            # Remove stale symlink/file if present (idempotent re-generation).
+            if link_on_disk.exists() or link_on_disk.is_symlink():
+                link_on_disk.unlink()
+            _os.symlink(link_target, link_on_disk)
+        _git(["add", "."])
+        msg = f"H-infra commit {i}" if i > 0 else "H-infra initial commit"
+        _git(["commit", "-q", "-m", msg])
+        commit_shas.append(_head_sha())
+
+    # Optional: create an orphan tip commit and force-reset the branch to it.
+    # This simulates a force-push that makes earlier commits unreachable from
+    # any ref — so a ``git clone`` of this repo will NOT fetch those commits.
+    # Used by H4 to produce a non-tip commit that is absent after a plain clone,
+    # exposing the Rust FETCH-GIT-COMMIT-ABSENT bug before the 4-step fix.
+    orphan_tip: dict | None = repo_spec.get("orphan_tip")
+    if orphan_tip is not None:
+        # Create an orphan branch, commit the orphan files, then force-reset
+        # the target ref to that orphan commit so it becomes the branch tip.
+        orphan_branch = "__milpa_hinfra_orphan__"
+        _git(["checkout", "--orphan", orphan_branch])
+        _git(["rm", "-rf", "."])
+        orphan_files: dict = orphan_tip.get("files", {})
+        for relpath, content in orphan_files.items():
+            target = repo_dir / relpath
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        _git(["add", "."])
+        _git(["commit", "-q", "-m", "H-infra orphan tip (simulates force-push)"])
+        orphan_sha = _head_sha()
+        # Force-reset the target ref to the orphan commit
+        _git(["branch", "-f", ref, orphan_sha])
+        # Return to a detached HEAD so `git clone` clones the ref correctly
+        _git(["checkout", "--detach", "HEAD"])
+
+    return repo_dir, commit_shas
+
+
+def _execute_git_protocol_fixture(
+    fixture: "Fixture",
+    tmp_dir: Path,
+) -> tuple[Literal["pass", "fail", "skip"], str]:
+    """Execute a git-protocol fixture end-to-end using the REAL GitFetcher.
+
+    H-infra flow:
+    1. Parse ``git-protocol.json``.
+    2. Generate each declared repo under a tempdir via ``_make_git_protocol_repo``.
+    3. Build a ``file://`` URL for the target repo.
+    4. Invoke the REAL ``GitFetcher`` (not MockedGitFetcher) via ``FetcherRegistry``.
+    5. Compare ``compute_content_hash(dest)`` to ``expected/content_hash``.
+
+    The content_hash assertion is the proof that H-infra exercises the REAL
+    fetcher against a REAL git repo: MockedGitFetcher stages bytes verbatim
+    without any git invocation, so it could never fail this assertion for
+    transport-dependent reasons (object-store vs smudge divergence, submodule
+    omission, etc.).
+    """
+    from milpa.fetchers.git import GitFetcher, GitProvenance
+    from milpa.fetchers.types import FetcherRegistry
+    from milpa.identity import compute_content_hash
+
+    fixture_dir = fixture.dir
+    spec_path = fixture_dir / "git-protocol.json"
+    try:
+        spec_text = spec_path.read_text(encoding="utf-8")
+    except OSError as e:
+        return ("fail", f"git-protocol.json missing or unreadable: {e}")
+    try:
+        spec = json.loads(spec_text)
+    except json.JSONDecodeError as e:
+        return ("fail", f"git-protocol.json parse error: {e}")
+
+    # Read expected outcome: either a content_hash (success) or an error slug.
+    # Error-class fixtures (expected/error file) assert the fetcher raises the
+    # named slug; success-class fixtures assert content_hash matches.
+    expected_error_path = fixture_dir / "expected" / "error"
+    expected_hash_path = fixture_dir / "expected" / "content_hash"
+    expected_error: str | None = None
+    expected_hash: str = ""
+    if expected_error_path.exists():
+        expected_error = expected_error_path.read_text(encoding="utf-8").strip()
+    else:
+        try:
+            expected_hash = expected_hash_path.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            return ("fail", f"expected/content_hash missing or unreadable: {e}")
+
+    repos_spec: list = spec.get("repos", [])
+    fetch_spec: dict = spec.get("fetch", {})
+
+    # Generate repos in a sub-tempdir (separate from tmp_dir for clarity)
+    repos_tmpdir = tmp_dir / "git-repos"
+    repos_tmpdir.mkdir(parents=True, exist_ok=True)
+
+    repo_paths: dict = {}
+    repo_commit_shas: dict = {}  # name -> [sha_0, sha_1, ...]
+    try:
+        for repo_spec in repos_spec:
+            repo_dir, commit_shas = _make_git_protocol_repo(repos_tmpdir, repo_spec)
+            repo_paths[repo_spec["name"]] = repo_dir
+            repo_commit_shas[repo_spec["name"]] = commit_shas
+    except RuntimeError as e:
+        return ("fail", f"git repo generation failed: {e}")
+
+    # Resolve the target repo
+    repo_name = fetch_spec.get("repo_name", "")
+    if repo_name not in repo_paths:
+        return ("fail", f"fetch.repo_name {repo_name!r} not found in repos")
+
+    target_repo = repo_paths[repo_name]
+    # Use file:// URL so GitFetcher exercises the real git clone protocol path
+    file_url = f"file://{target_repo.resolve()}"
+    dep_name = fetch_spec.get("dep_name", "smoke")
+    ref = fetch_spec.get("ref", "main")
+    commit_sha = fetch_spec.get("commit_sha")  # may be None or "@repo:<n>:commit:<i>"
+
+    # H4: resolve "@repo:<name>:commit:<index>" references to the actual SHA
+    # captured during repo generation.  This is the mechanism that lets a fixture
+    # pin a non-tip commit without knowing its SHA statically.
+    if isinstance(commit_sha, str) and commit_sha.startswith("@repo:"):
+        parts = commit_sha.split(":")
+        # Expected format: @repo:<repo_name>:commit:<index>
+        if len(parts) == 4 and parts[2] == "commit":
+            ref_repo_name = parts[1]
+            try:
+                commit_index = int(parts[3])
+            except ValueError:
+                return ("fail", f"commit SHA reference {commit_sha!r}: index must be an integer")
+            sha_list = repo_commit_shas.get(ref_repo_name)
+            if sha_list is None:
+                return ("fail", f"commit SHA reference {commit_sha!r}: repo {ref_repo_name!r} not found")
+            if commit_index < 0 or commit_index >= len(sha_list):
+                return ("fail", f"commit SHA reference {commit_sha!r}: index {commit_index} out of range (repo has {len(sha_list)} commits)")
+            commit_sha = sha_list[commit_index]
+        else:
+            return ("fail", f"commit SHA reference {commit_sha!r}: expected format @repo:<name>:commit:<index>")
+
+    dest = tmp_dir / "_deps" / dep_name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    # Run the REAL GitFetcher.
+    # H3d: error-class fixtures (EXTRACT-SYMLINK-ESCAPE, FETCH-GIT-LFS-POINTER)
+    # expect the fetcher to raise a MilpaError with the declared slug.
+    from milpa.errors import MilpaError as _MilpaError
+
+    registry = FetcherRegistry()
+    registry.register(GitFetcher())
+    try:
+        result = registry.fetch(
+            dep_name,
+            GitProvenance(url=file_url, ref=ref, commit_sha=commit_sha),
+            dest=dest,
+        )
+    except _MilpaError as e:
+        if expected_error is not None:
+            if e.slug == expected_error:
+                return ("pass", "")
+            else:
+                return ("fail", f"expected error {expected_error!r}, got {e.slug!r}: {e}")
+        return ("fail", f"GitFetcher.fetch raised unexpected error {e.slug!r}: {e}")
+    except Exception as e:
+        if expected_error is not None:
+            return ("fail", f"expected error {expected_error!r}, got unexpected exception: {e}")
+        return ("fail", f"GitFetcher.fetch failed: {e}")
+
+    # Fetcher succeeded — if we expected an error, that's a failure.
+    if expected_error is not None:
+        return ("fail", f"expected error {expected_error!r} but GitFetcher.fetch succeeded")
+
+    # Compute content_hash of the materialized tree
+    try:
+        got_hash = compute_content_hash(dest)
+    except Exception as e:
+        return ("fail", f"compute_content_hash failed: {e}")
+
+    if got_hash != expected_hash:
+        return (
+            "fail",
+            f"content_hash mismatch:\n"
+            f"  expected: {expected_hash}\n"
+            f"  actual:   {got_hash}\n"
+            f"  (GitFetcher used file:// URL: {file_url!r})",
+        )
+
+    return ("pass", "")
+
+
+# ---------------------------------------------------------------------------
 # The in-process "execute" function — drives core functions directly
 # ---------------------------------------------------------------------------
 
@@ -456,6 +774,12 @@ def _execute_fixture(
     # CLI-only verb fixtures are driven by the black-box CLI harness.
     if fixture.is_cli_only:
         return ("skip", f"CLI-only verb {fixture.cmd!r}; skip in in-process adapter")
+
+    # H-infra: git-protocol fixtures run the REAL GitFetcher against generated
+    # local bare repos.  They have no milpa.kdl, mocked-fetches/, or index.kdl —
+    # dispatch before _build_env which would fail on those absences.
+    if fixture.cmd == "git-protocol":
+        return _execute_git_protocol_fixture(fixture, tmp_dir)
 
     # Import resolver / frozen lazily (they raise NotImplementedError now)
     from milpa.frozen import resolve_frozen, resolve_workspace_frozen
@@ -1390,6 +1714,8 @@ def _is_not_yet_wired(fx: Fixture) -> bool:
         return False  # marked skip, not xfail
     if fx.cmd == "parse-lockfile":
         return False  # fully wired
+    if fx.cmd == "git-protocol":
+        return False  # H-infra tier: wired via _execute_git_protocol_fixture
     # Explicit allowlist is the primary gate.
     fixture_name = fx.dir.name  # e.g. "fixture-003-single-url-dep"
     return fixture_name in _NOT_YET_WIRED_FIXTURE_NAMES

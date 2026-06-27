@@ -1,0 +1,27 @@
+{
+  "repos": [
+    {
+      "name": "mylib",
+      "commits": [
+        {
+          "files": {
+            "hello.nim": "hello milpa\n",
+            "stub.nimble": "# stub\n"
+          }
+        }
+      ],
+      "orphan_tip": {
+        "files": {
+          "added.nim": "# force-pushed replacement commit\n"
+        }
+      },
+      "ref": "main"
+    }
+  ],
+  "fetch": {
+    "dep_name": "mylib",
+    "repo_name": "mylib",
+    "ref": "main",
+    "commit_sha": "@repo:mylib:commit:0"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "repos": [
+    {
+      "name": "mylib",
+      "files": {
+        "safe.txt": "regular file\n",
+        "stub.nimble": "# stub\n"
+      },
+      "symlinks": {
+        "evil.lnk": "../../../../etc/passwd"
+      },
+      "ref": "main"
+    }
+  ],
+  "fetch": {
+    "dep_name": "mylib",
+    "repo_name": "mylib",
+    "ref": "main",
+    "commit_sha": null
+  }
+}

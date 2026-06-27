@@ -25,8 +25,9 @@ from pathlib import Path
 import pytest
 
 from milpa.cas import CAStore
-from milpa.errors import FETCH_ALL_FAILED, MilpaError
+from milpa.errors import FETCH_ALL_FAILED, FETCH_DOWNLOAD_SIZE_EXCEEDED, MilpaError
 from milpa.fetchers.cas_admitting import CasAdmittingFetcher
+from milpa.fetchers.safe_extract import Limits
 from milpa.fetchers.mocked import (
     GitProvenance,
     LocalProvenance,
@@ -509,3 +510,118 @@ class TestFetchAnyDelegation:
         assert not store.contains(result.identity), (
             "non-admissible dep must NOT be admitted into the CAS store"
         )
+
+
+# ---------------------------------------------------------------------------
+# R1-07 — CasAdmittingFetcher staged-tree stat (spec/plugin-contract.md §2.4.2)
+# ---------------------------------------------------------------------------
+#
+# NORMATIVE: after the inner fetcher stages bytes into scratch and BEFORE/AT
+# hashing, the CasAdmittingFetcher MUST walk the staged tree, sum regular-file
+# sizes, and raise FETCH-DOWNLOAD-SIZE-EXCEEDED if total > Limits.max_total_size.
+
+
+class _OversizedFakeRegistry(FetcherRegistry):
+    """An inner registry that writes more total bytes than ``cap`` into dest.
+
+    Used to exercise the R1-07 chokepoint stat in CasAdmittingFetcher.
+
+    Parameters
+    ----------
+    total_bytes:
+        Total bytes to write across all staged files (split evenly across
+        ``num_files`` files so no single file exceeds any single-file cap).
+    num_files:
+        Number of regular files to write (default 2).
+    """
+
+    def __init__(self, total_bytes: int, num_files: int = 2) -> None:
+        super().__init__()
+        self._total_bytes = total_bytes
+        self._num_files = num_files
+
+    def fetch(
+        self,
+        name: str,
+        provenance: Provenance,
+        *,
+        dest: Path,
+    ) -> FetchResult:
+        dest.mkdir(parents=True, exist_ok=True)
+        per_file = self._total_bytes // self._num_files
+        for i in range(self._num_files):
+            (dest / f"file{i}.dat").write_bytes(b"\x00" * per_file)
+        receipt = _SimpleReceipt(marker="oversized")
+        identity = compute_content_hash(dest)
+        return FetchResult(name=name, path=dest, identity=identity, receipt=receipt)
+
+
+class TestStagedTreeStatR107:
+    """R1-07: CasAdmittingFetcher must stat the staged tree and raise
+    FETCH-DOWNLOAD-SIZE-EXCEEDED when total uncompressed size exceeds the cap.
+
+    Spec authority: spec/plugin-contract.md §2.4.2 NORMATIVE.
+    """
+
+    def test_oversized_staged_tree_raises_fetch_download_size_exceeded(
+        self, tmp_path: Path, store: CAStore, deps_dir: Path
+    ) -> None:
+        """R1-07 (RED→GREEN): a staged tree exceeding Limits.max_total_size raises
+        FETCH-DOWNLOAD-SIZE-EXCEEDED at the CasAdmitting layer before hashing/admission.
+
+        The inner fetcher writes 1 000 bytes total; we set max_total_size=500 bytes.
+        The chokepoint stat must fire and raise FETCH-DOWNLOAD-SIZE-EXCEEDED.
+        """
+        cap = 500
+        limits = Limits(max_total_size=cap, max_file_size=cap * 2)
+        oversized_inner = _OversizedFakeRegistry(total_bytes=1_000, num_files=2)
+        prov = GitProvenance(url="https://example.com/oversized.git", ref="main")
+        cas_reg = CasAdmittingFetcher(oversized_inner, store, limits=limits)
+        dest = deps_dir / "oversized"
+
+        with pytest.raises(MilpaError) as exc_info:
+            cas_reg.fetch("oversized", prov, dest=dest)
+
+        assert exc_info.value.slug == FETCH_DOWNLOAD_SIZE_EXCEEDED, (
+            f"expected FETCH-DOWNLOAD-SIZE-EXCEEDED; got {exc_info.value.slug!r}"
+        )
+
+    def test_within_cap_staged_tree_is_admitted_normally(
+        self, tmp_path: Path, store: CAStore, deps_dir: Path
+    ) -> None:
+        """R1-07 (happy path): a staged tree within Limits.max_total_size is admitted normally."""
+        cap = 5_000
+        limits = Limits(max_total_size=cap, max_file_size=cap)
+        prov = GitProvenance(url="https://example.com/small.git", ref="main")
+        # Write 100 bytes total — well within the 5 000-byte cap.
+        inner = _FakeRegistry({prov: [("a.nim", b"\x00" * 50), ("b.nim", b"\x00" * 50)]})
+        cas_reg = CasAdmittingFetcher(inner, store, limits=limits)
+        dest = deps_dir / "small"
+
+        result = cas_reg.fetch("small", prov, dest=dest)
+
+        assert dest.is_symlink(), "dest must be a symlink for a successful cas-admissible fetch"
+        assert store.contains(result.identity)
+
+    def test_non_admissible_path_not_stat_checked(
+        self, tmp_path: Path, store: CAStore, deps_dir: Path
+    ) -> None:
+        """R1-07: the stat check is ONLY applied to the cas-admissible (scratch) path.
+
+        A non-admissible (local) provenance that stages an oversized tree must NOT
+        raise FETCH-DOWNLOAD-SIZE-EXCEEDED — the check only gates CAS admission.
+        """
+        cap = 500
+        limits = Limits(max_total_size=cap, max_file_size=cap * 2)
+        prov = LocalProvenance(path=tmp_path / "local_src")
+        (tmp_path / "local_src").mkdir()
+        # Total 1 000 bytes — exceeds cap, but non-admissible path skips the stat.
+        oversized_inner = _OversizedFakeRegistry(total_bytes=1_000, num_files=2)
+        cas_reg = CasAdmittingFetcher(oversized_inner, store, limits=limits)
+        dest = deps_dir / "local_oversized"
+
+        # Must NOT raise — non-admissible path bypasses the chokepoint stat.
+        result = cas_reg.fetch("local_oversized", prov, dest=dest)
+
+        assert not dest.is_symlink(), "non-admissible fetch must produce a real directory"
+        assert result is not None

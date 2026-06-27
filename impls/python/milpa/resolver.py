@@ -68,7 +68,7 @@ from milpa.errors import (
     TNG_NO_IDENTITY,
     MilpaError,
 )
-from milpa.fetchers.git import GitProvenance
+from milpa.fetchers.git import GitProvenance, GitReceipt
 from milpa.fetchers.local import LocalProvenance
 from milpa.fetchers.tarball import TarballProvenance
 from milpa.fetchers.types import Provenance
@@ -327,6 +327,12 @@ class _Candidate:
     # predicates (a dep in ≥2 when-branches yields ≥2 list entries).
     # Never consulted for selection/solving. Empty for root/synthetic candidates.
     requires_predicates: dict[str, list[tuple[Predicate, ...]]] = field(default_factory=dict)
+    # R1-04: submodule SHA provenance map from the GitReceipt (H5).
+    # Maps submodule POSIX path (relative to dep root) → 40-hex gitlink SHA.
+    # Empty for non-git deps and git deps with no submodules.
+    # Populated by _process_url_worker from receipt.submodule_shas so that
+    # _build_graph can wire it into GitProvenanceRecord(submodule_shas=...).
+    submodule_shas: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -2725,6 +2731,13 @@ def _process_url_worker(
     src_dir = es.src_dir
 
     commit_sha: str | None = result.receipt.transport_fields().get("commit_sha")
+    # R1-04: read submodule_shas directly from the GitReceipt (not transport_fields,
+    # which only returns commit_sha and drops submodule provenance).
+    submodule_shas: dict[str, str] = (
+        result.receipt.submodule_shas
+        if isinstance(result.receipt, GitReceipt)
+        else {}
+    )
 
     candidate = _Candidate(
         name=dep.name,
@@ -2738,6 +2751,8 @@ def _process_url_worker(
         # D-lifecycle: declared mirrors (all manifest+prior declared URLs != observed).
         declared_mirror_urls=declared_mirror_urls,
         requires_predicates=requires_predicates,
+        # R1-04: submodule SHA provenance from the GitReceipt (H5).
+        submodule_shas=submodule_shas,
     )
 
     # Collect transitive deps for the BFS queue (returned to caller for enqueuing).
@@ -3278,6 +3293,8 @@ def _build_graph(
                 url=cand.provenance.url,
                 ref=cand.provenance.ref,
                 commit_sha=cand.provenance.commit_sha,
+                # R1-04: wire submodule_shas from _Candidate into the lockfile record.
+                submodule_shas=cand.submodule_shas,
                 origin="observed",
             )
         elif isinstance(cand.provenance, LP):

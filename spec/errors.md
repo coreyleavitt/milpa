@@ -70,6 +70,12 @@ A `_deps/<name>` symlink resolves to a CAS store entry but reading that entry ra
 
 ## EXTRACT
 
+### `EXTRACT-IO-ERROR`
+
+A filesystem read or write during extraction failed for an I/O reason unrelated to a path-escape or size-cap violation (e.g. a hardlink target that cannot be read back, or a blob write that fails mid-extraction).
+
+**Triggered:** `extract_tar` / `materialize-git-tree` performs a filesystem operation that fails with an OS I/O error after the entry has already passed the path-containment and size checks. Distinct from `EXTRACT-ZIP-SLIP` (a path-escape *attack*) — an I/O error MUST NOT be reported as a security escape, because the two demand different operator responses.
+
 ### `EXTRACT-SIZE-LIMIT`
 
 The archive exceeds a configured size or file-count limit (decompression bomb protection).
@@ -102,6 +108,12 @@ Could not download the tarball from the declared URL.
 
 **Triggered:** TarballFetcher._download raises URLError, FileNotFoundError, or OSError.
 
+### `FETCH-DOWNLOAD-SIZE-EXCEEDED`
+
+The download was aborted because the compressed response body exceeded the configured cap (`MAX_COMPRESSED_BYTES`). Raised instead of `FETCH-DOWNLOAD-FAILED` so a security size-cap rejection is not conflated with a network failure.
+
+**Triggered:** (1) `make_http_get` (Python) or `with_curl` (Rust) reads more than `MAX_COMPRESSED_BYTES` bytes from the HTTP transport before the full response arrives — the connection is aborted and no further bytes are buffered. Also raised by the post-read safety-net check in `TarballFetcher.fetch` when an injected transport returns a byte slice exceeding the cap. (2) The admission chokepoint (`CasAdmittingFetcher`) stats the staged tree before hashing and the total uncompressed size exceeds `Limits.max_total_size` (`plugin-contract.md §2.4.2`) — this bounds on-disk size for every fetcher, including transports that bypass the streaming HTTP cap.
+
 ### `FETCH-EXTRACT-FAILED`
 
 Safe extraction of the tarball raised an ExtractionError.
@@ -119,6 +131,20 @@ The index-pinned commit SHA is absent even after a full history fetch.
 A git subprocess (clone/fetch/checkout) exited non-zero.
 
 **Triggered:** _run_git receives a non-zero exit code from git.
+
+### `FETCH-GIT-LFS-POINTER`
+
+A blob in the git object store is a Git LFS pointer — its first line is exactly `version https://git-lfs.github.com/spec/v1`.
+
+milpa reads the git object store directly and cannot fetch LFS blobs; the tree would be incomplete. The dep must be vendored as a plain-git mirror or fetched via a `local=` path.
+
+**Triggered:** `materialize_git_tree` reads a blob whose first line is exactly `version https://git-lfs.github.com/spec/v1`. Carries `path=<relpath>` identifying the pointer file.
+
+### `FETCH-GIT-SUBMODULE-FAILED`
+
+A `.gitmodules` submodule entry could not be resolved or its object store could not be fetched. The superproject's tree is incomplete without the submodule content.
+
+**Triggered:** `materialize_git_tree` finds a mode-160000 gitlink, reads the corresponding entry from `.gitmodules`, resolves its URL (absolute pass-through; relative `../` / `./` resolved against the superproject's provenance URL), and either (a) the entry is absent or malformed in `.gitmodules`, or (b) the submodule clone/fetch fails. Carries `submodule_path=<relpath>` and `submodule_url=<resolved-url>`.
 
 ### `FETCH-LOCAL-PATH-NOT-DIR`
 
@@ -431,6 +457,12 @@ Unknown provenance `kind` value.
 A dep's `src_dir` value in the lockfile contains an unsafe character (ASCII control character 0x00–0x1F, 0x7F, or Unicode line separator U+2028/U+2029).
 
 **Triggered:** The lockfile parse boundary validates `src_dir` against the same unsafe-char predicate as the manifest parse (`MAN-SRC-DIR-UNSAFE`).  A poisoned `milpa.lock` with a newline or control character in `src_dir` would otherwise flow to `nim.cfg --path:` on frozen reconstruction.  Both impls validate at the lockfile parse boundary so all consumers (`verify`, `frozen`, `show`) are covered.
+
+### `LOCK-SUBMODULE-FIELD-INVALID`
+
+A `submodule "<path>" sha="<40hex>"` child node in a `git` provenance block is structurally malformed (wrong argument count, non-string path, or missing/invalid `sha=` property).
+
+**Triggered:** The lockfile parse boundary reads a `submodule` node whose shape violates `spec/lockfile-schema.md §4.1`. Distinct from `LOCK-PROV-FIELD-ARITY` (which covers scalar provenance-field arity) so a malformed submodule node is not conflated with a scalar-field error.
 
 ### `LOCK-VERSION-MISSING`
 

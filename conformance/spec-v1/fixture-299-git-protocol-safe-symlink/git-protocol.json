@@ -1,0 +1,21 @@
+{
+  "repos": [
+    {
+      "name": "mylib",
+      "files": {
+        "target.txt": "target content\n",
+        "stub.nimble": "# stub\n"
+      },
+      "symlinks": {
+        "link.txt": "target.txt"
+      },
+      "ref": "main"
+    }
+  ],
+  "fetch": {
+    "dep_name": "mylib",
+    "repo_name": "mylib",
+    "ref": "main",
+    "commit_sha": null
+  }
+}

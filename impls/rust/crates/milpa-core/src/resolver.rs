@@ -2106,6 +2106,8 @@ impl<'a> ResolveProvider<'a> {
                 ref_spec: opt(&dep.git_ref),
                 commit_sha: commit,
                 origin: "observed".to_string(),
+                // R1-04: wire submodule SHAs from the Receipt (no longer discarded).
+                submodule_shas: receipt.submodule_shas.clone(),
             }),
             // D-lifecycle: all candidate URLs except the observed one.
             declared_mirror_urls,
@@ -3063,6 +3065,7 @@ impl<'a> ResolveProvider<'a> {
                                 ref_spec: ref_spec.clone(),
                                 commit_sha: None, // declared = unverified
                                 origin: "declared".to_string(),
+                                submodule_shas: vec![],
                             });
                         }
                         provs
@@ -3619,6 +3622,12 @@ fn git_prov(url: &str, git_ref: &str, commit_sha: Option<String>) -> Provenance 
 /// convention). The non-transport `Member`/`Registry` records have no transport
 /// source, so they are produced directly (workspace resolve / lockfile read),
 /// never through this map.
+///
+/// The `Git` arm intentionally emits `submodule_shas: vec![]` — the named-dep
+/// / registry code path does not perform a raw git fetch (no `fetch_git` call),
+/// so there are no submodule gitlinks to record.  Submodule SHAs are populated
+/// only by the `fetch_git` → `materialize_git_tree` path in `resolver.rs`
+/// (direct git= deps), not here.
 fn transport_to_record(p: &Provenance) -> ProvenanceRecord {
     match p {
         Provenance::Git {
@@ -3630,6 +3639,7 @@ fn transport_to_record(p: &Provenance) -> ProvenanceRecord {
             ref_spec: opt(ref_spec),
             commit_sha: commit_sha.clone(),
             origin: "observed".to_string(),
+            submodule_shas: vec![],
         },
         Provenance::Tarball {
             url,

@@ -37,6 +37,12 @@ pub enum Cmd {
     /// not model — they are driven exclusively by the black-box CLI harness
     /// (`harness/`). The in-process corpus runner SKIPS them (not a failure).
     CliOnly,
+    /// H-infra: git-protocol fixture tier. The runner generates local bare
+    /// repos at test time, runs the REAL `fetch_git` against `file://` URLs,
+    /// and asserts `content_hash` matches `expected/content_hash`.
+    /// Distinct from both the static corpus (MockedFetcher) and the
+    /// `MILPA_INTEGRATION_TESTS=1` network tier.
+    GitProtocol,
 }
 
 impl Cmd {
@@ -52,6 +58,9 @@ impl Cmd {
                     "frozen" => Cmd::Frozen,
                     "verify" => Cmd::Verify,
                     "resolve" | "" => Cmd::Resolve,
+                    // H-infra: git-protocol fixtures run the REAL fetcher against
+                    // generated local bare repos (no milpa.kdl / mocked-fetches/).
+                    "git-protocol" => Cmd::GitProtocol,
                     // Mutation (§2.7.1) + liveness (§2.7.2) selectors: CLI-only.
                     // check-certificate (§2.7.3): also CLI-only (--certificate flag).
                     // workspace (S10 D4): add-member/remove-member are CLI-only.

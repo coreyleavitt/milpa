@@ -222,6 +222,7 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
             ref_spec: None,
             commit_sha: None,
             origin: "declared".to_string(),
+            submodule_shas: vec![],
         });
     }
 
@@ -314,10 +315,71 @@ fn parse_cond_require(node: &KdlNode) -> Option<milpa_types::CondRequire> {
 /// Parse a `provenance { kind "…" … }` block (lockfile-schema §4). Each child
 /// node MUST carry exactly one value (`LOCK-PROV-FIELD-ARITY`); the `kind`
 /// discriminator selects the record shape and which fields are required.
+///
+/// H5: `submodule "<path>" sha="<40hex>"` child nodes are collected separately
+/// (1 positional arg + `sha=` property); they do NOT participate in the flat
+/// one-value-per-field rule and are only meaningful for `kind "git"`.
 fn parse_provenance(node: &KdlNode, dep_name: &str) -> LockResult<ProvenanceRecord> {
     // Collect each child's single value (last-wins, mirroring the Python dict).
+    // H5: `submodule` nodes are collected separately.
     let mut fields: Vec<(&str, String)> = Vec::new();
+    let mut submodule_shas: Vec<(String, String)> = Vec::new();
     for child in children(node) {
+        if child.name().value() == "submodule" {
+            // submodule "<path>" sha="<40hex>"
+            // Structural validation: exactly one positional string arg (path) and
+            // a `sha=` property with a string value are required.  Any deviation
+            // raises LOCK-SUBMODULE-FIELD-INVALID (distinct from the scalar-field
+            // arity code used by other provenance child nodes).
+            let a = args(child);
+            // Wrong arg count (not exactly 1) or non-string first arg.
+            let sub_path = match a.as_slice() {
+                [entry] => match entry.value().as_string() {
+                    Some(s) => s.to_string(),
+                    None => {
+                        return Err(err(
+                            "LOCK-SUBMODULE-FIELD-INVALID",
+                            format!(
+                                "dep {dep_name:?}: submodule path must be a string \
+                                 (got a non-string value)"
+                            ),
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(err(
+                        "LOCK-SUBMODULE-FIELD-INVALID",
+                        format!(
+                            "dep {dep_name:?}: submodule node requires exactly one \
+                             positional string argument (the path); got {}",
+                            a.len()
+                        ),
+                    ));
+                }
+            };
+            // Missing or non-string sha= property.
+            let sub_sha = child
+                .entries()
+                .iter()
+                .find(|e| e.name().map(|n| n.value()) == Some("sha"))
+                .and_then(|e| e.value().as_string())
+                .map(|s| s.to_string());
+            let sub_sha = match sub_sha {
+                Some(s) => s,
+                None => {
+                    return Err(err(
+                        "LOCK-SUBMODULE-FIELD-INVALID",
+                        format!(
+                            "dep {dep_name:?}: submodule {:?} missing required \
+                             sha= property (or sha= is not a string)",
+                            sub_path
+                        ),
+                    ));
+                }
+            };
+            submodule_shas.push((sub_path, sub_sha));
+            continue;
+        }
         let a = args(child);
         let [entry] = a.as_slice() else {
             return Err(err(
@@ -334,6 +396,8 @@ fn parse_provenance(node: &KdlNode, dep_name: &str) -> LockResult<ProvenanceReco
             fields.push((child.name().value(), s.to_string()));
         }
     }
+    // Ensure path-sorted order (matches lockfile-schema §4.1 normative order).
+    submodule_shas.sort_by(|a, b| a.0.cmp(&b.0));
 
     let get = |key: &str| -> Option<String> {
         fields
@@ -368,6 +432,7 @@ fn parse_provenance(node: &KdlNode, dep_name: &str) -> LockResult<ProvenanceReco
             ref_spec: get("ref"),
             commit_sha: get("commit_sha"),
             origin,
+            submodule_shas,
         }),
         "tarball" => Ok(ProvenanceRecord::Tarball {
             url: required("url")?,
@@ -712,6 +777,7 @@ fn format_provenance_fields(p: &ProvenanceRecord) -> Vec<String> {
             ref_spec,
             commit_sha,
             origin,
+            submodule_shas,
         } => {
             out.push(format!("origin {}", kdl_str(origin)));
             out.push(format!("kind {}", kdl_str("git")));
@@ -721,6 +787,14 @@ fn format_provenance_fields(p: &ProvenanceRecord) -> Vec<String> {
             }
             if let Some(c) = commit_sha {
                 out.push(format!("commit_sha {}", kdl_str(c)));
+            }
+            // H5: emit submodule nodes path-sorted (lockfile-schema §4.1).
+            for (sub_path, sub_sha) in submodule_shas {
+                out.push(format!(
+                    "submodule {} sha={}",
+                    kdl_str(sub_path),
+                    kdl_str(sub_sha)
+                ));
             }
         }
         ProvenanceRecord::Tarball { url, sha256, origin } => {
@@ -1350,6 +1424,7 @@ mod tests {
                 ref_spec: Some("main".into()),
                 commit_sha: None,
                 origin: "observed".into(),
+                submodule_shas: vec![],
             }]
         );
     }
@@ -1491,6 +1566,27 @@ mod tests {
             code_of("version 1\ndep \"foo\" {\n    provenance {\n        kind \"git\"\n        ref \"main\"\n    }\n}\n"),
             "LOCK-PROV-FIELD-MISSING"
         );
+        // LOCK-SUBMODULE-FIELD-INVALID: submodule node with zero args (missing path).
+        assert_eq!(
+            code_of(
+                "version 1\ndep \"foo\" {\n    provenance {\n        kind \"git\"\n        \
+                 url \"https://e/x.git\"\n        submodule sha=\"abc\"\n    }\n}\n"
+            ),
+            "LOCK-SUBMODULE-FIELD-INVALID"
+        );
+        // LOCK-SUBMODULE-FIELD-INVALID: submodule node missing sha= property.
+        assert_eq!(
+            code_of(
+                "version 1\ndep \"foo\" {\n    provenance {\n        kind \"git\"\n        \
+                 url \"https://e/x.git\"\n        submodule \"vendor/lib\"\n    }\n}\n"
+            ),
+            "LOCK-SUBMODULE-FIELD-INVALID"
+        );
+        // Scalar-field arity errors still use LOCK-PROV-FIELD-ARITY (not the new slug).
+        assert_eq!(
+            code_of("version 1\ndep \"foo\" {\n    provenance {\n        kind \"git\" \"extra\"\n    }\n}\n"),
+            "LOCK-PROV-FIELD-ARITY"
+        );
     }
 
     // --- emit (S5b) ---
@@ -1512,6 +1608,7 @@ mod tests {
                     ref_spec: Some("main".into()),
                     commit_sha: Some("deadbeef".into()),
                     origin: "observed".into(),
+                    submodule_shas: vec![],
                 }],
                 active_flags: vec!["ssl".into()],
                 dep_decl: None,
@@ -1617,6 +1714,7 @@ mod tests {
                     ref_spec: None,
                     commit_sha: None,
                     origin: "observed".into(),
+                    submodule_shas: vec![],
                 }],
                 active_flags: vec![],
                 dep_decl: None,
@@ -1666,6 +1764,7 @@ mod tests {
                     ref_spec: Some(with_newline_and_tab.into()),
                     commit_sha: None,
                     origin: "observed".into(),
+                    submodule_shas: vec![],
                 }],
                 active_flags: vec![],
                 dep_decl: None,
@@ -1793,6 +1892,7 @@ mod tests {
             ref_spec: opt(ref_spec),
             commit_sha: sha.map(String::from),
             origin: "observed".into(),
+            submodule_shas: vec![],
         }
     }
 
@@ -1895,6 +1995,7 @@ mod tests {
                 ref_spec: Some("main".into()),
                 commit_sha: Some("abc123".into()),
                 origin: "observed".into(),
+                submodule_shas: vec![],
             }]
         );
         assert_eq!(
@@ -1943,6 +2044,7 @@ mod tests {
                 ref_spec: None,
                 commit_sha: None,
                 origin: "observed".into(),
+                submodule_shas: vec![],
             }]
         );
     }
@@ -2022,6 +2124,7 @@ mod tests {
                 ref_spec: None,
                 commit_sha: None,
                 origin: "observed".into(),
+                submodule_shas: vec![],
             }],
             active_flags: vec![],
             dep_decl: None,
@@ -2369,12 +2472,14 @@ mod tests {
                     ref_spec: Some("main".into()),
                     commit_sha: Some("deadbeef1234567890deadbeef1234567890dead".into()),
                     origin: "observed".into(),
+                    submodule_shas: vec![],
                 },
                 ProvenanceRecord::Git {
                     url: "https://mirror.example.com/foo-mirror.git".into(),
                     ref_spec: None,
                     commit_sha: None,
                     origin: "declared".into(),
+                    submodule_shas: vec![],
                 },
             ],
             active_flags: vec![],
@@ -2495,6 +2600,7 @@ mod tests {
                     ref_spec: None,
                     commit_sha: None,
                     origin: "declared".into(),  // only declared, never observed
+                    submodule_shas: vec![],
                 }],
                 active_flags: vec![],
                 dep_decl: None,
@@ -2551,6 +2657,7 @@ mod tests {
                 ref_spec: None,
                 commit_sha: None,
                 origin: "observed".into(),
+                submodule_shas: vec![],
             }],
             active_flags: vec![],
             dep_decl: None,
@@ -3008,6 +3115,7 @@ mod tests {
                 ref_spec: None,
                 commit_sha: None,
                 origin: "observed".into(),
+                submodule_shas: vec![],
             }],
             active_flags: vec![],
             dep_decl: None,
@@ -3055,6 +3163,7 @@ mod tests {
                 ref_spec: None,
                 commit_sha: None,
                 origin: "observed".into(),
+                submodule_shas: vec![],
             }],
             active_flags: vec!["ssl".into()],
             dep_decl: None,
@@ -3353,6 +3462,7 @@ mod tests {
             ref_spec: Some("main".into()),
             commit_sha: Some("abc123".into()),
             origin: origin.into(),
+            submodule_shas: vec![],
         }
     }
 
