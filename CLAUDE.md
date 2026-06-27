@@ -227,8 +227,7 @@ The Python impl is uv-managed from `impls/python/` (run these from there):
 ```bash
 cd impls/python
 uv sync                    # install milpa + dev deps (pytest, hypothesis)
-uv run pytest              # unit tests (~11 sec)
-MILPA_INTEGRATION_TESTS=1 uv run pytest tests/test_integration.py   # gated network tests
+uv run pytest              # unit + conformance + H-infra git tier (~90 sec)
 uv run python -m milpa --help                          # invoke CLI
 uv run python -m milpa -C <project_dir> fetch          # fetch in some other project
 ```
@@ -267,8 +266,12 @@ Toolchain expectations:
 - Example tests for specific behaviors (in `tests/test_*.py`)
 - Property tests for algebraic / round-trip properties (in
   `tests/test_*_properties.py`) — Hypothesis with KDL-safe alphabets
-- Integration tests gated by `MILPA_INTEGRATION_TESTS=1` (real network
-  against real github URLs; uses fresco's actual dep tree as fixture)
+- **H-infra git-protocol tier** (in `tests/test_conformance.py`): the real
+  `GitFetcher` is run against *generated local* bare repos via `file://`
+  URLs — real git, no network. This replaced the retired real-network
+  `test_integration.py` (deleted in the clean-room swap `5ae87ad`). There is
+  **no `MILPA_INTEGRATION_TESTS` network suite** anymore (only a stale comment
+  references the env var). See `docs/rfc-fetch-extraction-hardening.md`.
 - No mocking. Tests use real subprocess for git, real Hypothesis,
   fakes injected as kwargs (`fetcher`, `index`/`index_loader`)
   for unit tests where network would be undesirable.
@@ -286,17 +289,27 @@ swapped in: `impls/python/` IS the rewrite; the frozen design-vehicle impl is de
 `spec/errors.md` is spec-owned (not generated from any impl); harness runs `python` +
 `rust` with zero cross-impl divergence.
 
-## Real fresco verification
+## Real fresco verification (manual, on-demand smoke test)
 
-milpa is verified end-to-end against fresco's real dep tree:
-- fresco's `milpa.kdl` declares `intonaco git=... ref=main`
-- intonaco's `intonaco.nimble` requires chronos (URL) + transitives (named)
-- `milpa fetch` resolves 7 deps (intonaco, chronos, results, stew,
-  bearssl, httputils, unittest2) in ~5 seconds via parallel fetch
-- Lockfile records every dep with sha + content_hash
-- `milpa verify` confirms _deps/ matches the lockfile
+There is no automated real-network fixture (see Testing patterns above). When
+network is available, validate end-to-end against fresco's real dep tree by
+hand — a temp project with the real `intonaco` git dep:
 
-This is the integration test suite's primary fixture. Don't break it.
+```bash
+cd impls/python
+# milpa.kdl: deps { intonaco git=(url)"https://github.com/coreyleavitt/intonaco.git" ref="main" }
+uv run python -m milpa -C <tmp> fetch    # resolves 7 deps: intonaco, chronos,
+                                         # results, stew, bearssl, httputils, unittest2
+uv run python -m milpa -C <tmp> verify   # re-hashes _deps/ against the lockfile
+```
+
+- intonaco's `intonaco.nimble` requires chronos (URL) + transitives (named).
+- Lockfile records every dep with a `sha256` content-hash identity.
+- `verify` confirms the object-store-materialized `_deps/` matches the lockfile.
+
+Last run green 2026-06-27 against the object-store materialization. This is the
+canonical real-world exercise of the realistic-size git path that the (tiny)
+conformance fixtures don't cover (gap tracked in #177).
 
 ## Anti-priorities
 
