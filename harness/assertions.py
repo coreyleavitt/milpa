@@ -79,19 +79,38 @@ def normalize_deps_structure(scratch_dir: str, cas_dir: str) -> Optional[str]:
     # Ensure no trailing slash in the prefix.
     canonical_cas = canonical_cas.rstrip("/")
 
-    lines = []
-    for entry in sorted(deps_dir.iterdir()):
+    def _entry_lines(entry: Path, prefix: str = "") -> list[str]:
+        """Return normalized line(s) for a single _deps/ entry.
+
+        For bare deps (symlinks), return one line ``<name> -> <CAS_ROOT>/…/``.
+        For namespace directories (``@<ns>/``), recurse one level and return
+        one line per child using the compound key ``@<ns>/<child>``.
+        """
         if entry.is_symlink():
             target = entry.resolve()
             target_str = str(target)
+            label = f"{prefix}{entry.name}"
             if target_str.startswith(canonical_cas):
                 normalized = target_str.replace(canonical_cas, "<CAS_ROOT>")
-                lines.append(f"{entry.name} -> {normalized}/")
+                return [f"{label} -> {normalized}/"]
             else:
                 # Slice C c2: a local dep symlinks directly to a working tree
-                # outside the CAS; its absolute path is non-reproducible, so the
-                # normative surface is just "(symlink)" (spec §2.6 / fixture-181).
-                lines.append(f"{entry.name} -> (symlink)")
+                # outside the CAS; its absolute path is non-reproducible, so
+                # the normative surface is just "(symlink)" (spec §2.6 / fixture-181).
+                return [f"{label} -> (symlink)"]
+        elif entry.is_dir() and entry.name.startswith("@"):
+            # Namespace directory (C1 on-disk layout: ``_deps/@<ns>/<name>``).
+            # Emit one line per child, keyed as ``@<ns>/<child>``.
+            result = []
+            ns_prefix = f"{entry.name}/"
+            for child in sorted(entry.iterdir()):
+                result.extend(_entry_lines(child, prefix=ns_prefix))
+            return result
+        return []
+
+    lines = []
+    for entry in sorted(deps_dir.iterdir()):
+        lines.extend(_entry_lines(entry))
 
     if not lines:
         return ""

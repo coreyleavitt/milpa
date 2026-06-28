@@ -283,19 +283,26 @@ class TestUrlDepParse:
         assert dep.ref == "main"
 
     def test_url_dep_http_scheme(self) -> None:
-        text = 'name "x"\ndeps {\n    foo git="http://example.com/foo.git" ref="main"\n}\n'
+        text = 'name "x"\ndeps {\n    foo git=(url)"http://example.com/foo.git" ref="main"\n}\n'
         m = parse_manifest(text)
         assert isinstance(m.deps[0], UrlDep)
 
     def test_url_dep_ssh_scheme(self) -> None:
-        text = 'name "x"\ndeps {\n    foo git="ssh://git@github.com/x/y.git" ref="v1"\n}\n'
+        text = 'name "x"\ndeps {\n    foo git=(url)"ssh://git@github.com/x/y.git" ref="v1"\n}\n'
         m = parse_manifest(text)
         assert isinstance(m.deps[0], UrlDep)
 
     def test_url_dep_git_scheme(self) -> None:
-        text = 'name "x"\ndeps {\n    foo git="git://github.com/x/y.git" ref="v1"\n}\n'
+        text = 'name "x"\ndeps {\n    foo git=(url)"git://github.com/x/y.git" ref="v1"\n}\n'
         m = parse_manifest(text)
         assert isinstance(m.deps[0], UrlDep)
+
+    def test_url_dep_plain_string_raises_man_url_arg_type(self) -> None:
+        """S3 strict: plain string git= URL raises MAN-URL-ARG-TYPE."""
+        from milpa.errors import MAN_URL_ARG_TYPE, MilpaError
+        with pytest.raises(MilpaError) as exc_info:
+            parse_manifest('name "x"\ndeps {\n    foo git="https://example.com/foo.git" ref="main"\n}\n')
+        assert exc_info.value.slug == MAN_URL_ARG_TYPE
 
     def test_ref_missing_raises_corpus(self) -> None:
         """Corpus fixture 015: MAN-DEP-REF-MISSING."""
@@ -395,9 +402,9 @@ class TestUrlDepParse:
         expected = fixture_error("fixture-028-man-dep-flag-bool")
         assert_slug(text, expected)
 
-    def test_plain_string_git_url_accepted(self) -> None:
-        """The spec requires both plain string and (url)-annotated forms."""
-        text = 'name "x"\ndeps {\n    foo git="https://a/foo.git" ref="main"\n}\n'
+    def test_url_annotated_git_url_accepted(self) -> None:
+        """S3: (url)-annotated form is required for git= URLs."""
+        text = 'name "x"\ndeps {\n    foo git=(url)"https://a/foo.git" ref="main"\n}\n'
         m = parse_manifest(text)
         assert isinstance(m.deps[0], UrlDep)
         assert m.deps[0].git == "https://a/foo.git"
@@ -492,18 +499,18 @@ class TestTarballDepParse:
         assert isinstance(dep, TarballDep)
         assert dep.strip_components == 1
 
-    def test_tarball_plain_url_accepted(self) -> None:
-        """Plain string (not (url)-annotated) must also be accepted."""
+    def test_tarball_plain_url_raises_man_url_arg_type(self) -> None:
+        """S3 strict: plain string tarball= URL raises MAN-URL-ARG-TYPE."""
+        from milpa.errors import MAN_URL_ARG_TYPE, MilpaError
         text = textwrap.dedent("""\
             name "x"
             deps {
                 foo tarball="https://example.com/foo.tar.gz"
             }
         """)
-        m = parse_manifest(text)
-        dep = m.deps[0]
-        assert isinstance(dep, TarballDep)
-        assert dep.url == "https://example.com/foo.tar.gz"
+        with pytest.raises(MilpaError) as exc_info:
+            parse_manifest(text)
+        assert exc_info.value.slug == MAN_URL_ARG_TYPE
 
     def test_tarball_url_empty_corpus(self) -> None:
         """Corpus fixture 017: MAN-DEP-TARBALL-URL (empty string)."""
@@ -837,8 +844,24 @@ class TestMirrorsParse:
         assert dep.mirrors[0] == "https://backup1/foo.git"
         assert dep.mirrors[1] == "https://backup2/foo.git"
 
-    def test_url_dep_plain_string_mirror(self) -> None:
-        """Plain string mirror (no (url) annotation) is accepted per §2."""
+    def test_url_dep_annotated_mirror_accepted(self) -> None:
+        """S3: (url)-annotated mirror is accepted."""
+        text = textwrap.dedent("""\
+            name "x"
+            deps {
+                foo git=(url)"https://a/foo.git" ref="main" {
+                    mirror (url)"https://b/foo.git"
+                }
+            }
+        """)
+        m = parse_manifest(text)
+        dep = m.deps[0]
+        assert isinstance(dep, UrlDep)
+        assert dep.mirrors == ("https://b/foo.git",)
+
+    def test_url_dep_plain_string_mirror_raises_man_url_arg_type(self) -> None:
+        """S3 strict: plain string mirror raises MAN-URL-ARG-TYPE."""
+        from milpa.errors import MAN_URL_ARG_TYPE, MilpaError
         text = textwrap.dedent("""\
             name "x"
             deps {
@@ -847,10 +870,9 @@ class TestMirrorsParse:
                 }
             }
         """)
-        m = parse_manifest(text)
-        dep = m.deps[0]
-        assert isinstance(dep, UrlDep)
-        assert dep.mirrors == ("https://b/foo.git",)
+        with pytest.raises(MilpaError) as exc_info:
+            parse_manifest(text)
+        assert exc_info.value.slug == MAN_URL_ARG_TYPE
 
     def test_dep_mirror_arity_corpus(self) -> None:
         """Corpus fixture 025: MAN-DEP-MIRROR-ARITY (mirror with no arg)."""

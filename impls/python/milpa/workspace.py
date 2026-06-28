@@ -46,6 +46,7 @@ Error codes raised here (WS-* and file-level MAN-*/NIMBLE-*):
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -163,37 +164,85 @@ def load_or_discover_manifest(project_dir: Path) -> Manifest:
 
 
 # ---------------------------------------------------------------------------
-# Internal helper: member-path containment check (Option A — follows symlinks)
+# Internal helper: best-effort path resolution (spec §11.0 — S4, #168)
 # ---------------------------------------------------------------------------
 
 
-def _member_path_is_under_root(workspace_root: Path, rel_path: str) -> bool:
-    """Return True if the member path resolves to within the workspace root.
+def _best_effort_resolve(path: Path) -> Path:
+    """Resolve a path, stopping at the longest *stat-existing* prefix.
 
-    Implements the Option-A semantics shared with the Rust impl:
-      1. Resolve ``workspace_root`` (always exists) to its real path.
-      2. Resolve the candidate using ``Path.resolve(strict=False)`` —
-         ``strict=False`` follows symlinks for the portions that exist and
-         normalizes ``..`` components lexically for the rest.  This means:
-         - An existing member symlink whose target is outside the root is
-           caught because ``resolve()`` follows it to the real location.
-         - A non-existent path like ``../../escape`` is still caught because
-           the lexical ``..``-normalization escapes the root.
-         - A non-existent path like ``pkg`` (inside the workspace) is NOT a
-           false escape — it proceeds to ``WS-MEMBER-DIR-MISSING``.
-      3. Return ``real_cand.is_relative_to(real_root)`` — **inclusive**:
-         a path that resolves TO the root returns True (not an escape),
-         which lets it fall through to the ``WS-MEMBER-IS-WORKSPACE``
-         manifest-parse check.
+    Unlike ``Path.resolve(strict=False)``, this function treats **dangling and
+    cyclic symlinks as non-existent** by using ``os.stat()`` (which follows
+    symlinks) rather than ``os.lstat()`` to determine which prefix exists:
 
-    Note: ``Path.resolve()`` without ``strict`` (Python 3.6+) is equivalent
-    to ``resolve(strict=False)`` — it never raises even for non-existent paths.
+    - An existing symlink whose target resolves to a real path is fully
+      canonicalized (``Path.resolve(strict=True)`` on the full path).
+    - A dangling symlink (target absent) or cyclic symlink (ELOOP) causes
+      ``os.stat()`` to fail, so the symlink itself is excluded from the
+      "longest existing prefix."  The result is ``canonical_parent / symlink_name``
+      — i.e. the path stays inside its parent directory, not following the link.
+
+    Algorithm (mirrors Rust ``best_effort_resolve`` with stat-not-lstat, spec §11.0):
+    1. Try ``path.stat()`` (follows symlinks).  If it succeeds, the path fully
+       exists; return ``path.resolve(strict=True)`` for full canonicalization.
+    2. Walk up the path hierarchy from longest to shortest prefix, finding the
+       longest prefix for which ``stat()`` succeeds.  Canonicalize that prefix
+       (resolves all symlinks in it), then append the non-existent suffix and
+       normalize ``..`` / ``.`` lexically via ``os.path.normpath``.
+    3. If no stat-existing prefix is found (degenerate case), fall back to
+       ``os.path.normpath``.
     """
-    real_root = workspace_root.resolve()
-    # (workspace_root / rel_path).resolve() follows symlinks for extant parts
-    # and normalizes ".." lexically for non-existent parts — exactly what we want.
-    real_cand = (workspace_root / rel_path).resolve()
-    return real_cand.is_relative_to(real_root)
+    try:
+        path.stat()  # follows symlinks; raises for dangling or cyclic
+        return path.resolve(strict=True)
+    except OSError:
+        pass
+
+    # Find the longest ancestor prefix that stat()-exists.
+    parts = path.parts
+    for i in range(len(parts) - 1, 0, -1):
+        prefix = Path(*parts[:i])
+        try:
+            prefix.stat()  # follows symlinks at every component of the prefix
+            real_prefix = prefix.resolve(strict=True)
+            suffix = Path(*parts[i:])
+            # Normalize ".." / "." in the suffix relative to real_prefix.
+            return Path(os.path.normpath(real_prefix / suffix))
+        except OSError:
+            continue
+
+    # No stat-existing prefix found — pure lexical normalization.
+    return Path(os.path.normpath(path))
+
+
+# ---------------------------------------------------------------------------
+# Internal helper: member-path containment check (spec §11.0 — S4, #168)
+# ---------------------------------------------------------------------------
+
+
+def _member_path_is_under_root(real_root: Path, resolved_cand: Path) -> bool:
+    """Return True if the pre-resolved candidate path is within the workspace root.
+
+    Implements the containment check from spec §11.0 (S4, #168).  Both
+    arguments must already be resolved (caller owns the resolution step so
+    the single ``_best_effort_resolve`` call is not duplicated):
+
+      - ``real_root`` — ``workspace_root.resolve(strict=True)`` (always exists).
+      - ``resolved_cand`` — result of ``_best_effort_resolve(workspace_root / rel_path)``.
+
+    Returns ``real_cand.is_relative_to(real_root)`` — **inclusive**: a path
+    that resolves TO the root returns True (not an escape), which lets it
+    fall through to the ``WS-MEMBER-IS-WORKSPACE`` manifest-parse check.
+
+    Consequences (spec §11.0):
+    - An existing symlink pointing outside the root is caught (stat follows
+      the live link → real outside path → escape → ``WS-MEMBER-PATH-ESCAPE``).
+    - A cyclic symlink (ELOOP) → stat fails → treated as non-existent →
+      result = canonical_root/symlink_name → no escape → ``WS-MEMBER-DIR-MISSING``.
+    - A dangling symlink (target absent) → stat fails → same as cyclic →
+      ``WS-MEMBER-DIR-MISSING``.
+    """
+    return resolved_cand.is_relative_to(real_root)
 
 
 # ---------------------------------------------------------------------------
@@ -250,21 +299,24 @@ def load_workspace(workspace_root: Path) -> LoadedWorkspace:
             )
 
         # §WS-MEMBER-PATH-ESCAPE: member path must not resolve outside the workspace root.
-        # Checked before dir-existence so an escaping path always yields this slug,
+        # Uses _best_effort_resolve (stat-based, spec §11.0) so that dangling and
+        # cyclic symlinks are treated as non-existent (no escape) and fall through
+        # to WS-MEMBER-DIR-MISSING rather than WS-MEMBER-PATH-ESCAPE.
+        # Checked before dir-existence so a live escaping path always yields this slug
         # regardless of whether the target dir exists.
-        if not _member_path_is_under_root(workspace_root, rel_path):
-            abs_dir = (workspace_root / rel_path).resolve()
-            resolved_root = workspace_root.resolve()
+        resolved_root = workspace_root.resolve(strict=True)
+        best_effort_abs = _best_effort_resolve(workspace_root / rel_path)
+        if not _member_path_is_under_root(resolved_root, best_effort_abs):
             raise MilpaError(
                 WS_MEMBER_PATH_ESCAPE,
                 f"workspace member {rel_path!r} resolves outside the workspace root "
-                f"({abs_dir} is not under {resolved_root})",
+                f"({best_effort_abs} is not under {resolved_root})",
                 member=rel_path,
-                path=str(abs_dir),
+                path=str(best_effort_abs),
                 workspace_root=str(resolved_root),
             )
 
-        abs_dir = (workspace_root / rel_path).resolve()
+        abs_dir = best_effort_abs
         declared_abs.add(abs_dir)
 
         # §WS-MEMBER-DIR-MISSING: member directory must exist
@@ -386,19 +438,23 @@ def load_workspace_from_manifest(
             )
 
         # §WS-MEMBER-PATH-ESCAPE: containment check before dir-existence check.
-        if not _member_path_is_under_root(workspace_root, rel_path):
-            abs_dir = (workspace_root / rel_path).resolve()
-            resolved_root = workspace_root.resolve()
+        # Uses _best_effort_resolve (stat-based, spec §11.0) so that dangling and
+        # cyclic symlinks are treated as non-existent (no escape) and fall through
+        # to WS-MEMBER-DIR-MISSING rather than WS-MEMBER-PATH-ESCAPE.
+        # Mirrors the identical pattern in load_workspace().
+        resolved_root = workspace_root.resolve(strict=True)
+        best_effort_abs = _best_effort_resolve(workspace_root / rel_path)
+        if not _member_path_is_under_root(resolved_root, best_effort_abs):
             raise MilpaError(
                 WS_MEMBER_PATH_ESCAPE,
                 f"workspace member {rel_path!r} resolves outside the workspace root "
-                f"({abs_dir} is not under {resolved_root})",
+                f"({best_effort_abs} is not under {resolved_root})",
                 member=rel_path,
-                path=str(abs_dir),
+                path=str(best_effort_abs),
                 workspace_root=str(resolved_root),
             )
 
-        abs_dir = (workspace_root / rel_path).resolve()
+        abs_dir = best_effort_abs
         declared_abs.add(abs_dir)
 
         if not abs_dir.is_dir():

@@ -8,8 +8,6 @@
 //! Both the single-package [`resolve_frozen`] and the [`resolve_workspace_frozen`]
 //! paths live here; the latter adds the workspace-member disqualifications
 //! (`FROZEN-MEMBER-NOT-IN-WORKSPACE` / `FROZEN-MEMBER-IDENTITY-DRIFT`).
-//! `FROZEN-LEGACY-REGISTRY-PROVENANCE` is raised from both — a legacy registry
-//! record has no fetchable URL, so the frozen path cannot honor it.
 
 use std::path::Path;
 
@@ -204,14 +202,15 @@ pub fn rebuild_deps_view(
     deps_dir: &Path,
     store: &CaStore,
 ) {
-    use milpa_types::ProvenanceRecord;
+    use milpa_types::{dep_dir_name, ProvenanceRecord};
 
     if !deps_dir.is_dir() {
         return;
     }
 
-    // Step 1: compute expected entry set (name → identity) for CAS entries only.
-    // Also collect local dep names to PRESERVE in _deps/ (fetch_local created
+    // Step 1: compute expected entry set (dir_entry → identity) for CAS entries only.
+    // C1: use dep_dir_name so qualified deps map to "@ns/name" (not "ns::name").
+    // Also collect local dep dir_entries to PRESERVE in _deps/ (fetch_local created
     // their symlinks; rebuild_deps_view must not remove them as stale).
     let mut expected: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
@@ -233,17 +232,48 @@ pub fn rebuild_deps_view(
         if dep.identity.is_empty() {
             continue;
         }
-        expected.insert(dep.name.clone(), dep.identity.clone());
+        // C1: dep_dir_name gives "@ns/name" for qualified deps, "name" for bare.
+        let dir_entry = dep_dir_name(&dep.name, dep.namespace.as_deref());
+        expected.insert(dir_entry, dep.identity.clone());
         for alias in &dep.aliases {
             expected.insert(alias.clone(), dep.identity.clone());
         }
     }
 
     // Step 2: remove stale entries (not in expected set, and not a preserved local dep).
+    // C1: namespace dirs ("@<ns>/") may contain multiple entries; check their
+    // children (as "@ns/child") rather than the dir itself.
     if let Ok(read_dir) = std::fs::read_dir(deps_dir) {
         for entry in read_dir.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !expected.contains_key(&name) && !local_names.contains(&name) {
+            if name.starts_with('@') && entry.path().is_dir() {
+                // Namespace directory: check each child independently.
+                let mut any_kept = false;
+                if let Ok(children) = std::fs::read_dir(entry.path()) {
+                    for child in children.flatten() {
+                        let child_name = child.file_name().to_string_lossy().into_owned();
+                        let compound = format!("{}/{}", name, child_name);
+                        if expected.contains_key(&compound) {
+                            any_kept = true;
+                        } else {
+                            let child_path = child.path();
+                            let meta = std::fs::symlink_metadata(&child_path);
+                            if let Ok(m) = meta {
+                                let ft = m.file_type();
+                                let _ = if ft.is_symlink() || ft.is_file() {
+                                    std::fs::remove_file(&child_path)
+                                } else {
+                                    std::fs::remove_dir_all(&child_path)
+                                };
+                            }
+                        }
+                    }
+                }
+                // Remove the namespace dir itself if now empty.
+                if !any_kept {
+                    let _ = std::fs::remove_dir(entry.path());
+                }
+            } else if !expected.contains_key(&name) && !local_names.contains(&name) {
                 let path = entry.path();
                 let meta = std::fs::symlink_metadata(&path);
                 if let Ok(m) = meta {
@@ -259,9 +289,17 @@ pub fn rebuild_deps_view(
     }
 
     // Step 3: create/refresh expected CAS symlinks.
+    // C1: for qualified deps, create the "@ns/" parent directory first.
     // store.link() clears any existing entry before creating the new symlink.
-    for (name, identity) in &expected {
-        let _ = store.link(identity, &deps_dir.join(name));
+    for (dir_entry, identity) in &expected {
+        let target = deps_dir.join(dir_entry);
+        // Ensure parent directory exists (needed for "@ns/name" paths).
+        if let Some(parent) = target.parent() {
+            if !parent.exists() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        let _ = store.link(identity, &target);
     }
 }
 
@@ -283,15 +321,49 @@ fn check_strategy(strategy: Strategy, lock: &Lockfile) -> Result<(), MilpaError>
     Ok(())
 }
 
-/// Every manifest dep must have a lockfile entry; a `Named` dep's constraint
-/// must still be satisfied by the locked version.
+/// Every manifest dep (including `dev_deps`) must have a lockfile entry;
+/// a `Named` dep's constraint must still be satisfied by the locked version.
+///
+/// S1 (#142 + #178): uses an alias-aware lookup (checks `d.aliases` too) and
+/// iterates both `manifest.deps` AND `manifest.dev_deps` — mirrors Python's
+/// `frozen.py:199` (`list(manifest.deps) + list(manifest.dev_deps)`).
+/// Previously this function iterated only `manifest.deps`, causing a live
+/// divergence with the Python impl for any manifest with a dev-dep absent
+/// from the lockfile (#178).
 fn check_manifest_alignment(manifest: &Manifest, lock: &Lockfile) -> Result<(), MilpaError> {
-    for mdep in &manifest.deps {
+    use milpa_types::dep_dir_name;
+    // C1 + S1 (#142): alias-aware, namespace-aware lookup.
+    // For qualified named deps, match on (name, namespace) not just bare name.
+    // A dep present only as a lockfile alias must not fire FROZEN-MANIFEST-DEP-NOT-IN-LOCK.
+    let find_locked = |name: &str, namespace: Option<&str>| -> Option<&LockedDep> {
+        // For qualified deps: find the lock entry with matching (name, namespace).
+        // For bare deps: fall back to alias lookup.
+        if namespace.is_some() {
+            lock.deps.iter().find(|d| {
+                d.name == name && d.namespace.as_deref() == namespace
+            })
+        } else {
+            lock.deps.iter().find(|d| {
+                (d.name == name && d.namespace.is_none())
+                    || d.aliases.iter().any(|a| a == name)
+            })
+        }
+    };
+
+    // S1 (#178): iterate BOTH deps and dev_deps — mirrors Python frozen.py:199.
+    for mdep in manifest.deps.iter().chain(manifest.dev_deps.iter()) {
         let name = mdep.name();
-        let Some(locked) = lock.deps.iter().find(|d| d.name == name) else {
+        // C1: extract namespace for qualified named deps.
+        let namespace = if let milpa_manifest::Dep::Named(n) = mdep {
+            n.namespace.as_deref()
+        } else {
+            None
+        };
+        let Some(locked) = find_locked(name, namespace) else {
+            let key = dep_dir_name(name, namespace);
             return Err(frozen(
                 "FROZEN-MANIFEST-DEP-NOT-IN-LOCK",
-                format!("manifest dep {name:?} has no lockfile entry (re-run `milpa fetch`)"),
+                format!("manifest dep {key:?} has no lockfile entry (re-run `milpa fetch`)"),
             ));
         };
         if let Dep::Named(n) = mdep {
@@ -324,8 +396,7 @@ fn check_manifest_alignment(manifest: &Manifest, lock: &Lockfile) -> Result<(), 
 }
 
 /// Rebuild a [`ResolvedDep`] from a [`LockedDep`], deriving the transport
-/// provenance from the first record. A `Registry` record is the legacy
-/// disqualification; `Member`/`Local` are unreachable here (they bail above).
+/// provenance from the first record. `Member`/`Local` are unreachable here (they bail above).
 fn resolved_from_locked(locked: &LockedDep) -> Result<ResolvedDep, MilpaError> {
     let Some(version) = parse_version(&locked.version) else {
         return Err(frozen(
@@ -337,10 +408,11 @@ fn resolved_from_locked(locked: &LockedDep) -> Result<ResolvedDep, MilpaError> {
         ));
     };
     // D-lifecycle: validate the first provenance (observed), then carry ALL provenances.
-    // The first provenance is still checked for registry/missing guards; all are carried.
+    // The first provenance is checked for missing guard; all are carried.
     let _check = provenance_from_record(locked.provenances.first(), &locked.name)?;
     Ok(ResolvedDep {
         name: locked.name.clone(),
+        namespace: locked.namespace.clone(), // C1: carry namespace for qualified deps
         identity: locked.identity.clone().unwrap_or_default(),
         version,
         src_dir: locked.src_dir.clone(),
@@ -361,23 +433,14 @@ fn resolved_from_locked(locked: &LockedDep) -> Result<ResolvedDep, MilpaError> {
 }
 
 /// The emission-level provenance record for a resolved dep — `ResolvedDep` now
-/// carries the record directly, so this is the lockfile record itself, with two
-/// guards: a `Registry` record is the legacy disqualification
-/// (`FROZEN-LEGACY-REGISTRY-PROVENANCE` — no fetchable URL), and a missing record
-/// is a malformed lockfile dep. `Member` passes through (workspace-frozen members
-/// keep their member record); single-package `Local`/`Member` bail before here.
+/// carries the record directly, so this is the lockfile record itself. A missing
+/// record is a malformed lockfile dep. `Member` passes through (workspace-frozen
+/// members keep their member record); single-package `Local`/`Member` bail before here.
 fn provenance_from_record(
     record: Option<&ProvenanceRecord>,
     name: &str,
 ) -> Result<ProvenanceRecord, MilpaError> {
     match record {
-        Some(ProvenanceRecord::Registry { .. }) => Err(frozen(
-            "FROZEN-LEGACY-REGISTRY-PROVENANCE",
-            format!(
-                "lock entry {name:?} uses the legacy registry provenance; \
-                 run `milpa update {name}` to re-resolve via the tianguis index"
-            ),
-        )),
         Some(rec) => Ok(rec.clone()),
         None => Err(frozen(
             "FROZEN-IDENTITY-NOT-IN-STORE",

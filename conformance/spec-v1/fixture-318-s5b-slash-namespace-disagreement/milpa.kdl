@@ -1,0 +1,15 @@
+// fixture-318: M2 fix — slash namespace "ns1/bar" disagrees with namespace="ns2" attribute
+//
+// When a dep name uses slash syntax to specify a namespace (e.g. "ns1/bar")
+// AND a separate namespace= attribute is also present AND the two namespaces
+// disagree, the parser must reject with MAN-DEP-NAME-INVALID.
+//
+// Before M2 fix: the namespace= attribute silently won; the slash namespace
+// was silently dropped with no error raised.
+// After M2 fix: the parser raises MAN-DEP-NAME-INVALID if the two namespace
+// sources disagree (one wins only if they agree or only one is present).
+name "myapp"
+kind "application"
+deps {
+    "ns1/bar" namespace="ns2" ">= 1.0.0"
+}

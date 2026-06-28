@@ -1,5 +1,5 @@
 name "x"
 kind "library"
 deps {
-    foo tarball=""
+    foo tarball=(url)""
 }

@@ -1,0 +1,11 @@
+name "main-lib"
+kind "library"
+flags {
+    optional default=#false
+}
+deps {
+    lib-a git=(url)"https://example.com/lib-a.git" ref="main"
+    when flag="optional" {
+        lib-absent git=(url)"https://example.com/lib-absent.git" ref="main"
+    }
+}

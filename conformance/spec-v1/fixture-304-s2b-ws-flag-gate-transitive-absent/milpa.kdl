@@ -1,0 +1,14 @@
+// fixture-304: S2b — workspace member URL dep with flag-gated transitive dep absent
+//
+// Workspace with one member that depends on main-lib (URL dep).
+// main-lib declares a flag-gated transitive dep (lib-absent, flag=optional OFF)
+// that is NOT in mocked-fetches.
+//
+// Before S2b fix: _collect_transitive_deps returns lib-absent → BFS enqueues it
+//   inside _run_bfs_wave_loop (which covers both resolve() and resolve_workspace())
+//   → fetch fails (RED).
+// After S2b fix: edgeset_to_bfs_deps derives from EdgeSet (flag-filtered) →
+//   lib-absent not enqueued → resolve_workspace() succeeds (GREEN).
+workspace {
+    member "member-a"
+}

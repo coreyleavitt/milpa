@@ -105,6 +105,8 @@ from milpa.edge_sources import (
     EdgeSourceCtx,
     MilpaKdlEdgeSource,
     NimbleEdgeSource,
+    _resolve_edges_pure,
+    edgeset_to_bfs_deps,
     edgeset_to_terms,
     resolve_edges,
 )
@@ -113,7 +115,7 @@ from milpa.nimble import parse_nimble
 from milpa.profile import Profile
 from milpa.registry import GitIndexProvenance, Index, IndexVersion
 from milpa.solver import SolverError, Term, solve_with_cert
-from milpa.version import Strategy, Version, VersionSet, format_version_str, parse_version
+from milpa.version import DepKey, Strategy, Version, VersionSet, dep_dir_name, format_version_str, parse_version
 from milpa.workspace import LoadedWorkspace
 
 if TYPE_CHECKING:
@@ -358,7 +360,7 @@ class _Provider:
         params: ResolveParams,
         overrides_by_name: dict[str, Override],
         root_authority: set[str],
-        seen_named: set[str],
+        seen_named: set[DepKey],
         seen_url: set[tuple[str, str]],
         provenance_gate: dict[str, tuple[tuple[object, ...], bool]],
         edge_cache: dict[tuple[str, Version], EdgeSet] | None = None,
@@ -415,28 +417,41 @@ class _Provider:
         """Add a candidate unconditionally (for __root__ and pre-built deps)."""
         self._candidates.setdefault(c.name, {})[c.version] = c
 
-    def register_named_stubs(self, name: str, stubs: list[_NamedStub]) -> None:
-        """Phase A: register all satisfying IndexVersion stubs for ``name``."""
-        stub_map = self._stubs.setdefault(name, {})
+    def register_named_stubs(self, dep_key: DepKey, stubs: list[_NamedStub]) -> None:
+        """Phase A: register all satisfying IndexVersion stubs for ``dep_key``.
+
+        The dict key is ``dep_key.solver_var()`` — the same string the PubGrub
+        solver uses as the package variable, so ``_stubs`` and ``_candidates``
+        are always in sync with the solver's view.
+        """
+        solver_var = dep_key.solver_var()
+        stub_map = self._stubs.setdefault(solver_var, {})
         for stub in stubs:
             ver = stub.version
             # Don't revert a materialised candidate back to a stub.
-            if ver in self._candidates.get(name, {}):
+            if ver in self._candidates.get(solver_var, {}):
                 continue
             stub_map[ver] = stub
 
     def _materialize(self, stub: _NamedStub) -> _Candidate:
-        """Phase B: fetch + parse the named dep for the selected version."""
-        name = stub.name
+        """Phase B: fetch + parse the named dep for the selected version.
+
+        ``solver_var`` is the solver-package-variable string (dep_key.solver_var());
+        used as the dict key in _candidates/_stubs.  ``bare_name`` is the plain
+        package name used for file-system operations (dest path, EdgeSourceCtx.dep_name,
+        nimble file lookup) — always stub.dep_key.name regardless of namespace.
+        """
+        solver_var = stub.name  # dep_key.solver_var(); same as stub.name property
+        bare_name = stub.dep_key.name  # plain name for filesystem / EdgeSourceCtx
         iv = stub.index_version
 
         # Check identity gate (TNG-NO-IDENTITY).
         if not iv.content_hash:
             raise MilpaError(
                 TNG_NO_IDENTITY,
-                f"package {name!r} version {iv.version!r} has no identity "
+                f"package {bare_name!r} version {iv.version!r} has no identity "
                 f"(content_hash is absent) — cannot fetch",
-                name=name,
+                name=bare_name,
                 version=iv.version,
             )
 
@@ -452,12 +467,18 @@ class _Provider:
             # OCI not yet implemented for Phase B; raise loudly.
             raise MilpaError(
                 TNG_NO_IDENTITY,
-                f"package {name!r}: OCI provenance not yet supported in Phase B",
-                name=name,
+                f"package {bare_name!r}: OCI provenance not yet supported in Phase B",
+                name=bare_name,
             )
 
-        dest = self._deps_dir / name
-        result = self._env.fetcher.fetch(name, prov, dest=dest)
+        # C1 (rfc-resolver-correctness.md): file-system destination uses the
+        # canonical dep_dir_name form: bare deps at ``_deps/<name>``, qualified
+        # deps at ``_deps/@<namespace>/<name>`` (Windows-safe, no ``::`` on disk).
+        _dir_entry = dep_dir_name(bare_name, stub.dep_key.namespace)
+        dest = self._deps_dir / _dir_entry
+        # Ensure the parent @<ns>/ directory exists for qualified deps.
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        result = self._env.fetcher.fetch(bare_name, prov, dest=dest)
 
         # Resolve the commit_sha from the receipt (may differ from index if
         # the index had a symbolic ref; the receipt reflects the actual commit).
@@ -466,6 +487,7 @@ class _Provider:
         )
 
         # Resolve edges via the coordinator (§4.2.1 resolve_edges, NORMATIVE).
+        # ctx.dep_name = bare_name: used for .nimble file lookup (filesystem).
         # ctx.dep_decl comes from IndexVersion.dep_decl (S2 field — may be None
         # for old index entries).  ctx.is_overridden = False for named deps that
         # reach materialisation (overridden named deps are coerced to URL deps
@@ -473,13 +495,13 @@ class _Provider:
         has_milpa_kdl = (result.path / "milpa.kdl").exists()
         # S3 (RFC #23 §3.1.2 + §7 S3): seed active_flags from positive flag
         # requests stored at queue-seeding time (step 5 in resolve()).
-        _name_flag_reqs = self._flag_requests_by_name.get(name, ())
+        _name_flag_reqs = self._flag_requests_by_name.get(solver_var, ())
         _requested_flags: frozenset[str] = frozenset(
             fr.name for fr in _name_flag_reqs if fr.enabled
         )
         ctx = EdgeSourceCtx(
             dep_path=result.path,
-            dep_name=name,
+            dep_name=bare_name,  # bare name for filesystem (nimble file lookup)
             dep_decl=iv.dep_decl,  # S2 field; None when absent
             dep_decl_schema_version=iv.dep_decl_schema_version,  # S3b schema check
             is_overridden=False,   # overridden named → URL coercion before Phase A
@@ -488,7 +510,7 @@ class _Provider:
             active_flags=_requested_flags,  # S3: consumer-requested flags
         )
         es = resolve_edges(
-            name,
+            solver_var,  # qualified solver variable (= bare name when namespace=None)
             stub.version,
             ctx,
             self._edge_cache,
@@ -511,7 +533,7 @@ class _Provider:
         )
 
         candidate = _Candidate(
-            name=name,
+            name=solver_var,  # qualified solver variable — matches _candidates dict key
             version=stub.version,
             identity=result.identity,
             src_dir=src_dir,
@@ -540,18 +562,26 @@ class _Provider:
                     dep_manifest_flags = _dep_m.flags
                 except Exception:
                     pass  # non-fatal; flags remain empty
-            _flag_reqs = self._flag_requests_by_name.get(name, ())
+            _flag_reqs = self._flag_requests_by_name.get(solver_var, ())
             _active_entry = compute_dep_active_flags(dep_manifest_flags, _flag_reqs)
             if _active_entry:
                 self.dep_active_flags[iv.content_hash] = _active_entry
+            # S4c (RFC #23 §3.1.4): check for flag conflicts at materialisation time.
+            # Named deps are materialised inside the PubGrub solver (via
+            # `_Provider.dependencies_of`), AFTER `_s4c_check_flag_conflicts` runs.
+            # The post-fixpoint S4c pass therefore never sees named dep candidates.
+            # Closing this gap: check conflicts here, right after active_entry is
+            # computed — same algorithm as `_s4c_check_flag_conflicts` / `_raise_if_flag_conflicts`.
+            if _active_entry and dep_manifest_flags:
+                _raise_if_flag_conflicts(bare_name, dep_manifest_flags, _active_entry)
 
-        # Register and clear stub.
-        self._candidates.setdefault(name, {})[stub.version] = candidate
-        self._stubs.get(name, {}).pop(stub.version, None)
+        # Register and clear stub (both keyed by solver_var).
+        self._candidates.setdefault(solver_var, {})[stub.version] = candidate
+        self._stubs.get(solver_var, {}).pop(stub.version, None)
 
         # Enroll any newly-discovered transitive named deps.
         if self._on_transitive_named is not None:
-            for req_name, _vs in _terms_to_named_reqs(dep_terms, name):
+            for req_name, _vs in _terms_to_named_reqs(dep_terms, solver_var):
                 self._on_transitive_named(req_name)
 
         return candidate
@@ -594,11 +624,23 @@ class _Provider:
 
 @dataclass
 class _NamedStub:
-    """Phase A stub — lightweight placeholder before fetch."""
+    """Phase A stub — lightweight placeholder before fetch.
 
-    name: str
+    ``dep_key`` carries the qualified identity (namespace + bare name).
+    ``name`` is a property returning ``dep_key.solver_var()`` — the string
+    key used in ``_Provider._candidates`` / ``_stubs`` and as the PubGrub
+    solver variable.  For ``namespace=None`` (all pre-S5b deps) this equals
+    the bare name, so existing behaviour is unchanged.
+    """
+
+    dep_key: DepKey
     version: Version
     index_version: IndexVersion
+
+    @property
+    def name(self) -> str:
+        """Solver-variable string: bare name for namespace=None, else 'ns::name'."""
+        return self.dep_key.solver_var()
 
 
 # ---------------------------------------------------------------------------
@@ -1104,11 +1146,14 @@ def _dep_to_term(
     if isinstance(dep, NamedDep):
         if dep.name == "nim":
             return (None, None)
+        # S5b: populate DepKey.namespace from the manifest dep (None for unqualified deps).
+        _dep_key = DepKey(name=dep.name, namespace=dep.namespace)
+        svar = _dep_key.solver_var()  # = dep.name for namespace=None (backward compat)
         vs = dep.constraint_set if dep.constraint_set is not None else VersionSet.full()
         # Check if this named dep is overridden (becomes a URL dep at sentinel).
         if dep.name in overrides_by_name:
-            return (Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)), dep.name)
-        return (Term.require(dep.name, vs), dep.name)
+            return (Term.require(svar, VersionSet.eq(_URL_DEP_VERSION)), svar)
+        return (Term.require(svar, vs), svar)
 
     if isinstance(dep, TarballDep):
         return (Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)), dep.name)
@@ -1129,7 +1174,7 @@ def _dep_to_term(
 
 
 def _enumerate_named_stubs(
-    name: str,
+    dep_key: DepKey,
     constraint: VersionSet | None,
     index: Index,
     provider: _Provider,
@@ -1138,20 +1183,30 @@ def _enumerate_named_stubs(
 ) -> None:
     """Phase A: enumerate all satisfying IndexVersions as stubs (no fetch).
 
+    Takes a ``DepKey`` (S5a) so the solver variable and ``seen_named`` key
+    are the qualified identity.  The bare name (``dep_key.name``) is used for
+    the registry lookup; the solver variable (``dep_key.solver_var()``) is used
+    as the dict key in the provider's ``_stubs`` / ``_candidates``.
+
     Passes ``constraint=None`` to ``resolve_named_all`` so the solver sees
     the full candidate space — constraint accumulation is the solver's job.
     The dep_terms (registered in Phase B materialisation) will carry the
     actual constraint as incompatibility terms.
     """
-    # Always enumerate all versions regardless of constraint; the solver's
-    # incompatibility terms encode the constraint (P3.3 S2 diamond correctness).
-    all_versions = index.resolve_named_all(name, constraint=None)
+    # S5b: use qualified lookup when namespace is set, bare lookup otherwise.
+    # Qualified lookup bypasses TNG-AMBIGUOUS-NAME (registry-protocol §5.1).
+    if dep_key.namespace is not None:
+        all_versions = index.resolve_named_all_qualified(
+            dep_key.namespace, dep_key.name, constraint=None
+        )
+    else:
+        all_versions = index.resolve_named_all(dep_key.name, constraint=None)
     stubs: list[_NamedStub] = []
     for iv in all_versions:
         ver = _parse_version_strict(iv.version)
         if ver is not None:
-            stubs.append(_NamedStub(name=name, version=ver, index_version=iv))
-    provider.register_named_stubs(name, stubs)
+            stubs.append(_NamedStub(dep_key=dep_key, version=ver, index_version=iv))
+    provider.register_named_stubs(dep_key, stubs)
 
 
 def _parse_version_strict(s: str) -> Version | None:
@@ -1182,9 +1237,6 @@ def _provenance_key_for_url_dep(
             return ("member-override", ov.target.member_name)
     return ("url", dep.git, dep.ref)
 
-
-def _provenance_key_for_named(name: str) -> tuple[object, ...]:
-    return ("named", name)
 
 
 def _provenance_key_for_tarball(dep: TarballDep) -> tuple[object, ...]:
@@ -1220,7 +1272,7 @@ def _terms_to_named_reqs(
 def _run_bfs_wave_loop(
     bfs_queue: list[object],
     executor: object,
-    seen_named: set[str],
+    seen_named: set[DepKey],
     seen_url: set[tuple[str, str]],
     seen_tarball: set[str],
     seen_local: set[str],
@@ -1274,17 +1326,16 @@ def _run_bfs_wave_loop(
             if kind == "named":
                 # Named items are synchronous (Phase A enumeration, no I/O).
                 # Process them inline now; they may add more items to the queue.
-                name_str: str = item[1]
-                constraint_str: str | None = item[2] if len(item) > 2 else None
-                if name_str not in seen_named and name_str != "nim":
-                    seen_named.add(name_str)
-                    record_discovery(name_str)  # Phase B: transitive named dep
+                dep_key_n: DepKey = item[1]  # S5a: qualified DepKey (namespace+name)
+                if dep_key_n not in seen_named and dep_key_n.name != "nim":
+                    seen_named.add(dep_key_n)
+                    record_discovery(dep_key_n.solver_var())  # Phase B: transitive named dep
                     # Enumerate-all normative (resolver-semantics §2.1):
-                    # do NOT pre-filter by constraint_str here.  The solver
+                    # do NOT pre-filter by constraint here.  The solver
                     # owns satisfiability via incompatibility accumulation;
                     # pre-filtering would emit TNG-NO-SATISFYING-VERSION
                     # instead of the canonical SOLVE-CONFLICT on the error path.
-                    _enumerate_named_stubs(name_str, None, index, provider, deps_dir, env)
+                    _enumerate_named_stubs(dep_key_n, None, index, provider, deps_dir, env)
                 # Named items are always processed inline, not as futures.
                 continue
 
@@ -1537,7 +1588,7 @@ def _s4a_run_fixpoint(
     provider: "_Provider",
     bfs_queue: "list[object]",
     executor: object,
-    seen_named: "set[str]",
+    seen_named: "set[DepKey]",
     seen_url: "set[tuple[str, str]]",
     seen_tarball: "set[str]",
     seen_local: "set[str]",
@@ -1619,7 +1670,12 @@ def _s4a_run_fixpoint(
         for dep_name_k in list(provider._candidates.keys()):
             if dep_name_k == "__root__":
                 continue
-            kdl_path = deps_dir / dep_name_k / "milpa.kdl"
+            # C1/H2 fix: decompose the solver-var (which may be "ns::bar") into
+            # a DepKey and use dep_dir_name so qualified deps resolve to
+            # ``_deps/@ns/bar/milpa.kdl`` rather than the nonexistent
+            # ``_deps/ns::bar/milpa.kdl``.
+            _dk_s4b = DepKey.from_solver_var(dep_name_k)
+            kdl_path = deps_dir / dep_dir_name(_dk_s4b.name, _dk_s4b.namespace) / "milpa.kdl"
             if kdl_path.exists():
                 try:
                     dm = _parse_manifest(kdl_path.read_text(encoding="utf-8"))
@@ -1784,9 +1840,14 @@ def _s4a_run_fixpoint(
                     _enqueue_dep(sub_dep, overrides_by_name, bfs_queue)
 
                 elif isinstance(sub_dep, _NamedDep):
-                    if sub_dep.name in seen_named:
+                    # S5b: use DepKey with namespace from sub_dep (transitive named deps
+                    # discovered during solve have namespace=None; direct manifest deps carry
+                    # the namespace from their manifest declaration).
+                    _sdk = DepKey(name=sub_dep.name, namespace=sub_dep.namespace)
+                    _svar = _sdk.solver_var()
+                    if _sdk in seen_named:
                         if target_cand is not None:
-                            if sub_dep.name not in target_cand.requires_names:
+                            if _svar not in target_cand.requires_names:
                                 from milpa.solver import Term as _Term
                                 from milpa.version import VersionSet as _VS
                                 vs = (
@@ -1795,12 +1856,12 @@ def _s4a_run_fixpoint(
                                     else _VS.full()
                                 )
                                 target_cand.dep_terms.append(
-                                    _Term.require(sub_dep.name, vs)
+                                    _Term.require(_svar, vs)
                                 )
-                                target_cand.requires_names.append(sub_dep.name)
+                                target_cand.requires_names.append(_svar)
                         continue
                     if target_cand is not None:
-                        if sub_dep.name not in target_cand.requires_names:
+                        if _svar not in target_cand.requires_names:
                             from milpa.solver import Term as _Term
                             from milpa.version import VersionSet as _VS
                             vs = (
@@ -1809,9 +1870,9 @@ def _s4a_run_fixpoint(
                                 else _VS.full()
                             )
                             target_cand.dep_terms.append(
-                                _Term.require(sub_dep.name, vs)
+                                _Term.require(_svar, vs)
                             )
-                            target_cand.requires_names.append(sub_dep.name)
+                            target_cand.requires_names.append(_svar)
                     _enqueue_dep(sub_dep, overrides_by_name, bfs_queue)
 
         if not any_change:
@@ -1988,7 +2049,10 @@ def _s4c_check_flag_conflicts(
         # We need this regardless of whether dep_active_flags has an entry,
         # because a dep with no consumer requests may still have default=#true
         # flags that conflict.
-        kdl_path = deps_dir / dep_name / "milpa.kdl"
+        # C1/H2 fix: decompose the solver-var via DepKey so qualified deps
+        # (solver-var "ns::bar") resolve to ``_deps/@ns/bar/milpa.kdl``.
+        _dk_s4c = DepKey.from_solver_var(dep_name)
+        kdl_path = deps_dir / dep_dir_name(_dk_s4c.name, _dk_s4c.namespace) / "milpa.kdl"
         if not kdl_path.exists():
             continue
         try:
@@ -2167,7 +2231,7 @@ def resolve(
     # Step 4: build the provider and dedup sets
     # ------------------------------------------------------------------
     seen_url: set[tuple[str, str]] = set()
-    seen_named: set[str] = set()
+    seen_named: set[DepKey] = set()  # S5a: qualified key (namespace+name)
     seen_local: set[str] = set()
     seen_tarball: set[str] = set()
 
@@ -2217,8 +2281,10 @@ def resolve(
     root_requires: list[str] = []
 
     # BFS queue: items are tuples dispatched below.
-    # Format: ("url", UrlDep) | ("named", str, str|None)
+    # Format: ("url", UrlDep) | ("named", DepKey, str|None)
     #        | ("tarball", TarballDep) | ("local", LocalDep)
+    # S5a: named items carry a DepKey (namespace + bare name) so the solver
+    # variable and seen_named key agree on the qualified identity.
     bfs_queue: list[object] = []
 
     for dep in all_root_deps:
@@ -2267,11 +2333,13 @@ def resolve(
                 # S8b: MemberTarget in a single-package manifest is a no-op;
                 # fall through to named-dep handling (no workspace member to resolve to).
                 if isinstance(ov.target, MemberTarget):
+                    # S5b: carry namespace from manifest dep
+                    _dk_mt = DepKey(name=dep.name, namespace=dep.namespace)
                     vs = dep.constraint_set if dep.constraint_set is not None else VersionSet.full()
-                    root_terms.append(Term.require(dep.name, vs))
-                    root_requires.append(dep.name)
-                    bfs_queue.append(("named", dep.name, dep.constraint))
-                    _record_discovery(dep.name)
+                    root_terms.append(Term.require(_dk_mt.solver_var(), vs))
+                    root_requires.append(_dk_mt.solver_var())
+                    bfs_queue.append(("named", _dk_mt, dep.constraint))
+                    _record_discovery(_dk_mt.solver_var())
                     continue
                 effective_dep = _apply_git_override_to_url_dep(
                     UrlDep(name=dep.name, git="", ref=""), ov
@@ -2283,14 +2351,16 @@ def resolve(
                 bfs_queue.append(("url", effective_dep))
                 _record_discovery(dep.name)  # Phase B: overridden named → URL
             else:
+                # S5b: carry namespace from manifest dep.
+                _dk = DepKey(name=dep.name, namespace=dep.namespace)
                 vs = dep.constraint_set if dep.constraint_set is not None else VersionSet.full()
-                root_terms.append(Term.require(dep.name, vs))
-                root_requires.append(dep.name)
-                bfs_queue.append(("named", dep.name, dep.constraint))
-                _record_discovery(dep.name)  # Phase B: named deps in declaration order
-                # S3: store flag_requests for named deps so _materialize can use them.
+                root_terms.append(Term.require(_dk.solver_var(), vs))
+                root_requires.append(_dk.solver_var())
+                bfs_queue.append(("named", _dk, dep.constraint))
+                _record_discovery(_dk.solver_var())  # Phase B: named deps in declaration order
+                # S3: store flag_requests keyed by solver_var so _materialize can use them.
                 if dep.flag_requests:
-                    provider._flag_requests_by_name[dep.name] = dep.flag_requests
+                    provider._flag_requests_by_name[_dk.solver_var()] = dep.flag_requests
 
         elif isinstance(dep, TarballDep):
             root_terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
@@ -2423,10 +2493,16 @@ def resolve(
     # immediately so the solver can see them.
     # ------------------------------------------------------------------
     def _on_transitive_named(name: str) -> None:
-        if name in seen_named or name == "nim":
+        # ``name`` here is a solver_var string (e.g. ``"ns::bar"`` for qualified
+        # deps or plain ``"bar"`` for bare deps).  Decompose via from_solver_var
+        # so the namespace is preserved through to _enumerate_named_stubs.
+        # C1 / H2 (rfc-resolver-correctness.md): use DepKey.from_solver_var as the
+        # SOLE site that parses a ``::``-joined solver_var back into components.
+        _dk_t = DepKey.from_solver_var(name)
+        if _dk_t in seen_named or _dk_t.name == "nim":
             return
-        seen_named.add(name)
-        _enumerate_named_stubs(name, None, index, provider, deps_dir, env)
+        seen_named.add(_dk_t)
+        _enumerate_named_stubs(_dk_t, None, index, provider, deps_dir, env)
 
     provider.set_transitive_callback(_on_transitive_named)
 
@@ -2569,29 +2645,6 @@ def _check_provenance_gate(
     )
 
 
-def _pick_edges(
-    dep_name: str,
-    version: "Version",
-    ctx: EdgeSourceCtx,
-    milpakdl_source: MilpaKdlEdgeSource,
-    nimble_source: NimbleEdgeSource,
-) -> EdgeSet:
-    """Dispatch to the correct EdgeSource for a single (dep, version) — no cache.
-
-    Single source of truth for the ``has_milpa_kdl`` branching used by the
-    three per-transport worker functions (_process_url_worker,
-    _process_tarball_worker, _process_local_worker).  Workers call this instead
-    of duplicating the two-branch ``if has_milpa_kdl`` block inline.
-
-    Workers do NOT use the ``resolve_edges`` coordinator here because they run
-    on worker threads before the edge_cache is available; the main thread seals
-    the cache from the returned EdgeSet after the worker returns.
-    """
-    if ctx.has_milpa_kdl:
-        return milpakdl_source.edges_for(dep_name, version, ctx)
-    return nimble_source.edges_for(dep_name, version, ctx)
-
-
 def _process_url_worker(
     dep: UrlDep,
     deps_dir: Path,
@@ -2723,9 +2776,14 @@ def _process_url_worker(
         overrides_by_name=overrides_by_name,
         active_flags=requested_flags,  # S3: consumer-requested flags
     )
-    # Call the source directly (worker thread — no shared edge_cache yet).
+    # Call _resolve_edges_pure (worker thread — no shared edge_cache yet).
     # The main thread seals edge_cache from the returned EdgeSet.
-    es = _pick_edges(dep.name, _URL_DEP_VERSION, ctx, MilpaKdlEdgeSource(), NimbleEdgeSource())
+    # S2b: route through the coordinator (clauses b/c/d) — honors override-suppression
+    # and DepDecl (clause c); _pick_edges only implemented clause d.
+    es = _resolve_edges_pure(
+        dep.name, _URL_DEP_VERSION, ctx,
+        dep_decl_source=DepDeclEdgeSource(env.dep_decl_store) if env.dep_decl_store is not None else None,
+    )
 
     dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
     src_dir = es.src_dir
@@ -2756,44 +2814,9 @@ def _process_url_worker(
     )
 
     # Collect transitive deps for the BFS queue (returned to caller for enqueuing).
-    transitive_deps = _collect_transitive_deps(result.path, dep.name, overrides_by_name)
+    # S2b: derived from the EdgeSet (already flag-filtered); no second parse.
+    transitive_deps = edgeset_to_bfs_deps(es, overrides_by_name)
     return candidate, transitive_deps, es
-
-
-def _collect_transitive_deps(
-    dep_path: Path,
-    dep_name: str,
-    overrides_by_name: dict[str, Override],
-) -> list[object]:
-    """Collect transitive deps from a fetched tree as raw dep objects.
-
-    Returns a list of raw dep objects (UrlDep, NamedDep, TarballDep, LocalDep)
-    from the fetched tree.  These are returned to the caller (BFS loop) for
-    enqueuing into bfs_queue — this function does NOT touch bfs_queue directly,
-    making it safe to call from worker threads.
-
-    NORMATIVE §9: reads ONLY ``m.deps``, NEVER ``m.dev_deps`` — a transitive
-    dep's dev-deps MUST NOT enter the resolved graph.
-    """
-    milpa_kdl = dep_path / "milpa.kdl"
-    if milpa_kdl.exists():
-        from milpa.manifest import parse_manifest
-        try:
-            m = parse_manifest(milpa_kdl.read_text(encoding="utf-8"))
-        except MilpaError:
-            m = None
-
-        if m is not None:
-            # NORMATIVE §9: transitive deps read ONLY m.deps, never m.dev_deps.
-            return list(m.deps)
-
-    # Fallback: nimble parse.
-    try:
-        nimble_path = _find_nimble_file(dep_path, dep_name)
-        nm = parse_nimble(nimble_path.read_text(encoding="utf-8"))
-        return list(nm.deps)
-    except FileNotFoundError:
-        return []
 
 
 def _enqueue_dep(
@@ -2831,7 +2854,9 @@ def _enqueue_dep(
                 UrlDep(name=dep.name, git="", ref=""), ov
             )))
         else:
-            bfs_queue.append(("named", dep.name, dep.constraint))
+            # S5b: transitive named deps have namespace=None (only direct manifest deps
+            # carry a namespace); bare name is used for registry lookup.
+            bfs_queue.append(("named", DepKey(name=dep.name, namespace=dep.namespace), dep.constraint))
     elif isinstance(dep, TarballDep):
         # M2: TarballDep from transitive manifests is out of scope —
         # only root-declared tarball deps are admitted (mirrors edge_sources.py:333).
@@ -2934,7 +2959,10 @@ def _process_tarball_worker(
         has_milpa_kdl=has_milpa_kdl,
         overrides_by_name=overrides_by_name,
     )
-    es = _pick_edges(dep.name, _URL_DEP_VERSION, ctx, MilpaKdlEdgeSource(), NimbleEdgeSource())
+    es = _resolve_edges_pure(
+        dep.name, _URL_DEP_VERSION, ctx,
+        dep_decl_source=DepDeclEdgeSource(env.dep_decl_store) if env.dep_decl_store is not None else None,
+    )
 
     dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
     src_dir = es.src_dir
@@ -2954,7 +2982,7 @@ def _process_tarball_worker(
         ),
         requires_predicates=requires_predicates,
     )
-    transitive_deps = _collect_transitive_deps(result.path, dep.name, overrides_by_name)
+    transitive_deps = edgeset_to_bfs_deps(es, overrides_by_name)
     return candidate, transitive_deps, es
 
 
@@ -3002,7 +3030,10 @@ def _process_local_worker(
         has_milpa_kdl=has_milpa_kdl,
         overrides_by_name=overrides_by_name,
     )
-    es = _pick_edges(dep.name, _URL_DEP_VERSION, ctx, MilpaKdlEdgeSource(), NimbleEdgeSource())
+    es = _resolve_edges_pure(
+        dep.name, _URL_DEP_VERSION, ctx,
+        dep_decl_source=DepDeclEdgeSource(env.dep_decl_store) if env.dep_decl_store is not None else None,
+    )
 
     dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
     src_dir = es.src_dir
@@ -3017,7 +3048,7 @@ def _process_local_worker(
         provenance=_LocalDepProvenance(declared_path=declared_path_str),
         requires_predicates=requires_predicates,
     )
-    transitive_deps = _collect_transitive_deps(result.path, dep.name, overrides_by_name)
+    transitive_deps = edgeset_to_bfs_deps(es, overrides_by_name)
     return candidate, transitive_deps, es
 
 
@@ -3084,13 +3115,16 @@ def _dedup_candidates(
 
         non_canonicals = [n for n in group if n != canonical]
 
-        # Step 5: invariant guard — re-derive requires from fetched tree.
+        # Step 5: invariant guard — re-derive requires from the sealed edge_cache.
         # Identical content ⇒ identical tree ⇒ identical requires. Any mismatch
         # is a bug, not a user error → MILPA-INTERNAL.
+        # S2b: use provider._edge_cache instead of re-parsing the fetched tree —
+        # the edge_cache is sealed by the main thread after each worker returns and
+        # is already flag-filtered by _manifest_to_edgeset.
         all_requires: list[frozenset[str]] = []
         for member_name in group:
-            dep_path = deps_dir / member_name
-            raw_deps = _collect_transitive_deps(dep_path, member_name, overrides_by_name)
+            cached_es = provider._edge_cache.get((member_name, _URL_DEP_VERSION))  # type: ignore[attr-defined]
+            raw_deps = edgeset_to_bfs_deps(cached_es, overrides_by_name) if cached_es is not None else []
             # Canonicalize dep names through the alias map (partially built so far
             # — for same-group members: no alias yet; across-group: alias may exist).
             req_names: frozenset[str] = frozenset(
@@ -3208,7 +3242,10 @@ def rebuild_deps_view(
         # Skip deps without a CAS identity (should not occur for non-local/member).
         if not dep.identity:
             continue
-        expected[dep.name] = dep.identity
+        # C1: use dep_dir_name so qualified deps go to ``@<ns>/<name>``
+        # (not ``ns::name`` with a Windows-illegal ``:``).
+        _dir_entry = dep_dir_name(dep.name, dep.namespace)
+        expected[_dir_entry] = dep.identity
         for alias in dep.aliases:
             expected[alias] = dep.identity
 
@@ -3216,8 +3253,30 @@ def rebuild_deps_view(
         return  # nothing to rebuild
 
     # Step 2: remove stale entries (not in expected set, and not a preserved local dep).
+    # C1: namespace dirs (``@<ns>/``) may contain multiple entries; check their
+    # children rather than the dir itself.
     for child in list(deps_dir.iterdir()):
-        if child.name not in expected and child.name not in local_names:
+        child_key = child.name
+        if child.name.startswith("@") and child.is_dir():
+            # Namespace directory: check each child independently.
+            for grandchild in list(child.iterdir()):
+                gc_key = f"{child.name}/{grandchild.name}"
+                if gc_key not in expected:
+                    try:
+                        st = os.lstat(grandchild)
+                        if _stat.S_ISLNK(st.st_mode):
+                            os.unlink(grandchild)
+                        else:
+                            shutil.rmtree(grandchild, ignore_errors=True)
+                    except FileNotFoundError:
+                        pass
+            # Remove the namespace dir itself if now empty.
+            try:
+                if child.is_dir() and not any(child.iterdir()):
+                    child.rmdir()
+            except (OSError, StopIteration):
+                pass
+        elif child_key not in expected and child_key not in local_names:
             try:
                 st = os.lstat(child)
                 if _stat.S_ISLNK(st.st_mode):
@@ -3231,9 +3290,12 @@ def rebuild_deps_view(
     # store.link(identity, target) creates a relative symlink; it is idempotent
     # (clears any existing entry first).
     _store = store  # type: ignore[assignment]
-    for name, identity in expected.items():
+    for dir_entry, identity in expected.items():
+        target = deps_dir / dir_entry
+        # Ensure the parent directory exists for qualified deps (``@<ns>/``).
+        target.parent.mkdir(parents=True, exist_ok=True)
         try:
-            _store.link(identity, deps_dir / name)
+            _store.link(identity, target)
         except Exception:
             # CAS entry missing for this identity — the resolver already validated
             # presence (FROZEN-IDENTITY-NOT-IN-STORE); treat as non-fatal here.
@@ -3279,6 +3341,13 @@ def _build_graph(
             cand = provider.get(name, version)
         except KeyError:
             continue
+        # C1 (rfc-resolver-correctness.md): ``name`` here is a solver_var string
+        # (e.g. ``"ns1::bar"`` for qualified deps).  Decompose it into bare name +
+        # namespace for ``ResolvedDep`` so the lockfile receives the bare name as
+        # the dep arg and namespace as a separate child node (never ``::`` on disk).
+        _cand_dk = DepKey.from_solver_var(name)
+        _bare_name = _cand_dk.name        # e.g. "bar"
+        _namespace = _cand_dk.namespace   # e.g. "ns1" or None
 
         # Map fetcher provenance → lockfile ProvenanceRecord (observed).
         observed_record: (
@@ -3385,7 +3454,10 @@ def _build_graph(
         )
         if not _active_map and cand.identity and not _is_member:
             # No consumer requests — derive defaults only.
-            _kdl_path = deps_dir / name / "milpa.kdl"
+            # C1: use dep_dir_name to find the dep's milpa.kdl at the correct
+            # on-disk location (``_deps/@ns/bar/milpa.kdl`` for qualified deps).
+            _dir_entry = dep_dir_name(_bare_name, _namespace)
+            _kdl_path = deps_dir / _dir_entry / "milpa.kdl"
             if _kdl_path.exists():
                 try:
                     from milpa.manifest import parse_manifest as _pm_s5
@@ -3396,7 +3468,7 @@ def _build_graph(
         _active_flags_sorted: tuple[str, ...] = tuple(sorted(_active_map.keys()))
 
         resolved = ResolvedDep(
-            name=name,
+            name=_bare_name,    # C1: bare name (never solver_var "ns::bar")
             identity=cand.identity,
             version=version_str,
             src_dir=cand.src_dir,
@@ -3413,6 +3485,8 @@ def _build_graph(
             # Phase B: aliases — lex-sorted list of non-canonical names that share
             # this dep's content identity.  Empty for non-deduped deps.
             aliases=tuple(canonical_to_aliases.get(name, [])),
+            # C1: carry namespace for qualified named deps.
+            namespace=_namespace,
         )
         deps.append(resolved)
 
@@ -3629,7 +3703,7 @@ def resolve_workspace(
 
     provenance_gate: dict[str, tuple[tuple[object, ...], bool]] = {}
     seen_url: set[tuple[str, str]] = set()
-    seen_named: set[str] = set()
+    seen_named: set[DepKey] = set()  # S5a: qualified key (namespace+name)
     seen_local: set[str] = set()
     seen_tarball: set[str] = set()
 
@@ -3795,15 +3869,15 @@ def resolve_workspace(
             elif isinstance(dep, NamedDep):
                 if name == "nim":
                     continue
-                bfs_queue.append(("named", name, dep.constraint))
-                _ws_record_discovery(name)  # Phase B: named dep in seed order
+                # S5b: carry namespace from manifest dep.
+                _dk_ws = DepKey(name=name, namespace=dep.namespace)
+                bfs_queue.append(("named", _dk_ws, dep.constraint))
+                _ws_record_discovery(_dk_ws.solver_var())  # Phase B: named dep in seed order
                 # S11 (RFC #23 §3.8): accumulate flag_requests from ALL members
-                # (workspace-wide union).  Union via concatenation — monotone;
-                # compute_dep_active_flags sees all requests, dedup is not needed
-                # (duplicate positive requests are idempotent for union semantics).
+                # (workspace-wide union).  Keyed by solver_var to agree with _materialize.
                 if dep.flag_requests:
-                    existing_named = provider._flag_requests_by_name.get(name, ())
-                    provider._flag_requests_by_name[name] = existing_named + dep.flag_requests
+                    existing_named = provider._flag_requests_by_name.get(_dk_ws.solver_var(), ())
+                    provider._flag_requests_by_name[_dk_ws.solver_var()] = existing_named + dep.flag_requests
             elif isinstance(dep, TarballDep):
                 bfs_queue.append(("tarball", dep))
                 _ws_record_discovery(name)  # Phase B: tarball dep in seed order
@@ -3925,11 +3999,16 @@ def resolve_workspace(
     # Wire Phase B transitive callback BEFORE solve
     # ------------------------------------------------------------------
     def _on_transitive_named(name: str) -> None:
-        if name in seen_named or name == "nim":
+        # ``name`` here is a solver_var string (e.g. ``"ns::bar"`` for qualified
+        # deps or plain ``"bar"`` for bare deps).  Decompose via from_solver_var
+        # so the namespace is preserved through to _enumerate_named_stubs.
+        # Mirrors the single-package _on_transitive_named (resolve() step 7).
+        _dk_wt = DepKey.from_solver_var(name)
+        if _dk_wt in seen_named or _dk_wt.name == "nim":
             return
-        seen_named.add(name)
-        _ws_record_discovery(name)  # Phase B: lazy-materialized named dep
-        _enumerate_named_stubs(name, None, index, provider, deps_dir, env)
+        seen_named.add(_dk_wt)
+        _ws_record_discovery(_dk_wt.solver_var())  # Phase B: lazy-materialized named dep
+        _enumerate_named_stubs(_dk_wt, None, index, provider, deps_dir, env)
 
     provider.set_transitive_callback(_on_transitive_named)
 

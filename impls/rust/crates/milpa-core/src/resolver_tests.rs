@@ -220,6 +220,7 @@ fn url_dep(name: &str, git: &str, refp: &str) -> Dep {
 fn named_dep(name: &str, constraint: Option<&str>) -> Dep {
     Dep::Named(NamedDep {
         name: name.to_string(),
+        namespace: None,
         constraint: constraint.map(str::to_string),
         parsed_constraint: constraint.map(|c| {
             milpa_solver::VersionSet::from_constraint(Some(c))
@@ -663,6 +664,130 @@ fn resolve_root_override_precedence_suppresses_transitive_provenance() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// S2a (#131) characterization tests — regression net for the SSOT refactor
+// that routes extract_requires through edge_sources::resolve_edges.
+// These tests pin behaviors that must be preserved after the refactor.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s2a_transitive_milpa_kdl_flag_inactive_dep_excluded() {
+    // Characterization test for S2a: a transitive dep that has a milpa.kdl with
+    // a flag-gated sub-dep (default=#false) must NOT appear in the resolved graph.
+    // After the S2a refactor, this behavior flows through resolve_edges (which
+    // uses the flag-aware MilpaKdlEdgeSource), not the inline clause-d block.
+    let extra_url = "https://example.com/s2a-extra.git";
+    let parent_url = "https://example.com/s2a-parent.git";
+    let parent_kdl = r#"name "s2aparent"
+kind "library"
+flags {
+    feature_x default=#false
+}
+deps {
+    when flag="feature_x" {
+        s2aextra git=(url)"https://example.com/s2a-extra.git" ref="main"
+    }
+}"#;
+    let reg = FakeReg::git(&[
+        (parent_url, "main", milpa_kdl("s2achar01s2achar01s2achar01s2achar01s2achar01", parent_kdl)),
+        (extra_url, "main", nimble("s2achar02s2achar02s2achar02s2achar02s2achar02", "")),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("s2aparent", parent_url, "main")]);
+    let graph = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp)).unwrap();
+    assert!(
+        graph.deps.iter().all(|d| d.name != "s2aextra"),
+        "s2aextra must be excluded: flag feature_x is default=#false"
+    );
+    assert!(
+        reg.calls().iter().all(|c| c.1 != extra_url),
+        "s2aextra must never be fetched"
+    );
+}
+
+#[test]
+fn s2a_transitive_milpa_kdl_flag_active_via_default_dep_included() {
+    // Complement of the above: with default=#true, the flag-gated sub-dep IS included.
+    // URL tail is "s2aextray" so the resolver assigns dep name "s2aextray".
+    let extra_url = "https://example.com/s2aextray.git";
+    let parent_url = "https://example.com/s2aparenton.git";
+    let parent_kdl = r#"name "s2aparenton"
+kind "library"
+flags {
+    feature_y default=#true
+}
+deps {
+    when flag="feature_y" {
+        s2aextray git=(url)"https://example.com/s2aextray.git" ref="main"
+    }
+}"#;
+    let reg = FakeReg::git(&[
+        (parent_url, "main", milpa_kdl("s2achar03s2achar03s2achar03s2achar03s2achar03", parent_kdl)),
+        (extra_url, "main", nimble("s2achar04s2achar04s2achar04s2achar04s2achar04", "")),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("s2aparenton", parent_url, "main")]);
+    let graph = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp)).unwrap();
+    assert!(
+        graph.deps.iter().any(|d| d.name == "s2aextray"),
+        "s2aextray must be included: flag feature_y is default=#true"
+    );
+    assert!(
+        reg.calls().iter().any(|c| c.1 == extra_url),
+        "s2aextray must be fetched"
+    );
+}
+
+#[test]
+fn s2a_override_routes_transitive_named_dep_in_milpa_kdl_to_fork() {
+    // Characterization test: a transitive NAMED dep declared in a milpa.kdl
+    // that has a root-level override must enter the solver as eq_sentinel
+    // (via overrides_by_name in edgeset_to_extracted), and the override must
+    // route the fetch to the fork URL.
+    // After the S2a refactor this same path flows through resolve_edges.
+    //
+    // translib's milpa.kdl declares "s2ashared" as a named dep (no URL).
+    // Root override: s2ashared → fork. The named dep in translib's EdgeSet must
+    // be recognized as overridden and enqueued as Item::Named{ eq_sentinel }.
+    let translib_url = "https://example.com/s2atranslib.git";
+    let fork_url = "https://fork.example.com/s2ashared.git";
+    let translib_kdl = r#"name "s2atranslib"
+kind "library"
+deps {
+    s2ashared ">= 1.0.0"
+}"#;
+    let reg = FakeReg::git(&[
+        (translib_url, "main", milpa_kdl("s2achar05s2achar05s2achar05s2achar05s2achar05", translib_kdl)),
+        (fork_url, "main", nimble("s2achar06s2achar06s2achar06s2achar06s2achar06", "")),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    // Root has no s2ashared dep directly — only an override routing it to fork.
+    let m = manifest_full(
+        vec![url_dep("s2atranslib", translib_url, "main")],
+        Vec::new(),
+        vec![Override {
+            name: "s2ashared".into(),
+            target: OverrideTarget::Git {
+                url: fork_url.into(),
+                git_ref: "main".into(),
+            },
+        }],
+    );
+    let graph = resolve(&m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp), None, false, &cas_store(&tmp)).unwrap();
+    let shared: Vec<_> = graph.deps.iter().filter(|d| d.name == "s2ashared").collect();
+    assert_eq!(shared.len(), 1, "s2ashared must appear exactly once");
+    match shared[0].provenances.first().expect("provenance") {
+        ProvenanceRecord::Git { url, .. } => {
+            assert_eq!(url, fork_url, "s2ashared must come from the fork (override)");
+        }
+        other => panic!("expected git provenance, got {other:?}"),
+    }
+    assert!(
+        reg.calls().iter().any(|c| c.1 == fork_url),
+        "fork must be fetched"
+    );
+}
+
 #[test]
 fn resolve_non_root_provenance_disagreement_conflicts() {
     // §10.3: two transitive deps declare `shared` from different URLs and the
@@ -854,6 +979,7 @@ fn resolve_prior_lockfile_pin_rejects_hostile_bytes() {
         strategy: "maxver".into(),
         deps: vec![LockedDep {
             name: "foo".into(),
+            namespace: None,
             identity: Some(
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
             ),
@@ -902,6 +1028,7 @@ fn resolve_prior_lockfile_pin_accepts_matching_bytes() {
         strategy: "maxver".into(),
         deps: vec![LockedDep {
             name: "foo".into(),
+            namespace: None,
             identity: Some(identity.clone()),
             version: "0.0.1".into(),
             src_dir: "src".into(),
@@ -958,6 +1085,7 @@ fn prior_with_zero_identity(dep_name: &str, url: &str) -> Lockfile {
         strategy: "maxver".into(),
         deps: vec![LockedDep {
             name: dep_name.into(),
+            namespace: None,
             identity: Some(
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
             ),
@@ -1620,6 +1748,105 @@ fn resolve_absent_profile_includes_conditional_dep() {
     assert_eq!(graph.deps.len(), 1);
 }
 
+// --- seed_root flag-gate characterization (§6 + S7, #179 migration guard) ---
+//
+// These two tests pin the flag-gate behavior of the `seed_root` path — i.e.
+// the filtering that `resolve_with_features` applies to the root manifest
+// when a profile is present (`Some(p)` arm, line ~228).  They must pass GREEN
+// BEFORE and AFTER the migration from `filter_manifest_by_profile` to the
+// unified `FilterCtx` + `filter_manifest` path.  If the two implementations
+// are NOT semantically equivalent these tests catch the divergence.
+
+#[test]
+fn seed_root_flag_gate_default_flag_includes_dep() {
+    // §6 / S7: a root dep gated by `when flag="feat"` is INCLUDED when the
+    // manifest declares `flags { feat default=#true }` and a profile is present.
+    // `filter_manifest_by_profile` computes the flag closure over manifest
+    // defaults and enriches `profile.flags`; the closure includes "feat".
+    // After migration: `FilterCtx::build(manifest, Some(p), None)` computes
+    // the same `active_flags` set → identical result.
+    let reg = FakeReg::git(&[(
+        "https://example.com/optlib.git",
+        "main",
+        nimble("optlib", "srcDir = \"src\"\n"),
+    )]);
+    let tmp = tempfile::tempdir().unwrap();
+    let dep = Dep::Url(UrlDep {
+        name: "optlib".into(),
+        git: "https://example.com/optlib.git".into(),
+        git_ref: "main".into(),
+        mirrors: Vec::new(),
+        predicates: vec![Predicate {
+            name: "flag".into(),
+            values: vec!["feat".into()],
+            negated: false,
+        }],
+        flag_requests: Vec::new(),
+        optional: false,
+    });
+    let mut m = manifest(vec![dep]);
+    m.flags.push(milpa_manifest::FlagDecl {
+        name: "feat".into(),
+        default: true,
+        description: String::new(),
+        defines: Vec::new(),
+        enables_same_pkg: Vec::new(),
+        enables_cross_pkg: Vec::new(),
+        conflicts: Vec::new(),
+    });
+    let profile = Profile { platform: Some("linux".into()), ..Profile::default() };
+    let graph = resolve(
+        &m, None, &reg, Some(&profile), None, Strategy::Maxver,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap();
+    assert_eq!(graph.deps.len(), 1, "default-active flag → dep included via seed_root");
+    assert_eq!(graph.deps[0].name, "optlib");
+}
+
+#[test]
+fn seed_root_flag_gate_inactive_flag_excludes_dep() {
+    // §6 / S7: a root dep gated by `when flag="nodef"` is EXCLUDED when the
+    // manifest declares `flags { nodef default=#false }` and a profile is present.
+    // The flag is not in the closure of default-true flags → enriched
+    // `profile.flags` does NOT contain "nodef" → dep filtered out.
+    // After migration: `FilterCtx::build` active_flags also omits "nodef" →
+    // dep_passes_flag_predicates returns false → same exclusion.
+    let reg = FakeReg::default(); // dep must never be fetched
+    let tmp = tempfile::tempdir().unwrap();
+    let dep = Dep::Url(UrlDep {
+        name: "optlib2".into(),
+        git: "https://example.com/optlib2.git".into(),
+        git_ref: "main".into(),
+        mirrors: Vec::new(),
+        predicates: vec![Predicate {
+            name: "flag".into(),
+            values: vec!["nodef".into()],
+            negated: false,
+        }],
+        flag_requests: Vec::new(),
+        optional: false,
+    });
+    let mut m = manifest(vec![dep]);
+    m.flags.push(milpa_manifest::FlagDecl {
+        name: "nodef".into(),
+        default: false,
+        description: String::new(),
+        defines: Vec::new(),
+        enables_same_pkg: Vec::new(),
+        enables_cross_pkg: Vec::new(),
+        conflicts: Vec::new(),
+    });
+    let profile = Profile { platform: Some("linux".into()), ..Profile::default() };
+    let graph = resolve(
+        &m, None, &reg, Some(&profile), None, Strategy::Maxver,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap();
+    assert!(graph.deps.is_empty(), "inactive flag → dep excluded via seed_root");
+    assert!(reg.calls().is_empty(), "excluded dep must never be fetched");
+}
+
 // --- tarball TOFU pinning (lockfile-schema.md §5, issue #116) ---------------
 
 #[test]
@@ -1654,6 +1881,7 @@ fn tarball_prior(name: &str, url: &str, identity: &str, sha256: &str) -> Lockfil
         strategy: "maxver".into(),
         deps: vec![LockedDep {
             name: name.into(),
+            namespace: None,
             identity: Some(identity.into()),
             version: "0.0.1".into(),
             src_dir: "src".into(),
@@ -2370,6 +2598,7 @@ deps {
         deps: vec![
             milpa_types::LockedDep {
                 name: "optfoo".into(),
+                namespace: None,
                 identity: None,
                 version: "0.1.0".into(),
                 src_dir: "src".into(),

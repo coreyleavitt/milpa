@@ -136,6 +136,96 @@ class Version:
 
 
 # ---------------------------------------------------------------------------
+# DepKey — resolver identity key (S1, rfc-resolver-correctness.md)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DepKey:
+    """A resolver-level dep identity key.
+
+    ``name`` is the canonical bare name (always present).
+    ``namespace`` is ``None`` for unqualified (default) deps; populated by S5b
+    when the manifest grammar supports namespace-qualified ``NamedDep`` refs.
+
+    Used as a dict key in ``_locked_index`` (frozen.py) and ``seen_named``
+    (resolver.py, S5a).  A named type — not a tuple — gives call-site
+    guardrails and forces Python and Rust to converge on the same shape.
+
+    Spec: ``spec/resolver-semantics.md`` DepKey fields+ordering clause.
+    """
+
+    name: str
+    namespace: str | None = None
+
+    def solver_var(self) -> str:
+        """Canonical PubGrub solver-variable string for this dep.
+
+        ``namespace=None`` → bare name (backward-compatible with all
+        pre-S5b deps; the solver key is unchanged from before S5a).
+        ``namespace='ns'`` → ``'ns::name'`` — a distinct key from the bare
+        name and from every other namespace, so ``(ns1, foo)`` and ``(ns2, foo)``
+        become distinct solver variables.
+
+        Agreed with ``seen_named`` (``set[DepKey]``): both uniquely identify the
+        same dep, and neither can collapse two different namespaces to one key.
+
+        SOLVER-INTERNAL ONLY. This string MUST NOT be written to disk,
+        the lockfile, or _deps/ paths.  Use ``dep_dir_name()`` for filesystem
+        layout and ``LockedDep.name``/``LockedDep.namespace`` for lockfile.
+        """
+        if self.namespace is None:
+            return self.name
+        return f"{self.namespace}::{self.name}"
+
+    @classmethod
+    def from_solver_var(cls, s: str) -> "DepKey":
+        """Parse a solver-variable string back into a DepKey.
+
+        This is the SOLE site that decomposes a ``::``-joined solver variable
+        back into (namespace, name) components.  Splits on the FIRST ``::``::
+
+            ``"bar"``      → ``DepKey(name="bar")``
+            ``"ns::bar"``  → ``DepKey(name="bar", namespace="ns")``
+
+        Use this at every call-site that receives a solver_var string and
+        needs a structured DepKey (e.g. ``_on_transitive_named``,
+        ``_build_graph``).  Never split on ``::`` inline.
+        """
+        if "::" in s:
+            ns, _, name = s.partition("::")
+            return cls(name=name, namespace=ns)
+        return cls(name=s)
+
+
+# ---------------------------------------------------------------------------
+# dep_dir_name — SSOT for _deps/ layout (C1, rfc-resolver-correctness.md)
+# ---------------------------------------------------------------------------
+
+
+def dep_dir_name(name: str, namespace: str | None) -> str:
+    """Canonical ``_deps/`` entry name for a dep.
+
+    Bare dep (``namespace=None``): ``"<name>"``  → ``_deps/<name>``
+    Qualified dep (``namespace="ns"``): ``"@<ns>/<name>"`` → ``_deps/@ns/<name>``
+
+    The ``@<ns>/`` prefix (npm-scope form) is:
+    - Windows-safe (no ``:`` or ``*`` forbidden characters)
+    - Collision-free with bare names (bare names cannot start with ``@``)
+    - Human-readable (analogous to npm ``@scope/pkg`` convention)
+
+    Collocated with ``DepKey`` (the Rust impl does the same in milpa-types),
+    because ``dep_dir_name`` is a pure function of (name, namespace) — the same
+    fields that define a ``DepKey``.  Call it from:
+    ``rebuild_deps_view``, ``_materialize_named``, ``nimcfg._path_for``,
+    ``frozen._locked_index``, ``lockfile.verify_lockfile_against_deps``.
+    """
+    if namespace is None:
+        return name
+    return f"@{namespace}/{name}"
+
+
+# ---------------------------------------------------------------------------
 # Strategy
 # ---------------------------------------------------------------------------
 

@@ -37,6 +37,100 @@ use milpa_types::{EdgeSet, EdgeSource, NamedRequire, RequireEntry, UrlRequire, V
 // that produce sub-items (private to this module; the caller also imports Item).
 
 // ---------------------------------------------------------------------------
+// Flag-predicate helpers (SSOT — also used by resolver.rs for root/fixpoint)
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when `dep` passes all flag-axis predicates given `active`.
+///
+/// Only evaluates `"flag"` predicates; platform/arch predicates are ignored
+/// here (they are evaluated at root-manifest parse time, not in the transitive
+/// EdgeSet). A dep with no flag predicates always passes.
+///
+/// This is the single implementation of flag-predicate admission logic — it is
+/// imported by `resolver.rs` rather than re-implemented there.
+pub(crate) fn dep_passes_flag_predicates(dep: &Dep, active: &BTreeSet<&str>) -> bool {
+    for p in dep.predicates() {
+        if p.name != "flag" {
+            continue;
+        }
+        let any_match = p.values.iter().any(|v| active.contains(v.as_str()));
+        let satisfied = if p.negated { !any_match } else { any_match };
+        if !satisfied {
+            return false;
+        }
+    }
+    true
+}
+
+/// Build an `EdgeSet` from a manifest with flag-predicate filtering (§6 transitive).
+///
+/// Merges the manifest's own default-active flags with `active_flags` from the
+/// consumer's flag requests (S3 single-hop activation). Only `manifest.deps` is
+/// included — `dev_deps` excluded (§9) and `overrides` dropped (§10.2).
+/// Carries `flag_requests` from URL dep entries so callers can reconstruct
+/// `Item::Url.flag_requests` for multi-consumer union (S4b).
+///
+/// Pass `&BTreeSet::new()` for `active_flags` on transitive hops (single-hop
+/// scope): only the manifest's own defaults activate flags then.
+///
+/// This is the SSOT for "EdgeSet from milpa.kdl with flag filtering". Both
+/// `MilpaKdlEdgeSource` and `Provider::extract_requires` use this function;
+/// `manifest_to_edgeset` (pure normative projection, no flag filtering) is kept
+/// separately for unit tests and callers that do not need flag filtering.
+pub fn build_edgeset_with_flags(manifest: &Manifest, active_flags: &BTreeSet<String>) -> EdgeSet {
+    // Merge manifest's own default-active flags with consumer requests.
+    let mut active: BTreeSet<&str> = manifest
+        .flags
+        .iter()
+        .filter(|f| f.default)
+        .map(|f| f.name.as_str())
+        .collect();
+    for flag in active_flags {
+        active.insert(flag.as_str());
+    }
+
+    let mut requires = Vec::new();
+    for dep in &manifest.deps {
+        if !dep_passes_flag_predicates(dep, &active) {
+            continue;
+        }
+        match dep {
+            Dep::Url(u) => {
+                // S4b: carry flag_requests so the caller can reconstruct Item::Url.flag_requests
+                // for multi-consumer union (§3.1.3). FlagRequest is the SSOT (milpa-types).
+                requires.push(RequireEntry::Url(UrlRequire {
+                    url: u.git.clone(),
+                    ref_: u.git_ref.clone(),
+                    predicates: Vec::new(),
+                    flag_requests: u.flag_requests.clone(),
+                }));
+            }
+            Dep::Named(n) => {
+                if n.name == "nim" {
+                    continue;
+                }
+                // H2: carry namespace from manifest NamedDep into NamedRequire so
+                // transitive qualified deps preserve their namespace through the EdgeSet.
+                requires.push(RequireEntry::Named(NamedRequire {
+                    name: n.name.clone(),
+                    constraint_str: n.constraint.clone().unwrap_or_default(),
+                    predicates: Vec::new(),
+                    namespace: n.namespace.clone(),
+                }));
+            }
+            // Local/Tarball/Member from a transitive milpa.kdl are out of scope.
+            Dep::Local(_) | Dep::Tarball(_) | Dep::Member(_) => {}
+        }
+    }
+    // §10.2: manifest.overrides dropped entirely.
+    EdgeSet {
+        requires,
+        src_dir: manifest.src_dir.clone(),
+        source: EdgeSource::MilpaKdl,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Context carrier
 // ---------------------------------------------------------------------------
 
@@ -140,10 +234,12 @@ impl NimbleEdgeSource {
                     if name == "nim" {
                         continue;
                     }
+                    // Nimble sources have no namespace concept; keep None.
                     requires.push(RequireEntry::Named(NamedRequire {
                         name: name.clone(),
                         constraint_str: constraint.clone().unwrap_or_default(),
                         predicates: predicates.clone(),
+                        namespace: None,
                     }));
                 }
             }
@@ -176,6 +272,13 @@ fn empty_nimble() -> EdgeSet {
 pub struct MilpaKdlEdgeSource;
 
 impl MilpaKdlEdgeSource {
+    /// Parse `dep_path/milpa.kdl` and return an `EdgeSet` with flag-predicate
+    /// filtering applied (§6 transitive, §9, §10.2).
+    ///
+    /// Uses `ctx.active_flags` (S3 single-hop consumer requests) merged with the
+    /// manifest's own default-active flags via `build_edgeset_with_flags`.
+    /// This is the SSOT milpa.kdl edge source — delegates to `build_edgeset_with_flags`
+    /// which carries `flag_requests` and applies dep-level flag filtering.
     pub fn edges_for(&self, _name: &str, _version: &Version, ctx: &EdgeSourceCtx) -> EdgeSet {
         let Some(dep_path) = ctx.dep_path else {
             return empty_milpa_kdl();
@@ -189,7 +292,8 @@ impl MilpaKdlEdgeSource {
             Ok(m) => m,
             Err(_) => return empty_milpa_kdl(),
         };
-        manifest_to_edgeset(&manifest)
+        // Apply flag filtering via ctx.active_flags (S3 single-hop) + manifest defaults.
+        build_edgeset_with_flags(&manifest, &ctx.active_flags)
     }
 }
 
@@ -223,10 +327,13 @@ pub fn manifest_to_edgeset(manifest: &Manifest) -> EdgeSet {
                 if n.name == "nim" {
                     continue;
                 }
+                // H2: carry namespace from manifest NamedDep so transitive
+                // qualified deps preserve their namespace through the EdgeSet.
                 requires.push(RequireEntry::Named(NamedRequire {
                     name: n.name.clone(),
                     constraint_str: n.constraint.clone().unwrap_or_default(),
                     predicates: Vec::new(),
+                    namespace: n.namespace.clone(),
                 }));
             }
             // Local/Tarball/Member from a transitive milpa.kdl are out of
@@ -266,7 +373,7 @@ pub fn resolve_edges<'cache>(
     milpakdl_source: Option<&MilpaKdlEdgeSource>,
     // dep_decl_source: S3b injection point (wired from DepDeclStore in resolver.rs L1200+).
     dep_decl_source: Option<&dyn DepDeclSource>,
-) -> Result<&'cache EdgeSet, ManifestError> {
+) -> Result<&'cache EdgeSet, crate::MilpaError> {
     let cache_key = (name.to_string(), version.clone());
     // Clause (a): sealed once per (name, version) — parent-independent
     if edge_cache.contains_key(&cache_key) {
@@ -287,8 +394,11 @@ pub fn resolve_edges<'cache>(
         }
     } else if ctx.dep_decl.is_some() {
         if let Some(dds) = dep_decl_source {
-            // Clause (c): dep_decl + dep_decl_source → DepDecl [S3b]
-            dds.edges_for(name, version, ctx)
+            // Clause (c): dep_decl + dep_decl_source → DepDecl [S3b].
+            // `DepDeclSource::edges_for` returns Result<EdgeSet, MilpaError>:
+            // implementors handle the soft `TNG-DEPDECL-FETCH-FAILED` policy
+            // internally; hard integrity failures propagate here.
+            dds.edges_for(name, version, ctx)?
         } else {
             // dep_decl_source=None (compat path): fall through to milpa.kdl / nimble
             if ctx.has_milpa_kdl {
@@ -315,8 +425,19 @@ pub fn resolve_edges<'cache>(
 /// S3b injection-point trait. Implementors parse a pre-fetched DepDecl
 /// artifact and return an `EdgeSet`. The trait is structurally present so
 /// S3b can inject without changing the coordinator's signature.
+///
+/// Returns `Result<EdgeSet, MilpaError>` so that integrity failures
+/// (`HASH-MISMATCH`, `PARSE-ERROR`, `SCHEMA-MISMATCH`, `SCHEMA-UNSUPPORTED`)
+/// can be propagated as hard errors through `resolve_edges`.
+/// `TNG-DEPDECL-FETCH-FAILED` (soft, policy-gated) should be handled by the
+/// implementor before returning; see `PolicyDepDeclSource` in `resolver.rs`.
 pub trait DepDeclSource {
-    fn edges_for(&self, name: &str, version: &Version, ctx: &EdgeSourceCtx) -> EdgeSet;
+    fn edges_for(
+        &self,
+        name: &str,
+        version: &Version,
+        ctx: &EdgeSourceCtx,
+    ) -> Result<EdgeSet, crate::MilpaError>;
 }
 
 /// S3b: DepDecl-backed edge source. Wraps a `DepDeclStore` and implements
@@ -890,6 +1011,7 @@ overrides {
                 name: "bar".to_string(),
                 constraint_str: ">= 1.0.0".to_string(),
                 predicates: Vec::new(),
+                namespace: None,
             })],
             src_dir: String::new(),
             source: EdgeSource::MilpaKdl,
@@ -922,11 +1044,13 @@ overrides {
                     name: "foo".to_string(),
                     constraint_str: String::new(),
                     predicates: vec![p_linux.clone()],
+                    namespace: None,
                 }),
                 RequireEntry::Named(NamedRequire {
                     name: "foo".to_string(),
                     constraint_str: String::new(),
                     predicates: vec![p_mac.clone()],
+                    namespace: None,
                 }),
             ],
             src_dir: String::new(),
@@ -985,6 +1109,7 @@ overrides {
                 name: "extra".to_string(),
                 constraint_str: String::new(),
                 predicates: vec![p.clone()],
+                namespace: None,
             })],
             src_dir: String::new(),
             source: EdgeSource::NimbleFallback,

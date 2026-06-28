@@ -1,0 +1,17 @@
+// fixture-317: H2 fix — transitive qualified named dep preserves namespace
+//
+// Root depends on foo (URL dep).  foo's milpa.kdl declares "ns1/baz" — a
+// qualified named dep using slash syntax.  The resolved lockfile must carry
+// dep "baz" { namespace "ns1"; ... } (not plain dep "baz" with no namespace,
+// and not the old broken dep "ns1::baz").
+//
+// Before H2 fix: NamedRequire had no namespace field; the namespace was
+// silently dropped crossing the EdgeSet boundary → baz appeared in the
+// lockfile as a bare dep with no namespace (or resolution failed).
+// After H2 fix:  NamedRequire carries namespace; the qualified key propagates
+// end-to-end through solver → graph → lockfile.
+name "testapp"
+kind "application"
+deps {
+    foo git=(url)"https://example.com/foo.git" ref="main"
+}

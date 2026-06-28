@@ -531,23 +531,18 @@ def _kdl_val_to_milpa(val: object) -> KdlValue:
 def _kdl_entry_as_url(val: object) -> UrlValue | None:
     """Extract a ``UrlValue`` from a raw kdl-py entry value.
 
-    Recognises three forms:
-    1. ``kdl.types.String`` with ``tag == "url"`` — the normative annotated form.
-    2. ``kdl.types.String`` with ``tag is None`` — plain string accepted as URL
-       per ``manifest-grammar.md`` §4 rule 4.
-    3. Plain Python ``str`` — bare untagged string (untagged-native path).
+    S3 strict: ONLY the ``(url)``-annotated form is accepted.
+    Plain strings (tag is None) and other annotations all return ``None``
+    so the caller can raise ``MAN-URL-ARG-TYPE``.
 
-    Any non-string type (bool, float, None, etc.) returns ``None`` so the
-    caller can raise ``MAN-*-ARG-TYPE``.
+    Any non-string type (bool, float, None, etc.) also returns ``None``.
     """
     if isinstance(val, _kdl.types.String):
-        # tag == "url" → normative form; tag is None → plain string; both OK
-        if val.tag in ("url", None):
+        if val.tag == "url":
             return UrlValue(val.value)
-        # Some other annotation — not a URL
+        # Plain string (tag is None) or other annotation → rejected
         return None
-    if isinstance(val, str):
-        return UrlValue(val)
+    # Plain Python str (untagged-native path) → rejected under S3
     return None
 
 

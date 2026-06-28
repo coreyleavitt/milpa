@@ -230,12 +230,6 @@ A dep's pinned identity is not present in the CAS.
 
 **Triggered:** _link_external finds the dep's identity is absent or None, or CAStore.contains returns False.
 
-### `FROZEN-LEGACY-REGISTRY-PROVENANCE`
-
-A lock entry uses the legacy registry provenance and cannot be reconstructed by the frozen path.
-
-**Triggered:** _source_from_provenance encounters a RegistryProvenanceRecord; the user must run `milpa update <name>` to re-resolve via tianguis.
-
 ### `FROZEN-LOCAL-DEP`
 
 A dep has a local provenance; editable trees always re-resolve.
@@ -376,9 +370,9 @@ A `dep` node requires exactly one string argument (the name).
 
 ### `LOCK-DEP-NAME-INVALID`
 
-A dep's `name` or an entry in its `aliases` list in the lockfile contains characters outside the dep-name charset `[A-Za-z0-9_-]+`.
+A dep's `name`, `namespace`, or an entry in its `aliases` list in the lockfile contains characters outside the dep-name charset `[A-Za-z0-9_-]+`.
 
-**Triggered:** The lockfile parse boundary validates the dep name and every alias against the same charset predicate as the manifest parse (`MAN-DEP-NAME-INVALID`; Python `_FLAG_NAME_CHARSET_RE`, Rust `valid_flag_name`).  A poisoned `milpa.lock` with a name like `../evil` (containing `/`) would otherwise flow to `nim.cfg --path:` via string concat and to the filesystem via `deps_dir / name`, enabling path traversal outside `_deps/`.  The charset predicate (not `contains_unsafe_char`) is used because `/` and `.` are not control characters.  Both impls validate at the lockfile parse boundary so all consumers (`verify`, `frozen`, `show`) are covered.
+**Triggered:** The lockfile parse boundary validates the dep name, every alias, and the optional `namespace` child node against the same charset predicate as the manifest parse (`MAN-DEP-NAME-INVALID`; Python `_FLAG_NAME_CHARSET_RE`, Rust `valid_flag_name`).  A poisoned `milpa.lock` with a name like `../evil` (containing `/`) would otherwise flow to `nim.cfg --path:` via string concat and to the filesystem via `deps_dir / name`, enabling path traversal outside `_deps/`.  Likewise, a traversal namespace `"ns/../../x"` in the `namespace` child node would escape `_deps/` via `dep_dir_name` → `@ns/../../x/<name>`.  The charset predicate (not `contains_unsafe_char`) is used because `/` and `.` are not control characters.  Both impls validate at the lockfile parse boundary so all consumers (`verify`, `frozen`, `show`) are covered.
 
 ### `LOCK-DEP-NOT-FOUND`
 
@@ -450,7 +444,7 @@ A provenance block is missing the `kind` discriminator.
 
 Unknown provenance `kind` value.
 
-**Triggered:** The `kind` field is not one of: git, tarball, local, member, oci, registry.
+**Triggered:** The `kind` field is not one of: git, tarball, local, member, oci.
 
 ### `LOCK-SRC-DIR-UNSAFE`
 
@@ -475,6 +469,12 @@ Lockfile is missing the required top-level `version` node.
 Lockfile schema version is not supported by this milpa.
 
 **Triggered:** The `version` integer is higher than LOCKFILE_SCHEMA_VERSION.
+
+### `LOCK-STRATEGY-MISSING`
+
+Lockfile has an absent or malformed top-level `strategy` node.
+
+**Triggered:** parse_lockfile finds no `strategy` node in the KDL document, OR the `strategy` node is present but its argument is not a recognized string value (e.g. an integer literal). A conformant emitter always writes this node with a valid string value; its absence or malformed form means the lockfile predates the strict-parser era or was hand-written incorrectly. Regenerate via `milpa fetch`.
 
 ## MAN
 
@@ -563,9 +563,11 @@ MemberDep takes no properties.
 
 ### `MAN-DEP-NAME-INVALID`
 
-A dep node name contains characters not allowed in the dep-name charset `[A-Za-z0-9_-]+`.
+A dep node name contains characters not allowed in the dep-name charset `[A-Za-z0-9_-]+`, or is a malformed slash-shorthand NamedDep.
 
-**Triggered:** A dep declaration's KDL node name contains characters outside `[A-Za-z0-9_-]+`. KDL 2.0 quoted node names can contain spaces, `\n`, `!`, and other characters not permitted in milpa dep names. Because dep names flow to nim.cfg path emission (`--path:"_deps/<name>"`) and feature-flag defines (`-d:<pkg>_<flag>`), the parse boundary MUST validate every dep name against the dep-name charset and reject invalid names before they can propagate. Alias names (derived from dep names via the optional desugar pass) inherit this protection automatically.
+**Triggered:**
+- A dep declaration's KDL node name contains characters outside `[A-Za-z0-9_-]+`. KDL 2.0 quoted node names can contain spaces, `\n`, `!`, and other characters not permitted in milpa dep names. Because dep names flow to nim.cfg path emission (`--path:"_deps/<name>"`) and feature-flag defines (`-d:<pkg>_<flag>`), the parse boundary MUST validate every dep name against the dep-name charset and reject invalid names before they can propagate. Alias names (derived from dep names via the optional desugar pass) inherit this protection automatically.
+- (S5b) A NamedDep node name uses the slash-shorthand form but contains more than one slash (e.g. `"a/b/c"`), or has an empty segment (e.g. `"/bar"`, `"ns/"`, `"/"`). The parser detects these malformed forms before routing the node name to charset validation.
 
 ### `MAN-DEP-MIRROR-ARITY`
 
@@ -587,9 +589,9 @@ NamedDep's version constraint is invalid: either the positional arg is not a str
 
 ### `MAN-DEP-NAMED-PROPS`
 
-NamedDep takes only a positional version constraint, no properties.
+NamedDep takes only a positional version constraint and the permitted properties `optional=` and `namespace=` (S5b); any other property is rejected.
 
-**Triggered:** A bare-name dep has properties (other than `git=...` which routes elsewhere).
+**Triggered:** A bare-name dep has properties other than `git=` (which routes to UrlDep), `optional=`, or `namespace=`. Also raised when `namespace=` is present but its value is non-string or empty.
 
 ### `MAN-DEP-REF-MISSING`
 
@@ -958,9 +960,9 @@ Unknown top-level node in package manifest.
 
 ### `MAN-URL-ARG-TYPE`
 
-A URL-typed argument must be a string or (url)-annotated value.
+A URL-typed argument must be a `(url)`-annotated string value.
 
-**Triggered:** A URL position receives a non-string, non-ParseResult value.
+**Triggered:** A URL position (`git=`, `tarball=`, or `mirror`) receives a value that is not a `(url)`-annotated string. Both plain (unannotated) strings and non-string types are rejected. KDL typed annotations are mandatory for URL fields; a bare string raises this error.
 
 ### `MAN-WORKSPACE-HAS-DEPS-OR-KIND`
 
@@ -1228,7 +1230,7 @@ The locked `dep_decl` pin no longer matches the current index pointer for a dep 
 
 A workspace member has no directory at the declared path.
 
-**Triggered:** load_workspace resolves a member path and finds no directory there.
+**Triggered:** load_workspace resolves a member path and finds no directory there. This includes the case where the declared member path is a **cyclic symlink** (ELOOP — the symlink chain forms a loop) or a **dangling symlink** (the symlink target does not exist): both are treated as non-existent by the best-effort-resolve algorithm (§11.0), so the directory-existence check fails and yields this error. This is the correct outcome — an unresolvable member path is a missing dir, not an escape.
 
 ### `WS-MEMBER-DOT`
 
@@ -1266,9 +1268,11 @@ A workspace member path resolves outside the workspace root.
 
 **Triggered:** load_workspace resolves a member path and finds it escapes the workspace root directory. This is a security boundary: a workspace must not be able to read or incorporate manifests from arbitrary locations on the filesystem.
 
-Resolution algorithm (Option A — best-effort canonicalization): both root and candidate are resolved via the same algorithm: the **longest existing path prefix is fully canonicalized** (all symlinks followed), and the remaining non-existent suffix is normalized lexically — equivalent to Python `Path.resolve(strict=False)`. A dangling symlink encountered **anywhere along the path** (not only as the final component) has its (single-hop) link target read and resolved relative to the canonicalized parent before lexical normalization, so an outside-pointing dangling symlink is detected as an escape regardless of whether it is the terminal component or a mid-path component. Note: multi-hop symlink chains and symlink cycles are only resolved one hop deep by this algorithm — that limitation is tracked by issue #168 and does not affect the current security boundary. This single algorithm handles all cases uniformly: an existing path is fully canonicalized; a non-existent path is resolved with all symlinks in its existing prefix resolved first. The resolved candidate is an escape iff it does not start with the resolved root — this comparison is **inclusive**: a candidate that resolves to exactly the root is NOT an escape (it falls through to the `WS-MEMBER-IS-WORKSPACE` manifest-parse check, which fires because the root's own `milpa.kdl` is a workspace document). This inclusive semantics is what ensures `"pkg/.."` (which lexically reduces to the root) yields `WS-MEMBER-IS-WORKSPACE`, not `WS-MEMBER-PATH-ESCAPE`, even when the workspace root is accessed via a symlinked path.
+Resolution algorithm (best-effort canonicalization — spec §11.0): both root and candidate are resolved via the **best-effort-resolve** algorithm — the longest **stat-existing** prefix is fully canonicalized (all symlinks followed via `stat`, not `lstat`), and the remaining non-existent suffix is normalized lexically. The resolved candidate is an escape iff it does not start with the resolved root — this comparison is **inclusive**: a candidate that resolves to exactly the root is NOT an escape (it falls through to the `WS-MEMBER-IS-WORKSPACE` manifest-parse check). This inclusive semantics ensures `"pkg/.."` (which lexically reduces to the root) yields `WS-MEMBER-IS-WORKSPACE`, not `WS-MEMBER-PATH-ESCAPE`, even when the workspace root is accessed via a symlinked path.
 
-The check runs after the dot-path check (so `"."` yields `WS-MEMBER-DOT`, not `WS-MEMBER-PATH-ESCAPE`) and before the directory-existence check (so an escaping path yields `WS-MEMBER-PATH-ESCAPE` regardless of whether the target directory exists).
+Critically, **`stat` (not `lstat`) is used** to determine which prefix "exists," so dangling and cyclic symlinks are treated as non-existent: their stat fails, the longest stat-existing prefix is the parent directory, and the result stays within the workspace root → `WS-MEMBER-DIR-MISSING` rather than `WS-MEMBER-PATH-ESCAPE`. Only an existing symlink whose target genuinely resolves outside the root (stat succeeds and the canonical path is outside) yields `WS-MEMBER-PATH-ESCAPE`.
+
+The check runs after the dot-path check (so `"."` yields `WS-MEMBER-DOT`, not `WS-MEMBER-PATH-ESCAPE`) and before the directory-existence check (so a live escaping path yields `WS-MEMBER-PATH-ESCAPE` regardless of whether the target directory exists).
 
 ### `WS-NO-MANIFEST`
 

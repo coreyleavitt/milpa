@@ -349,6 +349,76 @@ impl Index {
         }
         Ok(satisfying)
     }
+
+    /// S5b: qualified (namespace, name) lookup — never returns `TNG-AMBIGUOUS-NAME`.
+    /// Returns `None` when the exact `(namespace, name)` pair is absent from the index.
+    pub fn lookup_qualified(&self, namespace: &str, name: &str) -> Option<Package> {
+        self.packages
+            .iter()
+            .find(|p| p.name == name && p.namespace == namespace)
+            .cloned()
+    }
+
+    /// S5b: resolve a qualified `(namespace, name)` dep.  Bypasses bare-name
+    /// collision detection — the caller already asserts the exact namespace.
+    pub fn resolve_named_all_qualified(
+        &self,
+        namespace: &str,
+        name: &str,
+        vs: &VersionSet,
+        constraint_desc: Option<&str>,
+    ) -> Result<Vec<IndexVersion>, CoreError> {
+        let qualified = format!("{namespace}/{name}");
+        let pkg = match self.lookup_qualified(namespace, name) {
+            Some(p) => p,
+            None => {
+                return Err(tng(
+                    "TNG-NOT-FOUND",
+                    format!("package {qualified:?} is not in the tianguis index"),
+                ));
+            }
+        };
+
+        let mut satisfying: Vec<IndexVersion> = Vec::new();
+        let mut provenance_less: Vec<String> = Vec::new();
+        for v in &pkg.versions {
+            let Some(parsed) = parse_version(&v.version) else {
+                continue;
+            };
+            if vs.contains(&parsed) {
+                if v.provenances.is_empty() {
+                    provenance_less.push(v.version.clone());
+                    continue;
+                }
+                satisfying.push(v.clone());
+            }
+        }
+
+        if satisfying.is_empty() {
+            if !provenance_less.is_empty() {
+                return Err(tng(
+                    "TNG-NO-PROVENANCE",
+                    format!(
+                        "{qualified:?} has no fetchable version satisfying {constraint_desc:?} — \
+                         all satisfying versions lack provenance: {}",
+                        provenance_less.join(", ")
+                    ),
+                ));
+            }
+            return Err(tng(
+                "TNG-NO-SATISFYING-VERSION",
+                format!(
+                    "no version of {qualified:?} satisfies constraint {constraint_desc:?} (available: {})",
+                    pkg.versions
+                        .iter()
+                        .map(|v| v.version.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        }
+        Ok(satisfying)
+    }
 }
 
 // ---------------------------------------------------------------------------

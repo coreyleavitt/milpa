@@ -1,0 +1,13 @@
+schema_version 1
+package "bar" {
+    namespace "ns1"
+    version "1.0.0" {
+        content_hash "sha256:f87b54ab50cb9d983d25a264feb8117d671bd819f4e7d48cd3db7dc220480b3e"
+        provenance {
+            kind "git"
+            url "https://github.com/ns1/bar.git"
+            ref "v1.0.0"
+            commit_sha "beef0000beef0000beef0000beef0000beef0000"
+        }
+    }
+}

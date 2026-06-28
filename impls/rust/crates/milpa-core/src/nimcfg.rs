@@ -53,8 +53,14 @@ pub fn format_nimcfg(
         lines.push(format!("--path:\"{self_src_dir}\""));
     }
 
+    // C1: sort by dep_dir_name ("@ns/name" for qualified, "name" for bare) so
+    // two qualified deps with the same bare name sort deterministically by namespace.
     let mut ordered: Vec<&ResolvedDep> = graph.deps.iter().collect();
-    ordered.sort_by(|a, b| a.name.cmp(&b.name));
+    ordered.sort_by(|a, b| {
+        let a_dir = milpa_types::dep_dir_name(&a.name, a.namespace.as_deref());
+        let b_dir = milpa_types::dep_dir_name(&b.name, b.namespace.as_deref());
+        a_dir.cmp(&b_dir)
+    });
     for dep in &ordered {
         lines.push(format!("--path:\"{}\"", path_for(dep, deps_dir)));
         // B-nimcfg: emit one --path: per alias (already lex-sorted on dep.aliases).
@@ -114,9 +120,11 @@ pub fn format_nimcfg(
     lines.join("\n")
 }
 
-/// `<deps_dir>/<name>[/<src_dir>]` in POSIX form.
+/// `<deps_dir>/<dep_dir_name>[/<src_dir>]` in POSIX form.
+/// C1: uses dep_dir_name so qualified deps get `_deps/@ns/name/src` paths.
 fn path_for(dep: &ResolvedDep, deps_dir: &str) -> String {
-    let mut base = format!("{deps_dir}/{}", dep.name);
+    let dir = milpa_types::dep_dir_name(&dep.name, dep.namespace.as_deref());
+    let mut base = format!("{deps_dir}/{}", dir);
     if !dep.src_dir.is_empty() {
         base.push('/');
         base.push_str(&dep.src_dir);
@@ -146,7 +154,9 @@ pub fn build_flag_defines(
 ) -> HashMap<String, HashMap<String, Vec<String>>> {
     let mut result: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
     for dep in &graph.deps {
-        let manifest_path = deps_dir.join(&dep.name).join("milpa.kdl");
+        // C1: use dep_dir_name so qualified deps are found at _deps/@ns/name/milpa.kdl.
+        let dir_entry = milpa_types::dep_dir_name(&dep.name, dep.namespace.as_deref());
+        let manifest_path = deps_dir.join(&dir_entry).join("milpa.kdl");
         let text = match std::fs::read_to_string(&manifest_path) {
             Ok(t) => t,
             Err(_) => continue,
@@ -160,6 +170,9 @@ pub fn build_flag_defines(
             .into_iter()
             .map(|f| (f.name, f.defines))
             .collect();
+        // Key by dep.name (bare name) — flag defines are keyed by the dep's
+        // canonical bare name, not its dir_entry. This matches how format_nimcfg
+        // looks them up (by dep.name).
         result.insert(dep.name.clone(), flag_map);
     }
     result
@@ -345,6 +358,7 @@ mod tests {
     fn dep(name: &str, src_dir: &str) -> ResolvedDep {
         ResolvedDep {
             name: name.into(),
+            namespace: None,
             identity: "sha256:00".into(),
             version: Version::release(0, 0, 1),
             src_dir: src_dir.into(),
@@ -432,6 +446,7 @@ mod tests {
     fn dep_with_aliases(name: &str, src_dir: &str, aliases: Vec<String>) -> ResolvedDep {
         ResolvedDep {
             name: name.into(),
+            namespace: None,
             identity: "sha256:00".into(),
             version: Version::release(0, 0, 1),
             src_dir: src_dir.into(),
@@ -523,6 +538,7 @@ mod tests {
     fn dep_with_flags(name: &str, active_flags: Vec<String>) -> ResolvedDep {
         ResolvedDep {
             name: name.into(),
+            namespace: None,
             identity: "sha256:00".into(),
             version: Version::release(0, 0, 1),
             src_dir: String::new(),

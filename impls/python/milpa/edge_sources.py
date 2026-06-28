@@ -201,7 +201,7 @@ def _nimble_edges(dep_path: Path, dep_name: str) -> tuple[list[NamedRequire | Ur
         # produce NimbleManifest without dep_predicates (e.g. old tests).
         preds = nm.dep_predicates[i] if i < len(nm.dep_predicates) else ()
         if isinstance(dep, UrlDep):
-            requires.append(UrlRequire(url=dep.git, ref=dep.ref, predicates=preds))
+            requires.append(UrlRequire(url=dep.git, ref=dep.ref, predicates=preds, name=dep.name))
         elif isinstance(dep, NamedDep):
             if dep.name == "nim":
                 continue
@@ -338,13 +338,24 @@ def _manifest_to_edgeset(
         if not dep_passes_flag_predicates(predicates, effective_flags):
             continue
         if isinstance(dep, UrlDep):
-            requires.append(UrlRequire(url=dep.git, ref=dep.ref))
+            requires.append(UrlRequire(
+                url=dep.git,
+                ref=dep.ref,
+                name=dep.name,
+                # S3 + S4b: carry flag_requests so edgeset_to_bfs_deps can pass
+                # them through to UrlDep without a second manifest parse.
+                # Matches Rust UrlRequire.flag_requests (milpa-types).
+                flag_requests=dep.flag_requests,
+            ))
         elif isinstance(dep, NamedDep):
             if dep.name == "nim":
                 continue
             requires.append(NamedRequire(
                 name=dep.name,
                 constraint_str=dep.constraint or "",
+                # H2 (rfc-resolver-correctness.md): carry namespace so transitive
+                # qualified deps survive the EdgeSet boundary.
+                namespace=dep.namespace,
             ))
         # Tarball/Local/Member from transitive milpa.kdl: out of scope (mirrors
         # existing _parse_transitive_deps deferral; only URL + named enter the graph).
@@ -450,25 +461,25 @@ class DepDeclEdgeSource:
 # ---------------------------------------------------------------------------
 
 
-def resolve_edges(
+def _resolve_edges_pure(
     name: str,
     version: "Version",
     ctx: EdgeSourceCtx,
-    edge_cache: dict[tuple[str, "Version"], EdgeSet],
     *,
     nimble_source: NimbleEdgeSource | None = None,
     milpakdl_source: MilpaKdlEdgeSource | None = None,
     dep_decl_source: "DepDeclEdgeSource | None" = None,
     strict_attestation: bool = False,
 ) -> EdgeSet:
-    """Decide which EdgeSource supplies edges for ``(name, version)`` — once.
+    """Implement clauses (b)(c)(d) of §4.2.1 ``resolve_edges`` — no cache.
 
-    Implements spec/resolver-semantics.md §4.2.1 ``resolve_edges`` (S4-i amendment):
-
-    Clause (a) — Sealed once:
-        If ``(name, version)`` is in ``edge_cache``, return the sealed EdgeSet
-        immediately.  A diamond where two BFS parents reach ``D@v`` cannot yield
-        two different EdgeSets.
+    This is the **pure** dispatch used by:
+    - The URL/tarball/local **workers** (S2b): they call this directly because
+      they run on worker threads before the edge_cache is available for writing.
+      Workers now honor clause (b) override-suppression and clause (c) DepDecl
+      instead of falling through to clause (d) only (the old ``_pick_edges`` bug).
+    - ``resolve_edges`` (the thin cached wrapper below): delegates to this after
+      the clause-(a) cache check.
 
     Clause (b) — Override suppresses DepDecl:
         When ``ctx.is_overridden``, the attested DepDecl describes the *original*
@@ -477,47 +488,11 @@ def resolve_edges(
 
     Clause (c) — DepDecl mainline (S3b):
         When ``ctx.dep_decl`` is set AND ``dep_decl_source`` is not None, use the
-        attested source.  The resolver injects a ``DepDeclEdgeSource`` from
-        ``MilpaEnv.dep_decl_store`` (wired at S3b — resolver.py line ~222/304).
+        attested source.
 
     Clause (d) — MilpaKdl / Nimble fallback:
         ``has_milpa_kdl → MilpaKdlEdgeSource``; else ``NimbleEdgeSource``.
-
-    Parameters
-    ----------
-    name, version:
-        The package being resolved.
-    ctx:
-        Per-package context (dep_path, dep_decl, is_overridden, has_milpa_kdl, …).
-    edge_cache:
-        Resolver-scoped memo; mutated in place (caller owns).
-    nimble_source:
-        Injectable NimbleEdgeSource (default: a fresh NimbleEdgeSource()).
-    milpakdl_source:
-        Injectable MilpaKdlEdgeSource (default: a fresh MilpaKdlEdgeSource()).
-    dep_decl_source:
-        ``DepDeclEdgeSource`` instance (S3b).  ``None`` falls through to
-        MilpaKdl/Nimble (S4-i compatibility behavior).  After S3b, the
-        resolver injects a real instance from ``MilpaEnv.dep_decl_store``.
-    strict_attestation:
-        When ``True`` (strict policy from manifest OR ``--require-attested-metadata``
-        flag), ``TNG-DEPDECL-FETCH-FAILED`` from the DepDecl store is re-raised
-        as a hard error (S5 strict clause b).  When ``False`` (non-strict,
-        default), an unreachable DepDecl artifact falls through to Nimble
-        fallback so resolution can continue (S5 non-strict deferred behaviour).
-        Integrity failures (HASH-MISMATCH, PARSE-ERROR, SCHEMA-*) are ALWAYS
-        hard errors regardless of this flag.
-
-    Returns
-    -------
-    EdgeSet
-        Sealed in ``edge_cache`` on first call; returned from cache on repeat calls.
     """
-    # Clause (a): sealed once — parent-independent.
-    cache_key = (name, version)
-    if cache_key in edge_cache:
-        return edge_cache[cache_key]
-
     # Resolve source singletons.
     _nimble = nimble_source if nimble_source is not None else NimbleEdgeSource()
     _milpakdl = milpakdl_source if milpakdl_source is not None else MilpaKdlEdgeSource()
@@ -557,6 +532,74 @@ def resolve_edges(
     else:
         # Clause (d): raw git-URL dep with no milpa.kdl → NimbleEdgeSource.
         es = _nimble.edges_for(name, version, ctx)
+
+    return es
+
+
+def resolve_edges(
+    name: str,
+    version: "Version",
+    ctx: EdgeSourceCtx,
+    edge_cache: dict[tuple[str, "Version"], EdgeSet],
+    *,
+    nimble_source: NimbleEdgeSource | None = None,
+    milpakdl_source: MilpaKdlEdgeSource | None = None,
+    dep_decl_source: "DepDeclEdgeSource | None" = None,
+    strict_attestation: bool = False,
+) -> EdgeSet:
+    """Thin cached wrapper: clause (a) + delegates to ``_resolve_edges_pure``.
+
+    Implements spec/resolver-semantics.md §4.2.1 ``resolve_edges`` (S4-i amendment):
+
+    Clause (a) — Sealed once:
+        If ``(name, version)`` is in ``edge_cache``, return the sealed EdgeSet
+        immediately.  A diamond where two BFS parents reach ``D@v`` cannot yield
+        two different EdgeSets.
+
+    Clauses (b)(c)(d) — delegated to ``_resolve_edges_pure``.
+
+    Parameters
+    ----------
+    name, version:
+        The package being resolved.
+    ctx:
+        Per-package context (dep_path, dep_decl, is_overridden, has_milpa_kdl, …).
+    edge_cache:
+        Resolver-scoped memo; mutated in place (caller owns).
+    nimble_source:
+        Injectable NimbleEdgeSource (default: a fresh NimbleEdgeSource()).
+    milpakdl_source:
+        Injectable MilpaKdlEdgeSource (default: a fresh MilpaKdlEdgeSource()).
+    dep_decl_source:
+        ``DepDeclEdgeSource`` instance (S3b).  ``None`` falls through to
+        MilpaKdl/Nimble (S4-i compatibility behavior).  After S3b, the
+        resolver injects a real instance from ``MilpaEnv.dep_decl_store``.
+    strict_attestation:
+        When ``True`` (strict policy from manifest OR ``--require-attested-metadata``
+        flag), ``TNG-DEPDECL-FETCH-FAILED`` from the DepDecl store is re-raised
+        as a hard error (S5 strict clause b).  When ``False`` (non-strict,
+        default), an unreachable DepDecl artifact falls through to Nimble
+        fallback so resolution can continue (S5 non-strict deferred behaviour).
+        Integrity failures (HASH-MISMATCH, PARSE-ERROR, SCHEMA-*) are ALWAYS
+        hard errors regardless of this flag.
+
+    Returns
+    -------
+    EdgeSet
+        Sealed in ``edge_cache`` on first call; returned from cache on repeat calls.
+    """
+    # Clause (a): sealed once — parent-independent.
+    cache_key = (name, version)
+    if cache_key in edge_cache:
+        return edge_cache[cache_key]
+
+    es = _resolve_edges_pure(
+        name, version, ctx,
+        nimble_source=nimble_source,
+        milpakdl_source=milpakdl_source,
+        dep_decl_source=dep_decl_source,
+        strict_attestation=strict_attestation,
+    )
 
     # Seal in cache.
     edge_cache[cache_key] = es
@@ -640,11 +683,18 @@ def edgeset_to_terms(
         elif isinstance(entry, NamedRequire):
             if entry.name == "nim":
                 continue
-            if entry.name not in seen_dep_names:
+            # H2 (rfc-resolver-correctness.md): use the solver_var (``ns::name``
+            # for qualified deps) as the PubGrub term key so that
+            # ``ns1::bar`` and ``ns2::bar`` are distinct solver variables even
+            # when both have bare name ``"bar"``.
+            from milpa.version import DepKey as _DK
+            _entry_dk = _DK(name=entry.name, namespace=entry.namespace)
+            _svar = _entry_dk.solver_var()  # "bar" or "ns1::bar"
+            if _svar not in seen_dep_names:
                 if entry.name in overrides_by_name:
                     # Named dep with override → URL at sentinel.
                     dep_terms.append(
-                        Term.require(entry.name, VersionSet.eq(url_dep_version))
+                        Term.require(_svar, VersionSet.eq(url_dep_version))
                     )
                 else:
                     # Parse constraint_str → VersionSet.
@@ -657,13 +707,69 @@ def edgeset_to_terms(
                     else:
                         from milpa.version import VersionSet as VS
                         vs = VS.full()
-                    dep_terms.append(Term.require(entry.name, vs))
-                requires_names.append(entry.name)
-                seen_dep_names.add(entry.name)
+                    dep_terms.append(Term.require(_svar, vs))
+                requires_names.append(_svar)
+                seen_dep_names.add(_svar)
             if entry.predicates:
-                requires_predicates.setdefault(entry.name, []).append(entry.predicates)
+                requires_predicates.setdefault(_svar, []).append(entry.predicates)
 
     return dep_terms, requires_names, requires_predicates
+
+
+def edgeset_to_bfs_deps(
+    es: EdgeSet,
+    overrides_by_name: dict[str, object],
+) -> list[object]:
+    """Convert an ``EdgeSet`` to raw dep objects for BFS enqueuing.
+
+    This is the S2b replacement for ``_collect_transitive_deps``.  Instead of
+    re-parsing the fetched tree (the old bug: ``list(m.deps)`` without flag
+    filtering), workers now call this on the EdgeSet they already computed via
+    ``_resolve_edges_pure`` — which already applied flag filtering via
+    ``_manifest_to_edgeset``.
+
+    Returns a list of ``UrlDep | NamedDep`` objects.  Tarball/Local/Member
+    entries are absent from the EdgeSet by construction (``_manifest_to_edgeset``
+    drops them at line 349), so no explicit filtering is needed here.
+
+    Parameters
+    ----------
+    es:
+        The EdgeSet produced by ``_resolve_edges_pure`` for this dep.
+        Already flag-filtered — every entry in ``es.requires`` is "active".
+    overrides_by_name:
+        Root-manifest overrides dict (passed through for callers; BFS enqueuing
+        applies override routing after this function returns).
+
+    Returns
+    -------
+    list[UrlDep | NamedDep]
+        Raw dep objects ready for ``_enqueue_dep``.
+    """
+    from milpa.manifest import NamedDep as _NamedDep, UrlDep as _UrlDep
+    from milpa.nimble import url_to_name as _url_to_name
+
+    result: list[object] = []
+    for entry in es.requires:
+        if isinstance(entry, UrlRequire):
+            # Use the declared name if set (milpa.kdl/nimble source);
+            # fall back to url_to_name for DepDecl-sourced entries (name=None).
+            if entry.name is not None:
+                name = entry.name
+            else:
+                name = _url_to_name(entry.url)
+            # Pass flag_requests through directly — they're already FlagRequest
+            # objects on UrlRequire (M5: no raw-tuple round-trip).
+            result.append(_UrlDep(name=name, git=entry.url, ref=entry.ref, flag_requests=entry.flag_requests))
+        elif isinstance(entry, NamedRequire):
+            # H2 (rfc-resolver-correctness.md): carry namespace so transitive
+            # qualified deps reconstruct the correct DepKey in the BFS loop.
+            result.append(_NamedDep(
+                name=entry.name,
+                constraint=entry.constraint_str or "",
+                namespace=entry.namespace,
+            ))
+    return result
 
 
 def _name_from_url(url: str) -> str | None:

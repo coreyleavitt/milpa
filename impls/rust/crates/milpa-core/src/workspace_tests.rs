@@ -117,18 +117,18 @@ fn member_symlink_escaping_root_yields_path_escape() {
     assert_eq!(result.code(), "WS-MEMBER-PATH-ESCAPE");
 }
 
-/// Dangling-symlink OUTSIDE root → WS-MEMBER-PATH-ESCAPE.
+/// Dangling-symlink OUTSIDE root → WS-MEMBER-DIR-MISSING (spec §11.0, S4, #168).
 ///
-/// A member dir that is a symlink pointing to a nonexistent path OUTSIDE the
-/// workspace root must yield WS-MEMBER-PATH-ESCAPE, not WS-MEMBER-DIR-MISSING.
-/// Python's `resolve(strict=False)` follows the dangling link and resolves to
-/// the (nonexistent) outside target; `is_relative_to(root)` is False →
-/// WS-MEMBER-PATH-ESCAPE.  Rust must match: before this fix, `candidate.exists()`
-/// returned false (stat follows the dead link) → fell to `normalize_lexically` →
-/// treated the symlink as a plain dir → starts_with(root) true → WRONG slug.
+/// A member dir that is a dangling symlink (target nonexistent, outside the root)
+/// yields WS-MEMBER-DIR-MISSING — NOT WS-MEMBER-PATH-ESCAPE.
+/// spec §11.0: `metadata()` (stat) is used to determine existence; stat fails for
+/// a dangling symlink, so the longest stat-existing prefix is the parent directory.
+/// The resolved candidate is `canonical_root/dangle-out` → inside root → no escape
+/// → dir-existence check fails → WS-MEMBER-DIR-MISSING.
+/// Conformance corpus: fixture-310-ws-member-dangling-symlink.
 #[test]
 #[cfg(unix)]
-fn dangling_symlink_outside_root_yields_path_escape() {
+fn dangling_symlink_outside_root_yields_dir_missing() {
     use std::os::unix::fs::symlink;
 
     // Layout:
@@ -145,11 +145,10 @@ fn dangling_symlink_outside_root_yields_path_escape() {
     ).unwrap();
     // Create dangling symlink: target does NOT exist.
     symlink("../../outside-nonexistent", ws_root.join("dangle-out")).unwrap();
-    // Confirm the target really is missing (so candidate.exists() returns false).
     assert!(!ws_root.join("dangle-out").exists(), "target must be absent for this test to be meaningful");
 
     let result = load_workspace(&ws_root).unwrap_err();
-    assert_eq!(result.code(), "WS-MEMBER-PATH-ESCAPE");
+    assert_eq!(result.code(), "WS-MEMBER-DIR-MISSING");
 }
 
 /// Dangling-symlink INSIDE root → WS-MEMBER-DIR-MISSING (not PATH-ESCAPE).
@@ -182,26 +181,20 @@ fn dangling_symlink_inside_root_yields_dir_missing() {
     assert_eq!(result.code(), "WS-MEMBER-DIR-MISSING");
 }
 
-/// Mid-path dangling symlink: member "danglink/pkg" where "danglink" is a
-/// dangling symlink pointing outside the workspace root.
+/// Mid-path dangling symlink → WS-MEMBER-DIR-MISSING (spec §11.0, S4, #168).
 ///
-/// Python: `(root / "danglink/pkg").resolve(strict=False)` reads danglink's
-/// target, resolves it relative to root → outside path →
-/// `is_relative_to(root)` False → WS-MEMBER-PATH-ESCAPE.
+/// Member "danglink/pkg" where "danglink" is a dangling symlink outside the root.
+/// spec §11.0: `metadata()` (stat) fails for "danglink" → not in the stat-existing
+/// prefix → longest prefix is `workspace-root` → result is
+/// `canonical_root/danglink/pkg` → inside root → no escape → WS-MEMBER-DIR-MISSING.
 ///
-/// Rust before the fix: `symlink_metadata("danglink/pkg")` fails (parent
-/// dangling) → ancestor-walk finds `danglink` → `ancestor.canonicalize()`
-/// fails (dangling) → `normalize_lexically("root/danglink")` (does NOT follow
-/// link) → `root/danglink/pkg` starts_with(root) True → WS-MEMBER-DIR-MISSING.
-/// WRONG slug — divergence from Python.
-///
-/// After the fix: ancestor-walk finds `danglink` → `best_effort_resolve(danglink)`
-/// → dangling branch → reads link target `../../outside-nonexistent` → resolves
-/// outside root → `outside/pkg` starts_with(root) False → WS-MEMBER-PATH-ESCAPE.
-/// CORRECT — parity with Python.
+/// (Before S4 the ancestor-walk used `symlink_metadata` (lstat) which found
+/// "danglink" as the longest existing prefix → `best_effort_resolve(danglink)` →
+/// dangling branch → followed the link target outside the root → PATH-ESCAPE.
+/// The new stat-based walk skips dangling symlinks entirely.)
 #[test]
 #[cfg(unix)]
-fn mid_path_dangling_symlink_outside_root_yields_path_escape() {
+fn mid_path_dangling_symlink_outside_root_yields_dir_missing() {
     use std::os::unix::fs::symlink;
 
     // Layout:
@@ -209,7 +202,6 @@ fn mid_path_dangling_symlink_outside_root_yields_path_escape() {
     //     workspace-root/
     //       milpa.kdl      (workspace declaring member "danglink/pkg")
     //       danglink -> ../../outside-nonexistent  (dangling: target absent)
-    //   (no "outside-nonexistent" directory — the link is dangling)
     let outer = tempfile::tempdir().unwrap();
     let ws_root = outer.path().join("workspace-root");
     std::fs::create_dir_all(&ws_root).unwrap();
@@ -217,21 +209,71 @@ fn mid_path_dangling_symlink_outside_root_yields_path_escape() {
         ws_root.join("milpa.kdl"),
         "workspace {\n    member \"danglink/pkg\"\n}\n",
     ).unwrap();
-    // Create dangling symlink at ws_root/danglink → ../../outside-nonexistent
-    // The target does NOT exist; danglink/pkg is a mid-path dangling case.
     symlink("../../outside-nonexistent", ws_root.join("danglink")).unwrap();
-    // Confirm the member path is truly unreachable (stat fails on danglink/pkg).
     assert!(!ws_root.join("danglink").exists(), "danglink target must be absent");
     assert!(!ws_root.join("danglink/pkg").exists(), "mid-path must be unreachable");
 
     let result = load_workspace(&ws_root).unwrap_err();
     assert_eq!(
         result.code(),
-        "WS-MEMBER-PATH-ESCAPE",
-        "mid-path dangling symlink pointing outside root must yield \
-         WS-MEMBER-PATH-ESCAPE (not WS-MEMBER-DIR-MISSING) — got {:?}",
+        "WS-MEMBER-DIR-MISSING",
+        "mid-path dangling symlink treated as non-existent (spec §11.0) — got {:?}",
         result.code()
     );
+}
+
+/// Cyclic (self-referential) symlink member → WS-MEMBER-DIR-MISSING (spec §11.0, S4, #168).
+///
+/// A member that is a self-referential symlink (`link-self → link-self`) causes stat
+/// to fail with ELOOP.  spec §11.0: stat-based ancestor walk → longest stat-existing
+/// prefix = workspace-root → result is inside root → no escape → WS-MEMBER-DIR-MISSING.
+/// Conformance corpus: fixture-309-ws-member-cyclic-symlink.
+#[test]
+#[cfg(unix)]
+fn cyclic_symlink_member_yields_dir_missing() {
+    use std::os::unix::fs::symlink;
+
+    let outer = tempfile::tempdir().unwrap();
+    let ws_root = outer.path().join("workspace-root");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    std::fs::write(
+        ws_root.join("milpa.kdl"),
+        "workspace {\n    member \"link-self\"\n}\n",
+    ).unwrap();
+    // Self-referential symlink: link-self → link-self
+    symlink("link-self", ws_root.join("link-self")).unwrap();
+    assert!(!ws_root.join("link-self").exists(), "cyclic symlink must not stat-exist");
+
+    let result = load_workspace(&ws_root).unwrap_err();
+    assert_eq!(
+        result.code(),
+        "WS-MEMBER-DIR-MISSING",
+        "cyclic symlink member must yield WS-MEMBER-DIR-MISSING (spec §11.0) — got {:?}",
+        result.code()
+    );
+}
+
+/// Two-hop cyclic symlink (a→b, b→a) member → WS-MEMBER-DIR-MISSING (spec §11.0).
+///
+/// Exercises the ELOOP stat failure path for multi-hop cycles.
+#[test]
+#[cfg(unix)]
+fn two_hop_cyclic_symlink_member_yields_dir_missing() {
+    use std::os::unix::fs::symlink;
+
+    let outer = tempfile::tempdir().unwrap();
+    let ws_root = outer.path().join("workspace-root");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    std::fs::write(
+        ws_root.join("milpa.kdl"),
+        "workspace {\n    member \"link-a\"\n}\n",
+    ).unwrap();
+    symlink("link-b", ws_root.join("link-a")).unwrap();
+    symlink("link-a", ws_root.join("link-b")).unwrap();
+    assert!(!ws_root.join("link-a").exists(), "cyclic symlink must not stat-exist");
+
+    let result = load_workspace(&ws_root).unwrap_err();
+    assert_eq!(result.code(), "WS-MEMBER-DIR-MISSING");
 }
 
 #[test]

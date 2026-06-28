@@ -546,6 +546,97 @@ error `MAN-PREDICATE-MIXED-NEGATION`) is defined in
 
 ---
 
+## 6a  DepKey — resolver identity key
+
+> NORMATIVE: Every implementation MUST represent the resolver-level identity
+> of a dep as a **`DepKey`** value, not a bare string. The canonical shape is:
+>
+> ```
+> DepKey { name: String, namespace: Option<String> }
+> ```
+>
+> In S1 (rfc-resolver-correctness.md), `namespace` is always `None` — strictly
+> equivalent to a bare string but type-correct. S5b populates `namespace` from
+> the manifest grammar for namespace-qualified `NamedDep` references.
+>
+> **Ordering:** `DepKey` values are ordered lexicographically by `(namespace,
+> name)`, with `None` namespace sorting before any non-`None` value.
+>
+> **Usage:** `DepKey` is used as the key in the frozen-path manifest-coverage
+> index (§7.1 condition 2) and MUST be used in `seen_named` (the resolver's
+> transitive-named-dep dedup set, S5a). This forces the alias-awareness fix:
+> the index maps EVERY canonical name AND every alias to its `LockedDep`.
+
+## 6b  Solver variable (solver_var) — S5b
+
+> NORMATIVE (S5b): The **solver variable** is the string key used INTERNALLY
+> by the PubGrub solver. It is derived from the `DepKey`:
+>
+> - Bare dep (`namespace == None`): `solver_var = name`
+> - Qualified dep (`namespace == Some(ns)`): `solver_var = "ns::name"`
+>
+> The double-colon separator (`::`) is SOLVER-INTERNAL ONLY. It MUST NOT
+> appear in the lockfile, the `_deps/` layout, the `nim.cfg` path entries,
+> or the `requires` list. The `::` form is invisible to users; it never
+> reaches any serialized surface.
+>
+> **Consequence:** Two NamedDeps with the same bare `name` but different
+> `namespace` values have distinct solver variables and are treated as
+> completely independent packages by the solver.
+>
+> **Cross-name precedence gate:** The gate that prevents two different
+> transports from claiming the same dep (RES-PROVENANCE-CONFLICT) MUST key
+> on the solver variable, not the bare name. Two qualified deps sharing a
+> bare name MUST NOT be flagged as conflicting by the gate.
+
+## 6c  On-disk layout for qualified deps — S5b
+
+> NORMATIVE (S5b): A qualified dep MUST be materialized under
+> `_deps/@<namespace>/<name>/` (npm-scope form). A bare dep is materialized
+> as `_deps/<name>/` (unchanged). The `@` prefix is RESERVED — bare dep
+> names MUST NOT start with `@` (see `spec/manifest-grammar.md §2.1`).
+>
+> This form is Windows-safe (no `:` in path components), human-readable, and
+> collision-free with bare names.
+>
+> **nim.cfg:** Qualified dep paths are emitted as
+> `--path:"_deps/@<namespace>/<name>/src"`. Bare dep paths are unchanged.
+>
+> **requires field in lockfile:** When dep A requires qualified dep B
+> (`namespace = "ns"`, `name = "bar"`), A's `requires` node lists it as
+> `"ns/bar"` (slash-separated). This is the canonical serialized form for
+> qualified dep names in `requires`. Bare dep names are unchanged.
+>
+> **Lockfile dep node:** A qualified dep is serialized with the bare name as
+> the node argument and `namespace` as the FIRST child node:
+>
+> ```kdl
+> dep "bar" {
+>     namespace "ns1"
+>     identity "sha256:..."
+>     ...
+> }
+> ```
+>
+> The lockfile records two qualified deps with the same bare name as two
+> separate `dep "bar"` nodes distinguished by their `namespace` child:
+>
+> ```kdl
+> dep "bar" {
+>     namespace "ns1"
+>     identity "sha256:aaa..."
+>     ...
+> }
+>
+> dep "bar" {
+>     namespace "ns2"
+>     identity "sha256:bbb..."
+>     ...
+> }
+> ```
+>
+> And `_deps/` contains: `_deps/@ns1/bar/` and `_deps/@ns2/bar/`.
+
 ## 7  `--frozen` resolution
 
 `--frozen` is a resolver behavior, not merely a CLI flag. The normative
@@ -590,7 +681,11 @@ cross-references this section rather than restating the list.
 > 1. **`FROZEN-STRATEGY-MISMATCH`** — the lockfile's recorded `strategy`
 >    field does not equal the requested `Strategy`.
 > 2. **`FROZEN-MANIFEST-DEP-NOT-IN-LOCK`** — a dep declared in the
->    manifest has no corresponding lockfile entry.
+>    manifest's `deps` **or** `dev-deps` (§9 cross-ref) has no corresponding
+>    lockfile entry. The check is alias-aware: a manifest dep whose name
+>    matches a lockfile alias (not just a canonical name) is considered
+>    present (S1, rfc-resolver-correctness.md #142). Both `deps` and
+>    `dev-deps` are checked on both the single-package and workspace paths.
 > 3. **`FROZEN-LOCKED-VERSION-UNPARSEABLE`** — a locked version string
 >    cannot be parsed as a valid semver `X.Y.Z`.
 > 4. **`FROZEN-CONSTRAINT-UNSATISFIED`** — for a `NamedDep` with a
@@ -598,16 +693,13 @@ cross-references this section rather than restating the list.
 >    constraint.
 > 5. **`FROZEN-IDENTITY-NOT-IN-STORE`** — a dep's recorded identity is
 >    absent from the CAS.
-> 6. **`FROZEN-LEGACY-REGISTRY-PROVENANCE`** — a locked dep carries the
->    legacy `kind "registry"` provenance record (pre-#97 lockfile); run
->    `milpa update <dep>` to re-resolve it through the tianguis index.
-> 7. **`FROZEN-LOCAL-DEP`** — a dep carries a local-path provenance;
+> 6. **`FROZEN-LOCAL-DEP`** — a dep carries a local-path provenance;
 >    editable trees always re-resolve.
-> 8. **`FROZEN-MEMBER-DEP`** — a locked dep carries a workspace-member
+> 7. **`FROZEN-MEMBER-DEP`** — a locked dep carries a workspace-member
 >    provenance in a single-package (non-workspace) resolve context.
-> 9. **`FROZEN-MEMBER-NOT-IN-WORKSPACE`** — the lockfile references a
+> 8. **`FROZEN-MEMBER-NOT-IN-WORKSPACE`** — the lockfile references a
 >    workspace member that is not present in the current workspace.
-> 10. **`FROZEN-MEMBER-IDENTITY-DRIFT`** — a workspace member's on-disk
+> 9. **`FROZEN-MEMBER-IDENTITY-DRIFT`** — a workspace member's on-disk
 >     `content_hash` differs from the lockfile's pinned identity.
 >
 > No other `FROZEN-*` *resolve-path preconditions* exist; this list is
@@ -616,17 +708,12 @@ cross-references this section rather than restating the list.
 > path is entered (the caller, `_try_frozen` / `_try_workspace_frozen`,
 > checks for a present `milpa.lock` and an attached CAS; see
 > `spec/cli-contract.md` and `spec/errors.md`). They are a distinct layer
-> from the ten preconditions above and bring the catalog total to twelve
+> from the nine preconditions above and bring the catalog total to eleven
 > `FROZEN-*` codes.
 
-> NORMATIVE: Conditions 1–5 and 7 are checked inside `resolve_frozen()`
-> (single-package path); conditions 8–10 are checked inside
-> `resolve_workspace_frozen()`. **Condition 6
-> (`FROZEN-LEGACY-REGISTRY-PROVENANCE`) is checked in BOTH paths** — it is
-> raised via `_source_from_provenance` wherever a locked dep is materialized, so
-> a `registry`-provenance dep in a workspace member triggers it under
-> `resolve_workspace_frozen()` exactly as it does in the single-package path. An
-> implementation MUST NOT scope condition 6 to the single-package path only.
+> NORMATIVE: Conditions 1–5 and 6 are checked inside `resolve_frozen()`
+> (single-package path); conditions 7–9 are checked inside
+> `resolve_workspace_frozen()` (workspace path).
 
 > NORMATIVE: Workspace-member deps are verified by computing their
 > on-disk `content_hash` and comparing against the lockfile's pinned
@@ -883,6 +970,51 @@ A workspace is a collection of related packages resolved together into
 one shared graph. This section is normative for any implementation that
 supports milpa workspace manifests.
 
+### 11.0  Member-path canonicalization (S4 — #168)
+
+> NORMATIVE: Before checking whether a declared member path escapes the
+> workspace root, a conformant implementation MUST canonicalize the
+> candidate path using the **best-effort-resolve** algorithm:
+>
+> 1. If the full candidate path **stat-exists** (i.e. `stat()` succeeds,
+>    following all symlinks), fully canonicalize it (resolve all symlinks
+>    to real paths).
+> 2. Otherwise, walk up the path hierarchy from longest to shortest
+>    prefix, finding the longest prefix for which `stat()` succeeds.
+>    Canonicalize that prefix (all symlinks resolved), then append the
+>    remaining suffix and normalize lexically (`..` / `.` eliminated
+>    without touching the filesystem).
+>
+> **Critical invariant:** a dangling or cyclic symlink MUST be treated
+> as non-existent — `stat()` MUST be used (follows symlinks), NOT
+> `lstat()` (which would lstat-succeed on a dangling or cyclic symlink
+> and therefore include the symlink itself in the "existing prefix").
+> Concretely: if the declared member path is a dangling symlink (target
+> absent) or a cyclic symlink (ELOOP), `stat()` fails, so the longest
+> stat-existing prefix is the **parent directory** of the symlink.  The
+> result is `canonical_parent / symlink_name` — which is inside the
+> workspace root — and the path therefore does NOT escape.  The
+> subsequent directory-existence check then fails → `WS-MEMBER-DIR-MISSING`.
+>
+> This rule has two concrete consequences for unresolvable symlinks:
+>
+> - **Cyclic symlink member** (`link-a → link-a`, or `a → b, b → a`):
+>   stat fails (ELOOP) → treated as non-existent → best-effort-resolve
+>   returns `canonical_root/link-a` → no escape → `WS-MEMBER-DIR-MISSING`.
+>   (Without this rule, Python's `Path.resolve(strict=False)` would raise
+>   an unhandled `OSError(ELOOP)` — a crash.)
+> - **Dangling symlink member pointing outside the root** (`link-d → ../outside`,
+>   where `../outside` does not exist): stat fails → treated as non-existent →
+>   best-effort-resolve returns `canonical_root/link-d` → no escape →
+>   `WS-MEMBER-DIR-MISSING`.  (Without this rule, following the link target
+>   one hop would detect an escape and yield `WS-MEMBER-PATH-ESCAPE`, leaking
+>   information about the link target's path.)
+>
+> Note: an existing symlink whose target resolves to a real path **outside**
+> the workspace root is NOT in either case above — `stat()` succeeds and
+> the path is fully canonicalized to the outside location →
+> `WS-MEMBER-PATH-ESCAPE` (unchanged behavior, correct security boundary).
+
 ### 11.1  Member dep-set union
 
 > NORMATIVE: The workspace resolver MUST union the `deps` and `dev-deps`
@@ -1100,11 +1232,10 @@ All codes are defined in `spec/errors.md`.
 | `FROZEN-LOCKED-VERSION-UNPARSEABLE` | Locked version string is not a valid semver (§7.1 #3) |
 | `FROZEN-CONSTRAINT-UNSATISFIED` | Locked version no longer satisfies named dep constraint (§7.1 #4) |
 | `FROZEN-IDENTITY-NOT-IN-STORE` | Dep identity absent from CAS (§7.1 #5) |
-| `FROZEN-LEGACY-REGISTRY-PROVENANCE` | Locked dep uses pre-#97 registry provenance; re-resolve via tianguis (§7.1 #6) |
-| `FROZEN-LOCAL-DEP` | Editable local dep cannot use frozen path (§7.1 #7) |
-| `FROZEN-MEMBER-DEP` | Workspace member dep cannot use frozen path in single-package context (§7.1 #8) |
-| `FROZEN-MEMBER-NOT-IN-WORKSPACE` | Lockfile references member not present in workspace (§7.1 #9) |
-| `FROZEN-MEMBER-IDENTITY-DRIFT` | Member on-disk hash differs from lockfile pin (§7.1 #10) |
+| `FROZEN-LOCAL-DEP` | Editable local dep cannot use frozen path (§7.1 #6) |
+| `FROZEN-MEMBER-DEP` | Workspace member dep cannot use frozen path in single-package context (§7.1 #7) |
+| `FROZEN-MEMBER-NOT-IN-WORKSPACE` | Lockfile references member not present in workspace (§7.1 #8) |
+| `FROZEN-MEMBER-IDENTITY-DRIFT` | Member on-disk hash differs from lockfile pin (§7.1 #9) |
 | `FETCH-ALL-FAILED` | Every mirror candidate failed (network error or identity mismatch) (§8a) |
 | `RES-PROVENANCE-CONFLICT` | Two transitive deps declare different provenances for the same name (§10.3) |
 | `MAN-PREDICATE-MIXED-NEGATION` | Predicate mixes negated and non-negated values (manifest-grammar §6) |

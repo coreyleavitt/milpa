@@ -42,74 +42,52 @@ fn normalize_lexically(path: &std::path::Path) -> std::path::PathBuf {
     normalized
 }
 
-/// Best-effort path resolution mirroring Python `Path.resolve(strict=False)`.
+/// Best-effort path resolution using stat (not lstat) to find the longest existing prefix.
 ///
-/// Finds the **longest existing ancestor prefix** of `path`, canonicalizes it
+/// Finds the **longest stat-existing ancestor prefix** of `path`, canonicalizes it
 /// (following all symlinks via `fs::canonicalize`), then appends the remaining
-/// non-existent suffix and normalizes lexically.  For a final component that is
-/// a **dangling symlink** (lstat succeeds, stat fails), the symlink target is
-/// read, joined onto the canonicalized parent, and normalized lexically —
-/// matching Python's behaviour of following dangling links to their (absent)
-/// targets so that an outside-pointing dangling symlink is still detected as an
-/// escape.
+/// non-existent suffix and normalizes lexically.
+///
+/// **Critical invariant (spec §11.0, S4, #168):** `metadata()` (stat, follows symlinks)
+/// is used — NOT `symlink_metadata()` (lstat) — to determine which prefix "exists."
+/// This means dangling symlinks (stat fails, target absent) and cyclic symlinks
+/// (stat fails, ELOOP) are treated as **non-existent**.  Their longest stat-existing
+/// prefix is the parent directory, and the result is `canonical_parent / symlink_name`
+/// — i.e. the path stays inside its parent, never following the broken link.
+///
+/// Consequences for the `WS-MEMBER-PATH-ESCAPE` containment check:
+/// - An **existing** symlink pointing outside the root: stat succeeds → fast path →
+///   `canonicalize()` returns the real outside path → escape detected correctly.
+/// - A **dangling** symlink (outside-pointing, target absent): stat fails → longest
+///   stat-existing prefix = parent dir → result is inside parent → no escape →
+///   `WS-MEMBER-DIR-MISSING`.
+/// - A **cyclic** symlink (ELOOP): stat fails → same as dangling → `WS-MEMBER-DIR-MISSING`.
 ///
 /// Key correctness property: the existing portion of the path is **always**
-/// canonicalized (all symlinks resolved), so any symlinks in intermediate
-/// components of `path` are followed through.  This is what Python's `resolve()`
-/// does, and it is why `best_effort_resolve(root/pkg/..)` yields the same
-/// canonical root that `canonicalize(root)` yields even when `root` is a
-/// symlink.
+/// canonicalized (all symlinks resolved), so any live symlinks in intermediate
+/// components of `path` are followed through.  This ensures
+/// `best_effort_resolve(root/pkg/..)` yields the same canonical root that
+/// `canonicalize(root)` yields even when `root` is a symlink.
 fn best_effort_resolve(path: &std::path::Path) -> std::path::PathBuf {
     use std::path::Component;
 
-    // Fast path: path exists (stat succeeds, symlinks followed).
+    // Fast path: path stat-exists (stat succeeds, all symlinks followed).
     if path.exists() {
         return path.canonicalize().unwrap_or_else(|_| normalize_lexically(path));
     }
 
-    // Walk ancestors from `path` upward to find the longest prefix that exists.
-    // `path.ancestors()` yields path, parent, grandparent, …, root.
-    // The first ancestor for which `symlink_metadata` succeeds (i.e. exists on
-    // disk, even as a dangling symlink) is our split point.
+    // Ordinary non-existent (or dangling/cyclic symlink) path:
+    // find the longest ancestor prefix for which stat() succeeds.
     //
-    // We need to be careful: `path.ancestors()` starts at `path` itself.
-    // We already know `path` doesn't exist via stat, but its lstat might succeed
-    // (dangling symlink case).  Handle that first.
-    let dangling = path
-        .symlink_metadata()
-        .ok()
-        .filter(|m| m.file_type().is_symlink())
-        .and_then(|_| std::fs::read_link(path).ok());
-    if let Some(link_target) = dangling {
-        // Dangling symlink: canonicalize the real parent, join the link target,
-        // normalize lexically.  This is how Python resolve(strict=False) handles
-        // dangling symlinks: it reads the link and appends the target to the
-        // resolved parent, even though the target doesn't exist.
-        // parent() is None only for "/" or a bare filename; a dangling-symlink
-        // member path always has a real parent component, so the fallback is
-        // unreachable in practice.
-        let parent = path.parent().unwrap_or(path);
-        let real_parent = best_effort_resolve(parent);
-        let joined = if link_target.is_absolute() {
-            link_target
-        } else {
-            real_parent.join(link_target)
-        };
-        return normalize_lexically(&joined);
-    }
-
-    // Ordinary non-existent path: find the longest existing ancestor prefix.
-    // Collect ancestor components so we can reconstruct the suffix.
+    // `path.ancestors()` yields path, parent, grandparent, …, root.
+    // Using `metadata()` (= stat) means dangling/cyclic symlinks at any
+    // position in the path are skipped over (their stat fails → not found).
     let components: Vec<Component> = path.components().collect();
-    // Try progressively shorter prefixes (from full path down to root).
-    // `path.ancestors()` gives us the prefix paths in descending length order.
-    // We pair each with the number of components that it has, so we know how
-    // many trailing components to re-append.
     let mut found: Option<(std::path::PathBuf, usize)> = None;
     for ancestor in path.ancestors() {
-        // Check whether this ancestor exists (lstat is enough — we just need to
-        // know if the path node exists on the inode table).
-        if ancestor.symlink_metadata().is_ok() {
+        // Use metadata() (stat, follows symlinks) — NOT symlink_metadata() (lstat).
+        // Dangling and cyclic symlinks are excluded because stat fails for them.
+        if ancestor.metadata().is_ok() {
             let ancestor_components: Vec<Component> = ancestor.components().collect();
             let prefix_len = ancestor_components.len();
             found = Some((ancestor.to_path_buf(), prefix_len));
@@ -119,16 +97,11 @@ fn best_effort_resolve(path: &std::path::Path) -> std::path::PathBuf {
 
     match found {
         Some((ancestor, prefix_len)) => {
-            // Recursively resolve the existing ancestor prefix.  This handles
-            // mid-path dangling symlinks: if `ancestor` itself is a dangling
-            // symlink, `canonicalize()` fails and the old
-            // `unwrap_or_else(normalize_lexically)` fallback returned the
-            // lexical path WITHOUT following the link — producing the wrong
-            // result.  Delegating back to `best_effort_resolve` re-enters the
-            // dangling-symlink branch above, which reads the link target and
-            // resolves correctly.  Termination is guaranteed because `ancestor`
-            // is a STRICT prefix of `path` (strictly fewer components), so
-            // each recursive call operates on a strictly shorter path.
+            // Recursively resolve the existing ancestor prefix.  This handles any
+            // live mid-path symlinks: `ancestor` stat-exists, so `best_effort_resolve`
+            // takes the fast path and returns `canonicalize(ancestor)`.
+            // Termination is guaranteed because `ancestor` is a STRICT prefix of
+            // `path` (strictly fewer components).
             let real_prefix = best_effort_resolve(&ancestor);
             // Re-append the non-existent suffix components.
             let suffix: std::path::PathBuf = components[prefix_len..].iter().collect();
@@ -146,19 +119,18 @@ fn best_effort_resolve(path: &std::path::Path) -> std::path::PathBuf {
 /// returns true, letting the caller fall through to the `WS-MEMBER-IS-WORKSPACE`
 /// check).
 ///
-/// Algorithm (Option A — mirrors Python `workspace.py` `_member_path_is_under_root`
-/// which calls `Path.resolve(strict=False)`):
+/// Algorithm (spec §11.0, S4, #168 — mirrors Python `workspace.py` `_member_path_is_under_root`):
 ///   1. `best_effort_resolve(root)` — root always exists, so this equals `canonicalize(root)`.
-///   2. `best_effort_resolve(candidate)` — canonicalizes the longest existing
-///      prefix of candidate (following symlinks in it), then appends the remaining
-///      non-existent components and normalizes lexically.  This is the structural
-///      mirror of Python's `(root / rel).resolve()`.
+///   2. `best_effort_resolve(candidate)` — stat-based: canonicalizes the longest
+///      stat-existing prefix of candidate (following live symlinks), then appends
+///      the remaining non-existent (or dangling/cyclic) suffix and normalizes lexically.
+///      Dangling and cyclic symlinks are treated as non-existent (stat fails for them).
 ///   3. Return `real_cand.starts_with(real_root)` — inclusive.
 ///
 /// Correctness for the symlinked-root case: if `root` is a symlink to `realroot`
 /// and candidate = `root/pkg/..`, then:
 ///   - `best_effort_resolve(root)` = `canonicalize(root)` = `realroot`
-///   - `best_effort_resolve(root/pkg/..)`: `root` is the longest existing prefix
+///   - `best_effort_resolve(root/pkg/..)`: `root` is the longest stat-existing prefix
 ///     (pkg does not exist), so prefix is canonicalized to `realroot`, suffix is
 ///     `pkg/..`, joined → `realroot/pkg/..`, normalized → `realroot`.
 ///   - `realroot.starts_with(realroot)` → true → NOT an escape.

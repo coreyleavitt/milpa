@@ -1,0 +1,13 @@
+schema_version 1
+package "baz" {
+    namespace "ns1"
+    version "1.0.0" {
+        content_hash "sha256:ef697b08f76e85dfbf6ef62aeac70982d169f328461c0bafee32dcac12f1ce40"
+        provenance {
+            kind "git"
+            url "https://github.com/ns1/baz.git"
+            ref "v1.0.0"
+            commit_sha "cccc0000cccc0000cccc0000cccc0000cccc0000"
+        }
+    }
+}

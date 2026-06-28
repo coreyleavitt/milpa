@@ -299,6 +299,10 @@ class NamedDep:
     flag_requests: tuple[FlagRequest, ...] = ()
     optional: bool = False
     predicates: tuple[Predicate, ...] = ()  # S7: auto-injected gate for optional
+    # S5b: namespace from ``namespace=`` attribute or slash-shorthand desugar.
+    # None = default (bare-name lookup, existing behavior).  Non-None = qualified
+    # lookup that bypasses TNG-AMBIGUOUS-NAME (registry-protocol §5.1).
+    namespace: str | None = None
 
     def __post_init__(self) -> None:
         """Pre-type the constraint at construction time.
@@ -793,6 +797,7 @@ def _desugar_one_dep(
             flag_requests=dep.flag_requests,
             optional=True,
             predicates=new_preds,
+            namespace=dep.namespace,  # S5b: preserve namespace through desugar
         )
 
 
@@ -1210,7 +1215,13 @@ def _parse_dep_block(
     dep-own predicates).
     """
     deps: list[Dep] = []
-    seen_names: set[str] = set()
+    # S5b: uniqueness key is the qualified identity.  For NamedDep it is
+    # ``(namespace, name)`` — two NamedDeps with the same bare name but
+    # different namespaces are DISTINCT and both allowed in one block.
+    # For all other dep types (UrlDep, LocalDep, TarballDep, MemberDep) the
+    # name is the bare node name and no namespace exists, so the key is
+    # ``(None, name)`` (same as before this change).
+    seen_names: set[tuple[str | None, str]] = set()
 
     for child in node_children(block):
         child_nm = node_name(child)
@@ -1227,14 +1238,17 @@ def _parse_dep_block(
                 outer_predicates=outer_predicates + tuple(when_predicates),
             )
             for dep in sub_deps:
-                if dep.name in seen_names:
+                ns = dep.namespace if isinstance(dep, NamedDep) else None
+                _key = (ns, dep.name)
+                if _key in seen_names:
+                    display = f"{ns}/{dep.name}" if ns else dep.name
                     raise MilpaError(
                         MAN_DEP_DUPLICATE,
-                        f"duplicate dep {dep.name!r} in {block_name!r} block",
+                        f"duplicate dep {display!r} in {block_name!r} block",
                         dep=dep.name,
                         block=block_name,
                     )
-                seen_names.add(dep.name)
+                seen_names.add(_key)
                 deps.append(dep)
             continue
 
@@ -1242,15 +1256,18 @@ def _parse_dep_block(
             child, block_name=block_name, outer_predicates=outer_predicates
         )
         dep_name = dep.name
+        ns = dep.namespace if isinstance(dep, NamedDep) else None
+        _dep_key = (ns, dep_name)
+        display_name = f"{ns}/{dep_name}" if ns else dep_name
 
-        if dep_name in seen_names:
+        if _dep_key in seen_names:
             raise MilpaError(
                 MAN_DEP_DUPLICATE,
-                f"duplicate dep {dep_name!r} in {block_name!r} block",
+                f"duplicate dep {display_name!r} in {block_name!r} block",
                 dep=dep_name,
                 block=block_name,
             )
-        seen_names.add(dep_name)
+        seen_names.add(_dep_key)
         deps.append(dep)
 
     return deps
@@ -1277,17 +1294,47 @@ def _parse_dep_node(
     if nm == "member":
         return _parse_member_dep(n, outer_predicates=outer_predicates)
 
-    # R2-C1 security fix: validate dep name charset at parse boundary.
-    # KDL 2.0 quoted node names can contain chars outside [A-Za-z0-9_-].
-    # A dep name with \n (or other nim.cfg-significant char) would inject content
-    # via --path:"_deps/<name>" and -d:<pkg>_<flag> emit lines in nimcfg.py.
-    if not valid_dep_name(nm):
-        raise MilpaError(
-            MAN_DEP_NAME_INVALID,
-            f"dep {nm!r}: dep names must match [A-Za-z0-9_-]+ "
-            "(no spaces, control characters, or nim.cfg-significant chars)",
-            dep=nm,
-        )
+    # S5b: slash-shorthand desugar (manifest-grammar.md §3.2 NamedDep).
+    # ``"core/pkg"`` desugars to namespace="core", name="pkg" at parse time.
+    # The desugar happens before the charset check so downstream only sees the
+    # attribute form.  A name with more than one `/` or empty parts is malformed.
+    slash_namespace: str | None = None
+    if "/" in nm:
+        parts = nm.split("/")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise MilpaError(
+                MAN_DEP_NAME_INVALID,
+                f"dep {nm!r}: qualified dep names must have exactly one '/' separator "
+                "with non-empty namespace and package name parts (e.g. \"core/pkg\")",
+                dep=nm,
+            )
+        ns_part, name_part = parts
+        if not valid_dep_name(ns_part):
+            raise MilpaError(
+                MAN_DEP_NAME_INVALID,
+                f"dep {nm!r}: namespace part {ns_part!r} must match [A-Za-z0-9_-]+",
+                dep=nm,
+            )
+        if not valid_dep_name(name_part):
+            raise MilpaError(
+                MAN_DEP_NAME_INVALID,
+                f"dep {nm!r}: name part {name_part!r} must match [A-Za-z0-9_-]+",
+                dep=nm,
+            )
+        slash_namespace = ns_part
+        nm = name_part
+    else:
+        # R2-C1 security fix: validate dep name charset at parse boundary.
+        # KDL 2.0 quoted node names can contain chars outside [A-Za-z0-9_-].
+        # A dep name with \n (or other nim.cfg-significant char) would inject content
+        # via --path:"_deps/<name>" and -d:<pkg>_<flag> emit lines in nimcfg.py.
+        if not valid_dep_name(nm):
+            raise MilpaError(
+                MAN_DEP_NAME_INVALID,
+                f"dep {nm!r}: dep names must match [A-Za-z0-9_-]+ "
+                "(no spaces, control characters, or nim.cfg-significant chars)",
+                dep=nm,
+            )
 
     if "git" in props:
         return _parse_url_dep(n, dep_name=nm, outer_predicates=outer_predicates)
@@ -1295,7 +1342,12 @@ def _parse_dep_node(
         return _parse_local_dep(n, dep_name=nm, outer_predicates=outer_predicates)
     if "tarball" in props:
         return _parse_tarball_dep(n, dep_name=nm, outer_predicates=outer_predicates)
-    return _parse_named_dep(n, dep_name=nm, outer_predicates=outer_predicates)
+    return _parse_named_dep(
+        n,
+        dep_name=nm,
+        outer_predicates=outer_predicates,
+        slash_namespace=slash_namespace,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1639,10 +1691,14 @@ def _parse_named_dep(
     *,
     dep_name: str,
     outer_predicates: tuple[Predicate, ...] = (),
+    slash_namespace: str | None = None,
 ) -> NamedDep:
     """Parse a NamedDep (registry-resolved).
 
     Grammar: ``<name>`` or ``<name> "<version-constraint>"``
+    S5b extension: ``<name> namespace="<ns>" ["<constraint>"]`` or
+    slash-shorthand ``"<ns>/<name>" ["<constraint>"]`` (desugared before this call).
+
     Optionally with a ``{ flag "x" }`` child block (§3.1.5, S3 RFC #23).
     ``optional=#true`` is permitted (S7 RFC #23 §3.2).
 
@@ -1652,9 +1708,45 @@ def _parse_named_dep(
     ``outer_predicates`` are inherited predicates from an enclosing ``when``
     block (§6.3); they are stored as the initial predicates tuple.  The
     optional-desugar pass (S7) may extend this tuple with a flag gate.
+
+    ``slash_namespace`` carries the namespace extracted by the slash-desugar
+    pass in ``_parse_dep_node``; the ``namespace=`` attribute overrides it
+    (both cannot be set simultaneously — redundant but harmless).
     """
     raw_args = node_args(n)
     props = node_props(n)
+
+    # --- namespace= (str; default None) S5b ---
+    # Accept ``namespace="..."`` as a property on NamedDep; mutually compatible
+    # with slash-shorthand (the two paths converge here).
+    namespace: str | None = slash_namespace
+    if "namespace" in props:
+        ns_val = node_prop_str(n, "namespace")
+        if ns_val is None:
+            raise MilpaError(
+                MAN_DEP_NAMED_PROPS,
+                f"dep {dep_name!r}: 'namespace=' must be a string",
+                dep=dep_name,
+                prop="namespace",
+            )
+        if not valid_dep_name(ns_val):
+            raise MilpaError(
+                MAN_DEP_NAME_INVALID,
+                f"dep {dep_name!r}: namespace {ns_val!r} must match [A-Za-z0-9_-]+ "
+                "(same charset as dep names)",
+                dep=dep_name,
+            )
+        # M2 (rfc-resolver-correctness.md): if BOTH slash-shorthand AND namespace=
+        # attribute are present AND they DISAGREE, raise MAN-DEP-NAME-INVALID.
+        # If they agree, accept (idempotent; author just over-specified).
+        if slash_namespace is not None and slash_namespace != ns_val:
+            raise MilpaError(
+                MAN_DEP_NAME_INVALID,
+                f"dep {dep_name!r}: slash namespace {slash_namespace!r} disagrees "
+                f"with namespace= attribute {ns_val!r}; use one or the other",
+                dep=dep_name,
+            )
+        namespace = ns_val
 
     # --- optional= (bool; default False) ---
     # Allowed on NamedDep (RFC #23 §3.2 covers both URL and named deps).
@@ -1671,9 +1763,10 @@ def _parse_named_dep(
             )
         optional = optional_v
 
-    # Any property other than 'optional' (and 'git=' which routes to UrlDep) is an error.
+    # Any property other than 'optional' and 'namespace' is an error.
+    # (git= routes to UrlDep before we reach here.)
     for prop_key in props:
-        if prop_key != "optional":
+        if prop_key not in ("optional", "namespace"):
             raise MilpaError(
                 MAN_DEP_NAMED_PROPS,
                 f"dep {dep_name!r}: NamedDep does not accept properties "
@@ -1714,6 +1807,7 @@ def _parse_named_dep(
             flag_requests=tuple(flag_requests),
             optional=optional,
             predicates=outer_predicates,
+            namespace=namespace,
         )
 
     # Exactly one arg — must be a string constraint.
@@ -1735,6 +1829,7 @@ def _parse_named_dep(
         flag_requests=tuple(flag_requests),
         optional=optional,
         predicates=outer_predicates,
+        namespace=namespace,
     )
 
 
@@ -1809,12 +1904,11 @@ def _parse_tarball_dep(
     # --- tarball= URL ---
     tarball_url_v = node_prop_url(n, "tarball")
     if tarball_url_v is None:
-        # Present but wrong type
-        raw = props.get("tarball")
-        if raw is not None:
+        if "tarball" in props:
+            # Present but not a (url)-annotated string (plain string, wrong type, etc.)
             raise MilpaError(
-                MAN_DEP_TARBALL_URL,
-                f"dep {dep_name!r}: 'tarball=' must be a URL string",
+                MAN_URL_ARG_TYPE,
+                f"dep {dep_name!r}: 'tarball=' must be a (url)-annotated URL string",
                 dep=dep_name,
             )
         raise MilpaError(
@@ -2761,10 +2855,14 @@ def _format_dep_line(dep: Dep) -> str:
             when_preds = dep.predicates
 
         # Build the dep node body (without leading indentation — added below).
+        # S5b: emit ``namespace="..."`` attribute (canonical form) when present.
+        # The slash shorthand is NEVER emitted — canonical output always uses the
+        # attribute form so downstream parsers only see one form.
+        ns_attr = f' namespace="{_kdl_str(dep.namespace)}"' if dep.namespace is not None else ""
         if dep.constraint is None:
-            head = f'"{_kdl_str(dep.name)}"'
+            head = f'"{_kdl_str(dep.name)}"{ns_attr}'
         else:
-            head = f'"{_kdl_str(dep.name)}" "{_kdl_str(dep.constraint)}"'
+            head = f'"{_kdl_str(dep.name)}"{ns_attr} "{_kdl_str(dep.constraint)}"'
         # optional=#true — round-trip preservation (S7 RFC #23 §3.2).
         if dep.optional:
             head += " optional=#true"

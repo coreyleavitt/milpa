@@ -359,6 +359,92 @@ class Index:
         """
         return self.resolve_named_all(name, constraint)[0]
 
+    # ------------------------------------------------------------------
+    # S5b — qualified lookup (namespace-aware)
+    # ------------------------------------------------------------------
+
+    def lookup_qualified(self, namespace: str, name: str) -> Package | None:
+        """Qualified (namespace, name) lookup — always returns at most one Package.
+
+        Returns the ``Package`` when the ``(namespace, name)`` pair is found,
+        ``None`` when not found.  Never returns ``AmbiguousName`` — the caller
+        supplies a namespace, so ambiguity cannot occur.
+
+        Registry-protocol §5.1 S5b: this path bypasses ``TNG-AMBIGUOUS-NAME``
+        because the manifest grammar provided an explicit namespace qualifier.
+        """
+        for p in self.packages:
+            if p.namespace == namespace and p.name == name:
+                return p
+        return None
+
+    def resolve_named_all_qualified(
+        self,
+        namespace: str,
+        name: str,
+        constraint: str | None = None,
+    ) -> list[IndexVersion]:
+        """Qualified-namespace resolve — bypasses ``TNG-AMBIGUOUS-NAME``.
+
+        Same behaviour as ``resolve_named_all`` for error precedence, but uses
+        ``lookup_qualified`` instead of ``lookup_bare``:
+          ``TNG-NOT-FOUND`` → ``TNG-NO-PROVENANCE`` → ``TNG-NO-SATISFYING-VERSION``.
+        ``TNG-AMBIGUOUS-NAME`` is never raised (namespace was specified).
+
+        Called by the resolver when ``dep_key.namespace`` is not None (S5b).
+        """
+        pkg = self.lookup_qualified(namespace, name)
+        if pkg is None:
+            raise MilpaError(
+                TNG_NOT_FOUND,
+                f"package {namespace!r}/{name!r} is not in the tianguis index",
+                name=name,
+                namespace=namespace,
+            )
+
+        vs = VersionSet.from_constraint(constraint)
+
+        satisfying: list[IndexVersion] = []
+        provenance_less: list[str] = []
+
+        for iv in pkg.versions:
+            parsed = parse_version(iv.version)
+            if parsed is None:
+                continue
+            if vs.contains(parsed):
+                if not iv.provenances:
+                    provenance_less.append(iv.version)
+                    warnings.warn(
+                        f"version {iv.version!r} of {namespace!r}/{name!r} has no provenance — skipped",
+                        stacklevel=2,
+                    )
+                    continue
+                satisfying.append(iv)
+
+        if satisfying:
+            return satisfying
+
+        qualified = f"{namespace}/{name}"
+        if provenance_less:
+            raise MilpaError(
+                TNG_NO_PROVENANCE,
+                f"{qualified!r} has no fetchable version satisfying constraint "
+                f"{constraint!r} — all satisfying versions lack provenance: "
+                f"{', '.join(provenance_less)}",
+                name=name,
+                constraint=constraint,
+                excluded=provenance_less,
+            )
+
+        raise MilpaError(
+            TNG_NO_SATISFYING_VERSION,
+            f"no version of {qualified!r} satisfies constraint {constraint!r} "
+            f"(available: {', '.join(iv.version for iv in pkg.versions)})",
+            name=name,
+            constraint=constraint,
+            available=[iv.version for iv in pkg.versions],
+        )
+
 
 # ---------------------------------------------------------------------------
 # parse_index — the public entry point

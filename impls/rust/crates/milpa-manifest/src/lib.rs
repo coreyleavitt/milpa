@@ -29,6 +29,7 @@ pub use milpa_types::Predicate;
 // references to `milpa_manifest::FlagRequest` and `crate::FlagRequest`
 // compile unchanged.
 pub use milpa_types::FlagRequest;
+pub use milpa_types::DepKey;
 
 /// Highest manifest spec-version epoch this implementation understands
 /// (grammar §4.4). Bumped only for breaking semantic changes; additive
@@ -65,6 +66,10 @@ pub struct UrlDep {
 ///   the resolver consumes this field directly and never re-parses manifest deps.
 /// - `flag_requests` — consumer feature-flag requests (§3.1.5 S3 RFC #23),
 ///   structurally identical to `UrlDep.flag_requests` (SSOT: reuses `FlagRequest`).
+/// - `namespace` — S5b: registry namespace qualifier.  `None` = bare-name
+///   lookup (current default); `Some("ns")` = qualified lookup that bypasses
+///   `TNG-AMBIGUOUS-NAME`.  Populated from `namespace="..."` attribute or
+///   slash-shorthand desugar at parse time.
 #[derive(Debug, Clone)]
 pub struct NamedDep {
     pub name: String,
@@ -80,14 +85,16 @@ pub struct NamedDep {
     /// S7: auto-injected gate predicate from optional desugaring (flag=<depname>).
     /// The resolver uses this via `dep.predicates()` for flag-filtering.
     pub predicates: Vec<Predicate>,
+    /// S5b: namespace qualifier from `namespace="..."` attribute or slash-shorthand.
+    /// `None` = default (bare-name lookup, all pre-S5b deps).
+    pub namespace: Option<String>,
 }
 
 impl PartialEq for NamedDep {
     fn eq(&self, other: &Self) -> bool {
-        // Compare by name + raw constraint string only (mirrors Python's
-        // `compare=False` on `constraint_set`; the parsed form is deterministic
-        // from the raw string so excluding it preserves test ergonomics).
+        // Compare by name + raw constraint string + namespace (mirrors Python).
         self.name == other.name && self.constraint == other.constraint
+            && self.namespace == other.namespace
     }
 }
 
@@ -968,6 +975,16 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
     let mut spec_version_explicit = false;
     let mut attestation_policy = AttestationPolicy::Permissive;
 
+    // S5b: seen_names key is the solver variable (namespace::name or bare name),
+    // so two qualified deps with the same bare name but different namespaces
+    // are NOT considered duplicates (matches Python _parse_dep_block logic).
+    // M1: route through DepKey::solver_var() — SOLE join site for "::" (SSOT).
+    let dep_unique_key = |dep: &Dep| -> String {
+        match dep {
+            Dep::Named(n) => DepKey { name: n.name.clone(), namespace: n.namespace.clone() }.solver_var(),
+            other => other.name().to_string(),
+        }
+    };
     let mut seen_names: BTreeSet<String> = BTreeSet::new();
     let mut seen_dev_dep_names: BTreeSet<String> = BTreeSet::new();
     let mut seen_override_names: BTreeSet<String> = BTreeSet::new();
@@ -1029,7 +1046,8 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
             "deps" => {
                 for child in children(node) {
                     for dep in expand_dep_child(child, &[])? {
-                        if !seen_names.insert(dep.name().to_string()) {
+                        let key = dep_unique_key(&dep);
+                        if !seen_names.insert(key.clone()) {
                             return Err(err(
                                 "MAN-DEP-DUPLICATE",
                                 format!("duplicate dep {:?} in manifest", dep.name()),
@@ -1042,7 +1060,8 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
             "dev-deps" => {
                 for child in children(node) {
                     for dep in expand_dep_child(child, &[])? {
-                        if !seen_dev_dep_names.insert(dep.name().to_string()) {
+                        let key = dep_unique_key(&dep);
+                        if !seen_dev_dep_names.insert(key.clone()) {
                             return Err(err(
                                 "MAN-DEP-DUPLICATE",
                                 format!("duplicate dep {:?} in manifest", dep.name()),
@@ -1414,34 +1433,81 @@ fn parse_dep(node: &KdlNode) -> Result<Dep, ManifestError> {
     if node.name().value() == "member" {
         return Ok(Dep::Member(parse_member_dep(node)?));
     }
-    // R2-C1 security fix: validate dep name charset at parse boundary.
-    // KDL 2.0 quoted node names can contain chars outside [A-Za-z0-9_-].
-    // A dep name with \n (or other nim.cfg-significant char) would inject content
-    // via --path:"_deps/<name>" and -d:<pkg>_<flag> emit lines in nimcfg.rs.
-    let dep_nm = node.name().value();
-    if !valid_flag_name(dep_nm) {
-        return Err(err(
-            "MAN-DEP-NAME-INVALID",
-            format!(
-                "dep {dep_nm:?}: dep names must match [A-Za-z0-9_-]+ \
-                 (no spaces, control characters, or nim.cfg-significant chars)"
-            ),
-        ));
-    }
+    // S5b: slash-shorthand desugar (manifest-grammar.md §3.2 NamedDep).
+    // ``"core/pkg"`` desugars to namespace="core", name="pkg" at parse time.
+    // The desugar happens before the charset check so downstream only sees the
+    // attribute form.  A name with more than one `/` or empty parts is malformed.
+    let raw_node_name = node.name().value();
+    let (dep_nm, slash_namespace): (&str, Option<String>) = if raw_node_name.contains('/') {
+        let parts: Vec<&str> = raw_node_name.splitn(3, '/').collect();
+        // splitn(3) gives at most 3 parts; if we get 3, there are ≥2 slashes.
+        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty()
+            || raw_node_name.matches('/').count() != 1
+        {
+            return Err(err(
+                "MAN-DEP-NAME-INVALID",
+                format!(
+                    "dep {raw_node_name:?}: qualified dep names must have exactly one '/' \
+                     separator with non-empty namespace and package name parts (e.g. \"core/pkg\")"
+                ),
+            ));
+        }
+        let ns_part = parts[0];
+        let name_part = parts[1];
+        if !valid_flag_name(ns_part) {
+            return Err(err(
+                "MAN-DEP-NAME-INVALID",
+                format!("dep {raw_node_name:?}: namespace part {ns_part:?} must match [A-Za-z0-9_-]+"),
+            ));
+        }
+        if !valid_flag_name(name_part) {
+            return Err(err(
+                "MAN-DEP-NAME-INVALID",
+                format!("dep {raw_node_name:?}: name part {name_part:?} must match [A-Za-z0-9_-]+"),
+            ));
+        }
+        (name_part, Some(ns_part.to_string()))
+    } else {
+        // R2-C1 security fix: validate dep name charset at parse boundary.
+        // KDL 2.0 quoted node names can contain chars outside [A-Za-z0-9_-].
+        // A dep name with \n (or other nim.cfg-significant char) would inject content
+        // via --path:"_deps/<name>" and -d:<pkg>_<flag> emit lines in nimcfg.rs.
+        let dep_nm = raw_node_name;
+        if !valid_flag_name(dep_nm) {
+            return Err(err(
+                "MAN-DEP-NAME-INVALID",
+                format!(
+                    "dep {dep_nm:?}: dep names must match [A-Za-z0-9_-]+ \
+                     (no spaces, control characters, or nim.cfg-significant chars)"
+                ),
+            ));
+        }
+        (dep_nm, None)
+    };
     let names = prop_names(node);
     if names.contains("git") {
-        Ok(Dep::Url(parse_url_dep(node)?))
+        Ok(Dep::Url(parse_url_dep_with_name(node, dep_nm)?))
     } else if names.contains("local") {
-        Ok(Dep::Local(parse_local_dep(node)?))
+        Ok(Dep::Local(parse_local_dep_with_name(node, dep_nm)?))
     } else if names.contains("tarball") {
-        Ok(Dep::Tarball(parse_tarball_dep(node)?))
+        Ok(Dep::Tarball(parse_tarball_dep_with_name(node, dep_nm)?))
     } else {
-        Ok(Dep::Named(parse_named_dep(node)?))
+        Ok(Dep::Named(parse_named_dep_with_name(node, dep_nm, slash_namespace)?))
     }
 }
 
+/// Thin wrapper: parse a UrlDep from a node whose name may have been desugared.
+fn parse_url_dep_with_name(node: &KdlNode, dep_nm: &str) -> Result<UrlDep, ManifestError> {
+    parse_url_dep_inner(node, dep_nm)
+}
+
 fn parse_url_dep(node: &KdlNode) -> Result<UrlDep, ManifestError> {
-    let name = node.name().value().to_string();
+    let nm = node.name().value();
+    parse_url_dep_inner(node, nm)
+}
+
+fn parse_url_dep_inner(node: &KdlNode, dep_nm: &str) -> Result<UrlDep, ManifestError> {
+    let name = dep_nm.to_string();
     let extra: Vec<&str> = prop_names(node)
         .into_iter()
         .filter(|p| !URL_DEP_PROPS.contains(p))
@@ -1571,8 +1637,16 @@ fn parse_flag_request(dep_name: &str, node: &KdlNode) -> Result<FlagRequest, Man
     })
 }
 
+fn parse_local_dep_with_name(node: &KdlNode, dep_nm: &str) -> Result<LocalDep, ManifestError> {
+    parse_local_dep_inner(node, dep_nm)
+}
+
 fn parse_local_dep(node: &KdlNode) -> Result<LocalDep, ManifestError> {
-    let name = node.name().value().to_string();
+    parse_local_dep_inner(node, node.name().value())
+}
+
+fn parse_local_dep_inner(node: &KdlNode, dep_nm: &str) -> Result<LocalDep, ManifestError> {
+    let name = dep_nm.to_string();
     let extra: Vec<&str> = prop_names(node)
         .into_iter()
         .filter(|p| *p != "local")
@@ -1596,8 +1670,16 @@ fn parse_local_dep(node: &KdlNode) -> Result<LocalDep, ManifestError> {
     }
 }
 
+fn parse_tarball_dep_with_name(node: &KdlNode, dep_nm: &str) -> Result<TarballDep, ManifestError> {
+    parse_tarball_dep_inner(node, dep_nm)
+}
+
 fn parse_tarball_dep(node: &KdlNode) -> Result<TarballDep, ManifestError> {
-    let name = node.name().value().to_string();
+    parse_tarball_dep_inner(node, node.name().value())
+}
+
+fn parse_tarball_dep_inner(node: &KdlNode, dep_nm: &str) -> Result<TarballDep, ManifestError> {
+    let name = dep_nm.to_string();
     let allowed = ["tarball", "sha256", "strip_components"];
     let extra: Vec<&str> = prop_names(node)
         .into_iter()
@@ -1692,9 +1774,70 @@ fn parse_member_dep(node: &KdlNode) -> Result<MemberDep, ManifestError> {
     })
 }
 
-fn parse_named_dep(node: &KdlNode) -> Result<NamedDep, ManifestError> {
-    let name = node.name().value().to_string();
-    // Only `optional` is a valid property on NamedDep (git= routes to UrlDep).
+/// S5b entry point: parse a NamedDep when the dep-name may have been desugared.
+/// `slash_namespace` is `Some("ns")` when the node name contained a `/` and was
+/// split by `parse_dep`; `None` for bare names.  The `namespace=` property is
+/// also accepted and takes precedence if both are present (error if they conflict).
+fn parse_named_dep_with_name(
+    node: &KdlNode,
+    dep_nm: &str,
+    slash_namespace: Option<String>,
+) -> Result<NamedDep, ManifestError> {
+    let name = dep_nm.to_string();
+    // S5b: parse the `namespace=` attribute.
+    let attr_namespace: Option<String> = match prop(node, "namespace") {
+        None => None,
+        Some(e) => match e.value().as_string() {
+            Some(ns) if !ns.is_empty() => {
+                if !valid_flag_name(ns) {
+                    return Err(err(
+                        "MAN-DEP-NAME-INVALID",
+                        format!(
+                            "dep {name:?}: namespace {ns:?} must match [A-Za-z0-9_-]+"
+                        ),
+                    ));
+                }
+                Some(ns.to_string())
+            }
+            Some(_) => {
+                return Err(err(
+                    "MAN-DEP-NAMED-PROPS",
+                    format!("dep {name:?}: 'namespace=' must be a non-empty string"),
+                ));
+            }
+            None => {
+                return Err(err(
+                    "MAN-DEP-NAMED-PROPS",
+                    format!("dep {name:?}: 'namespace=' must be a string value"),
+                ));
+            }
+        },
+    };
+    // M2 fix: if both slash and attribute namespace sources are present AND they
+    // disagree, raise MAN-DEP-NAME-INVALID. Agreement or single-source is fine.
+    let namespace: Option<String> = match (attr_namespace, slash_namespace) {
+        (Some(a), Some(s)) if a != s => {
+            return Err(err(
+                "MAN-DEP-NAME-INVALID",
+                format!(
+                    "dep {name:?}: slash namespace {s:?} and namespace= attribute {a:?} disagree — \
+                     use one or the other, or ensure they match"
+                ),
+            ));
+        }
+        (Some(a), _) => Some(a),
+        (_, s) => s,
+    };
+
+    // Only `optional` and `namespace` are valid properties on NamedDep.
+    for (key, _) in props(node) {
+        if key != "optional" && key != "namespace" {
+            return Err(err(
+                "MAN-DEP-NAMED-PROPS",
+                format!("dep {name:?}: unknown property/properties {key:?} on a named dep"),
+            ));
+        }
+    }
     let optional = match prop(node, "optional") {
         None => false,
         Some(e) => match e.value() {
@@ -1707,15 +1850,6 @@ fn parse_named_dep(node: &KdlNode) -> Result<NamedDep, ManifestError> {
             }
         },
     };
-    // Any property besides `optional` is an error.
-    for (key, _) in props(node) {
-        if key != "optional" {
-            return Err(err(
-                "MAN-DEP-NAMED-PROPS",
-                format!("dep {name:?}: unknown property/properties {key:?} on a named dep"),
-            ));
-        }
-    }
     let a = args(node);
     let (constraint, parsed_constraint) = match a.len() {
         0 => (None, None),
@@ -1755,7 +1889,9 @@ fn parse_named_dep(node: &KdlNode) -> Result<NamedDep, ManifestError> {
         } else {
             return Err(err(
                 "MAN-DEP-UNKNOWN-CHILD",
-                format!("dep {name:?}: unknown child node {child_nm:?}; only \"flag\" is valid on a named dep"),
+                format!(
+                    "dep {name:?}: unknown child node {child_nm:?}; only \"flag\" is valid on a named dep"
+                ),
             ));
         }
     }
@@ -1766,7 +1902,12 @@ fn parse_named_dep(node: &KdlNode) -> Result<NamedDep, ManifestError> {
         flag_requests,
         optional,
         predicates: Vec::new(), // Populated by desugar pass in parse_manifest_doc.
+        namespace,
     })
+}
+
+fn parse_named_dep(node: &KdlNode) -> Result<NamedDep, ManifestError> {
+    parse_named_dep_with_name(node, node.name().value(), None)
 }
 
 // ---------------------------------------------------------------------------
@@ -2244,9 +2385,14 @@ fn parse_override(node: &KdlNode) -> Result<Override, ManifestError> {
 /// Normalize a URL argument: accept a string value (plain or `(url)`-annotated);
 /// reject a non-string value or any other type annotation (grammar §2).
 fn url_arg(context: &str, field: &str, entry: &KdlEntry) -> Result<String, ManifestError> {
+    // S3 strict: ONLY the (url)-annotated form is accepted.
     match entry.value().as_string() {
         Some(s) => match entry_ty(entry) {
-            None | Some("url") => Ok(s.to_string()),
+            Some("url") => Ok(s.to_string()),
+            None => Err(err(
+                "MAN-URL-ARG-TYPE",
+                format!("{context}: {field:?} must be a (url)-annotated URL string, not a plain string"),
+            )),
             Some(other) => Err(err(
                 "MAN-URL-ARG-TYPE",
                 format!("{context}: {field:?} has unsupported type annotation ({other:?}); only (url) is recognized"),
@@ -2254,7 +2400,7 @@ fn url_arg(context: &str, field: &str, entry: &KdlEntry) -> Result<String, Manif
         },
         None => Err(err(
             "MAN-URL-ARG-TYPE",
-            format!("{context}: {field:?} expects a URL string (plain or (url)-annotated)"),
+            format!("{context}: {field:?} expects a (url)-annotated URL string"),
         )),
     }
 }

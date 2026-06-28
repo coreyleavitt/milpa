@@ -29,7 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha256
-from typing import Union
+from typing import TYPE_CHECKING, Union
 
 from milpa.kdl_io import (
     KdlNode,
@@ -45,6 +45,9 @@ from milpa.kdl_io import (
     value_as_int,
 )
 from milpa.predicate import Predicate
+
+if TYPE_CHECKING:
+    from milpa.manifest import FlagRequest
 
 # ---------------------------------------------------------------------------
 # EdgeSource fidelity tag (spec/dep-decl.md §1)
@@ -86,11 +89,19 @@ class NamedRequire:
     (back-compat: unconditional requires are unaffected).  Nothing populates
     the field until S3b; ``frozen=True`` dataclass auto-derives ``__eq__``
     and ``__repr__`` that include it for free.
+
+    `namespace` is the optional namespace for qualified named deps (H2,
+    rfc-resolver-correctness.md).  None for bare-name deps (all pre-S5b deps
+    and all DepDecl-sourced entries).  Populated by ``_manifest_to_edgeset``
+    from ``NamedDep.namespace`` so that transitive qualified deps (a transitive
+    milpa.kdl declaring ``"ns/pkg"``) survive the EdgeSet boundary with their
+    namespace intact.
     """
 
     name: str
     constraint_str: str
     predicates: tuple[Predicate, ...] = ()
+    namespace: str | None = None
 
 
 @dataclass(frozen=True)
@@ -100,11 +111,28 @@ class UrlRequire:
     `predicates` carries optional ``when``-gate annotations (S2 — RFC
     ``rfc-conditional-requires.md`` §3.3).  Defaults to an empty tuple
     (back-compat).
+
+    `name` is the declared dep name when sourced from milpa.kdl or a .nimble
+    file (the KDL node name / nimble requires identifier).  ``None`` when
+    sourced from a DepDecl artifact (which encodes only URL + ref, no name).
+    Populated by S2b to allow BFS-dep reconstruction from an EdgeSet without
+    a second parse of the fetched tree.
+
+    `flag_requests` carries the consumer-side flag requests (S3 + S4b).
+    Not encoded in DepDecl artifacts (provider-side metadata has no consumer
+    context); always empty in the DepDecl parse path.  Populated by
+    ``_manifest_to_edgeset`` so that ``edgeset_to_bfs_deps`` can pass
+    ``UrlDep.flag_requests`` through without a second manifest parse.
+
+    Mirrors ``UrlRequire.flag_requests: Vec<FlagRequest>`` in the Rust impl
+    (milpa-types).
     """
 
     url: str
     ref: str
     predicates: tuple[Predicate, ...] = ()
+    name: str | None = None
+    flag_requests: tuple[FlagRequest, ...] = ()
 
 
 RequireEntry = Union[NamedRequire, UrlRequire]

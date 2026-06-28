@@ -32,9 +32,12 @@ use milpa_solver::{
     parse_version, solve, solve_with_refutation, vs_to_constraint_str, Dep as SolverDep,
     PackageProvider, RefutationEntry, Strategy, VersionSet,
 };
-use milpa_types::{EdgeSet, FlagRequest, Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph, Version};
+use milpa_types::{DepKey, EdgeSet, FlagRequest, Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph, Version};
 
-use crate::edge_sources::{EdgeSourceCtx, NimbleEdgeSource};
+use crate::edge_sources::{
+    dep_passes_flag_predicates, resolve_edges, DepDeclEdgeSource,
+    DepDeclSource, EdgeSourceCtx, MilpaKdlEdgeSource, NimbleEdgeSource,
+};
 use crate::error::{CoreError, MilpaError};
 use crate::fetch::{FetchError, FetcherRegistry, Receipt};
 use crate::frozen::rebuild_deps_view;
@@ -190,39 +193,22 @@ pub fn resolve_with_features(
     // §6: filter conditional deps by the active profile before anything else.
     // An absent profile disables filtering entirely (§6 absent-profile rule).
     //
-    // S7 (RFC #23 §3.2 + §3.1.2): before filtering, expand `profile.flags`
-    // by running flag_enables_closure over the manifest's default-true flags.
-    // This ensures optional deps activated via `enables` are visible to the
-    // profile's flag predicate check — mirrors Python's _filter_manifest_by_profile.
+    // S7 / #179: unified through the shared FilterCtx + filter_manifest path
+    // (same as resolve_with_cert and seed_workspace).  FilterCtx::build computes
+    // the flag closure over the manifest's default-true flags (or cli_seed when
+    // has_cli_features), which is semantically identical to the former
+    // filter_manifest_by_profile path (profile.flags is always empty at all
+    // call-sites: CLI + conformance runner).
     let filtered;
-    let enriched_profile_storage;
     let manifest = match profile {
         Some(p) => {
-            use milpa_manifest::flag_enables_closure;
-            use std::collections::HashSet;
-            // S9: when CLI features present, override the default seed.
-            let seed: HashSet<String> = if has_cli_features {
-                cli_seed.clone()
-            } else {
-                manifest
-                    .flags
-                    .iter()
-                    .filter(|f| f.default)
-                    .map(|f| f.name.clone())
-                    .collect()
-            };
-            let active = flag_enables_closure(&manifest.flags, &seed);
-            // Merge existing profile.flags with the closure result.
-            let mut merged_flags: Vec<String> = p.flags.clone();
-            for flag in &active {
-                if !merged_flags.contains(flag) {
-                    merged_flags.push(flag.clone());
-                }
-            }
-            let mut ep = p.clone();
-            ep.flags = merged_flags;
-            enriched_profile_storage = ep;
-            filtered = filter_manifest_by_profile(manifest, &enriched_profile_storage);
+            // S9: when CLI features present use cli_seed as the flag closure
+            // seed; otherwise use manifest defaults.  FilterCtx::build handles
+            // both via its cli_seed parameter.
+            let cli_seed_opt: Option<&std::collections::HashSet<String>> =
+                if has_cli_features { Some(&cli_seed) } else { None };
+            let ctx = FilterCtx::build(manifest, Some(p.clone()), cli_seed_opt);
+            filtered = filter_manifest(manifest, &ctx);
             &filtered
         }
         None if has_cli_features => {
@@ -232,9 +218,10 @@ pub fn resolve_with_features(
             // SEPARATE axis (§489): they still apply based on the active flag set.
             //
             // Previous code synthesised a Profile{platform:None,...} and called
-            // filter_manifest_by_profile; predicate_satisfied returns false for
-            // platform/arch/nim/milpa when the axis is None ("an absent axis
-            // matches nothing"), which PRUNES those deps — a §470 violation.
+            // filter_manifest_by_profile (now deleted); predicate_satisfied
+            // returned false for platform/arch/nim/milpa when the axis is None
+            // ("an absent axis matches nothing"), which PRUNED those deps — a
+            // §470 violation.
             //
             // Correct fix: use dep_passes_flag_predicates (SSOT) directly.
             // Non-flag predicates are not evaluated (absent profile = include all).
@@ -1041,9 +1028,11 @@ enum Item {
     /// (`MAN-DEP-NAMED-CONSTRAINT`) or at the nimble-parse boundary for .nimble
     /// deps (`MAN-NIMBLE-CONSTRAINT`). The `VersionSet` is never re-parsed at
     /// dispatch time; `process_named` receives it directly.
+    /// S5b: `namespace` is `Some("ns")` for qualified deps; `None` for bare/transitive.
     Named {
         name: String,
         constraint: VersionSet,
+        namespace: Option<String>,
     },
     Local(LocalDep),
     Tarball(TarballDep),
@@ -1053,9 +1042,22 @@ impl Item {
     fn name(&self) -> &str {
         match self {
             Item::Url(d) => &d.name,
-            Item::Named { name, .. } => name,
+            Item::Named { name, .. } => name,  // bare name (for debug/display)
             Item::Local(d) => &d.name,
             Item::Tarball(d) => &d.name,
+        }
+    }
+
+    /// The gate key: solver_var for Named items (namespace-qualified), bare name
+    /// for all other transports.  Used in `seen_by_name` to avoid conflating two
+    /// qualified deps that share a bare name (S5b: ns1::bar vs ns2::bar).
+    fn gate_key(&self) -> String {
+        match self {
+            Item::Named { name, namespace, .. } => {
+                let dep_key = DepKey { name: name.clone(), namespace: namespace.clone() };
+                dep_key.solver_var().to_string()
+            }
+            _ => self.name().to_string(),
         }
     }
 
@@ -1065,7 +1067,10 @@ impl Item {
     fn pkey(&self) -> PKey {
         match self {
             Item::Url(d) => PKey::Url(d.git.clone(), d.git_ref.clone()),
-            Item::Named { name, .. } => PKey::Named(name.clone()),
+            Item::Named { name, namespace, .. } => PKey::Named(DepKey {
+                name: name.clone(),
+                namespace: namespace.clone(),
+            }),  // S5b: qualified key when namespace is set
             Item::Local(d) => PKey::Local(d.path.clone()),
             Item::Tarball(d) => PKey::Tarball(d.url.clone()),
         }
@@ -1075,7 +1080,7 @@ impl Item {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PKey {
     Url(String, String),
-    Named(String),
+    Named(DepKey),  // S5a: qualified key (namespace+name) so two namespaces with same bare name differ
     Local(String),
     Tarball(String),
     /// S8b: sentinel for a MemberTarget override — the dep is satisfied by a
@@ -1145,6 +1150,51 @@ struct Candidate {
 // The two-phase provider
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// S3b policy adapter: wraps DepDeclEdgeSource with Provider-level attestation policy.
+// Implements DepDeclSource so resolve_edges can call it via the trait object.
+// ---------------------------------------------------------------------------
+
+/// `DepDeclSource` adapter that wraps `DepDeclEdgeSource` and applies the
+/// Provider-level non-strict attestation policy for `TNG-DEPDECL-FETCH-FAILED`.
+///
+/// Hard integrity failures (HASH-MISMATCH, PARSE-ERROR, SCHEMA-*) are always
+/// propagated; soft fetch failures fall through to milpa.kdl or nimble based
+/// on `strict` and `ctx.has_milpa_kdl`.
+struct PolicyDepDeclSource<'a> {
+    inner: DepDeclEdgeSource<'a>,
+    /// When `false`, a `TNG-DEPDECL-FETCH-FAILED` error falls through to
+    /// milpa.kdl / nimble (non-strict attestation policy). When `true`, it
+    /// propagates as a hard error (strict policy).
+    strict: bool,
+}
+
+impl<'a> DepDeclSource for PolicyDepDeclSource<'a> {
+    fn edges_for(
+        &self,
+        name: &str,
+        version: &Version,
+        ctx: &EdgeSourceCtx,
+    ) -> Result<EdgeSet, MilpaError> {
+        match self.inner.edges_for_result(name, ctx) {
+            Ok(es) => Ok(es),
+            Err(ref e) if e.code() == "TNG-DEPDECL-FETCH-FAILED" && !self.strict => {
+                // Non-strict: artifact unreachable → fall through to milpa.kdl / nimble.
+                // The attestation-policy summary warning fires after solve() via
+                // enforce_attestation_policy (same path as any NimbleFallback dep).
+                if ctx.has_milpa_kdl {
+                    Ok(MilpaKdlEdgeSource.edges_for(name, version, ctx))
+                } else {
+                    Ok(NimbleEdgeSource.edges_for(name, version, ctx)?)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 /// Backs the solver's [`PackageProvider`] queries. Eager candidates land in
 /// `candidates` during BFS; named stubs in `stubs` are fetched lazily. All
 /// mutable state is `RefCell`-guarded because the solver calls the queries via
@@ -1172,7 +1222,7 @@ struct ResolveProvider<'a> {
     edge_cache: RefCell<BTreeMap<(String, Version), EdgeSet>>,
 
     seen_url: RefCell<BTreeSet<(String, String)>>,
-    seen_named: RefCell<BTreeSet<String>>,
+    seen_named: RefCell<BTreeSet<DepKey>>,  // S5a: qualified key (namespace+name)
     seen_local: RefCell<BTreeSet<String>>,
     seen_tarball: RefCell<BTreeSet<String>>,
     seen_by_name: RefCell<BTreeMap<String, (PKey, bool)>>,
@@ -1336,25 +1386,30 @@ impl<'a> ResolveProvider<'a> {
                         .parsed_constraint
                         .clone()
                         .unwrap_or_else(VersionSet::full);
-                    // S3: store flag_requests for use during materialize_named.
+                    // S5b: compute solver variable — "ns::name" for qualified, "name" for bare.
+                    // This matches Python: _dk.solver_var() is the solver package identifier.
+                    let dep_key = DepKey { name: name.clone(), namespace: n.namespace.clone() };
+                    let solver_var = dep_key.solver_var().to_string();
+                    // S3: store flag_requests keyed by solver_var so materialize_named can find them.
                     if !n.flag_requests.is_empty() {
                         self.flag_requests_by_name
                             .borrow_mut()
-                            .insert(name.clone(), n.flag_requests.clone());
+                            .insert(solver_var.clone(), n.flag_requests.clone());
                     }
                     if self.overrides.contains_key(&name) {
                         // Override routes a named dep to a URL/local fetch → singleton.
+                        // Overrides are keyed by bare name (manifests use bare names in overrides).
                         let ov = &self.overrides[&name];
-                        root_deps.push(SolverDep::new(name.clone(), eq_sentinel()));
+                        root_deps.push(SolverDep::new(solver_var.clone(), eq_sentinel()));
                         match &ov.target {
                             // S8a: LocalTarget override on root NamedDep → local pkey + item.
                             OverrideTarget::Local { path } => {
                                 seen_by_name.insert(
-                                    name.clone(),
+                                    solver_var.clone(),
                                     (PKey::Local(path.clone()), true),
                                 );
-                                root_requires.push(name.clone());
-                                self.discovery_order.borrow_mut().push(name.clone());
+                                root_requires.push(solver_var.clone());
+                                self.discovery_order.borrow_mut().push(solver_var.clone());
                                 queue.push(Item::Local(LocalDep { name, path: path.clone(), predicates: vec![] }));
                                 continue;
                             }
@@ -1362,28 +1417,29 @@ impl<'a> ResolveProvider<'a> {
                                 // S8b: MemberTarget in a single-package manifest is a no-op
                                 // (no workspace context; no member candidate pre-registered).
                                 // Treat as if the override were absent: resolve as named dep.
-                                // Revert to named-dep solver term (already pushed as sentinel above).
-                                // We drop the sentinel we pushed and push the real constraint term.
                                 root_deps.pop(); // undo the sentinel push
-                                root_deps.push(SolverDep::new(name.clone(), vs.clone()));
-                                seen_by_name.insert(name.clone(), (PKey::Named(name.clone()), true));
+                                root_deps.push(SolverDep::new(solver_var.clone(), vs.clone()));
+                                // S5b: PKey::Named carries qualified DepKey
+                                seen_by_name.insert(solver_var.clone(), (PKey::Named(dep_key.clone()), true));
                             }
                             OverrideTarget::Git { url, git_ref } => {
                                 seen_by_name.insert(
-                                    name.clone(),
+                                    solver_var.clone(),
                                     (PKey::Url(url.clone(), git_ref.clone()), true),
                                 );
                             }
                         }
                     } else {
-                        root_deps.push(SolverDep::new(name.clone(), vs.clone()));
-                        seen_by_name.insert(name.clone(), (PKey::Named(name.clone()), true));
+                        root_deps.push(SolverDep::new(solver_var.clone(), vs.clone()));
+                        // S5b: PKey::Named carries qualified DepKey
+                        seen_by_name.insert(solver_var.clone(), (PKey::Named(dep_key.clone()), true));
                     }
-                    root_requires.push(name.clone());
-                    self.discovery_order.borrow_mut().push(name.clone()); // Phase B: root deps in declaration order
+                    root_requires.push(solver_var.clone());
+                    self.discovery_order.borrow_mut().push(solver_var.clone()); // Phase B: root deps in declaration order
                     queue.push(Item::Named {
                         name,
                         constraint: vs,
+                        namespace: n.namespace.clone(),
                     });
                 }
                 Dep::Member(_) => {
@@ -1554,6 +1610,7 @@ impl<'a> ResolveProvider<'a> {
                             queue.push(Item::Named {
                                 name: name.clone(),
                                 constraint: VersionSet::full(),
+                                namespace: None, // override-induced named item; no namespace
                             });
                         }
                     }
@@ -1604,27 +1661,32 @@ impl<'a> ResolveProvider<'a> {
                             .parsed_constraint
                             .clone()
                             .unwrap_or_else(VersionSet::full);
-                        terms.push(SolverDep::new(name.clone(), vs.clone()));
-                        requires.push(name.clone());
+                        // S5b: use solver_var ("ns::name" or "name") as the solver term.
+                        let dep_key = DepKey { name: name.clone(), namespace: n.namespace.clone() };
+                        let solver_var = dep_key.solver_var().to_string();
+                        terms.push(SolverDep::new(solver_var.clone(), vs.clone()));
+                        requires.push(solver_var.clone());
                         seen_by_name
-                            .entry(name.clone())
-                            .or_insert((PKey::Named(name.clone()), true));
-                        if !self.discovery_order.borrow().contains(&name) {
-                            self.discovery_order.borrow_mut().push(name.clone());
+                            .entry(solver_var.clone())
+                            .or_insert((PKey::Named(dep_key), true));  // S5b
+                        if !self.discovery_order.borrow().contains(&solver_var) {
+                            self.discovery_order.borrow_mut().push(solver_var.clone());
                         }
                         // S11 (RFC #23 §3.8): accumulate flag_requests from ALL members
                         // (workspace-wide union). Union via extend — monotone; duplicate
                         // positive requests are idempotent for union semantics.
+                        // Flag requests keyed by solver_var.
                         if !n.flag_requests.is_empty() {
                             self.flag_requests_by_name
                                 .borrow_mut()
-                                .entry(name.clone())
+                                .entry(solver_var.clone())
                                 .or_default()
                                 .extend(n.flag_requests.iter().cloned());
                         }
                         queue.push(Item::Named {
                             name,
                             constraint: vs,
+                            namespace: n.namespace.clone(),
                         });
                     }
                     Dep::Member(_) => unreachable!("handled by the coercion branch above"),
@@ -1811,7 +1873,7 @@ impl<'a> ResolveProvider<'a> {
             Item::Url(dep) => self.process_url(dep),
             Item::Local(dep) => self.process_local(dep),
             Item::Tarball(dep) => self.process_tarball(dep),
-            Item::Named { name, constraint } => self.process_named(&name, constraint),
+            Item::Named { name, constraint, namespace } => self.process_named(&name, constraint, namespace.as_deref()),
         }
     }
 
@@ -1823,20 +1885,23 @@ impl<'a> ResolveProvider<'a> {
         if name == "nim" {
             return Gate::Proceed;
         }
+        // S5b: use gate_key (solver_var) so that ns1::bar and ns2::bar are
+        // distinct entries in seen_by_name (both have bare name "bar").
+        let key = item.gate_key();
         let pkey = item.pkey();
         let mut seen = self.seen_by_name.borrow_mut();
-        match seen.get(name) {
+        match seen.get(&key) {
             None => {
-                seen.insert(name.to_string(), (pkey, false));
+                seen.insert(key.clone(), (pkey, false));
                 // Phase B: record transitive dep first-enqueue (BFS-insertion order).
                 // Root deps are recorded in seed_root(); transitive deps land here.
-                self.discovery_order.borrow_mut().push(name.to_string());
+                self.discovery_order.borrow_mut().push(key.clone());
                 Gate::Proceed
             }
             Some((prior_key, is_root)) => {
                 if *prior_key == pkey {
                     Gate::Proceed
-                } else if *is_root || self.root_authority.contains(name) {
+                } else if *is_root || self.root_authority.contains(&key) {
                     Gate::Suppress
                 } else {
                     Gate::Conflict(prior_key.clone(), pkey)
@@ -1996,7 +2061,9 @@ impl<'a> ResolveProvider<'a> {
                                                     }
                                                 }
                                                 Dep::Named(n) => {
-                                                    if !self.seen_named.borrow().contains(&n.name) {
+                                                    // H2: check by full DepKey (namespace-aware).
+                                                    let n_key = DepKey { name: n.name.clone(), namespace: n.namespace.clone() };
+                                                    if !self.seen_named.borrow().contains(&n_key) {
                                                         let constraint = if self.overrides.contains_key(&n.name) {
                                                             eq_sentinel()
                                                         } else {
@@ -2006,6 +2073,7 @@ impl<'a> ResolveProvider<'a> {
                                                         new_items.push(Item::Named {
                                                             name: n.name.clone(),
                                                             constraint,
+                                                            namespace: n.namespace.clone(), // H2: carry namespace
                                                         });
                                                     }
                                                 }
@@ -2250,9 +2318,14 @@ impl<'a> ResolveProvider<'a> {
     /// `constraint` is a pre-parsed `VersionSet` — validated at the parse
     /// boundary (manifest: `MAN-DEP-NAMED-CONSTRAINT`; nimble:
     /// `MAN-NIMBLE-CONSTRAINT`). No re-parsing occurs here.
-    fn process_named(&self, name: &str, constraint: VersionSet) -> Result<(), MilpaError> {
+    /// Phase A: enumerate index versions for a named dep as stubs (no fetch).
+    /// `namespace` is `Some("ns")` for S5b qualified deps; `None` for bare/transitive.
+    fn process_named(&self, name: &str, constraint: VersionSet, namespace: Option<&str>) -> Result<(), MilpaError> {
+        // Track by DepKey — qualified key if namespace is set, bare otherwise.
+        let dep_key = DepKey { name: name.to_string(), namespace: namespace.map(str::to_string) };
+        // For "nim" we mark as seen but skip index enumeration.
         if name == "nim" {
-            self.seen_named.borrow_mut().insert(name.to_string());
+            self.seen_named.borrow_mut().insert(dep_key);
             return Ok(());
         }
         // A member-named transitive dep is already satisfied by the in-tree
@@ -2260,7 +2333,9 @@ impl<'a> ResolveProvider<'a> {
         if self.member_names.contains(name) {
             return Ok(());
         }
-        if !self.seen_named.borrow_mut().insert(name.to_string()) {
+        // DepKey dedup — (namespace, name) pair; two qualified deps with the same
+        // bare name but different namespaces are distinct and both enumerated.
+        if !self.seen_named.borrow_mut().insert(dep_key) {
             return Ok(());
         }
         // Phase A enumerate: enumerate ALL versions from the index (enumerate-all
@@ -2269,14 +2344,18 @@ impl<'a> ResolveProvider<'a> {
         // pre-filter by the declared constraint.  Pre-filtering produces the
         // correct selected version on the happy path but emits TNG-NO-SATISFYING-VERSION
         // instead of the canonical SOLVE-CONFLICT on the error path.
-        // TNG-NOT-FOUND / TNG-AMBIGUOUS-NAME / TNG-NO-PROVENANCE can still fire
-        // (package absent, ambiguous namespace, or all versions lack provenance).
+        // S5b: if namespace is set, use qualified lookup (bypasses TNG-AMBIGUOUS-NAME).
         let enumerate_all = VersionSet::full();
         let raw_str: Option<&str> = None;
-        let versions = self
-            .index
-            .resolve_named_all(name, &enumerate_all, raw_str)
-            .map_err(MilpaError::from)?;
+        let versions = if let Some(ns) = namespace {
+            self.index
+                .resolve_named_all_qualified(ns, name, &enumerate_all, raw_str)
+                .map_err(MilpaError::from)?
+        } else {
+            self.index
+                .resolve_named_all(name, &enumerate_all, raw_str)
+                .map_err(MilpaError::from)?
+        };
         let mut by_ver: BTreeMap<Version, IndexVersion> = BTreeMap::new();
         for e in versions {
             if let Some(v) = parse_version(&e.version) {
@@ -2284,9 +2363,15 @@ impl<'a> ResolveProvider<'a> {
             }
         }
         if !by_ver.is_empty() {
+            // M1 SSOT: route through DepKey::solver_var() — sole join site for "::".
+            // For qualified deps the key is "ns::name"; for bare deps just "name".
+            let stub_key = DepKey {
+                name: name.to_string(),
+                namespace: namespace.map(str::to_string),
+            }.solver_var();
             self.stubs
                 .borrow_mut()
-                .entry(name.to_string())
+                .entry(stub_key)
                 .or_default()
                 .extend(by_ver);
         }
@@ -2296,10 +2381,16 @@ impl<'a> ResolveProvider<'a> {
     /// Phase B: fetch + parse a named dep for the solver-selected version.
     fn materialize_named(
         &self,
-        name: &str,
+        name: &str,  // solver_var: "ns::bare" for qualified, "bare" for unqualified
         version: &Version,
         entry: &IndexVersion,
     ) -> Result<Vec<SolverDep>, MilpaError> {
+        // M1 / C1: use from_solver_var — SOLE split site for "::" in Rust.
+        // solver_var = "ns::bare" → bare_name = "bare", namespace = Some("ns");
+        // bare name → bare_name = name, namespace = None.
+        let dep_key_mat = DepKey::from_solver_var(name);
+        let bare_name = dep_key_mat.name.as_str();
+
         // Identity gate (registry-protocol §4): the index content_hash is the
         // trust root for a named dep. A version with no identity cannot have its
         // fetched bytes verified, so it is refused before any fetch is attempted.
@@ -2313,20 +2404,25 @@ impl<'a> ResolveProvider<'a> {
                 ),
             )));
         }
-        let dest = self.deps_dir.join(name);
+        // C1: filesystem destination uses dep_dir_name (@ns/name for qualified,
+        // bare name otherwise). Windows-safe, no "::" on disk.
+        // Matches Python: dep_dir_name(bare_name, dep_key.namespace) → _deps/@ns/name.
+        let dir_entry = milpa_types::dep_dir_name(bare_name, dep_key_mat.namespace.as_deref());
+        let dest = self.deps_dir.join(&dir_entry);
         // The index provenances are preference-ordered (canonical, then mirrors);
         // fetch_any tries them in order, identity-gated on the content_hash.
+        // S5b: fetch uses bare_name for the display name; dest is already bare-name-based.
         let (identity, _ref) = self.fetch_any(
-            name,
+            bare_name,
             &entry.provenances,
             &dest,
             Some(entry.content_hash.as_str()),
         )?;
-        // S3: look up flag_requests stored during seed_root for this named dep.
+        // S3: flag_requests keyed by solver_var (name); extract_requires uses bare_name.
         let named_active_flags: BTreeSet<String> = self
             .flag_requests_by_name
             .borrow()
-            .get(name)
+            .get(name)  // name = solver_var
             .map(|frs| {
                 frs.iter()
                     .filter(|fr| fr.enabled)
@@ -2334,7 +2430,7 @@ impl<'a> ResolveProvider<'a> {
                     .collect()
             })
             .unwrap_or_default();
-        let ex = self.extract_requires(&dest, name, version, false,
+        let ex = self.extract_requires(&dest, bare_name, version, false,
                 entry.dep_decl.as_deref(),
                 entry.dep_decl_schema_version,
                 named_active_flags)?;
@@ -2388,7 +2484,14 @@ impl<'a> ResolveProvider<'a> {
                         if !active.is_empty() {
                             self.dep_active_flags
                                 .borrow_mut()
-                                .insert(identity_str.clone(), active);
+                                .insert(identity_str.clone(), active.clone());
+                            // S4c (RFC #23 §3.1.4): check for flag conflicts at materialisation time.
+                            // Named deps are materialised inside the PubGrub solver, AFTER
+                            // `check_s4c_flag_conflicts` runs.  The post-fixpoint S4c pass therefore
+                            // never sees named dep candidates.  Closing this gap: check here, right
+                            // after active is computed — same algorithm as `raise_if_flag_conflicts`.
+                            // Mirrors Python `_materialize_named` S4c inline check.
+                            raise_if_flag_conflicts(bare_name, &mf.flags, &active)?;
                         }
                     }
                 }
@@ -2472,14 +2575,15 @@ impl<'a> ResolveProvider<'a> {
     }
 
     /// Read a fetched dep's transitive requires via the `EdgeSource` seam
-    /// (§4.2.1). Implements the priority-ordered sourcing decision and memoizes
-    /// the result in `edge_cache` (clause a). `version` is the solver-facing
-    /// version (`url_dep_version()` for eager URL/local/tarball deps; the index
-    /// version for named deps). `is_overridden` suppresses DepDecl (clause b).
+    /// (§4.2.1). Delegates clause (b)–(d) dispatch to `edge_sources::resolve_edges`
+    /// (the single live edge-dispatch path after the S2a SSOT refactor).
+    /// Keeps clause (a) cache management here: uses the Provider's own `RefCell`
+    /// edge-cache, bypassing it when `active_flags` is non-empty (S3 consumer-
+    /// specific EdgeSets must not be shared across consumers).
     ///
-    /// `dep_decl` and `dep_decl_schema_version` carry the index-attested DepDecl
-    /// pointer for named deps (S3b clause c). Both are `None` for URL/local/tarball
-    /// deps (not in the index).
+    /// `is_overridden` suppresses DepDecl (clause b). `dep_decl` /
+    /// `dep_decl_schema_version` carry the index-attested DepDecl pointer for
+    /// named deps (S3b clause c). Both are `None` for URL/local/tarball deps.
     ///
     /// Returns `(solver deps, requires names, src_dir, sub-items)`.
     fn extract_requires(
@@ -2498,206 +2602,48 @@ impl<'a> ResolveProvider<'a> {
     ) -> Result<Extracted, MilpaError> {
         let has_milpa_kdl = dest.join("milpa.kdl").is_file();
 
-        // Clause (a): cache hit → reconstruct Extracted from cached EdgeSet.
-        // Bypass when active_flags is non-empty (S3: consumer-specific, not sharable).
-        let cache_key = (name.to_string(), version.clone());
-        if active_flags.is_empty() {
-            let cache = self.edge_cache.borrow();
-            if let Some(es) = cache.get(&cache_key) {
-                return self.edgeset_to_extracted(es, name);
+        // Build the S3b DepDecl source with Provider-level attestation policy.
+        // `PolicyDepDeclSource` wraps `DepDeclEdgeSource` and handles the non-strict
+        // `TNG-DEPDECL-FETCH-FAILED` fallback (falls through to milpa.kdl / nimble).
+        let policy_dds: Option<PolicyDepDeclSource<'_>> = self.dep_decl_store.map(|store| {
+            PolicyDepDeclSource {
+                inner: DepDeclEdgeSource::new(store),
+                strict: self.strict_attestation,
             }
-        }
+        });
+        let dds_ref: Option<&dyn DepDeclSource> = policy_dds
+            .as_ref()
+            .map(|s| s as &dyn DepDeclSource);
 
-        // Cache miss (or active_flags bypass): dispatch to appropriate source (clauses b/c/d).
-        let es: EdgeSet = if is_overridden {
-            // Clause (b): is_overridden suppresses DepDecl — use milpa.kdl or nimble.
-            if has_milpa_kdl {
-                let text =
-                    std::fs::read_to_string(dest.join("milpa.kdl")).map_err(io_err)?;
-                let manifest = milpa_manifest::parse_manifest(&text)?;
-                self.build_edgeset_from_manifest(&manifest, &BTreeSet::new())
-            } else {
-                let ctx = EdgeSourceCtx {
-                    dep_path: Some(dest),
-                    dep_name: name,
-                    dep_decl: None,
-                    is_overridden,
-                    has_milpa_kdl: false,
-                    dep_decl_schema_version: None,
-                    overrides_by_name: &self.overrides,
-                    active_flags: BTreeSet::new(),
-                };
-                let src = NimbleEdgeSource;
-                src.edges_for(name, version, &ctx)?
-            }
-        } else if dep_decl.is_some() {
-            if let Some(store) = self.dep_decl_store {
-                // Clause (c): index-attested DepDecl mainline (S3b).
-                //
-                // S5 policy gate (spec §6 / resolver-semantics §13; Python edge_sources.py:488-500):
-                //   TNG-DEPDECL-FETCH-FAILED: policy-gated.
-                //     Non-strict → fall through to milpa.kdl / nimble (NimbleFallback).
-                //     Strict     → hard error (propagate).
-                //   Integrity failures (HASH-MISMATCH, PARSE-ERROR, SCHEMA-*):
-                //     ALWAYS hard regardless of policy — supply-chain invariant.
-                let source = crate::edge_sources::DepDeclEdgeSource::new(store);
-                let ctx = EdgeSourceCtx {
-                    dep_path: Some(dest),
-                    dep_name: name,
-                    dep_decl,
-                    is_overridden: false,
-                    has_milpa_kdl,
-                    dep_decl_schema_version,
-                    overrides_by_name: &self.overrides,
-                    active_flags: BTreeSet::new(),
-                };
-                match source.edges_for_result(name, &ctx) {
-                    Ok(es) => es,
-                    Err(ref e) if e.code() == "TNG-DEPDECL-FETCH-FAILED" && !self.strict_attestation => {
-                        // Non-strict: artifact unreachable → fall through to milpa.kdl / nimble.
-                        // The attestation-policy summary warning fires after solve() via
-                        // enforce_attestation_policy (same path as any NimbleFallback dep).
-                        if has_milpa_kdl {
-                            let text =
-                                std::fs::read_to_string(dest.join("milpa.kdl")).map_err(io_err)?;
-                            let manifest = milpa_manifest::parse_manifest(&text)?;
-                            self.build_edgeset_from_manifest(&manifest, &BTreeSet::new())
-                        } else {
-                            let fallback_ctx = EdgeSourceCtx {
-                                dep_path: Some(dest),
-                                dep_name: name,
-                                dep_decl: None,
-                                is_overridden: false,
-                                has_milpa_kdl: false,
-                                dep_decl_schema_version: None,
-                                overrides_by_name: &self.overrides,
-                                active_flags: BTreeSet::new(),
-                            };
-                            let src = NimbleEdgeSource;
-                            src.edges_for(name, version, &fallback_ctx)?
-                        }
-                    }
-                    Err(e) => return Err(e),
-                }
-            } else {
-                // dep_decl_store=None (S4-i compat): fall through to milpa.kdl / nimble.
-                if has_milpa_kdl {
-                    let text =
-                        std::fs::read_to_string(dest.join("milpa.kdl")).map_err(io_err)?;
-                    let manifest = milpa_manifest::parse_manifest(&text)?;
-                    self.build_edgeset_from_manifest(&manifest, &BTreeSet::new())
-                } else {
-                    let ctx = EdgeSourceCtx {
-                        dep_path: Some(dest),
-                        dep_name: name,
-                        dep_decl,
-                        is_overridden: false,
-                        has_milpa_kdl: false,
-                        dep_decl_schema_version,
-                        overrides_by_name: &self.overrides,
-                        active_flags: BTreeSet::new(),
-                    };
-                    let src = NimbleEdgeSource;
-                    src.edges_for(name, version, &ctx)?
-                }
-            }
-        } else if has_milpa_kdl {
-            // Clause (d): milpa.kdl present — parse with flag-predicate filtering.
-            // For milpa.kdl, parse the manifest here so we can apply flag-predicate
-            // filtering (§6 transitive: each dep evaluates against its own default
-            // flags, merged with S3 active_flags from the consumer's flag_requests).
-            // Flag filtering is resolver-local and not part of the EdgeSource
-            // seam's normative projection; it happens before constructing the EdgeSet.
-            let text = std::fs::read_to_string(dest.join("milpa.kdl")).map_err(io_err)?;
-            let manifest = milpa_manifest::parse_manifest(&text)?;
-            self.build_edgeset_from_manifest(&manifest, &active_flags)
-        } else {
-            // Clause (d/else): nimble fallback.
-            let ctx = EdgeSourceCtx {
-                dep_path: Some(dest),
-                dep_name: name,
-                dep_decl: None,
-                is_overridden: false,
-                has_milpa_kdl: false,
-                dep_decl_schema_version: None,
-                overrides_by_name: &self.overrides,
-                active_flags: BTreeSet::new(),
-            };
-            let src = NimbleEdgeSource;
-            src.edges_for(name, version, &ctx)?
+        // Build the EdgeSourceCtx. `active_flags` is passed via ctx so that
+        // `MilpaKdlEdgeSource.edges_for` (now flag-aware) applies the correct
+        // filter on the dep's own default flags merged with consumer requests.
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(dest),
+            dep_name: name,
+            dep_decl,
+            is_overridden,
+            has_milpa_kdl,
+            dep_decl_schema_version,
+            overrides_by_name: &self.overrides,
+            active_flags: active_flags.clone(),
         };
 
-        // Seal cache (clause a) — skip when active_flags was non-empty (S3 bypass).
-        let extracted = self.edgeset_to_extracted(&es, name)?;
-        if active_flags.is_empty() {
-            self.edge_cache.borrow_mut().insert(cache_key, es);
-        }
-        Ok(extracted)
-    }
+        // Clause (a): use Provider's shared cache when active_flags is empty.
+        // Use a temporary (empty) cache when active_flags is non-empty so those
+        // consumer-specific EdgeSets are never stored in the shared cache.
+        // `resolve_edges` handles the full clause (a)+(b)+(c)+(d) logic.
+        let es: EdgeSet = if !active_flags.is_empty() {
+            // S3 bypass: temporary cache — effective no-caching for this call.
+            let mut temp_cache = BTreeMap::new();
+            resolve_edges(name, version, &ctx, &mut temp_cache, None, None, dds_ref)?.clone()
+        } else {
+            // Shared cache: resolve_edges checks and seals clause (a).
+            let mut cache = self.edge_cache.borrow_mut();
+            resolve_edges(name, version, &ctx, &mut *cache, None, None, dds_ref)?.clone()
+        };
 
-    /// Build an `EdgeSet` from a parsed `milpa.kdl` manifest, applying flag-
-    /// predicate filtering (§6 transitive: each dep evaluates against its own
-    /// default flags, merged with `active_flags` from S3 consumer requests).
-    /// Only `manifest.deps` is included — **never** `dev_deps` (§9) — and
-    /// `overrides` are dropped entirely (§10.2).
-    ///
-    /// `active_flags`: S3 RFC #23 cross-package requests from the consumer's dep
-    /// declaration. Merged with the manifest's own defaults before filtering.
-    /// Pass `&BTreeSet::new()` for transitive hops (single-hop S3 scope).
-    ///
-    /// Flag filtering is applied here (resolver-local) rather than in
-    /// `edge_sources::manifest_to_edgeset` (which is the pure normative
-    /// projection used by tests that don't need flag filtering).
-    fn build_edgeset_from_manifest(&self, manifest: &Manifest, active_flags: &BTreeSet<String>) -> EdgeSet {
-        use milpa_types::{NamedRequire, RequireEntry, UrlRequire};
-        // Merge manifest defaults with S3 consumer requests.
-        let mut active: BTreeSet<&str> = manifest
-            .flags
-            .iter()
-            .filter(|f| f.default)
-            .map(|f| f.name.as_str())
-            .collect();
-        for flag in active_flags {
-            active.insert(flag.as_str());
-        }
-        let mut requires = Vec::new();
-        for d in &manifest.deps {
-            if !dep_passes_flag_predicates(d, &active) {
-                continue;
-            }
-            match d {
-                Dep::Url(u) => {
-                    // S4b: carry flag_requests from the dep declaration so that
-                    // `edgeset_to_extracted` can reconstruct them in the Item::Url.
-                    // This is the only UrlRequire construction site where flag_requests
-                    // may be non-empty (direct milpa.kdl dep entries with `flag` children).
-                    // FlagRequest is the SSOT (milpa-types); no conversion needed.
-                    requires.push(RequireEntry::Url(UrlRequire {
-                        url: u.git.clone(),
-                        ref_: u.git_ref.clone(),
-                        predicates: Vec::new(),
-                        flag_requests: u.flag_requests.clone(),
-                    }));
-                }
-                Dep::Named(n) => {
-                    if n.name == "nim" {
-                        continue;
-                    }
-                    requires.push(RequireEntry::Named(NamedRequire {
-                        name: n.name.clone(),
-                        constraint_str: n.constraint.clone().unwrap_or_default(),
-                        predicates: Vec::new(),
-                    }));
-                }
-                Dep::Local(_) | Dep::Tarball(_) | Dep::Member(_) => {}
-            }
-        }
-        // §10.2: manifest.overrides dropped entirely — NOT included in EdgeSet
-        EdgeSet {
-            requires,
-            src_dir: manifest.src_dir.clone(),
-            source: milpa_types::EdgeSource::MilpaKdl,
-        }
+        self.edgeset_to_extracted(&es, name)
     }
 
     /// Convert an `EdgeSet` → `Extracted` (solver deps, names, src_dir, sub-items).
@@ -2746,7 +2692,11 @@ impl<'a> ResolveProvider<'a> {
                     }
                 }
                 RequireEntry::Named(n) => {
-                    if !seen_dep_names.contains(&n.name) {
+                    // H2: use the solver_var (ns::name or bare name) as the
+                    // canonical key so qualified deps are distinct from bare deps.
+                    let n_key = DepKey { name: n.name.clone(), namespace: n.namespace.clone() };
+                    let solver_var = n_key.solver_var();
+                    if !seen_dep_names.contains(&solver_var) {
                         // Override check: a named transitive dep that is itself overridden
                         // enters as eq_sentinel() so the resolver routes it through the
                         // override URL fetch (§10).
@@ -2780,17 +2730,20 @@ impl<'a> ResolveProvider<'a> {
                                 }
                             }
                         };
-                        deps.push(SolverDep::new(n.name.clone(), vs.clone()));
-                        requires_names.push(n.name.clone());
+                        // H2: use solver_var as the key so the solver sees qualified deps
+                        // as distinct from bare deps with the same name.
+                        deps.push(SolverDep::new(solver_var.clone(), vs.clone()));
+                        requires_names.push(solver_var.clone());
                         items.push(Item::Named {
                             name: n.name.clone(),
                             constraint: vs,
+                            namespace: n.namespace.clone(), // H2: carry namespace
                         });
-                        seen_dep_names.insert(n.name.clone());
+                        seen_dep_names.insert(solver_var.clone());
                     }
                     // S4: accumulate predicates if non-empty (do not overwrite).
                     if !n.predicates.is_empty() {
-                        requires_predicates.entry(n.name.clone()).or_default().push(n.predicates.clone());
+                        requires_predicates.entry(solver_var.clone()).or_default().push(n.predicates.clone());
                     }
                 }
             }
@@ -3037,8 +2990,12 @@ impl<'a> ResolveProvider<'a> {
                 // Delegates to lockfile::cond_require_sort_key (SSOT) so
                 // escaping is shared with the emitter — cannot drift (C1 fix).
                 cond_requires.sort_by_key(|cr| cond_require_sort_key(cr));
+                // C1: split solver_var back to bare name + namespace.
+                // Candidate.name is the solver_var ("ns::bare" or "bare").
+                let dep_key = DepKey::from_solver_var(&c.name);
                 ResolvedDep {
-                    name: c.name.clone(),
+                    name: dep_key.name.clone(),
+                    namespace: dep_key.namespace.clone(),
                     identity: c.identity.clone(),
                     version: c.version.clone(),
                     src_dir: c.src_dir.clone(),
@@ -3105,7 +3062,12 @@ impl<'a> ResolveProvider<'a> {
                                     None => {
                                         // No entry — compute defaults-only from manifest.
                                         drop(daf);
-                                        let kdl_path = self.deps_dir.join(&c.name).join("milpa.kdl");
+                                        // C1: use dep_dir_name so qualified deps
+                                        // are found at _deps/@ns/name/milpa.kdl.
+                                        let c_dir = milpa_types::dep_dir_name(
+                                            &dep_key.name, dep_key.namespace.as_deref()
+                                        );
+                                        let kdl_path = self.deps_dir.join(&c_dir).join("milpa.kdl");
                                         if let Ok(txt) = std::fs::read_to_string(&kdl_path) {
                                             if let Ok(mf) = parse_mf(&txt) {
                                                 compute_dep_active_flags(&mf.flags, &[])
@@ -3186,7 +3148,12 @@ impl<'a> ResolveProvider<'a> {
             // dep_name → parsed Manifest
             let mut dep_manifests: BTreeMap<String, milpa_manifest::Manifest> = BTreeMap::new();
             for name in &dep_names {
-                let kdl_path = self.deps_dir.join(name).join("milpa.kdl");
+                // C1/H2 fix (S4b): decompose the solver-var (e.g. "ns::bar") via
+                // DepKey::from_solver_var so qualified deps resolve to the canonical
+                // ``_deps/@ns/bar/`` layout rather than the nonexistent ``_deps/ns::bar/``.
+                let dk_s4b = DepKey::from_solver_var(name);
+                let dir_name = milpa_types::dep_dir_name(&dk_s4b.name, dk_s4b.namespace.as_deref());
+                let kdl_path = self.deps_dir.join(&dir_name).join("milpa.kdl");
                 if kdl_path.is_file() {
                     if let Ok(text) = std::fs::read_to_string(&kdl_path) {
                         if let Ok(manifest) = milpa_manifest::parse_manifest(&text) {
@@ -3390,7 +3357,9 @@ impl<'a> ResolveProvider<'a> {
                                 }
                             }
                             Dep::Named(n) => {
-                                if !self.seen_named.borrow().contains(&n.name) {
+                                // H2: check by full DepKey (namespace-aware).
+                                let n_key = DepKey { name: n.name.clone(), namespace: n.namespace.clone() };
+                                if !self.seen_named.borrow().contains(&n_key) {
                                     let constraint = if self.overrides.contains_key(&n.name) {
                                         eq_sentinel()
                                     } else {
@@ -3400,6 +3369,7 @@ impl<'a> ResolveProvider<'a> {
                                     new_items.push(Item::Named {
                                         name: n.name.clone(),
                                         constraint,
+                                        namespace: n.namespace.clone(), // H2: carry namespace
                                     });
                                 }
                             }
@@ -3482,7 +3452,11 @@ impl<'a> ResolveProvider<'a> {
             }
 
             // Load the dep's manifest to get flag declarations (conflicts field).
-            let kdl_path = deps_dir.join(dep_name).join("milpa.kdl");
+            // C1/H2 fix (S4c): decompose the solver-var via DepKey::from_solver_var
+            // so qualified deps ("ns::bar") resolve to ``_deps/@ns/bar/milpa.kdl``.
+            let dk_s4c = DepKey::from_solver_var(dep_name);
+            let dir_name_s4c = milpa_types::dep_dir_name(&dk_s4c.name, dk_s4c.namespace.as_deref());
+            let kdl_path = deps_dir.join(&dir_name_s4c).join("milpa.kdl");
             if !kdl_path.exists() {
                 continue;
             }
@@ -3967,72 +3941,6 @@ fn predicate_satisfied_profile_only(pred: &Predicate, profile: &Profile) -> bool
     if pred.negated { !any_match } else { any_match }
 }
 
-/// Filter conditional deps by the active profile (§6). Flag predicates evaluate
-/// against `profile.flags`; `nim` predicates against `profile.nim_version`.
-///
-/// Legacy helper: kept for [`seed_workspace`] call-sites not yet migrated to
-/// [`FilterCtx`] + [`filter_manifest`] (S2 wires those).  New call-sites should
-/// use [`filter_manifest`] instead.
-fn filter_manifest_by_profile(manifest: &Manifest, profile: &Profile) -> Manifest {
-    let mut out = manifest.clone();
-    out.deps.retain(|d| dep_matches_profile(d, profile));
-    out.dev_deps.retain(|d| dep_matches_profile(d, profile));
-    out
-}
-
-fn dep_matches_profile(dep: &Dep, profile: &Profile) -> bool {
-    dep.predicates()
-        .iter()
-        .all(|p| predicate_satisfied(p, profile))
-}
-
-fn predicate_satisfied(pred: &Predicate, profile: &Profile) -> bool {
-    // §3.C / §6: an absent axis is indeterminate → the predicate evaluates to false
-    // regardless of negation.  Check for absence BEFORE applying negation so that
-    // `when arch != "arm64"` with arch=None yields false, not true.
-    // (Flag predicates are never "absent" — an empty flag set means no flag is active,
-    // which is handled below as any_match=false with negated=false ⟹ false.)
-    let axis_present = match pred.name.as_str() {
-        "flag" => true, // flags are always "present" (an empty set is valid)
-        "platform" => profile.platform.is_some(),
-        "arch" => profile.arch.is_some(),
-        "nim" => profile.nim_version.is_some(),
-        "milpa" => profile.milpa_version.is_some(),
-        _ => false,
-    };
-    if !axis_present {
-        return false;
-    }
-    let any_match = match pred.name.as_str() {
-        "flag" => pred.values.iter().any(|v| profile.flags.contains(v)),
-        // platform / arch are plain string-equality axes (Nim's hostOS / hostCPU
-        // vocabulary); an absent axis matches nothing.
-        "platform" => match &profile.platform {
-            Some(actual) => pred.values.iter().any(|v| v == actual),
-            None => false,
-        },
-        "arch" => match &profile.arch {
-            Some(actual) => pred.values.iter().any(|v| v == actual),
-            None => false,
-        },
-        // nim / milpa are version-constraint (or plain-equality) axes.
-        "nim" => match &profile.nim_version {
-            Some(actual) => pred.values.iter().any(|v| version_satisfies(actual, v)),
-            None => false,
-        },
-        "milpa" => match &profile.milpa_version {
-            Some(actual) => pred.values.iter().any(|v| version_satisfies(actual, v)),
-            None => false,
-        },
-        _ => false,
-    };
-    if pred.negated {
-        !any_match
-    } else {
-        any_match
-    }
-}
-
 /// True if `actual` satisfies a `nim`/`milpa` predicate value — a version
 /// constraint (leading comparison operator) or a plain-equality string.
 fn version_satisfies(actual: &Version, declared: &str) -> bool {
@@ -4055,20 +3963,6 @@ fn normalize_constraint(s: &str) -> String {
         }
     }
     s.to_string()
-}
-
-fn dep_passes_flag_predicates(dep: &Dep, active: &BTreeSet<&str>) -> bool {
-    for p in dep.predicates() {
-        if p.name != "flag" {
-            continue;
-        }
-        let any_match = p.values.iter().any(|v| active.contains(v.as_str()));
-        let satisfied = if p.negated { !any_match } else { any_match };
-        if !satisfied {
-            return false;
-        }
-    }
-    true
 }
 
 /// Compute the set of active flags for a dep, given its declared flags and the
@@ -4290,8 +4184,8 @@ struct ProviderOpts<'a> {
 /// non-cert and cert paths share identical setup; they diverge only at the
 /// solve dispatch and error-wrapping).
 ///
-/// `manifest` must already be profile-filtered (callers own the
-/// `filter_manifest_by_profile` step because the filtered value needs to
+/// `manifest` must already be profile-filtered via `FilterCtx` + `filter_manifest`
+/// (callers own the filter step because the filtered value needs to
 /// outlive this call). `empty_index` is a caller-owned `Index::default()`
 /// whose lifetime anchors the borrow in the returned provider.
 ///

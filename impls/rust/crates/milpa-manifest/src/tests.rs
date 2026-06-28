@@ -57,7 +57,7 @@ fn error_codes_match_fixtures() {
             "MAN-DEP-REF-MISSING",
         ),
         ("name \"x\"\ndeps {\n  foo local=\"\"\n}\n", "MAN-DEP-LOCAL-PATH"),
-        ("name \"x\"\ndeps {\n  foo tarball=\"\"\n}\n", "MAN-DEP-TARBALL-URL"),
+        ("name \"x\"\ndeps {\n  foo tarball=\"\"\n}\n", "MAN-URL-ARG-TYPE"),
         (
             "name \"x\"\ndeps {\n  foo tarball=(url)\"https://x/t.tgz\" sha256=42\n}\n",
             "MAN-DEP-TARBALL-SHA",
@@ -99,11 +99,11 @@ fn error_codes_match_fixtures() {
         ),
         (
             "name \"x\"\ndeps {\n  foo git=\"no-scheme\" ref=\"m\"\n}\n",
-            "MAN-GIT-URL-NO-SCHEME",
+            "MAN-URL-ARG-TYPE",
         ),
         (
             "name \"x\"\ndeps {\n  foo git=\"ftp://a/f.git\" ref=\"m\"\n}\n",
-            "MAN-GIT-URL-BAD-SCHEME",
+            "MAN-URL-ARG-TYPE",
         ),
         (
             "name \"x\"\noverrides {\n  notpkg \"a\"\n}\n",
@@ -778,6 +778,139 @@ fn s2_default_seeding_is_callers_responsibility() {
     assert!(result.contains("ssl"));
     assert!(result.contains("net"));
     assert!(!result.contains("debug"));
+}
+
+// ---------------------------------------------------------------------------
+// S5b: namespace-qualified named dep grammar
+// ---------------------------------------------------------------------------
+
+/// Helper: extract the single NamedDep from a manifest text.
+fn single_named(text: &str) -> NamedDep {
+    let m = pkg(text);
+    assert_eq!(m.deps.len(), 1, "expected exactly one dep");
+    match m.deps.into_iter().next().unwrap() {
+        Dep::Named(n) => n,
+        other => panic!("expected Named dep, got {other:?}"),
+    }
+}
+
+fn s5b_manifest(dep_line: &str) -> String {
+    format!("name \"app\"\nkind \"library\"\ndeps {{\n  {dep_line}\n}}\n")
+}
+
+#[test]
+fn s5b_named_dep_namespace_attr_parsed() {
+    // Canonical form: `pkg namespace="core" ">= 1.0.0"`.
+    let n = single_named(&s5b_manifest(r#"pkg namespace="core" ">= 1.0.0""#));
+    assert_eq!(n.name, "pkg");
+    assert_eq!(n.namespace, Some("core".to_string()));
+    assert_eq!(n.constraint.as_deref(), Some(">= 1.0.0"));
+}
+
+#[test]
+fn s5b_named_dep_namespace_attr_no_constraint() {
+    let n = single_named(&s5b_manifest(r#"pkg namespace="core""#));
+    assert_eq!(n.name, "pkg");
+    assert_eq!(n.namespace, Some("core".to_string()));
+    assert!(n.constraint.is_none());
+}
+
+#[test]
+fn s5b_slash_shorthand_desugars_to_namespace_attr() {
+    // Slash shorthand: `"core/pkg" ">= 1.0.0"` desugars to namespace="core", name="pkg".
+    let n = single_named(&s5b_manifest(r#""core/pkg" ">= 1.0.0""#));
+    assert_eq!(n.name, "pkg");
+    assert_eq!(n.namespace, Some("core".to_string()));
+    assert_eq!(n.constraint.as_deref(), Some(">= 1.0.0"));
+}
+
+#[test]
+fn s5b_slash_shorthand_no_constraint() {
+    let n = single_named(&s5b_manifest(r#""core/pkg""#));
+    assert_eq!(n.name, "pkg");
+    assert_eq!(n.namespace, Some("core".to_string()));
+    assert!(n.constraint.is_none());
+}
+
+#[test]
+fn s5b_slash_two_slashes_invalid() {
+    let err = doc_err(&s5b_manifest(r#""a/b/c""#));
+    assert_eq!(err, "MAN-DEP-NAME-INVALID");
+}
+
+#[test]
+fn s5b_slash_empty_namespace_invalid() {
+    let err = doc_err(&s5b_manifest(r#""/pkg""#));
+    assert_eq!(err, "MAN-DEP-NAME-INVALID");
+}
+
+#[test]
+fn s5b_slash_empty_name_part_invalid() {
+    let err = doc_err(&s5b_manifest(r#""core/""#));
+    assert_eq!(err, "MAN-DEP-NAME-INVALID");
+}
+
+#[test]
+fn s5b_namespace_attr_non_string_invalid() {
+    let err = doc_err(&s5b_manifest("pkg namespace=123"));
+    assert_eq!(err, "MAN-DEP-NAMED-PROPS");
+}
+
+#[test]
+fn s5b_namespace_attr_invalid_charset() {
+    let err = doc_err(&s5b_manifest("pkg namespace=\"core!\""));
+    assert_eq!(err, "MAN-DEP-NAME-INVALID");
+}
+
+#[test]
+fn s5b_both_forms_produce_identical_named_dep() {
+    // canonical attr and slash shorthand must produce identical NamedDep.
+    let attr = single_named(&s5b_manifest(r#"pkg namespace="core" ">= 1.0.0""#));
+    let slash = single_named(&s5b_manifest(r#""core/pkg" ">= 1.0.0""#));
+    assert_eq!(attr, slash);
+}
+
+#[test]
+fn s5b_no_namespace_gives_none() {
+    let n = single_named(&s5b_manifest(r#"pkg ">= 1.0.0""#));
+    assert!(n.namespace.is_none());
+}
+
+#[test]
+fn s5b_two_qualified_deps_different_namespaces_not_duplicates() {
+    // Two deps with same bare name but different namespaces are allowed.
+    let text = "name \"app\"\nkind \"library\"\ndeps {\n  \"ns1/alpha\" \">= 1.0.0\"\n  \"ns2/alpha\" \">= 2.0.0\"\n}\n";
+    let m = pkg(text);
+    assert_eq!(m.deps.len(), 2);
+}
+
+#[test]
+fn s5b_two_same_namespace_same_name_is_duplicate() {
+    // Same (namespace, name) pair is a duplicate.
+    let text = "name \"app\"\nkind \"library\"\ndeps {\n  \"core/pkg\" \">= 1.0.0\"\n  \"core/pkg\" \">= 2.0.0\"\n}\n";
+    let err = doc_err(text);
+    assert_eq!(err, "MAN-DEP-DUPLICATE");
+}
+
+#[test]
+fn s5b_format_namespace_canonical_attr_form() {
+    // Round-trip: format emits namespace= attr, NOT slash form.
+    let m = pkg(&s5b_manifest(r#""core/pkg" ">= 1.0.0""#));
+    let text = crate::format::format_manifest(&m);
+    // Must contain canonical attr form.
+    assert!(text.contains("namespace=\"core\""), "expected namespace attr in:\n{text}");
+    // Must NOT re-emit the slash shorthand.
+    assert!(!text.contains("core/pkg"), "slash form must not appear in output:\n{text}");
+}
+
+#[test]
+fn s5b_format_namespace_round_trip() {
+    // parse → format → parse must yield equal manifest.
+    let input = s5b_manifest(r#""core/pkg" ">= 1.0.0""#);
+    let m = pkg(&input);
+    let text = crate::format::format_manifest(&m);
+    let m2 = pkg(&text);
+    assert_eq!(m.deps, m2.deps);
 }
 
 // --- RFC §3.1.1 example ---

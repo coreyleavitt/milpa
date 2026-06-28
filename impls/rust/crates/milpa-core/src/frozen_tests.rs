@@ -27,6 +27,7 @@ fn manifest(deps: Vec<Dep>) -> Manifest {
 fn named(name: &str, constraint: Option<&str>) -> Dep {
     Dep::Named(NamedDep {
         name: name.into(),
+        namespace: None,
         constraint: constraint.map(str::to_string),
         parsed_constraint: constraint.map(|c| {
             milpa_solver::VersionSet::from_constraint(Some(c))
@@ -49,6 +50,7 @@ fn lock(strategy: &str, deps: Vec<LockedDep>) -> Lockfile {
 fn locked(name: &str, version: &str, identity: Option<&str>, prov: ProvenanceRecord) -> LockedDep {
     LockedDep {
         name: name.into(),
+        namespace: None,
         identity: identity.map(str::to_string),
         version: version.into(),
         src_dir: "src".into(),
@@ -207,30 +209,6 @@ fn identity_not_in_store() {
     );
     let err = resolve_frozen(&manifest(vec![]), &lf, &store, &deps_dir(&tmp)).unwrap_err();
     assert_eq!(err.code(), "FROZEN-IDENTITY-NOT-IN-STORE");
-}
-
-#[test]
-fn legacy_registry_provenance() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (store, identity) = store_with_foo(tmp.path());
-    let lf = lock(
-        "maxver",
-        vec![locked(
-            "foo",
-            "1.0.0",
-            Some(&identity),
-            ProvenanceRecord::Registry {
-                name: "foo".into(),
-                tag: Some("v1.0.0".into()),
-                commit_sha: None,
-                origin: "observed".into(),
-            },
-        )],
-    );
-    // Identity IS in the store, so it gets past link_external and fails when
-    // rebuilding the resolved dep from the legacy record.
-    let err = resolve_frozen(&manifest(vec![]), &lf, &store, &deps_dir(&tmp)).unwrap_err();
-    assert_eq!(err.code(), "FROZEN-LEGACY-REGISTRY-PROVENANCE");
 }
 
 // ---------------------------------------------------------------------------
@@ -442,6 +420,7 @@ fn frozen_carries_all_provenances() {
     };
     let locked_dep = LockedDep {
         name: "foo".into(),
+        namespace: None,
         identity: Some(identity),
         version: "0.0.1".into(),
         src_dir: "src".into(),
@@ -481,6 +460,7 @@ fn frozen_carries_all_provenances() {
 fn local_dep(name: &str, path: &str) -> milpa_types::ResolvedDep {
     milpa_types::ResolvedDep {
         name: name.into(),
+        namespace: None,
         identity: String::new(),
         version: milpa_types::Version::release(0, 0, 1),
         src_dir: "src".into(),
@@ -581,6 +561,7 @@ fn rebuild_deps_view_preserves_local_symlink_alongside_cas_dep() {
     let local = local_dep("locallib", &local_src.to_string_lossy());
     let git = milpa_types::ResolvedDep {
         name: "foo".into(),
+        namespace: None,
         identity: identity.clone(),
         version: milpa_types::Version::release(0, 0, 1),
         src_dir: "src".into(),

@@ -1,0 +1,15 @@
+// fixture-303: S2b — URL dep with flag-gated transitive dep absent from mocked fetches
+//
+// Root depends on main-lib (URL dep).  main-lib declares two transitive deps:
+//   - lib-a  (unconditional)            → must appear in resolved graph
+//   - lib-absent (flag="optional", OFF) → must NOT be fetched (not in mocked-fetches)
+//
+// Before S2b fix: _collect_transitive_deps returns lib-absent (no flag filter) →
+//   BFS enqueues it → fetch fails with FETCH-ALL-FAILED (RED).
+// After S2b fix:  edgeset_to_bfs_deps derives BFS deps from the EdgeSet (flag-filtered)
+//   → lib-absent absent → not enqueued → resolve succeeds (GREEN).
+name "testapp"
+kind "application"
+deps {
+    main-lib git=(url)"https://example.com/main-lib.git" ref="main"
+}

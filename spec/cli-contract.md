@@ -956,8 +956,6 @@ source** for the complete list of frozen-fast-path disqualifying conditions.
 >   satisfies the manifest constraint
 > - `FROZEN-IDENTITY-NOT-IN-STORE` — a dep's pinned identity is absent from
 >   the CAS
-> - `FROZEN-LEGACY-REGISTRY-PROVENANCE` — a lockfile entry uses the legacy
->   `kind "registry"` provenance (pre-#97); must re-resolve via tianguis
 > - `FROZEN-LOCAL-DEP` — a dep has a local provenance (editable trees always
 >   re-resolve)
 > - `FROZEN-MEMBER-DEP` — a dep is a workspace member (members always

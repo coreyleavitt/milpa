@@ -128,6 +128,81 @@ impl fmt::Display for Version {
     }
 }
 
+/// Resolver-level dep identity key (S1, rfc-resolver-correctness.md #108/#142).
+///
+/// `name` is the canonical bare name (always present).
+/// `namespace` is `None` in S1; populated by S5 when the manifest grammar
+/// supports namespace-qualified `NamedDep` references.
+///
+/// Used as a map key in `_locked_index` (frozen.rs) and `seen_named`
+/// (resolver.rs, S5a). A named struct — not a tuple — gives call-site
+/// guardrails and forces Python and Rust to converge on the same shape.
+///
+/// Spec: `spec/resolver-semantics.md` DepKey fields+ordering clause.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DepKey {
+    pub name: String,
+    pub namespace: Option<String>,
+}
+
+impl DepKey {
+    /// Construct a bare-name key (S1: `namespace` is always `None`).
+    pub fn bare(name: impl Into<String>) -> Self {
+        DepKey { name: name.into(), namespace: None }
+    }
+
+    /// Canonical PubGrub solver-variable string for this dep.
+    ///
+    /// `namespace == None` → bare name (backward-compatible with all pre-S5b
+    /// deps; the solver key is unchanged from before S5a).
+    /// `namespace == Some("ns")` → `"ns::name"` — a distinct key from the bare
+    /// name and from every other namespace, so `(ns1, foo)` and `(ns2, foo)`
+    /// become distinct solver variables.
+    ///
+    /// Agrees with `seen_named` (`BTreeSet<DepKey>`): both uniquely identify
+    /// the same dep and neither can collapse two different namespaces to one key.
+    pub fn solver_var(&self) -> String {
+        match &self.namespace {
+            None => self.name.clone(),
+            Some(ns) => format!("{}::{}", ns, self.name),
+        }
+    }
+
+    /// Reconstruct a `DepKey` from a solver-variable string produced by `solver_var()`.
+    ///
+    /// `"ns::name"` → `DepKey { name: "name", namespace: Some("ns") }`.
+    /// `"name"` (no `::`) → `DepKey::bare("name")`.
+    ///
+    /// This is the SOLE place a `"ns::name"` string is split back to its
+    /// components in the Rust impl (M1 SSOT fix, rfc-resolver-correctness.md).
+    pub fn from_solver_var(s: &str) -> Self {
+        match s.split_once("::") {
+            Some((ns, name)) => DepKey { name: name.into(), namespace: Some(ns.into()) },
+            None => DepKey::bare(s),
+        }
+    }
+}
+
+/// Canonical `_deps/` directory entry name for a dep (C1, rfc-resolver-correctness.md).
+///
+/// Bare dep (`namespace=None`): `"<name>"` → `_deps/<name>`.
+/// Qualified dep (`namespace="ns"`): `"@<ns>/<name>"` → `_deps/@ns/<name>`.
+///
+/// The `@<ns>/` prefix (npm-scope form) is:
+/// - Windows-safe (no `:` or `*` forbidden characters)
+/// - Collision-free with bare names (bare names cannot start with `@`)
+/// - Human-readable (analogous to npm `@scope/pkg` convention)
+///
+/// This is the SSOT for the on-disk path decision. Called from `rebuild_deps_view`,
+/// `materialize_named`, `nimcfg::path_for`, `frozen::check_manifest_alignment`,
+/// and `lockfile::verify_lockfile_against_deps`.
+pub fn dep_dir_name(name: &str, namespace: Option<&str>) -> String {
+    match namespace {
+        None => name.to_string(),
+        Some(ns) => format!("@{}/{}", ns, name),
+    }
+}
+
 /// Where a resolved dep's bytes come from. A **closed enum** (RFC §4.6): the
 /// spec fixes exactly four transport kinds, so dispatch is an exhaustive
 /// `match` and a new transport is an auditable variant, not an injectable
@@ -179,7 +254,13 @@ impl Provenance {
 /// building the graph; `from_graph` is then a near-trivial clone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDep {
+    /// Bare dep name (no `::` separator). For qualified deps, the namespace is in
+    /// `namespace`. The pair `(name, namespace)` uniquely identifies a dep.
     pub name: String,
+    /// C1 (rfc-resolver-correctness.md): namespace for qualified named deps.
+    /// `None` for all bare-name and URL/local/tarball/member deps.
+    /// Serialized as a KDL child node `namespace "<ns>"` in the lockfile (§3.9).
+    pub namespace: Option<String>,
     /// Content hash, e.g. `sha256:…` — immutable, recomputable from bytes.
     pub identity: String,
     pub version: Version,
@@ -218,23 +299,23 @@ pub struct ResolvedGraph {
 ///
 /// **Distinct from the transport [`Provenance`] enum**, deliberately. `Provenance`
 /// models the four *transport* kinds a fetcher dispatches on; `ProvenanceRecord`
-/// models what a `milpa.lock` *records about where bytes came from* — six kinds,
-/// because it additionally carries workspace-internal `Member` references and the
-/// read-compat legacy `Registry` kind (milpa#97), neither of which is a transport.
+/// models what a `milpa.lock` *records about where bytes came from* — five kinds,
+/// because it additionally carries workspace-internal `Member` references,
+/// which is not a transport.
 /// They are different sets by design, so they are different types (mirrors the
 /// Python `ProvenanceRecord` union in `lockfile.py`). Optional fields are `None`
 /// when omitted from the KDL — never an empty string.
 ///
 /// `origin`: `"observed"` (milpa fetched+verified these bytes) or `"declared"`
 /// (author-claimed mirror, unverified until first use). Per-lockfile annotation —
-/// never a CAS-entry property. Default `"observed"`. D-provenance (lockfile-schema §4).
+/// never a CAS-entry property. Required (S3 strict). D-provenance (lockfile-schema §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProvenanceRecord {
     Git {
         url: String,
         ref_spec: Option<String>,
         commit_sha: Option<String>,
-        /// "observed" or "declared". Default "observed".
+        /// "observed" or "declared".
         origin: String,
         /// H5: submodule path → 40-hex gitlink SHA, path-sorted.
         /// Empty for deps with no submodules.
@@ -244,34 +325,25 @@ pub enum ProvenanceRecord {
         url: String,
         /// Archive sha256 (transport receipt, NOT identity); `None` pre-TOFU.
         sha256: Option<String>,
-        /// "observed" or "declared". Default "observed".
+        /// "observed" or "declared".
         origin: String,
     },
     Local {
         /// As-declared relative path from the project root (never absolutized).
         path: String,
-        /// "observed" or "declared". Default "observed".
+        /// "observed" or "declared".
         origin: String,
     },
     Member {
         name: String,
-        /// "observed" or "declared". Default "observed".
+        /// "observed" or "declared".
         origin: String,
     },
     Oci {
         registry: String,
         repository: String,
         digest: String,
-        /// "observed" or "declared". Default "observed".
-        origin: String,
-    },
-    /// Read-compat only (milpa#97): the writer never emits this; the parser
-    /// still accepts it so pre-#97 lockfiles round-trip.
-    Registry {
-        name: String,
-        tag: Option<String>,
-        commit_sha: Option<String>,
-        /// "observed" or "declared". Default "observed".
+        /// "observed" or "declared".
         origin: String,
     },
 }
@@ -285,7 +357,6 @@ impl ProvenanceRecord {
             ProvenanceRecord::Local { origin, .. } => origin,
             ProvenanceRecord::Member { origin, .. } => origin,
             ProvenanceRecord::Oci { origin, .. } => origin,
-            ProvenanceRecord::Registry { origin, .. } => origin,
         }
     }
 
@@ -297,7 +368,6 @@ impl ProvenanceRecord {
             ProvenanceRecord::Local { .. } => "local",
             ProvenanceRecord::Member { .. } => "member",
             ProvenanceRecord::Oci { .. } => "oci",
-            ProvenanceRecord::Registry { .. } => "registry",
         }
     }
 }
@@ -326,7 +396,12 @@ pub struct CondRequire {
 /// are stored as `ProvenanceRecord` with `origin="declared"`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockedDep {
+    /// Bare dep name (no `::` separator). The namespace is in `namespace`.
     pub name: String,
+    /// C1 (rfc-resolver-correctness.md): namespace for qualified named deps.
+    /// `None` for all bare-name and non-named deps. Parsed from the optional
+    /// `namespace "<ns>"` child node in the lockfile dep block (§3.9).
+    pub namespace: Option<String>,
     pub identity: Option<String>,
     pub version: String,
     pub src_dir: String,
@@ -422,6 +497,10 @@ pub enum EdgeSource {
 /// `predicates` carries optional `when`-gate annotations (S2 — RFC
 /// `rfc-conditional-requires.md` §3.3). Defaults to an empty `Vec` (back-compat:
 /// unconditional requires are unaffected). Nothing populates it until S3b.
+///
+/// `namespace` carries the registry namespace from `namespace="..."` or slash-shorthand
+/// desugaring (H2 fix, rfc-resolver-correctness.md). `None` for bare-name deps and
+/// nimble-sourced deps (which have no namespace concept).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamedRequire {
     pub name: String,
@@ -429,6 +508,10 @@ pub struct NamedRequire {
     pub constraint_str: String,
     /// Optional `when`-gate predicates (S2; empty = unconditional).
     pub predicates: Vec<Predicate>,
+    /// H2: namespace qualifier, carried from manifest NamedDep through EdgeSet to
+    /// the resolver so transitive qualified deps preserve their namespace end-to-end.
+    /// `None` for bare-name deps and nimble-sourced requires.
+    pub namespace: Option<String>,
 }
 
 /// S4b (RFC #23 §3.1.3): a consumer-side flag request carried in a dep
@@ -607,6 +690,7 @@ mod tests {
             name: "foo".into(),
             constraint_str: "".into(),
             predicates: Vec::new(),
+            namespace: None,
         };
         let predicated = NamedRequire {
             name: "foo".into(),
@@ -616,6 +700,7 @@ mod tests {
                 values: vec!["linux".into()],
                 negated: false,
             }],
+            namespace: None,
         };
         assert_ne!(plain, predicated);
     }
@@ -641,6 +726,100 @@ mod tests {
             flag_requests: Vec::new(),
         };
         assert_ne!(plain, predicated);
+    }
+
+    // -----------------------------------------------------------------------
+    // S5a — DepKey.solver_var() (rfc-resolver-correctness.md)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dep_key_solver_var_bare_name_is_identity() {
+        // namespace=None → solver_var() == bare name (backward compat)
+        let k = DepKey { name: "chronos".into(), namespace: None };
+        assert_eq!(k.solver_var(), "chronos");
+    }
+
+    #[test]
+    fn dep_key_solver_var_with_namespace() {
+        // namespace="core" → solver_var() == "core::chronos"
+        let k = DepKey { name: "chronos".into(), namespace: Some("core".into()) };
+        assert_eq!(k.solver_var(), "core::chronos");
+    }
+
+    #[test]
+    fn dep_key_solver_var_two_namespaces_are_distinct() {
+        // (ns1, foo) and (ns2, foo) produce DISTINCT solver vars
+        let k1 = DepKey { name: "foo".into(), namespace: Some("ns1".into()) };
+        let k2 = DepKey { name: "foo".into(), namespace: Some("ns2".into()) };
+        assert_ne!(k1.solver_var(), k2.solver_var());
+    }
+
+    #[test]
+    fn dep_key_seen_named_set_distinguishes_namespaces() {
+        // After S5a: BTreeSet<DepKey> correctly keeps two same-bare-name/
+        // different-namespace DepKeys as distinct (no collapse).
+        use std::collections::BTreeSet;
+
+        let k_ns1 = DepKey { name: "foo".into(), namespace: Some("ns1".into()) };
+        let k_ns2 = DepKey { name: "foo".into(), namespace: Some("ns2".into()) };
+        let k_none = DepKey::bare("foo");
+
+        // OLD (BTreeSet<String>): both map to "foo" → collapse (bug)
+        let mut old_seen: BTreeSet<String> = BTreeSet::new();
+        old_seen.insert(k_ns1.name.clone());
+        assert!(old_seen.contains(&k_ns2.name)); // demonstrates the collapse
+
+        // NEW (BTreeSet<DepKey>): distinct keys
+        let mut new_seen: BTreeSet<DepKey> = BTreeSet::new();
+        new_seen.insert(k_ns1.clone());
+        assert!(!new_seen.contains(&k_ns2)); // different namespace → NOT dropped (fix)
+        assert!(!new_seen.contains(&k_none)); // None also distinct from "ns1"
+
+        // None-namespace still deduplicates correctly (no regression)
+        let mut new_seen2: BTreeSet<DepKey> = BTreeSet::new();
+        new_seen2.insert(k_none.clone());
+        assert!(new_seen2.contains(&DepKey::bare("foo"))); // same name + None → dedup OK
+    }
+
+    // M1 / C1 SSOT: from_solver_var is the SOLE split site for DepKey reconstruction
+    // from "::" in Rust.  (lockfile.rs req_name_to_lockfile also splits "::" but
+    // only to format requires entries, not to reconstruct a DepKey.)
+
+    #[test]
+    fn dep_key_from_solver_var_bare_name() {
+        // No "::" → bare key.
+        let k = DepKey::from_solver_var("chronos");
+        assert_eq!(k.name, "chronos");
+        assert_eq!(k.namespace, None);
+    }
+
+    #[test]
+    fn dep_key_from_solver_var_qualified() {
+        // "ns::name" → namespace=Some("ns"), name="name".
+        let k = DepKey::from_solver_var("ns1::bar");
+        assert_eq!(k.name, "bar");
+        assert_eq!(k.namespace, Some("ns1".to_string()));
+    }
+
+    #[test]
+    fn dep_key_from_solver_var_round_trips() {
+        // solver_var() → from_solver_var() round-trip is identity.
+        let original = DepKey { name: "baz".into(), namespace: Some("core".into()) };
+        let var = original.solver_var();
+        let recovered = DepKey::from_solver_var(&var);
+        assert_eq!(recovered, original);
+    }
+
+    // C1: dep_dir_name SSOT.
+
+    #[test]
+    fn dep_dir_name_bare() {
+        assert_eq!(dep_dir_name("chronos", None), "chronos");
+    }
+
+    #[test]
+    fn dep_dir_name_qualified() {
+        assert_eq!(dep_dir_name("bar", Some("ns1")), "@ns1/bar");
     }
 
 }

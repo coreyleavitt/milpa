@@ -1,5 +1,5 @@
 name "x"
 kind "library"
 deps {
-    foo git="ftp://example.com/foo.git" ref="main"
+    foo git=(url)"ftp://example.com/foo.git" ref="main"
 }

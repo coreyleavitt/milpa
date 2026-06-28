@@ -8,18 +8,17 @@ from the lockfile and the CAS alone.  This is enforced by signature:
 ``resolve_frozen`` takes ``MilpaEnv`` but NOT ``ResolveParams`` — there is no
 ``strategy`` / ``max_parallel`` / ``prior`` available here (RFC §4.4 NORMATIVE).
 
-The 10 resolver-level ``FROZEN-*`` preconditions (§7.1) are:
+The 9 resolver-level ``FROZEN-*`` preconditions (§7.1) are:
 
 1. ``FROZEN-STRATEGY-MISMATCH`` — lockfile.strategy != default requested strategy.
 2. ``FROZEN-MANIFEST-DEP-NOT-IN-LOCK`` — manifest dep has no lockfile entry.
 3. ``FROZEN-LOCKED-VERSION-UNPARSEABLE`` — locked version not parseable.
 4. ``FROZEN-CONSTRAINT-UNSATISFIED`` — locked version doesn't satisfy named constraint.
 5. ``FROZEN-IDENTITY-NOT-IN-STORE`` — dep identity absent from CAS.
-6. ``FROZEN-LEGACY-REGISTRY-PROVENANCE`` — dep has ``kind "registry"`` (BOTH paths).
-7. ``FROZEN-LOCAL-DEP`` — dep has local provenance (single-package path only).
-8. ``FROZEN-MEMBER-DEP`` — locked dep has member provenance (single-package raises).
-9. ``FROZEN-MEMBER-NOT-IN-WORKSPACE`` — lockfile member not in workspace members.
-10. ``FROZEN-MEMBER-IDENTITY-DRIFT`` — member on-disk hash ≠ lockfile pin.
+6. ``FROZEN-LOCAL-DEP`` — dep has local provenance (single-package path only).
+7. ``FROZEN-MEMBER-DEP`` — locked dep has member provenance (single-package raises).
+8. ``FROZEN-MEMBER-NOT-IN-WORKSPACE`` — lockfile member not in workspace members.
+9. ``FROZEN-MEMBER-IDENTITY-DRIFT`` — member on-disk hash ≠ lockfile pin.
 
 The 2 CLI-level guards (``FROZEN-NO-LOCKFILE``, ``FROZEN-NO-CAS``) are raised in
 ``cli.py`` BEFORE the resolve path is entered (RFC §8 scope clarification).
@@ -33,7 +32,7 @@ Public surface
 ``resolve_workspace_frozen(workspace, lockfile, env, deps_dir) -> ResolvedGraph``
     Reconstruct the graph for a workspace from a shared lockfile.
 
-Spec: spec/resolver-semantics.md §7 and §7.1 (the closed list of 10 preconditions).
+Spec: spec/resolver-semantics.md §7 and §7.1 (the closed list of 9 preconditions).
 """
 
 from __future__ import annotations
@@ -44,7 +43,6 @@ from milpa.context import MilpaEnv
 from milpa.errors import (
     FROZEN_CONSTRAINT_UNSATISFIED,
     FROZEN_IDENTITY_NOT_IN_STORE,
-    FROZEN_LEGACY_REGISTRY_PROVENANCE,
     FROZEN_LOCAL_DEP,
     FROZEN_LOCKED_VERSION_UNPARSEABLE,
     FROZEN_MANIFEST_DEP_NOT_IN_LOCK,
@@ -60,12 +58,11 @@ from milpa.lockfile import (
     LockedDep,
     Lockfile,
     MemberProvenanceRecord,
-    RegistryProvenanceRecord,
     ResolvedDep,
     ResolvedGraph,
 )
 from milpa.manifest import Manifest, MemberDep, NamedDep
-from milpa.version import VersionSet, parse_version
+from milpa.version import DepKey, VersionSet, parse_version
 from milpa.workspace import LoadedWorkspace
 
 # The default strategy string used when no explicit strategy is passed.
@@ -74,28 +71,40 @@ from milpa.workspace import LoadedWorkspace
 _DEFAULT_STRATEGY = "maxver"
 
 
+def _locked_index(deps: object) -> "dict[DepKey, LockedDep]":
+    """Build an alias-aware lookup map from lockfile deps.
+
+    Maps EVERY canonical name AND every alias to its canonical ``LockedDep``.
+    This is the SSOT for all "is this manifest dep in the lockfile?" checks
+    (condition 2: FROZEN-MANIFEST-DEP-NOT-IN-LOCK) — both ``resolve_frozen``
+    and ``resolve_workspace_frozen`` use it in place of the bare
+    ``{d.name: d for d in lockfile.deps}`` pattern.
+
+    S1 (rfc-resolver-correctness.md #142): fixes the false-positive where a
+    manifest dep known only as an alias fired FROZEN-MANIFEST-DEP-NOT-IN-LOCK
+    because the old dict keyed on canonical names only.
+
+    C1 (rfc-resolver-correctness.md): key by ``DepKey(name=dep.name,
+    namespace=dep.namespace)`` so a manifest dep ``"ns1/bar"`` (which parses
+    to ``DepKey(name="bar", namespace="ns1")``) matches the lockfile dep with
+    bare name ``"bar"`` and namespace ``"ns1"``.  Aliases are always bare
+    (no namespace) — alias DepKeys use ``namespace=None``.
+    """
+    index: dict[DepKey, LockedDep] = {}
+    for dep in deps:  # type: ignore[union-attr]
+        index[DepKey(name=dep.name, namespace=getattr(dep, "namespace", None))] = dep
+        for alias in dep.aliases:
+            index[DepKey(name=alias)] = dep
+    return index
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
 
-def _check_legacy_registry_provenance(locked: LockedDep) -> None:
-    """Condition 6 (BOTH paths): FROZEN-LEGACY-REGISTRY-PROVENANCE.
-
-    Raises if any provenance record has kind ``registry`` (pre-#97 provenance).
-    """
-    for prov in locked.provenances:
-        if isinstance(prov, RegistryProvenanceRecord):
-            raise MilpaError(
-                FROZEN_LEGACY_REGISTRY_PROVENANCE,
-                f"dep {locked.name!r} uses legacy 'registry' provenance; "
-                f"re-resolve via tianguis to regenerate the lockfile",
-                name=locked.name,
-            )
-
-
 def _check_local_provenance(locked: LockedDep) -> None:
-    """Condition 7 (single-package path only): FROZEN-LOCAL-DEP.
+    """Condition 6 (single-package path only): FROZEN-LOCAL-DEP.
 
     Raises if any provenance record has kind ``local``.
     """
@@ -110,7 +119,7 @@ def _check_local_provenance(locked: LockedDep) -> None:
 
 
 def _check_member_provenance_in_single_package(locked: LockedDep) -> None:
-    """Condition 8 (single-package path only): FROZEN-MEMBER-DEP.
+    """Condition 7 (single-package path only): FROZEN-MEMBER-DEP.
 
     Raises if any provenance record has kind ``member`` in single-package context.
     """
@@ -145,6 +154,8 @@ def _reconstruct_from_locked(locked: LockedDep) -> ResolvedDep:
         # for frozen graph reconstruction (mirrors Rust: Vec::new()).
         cond_requires=(),
         aliases=locked.aliases,
+        # C1: carry namespace for qualified named deps (None for all others).
+        namespace=getattr(locked, "namespace", None),
     )
 
 
@@ -163,7 +174,7 @@ def resolve_frozen(
 
     Checks the resolver-level ``FROZEN-*`` preconditions from
     ``resolver-semantics.md`` §7.1 for the single-package path:
-    conditions 1–5, 6 (BOTH paths), 7, 8.
+    conditions 1–7.
 
     Parameters
     ----------
@@ -193,12 +204,19 @@ def resolve_frozen(
             requested_strategy=_DEFAULT_STRATEGY,
         )
 
-    locked_by_name = {d.name: d for d in lockfile.deps}
+    # S1 (#142): alias-aware lookup — maps canonical name AND every alias to
+    # the canonical LockedDep.  Replaces the bare {d.name: d} dict.
+    locked_index = _locked_index(lockfile.deps)
 
     # Condition 2: FROZEN-MANIFEST-DEP-NOT-IN-LOCK (for each manifest dep)
+    # §7.1 #2: check both ``deps`` and ``dev_deps`` (spec/resolver-semantics.md).
     all_deps = list(manifest.deps) + list(manifest.dev_deps)
     for dep in all_deps:
-        if dep.name not in locked_by_name:
+        # C1: use DepKey(name, namespace) so qualified deps (``"ns/bar"`` →
+        # namespace="ns", name="bar") match the lockfile entry with the same
+        # bare name + namespace pair — not just the bare name.
+        _ns = getattr(dep, "namespace", None)
+        if DepKey(name=dep.name, namespace=_ns) not in locked_index:
             raise MilpaError(
                 FROZEN_MANIFEST_DEP_NOT_IN_LOCK,
                 f"manifest dep {dep.name!r} has no entry in the lockfile; "
@@ -208,13 +226,10 @@ def resolve_frozen(
 
     # Per-dep checks (3–8) for each locked dep
     for locked in lockfile.deps:
-        # Condition 6: FROZEN-LEGACY-REGISTRY-PROVENANCE (BOTH paths)
-        _check_legacy_registry_provenance(locked)
-
-        # Condition 7: FROZEN-LOCAL-DEP (single-package only)
+        # Condition 6: FROZEN-LOCAL-DEP (single-package only)
         _check_local_provenance(locked)
 
-        # Condition 8: FROZEN-MEMBER-DEP (single-package only)
+        # Condition 7: FROZEN-MEMBER-DEP (single-package only)
         _check_member_provenance_in_single_package(locked)
 
         # Condition 3: FROZEN-LOCKED-VERSION-UNPARSEABLE
@@ -229,8 +244,9 @@ def resolve_frozen(
             )
 
         # Condition 4: FROZEN-CONSTRAINT-UNSATISFIED (for named deps)
+        # S1 (#142): also find the manifest dep via alias (d.name in locked.aliases).
         manifest_dep = next(
-            (d for d in all_deps if d.name == locked.name),
+            (d for d in all_deps if d.name == locked.name or d.name in locked.aliases),
             None,
         )
         if manifest_dep is not None and isinstance(manifest_dep, NamedDep):
@@ -295,11 +311,10 @@ def resolve_workspace_frozen(
     ``resolver-semantics.md`` §7.1:
 
     - Condition 1: FROZEN-STRATEGY-MISMATCH (BOTH paths).
-    - Condition 6: FROZEN-LEGACY-REGISTRY-PROVENANCE (BOTH paths).
-    - Condition 9: FROZEN-MEMBER-NOT-IN-WORKSPACE.
-    - Condition 10: FROZEN-MEMBER-IDENTITY-DRIFT.
+    - Condition 8: FROZEN-MEMBER-NOT-IN-WORKSPACE.
+    - Condition 9: FROZEN-MEMBER-IDENTITY-DRIFT.
 
-    (Conditions 2–5 apply to non-member deps. Conditions 7–8 do not apply
+    (Conditions 2–5 apply to non-member deps. Conditions 6–7 do not apply
     to the workspace path — local and member provenance are valid here.)
 
     Parameters
@@ -336,7 +351,9 @@ def resolve_workspace_frozen(
             requested_strategy=_DEFAULT_STRATEGY,
         )
 
-    locked_by_name = {d.name: d for d in lockfile.deps}
+    # S1 (#142): alias-aware lookup — maps canonical name AND every alias to
+    # the canonical LockedDep.  Replaces the bare {d.name: d} dict.
+    locked_index = _locked_index(lockfile.deps)
 
     # Conditions 2-4: per-member manifest alignment (mirrors Rust check_manifest_alignment).
     # S2 (RFC: workspace-completion §3.A): filter member deps via FilterContext BEFORE
@@ -359,14 +376,18 @@ def resolve_workspace_frozen(
             if isinstance(dep, MemberDep):
                 continue
             # Condition 2: FROZEN-MANIFEST-DEP-NOT-IN-LOCK
-            if dep.name not in locked_by_name:
+            # S1 (#142): alias-aware lookup.
+            # C1: include namespace in DepKey for qualified deps.
+            _dep_ns = getattr(dep, "namespace", None)
+            _dep_key_ws = DepKey(name=dep.name, namespace=_dep_ns)
+            if _dep_key_ws not in locked_index:
                 raise MilpaError(
                     FROZEN_MANIFEST_DEP_NOT_IN_LOCK,
                     f"member {member.manifest.name!r}: dep {dep.name!r} has no entry "
                     f"in the lockfile; run 'milpa fetch' to regenerate the lockfile",
                     name=dep.name,
                 )
-            locked = locked_by_name[dep.name]
+            locked = locked_index[_dep_key_ws]
             # Condition 3: FROZEN-LOCKED-VERSION-UNPARSEABLE
             parsed = parse_version(locked.version)
             if parsed is None:
@@ -399,16 +420,13 @@ def resolve_workspace_frozen(
 
     # Per-dep checks
     for locked in lockfile.deps:
-        # Condition 6: FROZEN-LEGACY-REGISTRY-PROVENANCE (BOTH paths)
-        _check_legacy_registry_provenance(locked)
-
         # Determine if this locked dep is a member or an external dep.
         is_member = any(
             isinstance(p, MemberProvenanceRecord) for p in locked.provenances
         )
 
         if is_member:
-            # Condition 9: FROZEN-MEMBER-NOT-IN-WORKSPACE
+            # Condition 8: FROZEN-MEMBER-NOT-IN-WORKSPACE
             if locked.name not in members_by_name:
                 raise MilpaError(
                     FROZEN_MEMBER_NOT_IN_WORKSPACE,
@@ -418,7 +436,7 @@ def resolve_workspace_frozen(
                     name=locked.name,
                 )
 
-            # Condition 10: FROZEN-MEMBER-IDENTITY-DRIFT
+            # Condition 9: FROZEN-MEMBER-IDENTITY-DRIFT
             member = members_by_name[locked.name]
             actual_identity = compute_content_hash(member.abs_dir)
             if locked.identity is not None and locked.identity != actual_identity:

@@ -1,0 +1,5 @@
+name "foo"
+kind "library"
+deps {
+    "ns1/baz" ">= 1.0.0"
+}

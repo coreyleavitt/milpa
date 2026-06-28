@@ -1,0 +1,19 @@
+// fixture-305: S2b — URL dep with override + flag-gated transitive named dep
+//
+// Root depends on main-lib2 (URL dep) and overrides "alib" to a git URL
+// that is NOT in mocked-fetches.  main-lib2 declares alib as a named dep
+// gated on flag="experimental" (default=#false, NOT active).
+//
+// Before S2b fix: _collect_transitive_deps returns alib (no flag filter) →
+//   _enqueue_dep applies override → BFS tries to fetch alib-override URL →
+//   FETCH-ALL-FAILED (RED).
+// After S2b fix: edgeset_to_bfs_deps uses flag-filtered EdgeSet → alib absent →
+//   not enqueued → resolve succeeds without fetching alib (GREEN).
+name "testapp"
+kind "application"
+deps {
+    main-lib2 git=(url)"https://example.com/main-lib2.git" ref="main"
+}
+overrides {
+    pkg "alib" git=(url)"https://example.com/alib-override.git" ref="main"
+}

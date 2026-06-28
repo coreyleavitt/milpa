@@ -546,7 +546,7 @@ class TestWorkspaceCrossPkgEnableFixpoint:
             '}\n'
             'deps {\n'
             '    when flag="g1" {\n'
-            '        lib-c git="https://example.com/lib-c.git" ref="main"\n'
+            '        lib-c git=(url)"https://example.com/lib-c.git" ref="main"\n'
             '    }\n'
             '}\n'
         )
@@ -574,7 +574,7 @@ class TestWorkspaceCrossPkgEnableFixpoint:
             '    }\n'
             '}\n'
             'deps {\n'
-            '    lib-b git="https://example.com/lib-b.git" ref="main"\n'
+            '    lib-b git=(url)"https://example.com/lib-b.git" ref="main"\n'
             '}\n'
         )
         (member_a_dir / "milpa.kdl").write_text(
@@ -587,7 +587,7 @@ class TestWorkspaceCrossPkgEnableFixpoint:
             '    }\n'
             '}\n'
             'deps {\n'
-            '    lib-b git="https://example.com/lib-b.git" ref="main"\n'
+            '    lib-b git=(url)"https://example.com/lib-b.git" ref="main"\n'
             '}\n',
             encoding="utf-8",
         )

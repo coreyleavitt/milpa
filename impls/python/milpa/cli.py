@@ -84,7 +84,7 @@ from milpa.predicate import dep_passes_flag_predicates
 from milpa.profile import Profile
 from milpa.resolver import resolve, resolve_workspace
 from milpa.solver import SolverError, SolveSuccess, certificate_to_json
-from milpa.version import Strategy
+from milpa.version import DepKey, Strategy
 from milpa.workspace import (
     LoadedWorkspace,
     find_workspace_root,
@@ -1254,6 +1254,10 @@ def cmd_show(project_dir: Path) -> int:
         # that a transitive optional dep is present (the `cargo tree -e features` need).
         if dep.active_flags:
             print(f"  active_flags {' '.join(dep.active_flags)}")
+        # S1 (rfc-resolver-correctness.md #142): surface aliases so a user can see
+        # that a dep was deduped (e.g. "bar" → canonical "foo").
+        if dep.aliases:
+            print(f"  aliases     {', '.join(sorted(dep.aliases))}")
     return 0
 
 
@@ -1263,7 +1267,6 @@ def _format_provenance(p: object) -> str:
         LocalProvenanceRecord,
         MemberProvenanceRecord,
         OciProvenanceRecord,
-        RegistryProvenanceRecord,
         TarballProvenanceRecord,
     )
 
@@ -1282,13 +1285,6 @@ def _format_provenance(p: object) -> str:
         return f"member {p.name}"
     if isinstance(p, OciProvenanceRecord):
         return f"oci {p.registry}/{p.repository}@{p.digest[:15]}"
-    if isinstance(p, RegistryProvenanceRecord):
-        parts = [f"registry (legacy) {p.name}"]
-        if p.tag:
-            parts.append(f"@ {p.tag}")
-        if p.commit_sha:
-            parts.append(f"(sha {p.commit_sha[:8]})")
-        return " ".join(parts)
     return str(p)
 
 
@@ -2112,18 +2108,42 @@ def cmd_remove(
     manifest_text = manifest_path.read_text(encoding="utf-8")
     manifest = parse_manifest(manifest_text)
 
+    # S5b: parse slash-shorthand in dep_name ("ns1/bar" → namespace="ns1", bare="bar").
+    # The lockfile key (solver_var) for a qualified dep is "ns1::bar".
+    from milpa.manifest import NamedDep as _NamedDep
+    _remove_namespace: str | None = None
+    _remove_bare: str = dep_name
+    if "/" in dep_name:
+        _parts = dep_name.split("/")
+        if len(_parts) == 2 and _parts[0] and _parts[1]:
+            _remove_namespace, _remove_bare = _parts[0], _parts[1]
+        # Malformed (a/b/c or empty parts): leave dep_name as-is; the guard below
+        # will produce MAN-REMOVE-DEP-ABSENT with the original dep_name in the message.
+
+    # Compute the solver_var for lockfile lookups when namespace is set.
+    # Route through DepKey.solver_var() — the SOLE :: join site.
+    _remove_solver_var: str = DepKey(name=_remove_bare, namespace=_remove_namespace).solver_var()
+
     # D-update-remove: alias→canonical resolution (Phase D item 5).
     # If dep_name is an alias of a canonical lockfile dep, resolve to the
     # canonical manifest name so the guard and manifest mutation operate correctly.
+    # For qualified deps, the lockfile dep name IS the solver_var ("ns1::bar").
     prior_for_alias = _maybe_load_prior_lockfile(lock_path)
     if prior_for_alias is not None:
-        canonical_name = resolve_alias_to_canonical(dep_name, prior_for_alias)
+        canonical_name = resolve_alias_to_canonical(_remove_solver_var, prior_for_alias)
     else:
-        canonical_name = dep_name
+        canonical_name = _remove_solver_var
 
-    # Guard: dep must be declared in milpa.kdl (using canonical name).
-    existing_names = {dep.name for dep in manifest.deps}
-    if canonical_name not in existing_names:
+    # Guard: dep must be declared in milpa.kdl.
+    # For qualified deps, match by (namespace, bare_name); for bare deps, match by name.
+    def _dep_remove_key(d: object) -> str:
+        """Return the remove-key for a dep: solver_var for NamedDep, bare name for others."""
+        if isinstance(d, _NamedDep) and d.namespace:
+            return DepKey(name=d.name, namespace=d.namespace).solver_var()
+        return getattr(d, "name", "")
+
+    existing_keys = {_dep_remove_key(dep) for dep in manifest.deps}
+    if canonical_name not in existing_keys:
         print(
             f"milpa remove: dep {dep_name!r} is not declared in milpa.kdl",
             file=sys.stderr,
@@ -2142,7 +2162,7 @@ def cmd_remove(
 
     # Build proposed manifest without the dep.
     from dataclasses import replace as _replace
-    new_deps = tuple(d for d in manifest.deps if d.name != canonical_name)
+    new_deps = tuple(d for d in manifest.deps if _dep_remove_key(d) != canonical_name)
     proposed_manifest = _replace(manifest, deps=new_deps)
 
     # Re-resolve.

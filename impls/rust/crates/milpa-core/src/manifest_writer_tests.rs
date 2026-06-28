@@ -61,6 +61,7 @@ fn add_dep_rewrites_canonically_and_reports_comment_loss() {
                 flag_requests: Vec::new(),
                 optional: false,
                 predicates: Vec::new(),
+                namespace: None,
             }));
         m
     })

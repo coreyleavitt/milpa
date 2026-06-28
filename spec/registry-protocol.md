@@ -400,6 +400,21 @@ entry point uses a bare-name lookup (no namespace qualifier) via
 > stop. The policy layer (`resolve_named`, `resolve_named_all`) converts
 > `AmbiguousName` to `TNG-AMBIGUOUS-NAME`.
 
+### 5.1a  Qualified lookup (S5b)
+
+When a NamedDep carries a `namespace=` attribute (or uses the slash shorthand
+`"<ns>/<name>"`), the resolver uses a **qualified lookup** instead of the
+bare-name path.
+
+> NORMATIVE (S5b): A qualified lookup MUST match the exact `(namespace, name)`
+> pair. It MUST NOT raise `TNG-AMBIGUOUS-NAME` (the namespace is already
+> specified). It MUST raise `TNG-NOT-FOUND` when no package with that exact
+> `(namespace, name)` pair exists.
+
+> NORMATIVE (S5b): The entry point for qualified lookup is
+> `Index.lookup_qualified(namespace, name)`. Implementations MUST provide this
+> primitive in addition to `Index.lookup_bare`.
+
 ### 5.2  Constraint filtering and ordering
 
 Once a package is found, its versions are filtered by the constraint.

@@ -166,6 +166,7 @@ pub fn manifest_from_nimble(nm: &NimbleManifest, name: &str) -> Manifest {
                     flag_requests: Vec::new(),
                     optional: false,
                     predicates: Vec::new(),
+                    namespace: None, // Nimble-derived deps have no namespace.
                 }));
             }
         }

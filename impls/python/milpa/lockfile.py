@@ -1,7 +1,7 @@
 """milpa.lock — reproducible-build snapshot of a resolved dep graph.
 
 Owns:
-  - ProvenanceRecord discriminated union (6 variants + 1 read-compat variant)
+  - ProvenanceRecord discriminated union (5 variants)
   - LockedDep, Lockfile — lockfile data model
   - ResolvedDep, ResolvedGraph — resolver output types (owned here to avoid
     forward-import cycles: resolver.py imports and *produces* these types;
@@ -25,7 +25,6 @@ ProvenanceRecord kinds (lockfile-schema.md §4):
     local    — §4.3: path (req, as-declared relative)
     member   — §4.4: name (req, workspace member name)
     oci      — §4.5: registry/repository/digest (all req)
-    registry — §4.6: read-compat only; writer never emits this kind
 """
 
 from __future__ import annotations
@@ -51,6 +50,7 @@ from milpa.errors import (
     LOCK_PROV_KIND_MISSING,
     LOCK_PROV_KIND_UNKNOWN,
     LOCK_SRC_DIR_UNSAFE,
+    LOCK_STRATEGY_MISSING,
     LOCK_VERSION_MISSING,
     LOCK_VERSION_UNSUPPORTED,
     VERIFY_ALIAS_SYMLINK_MISSING,
@@ -59,6 +59,7 @@ from milpa.errors import (
 )
 from milpa.identity import compute_content_hash, parse_identity
 from milpa.manifest import contains_unsafe_char, valid_dep_name
+from milpa.version import dep_dir_name  # noqa: F401 — re-exported (callers may import from here)
 from milpa.kdl_io import (
     KdlNode,
     node_args,
@@ -167,24 +168,6 @@ class OciProvenanceRecord:
     kind: str = field(default="oci", init=False)
 
 
-@dataclass(frozen=True)
-class RegistryProvenanceRecord:
-    """READ-COMPAT ONLY (lockfile-schema.md §4.6).
-
-    The writer never emits this kind — named deps now resolve to git/oci via
-    tianguis. The parser must still accept `registry` provenance blocks in
-    existing lockfiles. This class is retained until straggler old lockfiles are
-    regenerated; it will be removed in a future schema version.
-    origin: "observed" or "declared". Default "observed".
-    """
-
-    name: str
-    tag: str | None = None
-    commit_sha: str | None = None
-    origin: str = "observed"
-    kind: str = field(default="registry", init=False)
-
-
 #: Discriminated union of all provenance record variants.
 ProvenanceRecord = (
     GitProvenanceRecord
@@ -192,7 +175,6 @@ ProvenanceRecord = (
     | LocalProvenanceRecord
     | MemberProvenanceRecord
     | OciProvenanceRecord
-    | RegistryProvenanceRecord
 )
 
 # ---------------------------------------------------------------------------
@@ -234,7 +216,7 @@ class LockedDep:
     requires: direct transitive dep names, sorted lexicographically.
     provenances: one or more ProvenanceRecord per dep (Phase D). Each record
       carries an origin ("observed"|"declared"). Emitted in canonical sort order
-      (declared < observed; git < tarball < oci < local < member < registry).
+      (declared < observed; git < tarball < oci < local < member).
     active_flags: feature flags active for this dep; omitted from KDL when empty.
     """
 
@@ -256,6 +238,13 @@ class LockedDep:
     # multiple manifest names (dedup). Lexicographically sorted. Omitted from
     # KDL entirely when empty. See lockfile-schema.md §3.8.
     aliases: tuple[str, ...] = ()
+    # C1 (rfc-resolver-correctness.md): namespace for qualified named deps
+    # (§3.9, lockfile-schema.md).  None for bare deps (all pre-S5b deps
+    # and all URL/tarball/local/member deps).  When non-None, serialized as
+    # a child node: ``dep "bar" { namespace "ns1"; ... }`` — the dep arg is
+    # always the BARE name.  Never folded into the dep arg with ``::``
+    # (solver-internal encoding ONLY; see DepKey.solver_var / from_solver_var).
+    namespace: str | None = None
 
 
 @dataclass(frozen=True)
@@ -316,6 +305,9 @@ class ResolvedDep:
     # multiple manifest names (dedup). Lexicographically sorted. Empty for
     # non-deduped deps. Canonical = BFS-insertion-order first.
     aliases: tuple[str, ...] = ()
+    # C1 (rfc-resolver-correctness.md): namespace for qualified named deps.
+    # Same semantics as LockedDep.namespace — see that field's docstring.
+    namespace: str | None = None
 
 
 @dataclass(frozen=True)
@@ -361,13 +353,12 @@ def _parse_dep_identity_str(val: Any, dep_name: str) -> str:
 # ---------------------------------------------------------------------------
 # Provenance sort key (lockfile-schema.md §4.0)
 #
-# SSOT for canonical provenance ordering in BOTH parse-side (self_mirrors
-# conversion) and emit-side (format_lockfile). BOTH impls MUST use this key
-# identically to guarantee zero cross-impl byte divergence.
+# SSOT for canonical provenance ordering on the emit-side (format_lockfile).
+# BOTH impls MUST use this key identically to guarantee zero cross-impl byte divergence.
 #
 # Key: (origin_rank, kind_rank, primary, secondary)
 #   origin_rank: declared=0, observed=1
-#   kind_rank:   git=0, tarball=1, oci=2, local=3, member=4, registry=5
+#   kind_rank:   git=0, tarball=1, oci=2, local=3, member=4
 #   (primary, secondary): per-kind fields, bytewise over post-escape KDL form
 # ---------------------------------------------------------------------------
 
@@ -378,7 +369,6 @@ _KIND_RANK: dict[str, int] = {
     "oci": 2,
     "local": 3,
     "member": 4,
-    "registry": 5,
 }
 
 
@@ -407,9 +397,6 @@ def _provenance_sort_key(p: "ProvenanceRecord") -> tuple[int, int, str, str]:
     elif isinstance(p, MemberProvenanceRecord):
         primary = _kdl_str(p.name)
         secondary = ""
-    elif isinstance(p, RegistryProvenanceRecord):
-        primary = _kdl_str(p.name)
-        secondary = _kdl_str(p.tag) if p.tag is not None else ""
     else:
         primary = ""
         secondary = ""
@@ -425,13 +412,12 @@ def parse_lockfile(text: str) -> Lockfile:
     """Parse KDL 2.0 lockfile text into a ``Lockfile`` value.
 
     Raises ``MilpaError`` with LOCK-* slugs on any parse error.
-    Defaults: strategy = "maxver" (tolerates pre-v1.0 lockfiles without the
-    strategy node, per lockfile-schema.md §2.2).
+    Strict parser (S3): both ``version`` and ``strategy`` are required.
     """
     doc = parse_kdl(text, context="lockfile")
 
     deps: list[LockedDep] = []
-    strategy: str = "maxver"
+    strategy: str | None = None
     schema_version: int | None = None
 
     for node in nodes(doc):
@@ -456,6 +442,11 @@ def parse_lockfile(text: str) -> Lockfile:
             f"(this milpa understands version {LOCKFILE_SCHEMA_VERSION})",
             got=schema_version,
             supported=LOCKFILE_SCHEMA_VERSION,
+        )
+    if strategy is None:
+        raise MilpaError(
+            LOCK_STRATEGY_MISSING,
+            "lockfile missing required 'strategy' node; regenerate via 'milpa fetch'",
         )
 
     return Lockfile(deps=tuple(deps), strategy=strategy, version=schema_version)
@@ -483,17 +474,23 @@ def _parse_top_version(node: KdlNode) -> int:
 def _parse_top_strategy(node: KdlNode) -> str:
     """Parse the top-level ``strategy`` node → strategy name string.
 
-    The strategy node is optional (pre-v1.0 compat). If present and has
-    exactly one string arg, use it. If present but malformed, we still
-    default to "maxver" (fail-open for diagnostics — the strategy field is
-    informational, not load-bearing for parse correctness).
+    S3 strict: the strategy node must have exactly one string argument.
+    A present-but-malformed node (e.g. ``strategy 42`` — non-string arg,
+    or wrong arity) raises ``LOCK-STRATEGY-MISSING``, matching Rust's
+    ``parse_lockfile`` which leaves ``strategy`` unset when the arg is not a
+    string and then raises ``LOCK-STRATEGY-MISSING`` at the ``ok_or_else``
+    site.
     """
     args = node_args(node)
     if len(args) == 1:
         s = value_as_str(args[0])
         if s is not None:
             return s
-    return "maxver"
+    raise MilpaError(
+        LOCK_STRATEGY_MISSING,
+        "lockfile 'strategy' node has no valid string argument; "
+        "regenerate via 'milpa fetch'",
+    )
 
 
 def _parse_dep(node: KdlNode) -> LockedDep:
@@ -509,12 +506,35 @@ def _parse_dep(node: KdlNode) -> LockedDep:
     dep_decl: str | None = None  # S6: additive dep_decl pin (§3.7)
     cond_requires: list[CondRequire] = []  # S4: additive cond-require annotations
     aliases: tuple[str, ...] = ()  # Phase B: alternate names for deduped deps
-    # Read-compat: accumulate legacy self_mirrors URLs for conversion (§3.7)
-    legacy_self_mirror_urls: list[str] = []
+    namespace: str | None = None  # C1: qualified dep namespace (§3.9)
 
     for child in node_children(node):
         cname = node_name(child)
-        if cname == "identity":
+        if cname == "namespace":
+            # C1: parse the optional namespace child node (§3.9).
+            # Form: ``namespace "<ns>"`` — exactly one string arg.
+            # Security: validate charset at the lockfile parse boundary.
+            # A poisoned milpa.lock with namespace "ns/../../x" would escape
+            # _deps/ via dep_dir_name → "@ns/../../x/<name>".  Reuse the
+            # dep-name charset predicate (valid_dep_name / LOCK-DEP-NAME-INVALID)
+            # — same predicate as dep names and aliases.
+            # Empty namespace → skip/ignore (parity with Rust !is_empty() guard).
+            ns_args = node_args(child)
+            if len(ns_args) == 1:
+                ns_val = value_as_str(ns_args[0])
+                if ns_val is not None and ns_val:  # skip empty (Rust parity)
+                    if not valid_dep_name(ns_val):
+                        raise MilpaError(
+                            LOCK_DEP_NAME_INVALID,
+                            f"dep {dep_name!r}: lockfile 'namespace' value {ns_val!r} "
+                            f"contains characters outside [A-Za-z0-9_-] — "
+                            "rejected to prevent path traversal via a poisoned milpa.lock",
+                            name=ns_val,
+                        )
+                    namespace = ns_val
+            # Malformed namespace child (wrong arity / non-string) is silently
+            # skipped for forward-compat (same spirit as "skip unknown child nodes").
+        elif cname == "identity":
             identity = _parse_dep_identity(child, dep_name)
         elif cname == "version":
             version = _parse_dep_scalar_str(child, dep_name, "version")
@@ -538,11 +558,6 @@ def _parse_dep(node: KdlNode) -> LockedDep:
             aliases = _parse_dep_aliases(child)
         elif cname == "active_flags":
             active_flags = _parse_dep_active_flags(child)
-        elif cname == "self_mirrors":
-            # Read-compat (§3.7): old self_mirrors → declared provenance records.
-            # Collect URLs; convert after parsing all children so provenance
-            # blocks (if present) are already accumulated.
-            legacy_self_mirror_urls.extend(_parse_dep_self_mirrors(child))
         elif cname == "provenance":
             provenances.append(_parse_provenance_block(child, dep_name))
         elif cname == "dep_decl":
@@ -557,11 +572,6 @@ def _parse_dep(node: KdlNode) -> LockedDep:
                 cond_requires.append(cr)
         # other unknown child nodes are silently skipped (forward compat)
 
-    # Read-compat §3.7: convert legacy self_mirrors URLs to declared git provenances.
-    # Each URL becomes a GitProvenanceRecord(origin="declared", url=url, ref=None, commit_sha=None).
-    for url in legacy_self_mirror_urls:
-        provenances.append(GitProvenanceRecord(url=url, origin="declared"))
-
     return LockedDep(
         name=dep_name,
         identity=identity,
@@ -573,6 +583,7 @@ def _parse_dep(node: KdlNode) -> LockedDep:
         dep_decl=dep_decl,
         cond_requires=tuple(cond_requires),
         aliases=aliases,
+        namespace=namespace,
     )
 
 
@@ -682,16 +693,6 @@ def _parse_dep_aliases(node: KdlNode) -> tuple[str, ...]:
             )
         aliases.append(s)
     return tuple(sorted(aliases))
-
-
-def _parse_dep_self_mirrors(node: KdlNode) -> tuple[str, ...]:
-    """Parse the ``self_mirrors`` child node.
-
-    Accepts both plain strings and (url)-annotated values. The raw kdl-py
-    entry value must be accessed to detect the url tag. We use node_args
-    which strips annotations — both forms return a str through value_as_str.
-    """
-    return tuple(s for a in node_args(node) if (s := value_as_str(a)) is not None)
 
 
 def _parse_cond_require(node: KdlNode) -> "CondRequire | None":
@@ -826,9 +827,8 @@ def _parse_provenance_block(node: KdlNode, dep_name: str) -> ProvenanceRecord:
             dep=dep_name,
         )
 
-    # origin field: default "observed" when absent (back-compat: existing lockfiles
-    # without origin are all observed). Per spec §4.
-    origin = fields.get("origin", "observed")
+    # origin field: required (S3 purge: no default; raises LOCK-PROV-FIELD-MISSING if absent)
+    origin = _req_field(fields, "origin", dep_name)
 
     if kind == "git":
         return GitProvenanceRecord(
@@ -861,19 +861,11 @@ def _parse_provenance_block(node: KdlNode, dep_name: str) -> ProvenanceRecord:
             digest=_req_field(fields, "digest", dep_name),
             origin=origin,
         )
-    if kind == "registry":
-        # Read-compat only (§4.6); writer never emits this
-        return RegistryProvenanceRecord(
-            name=_req_field(fields, "name", dep_name),
-            tag=fields.get("tag"),
-            commit_sha=fields.get("commit_sha"),
-            origin=origin,
-        )
 
     raise MilpaError(
         LOCK_PROV_KIND_UNKNOWN,
         f"dep {dep_name!r}: unknown provenance kind {kind!r} "
-        f"(known: git, tarball, local, member, oci, registry)",
+        f"(known: git, tarball, local, member, oci)",
         dep=dep_name,
         kind=kind,
     )
@@ -892,22 +884,45 @@ def _req_field(fields: dict[str, str], key: str, dep_name: str) -> str:
     return val
 
 
+# dep_dir_name — moved to version.py (collocated with DepKey per Rust convention).
+# Re-exported here via `from milpa.version import dep_dir_name` for backward compat.
+
+
 # ---------------------------------------------------------------------------
 # 4c — from_graph + format_lockfile (byte-exact hand-rolled templating)
 # ---------------------------------------------------------------------------
 
 
+def _req_name_to_lockfile(s: str) -> str:
+    """Convert a ``requires`` entry from solver-var form to lockfile-safe form.
+
+    Solver-internally qualified deps are keyed by ``"ns::name"`` (the solver
+    variable).  The lockfile serializes the same relationship as ``"ns/name"``
+    (slash-separated, Windows-safe, mirrors the manifest declaration syntax).
+
+    Bare dep names (no ``::`` separator) are returned unchanged.
+
+    This is the SOLE conversion site — called from ``_locked_from_resolved``.
+    """
+    if "::" in s:
+        ns, _, name = s.partition("::")
+        return f"{ns}/{name}"
+    return s
+
+
 def from_graph(graph: ResolvedGraph, *, strategy: str = "maxver") -> Lockfile:
     """Convert a ResolvedGraph into a Lockfile.
 
-    Deps are sorted lexicographically by name (lockfile-schema.md §2.3 +
-    §2.4 + resolver-semantics.md §4.4). Same graph always produces
-    byte-identical lockfile text.
+    Deps are sorted by ``(namespace or "", name)`` so that two qualified deps
+    with the same bare name (e.g. ``ns1::bar`` and ``ns2::bar``) land in a
+    stable, deterministic order (lockfile-schema.md §2.3 + §2.4 +
+    resolver-semantics.md §4.4). Same graph always produces byte-identical
+    lockfile text.
     """
     deps = tuple(
         sorted(
             (_locked_from_resolved(d) for d in graph.deps),
-            key=lambda d: d.name,
+            key=lambda d: (d.namespace or "", d.name),
         )
     )
     return Lockfile(deps=deps, strategy=strategy)
@@ -923,7 +938,9 @@ def _locked_from_resolved(d: ResolvedDep) -> LockedDep:
         # Sort lexicographically — requires is accumulated in BFS arrival order
         # which is non-deterministic across parallel-fetch runs. Lexicographic
         # order is the spec's single canonical ordering rule (§3.4 / §4.4).
-        requires=tuple(sorted(d.requires)),
+        # C1: convert solver_var form ("ns::name") to lockfile-safe slash form
+        # ("ns/name") — solver vars must not appear in the lockfile (§1.7.1).
+        requires=tuple(sorted(_req_name_to_lockfile(r) for r in d.requires)),
         provenances=d.provenances,
         active_flags=d.active_flags,
         # S6: carry the dep_decl hash from the resolver through to the lockfile pin.
@@ -932,6 +949,8 @@ def _locked_from_resolved(d: ResolvedDep) -> LockedDep:
         cond_requires=d.cond_requires,
         # Phase B: carry dedup aliases from ResolvedDep (lex-sorted by dedup pass).
         aliases=d.aliases,
+        # C1: carry namespace for qualified named deps (None for all others).
+        namespace=d.namespace,
     )
 
 
@@ -1072,6 +1091,10 @@ def format_lockfile(lockfile: Lockfile) -> str:
     ]
     for dep in lockfile.deps:
         lines.append(f"dep {_kdl_str(dep.name)} {{")
+        # C1: namespace child node — emitted FIRST when non-None (§3.9).
+        # ``dep "bar" { namespace "ns1"; ... }`` — bare name as arg, ns as child.
+        if dep.namespace is not None:
+            lines.append(f"    namespace {_kdl_str(dep.namespace)}")
         # identity — emitted only when not None
         if dep.identity is not None:
             lines.append(f"    identity {_kdl_str(dep.identity)}")
@@ -1104,8 +1127,7 @@ def format_lockfile(lockfile: Lockfile) -> str:
         if dep.dep_decl is not None:
             lines.append(f"    dep_decl {_kdl_str(dep.dep_decl)}")
         # provenance blocks — sorted by canonical key (§4.0): declared < observed;
-        # git < tarball < oci < local < member < registry; then (primary, secondary).
-        # NOTE: self_mirrors is NEVER emitted (D-provenance: removed from schema).
+        # git < tarball < oci < local < member; then (primary, secondary).
         for prov in sorted(dep.provenances, key=_provenance_sort_key):
             lines.append("    provenance {")
             for pline in _format_provenance_fields(prov):
@@ -1126,10 +1148,9 @@ def _format_provenance_fields(p: ProvenanceRecord) -> list[str]:
       local:    origin / kind / path
       member:   origin / kind / name
       oci:      origin / kind / registry / repository / digest
-      registry: origin / kind / name / tag / commit_sha  (read-compat round-trip)
 
     origin is ALWAYS emitted (never omitted), regardless of value.
-    Optional fields (ref, commit_sha, sha256, tag) are omitted when None.
+    Optional fields (ref, commit_sha, sha256) are omitted when None.
     """
     # origin is always first, always emitted.
     out = [f"origin {_kdl_str(p.origin)}", f"kind {_kdl_str(p.kind)}"]
@@ -1154,12 +1175,6 @@ def _format_provenance_fields(p: ProvenanceRecord) -> list[str]:
         out.append(f"registry {_kdl_str(p.registry)}")
         out.append(f"repository {_kdl_str(p.repository)}")
         out.append(f"digest {_kdl_str(p.digest)}")
-    elif isinstance(p, RegistryProvenanceRecord):
-        out.append(f"name {_kdl_str(p.name)}")
-        if p.tag is not None:
-            out.append(f"tag {_kdl_str(p.tag)}")
-        if p.commit_sha is not None:
-            out.append(f"commit_sha {_kdl_str(p.commit_sha)}")
     return out
 
 
@@ -1233,8 +1248,10 @@ def verify_against_graph(
     Raises ``MilpaError(LOCK_GRAPH_MISMATCH)`` on any divergence.
     Collects ALL mismatches before raising (not fail-fast).
     """
-    locked_by_name = {d.name: d for d in lockfile.deps}
-    graph_by_name = {d.name: d for d in graph.deps}
+    # C1: key by dep_dir_name (namespace-aware) so two qualified deps with the
+    # same bare name (e.g. ns1/bar and ns2/bar) are distinct in the index.
+    locked_by_name = {dep_dir_name(d.name, d.namespace): d for d in lockfile.deps}
+    graph_by_name = {dep_dir_name(d.name, d.namespace): d for d in graph.deps}
 
     errors: list[str] = []
     for name in sorted(graph_by_name.keys() - locked_by_name.keys()):
@@ -1375,16 +1392,20 @@ def verify_lockfile_against_deps(
     """
     import os as _os
     divergences: list[str] = []
-    locked_by_name = {d.name: d for d in lockfile.deps}
+    # C1: key by dep_dir_name (namespace-aware) so qualified deps are found
+    # at ``_deps/@<ns>/<name>`` not ``_deps/<name>``.
+    locked_by_dir = {dep_dir_name(d.name, d.namespace): d for d in lockfile.deps}
 
-    # Build the set of all expected names (canonical + alias) so the extra-dep
-    # scan does not flag alias symlinks as unexpected.
-    expected_names: set[str] = set(locked_by_name.keys())
+    # Build the set of all expected dir-names (canonical + alias) so the
+    # extra-dep scan does not flag expected entries as unexpected.
+    expected_dir_names: set[str] = set(locked_by_dir.keys())
     for locked in lockfile.deps:
-        expected_names.update(locked.aliases)
+        expected_dir_names.update(locked.aliases)
 
-    for name, locked in sorted(locked_by_name.items()):
-        dep_path = deps_dir / name
+    for dir_name, locked in sorted(locked_by_dir.items()):
+        dep_path = deps_dir / dir_name
+        # Use the last path component as the display name in error messages.
+        name = locked.name
 
         # --- dispatch on provenance kind (§6.2 NORMATIVE) ---
         if _is_local_dep(locked):
@@ -1468,11 +1489,22 @@ def verify_lockfile_against_deps(
                 )
 
     # --- extra-dep scan (excludes hidden entries + declared alias names) ---
+    # C1: namespace directories (``@<ns>/``) appear as top-level entries in
+    # ``deps_dir/``.  Scan their children rather than flagging the namespace
+    # dir itself as extra.
     if deps_dir.exists() and deps_dir.is_dir():
         for entry in sorted(deps_dir.iterdir()):
             if entry.name.startswith("."):
                 continue
-            if entry.name not in expected_names:
+            if entry.name.startswith("@") and entry.is_dir():
+                # Namespace directory: scan one level deeper.
+                for child in sorted(entry.iterdir()):
+                    qualified = f"{entry.name}/{child.name}"
+                    if qualified not in expected_dir_names:
+                        divergences.append(
+                            f"{qualified}: extra dep in {deps_dir}/ not in lockfile"
+                        )
+            elif entry.name not in expected_dir_names:
                 divergences.append(
                     f"{entry.name}: extra dep in {deps_dir}/ not in lockfile"
                 )

@@ -1,0 +1,8 @@
+name "bar"
+kind "library"
+flags {
+    openssl default=#true {
+        conflicts "bearssl"
+    }
+    bearssl default=#true
+}

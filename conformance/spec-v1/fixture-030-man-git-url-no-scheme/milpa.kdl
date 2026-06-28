@@ -1,5 +1,5 @@
 name "x"
 kind "library"
 deps {
-    foo git="no-scheme-here" ref="main"
+    foo git=(url)"no-scheme-here" ref="main"
 }

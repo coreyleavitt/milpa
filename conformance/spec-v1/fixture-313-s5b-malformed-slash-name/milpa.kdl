@@ -1,0 +1,5 @@
+name "myapp"
+kind "application"
+deps {
+    "a/b/c" ">= 1.0.0"
+}

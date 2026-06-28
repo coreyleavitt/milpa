@@ -202,16 +202,21 @@ def test_symlink_member_escaping_root_from_manifest(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Dangling-symlink parity (Item 1 — matches Rust workspace_tests.rs)
+# S4 (#168) — cyclic and dangling symlink → WS-MEMBER-DIR-MISSING (spec §11.0)
 #
-# Python `resolve(strict=False)` follows dangling symlinks to the (nonexistent)
-# target, so `is_relative_to(root)` correctly catches outside-escaping danglers.
-# These tests pin that behavior against regression and document parity with Rust.
+# After S4 the best-effort-resolve algorithm uses stat() (not lstat()), so
+# dangling and cyclic symlinks are treated as non-existent: the longest
+# stat-existing prefix is the parent directory, and the resolved candidate
+# stays inside the workspace root.  The dir-existence check then fails →
+# WS-MEMBER-DIR-MISSING (not WS-MEMBER-PATH-ESCAPE, not an OSError crash).
+#
+# Note: an existing symlink whose target is OUTSIDE the root still yields
+# WS-MEMBER-PATH-ESCAPE (stat succeeds, fast path canonicalizes to outside).
 # ---------------------------------------------------------------------------
 
 
-def test_dangling_symlink_outside_root_yields_path_escape(tmp_path: Path) -> None:
-    """A dangling symlink whose target is outside the workspace root → WS-MEMBER-PATH-ESCAPE.
+def test_dangling_symlink_outside_root_yields_dir_missing(tmp_path: Path) -> None:
+    """A dangling symlink with a nonexistent target outside the root → WS-MEMBER-DIR-MISSING.
 
     Layout::
 
@@ -220,10 +225,10 @@ def test_dangling_symlink_outside_root_yields_path_escape(tmp_path: Path) -> Non
           milpa.kdl      (workspace declaring member "dangle-out")
           dangle-out -> ../../outside-nonexistent   (dangling: target absent)
 
-    Python ``Path.resolve(strict=False)`` follows the symlink to the nonexistent
-    outside target; ``is_relative_to(root)`` is False → WS-MEMBER-PATH-ESCAPE.
-    (Rust: before the dangling-symlink fix, ``candidate.exists()`` was False →
-    ``normalize_lexically`` treated the symlink as a normal dir → wrong slug.)
+    spec §11.0: stat() fails for a dangling symlink → treated as non-existent →
+    best-effort-resolve returns canonical_root/dangle-out → no escape →
+    dir-existence check fails → WS-MEMBER-DIR-MISSING.
+    Conformance corpus: fixture-310-ws-member-dangling-symlink.
     """
     ws_root = tmp_path / "workspace-root"
     ws_root.mkdir()
@@ -233,7 +238,59 @@ def test_dangling_symlink_outside_root_yields_path_escape(tmp_path: Path) -> Non
 
     with pytest.raises(MilpaError) as exc_info:
         load_workspace(ws_root)
-    assert exc_info.value.slug == WS_MEMBER_PATH_ESCAPE
+    assert exc_info.value.slug == WS_MEMBER_DIR_MISSING
+
+
+def test_cyclic_symlink_yields_dir_missing_no_eloop_crash(tmp_path: Path) -> None:
+    """A cyclic (self-referential) symlink member → WS-MEMBER-DIR-MISSING, no OSError crash.
+
+    Layout::
+
+      tmp_path/
+        workspace-root/
+          milpa.kdl      (workspace declaring member "link-self")
+          link-self -> link-self   (self-referential cycle)
+
+    spec §11.0: stat() on a cyclic symlink raises OSError(ELOOP) → treated as
+    non-existent → best-effort-resolve returns canonical_root/link-self → no escape →
+    dir-existence check fails → WS-MEMBER-DIR-MISSING.  No OSError must escape.
+    Conformance corpus: fixture-309-ws-member-cyclic-symlink.
+    """
+    ws_root = tmp_path / "workspace-root"
+    ws_root.mkdir()
+    _write_workspace(ws_root, ["link-self"])
+    (ws_root / "link-self").symlink_to("link-self")
+    assert not (ws_root / "link-self").exists(), "cyclic symlink must not stat-exist"
+
+    with pytest.raises(MilpaError) as exc_info:
+        load_workspace(ws_root)
+    assert exc_info.value.slug == WS_MEMBER_DIR_MISSING
+
+
+def test_two_hop_cyclic_symlink_yields_dir_missing(tmp_path: Path) -> None:
+    """A two-hop cyclic symlink (a→b, b→a) member → WS-MEMBER-DIR-MISSING, no OSError crash.
+
+    Layout::
+
+      tmp_path/
+        workspace-root/
+          milpa.kdl          (workspace declaring member "link-a")
+          link-a -> link-b   )
+          link-b -> link-a   } two-hop cycle → ELOOP
+
+    Exercises the ELOOP crash path that was previously unhandled by Python's
+    Path.resolve(strict=False) for multi-hop cycles.
+    """
+    ws_root = tmp_path / "workspace-root"
+    ws_root.mkdir()
+    _write_workspace(ws_root, ["link-a"])
+    (ws_root / "link-a").symlink_to("link-b")
+    (ws_root / "link-b").symlink_to("link-a")
+    assert not (ws_root / "link-a").exists(), "cyclic symlink must not stat-exist"
+
+    with pytest.raises(MilpaError) as exc_info:
+        load_workspace(ws_root)
+    assert exc_info.value.slug == WS_MEMBER_DIR_MISSING
 
 
 def test_dangling_symlink_inside_root_yields_dir_missing(tmp_path: Path) -> None:
@@ -329,45 +386,42 @@ def test_member_resolves_to_root_via_symlinked_ws_root_from_manifest(
 
 
 # ---------------------------------------------------------------------------
-# Mid-path dangling symlink parity (new — matches Rust workspace_tests.rs
-# `mid_path_dangling_symlink_outside_root_yields_path_escape`)
+# Mid-path dangling symlink (S4, spec §11.0 — stat-based, treated as non-existent)
 #
-# Python `resolve(strict=False)` follows a mid-path dangling symlink to its
-# (nonexistent) target, so `is_relative_to(root)` catches outside escapes even
-# when the symlink is NOT the final path component.
+# After S4, a dangling mid-path symlink is treated as non-existent (stat fails),
+# so the longest stat-existing prefix is the workspace root, and the result
+# stays inside the root → WS-MEMBER-DIR-MISSING (not WS-MEMBER-PATH-ESCAPE).
 # ---------------------------------------------------------------------------
 
 
-def test_mid_path_dangling_symlink_outside_root_yields_path_escape(
+def test_mid_path_dangling_symlink_outside_root_yields_dir_missing(
     tmp_path: Path,
 ) -> None:
-    """Member 'danglink/pkg' where 'danglink' is a dangling symlink outside root.
+    """Member 'danglink/pkg' where 'danglink' is a dangling symlink → WS-MEMBER-DIR-MISSING.
 
     Layout::
 
       tmp_path/
         workspace-root/
           milpa.kdl      (workspace declaring member "danglink/pkg")
-          danglink -> ../../outside-nonexistent   (dangling: target absent, outside root)
+          danglink -> ../../outside-nonexistent   (dangling: target absent)
 
-    Python ``Path.resolve(strict=False)`` reads danglink's target and resolves
-    ``outside-nonexistent/pkg``.  ``is_relative_to(root)`` is False →
-    WS-MEMBER-PATH-ESCAPE.  Pins parity with Rust after the ancestor-walk fix.
+    spec §11.0: stat() on 'danglink' fails (dangling symlink) → treated as
+    non-existent → longest stat-existing prefix = workspace-root → result is
+    workspace-root/danglink/pkg → inside root → no escape → WS-MEMBER-DIR-MISSING.
     """
     ws_root = tmp_path / "workspace-root"
     ws_root.mkdir()
     _write_workspace(ws_root, ["danglink/pkg"])
-    # Create a dangling symlink at ws_root/danglink pointing outside the root.
-    # Target does NOT exist.
     (ws_root / "danglink").symlink_to("../../outside-nonexistent")
     assert not (ws_root / "danglink").exists(), "danglink target must be absent"
     assert not (ws_root / "danglink" / "pkg").exists(), "mid-path must be unreachable"
 
     with pytest.raises(MilpaError) as exc_info:
         load_workspace(ws_root)
-    assert exc_info.value.slug == WS_MEMBER_PATH_ESCAPE, (
-        f"Expected WS-MEMBER-PATH-ESCAPE, got {exc_info.value.slug!r} — "
-        "mid-path dangling symlink outside root must be detected as an escape"
+    assert exc_info.value.slug == WS_MEMBER_DIR_MISSING, (
+        f"Expected WS-MEMBER-DIR-MISSING, got {exc_info.value.slug!r} — "
+        "mid-path dangling symlink must be treated as non-existent (spec §11.0)"
     )
 
 

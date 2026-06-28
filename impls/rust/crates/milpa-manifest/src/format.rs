@@ -501,9 +501,18 @@ fn format_dep_line(dep: &Dep) -> String {
             };
 
             // Build the dep node body (without leading indentation — added below).
+            // S5b: emit `namespace="..."` attribute in canonical form (never slash).
+            let ns_attr = match &n.namespace {
+                Some(ns) => format!(" namespace=\"{}\"", kdl_str(ns)),
+                None => String::new(),
+            };
+            // ns_attr is either "" or " namespace=\"ns\"" (with a leading space).
+            // Result: `"name"`, `"name" "c"`, `"name" namespace="ns"`, or
+            //         `"name" namespace="ns" "c"` — always single-spaced.
+            let name_part = format!("\"{}\"{}",  kdl_str(&n.name), ns_attr);
             let mut head = match &n.constraint {
-                None => format!("\"{}\"", kdl_str(&n.name)),
-                Some(c) => format!("\"{}\" \"{}\"", kdl_str(&n.name), kdl_str(c)),
+                None => name_part,
+                Some(c) => format!("{} \"{}\"", name_part, kdl_str(c)),
             };
             // S7: emit `optional=#true`.
             if n.optional {
@@ -606,6 +615,7 @@ mod tests {
                 flag_requests: Vec::new(),
                 optional: false,
                 predicates: Vec::new(),
+                namespace: None,
             }),
         ];
         let text = format_manifest(&m);
@@ -723,6 +733,7 @@ mod tests {
             flag_requests: Vec::new(),
             optional: false,
             predicates: vec![platform_pred("linux")],
+            namespace: None,
         })];
         let text = format_manifest(&m);
         assert!(text.contains("when"), "expected when-block in:\n{text}");
@@ -761,6 +772,7 @@ mod tests {
             }],
             optional: false,
             predicates: vec![platform_pred("linux")],
+            namespace: None,
         })];
         let text = format_manifest(&m);
         assert!(text.contains("when"), "expected when-block in:\n{text}");

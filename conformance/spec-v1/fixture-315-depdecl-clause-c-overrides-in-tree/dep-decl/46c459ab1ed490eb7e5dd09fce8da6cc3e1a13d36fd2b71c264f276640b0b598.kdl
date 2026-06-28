@@ -1,0 +1,5 @@
+dep_decl {
+    dep_decl_schema_version 0
+    src_dir "src"
+    require "bar" ">= 2.0.0"
+}

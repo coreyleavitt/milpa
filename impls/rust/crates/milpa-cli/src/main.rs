@@ -227,16 +227,6 @@ fn format_provenance_record(p: &ProvenanceRecord) -> String {
         ProvenanceRecord::Oci { registry, repository, digest, .. } => {
             format!("oci {registry}/{repository}@{}", &digest[..digest.len().min(15)])
         }
-        ProvenanceRecord::Registry { name, tag, commit_sha, .. } => {
-            let mut parts = vec![format!("registry (legacy) {name}")];
-            if let Some(t) = tag {
-                parts.push(format!("@ {t}"));
-            }
-            if let Some(sha) = commit_sha {
-                parts.push(format!("(sha {})", &sha[..sha.len().min(8)]));
-            }
-            parts.join(" ")
-        }
     }
 }
 
@@ -281,6 +271,13 @@ fn cmd_show(dir: &Path) -> Result<i32, MilpaError> {
         // S10 (RFC #23 §3.7): print active_flags when non-empty.
         if !dep.active_flags.is_empty() {
             println!("  active_flags {}", dep.active_flags.join(" "));
+        }
+        // S1 (rfc-resolver-correctness.md #142): surface aliases so a user can see
+        // that a dep was deduped (e.g. "bar" → canonical "foo").
+        if !dep.aliases.is_empty() {
+            let mut sorted_aliases = dep.aliases.clone();
+            sorted_aliases.sort();
+            println!("  aliases     {}", sorted_aliases.join(", "));
         }
     }
     Ok(0)
@@ -1721,6 +1718,42 @@ fn canonical_name_for(name: &str, lockfile: &milpa_core::Lockfile) -> String {
     name.to_string()
 }
 
+/// S5b: Convert a CLI dep-name from slash form to double-colon solver_var form.
+///
+/// `"ns1/bar"` → `"ns1::bar"`.  Names without a slash are returned unchanged.
+/// Malformed slash forms (more than one slash, empty segments) are also
+/// returned unchanged — the guard in the caller will produce MAN-REMOVE-DEP-ABSENT.
+/// M1: routes through `DepKey::solver_var()` — SOLE join site for `::` in CLI.
+fn desugar_dep_name(name: &str) -> String {
+    if name.contains('/') {
+        let parts: Vec<&str> = name.splitn(2, '/').collect();
+        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty()
+            && !parts[1].contains('/')
+        {
+            return milpa_manifest::DepKey {
+                name: parts[1].to_string(),
+                namespace: Some(parts[0].to_string()),
+            }.solver_var();
+        }
+    }
+    name.to_string()
+}
+
+/// S5b: Compute the solver_var (remove-key) for a dep.
+///
+/// For `Dep::Named` with a namespace, returns `"ns::bare"`.
+/// For all other deps (or Named without namespace), returns the bare name.
+/// M1: routes through `DepKey::solver_var()` — SOLE join site for `::` in CLI.
+fn dep_remove_key(dep: &milpa_manifest::Dep) -> String {
+    if let milpa_manifest::Dep::Named(n) = dep {
+        return milpa_manifest::DepKey {
+            name: n.name.clone(),
+            namespace: n.namespace.clone(),
+        }.solver_var();
+    }
+    dep.name().to_string()
+}
+
 /// `milpa remove <name>` — drop a dep from `milpa.kdl` and regenerate the
 /// lockfile (cli-contract §5.7). Mirrors `cmd_add`'s structure: load the
 /// manifest, reject an undeclared dep, build the proposed manifest (minus the
@@ -1758,14 +1791,17 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
         } else {
             None
         };
+        // S5b: desugar slash shorthand for workspace member remove.
+        let name_key_ws: String = desugar_dep_name(&name);
         let canonical_ws: String = if let Some(ref lf) = shared_prior {
-            canonical_name_for(&name, lf)
+            canonical_name_for(&name_key_ws, lf)
         } else {
-            name.clone()
+            name_key_ws.clone()
         };
 
         // Guard: dep must be declared in the MEMBER's milpa.kdl.
-        if !existing.deps.iter().any(|d| d.name() == canonical_ws) {
+        // S5b: use dep_remove_key() to match qualified deps by solver_var.
+        if !existing.deps.iter().any(|d| dep_remove_key(d) == canonical_ws) {
             eprintln!("remove: no dep {name:?} in milpa.kdl");
             eprintln!("milpa-error: MAN-REMOVE-DEP-ABSENT");
             return Ok(1);
@@ -1773,7 +1809,7 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
 
         // Build proposed member manifest without the dep.
         let mut proposed_member = existing.clone();
-        proposed_member.deps.retain(|d| d.name() != canonical_ws.as_str());
+        proposed_member.deps.retain(|d| dep_remove_key(d) != canonical_ws);
 
         // Rebuild workspace with proposed member manifest and resolve.
         let ws_with_override = ws_with_member_override(&ws, dir, proposed_member.clone());
@@ -1799,13 +1835,19 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
         // NO member-local lock written (D5 correctness point).
         let canonical_c = canonical_ws.clone();
         mutate_manifest_file(&dir.join("milpa.kdl"), move |mut m| {
-            m.deps.retain(|d| d.name() != canonical_c.as_str());
+            // S5b: use dep_remove_key() so qualified deps are matched by solver_var.
+            m.deps.retain(|d| dep_remove_key(d) != canonical_c.as_str());
             m
         })?;
         write_lockfile(&from_graph(&graph, strategy.as_str()), &ws_lock_path)?;
         eprintln!("removed {canonical_ws}");
         return Ok(0);
     }
+
+    // S5b: desugar slash shorthand in the dep name ("ns1/bar" → "ns1::bar").
+    // The solver_var form is what the lockfile stores and what dep_remove_key()
+    // returns for qualified Named deps.
+    let name_key: String = desugar_dep_name(&name);
 
     // D-update-remove: alias→canonical resolution (Phase D item 5).
     // If `name` is an alias of a canonical lockfile dep, resolve to the manifest
@@ -1817,13 +1859,14 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
         None
     };
     let canonical: String = if let Some(ref lf) = prior_lock {
-        canonical_name_for(&name, lf)
+        canonical_name_for(&name_key, lf)
     } else {
-        name.clone()
+        name_key.clone()
     };
 
     // §5.7: reject if <dep> (resolved canonical) is not declared in milpa.kdl.
-    if !existing.deps.iter().any(|d| d.name() == canonical) {
+    // S5b: use dep_remove_key() so that qualified deps ("ns1::bar") match.
+    if !existing.deps.iter().any(|d| dep_remove_key(d) == canonical) {
         eprintln!("remove: no dep {name:?} in milpa.kdl");
         eprintln!("milpa-error: MAN-REMOVE-DEP-ABSENT");
         return Ok(1);
@@ -1840,7 +1883,7 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
     // (§5.7). Only on success do we commit both outputs; on any failure both
     // files are left unmodified (resolve runs before any write).
     let mut proposed = existing.clone();
-    proposed.deps.retain(|d| d.name() != canonical);
+    proposed.deps.retain(|d| dep_remove_key(d) != canonical);
 
     let deps_dir = dir.join("_deps");
     let registry = build_registry();
@@ -1885,7 +1928,8 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
     {
         let canonical = canonical.clone();
         mutate_manifest_file(&dir.join("milpa.kdl"), move |mut m| {
-            m.deps.retain(|d| d.name() != canonical);
+            // S5b: use dep_remove_key() so qualified deps are matched by solver_var.
+            m.deps.retain(|d| dep_remove_key(d) != canonical.as_str());
             m
         })?;
     }
@@ -2407,7 +2451,7 @@ mod tests {
     fn remove_rejects_undeclared_dep_and_leaves_files() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let manifest = "name \"app\"\nkind \"application\"\ndeps {\n  foo git=\"https://e/foo.git\" ref=\"main\"\n}\n";
+        let manifest = "name \"app\"\nkind \"application\"\ndeps {\n  foo git=(url)\"https://e/foo.git\" ref=\"main\"\n}\n";
         std::fs::write(dir.join("milpa.kdl"), manifest).unwrap();
         // remove of an absent dep → exit 1 (MAN-REMOVE-DEP-ABSENT).
         assert_eq!(cmd_remove(dir, Strategy::default(), &["ghost".into()], false).unwrap(), 1);
@@ -2437,7 +2481,7 @@ mod tests {
         );
         std::fs::write(
             proj.join("milpa.kdl"),
-            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=\"{url}\" ref=\"main\"\n}}\n"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=(url)\"{url}\" ref=\"main\"\n}}\n"),
         )
         .unwrap();
 
@@ -2471,7 +2515,7 @@ mod tests {
         let mocked = make_mocked_fetches(tmp.path(), bar, "main", &"b".repeat(40), &[("bar.nim", b"# bar")]);
 
         let manifest = format!(
-            "name \"app\"\nkind \"application\"\ndeps {{\n  foo git=\"{foo}\" ref=\"main\"\n  bar git=\"{bar}\" ref=\"main\"\n}}\n"
+            "name \"app\"\nkind \"application\"\ndeps {{\n  foo git=(url)\"{foo}\" ref=\"main\"\n  bar git=(url)\"{bar}\" ref=\"main\"\n}}\n"
         );
         std::fs::write(proj.join("milpa.kdl"), &manifest).unwrap();
 
@@ -2557,6 +2601,7 @@ mod tests {
         });
         let dep = milpa_core::LockedDep {
             name: dep_name.to_string(),
+            namespace: None,
             identity: Some(identity.to_string()),
             version: "0.0.1".to_string(),
             src_dir: String::new(),
@@ -2595,9 +2640,9 @@ mod tests {
             proj.join("milpa.kdl"),
             format!(
                 "name \"app\"\nkind \"application\"\ndeps {{\n  \
-                 foo git=\"{primary_url}\" ref=\"main\" {{\n    \
-                 mirror \"{mirror1_url}\"\n    \
-                 mirror \"{mirror2_url}\"\n  }}\n}}\n"
+                 foo git=(url)\"{primary_url}\" ref=\"main\" {{\n    \
+                 mirror (url)\"{mirror1_url}\"\n    \
+                 mirror (url)\"{mirror2_url}\"\n  }}\n}}\n"
             ),
         )
         .unwrap();
@@ -2652,8 +2697,8 @@ mod tests {
             proj.join("milpa.kdl"),
             format!(
                 "name \"app\"\nkind \"application\"\ndeps {{\n  \
-                 foo git=\"{primary_url}\" ref=\"main\" {{\n    \
-                 mirror \"{mirror1_url}\"\n  }}\n}}\n"
+                 foo git=(url)\"{primary_url}\" ref=\"main\" {{\n    \
+                 mirror (url)\"{mirror1_url}\"\n  }}\n}}\n"
             ),
         )
         .unwrap();
@@ -2705,7 +2750,7 @@ mod tests {
         // milpa.kdl: foo declared.
         std::fs::write(
             proj.join("milpa.kdl"),
-            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=\"{primary_url}\" ref=\"main\"\n}}\n"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=(url)\"{primary_url}\" ref=\"main\"\n}}\n"),
         )
         .unwrap();
 
@@ -2751,7 +2796,7 @@ mod tests {
         // milpa.kdl: foo declared.
         std::fs::write(
             proj.join("milpa.kdl"),
-            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=\"{primary_url}\" ref=\"main\"\n}}\n"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=(url)\"{primary_url}\" ref=\"main\"\n}}\n"),
         )
         .unwrap();
 
@@ -2799,7 +2844,7 @@ mod tests {
         // milpa.kdl: foo declared.
         std::fs::write(
             proj.join("milpa.kdl"),
-            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=\"{primary_url}\" ref=\"main\"\n}}\n"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=(url)\"{primary_url}\" ref=\"main\"\n}}\n"),
         )
         .unwrap();
 
@@ -2848,7 +2893,7 @@ mod tests {
 
         std::fs::write(
             proj.join("milpa.kdl"),
-            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=\"{primary_url}\" ref=\"main\"\n}}\n"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=(url)\"{primary_url}\" ref=\"main\"\n}}\n"),
         )
         .unwrap();
 
@@ -3004,7 +3049,7 @@ mod tests {
         );
         std::fs::write(
             proj.join("milpa.kdl"),
-            "name \"app\"\nkind \"application\"\ndeps {\n  foo git=\"https://example.com/foo.git\" ref=\"main\"\n}\n",
+            "name \"app\"\nkind \"application\"\ndeps {\n  foo git=(url)\"https://example.com/foo.git\" ref=\"main\"\n}\n",
         )
         .unwrap();
 
@@ -3086,8 +3131,8 @@ mod tests {
         std::fs::write(
             proj.join("milpa.kdl"),
             "name \"app\"\nkind \"application\"\ndeps {\n  \
-             foo git=\"https://example.com/foo.git\" ref=\"main\"\n  \
-             bar git=\"https://example.com/bar.git\" ref=\"main\"\n}\n",
+             foo git=(url)\"https://example.com/foo.git\" ref=\"main\"\n  \
+             bar git=(url)\"https://example.com/bar.git\" ref=\"main\"\n}\n",
         )
         .unwrap();
 
@@ -3152,7 +3197,7 @@ mod tests {
 
         std::fs::write(
             proj.join("milpa.kdl"),
-            "name \"app\"\nkind \"application\"\ndeps {\n  foo git=\"https://example.com/foo.git\" ref=\"main\"\n}\n",
+            "name \"app\"\nkind \"application\"\ndeps {\n  foo git=(url)\"https://example.com/foo.git\" ref=\"main\"\n}\n",
         )
         .unwrap();
 
@@ -3934,7 +3979,7 @@ mod tests {
         std::fs::write(
             proj.join("milpa.kdl"),
             format!(
-                "name \"app\"\nkind \"application\"\ndeps {{\n  dpa git=\"{url_a}\" ref=\"main\"\n  dpb git=\"{url_b}\" ref=\"main\"\n}}\n"
+                "name \"app\"\nkind \"application\"\ndeps {{\n  dpa git=(url)\"{url_a}\" ref=\"main\"\n  dpb git=(url)\"{url_b}\" ref=\"main\"\n}}\n"
             ),
         ).unwrap();
 

@@ -1106,10 +1106,20 @@ emitting `milpa.lock` and `nim.cfg`.
 >   `overrides` block.
 > - `WS-MEMBER-DUPLICATE-NAME` — fixture-111: two member directories both declare
 >   the same package name.
-> - `FROZEN-LEGACY-REGISTRY-PROVENANCE` — fixture-114: `cas-seed/` pre-populates
->   the CAS (runner now copies before admitting, so the seed tree is not
->   destroyed on the first run), then the lockfile's `kind "registry"` provenance
->   triggers the raise.
+> - `LOCK-PROV-KIND-UNKNOWN` (registry) — fixture-114: lockfile with
+>   `kind "registry"` provenance now hits the unknown-kind path (the registry
+>   read-compat shim was deleted in S3).
+> - `LOCK-STRATEGY-MISSING` — fixture-307: lockfile missing the `strategy` node
+>   raises `LOCK-STRATEGY-MISSING` (S3 strict parser).
+> - `LOCK-STRATEGY-MISSING` (malformed arg) — fixture-319: lockfile with `strategy
+>   42` (integer arg, not a string) also raises `LOCK-STRATEGY-MISSING` — matches
+>   Rust which leaves `strategy` unset when the arg is not a string.
+> - `LOCK-PROV-FIELD-MISSING` (absent `origin`) — fixture-323: lockfile with a git
+>   provenance block missing the required `origin` field raises
+>   `LOCK-PROV-FIELD-MISSING` (S3 strict; `origin` no longer has a default).
+> - `MAN-URL-ARG-TYPE` (plain string) — fixture-308: manifest dep with a bare
+>   `git="..."` string (no `(url)` annotation) raises `MAN-URL-ARG-TYPE`
+>   (S3 URL-annotation requirement).
 > - Conditional-dep exclusion via profile predicates — fixture-115: `env` file
 >   sets `MILPA_TARGET_PLATFORM=linux`; a dep gated on `platform="windows"` is
 >   absent from the resolved graph.
@@ -1151,6 +1161,51 @@ emitting `milpa.lock` and `nim.cfg`.
 >   `dep_decl` hash recorded in `milpa.lock` differs from the live index pointer.
 > - `LOCK-DEPDECL-PIN-MISSING` — fixture-143: `milpa verify` detects that a
 >   `dep_decl` pin in `milpa.lock` has no corresponding pointer in the live index.
+>
+> The following fixtures cover **S5b namespace-qualified named deps**
+> (`rfc-resolver-correctness.md` C1/H2/M2 fixes):
+>
+> - fixture-311 (`s5b-qualified-named-attr`): qualified named dep via `namespace=`
+>   attribute; lockfile emits `dep "bar" { namespace "ns1"; ... }` (bare name as
+>   node arg, namespace as first child); on-disk at `_deps/@ns1/bar/`.
+> - fixture-312 (`s5b-qualified-named-slash`): qualified named dep via slash
+>   shorthand `"ns1/bar"` — same expected output as fixture-311.
+> - fixture-313 (`s5b-malformed-slash-name`): triple-segment slash `"a/b/c"` →
+>   `MAN-DEP-NAME-INVALID`.
+> - fixture-314 (`s5b-two-namespaces-payoff`): two qualified deps with the same
+>   bare name from different namespaces (`ns1/bar` and `ns2/bar`) → both appear
+>   in the lockfile and on disk (`_deps/@ns1/bar/` and `_deps/@ns2/bar/`).
+> - fixture-315 (`depdecl-clause-c-overrides-in-tree`): depdecl overrides that
+>   are transitive within the tree.
+> - fixture-316 (`s5b-namespace-lock-roundtrip`): `lock-roundtrip` fixture proving
+>   C1 fix — a lockfile with `dep "bar" { namespace "ns1"; ... }` parses and
+>   re-emits byte-identically (cannot raise `LOCK-DEP-NAME-INVALID`).
+> - fixture-317 (`s5b-transitive-qualified-named`): H2 fix proof — a URL dep's
+>   transitive `milpa.kdl` declares `"ns1/baz"` (slash syntax); the namespace
+>   survives the `NamedRequire` → `EdgeSet` boundary and appears in the lockfile
+>   as `dep "baz" { namespace "ns1"; ... }`.
+> - fixture-318 (`s5b-slash-namespace-disagreement`): M2 fix proof — a dep uses
+>   both slash shorthand (`"ns1/bar"`) and a disagreeing `namespace="ns2"` attribute
+>   → `MAN-DEP-NAME-INVALID` (agreeing values are accepted; disagreement is an error).
+> - fixture-320 (`frozen-alias-dep-coverage`): single-package frozen path with a dep
+>   that has an alias — verifies the alias-aware `_locked_index` lookup resolves
+>   correctly and the `_deps/` symlinks appear for both canonical name and alias.
+> - fixture-321 (`ws-frozen-alias-dep-coverage`): workspace frozen path variant of
+>   fixture-320 — multi-member workspace with a shared dep carrying an alias entry in
+>   the lockfile; both aliases appear in the resolved `_deps/`.
+> - fixture-322 (`frozen-dev-dep-not-in-lock`): `FROZEN-MANIFEST-DEP-NOT-IN-LOCK`
+>   via a dev dep — verifies that `resolve_frozen` checks `dev_deps` in addition to
+>   `deps` (S1 #178 fix; both impls).
+> - fixture-324 (`lock-dep-namespace-traversal`): `LOCK-DEP-NAME-INVALID` (security)
+>   — lockfile dep with `namespace "ns/../../outside"` (traversal payload) is
+>   rejected at the parse boundary by both impls; prevents `dep_dir_name` from
+>   producing an escaping path like `@ns/../../outside/<name>` under `_deps/`.
+> - fixture-325 (`s4c-qualified-named-flag-conflict`): `RESOLVE-FLAG-CONFLICT`
+>   — a qualified named dep (`bar namespace="ns1"`) with two mutually-exclusive
+>   `default=#true` flags exercises the S4c post-fixpoint conflict check on the
+>   `@ns1/bar/milpa.kdl` path; without the C1/H2 S4c path fix both impls would
+>   silently skip the check (nonexistent `_deps/ns1::bar/milpa.kdl`), resolve
+>   successfully, and miss the conflict.
 
 ### 4.1  Imperative cross-fixture tests (harness-level)
 

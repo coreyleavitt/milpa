@@ -216,12 +216,10 @@ class TestUrlValue:
         uv = self._parse_url_prop('foo git=(url)"https://github.com/x/y"', "git")
         assert not isinstance(uv, urllib.parse.ParseResult)
 
-    def test_bare_string_prop_returns_url_value(self) -> None:
-        """A plain string (no annotation) also returns UrlValue per §4 rule 4."""
+    def test_bare_string_prop_returns_none(self) -> None:
+        """S3 strict: a plain string (no annotation) returns None so the caller raises MAN-URL-ARG-TYPE."""
         uv = self._parse_url_prop('foo git="https://github.com/x/y"', "git")
-        assert uv is not None
-        assert isinstance(uv, UrlValue)
-        assert str(uv) == "https://github.com/x/y"
+        assert uv is None
 
     def test_wrong_type_prop_returns_none(self) -> None:
         """A non-string property returns None from node_prop_url."""
@@ -229,7 +227,7 @@ class TestUrlValue:
         assert uv is None
 
     def test_absent_prop_returns_none(self) -> None:
-        uv = self._parse_url_prop('foo git="x"', "missing")
+        uv = self._parse_url_prop('foo git=(url)"x"', "missing")
         assert uv is None
 
     def test_node_arg_url_with_url_annotation(self) -> None:
@@ -239,12 +237,12 @@ class TestUrlValue:
         assert uv is not None
         assert str(uv) == "https://example.com"
 
-    def test_node_arg_url_with_plain_string(self) -> None:
+    def test_node_arg_url_with_plain_string_returns_none(self) -> None:
+        """S3 strict: plain string arg returns None from node_arg_url."""
         doc = parse_kdl('dep "https://example.com"', context="manifest")
         n = nodes(doc)[0]
         uv = node_arg_url(n, 0)
-        assert uv is not None
-        assert str(uv) == "https://example.com"
+        assert uv is None
 
     def test_node_arg_url_wrong_type_returns_none(self) -> None:
         doc = parse_kdl("dep 42", context="manifest")

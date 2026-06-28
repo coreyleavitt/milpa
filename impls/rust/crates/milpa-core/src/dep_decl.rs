@@ -235,7 +235,7 @@ fn parse_require_node(node: &KdlNode) -> Option<RequireEntry> {
             .and_then(|e| e.value().as_string())
             .unwrap_or("")
             .to_string();
-        Some(RequireEntry::Named(NamedRequire { name, constraint_str, predicates: Vec::new() }))
+        Some(RequireEntry::Named(NamedRequire { name, constraint_str, predicates: Vec::new(), namespace: None }))
     }
 }
 
@@ -287,11 +287,13 @@ mod tests {
                     name: "results".to_string(),
                     constraint_str: ">= 0.5.0".to_string(),
                     predicates: Vec::new(),
+                    namespace: None,
                 }),
                 RequireEntry::Named(NamedRequire {
                     name: "stew".to_string(),
                     constraint_str: ">= 0.1 & < 1.0".to_string(),
                     predicates: Vec::new(),
+                    namespace: None,
                 }),
                 RequireEntry::Url(UrlRequire {
                     url: "https://github.com/status-im/nim-chronos.git".to_string(),
@@ -393,11 +395,13 @@ mod tests {
                     name: "foo".into(),
                     constraint_str: ">= 1.0.0".into(),
                     predicates: Vec::new(),
+                    namespace: None,
                 }),
                 RequireEntry::Named(NamedRequire {
                     name: "bar".into(),
                     constraint_str: "".into(),
                     predicates: Vec::new(),
+                    namespace: None,
                 }),
             ]
         );

@@ -27,10 +27,8 @@ fn err(code: &'static str, message: impl Into<String>) -> CoreError {
 /// Parse `milpa.lock` text into a [`Lockfile`] (lockfile-schema §2–§4).
 ///
 /// Mirrors `lockfile.py:parse_lockfile`: scan the top-level nodes, then validate
-/// the schema version *after* the scan so a malformed `dep`/`version` node
-/// encountered earlier reports first. `strategy` defaults to `"maxver"` and a
-/// malformed `strategy` node is silently ignored (spec §2.2: tolerate pre-v1.0
-/// lockfiles that predate the always-emitted node).
+/// the schema version *after* the scan. S3 strict: both `version` and `strategy`
+/// are required; missing `strategy` raises `LOCK-STRATEGY-MISSING`.
 pub fn parse_lockfile(text: &str) -> LockResult<Lockfile> {
     // Depth guard — see milpa_manifest::KDL_MAX_NESTING_DEPTH for rationale.
     // Both brace depth and block-comment depth are checked (mirrors Python).
@@ -50,19 +48,18 @@ pub fn parse_lockfile(text: &str) -> LockResult<Lockfile> {
         .map_err(|e| err("LOCK-KDL-SYNTAX", format!("KDL syntax error: {e}")))?;
 
     let mut deps: Vec<LockedDep> = Vec::new();
-    let mut strategy = String::from("maxver");
+    let mut strategy: Option<String> = None;
     let mut version: Option<u32> = None;
 
     for node in doc.nodes() {
         match node.name().value() {
             "version" => version = Some(scalar_u32(node, "version")?),
             "strategy" => {
-                // Set only on a well-formed single-string arg; otherwise keep
-                // the default (no error — §2.2).
+                // Accept any well-formed single-string arg.
                 let a = args(node);
                 if let [entry] = a.as_slice() {
                     if let Some(s) = entry.value().as_string() {
-                        strategy = s.to_string();
+                        strategy = Some(s.to_string());
                     }
                 }
             }
@@ -86,6 +83,12 @@ pub fn parse_lockfile(text: &str) -> LockResult<Lockfile> {
             ),
         ));
     }
+    let strategy = strategy.ok_or_else(|| {
+        err(
+            "LOCK-STRATEGY-MISSING",
+            "lockfile missing required 'strategy' node; regenerate via 'milpa fetch'",
+        )
+    })?;
 
     Ok(Lockfile {
         version,
@@ -126,12 +129,12 @@ fn scalar_u32(node: &KdlNode, field: &str) -> LockResult<u32> {
 /// Parse one `dep "name" { … }` block (lockfile-schema §3).
 fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
     let name = dep_name(node)?;
+    let mut namespace: Option<String> = None; // C1: qualified dep namespace (§3.9)
     let mut identity: Option<String> = None;
     let mut version = String::from("0.0.0");
     let mut src_dir = String::new();
     let mut requires: Vec<String> = Vec::new();
     let mut active_flags: Vec<String> = Vec::new();
-    let mut legacy_self_mirror_urls: Vec<String> = Vec::new();
     let mut dep_decl: Option<String> = None; // S6: additive dep_decl pin (§3.7)
     let mut cond_requires: Vec<milpa_types::CondRequire> = Vec::new(); // S4
     let mut aliases: Vec<String> = Vec::new(); // Phase B: alternate names
@@ -139,6 +142,35 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
 
     for child in children(node) {
         match child.name().value() {
+            "namespace" => {
+                // C1: parse the optional namespace child node (§3.9).
+                // Form: `namespace "<ns>"` — exactly one string arg.
+                // Security: validate charset at the lockfile parse boundary.
+                // A poisoned milpa.lock with namespace "ns/../../x" would
+                // escape _deps/ via dep_dir_name → "@ns/../../x/<name>".
+                // Reuse valid_flag_name ([A-Za-z0-9_-]+), same predicate as
+                // dep names and aliases (LOCK-DEP-NAME-INVALID).
+                // Malformed (wrong arity / non-string) silently ignored.
+                if let Some(ns_val) = args(child)
+                    .first()
+                    .and_then(|e| e.value().as_string().map(str::to_string))
+                {
+                    if !ns_val.is_empty() {
+                        if !valid_flag_name(&ns_val) {
+                            return Err(err(
+                                "LOCK-DEP-NAME-INVALID",
+                                format!(
+                                    "dep {:?}: lockfile 'namespace' value {:?} \
+                                     contains characters outside [A-Za-z0-9_-] — \
+                                     rejected to prevent path traversal via a poisoned milpa.lock",
+                                    name, ns_val
+                                ),
+                            ));
+                        }
+                        namespace = Some(ns_val);
+                    }
+                }
+            }
             "identity" => {
                 let val = scalar_str(child, &name, "identity")?;
                 // Reuse the identity grammar validator (§3.1); any ID-* failure
@@ -194,9 +226,8 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
                 aliases = v;
             }
             "active_flags" => active_flags = string_args(child),
-            // Read-compat: legacy `self_mirrors` nodes → declared provenance
-            // entries (D-provenance, lockfile-schema §3.7).
-            "self_mirrors" => legacy_self_mirror_urls.extend(string_args(child)),
+            // S3 purge: legacy `self_mirrors` nodes are silently ignored (§3.7).
+            "self_mirrors" => {}
             // S6: dep_decl pin — forward-compat: silently skip absent/malformed.
             "dep_decl" => {
                 dep_decl = args(child)
@@ -214,20 +245,9 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
         }
     }
 
-    // D-provenance read-compat: convert legacy self_mirrors URLs to declared
-    // GitProvenanceRecord entries (appended after any explicit provenance blocks).
-    for url in legacy_self_mirror_urls {
-        provenances.push(ProvenanceRecord::Git {
-            url,
-            ref_spec: None,
-            commit_sha: None,
-            origin: "declared".to_string(),
-            submodule_shas: vec![],
-        });
-    }
-
     Ok(LockedDep {
         name,
+        namespace,
         identity,
         version,
         src_dir,
@@ -422,9 +442,8 @@ fn parse_provenance(node: &KdlNode, dep_name: &str) -> LockResult<ProvenanceReco
         )
     })?;
 
-    // D-provenance: `origin` defaults to "observed" when absent (back-compat
-    // for lockfiles written before this field was introduced).
-    let origin = get("origin").unwrap_or_else(|| "observed".to_string());
+    // S3 strict: `origin` is required; raises LOCK-PROV-FIELD-MISSING when absent.
+    let origin = required("origin")?;
 
     match kind.as_str() {
         "git" => Ok(ProvenanceRecord::Git {
@@ -453,17 +472,11 @@ fn parse_provenance(node: &KdlNode, dep_name: &str) -> LockResult<ProvenanceReco
             digest: required("digest")?,
             origin,
         }),
-        "registry" => Ok(ProvenanceRecord::Registry {
-            name: required("name")?,
-            tag: get("tag"),
-            commit_sha: get("commit_sha"),
-            origin,
-        }),
         other => Err(err(
             "LOCK-PROV-KIND-UNKNOWN",
             format!(
                 "dep {dep_name:?}: unknown provenance kind {other:?} \
-                 (supported: git, tarball, local, member, oci, registry)"
+                 (known: git, tarball, local, member, oci)"
             ),
         )),
     }
@@ -594,7 +607,7 @@ const HEADER: &str = "// generated by milpa; reproducible build snapshot";
 ///
 /// origin_rank: "declared"→0, "observed"→1, unknown→99.
 /// kind_rank:   "git"→0, "tarball"→1, "oci"→2, "local"→3, "member"→4,
-///              "registry"→5, unknown→99.
+///              unknown→99.
 fn provenance_sort_key(p: &ProvenanceRecord) -> (u8, u8, String, String) {
     let origin_rank = match p.origin() {
         "declared" => 0u8,
@@ -607,7 +620,6 @@ fn provenance_sort_key(p: &ProvenanceRecord) -> (u8, u8, String, String) {
         ProvenanceRecord::Oci { .. } => 2u8,
         ProvenanceRecord::Local { .. } => 3u8,
         ProvenanceRecord::Member { .. } => 4u8,
-        ProvenanceRecord::Registry { .. } => 5u8,
     };
     let (primary, secondary) = match p {
         ProvenanceRecord::Git { url, ref_spec, .. } => (
@@ -621,10 +633,6 @@ fn provenance_sort_key(p: &ProvenanceRecord) -> (u8, u8, String, String) {
         ),
         ProvenanceRecord::Local { path, .. } => (kdl_str(path), String::new()),
         ProvenanceRecord::Member { name, .. } => (kdl_str(name), String::new()),
-        ProvenanceRecord::Registry { name, tag, .. } => (
-            kdl_str(name),
-            tag.as_deref().map(kdl_str).unwrap_or_default(),
-        ),
     };
     (origin_rank, kind_rank, primary, secondary)
 }
@@ -640,6 +648,11 @@ pub fn format_lockfile(lockfile: &Lockfile) -> String {
     ];
     for dep in &lockfile.deps {
         lines.push(format!("dep {} {{", kdl_str(&dep.name)));
+        // C1: emit namespace child FIRST (before identity) to match Python's
+        // emission order (lockfile-schema §3.9 / fixture-311/314).
+        if let Some(ns) = &dep.namespace {
+            lines.push(format!("    namespace {}", kdl_str(ns)));
+        }
         if let Some(identity) = &dep.identity {
             lines.push(format!("    identity {}", kdl_str(identity)));
         }
@@ -827,22 +840,6 @@ fn format_provenance_fields(p: &ProvenanceRecord) -> Vec<String> {
             out.push(format!("repository {}", kdl_str(repository)));
             out.push(format!("digest {}", kdl_str(digest)));
         }
-        ProvenanceRecord::Registry {
-            name,
-            tag,
-            commit_sha,
-            origin,
-        } => {
-            out.push(format!("origin {}", kdl_str(origin)));
-            out.push(format!("kind {}", kdl_str("registry")));
-            out.push(format!("name {}", kdl_str(name)));
-            if let Some(t) = tag {
-                out.push(format!("tag {}", kdl_str(t)));
-            }
-            if let Some(c) = commit_sha {
-                out.push(format!("commit_sha {}", kdl_str(c)));
-            }
-        }
     }
     out
 }
@@ -970,7 +967,14 @@ pub fn write_lockfile(
 /// here.
 pub fn from_graph(graph: &ResolvedGraph, strategy: &str) -> Lockfile {
     let mut deps: Vec<LockedDep> = graph.deps.iter().map(locked_from_resolved).collect();
-    deps.sort_by(|a, b| a.name.cmp(&b.name));
+    // C1: sort by (namespace, name) so two qualified deps with the same bare name
+    // (e.g. ns1::bar and ns2::bar) land in a stable, deterministic order.
+    // Mirrors Python `key=lambda d: (d.namespace or "", d.name)`.
+    deps.sort_by(|a, b| {
+        let a_ns = a.namespace.as_deref().unwrap_or("");
+        let b_ns = b.namespace.as_deref().unwrap_or("");
+        a_ns.cmp(b_ns).then(a.name.cmp(&b.name))
+    });
     Lockfile {
         version: LOCKFILE_SCHEMA_VERSION,
         strategy: strategy.to_string(),
@@ -978,9 +982,21 @@ pub fn from_graph(graph: &ResolvedGraph, strategy: &str) -> Lockfile {
     }
 }
 
+/// Convert a solver-var form requires name (`"ns::name"`) to lockfile-safe
+/// slash form (`"ns/name"`). Bare dep names (no `::`) are returned unchanged.
+/// This is the SOLE conversion site — matches Python `_req_name_to_lockfile`.
+fn req_name_to_lockfile(s: &str) -> String {
+    match s.split_once("::") {
+        Some((ns, name)) => format!("{}/{}", ns, name),
+        None => s.to_string(),
+    }
+}
+
 /// Translate one flat [`ResolvedDep`] into a structured [`LockedDep`].
 fn locked_from_resolved(d: &ResolvedDep) -> LockedDep {
-    let mut requires = d.requires.clone();
+    // C1: convert solver_var form ("ns::name") to lockfile-safe slash form
+    // ("ns/name") — solver vars must not appear in the lockfile.
+    let mut requires: Vec<String> = d.requires.iter().map(|r| req_name_to_lockfile(r)).collect();
     requires.sort();
     // S4: carry cond_requires; sort by total key (name, predicate-string) for
     // byte-exact determinism when same-name entries exist (C1 fix).
@@ -988,6 +1004,8 @@ fn locked_from_resolved(d: &ResolvedDep) -> LockedDep {
     cond_requires.sort_by_key(|cr| cond_require_sort_key(cr));
     LockedDep {
         name: d.name.clone(),
+        // C1: carry namespace for qualified named deps.
+        namespace: d.namespace.clone(),
         // Every dep in a resolved graph is content-hashed; an empty identity
         // would only be the synthetic root, which `build_graph` already drops.
         identity: opt(&d.identity),
@@ -1031,29 +1049,32 @@ fn opt(s: &str) -> Option<String> {
 /// other, or an identity mismatch — is `LOCK-GRAPH-MISMATCH`. Used by `milpa lock`
 /// / `milpa verify` to assert the lockfile is in sync with a fresh resolve.
 pub fn verify_against_graph(lockfile: &Lockfile, graph: &ResolvedGraph) -> Result<(), CoreError> {
+    use milpa_types::dep_dir_name;
     use std::collections::BTreeMap;
-    let locked: BTreeMap<&str, &LockedDep> =
-        lockfile.deps.iter().map(|d| (d.name.as_str(), d)).collect();
-    let resolved: BTreeMap<&str, &ResolvedDep> =
-        graph.deps.iter().map(|d| (d.name.as_str(), d)).collect();
+    // C1: key by dep_dir_name (namespace-aware) so two qualified deps with the
+    // same bare name (ns1::bar, ns2::bar) are kept distinct in the map.
+    let locked: BTreeMap<String, &LockedDep> =
+        lockfile.deps.iter().map(|d| (dep_dir_name(&d.name, d.namespace.as_deref()), d)).collect();
+    let resolved: BTreeMap<String, &ResolvedDep> =
+        graph.deps.iter().map(|d| (dep_dir_name(&d.name, d.namespace.as_deref()), d)).collect();
 
     let mut errors: Vec<String> = Vec::new();
     for name in resolved.keys() {
-        if !locked.contains_key(name) {
+        if !locked.contains_key(name.as_str()) {
             errors.push(format!(
                 "unexpected dep {name:?} in resolved graph (not in lockfile)"
             ));
         }
     }
     for name in locked.keys() {
-        if !resolved.contains_key(name) {
+        if !resolved.contains_key(name.as_str()) {
             errors.push(format!(
                 "locked dep {name:?} is missing from resolved graph"
             ));
         }
     }
     for (name, r) in &resolved {
-        if let Some(l) = locked.get(name) {
+        if let Some(l) = locked.get(name.as_str()) {
             if l.identity.as_deref() != Some(r.identity.as_str()) {
                 errors.push(format!(
                     "identity mismatch for {name:?}: locked={:?}, actual={:?}",
@@ -1196,21 +1217,25 @@ pub fn verify_lockfile_against_deps(
     lockfile: &Lockfile,
     deps_dir: &std::path::Path,
 ) -> Vec<String> {
+    use milpa_types::dep_dir_name;
     use std::collections::BTreeSet;
     let mut divergences: Vec<String> = Vec::new();
 
-    // Build the full expected-name set: canonical names + all alias names.
+    // Build the full expected-name set: canonical dep_dir_names + all alias names.
+    // C1: use dep_dir_name so qualified deps are keyed as "@ns/name".
     // Used by the extra-dep scan to exclude both.
     let mut expected_names: BTreeSet<String> = BTreeSet::new();
     for dep in &lockfile.deps {
-        expected_names.insert(dep.name.clone());
+        expected_names.insert(dep_dir_name(&dep.name, dep.namespace.as_deref()));
         for alias in &dep.aliases {
             expected_names.insert(alias.clone());
         }
     }
 
     for locked in &lockfile.deps {
-        let dep_path = deps_dir.join(&locked.name);
+        // C1: use dep_dir_name so qualified deps are found at "_deps/@ns/name".
+        let dir_name = dep_dir_name(&locked.name, locked.namespace.as_deref());
+        let dep_path = deps_dir.join(&dir_name);
 
         // --- dispatch on provenance kind (lockfile-schema §6.2 NORMATIVE) ---
         if is_local_dep(locked) {
@@ -1300,12 +1325,30 @@ pub fn verify_lockfile_against_deps(
     }
 
     // --- extra-dep scan (excludes hidden entries + all expected names) ---
+    // C1: namespace directories (@ns/) may contain multiple entries; check
+    // their children (as @ns/name) rather than the dir itself.
     if let Ok(rd) = std::fs::read_dir(deps_dir) {
-        let mut extras: Vec<String> = rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| !n.starts_with('.') && !expected_names.contains(n.as_str()))
-            .collect();
+        let mut extras: Vec<String> = Vec::new();
+        for entry in rd.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            if name.starts_with('@') && entry.path().is_dir() {
+                // Namespace directory: check each child independently.
+                if let Ok(children_rd) = std::fs::read_dir(entry.path()) {
+                    for child in children_rd.filter_map(|e| e.ok()) {
+                        let child_name = child.file_name().to_string_lossy().into_owned();
+                        let compound = format!("{}/{}", name, child_name);
+                        if !expected_names.contains(compound.as_str()) {
+                            extras.push(compound);
+                        }
+                    }
+                }
+            } else if !expected_names.contains(name.as_str()) {
+                extras.push(name);
+            }
+        }
         extras.sort();
         for n in extras {
             divergences.push(format!(
@@ -1401,6 +1444,7 @@ mod tests {
              \x20   src_dir \"src\"\n\
              \x20   requires \"bar\" \"baz\"\n\
              \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
              \x20       kind \"git\"\n\
              \x20       url \"https://example.com/foo.git\"\n\
              \x20       ref \"main\"\n\
@@ -1433,7 +1477,7 @@ mod tests {
     fn absent_identity_is_none_and_bare_requires_is_empty() {
         let text = "version 1\nstrategy \"maxver\"\n\
                     dep \"foo\" {\n    version \"0.0.1\"\n    src_dir \"\"\n    requires\n    \
-                    provenance {\n        kind \"local\"\n        path \"../foo\"\n    }\n}\n";
+                    provenance {\n        origin \"observed\"\n        kind \"local\"\n        path \"../foo\"\n    }\n}\n";
         let lock = parse_lockfile(text).unwrap();
         let dep = &lock.deps[0];
         assert_eq!(dep.identity, None);
@@ -1448,43 +1492,29 @@ mod tests {
     }
 
     #[test]
-    fn strategy_defaults_to_maxver_when_absent() {
-        let lock = parse_lockfile("version 1\n").unwrap();
-        assert_eq!(lock.strategy, "maxver");
-        assert!(lock.deps.is_empty());
+    fn strategy_absent_raises_lock_strategy_missing() {
+        let err = parse_lockfile("version 1\n").unwrap_err();
+        assert_eq!(err.code(), "LOCK-STRATEGY-MISSING");
     }
 
     #[test]
-    fn self_mirrors_read_compat_converts_to_declared_provenances() {
-        // D-provenance read-compat: legacy `self_mirrors` nodes are converted
-        // to GitProvenanceRecord entries with origin="declared".
-        let text = "version 1\n\
+    fn self_mirrors_silently_ignored() {
+        // S3 purge: legacy `self_mirrors` nodes are silently ignored (§3.7).
+        let text = "version 1\nstrategy \"maxver\"\n\
                     dep \"foo\" {\n    version \"0.0.1\"\n    src_dir \"\"\n    requires\n    \
                     self_mirrors (url)\"https://a.example/foo.git\" \"https://b.example/foo.git\"\n    \
-                    provenance {\n        kind \"git\"\n        url \"https://example.com/foo.git\"\n    }\n}\n";
+                    provenance {\n        origin \"observed\"\n        kind \"git\"\n        url \"https://example.com/foo.git\"\n    }\n}\n";
         let lock = parse_lockfile(text).unwrap();
-        // The primary provenance (from explicit provenance block) comes first,
-        // then the declared mirrors (converted from self_mirrors).
-        // After parsing, there should be 3 provenances total.
-        assert_eq!(lock.deps[0].provenances.len(), 3);
-        // The declared mirrors have origin="declared"
-        let declared: Vec<_> = lock.deps[0].provenances.iter()
-            .filter(|p| p.origin() == "declared")
-            .collect();
-        assert_eq!(declared.len(), 2);
-        if let ProvenanceRecord::Git { url, origin, .. } = &declared[0] {
-            assert_eq!(url, "https://a.example/foo.git");
-            assert_eq!(origin, "declared");
-        } else {
-            panic!("expected Git provenance");
-        }
+        // Only the explicit provenance block is counted; self_mirrors is ignored.
+        assert_eq!(lock.deps[0].provenances.len(), 1);
+        assert_eq!(lock.deps[0].provenances[0].origin(), "observed");
     }
 
     #[test]
     fn accepts_every_provenance_kind() {
         for (kind_block, want) in [
             (
-                "kind \"tarball\"\n        url \"https://e/x.tar.gz\"\n        sha256 \"abc\"",
+                "origin \"observed\"\n        kind \"tarball\"\n        url \"https://e/x.tar.gz\"\n        sha256 \"abc\"",
                 ProvenanceRecord::Tarball {
                     url: "https://e/x.tar.gz".into(),
                     sha256: Some("abc".into()),
@@ -1492,14 +1522,14 @@ mod tests {
                 },
             ),
             (
-                "kind \"member\"\n        name \"liba\"",
+                "origin \"observed\"\n        kind \"member\"\n        name \"liba\"",
                 ProvenanceRecord::Member {
                     name: "liba".into(),
                     origin: "observed".into(),
                 },
             ),
             (
-                "kind \"oci\"\n        registry \"r\"\n        repository \"o/p\"\n        digest \"sha256:d\"",
+                "origin \"observed\"\n        kind \"oci\"\n        registry \"r\"\n        repository \"o/p\"\n        digest \"sha256:d\"",
                 ProvenanceRecord::Oci {
                     registry: "r".into(),
                     repository: "o/p".into(),
@@ -1507,22 +1537,23 @@ mod tests {
                     origin: "observed".into(),
                 },
             ),
-            (
-                "kind \"registry\"\n        name \"n\"\n        tag \"v1\"",
-                ProvenanceRecord::Registry {
-                    name: "n".into(),
-                    tag: Some("v1".into()),
-                    commit_sha: None,
-                    origin: "observed".into(),
-                },
-            ),
         ] {
             let text = format!(
-                "version 1\ndep \"foo\" {{\n    version \"0.0.1\"\n    src_dir \"\"\n    requires\n    provenance {{\n        {kind_block}\n    }}\n}}\n"
+                "version 1\nstrategy \"maxver\"\ndep \"foo\" {{\n    version \"0.0.1\"\n    src_dir \"\"\n    requires\n    provenance {{\n        {kind_block}\n    }}\n}}\n"
             );
             let lock = parse_lockfile(&text).unwrap();
             assert_eq!(lock.deps[0].provenances, vec![want]);
         }
+    }
+
+    #[test]
+    fn registry_kind_raises_lock_prov_kind_unknown() {
+        // S3 purge: registry kind is no longer recognized.
+        let text = "version 1\nstrategy \"maxver\"\n\
+                    dep \"foo\" {\n    version \"0.0.1\"\n    src_dir \"\"\n    requires\n    \
+                    provenance {\n        origin \"observed\"\n        kind \"registry\"\n        name \"n\"\n    }\n}\n";
+        let err = parse_lockfile(text).unwrap_err();
+        assert_eq!(err.code(), "LOCK-PROV-KIND-UNKNOWN");
     }
 
     // --- error-path coverage (the 12 LOCK-* parse codes) ---
@@ -1538,38 +1569,47 @@ mod tests {
         assert_eq!(code_of("version 99\n"), "LOCK-VERSION-UNSUPPORTED");
         assert_eq!(code_of("version\n"), "LOCK-FIELD-ARITY");
         assert_eq!(code_of("version \"x\"\n"), "LOCK-FIELD-TYPE");
+        // LOCK-STRATEGY-MISSING: version present but strategy absent.
+        assert_eq!(code_of("version 1\n"), "LOCK-STRATEGY-MISSING");
         assert_eq!(
-            code_of("version 1\ndep {\n    version \"0.0.1\"\n}\n"),
+            code_of("version 1\nstrategy \"maxver\"\ndep {\n    version \"0.0.1\"\n}\n"),
             "LOCK-DEP-NAME-ARITY"
         );
         assert_eq!(
-            code_of("version 1\ndep \"foo\" {\n    version \"0.0.1\" \"extra\"\n}\n"),
+            code_of("version 1\nstrategy \"maxver\"\ndep \"foo\" {\n    version \"0.0.1\" \"extra\"\n}\n"),
             "LOCK-DEP-FIELD-ARITY"
         );
         assert_eq!(
-            code_of("version 1\ndep \"foo\" {\n    identity \"not-a-multihash\"\n}\n"),
+            code_of("version 1\nstrategy \"maxver\"\ndep \"foo\" {\n    identity \"not-a-multihash\"\n}\n"),
             "LOCK-DEP-IDENTITY-INVALID"
         );
         assert_eq!(
-            code_of("version 1\ndep \"foo\" {\n    provenance {\n        kind \"git\" \"extra\"\n    }\n}\n"),
+            code_of("version 1\nstrategy \"maxver\"\ndep \"foo\" {\n    provenance {\n        kind \"git\" \"extra\"\n    }\n}\n"),
             "LOCK-PROV-FIELD-ARITY"
         );
         assert_eq!(
-            code_of("version 1\ndep \"foo\" {\n    provenance {\n        url \"https://e/x.git\"\n    }\n}\n"),
+            code_of("version 1\nstrategy \"maxver\"\ndep \"foo\" {\n    provenance {\n        url \"https://e/x.git\"\n    }\n}\n"),
             "LOCK-PROV-KIND-MISSING"
         );
+        // LOCK-PROV-KIND-UNKNOWN: origin present but unknown kind.
         assert_eq!(
-            code_of("version 1\ndep \"foo\" {\n    provenance {\n        kind \"ftp\"\n    }\n}\n"),
+            code_of("version 1\nstrategy \"maxver\"\ndep \"foo\" {\n    provenance {\n        origin \"observed\"\n        kind \"ftp\"\n    }\n}\n"),
             "LOCK-PROV-KIND-UNKNOWN"
         );
+        // LOCK-PROV-FIELD-MISSING: kind present, origin missing (S3 strict).
         assert_eq!(
-            code_of("version 1\ndep \"foo\" {\n    provenance {\n        kind \"git\"\n        ref \"main\"\n    }\n}\n"),
+            code_of("version 1\nstrategy \"maxver\"\ndep \"foo\" {\n    provenance {\n        kind \"git\"\n    }\n}\n"),
+            "LOCK-PROV-FIELD-MISSING"
+        );
+        // LOCK-PROV-FIELD-MISSING: origin present, url missing.
+        assert_eq!(
+            code_of("version 1\nstrategy \"maxver\"\ndep \"foo\" {\n    provenance {\n        origin \"observed\"\n        kind \"git\"\n        ref \"main\"\n    }\n}\n"),
             "LOCK-PROV-FIELD-MISSING"
         );
         // LOCK-SUBMODULE-FIELD-INVALID: submodule node with zero args (missing path).
         assert_eq!(
             code_of(
-                "version 1\ndep \"foo\" {\n    provenance {\n        kind \"git\"\n        \
+                "version 1\nstrategy \"maxver\"\ndep \"foo\" {\n    provenance {\n        origin \"observed\"\n        kind \"git\"\n        \
                  url \"https://e/x.git\"\n        submodule sha=\"abc\"\n    }\n}\n"
             ),
             "LOCK-SUBMODULE-FIELD-INVALID"
@@ -1577,14 +1617,14 @@ mod tests {
         // LOCK-SUBMODULE-FIELD-INVALID: submodule node missing sha= property.
         assert_eq!(
             code_of(
-                "version 1\ndep \"foo\" {\n    provenance {\n        kind \"git\"\n        \
+                "version 1\nstrategy \"maxver\"\ndep \"foo\" {\n    provenance {\n        origin \"observed\"\n        kind \"git\"\n        \
                  url \"https://e/x.git\"\n        submodule \"vendor/lib\"\n    }\n}\n"
             ),
             "LOCK-SUBMODULE-FIELD-INVALID"
         );
         // Scalar-field arity errors still use LOCK-PROV-FIELD-ARITY (not the new slug).
         assert_eq!(
-            code_of("version 1\ndep \"foo\" {\n    provenance {\n        kind \"git\" \"extra\"\n    }\n}\n"),
+            code_of("version 1\nstrategy \"maxver\"\ndep \"foo\" {\n    provenance {\n        kind \"git\" \"extra\"\n    }\n}\n"),
             "LOCK-PROV-FIELD-ARITY"
         );
     }
@@ -1599,6 +1639,7 @@ mod tests {
             strategy: "maxver".into(),
             deps: vec![LockedDep {
                 name: "foo".into(),
+                namespace: None,
                 identity: Some(VALID_ID.into()),
                 version: "1.2.3".into(),
                 src_dir: "src".into(),
@@ -1665,6 +1706,7 @@ mod tests {
             strategy: "maxver".into(),
             deps: vec![LockedDep {
                 name: "foo".into(),
+                namespace: None,
                 identity: None,
                 version: "0.0.1".into(),
                 src_dir: String::new(),
@@ -1705,6 +1747,7 @@ mod tests {
             strategy: "maxver".into(),
             deps: vec![LockedDep {
                 name: "safe-name".into(),  // must be clean: LOCK-DEP-NAME-INVALID rejects non-charset chars
+                namespace: None,
                 identity: None,
                 version: nasty.into(),
                 src_dir: String::new(), // must be clean: LOCK-SRC-DIR-UNSAFE rejects control chars
@@ -1755,6 +1798,7 @@ mod tests {
             strategy: "maxver".into(),
             deps: vec![LockedDep {
                 name: "foo".into(),
+                namespace: None,
                 identity: None,
                 version: "0.0.1".into(),
                 src_dir: String::new(),
@@ -1817,12 +1861,6 @@ mod tests {
                 digest: "sha256:d".into(),
                 origin: "observed".into(),
             },
-            ProvenanceRecord::Registry {
-                name: "n".into(),
-                tag: Some("v1".into()),
-                commit_sha: None,
-                origin: "observed".into(),
-            },
         ];
         for prov in kinds {
             let lock = Lockfile {
@@ -1830,6 +1868,7 @@ mod tests {
                 strategy: "maxver".into(),
                 deps: vec![LockedDep {
                     name: "foo".into(),
+                    namespace: None,
                     identity: None,
                     version: "0.0.1".into(),
                     src_dir: String::new(),
@@ -1874,6 +1913,7 @@ mod tests {
     fn rdep(name: &str, prov: ProvenanceRecord, requires: Vec<&str>) -> ResolvedDep {
         ResolvedDep {
             name: name.into(),
+            namespace: None,
             identity: format!("sha256:{}", "0".repeat(63) + "1"),
             version: Version::release(0, 0, 1),
             src_dir: "src".into(),
@@ -2088,6 +2128,7 @@ mod tests {
             strategy: "maxver".into(),
             deps: vec![LockedDep {
                 name: "foo".into(),
+                namespace: None,
                 identity: Some("sha256:00".into()),
                 version: "0.0.1".into(),
                 src_dir: String::new(),
@@ -2115,6 +2156,7 @@ mod tests {
     fn make_verify_dep(name: &str, aliases: Vec<String>) -> LockedDep {
         LockedDep {
             name: name.into(),
+            namespace: None,
             identity: Some(VALID_ID.into()),
             version: "1.0.0".into(),
             src_dir: String::new(),
@@ -2462,6 +2504,7 @@ mod tests {
     fn make_verify_dep_multi_prov(name: &str, identity: &str) -> LockedDep {
         LockedDep {
             name: name.into(),
+            namespace: None,
             identity: Some(identity.into()),
             version: "1.0.0".into(),
             src_dir: String::new(),
@@ -2591,6 +2634,7 @@ mod tests {
             strategy: "maxver".into(),
             deps: vec![LockedDep {
                 name: "foo".into(),
+                namespace: None,
                 identity: Some(actual_identity),
                 version: "1.0.0".into(),
                 src_dir: String::new(),
@@ -2648,6 +2692,7 @@ mod tests {
     fn make_locked(cond_requires: Vec<milpa_types::CondRequire>) -> LockedDep {
         LockedDep {
             name: "qux".into(),
+            namespace: None,
             identity: Some(VALID_ID.into()),
             version: "1.0.0".into(),
             src_dir: "src".into(),
@@ -2751,6 +2796,7 @@ mod tests {
              \x20   requires \"bar\" \"extra\"\n\
              \x20   cond-require \"extra\" platform=\"linux\"\n\
              \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
              \x20       kind \"git\"\n\
              \x20       url \"https://example.com/qux.git\"\n\
              \x20   }}\n\
@@ -2781,6 +2827,7 @@ mod tests {
              \x20   requires \"bar\" \"extra\"\n\
              \x20   cond-require \"extra\" platform=(not)\"linux\"\n\
              \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
              \x20       kind \"git\"\n\
              \x20       url \"https://example.com/qux.git\"\n\
              \x20   }}\n\
@@ -2807,6 +2854,7 @@ mod tests {
              \x20       when platform=(not)\"linux\"\n\
              \x20   }}\n\
              \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
              \x20       kind \"git\"\n\
              \x20       url \"https://example.com/qux.git\"\n\
              \x20   }}\n\
@@ -2925,12 +2973,14 @@ mod tests {
         // None → not appended).
         let sample = format!(
             "version 1\n\
+             strategy \"maxver\"\n\
              dep \"foo\" {{\n\
              \x20   version \"0.0.1\"\n\
              \x20   src_dir \"\"\n\
              \x20   requires\n\
              \x20   cond-require \"bar\" evilkey=\"value\"\n\
              \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
              \x20       kind \"local\"\n\
              \x20       path \"../foo\"\n\
              \x20   }}\n\
@@ -2950,6 +3000,7 @@ mod tests {
         // Block-form when-child with an unknown key is also dropped.
         let sample = format!(
             "version 1\n\
+             strategy \"maxver\"\n\
              dep \"foo\" {{\n\
              \x20   version \"0.0.1\"\n\
              \x20   src_dir \"\"\n\
@@ -2958,6 +3009,7 @@ mod tests {
              \x20       when evilkey=\"value\"\n\
              \x20   }}\n\
              \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
              \x20       kind \"local\"\n\
              \x20       path \"../foo\"\n\
              \x20   }}\n\
@@ -2976,12 +3028,14 @@ mod tests {
         // A cond-require with a known key (platform) must be accepted.
         let sample = format!(
             "version 1\n\
+             strategy \"maxver\"\n\
              dep \"foo\" {{\n\
              \x20   version \"0.0.1\"\n\
              \x20   src_dir \"\"\n\
              \x20   requires\n\
              \x20   cond-require \"bar\" platform=\"linux\"\n\
              \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
              \x20       kind \"local\"\n\
              \x20       path \"../foo\"\n\
              \x20   }}\n\
@@ -3033,12 +3087,14 @@ mod tests {
         // cond-require node with no positional arg → None → not appended.
         let sample = format!(
             "version 1\n\
+             strategy \"maxver\"\n\
              dep \"foo\" {{\n\
              \x20   version \"0.0.1\"\n\
              \x20   src_dir \"\"\n\
              \x20   requires\n\
              \x20   cond-require platform=\"linux\"\n\
              \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
              \x20       kind \"local\"\n\
              \x20       path \"../foo\"\n\
              \x20   }}\n\
@@ -3054,6 +3110,7 @@ mod tests {
         // A block child that is NOT "when" must be silently skipped (forward compat).
         let sample = format!(
             "version 1\n\
+             strategy \"maxver\"\n\
              dep \"foo\" {{\n\
              \x20   version \"0.0.1\"\n\
              \x20   src_dir \"\"\n\
@@ -3063,6 +3120,7 @@ mod tests {
              \x20       when platform=\"macosx\"\n\
              \x20   }}\n\
              \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
              \x20       kind \"local\"\n\
              \x20       path \"../foo\"\n\
              \x20   }}\n\
@@ -3081,6 +3139,7 @@ mod tests {
         // A "when" child with no recognised props → empty predicates → CondRequire is None.
         let sample = format!(
             "version 1\n\
+             strategy \"maxver\"\n\
              dep \"foo\" {{\n\
              \x20   version \"0.0.1\"\n\
              \x20   src_dir \"\"\n\
@@ -3089,6 +3148,7 @@ mod tests {
              \x20       when\n\
              \x20   }}\n\
              \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
              \x20       kind \"local\"\n\
              \x20       path \"../foo\"\n\
              \x20   }}\n\
@@ -3106,6 +3166,7 @@ mod tests {
     fn make_locked_with_aliases(aliases: Vec<String>) -> LockedDep {
         LockedDep {
             name: "foo".into(),
+            namespace: None,
             identity: Some(VALID_ID.into()),
             version: "1.0.0".into(),
             src_dir: "src".into(),
@@ -3154,6 +3215,7 @@ mod tests {
         // Field order: requires → cond-require* → aliases → active_flags
         let dep = LockedDep {
             name: "foo".into(),
+            namespace: None,
             identity: Some(VALID_ID.into()),
             version: "1.0.0".into(),
             src_dir: "src".into(),
@@ -3205,6 +3267,7 @@ mod tests {
              \x20   requires\n\
              \x20   aliases \"zebra\" \"alpha\"\n\
              \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
              \x20       kind \"git\"\n\
              \x20       url \"https://example.com/foo.git\"\n\
              \x20   }}\n\
@@ -3313,6 +3376,7 @@ mod tests {
     fn local_locked_dep(name: &str, path: &str) -> LockedDep {
         LockedDep {
             name: name.to_string(),
+            namespace: None,
             identity: None, // local deps carry NO identity
             version: "0.0.1".to_string(),
             src_dir: String::new(),
@@ -3469,6 +3533,7 @@ mod tests {
     fn make_locked_dep(name: &str, identity: Option<&str>, provs: Vec<ProvenanceRecord>) -> LockedDep {
         LockedDep {
             name: name.into(),
+            namespace: None,
             version: "1.0.0".into(),
             src_dir: "src".into(),
             requires: vec![],

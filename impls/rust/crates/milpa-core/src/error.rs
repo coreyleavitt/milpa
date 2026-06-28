@@ -127,6 +127,7 @@ impl CoreError {
             "LOCK-PROV-KIND-MISSING",
             "LOCK-PROV-KIND-UNKNOWN",
             "LOCK-PROV-FIELD-MISSING",
+            "LOCK-STRATEGY-MISSING",
             // lockfile dep name/alias charset validation (mirrors MAN-DEP-NAME-INVALID;
             // R8-S1 security fix — path traversal + nim.cfg injection via poisoned lock).
             "LOCK-DEP-NAME-INVALID",
@@ -182,7 +183,6 @@ impl CoreError {
             "FROZEN-MEMBER-DEP",
             "FROZEN-LOCAL-DEP",
             "FROZEN-IDENTITY-NOT-IN-STORE",
-            "FROZEN-LEGACY-REGISTRY-PROVENANCE",
             // workspace-frozen disqualifications (S11b)
             "FROZEN-MEMBER-NOT-IN-WORKSPACE",
             "FROZEN-MEMBER-IDENTITY-DRIFT",

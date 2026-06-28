@@ -110,8 +110,7 @@ dep "depname2" { ... }
 > NORMATIVE: A lockfile MUST contain exactly one top-level `strategy` node
 > carrying one string argument naming the resolution strategy used to produce
 > this lockfile (e.g. `"maxver"`). A conformant emitter always writes this node;
-> the parser MUST still default to `"maxver"` when the node is absent, to
-> tolerate any pre-v1.0 lockfiles that predate this requirement.
+> the parser MUST raise `LOCK-STRATEGY-MISSING` when the node is absent.
 
 > NOTE: `strategy` is recorded for diagnostics and for the frozen fast-path
 > strategy-match check (`FROZEN-STRATEGY-MISMATCH`). It does not change how the
@@ -150,6 +149,10 @@ dep "depname2" { ... }
 >
 > **Dep-block child field layout (4-space indent):**
 >
+> - `    namespace "<ns>"` — emitted as the FIRST child node ONLY for
+>   namespace-qualified named deps. Absent (entirely omitted) for bare deps.
+>   A `dep "bar" { namespace "ns1"; ... }` node is a distinct dep from a
+>   `dep "bar" { ... }` node with no namespace (two different packages).
 > - `    identity "<sha256:64hex>"` — emitted only for identity-bearing dep kinds
 >   (`git` / `tarball` / `oci` / `member`; see §3.1 and `spec/identity.md §4.1`);
 >   absent **only** for `local` deps.
@@ -157,7 +160,9 @@ dep "depname2" { ... }
 > - `    src_dir "<path>"` — always emitted (empty string → `src_dir ""`).
 > - `    requires` (bare, no arguments) when the dep has no transitive deps;
 >   otherwise `    requires "<dep1>" "<dep2>" ...` with args in lexicographic
->   order, space-separated, each double-quoted.
+>   order, space-separated, each double-quoted. For qualified deps, the arg
+>   uses slash-separated form: `"ns/name"` (e.g. `requires "ns1/baz"`).
+>   The solver-internal `::` separator MUST NOT appear here.
 > - Zero or more `    cond-require ...` nodes (§3.5) — emitted immediately
 >   after `requires`, sorted lexicographically by name; omitted entirely when
 >   the dep has no conditional require annotations.
@@ -168,8 +173,7 @@ dep "depname2" { ... }
 >   are double-quoted and space-separated.
 > - One or more `    provenance {` blocks — emitted in canonical sorted order
 >   (see §4 for the sort key). The emitter MUST NOT write a `self_mirrors`
->   node; the parser MUST convert any legacy `self_mirrors` node to declared
->   provenance records (see §3.7 read-compat).
+>   node (see §3.7).
 >
 > **Provenance child field layout (8-space indent):**
 >
@@ -210,14 +214,14 @@ Each `dep` node contains the following child nodes:
 
 ```kdl
 dep "depname" {
+    namespace "optional-ns"              // omitted for bare deps; FIRST when present
     identity "sha256:<64-hex>"
     version "1.2.3"
     src_dir "src"
-    requires "dep1" "dep2"
+    requires "dep1" "ns2/dep2"          // qualified dep refs use "ns/name" slash form
     cond-require "dep2" platform="linux"  // additive; omitted when empty (§3.5)
     aliases "alt-name" "other-name"       // omitted when empty (§3.8)
     active_flags "flag1"                  // omitted when empty
-    self_mirrors (url)"https://..."       // omitted when empty
     provenance {
         kind "git"
         url "https://..."
@@ -468,20 +472,15 @@ dep "pkg" {
 > keep diffs minimal. When present, arguments MUST be emitted in
 > lexicographically sorted order (Unicode codepoint order).
 
-### 3.7  `self_mirrors` field (read-compat only; removed from schema)
+### 3.7  `self_mirrors` field (removed)
 
 > NORMATIVE: The `self_mirrors` field was removed from the lockfile schema in
 > Phase D (D-provenance). Self-mirror URLs are now stored as provenance records
 > with `origin "declared"` (see §4). The emitter MUST NOT write a `self_mirrors`
-> node. On parse, if a dep block contains an old `self_mirrors` node (legacy
-> lockfiles), the parser MUST convert each URL to a `GitProvenanceRecord` with
-> `origin="declared"`, `url=<the url>`, `ref=None`, `commit_sha=None`, and append
-> it to the dep's `provenances` list. This conversion is transparent — the
-> re-emitted lockfile has no `self_mirrors` node and instead has declared
-> provenance blocks in canonical sort order.
-
-> NOTE: This read-compat conversion requires no schema version bump (purely
-> additive parse-path; no emitter changes beyond "never write self_mirrors").
+> node. On parse, any `self_mirrors` node in a dep block is silently ignored
+> (treated as an unknown node; KDL 2.0 forward-compat skip). The pre-v1
+> read-compat conversion shim has been deleted; old lockfiles with `self_mirrors`
+> must be regenerated via `milpa fetch`.
 
 ### 3.8  `aliases` field (optional, Phase B)
 
@@ -516,9 +515,8 @@ The blocks' children are scalar fields.
 > (first) and a `kind` child node (second). `origin` MUST be either
 > `"observed"` (milpa fetched these bytes and verified they hash to the
 > recorded identity) or `"declared"` (an author-claimed mirror location,
-> unverified until first use). Absent `origin` on parse MUST default to
-> `"observed"` (back-compat: existing lockfiles without `origin` are all
-> observed). `origin` MUST be emitted always — never omitted.
+> unverified until first use). Absent `origin` on parse MUST raise
+> `LOCK-PROV-FIELD-MISSING`. `origin` MUST be emitted always — never omitted.
 
 > NORMATIVE: `observed` / `declared` is a **per-lockfile annotation**, never
 > a CAS-entry property. The CAS holds bytes only. Concurrent projects sharing
@@ -575,14 +573,13 @@ prior lockfile appended). It tries candidates in order until one succeeds.
 >
 > - `origin_rank`: `"declared"` → 0, `"observed"` → 1 (declared before observed)
 > - `kind_rank`: `"git"` → 0, `"tarball"` → 1, `"oci"` → 2, `"local"` → 3,
->   `"member"` → 4, `"registry"` → 5, any future kind appended after 5
+>   `"member"` → 4, any future kind appended after 4
 > - `(primary, secondary)` per kind (bytewise over the post-escape KDL string form):
 >   - `git`: `(url, ref or "")`
 >   - `tarball`: `(url, "")`
 >   - `oci`: `(registry + "/" + repository, digest)`
 >   - `local`: `(path, "")`
 >   - `member`: `(name, "")`
->   - `registry`: `(name, tag or "")`
 >
 > All string comparisons are bytewise (lexicographic over UTF-8 bytes).
 
@@ -593,8 +590,8 @@ default to `null`.
 ### 4.1  `git` provenance
 
 Used for `git=...` URL deps and named deps resolved via the tianguis index to a
-git URL. Also used for self-mirrors converted from legacy `self_mirrors` nodes
-(origin `"declared"`, ref/commit_sha empty/absent).
+git URL. Also used for declared mirror provenances (origin `"declared"`,
+ref/commit_sha empty/absent).
 
 | Field | Required | Type | Semantics |
 |---|---|---|---|
@@ -693,20 +690,6 @@ Used for OCI-artifact deps resolved via the tianguis index to an OCI registry.
 > NORMATIVE: All three fields — `registry`, `repository`, `digest` — are
 > required; the absence of any raises `LOCK-PROV-FIELD-MISSING`.
 
-### 4.6  `registry` provenance (read-compat only)
-
-> NOTE: The `registry` kind was emitted by milpa prior to issue #97. The
-> writer never emits it any longer — named deps now resolve to `git` or `oci`
-> records via the tianguis index. The parser MUST still accept `registry`
-> provenance blocks in existing lockfiles to preserve read-compat. The
-> `RegistryProvenanceRecord` dataclass is retained until straggler old lockfiles
-> are regenerated; it will be removed in a future schema version.
-
-Fields: `kind "registry"`, `name` (required), `tag` (optional), `commit_sha`
-(optional). A lockfile containing a `registry` provenance entry on the frozen
-fast-path raises `FROZEN-LEGACY-REGISTRY-PROVENANCE` — the user must run
-`milpa update <name>` to re-resolve via tianguis.
-
 ---
 
 ## 5  Tarball TOFU first-use pinning
@@ -786,10 +769,10 @@ at the contract level; implementation detail is incidental.
 > - **Non-identity-bearing provenance** (`kind = "local"` — the only
 >   non-identity-bearing kind): check liveness only — see §6.2.1 below. There is
 >   NO content hash comparison for `local` deps.
-> - **Identity-bearing provenance** (`git`, `tarball`, `oci`, `member`,
->   `registry`): apply the four-state structural check and identity hash-compare
->   described in §6.2.2 below. Note `member` is identity-bearing despite not being
->   CAS-admissible — see `spec/identity.md §4.1` and §6.3 for its routing.
+> - **Identity-bearing provenance** (`git`, `tarball`, `oci`, `member`): apply the
+>   four-state structural check and identity hash-compare described in §6.2.2
+>   below. Note `member` is identity-bearing despite not being CAS-admissible —
+>   see `spec/identity.md §4.1` and §6.3 for its routing.
 
 #### 6.2.1  Non-identity-bearing dep liveness check
 
@@ -1132,5 +1115,10 @@ All error codes in this section are defined in `spec/errors.md`.
 
 | Code | Condition |
 |---|---|
-| `FROZEN-LEGACY-REGISTRY-PROVENANCE` | Lockfile entry has `registry` provenance; re-resolve required |
 | `FROZEN-STRATEGY-MISMATCH` | Requested strategy differs from lockfile's recorded strategy |
+
+**Lockfile strategy:**
+
+| Code | Condition |
+|---|---|
+| `LOCK-STRATEGY-MISSING` | Top-level `strategy` node absent |

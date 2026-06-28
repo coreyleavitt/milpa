@@ -1,0 +1,5 @@
+name "myapp"
+kind "application"
+deps {
+    foo git="https://github.com/example/foo.git" ref="main"
+}

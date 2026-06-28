@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from milpa.lockfile import MemberProvenanceRecord, ResolvedDep, ResolvedGraph
+from milpa.version import dep_dir_name
 
 if TYPE_CHECKING:
     from milpa.workspace import LoadedMember, LoadedWorkspace
@@ -85,8 +86,10 @@ def format_nimcfg(
     if self_src_dir:
         path_lines.append(f'--path:"{self_src_dir}"')
 
-    # Lexicographic by dep name — spec's single canonical ordering rule.
-    ordered = sorted(graph.deps, key=lambda d: d.name)
+    # Lexicographic by dep_dir_name — spec's single canonical ordering rule.
+    # For qualified deps, sort by ``@<ns>/<name>`` so the order matches the
+    # on-disk layout and the lockfile sort order (both use dep_dir_name).
+    ordered = sorted(graph.deps, key=lambda d: dep_dir_name(d.name, d.namespace))
     for dep in ordered:
         path_lines.append(f'--path:"{_path_for(dep, deps_dir)}"')
         # B-nimcfg: emit one --path: per alias (lex-sorted, already sorted on dep).
@@ -145,7 +148,9 @@ def build_flag_defines(
 
     result: dict[str, dict[str, tuple[str, ...]]] = {}
     for dep in graph.deps:
-        dep_manifest = deps_dir / dep.name / "milpa.kdl"
+        # C1: qualified deps live at ``@<ns>/<name>/``, not ``<name>/``.
+        _dir_entry = dep_dir_name(dep.name, dep.namespace)
+        dep_manifest = deps_dir / _dir_entry / "milpa.kdl"
         if not dep_manifest.is_file():
             continue
         try:
@@ -157,12 +162,16 @@ def build_flag_defines(
 
 
 def _path_for(dep: ResolvedDep, deps_dir: Path) -> str:
-    """Compute ``<deps_dir>/<name>[/<src_dir>]`` in POSIX form (§7.3).
+    """Compute ``<deps_dir>/<dir_entry>[/<src_dir>]`` in POSIX form (§7.3).
 
     *deps_dir* may be a relative Path like ``Path("_deps")``; ``as_posix()``
-    yields ``"_deps"`` which is correct. An absolute Path gives ``"/abs/path"``.
+    yields ``"_deps"`` which is correct.  An absolute Path gives ``"/abs/path"``.
+
+    C1 (rfc-resolver-correctness.md): uses ``dep_dir_name`` so qualified deps
+    emit ``--path:"_deps/@<ns>/<name>[/src]"`` (Windows-safe, no ``::``).
     """
-    base = deps_dir.as_posix() + "/" + dep.name
+    _dir_entry = dep_dir_name(dep.name, dep.namespace)
+    base = deps_dir.as_posix() + "/" + _dir_entry
     if dep.src_dir:
         base += "/" + dep.src_dir
     return base
@@ -290,7 +299,9 @@ def _dep_target(
     if _is_member_dep(dep) and dep.name in member_by_name:
         base: Path = member_by_name[dep.name].abs_dir
     else:
-        base = workspace_root / "_deps" / dep.name
+        # C1: qualified deps live at ``_deps/@<ns>/<name>``.
+        _dir_entry = dep_dir_name(dep.name, dep.namespace)
+        base = workspace_root / "_deps" / _dir_entry
 
     if dep.src_dir:
         return base / dep.src_dir

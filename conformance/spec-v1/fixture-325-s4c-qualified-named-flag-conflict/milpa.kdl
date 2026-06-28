@@ -1,0 +1,5 @@
+name "myapp"
+kind "application"
+deps {
+    bar namespace="ns1" ">= 1.0.0"
+}

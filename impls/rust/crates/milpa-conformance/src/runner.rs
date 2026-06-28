@@ -359,13 +359,27 @@ pub fn read_deps_structure(deps_dir: &Path, cas_root: &Path) -> std::io::Result<
         .to_string_lossy()
         .into_owned();
 
+    // Collect (label, path) pairs — recurse one level into @ns/ directories.
+    // C1: namespace directories ("@<ns>/") hold the actual per-dep symlinks;
+    // emit them as "@ns/name -> ..." consistent with fixture _deps_structure.txt.
     let mut entries: Vec<(String, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(deps_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
-            let name = entry.file_name().to_string_lossy().into_owned();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
             entries.push((name, path));
+        } else if meta.file_type().is_dir() && name.starts_with('@') {
+            // Namespace directory: recurse one level and collect children.
+            for child in std::fs::read_dir(&path)?.flatten() {
+                let child_path = child.path();
+                let child_name = child.file_name().to_string_lossy().into_owned();
+                let child_meta = std::fs::symlink_metadata(&child_path)?;
+                if child_meta.file_type().is_symlink() {
+                    entries.push((format!("{}/{}", name, child_name), child_path));
+                }
+            }
         }
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));

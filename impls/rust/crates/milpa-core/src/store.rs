@@ -289,6 +289,13 @@ impl CaStore {
         }
         clear_dest(target)?;
         let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        // C1: parent may be an @ns/ dir that does not yet exist on first fetch.
+        std::fs::create_dir_all(parent).map_err(|e| {
+            CoreError::Identity(
+                INTERNAL_IO,
+                format!("cannot create parent dir {}: {e}", parent.display()),
+            )
+        })?;
         let rel = relpath(&canonical, parent);
         std::os::unix::fs::symlink(&rel, target).map_err(|e| {
             CoreError::Identity(

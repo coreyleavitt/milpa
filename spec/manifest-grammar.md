@@ -25,13 +25,15 @@ A conformant implementation of this spec MUST:
 3. Accept the top-level nodes of a package manifest (`name`, `kind`, `deps`,
    `dev-deps`, `overrides`, `src_dir`, `flags`, `mirrors`, `cas`,
    `spec-version`); reject unknown nodes with `MAN-UNKNOWN-TOP-LEVEL`.
-4. Accept URLs in both bare-string and `(url)`-annotated form; normalize to a
+4. Require the `(url)` annotation on all URL fields (`git=`, `tarball=`, `mirror`); normalize to a
    URL string internally; reject other types with `MAN-URL-ARG-TYPE`.
 5. Parse all five dep forms (URL, named, local, tarball, member) using the
    disambiguating properties described in §3.
 6. Enforce that dep names are unique **within** each of `deps` and `dev-deps`
    independently (`MAN-DEP-DUPLICATE`); the same name in both blocks is valid
-   (§3.3).
+   (§3.3). For NamedDeps, uniqueness is by `(namespace, name)` pair (the
+   solver variable) — two deps with the same bare name but different namespaces
+   are distinct (S5b: `ns1/bar` and `ns2/bar` are not duplicates).
 7. Parse the P3 provenance-descriptor model (§4): closed meta-grammar, the four
    declared kinds (`git`, `local`, `tarball`, `oci`), and the three behavioral
    properties (parse-always, verify-always, fetch-fails-precisely).
@@ -94,23 +96,21 @@ A conformant implementation of this spec MUST:
 KDL 2.0 supports optional type annotations on values: `(tag)"value"`. milpa
 uses the `(url)` annotation to mark URL strings.
 
-> NORMATIVE: A parser MUST accept both forms for any URL-typed field:
+> NORMATIVE: A parser MUST require the `(url)` annotation on all URL-typed
+> fields (`git=`, `tarball=`, and `mirror`). The canonical form is:
 >
-> - Plain string: `git="https://github.com/foo/bar.git"`
-> - `(url)`-annotated: `git=(url)"https://github.com/foo/bar.git"`
+> - `git=(url)"https://github.com/foo/bar.git"`
 >
-> Both MUST be treated identically after normalization to a plain URL string.
-> Any other type annotation on a URL position MUST raise `MAN-URL-ARG-TYPE`.
+> A plain (unannotated) string at a URL position MUST raise `MAN-URL-ARG-TYPE`.
+> Any type annotation other than `(url)` on a URL position MUST also raise
+> `MAN-URL-ARG-TYPE`.
 
 > NORMATIVE: A serializer (formatter) MUST emit the `(url)` annotation on all
-> URL-valued fields in generated output. This is a documentation convention,
-> not a parse requirement, but machine-written files MUST follow it for
-> interoperability.
+> URL-valued fields in generated output. This matches the strict parse requirement.
 
 > NOTE: The reference Python serializer (`format_manifest`) emits `(url)` on
-> every `git=`, `tarball=`, and `mirror` URL. The parser accepts both forms via
-> `_url_arg` which coerces a kdl-py `ParseResult` (the product of `(url)` parsing)
-> back to a plain string.
+> every `git=`, `tarball=`, and `mirror` URL. The parser requires the `(url)`
+> annotation via `_kdl_entry_as_url` in `kdl_io.py`.
 
 ---
 
@@ -174,8 +174,9 @@ uses the `(url)` annotation to mark URL strings.
 
 > NORMATIVE: The `mirrors` block declares alternative URLs where **this
 > package** is hosted. Each child node MUST be named `mirror` and carry exactly
-> one URL argument (plain string or `(url)`-annotated). Unknown child names raise
-> `MAN-MIRRORS-UNKNOWN-CHILD`; wrong arity raises `MAN-MIRRORS-ARITY`.
+> one `(url)`-annotated URL argument. Unknown child names raise
+> `MAN-MIRRORS-UNKNOWN-CHILD`; wrong arity raises `MAN-MIRRORS-ARITY`; a plain
+> (unannotated) string raises `MAN-URL-ARG-TYPE`.
 
 ### 3.2  The `deps` block
 
@@ -227,16 +228,64 @@ Grammar: `<name> git=(url)"<URL>" ref="<git-ref>" [<predicate-props>] [{ … }]`
 
 #### NamedDep
 
-Grammar: `<name> ["<version-constraint>"]`
+Grammar:
+
+```kdl
+// Canonical form — namespace= attribute
+<name> [namespace="<ns>"] ["<version-constraint>"]
+
+// Slash-shorthand sugar — desugars at parse time to the canonical form
+"<ns>/<name>" ["<version-constraint>"]
+```
 
 > NORMATIVE: A NamedDep MUST have zero or one positional string argument (the
 > version constraint). More than one positional arg raises `MAN-DEP-NAMED-ARITY`;
-> a non-string arg raises `MAN-DEP-NAMED-CONSTRAINT`. Any property (other than
-> `git=`, which routes to UrlDep) raises `MAN-DEP-NAMED-PROPS`.
+> a non-string arg raises `MAN-DEP-NAMED-CONSTRAINT`. Any property other than
+> `git=` (which routes to UrlDep), `optional=`, and `namespace=` raises
+> `MAN-DEP-NAMED-PROPS`.
+
+> NORMATIVE (S5b — namespace-qualified named deps): A NamedDep MAY carry a
+> `namespace=` attribute whose value is a non-empty string matching the dep-name
+> charset `[A-Za-z0-9_-]+`. An empty or non-string `namespace=` value raises
+> `MAN-DEP-NAMED-PROPS`; a non-empty value that violates the charset raises
+> `MAN-DEP-NAME-INVALID`.
+>
+> Alternatively, the node name MAY use the **slash shorthand** syntax
+> `"<ns>/<name>"` where both `<ns>` and `<name>` are non-empty and contain
+> no further slashes. The parser MUST desugar this form at parse time into
+> separate `namespace` + `name` fields. A name with more than one slash
+> (e.g. `"a/b/c"`) or with an empty segment MUST raise `MAN-DEP-NAME-INVALID`.
+>
+> **M2 — disagreement rule (NORMATIVE):** If BOTH the slash shorthand AND
+> a `namespace=` attribute are present on the same dep, the parser MUST check
+> that the two namespace values agree. If they agree, the result is identical
+> to either form alone (no error). If they DISAGREE, the parser MUST raise
+> `MAN-DEP-NAME-INVALID`. Using both forms with the same namespace is
+> redundant but not an error. Example (raises `MAN-DEP-NAME-INVALID`):
+> `"ns1/bar" namespace="ns2"` (slash says ns1, attribute says ns2).
+>
+> Two NamedDeps with the same bare `<name>` but different `<namespace>` values
+> are **distinct deps** (`DepKey = (namespace, name)`) and MUST NOT be flagged
+> as `MAN-DEP-DUPLICATE`.
+>
+> The **canonical serialization** of a qualified NamedDep is the `namespace=`
+> attribute form; the slash-shorthand MUST NOT appear in generated manifests.
+
+> NORMATIVE: The solver variable for a NamedDep is:
+> - Bare dep (no namespace): `<name>`
+> - Qualified dep (has namespace): `<namespace>::<name>`
+>
+> The solver variable is SOLVER-INTERNAL ONLY — it MUST NOT appear in the
+> lockfile, `_deps/` layout, `nim.cfg` paths, or the `requires` list.
+> See `spec/resolver-semantics.md §6b` and `§6c` for the correct serialized
+> forms of qualified dep names on each surface.
 
 > NOTE: NamedDeps are resolved against the tianguis index. The constraint
 > syntax is an opaque string passed to `VersionSet.from_constraint`; the
 > constraint grammar is defined in `spec/resolver-semantics.md` (S6).
+> Qualified NamedDeps use `lookup_qualified(ns, name)` which bypasses
+> `TNG-AMBIGUOUS-NAME`; bare NamedDeps use the standard `resolve_named`
+> path which may still raise `TNG-AMBIGUOUS-NAME` on collision.
 
 #### LocalDep
 
@@ -258,8 +307,9 @@ Grammar: `<name> local="<path>"`
 
 Grammar: `<name> tarball=(url)"<URL>" [sha256="<hex>"] [strip_components=<N>]`
 
-> NORMATIVE: A TarballDep MUST carry a `tarball=` URL (plain string or
-> `(url)`-annotated, non-empty). Empty or non-string raises `MAN-DEP-TARBALL-URL`.
+> NORMATIVE: A TarballDep MUST carry a `tarball=` URL (`(url)`-annotated,
+> non-empty). A plain (unannotated) string or non-string raises `MAN-URL-ARG-TYPE`;
+> an empty string raises `MAN-DEP-TARBALL-URL`.
 > Other permitted properties: `sha256` (optional string; raises
 > `MAN-DEP-TARBALL-SHA` if non-string when present) and `strip_components`
 > (optional non-negative integer; raises `MAN-DEP-TARBALL-STRIP` if negative,

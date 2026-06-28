@@ -1,0 +1,11 @@
+name "main-lib2"
+kind "library"
+flags {
+    experimental default=#false
+}
+deps {
+    corelib git=(url)"https://example.com/corelib.git" ref="main"
+    when flag="experimental" {
+        alib "^1.0.0"
+    }
+}
