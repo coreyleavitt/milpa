@@ -74,6 +74,9 @@ pub enum Produced {
     /// The `content_hash` field carries the computed hash for diagnostic output.
     /// `run_fixture` maps this to `Verdict::Pass` for success-expected fixtures.
     GitProtocolPass { content_hash: String },
+    /// H-infra: a `cmd=hash` run that passed the expected/stdout assertion.
+    /// The `identity` field carries the computed identity for diagnostic output.
+    HashPass { identity: String },
 }
 
 /// The implementation under test. The `Err` payload is the error **code**
@@ -195,6 +198,9 @@ pub fn run_fixture(fx: &Fixture, target: &dyn Target, scratch: &Scratch) -> Verd
         // inside run_git_protocol_fixture and returned as GitProtocolPass).
         // The fixture has no milpa.lock / nim.cfg / _deps_structure.txt to diff.
         (Expected::Success, Ok(Produced::GitProtocolPass { .. })) => Verdict::Pass,
+        // H-infra: hash fixture passed the expected/stdout assertion (checked
+        // inside run_hash_fixture and returned as HashPass).
+        (Expected::Success, Ok(Produced::HashPass { .. })) => Verdict::Pass,
     }
 }
 
@@ -954,6 +960,12 @@ impl Target for MilpaTarget {
             Cmd::GitProtocol => {
                 run_git_protocol_fixture(fx, scratch)
             }
+            // H-infra: hash fixtures exercise the milpa hash A0-cmd path.
+            // Same git-protocol.json schema; asserts expected/stdout matches
+            // the identity computed over the materialized tree.
+            Cmd::Hash => {
+                run_hash_fixture(fx, scratch)
+            }
             // CLI-only verbs are skipped by `run_fixture` before reaching the
             // Target; this arm exists only for match exhaustiveness.
             Cmd::CliOnly => Err(
@@ -1481,6 +1493,130 @@ fn run_git_protocol_fixture(fx: &Fixture, scratch: &Scratch) -> Result<Produced,
     // Return GitProtocolPass: git-protocol fixtures assert only content_hash.
     // run_fixture's (Expected::Success, Ok(Produced::GitProtocolPass { .. })) arm passes it.
     Ok(Produced::GitProtocolPass { content_hash: got_hash })
+}
+
+/// Execute a `hash` fixture end-to-end: build a local git repo, materialise the
+/// tree via `fetch_git`, compute the content identity, and assert it matches
+/// `expected/stdout`.
+///
+/// This pins the A0 `milpa hash <source-spec>` path:
+///   - `fetch_git` materialises the tree (same inner registry as `cmd_hash`).
+///   - `compute_content_hash(&dest)` gives the identity (identical to what
+///     `DefaultRegistry::fetch` sets as `Receipt::identity`, which is what
+///     `cmd_hash` reads and prints to stdout).
+///   - `expected/stdout` carries the expected `sha256:<64hex>` line.
+///
+/// Reuses the `git-protocol.json` schema and `make_git_protocol_repo` so
+/// fixtures can be authored with the same tooling as git-protocol fixtures.
+fn run_hash_fixture(fx: &Fixture, scratch: &Scratch) -> Result<Produced, String> {
+    // Parse git-protocol.json (same schema as git-protocol fixtures)
+    let spec_path = fx.dir.join("git-protocol.json");
+    let spec_text = std::fs::read_to_string(&spec_path)
+        .map_err(|e| format!("git-protocol.json missing or unreadable: {e}"))?;
+    let spec = serde_like::parse(&spec_text)
+        .map_err(|e| format!("git-protocol.json parse error: {e}"))?;
+
+    // Read expected stdout (sha256:<hex> for git sources, empty for local)
+    let expected_stdout_path = fx.dir.join("expected").join("stdout");
+    let expected_stdout = std::fs::read_to_string(&expected_stdout_path)
+        .map_err(|e| format!("expected/stdout missing or unreadable: {e}"))?
+        .trim()
+        .to_string();
+
+    let repos_spec = spec.get("repos")
+        .and_then(|v| v.as_arr())
+        .ok_or("git-protocol.json missing 'repos' array")?;
+    let fetch_spec = spec.get("fetch")
+        .and_then(|v| v.as_obj())
+        .ok_or("git-protocol.json missing 'fetch' object")?;
+
+    // Generate repos (reuse make_git_protocol_repo)
+    let repos_tmpdir = scratch.root.join("hash-git-repos");
+    std::fs::create_dir_all(&repos_tmpdir)
+        .map_err(|e| format!("create repos tmpdir: {e}"))?;
+
+    let mut repo_paths: std::collections::HashMap<String, std::path::PathBuf> =
+        std::collections::HashMap::new();
+    let mut repo_commit_shas: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for repo_spec in repos_spec {
+        let name = repo_spec.get("name").and_then(|v| v.as_str())
+            .ok_or("repo spec missing 'name'")?
+            .to_string();
+        let (repo_dir, shas) = make_git_protocol_repo(&repos_tmpdir, repo_spec)?;
+        repo_paths.insert(name.clone(), repo_dir);
+        repo_commit_shas.insert(name, shas);
+    }
+
+    let fetch_map: std::collections::HashMap<&str, &serde_like::Val> =
+        fetch_spec.iter().map(|(k, v)| (k.as_str(), v)).collect();
+
+    let repo_name = fetch_map.get("repo_name")
+        .and_then(|v| v.as_str())
+        .ok_or("fetch missing 'repo_name'")?;
+    let dep_name = fetch_map.get("dep_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("smoke");
+    let ref_spec = fetch_map.get("ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or("main");
+
+    let raw_commit_sha: Option<&str> = fetch_map.get("commit_sha")
+        .and_then(|v| if v.is_null() { None } else { v.as_str() });
+    let commit_sha: Option<String> = match raw_commit_sha {
+        None => None,
+        Some(s) if s.starts_with("@repo:") => {
+            let parts: Vec<&str> = s.splitn(4, ':').collect();
+            if parts.len() == 4 && parts[0] == "@repo" && parts[2] == "commit" {
+                let ref_repo = parts[1];
+                let idx: usize = parts[3].parse()
+                    .map_err(|_| format!("commit SHA reference {s:?}: index must be an integer"))?;
+                let sha_list = repo_commit_shas.get(ref_repo)
+                    .ok_or_else(|| format!("commit SHA reference {s:?}: repo {ref_repo:?} not found"))?;
+                Some(sha_list.get(idx)
+                    .ok_or_else(|| format!("commit SHA reference {s:?}: index {idx} out of range"))?
+                    .clone())
+            } else {
+                return Err(format!("commit SHA reference {s:?}: expected @repo:<name>:commit:<index>"));
+            }
+        }
+        Some(s) => Some(s.to_string()),
+    };
+
+    let target_repo = repo_paths.get(repo_name)
+        .ok_or_else(|| format!("fetch.repo_name {repo_name:?} not found in repos"))?;
+
+    let abs_repo = target_repo.canonicalize()
+        .map_err(|e| format!("canonicalize repo path: {e}"))?;
+    let file_url = format!("file://{}", abs_repo.to_string_lossy());
+
+    let dest = scratch.deps_dir.join(dep_name);
+
+    // Materialise the tree via the REAL fetch_git (same inner transport as cmd_hash)
+    milpa_core::fetchers::fetch_git(
+        dep_name,
+        &file_url,
+        ref_spec,
+        commit_sha.as_deref(),
+        &dest,
+    ).map_err(|e| format!("fetch_git failed [{}]: {:?}", e.code(), e))?;
+
+    // Compute the content identity — identical to what DefaultRegistry::fetch sets
+    // as Receipt::identity, which is what cmd_hash reads and prints to stdout.
+    // A0 architectural pin: MUST use compute_content_hash here, NOT receipt.identity
+    // from fetch_git (the low-level fn does not set identity; DefaultRegistry does).
+    let got_identity = milpa_core::compute_content_hash(&dest)
+        .map_err(|e| format!("compute_content_hash failed: {e:?}"))?;
+
+    if got_identity != expected_stdout {
+        return Err(format!(
+            "hash stdout mismatch:\n  expected: {expected_stdout:?}\n  actual:   {got_identity:?}\n  \
+             (fetch_git used file:// URL: {file_url:?})"
+        ));
+    }
+
+    // Return HashPass: hash fixtures assert only expected/stdout.
+    Ok(Produced::HashPass { identity: got_identity })
 }
 
 /// Parse the fixture's optional `env` file (KEY=VALUE per line) into a map.

@@ -309,8 +309,8 @@ fn resolve_single_url_dep_no_transitive() {
     let foo = &graph.deps[0];
     assert_eq!(foo.name, "foo");
     assert_eq!(foo.src_dir, "src");
-    assert!(foo.identity.starts_with("sha256:"));
-    assert_eq!(foo.identity.len(), "sha256:".len() + 64);
+    assert!(foo.identity.starts_with("dag-sha256:"));
+    assert_eq!(foo.identity.len(), "dag-sha256:".len() + 64);
     match foo.provenances.first().expect("at least one provenance") {
         ProvenanceRecord::Git {
             url,
@@ -524,7 +524,7 @@ fn s5b_phase_a_error_slug_divergence_spike() {
             namespace: String::new(),
             versions: vec![IndexVersion {
                 version: "1.0.0".to_string(),
-                content_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+                content_hash: "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
                     .to_string(),
                 provenances: vec![Provenance::Git {
                     url: "https://example.com/foo.git".into(),
@@ -981,7 +981,7 @@ fn resolve_prior_lockfile_pin_rejects_hostile_bytes() {
             name: "foo".into(),
             namespace: None,
             identity: Some(
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
+                "dag-sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
             ),
             version: "0.0.1".into(),
             src_dir: "src".into(),
@@ -1087,7 +1087,7 @@ fn prior_with_zero_identity(dep_name: &str, url: &str) -> Lockfile {
             name: dep_name.into(),
             namespace: None,
             identity: Some(
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
+                "dag-sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
             ),
             version: "0.0.1".into(),
             src_dir: "src".into(),

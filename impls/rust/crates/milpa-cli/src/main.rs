@@ -18,7 +18,8 @@ use milpa_core::{
     dep_decl_store::DepDeclStore, discover_manifest, effective_strict_policy,
     fetch::{FetchError, FetcherRegistry}, format_nimcfg, format_workspace_nimcfgs, from_graph,
     load_index, load_lockfile, load_manifest, load_workspace, LoadedMember, LoadedWorkspace,
-    make_dep_decl_store, mutate_manifest_file, parse_env_bool, parse_lockfile, parse_version,
+    make_dep_decl_store, mutate_manifest_file, parse_env_bool, parse_lockfile, parse_source_spec,
+    parse_version,
     resolve, resolve_with_cert, resolve_with_features, resolve_workspace_frozen,
     resolve_workspace_with_cert, resolve_workspace_with_features,
     verify_lockfile_against_deps, workspace_any_member_strict, write_lockfile, CaStore,
@@ -31,7 +32,7 @@ use milpa_manifest::{valid_flag_name, Dep, FlagRequest, Manifest, OverrideTarget
 const VERSION: &str = "0.1.0";
 
 const USAGE: &str = "usage: milpa [-C <dir>] [-j <N>] [-s <mode>] [--frozen] \
-[--no-index] [--certificate <path>] <fetch|lock|show|verify|clean|add|remove|update> [args]";
+[--no-index] [--certificate <path>] <fetch|lock|show|verify|clean|add|remove|update|hash> [args]";
 
 fn main() {
     // Gap-1 R4: catch any Rust panic, emit a human line + the machine-readable
@@ -122,6 +123,7 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
         "remove" => cmd_remove(dir, cli.strategy, &cli.rest, cli.no_index),
         "store" => cmd_store(&cli.rest),
         "workspace" => cmd_workspace(dir, &cli.rest, cli.strategy, cli.no_index),
+        "hash" => cmd_hash(&cli.rest, dir),
         other => {
             // Gap-1 §3: unknown verb is a usage error → exit 2 (no milpa-error: line).
             eprintln!("milpa: unknown command {other:?}\n{USAGE}");
@@ -459,6 +461,59 @@ fn cmd_clean(dir: &Path) -> Result<i32, MilpaError> {
         let _ = std::fs::remove_dir_all(dir.join("_deps"));
         let _ = std::fs::remove_file(dir.join("nim.cfg"));
     }
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// `milpa hash` — probe content identity without CAS side-effects (A0-cmd)
+// ---------------------------------------------------------------------------
+
+/// `milpa hash <token> [<token>...]` — parse the source spec tokens, fetch the
+/// source into a scratch temp dir via the **inner** (non-CAS) registry, print the
+/// content identity to stdout, then discard the temp dir.
+///
+/// Architectural pin (spec/cli-contract.md §5.11 NORMATIVE):
+///   - Identity is read from `Receipt::identity` — the field set by
+///     `DefaultRegistry::fetch` (the same site `milpa fetch` uses).
+///   - This function MUST NOT call `compute_content_hash` directly.
+///   - No `milpa.lock`, no `_deps/`, no CAS admission.
+///
+/// stdout: `sha256:<64hex>` (one line) for git/tarball/OCI sources;
+///         empty for local/editable sources (no stable identity).
+/// stderr: diagnostic on failure only.
+/// Exit: 0 on success; 1 on bad spec (CLI-SOURCE-SPEC-INVALID) or fetch error.
+fn cmd_hash(tokens: &[String], base_dir: &Path) -> Result<i32, MilpaError> {
+    if tokens.is_empty() {
+        // Empty token list: surface the parse error (CLI-SOURCE-SPEC-INVALID).
+        parse_source_spec::<String>(&[], Some(base_dir))?;
+        unreachable!("parse_source_spec always fails on empty tokens");
+    }
+    let prov = parse_source_spec(tokens, Some(base_dir))?;
+
+    // Fetch into a scratch temp dir using the same inner registry as `milpa fetch`
+    // (but bypassing CAS admission — pure hash probe, zero side effects).
+    let tmp = tempfile::TempDir::new().map_err(|e| {
+        MilpaError::Core(CoreError::Resolver(
+            "MILPA-INTERNAL",
+            format!("cmd_hash: create temp dir: {e}"),
+        ))
+    })?;
+
+    // Build the inner registry directly (same selection logic as build_registry(),
+    // but without the CasAdmittingFetcher wrapper — no CAS admission here).
+    let receipt = match mocked_fetches_dir() {
+        Some(mocked_dir) => MockedFetcher::new(mocked_dir).fetch("hash", &prov, tmp.path()),
+        None => DefaultRegistry::with_curl().fetch("hash", &prov, tmp.path()),
+    }
+    .map_err(MilpaError::Fetch)?;
+    // tmp is dropped here (auto-cleanup) after the fetch result is obtained.
+
+    // Print the identity — it comes from Receipt::identity (set by DefaultRegistry::fetch).
+    // MUST NOT call compute_content_hash here (spec/cli-contract.md §5.11 NORMATIVE).
+    if let Some(id) = &receipt.identity {
+        println!("{id}");
+    }
+    // For local/editable provenances identity is None → print nothing (stdout empty).
     Ok(0)
 }
 
@@ -2633,7 +2688,7 @@ mod tests {
         let mirror1_url = "https://mirror1.example.com/foo.git";
         let mirror2_url = "https://mirror2.example.com/foo.git";
         let sha = "a".repeat(40);
-        let identity = format!("sha256:{}", "a".repeat(64));
+        let identity = format!("dag-sha256:{}", "a".repeat(64));
 
         // milpa.kdl: foo with BOTH mirrors still declared.
         std::fs::write(
@@ -2690,7 +2745,7 @@ mod tests {
         let mirror1_url = "https://mirror1.example.com/foo.git";
         let mirror2_url = "https://mirror2.example.com/foo.git";
         let sha = "a".repeat(40);
-        let identity = format!("sha256:{}", "a".repeat(64));
+        let identity = format!("dag-sha256:{}", "a".repeat(64));
 
         // milpa.kdl: foo with ONLY mirror1 (mirror2 was removed).
         std::fs::write(
@@ -2745,7 +2800,7 @@ mod tests {
 
         let primary_url = "https://example.com/foo.git";
         let sha = "a".repeat(40);
-        let identity = format!("sha256:{}", "a".repeat(64));
+        let identity = format!("dag-sha256:{}", "a".repeat(64));
 
         // milpa.kdl: foo declared.
         std::fs::write(
@@ -2791,7 +2846,7 @@ mod tests {
 
         let primary_url = "https://example.com/foo.git";
         let sha = "a".repeat(40);
-        let identity = format!("sha256:{}", "a".repeat(64));
+        let identity = format!("dag-sha256:{}", "a".repeat(64));
 
         // milpa.kdl: foo declared.
         std::fs::write(
@@ -2839,7 +2894,7 @@ mod tests {
 
         let primary_url = "https://example.com/foo.git";
         let sha = "a".repeat(40);
-        let identity = format!("sha256:{}", "a".repeat(64));
+        let identity = format!("dag-sha256:{}", "a".repeat(64));
 
         // milpa.kdl: foo declared.
         std::fs::write(
@@ -2889,7 +2944,7 @@ mod tests {
 
         let primary_url = "https://example.com/foo.git";
         let sha = "a".repeat(40);
-        let identity = format!("sha256:{}", "a".repeat(64));
+        let identity = format!("dag-sha256:{}", "a".repeat(64));
 
         std::fs::write(
             proj.join("milpa.kdl"),
@@ -3229,7 +3284,7 @@ mod tests {
         let index_path = tmp.path().join("index.kdl");
         std::fs::write(
             &index_path,
-            "schema_version 99\npackage \"foo\" {\n  version \"1.0.0\" {\n    content_hash \"sha256:0000000000000000000000000000000000000000000000000000000000000001\"\n    provenance {\n      kind \"git\"\n      url \"https://github.com/example/foo.git\"\n      ref \"v1.0.0\"\n    }\n  }\n}\n",
+            "schema_version 99\npackage \"foo\" {\n  version \"1.0.0\" {\n    content_hash \"dag-sha256:0000000000000000000000000000000000000000000000000000000000000001\"\n    provenance {\n      kind \"git\"\n      url \"https://github.com/example/foo.git\"\n      ref \"v1.0.0\"\n    }\n  }\n}\n",
         )
         .unwrap();
 
@@ -3294,7 +3349,7 @@ mod tests {
     /// directory names only.  Controlled hex names enable prefix-match tests
     /// without needing real content that hashes to a chosen value.
     fn make_store_entry(store_root: &std::path::Path, hex64: &str) -> PathBuf {
-        let entry = store_root.join("sha256").join(hex64);
+        let entry = store_root.join("dag-sha256").join(hex64);
         std::fs::create_dir_all(&entry).unwrap();
         std::fs::write(entry.join("dummy.nim"), b"# test sentinel\n").unwrap();
         entry
@@ -3315,7 +3370,7 @@ mod tests {
         let identities = store.list_identities();
         assert_eq!(
             identities,
-            vec![format!("sha256:{hex_a}"), format!("sha256:{hex_b}")],
+            vec![format!("dag-sha256:{hex_a}"), format!("dag-sha256:{hex_b}")],
             "list_identities must be lex-sorted"
         );
     }
@@ -3338,7 +3393,7 @@ mod tests {
         let store_root = tmp.path().join("cas");
         let hex64 = "c".repeat(64);
         let entry = make_store_entry(&store_root, &hex64);
-        let identity = format!("sha256:{hex64}");
+        let identity = format!("dag-sha256:{hex64}");
 
         let store = CaStore::new(&store_root);
         let resolved = store.resolve_prefix(&identity).unwrap();
@@ -3352,7 +3407,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store_root = tmp.path().join("cas");
         std::fs::create_dir_all(&store_root).unwrap();
-        let identity = format!("sha256:{}", "d".repeat(64));
+        let identity = format!("dag-sha256:{}", "d".repeat(64));
 
         let store = CaStore::new(&store_root);
         let err = store.resolve_prefix(&identity).unwrap_err();
@@ -3370,7 +3425,7 @@ mod tests {
         let entry_a = make_store_entry(&store_root, &hex_a);
         make_store_entry(&store_root, &hex_b);
 
-        let prefix = format!("sha256:{}", &hex_a[..16]);
+        let prefix = format!("dag-sha256:{}", &hex_a[..16]);
         let store = CaStore::new(&store_root);
         let resolved = store.resolve_prefix(&prefix).unwrap();
         assert_eq!(store.path_for(&resolved).unwrap(), entry_a);
@@ -3387,7 +3442,7 @@ mod tests {
         make_store_entry(&store_root, &hex_a);
         make_store_entry(&store_root, &hex_b);
 
-        let prefix = format!("sha256:{}", &shared[..16]); // 16 chars → matches both
+        let prefix = format!("dag-sha256:{}", &shared[..16]); // 16 chars → matches both
         let store = CaStore::new(&store_root);
         let err = store.resolve_prefix(&prefix).unwrap_err();
         assert_eq!(err.code(), "STORE-AMBIGUOUS-PREFIX");
@@ -3401,7 +3456,7 @@ mod tests {
         let hex64 = "e".repeat(64);
         make_store_entry(&store_root, &hex64);
 
-        let prefix = format!("sha256:{}", "e".repeat(15)); // 15 < 16 → rejected
+        let prefix = format!("dag-sha256:{}", "e".repeat(15)); // 15 < 16 → rejected
         let store = CaStore::new(&store_root);
         let err = store.resolve_prefix(&prefix).unwrap_err();
         assert_eq!(err.code(), "STORE-AMBIGUOUS-PREFIX");
@@ -3461,7 +3516,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_CACHE_DIR", &store_root) };
         let rc = cmd_store(&[
             "path".to_string(),
-            format!("sha256:{}", "d".repeat(64)),
+            format!("dag-sha256:{}", "d".repeat(64)),
         ]).unwrap();
         unsafe { std::env::remove_var("MILPA_CACHE_DIR") };
 
@@ -3577,7 +3632,7 @@ mod tests {
             "// generated by milpa; reproducible build snapshot\n",
             "version 1\nstrategy \"maxver\"\n\n",
             "dep \"mylib\" {\n",
-            "    identity \"sha256:", "a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+            "    identity \"dag-sha256:", "a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
             "    version \"1.0.0\"\n",
             "    src_dir \"\"\n",
             "    requires\n",
@@ -3625,7 +3680,7 @@ mod tests {
             "// generated by milpa; reproducible build snapshot\n",
             "version 1\nstrategy \"maxver\"\n\n",
             "dep \"optdep\" {\n",
-            "    identity \"sha256:", "a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+            "    identity \"dag-sha256:", "a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
             "    version \"1.0.0\"\n",
             "    src_dir \"\"\n",
             "    requires\n",

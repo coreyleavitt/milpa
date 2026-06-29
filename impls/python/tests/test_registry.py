@@ -74,7 +74,7 @@ package "nimkdl" {
     namespace "coreyleavitt"
     upstream (url)"https://github.com/coreyleavitt/nimkdl"
     version "0.1.4" {
-        content_hash "sha256:1aaf2a95f53681c86f6dcd4c1267144401ba923f31afa42da3c5ae783dc7ab61"
+        content_hash "dag-sha256:1aaf2a95f53681c86f6dcd4c1267144401ba923f31afa42da3c5ae783dc7ab61"
         provenance {
             kind "oci"
             registry "ghcr.io"
@@ -96,7 +96,7 @@ package "chronos" {
     namespace "status-im"
     upstream (url)"https://github.com/status-im/nim-chronos"
     version "4.0.3" {
-        content_hash "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+        content_hash "dag-sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
         provenance {
             kind "git"
             url (url)"https://github.com/status-im/nim-chronos"
@@ -131,7 +131,7 @@ class TestParseIndexValid:
         assert len(nimkdl.versions) == 1
         iv = nimkdl.versions[0]
         assert iv.version == "0.1.4"
-        assert iv.content_hash.startswith("sha256:")
+        assert iv.content_hash.startswith("dag-sha256:")
         assert len(iv.provenances) == 1
         prov = iv.provenances[0]
         assert isinstance(prov, OciIndexProvenance)
@@ -169,7 +169,7 @@ class TestParseIndexValid:
         no_sv = """\
 package "foo" {
     version "1.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
         provenance {
             kind "git"
             url "https://example.com/foo.git"
@@ -193,7 +193,7 @@ package "foo" {
 schema_version 1
 package "foo" {
     version "1.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
         provenance {
             kind "future-transport"
             url "https://example.com/foo"
@@ -217,15 +217,15 @@ package "foo" {
 schema_version 1
 package "foo" {
     version "1.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
         provenance { kind "git" url "https://example.com/foo.git" ref "v1" }
     }
     version "3.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000003"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000003"
         provenance { kind "git" url "https://example.com/foo.git" ref "v3" }
     }
     version "2.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000002"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000002"
         provenance { kind "git" url "https://example.com/foo.git" ref "v2" }
     }
 }
@@ -240,15 +240,15 @@ package "foo" {
 schema_version 1
 package "foo" {
     version "not-semver" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000099"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000099"
         provenance { kind "git" url "https://example.com/foo.git" ref "main" }
     }
     version "2.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000002"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000002"
         provenance { kind "git" url "https://example.com/foo.git" ref "v2" }
     }
     version "1.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
         provenance { kind "git" url "https://example.com/foo.git" ref "v1" }
     }
 }
@@ -264,11 +264,11 @@ package "foo" {
 schema_version 1
 package "foo" {
     version "1.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
         provenance { kind "git" url "https://example.com/foo.git" ref "v1" }
     }
     version "1.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000002"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000002"
         provenance { kind "git" url "https://example.com/foo.git" ref "dup" }
     }
 }
@@ -298,7 +298,7 @@ package "foo" {
 schema_version 1
 package "foo" {
     version "1.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
         provenance {
             kind "git"
             url "https://example.com/foo.git"
@@ -415,7 +415,7 @@ class TestValidators:
 schema_version 1
 package "foo" {
     version "1.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
         provenance {
             kind "git"
             url "https://example.com/foo.git"
@@ -439,7 +439,7 @@ package "foo" {
 schema_version 1
 package "foo" {
     version "1.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
         provenance {
             kind "oci"
             registry "ghcr.io"
@@ -468,7 +468,7 @@ package "foo" {
 schema_version 1
 package "bar" {
     version "1.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
         dep_decl "sha256:../../etc/passwd"
         dep_decl_schema_version 0
         provenance {
@@ -548,7 +548,7 @@ package "bar" {
 schema_version 1
 package "foo" {
     version "1.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
         provenance {
             kind "oci"
             registry "ghcr.io"
@@ -598,11 +598,11 @@ class TestResolveNamed:
 schema_version 1
 package "bar" {
     version "2.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000002"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000002"
         provenance { kind "git" url "https://example.com/bar.git" ref "v2" }
     }
     version "1.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
         provenance { kind "git" url "https://example.com/bar.git" ref "v1" }
     }
 }
@@ -815,7 +815,7 @@ schema_version 1
 package "nkdl" {{
     namespace "coreyleavitt"
     version "0.2.0" {{
-        content_hash "sha256:{'0' * 64}"
+        content_hash "dag-sha256:{'0' * 64}"
         dep_decl "{_DEP_DECL_HASH}"
         dep_decl_schema_version 0
         provenance {{
@@ -833,7 +833,7 @@ schema_version 1
 package "nkdl" {
     namespace "coreyleavitt"
     version "0.2.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
         provenance {
             kind "git"
             url "https://github.com/coreyleavitt/nkdl"

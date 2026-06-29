@@ -642,7 +642,7 @@ class TestMockedRegistry:
         assert isinstance(result.receipt, GitReceipt)
         assert result.receipt.commit_sha == sha
         assert (dest / "bar.nim").read_bytes() == b"# bar"
-        assert result.identity.startswith("sha256:")
+        assert result.identity.startswith("dag-sha256:")
 
 
 # ---------------------------------------------------------------------------

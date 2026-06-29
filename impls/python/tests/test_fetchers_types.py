@@ -227,7 +227,7 @@ class TestFetcherRegistryDispatch:
         result = r.fetch("pkg", _AProvenance(), dest=tmp_path / "pkg")
         assert result.name == "pkg"
         assert result.path.exists()
-        assert result.identity.startswith("sha256:")
+        assert result.identity.startswith("dag-sha256:")
         assert result.receipt.transport_fields() == {"marker": "a-ok"}
 
     def test_dispatch_ambiguity_raises_uncoded_fetch_error(self, tmp_path: Path) -> None:
@@ -294,7 +294,7 @@ class TestRegistryComputesIdentity:
         r = FetcherRegistry()
         r.register(_AFetcher())
         result = r.fetch("mypkg", _AProvenance(), dest=tmp_path / "mypkg")
-        assert result.identity.startswith("sha256:")
+        assert result.identity.startswith("dag-sha256:")
 
     def test_two_different_deps_different_identity(self, tmp_path: Path) -> None:
         r = FetcherRegistry()
@@ -355,7 +355,7 @@ class TestFetchAny:
         primary = _TaggedProvenance(tag="primary", fail=True)
         mirror = _TaggedProvenance(tag="mirror", fail=False)
         result = r.fetch_any("pkg", [primary, mirror], dest=tmp_path / "pkg")
-        assert result.identity.startswith("sha256:")
+        assert result.identity.startswith("dag-sha256:")
         assert result.receipt.transport_fields()["marker"] == "ok-mirror"
 
     def test_all_fail_raises_fetch_all_failed(self, tmp_path: Path) -> None:
@@ -449,7 +449,7 @@ class TestFetchAnyIdentityGate:
         self, tmp_path: Path
     ) -> None:
         """If all candidates produce wrong identity, FETCH-ALL-FAILED is raised."""
-        wrong_identity = "sha256:" + "a" * 64
+        wrong_identity = "dag-sha256:" + "a" * 64
         r = FetcherRegistry()
         r.register(_IdentityWritingFetcher("wrong"))
         with pytest.raises(MilpaError) as exc_info:
@@ -545,7 +545,7 @@ class TestEntryPointDiscovery:
         dest = tmp_path / "stub-dep"
         result = registry.fetch("stub-dep", StubProvenance(), dest=dest)
         assert (dest / "stub.txt").read_text() == "stub content\n"
-        assert result.identity.startswith("sha256:")
+        assert result.identity.startswith("dag-sha256:")
         assert result.receipt.transport_fields()["stub_marker"] == "stub-v1"
 
 
@@ -583,7 +583,7 @@ class TestFetchAnyIdentityNoneNoCrash:
         fetch_any must NOT crash with TypeError when slicing None."""
         r = FetcherRegistry()
         r.register(_NonAdmissibleFetcher())
-        expected = "sha256:" + "a" * 64  # some expected hash that won't match None
+        expected = "dag-sha256:" + "a" * 64  # some expected hash that won't match None
 
         # Must not raise TypeError; must raise FETCH-ALL-FAILED (identity mismatch
         # counted as a failure, not a crash).

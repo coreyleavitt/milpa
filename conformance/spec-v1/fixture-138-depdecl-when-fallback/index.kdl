@@ -1,7 +1,7 @@
 schema_version 1
 package "bar" {
     version "2.0.0" {
-        content_hash "sha256:94103e1c378d5b8e034414bf69bfa128e780407aa36276f8b3dd395c1e9f4468"
+        content_hash "dag-sha256:94103e1c378d5b8e034414bf69bfa128e780407aa36276f8b3dd395c1e9f4468"
         dep_decl "sha256:8c2f20b957c5a16fe803caa5b0d3d4997b500549cae95d5716ded986d1c5ed22"
         dep_decl_schema_version 0
         provenance {
@@ -14,7 +14,7 @@ package "bar" {
 }
 package "extra" {
     version "1.0.0" {
-        content_hash "sha256:2689ab5d202e9403c19c6f8b1488c746ad755e16e16d165537390eae192688b4"
+        content_hash "dag-sha256:2689ab5d202e9403c19c6f8b1488c746ad755e16e16d165537390eae192688b4"
         dep_decl "sha256:8c2f20b957c5a16fe803caa5b0d3d4997b500549cae95d5716ded986d1c5ed22"
         dep_decl_schema_version 0
         provenance {
@@ -27,7 +27,7 @@ package "extra" {
 }
 package "qux" {
     version "1.0.0" {
-        content_hash "sha256:82240c317c9071f232849a5e525eb27c1e8113d05fa1db02da6f690652f0e279"
+        content_hash "dag-sha256:82240c317c9071f232849a5e525eb27c1e8113d05fa1db02da6f690652f0e279"
         provenance {
             kind "git"
             url "https://github.com/example/qux.git"

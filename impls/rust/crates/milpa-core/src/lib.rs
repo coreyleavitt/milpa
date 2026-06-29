@@ -31,6 +31,7 @@ pub mod nimcfg;
 pub mod registry;
 pub mod resolver;
 pub mod safe_extract;
+pub mod source_spec;
 pub mod store;
 pub mod workspace;
 
@@ -58,6 +59,7 @@ pub use milpa_manifest::{format_manifest, format_workspace_manifest};
 // `From<ManifestError>` impl lives here, so `?` lifts parse errors at this
 // boundary.
 pub use fetch::{FetchError, Fetcher, FetcherRegistry, Receipt};
+pub use source_spec::parse_source_spec;
 pub use fetchers::{
     mocked_default_branch, resolve_mock_key, stage_mock_content, url_key, CasAdmittingFetcher,
     DefaultRegistry, MockedFetcher,

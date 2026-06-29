@@ -14,7 +14,7 @@ dep "mylib" {
 }
 
 dep "translib" {
-    identity "sha256:f089c68be5b441fb11822b4696d764030fae65631fefed440d378de62d1738e7"
+    identity "dag-sha256:f089c68be5b441fb11822b4696d764030fae65631fefed440d378de62d1738e7"
     version "0.0.1"
     src_dir "src"
     requires "mylib"

@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "pkg-a" {
-    identity "sha256:bc145e9cef31d4090e458c15ca3a0dff2d6707b2f6334777c4ed61c2b4b8dea3"
+    identity "dag-sha256:bc145e9cef31d4090e458c15ca3a0dff2d6707b2f6334777c4ed61c2b4b8dea3"
     version "0.0.1"
     src_dir "src"
     requires "pkg-b"
@@ -15,7 +15,7 @@ dep "pkg-a" {
 }
 
 dep "pkg-b" {
-    identity "sha256:a01dc4f0ded96b3b5f823003fd0d2676007c673b90b350348b505a8463efcff1"
+    identity "dag-sha256:a01dc4f0ded96b3b5f823003fd0d2676007c673b90b350348b505a8463efcff1"
     version "0.0.1"
     src_dir ""
     requires "pkg-c"
@@ -27,7 +27,7 @@ dep "pkg-b" {
 }
 
 dep "pkg-c" {
-    identity "sha256:0da60a1f6630d39e8e7d4efc7cd082dce94e6c77e8e459bd12b2471c7dcd132a"
+    identity "dag-sha256:0da60a1f6630d39e8e7d4efc7cd082dce94e6c77e8e459bd12b2471c7dcd132a"
     version "0.0.1"
     src_dir ""
     requires

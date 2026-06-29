@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "lib-flags" {
-    identity "sha256:0042a3fcba8ec348801638ad0b1d38244102c681fb006fef5cd6f5b0d03344fb"
+    identity "dag-sha256:0042a3fcba8ec348801638ad0b1d38244102c681fb006fef5cd6f5b0d03344fb"
     version "0.0.1"
     src_dir ""
     requires

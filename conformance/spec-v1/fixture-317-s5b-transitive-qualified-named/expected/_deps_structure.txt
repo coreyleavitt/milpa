@@ -1,2 +1,2 @@
-@ns1/baz -> <CAS_ROOT>/sha256/ef697b08f76e85dfbf6ef62aeac70982d169f328461c0bafee32dcac12f1ce40/
-foo -> <CAS_ROOT>/sha256/ab62aa70b1a24c49c93a2b2e97933c2d40705e4182467cd0603f594736cabd1b/
+@ns1/baz -> <CAS_ROOT>/dag-sha256/ef697b08f76e85dfbf6ef62aeac70982d169f328461c0bafee32dcac12f1ce40/
+foo -> <CAS_ROOT>/dag-sha256/ab62aa70b1a24c49c93a2b2e97933c2d40705e4182467cd0603f594736cabd1b/

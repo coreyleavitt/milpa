@@ -43,6 +43,15 @@ pub enum Cmd {
     /// Distinct from both the static corpus (MockedFetcher) and the
     /// `MILPA_INTEGRATION_TESTS=1` network tier.
     GitProtocol,
+    /// H-infra: hash fixture tier (`milpa hash` A0-cmd). The runner generates
+    /// local bare repos (same `git-protocol.json` schema), runs the REAL
+    /// `fetch_git`, computes `compute_content_hash` over the materialized tree
+    /// (identical to what `DefaultRegistry::fetch` sets as `Receipt::identity`),
+    /// and asserts it matches `expected/stdout`.
+    ///
+    /// This pins the full `milpa hash <source-spec>` path: source → identity
+    /// line on stdout, no CAS admission, no lockfile side-effects.
+    Hash,
 }
 
 impl Cmd {
@@ -61,6 +70,10 @@ impl Cmd {
                     // H-infra: git-protocol fixtures run the REAL fetcher against
                     // generated local bare repos (no milpa.kdl / mocked-fetches/).
                     "git-protocol" => Cmd::GitProtocol,
+                    // H-infra: hash fixtures exercise the milpa hash A0-cmd path.
+                    // Same git-protocol.json schema; asserts expected/stdout matches
+                    // the identity computed over the materialized tree.
+                    "hash" => Cmd::Hash,
                     // Mutation (§2.7.1) + liveness (§2.7.2) selectors: CLI-only.
                     // check-certificate (§2.7.3): also CLI-only (--certificate flag).
                     // workspace (S10 D4): add-member/remove-member are CLI-only.

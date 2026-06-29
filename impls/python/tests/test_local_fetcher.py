@@ -191,7 +191,7 @@ class TestLocalFetcherIdentity:
         fetcher = LocalFetcher()
         receipt = fetcher.fetch("mylib", LocalProvenance(path=src), dest=dest)
         for v in receipt.transport_fields().values():
-            assert not v.startswith("sha256:")
+            assert not v.startswith("dag-sha256:")
 
 
 # ---------------------------------------------------------------------------

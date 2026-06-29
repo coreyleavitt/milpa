@@ -5,7 +5,7 @@
 use super::*;
 use milpa_solver::VersionSet;
 
-const ID1: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+const ID1: &str = "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001";
 
 fn full() -> VersionSet {
     VersionSet::full()
@@ -200,7 +200,7 @@ fn duplicate_version_keeps_the_first() {
          \x20       content_hash \"{ID1}\"\n\
          \x20   }}\n\
          \x20   version \"1.0.0\" {{\n\
-         \x20       content_hash \"sha256:{}\"\n\
+         \x20       content_hash \"dag-sha256:{}\"\n\
          \x20   }}\n\
          }}\n",
         "2".repeat(64)

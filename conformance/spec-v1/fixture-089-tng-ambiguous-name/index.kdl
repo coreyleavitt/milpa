@@ -2,7 +2,7 @@ schema_version 1
 package "bar" {
     namespace "ns1"
     version "1.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
         provenance {
             kind "git"
             url "https://github.com/ns1/bar.git"
@@ -13,7 +13,7 @@ package "bar" {
 package "bar" {
     namespace "ns2"
     version "1.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000002"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000002"
         provenance {
             kind "git"
             url "https://github.com/ns2/bar.git"

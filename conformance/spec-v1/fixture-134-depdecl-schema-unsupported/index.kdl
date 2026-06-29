@@ -1,7 +1,7 @@
 schema_version 1
 package "bar" {
     version "2.0.0" {
-        content_hash "sha256:94103e1c378d5b8e034414bf69bfa128e780407aa36276f8b3dd395c1e9f4468"
+        content_hash "dag-sha256:94103e1c378d5b8e034414bf69bfa128e780407aa36276f8b3dd395c1e9f4468"
         dep_decl "sha256:e2cfaefd7db74077f752213f42def246585f209811109b3683f0554c87df910f"
         dep_decl_schema_version 999
         provenance {

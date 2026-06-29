@@ -655,7 +655,7 @@ def test_update_preserves_declared_mirror_provenances(tmp_path: Path) -> None:
     mirror2_url = "https://mirror2.example.com/foo.git"
     ref = "main"
     sha = "abcdef1234567890abcdef1234567890abcdef12"
-    identity = "sha256:a1e5adf673db945ef4fd8def4ab5e0c753c2c831323907fd894712d2c46c4ba3"
+    identity = "dag-sha256:a1e5adf673db945ef4fd8def4ab5e0c753c2c831323907fd894712d2c46c4ba3"
 
     # milpa.kdl with both mirrors still declared.
     (tmp_path / "milpa.kdl").write_text(
@@ -722,7 +722,7 @@ def test_update_drops_mirror_removed_from_manifest(tmp_path: Path) -> None:
     mirror2_url = "https://mirror2.example.com/foo.git"
     ref = "main"
     sha = "abcdef1234567890abcdef1234567890abcdef12"
-    identity = "sha256:a1e5adf673db945ef4fd8def4ab5e0c753c2c831323907fd894712d2c46c4ba3"
+    identity = "dag-sha256:a1e5adf673db945ef4fd8def4ab5e0c753c2c831323907fd894712d2c46c4ba3"
 
     # milpa.kdl: only mirror1 is still declared (mirror2 was removed).
     (tmp_path / "milpa.kdl").write_text(
@@ -792,7 +792,7 @@ def test_update_alias_resolves_to_canonical(tmp_path: Path) -> None:
     primary_url = "https://github.com/example/foo.git"
     ref = "main"
     sha = "abcdef1234567890abcdef1234567890abcdef12"
-    identity = "sha256:a1e5adf673db945ef4fd8def4ab5e0c753c2c831323907fd894712d2c46c4ba3"
+    identity = "dag-sha256:a1e5adf673db945ef4fd8def4ab5e0c753c2c831323907fd894712d2c46c4ba3"
 
     # milpa.kdl: foo is the declared dep.
     (tmp_path / "milpa.kdl").write_text(
@@ -848,7 +848,7 @@ def test_remove_alias_resolves_to_canonical(tmp_path: Path) -> None:
     primary_url = "https://github.com/example/foo.git"
     ref = "main"
     sha = "abcdef1234567890abcdef1234567890abcdef12"
-    identity = "sha256:a1e5adf673db945ef4fd8def4ab5e0c753c2c831323907fd894712d2c46c4ba3"
+    identity = "dag-sha256:a1e5adf673db945ef4fd8def4ab5e0c753c2c831323907fd894712d2c46c4ba3"
 
     # milpa.kdl: foo is declared.
     (tmp_path / "milpa.kdl").write_text(
@@ -911,7 +911,7 @@ def test_remove_canonical_with_required_alias_warns(tmp_path: Path) -> None:
     primary_url = "https://github.com/example/foo.git"
     ref = "main"
     sha = "abcdef1234567890abcdef1234567890abcdef12"
-    identity = "sha256:a1e5adf673db945ef4fd8def4ab5e0c753c2c831323907fd894712d2c46c4ba3"
+    identity = "dag-sha256:a1e5adf673db945ef4fd8def4ab5e0c753c2c831323907fd894712d2c46c4ba3"
 
     # milpa.kdl: foo is declared.
     (tmp_path / "milpa.kdl").write_text(
@@ -959,7 +959,7 @@ def test_update_no_mirrors_regression(tmp_path: Path) -> None:
     primary_url = "https://github.com/example/foo.git"
     ref = "main"
     sha = "abcdef1234567890abcdef1234567890abcdef12"
-    identity = "sha256:a1e5adf673db945ef4fd8def4ab5e0c753c2c831323907fd894712d2c46c4ba3"
+    identity = "dag-sha256:a1e5adf673db945ef4fd8def4ab5e0c753c2c831323907fd894712d2c46c4ba3"
 
     (tmp_path / "milpa.kdl").write_text(
         'name "myapp"\nkind "application"\n'

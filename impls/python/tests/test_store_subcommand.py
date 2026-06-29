@@ -3,8 +3,7 @@
 TDD: these tests were written BEFORE the implementation; they drive the
 RED→GREEN loop.
 
-Spec authority: docs/rfc-content-addressed-identity.md Phase C, §§390-396.
-Store layout: spec/identity.md §3 — <root>/sha256/<64hex>/.
+Spec authority: spec/identity.md §3 — <root>/<algorithm>/<64hex>/.
 Error codes: STORE-AMBIGUOUS-PREFIX, CAS-NOT-IN-STORE.
 
 All tests point MILPA_CACHE_DIR at a per-test tmp directory so they never
@@ -24,7 +23,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
-def _make_store_entry(store_root: Path, hex64: str) -> Path:
+def _make_store_entry(store_root: Path, hex64: str, algo: str = "dag-sha256") -> Path:
     """Create a bare CAS-layout directory for a given 64-hex digest.
 
     This bypasses content-hashing intentionally: the store-ls / store-path
@@ -32,7 +31,7 @@ def _make_store_entry(store_root: Path, hex64: str) -> Path:
     entries with controlled hex names is the standard technique for testing
     prefix matching without needing real content that hashes to a chosen value.
     """
-    entry = store_root / "sha256" / hex64
+    entry = store_root / algo / hex64
     entry.mkdir(parents=True, exist_ok=True)
     # Place a sentinel file so the directory is non-empty (mirrors a real admit).
     (entry / "dummy.nim").write_text("# test sentinel\n", encoding="utf-8")
@@ -73,7 +72,7 @@ def test_store_ls_two_entries_sorted(tmp_path: Path) -> None:
 
     assert result.returncode == 0, f"stderr: {result.stderr}"
     lines = result.stdout.strip().splitlines()
-    assert lines == [f"sha256:{hex_a}", f"sha256:{hex_b}"], (
+    assert lines == [f"dag-sha256:{hex_a}", f"dag-sha256:{hex_b}"], (
         f"Expected lex-sorted identities, got: {lines!r}"
     )
 
@@ -104,7 +103,7 @@ def test_store_path_full_identity_present(tmp_path: Path) -> None:
     store_root = tmp_path / "cas"
     hex64 = "c" * 64
     entry = _make_store_entry(store_root, hex64)
-    identity = f"sha256:{hex64}"
+    identity = f"dag-sha256:{hex64}"
 
     result = _run_store(["path", identity], store_root)
 
@@ -124,7 +123,7 @@ def test_store_path_full_identity_absent(tmp_path: Path) -> None:
     """store path with absent full identity → CAS-NOT-IN-STORE, exit 1."""
     store_root = tmp_path / "cas"
     store_root.mkdir(parents=True, exist_ok=True)
-    identity = "sha256:" + "d" * 64
+    identity = "dag-sha256:" + "d" * 64
 
     result = _run_store(["path", identity], store_root)
 
@@ -150,7 +149,7 @@ def test_store_path_unique_prefix(tmp_path: Path) -> None:
     _make_store_entry(store_root, hex_b)
 
     # Prefix that matches only hex_a (first 16 chars are "aaaa111100000000")
-    prefix = "sha256:" + hex_a[:16]
+    prefix = "dag-sha256:" + hex_a[:16]
 
     result = _run_store(["path", prefix], store_root)
 
@@ -176,7 +175,7 @@ def test_store_path_ambiguous_prefix(tmp_path: Path) -> None:
     _make_store_entry(store_root, hex_a)
     _make_store_entry(store_root, hex_b)
 
-    prefix = "sha256:" + shared[:16]  # 16 chars → matches both
+    prefix = "dag-sha256:" + shared[:16]  # 16 chars → matches both
 
     result = _run_store(["path", prefix], store_root)
 
@@ -198,7 +197,7 @@ def test_store_path_prefix_too_short(tmp_path: Path) -> None:
     _make_store_entry(store_root, hex64)
 
     # 15 hex chars — below the 16-char minimum
-    prefix = "sha256:" + "e" * 15
+    prefix = "dag-sha256:" + "e" * 15
 
     result = _run_store(["path", prefix], store_root)
 
@@ -209,12 +208,12 @@ def test_store_path_prefix_too_short(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Behaviour 8 — store path: bare 64-hex (no sha256: prefix) is accepted
+# Behaviour 8 — store path: bare 64-hex (no dag-sha256: prefix) is accepted
 # ---------------------------------------------------------------------------
 
 
 def test_store_path_bare_64hex_accepted(tmp_path: Path) -> None:
-    """store path accepts bare 64-hex identity (no sha256: prefix)."""
+    """store path accepts bare 64-hex identity (no algorithm prefix)."""
     store_root = tmp_path / "cas"
     hex64 = "f" * 64
     entry = _make_store_entry(store_root, hex64)
@@ -229,12 +228,12 @@ def test_store_path_bare_64hex_accepted(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Behaviour 9 — store path: bare ≥16-char prefix (no sha256:) is accepted
+# Behaviour 9 — store path: bare ≥16-char prefix (no algorithm prefix) is accepted
 # ---------------------------------------------------------------------------
 
 
 def test_store_path_bare_prefix_accepted(tmp_path: Path) -> None:
-    """store path accepts a bare hex prefix (no sha256: prefix) ≥16 chars."""
+    """store path accepts a bare hex prefix (no algorithm prefix) ≥16 chars."""
     store_root = tmp_path / "cas"
     hex64 = "1234567890abcdef" + "0" * 48  # unique 16-char prefix
     entry = _make_store_entry(store_root, hex64)

@@ -31,7 +31,7 @@ A conformant implementation of this spec MUST:
 3. Hash symlinks by their target string (not by following them), using the
    symlink mode marker `0x80`.
 4. NOT normalize line endings; raw bytes are fed to the hash as-is.
-5. Encode the output as `sha256:<64-lowercase-hex-chars>`.
+5. Encode the output as `dag-sha256:<64-lowercase-hex-chars>`.
 6. Validate identity strings via the `<algorithm>:<digest>` grammar (§2),
    rejecting unknown algorithms and wrong digest lengths.
 7. Lay out the CAS as `<root>/<algorithm>/<hex-digest>/` (§3).
@@ -249,23 +249,6 @@ write materialized blobs with the following fixed modes:
 > and relative-URL handling are specified in `spec/plugin-contract.md §2.3`
 > and land with H5.
 
-#### 1.7.6  Migration note
-
-Object-store materialization changes the `content_hash` for any git dep where
-the working-tree checkout bytes differed from the object-store blob bytes (e.g.
-repos with `autocrlf`- or `filter=`-affected content). This is a one-time hash
-churn.
-
-**Scope.** The conformance corpus is **not affected**: `MockedGitFetcher` stages
-fixture content verbatim with no git invocation, so every corpus git-dep
-`content_hash` is the hash of pre-baked bytes and is unchanged. The churn
-lands exclusively on the **real-network integration fixture** (`fresco`,
-`MILPA_INTEGRATION_TESTS=1`), which must be re-locked after H3b/H3c land.
-
-Per `spec_versioning_deferred`: milpa is pre-1.0 with no external consumers;
-the spec is mutated in place. The pre-fix hashes were incorrect (they captured
-smudge output, not object-store bytes) and carry no compatibility obligation.
-
 ---
 
 ## 2  Identity string format (multihash encoding)
@@ -276,18 +259,28 @@ smudge output, not object-store bytes) and carry no compatibility obligation.
 > stored in lockfiles, CAS paths, and `FetchResult.identity` MUST be:
 >
 > ```
-> sha256:<64-lowercase-hex-chars>
+> dag-sha256:<64-lowercase-hex-chars>
 > ```
 >
-> The `sha256:` prefix is part of the canonical form. An identity string
-> without the prefix is invalid.
+> The `dag-sha256:` prefix is part of the canonical form. An identity string
+> without this prefix is invalid. The algorithm name `dag-sha256` is the A1
+> epoch name, chosen for forward compatibility with the Merkle DAG encoding
+> that B1 will introduce.
 
 > NORMATIVE: The hex digest MUST use lowercase letters `a`–`f`; uppercase
 > is rejected.
 
-> NOTE: The reference implementation returns `f"sha256:{h.hexdigest()}"`
+> NOTE: The reference implementation returns `f"dag-sha256:{h.hexdigest()}"`
 > from `compute_content_hash` (`identity.py:128`). `hashlib.hexdigest()`
 > always produces lowercase.
+
+> NOTE (A1 interim epoch): The underlying digest computation is flat SHA256
+> over the canonical byte stream defined in §1.2. The `dag-sha256:` prefix
+> does NOT yet imply a Merkle DAG encoding; that is the B1 milestone. During
+> the A1 epoch, `dag-sha256:<hex>` means "flat SHA256 digest, Merkle DAG
+> encoding reserved". No external consumers exist pre-v1; the prefix will be
+> stable when the DAG encoding lands because the digest bytes will change,
+> which is the correct behaviour.
 
 ### 2.2  Validation grammar
 
@@ -298,27 +291,17 @@ smudge output, not object-store bytes) and carry no compatibility obligation.
 > 2. The string MUST contain a `:` separator (`ID-NO-ALGORITHM-PREFIX`
 >    otherwise).
 > 3. The algorithm prefix (the part before `:`) MUST be in the supported
->    algorithm set (`ID-UNSUPPORTED-ALGORITHM` otherwise). Currently the
->    only supported algorithm is `sha256`.
+>    algorithm set (`ID-UNSUPPORTED-ALGORITHM` otherwise). The only supported
+>    algorithm in the A1 epoch is `dag-sha256`. Stale `sha256:` identities
+>    (epoch-0) are explicitly NOT accepted; they raise `ID-UNSUPPORTED-ALGORITHM`.
 > 4. The digest (the part after `:`) MUST be exactly 64 characters for
->    `sha256` (`ID-WRONG-DIGEST-LENGTH` otherwise).
+>    `dag-sha256` (`ID-WRONG-DIGEST-LENGTH` otherwise).
 > 5. The digest MUST consist entirely of `0`–`9` and `a`–`f`
 >    (`ID-NON-HEX-DIGEST` otherwise).
 
 > NOTE: The reference implementation is `parse_identity` in `identity.py`,
 > lines 65–107. It returns the input string unchanged when valid — the
 > canonical form is the input itself.
-
-### 2.3  Algorithm agility
-
-> NOTE: The `sha256:` prefix anticipates future algorithm migration. Adding
-> a new algorithm requires: (1) adding it to `SUPPORTED_ALGORITHMS`, (2)
-> adding its digest-hex length to `_DIGEST_HEX_LEN`, and (3) updating
-> `compute_content_hash`. During a migration window, lockfiles MAY carry
-> both the old and new algorithm's identity per dep; both MUST be written,
-> and only the new one is required to match for verification. This is
-> **not yet implemented** in spec v1.0; a future spec amendment will define
-> the migration protocol.
 
 ---
 
@@ -332,8 +315,8 @@ smudge output, not object-store bytes) and carry no compatibility obligation.
 >
 > ```
 > <root>/
->   <algorithm>/           e.g. sha256/
->     <hex-digest>/        e.g. a3f9...c1d2/   (64 hex chars for sha256)
+>   <algorithm>/           e.g. dag-sha256/
+>     <hex-digest>/        e.g. a3f9...c1d2/   (64 hex chars for dag-sha256)
 >       <tree contents>    the source tree, as-fetched
 > ```
 >
@@ -449,7 +432,7 @@ smudge output, not object-store bytes) and carry no compatibility obligation.
 > `docs/rfc-store-gc.md`. A spec amendment adding the `STORE-GC-ENTRY-IN-USE`
 > error code and the `milpa store gc` command lands with the implementation
 > (tracked in issue #141). No implementation may remove entries from
-> `_scratch/` or `sha256/` before that amendment is applied.
+> `_scratch/` or `dag-sha256/` (or any future algorithm dir) before that amendment is applied.
 
 ### 3.5  The `_deps/<name>` symlink convention
 

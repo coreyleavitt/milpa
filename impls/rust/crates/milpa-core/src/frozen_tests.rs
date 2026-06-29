@@ -124,7 +124,7 @@ fn constraint_unsatisfied() {
     let store = CaStore::new(tmp.path().join(".cas"));
     let lf = lock(
         "maxver",
-        vec![locked("foo", "1.0.0", Some("sha256:00"), git_rec())],
+        vec![locked("foo", "1.0.0", Some("dag-sha256:00"), git_rec())],
     );
     let err = resolve_frozen(
         &manifest(vec![named("foo", Some(">= 2.0.0"))]),
@@ -142,7 +142,7 @@ fn locked_version_unparseable() {
     let store = CaStore::new(tmp.path().join(".cas"));
     let lf = lock(
         "maxver",
-        vec![locked("foo", "not-a-version", Some("sha256:00"), git_rec())],
+        vec![locked("foo", "not-a-version", Some("dag-sha256:00"), git_rec())],
     );
     let err = resolve_frozen(
         &manifest(vec![named("foo", Some(">= 1.0.0"))]),
@@ -163,7 +163,7 @@ fn member_dep_bails() {
         vec![locked(
             "liba",
             "0.0.1",
-            Some("sha256:00"),
+            Some("dag-sha256:00"),
             ProvenanceRecord::Member {
                 name: "liba".into(),
                 origin: "observed".into(),
@@ -183,7 +183,7 @@ fn local_dep_bails() {
         vec![locked(
             "foo",
             "0.0.1",
-            Some("sha256:00"),
+            Some("dag-sha256:00"),
             ProvenanceRecord::Local {
                 path: "../foo".into(),
                 origin: "observed".into(),
@@ -203,7 +203,7 @@ fn identity_not_in_store() {
         vec![locked(
             "foo",
             "0.0.1",
-            Some("sha256:0000000000000000000000000000000000000000000000000000000000000001"),
+            Some("dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"),
             git_rec(),
         )],
     );
@@ -248,7 +248,7 @@ fn workspace_frozen_member_not_in_workspace() {
             locked(
                 "libbar",
                 "0.0.1",
-                Some("sha256:8e5993e3c885dc876559e664001b5c1184aee88f7e9f3cd1538b6718305760bc"),
+                Some("dag-sha256:8e5993e3c885dc876559e664001b5c1184aee88f7e9f3cd1538b6718305760bc"),
                 ProvenanceRecord::Member {
                     name: "libbar".into(),
                     origin: "observed".into(),
@@ -258,7 +258,7 @@ fn workspace_frozen_member_not_in_workspace() {
             locked(
                 "libfoo",
                 "0.0.1",
-                Some("sha256:0000000000000000000000000000000000000000000000000000000000000002"),
+                Some("dag-sha256:0000000000000000000000000000000000000000000000000000000000000002"),
                 ProvenanceRecord::Member {
                     name: "libfoo".into(),
                     origin: "observed".into(),
@@ -288,7 +288,7 @@ fn workspace_frozen_member_identity_drift() {
         vec![locked(
             "libfoo",
             "0.0.1",
-            Some("sha256:0000000000000000000000000000000000000000000000000000000000000099"),
+            Some("dag-sha256:0000000000000000000000000000000000000000000000000000000000000099"),
             ProvenanceRecord::Member {
                 name: "libfoo".into(),
                 origin: "observed".into(),

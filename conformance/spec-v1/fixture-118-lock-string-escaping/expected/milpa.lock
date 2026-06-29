@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "foo" {
-    identity "sha256:19f1b5dadf5a74f44e39f7403a519a8a560fbd61b97425d4ade643ee4a52fa59"
+    identity "dag-sha256:19f1b5dadf5a74f44e39f7403a519a8a560fbd61b97425d4ade643ee4a52fa59"
     version "0.0.1"
     src_dir "src"
     requires

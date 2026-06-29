@@ -18,7 +18,7 @@ consumption model (`DepDeclEdgeSource`, `DepDeclStore`) is specified in
 Related specs:
 
 - `spec/errors.md` — cross-reference for `TNG-DEPDECL-*` codes (owned here)
-- `spec/identity.md` (S12) — `dep_decl_hash` encoding mirrors `content_hash`
+- `spec/identity.md` (S12) — source-tree identity (`content_hash`, `dag-sha256:` prefix); note that `dep_decl_hash` uses a fixed `sha256:` prefix and is a distinct hash domain
 - `spec/manifest-grammar.md` (S4) §5 — cross-references §7 of this doc
 - `spec/registry-protocol.md` (S14) — `dep_decl` + `dep_decl_schema_version`
   pointer fields in the index version-node
@@ -34,8 +34,9 @@ A conformant implementation of this spec MUST:
 1. Represent the in-memory edge set as a single `EdgeSet` value with the
    three fields defined in §1: `requires`, `src_dir`, and the in-memory-only
    `source` fidelity tag. No parallel type duplicates this.
-2. Compute `dep_decl_hash` as `"sha256:" + hex(sha256(dep_decl_bytes))`
-   (§3), using the same encoding as `content_hash` in `spec/identity.md`.
+2. Compute `dep_decl_hash` as `"sha256:" + hex(sha256(dep_decl_bytes))` (§3).
+   Note: `dep_decl_hash` uses the fixed `sha256:` prefix; it is a separate
+   hash domain from `content_hash` (`dag-sha256:` in `spec/identity.md`).
 3. As a **producer**, emit DepDecl artifact bytes by following all seven
    character-level rules of §2 exactly. Any degree of freedom KDL 2.0 leaves
    open that is not pinned by §2 is invalid in a DepDecl artifact.
@@ -321,13 +322,15 @@ Trailing newline (`0x0A`) after the closing `}`.
 >   characters** (`0`–`9`, `a`–`f`).
 > - The prefix `"sha256:"` is a **literal 7-character ASCII string**.
 
-> NORMATIVE: This encoding is **identical** to `content_hash` in
-> `spec/identity.md §2.1`. The two are distinct hash axes over different
-> artifacts (source tree vs declaration bytes), but the encoding format is
-> the same: `<algorithm>:<64-lowercase-hex>`. A conformant implementation
-> MUST validate `dep_decl_hash` strings with the same `parse_identity`
-> semantics as `content_hash` (same algorithm set, same length, same
-> lowercase-hex requirement).
+> NORMATIVE: `dep_decl_hash` uses the `sha256:` prefix permanently — it is
+> the hash of a DepDecl **artifact** (a declaration document), not the hash of
+> a source tree. This domain is distinct from `content_hash` / `identity`,
+> which use `dag-sha256:` (spec/identity.md §2.1). A conformant implementation
+> MUST validate `dep_decl_hash` using its own dedicated validator (matching
+> `^sha256:[0-9a-f]{64}$`), NOT via `parse_identity`. Using `parse_identity`
+> on a `dep_decl_hash` value would incorrectly reject it with
+> `ID-UNSUPPORTED-ALGORITHM` because `sha256` is no longer in
+> `SUPPORTED_ALGORITHMS` for source-tree identity strings.
 
 > NORMATIVE: A **consumer** verifies by computing `sha256(received_bytes)` and
 > comparing to the `dep_decl` pointer field from the index version-node. If

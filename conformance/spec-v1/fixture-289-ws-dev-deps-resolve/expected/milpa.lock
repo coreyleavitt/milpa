@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "devtool" {
-    identity "sha256:5c0b68348639dc86ae91466cbc7117c9089b685a6b9d09db69becaa37cdadf58"
+    identity "dag-sha256:5c0b68348639dc86ae91466cbc7117c9089b685a6b9d09db69becaa37cdadf58"
     version "0.0.1"
     src_dir ""
     requires
@@ -17,7 +17,7 @@ dep "devtool" {
 }
 
 dep "extlib" {
-    identity "sha256:e0b6c41a3af15c89dc5e8b042165cbc1b03098ec449964664c7b774e3251d36c"
+    identity "dag-sha256:e0b6c41a3af15c89dc5e8b042165cbc1b03098ec449964664c7b774e3251d36c"
     version "0.0.1"
     src_dir ""
     requires
@@ -31,7 +31,7 @@ dep "extlib" {
 }
 
 dep "member-a" {
-    identity "sha256:b33d3d3d4be5de690a17a0b4fbeee0731b4703b311f20ec21c27c7bd7988dfdb"
+    identity "dag-sha256:b33d3d3d4be5de690a17a0b4fbeee0731b4703b311f20ec21c27c7bd7988dfdb"
     version "0.0.1"
     src_dir ""
     requires "devtool" "extlib"
@@ -43,7 +43,7 @@ dep "member-a" {
 }
 
 dep "member-b" {
-    identity "sha256:6d368b77914f47c54f15187012fafcf00ca21409d600d24bface55653b90d91f"
+    identity "dag-sha256:6d368b77914f47c54f15187012fafcf00ca21409d600d24bface55653b90d91f"
     version "0.0.1"
     src_dir ""
     requires "member-a" "testhelper"
@@ -55,7 +55,7 @@ dep "member-b" {
 }
 
 dep "testhelper" {
-    identity "sha256:88b45336cb8a4872fb764f4b174db3ba85318cdc5c1224692c99fb0f21c7c25b"
+    identity "dag-sha256:88b45336cb8a4872fb764f4b174db3ba85318cdc5c1224692c99fb0f21c7c25b"
     version "0.0.1"
     src_dir ""
     requires

@@ -1,1 +1,1 @@
-mylib -> <CAS_ROOT>/sha256/29fd457cfa9f8dcc8d07d0be4cd68ad37d59f76f190d993dd9c29710c80774fd/
+mylib -> <CAS_ROOT>/dag-sha256/29fd457cfa9f8dcc8d07d0be4cd68ad37d59f76f190d993dd9c29710c80774fd/

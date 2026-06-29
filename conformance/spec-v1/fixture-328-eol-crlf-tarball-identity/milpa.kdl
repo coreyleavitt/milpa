@@ -1,0 +1,5 @@
+name "probe"
+kind "application"
+deps {
+    mylib tarball=(url)"https://example.com/eol-crlf.tar.gz"
+}

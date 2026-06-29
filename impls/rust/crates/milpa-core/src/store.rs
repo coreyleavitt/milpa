@@ -24,7 +24,8 @@ use crate::identity::{compute_content_hash, parse_identity, INTERNAL_IO};
 /// dir is created lazily.
 ///
 /// The scratch dir is always on the same filesystem mount as the CAS
-/// ``sha256/`` entries, so the rename(2) in [`CaStore::admit`] is atomic.
+/// algorithm dirs (e.g. ``dag-sha256/``), so the rename(2) in
+/// [`CaStore::admit`] is atomic.
 #[derive(Debug)]
 pub struct ScratchDir {
     pub path: PathBuf,
@@ -55,36 +56,45 @@ impl CaStore {
 
     /// Return a lexicographically sorted list of all identities in the store.
     ///
-    /// Scans `<root>/sha256/*/` directories (only the `sha256` algorithm
-    /// directory is expected per spec/identity.md §3). Non-directory entries
-    /// and names starting with `_` (scratch) are ignored.  Empty store → empty
-    /// list.  Identities are returned in `sha256:<64hex>` canonical form.
+    /// Enumerates all algorithm subdirectories under `<root>/` generically
+    /// (spec/identity.md §3). Non-directory entries and names starting with `_`
+    /// (scratch) are ignored.  Empty store → empty list.  Identities are
+    /// returned in `<algorithm>:<64hex>` canonical form.
     pub fn list_identities(&self) -> Vec<String> {
-        let sha256_dir = self.root.join("sha256");
         let mut identities: Vec<String> = Vec::new();
-        let Ok(entries) = std::fs::read_dir(&sha256_dir) else {
+        let Ok(algo_dirs) = std::fs::read_dir(&self.root) else {
             return identities;
         };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            // Skip scratch dirs and non-directory entries.
-            if name_str.starts_with('_') {
+        for algo_entry in algo_dirs.flatten() {
+            let algo_name = algo_entry.file_name();
+            let algo_str = algo_name.to_string_lossy();
+            // Skip scratch dirs (_scratch/) and non-directory entries.
+            if algo_str.starts_with('_') || !algo_entry.path().is_dir() {
                 continue;
             }
-            if entry.path().is_dir() {
-                identities.push(format!("sha256:{name_str}"));
+            let Ok(hex_entries) = std::fs::read_dir(algo_entry.path()) else {
+                continue;
+            };
+            for hex_entry in hex_entries.flatten() {
+                let name = hex_entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with('_') {
+                    continue;
+                }
+                if hex_entry.path().is_dir() {
+                    identities.push(format!("{algo_str}:{name_str}"));
+                }
             }
         }
         identities.sort();
         identities
     }
 
-    /// Resolve a hex-digest prefix (with or without `sha256:` algorithm prefix)
-    /// to a full identity string.
+    /// Resolve a hex-digest prefix (with or without algorithm prefix) to a full
+    /// identity string.
     ///
     /// Rules (spec/identity.md §3, C-store-ro slice):
-    /// - Full identity (64-hex bare or `sha256:<64hex>`) → exact lookup.
+    /// - Full identity (64-hex bare or `<algo>:<64hex>`) → exact lookup.
     ///   Present → return the full identity.  Absent → `CAS-NOT-IN-STORE`.
     /// - Prefix whose hex portion is ≥16 chars → unique-prefix match.
     ///   Exactly 1 match → return the identity.  0 → `CAS-NOT-IN-STORE`.
@@ -95,22 +105,51 @@ impl CaStore {
     ///   the error catalog minimal.
     pub fn resolve_prefix(&self, prefix: &str) -> Result<String, CoreError> {
         // Strip optional algorithm prefix to get the raw hex portion.
-        let hex_part = if let Some(rest) = prefix.strip_prefix("sha256:") {
-            rest
+        let hex_part = if let Some(colon_pos) = prefix.find(':') {
+            &prefix[colon_pos + 1..]
         } else {
             prefix
         };
 
         // Exact match: 64-hex digest → direct lookup.
         if hex_part.len() == 64 {
-            let full_identity = format!("sha256:{hex_part}");
-            if self.path_for(&full_identity)?.is_dir() {
-                return Ok(full_identity);
+            // Build a canonical identity to look up. If there's an algo prefix,
+            // validate it; otherwise search all algorithms.
+            if prefix.contains(':') {
+                // Validate the claimed algorithm+digest via parse_identity.
+                let full_identity = prefix.to_string();
+                if self.path_for(&full_identity)?.is_dir() {
+                    return Ok(full_identity);
+                }
+                return Err(CoreError::Identity(
+                    "CAS-NOT-IN-STORE",
+                    format!("identity not in store: {full_identity:?}"),
+                ));
+            } else {
+                // Bare 64-hex: search all algorithm subdirs.
+                let matches: Vec<String> = self
+                    .list_identities()
+                    .into_iter()
+                    .filter(|id| {
+                        id.split_once(':')
+                            .map(|(_, h)| h == hex_part)
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                return match matches.len() {
+                    1 => Ok(matches.into_iter().next().unwrap()),
+                    0 => Err(CoreError::Identity(
+                        "CAS-NOT-IN-STORE",
+                        format!("no store entry matches bare hex {prefix:?}"),
+                    )),
+                    n => Err(CoreError::Identity(
+                        "STORE-AMBIGUOUS-PREFIX",
+                        format!(
+                            "bare hex {prefix:?} matches {n} store entries across algorithms"
+                        ),
+                    )),
+                };
             }
-            return Err(CoreError::Identity(
-                "CAS-NOT-IN-STORE",
-                format!("identity not in store: {full_identity:?}"),
-            ));
         }
 
         // Prefix match: enforce the 16-char minimum.
@@ -135,8 +174,8 @@ impl CaStore {
             .list_identities()
             .into_iter()
             .filter(|id| {
-                id.strip_prefix("sha256:")
-                    .map(|h| h.starts_with(hex_part))
+                id.split_once(':')
+                    .map(|(_, h)| h.starts_with(hex_part))
                     .unwrap_or(false)
             })
             .collect();
@@ -234,8 +273,9 @@ impl CaStore {
     /// - On **failure** the caller removes `sd.path` to avoid leaking scratch dirs.
     ///   (A future C-gc slice will age out any SIGKILL survivors under `_scratch/`.)
     ///
-    /// Both `_scratch/` and `sha256/` live directly under `root`, so the
-    /// rename(2) in `admit()` is guaranteed same-filesystem (no EXDEV).
+    /// Both `_scratch/` and the algorithm dirs (e.g. `dag-sha256/`) live directly
+    /// under `root`, so the rename(2) in `admit()` is guaranteed same-filesystem
+    /// (no EXDEV).
     pub fn scratch(&self) -> Result<ScratchDir, CoreError> {
         let scratch_root = self.root.join("_scratch");
         std::fs::create_dir_all(&scratch_root).map_err(|e| {
@@ -396,15 +436,15 @@ mod tests {
     }
 
     #[test]
-    fn admit_places_tree_under_sha256_hex() {
+    fn admit_places_tree_under_algo_hex() {
         let root = tmp();
         let store = CaStore::new(root.join("cas"));
         let scratch = scratch_tree(&root, "scratch", "hello");
         let identity = compute_content_hash(&scratch).unwrap();
 
         let canonical = store.admit(&scratch, &identity).unwrap();
-        let hex = identity.strip_prefix("sha256:").unwrap();
-        assert_eq!(canonical, root.join("cas").join("sha256").join(hex));
+        let (algo, hex) = identity.split_once(':').unwrap();
+        assert_eq!(canonical, root.join("cas").join(algo).join(hex));
         assert!(canonical.is_dir());
         assert_eq!(
             fs::read_to_string(canonical.join("file.txt")).unwrap(),
@@ -545,7 +585,7 @@ mod tests {
         let root = tmp();
         let store = CaStore::new(root.join("cas"));
         let scratch = scratch_tree(&root, "scratch", "actual contents");
-        let bogus = format!("sha256:{}", "b".repeat(64));
+        let bogus = format!("dag-sha256:{}", "b".repeat(64));
 
         let e = store.admit(&scratch, &bogus).unwrap_err();
         assert_eq!(e.code(), "CAS-IDENTITY-MISMATCH");
@@ -590,7 +630,7 @@ mod tests {
         let target = root.join("_deps").join("x");
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         let e = store
-            .link(&format!("sha256:{}", "c".repeat(64)), &target)
+            .link(&format!("dag-sha256:{}", "c".repeat(64)), &target)
             .unwrap_err();
         assert_eq!(e.code(), "CAS-NOT-IN-STORE");
         assert!(fs::symlink_metadata(&target).is_err()); // no dangling symlink
@@ -678,11 +718,11 @@ mod tests {
     }
 
     #[test]
-    fn scratch_is_sibling_of_sha256() {
+    fn scratch_is_sibling_of_algo_dirs() {
         let root = tmp();
         let store = CaStore::new(root.join("cas"));
         let sd = store.scratch().unwrap();
-        // <cas_root>/_scratch/ must be a sibling of <cas_root>/sha256/
+        // <cas_root>/_scratch/ must be a direct sibling of algorithm dirs (e.g. dag-sha256/)
         assert_eq!(
             sd.path.parent().unwrap().parent().unwrap(),
             root.join("cas"),

@@ -1,4 +1,4 @@
-lib-consumer -> <CAS_ROOT>/sha256/b8f9588e661ede97b7e4bcda01d4ac121979d279a60b6a0fce90558c85806d6f/
-lib-enabler -> <CAS_ROOT>/sha256/966153c4a61aed945600f17b8ec7c77bc7e475467f520b991125882db706c3ec/
-lib-end -> <CAS_ROOT>/sha256/fae64ab2a378f93e6e02b38da2db679d053f96d95da668cb9f536b67c5b12549/
-lib-target -> <CAS_ROOT>/sha256/417f5f4e7cd9015749667262e5ccd9a17293064a76e5d2cbf2b8cfc99cd8221b/
+lib-consumer -> <CAS_ROOT>/dag-sha256/b8f9588e661ede97b7e4bcda01d4ac121979d279a60b6a0fce90558c85806d6f/
+lib-enabler -> <CAS_ROOT>/dag-sha256/966153c4a61aed945600f17b8ec7c77bc7e475467f520b991125882db706c3ec/
+lib-end -> <CAS_ROOT>/dag-sha256/fae64ab2a378f93e6e02b38da2db679d053f96d95da668cb9f536b67c5b12549/
+lib-target -> <CAS_ROOT>/dag-sha256/417f5f4e7cd9015749667262e5ccd9a17293064a76e5d2cbf2b8cfc99cd8221b/

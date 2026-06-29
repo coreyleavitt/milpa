@@ -359,7 +359,7 @@ mod tests {
         ResolvedDep {
             name: name.into(),
             namespace: None,
-            identity: "sha256:00".into(),
+            identity: "dag-sha256:00".into(),
             version: Version::release(0, 0, 1),
             src_dir: src_dir.into(),
             requires: vec![],
@@ -447,7 +447,7 @@ mod tests {
         ResolvedDep {
             name: name.into(),
             namespace: None,
-            identity: "sha256:00".into(),
+            identity: "dag-sha256:00".into(),
             version: Version::release(0, 0, 1),
             src_dir: src_dir.into(),
             requires: vec![],
@@ -539,7 +539,7 @@ mod tests {
         ResolvedDep {
             name: name.into(),
             namespace: None,
-            identity: "sha256:00".into(),
+            identity: "dag-sha256:00".into(),
             version: Version::release(0, 0, 1),
             src_dir: String::new(),
             requires: vec![],

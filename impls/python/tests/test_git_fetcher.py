@@ -218,9 +218,9 @@ class TestGitFetcherHappyPath:
         registry.register(GitFetcher())
         result = registry.fetch("mylib", GitProvenance(url=str(repo), ref="main"), dest=dest)
         # identity is on result, not in receipt transport_fields
-        assert result.identity.startswith("sha256:")
+        assert result.identity.startswith("dag-sha256:")
         for v in result.receipt.transport_fields().values():
-            assert not v.startswith("sha256:")
+            assert not v.startswith("dag-sha256:")
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +363,7 @@ class TestGitFetcherNoNetwork:
         result = registry.fetch("pkg", GitProvenance(url=str(repo), ref="main"), dest=dest)
         assert result.name == "pkg"
         assert result.path == dest
-        assert result.identity.startswith("sha256:")
+        assert result.identity.startswith("dag-sha256:")
         assert result.receipt.transport_fields()["commit_sha"] == sha
 
 
@@ -657,7 +657,7 @@ class TestMaterializeGitTreeBaseline:
 
         # The hash computed over the materialized tree must be stable.
         h = compute_content_hash(dest)
-        assert h.startswith("sha256:")
+        assert h.startswith("dag-sha256:")
         # Re-compute: identical
         assert compute_content_hash(dest) == h
 
@@ -1248,7 +1248,7 @@ class TestH5SubmoduleRecursion:
         )
 
         h = compute_content_hash(dest)
-        assert h.startswith("sha256:")
+        assert h.startswith("dag-sha256:")
         # Re-hash: must be stable.
         assert compute_content_hash(dest) == h
         # Without submodule content, the hash would differ from a repo that
@@ -2175,7 +2175,7 @@ class TestR104SubmoduleShasEndToEnd:
         from milpa.lockfile import LockedDep, Lockfile
         dep = LockedDep(
             name="mylib",
-            identity="sha256:" + "a" * 64,
+            identity="dag-sha256:" + "a" * 64,
             version="0.0.1",
             src_dir="",
             requires=(),
@@ -2229,7 +2229,7 @@ class TestR104SubmoduleShasEndToEnd:
         # Round-trip through lockfile.
         dep = LockedDep(
             name="superlib",
-            identity="sha256:" + "a" * 64,
+            identity="dag-sha256:" + "a" * 64,
             version="0.0.1",
             src_dir="",
             requires=(),

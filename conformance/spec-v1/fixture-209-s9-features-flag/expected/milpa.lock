@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "featurelib" {
-    identity "sha256:25294c1843da6cc519fe5c3b5994d8de156183009f6b65e4d691ba06964a7449"
+    identity "dag-sha256:25294c1843da6cc519fe5c3b5994d8de156183009f6b65e4d691ba06964a7449"
     version "0.0.1"
     src_dir ""
     requires

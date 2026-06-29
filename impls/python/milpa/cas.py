@@ -111,26 +111,34 @@ class CAStore:
     def list_identities(self) -> list[str]:
         """Return a lexicographically sorted list of all identities in the store.
 
-        Scans ``<root>/<algorithm>/<hex-digest>/`` directories.  Only the
-        ``sha256`` algorithm directory is expected per spec/identity.md §3.
-        Empty store → empty list.  Entries are returned in the canonical
-        ``sha256:<64hex>`` form.
+        Scans ``<root>/<algorithm>/<hex-digest>/`` directories generically —
+        enumerates every algorithm subdir under the CAS root (spec/identity.md §3.1).
+        Empty store → empty list.  Entries are returned in canonical
+        ``<algorithm>:<64hex>`` form.
         """
         identities: list[str] = []
-        sha256_dir = self.root / "sha256"
-        if sha256_dir.is_dir():
-            for entry in sha256_dir.iterdir():
+        if not self.root.is_dir():
+            return identities
+        for algo_dir in self.root.iterdir():
+            # Skip scratch dir and any non-directory entries.
+            if algo_dir.name.startswith("_") or not algo_dir.is_dir():
+                continue
+            for entry in algo_dir.iterdir():
                 if entry.is_dir() and not entry.name.startswith("_"):
-                    identities.append(f"sha256:{entry.name}")
+                    identities.append(f"{algo_dir.name}:{entry.name}")
         identities.sort()
         return identities
 
     def resolve_prefix(self, prefix: str) -> str:
-        """Resolve a hex-digest prefix (with or without ``sha256:`` algorithm prefix)
+        """Resolve a hex-digest prefix (with or without an algorithm prefix)
         to a full identity string.
 
+        Generic: strips any ``<algo>:`` prefix to get the bare hex portion;
+        does NOT hardcode ``sha256:`` (spec/identity.md §3.1 — store layout is
+        algorithm-generic).
+
         Rules (spec/identity.md §3, C-store-ro slice):
-        - A complete identity (``sha256:<64hex>`` or bare 64-hex) → exact lookup.
+        - A complete identity (``<algo>:<64hex>`` or bare 64-hex) → exact lookup.
           Present → return the full identity.  Absent → raise ``CAS-NOT-IN-STORE``.
         - Else treat as a prefix of the hex digest.  The hex portion of the prefix
           MUST be at least 16 characters; anything shorter is rejected as
@@ -144,20 +152,45 @@ class CAStore:
         The caller may then use ``path_for(identity)`` on the returned identity.
         """
         # Strip optional algorithm prefix to get the raw hex portion of the arg.
-        if prefix.startswith("sha256:"):
-            hex_part = prefix[len("sha256:"):]
+        if ":" in prefix:
+            _, _, hex_part = prefix.partition(":")
+            algo_prefix: str | None = prefix[: prefix.index(":")]
         else:
             hex_part = prefix
+            algo_prefix = None
 
         # Exact match: 64-hex digest → direct lookup.
         if len(hex_part) == 64:
-            full_identity = f"sha256:{hex_part}"
-            if self.contains(full_identity):
-                return full_identity
+            # If a full identity was supplied (algo:hex), validate and look up directly.
+            if algo_prefix is not None:
+                full_identity = f"{algo_prefix}:{hex_part}"
+                if self.contains(full_identity):
+                    return full_identity
+                raise MilpaError(
+                    CAS_NOT_IN_STORE,
+                    f"identity not in store: {full_identity!r}",
+                    identity=full_identity,
+                )
+            # Bare 64-hex: search all algorithms for a match.
+            matches = [
+                identity
+                for identity in self.list_identities()
+                if identity.partition(":")[2] == hex_part
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) == 0:
+                raise MilpaError(
+                    CAS_NOT_IN_STORE,
+                    f"identity not in store: {prefix!r}",
+                    identity=prefix,
+                )
             raise MilpaError(
-                CAS_NOT_IN_STORE,
-                f"identity not in store: {full_identity!r}",
-                identity=full_identity,
+                STORE_AMBIGUOUS_PREFIX,
+                f"bare hex prefix {prefix!r} matches {len(matches)} store entries "
+                f"across multiple algorithms (need an algorithm prefix to disambiguate)",
+                prefix=prefix,
+                matches=list(matches),
             )
 
         # Prefix match: enforce the 16-char minimum.
@@ -178,7 +211,8 @@ class CAStore:
         matches = [
             identity
             for identity in self.list_identities()
-            if identity[len("sha256:"):].startswith(hex_part)
+            if identity.partition(":")[2].startswith(hex_part)
+            and (algo_prefix is None or identity.startswith(f"{algo_prefix}:"))
         ]
 
         if len(matches) == 1:

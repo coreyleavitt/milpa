@@ -2072,7 +2072,7 @@ fn cas_admitting_fetcher_produces_cas_symlink_at_dest() {
     assert_eq!(std::fs::read(dest.join("bar.nim")).unwrap(), b"# bar");
 
     // The CAS entry lives under <cas_root>/sha256/<hex>/.
-    assert!(cas_root.join("sha256").is_dir());
+    assert!(cas_root.join("dag-sha256").is_dir());
 }
 
 // Local provenance through CasAdmittingFetcher must NOT be admitted to CAS.
@@ -2108,7 +2108,7 @@ fn cas_admitting_fetcher_local_provenance_is_live_symlink_not_cas_admitted() {
 
     // CAS must NOT have been populated (no sha256/ subdir created).
     assert!(
-        !cas_root.join("sha256").is_dir(),
+        !cas_root.join("dag-sha256").is_dir(),
         "CAS must not be populated for Local provenance"
     );
 
@@ -2163,8 +2163,8 @@ fn cas_admitting_fetcher_no_scratch_leaked_after_success() {
 }
 
 #[test]
-fn cas_admitting_fetcher_scratch_is_sibling_of_sha256() {
-    // C-stage layout: <cas_root>/_scratch/ and <cas_root>/sha256/ are siblings.
+fn cas_admitting_fetcher_scratch_is_sibling_of_algo_dir() {
+    // C-stage layout: <cas_root>/_scratch/ and <cas_root>/dag-sha256/ are siblings.
     let d = tmp();
     let mocked = d.path().join("mocked-fetches");
     let key = super::url_key("https://github.com/example/layout.git", "main");
@@ -2186,14 +2186,14 @@ fn cas_admitting_fetcher_scratch_is_sibling_of_sha256() {
     };
     FetcherRegistry::fetch(&fetcher, "layout", &p, &dest).unwrap();
 
-    // sha256/ is a direct child of cas_root.
-    assert!(cas_root.join("sha256").is_dir());
+    // dag-sha256/ is a direct child of cas_root.
+    assert!(cas_root.join("dag-sha256").is_dir());
     // If _scratch/ was created it must also be a direct child of cas_root.
     if cas_root.join("_scratch").exists() {
         assert_eq!(
             cas_root.join("_scratch").parent().unwrap(),
             cas_root,
-            "_scratch/ must be a direct sibling of sha256/ under cas_root"
+            "_scratch/ must be a direct sibling of dag-sha256/ under cas_root"
         );
     }
 }
@@ -3126,7 +3126,7 @@ fn h3c_a_materialize_git_tree_basic() {
     // content_hash must be stable across re-computations.
     use crate::identity::compute_content_hash;
     let h = compute_content_hash(&dest).unwrap();
-    assert!(h.starts_with("sha256:"), "content_hash must be sha256: prefixed");
+    assert!(h.starts_with("dag-sha256:"), "content_hash must be dag-sha256: prefixed");
     assert_eq!(compute_content_hash(&dest).unwrap(), h, "hash must be stable");
 }
 
@@ -3574,7 +3574,7 @@ fn h3c_cross_impl_hash_invariant_single_lf_file() {
     let h1 = compute_content_hash(&dest1).unwrap();
     let h2 = compute_content_hash(&dest2).unwrap();
     assert_eq!(h1, h2, "H3c: same committed content must hash identically across two materializations");
-    assert!(h1.starts_with("sha256:"), "hash must be sha256: prefixed");
+    assert!(h1.starts_with("dag-sha256:"), "hash must be dag-sha256: prefixed");
 
     // Verify the bytes are LF (what was committed — not CRLF from smudge).
     assert_eq!(std::fs::read(dest1.join("data.nim")).unwrap(), b"# convergence\n");
@@ -3898,5 +3898,143 @@ fn no_checkout_clone(src: &std::path::Path, dest: &std::path::Path) -> Result<()
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A0 — Receipt::identity pin tests (milpa hash architectural pin)
+// ---------------------------------------------------------------------------
+//
+// `DefaultRegistry::fetch` sets `Receipt::identity` for CAS-admissible provenances.
+// `milpa hash` reads from this field — it must NOT call `compute_content_hash`
+// directly (spec/cli-contract.md §5.11 NORMATIVE).
+//
+// These tests prove: (a) identity is set and has the right format;
+// (b) the identity equals what `compute_content_hash` would produce independently;
+// (c) CasAdmittingFetcher::inner() is accessible for identity probing.
+
+/// A0-pin-1: `DefaultRegistry::fetch` for a git prov sets `Receipt::identity`
+/// to a `sha256:<64hex>` string.
+#[test]
+fn a0_default_registry_fetch_sets_identity_for_git_prov() {
+    let d = tmp();
+    let repo = d.path().join("origin");
+    let Some(sha) = make_repo(&repo) else {
+        eprintln!("skipping: git unavailable");
+        return;
+    };
+    let url = format!("file://{}", repo.display());
+    let dest = d.path().join("dest");
+
+    let registry = DefaultRegistry::with_curl();
+    let prov = milpa_types::Provenance::Git {
+        url: url.clone(),
+        ref_spec: sha.clone(),
+        commit_sha: None,
+    };
+    let receipt = registry.fetch("dep", &prov, &dest).unwrap();
+
+    let identity = receipt.identity.as_deref().expect("git prov must set Receipt::identity");
+    assert!(
+        identity.starts_with("dag-sha256:"),
+        "identity must start with sha256:, got {identity:?}"
+    );
+    assert_eq!(
+        identity.len(),
+        "dag-sha256:".len() + 64,
+        "identity must be sha256:<64hex>, got {identity:?}"
+    );
+}
+
+/// A0-pin-2: `Receipt::identity` from `DefaultRegistry::fetch` equals the value
+/// that `compute_content_hash` produces on the same materialized tree.
+///
+/// This is the ARCHITECTURAL PROOF: identity printed by `milpa hash` is the
+/// same as what `milpa fetch` would compute — because they use the same
+/// `DefaultRegistry::fetch` code path.
+#[test]
+fn a0_receipt_identity_equals_compute_content_hash() {
+    let d = tmp();
+    let repo = d.path().join("origin");
+    let Some(sha) = make_repo(&repo) else {
+        eprintln!("skipping: git unavailable");
+        return;
+    };
+    let url = format!("file://{}", repo.display());
+    let dest = d.path().join("dest");
+
+    let registry = DefaultRegistry::with_curl();
+    let prov = milpa_types::Provenance::Git {
+        url,
+        ref_spec: sha,
+        commit_sha: None,
+    };
+    let receipt = registry.fetch("dep", &prov, &dest).unwrap();
+    let from_receipt = receipt.identity.clone().expect("git prov must set identity");
+
+    // Independent computation on the same tree.
+    let direct = crate::identity::compute_content_hash(&dest).unwrap();
+    assert_eq!(
+        from_receipt, direct,
+        "Receipt::identity must equal compute_content_hash on the materialized tree"
+    );
+}
+
+/// A0-pin-3: `DefaultRegistry::fetch` for a local prov leaves `Receipt::identity`
+/// as `None` (local/editable sources have no stable identity).
+#[test]
+fn a0_default_registry_fetch_no_identity_for_local_prov() {
+    let d = tmp();
+    let src = d.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("mod.nim"), b"discard").unwrap();
+    let dest = d.path().join("_deps/mylib");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+
+    let registry = DefaultRegistry::with_curl();
+    let prov = milpa_types::Provenance::Local { path: src.to_string_lossy().into_owned() };
+    let receipt = registry.fetch("mylib", &prov, &dest).unwrap();
+
+    assert!(
+        receipt.identity.is_none(),
+        "local prov must NOT set identity (no stable identity for editable trees)"
+    );
+}
+
+/// A0-pin-4: `CasAdmittingFetcher::inner()` accessor returns the inner registry;
+/// calling fetch on it sets `Receipt::identity` for git provenances.
+#[test]
+fn a0_cas_admitting_fetcher_inner_returns_registry_with_identity() {
+    let d = tmp();
+    let repo = d.path().join("origin");
+    let Some(sha) = make_repo(&repo) else {
+        eprintln!("skipping: git unavailable");
+        return;
+    };
+    let url = format!("file://{}", repo.display());
+    let dest = d.path().join("dest");
+
+    let store = crate::store::CaStore::new(d.path().join("cas"));
+    let cas = CasAdmittingFetcher::new(DefaultRegistry::with_curl(), store);
+    let prov = milpa_types::Provenance::Git {
+        url,
+        ref_spec: sha,
+        commit_sha: None,
+    };
+    // Call inner() directly — same as what milpa hash uses.
+    let receipt = cas.inner().fetch("dep", &prov, &dest).unwrap();
+    assert!(
+        receipt.identity.as_deref().map(|id| id.starts_with("dag-sha256:")).unwrap_or(false),
+        "inner().fetch() must set Receipt::identity for git prov"
+    );
+    // CAS must NOT have any entries (inner fetch bypasses CAS admission).
+    let cas_dag_sha256 = d.path().join("cas/dag-sha256");
+    if cas_dag_sha256.exists() {
+        let entries: Vec<_> = std::fs::read_dir(&cas_dag_sha256).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "inner().fetch() must NOT admit to CAS; found {} entries",
+            entries.len()
+        );
     }
 }

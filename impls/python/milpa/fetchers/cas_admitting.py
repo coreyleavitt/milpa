@@ -69,6 +69,16 @@ class CasAdmittingFetcher:
         self._store = store
         self._limits = limits
 
+    @property
+    def inner(self) -> FetcherRegistry:
+        """The underlying FetcherRegistry (no CAS, no side-effects).
+
+        Used by ``milpa hash`` to fetch into a throwaway scratch directory
+        and obtain the content identity without CAS admission.  The caller
+        is responsible for discarding the scratch directory after use.
+        """
+        return self._inner
+
     def fetch(
         self,
         name: str,

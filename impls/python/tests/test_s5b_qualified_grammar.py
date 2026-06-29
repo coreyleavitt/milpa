@@ -223,7 +223,7 @@ def test_lookup_qualified_bypasses_ambiguous() -> None:
             namespace="core",
             versions=(IndexVersion(
                 version="1.0.0",
-                content_hash="sha256:" + "0" * 62 + "01",
+                content_hash="dag-sha256:" + "0" * 62 + "01",
                 provenances=(GitIndexProvenance(
                     url="https://example.com/core/alpha.git",
                     ref="v1.0.0",
@@ -236,7 +236,7 @@ def test_lookup_qualified_bypasses_ambiguous() -> None:
             namespace="third-party",
             versions=(IndexVersion(
                 version="2.0.0",
-                content_hash="sha256:" + "0" * 62 + "02",
+                content_hash="dag-sha256:" + "0" * 62 + "02",
                 provenances=(GitIndexProvenance(
                     url="https://example.com/tp/alpha.git",
                     ref="v2.0.0",
@@ -282,7 +282,7 @@ def test_resolve_named_all_qualified() -> None:
             namespace="core",
             versions=(IndexVersion(
                 version="1.0.0",
-                content_hash="sha256:" + "0" * 62 + "01",
+                content_hash="dag-sha256:" + "0" * 62 + "01",
                 provenances=(GitIndexProvenance(
                     url="https://example.com/core/alpha.git",
                     ref="v1.0.0",
@@ -295,7 +295,7 @@ def test_resolve_named_all_qualified() -> None:
             namespace="third-party",
             versions=(IndexVersion(
                 version="2.0.0",
-                content_hash="sha256:" + "0" * 62 + "02",
+                content_hash="dag-sha256:" + "0" * 62 + "02",
                 provenances=(GitIndexProvenance(
                     url="https://example.com/tp/alpha.git",
                     ref="v2.0.0",
@@ -330,8 +330,8 @@ def test_resolve_two_namespaced_deps_distinct(tmp_path: Path) -> None:
     from milpa.version import Strategy
     from milpa.fetchers.mocked import MockedGitFetcher
 
-    content_hash_core = "sha256:" + "a" * 64
-    content_hash_tp = "sha256:" + "b" * 64
+    content_hash_core = "dag-sha256:" + "a" * 64
+    content_hash_tp = "dag-sha256:" + "b" * 64
 
     idx = Index(packages=[
         Package(
@@ -483,7 +483,7 @@ strategy "maxver"
 
 dep "bar" {
     namespace "ns1"
-    identity "sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
+    identity "dag-sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
     version "1.0.0"
     src_dir "src"
     requires
@@ -514,7 +514,7 @@ strategy "maxver"
 
 dep "bar" {
     namespace "ns1"
-    identity "sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
+    identity "dag-sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
     version "1.0.0"
     src_dir "src"
     requires
@@ -542,7 +542,7 @@ strategy "maxver"
 
 dep "bar" {
     namespace "ns1"
-    identity "sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
+    identity "dag-sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
     version "1.0.0"
     src_dir "src"
     requires
@@ -576,7 +576,7 @@ version 1
 strategy "maxver"
 
 dep "bar" {
-    identity "sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
+    identity "dag-sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
     version "1.0.0"
     src_dir "src"
     requires
@@ -688,7 +688,7 @@ strategy "maxver"
 
 dep "bar" {
     namespace "ns/../../outside"
-    identity "sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
+    identity "dag-sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
     version "1.0.0"
     src_dir "src"
     requires
@@ -718,7 +718,7 @@ strategy "maxver"
 
 dep "bar" {
     namespace ".."
-    identity "sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
+    identity "dag-sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
     version "1.0.0"
     src_dir "src"
     requires
@@ -750,7 +750,7 @@ strategy "maxver"
 
 dep "bar" {
     namespace ""
-    identity "sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
+    identity "dag-sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
     version "1.0.0"
     src_dir "src"
     requires

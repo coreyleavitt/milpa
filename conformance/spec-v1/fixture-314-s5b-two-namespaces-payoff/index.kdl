@@ -2,7 +2,7 @@ schema_version 1
 package "bar" {
     namespace "ns1"
     version "1.0.0" {
-        content_hash "sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
+        content_hash "dag-sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
         provenance {
             kind "git"
             url "https://github.com/ns1/bar.git"
@@ -14,7 +14,7 @@ package "bar" {
 package "bar" {
     namespace "ns2"
     version "2.0.0" {
-        content_hash "sha256:09930ae60b7bac991a5602b905f841a3cdc2e0bbc7e88a7421a305b3c100a56e"
+        content_hash "dag-sha256:09930ae60b7bac991a5602b905f841a3cdc2e0bbc7e88a7421a305b3c100a56e"
         provenance {
             kind "git"
             url "https://github.com/ns2/bar.git"

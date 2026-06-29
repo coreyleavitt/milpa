@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "lib-b" {
-    identity "sha256:97758f23c28d05e720b62608d658b54977cfafb206c7a81c23ce5498d0dbb7ee"
+    identity "dag-sha256:97758f23c28d05e720b62608d658b54977cfafb206c7a81c23ce5498d0dbb7ee"
     version "0.0.1"
     src_dir ""
     requires "lib-c"
@@ -18,7 +18,7 @@ dep "lib-b" {
 }
 
 dep "lib-c" {
-    identity "sha256:bd73cb846e6b0da2af09cc500e766442b644b153ea9d485e54c920d765919ddf"
+    identity "dag-sha256:bd73cb846e6b0da2af09cc500e766442b644b153ea9d485e54c920d765919ddf"
     version "0.0.1"
     src_dir ""
     requires
@@ -32,7 +32,7 @@ dep "lib-c" {
 }
 
 dep "member-a" {
-    identity "sha256:eab8947c6f1cf7591d1cf9b52c0a6b65457ffeeffa3f13ed605970840584584e"
+    identity "dag-sha256:eab8947c6f1cf7591d1cf9b52c0a6b65457ffeeffa3f13ed605970840584584e"
     version "0.0.1"
     src_dir ""
     requires "lib-b"

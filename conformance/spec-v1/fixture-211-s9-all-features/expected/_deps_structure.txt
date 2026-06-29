@@ -1,2 +1,2 @@
-debuglib -> <CAS_ROOT>/sha256/612f0f3d4b4d47051306c28466cf65ce05b9223285179ef9c087f6005bd1699e/
-tlslib -> <CAS_ROOT>/sha256/2ac25ea74f0747af23d9eaff360bea2d822b7bfa88dfe4dad370357fb49bd9d6/
+debuglib -> <CAS_ROOT>/dag-sha256/612f0f3d4b4d47051306c28466cf65ce05b9223285179ef9c087f6005bd1699e/
+tlslib -> <CAS_ROOT>/dag-sha256/2ac25ea74f0747af23d9eaff360bea2d822b7bfa88dfe4dad370357fb49bd9d6/

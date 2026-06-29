@@ -52,8 +52,24 @@ def make_tree(files: dict[str, tuple[str, bool]], root: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_supported_algorithms_contains_sha256() -> None:
-    assert "sha256" in SUPPORTED_ALGORITHMS
+def test_supported_algorithms_contains_dag_sha256() -> None:
+    """A1: canonical scheme is dag-sha256; sha256 is not in the supported set."""
+    assert "dag-sha256" in SUPPORTED_ALGORITHMS
+    assert "sha256" not in SUPPORTED_ALGORITHMS
+
+
+def test_sha256_prefix_rejected_as_unsupported_algorithm() -> None:
+    """A1: stale sha256: identity string → ID-UNSUPPORTED-ALGORITHM (no legacy tier)."""
+    stale = "sha256:" + "a" * 64
+    with pytest.raises(MilpaError) as exc_info:
+        parse_identity(stale)
+    assert exc_info.value.slug == ID_UNSUPPORTED_ALGORITHM
+
+
+def test_dag_sha256_prefix_accepted() -> None:
+    """A1: dag-sha256:<64hex> is the canonical form and must round-trip."""
+    valid = "dag-sha256:" + "a" * 64
+    assert parse_identity(valid) == valid
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +125,9 @@ def test_parse_identity_unsupported_algorithm(algo: str) -> None:
 
 @pytest.mark.parametrize("length", [0, 1, 32, 63, 65, 128])
 def test_parse_identity_wrong_digest_length(length: int) -> None:
-    """Check 4: sha256 digest not exactly 64 chars → ID-WRONG-DIGEST-LENGTH."""
+    """Check 4: dag-sha256 digest not exactly 64 chars → ID-WRONG-DIGEST-LENGTH."""
     with pytest.raises(MilpaError) as exc_info:
-        parse_identity(f"sha256:{'a' * length}")
+        parse_identity(f"dag-sha256:{'a' * length}")
     assert exc_info.value.slug == ID_WRONG_DIGEST_LENGTH
 
 
@@ -134,7 +150,7 @@ def test_parse_identity_non_hex_digest(digest: str) -> None:
     """Check 5: non-lowercase-hex chars in digest → ID-NON-HEX-DIGEST."""
     assert len(digest) == 64, "test setup: digest must be exactly 64 chars"
     with pytest.raises(MilpaError) as exc_info:
-        parse_identity(f"sha256:{digest}")
+        parse_identity(f"dag-sha256:{digest}")
     assert exc_info.value.slug == ID_NON_HEX_DIGEST
 
 
@@ -144,15 +160,15 @@ def test_parse_identity_non_hex_digest(digest: str) -> None:
 
 
 def test_parse_identity_valid_lowercase_hex_accepted() -> None:
-    """A well-formed sha256 identity is accepted and returned unchanged."""
-    valid = "sha256:" + "a" * 64
+    """A well-formed dag-sha256 identity is accepted and returned unchanged."""
+    valid = "dag-sha256:" + "a" * 64
     assert parse_identity(valid) == valid
 
 
 def test_parse_identity_valid_uses_full_hex_alphabet() -> None:
     """All of 0-9 + a-f are accepted."""
     digest = ("0123456789abcdef" * 4)[:64]
-    valid = f"sha256:{digest}"
+    valid = f"dag-sha256:{digest}"
     assert parse_identity(valid) == valid
 
 
@@ -160,7 +176,7 @@ def test_parse_identity_uppercase_f_rejected() -> None:
     """Uppercase hex is explicitly rejected (§2.1: MUST use lowercase)."""
     digest = "F" * 64  # uppercase F — hex but wrong case
     with pytest.raises(MilpaError) as exc_info:
-        parse_identity(f"sha256:{digest}")
+        parse_identity(f"dag-sha256:{digest}")
     assert exc_info.value.slug == ID_NON_HEX_DIGEST
 
 
@@ -301,8 +317,8 @@ def test_broken_symlink_does_not_crash(tmp_path: Path) -> None:
     tmp.mkdir()
     os.symlink("/nonexistent/elsewhere", tmp / "broken")
     result = compute_content_hash(tmp)
-    assert result.startswith("sha256:")
-    digest = result[len("sha256:"):]
+    assert result.startswith("dag-sha256:")
+    digest = result[len("dag-sha256:"):]
     assert len(digest) == 64
     assert all(c in "0123456789abcdef" for c in digest)
 
@@ -313,12 +329,15 @@ def test_broken_symlink_does_not_crash(tmp_path: Path) -> None:
 
 
 def test_empty_tree_hashes_empty_byte_stream(tmp_path: Path) -> None:
-    """An empty tree produces sha256 of the empty byte stream (§1.2)."""
+    """An empty tree produces sha256 of the empty byte stream (§1.2).
+
+    A1: the prefix is dag-sha256: but the digest value is unchanged (flat SHA-256).
+    """
     tmp = tmp_path / "empty"
     tmp.mkdir()
-    # sha256("") = e3b0c44...
+    # sha256("") = e3b0c44...; A1 renames the prefix to dag-sha256:
     assert compute_content_hash(tmp) == (
-        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        "dag-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     )
 
 
@@ -327,18 +346,18 @@ def test_empty_tree_hashes_empty_byte_stream(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_output_has_sha256_prefix(tmp_path: Path) -> None:
-    """Output always starts with 'sha256:' (§2.1)."""
+def test_output_has_dag_sha256_prefix(tmp_path: Path) -> None:
+    """Output always starts with 'dag-sha256:' (§2.1, A1 epoch)."""
     tmp = make_tree({"a.nim": ("echo hi\n", False)}, tmp_path / "t")
     result = compute_content_hash(tmp)
-    assert result.startswith("sha256:")
+    assert result.startswith("dag-sha256:")
 
 
 def test_output_hex_is_64_lowercase_chars(tmp_path: Path) -> None:
     """The digest part is exactly 64 lowercase hex chars (§2.1)."""
     tmp = make_tree({"a.nim": ("echo hi\n", False)}, tmp_path / "t")
     result = compute_content_hash(tmp)
-    digest = result[len("sha256:"):]
+    digest = result[len("dag-sha256:"):]
     assert len(digest) == 64
     assert all(c in "0123456789abcdef" for c in digest)
 
@@ -360,7 +379,7 @@ def test_output_is_valid_per_parse_identity(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 RUST_ORACLE_HASH = (
-    "sha256:85f2eb93585a6870b118351b14b8e32a4f55d61809f1612aaca5bae3c3db61cd"
+    "dag-sha256:85f2eb93585a6870b118351b14b8e32a4f55d61809f1612aaca5bae3c3db61cd"
 )
 
 

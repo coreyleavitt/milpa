@@ -290,14 +290,22 @@ pub(crate) fn curl_streaming_transport(
 }
 
 impl FetcherRegistry for DefaultRegistry {
+    /// Dispatch to the per-transport fetcher, then compute and attach the
+    /// content identity for CAS-admissible provenances (git / tarball / OCI).
+    ///
+    /// A0 architectural pin: this is the single site where `compute_content_hash`
+    /// is called in the fetch path. Both `CasAdmittingFetcher::fetch` (for
+    /// production CAS admission) and `milpa hash` (via the inner registry) read
+    /// the identity from `Receipt::identity` — they MUST NOT call
+    /// `compute_content_hash` themselves (spec/cli-contract.md §5.11 NORMATIVE).
     fn fetch(&self, name: &str, p: &Provenance, dest: &Path) -> Result<Receipt, FetchError> {
-        match p {
-            Provenance::Local { path } => fetch_local(name, Path::new(path), dest),
+        let mut receipt = match p {
+            Provenance::Local { path } => fetch_local(name, Path::new(path), dest)?,
             Provenance::Git {
                 url,
                 ref_spec,
                 commit_sha,
-            } => fetch_git(name, url, ref_spec, commit_sha.as_deref(), dest),
+            } => fetch_git(name, url, ref_spec, commit_sha.as_deref(), dest)?,
             Provenance::Tarball {
                 url,
                 expected_sha256,
@@ -309,13 +317,25 @@ impl FetcherRegistry for DefaultRegistry {
                 *strip_components,
                 dest,
                 self.http_get.as_ref(),
-            ),
+            )?,
             Provenance::Oci {
                 registry,
                 repository,
                 digest,
-            } => fetch_oci(name, registry, repository, digest, dest),
+            } => fetch_oci(name, registry, repository, digest, dest)?,
+        };
+        // Compute content identity for CAS-admissible provenances. Local/editable
+        // sources carry no stable identity (lockfile-schema.md §4.3 NORMATIVE).
+        if p.cas_admissible() {
+            use crate::identity::compute_content_hash;
+            receipt.identity = Some(compute_content_hash(dest).map_err(|e| {
+                FetchError::Failed(format!(
+                    "DefaultRegistry: compute identity for {name:?}: {}",
+                    e.message()
+                ))
+            })?);
         }
+        Ok(receipt)
     }
 }
 
@@ -1258,6 +1278,7 @@ pub fn fetch_git(
         resolved_ref: Some(commit),
         archive_sha256: None,
         submodule_shas,
+        identity: None,
     })
 }
 
@@ -1845,6 +1866,17 @@ impl<R: FetcherRegistry> CasAdmittingFetcher<R> {
     pub fn new(inner: R, store: crate::store::CaStore) -> Self {
         CasAdmittingFetcher { inner, store }
     }
+
+    /// Return a reference to the inner [`FetcherRegistry`].
+    ///
+    /// A0 architectural pin: `milpa hash` (and tests that need to probe
+    /// `Receipt::identity` without CAS side-effects) call the inner registry
+    /// directly. Callers MUST read identity from `Receipt::identity` — they
+    /// must NOT call `compute_content_hash` themselves
+    /// (spec/cli-contract.md §5.11 NORMATIVE).
+    pub fn inner(&self) -> &R {
+        &self.inner
+    }
 }
 
 impl<R: FetcherRegistry> FetcherRegistry for CasAdmittingFetcher<R> {
@@ -1886,12 +1918,23 @@ impl<R: FetcherRegistry> FetcherRegistry for CasAdmittingFetcher<R> {
                 }
             }
 
-            // Compute the identity and admit to the CAS.
-            use crate::identity::compute_content_hash;
-            let identity = compute_content_hash(&scratch.path).map_err(|e| {
-                let _ = std::fs::remove_dir_all(&scratch.path);
-                FetchError::Failed(format!("CasAdmittingFetcher: hash scratch tree: {}", e.message()))
-            })?;
+            // Prefer the identity pre-computed by the inner registry (A0 pin:
+            // `DefaultRegistry::fetch` sets `Receipt::identity` so `milpa hash`
+            // and this path share the same hash derivation). Fall back to
+            // `compute_content_hash` for inner registries that do not set identity
+            // (e.g. `MockedFetcher`, `FakeFetcher`) — keeps backward compat.
+            let identity = if let Some(id) = receipt.identity.clone() {
+                id
+            } else {
+                use crate::identity::compute_content_hash;
+                compute_content_hash(&scratch.path).map_err(|e| {
+                    let _ = std::fs::remove_dir_all(&scratch.path);
+                    FetchError::Failed(format!(
+                        "CasAdmittingFetcher: hash scratch tree: {}",
+                        e.message()
+                    ))
+                })?
+            };
             let admit_result = self.store.admit(&scratch.path, &identity).map_err(|e| {
                 let _ = std::fs::remove_dir_all(&scratch.path);
                 FetchError::Failed(format!("CasAdmittingFetcher: admit to CAS: {}", e.message()))

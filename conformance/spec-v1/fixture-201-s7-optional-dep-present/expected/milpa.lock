@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "optlib" {
-    identity "sha256:b8324d15003887580ef0f1c6e6cca1ef63561ba635cfdd9c209caf77f47a27b8"
+    identity "dag-sha256:b8324d15003887580ef0f1c6e6cca1ef63561ba635cfdd9c209caf77f47a27b8"
     version "0.0.1"
     src_dir ""
     requires

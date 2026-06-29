@@ -1,1 +1,1 @@
-lib-flags -> <CAS_ROOT>/sha256/0042a3fcba8ec348801638ad0b1d38244102c681fb006fef5cd6f5b0d03344fb/
+lib-flags -> <CAS_ROOT>/dag-sha256/0042a3fcba8ec348801638ad0b1d38244102c681fb006fef5cd6f5b0d03344fb/

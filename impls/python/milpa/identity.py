@@ -14,13 +14,19 @@ Canonical byte stream (identity.md §1.2):
         0x80 — symbolic link (content-bytes = link-target UTF-8)
     Empty directories contribute no bytes (§1.2).
 
-Identity string (identity.md §2.1):
-    sha256:<64-lowercase-hex-chars>
+Identity string (identity.md §2.1, A1 epoch):
+    dag-sha256:<64-lowercase-hex-chars>
+
+    The scheme prefix is dag-sha256 (A1). The underlying digest is still the flat
+    SHA-256 of the canonical byte stream; the Merkle-DAG computation is a later
+    slice (B1). A stale sha256: prefix is rejected as ID-UNSUPPORTED-ALGORITHM
+    at parse time — re-lock with `milpa fetch`.
 
 parse_identity five ordered checks (identity.md §2.2):
     1. Must be a string              → ID-NOT-A-STRING
     2. Must contain ':'              → ID-NO-ALGORITHM-PREFIX
-    3. Algorithm in supported set    → ID-UNSUPPORTED-ALGORITHM
+    3. Algorithm in CANONICAL_SCHEMES → ID-UNSUPPORTED-ALGORITHM
+       (sha256: and all other prefixes are rejected; only dag-sha256: is canonical)
     4. Digest length correct         → ID-WRONG-DIGEST-LENGTH
     5. Digest all lowercase hex      → ID-NON-HEX-DIGEST
 """
@@ -45,16 +51,16 @@ from milpa.errors import (
 )
 
 # ---------------------------------------------------------------------------
-# Algorithm table (identity.md §2.3 algorithm-agility dispatch)
+# Algorithm table (identity.md §2.2 two-tier scheme classification, A1)
 # ---------------------------------------------------------------------------
 
-#: The set of algorithm prefixes milpa currently accepts in identity strings.
-#: Adding a new algorithm: add it here and to _DIGEST_HEX_LEN below; no other
-#: changes required in this module.
-SUPPORTED_ALGORITHMS: frozenset[str] = frozenset({"sha256"})
+#: Canonical scheme set — the ONLY accepted prefixes in identity strings (A1).
+#: Stale sha256: and all other prefixes are rejected as ID-UNSUPPORTED-ALGORITHM.
+#: Adding a future canonical scheme: add it here and to _DIGEST_HEX_LEN below.
+SUPPORTED_ALGORITHMS: frozenset[str] = frozenset({"dag-sha256"})
 
-#: Expected hex-character length of the digest part for each algorithm.
-_DIGEST_HEX_LEN: dict[str, int] = {"sha256": 64}
+#: Expected hex-character length of the digest part for each canonical algorithm.
+_DIGEST_HEX_LEN: dict[str, int] = {"dag-sha256": 64}
 
 # ---------------------------------------------------------------------------
 # Mode markers (identity.md §1.2)
@@ -70,16 +76,21 @@ _MODE_SYMLINK: bytes = b"\x80"
 
 
 def parse_identity(s: Any) -> str:
-    """Validate a multihash-encoded identity string.
+    """Validate a milpa identity string (A1 two-tier scheme check).
 
     Applies the five ordered checks from identity.md §2.2 in order.
     Returns the input string unchanged when valid (the canonical form IS the
     input itself).
 
+    Only dag-sha256: is accepted (CANONICAL_SCHEMES = SUPPORTED_ALGORITHMS).
+    sha256: and all other prefixes → ID-UNSUPPORTED-ALGORITHM (no legacy tier;
+    re-lock with `milpa fetch`).
+
     Raises:
         MilpaError(ID_NOT_A_STRING)            — input is not a str
         MilpaError(ID_NO_ALGORITHM_PREFIX)     — no ':' separator
         MilpaError(ID_UNSUPPORTED_ALGORITHM)   — algorithm not in SUPPORTED_ALGORITHMS
+                                                 (includes stale sha256: identities)
         MilpaError(ID_WRONG_DIGEST_LENGTH)     — digest length wrong for algorithm
         MilpaError(ID_NON_HEX_DIGEST)         — digest contains non-lowercase-hex chars
     """
@@ -96,19 +107,26 @@ def parse_identity(s: Any) -> str:
         raise MilpaError(
             ID_NO_ALGORITHM_PREFIX,
             f"identity {s!r} is missing the algorithm prefix; "
-            f"expected '<algorithm>:<digest>' (e.g. 'sha256:abc...')",
+            f"expected '<algorithm>:<digest>' (e.g. 'dag-sha256:abc...')",
             identity=s,
         )
 
     algorithm, _, digest = s.partition(":")
 
-    # Check 3: algorithm must be supported (identity.md §2.2 rule 3)
+    # Check 3: algorithm must be in the canonical scheme set (identity.md §2.2 rule 3).
+    # Two-tier: CANONICAL_SCHEMES = {dag-sha256}; everything else (including the
+    # legacy sha256: prefix) is rejected with no compatibility path — re-lock.
     if algorithm not in SUPPORTED_ALGORITHMS:
         allowed = ", ".join(sorted(SUPPORTED_ALGORITHMS))
+        hint = (
+            " (stale epoch-1 hash — re-lock with `milpa fetch`)"
+            if algorithm == "sha256"
+            else ""
+        )
         raise MilpaError(
             ID_UNSUPPORTED_ALGORITHM,
-            f"identity {s!r} uses unsupported algorithm {algorithm!r} "
-            f"(supported: {allowed})",
+            f"identity {s!r} uses unsupported algorithm {algorithm!r}"
+            f"{hint} (supported: {allowed})",
             algorithm=algorithm,
             identity=s,
         )
@@ -144,10 +162,11 @@ def parse_identity(s: Any) -> str:
 
 
 def compute_content_hash(path: Path) -> str:
-    """Compute the sha256 content hash of the source tree at `path`.
+    """Compute the content hash of the source tree at `path`.
 
-    Returns the multihash-encoded identity string ``sha256:<64-hex>``.
-    The ``sha256:`` prefix is the canonical form (identity.md §2.1).
+    Returns the identity string ``dag-sha256:<64-hex>`` (A1 canonical form,
+    identity.md §2.1). The underlying digest is still the flat SHA-256 of the
+    canonical byte stream; the Merkle-DAG computation is a later slice (B1).
 
     Same source bytes always produce the same hash regardless of how the tree
     was obtained (git, tarball, OCI, local copy) — identity is transport- and
@@ -165,7 +184,7 @@ def compute_content_hash(path: Path) -> str:
         h.update(b"\x00")
         h.update(entry.content)
         h.update(b"\x00")
-    return f"sha256:{h.hexdigest()}"
+    return f"dag-sha256:{h.hexdigest()}"
 
 
 # ---------------------------------------------------------------------------

@@ -66,6 +66,7 @@ from milpa.errors import (
     CAS_NOT_IN_STORE,
 )
 from milpa.fetchers import CasAdmittingFetcher, build_registry, mocked_registry
+from milpa.fetchers.types import Provenance
 from milpa.frozen import resolve_frozen, resolve_workspace_frozen
 from milpa.index_cache import load_default_index
 from milpa.lockfile import (
@@ -342,6 +343,24 @@ def _make_parser() -> argparse.ArgumentParser:
         "name_or_path",
         metavar="<name|path>",
         help="member package name or path to remove",
+    )
+
+    # hash — content identity probe (A0-cmd slice)
+    sp_hash = subparsers.add_parser(
+        "hash",
+        help=(
+            "print the content identity of a source without CAS admission, "
+            "lockfile writes, or _deps/ population"
+        ),
+    )
+    sp_hash.add_argument(
+        "source",
+        nargs="+",
+        metavar="<token>",
+        help=(
+            "source spec tokens: 'git=<url> ref=<sha>' or 'local=<path>'. "
+            "The parser accepts the same forms as the manifest dep block."
+        ),
     )
 
     # store — read-only CAS inspection (C-store-ro slice, Phase C)
@@ -1683,6 +1702,48 @@ def cmd_store_path(store: "CAStore", identity_or_prefix: str) -> int:
         return 1
 
     print(str(store.path_for(identity)))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# cmd_hash (A0-cmd) — content identity probe
+# ---------------------------------------------------------------------------
+
+
+def cmd_hash(prov: Provenance, env: MilpaEnv) -> int:
+    """Print the content identity of a source (no CAS admission, no lockfile, no _deps/).
+
+    Architectural pin (spec/cli-contract.md §5.N, A0-cmd):
+      1. Fetch ``prov`` into a SCRATCH/throwaway destination via
+         ``env.fetcher.inner`` — the bare ``FetcherRegistry``, NOT the
+         CAS-admitting wrapper. This gives us the identity the REAL fetch path
+         produces without any CAS or lockfile side-effects.
+      2. Print ``result.identity`` to stdout (exactly one line on success).
+      3. Discard the scratch directory (``tempfile.TemporaryDirectory`` context
+         manager guarantees cleanup regardless of success or failure).
+
+    MUST NOT call ``compute_content_hash``, ``identity.py``, or any hash
+    function directly — the identity comes exclusively from the fetch result.
+    This keeps ``milpa hash`` provably consistent with ``milpa fetch``.
+
+    stdout:
+      - ``sha256:<64hex>`` for CAS-admissible sources (git, tarball, OCI).
+      - Empty for non-admissible sources (local/editable trees) — local sources
+        have no stable identity in milpa's model (lockfile §4.3 NORMATIVE).
+
+    stderr: diagnostics only (fetch errors surface here via the outer MilpaError
+    handler in ``main()``).
+
+    spec/cli-contract.md §5.N — ``milpa hash``.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "_hash_src"
+        result = env.fetcher.inner.fetch("hash-probe", prov, dest=dest)
+
+    if result.identity is not None:
+        print(result.identity)
     return 0
 
 
@@ -3101,6 +3162,10 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print("usage: milpa workspace <add-member|remove-member> [args]", file=sys.stderr)
                 return 2
+        elif args.command == "hash":
+            from milpa.source_spec import parse_source_spec
+            prov = parse_source_spec(list(args.source), base_dir=project_dir)
+            return cmd_hash(prov, env)
         elif args.command == "store":
             store_cmd = getattr(args, "store_command", None)
             if store_cmd == "ls":

@@ -1,7 +1,7 @@
 schema_version 1
 package "netlib" {
     version "1.0.0" {
-        content_hash "sha256:2fe1543a0cdcc970f835c5321faf0218028f399c97086a664976340b63b6bf07"
+        content_hash "dag-sha256:2fe1543a0cdcc970f835c5321faf0218028f399c97086a664976340b63b6bf07"
         provenance {
             kind "git"
             url "https://github.com/example/netlib.git"

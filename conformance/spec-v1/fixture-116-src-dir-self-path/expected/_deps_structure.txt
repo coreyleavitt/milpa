@@ -1,1 +1,1 @@
-foo -> <CAS_ROOT>/sha256/a1e5adf673db945ef4fd8def4ab5e0c753c2c831323907fd894712d2c46c4ba3/
+foo -> <CAS_ROOT>/dag-sha256/a1e5adf673db945ef4fd8def4ab5e0c753c2c831323907fd894712d2c46c4ba3/

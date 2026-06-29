@@ -65,12 +65,12 @@ def test_path_for_parses_identity(store: CAStore, tmp: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_admit_places_tree_under_sha256_hex(store: CAStore, tmp: Path) -> None:
+def test_admit_places_tree_under_algo_hex(store: CAStore, tmp: Path) -> None:
     tree = _tree(tmp, "src", "hello")
     identity = compute_content_hash(tree)
     canonical = store.admit(tree, identity)
-    hex_digest = identity.removeprefix("sha256:")
-    assert canonical == store.root / "sha256" / hex_digest
+    algo, _, hex_digest = identity.partition(":")
+    assert canonical == store.root / algo / hex_digest
     assert canonical.is_dir()
     assert (canonical / "file.txt").read_text() == "hello"
 
@@ -85,7 +85,7 @@ def test_admit_source_gone_after_admit(store: CAStore, tmp: Path) -> None:
 
 def test_admit_rejects_identity_mismatch(store: CAStore, tmp: Path) -> None:
     tree = _tree(tmp, "src", "actual bytes")
-    bogus = "sha256:" + "b" * 64
+    bogus = "dag-sha256:" + "b" * 64
     with pytest.raises(MilpaError) as exc_info:
         store.admit(tree, bogus)
     assert exc_info.value.slug == CAS_IDENTITY_MISMATCH
@@ -250,7 +250,7 @@ def test_link_creates_relative_symlink(store: CAStore, tmp: Path) -> None:
 
 
 def test_link_rejects_not_in_store(store: CAStore, tmp: Path) -> None:
-    missing = "sha256:" + "c" * 64
+    missing = "dag-sha256:" + "c" * 64
     deps_dir = tmp / "_deps"
     deps_dir.mkdir()
     target = deps_dir / "absent"
@@ -541,6 +541,6 @@ def test_property_hash_stability(content: str) -> None:
         actual_hash = compute_content_hash(copy)
 
         canonical = store.admit(tree, expected_hash)
-        hex_digest = expected_hash.removeprefix("sha256:")
-        assert canonical == store.root / "sha256" / hex_digest
+        algo, _, hex_digest = expected_hash.partition(":")
+        assert canonical == store.root / algo / hex_digest
         assert expected_hash == actual_hash

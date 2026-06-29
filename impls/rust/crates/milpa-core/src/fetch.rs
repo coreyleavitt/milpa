@@ -28,6 +28,16 @@ pub struct Receipt {
     /// Used by `transport_to_record` / `resolver.rs` to populate
     /// `ProvenanceRecord::Git { submodule_shas, .. }` in the lockfile.
     pub submodule_shas: Vec<(String, String)>,
+    /// Content identity (`sha256:<hex>`) computed by [`DefaultRegistry::fetch`]
+    /// after materialising the tree for CAS-admissible provenances (git, tarball,
+    /// OCI). `None` for local/editable sources and for fetchers that do not
+    /// compute identity (e.g. `MockedFetcher`, `FakeFetcher`).
+    ///
+    /// A0 architectural pin: `milpa hash` MUST read identity from this field —
+    /// it must NOT call `compute_content_hash` directly. This is the single
+    /// field that proves the hash subcommand and the real fetch path use the
+    /// same identity derivation (spec/cli-contract.md §5.11 NORMATIVE).
+    pub identity: Option<String>,
 }
 
 /// Fetch errors.

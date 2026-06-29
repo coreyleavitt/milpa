@@ -1430,7 +1430,7 @@ mod tests {
     use super::*;
 
     const VALID_ID: &str =
-        "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+        "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001";
 
     #[test]
     fn parses_a_full_dep_with_git_provenance() {
@@ -1914,7 +1914,7 @@ mod tests {
         ResolvedDep {
             name: name.into(),
             namespace: None,
-            identity: format!("sha256:{}", "0".repeat(63) + "1"),
+            identity: format!("dag-sha256:{}", "0".repeat(63) + "1"),
             version: Version::release(0, 0, 1),
             src_dir: "src".into(),
             requires: requires.into_iter().map(String::from).collect(),
@@ -2111,7 +2111,7 @@ mod tests {
 
         // An identity mismatch diverges.
         let mut drifted = lock.clone();
-        drifted.deps[0].identity = Some("sha256:different".into());
+        drifted.deps[0].identity = Some("dag-sha256:different".into());
         assert_eq!(
             verify_against_graph(&drifted, &graph).unwrap_err().code(),
             "LOCK-GRAPH-MISMATCH"
@@ -2129,7 +2129,7 @@ mod tests {
             deps: vec![LockedDep {
                 name: "foo".into(),
                 namespace: None,
-                identity: Some("sha256:00".into()),
+                identity: Some("dag-sha256:00".into()),
                 version: "0.0.1".into(),
                 src_dir: String::new(),
                 requires: vec![],
@@ -2586,7 +2586,7 @@ mod tests {
         drop(f);
 
         // Lock to a WRONG identity (simulating tampered bytes).
-        let wrong_identity = format!("sha256:{}", "a".repeat(64));
+        let wrong_identity = format!("dag-sha256:{}", "a".repeat(64));
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),

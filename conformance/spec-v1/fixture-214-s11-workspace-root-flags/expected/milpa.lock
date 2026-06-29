@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "alpha" {
-    identity "sha256:5f0420606149fc22f5cc940faf9ab373d638e5aca177ce8f7abbc3b646698347"
+    identity "dag-sha256:5f0420606149fc22f5cc940faf9ab373d638e5aca177ce8f7abbc3b646698347"
     version "0.0.1"
     src_dir "src"
     requires "netlib"
@@ -15,7 +15,7 @@ dep "alpha" {
 }
 
 dep "beta" {
-    identity "sha256:2cadf1b7a308877ee62b61f16abc376bfe58412d6d0778e48f780d9080bfa31f"
+    identity "dag-sha256:2cadf1b7a308877ee62b61f16abc376bfe58412d6d0778e48f780d9080bfa31f"
     version "0.0.1"
     src_dir "src"
     requires "netlib"
@@ -27,7 +27,7 @@ dep "beta" {
 }
 
 dep "netlib" {
-    identity "sha256:2fe1543a0cdcc970f835c5321faf0218028f399c97086a664976340b63b6bf07"
+    identity "dag-sha256:2fe1543a0cdcc970f835c5321faf0218028f399c97086a664976340b63b6bf07"
     version "1.0.0"
     src_dir ""
     requires

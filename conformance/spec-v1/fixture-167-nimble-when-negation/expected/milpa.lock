@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "extra_a" {
-    identity "sha256:7ffbc6edceefaa8d100537fc80d3192f35be43fd458fbfbc5ffeba5bb41451af"
+    identity "dag-sha256:7ffbc6edceefaa8d100537fc80d3192f35be43fd458fbfbc5ffeba5bb41451af"
     version "0.0.1"
     src_dir "src"
     requires
@@ -17,7 +17,7 @@ dep "extra_a" {
 }
 
 dep "extra_b" {
-    identity "sha256:8d888c4d8034316c14e8d2d382733d60406841fc9768429b43e1efd19b01e2b2"
+    identity "dag-sha256:8d888c4d8034316c14e8d2d382733d60406841fc9768429b43e1efd19b01e2b2"
     version "0.0.1"
     src_dir "src"
     requires
@@ -31,7 +31,7 @@ dep "extra_b" {
 }
 
 dep "extra_c" {
-    identity "sha256:4d0ed8b05d7d84463135c1628fd5b1493a560b7c82ca728594cadd746cdd8910"
+    identity "dag-sha256:4d0ed8b05d7d84463135c1628fd5b1493a560b7c82ca728594cadd746cdd8910"
     version "0.0.1"
     src_dir "src"
     requires
@@ -45,7 +45,7 @@ dep "extra_c" {
 }
 
 dep "foo" {
-    identity "sha256:741eef5f629941a48021c4656d38deac0ae02da4cf408c57d55a70d365d3aa32"
+    identity "dag-sha256:741eef5f629941a48021c4656d38deac0ae02da4cf408c57d55a70d365d3aa32"
     version "0.0.1"
     src_dir "src"
     requires "extra_a" "extra_b" "extra_c"

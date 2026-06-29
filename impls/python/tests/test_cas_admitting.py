@@ -318,11 +318,11 @@ class TestCasAdmissiblePath:
     def test_scratch_location_is_under_cas_root(
         self, tmp_path: Path, store: CAStore, deps_dir: Path
     ) -> None:
-        """CAStore.scratch() allocates under <cas_root>/_scratch/ (sibling of sha256/).
+        """CAStore.scratch() allocates under <cas_root>/_scratch/ (sibling of algo dir).
 
         Verified by observing fetch: after a completed fetch the content is in
-        sha256/<hex>/ and _scratch/ is its sibling.  (We verify the layout is
-        consistent even after cleanup — both sha256/ and the _scratch parent
+        dag-sha256/<hex>/ and _scratch/ is its sibling.  (We verify the layout is
+        consistent even after cleanup — both the algo dir and the _scratch parent
         live directly under store.root.)
         """
         prov = self._make_git_prov()
@@ -332,13 +332,13 @@ class TestCasAdmissiblePath:
 
         cas_reg.fetch("foo", prov, dest=dest)
 
-        # sha256/ must be a direct child of cas_root.
-        assert (store.root / "sha256").is_dir(), "sha256/ must exist under cas_root"
+        # dag-sha256/ must be a direct child of cas_root (A1 canonical scheme dir).
+        assert (store.root / "dag-sha256").is_dir(), "dag-sha256/ must exist under cas_root"
         # _scratch/ if it exists (may have been removed) must also be a direct child.
         # Assert it is NOT nested somewhere unexpected.
         if (store.root / "_scratch").exists():
             assert (store.root / "_scratch").parent == store.root, (
-                "_scratch/ must be a direct sibling of sha256/ under cas_root"
+                "_scratch/ must be a direct sibling of dag-sha256/ under cas_root"
             )
 
     def test_two_concurrent_fetches_dont_collide(

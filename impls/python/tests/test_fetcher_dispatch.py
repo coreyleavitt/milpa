@@ -135,7 +135,7 @@ class TestGitProvenanceCrossDispatch:
             f"got {type(result.receipt).__name__}"
         )
         assert result.receipt.commit_sha == self.SHA
-        assert result.identity.startswith("sha256:")
+        assert result.identity.startswith("dag-sha256:")
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +207,7 @@ class TestTarballProvenanceCrossDispatch:
             f"got {type(result.receipt).__name__}"
         )
         assert result.receipt.archive_sha256 == self.SHA
-        assert result.identity.startswith("sha256:")
+        assert result.identity.startswith("dag-sha256:")
 
     def test_expected_sha256_field_name_is_canonical(self) -> None:
         """TarballProvenance uses expected_sha256 (canonical field), not sha256."""

@@ -226,11 +226,12 @@ impl CoreError {
             "TNG-DEPDECL-FETCH-FAILED",
             "TNG-DEPDECL-SCHEMA-MISMATCH",
             "TNG-DEPDECL-SCHEMA-UNSUPPORTED",
-            // CLI-layer argument-validation error (spec/errors.md §CLI).
-            // Raised when --all-features and --no-default-features are both
-            // supplied; the combination is contradictory and is rejected before
-            // the resolver is called.
+            // CLI-layer argument-validation errors (spec/errors.md §CLI).
+            // CLI-FEATURE-FLAGS-CONFLICT: --all-features + --no-default-features together.
             "CLI-FEATURE-FLAGS-CONFLICT",
+            // CLI-SOURCE-SPEC-INVALID: malformed source-spec tokens for `milpa hash`
+            // (spec/cli-contract.md §5.11; A0 slice).
+            "CLI-SOURCE-SPEC-INVALID",
             // internal / panic sentinels (Gap-1 R4 / S1c). MILPA-INTERNAL is
             // the outermost catch-all; INTERNAL-PANIC fires from the panic hook.
             "MILPA-INTERNAL",

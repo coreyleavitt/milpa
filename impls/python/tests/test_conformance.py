@@ -756,6 +756,137 @@ def _execute_git_protocol_fixture(
 
 
 # ---------------------------------------------------------------------------
+# H-infra: hash fixture tier (cmd=hash)
+# ---------------------------------------------------------------------------
+# The ``hash`` fixture type exercises the A0 ``milpa hash`` subcommand path:
+#
+#   parse_source_spec(tokens) → Provenance
+#   → env.fetcher.inner.fetch() → FetchResult
+#   → print(result.identity)
+#
+# Fixture schema: ``git-protocol.json`` (same as the git-protocol tier) for
+# repo setup; ``expected/stdout`` carries the expected stdout line
+# (``sha256:<64hex>`` for git/tarball sources, empty for local/editable).
+#
+# The runner asserts ``result.identity`` (set by the REAL GitFetcher) matches
+# ``expected/stdout``, which is exactly what ``cmd_hash`` prints.  Calling
+# ``result.identity`` directly (rather than capturing ``print()``) avoids
+# stdout-redirect complexity while still pinning the same value.
+
+
+def _execute_hash_fixture(
+    fixture: "Fixture",
+    tmp_dir: Path,
+) -> tuple[Literal["pass", "fail", "skip"], str]:
+    """Execute a ``hash`` fixture by running the REAL GitFetcher and checking identity.
+
+    Mirrors the ``milpa hash`` A0-cmd path: fetch via the inner registry (no
+    CAS admission), then assert ``result.identity`` matches ``expected/stdout``.
+    """
+    from milpa.fetchers.git import GitFetcher, GitProvenance
+    from milpa.fetchers.types import FetcherRegistry
+
+    fixture_dir = fixture.dir
+    spec_path = fixture_dir / "git-protocol.json"
+    try:
+        spec_text = spec_path.read_text(encoding="utf-8")
+    except OSError as e:
+        return ("fail", f"git-protocol.json missing or unreadable: {e}")
+    try:
+        spec = json.loads(spec_text)
+    except json.JSONDecodeError as e:
+        return ("fail", f"git-protocol.json parse error: {e}")
+
+    # Read expected stdout (the sha256 identity line or empty for local sources).
+    expected_stdout_path = fixture_dir / "expected" / "stdout"
+    try:
+        expected_stdout = expected_stdout_path.read_text(encoding="utf-8").strip()
+    except OSError as e:
+        return ("fail", f"expected/stdout missing or unreadable: {e}")
+
+    repos_spec: list = spec.get("repos", [])
+    fetch_spec: dict = spec.get("fetch", {})
+
+    # Generate repos in a sub-tempdir (reuses _make_git_protocol_repo infrastructure)
+    repos_tmpdir = tmp_dir / "git-repos"
+    repos_tmpdir.mkdir(parents=True, exist_ok=True)
+
+    repo_paths: dict = {}
+    repo_commit_shas: dict = {}
+    try:
+        for repo_spec in repos_spec:
+            repo_dir, commit_shas = _make_git_protocol_repo(repos_tmpdir, repo_spec)
+            repo_paths[repo_spec["name"]] = repo_dir
+            repo_commit_shas[repo_spec["name"]] = commit_shas
+    except RuntimeError as e:
+        return ("fail", f"git repo generation failed: {e}")
+
+    repo_name = fetch_spec.get("repo_name", "")
+    if repo_name not in repo_paths:
+        return ("fail", f"fetch.repo_name {repo_name!r} not found in repos")
+
+    target_repo = repo_paths[repo_name]
+    file_url = f"file://{target_repo.resolve()}"
+    dep_name = fetch_spec.get("dep_name", "smoke")
+    ref = fetch_spec.get("ref", "main")
+    commit_sha = fetch_spec.get("commit_sha")
+
+    # Resolve "@repo:<name>:commit:<index>" references (H4, same as git-protocol tier)
+    if isinstance(commit_sha, str) and commit_sha.startswith("@repo:"):
+        parts = commit_sha.split(":")
+        if len(parts) == 4 and parts[2] == "commit":
+            ref_repo_name = parts[1]
+            try:
+                commit_index = int(parts[3])
+            except ValueError:
+                return ("fail", f"commit SHA reference {commit_sha!r}: index must be an integer")
+            sha_list = repo_commit_shas.get(ref_repo_name)
+            if sha_list is None:
+                return ("fail", f"commit SHA reference {commit_sha!r}: repo {ref_repo_name!r} not found")
+            if commit_index < 0 or commit_index >= len(sha_list):
+                return ("fail", f"commit SHA reference {commit_sha!r}: index {commit_index} out of range")
+            commit_sha = sha_list[commit_index]
+        else:
+            return ("fail", f"commit SHA reference {commit_sha!r}: expected format @repo:<name>:commit:<index>")
+
+    dest = tmp_dir / "_deps" / dep_name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    # Fetch via the REAL GitFetcher (no CAS admission — mirrors cmd_hash's
+    # env.fetcher.inner.fetch() call).
+    from milpa.errors import MilpaError as _MilpaError
+
+    registry = FetcherRegistry()
+    registry.register(GitFetcher())
+    try:
+        result = registry.fetch(
+            dep_name,
+            GitProvenance(url=file_url, ref=ref, commit_sha=commit_sha),
+            dest=dest,
+        )
+    except _MilpaError as e:
+        return ("fail", f"GitFetcher.fetch raised unexpected error {e.slug!r}: {e}")
+    except Exception as e:
+        return ("fail", f"GitFetcher.fetch failed: {e}")
+
+    # The identity printed by milpa hash is result.identity (None → empty stdout).
+    # A0-cmd architectural pin: cmd_hash reads identity from result.identity, NOT
+    # from compute_content_hash directly (spec/cli-contract.md §5.11 NORMATIVE).
+    got_identity = result.identity if result.identity is not None else ""
+
+    if got_identity != expected_stdout:
+        return (
+            "fail",
+            f"hash identity mismatch:\n"
+            f"  expected: {expected_stdout!r}\n"
+            f"  actual:   {got_identity!r}\n"
+            f"  (GitFetcher used file:// URL: {file_url!r})",
+        )
+
+    return ("pass", "")
+
+
+# ---------------------------------------------------------------------------
 # The in-process "execute" function — drives core functions directly
 # ---------------------------------------------------------------------------
 
@@ -780,6 +911,11 @@ def _execute_fixture(
     # dispatch before _build_env which would fail on those absences.
     if fixture.cmd == "git-protocol":
         return _execute_git_protocol_fixture(fixture, tmp_dir)
+
+    # H-infra: hash fixtures exercise the milpa hash A0-cmd path using the REAL
+    # GitFetcher; no milpa.kdl or mocked-fetches/ needed.
+    if fixture.cmd == "hash":
+        return _execute_hash_fixture(fixture, tmp_dir)
 
     # Import resolver / frozen lazily (they raise NotImplementedError now)
     from milpa.frozen import resolve_frozen, resolve_workspace_frozen
@@ -1716,6 +1852,8 @@ def _is_not_yet_wired(fx: Fixture) -> bool:
         return False  # fully wired
     if fx.cmd == "git-protocol":
         return False  # H-infra tier: wired via _execute_git_protocol_fixture
+    if fx.cmd == "hash":
+        return False  # H-infra tier: wired via _execute_hash_fixture
     # Explicit allowlist is the primary gate.
     fixture_name = fx.dir.name  # e.g. "fixture-003-single-url-dep"
     return fixture_name in _NOT_YET_WIRED_FIXTURE_NAMES

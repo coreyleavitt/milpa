@@ -1,0 +1,17 @@
+{
+  "repos": [
+    {
+      "name": "probe",
+      "files": {
+        "hash-probe.nim": "# milpa hash probe\n"
+      },
+      "ref": "main"
+    }
+  ],
+  "fetch": {
+    "dep_name": "probe",
+    "repo_name": "probe",
+    "ref": "main",
+    "commit_sha": null
+  }
+}

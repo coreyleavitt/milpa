@@ -1,7 +1,7 @@
 schema_version 1
 package "shared" {
     version "1.0.0" {
-        content_hash "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        content_hash "dag-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         provenance {
             kind "git"
             url "https://example.com/shared.git"
@@ -10,7 +10,7 @@ package "shared" {
         }
     }
     version "2.0.0" {
-        content_hash "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        content_hash "dag-sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         provenance {
             kind "git"
             url "https://example.com/shared.git"

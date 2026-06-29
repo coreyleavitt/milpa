@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "foo" {
-    identity "sha256:a1e5adf673db945ef4fd8def4ab5e0c753c2c831323907fd894712d2c46c4ba3"
+    identity "dag-sha256:a1e5adf673db945ef4fd8def4ab5e0c753c2c831323907fd894712d2c46c4ba3"
     version "0.0.1"
     src_dir "src"
     requires
@@ -17,7 +17,7 @@ dep "foo" {
 }
 
 dep "member-a" {
-    identity "sha256:8a4e58dbdfd30c1e15f78a355cc5c098a00611a5269a66b709c559b6eb799bec"
+    identity "dag-sha256:8a4e58dbdfd30c1e15f78a355cc5c098a00611a5269a66b709c559b6eb799bec"
     version "0.0.1"
     src_dir ""
     requires "foo"

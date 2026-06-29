@@ -1,7 +1,7 @@
 schema_version 1
 package "bar" {
     version "1.0.0" {
-        content_hash "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
         provenance {
             kind "oci"
             registry "-badregistry.io"

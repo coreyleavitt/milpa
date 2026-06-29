@@ -17,7 +17,7 @@ use crate::error::CoreError;
 
 /// Hash algorithms milpa understands, with their hex digest length. New
 /// algorithms are added here and nowhere else.
-pub const SUPPORTED_ALGORITHMS: &[(&str, usize)] = &[("sha256", 64)];
+pub const SUPPORTED_ALGORITHMS: &[(&str, usize)] = &[("dag-sha256", 64)];
 
 // Mode markers — one byte per entry (identity.md §1.2).
 const MODE_REGULAR: u8 = 0x00; // regular file — exec bit excluded (Resolved Decision 1)
@@ -81,8 +81,8 @@ pub fn parse_identity(s: &str) -> Result<(&str, &str), CoreError> {
     Ok((algorithm, digest))
 }
 
-/// Compute the content hash of a source tree, returning `"sha256:<64-hex>"`.
-/// The `sha256:` prefix is part of the canonical form (identity.md §2.1).
+/// Compute the content hash of a source tree, returning `"dag-sha256:<64-hex>"`.
+/// The `dag-sha256:` prefix is part of the canonical form (identity.md §2.1).
 pub fn compute_content_hash(root: &Path) -> Result<String, CoreError> {
     let mut entries = enumerate_entries(root)?;
     // §1.3: sort by raw byte-order of the relative path.
@@ -97,7 +97,7 @@ pub fn compute_content_hash(root: &Path) -> Result<String, CoreError> {
         h.update(&e.content);
         h.update([0x00]);
     }
-    Ok(format!("sha256:{:x}", h.finalize()))
+    Ok(format!("dag-sha256:{:x}", h.finalize()))
 }
 
 /// One tree entry destined for the hash: its relpath bytes, mode marker, and
@@ -242,22 +242,37 @@ mod tests {
     const S_IXUSR: u32 = 0o100;
 
     #[test]
-    fn sha256_is_supported_with_64_hex_chars() {
+    fn dag_sha256_is_supported_with_64_hex_chars() {
         assert_eq!(
-            SUPPORTED_ALGORITHMS.iter().find(|(a, _)| *a == "sha256"),
-            Some(&("sha256", 64))
+            SUPPORTED_ALGORITHMS.iter().find(|(a, _)| *a == "dag-sha256"),
+            Some(&("dag-sha256", 64))
+        );
+    }
+
+    #[test]
+    fn sha256_is_not_in_supported_algorithms() {
+        assert!(
+            SUPPORTED_ALGORITHMS.iter().all(|(a, _)| *a != "sha256"),
+            "stale sha256 must not be in SUPPORTED_ALGORITHMS"
         );
     }
 
     // --- parse_identity (mirrors test_identity_validator.py) -----------------
 
     #[test]
-    fn parse_identity_accepts_sha256_canonical_form() {
-        let valid = format!("sha256:{}", "a".repeat(64));
+    fn parse_identity_accepts_dag_sha256_canonical_form() {
+        let valid = format!("dag-sha256:{}", "a".repeat(64));
         assert_eq!(
             parse_identity(&valid).unwrap(),
-            ("sha256", &"a".repeat(64)[..])
+            ("dag-sha256", &"a".repeat(64)[..])
         );
+    }
+
+    #[test]
+    fn parse_identity_rejects_stale_sha256_prefix() {
+        let stale = format!("sha256:{}", "a".repeat(64));
+        let e = parse_identity(&stale).unwrap_err();
+        assert_eq!(e.code(), "ID-UNSUPPORTED-ALGORITHM");
     }
 
     #[test]
@@ -274,13 +289,13 @@ mod tests {
 
     #[test]
     fn parse_identity_rejects_wrong_length_digest() {
-        let e = parse_identity("sha256:abc123").unwrap_err();
+        let e = parse_identity("dag-sha256:abc123").unwrap_err();
         assert_eq!(e.code(), "ID-WRONG-DIGEST-LENGTH");
     }
 
     #[test]
     fn parse_identity_rejects_non_hex_characters_in_digest() {
-        let e = parse_identity(&format!("sha256:{}", "Z".repeat(64))).unwrap_err();
+        let e = parse_identity(&format!("dag-sha256:{}", "Z".repeat(64))).unwrap_err();
         assert_eq!(e.code(), "ID-NON-HEX-DIGEST");
     }
 
@@ -398,7 +413,7 @@ mod tests {
         fs::create_dir_all(&a).unwrap();
         symlink("/nonexistent/elsewhere", a.join("broken")).unwrap();
         let h = compute_content_hash(&a).unwrap();
-        let digest = h.strip_prefix("sha256:").unwrap();
+        let digest = h.strip_prefix("dag-sha256:").unwrap();
         assert_eq!(digest.len(), 64);
         assert!(digest
             .bytes()
@@ -428,7 +443,7 @@ mod tests {
         write(&a.join(".git/HEAD"), "junk\n", false);
         assert_eq!(
             compute_content_hash(&a).unwrap(),
-            "sha256:85f2eb93585a6870b118351b14b8e32a4f55d61809f1612aaca5bae3c3db61cd"
+            "dag-sha256:85f2eb93585a6870b118351b14b8e32a4f55d61809f1612aaca5bae3c3db61cd"
         );
     }
 
@@ -437,10 +452,10 @@ mod tests {
         let root = tmp();
         let a = root.join("a");
         fs::create_dir_all(&a).unwrap();
-        // sha256 of the empty byte stream.
+        // sha256 of the empty byte stream (dag-sha256: prefix, flat SHA256 computation).
         assert_eq!(
             compute_content_hash(&a).unwrap(),
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            "dag-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
 

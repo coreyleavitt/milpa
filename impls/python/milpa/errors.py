@@ -33,6 +33,7 @@ STORE_AMBIGUOUS_PREFIX = "STORE-AMBIGUOUS-PREFIX"
 # ---------------------------------------------------------------------------
 
 CLI_FEATURE_FLAGS_CONFLICT = "CLI-FEATURE-FLAGS-CONFLICT"
+CLI_SOURCE_SPEC_INVALID = "CLI-SOURCE-SPEC-INVALID"
 
 # ---------------------------------------------------------------------------
 # EXTRACT — safe tarball extraction

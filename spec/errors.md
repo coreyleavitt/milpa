@@ -68,6 +68,12 @@ A `_deps/<name>` symlink resolves to a CAS store entry but reading that entry ra
 
 **Fix:** Pass at most one of `--all-features` or `--no-default-features` per invocation.
 
+### `CLI-SOURCE-SPEC-INVALID`
+
+A `milpa hash <source>` source spec is malformed or contains an unrecognized key.
+
+**Triggered:** `parse_source_spec` receives a token list that violates the `git=<url> ref=<value>` or `local=<path>` grammar: a token contains no `=` separator; an unknown key appears (not `git`, `ref`, or `local`); a required key is missing (e.g. `git=` without `ref=`); incompatible forms are mixed (e.g. both `git=` and `local=`); the token list is empty; a key is duplicated; or the resulting `LocalProvenance` construction fails because the resolved path is not absolute.
+
 ## EXTRACT
 
 ### `EXTRACT-IO-ERROR`
@@ -320,13 +326,13 @@ Identity value is not a string.
 
 Identity string uses an algorithm milpa does not support.
 
-**Triggered:** parse_identity finds an algorithm prefix not in SUPPORTED_ALGORITHMS (currently only `sha256` is supported).
+**Triggered:** `parse_identity` finds an algorithm prefix not in `SUPPORTED_ALGORITHMS`. In the A1 epoch the only supported algorithm is `dag-sha256`. Stale `sha256:` identities from epoch-0 also raise this code; remediation is to re-lock with `milpa fetch`.
 
 ### `ID-WRONG-DIGEST-LENGTH`
 
 Digest component has the wrong number of hex characters.
 
-**Triggered:** parse_identity finds the digest length does not match the expected length for the algorithm (sha256 requires exactly 64 hex chars).
+**Triggered:** `parse_identity` finds the digest length does not match the expected length for the algorithm (`dag-sha256` requires exactly 64 hex chars).
 
 ## INTERNAL
 

@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "lib-childless" {
-    identity "sha256:b423e45b0751029cb485b8c9fdc687e0fae8ba4a06ee144b912ee29e766ec6e4"
+    identity "dag-sha256:b423e45b0751029cb485b8c9fdc687e0fae8ba4a06ee144b912ee29e766ec6e4"
     version "0.0.1"
     src_dir ""
     requires
@@ -18,7 +18,7 @@ dep "lib-childless" {
 }
 
 dep "lib-ssl" {
-    identity "sha256:16b789bc2217369e41d30286fe50029116e5b6a0f2a82039e7e11e03cd506e3a"
+    identity "dag-sha256:16b789bc2217369e41d30286fe50029116e5b6a0f2a82039e7e11e03cd506e3a"
     version "0.0.1"
     src_dir ""
     requires

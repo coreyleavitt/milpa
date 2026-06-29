@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "foo" {
-    identity "sha256:c684cdfe20817472a8367adbd33d432ec204e07895c68330caf84c4f5a6b5bc7"
+    identity "dag-sha256:c684cdfe20817472a8367adbd33d432ec204e07895c68330caf84c4f5a6b5bc7"
     version "0.0.1"
     src_dir "src"
     requires "nimcompat"
@@ -21,7 +21,7 @@ dep "foo" {
 }
 
 dep "nimcompat" {
-    identity "sha256:268578a3a58fb8c03a54ff6c3809bd175f5b9304475735ee597f29b2b2d30142"
+    identity "dag-sha256:268578a3a58fb8c03a54ff6c3809bd175f5b9304475735ee597f29b2b2d30142"
     version "0.0.1"
     src_dir "src"
     requires

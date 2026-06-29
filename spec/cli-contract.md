@@ -932,6 +932,66 @@ member "<name>"` to stderr.
 > in-process conformance runner's perspective (no library entry point), driven
 > exclusively by the black-box harness.
 
+### 5.11  `hash` (A0-cmd)
+
+**Purpose:** Probe the content identity of a source without producing any
+persistent output. Intended for build-pipeline use — a caller can pin the
+identity returned here and later use it as the `expected_identity` when
+fetching from the same source.
+
+**Arguments:**
+
+```
+milpa hash <token> [<token>...]
+```
+
+Source spec tokens (same grammar as `parse_source_spec`):
+
+| Form | Tokens |
+|---|---|
+| git | `git=<url> ref=<commit-sha-or-ref>` |
+| local | `local=<path>` |
+
+> NORMATIVE: `milpa hash` MUST:
+>
+> - Parse the source spec tokens via `parse_source_spec`; on any parse error
+>   emit `CLI-SOURCE-SPEC-INVALID` and exit 1.
+> - Fetch the source into a **scratch/throwaway** destination using the SAME
+>   fetcher machinery that `milpa fetch` uses (the bare `FetcherRegistry`,
+>   NOT the CAS-admitting wrapper). This produces the content identity via the
+>   same code path as a real `milpa fetch`.
+> - Print the content identity to **stdout** as exactly one line
+>   (`sha256:<64hex>`) for CAS-admissible sources (git, tarball, OCI).
+> - Print **nothing** to stdout for non-admissible (local/editable) sources
+>   — local trees have no stable identity in milpa's model
+>   (lockfile §4.3 NORMATIVE).
+> - Discard the scratch directory; MUST NOT write `milpa.lock`, populate
+>   `_deps/`, or admit any entry to the CAS.
+> - Exit 0 on success.
+
+> NORMATIVE: `milpa hash` MUST NOT call `compute_content_hash` or any hash
+> function directly. The identity MUST come from the fetch result's
+> `.identity` field — the same field the resolver and CAS-admission path
+> rely on. A direct hash call would reintroduce a dual-derivation path that
+> this command exists to eliminate.
+
+> NOTE: git auth inherits the same environment (SSH agent, credential helper)
+> that `milpa fetch` uses — no additional auth configuration is required or
+> accepted.
+
+**Exit-code / slug table:**
+
+| Condition | Exit code | Slug |
+|---|---|---|
+| Success | 0 | — |
+| Bad source spec | 1 | `CLI-SOURCE-SPEC-INVALID` |
+| git/fetch errors | 1 | `FETCH-GIT-FAILED`, `FETCH-GIT-COMMIT-ABSENT`, etc. (same as `fetch`) |
+
+**stdout:** `sha256:<64hex>` (one line) for CAS-admissible sources; empty for
+local sources.
+
+**stderr:** diagnostic on failure only.
+
 ---
 
 ## 6  `--frozen` flag/exit semantics (normative)

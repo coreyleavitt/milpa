@@ -90,7 +90,7 @@ def _write_locked_dep(
     git_url: str = "https://example.com/dep.git",
     ref: str = "main",
     sha: str = "a" * 40,
-    identity: str = "sha256:" + "a" * 64,
+    identity: str = "dag-sha256:" + "a" * 64,
 ) -> None:
     """Write a minimal lockfile with one dep that has active_flags set."""
     dep = LockedDep(
