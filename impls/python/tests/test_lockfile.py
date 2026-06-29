@@ -1234,7 +1234,7 @@ class TestFixture118ByteExact:
         # After KDL unescaping: ref = v1"x\y
         # The mocked-fetch entry provides:
         #   sha = abcdef1234567890abcdef1234567890abcdef12
-        #   identity = dag-sha256:19f1b5dadf5a74f44e39f7403a519a8a560fbd61b97425d4ade643ee4a52fa59
+        #   identity = dag-sha256:3e351c5a2cc1aa09059cf55207ad599a439baac321acbdaf45c7b563b4eac859
         #   nimble: version = "1.0.0", srcDir = "src"
         prov = GitProvenanceRecord(
             url="https://github.com/example/foo.git",
@@ -1243,7 +1243,7 @@ class TestFixture118ByteExact:
         )
         dep = ResolvedDep(
             name="foo",
-            identity="dag-sha256:19f1b5dadf5a74f44e39f7403a519a8a560fbd61b97425d4ade643ee4a52fa59",
+            identity="dag-sha256:3e351c5a2cc1aa09059cf55207ad599a439baac321acbdaf45c7b563b4eac859",
             version="0.0.1",
             src_dir="src",
             requires=(),
@@ -1279,7 +1279,7 @@ class TestFixture118ByteExact:
         )
         dep = ResolvedDep(
             name="foo",
-            identity="dag-sha256:19f1b5dadf5a74f44e39f7403a519a8a560fbd61b97425d4ade643ee4a52fa59",
+            identity="dag-sha256:3e351c5a2cc1aa09059cf55207ad599a439baac321acbdaf45c7b563b4eac859",
             version="0.0.1",
             src_dir="src",
             requires=(),

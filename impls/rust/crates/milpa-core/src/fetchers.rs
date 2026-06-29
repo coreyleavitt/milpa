@@ -168,8 +168,21 @@ fn decompress_capped_xz(
     Ok(buf)
 }
 
+use crate::dag_identity::{MaterializedEntry, MODE_EXECUTABLE, MODE_REGULAR, MODE_SYMLINK};
 use crate::fetch::{FetchError, FetcherRegistry, Receipt};
 use crate::safe_extract::{extract_tar, Limits};
+
+/// git ls-tree blob mode → epoch-2 mode-byte (spec/identity.md §1.8.2.1).
+/// `100644` regular → 0x00, `100755` executable → 0x01, `120000` symlink → 0x80.
+/// Any other (unexpected) mode is treated as a regular blob (0x00) — matching the
+/// permissive disk-write branch.
+fn git_mode_to_byte(mode: &str) -> u8 {
+    match mode {
+        "100755" => MODE_EXECUTABLE,
+        "120000" => MODE_SYMLINK,
+        _ => MODE_REGULAR,
+    }
+}
 
 fn transport(code: &'static str, message: impl Into<String>) -> FetchError {
     FetchError::Transport(code, message.into())
@@ -437,6 +450,35 @@ pub fn materialize_git_tree(
 /// use distinct SHAs, so only depth limits them — not the visited-set alone).
 const MAX_SUBMODULE_DEPTH: usize = 16;
 
+/// The git **materialize seam** (RFC slice B2-git): read a commit's tree from the
+/// object store into a buffered `Vec<MaterializedEntry>` (spec §1.8.4).
+///
+/// This is the single source of truth for git tree enumeration. Both consumers
+/// read from here: [`materialize_git_tree`] writes the entries to `dest/` (the CAS
+/// path), and the epoch-2 DAG builder ([`crate::dag_identity::compute_dag_identity`])
+/// computes the `dag-sha256:` identity over them.
+///
+/// Submodules (mode-160000 gitlinks) are recursed via `submodule_fetch` and their
+/// committed blobs spliced into the sequence under the gitlink's path prefix (spec
+/// §1.8.7); the DAG builder then folds them into a subtree whose root `H_tree`
+/// becomes the gitlink's child digest. URLs + pinned SHAs are returned separately
+/// as PROVENANCE (the `path → sha` map).
+pub fn enumerate_git_entries(
+    repo: &Path,
+    commit: &str,
+    submodule_fetch: Option<&dyn Fn(&str, &str) -> Result<PathBuf, FetchError>>,
+    superproject_url: Option<&str>,
+) -> Result<(Vec<MaterializedEntry>, std::collections::HashMap<String, String>), FetchError> {
+    enumerate_git_entries_inner(
+        repo,
+        commit,
+        submodule_fetch,
+        superproject_url,
+        0,
+        &std::collections::HashSet::new(),
+    )
+}
+
 /// Internal implementation with depth and ancestor-path visited-set tracking (R1-03, R2-01).
 ///
 /// `visited` is the set of `(resolved_url, commit_sha)` pairs on the CURRENT
@@ -444,21 +486,15 @@ const MAX_SUBMODULE_DEPTH: usize = 16;
 /// set with the child's key pre-inserted, so siblings do NOT share keys —
 /// only a repeat on the ancestor chain triggers `FETCH-GIT-SUBMODULE-FAILED`.
 /// This matches Python's `child_seen = seen | {visit_key}` pattern exactly.
-fn materialize_git_tree_inner(
+fn enumerate_git_entries_inner(
     repo: &Path,
     commit: &str,
-    dest: &Path,
     submodule_fetch: Option<&dyn Fn(&str, &str) -> Result<PathBuf, FetchError>>,
     superproject_url: Option<&str>,
     depth: usize,
     visited: &std::collections::HashSet<(String, String)>,
-) -> Result<std::collections::HashMap<String, String>, FetchError> {
-    use crate::safe_extract::normalize_lexical;
+) -> Result<(Vec<MaterializedEntry>, std::collections::HashMap<String, String>), FetchError> {
     use std::collections::HashMap;
-
-    // Canonicalize dest so prefix comparisons are reliable.
-    let dest_root = std::fs::canonicalize(dest)
-        .unwrap_or_else(|_| normalize_lexical(dest));
 
     // -----------------------------------------------------------------------
     // Step 1: ls-tree -r — enumerate (mode, type, sha, path) for every entry
@@ -711,82 +747,28 @@ fn materialize_git_tree_inner(
     }
 
     // -----------------------------------------------------------------------
-    // Step 3: write blobs to dest with fixed modes + safety checks
+    // Step 3: build the buffered materialized entry sequence
     // -----------------------------------------------------------------------
+    // The git mode → mode-byte mapping is the SSOT for the exec/symlink bit that
+    // epoch-2 identity depends on (spec §1.8.2.1). LFS detection + on-disk-mode
+    // writing + path containment are the DISK consumer's concern
+    // (`materialize_git_tree`), not the abstract entry sequence.
     let mut gitlink_results: HashMap<String, String> = HashMap::new();
+    let mut entries: Vec<MaterializedEntry> = Vec::with_capacity(blobs.len());
 
     for (mode, _obj_type, sha, entry_path) in &blobs {
         let content = match blob_bytes.get(sha.as_str()) {
-            Some(b) => b,
+            Some(b) => b.clone(),
             None => return Err(transport(
                 "FETCH-GIT-FAILED",
                 format!("cat-file result missing for SHA {sha:?} (path {entry_path:?})"),
             )),
         };
-
-        // R1-01: zip-slip containment — BEFORE writing any blob or symlink.
-        // Reject absolute entry paths and `..`-escape paths. Lexically normalize
-        // the joined path and require it to equal dest_root or be strictly under
-        // it (component-aware Path::starts_with).
-        {
-            let joined = dest_root.join(entry_path);
-            let normalized = normalize_lexical(&joined);
-            // An absolute entry_path (e.g. "/etc/x") would join but resolve to
-            // outside dest_root.  A ".." escape ("../../escape") would also fail.
-            if !normalized.starts_with(&dest_root) {
-                return Err(transport(
-                    "EXTRACT-ZIP-SLIP",
-                    format!(
-                        "git ls-tree entry {entry_path:?} resolves outside destination: \
-                         {} not under {} (zip-slip rejected)",
-                        normalized.display(),
-                        dest_root.display()
-                    ),
-                ));
-            }
-        }
-        let abs_dest = dest_root.join(entry_path);
-
-        if mode == "120000" {
-            // Symlink: blob bytes are the link-target string.
-            materialize_symlink(entry_path, content, &abs_dest, &dest_root)?;
-        } else if mode == "100644" || mode == "100755" {
-            // Regular or executable blob.
-            // LFS first-line detection (plugin-contract.md §2.3.2).
-            check_lfs(entry_path, content)?;
-            // Create parent dirs.
-            if let Some(parent) = abs_dest.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| transport(
-                    "FETCH-GIT-FAILED",
-                    format!("creating parent for {entry_path:?}: {e}"),
-                ))?;
-            }
-            std::fs::write(&abs_dest, content).map_err(|e| transport(
-                "FETCH-GIT-FAILED",
-                format!("writing {entry_path:?}: {e}"),
-            ))?;
-            // Fixed on-disk mode.
-            let on_disk_mode: u32 = if mode == "100755" { 0o755 } else { 0o644 };
-            std::fs::set_permissions(&abs_dest, std::fs::Permissions::from_mode(on_disk_mode))
-                .map_err(|e| transport(
-                    "FETCH-GIT-FAILED",
-                    format!("chmod {entry_path:?}: {e}"),
-                ))?;
-        } else {
-            // Unexpected mode (e.g. 100664 or future) — write with default.
-            // Do not raise; be permissive on unknown regular modes.
-            check_lfs(entry_path, content)?;
-            if let Some(parent) = abs_dest.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| transport(
-                    "FETCH-GIT-FAILED",
-                    format!("creating parent for {entry_path:?}: {e}"),
-                ))?;
-            }
-            std::fs::write(&abs_dest, content).map_err(|e| transport(
-                "FETCH-GIT-FAILED",
-                format!("writing {entry_path:?}: {e}"),
-            ))?;
-        }
+        entries.push(MaterializedEntry {
+            relpath: entry_path.clone(),
+            mode_byte: git_mode_to_byte(mode),
+            content,
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -794,13 +776,14 @@ fn materialize_git_tree_inner(
     // -----------------------------------------------------------------------
     if !gitlinks.is_empty() {
         if let Some(ref fetch_fn) = submodule_fetch {
-            // Parse .gitmodules from the materialized tree (written in Step 3).
-            let gitmodules_path = dest_root.join(".gitmodules");
-            let gitmodules_bytes = if gitmodules_path.exists() {
-                std::fs::read(&gitmodules_path).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            // Parse .gitmodules from the object store (NOT from disk): its bytes
+            // were read in Step 2. .gitmodules is committed content, a regular
+            // blob at the repo root (relpath ".gitmodules").
+            let gitmodules_bytes: Vec<u8> = blobs
+                .iter()
+                .find(|(_, _, _, p)| p == ".gitmodules")
+                .and_then(|(_, _, sha, _)| blob_bytes.get(sha.as_str()).cloned())
+                .unwrap_or_default();
             let submodule_url_map = parse_gitmodules(&gitmodules_bytes);
 
             for (_mode, _obj_type, sha, entry_path) in &gitlinks {
@@ -868,36 +851,23 @@ fn materialize_git_tree_inner(
 
                 let sub_scratch = fetch_fn(&resolved_url, sha)?;
 
-                // R1-01: zip-slip containment for gitlink sub_dest.
-                let sub_dest = {
-                    let joined = dest_root.join(entry_path);
-                    let normalized = normalize_lexical(&joined);
-                    if !normalized.starts_with(&dest_root) {
-                        return Err(transport(
-                            "EXTRACT-ZIP-SLIP",
-                            format!(
-                                "gitlink entry_path {entry_path:?} resolves outside destination: \
-                                 {} not under {} (zip-slip rejected)",
-                                normalized.display(),
-                                dest_root.display()
-                            ),
-                        ));
-                    }
-                    joined
-                };
-                std::fs::create_dir_all(&sub_dest).map_err(|e| transport(
-                    "FETCH-GIT-FAILED",
-                    format!("creating submodule dest {entry_path:?}: {e}"),
-                ))?;
-                let sub_results = materialize_git_tree_inner(
+                // Recurse via the SAME seam: enumerate the submodule's tree, then
+                // splice its entries in under the gitlink path prefix (spec §1.8.7).
+                let (sub_entries, sub_results) = enumerate_git_entries_inner(
                     &sub_scratch,
                     sha,
-                    &sub_dest,
                     submodule_fetch.as_ref().map(|f| f as &dyn Fn(&str, &str) -> Result<PathBuf, FetchError>),
                     Some(&resolved_url),
                     depth + 1,
                     &child_visited,
                 )?;
+                for sub_entry in sub_entries {
+                    entries.push(MaterializedEntry {
+                        relpath: format!("{entry_path}/{}", sub_entry.relpath),
+                        mode_byte: sub_entry.mode_byte,
+                        content: sub_entry.content,
+                    });
+                }
                 gitlink_results.insert(entry_path.clone(), sha.clone());
                 // Accumulate nested results with prefixed paths.
                 for (nested_path, nested_sha) in sub_results {
@@ -910,6 +880,88 @@ fn materialize_git_tree_inner(
         }
     }
     // If submodule_fetch is None, gitlinks are silently skipped (H3c behaviour).
+
+    Ok((entries, gitlink_results))
+}
+
+/// Materialize a git commit's tree from the object store into `dest`.
+///
+/// Thin disk-writing consumer of the [`enumerate_git_entries`] seam (RFC slice
+/// B2-git): it enumerates once, then writes each buffered entry to `dest/` with
+/// fixed on-disk modes + the path/symlink/LFS safety checks. `fetch_git` produces
+/// its output tree EXCLUSIVELY via this function (plugin-contract.md §2.4.1).
+///
+/// Disk contract (spec/identity.md §1.7.4): mode-byte 0x00 → 0o644, 0x01 → 0o755,
+/// 0x80 (symlink) → lexical containment check before write. Entry paths are
+/// lexically checked against `dest_root` BEFORE any write (EXTRACT-ZIP-SLIP, R1-01).
+fn materialize_git_tree_inner(
+    repo: &Path,
+    commit: &str,
+    dest: &Path,
+    submodule_fetch: Option<&dyn Fn(&str, &str) -> Result<PathBuf, FetchError>>,
+    superproject_url: Option<&str>,
+    depth: usize,
+    visited: &std::collections::HashSet<(String, String)>,
+) -> Result<std::collections::HashMap<String, String>, FetchError> {
+    use crate::safe_extract::normalize_lexical;
+
+    // Canonicalize dest so prefix comparisons are reliable.
+    let dest_root = std::fs::canonicalize(dest).unwrap_or_else(|_| normalize_lexical(dest));
+
+    let (entries, gitlink_results) = enumerate_git_entries_inner(
+        repo,
+        commit,
+        submodule_fetch,
+        superproject_url,
+        depth,
+        visited,
+    )?;
+
+    for entry in &entries {
+        // R1-01 NORMATIVE: lexical containment check BEFORE any write. Reject
+        // absolute entry paths and `..`-escape paths.
+        let joined = dest_root.join(&entry.relpath);
+        let normalized = normalize_lexical(&joined);
+        if !normalized.starts_with(&dest_root) {
+            return Err(transport(
+                "EXTRACT-ZIP-SLIP",
+                format!(
+                    "git ls-tree entry {:?} resolves outside destination: \
+                     {} not under {} (zip-slip rejected)",
+                    entry.relpath,
+                    normalized.display(),
+                    dest_root.display()
+                ),
+            ));
+        }
+        let abs_dest = dest_root.join(&entry.relpath);
+
+        if entry.mode_byte == MODE_SYMLINK {
+            // Symlink: blob bytes are the link-target string.
+            materialize_symlink(&entry.relpath, &entry.content, &abs_dest, &dest_root)?;
+        } else {
+            // Regular or executable blob.
+            // LFS first-line detection (plugin-contract.md §2.3.2).
+            check_lfs(&entry.relpath, &entry.content)?;
+            if let Some(parent) = abs_dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| transport(
+                    "FETCH-GIT-FAILED",
+                    format!("creating parent for {:?}: {e}", entry.relpath),
+                ))?;
+            }
+            std::fs::write(&abs_dest, &entry.content).map_err(|e| transport(
+                "FETCH-GIT-FAILED",
+                format!("writing {:?}: {e}", entry.relpath),
+            ))?;
+            // Fixed on-disk mode (spec §1.7.4): 0o755 for executable, else 0o644.
+            let on_disk_mode: u32 = if entry.mode_byte == MODE_EXECUTABLE { 0o755 } else { 0o644 };
+            std::fs::set_permissions(&abs_dest, std::fs::Permissions::from_mode(on_disk_mode))
+                .map_err(|e| transport(
+                    "FETCH-GIT-FAILED",
+                    format!("chmod {:?}: {e}", entry.relpath),
+                ))?;
+        }
+    }
 
     Ok(gitlink_results)
 }
@@ -1676,38 +1728,7 @@ pub(crate) fn fetch_tarball_with_decomp_cap(
     // `Limits::default().decomp_cap()` for the production default; tests inject
     // a small cap to exercise the lzma-alone decompressor guard end-to-end).
 
-    let tar_bytes = if bytes.starts_with(MAGIC_GZIP) {
-        decompress_capped(GzDecoder::new(&bytes[..]), decomp_cap, name, "gzip")?
-    } else if bytes.starts_with(MAGIC_BZ2) {
-        decompress_capped(
-            bzip2_rs::DecoderReader::new(&bytes[..]),
-            decomp_cap,
-            name,
-            "bzip2",
-        )?
-    } else if bytes.starts_with(MAGIC_XZ) {
-        // lzma-rs uses a Write-based API (xz_decompress) rather than a Read-based
-        // decoder; route through decompress_capped_xz so cap constant, slug, and
-        // error message are the same SSOT as gzip/bzip2 — eliminating the parallel
-        // inline copy that R19 flagged.
-        decompress_capped_xz(&bytes[..], decomp_cap, name)?
-    } else {
-        // R2-02/NEW-D: lzma-alone (`.tar.lzma`, FORMAT_ALONE / LZMA1) has NO
-        // reliable magic bytes — the first 5 bytes are encoder-dependent
-        // "properties" + dictionary size.  Strategy (mirrors Python): attempt
-        // `lzma_decompress` (LZMA1/FORMAT_ALONE via lzma-rs) under the same
-        // `decomp_cap` bound.  If it decompresses → treat as lzma-alone (apply
-        // cap, raise EXTRACT-SIZE-LIMIT on breach).  If it errors → the stream
-        // is not lzma-alone → fall through to plain-tar (unchanged behavior).
-        match decompress_capped_lzma(&bytes[..], decomp_cap, name) {
-            Ok(decompressed) => decompressed,
-            Err(e) if e.code() == "EXTRACT-SIZE-LIMIT" => return Err(e),
-            Err(_) => {
-                // Not lzma-alone — treat as uncompressed tar (fall through).
-                bytes
-            }
-        }
-    };
+    let tar_bytes = decompress_tar_archive(&bytes, decomp_cap, name)?;
 
     clear_dest(dest).map_err(|e| transport("FETCH-EXTRACT-FAILED", e))?;
     extract_tar(&tar_bytes, dest, strip_components, Limits::default()).map_err(|e| {
@@ -1825,6 +1846,99 @@ pub fn fetch_oci(
     };
     let _ = std::fs::remove_dir_all(&scratch);
     result
+}
+
+/// Decompress a tarball archive's raw bytes into uncompressed tar bytes, applying
+/// the SA-1 decompression-bomb cap. Single source of truth for the magic-byte
+/// format dispatch (gzip / bzip2 / xz / lzma-alone / plain tar) shared by
+/// [`fetch_tarball`] and [`enumerate_tarball_entries`].
+fn decompress_tar_archive(
+    bytes: &[u8],
+    decomp_cap: u64,
+    name: &str,
+) -> Result<Vec<u8>, FetchError> {
+    if bytes.starts_with(MAGIC_GZIP) {
+        decompress_capped(GzDecoder::new(bytes), decomp_cap, name, "gzip")
+    } else if bytes.starts_with(MAGIC_BZ2) {
+        decompress_capped(bzip2_rs::DecoderReader::new(bytes), decomp_cap, name, "bzip2")
+    } else if bytes.starts_with(MAGIC_XZ) {
+        // lzma-rs uses a Write-based API (xz_decompress); route through
+        // decompress_capped_xz so cap/slug/message are the same SSOT as gzip/bzip2.
+        decompress_capped_xz(bytes, decomp_cap, name)
+    } else {
+        // R2-02/NEW-D: lzma-alone (`.tar.lzma`, FORMAT_ALONE / LZMA1) has NO
+        // reliable magic bytes. Attempt-decode; on EXTRACT-SIZE-LIMIT propagate,
+        // on any other error treat as uncompressed tar (fall through).
+        match decompress_capped_lzma(bytes, decomp_cap, name) {
+            Ok(decompressed) => Ok(decompressed),
+            Err(e) if e.code() == "EXTRACT-SIZE-LIMIT" => Err(e),
+            Err(_) => Ok(bytes.to_vec()),
+        }
+    }
+}
+
+/// The tarball **materialize seam** (RFC slice B2-tarball): read an archive's
+/// members into a buffered `Vec<MaterializedEntry>` (spec §1.8.4), feeding the
+/// epoch-2 DAG builder ([`crate::dag_identity::compute_dag_identity`]).
+///
+/// The tarball sibling of [`enumerate_git_entries`]: it produces the same abstract
+/// `(relpath, mode_byte, content)` sequence from a `.tar(.gz/.bz2/.xz)` archive,
+/// applying the same content rules so identity is **transport-independent** (spec
+/// §1.1): a git tree and a faithful tarball of the same source bytes hash to the
+/// same `dag-sha256:`. Decompression reuses [`decompress_tar_archive`] (SSOT) and
+/// the tar parse reuses [`crate::safe_extract::tar_materialize_entries`] (the same
+/// USTAR reader as `extract_tar`).
+///
+/// LOSSY-ARCHIVE RULE (spec/identity.md §1.8.10): the exec bit is part of epoch-2
+/// identity. A `.tar` records POSIX modes faithfully; an archive format that drops
+/// exec bits (e.g. `.zip`) materializes a *genuinely different* tree (every file
+/// `0x00`) and hashes differently — correct behaviour, not a bug. `.zip` is
+/// rejected upstream by [`fetch_tarball`]; only the exec-bit-faithful tar family
+/// feeds this seam.
+pub fn enumerate_tarball_entries(
+    archive: &[u8],
+    strip_components: u32,
+    limits: Limits,
+) -> Result<Vec<MaterializedEntry>, FetchError> {
+    let tar_bytes = decompress_tar_archive(archive, limits.decomp_cap(), "tarball-materialize")?;
+    crate::safe_extract::tar_materialize_entries(&tar_bytes, strip_components).map_err(|e| {
+        transport(
+            "FETCH-EXTRACT-FAILED",
+            format!("tarball materialize seam: tar parse failed ({})", e.code()),
+        )
+    })
+}
+
+// The local-path **materialize seam** is the canonical on-disk identity walk:
+// it lives in `identity::enumerate_local_entries` (the single source of truth for
+// turning on-disk bytes + POSIX modes into a `MaterializedEntry` sequence, with
+// proper ID-NON-UTF8-* coded errors), and `compute_content_hash` uses it. The
+// local sibling of the object-store seams `enumerate_git_entries` /
+// `enumerate_tarball_entries` is therefore identity's walk — not a second copy
+// here (single source of truth).
+
+/// The OCI **materialize seam** — a coded not-implemented STUB (RFC slice B2-oci).
+///
+/// Every other transport (git / tarball / local) has a real epoch-2 materializer
+/// feeding [`crate::dag_identity::compute_dag_identity`]. OCI does NOT: there is no
+/// epoch-2 OCI fetcher path yet (the OCI dag-oracle conformance tier stays
+/// SKIPPED), so asking for the OCI seam is a clear coded not-implemented condition.
+///
+/// NOTE (slug): there is no `FETCH-*-NOT-IMPLEMENTED` slug in `spec/errors.md`, and
+/// the error-catalog discipline forbids minting one carelessly. This stub returns
+/// the non-catalog [`FetchError::Failed`] marker; if the OCI epoch-2 materializer
+/// is ever built (B2-oci proper), a catalog slug is a deliberate spec decision made
+/// then, not now.
+pub fn enumerate_oci_entries(
+    _registry: &str,
+    _repository: &str,
+    _digest: &str,
+) -> Result<Vec<MaterializedEntry>, FetchError> {
+    Err(FetchError::Failed(
+        "OCI epoch-2 materialize seam is not implemented (RFC identity-conformance \
+         B2-oci is a stub; there is no epoch-2 OCI fetcher path yet)"
+            .to_string(),
+    ))
 }
 
 // ---------------------------------------------------------------------------

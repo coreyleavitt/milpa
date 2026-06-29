@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import io
 import subprocess
+import tarfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,14 +40,27 @@ _CHUNK_SIZE: int = 65_536  # 64 KiB
 #: level alongside _CHUNK_SIZE for consistency with other format-magic constants.
 _MAGIC_ZIP: bytes = b"\x50\x4b\x03\x04"
 
+from milpa.dag_identity import (
+    MODE_EXECUTABLE,
+    MODE_REGULAR,
+    MODE_SYMLINK,
+    MaterializedEntry,
+)
 from milpa.errors import (
     FETCH_DOWNLOAD_FAILED,
     FETCH_DOWNLOAD_SIZE_EXCEEDED,
     FETCH_EXTRACT_FAILED,
     FETCH_SHA256_MISMATCH,
+    ID_NON_UTF8_RELPATH,
+    ID_NON_UTF8_SYMLINK_TARGET,
     MilpaError,
 )
-from milpa.fetchers.safe_extract import _DEFAULT_LIMITS, Limits, extract_tar
+from milpa.fetchers.safe_extract import (
+    _DEFAULT_LIMITS,
+    _decompress_capped,
+    Limits,
+    extract_tar,
+)
 from milpa.fetchers.types import (
     Fetcher,
     Provenance,
@@ -211,6 +225,126 @@ def make_http_get(compressed_cap: int = MAX_COMPRESSED_BYTES) -> HttpGet:
             return b"".join(chunks)
 
     return _curl
+
+
+# ---------------------------------------------------------------------------
+# enumerate_tarball_entries — the tarball materialize seam (RFC slice B2-tarball)
+# ---------------------------------------------------------------------------
+
+
+def enumerate_tarball_entries(
+    archive: bytes | io.IOBase,
+    *,
+    strip_components: int = 0,
+    limits: Limits = _DEFAULT_LIMITS,
+) -> list[MaterializedEntry]:
+    """The tarball **materialize seam** (RFC slice B2-tarball): read an archive's
+    members into a buffered ``list[MaterializedEntry]`` (spec §1.8.4), feeding the
+    epoch-2 DAG builder (``milpa.dag_identity.compute_dag_identity``).
+
+    This is the tarball sibling of ``enumerate_git_entries``: it produces the same
+    abstract ``(relpath, mode_byte, content)`` sequence from a ``.tar(.gz/.bz2/.xz)``
+    archive, applying the same content rules as git so that identity is
+    **transport-independent** (spec §1.1): a git tree and a faithful tarball of the
+    same source bytes hash to the same ``dag-sha256:``. The decompression cap is
+    reused from ``safe_extract`` (the SSOT); ``compute_dag_identity`` is the single
+    DAG builder.
+
+    Mode mapping (spec §1.8.2.1):
+      * tar entry with any POSIX execute bit set (``mode & 0o111``) → ``0x01``.
+      * tar entry with no execute bit → ``0x00``.
+      * tar symlink entry (``issym``) → ``0x80``; content is the link-target
+        string bytes (``linkname``), not followed.
+      * tar hardlink entry (``islnk``) → resolved to the target's content bytes
+        (copy-bytes, same as ``extract_tar`` pass 2); exec bit from the link's mode.
+      * directories, device nodes, and FIFOs contribute no leaf (subtrees are
+        synthesised by the builder; the others are never legitimate source).
+
+    LOSSY-ARCHIVE RULE (spec/identity.md §1.8.10, RFC §3.4): the exec bit is part
+    of epoch-2 identity. A ``.tar`` records POSIX modes faithfully, so a tarball of
+    a tree with an executable script reproduces the same digest as the git tree. An
+    archive format that **drops** POSIX exec bits (e.g. a ``.zip``) materializes a
+    *genuinely different* tree — every file is ``0x00`` — and therefore hashes
+    differently. That is correct behaviour, not a bug: the bytes-plus-modes that
+    were actually delivered are what get hashed. ``.zip`` is rejected upstream by
+    ``TarballFetcher`` (it is not an exec-bit-faithful tar format).
+
+    Args:
+        archive:          Raw archive bytes, or a binary file object.
+        strip_components: Drop this many leading path components per entry
+                          (like ``tar --strip-components=N``); entries with fewer
+                          components are skipped. Matches ``extract_tar``.
+        limits:           Extraction caps; only ``decomp_cap`` is consulted here
+                          (the stream-level decompression-bomb guard).
+
+    Returns:
+        Buffered ``list[MaterializedEntry]`` (blobs + symlinks), POSIX relpaths.
+
+    Raises:
+        MilpaError(EXTRACT_SIZE_LIMIT)         — decompressed stream exceeds the cap.
+        MilpaError(ID_NON_UTF8_RELPATH)        — a member path is not valid UTF-8.
+        MilpaError(ID_NON_UTF8_SYMLINK_TARGET) — a symlink target is not valid UTF-8.
+    """
+    raw = archive if isinstance(archive, bytes) else archive.read()
+    # Reuse the safe_extract decompression SSOT (stream-level bomb cap).
+    raw_tar_bytes, archive_fmt = _decompress_capped(raw, limits.decomp_cap)
+    tar_mode = "r:" if archive_fmt != "tar" else "r:*"
+
+    entries: list[MaterializedEntry] = []
+    with tarfile.open(fileobj=io.BytesIO(raw_tar_bytes), mode=tar_mode) as tf:
+        for member in tf.getmembers():
+            relpath = _tar_member_relpath(member.name, strip_components)
+            if relpath is None:
+                continue
+            if member.isdir():
+                # Subtrees are synthesised by the builder from the relpath set.
+                continue
+            if member.issym():
+                target = _check_utf8(
+                    member.linkname,
+                    ID_NON_UTF8_SYMLINK_TARGET,
+                    f"tarball symlink {member.name!r} target is not valid UTF-8",
+                )
+                entries.append(
+                    MaterializedEntry(relpath, MODE_SYMLINK, target.encode("utf-8"))
+                )
+            elif member.isfile() or member.islnk():
+                # extractfile follows hardlinks to the target's content bytes.
+                fobj = tf.extractfile(member)
+                content = fobj.read() if fobj is not None else b""
+                mode_byte = MODE_EXECUTABLE if (member.mode & 0o111) else MODE_REGULAR
+                entries.append(MaterializedEntry(relpath, mode_byte, content))
+            # device nodes / FIFOs: silently skipped (never legitimate source).
+    return entries
+
+
+def _tar_member_relpath(name: str, strip_components: int) -> str | None:
+    """Normalise a tar member name to a POSIX relpath, or ``None`` to skip.
+
+    Drops empty + ``.`` components and applies ``strip_components``; an entry with
+    no components left is skipped (mirrors ``extract_tar._check_and_strip``). Path
+    containment (zip-slip) is the disk-writer's concern, not the identity seam's —
+    the builder hashes whatever relpaths the archive declares.
+    """
+    raw_parts = [p for p in name.split("/") if p and p != "."]
+    if len(raw_parts) <= strip_components:
+        return None
+    relpath = "/".join(raw_parts[strip_components:])
+    _check_utf8(relpath, ID_NON_UTF8_RELPATH, f"tarball entry path {name!r} is not valid UTF-8")
+    return relpath
+
+
+def _check_utf8(s: str, slug: str, message: str) -> str:
+    """Return ``s`` if it round-trips through UTF-8, else raise ``MilpaError(slug)``.
+
+    ``tarfile`` decodes member names/linknames with ``surrogateescape``, so a
+    non-UTF-8 byte sequence survives as lone surrogates that fail to re-encode.
+    """
+    try:
+        s.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise MilpaError(slug, message, value=s.encode("utf-8", "backslashreplace").decode()) from exc
+    return s
 
 
 # ---------------------------------------------------------------------------

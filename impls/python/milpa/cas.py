@@ -237,13 +237,23 @@ class CAStore:
     # §3.3 — admit
     # ------------------------------------------------------------------
 
-    def admit(self, src: Path, identity: str) -> Path:
+    def admit(self, src: Path, identity: str, *, precomputed_hash: str | None = None) -> Path:
         """Move *src* into the store under *identity*, returning the canonical path.
 
         Semantics (identity.md §3.3):
         1. Compute the content hash of *src* and compare to *identity*.
            On mismatch, raise ``CAS-IDENTITY-MISMATCH`` and leave *src* in
            place (store is NOT modified).
+
+        ``precomputed_hash`` (RFC identity-conformance-authority B2): when the
+        caller has already hashed *src* (e.g. the fetcher registry computes the
+        identity once, immediately after materialization), it may inject that
+        digest here to avoid a redundant tree re-walk. The verification semantics
+        are unchanged — the injected digest is still compared against *identity*
+        exactly as a freshly-computed one would be. This is the seam that
+        B-cutover uses to swap the identity emitter without re-plumbing admission;
+        when ``None`` (the default) ``admit`` computes the hash itself, preserving
+        current behaviour.
         2. **CAS-hit pre-check (idempotency)**: if the canonical entry already
            exists, drop *src* and return the existing path immediately — O(1),
            no rename attempted.  This is the **duplicate-admission = no-op** rule
@@ -263,7 +273,7 @@ class CAStore:
         ``<root>/_scratch/`` (same filesystem mount as the CAS entries).  See
         ``scratch()`` for the scratch lifecycle.
         """
-        actual = compute_content_hash(src)
+        actual = precomputed_hash if precomputed_hash is not None else compute_content_hash(src)
         if actual != identity:
             raise MilpaError(
                 CAS_IDENTITY_MISMATCH,

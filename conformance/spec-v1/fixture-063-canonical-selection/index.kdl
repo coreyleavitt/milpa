@@ -1,7 +1,7 @@
 schema_version 1
 package "X" {
     version "2.0.0" {
-        content_hash "dag-sha256:f511242911fd63eb7619d09449d39dcdf02223f14c85599e4a9737db91260703"
+        content_hash "dag-sha256:8d252d84a960d1812fde4c229fe9dc9381e1187a71208d4ef2ebdd851b3185e1"
         provenance {
             kind "git"
             url "https://example.com/X.git"
@@ -10,7 +10,7 @@ package "X" {
         }
     }
     version "1.0.0" {
-        content_hash "dag-sha256:14e1ed0c7b2a441641fb15841502be5cd8bf8e76795afe04a6475784f0bf8525"
+        content_hash "dag-sha256:13daf10cf5d7bd80b62cf2035f217ab5e8f55a087e0673be6243fbf6f1e1500a"
         provenance {
             kind "git"
             url "https://example.com/X.git"
@@ -21,7 +21,7 @@ package "X" {
 }
 package "Y" {
     version "2.0.0" {
-        content_hash "dag-sha256:3f407d75a983965ab5c9ae9fb418cd6ec3b4585bcee4a8eda352d450c80c3d12"
+        content_hash "dag-sha256:a7ed8d53ad0d547884d5097e76be437af647aec7c746f7d0e6ea9d7a918d8219"
         provenance {
             kind "git"
             url "https://example.com/Y.git"
@@ -30,7 +30,7 @@ package "Y" {
         }
     }
     version "1.0.0" {
-        content_hash "dag-sha256:33e252d12a22a2ef8b1e74bb6c42c969e20467edd73d78cbc9b738e730be5aac"
+        content_hash "dag-sha256:2097dd27cec38e7c63814f415508c620288e28a264bac7876a1c6e16d90c7bbd"
         provenance {
             kind "git"
             url "https://example.com/Y.git"
@@ -41,7 +41,7 @@ package "Y" {
 }
 package "Z" {
     version "2.0.0" {
-        content_hash "dag-sha256:451a706e58da61cfb9ca8c7dceae0b94a44e10e6b2bf3c3a8b671cde68565b62"
+        content_hash "dag-sha256:86d323daa4b5865df8267a98e243cbf1ff6fd9c1a8192aaf1a88db7dcb55077a"
         provenance {
             kind "git"
             url "https://example.com/Z.git"
@@ -50,7 +50,7 @@ package "Z" {
         }
     }
     version "1.0.0" {
-        content_hash "dag-sha256:7ba2fefabe70eeb6a088ddc085fe8509ab7a4c7f7fff898969dba7829e906682"
+        content_hash "dag-sha256:50a71b15b122363141c7974b2716c11e1d1bd9cf83c0e771b955334e1788dd94"
         provenance {
             kind "git"
             url "https://example.com/Z.git"

@@ -1,0 +1,11 @@
+{
+  "files": {
+    "a.txt": "alpha\n",
+    "a/b.txt": "beta\n",
+    "a/run.sh": "#!/bin/sh\necho hi\n"
+  },
+  "symlinks": {
+    "link": "a/b.txt"
+  },
+  "executable": ["a/run.sh"]
+}

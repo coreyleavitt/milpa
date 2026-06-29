@@ -4,7 +4,7 @@ strategy "maxver"
 
 dep "bar" {
     namespace "ns1"
-    identity "dag-sha256:5859c6a82a7e188a8a85684e873de2f9352b81a6e11722f0f003f25a76acf7a1"
+    identity "dag-sha256:69de9e0caa711713027881b3e947be025ed76188b863620e815c7b9e86a80f8a"
     version "1.0.0"
     src_dir "src"
     requires
@@ -19,7 +19,7 @@ dep "bar" {
 
 dep "bar" {
     namespace "ns2"
-    identity "dag-sha256:09930ae60b7bac991a5602b905f841a3cdc2e0bbc7e88a7421a305b3c100a56e"
+    identity "dag-sha256:c2b30f2c58b4ceaf2def12d8f0ec319962fdb5480afab43cbc810ebfcdcbaf28"
     version "2.0.0"
     src_dir "src"
     requires

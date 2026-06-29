@@ -15,6 +15,7 @@ use milpa_manifest::{Manifest, Workspace};
 pub use milpa_types::{ActivationSource, LockedDep, Lockfile, ProvenanceRecord};
 use milpa_types::ResolvedGraph;
 
+pub mod dag_identity;
 pub mod dep_decl;
 pub mod dep_decl_store;
 pub mod discovery;
@@ -35,6 +36,7 @@ pub mod source_spec;
 pub mod store;
 pub mod workspace;
 
+pub use dag_identity::{compute_dag_identity, MaterializedEntry};
 pub use dep_decl::{dep_decl_hash, parse_dep_decl, MAX_DEP_DECL_SCHEMA_VERSION};
 pub use dep_decl_store::{
     index_base_url, make_dep_decl_store, verify as verify_dep_decl_hash, DepDeclStore,
@@ -65,7 +67,9 @@ pub use fetchers::{
     DefaultRegistry, MockedFetcher,
 };
 pub use frozen::{rebuild_deps_view, resolve_frozen, resolve_workspace_frozen};
-pub use identity::{compute_content_hash, parse_identity, SUPPORTED_ALGORITHMS};
+pub use identity::{
+    compute_content_hash, enumerate_local_entries, parse_identity, SUPPORTED_ALGORITHMS,
+};
 pub use milpa_manifest::{parse_document, AttestationPolicy, ManifestDoc, Profile};
 pub use milpa_solver::{parse_version, Strategy};
 pub use nimcfg::build_flag_defines;

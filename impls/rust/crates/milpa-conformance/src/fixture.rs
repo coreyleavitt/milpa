@@ -52,6 +52,15 @@ pub enum Cmd {
     /// This pins the full `milpa hash <source-spec>` path: source → identity
     /// line on stdout, no CAS admission, no lockfile side-effects.
     Hash,
+    /// Epoch-2 Merkle-DAG oracle fixture (RFC `rfc-identity-conformance-authority`
+    /// slice B1). Carries a `dag-oracle.json` source description and a
+    /// hand-computed `dag-sha256:` pin in `expected/content_hash`. The
+    /// per-transport materializer + DAG builder land in slice B2; until then the
+    /// impls emit the interim epoch-1 flat digest, so these fixtures are SKIPPED
+    /// (pending) — they MUST NOT be asserted against impl output yet. They become
+    /// live in B2. The frozen oracle is self-tested out-of-band (Python
+    /// `tests/test_dag_sha256_oracle.py`), not against either impl's identity code.
+    DagOracle,
 }
 
 impl Cmd {
@@ -74,6 +83,9 @@ impl Cmd {
                     // Same git-protocol.json schema; asserts expected/stdout matches
                     // the identity computed over the materialized tree.
                     "hash" => Cmd::Hash,
+                    // Epoch-2 Merkle-DAG oracle fixtures (RFC B1): skipped until
+                    // the B2 materializer/DAG builder lands (see `Cmd::DagOracle`).
+                    "dag-oracle" => Cmd::DagOracle,
                     // Mutation (§2.7.1) + liveness (§2.7.2) selectors: CLI-only.
                     // check-certificate (§2.7.3): also CLI-only (--certificate flag).
                     // workspace (S10 D4): add-member/remove-member are CLI-only.

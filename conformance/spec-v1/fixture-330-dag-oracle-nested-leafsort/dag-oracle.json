@@ -1,0 +1,8 @@
+{
+  "entries": [
+    {"relpath": "a.txt",    "mode": "regular",    "content": "alpha\n"},
+    {"relpath": "a/b.txt",  "mode": "regular",    "content": "beta\n"},
+    {"relpath": "a/run.sh", "mode": "executable", "content": "#!/bin/sh\necho hi\n"},
+    {"relpath": "link",     "mode": "symlink",    "content": "a/b.txt"}
+  ]
+}

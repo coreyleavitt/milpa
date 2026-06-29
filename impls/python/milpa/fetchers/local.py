@@ -38,6 +38,14 @@ from milpa.errors import (
 )
 from milpa.fetchers.types import Fetcher, Provenance, ProvenanceReceipt
 
+# The local-path **materialize seam** IS the canonical on-disk identity walk: it
+# lives in ``milpa.identity`` (the single source of truth for turning on-disk
+# bytes + POSIX modes into a ``MaterializedEntry`` sequence), and is re-exported
+# here for the per-transport sibling narrative (the local sibling of
+# ``enumerate_git_entries`` / ``enumerate_tarball_entries``). Not a duplicate code
+# path — an alias onto identity's walk.
+from milpa.identity import enumerate_local_entries  # noqa: F401  (re-export)
+
 # ---------------------------------------------------------------------------
 # LocalProvenance
 # ---------------------------------------------------------------------------

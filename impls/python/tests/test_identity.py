@@ -244,41 +244,44 @@ def test_adding_files_under_git_does_not_change_hash(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# compute_content_hash — exec bit excluded from identity (Resolved Decision 1)
+# compute_content_hash — exec bit IS part of identity (epoch 2, §1.8.2 / §1.8.10)
 # ---------------------------------------------------------------------------
 
 
-def test_executable_bit_does_not_change_hash(tmp_path: Path) -> None:
-    """Toggling the owner-execute bit does NOT change the hash (Resolved Decision 1).
+def test_executable_bit_changes_hash(tmp_path: Path) -> None:
+    """Setting the owner-execute bit DOES change the hash (epoch 2, §1.8.2).
 
-    The mode-marker byte stays in the byte stream to distinguish symlinks (0x80)
-    from regular files (0x00), but the 0x01 'executable' value and all S_IXUSR
-    selection logic are removed. Regular files always emit 0x00.
+    Epoch 2 uses a four-valued mode-byte: a regular file (0x00) and an executable
+    file (0x01) with identical bytes materialize *different* tree nodes, so they
+    hash differently — a deliberate correction over the interim epoch-1 stream
+    (which excluded the exec bit).
     """
     content = "#!/bin/sh\necho hi\n"
     tree_non_exec = make_tree({"script.sh": (content, False)}, tmp_path / "non_exec")
     tree_exec = make_tree({"script.sh": (content, True)}, tmp_path / "exec")
-    assert compute_content_hash(tree_non_exec) == compute_content_hash(tree_exec)
+    assert compute_content_hash(tree_non_exec) != compute_content_hash(tree_exec)
 
 
-def test_no_execute_bit_affects_hash(tmp_path: Path) -> None:
-    """Owner, group, and world execute bits each leave the hash unchanged (Resolved Decision 1)."""
-    tree = make_tree({"f.sh": ("#!/bin/sh\n", False)}, tmp_path / "t")
-    fpath = tree / "f.sh"
+def test_any_execute_bit_affects_hash(tmp_path: Path) -> None:
+    """Any of owner/group/world execute bits flips the file to mode-byte 0x01,
+    changing identity (epoch 2, §1.8.2.1: ``st_mode & 0o111``)."""
+    base = make_tree({"f.sh": ("#!/bin/sh\n", False)}, tmp_path / "t")
+    base_hash = compute_content_hash(base)
 
-    base_hash = compute_content_hash(tree)
+    # Owner-execute (S_IXUSR = 0o100) → mode-byte 0x01 → different hash.
+    owner = make_tree({"f.sh": ("#!/bin/sh\n", False)}, tmp_path / "owner")
+    (owner / "f.sh").chmod((owner / "f.sh").stat().st_mode | 0o100)
+    assert compute_content_hash(owner) != base_hash
 
-    # Set owner-execute (S_IXUSR = 0o100) — must NOT change the hash.
-    fpath.chmod(fpath.stat().st_mode | 0o100)
-    assert compute_content_hash(tree) == base_hash
+    # Group-execute (S_IXGRP = 0o010) → mode-byte 0x01 → different hash.
+    group = make_tree({"f.sh": ("#!/bin/sh\n", False)}, tmp_path / "group")
+    (group / "f.sh").chmod((group / "f.sh").stat().st_mode | 0o010)
+    assert compute_content_hash(group) != base_hash
 
-    # Set group-execute (S_IXGRP = 0o010) — must NOT change the hash.
-    fpath.chmod(fpath.stat().st_mode | 0o010)
-    assert compute_content_hash(tree) == base_hash
-
-    # Set world-execute (S_IXOTH = 0o001) — must NOT change the hash.
-    fpath.chmod(fpath.stat().st_mode | 0o001)
-    assert compute_content_hash(tree) == base_hash
+    # World-execute (S_IXOTH = 0o001) → mode-byte 0x01 → different hash.
+    world = make_tree({"f.sh": ("#!/bin/sh\n", False)}, tmp_path / "world")
+    (world / "f.sh").chmod((world / "f.sh").stat().st_mode | 0o001)
+    assert compute_content_hash(world) != base_hash
 
 
 # ---------------------------------------------------------------------------
@@ -328,14 +331,15 @@ def test_broken_symlink_does_not_crash(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_empty_tree_hashes_empty_byte_stream(tmp_path: Path) -> None:
-    """An empty tree produces sha256 of the empty byte stream (§1.2).
+def test_empty_tree_hashes_empty_root(tmp_path: Path) -> None:
+    """An empty tree is the zero-entry Merkle-DAG root: sha256(b"") (§1.8.5).
 
-    A1: the prefix is dag-sha256: but the digest value is unchanged (flat SHA-256).
+    The empty-root digest is independently pinned (the conformance authority's
+    empty-root oracle); under epoch 2 a zero-entry root hashes the empty byte
+    string, so the value coincides with sha256("").
     """
     tmp = tmp_path / "empty"
     tmp.mkdir()
-    # sha256("") = e3b0c44...; A1 renames the prefix to dag-sha256:
     assert compute_content_hash(tmp) == (
         "dag-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     )
@@ -379,7 +383,7 @@ def test_output_is_valid_per_parse_identity(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 RUST_ORACLE_HASH = (
-    "dag-sha256:85f2eb93585a6870b118351b14b8e32a4f55d61809f1612aaca5bae3c3db61cd"
+    "dag-sha256:10c68c24594e4ab384f0672a67b738eab5190e0837a3e09dd27e89eb1172791a"
 )
 
 
@@ -483,3 +487,84 @@ def test_non_utf8_relpath_raises_error(tmp_path: Path) -> None:
     with pytest.raises(MilpaError) as exc_info:
         compute_content_hash(tmp)
     assert exc_info.value.slug == ID_NON_UTF8_RELPATH
+
+
+# ---------------------------------------------------------------------------
+# B-cutover STEP-1 invariant: a git-materialized ON-DISK tree hashed through the
+# production identity site (compute_content_hash → enumerate_local_entries → DAG)
+# equals the git OBJECT-STORE enumeration (enumerate_git_entries → DAG), and both
+# equal the independently hand-frozen nested oracle pin.
+#
+# This is the load-bearing invariant of the clean cutover: because CAS verify
+# re-hashes the on-disk stored tree, the production identity MUST be derivable
+# from the on-disk tree. The per-transport object-store enumerator then stands as
+# the faithfulness PROOF, not a second identity source. If this ever diverges
+# (e.g. materialize_git_tree drops the exec bit or a symlink on disk), it is a
+# real correctness BLOCKER, not something to paper over.
+# ---------------------------------------------------------------------------
+
+#: Independently hand-frozen nested-tree oracle pin (conformance authority).
+_NESTED_PIN = "dag-sha256:e3213019260649b72bb0295aaec004eb20a625dd55fcd4bac9e35df96bce316f"
+
+
+def _git(repo: Path, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+         "-c", "core.autocrlf=false", *args],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def test_git_materialized_ondisk_equals_object_store_invariant(tmp_path: Path) -> None:
+    """on-disk(git-materialized) identity == git object-store identity == nested pin."""
+    import subprocess
+
+    from milpa.dag_identity import compute_dag_identity
+    from milpa.fetchers.git import enumerate_git_entries, materialize_git_tree
+    from milpa.identity import enumerate_local_entries
+
+    # Build the nested oracle tree (a.txt, a/b.txt, a/run.sh +x, link → a/b.txt).
+    repo = tmp_path / "nested"
+    repo.mkdir()
+    (repo / "a.txt").write_text("alpha\n")
+    (repo / "a").mkdir()
+    (repo / "a/b.txt").write_text("beta\n")
+    (repo / "a/run.sh").write_text("#!/bin/sh\necho hi\n")
+    os.chmod(repo / "a/run.sh", 0o755)
+    os.symlink("a/b.txt", repo / "link")
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "nested")
+    commit = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "main"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    # Clone --no-checkout: object store only (mirrors GitFetcher discipline).
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", "--no-checkout", f"file://{repo.resolve()}", str(clone)],
+        check=True, capture_output=True, text=True,
+    )
+
+    # Object-store enumeration → identity.
+    obj_entries, _ = enumerate_git_entries(clone, commit, submodule_fetch=None)
+    obj_identity = compute_dag_identity(obj_entries)
+
+    # Materialize to disk via the production disk writer, then the production
+    # identity site (compute_content_hash uses the same enumerate_local_entries walk).
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    materialize_git_tree(clone, commit, dest, submodule_fetch=None)
+    ondisk_identity = compute_content_hash(dest)
+    # Sanity: compute_content_hash IS enumerate_local_entries → compute_dag_identity.
+    assert ondisk_identity == compute_dag_identity(enumerate_local_entries(dest))
+
+    assert obj_identity == _NESTED_PIN, "object-store enumeration drifted from the pin"
+    assert ondisk_identity == _NESTED_PIN, (
+        "git-materialized ON-DISK tree hashed differently from the object-store pin — "
+        "materialize_git_tree did not preserve the tree faithfully (exec bit / symlink)"
+    )
+    assert ondisk_identity == obj_identity

@@ -174,9 +174,14 @@ published version.
 > `UserWarning` and be skipped. Duplicate versions MUST NOT raise a hard error.
 
 **`content_hash`** (child node, string, **required and non-empty**) — the
-sha256 identity of the source tree, in `sha256:<64-hex>` form. This is the
-value milpa recomputes after fetching to enforce Invariant 1 (identity gate).
-See `spec/identity.md` (S12) for the canonical byte algorithm.
+content identity of the source tree, as an `<algorithm>:<hex>` identity string.
+The canonical scheme is the one `spec/identity.md` (S12) defines: under epoch 2
+that is `dag-sha256:<64-hex>` (the canonical content Merkle DAG, `identity.md`
+§1.8 / §2.1). A conformant reader MUST accept the `dag-sha256:` scheme here.
+Validation is **epoch-gated** — it tracks `spec/identity.md`'s current canonical
+scheme — and MUST NOT be a fixed `sha256:`-only regex. This is the value milpa
+recomputes after fetching to enforce Invariant 1 (identity gate). See
+`spec/identity.md` (S12) for the canonical byte algorithm.
 
 > NORMATIVE: An index entry whose `content_hash` is absent or empty string
 > MUST raise `TNG-NO-IDENTITY` on the resolution read path. Identity is
@@ -553,7 +558,7 @@ package "nimkdl" {
     namespace "coreyleavitt"
     upstream (url)"https://github.com/coreyleavitt/nimkdl"
     version "0.1.4" {
-        content_hash "sha256:1aaf2a95f53681c86f6dcd4c1267144401ba923f31afa42da3c5ae783dc7ab61"
+        content_hash "dag-sha256:1aaf2a95f53681c86f6dcd4c1267144401ba923f31afa42da3c5ae783dc7ab61"
         provenance {
             kind "oci"
             registry "ghcr.io"
@@ -575,7 +580,7 @@ package "chronos" {
     namespace "status-im"
     upstream (url)"https://github.com/status-im/nim-chronos"
     version "4.0.3" {
-        content_hash "sha256:abc123…"
+        content_hash "dag-sha256:abc123…"
         provenance {
             kind "git"
             url (url)"https://github.com/status-im/nim-chronos"

@@ -1,7 +1,7 @@
 schema_version 1
 package "bar" {
     version "2.0.0" {
-        content_hash "dag-sha256:36f1b90340f57a398c8857f92b78b51d0a207df6b9965db95011bf39df83e66a"
+        content_hash "dag-sha256:6f6a0d7107eb15b5f0dfceea05ea9e8e418ff6ffa24bc5766cd127744d70c826"
         dep_decl "sha256:8c2f20b957c5a16fe803caa5b0d3d4997b500549cae95d5716ded986d1c5ed22"
         dep_decl_schema_version 0
         provenance {
@@ -14,7 +14,7 @@ package "bar" {
 }
 package "qux" {
     version "1.0.0" {
-        content_hash "dag-sha256:e47d3551069bf3c80205baea412d43935f36ed92af645524fb19726343ef80ab"
+        content_hash "dag-sha256:7283cd506bd2fa4b0be87e9a441b532fe09e3f9e35bfe193c811c1936ac3355e"
         dep_decl "sha256:46c459ab1ed490eb7e5dd09fce8da6cc3e1a13d36fd2b71c264f276640b0b598"
         dep_decl_schema_version 0
         provenance {

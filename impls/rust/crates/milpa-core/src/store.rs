@@ -212,7 +212,40 @@ impl CaStore {
     /// remove src, return the winner's canonical path.  Content-addressing
     /// guarantees the bytes are identical, so no corruption can occur.
     pub fn admit(&self, src: &Path, identity: &str) -> Result<PathBuf, CoreError> {
-        let actual = compute_content_hash(src)?;
+        self.admit_inner(src, identity, None)
+    }
+
+    /// Like [`CaStore::admit`] but with a caller-supplied precomputed content hash
+    /// (RFC identity-conformance-authority B2). When the caller has already hashed
+    /// `src` (e.g. the fetcher registry computes the identity once, right after
+    /// materialization), it injects that digest here to avoid a redundant tree
+    /// re-walk. The verification semantics are unchanged — the injected digest is
+    /// compared against `identity` exactly as a freshly-computed one would be.
+    /// This is the seam B-cutover uses to swap the identity emitter without
+    /// re-plumbing admission.
+    pub fn admit_with_hash(
+        &self,
+        src: &Path,
+        identity: &str,
+        precomputed_hash: &str,
+    ) -> Result<PathBuf, CoreError> {
+        self.admit_inner(src, identity, Some(precomputed_hash))
+    }
+
+    fn admit_inner(
+        &self,
+        src: &Path,
+        identity: &str,
+        precomputed_hash: Option<&str>,
+    ) -> Result<PathBuf, CoreError> {
+        let computed;
+        let actual: &str = match precomputed_hash {
+            Some(h) => h,
+            None => {
+                computed = compute_content_hash(src)?;
+                &computed
+            }
+        };
         if actual != identity {
             return Err(CoreError::Identity(
                 "CAS-IDENTITY-MISMATCH",

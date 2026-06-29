@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "mylib" {
-    identity "dag-sha256:29fd457cfa9f8dcc8d07d0be4cd68ad37d59f76f190d993dd9c29710c80774fd"
+    identity "dag-sha256:f18587036d1c18e8cae5e881018c2f79b060fb1e88d2427c03c4dee7f32f6f5d"
     version "0.0.1"
     src_dir ""
     requires

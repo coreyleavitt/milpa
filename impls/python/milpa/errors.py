@@ -89,6 +89,10 @@ FROZEN_STRATEGY_MISMATCH = "FROZEN-STRATEGY-MISMATCH"
 # ID — content-hash identity
 # ---------------------------------------------------------------------------
 
+# ID-NAME-TOO-LONG: epoch-2 Merkle-DAG leaf-name ceiling (spec/identity.md §1.8.8).
+# Reserved for the B2 materializer/DAG builder; no epoch-1 raise site yet. Declared
+# here so the spec↔errors.py bijection (tests/test_errors.py) stays exact.
+ID_NAME_TOO_LONG = "ID-NAME-TOO-LONG"
 ID_NO_ALGORITHM_PREFIX = "ID-NO-ALGORITHM-PREFIX"
 ID_NON_HEX_DIGEST = "ID-NON-HEX-DIGEST"
 ID_NON_UTF8_RELPATH = "ID-NON-UTF8-RELPATH"

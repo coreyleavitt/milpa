@@ -244,11 +244,13 @@ fn workspace_frozen_member_not_in_workspace() {
     let lf = lock(
         "maxver",
         vec![
-            // "libbar" IS in the workspace.
+            // "libbar" IS in the workspace; its pin must match the member's
+            // epoch-2 on-disk identity so the drift check passes and the
+            // not-in-workspace error (for libfoo) is what fires.
             locked(
                 "libbar",
                 "0.0.1",
-                Some("dag-sha256:8e5993e3c885dc876559e664001b5c1184aee88f7e9f3cd1538b6718305760bc"),
+                Some("dag-sha256:49845efa0775928552ad4327409411c871582b1c717b53e97a4f11acc6ab0eb3"),
                 ProvenanceRecord::Member {
                     name: "libbar".into(),
                     origin: "observed".into(),

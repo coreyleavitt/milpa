@@ -11,17 +11,14 @@
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use sha2::{Digest, Sha256};
-
+use crate::dag_identity::{
+    compute_dag_identity, MaterializedEntry, MODE_EXECUTABLE, MODE_REGULAR, MODE_SYMLINK,
+};
 use crate::error::CoreError;
 
 /// Hash algorithms milpa understands, with their hex digest length. New
 /// algorithms are added here and nowhere else.
 pub const SUPPORTED_ALGORITHMS: &[(&str, usize)] = &[("dag-sha256", 64)];
-
-// Mode markers — one byte per entry (identity.md §1.2).
-const MODE_REGULAR: u8 = 0x00; // regular file — exec bit excluded (Resolved Decision 1)
-const MODE_SYMLINK: u8 = 0x80;
 
 /// Non-catalog sentinel for filesystem I/O failures encountered while walking a
 /// tree to hash it. identity.md §5 catalogs no code for this: the Python
@@ -81,99 +78,127 @@ pub fn parse_identity(s: &str) -> Result<(&str, &str), CoreError> {
     Ok((algorithm, digest))
 }
 
-/// Compute the content hash of a source tree, returning `"dag-sha256:<64-hex>"`.
-/// The `dag-sha256:` prefix is part of the canonical form (identity.md §2.1).
+/// Compute the canonical content Merkle-DAG identity of a source tree, returning
+/// `"dag-sha256:<64-hex>"` (identity.md §1.8 / §2.1).
+///
+/// The on-disk tree is walked into a buffered `Vec<MaterializedEntry>` by
+/// [`enumerate_local_entries`] (the canonical disk walk) and folded by
+/// [`crate::dag_identity::compute_dag_identity`]. The STEP-1 invariant (a
+/// git-materialized on-disk tree hashed here equals the git object-store
+/// enumeration) is what lets every transport, plus CAS verify, share this one
+/// identity site.
 pub fn compute_content_hash(root: &Path) -> Result<String, CoreError> {
-    let mut entries = enumerate_entries(root)?;
-    // §1.3: sort by raw byte-order of the relative path.
-    entries.sort_by(|a, b| a.relpath.cmp(&b.relpath));
-
-    let mut h = Sha256::new();
-    for e in &entries {
-        h.update(&e.relpath);
-        h.update([0x00]);
-        h.update([e.mode_marker]);
-        h.update([0x00]);
-        h.update(&e.content);
-        h.update([0x00]);
-    }
-    Ok(format!("dag-sha256:{:x}", h.finalize()))
+    compute_dag_identity(&enumerate_local_entries(root)?)
 }
 
-/// One tree entry destined for the hash: its relpath bytes, mode marker, and
-/// content bytes (file contents, or — for a symlink — the link-target string).
-struct Entry {
-    relpath: Vec<u8>,
-    mode_marker: u8,
-    content: Vec<u8>,
-}
-
-/// Walk `root` recursively, collecting one [`Entry`] per file and symlink.
-/// Skips `.git` components at any depth (§1.4), directories themselves, and
-/// (consequently) empty directories. Symlinks are NEVER followed — neither for
-/// content (§1.5) nor for recursion — so a symlinked directory is a leaf entry.
-fn enumerate_entries(root: &Path) -> Result<Vec<Entry>, CoreError> {
+/// The canonical on-disk walk (the local materialize seam): walk `root` into a
+/// buffered `Vec<MaterializedEntry>` (spec §1.8.4) feeding the epoch-2 DAG builder.
+///
+/// Single source of truth for turning real on-disk bytes + POSIX mode bits into
+/// the materialize seam. [`compute_content_hash`] uses it, and the local transport
+/// is exactly this walk applied to a local source dir — the local sibling of the
+/// object-store seams [`crate::fetchers::enumerate_git_entries`] /
+/// [`crate::fetchers::enumerate_tarball_entries`]. Mode mapping (spec §1.8.2.1):
+/// a regular file with any POSIX execute bit (`st_mode & 0o111`) → `0x01`, else
+/// `0x00`; a symlink → `0x80` with the `read_link` target string bytes (not
+/// followed). A `.git` component is skipped at any depth (§1.8.6). Non-UTF-8
+/// names / symlink targets are coded errors (cross-impl contract with Python).
+pub fn enumerate_local_entries(root: &Path) -> Result<Vec<MaterializedEntry>, CoreError> {
     let mut out = Vec::new();
     walk(root, root, &mut out)?;
     Ok(out)
 }
 
-fn walk(root: &Path, dir: &Path, out: &mut Vec<Entry>) -> Result<(), CoreError> {
-    let rd = std::fs::read_dir(dir).map_err(|e| {
-        CoreError::Identity(
-            INTERNAL_IO,
-            format!("cannot read directory {}: {e}", dir.display()),
-        )
-    })?;
-    for ent in rd {
-        let ent = ent.map_err(|e| {
+fn walk(root: &Path, dir: &Path, out: &mut Vec<MaterializedEntry>) -> Result<(), CoreError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut children: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| {
+            CoreError::Identity(
+                INTERNAL_IO,
+                format!("cannot read directory {}: {e}", dir.display()),
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
             CoreError::Identity(
                 INTERNAL_IO,
                 format!("cannot read entry under {}: {e}", dir.display()),
             )
         })?;
+    // Stream order is irrelevant (the builder re-sorts each level by leaf name);
+    // a stable sort keeps the walk deterministic.
+    children.sort_by_key(|e| e.file_name());
+
+    for ent in children {
         let path = ent.path();
-        // §1.4: exclude `.git` (and anything beneath it) at any depth.
+        // §1.8.6 (inherits §1.4): exclude `.git` (and anything beneath it) at any depth.
         if path.file_name().map(|n| n == ".git").unwrap_or(false) {
             continue;
         }
-        // symlink_metadata does NOT follow the link, so a symlink — even to a
-        // directory — reports as a symlink and becomes a leaf entry.
-        let ft = std::fs::symlink_metadata(&path).map_err(|e| {
-            CoreError::Identity(INTERNAL_IO, format!("cannot stat {}: {e}", path.display()))
-        })?;
-        if ft.file_type().is_symlink() {
-            out.push(symlink_entry(root, &path)?);
-        } else if ft.is_dir() {
-            walk(root, &path, out)?;
-        } else if ft.is_file() {
-            // §1.3 / spec/errors.md ID-NON-UTF8-RELPATH: the relpath is
-            // encoded as UTF-8 in the canonical byte stream (cross-impl
-            // contract with the Python reference). On Linux, filenames are raw
-            // byte sequences; validate before hashing so both impls raise the
-            // same coded error rather than silently diverging on non-UTF-8
-            // byte sequences (mirrors the ID-NON-UTF8-SYMLINK-TARGET pattern).
-            let rb = relpath_bytes(root, &path);
-            if std::str::from_utf8(&rb).is_err() {
+        // §1.3 / spec/errors.md ID-NON-UTF8-RELPATH: the relpath is encoded as
+        // UTF-8 (cross-impl contract with Python). On Linux, filenames are raw
+        // byte sequences; validate before constructing the entry so both impls
+        // raise the same coded error rather than silently diverging.
+        let rb = relpath_bytes(root, &path);
+        let relpath = match std::str::from_utf8(&rb) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
                 return Err(CoreError::Identity(
                     "ID-NON-UTF8-RELPATH",
                     format!(
                         "file path {:?} is not valid UTF-8 — cannot compute a content hash",
                         String::from_utf8_lossy(&rb)
                     ),
-                ));
+                ))
             }
+        };
+        // symlink_metadata does NOT follow the link, so a symlink — even to a
+        // directory — reports as a symlink and becomes a leaf entry.
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+            CoreError::Identity(INTERNAL_IO, format!("cannot stat {}: {e}", path.display()))
+        })?;
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            // §1.5/§1.8.1: hash the link-target string as UTF-8 bytes; do not follow.
+            let target = std::fs::read_link(&path).map_err(|e| {
+                CoreError::Identity(
+                    INTERNAL_IO,
+                    format!("cannot readlink {}: {e}", path.display()),
+                )
+            })?;
+            let target_str = target.into_os_string().into_string().map_err(|_| {
+                CoreError::Identity(
+                    "ID-NON-UTF8-SYMLINK-TARGET",
+                    format!(
+                        "symlink target at {relpath:?} is not valid UTF-8 \
+                         — cannot compute a content hash"
+                    ),
+                )
+            })?;
+            out.push(MaterializedEntry {
+                relpath,
+                mode_byte: MODE_SYMLINK,
+                content: target_str.into_bytes(),
+            });
+        } else if ft.is_dir() {
+            walk(root, &path, out)?;
+        } else if ft.is_file() {
             let content = std::fs::read(&path).map_err(|e| {
                 CoreError::Identity(
                     INTERNAL_IO,
                     format!("cannot read file {}: {e}", path.display()),
                 )
             })?;
-            // Resolved Decision 1: exec bit is NOT part of identity.
-            // Regular files always use MODE_REGULAR (0x00).
-            out.push(Entry {
-                relpath: rb,
-                mode_marker: MODE_REGULAR,
+            // §1.8.2.1: the executable bit is part of epoch-2 identity.
+            let mode_byte = if meta.permissions().mode() & 0o111 != 0 {
+                MODE_EXECUTABLE
+            } else {
+                MODE_REGULAR
+            };
+            out.push(MaterializedEntry {
+                relpath,
+                mode_byte,
                 content,
             });
         }
@@ -181,44 +206,6 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Entry>) -> Result<(), CoreError> 
         // is_file()/is_symlink() pair would also skip them.
     }
     Ok(())
-}
-
-fn symlink_entry(root: &Path, path: &Path) -> Result<Entry, CoreError> {
-    // §1.3 / spec/errors.md ID-NON-UTF8-RELPATH: validate the symlink's own
-    // relpath is UTF-8 before hashing (cross-impl contract; mirrors the
-    // ID-NON-UTF8-RELPATH check for regular files).
-    let rb = relpath_bytes(root, path);
-    if std::str::from_utf8(&rb).is_err() {
-        return Err(CoreError::Identity(
-            "ID-NON-UTF8-RELPATH",
-            format!(
-                "file path {:?} is not valid UTF-8 — cannot compute a content hash",
-                String::from_utf8_lossy(&rb)
-            ),
-        ));
-    }
-    // §1.5: hash the link-target string as UTF-8 bytes; do not follow. A target
-    // that is not valid UTF-8 is unrepresentable in the canonical byte stream.
-    let target = std::fs::read_link(path).map_err(|e| {
-        CoreError::Identity(
-            INTERNAL_IO,
-            format!("cannot readlink {}: {e}", path.display()),
-        )
-    })?;
-    let target_str = target.into_os_string().into_string().map_err(|_| {
-        CoreError::Identity(
-            "ID-NON-UTF8-SYMLINK-TARGET",
-            format!(
-                "symlink target at {:?} is not valid UTF-8 — cannot compute a content hash",
-                String::from_utf8_lossy(&rb)
-            ),
-        )
-    })?;
-    Ok(Entry {
-        relpath: rb,
-        mode_marker: MODE_SYMLINK,
-        content: target_str.into_bytes(),
-    })
 }
 
 /// The POSIX relative path from `root` to `path`, as raw bytes. On Linux a
@@ -322,14 +309,15 @@ mod tests {
     }
 
     #[test]
-    fn executable_bit_does_not_change_content_hash() {
-        // Resolved Decision 1: exec bit is excluded from identity. Toggling
-        // S_IXUSR must NOT change the hash.
+    fn executable_bit_changes_content_hash() {
+        // Epoch 2 (§1.8.2): the exec bit IS part of identity. A regular file
+        // (0x00) and an executable file (0x01) with identical bytes hash
+        // differently — a deliberate correction over interim epoch 1.
         let root = tmp();
         let (a, b) = (root.join("a"), root.join("b"));
         write(&a.join("script.sh"), "#!/bin/sh\necho hi\n", false);
         write(&b.join("script.sh"), "#!/bin/sh\necho hi\n", true);
-        assert_eq!(
+        assert_ne!(
             compute_content_hash(&a).unwrap(),
             compute_content_hash(&b).unwrap()
         );
@@ -443,7 +431,7 @@ mod tests {
         write(&a.join(".git/HEAD"), "junk\n", false);
         assert_eq!(
             compute_content_hash(&a).unwrap(),
-            "dag-sha256:85f2eb93585a6870b118351b14b8e32a4f55d61809f1612aaca5bae3c3db61cd"
+            "dag-sha256:10c68c24594e4ab384f0672a67b738eab5190e0837a3e09dd27e89eb1172791a"
         );
     }
 
@@ -452,7 +440,7 @@ mod tests {
         let root = tmp();
         let a = root.join("a");
         fs::create_dir_all(&a).unwrap();
-        // sha256 of the empty byte stream (dag-sha256: prefix, flat SHA256 computation).
+        // Empty tree = the zero-entry Merkle-DAG root (§1.8.5): sha256(b"").
         assert_eq!(
             compute_content_hash(&a).unwrap(),
             "dag-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"

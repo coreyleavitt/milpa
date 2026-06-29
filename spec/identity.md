@@ -23,9 +23,10 @@ specs:
 
 A conformant implementation of this spec MUST:
 
-1. Compute `content_hash` using the canonical byte stream defined in §1:
-   UTF-8-byte-order-sorted file entries, per-entry serialization with null-byte
-   separators, sha256 digest.
+1. Compute `content_hash` as the canonical content Merkle DAG of §1.8 (epoch 2,
+   the epoch in force per §1.1.1): per-level leaf-name sort, four-valued
+   mode-byte, bottom-up tree nodes, root `H_tree` as the digest. (The interim
+   epoch-1 flat byte stream of §1.2 is retired and no longer emitted.)
 2. Exclude any path component named `.git` at any depth from the hashed
    tree.
 3. Hash symlinks by their target string (not by following them), using the
@@ -64,7 +65,33 @@ The hash is:
 - **Recomputable**: given the bytes on disk, any implementation can reproduce
   the hash without contacting any network service.
 
-### 1.2  Canonical byte stream
+### 1.1.1  Two epochs (interim flat stream vs. canonical Merkle DAG)
+
+> NORMATIVE: milpa identity has two epochs. The identity-string scheme prefix
+> (`dag-sha256:`, §2) names the *full canonical computation*, and which epoch is
+> in force is a property of the milpa release, not of the string:
+>
+> - **Epoch 1 (interim, RETIRED).** §1.2–§1.7 define a single **flat
+>   null-separated byte stream** over the whole tree, digested with one sha256
+>   pass. This is what the reference impls emitted in the interim; it is **no
+>   longer emitted** (RFC `rfc-identity-conformance-authority`, B-cutover). Its
+>   mode marker was two-valued (`0x00` regular, `0x80` symlink) and the executable
+>   bit was excluded. §1.2–§1.7 are retained as the historical description and as
+>   the home of the cross-cutting content rules §1.8 inherits.
+> - **Epoch 2 (canonical Merkle DAG, the forever format — IN FORCE).** §1.8
+>   defines a canonical content **Merkle DAG** of blob and tree nodes. It is the
+>   normative target the multi-impl conformance corpus freezes (RFC
+>   `rfc-identity-conformance-authority`). Epoch 2 includes the executable bit
+>   (mode-byte `0x01`, §1.8.2) — a deliberate correction over epoch 1.
+
+> NORMATIVE: Epoch 2 is the meaning of `dag-sha256:`. The B-cutover flipped
+> emission from the §1.2 flat stream to the §1.8 Merkle DAG; the digest bytes
+> changed (intended — there are no external consumers pre-v1, see §2.1). The
+> cross-cutting content rules (`.git` exclusion §1.4, symlink-as-target §1.5,
+> raw bytes / no line-ending normalization §1.6, non-UTF-8 relpath rejection)
+> are **shared by both epochs**; §1.8 inherits them by reference.
+
+### 1.2  Canonical byte stream (epoch 1 — interim)
 
 > NORMATIVE: The input to sha256 is the concatenation of zero or more
 > **entry records**, one per file or symlink under the tree, in ascending
@@ -211,10 +238,18 @@ filter can apply.
 
 #### 1.7.4  On-disk mode for materialized blobs
 
-Identity ignores the exec bit (§1.2), so the on-disk mode of materialized
-files does not affect the hash. However, to keep `milpa verify`
-re-hashing byte-identically across hosts, conformant implementations MUST
-write materialized blobs with the following fixed modes:
+Conformant implementations MUST write materialized blobs with the following
+fixed on-disk modes:
+
+- Under **epoch 2** (§1.8, in force) the executable bit is **part of identity**
+  (mode-byte `0x01`, §1.8.2), so the on-disk mode is identity-bearing and MUST
+  be preserved exactly as committed. This is what makes the B-cutover invariant
+  hold: re-walking the materialized on-disk tree (`compute_content_hash`, which
+  CAS `verify` uses) reproduces the same `dag-sha256:` as the object-store
+  enumeration only because the exec bit and symlinks survive to disk.
+- (Historical: under the retired interim epoch 1 the exec bit was excluded from
+  the hash; the fixed modes were still required so `milpa verify` re-hashed
+  byte-identically across hosts.)
 
 > NORMATIVE:
 >
@@ -251,6 +286,257 @@ write materialized blobs with the following fixed modes:
 
 ---
 
+## 1.8  Canonical content Merkle DAG (epoch 2 — the forever format)
+
+This section is the **byte-level normative table** for milpa identity epoch 2.
+It is the format the multi-impl conformance corpus freezes; a wrong byte or a
+wrong child order is a permanent cross-impl divergence. Epoch 2 inherits the
+shared content rules of §1.4 (`.git` exclusion), §1.5 (symlink-as-target), §1.6
+(raw bytes, no line-ending normalization), and the non-UTF-8 relpath rejection
+(`ID-NON-UTF8-RELPATH`).
+
+Identity is the digest of a **canonical content Merkle DAG**: leaves are content
+**blob nodes**, interior nodes are **tree nodes** (one per directory), and the
+identity is the digest of the **root tree node**. This aligns milpa with
+git/OCI/IPFS (all Merkle-addressed) while remaining transport-independent: the
+DAG derives from content, not from how the content was fetched.
+
+> NORMATIVE: `dag-sha256:<hex>` is a milpa scheme string, **not an IPFS CID**
+> (RFC §3.6); it MUST NOT be passed to CID/multihash-parsing libraries. The
+> digest is the raw 32-byte/64-hex sha256, with no multicodec/varint prefix.
+
+### 1.8.1  Blob node
+
+> NORMATIVE: A **blob node** is a single regular file or symlink. Its digest is:
+>
+> ```
+> H_blob = sha256(content-bytes)
+> ```
+>
+> This is **transport-neutral**: it is the sha256 of the raw content bytes
+> directly, **NOT** git's `blob <len>\0<content>` object hash, and **NOT**
+> wrapped in any framing. For a **regular file**, `content-bytes` is the exact
+> bytes on disk / in the object store — no line-ending normalization (§1.6). For
+> a **symlink**, `content-bytes` is the UTF-8 encoding of the link-target string
+> (§1.5); the symlink is not followed. A non-UTF-8 symlink target raises
+> `ID-NON-UTF8-SYMLINK-TARGET`; a non-UTF-8 relpath raises `ID-NON-UTF8-RELPATH`.
+
+### 1.8.2  Tree node and the per-entry encoding
+
+A **tree node** is the canonical encoding of one directory's immediate children.
+Each child — whether a blob (file/symlink) or a subtree (subdirectory) — is one
+**entry**.
+
+> NORMATIVE: Each entry is serialized as exactly these four fields, concatenated
+> with no separators or padding:
+>
+> ```
+> <uint32-be name-length> <name-bytes> <mode-byte> <child-digest-raw>
+> ```
+>
+> where:
+>
+> - `<uint32-be name-length>` is the byte length of `<name-bytes>`, encoded as a
+>   4-byte big-endian unsigned integer.
+> - `<name-bytes>` is the UTF-8 encoding of the child's **leaf name** — a single
+>   path component (e.g. `b.txt`), **NOT** the full relpath. It MUST NOT contain
+>   `/`. Length-prefixing removes any separator-byte ambiguity: a name may
+>   contain any byte except those excluded by the OS, and no in-band delimiter is
+>   used.
+> - `<mode-byte>` is exactly one byte (§1.8.2.1).
+> - `<child-digest-raw>` is the **raw 32-byte** sha256 digest of the child node —
+>   `H_blob` for a blob child, `H_tree` for a subtree child. It is the raw bytes,
+>   **never** the ASCII `dag-sha256:<hex>` string (the self-describing string
+>   lives only in lockfiles/CAS paths, never inside a node).
+>
+> The tree-node digest is:
+>
+> ```
+> H_tree = sha256(concat(entries-in-canonical-order))   // §1.8.3
+> ```
+
+> NORMATIVE: Leaf names are unique within a tree node (a filesystem/`git tree`
+> invariant: a directory cannot hold two children of the same name). An
+> implementation MUST NOT emit two entries with the same `<name-bytes>` in one
+> tree node.
+
+#### 1.8.2.1  Mode-byte (four-valued)
+
+> NORMATIVE: The mode-byte takes exactly four values:
+>
+> | Byte   | Meaning                          | Child digest is |
+> |--------|----------------------------------|-----------------|
+> | `0x00` | regular file                     | `H_blob`        |
+> | `0x01` | executable regular file          | `H_blob`        |
+> | `0x80` | symbolic link                    | `H_blob`        |
+> | `0x40` | tree (subdirectory / submodule)  | `H_tree`        |
+>
+> No other value is valid. A directory entry (including a spliced submodule,
+> §1.8.7) is always `0x40` regardless of the directory's own permission bits —
+> directory permissions are not content.
+
+> NORMATIVE: The mode-byte is a **type tag** that domain-separates `H_blob` from
+> `H_tree` within a parent. Because blob and subtree children both carry a raw
+> 32-byte digest in the same position, the mode-byte (together with the
+> length-prefixed name) is what makes the entry stream unambiguously decodable
+> and prevents a blob from forging a subtree, or vice versa (the
+> Certificate-Transparency leaf/node-prefix discipline). The `0x40` value is
+> therefore load-bearing — without it the encoding could neither represent
+> subdirectories nor separate the two digest spaces.
+
+> NORMATIVE: `0x01` (the executable bit) places the POSIX `+x` bit into identity
+> for the first time. This is a deliberate **epoch-2 correction**: epoch 1
+> dropped it, so two trees differing only in a script's executable bit hashed
+> identically (a correctness hole). git tracks it (`100644`/`100755`); the
+> materializers already carry it. A `100755` `ls-tree` blob → `0x01`; a `100644`
+> blob → `0x00`; a `120000` blob → `0x80`.
+
+### 1.8.3  Canonical child order — leaf-name byte sort (top divergence risk)
+
+> NORMATIVE: Within a tree node, entries — **both blob and subtree children** —
+> MUST be concatenated in **ascending UTF-8 byte order of the leaf name**
+> (`<name-bytes>`), compared byte-by-byte; the first differing byte determines
+> the order; a shorter name that is a byte-prefix of a longer one sorts first.
+> No locale collation, no Unicode normalization.
+
+> NORMATIVE: The sort key is the **leaf name (single path component)**, **not**
+> the full relpath. This differs from epoch 1's full-relpath sort (§1.3) and is
+> **the single highest cross-impl-divergence risk in epoch 2.** A materializer's
+> natural stream order (`git ls-tree -r`, or a flat directory walk) is
+> *full-relpath* order, which can differ from per-level leaf-name order. The DAG
+> builder MUST re-sort the immediate children of **every** tree node by leaf name
+> independently, and MUST NOT rely on the materializer's stream order.
+>
+> Worked example (the corpus pins this as `fixture-330-dag-oracle-nested-leafsort`):
+> a root containing a subdirectory `a/` and a file `a.txt`. In full-relpath byte
+> order, `a.txt` precedes `a/b.txt` because `.` (`0x2e`) < `/` (`0x2f`) — i.e.
+> the file would come *before* the directory. But by leaf name, `"a"` is a
+> byte-prefix of `"a.txt"`, so the **subdirectory `a` sorts first**. A builder
+> that re-uses stream order produces a different (wrong) root `H_tree`.
+
+### 1.8.4  DAG construction (buffered, bottom-up)
+
+> NORMATIVE: A per-transport **materializer** yields a **flat, fully-buffered**
+> sequence of `(relpath, mode, content-bytes)` triples for the whole tree (e.g.
+> `git ls-tree -r` over the committed tree, or a directory walk). This is **not**
+> a streaming hash feed: the builder MUST collect the whole sequence before
+> hashing (peak memory is bounded to "the entry set + one blob at a time"). The
+> builder then groups entries by directory prefix and constructs tree nodes
+> **bottom-up** (deepest directories first), each `H_tree` becoming a parent
+> entry with mode `0x40`. The **root tree node's `H_tree` is the identity.**
+
+> NOTE: Reference pseudocode (a conformant impl MAY differ internally so long as
+> the resulting bytes match):
+>
+> ```
+> def dag_identity(entries):                  # entries: list of (relpath, mode, bytes)
+>     entries = [e for e in entries           # §1.4: drop any path with a `.git` component
+>                if ".git" not in e.relpath.split("/")]
+>     root = build_nested_tree(entries)        # group by directory prefix
+>     digest, _ = h_tree(root)
+>     return "dag-sha256:" + hex(digest)
+>
+> def h_tree(node):                            # returns (digest, is_empty)
+>     items = []
+>     for leaf, (mode, content) in node.files:
+>         items.append((leaf, blob_mode_byte(mode), sha256(content)))   # H_blob
+>     for leaf, sub in node.subdirs:
+>         sub_digest, sub_empty = h_tree(sub)
+>         if sub_empty:                        # §1.8.5: omit empty subdir
+>             continue
+>         items.append((leaf, 0x40, sub_digest))                        # H_tree
+>     items.sort(key=lambda i: utf8(i.leaf))   # §1.8.3: leaf-name byte order
+>     blob = b"".join(u32be(len(utf8(name))) + utf8(name) + bytes([m]) + dig
+>                     for (name, m, dig) in items)
+>     return sha256(blob), (len(items) == 0)
+> ```
+
+### 1.8.5  Empty directories and the empty root
+
+> NORMATIVE: A tree node with **zero entries** contributes **no entry** to its
+> parent. This rule is applied recursively: an intermediate directory that
+> becomes empty after omitting its empty children is itself omitted. This keeps
+> git (which records no empty directories) byte-identical with the tarball/local
+> materializers (which may carry empty directories on disk).
+
+> NORMATIVE: The **empty source tree** is the zero-entry root tree node. Its
+> identity is the digest of the empty entry concatenation:
+>
+> ```
+> dag-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+> ```
+>
+> (= `dag-sha256:` + `sha256(b"")`). Pinned as `fixture-329-dag-oracle-empty-root`.
+
+> NORMATIVE: The zero-entry-tree digest (`sha256` of the empty string) is the
+> identity **only** when the whole tree is empty. It is **never** used as a
+> `<child-digest-raw>`, because empty subdirectories are omitted from their
+> parents (above) before the parent is encoded.
+
+### 1.8.6  `.git/` exclusion
+
+> NORMATIVE: Inherited from §1.4: any path whose components include one named
+> exactly `.git` is excluded **before** DAG construction, at any depth.
+
+### 1.8.7  Submodules
+
+> NORMATIVE: A `160000` gitlink occupies a **directory position**. Its source
+> bytes are content (§1.7.5): the submodule is fetched and materialized, its
+> **root `H_tree`** is computed, and that `H_tree` is spliced in as the
+> `<child-digest-raw>` of a tree entry at the gitlink's path, with mode `0x40`
+> (a subtree child). The submodule's URL and pinned commit SHA are provenance
+> and are recorded separately (§1.7.5) — never inside a node. A submodule whose
+> materialized tree is empty is an empty subdirectory and is omitted (§1.8.5).
+
+### 1.8.8  Name-byte ceiling
+
+> NORMATIVE: A leaf name's `<name-bytes>` length MUST NOT exceed **4096 bytes**.
+> A longer name raises `ID-NAME-TOO-LONG`. (Common filesystems cap a single path
+> component at 255 bytes; the 4096-byte ceiling is a generous, transport-neutral
+> bound that also caps the `<uint32-be name-length>` field far below its range,
+> foreclosing any length-field abuse.)
+
+### 1.8.9  Soundness
+
+> NOTE: The encoding is injective up to sha256: each tree node's byte string
+> decodes uniquely (read 4-byte length, then that many name bytes, then 1 mode
+> byte, then 32 digest bytes, repeat), the canonical leaf-name sort makes the
+> order deterministic, and the mode-byte domain-separates the blob and tree
+> digest spaces. Distinct trees therefore produce distinct encodings (and hence
+> distinct digests, absent a sha256 collision). Shared subtrees share an
+> `H_tree` — the basis for the subtree-dedup CAS work split out of this RFC.
+
+### 1.8.10  Materializer faithfulness and lossy archives
+
+> NORMATIVE: Identity is transport-independent (§1.1): the git, tarball, and
+> local-path materializers MUST all yield the same `(relpath, mode, content)`
+> sequence — and therefore the same `dag-sha256:` — for a tree whose source bytes
+> and POSIX modes are identical. The executable bit (`0x01`, §1.8.2.1) is part of
+> identity, so a materializer MUST set it from the bytes its transport actually
+> delivers:
+>
+> - **git**: from the `ls-tree` mode (`100755` → `0x01`, `100644` → `0x00`,
+>   `120000` → `0x80`), per §1.8.2.1.
+> - **tarball**: from the tar entry mode — any POSIX execute bit (`mode & 0o111`)
+>   → `0x01`, else `0x00`; a tar symlink entry → `0x80` with the `linkname` string
+>   as content.
+> - **local path**: from the on-disk `st_mode` (`st_mode & 0o111` → `0x01`); a
+>   symlink → `0x80` with the `readlink` target string as content.
+
+> NORMATIVE: A **lossy archive format** — one that does not record POSIX execute
+> bits (e.g. a `.zip`) — materializes a **genuinely different tree**: every file
+> is `0x00` because the `+x` bit was never delivered. Its `dag-sha256:` therefore
+> **differs** from the git/`.tar` digest of the same logical source, and this is
+> **correct behaviour, not a bug**: identity hashes the bytes-plus-modes that were
+> actually delivered, and a delivery that dropped the exec bit is not the same
+> tree. A conformant implementation MUST NOT silently re-impute exec bits a lossy
+> archive failed to carry, and MUST NOT admit a lossy archive format through an
+> exec-bit-faithful materializer path. (The reference `TarballFetcher` rejects
+> `.zip` upstream; only the exec-bit-faithful tar family — `.tar` / `.tar.gz` /
+> `.tar.bz2` / `.tar.xz` — feeds the tarball materializer.)
+
+---
+
 ## 2  Identity string format (multihash encoding)
 
 ### 2.1  Canonical form
@@ -263,24 +549,25 @@ write materialized blobs with the following fixed modes:
 > ```
 >
 > The `dag-sha256:` prefix is part of the canonical form. An identity string
-> without this prefix is invalid. The algorithm name `dag-sha256` is the A1
-> epoch name, chosen for forward compatibility with the Merkle DAG encoding
-> that B1 will introduce.
+> without this prefix is invalid. The algorithm name `dag-sha256` names the
+> canonical content **Merkle DAG** encoding of §1.8.
 
 > NORMATIVE: The hex digest MUST use lowercase letters `a`–`f`; uppercase
 > is rejected.
 
-> NOTE: The reference implementation returns `f"dag-sha256:{h.hexdigest()}"`
-> from `compute_content_hash` (`identity.py:128`). `hashlib.hexdigest()`
-> always produces lowercase.
+> NOTE: The reference implementation returns `f"dag-sha256:{digest.hex()}"`
+> from `compute_content_hash` (`identity.py`), where the digest is the root
+> `H_tree` of the canonical Merkle DAG of §1.8. Lowercase hex is produced.
 
-> NOTE (A1 interim epoch): The underlying digest computation is flat SHA256
-> over the canonical byte stream defined in §1.2. The `dag-sha256:` prefix
-> does NOT yet imply a Merkle DAG encoding; that is the B1 milestone. During
-> the A1 epoch, `dag-sha256:<hex>` means "flat SHA256 digest, Merkle DAG
-> encoding reserved". No external consumers exist pre-v1; the prefix will be
-> stable when the DAG encoding lands because the digest bytes will change,
-> which is the correct behaviour.
+> NOTE: The interim epoch-1 flat byte stream is **retired** (RFC
+> `rfc-identity-conformance-authority`, B-cutover). `dag-sha256:<hex>` now means
+> the actual §1.8 canonical content Merkle DAG — the digest is the root `H_tree`,
+> not the flat SHA256 of §1.2. §1.2–§1.7 are retained only as the historical
+> description of the interim stream and as the source of the cross-cutting content
+> rules (`.git` exclusion, symlink-as-target, raw bytes, non-UTF-8 rejection) that
+> §1.8 inherits; the executable bit, **excluded** under epoch 1, is **part of**
+> epoch-2 identity (§1.8.2). A stale `sha256:` identity is rejected at parse as
+> `ID-UNSUPPORTED-ALGORITHM` — re-lock with `milpa fetch`.
 
 ### 2.2  Validation grammar
 
@@ -598,6 +885,7 @@ All identity and CAS errors are defined in `spec/errors.md`. Summary:
 | `ID-UNSUPPORTED-ALGORITHM` | algorithm prefix not in supported set |
 | `ID-WRONG-DIGEST-LENGTH` | digest length wrong for algorithm |
 | `ID-NON-HEX-DIGEST` | digest contains non-lowercase-hex chars |
+| `ID-NAME-TOO-LONG` | an epoch-2 leaf name exceeds the 4096-byte ceiling (§1.8.8) |
 | `ID-NON-UTF8-RELPATH` | a source-tree relative path is not valid UTF-8 (§1.3) |
 | `ID-NON-UTF8-SYMLINK-TARGET` | a symlink target string is not valid UTF-8 (§1.5) |
 | `CAS-IDENTITY-MISMATCH` | `admit()` computed hash ≠ claimed identity |

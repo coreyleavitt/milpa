@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "lib-a" {
-    identity "dag-sha256:d2d202c427d34c53aa2bbb0cf3ffb9087eefa0f8f9c274a1ff7f2dd8cf453a98"
+    identity "dag-sha256:c6929b65cb8fdef836f9ac3de5cd48489214b83ce059275b9fe86e3ff30716fc"
     version "0.0.1"
     src_dir ""
     requires "lib-target"
@@ -18,7 +18,7 @@ dep "lib-a" {
 }
 
 dep "lib-b" {
-    identity "dag-sha256:93a0062f2b54fcfcffc380a035f2b09a28823aac808f7d46365490cd8f485441"
+    identity "dag-sha256:3c0b72564db5d5ef8ffe0c8167f113edf75be80d736a1b7cb8065c8b44847f4f"
     version "0.0.1"
     src_dir ""
     requires "lib-target"
@@ -33,7 +33,7 @@ dep "lib-b" {
 }
 
 dep "lib-end" {
-    identity "dag-sha256:fae64ab2a378f93e6e02b38da2db679d053f96d95da668cb9f536b67c5b12549"
+    identity "dag-sha256:2fbe28e6dde1b7f20399d700d54607c62c73d689242b331c7d71662ed30bcf96"
     version "0.0.1"
     src_dir ""
     requires
@@ -47,7 +47,7 @@ dep "lib-end" {
 }
 
 dep "lib-target" {
-    identity "dag-sha256:66251a5bb4817414a68b6f6e4f6704fe8ddde1613532ab74bb32d3ed2cc68cd7"
+    identity "dag-sha256:e9c174849cbb386ac156b03d03a7ce448cf4b1864c328588de00aa47beea7768"
     version "0.0.1"
     src_dir ""
     requires "lib-end"

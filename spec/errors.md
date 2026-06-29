@@ -292,6 +292,20 @@ The requested resolution strategy differs from what the lockfile was built with.
 
 ## ID
 
+### `ID-NAME-TOO-LONG`
+
+A leaf name (single path component) in the source tree exceeds the epoch-2
+Merkle-DAG name-byte ceiling of 4096 bytes (`spec/identity.md` §1.8.8).
+
+**Triggered:** The epoch-2 DAG builder encodes a tree-node entry whose
+`<name-bytes>` length exceeds 4096 bytes (the `<uint32-be name-length>` field of
+`spec/identity.md` §1.8.2). The ceiling forecloses any abuse of the 4-byte
+length field and is far above every real filesystem's per-component cap (255
+bytes). Reserved for the epoch-2 materializer/DAG builder (RFC
+`rfc-identity-conformance-authority` slice B2); no epoch-1 raise site exists, so
+the reference impls register it as a deferred-to-B2 code under their
+catalog-bijection lints until B2 wires the builder.
+
 ### `ID-NO-ALGORITHM-PREFIX`
 
 Identity string is missing the `<algorithm>:` prefix (expected `<algorithm>:<digest>` form).

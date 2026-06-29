@@ -1,7 +1,7 @@
 schema_version 1
 package "lib-a" {
     version "1.0.0" {
-        content_hash "dag-sha256:636bb281ad6bbb5f74ef43e02b5090edb502d35224ca86cccdc18c725c1d5739"
+        content_hash "dag-sha256:db56482117bcddc6a055156f5bef8de53f101fb1a9a7e7f85887ed0f92e9a573"
         provenance {
             kind "git"
             url "https://example.com/lib-a.git"

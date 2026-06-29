@@ -973,6 +973,14 @@ impl Target for MilpaTarget {
                  black-box CLI harness, not the in-process Target"
                     .to_string(),
             ),
+            // Epoch-2 Merkle-DAG oracle fixtures (RFC slice B2-git): the production
+            // DAG builder + per-transport materializers reproduce the hand-frozen
+            // `dag-sha256:` pin. Two transports are live: staged seam input
+            // (dag-oracle.json) → builder; git (git-protocol.json) → real
+            // object-store materialization → git seam → builder. The builder is
+            // independent of the frozen oracle, so reproducing the pin IS the
+            // differential check.
+            Cmd::DagOracle => run_dag_oracle_fixture(fx, scratch),
         }
     }
 }
@@ -1247,6 +1255,25 @@ fn make_git_protocol_repo(
                     .map_err(|e| format!("create symlink {link_path} -> {link_target}: {e}"))?;
             }
         }
+        // Exec-bit support (epoch-2 identity, spec §1.8.2.1): chmod +x the listed
+        // paths before `git add` so git records them as mode-100755 blobs.
+        if let Some(exec_val) = repo_spec.get("executable") {
+            use std::os::unix::fs::PermissionsExt as _;
+            let execs = exec_val.as_arr()
+                .ok_or("repo_spec 'executable' must be an array")?;
+            for val in execs {
+                let relpath = val.as_str()
+                    .ok_or("'executable' entries must be strings")?;
+                let target = repo_dir.join(relpath);
+                let mut perms = std::fs::metadata(&target)
+                    .map_err(|e| format!("stat {relpath}: {e}"))?
+                    .permissions();
+                let mode = perms.mode();
+                perms.set_mode(mode | 0o111);
+                std::fs::set_permissions(&target, perms)
+                    .map_err(|e| format!("chmod +x {relpath}: {e}"))?;
+            }
+        }
         let out = git_c(&["add", "."]).map_err(|e| format!("git add: {e}"))?;
         if !out.status.success() {
             return Err(format!("git add failed: {}", String::from_utf8_lossy(&out.stderr)));
@@ -1493,6 +1520,261 @@ fn run_git_protocol_fixture(fx: &Fixture, scratch: &Scratch) -> Result<Produced,
     // Return GitProtocolPass: git-protocol fixtures assert only content_hash.
     // run_fixture's (Expected::Success, Ok(Produced::GitProtocolPass { .. })) arm passes it.
     Ok(Produced::GitProtocolPass { content_hash: got_hash })
+}
+
+// ---------------------------------------------------------------------------
+// Epoch-2 Merkle-DAG oracle tier (cmd=dag-oracle) — RFC identity-conformance B2
+// ---------------------------------------------------------------------------
+// Two transports, distinguished by the fixture's source file:
+//   * dag-oracle.json   — staged seam input fed DIRECTLY to the production DAG
+//                         builder (the builder's own contract test).
+//   * git-protocol.json — a real git repo cloned --no-checkout and enumerated via
+//                         the production git seam (enumerate_git_entries), then
+//                         fed to the SAME builder (the cross-transport proof).
+// Either way the impl's builder reproduces the hand-frozen pin in
+// expected/content_hash; the builder is independent of the frozen reference
+// oracle, so agreement IS the differential check. Reuses GitProtocolPass since
+// the assertion target is identical (a content-hash string).
+
+fn run_dag_oracle_fixture(fx: &Fixture, scratch: &Scratch) -> Result<Produced, String> {
+    let expected = std::fs::read_to_string(fx.dir.join("expected").join("content_hash"))
+        .map_err(|e| format!("expected/content_hash missing: {e}"))?
+        .trim()
+        .to_string();
+
+    let git_spec = fx.dir.join("git-protocol.json");
+    let tarball_spec = fx.dir.join("tarball-protocol.json");
+    let local_spec = fx.dir.join("local-protocol.json");
+    let staged_spec = fx.dir.join("dag-oracle.json");
+
+    let (entries, transport): (Vec<milpa_core::MaterializedEntry>, &str) = if git_spec.is_file() {
+        (dag_oracle_git_entries(fx, scratch)?, "git")
+    } else if tarball_spec.is_file() {
+        (dag_oracle_tarball_entries(&tarball_spec, scratch)?, "tarball")
+    } else if local_spec.is_file() {
+        (dag_oracle_local_entries(&local_spec, scratch)?, "local")
+    } else if staged_spec.is_file() {
+        (dag_oracle_staged_entries(&staged_spec)?, "staged")
+    } else {
+        return Err(
+            "dag-oracle fixture has none of git-protocol.json / tarball-protocol.json / \
+             local-protocol.json / dag-oracle.json"
+                .to_string(),
+        );
+    };
+
+    let got = milpa_core::compute_dag_identity(&entries)
+        .map_err(|e| format!("compute_dag_identity failed: {e:?}"))?;
+    if got != expected {
+        return Err(format!(
+            "dag-sha256 mismatch ({transport} transport):\n  \
+             expected (pinned oracle): {expected}\n  actual   (impl builder):  {got}"
+        ));
+    }
+    Ok(Produced::GitProtocolPass { content_hash: got })
+}
+
+/// Parse a staged `dag-oracle.json` (list of `{relpath, mode, content}`) into the
+/// materialized seam sequence — the builder's contract test input.
+fn dag_oracle_staged_entries(path: &Path) -> Result<Vec<milpa_core::MaterializedEntry>, String> {
+    use milpa_core::dag_identity::{MODE_EXECUTABLE, MODE_REGULAR, MODE_SYMLINK};
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("dag-oracle.json unreadable: {e}"))?;
+    let spec = serde_like::parse(&text).map_err(|e| format!("dag-oracle.json parse error: {e}"))?;
+    let arr = spec.get("entries").and_then(|v| v.as_arr()).unwrap_or(&[]);
+    let mut entries = Vec::with_capacity(arr.len());
+    for e in arr {
+        let relpath = e.get("relpath").and_then(|v| v.as_str())
+            .ok_or("entry missing string 'relpath'")?;
+        let mode_str = e.get("mode").and_then(|v| v.as_str())
+            .ok_or("entry missing string 'mode'")?;
+        let content = e.get("content").and_then(|v| v.as_str())
+            .ok_or("entry missing string 'content'")?;
+        let mode_byte = match mode_str {
+            "regular" => MODE_REGULAR,
+            "executable" => MODE_EXECUTABLE,
+            "symlink" => MODE_SYMLINK,
+            other => return Err(format!("unknown entry mode {other:?}")),
+        };
+        entries.push(milpa_core::MaterializedEntry::new(
+            relpath,
+            mode_byte,
+            content.as_bytes().to_vec(),
+        ));
+    }
+    Ok(entries)
+}
+
+/// Generate the git repo from `git-protocol.json`, clone --no-checkout, and return
+/// the production git seam's entries — the cross-transport proof path (the SAME
+/// enumeration milpa uses to materialize a git dep into the CAS).
+fn dag_oracle_git_entries(
+    fx: &Fixture,
+    scratch: &Scratch,
+) -> Result<Vec<milpa_core::MaterializedEntry>, String> {
+    let spec_text = std::fs::read_to_string(fx.dir.join("git-protocol.json"))
+        .map_err(|e| format!("git-protocol.json unreadable: {e}"))?;
+    let spec = serde_like::parse(&spec_text)
+        .map_err(|e| format!("git-protocol.json parse error: {e}"))?;
+    let repos_spec = spec.get("repos").and_then(|v| v.as_arr())
+        .ok_or("git-protocol.json missing 'repos' array")?;
+    let fetch_spec = spec.get("fetch")
+        .ok_or("git-protocol.json missing 'fetch' object")?;
+
+    let repos_tmpdir = scratch.root.join("dag-oracle-repos");
+    std::fs::create_dir_all(&repos_tmpdir).map_err(|e| format!("create repos tmpdir: {e}"))?;
+
+    let mut repo_paths: std::collections::HashMap<String, std::path::PathBuf> =
+        std::collections::HashMap::new();
+    for repo_spec in repos_spec {
+        let name = repo_spec.get("name").and_then(|v| v.as_str())
+            .ok_or("repo spec missing 'name'")?
+            .to_string();
+        let (repo_dir, _shas) = make_git_protocol_repo(&repos_tmpdir, repo_spec)?;
+        repo_paths.insert(name, repo_dir);
+    }
+
+    let repo_name = fetch_spec.get("repo_name").and_then(|v| v.as_str())
+        .ok_or("fetch missing 'repo_name'")?;
+    let target_repo = repo_paths.get(repo_name)
+        .ok_or_else(|| format!("fetch.repo_name {repo_name:?} not found in repos"))?;
+    let file_url = format!("file://{}", target_repo.canonicalize()
+        .map_err(|e| format!("canonicalize repo: {e}"))?.display());
+    let git_ref = fetch_spec.get("ref").and_then(|v| v.as_str()).unwrap_or("main");
+
+    // Clone --no-checkout (spec §1.7.1: no working-tree checkout / smudge filters),
+    // mirroring fetch_git's object-store discipline, then enumerate via the seam.
+    let clone_scratch = scratch.root.join("dag-oracle-clone");
+    let out = std::process::Command::new("git")
+        .args(["clone", "-q", "--no-checkout", "--end-of-options", &file_url])
+        .arg(&clone_scratch)
+        .output()
+        .map_err(|e| format!("git clone spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("git clone failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    let rev = std::process::Command::new("git")
+        .arg("-C").arg(&clone_scratch)
+        .args(["rev-parse", git_ref])
+        .output()
+        .map_err(|e| format!("git rev-parse spawn: {e}"))?;
+    if !rev.status.success() {
+        return Err(format!("git rev-parse failed: {}", String::from_utf8_lossy(&rev.stderr)));
+    }
+    let commit = String::from_utf8_lossy(&rev.stdout).trim().to_string();
+
+    let (entries, _submodule_shas) =
+        milpa_core::fetchers::enumerate_git_entries(&clone_scratch, &commit, None, None)
+            .map_err(|e| format!("enumerate_git_entries failed: {e:?}"))?;
+    Ok(entries)
+}
+
+/// Lay out a `{files, symlinks, executable}` tree description onto disk (the shared
+/// on-disk shape `make_git_protocol_repo` commits, minus git): regular files, the
+/// exec bit (+x) for relpaths in `executable`, and filesystem symlinks (target
+/// string written verbatim, not followed). Shared by the tarball + local proofs.
+fn materialize_tree_on_disk(root: &Path, spec: &serde_like::Val) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::create_dir_all(root).map_err(|e| format!("create tree root: {e}"))?;
+    if let Some(files) = spec.get("files").and_then(|v| v.as_obj()) {
+        for (relpath, val) in files {
+            let content = val.as_str()
+                .ok_or_else(|| format!("file {relpath:?} value must be a string"))?;
+            let target = root.join(relpath);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("create dir for {relpath}: {e}"))?;
+            }
+            std::fs::write(&target, content.as_bytes())
+                .map_err(|e| format!("write {relpath}: {e}"))?;
+        }
+    }
+    if let Some(execs) = spec.get("executable").and_then(|v| v.as_arr()) {
+        for val in execs {
+            let relpath = val.as_str().ok_or("'executable' entries must be strings")?;
+            let target = root.join(relpath);
+            let mut perms = std::fs::metadata(&target)
+                .map_err(|e| format!("stat {relpath}: {e}"))?
+                .permissions();
+            let mode = perms.mode();
+            perms.set_mode(mode | 0o111);
+            std::fs::set_permissions(&target, perms)
+                .map_err(|e| format!("chmod +x {relpath}: {e}"))?;
+        }
+    }
+    if let Some(symlinks) = spec.get("symlinks").and_then(|v| v.as_obj()) {
+        for (link_path, val) in symlinks {
+            let link_target = val.as_str()
+                .ok_or_else(|| format!("symlink {link_path:?} value must be a string"))?;
+            let link_on_disk = root.join(link_path);
+            if let Some(parent) = link_on_disk.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("create dir for symlink {link_path}: {e}"))?;
+            }
+            let _ = std::fs::remove_file(&link_on_disk);
+            std::os::unix::fs::symlink(link_target, &link_on_disk)
+                .map_err(|e| format!("create symlink {link_path} -> {link_target}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Build a real `.tar.gz` from `tarball-protocol.json` (via the system `tar`,
+/// mirroring how git-protocol fixtures shell out to `git`), then enumerate it via
+/// the production tarball seam (`enumerate_tarball_entries`) — the cross-transport
+/// proof for the tarball transport.
+fn dag_oracle_tarball_entries(
+    spec_path: &Path,
+    scratch: &Scratch,
+) -> Result<Vec<milpa_core::MaterializedEntry>, String> {
+    let text = std::fs::read_to_string(spec_path)
+        .map_err(|e| format!("tarball-protocol.json unreadable: {e}"))?;
+    let spec = serde_like::parse(&text)
+        .map_err(|e| format!("tarball-protocol.json parse error: {e}"))?;
+
+    let tree_root = scratch.root.join("tarball-tree");
+    materialize_tree_on_disk(&tree_root, &spec)?;
+
+    let archive_path = scratch.root.join("tarball-archive.tar.gz");
+    // `tar -czf <archive> -C <tree> .` preserves POSIX modes (exec bit) + symlinks.
+    let out = std::process::Command::new("tar")
+        .arg("-czf").arg(&archive_path)
+        .arg("-C").arg(&tree_root)
+        .arg(".")
+        .output()
+        .map_err(|e| format!("tar spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("tar -czf failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    let archive_bytes = std::fs::read(&archive_path)
+        .map_err(|e| format!("read tar archive: {e}"))?;
+
+    milpa_core::fetchers::enumerate_tarball_entries(
+        &archive_bytes,
+        0,
+        milpa_core::Limits::default(),
+    )
+    .map_err(|e| format!("enumerate_tarball_entries failed: {e:?}"))
+}
+
+/// Lay out `local-protocol.json` on disk, then enumerate it via the production
+/// local seam (`enumerate_local_entries`) — the cross-transport proof for the
+/// local transport (a directory walk reading the on-disk POSIX bits).
+fn dag_oracle_local_entries(
+    spec_path: &Path,
+    scratch: &Scratch,
+) -> Result<Vec<milpa_core::MaterializedEntry>, String> {
+    let text = std::fs::read_to_string(spec_path)
+        .map_err(|e| format!("local-protocol.json unreadable: {e}"))?;
+    let spec = serde_like::parse(&text)
+        .map_err(|e| format!("local-protocol.json parse error: {e}"))?;
+
+    let tree_root = scratch.root.join("local-tree");
+    materialize_tree_on_disk(&tree_root, &spec)?;
+
+    milpa_core::enumerate_local_entries(&tree_root)
+        .map_err(|e| format!("enumerate_local_entries failed: {e:?}"))
 }
 
 /// Execute a `hash` fixture end-to-end: build a local git repo, materialise the

@@ -54,6 +54,12 @@ from milpa.errors import (
     ID_NON_UTF8_RELPATH,
     MilpaError,
 )
+from milpa.dag_identity import (
+    MODE_EXECUTABLE,
+    MODE_REGULAR,
+    MODE_SYMLINK,
+    MaterializedEntry,
+)
 from milpa.fetchers.safe_extract import _normalize_lexical
 from milpa.fetchers.types import Fetcher, Provenance, ProvenanceReceipt
 
@@ -133,76 +139,72 @@ class GitReceipt(ProvenanceReceipt):
 # ---------------------------------------------------------------------------
 
 
-def materialize_git_tree(
+#: git ls-tree blob mode → epoch-2 mode-byte (spec/identity.md §1.8.2.1).
+#: 100644 regular → 0x00, 100755 executable → 0x01, 120000 symlink → 0x80.
+#: Any other (unexpected) mode is treated as a regular blob (0x00) — see the
+#: permissive branch in ``materialize_git_tree``'s disk writer.
+_GIT_MODE_TO_BYTE: dict[str, int] = {
+    "100644": MODE_REGULAR,
+    "100755": MODE_EXECUTABLE,
+    "120000": MODE_SYMLINK,
+}
+
+
+def enumerate_git_entries(
     repo: Path,
     commit: str,
-    dest: Path,
     *,
     submodule_fetch: Callable[[str, str], Path] | None,
     superproject_url: str | None = None,
     depth: int = 0,
     seen: set[tuple[str, str]] | None = None,
-) -> dict[str, str]:
-    """Materialize a git commit's tree from the object store into ``dest/``.
+) -> tuple[list[MaterializedEntry], dict[str, str]]:
+    """The git **materialize seam** (RFC slice B2-git): read a commit's tree from
+    the object store into a buffered ``list[MaterializedEntry]`` (spec §1.8.4).
 
-    This is the single chokepoint for blob writing, fixed mode, LFS detection,
-    symlink-escape containment, and submodule recursion (H5).  ``GitFetcher.fetch``
-    produces its output tree EXCLUSIVELY via this function (plugin-contract.md §2.4.1).
+    This is the single source of truth for git tree enumeration. Both consumers
+    read from here:
+
+      * ``materialize_git_tree`` — writes the entries to ``dest/`` (CAS path).
+      * the epoch-2 DAG builder (``milpa.dag_identity.compute_dag_identity``) —
+        computes the ``dag-sha256:`` identity over the entries.
+
+    Submodules (mode-160000 gitlinks) are recursed via ``submodule_fetch`` and
+    their committed blobs are spliced into the sequence under the gitlink's path
+    prefix (spec §1.8.7): the DAG builder then folds them into a subtree whose
+    root ``H_tree`` becomes the gitlink's child digest. The submodule URLs and
+    pinned SHAs are returned separately as PROVENANCE.
 
     Args:
-        repo:              Path to the clone scratch directory holding ``.git/``
-                           (the object store we read from).  This is the
-                           ``--no-checkout`` clone directory, NOT the output tree.
-        commit:            Commit SHA to materialize.
-        dest:              Clean output tree directory.  Caller must create it.
-                           MUST NOT contain ``.git``.
-        submodule_fetch:   H5 recursion seam.  Called with ``(resolved_url, sha)``
-                           for each mode-160000 gitlink entry; should return the
-                           clone-scratch path for the submodule.  Pass ``None``
-                           to record gitlinks without recursing (H3b behaviour:
-                           the seam is defined, H5 wires it).
-        superproject_url:  H5: the remote URL of this repo (used to resolve
-                           relative ``url = ../sibling`` entries in ``.gitmodules``).
-                           Required when submodule_fetch is not None and the repo
-                           has submodules with relative URLs.
-        depth:             R1-03: current recursion depth.  Root call uses 0 (default).
-                           Each submodule call increments by 1.  Exceeding
-                           ``MAX_SUBMODULE_DEPTH`` raises FETCH-GIT-SUBMODULE-FAILED.
-        seen:              R1-03: set of ``(resolved_url, sha)`` pairs already visited.
-                           Root call passes ``None`` (default creates empty set).
-                           Re-encountering a pair raises FETCH-GIT-SUBMODULE-FAILED.
+        repo:              ``--no-checkout`` clone scratch holding ``.git/`` (the
+                           object store read from); NOT an output tree.
+        commit:            Commit SHA to enumerate.
+        submodule_fetch:   H5 recursion seam: ``(resolved_url, sha) -> clone_scratch``.
+                           ``None`` records nothing for gitlinks (no recursion).
+        superproject_url:  remote URL of this repo (resolves relative
+                           ``url = ../sibling`` in ``.gitmodules``).
+        depth:             R1-03 recursion depth (root = 0).
+        seen:              R1-03 visited ``(url, sha)`` set on the current path.
 
     Returns:
-        ``dict[str, str]`` mapping submodule path (relative to dest root, POSIX)
-        → sha for every mode-160000 gitlink recursed.  Empty dict when no
-        submodules exist or ``submodule_fetch`` is ``None``.
+        ``(entries, submodule_shas)``:
+          * ``entries`` — buffered ``MaterializedEntry`` list (blobs + symlinks,
+            committed-tree relpaths, submodule blobs prefixed by gitlink path).
+          * ``submodule_shas`` — ``{submodule_path (POSIX): sha}`` PROVENANCE map.
 
     Raises:
-        MilpaError(EXTRACT_ZIP_SLIP)           — a tree entry path escapes dest (R1-01).
-        MilpaError(EXTRACT_SYMLINK_ESCAPE)     — a committed symlink's target escapes dest.
-        MilpaError(FETCH_GIT_LFS_POINTER)      — a blob is a Git-LFS pointer.
         MilpaError(FETCH_GIT_FAILED)           — git subprocess failed.
-        MilpaError(FETCH_GIT_SUBMODULE_FAILED) — submodule URL unresolvable, fetch failed,
-                                                  or recursion depth/cycle exceeded (R1-03).
+        MilpaError(ID_NON_UTF8_RELPATH)        — a tree entry path is not UTF-8.
+        MilpaError(FETCH_GIT_SUBMODULE_FAILED)  — submodule URL unresolvable, fetch
+                                                  failed, or depth/cycle exceeded.
 
     Implementation contract (spec/identity.md §1.7, plugin-contract.md §2.3):
       - ``git ls-tree -r -z <commit>`` enumerates blobs/symlinks/gitlinks.
         NUL-delimited (-z) disables C-quoting so exotic / non-ASCII filenames
         are preserved faithfully (R1-15 NORMATIVE).
       - ``git cat-file --batch`` streams ALL blob bytes in ONE subprocess.
-      - mode-100644 → 0o644, mode-100755 → 0o755, dirs → 0o755.
-      - mode-120000 (symlink): lexical containment check before write.
-      - mode-160000 (gitlink): read .gitmodules, resolve URL, recurse via
-        ``submodule_fetch(resolved_url, sha)`` (H5 seam).
-      - Blob write path: entry path is lexically checked against dest_root
-        BEFORE any write — absolute paths and ``..`` escapes raise
-        EXTRACT-ZIP-SLIP (R1-01 NORMATIVE).
-      - Output tree has no ``.git`` directory.
       - Empty directories are NOT synthesized.
     """
-    # Canonicalize dest so prefix comparisons are reliable (mirrors SafeExtractor).
-    dest_root = dest.resolve()
-
     # -----------------------------------------------------------------------
     # Step 1: ls-tree -r -z — enumerate (mode, type, sha, path) for every entry
     #
@@ -316,58 +318,39 @@ def materialize_git_tree(
             blob_bytes[sha] = content
 
     # -----------------------------------------------------------------------
-    # Step 3: write blobs to dest with fixed modes + safety checks
+    # Step 3: build the buffered materialized entry sequence
+    # -----------------------------------------------------------------------
+    # The git mode → mode-byte mapping is the SSOT for the exec/symlink bit that
+    # epoch-2 identity depends on (spec §1.8.2.1). LFS detection + on-disk-mode
+    # writing + path containment are the DISK consumer's concern
+    # (``materialize_git_tree``), not the abstract entry sequence.
+    entries: list[MaterializedEntry] = [
+        MaterializedEntry(
+            relpath=entry_path,
+            mode_byte=_GIT_MODE_TO_BYTE.get(mode, MODE_REGULAR),
+            content=blob_bytes[sha],
+        )
+        for (mode, _obj_type, sha, entry_path) in blobs
+    ]
+
+    # -----------------------------------------------------------------------
+    # Step 4: gitlinks — submodule recursion (H5), spliced into the sequence
     # -----------------------------------------------------------------------
     gitlink_results: dict[str, str] = {}
 
-    for mode, obj_type, sha, entry_path in blobs:
-        content = blob_bytes[sha]
-        abs_dest = dest_root / entry_path
-
-        # R1-01 NORMATIVE: lexical containment check BEFORE any write.
-        # Reuse _normalize_lexical (SSOT from safe_extract) to resolve
-        # . and .. without hitting the filesystem.  Reject absolute entry
-        # paths (which Python pathlib silently makes absolute when joining)
-        # and any .. escape out of dest_root.
-        _check_path_containment(entry_path, abs_dest, dest_root)
-
-        if mode == "120000":
-            # Symlink: blob bytes are the link-target string.
-            _materialize_symlink(entry_path, content, abs_dest, dest_root)
-
-        elif mode in ("100644", "100755"):
-            # Regular or executable blob.
-            # LFS first-line detection (plugin-contract.md §2.3.2).
-            _check_lfs(entry_path, content)
-            # Write with fixed mode.
-            abs_dest.parent.mkdir(parents=True, exist_ok=True)
-            abs_dest.write_bytes(content)
-            on_disk_mode = 0o755 if mode == "100755" else 0o644
-            abs_dest.chmod(on_disk_mode)
-
-        else:
-            # Unexpected mode (e.g. 100664 or future) — write with default.
-            # Do not raise; be permissive on unknown regular modes.
-            _check_lfs(entry_path, content)
-            abs_dest.parent.mkdir(parents=True, exist_ok=True)
-            abs_dest.write_bytes(content)
-
-    # -----------------------------------------------------------------------
-    # Step 4: gitlinks — submodule recursion (H5)
-    # -----------------------------------------------------------------------
     if gitlinks and submodule_fetch is not None:
         # R1-03: initialise seen set at the root call (depth=0, seen=None).
         if seen is None:
             seen = set()
 
-        # Parse .gitmodules from the object store to get submodule URLs.
-        # .gitmodules is a regular blob enumerated in Step 1; its bytes were
-        # read in Step 2 and written to disk in Step 3.  Read from disk now —
-        # it is committed content, not a working-tree file.
-        gitmodules_path = dest_root / ".gitmodules"
+        # Parse .gitmodules from the object store (NOT from disk): its bytes were
+        # read in Step 2. .gitmodules is committed content, a regular blob at the
+        # repo root (relpath ".gitmodules").
         gitmodules_bytes = b""
-        if gitmodules_path.exists():
-            gitmodules_bytes = gitmodules_path.read_bytes()
+        for mode, _obj_type, sha, entry_path in blobs:
+            if entry_path == ".gitmodules":
+                gitmodules_bytes = blob_bytes[sha]
+                break
         submodule_url_map = _parse_gitmodules(gitmodules_bytes)
 
         for mode, obj_type, sha, entry_path in gitlinks:
@@ -419,26 +402,103 @@ def materialize_git_tree(
                     submodule_url=resolved_url,
                 ) from exc
 
-            sub_dest = dest_root / entry_path
-            # R1-01: containment check for gitlink sub_dest path.
-            _check_path_containment(entry_path, sub_dest, dest_root)
-            sub_dest.mkdir(parents=True, exist_ok=True)
-            # Recurse: the submodule's superproject_url is the resolved URL
-            # (for resolving nested relative URLs in the sub's .gitmodules).
-            sub_results = materialize_git_tree(
+            # Recurse via the SAME seam: enumerate the submodule's tree, then
+            # splice its entries in under the gitlink path prefix (spec §1.8.7).
+            sub_entries, sub_results = enumerate_git_entries(
                 sub_scratch,
                 sha,
-                sub_dest,
                 submodule_fetch=submodule_fetch,
                 superproject_url=resolved_url,
                 depth=depth + 1,
                 seen=child_seen,
             )
-            # Record this gitlink using its POSIX path relative to dest_root.
+            for sub_entry in sub_entries:
+                entries.append(
+                    MaterializedEntry(
+                        relpath=entry_path + "/" + sub_entry.relpath,
+                        mode_byte=sub_entry.mode_byte,
+                        content=sub_entry.content,
+                    )
+                )
+            # Record this gitlink using its POSIX path relative to the root.
             gitlink_results[entry_path] = sha
             # Accumulate nested submodule results with prefixed paths.
             for nested_path, nested_sha in sub_results.items():
                 gitlink_results[entry_path + "/" + nested_path] = nested_sha
+
+    return entries, gitlink_results
+
+
+def materialize_git_tree(
+    repo: Path,
+    commit: str,
+    dest: Path,
+    *,
+    submodule_fetch: Callable[[str, str], Path] | None,
+    superproject_url: str | None = None,
+    depth: int = 0,
+    seen: set[tuple[str, str]] | None = None,
+) -> dict[str, str]:
+    """Materialize a git commit's tree from the object store into ``dest/``.
+
+    Thin disk-writing consumer of the ``enumerate_git_entries`` seam (RFC slice
+    B2-git): it enumerates once, then writes each buffered entry to ``dest/`` with
+    fixed on-disk modes + the path/symlink/LFS safety checks. ``GitFetcher.fetch``
+    produces its output tree EXCLUSIVELY via this function (plugin-contract.md §2.4.1).
+
+    Args / Returns / Raises: the seam (``enumerate_git_entries``) plus the disk
+    safety checks below. Returns the ``{submodule_path: sha}`` PROVENANCE map.
+
+    Raises:
+        MilpaError(EXTRACT_ZIP_SLIP)           — a tree entry path escapes dest (R1-01).
+        MilpaError(EXTRACT_SYMLINK_ESCAPE)     — a committed symlink's target escapes dest.
+        MilpaError(FETCH_GIT_LFS_POINTER)      — a blob is a Git-LFS pointer.
+        MilpaError(FETCH_GIT_FAILED)           — git subprocess failed.
+        MilpaError(FETCH_GIT_SUBMODULE_FAILED) — submodule URL unresolvable, fetch failed,
+                                                  or recursion depth/cycle exceeded (R1-03).
+
+    Disk contract (spec/identity.md §1.7.4):
+      - mode-byte 0x00 (regular) → 0o644, 0x01 (executable) → 0o755.
+      - mode-byte 0x80 (symlink): lexical containment check before write.
+      - Blob write path: entry path is lexically checked against dest_root
+        BEFORE any write — absolute paths and ``..`` escapes raise
+        EXTRACT-ZIP-SLIP (R1-01 NORMATIVE).
+      - Output tree has no ``.git`` directory; empty directories are NOT synthesized.
+    """
+    # Canonicalize dest so prefix comparisons are reliable (mirrors SafeExtractor).
+    dest_root = dest.resolve()
+
+    entries, gitlink_results = enumerate_git_entries(
+        repo,
+        commit,
+        submodule_fetch=submodule_fetch,
+        superproject_url=superproject_url,
+        depth=depth,
+        seen=seen,
+    )
+
+    for entry in entries:
+        abs_dest = dest_root / entry.relpath
+
+        # R1-01 NORMATIVE: lexical containment check BEFORE any write.
+        # Reuse _normalize_lexical (SSOT from safe_extract) to resolve
+        # . and .. without hitting the filesystem.  Reject absolute entry
+        # paths (which Python pathlib silently makes absolute when joining)
+        # and any .. escape out of dest_root.
+        _check_path_containment(entry.relpath, abs_dest, dest_root)
+
+        if entry.mode_byte == MODE_SYMLINK:
+            # Symlink: blob bytes are the link-target string.
+            _materialize_symlink(entry.relpath, entry.content, abs_dest, dest_root)
+        else:
+            # Regular or executable blob.
+            # LFS first-line detection (plugin-contract.md §2.3.2).
+            _check_lfs(entry.relpath, entry.content)
+            abs_dest.parent.mkdir(parents=True, exist_ok=True)
+            abs_dest.write_bytes(entry.content)
+            # Fixed on-disk mode (spec §1.7.4): 0o755 for executable, else 0o644.
+            on_disk_mode = 0o755 if entry.mode_byte == MODE_EXECUTABLE else 0o644
+            abs_dest.chmod(on_disk_mode)
 
     return gitlink_results
 

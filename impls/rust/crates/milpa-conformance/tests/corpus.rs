@@ -129,8 +129,13 @@ fn spec_error_codes() -> BTreeSet<String> {
 /// as S3b targets even though not all raise sites are wired yet.
 ///
 /// H3c moved `FETCH-GIT-LFS-POINTER` from DEFERRED to `implemented_error_codes()`
-/// (now wired in `materialize_git_tree`).  This list is now empty; the catalog is
-/// a pure bijection with the spec.
+/// (now wired in `materialize_git_tree`).
+///
+/// B1 (RFC `rfc-identity-conformance-authority`) added the epoch-2 Merkle-DAG
+/// name-byte ceiling code `ID-NAME-TOO-LONG` (`spec/identity.md` §1.8.8); slice
+/// B2-git wired it to its only raise site (the epoch-2 DAG builder in
+/// `dag_identity.rs`), so it has moved from DEFERRED to `implemented_error_codes()`.
+/// No codes remain deferred.
 const DEFERRED: &[&str] = &[];
 
 /// Spec codes this implementation intentionally never emits.

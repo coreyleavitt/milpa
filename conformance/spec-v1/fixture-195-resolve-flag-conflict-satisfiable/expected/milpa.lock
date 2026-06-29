@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "lib-tls" {
-    identity "dag-sha256:3027ba09315410f81dea4ede7a089025f79e15c3608472e81a30422b1d0da43b"
+    identity "dag-sha256:27860c5f0fde705d6be14422d18b622f9093d7a267e98286949418ae17e50fae"
     version "0.0.1"
     src_dir ""
     requires

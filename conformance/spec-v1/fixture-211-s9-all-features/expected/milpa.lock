@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "debuglib" {
-    identity "dag-sha256:612f0f3d4b4d47051306c28466cf65ce05b9223285179ef9c087f6005bd1699e"
+    identity "dag-sha256:b0b044d257e9cc0e2e5cf3d86ea3ad616502dbbd960df44cb1142d643307ffe7"
     version "0.0.1"
     src_dir ""
     requires
@@ -17,7 +17,7 @@ dep "debuglib" {
 }
 
 dep "tlslib" {
-    identity "dag-sha256:2ac25ea74f0747af23d9eaff360bea2d822b7bfa88dfe4dad370357fb49bd9d6"
+    identity "dag-sha256:06c42623e12c1c865699ca9de8753487c38098aae8354498c6637e765bba8500"
     version "0.0.1"
     src_dir ""
     requires

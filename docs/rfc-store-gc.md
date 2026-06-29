@@ -29,6 +29,25 @@ proceed until this document is ratified.
 
 ---
 
+## Epoch-1 `sha256/` subtree is now bulk garbage (B-cutover, 2026-06-29)
+
+The identity B-cutover (RFC `rfc-identity-conformance-authority`) flipped
+`compute_content_hash` from the interim epoch-1 flat byte stream to the canonical
+content Merkle DAG (`spec/identity.md §1.8`). Every production identity is now
+`dag-sha256:` and admits under `<cas-root>/dag-sha256/<hex>/`. The previous
+epoch-1 CAS subtree at **`<cas-root>/sha256/<hex>/`** is therefore **bulk
+garbage** — no lockfile references it anymore (all re-locked to `dag-sha256:`),
+and nothing re-admits to it. (Note: the black-box conformance harness'
+`_seed_cas_from_lock` still writes seeds to a literal `sha256/` path, a separate
+epoch-1 vestige; it is not on the gated test path and is harmless because the
+seeded deps are re-materialized.)
+
+`milpa store gc` MUST treat the entire `<cas-root>/sha256/` subtree as
+unconditionally evictable (no liveness check needed — no `dag-sha256:` lockfile
+can reference an epoch-1 `sha256:` entry, and `sha256:` is rejected at parse as
+`ID-UNSUPPORTED-ALGORITHM`). This is the simplest possible GC case and a good
+first pruning target when this RFC is implemented (#141).
+
 ## Scope
 
 This RFC covers only GC design: liveness predicate, sentinel protocol, and

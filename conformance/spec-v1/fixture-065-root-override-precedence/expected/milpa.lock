@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "shared" {
-    identity "dag-sha256:9b0826d01d3a53779145a445a0e3cbf8b3fd12c55d5d99a15c8a3700f00f1b4d"
+    identity "dag-sha256:bf96b8218ab368e242f81123dd8de4d52bfc53a100f755737a08196d86f15b64"
     version "0.0.1"
     src_dir "src"
     requires
@@ -17,7 +17,7 @@ dep "shared" {
 }
 
 dep "translib" {
-    identity "dag-sha256:a7e53c6e057d3cfdca8b97bf7ad1a5c362a126c8dbd53104b259989dbf532050"
+    identity "dag-sha256:b94cfc14af5c41b17dfbdff88d9bc521b353bde49cc04f3e945900f73f8d28d9"
     version "0.0.1"
     src_dir "src"
     requires "shared"

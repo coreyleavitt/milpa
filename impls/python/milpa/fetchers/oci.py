@@ -186,6 +186,35 @@ def make_oras_pull() -> OciPull:
 
 
 # ---------------------------------------------------------------------------
+# enumerate_oci_entries — the OCI materialize seam (RFC slice B2-oci: STUB)
+# ---------------------------------------------------------------------------
+
+
+def enumerate_oci_entries(*_args: object, **_kwargs: object) -> list:
+    """The OCI **materialize seam** — a coded not-implemented STUB (RFC slice B2-oci).
+
+    Every other transport (git / tarball / local) has a real epoch-2 materializer
+    feeding ``compute_dag_identity``. OCI does **not**: there is no epoch-2 OCI
+    fetcher path yet (the OCI dag-oracle conformance tier stays SKIPPED), so asking
+    for the OCI seam is a clear coded not-implemented condition rather than a silent
+    empty/incorrect result.
+
+    NOTE (slug): there is no ``FETCH-*-NOT-IMPLEMENTED`` slug in ``spec/errors.md``,
+    and the error-catalog discipline forbids minting one carelessly. This stub
+    raises the language-level not-implemented marker (``NotImplementedError``); if
+    the OCI epoch-2 materializer is ever built (B2-oci proper), a catalog slug is a
+    deliberate spec decision made then, not now.
+
+    Raises:
+        NotImplementedError: always — the OCI epoch-2 materializer is not built.
+    """
+    raise NotImplementedError(
+        "OCI epoch-2 materialize seam is not implemented (RFC identity-conformance "
+        "B2-oci is a stub; there is no epoch-2 OCI fetcher path yet)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # OciFetcher
 # ---------------------------------------------------------------------------
 

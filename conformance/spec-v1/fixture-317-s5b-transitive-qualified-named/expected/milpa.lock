@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "foo" {
-    identity "dag-sha256:ab62aa70b1a24c49c93a2b2e97933c2d40705e4182467cd0603f594736cabd1b"
+    identity "dag-sha256:78590d7fc3fffdc52e4588782086e18ca910b8f0b1247f92c5ba8ef72d352f00"
     version "0.0.1"
     src_dir ""
     requires "ns1/baz"
@@ -18,7 +18,7 @@ dep "foo" {
 
 dep "baz" {
     namespace "ns1"
-    identity "dag-sha256:ef697b08f76e85dfbf6ef62aeac70982d169f328461c0bafee32dcac12f1ce40"
+    identity "dag-sha256:b3ef94f6e0c78594f82f4002c4d3d92ff8342189eeb8776b8ed86c06edca50ac"
     version "1.0.0"
     src_dir "src"
     requires

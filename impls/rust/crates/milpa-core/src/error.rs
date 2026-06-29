@@ -100,6 +100,8 @@ impl CoreError {
             "ID-NON-HEX-DIGEST",
             "ID-NON-UTF8-RELPATH",
             "ID-NON-UTF8-SYMLINK-TARGET",
+            // ID-NAME-TOO-LONG: epoch-2 Merkle-DAG leaf-name ceiling (§1.8.8).
+            "ID-NAME-TOO-LONG",
             // CAS (identity.md §3.3 / §3.6)
             "CAS-IDENTITY-MISMATCH",
             "CAS-NOT-IN-STORE",

@@ -387,6 +387,9 @@ struct TarEntry<'a> {
     linkname: String,
     size: u64,
     kind: EntryKind,
+    /// POSIX mode bits (header bytes 100..108, octal). Only the execute bits
+    /// (`& 0o111`) are load-bearing for epoch-2 identity (§1.8.2.1).
+    mode: u32,
     data: &'a [u8],
 }
 
@@ -604,11 +607,16 @@ impl<'a> Iterator for TarEntries<'a> {
                 _ => EntryKind::Other,
             };
 
+            // POSIX mode bits (bytes 100..108, octal). Used only for the epoch-2
+            // execute bit (§1.8.2.1); an unparseable field defaults to 0 (regular).
+            let mode = octal(&header[100..108]).unwrap_or(0) as u32;
+
             return Some(Ok(TarEntry {
                 name,
                 linkname,
                 size,
                 kind,
+                mode,
                 data,
             }));
         }
@@ -693,6 +701,92 @@ fn octal(field: &[u8]) -> Option<u64> {
         return Some(0);
     }
     u64::from_str_radix(&s, 8).ok()
+}
+
+/// Materialize a (decompressed) tar byte stream into the epoch-2 seam sequence
+/// (`Vec<MaterializedEntry>`, spec §1.8.4) — the tar-format half of the tarball
+/// materialize seam (RFC slice B2-tarball).
+///
+/// This reuses the hand-rolled [`TarEntries`] USTAR reader (the tar-format SSOT
+/// shared with [`extract_tar`]) so the same long-path / PAX / GNU-LongLink
+/// handling applies. Decompression is the caller's concern (see
+/// `fetchers::enumerate_tarball_entries`), exactly as for [`extract_tar`].
+///
+/// Mode mapping (spec §1.8.2.1): a regular file with any POSIX execute bit
+/// (`mode & 0o111`) → `0x01`, else `0x00`; a symlink entry → `0x80` with the
+/// `linkname` string bytes as content; a hardlink → resolved to the target's
+/// content bytes (copy-bytes, mirroring `extract_tar` pass 2) with the link's own
+/// mode. Directories and device/FIFO entries contribute no leaf (subtrees are
+/// synthesised by the DAG builder).
+pub fn tar_materialize_entries(
+    tar: &[u8],
+    strip_components: u32,
+) -> Result<Vec<crate::dag_identity::MaterializedEntry>, MilpaError> {
+    use std::collections::HashMap;
+
+    use crate::dag_identity::{
+        MaterializedEntry, MODE_EXECUTABLE, MODE_REGULAR, MODE_SYMLINK,
+    };
+
+    let strip = strip_components as usize;
+    let strip_name = |raw: &str| -> Option<String> {
+        let parts: Vec<&str> = raw
+            .split('/')
+            .filter(|p| !p.is_empty() && *p != ".")
+            .collect();
+        if parts.len() <= strip {
+            None
+        } else {
+            Some(parts[strip..].join("/"))
+        }
+    };
+    let mode_byte = |mode: u32| if mode & 0o111 != 0 { MODE_EXECUTABLE } else { MODE_REGULAR };
+
+    let mut entries: Vec<MaterializedEntry> = Vec::new();
+    let mut file_index: HashMap<String, usize> = HashMap::new();
+    // (relpath, stripped_linkname, mode_byte) — resolved in pass 2 once all files
+    // are collected (hardlink may forward-reference its target).
+    let mut hardlinks: Vec<(String, String, u8)> = Vec::new();
+
+    for entry in TarEntries::new(tar) {
+        let entry = entry?;
+        let relpath = match strip_name(&entry.name) {
+            Some(s) => s,
+            None => continue,
+        };
+        match entry.kind {
+            EntryKind::Dir | EntryKind::Other => {}
+            EntryKind::Symlink => {
+                entries.push(MaterializedEntry {
+                    relpath,
+                    mode_byte: MODE_SYMLINK,
+                    content: entry.linkname.into_bytes(),
+                });
+            }
+            EntryKind::File => {
+                file_index.insert(relpath.clone(), entries.len());
+                entries.push(MaterializedEntry {
+                    relpath,
+                    mode_byte: mode_byte(entry.mode),
+                    content: entry.data.to_vec(),
+                });
+            }
+            EntryKind::HardLink => {
+                if let Some(link) = strip_name(&entry.linkname) {
+                    hardlinks.push((relpath, link, mode_byte(entry.mode)));
+                }
+            }
+        }
+    }
+
+    for (relpath, link, mb) in hardlinks {
+        if let Some(&idx) = file_index.get(&link) {
+            let content = entries[idx].content.clone();
+            entries.push(MaterializedEntry { relpath, mode_byte: mb, content });
+        }
+    }
+
+    Ok(entries)
 }
 
 #[cfg(test)]

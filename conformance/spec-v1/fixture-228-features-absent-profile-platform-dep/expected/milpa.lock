@@ -3,7 +3,7 @@ version 1
 strategy "maxver"
 
 dep "flaglib" {
-    identity "dag-sha256:95ff809d73d7f410004985fe46937c6e237f59e70631f71336ad9861f31e36b4"
+    identity "dag-sha256:dbf84a9af0796be0d89294d487f845dcc023226bc169b0c41b36d976e8a32666"
     version "0.0.1"
     src_dir ""
     requires
@@ -17,7 +17,7 @@ dep "flaglib" {
 }
 
 dep "platformlib" {
-    identity "dag-sha256:31d46c96de7e673a5b85fd3e438f3a9459741fe1ae55c5f3fa0241f09a537878"
+    identity "dag-sha256:0008e20e4441ad22d9e3be285e3b51ddaa8513ca0b066b11b61ba126339b320b"
     version "0.0.1"
     src_dir ""
     requires
