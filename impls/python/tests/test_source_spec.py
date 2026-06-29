@@ -9,7 +9,10 @@ import pytest
 from milpa.errors import CLI_SOURCE_SPEC_INVALID, MilpaError
 from milpa.fetchers.git import GitProvenance
 from milpa.fetchers.local import LocalProvenance
+from milpa.fetchers.oci import OciProvenance
 from milpa.source_spec import parse_source_spec
+
+_VALID_DIGEST = "sha256:" + "a" * 64
 
 
 # ---------------------------------------------------------------------------
@@ -141,3 +144,65 @@ def test_symbolic_ref_accepted() -> None:
     assert isinstance(result, GitProvenance)
     assert result.ref == "main"
     assert result.commit_sha is None
+
+
+# ---------------------------------------------------------------------------
+# OCI form tests (oci=<registry>/<repository>@<digest>)
+# ---------------------------------------------------------------------------
+
+
+def test_oci_form_basic() -> None:
+    """oci=ghcr.io/org/pkg@sha256:<64hex> → OciProvenance with correct fields."""
+    result = parse_source_spec([f"oci=ghcr.io/org/pkg@{_VALID_DIGEST}"])
+    assert isinstance(result, OciProvenance)
+    assert result.registry == "ghcr.io"
+    assert result.repository == "org/pkg"
+    assert result.digest == _VALID_DIGEST
+
+
+def test_oci_form_multi_slash_repository() -> None:
+    """Repository with multiple slashes: registry=first segment, repository=rest."""
+    result = parse_source_spec([f"oci=reg.io/a/b/c@{_VALID_DIGEST}"])
+    assert isinstance(result, OciProvenance)
+    assert result.registry == "reg.io"
+    assert result.repository == "a/b/c"
+    assert result.digest == _VALID_DIGEST
+
+
+def test_oci_missing_at_raises() -> None:
+    """oci= value without '@' → CLI-SOURCE-SPEC-INVALID."""
+    with pytest.raises(MilpaError) as exc_info:
+        parse_source_spec(["oci=ghcr.io/org/pkg"])
+    assert exc_info.value.slug == CLI_SOURCE_SPEC_INVALID
+
+
+def test_oci_two_at_raises() -> None:
+    """oci= value with two '@' → CLI-SOURCE-SPEC-INVALID."""
+    with pytest.raises(MilpaError) as exc_info:
+        parse_source_spec([f"oci=ghcr.io/org/pkg@{_VALID_DIGEST}@extra"])
+    assert exc_info.value.slug == CLI_SOURCE_SPEC_INVALID
+
+
+def test_oci_no_slash_before_at_raises() -> None:
+    """oci= value with no '/' before '@' → CLI-SOURCE-SPEC-INVALID."""
+    with pytest.raises(MilpaError) as exc_info:
+        parse_source_spec([f"oci=ghcr.io@{_VALID_DIGEST}"])
+    assert exc_info.value.slug == CLI_SOURCE_SPEC_INVALID
+
+
+def test_oci_invalid_digest_raises() -> None:
+    """oci= with malformed digest → CLI-SOURCE-SPEC-INVALID (via OciProvenance validation)."""
+    with pytest.raises(MilpaError) as exc_info:
+        parse_source_spec(["oci=ghcr.io/org/pkg@notadigest"])
+    assert exc_info.value.slug == CLI_SOURCE_SPEC_INVALID
+
+
+def test_oci_mixed_with_git_raises() -> None:
+    """Mixing oci= with git= → CLI-SOURCE-SPEC-INVALID."""
+    with pytest.raises(MilpaError) as exc_info:
+        parse_source_spec([
+            f"oci=ghcr.io/org/pkg@{_VALID_DIGEST}",
+            "git=https://example.com/r.git",
+            "ref=main",
+        ])
+    assert exc_info.value.slug == CLI_SOURCE_SPEC_INVALID

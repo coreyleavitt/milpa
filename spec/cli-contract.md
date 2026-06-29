@@ -951,6 +951,7 @@ Source spec tokens (same grammar as `parse_source_spec`):
 |---|---|
 | git | `git=<url> ref=<commit-sha-or-ref>` |
 | local | `local=<path>` |
+| oci | `oci=<registry>/<repository>@sha256:<64hex>` |
 
 > NORMATIVE: `milpa hash` MUST:
 >

@@ -6,8 +6,9 @@ slice; this module has no CLI dependency.
 
 Accepted forms
 --------------
-- ``git=<url> ref=<value>``   → GitProvenance(url, ref, commit_sha=None)
-- ``local=<path>``            → LocalProvenance(path=<abs path>)
+- ``git=<url> ref=<value>``                          → GitProvenance(url, ref, commit_sha=None)
+- ``local=<path>``                                   → LocalProvenance(path=<abs path>)
+- ``oci=<registry>/<repository>@<digest>``           → OciProvenance(registry, repository, digest)
 
 ``ref`` may be any string (branch, tag, or full commit SHA).  Enforcing that
 ``ref`` is a pinned SHA is the caller's responsibility — this parser does NOT
@@ -17,8 +18,16 @@ resolves it.
 For ``local=``, relative paths are resolved against ``base_dir`` (defaults to
 ``Path.cwd()``).  Path existence is NOT checked — that is the fetcher's job.
 
+For ``oci=``, the value is split on the single ``@``: the left part is
+``registry/repository`` (split on the first ``/``), the right part is the
+digest kept verbatim (``sha256:<64-hex>`` form).  ``OciProvenance.__post_init__``
+validation (``TNG-BAD-OCI-DIGEST`` / ``TNG-UNSAFE-OCI-FIELD``) is translated
+to ``CLI-SOURCE-SPEC-INVALID`` so all parse errors from this module share one
+error code.
+
 All parse failures raise ``MilpaError(CLI_SOURCE_SPEC_INVALID, ...)``.
-``LocalProvenance`` ``ValueError`` is translated rather than allowed to escape.
+``LocalProvenance`` and ``OciProvenance`` ``ValueError``/``MilpaError``
+construction errors are translated rather than allowed to escape.
 """
 
 from __future__ import annotations
@@ -28,13 +37,15 @@ from pathlib import Path
 from milpa.errors import CLI_SOURCE_SPEC_INVALID, MilpaError
 from milpa.fetchers.git import GitProvenance
 from milpa.fetchers.local import LocalProvenance
+from milpa.fetchers.oci import OciProvenance
 from milpa.fetchers.types import Provenance
 
-_KNOWN_KEYS: frozenset[str] = frozenset({"git", "ref", "local"})
+_KNOWN_KEYS: frozenset[str] = frozenset({"git", "ref", "local", "oci"})
 _GIT_REQUIRED: frozenset[str] = frozenset({"git", "ref"})
 _LOCAL_REQUIRED: frozenset[str] = frozenset({"local"})
 _GIT_KEYS: frozenset[str] = frozenset({"git", "ref"})
 _LOCAL_KEYS: frozenset[str] = frozenset({"local"})
+_OCI_KEYS: frozenset[str] = frozenset({"oci"})
 
 
 def parse_source_spec(
@@ -51,7 +62,7 @@ def parse_source_spec(
                   Defaults to ``Path.cwd()`` when ``None``.
 
     Returns:
-        A ``GitProvenance`` or ``LocalProvenance`` instance.
+        A ``GitProvenance``, ``LocalProvenance``, or ``OciProvenance`` instance.
 
     Raises:
         MilpaError(CLI_SOURCE_SPEC_INVALID): on any parse error.
@@ -59,7 +70,8 @@ def parse_source_spec(
     if not tokens:
         raise MilpaError(
             CLI_SOURCE_SPEC_INVALID,
-            "source spec requires at least one token (e.g. git=<url> ref=<ref> or local=<path>)",
+            "source spec requires at least one token "
+            "(e.g. git=<url> ref=<ref>, local=<path>, or oci=<registry>/<repo>@<digest>)",
         )
 
     resolved: dict[str, str] = {}
@@ -74,7 +86,7 @@ def parse_source_spec(
         if key not in _KNOWN_KEYS:
             raise MilpaError(
                 CLI_SOURCE_SPEC_INVALID,
-                f"unknown source-spec key {key!r}: expected one of git, ref, local",
+                f"unknown source-spec key {key!r}: expected one of git, ref, local, oci",
                 key=key,
             )
         if key in resolved:
@@ -90,10 +102,12 @@ def parse_source_spec(
     # Detect mixed forms
     has_git_keys = bool(present & _GIT_KEYS)
     has_local_keys = bool(present & _LOCAL_KEYS)
-    if has_git_keys and has_local_keys:
+    has_oci_keys = bool(present & _OCI_KEYS)
+    form_count = sum([has_git_keys, has_local_keys, has_oci_keys])
+    if form_count > 1:
         raise MilpaError(
             CLI_SOURCE_SPEC_INVALID,
-            "cannot mix git and local forms in a single source spec",
+            "cannot mix source spec forms (git, local, oci) in a single spec",
             keys=sorted(present),
         )
 
@@ -106,6 +120,45 @@ def parse_source_spec(
                 missing=sorted(missing),
             )
         return GitProvenance(url=resolved["git"], ref=resolved["ref"])
+
+    if has_oci_keys:
+        raw_oci = resolved["oci"]
+        # Split on '@': there MUST be exactly one '@'.
+        at_parts = raw_oci.split("@")
+        if len(at_parts) != 2:
+            raise MilpaError(
+                CLI_SOURCE_SPEC_INVALID,
+                f"oci= value must contain exactly one '@'; got {raw_oci!r}",
+                value=raw_oci,
+            )
+        ref_part, digest = at_parts
+        if not digest:
+            raise MilpaError(
+                CLI_SOURCE_SPEC_INVALID,
+                f"oci= value has empty digest (nothing after '@'); got {raw_oci!r}",
+                value=raw_oci,
+            )
+        # Split the registry/repository on the first '/'.
+        slash_pos = ref_part.find("/")
+        if slash_pos == -1:
+            raise MilpaError(
+                CLI_SOURCE_SPEC_INVALID,
+                f"oci= registry/repository reference must contain '/'; got {ref_part!r}",
+                value=raw_oci,
+            )
+        registry = ref_part[:slash_pos]
+        repository = ref_part[slash_pos + 1:]
+        # Construct OciProvenance; translate any MilpaError from validation
+        # (TNG-BAD-OCI-DIGEST / TNG-UNSAFE-OCI-FIELD) into CLI-SOURCE-SPEC-INVALID.
+        try:
+            return OciProvenance(registry=registry, repository=repository, digest=digest)
+        except MilpaError as exc:
+            raise MilpaError(
+                CLI_SOURCE_SPEC_INVALID,
+                f"invalid oci= spec: {exc.message}",
+                value=raw_oci,
+                inner_slug=exc.slug,
+            ) from exc
 
     # local form
     raw_path = resolved["local"]

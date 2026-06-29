@@ -431,15 +431,23 @@ surface to get it. The prefix does the work; nothing accommodates the old bytes.
 
 - **A3 — Delete tianguis's freelance hasher; delegate to `milpa hash` (cross-repo,
   code-only).** One atomic tianguis change set (no RED trunk): route **both**
-  `vendor/driver.nim` *and* `vendor/realdriver.nim` through `milpa hash
-  git=<url> ref=<sha>` (object-store form, A0); **delete** `identity.nim`,
+  tianguis hashing call sites through `milpa hash`, each via the source form that
+  matches the call site's actual transport — `vendor/driver.nim` (git shallow
+  clone) via `milpa hash git=<url> ref=<sha>`, and `vendor/realdriver.nim` (OCI
+  `oras pull` + extract) via `milpa hash oci=<registry>/<repo>@<digest>`. **This
+  corrects the original A3 assumption that *both* drivers were git-sourced:
+  `realdriver.nim` hashes an OCI-pulled tree, which is why A3 has a hard
+  prerequisite that `milpa hash` carry an `oci=` form (added as the A0 `oci=`
+  extension before A3 completes).** Then **delete** `identity.nim`,
   `tests/test_identity.nim`, the frozen `identity_conformance.json` (after the
-  `namespace.nim`/`vendor/merge.nim` usage audit). **A0 must be merged + green on
-  milpa main first** (`parity.yaml` always clones milpa HEAD). A3 is a **code**
-  change only — it does *not* regenerate the index (that would be a wasted
-  intermediate epoch-1 regen; the single index regen is B-cutover). Avoid
-  re-vendoring between A3 and B-cutover.
-  *Testable:* `milpa hash` output equals tianguis's prior hash for a sample
+  `namespace.nim`/`vendor/merge.nim` usage audit — both confirmed clean). **A0
+  (incl. the `oci=` extension) must be merged + green on milpa main first**
+  (`parity.yaml` always clones milpa HEAD). A3 is a **code** change only — it does
+  *not* regenerate the index (that would be a wasted intermediate epoch-1 regen;
+  the single index regen is B-cutover). Avoid re-vendoring between A3 and
+  B-cutover.
+  *Testable:* `milpa hash` output equals tianguis's prior hash (modulo the
+  `dag-sha256:` vs `sha256:` prefix) for a sample git source and a sample OCI
   source; tianguis builds + parity CI green with `identity.nim` gone.
 
 ### Phase B — Canonical Merkle-DAG identity (epoch 2, #180)

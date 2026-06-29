@@ -8,6 +8,7 @@
 //!
 //! - `git=<url> ref=<value>` → `Provenance::Git { url, ref_spec, commit_sha: None }`
 //! - `local=<path>` → `Provenance::Local { path: <absolute path> }`
+//! - `oci=<registry>/<repository>@sha256:<64hex>` → `Provenance::Oci { registry, repository, digest }`
 //!
 //! `ref` may be any string (branch, tag, or full commit SHA). Enforcing that
 //! `ref` is a pinned SHA is the caller's responsibility — this parser does NOT
@@ -16,6 +17,13 @@
 //! For `local=`, relative paths are resolved against `base_dir` (defaults to the
 //! current directory when `None`). Path existence is NOT checked — that is the
 //! fetcher's job.
+//!
+//! For `oci=`, the value is split on the single `@`: left part is
+//! `registry/repository` (split on the first `/`), right part is the digest kept
+//! verbatim (`sha256:<64-hex>` form). Digest format is validated inline
+//! (mirrors `validate_oci_digest` / `TNG-BAD-OCI-DIGEST` semantics), and
+//! registry/repository are checked for leading `-` (mirrors `validate_oci_field` /
+//! `TNG-UNSAFE-OCI-FIELD`). All violations are translated to `CLI-SOURCE-SPEC-INVALID`.
 //!
 //! All parse failures return [`MilpaError::Core`] with the `CLI-SOURCE-SPEC-INVALID`
 //! slug (spec/errors.md §CLI; spec/cli-contract.md §5.11).
@@ -69,10 +77,10 @@ pub fn parse_source_spec<S: AsRef<str>>(
         let value = &token[eq_pos + 1..];
 
         match key {
-            "git" | "ref" | "local" => {}
+            "git" | "ref" | "local" | "oci" => {}
             _ => {
                 return Err(invalid(format!(
-                    "unknown source-spec key {key:?}: expected one of git, ref, local"
+                    "unknown source-spec key {key:?}: expected one of git, ref, local, oci"
                 )));
             }
         }
@@ -85,12 +93,15 @@ pub fn parse_source_spec<S: AsRef<str>>(
 
     let has_git_keys = resolved.contains_key("git") || resolved.contains_key("ref");
     let has_local_keys = resolved.contains_key("local");
+    let has_oci_keys = resolved.contains_key("oci");
 
-    if has_git_keys && has_local_keys {
+    let form_count =
+        usize::from(has_git_keys) + usize::from(has_local_keys) + usize::from(has_oci_keys);
+    if form_count > 1 {
         let mut keys: Vec<String> = resolved.keys().cloned().collect();
         keys.sort();
         return Err(invalid(format!(
-            "cannot mix git and local forms in a single source spec (keys: {keys:?})"
+            "cannot mix source spec forms (git, local, oci) in a single spec (keys: {keys:?})"
         )));
     }
 
@@ -112,6 +123,52 @@ pub fn parse_source_spec<S: AsRef<str>>(
             url: resolved.remove("git").unwrap(),
             ref_spec: resolved.remove("ref").unwrap(),
             commit_sha: None,
+        });
+    }
+
+    if has_oci_keys {
+        let raw_oci = resolved.remove("oci").unwrap();
+        // Split on '@': there MUST be exactly one '@'.
+        if raw_oci.matches('@').count() != 1 {
+            return Err(invalid(format!(
+                "oci= value must contain exactly one '@'; got {raw_oci:?}"
+            )));
+        }
+        let (ref_part, digest) = raw_oci.split_once('@').unwrap();
+        if digest.is_empty() {
+            return Err(invalid(format!(
+                "oci= value has empty digest (nothing after '@'); got {raw_oci:?}"
+            )));
+        }
+        // Split registry/repository on the first '/'.
+        let Some(slash_pos) = ref_part.find('/') else {
+            return Err(invalid(format!(
+                "oci= registry/repository reference must contain '/'; got {ref_part:?}"
+            )));
+        };
+        let registry = &ref_part[..slash_pos];
+        let repository = &ref_part[slash_pos + 1..];
+        // Validate registry and repository: must not begin with '-' (TNG-UNSAFE-OCI-FIELD).
+        for (field_name, field_val) in [("registry", registry), ("repository", repository)] {
+            if field_val.starts_with('-') {
+                return Err(invalid(format!(
+                    "oci= {field_name} {field_val:?} must not begin with '-'"
+                )));
+            }
+        }
+        // Validate digest format: sha256:<64 lowercase hex> (TNG-BAD-OCI-DIGEST).
+        let digest_ok = digest
+            .strip_prefix("sha256:")
+            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        if !digest_ok {
+            return Err(invalid(format!(
+                "oci= digest {digest:?} is not in `sha256:<64 lowercase hex>` form"
+            )));
+        }
+        return Ok(Provenance::Oci {
+            registry: registry.to_string(),
+            repository: repository.to_string(),
+            digest: digest.to_string(),
         });
     }
 
@@ -276,5 +333,90 @@ mod tests {
             matches!(&result, Provenance::Git { ref_spec, commit_sha: None, .. } if ref_spec == "main"),
             "symbolic ref should be accepted: {result:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // OCI form tests (oci=<registry>/<repository>@<digest>)
+    // -----------------------------------------------------------------------
+
+    fn valid_digest() -> String {
+        format!("sha256:{}", "a".repeat(64))
+    }
+
+    // Test 11: basic oci= form → Provenance::Oci
+    #[test]
+    fn oci_form_basic() {
+        let digest = valid_digest();
+        let token = format!("oci=ghcr.io/org/pkg@{digest}");
+        let result = parse_source_spec(&[token.as_str()], None).unwrap();
+        assert!(
+            matches!(
+                &result,
+                Provenance::Oci { registry, repository, digest: d }
+                if registry == "ghcr.io" && repository == "org/pkg" && d == &digest
+            ),
+            "expected OCI provenance, got {result:?}"
+        );
+    }
+
+    // Test 12: repository with multiple slashes → registry=first segment, repository=rest
+    #[test]
+    fn oci_form_multi_slash_repository() {
+        let digest = valid_digest();
+        let token = format!("oci=reg.io/a/b/c@{digest}");
+        let result = parse_source_spec(&[token.as_str()], None).unwrap();
+        assert!(
+            matches!(
+                &result,
+                Provenance::Oci { registry, repository, .. }
+                if registry == "reg.io" && repository == "a/b/c"
+            ),
+            "expected registry=reg.io, repository=a/b/c, got {result:?}"
+        );
+    }
+
+    // Test 13: missing '@' → CLI-SOURCE-SPEC-INVALID
+    #[test]
+    fn oci_missing_at_raises() {
+        let err = parse_source_spec(&["oci=ghcr.io/org/pkg"], None).unwrap_err();
+        assert_eq!(err.code(), "CLI-SOURCE-SPEC-INVALID");
+    }
+
+    // Test 14: two '@' → CLI-SOURCE-SPEC-INVALID
+    #[test]
+    fn oci_two_at_raises() {
+        let digest = valid_digest();
+        let token = format!("oci=ghcr.io/org/pkg@{digest}@extra");
+        let err = parse_source_spec(&[token.as_str()], None).unwrap_err();
+        assert_eq!(err.code(), "CLI-SOURCE-SPEC-INVALID");
+    }
+
+    // Test 15: no '/' before '@' → CLI-SOURCE-SPEC-INVALID
+    #[test]
+    fn oci_no_slash_before_at_raises() {
+        let digest = valid_digest();
+        let token = format!("oci=ghcr.io@{digest}");
+        let err = parse_source_spec(&[token.as_str()], None).unwrap_err();
+        assert_eq!(err.code(), "CLI-SOURCE-SPEC-INVALID");
+    }
+
+    // Test 16: invalid digest → CLI-SOURCE-SPEC-INVALID
+    #[test]
+    fn oci_invalid_digest_raises() {
+        let err = parse_source_spec(&["oci=ghcr.io/org/pkg@notadigest"], None).unwrap_err();
+        assert_eq!(err.code(), "CLI-SOURCE-SPEC-INVALID");
+    }
+
+    // Test 17: mixing oci= with git= → CLI-SOURCE-SPEC-INVALID
+    #[test]
+    fn oci_mixed_with_git_raises() {
+        let digest = valid_digest();
+        let oci_token = format!("oci=ghcr.io/org/pkg@{digest}");
+        let err = parse_source_spec(
+            &[oci_token.as_str(), "git=https://example.com/r.git", "ref=main"],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "CLI-SOURCE-SPEC-INVALID");
     }
 }
