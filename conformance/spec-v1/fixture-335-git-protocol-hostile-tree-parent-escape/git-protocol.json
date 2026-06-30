@@ -1,0 +1,21 @@
+{
+    "repos": [
+        {
+            "name": "evil",
+            "ref": "main",
+            "hostile_tree": [
+                {
+                    "mode": "100644",
+                    "name": "../../escape",
+                    "content": "pwned\n"
+                }
+            ]
+        }
+    ],
+    "fetch": {
+        "dep_name": "evil",
+        "repo_name": "evil",
+        "ref": "main",
+        "commit_sha": null
+    }
+}

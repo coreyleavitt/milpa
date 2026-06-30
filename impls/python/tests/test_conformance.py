@@ -500,6 +500,7 @@ def _load_prior_lockfile(fixture_dir: Path) -> Lockfile | None:
 def _make_git_protocol_repo(
     tmpdir: Path,
     repo_spec: dict,  # type: ignore[type-arg]
+    peer_shas: "dict[str, str] | None" = None,
 ) -> tuple[Path, list]:  # type: ignore[type-arg]
     """Build a local git repo from a git-protocol.json repo spec.
 
@@ -525,8 +526,17 @@ def _make_git_protocol_repo(
     absolute, safe or escaping — the generator commits whatever the fixture
     declares; containment-checking is the fetcher's job, not the generator's).
 
-    git user identity is overridden via ``-c`` flags (the fixture repo is
-    disposable and not constrained by the global config policy).
+    *Submodules* (H5, #177, R1-03): ``repo_spec["submodules"]`` is a list of
+    ``{"path": <relpath>, "repo": <name>, "ref": <branch>}`` dicts.  After
+    the normal file commits, .gitmodules is written with RELATIVE urls
+    (``../<repo-name>``) and gitlink entries are injected via
+    ``git update-index --add --cacheinfo 160000,<sha>,<path>``.  The submodule
+    repos MUST appear before the superproject in the descriptor (so their SHAs
+    are available in ``peer_shas``).
+
+    git user identity and commit timestamp are pinned via env vars so commit
+    SHAs are deterministic across runs and both impls — required for golden
+    ``expected/submodule_shas`` (#177, H5 cross-impl gap).
     """
     import os as _os
 
@@ -536,15 +546,33 @@ def _make_git_protocol_repo(
     repo_dir = tmpdir / name
     repo_dir.mkdir(parents=True, exist_ok=True)
 
+    # Pin commit authorship + timestamp so commit SHAs are reproducible across
+    # runs and impls.  Content hashes are unaffected (they exclude .git/).
+    # 1577836800 = 2020-01-01T00:00:00Z.
+    _hinfra_env = {
+        **_os.environ,
+        "GIT_AUTHOR_NAME": "Milpa H-infra",
+        "GIT_AUTHOR_EMAIL": "milpa-hinfra@test.milpa",
+        "GIT_AUTHOR_DATE": "1577836800 +0000",
+        "GIT_COMMITTER_NAME": "Milpa H-infra",
+        "GIT_COMMITTER_EMAIL": "milpa-hinfra@test.milpa",
+        "GIT_COMMITTER_DATE": "1577836800 +0000",
+    }
+
     def _git(args: list) -> None:  # type: ignore[type-arg]
         result = subprocess.run(
             ["git", "-C", str(repo_dir),
              "-c", "user.email=milpa-hinfra@test.milpa",
              "-c", "user.name=Milpa H-infra",
              "-c", "core.autocrlf=false",
+             # Disable commit signing so the commit SHA is independent of the
+             # host's global git config (e.g. commit.gpgSign=true / ssh signing).
+             # Required for cross-impl golden submodule_shas (#177, H5).
+             "-c", "commit.gpgSign=false",
              ] + args,
             capture_output=True,
             text=True,
+            env=_hinfra_env,
         )
         if result.returncode != 0:
             raise RuntimeError(
@@ -557,6 +585,7 @@ def _make_git_protocol_repo(
         return subprocess.run(
             ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
             capture_output=True, text=True, check=True,
+            env=_hinfra_env,
         ).stdout.strip()
 
     # init — without -c user.* (git init ignores them cleanly in some versions)
@@ -564,6 +593,90 @@ def _make_git_protocol_repo(
         ["git", "-C", str(repo_dir), "init", "-b", ref, "-q"],
         capture_output=True, check=True,
     )
+
+    # hostile_tree branch (#177, EXTRACT-ZIP-SLIP fixtures): build a raw git
+    # tree object whose entry paths contain path-traversal sequences that
+    # `git add` and `git mktree` refuse to accept (e.g. "../../escape" or
+    # "/escape").  We bypass git's safety checks by hand-crafting the raw
+    # tree object bytes and feeding them directly to `git hash-object
+    # --literally`, exactly as the verified recipe in the design doc prescribes.
+    # The normal files/commits/symlinks/orphan_tip path is SKIPPED entirely.
+    if "hostile_tree" in repo_spec:
+        entries = repo_spec["hostile_tree"]  # list of {"mode", "name", "content"}
+        # Step 1: write each blob object and collect its SHA.
+        blob_shas: list[tuple[str, str, str]] = []  # (mode, name, sha)
+        for entry in entries:
+            mode = entry["mode"]
+            name = entry["name"]
+            content_bytes = entry["content"].encode("utf-8")
+            result = subprocess.run(
+                ["git", "-C", str(repo_dir), "hash-object", "-w", "--stdin"],
+                input=content_bytes,           # binary stdin — no text=True
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"git hash-object (blob) failed:\n"
+                    f"  stdout: {result.stdout.decode(errors='replace').strip()}\n"
+                    f"  stderr: {result.stderr.decode(errors='replace').strip()}"
+                )
+            blob_sha = result.stdout.decode().strip()
+            blob_shas.append((mode, name, blob_sha))
+
+        # Step 2: build raw tree bytes.
+        # Format per git-pack-protocol: "<mode> <name>\0<20-byte-sha>" per entry.
+        raw_tree = b""
+        for mode, name, sha_hex in blob_shas:
+            raw_tree += f"{mode} {name}".encode("utf-8") + b"\x00"
+            raw_tree += bytes.fromhex(sha_hex)
+
+        # Step 3: write the raw tree object (--literally bypasses path validation).
+        result = subprocess.run(
+            ["git", "-C", str(repo_dir),
+             "hash-object", "-t", "tree", "--literally", "-w", "--stdin"],
+            input=raw_tree,                    # binary stdin — no text=True
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git hash-object (tree) failed:\n"
+                f"  stdout: {result.stdout.decode(errors='replace').strip()}\n"
+                f"  stderr: {result.stderr.decode(errors='replace').strip()}"
+            )
+        tree_sha = result.stdout.decode().strip()
+
+        # Step 4: create a commit wrapping the hostile tree.
+        result = subprocess.run(
+            ["git", "-C", str(repo_dir),
+             "-c", "user.email=milpa-hinfra@test.milpa",
+             "-c", "user.name=Milpa H-infra",
+             "-c", "core.autocrlf=false",
+             "commit-tree", tree_sha, "-m", "H-infra hostile-tree commit"],
+            capture_output=True,
+            env=_hinfra_env,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git commit-tree failed:\n"
+                f"  stdout: {result.stdout.decode(errors='replace').strip()}\n"
+                f"  stderr: {result.stderr.decode(errors='replace').strip()}"
+            )
+        commit_sha_hostile = result.stdout.decode().strip()
+
+        # Step 5: point the branch ref at this commit.
+        result = subprocess.run(
+            ["git", "-C", str(repo_dir),
+             "update-ref", f"refs/heads/{ref}", commit_sha_hostile],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git update-ref failed:\n"
+                f"  stdout: {result.stdout.decode(errors='replace').strip()}\n"
+                f"  stderr: {result.stderr.decode(errors='replace').strip()}"
+            )
+
+        return repo_dir, [commit_sha_hostile]
 
     # Normalise to a list of commit specs regardless of form.
     if "commits" in repo_spec:
@@ -607,6 +720,49 @@ def _make_git_protocol_repo(
         _git(["add", "."])
         msg = f"H-infra commit {i}" if i > 0 else "H-infra initial commit"
         _git(["commit", "-q", "-m", msg])
+        commit_shas.append(_head_sha())
+
+    # H5 (#177, R1-03): submodule superproject support.
+    # If "submodules" is declared, write .gitmodules with RELATIVE urls
+    # (``../<repo-name>``) and inject gitlink entries via
+    # ``git update-index --add --cacheinfo 160000,<sha>,<path>``.
+    # The submodule repos MUST be built before this repo (descriptor order
+    # guarantees this) so their head SHAs are available in peer_shas.
+    # Using relative urls keeps committed .gitmodules bytes deterministic
+    # (no tmpdir path) — milpa resolves them against the superproject URL.
+    submodule_specs: list = repo_spec.get("submodules", [])
+    if submodule_specs:
+        if peer_shas is None:
+            raise RuntimeError(
+                f"repo {name!r} declares submodules but no peer_shas were provided"
+            )
+        gitmodules_sections = []
+        for sub_spec in submodule_specs:
+            sub_path = sub_spec["path"]
+            sub_repo = sub_spec["repo"]
+            # Use "./<repo-name>" (POSIX sibling URL): milpa's _resolve_submodule_url
+            # strips the last path component from the superproject URL
+            # (e.g. "file:///tmp/git-repos/super" → "file:///tmp/git-repos")
+            # then joins the relative URL.  "./<repo>" → "git-repos/<repo>" ✓
+            # "../<repo>" would overshoot to the tmpdir's parent. (#177, H5)
+            gitmodules_sections.append(
+                f'[submodule "{sub_path}"]\n\tpath = {sub_path}\n\turl = ./{sub_repo}'
+            )
+        gitmodules_content = "\n".join(gitmodules_sections) + "\n"
+        (repo_dir / ".gitmodules").write_text(gitmodules_content, encoding="utf-8")
+        _git(["add", ".gitmodules"])
+        for sub_spec in submodule_specs:
+            sub_path = sub_spec["path"]
+            sub_repo = sub_spec["repo"]
+            sub_sha = peer_shas.get(sub_repo)
+            if sub_sha is None:
+                raise RuntimeError(
+                    f"submodule repo {sub_repo!r} not found in peer_shas; "
+                    f"available: {list(peer_shas)}"
+                )
+            _git(["update-index", "--add", "--cacheinfo",
+                  f"160000,{sub_sha},{sub_path}"])
+        _git(["commit", "-q", "-m", "H-infra add submodules"])
         commit_shas.append(_head_sha())
 
     # Optional: create an orphan tip commit and force-reset the branch to it.
@@ -676,15 +832,23 @@ def _execute_git_protocol_fixture(
     # named slug; success-class fixtures assert content_hash matches.
     expected_error_path = fixture_dir / "expected" / "error"
     expected_hash_path = fixture_dir / "expected" / "content_hash"
+    expected_shas_path = fixture_dir / "expected" / "submodule_shas"
     expected_error: str | None = None
     expected_hash: str = ""
+    # H5 (#177): optional submodule_shas golden — present only for submodule fixtures.
+    expected_shas: str | None = None
+    if expected_shas_path.exists():
+        expected_shas = expected_shas_path.read_text(encoding="utf-8")
     if expected_error_path.exists():
         expected_error = expected_error_path.read_text(encoding="utf-8").strip()
     else:
         try:
             expected_hash = expected_hash_path.read_text(encoding="utf-8").strip()
         except OSError as e:
-            return ("fail", f"expected/content_hash missing or unreadable: {e}")
+            if not _REGEN_MODE:
+                return ("fail", f"expected/content_hash missing or unreadable: {e}")
+            # In REGEN_MODE: expected_hash stays "" — the bless block at line ~778
+            # will compute and write it once the fetcher materialises the tree.
 
     repos_spec: list = spec.get("repos", [])
     fetch_spec: dict = spec.get("fetch", {})
@@ -697,7 +861,12 @@ def _execute_git_protocol_fixture(
     repo_commit_shas: dict = {}  # name -> [sha_0, sha_1, ...]
     try:
         for repo_spec in repos_spec:
-            repo_dir, commit_shas = _make_git_protocol_repo(repos_tmpdir, repo_spec)
+            # Pass SHAs of repos built so far so superproject submodule injection
+            # can look up gitlink SHAs (H5, #177).
+            peer_shas = {n: shas[-1] for n, shas in repo_commit_shas.items() if shas}
+            repo_dir, commit_shas = _make_git_protocol_repo(
+                repos_tmpdir, repo_spec, peer_shas=peer_shas
+            )
             repo_paths[repo_spec["name"]] = repo_dir
             repo_commit_shas[repo_spec["name"]] = commit_shas
     except RuntimeError as e:
@@ -709,8 +878,30 @@ def _execute_git_protocol_fixture(
         return ("fail", f"fetch.repo_name {repo_name!r} not found in repos")
 
     target_repo = repo_paths[repo_name]
-    # Use file:// URL so GitFetcher exercises the real git clone protocol path
-    file_url = f"file://{target_repo.resolve()}"
+    # Build the fetch URL for the target repo.
+    #
+    # Normally we use file:// so GitFetcher exercises the real git pack-transfer
+    # protocol path (clone over the smart-HTTP-like protocol).
+    #
+    # EXCEPTION — hostile_tree repos (#177, EXTRACT-ZIP-SLIP fixtures):
+    # git's pack-transfer fsck validates tree-entry paths and rejects hostiles
+    # with "fullPathname" BEFORE the objects even arrive at the clone scratch.
+    # That means git raises FETCH-GIT-FAILED, not milpa raising EXTRACT-ZIP-SLIP,
+    # which is NOT what these fixtures test.  The fixtures test milpa's OWN
+    # containment guard (R1-01 NORMATIVE), so the clone must succeed.
+    #
+    # When a repo spec carries "hostile_tree", we use a raw local filesystem path
+    # (no file:// prefix).  git then uses its local-transport optimization
+    # (hardlink/copy of loose objects), which SKIPS the pack-transfer fsck.
+    # The hostile tree objects arrive in the clone scratch intact; git ls-tree
+    # enumerates the hostile entries; milpa's materializer fires EXTRACT-ZIP-SLIP.
+    target_spec_by_name = {rs["name"]: rs for rs in repos_spec}
+    uses_hostile_tree = bool(target_spec_by_name.get(repo_name, {}).get("hostile_tree"))
+    if uses_hostile_tree:
+        # Local-transport path: git hardlinks objects, bypasses pack-fsck.
+        file_url = str(target_repo.resolve())
+    else:
+        file_url = f"file://{target_repo.resolve()}"
     dep_name = fetch_spec.get("dep_name", "smoke")
     ref = fetch_spec.get("ref", "main")
     commit_sha = fetch_spec.get("commit_sha")  # may be None or "@repo:<n>:commit:<i>"
@@ -774,8 +965,22 @@ def _execute_git_protocol_fixture(
     except Exception as e:
         return ("fail", f"compute_content_hash failed: {e}")
 
+    # H5 (#177): extract submodule_shas from the receipt and format as
+    # path-sorted lines ``<path> <40hex>\n`` for the golden comparison.
+    # registry.fetch() returns FetchResult; the GitReceipt is at result.receipt.
+    receipt_shas: dict[str, str] = getattr(
+        getattr(result, "receipt", None), "submodule_shas", {}
+    ) or {}
+    got_shas_text = "".join(
+        f"{p} {s}\n" for p, s in sorted(receipt_shas.items())
+    )
+
     if _REGEN_MODE:
         _regen_write(fixture_dir / "expected" / "content_hash", got_hash + "\n")
+        # Write submodule_shas only if this fixture has any submodules
+        # (keeps unrelated fixtures' expected/ directories unchanged).
+        if got_shas_text:
+            _regen_write(fixture_dir / "expected" / "submodule_shas", got_shas_text)
         return ("pass", "")
 
     if got_hash != expected_hash:
@@ -784,6 +989,16 @@ def _execute_git_protocol_fixture(
             f"content_hash mismatch:\n"
             f"  expected: {expected_hash}\n"
             f"  actual:   {got_hash}\n"
+            f"  (GitFetcher used file:// URL: {file_url!r})",
+        )
+
+    # H5 (#177): assert submodule_shas if a golden exists.
+    if expected_shas is not None and got_shas_text != expected_shas:
+        return (
+            "fail",
+            f"submodule_shas mismatch:\n"
+            f"  expected:\n{expected_shas}"
+            f"  actual:\n{got_shas_text}"
             f"  (GitFetcher used file:// URL: {file_url!r})",
         )
 

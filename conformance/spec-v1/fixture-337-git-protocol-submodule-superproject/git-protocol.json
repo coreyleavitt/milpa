@@ -1,0 +1,29 @@
+{
+  "repos": [
+    {
+      "name": "subAlpha",
+      "ref": "main",
+      "files": {"alpha.nim": "const a = 1\n"}
+    },
+    {
+      "name": "subZeta",
+      "ref": "main",
+      "files": {"zeta.nim": "const z = 2\n"}
+    },
+    {
+      "name": "super",
+      "ref": "main",
+      "files": {"root.nim": "import std/os\n"},
+      "submodules": [
+        {"path": "libs/zeta",  "repo": "subZeta",  "ref": "main"},
+        {"path": "libs/alpha", "repo": "subAlpha", "ref": "main"}
+      ]
+    }
+  ],
+  "fetch": {
+    "dep_name": "super",
+    "repo_name": "super",
+    "ref": "main",
+    "commit_sha": null
+  }
+}

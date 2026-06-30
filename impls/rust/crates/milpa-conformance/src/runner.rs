@@ -1142,6 +1142,7 @@ mod serde_like {
 fn make_git_protocol_repo(
     tmpdir: &std::path::Path,
     repo_spec: &serde_like::Val,
+    peer_shas: &std::collections::HashMap<String, String>,
 ) -> Result<(std::path::PathBuf, Vec<String>), String> {
     let name = repo_spec.get("name")
         .and_then(|v| v.as_str())
@@ -1164,14 +1165,27 @@ fn make_git_protocol_repo(
         return Err(format!("git init failed: {}", String::from_utf8_lossy(&out.stderr)));
     }
 
-    // git add + commit helper (captures the SHA after each commit)
+    // git add + commit helper (captures the SHA after each commit).
+    // Pin commit authorship + timestamp so commit SHAs are reproducible across
+    // runs and impls — required for golden expected/submodule_shas (#177, H5).
+    // 1577836800 = 2020-01-01T00:00:00Z. Content hashes are unaffected (.git/ excluded).
+    // commit.gpgSign=false prevents host SSH/GPG commit signing from changing the
+    // commit SHA (the signed commit object differs from an unsigned one, breaking
+    // cross-impl golden reproducibility if the host has commit.gpgSign=true).
     let git_c = |args: &[&str]| -> std::io::Result<std::process::Output> {
         std::process::Command::new("git")
             .arg("-C").arg(&repo_dir)
             .args(["-c", "user.email=milpa-hinfra@test.milpa",
                    "-c", "user.name=Milpa H-infra",
-                   "-c", "core.autocrlf=false"])
+                   "-c", "core.autocrlf=false",
+                   "-c", "commit.gpgSign=false"])
             .args(args)
+            .env("GIT_AUTHOR_NAME", "Milpa H-infra")
+            .env("GIT_AUTHOR_EMAIL", "milpa-hinfra@test.milpa")
+            .env("GIT_AUTHOR_DATE", "1577836800 +0000")
+            .env("GIT_COMMITTER_NAME", "Milpa H-infra")
+            .env("GIT_COMMITTER_EMAIL", "milpa-hinfra@test.milpa")
+            .env("GIT_COMMITTER_DATE", "1577836800 +0000")
             .output()
     };
     let head_sha = || -> Result<String, String> {
@@ -1183,10 +1197,114 @@ fn make_git_protocol_repo(
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
 
-    // Normalize to a list of commit specs regardless of form.
-    // Multi-commit form: use repo_spec["commits"] array.
-    // Single-commit form: wrap repo_spec["files"] in a one-element list.
+    // hostile_tree branch (#177, EXTRACT-ZIP-SLIP fixtures): build a raw git
+    // tree object whose entry paths contain path-traversal sequences that
+    // `git add` and `git mktree` refuse to accept (e.g. "../../escape" or
+    // "/escape").  We bypass git's safety checks by hand-crafting the raw
+    // tree object bytes and feeding them to `git hash-object --literally`,
+    // exactly as the verified recipe in the design doc prescribes.
+    // The normal files/commits/symlinks/orphan_tip path is SKIPPED entirely.
     let mut commit_shas: Vec<String> = Vec::new();
+
+    if let Some(hostile_entries_val) = repo_spec.get("hostile_tree") {
+        use std::io::Write as _;
+        let entries = hostile_entries_val.as_arr()
+            .ok_or("repo_spec 'hostile_tree' must be an array")?;
+
+        // Step 1: write each blob and collect its SHA.
+        let mut blob_shas: Vec<(String, String, String)> = Vec::new(); // (mode, name, sha)
+        for entry_val in entries {
+            let mode = entry_val.get("mode").and_then(|v| v.as_str())
+                .ok_or("hostile_tree entry missing 'mode'")?;
+            let name = entry_val.get("name").and_then(|v| v.as_str())
+                .ok_or("hostile_tree entry missing 'name'")?;
+            let content = entry_val.get("content").and_then(|v| v.as_str())
+                .ok_or("hostile_tree entry missing 'content'")?;
+
+            let mut child = std::process::Command::new("git")
+                .arg("-C").arg(&repo_dir)
+                .args(["hash-object", "-w", "--stdin"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("git hash-object (blob) spawn: {e}"))?;
+            child.stdin.take().unwrap().write_all(content.as_bytes())
+                .map_err(|e| format!("git hash-object (blob) write stdin: {e}"))?;
+            let out = child.wait_with_output()
+                .map_err(|e| format!("git hash-object (blob) wait: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "git hash-object (blob) failed:\n  stderr: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            blob_shas.push((mode.to_string(), name.to_string(), sha));
+        }
+
+        // Step 2: build raw tree bytes.
+        // Format per git pack protocol: "<mode> <name>\0<20-byte-sha>" per entry.
+        let mut raw_tree: Vec<u8> = Vec::new();
+        for (mode, name, sha_hex) in &blob_shas {
+            let header = format!("{mode} {name}");
+            raw_tree.extend_from_slice(header.as_bytes());
+            raw_tree.push(0u8); // NUL separator
+            // Decode 40-char hex SHA to 20 raw bytes.
+            for i in 0..20 {
+                let byte_str = &sha_hex[i * 2..i * 2 + 2];
+                let byte = u8::from_str_radix(byte_str, 16)
+                    .map_err(|_| format!("invalid SHA hex in blob {sha_hex:?}"))?;
+                raw_tree.push(byte);
+            }
+        }
+
+        // Step 3: write the raw tree object (--literally bypasses path validation).
+        let mut child = std::process::Command::new("git")
+            .arg("-C").arg(&repo_dir)
+            .args(["hash-object", "-t", "tree", "--literally", "-w", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("git hash-object (tree) spawn: {e}"))?;
+        child.stdin.take().unwrap().write_all(&raw_tree)
+            .map_err(|e| format!("git hash-object (tree) write stdin: {e}"))?;
+        let out = child.wait_with_output()
+            .map_err(|e| format!("git hash-object (tree) wait: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git hash-object (tree) failed:\n  stderr: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let tree_sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        // Step 4: create a commit wrapping the hostile tree.
+        let out = git_c(&["commit-tree", &tree_sha, "-m", "H-infra hostile-tree commit"])
+            .map_err(|e| format!("git commit-tree: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git commit-tree failed:\n  stderr: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let commit_sha_hostile = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        // Step 5: point the branch ref at this commit.
+        let update_ref_arg = format!("refs/heads/{ref_name}");
+        let out = git_c(&["update-ref", &update_ref_arg, &commit_sha_hostile])
+            .map_err(|e| format!("git update-ref: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git update-ref failed:\n  stderr: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+
+        commit_shas.push(commit_sha_hostile);
+        return Ok((repo_dir, commit_shas));
+    }
 
     if let Some(commits_val) = repo_spec.get("commits") {
         // Multi-commit form
@@ -1344,6 +1462,64 @@ fn make_git_protocol_repo(
         }
     }
 
+    // H5 (#177, R1-03): submodule superproject support.
+    // Write .gitmodules with RELATIVE sibling urls ("./repo-name") and inject
+    // gitlink entries via `git update-index --add --cacheinfo 160000,<sha>,<path>`.
+    // Submodule repos MUST precede the superproject in the descriptor (descriptor
+    // order guarantees this) so their SHAs are available in peer_shas.
+    // Using "./repo-name" keeps committed .gitmodules bytes deterministic
+    // (no tmpdir path); milpa resolves them against the superproject file:// URL.
+    if let Some(submodules_val) = repo_spec.get("submodules") {
+        let submodules = submodules_val.as_arr()
+            .ok_or("repo_spec 'submodules' must be an array")?;
+        // Build .gitmodules content
+        let mut gitmodules_content = String::new();
+        for sub_spec in submodules {
+            let sub_path = sub_spec.get("path").and_then(|v| v.as_str())
+                .ok_or("submodule spec missing 'path'")?;
+            let sub_repo = sub_spec.get("repo").and_then(|v| v.as_str())
+                .ok_or("submodule spec missing 'repo'")?;
+            gitmodules_content.push_str(&format!(
+                "[submodule \"{sub_path}\"]\n\tpath = {sub_path}\n\turl = ./{sub_repo}\n"
+            ));
+        }
+        let gitmodules_path = repo_dir.join(".gitmodules");
+        std::fs::write(&gitmodules_path, gitmodules_content.as_bytes())
+            .map_err(|e| format!("write .gitmodules: {e}"))?;
+        let out = git_c(&["add", ".gitmodules"])
+            .map_err(|e| format!("git add .gitmodules: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("git add .gitmodules failed: {}", String::from_utf8_lossy(&out.stderr)));
+        }
+        // Inject gitlink entries for each submodule
+        for sub_spec in submodules {
+            let sub_path = sub_spec.get("path").and_then(|v| v.as_str())
+                .ok_or("submodule spec missing 'path'")?;
+            let sub_repo = sub_spec.get("repo").and_then(|v| v.as_str())
+                .ok_or("submodule spec missing 'repo'")?;
+            let sub_sha = peer_shas.get(sub_repo)
+                .ok_or_else(|| format!(
+                    "submodule repo {sub_repo:?} not found in peer_shas; \
+                     available: {:?}", peer_shas.keys().collect::<Vec<_>>()
+                ))?;
+            let cacheinfo = format!("160000,{sub_sha},{sub_path}");
+            let out = git_c(&["update-index", "--add", "--cacheinfo", &cacheinfo])
+                .map_err(|e| format!("git update-index (submodule {sub_path}): {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "git update-index --cacheinfo {sub_path} failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+        }
+        let out = git_c(&["commit", "-q", "-m", "H-infra add submodules"])
+            .map_err(|e| format!("git commit (submodules): {e}"))?;
+        if !out.status.success() {
+            return Err(format!("git commit (submodules) failed: {}", String::from_utf8_lossy(&out.stderr)));
+        }
+        commit_shas.push(head_sha()?);
+    }
+
     Ok((repo_dir, commit_shas))
 }
 
@@ -1403,7 +1579,12 @@ fn run_git_protocol_fixture(fx: &Fixture, scratch: &Scratch) -> Result<Produced,
         let name = repo_spec.get("name").and_then(|v| v.as_str())
             .ok_or("repo spec missing 'name'")?
             .to_string();
-        let (repo_dir, shas) = make_git_protocol_repo(&repos_tmpdir, repo_spec)?;
+        // Build peer_shas from repos built so far for submodule gitlink injection
+        // (H5, #177): the superproject looks up each submodule's head SHA here.
+        let peer_shas: std::collections::HashMap<String, String> = repo_commit_shas.iter()
+            .filter_map(|(n, shas)| shas.last().map(|s| (n.clone(), s.clone())))
+            .collect();
+        let (repo_dir, shas) = make_git_protocol_repo(&repos_tmpdir, repo_spec, &peer_shas)?;
         repo_paths.insert(name.clone(), repo_dir);
         repo_commit_shas.insert(name, shas);
     }
@@ -1451,10 +1632,38 @@ fn run_git_protocol_fixture(fx: &Fixture, scratch: &Scratch) -> Result<Produced,
     let target_repo = repo_paths.get(repo_name)
         .ok_or_else(|| format!("fetch.repo_name {repo_name:?} not found in repos"))?;
 
-    // Build file:// URL so fetch_git exercises the real git clone path
+    // Build fetch URL for the target repo.
+    //
+    // Normally we use file:// so fetch_git exercises the real git pack-transfer
+    // protocol path (clone over the smart-HTTP-like protocol).
+    //
+    // EXCEPTION — hostile_tree repos (#177, EXTRACT-ZIP-SLIP fixtures):
+    // git's pack-transfer fsck validates tree-entry paths and rejects hostiles
+    // with "fullPathname" BEFORE the objects arrive at the clone scratch.
+    // That means git raises FETCH-GIT-FAILED, not milpa raising EXTRACT-ZIP-SLIP,
+    // which is NOT what these fixtures test.  The fixtures test milpa's OWN
+    // containment guard (R1-01 NORMATIVE), so the clone must succeed.
+    //
+    // When the target repo spec carries "hostile_tree", we use a raw local
+    // filesystem path (no file:// prefix).  git then uses local-transport
+    // (hardlink/copy of loose objects), which SKIPS pack-transfer fsck.
+    // The hostile tree objects arrive in the clone scratch intact; git ls-tree
+    // enumerates the hostile entries; milpa's materializer fires EXTRACT-ZIP-SLIP.
     let abs_repo = target_repo.canonicalize()
         .map_err(|e| format!("canonicalize repo path: {e}"))?;
-    let file_url = format!("file://{}", abs_repo.to_string_lossy());
+    let target_spec_by_name: std::collections::HashMap<&str, &serde_like::Val> =
+        repos_spec.iter()
+            .filter_map(|rs| rs.get("name").and_then(|v| v.as_str()).map(|n| (n, rs)))
+            .collect();
+    let uses_hostile_tree = target_spec_by_name.get(repo_name)
+        .and_then(|rs| rs.get("hostile_tree"))
+        .is_some();
+    let file_url = if uses_hostile_tree {
+        // Local-transport path: git hardlinks objects, bypasses pack-fsck.
+        abs_repo.to_string_lossy().into_owned()
+    } else {
+        format!("file://{}", abs_repo.to_string_lossy())
+    };
 
     let dest = scratch.deps_dir.join(dep_name);
 
@@ -1470,7 +1679,8 @@ fn run_git_protocol_fixture(fx: &Fixture, scratch: &Scratch) -> Result<Produced,
         &dest,
     );
 
-    match fetch_result {
+    // Keep the receipt to extract submodule_shas after the error check.
+    let receipt = match fetch_result {
         Err(e) => {
             let slug = e.code().to_string();
             if let Some(ref expected_slug) = expected_error {
@@ -1503,8 +1713,9 @@ fn run_git_protocol_fixture(fx: &Fixture, scratch: &Scratch) -> Result<Produced,
                      (expected 40-char hex SHA)"
                 ));
             }
+            receipt
         }
-    }
+    };
 
     // Compute content_hash of the materialized tree
     let got_hash = milpa_core::compute_content_hash(&dest)
@@ -1517,7 +1728,28 @@ fn run_git_protocol_fixture(fx: &Fixture, scratch: &Scratch) -> Result<Produced,
         ));
     }
 
-    // Return GitProtocolPass: git-protocol fixtures assert only content_hash.
+    // H5 (#177): assert submodule_shas if the golden file exists.
+    // Format: path-sorted lines "<path> <40hex>\n" — mirrors Python executor.
+    let expected_shas_path = fx.dir.join("expected").join("submodule_shas");
+    if expected_shas_path.exists() {
+        let expected_shas = std::fs::read_to_string(&expected_shas_path)
+            .map_err(|e| format!("expected/submodule_shas unreadable: {e}"))?;
+        // receipt.submodule_shas is Vec<(String, String)>, path-sorted by the fetcher.
+        let mut got_shas = receipt.submodule_shas.clone();
+        got_shas.sort_by(|a, b| a.0.cmp(&b.0));
+        let got_shas_text: String = got_shas.iter()
+            .map(|(p, s)| format!("{p} {s}\n"))
+            .collect();
+        if got_shas_text != expected_shas {
+            return Err(format!(
+                "submodule_shas mismatch:\n  expected:\n{expected_shas}\
+                   actual:\n{got_shas_text}\
+                   (fetch_git used file:// URL: {file_url:?})"
+            ));
+        }
+    }
+
+    // Return GitProtocolPass: git-protocol fixtures assert content_hash (+ submodule_shas).
     // run_fixture's (Expected::Success, Ok(Produced::GitProtocolPass { .. })) arm passes it.
     Ok(Produced::GitProtocolPass { content_hash: got_hash })
 }
@@ -1626,11 +1858,16 @@ fn dag_oracle_git_entries(
 
     let mut repo_paths: std::collections::HashMap<String, std::path::PathBuf> =
         std::collections::HashMap::new();
+    let mut peer_shas_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for repo_spec in repos_spec {
         let name = repo_spec.get("name").and_then(|v| v.as_str())
             .ok_or("repo spec missing 'name'")?
             .to_string();
-        let (repo_dir, _shas) = make_git_protocol_repo(&repos_tmpdir, repo_spec)?;
+        let (repo_dir, shas) = make_git_protocol_repo(&repos_tmpdir, repo_spec, &peer_shas_map)?;
+        if let Some(last) = shas.last() {
+            peer_shas_map.insert(name.clone(), last.clone());
+        }
         repo_paths.insert(name, repo_dir);
     }
 
@@ -1825,7 +2062,10 @@ fn run_hash_fixture(fx: &Fixture, scratch: &Scratch) -> Result<Produced, String>
         let name = repo_spec.get("name").and_then(|v| v.as_str())
             .ok_or("repo spec missing 'name'")?
             .to_string();
-        let (repo_dir, shas) = make_git_protocol_repo(&repos_tmpdir, repo_spec)?;
+        let peer_shas: std::collections::HashMap<String, String> = repo_commit_shas.iter()
+            .filter_map(|(n, shas)| shas.last().map(|s| (n.clone(), s.clone())))
+            .collect();
+        let (repo_dir, shas) = make_git_protocol_repo(&repos_tmpdir, repo_spec, &peer_shas)?;
         repo_paths.insert(name.clone(), repo_dir);
         repo_commit_shas.insert(name, shas);
     }
