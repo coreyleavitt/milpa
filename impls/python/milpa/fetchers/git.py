@@ -819,14 +819,23 @@ class GitFetcher(Fetcher):
                 commit = p.commit_sha
             else:
                 # Mutable-ref tip: resolve the ref to a commit SHA.
-                # We fetch the ref explicitly so it's available in the no-checkout clone.
-                _run_git(
-                    name,
-                    p,
-                    ["git", "-C", str(clone_scratch), "fetch", "-q", "origin",
-                     "--end-of-options", p.ref],
-                )
-                commit = _git_resolve_ref(clone_scratch, p.ref)
+                # The full clone already fetched every branch, tag, and reachable
+                # object, so a branch tip, tag, or any commit SHA (full OR short)
+                # reachable from history usually resolves locally — no fetch needed.
+                # Only fetch explicitly when the ref is not yet present (e.g. a PR
+                # ref / hidden namespace the default clone didn't bring down).  This
+                # also avoids ``git fetch origin <short-sha>``, which servers reject
+                # outright (they accept full SHAs via allowReachableSHA1InWant but
+                # not abbreviated ones).
+                commit = _try_resolve_ref(clone_scratch, p.ref)
+                if commit is None:
+                    _run_git(
+                        name,
+                        p,
+                        ["git", "-C", str(clone_scratch), "fetch", "-q", "origin",
+                         "--end-of-options", p.ref],
+                    )
+                    commit = _git_resolve_ref(clone_scratch, p.ref)
 
             # --- materialize the object-store tree into dest ----------------
             # spec/plugin-contract.md §2.3 + §2.4.1 NORMATIVE: the ONLY path
@@ -957,6 +966,54 @@ def _git_head_sha(dest: Path) -> str:
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+
+def _try_resolve_ref(repo: Path, ref: str) -> "str | None":
+    """Try to resolve *ref* against the object store at *repo* without fetching.
+
+    Does NOT consult FETCH_HEAD — a ``git clone`` leaves a stale FETCH_HEAD
+    pointing at the default branch, so consulting it would mis-resolve any
+    non-default-branch ref.  (The existing _git_resolve_ref keeps its
+    FETCH_HEAD-first logic; it is called only AFTER an explicit fetch.)
+
+    Tries in order:
+    1. ``refs/remotes/origin/<ref>^{commit}`` — branch tips fetched by the
+       full clone (covers branch names and some tags).
+    2. ``<ref>^{commit}``  — resolves annotated/lightweight tags, full SHAs,
+       and short SHAs that are already present in the object store (git
+       internally expands abbreviated OIDs to the full 40-char SHA).
+
+    Returns the full 40-char SHA on success, or ``None`` when the ref cannot
+    be resolved without a targeted ``git fetch``.
+    R5: ``--end-of-options`` ensures refs starting with ``-`` are not
+    parsed as flags.
+    """
+    # 1. Remote-tracking branch tip (populated by the full clone).
+    result = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+         "--end-of-options", f"refs/remotes/origin/{ref}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        sha = result.stdout.strip()
+        if sha:
+            return sha
+
+    # 2. Direct resolution — covers tags, full SHAs, and short SHAs present
+    #    in the object store.
+    result2 = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+         "--end-of-options", f"{ref}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    if result2.returncode == 0:
+        sha = result2.stdout.strip()
+        if sha:
+            return sha
+
+    return None
 
 
 def _git_resolve_ref(repo: Path, ref: str) -> str:

@@ -4038,3 +4038,86 @@ fn a0_cas_admitting_fetcher_inner_returns_registry_with_identity() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// H-infra regression: short-SHA ref resolution (git fetch ordering fix)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn git_short_sha_ref_resolves_without_explicit_fetch() {
+    // Regression guard for the short-SHA `ref` bug: `git fetch origin <short-sha>`
+    // is rejected by GitHub's smart protocol, but the commit is already present
+    // after the full clone.  The fix resolves locally first; the explicit fetch
+    // is only a fallback.
+    //
+    // Setup: 2-commit repo so the pinned SHA is a non-HEAD ancestor (proves the
+    // object-store lookup works for older commits, not just the branch tip).
+    // We use the 7-char short SHA of the FIRST commit as `ref` with `commit_sha=None`.
+    let d = tmp();
+    let repo = d.path().join("short_sha_origin");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    let git = |args: &[&str]| -> Option<std::process::Output> {
+        std::process::Command::new("git")
+            .arg("-C").arg(&repo)
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .output().ok()
+            .filter(|o| o.status.success())
+    };
+
+    // git init (without -c flags — some versions ignore them on init).
+    let init_ok = std::process::Command::new("git")
+        .arg("-C").arg(&repo)
+        .args(["init", "-q", "-b", "main"])
+        .output().ok().map(|o| o.status.success()).unwrap_or(false);
+    if !init_ok {
+        eprintln!("skipping: git unavailable");
+        return;
+    }
+
+    // First commit.
+    std::fs::write(repo.join("first.nim"), b"# first\n").unwrap();
+    let Some(_) = git(&["add", "."]) else {
+        eprintln!("skipping: git add failed");
+        return;
+    };
+    let Some(_) = git(&["commit", "-q", "-m", "first commit"]) else {
+        eprintln!("skipping: git commit failed");
+        return;
+    };
+    let first_sha = String::from_utf8_lossy(
+        &std::process::Command::new("git")
+            .arg("-C").arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output().unwrap().stdout,
+    ).trim().to_string();
+
+    // Second commit so the first is a non-HEAD ancestor.
+    std::fs::write(repo.join("second.nim"), b"# second\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "second commit"]);
+
+    // 7-char short SHA of the first commit — the server-rejected ref form.
+    let short_sha = first_sha[..7].to_string();
+    let repo_url = format!("file://{}", repo.display());
+    let dest = d.path().join("_deps/short_sha_dep");
+
+    // fetch_git with ref=<short-sha> and commit_sha=None — the mutable-ref bug path.
+    let r = super::fetch_git("short_sha_dep", &repo_url, &short_sha, None, &dest)
+        .expect("fetch_git must succeed with a short SHA ref reachable from clone");
+
+    // The materialized tree must contain only the first commit's file.
+    assert!(dest.join("first.nim").exists(), "first.nim must be present (first commit)");
+    assert!(
+        !dest.join("second.nim").exists(),
+        "second.nim must NOT be present (fetched only the first commit)"
+    );
+
+    // resolved_ref must be the full first-commit SHA.
+    let resolved = r.resolved_ref.expect("Receipt must carry resolved_ref");
+    assert!(
+        resolved.starts_with(&short_sha),
+        "resolved_ref {resolved:?} must start with short SHA {short_sha:?}"
+    );
+}

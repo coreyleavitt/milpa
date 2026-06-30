@@ -2374,3 +2374,97 @@ def test_corpus_fixture(fixture_id: str, tmp_path: Path) -> None:
     elif verdict == "fail":
         pytest.fail(f"{fx.id}: {message}")
     # "pass" → test passes
+
+
+# ---------------------------------------------------------------------------
+# H-infra regression: short-SHA ref resolution (git fetch ordering fix)
+# ---------------------------------------------------------------------------
+
+
+def test_git_short_sha_ref_resolves_without_fetch(tmp_path: Path) -> None:
+    """GitFetcher must resolve a short commit SHA used as ``ref`` (commit_sha=None).
+
+    Root cause: the mutable-ref branch previously did ``git fetch origin <ref>``
+    unconditionally, before trying to resolve locally.  GitHub's smart protocol
+    rejects ``git fetch origin <short-sha>`` (only full SHAs are accepted via
+    ``allowReachableSHA1InWant``; abbreviated OIDs are not).  The fix resolves
+    against the clone-local object store first; the explicit fetch is only a
+    fallback for refs absent after the full clone (PR refs, hidden namespaces).
+
+    This test creates a 2-commit bare repo so the pinned SHA is a non-HEAD
+    ancestor (proving the object-store lookup handles older commits, not just
+    the branch tip).  The 7-char short SHA of the first commit is used as
+    ``ref`` with ``commit_sha=None`` — exactly the amoxtli / user case.
+
+    The test is in the H-infra git tier: a real local bare repo via ``file://``,
+    the real GitFetcher, no network.
+    """
+    from milpa.fetchers.git import GitFetcher, GitProvenance
+    from milpa.fetchers.types import FetcherRegistry
+    from milpa.identity import compute_content_hash
+
+    # Build a 2-commit bare repo.
+    repo_dir = tmp_path / "short_sha_origin"
+    repo_dir.mkdir()
+
+    def _git(args: list) -> str:  # type: ignore[type-arg]
+        result = subprocess.run(
+            ["git", "-C", str(repo_dir),
+             "-c", "user.email=milpa-hinfra@test.milpa",
+             "-c", "user.name=Milpa H-infra",
+             "-c", "core.autocrlf=false",
+             ] + args,
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"git unavailable or init failed: {result.stderr.strip()}")
+        return result.stdout.strip()
+
+    subprocess.run(
+        ["git", "-C", str(repo_dir), "init", "-b", "main", "-q"],
+        capture_output=True, check=False,
+    )
+    (repo_dir / "first.nim").write_text("# first\n", encoding="utf-8")
+    _git(["add", "."])
+    _git(["commit", "-q", "-m", "first commit"])
+    first_sha_full = subprocess.run(
+        ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    # Add a second commit so the first is a non-HEAD ancestor.
+    (repo_dir / "second.nim").write_text("# second\n", encoding="utf-8")
+    _git(["add", "."])
+    _git(["commit", "-q", "-m", "second commit"])
+
+    # 7-char short SHA of the FIRST (non-HEAD) commit.
+    short_sha = first_sha_full[:7]
+
+    # Fetch using the short SHA as ``ref`` (commit_sha=None) — the bug path.
+    file_url = f"file://{repo_dir.resolve()}"
+    dest = tmp_path / "_deps" / "short_sha_dep"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    registry = FetcherRegistry()
+    registry.register(GitFetcher())
+    receipt = registry.fetch(
+        "short_sha_dep",
+        GitProvenance(url=file_url, ref=short_sha, commit_sha=None),
+        dest=dest,
+    )
+
+    # The materialized tree must contain only the first commit's file.
+    assert (dest / "first.nim").exists(), "first.nim must be present (first commit)"
+    assert not (dest / "second.nim").exists(), "second.nim must NOT be present (only first commit)"
+
+    # The receipt's commit_sha must be the full SHA of the first commit.
+    assert receipt.receipt.commit_sha is not None
+    assert receipt.receipt.commit_sha.startswith(short_sha), (
+        f"receipt.commit_sha {receipt.receipt.commit_sha!r} must start with short SHA {short_sha!r}"
+    )
+
+    # The FetchResult identity must be a dag-sha256: hash (confirms CAS path works).
+    assert receipt.identity is not None
+    assert receipt.identity.startswith("dag-sha256:"), (
+        f"expected dag-sha256: identity, got {receipt.identity!r}"
+    )

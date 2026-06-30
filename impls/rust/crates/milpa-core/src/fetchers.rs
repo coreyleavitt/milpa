@@ -1229,11 +1229,24 @@ pub fn fetch_git(
             sha.to_string()
         }
         None => {
-            // Mutable-ref tip: fetch the ref, then resolve it.
-            git_status(name, Command::new("git").arg("-C").arg(&clone_scratch).args([
-                "fetch", "-q", "origin", "--end-of-options", ref_spec,
-            ]))?;
-            git_resolve_ref(&clone_scratch, ref_spec, name)?
+            // Mutable-ref tip: resolve the ref to a commit SHA.
+            // The full clone already fetched every branch, tag, and reachable
+            // object, so a branch tip, tag, or any commit SHA (full OR short)
+            // reachable from history usually resolves locally — no fetch needed.
+            // Only fetch explicitly when the ref is not yet present (e.g. a PR
+            // ref / hidden namespace the default clone didn't bring down).  This
+            // also avoids `git fetch origin <short-sha>`, which servers reject
+            // outright (they accept full SHAs via allowReachableSHA1InWant but
+            // not abbreviated ones).
+            match try_resolve_ref(&clone_scratch, ref_spec) {
+                Some(sha) => sha,
+                None => {
+                    git_status(name, Command::new("git").arg("-C").arg(&clone_scratch).args([
+                        "fetch", "-q", "origin", "--end-of-options", ref_spec,
+                    ]))?;
+                    git_resolve_ref(&clone_scratch, ref_spec, name)?
+                }
+            }
         }
     };
 
@@ -1467,6 +1480,53 @@ fn commit_present(dir: &Path, sha: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Try to resolve *ref_spec* against the object store at *repo* without fetching.
+///
+/// Mirrors Python's `_try_resolve_ref`.  Does NOT consult `FETCH_HEAD` — a
+/// `git clone` leaves a stale `FETCH_HEAD` pointing at the default branch, so
+/// consulting it would mis-resolve any non-default-branch ref.
+///
+/// Tries in order:
+/// 1. `refs/remotes/origin/<ref>^{commit}` — branch tips from the full clone.
+/// 2. `<ref>^{commit}` — resolves tags, full SHAs, and short SHAs already
+///    present in the object store (git expands abbreviated OIDs internally).
+///
+/// Returns `Some(sha)` on success, `None` when a targeted `git fetch` is needed.
+/// R5: `--end-of-options` before the ref so refs starting with `-` are not
+/// parsed as flags.
+fn try_resolve_ref(repo: &Path, ref_spec: &str) -> Option<String> {
+    // 1. Remote-tracking branch tip (populated by the full clone).
+    let out1 = Command::new("git")
+        .arg("-C").arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", "--end-of-options",
+               &format!("refs/remotes/origin/{ref_spec}^{{commit}}")])
+        .output()
+        .ok()?;
+    if out1.status.success() {
+        let sha = String::from_utf8_lossy(&out1.stdout).trim().to_string();
+        if !sha.is_empty() {
+            return Some(sha);
+        }
+    }
+
+    // 2. Direct resolution — covers tags, full SHAs, and short SHAs present
+    //    in the object store.
+    let out2 = Command::new("git")
+        .arg("-C").arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", "--end-of-options",
+               &format!("{ref_spec}^{{commit}}")])
+        .output()
+        .ok()?;
+    if out2.status.success() {
+        let sha = String::from_utf8_lossy(&out2.stdout).trim().to_string();
+        if !sha.is_empty() {
+            return Some(sha);
+        }
+    }
+
+    None
 }
 
 /// Resolve a ref name to a commit SHA in the object store at `repo`.
