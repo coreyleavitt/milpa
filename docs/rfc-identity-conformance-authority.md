@@ -507,7 +507,10 @@ surface to get it. The prefix does the work; nothing accommodates the old bytes.
   admission), with its own `rename(2)` admission unit, path grammar (`<algo>/
   <type>/<hex>`), and GC interaction (`rfc-store-gc.md`, incl. pruning the
   epoch-1 `sha256/` garbage). Separable from identity correctness. **Filed as its
-  own issue**, not a slice here.
+  own issue (#181, `rfc-cas-subtree-dedup.md`) — DEFERRED BY DESIGN**, not a slice
+  here: whole-dep cross-project dedup already ships; subtree dedup is marginal for
+  source deps + a CAS-core rewrite, so it's gated on a real subtree-sharing
+  consumer (the v2 toolchain build-closure).
 
 ### Spec-edit ledger (every normative file/section this RFC touches)
 
