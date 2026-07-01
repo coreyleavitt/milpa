@@ -27,9 +27,14 @@ serde_json = "1"
 # RFC: rfc-registry-trust-federation §5.3.
 #
 # S4 spike verdict: INSUFFICIENT — sigstore 0.11.0 does NOT support DSSE/in-toto
-# attestation bundles (BundleErrorKind::DsseUnsupported); S4b is ACTIVE. The crate
-# is retained here as the planned dep for S4b; SigstoreVerifier is a placeholder.
-# S4b will pin the minimum sigstore version that supports DSSE and narrow features.
+# attestation bundles (BundleErrorKind::DsseUnsupported).
+# S4b mini-spike (low-level primitives) verdict: NOT VIABLE — two blocking gaps:
+#   (1) CertificatePool (cert chain at integratedTime) is pub(crate) only.
+#   (2) Rekor SET / inclusion proof verification is TODO (sigstore-rs#285) — not
+#       implemented even for the MessageSignature path.
+# S4b is DEFERRED pending upstream sigstore-rs fixing both gaps. The crate is retained
+# here as the planned dep; SigstoreVerifier is a placeholder. Retry S4b when sigstore-rs
+# ships DSSE support + Rekor SET verification (sigstore-rs#285).
 sigstore = "0.11"
 
 [dev-dependencies]

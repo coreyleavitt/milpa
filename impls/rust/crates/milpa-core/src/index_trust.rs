@@ -11,8 +11,8 @@
 //!   [`SigstoreVerifier`]; test/conformance code passes [`MockVerifier`].
 //! - [`verify_index_bundle`] — pure function; never panics.  Implements RFC §4 steps 1–3
 //!   (JSON parse, integratedTime extract, freshness check) correctly.  Steps 4–6
-//!   (crypto) are stubbed pending S4b (see below).
-//! - [`SigstoreVerifier`] — **S4b ACTIVE**: placeholder; always panics with
+//!   (crypto) are stubbed; see the S4b DEFERRED note below.
+//! - [`SigstoreVerifier`] — **S4b DEFERRED**: placeholder; always panics with
 //!   `unimplemented!`.  See the S4b note below.
 //! - [`MockVerifier`] — test seam; returns a caller-supplied result, ignoring all inputs.
 //!   This is the S7 conformance corpus seam (`mock_verifier_result` env field).
@@ -23,27 +23,60 @@
 //!   vs test (`_oracle/test_trust_bundle.json`). Factory methods: [`TrustBundle::production`] /
 //!   [`TrustBundle::test`].
 //!
-//! # S4b ACTIVE — SigstoreVerifier is a placeholder
+//! # S4b DEFERRED — SigstoreVerifier is a placeholder; low-level-primitives spike NOT VIABLE
 //!
-//! The S4 spike found that `sigstore-rs` 0.11.0 does **NOT** support DSSE/in-toto attestation
-//! bundles produced by `cosign attest-blob`:
+//! ## S4 spike finding (original)
 //!
-//! - [`bundle::verify::models::BundleErrorKind::DsseUnsupported`] is returned for any bundle
-//!   whose `content` is a DSSE envelope (all `cosign attest-blob` output).
-//! - Only `Content::MessageSignature` (hashedrekord / `cosign sign-blob` format) is handled.
+//! `sigstore-rs` 0.11.0 does **NOT** support DSSE/in-toto attestation bundles produced by
+//! `cosign attest-blob`:
+//!
+//! - `BundleErrorKind::DsseUnsupported` is returned for any bundle whose `content` is a DSSE
+//!   envelope (all `cosign attest-blob` output); only `Content::MessageSignature` (hashedrekord)
+//!   is handled.
 //! - Bundle v0.3 format is rejected (`BundleProfileErrorKind::Unknown`).
 //!
-//! What IS confirmed:
-//! - Offline flag (`verify(input, bundle, policy, offline=true)`) exists: ✓
-//! - Cert-at-SET-time: confirmed in `verifier.rs` step 7: cert expiry checked against
-//!   `log_entry.integrated_time`, NOT wall-clock.  ✓
-//! - `blocking::Verifier` (sync): ✓
-//! - `ManualTrustRoot` for custom trust roots: ✓
-//! - `Identity` policy (SubjectAltName + OIDC issuer): ✓
+//! ## S4b mini-spike finding (low-level primitives path — NOT VIABLE)
 //!
-//! S4b will retrofit a real `SigstoreVerifier` using either:
-//!   (a) a newer sigstore-rs version that supports DSSE/in-toto attestation bundles, or
-//!   (b) an alternative approach that meets the same requirements.
+//! The recommended S4b path was: parse the DSSE envelope ourselves (pure JSON + byte assembly,
+//! no crypto) and hand the result to sigstore-rs lower-level primitives for the actual
+//! signature / cert-chain / SET verification.
+//!
+//! The spike (sourced from the vendored sigstore 0.11.0 source) found **TWO blocking gaps**
+//! that make this approach NOT VIABLE against sigstore-rs 0.11.0:
+//!
+//! **Gap 1 — `CertificatePool` is `pub(crate)` only.**
+//!   `CertificatePool::verify_cert_with_time` is the primitive that validates the Fulcio leaf
+//!   cert chain against the embedded Fulcio root AT the cert's issuance time (not wall-clock).
+//!   It is declared `pub(crate)` in `crypto/mod.rs` and is inaccessible outside the crate.
+//!   Without it, RFC §4 step 2 (cert chain validation at `integratedTime`) cannot be implemented
+//!   without hand-rolling webpki at-time validation — which violates the no-hand-rolled-crypto rule.
+//!
+//! **Gap 2 — Rekor SET / inclusion proof verification is an explicit TODO in sigstore-rs 0.11.0.**
+//!   In `bundle/verify/verifier.rs` lines 155–162, steps 5 (Merkle inclusion) and 6 (Signed Entry
+//!   Timestamp counter-signature) are literal `// TODO(tnytown): ...; sigstore-rs#285` comments.
+//!   These are NOT implemented even for the MessageSignature path.  RFC §4 step 5 requires SET
+//!   verification; the library does not implement it.  Doing it ourselves would require hand-rolling
+//!   the SET counter-signature check (ECDSA verify over the tlog entry JSON using the Rekor public
+//!   key), which violates the no-hand-rolled-crypto rule.
+//!
+//! ## What sigstore-rs 0.11.0 DOES provide (for reference)
+//!
+//! - `blocking::Verifier` + `ManualTrustRoot`: ✓
+//! - Cert-at-SET-time via `integratedTime` window check (verifier.rs step 7): ✓
+//! - Identity policy (`SubjectAltName` + OIDC issuer) via `bundle::verify::policy::Identity`: ✓
+//! - `CosignVerificationKey` (ECDSA P-256 signature verification given a public key): ✓
+//! - Offline flag (`verify(…, offline=true)`): ✓ (but disabled for DSSE)
+//!
+//! ## Path forward
+//!
+//! S4b remains deferred as a **tracked known-limitation**:
+//! - Rust production `SigstoreVerifier` is blocked until sigstore-rs ships **both** (a) DSSE/in-toto
+//!   attestation bundle support AND (b) Rekor SET/inclusion proof verification (sigstore-rs#285).
+//! - Track upstream sigstore-rs releases; retry S4b when both gaps are closed.
+//! - Consider an upstream contribution to sigstore-rs to close one or both gaps.
+//! - Alternative: evaluate `sigstore-rekor-types` + `sigstore-fulcio` crates directly if they
+//!   expose the missing primitives at a lower level.
+//!
 //! Conformance stays green via [`MockVerifier`].
 //!
 //! # Slice boundary
@@ -263,10 +296,10 @@ pub trait IndexBundleVerifier {
 /// Passing `None` skips this bound entirely (pure cache reads, offline safety —
 /// RFC §4 step 6, §7.2).
 ///
-/// **Steps 4–6 — S4b ACTIVE**: crypto verification is stubbed.  The sigstore-rs 0.11.0
-/// crate does not support DSSE/in-toto attestation bundles (`cosign attest-blob` format);
-/// see the module-level S4b note.  Returns [`SigInvalid`] for all bundles that pass
-/// steps 1–3.  This is conservative (no false [`Trusted`] results).
+/// **Steps 4–6 — S4b DEFERRED**: crypto verification is stubbed.  sigstore-rs 0.11.0 has
+/// two blocking gaps (DSSE unsupported; Rekor SET verification TODO sigstore-rs#285);
+/// see the module-level S4b note for the full spike finding.  Returns [`SigInvalid`] for
+/// all bundles that pass steps 1–3.  This is conservative (no false [`Trusted`] results).
 ///
 /// Never panics; returns a [`VerificationResult`] for every input.
 ///
@@ -309,9 +342,9 @@ pub fn verify_index_bundle(
         }
     }
 
-    // Steps 4–6: S4b ACTIVE — crypto verification placeholder.
-    // sigstore-rs 0.11.0 does not support DSSE/in-toto attestation bundles.
-    // See the module-level S4b note. Returns SigInvalid conservatively (no false Trusted).
+    // Steps 4–6: S4b DEFERRED — crypto verification placeholder.
+    // sigstore-rs 0.11.0 has two blocking gaps: DSSE unsupported + Rekor SET TODO (#285).
+    // See module-level S4b note. Returns SigInvalid conservatively (no false Trusted).
     _crypto_stub_s4b(index_bytes, &bundle_json, trust_bundle, expected_signer, integrated_time)
 }
 
@@ -333,9 +366,12 @@ fn extract_integrated_time(bundle_json: &serde_json::Value) -> Option<u64> {
 
 /// S4b placeholder for steps 4–6 crypto verification.
 ///
-/// Returns [`VerificationResult::SigInvalid`] conservatively.
-/// S4b will replace this with real DSSE/in-toto verification using either
-/// a newer sigstore-rs version or an alternative approach.
+/// Returns [`VerificationResult::SigInvalid`] conservatively (no false `Trusted` results).
+///
+/// S4b mini-spike found the low-level primitives approach NOT VIABLE against sigstore-rs 0.11.0:
+/// `CertificatePool` is `pub(crate)` and Rekor SET verification is TODO (sigstore-rs#285).
+/// This stub will be replaced when sigstore-rs ships both DSSE support and SET verification.
+/// See the module-level S4b note for details.
 ///
 /// RFC §11 S4b: "Rust SigstoreVerifier retrofit (CONDITIONAL)".
 #[allow(unused_variables)]
@@ -346,11 +382,8 @@ fn _crypto_stub_s4b(
     expected_signer: &str,
     integrated_time: u64,
 ) -> VerificationResult {
-    // S4b TODO: implement real DSSE/in-toto verification.
-    // sigstore-rs 0.11.0 DsseUnsupported gap — see module-level S4b note.
-    // Options for S4b:
-    //   (a) newer sigstore-rs with DSSE support
-    //   (b) manual DSSE envelope signature verification using sigstore crypto primitives
+    // S4b DEFERRED: two blocking gaps in sigstore-rs 0.11.0 prevent real DSSE verification.
+    // See module-level S4b note for the full spike finding.
     VerificationResult::SigInvalid
 }
 
@@ -360,19 +393,21 @@ fn _crypto_stub_s4b(
 
 /// Production verifier using `sigstore-rs`.
 ///
-/// # S4b ACTIVE — this is a placeholder that panics
+/// # S4b DEFERRED — this is a placeholder that panics
 ///
 /// The S4 spike confirmed that sigstore-rs 0.11.0 does NOT support DSSE/in-toto
 /// attestation bundles from `cosign attest-blob` (`BundleErrorKind::DsseUnsupported`).
-/// Per RFC §11 S4b, `SigstoreVerifier` is a clearly-marked placeholder until S4b
-/// retrofits the real implementation.
+///
+/// The S4b mini-spike (low-level primitives approach) found the approach NOT VIABLE:
+///   - `CertificatePool` (cert chain validation at `integratedTime`) is `pub(crate)`.
+///   - Rekor SET / inclusion proof verification is TODO in sigstore-rs 0.11.0 (issue #285).
+///
+/// `SigstoreVerifier` remains a placeholder until sigstore-rs ships both DSSE support
+/// and Rekor SET verification (sigstore-rs#285).  See module-level doc for the full
+/// S4b spike finding.
 ///
 /// Calling `SigstoreVerifier::verify()` will panic with `unimplemented!`.
 /// Use [`MockVerifier`] for all tests and conformance fixtures.
-///
-/// S4b will retrofit a real implementation using either:
-///   (a) a newer sigstore-rs version with DSSE support, or
-///   (b) an alternative crate or approach.
 ///
 /// RFC §11 S4/S4b.
 pub struct SigstoreVerifier;
@@ -386,15 +421,16 @@ impl IndexBundleVerifier for SigstoreVerifier {
         _expected_signer: &str,
         _max_age_seconds: Option<u64>,
     ) -> VerificationResult {
-        // S4b ACTIVE: sigstore-rs 0.11.0 does not support DSSE/in-toto attestation bundles.
-        // The `cosign attest-blob` bundle format (Content::DsseEnvelope) returns
-        // BundleErrorKind::DsseUnsupported in the current sigstore-rs API.
+        // S4b DEFERRED: sigstore-rs 0.11.0 has two blocking gaps for DSSE verification:
+        //   (1) BundleErrorKind::DsseUnsupported — high-level path fails for DSSE envelopes.
+        //   (2) Low-level primitives approach NOT VIABLE: CertificatePool is pub(crate) only,
+        //       and Rekor SET/inclusion proof verification is TODO (sigstore-rs#285).
         //
-        // S4b will retrofit this once DSSE support lands upstream or an alternative
-        // approach is identified. Until then, this will panic if called.
+        // This placeholder will remain until sigstore-rs ships both DSSE support and Rekor
+        // SET verification. See module-level S4b note for the full spike finding.
         //
-        // All conformance tests and policy tests use MockVerifier; this code path
-        // is not reached in testing.
+        // All conformance tests and policy tests use MockVerifier; this code path is never
+        // reached in testing.
         //
         // RFC §11 S4b: "Rust SigstoreVerifier retrofit (CONDITIONAL)".
         unimplemented!(

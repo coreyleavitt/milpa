@@ -1,9 +1,10 @@
 # rfc-registry-trust-federation — handoff
 
-- **Stage:** 3 (tdd slice grind) — **S1–S7 DONE**. Functional grind COMPLETE. Only parked S4b (sigstore-rs DSSE gap, awaiting Corey's steer) remains → next stage is `/code-review`.
-- **Resume:** LOOP STOPPED (functional grind done; blocked on the S4b fork). Next stage: `/compact` then `/code-review docs/rfc-registry-trust-federation.md` (Stage 4). Everything S1–S7 is UNCOMMITTED in the working tree — commit is Corey's call.
+- **Stage:** 3 (tdd slice grind) — **S1–S7 DONE**. Functional grind COMPLETE. S4b mini-spike COMPLETE (NOT VIABLE — see below). Next: `/code-review docs/rfc-registry-trust-federation.md` (Stage 4).
+- **Resume:** S1–S7 COMMITTED as `8b65abd`. S4b mini-spike DONE (NOT VIABLE verdict; placeholder + comments updated in `index_trust.rs` and `Cargo.toml`; no new tests, no code changes beyond comment updates). `/code-review` is next.
 - **RFC path:** `docs/rfc-registry-trust-federation.md`
-- **Awaiting Corey (3 decisions):** (1) **S4b path** — the sigstore-rs DSSE-gap fork (recommend: low-level-primitives mini-spike; see ⚠️ section below). (2) **Commit** the S1–S7 tree (7 slices; do NOT bundle amoxtli's milpa.lock or the pre-existing fetch-hardening/#177 WIP). (3) **File the 4 follow-on issues** (tianguis `index.kdl.bundle` delivery; Part-2 per-entry attribution; observability command; NEW: sigstore-rs DSSE-gap tracking for S4b) — held pending your greenlight.
+- **Corey's decisions (resolved):** (1) S4b → RUN the low-level-primitives mini-spike → **agent `a46525fa` IN FLIGHT** (spike-then-implement-if-viable). (2) Commit → DONE `8b65abd` (136 files; excluded harness lock + pre-existing fetch-hardening/#177 handoffs). (3) "no, do them now" → skip GH-issue filing, implement small follow-ons inline: **observability command** sequenced AFTER S4b (it needs the verifier to surface signer/integratedTime/Rekor-UUID metadata, which S4b's real-verifier work defines); **tianguis `index.kdl.bundle` delivery** is cross-repo (`coreyleavitt/tianguis`) — not checked out here, pending; **Part-2 per-entry attribution** STAYS deferred (settled Layer-1-only scope, separate RFC).
+- **⚠️ git-identity landmine (fixed):** `.git/config` had a LOCAL override `user.email=t@t`/`user.name=t` (leftover from #177 git experiments) shadowing the correct global `corey@leavitt.dev`. Removed via `git config --local --unset user.{email,name}`. VERIFY `git config user.email` == corey@leavitt.dev before any future commit this session.
 
 ## Progress
 - **S7 DONE** (cross-impl conformance fixtures + `index-trust` cmd in both runners; Python **2543 passed, 31 skipped**; Rust **317 pass, 34 skip (cli-only), 0 regressions** — 351 total fixtures): 18 fixture directories (`fixture-338` through `fixture-355`) under `conformance/spec-v1/`; `_oracle/test_trust_bundle.json` placeholder committed; `Cmd::IndexTrust` + `from_dir("index-trust")` in Rust `fixture.rs`; `Produced::IndexTrustPass` + `run_index_trust_fixture` + `Cmd::IndexTrust` dispatch in Rust `runner.rs`; `_execute_index_trust_fixture` + dispatch + `_is_not_yet_wired` entry in Python `test_conformance.py`. Both runners consume identical env fields (`mock_verifier_result`, `MILPA_INDEX_TRUST_MANIFEST`, `MILPA_INDEX_TRUST`, `MILPA_REQUIRE_ATTESTED_INDEX`, `MILPA_INDEX_TRUST_WS_MEMBER_MAX`, `MILPA_INDEX_TRUST_WS_CONFLICT`) and produce byte-identical outcome strings (`trusted`, `warn:TNG-INDEX-*`, `error:TNG-INDEX-*`, `error:WS-INDEX-CONFLICTING-SIGNERS`). Functional grind complete.
@@ -12,10 +13,36 @@
 
 - **S5 DONE** (Python functional slice; both gates green): manifest nodes `index-trust`/`index-trust-signer`/`index-trust-bundle`; `trust.py` `effective_trust_policy` extended to full §6.6 (matches Rust); `IndexTrustConfig` on context; cli flags `--require-attested-index`/`--refresh-index` + 5 env reads; `load_index(url, config, verifier, http_get, bundle_http_get)` rewrite — verify-every-read, freshness-only-on-network (`max_age_seconds=None` on cache reads), bundle-URL derivation (query/fragment preserved), bounded crash-recovery (1 refetch then hard-fail), warn degraded-marker `.kdl.no-bundle` / strict no-partial-cache, `--refresh-index` TTL bypass; `enforce_index_trust` 6-way dispatch (warn=1 dedup'd warning/URL+exit0, strict=raise, off=silent); workspace `merge_workspace_index_trust_policy` (strict>warn>off) + `_check_conflicting_signers` → `WS-INDEX-CONFLICTING-SIGNERS`. **7 new codes** (6 `TNG-INDEX-*` + `WS-INDEX-CONFLICTING-SIGNERS`) in `errors.py`+`spec/errors.md`+Rust `corpus.rs` DEFERRED — disk-verified consistent, bijection green. Real-`SigstoreVerifier` oracle integration test = `@pytest.mark.skip` (hermetic Sigstore signing deferred). Python **2525 passed, 31 skipped**; Rust conformance+bijection **2 passed**.
 
-## ⚠️ S4b ACTIVE — sigstore-rs DSSE gap (surfaced to Corey; parked, not blocking S5/S6/S7)
-S4 spike verdict: **INSUFFICIENT**. `sigstore-rs 0.11.0` supports offline verify ✓, cert-at-SET-time ✓, `ManualTrustRoot` ✓, identity policy ✓ — BUT `CheckedBundle::try_from` returns `DsseUnsupported` for `Content::DsseEnvelope`; only `MessageSignature` (hashedrekord) bundles work, and Bundle v0.3 is rejected. Our design is DSSE + in-toto (settled), which is exactly what `cosign attest-blob` produces — so sigstore-rs 0.11 cannot verify our bundles. **This is the RFC's PRE-PLANNED S4b contingency firing, not a violated spec assumption** — so it does NOT hard-stop the grind. Impact is Rust-only: Python (sigstore-python) verifies DSSE fine, so Python index-trust is fully functional; only the Rust *production* `SigstoreVerifier` is deferred (honest `unimplemented!` placeholder; conformance stays green via MockVerifier).
-- **Recommended S4b path (awaiting Corey's steer):** targeted follow-up mini-spike into sigstore-rs LOW-level primitives — parse the DSSE envelope ourselves (envelope/PAE framing is NOT crypto) and feed the payload + cert + Rekor SET to sigstore-rs's crypto/cosign primitives for the actual signature/cert-chain/SET verification. Preserves the settled DSSE design and the no-hand-rolled-crypto rule. If that mini-spike also fails → defer S4b as a tracked known-limitation (Rust real-verify lags until sigstore-rs gains DSSE; consider upstream contribution). NOT option-c (switching bundle format to MessageSignature) — too much blast radius (Python S3 + tianguis signing + spec).
-- **S4b is the ONE remaining slice after S5/S6/S7** — the functional grind can complete without it.
+## S4b COMPLETE — mini-spike verdict: NOT VIABLE (sigstore-rs 0.11.0 has two blocking gaps)
+
+**S4 original finding:** `CheckedBundle::try_from` returns `BundleErrorKind::DsseUnsupported` for
+any `Content::DsseEnvelope` bundle; only `MessageSignature` (hashedrekord) is handled.
+
+**S4b mini-spike finding (low-level primitives path):** The spike sourced the vendored sigstore 0.11.0
+source and found **TWO blocking gaps** that make the approach NOT VIABLE:
+
+1. **`CertificatePool` is `pub(crate)` only** (`crypto/mod.rs` line 177). `CertificatePool::verify_cert_with_time`
+   is the primitive that validates the Fulcio leaf cert chain against the embedded Fulcio root AT cert
+   issuance time. It is inaccessible from outside the crate. Without it, RFC §4 step 2 (cert chain at
+   `integratedTime`) cannot be implemented without hand-rolling webpki at-time validation — which violates
+   the no-hand-rolled-crypto rule.
+
+2. **Rekor SET / inclusion proof verification is a TODO in sigstore-rs 0.11.0** (`bundle/verify/verifier.rs`
+   lines 155–162: `// TODO(tnytown): Merkle inclusion; sigstore-rs#285` and `// TODO(tnytown) SET verification;
+   sigstore-rs#285`). This is NOT implemented even for the MessageSignature path. RFC §4 step 5 requires
+   SET verification. Hand-rolling it (ECDSA verify over tlog entry JSON using Rekor public key) violates
+   the no-hand-rolled-crypto rule.
+
+**What sigstore-rs 0.11.0 DOES provide:** cert-at-SET-time window check ✓ (verifier.rs step 7),
+`ManualTrustRoot` ✓, `CosignVerificationKey` (ECDSA P-256 verify given a public key) ✓, identity
+policy ✓ — but none of the blocking-gap items.
+
+**Outcome:** S4b is DEFERRED as a tracked known-limitation. Placeholder and comments updated in
+`impls/rust/crates/milpa-core/src/index_trust.rs` and `Cargo.toml` to record the full finding.
+No code changes beyond comment updates; no new tests. Conformance stays green via MockVerifier.
+
+**Path forward:** Retry S4b when sigstore-rs ships both (a) DSSE/in-toto attestation support AND
+(b) Rekor SET/inclusion proof verification (sigstore-rs#285). Consider upstream contribution.
 
 ## Progress
 - **S4 DONE** (Rust verifier, S4b activated): `impls/rust/crates/milpa-core/src/index_trust.rs` at structural parity with S3 (7-variant `VerificationResult` with string reprs byte-identical to Python `.value`; `IndexBundleVerifier` trait; pure `verify_index_bundle` steps 1–3; `MockVerifier`; `IndexTrustConfig` no-verifier-field; `TrustBundle` prod via `include_bytes!` placeholder / test via `_oracle/`). `SigstoreVerifier` = honest `unimplemented!` placeholder (S4b). `sigstore = "0.11"` in `milpa-core/Cargo.toml` w/ deps-rationale documenting the DSSE gap. `./dev-rust test --workspace` 849 passed 0 failed; conformance 299 pass 0 regressions; bijection test green (no `TNG-INDEX-*` added).
