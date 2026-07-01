@@ -493,6 +493,194 @@ class MockVerifier:
 
 
 # ---------------------------------------------------------------------------
+# IndexBundleInfo + describe_index_bundle — pure JSON observability helper
+# ---------------------------------------------------------------------------
+#
+# ``describe_index_bundle`` extracts observable CLAIMS from a Sigstore bundle's
+# JSON without performing any cryptographic verification and without any network
+# access.  It is the single source of truth for the ``milpa show --index-trust``
+# output format; both the Python CLI and the Rust CLI call this logic, producing
+# byte-identical output for the same bundle bytes.
+#
+# Fields extracted by pure JSON parsing:
+#   ``integrated_time``   — ``verificationMaterial.tlogEntries[0].integratedTime``
+#   ``rekor_log_index``   — ``verificationMaterial.tlogEntries[0].logIndex``
+#   ``subject_sha256``    — ``_milpa_claims.subject_sha256`` (test/mock bundles)
+#   ``signer_san``        — ``_milpa_claims.signer_san`` (test/mock bundles)
+#   ``oidc_issuer``       — ``_milpa_claims.oidc_issuer`` (test/mock bundles)
+#
+# The ``_milpa_claims`` section is written into conformance fixture mock bundles so
+# the describe helper can surface all five fields from pure JSON (no X.509 parsing).
+# Real Sigstore bundles produced by ``cosign attest-blob`` do NOT contain
+# ``_milpa_claims``; those fields are surfaced as ``(not available)`` in both impls
+# until a dedicated X.509 extraction path is added in a future slice.
+
+
+@dataclasses.dataclass(frozen=True)
+class IndexBundleInfo:
+    """Observable claims extracted from a Sigstore bundle — pure JSON, no crypto.
+
+    RFC: ``docs/rfc-registry-trust-federation.md``.
+    """
+
+    integrated_time: int
+    """Rekor SET ``integratedTime`` (unix epoch seconds).
+
+    Extracted from ``verificationMaterial.tlogEntries[0].integratedTime``.
+    Used to compute the freshness/staleness of the cached bundle.
+    """
+
+    rekor_log_index: str
+    """Rekor transparency-log entry index.
+
+    Extracted from ``verificationMaterial.tlogEntries[0].logIndex``.
+    Identifies the specific Rekor tlog entry that anchors this attestation.
+    """
+
+    subject_sha256: str | None
+    """SHA-256 digest of the attested subject (index.kdl bytes).
+
+    Extracted from ``_milpa_claims.subject_sha256`` in test/mock bundles.
+    ``None`` when the field is absent (production bundles pending a future slice).
+    """
+
+    signer_san: str | None
+    """SubjectAltName from the signing certificate (signer IDENTITY).
+
+    Extracted from ``_milpa_claims.signer_san`` in test/mock bundles.
+    ``None`` when the field is absent (production bundles pending a future slice).
+    """
+
+    oidc_issuer: str | None
+    """OIDC issuer from the signing certificate.
+
+    Extracted from ``_milpa_claims.oidc_issuer`` in test/mock bundles.
+    ``None`` when the field is absent (production bundles pending a future slice).
+    """
+
+
+def describe_index_bundle(bundle_bytes: bytes) -> "IndexBundleInfo | None":
+    """Parse a Sigstore bundle JSON and extract observable claims.
+
+    Pure JSON extraction — no cryptographic operations, no network access.
+    Returns ``None`` if the bytes are not parseable as a JSON object or if the
+    mandatory ``integratedTime`` field is absent/invalid (pre-crypto bundle parse
+    failure; the same condition that ``verify_index_bundle`` maps to
+    ``BundleMalformed``).
+
+    The five fields and their JSON paths:
+
+    * ``integrated_time`` — ``verificationMaterial.tlogEntries[0].integratedTime``
+    * ``rekor_log_index`` — ``verificationMaterial.tlogEntries[0].logIndex``
+    * ``subject_sha256``  — ``_milpa_claims.subject_sha256``
+    * ``signer_san``      — ``_milpa_claims.signer_san``
+    * ``oidc_issuer``     — ``_milpa_claims.oidc_issuer``
+
+    Both Python and Rust impls use the SAME JSON paths so the output of
+    ``format_index_trust_info`` is byte-identical across impls for any given
+    bundle bytes.
+    """
+    try:
+        data: dict[str, Any] = json.loads(bundle_bytes)
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    # Extract integratedTime (mandatory — same logic as verify_index_bundle step 2).
+    # Proto3 JSON encodes int64 as a string; accept both string and native integer forms.
+    try:
+        raw_it = data["verificationMaterial"]["tlogEntries"][0]["integratedTime"]
+        integrated_time = int(raw_it)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+    # Extract logIndex (Rekor entry reference).
+    try:
+        raw_li = data["verificationMaterial"]["tlogEntries"][0]["logIndex"]
+        rekor_log_index = str(int(raw_li))  # normalise to plain int string
+    except (KeyError, IndexError, TypeError, ValueError):
+        rekor_log_index = "(not available)"
+
+    # Extract signer/issuer/subject from _milpa_claims (test/mock section).
+    # Real Sigstore bundles do not carry this section; those fields surface as None.
+    claims = data.get("_milpa_claims")
+    if not isinstance(claims, dict):
+        claims = {}
+    subject_sha256: str | None = claims.get("subject_sha256")
+    signer_san: str | None = claims.get("signer_san")
+    oidc_issuer: str | None = claims.get("oidc_issuer")
+
+    return IndexBundleInfo(
+        integrated_time=integrated_time,
+        rekor_log_index=rekor_log_index,
+        subject_sha256=subject_sha256,
+        signer_san=signer_san,
+        oidc_issuer=oidc_issuer,
+    )
+
+
+def format_index_trust_info(
+    *,
+    index_url: str,
+    policy: str,
+    index_cached: bool,
+    bundle_cached: bool,
+    info: "IndexBundleInfo | None",
+    now: int,
+    max_age: int = 604800,
+) -> str:
+    """Format the ``milpa show --index-trust`` observability output.
+
+    Produces a fixed-width label block where every label (including the colon)
+    is exactly 16 characters so values align in a column.  This exact layout is
+    byte-identical between the Python and Rust impls — see the Rust counterpart
+    ``milpa_core::index_trust::format_index_trust_info``.
+
+    Parameters
+    ----------
+    index_url:
+        The index URL being described (from ``MILPA_INDEX_URL`` or the default).
+    policy:
+        The effective index-trust policy (``warn`` / ``strict`` / ``off``).
+    index_cached:
+        Whether the index file is present in the local cache.
+    bundle_cached:
+        Whether the Sigstore bundle sidecar is present in the local cache.
+    info:
+        The parsed claims from the cached bundle, or ``None`` when no bundle is
+        cached or the bundle is not parseable.
+    now:
+        Current time as unix epoch seconds.  Injected for test determinism.
+    max_age:
+        Bundle freshness window in seconds (default: 7 days = 604800 s).
+
+    Returns
+    -------
+    str
+        The formatted output string with a trailing newline.  All fields use
+        POSIX ``\\n`` line endings.
+    """
+    lines: list[str] = []
+    lines.append(f"index-url:      {index_url}")
+    lines.append(f"policy:         {policy}")
+    lines.append(f"index-cached:   {'yes' if index_cached else 'no'}")
+    lines.append(f"bundle-cached:  {'yes' if bundle_cached else 'no'}")
+
+    if info is not None:
+        lines.append(f"signer:         {info.signer_san or '(not available)'}")
+        lines.append(f"issuer:         {info.oidc_issuer or '(not available)'}")
+        lines.append(f"integrated:     {info.integrated_time}")
+        lines.append(f"subject-sha256: {info.subject_sha256 or '(not available)'}")
+        lines.append(f"rekor-entry:    {info.rekor_log_index}")
+        age = now - info.integrated_time
+        freshness = "fresh" if age < max_age else "stale"
+        lines.append(f"freshness:      {freshness}")
+
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # IndexTrustConfig — config bundle for load_index (verifier NOT a field)
 # ---------------------------------------------------------------------------
 

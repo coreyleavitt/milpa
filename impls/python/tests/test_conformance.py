@@ -1475,6 +1475,103 @@ def _execute_index_trust_fixture(
 
 
 # ---------------------------------------------------------------------------
+# show-index-trust fixture runner
+# ---------------------------------------------------------------------------
+# Exercises the ``milpa show --index-trust`` observability output via the
+# pure-JSON ``describe_index_bundle`` + ``format_index_trust_info`` helpers.
+#
+# Fixture schema (cmd=show-index-trust):
+#   cmd                        ← "show-index-trust"
+#   env                        ← KEY=VALUE pairs (see below)
+#   index.kdl                  ← optional; presence → index-cached=yes
+#   index.kdl.bundle           ← optional; presence → bundle-cached=yes
+#   expected/
+#     stdout                   ← byte-identical expected output
+#
+# Env fields consumed:
+#   MILPA_INDEX_URL            — index URL shown in output
+#   MILPA_INDEX_TRUST_MANIFEST — manifest-level policy (warn/strict/off; absent→warn)
+#   MILPA_INDEX_TRUST          — env override (same axis as env var)
+#   MILPA_SHOW_NOW             — injected "now" unix timestamp (deterministic freshness)
+#   MILPA_INDEX_MAX_AGE        — optional freshness window in seconds (absent→604800)
+#
+# Both Python and Rust runners use ``format_index_trust_info`` with the same
+# env fields and produce byte-identical ``expected/stdout`` for every fixture.
+
+
+def _execute_show_index_trust_fixture(
+    fixture: "Fixture",
+    tmp_dir: Path,
+) -> tuple[Literal["pass", "fail", "skip"], str]:
+    """Execute a show-index-trust fixture: pure JSON describe + format.
+
+    Reads ``expected/stdout`` and compares to the computed output from
+    ``format_index_trust_info``.  Both the Python and Rust runners produce
+    byte-identical output for the three fixture scenarios.
+    """
+    from milpa.index_trust import describe_index_bundle, format_index_trust_info
+    from milpa.trust import effective_trust_policy
+
+    fixture_dir = fixture.dir
+    env = read_env_file(fixture_dir)
+
+    # Read expected/stdout.
+    stdout_file = fixture_dir / "expected" / "stdout"
+    try:
+        expected_stdout = stdout_file.read_text(encoding="utf-8")
+    except OSError as e:
+        return ("fail", f"cannot read expected/stdout: {e}")
+
+    # Resolve inputs from env.
+    index_url = env.get("MILPA_INDEX_URL") or "https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl"
+    manifest_policy_str = env.get("MILPA_INDEX_TRUST_MANIFEST") or "warn"
+    env_trust = env.get("MILPA_INDEX_TRUST")
+    policy = effective_trust_policy(manifest_policy_str, flag=False, env_override=env_trust)
+
+    try:
+        now = int(env.get("MILPA_SHOW_NOW", "") or "0")
+    except ValueError:
+        now = 0
+
+    try:
+        max_age_str = env.get("MILPA_INDEX_MAX_AGE", "") or ""
+        max_age = int(max_age_str) if max_age_str.strip() else 604800
+    except ValueError:
+        max_age = 604800
+
+    # Determine cache state from fixture files.
+    index_cached = (fixture_dir / "index.kdl").is_file()
+    bundle_file = fixture_dir / "index.kdl.bundle"
+    bundle_cached = bundle_file.is_file()
+
+    # Parse bundle if present.
+    info = None
+    if bundle_cached:
+        try:
+            info = describe_index_bundle(bundle_file.read_bytes())
+        except OSError:
+            pass
+
+    # Format the output.
+    got_stdout = format_index_trust_info(
+        index_url=index_url,
+        policy=str(policy),
+        index_cached=index_cached,
+        bundle_cached=bundle_cached,
+        info=info,
+        now=now,
+        max_age=max_age,
+    )
+
+    if got_stdout == expected_stdout:
+        return ("pass", "")
+    return (
+        "fail",
+        f"stdout mismatch:\n  expected: {expected_stdout!r}\n  actual:   {got_stdout!r}",
+    )
+
+
+# ---------------------------------------------------------------------------
 # The in-process "execute" function — drives core functions directly
 # ---------------------------------------------------------------------------
 
@@ -1522,6 +1619,12 @@ def _execute_fixture(
     # via MockVerifier — no real Sigstore infrastructure or milpa.kdl required.
     if fixture.cmd == "index-trust":
         return _execute_index_trust_fixture(fixture, tmp_dir)
+
+    # show-index-trust: observability command (describe cached bundle claims).
+    # Pure JSON extraction — no crypto, no manifest load. Deterministic via
+    # MILPA_SHOW_NOW and MILPA_INDEX_MAX_AGE env fields.
+    if fixture.cmd == "show-index-trust":
+        return _execute_show_index_trust_fixture(fixture, tmp_dir)
 
     # Import resolver / frozen lazily (they raise NotImplementedError now)
     from milpa.frozen import resolve_frozen, resolve_workspace_frozen
@@ -2467,6 +2570,8 @@ def _is_not_yet_wired(fx: Fixture) -> bool:
         return False  # epoch-2 oracle: "normal" mark, skipped at run time (pending B2)
     if fx.cmd == "index-trust":
         return False  # S7: policy state machine via MockVerifier (RFC registry-trust-federation)
+    if fx.cmd == "show-index-trust":
+        return False  # observability command: describe cached bundle claims (pure JSON)
     # Explicit allowlist is the primary gate.
     fixture_name = fx.dir.name  # e.g. "fixture-003-single-url-dep"
     return fixture_name in _NOT_YET_WIRED_FIXTURE_NAMES

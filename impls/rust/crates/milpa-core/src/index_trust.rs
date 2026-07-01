@@ -644,6 +644,165 @@ pub fn enforce_index_trust(
 }
 
 // ---------------------------------------------------------------------------
+// IndexBundleInfo + describe_index_bundle + format_index_trust_info
+// — pure JSON observability helpers for `milpa show --index-trust`
+// ---------------------------------------------------------------------------
+//
+// These three items are the Rust counterpart of the Python helpers in
+// `impls/python/milpa/index_trust.py`.  They produce byte-identical output
+// for the same bundle bytes so the shared conformance fixtures pass for both
+// impls.
+//
+// Fields extracted by pure JSON (no crypto, no network):
+//   `integrated_time`  — `verificationMaterial.tlogEntries[0].integratedTime`
+//   `rekor_log_index`  — `verificationMaterial.tlogEntries[0].logIndex`
+//   `signer_san`       — `_milpa_claims.signer_san` (test/mock bundles)
+//   `oidc_issuer`      — `_milpa_claims.oidc_issuer` (test/mock bundles)
+//   `subject_sha256`   — `_milpa_claims.subject_sha256` (test/mock bundles)
+//
+// The `_milpa_claims` section is written into conformance fixture mock bundles
+// so all five fields are available without X.509 parsing.  Real Sigstore
+// bundles do NOT contain `_milpa_claims`; those fields appear as
+// `"(not available)"` in both impls until a dedicated X.509 extraction path
+// is added in a future slice.
+
+/// Observable claims extracted from a Sigstore bundle — pure JSON, no crypto.
+///
+/// Rust parity with Python `IndexBundleInfo` in `impls/python/milpa/index_trust.py`.
+#[derive(Debug, Clone)]
+pub struct IndexBundleInfo {
+    /// Rekor SET `integratedTime` (unix epoch seconds).
+    ///
+    /// Extracted from `verificationMaterial.tlogEntries[0].integratedTime`.
+    /// Used to compute the freshness/staleness of the cached bundle.
+    pub integrated_time: i64,
+
+    /// Rekor transparency-log entry index.
+    ///
+    /// Extracted from `verificationMaterial.tlogEntries[0].logIndex`.
+    /// `"(not available)"` when the field is absent.
+    pub rekor_log_index: String,
+
+    /// SHA-256 digest of the attested subject (index.kdl bytes).
+    ///
+    /// Extracted from `_milpa_claims.subject_sha256` in test/mock bundles.
+    /// `None` when the field is absent.
+    pub subject_sha256: Option<String>,
+
+    /// SubjectAltName from the signing certificate (signer IDENTITY).
+    ///
+    /// Extracted from `_milpa_claims.signer_san` in test/mock bundles.
+    /// `None` when the field is absent.
+    pub signer_san: Option<String>,
+
+    /// OIDC issuer from the signing certificate.
+    ///
+    /// Extracted from `_milpa_claims.oidc_issuer` in test/mock bundles.
+    /// `None` when the field is absent.
+    pub oidc_issuer: Option<String>,
+}
+
+/// Parse a Sigstore bundle JSON and extract observable claims.
+///
+/// Pure JSON extraction — no cryptographic operations, no network access.
+/// Returns `None` if the bytes are not parseable as a JSON object or if the
+/// mandatory `integratedTime` field is absent/invalid.
+///
+/// Rust parity with Python `describe_index_bundle` in `index_trust.py`.
+/// Both impls use the SAME JSON paths so `format_index_trust_info` produces
+/// byte-identical output for any given bundle bytes.
+pub fn describe_index_bundle(bundle_bytes: &[u8]) -> Option<IndexBundleInfo> {
+    let data: serde_json::Value = serde_json::from_slice(bundle_bytes).ok()?;
+    let obj = data.as_object()?;
+    let _ = obj; // confirm it's an object
+
+    // Extract integratedTime (mandatory — same logic as verify_index_bundle step 2).
+    // Proto3 JSON encodes int64 as a string; accept both string and native integer.
+    let integrated_time = extract_integrated_time(&data).and_then(|t| i64::try_from(t).ok())?;
+
+    // Extract logIndex (Rekor entry reference); normalise to plain integer string.
+    let rekor_log_index = {
+        let raw = &data["verificationMaterial"]["tlogEntries"][0]["logIndex"];
+        if let Some(s) = raw.as_str() {
+            // Normalise: parse as i64 and re-stringify to match Python's `str(int(raw_li))`.
+            s.parse::<i64>().map(|n| n.to_string()).unwrap_or_else(|_| s.to_string())
+        } else if let Some(n) = raw.as_i64() {
+            n.to_string()
+        } else {
+            "(not available)".to_string()
+        }
+    };
+
+    // Extract signer/issuer/subject from `_milpa_claims` (test/mock section).
+    let claims = &data["_milpa_claims"];
+    let signer_san = claims["signer_san"].as_str().map(|s| s.to_string());
+    let oidc_issuer = claims["oidc_issuer"].as_str().map(|s| s.to_string());
+    let subject_sha256 = claims["subject_sha256"].as_str().map(|s| s.to_string());
+
+    Some(IndexBundleInfo {
+        integrated_time,
+        rekor_log_index,
+        subject_sha256,
+        signer_san,
+        oidc_issuer,
+    })
+}
+
+/// Format the `milpa show --index-trust` observability output.
+///
+/// Produces a fixed-width label block where every label (including the colon)
+/// is exactly 16 characters so values align in a column.  This layout is
+/// byte-identical to the Python `format_index_trust_info` in `index_trust.py`.
+///
+/// Parameters:
+/// - `index_url`    — index URL from `MILPA_INDEX_URL` or the default.
+/// - `policy`       — effective index-trust policy string (`"warn"` / `"strict"` / `"off"`).
+/// - `index_cached` — whether the index file is present in the local cache.
+/// - `bundle_cached`— whether the Sigstore bundle sidecar is present.
+/// - `info`         — parsed claims, or `None` when no bundle is cached.
+/// - `now`          — current unix epoch seconds (injected for determinism).
+/// - `max_age`      — freshness window in seconds (default 604800 = 7 days).
+///
+/// Returns a `String` with a trailing newline; all line endings are `\n`.
+pub fn format_index_trust_info(
+    index_url: &str,
+    policy: &str,
+    index_cached: bool,
+    bundle_cached: bool,
+    info: Option<&IndexBundleInfo>,
+    now: i64,
+    max_age: u64,
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("index-url:      {index_url}"));
+    lines.push(format!("policy:         {policy}"));
+    lines.push(format!("index-cached:   {}", if index_cached { "yes" } else { "no" }));
+    lines.push(format!("bundle-cached:  {}", if bundle_cached { "yes" } else { "no" }));
+
+    if let Some(info) = info {
+        lines.push(format!(
+            "signer:         {}",
+            info.signer_san.as_deref().unwrap_or("(not available)")
+        ));
+        lines.push(format!(
+            "issuer:         {}",
+            info.oidc_issuer.as_deref().unwrap_or("(not available)")
+        ));
+        lines.push(format!("integrated:     {}", info.integrated_time));
+        lines.push(format!(
+            "subject-sha256: {}",
+            info.subject_sha256.as_deref().unwrap_or("(not available)")
+        ));
+        lines.push(format!("rekor-entry:    {}", info.rekor_log_index));
+        let age = now.saturating_sub(info.integrated_time);
+        let freshness = if (age as u64) < max_age { "fresh" } else { "stale" };
+        lines.push(format!("freshness:      {freshness}"));
+    }
+
+    lines.join("\n") + "\n"
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests — parity with Python S3
 // ---------------------------------------------------------------------------
 
@@ -959,5 +1118,239 @@ mod tests {
         let bundle = TrustBundle::test();
         assert_eq!(bundle.label, "test");
         assert!(!bundle.raw_json.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // describe_index_bundle — Rust parity with Python unit tests
+    // ---------------------------------------------------------------------------
+
+    const SIGNER_SAN: &str = "https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml@refs/heads/main";
+    const OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
+    const SUBJECT_SHA256: &str =
+        "abc123deadbeefabc123deadbeefabc123deadbeefabc123deadbeefabc12345";
+
+    fn mock_bundle_bytes() -> Vec<u8> {
+        serde_json::json!({
+            "verificationMaterial": {
+                "tlogEntries": [{"integratedTime": "1735000000", "logIndex": "98765432"}]
+            },
+            "_milpa_claims": {
+                "signer_san": SIGNER_SAN,
+                "oidc_issuer": OIDC_ISSUER,
+                "subject_sha256": SUBJECT_SHA256,
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn describe_full_mock_bundle() {
+        let info = describe_index_bundle(&mock_bundle_bytes()).expect("should parse");
+        assert_eq!(info.integrated_time, 1_735_000_000);
+        assert_eq!(info.rekor_log_index, "98765432");
+        assert_eq!(info.signer_san.as_deref(), Some(SIGNER_SAN));
+        assert_eq!(info.oidc_issuer.as_deref(), Some(OIDC_ISSUER));
+        assert_eq!(info.subject_sha256.as_deref(), Some(SUBJECT_SHA256));
+    }
+
+    #[test]
+    fn describe_integer_integrated_time() {
+        let bytes = serde_json::json!({
+            "verificationMaterial": {
+                "tlogEntries": [{"integratedTime": 1_735_000_000_i64, "logIndex": "42"}]
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let info = describe_index_bundle(&bytes).expect("should parse");
+        assert_eq!(info.integrated_time, 1_735_000_000);
+        assert_eq!(info.rekor_log_index, "42");
+    }
+
+    #[test]
+    fn describe_no_milpa_claims_fields_are_none() {
+        let bytes = serde_json::json!({
+            "verificationMaterial": {
+                "tlogEntries": [{"integratedTime": "1735000000", "logIndex": "1"}]
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let info = describe_index_bundle(&bytes).expect("should parse");
+        assert!(info.signer_san.is_none());
+        assert!(info.oidc_issuer.is_none());
+        assert!(info.subject_sha256.is_none());
+        assert_eq!(info.rekor_log_index, "1");
+    }
+
+    #[test]
+    fn describe_missing_log_index_shows_not_available() {
+        let bytes = serde_json::json!({
+            "verificationMaterial": {
+                "tlogEntries": [{"integratedTime": "1735000000"}]
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let info = describe_index_bundle(&bytes).expect("should parse");
+        assert_eq!(info.rekor_log_index, "(not available)");
+    }
+
+    #[test]
+    fn describe_not_json_returns_none() {
+        assert!(describe_index_bundle(b"not valid json!!!").is_none());
+    }
+
+    #[test]
+    fn describe_json_array_returns_none() {
+        assert!(describe_index_bundle(b"[\"not\", \"an\", \"object\"]").is_none());
+    }
+
+    #[test]
+    fn describe_missing_integrated_time_returns_none() {
+        let bytes = serde_json::json!({"verificationMaterial": {"tlogEntries": [{"logIndex": "1"}]}})
+            .to_string()
+            .into_bytes();
+        assert!(describe_index_bundle(&bytes).is_none());
+    }
+
+    #[test]
+    fn describe_empty_tlog_entries_returns_none() {
+        let bytes = serde_json::json!({"verificationMaterial": {"tlogEntries": []}})
+            .to_string()
+            .into_bytes();
+        assert!(describe_index_bundle(&bytes).is_none());
+    }
+
+    #[test]
+    fn describe_empty_bytes_returns_none() {
+        assert!(describe_index_bundle(b"").is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // format_index_trust_info — byte-identical to Python
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn format_no_bundle() {
+        let out = format_index_trust_info(
+            "https://example.com/index.kdl",
+            "warn",
+            false,
+            false,
+            None,
+            1_735_001_000,
+            604800,
+        );
+        assert_eq!(
+            out,
+            "index-url:      https://example.com/index.kdl\n\
+             policy:         warn\n\
+             index-cached:   no\n\
+             bundle-cached:  no\n"
+        );
+    }
+
+    #[test]
+    fn format_fresh_bundle() {
+        let info = IndexBundleInfo {
+            integrated_time: 1_735_000_000,
+            rekor_log_index: "98765432".to_string(),
+            subject_sha256: Some(SUBJECT_SHA256.to_string()),
+            signer_san: Some(SIGNER_SAN.to_string()),
+            oidc_issuer: Some(OIDC_ISSUER.to_string()),
+        };
+        let out = format_index_trust_info(
+            "https://mock.example.com/index.kdl",
+            "warn",
+            true,
+            true,
+            Some(&info),
+            1_735_001_000, // age = 1000 s < 604800
+            604800,
+        );
+        assert!(out.ends_with("freshness:      fresh\n"));
+        assert!(out.contains("policy:         warn\n"));
+        assert!(out.contains(&format!("signer:         {SIGNER_SAN}\n")));
+        assert!(out.contains("integrated:     1735000000\n"));
+        assert!(out.contains("rekor-entry:    98765432\n"));
+    }
+
+    #[test]
+    fn format_stale_bundle() {
+        let info = IndexBundleInfo {
+            integrated_time: 1_735_000_000,
+            rekor_log_index: "98765432".to_string(),
+            subject_sha256: Some(SUBJECT_SHA256.to_string()),
+            signer_san: Some(SIGNER_SAN.to_string()),
+            oidc_issuer: Some(OIDC_ISSUER.to_string()),
+        };
+        let out = format_index_trust_info(
+            "https://mock.example.com/index.kdl",
+            "strict",
+            true,
+            true,
+            Some(&info),
+            1_735_700_000, // age = 700000 s > 604800
+            604800,
+        );
+        assert!(out.ends_with("freshness:      stale\n"));
+        assert!(out.contains("policy:         strict\n"));
+    }
+
+    #[test]
+    fn format_not_available_fields() {
+        let info = IndexBundleInfo {
+            integrated_time: 1_735_000_000,
+            rekor_log_index: "99".to_string(),
+            subject_sha256: None,
+            signer_san: None,
+            oidc_issuer: None,
+        };
+        let out = format_index_trust_info(
+            "https://x.example.com/index.kdl",
+            "warn",
+            true,
+            true,
+            Some(&info),
+            1_735_001_000,
+            604800,
+        );
+        assert!(out.contains("signer:         (not available)\n"));
+        assert!(out.contains("issuer:         (not available)\n"));
+        assert!(out.contains("subject-sha256: (not available)\n"));
+    }
+
+    #[test]
+    fn format_label_alignment_all_lines_column_16() {
+        let info = IndexBundleInfo {
+            integrated_time: 1_735_000_000,
+            rekor_log_index: "98765432".to_string(),
+            subject_sha256: Some(SUBJECT_SHA256.to_string()),
+            signer_san: Some(SIGNER_SAN.to_string()),
+            oidc_issuer: Some(OIDC_ISSUER.to_string()),
+        };
+        let out = format_index_trust_info(
+            "https://mock.example.com/index.kdl",
+            "warn",
+            true,
+            true,
+            Some(&info),
+            1_735_001_000,
+            604800,
+        );
+        for line in out.trim_end_matches('\n').split('\n') {
+            assert!(
+                line.len() > 16,
+                "Line too short: {line:?}"
+            );
+            let bytes = line.as_bytes();
+            assert_eq!(
+                bytes[15], b' ',
+                "Column 16 alignment broken: {line:?}; char at index 15 is {:?}",
+                bytes[15] as char
+            );
+        }
     }
 }

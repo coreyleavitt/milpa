@@ -80,6 +80,9 @@ pub enum Produced {
     /// S7: a `cmd=index-trust` run that passed the `expected/outcome` assertion.
     /// The `outcome` field carries the computed outcome string for diagnostics.
     IndexTrustPass { outcome: String },
+    /// `show-index-trust`: passed the `expected/stdout` byte-compare assertion.
+    /// The `stdout` field carries the formatted output for diagnostics.
+    ShowIndexTrustPass { stdout: String },
 }
 
 /// The implementation under test. The `Err` payload is the error **code**
@@ -207,6 +210,9 @@ pub fn run_fixture(fx: &Fixture, target: &dyn Target, scratch: &Scratch) -> Verd
         // S7: index-trust policy state machine passed the expected/outcome assertion
         // (checked inside run_index_trust_fixture and returned as IndexTrustPass).
         (Expected::Success, Ok(Produced::IndexTrustPass { .. })) => Verdict::Pass,
+        // show-index-trust: observability fixture passed the expected/stdout assertion
+        // (checked inside run_show_index_trust_fixture and returned as ShowIndexTrustPass).
+        (Expected::Success, Ok(Produced::ShowIndexTrustPass { .. })) => Verdict::Pass,
     }
 }
 
@@ -992,6 +998,8 @@ impl Target for MilpaTarget {
             // S7: index-trust policy state machine (RFC registry-trust-federation §11 S7).
             // MockVerifier-driven; no real Sigstore infrastructure required.
             Cmd::IndexTrust => run_index_trust_fixture(fx),
+            // show-index-trust: observability (spec/cli-contract.md §5.3a).
+            Cmd::ShowIndexTrust => run_show_index_trust_fixture(fx),
         }
     }
 }
@@ -2535,6 +2543,85 @@ fn run_index_trust_fixture(fx: &Fixture) -> Result<Produced, String> {
     }
     Err(format!(
         "outcome mismatch:\n  expected: {expected_outcome:?}\n  actual:   {got_outcome:?}"
+    ))
+}
+
+/// Runner for `cmd=show-index-trust` fixtures (spec/cli-contract.md §5.3a).
+///
+/// The runner:
+/// 1. Reads `env` for `MILPA_INDEX_URL`, `MILPA_INDEX_TRUST_MANIFEST`,
+///    `MILPA_SHOW_NOW`, `MILPA_INDEX_MAX_AGE`.
+/// 2. Checks file presence for `<fixture>/index.kdl` and `<fixture>/index.kdl.bundle`.
+/// 3. If `index.kdl.bundle` is present, reads it and calls `describe_index_bundle`.
+/// 4. Calls `format_index_trust_info` with `now=MILPA_SHOW_NOW` (injected for determinism).
+/// 5. Byte-compares the result against `expected/stdout`.
+///
+/// No crypto, no network.  Output is byte-identical to the Python runner.
+fn run_show_index_trust_fixture(fx: &Fixture) -> Result<Produced, String> {
+    use milpa_core::index_trust::{describe_index_bundle, format_index_trust_info};
+
+    let dir = &fx.dir;
+    let env = fixture_env(dir);
+
+    // Index URL from env (mandatory — fixture must supply it).
+    let index_url = env
+        .get("MILPA_INDEX_URL")
+        .cloned()
+        .ok_or_else(|| "MILPA_INDEX_URL missing from fixture env".to_string())?;
+
+    // Effective policy: use MILPA_INDEX_TRUST_MANIFEST from env as the display
+    // policy string.  (The full `effective_trust_policy` calculation is not
+    // exercised here; the fixture env sets the direct policy value for observability.)
+    let policy_str = env
+        .get("MILPA_INDEX_TRUST_MANIFEST")
+        .cloned()
+        .unwrap_or_else(|| "warn".to_string());
+
+    // Injected timestamp for deterministic freshness calculation.
+    let now: i64 = env
+        .get("MILPA_SHOW_NOW")
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .ok_or_else(|| "MILPA_SHOW_NOW missing or invalid in fixture env".to_string())?;
+
+    let max_age: u64 = env
+        .get("MILPA_INDEX_MAX_AGE")
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(604800);
+
+    // File presence: index.kdl and index.kdl.bundle are stored in the fixture dir.
+    let index_file = dir.join("index.kdl");
+    let bundle_file = dir.join("index.kdl.bundle");
+    let index_cached = index_file.exists();
+    let bundle_cached = bundle_file.exists();
+
+    let info = if bundle_cached {
+        std::fs::read(&bundle_file)
+            .ok()
+            .and_then(|b| describe_index_bundle(&b))
+    } else {
+        None
+    };
+
+    let got_stdout = format_index_trust_info(
+        &index_url,
+        &policy_str,
+        index_cached,
+        bundle_cached,
+        info.as_ref(),
+        now,
+        max_age,
+    );
+
+    // Read expected/stdout and byte-compare.
+    let expected_path = dir.join("expected").join("stdout");
+    let expected_stdout = std::fs::read_to_string(&expected_path)
+        .map_err(|e| format!("cannot read expected/stdout: {e}"))?;
+
+    if got_stdout == expected_stdout {
+        return Ok(Produced::ShowIndexTrustPass { stdout: got_stdout });
+    }
+    Err(format!(
+        "stdout mismatch:\n--- expected ---\n{expected_stdout}--- actual ---\n{got_stdout}"
     ))
 }
 

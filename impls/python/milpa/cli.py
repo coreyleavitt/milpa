@@ -279,9 +279,20 @@ def _make_parser() -> argparse.ArgumentParser:
     _add_feature_args(sp_lock)
 
     # show
-    subparsers.add_parser(
+    sp_show = subparsers.add_parser(
         "show",
         help="print the resolved dep tree from milpa.lock",
+    )
+    sp_show.add_argument(
+        "--index-trust",
+        action="store_true",
+        default=False,
+        dest="index_trust",
+        help=(
+            "print index-trust observability: effective policy, cache state, "
+            "and bundle claims (no verification — claims only). "
+            "spec/cli-contract.md §5.3a."
+        ),
     )
 
     # verify
@@ -1328,6 +1339,88 @@ def _format_provenance(p: object) -> str:
     if isinstance(p, OciProvenanceRecord):
         return f"oci {p.registry}/{p.repository}@{p.digest[:15]}"
     return str(p)
+
+
+# ---------------------------------------------------------------------------
+# cmd_show_index_trust (show --index-trust)
+# ---------------------------------------------------------------------------
+
+
+def cmd_show_index_trust(project_dir: Path) -> int:
+    """Print index-trust observability: effective policy + cached bundle claims.
+
+    Reads the configured index URL, locates its cached index and bundle sidecars
+    (if any), and prints the observable claims in the fixed-width label format
+    defined by ``format_index_trust_info``.
+
+    This command describes CLAIMS ONLY — no cryptographic verification is
+    performed.  Verification is enforced at fetch/lock time; this command is
+    for human audit of what is cached.
+
+    spec/cli-contract.md §5.3a.
+    """
+    import os
+    import time
+
+    from milpa.index_cache import _bundle_path, _default_cache_dir, cache_path_for, index_url_from_env
+    from milpa.index_trust import describe_index_bundle, format_index_trust_info
+    from milpa.trust import TrustPolicy, effective_trust_policy
+
+    index_url = index_url_from_env()
+
+    # Compute effective policy: try to load manifest index-trust, then apply env.
+    # If the manifest cannot be loaded (e.g. not in a milpa project dir), fall back
+    # to the env-only policy.
+    manifest_policy: str = "warn"
+    try:
+        from milpa.manifest import ManifestDoc, discover_manifest
+        doc = discover_manifest(project_dir)
+        if isinstance(doc, ManifestDoc) and doc.manifest is not None:
+            mp = getattr(doc.manifest, "index_trust_policy", None)
+            if mp is not None:
+                manifest_policy = str(mp)
+        elif hasattr(doc, "root") and doc.root is not None:
+            mp = getattr(doc.root, "index_trust_policy", None)
+            if mp is not None:
+                manifest_policy = str(mp)
+    except Exception:
+        pass  # no manifest — use env default
+
+    env_trust = os.environ.get("MILPA_INDEX_TRUST")
+    policy = effective_trust_policy(manifest_policy, flag=False, env_override=env_trust)
+
+    cache_dir = _default_cache_dir()
+    cache_file = cache_path_for(index_url, cache_dir)
+    bundle_file = _bundle_path(cache_file)
+
+    index_cached = cache_file.is_file()
+    bundle_cached = bundle_file.is_file()
+
+    info = None
+    if bundle_cached:
+        try:
+            info = describe_index_bundle(bundle_file.read_bytes())
+        except OSError:
+            pass
+
+    now = int(time.time())
+    max_age_str = os.environ.get("MILPA_INDEX_MAX_AGE", "")
+    try:
+        max_age = int(max_age_str) if max_age_str.strip() else 604800
+    except ValueError:
+        max_age = 604800
+
+    output = format_index_trust_info(
+        index_url=index_url,
+        policy=str(policy),
+        index_cached=index_cached,
+        bundle_cached=bundle_cached,
+        info=info,
+        now=now,
+        max_age=max_age,
+    )
+    print(output, end="")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -3148,6 +3241,8 @@ def main(argv: list[str] | None = None) -> int:
                 all_features=_cli_all_features,
             )
         elif args.command == "show":
+            if getattr(args, "index_trust", False):
+                return cmd_show_index_trust(project_dir)
             return cmd_show(project_dir)
         elif args.command == "verify":
             return cmd_verify(

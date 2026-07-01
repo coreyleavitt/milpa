@@ -1,0 +1,4 @@
+index-url:      https://mock.example.com/index.kdl
+policy:         warn
+index-cached:   yes
+bundle-cached:  no

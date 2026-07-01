@@ -121,7 +121,15 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
     }
 
     match cli.verb.as_str() {
-        "show" => cmd_show(dir),
+        "show" => {
+            // `--index-trust` flag on `show`: describe cached bundle claims.
+            // spec/cli-contract.md §5.3a.
+            if cli.rest.iter().any(|a| a == "--index-trust") {
+                cmd_show_index_trust(dir)
+            } else {
+                cmd_show(dir)
+            }
+        }
         "verify" => cmd_verify(dir, cli.require_attested_metadata, cli.no_index),
         "clean" => cmd_clean(dir),
         "fetch" => cmd_fetch(dir, cli.strategy, cli.frozen, true, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest),
@@ -305,6 +313,70 @@ fn cmd_show(dir: &Path) -> Result<i32, MilpaError> {
             println!("  aliases     {}", sorted_aliases.join(", "));
         }
     }
+    Ok(0)
+}
+
+/// `milpa show --index-trust` — print index-trust observability to stdout.
+///
+/// Describes the effective index-trust policy and the cached bundle's CLAIMS
+/// (no cryptographic verification — claims only).  The output format is
+/// byte-identical to the Python implementation.
+///
+/// spec/cli-contract.md §5.3a.
+fn cmd_show_index_trust(_dir: &Path) -> Result<i32, MilpaError> {
+    use milpa_core::index_cache::{cache_path_for, index_url_from_env};
+    use milpa_core::index_trust::{describe_index_bundle, format_index_trust_info};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let index_url = index_url_from_env();
+
+    // Effective policy: read MILPA_INDEX_TRUST env (policy override).
+    // We don't load the manifest here (show --index-trust is a quick CLI command
+    // that must work even outside a milpa project dir).  The manifest-level policy
+    // is surfaced when the user provides MILPA_INDEX_TRUST_MANIFEST via env; for
+    // the real CLI the env var MILPA_INDEX_TRUST is the runtime policy override.
+    let policy_str = std::env::var("MILPA_INDEX_TRUST").unwrap_or_else(|_| "warn".to_string());
+
+    // Locate cached files: index + bundle sidecar.
+    let cache_dir = index_cache_dir();
+    let cache_file = cache_path_for(&index_url, &cache_dir);
+    let bundle_file = {
+        // bundle_path() in index_cache.rs appends ".bundle" to the cache file path.
+        let mut p = cache_file.as_os_str().to_os_string();
+        p.push(".bundle");
+        std::path::PathBuf::from(p)
+    };
+
+    let index_cached = cache_file.exists();
+    let bundle_cached = bundle_file.exists();
+
+    let info = if bundle_cached {
+        std::fs::read(&bundle_file)
+            .ok()
+            .and_then(|b| describe_index_bundle(&b))
+    } else {
+        None
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let max_age = std::env::var("MILPA_INDEX_MAX_AGE")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(604800);
+
+    let output = format_index_trust_info(
+        &index_url,
+        &policy_str,
+        index_cached,
+        bundle_cached,
+        info.as_ref(),
+        now,
+        max_age,
+    );
+    print!("{output}");
     Ok(0)
 }
 

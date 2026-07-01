@@ -1,0 +1,16 @@
+{
+  "mediaType": "application/vnd.dev.sigstore.bundle+json;version=0.3",
+  "verificationMaterial": {
+    "tlogEntries": [
+      {
+        "integratedTime": "1735000000",
+        "logIndex": "98765432"
+      }
+    ]
+  },
+  "_milpa_claims": {
+    "signer_san": "https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml@refs/heads/main",
+    "oidc_issuer": "https://token.actions.githubusercontent.com",
+    "subject_sha256": "abc123deadbeefabc123deadbeefabc123deadbeefabc123deadbeefabc12345"
+  }
+}

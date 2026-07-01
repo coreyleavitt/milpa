@@ -612,6 +612,88 @@ stdout. Does not resolve or fetch.
 > output (attributing each dep to its originating member) is tracked as a
 > future enhancement in issue #165.
 
+### 5.3a  `show --index-trust`
+
+**Purpose:** Print the effective index-trust policy and the observable claims
+from the locally-cached Sigstore bundle — no cryptographic verification, no
+network access. A pure observability/debugging tool.
+
+**Arguments:** `--index-trust` flag on the `show` subcommand.
+
+**Global flags used:** `-C` (ignored; the command reads the XDG/env-derived
+index cache, not a project directory).
+
+> NORMATIVE: `show --index-trust` MUST:
+> - Print the effective index-trust policy string (`warn`, `strict`, or `off`)
+>   as `policy:` in the output block.
+> - Report whether the index file and the Sigstore bundle sidecar are present
+>   in the local cache (`index-cached:` and `bundle-cached:` fields, `yes`/`no`).
+> - If and only if a bundle is cached and parseable as a JSON object with a
+>   valid `verificationMaterial.tlogEntries[0].integratedTime`, print the
+>   following additional fields: `signer:`, `issuer:`, `integrated:`,
+>   `subject-sha256:`, `rekor-entry:`, `freshness:`.
+> - MUST NOT print a cryptographic verification verdict (`verified ✓/✗`).
+>   Claims are printed as-is from JSON fields; verification is enforced at
+>   `fetch`/`lock` time, not by this command.
+> - Produce output that is byte-identical between all conformant implementations.
+
+> NORMATIVE: The output format uses a **fixed 16-character label+colon column**
+> so values align in a single column. Every label (including the trailing colon)
+> occupies exactly 16 characters. Trailing whitespace MUST NOT appear on any line.
+
+> NORMATIVE: The canonical field set and format:
+>
+> ```
+> index-url:      <url>
+> policy:         <warn|strict|off>
+> index-cached:   <yes|no>
+> bundle-cached:  <yes|no>
+> ```
+>
+> When a bundle is cached and parseable, the following additional fields are
+> appended in this order:
+>
+> ```
+> signer:         <SAN or (not available)>
+> issuer:         <OIDC issuer or (not available)>
+> integrated:     <unix epoch seconds>
+> subject-sha256: <hex digest or (not available)>
+> rekor-entry:    <log index integer or (not available)>
+> freshness:      <fresh|stale>
+> ```
+>
+> Freshness: `fresh` if `now - integrated_time < max_age_seconds`, else `stale`.
+> Default `max_age_seconds` is 604800 (7 days). Overridable via
+> `MILPA_INDEX_MAX_AGE` env var (integer seconds).
+
+> NOTE: `signer:`, `issuer:`, and `subject-sha256:` are extracted from the
+> `_milpa_claims` JSON section that the tianguis publishing workflow writes into
+> every conformance-fixture mock bundle. Real Sigstore bundles do NOT contain
+> this section (SAN and OIDC issuer are encoded in the DER certificate chain);
+> those fields show `(not available)` until a dedicated X.509 extraction path is
+> added (tracked as a future slice). The `integrated:` and `rekor-entry:` fields
+> are extracted from `verificationMaterial.tlogEntries[0]` and are available in
+> all real Sigstore bundles.
+
+**Conformance fixtures:** `fixture-356` (fresh bundle), `fixture-357` (stale
+bundle), `fixture-358` (index cached, no bundle).
+
+**Environment variables consumed:**
+- `MILPA_INDEX_URL` — index URL to report (defaults to the global default).
+- `MILPA_INDEX_TRUST_MANIFEST` — manifest-declared policy (used as the `policy:`
+  display value in fixtures; the live CLI derives the effective policy via the
+  full `effective_trust_policy` logic from §8.6).
+- `MILPA_INDEX_MAX_AGE` — freshness window in seconds (default 604800).
+- `MILPA_SHOW_NOW` — injected unix timestamp for deterministic freshness in
+  conformance fixtures (conformance runners MUST use this value when set;
+  production CLI uses `SystemTime::now()`).
+
+**Exit codes:** 0 always (even when bundle is absent or claims are unavailable).
+
+**stdout:** the fixed-format observability block (above).
+
+**stderr:** empty.
+
 ### 5.4  `verify`
 
 **Purpose:** Recheck every dep in `_deps/` against `milpa.lock` using

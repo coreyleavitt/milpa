@@ -69,6 +69,13 @@ pub enum Cmd {
     /// `"warn:TNG-INDEX-*"`, or `"error:TNG-INDEX-*"`).  No real Sigstore
     /// infrastructure is required (policy machine only; RFC §10.1).
     IndexTrust,
+    /// `show-index-trust`: observability fixture (spec/cli-contract.md §5.3a).
+    /// The runner reads `env` for `MILPA_INDEX_URL`, `MILPA_INDEX_TRUST_MANIFEST`,
+    /// `MILPA_SHOW_NOW`, and `MILPA_INDEX_MAX_AGE`, checks file presence for
+    /// `index.kdl` and `index.kdl.bundle`, calls `describe_index_bundle` +
+    /// `format_index_trust_info`, and byte-compares against `expected/stdout`.
+    /// No crypto, no network.  Byte-identical to Python runner.
+    ShowIndexTrust,
 }
 
 impl Cmd {
@@ -96,6 +103,8 @@ impl Cmd {
                     "dag-oracle" => Cmd::DagOracle,
                     // S7: index-trust policy state machine via MockVerifier.
                     "index-trust" => Cmd::IndexTrust,
+                    // show-index-trust: observability (spec/cli-contract.md §5.3a).
+                    "show-index-trust" => Cmd::ShowIndexTrust,
                     // Mutation (§2.7.1) + liveness (§2.7.2) selectors: CLI-only.
                     // check-certificate (§2.7.3): also CLI-only (--certificate flag).
                     // workspace (S10 D4): add-member/remove-member are CLI-only.

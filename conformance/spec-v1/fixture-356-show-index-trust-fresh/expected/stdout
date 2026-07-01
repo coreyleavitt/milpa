@@ -1,0 +1,10 @@
+index-url:      https://mock.example.com/index.kdl
+policy:         warn
+index-cached:   yes
+bundle-cached:  yes
+signer:         https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml@refs/heads/main
+issuer:         https://token.actions.githubusercontent.com
+integrated:     1735000000
+subject-sha256: abc123deadbeefabc123deadbeefabc123deadbeefabc123deadbeefabc12345
+rekor-entry:    98765432
+freshness:      fresh
