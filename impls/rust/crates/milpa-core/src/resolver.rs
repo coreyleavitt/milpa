@@ -4047,22 +4047,45 @@ fn res_err(code: &'static str, msg: String) -> MilpaError {
 }
 
 // ---------------------------------------------------------------------------
-// Attestation-policy SSOT helpers (Finding 1)
+// Trust-policy SSOT helpers (S1 — RFC rfc-registry-trust-federation)
 // ---------------------------------------------------------------------------
 
-/// Compute the effective strict attestation policy (S5, §13.1).
+/// Compute the effective trust policy for a single-package manifest axis
+/// (attestation-policy or, in later slices, index-trust).
 ///
-/// The rule is the logical OR of:
-///   - `manifest_policy == AttestationPolicy::Strict` (project-wide)
-///   - `flag` (CLI `--require-attested-metadata` / `MILPA_REQUIRE_ATTESTED_METADATA`)
+/// Authority model (RFC §6.6):
+/// - `Off` can ONLY be declared in the manifest; env/flag may only STRENGTHEN.
+/// - `env_override=Some(Off)` is a no-op floor — it cannot weaken manifest warn/strict.
+/// - `flag` (e.g. `--require-attested-metadata`) escalates the base to `Strict`.
 ///
-/// The flag CANNOT weaken a manifest-declared strict policy (OR semantics).
+/// For the attestation-policy axis the `env_override` is always `None` (the env
+/// input is a bool `--require-attested-metadata`/`MILPA_REQUIRE_ATTESTED_METADATA`
+/// captured in `flag`).  The `env_override` parameter is plumbed now so the
+/// index-trust axis (S5/S6) can reuse this function without a new SSOT split.
 ///
-/// This is the single source of truth for the effective-policy predicate.
-/// Mirrors `attestation.py::effective_strict_policy`.
-pub fn effective_strict_policy(manifest_policy: &milpa_manifest::AttestationPolicy, flag: bool) -> bool {
-    use milpa_manifest::AttestationPolicy;
-    *manifest_policy == AttestationPolicy::Strict || flag
+/// Mirrors `trust.py::effective_trust_policy`.
+pub fn effective_trust_policy(
+    manifest_policy: &milpa_manifest::TrustPolicy,
+    flag: bool,
+    env_override: Option<&milpa_manifest::TrustPolicy>,
+) -> milpa_manifest::TrustPolicy {
+    use milpa_manifest::TrustPolicy;
+    // Off is an auditable, project-only opt-out.  Env/flag cannot set or clear it.
+    if *manifest_policy == TrustPolicy::Off {
+        return TrustPolicy::Off;
+    }
+    // base = max(manifest, env) where Strict > Warn; env=Off is a no-op floor.
+    let base = match env_override {
+        Some(TrustPolicy::Strict) => TrustPolicy::Strict,
+        // env=Warn or env=Off cannot strengthen beyond what the manifest already says.
+        _ => manifest_policy.clone(),
+    };
+    // Flag can only escalate: Warn→Strict.
+    if flag {
+        TrustPolicy::Strict
+    } else {
+        base
+    }
 }
 
 /// Parse a truthy env-var value (D-F3 SSOT).
@@ -4082,17 +4105,17 @@ pub fn parse_env_bool(value: &str) -> bool {
 /// Combine with the CLI flag via OR:
 /// `workspace_any_member_strict(ws) || flag`.
 pub fn workspace_any_member_strict(workspace: &LoadedWorkspace) -> bool {
-    use milpa_manifest::AttestationPolicy;
+    use milpa_manifest::TrustPolicy;
     workspace
         .members
         .iter()
-        .any(|m| m.manifest.attestation_policy == AttestationPolicy::Strict)
+        .any(|m| m.manifest.attestation_policy == TrustPolicy::Strict)
 }
 
 /// S5: attestation-policy enforcement (spec/resolver-semantics.md §S5).
 ///
 /// Called once after `solve()` completes. Effective strict policy = logical OR of:
-///   - `manifest.attestation_policy == AttestationPolicy::Strict` (project-wide)
+///   - `manifest.attestation_policy == TrustPolicy::Strict` (project-wide)
 ///   - `require_attested_metadata` flag (CLI `--require-attested-metadata`)
 ///
 /// Non-strict: emit ONE summary warning to stderr for all NimbleFallback deps.
@@ -4106,8 +4129,9 @@ fn enforce_attestation_policy(
     manifest: &Manifest,
     require_attested_metadata: bool,
 ) -> Result<(), MilpaError> {
-    let is_strict = effective_strict_policy(&manifest.attestation_policy, require_attested_metadata);
-    enforce_attestation_policy_strict(provider, is_strict)
+    use milpa_manifest::TrustPolicy;
+    let policy = effective_trust_policy(&manifest.attestation_policy, require_attested_metadata, None);
+    enforce_attestation_policy_strict(provider, policy == TrustPolicy::Strict)
 }
 
 /// Core enforcement logic shared by single-package and workspace paths.
@@ -4144,7 +4168,7 @@ fn enforce_attestation_policy_strict(
             format!(
                 "strict attestation policy: {} dep(s) resolved from un-attested \
                  .nimble metadata: {}. Ensure all deps are indexed with a dep_decl \
-                 pointer, or relax 'attestation-policy' to 'permissive' in milpa.kdl.",
+                 pointer, or relax 'attestation-policy' to 'warn' in milpa.kdl.",
                 nimble_fallback_names.len(),
                 nimble_fallback_names
                     .iter()
@@ -4173,7 +4197,7 @@ fn enforce_attestation_policy_strict(
 ///
 /// `prior` enables §8 pin reuse; `dep_decl_store` drives S3b DepDecl; `require_attested_metadata`
 /// is the CLI/env strict-attestation flag (combined with the manifest policy via
-/// `effective_strict_policy` — §13.1 OR rule).
+/// `effective_trust_policy` — §13.1 OR rule).
 struct ProviderOpts<'a> {
     prior: Option<&'a Lockfile>,
     dep_decl_store: Option<&'a dyn crate::dep_decl_store::DepDeclStore>,
@@ -4194,7 +4218,7 @@ struct ProviderOpts<'a> {
 ///
 /// SSOT notes:
 ///   - All three inline OR expressions (`resolve`, `resolve_with_cert`,
-///     `enforce_attestation_policy`) are now replaced by `effective_strict_policy`.
+///     `enforce_attestation_policy`) are now replaced by `effective_trust_policy`.
 ///   - The `overrides` collection, named-dep/no-index check, `create_dir_all`,
 ///     strict computation, and `ResolveProvider::new` live here exactly once.
 fn build_single_provider<'a>(
@@ -4239,11 +4263,12 @@ fn build_single_provider<'a>(
 
     std::fs::create_dir_all(deps_dir).map_err(io_err)?;
 
-    // S5: effective strict policy is the SSOT OR of manifest policy and the
-    // CLI flag (resolver-semantics §13.1; OR semantics — flag cannot weaken
-    // manifest-strict).
+    // S5: effective strict policy is the SSOT result of manifest policy and the
+    // CLI flag (resolver-semantics §13.1; flag can only strengthen, never weaken).
+    use milpa_manifest::TrustPolicy;
     let strict_attestation =
-        effective_strict_policy(&manifest.attestation_policy, require_attested_metadata);
+        effective_trust_policy(&manifest.attestation_policy, require_attested_metadata, None)
+        == TrustPolicy::Strict;
 
     let provider = ResolveProvider::new(
         fetcher,

@@ -1,8 +1,9 @@
-"""Attestation-policy helpers — S5 (RFC: Content-Addressed Attested Dependency Metadata).
+"""Attestation-policy enforcement — S5 (RFC: Content-Addressed Attested Dependency Metadata).
 
 Spec authority: spec/resolver-semantics.md §S5; docs/rfc-content-addressed-metadata.md §9.
 
-The effective strict policy is the logical OR of:
+Policy computation (the normative OR rule) lives in ``trust.effective_trust_policy``
+(RFC: registry-trust-federation §6.6 S1 SSOT unification):
   - the manifest ``attestation-policy "strict"`` field (committed, project default)
   - the ``--require-attested-metadata`` CLI flag (CI, where the manifest can't be edited)
 
@@ -12,7 +13,7 @@ The flag MUST NOT weaken a manifest-declared strict policy (OR semantics):
 
 Post-resolve enforcement (called at the end of ``resolve()``):
 
-Non-strict (default):
+Non-strict / warn (default):
   If any resolved dep used ``EdgeSource.NIMBLE_FALLBACK``, emit a SINGLE summary
   warning to stderr enumerating those dep names.
 
@@ -41,38 +42,7 @@ from milpa.errors import RES_UNATTESTED_METADATA, MilpaError
 
 if TYPE_CHECKING:
     from milpa.dep_decl import EdgeSet
-    from milpa.manifest import AttestationPolicy, Manifest
-
-
-# ---------------------------------------------------------------------------
-# Effective-policy computation (the normative OR rule)
-# ---------------------------------------------------------------------------
-
-
-def effective_strict_policy(
-    manifest_policy: "AttestationPolicy",
-    flag: bool,
-) -> bool:
-    """Compute the effective strict policy.
-
-    Returns ``True`` (strict) iff EITHER source says strict.
-    The flag CANNOT weaken a manifest-declared strict policy.
-
-    Parameters
-    ----------
-    manifest_policy:
-        The ``attestation-policy`` field from the root manifest
-        (``"permissive"`` or ``"strict"``).
-    flag:
-        ``True`` when ``--require-attested-metadata`` was passed on the CLI.
-
-    Returns
-    -------
-    bool
-        ``True`` if effective policy is strict; ``False`` if permissive.
-    """
-    # OR semantics: strict if either source says strict.
-    return manifest_policy == "strict" or flag
+    from milpa.manifest import Manifest
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +112,7 @@ def enforce_attestation_policy(
                 f"strict attestation policy: {len(nimble_fallback_names)} dep(s) "
                 f"resolved from un-attested .nimble metadata: {names_str}. "
                 f"Ensure all deps are indexed with a dep_decl pointer, or relax "
-                f"'attestation-policy' to 'permissive' in milpa.kdl.",
+                f"'attestation-policy' to 'warn' in milpa.kdl.",
                 names=nimble_fallback_names,
             )
     else:

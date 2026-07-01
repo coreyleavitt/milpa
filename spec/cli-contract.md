@@ -64,13 +64,19 @@ A conformant implementation of this spec MUST:
     `MILPA_CLI_FEATURES`, `MILPA_NO_DEFAULT_FEATURES`, and `MILPA_ALL_FEATURES`
     as the corresponding environment-variable forms used by the conformance
     harness.
+17. Accept `--require-attested-index` as a global flag; escalates the effective
+    `index-trust` policy from `warn` to `strict`; MUST NOT set or clear `off`
+    (§2.8, `spec/registry-protocol.md §3.4.5`). Also honour `MILPA_INDEX_TRUST`
+    as the environment-variable form of the index-trust policy (§8.6).
+18. Accept `--refresh-index` as a global flag; forces a fresh index and bundle
+    fetch, bypassing the cache TTL (§2.9, §8.6).
 
 ---
 
 ## 1  Invocation form
 
 ```
-milpa [--version] [-C <dir>] [-j <N>] [-s <mode>] [--frozen] [--certificate <path>] [--require-attested-metadata] <verb> [<verb-args>]
+milpa [--version] [-C <dir>] [-j <N>] [-s <mode>] [--frozen] [--certificate <path>] [--require-attested-metadata] [--require-attested-index] [--refresh-index] <verb> [<verb-args>]
 ```
 
 > NORMATIVE: The implementation MUST support the short flag `-C` (and
@@ -349,6 +355,46 @@ during resolution (RFC #23 §3.4). They apply to `fetch`, `lock`, and `update`.
 > (non-empty non-false value), and `MILPA_ALL_FEATURES` (non-empty non-false
 > value) are the corresponding environment-variable forms, used by the
 > conformance harness to drive these flags via the fixture `env` file.
+
+### 2.8  `--require-attested-index`
+
+> NORMATIVE: When `--require-attested-index` is given, the effective
+> `index-trust` policy (see `spec/registry-protocol.md §3.4.5`) is escalated
+> from `warn` to `strict` for the duration of the invocation. This flag MAY
+> ONLY strengthen the policy (warn→strict). It MUST NOT set or clear `off`.
+> When the manifest declares `index-trust "off"`, the flag has no effect —
+> `off` is a positive, auditable opt-out that only the committed manifest can
+> declare (§3.4.5 effective-policy rule 1).
+
+> NORMATIVE: `--require-attested-index` MUST NOT interfere with or imply
+> `--require-attested-metadata` (§15, §8.5). These are DISTINCT flags governing
+> DISTINCT policy axes: `--require-attested-index` governs whole-index Sigstore
+> verification; `--require-attested-metadata` governs per-dep DepDecl attestation.
+> Setting one has no effect on the other.
+
+> NOTE: This flag is the CLI companion to `MILPA_INDEX_TRUST=strict` (§8.6).
+> The difference: the env var persists across all invocations in a shell session;
+> the flag applies only to one invocation. Both respect the authority model —
+> neither can override a manifest `off`.
+
+### 2.9  `--refresh-index`
+
+> NORMATIVE: When `--refresh-index` is given, the implementation MUST bypass
+> the index cache TTL and perform a fresh network fetch of both the index and
+> its bundle sidecar, regardless of the cached file's age. The fresh
+> (index, bundle) pair MUST be verified (per `spec/registry-protocol.md §3.4.4`)
+> and, on success, cached as normal. The flag is idempotent — applying it when
+> the cache is already fresh has no observable effect beyond the network fetch.
+
+> NORMATIVE: `--refresh-index` is the documented remediation step after a
+> pre-RFC cache warm (no bundle sidecar exists). A warm cache lacking a bundle
+> sidecar triggers `TNG-INDEX-BUNDLE-MISSING` under `warn` policy; running
+> `milpa fetch --refresh-index` forces re-fetch with bundle acquisition and
+> produces the `.index.kdl.bundle` sidecar for future cache reads.
+
+> NOTE: `--refresh-index` does NOT change the trust policy; it only bypasses the
+> cache TTL. Under `strict` policy, if the freshly fetched bundle fails
+> verification, the resolve still fails as normal.
 
 ---
 
@@ -1383,6 +1429,91 @@ in-process fetcher that a per-impl test adapter would otherwise inject.
 > `env` file via `fixture_require_attested_metadata()` and pass it to `resolve()`
 > directly, so there is one code path for both the CLI and the conformance runner.
 
+### 8.6  Index attestation trust (normative)
+
+These five variables control whole-index Sigstore verification (see
+`spec/registry-protocol.md §3.4`). All five are normative — conformant
+implementations MUST honour them. They are distinct from the dep-metadata
+attestation axis governed by §8.5 (`MILPA_REQUIRE_ATTESTED_METADATA`); these
+two axes govern different concerns and MUST NOT be conflated.
+
+#### `MILPA_INDEX_TRUST`
+
+> NORMATIVE: Sets the `index-trust` policy for the invocation. Accepted values:
+> `warn` (default), `strict`, `off`.
+>
+> When unset, the effective policy is derived from the manifest `index-trust`
+> field and the `--require-attested-index` flag per
+> `spec/registry-protocol.md §3.4.5`.
+>
+> `MILPA_INDEX_TRUST=off` is a **no-op floor**: it CANNOT weaken a manifest
+> `warn` or `strict` policy. Only a manifest `index-trust "off"` declaration
+> (committed to version control) can disable the gate. Setting `off` in the
+> environment has no effect when the manifest declares `warn` or `strict`.
+>
+> `MILPA_INDEX_TRUST=strict` or `=warn` MAY strengthen the effective policy
+> (env `strict` beats manifest `warn`); they CANNOT override a manifest `off`.
+
+> NOTE: This is the distinct env-var sibling of `MILPA_REQUIRE_ATTESTED_METADATA`
+> (§8.5). The naming confirms they are separate axes: `MILPA_INDEX_TRUST` governs
+> whole-index Sigstore verification; `MILPA_REQUIRE_ATTESTED_METADATA` governs
+> per-dep DepDecl attestation. No collision exists.
+
+#### `MILPA_INDEX_TRUST_SIGNER`
+
+> NORMATIVE: When set to a non-empty value, overrides the expected signer
+> IDENTITY for whole-index attestation. The value MUST be a GitHub Actions OIDC
+> workflow URL or other SubjectAltName string expected in the signing certificate
+> (e.g. `https://github.com/myorg/myregistry/.github/workflows/reindex.yaml@refs/heads/main`).
+>
+> This variable overrides the signer IDENTITY only. It MUST NOT be used for
+> trust-bundle (CA root) overrides — use `MILPA_INDEX_TRUST_BUNDLE` for that.
+> `MILPA_INDEX_TRUST_SIGNER` MUST NOT accept a `file://` path.
+>
+> Use this variable (or the `index-trust-signer` manifest node) to configure
+> the expected signer when running a private registry at a custom
+> `MILPA_INDEX_URL`. When `MILPA_INDEX_URL` is non-default and no signer
+> override is configured, `warn` policy emits a `TNG-INDEX-SIGNER-MISMATCH`
+> warning; `strict` fails.
+
+#### `MILPA_INDEX_TRUST_BUNDLE`
+
+> NORMATIVE: When set to a `file://` path, overrides the embedded Fulcio CA
+> root and Rekor public key bundle used for whole-index verification. The value
+> MUST be a `file://` URL pointing to a valid Sigstore trust bundle JSON file.
+> Values that are not `file://` paths MUST be rejected.
+>
+> This variable overrides the trust ROOT (Fulcio CA + Rekor public key). It is
+> ORTHOGONAL to `MILPA_INDEX_TRUST_SIGNER` — changing one does not imply the
+> other. Required for private Sigstore instances (e.g. a self-hosted Fulcio +
+> Rekor deployment serving a private registry).
+
+#### `MILPA_INDEX_MAX_AGE`
+
+> NORMATIVE: Sets the freshness window for the whole-index bundle verification,
+> in seconds. Default: `604800` (7 days).
+>
+> This bound is asserted as `now - SET.integratedTime < MILPA_INDEX_MAX_AGE` at
+> network-fetch time ONLY (State 2 and recovery re-fetches, per §6 of
+> `spec/registry-protocol.md`). It is NOT asserted on pure cache reads (States 1
+> and 3), preserving offline / air-gapped use.
+>
+> `integratedTime` is embedded in the bundle; no live Rekor network query is
+> needed for this check. Lowering the value tightens rollback-attack protection
+> at the cost of more frequent network access. The 7-day default is a
+> deployment-smoothness tradeoff.
+
+#### `MILPA_INDEX_BUNDLE_URL`
+
+> NORMATIVE: When set to a non-empty URL, overrides the normatively derived
+> bundle URL (`spec/registry-protocol.md §3.4.2`) for the current index URL.
+> Use this when the bundle is served from a separate host or when the path-suffix
+> derivation is not viable (e.g. when the index URL has an unusual path structure
+> incompatible with `.bundle` appending).
+>
+> Supports the same URL schemes as `MILPA_INDEX_URL`: HTTPS, HTTP, and
+> `file://`. When set, the derivation algorithm in §3.4.2 is bypassed entirely.
+
 ---
 
 ## 9  `--version`
@@ -1451,6 +1582,11 @@ implementation-specific and not frozen by this spec.
 | `MILPA_CACHE_DIR`                 | YES       | CAS root                      | `$XDG_CACHE_HOME/milpa/cas`                     |
 | `MILPA_MOCKED_FETCHES`            | YES       | fetch transport (conformance) | (none; real transport used)                      |
 | `MILPA_DEP_DECL_DIR`              | YES       | DepDecl store (conformance)   | (none; `HttpDepDeclStore` used)                  |
+| `MILPA_INDEX_TRUST`               | YES       | index attestation policy      | `warn`                                           |
+| `MILPA_INDEX_TRUST_SIGNER`        | YES       | expected signer identity      | (pinned tianguis vendor-bot OIDC SAN; §8.6)      |
+| `MILPA_INDEX_TRUST_BUNDLE`        | YES       | Fulcio CA + Rekor key bundle  | (embedded production trust bundle; §8.6)         |
+| `MILPA_INDEX_MAX_AGE`             | YES       | bundle freshness window (sec) | `604800` (7 days; §8.6)                          |
+| `MILPA_INDEX_BUNDLE_URL`          | YES       | Sigstore bundle URL override  | (derived from `MILPA_INDEX_URL`; §8.6)           |
 | `XDG_CACHE_HOME`                  | NO        | CAS + index cache base        | `~/.cache`                                       |
 | `ACTIONS_ID_TOKEN_REQUEST_TOKEN`  | NO        | `publish` OIDC (out-of-scope) | —                                                |
 | `ACTIONS_ID_TOKEN_REQUEST_URL`    | NO        | `publish` OIDC (out-of-scope) | —                                                |

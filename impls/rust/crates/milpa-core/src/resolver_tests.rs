@@ -249,7 +249,10 @@ fn manifest_full(deps: Vec<Dep>, dev_deps: Vec<Dep>, overrides: Vec<Override>) -
         cas_dir: String::new(),
         spec_version: 1,
         spec_version_explicit: false,
-        attestation_policy: milpa_manifest::AttestationPolicy::Permissive,
+        attestation_policy: milpa_manifest::TrustPolicy::Warn,
+        index_trust_policy: milpa_manifest::TrustPolicy::Warn,
+        index_trust_signer: None,
+        index_trust_bundle: None,
         optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }
@@ -2340,7 +2343,10 @@ fn manifest_with_flags(name: &str, flags: Vec<milpa_manifest::FlagDecl>) -> milp
         cas_dir: String::new(),
         spec_version: 1,
         spec_version_explicit: false,
-        attestation_policy: milpa_manifest::AttestationPolicy::Permissive,
+        attestation_policy: milpa_manifest::TrustPolicy::Warn,
+        index_trust_policy: milpa_manifest::TrustPolicy::Warn,
+        index_trust_signer: None,
+        index_trust_bundle: None,
         optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }

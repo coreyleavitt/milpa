@@ -1,0 +1,3 @@
+MILPA_INDEX_TRUST_MANIFEST=warn
+MILPA_REQUIRE_ATTESTED_INDEX=1
+mock_verifier_result=trusted

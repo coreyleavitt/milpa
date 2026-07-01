@@ -1,4 +1,4 @@
-"""tianguis index acquisition — four-state freshness cache (S8b).
+"""tianguis index acquisition — four-state freshness cache + bundle verification (S5).
 
 Mirrors ``impls/rust/crates/milpa-core/src/index_cache.rs``.
 
@@ -6,32 +6,43 @@ The HTTP transport and clock are injected (``HttpGet`` / ``now_unix``) so all
 four cache states are unit-testable without a network or a real wall-clock.
 Production callers pass ``urllib_http_get`` and ``time.time`` (cast to ``int``).
 
-Four states (registry-protocol §6 NORMATIVE):
-  1. **Fresh cache** (age < TTL) → serve cached bytes, no network.
-  2. **Stale cache** (age ≥ TTL) → re-fetch, overwrite, serve fresh bytes.
-  3. **Network failure with stale-but-present cache** → serve the stale cache
-     as an offline fallback; emit a warning to stderr that MUST NOT contain
-     a ``milpa-error:`` line (R3 requirement).
+Four states (registry-protocol §6 NORMATIVE; RFC registry-trust-federation §7.2):
+  1. **Fresh cache** (age < TTL) → serve cached bytes + bundle sidecar, no network.
+     Crypto-verified on EVERY read; freshness NOT re-asserted on pure cache reads
+     (offline/air-gapped safety — RFC §4 step 6).
+  2. **Stale cache** (age ≥ TTL) → re-fetch index + bundle, overwrite, serve fresh.
+     Crypto-verified AND freshness asserted (network-fetch path).
+  3. **Network failure with stale-but-present cache** → serve the stale cache as
+     an offline fallback; emit a warning.  Crypto-verified; freshness NOT asserted.
   4. **Network failure with no cache** → raise ``MILPA-INDEX-UNREACHABLE``.
+
+Bundle sidecar files (RFC §7.2):
+  ``<key>.index.kdl``         ← index content
+  ``<key>.index.kdl.at``      ← fetch-time stamp
+  ``<key>.index.kdl.bundle``  ← Sigstore bundle (NEW S5)
+  ``<key>.index.kdl.no-bundle`` ← degraded marker (warn only; bundle 404)
+
+Crash recovery (RFC §7.2 — bounded):
+  On a cache READ, a digest-mismatch or missing bundle sidecar → delete both
+  sidecars + refetch ONCE.  If the refetch ALSO fails verification → hard-fail
+  regardless of policy (active-adversary signal).
 
 ``MILPA_INDEX_URL``, when set to a non-empty string, overrides the default
 index URL for every index-fetching operation in that invocation.  Supports
 the ``file://`` scheme so air-gapped / harness deployments can substitute a
 private or local index (``cli-contract.md`` §8.1 NORMATIVE).
 
-Cache writes are atomic: write to a sibling ``.tmp`` file, then
-``os.replace()`` (POSIX ``rename(2)``).  Concurrent readers never observe a
-partial write.
+Cache writes are atomic: write bundle sidecar first, then atomic-rename index
+file.  Concurrent readers that observe a half-written pair trigger crash-recovery
+(digest mismatch → single bounded refetch), which is safe and self-correcting.
 
-The cache lives outside the project directory (under ``$XDG_CACHE_HOME/milpa/
-index/`` by default).  ``milpa clean`` MUST NOT remove the index cache — it is
-the registry, not project state (registry-protocol §6 NORMATIVE).
-
-Spec authority: ``spec/registry-protocol.md`` §6; ``spec/cli-contract.md`` §8.
+Spec authority: ``spec/registry-protocol.md`` §6; ``spec/cli-contract.md`` §8;
+``docs/rfc-registry-trust-federation.md`` §4, §6.5, §7.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import sys
@@ -40,10 +51,12 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse, urlunparse
 
 from milpa.errors import MILPA_INDEX_UNREACHABLE, MilpaError
 
 if TYPE_CHECKING:
+    from milpa.index_trust import IndexBundleVerifier, IndexTrustConfig
     from milpa.registry import Index
 
 # ---------------------------------------------------------------------------
@@ -61,17 +74,27 @@ DEFAULT_INDEX_URL: str = (
 #: invocation, short enough that the vendor-en-absentia daily pass is visible.
 DEFAULT_TTL_SECONDS: int = 24 * 60 * 60
 
+# Sentinel for bundle HTTP get: raised to signal a 404 (bundle not found).
+_BUNDLE_404_SENTINEL = "BUNDLE-404"
+
 # ---------------------------------------------------------------------------
-# HttpGet type
+# Transport types
 # ---------------------------------------------------------------------------
 
-#: A fetch transport: maps a URL string to body text, or raises a ``str`` on
-#: failure.  Injected so tests drive cache states without a network.
-#:
-#: Signature: ``(url: str) -> str``
-#: On error: raise ``Exception`` (any subclass); the message is used for
-#: the ``MILPA-INDEX-UNREACHABLE`` error message.
-HttpGet = Callable[[str], str]
+#: A fetch transport for the index: maps a URL string to body bytes, or raises.
+#: Signature: ``(url: str) -> bytes``
+#: On error: raise ``Exception`` (any subclass).
+HttpGet = Callable[[str], bytes]
+
+#: A fetch transport for the bundle sidecar: maps a URL string to body bytes,
+#: or raises on network error.  Raise ``_BundleNotFound`` on HTTP 404.
+#: Injected separately from ``http_get`` so each can be faked independently in tests.
+BundleHttpGet = Callable[[str], bytes]
+
+
+class _BundleNotFound(Exception):
+    """Raised by ``bundle_http_get`` when the bundle URL returns HTTP 404."""
+
 
 # ---------------------------------------------------------------------------
 # URL helpers
@@ -104,6 +127,25 @@ def _default_cache_dir() -> Path:
     return base / "milpa" / "index"
 
 
+def derive_bundle_url(index_url: str) -> str:
+    """Derive the bundle sidecar URL from the index URL (RFC §7.3 NORMATIVE).
+
+    Derivation: strip query string and fragment from ``index_url``; append
+    ``.bundle`` to the URL PATH; then reattach the original query string and
+    fragment.  Naive string suffixing breaks ``?ref=main`` and trailing-slash
+    URLs (e.g. ``https://host/index.kdl?ref=main.bundle`` is wrong).
+
+    Example (default index URL):
+        ``https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl``
+        → ``https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl.bundle``
+    """
+    parsed = urlparse(index_url)
+    # Append .bundle to the path component only.
+    new_path = parsed.path + ".bundle"
+    # Reattach query and fragment (if any).
+    return urlunparse(parsed._replace(path=new_path))
+
+
 # ---------------------------------------------------------------------------
 # Cache path + stamp helpers
 # ---------------------------------------------------------------------------
@@ -126,6 +168,16 @@ def _stamp_path(cache_file: Path) -> Path:
     return cache_file.with_suffix(".kdl.at")
 
 
+def _bundle_path(cache_file: Path) -> Path:
+    """Sidecar Sigstore bundle: ``<cache_file>.bundle`` (RFC §7.2 naming)."""
+    return Path(str(cache_file) + ".bundle")
+
+
+def _no_bundle_marker_path(cache_file: Path) -> Path:
+    """Degraded-marker sidecar (warn only): ``<cache_file>.no-bundle`` (RFC §7.2)."""
+    return Path(str(cache_file) + ".no-bundle")
+
+
 def _read_stamp(stamp_file: Path) -> int | None:
     """Read a sidecar stamp file and return its unix-second value, or ``None``."""
     try:
@@ -137,14 +189,62 @@ def _read_stamp(stamp_file: Path) -> int | None:
 
 def _write_stamp(stamp_file: Path, now_unix: int) -> None:
     """Write the fetch time (unix seconds) to the sidecar stamp file."""
-    import contextlib
-
     with contextlib.suppress(OSError):
         stamp_file.write_text(str(now_unix))  # non-fatal: worst case the next invocation re-fetches
 
 
 # ---------------------------------------------------------------------------
-# load_index — main entry point
+# Bundle verification helpers
+# ---------------------------------------------------------------------------
+
+
+def _verify_and_enforce(
+    index_bytes: bytes,
+    bundle_bytes: bytes | None,
+    config: "IndexTrustConfig",
+    verifier: "IndexBundleVerifier",
+    index_url: str,
+    is_network_fetch: bool,
+) -> None:
+    """Verify the bundle against index_bytes and enforce the configured policy.
+
+    Args:
+        index_bytes: Raw bytes of the index (single-read invariant — the same
+            object MUST be passed to parse_index; no second disk read between
+            verification and parsing).
+        bundle_bytes: Raw bytes of the Sigstore bundle sidecar, or ``None``
+            when the bundle is absent (bundle-404 or missing sidecar).
+        config: IndexTrustConfig carrying policy, trust_bundle, expected_signer,
+            max_age_seconds.
+        verifier: Injected IndexBundleVerifier (SigstoreVerifier in production;
+            MockVerifier in tests).
+        index_url: The index URL being loaded (for warn dedup key and error msgs).
+        is_network_fetch: True on network-fetch paths (States 2 + recovery
+            refetch) — freshness assertion fires.  False on pure cache reads
+            (States 1 and 3) — freshness NOT asserted (offline safety).
+    """
+    from milpa.index_trust import BundleMissing, enforce_index_trust, verify_index_bundle
+
+    if config.policy == "off":
+        return
+
+    if bundle_bytes is None:
+        result = BundleMissing
+    else:
+        max_age = config.max_age_seconds if is_network_fetch else None
+        result = verifier.verify(
+            index_bytes=index_bytes,
+            bundle_bytes=bundle_bytes,
+            trust_bundle=config.trust_bundle,
+            expected_signer=config.expected_signer,
+            max_age_seconds=max_age,
+        )
+
+    enforce_index_trust(result, config.policy, index_url)
+
+
+# ---------------------------------------------------------------------------
+# load_index — main entry point (S5: new signature with trust gate)
 # ---------------------------------------------------------------------------
 
 
@@ -154,21 +254,42 @@ def load_index(
     http_get: HttpGet,
     ttl_seconds: int,
     now_unix: int,
-) -> Index:
+    # S5 additions — trust gate seam:
+    config: "IndexTrustConfig | None" = None,
+    verifier: "IndexBundleVerifier | None" = None,
+    bundle_http_get: "BundleHttpGet | None" = None,
+    refresh: bool = False,
+) -> "Index":
     """Fetch + cache + parse the ``index.kdl`` at *url*.
+
+    S5 trust gate: when ``config`` is provided (not None), the Sigstore
+    bundle is fetched/cached and verified BEFORE parsing.  The single-read
+    invariant is maintained: the same ``index_bytes`` object is passed to
+    both ``verifier.verify`` and ``parse_index`` — no second disk read.
 
     Arguments:
         url:         Index URL to fetch.  Supports ``http://``, ``https://``,
                      and ``file://`` schemes.
         cache_dir:   Directory where the cached ``*.index.kdl`` and sidecar
-                     ``*.index.kdl.at`` files are stored.
-        http_get:    Injected transport.  Receives the URL, returns the body
-                     text.  On failure raises any ``Exception``; the message
-                     is used in the ``MILPA-INDEX-UNREACHABLE`` error.
+                     ``*.index.kdl.at``, ``*.index.kdl.bundle`` files are stored.
+        http_get:    Injected transport for index bytes.  Receives the URL,
+                     returns raw bytes.  On failure raises any ``Exception``.
         ttl_seconds: Cache TTL in seconds.  Pass ``DEFAULT_TTL_SECONDS`` for
                      the normative 24h value.
         now_unix:    Current time (unix seconds).  Injected for test
                      determinism; production callers pass ``int(time.time())``.
+        config:      ``IndexTrustConfig`` carrying policy + trust_bundle +
+                     expected_signer + max_age_seconds.  ``None`` disables the
+                     trust gate (legacy callers / ``--no-index`` path).
+        verifier:    ``IndexBundleVerifier`` implementation.  REQUIRED when
+                     ``config`` is not None.  ``SigstoreVerifier()`` in
+                     production; ``MockVerifier(result)`` in tests.
+        bundle_http_get:
+                     Injected transport for bundle bytes (separate from
+                     ``http_get`` so per-URL mock state is independent).
+                     Returns raw bytes; raises ``_BundleNotFound`` on 404.
+        refresh:     When True, bypass cache TTL and force a fresh index+bundle
+                     fetch (``--refresh-index``).
 
     Returns:
         Parsed ``Index``.
@@ -176,35 +297,82 @@ def load_index(
     Raises:
         ``MilpaError(MILPA_INDEX_UNREACHABLE)`` — network failure with no
         usable cache (state 4).
-        Any ``MilpaError(TNG-*)`` raised by ``parse_index`` — these propagate
-        unchanged.
+        ``MilpaError(TNG-INDEX-*)`` — trust gate failure under strict policy.
+        Any ``MilpaError(TNG-*)`` raised by ``parse_index`` — propagate unchanged.
     """
     from milpa.registry import parse_index  # local import to avoid circular at module level
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_path_for(url, cache_dir)
     stamp_file = _stamp_path(cache_file)
+    bundle_file = _bundle_path(cache_file)
+    no_bundle_marker = _no_bundle_marker_path(cache_file)
+
+    # Determine whether the trust gate is active.
+    trust_active = config is not None and verifier is not None
 
     # -------------------------------------------------------------------------
     # State 1: Fresh cache (age < TTL) → serve without network.
-    # The fetch time is recorded in a sidecar ``.at`` file (not the fs mtime)
-    # so age is controlled by the injected ``now_unix`` clock — deterministic.
+    # When trust gate is active: crypto-verify on EVERY read; freshness NOT
+    # re-asserted on pure cache reads (offline/air-gapped safety — RFC §4 step 6).
     # -------------------------------------------------------------------------
     fetched_at = _read_stamp(stamp_file)
-    if fetched_at is not None:
+    if fetched_at is not None and not refresh:
         age = now_unix - fetched_at
         if age < ttl_seconds:
-            text = cache_file.read_text()
-            return parse_index(text)
+            index_bytes = cache_file.read_bytes()
+            if trust_active:
+                assert config is not None and verifier is not None  # type narrowing
+                bundle_bytes_cached: bytes | None = None
+                if bundle_file.is_file():
+                    bundle_bytes_cached = bundle_file.read_bytes()
+                elif no_bundle_marker.is_file():
+                    bundle_bytes_cached = None  # degraded; BundleMissing enforced below
+                # else: no bundle and no degraded marker → treat as BundleMissing
+                # (triggers crash recovery if bundle IS expected)
+
+                # Crash recovery: if bundle missing/mismatch on a CACHE READ,
+                # delete sidecars and fall through to refetch once (RFC §7.2).
+                if not _cache_bundle_looks_ok(bundle_bytes_cached, bundle_file):
+                    _delete_bundle_sidecars(bundle_file, no_bundle_marker)
+                    return _refetch_with_recovery(
+                        url=url, cache_dir=cache_dir, cache_file=cache_file,
+                        stamp_file=stamp_file, bundle_file=bundle_file,
+                        no_bundle_marker=no_bundle_marker,
+                        http_get=http_get, bundle_http_get=bundle_http_get,
+                        config=config, verifier=verifier,
+                        now_unix=now_unix, is_recovery=True,
+                    )
+
+                # is_network_fetch=False: freshness NOT re-asserted on cache reads.
+                _verify_and_enforce(
+                    index_bytes=index_bytes,
+                    bundle_bytes=bundle_bytes_cached,
+                    config=config,
+                    verifier=verifier,
+                    index_url=url,
+                    is_network_fetch=False,
+                )
+            try:
+                return parse_index(index_bytes.decode("utf-8"))
+            except UnicodeDecodeError as exc:
+                # Non-UTF-8 index bytes (e.g. a tianguis encoding bug over a
+                # validly-signed blob) → surface via index-parse error path.
+                from milpa.errors import TNG_KDL_SYNTAX
+                raise MilpaError(
+                    TNG_KDL_SYNTAX,
+                    f"index bytes from {url!r} are not valid UTF-8: {exc}",
+                    url=url,
+                ) from exc
 
     # -------------------------------------------------------------------------
     # State 2 / 3 / 4: Stale or missing → attempt to fetch.
     # -------------------------------------------------------------------------
     fetch_error: str | None = None
-    fetched_text: str | None = None
+    fetched_bytes: bytes | None = None
 
     try:
-        fetched_text = http_get(url)
+        fetched_bytes = http_get(url)
     except Exception as exc:
         fetch_error = str(exc)
 
@@ -218,8 +386,45 @@ def load_index(
                 f"({fetch_error}) — using cached (possibly out-of-date) index",
                 file=sys.stderr,
             )
-            text = cache_file.read_text()
-            return parse_index(text)
+            index_bytes = cache_file.read_bytes()
+            if trust_active:
+                assert config is not None and verifier is not None  # type narrowing
+                bundle_bytes_stale: bytes | None = None
+                if bundle_file.is_file():
+                    bundle_bytes_stale = bundle_file.read_bytes()
+                elif no_bundle_marker.is_file():
+                    bundle_bytes_stale = None  # degraded
+
+                # Crash recovery: same as State 1 path.
+                if not _cache_bundle_looks_ok(bundle_bytes_stale, bundle_file):
+                    # Cannot refetch — we already know network is down.
+                    # Hard-fail rather than serve unverified bytes.
+                    _delete_bundle_sidecars(bundle_file, no_bundle_marker)
+                    raise MilpaError(
+                        MILPA_INDEX_UNREACHABLE,
+                        f"failed to load index from {url!r}: {fetch_error} "
+                        "(cache bundle missing/corrupt and network unavailable for recovery)",
+                        url=url,
+                    )
+
+                # is_network_fetch=False: stale offline fallback — no freshness.
+                _verify_and_enforce(
+                    index_bytes=index_bytes,
+                    bundle_bytes=bundle_bytes_stale,
+                    config=config,
+                    verifier=verifier,
+                    index_url=url,
+                    is_network_fetch=False,
+                )
+            try:
+                return parse_index(index_bytes.decode("utf-8"))
+            except UnicodeDecodeError as exc:
+                from milpa.errors import TNG_KDL_SYNTAX
+                raise MilpaError(
+                    TNG_KDL_SYNTAX,
+                    f"index bytes from {url!r} are not valid UTF-8: {exc}",
+                    url=url,
+                ) from exc
 
         # State 4: no usable cache — hard failure.
         raise MilpaError(
@@ -228,17 +433,71 @@ def load_index(
             url=url,
         )
 
-    assert fetched_text is not None  # type narrowing: fetch_error is None implies success
+    assert fetched_bytes is not None  # type narrowing: fetch_error is None implies success
+
+    # State 2: network fetch succeeded.
+    # -------------------------------------------------------------------------
+    # Fetch bundle sidecar (S5 trust gate) — BEFORE writing index to cache.
+    # Atomic write order: bundle first, then index rename (RFC §7.2).
+    # -------------------------------------------------------------------------
+    fetched_bundle: bytes | None = None
+    bundle_was_404 = False
+
+    if trust_active and bundle_http_get is not None:
+        bundle_url = _get_bundle_url(url)
+        try:
+            fetched_bundle = bundle_http_get(bundle_url)
+        except _BundleNotFound:
+            bundle_was_404 = True
+        except Exception:
+            # Non-404 bundle fetch error: treat as BundleMissing for policy dispatch.
+            bundle_was_404 = True
+
+    # Verify BEFORE caching (is_network_fetch=True → freshness asserted).
+    if trust_active:
+        assert config is not None and verifier is not None  # type narrowing
+        if bundle_was_404:
+            # Bundle 404 under strict: hard-fail; do NOT cache partial state.
+            # Under warn: cache index + write degraded marker; use BundleMissing dispatch.
+            from milpa.index_trust import enforce_index_trust, BundleMissing
+            if config.policy == "strict":
+                enforce_index_trust(BundleMissing, config.policy, url)
+                # strict raises in enforce_index_trust; we never reach here.
+            else:
+                # warn: write degraded marker and proceed (RFC §7.2, §7.4).
+                enforce_index_trust(BundleMissing, config.policy, url)
+                # Proceed with caching; write no-bundle marker.
+        else:
+            _verify_and_enforce(
+                index_bytes=fetched_bytes,
+                bundle_bytes=fetched_bundle,
+                config=config,
+                verifier=verifier,
+                index_url=url,
+                is_network_fetch=True,  # freshness ASSERTED on network-fetch path
+            )
 
     # -------------------------------------------------------------------------
-    # Atomic write: temp sibling + os.replace(), so a concurrent reader never
-    # sees a half-written file (registry-protocol §6 NORMATIVE).
+    # Atomic write: bundle sidecar first, then index rename (RFC §7.2).
     # -------------------------------------------------------------------------
+    # Write bundle sidecar first so a reader that sees the index always has its bundle.
+    if trust_active:
+        assert config is not None  # type narrowing
+        if fetched_bundle is not None and config.policy != "off":
+            _atomic_write_bytes(bundle_file, fetched_bundle)
+        elif bundle_was_404 and config.policy != "strict":
+            # warn policy + bundle 404: write degraded marker.
+            with contextlib.suppress(OSError):
+                no_bundle_marker.write_bytes(b"")
+            # Remove any stale bundle sidecar.
+            with contextlib.suppress(OSError):
+                bundle_file.unlink(missing_ok=True)
+        # Under strict+bundle_was_404: enforce_index_trust already raised.
+
+    # Atomic write of the index (temp sibling + os.replace).
     tmp_file = cache_file.with_suffix(f".kdl.tmp.{now_unix}")
-    import contextlib
-
     try:
-        tmp_file.write_text(fetched_text)
+        tmp_file.write_bytes(fetched_bytes)
         os.replace(tmp_file, cache_file)
     except OSError:
         with contextlib.suppress(OSError):
@@ -248,7 +507,183 @@ def load_index(
     # Record fetch time to the sidecar (governs freshness, not fs mtime).
     _write_stamp(stamp_file, now_unix)
 
-    return parse_index(fetched_text)
+    try:
+        return parse_index(fetched_bytes.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        from milpa.errors import TNG_KDL_SYNTAX
+        raise MilpaError(
+            TNG_KDL_SYNTAX,
+            f"index bytes from {url!r} are not valid UTF-8: {exc}",
+            url=url,
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_bundle_url(index_url: str) -> str:
+    """Return the bundle URL: ``MILPA_INDEX_BUNDLE_URL`` override or derived URL."""
+    override = os.environ.get("MILPA_INDEX_BUNDLE_URL", "").strip()
+    return override if override else derive_bundle_url(index_url)
+
+
+def _cache_bundle_looks_ok(bundle_bytes: bytes | None, bundle_file: Path) -> bool:
+    """Return True if the bundle state is consistent (present-and-non-empty, or file absent).
+
+    Returns False when:
+    - The caller expected a bundle file but it's gone (interrupted write).
+    - The bundle file exists but reads as empty bytes.
+    This triggers crash recovery (RFC §7.2).
+    """
+    if bundle_bytes is None and not bundle_file.is_file():
+        # No bundle file, and no degraded-marker was found either.  Could be a
+        # pre-RFC cache or an interrupted write.  Caller checks which.
+        return False
+    if bundle_bytes is not None and len(bundle_bytes) == 0:
+        return False  # Empty bundle sidecar: interrupted write.
+    return True
+
+
+def _delete_bundle_sidecars(bundle_file: Path, no_bundle_marker: Path) -> None:
+    """Delete the bundle sidecar and degraded marker (RFC §7.2 crash recovery)."""
+    with contextlib.suppress(OSError):
+        bundle_file.unlink(missing_ok=True)
+    with contextlib.suppress(OSError):
+        no_bundle_marker.unlink(missing_ok=True)
+
+
+def _refetch_with_recovery(
+    *,
+    url: str,
+    cache_dir: Path,
+    cache_file: Path,
+    stamp_file: Path,
+    bundle_file: Path,
+    no_bundle_marker: Path,
+    http_get: HttpGet,
+    bundle_http_get: "BundleHttpGet | None",
+    config: "IndexTrustConfig",
+    verifier: "IndexBundleVerifier",
+    now_unix: int,
+    is_recovery: bool,
+) -> "Index":
+    """Bounded crash-recovery refetch (RFC §7.2).
+
+    Called when a CACHE READ detects a missing/corrupt bundle sidecar (interrupted
+    write scenario).  Performs ONE network refetch.  If the refetch ALSO fails
+    verification, hard-fail regardless of policy (active-adversary signal).
+    """
+    from milpa.registry import parse_index
+
+    # Attempt one recovery refetch.
+    fetch_error: str | None = None
+    fetched_bytes: bytes | None = None
+
+    try:
+        fetched_bytes = http_get(url)
+    except Exception as exc:
+        fetch_error = str(exc)
+
+    if fetch_error is not None:
+        raise MilpaError(
+            MILPA_INDEX_UNREACHABLE,
+            f"crash-recovery refetch failed for {url!r}: {fetch_error}",
+            url=url,
+        )
+
+    assert fetched_bytes is not None
+
+    # Fetch bundle for recovery path.
+    fetched_bundle: bytes | None = None
+    bundle_was_404 = False
+
+    if bundle_http_get is not None:
+        bundle_url = _get_bundle_url(url)
+        try:
+            fetched_bundle = bundle_http_get(bundle_url)
+        except _BundleNotFound:
+            bundle_was_404 = True
+        except Exception:
+            bundle_was_404 = True
+
+    # Verify recovery fetch (is_network_fetch=True — freshness asserted).
+    if bundle_was_404:
+        from milpa.index_trust import enforce_index_trust, BundleMissing
+        # Second consecutive miss: hard-fail regardless of policy (RFC §7.2).
+        if is_recovery:
+            raise MilpaError(
+                MILPA_INDEX_UNREACHABLE,
+                f"crash-recovery: second consecutive bundle mismatch for {url!r} — "
+                "hard-fail (active adversary signal per RFC §7.2)",
+                url=url,
+            )
+        enforce_index_trust(BundleMissing, config.policy, url)
+    else:
+        # On recovery, ALWAYS hard-fail if verification fails (not policy-gated).
+        from milpa.index_trust import (
+            BundleMissing as _BM, Trusted,
+            enforce_index_trust, VerificationResult,
+        )
+        max_age = config.max_age_seconds  # recovery = network fetch → freshness checked
+        result = verifier.verify(
+            index_bytes=fetched_bytes,
+            bundle_bytes=fetched_bundle if fetched_bundle is not None else b"",
+            trust_bundle=config.trust_bundle,
+            expected_signer=config.expected_signer,
+            max_age_seconds=max_age,
+        )
+        if result is not Trusted:
+            # Second consecutive mismatch after a recovery refetch: hard-fail.
+            raise MilpaError(
+                MILPA_INDEX_UNREACHABLE,
+                f"crash-recovery: verification still failed after refetch for {url!r} "
+                f"(result={result.value!r}) — hard-fail (active adversary signal per RFC §7.2)",
+                url=url,
+            )
+
+    # Write recovered state.
+    if fetched_bundle is not None:
+        _atomic_write_bytes(bundle_file, fetched_bundle)
+    elif bundle_was_404 and config.policy != "strict":
+        with contextlib.suppress(OSError):
+            no_bundle_marker.write_bytes(b"")
+        with contextlib.suppress(OSError):
+            bundle_file.unlink(missing_ok=True)
+
+    tmp_file = cache_file.with_suffix(f".kdl.tmp.recovery.{now_unix}")
+    try:
+        tmp_file.write_bytes(fetched_bytes)
+        os.replace(tmp_file, cache_file)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp_file.unlink(missing_ok=True)
+        raise
+
+    _write_stamp(stamp_file, now_unix)
+
+    try:
+        return parse_index(fetched_bytes.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        from milpa.errors import TNG_KDL_SYNTAX
+        raise MilpaError(
+            TNG_KDL_SYNTAX,
+            f"index bytes from {url!r} are not valid UTF-8: {exc}",
+            url=url,
+        ) from exc
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` atomically (sibling tmp + os.replace)."""
+    tmp = Path(str(path) + ".tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -256,17 +691,31 @@ def load_index(
 # ---------------------------------------------------------------------------
 
 
-def urllib_http_get(url: str) -> str:
+def urllib_http_get(url: str) -> bytes:
     """Production ``HttpGet`` transport using ``urllib``.
 
     Supports ``http://``, ``https://``, and ``file://`` schemes.
+    Returns raw bytes (index_cache.py now uses bytes throughout).
     On any error raises an exception whose ``str()`` is used in the
     ``MILPA-INDEX-UNREACHABLE`` message.
     """
     with urllib.request.urlopen(url) as resp:  # noqa: S310 — URL is user-controlled; known risk
-        raw: bytes = resp.read()
-        encoding: str = resp.headers.get_content_charset("utf-8") or "utf-8"
-        return raw.decode(encoding)
+        return resp.read()
+
+
+def urllib_bundle_http_get(url: str) -> bytes:
+    """Production ``BundleHttpGet`` transport using ``urllib``.
+
+    Raises ``_BundleNotFound`` on HTTP 404; raises other ``Exception`` on
+    other network errors.
+    """
+    try:
+        with urllib.request.urlopen(url) as resp:  # noqa: S310
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise _BundleNotFound(f"bundle not found at {url!r}: HTTP 404") from exc
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -280,17 +729,29 @@ def load_default_index(
     http_get: HttpGet | None = None,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     now_unix: int | None = None,
-) -> Index:
+    config: "IndexTrustConfig | None" = None,
+    verifier: "IndexBundleVerifier | None" = None,
+    bundle_http_get: "BundleHttpGet | None" = None,
+    refresh: bool = False,
+) -> "Index":
     """Load the index from ``MILPA_INDEX_URL`` (or the default URL).
 
     Convenience wrapper over ``load_index`` for production callers:
 
     - ``cache_dir``:   defaults to the XDG cache dir.
-    - ``http_get``:    defaults to ``urllib_http_get``.
+    - ``http_get``:    defaults to ``urllib_http_get`` (returns bytes).
     - ``ttl_seconds``: defaults to ``DEFAULT_TTL_SECONDS``.
     - ``now_unix``:    defaults to the real wall clock (``int(time.time())``).
+    - ``config``:      ``IndexTrustConfig`` for the trust gate; ``None`` disables.
+    - ``verifier``:    ``IndexBundleVerifier``; REQUIRED when config is not None.
+    - ``bundle_http_get``: defaults to ``urllib_bundle_http_get`` when config set.
+    - ``refresh``:     force re-fetch bypassing TTL (``--refresh-index``).
     """
     import time
+
+    effective_bundle_get = bundle_http_get
+    if config is not None and effective_bundle_get is None:
+        effective_bundle_get = urllib_bundle_http_get
 
     return load_index(
         url=index_url_from_env(),
@@ -298,4 +759,8 @@ def load_default_index(
         http_get=http_get if http_get is not None else urllib_http_get,
         ttl_seconds=ttl_seconds,
         now_unix=now_unix if now_unix is not None else int(time.time()),
+        config=config,
+        verifier=verifier,
+        bundle_http_get=effective_bundle_get,
+        refresh=refresh,
     )

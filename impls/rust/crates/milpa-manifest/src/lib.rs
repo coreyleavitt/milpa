@@ -19,8 +19,10 @@ use milpa_types::Version;
 
 pub mod format;
 pub mod nimble;
+pub mod trust;
 
 pub use format::{format_manifest, format_workspace_manifest};
+pub use trust::{parse_trust_policy, TrustPolicy};
 // Re-export Predicate from milpa-types (the new SSOT) so all existing
 // references to `milpa_manifest::Predicate` and `crate::Predicate` compile
 // unchanged.
@@ -246,21 +248,23 @@ pub struct Manifest {
     pub cas_dir: String,
     pub spec_version: i64,
     pub spec_version_explicit: bool,
-    /// S5: attestation policy from `attestation-policy "strict"|"permissive"` (default: permissive).
-    pub attestation_policy: AttestationPolicy,
+    /// S5: attestation policy from `attestation-policy "warn"|"strict"|"off"` (default: warn).
+    /// S1 (RFC rfc-registry-trust-federation): renamed from `AttestationPolicy`;
+    /// the user-facing "permissive" value is renamed to "warn" (pre-v1 breaking cutover).
+    pub attestation_policy: TrustPolicy,
+    /// S6: whole-index trust policy from `index-trust "warn"|"strict"|"off"` (default: warn).
+    /// RFC registry-trust-federation §6.4.
+    pub index_trust_policy: TrustPolicy,
+    /// S6: expected SubjectAltName override from `index-trust-signer "<identity>"` (RFC §3.2).
+    /// `None` means use the default pinned vendor-bot identity.
+    pub index_trust_signer: Option<String>,
+    /// S6: trust-root override (file:// path) from `index-trust-bundle "<path>"` (RFC §3.2).
+    /// `None` means use the embedded production trust bundle.
+    pub index_trust_bundle: Option<String>,
     /// S7: flag names that were auto-injected by optional-dep desugaring.
     /// `format_manifest` skips these from the `flags {}` block (they're implied
     /// by `optional=#true` on the dep; serializing them would cause a re-parse clash).
     pub optional_auto_flags: std::collections::BTreeSet<String>,
-}
-
-/// S5: Attestation policy — controls fallback-warning vs. hard-error behaviour
-/// for deps resolved from un-attested `.nimble` metadata.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum AttestationPolicy {
-    #[default]
-    Permissive,
-    Strict,
 }
 
 /// A parsed workspace-root `milpa.kdl` (grammar §7). Pure container: member
@@ -541,6 +545,9 @@ const PACKAGE_TOP_LEVEL: &[&str] = &[
     "cas",
     "spec-version",
     "attestation-policy",
+    "index-trust",
+    "index-trust-signer",
+    "index-trust-bundle",
 ];
 const WORKSPACE_TOP_LEVEL: &[&str] = &["workspace", "name", "overrides", "spec-version", "flags"];
 
@@ -973,7 +980,10 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
     let mut cas_dir = String::new();
     let mut spec_version: i64 = 1;
     let mut spec_version_explicit = false;
-    let mut attestation_policy = AttestationPolicy::Permissive;
+    let mut attestation_policy = TrustPolicy::Warn;
+    let mut index_trust_policy = TrustPolicy::Warn;
+    let mut index_trust_signer: Option<String> = None;
+    let mut index_trust_bundle: Option<String> = None;
 
     // S5b: seen_names key is the solver variable (namespace::name or bare name),
     // so two qualified deps with the same bare name but different namespaces
@@ -1123,21 +1133,48 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
                     return Err(err(
                         "MAN-UNKNOWN-TOP-LEVEL",
                         "'attestation-policy' takes exactly one string argument \
-                         ('permissive' or 'strict')",
+                         ('warn', 'strict', or 'off')",
                     ));
                 }
-                attestation_policy = match val.unwrap() {
-                    "permissive" => AttestationPolicy::Permissive,
-                    "strict" => AttestationPolicy::Strict,
-                    other => {
-                        return Err(err(
-                            "MAN-UNKNOWN-TOP-LEVEL",
-                            format!(
-                                "'attestation-policy' must be 'permissive' or 'strict', got {other:?}"
-                            ),
-                        ));
-                    }
-                };
+                attestation_policy = parse_trust_policy(val.unwrap(), "attestation-policy")
+                    .map_err(|e| err("MAN-UNKNOWN-TOP-LEVEL", e))?;
+            }
+            "index-trust" => {
+                let a = args(node);
+                let val = a.first().and_then(|e| e.value().as_string());
+                if a.len() != 1 || val.is_none() {
+                    return Err(err(
+                        "MAN-UNKNOWN-TOP-LEVEL",
+                        "'index-trust' takes exactly one string argument \
+                         ('warn', 'strict', or 'off')",
+                    ));
+                }
+                index_trust_policy = parse_trust_policy(val.unwrap(), "index-trust")
+                    .map_err(|e| err("MAN-UNKNOWN-TOP-LEVEL", e))?;
+            }
+            "index-trust-signer" => {
+                let a = args(node);
+                let val = a.first().and_then(|e| e.value().as_string());
+                if a.len() != 1 || val.is_none() {
+                    return Err(err(
+                        "MAN-UNKNOWN-TOP-LEVEL",
+                        "'index-trust-signer' takes exactly one string argument \
+                         (GitHub Actions OIDC workflow URL / expected SubjectAltName)",
+                    ));
+                }
+                index_trust_signer = Some(val.unwrap().to_string());
+            }
+            "index-trust-bundle" => {
+                let a = args(node);
+                let val = a.first().and_then(|e| e.value().as_string());
+                if a.len() != 1 || val.is_none() {
+                    return Err(err(
+                        "MAN-UNKNOWN-TOP-LEVEL",
+                        "'index-trust-bundle' takes exactly one string argument \
+                         (file:// path to Fulcio CA + Rekor public key bundle)",
+                    ));
+                }
+                index_trust_bundle = Some(val.unwrap().to_string());
             }
             "workspace" => {
                 return Err(err(
@@ -1271,6 +1308,9 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
         spec_version,
         spec_version_explicit,
         attestation_policy,
+        index_trust_policy,
+        index_trust_signer,
+        index_trust_bundle,
         optional_auto_flags,
     })
 }

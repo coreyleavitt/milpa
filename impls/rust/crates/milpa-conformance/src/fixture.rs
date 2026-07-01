@@ -61,6 +61,14 @@ pub enum Cmd {
     /// live in B2. The frozen oracle is self-tested out-of-band (Python
     /// `tests/test_dag_sha256_oracle.py`), not against either impl's identity code.
     DagOracle,
+    /// S7: index-trust fixture (RFC `rfc-registry-trust-federation` §11 S7).
+    /// Exercises the whole-index trust policy state machine via `MockVerifier`.
+    /// The runner reads `mock_verifier_result` from the fixture `env` file,
+    /// computes `effective_trust_policy`, calls `enforce_index_trust`, and
+    /// compares the outcome to `expected/outcome` (`"trusted"`,
+    /// `"warn:TNG-INDEX-*"`, or `"error:TNG-INDEX-*"`).  No real Sigstore
+    /// infrastructure is required (policy machine only; RFC §10.1).
+    IndexTrust,
 }
 
 impl Cmd {
@@ -86,6 +94,8 @@ impl Cmd {
                     // Epoch-2 Merkle-DAG oracle fixtures (RFC B1): skipped until
                     // the B2 materializer/DAG builder lands (see `Cmd::DagOracle`).
                     "dag-oracle" => Cmd::DagOracle,
+                    // S7: index-trust policy state machine via MockVerifier.
+                    "index-trust" => Cmd::IndexTrust,
                     // Mutation (§2.7.1) + liveness (§2.7.2) selectors: CLI-only.
                     // check-certificate (§2.7.3): also CLI-only (--certificate flag).
                     // workspace (S10 D4): add-member/remove-member are CLI-only.

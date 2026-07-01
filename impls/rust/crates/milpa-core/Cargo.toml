@@ -16,6 +16,21 @@ flate2 = "1.1.9"
 bzip2-rs = "0.1"
 lzma-rs = "0.3"
 tar = "0.4"
+# deps-rationale: used in index_trust.rs for Sigstore bundle JSON parsing (integratedTime
+# extraction, bundle structure validation) without hand-rolling a parser. Also used by the
+# S4b SigstoreVerifier retrofit once DSSE/in-toto support lands in sigstore-rs.
+serde_json = "1"
+# deps-rationale: Sigstore bundle verification MUST NOT be hand-rolled and shelling out
+# to `cosign` at resolve time is unacceptable (adds an external binary dep, shell-injection
+# surface, conformance test friction). The `sigstore` crate is the Sigstore project's own
+# Rust library; it is a deliberate, justified exception to milpa's dep-light posture.
+# RFC: rfc-registry-trust-federation §5.3.
+#
+# S4 spike verdict: INSUFFICIENT — sigstore 0.11.0 does NOT support DSSE/in-toto
+# attestation bundles (BundleErrorKind::DsseUnsupported); S4b is ACTIVE. The crate
+# is retained here as the planned dep for S4b; SigstoreVerifier is a placeholder.
+# S4b will pin the minimum sigstore version that supports DSSE and narrow features.
+sigstore = "0.11"
 
 [dev-dependencies]
 tempfile = "3"

@@ -49,6 +49,9 @@ A conformant implementation of this spec MUST:
    `MILPA_INDEX_URL` when set (§1).
 10. Implement the four-state cache freshness model: fresh-serve / stale-refetch
     / offline-fallback / no-cache-error (§6).
+11. Verify the whole-index Sigstore attestation bundle before trusting any
+    claim in the index; honour the `index-trust` trust-policy from the
+    manifest and `MILPA_INDEX_TRUST` env var (§3.4).
 
 ---
 
@@ -346,6 +349,218 @@ Fields: `registry` (required), `repository` (required), `digest` (required).
 > milpa cannot fetch is non-fatal provided other provenances on the same version
 > remain fetchable).
 
+### 3.4  Whole-index attestation gate (Layer 1)
+
+Layer 1 verifies the Sigstore attestation over the complete `index.kdl`
+document before any claim in the index is trusted. This section is orthogonal
+to the per-entry attestation fields in §3.2 (`attestation`, `signed_by`,
+`rekor`): those fields' "parsed and ignored" normative clauses remain in full
+force under Layer 1. Per-entry Layer 2 verification is a future extension that
+inverts those clauses; it is explicitly out of scope here.
+
+#### 3.4.1  When the gate fires
+
+> NORMATIVE: The gate MUST fire on every index load — fresh cache read
+> (State 1), stale-refetch (State 2), and offline-fallback (State 3, as
+> defined in §6) — immediately after the index bytes are obtained and BEFORE
+> the bytes are decoded or parsed. No index claim (schema_version, package
+> entry, version, provenance) may be used before the gate passes or produces
+> a `warn`-policy warning.
+
+> NORMATIVE: The gate MUST NOT fire on frozen-path invocations (`fetch
+> --frozen`, or any path that reconstructs the dep graph from `milpa.lock`
+> without loading the index). When `--no-index` is active, no index is loaded
+> and the gate is not invoked; `MILPA_INDEX_TRUST` and
+> `--require-attested-index` are effectively no-ops in that case.
+
+> NORMATIVE: `milpa remove` and `milpa clean` do NOT load the index and MUST
+> NOT invoke the gate. `milpa show` invokes the gate ONLY when it actually
+> loads the index; a lockfile-only `show` (no index load needed) does NOT
+> invoke the gate. `milpa verify` invokes the gate in crypto-only mode (steps
+> 1–5, §3.4.4) but MUST NOT assert the wall-clock freshness bound (step 6),
+> preserving offline audit capability.
+
+#### 3.4.2  Bundle acquisition and URL derivation
+
+> NORMATIVE: The bundle URL is derived from the index URL by: strip any query
+> string and fragment from the index URL; append `.bundle` to the URL PATH
+> component; then reattach the original query string and fragment. Naive string
+> suffixing (e.g. appending `.bundle` to the full URL string including any
+> `?ref=main` query) is INCORRECT and MUST NOT be implemented.
+
+For the default index URL the derived bundle URL is:
+
+```
+https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl.bundle
+```
+
+> NORMATIVE: `MILPA_INDEX_BUNDLE_URL` (§8 of `spec/cli-contract.md`) overrides
+> the derived URL entirely when set. This is required for deployments where the
+> bundle is served from a separate host or where suffix-derivation is not viable.
+
+> NORMATIVE: The bundle is cached as a sidecar alongside the index:
+> `<cache-key>.index.kdl.bundle`. The bundle MUST use a SEPARATE injectable
+> transport from the index transport, so that per-transport mock state and
+> failure injection can be applied independently.
+
+> NORMATIVE (crash recovery): On a pure cache read (States 1 or 3) that finds
+> the bundle sidecar missing or whose digest does not match the index (e.g. from
+> an interrupted write), the implementation MUST silently delete both sidecars and
+> perform ONE recovery re-fetch. If the network-fetched (index, bundle) pair ALSO
+> fails verification on the recovery re-fetch, the implementation MUST hard-fail
+> regardless of policy. A second consecutive mismatch indicates an active adversary
+> signal, not an interrupted write; the implementation MUST NOT loop.
+
+#### 3.4.3  Bundle format
+
+The Sigstore bundle is a JSON document carrying:
+- `verificationMaterial.x509CertificateChain` — the signing certificate chain.
+- `verificationMaterial.tlogEntries[]` — one or more Rekor transparency-log
+  entries, each carrying an inclusion proof and a signed entry timestamp (SET).
+- `dsseEnvelope` — a DSSE envelope whose JSON payload is an in-toto attestation
+  statement. The statement's subject is the sha256 digest of the signed file.
+
+> NORMATIVE: The signature covers the DSSE envelope payload (an in-toto
+> statement), NOT the raw index bytes directly. A conformant implementation MUST
+> verify by extracting `statement.subject[0].digest.sha256` from the DSSE payload
+> and asserting it equals `sha256(index_bytes)`.
+
+#### 3.4.4  Verification steps
+
+A conformant implementation MUST execute the following six steps in order:
+
+**Step 1 — Parse the bundle JSON.** If the bundle is not valid JSON or does not
+conform to the Sigstore bundle schema, MUST raise `TNG-INDEX-BUNDLE-MALFORMED`.
+This is a pre-cryptographic failure — no signature check has been attempted.
+
+**Step 2 — Validate the certificate chain against the embedded Fulcio root.**
+Certificate validity MUST be checked at the Rekor SET `integratedTime`, NOT
+current wall-clock time. Fulcio issues short-lived (~10-minute) certificates;
+checking `cert.NotAfter >= now` is INCORRECT and MUST NOT be implemented. A
+certificate now-expired by wall-clock but valid at its `integratedTime` MUST
+verify successfully. `TNG-INDEX-SIGNATURE-INVALID` is raised ONLY when the
+certificate was expired AT its own `integratedTime`.
+
+**Step 3 — Confirm the signer identity.** The certificate's SubjectAltName MUST
+match the expected signer identity. The pinned default identity is:
+
+- Issuer: `https://token.actions.githubusercontent.com`
+- SAN: `https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml@refs/heads/main`
+
+This identity is overridable via `MILPA_INDEX_TRUST_SIGNER` or the
+`index-trust-signer` manifest node. A SAN mismatch MUST raise
+`TNG-INDEX-SIGNER-MISMATCH`. When `MILPA_INDEX_URL` is non-default and no
+signer override is configured, `warn` policy proceeds with a
+`TNG-INDEX-SIGNER-MISMATCH` warning; `strict` policy raises the error.
+
+**Step 4 — Verify the DSSE envelope.** The envelope signature MUST be verified
+against the certificate's public key. The in-toto statement's subject digest
+(`statement.subject[0].digest.sha256`) MUST equal `sha256(index_bytes)`. A
+digest mismatch MUST raise `TNG-INDEX-DIGEST-MISMATCH`.
+
+> NOTE: The slug `TNG-INDEX-DIGEST-MISMATCH` uses "digest", not "identity".
+> The term "identity" is reserved in milpa for the `content_hash` of a source
+> tree (see `spec/identity.md`); using it for a bundle-subject mismatch would
+> create a false collision with milpa's identity model.
+
+**Step 5 — Verify the Rekor inclusion proof** against the embedded Rekor public
+key. Failure MUST raise `TNG-INDEX-SIGNATURE-INVALID`.
+
+**Step 6 — Freshness assertion (network-fetch paths only).** On a network-fetch
+path (State 2 or recovery re-fetch), MUST assert
+`now - SET.integratedTime < MILPA_INDEX_MAX_AGE` (default 7 days; configurable
+via `MILPA_INDEX_MAX_AGE` in `spec/cli-contract.md §8`). `integratedTime` is
+embedded in the bundle; no live Rekor network query is needed. On exceed, MUST
+raise `TNG-INDEX-BUNDLE-STALE`.
+
+> NORMATIVE: On a PURE CACHE READ (States 1 and 3), steps 1–5 MUST still be
+> executed, but step 6 (freshness) MUST NOT be asserted. Rationale: the
+> rollback attack is a network-delivery attack; defending at the fetch boundary
+> fully closes it. Re-asserting wall-clock freshness on cache reads would break
+> air-gapped deployments without adding security.
+
+> NORMATIVE: Verification MUST NOT use hand-rolled cryptographic code.
+> Implementations MUST delegate to `sigstore-python` (Python) or `sigstore-rs`
+> (Rust). Verification MUST work without live Rekor network access — the bundle
+> carries all material needed for offline verification (inclusion proof + SET).
+
+> NORMATIVE (TOCTOU): The index bytes MUST be read ONCE. The same in-memory
+> bytes object MUST be passed to both bundle verification and the KDL parser.
+> There MUST NOT be a second disk read between verification and parsing.
+
+> NOTE: The six error slugs referenced above — `TNG-INDEX-BUNDLE-MISSING`,
+> `TNG-INDEX-BUNDLE-MALFORMED`, `TNG-INDEX-SIGNATURE-INVALID`,
+> `TNG-INDEX-DIGEST-MISMATCH`, `TNG-INDEX-SIGNER-MISMATCH`,
+> `TNG-INDEX-BUNDLE-STALE` — are defined in `spec/errors.md` and first raised
+> in S5 (Python) and S6 (Rust) of the registry-trust-federation RFC.
+
+#### 3.4.5  Trust policy
+
+> NORMATIVE: The `index-trust` field in `milpa.kdl` and the `MILPA_INDEX_TRUST`
+> environment variable (see `spec/cli-contract.md §8`) govern behaviour on
+> verification failure:
+>
+> | Policy value | Behaviour on any verification failure |
+> |---|---|
+> | `warn` (default) | Resolve proceeds; MUST emit exactly one warning to stderr per unique index URL per invocation, including the applicable `TNG-INDEX-*` slug as the machine-readable signal. Exit code remains 0. |
+> | `strict` | Hard fail; MUST raise the appropriate `TNG-INDEX-*` error and exit 1. |
+> | `off` | Gate is skipped entirely; no bundle is fetched or verified. |
+
+> NORMATIVE: Under `warn`, the warning MUST include the applicable `TNG-INDEX-*`
+> slug. CI systems MAY match the `TNG-INDEX-` prefix to detect index-trust
+> failures non-intrusively. Exit code MUST remain 0 under `warn`. The dedup key
+> for warning emission is the index URL; at most one warning is emitted per unique
+> index URL per invocation.
+
+> NORMATIVE: Under `warn`, a bundle fetch that returns 404 MAY cache the index
+> with a `.kdl.no-bundle` degraded-marker sidecar so the normal TTL governs
+> re-fetch cadence. Under `strict`, a bundle 404 MUST raise
+> `TNG-INDEX-BUNDLE-MISSING` and MUST NOT write partial cache state.
+
+> NORMATIVE (effective policy): The effective policy is computed as follows:
+>
+> 1. If the manifest declares `index-trust "off"`, the effective policy is `off`
+>    unconditionally. No environment variable or CLI flag can override a manifest
+>    `off`. `off` is an auditable opt-out that MUST ONLY be declared in `milpa.kdl`
+>    (committed to version control). `MILPA_INDEX_TRUST=off` in the environment is
+>    a no-op floor — it CANNOT weaken a manifest `warn` or `strict` policy.
+> 2. Otherwise: `base = max(manifest_policy or "warn", env_policy)` over
+>    `{warn, strict}`. `MILPA_INDEX_TRUST=off` in the environment is ignored in
+>    this step.
+> 3. If `--require-attested-index` is given: effective policy is `strict` (unless
+>    rule 1 applies; the flag MUST NOT set or clear `off`).
+
+#### 3.4.6  Per-URL signer resolution
+
+> NORMATIVE: The signer identity and trust-bundle overrides are resolved PER index
+> URL (per cache key), not globally. The pinned default signer identity (§3.4.4
+> step 3) applies only to the default tianguis index URL. A user running a custom
+> `MILPA_INDEX_URL` MUST configure the expected signer via `MILPA_INDEX_TRUST_SIGNER`
+> or the `index-trust-signer` manifest node, or accept the `TNG-INDEX-SIGNER-MISMATCH`
+> warning/error depending on policy.
+
+> NORMATIVE: The `MILPA_INDEX_TRUST_SIGNER` variable overrides the signer IDENTITY
+> only (a SubjectAltName string). It MUST NOT accept `file://` trust-bundle paths.
+> The `MILPA_INDEX_TRUST_BUNDLE` variable overrides the trust ROOT (Fulcio CA +
+> Rekor public key) and is orthogonal to signer identity — changing one does not
+> imply the other. Both are defined in `spec/cli-contract.md §8`.
+
+#### 3.4.7  Workspace requirements
+
+> NORMATIVE (workspace policy merge): In a workspace invocation, the effective
+> `index-trust` policy is the MAX over the root manifest's policy and all member
+> manifests' policies (`strict > warn > off`), computed BEFORE the index is first
+> loaded. A workspace where the root declares `warn` and any member declares `strict`
+> MUST resolve under `strict`.
+
+> NORMATIVE (conflicting-signers validation error): If two or more workspace members
+> declare DIFFERENT signer identities (via `index-trust-signer` in `milpa.kdl`) or
+> different trust-bundle overrides (via `index-trust-bundle`) for the SAME index URL,
+> the implementation MUST raise a hard validation error BEFORE any index fetch. This
+> check fires at workspace-load time. The workspace-conflicting-signers validation
+> error is distinct from the six `TNG-INDEX-*` error slugs; it is a manifest-
+> consistency error that does not involve cryptographic verification.
+
 ---
 
 ## 4  Security validators
@@ -546,6 +761,19 @@ message wording.
 | `TNG-NO-SATISFYING-VERSION` | No version satisfies the constraint |
 | `TNG-NO-PROVENANCE` | All satisfying versions lack provenance |
 | `TNG-NO-IDENTITY` | Index entry's `content_hash` is absent or empty string; raised before any fetch is attempted |
+
+The following six codes are raised by the whole-index attestation gate (§3.4).
+They are defined in `spec/errors.md` and first added to `errors.py` / `errors.rs`
+in S5/S6 of the registry-trust-federation RFC alongside their raise sites.
+
+| Code | When raised |
+|---|---|
+| `TNG-INDEX-BUNDLE-MISSING` | No bundle sidecar is available. Under `strict`: hard fail. Under `warn`: proceed with warning and remediation hint. |
+| `TNG-INDEX-BUNDLE-MALFORMED` | Bundle JSON fails to parse or is not a valid Sigstore bundle (pre-cryptographic failure, before any signature check). |
+| `TNG-INDEX-SIGNATURE-INVALID` | Cryptographic verification failed — bad cert chain, wrong Fulcio CA root, or certificate expired AT its own `integratedTime`. A cert now-expired but valid at `integratedTime` MUST NOT trigger this. |
+| `TNG-INDEX-DIGEST-MISMATCH` | The bundle's in-toto statement subject digest does not match `sha256(index_bytes)`. Indicates tampering or a mismatched bundle/index pair. |
+| `TNG-INDEX-SIGNER-MISMATCH` | The bundle's certificate SubjectAltName does not match the expected signer identity (§3.4.4 step 3). |
+| `TNG-INDEX-BUNDLE-STALE` | `now - SET.integratedTime >= MILPA_INDEX_MAX_AGE`. Bundle is cryptographically valid but was signed beyond the maximum allowed age. Asserted on network-fetch paths only; NOT asserted on pure cache reads. |
 
 ---
 

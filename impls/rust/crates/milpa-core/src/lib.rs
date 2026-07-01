@@ -26,6 +26,7 @@ pub mod fetchers;
 pub mod frozen;
 pub mod identity;
 pub mod index_cache;
+pub mod index_trust;
 pub mod lockfile;
 pub mod manifest_writer;
 pub mod nimcfg;
@@ -44,7 +45,10 @@ pub use dep_decl_store::{
 };
 pub use discovery::{discover_manifest, load_manifest};
 pub use error::{CoreError, MilpaError};
-pub use index_cache::{index_url_from_env, load_index, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS};
+pub use index_cache::{
+    derive_bundle_url, get_bundle_url, index_url_from_env, load_index, BundleError,
+    BundleHttpGet, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS,
+};
 pub use lockfile::{
     format_lockfile, from_graph, load_lockfile, parse_lockfile, strip_dep_pin,
     verify_against_graph, verify_lockfile_against_deps, write_lockfile,
@@ -70,7 +74,7 @@ pub use frozen::{rebuild_deps_view, resolve_frozen, resolve_workspace_frozen};
 pub use identity::{
     compute_content_hash, enumerate_local_entries, parse_identity, SUPPORTED_ALGORITHMS,
 };
-pub use milpa_manifest::{parse_document, AttestationPolicy, ManifestDoc, Profile};
+pub use milpa_manifest::{parse_document, ManifestDoc, Profile, TrustPolicy};
 pub use milpa_solver::{parse_version, Strategy};
 pub use nimcfg::build_flag_defines;
 pub use nimcfg::format_nimcfg;
@@ -78,7 +82,7 @@ pub use nimcfg::format_workspace_nimcfgs;
 pub use registry::Index;
 pub use resolver::{
     check_frozen_active_flags_mismatch, check_workspace_frozen_active_flags_mismatch,
-    compute_dep_active_flags, effective_strict_policy,
+    compute_dep_active_flags, effective_trust_policy,
     filter_manifest, parse_env_bool, resolve, resolve_with_cert, resolve_with_features,
     resolve_workspace, resolve_workspace_with_cert, resolve_workspace_with_features,
     workspace_any_member_strict, FailureCert, FilterCtx, SuccessCert, WitnessEntry,
@@ -86,7 +90,10 @@ pub use resolver::{
 pub use milpa_solver::RefutationEntry;
 pub use safe_extract::{extract_tar, ExtractionResult, Limits};
 pub use store::{default_store, CaStore};
-pub use workspace::{load_workspace, LoadedMember, LoadedWorkspace};
+pub use workspace::{
+    check_conflicting_signers, load_workspace, merge_workspace_index_trust_policy, LoadedMember,
+    LoadedWorkspace,
+};
 
 /// The union of every error code the Rust implementation can currently emit,
 /// across all domains. The single boundary the conformance parity check reads:

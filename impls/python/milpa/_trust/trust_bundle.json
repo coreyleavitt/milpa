@@ -1,0 +1,5 @@
+{
+  "__milpa_placeholder__": true,
+  "__note__": "Replace with the real Sigstore public-instance Fulcio CA root + Rekor public key trust bundle (TUF bundle JSON / sigstore TrustRoot format). See docs/rfc-registry-trust-federation.md §3.1 and §12.3. Gated: populate alongside the S5 integration test (§12.2) once the test-bundle generation tooling is validated end-to-end. Until then, SigstoreVerifier falls back to Verifier.production() (which uses sigstore-python's own embedded trust root).",
+  "chains": []
+}

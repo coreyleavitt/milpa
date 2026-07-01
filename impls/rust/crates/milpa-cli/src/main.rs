@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use milpa_core::{
     add_mirror, apply_workspace_manifest_change, build_flag_defines, check_frozen_active_flags_mismatch,
     check_workspace_frozen_active_flags_mismatch,
-    dep_decl_store::DepDeclStore, discover_manifest, effective_strict_policy,
+    dep_decl_store::DepDeclStore, discover_manifest, effective_trust_policy,
     fetch::{FetchError, FetcherRegistry}, format_nimcfg, format_workspace_nimcfgs, from_graph,
     load_index, load_lockfile, load_manifest, load_workspace, LoadedMember, LoadedWorkspace,
     make_dep_decl_store, mutate_manifest_file, parse_env_bool, parse_lockfile, parse_source_spec,
@@ -75,6 +75,14 @@ struct Cli {
     /// OVERRIDES any configured index (env or default). URL/local deps resolve;
     /// a named dep raises `RES-NO-INDEX`. Only `fetch`/`lock` consult it.
     no_index: bool,
+    /// S6: `--require-attested-index` flag (cli-contract §8.5, RFC §6.5).
+    /// Overrides any `index-trust` manifest field → effective policy = Strict.
+    /// Identical semantics to `--require-attested-metadata` but for the index.
+    require_attested_index: bool,
+    /// S6: `--refresh-index` flag (cli-contract §8.6, RFC §7.1).
+    /// Bypasses the TTL and forces a fresh network fetch of the index and its
+    /// Sigstore bundle sidecar.
+    refresh_index: bool,
     verb: String,
     rest: Vec<String>,
 }
@@ -144,6 +152,11 @@ fn parse_args(args: &[String]) -> Option<Cli> {
     let mut require_attested_metadata = std::env::var("MILPA_REQUIRE_ATTESTED_METADATA")
         .map(|v| parse_env_bool(&v))
         .unwrap_or(false);
+    // S6: `MILPA_INDEX_TRUST` env var (RFC §6.5) can also activate strict index policy.
+    let mut require_attested_index = std::env::var("MILPA_INDEX_TRUST")
+        .map(|v| v.trim() == "strict")
+        .unwrap_or(false);
+    let mut refresh_index = false;
     let mut i = 0;
     let verb;
     loop {
@@ -177,6 +190,14 @@ fn parse_args(args: &[String]) -> Option<Cli> {
                 require_attested_metadata = true;
                 i += 1;
             }
+            "--require-attested-index" => {
+                require_attested_index = true;
+                i += 1;
+            }
+            "--refresh-index" => {
+                refresh_index = true;
+                i += 1;
+            }
             v if !v.starts_with('-') => {
                 verb = v.to_string();
                 i += 1;
@@ -192,6 +213,8 @@ fn parse_args(args: &[String]) -> Option<Cli> {
         certificate,
         require_attested_metadata,
         no_index,
+        require_attested_index,
+        refresh_index,
         verb,
         rest: args[i..].to_vec(),
     })
@@ -358,17 +381,19 @@ fn cmd_verify(dir: &Path, require_attested_metadata: bool, no_index: bool) -> Re
     let pinned: Vec<_> = lock.deps.iter().filter(|d| d.dep_decl.is_some()).collect();
     if !pinned.is_empty() {
         // §13.1: effective strict = OR(manifest/workspace-member attestation-policy "strict",
-        // require_attested_metadata).  Use the SSOT helpers (Finding 1 + Finding 2):
-        //   - Single-package: effective_strict_policy(manifest.attestation_policy, flag)
+        // require_attested_metadata).  Use the SSOT helpers (S1 rename):
+        //   - Single-package: effective_trust_policy(&manifest.attestation_policy, flag, None) == TrustPolicy::Strict
         //   - Workspace:      workspace_any_member_strict(ws) || flag
         // The env-var parse lives in parse_args (the one SSOT); `require_attested_metadata`
         // already incorporates it — no inline re-read here.
         let strict = match discover_manifest(dir) {
             Ok(milpa_manifest::ManifestDoc::Package(m)) => {
-                effective_strict_policy(&m.attestation_policy, require_attested_metadata)
+                use milpa_core::TrustPolicy;
+                effective_trust_policy(&m.attestation_policy, require_attested_metadata, None)
+                    == TrustPolicy::Strict
             }
             Ok(milpa_manifest::ManifestDoc::Workspace(_)) => {
-                // Finding 2: load the workspace and consult member policies.
+                // load the workspace and consult member policies.
                 match load_workspace(dir) {
                     Ok(ws) => workspace_any_member_strict(&ws) || require_attested_metadata,
                     Err(_) => require_attested_metadata,
@@ -379,7 +404,7 @@ fn cmd_verify(dir: &Path, require_attested_metadata: bool, no_index: bool) -> Re
 
         // Determine online state: MILPA_INDEX_URL must be set.
         // maybe_index() returns None when offline/unreachable (treats as absent).
-        let index_opt = maybe_index(no_index)?;
+        let index_opt = maybe_index(no_index, false, false)?;
         if index_opt.is_none() {
             // Offline / unreachable.
             if strict {
@@ -715,7 +740,7 @@ fn cmd_fetch(
             )?;
             resolve_workspace_frozen(&ws, &lock, &build_store(), &deps_dir)?
         } else {
-            let index = maybe_index(no_index)?;
+            let index = maybe_index(no_index, false, false)?;
             let profile = profile_from_env();
             // §8: reuse existing pins (idempotent repeated fetch — see single-pkg path).
             let prior = maybe_prior_lockfile(&dir.join("milpa.lock"));
@@ -801,7 +826,7 @@ fn cmd_fetch(
         )?;
         Milpa.resolve_frozen(&manifest, &lock, &build_store(), &deps_dir)?
     } else {
-        let index = maybe_index(no_index)?;
+        let index = maybe_index(no_index, false, false)?;
         let profile = profile_from_env();
         // §8: reuse the existing lockfile's pins so repeated `fetch`/`lock` runs
         // are idempotent and a silently-moved ref / substituted archive is caught.
@@ -1033,7 +1058,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
 
     if let ManifestDoc::Workspace(_) = doc {
         let ws = load_workspace(dir)?;
-        let index = maybe_index(no_index)?;
+        let index = maybe_index(no_index, false, false)?;
         let profile = profile_from_env();
         let ws_deps_dir = dir.join("_deps");
         let graph = resolve_workspace_with_features(
@@ -1065,7 +1090,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
     if let Some((ws_root, ws)) = find_parent_workspace(dir) {
         let ws_lock_path = ws_root.join("milpa.lock");
         let ws_deps_dir = ws_root.join("_deps");
-        let index = maybe_index(no_index)?;
+        let index = maybe_index(no_index, false, false)?;
         let profile = profile_from_env();
         // Re-build prior against the SHARED lockfile, not a member-local one.
         let ws_prior: Option<milpa_core::Lockfile> = match &name {
@@ -1114,7 +1139,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
     let ManifestDoc::Package(manifest) = doc else {
         unreachable!("workspace handled above");
     };
-    let index = maybe_index(no_index)?;
+    let index = maybe_index(no_index, false, false)?;
     let profile = profile_from_env();
     let dep_decl_store_owned = maybe_dep_decl_store(no_index);
     let dep_decl_store: Option<&dyn DepDeclStore> = dep_decl_store_owned.as_deref();
@@ -1238,7 +1263,7 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -> R
         let ws_with_override = ws_with_member_override(&ws, dir, proposed_member.clone());
         let ws_deps_dir = ws_root.join("_deps");
         let ws_lock_path = ws_root.join("milpa.lock");
-        let index = maybe_index(no_index)?;
+        let index = maybe_index(no_index, false, false)?;
         let profile = profile_from_env();
         let graph = resolve_workspace_with_features(
             &ws_with_override,
@@ -1348,7 +1373,7 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -> R
 
     let deps_dir = dir.join("_deps");
     let registry = build_registry();
-    let index = maybe_index(no_index)?;
+    let index = maybe_index(no_index, false, false)?;
     let profile = profile_from_env();
     let graph = resolve(
         &proposed,
@@ -1509,7 +1534,7 @@ fn cmd_workspace_add_member(
 
     // Delegate to apply_workspace_manifest_change.
     let registry = build_registry();
-    let index = maybe_index(no_index)?;
+    let index = maybe_index(no_index, false, false)?;
     let profile = profile_from_env();
     let _rel_path = rel_path.clone();
     apply_workspace_manifest_change(
@@ -1653,7 +1678,7 @@ fn cmd_workspace_remove_member(
 
     // Delegate to apply_workspace_manifest_change.
     let registry = build_registry();
-    let index = maybe_index(no_index)?;
+    let index = maybe_index(no_index, false, false)?;
     let profile = profile_from_env();
     let _matched_path = matched_path.clone();
     apply_workspace_manifest_change(
@@ -1869,7 +1894,7 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
         // Rebuild workspace with proposed member manifest and resolve.
         let ws_with_override = ws_with_member_override(&ws, dir, proposed_member.clone());
         let ws_deps_dir = ws_root.join("_deps");
-        let index = maybe_index(no_index)?;
+        let index = maybe_index(no_index, false, false)?;
         let profile = profile_from_env();
         let graph = resolve_workspace_with_features(
             &ws_with_override,
@@ -1942,7 +1967,7 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool) -
 
     let deps_dir = dir.join("_deps");
     let registry = build_registry();
-    let index = maybe_index(no_index)?;
+    let index = maybe_index(no_index, false, false)?;
     let profile = profile_from_env();
     let graph = resolve(
         &proposed,
@@ -2024,7 +2049,11 @@ fn no_index_requested(flag: bool) -> bool {
     matches!(std::env::var("MILPA_INDEX_URL"), Ok(s) if s.trim().is_empty())
 }
 
-fn maybe_index(no_index: bool) -> Result<Option<Index>, MilpaError> {
+fn maybe_index(
+    no_index: bool,
+    require_attested_index: bool,
+    refresh_index: bool,
+) -> Result<Option<Index>, MilpaError> {
     // --no-index flag OR present-but-empty MILPA_INDEX_URL → explicitly no
     // index (the flag overrides any configured index). Absent → default URL.
     if no_index_requested(no_index) {
@@ -2041,23 +2070,123 @@ fn maybe_index(no_index: bool) -> Result<Option<Index>, MilpaError> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let http = |url: &str| -> Result<String, String> {
+
+    let http = |url: &str| -> Result<Vec<u8>, String> {
         let out = std::process::Command::new("curl")
             .args(["-fsSL", url])
             .output()
             .map_err(|e| format!("curl: {e}"))?;
         if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            Ok(out.stdout)
         } else {
             Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
         }
     };
+
+    // S6: Build IndexTrustConfig from env vars + CLI flags.
+    // MILPA_INDEX_TRUST: "warn"|"strict"|"off" (default: "warn" per manifest default)
+    // MILPA_INDEX_TRUST_SIGNER: override SubjectAltName
+    // MILPA_INDEX_TRUST_BUNDLE: override trust bundle file path
+    // MILPA_INDEX_MAX_AGE: override max freshness age in seconds
+    //
+    // --require-attested-index escalates to Strict regardless of env.
+    // SigstoreVerifier stays unimplemented! (S4b) — passed only when trust gate is active
+    // but the bundle endpoint does not yet exist in tianguis production (§9.2 prerequisite).
+    use milpa_core::index_trust::{IndexTrustConfig, SigstoreVerifier, TrustBundle};
+    use milpa_core::{BundleError, BundleHttpGet};
+    use milpa_manifest::TrustPolicy;
+
+    let env_policy: Option<TrustPolicy> = std::env::var("MILPA_INDEX_TRUST").ok().and_then(|v| {
+        match v.trim() {
+            "strict" => Some(TrustPolicy::Strict),
+            "warn" => Some(TrustPolicy::Warn),
+            "off" => Some(TrustPolicy::Off),
+            _ => None,
+        }
+    });
+
+    let effective_policy = if require_attested_index {
+        TrustPolicy::Strict
+    } else {
+        env_policy.unwrap_or(TrustPolicy::Warn)
+    };
+
+    // Only wire the trust gate when policy is not Off (avoid wasting a bundle
+    // fetch and constructing SigstoreVerifier when the user explicitly disabled it).
+    let (config_opt, verifier_ref, bundle_http): (
+        Option<IndexTrustConfig>,
+        Option<SigstoreVerifier>,
+        Option<Box<dyn Fn(&str) -> Result<Vec<u8>, BundleError>>>,
+    ) = if effective_policy == TrustPolicy::Off {
+        (None, None, None)
+    } else {
+        // Default signer: the tianguis vendor-bot GitHub Actions OIDC workflow URL
+        // (RFC §3.2). Override via MILPA_INDEX_TRUST_SIGNER or index-trust-signer.
+        const DEFAULT_SIGNER: &str =
+            "https://github.com/coreyleavitt/tianguis/.github/workflows/publish-index.yaml\
+             @refs/heads/main";
+        let signer = std::env::var("MILPA_INDEX_TRUST_SIGNER")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_SIGNER.to_string());
+
+        let trust_bundle = TrustBundle::production();
+
+        let max_age: Option<u64> = std::env::var("MILPA_INDEX_MAX_AGE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok());
+
+        let mut cfg = IndexTrustConfig::new(effective_policy, trust_bundle, signer);
+        if let Some(age) = max_age {
+            cfg.max_age_seconds = age;
+        }
+
+        let bundle_http_fn = |bundle_url: &str| -> Result<Vec<u8>, BundleError> {
+            let out = std::process::Command::new("curl")
+                .args(["-fsSL", bundle_url])
+                .output()
+                .map_err(|e| BundleError::Other(format!("curl: {e}")))?;
+            if out.status.success() {
+                Ok(out.stdout)
+            } else {
+                // Attempt to distinguish 404 from other errors: re-run with -w for status.
+                let status_out = std::process::Command::new("curl")
+                    .args(["-o", "/dev/null", "-s", "-w", "%{http_code}", bundle_url])
+                    .output()
+                    .map_err(|e| BundleError::Other(format!("curl status check: {e}")))?;
+                let code = String::from_utf8_lossy(&status_out.stdout);
+                if code.trim() == "404" {
+                    Err(BundleError::NotFound)
+                } else {
+                    Err(BundleError::Other(
+                        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                    ))
+                }
+            }
+        };
+
+        (
+            Some(cfg),
+            Some(SigstoreVerifier),
+            Some(Box::new(bundle_http_fn)),
+        )
+    };
+
+    let verifier_trait: Option<&dyn milpa_core::index_trust::IndexBundleVerifier> =
+        verifier_ref.as_ref().map(|v| v as &dyn milpa_core::index_trust::IndexBundleVerifier);
+    let bundle_fn_ref: Option<BundleHttpGet<'_>> =
+        bundle_http.as_deref().map(|f| f as BundleHttpGet<'_>);
+
     match load_index(
         &url,
         &index_cache_dir(),
         &http,
         DEFAULT_TTL_SECONDS,
         now,
+        config_opt.as_ref(),
+        verifier_trait,
+        bundle_fn_ref,
+        refresh_index,
     ) {
         Ok(index) => Ok(Some(index)),
         // Non-catalog sentinels: index is unreachable or cache I/O failed.
@@ -3294,7 +3423,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_URL", &url) };
         unsafe { std::env::set_var("XDG_CACHE_HOME", tmp.path()) };
 
-        let result = maybe_index(false);
+        let result = maybe_index(false, false, false);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };
@@ -3327,7 +3456,7 @@ mod tests {
         };
         unsafe { std::env::set_var("XDG_CACHE_HOME", tmp.path()) };
 
-        let result = maybe_index(false);
+        let result = maybe_index(false, false, false);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };

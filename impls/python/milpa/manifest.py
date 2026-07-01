@@ -141,6 +141,7 @@ from milpa.kdl_io import (
     value_as_strict_int,
 )
 from milpa.predicate import Predicate  # SSOT for Predicate; re-exported below
+from milpa.trust import TrustPolicy, _parse_trust_policy
 from milpa.version import VersionSet
 
 # Re-export so ``milpa.manifest.Predicate`` still resolves for all existing
@@ -152,7 +153,6 @@ __all__ = ["Predicate"]
 # ---------------------------------------------------------------------------
 
 Kind = Literal["library", "application"]
-AttestationPolicy = Literal["permissive", "strict"]
 
 MANIFEST_SPEC_VERSION: int = 1
 """Highest manifest spec-version epoch this implementation understands.
@@ -178,6 +178,10 @@ _PACKAGE_TOP_LEVEL: frozenset[str] = frozenset(
         "cas",
         "spec-version",
         "attestation-policy",
+        # S5 (RFC registry-trust-federation §6.4): whole-index attestation gate.
+        "index-trust",
+        "index-trust-signer",
+        "index-trust-bundle",
     }
 )
 
@@ -515,8 +519,15 @@ class Manifest:
     spec_version_explicit: bool = False
     dev_deps: tuple[Dep, ...] = ()
     had_comments: bool = False
-    attestation_policy: AttestationPolicy = "permissive"
+    attestation_policy: TrustPolicy = "warn"
     optional_auto_flags: frozenset[str] = frozenset()  # S7: not serialized
+    # S5 (RFC registry-trust-federation §6.4): whole-index attestation gate policy.
+    index_trust_policy: TrustPolicy = "warn"
+    """Effective index-trust policy parsed from ``index-trust`` node; defaults to ``'warn'``."""
+    index_trust_signer: str | None = None
+    """Expected SubjectAltName override from ``index-trust-signer`` node (RFC §3.2)."""
+    index_trust_bundle: str | None = None
+    """Trust-root override (``file://`` path) from ``index-trust-bundle`` node (RFC §3.2)."""
 
 
 @dataclass(frozen=True)
@@ -884,7 +895,11 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
     cas_dir: str = ""
     spec_version: int = 1
     spec_version_explicit: bool = False
-    attestation_policy: AttestationPolicy = "permissive"
+    attestation_policy: TrustPolicy = "warn"
+    # S5: index-trust nodes (RFC registry-trust-federation §6.4)
+    index_trust_policy: TrustPolicy = "warn"
+    index_trust_signer: str | None = None
+    index_trust_bundle: str | None = None
     seen_top_level: set[str] = set()
 
     for n in nodes(doc):
@@ -1004,19 +1019,49 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
                 raise MilpaError(
                     MAN_UNKNOWN_TOP_LEVEL,
                     "'attestation-policy' takes exactly one string argument "
-                    "('permissive' or 'strict')",
+                    "('warn', 'strict', or 'off')",
                     node="attestation-policy",
                 )
-            policy_val = raw_args[0]
-            if policy_val not in ("permissive", "strict"):
+            attestation_policy = _parse_trust_policy(
+                raw_args[0], node="attestation-policy"
+            )
+
+        elif nm == "index-trust":
+            # S5: whole-index attestation gate policy (RFC §6.4).
+            raw_args = node_args(n)
+            if len(raw_args) != 1 or not isinstance(raw_args[0], str):
                 raise MilpaError(
                     MAN_UNKNOWN_TOP_LEVEL,
-                    f"'attestation-policy' must be 'permissive' or 'strict', "
-                    f"got {policy_val!r}",
-                    node="attestation-policy",
-                    value=policy_val,
+                    "'index-trust' takes exactly one string argument "
+                    "('warn', 'strict', or 'off')",
+                    node="index-trust",
                 )
-            attestation_policy = policy_val  # type: ignore[assignment]
+            index_trust_policy = _parse_trust_policy(raw_args[0], node="index-trust")
+
+        elif nm == "index-trust-signer":
+            # S5: expected SubjectAltName override (RFC §3.2, §6.4).
+            raw_args = node_args(n)
+            if len(raw_args) != 1 or not isinstance(raw_args[0], str):
+                raise MilpaError(
+                    MAN_UNKNOWN_TOP_LEVEL,
+                    "'index-trust-signer' takes exactly one string argument "
+                    "(expected SubjectAltName / OIDC workflow URL)",
+                    node="index-trust-signer",
+                )
+            index_trust_signer = raw_args[0]
+
+        elif nm == "index-trust-bundle":
+            # S5: trust-root override — a file:// path to a custom Fulcio CA +
+            # Rekor key bundle (RFC §3.2, §6.4).
+            raw_args = node_args(n)
+            if len(raw_args) != 1 or not isinstance(raw_args[0], str):
+                raise MilpaError(
+                    MAN_UNKNOWN_TOP_LEVEL,
+                    "'index-trust-bundle' takes exactly one string argument "
+                    "(a file:// path to an alternate trust root bundle)",
+                    node="index-trust-bundle",
+                )
+            index_trust_bundle = raw_args[0]
 
         elif nm == "flags":
             flags = _parse_flags_block(n)
@@ -1085,6 +1130,9 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
         dev_deps=tuple(dev_deps),
         attestation_policy=attestation_policy,
         optional_auto_flags=optional_auto_flags,
+        index_trust_policy=index_trust_policy,
+        index_trust_signer=index_trust_signer,
+        index_trust_bundle=index_trust_bundle,
     )
 
 

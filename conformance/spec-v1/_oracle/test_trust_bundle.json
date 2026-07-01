@@ -1,0 +1,4 @@
+{
+  "__placeholder__": true,
+  "__note__": "Test Sigstore trust bundle — real bundle generated in S5 alongside the integration test (RFC §12.2). Per-impl integration tests against this file are @pytest.mark.skip until S5 (hermetic Sigstore signing requires live Fulcio/Rekor). The shared S7 conformance corpus uses MockVerifier and does NOT depend on this file."
+}

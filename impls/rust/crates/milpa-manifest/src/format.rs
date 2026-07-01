@@ -575,7 +575,10 @@ mod tests {
             cas_dir: String::new(),
             spec_version: 1,
             spec_version_explicit: false,
-            attestation_policy: crate::AttestationPolicy::Permissive,
+            attestation_policy: crate::TrustPolicy::Warn,
+            index_trust_policy: crate::TrustPolicy::Warn,
+            index_trust_signer: None,
+            index_trust_bundle: None,
             optional_auto_flags: std::collections::BTreeSet::new(),
         }
     }

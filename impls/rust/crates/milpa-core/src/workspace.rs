@@ -387,12 +387,126 @@ pub fn load_workspace_from_manifest(
         });
     }
 
+    // S6: workspace index-trust validation (RFC registry-trust-federation §6.4a).
+    // Raise WS-INDEX-CONFLICTING-SIGNERS if members disagree on signer/bundle
+    // identity BEFORE any network fetch (manifest-consistency error).
+    check_conflicting_signers(root, &members)?;
+
     Ok(LoadedWorkspace {
         root: root.to_path_buf(),
         members,
         overrides: parsed.overrides.clone(),
         flags: parsed.flags.clone(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// S6: workspace index-trust merge + conflicting-signers check
+// ---------------------------------------------------------------------------
+
+/// Return the MAX of root + all member `index_trust_policy` values.
+///
+/// `strict > warn > off` (RFC registry-trust-federation §6.4a).  A workspace
+/// where root=`warn` and any member=`strict` resolves under `strict`.  The
+/// returned value is the effective policy for the whole workspace invocation.
+pub fn merge_workspace_index_trust_policy(
+    root_policy: &milpa_manifest::TrustPolicy,
+    member_policies: &[milpa_manifest::TrustPolicy],
+) -> milpa_manifest::TrustPolicy {
+    use milpa_manifest::TrustPolicy;
+    fn rank(p: &TrustPolicy) -> u8 {
+        match p {
+            TrustPolicy::Strict => 2,
+            TrustPolicy::Warn => 1,
+            TrustPolicy::Off => 0,
+        }
+    }
+    let mut best = root_policy.clone();
+    for p in member_policies {
+        if rank(p) > rank(&best) {
+            best = p.clone();
+        }
+    }
+    best
+}
+
+/// Raise `WS-INDEX-CONFLICTING-SIGNERS` if workspace members disagree on
+/// `index_trust_signer` or `index_trust_bundle`.
+///
+/// Only non-`None` values are compared; a member that does not declare a signer
+/// cannot conflict with one that does (the non-declaring member inherits the
+/// default, which is an operator/env concern, not a manifest conflict).
+///
+/// This is a manifest-consistency check and is raised BEFORE any index fetch
+/// (RFC §6.4a).
+pub fn check_conflicting_signers(
+    workspace_root: &Path,
+    members: &[LoadedMember],
+) -> Result<(), MilpaError> {
+    // Collect { signer_value → [member_path, ...] }.
+    let mut signer_to_members: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut bundle_to_members: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+
+    for member in members {
+        if let Some(ref signer) = member.manifest.index_trust_signer {
+            signer_to_members
+                .entry(signer.clone())
+                .or_default()
+                .push(member.path.clone());
+        }
+        if let Some(ref bundle) = member.manifest.index_trust_bundle {
+            bundle_to_members
+                .entry(bundle.clone())
+                .or_default()
+                .push(member.path.clone());
+        }
+    }
+
+    if signer_to_members.len() > 1 {
+        let mut entries: Vec<_> = signer_to_members.into_iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let (signer_a, members_a) = &entries[0];
+        let (signer_b, members_b) = &entries[1];
+        return Err(ws(
+            "WS-INDEX-CONFLICTING-SIGNERS",
+            format!(
+                "workspace members declare conflicting index-trust-signer values: \
+                 {:?} (in {:?}) vs {:?} (in {:?}). \
+                 All members sharing an index URL must agree on the signer identity. \
+                 workspace root: {}",
+                signer_a,
+                members_a,
+                signer_b,
+                members_b,
+                workspace_root.display()
+            ),
+        ));
+    }
+
+    if bundle_to_members.len() > 1 {
+        let mut entries: Vec<_> = bundle_to_members.into_iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let (bundle_a, members_a) = &entries[0];
+        let (bundle_b, members_b) = &entries[1];
+        return Err(ws(
+            "WS-INDEX-CONFLICTING-SIGNERS",
+            format!(
+                "workspace members declare conflicting index-trust-bundle values: \
+                 {:?} (in {:?}) vs {:?} (in {:?}). \
+                 All members sharing an index URL must agree on the trust-bundle. \
+                 workspace root: {}",
+                bundle_a,
+                members_a,
+                bundle_b,
+                members_b,
+                workspace_root.display()
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

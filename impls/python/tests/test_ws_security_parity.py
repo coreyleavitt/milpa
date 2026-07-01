@@ -19,6 +19,7 @@ import pytest
 
 from milpa.errors import (
     MilpaError,
+    WS_INDEX_CONFLICTING_SIGNERS,
     WS_MEMBER_DIR_MISSING,
     WS_MEMBER_DOT,
     WS_MEMBER_IS_WORKSPACE,
@@ -29,6 +30,7 @@ from milpa.workspace import (
     load_workspace,
     load_workspace_from_manifest,
     load_workspace_with_member_override,
+    merge_workspace_index_trust_policy,
 )
 
 
@@ -450,3 +452,177 @@ def test_member_override_missing_member_raises_milpa_error(tmp_path: Path) -> No
     )
     with pytest.raises(MilpaError):
         load_workspace_with_member_override(workspace, nonmember, dummy_manifest)
+
+
+# ---------------------------------------------------------------------------
+# S5: workspace index-trust max-merge (RFC registry-trust-federation §6.4a)
+# ---------------------------------------------------------------------------
+
+
+class TestMergeWorkspaceIndexTrustPolicy:
+    """Unit tests for ``merge_workspace_index_trust_policy``.
+
+    The effective policy = MAX(root, *members) with strict > warn > off.
+    This is computed BEFORE the index is loaded so every resolve call sees
+    the most-restrictive declared policy in the workspace.
+    """
+
+    def test_all_warn_returns_warn(self) -> None:
+        assert merge_workspace_index_trust_policy("warn", ["warn", "warn"]) == "warn"
+
+    def test_all_off_returns_off(self) -> None:
+        assert merge_workspace_index_trust_policy("off", ["off", "off"]) == "off"
+
+    def test_all_strict_returns_strict(self) -> None:
+        assert merge_workspace_index_trust_policy("strict", ["strict"]) == "strict"
+
+    def test_member_strict_escalates_root_warn(self) -> None:
+        """root=warn + any member=strict → strict (RFC §6.4a conformance fixture)."""
+        assert merge_workspace_index_trust_policy("warn", ["warn", "strict"]) == "strict"
+
+    def test_root_strict_overrides_member_warn(self) -> None:
+        """root=strict + members=warn → strict."""
+        assert merge_workspace_index_trust_policy("strict", ["warn", "warn"]) == "strict"
+
+    def test_root_off_member_warn_returns_warn(self) -> None:
+        """root=off + member=warn → warn (warn > off)."""
+        assert merge_workspace_index_trust_policy("off", ["warn"]) == "warn"
+
+    def test_root_off_member_strict_returns_strict(self) -> None:
+        """root=off + member=strict → strict (strict > warn > off)."""
+        assert merge_workspace_index_trust_policy("off", ["strict"]) == "strict"
+
+    def test_no_members_returns_root_policy(self) -> None:
+        """No members: effective policy = root policy."""
+        assert merge_workspace_index_trust_policy("strict", []) == "strict"
+        assert merge_workspace_index_trust_policy("warn", []) == "warn"
+        assert merge_workspace_index_trust_policy("off", []) == "off"
+
+    def test_member_off_cannot_weaken_root_warn(self) -> None:
+        """Member=off cannot weaken root=warn."""
+        assert merge_workspace_index_trust_policy("warn", ["off"]) == "warn"
+
+    def test_mixed_strict_warn_off_returns_strict(self) -> None:
+        """MAX of all three values is strict."""
+        result = merge_workspace_index_trust_policy("off", ["warn", "strict", "off"])
+        assert result == "strict"
+
+
+# ---------------------------------------------------------------------------
+# S5: workspace conflicting-signers validation error (RFC §6.4a)
+# ---------------------------------------------------------------------------
+
+
+def _make_workspace_with_members(
+    tmp_path: Path,
+    members: list[tuple[str, str | None, str | None]],
+    workspace_rel: str = "ws",
+) -> Path:
+    """Create a workspace directory with members.
+
+    ``members`` is a list of (name, index_trust_signer, index_trust_bundle).
+    Returns the workspace root path.
+    """
+    ws_root = tmp_path / workspace_rel
+    ws_root.mkdir()
+
+    member_decls = []
+    for i, (name, signer, bundle) in enumerate(members):
+        member_dir = ws_root / f"pkg_{i}"
+        member_dir.mkdir()
+        kdl_lines = [f'name "{name}"']
+        if signer is not None:
+            kdl_lines.append(f'index-trust-signer "{signer}"')
+        if bundle is not None:
+            kdl_lines.append(f'index-trust-bundle "{bundle}"')
+        (member_dir / "milpa.kdl").write_text("\n".join(kdl_lines) + "\n")
+        member_decls.append(f'  member "pkg_{i}"')
+
+    ws_kdl = "workspace {\n" + "\n".join(member_decls) + "\n}\n"
+    (ws_root / "milpa.kdl").write_text(ws_kdl)
+    return ws_root
+
+
+class TestConflictingSigners:
+    """Workspace conflicting-signers validation fires at load time, before any fetch."""
+
+    def test_two_members_same_signer_ok(self, tmp_path: Path) -> None:
+        """Members agreeing on signer → no error."""
+        signer = "https://github.com/acme/reg/.github/workflows/sign.yaml@refs/heads/main"
+        ws = _make_workspace_with_members(tmp_path, [
+            ("a", signer, None),
+            ("b", signer, None),
+        ])
+        loaded = load_workspace(ws)
+        assert len(loaded.members) == 2
+
+    def test_two_members_no_signer_ok(self, tmp_path: Path) -> None:
+        """Members with no signer declaration → no error (inherits default)."""
+        ws = _make_workspace_with_members(tmp_path, [
+            ("a", None, None),
+            ("b", None, None),
+        ])
+        loaded = load_workspace(ws)
+        assert len(loaded.members) == 2
+
+    def test_two_members_conflicting_signers_raises(self, tmp_path: Path) -> None:
+        """Two members with DIFFERENT signers → WS-INDEX-CONFLICTING-SIGNERS."""
+        signer_a = "https://github.com/acme/.github/workflows/sign.yaml@refs/heads/main"
+        signer_b = "https://github.com/other/.github/workflows/sign.yaml@refs/heads/main"
+        ws = _make_workspace_with_members(tmp_path, [
+            ("a", signer_a, None),
+            ("b", signer_b, None),
+        ])
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace(ws)
+        assert exc_info.value.slug == WS_INDEX_CONFLICTING_SIGNERS
+
+    def test_two_members_conflicting_bundles_raises(self, tmp_path: Path) -> None:
+        """Two members with DIFFERENT trust-bundles → WS-INDEX-CONFLICTING-SIGNERS."""
+        bundle_a = "https://registry-a.test/trust_bundle.json"
+        bundle_b = "https://registry-b.test/trust_bundle.json"
+        ws = _make_workspace_with_members(tmp_path, [
+            ("a", None, bundle_a),
+            ("b", None, bundle_b),
+        ])
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace(ws)
+        assert exc_info.value.slug == WS_INDEX_CONFLICTING_SIGNERS
+
+    def test_conflicting_error_includes_member_paths(self, tmp_path: Path) -> None:
+        """WS-INDEX-CONFLICTING-SIGNERS error context includes the conflicting members."""
+        signer_a = "https://github.com/acme/.github/workflows/sign.yaml@refs/heads/main"
+        signer_b = "https://github.com/other/.github/workflows/sign.yaml@refs/heads/main"
+        ws = _make_workspace_with_members(tmp_path, [
+            ("a", signer_a, None),
+            ("b", signer_b, None),
+        ])
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace(ws)
+        # Context or message should include at least one of the conflicting signers.
+        combined = exc_info.value.message + str(exc_info.value.context)
+        assert signer_a in combined or signer_b in combined
+
+    def test_one_member_declares_signer_other_does_not_ok(self, tmp_path: Path) -> None:
+        """One member declaring a signer, other declaring None → no conflict."""
+        signer = "https://github.com/acme/.github/workflows/sign.yaml@refs/heads/main"
+        ws = _make_workspace_with_members(tmp_path, [
+            ("a", signer, None),
+            ("b", None, None),  # no signer — inherits default
+        ])
+        # Only non-None signers participate in the conflict check.
+        loaded = load_workspace(ws)
+        assert len(loaded.members) == 2
+
+    def test_conflicting_check_fires_before_fetch(self, tmp_path: Path) -> None:
+        """Conflicting-signers check fires at workspace load time, not at fetch time."""
+        signer_a = "https://github.com/acme/.github/workflows/sign.yaml@refs/heads/main"
+        signer_b = "https://github.com/other/.github/workflows/sign.yaml@refs/heads/main"
+        ws = _make_workspace_with_members(tmp_path, [
+            ("a", signer_a, None),
+            ("b", signer_b, None),
+        ])
+        # Must raise during load_workspace, not lazily at resolution time.
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace(ws)
+        assert exc_info.value.slug == WS_INDEX_CONFLICTING_SIGNERS

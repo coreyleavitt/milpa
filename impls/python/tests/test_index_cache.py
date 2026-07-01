@@ -1,4 +1,4 @@
-"""Tests for milpa.index_cache — S8b.
+"""Tests for milpa.index_cache — S8b (updated for S5 bytes transport).
 
 Drives ALL FOUR cache states via injected ``http_get`` + ``now_unix``.
 No network access; no real sleep; no reads from ``~/.cache``.
@@ -17,6 +17,9 @@ Also covers:
   - ``index_url_from_env`` default + override.
   - Atomic write: no partial file visible to a concurrent reader.
   - Parse error in fetched bytes propagates the correct ``TNG-*`` slug.
+
+S5 note: ``HttpGet`` now returns ``bytes`` (not ``str``) — all mock transports
+updated accordingly.  ``urllib_http_get`` also returns ``bytes``.
 """
 
 from __future__ import annotations
@@ -30,10 +33,29 @@ from milpa.index_cache import (
     DEFAULT_INDEX_URL,
     DEFAULT_TTL_SECONDS,
     HttpGet,
+    _BundleNotFound,
     cache_path_for,
+    derive_bundle_url,
     index_url_from_env,
     load_index,
     urllib_http_get,
+)
+from milpa.index_trust import (
+    BundleMissing,
+    BundleStale,
+    DigestMismatch,
+    IndexTrustConfig,
+    MockVerifier,
+    SigInvalid,
+    Trusted,
+    TrustBundle,
+    VerificationResult,
+    _reset_warned_urls,
+)
+from milpa.errors import (
+    TNG_INDEX_BUNDLE_MISSING,
+    TNG_INDEX_DIGEST_MISMATCH,
+    TNG_INDEX_SIGNATURE_INVALID,
 )
 
 # ---------------------------------------------------------------------------
@@ -86,17 +108,21 @@ BAD_SCHEMA_INDEX = "schema_version 99\n"
 
 
 def make_counter_get(body: str) -> tuple[HttpGet, list[int]]:
-    """Return an ``HttpGet`` that serves *body* and a call-count list."""
-    calls: list[int] = [0]
+    """Return an ``HttpGet`` that serves *body* as bytes and a call-count list.
 
-    def get(url: str) -> str:
+    S5: HttpGet now returns ``bytes``; the body is encoded to UTF-8.
+    """
+    calls: list[int] = [0]
+    body_bytes = body.encode("utf-8")
+
+    def get(url: str) -> bytes:
         calls[0] += 1
-        return body
+        return body_bytes
 
     return get, calls
 
 
-def failing_get(url: str) -> str:
+def failing_get(url: str) -> bytes:
     raise RuntimeError("network down")
 
 
@@ -118,7 +144,7 @@ class TestMissingState:
         load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000)
         cache_file = cache_path_for(URL, tmp_path)
         assert cache_file.is_file()
-        assert "schema_version" in cache_file.read_text()
+        assert b"schema_version" in cache_file.read_bytes()
 
     def test_missing_writes_stamp_file(self, tmp_path: Path) -> None:
         get, _ = make_counter_get(VALID_INDEX)
@@ -152,7 +178,8 @@ class TestFreshState:
 
         # Override the cache with different content to confirm we read from disk.
         cache_file = cache_path_for(URL, tmp_path)
-        cache_file.write_text(VALID_INDEX_V2)
+        # S5: cache is written as bytes; overwrite as bytes too.
+        cache_file.write_bytes(VALID_INDEX_V2.encode("utf-8"))
 
         idx = load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000)
         # Fresh → reads what's on disk (our overwrite).
@@ -199,7 +226,7 @@ class TestStaleState:
 
         assert idx.packages[0].versions[0].version == "2.0.0"
         cache_file = cache_path_for(URL, tmp_path)
-        assert "2.0.0" in cache_file.read_text()
+        assert b"2.0.0" in cache_file.read_bytes()
 
     def test_stale_refetch_updates_stamp(self, tmp_path: Path) -> None:
         get, _ = make_counter_get(VALID_INDEX)
@@ -532,7 +559,7 @@ class TestAtomicWrite:
         get, _ = make_counter_get(VALID_INDEX)
         load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000)
         cache_file = cache_path_for(URL, tmp_path)
-        content = cache_file.read_text()
+        content = cache_file.read_bytes().decode("utf-8")
         # The file should be parseable as a valid index.
         from milpa.registry import parse_index as _parse_index
         idx = _parse_index(content)
@@ -544,3 +571,366 @@ class TestAtomicWrite:
         load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000)
         tmp_files = list(tmp_path.glob("*.tmp.*"))
         assert tmp_files == [], f"left-over tmp files: {tmp_files}"
+
+
+# ---------------------------------------------------------------------------
+# S5 helpers — shared fixtures for trust-gate tests
+# ---------------------------------------------------------------------------
+
+_DUMMY_BUNDLE = TrustBundle(raw_json=b'{"__test__": true}', label="test:dummy")
+_DEFAULT_SIGNER = (
+    "https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml@refs/heads/main"
+)
+_FAKE_BUNDLE_BYTES = b'{"fake_bundle": true}'  # placeholder bytes; MockVerifier ignores content
+
+
+def _make_trust_config(policy: str = "strict", max_age: int = 604800) -> IndexTrustConfig:
+    return IndexTrustConfig(
+        policy=policy,  # type: ignore[arg-type]
+        trust_bundle=_DUMMY_BUNDLE,
+        expected_signer=_DEFAULT_SIGNER,
+        max_age_seconds=max_age,
+    )
+
+
+def make_bundle_get(bundle_bytes: bytes = _FAKE_BUNDLE_BYTES) -> "_BundleGet":
+    """Return a bundle_http_get that serves ``bundle_bytes``."""
+    def get(url: str) -> bytes:
+        return bundle_bytes
+    return get
+
+
+def failing_bundle_get(url: str) -> bytes:
+    """bundle_http_get that raises _BundleNotFound (HTTP 404 simulation)."""
+    raise _BundleNotFound(f"bundle 404: {url!r}")
+
+
+# Typing alias
+_BundleGet = "object"  # Callable[[str], bytes]
+
+
+# ---------------------------------------------------------------------------
+# 12. S5: Trust gate — verify on every cache read
+# ---------------------------------------------------------------------------
+
+
+class TestTrustGateVerifyEveryRead:
+    """Verify that crypto runs on EVERY cache read, not just network fetches (RFC §7.2)."""
+
+    def test_fresh_cache_crypto_verified(self, tmp_path: Path) -> None:
+        """State 1 (fresh cache): crypto verification fires before parse."""
+        get, _ = make_counter_get(VALID_INDEX)
+        verifier = MockVerifier(Trusted)
+        config = _make_trust_config("strict")
+        bundle_get = make_bundle_get()
+        _reset_warned_urls()
+
+        # First load: populates cache + bundle sidecar.
+        load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                   config=config, verifier=verifier, bundle_http_get=bundle_get)
+        # Second load: fresh cache (age=0 < TTL) → reads from disk.
+        idx = load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                         config=config, verifier=verifier, bundle_http_get=bundle_get)
+        assert idx.packages[0].name == "bar"
+
+    def test_fresh_cache_strict_sig_invalid_raises(self, tmp_path: Path) -> None:
+        """State 1 (fresh cache) + strict policy + SigInvalid → raises TNG-INDEX-SIGNATURE-INVALID."""
+        get, _ = make_counter_get(VALID_INDEX)
+        bundle_get = make_bundle_get()
+        _reset_warned_urls()
+
+        # Populate cache with Trusted verifier.
+        load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                   config=_make_trust_config("strict"),
+                   verifier=MockVerifier(Trusted),
+                   bundle_http_get=bundle_get)
+
+        # Re-read fresh cache with SigInvalid verifier — strict must raise.
+        with pytest.raises(MilpaError) as exc_info:
+            load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                       config=_make_trust_config("strict"),
+                       verifier=MockVerifier(SigInvalid),
+                       bundle_http_get=bundle_get)
+        assert exc_info.value.slug == TNG_INDEX_SIGNATURE_INVALID
+
+    def test_fresh_cache_warn_sig_invalid_proceeds(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """State 1 (fresh cache) + warn policy + SigInvalid → proceeds with warning."""
+        get, _ = make_counter_get(VALID_INDEX)
+        bundle_get = make_bundle_get()
+        _reset_warned_urls()
+
+        load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                   config=_make_trust_config("warn"),
+                   verifier=MockVerifier(Trusted),
+                   bundle_http_get=bundle_get)
+
+        _reset_warned_urls()
+        idx = load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                         config=_make_trust_config("warn"),
+                         verifier=MockVerifier(SigInvalid),
+                         bundle_http_get=bundle_get)
+        err = capsys.readouterr().err
+        assert TNG_INDEX_SIGNATURE_INVALID in err
+        assert idx.packages[0].name == "bar"
+
+    def test_off_policy_skips_verification(self, tmp_path: Path) -> None:
+        """off policy: verifier is not called; no exception even with SigInvalid."""
+        get, _ = make_counter_get(VALID_INDEX)
+        bundle_get = make_bundle_get()
+        _reset_warned_urls()
+
+        load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                   config=_make_trust_config("off"),
+                   verifier=MockVerifier(SigInvalid),  # would raise if called under strict
+                   bundle_http_get=bundle_get)
+        # No exception → off policy skips verification.
+
+
+# ---------------------------------------------------------------------------
+# 13. S5: Freshness only on network-fetch path (RFC §4 step 6, §7.2)
+# ---------------------------------------------------------------------------
+
+
+class TestFreshnessOnlyOnNetwork:
+    """Stale bundle on pure cache read: NOT BundleStale (freshness skipped).
+    Same stale bundle on network fetch: BundleStale (freshness asserted).
+    """
+
+    def test_stale_bundle_on_cache_read_does_not_raise(self, tmp_path: Path) -> None:
+        """State 1 (fresh cache): BundleStale result under strict MUST NOT raise.
+
+        The verifier is called with max_age_seconds=None (freshness skipped).
+        But our MockVerifier returns BundleStale regardless of max_age.
+        So we need to check the enforce_index_trust call with is_network_fetch=False.
+
+        Under strict + BundleStale on a cache read → should still raise (the
+        MockVerifier returns BundleStale; enforce_index_trust sees strict+BundleStale).
+        This test demonstrates the semantics of the FRESHNESS PATH (passed max_age=None
+        to verifier, verifier itself decides BundleStale vs not).
+
+        NOTE: since MockVerifier ignores max_age, we test the contract differently:
+        verify that a cache-read path passes max_age_seconds=None to the verifier.
+        """
+        # Use a verifier that records what max_age was passed.
+        recorded_max_age: list[int | None] = []
+
+        class RecordingVerifier:
+            def verify(self, index_bytes, bundle_bytes, trust_bundle, expected_signer,
+                       max_age_seconds):
+                recorded_max_age.append(max_age_seconds)
+                return Trusted  # always passes
+
+        get, _ = make_counter_get(VALID_INDEX)
+        bundle_get = make_bundle_get()
+        _reset_warned_urls()
+
+        # First fetch (network) → populates cache; max_age should be the config value.
+        config = _make_trust_config("strict", max_age=604800)
+        load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                   config=config, verifier=RecordingVerifier(),
+                   bundle_http_get=bundle_get)
+
+        # Second fetch (fresh cache) → max_age_seconds passed as None.
+        load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                   config=config, verifier=RecordingVerifier(),
+                   bundle_http_get=bundle_get)
+
+        assert len(recorded_max_age) == 2, f"expected 2 verify calls, got {recorded_max_age}"
+        # First call: network fetch → max_age is the config value.
+        assert recorded_max_age[0] == 604800, (
+            f"network fetch should pass max_age=604800, got {recorded_max_age[0]!r}"
+        )
+        # Second call: fresh cache read → max_age=None (freshness skipped).
+        assert recorded_max_age[1] is None, (
+            f"cache read should pass max_age=None, got {recorded_max_age[1]!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 14. S5: Bundle-URL derivation (RFC §7.3)
+# ---------------------------------------------------------------------------
+
+
+class TestBundleUrlDerivation:
+    """Normative bundle-URL derivation: strip query+fragment, append .bundle to path."""
+
+    def test_derive_bundle_url_default(self) -> None:
+        """Default index URL → expected bundle URL."""
+        from milpa.index_cache import DEFAULT_INDEX_URL
+        bundle_url = derive_bundle_url(DEFAULT_INDEX_URL)
+        assert bundle_url == (
+            "https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl.bundle"
+        )
+
+    def test_derive_bundle_url_plain(self) -> None:
+        """Simple URL: just appends .bundle to path."""
+        url = derive_bundle_url("https://example.com/index.kdl")
+        assert url == "https://example.com/index.kdl.bundle"
+
+    def test_derive_bundle_url_preserves_query(self) -> None:
+        """Query string is stripped from path, appended after .bundle."""
+        url = derive_bundle_url("https://example.com/index.kdl?ref=main")
+        # Path gets .bundle; query is reattached.
+        assert url == "https://example.com/index.kdl.bundle?ref=main"
+
+    def test_derive_bundle_url_preserves_fragment(self) -> None:
+        """Fragment is stripped from path, reattached after .bundle."""
+        url = derive_bundle_url("https://example.com/index.kdl#section")
+        assert url == "https://example.com/index.kdl.bundle#section"
+
+    def test_derive_bundle_url_naive_suffix_would_be_wrong(self) -> None:
+        """Naive string suffix would embed query params in path — derivation fixes this."""
+        idx_url = "https://example.com/index.kdl?ref=main"
+        naive = idx_url + ".bundle"  # would be wrong
+        correct = derive_bundle_url(idx_url)
+        assert correct != naive, "derivation must not naively append .bundle to the full URL"
+
+
+# ---------------------------------------------------------------------------
+# 15. S5: Bundle 404 handling — strict vs warn (RFC §7.2)
+# ---------------------------------------------------------------------------
+
+
+class TestBundle404Handling:
+    """bundle 404: strict → TNG-INDEX-BUNDLE-MISSING; warn → degraded marker."""
+
+    def test_bundle_404_strict_raises_bundle_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """strict + bundle 404 → raises TNG-INDEX-BUNDLE-MISSING; no cache written."""
+        get, _ = make_counter_get(VALID_INDEX)
+        config = _make_trust_config("strict")
+        _reset_warned_urls()
+
+        with pytest.raises(MilpaError) as exc_info:
+            load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                       config=config, verifier=MockVerifier(Trusted),
+                       bundle_http_get=failing_bundle_get)
+        assert exc_info.value.slug == TNG_INDEX_BUNDLE_MISSING
+        # Under strict, no partial cache state is written.
+        cache_file = cache_path_for(URL, tmp_path)
+        # The index file may or may not exist; but there should be no no-bundle marker.
+        no_bundle_marker = Path(str(cache_file) + ".no-bundle")
+        assert not no_bundle_marker.exists(), (
+            "strict must not write a degraded no-bundle marker"
+        )
+
+    def test_bundle_404_warn_writes_degraded_marker(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """warn + bundle 404 → writes .kdl.no-bundle marker, warning in stderr."""
+        get, _ = make_counter_get(VALID_INDEX)
+        config = _make_trust_config("warn")
+        _reset_warned_urls()
+
+        idx = load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                         config=config, verifier=MockVerifier(Trusted),
+                         bundle_http_get=failing_bundle_get)
+        assert idx.packages[0].name == "bar"  # resolve proceeds
+
+        cache_file = cache_path_for(URL, tmp_path)
+        no_bundle_marker = Path(str(cache_file) + ".no-bundle")
+        assert no_bundle_marker.exists(), (
+            "warn + bundle 404 must write the .kdl.no-bundle degraded marker"
+        )
+        err = capsys.readouterr().err
+        assert TNG_INDEX_BUNDLE_MISSING in err
+
+    def test_bundle_404_off_no_marker_no_warning(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """off + bundle 404 → no degraded marker, no warning (trust gate skipped)."""
+        get, _ = make_counter_get(VALID_INDEX)
+        config = _make_trust_config("off")
+        _reset_warned_urls()
+
+        idx = load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                         config=config, verifier=MockVerifier(Trusted),
+                         bundle_http_get=failing_bundle_get)
+        assert idx.packages[0].name == "bar"
+
+        err = capsys.readouterr().err
+        assert TNG_INDEX_BUNDLE_MISSING not in err
+
+
+# ---------------------------------------------------------------------------
+# 16. S5: Crash recovery (RFC §7.2 — bounded, one retry)
+# ---------------------------------------------------------------------------
+
+
+class TestCrashRecovery:
+    """On cache-read bundle missing/corrupt → delete sidecars + refetch ONCE."""
+
+    def test_missing_bundle_sidecar_triggers_recovery(
+        self, tmp_path: Path
+    ) -> None:
+        """Cache file exists but bundle sidecar is absent → recovery refetch succeeds."""
+        get, calls = make_counter_get(VALID_INDEX)
+        bundle_get = make_bundle_get()
+        config = _make_trust_config("strict")
+        _reset_warned_urls()
+
+        # First load: populates cache + bundle.
+        load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                   config=config, verifier=MockVerifier(Trusted),
+                   bundle_http_get=bundle_get)
+        assert calls[0] == 1
+
+        # Delete the bundle sidecar to simulate an interrupted write.
+        cache_file = cache_path_for(URL, tmp_path)
+        bundle_file = Path(str(cache_file) + ".bundle")
+        bundle_file.unlink()
+
+        # Fresh cache read (age=0 < TTL) but bundle missing → recovery refetch.
+        _reset_warned_urls()
+        idx = load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                         config=config, verifier=MockVerifier(Trusted),
+                         bundle_http_get=bundle_get)
+        assert idx.packages[0].name == "bar"
+        # Recovery refetch = one additional call.
+        assert calls[0] == 2, f"Expected recovery refetch; got {calls[0]} total calls"
+
+    def test_no_trust_config_no_recovery(self, tmp_path: Path) -> None:
+        """Without trust config, bundle sidecar absence is ignored (legacy path)."""
+        get, calls = make_counter_get(VALID_INDEX)
+        _reset_warned_urls()
+
+        # Populate cache without trust gate.
+        load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000)
+        assert calls[0] == 1
+
+        # Fresh cache read with no trust config → no recovery needed.
+        idx = load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000)
+        assert calls[0] == 1  # still only 1 call
+        assert idx.packages[0].name == "bar"
+
+
+# ---------------------------------------------------------------------------
+# 17. S5: --refresh-index bypasses cache TTL (RFC §7.4)
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshIndex:
+    def test_refresh_index_bypasses_fresh_cache(self, tmp_path: Path) -> None:
+        """refresh=True forces re-fetch even when cache is fresh."""
+        get, calls = make_counter_get(VALID_INDEX)
+        _reset_warned_urls()
+
+        # Populate cache.
+        load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000)
+        assert calls[0] == 1
+
+        # Refresh forces re-fetch (age=0 < TTL, but refresh=True).
+        load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000, refresh=True)
+        assert calls[0] == 2, "refresh=True must bypass cache TTL"
+
+    def test_no_refresh_respects_ttl(self, tmp_path: Path) -> None:
+        """refresh=False (default) respects TTL — serves from cache."""
+        get, calls = make_counter_get(VALID_INDEX)
+        _reset_warned_urls()
+
+        load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000)
+        load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000, refresh=False)
+        assert calls[0] == 1, "refresh=False must NOT re-fetch a fresh cache"

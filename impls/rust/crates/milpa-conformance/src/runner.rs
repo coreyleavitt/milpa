@@ -77,6 +77,9 @@ pub enum Produced {
     /// H-infra: a `cmd=hash` run that passed the expected/stdout assertion.
     /// The `identity` field carries the computed identity for diagnostic output.
     HashPass { identity: String },
+    /// S7: a `cmd=index-trust` run that passed the `expected/outcome` assertion.
+    /// The `outcome` field carries the computed outcome string for diagnostics.
+    IndexTrustPass { outcome: String },
 }
 
 /// The implementation under test. The `Err` payload is the error **code**
@@ -201,6 +204,9 @@ pub fn run_fixture(fx: &Fixture, target: &dyn Target, scratch: &Scratch) -> Verd
         // H-infra: hash fixture passed the expected/stdout assertion (checked
         // inside run_hash_fixture and returned as HashPass).
         (Expected::Success, Ok(Produced::HashPass { .. })) => Verdict::Pass,
+        // S7: index-trust policy state machine passed the expected/outcome assertion
+        // (checked inside run_index_trust_fixture and returned as IndexTrustPass).
+        (Expected::Success, Ok(Produced::IndexTrustPass { .. })) => Verdict::Pass,
     }
 }
 
@@ -895,12 +901,14 @@ impl Target for MilpaTarget {
 
                 // §13.1: effective strict = OR(manifest attestation-policy "strict",
                 // MILPA_REQUIRE_ATTESTED_METADATA flag from fixture env).
-                // Route through the milpa-core SSOT helpers (effective_strict_policy /
+                // Route through the milpa-core SSOT helpers (effective_trust_policy /
                 // workspace_any_member_strict) rather than re-deriving the OR rule.
                 let flag_strict = fixture_require_attested_metadata(&fx.dir);
                 let strict = match &doc {
                     ManifestDoc::Package(m) => {
-                        milpa_core::effective_strict_policy(&m.attestation_policy, flag_strict)
+                        use milpa_core::TrustPolicy;
+                        milpa_core::effective_trust_policy(&m.attestation_policy, flag_strict, None)
+                            == TrustPolicy::Strict
                     }
                     ManifestDoc::Workspace(_) => {
                         // Workspace: OR across all members (+ flag). Reuse the
@@ -981,6 +989,9 @@ impl Target for MilpaTarget {
             // independent of the frozen oracle, so reproducing the pin IS the
             // differential check.
             Cmd::DagOracle => run_dag_oracle_fixture(fx, scratch),
+            // S7: index-trust policy state machine (RFC registry-trust-federation §11 S7).
+            // MockVerifier-driven; no real Sigstore infrastructure required.
+            Cmd::IndexTrust => run_index_trust_fixture(fx),
         }
     }
 }
@@ -2366,6 +2377,165 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// S7: index-trust policy state machine fixture runner
+// ---------------------------------------------------------------------------
+
+/// Run a `cmd=index-trust` fixture: computes the effective trust policy via
+/// [`milpa_core::effective_trust_policy`], runs [`milpa_core::index_trust::enforce_index_trust`]
+/// with a [`MockVerifier`]-driven result, and compares the outcome to
+/// `expected/outcome`.
+///
+/// Env fields consumed:
+/// - `mock_verifier_result`      — `VerificationResult` wire string; drives MockVerifier.
+/// - `MILPA_INDEX_TRUST_MANIFEST` — simulated manifest `index-trust` policy
+///   (`warn` / `strict` / `off`; absent → `warn`).
+/// - `MILPA_INDEX_TRUST`         — env policy override (same axis as the CLI
+///   `MILPA_INDEX_TRUST` env var).
+/// - `MILPA_REQUIRE_ATTESTED_INDEX` — flag escalation (`1` = escalate warn→strict).
+/// - `MILPA_INDEX_TRUST_WS_MEMBER_MAX` — simulates workspace member max-merge:
+///   `max(root_policy, member_max)` replaces manifest policy before calling
+///   `effective_trust_policy`.
+/// - `MILPA_INDEX_TRUST_WS_CONFLICT` — workspace conflicting-signers (1 = conflict);
+///   immediately returns `error:WS-INDEX-CONFLICTING-SIGNERS` without going through
+///   the verifier (validated before any fetch in the real resolver).
+///
+/// Returns `Ok(Produced::IndexTrustPass { outcome })` when the computed outcome
+/// matches `expected/outcome`; `Err(message)` on any mismatch.
+fn run_index_trust_fixture(fx: &Fixture) -> Result<Produced, String> {
+    use milpa_core::index_trust::{
+        IndexBundleVerifier, MockVerifier, TrustBundle, VerificationResult, enforce_index_trust,
+    };
+    use milpa_core::{effective_trust_policy, parse_env_bool, TrustPolicy};
+
+    // Inline trust policy parser: same as milpa_manifest::parse_trust_policy.
+    // milpa_manifest is not in milpa-conformance's Cargo.toml deps; TrustPolicy
+    // IS re-exported from milpa_core. This mirrors the three-value logic exactly.
+    fn parse_trust_policy_str(s: &str, field: &str) -> Result<TrustPolicy, String> {
+        match s {
+            "warn" => Ok(TrustPolicy::Warn),
+            "strict" => Ok(TrustPolicy::Strict),
+            "off" => Ok(TrustPolicy::Off),
+            _ => Err(format!(
+                "unknown trust policy {s:?} for {field}: expected \"warn\", \"strict\", or \"off\""
+            )),
+        }
+    }
+
+    let dir = &fx.dir;
+    let env = fixture_env(dir);
+
+    // Read expected/outcome.
+    let outcome_path = dir.join("expected").join("outcome");
+    let expected_outcome = std::fs::read_to_string(&outcome_path)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| format!("cannot read expected/outcome: {e}"))?;
+
+    // Workspace conflicting-signers: hard validation error before any fetch/verify.
+    let ws_conflict = env
+        .get("MILPA_INDEX_TRUST_WS_CONFLICT")
+        .map(|v| parse_env_bool(v))
+        .unwrap_or(false);
+    if ws_conflict {
+        let got_outcome = "error:WS-INDEX-CONFLICTING-SIGNERS".to_string();
+        if got_outcome == expected_outcome {
+            return Ok(Produced::IndexTrustPass { outcome: got_outcome });
+        }
+        return Err(format!(
+            "outcome mismatch:\n  expected: {expected_outcome:?}\n  actual:   {got_outcome:?}"
+        ));
+    }
+
+    // Parse mock_verifier_result (drives MockVerifier; absent → "trusted").
+    let mock_result_str = env
+        .get("mock_verifier_result")
+        .map(|s| s.as_str())
+        .unwrap_or("trusted");
+    let mock_result = VerificationResult::from_value(mock_result_str)
+        .ok_or_else(|| format!("invalid mock_verifier_result: {mock_result_str:?}"))?;
+
+    // Manifest policy from env field (absent → Warn, same as absent index-trust node).
+    let manifest_policy_str = env
+        .get("MILPA_INDEX_TRUST_MANIFEST")
+        .map(|s| s.as_str())
+        .unwrap_or("warn");
+    let mut manifest_policy =
+        parse_trust_policy_str(manifest_policy_str, "MILPA_INDEX_TRUST_MANIFEST")
+            .map_err(|e| format!("invalid MILPA_INDEX_TRUST_MANIFEST: {e}"))?;
+
+    // Workspace member max-merge: max(root_policy, member_max_policy).
+    // strict=2 > warn=1 > off=0; only escalates, never demotes.
+    if let Some(ws_member_max_str) = env.get("MILPA_INDEX_TRUST_WS_MEMBER_MAX") {
+        let member_max =
+            parse_trust_policy_str(ws_member_max_str, "MILPA_INDEX_TRUST_WS_MEMBER_MAX")
+                .map_err(|e| format!("invalid MILPA_INDEX_TRUST_WS_MEMBER_MAX: {e}"))?;
+        let rank = |p: &TrustPolicy| match p {
+            TrustPolicy::Off => 0u8,
+            TrustPolicy::Warn => 1,
+            TrustPolicy::Strict => 2,
+        };
+        if rank(&member_max) > rank(&manifest_policy) {
+            manifest_policy = member_max;
+        }
+    }
+
+    // Env override (MILPA_INDEX_TRUST) and flag (MILPA_REQUIRE_ATTESTED_INDEX).
+    let env_override = env
+        .get("MILPA_INDEX_TRUST")
+        .and_then(|s| parse_trust_policy_str(s, "MILPA_INDEX_TRUST").ok());
+    let flag = env
+        .get("MILPA_REQUIRE_ATTESTED_INDEX")
+        .map(|v| parse_env_bool(v))
+        .unwrap_or(false);
+
+    // Compute effective policy via the shared SSOT helper (RFC §6.6 authority model).
+    let policy = effective_trust_policy(&manifest_policy, flag, env_override.as_ref());
+
+    // Build MockVerifier and call verify (ignores all params; returns mock_result).
+    let trust_bundle = TrustBundle::test();
+    let verifier = MockVerifier::new(mock_result.clone());
+    let result = verifier.verify(
+        b"index-bytes",
+        b"bundle-bytes",
+        &trust_bundle,
+        "",
+        None,
+    );
+
+    // Invoke enforce_index_trust and determine the outcome.
+    let got_outcome = match enforce_index_trust(result.clone(), &policy, "mock://test-index") {
+        Err(e) => format!("error:{}", e.code()),
+        Ok(()) => {
+            if policy == TrustPolicy::Off || result == VerificationResult::Trusted {
+                "trusted".to_string()
+            } else {
+                // policy == Warn + non-Trusted result → a warning was emitted to stderr.
+                // The slug is deterministically derivable from the VerificationResult variant
+                // (the slug_map in enforce_index_trust is a bijection; we mirror it here so
+                // the conformance runner can compute the outcome string for comparison without
+                // capturing stderr — the BEHAVIOR is verified by enforce_index_trust NOT raising).
+                let slug = match &result {
+                    VerificationResult::BundleMissing => "TNG-INDEX-BUNDLE-MISSING",
+                    VerificationResult::BundleMalformed => "TNG-INDEX-BUNDLE-MALFORMED",
+                    VerificationResult::SigInvalid => "TNG-INDEX-SIGNATURE-INVALID",
+                    VerificationResult::DigestMismatch => "TNG-INDEX-DIGEST-MISMATCH",
+                    VerificationResult::SignerMismatch => "TNG-INDEX-SIGNER-MISMATCH",
+                    VerificationResult::BundleStale => "TNG-INDEX-BUNDLE-STALE",
+                    VerificationResult::Trusted => unreachable!("handled above"),
+                };
+                format!("warn:{slug}")
+            }
+        }
+    };
+
+    if got_outcome == expected_outcome {
+        return Ok(Produced::IndexTrustPass { outcome: got_outcome });
+    }
+    Err(format!(
+        "outcome mismatch:\n  expected: {expected_outcome:?}\n  actual:   {got_outcome:?}"
+    ))
 }
 
 #[cfg(test)]

@@ -1,0 +1,3 @@
+MILPA_INDEX_TRUST_MANIFEST=off
+MILPA_INDEX_TRUST=strict
+mock_verifier_result=trusted

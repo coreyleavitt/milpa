@@ -1156,6 +1156,42 @@ The DepDecl artifact declares a `dep_decl_schema_version` greater than the imple
 
 **Triggered:** The consumer's version-enforcement check (§4.3 of `spec/dep-decl.md`) finds `artifact.dep_decl_schema_version > MAX_DEP_DECL_SCHEMA_VERSION`.  The user must upgrade their milpa installation.  Defined in `spec/dep-decl.md §6`.
 
+### `TNG-INDEX-BUNDLE-MISSING`
+
+No Sigstore bundle sidecar is available alongside the index.
+
+**Triggered:** `load_index` in `index_cache.py` attempts to fetch the bundle sidecar at the normatively derived URL (strip query+fragment from `MILPA_INDEX_URL`, append `.bundle` to path, reattach query+fragment) and receives an HTTP 404 or equivalent absence signal.  Under `strict` policy this is a hard failure; under `warn` a degraded-marker `.kdl.no-bundle` is written and the resolve proceeds with a `TNG-INDEX-BUNDLE-MISSING` warning (RFC §7.2, §7.4).
+
+### `TNG-INDEX-BUNDLE-MALFORMED`
+
+The Sigstore bundle JSON is unparseable or structurally invalid (pre-crypto failure, before any signature check).
+
+**Triggered:** `verify_index_bundle` in `index_trust.py` finds the bundle bytes are not valid JSON, are not a JSON object, or are missing the required `verificationMaterial.tlogEntries` structure.  This is distinct from `TNG-INDEX-SIGNATURE-INVALID` which covers cryptographic failures on a structurally valid bundle.
+
+### `TNG-INDEX-SIGNATURE-INVALID`
+
+Cryptographic verification of the whole-index Sigstore bundle failed.
+
+**Triggered:** `verify_index_bundle` in `index_trust.py` finds the Fulcio certificate chain validation fails, the Rekor inclusion proof is invalid, or the certificate was expired AT its own Rekor SET `integratedTime`.  A certificate now-expired by wall-clock but valid at `integratedTime` MUST NOT trigger this error (RFC §4 step 2 — cert-at-SET-time requirement).
+
+### `TNG-INDEX-DIGEST-MISMATCH`
+
+The bundle's attested subject digest does not match the index bytes.
+
+**Triggered:** `verify_index_bundle` in `index_trust.py` extracts `statement.subject[0].digest.sha256` from the DSSE in-toto attestation and finds it does not equal `sha256(index_bytes)`.  Indicates tampering after attestation or a mismatched bundle/index pair.  The slug uses `DIGEST` rather than `IDENTITY` because "identity" is a load-bearing milpa term meaning the `content_hash` of a source tree; using it here would create a false collision.
+
+### `TNG-INDEX-SIGNER-MISMATCH`
+
+The bundle's certificate SubjectAltName does not match the expected signer identity.
+
+**Triggered:** `verify_index_bundle` in `index_trust.py` finds the signing certificate's SubjectAltName does not equal the expected signer identity (default: pinned tianguis vendor-bot OIDC URL; overridable via `MILPA_INDEX_TRUST_SIGNER` env var or `index-trust-signer` manifest node — RFC §3.2).
+
+### `TNG-INDEX-BUNDLE-STALE`
+
+The Sigstore bundle is cryptographically valid but was signed beyond the maximum allowed age.
+
+**Triggered:** `verify_index_bundle` in `index_trust.py` on a network-fetch path (States 2 + crash-recovery refetch) finds `now - SET.integratedTime >= MILPA_INDEX_MAX_AGE` (default 7 days = 604800 s).  Indicates a rollback attack or a frozen CDN.  This check is NEVER asserted on pure cache reads (States 1 and 3) so offline/air-gapped invocations never fail on staleness; only the network-fetch boundary is defended (RFC §4 step 6, §7.2).
+
 ### `TNG-KDL-SYNTAX`
 
 The index text is not valid KDL and cannot be parsed.
@@ -1245,6 +1281,12 @@ The locked `dep_decl` pin no longer matches the current index pointer for a dep 
 **Triggered:** `milpa verify` loads the live index and finds that the `dep_decl` hash recorded in `milpa.lock` for a dep differs from the `dep_decl` pointer the index now carries for that version — the dependency graph has drifted since the lockfile was written. Also raised when the edge check is required but the index is offline and strict mode (`--require-attested-metadata`) is active.
 
 ## WS
+
+### `WS-INDEX-CONFLICTING-SIGNERS`
+
+Two or more workspace members declare different `index-trust-signer` or `index-trust-bundle` values for the same index URL.
+
+**Triggered:** `load_workspace` iterates workspace member manifests and finds that two members specify different signer identities (via `index-trust-signer`) or different trust-bundle overrides (via `index-trust-bundle`) for the same index URL. This check fires at workspace-load time, BEFORE any index fetch. The implementation includes the conflicting member paths, the index URL, and the two distinct signer (or bundle) values in the error context.
 
 ### `WS-MEMBER-DIR-MISSING`
 

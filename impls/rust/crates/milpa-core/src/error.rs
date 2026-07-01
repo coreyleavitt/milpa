@@ -243,6 +243,22 @@ impl CoreError {
             // index_cache; swallowed by maybe_index (→ treat index as absent).
             // Catalog entry satisfies the bijection invariant; no terminal fixture.
             "MILPA-INDEX-UNREACHABLE",
+            // S6 (Rust mirror of Python S5): tianguis index attestation failure codes
+            // (RFC rfc-registry-trust-federation §6 / §10, spec/errors.md TNG-INDEX-*).
+            // Emitted by enforce_index_trust / load_index when the Sigstore bundle
+            // sidecar is absent, malformed, cryptographically invalid, digest-mismatching,
+            // signer-mismatching, or beyond the max-age window.
+            "TNG-INDEX-BUNDLE-MISSING",
+            "TNG-INDEX-BUNDLE-MALFORMED",
+            "TNG-INDEX-SIGNATURE-INVALID",
+            "TNG-INDEX-DIGEST-MISMATCH",
+            "TNG-INDEX-SIGNER-MISMATCH",
+            "TNG-INDEX-BUNDLE-STALE",
+            // S6: workspace member signer-conflict detection (RFC §6.4a).
+            // Emitted by check_conflicting_signers in workspace.rs when two workspace
+            // members declare different index-trust-signer or index-trust-bundle values
+            // for the same index URL (manifest-consistency error; raised before fetch).
+            "WS-INDEX-CONFLICTING-SIGNERS",
         ]
     }
 }

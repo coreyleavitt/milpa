@@ -85,6 +85,16 @@ class MilpaEnv:
     #: ``_build_dep_decl_store`` to suppress index loading. (cli-contract §8.1)
     no_index: bool = False
 
+    # S5 (RFC registry-trust-federation §6.4 / §10.1): index-trust configuration.
+    # ``None`` disables the index-trust gate (legacy / no-bundle path).
+    # When set, ``load_index`` consults it for every index fetch/cache-read.
+    # Type is ``object | None`` to avoid a circular import with ``index_trust.py``;
+    # callers that need the typed API import ``IndexTrustConfig`` directly.
+    index_trust_config: object | None = None  # IndexTrustConfig | None
+
+    #: Force fresh index+bundle fetch, bypassing cache TTL (``--refresh-index``).
+    refresh_index: bool = False
+
 
 @dataclass(frozen=True)
 class ResolveParams:

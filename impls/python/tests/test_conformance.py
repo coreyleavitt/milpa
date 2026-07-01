@@ -1337,6 +1337,144 @@ def _dag_oracle_local_entries(local_spec: Path, tmp_dir: Path) -> list:
 
 
 # ---------------------------------------------------------------------------
+# S7: index-trust fixture tier (cmd=index-trust) — policy state machine test
+# ---------------------------------------------------------------------------
+# The index-trust fixture tier exercises the whole-index trust policy state
+# machine (RFC registry-trust-federation §11 S7) via MockVerifier — no real
+# Sigstore infrastructure required.
+#
+# Fixture schema:
+#   cmd                         ← "index-trust"
+#   env                         ← KEY=VALUE pairs (see below)
+#   index.kdl                   ← placeholder (not parsed by this runner)
+#   index.kdl.bundle            ← placeholder (MockVerifier ignores content)
+#   expected/outcome            ← "trusted" | "warn:TNG-INDEX-*" | "error:TNG-INDEX-*"
+#                                  or "error:WS-INDEX-CONFLICTING-SIGNERS"
+#
+# Env fields consumed by this runner:
+#   mock_verifier_result         ← VerificationResult wire string (drives MockVerifier)
+#   MILPA_INDEX_TRUST_MANIFEST   ← simulated manifest index-trust policy (warn/strict/off)
+#   MILPA_INDEX_TRUST            ← env override (mirrors MILPA_INDEX_TRUST env var)
+#   MILPA_REQUIRE_ATTESTED_INDEX ← flag escalation (1 = escalate warn→strict)
+#   MILPA_INDEX_TRUST_WS_MEMBER_MAX ← workspace member max policy (for fixture 12)
+#   MILPA_INDEX_TRUST_WS_CONFLICT   ← triggers WS-INDEX-CONFLICTING-SIGNERS (1 = conflict)
+#
+# Both the Python and Rust runners read the same env fields and produce the same
+# expected/outcome strings — the cross-impl convergence proof for the policy
+# state machine (RFC §10.3).
+
+# Maps VerificationResult → TNG-INDEX-* slug for the warn-outcome case.
+# Mirrors the enforce_index_trust slug_map; kept here to determine the warn
+# slug without re-parsing stderr (the conformance runner tests BEHAVIOR, not
+# message text).
+_VR_TO_SLUG: dict[str, str] = {
+    "bundle-missing": "TNG-INDEX-BUNDLE-MISSING",
+    "bundle-malformed": "TNG-INDEX-BUNDLE-MALFORMED",
+    "sig-invalid": "TNG-INDEX-SIGNATURE-INVALID",
+    "digest-mismatch": "TNG-INDEX-DIGEST-MISMATCH",
+    "signer-mismatch": "TNG-INDEX-SIGNER-MISMATCH",
+    "bundle-stale": "TNG-INDEX-BUNDLE-STALE",
+}
+
+# Trust policy rank for workspace member max-merge (strict > warn > off).
+_TRUST_POLICY_RANK: dict[str, int] = {"off": 0, "warn": 1, "strict": 2}
+
+
+def _execute_index_trust_fixture(
+    fixture: "Fixture",
+    tmp_dir: Path,
+) -> tuple[Literal["pass", "fail", "skip"], str]:
+    """Execute an index-trust fixture: policy state machine via MockVerifier.
+
+    Reads ``expected/outcome`` and compares to the computed outcome from
+    ``enforce_index_trust(MockVerifier(mock_result), effective_policy, url)``.
+
+    Both the Python and Rust runners produce byte-identical outcomes for all
+    eighteen scenarios in §10.3 — the cross-impl convergence proof.
+    """
+    from milpa.errors import MilpaError as _ME, WS_INDEX_CONFLICTING_SIGNERS
+    from milpa.index_trust import MockVerifier, VerificationResult, _reset_warned_urls, enforce_index_trust
+    from milpa.trust import effective_trust_policy
+
+    fixture_dir = fixture.dir
+    env = read_env_file(fixture_dir)
+
+    # Read expected/outcome
+    outcome_file = fixture_dir / "expected" / "outcome"
+    try:
+        expected_outcome = outcome_file.read_text(encoding="utf-8").strip()
+    except OSError as e:
+        return ("fail", f"cannot read expected/outcome: {e}")
+
+    # Workspace conflicting-signers special case: before any index fetch or verify,
+    # the workspace validation raises WS-INDEX-CONFLICTING-SIGNERS.
+    if env_flag(env, "MILPA_INDEX_TRUST_WS_CONFLICT"):
+        got_outcome = f"error:{WS_INDEX_CONFLICTING_SIGNERS}"
+        if got_outcome == expected_outcome:
+            return ("pass", "")
+        return (
+            "fail",
+            f"outcome mismatch:\n  expected: {expected_outcome!r}\n  actual:   {got_outcome!r}",
+        )
+
+    # Parse mock_verifier_result (drives MockVerifier).
+    mock_result_str = env.get("mock_verifier_result", "trusted")
+    try:
+        mock_result = VerificationResult(mock_result_str)
+    except ValueError:
+        return ("fail", f"invalid mock_verifier_result: {mock_result_str!r}")
+
+    # Determine manifest policy (simulated from MILPA_INDEX_TRUST_MANIFEST env field;
+    # defaults to "warn" when absent — mirrors absent index-trust node in milpa.kdl).
+    manifest_policy_str: str = env.get("MILPA_INDEX_TRUST_MANIFEST") or "warn"
+
+    # Workspace member max-merge: if MILPA_INDEX_TRUST_WS_MEMBER_MAX is set,
+    # the merged manifest policy is max(root_policy, member_max_policy).
+    # RFC §6.4a: strict > warn > off.
+    ws_member_max = env.get("MILPA_INDEX_TRUST_WS_MEMBER_MAX")
+    if ws_member_max is not None:
+        if _TRUST_POLICY_RANK.get(ws_member_max, 1) > _TRUST_POLICY_RANK.get(manifest_policy_str, 1):
+            manifest_policy_str = ws_member_max
+
+    # Env override and flag escalation.
+    env_trust = env.get("MILPA_INDEX_TRUST")  # None if absent
+    flag = env_flag(env, "MILPA_REQUIRE_ATTESTED_INDEX")
+
+    # Compute effective policy via the shared SSOT helper (RFC §6.6 authority model).
+    policy = effective_trust_policy(manifest_policy_str, flag, env_trust)
+
+    # Reset warn dedup before calling enforce so each fixture starts clean.
+    _reset_warned_urls()
+
+    # Build MockVerifier and get the verification result (MockVerifier ignores all params).
+    verifier = MockVerifier(mock_result)
+    result = verifier.verify(b"index-bytes", b"bundle-bytes", None, "", None)  # type: ignore[arg-type]
+
+    # Invoke enforce_index_trust and observe the outcome.
+    _test_url = "mock://test-index"
+    try:
+        enforce_index_trust(result, policy, _test_url)
+    except _ME as e:
+        got_outcome = f"error:{e.slug}"
+    else:
+        # No exception: policy is "off" OR result is Trusted, OR policy is "warn"
+        # with a non-Trusted result (warning was emitted to stderr).
+        if policy == "off" or result == VerificationResult.TRUSTED:
+            got_outcome = "trusted"
+        else:
+            # policy == "warn" + non-Trusted result: a warning was emitted.
+            slug = _VR_TO_SLUG.get(mock_result_str, "UNKNOWN")
+            got_outcome = f"warn:{slug}"
+
+    if got_outcome == expected_outcome:
+        return ("pass", "")
+    return (
+        "fail",
+        f"outcome mismatch:\n  expected: {expected_outcome!r}\n  actual:   {got_outcome!r}",
+    )
+
+
+# ---------------------------------------------------------------------------
 # The in-process "execute" function — drives core functions directly
 # ---------------------------------------------------------------------------
 
@@ -1379,6 +1517,11 @@ def _execute_fixture(
     # tarball/local/oci materializers land in later B2 slices.
     if fixture.cmd == "dag-oracle":
         return _execute_dag_oracle_fixture(fixture, tmp_dir)
+
+    # S7: index-trust fixtures exercise the whole-index trust policy state machine
+    # via MockVerifier — no real Sigstore infrastructure or milpa.kdl required.
+    if fixture.cmd == "index-trust":
+        return _execute_index_trust_fixture(fixture, tmp_dir)
 
     # Import resolver / frozen lazily (they raise NotImplementedError now)
     from milpa.frozen import resolve_frozen, resolve_workspace_frozen
@@ -1921,7 +2064,7 @@ def _execute_verify(
     # Reuse the same SSOT helper as the CLI cmd_verify.
     # Load workspace once and reuse for both the attestation-policy check and
     # the frozen-flags mismatch check below (L5: avoid double load_workspace).
-    from milpa.attestation import effective_strict_policy
+    from milpa.trust import effective_trust_policy
     loaded_ws_verify = None
     if isinstance(doc, WorkspaceManifest):
         # Workspace: OR across all members (same rule as resolve_workspace).
@@ -1929,14 +2072,14 @@ def _execute_verify(
             # M6: use project_root for all workspace loads in verify path.
             loaded_ws_verify = load_workspace(project_root)
             _strict = flag_require_attested or any(
-                effective_strict_policy(m.manifest.attestation_policy, False)
+                effective_trust_policy(m.manifest.attestation_policy, False) == "strict"
                 for m in loaded_ws_verify.members
             )
         except MilpaError:
             _strict = flag_require_attested
     else:
         assert isinstance(doc, Manifest)
-        _strict = effective_strict_policy(doc.attestation_policy, flag_require_attested)
+        _strict = effective_trust_policy(doc.attestation_policy, flag_require_attested) == "strict"
 
     # S11b (Breadth-P2c): workspace frozen-flags mismatch check.
     # Runs BEFORE disk check (same as cmd_verify's ordering); uses manifest
@@ -2322,6 +2465,8 @@ def _is_not_yet_wired(fx: Fixture) -> bool:
         return False  # H-infra tier: wired via _execute_hash_fixture
     if fx.cmd == "dag-oracle":
         return False  # epoch-2 oracle: "normal" mark, skipped at run time (pending B2)
+    if fx.cmd == "index-trust":
+        return False  # S7: policy state machine via MockVerifier (RFC registry-trust-federation)
     # Explicit allowlist is the primary gate.
     fixture_name = fx.dir.name  # e.g. "fixture-003-single-url-dep"
     return fixture_name in _NOT_YET_WIRED_FIXTURE_NAMES

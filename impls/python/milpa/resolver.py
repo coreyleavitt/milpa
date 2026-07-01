@@ -2252,8 +2252,8 @@ def resolve(
     # Sealed once per (name, version) — shared with provider for _materialize.
     edge_cache: dict[tuple[str, Version], EdgeSet] = {}
 
-    from milpa.attestation import effective_strict_policy as _eff_strict
-    _is_strict_early = _eff_strict(manifest.attestation_policy, params.require_attested_metadata)
+    from milpa.trust import effective_trust_policy as _eff_trust
+    _is_strict_early = _eff_trust(manifest.attestation_policy, params.require_attested_metadata) == "strict"
 
     provider = _Provider(
         env=env,
@@ -3608,9 +3608,9 @@ def resolve_workspace(
     # §13.1 workspace attestation policy: effective strict = OR of
     # params.require_attested_metadata (flag/env) OR any member's
     # attestation-policy == "strict".
-    from milpa.attestation import effective_strict_policy as _eff_strict
+    from milpa.trust import effective_trust_policy as _eff_trust
     _ws_is_strict = params.require_attested_metadata or any(
-        _eff_strict(m.manifest.attestation_policy, False)
+        _eff_trust(m.manifest.attestation_policy, False) == "strict"
         for m in workspace.members
     )
     deps_dir.mkdir(parents=True, exist_ok=True)

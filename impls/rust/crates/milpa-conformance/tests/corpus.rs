@@ -135,7 +135,11 @@ fn spec_error_codes() -> BTreeSet<String> {
 /// name-byte ceiling code `ID-NAME-TOO-LONG` (`spec/identity.md` §1.8.8); slice
 /// B2-git wired it to its only raise site (the epoch-2 DAG builder in
 /// `dag_identity.rs`), so it has moved from DEFERRED to `implemented_error_codes()`.
-/// No codes remain deferred.
+/// S5 (Python) adds the six TNG-INDEX-* codes and WS-INDEX-CONFLICTING-SIGNERS
+/// to spec/errors.md and errors.py.
+/// S6 (Rust mirror of S5) moved all 7 codes from DEFERRED to implemented_error_codes()
+/// (wired in error.rs CoreError::all_codes(), enforce_index_trust, and
+/// check_conflicting_signers in workspace.rs).
 const DEFERRED: &[&str] = &[];
 
 /// Spec codes this implementation intentionally never emits.

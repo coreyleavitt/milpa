@@ -58,6 +58,7 @@ from milpa.errors import (
     MAN_NO_MANIFEST,
     NIMBLE_FILE_NOT_FOUND,
     NIMBLE_FILE_UNREADABLE,
+    WS_INDEX_CONFLICTING_SIGNERS,
     WS_MEMBER_DIR_MISSING,
     WS_MEMBER_DOT,
     WS_MEMBER_DUPLICATE_NAME,
@@ -390,6 +391,13 @@ def load_workspace(workspace_root: Path) -> LoadedWorkspace:
     # Orphan-member warning (cli-contract.md §7.1): emit a warning for each
     # depth-1 subdir that contains a milpa.kdl but is NOT declared as a member.
     _warn_orphan_members(workspace_root, declared_abs)
+
+    # S5: workspace index-trust validation (spec §3.4a, RFC registry-trust-federation §6.4a).
+    # 1) Conflicting-signers: two members declare DIFFERENT signer identities or
+    #    trust-bundle overrides for the SAME index URL → hard validation error BEFORE fetch.
+    # 2) Max-merge: effective policy = MAX(root_policy, *member_policies).
+    #    Stored on the LoadedWorkspace for cli.py to read when building IndexTrustConfig.
+    _check_conflicting_signers(workspace_root, members)
 
     return LoadedWorkspace(
         root_dir=workspace_root,
@@ -726,6 +734,102 @@ def _manifest_from_nimble(
         kind="library",
         src_dir=nimble.src_dir or "",
     )
+
+
+# ---------------------------------------------------------------------------
+# S5: workspace index-trust helpers (RFC registry-trust-federation §6.4a)
+# ---------------------------------------------------------------------------
+
+# Policy ordering: strict > warn > off
+_TRUST_POLICY_RANK: dict[str, int] = {"strict": 2, "warn": 1, "off": 0}
+
+
+def merge_workspace_index_trust_policy(
+    root_policy: str,
+    member_policies: list[str],
+) -> str:
+    """Return the MAX of root + all member index-trust policies.
+
+    ``strict > warn > off`` (RFC §6.4a).
+
+    A workspace where root=``warn`` and any member=``strict`` resolves under
+    ``strict``.  The returned value is the effective policy for the whole
+    workspace invocation.
+
+    Parameters
+    ----------
+    root_policy:
+        The ``index_trust_policy`` from the workspace root manifest (default
+        ``'warn'`` if the node is absent).
+    member_policies:
+        The ``index_trust_policy`` from each workspace member manifest.
+    """
+    all_policies = [root_policy, *member_policies]
+    return max(all_policies, key=lambda p: _TRUST_POLICY_RANK.get(p, 1))
+
+
+def _check_conflicting_signers(
+    workspace_root: Path,
+    members: list["LoadedMember"],
+) -> None:
+    """Raise WS-INDEX-CONFLICTING-SIGNERS if members disagree on signer / bundle.
+
+    Iterates member manifests and checks that no two declare DIFFERENT
+    ``index_trust_signer`` or ``index_trust_bundle`` values.  Raises BEFORE
+    any index fetch (RFC §6.4a: manifest-consistency error).
+
+    Only non-None values are compared; a member that doesn't declare a signer
+    cannot conflict with one that does (the non-declaring member inherits the
+    default, which is an operator/env concern, not a manifest conflict).
+    """
+    # Check signers: collect {signer_value → [rel_path, ...]} per index URL.
+    # For now we use a single default index URL (per MILPA_INDEX_URL or default);
+    # the per-URL logic is wired in S6 when multiple index URLs are supported.
+    # At S5 scope: if any two members declare different non-None signers → conflict.
+    signer_to_members: dict[str, list[str]] = {}
+    bundle_to_members: dict[str, list[str]] = {}
+
+    for member in members:
+        signer = member.manifest.index_trust_signer
+        bundle = member.manifest.index_trust_bundle
+        if signer is not None:
+            signer_to_members.setdefault(signer, []).append(member.rel_path)
+        if bundle is not None:
+            bundle_to_members.setdefault(bundle, []).append(member.rel_path)
+
+    if len(signer_to_members) > 1:
+        all_signer_entries = sorted(signer_to_members.items())
+        first_signer, first_members = all_signer_entries[0]
+        second_signer, second_members = all_signer_entries[1]
+        raise MilpaError(
+            WS_INDEX_CONFLICTING_SIGNERS,
+            f"workspace members declare conflicting index-trust-signer values: "
+            f"{first_signer!r} (in {first_members}) "
+            f"vs {second_signer!r} (in {second_members}). "
+            f"All members sharing an index URL must agree on the signer identity.",
+            workspace_root=str(workspace_root),
+            signer_a=first_signer,
+            members_a=first_members,
+            signer_b=second_signer,
+            members_b=second_members,
+        )
+
+    if len(bundle_to_members) > 1:
+        all_bundle_entries = sorted(bundle_to_members.items())
+        first_bundle, first_members = all_bundle_entries[0]
+        second_bundle, second_members = all_bundle_entries[1]
+        raise MilpaError(
+            WS_INDEX_CONFLICTING_SIGNERS,
+            f"workspace members declare conflicting index-trust-bundle values: "
+            f"{first_bundle!r} (in {first_members}) "
+            f"vs {second_bundle!r} (in {second_members}). "
+            f"All members sharing an index URL must agree on the trust-bundle.",
+            workspace_root=str(workspace_root),
+            bundle_a=first_bundle,
+            members_a=first_members,
+            bundle_b=second_bundle,
+            members_b=second_members,
+        )
 
 
 def _warn_orphan_members(workspace_root: Path, declared_abs: set[Path]) -> None:

@@ -238,6 +238,29 @@ def _make_parser() -> argparse.ArgumentParser:
             "(the flag cannot weaken a manifest-declared strict policy)."
         ),
     )
+    # S5 (RFC registry-trust-federation §6.2): index-trust flags.
+    parser.add_argument(
+        "--require-attested-index",
+        action="store_true",
+        default=False,
+        help=(
+            "escalate index-trust policy from 'warn' to 'strict'; CI hard-fail toggle. "
+            "Cannot set or clear 'off' — only the manifest can declare index-trust \"off\". "
+            "Mirrors --require-attested-metadata for the whole-index attestation axis "
+            "(RFC registry-trust-federation §6.2)."
+        ),
+    )
+    parser.add_argument(
+        "--refresh-index",
+        action="store_true",
+        default=False,
+        help=(
+            "force a fresh index + bundle fetch, bypassing the cache TTL. "
+            "Use when upgrading from a pre-RFC cache (no bundle sidecar) or "
+            "after a suspected cache-poisoning incident "
+            "(RFC registry-trust-federation §6.2, §7.4)."
+        ),
+    )
 
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
 
@@ -1331,7 +1354,7 @@ def cmd_verify(
     stdout: none.
     stderr: diagnostics + summary.
     """
-    from milpa.attestation import effective_strict_policy
+    from milpa.trust import effective_trust_policy
 
     ws = find_workspace_root(project_dir)
     lock_path: Path
@@ -1344,7 +1367,7 @@ def cmd_verify(
         deps_dir = ws.root_dir / "_deps"
         # §13.1 workspace attestation rule: strict if ANY member is strict.
         effective_strict = require_attested_metadata or any(
-            effective_strict_policy(m.manifest.attestation_policy, False)
+            effective_trust_policy(m.manifest.attestation_policy, False) == "strict"
             for m in ws.members
         )
     else:
@@ -1353,8 +1376,10 @@ def cmd_verify(
         # Load manifest to read attestation-policy (may be absent / .nimble fallback).
         try:
             manifest = load_or_discover_manifest(project_dir)
-            effective_strict = effective_strict_policy(
-                manifest.attestation_policy, require_attested_metadata
+            effective_strict = (
+                effective_trust_policy(
+                    manifest.attestation_policy, require_attested_metadata
+                ) == "strict"
             )
         except MilpaError:
             # Manifest unreadable — fall back to flag-only policy (same as pre-fix
@@ -1477,7 +1502,7 @@ def _verify_dep_decl_pins(
     ``strict`` is the EFFECTIVE strict policy — the OR of manifest
     ``attestation-policy "strict"`` and the ``--require-attested-metadata``
     flag / ``MILPA_REQUIRE_ATTESTED_METADATA`` env (computed by the caller
-    via ``attestation.effective_strict_policy``).
+    via ``trust.effective_trust_policy``).
 
     §3.7.2 semantics:
     - Offline (no dep_decl_store or no MILPA_INDEX_URL):
@@ -3042,6 +3067,36 @@ def main(argv: list[str] | None = None) -> int:
         _env_require_attested and _env_require_attested not in ("0", "false")
     )
     effective_require_attested = args.require_attested_metadata or _env_require_attested_bool
+
+    # S5 (RFC registry-trust-federation §6.3): read all 5 index-trust env vars.
+    _env_index_trust = os.environ.get("MILPA_INDEX_TRUST", "").strip() or None
+    _env_index_trust_signer = os.environ.get("MILPA_INDEX_TRUST_SIGNER", "").strip() or None
+    _env_index_trust_bundle = os.environ.get("MILPA_INDEX_TRUST_BUNDLE", "").strip() or None
+    _env_index_max_age_raw = os.environ.get("MILPA_INDEX_MAX_AGE", "").strip()
+    _env_index_max_age: int = 604800  # default: 7 days
+    if _env_index_max_age_raw:
+        try:
+            _env_index_max_age = int(_env_index_max_age_raw)
+        except ValueError:
+            print(
+                f"milpa: warning: MILPA_INDEX_MAX_AGE={_env_index_max_age_raw!r} is "
+                "not a valid integer; using default 604800 (7 days)",
+                file=sys.stderr,
+            )
+    _env_index_bundle_url = os.environ.get("MILPA_INDEX_BUNDLE_URL", "").strip() or None
+
+    # Build the effective IndexTrustConfig from env + CLI flags.
+    # The manifest-level policy is applied later, per-verb, when the manifest is loaded.
+    # Here we stash the env + flag inputs in MilpaEnv for use in _load_index_for_verb.
+    _require_attested_index = getattr(args, "require_attested_index", False)
+    _refresh_index = getattr(args, "refresh_index", False)
+
+    # Update the env with index-trust state (env vars + flags).
+    from dataclasses import replace as _dc_replace
+    env = _dc_replace(
+        env,
+        refresh_index=_refresh_index,
+    )
 
     # Dispatch.
     try:

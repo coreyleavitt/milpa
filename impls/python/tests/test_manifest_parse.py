@@ -1582,6 +1582,89 @@ class TestTopLevelNodeDispatch:
         assert m.cas_dir == "/tmp/cas"
         assert m.spec_version_explicit is True
 
+    # -----------------------------------------------------------------------
+    # S5: index-trust, index-trust-signer, index-trust-bundle nodes
+    # -----------------------------------------------------------------------
+
+    def test_index_trust_warn(self) -> None:
+        """``index-trust \"warn\"`` is parsed and stored on the Manifest."""
+        m = parse_manifest('name "x"\nindex-trust "warn"\n')
+        assert m.index_trust_policy == "warn"
+
+    def test_index_trust_strict(self) -> None:
+        """``index-trust \"strict\"`` is parsed correctly."""
+        m = parse_manifest('name "x"\nindex-trust "strict"\n')
+        assert m.index_trust_policy == "strict"
+
+    def test_index_trust_off(self) -> None:
+        """``index-trust \"off\"`` is the auditable opt-out path."""
+        m = parse_manifest('name "x"\nindex-trust "off"\n')
+        assert m.index_trust_policy == "off"
+
+    def test_index_trust_default_is_warn(self) -> None:
+        """When absent, ``index_trust_policy`` defaults to ``'warn'``."""
+        m = parse_manifest('name "x"\n')
+        assert m.index_trust_policy == "warn"
+
+    def test_index_trust_rejects_invalid_value(self) -> None:
+        """``index-trust \"enable\"`` → MAN-UNKNOWN-TOP-LEVEL."""
+        assert_slug('name "x"\nindex-trust "enable"\n', E.MAN_UNKNOWN_TOP_LEVEL)
+
+    def test_index_trust_signer_parsed(self) -> None:
+        """``index-trust-signer`` stores the expected SubjectAltName."""
+        signer = "https://github.com/acme/registry/.github/workflows/sign.yaml@refs/heads/main"
+        m = parse_manifest(f'name "x"\nindex-trust-signer "{signer}"\n')
+        assert m.index_trust_signer == signer
+
+    def test_index_trust_signer_default_is_none(self) -> None:
+        """When absent, ``index_trust_signer`` is ``None``."""
+        m = parse_manifest('name "x"\n')
+        assert m.index_trust_signer is None
+
+    def test_index_trust_bundle_parsed(self) -> None:
+        """``index-trust-bundle`` stores the custom bundle URL."""
+        bundle_url = "https://example.com/trust_bundle.json"
+        m = parse_manifest(f'name "x"\nindex-trust-bundle "{bundle_url}"\n')
+        assert m.index_trust_bundle == bundle_url
+
+    def test_index_trust_bundle_default_is_none(self) -> None:
+        """When absent, ``index_trust_bundle`` is ``None``."""
+        m = parse_manifest('name "x"\n')
+        assert m.index_trust_bundle is None
+
+    def test_index_trust_all_three_nodes_together(self) -> None:
+        """All three S5 nodes can coexist in a single manifest."""
+        signer = "https://github.com/acme/reg/.github/workflows/sign.yaml@refs/heads/main"
+        bundle_url = "https://example.com/trust_bundle.json"
+        text = textwrap.dedent(f"""\
+            name "x"
+            index-trust "strict"
+            index-trust-signer "{signer}"
+            index-trust-bundle "{bundle_url}"
+        """)
+        m = parse_manifest(text)
+        assert m.index_trust_policy == "strict"
+        assert m.index_trust_signer == signer
+        assert m.index_trust_bundle == bundle_url
+
+    def test_dispatch_exhaustive_with_index_trust(self) -> None:
+        """The exhaustive dispatch test extended with S5 nodes."""
+        signer = "https://github.com/acme/reg/.github/workflows/sign.yaml@refs/heads/main"
+        text = textwrap.dedent(f"""\
+            spec-version 1
+            name "fullyloaded"
+            index-trust "strict"
+            index-trust-signer "{signer}"
+            index-trust-bundle "https://example.com/trust_bundle.json"
+            cas {{
+                dir "/tmp/cas"
+            }}
+        """)
+        m = parse_manifest(text)
+        assert m.index_trust_policy == "strict"
+        assert m.index_trust_signer == signer
+        assert m.index_trust_bundle == "https://example.com/trust_bundle.json"
+
 
 # ---------------------------------------------------------------------------
 # 3d — Workspace manifest grammar

@@ -13,6 +13,12 @@ dependencies = [
     # KDL 2.0 parser (tabatkins/kdlpy); pinned to exact SHA — swap to kdl-py>=2.0
     # when it publishes to PyPI.  SHA verified 2026-06-12 as main HEAD.
     "kdl-py @ git+https://github.com/tabatkins/kdlpy.git@d9a220762fb9f55e4f59296256221084c26f54da",
+    # Sigstore bundle verification — whole-index attestation gate (RFC registry-trust-federation
+    # §5.3).  Deliberate exception to milpa's dep-light posture: signature and transparency-log
+    # verification MUST NOT be hand-rolled, and shelling out to cosign at resolve time adds an
+    # unacceptable external binary dep.  sigstore-python is the Sigstore project's own library
+    # and supports offline bundle verification (no live Rekor call at resolve time).
+    "sigstore >= 3.0.0",
 ]
 
 [project.scripts]
