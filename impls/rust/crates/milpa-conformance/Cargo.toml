@@ -19,6 +19,6 @@ known-failing = "known_failing.txt"
 [dependencies]
 milpa-core = { workspace = true }
 milpa-types = { workspace = true }
-
-[dev-dependencies]
+# Used in run_index_trust_fixture (Item 4 M4): real workspace manifest writes for
+# fixture-355 and fixture-349 runners require a temp dir outside the fixture dir.
 tempfile = "3"

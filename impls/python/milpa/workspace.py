@@ -782,10 +782,14 @@ def _check_conflicting_signers(
     cannot conflict with one that does (the non-declaring member inherits the
     default, which is an operator/env concern, not a manifest conflict).
     """
-    # Check signers: collect {signer_value → [rel_path, ...]} per index URL.
-    # For now we use a single default index URL (per MILPA_INDEX_URL or default);
-    # the per-URL logic is wired in S6 when multiple index URLs are supported.
-    # At S5 scope: if any two members declare different non-None signers → conflict.
+    # Check signers: collect {signer_value → [rel_path, ...]} across all members.
+    # The index URL is process-global (MILPA_INDEX_URL or DEFAULT_INDEX_URL) — the
+    # manifest grammar has no per-member index-url node, so there is exactly ONE
+    # index URL per invocation.  The global comparison here is therefore equivalent
+    # to the spec §3.4.7 "per index URL" grouping: only one group ever exists.
+    # If per-member index URLs are introduced in a future slice, this check MUST
+    # be updated to group members by their effective index URL before comparing.
+    # At current scope: if any two members declare different non-None signers → conflict.
     signer_to_members: dict[str, list[str]] = {}
     bundle_to_members: dict[str, list[str]] = {}
 

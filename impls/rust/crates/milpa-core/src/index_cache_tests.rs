@@ -544,3 +544,546 @@ fn fresh_cache_still_verifies_bundle() {
         "fresh-cache read must re-verify the bundle"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Item 5b: warn dedup — at most one warning per unique URL per invocation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn warn_two_calls_same_url_emits_only_one_warning() {
+    // Verify the dedup set prevents duplicate stderr lines.
+    // We can't capture stderr in a unit test, but we CAN verify the dedup state
+    // via _reset_warned_urls and the internal invariant: enforce_index_trust
+    // with Warn+non-Trusted must insert the URL the first time and skip the second.
+    _reset_warned_urls();
+    let d = tmp();
+    let get = |_: &str| Ok(INDEX.as_bytes().to_vec());
+    let mock = MockVerifier::new(VerificationResult::SigInvalid);
+
+    // First call: inserts URL into dedup set and emits warning (test can't assert
+    // the stderr line but asserts it doesn't raise).
+    let r1 = load_index(URL, d.path(), &get, DEFAULT_TTL_SECONDS, 1000,
+        Some(&cfg(TrustPolicy::Warn)), Some(&mock), Some(&ok_bundle as BundleHttpGet<'_>), false);
+    assert!(r1.is_ok(), "first warn call must succeed: {:?}", r1);
+
+    // Second call: dedup set already has URL → no duplicate warning.
+    // The call must still succeed (exit 0 semantics).
+    let r2 = load_index(URL, d.path(), &get, DEFAULT_TTL_SECONDS, 1000,
+        Some(&cfg(TrustPolicy::Warn)), Some(&mock), Some(&ok_bundle as BundleHttpGet<'_>), false);
+    assert!(r2.is_ok(), "second warn call (dedup) must succeed: {:?}", r2);
+}
+
+#[test]
+fn warn_two_calls_different_urls_emits_two_warnings() {
+    // Two distinct URLs → two warning emissions (dedup is per-URL).
+    _reset_warned_urls();
+    let d = tmp();
+    let d2 = tmp();
+    let get = |_: &str| Ok(INDEX.as_bytes().to_vec());
+    const URL2: &str = "https://other.test/index.kdl";
+
+    let mock = MockVerifier::new(VerificationResult::SigInvalid);
+
+    let r1 = load_index(URL, d.path(), &get, DEFAULT_TTL_SECONDS, 1000,
+        Some(&cfg(TrustPolicy::Warn)), Some(&mock), Some(&ok_bundle as BundleHttpGet<'_>), false);
+    assert!(r1.is_ok());
+
+    let r2 = load_index(URL2, d2.path(), &get, DEFAULT_TTL_SECONDS, 1000,
+        Some(&cfg(TrustPolicy::Warn)), Some(&mock), Some(&ok_bundle as BundleHttpGet<'_>), false);
+    assert!(r2.is_ok(), "different-URL warn call must succeed: {:?}", r2);
+}
+
+// ---------------------------------------------------------------------------
+// Item 5c / spec §3.4.5: crash recovery — bundle sidecar deleted between reads
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bundle_deleted_between_reads_triggers_recovery_refetch() {
+    // Simulates crash-recovery scenario (index_cache.rs State 1 → crash-recovery):
+    // index cached + bundle present → populate cache → delete bundle → re-read.
+    // On re-read, the cache has the index but the bundle sidecar is missing.
+    //
+    // Spec §3.4.5 NORMATIVE: if the recovery re-fetch ALSO fails to produce a
+    // verifiable bundle (404 OR transport error OR verify failure), the impl MUST
+    // hard-fail with MILPA-INDEX-UNREACHABLE regardless of policy.  This is an
+    // active-adversary signal, not an interrupted write.
+    //
+    // FIXED (round-4 review Item 1): previously asserted TNG-INDEX-BUNDLE-MISSING
+    // (wrong — that's the non-recovery 404 slug); recovery path is MILPA-INDEX-UNREACHABLE.
+    _reset_warned_urls();
+    let d = tmp();
+    let get = |_: &str| Ok(INDEX.as_bytes().to_vec());
+
+    // Populate cache: index + bundle.
+    let mock_ok = MockVerifier::new(VerificationResult::Trusted);
+    load_index(URL, d.path(), &get, DEFAULT_TTL_SECONDS, 1000,
+        Some(&cfg(TrustPolicy::Strict)), Some(&mock_ok),
+        Some(&ok_bundle as BundleHttpGet<'_>), false).unwrap();
+
+    // Delete the bundle sidecar to simulate a crash between index-write and bundle-write.
+    let cache_file = cache_path_for(URL, d.path());
+    let bundle_file = bundle_path(&cache_file);
+    std::fs::remove_file(&bundle_file).unwrap();
+    assert!(!bundle_file.exists(), "bundle must be deleted for this test");
+
+    // Re-read: cache is fresh (State 1), bundle is missing → crash recovery.
+    // Recovery re-fetch returns 404 → spec §3.4.5: hard-fail MILPA-INDEX-UNREACHABLE.
+    let err = load_index(
+        URL, d.path(), &get, DEFAULT_TTL_SECONDS, 1000,
+        Some(&cfg(TrustPolicy::Strict)), Some(&mock_ok),
+        Some(&not_found_bundle as BundleHttpGet<'_>), false,
+    ).unwrap_err();
+    assert_eq!(
+        err.code(),
+        "MILPA-INDEX-UNREACHABLE",
+        "crash-recovery + bundle 404 must hard-fail MILPA-INDEX-UNREACHABLE (spec §3.4.5 — \
+         recovery path overrides policy regardless of Strict/Warn): got {:?}",
+        err.code()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// spec §3.4.5 crash-recovery semantics (Item 1, round-4 HIGH finding):
+//   if the (index, bundle) pair fetched during crash-RECOVERY ALSO fails to
+//   produce a verifiable bundle, the impl MUST hard-fail MILPA-INDEX-UNREACHABLE
+//   regardless of policy (active-adversary signal, not an interrupted write).
+// ---------------------------------------------------------------------------
+
+/// (a) Warn + fresh cache with bundle sidecar deleted (no marker) + bundle 404
+///     on recovery re-fetch → MILPA-INDEX-UNREACHABLE (NOT degraded-marker warn).
+#[test]
+fn recovery_warn_bundle_404_hard_fails_not_degrade() {
+    _reset_warned_urls();
+    let d = tmp();
+    let get = |_: &str| Ok(INDEX.as_bytes().to_vec());
+
+    // Populate cache: index + bundle (Warn policy, Trusted).
+    let mock_ok = MockVerifier::new(VerificationResult::Trusted);
+    load_index(URL, d.path(), &get, DEFAULT_TTL_SECONDS, 1000,
+        Some(&cfg(TrustPolicy::Warn)), Some(&mock_ok),
+        Some(&ok_bundle as BundleHttpGet<'_>), false).unwrap();
+
+    // Delete the bundle sidecar to trigger crash-recovery on next read.
+    let cache_file = cache_path_for(URL, d.path());
+    let bundle_file = bundle_path(&cache_file);
+    std::fs::remove_file(&bundle_file).unwrap();
+    // Make sure no .no-bundle marker exists (this is a crash, not a known-absent case).
+    let nbm = no_bundle_marker_path(&cache_file);
+    assert!(!nbm.exists(), "no .no-bundle marker must exist for the crash scenario");
+
+    // Recovery re-fetch: bundle 404 → spec §3.4.5 MUST hard-fail MILPA-INDEX-UNREACHABLE
+    // regardless of Warn policy.  Must NOT write a degraded marker.
+    let err = load_index(
+        URL, d.path(), &get, DEFAULT_TTL_SECONDS, 1000,
+        Some(&cfg(TrustPolicy::Warn)), Some(&mock_ok),
+        Some(&not_found_bundle as BundleHttpGet<'_>), false,
+    ).unwrap_err();
+    assert_eq!(
+        err.code(),
+        "MILPA-INDEX-UNREACHABLE",
+        "recovery + Warn + bundle 404 must hard-fail MILPA-INDEX-UNREACHABLE (spec §3.4.5), \
+         NOT write a degraded marker and continue: got {:?}",
+        err.code()
+    );
+    // No degraded marker must have been written (recovery hard-fail; §3.4.5).
+    assert!(
+        !nbm.exists(),
+        ".no-bundle marker must NOT be written when recovery hard-fails (spec §3.4.5)"
+    );
+}
+
+/// (b) Warn + fresh cache with bundle sidecar deleted + recovery re-fetch
+///     succeeds with a valid bundle → index served, cache repaired (bundle written).
+#[test]
+fn recovery_warn_valid_bundle_serves_and_repairs_cache() {
+    _reset_warned_urls();
+    let d = tmp();
+    let get = |_: &str| Ok(INDEX.as_bytes().to_vec());
+
+    // Populate cache: index + bundle (Warn policy, Trusted).
+    let mock_ok = MockVerifier::new(VerificationResult::Trusted);
+    load_index(URL, d.path(), &get, DEFAULT_TTL_SECONDS, 1000,
+        Some(&cfg(TrustPolicy::Warn)), Some(&mock_ok),
+        Some(&ok_bundle as BundleHttpGet<'_>), false).unwrap();
+
+    // Delete the bundle sidecar to trigger crash-recovery.
+    let cache_file = cache_path_for(URL, d.path());
+    let bundle_file = bundle_path(&cache_file);
+    std::fs::remove_file(&bundle_file).unwrap();
+
+    // Recovery re-fetch: bundle available + verifier says Trusted → Ok (cache repaired).
+    let result = load_index(
+        URL, d.path(), &get, DEFAULT_TTL_SECONDS, 1000,
+        Some(&cfg(TrustPolicy::Warn)), Some(&mock_ok),
+        Some(&ok_bundle as BundleHttpGet<'_>), false,
+    );
+    assert!(
+        result.is_ok(),
+        "recovery + Warn + valid bundle must serve index without error: {:?}",
+        result
+    );
+    let idx = result.unwrap();
+    assert_eq!(idx.packages.len(), 1, "index must be parsed correctly after recovery");
+    // Bundle sidecar must be written (cache repaired).
+    assert!(
+        bundle_file.exists(),
+        "bundle sidecar must be written to disk after successful recovery re-fetch"
+    );
+}
+
+/// (c) Warn + fresh cache with bundle sidecar deleted + recovery re-fetch
+///     bundle is present but verifier returns SigInvalid → MILPA-INDEX-UNREACHABLE
+///     regardless of Warn policy (spec §3.4.5: second consecutive failure is
+///     an active-adversary signal).
+#[test]
+fn recovery_warn_sig_invalid_hard_fails_regardless() {
+    _reset_warned_urls();
+    let d = tmp();
+    let get = |_: &str| Ok(INDEX.as_bytes().to_vec());
+
+    // Populate cache: index + bundle (Warn policy, Trusted initially).
+    let mock_ok = MockVerifier::new(VerificationResult::Trusted);
+    load_index(URL, d.path(), &get, DEFAULT_TTL_SECONDS, 1000,
+        Some(&cfg(TrustPolicy::Warn)), Some(&mock_ok),
+        Some(&ok_bundle as BundleHttpGet<'_>), false).unwrap();
+
+    // Delete the bundle sidecar to trigger crash-recovery.
+    let cache_file = cache_path_for(URL, d.path());
+    let bundle_file = bundle_path(&cache_file);
+    std::fs::remove_file(&bundle_file).unwrap();
+
+    // Recovery re-fetch: bundle available but SigInvalid → spec §3.4.5 MUST
+    // hard-fail MILPA-INDEX-UNREACHABLE regardless of Warn policy.
+    let mock_bad = MockVerifier::new(VerificationResult::SigInvalid);
+    let err = load_index(
+        URL, d.path(), &get, DEFAULT_TTL_SECONDS, 1000,
+        Some(&cfg(TrustPolicy::Warn)), Some(&mock_bad),
+        Some(&ok_bundle as BundleHttpGet<'_>), false,
+    ).unwrap_err();
+    assert_eq!(
+        err.code(),
+        "MILPA-INDEX-UNREACHABLE",
+        "recovery + Warn + SigInvalid must hard-fail MILPA-INDEX-UNREACHABLE (spec §3.4.5), \
+         NOT proceed as a normal warn: got {:?}",
+        err.code()
+    );
+    // Bundle must not be written (failed verification; no partial write).
+    assert!(
+        !bundle_file.exists(),
+        "bundle must NOT be written after failed recovery verification"
+    );
+}
+
+#[test]
+fn second_consecutive_bundle_mismatch_is_hard_fail_under_strict() {
+    // After two consecutive verify failures under Strict, the caller surfaces a hard error.
+    // This mirrors Python's TestCrashRecovery: consecutive mismatches do not flip to Warn.
+    _reset_warned_urls();
+    let d = tmp();
+    let get = |_: &str| Ok(INDEX.as_bytes().to_vec());
+
+    // First call: mismatch verifier + Strict → hard fail.
+    let mock_bad = MockVerifier::new(VerificationResult::DigestMismatch);
+    let err1 = load_index(URL, d.path(), &get, DEFAULT_TTL_SECONDS, 1000,
+        Some(&cfg(TrustPolicy::Strict)), Some(&mock_bad),
+        Some(&ok_bundle as BundleHttpGet<'_>), false).unwrap_err();
+    assert_eq!(err1.code(), "TNG-INDEX-DIGEST-MISMATCH");
+
+    _reset_warned_urls();
+    // Second call (same state): still a hard fail.
+    let err2 = load_index(URL, d.path(), &get, DEFAULT_TTL_SECONDS, 1000,
+        Some(&cfg(TrustPolicy::Strict)), Some(&mock_bad),
+        Some(&ok_bundle as BundleHttpGet<'_>), false).unwrap_err();
+    assert_eq!(err2.code(), "TNG-INDEX-DIGEST-MISMATCH",
+        "consecutive mismatch under Strict must remain hard fail, not downgrade to Warn");
+}
+
+// ---------------------------------------------------------------------------
+// ITEM 2 (M9): bundle_http_get receives the URL produced by get_bundle_url
+// ---------------------------------------------------------------------------
+
+/// Prove that `load_index` passes `get_bundle_url(index_url)` to the injected
+/// `bundle_http_get` closure.  A recording closure captures the actual URL; we
+/// assert it equals `derive_bundle_url(URL)` (the expected default derivation).
+///
+/// When `MILPA_INDEX_BUNDLE_URL` is not set (the normal case in CI and tests),
+/// `get_bundle_url` returns `derive_bundle_url(index_url)`.  This test is
+/// intentionally written for the no-override path so no global env manipulation
+/// is required — it stays race-free and lock-free.  The override path is
+/// exercised at the binary level in `crates/milpa-cli/tests/cli_index_trust.rs`
+/// (scenario 7 / `bundle_url_override_routes_bundle_fetch_to_override_path`).
+#[test]
+fn bundle_http_get_receives_derived_url_when_no_env_override() {
+    _reset_warned_urls();
+    let d = tmp();
+    let get = |_: &str| Ok(INDEX.as_bytes().to_vec());
+    let mock_ok = MockVerifier::new(VerificationResult::Trusted);
+
+    // Recording closure: captures the URL it is called with.
+    let recorded: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+    let recording = |url: &str| -> Result<Vec<u8>, BundleError> {
+        *recorded.borrow_mut() = Some(url.to_string());
+        Ok(BUNDLE.to_vec())
+    };
+
+    // If MILPA_INDEX_BUNDLE_URL happens to be set in the environment, temporarily
+    // clear it so this test exercises the derivation path, not the override path.
+    let had_override = std::env::var("MILPA_INDEX_BUNDLE_URL").ok();
+    if had_override.is_some() {
+        // SAFETY: guarded by the check above; no other thread writes this var here.
+        unsafe { std::env::remove_var("MILPA_INDEX_BUNDLE_URL") };
+    }
+
+    let result = load_index(
+        URL,
+        d.path(),
+        &get,
+        DEFAULT_TTL_SECONDS,
+        1000,
+        Some(&cfg(TrustPolicy::Strict)),
+        Some(&mock_ok),
+        Some(&recording as BundleHttpGet<'_>),
+        false,
+    );
+
+    // Restore if we cleared it.
+    if let Some(v) = had_override {
+        unsafe { std::env::set_var("MILPA_INDEX_BUNDLE_URL", v) };
+    }
+
+    assert!(result.is_ok(), "Trusted + Strict must succeed: {:?}", result);
+    // URL constant is "https://example.test/index.kdl"; derived bundle appends ".bundle".
+    assert_eq!(
+        recorded.borrow().as_deref(),
+        Some("https://example.test/index.kdl.bundle"),
+        "bundle_http_get must receive derive_bundle_url(index_url) when \
+         MILPA_INDEX_BUNDLE_URL is not set; got: {:?}",
+        recorded.borrow()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Item 1 (M2): spec §7.2 ordering — verify BEFORE writing cache
+// ---------------------------------------------------------------------------
+
+/// Spec §7.2: on a state-2 (network-fetch) path with Strict policy and a
+/// SigInvalid verifier result, the error must be returned AND no cache
+/// artifacts (index, stamp, bundle) should be written.
+///
+/// This tests the ordering requirement: verify in-memory first; write
+/// bundle sidecar → index → stamp ONLY on success.  Prior to the fix,
+/// the code wrote the cache first, then verified — leaving a
+/// fresh-stamped UNVERIFIED index on disk after a strict failure.
+#[test]
+fn strict_sig_invalid_state2_leaves_no_cache_artifacts() {
+    _reset_warned_urls();
+    let d = tmp();
+    let get = |_: &str| Ok(INDEX.as_bytes().to_vec());
+    let mock = MockVerifier::new(VerificationResult::SigInvalid);
+
+    let err = load_index(
+        URL,
+        d.path(),
+        &get,
+        DEFAULT_TTL_SECONDS,
+        1000,
+        Some(&cfg(TrustPolicy::Strict)),
+        Some(&mock),
+        Some(&ok_bundle as BundleHttpGet<'_>),
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "TNG-INDEX-SIGNATURE-INVALID");
+
+    // Spec §7.2: no cache artifacts must be written on verification failure.
+    let cache_file = cache_path_for(URL, d.path());
+    assert!(
+        !cache_file.exists(),
+        "index must NOT be written to cache when strict verification fails (spec §7.2 ordering)"
+    );
+    assert!(
+        !bundle_path(&cache_file).exists(),
+        "bundle sidecar must NOT be written when strict verification fails (spec §7.2 ordering)"
+    );
+    // Check stamp as well.
+    let stamp_file = cache_file.with_extension("kdl.at");
+    assert!(
+        !stamp_file.exists(),
+        "stamp must NOT be written when strict verification fails (spec §7.2 ordering)"
+    );
+}
+
+/// When strict + bundle-ok + verify succeeds, cache artifacts ARE written (happy path).
+/// Regression guard: the spec §7.2 fix must not break the success path.
+#[test]
+fn strict_trusted_state2_writes_cache_artifacts() {
+    _reset_warned_urls();
+    let d = tmp();
+    let get = |_: &str| Ok(INDEX.as_bytes().to_vec());
+    let mock = MockVerifier::new(VerificationResult::Trusted);
+
+    load_index(
+        URL,
+        d.path(),
+        &get,
+        DEFAULT_TTL_SECONDS,
+        1000,
+        Some(&cfg(TrustPolicy::Strict)),
+        Some(&mock),
+        Some(&ok_bundle as BundleHttpGet<'_>),
+        false,
+    )
+    .unwrap();
+
+    let cache_file = cache_path_for(URL, d.path());
+    assert!(cache_file.exists(), "index must be written after successful strict verification");
+    assert!(bundle_path(&cache_file).exists(), "bundle sidecar must be written after success");
+}
+
+/// Warn + bundle-404 (BundleError::NotFound) must still write the index and
+/// stamp AND the .no-bundle degraded marker (spec §7.2: warn degraded path).
+#[test]
+fn warn_bundle_404_state2_writes_index_and_no_bundle_marker() {
+    _reset_warned_urls();
+    let d = tmp();
+    let get = |_: &str| Ok(INDEX.as_bytes().to_vec());
+    let mock = MockVerifier::new(VerificationResult::Trusted);
+
+    load_index(
+        URL,
+        d.path(),
+        &get,
+        DEFAULT_TTL_SECONDS,
+        1000,
+        Some(&cfg(TrustPolicy::Warn)),
+        Some(&mock),
+        Some(&not_found_bundle as BundleHttpGet<'_>),
+        false,
+    )
+    .unwrap();
+
+    let cache_file = cache_path_for(URL, d.path());
+    assert!(cache_file.exists(), "index must be written even when bundle 404s under Warn");
+    assert!(
+        no_bundle_marker_path(&cache_file).exists(),
+        ".no-bundle marker must be written when bundle 404s under Warn"
+    );
+}
+
+/// Strict + bundle-404 must NOT write any cache artifacts.
+#[test]
+fn strict_bundle_404_state2_leaves_no_cache_artifacts() {
+    _reset_warned_urls();
+    let d = tmp();
+    let get = |_: &str| Ok(INDEX.as_bytes().to_vec());
+    let mock = MockVerifier::new(VerificationResult::Trusted);
+
+    let err = load_index(
+        URL,
+        d.path(),
+        &get,
+        DEFAULT_TTL_SECONDS,
+        1000,
+        Some(&cfg(TrustPolicy::Strict)),
+        Some(&mock),
+        Some(&not_found_bundle as BundleHttpGet<'_>),
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "TNG-INDEX-BUNDLE-MISSING");
+
+    let cache_file = cache_path_for(URL, d.path());
+    assert!(
+        !cache_file.exists(),
+        "index must NOT be written when strict + bundle-404 (spec §7.2)"
+    );
+    assert!(
+        !no_bundle_marker_path(&cache_file).exists(),
+        ".no-bundle marker must NOT be written under Strict (only under Warn)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ITEM 3 (round-3 review): BundleError::Other → BundleMissing (not BundleMalformed)
+//
+// Rationale: a non-404 transport error means bytes NEVER ARRIVED — the correct
+// slug is TNG-INDEX-BUNDLE-MISSING (same as 404), NOT TNG-INDEX-BUNDLE-MALFORMED
+// (which is reserved for bytes that arrived but failed to parse).
+// No .no-bundle marker is written for transient errors (next read goes through
+// crash-recovery refetch, not the degraded-marker path).
+// ---------------------------------------------------------------------------
+
+/// Warn + transport error → warning slug TNG-INDEX-BUNDLE-MISSING, no marker file.
+#[test]
+fn warn_transport_error_emits_bundle_missing_not_malformed() {
+    _reset_warned_urls();
+    let d = tmp();
+    let get = |_: &str| Ok(INDEX.as_bytes().to_vec());
+    let mock = MockVerifier::new(VerificationResult::Trusted);
+
+    // Load with warn policy + transport error (non-404).
+    // Should succeed (warn allows proceeding) but emit BundleMissing warning.
+    let result = load_index(
+        URL,
+        d.path(),
+        &get,
+        DEFAULT_TTL_SECONDS,
+        1000,
+        Some(&cfg(TrustPolicy::Warn)),
+        Some(&mock),
+        Some(&err_bundle as BundleHttpGet<'_>),
+        false,
+    );
+    // Warn: should return Ok (proceed despite missing bundle).
+    assert!(
+        result.is_ok(),
+        "warn + transport error should succeed (warn allows proceeding): {result:?}"
+    );
+
+    // The .no-bundle marker must NOT be written for transient errors.
+    let cache_file = cache_path_for(URL, d.path());
+    assert!(
+        !no_bundle_marker_path(&cache_file).exists(),
+        ".no-bundle marker must NOT be written for transient transport errors (only for genuine 404)"
+    );
+}
+
+/// Strict + transport error → error slug TNG-INDEX-BUNDLE-MISSING (not MALFORMED).
+#[test]
+fn strict_transport_error_returns_bundle_missing_slug() {
+    _reset_warned_urls();
+    let d = tmp();
+    let get = |_: &str| Ok(INDEX.as_bytes().to_vec());
+    let mock = MockVerifier::new(VerificationResult::Trusted);
+
+    let err = load_index(
+        URL,
+        d.path(),
+        &get,
+        DEFAULT_TTL_SECONDS,
+        1000,
+        Some(&cfg(TrustPolicy::Strict)),
+        Some(&mock),
+        Some(&err_bundle as BundleHttpGet<'_>),
+        false,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        "TNG-INDEX-BUNDLE-MISSING",
+        "non-404 transport error must map to TNG-INDEX-BUNDLE-MISSING (bytes never arrived), \
+         not TNG-INDEX-BUNDLE-MALFORMED (reserved for parse failures)"
+    );
+
+    // No marker file for transient errors under Strict.
+    let cache_file = cache_path_for(URL, d.path());
+    assert!(
+        !no_bundle_marker_path(&cache_file).exists(),
+        ".no-bundle marker must NOT be written under Strict for transport errors"
+    );
+    assert!(
+        !cache_file.exists(),
+        "index must NOT be written when strict + transport error (spec §7.2)"
+    );
+}

@@ -139,7 +139,10 @@ pub fn cache_path_for(url: &str, cache_dir: &Path) -> PathBuf {
 }
 
 /// `<cache_file>.bundle` — the Sigstore bundle sidecar.
-fn bundle_path(cache_file: &Path) -> PathBuf {
+///
+/// `pub` so `cmd_show_index_trust` can locate the cached bundle without
+/// reconstructing the `.bundle` suffix inline (Item 5b SSOT).
+pub fn bundle_path(cache_file: &Path) -> PathBuf {
     let mut p = cache_file.as_os_str().to_os_string();
     p.push(".bundle");
     PathBuf::from(p)
@@ -184,6 +187,35 @@ fn net_or_io(e: std::io::Error) -> MilpaError {
         "MILPA-INTERNAL-IO",
         format!("index cache I/O error: {e}"),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Internal write helper (Item 4 — extracted from ×4 inline occurrences)
+// ---------------------------------------------------------------------------
+
+/// Atomic index-cache write: tmp write → rename (atomic on POSIX) → stamp write.
+///
+/// Write order: index bytes → stamp. The stamp file is written LAST so that a
+/// crash between the rename and the stamp write is correctly detected as a
+/// "stale" cache entry on the next read (no stamp ⇒ missing ⇒ refetch).
+///
+/// Item 4: extracted from the four state-2 arms that previously inlined this
+/// sequence verbatim.  The `.bundle` sidecar write (when present) is handled
+/// BEFORE calling this helper (spec §7.2 write order: bundle → index → stamp).
+fn write_index_to_cache(
+    cache_file: &Path,
+    index_bytes: &[u8],
+    stamp_file: &Path,
+    now_unix: u64,
+) -> Result<(), MilpaError> {
+    let tmp = cache_file.with_extension(format!("kdl.tmp.{now_unix}"));
+    std::fs::write(&tmp, index_bytes).map_err(net_or_io)?;
+    std::fs::rename(&tmp, cache_file).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        net_or_io(e)
+    })?;
+    let _ = std::fs::write(stamp_file, now_unix.to_string());
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +295,12 @@ pub fn load_index(
         && verifier.is_some()
         && bundle_http_get.is_some();
 
+    // Track whether we arrived at State 2 via crash-recovery (State 1 → Ok(None)).
+    // Spec §3.4.5 NORMATIVE: if the (index, bundle) pair fetched during a
+    // crash-RECOVERY re-fetch ALSO fails verification, the impl MUST hard-fail
+    // with MILPA-INDEX-UNREACHABLE regardless of policy (active-adversary signal).
+    let mut is_recovery = false;
+
     // --- State 1: fresh cache (age < ttl and not forced refresh) --------------
     if !refresh {
         if let Some(fetched_at) = read_stamp(&stamp_file) {
@@ -280,6 +318,7 @@ pub fn load_index(
                     Ok(None) => {
                         // Bundle inconsistency during fresh-cache read — fall through
                         // to crash recovery below (one bounded refetch).
+                        is_recovery = true;
                     }
                     Err(e) => return Err(e),
                 }
@@ -288,10 +327,18 @@ pub fn load_index(
     }
 
     // --- State 2: network fetch (stale / missing / --refresh-index) -----------
+    //
+    // Spec §7.2 ordering: verify in-memory FIRST; write to cache ONLY on success.
+    // Prior to this fix the cache was written before verification, leaving a
+    // fresh-stamped UNVERIFIED index on disk after a strict failure.
+    //
+    // Spec §3.4.5: when is_recovery=true, any bundle failure (404, transport error,
+    // or verification failure) is a hard MILPA-INDEX-UNREACHABLE regardless of policy.
     let bundle_url = get_bundle_url(url);
     match http_get(url) {
         Ok(index_bytes) => {
-            // Fetch bundle sidecar when trust gate is active.
+            // Fetch bundle sidecar when trust gate is active (both fetches are in-memory;
+            // no cache mutation yet).
             let bundle_result: Option<Result<Vec<u8>, BundleError>> =
                 if trust_active {
                     Some(bundle_http_get.unwrap()(&bundle_url))
@@ -299,39 +346,82 @@ pub fn load_index(
                     None
                 };
 
-            // Atomically write the new index to cache.
-            let tmp = cache_file.with_extension(format!("kdl.tmp.{now_unix}"));
-            std::fs::write(&tmp, &index_bytes).map_err(net_or_io)?;
-            std::fs::rename(&tmp, &cache_file).map_err(|e| {
-                let _ = std::fs::remove_file(&tmp);
-                net_or_io(e)
-            })?;
-            let _ = std::fs::write(&stamp_file, now_unix.to_string());
-
-            // Handle bundle sidecar: write / degrade-mark / fail.
+            // Spec §7.2: resolve the trust-gate disposition entirely in-memory before
+            // touching the cache.  Each arm either returns an error (no cache write)
+            // or completes the appropriate cache write on success.
             if trust_active {
                 match bundle_result.unwrap() {
                     Ok(bundle_bytes) => {
-                        // Delete any stale no-bundle marker.
-                        let _ = std::fs::remove_file(no_bundle_marker_path(&cache_file));
-                        // Write bundle sidecar.
-                        std::fs::write(bundle_path(&cache_file), &bundle_bytes)
-                            .map_err(net_or_io)?;
-                        // Verify + enforce (network fetch → freshness check on).
-                        if let Some(v) = verifier {
+                        // config and verifier are always Some here (trust_active asserts it).
+                        let cfg_ref = config.expect("config must be Some when trust_active");
+                        let ver_ref = verifier.expect("verifier must be Some when trust_active");
+
+                        // Spec §3.4.5 NORMATIVE: on the crash-recovery path, check the raw
+                        // verification result BEFORE dispatching through policy.  Any non-Trusted
+                        // result on a recovery re-fetch MUST hard-fail MILPA-INDEX-UNREACHABLE
+                        // regardless of Warn/Strict policy (active-adversary signal).
+                        if is_recovery {
+                            let max_age = Some(cfg_ref.max_age_seconds);
+                            let raw = ver_ref.verify(
+                                &index_bytes,
+                                &bundle_bytes,
+                                &cfg_ref.trust_bundle,
+                                &cfg_ref.expected_signer,
+                                max_age,
+                            );
+                            if raw != VerificationResult::Trusted {
+                                return Err(MilpaError::Core(CoreError::Tianguis(
+                                    "MILPA-INDEX-UNREACHABLE",
+                                    format!(
+                                        "crash-recovery: second consecutive bundle failure \
+                                         for {url:?} (result={:?}) — hard-fail \
+                                         (active-adversary signal per spec §3.4.5)",
+                                        raw.value()
+                                    ),
+                                )));
+                            }
+                            // Trusted on recovery: write cache and proceed normally.
+                            let _ = std::fs::remove_file(no_bundle_marker_path(&cache_file));
+                            std::fs::write(bundle_path(&cache_file), &bundle_bytes)
+                                .map_err(net_or_io)?;
+                            write_index_to_cache(&cache_file, &index_bytes, &stamp_file, now_unix)?;
+                        } else {
+                            // Non-recovery: normal verify-and-enforce (policy gates errors).
+                            // On failure (Strict): return error WITHOUT writing anything.
                             verify_and_enforce(
                                 &index_bytes,
                                 &bundle_bytes,
-                                config.unwrap(),
-                                v,
+                                cfg_ref,
+                                ver_ref,
                                 &policy,
                                 url,
                                 true,
                             )?;
+                            // Verification passed (or Warn — enforce returned Ok).
+                            // Spec §7.2 write order: bundle sidecar → index → stamp.
+                            let _ = std::fs::remove_file(no_bundle_marker_path(&cache_file));
+                            std::fs::write(bundle_path(&cache_file), &bundle_bytes)
+                                .map_err(net_or_io)?;
+                            write_index_to_cache(&cache_file, &index_bytes, &stamp_file, now_unix)?;
                         }
                     }
                     Err(BundleError::NotFound) => {
-                        // Bundle 404: under Strict → hard fail; under Warn → degrade.
+                        // Bundle 404.
+                        // Spec §3.4.5: on the crash-recovery path, 404 is a hard-fail
+                        // MILPA-INDEX-UNREACHABLE regardless of policy (second consecutive
+                        // miss is an active-adversary signal).  Do NOT write any marker.
+                        if is_recovery {
+                            return Err(MilpaError::Core(CoreError::Tianguis(
+                                "MILPA-INDEX-UNREACHABLE",
+                                format!(
+                                    "crash-recovery: bundle still unavailable (404) at \
+                                     {bundle_url:?} for index {url:?} — hard-fail \
+                                     (active-adversary signal per spec §3.4.5)"
+                                ),
+                            )));
+                        }
+                        // Non-recovery 404: under Strict → hard fail (no cache write).
+                        // Under Warn → write degraded state (index + stamp + .no-bundle marker).
                         if policy == TrustPolicy::Strict {
                             return Err(MilpaError::Core(CoreError::Tianguis(
                                 "TNG-INDEX-BUNDLE-MISSING",
@@ -344,32 +434,39 @@ pub fn load_index(
                                 ),
                             )));
                         }
-                        // Warn: write the degraded marker + enforce (suppress dup).
+                        // Warn: write degraded marker, then index + stamp.
                         let _ = std::fs::write(no_bundle_marker_path(&cache_file), b"");
-                        enforce_index_trust(
-                            VerificationResult::BundleMissing,
-                            &policy,
-                            url,
-                        )?;
+                        write_index_to_cache(&cache_file, &index_bytes, &stamp_file, now_unix)?;
+                        enforce_index_trust(VerificationResult::BundleMissing, &policy, url)?;
                     }
-                    Err(BundleError::Other(e)) => {
-                        // Non-404 bundle fetch error → treat as BundleMalformed and
-                        // propagate under Strict; warn under Warn.
-                        enforce_index_trust(
-                            VerificationResult::BundleMalformed,
-                            &policy,
-                            url,
-                        )?;
-                        if policy == TrustPolicy::Strict {
+                    Err(BundleError::Other(_e)) => {
+                        // Non-404 transport error: bytes never arrived → BundleMissing
+                        // (BundleMalformed is reserved for bytes that arrived but don't parse).
+                        //
+                        // Spec §3.4.5: on the crash-recovery path, transport error is a
+                        // hard-fail MILPA-INDEX-UNREACHABLE regardless of policy.
+                        if is_recovery {
                             return Err(MilpaError::Core(CoreError::Tianguis(
-                                "TNG-INDEX-BUNDLE-MALFORMED",
+                                "MILPA-INDEX-UNREACHABLE",
                                 format!(
-                                    "index-trust strict: bundle fetch error for {url:?}: {e}"
+                                    "crash-recovery: bundle transport error at \
+                                     {bundle_url:?} for index {url:?} — hard-fail \
+                                     (active-adversary signal per spec §3.4.5)"
                                 ),
                             )));
                         }
+                        // Non-recovery transport error: no .no-bundle marker (transient;
+                        // next read goes through crash-recovery refetch without degraded side-channel).
+                        // Strict: fail closed — no cache write, no marker.
+                        // Warn: emit warning, then write index + stamp (no bundle, no marker).
+                        enforce_index_trust(VerificationResult::BundleMissing, &policy, url)?;
+                        // Reached only under Warn (Strict already returned via `?`).
+                        write_index_to_cache(&cache_file, &index_bytes, &stamp_file, now_unix)?;
                     }
                 }
+            } else {
+                // No trust gate: write index + stamp directly.
+                write_index_to_cache(&cache_file, &index_bytes, &stamp_file, now_unix)?;
             }
 
             let text = std::str::from_utf8(&index_bytes).map_err(|_| {
@@ -446,18 +543,19 @@ fn try_serve_from_cache(
             // Warn → continue; Strict handled in the caller (never reaches here).
         } else if cache_bundle_looks_ok(&bp) {
             // Bundle sidecar present — verify.
+            // config and verifier are always Some here: trust_active asserts it
+            // (trust_active = policy≠Off && config.is_some() && verifier.is_some()).
+            // The inner Option-check was dead code (Item 5a); removed.
             let bundle_bytes = std::fs::read(&bp).map_err(net_or_io)?;
-            if let (Some(cfg), Some(v)) = (config, verifier) {
-                verify_and_enforce(
-                    &index_bytes,
-                    &bundle_bytes,
-                    cfg,
-                    v,
-                    policy,
-                    url,
-                    is_network_fetch,
-                )?;
-            }
+            verify_and_enforce(
+                &index_bytes,
+                &bundle_bytes,
+                config.expect("config must be Some when trust_active"),
+                verifier.expect("verifier must be Some when trust_active"),
+                policy,
+                url,
+                is_network_fetch,
+            )?;
         } else {
             // Bundle sidecar absent (neither a .no-bundle marker nor a .bundle
             // file) — inconsistent cache state; signal crash recovery needed.

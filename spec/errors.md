@@ -1192,6 +1192,12 @@ The Sigstore bundle is cryptographically valid but was signed beyond the maximum
 
 **Triggered:** `verify_index_bundle` in `index_trust.py` on a network-fetch path (States 2 + crash-recovery refetch) finds `now - SET.integratedTime >= MILPA_INDEX_MAX_AGE` (default 7 days = 604800 s).  Indicates a rollback attack or a frozen CDN.  This check is NEVER asserted on pure cache reads (States 1 and 3) so offline/air-gapped invocations never fail on staleness; only the network-fetch boundary is defended (RFC §4 step 6, §7.2).
 
+### `TNG-INDEX-VERIFY-UNSUPPORTED`
+
+An implementation that cannot perform required index attestation verification MUST fail closed with this code under strict policy.
+
+**Triggered:** when the effective index-trust policy resolves to `strict` but the implementation's Sigstore verifier is not yet functional.  The Rust implementation raises this code because `sigstore-rs` 0.11.0 does not support DSSE/in-toto attestation bundles (`BundleErrorKind::DsseUnsupported`) and Rekor SET verification is a known upstream TODO (sigstore-rs#285).  Under `warn` policy the implementation emits a single warning per invocation and proceeds without verification.  **Remediation:** set `index-trust "warn"` or `index-trust "off"` in `milpa.kdl`, or set `MILPA_INDEX_TRUST=warn`/`MILPA_INDEX_TRUST=off`, or use the Python reference implementation which also defers S4b but will gain sigstore support first.
+
 ### `TNG-KDL-SYNTAX`
 
 The index text is not valid KDL and cannot be parsed.

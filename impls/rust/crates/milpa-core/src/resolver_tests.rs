@@ -2630,3 +2630,88 @@ deps {
     )
     .expect("F5: consistent lock must pass frozen check");
 }
+
+// ---------------------------------------------------------------------------
+// M6: effective_trust_policy SSOT unit tests (RFC registry-trust-federation §6.3)
+// Zero tests existed before this PR; these cover the full policy matrix.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn effective_trust_policy_manifest_off_unconditional() {
+    use crate::resolver::effective_trust_policy;
+    use milpa_manifest::TrustPolicy;
+    // manifest=Off wins unconditionally — env=Strict and flag=true are both no-ops.
+    assert_eq!(
+        effective_trust_policy(&TrustPolicy::Off, true, Some(&TrustPolicy::Strict)),
+        TrustPolicy::Off,
+        "manifest Off must win over flag=true + env=Strict"
+    );
+    assert_eq!(
+        effective_trust_policy(&TrustPolicy::Off, false, Some(&TrustPolicy::Strict)),
+        TrustPolicy::Off,
+        "manifest Off must win over env=Strict"
+    );
+    assert_eq!(
+        effective_trust_policy(&TrustPolicy::Off, false, None),
+        TrustPolicy::Off,
+        "manifest Off with no env must still be Off"
+    );
+}
+
+#[test]
+fn effective_trust_policy_flag_escalates_warn_to_strict() {
+    use crate::resolver::effective_trust_policy;
+    use milpa_manifest::TrustPolicy;
+    assert_eq!(
+        effective_trust_policy(&TrustPolicy::Warn, true, None),
+        TrustPolicy::Strict,
+        "flag=true must escalate Warn→Strict"
+    );
+}
+
+#[test]
+fn effective_trust_policy_env_strict_escalates_manifest_warn() {
+    use crate::resolver::effective_trust_policy;
+    use milpa_manifest::TrustPolicy;
+    assert_eq!(
+        effective_trust_policy(&TrustPolicy::Warn, false, Some(&TrustPolicy::Strict)),
+        TrustPolicy::Strict,
+        "env=Strict must escalate manifest Warn"
+    );
+}
+
+#[test]
+fn effective_trust_policy_env_off_is_noop_floor() {
+    use crate::resolver::effective_trust_policy;
+    use milpa_manifest::TrustPolicy;
+    // env=Off cannot downgrade manifest Warn — it is a no-op floor.
+    assert_eq!(
+        effective_trust_policy(&TrustPolicy::Warn, false, Some(&TrustPolicy::Off)),
+        TrustPolicy::Warn,
+        "env=Off must not downgrade manifest Warn"
+    );
+}
+
+#[test]
+fn effective_trust_policy_env_warn_no_escalation() {
+    use crate::resolver::effective_trust_policy;
+    use milpa_manifest::TrustPolicy;
+    // env=Warn on manifest Warn → stays Warn.
+    assert_eq!(
+        effective_trust_policy(&TrustPolicy::Warn, false, Some(&TrustPolicy::Warn)),
+        TrustPolicy::Warn,
+        "env=Warn + manifest=Warn must stay Warn"
+    );
+}
+
+#[test]
+fn effective_trust_policy_manifest_strict_env_off_stays_strict() {
+    use crate::resolver::effective_trust_policy;
+    use milpa_manifest::TrustPolicy;
+    // manifest=Strict + env=Off → stays Strict (Off in env is a no-op floor).
+    assert_eq!(
+        effective_trust_policy(&TrustPolicy::Strict, false, Some(&TrustPolicy::Off)),
+        TrustPolicy::Strict,
+        "env=Off must not downgrade manifest Strict"
+    );
+}

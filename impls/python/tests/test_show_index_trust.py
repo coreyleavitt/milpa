@@ -295,3 +295,46 @@ def test_label_alignment_all_lines_same_column():
             f"Column 16 alignment broken on: {line!r}; "
             f"char at index 15 is {line[15]!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# format_index_trust_info — future-dated integratedTime (ITEM M10)
+# ---------------------------------------------------------------------------
+
+
+def test_format_future_dated_integrated_time_reports_fresh():
+    """A future-dated ``integratedTime`` (integratedTime > now) MUST report 'fresh'.
+
+    M10 Python pin test: ``age = now - integratedTime`` is NEGATIVE when
+    integratedTime is in the future; negative age < max_age → 'fresh'.
+    The freshness formula must NOT special-case negative ages — a negative age
+    is simply a bundle signed in the future (unlikely in production but trivially
+    possible in test fixtures), and it is unambiguously fresh.
+
+    Rust is fixed to match this semantics.  Both impls must agree.
+    """
+    future_time = 9_999_999_999  # far future epoch
+    now = 1_735_000_000  # a past "now"
+    info = IndexBundleInfo(
+        integrated_time=future_time,
+        rekor_log_index="1",
+        subject_sha256=None,
+        signer_san=None,
+        oidc_issuer=None,
+    )
+    out = format_index_trust_info(
+        index_url="https://example.com/index.kdl",
+        policy="warn",
+        index_cached=True,
+        bundle_cached=True,
+        info=info,
+        now=now,
+        max_age=604800,
+    )
+    assert "fresh" in out, (
+        f"M10: future-dated integratedTime (age = now - integratedTime < 0) must "
+        f"report 'fresh'; age = {now} - {future_time} = {now - future_time}; output:\n{out}"
+    )
+    assert "stale" not in out, (
+        f"M10: future-dated bundle must NOT report 'stale'; output:\n{out}"
+    )

@@ -9,7 +9,7 @@ Production callers pass ``urllib_http_get`` and ``time.time`` (cast to ``int``).
 Four states (registry-protocol §6 NORMATIVE; RFC registry-trust-federation §7.2):
   1. **Fresh cache** (age < TTL) → serve cached bytes + bundle sidecar, no network.
      Crypto-verified on EVERY read; freshness NOT re-asserted on pure cache reads
-     (offline/air-gapped safety — RFC §4 step 6).
+     (offline/air-gapped safety — spec §3.4.4 step 3).
   2. **Stale cache** (age ≥ TTL) → re-fetch index + bundle, overwrite, serve fresh.
      Crypto-verified AND freshness asserted (network-fetch path).
   3. **Network failure with stale-but-present cache** → serve the stale cache as
@@ -314,7 +314,7 @@ def load_index(
     # -------------------------------------------------------------------------
     # State 1: Fresh cache (age < TTL) → serve without network.
     # When trust gate is active: crypto-verify on EVERY read; freshness NOT
-    # re-asserted on pure cache reads (offline/air-gapped safety — RFC §4 step 6).
+    # re-asserted on pure cache reads (offline/air-gapped safety — spec §3.4.4 step 3).
     # -------------------------------------------------------------------------
     fetched_at = _read_stamp(stamp_file)
     if fetched_at is not None and not refresh:
@@ -323,17 +323,40 @@ def load_index(
             index_bytes = cache_file.read_bytes()
             if trust_active:
                 assert config is not None and verifier is not None  # type narrowing
-                bundle_bytes_cached: bytes | None = None
                 if bundle_file.is_file():
                     bundle_bytes_cached = bundle_file.read_bytes()
+                    # Consistency check: empty bundle bytes = interrupted write.
+                    if not _cache_bundle_looks_ok(bundle_bytes_cached, bundle_file):
+                        _delete_bundle_sidecars(bundle_file, no_bundle_marker)
+                        return _refetch_with_recovery(
+                            url=url, cache_dir=cache_dir, cache_file=cache_file,
+                            stamp_file=stamp_file, bundle_file=bundle_file,
+                            no_bundle_marker=no_bundle_marker,
+                            http_get=http_get, bundle_http_get=bundle_http_get,
+                            config=config, verifier=verifier,
+                            now_unix=now_unix, is_recovery=True,
+                        )
+                    # is_network_fetch=False: freshness NOT re-asserted on cache reads.
+                    _verify_and_enforce(
+                        index_bytes=index_bytes,
+                        bundle_bytes=bundle_bytes_cached,
+                        config=config,
+                        verifier=verifier,
+                        index_url=url,
+                        is_network_fetch=False,
+                    )
                 elif no_bundle_marker.is_file():
-                    bundle_bytes_cached = None  # degraded; BundleMissing enforced below
-                # else: no bundle and no degraded marker → treat as BundleMissing
-                # (triggers crash recovery if bundle IS expected)
-
-                # Crash recovery: if bundle missing/mismatch on a CACHE READ,
-                # delete sidecars and fall through to refetch once (RFC §7.2).
-                if not _cache_bundle_looks_ok(bundle_bytes_cached, bundle_file):
+                    # Degraded mode: bundle transport previously returned 404 (RFC §7.2).
+                    # Enforce BundleMissing per policy; the marker is preserved — this is
+                    # NOT a crash state (H4 fix: the pre-fix code mis-classified this as
+                    # crash → _cache_bundle_looks_ok(None, absent_file) → False → recovery).
+                    from milpa.index_trust import BundleMissing, enforce_index_trust
+                    enforce_index_trust(BundleMissing, config.policy, url)
+                    # warn: execution continues to parse_index below.
+                    # strict: enforce_index_trust raises; we never reach here.
+                else:
+                    # No bundle AND no degraded marker: pre-RFC cache or interrupted write.
+                    # Trigger bounded crash recovery (one refetch).
                     _delete_bundle_sidecars(bundle_file, no_bundle_marker)
                     return _refetch_with_recovery(
                         url=url, cache_dir=cache_dir, cache_file=cache_file,
@@ -343,16 +366,6 @@ def load_index(
                         config=config, verifier=verifier,
                         now_unix=now_unix, is_recovery=True,
                     )
-
-                # is_network_fetch=False: freshness NOT re-asserted on cache reads.
-                _verify_and_enforce(
-                    index_bytes=index_bytes,
-                    bundle_bytes=bundle_bytes_cached,
-                    config=config,
-                    verifier=verifier,
-                    index_url=url,
-                    is_network_fetch=False,
-                )
             try:
                 return parse_index(index_bytes.decode("utf-8"))
             except UnicodeDecodeError as exc:
@@ -389,16 +402,37 @@ def load_index(
             index_bytes = cache_file.read_bytes()
             if trust_active:
                 assert config is not None and verifier is not None  # type narrowing
-                bundle_bytes_stale: bytes | None = None
                 if bundle_file.is_file():
                     bundle_bytes_stale = bundle_file.read_bytes()
+                    # Consistency check: empty bundle bytes = interrupted write.
+                    if not _cache_bundle_looks_ok(bundle_bytes_stale, bundle_file):
+                        # Cannot refetch — network is down.  Hard-fail.
+                        _delete_bundle_sidecars(bundle_file, no_bundle_marker)
+                        raise MilpaError(
+                            MILPA_INDEX_UNREACHABLE,
+                            f"failed to load index from {url!r}: {fetch_error} "
+                            "(cache bundle missing/corrupt and network unavailable for recovery)",
+                            url=url,
+                        )
+                    # is_network_fetch=False: stale offline fallback — no freshness.
+                    _verify_and_enforce(
+                        index_bytes=index_bytes,
+                        bundle_bytes=bundle_bytes_stale,
+                        config=config,
+                        verifier=verifier,
+                        index_url=url,
+                        is_network_fetch=False,
+                    )
                 elif no_bundle_marker.is_file():
-                    bundle_bytes_stale = None  # degraded
-
-                # Crash recovery: same as State 1 path.
-                if not _cache_bundle_looks_ok(bundle_bytes_stale, bundle_file):
-                    # Cannot refetch — we already know network is down.
-                    # Hard-fail rather than serve unverified bytes.
+                    # Degraded mode: serve cached index under BundleMissing policy.
+                    # Marker preserved; cannot refetch (network down) — not a crash state
+                    # (H4 fix: pre-fix code mis-classified this as crash → hard-fail).
+                    from milpa.index_trust import BundleMissing, enforce_index_trust
+                    enforce_index_trust(BundleMissing, config.policy, url)
+                    # warn: execution continues to parse_index below.
+                    # strict: enforce_index_trust raises; we never reach here.
+                else:
+                    # No bundle AND no marker: crash state; network down, cannot recover.
                     _delete_bundle_sidecars(bundle_file, no_bundle_marker)
                     raise MilpaError(
                         MILPA_INDEX_UNREACHABLE,
@@ -406,16 +440,6 @@ def load_index(
                         "(cache bundle missing/corrupt and network unavailable for recovery)",
                         url=url,
                     )
-
-                # is_network_fetch=False: stale offline fallback — no freshness.
-                _verify_and_enforce(
-                    index_bytes=index_bytes,
-                    bundle_bytes=bundle_bytes_stale,
-                    config=config,
-                    verifier=verifier,
-                    index_url=url,
-                    is_network_fetch=False,
-                )
             try:
                 return parse_index(index_bytes.decode("utf-8"))
             except UnicodeDecodeError as exc:
@@ -441,7 +465,8 @@ def load_index(
     # Atomic write order: bundle first, then index rename (RFC §7.2).
     # -------------------------------------------------------------------------
     fetched_bundle: bytes | None = None
-    bundle_was_404 = False
+    bundle_was_404 = False       # genuine HTTP 404 (_BundleNotFound)
+    bundle_transport_error = False  # other transport failure (500, reset, etc.)
 
     if trust_active and bundle_http_get is not None:
         bundle_url = _get_bundle_url(url)
@@ -450,23 +475,24 @@ def load_index(
         except _BundleNotFound:
             bundle_was_404 = True
         except Exception:
-            # Non-404 bundle fetch error: treat as BundleMissing for policy dispatch.
-            bundle_was_404 = True
+            # Non-404 transport error: slug stays BUNDLE-MISSING (bytes never
+            # arrived) but the .no-bundle degraded marker MUST NOT be written —
+            # transient failures should not settle into degraded mode.
+            bundle_transport_error = True
 
     # Verify BEFORE caching (is_network_fetch=True → freshness asserted).
     if trust_active:
         assert config is not None and verifier is not None  # type narrowing
-        if bundle_was_404:
-            # Bundle 404 under strict: hard-fail; do NOT cache partial state.
-            # Under warn: cache index + write degraded marker; use BundleMissing dispatch.
+        if bundle_was_404 or bundle_transport_error:
+            # Bundle unavailable under strict: hard-fail; do NOT cache partial state.
+            # Under warn: cache index; write degraded marker only on genuine 404.
             from milpa.index_trust import enforce_index_trust, BundleMissing
             if config.policy == "strict":
                 enforce_index_trust(BundleMissing, config.policy, url)
                 # strict raises in enforce_index_trust; we never reach here.
             else:
-                # warn: write degraded marker and proceed (RFC §7.2, §7.4).
+                # warn: proceed; marker written below (only for genuine 404).
                 enforce_index_trust(BundleMissing, config.policy, url)
-                # Proceed with caching; write no-bundle marker.
         else:
             _verify_and_enforce(
                 index_bytes=fetched_bytes,
@@ -486,13 +512,16 @@ def load_index(
         if fetched_bundle is not None and config.policy != "off":
             _atomic_write_bytes(bundle_file, fetched_bundle)
         elif bundle_was_404 and config.policy != "strict":
-            # warn policy + bundle 404: write degraded marker.
+            # warn policy + genuine 404: write degraded marker.
+            # Transient transport errors (bundle_transport_error) do NOT write the
+            # marker — the next fresh-cache read should try to re-fetch the bundle
+            # via crash-recovery rather than staying in degraded mode indefinitely.
             with contextlib.suppress(OSError):
                 no_bundle_marker.write_bytes(b"")
             # Remove any stale bundle sidecar.
             with contextlib.suppress(OSError):
                 bundle_file.unlink(missing_ok=True)
-        # Under strict+bundle_was_404: enforce_index_trust already raised.
+        # Under strict+bundle_was_404/bundle_transport_error: enforce_index_trust already raised.
 
     # Atomic write of the index (temp sibling + os.replace).
     tmp_file = cache_file.with_suffix(f".kdl.tmp.{now_unix}")
@@ -597,7 +626,8 @@ def _refetch_with_recovery(
 
     # Fetch bundle for recovery path.
     fetched_bundle: bytes | None = None
-    bundle_was_404 = False
+    bundle_was_404 = False       # genuine HTTP 404 (_BundleNotFound)
+    bundle_transport_error = False  # other transport failure (500, reset, etc.)
 
     if bundle_http_get is not None:
         bundle_url = _get_bundle_url(url)
@@ -606,10 +636,10 @@ def _refetch_with_recovery(
         except _BundleNotFound:
             bundle_was_404 = True
         except Exception:
-            bundle_was_404 = True
+            bundle_transport_error = True
 
     # Verify recovery fetch (is_network_fetch=True — freshness asserted).
-    if bundle_was_404:
+    if bundle_was_404 or bundle_transport_error:
         from milpa.index_trust import enforce_index_trust, BundleMissing
         # Second consecutive miss: hard-fail regardless of policy (RFC §7.2).
         if is_recovery:
@@ -647,6 +677,9 @@ def _refetch_with_recovery(
     if fetched_bundle is not None:
         _atomic_write_bytes(bundle_file, fetched_bundle)
     elif bundle_was_404 and config.policy != "strict":
+        # Genuine 404: write degraded marker so TTL governs re-fetch cadence.
+        # Transient transport errors (bundle_transport_error) do NOT write the
+        # marker — let the next read try crash-recovery refetch instead.
         with contextlib.suppress(OSError):
             no_bundle_marker.write_bytes(b"")
         with contextlib.suppress(OSError):

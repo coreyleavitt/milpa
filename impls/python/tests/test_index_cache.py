@@ -445,7 +445,7 @@ class TestLoadIndexForVerbThreeWay:
         # Track what URL load_default_index would call index_url_from_env with.
         captured_urls: list[str] = []
 
-        def fake_load_default_index() -> object:
+        def fake_load_default_index(**kwargs: object) -> object:
             # Record the URL that index_url_from_env() returns at call time.
             captured_urls.append(index_url_from_env())
             # Return a sentinel index object so _load_index_for_verb gets index≠None.
@@ -470,7 +470,7 @@ class TestLoadIndexForVerbThreeWay:
 
         called = False
 
-        def fake_load_default_index() -> object:
+        def fake_load_default_index(**kwargs: object) -> object:
             nonlocal called
             called = True
             return object()
@@ -492,7 +492,7 @@ class TestLoadIndexForVerbThreeWay:
 
         called = False
 
-        def fake_load_default_index() -> object:
+        def fake_load_default_index(**kwargs: object) -> object:
             nonlocal called
             called = True
             return object()
@@ -515,7 +515,7 @@ class TestLoadIndexForVerbThreeWay:
 
         captured_urls: list[str] = []
 
-        def fake_load_default_index() -> object:
+        def fake_load_default_index(**kwargs: object) -> object:
             captured_urls.append(index_url_from_env())
             return object()
 
@@ -537,7 +537,7 @@ class TestLoadIndexForVerbThreeWay:
         from milpa.errors import MILPA_INDEX_UNREACHABLE, MilpaError as _MilpaError
         monkeypatch.delenv("MILPA_INDEX_URL", raising=False)
 
-        def fake_load_unreachable() -> object:
+        def fake_load_unreachable(**kwargs: object) -> object:
             raise _MilpaError(MILPA_INDEX_UNREACHABLE, "test: network unavailable")
 
         from milpa.cli import _load_index_for_verb
@@ -855,6 +855,83 @@ class TestBundle404Handling:
         assert TNG_INDEX_BUNDLE_MISSING not in err
 
 
+class TestBundleTransportErrorHandling:
+    """Non-404 bundle transport errors (500, connection reset, etc.).
+
+    Slug is still BUNDLE-MISSING (bytes never arrived), but the degraded
+    .no-bundle marker MUST NOT be written — transient failures should not
+    settle into degraded mode; the next fresh-cache read should go through
+    crash-recovery refetch instead.
+    """
+
+    def test_warn_transport_error_warns_bundle_missing_no_marker(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """warn + generic transport exception → BUNDLE-MISSING warning; NO .no-bundle marker."""
+        get, _ = make_counter_get(VALID_INDEX)
+        config = _make_trust_config("warn")
+        _reset_warned_urls()
+
+        def erroring_bundle_get(url: str) -> bytes:
+            raise OSError(f"connection reset: {url!r}")
+
+        idx = load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                         config=config, verifier=MockVerifier(Trusted),
+                         bundle_http_get=erroring_bundle_get)
+        assert idx.packages[0].name == "bar"  # resolve proceeds
+
+        cache_file = cache_path_for(URL, tmp_path)
+        no_bundle_marker = Path(str(cache_file) + ".no-bundle")
+        assert not no_bundle_marker.exists(), (
+            "warn + generic transport error MUST NOT write the .no-bundle degraded marker"
+        )
+        err = capsys.readouterr().err
+        assert TNG_INDEX_BUNDLE_MISSING in err, (
+            "warn + transport error must still emit TNG-INDEX-BUNDLE-MISSING warning"
+        )
+
+    def test_strict_transport_error_raises_bundle_missing_no_marker(
+        self, tmp_path: Path
+    ) -> None:
+        """strict + generic transport exception → raises BUNDLE-MISSING; nothing cached."""
+        get, _ = make_counter_get(VALID_INDEX)
+        config = _make_trust_config("strict")
+        _reset_warned_urls()
+
+        def erroring_bundle_get(url: str) -> bytes:
+            raise ConnectionError(f"HTTP 500: {url!r}")
+
+        with pytest.raises(MilpaError) as exc_info:
+            load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                       config=config, verifier=MockVerifier(Trusted),
+                       bundle_http_get=erroring_bundle_get)
+        assert exc_info.value.slug == TNG_INDEX_BUNDLE_MISSING
+
+        cache_file = cache_path_for(URL, tmp_path)
+        no_bundle_marker = Path(str(cache_file) + ".no-bundle")
+        assert not no_bundle_marker.exists(), (
+            "strict + transport error MUST NOT write a degraded marker"
+        )
+
+    def test_404_warn_still_writes_marker(
+        self, tmp_path: Path
+    ) -> None:
+        """Pinned: warn + genuine _BundleNotFound 404 DOES write the .no-bundle marker."""
+        get, _ = make_counter_get(VALID_INDEX)
+        config = _make_trust_config("warn")
+        _reset_warned_urls()
+
+        load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                   config=config, verifier=MockVerifier(Trusted),
+                   bundle_http_get=failing_bundle_get)
+
+        cache_file = cache_path_for(URL, tmp_path)
+        no_bundle_marker = Path(str(cache_file) + ".no-bundle")
+        assert no_bundle_marker.exists(), (
+            "pinned: warn + genuine 404 (_BundleNotFound) MUST write the .no-bundle marker"
+        )
+
+
 # ---------------------------------------------------------------------------
 # 16. S5: Crash recovery (RFC §7.2 — bounded, one retry)
 # ---------------------------------------------------------------------------
@@ -934,3 +1011,202 @@ class TestRefreshIndex:
         load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000)
         load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000, refresh=False)
         assert calls[0] == 1, "refresh=False must NOT re-fetch a fresh cache"
+
+
+# ---------------------------------------------------------------------------
+# 18. H4: .no-bundle marker is NOT a crash state — fresh cache (State 1)
+# ---------------------------------------------------------------------------
+
+
+class TestNoBundleMarkerFreshCache:
+    """State 1 (fresh cache) with .no-bundle marker must NOT trigger crash recovery.
+
+    H4 regression: ``_cache_bundle_looks_ok(None, bundle_file)`` returned False
+    when the .no-bundle marker was present (bundle_bytes=None, bundle_file absent)
+    because the function could not distinguish "degraded marker" from "no bundle at
+    all".  This caused crash recovery (``_refetch_with_recovery``) to fire, delete
+    the marker, attempt a refetch, find the bundle 404 AGAIN, and hard-fail with
+    ``MILPA-INDEX-UNREACHABLE`` — even under warn policy where the caller should
+    simply receive a warning and a valid index.
+    """
+
+    def _populate_with_marker(self, tmp_path: Path) -> None:
+        """First load: bundle 404 under warn policy → writes .no-bundle marker + index."""
+        get, _ = make_counter_get(VALID_INDEX)
+        _reset_warned_urls()
+        load_index(
+            URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+            config=_make_trust_config("warn"),
+            verifier=MockVerifier(Trusted),
+            bundle_http_get=failing_bundle_get,
+        )
+
+    def test_warn_fresh_cache_with_marker_does_not_raise(
+        self, tmp_path: Path
+    ) -> None:
+        """Fresh cache (State 1) + warn + .no-bundle marker: returns index, no raise.
+
+        H4 regression: raised MILPA-INDEX-UNREACHABLE via crash-recovery path.
+        """
+        self._populate_with_marker(tmp_path)
+        get, calls = make_counter_get(VALID_INDEX)
+        _reset_warned_urls()
+        # Second load at same now_unix=1000 → age=0 < DEFAULT_TTL_SECONDS → State 1.
+        idx = load_index(
+            URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+            config=_make_trust_config("warn"),
+            verifier=MockVerifier(Trusted),
+            bundle_http_get=failing_bundle_get,
+        )
+        assert idx.packages[0].name == "bar"
+        assert calls[0] == 0, "State 1 must not trigger a network fetch"
+
+    def test_warn_fresh_cache_with_marker_emits_warning(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Fresh cache + warn + .no-bundle marker: emits TNG-INDEX-BUNDLE-MISSING warning."""
+        self._populate_with_marker(tmp_path)
+        _reset_warned_urls()
+        get, _ = make_counter_get(VALID_INDEX)
+        load_index(
+            URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+            config=_make_trust_config("warn"),
+            verifier=MockVerifier(Trusted),
+            bundle_http_get=failing_bundle_get,
+        )
+        err = capsys.readouterr().err
+        assert TNG_INDEX_BUNDLE_MISSING in err, (
+            "warn policy with .no-bundle marker must emit TNG-INDEX-BUNDLE-MISSING"
+        )
+
+    def test_warn_fresh_cache_marker_not_deleted(
+        self, tmp_path: Path
+    ) -> None:
+        """.no-bundle marker must NOT be deleted on a fresh cache read (warn policy).
+
+        H4 regression: ``_delete_bundle_sidecars`` wiped the marker before crash recovery.
+        """
+        self._populate_with_marker(tmp_path)
+        cache_file = cache_path_for(URL, tmp_path)
+        no_bundle_marker = Path(str(cache_file) + ".no-bundle")
+        assert no_bundle_marker.exists(), "marker must exist after first load"
+
+        get, _ = make_counter_get(VALID_INDEX)
+        _reset_warned_urls()
+        load_index(
+            URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+            config=_make_trust_config("warn"),
+            verifier=MockVerifier(Trusted),
+            bundle_http_get=failing_bundle_get,
+        )
+        assert no_bundle_marker.exists(), (
+            "H4 regression: .no-bundle marker must NOT be deleted on a fresh cache read"
+        )
+
+    def test_strict_fresh_cache_with_marker_raises_bundle_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """Fresh cache (State 1) + strict + .no-bundle marker: raises TNG-INDEX-BUNDLE-MISSING.
+
+        H4 regression: raised MILPA-INDEX-UNREACHABLE (crash-recovery slug) instead of
+        the correct trust-policy slug TNG-INDEX-BUNDLE-MISSING.
+        """
+        self._populate_with_marker(tmp_path)
+        get, _ = make_counter_get(VALID_INDEX)
+        _reset_warned_urls()
+        with pytest.raises(MilpaError) as exc_info:
+            load_index(
+                URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                config=_make_trust_config("strict"),
+                verifier=MockVerifier(Trusted),
+                bundle_http_get=failing_bundle_get,
+            )
+        assert exc_info.value.slug == TNG_INDEX_BUNDLE_MISSING, (
+            f"H4: expected TNG-INDEX-BUNDLE-MISSING, got {exc_info.value.slug!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 19. H4: .no-bundle marker is NOT a crash state — offline fallback (State 3)
+# ---------------------------------------------------------------------------
+
+
+class TestNoBundleMarkerOfflineFallback:
+    """State 3 (offline fallback) with .no-bundle marker: serve cached index.
+
+    H4 regression in State 3: same mis-classification as State 1 — the marker was
+    deleted and MILPA-INDEX-UNREACHABLE raised ("Cannot refetch — network is down")
+    instead of serving the cached index under warn policy.
+    """
+
+    def _populate_with_marker(self, tmp_path: Path) -> None:
+        """Populate cache + write .no-bundle marker under warn policy (bundle 404)."""
+        get, _ = make_counter_get(VALID_INDEX)
+        _reset_warned_urls()
+        load_index(
+            URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+            config=_make_trust_config("warn"),
+            verifier=MockVerifier(Trusted),
+            bundle_http_get=failing_bundle_get,
+        )
+
+    def test_warn_offline_with_marker_serves_index(
+        self, tmp_path: Path
+    ) -> None:
+        """Offline (State 3) + warn + .no-bundle marker: serves cached index, no raise.
+
+        H4 regression: raised MILPA-INDEX-UNREACHABLE instead of serving cached index.
+        """
+        self._populate_with_marker(tmp_path)
+        _reset_warned_urls()
+        # Stale (age=8999 > ttl=100) + network down → State 3.
+        idx = load_index(
+            URL, tmp_path, failing_get, 100, 9999,
+            config=_make_trust_config("warn"),
+            verifier=MockVerifier(Trusted),
+            bundle_http_get=failing_bundle_get,
+        )
+        assert idx.packages[0].name == "bar"
+
+    def test_warn_offline_with_marker_not_deleted(
+        self, tmp_path: Path
+    ) -> None:
+        """Offline + warn + .no-bundle marker: marker must NOT be deleted.
+
+        H4 regression: ``_delete_bundle_sidecars`` wiped the marker before hard-fail.
+        """
+        self._populate_with_marker(tmp_path)
+        cache_file = cache_path_for(URL, tmp_path)
+        no_bundle_marker = Path(str(cache_file) + ".no-bundle")
+        assert no_bundle_marker.exists()
+
+        _reset_warned_urls()
+        load_index(
+            URL, tmp_path, failing_get, 100, 9999,
+            config=_make_trust_config("warn"),
+            verifier=MockVerifier(Trusted),
+            bundle_http_get=failing_bundle_get,
+        )
+        assert no_bundle_marker.exists(), (
+            "H4 regression: .no-bundle marker must NOT be deleted during offline fallback"
+        )
+
+    def test_strict_offline_with_marker_raises_bundle_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """Offline (State 3) + strict + .no-bundle marker: raises TNG-INDEX-BUNDLE-MISSING.
+
+        H4 regression: raised MILPA-INDEX-UNREACHABLE instead of TNG-INDEX-BUNDLE-MISSING.
+        """
+        self._populate_with_marker(tmp_path)
+        _reset_warned_urls()
+        with pytest.raises(MilpaError) as exc_info:
+            load_index(
+                URL, tmp_path, failing_get, 100, 9999,
+                config=_make_trust_config("strict"),
+                verifier=MockVerifier(Trusted),
+                bundle_http_get=failing_bundle_get,
+            )
+        assert exc_info.value.slug == TNG_INDEX_BUNDLE_MISSING, (
+            f"H4: expected TNG-INDEX-BUNDLE-MISSING, got {exc_info.value.slug!r}"
+        )

@@ -14,10 +14,11 @@ Public surface:
 
   ``verify_index_bundle(index_bytes, bundle_bytes, trust_bundle, expected_signer,
                         max_age_seconds)``
-      Pure verification function — no I/O, never raises.  Implements RFC §4
-      steps 1–6.  Cert validity is checked at Rekor SET ``integratedTime``, NOT
-      wall-clock now (§4 step 2).  Freshness is skipped when
-      ``max_age_seconds is None`` (pure cache reads, offline safety — §4 step 6).
+      Pure verification function — no I/O, never raises.  Implements spec
+      §3.4.4 steps 1–7.  Cert validity is checked at Rekor SET ``integratedTime``,
+      NOT wall-clock now (§3.4.4 step 4).  Freshness is checked at step 3
+      (after integratedTime extraction, before crypto) and skipped when
+      ``max_age_seconds is None`` (pure cache reads, offline safety — §3.4.4 step 3).
 
   ``SigstoreVerifier``
       Production ``IndexBundleVerifier`` using ``sigstore-python``.  Not exercised
@@ -91,7 +92,7 @@ class VerificationResult(enum.Enum):
         Cryptographic verification failed: bad Fulcio cert chain, cert was
         expired AT ``integratedTime``, or Rekor inclusion proof invalid.
         A cert now-expired but valid at ``integratedTime`` MUST NOT trigger
-        this variant (RFC §4 step 2 — cert-at-SET-time requirement).
+        this variant (spec §3.4.4 step 4 — cert-at-SET-time requirement).
     DIGEST_MISMATCH
         The bundle's DSSE in-toto ``subject[0].digest.sha256`` ≠
         ``sha256(index_bytes)``.  Indicates tampering after attestation.
@@ -128,6 +129,22 @@ SignerMismatch = VerificationResult.SIGNER_MISMATCH
 BundleStale = VerificationResult.BUNDLE_STALE
 BundleMissing = VerificationResult.BUNDLE_MISSING
 BundleMalformed = VerificationResult.BUNDLE_MALFORMED
+
+# Initialise after aliases are bound (forward references resolved).
+# Both maps are module-level singletons; _init_* functions are called once here.
+# pylint: disable=wrong-import-position  # aliases must precede init calls
+
+# ---------------------------------------------------------------------------
+# DEFAULT_INDEX_SIGNER — single source of truth for the tianguis signer SAN
+# ---------------------------------------------------------------------------
+
+#: The pinned default signer SubjectAltName for the tianguis reindex workflow.
+#: This is the SOLE canonical definition — spec §3.4.4 step 5, §3.4.6.
+#: cli.py imports this constant; tests pin it to the exact spec value.
+#: Never duplicate this string: changing it here propagates everywhere.
+DEFAULT_INDEX_SIGNER = (
+    "https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml@refs/heads/main"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +268,7 @@ class IndexBundleVerifier(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Pure verification function — RFC §4 steps 1–6; no I/O, never raises
+# Pure verification function — spec §3.4.4 steps 1–7; no I/O, never raises
 # ---------------------------------------------------------------------------
 
 
@@ -264,29 +281,34 @@ def verify_index_bundle(
 ) -> VerificationResult:
     """Verify a Sigstore bundle against ``index_bytes``; return a ``VerificationResult``.
 
-    Implements RFC §4 verification steps:
+    Implements spec §3.4.4 verification steps:
 
     **Step 1** — Parse bundle JSON.  Non-JSON or wrong type → ``BundleMalformed``
     (pre-crypto failure, distinct from a cryptographic failure).
 
     **Step 2** — Extract ``integratedTime`` from
     ``verificationMaterial.tlogEntries[0].integratedTime``.  Missing or
-    non-integer → ``BundleMalformed``.  This is the time used for cert
-    validity checking (step 4) — NOT wall-clock ``now``.
+    non-integer → ``BundleMalformed``.  This is the anchor for cert-at-SET-time
+    checking (step 4) — NOT wall-clock ``now``.
 
     **Step 3** — Freshness check: ONLY when ``max_age_seconds is not None``.
     If ``now − integratedTime ≥ max_age_seconds`` → ``BundleStale``.
+    Freshness is checked HERE (after integratedTime extraction, before any
+    crypto) because it needs only the parsed timestamp; failing fast on staleness
+    is fail-closed regardless of which crypto failures may also be present.
     Passing ``None`` skips this bound entirely (pure cache reads; see RFC §7.2
     rationale: the rollback attack is a network-delivery attack; defending at
     the fetch boundary fully closes it without breaking offline use).
 
-    **Steps 4–6** — Delegated to ``sigstore-python`` via ``_sigstore_verify``:
+    **Steps 4–7** — Delegated to ``sigstore-python`` via ``_sigstore_verify``:
       4. Decode cert chain and validate against Fulcio root AT ``integratedTime``
          (not wall-clock).  Fulcio issues ~10-minute certs; checking
          ``cert.NotAfter >= now`` is ALWAYS wrong and MUST NOT be implemented.
-      5. Assert SubjectAltName == ``expected_signer`` → ``SignerMismatch``.
+      5. Assert SubjectAltName == ``expected_signer`` → ``SignerMismatch``
+         (detected via ``policy.verify`` call-site recording, NOT message text).
       6. Verify DSSE envelope signature; extract ``statement.subject[0].digest.sha256``
-         and assert it equals ``sha256(index_bytes)`` → ``DigestMismatch``.
+         from the returned payload and assert it equals ``sha256(index_bytes)``
+         → ``DigestMismatch`` (detected post-verify from payload, NOT message text).
       7. Verify Rekor inclusion proof / signed entry timestamp offline → ``SigInvalid``.
 
     **Single-read invariant** (RFC §4, §7.2): the ``index_bytes`` object passed
@@ -305,7 +327,7 @@ def verify_index_bundle(
         return BundleMalformed
 
     # Step 2: Extract integratedTime from the first Rekor tlog entry.
-    # This timestamp is the anchor for cert-at-SET-time checking (RFC §4 step 2).
+    # This timestamp is the anchor for cert-at-SET-time checking (spec §3.4.4 step 4).
     try:
         tlog_entries: list[Any] = bundle_data["verificationMaterial"]["tlogEntries"]
         integrated_time = int(tlog_entries[0]["integratedTime"])
@@ -313,9 +335,12 @@ def verify_index_bundle(
         return BundleMalformed
 
     # Step 3: Freshness check — ONLY on the network-fetch path.
+    # Placed here (after integratedTime extraction, before crypto) because it
+    # needs only the parsed timestamp and failing fast on staleness is fail-closed
+    # regardless of crypto failures — spec §3.4.4 step 3 normative ordering.
     # Pure cache reads (States 1 and 3) pass max_age_seconds=None: the
     # wall-clock bound is NOT re-asserted so offline/air-gapped invocations
-    # never fail on staleness (RFC §4 step 6, §7.2).
+    # never fail on staleness (spec §3.4.4 step 3, RFC §7.2).
     if max_age_seconds is not None:
         now = int(time.time())
         if (now - integrated_time) >= max_age_seconds:
@@ -327,8 +352,75 @@ def verify_index_bundle(
         bundle_bytes=bundle_bytes,
         trust_bundle=trust_bundle,
         expected_signer=expected_signer,
-        integrated_time=integrated_time,
     )
+
+
+class _RecordingPolicy:
+    """Wraps a VerificationPolicy and records whether ``verify()`` raised.
+
+    Used by ``_sigstore_verify`` to distinguish ``SignerMismatch`` (policy raised)
+    from ``SigInvalid`` (cert chain or Rekor failed before/after the policy call).
+
+    Dispatch is by CALL-SITE, not by exception message text — spec §3.4.4
+    normative failure-slug-mapping clause.  ``sigstore.errors.VerificationError``
+    is the single exception type raised for ALL cryptographic failures; there are
+    no distinct subclasses for signer mismatch vs cert-chain failure, so the only
+    reliable signal is whether the failure originated inside ``policy.verify``.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.policy_raised: bool = False
+
+    def verify(self, cert: Any) -> None:
+        """Call inner policy; set ``policy_raised`` if it raises, then re-raise."""
+        try:
+            self._inner.verify(cert)
+        except Exception:
+            self.policy_raised = True
+            raise
+
+
+def _check_dsse_payload_digest(payload_bytes: bytes, index_bytes: bytes) -> bool:
+    """Check that the in-toto payload's subject sha256 matches ``sha256(index_bytes)``.
+
+    Called after a successful ``verify_dsse`` — the DSSE envelope signature is
+    already verified, so ``payload_bytes`` is trusted bytes from the signed
+    attestation.  Compares ``statement.subject[0].digest.sha256`` to
+    ``sha256(index_bytes)`` (spec §3.4.4 step 6 — digest mismatch detection
+    from the verified payload, NOT from exception message text).
+
+    Returns ``True`` ONLY when the sha256 field is present AND matches
+    ``sha256(index_bytes)`` — the definitive trust signal.
+
+    Returns ``False`` (→ ``DigestMismatch``) in ALL other cases:
+      - The payload is not parseable as JSON.
+      - The subject list is absent or empty.
+      - ``subject[0].digest.sha256`` is absent.
+      - The sha256 field is present but does not match.
+
+    Rationale: the subject digest is the SOLE binding between the attestation
+    and the index bytes.  Absence of the subject or its digest means the
+    attestation makes NO claim about the index content — any DSSE bundle signed
+    by the trusted identity whose statement lacks a sha256 subject (e.g. a
+    different predicate from the same CI workflow) would otherwise bind to
+    arbitrary tampered index bytes.  Spec §3.4.4 step 6 NORMATIVE: a payload
+    whose subject digest is absent or unextractable MUST produce
+    TNG-INDEX-DIGEST-MISMATCH.
+    """
+    import hashlib
+    try:
+        payload_json = json.loads(payload_bytes)
+        subjects = payload_json.get("subject", [])
+        if not subjects:
+            return False
+        sha256_claim = subjects[0].get("digest", {}).get("sha256")
+        if sha256_claim is None:
+            return False
+        expected = hashlib.sha256(index_bytes).hexdigest()
+        return sha256_claim == expected
+    except Exception:
+        return False
 
 
 def _sigstore_verify(
@@ -336,25 +428,78 @@ def _sigstore_verify(
     bundle_bytes: bytes,
     trust_bundle: TrustBundle,
     expected_signer: str,
-    integrated_time: int,  # noqa: ARG001 — reserved for cert-at-SET-time API in S5
 ) -> VerificationResult:
-    """RFC §4 steps 4–6: cryptographic verification via sigstore-python.
+    """Spec §3.4.4 steps 4–7: cryptographic verification via sigstore-python.
 
-    Cert validity is checked at ``integrated_time`` (the Rekor SET ``integratedTime``)
-    by sigstore-python when the bundle carries a Rekor inclusion proof, satisfying
-    the cert-at-SET-time normative requirement (RFC §4 step 2).
+    Cert validity is checked at the Rekor SET ``integratedTime`` embedded in
+    the bundle by sigstore-python, satisfying the cert-at-SET-time requirement
+    (§3.4.4 step 4).  No ``integrated_time`` parameter is needed here — the
+    library reads it from the bundle's tlog entry directly.
 
-    NOTE: custom trust-root support (``TrustBundle.raw_json`` → ``TrustRoot``) is
-    wired in S5 once the oracle bundle and ``TrustRoot`` API path are validated
-    end-to-end.  Until then, ``Verifier.production()`` is used for all bundles.
-    The test bundle path is exercised only after S5 generates the oracle.
+    Failure-to-variant mapping is TYPE-BASED, not message-text heuristic (spec
+    §3.4.4 normative failure-slug-mapping clause):
+
+    - ``VerificationError`` raised BEFORE ``policy.verify`` (cert chain / Rekor)
+      → ``SigInvalid``.
+    - ``VerificationError`` raised BY ``policy.verify`` (SAN mismatch)
+      → ``SignerMismatch`` (detected via ``_RecordingPolicy`` call-site recording).
+    - ``VerificationError`` raised AFTER ``policy.verify`` (sig or Rekor)
+      → ``SigInvalid``.
+    - Payload digest ≠ ``sha256(index_bytes)`` after successful ``verify_dsse``
+      → ``DigestMismatch`` (detected from returned payload, not from exception text).
+
+    Uses ``verify_dsse`` (not ``verify_artifact``) — the whole-index attestation
+    bundle is a DSSE-enveloped in-toto statement, not a bare hashedrekord bundle.
+
+    Offline semantics (RFC §5.2, item M5):
+    - Production path: ``Verifier.production(offline=True)`` — no TUF refresh.
+    - Custom-root path: ``Verifier(trusted_root=...)`` bypasses TUF entirely;
+      the root is provided directly, so no network access occurs for TUF.
+      Rekor inclusion proof verification in both paths is fully offline: the
+      bundle carries the inclusion proof and ``_verify_common_signing_cert``
+      verifies it against ``trusted_root.rekor_keyring`` without any live
+      Rekor HTTP query.  The custom-root path is therefore already offline
+      — there is no public API to add an extra offline flag because TUF is
+      already bypassed.
     """
     try:
+        from sigstore.errors import VerificationError
         from sigstore.models import Bundle
         from sigstore.verify import Verifier
         from sigstore.verify.policy import Identity
     except ImportError:
         # sigstore-python not installed; treat as signature invalid.
+        return SigInvalid
+
+    # Build the verifier FIRST (before parsing the bundle — construction is
+    # independent of bundle content and must complete to test the TrustedRoot path).
+    #
+    # RFC §5.2: offline verification MUST work without live Rekor access;
+    # the bundle carries an inclusion proof verifiable offline.
+    #
+    # M1 fix: when trust_bundle.label != "production", use a custom TrustedRoot
+    # constructed from trust_bundle.raw_json via TrustedRoot.from_file (public API;
+    # no _internal imports).  The production path uses Verifier.production(offline=True).
+    try:
+        if trust_bundle.label == "production":
+            verifier = Verifier.production(offline=True)
+        else:
+            # Custom trust root: write raw_json to a temp file and load via
+            # TrustedRoot.from_file (the public API; no _internal imports needed).
+            import tempfile
+            from sigstore.models import TrustedRoot
+            with tempfile.NamedTemporaryFile(
+                suffix=".json", delete=False, mode="wb"
+            ) as tmp:
+                tmp.write(trust_bundle.raw_json)
+                tmp_path = tmp.name
+            try:
+                trusted_root = TrustedRoot.from_file(tmp_path)
+                verifier = Verifier(trusted_root=trusted_root)
+            finally:
+                import os as _os
+                _os.unlink(tmp_path)
+    except Exception:
         return SigInvalid
 
     # Parse the Sigstore bundle.
@@ -363,56 +508,38 @@ def _sigstore_verify(
     except Exception:
         return BundleMalformed
 
-    # Build the verifier.
-    # S5 TODO: when trust_bundle.label != "production" or is not the placeholder,
-    # construct a Verifier from trust_bundle.raw_json via TrustRoot / from_file.
-    # Build the verifier with offline=True: no live Rekor/TUF network call at
-    # verify time (RFC §5.2 — offline verification MUST work without live Rekor
-    # access; the bundle carries an inclusion proof verifiable offline).
-    # S5 TODO: when trust_bundle.label != "production" or is not the placeholder,
-    # construct a Verifier from trust_bundle.raw_json via TrustedRoot.from_file.
-    try:
-        verifier = Verifier.production(offline=True)
-    except Exception:
-        return SigInvalid
-
     # Signer identity policy: SubjectAltName must match expected_signer.
     # Default issuer is the GitHub Actions OIDC endpoint; S5 wires the per-URL
     # signer override when index-trust-signer / MILPA_INDEX_TRUST_SIGNER is set.
-    identity_policy = Identity(
+    inner_policy = Identity(
         identity=expected_signer,
         issuer="https://token.actions.githubusercontent.com",
     )
+    # Wrap in a recording policy so we can distinguish SignerMismatch (policy
+    # raised inside _verify_common_signing_cert) from SigInvalid (other failures
+    # before or after the policy call) — spec §3.4.4 failure-slug-mapping clause.
+    recording = _RecordingPolicy(inner_policy)
 
+    # Steps 4-5, 7: cert chain + signer identity + Rekor via verify_dsse.
+    # verify_dsse runs _verify_common_signing_cert (cert chain at integratedTime,
+    # then policy.verify for SAN check) followed by DSSE envelope sig verification
+    # and Rekor consistency.  Returns (payload_type, payload_bytes) on success.
     try:
-        # sigstore 4.x uses input_ (trailing underscore) as the parameter name.
-        verifier.verify_artifact(
-            input_=index_bytes,
-            bundle=bundle,
-            policy=identity_policy,
-        )
-    except Exception as exc:
-        return _map_sigstore_error(str(exc))
+        _, payload_bytes = verifier.verify_dsse(bundle=bundle, policy=recording)
+    except VerificationError:
+        if recording.policy_raised:
+            return SignerMismatch
+        return SigInvalid
+    except Exception:
+        return SigInvalid
+
+    # Step 6: digest comparison from the verified in-toto payload.
+    # The DSSE sig is already confirmed valid, so payload_bytes is trusted.
+    # Compare statement.subject[0].digest.sha256 to sha256(index_bytes).
+    if not _check_dsse_payload_digest(payload_bytes, index_bytes):
+        return DigestMismatch
 
     return Trusted
-
-
-def _map_sigstore_error(error_msg: str) -> VerificationResult:
-    """Heuristic mapping of a sigstore VerificationError message to a VerificationResult.
-
-    Best-effort for S5 integration path.  The exact token set depends on the
-    sigstore-python version; calibrate against real oracle-bundle error messages
-    in S5.
-    """
-    msg = error_msg.lower()
-    # Signer identity / SubjectAltName mismatch
-    if any(tok in msg for tok in ("identity", "subject alternative", "san", "issuer", "certificate identity")):
-        return SignerMismatch
-    # DSSE subject digest mismatch (sha256 of index_bytes)
-    if any(tok in msg for tok in ("digest", "sha256", "hash mismatch", "subject hash")):
-        return DigestMismatch
-    # All other failures: bad cert chain, invalid inclusion proof, etc.
-    return SigInvalid
 
 
 # ---------------------------------------------------------------------------
@@ -587,7 +714,7 @@ def describe_index_bundle(bundle_bytes: bytes) -> "IndexBundleInfo | None":
     if not isinstance(data, dict):
         return None
 
-    # Extract integratedTime (mandatory — same logic as verify_index_bundle step 2).
+    # Extract integratedTime (mandatory — same logic as verify_index_bundle step 2/spec §3.4.4 step 2).
     # Proto3 JSON encodes int64 as a string; accept both string and native integer forms.
     try:
         raw_it = data["verificationMaterial"]["tlogEntries"][0]["integratedTime"]
@@ -737,6 +864,27 @@ def _reset_warned_urls() -> None:
     _warned_urls.clear()
 
 
+def result_to_slug(result: "VerificationResult") -> str:
+    """Map a non-Trusted ``VerificationResult`` to its ``TNG-INDEX-*`` error slug.
+
+    Single source of truth for the VerificationResult → slug bijection (M5).
+    Called by ``enforce_index_trust``, conformance runners, and any code that
+    needs the slug without performing enforcement.
+
+    Raises ``KeyError`` for ``VerificationResult.TRUSTED`` — callers must
+    guard against passing ``Trusted`` (which has no slug by design).
+    """
+    _map: dict[VerificationResult, str] = {
+        BundleMissing: TNG_INDEX_BUNDLE_MISSING,
+        BundleMalformed: TNG_INDEX_BUNDLE_MALFORMED,
+        SigInvalid: TNG_INDEX_SIGNATURE_INVALID,
+        DigestMismatch: TNG_INDEX_DIGEST_MISMATCH,
+        SignerMismatch: TNG_INDEX_SIGNER_MISMATCH,
+        BundleStale: TNG_INDEX_BUNDLE_STALE,
+    }
+    return _map[result]
+
+
 def enforce_index_trust(
     result: VerificationResult,
     policy: TrustPolicy,
@@ -747,7 +895,7 @@ def enforce_index_trust(
     Policy semantics (RFC §6.1):
 
     - ``off``     → silent; verifier was not called; no warning, no raise.
-    - ``Trusted`` → silent; all six verification steps passed.
+    - ``Trusted`` → silent; all seven verification steps passed (spec §3.4.4).
     - ``warn``    → emit ONE machine-readable warning to stderr per unique
                     ``index_url`` per invocation (dedup key = ``index_url``);
                     exit 0 (RFC "detection but not prevention").
@@ -773,43 +921,34 @@ def enforce_index_trust(
     if policy == "off" or result is Trusted:
         return
 
-    # Map VerificationResult → (slug, human_hint)
-    _slug_map: dict[VerificationResult, tuple[str, str]] = {
+    slug = result_to_slug(result)
+
+    # Human-readable hints per result variant (enforce_index_trust only; not exported).
+    _hint_map: dict[VerificationResult, str] = {
         BundleMissing: (
-            TNG_INDEX_BUNDLE_MISSING,
             "no attestation bundle for the index. "
             "Run 'milpa fetch --refresh-index' to re-fetch with attestation, "
-            "or set 'index-trust \"off\"' in milpa.kdl to suppress.",
+            "or set 'index-trust \"off\"' in milpa.kdl to suppress."
         ),
-        BundleMalformed: (
-            TNG_INDEX_BUNDLE_MALFORMED,
-            "the Sigstore bundle is not valid JSON or missing required fields.",
-        ),
-        SigInvalid: (
-            TNG_INDEX_SIGNATURE_INVALID,
-            "cryptographic verification of the index Sigstore bundle failed.",
-        ),
+        BundleMalformed: "the Sigstore bundle is not valid JSON or missing required fields.",
+        SigInvalid: "cryptographic verification of the index Sigstore bundle failed.",
         DigestMismatch: (
-            TNG_INDEX_DIGEST_MISMATCH,
             "the bundle's attested subject digest does not match the index bytes "
-            "(tampering or mismatched bundle/index pair).",
+            "(tampering or mismatched bundle/index pair)."
         ),
         SignerMismatch: (
-            TNG_INDEX_SIGNER_MISMATCH,
             "the bundle signer identity does not match the expected signer. "
             "Set 'index-trust-signer' in milpa.kdl or MILPA_INDEX_TRUST_SIGNER "
-            "to configure the expected SubjectAltName for a custom registry.",
+            "to configure the expected SubjectAltName for a custom registry."
         ),
         BundleStale: (
-            TNG_INDEX_BUNDLE_STALE,
             "the index attestation bundle is beyond the maximum allowed age "
             "(rollback attack or frozen CDN). "
             "Run 'milpa fetch --refresh-index' to force a fresh fetch, "
-            "or increase MILPA_INDEX_MAX_AGE.",
+            "or increase MILPA_INDEX_MAX_AGE."
         ),
     }
-
-    slug, hint = _slug_map[result]
+    hint = _hint_map[result]
 
     if policy == "strict":
         raise MilpaError(

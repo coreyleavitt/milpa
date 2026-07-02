@@ -1596,6 +1596,43 @@ two axes govern different concerns and MUST NOT be conflated.
 > Supports the same URL schemes as `MILPA_INDEX_URL`: HTTPS, HTTP, and
 > `file://`. When set, the derivation algorithm in §3.4.2 is bypassed entirely.
 
+#### `MILPA_INDEX_TRUST_MOCK_VERIFIER` (CONFORMANCE-INTERNAL)
+
+> CONFORMANCE-INTERNAL: This variable is **not for production use**. It drives
+> the `MockVerifier` seam in the shared S7 index-trust conformance corpus so the
+> corpus can exercise the trust-gate policy state machine in both implementations
+> without real Sigstore infrastructure.
+>
+> When set to one of the 7 wire strings (`trusted`, `sig-invalid`,
+> `digest-mismatch`, `signer-mismatch`, `bundle-stale`, `bundle-missing`,
+> `bundle-malformed`), the CLI injects a `MockVerifier` that returns that
+> `VerificationResult` and ignores all other inputs. The gate (`enforce_index_trust`
+> + effective policy computation) still runs normally against the injected result.
+>
+> **`file://` index URL restriction:** This variable is ONLY honored when the
+> resolved index URL has a `file://` scheme. All conformance fixtures and
+> hermetic tests use `file://` index URLs; production indexes are `https://`.
+> If this variable is set (non-empty after trimming) and the resolved index URL
+> does NOT have a `file://` scheme, the implementation MUST raise
+> `MILPA-INTERNAL` and exit 1 immediately — fail closed and visible, never
+> silently ignore or silently bypass verification. This rule prevents the mock
+> seam from being accidentally activated against a real index URL in a
+> misconfigured environment. Both reference implementations enforce this rule.
+>
+> An **invalid** value (not in the set of 7 wire strings) MUST cause the
+> implementation to fail immediately with a `MILPA-INTERNAL` diagnostic and exit 1.
+> The seam MUST NOT fail-open silently (silently treating an invalid value as
+> `trusted` would mask misconfigured test environments and hide regressions).
+>
+> When absent or empty, the production verifier (`SigstoreVerifier`, or the
+> S4b deferred stub) is used — this variable has no effect on production invocations.
+>
+> **Cross-impl alignment:** Both reference implementations use the SAME variable
+> name with the SAME value semantics (wire string as value, not a boolean flag +
+> a second variable). The S7 conformance fixtures inject this variable via the
+> fixture `env` file under the key `mock_verifier_result`, which the conformance
+> runner maps to `MILPA_INDEX_TRUST_MOCK_VERIFIER` when driving the CLI path.
+
 ---
 
 ## 9  `--version`

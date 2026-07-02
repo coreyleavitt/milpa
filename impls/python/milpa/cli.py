@@ -522,7 +522,197 @@ def _build_dep_decl_store(no_index: bool = False) -> object | None:
 # ---------------------------------------------------------------------------
 
 
-def _load_index_for_verb(env: MilpaEnv) -> MilpaEnv:
+def _load_manifest_trust_fields(
+    project_dir: Path,
+) -> "tuple[str, str | None, str | None]":
+    """Load (policy, signer, bundle) from manifest or workspace.  Pure I/O.
+
+    Returns the raw manifest-level fields before any env-var or flag override.
+    Falls back to ``("warn", None, None)`` on any load failure (missing manifest,
+    workspace detection error, etc.) — callers apply their own override logic.
+
+    This is the single source of truth for policy-field extraction; both
+    ``_build_index_trust`` (enforcement gate) and ``cmd_show_index_trust``
+    (observability) call it so they display and enforce the identical policy
+    (spec §5.3a SSOT requirement — item M4).
+    """
+    from milpa.workspace import merge_workspace_index_trust_policy
+
+    manifest_policy: str = "warn"
+    manifest_signer: str | None = None
+    manifest_bundle: str | None = None
+    try:
+        ws = find_workspace_root(project_dir)
+        if ws is not None:
+            # Workspace: max-merge member policies (RFC §6.4a).
+            member_policies = [m.manifest.index_trust_policy for m in ws.members]
+            manifest_policy = merge_workspace_index_trust_policy("warn", member_policies)
+            # Signer and bundle: consistent across members (enforced by _check_conflicting_signers).
+            manifest_signer = next(
+                (m.manifest.index_trust_signer for m in ws.members
+                 if m.manifest.index_trust_signer is not None),
+                None,
+            )
+            manifest_bundle = next(
+                (m.manifest.index_trust_bundle for m in ws.members
+                 if m.manifest.index_trust_bundle is not None),
+                None,
+            )
+        else:
+            m = load_or_discover_manifest(project_dir)
+            manifest_policy = str(m.index_trust_policy)
+            manifest_signer = m.index_trust_signer
+            manifest_bundle = m.index_trust_bundle
+    except (OSError, MilpaError):
+        pass  # no manifest or workspace detection error → use defaults
+    return manifest_policy, manifest_signer, manifest_bundle
+
+
+def _build_index_trust(
+    env: MilpaEnv,
+    project_dir: Path,
+) -> "tuple[object, object] | tuple[None, None]":
+    """Build ``(IndexTrustConfig, IndexBundleVerifier)`` for the index-trust gate.
+
+    Returns ``(None, None)`` when the effective policy is ``'off'`` (gate disabled).
+
+    Authority model (spec §3.4.5 / RFC registry-trust-federation §6.6):
+    1. Load manifest index-trust fields (policy, signer, bundle) via
+       ``_load_manifest_trust_fields`` (the SSOT shared with ``cmd_show_index_trust``).
+    2. Compute effective policy = effective_trust_policy(manifest, flag, env).
+    3. If off → return (None, None).
+    4. Build IndexTrustConfig from policy + signer + trust_bundle + max_age.
+    5. Build verifier: MockVerifier from MILPA_INDEX_TRUST_MOCK_VERIFIER
+       (conformance/test seam) or SigstoreVerifier (production).
+
+    MILPA_INDEX_TRUST_MOCK_VERIFIER conformance seam (spec/cli-contract.md §8.6.6):
+    When set to one of the 7 wire strings (trusted / sig-invalid /
+    digest-mismatch / signer-mismatch / bundle-stale / bundle-missing /
+    bundle-malformed), the CLI injects a ``MockVerifier(result)`` instead of
+    ``SigstoreVerifier``.  Invalid values are rejected with ``MILPA-INTERNAL``
+    (the seam must never fail-open silently).  This seam is IDENTICAL to the
+    Rust impl's seam (same single env var name and value semantics) so the shared
+    S7 conformance corpus can drive both impls via environment injection.
+
+    IMPORTANT: ``MILPA_INDEX_TRUST_MOCK_VERIFIER`` is ONLY honored when the
+    resolved index URL has a ``file://`` scheme (all conformance fixtures and
+    hermetic tests use file:// indexes; production indexes are https).  Attempting
+    to set the mock seam with a non-file:// index URL raises ``MILPA-INTERNAL``
+    — fail closed and visible, never silently bypass.
+    """
+    import os
+
+    from milpa.index_trust import (
+        DEFAULT_INDEX_SIGNER,
+        IndexTrustConfig,
+        MockVerifier,
+        SigstoreVerifier,
+        TrustBundle,
+        VerificationResult,
+    )
+    from milpa.trust import effective_trust_policy
+
+    # 1. Read index-trust env vars.
+    env_trust_raw = os.environ.get("MILPA_INDEX_TRUST", "").strip() or None
+    env_signer = os.environ.get("MILPA_INDEX_TRUST_SIGNER", "").strip() or None
+    env_bundle_path = os.environ.get("MILPA_INDEX_TRUST_BUNDLE", "").strip() or None
+    env_max_age_raw = os.environ.get("MILPA_INDEX_MAX_AGE", "").strip()
+    env_max_age = 604800  # default: 7 days
+    if env_max_age_raw:
+        try:
+            env_max_age = int(env_max_age_raw)
+        except ValueError:
+            pass  # invalid value: fall back to default (main() already warned)
+
+    # 2. Load manifest index-trust fields (policy, signer, bundle) via SSOT helper.
+    manifest_policy, manifest_signer, manifest_bundle = _load_manifest_trust_fields(project_dir)
+
+    # 3. Compute effective policy.
+    policy = effective_trust_policy(
+        manifest_policy,  # type: ignore[arg-type]
+        flag=env.require_attested_index,
+        env_override=env_trust_raw,
+    )
+
+    if policy == "off":
+        return None, None
+
+    # 4. Build trust bundle: env override path > manifest path > production embedded.
+    bundle_path = env_bundle_path or manifest_bundle
+    if bundle_path:
+        # spec/cli-contract.md §8.6 NORMATIVE: the value MUST be a file:// URL.
+        # Bare paths (no file:// prefix) MUST be rejected.
+        if not bundle_path.startswith("file://"):
+            raise MilpaError(
+                MILPA_INTERNAL,
+                f"MILPA_INDEX_TRUST_BUNDLE (or index-trust-bundle manifest node) "
+                f"must be a file:// URL; got: {bundle_path!r}. "
+                f"Use file:///abs/path/to/bundle.json (three slashes for an absolute path).",
+            )
+        # Strip the file:// scheme to get a filesystem path.
+        fs_path = bundle_path[len("file://"):]
+        try:
+            raw = Path(fs_path).read_bytes()
+        except OSError as exc:
+            raise MilpaError(
+                MILPA_INTERNAL,
+                f"cannot read index-trust-bundle file {fs_path!r}: {exc}",
+                path=fs_path,
+            ) from exc
+        trust_bundle = TrustBundle(raw_json=raw, label=f"custom:{fs_path}")
+    else:
+        trust_bundle = TrustBundle.production()
+
+    # 5. Build expected signer: env > manifest > default tianguis signer (SSOT constant).
+    expected_signer = env_signer or manifest_signer or DEFAULT_INDEX_SIGNER
+
+    config = IndexTrustConfig(
+        policy=policy,
+        trust_bundle=trust_bundle,
+        expected_signer=expected_signer,
+        max_age_seconds=env_max_age,
+    )
+
+    # 6. Build verifier: MockVerifier from conformance seam, SigstoreVerifier in production.
+    _MOCK_MAP = {
+        "trusted": VerificationResult.TRUSTED,
+        "sig-invalid": VerificationResult.SIG_INVALID,
+        "digest-mismatch": VerificationResult.DIGEST_MISMATCH,
+        "signer-mismatch": VerificationResult.SIGNER_MISMATCH,
+        "bundle-stale": VerificationResult.BUNDLE_STALE,
+        "bundle-missing": VerificationResult.BUNDLE_MISSING,
+        "bundle-malformed": VerificationResult.BUNDLE_MALFORMED,
+    }
+    mock_result_str = os.environ.get("MILPA_INDEX_TRUST_MOCK_VERIFIER", "").strip()
+    if mock_result_str:
+        # Guard: mock seam is conformance-internal; ONLY honored for file:// indexes.
+        # Production indexes are https; using the mock seam on https would silently
+        # bypass real Sigstore verification in a misconfigured non-test environment.
+        raw_index_url = os.environ.get("MILPA_INDEX_URL", "")
+        if not raw_index_url.startswith("file://"):
+            raise MilpaError(
+                MILPA_INTERNAL,
+                "MILPA_INDEX_TRUST_MOCK_VERIFIER is conformance-internal and only "
+                "honored for file:// index URLs (all conformance fixtures use file://; "
+                "production indexes are https). This variable must not be set in "
+                "production or with non-file:// index URLs.",
+            )
+        mock_result = _MOCK_MAP.get(mock_result_str)
+        if mock_result is None:
+            raise MilpaError(
+                MILPA_INTERNAL,
+                f"MILPA_INDEX_TRUST_MOCK_VERIFIER={mock_result_str!r} is not a valid "
+                f"VerificationResult wire string (expected one of: {', '.join(_MOCK_MAP)}). "
+                "Test seam must never fail-open silently.",
+            )
+        verifier: object = MockVerifier(mock_result)
+    else:
+        verifier = SigstoreVerifier()
+
+    return config, verifier
+
+
+def _load_index_for_verb(env: MilpaEnv, project_dir: "Path | None" = None) -> MilpaEnv:
     """Return a new MilpaEnv with the index eagerly loaded (or None if unreachable).
 
     Reads MILPA_INDEX_URL (cli-contract.md §8.1) using three-way semantics:
@@ -534,6 +724,12 @@ def _load_index_for_verb(env: MilpaEnv) -> MilpaEnv:
       ``index=None`` without any network attempt. Used by the harness for
       air-gapped fixtures that contain no ``index.kdl``.
     - ``MILPA_INDEX_URL`` **present and non-empty** → load from that URL.
+
+    When ``project_dir`` is provided, the manifest's ``index-trust`` policy,
+    signer, and bundle are loaded and merged with env vars / CLI flags to build
+    the ``IndexTrustConfig`` that is passed to ``load_default_index`` (C1 fix:
+    the trust gate was previously unplumbed — ``load_default_index()`` was called
+    bare with no config/verifier).
 
     TNG-* parse errors always propagate — the index was fetched but failed
     validation; the correct slug is more useful than silently treating a
@@ -550,10 +746,20 @@ def _load_index_for_verb(env: MilpaEnv) -> MilpaEnv:
     if _no_index_requested(env.no_index):
         return replace(env, index=None)
 
+    # Build IndexTrustConfig + verifier when project_dir is provided.
+    config: object = None
+    verifier: object = None
+    if project_dir is not None:
+        config, verifier = _build_index_trust(env, project_dir)
+
     # Absent → DEFAULT_INDEX_URL; non-empty → that URL.
     # load_default_index() calls index_url_from_env() which handles both cases.
     try:
-        index = load_default_index()
+        index = load_default_index(
+            config=config,
+            verifier=verifier,
+            refresh=env.refresh_index,
+        )
     except MilpaError as exc:
         if exc.slug == MILPA_INDEX_UNREACHABLE:
             # Unreachable index → let the resolver raise RES-NO-INDEX per dep.
@@ -944,7 +1150,7 @@ def cmd_fetch(
             # Silent fallthrough.
 
     # Full resolve path — load index.
-    env_with_index = _load_index_for_verb(env)
+    env_with_index = _load_index_for_verb(env, project_dir)
 
     prior = _maybe_load_prior_lockfile(lock_path)
     profile = Profile.from_environment()
@@ -1076,7 +1282,7 @@ def _cmd_fetch_workspace(
                 return 1
 
     # Full workspace resolve.
-    env_with_index = _load_index_for_verb(env)
+    env_with_index = _load_index_for_verb(env, ws_root)
     prior = _maybe_load_prior_lockfile(lock_path)
     profile = Profile.from_environment()
     params = ResolveParams(
@@ -1166,7 +1372,7 @@ def cmd_lock(
     lock_path = project_dir / "milpa.lock"
     deps_dir = project_dir / "_deps"
 
-    env_with_index = _load_index_for_verb(env)
+    env_with_index = _load_index_for_verb(env, project_dir)
     prior = _maybe_load_prior_lockfile(lock_path)
     profile = Profile.from_environment()
     params = ResolveParams(
@@ -1223,7 +1429,7 @@ def _cmd_lock_workspace(
     lock_path = ws_root / "milpa.lock"
     deps_dir = ws_root / "_deps"
 
-    env_with_index = _load_index_for_verb(env)
+    env_with_index = _load_index_for_verb(env, ws_root)
     prior = _maybe_load_prior_lockfile(lock_path)
     profile = Profile.from_environment()
     params = ResolveParams(
@@ -1357,6 +1563,11 @@ def cmd_show_index_trust(project_dir: Path) -> int:
     performed.  Verification is enforced at fetch/lock time; this command is
     for human audit of what is cached.
 
+    The effective policy is computed via ``_load_manifest_trust_fields`` — the
+    SAME helper used by the enforcement gate in ``_build_index_trust`` — so this
+    command always displays the policy that the gate would enforce (spec §5.3a
+    SSOT requirement, item M4).
+
     spec/cli-contract.md §5.3a.
     """
     import os
@@ -1364,27 +1575,14 @@ def cmd_show_index_trust(project_dir: Path) -> int:
 
     from milpa.index_cache import _bundle_path, _default_cache_dir, cache_path_for, index_url_from_env
     from milpa.index_trust import describe_index_bundle, format_index_trust_info
-    from milpa.trust import TrustPolicy, effective_trust_policy
+    from milpa.trust import effective_trust_policy
 
     index_url = index_url_from_env()
 
-    # Compute effective policy: try to load manifest index-trust, then apply env.
-    # If the manifest cannot be loaded (e.g. not in a milpa project dir), fall back
-    # to the env-only policy.
-    manifest_policy: str = "warn"
-    try:
-        from milpa.manifest import ManifestDoc, discover_manifest
-        doc = discover_manifest(project_dir)
-        if isinstance(doc, ManifestDoc) and doc.manifest is not None:
-            mp = getattr(doc.manifest, "index_trust_policy", None)
-            if mp is not None:
-                manifest_policy = str(mp)
-        elif hasattr(doc, "root") and doc.root is not None:
-            mp = getattr(doc.root, "index_trust_policy", None)
-            if mp is not None:
-                manifest_policy = str(mp)
-    except Exception:
-        pass  # no manifest — use env default
+    # Compute effective policy via the SSOT helper (same as the enforcement gate).
+    # _load_manifest_trust_fields handles workspace max-merge and falls back to
+    # "warn" when no manifest is present, so we never need bare except here.
+    manifest_policy, _, _ = _load_manifest_trust_fields(project_dir)
 
     env_trust = os.environ.get("MILPA_INDEX_TRUST")
     policy = effective_trust_policy(manifest_policy, flag=False, env_override=env_trust)
@@ -2082,7 +2280,7 @@ def _cmd_add_git(
     from dataclasses import replace as _replace
     proposed_manifest = _replace(manifest, deps=manifest.deps + (new_dep,))
 
-    env_with_index = _load_index_for_verb(env)
+    env_with_index = _load_index_for_verb(env, project_dir)
     deps_dir = project_dir / "_deps"
     profile = Profile.from_environment()
     params = ResolveParams(
@@ -2345,7 +2543,7 @@ def cmd_remove(
     proposed_manifest = _replace(manifest, deps=new_deps)
 
     # Re-resolve.
-    env_with_index = _load_index_for_verb(env)
+    env_with_index = _load_index_for_verb(env, project_dir)
     deps_dir = project_dir / "_deps"
     profile = Profile.from_environment()
     params = ResolveParams(
@@ -2430,7 +2628,7 @@ def cmd_update(
         )
 
     manifest = load_or_discover_manifest(project_dir)
-    env_with_index = _load_index_for_verb(env)
+    env_with_index = _load_index_for_verb(env, project_dir)
     deps_dir = project_dir / "_deps"
     profile = Profile.from_environment()
 
@@ -2570,7 +2768,7 @@ def _cmd_update_workspace(
             return 1
         prior = strip_dep_pin(prior, canonical_name)
 
-    env_with_index = _load_index_for_verb(env)
+    env_with_index = _load_index_for_verb(env, ws_root)
     profile = Profile.from_environment()
     params = ResolveParams(
         strategy=strategy,
@@ -2741,7 +2939,7 @@ def _cmd_add_from_member_dir(
     # Re-resolve the WHOLE workspace via the SSOT orchestration primitive.
     # apply_member_manifest_change: reload-workspace → apply mutator → resolve
     # in-memory → write member manifest → write shared lock.
-    env_with_index = _load_index_for_verb(env)
+    env_with_index = _load_index_for_verb(env, ws_root)
     profile = Profile.from_environment()
     params = ResolveParams(
         strategy=strategy,
@@ -2815,7 +3013,7 @@ def _cmd_remove_from_member_dir(
         return _replace(m, deps=new_deps)
 
     # Re-resolve the WHOLE workspace via the SSOT orchestration primitive.
-    env_with_index = _load_index_for_verb(env)
+    env_with_index = _load_index_for_verb(env, ws_root)
     profile = Profile.from_environment()
     params = ResolveParams(
         strategy=strategy,
@@ -2943,7 +3141,7 @@ def cmd_workspace_add_member(
         profile=profile,
         prior=None,
     )
-    env_with_index = _load_index_for_verb(env)
+    env_with_index = _load_index_for_verb(env, root)
 
     def _mutate(ws: WorkspaceManifest) -> WorkspaceManifest:
         return _replace(ws, members=ws.members + (rel_path,))
@@ -3084,7 +3282,7 @@ def cmd_workspace_remove_member(
         profile=profile,
         prior=None,
     )
-    env_with_index = _load_index_for_verb(env)
+    env_with_index = _load_index_for_verb(env, root)
 
     _matched_path = matched_path  # capture for closure
 
@@ -3185,10 +3383,13 @@ def main(argv: list[str] | None = None) -> int:
     _refresh_index = getattr(args, "refresh_index", False)
 
     # Update the env with index-trust state (env vars + flags).
+    # require_attested_index escalates the effective policy warn→strict per-verb
+    # in _build_index_trust; it must travel on env (not re-read from args later).
     from dataclasses import replace as _dc_replace
     env = _dc_replace(
         env,
         refresh_index=_refresh_index,
+        require_attested_index=_require_attested_index,
     )
 
     # Dispatch.

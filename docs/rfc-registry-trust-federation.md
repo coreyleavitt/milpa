@@ -220,7 +220,22 @@ inclusion proof / signed entry timestamp).
 1. Parse the bundle JSON. If the bundle is not valid JSON or does not conform
    to the Sigstore bundle schema, raise `TNG-INDEX-BUNDLE-MALFORMED` (this is a
    pre-crypto failure distinct from a cryptographic failure).
-2. Decode and validate the bundle's certificate against the embedded Fulcio root.
+2. Extract `integratedTime` from `verificationMaterial.tlogEntries[0].integratedTime`.
+   If the field is absent or non-integer, raise `TNG-INDEX-BUNDLE-MALFORMED`.
+   This timestamp anchors both the freshness check (step 3) and cert-at-SET-time
+   validation (step 4).
+3. **Network-fetch path only:** Assert `now - SET.integratedTime < MILPA_INDEX_MAX_AGE`
+   (default 7 days; offline-checkable because `integratedTime` is in the bundle). On
+   exceed: raise `TNG-INDEX-BUNDLE-STALE`. This freshness assertion fires ONLY when
+   the bundle was obtained via a network fetch (cache State 2, or any path that reaches
+   the network). Freshness is placed here — after integratedTime extraction (step 2)
+   and before cryptographic verification (steps 4–7) — because it needs only the parsed
+   timestamp; failing fast on staleness is fail-closed. On a PURE CACHE READ (States 1
+   and 3) step 3 MUST NOT be asserted; steps 1–2 and 4–7 MUST still be executed.
+   Rationale: the rollback attack is a network-delivery attack; defending at the fetch
+   boundary fully closes it. Re-asserting wall-clock freshness on offline cache reads
+   breaks air-gapped use without adding security.
+4. Decode and validate the bundle's certificate against the embedded Fulcio root.
    Certificate validity MUST be checked at the Rekor SET `integratedTime`, NOT
    current wall-clock time. Checking `cert.NotAfter >= now` is INCORRECT and
    MUST NOT be implemented: Fulcio issues ~10-minute certificates, so every real
@@ -229,30 +244,22 @@ inclusion proof / signed entry timestamp).
    at its own `integratedTime`; a cert now-expired but valid at SET time MUST
    verify successfully. The `sigstore-rs` spike (§12.1) MUST confirm that the
    cert-at-SET-time property is available in the library API before S4 begins.
-3. Confirm the certificate's SubjectAltName matches the expected signer identity
+5. Confirm the certificate's SubjectAltName matches the expected signer identity
    (default: pinned vendor-bot OIDC identity; overridable via §3.2). Mismatch
-   raises `TNG-INDEX-SIGNER-MISMATCH`.
-4. Verify the DSSE envelope signature using the cert's public key. Extract the
-   in-toto statement from the DSSE payload and assert
-   `statement.subject[0].digest.sha256 == sha256(index_bytes)`. The signature
-   covers the DSSE envelope payload (an in-toto statement), NOT raw index bytes.
-   A digest mismatch raises `TNG-INDEX-DIGEST-MISMATCH`. Fixture-generation
-   tooling MUST produce DSSE bundles (`cosign attest-blob` shape), not raw
-   signatures.
-5. Verify the Rekor inclusion proof / signed entry timestamp against the embedded
+   raises `TNG-INDEX-SIGNER-MISMATCH`. Implementations MUST detect this via the
+   verification policy call-site, not by matching exception message text.
+6. Verify the DSSE envelope signature using the cert's public key. After successful
+   signature verification, extract the in-toto statement from the verified DSSE
+   payload and assert `statement.subject[0].digest.sha256 == sha256(index_bytes)`.
+   The signature covers the DSSE envelope payload (an in-toto statement), NOT raw
+   index bytes. A digest mismatch raises `TNG-INDEX-DIGEST-MISMATCH`. Implementations
+   MUST detect digest mismatch from the verified payload, NOT from exception message
+   text. Fixture-generation tooling MUST produce DSSE bundles (`cosign attest-blob`
+   shape), not raw signatures.
+7. Verify the Rekor inclusion proof / signed entry timestamp against the embedded
    Rekor public key. Failure raises `TNG-INDEX-SIGNATURE-INVALID`.
-6. **Network-fetch path only:** Assert `now - SET.integratedTime < MILPA_INDEX_MAX_AGE`
-   (default 7 days; offline-checkable because `integratedTime` is in the bundle). On
-   exceed: raise `TNG-INDEX-BUNDLE-STALE`. This freshness assertion fires ONLY when
-   the bundle was obtained via a network fetch (cache State 2, or any path that reaches
-   the network). On a PURE CACHE READ (States 1 and 3) the cryptographic chain
-   (cert-at-SET-time, DSSE digest, inclusion proof, signer identity from steps 1–5)
-   is STILL re-verified, but the wall-clock `now - integratedTime` freshness bound is
-   NOT re-asserted. Rationale: the rollback attack is a network-delivery attack;
-   defending at the fetch boundary fully closes it. Re-asserting wall-clock freshness
-   on offline cache reads breaks air-gapped use without adding security.
 
-If all six verification steps pass: `index_bytes` is decoded to `str` for
+If all seven verification steps pass: `index_bytes` is decoded to `str` for
 parsing. A `UnicodeDecodeError` (non-UTF-8 index bytes — e.g., a tianguis
 encoding bug over a validly-signed blob) MUST surface via the existing
 index-parse error path, NOT as a bare exception. The exact error slug is chosen
@@ -260,7 +267,7 @@ in S5 (reusing the existing index-parse/KDL-parse error code if one exists; no
 new TNG code is introduced unless none exists). This is a normative requirement,
 not an implementation detail.
 
-Steps 1–6 are executed by the `sigstore-python` library (Python) or the
+Steps 1–7 are executed by the `sigstore-python` library (Python) or the
 `sigstore-rs` crate (Rust). milpa does not implement signature or
 transparency-log verification internally.
 
@@ -285,10 +292,10 @@ output format from `cosign attest-blob`. It is a JSON document carrying:
 
 The DSSE payload for an `attest-blob` bundle is a JSON `in-toto` attestation
 statement whose subject is the sha256 digest of the signed file. Verification
-step 4 (§4) extracts `statement.subject[0].digest.sha256` from the DSSE payload
-and asserts it matches `sha256(index_bytes)`. The signature covers the DSSE
-envelope, which in turn attests to the bytes' digest; it does NOT cover the raw
-`index.kdl` bytes directly.
+step 6 (§4) extracts `statement.subject[0].digest.sha256` from the verified DSSE
+payload and asserts it matches `sha256(index_bytes)`. The signature covers the
+DSSE envelope, which in turn attests to the bytes' digest; it does NOT cover the
+raw `index.kdl` bytes directly.
 
 ### 5.2 Offline verification
 
@@ -300,10 +307,10 @@ freshness cross-check; it is never a hard dependency at resolve time.
 This is critical for CI environments with restricted egress, air-gapped
 deployments, and offline laptop development. An air-gapped deployment performs
 ONE network `milpa fetch` to prime the cache; subsequent offline cache reads
-re-verify the cryptographic chain (cert-at-SET-time, DSSE digest, inclusion
-proof, signer identity) but do NOT re-assert the wall-clock freshness bound —
-so they never fail on staleness. The freshness bound is only re-evaluated when
-the network is next reached (§7.2).
+re-verify the cryptographic chain (steps 1–2 and 4–7: cert-at-SET-time, DSSE
+digest, inclusion proof, signer identity) but do NOT re-assert the wall-clock
+freshness bound (step 3) — so they never fail on staleness. The freshness bound
+is only re-evaluated when the network is next reached (§7.2).
 
 The `sigstore-python` and `sigstore-rs` libraries both support offline bundle
 verification when the bundle carries an inclusion proof. The Rust library's
@@ -1166,8 +1173,8 @@ versions. Before beginning S4, the spike MUST confirm:
 1. Does the crate support offline bundle verification (no Rekor network call) in
    its current release?
 2. Is the cert-at-SET-time property (`cert.valid_at(integrated_time)` or
-   equivalent) available? This is a correctness requirement (§4 step 2), not an
-   optimization.
+   equivalent) available? This is a correctness requirement (§4 step 4 / spec
+   §3.4.4 step 4), not an optimization.
 3. Is the API stable enough to pin, or does it track a pre-1.0 semver?
 4. Is offline bundle verification exercised by the crate's own test suite, or
    only by integration tests requiring a live Sigstore instance?

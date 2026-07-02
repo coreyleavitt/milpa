@@ -9,9 +9,9 @@
 //!   field is cross-impl identical.
 //! - [`IndexBundleVerifier`] — trait: the injected verifier seam.  Production code passes
 //!   [`SigstoreVerifier`]; test/conformance code passes [`MockVerifier`].
-//! - [`verify_index_bundle`] — pure function; never panics.  Implements RFC §4 steps 1–3
-//!   (JSON parse, integratedTime extract, freshness check) correctly.  Steps 4–6
-//!   (crypto) are stubbed; see the S4b DEFERRED note below.
+//! - [`verify_index_bundle`] — pure function; never panics.  Implements spec §3.4.4 steps 1–3
+//!   (JSON parse, integratedTime extract, freshness check) correctly.  Steps 4–7
+//!   (cert chain, signer, digest, Rekor SET) are stubbed; see the S4b DEFERRED note below.
 //! - [`SigstoreVerifier`] — **S4b DEFERRED**: placeholder; always panics with
 //!   `unimplemented!`.  See the S4b note below.
 //! - [`MockVerifier`] — test seam; returns a caller-supplied result, ignoring all inputs.
@@ -48,13 +48,13 @@
 //!   `CertificatePool::verify_cert_with_time` is the primitive that validates the Fulcio leaf
 //!   cert chain against the embedded Fulcio root AT the cert's issuance time (not wall-clock).
 //!   It is declared `pub(crate)` in `crypto/mod.rs` and is inaccessible outside the crate.
-//!   Without it, RFC §4 step 2 (cert chain validation at `integratedTime`) cannot be implemented
+//!   Without it, spec §3.4.4 step 4 (cert chain validation at `integratedTime`) cannot be implemented
 //!   without hand-rolling webpki at-time validation — which violates the no-hand-rolled-crypto rule.
 //!
 //! **Gap 2 — Rekor SET / inclusion proof verification is an explicit TODO in sigstore-rs 0.11.0.**
 //!   In `bundle/verify/verifier.rs` lines 155–162, steps 5 (Merkle inclusion) and 6 (Signed Entry
 //!   Timestamp counter-signature) are literal `// TODO(tnytown): ...; sigstore-rs#285` comments.
-//!   These are NOT implemented even for the MessageSignature path.  RFC §4 step 5 requires SET
+//!   These are NOT implemented even for the MessageSignature path.  spec §3.4.4 step 7 requires SET
 //!   verification; the library does not implement it.  Doing it ourselves would require hand-rolling
 //!   the SET counter-signature check (ECDSA verify over the tlog entry JSON using the Rekor public
 //!   key), which violates the no-hand-rolled-crypto rule.
@@ -96,6 +96,25 @@ use milpa_manifest::TrustPolicy;
 use crate::error::{CoreError, MilpaError};
 
 // ---------------------------------------------------------------------------
+// DEFAULT_INDEX_SIGNER — canonical tianguis signing identity (spec §3.4.4 step 5)
+// ---------------------------------------------------------------------------
+
+/// Default expected SubjectAltName for the tianguis index Sigstore bundle.
+///
+/// This is the GitHub Actions OIDC workflow SAN for the tianguis
+/// `reindex.yaml` CI workflow on the `main` branch.  It identifies the
+/// signer that ran the attestation step — not the commit author.
+///
+/// Override via:
+/// - `index-trust-signer "<san>"` in `milpa.kdl` (per-project).
+/// - `MILPA_INDEX_TRUST_SIGNER=<san>` environment variable (process-level).
+///
+/// spec §3.4.4 step 5 — signer identity check.
+pub const DEFAULT_INDEX_SIGNER: &str =
+    "https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml\
+     @refs/heads/main";
+
+// ---------------------------------------------------------------------------
 // VerificationResult — 7-variant enum (RFC §6.5)
 // ---------------------------------------------------------------------------
 
@@ -111,13 +130,13 @@ use crate::error::{CoreError, MilpaError};
 /// [`Trusted`]: VerificationResult::Trusted
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationResult {
-    /// All six RFC §4 verification steps passed.  The index bytes are trustworthy.
+    /// All seven spec §3.4.4 verification steps passed.  The index bytes are trustworthy.
     Trusted,
     /// Cryptographic verification failed: bad Fulcio cert chain, cert was expired AT
     /// `integratedTime`, or Rekor inclusion proof invalid.
     ///
     /// A cert now-expired but valid at `integratedTime` MUST NOT trigger this variant
-    /// (RFC §4 step 2 — cert-at-SET-time requirement).
+    /// (spec §3.4.4 step 4 — cert-at-SET-time requirement).
     SigInvalid,
     /// The bundle's DSSE in-toto `subject[0].digest.sha256` ≠ `sha256(index_bytes)`.
     /// Indicates tampering after attestation.
@@ -152,6 +171,27 @@ impl VerificationResult {
             Self::BundleStale => "bundle-stale",
             Self::BundleMissing => "bundle-missing",
             Self::BundleMalformed => "bundle-malformed",
+        }
+    }
+
+    /// Map a non-Trusted result to its `TNG-INDEX-*` error slug (M5 SSOT).
+    ///
+    /// Single source of truth for the VerificationResult → slug bijection.
+    /// Called by `enforce_index_trust` and conformance runners; eliminates
+    /// the previously-triplicated inline `match` blocks.
+    ///
+    /// # Panics
+    ///
+    /// Panics on `Trusted` — callers must guard (Trusted has no TNG-INDEX-* slug).
+    pub fn to_slug(&self) -> &'static str {
+        match self {
+            Self::BundleMissing => "TNG-INDEX-BUNDLE-MISSING",
+            Self::BundleMalformed => "TNG-INDEX-BUNDLE-MALFORMED",
+            Self::SigInvalid => "TNG-INDEX-SIGNATURE-INVALID",
+            Self::DigestMismatch => "TNG-INDEX-DIGEST-MISMATCH",
+            Self::SignerMismatch => "TNG-INDEX-SIGNER-MISMATCH",
+            Self::BundleStale => "TNG-INDEX-BUNDLE-STALE",
+            Self::Trusted => panic!("VerificationResult::Trusted has no TNG-INDEX-* slug"),
         }
     }
 
@@ -264,7 +304,7 @@ pub trait IndexBundleVerifier {
     /// - `expected_signer`: expected SubjectAltName (GitHub Actions OIDC workflow URL
     ///   or configured override).
     /// - `max_age_seconds`: freshness window in seconds.  Pass `None` on pure cache
-    ///   reads to skip the wall-clock bound (RFC §4 step 6, §7.2).
+    ///   reads to skip the wall-clock bound (spec §3.4.4 step 3, §7.2).
     fn verify(
         &self,
         index_bytes: &[u8],
@@ -276,27 +316,27 @@ pub trait IndexBundleVerifier {
 }
 
 // ---------------------------------------------------------------------------
-// Pure verification function — RFC §4 steps 1–3; crypto stubbed (S4b)
+// Pure verification function — spec §3.4.4 steps 1–3; crypto stubbed (S4b)
 // ---------------------------------------------------------------------------
 
 /// Verify a Sigstore bundle against `index_bytes`; return a [`VerificationResult`].
 ///
-/// Implements RFC §4 verification steps 1–3 correctly:
+/// Implements spec §3.4.4 verification steps 1–3 correctly:
 ///
 /// **Step 1** — Parse bundle JSON.  Non-JSON or non-object → [`BundleMalformed`]
 /// (pre-crypto failure, distinct from a cryptographic failure).
 ///
 /// **Step 2** — Extract `integratedTime` from
 /// `verificationMaterial.tlogEntries[0].integratedTime`.  Missing or non-integer
-/// → [`BundleMalformed`].  This is the anchor for cert-at-SET-time checking (RFC §4
-/// step 2) — NOT wall-clock `now`.
+/// → [`BundleMalformed`].  This is the anchor for cert-at-SET-time checking (spec
+/// §3.4.4 step 4) — NOT wall-clock `now`.
 ///
 /// **Step 3** — Freshness check: ONLY when `max_age_seconds` is `Some`.
 /// If `now − integratedTime ≥ max_age_seconds` → [`BundleStale`].
 /// Passing `None` skips this bound entirely (pure cache reads, offline safety —
-/// RFC §4 step 6, §7.2).
+/// spec §3.4.4 step 3, §7.2).
 ///
-/// **Steps 4–6 — S4b DEFERRED**: crypto verification is stubbed.  sigstore-rs 0.11.0 has
+/// **Steps 4–7 — S4b DEFERRED**: crypto verification is stubbed.  sigstore-rs 0.11.0 has
 /// two blocking gaps (DSSE unsupported; Rekor SET verification TODO sigstore-rs#285);
 /// see the module-level S4b note for the full spike finding.  Returns [`SigInvalid`] for
 /// all bundles that pass steps 1–3.  This is conservative (no false [`Trusted`] results).
@@ -322,7 +362,7 @@ pub fn verify_index_bundle(
     };
 
     // Step 2: extract integratedTime from the first Rekor tlog entry.
-    // This timestamp is the anchor for cert-at-SET-time checking (RFC §4 step 2).
+    // This timestamp is the anchor for cert-at-SET-time checking (spec §3.4.4 step 4).
     let integrated_time: u64 = match extract_integrated_time(&bundle_json) {
         Some(t) => t,
         None => return VerificationResult::BundleMalformed,
@@ -331,7 +371,7 @@ pub fn verify_index_bundle(
     // Step 3: freshness check — ONLY on the network-fetch path.
     // Pure cache reads (States 1 and 3) pass max_age_seconds=None: the
     // wall-clock bound is NOT re-asserted so offline/air-gapped invocations
-    // never fail on staleness (RFC §4 step 6, §7.2).
+    // never fail on staleness (spec §3.4.4 step 3, §7.2).
     if let Some(max_age) = max_age_seconds {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -342,7 +382,7 @@ pub fn verify_index_bundle(
         }
     }
 
-    // Steps 4–6: S4b DEFERRED — crypto verification placeholder.
+    // Steps 4–7: S4b DEFERRED — crypto verification placeholder.
     // sigstore-rs 0.11.0 has two blocking gaps: DSSE unsupported + Rekor SET TODO (#285).
     // See module-level S4b note. Returns SigInvalid conservatively (no false Trusted).
     _crypto_stub_s4b(index_bytes, &bundle_json, trust_bundle, expected_signer, integrated_time)
@@ -586,39 +626,36 @@ pub fn enforce_index_trust(
         return Ok(());
     }
 
-    // Map VerificationResult → (slug, human_hint).
-    let (slug, hint): (&'static str, &'static str) = match result {
+    // Slug via SSOT (M5 — single slug map lives on VerificationResult::to_slug).
+    let slug = result.to_slug();
+
+    // Human-readable hints (not exported; enforce_index_trust only).
+    let hint: &'static str = match result {
         VerificationResult::BundleMissing => (
-            "TNG-INDEX-BUNDLE-MISSING",
             "no attestation bundle for the index. \
              Run 'milpa fetch --refresh-index' to re-fetch with attestation, \
-             or set 'index-trust \"off\"' in milpa.kdl to suppress.",
+             or set 'index-trust \"off\"' in milpa.kdl to suppress."
         ),
         VerificationResult::BundleMalformed => (
-            "TNG-INDEX-BUNDLE-MALFORMED",
-            "the Sigstore bundle is not valid JSON or missing required fields.",
+            "the Sigstore bundle is not valid JSON or missing required fields."
         ),
         VerificationResult::SigInvalid => (
-            "TNG-INDEX-SIGNATURE-INVALID",
-            "cryptographic verification of the index Sigstore bundle failed.",
+            "cryptographic verification of the index Sigstore bundle failed."
         ),
         VerificationResult::DigestMismatch => (
-            "TNG-INDEX-DIGEST-MISMATCH",
             "the bundle's attested subject digest does not match the index bytes \
-             (tampering or mismatched bundle/index pair).",
+             (tampering or mismatched bundle/index pair)."
         ),
         VerificationResult::SignerMismatch => (
-            "TNG-INDEX-SIGNER-MISMATCH",
             "the bundle signer identity does not match the expected signer. \
              Set 'index-trust-signer' in milpa.kdl or MILPA_INDEX_TRUST_SIGNER \
-             to configure the expected SubjectAltName for a custom registry.",
+             to configure the expected SubjectAltName for a custom registry."
         ),
         VerificationResult::BundleStale => (
-            "TNG-INDEX-BUNDLE-STALE",
             "the index attestation bundle is beyond the maximum allowed age \
              (rollback attack or frozen CDN). \
              Run 'milpa fetch --refresh-index' to force a fresh fetch, \
-             or increase MILPA_INDEX_MAX_AGE.",
+             or increase MILPA_INDEX_MAX_AGE."
         ),
         VerificationResult::Trusted => unreachable!("handled above"),
     };
@@ -716,7 +753,7 @@ pub fn describe_index_bundle(bundle_bytes: &[u8]) -> Option<IndexBundleInfo> {
     let obj = data.as_object()?;
     let _ = obj; // confirm it's an object
 
-    // Extract integratedTime (mandatory — same logic as verify_index_bundle step 2).
+    // Extract integratedTime (mandatory — same logic as verify_index_bundle spec §3.4.4 step 2).
     // Proto3 JSON encodes int64 as a string; accept both string and native integer.
     let integrated_time = extract_integrated_time(&data).and_then(|t| i64::try_from(t).ok())?;
 
@@ -794,8 +831,13 @@ pub fn format_index_trust_info(
             info.subject_sha256.as_deref().unwrap_or("(not available)")
         ));
         lines.push(format!("rekor-entry:    {}", info.rekor_log_index));
-        let age = now.saturating_sub(info.integrated_time);
-        let freshness = if (age as u64) < max_age { "fresh" } else { "stale" };
+        // Item 7 (M10): use signed subtraction so future-dated bundles
+        // (integratedTime > now) produce a negative age, which is < max_age
+        // → "fresh".  Python: `age = now - info.integrated_time; age < max_age`.
+        // The old `now.saturating_sub(…) as u64` wrapped negative ages to huge
+        // positive values → false "stale".
+        let age = now - info.integrated_time; // i64 arithmetic; negative when future-dated
+        let freshness = if age < max_age as i64 { "fresh" } else { "stale" };
         lines.push(format!("freshness:      {freshness}"));
     }
 
@@ -845,6 +887,20 @@ mod tests {
     #[test]
     fn bundle_malformed_value_matches_python() {
         assert_eq!(VerificationResult::BundleMalformed.value(), "bundle-malformed");
+    }
+
+    // Item 6 (M6): pin the DEFAULT_INDEX_SIGNER constant to the spec §3.4.4 step 5 value.
+    #[test]
+    fn default_index_signer_pin_matches_spec() {
+        // Regression guard: the constant must be the tianguis reindex.yaml OIDC SAN.
+        // Changing this accidentally would silently bypass signer-mismatch detection
+        // for any consumer using the default signer.
+        assert_eq!(
+            DEFAULT_INDEX_SIGNER,
+            "https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml\
+             @refs/heads/main",
+            "spec §3.4.4 step 5: DEFAULT_INDEX_SIGNER must match the tianguis reindex workflow"
+        );
     }
 
     /// All 7 variants round-trip through from_value / value.
@@ -1320,6 +1376,36 @@ mod tests {
         assert!(out.contains("signer:         (not available)\n"));
         assert!(out.contains("issuer:         (not available)\n"));
         assert!(out.contains("subject-sha256: (not available)\n"));
+    }
+
+    // Item 7 (M10): future-dated integratedTime must be treated as "fresh"
+    // (not "stale") in both impls.  Python: `age = now - integrated_time`;
+    // negative age → `age < max_age` → True → "fresh".  The Rust bug was
+    // `now.saturating_sub(integrated_time) as u64` which wraps to a huge u64
+    // for negative ages → reports "stale" instead.
+    #[test]
+    fn format_future_dated_integrated_time_is_fresh() {
+        let now: i64 = 1_735_000_000;
+        let info = IndexBundleInfo {
+            integrated_time: now + 1000, // 1000 seconds in the future
+            rekor_log_index: "1".to_string(),
+            subject_sha256: None,
+            signer_san: None,
+            oidc_issuer: None,
+        };
+        let out = format_index_trust_info(
+            "https://example.com/index.kdl",
+            "warn",
+            true,
+            true,
+            Some(&info),
+            now,
+            604800,
+        );
+        assert!(
+            out.ends_with("freshness:      fresh\n"),
+            "future-dated integratedTime must be 'fresh', got: {out:?}"
+        );
     }
 
     #[test]

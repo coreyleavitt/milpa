@@ -377,8 +377,8 @@ inverts those clauses; it is explicitly out of scope here.
 > NOT invoke the gate. `milpa show` invokes the gate ONLY when it actually
 > loads the index; a lockfile-only `show` (no index load needed) does NOT
 > invoke the gate. `milpa verify` invokes the gate in crypto-only mode (steps
-> 1–5, §3.4.4) but MUST NOT assert the wall-clock freshness bound (step 6),
-> preserving offline audit capability.
+> 1–2 and 4–7, skipping step 3 (freshness), §3.4.4) but MUST NOT assert the
+> wall-clock freshness bound, preserving offline audit capability.
 
 #### 3.4.2  Bundle acquisition and URL derivation
 
@@ -427,13 +427,35 @@ The Sigstore bundle is a JSON document carrying:
 
 #### 3.4.4  Verification steps
 
-A conformant implementation MUST execute the following six steps in order:
+A conformant implementation MUST execute the following seven steps in order:
 
 **Step 1 — Parse the bundle JSON.** If the bundle is not valid JSON or does not
 conform to the Sigstore bundle schema, MUST raise `TNG-INDEX-BUNDLE-MALFORMED`.
 This is a pre-cryptographic failure — no signature check has been attempted.
 
-**Step 2 — Validate the certificate chain against the embedded Fulcio root.**
+**Step 2 — Extract `integratedTime`.** Extract the Rekor SET `integratedTime`
+from `verificationMaterial.tlogEntries[0].integratedTime`. If the field is
+absent or non-integer, MUST raise `TNG-INDEX-BUNDLE-MALFORMED`. This timestamp
+is required for both the freshness check (step 3) and cert-at-SET-time
+validation (step 4).
+
+**Step 3 — Freshness assertion (network-fetch paths only).** On a network-fetch
+path (State 2 or recovery re-fetch), MUST assert
+`now - SET.integratedTime < MILPA_INDEX_MAX_AGE` (default 7 days; configurable
+via `MILPA_INDEX_MAX_AGE` in `spec/cli-contract.md §8`). `integratedTime` is
+embedded in the bundle; no live Rekor network query is needed. On exceed, MUST
+raise `TNG-INDEX-BUNDLE-STALE`. Freshness is placed here — after integratedTime
+extraction (step 2) and before cryptographic verification (steps 4–7) — because
+it needs only the parsed timestamp; failing fast on staleness is fail-closed
+regardless of which crypto failures may also be present.
+
+> NORMATIVE: On a PURE CACHE READ (States 1 and 3), step 3 (freshness) MUST
+> NOT be asserted. Steps 1–2 and 4–7 MUST still be executed. Rationale: the
+> rollback attack is a network-delivery attack; defending at the fetch boundary
+> fully closes it. Re-asserting wall-clock freshness on cache reads would break
+> air-gapped deployments without adding security.
+
+**Step 4 — Validate the certificate chain against the embedded Fulcio root.**
 Certificate validity MUST be checked at the Rekor SET `integratedTime`, NOT
 current wall-clock time. Fulcio issues short-lived (~10-minute) certificates;
 checking `cert.NotAfter >= now` is INCORRECT and MUST NOT be implemented. A
@@ -441,7 +463,7 @@ certificate now-expired by wall-clock but valid at its `integratedTime` MUST
 verify successfully. `TNG-INDEX-SIGNATURE-INVALID` is raised ONLY when the
 certificate was expired AT its own `integratedTime`.
 
-**Step 3 — Confirm the signer identity.** The certificate's SubjectAltName MUST
+**Step 5 — Confirm the signer identity.** The certificate's SubjectAltName MUST
 match the expected signer identity. The pinned default identity is:
 
 - Issuer: `https://token.actions.githubusercontent.com`
@@ -453,31 +475,58 @@ This identity is overridable via `MILPA_INDEX_TRUST_SIGNER` or the
 signer override is configured, `warn` policy proceeds with a
 `TNG-INDEX-SIGNER-MISMATCH` warning; `strict` policy raises the error.
 
-**Step 4 — Verify the DSSE envelope.** The envelope signature MUST be verified
-against the certificate's public key. The in-toto statement's subject digest
+**Step 6 — Verify the DSSE envelope and subject digest.** The envelope signature
+MUST be verified against the certificate's public key. After successful signature
+verification, the in-toto statement's subject digest
 (`statement.subject[0].digest.sha256`) MUST equal `sha256(index_bytes)`. A
 digest mismatch MUST raise `TNG-INDEX-DIGEST-MISMATCH`.
+
+> NORMATIVE: A payload whose `subject` list is absent or empty, or whose
+> `subject[0].digest.sha256` field is absent or unextractable (including
+> non-parseable payload JSON), MUST raise `TNG-INDEX-DIGEST-MISMATCH`. The
+> subject digest is the sole binding between the attestation and the index
+> bytes; absence of a subject claim means the attestation makes no assertion
+> about the index content. Treating absence as "OK" would allow any DSSE
+> bundle signed by the trusted identity (e.g. a different predicate from the
+> same CI workflow) to bind to arbitrary tampered index bytes.
 
 > NOTE: The slug `TNG-INDEX-DIGEST-MISMATCH` uses "digest", not "identity".
 > The term "identity" is reserved in milpa for the `content_hash` of a source
 > tree (see `spec/identity.md`); using it for a bundle-subject mismatch would
 > create a false collision with milpa's identity model.
 
-**Step 5 — Verify the Rekor inclusion proof** against the embedded Rekor public
+> NOTE: Subject-digest comparison is performed on the verified payload returned
+> by the DSSE verification step, NOT by inspecting exception message text. A
+> conformant implementation MUST NOT infer `TNG-INDEX-DIGEST-MISMATCH` from
+> error-string patterns — the digest comparison is a deterministic check on
+> the signed payload bytes.
+
+**Step 7 — Verify the Rekor inclusion proof** against the embedded Rekor public
 key. Failure MUST raise `TNG-INDEX-SIGNATURE-INVALID`.
 
-**Step 6 — Freshness assertion (network-fetch paths only).** On a network-fetch
-path (State 2 or recovery re-fetch), MUST assert
-`now - SET.integratedTime < MILPA_INDEX_MAX_AGE` (default 7 days; configurable
-via `MILPA_INDEX_MAX_AGE` in `spec/cli-contract.md §8`). `integratedTime` is
-embedded in the bundle; no live Rekor network query is needed. On exceed, MUST
-raise `TNG-INDEX-BUNDLE-STALE`.
+> NORMATIVE (failure–slug mapping): The mapping from verification failure to
+> error slug is pinned as follows, independent of the cryptographic library's
+> exception hierarchy:
+>
+> - `TNG-INDEX-BUNDLE-MALFORMED` — steps 1–2 (pre-cryptographic parse failure).
+> - `TNG-INDEX-BUNDLE-STALE` — step 3 (freshness exceeded on network-fetch path).
+> - `TNG-INDEX-SIGNATURE-INVALID` — steps 4 and 7 (bad cert chain, cert expired
+>   at `integratedTime`, or invalid Rekor inclusion proof). Also the safe default
+>   for any cryptographic failure not positively identified as a distinct variant.
+> - `TNG-INDEX-SIGNER-MISMATCH` — step 5 (SubjectAltName ≠ expected signer).
+>   The variant distinction MUST NOT be inferred from exception message text; it
+>   MUST come from the verification library's typed error model or an equivalent
+>   structural mechanism (e.g., recording whether the identity-policy check itself
+>   failed).
+> - `TNG-INDEX-DIGEST-MISMATCH` — step 6 (DSSE subject digest ≠ sha256(index_bytes)).
+>   Implementations MUST detect this from the verified payload, not from exception
+>   message text.
 
-> NORMATIVE: On a PURE CACHE READ (States 1 and 3), steps 1–5 MUST still be
-> executed, but step 6 (freshness) MUST NOT be asserted. Rationale: the
-> rollback attack is a network-delivery attack; defending at the fetch boundary
-> fully closes it. Re-asserting wall-clock freshness on cache reads would break
-> air-gapped deployments without adding security.
+> NORMATIVE (first-failure precedence): When multiple failure conditions coexist,
+> the reported variant MUST be the FIRST failure encountered in the §3.4.4
+> evaluation order (steps 1–7). In particular: a bundle that is both stale (step 3)
+> and has an invalid signature (steps 4+) MUST report `TNG-INDEX-BUNDLE-STALE`,
+> not `TNG-INDEX-SIGNATURE-INVALID`.
 
 > NORMATIVE: Verification MUST NOT use hand-rolled cryptographic code.
 > Implementations MUST delegate to `sigstore-python` (Python) or `sigstore-rs`
@@ -514,8 +563,11 @@ raise `TNG-INDEX-BUNDLE-STALE`.
 
 > NORMATIVE: Under `warn`, a bundle fetch that returns 404 MAY cache the index
 > with a `.kdl.no-bundle` degraded-marker sidecar so the normal TTL governs
-> re-fetch cadence. Under `strict`, a bundle 404 MUST raise
-> `TNG-INDEX-BUNDLE-MISSING` and MUST NOT write partial cache state.
+> re-fetch cadence. The degraded marker applies only to a definitive 404/not-found
+> response; transient transport failures (e.g. HTTP 500, connection reset) MUST NOT
+> write the marker — the next fresh-cache read MUST go through crash-recovery refetch
+> instead of settling into degraded mode indefinitely. Under `strict`, a bundle 404
+> MUST raise `TNG-INDEX-BUNDLE-MISSING` and MUST NOT write partial cache state.
 
 > NORMATIVE (effective policy): The effective policy is computed as follows:
 >
@@ -534,7 +586,7 @@ raise `TNG-INDEX-BUNDLE-STALE`.
 
 > NORMATIVE: The signer identity and trust-bundle overrides are resolved PER index
 > URL (per cache key), not globally. The pinned default signer identity (§3.4.4
-> step 3) applies only to the default tianguis index URL. A user running a custom
+> step 5) applies only to the default tianguis index URL. A user running a custom
 > `MILPA_INDEX_URL` MUST configure the expected signer via `MILPA_INDEX_TRUST_SIGNER`
 > or the `index-trust-signer` manifest node, or accept the `TNG-INDEX-SIGNER-MISMATCH`
 > warning/error depending on policy.
@@ -552,6 +604,14 @@ raise `TNG-INDEX-BUNDLE-STALE`.
 > manifests' policies (`strict > warn > off`), computed BEFORE the index is first
 > loaded. A workspace where the root declares `warn` and any member declares `strict`
 > MUST resolve under `strict`.
+>
+> NOTE (root contribution): the workspace-root manifest grammar carries only the
+> `workspace { member … }` block and cannot declare `index-trust`; the root therefore
+> always contributes the default (`warn`) to the merge. A consequence of the MAX merge
+> is that a workspace has no manifest-level path to an effective `off` — even when
+> every member declares `off`, the merged policy is `warn`. (Whether the workspace
+> root block should be allowed to declare `index-trust` is an open design question,
+> deliberately not resolved here.)
 
 > NORMATIVE (conflicting-signers validation error): If two or more workspace members
 > declare DIFFERENT signer identities (via `index-trust-signer` in `milpa.kdl`) or
@@ -560,6 +620,15 @@ raise `TNG-INDEX-BUNDLE-STALE`.
 > check fires at workspace-load time. The workspace-conflicting-signers validation
 > error is distinct from the six `TNG-INDEX-*` error slugs; it is a manifest-
 > consistency error that does not involve cryptographic verification.
+
+> NOTE (per-URL scoping — current invariant): Per-URL signer grouping is currently
+> vacuous because the index URL is process-global (`MILPA_INDEX_URL` or
+> `DEFAULT_INDEX_URL`). The manifest grammar has no per-member `index-url` node, so
+> exactly one index URL exists per invocation. The global comparison implemented by
+> both impls is therefore equivalent to the normative per-URL requirement above: only
+> one URL group ever exists. If per-member index URLs are introduced in a future
+> slice, the conflicting-signers check MUST be updated to group members by their
+> effective index URL before comparing signer identities.
 
 ---
 
@@ -772,7 +841,7 @@ in S5/S6 of the registry-trust-federation RFC alongside their raise sites.
 | `TNG-INDEX-BUNDLE-MALFORMED` | Bundle JSON fails to parse or is not a valid Sigstore bundle (pre-cryptographic failure, before any signature check). |
 | `TNG-INDEX-SIGNATURE-INVALID` | Cryptographic verification failed — bad cert chain, wrong Fulcio CA root, or certificate expired AT its own `integratedTime`. A cert now-expired but valid at `integratedTime` MUST NOT trigger this. |
 | `TNG-INDEX-DIGEST-MISMATCH` | The bundle's in-toto statement subject digest does not match `sha256(index_bytes)`. Indicates tampering or a mismatched bundle/index pair. |
-| `TNG-INDEX-SIGNER-MISMATCH` | The bundle's certificate SubjectAltName does not match the expected signer identity (§3.4.4 step 3). |
+| `TNG-INDEX-SIGNER-MISMATCH` | The bundle's certificate SubjectAltName does not match the expected signer identity (§3.4.4 step 5). |
 | `TNG-INDEX-BUNDLE-STALE` | `now - SET.integratedTime >= MILPA_INDEX_MAX_AGE`. Bundle is cryptographically valid but was signed beyond the maximum allowed age. Asserted on network-fetch paths only; NOT asserted on pure cache reads. |
 
 ---

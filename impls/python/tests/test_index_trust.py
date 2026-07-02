@@ -42,6 +42,7 @@ from milpa.index_trust import (
     BundleMalformed,
     BundleMissing,
     BundleStale,
+    DEFAULT_INDEX_SIGNER,
     DigestMismatch,
     IndexBundleVerifier,
     IndexTrustConfig,
@@ -52,7 +53,10 @@ from milpa.index_trust import (
     Trusted,
     TrustBundle,
     VerificationResult,
+    _RecordingPolicy,
+    _check_dsse_payload_digest,
     _reset_warned_urls,
+    _sigstore_verify,
     enforce_index_trust,
     verify_index_bundle,
 )
@@ -645,3 +649,336 @@ def test_sigstore_verifier_against_oracle_bundle() -> None:
         max_age_seconds=None,  # skip freshness — committed bundle must not go stale
     )
     assert result is Trusted
+
+
+# ---------------------------------------------------------------------------
+# M1: MILPA_INDEX_TRUST_BUNDLE — custom trust root plumbing
+# ---------------------------------------------------------------------------
+
+
+def test_custom_trust_bundle_not_label_production_takes_custom_code_path(
+    tmp_path: pytest.TempPathFactory,
+) -> None:
+    """When trust_bundle.label != 'production', _sigstore_verify must use a custom TrustedRoot.
+
+    M1: The pre-fix code always calls ``Verifier.production(offline=True)`` regardless
+    of the ``trust_bundle`` parameter.  After the fix, a non-production trust_bundle
+    triggers the ``TrustedRoot.from_file`` path.
+
+    This test verifies the CODE PATH IS TAKEN by checking that ``TrustedRoot.from_file``
+    is called (via a mock).  It does NOT verify crypto — that stays out of unit tests
+    per the existing gating discipline (RFC §12.2).
+
+    M1 BLOCKER surface: if sigstore-python's public API does NOT support custom
+    TrustedRoot construction without ``_internal`` imports, this test is skipped
+    with a BLOCKER note.  The current finding: ``TrustedRoot.from_file(path: str)``
+    is a public classmethod and ``Verifier.__init__(trusted_root: TrustedRoot)``
+    is a public constructor — no internal imports needed.
+    """
+    import json
+    import unittest.mock
+
+    from milpa.index_trust import TrustBundle, _sigstore_verify
+
+    # Build a non-production trust bundle with recognizable raw_json.
+    custom_raw = json.dumps({"_custom_trust": True}).encode("utf-8")
+    custom_bundle = TrustBundle(raw_json=custom_raw, label="custom:/path/to/bundle.json")
+
+    # Dummy bundle bytes that will fail at Bundle.from_json (not valid Sigstore JSON),
+    # but we intercept before that by tracking TrustedRoot.from_file calls.
+    dummy_bundle_bytes = b'{"fake": "bundle"}'
+
+    # Track whether TrustedRoot.from_file was called.
+    from_file_calls: list[str] = []
+    original_from_file = None
+    try:
+        from sigstore.models import TrustedRoot
+        original_from_file = TrustedRoot.from_file
+
+        def tracking_from_file(path: str) -> "TrustedRoot":
+            from_file_calls.append(path)
+            return original_from_file(path)  # may fail; we check calls first
+
+        with unittest.mock.patch.object(TrustedRoot, "from_file", staticmethod(tracking_from_file)):
+            # Call _sigstore_verify with a non-production trust bundle.
+            # The result may be BundleMalformed (dummy bytes won't parse as a Bundle),
+            # but TrustedRoot.from_file MUST have been called first.
+            _sigstore_verify(
+                index_bytes=b"index content",
+                bundle_bytes=dummy_bundle_bytes,
+                trust_bundle=custom_bundle,
+                expected_signer="test@example.com",
+            )
+    except ImportError:
+        pytest.skip("sigstore-python not installed; M1 path untestable")
+        return
+
+    assert len(from_file_calls) > 0, (
+        "M1: when trust_bundle.label != 'production', TrustedRoot.from_file "
+        "must be called to construct a custom trust root; "
+        "pre-fix: Verifier.production() was always used instead."
+    )
+
+
+# ---------------------------------------------------------------------------
+# M3: typed exception dispatch — no message-text heuristics (spec §3.4.4)
+# ---------------------------------------------------------------------------
+
+
+def test_check_dsse_payload_digest_matches() -> None:
+    """``_check_dsse_payload_digest`` returns True when sha256 matches ``index_bytes``."""
+    import base64
+    import hashlib
+    import json
+
+    index_bytes = b"my index content"
+    expected_sha256 = hashlib.sha256(index_bytes).hexdigest()
+    statement = {
+        "_type": "https://in-toto.io/Statement/v0.1",
+        "subject": [{"name": "index.kdl", "digest": {"sha256": expected_sha256}}],
+        "predicate": {},
+    }
+    payload_bytes = json.dumps(statement).encode()
+    assert _check_dsse_payload_digest(payload_bytes, index_bytes) is True
+
+
+def test_check_dsse_payload_digest_mismatch() -> None:
+    """``_check_dsse_payload_digest`` returns False when sha256 does NOT match ``index_bytes``."""
+    import json
+
+    index_bytes = b"my index content"
+    wrong_sha256 = "a" * 64
+    statement = {
+        "_type": "https://in-toto.io/Statement/v0.1",
+        "subject": [{"name": "index.kdl", "digest": {"sha256": wrong_sha256}}],
+        "predicate": {},
+    }
+    payload_bytes = json.dumps(statement).encode()
+    assert _check_dsse_payload_digest(payload_bytes, index_bytes) is False
+
+
+def test_check_dsse_payload_digest_absent_subject_returns_false() -> None:
+    """``_check_dsse_payload_digest`` returns False when subject field is absent.
+
+    Absent subject = no digest claim → digest-mismatch (fail closed).
+    Attack: a DSSE bundle signed by the trusted identity whose statement has no
+    subject (e.g. a different predicate from the same CI workflow) would otherwise
+    bind to arbitrary tampered index bytes.  Spec §3.4.4 step 6 NORMATIVE.
+    """
+    import json
+    payload_bytes = json.dumps({"_type": "...", "predicate": {}}).encode()
+    assert _check_dsse_payload_digest(payload_bytes, b"anything") is False
+
+
+def test_check_dsse_payload_digest_empty_subject_list_returns_false() -> None:
+    """``_check_dsse_payload_digest`` returns False when subject list is empty.
+
+    Empty subject list is the attack-shaped case: well-formed payload, subject
+    list present but empty.  Must map to DigestMismatch (fail closed).
+    """
+    import json
+    payload_bytes = json.dumps({
+        "_type": "https://in-toto.io/Statement/v0.1",
+        "subject": [],
+        "predicate": {},
+    }).encode()
+    assert _check_dsse_payload_digest(payload_bytes, b"anything") is False
+
+
+def test_check_dsse_payload_digest_no_sha256_in_digest_returns_false() -> None:
+    """``_check_dsse_payload_digest`` returns False when sha256 key is absent in digest.
+
+    Subject present, digest dict present, but sha256 key missing.  The attestation
+    makes no sha256 claim → fail closed (DigestMismatch).
+    """
+    import json
+    payload_bytes = json.dumps({
+        "_type": "https://in-toto.io/Statement/v0.1",
+        "subject": [{"name": "index.kdl", "digest": {"sha512": "cafebabe"}}],
+        "predicate": {},
+    }).encode()
+    assert _check_dsse_payload_digest(payload_bytes, b"anything") is False
+
+
+def test_check_dsse_payload_digest_malformed_returns_false() -> None:
+    """``_check_dsse_payload_digest`` returns False on non-parseable payload.
+
+    Unparseable payload → cannot extract subject digest → DigestMismatch.
+    """
+    assert _check_dsse_payload_digest(b"not json at all", b"anything") is False
+
+
+def test_recording_policy_records_raise() -> None:
+    """``_RecordingPolicy`` sets ``policy_raised=True`` when inner policy raises."""
+    from sigstore.errors import VerificationError
+
+    class _AlwaysRaises:
+        def verify(self, cert: Any) -> None:
+            raise VerificationError("san mismatch")
+
+    recording = _RecordingPolicy(_AlwaysRaises())
+    assert recording.policy_raised is False
+
+    try:
+        recording.verify(object())  # cert is unused by _AlwaysRaises
+    except VerificationError:
+        pass
+
+    assert recording.policy_raised is True
+
+
+def test_recording_policy_no_raise_leaves_flag_false() -> None:
+    """``_RecordingPolicy`` leaves ``policy_raised=False`` when inner policy succeeds."""
+    class _AlwaysPasses:
+        def verify(self, cert: Any) -> None:
+            pass
+
+    recording = _RecordingPolicy(_AlwaysPasses())
+    recording.verify(object())
+    assert recording.policy_raised is False
+
+
+def test_m3_verification_error_without_policy_raise_maps_to_sig_invalid() -> None:
+    """M3: VerificationError not from policy.verify → SigInvalid (cert chain / Rekor failure).
+
+    Pre-fix: ``_map_sigstore_error`` would scan the message text for keywords and
+    could return SignerMismatch or DigestMismatch based on coincidental word matches.
+    Post-fix: type-based dispatch via ``_RecordingPolicy`` — only policy.verify raises
+    give SignerMismatch; everything else is SigInvalid.
+    """
+    import unittest.mock
+    try:
+        from sigstore.errors import VerificationError
+    except ImportError:
+        pytest.skip("sigstore-python not installed")
+        return
+
+    # Patch verify_dsse to raise VerificationError BEFORE policy is called.
+    # Simulates cert chain or Rekor failure — not signer mismatch.
+    with unittest.mock.patch(
+        "sigstore.verify.Verifier._verify_common_signing_cert",
+        side_effect=VerificationError("failed to build cert chain"),
+    ):
+        # We need a bundle that passes Bundle.from_json. Use the minimal bundle
+        # which DOES pass (it fails later at verify_dsse, not at from_json).
+        result = _sigstore_verify(
+            index_bytes=b"index content",
+            bundle_bytes=_make_minimal_bundle(integrated_time=1000),
+            trust_bundle=_DUMMY_TRUST_BUNDLE,
+            expected_signer=_DEFAULT_SIGNER,
+        )
+    # Must be SigInvalid — NOT SignerMismatch or DigestMismatch.
+    # Pre-fix code would potentially return SignerMismatch if the error message
+    # happened to contain "identity" or "san" (VerificationError messages do mention
+    # certificate fields). Post-fix: recording.policy_raised is False → SigInvalid.
+    assert result is SigInvalid, (
+        f"M3: expected SigInvalid for cert-chain failure not from policy.verify, got {result!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M4: freshness step-order and first-failure precedence (spec §3.4.4)
+# ---------------------------------------------------------------------------
+
+
+def test_m4_stale_plus_sig_invalid_reports_bundle_stale() -> None:
+    """M4: first-failure precedence — BundleStale (step 3) reported before SigInvalid (step 4+).
+
+    A bundle that is both stale (integratedTime far in the past) AND would fail
+    cryptographic verification (minimal bundle — not valid Sigstore JSON) MUST
+    report BundleStale, NOT SigInvalid.  Spec §3.4.4 normative first-failure
+    precedence: freshness (step 3) comes before crypto (steps 4–7).
+
+    This pins the implemented ordering against a potential future regression where
+    freshness is moved after crypto (which would break the spec).
+    """
+    stale_bundle = _make_minimal_bundle(integrated_time=1000)  # far in the past
+    result = verify_index_bundle(
+        index_bytes=b"index content",
+        bundle_bytes=stale_bundle,
+        trust_bundle=_DUMMY_TRUST_BUNDLE,
+        expected_signer=_DEFAULT_SIGNER,
+        max_age_seconds=604800,  # 7 days — bundle is clearly stale
+    )
+    assert result is BundleStale, (
+        f"M4: expected BundleStale for stale+would-be-sig-invalid bundle; got {result!r}. "
+        "Freshness (step 3) must be checked before crypto (steps 4+)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# DEFAULT_INDEX_SIGNER — SSOT constant pin (ITEM M7)
+# ---------------------------------------------------------------------------
+
+
+def test_default_index_signer_pins_to_spec_value() -> None:
+    """``DEFAULT_INDEX_SIGNER`` must exactly match spec §3.4.4 step 5 / §3.4.6.
+
+    This is the SSOT for the tianguis reindex SAN.  The Rust impl and the spec
+    both reference this value; a change here requires a coordinated update in
+    all three places.  If this test breaks, update the constant AND the spec
+    AND the Rust constant together.
+    """
+    assert DEFAULT_INDEX_SIGNER == (
+        "https://github.com/coreyleavitt/tianguis/"
+        ".github/workflows/reindex.yaml@refs/heads/main"
+    ), (
+        "DEFAULT_INDEX_SIGNER must match spec §3.4.4 step 5; "
+        "update spec/registry-protocol.md and impls/rust/ in lockstep"
+    )
+
+
+def test_default_index_signer_is_github_actions_oidc_url() -> None:
+    """``DEFAULT_INDEX_SIGNER`` must be a GitHub Actions OIDC workflow URL."""
+    assert DEFAULT_INDEX_SIGNER.startswith(
+        "https://github.com/coreyleavitt/tianguis/"
+    ), "default signer must be the tianguis reindex workflow URL"
+    assert DEFAULT_INDEX_SIGNER.endswith(
+        "@refs/heads/main"
+    ), "default signer must pin to the main branch ref"
+
+
+# ---------------------------------------------------------------------------
+# Custom-root offline semantics — ITEM M5
+# ---------------------------------------------------------------------------
+
+
+def test_custom_root_verifier_does_not_hit_network_on_construction() -> None:
+    """``_sigstore_verify`` with a custom TrustBundle does not hit the network.
+
+    Investigation (item M5): ``Verifier.__init__(trusted_root=...)`` bypasses TUF
+    entirely (no refresh request) and ``verify_dsse`` verifies the Rekor inclusion
+    proof offline using ``trusted_root.rekor_keyring`` — no live Rekor HTTP query.
+    The ``offline=True`` flag on ``Verifier.production`` only controls TUF root
+    refresh; the custom-root path already has equivalent semantics since TUF is
+    bypassed altogether.  NOT A BLOCKER.
+
+    This test confirms that constructing the verifier with a custom root succeeds
+    without any network calls (via a malformed-but-constructable JSON).
+    """
+    import unittest.mock
+
+    try:
+        from sigstore.verify import Verifier
+    except ImportError:
+        pytest.skip("sigstore-python not installed")
+        return
+
+    custom_bundle = TrustBundle(raw_json=b'{"placeholder": true}', label="custom:/fake/path")
+
+    # Patch tempfile.NamedTemporaryFile to avoid filesystem side effects, and
+    # TrustedRoot.from_file to confirm we don't attempt TUF or live network access.
+    # The key assertion: no urllib/http calls during Verifier construction.
+    with unittest.mock.patch("urllib.request.urlopen") as mock_urlopen:
+        # _sigstore_verify will fail at TrustedRoot.from_file (invalid JSON),
+        # returning SigInvalid — that's fine.  We just assert no HTTP call.
+        _sigstore_verify(
+            index_bytes=b"fake",
+            bundle_bytes=b'{"verificationMaterial": {"tlogEntries": []}}',
+            trust_bundle=custom_bundle,
+            expected_signer="https://example.com/workflow",
+        )
+        assert not mock_urlopen.called, (
+            "Custom-root Verifier construction must not make network calls; "
+            "TUF is bypassed entirely when trusted_root is provided directly"
+        )

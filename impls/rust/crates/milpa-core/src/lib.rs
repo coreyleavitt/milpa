@@ -91,8 +91,8 @@ pub use milpa_solver::RefutationEntry;
 pub use safe_extract::{extract_tar, ExtractionResult, Limits};
 pub use store::{default_store, CaStore};
 pub use workspace::{
-    check_conflicting_signers, load_workspace, merge_workspace_index_trust_policy, LoadedMember,
-    LoadedWorkspace,
+    check_conflicting_signers, load_workspace, merge_workspace_index_trust_policy,
+    workspace_index_trust_fields, workspace_index_trust_policy, LoadedMember, LoadedWorkspace,
 };
 
 /// The union of every error code the Rust implementation can currently emit,

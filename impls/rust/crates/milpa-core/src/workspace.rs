@@ -284,6 +284,12 @@ pub fn load_workspace(root: &Path) -> Result<LoadedWorkspace, MilpaError> {
         });
     }
 
+    // S6: workspace index-trust validation (RFC registry-trust-federation §6.4a).
+    // Raise WS-INDEX-CONFLICTING-SIGNERS if members disagree on signer/bundle
+    // identity BEFORE any network fetch (manifest-consistency error).
+    // Mirrors the same call already present in load_workspace_from_manifest.
+    check_conflicting_signers(root, &members)?;
+
     Ok(LoadedWorkspace {
         root: root.to_path_buf(),
         members,
@@ -428,6 +434,49 @@ pub fn merge_workspace_index_trust_policy(
         }
     }
     best
+}
+
+/// SSOT for workspace index-trust policy — MAX over all members' `index_trust_policy` values.
+///
+/// The workspace root (`workspace { … }` in `milpa.kdl`) is a pure container whose
+/// grammar type (`Workspace`) has NO `index_trust_policy` field; it cannot declare
+/// `index-trust`.  The merge base is therefore `Warn` (the field default).  Any member
+/// declaring `strict` elevates the whole workspace to `strict` (spec §6.4a MAX semantics).
+///
+/// This is the single call site for all 9 previously-inlined collect+merge patterns.
+/// Verb handlers and `load_manifest_index_trust_fields` call this instead of inlining.
+pub fn workspace_index_trust_policy(ws: &LoadedWorkspace) -> milpa_manifest::TrustPolicy {
+    let member_policies: Vec<milpa_manifest::TrustPolicy> = ws
+        .members
+        .iter()
+        .map(|m| m.manifest.index_trust_policy.clone())
+        .collect();
+    merge_workspace_index_trust_policy(&milpa_manifest::TrustPolicy::Warn, &member_policies)
+}
+
+/// SSOT for workspace index-trust `(policy, signer, bundle)`.
+///
+/// - `policy`: `workspace_index_trust_policy(ws)` — MAX over members (spec §6.4a).
+/// - `signer`: first non-None member `index_trust_signer` (members must agree per
+///   `check_conflicting_signers`; any non-None value is representative).
+/// - `bundle`: first non-None member `index_trust_bundle` (same invariant).
+///
+/// Mirrors Python `_load_manifest_trust_fields` workspace branch exactly.
+/// Used at all workspace `maybe_index` call sites so signer/bundle from `milpa.kdl`
+/// flow through to `build_index_trust_gate` with `env > manifest > default` precedence.
+pub fn workspace_index_trust_fields(
+    ws: &LoadedWorkspace,
+) -> (milpa_manifest::TrustPolicy, Option<String>, Option<String>) {
+    let policy = workspace_index_trust_policy(ws);
+    let signer = ws
+        .members
+        .iter()
+        .find_map(|m| m.manifest.index_trust_signer.clone());
+    let bundle = ws
+        .members
+        .iter()
+        .find_map(|m| m.manifest.index_trust_bundle.clone());
+    (policy, signer, bundle)
 }
 
 /// Raise `WS-INDEX-CONFLICTING-SIGNERS` if workspace members disagree on
