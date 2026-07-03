@@ -867,9 +867,8 @@ fn cmd_fetch(
             )?;
             resolve_workspace_frozen(&ws, &lock, &build_store(), &deps_dir)?
         } else {
-            // SSOT (Item 1): workspace_index_trust_fields replaces the inline collect+merge.
-            let (ws_index_policy, ws_index_signer, ws_index_bundle) = workspace_index_trust_fields(&ws);
-            let index = maybe_index(no_index, &ws_index_policy, ws_index_signer, ws_index_bundle, require_attested_index, refresh_index)?;
+            // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
+            let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index)?;
             let profile = profile_from_env();
             // §8: reuse existing pins (idempotent repeated fetch — see single-pkg path).
             let prior = maybe_prior_lockfile(&dir.join("milpa.lock"));
@@ -955,7 +954,7 @@ fn cmd_fetch(
         )?;
         Milpa.resolve_frozen(&manifest, &lock, &build_store(), &deps_dir)?
     } else {
-        let index = maybe_index(no_index, &manifest.index_trust_policy, manifest.index_trust_signer.clone(), manifest.index_trust_bundle.clone(), require_attested_index, refresh_index)?;
+        let index = maybe_index_for_manifest(no_index, &manifest, require_attested_index, refresh_index)?;
         let profile = profile_from_env();
         // §8: reuse the existing lockfile's pins so repeated `fetch`/`lock` runs
         // are idempotent and a silently-moved ref / substituted archive is caught.
@@ -1187,9 +1186,8 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
 
     if let ManifestDoc::Workspace(_) = doc {
         let ws = load_workspace(dir)?;
-        // SSOT (Item 1): workspace_index_trust_fields replaces the inline collect+merge.
-        let (ws_update_index_policy, ws_update_signer, ws_update_bundle) = workspace_index_trust_fields(&ws);
-        let index = maybe_index(no_index, &ws_update_index_policy, ws_update_signer, ws_update_bundle, require_attested_index, refresh_index)?;
+        // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
+        let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index)?;
         let profile = profile_from_env();
         let ws_deps_dir = dir.join("_deps");
         let graph = resolve_workspace_with_features(
@@ -1221,9 +1219,8 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
     if let Some((ws_root, ws)) = find_parent_workspace(dir)? {
         let ws_lock_path = ws_root.join("milpa.lock");
         let ws_deps_dir = ws_root.join("_deps");
-        // SSOT (Item 1): workspace_index_trust_fields replaces the inline collect+merge.
-        let (ws_parent_index_policy, ws_parent_signer, ws_parent_bundle) = workspace_index_trust_fields(&ws);
-        let index = maybe_index(no_index, &ws_parent_index_policy, ws_parent_signer, ws_parent_bundle, require_attested_index, refresh_index)?;
+        // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
+        let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index)?;
         let profile = profile_from_env();
         // Re-build prior against the SHARED lockfile, not a member-local one.
         let ws_prior: Option<milpa_core::Lockfile> = match &name {
@@ -1272,7 +1269,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
     let ManifestDoc::Package(manifest) = doc else {
         unreachable!("workspace handled above");
     };
-    let index = maybe_index(no_index, &manifest.index_trust_policy, manifest.index_trust_signer.clone(), manifest.index_trust_bundle.clone(), require_attested_index, refresh_index)?;
+    let index = maybe_index_for_manifest(no_index, &manifest, require_attested_index, refresh_index)?;
     let profile = profile_from_env();
     let dep_decl_store_owned = maybe_dep_decl_store(no_index);
     let dep_decl_store: Option<&dyn DepDeclStore> = dep_decl_store_owned.as_deref();
@@ -1396,9 +1393,8 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
         let ws_with_override = milpa_core::load_workspace_with_member_override(&ws, dir, proposed_member.clone())?;
         let ws_deps_dir = ws_root.join("_deps");
         let ws_lock_path = ws_root.join("milpa.lock");
-        // SSOT (Item 1): workspace_index_trust_fields replaces the inline collect+merge.
-        let (ws_add_index_policy, ws_add_signer, ws_add_bundle) = workspace_index_trust_fields(&ws);
-        let index = maybe_index(no_index, &ws_add_index_policy, ws_add_signer, ws_add_bundle, require_attested_index, refresh_index)?;
+        // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
+        let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index)?;
         let profile = profile_from_env();
         let graph = resolve_workspace_with_features(
             &ws_with_override,
@@ -1508,7 +1504,7 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
 
     let deps_dir = dir.join("_deps");
     let registry = build_registry();
-    let index = maybe_index(no_index, &existing.index_trust_policy, existing.index_trust_signer.clone(), existing.index_trust_bundle.clone(), require_attested_index, refresh_index)?;
+    let index = maybe_index_for_manifest(no_index, &existing, require_attested_index, refresh_index)?;
     let profile = profile_from_env();
     let graph = resolve(
         &proposed,
@@ -1673,9 +1669,8 @@ fn cmd_workspace_add_member(
 
     // Delegate to apply_workspace_manifest_change.
     let registry = build_registry();
-    // SSOT (Item 1): workspace_index_trust_fields replaces the inline collect+merge.
-    let (add_member_index_policy, add_member_signer, add_member_bundle) = workspace_index_trust_fields(&current_ws);
-    let index = maybe_index(no_index, &add_member_index_policy, add_member_signer, add_member_bundle, require_attested_index, refresh_index)?;
+    // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
+    let index = maybe_index_for_workspace(no_index, &current_ws, require_attested_index, refresh_index)?;
     let profile = profile_from_env();
     let _rel_path = rel_path.clone();
     apply_workspace_manifest_change(
@@ -1821,9 +1816,8 @@ fn cmd_workspace_remove_member(
 
     // Delegate to apply_workspace_manifest_change.
     let registry = build_registry();
-    // SSOT (Item 1): workspace_index_trust_fields replaces the inline collect+merge.
-    let (rm_member_index_policy, rm_member_signer, rm_member_bundle) = workspace_index_trust_fields(&current_ws);
-    let index = maybe_index(no_index, &rm_member_index_policy, rm_member_signer, rm_member_bundle, require_attested_index, refresh_index)?;
+    // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
+    let index = maybe_index_for_workspace(no_index, &current_ws, require_attested_index, refresh_index)?;
     let profile = profile_from_env();
     let _matched_path = matched_path.clone();
     apply_workspace_manifest_change(
@@ -2039,9 +2033,8 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
         // Rebuild workspace with proposed member manifest and resolve.
         let ws_with_override = milpa_core::load_workspace_with_member_override(&ws, dir, proposed_member.clone())?;
         let ws_deps_dir = ws_root.join("_deps");
-        // SSOT (Item 1): workspace_index_trust_fields replaces the inline collect+merge.
-        let (ws_rm_index_policy, ws_rm_signer, ws_rm_bundle) = workspace_index_trust_fields(&ws);
-        let index = maybe_index(no_index, &ws_rm_index_policy, ws_rm_signer, ws_rm_bundle, require_attested_index, refresh_index)?;
+        // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
+        let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index)?;
         let profile = profile_from_env();
         let graph = resolve_workspace_with_features(
             &ws_with_override,
@@ -2114,7 +2107,7 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
 
     let deps_dir = dir.join("_deps");
     let registry = build_registry();
-    let index = maybe_index(no_index, &existing.index_trust_policy, existing.index_trust_signer.clone(), existing.index_trust_bundle.clone(), require_attested_index, refresh_index)?;
+    let index = maybe_index_for_manifest(no_index, &existing, require_attested_index, refresh_index)?;
     let profile = profile_from_env();
     let graph = resolve(
         &proposed,
@@ -2714,6 +2707,37 @@ fn workspace_index_trust_fields(
         ws.index_trust_policy.clone(),
         ws.index_trust_signer.clone(),
         ws.index_trust_bundle.clone(),
+    )
+}
+
+/// RD-M4 SSOT: extract a loaded workspace's index-trust fields and call
+/// `maybe_index` in one place, so a future `maybe_index` signature change
+/// touches this one wrapper instead of every workspace call site.
+fn maybe_index_for_workspace(
+    no_index: bool,
+    ws: &LoadedWorkspace,
+    require_attested_index: bool,
+    refresh_index: bool,
+) -> Result<Option<Index>, MilpaError> {
+    let (policy, signer, bundle) = workspace_index_trust_fields(ws);
+    maybe_index(no_index, &policy, signer, bundle, require_attested_index, refresh_index)
+}
+
+/// RD-M4 SSOT: extract a single-package manifest's index-trust fields and
+/// call `maybe_index` in one place, mirroring `maybe_index_for_workspace`.
+fn maybe_index_for_manifest(
+    no_index: bool,
+    m: &Manifest,
+    require_attested_index: bool,
+    refresh_index: bool,
+) -> Result<Option<Index>, MilpaError> {
+    maybe_index(
+        no_index,
+        &m.index_trust_policy,
+        m.index_trust_signer.clone(),
+        m.index_trust_bundle.clone(),
+        require_attested_index,
+        refresh_index,
     )
 }
 
