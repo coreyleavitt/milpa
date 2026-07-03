@@ -1288,11 +1288,11 @@ The locked `dep_decl` pin no longer matches the current index pointer for a dep 
 
 ## WS
 
-### `WS-INDEX-CONFLICTING-SIGNERS`
+### `WS-INDEX-TRUST-ON-MEMBER`
 
-Two or more workspace members declare different `index-trust-signer` or `index-trust-bundle` values for the same index URL.
+A workspace member manifest declares `index-trust`, `index-trust-signer`, or `index-trust-bundle`. index-trust is a workspace-ROOT policy — the registry index is a process-global, workspace-shared resource, so only the resolution root (the workspace root manifest) may declare trust policy.
 
-**Triggered:** `load_workspace` iterates workspace member manifests and finds that two members specify different signer identities (via `index-trust-signer`) or different trust-bundle overrides (via `index-trust-bundle`) for the same index URL. This check fires at workspace-load time, BEFORE any index fetch. The implementation includes the conflicting member paths, the index URL, and the two distinct signer (or bundle) values in the error context.
+**Triggered:** every workspace-construction path (loading a workspace from disk, from an in-memory manifest, or with a proposed member-manifest override for a pending mutation) iterates workspace member manifests and finds that one declares any of the three index-trust nodes — including an explicit `index-trust "warn"` that matches the default value. This check fires at workspace-construction time, BEFORE any index fetch. The error context includes the offending member's path. The fix is to move the declaration to the workspace root manifest.
 
 ### `WS-MEMBER-DIR-MISSING`
 

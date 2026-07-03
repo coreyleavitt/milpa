@@ -525,47 +525,39 @@ def _build_dep_decl_store(no_index: bool = False) -> object | None:
 def _load_manifest_trust_fields(
     project_dir: Path,
 ) -> "tuple[str, str | None, str | None]":
-    """Load (policy, signer, bundle) from manifest or workspace.  Pure I/O.
+    """Load (policy, signer, bundle) from the resolution ROOT.  Pure I/O.
 
-    Returns the raw manifest-level fields before any env-var or flag override.
-    Falls back to ``("warn", None, None)`` on any load failure (missing manifest,
-    workspace detection error, etc.) — callers apply their own override logic.
+    index-trust is a root-only policy (spec §3.4.7): the resolution root is the
+    workspace root manifest (for a workspace) or the package manifest itself
+    (standalone).  Members MUST NOT declare it — ``find_workspace_root`` (via the
+    ``load_workspace`` it performs) raises ``WS-INDEX-TRUST-ON-MEMBER`` when one
+    does, and that error PROPAGATES from here rather than being swallowed, so
+    ``cmd_show_index_trust`` surfaces exactly what the enforcement gate would.
 
-    This is the single source of truth for policy-field extraction; both
-    ``_build_index_trust`` (enforcement gate) and ``cmd_show_index_trust``
-    (observability) call it so they display and enforce the identical policy
-    (spec §5.3a SSOT requirement — item M4).
+    Only a genuinely-absent standalone manifest degrades to ``("warn", None,
+    None)``; a present-but-invalid workspace is a hard error.
+
+    SSOT shared by ``_build_index_trust`` (enforcement gate) and
+    ``cmd_show_index_trust`` (observability) — spec §5.3a.
     """
-    from milpa.workspace import merge_workspace_index_trust_policy
-
-    manifest_policy: str = "warn"
-    manifest_signer: str | None = None
-    manifest_bundle: str | None = None
+    # Workspace root is the authority for index-trust.  UNGUARDED on purpose: a
+    # present-but-invalid workspace (e.g. a member illegally declaring
+    # index-trust) MUST raise, not silently fall back to warn.
+    ws = find_workspace_root(project_dir)
+    if ws is not None:
+        wm = ws.workspace_manifest
+        return (
+            str(wm.index_trust_policy),
+            wm.index_trust_signer,
+            wm.index_trust_bundle,
+        )
+    # Standalone package is its own root.  A genuinely-absent manifest (not a
+    # workspace, no package manifest) degrades to defaults.
     try:
-        ws = find_workspace_root(project_dir)
-        if ws is not None:
-            # Workspace: max-merge member policies (RFC §6.4a).
-            member_policies = [m.manifest.index_trust_policy for m in ws.members]
-            manifest_policy = merge_workspace_index_trust_policy("warn", member_policies)
-            # Signer and bundle: consistent across members (enforced by _check_conflicting_signers).
-            manifest_signer = next(
-                (m.manifest.index_trust_signer for m in ws.members
-                 if m.manifest.index_trust_signer is not None),
-                None,
-            )
-            manifest_bundle = next(
-                (m.manifest.index_trust_bundle for m in ws.members
-                 if m.manifest.index_trust_bundle is not None),
-                None,
-            )
-        else:
-            m = load_or_discover_manifest(project_dir)
-            manifest_policy = str(m.index_trust_policy)
-            manifest_signer = m.index_trust_signer
-            manifest_bundle = m.index_trust_bundle
+        m = load_or_discover_manifest(project_dir)
     except (OSError, MilpaError):
-        pass  # no manifest or workspace detection error → use defaults
-    return manifest_policy, manifest_signer, manifest_bundle
+        return "warn", None, None
+    return str(m.index_trust_policy), m.index_trust_signer, m.index_trust_bundle
 
 
 def _build_index_trust(
@@ -1580,8 +1572,9 @@ def cmd_show_index_trust(project_dir: Path) -> int:
     index_url = index_url_from_env()
 
     # Compute effective policy via the SSOT helper (same as the enforcement gate).
-    # _load_manifest_trust_fields handles workspace max-merge and falls back to
-    # "warn" when no manifest is present, so we never need bare except here.
+    # _load_manifest_trust_fields reads the resolution root and PROPAGATES a
+    # present-but-invalid workspace error (WS-INDEX-TRUST-ON-MEMBER) — show must
+    # surface exactly what the gate would enforce, so it is not swallowed here.
     manifest_policy, _, _ = _load_manifest_trust_fields(project_dir)
 
     env_trust = os.environ.get("MILPA_INDEX_TRUST")

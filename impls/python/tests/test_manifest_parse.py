@@ -1864,6 +1864,67 @@ class TestWorkspaceManifestParse:
         assert isinstance(result, WorkspaceManifest)
         assert result.flags[0].defines == ("OPT",)
 
+    # Root-authority index-trust (RFC registry-trust-federation §6.4a redesign):
+    # index-trust is a workspace-ROOT policy — the root manifest grammar MUST
+    # permit index-trust / index-trust-signer / index-trust-bundle as top-level
+    # nodes (they are neither 'deps' nor 'kind', so MAN-WORKSPACE-HAS-DEPS-OR-KIND
+    # must not fire for them). ------------------------------------------------
+
+    def test_workspace_root_index_trust_parsed(self) -> None:
+        """Workspace root may declare index-trust "strict" as a top-level node."""
+        text = textwrap.dedent("""\
+            index-trust "strict"
+            workspace {
+                member "pkgA"
+            }
+        """)
+        result = parse_workspace_or_manifest(text)
+        assert isinstance(result, WorkspaceManifest)
+        assert result.index_trust_policy == "strict"
+
+    def test_workspace_root_index_trust_defaults_warn(self) -> None:
+        """Workspace root with no index-trust node defaults to 'warn'."""
+        text = 'workspace {\n    member "pkgA"\n}\n'
+        result = parse_workspace_or_manifest(text)
+        assert isinstance(result, WorkspaceManifest)
+        assert result.index_trust_policy == "warn"
+
+    def test_workspace_root_index_trust_signer_parsed(self) -> None:
+        """Workspace root may declare index-trust-signer as a top-level node."""
+        signer = "https://github.com/acme/reg/.github/workflows/sign.yaml@refs/heads/main"
+        text = textwrap.dedent(f"""\
+            index-trust-signer "{signer}"
+            workspace {{
+                member "pkgA"
+            }}
+        """)
+        result = parse_workspace_or_manifest(text)
+        assert isinstance(result, WorkspaceManifest)
+        assert result.index_trust_signer == signer
+
+    def test_workspace_root_index_trust_bundle_parsed(self) -> None:
+        """Workspace root may declare index-trust-bundle as a top-level node."""
+        text = textwrap.dedent("""\
+            index-trust-bundle "file:///etc/milpa/trust-bundle.json"
+            workspace {
+                member "pkgA"
+            }
+        """)
+        result = parse_workspace_or_manifest(text)
+        assert isinstance(result, WorkspaceManifest)
+        assert result.index_trust_bundle == "file:///etc/milpa/trust-bundle.json"
+
+    def test_workspace_root_still_rejects_deps_and_kind(self) -> None:
+        """index-trust legality does not loosen the deps/kind rejection (regression guard)."""
+        text = textwrap.dedent("""\
+            index-trust "strict"
+            kind "library"
+            workspace {
+                member "pkgA"
+            }
+        """)
+        assert_slug_ws(text, E.MAN_WORKSPACE_HAS_DEPS_OR_KIND)
+
 
 # ---------------------------------------------------------------------------
 # S1 — enables/conflicts grammar (RFC #23 §3.1.1 and §3.1.4)

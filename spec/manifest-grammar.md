@@ -1022,9 +1022,10 @@ The profile fields are normalized to Nim's `hostOS` / `hostCPU` vocabulary.
 ## 7  Workspace manifest structure
 
 > NORMATIVE: A workspace manifest contains a `workspace { }` block and
-> optionally `name` and `overrides` top-level nodes. It MUST NOT contain `deps`
-> or `kind` (`MAN-WORKSPACE-HAS-DEPS-OR-KIND`). Any other top-level node raises
-> `MAN-WORKSPACE-UNKNOWN-TOP-LEVEL`.
+> optionally `name`, `overrides`, `spec-version`, `flags`, `index-trust`,
+> `index-trust-signer`, and `index-trust-bundle` top-level nodes. It MUST NOT
+> contain `deps` or `kind` (`MAN-WORKSPACE-HAS-DEPS-OR-KIND`). Any other
+> top-level node raises `MAN-WORKSPACE-UNKNOWN-TOP-LEVEL`.
 
 > NORMATIVE: The `name` node, when present, MUST carry exactly one positional
 > string argument. It is **informational only**: implementations MAY store or
@@ -1037,10 +1038,25 @@ The profile fields are normalized to Nim's `hostOS` / `hostCPU` vocabulary.
 > paths raise `MAN-WORKSPACE-MEMBER-DUPLICATE`; unknown child names raise
 > `MAN-WORKSPACE-UNKNOWN-NODE`.
 
-> NOTE: A workspace manifest is a pure container. To make the workspace root
-> itself a package, place the package at a subdirectory and declare it as a
-> member. The "`.`" path is not currently supported as a workspace member
-> (`WS-MEMBER-DOT`).
+> NORMATIVE: The `flags { }` block, when present, follows the same grammar as
+> the package-manifest `flags` block (§3.5) and applies workspace-wide.
+
+> NORMATIVE (root authority, registry-protocol.md §3.4.7): `index-trust`,
+> `index-trust-signer`, and `index-trust-bundle` are legal ONLY on the
+> workspace ROOT manifest — the registry index is a process-global,
+> workspace-shared resource, so index-trust is a property of the resolution
+> root, not of each member. A workspace MEMBER manifest declaring any of these
+> three nodes MUST raise `WS-INDEX-TRUST-ON-MEMBER` at workspace-load time.
+> See registry-protocol.md §3.4.7 for the full authority model and error
+> semantics.
+
+> NOTE: To make the workspace root itself a package, place the package at a
+> subdirectory and declare it as a member. The "`.`" path is not currently
+> supported as a workspace member (`WS-MEMBER-DOT`). The workspace-root
+> manifest is not a package (it still cannot declare `deps` or `kind`), but it
+> is no longer a purely inert container: it is the resolution root, so it
+> carries workspace-wide security policy (`index-trust`) and workspace-wide
+> flag defaults (`flags`).
 
 ---
 

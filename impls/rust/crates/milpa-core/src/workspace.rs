@@ -161,6 +161,16 @@ pub struct LoadedWorkspace {
     /// S11 (RFC #23 §3.8): workspace-root flags {}. Default-true flags
     /// activate workspace-wide via their enables_cross_pkg targets.
     pub flags: Vec<milpa_manifest::FlagDecl>,
+    /// S8 (RFC registry-trust-federation §6.4a, spec §3.4.7 root-authority
+    /// model): the workspace ROOT's own `index-trust` value — this IS the
+    /// effective policy for the whole workspace invocation, no merge across
+    /// members (members are structurally forbidden from declaring it; see
+    /// [`check_member_index_trust_declarations`]).
+    pub index_trust_policy: milpa_manifest::TrustPolicy,
+    /// S8: the workspace ROOT's own `index-trust-signer` value.
+    pub index_trust_signer: Option<String>,
+    /// S8: the workspace ROOT's own `index-trust-bundle` value.
+    pub index_trust_bundle: Option<String>,
 }
 
 /// Load and structurally validate the workspace at `root`.
@@ -284,17 +294,22 @@ pub fn load_workspace(root: &Path) -> Result<LoadedWorkspace, MilpaError> {
         });
     }
 
-    // S6: workspace index-trust validation (RFC registry-trust-federation §6.4a).
-    // Raise WS-INDEX-CONFLICTING-SIGNERS if members disagree on signer/bundle
-    // identity BEFORE any network fetch (manifest-consistency error).
-    // Mirrors the same call already present in load_workspace_from_manifest.
-    check_conflicting_signers(root, &members)?;
+    // S8 (RFC registry-trust-federation §6.4a, spec §3.4.7): root-authority
+    // validation. index-trust is declared ONLY on the resolution root (the
+    // workspace root manifest); a member declaring any of index-trust /
+    // index-trust-signer / index-trust-bundle is a hard error, raised here
+    // BEFORE any index fetch. Mirrors the same call in
+    // load_workspace_from_manifest.
+    check_member_index_trust_declarations(&members)?;
 
     Ok(LoadedWorkspace {
         root: root.to_path_buf(),
         members,
         overrides: parsed.overrides,
         flags: parsed.flags,  // S11: workspace-root flags
+        index_trust_policy: parsed.index_trust_policy,
+        index_trust_signer: parsed.index_trust_signer,
+        index_trust_bundle: parsed.index_trust_bundle,
     })
 }
 
@@ -393,168 +408,132 @@ pub fn load_workspace_from_manifest(
         });
     }
 
-    // S6: workspace index-trust validation (RFC registry-trust-federation §6.4a).
-    // Raise WS-INDEX-CONFLICTING-SIGNERS if members disagree on signer/bundle
-    // identity BEFORE any network fetch (manifest-consistency error).
-    check_conflicting_signers(root, &members)?;
+    // S8: same root-authority validation as load_workspace() — see there.
+    check_member_index_trust_declarations(&members)?;
 
     Ok(LoadedWorkspace {
         root: root.to_path_buf(),
         members,
         overrides: parsed.overrides.clone(),
         flags: parsed.flags.clone(),
+        index_trust_policy: parsed.index_trust_policy.clone(),
+        index_trust_signer: parsed.index_trust_signer.clone(),
+        index_trust_bundle: parsed.index_trust_bundle.clone(),
+    })
+}
+
+/// Rebuild a [`LoadedWorkspace`] with one member's manifest replaced,
+/// re-validating root-authority index-trust declarations across the FULL
+/// (post-substitution) member list.
+///
+/// S11e (RFC: workspace-completion §3.G / D5): used by `add`/`remove` invoked
+/// from a member dir to build the proposed workspace for resolution *before*
+/// any on-disk write. The resolver sees the updated member manifest while the
+/// workspace topology (root, other members) remains unchanged.
+///
+/// Mirrors `workspace.py:load_workspace_with_member_override`. This lives in
+/// `milpa-core` (not the CLI) so it is the ONLY way to construct an
+/// override'd `LoadedWorkspace` — a `LoadedWorkspace`'s public fields make it
+/// technically possible to hand-assemble one bypassing `load_workspace`'s
+/// validation, so the override constructor must re-validate rather than trust
+/// its input. That re-validation catches the case where a member OTHER than
+/// the one being overridden already (illegally) declares `index-trust`.
+///
+/// Returns `Err(WS-MEMBER-DIR-MISSING)` if `member_dir` (canonicalized) does
+/// not match any declared member's directory. Returns
+/// `Err(WS-INDEX-TRUST-ON-MEMBER)` if any member of the resulting list — the
+/// substituted one or any other — declares an index-trust field.
+pub fn load_workspace_with_member_override(
+    workspace: &LoadedWorkspace,
+    member_dir: &Path,
+    proposed_manifest: Manifest,
+) -> Result<LoadedWorkspace, MilpaError> {
+    let member_dir_abs = member_dir
+        .canonicalize()
+        .unwrap_or_else(|_| member_dir.to_path_buf());
+    let mut found = false;
+    let new_members: Vec<LoadedMember> = workspace
+        .members
+        .iter()
+        .map(|m| {
+            let m_abs = m.directory.canonicalize().unwrap_or_else(|_| m.directory.clone());
+            if m_abs == member_dir_abs {
+                found = true;
+                LoadedMember {
+                    name: m.name.clone(),
+                    path: m.path.clone(),
+                    directory: m.directory.clone(),
+                    manifest: proposed_manifest.clone(),
+                }
+            } else {
+                m.clone()
+            }
+        })
+        .collect();
+    if !found {
+        return Err(ws(
+            "WS-MEMBER-DIR-MISSING",
+            format!(
+                "load_workspace_with_member_override: member dir {} not found in workspace members",
+                member_dir_abs.display()
+            ),
+        ));
+    }
+
+    // S5 redesign: same root-authority validation as load_workspace() — the
+    // substituted member manifest could (illegally) introduce an index-trust
+    // declaration, so re-validate the full member list here too.
+    check_member_index_trust_declarations(&new_members)?;
+
+    Ok(LoadedWorkspace {
+        root: workspace.root.clone(),
+        members: new_members,
+        overrides: workspace.overrides.clone(),
+        flags: workspace.flags.clone(),
+        index_trust_policy: workspace.index_trust_policy.clone(),
+        index_trust_signer: workspace.index_trust_signer.clone(),
+        index_trust_bundle: workspace.index_trust_bundle.clone(),
     })
 }
 
 // ---------------------------------------------------------------------------
-// S6: workspace index-trust merge + conflicting-signers check
+// S8: workspace index-trust root-authority validation
+// (RFC registry-trust-federation §6.4a, spec/registry-protocol.md §3.4.7)
 // ---------------------------------------------------------------------------
 
-/// Return the MAX of root + all member `index_trust_policy` values.
+/// Raise `WS-INDEX-TRUST-ON-MEMBER` if any workspace member declares
+/// `index-trust`, `index-trust-signer`, or `index-trust-bundle`.
 ///
-/// `strict > warn > off` (RFC registry-trust-federation §6.4a).  A workspace
-/// where root=`warn` and any member=`strict` resolves under `strict`.  The
-/// returned value is the effective policy for the whole workspace invocation.
-pub fn merge_workspace_index_trust_policy(
-    root_policy: &milpa_manifest::TrustPolicy,
-    member_policies: &[milpa_manifest::TrustPolicy],
-) -> milpa_manifest::TrustPolicy {
-    use milpa_manifest::TrustPolicy;
-    fn rank(p: &TrustPolicy) -> u8 {
-        match p {
-            TrustPolicy::Strict => 2,
-            TrustPolicy::Warn => 1,
-            TrustPolicy::Off => 0,
-        }
-    }
-    let mut best = root_policy.clone();
-    for p in member_policies {
-        if rank(p) > rank(&best) {
-            best = p.clone();
-        }
-    }
-    best
-}
-
-/// SSOT for workspace index-trust policy — MAX over all members' `index_trust_policy` values.
+/// index-trust is a workspace-ROOT policy: the registry index is a
+/// process-global, workspace-shared resource (one index URL per invocation,
+/// no per-member index URL), so only the resolution root — the workspace
+/// root manifest — may declare these three fields. Raises BEFORE any index
+/// fetch.
 ///
-/// The workspace root (`workspace { … }` in `milpa.kdl`) is a pure container whose
-/// grammar type (`Workspace`) has NO `index_trust_policy` field; it cannot declare
-/// `index-trust`.  The merge base is therefore `Warn` (the field default).  Any member
-/// declaring `strict` elevates the whole workspace to `strict` (spec §6.4a MAX semantics).
-///
-/// This is the single call site for all 9 previously-inlined collect+merge patterns.
-/// Verb handlers and `load_manifest_index_trust_fields` call this instead of inlining.
-pub fn workspace_index_trust_policy(ws: &LoadedWorkspace) -> milpa_manifest::TrustPolicy {
-    let member_policies: Vec<milpa_manifest::TrustPolicy> = ws
-        .members
-        .iter()
-        .map(|m| m.manifest.index_trust_policy.clone())
-        .collect();
-    merge_workspace_index_trust_policy(&milpa_manifest::TrustPolicy::Warn, &member_policies)
-}
-
-/// SSOT for workspace index-trust `(policy, signer, bundle)`.
-///
-/// - `policy`: `workspace_index_trust_policy(ws)` — MAX over members (spec §6.4a).
-/// - `signer`: first non-None member `index_trust_signer` (members must agree per
-///   `check_conflicting_signers`; any non-None value is representative).
-/// - `bundle`: first non-None member `index_trust_bundle` (same invariant).
-///
-/// Mirrors Python `_load_manifest_trust_fields` workspace branch exactly.
-/// Used at all workspace `maybe_index` call sites so signer/bundle from `milpa.kdl`
-/// flow through to `build_index_trust_gate` with `env > manifest > default` precedence.
-pub fn workspace_index_trust_fields(
-    ws: &LoadedWorkspace,
-) -> (milpa_manifest::TrustPolicy, Option<String>, Option<String>) {
-    let policy = workspace_index_trust_policy(ws);
-    let signer = ws
-        .members
-        .iter()
-        .find_map(|m| m.manifest.index_trust_signer.clone());
-    let bundle = ws
-        .members
-        .iter()
-        .find_map(|m| m.manifest.index_trust_bundle.clone());
-    (policy, signer, bundle)
-}
-
-/// Raise `WS-INDEX-CONFLICTING-SIGNERS` if workspace members disagree on
-/// `index_trust_signer` or `index_trust_bundle`.
-///
-/// Only non-`None` values are compared; a member that does not declare a signer
-/// cannot conflict with one that does (the non-declaring member inherits the
-/// default, which is an operator/env concern, not a manifest conflict).
-///
-/// This is a manifest-consistency check and is raised BEFORE any index fetch
-/// (RFC §6.4a).
-pub fn check_conflicting_signers(
-    workspace_root: &Path,
+/// Fires even when a member's declared `index-trust` value matches the
+/// default (`warn`) — the rule is about WHERE the field is declared, not
+/// what value it holds, so `Manifest::index_trust_policy_explicit` (not just
+/// a non-default value) is what triggers this check. Mirrors
+/// `workspace.py:_check_member_index_trust_declarations`.
+pub fn check_member_index_trust_declarations(
     members: &[LoadedMember],
 ) -> Result<(), MilpaError> {
-    // Collect { signer_value → [member_path, ...] }.
-    let mut signer_to_members: std::collections::BTreeMap<String, Vec<String>> =
-        std::collections::BTreeMap::new();
-    let mut bundle_to_members: std::collections::BTreeMap<String, Vec<String>> =
-        std::collections::BTreeMap::new();
-
     for member in members {
-        if let Some(ref signer) = member.manifest.index_trust_signer {
-            signer_to_members
-                .entry(signer.clone())
-                .or_default()
-                .push(member.path.clone());
+        let m = &member.manifest;
+        if m.index_trust_policy_explicit
+            || m.index_trust_signer.is_some()
+            || m.index_trust_bundle.is_some()
+        {
+            return Err(ws(
+                "WS-INDEX-TRUST-ON-MEMBER",
+                format!(
+                    "index-trust is a workspace-root policy; declare it in the \
+                     workspace root manifest, not in member {:?}",
+                    member.path
+                ),
+            ));
         }
-        if let Some(ref bundle) = member.manifest.index_trust_bundle {
-            bundle_to_members
-                .entry(bundle.clone())
-                .or_default()
-                .push(member.path.clone());
-        }
     }
-
-    if signer_to_members.len() > 1 {
-        let mut entries: Vec<_> = signer_to_members.into_iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let (signer_a, members_a) = &entries[0];
-        let (signer_b, members_b) = &entries[1];
-        return Err(ws(
-            "WS-INDEX-CONFLICTING-SIGNERS",
-            format!(
-                "workspace members declare conflicting index-trust-signer values: \
-                 {:?} (in {:?}) vs {:?} (in {:?}). \
-                 All members sharing an index URL must agree on the signer identity. \
-                 workspace root: {}",
-                signer_a,
-                members_a,
-                signer_b,
-                members_b,
-                workspace_root.display()
-            ),
-        ));
-    }
-
-    if bundle_to_members.len() > 1 {
-        let mut entries: Vec<_> = bundle_to_members.into_iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let (bundle_a, members_a) = &entries[0];
-        let (bundle_b, members_b) = &entries[1];
-        return Err(ws(
-            "WS-INDEX-CONFLICTING-SIGNERS",
-            format!(
-                "workspace members declare conflicting index-trust-bundle values: \
-                 {:?} (in {:?}) vs {:?} (in {:?}). \
-                 All members sharing an index URL must agree on the trust-bundle. \
-                 workspace root: {}",
-                bundle_a,
-                members_a,
-                bundle_b,
-                members_b,
-                workspace_root.display()
-            ),
-        ));
-    }
-
     Ok(())
 }
 

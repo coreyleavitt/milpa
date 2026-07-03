@@ -402,6 +402,7 @@ fn member_resolves_to_root_via_symlinked_ws_root_from_manifest_yields_is_workspa
         overrides: vec![],
         flags: vec![],
         name: None,
+        ..Default::default()
     };
 
     // Load workspace from the SYMLINK path with a pre-parsed manifest.
@@ -437,250 +438,250 @@ fn loads_a_valid_two_member_workspace() {
 }
 
 // ---------------------------------------------------------------------------
-// Item 5a: merge_workspace_index_trust_policy matrix
-// (guards against a min-instead-of-max regression)
+// S8: workspace index-trust root-authority tests
+// (RFC registry-trust-federation §6.4a, spec/registry-protocol.md §3.4.7)
+//
+// Replaces the deleted max-merge + conflicting-signers matrix: index-trust
+// is now declared ONLY on the workspace ROOT (a single value, no merge). A
+// member declaring any of index-trust / index-trust-signer /
+// index-trust-bundle is a hard error (WS-INDEX-TRUST-ON-MEMBER), raised at
+// workspace-load time before any index fetch.
 // ---------------------------------------------------------------------------
 
 use milpa_manifest::TrustPolicy;
 
+/// No index-trust anywhere (root or member) → the workspace's effective
+/// policy defaults to Warn, same as the package-manifest field default.
 #[test]
-fn merge_all_warn_returns_warn() {
-    let result = merge_workspace_index_trust_policy(
-        &TrustPolicy::Warn,
-        &[TrustPolicy::Warn, TrustPolicy::Warn],
-    );
-    assert_eq!(result, TrustPolicy::Warn);
-}
-
-#[test]
-fn merge_all_off_returns_off() {
-    let result = merge_workspace_index_trust_policy(
-        &TrustPolicy::Off,
-        &[TrustPolicy::Off, TrustPolicy::Off],
-    );
-    assert_eq!(result, TrustPolicy::Off);
-}
-
-#[test]
-fn merge_member_strict_escalates_root_warn() {
-    let result = merge_workspace_index_trust_policy(
-        &TrustPolicy::Warn,
-        &[TrustPolicy::Warn, TrustPolicy::Strict],
-    );
-    assert_eq!(result, TrustPolicy::Strict);
-}
-
-#[test]
-fn merge_root_off_member_warn_returns_warn() {
-    // Off is the floor for the ROOT; a member declaring warn beats off.
-    let result = merge_workspace_index_trust_policy(
-        &TrustPolicy::Off,
-        &[TrustPolicy::Warn],
-    );
-    assert_eq!(result, TrustPolicy::Warn);
-}
-
-#[test]
-fn merge_mixed_returns_strict() {
-    // One strict member → whole workspace resolves strict.
-    let result = merge_workspace_index_trust_policy(
-        &TrustPolicy::Warn,
-        &[TrustPolicy::Off, TrustPolicy::Strict, TrustPolicy::Warn],
-    );
-    assert_eq!(result, TrustPolicy::Strict);
-}
-
-#[test]
-fn merge_no_members_returns_root_policy() {
-    // Empty member slice → root policy is returned unchanged.
-    assert_eq!(
-        merge_workspace_index_trust_policy(&TrustPolicy::Warn, &[]),
-        TrustPolicy::Warn,
-    );
-    assert_eq!(
-        merge_workspace_index_trust_policy(&TrustPolicy::Strict, &[]),
-        TrustPolicy::Strict,
-    );
-    assert_eq!(
-        merge_workspace_index_trust_policy(&TrustPolicy::Off, &[]),
-        TrustPolicy::Off,
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Item 4 regression: check_conflicting_signers now called by load_workspace
-// ---------------------------------------------------------------------------
-
-#[test]
-fn load_workspace_raises_conflicting_signers_via_load_workspace() {
-    // Item 4 fix: load_workspace (the path fetch/lock use) now calls
-    // check_conflicting_signers; prior to the fix it only ran in
-    // load_workspace_from_manifest (the mutation path).
-    let tmp = workspace_dir(
-        "workspace {\n    member \"a\"\n    member \"b\"\n}\n",
-        &[
-            (
-                "a",
-                Some(
-                    "name \"liba\"\nkind \"library\"\n\
-                     index-trust-signer \"https://github.com/org/repo/.github/workflows/publish.yaml@refs/heads/main\"\n",
-                ),
-            ),
-            (
-                "b",
-                Some(
-                    "name \"libb\"\nkind \"library\"\n\
-                     index-trust-signer \"https://github.com/org/OTHER/.github/workflows/publish.yaml@refs/heads/main\"\n",
-                ),
-            ),
-        ],
-    );
-    let result = load_workspace(tmp.path()).unwrap_err();
-    assert_eq!(
-        result.code(),
-        "WS-INDEX-CONFLICTING-SIGNERS",
-        "load_workspace must call check_conflicting_signers — got {:?}",
-        result.code()
-    );
-}
-
-#[test]
-fn load_workspace_raises_conflicting_bundle_via_load_workspace() {
-    let tmp = workspace_dir(
-        "workspace {\n    member \"a\"\n    member \"b\"\n}\n",
-        &[
-            (
-                "a",
-                Some(
-                    "name \"liba\"\nkind \"library\"\n\
-                     index-trust-bundle \"/path/to/bundle-a.json\"\n",
-                ),
-            ),
-            (
-                "b",
-                Some(
-                    "name \"libb\"\nkind \"library\"\n\
-                     index-trust-bundle \"/path/to/bundle-b.json\"\n",
-                ),
-            ),
-        ],
-    );
-    let result = load_workspace(tmp.path()).unwrap_err();
-    assert_eq!(
-        result.code(),
-        "WS-INDEX-CONFLICTING-SIGNERS",
-        "conflicting index-trust-bundle must raise WS-INDEX-CONFLICTING-SIGNERS — got {:?}",
-        result.code()
-    );
-}
-
-#[test]
-fn load_workspace_same_signer_across_members_is_ok() {
-    let tmp = workspace_dir(
-        "workspace {\n    member \"a\"\n    member \"b\"\n}\n",
-        &[
-            (
-                "a",
-                Some(
-                    "name \"liba\"\nkind \"library\"\n\
-                     index-trust-signer \"https://github.com/org/repo/.github/workflows/publish.yaml@refs/heads/main\"\n",
-                ),
-            ),
-            (
-                "b",
-                Some(
-                    "name \"libb\"\nkind \"library\"\n\
-                     index-trust-signer \"https://github.com/org/repo/.github/workflows/publish.yaml@refs/heads/main\"\n",
-                ),
-            ),
-        ],
-    );
-    let result = load_workspace(tmp.path());
-    assert!(result.is_ok(), "same signer in all members must be ok: {:?}", result);
-}
-
-#[test]
-fn load_workspace_no_signer_declarations_is_ok() {
-    let tmp = workspace_dir(
-        "workspace {\n    member \"a\"\n    member \"b\"\n}\n",
-        &[
-            ("a", Some("name \"liba\"\nkind \"library\"\n")),
-            ("b", Some("name \"libb\"\nkind \"library\"\n")),
-        ],
-    );
-    let result = load_workspace(tmp.path());
-    assert!(result.is_ok(), "no signer declarations must be ok: {:?}", result);
-}
-
-// ---------------------------------------------------------------------------
-// workspace_index_trust_policy — ITEM 1 SSOT tests
-// ---------------------------------------------------------------------------
-
-/// Empty workspace (no members) → base Warn (the workspace root cannot declare index-trust).
-#[test]
-fn workspace_index_trust_policy_empty_members_returns_warn() {
-    let tmp = workspace_dir("workspace {\n    member \"sub\"\n}\n", &[
-        ("sub", Some("name \"sub\"\n")),
-    ]);
-    let ws = load_workspace(tmp.path()).unwrap();
-    // sub has no index-trust node → Warn default.
-    assert_eq!(
-        workspace_index_trust_policy(&ws),
-        milpa_manifest::TrustPolicy::Warn,
-        "all-warn members must return Warn"
-    );
-}
-
-/// One member with `index-trust "strict"` → merged policy is Strict.
-///
-/// This is the key spec §6.4a MAX case: root has no policy (Warn base) and
-/// the member escalates to Strict.  Previously inlined ×9; now called via the helper.
-#[test]
-fn workspace_index_trust_policy_strict_member_dominates() {
+fn workspace_no_index_trust_anywhere_defaults_to_warn() {
     let tmp = workspace_dir(
         "workspace {\n    member \"sub\"\n}\n",
-        &[("sub", Some("name \"sub\"\nindex-trust \"strict\"\n"))],
+        &[("sub", Some("name \"sub\"\n"))],
     );
     let ws = load_workspace(tmp.path()).unwrap();
-    assert_eq!(
-        workspace_index_trust_policy(&ws),
-        milpa_manifest::TrustPolicy::Strict,
-        "root=no-policy (Warn) + member=strict must merge to Strict (spec §6.4a)"
-    );
+    assert_eq!(ws.index_trust_policy, TrustPolicy::Warn);
+    assert_eq!(ws.index_trust_signer, None);
+    assert_eq!(ws.index_trust_bundle, None);
 }
 
-/// Two members — one Warn, one Strict — merged = Strict.
+/// The workspace ROOT declaring `index-trust "strict"` alongside the
+/// `workspace { }` block IS the effective policy — no merge, member is plain.
 #[test]
-fn workspace_index_trust_policy_two_members_max_strict() {
+fn workspace_root_declares_index_trust_strict_is_effective_policy() {
     let tmp = workspace_dir(
-        "workspace {\n    member \"a\"\n    member \"b\"\n}\n",
-        &[
-            ("a", Some("name \"a\"\n")),
-            ("b", Some("name \"b\"\nindex-trust \"strict\"\n")),
-        ],
+        "index-trust \"strict\"\nworkspace {\n    member \"sub\"\n}\n",
+        &[("sub", Some("name \"sub\"\nkind \"library\"\n"))],
     );
     let ws = load_workspace(tmp.path()).unwrap();
-    assert_eq!(
-        workspace_index_trust_policy(&ws),
-        milpa_manifest::TrustPolicy::Strict,
-        "Warn + Strict must max-merge to Strict"
-    );
+    assert_eq!(ws.index_trust_policy, TrustPolicy::Strict);
 }
 
-/// workspace_index_trust_fields: signer is taken from the first member that declares one.
+/// The workspace ROOT can declare `index-trust "off"` — a manifest-level path
+/// to an effective `off` for the whole workspace, structurally unreachable
+/// under the old max-merge design (spec §3.4.7).
 #[test]
-fn workspace_index_trust_fields_returns_first_non_none_signer() {
+fn workspace_root_declares_index_trust_off_is_effective_policy() {
+    let tmp = workspace_dir(
+        "index-trust \"off\"\nworkspace {\n    member \"sub\"\n}\n",
+        &[("sub", Some("name \"sub\"\nkind \"library\"\n"))],
+    );
+    let ws = load_workspace(tmp.path()).unwrap();
+    assert_eq!(ws.index_trust_policy, TrustPolicy::Off);
+}
+
+/// The workspace ROOT's `index-trust-signer` / `index-trust-bundle` flow
+/// straight through to the LoadedWorkspace — no merge, no member scan.
+#[test]
+fn workspace_root_index_trust_signer_and_bundle_flow_through() {
     let signer = "https://github.com/org/repo/.github/workflows/pub.yaml@refs/heads/main";
+    let tmp = workspace_dir(
+        &format!(
+            "index-trust-signer \"{signer}\"\nindex-trust-bundle \"/path/to/bundle.json\"\n\
+             workspace {{\n    member \"sub\"\n}}\n"
+        ),
+        &[("sub", Some("name \"sub\"\nkind \"library\"\n"))],
+    );
+    let ws = load_workspace(tmp.path()).unwrap();
+    assert_eq!(ws.index_trust_signer.as_deref(), Some(signer));
+    assert_eq!(ws.index_trust_bundle.as_deref(), Some("/path/to/bundle.json"));
+}
+
+/// A member declaring `index-trust "strict"` is a hard error — WS-INDEX-TRUST-ON-MEMBER
+/// — raised BEFORE any index fetch, even when the root declares nothing.
+#[test]
+fn member_declaring_index_trust_is_ws_index_trust_on_member() {
+    let tmp = workspace_dir(
+        "workspace {\n    member \"sub\"\n}\n",
+        &[("sub", Some("name \"sub\"\nkind \"library\"\nindex-trust \"strict\"\n"))],
+    );
+    let result = load_workspace(tmp.path()).unwrap_err();
+    assert_eq!(result.code(), "WS-INDEX-TRUST-ON-MEMBER");
+}
+
+/// A member declaring `index-trust "warn"` — the SAME as the default value —
+/// still errors: the rule is about WHERE the field is declared, not what
+/// value it holds (spec §3.4.7 member-declaration-error clause).
+#[test]
+fn member_declaring_index_trust_warn_default_value_is_still_ws_index_trust_on_member() {
+    let tmp = workspace_dir(
+        "workspace {\n    member \"sub\"\n}\n",
+        &[("sub", Some("name \"sub\"\nkind \"library\"\nindex-trust \"warn\"\n"))],
+    );
+    let result = load_workspace(tmp.path()).unwrap_err();
+    assert_eq!(result.code(), "WS-INDEX-TRUST-ON-MEMBER");
+}
+
+/// A member declaring `index-trust-signer` (without `index-trust` itself) is
+/// also a hard error — all three fields are root-only.
+#[test]
+fn member_declaring_index_trust_signer_is_ws_index_trust_on_member() {
     let tmp = workspace_dir(
         "workspace {\n    member \"sub\"\n}\n",
         &[(
             "sub",
-            Some(&format!("name \"sub\"\nindex-trust-signer \"{signer}\"\n")),
+            Some(
+                "name \"sub\"\nkind \"library\"\n\
+                 index-trust-signer \"https://github.com/org/repo/.github/workflows/publish.yaml@refs/heads/main\"\n",
+            ),
         )],
     );
+    let result = load_workspace(tmp.path()).unwrap_err();
+    assert_eq!(result.code(), "WS-INDEX-TRUST-ON-MEMBER");
+}
+
+/// A member declaring `index-trust-bundle` is also a hard error.
+#[test]
+fn member_declaring_index_trust_bundle_is_ws_index_trust_on_member() {
+    let tmp = workspace_dir(
+        "workspace {\n    member \"sub\"\n}\n",
+        &[(
+            "sub",
+            Some("name \"sub\"\nkind \"library\"\nindex-trust-bundle \"/path/to/bundle.json\"\n"),
+        )],
+    );
+    let result = load_workspace(tmp.path()).unwrap_err();
+    assert_eq!(result.code(), "WS-INDEX-TRUST-ON-MEMBER");
+}
+
+/// Two members, one declaring index-trust — still errors (fires on the first
+/// offending member encountered; two members previously "agreeing" is no
+/// longer a legal escape hatch under the root-authority model).
+#[test]
+fn two_members_one_declaring_index_trust_is_ws_index_trust_on_member() {
+    let tmp = workspace_dir(
+        "workspace {\n    member \"a\"\n    member \"b\"\n}\n",
+        &[
+            ("a", Some("name \"a\"\nkind \"library\"\n")),
+            ("b", Some("name \"b\"\nkind \"library\"\nindex-trust \"strict\"\n")),
+        ],
+    );
+    let result = load_workspace(tmp.path()).unwrap_err();
+    assert_eq!(result.code(), "WS-INDEX-TRUST-ON-MEMBER");
+}
+
+/// load_workspace_from_manifest (the in-memory mutation path) enforces the
+/// same member-declaration check as load_workspace.
+#[test]
+fn load_workspace_from_manifest_also_raises_ws_index_trust_on_member() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sub_dir = tmp.path().join("sub");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+    std::fs::write(
+        sub_dir.join("milpa.kdl"),
+        "name \"sub\"\nkind \"library\"\nindex-trust \"strict\"\n",
+    )
+    .unwrap();
+    let parsed = milpa_manifest::Workspace {
+        members: vec!["sub".to_string()],
+        overrides: vec![],
+        flags: vec![],
+        name: None,
+        ..Default::default()
+    };
+    let result = load_workspace_from_manifest(tmp.path(), &parsed).unwrap_err();
+    assert_eq!(result.code(), "WS-INDEX-TRUST-ON-MEMBER");
+}
+
+// ---------------------------------------------------------------------------
+// RD-H2: load_workspace_with_member_override must re-validate the FULL
+// (post-substitution) member list, not just the substituted member.
+// ---------------------------------------------------------------------------
+
+/// `LoadedWorkspace`'s fields are public, so it is technically possible for a
+/// caller to hand-assemble (or hold a stale/tampered copy of) one that never
+/// went through `load_workspace`'s validation. `load_workspace_with_member_override`
+/// must not trust its input: even when the member being overridden is
+/// perfectly legal, if ANOTHER member in the list already (illegally) carries
+/// an index-trust declaration, the override must still raise
+/// `WS-INDEX-TRUST-ON-MEMBER` rather than silently constructing an invalid
+/// `LoadedWorkspace`.
+#[test]
+fn override_revalidates_other_members_not_just_the_substituted_one() {
+    let tmp = workspace_dir(
+        "workspace {\n    member \"a\"\n    member \"b\"\n}\n",
+        &[
+            ("a", Some("name \"a\"\nkind \"library\"\n")),
+            ("b", Some("name \"b\"\nkind \"library\"\n")),
+        ],
+    );
+    let ws = load_workspace(tmp.path()).unwrap(); // legal at load time
+
+    // Simulate a member that is (illegally) carrying an index-trust
+    // declaration in memory — e.g. a caller that built/held a LoadedWorkspace
+    // without going through load_workspace's validation.
+    let mut tampered = ws.clone();
+    tampered.members[0].manifest.index_trust_policy_explicit = true;
+
+    // Propose a harmless, unrelated change to member "b" — the member being
+    // overridden is NOT the illegal one.
+    let proposed_b = match milpa_manifest::parse_document("name \"b\"\nkind \"library\"\n").unwrap() {
+        milpa_manifest::ManifestDoc::Package(m) => m,
+        other => panic!("expected package, got {other:?}"),
+    };
+
+    let member_b_dir = tampered.members[1].directory.clone();
+    let result =
+        load_workspace_with_member_override(&tampered, &member_b_dir, proposed_b).unwrap_err();
+    assert_eq!(result.code(), "WS-INDEX-TRUST-ON-MEMBER");
+}
+
+/// The happy path: overriding a member with a legal proposed manifest, in an
+/// otherwise-legal workspace, succeeds and the substitution takes effect.
+#[test]
+fn override_succeeds_when_all_members_legal() {
+    let tmp = workspace_dir(
+        "workspace {\n    member \"a\"\n    member \"b\"\n}\n",
+        &[
+            ("a", Some("name \"a\"\nkind \"library\"\n")),
+            ("b", Some("name \"b\"\nkind \"library\"\n")),
+        ],
+    );
     let ws = load_workspace(tmp.path()).unwrap();
-    let (policy, got_signer, bundle) = workspace_index_trust_fields(&ws);
-    assert_eq!(policy, milpa_manifest::TrustPolicy::Warn);
-    assert_eq!(got_signer.as_deref(), Some(signer));
-    assert_eq!(bundle, None);
+    let proposed_b = match milpa_manifest::parse_document("name \"b\"\nkind \"application\"\n").unwrap()
+    {
+        milpa_manifest::ManifestDoc::Package(m) => m,
+        other => panic!("expected package, got {other:?}"),
+    };
+    let member_b_dir = ws.members[1].directory.clone();
+    let result = load_workspace_with_member_override(&ws, &member_b_dir, proposed_b).unwrap();
+    assert_eq!(result.members[1].manifest.kind, "application");
+    assert_eq!(result.members[0].manifest.kind, "library");
+}
+
+/// A `member_dir` that matches none of the workspace's declared members
+/// raises `WS-MEMBER-DIR-MISSING` rather than silently no-op'ing.
+#[test]
+fn override_unknown_member_dir_raises_member_dir_missing() {
+    let tmp = workspace_dir(
+        "workspace {\n    member \"a\"\n}\n",
+        &[("a", Some("name \"a\"\nkind \"library\"\n"))],
+    );
+    let ws = load_workspace(tmp.path()).unwrap();
+    let nonmember = tmp.path().join("not-a-member");
+    let proposed = match milpa_manifest::parse_document("name \"x\"\nkind \"library\"\n").unwrap() {
+        milpa_manifest::ManifestDoc::Package(m) => m,
+        other => panic!("expected package, got {other:?}"),
+    };
+    let result = load_workspace_with_member_override(&ws, &nonmember, proposed).unwrap_err();
+    assert_eq!(result.code(), "WS-MEMBER-DIR-MISSING");
 }

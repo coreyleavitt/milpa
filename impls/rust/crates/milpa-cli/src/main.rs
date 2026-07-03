@@ -18,7 +18,6 @@ use milpa_core::{
     dep_decl_store::DepDeclStore, discover_manifest, effective_trust_policy,
     fetch::{FetchError, FetcherRegistry}, format_nimcfg, format_workspace_nimcfgs, from_graph,
     load_index, load_lockfile, load_manifest, load_workspace,
-    workspace_index_trust_fields, workspace_index_trust_policy,
     LoadedMember, LoadedWorkspace,
     make_dep_decl_store, mutate_manifest_file, parse_env_bool, parse_lockfile, parse_source_spec,
     parse_version,
@@ -335,11 +334,16 @@ fn cmd_show_index_trust(dir: &Path) -> Result<i32, MilpaError> {
     let index_url = index_url_from_env();
 
     // Spec §5.3a SSOT: compute the effective index-trust policy the SAME way the
-    // enforcement gate does — load the manifest, max-merge workspace members, then
-    // apply env override.  Falls back to Warn on any manifest-load failure (missing
-    // milpa.kdl, workspace detection error) so `show --index-trust` works outside
-    // a milpa project dir.
-    let (manifest_policy, _manifest_signer, _manifest_bundle) = load_manifest_index_trust_fields(dir);
+    // enforcement gate does — load the manifest (root-authority model: a workspace's
+    // root value IS the effective policy, no merge across members — see
+    // resolve_index_trust_fields), then apply env override. Falls back to Warn ONLY
+    // for the genuine "no manifest here" case (MAN-NO-MANIFEST) so `show --index-trust`
+    // still works outside a milpa project dir. Any OTHER discovery/load failure —
+    // in particular a member illegally declaring index-trust (WS-INDEX-TRUST-ON-MEMBER)
+    // — MUST propagate (RD-M1 code-review item): this command's whole purpose is to
+    // show what the gate would enforce, so it must not silently print a fabricated
+    // "warn" for a workspace the gate would actually refuse to run against.
+    let (manifest_policy, _manifest_signer, _manifest_bundle) = resolve_index_trust_fields(dir)?;
     let env_override = read_env_index_trust_policy();
     let effective_policy = effective_trust_policy(&manifest_policy, false, env_override.as_ref());
     let policy_str = match effective_policy {
@@ -435,25 +439,32 @@ fn cmd_verify(
         Ok(milpa_manifest::ManifestDoc::Workspace(_)) => {
             // S11b (Breadth-P2c): workspace frozen-flags mismatch check.
             // Runs BEFORE disk-state check; uses manifest defaults (no CLI features at verify time).
-            if let Ok(ws) = load_workspace(dir) {
-                // SSOT (Item 1): workspace_index_trust_fields replaces the inline collect+merge.
-                let (p, s, b) = workspace_index_trust_fields(&ws);
-                verify_index_policy = p;
-                verify_index_signer = s;
-                verify_index_bundle = b;
-                if let Err(e) = check_workspace_frozen_active_flags_mismatch(
-                    &ws,
-                    &lock,
-                    &std::collections::BTreeSet::new(),
-                    false,
-                    false,
-                ) {
-                    eprintln!("{}: {}", e.code(), message_of(&e));
-                    eprintln!("milpa-error: {}", e.code());
-                    return Ok(1);
-                }
+            //
+            // RD-H1 (code-review): `discover_manifest` already CONFIRMED this dir's
+            // milpa.kdl is a workspace document, so `load_workspace`'s errors (WS-*,
+            // including WS-INDEX-TRUST-ON-MEMBER) MUST propagate here — swallowing
+            // them via `if let Ok(ws) = ...` silently downgraded a hard structural
+            // error into "verify passed" or a misleading LOCK-GRAPH-MISMATCH.
+            let ws = load_workspace(dir)?;
+            // SSOT (Item 1): workspace_index_trust_fields replaces the inline collect+merge.
+            let (p, s, b) = workspace_index_trust_fields(&ws);
+            verify_index_policy = p;
+            verify_index_signer = s;
+            verify_index_bundle = b;
+            if let Err(e) = check_workspace_frozen_active_flags_mismatch(
+                &ws,
+                &lock,
+                &std::collections::BTreeSet::new(),
+                false,
+                false,
+            ) {
+                eprintln!("{}: {}", e.code(), message_of(&e));
+                eprintln!("milpa-error: {}", e.code());
+                return Ok(1);
             }
         }
+        // Genuinely no manifest / not a milpa project dir here → graceful
+        // defaults (verify still runs the disk-state check below).
         Err(_) => {}
     }
 
@@ -492,10 +503,12 @@ fn cmd_verify(
             }
             Ok(milpa_manifest::ManifestDoc::Workspace(_)) => {
                 // load the workspace and consult member policies.
-                match load_workspace(dir) {
-                    Ok(ws) => workspace_any_member_strict(&ws) || require_attested_metadata,
-                    Err(_) => require_attested_metadata,
-                }
+                // RD-H1: this dir's milpa.kdl is a confirmed workspace document
+                // (discover_manifest already said so) — load_workspace errors
+                // (WS-INDEX-TRUST-ON-MEMBER etc.) MUST propagate, not silently
+                // fall back to the flag-only strict decision.
+                let ws = load_workspace(dir)?;
+                workspace_any_member_strict(&ws) || require_attested_metadata
             }
             Err(_) => require_attested_metadata,
         };
@@ -574,16 +587,29 @@ fn cmd_verify(
 /// member's `nim.cfg`.  The root-level `nim.cfg` is never present in workspace
 /// mode (workspaces use per-member nim.cfg), so we skip it.
 fn cmd_clean(dir: &Path) -> Result<i32, MilpaError> {
-    if let Ok(ws) = load_workspace(dir) {
-        // Workspace mode: remove root _deps/ + per-member nim.cfg.
-        let _ = std::fs::remove_dir_all(ws.root.join("_deps"));
-        for member in &ws.members {
-            let _ = std::fs::remove_file(member.directory.join("nim.cfg"));
+    // Root-cause discipline (RD-C1 family — "mirror everywhere"; Python's
+    // `cmd_clean` calls the unguarded `find_workspace_root` too): only a
+    // CONFIRMED workspace document at `dir` triggers workspace-mode cleanup;
+    // `load_workspace`'s structural errors (WS-*) then propagate rather than
+    // being swallowed into "must not be a workspace, clean single-package
+    // instead" — `if let Ok(ws) = load_workspace(dir) { .. } else { .. }`
+    // could not distinguish "no workspace here" from "workspace here but
+    // trust-invalid".
+    match discover_manifest(dir) {
+        Ok(ManifestDoc::Workspace(_)) => {
+            let ws = load_workspace(dir)?;
+            // Workspace mode: remove root _deps/ + per-member nim.cfg.
+            let _ = std::fs::remove_dir_all(ws.root.join("_deps"));
+            for member in &ws.members {
+                let _ = std::fs::remove_file(member.directory.join("nim.cfg"));
+            }
         }
-    } else {
-        // Single-package mode.
-        let _ = std::fs::remove_dir_all(dir.join("_deps"));
-        let _ = std::fs::remove_file(dir.join("nim.cfg"));
+        // Package manifest, or no manifest at all (nothing to clean) →
+        // single-package mode. Idempotent — exits 0 even if nothing exists.
+        Ok(ManifestDoc::Package(_)) | Err(_) => {
+            let _ = std::fs::remove_dir_all(dir.join("_deps"));
+            let _ = std::fs::remove_file(dir.join("nim.cfg"));
+        }
     }
     Ok(0)
 }
@@ -1192,7 +1218,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
     // S11e: member-dir detect-and-delegate for `update`.
     // If dir is a member of a parent workspace, delegate the full workspace re-resolve
     // to the workspace root (shared milpa.lock + shared _deps/), NOT a member-local lock.
-    if let Some((ws_root, ws)) = find_parent_workspace(dir) {
+    if let Some((ws_root, ws)) = find_parent_workspace(dir)? {
         let ws_lock_path = ws_root.join("milpa.lock");
         let ws_deps_dir = ws_root.join("_deps");
         // SSOT (Item 1): workspace_index_trust_fields replaces the inline collect+merge.
@@ -1310,7 +1336,7 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
     // S11e: if this is a member dir (has a parent workspace), delegate to
     // workspace-level add: mutate the MEMBER's manifest + re-resolve the WHOLE
     // workspace.  The shared lock must be written; NO member-local lock.
-    if let Some((ws_root, ws)) = find_parent_workspace(dir) {
+    if let Some((ws_root, ws)) = find_parent_workspace(dir)? {
         // Re-use `existing` (already loaded from dir/milpa.kdl) for the member manifest.
         // S10 (RFC #23 §3.7): parse --optional and --features from rest.
         let optional_flag = rest.iter().any(|a| a == "--optional");
@@ -1367,7 +1393,7 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
         }));
 
         // Rebuild the workspace with the proposed member manifest.
-        let ws_with_override = ws_with_member_override(&ws, dir, proposed_member.clone());
+        let ws_with_override = milpa_core::load_workspace_with_member_override(&ws, dir, proposed_member.clone())?;
         let ws_deps_dir = ws_root.join("_deps");
         let ws_lock_path = ws_root.join("milpa.lock");
         // SSOT (Item 1): workspace_index_trust_fields replaces the inline collect+merge.
@@ -1981,7 +2007,7 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
     // S11e: if this is a member dir (has a parent workspace), delegate to
     // workspace-level remove: mutate the MEMBER's manifest + re-resolve the WHOLE
     // workspace.  The shared lock must be written; NO member-local lock.
-    if let Some((ws_root, ws)) = find_parent_workspace(dir) {
+    if let Some((ws_root, ws)) = find_parent_workspace(dir)? {
         let ws_lock_path = ws_root.join("milpa.lock");
 
         // Alias→canonical resolution against the SHARED lockfile.
@@ -2011,7 +2037,7 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
         proposed_member.deps.retain(|d| dep_remove_key(d) != canonical_ws);
 
         // Rebuild workspace with proposed member manifest and resolve.
-        let ws_with_override = ws_with_member_override(&ws, dir, proposed_member.clone());
+        let ws_with_override = milpa_core::load_workspace_with_member_override(&ws, dir, proposed_member.clone())?;
         let ws_deps_dir = ws_root.join("_deps");
         // SSOT (Item 1): workspace_index_trust_fields replaces the inline collect+merge.
         let (ws_rm_index_policy, ws_rm_signer, ws_rm_bundle) = workspace_index_trust_fields(&ws);
@@ -2181,29 +2207,47 @@ fn read_env_index_trust_policy() -> Option<milpa_manifest::TrustPolicy> {
     })
 }
 
-/// Load the manifest-level index-trust (policy, signer, bundle) from `dir`.
+/// Resolve the manifest-level index-trust `(policy, signer, bundle)` for `dir`.
 ///
-/// This is the SSOT trust-field extractor shared by `cmd_show_index_trust` (observability)
-/// and `maybe_index` (enforcement gate) — spec §5.3a requires both to display/enforce the
-/// same policy.  Falls back to `(TrustPolicy::Warn, None, None)` on any load failure
-/// (missing manifest, workspace detection error) so callers work correctly outside a project dir.
+/// This is the SSOT trust-field resolution-root helper (RD-M4 code-review
+/// item): `cmd_show_index_trust` (observability) uses it directly; the
+/// enforcement gate (`maybe_index`'s callers — `cmd_fetch`/`cmd_update`/
+/// `cmd_add`/`cmd_remove`) already thread `discover_manifest(dir)?` +
+/// `load_workspace(dir)?` inline for the SAME un-swallowed discovery (they
+/// need the manifest/workspace object itself for more than trust fields, so
+/// they are not routed through this helper — but they follow the identical
+/// discipline below).
 ///
-/// Mirrors Python `_load_manifest_trust_fields` exactly (Item 2).
-fn load_manifest_index_trust_fields(
+/// Root-cause split (mirrors `cmd_fetch`'s pattern, and Python's
+/// `find_workspace_root`/`load_workspace` split): `discover_manifest`
+/// distinguishes "confirmed workspace document" / "package" / "absent"; once
+/// a directory's `milpa.kdl` is CONFIRMED workspace-shaped, `load_workspace`
+/// is called UNGUARDED — any structural error (`WS-*`, including
+/// `WS-INDEX-TRUST-ON-MEMBER`) propagates rather than being swallowed into a
+/// fabricated `(Warn, None, None)`.
+///
+/// The ONE case treated as "no project here" (graceful default, not an
+/// error): `discover_manifest` finding no manifest/`.nimble` at all
+/// (`MAN-NO-MANIFEST`) — so callers keep working outside a milpa project dir.
+/// Every other error (workspace structural failures, KDL syntax errors, …)
+/// propagates to the caller.
+fn resolve_index_trust_fields(
     dir: &Path,
-) -> (milpa_manifest::TrustPolicy, Option<String>, Option<String>) {
-    // Try workspace first (via SSOT helper), then single-package, then defaults.
+) -> Result<(milpa_manifest::TrustPolicy, Option<String>, Option<String>), MilpaError> {
     match discover_manifest(dir) {
         Ok(milpa_manifest::ManifestDoc::Workspace(_)) => {
-            match load_workspace(dir) {
-                Ok(ws) => workspace_index_trust_fields(&ws),
-                Err(_) => (milpa_manifest::TrustPolicy::Warn, None, None),
-            }
+            let ws = load_workspace(dir)?;
+            Ok(workspace_index_trust_fields(&ws))
         }
-        Ok(milpa_manifest::ManifestDoc::Package(ref m)) => {
-            (m.index_trust_policy.clone(), m.index_trust_signer.clone(), m.index_trust_bundle.clone())
+        Ok(milpa_manifest::ManifestDoc::Package(ref m)) => Ok((
+            m.index_trust_policy.clone(),
+            m.index_trust_signer.clone(),
+            m.index_trust_bundle.clone(),
+        )),
+        Err(e) if e.code() == "MAN-NO-MANIFEST" => {
+            Ok((milpa_manifest::TrustPolicy::Warn, None, None))
         }
-        Err(_) => (milpa_manifest::TrustPolicy::Warn, None, None),
+        Err(e) => Err(e),
     }
 }
 
@@ -2656,60 +2700,108 @@ fn maybe_prior_lockfile(path: &Path) -> Option<milpa_core::Lockfile> {
     load_lockfile(path).ok()
 }
 
-/// S11e: rebuild a `LoadedWorkspace` with one member's manifest replaced.
+/// S8 (RFC registry-trust-federation §6.4a, spec §3.4.7 root-authority model):
+/// read a loaded workspace's own `(index-trust, index-trust-signer,
+/// index-trust-bundle)` fields directly off its ROOT — no merge across
+/// members. Members are structurally forbidden from declaring these fields
+/// (`WS-INDEX-TRUST-ON-MEMBER`, enforced at `load_workspace` time), so by the
+/// time a `LoadedWorkspace` exists its root value IS the effective policy.
+/// Mirrors `cli.py:_load_manifest_trust_fields`'s workspace branch.
+fn workspace_index_trust_fields(
+    ws: &LoadedWorkspace,
+) -> (milpa_manifest::TrustPolicy, Option<String>, Option<String>) {
+    (
+        ws.index_trust_policy.clone(),
+        ws.index_trust_signer.clone(),
+        ws.index_trust_bundle.clone(),
+    )
+}
+
+// S11e / RD-H2: the member-override reconstruction used to live here as a
+// CLI-local `ws_with_member_override` that never re-validated root-authority
+// index-trust declarations after substitution. It now lives in `milpa-core`
+// as `load_workspace_with_member_override` (mirrors `workspace.py`'s module
+// shape — the validator and the constructor are colocated so a
+// `LoadedWorkspace` cannot be produced by this path without being
+// re-checked). See the two call sites below and
+// `milpa_core::workspace::load_workspace_with_member_override`.
+
+/// Determine whether `dir/milpa.kdl` is a *confirmed* workspace-shaped
+/// document, WITHOUT fully loading/validating the workspace.
 ///
-/// Mirrors `workspace.py:load_workspace_with_member_override`.
-/// Returns a new `LoadedWorkspace` identical to `ws` except the member whose
-/// directory matches `member_dir` (canonicalized) has its manifest replaced
-/// with `proposed_manifest`.
-fn ws_with_member_override(ws: &LoadedWorkspace, member_dir: &Path, proposed_manifest: milpa_manifest::Manifest) -> LoadedWorkspace {
-    let member_dir_abs = member_dir.canonicalize().unwrap_or_else(|_| member_dir.to_path_buf());
-    let new_members: Vec<milpa_core::LoadedMember> = ws.members.iter().map(|m| {
-        let m_abs = m.directory.canonicalize().unwrap_or_else(|_| m.directory.clone());
-        if m_abs == member_dir_abs {
-            milpa_core::LoadedMember {
-                name: m.name.clone(),
-                path: m.path.clone(),
-                directory: m.directory.clone(),
-                manifest: proposed_manifest.clone(),
-            }
-        } else {
-            m.clone()
-        }
-    }).collect();
-    LoadedWorkspace {
-        root: ws.root.clone(),
-        members: new_members,
-        overrides: ws.overrides.clone(),
-        flags: ws.flags.clone(),
+/// Root-cause split (mirrors the discovery half of `workspace.py:find_workspace_root`,
+/// which parses first and only calls `load_workspace` — unguarded — once the
+/// document is known to be a workspace manifest): a directory can be in one
+/// of four states, and only two of them mean "keep walking upward":
+///   - no `milpa.kdl` here, or it's unreadable            → `Ok(false)` (absent, keep walking)
+///   - `milpa.kdl` parses as a *package* manifest          → `Ok(false)` (transparent, keep walking)
+///   - `milpa.kdl` parses as a *workspace* manifest         → `Ok(true)`  (STOP — this is the root)
+///   - `milpa.kdl` fails to parse with a `MAN-WORKSPACE-*`  → `Err(e)`   (STOP — it IS a workspace
+///     grammar error (arity, duplicate member, unknown node,          document, but a structurally
+///     workspace-in-package, etc.)                                     invalid one; must propagate)
+///
+/// Any other parse failure (`MAN-KDL-SYNTAX`, `MAN-UNKNOWN-TOP-LEVEL` for a
+/// package-shaped doc, I/O error, …) means this directory's `milpa.kdl` is not
+/// recognizable as a workspace document at all — treated as absent, same as
+/// Python's ancestor walk.
+fn milpa_kdl_is_workspace_doc(dir: &Path) -> Result<bool, MilpaError> {
+    let kdl_path = dir.join("milpa.kdl");
+    let text = match std::fs::read_to_string(&kdl_path) {
+        Ok(t) => t,
+        Err(_) => return Ok(false), // no file / unreadable → absent, keep walking
+    };
+    match milpa_manifest::parse_document(&text) {
+        Ok(milpa_manifest::ManifestDoc::Workspace(_)) => Ok(true),
+        Ok(milpa_manifest::ManifestDoc::Package(_)) => Ok(false),
+        Err(e) if e.code.starts_with("MAN-WORKSPACE-") => Err(MilpaError::Manifest(e)),
+        Err(_) => Ok(false),
     }
 }
 
 /// S11e (RFC: workspace-completion §3.G / D5): walk upward from `start_dir`
 /// looking for a parent workspace that contains `start_dir` as a member.
 ///
-/// Mirrors `workspace.py:find_workspace_root`.  Returns `Some((root, ws))` if
-/// a workspace root is found AND `start_dir` is one of its declared members;
-/// returns `None` otherwise (standalone-package or not-a-declared-member).
+/// Mirrors `workspace.py:find_workspace_root`.  Returns `Ok(Some((root, ws)))`
+/// if a workspace root is found AND `start_dir` is one of its declared
+/// members; returns `Ok(None)` otherwise (standalone-package or
+/// not-a-declared-member).
 ///
-/// Algorithm:
+/// Algorithm (root-cause fix — RD-C1 code-review item): discovery
+/// (`milpa_kdl_is_workspace_doc`) is split from loading (`load_workspace`).
+/// Once a directory's `milpa.kdl` is CONFIRMED workspace-shaped, `load_workspace`
+/// is called unguarded — any structural error it raises (`WS-*`, including
+/// `WS-INDEX-TRUST-ON-MEMBER`) MUST propagate rather than being treated as
+/// "no workspace here, keep walking". Previously `if let Ok(ws) = load_workspace(...)`
+/// conflated "semantically invalid workspace" with "absent", silently falling
+/// through member-dir `add`/`update`/`remove` to standalone-package treatment.
+///
 /// 1. Walk up one directory at a time.
-/// 2. At each level, try to load `milpa.kdl` as a workspace (`load_workspace`).
-/// 3. If that succeeds, check that `start_dir` is the resolved directory of
-///    one of the workspace's declared members.
-/// 4. If so, return `(root, ws)`.  Otherwise continue walking.
-/// 5. Return `None` at the filesystem root.
-fn find_parent_workspace(start_dir: &Path) -> Option<(PathBuf, LoadedWorkspace)> {
-    let start_resolved = start_dir.canonicalize().ok()?;
+/// 2. At each level, check whether `milpa.kdl` is a confirmed workspace doc.
+/// 3. If not (absent or a package manifest) → continue upward.
+/// 4. If a `MAN-WORKSPACE-*` grammar error occurred at this level → propagate.
+/// 5. If confirmed → call `load_workspace` UNGUARDED (`?`); check that
+///    `start_dir` is the resolved directory of one of the declared members.
+/// 6. If so, return `(root, ws)`.  If the workspace doesn't declare
+///    `start_dir` as a member, stop searching (return `None`) — mirrors
+///    Python's "the workspace does not legitimately contain start_dir".
+/// 7. Return `None` at the filesystem root.
+fn find_parent_workspace(
+    start_dir: &Path,
+) -> Result<Option<(PathBuf, LoadedWorkspace)>, MilpaError> {
+    let Ok(start_resolved) = start_dir.canonicalize() else {
+        return Ok(None);
+    };
     let mut current = start_resolved.clone();
     // Walk upward — skip `current` itself (that's start_dir, the member dir).
     loop {
         match current.parent() {
-            None => return None, // filesystem root reached
+            None => return Ok(None), // filesystem root reached
             Some(parent) => current = parent.to_path_buf(),
         }
-        // Try to load a workspace at `current`.
-        if let Ok(ws) = load_workspace(&current) {
+        if milpa_kdl_is_workspace_doc(&current)? {
+            // Confirmed workspace document — load_workspace's errors (WS-*)
+            // MUST propagate from here on; this is the workspace root.
+            let ws = load_workspace(&current)?;
             // Check if start_dir is a declared member.
             for member in &ws.members {
                 // F10: if THIS member's directory is uncanonicalizable (e.g. the
@@ -2720,13 +2812,14 @@ fn find_parent_workspace(start_dir: &Path) -> Option<(PathBuf, LoadedWorkspace)>
                     Err(_) => continue,
                 };
                 if member_abs == start_resolved {
-                    return Some((current.clone(), ws));
+                    return Ok(Some((current.clone(), ws)));
                 }
             }
             // Found a workspace but start_dir is not a member — stop searching.
-            return None;
+            return Ok(None);
         }
-        // Not a workspace root (or load failed) → continue upward.
+        // Not a workspace root at this level (absent or a package manifest)
+        // → continue upward.
     }
 }
 
@@ -3976,21 +4069,22 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ITEM 3 (M3) / ITEM 2: load_manifest_index_trust_fields helper
+    // ITEM 3 (M3) / ITEM 2 / RD-M1 / RD-M4: resolve_index_trust_fields helper
     // -----------------------------------------------------------------------
 
     #[test]
-    fn load_manifest_trust_policy_returns_warn_for_missing_manifest() {
-        // No milpa.kdl in an empty temp dir → falls back to (Warn, None, None).
+    fn resolve_index_trust_fields_returns_warn_for_missing_manifest() {
+        // No milpa.kdl in an empty temp dir → the ONE graceful case
+        // (MAN-NO-MANIFEST) → (Warn, None, None).
         let tmp = tempfile::tempdir().unwrap();
-        let (policy, signer, bundle) = load_manifest_index_trust_fields(tmp.path());
+        let (policy, signer, bundle) = resolve_index_trust_fields(tmp.path()).unwrap();
         assert_eq!(policy, milpa_manifest::TrustPolicy::Warn, "missing manifest must default to Warn");
         assert!(signer.is_none(), "signer must be None for missing manifest");
         assert!(bundle.is_none(), "bundle must be None for missing manifest");
     }
 
     #[test]
-    fn load_manifest_trust_policy_reads_strict_from_manifest() {
+    fn resolve_index_trust_fields_reads_strict_from_manifest() {
         // Write a milpa.kdl with index-trust "strict" → returns Strict.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -3998,13 +4092,89 @@ mod tests {
             "name \"conformance-test\"\nindex-trust \"strict\"\n",
         )
         .unwrap();
-        let (policy, _, _) = load_manifest_index_trust_fields(tmp.path());
+        let (policy, _, _) = resolve_index_trust_fields(tmp.path()).unwrap();
         assert_eq!(policy, milpa_manifest::TrustPolicy::Strict, "manifest strict must return Strict");
     }
 
     #[test]
-    fn load_manifest_trust_policy_workspace_max_merge() {
-        // Workspace root (no policy) + member with strict → merged = Strict.
+    fn resolve_index_trust_fields_workspace_root_declares_directly() {
+        // S8 root-authority redesign (spec §3.4.7, RFC §6.4a): the workspace
+        // ROOT declares index-trust alongside `workspace { }`; the member
+        // declares nothing. The root's own value IS the effective policy —
+        // no merge.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("milpa.kdl"),
+            "index-trust \"strict\"\nworkspace {\n    member \"sub\"\n}\n",
+        )
+        .unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("milpa.kdl"), "name \"sub\"\nkind \"library\"\n").unwrap();
+
+        let (policy, _, _) = resolve_index_trust_fields(tmp.path()).unwrap();
+        assert_eq!(policy, milpa_manifest::TrustPolicy::Strict, "workspace root's own index-trust IS the effective policy");
+    }
+
+    #[test]
+    fn resolve_index_trust_fields_workspace_root_declares_signer_and_bundle() {
+        // Low code-review finding: prior tests only proved the workspace
+        // ROOT's `index-trust` *policy* reaches the gate/verifier via
+        // `workspace_index_trust_fields` (see
+        // `resolve_index_trust_fields_workspace_root_declares_directly`
+        // above). Nothing proved the root's `index-trust-signer` /
+        // `index-trust-bundle` make the same trip — `workspace_index_trust_fields`
+        // reads all three fields directly off `LoadedWorkspace`'s root with no
+        // merge across members (spec §3.4.7 root-authority model), so a gap
+        // here would be a silent regression if that read ever got narrowed to
+        // policy alone.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("milpa.kdl"),
+            "index-trust \"strict\"\n\
+             index-trust-signer \"https://github.com/acme/reg/.github/workflows/publish.yaml@refs/heads/main\"\n\
+             index-trust-bundle \"file:///etc/milpa/trust-bundle.json\"\n\
+             workspace {\n    member \"sub\"\n}\n",
+        )
+        .unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("milpa.kdl"), "name \"sub\"\nkind \"library\"\n").unwrap();
+
+        // resolve_index_trust_fields threads discover_manifest → load_workspace →
+        // workspace_index_trust_fields — the same path `maybe_index`'s callers use.
+        let (policy, signer, bundle) = resolve_index_trust_fields(tmp.path()).unwrap();
+        assert_eq!(policy, milpa_manifest::TrustPolicy::Strict);
+        assert_eq!(
+            signer.as_deref(),
+            Some("https://github.com/acme/reg/.github/workflows/publish.yaml@refs/heads/main"),
+            "workspace root's index-trust-signer must reach the gate config"
+        );
+        assert_eq!(
+            bundle.as_deref(),
+            Some("file:///etc/milpa/trust-bundle.json"),
+            "workspace root's index-trust-bundle must reach the gate config"
+        );
+
+        // Also confirm workspace_index_trust_fields itself (the SSOT helper
+        // Item 1 introduced to replace inline collect+merge) returns the same
+        // triple directly off a LoadedWorkspace, not just through the
+        // higher-level resolve_index_trust_fields wrapper.
+        let ws = load_workspace(tmp.path()).unwrap();
+        let (ws_policy, ws_signer, ws_bundle) = workspace_index_trust_fields(&ws);
+        assert_eq!(ws_policy, milpa_manifest::TrustPolicy::Strict);
+        assert_eq!(ws_signer, signer);
+        assert_eq!(ws_bundle, bundle);
+    }
+
+    #[test]
+    fn resolve_index_trust_fields_workspace_member_illegal_propagates_error() {
+        // RD-M1 (code-review): a member illegally declaring index-trust makes
+        // load_workspace() fail (WS-INDEX-TRUST-ON-MEMBER). Previously this
+        // helper's workspace branch swallowed that failure into a fabricated
+        // (Warn, None, None) default — which meant `show --index-trust` printed
+        // a confident "policy: warn" for a workspace `fetch`/`lock`/`verify`
+        // would actually refuse to run against. It must now propagate.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("milpa.kdl"),
@@ -4013,10 +4183,10 @@ mod tests {
         .unwrap();
         let sub = tmp.path().join("sub");
         std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(sub.join("milpa.kdl"), "name \"sub\"\nindex-trust \"strict\"\n").unwrap();
+        std::fs::write(sub.join("milpa.kdl"), "name \"sub\"\nkind \"library\"\nindex-trust \"strict\"\n").unwrap();
 
-        let (policy, _, _) = load_manifest_index_trust_fields(tmp.path());
-        assert_eq!(policy, milpa_manifest::TrustPolicy::Strict, "workspace member strict must max-merge to Strict");
+        let err = resolve_index_trust_fields(tmp.path()).unwrap_err();
+        assert_eq!(err.code(), "WS-INDEX-TRUST-ON-MEMBER");
     }
 
     // -----------------------------------------------------------------------

@@ -261,6 +261,14 @@ pub struct Manifest {
     /// S6: trust-root override (file:// path) from `index-trust-bundle "<path>"` (RFC §3.2).
     /// `None` means use the embedded production trust bundle.
     pub index_trust_bundle: Option<String>,
+    /// S8 (RFC registry-trust-federation §6.4a, spec §3.4.7): `true` iff the source
+    /// declared an `index-trust` node explicitly (absent-stays-absent, not
+    /// value-based). This distinguishes an explicit `index-trust "warn"` (which
+    /// still matches the default) from a genuinely absent node — the workspace
+    /// member-declaration check (`WS-INDEX-TRUST-ON-MEMBER`) fires on WHERE the
+    /// field is declared, not what value it holds, so it needs this flag rather
+    /// than just testing `index_trust_policy != Warn`.
+    pub index_trust_policy_explicit: bool,
     /// S7: flag names that were auto-injected by optional-dep desugaring.
     /// `format_manifest` skips these from the `flags {}` block (they're implied
     /// by `optional=#true` on the dep; serializing them would cause a re-parse clash).
@@ -283,6 +291,29 @@ pub struct Workspace {
     /// Optional workspace root name (grammar §7 `name` node).
     /// `None` when absent; `Some(name)` when declared.
     pub name: Option<String>,
+    /// S8 (RFC registry-trust-federation §6.4a, spec §3.4.7 root-authority model):
+    /// the workspace root IS the resolution root for index-trust purposes, so it
+    /// — and ONLY it — may declare `index-trust` / `index-trust-signer` /
+    /// `index-trust-bundle`. Defaults to `Warn` when the node is absent (same
+    /// default as the package-manifest field). No merge across members: this
+    /// single value IS the effective policy for the whole workspace invocation.
+    pub index_trust_policy: TrustPolicy,
+    /// S8: expected SubjectAltName override from the workspace-root
+    /// `index-trust-signer "<identity>"` node.
+    pub index_trust_signer: Option<String>,
+    /// S8: trust-root override (file:// path) from the workspace-root
+    /// `index-trust-bundle "<path>"` node.
+    pub index_trust_bundle: Option<String>,
+    /// Medium code-review finding (mirrors `Manifest::index_trust_policy_explicit`
+    /// and Python's `WorkspaceManifest.index_trust_policy_explicit`): `true`
+    /// iff the workspace root source declared an `index-trust` node
+    /// explicitly (absent-stays-absent, not value-based). Without this,
+    /// `format_workspace_manifest` cannot distinguish an explicit
+    /// `index-trust "warn"` (legal, redundant with the default, but
+    /// hand-authored and expected to survive a rewrite) from a genuinely
+    /// absent node — `milpa workspace add-member`/`remove-member` would
+    /// silently drop the former on the next `milpa.kdl` rewrite.
+    pub index_trust_policy_explicit: bool,
 }
 
 /// The two disjoint manifest roles (grammar §1). Detected by the presence of a
@@ -549,7 +580,16 @@ const PACKAGE_TOP_LEVEL: &[&str] = &[
     "index-trust-signer",
     "index-trust-bundle",
 ];
-const WORKSPACE_TOP_LEVEL: &[&str] = &["workspace", "name", "overrides", "spec-version", "flags"];
+const WORKSPACE_TOP_LEVEL: &[&str] = &[
+    "workspace",
+    "name",
+    "overrides",
+    "spec-version",
+    "flags",
+    "index-trust",
+    "index-trust-signer",
+    "index-trust-bundle",
+];
 
 // ---------------------------------------------------------------------------
 // Entry points.
@@ -751,12 +791,60 @@ fn parse_kdl(text: &str) -> Result<KdlDocument, ManifestError> {
 // Workspace document.
 // ---------------------------------------------------------------------------
 
+/// Shared parser for the `index-trust "<policy>"` node (package and
+/// workspace-root manifests both accept it — SSOT, no duplication).
+fn parse_index_trust_node(node: &KdlNode) -> Result<TrustPolicy, ManifestError> {
+    let a = args(node);
+    let val = a.first().and_then(|e| e.value().as_string());
+    if a.len() != 1 || val.is_none() {
+        return Err(err(
+            "MAN-UNKNOWN-TOP-LEVEL",
+            "'index-trust' takes exactly one string argument \
+             ('warn', 'strict', or 'off')",
+        ));
+    }
+    parse_trust_policy(val.unwrap(), "index-trust").map_err(|e| err("MAN-UNKNOWN-TOP-LEVEL", e))
+}
+
+/// Shared parser for the `index-trust-signer "<identity>"` node.
+fn parse_index_trust_signer_node(node: &KdlNode) -> Result<String, ManifestError> {
+    let a = args(node);
+    let val = a.first().and_then(|e| e.value().as_string());
+    if a.len() != 1 || val.is_none() {
+        return Err(err(
+            "MAN-UNKNOWN-TOP-LEVEL",
+            "'index-trust-signer' takes exactly one string argument \
+             (GitHub Actions OIDC workflow URL / expected SubjectAltName)",
+        ));
+    }
+    Ok(val.unwrap().to_string())
+}
+
+/// Shared parser for the `index-trust-bundle "<file://path>"` node.
+fn parse_index_trust_bundle_node(node: &KdlNode) -> Result<String, ManifestError> {
+    let a = args(node);
+    let val = a.first().and_then(|e| e.value().as_string());
+    if a.len() != 1 || val.is_none() {
+        return Err(err(
+            "MAN-UNKNOWN-TOP-LEVEL",
+            "'index-trust-bundle' takes exactly one string argument \
+             (file:// path to Fulcio CA + Rekor public key bundle)",
+        ));
+    }
+    Ok(val.unwrap().to_string())
+}
+
 fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
     let mut members: Vec<String> = Vec::new();
     let mut overrides: Vec<Override> = Vec::new();
     let mut seen_override_names: BTreeSet<String> = BTreeSet::new();
     let mut ws_flags: Vec<FlagDecl> = Vec::new();
     let mut ws_name: Option<String> = None;
+    // S8 (RFC registry-trust-federation §6.4a): root-authority index-trust fields.
+    let mut ws_index_trust_policy = TrustPolicy::Warn;
+    let mut ws_index_trust_signer: Option<String> = None;
+    let mut ws_index_trust_bundle: Option<String> = None;
+    let mut ws_index_trust_policy_explicit = false;
 
     for node in doc.nodes() {
         match node.name().value() {
@@ -772,6 +860,16 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
                         node.name().value()
                     ),
                 ));
+            }
+            "index-trust" => {
+                ws_index_trust_policy = parse_index_trust_node(node)?;
+                ws_index_trust_policy_explicit = true;
+            }
+            "index-trust-signer" => {
+                ws_index_trust_signer = Some(parse_index_trust_signer_node(node)?);
+            }
+            "index-trust-bundle" => {
+                ws_index_trust_bundle = Some(parse_index_trust_bundle_node(node)?);
             }
             "workspace" => {
                 for child in children(node) {
@@ -843,7 +941,16 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
         }
     }
 
-    Ok(Workspace { members, overrides, flags: ws_flags, name: ws_name })
+    Ok(Workspace {
+        members,
+        overrides,
+        flags: ws_flags,
+        name: ws_name,
+        index_trust_policy: ws_index_trust_policy,
+        index_trust_signer: ws_index_trust_signer,
+        index_trust_bundle: ws_index_trust_bundle,
+        index_trust_policy_explicit: ws_index_trust_policy_explicit,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -984,6 +1091,7 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
     let mut index_trust_policy = TrustPolicy::Warn;
     let mut index_trust_signer: Option<String> = None;
     let mut index_trust_bundle: Option<String> = None;
+    let mut index_trust_policy_explicit = false;
 
     // S5b: seen_names key is the solver variable (namespace::name or bare name),
     // so two qualified deps with the same bare name but different namespaces
@@ -1140,41 +1248,14 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
                     .map_err(|e| err("MAN-UNKNOWN-TOP-LEVEL", e))?;
             }
             "index-trust" => {
-                let a = args(node);
-                let val = a.first().and_then(|e| e.value().as_string());
-                if a.len() != 1 || val.is_none() {
-                    return Err(err(
-                        "MAN-UNKNOWN-TOP-LEVEL",
-                        "'index-trust' takes exactly one string argument \
-                         ('warn', 'strict', or 'off')",
-                    ));
-                }
-                index_trust_policy = parse_trust_policy(val.unwrap(), "index-trust")
-                    .map_err(|e| err("MAN-UNKNOWN-TOP-LEVEL", e))?;
+                index_trust_policy = parse_index_trust_node(node)?;
+                index_trust_policy_explicit = true;
             }
             "index-trust-signer" => {
-                let a = args(node);
-                let val = a.first().and_then(|e| e.value().as_string());
-                if a.len() != 1 || val.is_none() {
-                    return Err(err(
-                        "MAN-UNKNOWN-TOP-LEVEL",
-                        "'index-trust-signer' takes exactly one string argument \
-                         (GitHub Actions OIDC workflow URL / expected SubjectAltName)",
-                    ));
-                }
-                index_trust_signer = Some(val.unwrap().to_string());
+                index_trust_signer = Some(parse_index_trust_signer_node(node)?);
             }
             "index-trust-bundle" => {
-                let a = args(node);
-                let val = a.first().and_then(|e| e.value().as_string());
-                if a.len() != 1 || val.is_none() {
-                    return Err(err(
-                        "MAN-UNKNOWN-TOP-LEVEL",
-                        "'index-trust-bundle' takes exactly one string argument \
-                         (file:// path to Fulcio CA + Rekor public key bundle)",
-                    ));
-                }
-                index_trust_bundle = Some(val.unwrap().to_string());
+                index_trust_bundle = Some(parse_index_trust_bundle_node(node)?);
             }
             "workspace" => {
                 return Err(err(
@@ -1311,6 +1392,7 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
         index_trust_policy,
         index_trust_signer,
         index_trust_bundle,
+        index_trust_policy_explicit,
         optional_auto_flags,
     })
 }

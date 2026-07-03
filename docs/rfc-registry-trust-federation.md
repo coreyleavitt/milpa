@@ -416,26 +416,43 @@ at L1001–1019.
 
 In the Rust impl, mirrors `attestation_policy` in `milpa-manifest/src/lib.rs`.
 
-### 6.4a Workspace policy merge
+### 6.4a Workspace root authority (SUPERSEDES the original max-merge design)
 
-The index is loaded ONCE per workspace invocation. A member-level `index-trust`
-field would be silently ignored if only the root manifest were consulted. Instead:
+> **Redesign note:** the original S1–S7 build of this RFC shipped a
+> "workspace policy merge" (MAX over root + all member policies, plus a
+> conflicting-signers validation error across members). That design was a
+> scope error: the registry index is a process-global, workspace-shared
+> resource (one index URL per invocation, no per-member index URL), so
+> index-trust is a property of the **resolution root**, not of each member.
+> The text below describes the corrected, current design. The historical
+> slice narration further down this document (S5/S6/S7) describes what was
+> originally built and is kept for the historical record; where it conflicts
+> with this section, this section is authoritative.
 
-The effective index-trust POLICY for a workspace invocation is the MAX over the
-root manifest's `index-trust` and all member manifests' `index-trust` values
-(with `strict > warn > off`), computed BEFORE the index is first loaded.
+The index is loaded ONCE per workspace invocation. `index-trust`,
+`index-trust-signer`, and `index-trust-bundle` are declared ONLY on the
+**resolution root**:
 
-A workspace where root=`warn` and any member=`strict` resolves under `strict`.
-The corresponding conformance fixture is: root=warn + member=strict → strict (S7).
+- Standalone package: the package manifest itself (unchanged).
+- Workspace: the workspace ROOT manifest (the one carrying
+  `workspace { member … }`). The workspace-root grammar permits these three
+  nodes as top-level nodes alongside `workspace { }` — they are neither
+  `deps` nor `kind`, so the deps/kind rejection is unaffected.
 
-**Signer identity and trust-bundle are resolved PER index URL (per cache key),
-NOT globally.** A member using a non-default `MILPA_INDEX_URL` must declare its
-own `index-trust-signer` (and optionally `index-trust-bundle`); the signer for
-each distinct index URL is taken from the member(s) that use that URL. If two
-members declare DIFFERENT signers (or different trust-bundles) for the SAME index
-URL, that is a HARD validation error at workspace-load time, BEFORE any index
-fetch. This is specified in S2 (spec) and covered by an S7 conformance fixture
-(`workspace-conflicting-signers` → validation error).
+The effective policy for a workspace invocation is simply the root's own
+`index-trust` value (default `warn`) — there is no merge. A workspace root
+declaring `index-trust "off"` disables the gate for the whole workspace; this
+was structurally unreachable under the old max-merge design (see the old S7
+`workspace-conflicting-signers` scenario note above) and is now the whole
+point of the redesign.
+
+A workspace MEMBER manifest declaring ANY of the three index-trust nodes is a
+HARD validation error — `WS-INDEX-TRUST-ON-MEMBER` — raised at workspace-load
+time, BEFORE any index fetch, even when the declared value matches the
+default (e.g. an explicit `index-trust "warn"` on a member still errors: the
+rule is about WHERE the field is declared). This supersedes the old
+per-URL conflicting-signers check; per-URL signer/bundle grouping across
+members is now moot because members cannot declare signer/bundle at all.
 
 ### 6.5 Error codes
 
@@ -881,15 +898,18 @@ All eighteen pre-generated fixtures in `conformance/spec-v1/` (12 original + 6 n
 | cert-expired-wall-clock-ok | trusted | strict | trusted (cert valid at SET time; not a failure) |
 | flag-escalates-warn | trusted | warn + flag | trusted (strict effective; no warning emitted) |
 | upgrade-no-bundle-warn | bundle-missing | warn | warn:TNG-INDEX-BUNDLE-MISSING (with hint) |
-| workspace-member-strict | trusted | root=warn, member=strict | strict effective; trusted result |
+| workspace-member-strict *(fixture-349, REPURPOSED — see 6.4a redesign)* | trusted | workspace ROOT declares strict, member declares nothing | strict effective (root authority); trusted result |
 | off-sig-invalid | sig-invalid | off | trusted/proceed (verifier NOT consulted; no warning) |
 | off-digest-mismatch | digest-mismatch | off | proceed silently |
 | off-bundle-missing | bundle-missing | off | proceed silently |
 | manifest-off-env-strict | trusted | manifest=off + env=strict | off (env cannot override manifest off) |
 | manifest-warn-env-off | trusted | manifest=warn + env=off | warn (env=off cannot weaken manifest warn) |
-| workspace-conflicting-signers | — | two members, different signers, same index URL | validation error (before fetch) |
+| workspace-conflicting-signers *(fixture-355, REPURPOSED — see 6.4a redesign)* | trusted | workspace MEMBER illegally declares `index-trust "strict"` | error:WS-INDEX-TRUST-ON-MEMBER (before fetch) |
+| workspace-root-off *(fixture-366, NEW — 6.4a redesign)* | sig-invalid | workspace ROOT declares off | trusted/proceed (gate disabled; proves root can reach off) |
 
-Both runners produce byte-identical policy outcomes for all eighteen scenarios.
+Both runners produce byte-identical policy outcomes for all nineteen scenarios
+(fixture-349 and fixture-355 were repurposed in place, fixture-366 is new —
+see §6.4a for the root-authority redesign that motivated the change).
 
 ---
 
@@ -1081,10 +1101,11 @@ parse. Six `TNG-INDEX-*` codes raised at runtime.
   and `index-trust-bundle` nodes.
 - `impls/python/milpa/context.py` — `IndexTrustConfig` on `ResolveParams` or
   `MilpaEnv` (whichever carries the loaded-index context cleanly).
-- `impls/python/milpa/workspace.py` — workspace max-merge of `index_trust_policy`
-  across root + all members before index load; per-URL signer/trust-bundle
-  resolution; hard validation error if members declare conflicting signers for
-  the same index URL.
+- `impls/python/milpa/workspace.py` — index-trust root-authority validation
+  (§6.4a): a member manifest declaring `index-trust` / `index-trust-signer` /
+  `index-trust-bundle` raises `WS-INDEX-TRUST-ON-MEMBER` before index load.
+  *(Originally shipped as a workspace max-merge + per-URL conflicting-signers
+  check; superseded by the §6.4a root-authority redesign — see that section.)*
 - `impls/python/milpa/cli.py` — `--require-attested-index`, `--refresh-index`
   flags; `MILPA_INDEX_TRUST` / `MILPA_INDEX_TRUST_SIGNER` / `MILPA_INDEX_TRUST_BUNDLE` /
   `MILPA_INDEX_MAX_AGE` / `MILPA_INDEX_BUNDLE_URL` env reads.

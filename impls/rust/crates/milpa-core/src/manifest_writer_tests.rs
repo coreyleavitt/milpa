@@ -215,6 +215,7 @@ fn format_workspace_manifest_minimal_two_members() {
         overrides: Vec::new(),
         flags: Vec::new(),
         name: None,
+        ..Default::default()
     };
     let out = milpa_manifest::format_workspace_manifest(&ws);
     assert!(out.contains("member \"member-a\""), "output:\n{out}");
@@ -229,6 +230,7 @@ fn format_workspace_manifest_name_emitted_when_some() {
         overrides: Vec::new(),
         flags: Vec::new(),
         name: Some("my-workspace".into()),
+        ..Default::default()
     };
     let out = milpa_manifest::format_workspace_manifest(&ws);
     assert!(out.contains("name \"my-workspace\""), "output:\n{out}");
@@ -241,6 +243,7 @@ fn format_workspace_manifest_name_absent_when_none() {
         overrides: Vec::new(),
         flags: Vec::new(),
         name: None,
+        ..Default::default()
     };
     let out = milpa_manifest::format_workspace_manifest(&ws);
     // No standalone name= line (only the header comment)
@@ -261,6 +264,7 @@ fn format_workspace_manifest_url_annotation_on_git_override() {
         }],
         flags: Vec::new(),
         name: None,
+        ..Default::default()
     };
     let out = milpa_manifest::format_workspace_manifest(&ws);
     assert!(out.contains("git=(url)\"https://github.com/example/dep-x.git\""), "output:\n{out}");
@@ -288,6 +292,7 @@ fn format_workspace_manifest_idempotent() {
             conflicts: Vec::new(),
         }],
         name: Some("root".into()),
+        ..Default::default()
     };
     let first = milpa_manifest::format_workspace_manifest(&ws);
     let reparsed = match milpa_manifest::parse_document(&first).unwrap() {

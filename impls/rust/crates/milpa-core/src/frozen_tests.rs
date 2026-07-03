@@ -23,6 +23,7 @@ fn manifest(deps: Vec<Dep>) -> Manifest {
         index_trust_policy: milpa_manifest::TrustPolicy::Warn,
         index_trust_signer: None,
         index_trust_bundle: None,
+        index_trust_policy_explicit: false,
         optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }

@@ -2403,12 +2403,16 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// - `MILPA_INDEX_TRUST`         — env policy override (same axis as the CLI
 ///   `MILPA_INDEX_TRUST` env var).
 /// - `MILPA_REQUIRE_ATTESTED_INDEX` — flag escalation (`1` = escalate warn→strict).
-/// - `MILPA_INDEX_TRUST_WS_MEMBER_MAX` — simulates workspace member max-merge:
-///   `max(root_policy, member_max)` replaces manifest policy before calling
-///   `effective_trust_policy`.
-/// - `MILPA_INDEX_TRUST_WS_CONFLICT` — workspace conflicting-signers (1 = conflict);
-///   immediately returns `error:WS-INDEX-CONFLICTING-SIGNERS` without going through
-///   the verifier (validated before any fetch in the real resolver).
+/// - `MILPA_INDEX_TRUST_WS_ROOT` — root-authority model (spec §3.4.7, RFC §6.4a):
+///   writes a real workspace whose ROOT manifest declares `index-trust "<policy>"`
+///   directly (alongside `workspace { }`); the member declares nothing. The root's
+///   single value IS the effective policy — no merge — via `load_workspace` +
+///   `LoadedWorkspace::index_trust_policy`.
+/// - `MILPA_INDEX_TRUST_WS_MEMBER_ILLEGAL` — boolean flag; writes a real workspace
+///   where a MEMBER illegally declares `index-trust "strict"` (root optionally
+///   declares `MILPA_INDEX_TRUST_MANIFEST`); calls `load_workspace` directly, which
+///   raises `WS-INDEX-TRUST-ON-MEMBER` via `check_member_index_trust_declarations`
+///   BEFORE any index fetch — same ordering the real CLI's `cmd_fetch` uses.
 ///
 /// Returns `Ok(Produced::IndexTrustPass { outcome })` when the computed outcome
 /// matches `expected/outcome`; `Err(message)` on any mismatch.
@@ -2441,45 +2445,38 @@ fn run_index_trust_fixture(fx: &Fixture) -> Result<Produced, String> {
         .map(|s| s.trim().to_string())
         .map_err(|e| format!("cannot read expected/outcome: {e}"))?;
 
-    // Item 4 (M4): Workspace conflicting-signers — write real manifests and call
-    // the real load_workspace/check_conflicting_signers path (spec §6.4a).
-    // Prior to this fix the runner hardcoded the outcome without exercising any
-    // detection code, masking any regression in check_conflicting_signers.
-    let ws_conflict = env
-        .get("MILPA_INDEX_TRUST_WS_CONFLICT")
+    // S8 (root-authority redesign, spec §3.4.7 / RFC §6.4a): workspace MEMBER
+    // illegally declares index-trust — write real manifests and call the real
+    // load_workspace/check_member_index_trust_declarations path. This fires
+    // BEFORE any index fetch, same ordering the real CLI's cmd_fetch uses
+    // (find_workspace_root/load_workspace runs before _load_index_for_verb).
+    let ws_member_illegal = env
+        .get("MILPA_INDEX_TRUST_WS_MEMBER_ILLEGAL")
         .map(|v| parse_env_bool(v))
         .unwrap_or(false);
-    if ws_conflict {
-        // Write a two-member workspace with conflicting index-trust-signer values,
-        // then call load_workspace which internally calls check_conflicting_signers.
+    if ws_member_illegal {
+        let root_policy = env
+            .get("MILPA_INDEX_TRUST_MANIFEST")
+            .map(|s| s.as_str())
+            .unwrap_or("");
         let tmp = tempfile::tempdir()
             .map_err(|e| format!("cannot create tempdir for fixture-355: {e}"))?;
         let ws_root = tmp.path();
-        // Root manifest: workspace with two members.
+        let mut root_lines: Vec<String> = Vec::new();
+        if !root_policy.is_empty() {
+            root_lines.push(format!("index-trust \"{root_policy}\""));
+        }
+        root_lines.push("workspace {\n    member \"sub\"\n}".to_string());
+        std::fs::write(ws_root.join("milpa.kdl"), root_lines.join("\n") + "\n")
+            .map_err(|e| format!("cannot write workspace root milpa.kdl: {e}"))?;
+        let sub = ws_root.join("sub");
+        std::fs::create_dir_all(&sub).map_err(|e| format!("cannot create sub dir: {e}"))?;
         std::fs::write(
-            ws_root.join("milpa.kdl"),
-            "workspace {\n    member \"sub-a\"\n    member \"sub-b\"\n}\n",
-        ).map_err(|e| format!("cannot write workspace root milpa.kdl: {e}"))?;
-        // Member sub-a: signer A.
-        let sub_a = ws_root.join("sub-a");
-        std::fs::create_dir_all(&sub_a)
-            .map_err(|e| format!("cannot create sub-a dir: {e}"))?;
-        std::fs::write(
-            sub_a.join("milpa.kdl"),
-            "name \"sub-a\"\nindex-trust-signer \
-             \"https://github.com/org-a/repo/.github/workflows/reindex.yaml@refs/heads/main\"\n",
-        ).map_err(|e| format!("cannot write sub-a milpa.kdl: {e}"))?;
-        // Member sub-b: different signer B → triggers WS-INDEX-CONFLICTING-SIGNERS.
-        let sub_b = ws_root.join("sub-b");
-        std::fs::create_dir_all(&sub_b)
-            .map_err(|e| format!("cannot create sub-b dir: {e}"))?;
-        std::fs::write(
-            sub_b.join("milpa.kdl"),
-            "name \"sub-b\"\nindex-trust-signer \
-             \"https://github.com/org-b/repo/.github/workflows/reindex.yaml@refs/heads/main\"\n",
-        ).map_err(|e| format!("cannot write sub-b milpa.kdl: {e}"))?;
+            sub.join("milpa.kdl"),
+            "name \"sub\"\nkind \"library\"\nindex-trust \"strict\"\n",
+        ).map_err(|e| format!("cannot write sub milpa.kdl: {e}"))?;
 
-        // Call the real load_workspace: it calls check_conflicting_signers internally.
+        // Call the real load_workspace: it calls check_member_index_trust_declarations internally.
         let got_outcome = match milpa_core::load_workspace(ws_root) {
             Err(ref e) => format!("error:{}", e.code()),
             Ok(_) => "trusted".to_string(), // should not reach here
@@ -2510,36 +2507,29 @@ fn run_index_trust_fixture(fx: &Fixture) -> Result<Produced, String> {
         parse_trust_policy_str(manifest_policy_str, "MILPA_INDEX_TRUST_MANIFEST")
             .map_err(|e| format!("invalid MILPA_INDEX_TRUST_MANIFEST: {e}"))?;
 
-    // Item 4 (M4): Workspace member max-merge — write real manifests and call the
-    // real merge_workspace_index_trust_policy via load_workspace (spec §6.4a).
-    // Prior to this fix the runner inlined the merge logic directly, duplicating
-    // the production code and unable to catch a regression in merge_workspace_index_trust_policy.
-    if let Some(ws_member_max_str) = env.get("MILPA_INDEX_TRUST_WS_MEMBER_MAX") {
-        let member_policy_str = ws_member_max_str.as_str();
-        // Write a real workspace: root with manifest_policy, one member with member_policy.
+    // S8 (root-authority redesign, spec §3.4.7 / RFC §6.4a): the workspace ROOT
+    // declares index-trust directly (alongside `workspace { }`); the member
+    // declares nothing. No merge — the root's own value IS the effective policy,
+    // read straight off `LoadedWorkspace::index_trust_policy`.
+    if let Some(ws_root_policy_str) = env.get("MILPA_INDEX_TRUST_WS_ROOT") {
         let tmp = tempfile::tempdir()
             .map_err(|e| format!("cannot create tempdir for fixture-349: {e}"))?;
         let ws_root = tmp.path();
         std::fs::write(
             ws_root.join("milpa.kdl"),
-            "workspace {\n    member \"sub\"\n}\n",
+            format!("index-trust \"{ws_root_policy_str}\"\nworkspace {{\n    member \"sub\"\n}}\n"),
         ).map_err(|e| format!("cannot write ws root milpa.kdl: {e}"))?;
         let sub = ws_root.join("sub");
         std::fs::create_dir_all(&sub)
             .map_err(|e| format!("cannot create sub dir: {e}"))?;
         std::fs::write(
             sub.join("milpa.kdl"),
-            format!("name \"sub\"\nindex-trust \"{member_policy_str}\"\n"),
+            "name \"sub\"\nkind \"library\"\n",
         ).map_err(|e| format!("cannot write sub milpa.kdl: {e}"))?;
 
-        // Load the workspace and compute the merged policy via the SSOT helper.
-        // The written root manifest is "workspace { member sub }" — no index-trust
-        // node — so its effective policy is Warn (the field default).  The Python
-        // runner derives the base from the actual written root manifest (same result).
-        // Use workspace_index_trust_policy() so call sites and runner stay in sync.
         let ws = milpa_core::load_workspace(ws_root)
             .map_err(|e| format!("load_workspace for fixture-349 failed: {}", e.code()))?;
-        manifest_policy = milpa_core::workspace_index_trust_policy(&ws);
+        manifest_policy = ws.index_trust_policy;
     }
 
     // Env override (MILPA_INDEX_TRUST) and flag (MILPA_REQUIRE_ATTESTED_INDEX).

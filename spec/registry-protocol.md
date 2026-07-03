@@ -597,38 +597,36 @@ key. Failure MUST raise `TNG-INDEX-SIGNATURE-INVALID`.
 > Rekor public key) and is orthogonal to signer identity — changing one does not
 > imply the other. Both are defined in `spec/cli-contract.md §8`.
 
-#### 3.4.7  Workspace requirements
+#### 3.4.7  Workspace requirements — root authority
 
-> NORMATIVE (workspace policy merge): In a workspace invocation, the effective
-> `index-trust` policy is the MAX over the root manifest's policy and all member
-> manifests' policies (`strict > warn > off`), computed BEFORE the index is first
-> loaded. A workspace where the root declares `warn` and any member declares `strict`
-> MUST resolve under `strict`.
+> NORMATIVE (root authority): `index-trust`, `index-trust-signer`, and
+> `index-trust-bundle` are declared ONLY on the **resolution root**. The registry
+> index is a process-global, workspace-shared resource (one index URL per
+> invocation, no per-member index URL) — index-trust is therefore a property of
+> the resolution root, not of each member. The resolution root is:
 >
-> NOTE (root contribution): the workspace-root manifest grammar carries only the
-> `workspace { member … }` block and cannot declare `index-trust`; the root therefore
-> always contributes the default (`warn`) to the merge. A consequence of the MAX merge
-> is that a workspace has no manifest-level path to an effective `off` — even when
-> every member declares `off`, the merged policy is `warn`. (Whether the workspace
-> root block should be allowed to declare `index-trust` is an open design question,
-> deliberately not resolved here.)
+> - For a standalone package: the package manifest itself (unchanged).
+> - For a workspace: the workspace ROOT manifest — the one carrying the
+>   `workspace { member … }` block. The workspace-root manifest grammar
+>   permits `index-trust` / `index-trust-signer` / `index-trust-bundle` as
+>   top-level nodes alongside `workspace { }` (they are neither `deps` nor
+>   `kind`, so declaring them does not trigger the deps/kind rejection).
+>
+> The effective policy for a workspace invocation is simply the root's own
+> `index-trust` value (default `warn` if the node is absent) — there is no
+> merge, and no other manifest contributes to it. Consequently a workspace HAS
+> a manifest-level path to an effective `off`: declare `index-trust "off"` on
+> the workspace root.
 
-> NORMATIVE (conflicting-signers validation error): If two or more workspace members
-> declare DIFFERENT signer identities (via `index-trust-signer` in `milpa.kdl`) or
-> different trust-bundle overrides (via `index-trust-bundle`) for the SAME index URL,
-> the implementation MUST raise a hard validation error BEFORE any index fetch. This
-> check fires at workspace-load time. The workspace-conflicting-signers validation
-> error is distinct from the six `TNG-INDEX-*` error slugs; it is a manifest-
-> consistency error that does not involve cryptographic verification.
-
-> NOTE (per-URL scoping — current invariant): Per-URL signer grouping is currently
-> vacuous because the index URL is process-global (`MILPA_INDEX_URL` or
-> `DEFAULT_INDEX_URL`). The manifest grammar has no per-member `index-url` node, so
-> exactly one index URL exists per invocation. The global comparison implemented by
-> both impls is therefore equivalent to the normative per-URL requirement above: only
-> one URL group ever exists. If per-member index URLs are introduced in a future
-> slice, the conflicting-signers check MUST be updated to group members by their
-> effective index URL before comparing signer identities.
+> NORMATIVE (member-declaration error): A workspace MEMBER manifest declaring
+> ANY of `index-trust`, `index-trust-signer`, or `index-trust-bundle` MUST raise
+> a hard validation error — `WS-INDEX-TRUST-ON-MEMBER` — BEFORE any index fetch.
+> This check fires at workspace-load time. It fires even when the member's
+> declared value is identical to the default (e.g. an explicit
+> `index-trust "warn"` on a member is still an error) — the rule is about WHERE
+> the field is declared, not what value it holds. `WS-INDEX-TRUST-ON-MEMBER` is
+> distinct from the six `TNG-INDEX-*` error slugs; it is a manifest-structure
+> error that does not involve cryptographic verification.
 
 ---
 

@@ -259,11 +259,13 @@ impl CoreError {
             // MILPA_INDEX_TRUST_MOCK_VERIFIER is not set (no test seam active).
             // Complements the Python impl's same-named code under identical conditions.
             "TNG-INDEX-VERIFY-UNSUPPORTED",
-            // S6: workspace member signer-conflict detection (RFC §6.4a).
-            // Emitted by check_conflicting_signers in workspace.rs when two workspace
-            // members declare different index-trust-signer or index-trust-bundle values
-            // for the same index URL (manifest-consistency error; raised before fetch).
-            "WS-INDEX-CONFLICTING-SIGNERS",
+            // S8: workspace index-trust root-authority validation (RFC §6.4a,
+            // spec §3.4.7). Emitted by check_member_index_trust_declarations in
+            // workspace.rs when a workspace MEMBER declares index-trust /
+            // index-trust-signer / index-trust-bundle — that field is a
+            // workspace-ROOT-only policy (manifest-structure error; raised
+            // before any index fetch).
+            "WS-INDEX-TRUST-ON-MEMBER",
         ]
     }
 }

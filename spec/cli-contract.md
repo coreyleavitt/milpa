@@ -666,6 +666,14 @@ index cache, not a project directory).
 > Default `max_age_seconds` is 604800 (7 days). Overridable via
 > `MILPA_INDEX_MAX_AGE` env var (integer seconds).
 
+> NORMATIVE (workspace root authority): index-trust is declared ONLY on the
+> resolution root (`spec/registry-protocol.md §3.4.7`) — for a workspace, the
+> workspace ROOT manifest. `show --index-trust` MUST resolve the effective
+> policy from that single root value (no merge across members): if the
+> current directory is a workspace member or root, find the workspace root
+> and read its `index-trust` value (default `warn` if absent); otherwise read
+> the standalone package manifest's value.
+
 > NOTE: `signer:`, `issuer:`, and `subject-sha256:` are extracted from the
 > `_milpa_claims` JSON section that the tianguis publishing workflow writes into
 > every conformance-fixture mock bundle. Real Sigstore bundles do NOT contain

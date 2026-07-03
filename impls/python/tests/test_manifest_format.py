@@ -240,6 +240,60 @@ class TestSpecVersionRoundTrip:
         assert reparsed.spec_version == 1
 
 
+class TestIndexTrustRoundTrip:
+    """RD-M2: index-trust / index-trust-signer / index-trust-bundle must survive
+    a format_manifest → parse_manifest round trip.
+
+    Pre-fix: format_manifest never emitted these three nodes at all, so `milpa
+    add`/`remove` (which rewrite milpa.kdl via format_manifest) silently reverted
+    a declared `index-trust "strict"` back to the "warn" default — a fail-open,
+    and a spec/manifest-grammar.md §8 semantic-round-trip violation.
+    """
+
+    def test_policy_signer_bundle_round_trip(self) -> None:
+        m = Manifest(
+            name="pkg",
+            deps=(),
+            index_trust_policy="strict",
+            index_trust_policy_explicit=True,
+            index_trust_signer="signer@example.com",
+            index_trust_bundle="file:///tmp/bundle.json",
+        )
+        out = format_manifest(m)
+        assert 'index-trust "strict"' in out
+        assert 'index-trust-signer "signer@example.com"' in out
+        assert 'index-trust-bundle "file:///tmp/bundle.json"' in out
+
+        reparsed = parse_manifest(out)
+        assert reparsed.index_trust_policy == "strict"
+        assert reparsed.index_trust_policy_explicit is True
+        assert reparsed.index_trust_signer == "signer@example.com"
+        assert reparsed.index_trust_bundle == "file:///tmp/bundle.json"
+
+    def test_policy_not_explicit_stays_absent(self) -> None:
+        """A manifest that never declared index-trust must not gain one on format."""
+        m = Manifest(name="pkg", deps=())
+        out = format_manifest(m)
+        assert "index-trust " not in out
+        assert "index-trust\n" not in out
+        reparsed = parse_manifest(out)
+        assert reparsed.index_trust_policy_explicit is False
+        assert reparsed.index_trust_policy == "warn"
+
+    def test_explicit_warn_round_trips_as_explicit(self) -> None:
+        """index-trust "warn" (matching the default value) must still round-trip
+        as explicitly declared — the WHERE, not the value, is what matters for
+        WS-INDEX-TRUST-ON-MEMBER (spec: registry-protocol.md §3.4.7)."""
+        text = 'name "pkg"\nindex-trust "warn"\n'
+        m = parse_manifest(text)
+        assert m.index_trust_policy_explicit is True
+        out = format_manifest(m)
+        assert 'index-trust "warn"' in out
+        reparsed = parse_manifest(out)
+        assert reparsed.index_trust_policy_explicit is True
+        assert reparsed.index_trust_policy == "warn"
+
+
 class TestUrlAnnotation:
     """§2: (url) annotation required on all URL fields in serialized output."""
 
@@ -1281,6 +1335,98 @@ class TestFormatWorkspaceManifest:
         assert first == second, (
             f"Idempotence violated:\nFirst:\n{first}\nSecond:\n{second}"
         )
+
+    # -- RD-M2: index-trust round-trip (workspace root, root-authority model) --
+
+    def test_index_trust_policy_signer_bundle_round_trip(self) -> None:
+        """A workspace-root index-trust "strict" (+ signer/bundle) must survive
+        a format_workspace_manifest → parse round trip.
+
+        Pre-fix: format_workspace_manifest never emitted these nodes, so any
+        write path through it (e.g. `workspace add-member`/`remove-member`)
+        silently reverted a declared strict policy to the "warn" default.
+        """
+        from milpa.manifest import WorkspaceManifest, format_workspace_manifest, parse_workspace_or_manifest
+        ws = WorkspaceManifest(
+            members=("pkg",),
+            index_trust_policy="strict",
+            index_trust_policy_explicit=True,
+            index_trust_signer="signer@example.com",
+            index_trust_bundle="file:///tmp/bundle.json",
+        )
+        out = format_workspace_manifest(ws)
+        assert 'index-trust "strict"' in out
+        assert 'index-trust-signer "signer@example.com"' in out
+        assert 'index-trust-bundle "file:///tmp/bundle.json"' in out
+
+        reparsed = parse_workspace_or_manifest(out)
+        assert isinstance(reparsed, WorkspaceManifest)
+        assert reparsed.index_trust_policy == "strict"
+        assert reparsed.index_trust_policy_explicit is True
+        assert reparsed.index_trust_signer == "signer@example.com"
+        assert reparsed.index_trust_bundle == "file:///tmp/bundle.json"
+
+    def test_index_trust_not_explicit_stays_absent(self) -> None:
+        """A workspace root that never declared index-trust must not gain one."""
+        from milpa.manifest import WorkspaceManifest, format_workspace_manifest, parse_workspace_or_manifest
+        ws = WorkspaceManifest(members=("pkg",))
+        out = format_workspace_manifest(ws)
+        assert "index-trust " not in out
+        assert "index-trust\n" not in out
+        reparsed = parse_workspace_or_manifest(out)
+        assert isinstance(reparsed, WorkspaceManifest)
+        assert reparsed.index_trust_policy_explicit is False
+        assert reparsed.index_trust_policy == "warn"
+
+    def test_index_trust_survives_add_member_rewrite(self) -> None:
+        """A workspace-root "strict" policy must survive a simulated
+        add-member rewrite — the exact real-world path (`milpa workspace
+        add-member`) that goes through format_workspace_manifest.
+        """
+        from dataclasses import replace
+
+        from milpa.manifest import WorkspaceManifest, format_workspace_manifest, parse_workspace_or_manifest
+
+        ws = WorkspaceManifest(
+            members=("pkg-a",),
+            index_trust_policy="strict",
+            index_trust_policy_explicit=True,
+        )
+        # Simulate `workspace add-member`: append a member, then rewrite to disk.
+        ws_with_new_member = replace(ws, members=ws.members + ("pkg-b",))
+        out = format_workspace_manifest(ws_with_new_member)
+        reparsed = parse_workspace_or_manifest(out)
+        assert isinstance(reparsed, WorkspaceManifest)
+        assert reparsed.members == ("pkg-a", "pkg-b")
+        assert reparsed.index_trust_policy == "strict", (
+            "add-member rewrite must not revert a declared strict policy to warn"
+        )
+        assert reparsed.index_trust_policy_explicit is True
+
+    def test_index_trust_survives_remove_member_rewrite(self) -> None:
+        """A workspace-root "strict" policy must survive a simulated
+        remove-member rewrite (`milpa workspace remove-member`)."""
+        from dataclasses import replace
+
+        from milpa.manifest import WorkspaceManifest, format_workspace_manifest, parse_workspace_or_manifest
+
+        ws = WorkspaceManifest(
+            members=("pkg-a", "pkg-b"),
+            index_trust_policy="strict",
+            index_trust_policy_explicit=True,
+        )
+        # Simulate `workspace remove-member`: drop a member, then rewrite to disk.
+        ws_with_member_removed = replace(
+            ws, members=tuple(p for p in ws.members if p != "pkg-b")
+        )
+        out = format_workspace_manifest(ws_with_member_removed)
+        reparsed = parse_workspace_or_manifest(out)
+        assert isinstance(reparsed, WorkspaceManifest)
+        assert reparsed.members == ("pkg-a",)
+        assert reparsed.index_trust_policy == "strict", (
+            "remove-member rewrite must not revert a declared strict policy to warn"
+        )
+        assert reparsed.index_trust_policy_explicit is True
 
 
 # ---------------------------------------------------------------------------

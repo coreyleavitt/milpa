@@ -1349,31 +1349,48 @@ def _dag_oracle_local_entries(local_spec: Path, tmp_dir: Path) -> list:
 #   index.kdl                   ← served via file:// URL to the real load path
 #   index.kdl.bundle            ← sidecar (MockVerifier ignores content but load path reads it)
 #   expected/outcome            ← "trusted" | "warn:TNG-INDEX-*" | "error:TNG-INDEX-*"
-#                                  or "error:WS-INDEX-CONFLICTING-SIGNERS"
+#                                  or "error:WS-INDEX-TRUST-ON-MEMBER"
 #
 # Env fields consumed by this runner:
 #   mock_verifier_result         ← VerificationResult wire string; mapped to
 #                                  MILPA_INDEX_TRUST_MOCK_VERIFIER for the real CLI path
 #   MILPA_INDEX_TRUST_MANIFEST   ← manifest index-trust policy written to a real milpa.kdl
+#                                  (single-package fixtures) OR the workspace ROOT's
+#                                  index-trust value (workspace fixtures below)
 #   MILPA_INDEX_TRUST            ← env override (set in OS environment for the call)
 #   MILPA_REQUIRE_ATTESTED_INDEX ← flag escalation (passed as require_attested_index to MilpaEnv)
-#   MILPA_INDEX_TRUST_WS_MEMBER_MAX ← workspace member max policy; triggers workspace structure
-#   MILPA_INDEX_TRUST_WS_CONFLICT   ← triggers WS-INDEX-CONFLICTING-SIGNERS via real workspace load
+#   MILPA_INDEX_TRUST_WS_ROOT        ← workspace ROOT's declared index-trust policy;
+#                                      triggers a real workspace (root declares, member
+#                                      declares nothing — root-authority model, §6.4a)
+#   MILPA_INDEX_TRUST_WS_MEMBER_ILLEGAL ← boolean flag; triggers a real workspace where a
+#                                      MEMBER illegally declares `index-trust "strict"`
+#                                      (root optionally declares MILPA_INDEX_TRUST_MANIFEST)
 #
 # Item 2 (H6 root-cause fix): this runner now calls through the REAL CLI functions
 # _build_index_trust + _load_index_for_verb (via load_default_index) rather than
 # calling enforce_index_trust directly. A future regression that unwires the trust
 # gate from the CLI will cause these fixtures to fail.
 #
+# Root-authority model (RFC registry-trust-federation §6.4a redesign, spec §3.4.7):
+# index-trust is declared ONLY on the resolution root. For a workspace, that's the
+# workspace ROOT manifest — its single value IS the effective policy (no merge). A
+# MEMBER manifest declaring any index-trust field is a hard error
+# (WS-INDEX-TRUST-ON-MEMBER) raised at workspace-load time, BEFORE any index fetch.
+#
 # Layer exercised per fixture type:
 #   - Non-workspace (338–348, 350–354): real manifest parse → _build_index_trust
 #     (reads MILPA_INDEX_TRUST_MOCK_VERIFIER from env) → load_default_index →
 #     _verify_and_enforce → enforce_index_trust.  FULL CLI wiring path.
-#   - Workspace member-strict (349): real workspace manifest + member parse →
-#     _build_index_trust (reads workspace, max-merges policies) → full gate.
-#   - Workspace conflicting-signers (355): real workspace manifests →
-#     find_workspace_root → load_workspace → _check_conflicting_signers.
-#     Fires BEFORE the trust gate (as in the real CLI's cmd_fetch).
+#   - Workspace root declares policy (349, repurposed): real workspace root manifest
+#     carries `index-trust "<policy>"` directly; a plain member coexists → full gate
+#     reads the root's single value via _build_index_trust → _load_manifest_trust_fields.
+#   - Workspace root declares off (366, new): same shape as 349, proves the gate can
+#     be disabled workspace-wide — structurally unreachable under the old max-merge
+#     design, the whole point of the redesign.
+#   - Workspace member illegally declares index-trust (355, repurposed): real
+#     workspace manifests → find_workspace_root → load_workspace →
+#     _check_member_index_trust_declarations. Fires BEFORE the trust gate (as in the
+#     real CLI's cmd_fetch, which calls find_workspace_root before _load_index_for_verb).
 #
 # Both the Python and Rust runners read the same env fields and produce the same
 # expected/outcome strings — the cross-impl convergence proof for the policy
@@ -1389,38 +1406,50 @@ def _write_single_package_manifest(project_dir: Path, manifest_policy: str) -> N
     )
 
 
-def _write_workspace_member_strict(project_dir: Path, root_policy: str, member_policy: str) -> None:
-    """Write a workspace root + one member with different index-trust policies."""
+def _write_workspace_root_index_trust(project_dir: Path, root_policy: str) -> None:
+    """Write a workspace ROOT declaring index-trust, with one plain member.
+
+    Root-authority model (RFC registry-trust-federation §6.4a, spec §3.4.7):
+    index-trust is declared ONLY on the resolution root. For a workspace, the
+    root manifest carries `index-trust "<root_policy>"` directly as a
+    top-level node alongside `workspace { }` (legal per manifest.py
+    _WORKSPACE_TOP_LEVEL). The member declares nothing.
+    """
     project_dir.mkdir(parents=True, exist_ok=True)
     (project_dir / "milpa.kdl").write_text(
-        'workspace {\n    member "sub"\n}\n',
+        f'index-trust "{root_policy}"\nworkspace {{\n    member "sub"\n}}\n',
         encoding="utf-8",
     )
     sub_dir = project_dir / "sub"
     sub_dir.mkdir(parents=True, exist_ok=True)
     (sub_dir / "milpa.kdl").write_text(
-        f'name "sub"\nindex-trust "{member_policy}"\n',
-        encoding="utf-8",
+        'name "sub"\nkind "library"\n', encoding="utf-8",
     )
 
 
-def _write_conflicting_signers_workspace(project_dir: Path) -> None:
-    """Write a workspace with two members declaring different index-trust-signer values."""
+def _write_workspace_member_illegal_index_trust(project_dir: Path, root_policy: str) -> None:
+    """Write a workspace where a MEMBER illegally declares index-trust.
+
+    Root-authority model (RFC registry-trust-federation §6.4a, spec §3.4.7): a
+    member manifest declaring ANY of index-trust / index-trust-signer /
+    index-trust-bundle is a hard error (WS-INDEX-TRUST-ON-MEMBER), raised at
+    workspace-load time, BEFORE any index fetch. The root here optionally
+    declares `root_policy` (empty string → root declares nothing, defaults to
+    'warn'); the member illegally declares `index-trust "strict"`.
+    """
     project_dir.mkdir(parents=True, exist_ok=True)
+    root_lines = []
+    if root_policy:
+        root_lines.append(f'index-trust "{root_policy}"')
+    root_lines.append('workspace {\n    member "sub"\n}')
     (project_dir / "milpa.kdl").write_text(
-        'workspace {\n    member "sub-a"\n    member "sub-b"\n}\n',
-        encoding="utf-8",
+        "\n".join(root_lines) + "\n", encoding="utf-8",
     )
-    for name, signer in [
-        ("sub-a", "https://github.com/org-a/repo/.github/workflows/reindex.yaml@refs/heads/main"),
-        ("sub-b", "https://github.com/org-b/repo/.github/workflows/reindex.yaml@refs/heads/main"),
-    ]:
-        d = project_dir / name
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "milpa.kdl").write_text(
-            f'name "{name}"\nindex-trust-signer "{signer}"\n',
-            encoding="utf-8",
-        )
+    sub_dir = project_dir / "sub"
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    (sub_dir / "milpa.kdl").write_text(
+        'name "sub"\nkind "library"\nindex-trust "strict"\n', encoding="utf-8",
+    )
 
 
 def _execute_index_trust_fixture(
@@ -1433,8 +1462,17 @@ def _execute_index_trust_fixture(
     functions the CLI calls from ``_load_index_for_verb`` — so a future regression
     that unwires the trust gate from the CLI will cause these fixtures to fail.
 
-    For workspace conflicting-signers (fixture-355): calls ``find_workspace_root``
-    which triggers ``_check_conflicting_signers`` — the same path as ``cmd_fetch``.
+    For a workspace member illegally declaring index-trust (fixture-355): calls
+    ``find_workspace_root`` which triggers
+    ``_check_member_index_trust_declarations`` — the same path as ``cmd_fetch``
+    (which calls ``find_workspace_root`` before ``_load_index_for_verb``).
+
+    Verb-level surfacing of ``WS-INDEX-TRUST-ON-MEMBER`` (``show --index-trust``,
+    ``verify``, member-dir ``add``/``remove``/``update``, ``clean``) is a
+    CLI-dispatch behavior that a library-call conformance runner cannot drive
+    honestly; it is covered per-impl instead — Python: ``test_cli_index_trust.py``
+    (in-process ``cmd_*`` calls); Rust: ``cli_ws_index_trust_swallow.rs`` (real
+    binary via ``CARGO_BIN_EXE_milpa``).
     """
     import contextlib
     import io
@@ -1460,8 +1498,8 @@ def _execute_index_trust_fixture(
     manifest_policy = env_dict.get("MILPA_INDEX_TRUST_MANIFEST", "warn")
     env_trust = env_dict.get("MILPA_INDEX_TRUST")
     require_flag = env_flag(env_dict, "MILPA_REQUIRE_ATTESTED_INDEX")
-    ws_conflict = env_flag(env_dict, "MILPA_INDEX_TRUST_WS_CONFLICT")
-    ws_member_max = env_dict.get("MILPA_INDEX_TRUST_WS_MEMBER_MAX")
+    ws_member_illegal = env_flag(env_dict, "MILPA_INDEX_TRUST_WS_MEMBER_ILLEGAL")
+    ws_root_policy = env_dict.get("MILPA_INDEX_TRUST_WS_ROOT")
 
     # Validate mock_verifier_result against known wire strings.
     _VALID_WIRE = {
@@ -1474,16 +1512,19 @@ def _execute_index_trust_fixture(
     # --- Build project directory structure ---
     project_dir = tmp_dir / "project"
 
-    if ws_conflict:
-        # Workspace conflicting-signers: create real workspace manifests and call
-        # find_workspace_root, which triggers _check_conflicting_signers.
-        _write_conflicting_signers_workspace(project_dir)
+    if ws_member_illegal:
+        # Workspace member illegally declares index-trust: create real workspace
+        # manifests and call find_workspace_root, which triggers
+        # _check_member_index_trust_declarations — the same ordering cmd_fetch uses
+        # (find_workspace_root runs BEFORE _load_index_for_verb).
+        _write_workspace_member_illegal_index_trust(project_dir, manifest_policy)
         try:
             find_workspace_root(project_dir)
         except _ME as e:
             got_outcome = f"error:{e.slug}"
         else:
             got_outcome = "trusted"  # should not reach here
+
         if got_outcome == expected_outcome:
             return ("pass", "")
         return (
@@ -1491,9 +1532,11 @@ def _execute_index_trust_fixture(
             f"outcome mismatch:\n  expected: {expected_outcome!r}\n  actual:   {got_outcome!r}",
         )
 
-    if ws_member_max is not None:
-        # Workspace with member policy: root has manifest_policy, member has ws_member_max.
-        _write_workspace_member_strict(project_dir, manifest_policy, ws_member_max)
+    if ws_root_policy is not None:
+        # Workspace ROOT declares index-trust directly (root-authority model);
+        # the member declares nothing.  No merge — the root's value IS the
+        # effective policy.
+        _write_workspace_root_index_trust(project_dir, ws_root_policy)
     else:
         # Single-package fixture: write real milpa.kdl with index-trust field.
         _write_single_package_manifest(project_dir, manifest_policy)

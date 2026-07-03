@@ -26,6 +26,15 @@ fn kdl_str(s: &str) -> String {
         .replace('\t', "\\t")
 }
 
+/// Render a [`crate::TrustPolicy`] to its manifest wire string.
+fn trust_policy_str(p: &crate::TrustPolicy) -> &'static str {
+    match p {
+        crate::TrustPolicy::Strict => "strict",
+        crate::TrustPolicy::Warn => "warn",
+        crate::TrustPolicy::Off => "off",
+    }
+}
+
 /// Render a [`Manifest`] to `milpa.kdl` text (trailing newline included).
 pub fn format_manifest(m: &Manifest) -> String {
     let mut lines: Vec<String> = vec![HEADER.to_string(), String::new()];
@@ -46,6 +55,26 @@ pub fn format_manifest(m: &Manifest) -> String {
         lines.push("cas {".to_string());
         lines.push(format!("    dir \"{}\"", kdl_str(&m.cas_dir)));
         lines.push("}".to_string());
+        lines.push(String::new());
+    }
+    // index-trust / index-trust-signer / index-trust-bundle (RD-M2 code-review
+    // item; spec/manifest-grammar.md §8 semantic round-trip): present-stays-present
+    // / absent-stays-absent, mirroring spec-version above — index_trust_policy_explicit
+    // (not a non-default-value check) is what triggers emission, matching the
+    // WS-INDEX-TRUST-ON-MEMBER check's own "WHERE it's declared, not what value it
+    // holds" semantics (workspace.rs / manifest.py). Without this, add-member /
+    // remove-member / add / remove round-trips through format_manifest silently
+    // reverted a declared policy back to warn — a fail-open.
+    if m.index_trust_policy_explicit {
+        lines.push(format!("index-trust \"{}\"", trust_policy_str(&m.index_trust_policy)));
+        lines.push(String::new());
+    }
+    if let Some(signer) = &m.index_trust_signer {
+        lines.push(format!("index-trust-signer \"{}\"", kdl_str(signer)));
+        lines.push(String::new());
+    }
+    if let Some(bundle) = &m.index_trust_bundle {
+        lines.push(format!("index-trust-bundle \"{}\"", kdl_str(bundle)));
         lines.push(String::new());
     }
     if !m.deps.is_empty() {
@@ -199,6 +228,28 @@ pub fn format_workspace_manifest(ws: &Workspace) -> String {
     // name (optional on workspace root)
     if let Some(name) = &ws.name {
         lines.push(format!("name \"{}\"", kdl_str(name)));
+        lines.push(String::new());
+    }
+
+    // index-trust / index-trust-signer / index-trust-bundle (RD-M2 code-review
+    // item; spec §3.4.7 root-authority model — the workspace root is the
+    // resolution root for index-trust purposes). Mirrors `format_manifest`'s
+    // package-side gating: emission is keyed on `index_trust_policy_explicit`
+    // (present-stays-present / absent-stays-absent), NOT on the value, so a
+    // hand-authored but redundant `index-trust "warn"` survives a
+    // format→parse round trip instead of silently reverting to the implicit
+    // default the next time `milpa workspace add-member`/`remove-member`
+    // rewrites the file.
+    if ws.index_trust_policy_explicit {
+        lines.push(format!("index-trust \"{}\"", trust_policy_str(&ws.index_trust_policy)));
+        lines.push(String::new());
+    }
+    if let Some(signer) = &ws.index_trust_signer {
+        lines.push(format!("index-trust-signer \"{}\"", kdl_str(signer)));
+        lines.push(String::new());
+    }
+    if let Some(bundle) = &ws.index_trust_bundle {
+        lines.push(format!("index-trust-bundle \"{}\"", kdl_str(bundle)));
         lines.push(String::new());
     }
 
@@ -579,6 +630,7 @@ mod tests {
             index_trust_policy: crate::TrustPolicy::Warn,
             index_trust_signer: None,
             index_trust_bundle: None,
+            index_trust_policy_explicit: false,
             optional_auto_flags: std::collections::BTreeSet::new(),
         }
     }
@@ -900,6 +952,7 @@ mod tests {
                 enables_cross_pkg: Vec::new(),
                 conflicts: Vec::new(),
             }],
+            ..Default::default()
         };
         let text = format_workspace_manifest(&ws);
         // Must contain the properly escaped form.
@@ -917,5 +970,140 @@ mod tests {
             reparsed.flags[0].description,
             r#"for "CI" builds, base=C:\build"#
         );
+    }
+
+    // -------------------------------------------------------------------
+    // RD-M2 (code-review): index-trust / -signer / -bundle round-trip.
+    // Previously format_manifest/format_workspace_manifest emitted none of
+    // the three fields, so add-member/remove-member (and package add/remove,
+    // which round-trip through mutate_manifest_file → format_manifest) would
+    // silently revert a declared "strict" policy back to the implicit "warn"
+    // default on the very next write — a fail-open (spec/manifest-grammar.md
+    // §8 semantic round-trip).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn package_manifest_index_trust_strict_signer_bundle_round_trips() {
+        let mut m = base();
+        m.index_trust_policy = crate::TrustPolicy::Strict;
+        m.index_trust_policy_explicit = true;
+        m.index_trust_signer = Some(
+            "https://github.com/acme/reg/.github/workflows/publish.yaml@refs/heads/main".into(),
+        );
+        m.index_trust_bundle = Some("file:///etc/milpa/trust-bundle.json".into());
+
+        let text = format_manifest(&m);
+        assert!(text.contains("index-trust \"strict\""), "missing index-trust node:\n{text}");
+        assert!(text.contains("index-trust-signer"), "missing index-trust-signer node:\n{text}");
+        assert!(text.contains("index-trust-bundle"), "missing index-trust-bundle node:\n{text}");
+
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Package(p) => p,
+            other => panic!("expected package, got {other:?}"),
+        };
+        assert_eq!(reparsed.index_trust_policy, m.index_trust_policy);
+        assert_eq!(reparsed.index_trust_policy_explicit, m.index_trust_policy_explicit);
+        assert_eq!(reparsed.index_trust_signer, m.index_trust_signer);
+        assert_eq!(reparsed.index_trust_bundle, m.index_trust_bundle);
+        assert_eq!(reparsed, m, "full manifest must round-trip byte-for-semantic-equivalence");
+    }
+
+    /// A manifest that never declared `index-trust` at all must NOT gain one
+    /// on round-trip (absent-stays-absent — the flip side of the above test).
+    #[test]
+    fn package_manifest_without_index_trust_stays_absent() {
+        let m = base();
+        let text = format_manifest(&m);
+        assert!(!text.contains("index-trust"), "must not fabricate an index-trust node:\n{text}");
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Package(p) => p,
+            other => panic!("expected package, got {other:?}"),
+        };
+        assert!(!reparsed.index_trust_policy_explicit);
+    }
+
+    #[test]
+    fn workspace_manifest_index_trust_strict_signer_bundle_round_trips() {
+        let ws = crate::Workspace {
+            name: Some("my-ws".into()),
+            members: vec!["member-a".into()],
+            overrides: Vec::new(),
+            flags: Vec::new(),
+            index_trust_policy: crate::TrustPolicy::Strict,
+            index_trust_policy_explicit: true,
+            index_trust_signer: Some(
+                "https://github.com/acme/reg/.github/workflows/publish.yaml@refs/heads/main".into(),
+            ),
+            index_trust_bundle: Some("file:///etc/milpa/trust-bundle.json".into()),
+        };
+
+        let text = format_workspace_manifest(&ws);
+        assert!(text.contains("index-trust \"strict\""), "missing index-trust node:\n{text}");
+        assert!(text.contains("index-trust-signer"), "missing index-trust-signer node:\n{text}");
+        assert!(text.contains("index-trust-bundle"), "missing index-trust-bundle node:\n{text}");
+
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Workspace(w) => w,
+            other => panic!("expected workspace, got {other:?}"),
+        };
+        assert_eq!(reparsed.index_trust_policy, ws.index_trust_policy);
+        assert_eq!(reparsed.index_trust_policy_explicit, ws.index_trust_policy_explicit);
+        assert_eq!(reparsed.index_trust_signer, ws.index_trust_signer);
+        assert_eq!(reparsed.index_trust_bundle, ws.index_trust_bundle);
+        assert_eq!(reparsed, ws);
+    }
+
+    /// RD-M2 follow-up (Medium finding): a workspace root that hand-authors
+    /// the legal-but-redundant `index-trust "warn"` (same value as the
+    /// implicit default) must still round-trip byte-for-byte through
+    /// `milpa workspace add-member`/`remove-member` — mirrors
+    /// `package_manifest_index_trust_strict_signer_bundle_round_trips` and
+    /// the Python `WorkspaceManifest.index_trust_policy_explicit` behavior.
+    /// Before this fix, emission was gated on `index_trust_policy != Warn`
+    /// (value-based), so an explicit `"warn"` declaration silently vanished
+    /// on the next rewrite.
+    #[test]
+    fn workspace_manifest_index_trust_warn_explicit_round_trips() {
+        let mut ws = crate::Workspace {
+            name: Some("my-ws".into()),
+            members: vec!["member-a".into()],
+            overrides: Vec::new(),
+            flags: Vec::new(),
+            ..Default::default()
+        };
+        ws.index_trust_policy = crate::TrustPolicy::Warn;
+        ws.index_trust_policy_explicit = true;
+
+        let text = format_workspace_manifest(&ws);
+        assert!(text.contains("index-trust \"warn\""), "missing explicit index-trust node:\n{text}");
+
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Workspace(w) => w,
+            other => panic!("expected workspace, got {other:?}"),
+        };
+        assert_eq!(reparsed.index_trust_policy, ws.index_trust_policy);
+        assert_eq!(reparsed.index_trust_policy_explicit, ws.index_trust_policy_explicit);
+        assert_eq!(reparsed, ws);
+    }
+
+    /// Flip side: a workspace that never declared `index-trust` at all must
+    /// NOT gain one on round-trip (absent-stays-absent).
+    #[test]
+    fn workspace_manifest_without_index_trust_stays_absent() {
+        let ws = crate::Workspace {
+            name: Some("my-ws".into()),
+            members: vec!["member-a".into()],
+            overrides: Vec::new(),
+            flags: Vec::new(),
+            ..Default::default()
+        };
+        let text = format_workspace_manifest(&ws);
+        assert!(!text.contains("index-trust"), "must not fabricate an index-trust node:\n{text}");
+
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Workspace(w) => w,
+            other => panic!("expected workspace, got {other:?}"),
+        };
+        assert!(!reparsed.index_trust_policy_explicit);
     }
 }

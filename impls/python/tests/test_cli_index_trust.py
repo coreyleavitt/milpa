@@ -474,38 +474,33 @@ class TestMockSeamFileOnlyGuard:
 class TestShowIndexTrustWorkspacePolicy:
     """M4: ``cmd_show_index_trust`` must display the policy the enforcement gate enforces.
 
-    Pre-fix: ``cmd_show_index_trust`` called ``load_or_discover_manifest`` directly,
-    which raises when invoked on a workspace root (workspace node rejected in package
-    context).  The bare ``except Exception: pass`` swallowed it, so show always
-    displayed ``warn`` while the enforcement gate (which uses ``find_workspace_root``
-    + max-merge) could enforce ``strict``.
-
-    Post-fix: both paths call ``_load_manifest_trust_fields`` — the SSOT helper.
+    Post S5-redesign (RFC registry-trust-federation §6.4a — root authority):
+    index-trust is declared ONLY on the resolution root. For a workspace, that
+    is the workspace ROOT manifest (no merge across members). Both
+    ``cmd_show_index_trust`` and the enforcement gate call
+    ``_load_manifest_trust_fields`` — the SSOT helper — so they display and
+    enforce the identical root-declared policy.
     """
 
-    def test_workspace_member_strict_shown_as_strict(
+    def test_workspace_root_strict_shown_as_strict(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """Workspace root=warn + member=strict → show reports strict (same as gate enforces).
-
-        This is the M4 regression test: pre-fix show reported 'warn' because it could
-        not load the workspace root as a package manifest.
-        """
+        """Workspace ROOT declares strict → show reports strict (same as gate enforces)."""
         project_dir = tmp_path / "ws"
         project_dir.mkdir()
 
-        # Workspace root (no explicit index-trust → default warn).
+        # Workspace root declares strict directly (root authority).
         (project_dir / "milpa.kdl").write_text(
-            'workspace {\n    member "sub"\n}\n',
+            'index-trust "strict"\nworkspace {\n    member "sub"\n}\n',
             encoding="utf-8",
         )
-        # Member declares strict.
+        # Member declares nothing (legal).
         sub = project_dir / "sub"
         sub.mkdir()
         (sub / "milpa.kdl").write_text(
-            'name "sub"\nindex-trust "strict"\n',
+            'name "sub"\nkind "library"\n',
             encoding="utf-8",
         )
 
@@ -514,7 +509,7 @@ class TestShowIndexTrustWorkspacePolicy:
         assert ret == 0
         out = capsys.readouterr().out
         assert "strict" in out, (
-            f"M4: workspace with member declaring strict must show 'strict'; "
+            f"M4: workspace root declaring strict must show 'strict'; "
             f"output:\n{out}"
         )
         # Make sure it's on the policy line specifically.
@@ -522,6 +517,188 @@ class TestShowIndexTrustWorkspacePolicy:
         assert "strict" in policy_line, (
             f"M4: 'strict' must be on the policy: line; policy line={policy_line!r}"
         )
+
+    def test_workspace_root_declares_nothing_shown_as_warn_default(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Workspace root with no index-trust node → show reports 'warn' (default)."""
+        project_dir = tmp_path / "ws"
+        project_dir.mkdir()
+        (project_dir / "milpa.kdl").write_text(
+            'workspace {\n    member "sub"\n}\n',
+            encoding="utf-8",
+        )
+        sub = project_dir / "sub"
+        sub.mkdir()
+        (sub / "milpa.kdl").write_text('name "sub"\nkind "library"\n', encoding="utf-8")
+
+        from milpa.cli import cmd_show_index_trust
+        ret = cmd_show_index_trust(project_dir)
+        assert ret == 0
+        policy_line = next(
+            (l for l in capsys.readouterr().out.splitlines() if l.startswith("policy:")),
+            "",
+        )
+        assert "warn" in policy_line
+
+    def test_workspace_root_signer_and_bundle_resolve_from_root(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Root-declared index-trust-signer/-bundle (not just policy) reach the SSOT
+        resolution — the gate reads them straight off the root, no member merge.
+
+        Closes a coverage Low: prior tests exercised only the workspace-root
+        *policy*; signer/bundle share the same root-authority read path.
+        """
+        from milpa.cli import _load_manifest_trust_fields
+
+        project_dir = tmp_path / "ws"
+        project_dir.mkdir()
+        (project_dir / "milpa.kdl").write_text(
+            'index-trust "strict"\n'
+            'index-trust-signer "https://example.test/signer@refs/heads/main"\n'
+            'index-trust-bundle "file:///tmp/custom-root.json"\n'
+            'workspace {\n    member "sub"\n}\n',
+            encoding="utf-8",
+        )
+        sub = project_dir / "sub"
+        sub.mkdir()
+        (sub / "milpa.kdl").write_text('name "sub"\nkind "library"\n', encoding="utf-8")
+
+        policy, signer, bundle = _load_manifest_trust_fields(project_dir)
+        assert policy == "strict"
+        assert signer == "https://example.test/signer@refs/heads/main"
+        assert bundle == "file:///tmp/custom-root.json"
+
+
+# ---------------------------------------------------------------------------
+# TestShowIndexTrustMemberIllegalDeclaration — RD-M1
+# ---------------------------------------------------------------------------
+
+
+class TestShowIndexTrustMemberIllegalDeclaration:
+    """RD-M1: ``show --index-trust`` must NOT swallow ``WS-INDEX-TRUST-ON-MEMBER``.
+
+    Pre-fix: ``_load_manifest_trust_fields`` wrapped its ENTIRE body (including
+    ``find_workspace_root``) in a bare ``except (OSError, MilpaError): pass``, so a
+    member illegally declaring index-trust fell back to the ``("warn", None, None)``
+    default instead of propagating the validation error. That contradicted the
+    command's own SSOT claim: "always displays the policy the gate would enforce"
+    — the gate (``_build_index_trust`` → ``fetch``/``lock``) raises
+    ``WS-INDEX-TRUST-ON-MEMBER`` for this exact workspace, but ``show`` reported
+    ``policy: warn`` and exit 0.
+    """
+
+    def test_member_illegal_declaration_propagates(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Member declaring index-trust "warn" → show raises WS-INDEX-TRUST-ON-MEMBER.
+
+        Must NOT silently fall back to policy: warn / exit 0 — that would
+        contradict what the enforcement gate (fetch/lock) actually does.
+        """
+        from milpa.errors import WS_INDEX_TRUST_ON_MEMBER
+
+        project_dir = tmp_path / "ws"
+        project_dir.mkdir()
+        (project_dir / "milpa.kdl").write_text(
+            'workspace {\n    member "sub"\n}\n',
+            encoding="utf-8",
+        )
+        sub = project_dir / "sub"
+        sub.mkdir()
+        # ILLEGAL: a workspace member declaring index-trust at all.
+        (sub / "milpa.kdl").write_text(
+            'name "sub"\nkind "library"\nindex-trust "warn"\n',
+            encoding="utf-8",
+        )
+
+        from milpa.cli import cmd_show_index_trust
+        with pytest.raises(MilpaError) as exc_info:
+            cmd_show_index_trust(project_dir)
+        assert exc_info.value.slug == WS_INDEX_TRUST_ON_MEMBER, (
+            "RD-M1: show --index-trust must surface WS-INDEX-TRUST-ON-MEMBER, "
+            f"not silently default; got slug={exc_info.value.slug!r}"
+        )
+
+    def test_verify_member_illegal_declaration_propagates(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """RD-H1: ``verify`` must surface WS-INDEX-TRUST-ON-MEMBER, not swallow it.
+
+        ``cmd_verify`` resolves the workspace before the lockfile/disk-state
+        check, so a member illegally declaring index-trust must hard-fail here
+        rather than silently proceeding to a LOCK-GRAPH-MISMATCH / success.
+        Mirrors the Rust binary test
+        ``verify_at_workspace_root_propagates_ws_index_trust_on_member``.
+        """
+        from milpa.errors import WS_INDEX_TRUST_ON_MEMBER
+
+        project_dir = tmp_path / "ws"
+        project_dir.mkdir()
+        (project_dir / "milpa.kdl").write_text(
+            'workspace {\n    member "sub"\n}\n',
+            encoding="utf-8",
+        )
+        sub = project_dir / "sub"
+        sub.mkdir()
+        # ILLEGAL: a workspace member declaring index-trust at all.
+        (sub / "milpa.kdl").write_text(
+            'name "sub"\nkind "library"\nindex-trust "strict"\n',
+            encoding="utf-8",
+        )
+
+        from milpa.cli import cmd_verify
+        with pytest.raises(MilpaError) as exc_info:
+            cmd_verify(project_dir)
+        assert exc_info.value.slug == WS_INDEX_TRUST_ON_MEMBER, (
+            "RD-H1: verify must surface WS-INDEX-TRUST-ON-MEMBER, not swallow it; "
+            f"got slug={exc_info.value.slug!r}"
+        )
+
+    def test_standalone_package_no_workspace_still_shows_own_policy(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A standalone (non-workspace) package must still show its own policy fine."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        _write_project(project_dir, _MINIMAL_MILPA_KDL + 'index-trust "strict"\n')
+
+        from milpa.cli import cmd_show_index_trust
+        ret = cmd_show_index_trust(project_dir)
+        assert ret == 0
+        policy_line = next(
+            (l for l in capsys.readouterr().out.splitlines() if l.startswith("policy:")),
+            "",
+        )
+        assert "strict" in policy_line, (
+            f"RD-M1: standalone package must show its declared policy; got {policy_line!r}"
+        )
+
+    def test_no_manifest_at_all_degrades_gracefully(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Genuinely no manifest / not in a project → still degrades to warn, no crash."""
+        empty_dir = tmp_path / "empty"
+        empty_dir.mkdir()
+
+        from milpa.cli import cmd_show_index_trust
+        ret = cmd_show_index_trust(empty_dir)
+        assert ret == 0
+        policy_line = next(
+            (l for l in capsys.readouterr().out.splitlines() if l.startswith("policy:")),
+            "",
+        )
+        assert "warn" in policy_line
 
 
 # ---------------------------------------------------------------------------

@@ -231,8 +231,23 @@ def valid_dep_name(s: str) -> bool:
 _PREDICATE_PROPS: frozenset[str] = frozenset({"platform", "arch", "nim", "milpa", "flag"})
 
 # Top-level nodes permitted in a workspace manifest.
+# S5 redesign (RFC registry-trust-federation §6.4a root-authority model):
+# index-trust / index-trust-signer / index-trust-bundle are legal on a
+# workspace ROOT manifest — the registry index is a process-global,
+# workspace-shared resource, so index-trust is a property of the resolution
+# root, not of each member.  These three nodes are neither 'deps' nor 'kind',
+# so permitting them does not loosen the deps/kind rejection.
 _WORKSPACE_TOP_LEVEL: frozenset[str] = frozenset(
-    {"workspace", "name", "overrides", "spec-version", "flags"}
+    {
+        "workspace",
+        "name",
+        "overrides",
+        "spec-version",
+        "flags",
+        "index-trust",
+        "index-trust-signer",
+        "index-trust-bundle",
+    }
 )
 
 
@@ -528,6 +543,12 @@ class Manifest:
     """Expected SubjectAltName override from ``index-trust-signer`` node (RFC §3.2)."""
     index_trust_bundle: str | None = None
     """Trust-root override (``file://`` path) from ``index-trust-bundle`` node (RFC §3.2)."""
+    index_trust_policy_explicit: bool = False
+    """``True`` iff the source declared an ``index-trust`` node (absent-stays-absent
+    rule, mirrors ``spec_version_explicit``).  Needed because ``'warn'`` is both the
+    default AND a legal explicit value: a workspace MEMBER manifest that explicitly
+    declares ``index-trust "warn"`` must still raise ``WS-INDEX-TRUST-ON-MEMBER``
+    (RFC registry-trust-federation §6.4a) even though the value matches the default."""
 
 
 @dataclass(frozen=True)
@@ -541,12 +562,32 @@ class WorkspaceManifest:
     S11 (RFC #23 §3.8): workspace root may carry a ``flags {}`` block whose
     default-true activations apply workspace-wide.  Reuses ``FlagDecl`` — no
     parallel flag type.
+
+    S5 redesign (RFC registry-trust-federation §6.4a root-authority model):
+    the workspace root is the resolution root for index-trust purposes, so
+    it — and ONLY it — may declare ``index-trust`` / ``index-trust-signer`` /
+    ``index-trust-bundle``.  A member manifest declaring any of these three
+    raises ``WS-INDEX-TRUST-ON-MEMBER`` at workspace-load time
+    (``workspace.py``, not this module).
     """
 
     members: tuple[str, ...]
     overrides: tuple[Override, ...] = ()
     name: str | None = None
     flags: tuple["FlagDecl", ...] = ()  # S11: workspace-root flags (§3.8)
+    # S5 (RFC registry-trust-federation §6.4a): whole-index attestation gate,
+    # declared ONLY on the resolution root.
+    index_trust_policy: TrustPolicy = "warn"
+    """Effective index-trust policy for the whole workspace; defaults to ``'warn'``."""
+    index_trust_signer: str | None = None
+    """Expected SubjectAltName override from ``index-trust-signer`` node."""
+    index_trust_bundle: str | None = None
+    """Trust-root override (``file://`` path) from ``index-trust-bundle`` node."""
+    index_trust_policy_explicit: bool = False
+    """``True`` iff the source declared an ``index-trust`` node (absent-stays-absent
+    rule, mirrors ``Manifest.index_trust_policy_explicit``). Needed so the
+    serializer only emits ``index-trust`` when it was actually declared — never
+    a spurious default ``"warn"`` that wasn't in the source."""
 
 
 # ---------------------------------------------------------------------------
@@ -883,6 +924,51 @@ def _desugar_optional_deps(
     return new_deps, new_dev_deps, new_flags, frozenset(injected_flag_names)
 
 
+# ---------------------------------------------------------------------------
+# Shared index-trust node parsers (SSOT — used by both the package-manifest
+# parser and the workspace-root parser; RFC registry-trust-federation §6.4a)
+# ---------------------------------------------------------------------------
+
+
+def _parse_index_trust_node(n: "KdlNode") -> TrustPolicy:
+    """Parse an ``index-trust "<policy>"`` node into a ``TrustPolicy``."""
+    raw_args = node_args(n)
+    if len(raw_args) != 1 or not isinstance(raw_args[0], str):
+        raise MilpaError(
+            MAN_UNKNOWN_TOP_LEVEL,
+            "'index-trust' takes exactly one string argument "
+            "('warn', 'strict', or 'off')",
+            node="index-trust",
+        )
+    return _parse_trust_policy(raw_args[0], node="index-trust")
+
+
+def _parse_index_trust_signer_node(n: "KdlNode") -> str:
+    """Parse an ``index-trust-signer "<identity>"`` node into its raw string."""
+    raw_args = node_args(n)
+    if len(raw_args) != 1 or not isinstance(raw_args[0], str):
+        raise MilpaError(
+            MAN_UNKNOWN_TOP_LEVEL,
+            "'index-trust-signer' takes exactly one string argument "
+            "(expected SubjectAltName / OIDC workflow URL)",
+            node="index-trust-signer",
+        )
+    return raw_args[0]
+
+
+def _parse_index_trust_bundle_node(n: "KdlNode") -> str:
+    """Parse an ``index-trust-bundle "<file://path>"`` node into its raw string."""
+    raw_args = node_args(n)
+    if len(raw_args) != 1 or not isinstance(raw_args[0], str):
+        raise MilpaError(
+            MAN_UNKNOWN_TOP_LEVEL,
+            "'index-trust-bundle' takes exactly one string argument "
+            "(a file:// path to an alternate trust root bundle)",
+            node="index-trust-bundle",
+        )
+    return raw_args[0]
+
+
 def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
     deps: list[Dep] = []
     dev_deps: list[Dep] = []
@@ -900,6 +986,7 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
     index_trust_policy: TrustPolicy = "warn"
     index_trust_signer: str | None = None
     index_trust_bundle: str | None = None
+    index_trust_policy_explicit: bool = False
     seen_top_level: set[str] = set()
 
     for n in nodes(doc):
@@ -1028,40 +1115,17 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
 
         elif nm == "index-trust":
             # S5: whole-index attestation gate policy (RFC §6.4).
-            raw_args = node_args(n)
-            if len(raw_args) != 1 or not isinstance(raw_args[0], str):
-                raise MilpaError(
-                    MAN_UNKNOWN_TOP_LEVEL,
-                    "'index-trust' takes exactly one string argument "
-                    "('warn', 'strict', or 'off')",
-                    node="index-trust",
-                )
-            index_trust_policy = _parse_trust_policy(raw_args[0], node="index-trust")
+            index_trust_policy = _parse_index_trust_node(n)
+            index_trust_policy_explicit = True
 
         elif nm == "index-trust-signer":
             # S5: expected SubjectAltName override (RFC §3.2, §6.4).
-            raw_args = node_args(n)
-            if len(raw_args) != 1 or not isinstance(raw_args[0], str):
-                raise MilpaError(
-                    MAN_UNKNOWN_TOP_LEVEL,
-                    "'index-trust-signer' takes exactly one string argument "
-                    "(expected SubjectAltName / OIDC workflow URL)",
-                    node="index-trust-signer",
-                )
-            index_trust_signer = raw_args[0]
+            index_trust_signer = _parse_index_trust_signer_node(n)
 
         elif nm == "index-trust-bundle":
             # S5: trust-root override — a file:// path to a custom Fulcio CA +
             # Rekor key bundle (RFC §3.2, §6.4).
-            raw_args = node_args(n)
-            if len(raw_args) != 1 or not isinstance(raw_args[0], str):
-                raise MilpaError(
-                    MAN_UNKNOWN_TOP_LEVEL,
-                    "'index-trust-bundle' takes exactly one string argument "
-                    "(a file:// path to an alternate trust root bundle)",
-                    node="index-trust-bundle",
-                )
-            index_trust_bundle = raw_args[0]
+            index_trust_bundle = _parse_index_trust_bundle_node(n)
 
         elif nm == "flags":
             flags = _parse_flags_block(n)
@@ -1133,6 +1197,7 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
         index_trust_policy=index_trust_policy,
         index_trust_signer=index_trust_signer,
         index_trust_bundle=index_trust_bundle,
+        index_trust_policy_explicit=index_trust_policy_explicit,
     )
 
 
@@ -1165,6 +1230,13 @@ def _parse_workspace_doc(doc: KdlDocument) -> WorkspaceManifest:
     overrides: list[Override] = []
     ws_name: str | None = None
     ws_flags: list[FlagDecl] = []
+    # S5 (RFC registry-trust-federation §6.4a): index-trust is a root-authority
+    # field — legal ONLY on the workspace root (this function).  Members that
+    # declare it raise WS-INDEX-TRUST-ON-MEMBER in workspace.py at load time.
+    ws_index_trust_policy: TrustPolicy = "warn"
+    ws_index_trust_signer: str | None = None
+    ws_index_trust_bundle: str | None = None
+    ws_index_trust_policy_explicit: bool = False
 
     for n in nodes(doc):
         nm = node_name(n)
@@ -1237,11 +1309,26 @@ def _parse_workspace_doc(doc: KdlDocument) -> WorkspaceManifest:
             # Reuses _parse_flags_block (SSOT).
             ws_flags = _parse_flags_block(n)
 
+        elif nm == "index-trust":
+            # S5 (RFC registry-trust-federation §6.4a): root-authority policy.
+            ws_index_trust_policy = _parse_index_trust_node(n)
+            ws_index_trust_policy_explicit = True
+
+        elif nm == "index-trust-signer":
+            ws_index_trust_signer = _parse_index_trust_signer_node(n)
+
+        elif nm == "index-trust-bundle":
+            ws_index_trust_bundle = _parse_index_trust_bundle_node(n)
+
     return WorkspaceManifest(
         members=tuple(members),
         overrides=tuple(overrides),
         name=ws_name,
         flags=tuple(ws_flags),  # S11
+        index_trust_policy=ws_index_trust_policy,
+        index_trust_signer=ws_index_trust_signer,
+        index_trust_bundle=ws_index_trust_bundle,
+        index_trust_policy_explicit=ws_index_trust_policy_explicit,
     )
 
 
@@ -2717,6 +2804,26 @@ def format_manifest(manifest: Manifest) -> str:
         lines.append("}")
         lines.append("")
 
+    # index-trust / index-trust-signer / index-trust-bundle (S5, RFC
+    # registry-trust-federation §6.4a). Only emit "index-trust" when the
+    # source explicitly declared it (absent-stays-absent — "warn" is both the
+    # default AND a legal explicit value, so the explicit bit is load-bearing:
+    # a spurious emitted default would turn a workspace MEMBER manifest
+    # illegal on re-parse, WS-INDEX-TRUST-ON-MEMBER). signer/bundle are
+    # emitted whenever present, independent of the policy explicit bit.
+    if manifest.index_trust_policy_explicit:
+        lines.append(f'index-trust "{_kdl_str(manifest.index_trust_policy)}"')
+    if manifest.index_trust_signer is not None:
+        lines.append(f'index-trust-signer "{_kdl_str(manifest.index_trust_signer)}"')
+    if manifest.index_trust_bundle is not None:
+        lines.append(f'index-trust-bundle "{_kdl_str(manifest.index_trust_bundle)}"')
+    if (
+        manifest.index_trust_policy_explicit
+        or manifest.index_trust_signer is not None
+        or manifest.index_trust_bundle is not None
+    ):
+        lines.append("")
+
     # kind — always last (Rust canonical ordering)
     lines.append(f'kind "{_kdl_str(manifest.kind)}"')
 
@@ -2832,6 +2939,23 @@ def format_workspace_manifest(ws: "WorkspaceManifest") -> str:
                     lines.append(f"        conflicts {conflicts_args}")
                 lines.append("    }")
         lines.append("}")
+        lines.append("")
+
+    # index-trust / index-trust-signer / index-trust-bundle (S5, RFC
+    # registry-trust-federation §6.4a — root-authority policy). Only emit
+    # "index-trust" when the source explicitly declared it (absent-stays-
+    # absent — see format_manifest for why the explicit bit is load-bearing).
+    if ws.index_trust_policy_explicit:
+        lines.append(f'index-trust "{_kdl_str(ws.index_trust_policy)}"')
+    if ws.index_trust_signer is not None:
+        lines.append(f'index-trust-signer "{_kdl_str(ws.index_trust_signer)}"')
+    if ws.index_trust_bundle is not None:
+        lines.append(f'index-trust-bundle "{_kdl_str(ws.index_trust_bundle)}"')
+    if (
+        ws.index_trust_policy_explicit
+        or ws.index_trust_signer is not None
+        or ws.index_trust_bundle is not None
+    ):
         lines.append("")
 
     # Strip any trailing blank line so the file ends after the last block.
