@@ -772,3 +772,68 @@ class TestTrustBundleEnvVar:
         # Must NOT raise — file:// path is accepted.
         result_env = _load_index_for_verb(env, project_dir)
         assert result_env.index is not None, "file:// bundle path must be accepted"
+
+
+# ---------------------------------------------------------------------------
+# Sv — `milpa verify` reverifies the CACHED index bundle offline
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyReverifiesCachedBundle:
+    """Sv (rfc-attestation-verifier): `milpa verify` re-verifies the cached
+    ``index.kdl.bundle`` offline via the real verifier seam. A failing cached
+    bundle fails verify under strict; a trusted one does not block it. No network."""
+
+    @staticmethod
+    def _seed_cache_and_project(tmp_path, monkeypatch, mock_result: str) -> Path:
+        from milpa.index_cache import _bundle_path, _default_cache_dir, cache_path_for
+
+        cache_home = tmp_path / "cache"
+        monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
+        # Mock seam is honored for file:// index URLs only.
+        index_url = "file:///nonexistent/tianguis/index.kdl"
+        monkeypatch.setenv("MILPA_INDEX_URL", index_url)
+        monkeypatch.setenv("MILPA_INDEX_TRUST", "strict")
+        monkeypatch.setenv("MILPA_INDEX_TRUST_MOCK_VERIFIER", mock_result)
+
+        # Seed the on-disk cache with an index + bundle. Contents are irrelevant:
+        # MockVerifier returns ``mock_result`` regardless — the point is that verify
+        # READS the cached files and routes them through the verifier (never fetches).
+        cache_file = cache_path_for(index_url, _default_cache_dir())
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_bytes(b'name "tianguis-index"\n')
+        _bundle_path(cache_file).write_bytes(b'{"mediaType":"application/vnd.dev.sigstore.bundle.v0.3+json"}')
+
+        # Minimal project: a parseable lockfile + an (empty) _deps dir is enough to
+        # reach the reverify step, which runs right after the lockfile loads.
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        (proj / "milpa.kdl").write_text('name "x"\nkind "application"\n', encoding="utf-8")
+        (proj / "milpa.lock").write_text('version 1\nstrategy "maxver"\n', encoding="utf-8")
+        (proj / "_deps").mkdir()
+        return proj
+
+    def test_verify_fails_on_invalid_cached_bundle_offline(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from milpa.cli import cmd_verify
+
+        proj = self._seed_cache_and_project(tmp_path, monkeypatch, "sig-invalid")
+        rc = cmd_verify(proj, _make_minimal_env())
+        err = capsys.readouterr().err
+        assert rc == 1, f"strict + invalid cached bundle must fail verify; stderr:\n{err}"
+        assert "TNG-INDEX-SIGNATURE-INVALID" in err, f"expected slug in stderr:\n{err}"
+
+    def test_verify_does_not_block_on_trusted_cached_bundle(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from milpa.cli import cmd_verify
+
+        proj = self._seed_cache_and_project(tmp_path, monkeypatch, "trusted")
+        rc = cmd_verify(proj, _make_minimal_env())
+        err = capsys.readouterr().err
+        # Trusted cached bundle → reverify passes; verify proceeds (0 deps → success).
+        assert rc == 0, f"trusted cached bundle must not block verify; stderr:\n{err}"
+        assert "TNG-INDEX-" not in err, f"no trust slug expected on a trusted bundle:\n{err}"

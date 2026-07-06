@@ -4,7 +4,7 @@
 //! `std::process::Command`.  Env vars are set per-Command; no global state is
 //! mutated, so the tests are serial-safe and can run in any order.
 //!
-//! ITEM 1 — six dispatch scenarios:
+//! ITEM 1 — five dispatch scenarios (all via the MockVerifier seam):
 //!
 //!   (1) manifest `index-trust "strict"` + mock sig-invalid
 //!       → exit 1, TNG-INDEX-SIGNATURE-INVALID
@@ -17,8 +17,10 @@
 //!   (5) `--require-attested-index` + manifest warn + mock sig-invalid
 //!       → exit 1, TNG-INDEX-SIGNATURE-INVALID
 //!       (THE dead-flags regression: flag must be threaded to maybe_index)
-//!   (6) manifest strict + no mock seam
-//!       → exit 1, TNG-INDEX-VERIFY-UNSUPPORTED (not a panic / exit 101)
+//!
+//! (The old scenario 6 — strict + no seam → TNG-INDEX-VERIFY-UNSUPPORTED — is gone: S4a
+//! removed that stopgap. The real "strict really fails on a bad bundle end-to-end" test
+//! lands in S4b once S5 provides a fixture bundle to fail on.)
 //!
 //! ITEM 2 — bundle-URL override regression:
 //!
@@ -311,46 +313,9 @@ fn require_attested_index_flag_escalates_warn_to_strict() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Scenario 6: manifest strict + no mock seam → TNG-INDEX-VERIFY-UNSUPPORTED (not panic 101)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn strict_no_mock_seam_returns_verify_unsupported_not_panic() {
-    // With no MILPA_INDEX_TRUST_MOCK_VERIFIER set, maybe_index reaches the
-    // "no seam" branch and fails closed with TNG-INDEX-VERIFY-UNSUPPORTED.
-    // The error must be a clean exit 1, not a panic (exit 101).
-    let tmp = tempfile::TempDir::new().unwrap();
-    let proj = tmp.path().join("proj");
-    let cache = tmp.path().join("cache");
-    std::fs::create_dir_all(&proj).unwrap();
-
-    write_manifest(&proj, Some("strict"));
-    // Error fires before any fetch attempt — MILPA_INDEX_URL value doesn't matter.
-    // We set a nonexistent one to avoid accidentally hitting the production URL.
-    // No MILPA_INDEX_TRUST_MOCK_VERIFIER: intentional.
-
-    let (code, stderr) = run_fetch(
-        &proj,
-        &cache,
-        &[("MILPA_INDEX_URL", "file:///nonexistent-milpa-test-strict-no-seam.kdl")],
-        &[],
-    );
-
-    assert_ne!(
-        code, 0,
-        "strict + no seam must fail; got exit 0\nstderr:\n{stderr}"
-    );
-    assert_ne!(
-        code, 101,
-        "TNG-INDEX-VERIFY-UNSUPPORTED must be a clean error, not a panic (exit 101)\n\
-         stderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("TNG-INDEX-VERIFY-UNSUPPORTED"),
-        "stderr must contain TNG-INDEX-VERIFY-UNSUPPORTED\nstderr:\n{stderr}"
-    );
-}
+// Scenario 6 (strict + no seam → TNG-INDEX-VERIFY-UNSUPPORTED) was removed in S4a along
+// with the stopgap it asserted. The real end-to-end "strict fails on a bad bundle" test
+// lands in S4b, once S5 supplies a fixture bundle to fail on.
 
 // ---------------------------------------------------------------------------
 // Scenario 7 (ITEM 2): MILPA_INDEX_BUNDLE_URL override is used by bundle transport

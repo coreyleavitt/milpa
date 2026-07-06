@@ -254,11 +254,6 @@ impl CoreError {
             "TNG-INDEX-DIGEST-MISMATCH",
             "TNG-INDEX-SIGNER-MISMATCH",
             "TNG-INDEX-BUNDLE-STALE",
-            // S4b placeholder: strict policy + no functional verifier → fail closed.
-            // Raised by maybe_index in the Rust CLI when effective policy = Strict and
-            // MILPA_INDEX_TRUST_MOCK_VERIFIER is not set (no test seam active).
-            // Complements the Python impl's same-named code under identical conditions.
-            "TNG-INDEX-VERIFY-UNSUPPORTED",
             // S8: workspace index-trust root-authority validation (RFC §6.4a,
             // spec §3.4.7). Emitted by check_member_index_trust_declarations in
             // workspace.rs when a workspace MEMBER declares index-trust /

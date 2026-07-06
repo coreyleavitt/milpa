@@ -18,24 +18,64 @@ lzma-rs = "0.3"
 tar = "0.4"
 # deps-rationale: used in index_trust.rs for Sigstore bundle JSON parsing (integratedTime
 # extraction, bundle structure validation) without hand-rolling a parser. Also used by the
-# S4b SigstoreVerifier retrofit once DSSE/in-toto support lands in sigstore-rs.
+# SigstoreVerifier inclusion adapter (rekor_adapter.rs) to reshape already-parsed protocol
+# data — see rfc-attestation-verifier §5.1.
 serde_json = "1"
 # deps-rationale: Sigstore bundle verification MUST NOT be hand-rolled and shelling out
 # to `cosign` at resolve time is unacceptable (adds an external binary dep, shell-injection
 # surface, conformance test friction). The `sigstore` crate is the Sigstore project's own
 # Rust library; it is a deliberate, justified exception to milpa's dep-light posture.
-# RFC: rfc-registry-trust-federation §5.3.
+# RFC: rfc-registry-trust-federation §5.3; rfc-attestation-verifier §4/§5.1.
 #
-# S4 spike verdict: INSUFFICIENT — sigstore 0.11.0 does NOT support DSSE/in-toto
-# attestation bundles (BundleErrorKind::DsseUnsupported).
-# S4b mini-spike (low-level primitives) verdict: NOT VIABLE — two blocking gaps:
-#   (1) CertificatePool (cert chain at integratedTime) is pub(crate) only.
-#   (2) Rekor SET / inclusion proof verification is TODO (sigstore-rs#285) — not
-#       implemented even for the MessageSignature path.
-# S4b is DEFERRED pending upstream sigstore-rs fixing both gaps. The crate is retained
-# here as the planned dep; SigstoreVerifier is a placeholder. Retry S4b when sigstore-rs
-# ships DSSE support + Rekor SET verification (sigstore-rs#285).
-sigstore = "0.11"
+# S4/S4b spike history: sigstore 0.11.0 was INSUFFICIENT (no DSSE support; Rekor
+# inclusion = TODO sigstore-rs#285; CertificatePool pub(crate)). sigstore 0.14.0 changes
+# the verdict to VIABLE: DSSE bundle arm exists, the high-level Verifier does cert
+# validation internally, and a public offline inclusion primitive
+# (rekor::models::InclusionProof::verify) landed via sigstore-rs#285. milpa wires that
+# primitive itself (rekor_adapter.rs) because the crate's own step-5 is still a TODO
+# (verifier.rs:198). rfc-attestation-verifier §4.
+#
+# Pinned EXACT (=0.14.0): the inclusion adapter destructures the crate's protobuf bundle
+# shapes, so a silent minor bump could break it (rfc-attestation-verifier S1).
+#
+# Feature set is explicit + minimal — default-features=false drops `full` (incl.
+# `sigstore-trust-root`, `cosign`, `sign`, `mock-client`, `cached-client`) and `native-tls`:
+#   - `verify` — the high-level bundle Verifier (cert + DSSE + signature). Also unlocks
+#     `sigstore::bundle` (gated on any(sign, verify)). Transitively requires `cert`,
+#     `fulcio`, `rekor`, `sigstore_protobuf_specs`. NOTE: the crate's feature graph
+#     hard-requires `fulcio` (→ reqwest/webbrowser/openidconnect) from `verify`; milpa
+#     never calls those online paths (offline-only) — inert compile-time weight that
+#     cannot be excised without patching upstream. reqwest is pulled default-features=false
+#     with no TLS backend (native-tls dropped), which compiles because milpa makes no HTTPS
+#     call through it.
+#   - `rekor` — listed explicitly (already implied by `verify`) because the S2 inclusion
+#     adapter targets sigstore::rekor::models::{InclusionProof, checkpoint::SignedCheckpoint},
+#     which live behind #[cfg(feature = "rekor")] (lib.rs:268).
+# Deliberately NOT enabled: `sigstore-trust-root` (pulls tough+futures+async-trait for
+#   online TUF fetch — milpa hand-writes a ManualTrustRoot mapper instead, rfc S1.5).
+# New transitive: `tokio` (feature "rt") — the bundle verifier is async; blocking::Verifier
+#   builds its own current-thread runtime per instance. milpa has no other async context, so
+#   there is no nested-runtime panic risk.
+sigstore = { version = "=0.14.0", default-features = false, features = ["verify", "rekor"] }
+# deps-rationale: sigstore::bundle re-exports only `Bundle`, not `TransparencyLogEntry` /
+# protobuf `InclusionProof` / `Checkpoint`, which the S2 inclusion adapter must destructure.
+# Hard-pinned to the exact version sigstore 0.14.0 resolves (upstream pins caret "0.5";
+# milpa is more conservative — it pins the exact patch). rfc-attestation-verifier S1.
+sigstore_protobuf_specs = { version = "=0.5.1", default-features = false }
+# deps-rationale: the S1.5 trust-root mapper (trust_root.rs) builds a
+# `sigstore::trust::ManualTrustRoot`, whose fields are `Vec<CertificateDer>` (pki-types) and
+# rekor/ctfe key maps keyed by `hex::encode(log_id.key_id)` (§4 Rekor-key-lookup contract).
+# Both unify with sigstore 0.14.0's own transitive versions (rustls-pki-types 1.15.0, hex
+# 0.4.3), so the `CertificateDer` newtype is the SAME type sigstore's Verifier consumes.
+# rfc-attestation-verifier S1.5.
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+rustls-pki-types = { version = "1", default-features = false, features = ["alloc"] }
+# deps-rationale: S2's SAN policy wraps sigstore's `Identity` policy in a recording wrapper
+# (to split SignerMismatch from SigInvalid, mirroring the Python `_RecordingPolicy`). The
+# `VerificationPolicy` trait method is `verify(&self, cert: &x509_cert::Certificate)`, so
+# milpa must name that type. Unifies with sigstore 0.14.0's transitive x509-cert 0.2.5.
+# rfc-attestation-verifier S2.
+x509-cert = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

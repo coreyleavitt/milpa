@@ -251,6 +251,56 @@ fn verify_and_enforce(
     enforce_index_trust(result, policy, index_url)
 }
 
+/// Re-verify the ALREADY-CACHED index attestation bundle, fully offline (Sv,
+/// `rfc-attestation-verifier`).
+///
+/// Reads the on-disk cached `index.kdl` + `index.kdl.bundle` and re-runs bundle
+/// verification + policy enforcement with freshness DISABLED (`is_network_fetch =
+/// false`) — the offline post-incident audit path `milpa verify` provides (Part-1
+/// §7.5). It **never** touches the network and does **not** go through the cache
+/// state machine (no fetch, no TTL, no stale-refresh), so it cannot change any
+/// Part-1 cache behavior.
+///
+/// No-op when `config.policy == Off` or when nothing is cached for `url`. A
+/// recorded bundle-404 (`.no-bundle` marker) or an absent sidecar enforces
+/// `BundleMissing`; a present-but-invalid bundle raises the mapped `TNG-INDEX-*`
+/// slug under `Strict` (warns under `Warn`).
+pub fn reverify_cached_index(
+    url: &str,
+    cache_dir: &Path,
+    config: &IndexTrustConfig,
+    verifier: &dyn IndexBundleVerifier,
+) -> Result<(), MilpaError> {
+    if config.policy == TrustPolicy::Off {
+        return Ok(());
+    }
+    let cache_file = cache_path_for(url, cache_dir);
+    if !cache_file.exists() {
+        return Ok(()); // nothing cached to reverify — and we must not fetch here
+    }
+    let index_bytes = std::fs::read(&cache_file).map_err(|e| {
+        MilpaError::Core(CoreError::Tianguis(
+            "MILPA-INTERNAL",
+            format!("could not read cached index {}: {e}", cache_file.display()),
+        ))
+    })?;
+    if no_bundle_marker_path(&cache_file).exists() {
+        return enforce_index_trust(VerificationResult::BundleMissing, &config.policy, url);
+    }
+    match std::fs::read(bundle_path(&cache_file)) {
+        Ok(bundle_bytes) => verify_and_enforce(
+            &index_bytes,
+            &bundle_bytes,
+            config,
+            verifier,
+            &config.policy,
+            url,
+            false,
+        ),
+        Err(_) => enforce_index_trust(VerificationResult::BundleMissing, &config.policy, url),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // load_index — 4-state cache with optional trust gate
 // ---------------------------------------------------------------------------

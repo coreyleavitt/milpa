@@ -468,6 +468,37 @@ fn cmd_verify(
         Err(_) => {}
     }
 
+    // Sv (rfc-attestation-verifier): offline reverify of the CACHED index
+    // attestation bundle — the offline post-incident audit path (Part-1 §7.5).
+    // A tampered/invalid cached bundle fails verify under strict (warns under
+    // warn). Never fetches; independent of the online dep_decl edge check below.
+    {
+        let raw = std::env::var("MILPA_INDEX_URL").ok();
+        let explicit_no_index = raw.as_deref().map(|s| s.trim().is_empty()).unwrap_or(false);
+        if !no_index && !explicit_no_index {
+            let url = milpa_core::index_cache::index_url_from_env();
+            // Same gate assembly as index loading; None ⟹ policy off ⟹ nothing to reverify.
+            if let Some(active) = build_index_trust_gate(
+                &verify_index_policy,
+                verify_index_signer.clone(),
+                verify_index_bundle.clone(),
+                require_attested_index,
+                &url,
+            )? {
+                if let Err(e) = milpa_core::index_cache::reverify_cached_index(
+                    &url,
+                    &index_cache_dir(),
+                    &active.cfg,
+                    active.verifier.as_ref(),
+                ) {
+                    eprintln!("cached index attestation reverify failed: {}", message_of(&e));
+                    eprintln!("milpa-error: {}", e.code());
+                    return Ok(1);
+                }
+            }
+        }
+    }
+
     let deps_dir = dir.join("_deps");
     // Gap-1 D: VERIFY-DEPS-DIR-MISSING — emitted inline (Ok(1) path).
     if !deps_dir.exists() {
@@ -2244,18 +2275,6 @@ fn resolve_index_trust_fields(
     }
 }
 
-// Thread-local dedup flag: emit the TNG-INDEX-VERIFY-UNSUPPORTED warning at most once
-// per invocation regardless of how many index loads happen in the same process.
-thread_local! {
-    static WARNED_VERIFY_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Reset the unsupported-verifier warn dedup flag. **TEST USE ONLY.**
-#[cfg(test)]
-fn _reset_warned_verify_unsupported() {
-    WARNED_VERIFY_UNSUPPORTED.with(|c| c.set(false));
-}
-
 fn maybe_index(
     no_index: bool,
     manifest_policy: &milpa_manifest::TrustPolicy,
@@ -2299,44 +2318,33 @@ fn maybe_index(
     use milpa_core::BundleHttpGet;
     let gate = build_index_trust_gate(manifest_policy, manifest_signer, manifest_bundle, require_attested_index, &url)?;
     match gate {
-        IndexTrustGateOutcome::Ungated => {
-            load_index_raw(&url, &http, now, None, None, None, refresh_index)
-        }
-        IndexTrustGateOutcome::Active { cfg, verifier, bundle_fn } => {
-            load_index_raw(
-                &url,
-                &http,
-                now,
-                Some(&cfg),
-                Some(verifier.as_ref()),
-                Some(bundle_fn.as_ref() as BundleHttpGet<'_>),
-                refresh_index,
-            )
-        }
+        None => load_index_raw(&url, &http, now, None, None, None, refresh_index),
+        Some(active) => load_index_raw(
+            &url,
+            &http,
+            now,
+            Some(&active.cfg),
+            Some(active.verifier.as_ref()),
+            Some(active.bundle_fn.as_ref() as BundleHttpGet<'_>),
+            refresh_index,
+        ),
     }
 }
 
-/// Outcome of trust-gate assembly for one index load.
+/// An active trust gate: config + verifier + bundle transport, assembled for one index load.
 ///
-/// Item 5 (M8): extracted from the inline trust-gate plumbing in `maybe_index`.
-/// `build_index_trust_gate` returns this; `maybe_index` consumes it.
-enum IndexTrustGateOutcome {
-    /// No gate: policy=Off, or Warn+no-seam (warning already emitted).
-    Ungated,
-    /// Gate active: config + verifier + bundle transport assembled.
-    Active {
-        cfg: milpa_core::index_trust::IndexTrustConfig,
-        verifier: Box<dyn milpa_core::index_trust::IndexBundleVerifier>,
-        bundle_fn: Box<dyn Fn(&str) -> Result<Vec<u8>, milpa_core::BundleError>>,
-    },
+/// `build_index_trust_gate` returns `Some(_)` when the policy is Warn/Strict, `None` when
+/// Off. (Before the real verifier landed there was also a "Warn/Strict but no verifier"
+/// degraded state — that is gone; the real [`SigstoreVerifier`] always exists now.)
+struct IndexTrustGateActive {
+    cfg: milpa_core::index_trust::IndexTrustConfig,
+    verifier: Box<dyn milpa_core::index_trust::IndexBundleVerifier>,
+    bundle_fn: Box<dyn Fn(&str) -> Result<Vec<u8>, milpa_core::BundleError>>,
 }
 
-impl std::fmt::Debug for IndexTrustGateOutcome {
+impl std::fmt::Debug for IndexTrustGateActive {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Ungated => write!(f, "IndexTrustGateOutcome::Ungated"),
-            Self::Active { cfg, .. } => write!(f, "IndexTrustGateOutcome::Active {{ cfg: {cfg:?}, .. }}"),
-        }
+        write!(f, "IndexTrustGateActive {{ cfg: {:?}, .. }}", self.cfg)
     }
 }
 
@@ -2348,9 +2356,8 @@ impl std::fmt::Debug for IndexTrustGateOutcome {
 ///   - applies effective_trust_policy(manifest_policy, require_attested_index, env_override).
 ///   - applies env > manifest > default precedence for signer + bundle (Item 2).
 ///   - enforces the file:// guard on MILPA_INDEX_TRUST_MOCK_VERIFIER (spec §8.6.6).
-///   - dispatches: Off → Ungated; mock-seam → Active(MockVerifier);
-///     strict+no-seam → Err(TNG-INDEX-VERIFY-UNSUPPORTED);
-///     warn+no-seam → emit warning once, Ungated.
+///   - dispatches: Off → `None`; mock-seam → `Some(MockVerifier)`; otherwise (Warn/Strict) →
+///     `Some(SigstoreVerifier)` — the real verifier really verifies (RFC attestation-verifier).
 ///
 /// `manifest_signer` / `manifest_bundle` come from the manifest field (or the max-merged
 /// workspace value); they are the middle tier in env > manifest > default.
@@ -2362,26 +2369,25 @@ fn build_index_trust_gate(
     manifest_bundle: Option<String>,
     require_attested_index: bool,
     url: &str,
-) -> Result<IndexTrustGateOutcome, MilpaError> {
-    use milpa_core::index_trust::{IndexTrustConfig, MockVerifier, TrustBundle, DEFAULT_INDEX_SIGNER};
-    use milpa_manifest::TrustPolicy;
+) -> Result<Option<IndexTrustGateActive>, MilpaError> {
     use milpa_core::effective_trust_policy;
+    use milpa_core::index_trust::{
+        IndexBundleVerifier, IndexTrustConfig, MockVerifier, SigstoreVerifier, TrustBundle,
+        VerificationResult, DEFAULT_INDEX_SIGNER,
+    };
+    use milpa_manifest::TrustPolicy;
 
     let env_policy = read_env_index_trust_policy();
     let effective_policy = effective_trust_policy(manifest_policy, require_attested_index, env_policy.as_ref());
 
     // Policy=Off: gate fully disabled.
     if effective_policy == TrustPolicy::Off {
-        return Ok(IndexTrustGateOutcome::Ungated);
+        return Ok(None);
     }
 
-    // Check for mock-verifier seam.
-    // SigstoreVerifier is not yet functional (blocked by sigstore-rs#285 — S4b
-    // deferred; no DSSE + Rekor SET support). Dispatch:
-    // - MILPA_INDEX_TRUST_MOCK_VERIFIER=<wire> → conformance seam (file:// URLs only)
-    // - strict + no seam → fail closed: TNG-INDEX-VERIFY-UNSUPPORTED
-    // - warn  + no seam → emit ONE warning per process, then Ungated
-    // spec/cli-contract.md §8.6.6 CONFORMANCE-INTERNAL seam.
+    // Mock-verifier seam (conformance only): MILPA_INDEX_TRUST_MOCK_VERIFIER=<wire> is honored
+    // ONLY for file:// index URLs (spec §8.6.6). Absent it, the real SigstoreVerifier is used
+    // — both Warn and Strict really verify (RFC attestation-verifier; no more no-seam stopgap).
     let mock_verifier_str = std::env::var("MILPA_INDEX_TRUST_MOCK_VERIFIER")
         .ok()
         .filter(|s| !s.trim().is_empty());
@@ -2400,93 +2406,68 @@ fn build_index_trust_gate(
         )));
     }
 
-    if let Some(ref mock_str) = mock_verifier_str {
-        // Active gate with MockVerifier.
-        let mock_result = milpa_core::index_trust::VerificationResult::from_value(mock_str.trim())
-            .ok_or_else(|| MilpaError::Core(CoreError::Tianguis(
+    // Shared config assembly (both the mock seam and the real verifier use it).
+    // env > manifest > default precedence (Item 2 — mirrors Python _build_index_trust).
+    let signer = std::env::var("MILPA_INDEX_TRUST_SIGNER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or(manifest_signer) // manifest middle tier
+        .unwrap_or_else(|| DEFAULT_INDEX_SIGNER.to_string()); // spec default
+    // spec/cli-contract.md §8.6 NORMATIVE: MILPA_INDEX_TRUST_BUNDLE (or the manifest
+    // `index-trust-bundle` node) MUST be a `file://` URL; non-file:// values are rejected.
+    // A custom trust-root override currently resolves to TrustBundle::production() (the
+    // embedded standard trusted_root.json); wiring a file:// trust-root read is a separate
+    // follow-up, not needed for the public tianguis instance.
+    let raw_bundle = std::env::var("MILPA_INDEX_TRUST_BUNDLE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or(manifest_bundle); // manifest middle tier
+    let trust_bundle = match raw_bundle {
+        Some(ref path) if !path.starts_with("file://") => {
+            return Err(MilpaError::Core(CoreError::Tianguis(
                 "MILPA-INTERNAL",
                 format!(
-                    "MILPA_INDEX_TRUST_MOCK_VERIFIER={mock_str:?} is not a valid \
-                     VerificationResult wire string (expected one of: trusted, sig-invalid, \
-                     digest-mismatch, signer-mismatch, bundle-stale, bundle-missing, \
-                     bundle-malformed). Test seam must never fail-open silently."
+                    "MILPA_INDEX_TRUST_BUNDLE (or index-trust-bundle manifest node) \
+                     must be a file:// URL; got: {path:?}. \
+                     Use file:///abs/path/to/bundle.json (three slashes for an absolute \
+                     path). (spec/cli-contract.md §8.6 NORMATIVE)"
                 ),
-            )))?;
-        // env > manifest > default precedence (Item 2 — mirrors Python _build_index_trust).
-        let signer = std::env::var("MILPA_INDEX_TRUST_SIGNER")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or(manifest_signer) // manifest middle tier
-            .unwrap_or_else(|| DEFAULT_INDEX_SIGNER.to_string()); // spec default
-        // spec/cli-contract.md §8.6 NORMATIVE: MILPA_INDEX_TRUST_BUNDLE (or the
-        // manifest `index-trust-bundle` node) MUST be a `file://` URL.  Non-file://
-        // values MUST be rejected.  (Real bundle loading lands with S4b; until then
-        // a valid file:// value resolves to TrustBundle::production() as a placeholder.)
-        let raw_bundle = std::env::var("MILPA_INDEX_TRUST_BUNDLE")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or(manifest_bundle); // manifest middle tier
-        let trust_bundle = match raw_bundle {
-            Some(ref path) if !path.starts_with("file://") => {
-                return Err(MilpaError::Core(CoreError::Tianguis(
-                    "MILPA-INTERNAL",
-                    format!(
-                        "MILPA_INDEX_TRUST_BUNDLE (or index-trust-bundle manifest node) \
-                         must be a file:// URL; got: {path:?}. \
-                         Use file:///abs/path/to/bundle.json (three slashes for an absolute \
-                         path). (spec/cli-contract.md §8.6 NORMATIVE)"
-                    ),
-                )));
-            }
-            Some(_path) => TrustBundle::production(), // placeholder until S4b (path ignored)
-            None => TrustBundle::production(),
-        };
-        let max_age: Option<u64> = std::env::var("MILPA_INDEX_MAX_AGE")
-            .ok()
-            .and_then(|v| v.trim().parse().ok());
-        let mut cfg = IndexTrustConfig::new(effective_policy, trust_bundle, signer);
-        if let Some(age) = max_age {
-            cfg.max_age_seconds = age;
+            )));
         }
-        return Ok(IndexTrustGateOutcome::Active {
-            cfg,
-            verifier: Box::new(MockVerifier::new(mock_result)),
-            bundle_fn: build_bundle_http_fn(),
-        });
+        Some(_) | None => TrustBundle::production(),
+    };
+    let max_age: Option<u64> = std::env::var("MILPA_INDEX_MAX_AGE")
+        .ok()
+        .and_then(|v| v.trim().parse().ok());
+    let mut cfg = IndexTrustConfig::new(effective_policy, trust_bundle, signer);
+    if let Some(age) = max_age {
+        cfg.max_age_seconds = age;
     }
 
-    // No mock seam: S4b deferred.
-    match effective_policy {
-        TrustPolicy::Strict => {
-            // Fail closed: impl MUST error under strict when verification is unavailable.
-            Err(MilpaError::Core(CoreError::Tianguis(
-                "TNG-INDEX-VERIFY-UNSUPPORTED",
-                format!(
-                    "index-trust strict: Sigstore bundle verification is not yet supported \
-                     by this build (S4b deferred — sigstore-rs#285). \
-                     Remediation: set `index-trust \"warn\"` or `index-trust \"off\"` in \
-                     milpa.kdl, or remove `--require-attested-index` / `MILPA_INDEX_TRUST=strict` \
-                     if those escalated the policy, or use the Python reference implementation. \
-                     (index: {url:?})"
-                ),
-            )))
+    // Verifier: the conformance mock seam, or the real production verifier.
+    let verifier: Box<dyn IndexBundleVerifier> = match mock_verifier_str {
+        Some(mock_str) => {
+            let mock_result = VerificationResult::from_value(mock_str.trim()).ok_or_else(|| {
+                MilpaError::Core(CoreError::Tianguis(
+                    "MILPA-INTERNAL",
+                    format!(
+                        "MILPA_INDEX_TRUST_MOCK_VERIFIER={mock_str:?} is not a valid \
+                         VerificationResult wire string (expected one of: trusted, sig-invalid, \
+                         digest-mismatch, signer-mismatch, bundle-stale, bundle-missing, \
+                         bundle-malformed). Test seam must never fail-open silently."
+                    ),
+                ))
+            })?;
+            Box::new(MockVerifier::new(mock_result))
         }
-        TrustPolicy::Warn => {
-            // Emit at most ONE warning per process invocation, then load without gate.
-            let already_warned = WARNED_VERIFY_UNSUPPORTED.with(|c| c.get());
-            if !already_warned {
-                WARNED_VERIFY_UNSUPPORTED.with(|c| c.set(true));
-                eprintln!(
-                    "milpa: index-trust warning (TNG-INDEX-VERIFY-UNSUPPORTED): \
-                     Sigstore bundle verification is not yet supported by this build \
-                     (S4b deferred). Index trust policy will not be enforced. \
-                     Set index-trust \"off\" to suppress this warning."
-                );
-            }
-            Ok(IndexTrustGateOutcome::Ungated)
-        }
-        TrustPolicy::Off => unreachable!("handled above"),
-    }
+        None => Box::new(SigstoreVerifier),
+    };
+
+    Ok(Some(IndexTrustGateActive {
+        cfg,
+        verifier,
+        bundle_fn: build_bundle_http_fn(),
+    }))
 }
 
 /// Build the curl-based bundle HTTP fetcher closure.
@@ -4002,7 +3983,6 @@ mod tests {
     fn mock_seam_with_file_url_is_honored() {
         // Item 2 (M1): MILPA_INDEX_TRUST_MOCK_VERIFIER set + file:// URL → honored.
         let _guard = ENV_MUTEX.lock().unwrap();
-        _reset_warned_verify_unsupported();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_CACHE_HOME", tmp.path()) };
         // A nonexistent file:// URL → MILPA-INDEX-UNREACHABLE (or Ok(None) via load_index_raw),
@@ -4027,16 +4007,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ITEM 3: SigstoreVerifier stub behavior (S4b deferred)
+    // No-mock-seam path: the real SigstoreVerifier (S4a removed the stopgap)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn maybe_index_strict_no_mock_returns_tng_verify_unsupported() {
-        // strict + no MILPA_INDEX_TRUST_MOCK_VERIFIER → TNG-INDEX-VERIFY-UNSUPPORTED
+    fn maybe_index_strict_no_mock_no_longer_verify_unsupported() {
+        // After S4a: strict + no mock seam goes through the real SigstoreVerifier — the
+        // TNG-INDEX-VERIFY-UNSUPPORTED stopgap is gone. With an unreachable file:// index
+        // there is nothing to verify, so this resolves to Ok(None), NOT a fail-closed error.
+        // (Real strict-fails-on-a-bad-bundle is covered end-to-end in S4b/S5.)
         let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_CACHE_HOME", tmp.path()) };
-        // Use an unreachable URL: should fail before any network activity.
         unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///nonexistent-milpa-strict-test.kdl") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
 
@@ -4045,33 +4027,14 @@ mod tests {
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };
 
-        assert!(result.is_err(), "strict + no mock seam must error, got Ok({result:?})");
-        assert_eq!(
-            result.unwrap_err().code(),
-            "TNG-INDEX-VERIFY-UNSUPPORTED",
-            "expected TNG-INDEX-VERIFY-UNSUPPORTED"
-        );
-    }
-
-    #[test]
-    fn maybe_index_warn_no_mock_returns_ok_and_emits_warning() {
-        // warn + no mock seam → Ok (exit 0), exactly one warning emitted.
-        let _guard = ENV_MUTEX.lock().unwrap();
-        _reset_warned_verify_unsupported();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_CACHE_HOME", tmp.path()) };
-        // Point at a non-existent URL so load_index falls through to Ok(None).
-        unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///nonexistent-milpa-warn-test.kdl") };
-        unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
-
-        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Warn, None, None, false, false);
-
-        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
-        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
-        _reset_warned_verify_unsupported();
-
-        // warn + no seam → exit 0 (not an error).
-        assert!(result.is_ok(), "warn + no mock seam must return Ok, got {result:?}");
+        if let Err(e) = &result {
+            assert_ne!(
+                e.code(),
+                "TNG-INDEX-VERIFY-UNSUPPORTED",
+                "the VERIFY-UNSUPPORTED stopgap must be gone after S4a"
+            );
+        }
+        assert_eq!(result, Ok(None), "unreachable index under strict → Ok(None), got {result:?}");
     }
 
     #[test]
@@ -4236,7 +4199,7 @@ mod tests {
         );
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
         assert!(
-            matches!(gate, Ok(IndexTrustGateOutcome::Active { .. })),
+            matches!(gate, Ok(Some(_))),
             "manifest signer with mock seam must build Active gate: {gate:?}"
         );
     }
@@ -4259,7 +4222,7 @@ mod tests {
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
         // The gate must build successfully (env wins, no error expected).
         assert!(
-            matches!(gate, Ok(IndexTrustGateOutcome::Active { .. })),
+            matches!(gate, Ok(Some(_))),
             "env signer beats manifest signer: gate must be Active, got {gate:?}"
         );
     }
@@ -4280,7 +4243,7 @@ mod tests {
         );
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
         assert!(
-            matches!(gate, Ok(IndexTrustGateOutcome::Active { .. })),
+            matches!(gate, Ok(Some(_))),
             "neither manifest nor env signer → DEFAULT_INDEX_SIGNER, gate Active: {gate:?}"
         );
     }
@@ -4365,7 +4328,7 @@ mod tests {
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
         drop(guard);
         assert!(
-            matches!(result, Ok(IndexTrustGateOutcome::Active { .. })),
+            matches!(result, Ok(Some(_))),
             "file:// bundle URL must be accepted and gate must be Active: {result:?}"
         );
     }
@@ -4378,8 +4341,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn build_trust_gate_off_returns_ungated() {
-        // Policy=Off → Ungated regardless of env; no error.
+    fn build_trust_gate_off_returns_none() {
+        // Policy=Off → None (no gate) regardless of env; no error.
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST") };
@@ -4391,14 +4354,16 @@ mod tests {
             "file:///any",
         );
         assert!(
-            matches!(gate, Ok(IndexTrustGateOutcome::Ungated)),
-            "Off policy must return Ungated, got {gate:?}"
+            matches!(gate, Ok(None)),
+            "Off policy must return None, got {gate:?}"
         );
     }
 
     #[test]
-    fn build_trust_gate_strict_no_seam_returns_tng_error() {
-        // Strict + no seam → Err(TNG-INDEX-VERIFY-UNSUPPORTED).
+    fn build_trust_gate_strict_no_seam_builds_real_gate() {
+        // After S4a: strict + no seam builds an ACTIVE gate with the real SigstoreVerifier
+        // (no more TNG-INDEX-VERIFY-UNSUPPORTED stopgap). Assembly is pure (no I/O), so it
+        // succeeds here; the actual verification happens later in load_index_raw.
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST") };
@@ -4409,19 +4374,18 @@ mod tests {
             false,
             "file:///any",
         );
-        assert!(result.is_err(), "strict + no seam must return Err");
-        assert_eq!(
-            result.unwrap_err().code(),
-            "TNG-INDEX-VERIFY-UNSUPPORTED",
-            "expected TNG-INDEX-VERIFY-UNSUPPORTED"
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "strict + no seam must build an active real-verifier gate, got {result:?}"
         );
     }
 
     #[test]
-    fn build_trust_gate_warn_no_seam_returns_ungated() {
-        // Warn + no seam → warning emitted (stderr), Ungated returned.
+    fn build_trust_gate_warn_no_seam_builds_real_gate() {
+        // After S4a: warn + no seam also builds an active real-verifier gate (it no longer
+        // short-circuits to ungated). Warn vs strict differ only in how a verification
+        // FAILURE is handled downstream, not in whether the gate is assembled.
         let _guard = ENV_MUTEX.lock().unwrap();
-        _reset_warned_verify_unsupported();
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST") };
         let gate = build_index_trust_gate(
@@ -4431,11 +4395,82 @@ mod tests {
             false,
             "file:///any",
         );
-        _reset_warned_verify_unsupported();
         assert!(
-            matches!(gate, Ok(IndexTrustGateOutcome::Ungated)),
-            "Warn + no seam must return Ungated, got {gate:?}"
+            matches!(gate, Ok(Some(_))),
+            "Warn + no seam must build an active gate, got {gate:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sv: `milpa verify` reverifies the CACHED index bundle offline
+    // -----------------------------------------------------------------------
+
+    /// Seed an isolated cache with an index + bundle for `index_url`, and a minimal
+    /// valid project under `root`. Returns the project dir. Caller holds ENV_MUTEX and
+    /// has set XDG_CACHE_HOME + the MILPA_INDEX_* env vars.
+    fn seed_verify_reverify_case(root: &std::path::Path, index_url: &str) -> PathBuf {
+        let cache_file = milpa_core::index_cache::cache_path_for(index_url, &index_cache_dir());
+        std::fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+        std::fs::write(&cache_file, b"name \"tianguis-index\"\n").unwrap();
+        std::fs::write(
+            milpa_core::index_cache::bundle_path(&cache_file),
+            b"{\"mediaType\":\"application/vnd.dev.sigstore.bundle.v0.3+json\"}",
+        )
+        .unwrap();
+
+        let proj = root.join("proj");
+        std::fs::create_dir_all(proj.join("_deps")).unwrap();
+        std::fs::write(proj.join("milpa.kdl"), "name \"x\"\nkind \"application\"\n").unwrap();
+        std::fs::write(proj.join("milpa.lock"), "version 1\nstrategy \"maxver\"\n").unwrap();
+        proj
+    }
+
+    #[test]
+    fn verify_fails_on_invalid_cached_bundle_offline() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let index_url = "file:///nonexistent/tianguis/index.kdl";
+        unsafe { std::env::set_var("XDG_CACHE_HOME", tmp.path()) };
+        unsafe { std::env::set_var("MILPA_INDEX_URL", index_url) };
+        unsafe { std::env::set_var("MILPA_INDEX_TRUST", "strict") };
+        unsafe { std::env::set_var("MILPA_INDEX_TRUST_MOCK_VERIFIER", "sig-invalid") };
+
+        let proj = seed_verify_reverify_case(tmp.path(), index_url);
+        // Minimal-valid project: the ONLY exit-1 condition is the cached-bundle reverify.
+        let result = cmd_verify(&proj, false, false, false, false);
+
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+        unsafe { std::env::remove_var("MILPA_INDEX_TRUST") };
+        unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
+
+        assert_eq!(
+            result,
+            Ok(1),
+            "strict + invalid cached bundle must fail verify offline"
+        );
+    }
+
+    #[test]
+    fn verify_passes_on_trusted_cached_bundle_offline() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let index_url = "file:///nonexistent/tianguis/index.kdl";
+        unsafe { std::env::set_var("XDG_CACHE_HOME", tmp.path()) };
+        unsafe { std::env::set_var("MILPA_INDEX_URL", index_url) };
+        unsafe { std::env::set_var("MILPA_INDEX_TRUST", "strict") };
+        unsafe { std::env::set_var("MILPA_INDEX_TRUST_MOCK_VERIFIER", "trusted") };
+
+        let proj = seed_verify_reverify_case(tmp.path(), index_url);
+        let result = cmd_verify(&proj, false, false, false, false);
+
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+        unsafe { std::env::remove_var("MILPA_INDEX_TRUST") };
+        unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
+
+        // Trusted cached bundle → reverify passes; 0 deps → verify succeeds.
+        assert_eq!(result, Ok(0), "trusted cached bundle must not block verify");
     }
 
     #[test]
@@ -4470,7 +4505,7 @@ mod tests {
         );
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
         assert!(
-            matches!(gate, Ok(IndexTrustGateOutcome::Active { .. })),
+            matches!(gate, Ok(Some(_))),
             "seam on file:// must return Active, got {gate:?}"
         );
     }

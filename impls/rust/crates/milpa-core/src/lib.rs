@@ -31,10 +31,15 @@ pub mod lockfile;
 pub mod manifest_writer;
 pub mod nimcfg;
 pub mod registry;
+// Offline Rekor inclusion adapter (S2). `pub(crate)` API; consumed by `index_trust`'s
+// `SigstoreVerifier`.
+mod rekor_adapter;
 pub mod resolver;
 pub mod safe_extract;
 pub mod source_spec;
 pub mod store;
+// Standard trusted_root.json → ManualTrustRoot mapper (S1.5); consumed by `index_trust`.
+mod trust_root;
 pub mod workspace;
 
 pub use dag_identity::{compute_dag_identity, MaterializedEntry};

@@ -10,74 +10,50 @@
 //! - [`IndexBundleVerifier`] — trait: the injected verifier seam.  Production code passes
 //!   [`SigstoreVerifier`]; test/conformance code passes [`MockVerifier`].
 //! - [`verify_index_bundle`] — pure function; never panics.  Implements spec §3.4.4 steps 1–3
-//!   (JSON parse, integratedTime extract, freshness check) correctly.  Steps 4–7
-//!   (cert chain, signer, digest, Rekor SET) are stubbed; see the S4b DEFERRED note below.
-//! - [`SigstoreVerifier`] — **S4b DEFERRED**: placeholder; always panics with
-//!   `unimplemented!`.  See the S4b note below.
+//!   (JSON parse, integratedTime extract, freshness check) then delegates the real crypto
+//!   (steps 4–6 + offline transparency step 5) to [`verify_crypto`].
+//! - [`SigstoreVerifier`] — the real production verifier (sigstore-rs 0.14).  See the
+//!   verifier note below.
 //! - [`MockVerifier`] — test seam; returns a caller-supplied result, ignoring all inputs.
 //!   This is the S7 conformance corpus seam (`mock_verifier_result` env field).
 //! - [`IndexTrustConfig`] — struct: policy + trust_bundle + expected_signer + max_age.
 //!   Does NOT contain a verifier field — verifier is an explicit param of
 //!   `load_index(url, config, verifier, http_get, bundle_http_get)` (S6).
-//! - [`TrustBundle`] — production (`include_bytes!` over `_trust/trust_bundle.json` PLACEHOLDER)
+//! - [`TrustBundle`] — production (`include_bytes!` over the standard `_trust/trusted_root.json`)
 //!   vs test (`_oracle/test_trust_bundle.json`). Factory methods: [`TrustBundle::production`] /
-//!   [`TrustBundle::test`].
+//!   [`TrustBundle::test`]. [`crate::trust_root::map_trusted_root`] reshapes the bytes into a
+//!   `sigstore::trust::ManualTrustRoot` (S1.5).
 //!
-//! # S4b DEFERRED — SigstoreVerifier is a placeholder; low-level-primitives spike NOT VIABLE
+//! # The real verifier (RFC `rfc-attestation-verifier`, sigstore-rs 0.14)
 //!
-//! ## S4 spike finding (original)
+//! [`SigstoreVerifier`] performs real offline verification. [`verify_crypto`] runs, aborting
+//! on the first failure:
 //!
-//! `sigstore-rs` 0.11.0 does **NOT** support DSSE/in-toto attestation bundles produced by
-//! `cosign attest-blob`:
+//! 1. Parse the bundle **once** into `sigstore::bundle::Bundle`; assert exactly one tlog
+//!    entry (the §4 composition binding threads that same owned entry through both the
+//!    high-level verify and the inclusion adapter — no independent re-parse).
+//! 2. **Digest pre-check** — `sha256(index_bytes)` vs the DSSE in-toto subject digest →
+//!    `DigestMismatch` deterministically, *before* the opaque crate call (§4 error-taxonomy
+//!    fix: the crate collapses digest-mismatch and sig-fail into one unnameable error).
+//! 3. **High-level verify** (`blocking::Verifier::verify_digest`) — cert chain + DSSE +
+//!    signature + SAN/issuer policy (`policy::Identity`, wrapped in a `RecordingPolicy` so a
+//!    policy rejection is `SignerMismatch`, everything else `SigInvalid`).
+//! 4. **Offline transparency** (spec §3.4.4 step 5) — [`crate::rekor_adapter`] verifies the
+//!    Rekor inclusion proof + signed checkpoint against the trust root's Rekor key. This is
+//!    the piece milpa owns temporarily because sigstore-rs's own step 5 is still a TODO
+//!    (`verifier.rs:198`, sigstore-rs#285). The adapter reshapes already-parsed protobuf into
+//!    the crate's public `InclusionProof::verify` — **zero hand-rolled crypto** (§5.1).
 //!
-//! - `BundleErrorKind::DsseUnsupported` is returned for any bundle whose `content` is a DSSE
-//!   envelope (all `cosign attest-blob` output); only `Content::MessageSignature` (hashedrekord)
-//!   is handled.
-//! - Bundle v0.3 format is rejected (`BundleProfileErrorKind::Unknown`).
+//! The Fulcio/CTFE trust material is the standard `trusted_root.json`
+//! ([`TrustBundle::production`]) mapped by [`crate::trust_root::map_trusted_root`].
+//! [`MockVerifier`] remains the conformance-corpus seam (RFC §10.1: the shared corpus tests
+//! the policy state machine, not cryptography).
 //!
-//! ## S4b mini-spike finding (low-level primitives path — NOT VIABLE)
-//!
-//! The recommended S4b path was: parse the DSSE envelope ourselves (pure JSON + byte assembly,
-//! no crypto) and hand the result to sigstore-rs lower-level primitives for the actual
-//! signature / cert-chain / SET verification.
-//!
-//! The spike (sourced from the vendored sigstore 0.11.0 source) found **TWO blocking gaps**
-//! that make this approach NOT VIABLE against sigstore-rs 0.11.0:
-//!
-//! **Gap 1 — `CertificatePool` is `pub(crate)` only.**
-//!   `CertificatePool::verify_cert_with_time` is the primitive that validates the Fulcio leaf
-//!   cert chain against the embedded Fulcio root AT the cert's issuance time (not wall-clock).
-//!   It is declared `pub(crate)` in `crypto/mod.rs` and is inaccessible outside the crate.
-//!   Without it, spec §3.4.4 step 4 (cert chain validation at `integratedTime`) cannot be implemented
-//!   without hand-rolling webpki at-time validation — which violates the no-hand-rolled-crypto rule.
-//!
-//! **Gap 2 — Rekor SET / inclusion proof verification is an explicit TODO in sigstore-rs 0.11.0.**
-//!   In `bundle/verify/verifier.rs` lines 155–162, steps 5 (Merkle inclusion) and 6 (Signed Entry
-//!   Timestamp counter-signature) are literal `// TODO(tnytown): ...; sigstore-rs#285` comments.
-//!   These are NOT implemented even for the MessageSignature path.  spec §3.4.4 step 7 requires SET
-//!   verification; the library does not implement it.  Doing it ourselves would require hand-rolling
-//!   the SET counter-signature check (ECDSA verify over the tlog entry JSON using the Rekor public
-//!   key), which violates the no-hand-rolled-crypto rule.
-//!
-//! ## What sigstore-rs 0.11.0 DOES provide (for reference)
-//!
-//! - `blocking::Verifier` + `ManualTrustRoot`: ✓
-//! - Cert-at-SET-time via `integratedTime` window check (verifier.rs step 7): ✓
-//! - Identity policy (`SubjectAltName` + OIDC issuer) via `bundle::verify::policy::Identity`: ✓
-//! - `CosignVerificationKey` (ECDSA P-256 signature verification given a public key): ✓
-//! - Offline flag (`verify(…, offline=true)`): ✓ (but disabled for DSSE)
-//!
-//! ## Path forward
-//!
-//! S4b remains deferred as a **tracked known-limitation**:
-//! - Rust production `SigstoreVerifier` is blocked until sigstore-rs ships **both** (a) DSSE/in-toto
-//!   attestation bundle support AND (b) Rekor SET/inclusion proof verification (sigstore-rs#285).
-//! - Track upstream sigstore-rs releases; retry S4b when both gaps are closed.
-//! - Consider an upstream contribution to sigstore-rs to close one or both gaps.
-//! - Alternative: evaluate `sigstore-rekor-types` + `sigstore-fulcio` crates directly if they
-//!   expose the missing primitives at a lower level.
-//!
-//! Conformance stays green via [`MockVerifier`].
+//! **Known limitation (inherited, §4 gap-3):** the crate verifies the cert chain at the
+//! leaf's own `not_before` and only bounds-checks the leaf window against `integratedTime`;
+//! it does not re-verify the intermediate/root chain *at* `integratedTime`. For Fulcio's
+//! ~10-minute ephemeral certs the two coincide. A true chain-at-`integratedTime` fix is an
+//! upstream change (tracked with the S7 PR).
 //!
 //! # Slice boundary
 //!
@@ -87,13 +63,19 @@
 //!
 //! RFC: `docs/rfc-registry-trust-federation.md` §4, §6.5, §10.1, §11 S4/S4b.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use milpa_manifest::TrustPolicy;
+use sha2::{Digest, Sha256};
+use sigstore::bundle::verify::policy::{Identity, VerificationPolicy};
+use sigstore::bundle::verify::{blocking::Verifier, VerificationError};
+use sigstore::rekor::apis::configuration::Configuration as RekorConfiguration;
 
 use crate::error::{CoreError, MilpaError};
+use crate::rekor_adapter::{verify_entry_inclusion, AdapterOutcome};
+use crate::trust_root::map_trusted_root;
 
 // ---------------------------------------------------------------------------
 // DEFAULT_INDEX_SIGNER — canonical tianguis signing identity (spec §3.4.4 step 5)
@@ -113,6 +95,15 @@ use crate::error::{CoreError, MilpaError};
 pub const DEFAULT_INDEX_SIGNER: &str =
     "https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml\
      @refs/heads/main";
+
+/// OIDC issuer pinned alongside the SAN in the signer-identity policy.
+///
+/// The tianguis attestation is keyless-signed via GitHub Actions, so the issuer is always
+/// the GitHub Actions OIDC endpoint. Pinning it (not just the SAN) prevents a cert with a
+/// matching SAN from a *different* issuer from satisfying the policy. **Byte-identical to
+/// the Python impl's hardcoded issuer** (`index_trust.py` `Identity(..., issuer=...)`), so
+/// both impls make the same accept/reject decision (S5.5 differential).
+pub const DEFAULT_INDEX_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
 // ---------------------------------------------------------------------------
 // VerificationResult — 7-variant enum (RFC §6.5)
@@ -239,20 +230,22 @@ pub struct TrustBundle {
 }
 
 impl TrustBundle {
-    /// Load the embedded production trust bundle from `_trust/trust_bundle.json`.
+    /// Load the embedded production trust root from `_trust/trusted_root.json`.
     ///
-    /// **NOTE:** The current file is a PLACEHOLDER (contains `{"__placeholder__": true}`).
-    /// Replace with the real Sigstore public-instance Fulcio + Rekor bundle before S5/S6
-    /// wires production use. See RFC §3.1 and §12.3.
+    /// The bytes are the **standard Sigstore `trusted_root.json`** (Fulcio CAs +
+    /// Rekor + CTFE keys, each with `validFor` ranges), embedded verbatim — NOT a
+    /// milpa-invented schema. [`crate::trust_root::map_trusted_root`] reshapes them
+    /// into the `sigstore::trust::ManualTrustRoot` the S2 verifier consumes.
+    ///
+    /// Regenerate with `src/_trust/regenerate-trusted-root.sh` (network-only maintainer
+    /// tool; never run by the test gate). Rotation discipline: **append** new material, never delete old,
+    /// so committed S5 fixtures keep verifying at their `integratedTime` (RFC S1.5,
+    /// operationalizes Part-1 §12.3). Rotated only via a milpa version update — no
+    /// runtime TUF fetch (RFC §3.1).
     ///
     /// Production code ONLY — test code MUST use [`TrustBundle::test`].
     pub fn production() -> Self {
-        // deps-rationale: embedded at build time; no runtime network fetch.
-        // The placeholder is clearly marked; real bundle gated at S5/S6.
-        // RFC §3.1: the trust bundle is embedded via `include_bytes!` and rotated
-        // only via a milpa version update (TUF-based rotation is future work, RFC §12.3).
-        static PRODUCTION_BYTES: &[u8] =
-            include_bytes!("_trust/trust_bundle.json");
+        static PRODUCTION_BYTES: &[u8] = include_bytes!("_trust/trusted_root.json");
         TrustBundle {
             raw_json: PRODUCTION_BYTES,
             label: "production",
@@ -316,7 +309,7 @@ pub trait IndexBundleVerifier {
 }
 
 // ---------------------------------------------------------------------------
-// Pure verification function — spec §3.4.4 steps 1–3; crypto stubbed (S4b)
+// Pure verification function — spec §3.4.4 steps 1–3; real crypto via verify_crypto
 // ---------------------------------------------------------------------------
 
 /// Verify a Sigstore bundle against `index_bytes`; return a [`VerificationResult`].
@@ -336,10 +329,9 @@ pub trait IndexBundleVerifier {
 /// Passing `None` skips this bound entirely (pure cache reads, offline safety —
 /// spec §3.4.4 step 3, §7.2).
 ///
-/// **Steps 4–7 — S4b DEFERRED**: crypto verification is stubbed.  sigstore-rs 0.11.0 has
-/// two blocking gaps (DSSE unsupported; Rekor SET verification TODO sigstore-rs#285);
-/// see the module-level S4b note for the full spike finding.  Returns [`SigInvalid`] for
-/// all bundles that pass steps 1–3.  This is conservative (no false [`Trusted`] results).
+/// **Steps 4–6 + offline transparency step 5** — delegated to [`verify_crypto`]: digest
+/// pre-check, high-level cert/DSSE/signature/SAN verification, and offline Rekor
+/// inclusion-proof + checkpoint verification. Returns [`Trusted`] only if every step passes.
 ///
 /// Never panics; returns a [`VerificationResult`] for every input.
 ///
@@ -382,10 +374,12 @@ pub fn verify_index_bundle(
         }
     }
 
-    // Steps 4–7: S4b DEFERRED — crypto verification placeholder.
-    // sigstore-rs 0.11.0 has two blocking gaps: DSSE unsupported + Rekor SET TODO (#285).
-    // See module-level S4b note. Returns SigInvalid conservatively (no false Trusted).
-    _crypto_stub_s4b(index_bytes, &bundle_json, trust_bundle, expected_signer, integrated_time)
+    // Steps 4–6 + offline transparency step 5: real cryptographic verification.
+    // `bundle_json` (steps 1–3, freshness) and the Bundle parse inside `verify_crypto` are
+    // two reads of the same bytes; the composition-critical invariant (one Bundle threaded
+    // through both verify_digest AND inclusion) is upheld inside `verify_crypto` (RFC §4).
+    let _ = integrated_time; // consumed by the freshness bound above; crypto re-derives from the Bundle.
+    verify_crypto(index_bytes, bundle_bytes, trust_bundle, expected_signer)
 }
 
 /// Extract `integratedTime` from a parsed bundle JSON.
@@ -404,79 +398,194 @@ fn extract_integrated_time(bundle_json: &serde_json::Value) -> Option<u64> {
     }
 }
 
-/// S4b placeholder for steps 4–6 crypto verification.
+/// A [`VerificationPolicy`] wrapper that records whether the inner policy's `verify`
+/// rejected the certificate.
 ///
-/// Returns [`VerificationResult::SigInvalid`] conservatively (no false `Trusted` results).
+/// The crate collapses "SAN/issuer policy failed" and "signature failed" into one opaque
+/// `VerificationError::Signature(_)` whose inner kinds are unnameable outside the crate
+/// (RFC §4 error-taxonomy gap). So milpa cannot tell `SignerMismatch` from `SigInvalid`
+/// from the returned error. This wrapper records the policy-vs-not signal at the call site
+/// instead — byte-for-byte the same technique as the Python `_RecordingPolicy`.
+struct RecordingPolicy<'a> {
+    inner: &'a Identity,
+    rejected: Cell<bool>,
+}
+
+impl<'a> RecordingPolicy<'a> {
+    fn new(inner: &'a Identity) -> Self {
+        Self {
+            inner,
+            rejected: Cell::new(false),
+        }
+    }
+}
+
+impl VerificationPolicy for RecordingPolicy<'_> {
+    fn verify(
+        &self,
+        cert: &x509_cert::Certificate,
+    ) -> sigstore::bundle::verify::policy::PolicyResult {
+        let result = self.inner.verify(cert);
+        if result.is_err() {
+            self.rejected.set(true);
+        }
+        result
+    }
+}
+
+/// Extract the in-toto `subject[0].digest.sha256` (lowercase hex) from the bundle's DSSE
+/// envelope payload. Returns `None` if the bundle is not a DSSE envelope or the payload
+/// has no sha256 subject digest.
 ///
-/// S4b mini-spike found the low-level primitives approach NOT VIABLE against sigstore-rs 0.11.0:
-/// `CertificatePool` is `pub(crate)` and Rekor SET verification is TODO (sigstore-rs#285).
-/// This stub will be replaced when sigstore-rs ships both DSSE support and SET verification.
-/// See the module-level S4b note for details.
+/// This is *reshaping already-parsed data* (the crate's own `InTotoStatementV1` is
+/// `pub(crate)`), not verification — RFC §5.1-compliant. It lets milpa deterministically
+/// bucket a subject-digest mismatch as [`VerificationResult::DigestMismatch`] BEFORE the
+/// opaque crate call, dodging the error-taxonomy trap (RFC §4).
+fn extract_dsse_subject_sha256(bundle: &sigstore::bundle::Bundle) -> Option<String> {
+    use sigstore_protobuf_specs::dev::sigstore::bundle::v1::bundle::Content;
+    let payload = match bundle.content.as_ref()? {
+        Content::DsseEnvelope(env) => &env.payload,
+        Content::MessageSignature(_) => return None,
+    };
+    let statement: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    statement["subject"]
+        .get(0)?
+        .get("digest")?
+        .get("sha256")?
+        .as_str()
+        .map(|s| s.to_ascii_lowercase())
+}
+
+/// Real cryptographic verification (spec §3.4.4 steps 4–6 + offline transparency step 5).
 ///
-/// RFC §11 S4b: "Rust SigstoreVerifier retrofit (CONDITIONAL)".
-#[allow(unused_variables)]
-fn _crypto_stub_s4b(
+/// Runs the pipeline in RFC §4 / spec §3.4.4 order, aborting on the first failure:
+///
+/// 1. **Parse the bundle once** into `sigstore::bundle::Bundle`; assert exactly one tlog
+///    entry (mirrors the crate's own `BundleErrorKind::TlogEntry` gate). The single owned
+///    entry is threaded through both the high-level verify and the inclusion adapter — the
+///    §4 composition binding (no independent re-parse).
+/// 2. **Digest pre-check**: `sha256(index_bytes)` vs the DSSE subject digest →
+///    [`DigestMismatch`] deterministically, before the crate call (§4 taxonomy fix).
+/// 3. **High-level verify** (`verify_digest`): cert chain + DSSE + signature + SAN/issuer
+///    policy. A policy rejection → [`SignerMismatch`] (via [`RecordingPolicy`]); any other
+///    `Signature(_)` → [`SigInvalid`].
+/// 4. **Offline inclusion** via [`verify_entry_inclusion`] against the Rekor key looked up
+///    from the trust root by `hex(log_id.key_id)` → crypto failure [`SigInvalid`],
+///    structural failure [`BundleMalformed`].
+///
+/// Returns [`VerificationResult::Trusted`] only if every step passes. Never panics.
+///
+/// [`DigestMismatch`]: VerificationResult::DigestMismatch
+/// [`SignerMismatch`]: VerificationResult::SignerMismatch
+/// [`SigInvalid`]: VerificationResult::SigInvalid
+/// [`BundleMalformed`]: VerificationResult::BundleMalformed
+fn verify_crypto(
     index_bytes: &[u8],
-    bundle_json: &serde_json::Value,
+    bundle_bytes: &[u8],
     trust_bundle: &TrustBundle,
     expected_signer: &str,
-    integrated_time: u64,
 ) -> VerificationResult {
-    // S4b DEFERRED: two blocking gaps in sigstore-rs 0.11.0 prevent real DSSE verification.
-    // See module-level S4b note for the full spike finding.
-    VerificationResult::SigInvalid
+    // (1) Parse ONCE.
+    let bundle: sigstore::bundle::Bundle = match serde_json::from_slice(bundle_bytes) {
+        Ok(b) => b,
+        Err(_) => return VerificationResult::BundleMalformed,
+    };
+
+    // Singleton tlog entry — clone it now, before `bundle` is moved into `verify_digest`,
+    // so the SAME entry is used for inclusion (composition binding, RFC §4).
+    let entry = match bundle.verification_material.as_ref() {
+        Some(vm) if vm.tlog_entries.len() == 1 => vm.tlog_entries[0].clone(),
+        _ => return VerificationResult::BundleMalformed,
+    };
+
+    // (2) Digest pre-check.
+    let subject_sha256 = match extract_dsse_subject_sha256(&bundle) {
+        Some(h) => h,
+        None => return VerificationResult::BundleMalformed,
+    };
+    let actual = hex::encode(Sha256::digest(index_bytes));
+    if actual != subject_sha256 {
+        return VerificationResult::DigestMismatch;
+    }
+
+    // Map the embedded (or overridden) trust root. The production root is committed and
+    // known-good; a malformed *override* fails closed as SigInvalid (can't establish trust).
+    let trust_root = match map_trusted_root(trust_bundle.raw_json) {
+        Ok(t) => t,
+        Err(_) => return VerificationResult::SigInvalid,
+    };
+
+    // Look up the Rekor key for this entry's log by hex(log_id.key_id) — clone before the
+    // trust root is moved into the Verifier (which only consumes fulcio + ctfe keys).
+    let rekor_key = match entry.log_id.as_ref() {
+        Some(log_id) => match trust_root.rekor_keys.get(&hex::encode(&log_id.key_id)) {
+            Some(k) => k.clone(),
+            None => return VerificationResult::SigInvalid, // untrusted transparency log
+        },
+        None => return VerificationResult::BundleMalformed,
+    };
+
+    // (3) High-level verify: cert + DSSE + signature + SAN/issuer policy.
+    let verifier = match Verifier::new(RekorConfiguration::default(), trust_root) {
+        Ok(v) => v,
+        Err(_) => return VerificationResult::SigInvalid,
+    };
+    let identity = Identity::new(expected_signer, DEFAULT_INDEX_ISSUER);
+    let recording = RecordingPolicy::new(&identity);
+
+    let mut hasher = Sha256::new();
+    hasher.update(index_bytes);
+    // offline = true: milpa never makes an online Rekor call (spec §3.4.4).
+    if let Err(err) = verifier.verify_digest(hasher, bundle, &recording, true) {
+        return match err {
+            // Policy rejected the cert → SAN/issuer mismatch.
+            _ if recording.rejected.get() => VerificationResult::SignerMismatch,
+            // A pre-verify input error (should not happen — digest already computed).
+            VerificationError::Input(_) => VerificationResult::SigInvalid,
+            // Everything else — bad signature, cert chain, envelope consistency.
+            _ => VerificationResult::SigInvalid,
+        };
+    }
+
+    // (4) Offline transparency inclusion (spec §3.4.4 step 5) — the same singleton entry.
+    match verify_entry_inclusion(&entry, &rekor_key) {
+        AdapterOutcome::Included => VerificationResult::Trusted,
+        AdapterOutcome::CryptoInvalid(_) => VerificationResult::SigInvalid,
+        AdapterOutcome::Malformed(_) => VerificationResult::BundleMalformed,
+    }
 }
 
 // ---------------------------------------------------------------------------
 // SigstoreVerifier — production IndexBundleVerifier (RFC §11 S4)
 // ---------------------------------------------------------------------------
 
-/// Production verifier using `sigstore-rs`.
+/// Production verifier using `sigstore-rs` 0.14.
 ///
-/// # S4b DEFERRED — this is a placeholder that panics
+/// Performs real offline verification (RFC `rfc-attestation-verifier`): spec §3.4.4 steps
+/// 1–3 (parse / integratedTime / freshness) plus the real crypto — cert chain + DSSE +
+/// signature + SAN/issuer policy via the crate's high-level `Verifier`, and offline Rekor
+/// inclusion-proof + signed-checkpoint verification via [`crate::rekor_adapter`]. See
+/// [`verify_index_bundle`] / [`verify_crypto`].
 ///
-/// The S4 spike confirmed that sigstore-rs 0.11.0 does NOT support DSSE/in-toto
-/// attestation bundles from `cosign attest-blob` (`BundleErrorKind::DsseUnsupported`).
-///
-/// The S4b mini-spike (low-level primitives approach) found the approach NOT VIABLE:
-///   - `CertificatePool` (cert chain validation at `integratedTime`) is `pub(crate)`.
-///   - Rekor SET / inclusion proof verification is TODO in sigstore-rs 0.11.0 (issue #285).
-///
-/// `SigstoreVerifier` remains a placeholder until sigstore-rs ships both DSSE support
-/// and Rekor SET verification (sigstore-rs#285).  See module-level doc for the full
-/// S4b spike finding.
-///
-/// Calling `SigstoreVerifier::verify()` will panic with `unimplemented!`.
-/// Use [`MockVerifier`] for all tests and conformance fixtures.
-///
-/// RFC §11 S4/S4b.
+/// `MockVerifier` remains the conformance-corpus seam (RFC §10.1: the shared corpus tests
+/// the policy state machine, not cryptography).
 pub struct SigstoreVerifier;
 
 impl IndexBundleVerifier for SigstoreVerifier {
     fn verify(
         &self,
-        _index_bytes: &[u8],
-        _bundle_bytes: &[u8],
-        _trust_bundle: &TrustBundle,
-        _expected_signer: &str,
-        _max_age_seconds: Option<u64>,
+        index_bytes: &[u8],
+        bundle_bytes: &[u8],
+        trust_bundle: &TrustBundle,
+        expected_signer: &str,
+        max_age_seconds: Option<u64>,
     ) -> VerificationResult {
-        // S4b DEFERRED: sigstore-rs 0.11.0 has two blocking gaps for DSSE verification:
-        //   (1) BundleErrorKind::DsseUnsupported — high-level path fails for DSSE envelopes.
-        //   (2) Low-level primitives approach NOT VIABLE: CertificatePool is pub(crate) only,
-        //       and Rekor SET/inclusion proof verification is TODO (sigstore-rs#285).
-        //
-        // This placeholder will remain until sigstore-rs ships both DSSE support and Rekor
-        // SET verification. See module-level S4b note for the full spike finding.
-        //
-        // All conformance tests and policy tests use MockVerifier; this code path is never
-        // reached in testing.
-        //
-        // RFC §11 S4b: "Rust SigstoreVerifier retrofit (CONDITIONAL)".
-        unimplemented!(
-            "SigstoreVerifier: S4b ACTIVE — sigstore-rs 0.11.0 does not support \
-             DSSE/in-toto attestation bundles (BundleErrorKind::DsseUnsupported). \
-             Use MockVerifier for tests. See RFC docs/rfc-registry-trust-federation.md §11 S4b."
+        verify_index_bundle(
+            index_bytes,
+            bundle_bytes,
+            trust_bundle,
+            expected_signer,
+            max_age_seconds,
         )
     }
 }
@@ -889,6 +998,65 @@ mod tests {
         assert_eq!(VerificationResult::BundleMalformed.value(), "bundle-malformed");
     }
 
+    // --- Real SigstoreVerifier (S2) — reachable-without-preimage cases ---
+    //
+    // The real `bundle_v03.json` fixture attests an artifact whose bytes are not shipped,
+    // so through the PUBLIC `verify()` the digest pre-check always fires first. That makes
+    // DigestMismatch + the structural rejections testable here; the full-green `Trusted`
+    // verdict and SignerMismatch need a bundle over a KNOWN index and land in S5(a). The
+    // real cert-chain + offline-inclusion crypto is already proven green in
+    // `rekor_adapter::tests` (real inclusion) against this same fixture + trust root.
+
+    const REAL_BUNDLE_V03: &[u8] = include_bytes!("testdata/bundle_v03.json");
+
+    #[test]
+    fn real_verifier_digest_mismatch_takes_precedence() {
+        // A real, well-formed bundle but an index whose sha256 ≠ the attested subject.
+        // Proves the digest pre-check runs (and wins) BEFORE the opaque crate call — so a
+        // mismatch is deterministically DigestMismatch, never mis-slugged SigInvalid (§4).
+        let out = SigstoreVerifier.verify(
+            b"these are not the attested index bytes",
+            REAL_BUNDLE_V03,
+            &TrustBundle::production(),
+            DEFAULT_INDEX_SIGNER,
+            None, // pure cache read: skip the freshness bound
+        );
+        assert_eq!(out, VerificationResult::DigestMismatch, "got {out:?}");
+    }
+
+    #[test]
+    fn real_verifier_non_json_bundle_is_malformed() {
+        let out = SigstoreVerifier.verify(
+            b"index",
+            b"this is not a bundle",
+            &TrustBundle::production(),
+            DEFAULT_INDEX_SIGNER,
+            None,
+        );
+        assert_eq!(out, VerificationResult::BundleMalformed, "got {out:?}");
+    }
+
+    #[test]
+    fn real_verifier_multi_tlog_entry_is_malformed() {
+        // Duplicate the single tlog entry → two entries. The singleton assertion must
+        // reject (no entry-selection ambiguity, §4), and it fires before the digest check.
+        let mut v: serde_json::Value = serde_json::from_slice(REAL_BUNDLE_V03).unwrap();
+        let entries = v["verificationMaterial"]["tlogEntries"]
+            .as_array_mut()
+            .expect("tlogEntries array");
+        let dup = entries[0].clone();
+        entries.push(dup);
+        let bytes = serde_json::to_vec(&v).unwrap();
+        let out = SigstoreVerifier.verify(
+            b"index",
+            &bytes,
+            &TrustBundle::production(),
+            DEFAULT_INDEX_SIGNER,
+            None,
+        );
+        assert_eq!(out, VerificationResult::BundleMalformed, "got {out:?}");
+    }
+
     // Item 6 (M6): pin the DEFAULT_INDEX_SIGNER constant to the spec §3.4.4 step 5 value.
     #[test]
     fn default_index_signer_pin_matches_spec() {
@@ -1082,7 +1250,8 @@ mod tests {
     }
 
     /// Same stale bundle + None max_age → freshness NOT asserted, passes step 3.
-    /// (Steps 4–6 return SigInvalid due to S4b stub — that's the expected result.)
+    /// (This minimal bundle has no DSSE content, so `verify_crypto` returns BundleMalformed
+    /// — the point of the test is only that `None` skips the freshness bound, i.e. NOT stale.)
     #[test]
     fn stale_bundle_with_none_max_age_is_not_stale() {
         let trust_bundle = TrustBundle::test();
@@ -1100,7 +1269,6 @@ mod tests {
             None, // skip freshness
         );
         // Must NOT be BundleStale — freshness is skipped with None.
-        // Steps 4–6 return SigInvalid due to S4b stub.
         assert_ne!(result, VerificationResult::BundleStale, "None max_age must skip freshness check");
     }
 

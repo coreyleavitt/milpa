@@ -1632,8 +1632,8 @@ two axes govern different concerns and MUST NOT be conflated.
 > The seam MUST NOT fail-open silently (silently treating an invalid value as
 > `trusted` would mask misconfigured test environments and hide regressions).
 >
-> When absent or empty, the production verifier (`SigstoreVerifier`, or the
-> S4b deferred stub) is used — this variable has no effect on production invocations.
+> When absent or empty, the production verifier (`SigstoreVerifier`) is used — this
+> variable has no effect on production invocations.
 >
 > **Cross-impl alignment:** Both reference implementations use the SAME variable
 > name with the SAME value semantics (wire string as value, not a boolean flag +

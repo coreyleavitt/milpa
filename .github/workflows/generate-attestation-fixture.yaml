@@ -1,0 +1,76 @@
+# Regenerate the S5 index-attestation TEST FIXTURE (RFC rfc-attestation-verifier §S5(a)).
+#
+# Manually dispatched. Signs the committed known `index.kdl` with cosign KEYLESS using this
+# workflow's ambient GitHub Actions OIDC token — no browser, no personal identity. The result
+# is a real Sigstore v0.3 DSSE bundle that verifies against the production Fulcio/Rekor trust
+# root milpa embeds (`milpa-core/src/_trust/trusted_root.json`).
+#
+# Why a workflow (not a one-off local `cosign`): the signer SAN becomes a GitHub Actions
+# workflow identity — exactly milpa's production signer model (`DEFAULT_INDEX_SIGNER` is a GHA
+# workflow SAN) and the shape the tianguis vendor-bot uses to sign the real index.kdl.bundle
+# (RFC §1.2). It is reproducible (re-run to regenerate) and reusable as that flow's reference.
+#
+# The bundle is uploaded as a workflow artifact (not committed by a bot — milpa uses the global
+# git identity, no bot commits); a maintainer downloads it (`gh run download`) and commits it to
+# `conformance/spec-v1/_oracle/attestation/index.kdl.bundle`.
+#
+# SIGNER SAN pinned by the S5 tests (printed by the run for confirmation):
+#   https://github.com/coreyleavitt/milpa/.github/workflows/generate-attestation-fixture.yaml@refs/heads/main
+name: generate-attestation-fixture
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write # ambient OIDC token for keyless signing
+  contents: read
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Latest stable cosign (needs `--new-bundle-format`, i.e. cosign >= 2.4). Pin a
+      # specific `cosign-release:` once a version is confirmed working, for reproducibility.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Keyless attest-blob over the fixture index.kdl → v0.3 bundle
+        working-directory: conformance/spec-v1/_oracle/attestation
+        run: |
+          set -euxo pipefail
+          # milpa checks only the subject digest + signer SAN, not the predicate content.
+          printf '{"generated_by":"milpa-s5-fixture"}' > predicate.json
+          cosign attest-blob \
+            --yes \
+            --new-bundle-format \
+            --predicate predicate.json \
+            --type "https://milpa.dev/attestation/index/v1" \
+            --bundle index.kdl.bundle \
+            index.kdl
+          rm -f predicate.json
+          echo "== bundle head =="; head -c 300 index.kdl.bundle; echo
+          echo "== SIGNER SAN — pin this in the S5 tests =="
+          echo "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/generate-attestation-fixture.yaml@refs/heads/${GITHUB_REF_NAME}"
+
+      # Sanity: the freshly-signed bundle must verify against the public-good trust root under
+      # its own identity before we ship it as a fixture. Fails the run if cosign can't verify it.
+      - name: Self-verify the bundle
+        working-directory: conformance/spec-v1/_oracle/attestation
+        run: |
+          set -euxo pipefail
+          cosign verify-blob-attestation \
+            --new-bundle-format \
+            --bundle index.kdl.bundle \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/generate-attestation-fixture.yaml@refs/heads/${GITHUB_REF_NAME}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --type "https://milpa.dev/attestation/index/v1" \
+            index.kdl
+
+      - name: Upload the bundle fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: index-kdl-bundle
+          path: conformance/spec-v1/_oracle/attestation/index.kdl.bundle
+          if-no-files-found: error

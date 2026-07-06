@@ -982,3 +982,87 @@ def test_custom_root_verifier_does_not_hit_network_on_construction() -> None:
             "Custom-root Verifier construction must not make network calls; "
             "TUF is bypassed entirely when trusted_root is provided directly"
         )
+
+
+# ---------------------------------------------------------------------------
+# S6 — defensive regression: offline Rekor inclusion is actually enforced
+# ---------------------------------------------------------------------------
+#
+# Python already delegates inclusion verification to sigstore-python, but nothing
+# guarded that milpa's *call* (verify_dsse under offline=True) really rejects a
+# tampered inclusion proof — a future sigstore-python change or a mis-wired call
+# could silently drop the check. These tests use a REAL public-good v0.3 bundle
+# (tests/data/bundle_v03.json, a kubewarden-controller release attestation) that
+# verifies offline against sigstore-python's embedded production trust root.
+#
+# The bundle attests an artifact whose bytes we do not ship, so an UNTAMPERED run
+# through _sigstore_verify reaches the final digest check and returns
+# DigestMismatch — which proves cert + signature + offline inclusion ALL passed.
+# Tampering the inclusion proof must flip that outcome to SigInvalid.
+
+# The signing identity embedded in bundle_v03.json's Fulcio cert (SAN + issuer).
+_BUNDLE_V03_SAN = (
+    "https://github.com/kubewarden/kubewarden-controller/"
+    ".github/workflows/release.yml@refs/tags/v1.34.0"
+)
+
+
+def _load_bundle_v03() -> bytes:
+    from pathlib import Path
+
+    return (Path(__file__).parent / "data" / "bundle_v03.json").read_bytes()
+
+
+def test_s6_untampered_real_bundle_reaches_inclusion_and_digest_check() -> None:
+    """Baseline: a real bundle with a valid inclusion proof passes cert+sig+inclusion.
+
+    With no matching artifact preimage the run lands on DigestMismatch — which can
+    ONLY be reached after offline inclusion verification succeeds. If this ever
+    regresses to SigInvalid, the trust-root/offline path itself is broken.
+    """
+    result = _sigstore_verify(
+        b"not the attested index bytes",
+        _load_bundle_v03(),
+        TrustBundle.production(),
+        _BUNDLE_V03_SAN,
+    )
+    assert result == VerificationResult.DIGEST_MISMATCH, (
+        f"untampered real bundle must pass cert+sig+inclusion and reach the digest "
+        f"check (DigestMismatch); got {result!r} — offline verification is broken"
+    )
+
+
+@pytest.mark.parametrize(
+    "field, mutate",
+    [
+        # Flip a byte in the first Merkle proof hash → inclusion path no longer
+        # recomputes rootHash.
+        ("hashes", lambda ip: ip.__setitem__(
+            "hashes",
+            [("A" if ip["hashes"][0][0] != "A" else "B") + ip["hashes"][0][1:], *ip["hashes"][1:]],
+        )),
+        # Corrupt the signed-tree rootHash → checkpoint↔proof cross-check fails.
+        ("rootHash", lambda ip: ip.__setitem__(
+            "rootHash",
+            ("A" if ip["rootHash"][0] != "A" else "B") + ip["rootHash"][1:],
+        )),
+    ],
+)
+def test_s6_tampered_inclusion_proof_is_rejected(field, mutate) -> None:
+    """A present-but-tampered inclusion proof must be rejected (SigInvalid), NOT
+    silently accepted — the offline transparency guarantee (spec §3.4.4 step 5)."""
+    data = json.loads(_load_bundle_v03())
+    proof = data["verificationMaterial"]["tlogEntries"][0]["inclusionProof"]
+    mutate(proof)
+    tampered = json.dumps(data).encode()
+
+    result = _sigstore_verify(
+        b"not the attested index bytes",
+        tampered,
+        TrustBundle.production(),
+        _BUNDLE_V03_SAN,
+    )
+    assert result == SigInvalid, (
+        f"tampered inclusion proof ({field}) must be rejected as SigInvalid; got "
+        f"{result!r} — offline inclusion verification is not being enforced"
+    )

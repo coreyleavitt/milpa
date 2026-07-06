@@ -243,6 +243,42 @@ def _verify_and_enforce(
     enforce_index_trust(result, config.policy, index_url)
 
 
+def reverify_cached_index(
+    url: str,
+    cache_dir: Path,
+    config: "IndexTrustConfig | None",
+    verifier: "IndexBundleVerifier | None",
+) -> None:
+    """Re-verify the ALREADY-CACHED index attestation bundle, fully offline (Sv).
+
+    Reads the on-disk cached ``index.kdl`` + ``index.kdl.bundle`` and re-runs bundle
+    verification + policy enforcement with freshness DISABLED (``is_network_fetch=False``,
+    spec §3.4.4 step 3) — the offline post-incident audit path ``milpa verify`` is meant to
+    provide (Part-1 §7.5). It **never** touches the network and does **not** go through the
+    cache state machine (no fetch, no TTL, no stale-refresh) — so it cannot change any Part-1
+    cache behavior.
+
+    No-op when there is nothing to enforce or nothing cached: ``policy=off``, no
+    ``config``/``verifier``, or no cache file for ``url``. When the cache holds a bundle, a
+    tampered/invalid one raises the mapped ``TNG-INDEX-*`` slug under ``strict`` (warns under
+    ``warn``); a recorded bundle-404 (no-bundle marker) enforces ``BundleMissing`` the same way.
+    """
+    if config is None or verifier is None or config.policy == "off":
+        return
+    cache_file = cache_path_for(url, cache_dir)
+    if not cache_file.exists():
+        return  # nothing cached to reverify — and we must not fetch here
+    index_bytes = cache_file.read_bytes()
+    if _no_bundle_marker_path(cache_file).exists():
+        bundle_bytes: bytes | None = None
+    else:
+        bundle_file = _bundle_path(cache_file)
+        bundle_bytes = bundle_file.read_bytes() if bundle_file.exists() else None
+    _verify_and_enforce(
+        index_bytes, bundle_bytes, config, verifier, url, is_network_fetch=False
+    )
+
+
 # ---------------------------------------------------------------------------
 # load_index — main entry point (S5: new signature with trust gate)
 # ---------------------------------------------------------------------------

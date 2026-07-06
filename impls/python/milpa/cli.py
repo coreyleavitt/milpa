@@ -760,6 +760,31 @@ def _load_index_for_verb(env: MilpaEnv, project_dir: "Path | None" = None) -> Mi
     return replace(env, index=index)
 
 
+def _reverify_cached_index_bundle(env: MilpaEnv, project_dir: "Path | None") -> None:
+    """Sv: re-verify the CACHED index attestation bundle offline (never fetches).
+
+    Builds the same ``IndexTrustConfig`` + verifier as index loading, then re-runs
+    verification against the on-disk cache via ``index_cache.reverify_cached_index``.
+    Skips silently when no index is configured (``--no-index`` / empty
+    ``MILPA_INDEX_URL``), when the effective policy is ``off``, or when nothing is
+    cached. A failing cached bundle raises the mapped ``TNG-INDEX-*`` slug under
+    ``strict`` (warns under ``warn``).
+    """
+    from milpa.index_cache import (
+        _default_cache_dir,
+        index_url_from_env,
+        reverify_cached_index,
+    )
+
+    if _no_index_requested(env.no_index):
+        return
+    raw_index_url = os.environ.get("MILPA_INDEX_URL")
+    if raw_index_url is not None and raw_index_url.strip() == "":
+        return  # explicitly no index → nothing to reverify
+    config, verifier = _build_index_trust(env, project_dir) if project_dir is not None else (None, None)
+    reverify_cached_index(index_url_from_env(), _default_cache_dir(), config, verifier)
+
+
 # ---------------------------------------------------------------------------
 # Prior-lockfile loader (§8 pin reuse)
 # ---------------------------------------------------------------------------
@@ -1693,6 +1718,26 @@ def cmd_verify(
         print(f"failed to read lockfile: {exc.message}", file=sys.stderr)
         _emit_slug(exc.slug)
         return 1
+
+    # -------------------------------------------------------------------------
+    # Sv (rfc-attestation-verifier): offline reverify of the CACHED index
+    # attestation bundle — the offline post-incident audit path (Part-1 §7.5).
+    # A tampered/invalid cached bundle fails verify under strict (warns under
+    # warn). Never fetches; independent of the online dep_decl edge check below.
+    # (env is None only in direct unit-test calls that bypass the CLI env build.)
+    # -------------------------------------------------------------------------
+    if env is not None:
+        try:
+            _reverify_cached_index_bundle(
+                env, ws.root_dir if ws is not None else project_dir
+            )
+        except MilpaError as exc:
+            print(
+                f"cached index attestation reverify failed: {exc.message}",
+                file=sys.stderr,
+            )
+            _emit_slug(exc.slug)
+            return 1
 
     # -------------------------------------------------------------------------
     # S10: active_flags mismatch check (RFC #23 §3.7 — flag MEMBERSHIP only,

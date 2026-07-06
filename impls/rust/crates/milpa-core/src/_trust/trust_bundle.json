@@ -1,4 +1,0 @@
-{
-  "__placeholder__": true,
-  "__note__": "Production Sigstore trust bundle (Fulcio CA + Rekor public key + CTFE key). Replace with real bundle before S5 wires production use. See RFC: rfc-registry-trust-federation §3.1 and §12.3."
-}
