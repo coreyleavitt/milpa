@@ -1037,6 +1037,29 @@ def test_s5_real_bundle_wrong_index_is_digest_mismatch() -> None:
     )
 
 
+def test_s55_multifault_bundle_same_slug_as_rust() -> None:
+    """S5.5 cross-impl differential: a bundle with MULTIPLE crypto faults (corrupt DSSE
+    signature + corrupt inclusion-proof hash, digest intact) resolves to ``SigInvalid`` in
+    BOTH impls. The Rust impl asserts the SAME slug on the SAME committed fixture
+    (index_trust.rs ``s5_5_*``), guarding the divergence class S5.5 exists to catch.
+
+    KNOWN ACCEPTED ASYMMETRY (not tested here): if a bundle has BOTH a wrong subject digest
+    AND a crypto fault, the two impls report different slugs — Rust does the digest pre-check
+    FIRST (``DigestMismatch``; RFC §4 taxonomy fix), Python checks the digest only AFTER
+    ``verify_dsse`` (which fails on the signature first → ``SigInvalid``). Both still REJECT;
+    only the diagnostic slug differs. The fixture keeps the digest intact so the two orderings
+    converge. See docs/rfc-attestation-verifier.handoff.md."""
+    from pathlib import Path
+
+    root = Path(__file__).parents[3] / "conformance" / "spec-v1" / "_oracle" / "attestation"
+    index = (root / "index.kdl").read_bytes()
+    bundle = (root / "index.kdl.bundle.multifault").read_bytes()
+    assert (
+        _sigstore_verify(index, bundle, TrustBundle.production(), _FIXTURE_SIGNER)
+        == SigInvalid
+    )
+
+
 # ---------------------------------------------------------------------------
 # S6 — defensive regression: offline Rekor inclusion is actually enforced
 # ---------------------------------------------------------------------------

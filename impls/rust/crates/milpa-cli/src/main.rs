@@ -4473,6 +4473,49 @@ mod tests {
         assert_eq!(result, Ok(0), "trusted cached bundle must not block verify");
     }
 
+    /// S4b: `strict` really fails end-to-end on a BAD bundle through the REAL SigstoreVerifier
+    /// (no mock seam) — the replacement for the deleted VERIFY-UNSUPPORTED scenario 6. Uses the
+    /// real S5 fixture with its DSSE signature byte-flipped: the digest pre-check passes (real
+    /// index), then the real crypto rejects the tampered signature → fail closed (exit 1).
+    #[test]
+    fn s4b_strict_fails_on_bad_cached_bundle_via_real_verifier() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let index_url = "file:///nonexistent/tianguis/index.kdl";
+        unsafe { std::env::set_var("XDG_CACHE_HOME", tmp.path()) };
+        unsafe { std::env::set_var("MILPA_INDEX_URL", index_url) };
+        unsafe { std::env::set_var("MILPA_INDEX_TRUST", "strict") };
+        unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") }; // REAL verifier
+
+        let proj = seed_verify_reverify_case(tmp.path(), index_url);
+
+        // Overwrite the cache with the REAL index + a signature-tampered REAL bundle.
+        let fdir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../conformance/spec-v1/_oracle/attestation");
+        let real_index = std::fs::read(format!("{fdir}/index.kdl")).unwrap();
+        let real_bundle = std::fs::read(format!("{fdir}/index.kdl.bundle")).unwrap();
+        let mut bj: serde_json::Value = serde_json::from_slice(&real_bundle).unwrap();
+        let sig = bj["dsseEnvelope"]["signatures"][0]["sig"].as_str().unwrap().to_string();
+        let flipped = format!("{}{}", if sig.starts_with('A') { "B" } else { "A" }, &sig[1..]);
+        bj["dsseEnvelope"]["signatures"][0]["sig"] = serde_json::Value::String(flipped);
+        let tampered = serde_json::to_vec(&bj).unwrap();
+
+        let cache_file = milpa_core::index_cache::cache_path_for(index_url, &index_cache_dir());
+        std::fs::write(&cache_file, &real_index).unwrap();
+        std::fs::write(milpa_core::index_cache::bundle_path(&cache_file), &tampered).unwrap();
+
+        let result = cmd_verify(&proj, false, false, false, false);
+
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+        unsafe { std::env::remove_var("MILPA_INDEX_TRUST") };
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
+
+        assert_eq!(
+            result,
+            Ok(1),
+            "strict + real verifier + signature-tampered real bundle must fail closed"
+        );
+    }
+
     #[test]
     fn build_trust_gate_mock_seam_with_https_is_milpa_internal_error() {
         // Item 2 (M1) + Item 5: seam on https:// URL → MILPA-INTERNAL hard error.

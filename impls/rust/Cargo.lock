@@ -1413,6 +1413,7 @@ version = "0.0.0"
 dependencies = [
  "milpa-core",
  "milpa-manifest",
+ "serde_json",
  "tempfile",
 ]
 

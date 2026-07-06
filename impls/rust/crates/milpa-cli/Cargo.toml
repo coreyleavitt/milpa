@@ -16,3 +16,5 @@ milpa-manifest = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]
+# Test-only: craft tampered bundle fixtures for the S4b strict-fails integration test.
+serde_json = "1"
