@@ -985,6 +985,59 @@ def test_custom_root_verifier_does_not_hit_network_on_construction() -> None:
 
 
 # ---------------------------------------------------------------------------
+# S5(a) — real cosign-signed bundle verifies end-to-end (production trust root)
+# ---------------------------------------------------------------------------
+#
+# The committed fixture (conformance/spec-v1/_oracle/attestation/) is a REAL
+# Sigstore v0.3 DSSE bundle produced by the generate-attestation-fixture GitHub
+# Actions workflow: keyless cosign attest-blob over the known index.kdl, signed by
+# the workflow's OIDC identity, verifiable offline against the embedded production
+# trust root. This is the "units green, prod fails" hole a best-in-class verifier
+# cannot ship with — the actual Fulcio/Rekor wiring exercised end-to-end.
+
+_FIXTURE_SIGNER = (
+    "https://github.com/coreyleavitt/milpa/.github/workflows/"
+    "generate-attestation-fixture.yaml@refs/heads/main"
+)
+
+
+def _attestation_fixture() -> "tuple[bytes, bytes]":
+    from pathlib import Path
+
+    root = Path(__file__).parents[3] / "conformance" / "spec-v1" / "_oracle" / "attestation"
+    return (root / "index.kdl").read_bytes(), (root / "index.kdl.bundle").read_bytes()
+
+
+def test_s5_real_bundle_verifies_trusted_end_to_end() -> None:
+    index, bundle = _attestation_fixture()
+    assert (
+        _sigstore_verify(index, bundle, TrustBundle.production(), _FIXTURE_SIGNER)
+        == VerificationResult.TRUSTED
+    ), "real cosign bundle must verify Trusted against the embedded production trust root"
+
+
+def test_s5_real_bundle_wrong_signer_is_signer_mismatch() -> None:
+    index, bundle = _attestation_fixture()
+    assert (
+        _sigstore_verify(
+            index,
+            bundle,
+            TrustBundle.production(),
+            "https://github.com/evil/repo/.github/workflows/x.yaml@refs/heads/main",
+        )
+        == SignerMismatch
+    )
+
+
+def test_s5_real_bundle_wrong_index_is_digest_mismatch() -> None:
+    _, bundle = _attestation_fixture()
+    assert (
+        _sigstore_verify(b"tampered index bytes", bundle, TrustBundle.production(), _FIXTURE_SIGNER)
+        == VerificationResult.DIGEST_MISMATCH
+    )
+
+
+# ---------------------------------------------------------------------------
 # S6 — defensive regression: offline Rekor inclusion is actually enforced
 # ---------------------------------------------------------------------------
 #
