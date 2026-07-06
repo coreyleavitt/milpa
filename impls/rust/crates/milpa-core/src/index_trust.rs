@@ -1018,53 +1018,35 @@ mod tests {
     const FIXTURE_SIGNER: &str =
         "https://github.com/coreyleavitt/milpa/.github/workflows/generate-attestation-fixture.yaml@refs/heads/main";
 
-    /// S5(a): the real `cosign`-signed bundle should verify **Trusted** end-to-end.
+    /// S5(a): the real `cosign`-signed bundle verifies **Trusted** end-to-end against the
+    /// embedded production trust root — the "units green, prod fails" hole a best-in-class
+    /// verifier cannot ship with. Exercises the full production path (real Fulcio cert chain +
+    /// SCT + DSSE signature + offline Rekor inclusion) and the two preimage-dependent negatives
+    /// S2 could not reach (SignerMismatch and the green path itself).
     ///
-    /// ⚠️ IGNORED — BLOCKED by a sigstore-rs↔cosign interop gap. sigstore-rs 0.14's
-    /// `verify_digest` re-serializes the DSSE envelope (`serde_json::to_vec(&dsse)`) and
-    /// compares its sha256 to the `envelopeHash` cosign recorded in Rekor
-    /// (`bundle/verify/models.rs:tlog_entry_for_dsse`). For a real `cosign attest-blob
-    /// --new-bundle-format` bundle those bytes differ → `Signature(Transparency)` → SigInvalid,
-    /// even though the cert chain, DSSE signature, subject digest, and the OFFLINE Rekor
-    /// INCLUSION proof (via rekor_adapter) all verify, and sigstore-python accepts the SAME
-    /// bundle as Trusted. Tracked for resolution (upstream sigstore-rs, or milpa taking over the
-    /// envelope-consistency binding). See handoff.
+    /// Requires the vendored sigstore patch (`.vendor-sigstore`, `[patch.crates-io]`) that drops
+    /// the unsound DSSE envelopeHash re-serialization check — see that dir's MILPA-PATCH.md.
     #[test]
-    #[ignore = "sigstore-rs DSSE envelopeHash re-serialization rejects real cosign bundles; see handoff"]
     fn s5_real_bundle_verifies_trusted_end_to_end() {
         let index = std::fs::read(format!("{FIXTURE_DIR}/index.kdl")).expect("fixture index");
         let bundle = std::fs::read(format!("{FIXTURE_DIR}/index.kdl.bundle")).expect("fixture bundle");
+
+        // Full green.
         let r = SigstoreVerifier.verify(&index, &bundle, &TrustBundle::production(), FIXTURE_SIGNER, None);
         assert_eq!(r, VerificationResult::Trusted, "real bundle must verify Trusted, got {r:?}");
-    }
 
-    /// What DOES hold today on the real bundle: the offline Rekor inclusion proof + checkpoint
-    /// verify against the embedded production trust root, and a wrong index digest is caught by
-    /// the pre-check. (The full-`Trusted` path is blocked upstream — see the ignored test above.)
-    #[test]
-    fn s5_real_bundle_inclusion_and_digest_precheck() {
-        let index = std::fs::read(format!("{FIXTURE_DIR}/index.kdl")).expect("fixture index");
-        let bundle_bytes = std::fs::read(format!("{FIXTURE_DIR}/index.kdl.bundle")).expect("fixture bundle");
-
-        // Offline Rekor inclusion verifies against the embedded production trust root.
-        let bundle: sigstore::bundle::Bundle = serde_json::from_slice(&bundle_bytes).unwrap();
-        let entry = bundle.verification_material.as_ref().unwrap().tlog_entries[0].clone();
-        let root = map_trusted_root(TrustBundle::production().raw_json).unwrap();
-        let key = root
-            .rekor_keys
-            .get(&hex::encode(&entry.log_id.as_ref().unwrap().key_id))
-            .expect("bundle's rekor key is in the embedded production trust root")
-            .clone();
-        assert!(
-            matches!(
-                crate::rekor_adapter::verify_entry_inclusion(&entry, &key),
-                crate::rekor_adapter::AdapterOutcome::Included
-            ),
-            "real cosign bundle's offline inclusion proof must verify"
+        // Wrong expected signer → SignerMismatch (reachable now that the digest matches).
+        let r = SigstoreVerifier.verify(
+            &index,
+            &bundle,
+            &TrustBundle::production(),
+            "https://github.com/evil/repo/.github/workflows/x.yaml@refs/heads/main",
+            None,
         );
+        assert_eq!(r, VerificationResult::SignerMismatch, "wrong signer → SignerMismatch, got {r:?}");
 
-        // Digest pre-check fires before the (upstream-blocked) crate call.
-        let r = SigstoreVerifier.verify(b"tampered index", &bundle_bytes, &TrustBundle::production(), FIXTURE_SIGNER, None);
+        // Wrong index bytes → DigestMismatch (pre-check fires first).
+        let r = SigstoreVerifier.verify(b"tampered index", &bundle, &TrustBundle::production(), FIXTURE_SIGNER, None);
         assert_eq!(r, VerificationResult::DigestMismatch, "wrong index → DigestMismatch, got {r:?}");
     }
 

@@ -32,3 +32,9 @@ edition = "2021"
 rust-version = "1.74"
 license = "MIT"
 publish = false
+
+# TEMPORARY (milpa patch validation): use a locally-patched sigstore that drops the
+# unsound DSSE envelopeHash re-serialization check (see .vendor-sigstore models.rs).
+# rfc-attestation-verifier — replace with an upstream-fork git patch or drop once merged.
+[patch.crates-io]
+sigstore = { path = ".vendor-sigstore" }
