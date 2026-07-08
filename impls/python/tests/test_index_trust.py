@@ -1038,17 +1038,12 @@ def test_s5_real_bundle_wrong_index_is_digest_mismatch() -> None:
 
 
 def test_s55_multifault_bundle_same_slug_as_rust() -> None:
-    """S5.5 cross-impl differential: a bundle with MULTIPLE crypto faults (corrupt DSSE
-    signature + corrupt inclusion-proof hash, digest intact) resolves to ``SigInvalid`` in
-    BOTH impls. The Rust impl asserts the SAME slug on the SAME committed fixture
-    (index_trust.rs ``s5_5_*``), guarding the divergence class S5.5 exists to catch.
-
-    KNOWN ACCEPTED ASYMMETRY (not tested here): if a bundle has BOTH a wrong subject digest
-    AND a crypto fault, the two impls report different slugs — Rust does the digest pre-check
-    FIRST (``DigestMismatch``; RFC §4 taxonomy fix), Python checks the digest only AFTER
-    ``verify_dsse`` (which fails on the signature first → ``SigInvalid``). Both still REJECT;
-    only the diagnostic slug differs. The fixture keeps the digest intact so the two orderings
-    converge. See docs/rfc-attestation-verifier.handoff.md."""
+    """S5.5 cross-impl differential: a bundle with MULTIPLE faults — a wrong subject digest
+    AND a corrupt signature — resolves to the SAME slug in BOTH impls: ``DigestMismatch``.
+    The subject-digest binding is checked BEFORE cryptographic verification in both impls
+    (spec §3.4.4 precedence), so the digest fault wins deterministically. The Rust impl asserts
+    the same on the same committed fixture (index_trust.rs ``s5_5_*``). This is exactly the
+    first-failure-precedence divergence class S5.5 exists to catch — now a defined guarantee."""
     from pathlib import Path
 
     root = Path(__file__).parents[3] / "conformance" / "spec-v1" / "_oracle" / "attestation"
@@ -1056,7 +1051,7 @@ def test_s55_multifault_bundle_same_slug_as_rust() -> None:
     bundle = (root / "index.kdl.bundle.multifault").read_bytes()
     assert (
         _sigstore_verify(index, bundle, TrustBundle.production(), _FIXTURE_SIGNER)
-        == SigInvalid
+        == VerificationResult.DIGEST_MISMATCH
     )
 
 
@@ -1064,55 +1059,20 @@ def test_s55_multifault_bundle_same_slug_as_rust() -> None:
 # S6 — defensive regression: offline Rekor inclusion is actually enforced
 # ---------------------------------------------------------------------------
 #
-# Python already delegates inclusion verification to sigstore-python, but nothing
-# guarded that milpa's *call* (verify_dsse under offline=True) really rejects a
-# tampered inclusion proof — a future sigstore-python change or a mis-wired call
-# could silently drop the check. These tests use a REAL public-good v0.3 bundle
-# (tests/data/bundle_v03.json, a kubewarden-controller release attestation) that
-# verifies offline against sigstore-python's embedded production trust root.
-#
-# The bundle attests an artifact whose bytes we do not ship, so an UNTAMPERED run
-# through _sigstore_verify reaches the final digest check and returns
-# DigestMismatch — which proves cert + signature + offline inclusion ALL passed.
-# Tampering the inclusion proof must flip that outcome to SigInvalid.
-
-# The signing identity embedded in bundle_v03.json's Fulcio cert (SAN + issuer).
-_BUNDLE_V03_SAN = (
-    "https://github.com/kubewarden/kubewarden-controller/"
-    ".github/workflows/release.yml@refs/tags/v1.34.0"
-)
-
-
-def _load_bundle_v03() -> bytes:
-    from pathlib import Path
-
-    return (Path(__file__).parent / "data" / "bundle_v03.json").read_bytes()
-
-
-def test_s6_untampered_real_bundle_reaches_inclusion_and_digest_check() -> None:
-    """Baseline: a real bundle with a valid inclusion proof passes cert+sig+inclusion.
-
-    With no matching artifact preimage the run lands on DigestMismatch — which can
-    ONLY be reached after offline inclusion verification succeeds. If this ever
-    regresses to SigInvalid, the trust-root/offline path itself is broken.
-    """
-    result = _sigstore_verify(
-        b"not the attested index bytes",
-        _load_bundle_v03(),
-        TrustBundle.production(),
-        _BUNDLE_V03_SAN,
-    )
-    assert result == VerificationResult.DIGEST_MISMATCH, (
-        f"untampered real bundle must pass cert+sig+inclusion and reach the digest "
-        f"check (DigestMismatch); got {result!r} — offline verification is broken"
-    )
+# Python delegates inclusion verification to sigstore-python, but nothing guarded
+# that milpa's *call* (verify_dsse under offline=True) really rejects a tampered
+# inclusion proof — a future sigstore-python change or a mis-wired call could
+# silently drop it. Using the real S5 fixture (whose index bytes we DO have), an
+# untampered run verifies Trusted (test_s5_real_bundle_verifies_trusted_end_to_end);
+# tampering ONLY the inclusion proof — subject digest and signature intact, so the
+# digest pre-check passes and the DSSE signature still verifies — must flip the
+# outcome to SigInvalid, proving offline inclusion is enforced (spec §3.4.4 step 5).
 
 
 @pytest.mark.parametrize(
     "field, mutate",
     [
-        # Flip a byte in the first Merkle proof hash → inclusion path no longer
-        # recomputes rootHash.
+        # Flip a byte in the first Merkle proof hash.
         ("hashes", lambda ip: ip.__setitem__(
             "hashes",
             [("A" if ip["hashes"][0][0] != "A" else "B") + ip["hashes"][0][1:], *ip["hashes"][1:]],
@@ -1125,19 +1085,15 @@ def test_s6_untampered_real_bundle_reaches_inclusion_and_digest_check() -> None:
     ],
 )
 def test_s6_tampered_inclusion_proof_is_rejected(field, mutate) -> None:
-    """A present-but-tampered inclusion proof must be rejected (SigInvalid), NOT
-    silently accepted — the offline transparency guarantee (spec §3.4.4 step 5)."""
-    data = json.loads(_load_bundle_v03())
+    """A present-but-tampered inclusion proof (digest + signature intact) must be
+    rejected as SigInvalid — the offline transparency guarantee (spec §3.4.4 step 5)."""
+    index, bundle = _attestation_fixture()
+    data = json.loads(bundle)
     proof = data["verificationMaterial"]["tlogEntries"][0]["inclusionProof"]
     mutate(proof)
     tampered = json.dumps(data).encode()
 
-    result = _sigstore_verify(
-        b"not the attested index bytes",
-        tampered,
-        TrustBundle.production(),
-        _BUNDLE_V03_SAN,
-    )
+    result = _sigstore_verify(index, tampered, TrustBundle.production(), _FIXTURE_SIGNER)
     assert result == SigInvalid, (
         f"tampered inclusion proof ({field}) must be rejected as SigInvalid; got "
         f"{result!r} — offline inclusion verification is not being enforced"

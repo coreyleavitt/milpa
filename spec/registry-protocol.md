@@ -476,10 +476,13 @@ signer override is configured, `warn` policy proceeds with a
 `TNG-INDEX-SIGNER-MISMATCH` warning; `strict` policy raises the error.
 
 **Step 6 — Verify the DSSE envelope and subject digest.** The envelope signature
-MUST be verified against the certificate's public key. After successful signature
-verification, the in-toto statement's subject digest
-(`statement.subject[0].digest.sha256`) MUST equal `sha256(index_bytes)`. A
-digest mismatch MUST raise `TNG-INDEX-DIGEST-MISMATCH`.
+MUST be verified against the certificate's public key. The in-toto statement's
+subject digest (`statement.subject[0].digest.sha256`) MUST equal
+`sha256(index_bytes)`; a digest mismatch MUST raise `TNG-INDEX-DIGEST-MISMATCH`.
+The subject-digest comparison takes precedence over the cryptographic steps and MAY
+be performed before them (see the subject-digest-binding-precedence NORMATIVE clause
+below); the `Trusted` verdict nonetheless requires the envelope signature and all
+other steps to pass.
 
 > NORMATIVE: A payload whose `subject` list is absent or empty, or whose
 > `subject[0].digest.sha256` field is absent or unextractable (including
@@ -495,11 +498,14 @@ digest mismatch MUST raise `TNG-INDEX-DIGEST-MISMATCH`.
 > tree (see `spec/identity.md`); using it for a bundle-subject mismatch would
 > create a false collision with milpa's identity model.
 
-> NOTE: Subject-digest comparison is performed on the verified payload returned
-> by the DSSE verification step, NOT by inspecting exception message text. A
-> conformant implementation MUST NOT infer `TNG-INDEX-DIGEST-MISMATCH` from
-> error-string patterns — the digest comparison is a deterministic check on
-> the signed payload bytes.
+> NOTE: Subject-digest comparison is a deterministic byte check —
+> `statement.subject[0].digest.sha256` vs `sha256(index_bytes)` — NOT an inspection
+> of exception message text. A conformant implementation MUST NOT infer
+> `TNG-INDEX-DIGEST-MISMATCH` from error-string patterns. The payload bytes read for
+> the comparison MUST be the same bytes whose DSSE signature is verified on the
+> `Trusted` path (so a pre-crypto digest check is not a distinct read); this holds
+> whether the comparison is performed before the cryptographic steps (fail-fast) or
+> after them.
 
 **Step 7 — Verify the Rekor inclusion proof** against the embedded Rekor public
 key. Failure MUST raise `TNG-INDEX-SIGNATURE-INVALID`.
@@ -524,9 +530,29 @@ key. Failure MUST raise `TNG-INDEX-SIGNATURE-INVALID`.
 
 > NORMATIVE (first-failure precedence): When multiple failure conditions coexist,
 > the reported variant MUST be the FIRST failure encountered in the §3.4.4
-> evaluation order (steps 1–7). In particular: a bundle that is both stale (step 3)
-> and has an invalid signature (steps 4+) MUST report `TNG-INDEX-BUNDLE-STALE`,
-> not `TNG-INDEX-SIGNATURE-INVALID`.
+> evaluation order. In particular: a bundle that is both stale (step 3) and has an
+> invalid signature (steps 4+) MUST report `TNG-INDEX-BUNDLE-STALE`, not
+> `TNG-INDEX-SIGNATURE-INVALID`.
+>
+> NORMATIVE (subject-digest binding precedence): The subject-digest binding of
+> step 6 is evaluated BEFORE the cryptographic verification of steps 4–5 and 7.
+> A bundle whose `statement.subject[0].digest.sha256` ≠ `sha256(index_bytes)`
+> (or whose subject digest is absent/unextractable) MUST report
+> `TNG-INDEX-DIGEST-MISMATCH`, taking precedence over any concurrent signature,
+> certificate, signer-identity, or inclusion-proof failure. Rationale: a subject
+> mismatch means the bundle attests a DIFFERENT artifact than the index being
+> loaded — it is not "about" this index at all, which is the most fundamental
+> mismatch and cheapest to detect (a hash comparison, no cryptography). Checking
+> it first also yields identical slugs across implementations whose underlying
+> verification libraries interleave the cryptographic sub-steps differently.
+>
+> This precedence is SAFE despite the digest being read from a not-yet-verified
+> payload: the pre-check can only REJECT (it never accepts), the `Trusted` verdict
+> still requires the full cryptographic verification of steps 4–7 to pass, and the
+> exact payload bytes read for the digest pre-check are the same bytes whose DSSE
+> signature is verified on the `Trusted` path (single-read invariant below — no
+> TOCTOU). Implementations MUST NOT accept a bundle on the strength of the digest
+> pre-check alone.
 
 > NORMATIVE: Verification MUST NOT use hand-rolled cryptographic code.
 > Implementations MUST delegate to `sigstore-python` (Python) or `sigstore-rs`

@@ -1050,22 +1050,19 @@ mod tests {
         assert_eq!(r, VerificationResult::DigestMismatch, "wrong index → DigestMismatch, got {r:?}");
     }
 
-    /// S5.5 cross-impl differential: the SAME committed multi-crypto-fault bundle (corrupt DSSE
-    /// signature + corrupt inclusion-proof hash, digest intact) must yield the SAME slug in both
-    /// impls — `SigInvalid`. The Python impl asserts the same on the same fixture
-    /// (`test_index_trust.py::test_s55_*`), guarding the divergence class S5.5 exists to catch.
-    ///
-    /// KNOWN ACCEPTED ASYMMETRY (fixture keeps the digest intact to avoid it): on a bundle with
-    /// BOTH a wrong digest AND a crypto fault, Rust reports `DigestMismatch` (digest pre-check
-    /// first, §4) while Python reports `SigInvalid` (digest checked only after `verify_dsse`).
-    /// Both still reject; only the slug differs. See the handoff.
+    /// S5.5 cross-impl differential: the SAME committed multi-fault bundle (wrong subject digest
+    /// + corrupt signature) must yield the SAME slug in both impls — `DigestMismatch`. Both impls
+    /// check the subject-digest binding BEFORE cryptographic verification (spec §3.4.4 precedence),
+    /// so the digest fault wins deterministically. The Python impl asserts the same on the same
+    /// fixture (`test_index_trust.py::test_s55_*`) — the first-failure-precedence divergence class
+    /// S5.5 exists to catch, now a defined guarantee.
     #[test]
     fn s5_5_multifault_bundle_same_slug_as_python() {
         let index = std::fs::read(format!("{FIXTURE_DIR}/index.kdl")).expect("fixture index");
         let bundle = std::fs::read(format!("{FIXTURE_DIR}/index.kdl.bundle.multifault"))
             .expect("multifault fixture");
         let r = SigstoreVerifier.verify(&index, &bundle, &TrustBundle::production(), FIXTURE_SIGNER, None);
-        assert_eq!(r, VerificationResult::SigInvalid, "both impls must agree: SigInvalid, got {r:?}");
+        assert_eq!(r, VerificationResult::DigestMismatch, "both impls must agree: DigestMismatch, got {r:?}");
     }
 
     #[test]

@@ -508,6 +508,23 @@ def _sigstore_verify(
     except Exception:
         return BundleMalformed
 
+    # Step 6 (subject-digest binding) — PRE-CHECKED here, BEFORE cryptographic verification
+    # (spec §3.4.4 NORMATIVE precedence). A bundle whose in-toto subject does not match
+    # sha256(index_bytes) is attesting a DIFFERENT artifact, so it is rejected as
+    # TNG-INDEX-DIGEST-MISMATCH deterministically — even when the signature is ALSO invalid.
+    # This gives cross-impl slug parity with the Rust impl, whose crate collapses digest and
+    # signature failures into one opaque error and therefore MUST pre-check (RFC §4).
+    # Reading the UNVERIFIED payload is sound: we only ask "does this bundle even claim our
+    # index?", we do not trust its contents. The post-verify digest check below remains as
+    # belt-and-suspenders on the cryptographically-verified payload.
+    import base64
+    try:
+        _pre_payload = base64.b64decode(json.loads(bundle_bytes)["dsseEnvelope"]["payload"])
+    except Exception:
+        return BundleMalformed
+    if not _check_dsse_payload_digest(_pre_payload, index_bytes):
+        return DigestMismatch
+
     # Signer identity policy: SubjectAltName must match expected_signer.
     # Default issuer is the GitHub Actions OIDC endpoint; S5 wires the per-URL
     # signer override when index-trust-signer / MILPA_INDEX_TRUST_SIGNER is set.
