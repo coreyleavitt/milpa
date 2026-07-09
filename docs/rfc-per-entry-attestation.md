@@ -1,9 +1,12 @@
 # RFC: per-entry attestation & author-attribution (registry trust, Part 2)
 
-**Status**: Draft — design decided at sketch level. P1–P2 are unblocked
-committed scope; P3a (mock-gated) needs only open question 2's scoping answer;
-only the real-crypto tail (P3b, P4) is blocked on the tianguis bundle-delivery
-decision (open question 1). Tracking issue: #184.
+**Status**: Draft — design decided at sketch level; **amended 2026-07-09**
+resolving open question 1 (delivery: content-addressed pinned sidecar, §7) and
+open question 2 (`strict` criteria: epoch-based, underwritten by
+`rfc-registry-append-only.md`). The amendment deltas pend one architect review
+round, scoped jointly with the append-only RFC. P1–P3a are unblocked committed
+scope; the real-crypto tail (P3b, P4) is blocked only on the tianguis delivery
+*implementation* (cross-repo prerequisite issue). Tracking issue: #184.
 **Author**: Corey Leavitt
 **Part 1 (landed)**: `docs/rfc-registry-trust-federation.md` — whole-index attestation
 gate, #103 (committed `66f00ff` review-fixes + `25bc246` root-scoped redesign).
@@ -152,6 +155,10 @@ independently-nullable ones — so the correlation invariants are structural:
 ```
 EntryAttestation = {
   rekor: RekorRef | None,                  # kind-independent, factored out
+  bundle_pin: Sha256Hex | None,            # sha256 of the bundle BYTES — the
+                                           # delivery-integrity pin (§7). None
+                                           # during the P2 claim-only window →
+                                           # the gate reports BUNDLE-MISSING
   kind: AuthorSigned { signer: str }       # signer REQUIRED
       | MilpaVendored,
 }
@@ -160,7 +167,8 @@ attestation: EntryAttestation | None
 
 The **wire format keeps the existing three sibling KDL child nodes**
 (`attestation`, `signed_by`, `rekor` — tianguis already emits them; the Nim
-`RekorRef` object exists there). The parser normalizes at the boundary
+`RekorRef` object exists there) **and adds a fourth, `bundle sha256="<64-hex>"`**
+— the delivery pin (§7), emitted once per-entry delivery ships (P4). The parser normalizes at the boundary
 (parse-to-typed, same pattern as `IndexProvenance`), in `_parse_version_node`
 (`registry.py:605`) / `parse_version_node` (`registry.rs:453`).
 
@@ -235,12 +243,13 @@ a hard error (`WS-ENTRY-TRUST-ON-MEMBER`, landing with the P3 error-catalog
 change). One honest caveat: Part 1's root-scoping was *structurally* forced
 (one index document per invocation), while per-entry outcomes are per-selected-
 dep — a member owning a security-sensitive dep might legitimately want
-strict-for-my-subtree. That granularity question is folded into open question
-2 (scoped `strict`), to be resolved before P3a stabilizes the `strict`
-semantics; the root-scoped *placement of the knob* is decided and does not
-change with the answer.
+strict-for-my-subtree. That granularity question was folded into open question
+2 and is **subsumed by its epoch-based resolution** (2026-07-09): epoch scoping
+makes universal `strict` adoptable directly, so per-member scoping is no longer
+load-bearing for adoption — it survives only as a possible UX refinement. The
+root-scoped placement of the knob is decided and unchanged.
 
-### 5. Error codes (7 × `TNG-ENTRY-*`) and the gate pipeline
+### 5. Error codes (8 × `TNG-ENTRY-*`) and the gate pipeline
 
 The gate evaluates the selected entry through this pipeline; each stage maps to
 exactly one slug, so every code is reachable, every outcome has a code, and a
@@ -254,7 +263,8 @@ rediscovering it:
 | Stage | Condition | Slug | warn | strict |
 |---|---|---|---|---|
 | 0. attestation record | absent / unknown kind / structurally invalid (collapsed) | `TNG-ENTRY-UNATTESTED` | warning | error |
-| 1. bundle acquisition | entry is attested but its bundle is unavailable | `TNG-ENTRY-BUNDLE-MISSING` | warning | error |
+| 1. bundle acquisition | entry is attested but its bundle is unavailable (no pin recorded, or pinned bytes unfetchable) | `TNG-ENTRY-BUNDLE-MISSING` | warning | error |
+| 1b. acquisition integrity | fetched bytes' sha256 ≠ the §2 `bundle` pin | `TNG-ENTRY-BUNDLE-PIN-MISMATCH` | warning | error |
 | 2. bundle parse | bundle bytes are not a well-formed Sigstore bundle (pre-crypto) | `TNG-ENTRY-BUNDLE-MALFORMED` | warning | error |
 | 3. subject digest | `subject[0].digest.sha256` ≠ entry `content_hash` | `TNG-ENTRY-DIGEST-MISMATCH` | warning | error |
 | 4. subject identity | `subject[0].name` ≠ selected `pkg:tianguis/<ns>/<name>@<version>` | `TNG-ENTRY-SUBJECT-MISMATCH` | warning | error |
@@ -275,9 +285,14 @@ layering) — normatively NOT a second hardcoded copy of the default, or every
 vendored entry on a self-hosted/forked index deployment would spuriously
 mismatch. `UNATTESTED` and `BUNDLE-MISSING` are deliberately distinct slugs:
 "never attested" and "attested but the proof is unavailable" are different
-trust states with different remediations.
+trust states with different remediations — as are `BUNDLE-MISSING` and
+`BUNDLE-PIN-MISMATCH`: "proof unavailable" and "delivery path served wrong
+bytes" differ in the same way (the latter is tamper evidence). Stage 1b is
+enforced *inside* the artifact store at acquisition time (its one
+hash-verify site, the `TNG-DEPDECL-HASH-MISMATCH` precedent — §7), never
+re-checked at the gate; the pipeline row states where the outcome slots.
 
-The seven slugs (plus `WS-ENTRY-TRUST-ON-MEMBER`, §4) land with their raise
+The eight slugs (plus `WS-ENTRY-TRUST-ON-MEMBER`, §4) land with their raise
 sites at **P3**, `spec/errors.md` + `errors.py`/`error.rs` in the same change,
 per the error-catalog discipline — NOT at the spec-only P1 slice, because both
 impls' bijection lints reject spec slugs with no impl constants, and P3 is
@@ -343,8 +358,37 @@ loads the index, and today's `*Record` types carry no attestation fields.
   force-invalidate every existing lockfile for an additive optional field;
   stated explicitly because the parser behavior makes the choice load-bearing,
   not cosmetic).
-- **Per-entry bundles are cached** alongside the index cache, keyed by subject
-  digest, at first acquisition — the cache is *storage only*; subject/name
+- **Delivery & acquisition (open question 1 — RESOLVED 2026-07-09): bundles
+  are content-addressed leaves pinned from the signed index** — the second
+  instance of the registry's two-tier pattern (mutable signed map → immutable
+  hash-pinned artifacts; DepDecl was the first). The §2 `bundle` pin commits
+  the Layer-1-verified index to the exact bundle bytes; acquisition fetches
+  `<index_base_url>/attestation/<sha256_hex>.bundle` (same §3.3 URL derivation
+  as `dep-decl/`) through a **generalized content-addressed artifact store**
+  extracted from `HttpDepDeclStore` (path segment, extension, size cap, and
+  mismatch slug parametrized — an extraction owed under the §6
+  extract-or-decline discipline; P3a's mockable acquisition surface IS this
+  store's file-backed variant). The store verifies the pin at its one
+  hash-verify site before caching; a mismatch is
+  `TNG-ENTRY-BUNDLE-PIN-MISMATCH` (§5 stage 1b) — delivery-path tampering
+  caught before any cryptography, extending Part 1's trust boundary to the
+  bundle bytes for free. Rationale for pinned leaves over the alternatives:
+  a coordinate-addressed tree (`bundles/<ns>/<name>/<version>.bundle`) is
+  semantically mutable — no transport integrity, and it reintroduces the
+  freshness problem the §6 no-freshness derivation just eliminated, with a
+  worse federation story (mirrors must replicate layout; pinned leaves are
+  location-independent). Inlining bundles in `index.kdl` multiplies index
+  size by orders of magnitude, makes acquisition eager where §3 made the
+  gate lazy, and re-churns the Layer-1 bundle + cache on every backfill.
+  Addressing by the *subject's* `content_hash` is a near-miss trap: §1's
+  name binding means one `content_hash` legitimately maps to multiple
+  bundles (byte-identical trees under different coordinates), and an
+  unpinned path has no transport integrity at all. Prior-art convergence:
+  TUF targets, cargo sparse-index checksums, OCI blobs, and Go's sumdb all
+  land on this same shape.
+- **Per-entry bundles are cached** alongside the index cache, keyed by the §2
+  bundle pin (the store's native key), at first acquisition — the cache is
+  *storage only*; subject/name
   binding is enforced at every verification, never by cache location. Repeat
   resolves and offline operation verify from cache; no per-resolve network
   amplification. `BUNDLE-MISSING` is not negatively cached **during the
@@ -394,7 +438,7 @@ cross-impl convergence; per-entry has MORE states, not fewer):
   result — a mixed resolve needs different verdicts per entry); (ii) stage 1
   (`BUNDLE-MISSING`) is an *acquisition* failure, so the bundle-delivery/cache
   lookup needs its own mockable surface, distinct from the verifier. Matrix:
-  each of the seven slugs × {warn, strict} × {author-signed, vendored}, the
+  each of the eight slugs × {warn, strict} × {author-signed, vendored}, the
   collapse cases (unknown kind, `author-signed` missing `signed_by`), one mixed
   resolve (attested + unattested + failing entries in one graph) to pin
   warning ordering/aggregation, plus four scenario fixtures guarding specific
@@ -419,9 +463,12 @@ cross-impl convergence; per-entry has MORE states, not fewer):
 
 ## Prerequisites
 
-1. **tianguis per-entry bundle delivery design settled** — the load-bearing
-   blocker (open question 1). A significant `coreyleavitt/tianguis` change,
-   cross-repo. Gates P3b+P4 only; P1–P3a are delivery-agnostic by construction
+1. **tianguis per-entry bundle delivery** — design SETTLED (open question 1;
+   §7 content-addressed pinned sidecar). The cross-repo remainder is
+   implementation only (bundle tree + pin emission + backfill + publish-time
+   epoch gate; tianguis prerequisite issue coreyleavitt/tianguis#42). Gates
+   P3b+P4 only;
+   P1–P3a are delivery-agnostic by construction
    (subject binding is to `content_hash` + package coordinate, not to any
    delivery envelope, and P3a's bundle-acquisition surface is mocked).
 2. **Layer 1 shipped** — ✅ DONE (#103).
@@ -430,30 +477,38 @@ cross-impl convergence; per-entry has MORE states, not fewer):
 
 ## Open questions
 
-1. **Per-entry bundle delivery** (the crux; resolve in a tianguis prerequisite
-   issue before P3b/P4):
-   - (a) inline bundle bytes/URL in `index.kdl` per version node — one fetch,
-     no second round-trip, but a much larger index;
-   - (b) bundle sidecar tree in the tianguis repo
-     (`bundles/<ns>/<name>/<version>.bundle`) — best for the offline guarantee
-     and the caching design above, but a non-trivial tianguis +
-     vendor-bot-workflow change;
-   - (c) Rekor UUID online lookup only — **rejected**: breaks the offline
-     guarantee (Part 1 §5.2), the same grounds Part 1 rejected online-only
-     verification.
-2. **`strict` adoption criteria and scoping.** Under `warn`, Layer 2 is
-   observability (see threat model — stripping bypasses it). What coverage
-   threshold or per-project posture justifies flipping the default, and does
-   `strict` need a scoped form to be adoptable before universal coverage —
-   per-attestation-kind (strict-for-author-signed-only), per-package, or
-   per-workspace-member (the §4 granularity caveat folds in here)? Two hazards
-   any answer must address: (i) Part 1 faced the same question for
-   `index-trust` and stayed `warn`-default, and per-entry coverage will lag
-   even further; (ii) unlike `TNG-NO-IDENTITY` (static per entry), entry-trust
-   outcomes are **not stable under floating constraints** — one unattested
-   `1.4.2` publish upstream hard-fails every `^1.4` strict consumer with zero
-   consumer-side change, a new resolution-availability regression class that
-   scoped/pinned forms of `strict` would have to blunt.
+1. **Per-entry bundle delivery — RESOLVED (2026-07-09): content-addressed
+   pinned sidecar (§7).** The index's `bundle sha256=` pin commits to the
+   exact bytes; tianguis serves `attestation/<sha256_hex>.bundle` under the
+   index base URL. Inline-in-index and coordinate-addressed sidecar variants
+   rejected on transport-integrity / caching / federation grounds (full
+   rationale in §7); online-only Rekor lookup stays rejected (breaks the
+   offline guarantee, Part 1 §5.2). The cross-repo remainder is
+   implementation, not design — tianguis prerequisite issue filed
+   (coreyleavitt/tianguis#42: bundle tree + pin emission + backfill dispatch
+   + the publish-time epoch gate from open question 2).
+2. **`strict` adoption criteria — RESOLVED (2026-07-09): epoch-based, not
+   coverage-based**, underwritten by the append-only ratchet
+   (`rfc-registry-append-only.md`). tianguis enforces a publish-time gate:
+   every entry with `published_at >= E` (the attestation epoch) MUST carry
+   an attestation, so post-epoch `UNATTESTED` is a *legacy-only* state and
+   "strict for post-epoch entries" is sound without waiting for universal
+   backfill. This dissolves both hazards the question named: (i) there is
+   no coverage threshold to guess — the strict boundary is a fact about the
+   registry, not a bet about adoption; (ii) the floating-constraint
+   regression class collapses — a new `1.4.2` publish is post-epoch and
+   therefore attested by construction, so `^1.4` strict consumers cannot be
+   broken by upstream publishes; only pre-epoch legacy versions stay
+   warn-territory, a fixed and shrinking set. Robustness: `published_at`
+   is bot-asserted, but the ratchet freezes it once observed, and the
+   ratchet's baseline watermark makes backdating *new* entries
+   consumer-detectable (append-only RFC §4); that backdate check lands with
+   P3. Epoch encoding — recommended: a root-level `attestation-epoch` field
+   in `index.kdl`, signed with the document and frozen under the ratchet
+   lattice; finalized at P3. The §4 granularity caveat (per-member scoped
+   strict) is subsumed: epoch scoping makes universal `strict` adoptable
+   directly, so per-member scoping is no longer load-bearing for adoption —
+   it survives only as a possible UX refinement.
 3. **Stronger identity model → Part 3.** Two distinct gaps, one mechanism-shaped
    answer: (i) chained trust takes `signed_by` on the bot's word — an
    independent, itself-attested owner registry (`(namespace, name)` → allowed
@@ -471,18 +526,19 @@ scope, and everything bundle-shaped waits on the delivery decision:
 - **P1** spec: invert the §3.2 clauses; `EntryAttestation` tagged data model +
   closed-set/conservative-collapse rule + subject-binding requirements (§1);
   lockfile attestation-block schema (claim, not outcome). Spec-only; both
-  impls' parse behavior specced. **No error slugs here** — the eight slugs
-  (§5's seven + the WS one) land at P3 with their raise sites, keeping the
+  impls' parse behavior specced. **No error slugs here** — the nine slugs
+  (§5's eight + the WS one) land at P3 with their raise sites, keeping the
   bijection lints green throughout the window before P3a lands.
 - **P2** attribution surfacing WITHOUT gating (committed scope, not blocked):
   parse `EntryAttestation` into `IndexVersion` (both impls, parse-to-typed;
   the parse boundary grows the *(typed index, collapse diagnostics)* return —
   §2); record the claim in the lockfile; surface in `milpa show` as an
   unverified claim (§7 wording). Delivers the human-audit value on its own.
-- **P3** the gate (P3a needs only open question 2's scoping answer; P3b is
-  blocked on open question 1 via P4):
+- **P3** the gate (P3a fully unblocked — open question 2 is resolved
+  epoch-based; P3b lands with P4, which is implementation-blocked on the
+  tianguis prerequisite issue):
   `entry-trust` axis (root-scoped), selection-step pipeline (§5 table),
-  the eight-slug error-catalog change, `EntryBundleVerifier` + keyed
+  the nine-slug error-catalog change, `EntryBundleVerifier` + keyed
   `MockVerifier` + mockable bundle-acquisition surface, `milpa verify` offline
   re-verification, conformance `entry-*` matrix. Includes the
   extract-or-decline decision on sharing `SigstoreVerifier` internals (§6).

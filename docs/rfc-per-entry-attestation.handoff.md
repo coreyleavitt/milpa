@@ -1,5 +1,16 @@
 # rfc-per-entry-attestation — handoff
 
+- **AMENDED 2026-07-09 (post-review):** open questions 1 and 2 RESOLVED after
+  Corey's elegance challenge on the cross-repo blocker. OQ1 = content-addressed
+  pinned bundle sidecar (§7 rewritten; §2 gains `bundle_pin`; §5 gains stage 1b
+  `TNG-ENTRY-BUNDLE-PIN-MISMATCH` — taxonomy now 8 TNG-ENTRY-* + WS = 9 at P3).
+  OQ2 = epoch-based strict, underwritten by the NEW
+  `docs/rfc-registry-append-only.md` (Part 1 amendment: monotone-entry lattice
+  + consumer ratchet; closes the R5 stripping/rollback class structurally).
+  §4 granularity caveat subsumed. **These deltas are review-naked** — they must
+  be covered by the append-only RFC's architect rounds (scope note in
+  `rfc-registry-append-only.handoff.md`). P3a now fully unblocked; P3b/P4
+  blocked only on tianguis *implementation* (prerequisite issue filed).
 - **Stage:** doc review COMPLETE (3 rounds, 2026-07-08). The RFC was upgraded Stub → Draft
   under the fix mandate (fix through Medium); "fix" = edit the RFC text (no implementation
   exists). Round 3 hit the floor: 1 Medium (P3a/P3b wording contradiction, fixed inline +
