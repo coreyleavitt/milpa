@@ -515,8 +515,14 @@ cross-impl convergence; per-entry has MORE states, not fewer):
    signer set) would detect a compromised bot mis-attributing an author;
    (ii) no monotonicity across republishes — a continuity ratchet ("was
    author-signed, must stay author-signed by the same identity") covers the
-   downgrade/rollback hole. Both are Part-3 scope; Part 2's lockfile attestation
-   block is the local raw material for (ii).
+   downgrade/rollback hole. **(ii) AMENDED 2026-07-09:** the continuity
+   ratchet is no longer Part-3 territory — it is exactly the monotone row of
+   the append-only RFC's §1 lattice (`rfc-registry-append-only.md`, #185):
+   stripping, re-attribution, and author→vendored downgrade are ratchet
+   violations there. Ownership split: Part 2 owns the `EntryAttestation`
+   *type*; the append-only RFC owns the *order* over its values. Only (i),
+   the owner registry, remains Part-3 scope. Part 2's lockfile attestation
+   block remains the local raw material for per-consumer continuity.
 
 ## Slices
 
