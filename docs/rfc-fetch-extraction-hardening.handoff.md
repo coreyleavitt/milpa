@@ -39,6 +39,15 @@ Order: H0 → H1 → H1b → H2 → **H-infra → H4 → H3a → H3b → H3c →
 - Final gates run by the control loop (not just subagents): Python **2218 passed, 30 skipped**; Rust **735 passed, 0 failed** (`./dev-rust test --workspace`).
 - Nothing committed — all work is in the tree awaiting review + commit.
 
+## ✅ CLOSED OUT (2026-06-27)
+- **Committed:** `7341d34` (73 files, +10884/−412; `closes #143/#144/#145/#149/#140/#175` on push — NOT yet pushed).
+- **All findings resolved:** every Crit/High/Med (4 review rounds) + all Lows, except one Rust lzma/xz decompressor unify blocked by a lzma-rs HRTB limitation (documented in-code).
+- **Follow-up filed:** #177 (conformance gap — realistic-size + hostile-tree-entry + submodule golden-hash fixtures; the gap that let the 2 Criticals escape the suite).
+- **Final gates:** Python 2251 passed / 30 skipped; Rust 755 passed / 0 failed.
+- **Fresco re-lock — N/A (phantom):** `tests/test_integration.py` was DELETED in the clean-room swap (`5ae87ad`); there is no pinned real-network fixture to re-lock. The handoff/CLAUDE.md "Real fresco verification" blurb is STALE (describes the retired 196-line suite). Instead, ran a live end-to-end smoke test (2026-06-27, real network) of the committed object-store path: temp project → `milpa fetch` real `intonaco` → **resolved 7 deps** (intonaco/chronos/results/stew/bearssl/httputils/unittest2), **`milpa verify` → verified 7 deps (exit 0)**, no `.git` leaked into `_deps/`. Rewrite validated against the real tree.
+- **CLAUDE.md doc-staleness (flagged to Corey):** the "Real fresco verification" / "test_integration.py primary fixture" lines should be updated to reflect the H-infra tier (real git vs generated local repos, no network) that replaced the retired suite.
+- **Optional:** `git push` (auto-closes the 6 referenced issues).
+
 ## Review ledger (stage 4) — ✅ FLOOR REACHED (0 Crit/High/Med)
 - **Rounds:** R1 (find: 6 lenses + 7 verifiers → 23 findings) → R1 fixes → R2 re-review (found 9 new incl. 1 cross-impl High my own fix introduced) → R2/R3 fixes → R3 re-review (security CLEAN; found R3-01 High + R3-02 Med) → R4 fixes → R4 verify: **0 Crit/High/Med, only Lows remain.**
 - **Final gates:** Python **2245 passed / 30 skipped**; Rust **753 passed / 0 failed**. Bijection green (reused slugs only). Spec updated to match impl (errors.md trigger; plugin-contract §2.3.5 depth-bound, §2.3.7 entry-path containment + non-UTF-8→ID-NON-UTF8-RELPATH, §2.4.4 decomp stream-cap + lzma attempt-decode; stale cross-refs fixed).

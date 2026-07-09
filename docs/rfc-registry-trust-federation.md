@@ -1266,57 +1266,11 @@ version?" rather than "was the index tampered?". Deferral rationale:
   the tianguis vendor-bot workflow; per-entry attribution adds author identity
   for human-signed versions, which is valuable but not a safety gate.
 
-**File a follow-on GitHub issue** for Part-2 per-entry author-attribution
-(adjacent to #91 availability follow-on).
-
-### Part 2 design notes
-
-**Spec changes deferred:** The four normative "parsed and ignored" clauses in
-`spec/registry-protocol.md §3.2` are inverted in Part 2. The regression test
-`test_rekor_block_is_tolerated_and_ignored` is inverted: it asserts that
-`IndexVersion.attestation`, `IndexVersion.signed_by`, and `IndexVersion.rekor`
-ARE populated from the parsed version node, not ignored.
-
-**IndexVersion field surface (deferred):** `IndexVersion` gains three new fields:
-`attestation: str | None`, `signed_by: str | None`, and `rekor: RekorRef | None`
-(a dataclass with `uuid`, `log_index`, `integrated_time`). Parser in `registry.py`
-(L181–206) and `registry.rs` (L141–154) populates them.
-
-**Per-entry gate (deferred):** At version-selection time (`registry.py`
-`Index.resolve_named_all` / `resolve_named` L264–360; `registry.rs`
-`Index::satisfying_versions` L290–), verify the selected `IndexVersion`'s
-per-entry bundle:
-
-| `attestation` field value | Expected signer |
-|---|---|
-| `"milpa-vendored"` | Pinned vendor-bot identity |
-| `"author-signed"` | `signed_by` field value (trusted via chained whole-index trust) |
-| absent / unknown | `TNG-ENTRY-UNATTESTED` per policy |
-
-**Chained-trust rationale:** The `signed_by` field is trusted because the
-whole-index gate has already verified the entire `index.kdl` against the vendor-
-bot. The vendor-bot's attestation carries the `signed_by` identity; milpa uses
-it as the expected SubjectAltName for per-entry verification. A stronger model
-(independent per-package owner registry) is a potential further follow-on.
-
-**Deferred error codes:**
-
-| Slug | Condition |
-|---|---|
-| `TNG-ENTRY-UNATTESTED` | Selected version node has no `attestation` field (warn: warning; strict: error). |
-| `TNG-ENTRY-SIGNATURE-INVALID` | Per-entry bundle signature verification failed. |
-| `TNG-ENTRY-SIGNER-MISMATCH` | Per-entry bundle's certificate identity does not match the expected signer for that attestation kind. |
-
-**Per-entry bundle delivery (open question for Part 2):**
-
-- (a) Inline bundle bytes or URL in `index.kdl` per version node (larger index,
-  one fetch, no second round-trip).
-- (b) Bundle sidecar tree in tianguis repo (`bundles/<ns>/<name>/<version>.bundle`):
-  preferred for offline consistency, but a non-trivial tianguis change.
-- (c) Rekor UUID online lookup only: breaks the offline guarantee (§5.2).
-
-Resolve in the tianguis Part-2 prerequisite issue filed alongside the whole-
-index bundle delivery issue (§9.2).
+The full Part-2 design (field surface, per-entry gate, the 3 `TNG-ENTRY-*`
+codes, chained-trust rationale, and the open per-entry-bundle-delivery question)
+now lives in its own stub — **`docs/rfc-per-entry-attestation.md`** — so this RFC
+stays the single source of truth for Layer 1 and Part 2 has one home. A tracking
+GitHub issue (adjacent to #91) should be filed against that stub.
 
 ---
 
