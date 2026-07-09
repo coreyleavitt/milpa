@@ -116,7 +116,7 @@ Each field is tagged with one of four component orders:
 | Class (order) | Fields | Legal transitions |
 |---|---|---|
 | **Frozen** (set-once: `absent < v`; distinct values incomparable) | `content_hash`; `dep_decl` **together with** `dep_decl_schema_version` (they move in lockstep — mutating the schema version alone re-interprets the pin and is a violation); `published_at`; `rekor` block; presence of the version node; presence of the package node | `absent/empty → value` is legal **exactly once** (legacy backfill: an entry with an empty `content_hash` is unresolvable anyway (`TNG-NO-IDENTITY`), so backfilling it is semantically a first publication and the identity gate still guards the bytes; same shape for `dep_decl` rollout). `value → value′` and `value → absent` are violations. |
-| **Monotone** (the attestation order) | attestation record (Part 2's `EntryAttestation` incl. its `bundle` pin). **Ownership split**: Part 2 owns the *type*; this RFC owns the *order* over its values. | `None → MilpaVendored`, `None → AuthorSigned(s)`, `MilpaVendored → AuthorSigned(s)` (backfill/upgrade). Illegal: any `→ None` (stripping), `AuthorSigned(s₁) → AuthorSigned(s₂)` (re-attribution), `AuthorSigned → MilpaVendored` (downgrade). `MilpaVendored → MilpaVendored` with a changed `signed_by` (bot workflow identity rotation) is **unconstrained** — stated explicitly; vendored attestation is a bug ratchet, not a security boundary (Part 2 §3). |
+| **Monotone** (the attestation order) | attestation record (Part 2's `EntryAttestation` incl. its `bundle` pin). **Ownership split**: Part 2 owns the *type*; this RFC owns the *order* over its values. | `None → MilpaVendored`, `None → AuthorSigned(s)`, `MilpaVendored → AuthorSigned(s)` (backfill/upgrade). Illegal: any `→ None` (stripping), `AuthorSigned(s₁) → AuthorSigned(s₂)` (re-attribution), `AuthorSigned → MilpaVendored` (downgrade). `MilpaVendored → MilpaVendored` with a changed `signed_by` (bot workflow identity rotation) is **unconstrained** — stated explicitly; vendored attestation is a bug ratchet, not a security boundary (Part 2 §3). Within an otherwise-unchanged `(kind, signer)`, the record's `bundle` pin MUST be structurally equal — a same-kind `bundle_pin` swap is a violation (payload kind `monotone-repinned`); the pin may change only as part of a legal kind/signer upgrade transition. Scope split with Part 2's stage 1b: `TNG-ENTRY-BUNDLE-PIN-MISMATCH` checks *served bytes* against the current snapshot's pin (acquisition-time transport integrity); this row checks the *pin's history* across snapshots (ratchet-time). Different checks; they cannot collide. |
 | **Append-only** (multiset inclusion) | provenance **multiset**, compared by full-field value equality — never by list position | records may be added (mirrors, #91); removal is a violation. In-place mutation of one record's fields (e.g. `commit_sha`) manifests under multiset comparison as removal + addition — caught as removal. Preference **order** is advisory-mutable (reordering is legal — the identity gate makes every provenance of an entry byte-equivalent, `registry-protocol.md §3.3`, so order affects availability, not identity). |
 | **Advisory-mutable** (trivial order — everything comparable) | `yanked` / `yanked_at` / `yanked_reason` (§5) — mutable both directions but **every transition is surfaced as a ratchet notice**, never silent; package-level descriptive fields (`upstream`) — mutable and silent | both directions legal |
 
@@ -126,6 +126,21 @@ field/order-kind tags, instead of four hand-coded comparison branches plus
 special-cased disappearance rules. Adding a field later means tagging it with
 an order kind, not writing a new prose carve-out. (This is the
 audit-for-duplication discipline applied prospectively.)
+
+**Root-level fields (outside the entry map).** The entry lattice cannot
+classify document-root fields; they get their own two-row table under the
+same dominance machinery, keyed by field name:
+
+| Root field | Order | Legal transitions |
+|---|---|---|
+| `schema_version` | monotone non-decreasing | increase legal (schema evolution); decrease is a violation |
+| `attestation-epoch` (Part 2 OQ2) | **set-once** | `absent → E` legal exactly once; any change thereafter is a violation. Set-once, not merely non-decreasing: *raising* the epoch reclassifies every published entry as pre-epoch/legacy and nullifies the attestation mandate while staying technically non-decreasing. |
+
+Root-field violations raise `TNG-INDEX-ROOT-MUTATED` (§3). Ownership follows
+the attestation-order rule: this RFC owns root-field orders; the documents
+that introduce the fields own their types. Staging: `schema_version` is
+parseable today (A2); the `attestation-epoch` row enforces when Part 2's P3
+introduces the field.
 
 Two derived rules, stated explicitly:
 
@@ -298,17 +313,21 @@ explicit verb, so it is v1 scope:
 
 ### 3. Error taxonomy & diagnostics
 
-Three new slugs, landing with their raise sites (bijection discipline):
+Four new slugs, landing with their raise sites (bijection discipline):
 
 | Slug | Condition | Policy |
 |---|---|---|
+| `TNG-INDEX-ROOT-MUTATED` | A document-root field violates the §1 root-field class (`schema_version` decrease; `attestation-epoch` change once set). | gated by `index-history` |
 | `TNG-INDEX-ROLLBACK` | A package or version present in the baseline is absent from the candidate index (presence-component dominance failure — the rollback/deletion class). | gated by `index-history` |
-| `TNG-ENTRY-MUTATED` | An entry present in both violates the §1 field lattice (frozen-field change, monotone downgrade/strip/re-attribution, provenance removal). | gated by `index-history` |
+| `TNG-ENTRY-MUTATED` | An entry present in both violates the §1 field lattice (frozen-field change, monotone downgrade/strip/re-attribution/re-pin, provenance removal). | gated by `index-history` |
 | `TNG-INDEX-BASELINE-CORRUPT` | The baseline sidecar exists but is unparseable/truncated. | **hard fail regardless of policy** |
 
 **Ordering and precedence — one rule, not two.** All violations are sorted by
 the composite key `(class_rank, namespace, name, version)` where
-`TNG-INDEX-ROLLBACK` has rank 0 and `TNG-ENTRY-MUTATED` rank 1; the raised or
+`TNG-INDEX-ROOT-MUTATED` has rank 0 (document-level semantics beat entry-level
+— it is the bluntest signal), `TNG-INDEX-ROLLBACK` rank 1, and
+`TNG-ENTRY-MUTATED` rank 2 (root-field violations sort with an empty entry
+key); the raised or
 warned diagnostic carries the *first* element as its slug and the full sorted
 list in its payload. Worked example (the S5.5 lesson, pre-answered): package
 `aaa` has a frozen-field mutation, package `zzz` has a version disappearance —
@@ -321,7 +340,8 @@ kwargs (precedent: `names=` in `attestation.py`); the ratchet attaches
 `violations=[…]` where each element carries
 `(class, entry_key, field, kind, baseline_value, candidate_value)` and `kind`
 is the sub-class: `frozen-changed | frozen-unset | monotone-stripped |
-monotone-reattributed | monotone-downgraded | provenance-removed`. The
+monotone-reattributed | monotone-downgraded | monotone-repinned |
+provenance-removed | root-field-changed`. The
 sub-class lives in the payload, not in more slugs: Part 1's slug collapses
 were forced by verification-library ambiguity; these sub-classes are
 deterministic products of the lattice, so one raise site with a
@@ -445,13 +465,13 @@ version "1.4.2" {
   with Part 2's P2, not before. `§5.2` constraint filtering gains the
   yanked-exclusion clause (both lookup paths). `§6` index caching gains the
   baseline sidecar trio + lifecycle + the accept verb's cache semantics.
-  Appendix A gains the three slugs.
+  Appendix A gains the four slugs.
 - `spec/cli-contract.md` — `milpa index accept` verb; `MILPA_INDEX_HISTORY`
   env var; `index-history` manifest node with root-authority +
   `WS-INDEX-HISTORY-ON-MEMBER` member-declaration error (mirrors §3.4.7).
-- `spec/errors.md` — `TNG-INDEX-ROLLBACK`, `TNG-ENTRY-MUTATED`,
-  `TNG-INDEX-BASELINE-CORRUPT`, `WS-INDEX-HISTORY-ON-MEMBER` (with raise
-  sites, per slice sequencing).
+- `spec/errors.md` — `TNG-INDEX-ROOT-MUTATED`, `TNG-INDEX-ROLLBACK`,
+  `TNG-ENTRY-MUTATED`, `TNG-INDEX-BASELINE-CORRUPT`,
+  `WS-INDEX-HISTORY-ON-MEMBER` (with raise sites, per slice sequencing).
 - Part 1 RFC — a short amendment note pointing here (the "what Layer 1 does
   not check" §4 caveat gains its answer).
 - Part 2 RFC — OQ3(ii) amendment note: the continuity ratchet is this RFC's
@@ -479,8 +499,9 @@ pre-seed the sidecars before invoking the loader. Only then the matrix
 - each violation class, × {warn, strict}: `content_hash` swap, `dep_decl`
   swap, `dep_decl_schema_version` solo change, `published_at` change,
   version disappearance, package disappearance, in-place provenance mutation
-  (distinct from removal), provenance removal, attestation strip / signer
-  re-attribution / downgrade (staged to A6);
+  (distinct from removal), provenance removal, `schema_version` decrease
+  (root-field), attestation strip / signer re-attribution / downgrade /
+  same-kind `bundle_pin` swap / `attestation-epoch` change (staged to A6);
 - composite ordering: one fixture with a mutation on an alphabetically-early
   entry AND a rollback on a late entry → slug is `TNG-INDEX-ROLLBACK`,
   payload lists both in composite-key order;
@@ -554,7 +575,9 @@ composite-ordered violation payloads across the matrix (S5.5 precedent).
   write-after-index ordering, corrupt→hard-fail, reported-digest); wiring
   into **both** `load_index` State 2 and `_refetch_with_recovery`;
   `index-history` axis plumbing (manifest + env + root authority + member
-  error); `milpa index accept`; the four slugs in `spec/errors.md` +
+  error); the root-field check (`schema_version` row; `attestation-epoch`
+  row waits for the field, A6); `milpa index accept`; the five slugs in
+  `spec/errors.md` +
   `errors.py` (Python's bijection lint has **no deferred window** — raise
   sites land in the same change) + Rust `all_codes()` with corpus `DEFERRED`
   entries for the Rust raise sites; unit tests for every lattice row
@@ -576,7 +599,8 @@ composite-ordered violation payloads across the matrix (S5.5 precedent).
   enforcement — parse lands with Part 2's P2; this slice adds the dominance
   tags, inverts the pinned no-rekor regression test deliberately, and lands
   the staged fixtures (attestation strip / re-attribution / downgrade /
-  `rekor` mutation, × {warn, strict}).
+  same-kind `bundle_pin` swap / `rekor` mutation / `attestation-epoch`
+  change, × {warn, strict}).
 
 ## Connections
 

@@ -264,7 +264,7 @@ rediscovering it:
 |---|---|---|---|---|
 | 0. attestation record | absent / unknown kind / structurally invalid (collapsed) | `TNG-ENTRY-UNATTESTED` | warning | error |
 | 1. bundle acquisition | entry is attested but its bundle is unavailable (no pin recorded, or pinned bytes unfetchable) | `TNG-ENTRY-BUNDLE-MISSING` | warning | error |
-| 1b. acquisition integrity | fetched bytes' sha256 ≠ the §2 `bundle` pin | `TNG-ENTRY-BUNDLE-PIN-MISMATCH` | warning | error |
+| 1b. acquisition integrity | fetched bytes' sha256 ≠ the §2 `bundle` pin | `TNG-ENTRY-BUNDLE-PIN-MISMATCH` | **error (unconditional)** | error |
 | 2. bundle parse | bundle bytes are not a well-formed Sigstore bundle (pre-crypto) | `TNG-ENTRY-BUNDLE-MALFORMED` | warning | error |
 | 3. subject digest | `subject[0].digest.sha256` ≠ entry `content_hash` | `TNG-ENTRY-DIGEST-MISMATCH` | warning | error |
 | 4. subject identity | `subject[0].name` ≠ selected `pkg:tianguis/<ns>/<name>@<version>` | `TNG-ENTRY-SUBJECT-MISMATCH` | warning | error |
@@ -291,6 +291,22 @@ bytes" differ in the same way (the latter is tamper evidence). Stage 1b is
 enforced *inside* the artifact store at acquisition time (its one
 hash-verify site, the `TNG-DEPDECL-HASH-MISMATCH` precedent — §7), never
 re-checked at the gate; the pipeline row states where the outcome slots.
+And it inherits that precedent's **full severity model, not just its raise
+site**: `TNG-DEPDECL-HASH-MISMATCH` is a security invariant — always a hard
+error, never policy-gated — and a bundle-pin mismatch is the same class of
+fact (the Layer-1-verified index committed to exact bytes; the delivery path
+served different ones — active tampering or serious infra corruption, never
+a legacy/rollout state). `entry-trust` gates trust *interpretation*
+(unattested / unverifiable / mismatched claims); it never gates transport
+integrity. So stage 1b hard-fails under `warn` too — there is no coherent
+"warn and proceed" (proceeding on the wrong bytes verifies nothing;
+degrading to BUNDLE-MISSING would launder tamper evidence into a routine
+availability warning). Stage 1b's payload also carries a `cause`
+discriminator on `BUNDLE-MISSING` (`no-pin` — delivery not yet shipped /
+legacy entry — vs `unfetchable` — pin present, transport failed), since
+those two causes have the different-remediation property this section uses
+to justify separate slugs elsewhere; the discriminator rides the payload,
+not a new slug.
 
 The eight slugs (plus `WS-ENTRY-TRUST-ON-MEMBER`, §4) land with their raise
 sites at **P3**, `spec/errors.md` + `errors.py`/`error.rs` in the same change,
@@ -368,7 +384,12 @@ loads the index, and today's `*Record` types carry no attestation fields.
   extracted from `HttpDepDeclStore` (path segment, extension, size cap, and
   mismatch slug parametrized — an extraction owed under the §6
   extract-or-decline discipline; P3a's mockable acquisition surface IS this
-  store's file-backed variant). The store verifies the pin at its one
+  store's file-backed variant, whose parity knob is named now:
+  `MILPA_ENTRY_BUNDLE_DIR`, the mirror of `MILPA_DEP_DECL_DIR`). The bundle
+  size-cap default is fixed at P3 by the same measured-corpus reasoning that
+  sized `_DEP_DECL_MAX_ARTIFACT_BYTES` — not inherited blindly: Sigstore
+  bundles (cert chain + inclusion proof + SET) run larger than DepDecl KDL
+  text. The store verifies the pin at its one
   hash-verify site before caching; a mismatch is
   `TNG-ENTRY-BUNDLE-PIN-MISMATCH` (§5 stage 1b) — delivery-path tampering
   caught before any cryptography, extending Part 1's trust boundary to the
@@ -471,6 +492,13 @@ cross-impl convergence; per-entry has MORE states, not fewer):
    P1–P3a are delivery-agnostic by construction
    (subject binding is to `content_hash` + package coordinate, not to any
    delivery envelope, and P3a's bundle-acquisition surface is mocked).
+   **Honest tail:** that claim is about the *code*, not about production
+   usability — until P4's backfill ships, every real attested entry carries
+   no `bundle` pin, so `entry-trust strict` against the live registry
+   fail-closes with `TNG-ENTRY-BUNDLE-MISSING` on 100% of mandated entries,
+   not a partial degradation. `strict` is code-complete at P3a and
+   *functional* only after P4; the default (`warn`) is unaffected in the
+   window.
 2. **Layer 1 shipped** — ✅ DONE (#103).
 3. **Real verifiers in both impls** — ✅ DONE (attestation-verifier RFC; Rust
    via vendored sigstore-rs patch, upstreaming tracked in #183).
@@ -503,9 +531,21 @@ cross-impl convergence; per-entry has MORE states, not fewer):
    is bot-asserted, but the ratchet freezes it once observed, and the
    ratchet's baseline watermark makes backdating *new* entries
    consumer-detectable (append-only RFC §4); that backdate check lands with
-   P3. Epoch encoding — recommended: a root-level `attestation-epoch` field
-   in `index.kdl`, signed with the document and frozen under the ratchet
-   lattice; finalized at P3. The §4 granularity caveat (per-member scoped
+   P3. **`published_at` is mandatory post-epoch** (closing the omission
+   dodge the append-only RFC §4 names): tianguis#42's publish-time gate
+   makes `published_at` required at publish once the epoch is set, and the
+   consumer side is fail-closed — when the index declares
+   `attestation-epoch`, an entry *lacking* `published_at` is treated as
+   post-epoch (the mandate applies); omission must never be cheaper than a
+   detectable backdate. Detail (interaction with pre-epoch legacy entries
+   that genuinely lack the field) finalized at P3. Epoch encoding —
+   recommended: a root-level `attestation-epoch` field in `index.kdl`,
+   signed with the document and **set-once under the append-only RFC's
+   root-field class (its §1)** — set-once, not merely monotone-non-
+   decreasing, because *raising* the epoch reclassifies every published
+   entry as pre-epoch/legacy and nullifies the mandate while staying
+   technically non-decreasing; a root-field violation is
+   `TNG-INDEX-ROOT-MUTATED` there. Finalized at P3. The §4 granularity caveat (per-member scoped
    strict) is subsumed: epoch scoping makes universal `strict` adoptable
    directly, so per-member scoping is no longer load-bearing for adoption —
    it survives only as a possible UX refinement.
