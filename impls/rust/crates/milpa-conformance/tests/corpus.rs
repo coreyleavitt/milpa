@@ -145,6 +145,18 @@ fn spec_error_codes() -> BTreeSet<String> {
 /// is removed from spec/errors.md and replaced by WS-INDEX-TRUST-ON-MEMBER, wired in
 /// error.rs CoreError::all_codes() and check_member_index_trust_declarations in
 /// workspace.rs.
+/// P3a (RFC `rfc-per-entry-attestation.md` §5): added the eight TNG-ENTRY-*
+/// per-entry attestation gate codes plus WS-ENTRY-TRUST-ON-MEMBER to
+/// spec/errors.md and errors.py (Python) with raise sites in
+/// `entry_trust.py` / `entry_bundle_store.py` / `resolver.py` /
+/// `workspace.py`. Rust parity landed the same slice — raise sites in
+/// `entry_trust.rs` / `entry_bundle_store.rs` (`error.rs`'s
+/// `CoreError::all_codes()`), `resolver.rs`'s `build_graph` gate call, and
+/// `check_member_entry_trust_declarations` in `workspace.rs`. All 9 codes
+/// moved from DEFERRED to `implemented_error_codes()`.
+///
+/// `DEFERRED` is now EMPTY — every spec code either has a Rust raise site or
+/// is listed in `EXEMPT` below.
 const DEFERRED: &[&str] = &[];
 
 /// Spec codes this implementation intentionally never emits.

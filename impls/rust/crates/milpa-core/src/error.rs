@@ -261,6 +261,24 @@ impl CoreError {
             // workspace-ROOT-only policy (manifest-structure error; raised
             // before any index fetch).
             "WS-INDEX-TRUST-ON-MEMBER",
+            // P3a (RFC per-entry-attestation.md §5): per-entry Sigstore
+            // attestation gate. Emitted by enforce_entry_trust /
+            // evaluate_entry_attestation (entry_trust.rs) when the selected
+            // registry-resolved dep's attestation record is absent, its bundle
+            // is unavailable or fails one of the pre-crypto / crypto checks.
+            "TNG-ENTRY-UNATTESTED",
+            "TNG-ENTRY-BUNDLE-MISSING",
+            "TNG-ENTRY-BUNDLE-PIN-MISMATCH",
+            "TNG-ENTRY-BUNDLE-MALFORMED",
+            "TNG-ENTRY-DIGEST-MISMATCH",
+            "TNG-ENTRY-SUBJECT-MISMATCH",
+            "TNG-ENTRY-SIGNATURE-INVALID",
+            "TNG-ENTRY-SIGNER-MISMATCH",
+            // P3a: workspace entry-trust root-authority validation (RFC §4).
+            // Emitted by check_member_entry_trust_declarations in workspace.rs
+            // when a workspace MEMBER declares entry-trust — that field is a
+            // workspace-ROOT-only policy, mirroring WS-INDEX-TRUST-ON-MEMBER.
+            "WS-ENTRY-TRUST-ON-MEMBER",
         ]
     }
 }

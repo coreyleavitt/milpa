@@ -96,6 +96,7 @@ pub fn resolve(
         manifest, index, fetcher, profile, prior, strategy, deps_dir,
         dep_decl_store, require_attested_metadata, store,
         &std::collections::BTreeSet::new(), false, false,
+        None,
     )
 }
 
@@ -119,6 +120,9 @@ pub fn resolve_with_features(
     features: &std::collections::BTreeSet<String>,
     no_default_features: bool,
     all_features: bool,
+    // P3a (RFC per-entry-attestation.md §3): entry-trust gate config; `None`
+    // disables the gate entirely.
+    entry_trust: Option<&crate::entry_trust::EntryTrustConfig>,
 ) -> Result<ResolvedGraph, MilpaError> {
     // S9 (RFC #23 §3.4): compute root CLI active-flag seed when any CLI
     // feature-selection is present. Mirrors Python's _compute_root_active_seed.
@@ -307,7 +311,7 @@ pub fn resolve_with_features(
     // `--require-attested-metadata` CLI flag (flag cannot weaken manifest-strict).
     enforce_attestation_policy(&provider, manifest, require_attested_metadata)?;
 
-    let graph = provider.build_graph(&solution, &canonical_aliases);
+    let graph = provider.build_graph(&solution, &canonical_aliases, entry_trust)?;
 
     // S8a: non-reproducible override warning (RFC #23 §3.3 reproducibility carve-out).
     // A local= override produces a LocalProvenanceRecord for a dep that was declared
@@ -617,6 +621,9 @@ pub fn resolve_workspace_with_features(
     features: &std::collections::BTreeSet<String>,
     no_default_features: bool,
     all_features: bool,
+    // P3a (RFC per-entry-attestation.md §3): entry-trust gate config; `None`
+    // disables the gate entirely.
+    entry_trust: Option<&crate::entry_trust::EntryTrustConfig>,
 ) -> Result<ResolvedGraph, MilpaError> {
     // Compute workspace-root cli_seed (mirrors resolve_with_features logic).
     use std::collections::HashSet;
@@ -658,7 +665,7 @@ pub fn resolve_workspace_with_features(
 
     resolve_workspace_inner(
         workspace, index, fetcher, profile, prior, strategy, deps_dir,
-        require_attested_metadata, store, ws_cli_seed.as_ref(),
+        require_attested_metadata, store, ws_cli_seed.as_ref(), entry_trust,
     )
 }
 
@@ -681,6 +688,7 @@ pub fn resolve_workspace(
         workspace, index, fetcher, profile, prior, strategy, deps_dir,
         require_attested_metadata, store,
         None, // ws_cli_seed: no feature selection inputs
+        None, // entry_trust: gate disabled (backward-compat wrapper)
     )
 }
 
@@ -711,6 +719,9 @@ pub fn resolve_workspace_with_cert(
     features: &std::collections::BTreeSet<String>,
     no_default_features: bool,
     all_features: bool,
+    // P3a (RFC per-entry-attestation.md §3): entry-trust gate config; `None`
+    // disables the gate entirely.
+    entry_trust: Option<&crate::entry_trust::EntryTrustConfig>,
 ) -> Result<(ResolvedGraph, SuccessCert), (MilpaError, FailureCert)> {
     // Macro: wrap a plain MilpaError in the cert-failure pair with an empty
     // FailureCert (the cert only carries meaning for SOLVE-CONFLICT).
@@ -862,7 +873,10 @@ pub fn resolve_workspace_with_cert(
                 lift_err!(e);
             }
             let cert = provider.build_success_cert(&solution);
-            let graph = provider.build_graph(&solution, &canonical_aliases_ws);
+            let graph = match provider.build_graph(&solution, &canonical_aliases_ws, entry_trust) {
+                Ok(g) => g,
+                Err(e) => lift_err!(e),
+            };
             rebuild_deps_view(&graph, deps_dir, store);
             Ok((graph, cert))
         }
@@ -894,6 +908,7 @@ fn resolve_workspace_inner(
     require_attested_metadata: bool,
     store: &CaStore,
     ws_cli_seed: Option<&std::collections::HashSet<String>>,
+    entry_trust: Option<&crate::entry_trust::EntryTrustConfig>,
 ) -> Result<ResolvedGraph, MilpaError> {
     let overrides: BTreeMap<String, Override> = workspace
         .overrides
@@ -1007,7 +1022,7 @@ fn resolve_workspace_inner(
     // ws_is_strict (single computation, no duplicate any_member_strict loop).
     enforce_attestation_policy_strict(&provider, ws_is_strict)?;
 
-    let graph = provider.build_graph(&solution, &canonical_aliases_ws);
+    let graph = provider.build_graph(&solution, &canonical_aliases_ws, entry_trust)?;
     // B-nimcfg SSOT: rebuild _deps/ view (alias symlinks + stale-entry removal).
     // Mirrors resolve_workspace_frozen (frozen.rs:175) — the live path now owns
     // the rebuild internally, symmetric with the frozen path.
@@ -1149,6 +1164,15 @@ struct Candidate {
     /// named-dep candidates. `None` for URL/tarball/local/member candidates
     /// (no index entry) and the synthetic root.
     attestation: Option<EntryAttestation>,
+    /// P3a (RFC per-entry-attestation.md §3): `true` iff this candidate was
+    /// materialised via the named-dep (registry) path — the entry-trust
+    /// gate's discriminator for "is this a registry-resolved dep at all",
+    /// distinct from `attestation.is_none()` (also true for an unattested
+    /// registry dep). `false` for URL/tarball/local/member/root candidates.
+    is_registry: bool,
+    /// P3a: the entry's REAL index namespace (`registry::IndexVersion::namespace`),
+    /// populated for registry candidates only. Empty string otherwise.
+    registry_namespace: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1486,6 +1510,8 @@ impl<'a> ResolveProvider<'a> {
             dep_decl: None,
             requires_predicates: std::collections::BTreeMap::new(),
             attestation: None,
+            is_registry: false,
+            registry_namespace: String::new(),
         };
         self.store_candidate(root);
         Ok(queue)
@@ -1715,6 +1741,8 @@ impl<'a> ResolveProvider<'a> {
                 dep_decl: None, // workspace members never resolved via DepDecl
                 requires_predicates: std::collections::BTreeMap::new(),
                 attestation: None, // workspace members have no index entry
+                is_registry: false,
+                registry_namespace: String::new(),
             });
             root_deps.push(SolverDep::new(member.name.clone(), eq_sentinel()));
             root_requires.push(member.name.clone());
@@ -1830,6 +1858,8 @@ impl<'a> ResolveProvider<'a> {
             dep_decl: None,
             requires_predicates: std::collections::BTreeMap::new(),
             attestation: None,
+            is_registry: false,
+            registry_namespace: String::new(),
         };
         self.store_candidate(root);
         Ok(queue)
@@ -2190,6 +2220,8 @@ impl<'a> ResolveProvider<'a> {
             dep_decl: None, // URL deps not in the index; no DepDecl pin
             requires_predicates: ex.requires_predicates,
             attestation: None, // URL deps not in the index; no attestation record
+            is_registry: false,
+            registry_namespace: String::new(),
         });
 
         // S3 / S4a / C1: unconditionally seed dep_active_flags for this URL dep so that
@@ -2267,6 +2299,8 @@ impl<'a> ResolveProvider<'a> {
             dep_decl: None, // local deps not in the index; no DepDecl pin
             requires_predicates: ex.requires_predicates,
             attestation: None, // local deps not in the index; no attestation record
+            is_registry: false,
+            registry_namespace: String::new(),
         });
         self.process_items(ex.sub_items)?;
         Ok(())
@@ -2320,6 +2354,8 @@ impl<'a> ResolveProvider<'a> {
             declared_mirror_urls: Vec::new(), // tarball deps have no mirrors
             requires_predicates: ex.requires_predicates,
             attestation: None, // tarball deps not in the index; no attestation record
+            is_registry: false,
+            registry_namespace: String::new(),
         });
         self.process_items(ex.sub_items)?;
         Ok(())
@@ -2473,6 +2509,9 @@ impl<'a> ResolveProvider<'a> {
             // RFC per-entry-attestation.md P2: straight passthrough from the
             // selected index entry — already `None` when absent/collapsed.
             attestation: entry.attestation.clone(),
+            // P3a: this candidate came from the named-dep (registry) path.
+            is_registry: true,
+            registry_namespace: entry.namespace.clone(),
         };
         self.store_candidate(candidate);
         self.stubs
@@ -2955,11 +2994,20 @@ impl<'a> ResolveProvider<'a> {
     ///
     /// `canonical_aliases` maps canonical name → lex-sorted list of aliases
     /// (from the Phase B dedup pass); used to populate `ResolvedDep.aliases`.
+    /// `entry_trust` (P3a, RFC per-entry-attestation.md §3): when `Some`, the
+    /// entry-trust gate runs HERE, per selected registry-resolved dep — this
+    /// is the "post-solve, per selected dep" point the RFC specs: `solution`
+    /// is already the solver's FINAL pick (backtracking is done), and this
+    /// loop iterates exactly the selected set, never a rejected/enumerated
+    /// candidate. A `strict`-policy failure returns `Err` and aborts graph
+    /// construction (RFC §3: "a failing selected version is a hard, late
+    /// resolve failure with no automatic fallback").
     fn build_graph(
         &self,
         solution: &BTreeMap<String, Version>,
         canonical_aliases: &BTreeMap<String, Vec<String>>,
-    ) -> ResolvedGraph {
+        entry_trust: Option<&crate::entry_trust::EntryTrustConfig>,
+    ) -> Result<ResolvedGraph, MilpaError> {
         let cands = self.candidates.borrow();
         let mut chosen: BTreeMap<String, Candidate> = BTreeMap::new();
         for (name, version) in solution {
@@ -2980,10 +3028,10 @@ impl<'a> ResolveProvider<'a> {
             topo_visit(n, &chosen, &mut ordered, &mut visited, &mut visiting);
         }
 
-        let deps = ordered
+        let deps: Vec<ResolvedDep> = ordered
             .into_iter()
             .filter_map(|n| chosen.get(&n))
-            .map(|c| {
+            .map(|c| -> Result<ResolvedDep, MilpaError> {
                 // S4: build cond_requires from requires_predicates.
                 // Each (name, pred_vecs) entry may have ≥1 inner Vec<Predicate>
                 // (one per when-branch occurrence — C1 fix).  Emit one CondRequire
@@ -3007,7 +3055,38 @@ impl<'a> ResolveProvider<'a> {
                 // C1: split solver_var back to bare name + namespace.
                 // Candidate.name is the solver_var ("ns::bare" or "bare").
                 let dep_key = DepKey::from_solver_var(&c.name);
-                ResolvedDep {
+                let version_str = c.version.to_string();
+
+                // P3a (RFC per-entry-attestation.md §3, §5): the entry-trust
+                // gate — post-solve, per selected registry-resolved dep. Runs
+                // BEFORE the ResolvedDep is assembled so a strict-policy
+                // failure aborts graph construction outright (no
+                // partially-built graph escapes).
+                if let Some(cfg) = entry_trust {
+                    if c.is_registry {
+                        let (gate_result, gate_cause) = crate::entry_trust::evaluate_entry_attestation(
+                            c.attestation.as_ref(),
+                            &c.identity,
+                            &c.registry_namespace,
+                            &dep_key.name,
+                            &version_str,
+                            cfg.verifier.as_ref(),
+                            cfg.bundle_store.as_deref(),
+                            &cfg.trust_bundle,
+                            &cfg.expected_vendor_signer,
+                        )?;
+                        crate::entry_trust::enforce_entry_trust(
+                            gate_result,
+                            &cfg.policy,
+                            &c.registry_namespace,
+                            &dep_key.name,
+                            &version_str,
+                            gate_cause.as_deref(),
+                        )?;
+                    }
+                }
+
+                Ok(ResolvedDep {
                     name: dep_key.name.clone(),
                     namespace: dep_key.namespace.clone(),
                     identity: c.identity.clone(),
@@ -3045,6 +3124,14 @@ impl<'a> ResolveProvider<'a> {
                     // RFC per-entry-attestation.md P2: straight passthrough
                     // from the candidate — already `None` for non-named deps.
                     attestation: c.attestation.clone(),
+                    // P3a: the entry's REAL index namespace, for milpa
+                    // verify's offline re-verification (only meaningful
+                    // alongside attestation).
+                    registry_namespace: if c.is_registry {
+                        Some(c.registry_namespace.clone())
+                    } else {
+                        None
+                    },
                     cond_requires,
                     // Phase B: lex-sorted alias list for this canonical dep.
                     // Empty for non-deduped deps.
@@ -3101,10 +3188,10 @@ impl<'a> ResolveProvider<'a> {
                             active_map.into_keys().collect()
                         }
                     },
-                }
+                })
             })
-            .collect();
-        ResolvedGraph { deps }
+            .collect::<Result<Vec<ResolvedDep>, MilpaError>>()?;
+        Ok(ResolvedGraph { deps })
     }
 
     // --- shared helpers ----------------------------------------------------
@@ -4395,6 +4482,9 @@ pub fn resolve_with_cert(
     dep_decl_store: Option<&dyn crate::dep_decl_store::DepDeclStore>,
     require_attested_metadata: bool,
     store: &CaStore,
+    // P3a (RFC per-entry-attestation.md §3): entry-trust gate config; `None`
+    // disables the gate entirely.
+    entry_trust: Option<&crate::entry_trust::EntryTrustConfig>,
 ) -> Result<(ResolvedGraph, SuccessCert), (MilpaError, FailureCert)> {
     // Delegates to `solve_with_refutation` instead of `solve`; all setup is
     // identical to `resolve` — factored through `build_single_provider` (D-F2).
@@ -4450,7 +4540,10 @@ pub fn resolve_with_cert(
                 return Err((e, FailureCert { message: String::new(), refutation: Vec::new() }));
             }
             let cert = provider.build_success_cert(&solution);
-            let graph = provider.build_graph(&solution, &canonical_aliases_cert);
+            let graph = match provider.build_graph(&solution, &canonical_aliases_cert, entry_trust) {
+                Ok(g) => g,
+                Err(e) => return Err((e, FailureCert { message: String::new(), refutation: Vec::new() })),
+            };
             // B-nimcfg SSOT: rebuild _deps/ view (alias symlinks + stale-entry removal).
             // Mirrors resolve() — the cert path must also own the rebuild.
             rebuild_deps_view(&graph, deps_dir, store);

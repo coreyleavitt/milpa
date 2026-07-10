@@ -76,6 +76,14 @@ rustls-pki-types = { version = "1", default-features = false, features = ["alloc
 # milpa must name that type. Unifies with sigstore 0.14.0's transitive x509-cert 0.2.5.
 # rfc-attestation-verifier S2.
 x509-cert = { version = "0.2", default-features = false }
+# deps-rationale: P3a (RFC per-entry-attestation.md §6): SigstoreEntryVerifier's
+# pre-crypto stage decodes the DSSE envelope's base64 `payload` field to read
+# the in-toto subject (digest + name) BEFORE any cryptographic verification —
+# the same "reads the unverified DSSE payload" precedent `index_trust.rs`
+# documents. Already a transitive dependency of `sigstore` (0.14.0 resolves
+# base64 0.22.1); pinned to that exact version so both copies in the dep graph
+# are the SAME crate version, not merely compatible ones.
+base64 = { version = "=0.22.1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 tempfile = "3"

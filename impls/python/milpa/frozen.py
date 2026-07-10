@@ -159,11 +159,17 @@ def _reconstruct_from_locked(locked: LockedDep) -> ResolvedDep:
         namespace=getattr(locked, "namespace", None),
         # RFC per-entry-attestation.md P2 (§8 Command Coverage): the frozen
         # path carries the lockfile's attestation CLAIM through, nothing
-        # re-checked. Widen LockAttestation (no bundle_pin) back to the
-        # EntryAttestation shape ResolvedDep carries; bundle_pin is always
-        # None here since it was never persisted to the lockfile (§3.9).
+        # re-checked (no gate runs here — §8 command-coverage table). Widen
+        # LockAttestation back to the EntryAttestation shape ResolvedDep
+        # carries; bundle_pin round-trips too (P3a addition, lockfile-schema
+        # §3.9) since P4's offline verify needs it downstream of a frozen
+        # resolve too.
         attestation=(
-            EntryAttestation(kind=locked.attestation.kind, rekor=locked.attestation.rekor)
+            EntryAttestation(
+                kind=locked.attestation.kind,
+                rekor=locked.attestation.rekor,
+                bundle_pin=locked.attestation.bundle_pin,
+            )
             if locked.attestation is not None
             else None
         ),

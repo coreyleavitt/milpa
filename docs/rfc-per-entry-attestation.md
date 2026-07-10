@@ -108,8 +108,10 @@ The per-entry DSSE statement's in-toto subject **MUST** bind BOTH coordinates
 of what is being vouched for:
 
 - `subject[0].digest.sha256` = the hex of the entry's `content_hash`
-  (`sha256:<64-hex>`, `IndexVersion.content_hash` — spec `identity.md`
-  source-tree hash), and
+  (`IndexVersion.content_hash` — spec `identity.md` source-tree hash; note
+  the canonical identity scheme is `dag-sha256:<64-hex>`, so the hex MUST be
+  extracted scheme-agnostically the way `identity.parse_identity` does,
+  never via a hardcoded `sha256:` prefix strip), and
 - `subject[0].name` = the package identity,
   `pkg:tianguis/<namespace>/<name>@<version>`.
 

@@ -156,6 +156,14 @@ pub struct IndexVersion {
     /// attestation record, OR when a present record failed the closed-set /
     /// structural-validity check and conservatively collapsed to unattested.
     pub attestation: Option<EntryAttestation>,
+    /// P3a (RFC per-entry-attestation.md §1): the enclosing `Package`'s
+    /// namespace — always the REAL resolved namespace, even when the
+    /// manifest dep declaration was a bare (unqualified) name. Distinct from
+    /// the dep-key namespace tracked elsewhere (which records only whether
+    /// the manifest EXPLICITLY qualified the dep). Needed so the entry-trust
+    /// gate can build the exact `pkg:tianguis/<namespace>/<name>@<version>`
+    /// subject coordinate (§1) for a bare-name dep.
+    pub namespace: String,
 }
 
 /// A package: a `(namespace, name)` identity plus its versions (newest-first).
@@ -534,6 +542,9 @@ fn parse_version_node(
             dep_decl,
             dep_decl_schema_version,
             attestation,
+            // P3a: the enclosing Package's real namespace (always populated,
+            // even for bare/unqualified index entries — namespace "" then).
+            namespace: namespace.to_string(),
         },
         diagnostics,
     ))

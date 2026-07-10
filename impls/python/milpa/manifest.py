@@ -182,6 +182,8 @@ _PACKAGE_TOP_LEVEL: frozenset[str] = frozenset(
         "index-trust",
         "index-trust-signer",
         "index-trust-bundle",
+        # P3a (RFC per-entry-attestation.md §4): per-entry attestation gate.
+        "entry-trust",
     }
 )
 
@@ -247,6 +249,10 @@ _WORKSPACE_TOP_LEVEL: frozenset[str] = frozenset(
         "index-trust",
         "index-trust-signer",
         "index-trust-bundle",
+        # P3a (RFC per-entry-attestation.md §4): per-entry attestation gate,
+        # legal ONLY on the workspace root — same root-authority reasoning as
+        # index-trust (one shared graph, one trust posture).
+        "entry-trust",
     }
 )
 
@@ -549,6 +555,18 @@ class Manifest:
     default AND a legal explicit value: a workspace MEMBER manifest that explicitly
     declares ``index-trust "warn"`` must still raise ``WS-INDEX-TRUST-ON-MEMBER``
     (RFC registry-trust-federation §6.4a) even though the value matches the default."""
+    # P3a (RFC per-entry-attestation.md §4): per-entry author-attribution gate
+    # policy.  Root-scoped like index-trust (one shared graph, one trust
+    # posture) but simpler — no signer/bundle sub-fields, since the expected
+    # signer is derived per-kind from the entry itself or the already-resolved
+    # Layer-1 vendor-bot identity (§5), never a separate override.
+    entry_trust_policy: TrustPolicy = "warn"
+    """Effective entry-trust policy parsed from ``entry-trust`` node; defaults to ``'warn'``."""
+    entry_trust_policy_explicit: bool = False
+    """``True`` iff the source declared an ``entry-trust`` node (absent-stays-absent
+    rule, mirrors ``index_trust_policy_explicit``).  A workspace MEMBER manifest that
+    explicitly declares ``entry-trust "warn"`` must still raise
+    ``WS-ENTRY-TRUST-ON-MEMBER`` even though the value matches the default."""
 
 
 @dataclass(frozen=True)
@@ -588,6 +606,15 @@ class WorkspaceManifest:
     rule, mirrors ``Manifest.index_trust_policy_explicit``). Needed so the
     serializer only emits ``index-trust`` when it was actually declared — never
     a spurious default ``"warn"`` that wasn't in the source."""
+    # P3a (RFC per-entry-attestation.md §4): entry-trust, declared ONLY on the
+    # resolution root — same root-authority model as index-trust.  A member
+    # manifest declaring it raises ``WS-ENTRY-TRUST-ON-MEMBER`` at workspace-load
+    # time (``workspace.py``, not this module).
+    entry_trust_policy: TrustPolicy = "warn"
+    """Effective entry-trust policy for the whole workspace; defaults to ``'warn'``."""
+    entry_trust_policy_explicit: bool = False
+    """``True`` iff the source declared an ``entry-trust`` node (absent-stays-absent
+    rule, mirrors ``Manifest.entry_trust_policy_explicit``)."""
 
 
 # ---------------------------------------------------------------------------
@@ -943,6 +970,24 @@ def _parse_index_trust_node(n: "KdlNode") -> TrustPolicy:
     return _parse_trust_policy(raw_args[0], node="index-trust")
 
 
+def _parse_entry_trust_node(n: "KdlNode") -> TrustPolicy:
+    """Parse an ``entry-trust "<policy>"`` node into a ``TrustPolicy``.
+
+    P3a (RFC per-entry-attestation.md §4): shares the ``TrustPolicy`` type and
+    ``_parse_trust_policy`` mechanism with index-trust / attestation-policy, on
+    its own axis.
+    """
+    raw_args = node_args(n)
+    if len(raw_args) != 1 or not isinstance(raw_args[0], str):
+        raise MilpaError(
+            MAN_UNKNOWN_TOP_LEVEL,
+            "'entry-trust' takes exactly one string argument "
+            "('warn', 'strict', or 'off')",
+            node="entry-trust",
+        )
+    return _parse_trust_policy(raw_args[0], node="entry-trust")
+
+
 def _parse_index_trust_signer_node(n: "KdlNode") -> str:
     """Parse an ``index-trust-signer "<identity>"`` node into its raw string."""
     raw_args = node_args(n)
@@ -987,6 +1032,9 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
     index_trust_signer: str | None = None
     index_trust_bundle: str | None = None
     index_trust_policy_explicit: bool = False
+    # P3a: entry-trust node (RFC per-entry-attestation.md §4)
+    entry_trust_policy: TrustPolicy = "warn"
+    entry_trust_policy_explicit: bool = False
     seen_top_level: set[str] = set()
 
     for n in nodes(doc):
@@ -1127,6 +1175,11 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
             # Rekor key bundle (RFC §3.2, §6.4).
             index_trust_bundle = _parse_index_trust_bundle_node(n)
 
+        elif nm == "entry-trust":
+            # P3a: per-entry author-attribution gate policy (RFC §4).
+            entry_trust_policy = _parse_entry_trust_node(n)
+            entry_trust_policy_explicit = True
+
         elif nm == "flags":
             flags = _parse_flags_block(n)
 
@@ -1198,6 +1251,8 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
         index_trust_signer=index_trust_signer,
         index_trust_bundle=index_trust_bundle,
         index_trust_policy_explicit=index_trust_policy_explicit,
+        entry_trust_policy=entry_trust_policy,
+        entry_trust_policy_explicit=entry_trust_policy_explicit,
     )
 
 
@@ -1237,6 +1292,9 @@ def _parse_workspace_doc(doc: KdlDocument) -> WorkspaceManifest:
     ws_index_trust_signer: str | None = None
     ws_index_trust_bundle: str | None = None
     ws_index_trust_policy_explicit: bool = False
+    # P3a (RFC per-entry-attestation.md §4): same root-authority model.
+    ws_entry_trust_policy: TrustPolicy = "warn"
+    ws_entry_trust_policy_explicit: bool = False
 
     for n in nodes(doc):
         nm = node_name(n)
@@ -1320,6 +1378,11 @@ def _parse_workspace_doc(doc: KdlDocument) -> WorkspaceManifest:
         elif nm == "index-trust-bundle":
             ws_index_trust_bundle = _parse_index_trust_bundle_node(n)
 
+        elif nm == "entry-trust":
+            # P3a (RFC per-entry-attestation.md §4): root-authority policy.
+            ws_entry_trust_policy = _parse_entry_trust_node(n)
+            ws_entry_trust_policy_explicit = True
+
     return WorkspaceManifest(
         members=tuple(members),
         overrides=tuple(overrides),
@@ -1329,6 +1392,8 @@ def _parse_workspace_doc(doc: KdlDocument) -> WorkspaceManifest:
         index_trust_signer=ws_index_trust_signer,
         index_trust_bundle=ws_index_trust_bundle,
         index_trust_policy_explicit=ws_index_trust_policy_explicit,
+        entry_trust_policy=ws_entry_trust_policy,
+        entry_trust_policy_explicit=ws_entry_trust_policy_explicit,
     )
 
 
@@ -2824,6 +2889,13 @@ def format_manifest(manifest: Manifest) -> str:
     ):
         lines.append("")
 
+    # entry-trust (P3a, RFC per-entry-attestation.md §4). Same absent-stays-
+    # absent rule as index-trust (§ above) — "warn" is both the default AND a
+    # legal explicit value.
+    if manifest.entry_trust_policy_explicit:
+        lines.append(f'entry-trust "{_kdl_str(manifest.entry_trust_policy)}"')
+        lines.append("")
+
     # kind — always last (Rust canonical ordering)
     lines.append(f'kind "{_kdl_str(manifest.kind)}"')
 
@@ -2956,6 +3028,11 @@ def format_workspace_manifest(ws: "WorkspaceManifest") -> str:
         or ws.index_trust_signer is not None
         or ws.index_trust_bundle is not None
     ):
+        lines.append("")
+
+    # entry-trust (P3a, RFC per-entry-attestation.md §4 — root-authority policy).
+    if ws.entry_trust_policy_explicit:
+        lines.append(f'entry-trust "{_kdl_str(ws.entry_trust_policy)}"')
         lines.append("")
 
     # Strip any trailing blank line so the file ends after the last block.

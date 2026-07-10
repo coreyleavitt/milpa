@@ -267,6 +267,16 @@ class IndexVersion:
     §3.2), or ``None`` when the entry carries no attestation record, OR when a
     present record failed the closed-set / structural-validity check and
     conservatively collapsed to unattested (RFC per-entry-attestation §2).
+
+    ``namespace`` — the enclosing ``Package``'s namespace (P3a, RFC
+    per-entry-attestation.md §1).  Always the REAL resolved namespace, even
+    when the manifest dep declaration was a bare (unqualified) name — distinct
+    from ``DepKey.namespace`` / ``ResolvedDep.namespace``, which record only
+    whether the manifest EXPLICITLY qualified the dep.  Needed so the
+    entry-trust gate can build the exact ``pkg:tianguis/<namespace>/<name>@
+    <version>`` subject coordinate (§1) for a bare-name dep, without
+    re-deriving it from a solver variable that may have discarded the
+    qualifier.
     """
 
     version: str
@@ -275,6 +285,7 @@ class IndexVersion:
     dep_decl: str | None = None
     dep_decl_schema_version: int | None = None
     attestation: EntryAttestation | None = None
+    namespace: str = ""
 
 
 @dataclass(frozen=True)
@@ -724,6 +735,7 @@ def _parse_version_node(
             dep_decl=dep_decl,
             dep_decl_schema_version=dep_decl_schema_version,
             attestation=attestation,
+            namespace=namespace,
         ),
         diagnostics,
     )

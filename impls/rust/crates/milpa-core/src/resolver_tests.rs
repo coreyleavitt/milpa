@@ -254,6 +254,8 @@ fn manifest_full(deps: Vec<Dep>, dev_deps: Vec<Dep>, overrides: Vec<Override>) -
         index_trust_signer: None,
         index_trust_bundle: None,
         index_trust_policy_explicit: false,
+        entry_trust_policy: milpa_manifest::TrustPolicy::Warn,
+        entry_trust_policy_explicit: false,
         optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }
@@ -439,6 +441,7 @@ fn resolve_named_dep_strategy_selects_version() {
         dep_decl: None,
         dep_decl_schema_version: None,
         attestation: None,
+        namespace: String::new(),
     };
     let index = Index {
         packages: vec![Package {
@@ -539,6 +542,7 @@ fn s5b_phase_a_error_slug_divergence_spike() {
                 dep_decl: None,
                 dep_decl_schema_version: None,
                 attestation: None,
+                namespace: String::new(),
             }],
         }],
     };
@@ -2355,6 +2359,8 @@ fn manifest_with_flags(name: &str, flags: Vec<milpa_manifest::FlagDecl>) -> milp
         index_trust_signer: None,
         index_trust_bundle: None,
         index_trust_policy_explicit: false,
+        entry_trust_policy: milpa_manifest::TrustPolicy::Warn,
+        entry_trust_policy_explicit: false,
         optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }
@@ -2388,6 +2394,7 @@ fn c1b_cli_features_conflict_on_root_raises() {
         &m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp),
         None, false, &cas_store(&tmp),
         &features, false, false,
+        None,
     ).unwrap_err();
 
     assert_eq!(err.code(), "RESOLVE-FLAG-CONFLICT");
@@ -2420,6 +2427,7 @@ fn c1b_cli_features_conflict_payload_includes_cli_source() {
         &m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp),
         None, false, &cas_store(&tmp),
         &features, false, false,
+        None,
     ).unwrap_err();
 
     assert_eq!(err.code(), "RESOLVE-FLAG-CONFLICT");
@@ -2467,6 +2475,7 @@ fn c1b_cli_features_no_conflict_no_error() {
         &m, None, &reg, None, None, Strategy::Maxver, &deps_dir(&tmp),
         None, false, &cas_store(&tmp),
         &features, false, false,
+        None,
     ).unwrap();
 }
 

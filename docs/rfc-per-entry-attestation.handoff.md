@@ -22,9 +22,24 @@
       "claims author-signed by X" wording; BONUS bug fixed in both impls —
       frozen path wasn't carrying the claim (RFC §8 table), pinned with
       regression tests. Gates: pytest 2660 green; dev-rust workspace green.
-- [ ] P3a — mock-gated gate: `entry-trust` axis, selection-step pipeline,
-      nine slugs, `EntryBundleVerifier` + keyed MockVerifier + acquisition
-      surface, `milpa verify` offline re-verify, conformance matrix.
+- [x] P3a — mock-gated gate (2026-07-10), BOTH impls: `entry-trust` axis
+      (root-scoped + WS-ENTRY-TRUST-ON-MEMBER), post-solve selection gate
+      (stages 0–7; PIN-MISMATCH unconditional even under warn), 9 slugs
+      w/ raise sites + spec/errors.md, EntryBundleVerifier + keyed
+      MockEntryVerifier (MILPA_ENTRY_TRUST_MOCK_MAP/_DEFAULT) +
+      EntryBundleStore (MILPA_ENTRY_BUNDLE_DIR file + HTTP), verify
+      offline re-verify, all four online verbs wired (fetch/lock/add/
+      update), fixtures 367–377 + both runners, Rust hold-opens emptied.
+      §6 extract-or-decline: DECLINED sharing SigstoreVerifier internals
+      (recorded in module docstrings; revisit at P3b). Judgment calls made:
+      (a) subject digest binds dag-sha256 scheme-agnostically (RFC §1
+      prose corrected — said sha256:); (b) LockAttestation gained
+      bundle_pin+namespace beyond P1 §3.9 (offline verify needs them;
+      spec updated); (c) IndexVersion.namespace added. P3b note: Rust
+      SigstoreEntryVerifier fails closed after pre-crypto stages —
+      sigstore-rs exposes no verify-against-known-digest primitive
+      (pub(crate) only); needs the vendored-patch decision at P3b.
+      Gates: pytest 2723 green; dev-rust workspace + conformance green.
 - [ ] P3b — real-crypto strict-fails (lands with P4).
 - [ ] P4 — cross-repo tianguis bundle delivery (BLOCKED on tianguis).
 - [ ] P5 — Part 3 owner registry (future).

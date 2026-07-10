@@ -521,7 +521,7 @@ impl Target for MilpaTarget {
                 let manifest = match milpa_core::parse_document(&text) {
                     // Workspace: load (WS-* topology) → multi-member union resolve
                     // (RES-WS-*) → shared milpa.lock + per-member nim.cfg.
-                    Ok(ManifestDoc::Workspace(_)) => {
+                    Ok(ManifestDoc::Workspace(ws_doc)) => {
                         let loaded = match milpa_core::load_workspace(&project_root) {
                             Ok(w) => w,
                             Err(e) => return Err(e.code().to_string()),
@@ -540,6 +540,13 @@ impl Target for MilpaTarget {
                         let ws_cli_features = fixture_cli_features(&fx.dir);
                         let ws_cli_no_default = fixture_no_default_features(&fx.dir);
                         let ws_cli_all_features = fixture_all_features(&fx.dir);
+                        // P3a (RFC per-entry-attestation.md §3, §5): entry-trust gate
+                        // config; None (gate disabled) unless the fixture opts in.
+                        let entry_trust = fixture_entry_trust_config(
+                            &fx.dir,
+                            Some(ws_doc.entry_trust_policy.clone()),
+                            ws_doc.entry_trust_policy_explicit,
+                        );
                         let store = milpa_core::CaStore::new(&scratch.cas_root);
                         return match milpa_core::resolve_workspace_with_features(
                             &loaded,
@@ -554,6 +561,7 @@ impl Target for MilpaTarget {
                             &ws_cli_features,
                             ws_cli_no_default,
                             ws_cli_all_features,
+                            entry_trust.as_ref(),
                         ) {
                             Ok(graph) => {
                                 // B-nimcfg: _deps/ view rebuilt internally by resolve_workspace
@@ -598,6 +606,13 @@ impl Target for MilpaTarget {
                 let cli_features = fixture_cli_features(&fx.dir);
                 let cli_no_default = fixture_no_default_features(&fx.dir);
                 let cli_all_features = fixture_all_features(&fx.dir);
+                // P3a (RFC per-entry-attestation.md §3, §5): entry-trust gate
+                // config; None (gate disabled) unless the fixture opts in.
+                let entry_trust = fixture_entry_trust_config(
+                    &fx.dir,
+                    Some(manifest.entry_trust_policy.clone()),
+                    manifest.entry_trust_policy_explicit,
+                );
 
                 let store = milpa_core::CaStore::new(&scratch.cas_root);
                 match milpa_core::resolve_with_features(
@@ -614,6 +629,7 @@ impl Target for MilpaTarget {
                     &cli_features,
                     cli_no_default,
                     cli_all_features,
+                    entry_trust.as_ref(),
                 ) {
                     // S9: emit the byte-diff outputs. `_deps_structure.txt` is read
                     // by the harness from the materialized (symlinked) `_deps/`.
@@ -822,6 +838,8 @@ impl Target for MilpaTarget {
                             &verify_cli_features,
                             verify_cli_no_default,
                             verify_cli_all_features,
+                            // P3a: no verify-kind fixture drives entry-trust; gate disabled.
+                            None,
                         ).map_err(|e| e.code().to_string())
                     }
                     ManifestDoc::Package(ref manifest) => {
@@ -2215,6 +2233,102 @@ fn fixture_require_attested_metadata(dir: &Path) -> bool {
     env.get("MILPA_REQUIRE_ATTESTED_METADATA")
         .map(|v| parse_env_bool(v))
         .unwrap_or(false)
+}
+
+/// P3a (RFC per-entry-attestation.md §3, §5, Conformance section): build the
+/// `EntryTrustConfig` for a resolve fixture, or `None`. Mirrors the Python
+/// in-process adapter's `_fixture_entry_trust_config` — the impl-neutral
+/// fixture env-var contract both runners share:
+///
+/// - `entry-trust "<policy>"` (manifest field) — base policy, passed in via
+///   `manifest_policy` / `manifest_explicit` (read from the parsed
+///   manifest/workspace-root exactly as production does).
+/// - `MILPA_ENTRY_TRUST` — env override for the policy (fixture `env` file).
+/// - `MILPA_ENTRY_TRUST_MOCK_MAP` — JSON object: subject coordinate string
+///   (`"pkg:tianguis/<ns>/<name>@<version>"`) -> one of `{trusted,
+///   bundle-malformed, digest-mismatch, subject-mismatch, signature-invalid,
+///   signer-mismatch}`. Un-keyed subjects get `MILPA_ENTRY_TRUST_MOCK_DEFAULT`
+///   (default `"trusted"`).
+/// - `entry-bundles/<sha256_hex>.bundle` — fixture sub-directory, auto-detected
+///   exactly like `dep-decl/` — backs a `FileEntryBundleStore`. Absent -> no
+///   bundle store (every attested entry with a `bundle` pin resolves as
+///   `TNG-ENTRY-BUNDLE-MISSING`/unfetchable).
+///
+/// Returns `None` when the fixture declares NEITHER a manifest `entry-trust`
+/// field NOR `MILPA_ENTRY_TRUST` — the gate stays unconfigured (disabled) so
+/// pre-existing named-dep fixtures that predate P3a are unaffected.
+fn fixture_entry_trust_config(
+    fixture_dir: &Path,
+    manifest_policy: Option<milpa_core::TrustPolicy>,
+    manifest_explicit: bool,
+) -> Option<milpa_core::EntryTrustConfig> {
+    use milpa_core::entry_trust::{EntryVerificationResult, MockEntryVerifier};
+    use milpa_core::index_trust::{TrustBundle, DEFAULT_INDEX_SIGNER};
+    use milpa_core::{effective_trust_policy, EntryTrustConfig, FileEntryBundleStore, TrustPolicy};
+
+    let env = fixture_env(fixture_dir);
+    let env_policy_raw = env
+        .get("MILPA_ENTRY_TRUST")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let env_policy: Option<TrustPolicy> = env_policy_raw.as_deref().and_then(|s| match s {
+        "warn" => Some(TrustPolicy::Warn),
+        "strict" => Some(TrustPolicy::Strict),
+        "off" => Some(TrustPolicy::Off),
+        _ => None,
+    });
+
+    if env_policy.is_none() && !manifest_explicit {
+        return None;
+    }
+
+    let base_policy = manifest_policy.unwrap_or(TrustPolicy::Warn);
+    let policy = effective_trust_policy(&base_policy, false, env_policy.as_ref());
+
+    let default_result = env
+        .get("MILPA_ENTRY_TRUST_MOCK_DEFAULT")
+        .and_then(|s| EntryVerificationResult::from_value(s.trim()))
+        .unwrap_or(EntryVerificationResult::Trusted);
+
+    let mut by_subject: std::collections::HashMap<String, EntryVerificationResult> =
+        std::collections::HashMap::new();
+    if let Some(raw) = env.get("MILPA_ENTRY_TRUST_MOCK_MAP") {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+                if let Some(obj) = parsed.as_object() {
+                    for (k, v) in obj {
+                        if let Some(vs) = v.as_str() {
+                            if let Some(r) = EntryVerificationResult::from_value(vs) {
+                                by_subject.insert(k.clone(), r);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let bundle_dir = fixture_dir.join("entry-bundles");
+    let bundle_store: Option<Box<dyn milpa_core::EntryBundleStore>> = if bundle_dir.is_dir() {
+        Some(Box::new(FileEntryBundleStore::new(&bundle_dir)))
+    } else {
+        None
+    };
+
+    let expected_signer = env
+        .get("MILPA_INDEX_TRUST_SIGNER")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_INDEX_SIGNER.to_string());
+
+    Some(EntryTrustConfig {
+        policy,
+        trust_bundle: TrustBundle::test(),
+        expected_vendor_signer: expected_signer,
+        verifier: Box::new(MockEntryVerifier::new(default_result, by_subject)),
+        bundle_store,
+    })
 }
 
 /// §2.8.1: resolve the fixture's project root. When a `project-dir` control file

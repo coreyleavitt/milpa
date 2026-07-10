@@ -228,6 +228,7 @@ fn ver(v: &str, hash: &str, provs: Vec<Provenance>) -> IndexVersion {
         dep_decl: None,
         dep_decl_schema_version: None,
         attestation: None,
+        namespace: String::new(),
     }
 }
 

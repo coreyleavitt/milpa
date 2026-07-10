@@ -1,0 +1,6 @@
+name "myapp"
+kind "application"
+entry-trust "strict"
+deps {
+    bar ">= 2.0.0"
+}

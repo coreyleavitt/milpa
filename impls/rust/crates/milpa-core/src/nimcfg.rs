@@ -375,6 +375,7 @@ mod tests {
             aliases: vec![],
             active_flags: vec![],
             attestation: None,
+            registry_namespace: None,
         }
     }
 
@@ -464,6 +465,7 @@ mod tests {
             aliases,
             active_flags: vec![],
             attestation: None,
+            registry_namespace: None,
         }
     }
 
@@ -557,6 +559,7 @@ mod tests {
             aliases: vec![],
             active_flags,
             attestation: None,
+            registry_namespace: None,
         }
     }
 

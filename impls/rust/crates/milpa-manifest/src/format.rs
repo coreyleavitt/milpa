@@ -77,6 +77,12 @@ pub fn format_manifest(m: &Manifest) -> String {
         lines.push(format!("index-trust-bundle \"{}\"", kdl_str(bundle)));
         lines.push(String::new());
     }
+    // entry-trust (P3a, RFC per-entry-attestation.md §4). Same absent-stays-
+    // absent rule as index-trust above.
+    if m.entry_trust_policy_explicit {
+        lines.push(format!("entry-trust \"{}\"", trust_policy_str(&m.entry_trust_policy)));
+        lines.push(String::new());
+    }
     if !m.deps.is_empty() {
         lines.push("deps {".to_string());
         for dep in &m.deps {
@@ -250,6 +256,12 @@ pub fn format_workspace_manifest(ws: &Workspace) -> String {
     }
     if let Some(bundle) = &ws.index_trust_bundle {
         lines.push(format!("index-trust-bundle \"{}\"", kdl_str(bundle)));
+        lines.push(String::new());
+    }
+
+    // entry-trust (P3a, RFC per-entry-attestation.md §4 — root-authority policy).
+    if ws.entry_trust_policy_explicit {
+        lines.push(format!("entry-trust \"{}\"", trust_policy_str(&ws.entry_trust_policy)));
         lines.push(String::new());
     }
 
@@ -631,6 +643,8 @@ mod tests {
             index_trust_signer: None,
             index_trust_bundle: None,
             index_trust_policy_explicit: false,
+            entry_trust_policy: crate::TrustPolicy::Warn,
+            entry_trust_policy_explicit: false,
             optional_auto_flags: std::collections::BTreeSet::new(),
         }
     }
@@ -1035,6 +1049,8 @@ mod tests {
                 "https://github.com/acme/reg/.github/workflows/publish.yaml@refs/heads/main".into(),
             ),
             index_trust_bundle: Some("file:///etc/milpa/trust-bundle.json".into()),
+            entry_trust_policy: crate::TrustPolicy::Warn,
+            entry_trust_policy_explicit: false,
         };
 
         let text = format_workspace_manifest(&ws);
@@ -1106,4 +1122,109 @@ mod tests {
         };
         assert!(!reparsed.index_trust_policy_explicit);
     }
+
+    // P3a (RFC per-entry-attestation.md §4): entry-trust round-trip tests —
+    // mirror the index-trust ones above.
+
+    #[test]
+    fn package_manifest_entry_trust_strict_round_trips() {
+        let mut m = base();
+        m.entry_trust_policy = crate::TrustPolicy::Strict;
+        m.entry_trust_policy_explicit = true;
+
+        let text = format_manifest(&m);
+        assert!(text.contains("entry-trust \"strict\""), "missing entry-trust node:\n{text}");
+
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Package(p) => p,
+            other => panic!("expected package, got {other:?}"),
+        };
+        assert_eq!(reparsed.entry_trust_policy, m.entry_trust_policy);
+        assert_eq!(reparsed.entry_trust_policy_explicit, m.entry_trust_policy_explicit);
+        assert_eq!(reparsed, m);
+    }
+
+    /// A manifest that never declared `entry-trust` at all must NOT gain one
+    /// on round-trip (absent-stays-absent).
+    #[test]
+    fn package_manifest_without_entry_trust_stays_absent() {
+        let m = base();
+        let text = format_manifest(&m);
+        assert!(!text.contains("entry-trust"), "must not fabricate an entry-trust node:\n{text}");
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Package(p) => p,
+            other => panic!("expected package, got {other:?}"),
+        };
+        assert!(!reparsed.entry_trust_policy_explicit);
+    }
+
+    /// Explicit `entry-trust "warn"` (matching the default value) must still
+    /// survive a round trip — the absent-stays-absent rule is about WHERE the
+    /// field is declared, not what value it holds.
+    #[test]
+    fn package_manifest_entry_trust_warn_explicit_round_trips() {
+        let mut m = base();
+        m.entry_trust_policy = crate::TrustPolicy::Warn;
+        m.entry_trust_policy_explicit = true;
+
+        let text = format_manifest(&m);
+        assert!(text.contains("entry-trust \"warn\""), "missing explicit entry-trust node:\n{text}");
+
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Package(p) => p,
+            other => panic!("expected package, got {other:?}"),
+        };
+        assert_eq!(reparsed.entry_trust_policy, m.entry_trust_policy);
+        assert_eq!(reparsed.entry_trust_policy_explicit, m.entry_trust_policy_explicit);
+    }
+
+    #[test]
+    fn workspace_manifest_entry_trust_strict_round_trips() {
+        let mut ws = crate::Workspace {
+            name: Some("my-ws".into()),
+            members: vec!["member-a".into()],
+            overrides: Vec::new(),
+            flags: Vec::new(),
+            ..Default::default()
+        };
+        ws.entry_trust_policy = crate::TrustPolicy::Strict;
+        ws.entry_trust_policy_explicit = true;
+
+        let text = format_workspace_manifest(&ws);
+        assert!(text.contains("entry-trust \"strict\""), "missing entry-trust node:\n{text}");
+
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Workspace(w) => w,
+            other => panic!("expected workspace, got {other:?}"),
+        };
+        assert_eq!(reparsed.entry_trust_policy, ws.entry_trust_policy);
+        assert_eq!(reparsed.entry_trust_policy_explicit, ws.entry_trust_policy_explicit);
+        assert_eq!(reparsed, ws);
+    }
+
+    /// Flip side: a workspace that never declared `entry-trust` at all must
+    /// NOT gain one on round-trip (absent-stays-absent).
+    #[test]
+    fn workspace_manifest_without_entry_trust_stays_absent() {
+        let ws = crate::Workspace {
+            name: Some("my-ws".into()),
+            members: vec!["member-a".into()],
+            overrides: Vec::new(),
+            flags: Vec::new(),
+            ..Default::default()
+        };
+        let text = format_workspace_manifest(&ws);
+        assert!(!text.contains("entry-trust"), "must not fabricate an entry-trust node:\n{text}");
+
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Workspace(w) => w,
+            other => panic!("expected workspace, got {other:?}"),
+        };
+        assert!(!reparsed.entry_trust_policy_explicit);
+    }
+
+    // A workspace member manifest declaring `entry-trust` must raise
+    // `WS-ENTRY-TRUST-ON-MEMBER` — proven at the `milpa-core` workspace-load
+    // layer (`workspace_tests.rs`), not here; this crate only proves the
+    // per-manifest parse/format round-trip.
 }

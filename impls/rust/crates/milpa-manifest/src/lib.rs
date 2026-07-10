@@ -269,6 +269,17 @@ pub struct Manifest {
     /// field is declared, not what value it holds, so it needs this flag rather
     /// than just testing `index_trust_policy != Warn`.
     pub index_trust_policy_explicit: bool,
+    /// P3a (RFC per-entry-attestation.md §4): per-entry author-attribution
+    /// gate policy from `entry-trust "warn"|"strict"|"off"` (default: warn).
+    /// Root-scoped like `index_trust_policy` (one shared graph, one trust
+    /// posture) but simpler — no signer/bundle sub-fields.
+    pub entry_trust_policy: TrustPolicy,
+    /// `true` iff the source declared an `entry-trust` node explicitly
+    /// (absent-stays-absent, mirrors `index_trust_policy_explicit`). A
+    /// workspace MEMBER manifest that explicitly declares `entry-trust
+    /// "warn"` must still raise `WS-ENTRY-TRUST-ON-MEMBER` even though the
+    /// value matches the default.
+    pub entry_trust_policy_explicit: bool,
     /// S7: flag names that were auto-injected by optional-dep desugaring.
     /// `format_manifest` skips these from the `flags {}` block (they're implied
     /// by `optional=#true` on the dep; serializing them would cause a re-parse clash).
@@ -314,6 +325,14 @@ pub struct Workspace {
     /// absent node — `milpa workspace add-member`/`remove-member` would
     /// silently drop the former on the next `milpa.kdl` rewrite.
     pub index_trust_policy_explicit: bool,
+    /// P3a (RFC per-entry-attestation.md §4): entry-trust, declared ONLY on
+    /// the resolution root — same root-authority model as index-trust. A
+    /// member manifest declaring it raises `WS-ENTRY-TRUST-ON-MEMBER` at
+    /// workspace-load time (`workspace.rs`, not this module).
+    pub entry_trust_policy: TrustPolicy,
+    /// `true` iff the source declared an `entry-trust` node (absent-stays-
+    /// absent rule, mirrors `Manifest::entry_trust_policy_explicit`).
+    pub entry_trust_policy_explicit: bool,
 }
 
 /// The two disjoint manifest roles (grammar §1). Detected by the presence of a
@@ -579,6 +598,8 @@ const PACKAGE_TOP_LEVEL: &[&str] = &[
     "index-trust",
     "index-trust-signer",
     "index-trust-bundle",
+    // P3a (RFC per-entry-attestation.md §4): per-entry attestation gate.
+    "entry-trust",
 ];
 const WORKSPACE_TOP_LEVEL: &[&str] = &[
     "workspace",
@@ -589,6 +610,8 @@ const WORKSPACE_TOP_LEVEL: &[&str] = &[
     "index-trust",
     "index-trust-signer",
     "index-trust-bundle",
+    // P3a: per-entry attestation gate, legal ONLY on the workspace root.
+    "entry-trust",
 ];
 
 // ---------------------------------------------------------------------------
@@ -834,6 +857,23 @@ fn parse_index_trust_bundle_node(node: &KdlNode) -> Result<String, ManifestError
     Ok(val.unwrap().to_string())
 }
 
+/// Shared parser for the `entry-trust "<policy>"` node (package and
+/// workspace-root manifests both accept it). P3a (RFC per-entry-attestation.md
+/// §4): shares the `TrustPolicy` type + `parse_trust_policy` mechanism with
+/// index-trust / attestation-policy, on its own axis.
+fn parse_entry_trust_node(node: &KdlNode) -> Result<TrustPolicy, ManifestError> {
+    let a = args(node);
+    let val = a.first().and_then(|e| e.value().as_string());
+    if a.len() != 1 || val.is_none() {
+        return Err(err(
+            "MAN-UNKNOWN-TOP-LEVEL",
+            "'entry-trust' takes exactly one string argument \
+             ('warn', 'strict', or 'off')",
+        ));
+    }
+    parse_trust_policy(val.unwrap(), "entry-trust").map_err(|e| err("MAN-UNKNOWN-TOP-LEVEL", e))
+}
+
 fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
     let mut members: Vec<String> = Vec::new();
     let mut overrides: Vec<Override> = Vec::new();
@@ -845,6 +885,9 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
     let mut ws_index_trust_signer: Option<String> = None;
     let mut ws_index_trust_bundle: Option<String> = None;
     let mut ws_index_trust_policy_explicit = false;
+    // P3a (RFC per-entry-attestation.md §4): root-authority entry-trust field.
+    let mut ws_entry_trust_policy = TrustPolicy::Warn;
+    let mut ws_entry_trust_policy_explicit = false;
 
     for node in doc.nodes() {
         match node.name().value() {
@@ -870,6 +913,11 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
             }
             "index-trust-bundle" => {
                 ws_index_trust_bundle = Some(parse_index_trust_bundle_node(node)?);
+            }
+            "entry-trust" => {
+                // P3a (RFC per-entry-attestation.md §4): root-authority policy.
+                ws_entry_trust_policy = parse_entry_trust_node(node)?;
+                ws_entry_trust_policy_explicit = true;
             }
             "workspace" => {
                 for child in children(node) {
@@ -950,6 +998,8 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
         index_trust_signer: ws_index_trust_signer,
         index_trust_bundle: ws_index_trust_bundle,
         index_trust_policy_explicit: ws_index_trust_policy_explicit,
+        entry_trust_policy: ws_entry_trust_policy,
+        entry_trust_policy_explicit: ws_entry_trust_policy_explicit,
     })
 }
 
@@ -1092,6 +1142,9 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
     let mut index_trust_signer: Option<String> = None;
     let mut index_trust_bundle: Option<String> = None;
     let mut index_trust_policy_explicit = false;
+    // P3a (RFC per-entry-attestation.md §4): entry-trust node.
+    let mut entry_trust_policy = TrustPolicy::Warn;
+    let mut entry_trust_policy_explicit = false;
 
     // S5b: seen_names key is the solver variable (namespace::name or bare name),
     // so two qualified deps with the same bare name but different namespaces
@@ -1257,6 +1310,11 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
             "index-trust-bundle" => {
                 index_trust_bundle = Some(parse_index_trust_bundle_node(node)?);
             }
+            "entry-trust" => {
+                // P3a: per-entry author-attribution gate policy (RFC §4).
+                entry_trust_policy = parse_entry_trust_node(node)?;
+                entry_trust_policy_explicit = true;
+            }
             "workspace" => {
                 return Err(err(
                     "MAN-WORKSPACE-IN-PACKAGE",
@@ -1393,6 +1451,8 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
         index_trust_signer,
         index_trust_bundle,
         index_trust_policy_explicit,
+        entry_trust_policy,
+        entry_trust_policy_explicit,
         optional_auto_flags,
     })
 }

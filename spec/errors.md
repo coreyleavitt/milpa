@@ -1192,6 +1192,54 @@ The Sigstore bundle is cryptographically valid but was signed beyond the maximum
 
 **Triggered:** `verify_index_bundle` in `index_trust.py` on a network-fetch path (States 2 + crash-recovery refetch) finds `now - SET.integratedTime >= MILPA_INDEX_MAX_AGE` (default 7 days = 604800 s).  Indicates a rollback attack or a frozen CDN.  This check is NEVER asserted on pure cache reads (States 1 and 3) so offline/air-gapped invocations never fail on staleness; only the network-fetch boundary is defended (RFC §4 step 6, §7.2).
 
+### `TNG-ENTRY-UNATTESTED`
+
+The selected registry entry carries no per-entry attestation record — absent, of an unrecognized `attestation` kind, or structurally invalid (e.g. `"author-signed"` with no `signed_by`), all of which conservatively collapse to unattested at index-parse time (registry-protocol §3.2).
+
+**Triggered:** `evaluate_entry_attestation` in `entry_trust.py`, stage 0 of the `entry-trust` gate pipeline (RFC `rfc-per-entry-attestation.md` §5), when the selected `IndexVersion.attestation` is `None`. Fires at the selection step (post-solve, per selected registry-resolved dep — §3), never at candidate enumeration. Under `warn` (the default) this is a warning; under `strict` it is a hard failure.
+
+### `TNG-ENTRY-BUNDLE-MISSING`
+
+The selected entry is attested, but its Sigstore bundle is unavailable — either no `bundle` pin was recorded yet (cause `no-pin`, the expected pre-delivery state before tianguis per-entry bundle backfill ships), or the pin is present but the bundle could not be fetched (cause `unfetchable`).
+
+**Triggered:** `evaluate_entry_attestation` in `entry_trust.py`, stage 1, when `EntryAttestation.bundle_pin` is `None`, or when `EntryBundleStore.get` raises a fetch failure for a present pin. The `cause` discriminator rides the error payload, not a separate slug — `TNG-ENTRY-UNATTESTED` and `TNG-ENTRY-BUNDLE-MISSING` are deliberately distinct: "never attested" and "attested but the proof is unavailable" are different trust states with different remediations. Under `warn` this is a warning; under `strict` it is a hard failure.
+
+### `TNG-ENTRY-BUNDLE-PIN-MISMATCH`
+
+The fetched attestation bundle's bytes do not hash to the `bundle sha256=` pin recorded in the Layer-1-verified index — delivery-path tampering or serious infra corruption, caught before any cryptographic verification.
+
+**Triggered:** the entry-bundle artifact store (`entry_bundle_store.py`, the one hash-verify site — same pattern as `TNG-DEPDECL-HASH-MISMATCH`) computes `sha256(bundle_bytes) != bundle_pin`. This is a security invariant, not a policy-gated outcome: it is a hard error **unconditionally**, even under `entry-trust "warn"` (RFC §5 NORMATIVE) — proceeding on the wrong bytes verifies nothing, and degrading to `TNG-ENTRY-BUNDLE-MISSING` would launder tamper evidence into a routine availability warning.
+
+### `TNG-ENTRY-BUNDLE-MALFORMED`
+
+The per-entry Sigstore bundle JSON is unparseable or structurally invalid (pre-crypto failure, before any signature check).
+
+**Triggered:** `EntryBundleVerifier.verify` in `entry_trust.py` finds the bundle bytes are not valid JSON, are not a JSON object, or are missing the required DSSE envelope / `verificationMaterial.tlogEntries` structure. Distinct from `TNG-ENTRY-SIGNATURE-INVALID`, which covers cryptographic failures on a structurally valid bundle. Under `warn` this is a warning; under `strict` it is a hard failure.
+
+### `TNG-ENTRY-DIGEST-MISMATCH`
+
+The bundle's attested subject digest does not match the selected entry's `content_hash`.
+
+**Triggered:** `EntryBundleVerifier.verify` in `entry_trust.py` extracts `subject[0].digest.sha256` from the DSSE in-toto statement and finds it does not equal the hex of the selected `IndexVersion.content_hash`. Checked BEFORE any cryptographic verification (RFC §1 NORMATIVE, mirroring `registry-protocol.md §3.4.4`'s digest-before-crypto precedence). Without this check a valid, stale bundle (right signer, right signature) would still verify after the entry's `content_hash`/provenance was swapped underneath it. Under `warn` this is a warning; under `strict` it is a hard failure.
+
+### `TNG-ENTRY-SUBJECT-MISMATCH`
+
+The bundle's attested subject package identity does not match the selected entry's `pkg:tianguis/<namespace>/<name>@<version>` coordinate.
+
+**Triggered:** `EntryBundleVerifier.verify` in `entry_trust.py` extracts `subject[0].name` from the DSSE in-toto statement and finds it does not equal the selected entry's package coordinate. Checked BEFORE any cryptographic verification, alongside the digest check (RFC §1 NORMATIVE). Closes the cross-package replay hole: `content_hash` is name-independent, so without this check a byte-identical republish of one package under a different namespace/name could point at another package's genuine, public bundle and inherit its author's signature. Under `warn` this is a warning; under `strict` it is a hard failure.
+
+### `TNG-ENTRY-SIGNATURE-INVALID`
+
+Cryptographic verification of the per-entry Sigstore bundle failed — either the certificate chain / DSSE envelope signature is invalid, or the Rekor inclusion proof / checkpoint failed.
+
+**Triggered:** `EntryBundleVerifier.verify` in `entry_trust.py` finds the Fulcio certificate chain validation fails, the DSSE signature is invalid, or the Rekor inclusion proof is invalid — mirroring `TNG-INDEX-SIGNATURE-INVALID`'s collapse of cert/signature and inclusion failures into one slug (RFC §5 NORMATIVE: stages 5 and 7 of the gate pipeline deliberately share this slug). Under `warn` this is a warning; under `strict` it is a hard failure.
+
+### `TNG-ENTRY-SIGNER-MISMATCH`
+
+The bundle's certificate SubjectAltName does not match the expected signer for the entry's attestation kind.
+
+**Triggered:** `EntryBundleVerifier.verify` in `entry_trust.py` finds the signing certificate's SubjectAltName does not equal the expected signer — for `author-signed` entries, the record's own `signed_by` (chained trust from the Layer-1-verified index); for `milpa-vendored` entries, the SAME effective vendor-bot identity Layer 1 resolved (default SAN + `MILPA_INDEX_TRUST_SIGNER` / manifest override layering — never a second hardcoded copy of the default). Under `warn` this is a warning; under `strict` it is a hard failure.
+
 ### `TNG-KDL-SYNTAX`
 
 The index text is not valid KDL and cannot be parsed.
@@ -1281,6 +1329,12 @@ The locked `dep_decl` pin no longer matches the current index pointer for a dep 
 **Triggered:** `milpa verify` loads the live index and finds that the `dep_decl` hash recorded in `milpa.lock` for a dep differs from the `dep_decl` pointer the index now carries for that version — the dependency graph has drifted since the lockfile was written. Also raised when the edge check is required but the index is offline and strict mode (`--require-attested-metadata`) is active.
 
 ## WS
+
+### `WS-ENTRY-TRUST-ON-MEMBER`
+
+A workspace member manifest declares `entry-trust`. entry-trust is a workspace-ROOT policy (RFC `rfc-per-entry-attestation.md` §4) — one shared resolve graph, one trust posture — so only the resolution root (the workspace root manifest) may declare it.
+
+**Triggered:** every workspace-construction path (loading a workspace from disk, from an in-memory manifest, or with a proposed member-manifest override for a pending mutation) iterates workspace member manifests and finds that one declares `entry-trust` — including an explicit `entry-trust "warn"` that matches the default value. This check fires at workspace-construction time, mirroring `WS-INDEX-TRUST-ON-MEMBER`'s check for the sibling index-trust axis. The error context includes the offending member's path. The fix is to move the declaration to the workspace root manifest.
 
 ### `WS-INDEX-TRUST-ON-MEMBER`
 

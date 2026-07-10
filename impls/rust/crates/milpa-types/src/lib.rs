@@ -288,13 +288,23 @@ pub struct EntryAttestation {
 }
 
 /// Per-entry Layer 2 attestation CLAIM, lockfile-side (lockfile-schema §3.9).
-/// Narrower than [`EntryAttestation`]: no `bundle_pin` — the lockfile records
-/// the claim only, never a delivery-integrity pin (that lives in the index,
-/// re-derived at verification time from the cached index, not persisted here).
+///
+/// P3a addition (RFC per-entry-attestation.md §7): `bundle_pin` and
+/// `namespace` were added alongside `kind`/`rekor`. `bundle_pin` carries the
+/// SAME delivery-integrity hash as `EntryAttestation::bundle_pin` (the
+/// `bundle sha256=` node) — recorded so `milpa verify`'s offline
+/// re-verification can locate the cached bundle for a locked dep with no
+/// index available. `namespace` is the entry's REAL index namespace
+/// (`registry::IndexVersion::namespace`), distinct from `LockedDep::namespace`
+/// (manifest-qualification only) — mandatory whenever the attestation block
+/// itself is present (mirrors `kind`), defaulting to `""` on pre-P3a
+/// lockfiles (forward-compat).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockAttestation {
     pub kind: AttestationKind,
     pub rekor: Option<RekorRef>,
+    pub bundle_pin: Option<String>,
+    pub namespace: String,
 }
 
 /// One dep after resolution: identity (content hash) ⊥ provenances.
@@ -348,6 +358,15 @@ pub struct ResolvedDep {
     /// Converted to the narrower `LockAttestation` (bundle_pin dropped) at
     /// the `locked_from_resolved` boundary.
     pub attestation: Option<EntryAttestation>,
+    /// P3a addition (RFC per-entry-attestation.md §3): the entry's REAL index
+    /// namespace (`registry::IndexVersion::namespace`), populated only for
+    /// registry-resolved candidates. `None` for URL/tarball/local/member deps
+    /// and for the synthetic root. Distinct from `namespace` above (manifest-
+    /// qualification only) — a bare (unqualified) named dep still resolves
+    /// through a real namespaced index entry. Folded into
+    /// `LockAttestation::namespace` at the `locked_from_resolved` boundary;
+    /// not otherwise emitted.
+    pub registry_namespace: Option<String>,
 }
 
 /// The resolved dependency graph — the resolver's output, the emitters' input.

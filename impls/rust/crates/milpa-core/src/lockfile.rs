@@ -281,6 +281,8 @@ fn parse_lock_attestation(node: &KdlNode, dep_name: &str) -> Option<LockAttestat
     let mut kind_label: Option<String> = None;
     let mut signer: Option<String> = None;
     let mut rekor: Option<RekorRef> = None;
+    let mut bundle_pin: Option<String> = None;
+    let mut namespace = String::new();
 
     for child in children(node) {
         match child.name().value() {
@@ -297,6 +299,23 @@ fn parse_lock_attestation(node: &KdlNode, dep_name: &str) -> Option<LockAttestat
             "rekor" => {
                 rekor = Some(parse_lock_rekor_block(child));
             }
+            // P3a (lockfile-schema §3.9 addition): delivery-integrity pin.
+            "bundle" => {
+                bundle_pin = child
+                    .entries()
+                    .iter()
+                    .find(|e| e.name().map(|n| n.value()) == Some("sha256"))
+                    .and_then(|e| e.value().as_string())
+                    .map(str::to_string);
+            }
+            // P3a: the entry's REAL index namespace — absent on P2-vintage
+            // lockfiles (forward-compat: defaults to "").
+            "namespace" => {
+                namespace = args(child)
+                    .first()
+                    .and_then(|e| e.value().as_string().map(str::to_string))
+                    .unwrap_or_default();
+            }
             _ => {}
         }
     }
@@ -306,6 +325,8 @@ fn parse_lock_attestation(node: &KdlNode, dep_name: &str) -> Option<LockAttestat
             Some(s) if !s.is_empty() => Some(LockAttestation {
                 kind: AttestationKind::AuthorSigned { signer: s },
                 rekor,
+                bundle_pin,
+                namespace,
             }),
             _ => {
                 eprintln!(
@@ -319,6 +340,8 @@ fn parse_lock_attestation(node: &KdlNode, dep_name: &str) -> Option<LockAttestat
         Some("milpa-vendored") => Some(LockAttestation {
             kind: AttestationKind::MilpaVendored,
             rekor,
+            bundle_pin,
+            namespace,
         }),
         other => {
             eprintln!(
@@ -827,6 +850,15 @@ fn format_lock_attestation(att: &LockAttestation) -> Vec<String> {
         ));
         out.push("        }".to_string());
     }
+    if let Some(pin) = &att.bundle_pin {
+        // P3a: delivery-integrity pin (lockfile-schema §3.9 P3a addition).
+        out.push(format!("        bundle sha256={}", kdl_str(pin)));
+    }
+    // P3a: the entry's REAL index namespace — always emitted (mandatory,
+    // like `kind`), even when empty (an unqualified index entry legitimately
+    // has namespace ""); needed by `milpa verify`'s offline re-verification
+    // (§7) to rebuild the exact subject coordinate with no index available.
+    out.push(format!("        namespace {}", kdl_str(&att.namespace)));
     out.push("    }".to_string());
     out
 }
@@ -1151,12 +1183,18 @@ fn locked_from_resolved(d: &ResolvedDep) -> LockedDep {
         // The resolver populates ResolvedDep.aliases via finalize(); from_graph
         // carries them through so the lockfile emits the aliases line.
         aliases: d.aliases.clone(),
-        // RFC per-entry-attestation.md P2: narrow EntryAttestation (index-side,
-        // carries bundle_pin) to LockAttestation (lockfile-side, no bundle_pin —
-        // the lockfile records the claim only, never the delivery pin).
+        // RFC per-entry-attestation.md P2/P3a: narrow EntryAttestation
+        // (index-side) to LockAttestation (lockfile-side). P3a: bundle_pin
+        // NOW round-trips too (lockfile-schema §3.9 P3a addition) — `milpa
+        // verify`'s offline re-verification needs it downstream of a live
+        // resolve. namespace is folded in from ResolvedDep.registry_namespace
+        // (the entry's REAL index namespace, distinct from d.namespace which
+        // is manifest-qualification only).
         attestation: d.attestation.as_ref().map(|a| LockAttestation {
             kind: a.kind.clone(),
             rekor: a.rekor.clone(),
+            bundle_pin: a.bundle_pin.clone(),
+            namespace: d.registry_namespace.clone().unwrap_or_default(),
         }),
     }
 }
@@ -2060,6 +2098,7 @@ mod tests {
             aliases: vec![],
             active_flags: vec![],
             attestation: None,
+            registry_namespace: None,
         }
     }
 
@@ -3804,6 +3843,8 @@ mod tests {
         let att = LockAttestation {
             kind: AttestationKind::AuthorSigned { signer: "https://example.com/wf.yaml".into() },
             rekor: None,
+            bundle_pin: None,
+            namespace: String::new(),
         };
         let dep = make_locked_dep_with_attestation(Some(att));
         let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
@@ -3816,7 +3857,12 @@ mod tests {
 
     #[test]
     fn test_milpa_vendored_emitted_without_signer() {
-        let att = LockAttestation { kind: AttestationKind::MilpaVendored, rekor: None };
+        let att = LockAttestation {
+            kind: AttestationKind::MilpaVendored,
+            rekor: None,
+            bundle_pin: None,
+            namespace: String::new(),
+        };
         let dep = make_locked_dep_with_attestation(Some(att));
         let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
         let text = format_lockfile(&lf);
@@ -3833,6 +3879,8 @@ mod tests {
                 log_index: "42".into(),
                 integrated_time: "1000".into(),
             }),
+            bundle_pin: None,
+            namespace: String::new(),
         };
         let dep = make_locked_dep_with_attestation(Some(att));
         let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
@@ -3848,6 +3896,8 @@ mod tests {
         let att = LockAttestation {
             kind: AttestationKind::AuthorSigned { signer: "https://example.com/wf.yaml".into() },
             rekor: None,
+            bundle_pin: None,
+            namespace: String::new(),
         };
         let dep = make_locked_dep_with_attestation(Some(att));
         let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
@@ -3875,7 +3925,12 @@ mod tests {
             dep_decl: None,
             cond_requires: vec![],
             aliases: vec![],
-            attestation: Some(LockAttestation { kind: AttestationKind::MilpaVendored, rekor: None }),
+            attestation: Some(LockAttestation {
+                kind: AttestationKind::MilpaVendored,
+                rekor: None,
+                bundle_pin: None,
+                namespace: String::new(),
+            }),
         };
         let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
         let text = format_lockfile(&lf);
@@ -3894,6 +3949,8 @@ mod tests {
         let att = LockAttestation {
             kind: AttestationKind::AuthorSigned { signer: "https://example.com/wf.yaml".into() },
             rekor: Some(RekorRef { uuid: "abc".into(), log_index: "1".into(), integrated_time: "2".into() }),
+            bundle_pin: None,
+            namespace: String::new(),
         };
         let dep = make_locked_dep_with_attestation(Some(att.clone()));
         let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
@@ -3906,7 +3963,12 @@ mod tests {
 
     #[test]
     fn test_round_trip_parse_format_identical_milpa_vendored() {
-        let att = LockAttestation { kind: AttestationKind::MilpaVendored, rekor: None };
+        let att = LockAttestation {
+            kind: AttestationKind::MilpaVendored,
+            rekor: None,
+            bundle_pin: None,
+            namespace: String::new(),
+        };
         let dep = make_locked_dep_with_attestation(Some(att.clone()));
         let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
         let text1 = format_lockfile(&lf);
@@ -3993,15 +4055,22 @@ mod tests {
         assert_eq!(lf.deps[0].name, "foo");
         assert_eq!(
             lf.deps[0].attestation,
-            Some(LockAttestation { kind: AttestationKind::MilpaVendored, rekor: None })
+            Some(LockAttestation {
+                kind: AttestationKind::MilpaVendored,
+                rekor: None,
+                bundle_pin: None,
+                namespace: String::new(),
+            })
         );
     }
 
     #[test]
-    fn test_locked_from_resolved_narrows_entry_attestation_drops_bundle_pin() {
-        // RFC per-entry-attestation.md P2: `locked_from_resolved` narrows the
-        // index-side `EntryAttestation` (which carries `bundle_pin`) to the
-        // lockfile-side `LockAttestation` (no `bundle_pin`) by dropping it.
+    fn test_locked_from_resolved_carries_bundle_pin_and_namespace() {
+        // P3a (RFC per-entry-attestation.md §7, lockfile-schema §3.9 addition):
+        // `locked_from_resolved` now carries `bundle_pin` through (it no
+        // longer drops it — needed for `milpa verify`'s offline
+        // re-verification), and folds `ResolvedDep::registry_namespace` into
+        // `LockAttestation::namespace`.
         let entry_att = milpa_types::EntryAttestation {
             kind: AttestationKind::AuthorSigned { signer: "https://example.com/wf.yaml".into() },
             rekor: Some(RekorRef { uuid: "u".into(), log_index: "1".into(), integrated_time: "2".into() }),
@@ -4026,6 +4095,7 @@ mod tests {
             aliases: vec![],
             active_flags: vec![],
             attestation: Some(entry_att),
+            registry_namespace: Some("ns1".into()),
         };
         let graph = ResolvedGraph { deps: vec![resolved] };
         let lf = from_graph(&graph, "maxver");
@@ -4039,6 +4109,8 @@ mod tests {
                     log_index: "1".into(),
                     integrated_time: "2".into()
                 }),
+                bundle_pin: Some("a".repeat(64)),
+                namespace: "ns1".into(),
             }
         );
     }
@@ -4064,6 +4136,7 @@ mod tests {
             aliases: vec![],
             active_flags: vec![],
             attestation: None,
+            registry_namespace: None,
         };
         let graph = ResolvedGraph { deps: vec![resolved] };
         let lf = from_graph(&graph, "maxver");

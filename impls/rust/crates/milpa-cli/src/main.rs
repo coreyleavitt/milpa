@@ -84,6 +84,11 @@ struct Cli {
     /// Bypasses the TTL and forces a fresh network fetch of the index and its
     /// Sigstore bundle sidecar.
     refresh_index: bool,
+    /// P3a: `--require-attested-entries` flag (RFC per-entry-attestation.md
+    /// §4). Escalates the effective entry-trust policy warn→strict.
+    /// Identical semantics to `--require-attested-index` but for the
+    /// per-entry author-attribution axis.
+    require_attested_entries: bool,
     verb: String,
     rest: Vec<String>,
 }
@@ -131,12 +136,12 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
                 cmd_show(dir)
             }
         }
-        "verify" => cmd_verify(dir, cli.require_attested_metadata, cli.no_index, cli.require_attested_index, cli.refresh_index),
+        "verify" => cmd_verify(dir, cli.require_attested_metadata, cli.no_index, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries),
         "clean" => cmd_clean(dir),
-        "fetch" => cmd_fetch(dir, cli.strategy, cli.frozen, true, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest, cli.require_attested_index, cli.refresh_index),
-        "lock" => cmd_fetch(dir, cli.strategy, cli.frozen, false, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest, cli.require_attested_index, cli.refresh_index),
-        "update" => cmd_update(dir, cli.strategy, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index),
-        "add" => cmd_add(dir, cli.strategy, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index),
+        "fetch" => cmd_fetch(dir, cli.strategy, cli.frozen, true, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries),
+        "lock" => cmd_fetch(dir, cli.strategy, cli.frozen, false, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries),
+        "update" => cmd_update(dir, cli.strategy, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries),
+        "add" => cmd_add(dir, cli.strategy, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries),
         "remove" => cmd_remove(dir, cli.strategy, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index),
         "store" => cmd_store(&cli.rest),
         "workspace" => cmd_workspace(dir, &cli.rest, cli.strategy, cli.no_index, cli.require_attested_index, cli.refresh_index),
@@ -168,6 +173,8 @@ fn parse_args(args: &[String]) -> Option<Cli> {
     // three-value policy enum. Kill the double-read; env goes through the SSOT.
     let mut require_attested_index = false;
     let mut refresh_index = false;
+    // P3a: entry-trust escalation flag (mirrors require_attested_index).
+    let mut require_attested_entries = false;
     let mut i = 0;
     let verb;
     loop {
@@ -205,6 +212,10 @@ fn parse_args(args: &[String]) -> Option<Cli> {
                 require_attested_index = true;
                 i += 1;
             }
+            "--require-attested-entries" => {
+                require_attested_entries = true;
+                i += 1;
+            }
             "--refresh-index" => {
                 refresh_index = true;
                 i += 1;
@@ -226,6 +237,7 @@ fn parse_args(args: &[String]) -> Option<Cli> {
         no_index,
         require_attested_index,
         refresh_index,
+        require_attested_entries,
         verb,
         rest: args[i..].to_vec(),
     })
@@ -409,12 +421,14 @@ fn cmd_show_index_trust(dir: &Path) -> Result<i32, MilpaError> {
 /// `require_attested_metadata` is the parsed CLI flag (already ORed with the
 /// `MILPA_REQUIRE_ATTESTED_METADATA` env var by `parse_args` — the env parse
 /// lives there and only there, per Finding 1 SSOT).
+#[allow(clippy::too_many_arguments)]
 fn cmd_verify(
     dir: &Path,
     require_attested_metadata: bool,
     no_index: bool,
     require_attested_index: bool,
     refresh_index: bool,
+    require_attested_entries: bool,
 ) -> Result<i32, MilpaError> {
     // Gap-1 D: load_lockfile's `?` surfaces LOCK-FILE-NOT-FOUND via the Err path
     // in main (which now emits the milpa-error: slug automatically). No inline
@@ -432,11 +446,15 @@ fn cmd_verify(
     let mut verify_index_policy = milpa_manifest::TrustPolicy::Warn;
     let mut verify_index_signer: Option<String> = None;
     let mut verify_index_bundle: Option<String> = None;
+    // P3a (RFC per-entry-attestation.md §7): captured alongside the index-trust
+    // fields for the offline entry-attestation reverify below.
+    let mut verify_entry_trust_policy = milpa_manifest::TrustPolicy::Warn;
     match discover_manifest(dir) {
         Ok(milpa_manifest::ManifestDoc::Package(ref manifest)) => {
             verify_index_policy = manifest.index_trust_policy.clone();
             verify_index_signer = manifest.index_trust_signer.clone();
             verify_index_bundle = manifest.index_trust_bundle.clone();
+            verify_entry_trust_policy = manifest.entry_trust_policy.clone();
             if let Err(e) = check_frozen_active_flags_mismatch(
                 manifest,
                 &lock,
@@ -464,6 +482,7 @@ fn cmd_verify(
             verify_index_policy = p;
             verify_index_signer = s;
             verify_index_bundle = b;
+            verify_entry_trust_policy = ws.entry_trust_policy.clone();
             if let Err(e) = check_workspace_frozen_active_flags_mismatch(
                 &ws,
                 &lock,
@@ -510,6 +529,22 @@ fn cmd_verify(
                 }
             }
         }
+    }
+
+    // P3a (RFC per-entry-attestation.md §7): offline reverify of CACHED
+    // per-entry attestation bundles. Same shape as the index reverify above —
+    // never fetches, independent of the online dep_decl edge check below.
+    if let Err(e) = reverify_cached_entry_attestations(
+        &lock,
+        &verify_entry_trust_policy,
+        verify_index_signer.clone(),
+        verify_index_bundle.clone(),
+        require_attested_entries,
+        no_index,
+    ) {
+        eprintln!("cached entry attestation reverify failed: {}", message_of(&e));
+        eprintln!("milpa-error: {}", e.code());
+        return Ok(1);
     }
 
     let deps_dir = dir.join("_deps");
@@ -870,6 +905,7 @@ fn cmd_fetch(
     rest: &[String],
     require_attested_index: bool,
     refresh_index: bool,
+    require_attested_entries: bool,
 ) -> Result<i32, MilpaError> {
     let deps_dir = dir.join("_deps");
     let doc = discover_manifest(dir)?;
@@ -916,6 +952,14 @@ fn cmd_fetch(
             let profile = profile_from_env();
             // §8: reuse existing pins (idempotent repeated fetch — see single-pkg path).
             let prior = maybe_prior_lockfile(&dir.join("milpa.lock"));
+            // P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
+            let entry_trust = build_entry_trust_gate(
+                &ws.entry_trust_policy,
+                ws.index_trust_signer.clone(),
+                ws.index_trust_bundle.clone(),
+                require_attested_entries,
+                no_index,
+            )?;
 
             // S8 (RFC: workspace-completion §3.E): --certificate honored in workspace
             // mode (both fetch and lock). Mirrors cmd_fetch_with_cert for single-package.
@@ -927,6 +971,7 @@ fn cmd_fetch(
                     strategy, emit_nimcfg, cert_dest,
                     require_attested_metadata,
                     &cli_features, cli_no_default, cli_all_features,
+                    entry_trust.as_ref(),
                 );
             }
 
@@ -944,6 +989,7 @@ fn cmd_fetch(
                 &cli_features,
                 cli_no_default,
                 cli_all_features,
+                entry_trust.as_ref(),
             )?
         };
         write_lockfile(
@@ -1010,6 +1056,14 @@ fn cmd_fetch(
         let dep_decl_store_owned = maybe_dep_decl_store(no_index);
         let dep_decl_store: Option<&dyn DepDeclStore> =
             dep_decl_store_owned.as_deref();
+        // P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
+        let entry_trust = build_entry_trust_gate(
+            &manifest.entry_trust_policy,
+            manifest.index_trust_signer.clone(),
+            manifest.index_trust_bundle.clone(),
+            require_attested_entries,
+            no_index,
+        )?;
 
         if let Some(cert_dest) = cert_path {
             // §2.5: resolve with certificate — emit JSON regardless of success/failure,
@@ -1020,7 +1074,7 @@ fn cmd_fetch(
             return cmd_fetch_with_cert(
                 dir, &manifest, &deps_dir, index.as_ref(), registry.as_ref(),
                 profile.as_ref(), prior.as_ref(), strategy, emit_nimcfg, cert_dest,
-                dep_decl_store, require_attested_metadata,
+                dep_decl_store, require_attested_metadata, entry_trust.as_ref(),
             );
         }
 
@@ -1042,6 +1096,7 @@ fn cmd_fetch(
             &cli_features,
             cli_no_default,
             cli_all_features,
+            entry_trust.as_ref(),
         )?
     };
 
@@ -1086,8 +1141,9 @@ fn cmd_fetch_with_cert(
     cert_dest: &Path,
     dep_decl_store: Option<&dyn DepDeclStore>,
     require_attested_metadata: bool,
+    entry_trust: Option<&milpa_core::EntryTrustConfig>,
 ) -> Result<i32, MilpaError> {
-    match resolve_with_cert(manifest, index, registry, profile, prior, strategy, deps_dir, dep_decl_store, require_attested_metadata, &build_store()) {
+    match resolve_with_cert(manifest, index, registry, profile, prior, strategy, deps_dir, dep_decl_store, require_attested_metadata, &build_store(), entry_trust) {
         Ok((graph, cert)) => {
             // Write the success certificate (best-effort; a cert write failure
             // does NOT abort the command — the lock/nim.cfg still land).
@@ -1137,11 +1193,13 @@ fn cmd_fetch_workspace_with_cert(
     features: &std::collections::BTreeSet<String>,
     no_default_features: bool,
     all_features: bool,
+    entry_trust: Option<&milpa_core::EntryTrustConfig>,
 ) -> Result<i32, MilpaError> {
     match resolve_workspace_with_cert(
         ws, index, registry, profile, prior, strategy, deps_dir,
         require_attested_metadata, &build_store(),
         features, no_default_features, all_features,
+        entry_trust,
     ) {
         Ok((graph, cert)) => {
             // Write success certificate (best-effort; a cert write failure does
@@ -1181,7 +1239,8 @@ fn cmd_fetch_workspace_with_cert(
 /// - `update <dep>`: reject if `<dep>` is not in the lockfile (LOCK-DEP-NOT-FOUND);
 ///   drop ONLY that pin; pass all other pins to the resolver as `prior` so they
 ///   stay stable; re-resolve; write the new lockfile.
-fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, require_attested_index: bool, refresh_index: bool) -> Result<i32, MilpaError> {
+#[allow(clippy::too_many_arguments)]
+fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, require_attested_index: bool, refresh_index: bool, require_attested_entries: bool) -> Result<i32, MilpaError> {
     let name = rest.first().cloned();
     let lock_path = dir.join("milpa.lock");
 
@@ -1234,6 +1293,14 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
         let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index)?;
         let profile = profile_from_env();
         let ws_deps_dir = dir.join("_deps");
+        // P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
+        let entry_trust = build_entry_trust_gate(
+            &ws.entry_trust_policy,
+            ws.index_trust_signer.clone(),
+            ws.index_trust_bundle.clone(),
+            require_attested_entries,
+            no_index,
+        )?;
         let graph = resolve_workspace_with_features(
             &ws,
             index.as_ref(),
@@ -1247,6 +1314,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
             &std::collections::BTreeSet::new(),
             false,
             false,
+            entry_trust.as_ref(),
         )?;
         write_lockfile(&from_graph(&graph, strategy.as_str()), &lock_path)?;
         eprintln!(
@@ -1266,6 +1334,14 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
         // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
         let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index)?;
         let profile = profile_from_env();
+        // P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
+        let entry_trust = build_entry_trust_gate(
+            &ws.entry_trust_policy,
+            ws.index_trust_signer.clone(),
+            ws.index_trust_bundle.clone(),
+            require_attested_entries,
+            no_index,
+        )?;
         // Re-build prior against the SHARED lockfile, not a member-local one.
         let ws_prior: Option<milpa_core::Lockfile> = match &name {
             None => None,
@@ -1300,6 +1376,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
             &std::collections::BTreeSet::new(),
             false,
             false,
+            entry_trust.as_ref(),
         )?;
         write_lockfile(&from_graph(&graph, strategy.as_str()), &ws_lock_path)?;
         eprintln!(
@@ -1317,7 +1394,15 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
     let profile = profile_from_env();
     let dep_decl_store_owned = maybe_dep_decl_store(no_index);
     let dep_decl_store: Option<&dyn DepDeclStore> = dep_decl_store_owned.as_deref();
-    let graph = resolve(
+    // P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
+    let entry_trust = build_entry_trust_gate(
+        &manifest.entry_trust_policy,
+        manifest.index_trust_signer.clone(),
+        manifest.index_trust_bundle.clone(),
+        require_attested_entries,
+        no_index,
+    )?;
+    let graph = resolve_with_features(
         &manifest,
         index.as_ref(),
         registry.as_ref(),
@@ -1328,6 +1413,10 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
         dep_decl_store,
         false, // require_attested_metadata: not surfaced by `update` verb
         &build_store(),
+        &std::collections::BTreeSet::new(),
+        false,
+        false,
+        entry_trust.as_ref(),
     )?;
     write_lockfile(&from_graph(&graph, strategy.as_str()), &lock_path)?;
     eprintln!("updated {}", name.as_deref().unwrap_or("all deps"));
@@ -1335,7 +1424,8 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
 }
 
 /// `milpa add <name> --git <url> [--ref <r>]` / `add <name> --mirror <url>`.
-fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, require_attested_index: bool, refresh_index: bool) -> Result<i32, MilpaError> {
+#[allow(clippy::too_many_arguments)]
+fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, require_attested_index: bool, refresh_index: bool, require_attested_entries: bool) -> Result<i32, MilpaError> {
     let Some(name) = rest.first().cloned().filter(|n| !n.starts_with('-')) else {
         // Gap-1 C: no-name → usage error → exit 2 (no milpa-error: line).
         eprintln!("add: usage: milpa add <name> --git <url> [--ref <r>] | --mirror <url>");
@@ -1440,6 +1530,14 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
         // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
         let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index)?;
         let profile = profile_from_env();
+        // P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
+        let entry_trust = build_entry_trust_gate(
+            &ws.entry_trust_policy,
+            ws.index_trust_signer.clone(),
+            ws.index_trust_bundle.clone(),
+            require_attested_entries,
+            no_index,
+        )?;
         let graph = resolve_workspace_with_features(
             &ws_with_override,
             index.as_ref(),
@@ -1453,6 +1551,7 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
             &std::collections::BTreeSet::new(),
             false,
             false,
+            entry_trust.as_ref(),
         )?;
 
         // Atomic write: member manifest first, then shared workspace lock.
@@ -1550,7 +1649,15 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
     let registry = build_registry();
     let index = maybe_index_for_manifest(no_index, &existing, require_attested_index, refresh_index)?;
     let profile = profile_from_env();
-    let graph = resolve(
+    // P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
+    let entry_trust = build_entry_trust_gate(
+        &existing.entry_trust_policy,
+        existing.index_trust_signer.clone(),
+        existing.index_trust_bundle.clone(),
+        require_attested_entries,
+        no_index,
+    )?;
+    let graph = resolve_with_features(
         &proposed,
         index.as_ref(),
         registry.as_ref(),
@@ -1561,6 +1668,10 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
         None,
         false,
         &build_store(),
+        &std::collections::BTreeSet::new(),
+        false,
+        false,
+        entry_trust.as_ref(),
     )?;
 
     // Resolution succeeded → commit both outputs.
@@ -2093,6 +2204,10 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
             &std::collections::BTreeSet::new(),
             false,
             false,
+            // P3a (RFC per-entry-attestation.md §8): `remove` is not in the
+            // entry-trust command-coverage set (fetch/lock/add/update only) —
+            // mirrors the Python impl's cli.py wiring.
+            None,
         )?;
 
         // Atomic write: member manifest first, then shared workspace lock.
@@ -2361,6 +2476,55 @@ impl std::fmt::Debug for IndexTrustGateActive {
     }
 }
 
+/// Resolve `(TrustBundle, expected_signer)` from index-trust inputs: env
+/// override > manifest field > spec default (Item 2 precedence).
+///
+/// Extracted from `build_index_trust_gate` so `build_entry_trust_gate` (P3a)
+/// can derive the SAME effective vendor-bot identity Layer 1 resolved (RFC
+/// per-entry-attestation.md §5 NORMATIVE: the vendored-kind expected signer
+/// must be "the SAME effective vendor-bot identity Layer 1 resolved... never
+/// a second hardcoded copy of the default") without duplicating the
+/// file-loading / priority logic. Both callers pass their own manifest
+/// values (index-trust and entry-trust share the trust-root/signer INPUTS —
+/// `MILPA_INDEX_TRUST_SIGNER` / `index-trust-signer` — even though they are
+/// separate policy axes, RFC §4).
+fn resolve_trust_bundle_and_signer(
+    manifest_signer: Option<String>,
+    manifest_bundle: Option<String>,
+) -> Result<(milpa_core::index_trust::TrustBundle, String), MilpaError> {
+    use milpa_core::index_trust::{TrustBundle, DEFAULT_INDEX_SIGNER};
+
+    let signer = std::env::var("MILPA_INDEX_TRUST_SIGNER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or(manifest_signer) // manifest middle tier
+        .unwrap_or_else(|| DEFAULT_INDEX_SIGNER.to_string()); // spec default
+    // spec/cli-contract.md §8.6 NORMATIVE: MILPA_INDEX_TRUST_BUNDLE (or the manifest
+    // `index-trust-bundle` node) MUST be a `file://` URL; non-file:// values are rejected.
+    // A custom trust-root override currently resolves to TrustBundle::production() (the
+    // embedded standard trusted_root.json); wiring a file:// trust-root read is a separate
+    // follow-up, not needed for the public tianguis instance.
+    let raw_bundle = std::env::var("MILPA_INDEX_TRUST_BUNDLE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or(manifest_bundle); // manifest middle tier
+    let trust_bundle = match raw_bundle {
+        Some(ref path) if !path.starts_with("file://") => {
+            return Err(MilpaError::Core(CoreError::Tianguis(
+                "MILPA-INTERNAL",
+                format!(
+                    "MILPA_INDEX_TRUST_BUNDLE (or index-trust-bundle manifest node) \
+                     must be a file:// URL; got: {path:?}. \
+                     Use file:///abs/path/to/bundle.json (three slashes for an absolute \
+                     path). (spec/cli-contract.md §8.6 NORMATIVE)"
+                ),
+            )));
+        }
+        Some(_) | None => TrustBundle::production(),
+    };
+    Ok((trust_bundle, signer))
+}
+
 /// Build the trust-gate assembly for loading an index at `url`.
 ///
 /// Item 5 (M8): single owner of all trust-gate decisions:
@@ -2385,8 +2549,7 @@ fn build_index_trust_gate(
 ) -> Result<Option<IndexTrustGateActive>, MilpaError> {
     use milpa_core::effective_trust_policy;
     use milpa_core::index_trust::{
-        IndexBundleVerifier, IndexTrustConfig, MockVerifier, SigstoreVerifier, TrustBundle,
-        VerificationResult, DEFAULT_INDEX_SIGNER,
+        IndexBundleVerifier, IndexTrustConfig, MockVerifier, SigstoreVerifier, VerificationResult,
     };
     use milpa_manifest::TrustPolicy;
 
@@ -2420,35 +2583,7 @@ fn build_index_trust_gate(
     }
 
     // Shared config assembly (both the mock seam and the real verifier use it).
-    // env > manifest > default precedence (Item 2 — mirrors Python _build_index_trust).
-    let signer = std::env::var("MILPA_INDEX_TRUST_SIGNER")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or(manifest_signer) // manifest middle tier
-        .unwrap_or_else(|| DEFAULT_INDEX_SIGNER.to_string()); // spec default
-    // spec/cli-contract.md §8.6 NORMATIVE: MILPA_INDEX_TRUST_BUNDLE (or the manifest
-    // `index-trust-bundle` node) MUST be a `file://` URL; non-file:// values are rejected.
-    // A custom trust-root override currently resolves to TrustBundle::production() (the
-    // embedded standard trusted_root.json); wiring a file:// trust-root read is a separate
-    // follow-up, not needed for the public tianguis instance.
-    let raw_bundle = std::env::var("MILPA_INDEX_TRUST_BUNDLE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or(manifest_bundle); // manifest middle tier
-    let trust_bundle = match raw_bundle {
-        Some(ref path) if !path.starts_with("file://") => {
-            return Err(MilpaError::Core(CoreError::Tianguis(
-                "MILPA-INTERNAL",
-                format!(
-                    "MILPA_INDEX_TRUST_BUNDLE (or index-trust-bundle manifest node) \
-                     must be a file:// URL; got: {path:?}. \
-                     Use file:///abs/path/to/bundle.json (three slashes for an absolute \
-                     path). (spec/cli-contract.md §8.6 NORMATIVE)"
-                ),
-            )));
-        }
-        Some(_) | None => TrustBundle::production(),
-    };
+    let (trust_bundle, signer) = resolve_trust_bundle_and_signer(manifest_signer, manifest_bundle)?;
     let max_age: Option<u64> = std::env::var("MILPA_INDEX_MAX_AGE")
         .ok()
         .and_then(|v| v.trim().parse().ok());
@@ -2509,6 +2644,225 @@ fn build_bundle_http_fn() -> Box<dyn Fn(&str) -> Result<Vec<u8>, milpa_core::Bun
             }
         }
     })
+}
+
+/// Read `MILPA_ENTRY_TRUST` env var as a `TrustPolicy`. Mirrors
+/// `read_env_index_trust_policy` for the sibling entry-trust axis.
+fn read_env_entry_trust_policy() -> Option<milpa_manifest::TrustPolicy> {
+    use milpa_manifest::TrustPolicy;
+    std::env::var("MILPA_ENTRY_TRUST").ok().and_then(|v| match v.trim() {
+        "strict" => Some(TrustPolicy::Strict),
+        "warn" => Some(TrustPolicy::Warn),
+        "off" => Some(TrustPolicy::Off),
+        _ => None,
+    })
+}
+
+/// P3a (RFC per-entry-attestation.md §3, §4, §5): build the `EntryTrustConfig`
+/// for the entry-trust gate, or `None` when the effective policy is `Off`
+/// (`resolve_with_features` / `resolve_workspace_with_features` never invoke
+/// the gate machinery in that case — mirrors `build_index_trust_gate`'s `None`).
+///
+/// Authority model:
+/// 1. Compute effective policy = `effective_trust_policy(entry_trust_policy,
+///    require_attested_entries, MILPA_ENTRY_TRUST env override)`.
+/// 2. If `Off` → return `None`.
+/// 3. Reuse index-trust's trust-root + expected-signer resolution
+///    (`resolve_trust_bundle_and_signer`) — RFC §5 NORMATIVE: the
+///    vendored-kind expected signer MUST be the SAME effective vendor-bot
+///    identity Layer 1 resolved, never a second hardcoded copy.
+/// 4. Build the bundle store: `MILPA_ENTRY_BUNDLE_DIR` (mirror of
+///    `MILPA_DEP_DECL_DIR`) or derived from `MILPA_INDEX_URL`.
+/// 5. Build verifier: `MockEntryVerifier` from the `MILPA_ENTRY_TRUST_MOCK_MAP`
+///    / `MILPA_ENTRY_TRUST_MOCK_DEFAULT` conformance seam (file://-index-only
+///    guard, mirroring `MILPA_INDEX_TRUST_MOCK_VERIFIER`), or
+///    `SigstoreEntryVerifier` in production.
+fn build_entry_trust_gate(
+    entry_trust_policy: &milpa_manifest::TrustPolicy,
+    manifest_signer: Option<String>,
+    manifest_bundle: Option<String>,
+    require_attested_entries: bool,
+    no_index: bool,
+) -> Result<Option<milpa_core::EntryTrustConfig>, MilpaError> {
+    use milpa_core::entry_trust::{EntryVerificationResult, MockEntryVerifier, SigstoreEntryVerifier};
+    use milpa_core::{effective_trust_policy, EntryBundleVerifier, EntryTrustConfig};
+    use milpa_manifest::TrustPolicy;
+
+    let env_policy = read_env_entry_trust_policy();
+    let effective_policy =
+        effective_trust_policy(entry_trust_policy, require_attested_entries, env_policy.as_ref());
+    if effective_policy == TrustPolicy::Off {
+        return Ok(None);
+    }
+
+    // Reuse index-trust's trust-root + expected-signer resolution (RFC §5).
+    let (trust_bundle, expected_signer) = resolve_trust_bundle_and_signer(manifest_signer, manifest_bundle)?;
+
+    // Build the bundle-acquisition store.
+    let entry_bundle_dir = std::env::var("MILPA_ENTRY_BUNDLE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let raw_index_url = std::env::var("MILPA_INDEX_URL").ok().filter(|s| !s.is_empty());
+    let bundle_store = milpa_core::entry_bundle_store_from_paths(
+        entry_bundle_dir.as_deref(),
+        raw_index_url.as_deref(),
+        no_index,
+    );
+
+    // Verifier: MockEntryVerifier from conformance seam, SigstoreEntryVerifier
+    // in production. Mirrors MILPA_INDEX_TRUST_MOCK_VERIFIER's file://-only guard.
+    let mock_map_raw = std::env::var("MILPA_ENTRY_TRUST_MOCK_MAP")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let mock_default_raw = std::env::var("MILPA_ENTRY_TRUST_MOCK_DEFAULT")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let verifier: Box<dyn EntryBundleVerifier> = if mock_map_raw.is_some() || mock_default_raw.is_some() {
+        // Guard: mock seam is conformance-internal; ONLY honored for file:// indexes.
+        if !raw_index_url.as_deref().unwrap_or("").starts_with("file://") {
+            return Err(MilpaError::Core(CoreError::Tianguis(
+                "MILPA-INTERNAL",
+                "MILPA_ENTRY_TRUST_MOCK_MAP / MILPA_ENTRY_TRUST_MOCK_DEFAULT are \
+                 conformance-internal and only honored for file:// index URLs \
+                 (all conformance fixtures use file://; production indexes are \
+                 https). These variables must not be set in production or with \
+                 non-file:// index URLs."
+                    .to_string(),
+            )));
+        }
+        let default_result = mock_default_raw
+            .as_deref()
+            .and_then(EntryVerificationResult::from_value)
+            .unwrap_or(EntryVerificationResult::Trusted);
+        let mut by_subject: std::collections::HashMap<String, EntryVerificationResult> =
+            std::collections::HashMap::new();
+        if let Some(raw) = &mock_map_raw {
+            let parsed: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+                MilpaError::Core(CoreError::Tianguis(
+                    "MILPA-INTERNAL",
+                    format!("MILPA_ENTRY_TRUST_MOCK_MAP is not valid JSON: {e}"),
+                ))
+            })?;
+            let obj = parsed.as_object().ok_or_else(|| {
+                MilpaError::Core(CoreError::Tianguis(
+                    "MILPA-INTERNAL",
+                    "MILPA_ENTRY_TRUST_MOCK_MAP must be a JSON object".to_string(),
+                ))
+            })?;
+            for (k, v) in obj {
+                let vs = v.as_str().ok_or_else(|| {
+                    MilpaError::Core(CoreError::Tianguis(
+                        "MILPA-INTERNAL",
+                        format!("MILPA_ENTRY_TRUST_MOCK_MAP entry {k:?} must be a string value"),
+                    ))
+                })?;
+                let result = EntryVerificationResult::from_value(vs).ok_or_else(|| {
+                    MilpaError::Core(CoreError::Tianguis(
+                        "MILPA-INTERNAL",
+                        format!(
+                            "MILPA_ENTRY_TRUST_MOCK_MAP entry {k:?}={vs:?} is not a valid \
+                             result wire string. Test seam must never fail-open silently."
+                        ),
+                    ))
+                })?;
+                by_subject.insert(k.clone(), result);
+            }
+        }
+        Box::new(MockEntryVerifier::new(default_result, by_subject))
+    } else {
+        Box::new(SigstoreEntryVerifier)
+    };
+
+    Ok(Some(EntryTrustConfig {
+        policy: effective_policy,
+        trust_bundle,
+        expected_vendor_signer: expected_signer,
+        verifier,
+        bundle_store,
+    }))
+}
+
+/// P3a (RFC per-entry-attestation.md §7): re-verify CACHED per-entry
+/// attestation bundles offline — NEVER fetches.
+///
+/// For each locked dep carrying an `attestation` block, re-derive the
+/// verification outcome from the cached bundle (crypto + subject binding, no
+/// freshness — mirrors `reverify_cached_index`'s shape) against the
+/// lockfile's recorded kind/signer/namespace. Missing cached bundle →
+/// `BundleMissing` (warn/strict per policy). A no-op when the effective
+/// entry-trust policy is `Off`.
+///
+/// Offline invariant: this checks `bundle_store.is_cached(pin)` BEFORE ever
+/// calling `bundle_store.get(pin)` — for `HttpEntryBundleStore`, `get()` on
+/// an uncached pin would attempt a real network fetch, which `milpa verify`
+/// must never do. A pin that is present but not cached is reported as
+/// `BundleMissing` (cause `unfetchable`), exactly as if the bundle had never
+/// been fetched.
+fn reverify_cached_entry_attestations(
+    lock: &milpa_core::Lockfile,
+    entry_trust_policy: &milpa_manifest::TrustPolicy,
+    manifest_signer: Option<String>,
+    manifest_bundle: Option<String>,
+    require_attested_entries: bool,
+    no_index: bool,
+) -> Result<(), MilpaError> {
+    use milpa_core::entry_trust::EntryVerificationResult;
+    use milpa_core::EntryAttestation;
+
+    let Some(cfg) = build_entry_trust_gate(
+        entry_trust_policy,
+        manifest_signer,
+        manifest_bundle,
+        require_attested_entries,
+        no_index,
+    )?
+    else {
+        return Ok(()); // policy off
+    };
+
+    for dep in &lock.deps {
+        let Some(att) = &dep.attestation else { continue };
+
+        let (result, cause): (EntryVerificationResult, Option<String>) = match &att.bundle_pin {
+            None => (EntryVerificationResult::BundleMissing, Some("no-pin".to_string())),
+            Some(pin) => match &cfg.bundle_store {
+                Some(store) if store.is_cached(pin) => {
+                    // Cached: reuse the shared gate pipeline. get() on a
+                    // cached pin never touches the network (is_cached above).
+                    let reconstructed = EntryAttestation {
+                        kind: att.kind.clone(),
+                        rekor: att.rekor.clone(),
+                        bundle_pin: att.bundle_pin.clone(),
+                    };
+                    milpa_core::evaluate_entry_attestation(
+                        Some(&reconstructed),
+                        dep.identity.as_deref().unwrap_or(""),
+                        &att.namespace,
+                        &dep.name,
+                        &dep.version,
+                        cfg.verifier.as_ref(),
+                        cfg.bundle_store.as_deref(),
+                        &cfg.trust_bundle,
+                        &cfg.expected_vendor_signer,
+                    )?
+                }
+                // NEVER fetch — a present-but-uncached pin (or no store at
+                // all) is unfetchable-from-cache.
+                _ => (EntryVerificationResult::BundleMissing, Some("unfetchable".to_string())),
+            },
+        };
+
+        milpa_core::enforce_entry_trust(
+            result,
+            &cfg.policy,
+            &att.namespace,
+            &dep.name,
+            &dep.version,
+            cause.as_deref(),
+        )?;
+    }
+    Ok(())
 }
 
 /// Internal helper: call load_index with pre-resolved arguments.
@@ -3129,12 +3483,12 @@ mod tests {
 
         // First, fetch to produce a baseline lockfile with both pins.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        assert_eq!(cmd_fetch(&proj, Strategy::default(), false, true, None, false, false, &[], false, false).unwrap(), 0);
+        assert_eq!(cmd_fetch(&proj, Strategy::default(), false, true, None, false, false, &[], false, false, false).unwrap(), 0);
         let baseline = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
         assert!(baseline.contains("\"foo\"") && baseline.contains("\"bar\""));
 
         // Scoped update of foo: succeeds, writes the lockfile, leaves kdl intact.
-        let r = cmd_update(&proj, Strategy::default(), &["foo".into()], false, false, false);
+        let r = cmd_update(&proj, Strategy::default(), &["foo".into()], false, false, false, false);
         let after_kdl = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
         let after_lock = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
@@ -3160,7 +3514,7 @@ mod tests {
         .unwrap();
 
         // No lockfile yet → scoped update fails with LOCK-FILE-NOT-FOUND.
-        let no_lock = cmd_update(&proj, Strategy::default(), &["ghost".into()], false, false, false);
+        let no_lock = cmd_update(&proj, Strategy::default(), &["ghost".into()], false, false, false, false);
         assert!(no_lock.is_err());
         assert_eq!(no_lock.unwrap_err().code(), "LOCK-FILE-NOT-FOUND");
 
@@ -3170,7 +3524,7 @@ mod tests {
             "// generated by milpa; reproducible build snapshot\nversion 1\nstrategy \"maxver\"\n",
         )
         .unwrap();
-        let r = cmd_update(&proj, Strategy::default(), &["ghost".into()], false, false, false);
+        let r = cmd_update(&proj, Strategy::default(), &["ghost".into()], false, false, false, false);
         assert_eq!(r.unwrap(), 1, "dep-not-in-lock → exit 1");
     }
 
@@ -3271,7 +3625,7 @@ mod tests {
         let mocked = make_mocked_fetches(tmp.path(), primary_url, "main", &sha, &[("foo.nim", b"version = \"1.0.0\"\n")]);
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let r = cmd_update(&proj, Strategy::default(), &["foo".into()], false, false, false);
+        let r = cmd_update(&proj, Strategy::default(), &["foo".into()], false, false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(r.unwrap(), 0, "update must succeed");
@@ -3327,7 +3681,7 @@ mod tests {
         let mocked = make_mocked_fetches(tmp.path(), primary_url, "main", &sha, &[("foo.nim", b"version = \"1.0.0\"\n")]);
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let r = cmd_update(&proj, Strategy::default(), &["foo".into()], false, false, false);
+        let r = cmd_update(&proj, Strategy::default(), &["foo".into()], false, false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(r.unwrap(), 0, "update must succeed");
@@ -3379,7 +3733,7 @@ mod tests {
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         // Pass alias 'baz' as dep_name — must resolve to canonical 'foo'.
-        let r = cmd_update(&proj, Strategy::default(), &["baz".into()], false, false, false);
+        let r = cmd_update(&proj, Strategy::default(), &["baz".into()], false, false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(
@@ -3520,7 +3874,7 @@ mod tests {
         let mocked = make_mocked_fetches(tmp.path(), primary_url, "main", &sha, &[("foo.nim", b"version = \"1.0.0\"\n")]);
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let r = cmd_update(&proj, Strategy::default(), &["foo".into()], false, false, false);
+        let r = cmd_update(&proj, Strategy::default(), &["foo".into()], false, false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(r.unwrap(), 0, "update with no mirrors must succeed");
@@ -3559,6 +3913,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let after_add = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
         let lock = std::fs::read_to_string(proj.join("milpa.lock")).unwrap_or_default();
@@ -3571,12 +3926,13 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
 
         // (3) add a second dep with NO --ref → mocked default-branch discovery.
         let url2 = "https://example.com/bar.git";
         let _ = make_mocked_fetches(tmp.path(), url2, "trunk", &"c".repeat(40), &[("bar.nim", b"# bar")]);
-        let r2 = cmd_add(&proj, Strategy::default(), &["bar".into(), "--git".into(), url2.into()], false, false, false);
+        let r2 = cmd_add(&proj, Strategy::default(), &["bar".into(), "--git".into(), url2.into()], false, false, false, false);
         let after_add2 = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
 
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
@@ -3612,9 +3968,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(cmd_remove(tmp.path(), Strategy::default(), &[], false, false, false).unwrap(), 2);
         // add with no name → exit 2.
-        assert_eq!(cmd_add(tmp.path(), Strategy::default(), &[], false, false, false).unwrap(), 2);
+        assert_eq!(cmd_add(tmp.path(), Strategy::default(), &[], false, false, false, false).unwrap(), 2);
         // add with no --git/--mirror → exit 2.
-        assert_eq!(cmd_add(tmp.path(), Strategy::default(), &["foo".into()], false, false, false).unwrap(), 2);
+        assert_eq!(cmd_add(tmp.path(), Strategy::default(), &["foo".into()], false, false, false, false).unwrap(), 2);
     }
 
     // --- MILPA_MOCKED_FETCHES integration -----------------------------------
@@ -3668,7 +4024,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX; unique env var name; cleaned up after.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false, false, &[], false, false);
+        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false, false, &[], false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert!(result.is_ok(), "expected Ok, got {result:?}");
@@ -3755,7 +4111,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked_dir) };
-        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false, false, &[], false, false);
+        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false, false, &[], false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
         unsafe { std::env::remove_var("MILPA_CACHE_DIR") };
 
@@ -3816,7 +4172,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false, false, &[], false, false);
+        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false, false, &[], false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert!(result.is_err(), "expected Err, got {result:?}");
@@ -4451,7 +4807,7 @@ mod tests {
 
         let proj = seed_verify_reverify_case(tmp.path(), index_url);
         // Minimal-valid project: the ONLY exit-1 condition is the cached-bundle reverify.
-        let result = cmd_verify(&proj, false, false, false, false);
+        let result = cmd_verify(&proj, false, false, false, false, false);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST") };
@@ -4476,7 +4832,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_TRUST_MOCK_VERIFIER", "trusted") };
 
         let proj = seed_verify_reverify_case(tmp.path(), index_url);
-        let result = cmd_verify(&proj, false, false, false, false);
+        let result = cmd_verify(&proj, false, false, false, false, false);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST") };
@@ -4517,7 +4873,7 @@ mod tests {
         std::fs::write(&cache_file, &real_index).unwrap();
         std::fs::write(milpa_core::index_cache::bundle_path(&cache_file), &tampered).unwrap();
 
-        let result = cmd_verify(&proj, false, false, false, false);
+        let result = cmd_verify(&proj, false, false, false, false, false);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST") };
@@ -4794,6 +5150,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
@@ -4829,6 +5186,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
@@ -4855,6 +5213,7 @@ mod tests {
             Strategy::default(),
             &["myflag".into(), "--git".into(), "https://example.com/myflag.git".into(),
               "--ref".into(), "main".into(), "--optional".into()],
+            false,
             false,
             false,
             false,
@@ -5029,7 +5388,7 @@ mod tests {
         std::fs::write(proj.join("milpa.lock"), lock_text).unwrap();
 
         // verify must exit non-zero — optdep is in lock but flag is default=#false.
-        let rc = cmd_verify(&proj, false, false, false, false).unwrap();
+        let rc = cmd_verify(&proj, false, false, false, false, false).unwrap();
         assert_ne!(rc, 0, "verify must exit non-zero when active_flags mismatch");
     }
 
@@ -5328,6 +5687,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
@@ -5374,7 +5734,7 @@ mod tests {
 
         // Fetch first so there's a lockfile and _deps/ to satisfy remove's resolve.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        cmd_fetch(&proj, Strategy::Minver, false, true, None, false, false, &[], false, false).unwrap();
+        cmd_fetch(&proj, Strategy::Minver, false, true, None, false, false, &[], false, false, false).unwrap();
 
         // Remove dpa with minver strategy.
         let rc = cmd_remove(

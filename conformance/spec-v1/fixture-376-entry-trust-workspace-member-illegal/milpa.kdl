@@ -1,0 +1,7 @@
+// fixture-376: entry-trust is a workspace-ROOT policy (RFC per-entry-attestation.md
+// §4) — mirrors WS-INDEX-TRUST-ON-MEMBER's check for the sibling axis. A member
+// declaring entry-trust (even a value matching the default "warn") is a hard error.
+entry-trust "strict"
+workspace {
+    member "sub"
+}

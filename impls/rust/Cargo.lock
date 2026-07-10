@@ -1423,6 +1423,7 @@ version = "0.0.0"
 dependencies = [
  "milpa-core",
  "milpa-types",
+ "serde_json",
  "tempfile",
 ]
 
@@ -1430,6 +1431,7 @@ dependencies = [
 name = "milpa-core"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "bzip2-rs",
  "flate2",
  "hex",

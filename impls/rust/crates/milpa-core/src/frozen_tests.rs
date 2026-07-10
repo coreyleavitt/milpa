@@ -24,6 +24,8 @@ fn manifest(deps: Vec<Dep>) -> Manifest {
         index_trust_signer: None,
         index_trust_bundle: None,
         index_trust_policy_explicit: false,
+        entry_trust_policy: milpa_manifest::TrustPolicy::Warn,
+        entry_trust_policy_explicit: false,
         optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }
@@ -360,8 +362,11 @@ fn frozen_carries_aliases_from_locked_dep() {
 
 /// RFC per-entry-attestation.md P2 (§8 Command Coverage): the frozen fetch
 /// path must carry the lockfile's attestation CLAIM through, widened back to
-/// `EntryAttestation` with `bundle_pin: None` (never persisted to the
-/// lockfile — §3.9). Mirrors `frozen_carries_aliases_from_locked_dep`.
+/// `EntryAttestation` with `bundle_pin` round-tripped too (P3a addition,
+/// lockfile-schema §3.9 — the frozen path carries the CLAIM through
+/// unconditionally, including the delivery pin, since `milpa verify`'s
+/// offline re-verification needs it downstream of a frozen resolve too).
+/// Mirrors `frozen_carries_aliases_from_locked_dep`.
 #[test]
 fn frozen_carries_attestation_from_locked_dep() {
     let tmp = tempfile::tempdir().unwrap();
@@ -376,6 +381,8 @@ fn frozen_carries_attestation_from_locked_dep() {
             log_index: "1".into(),
             integrated_time: "2".into(),
         }),
+        bundle_pin: Some("a".repeat(64)),
+        namespace: "ns1".into(),
     });
     let lf = lock("maxver", vec![locked_dep]);
     let dd = deps_dir(&tmp);
@@ -392,9 +399,9 @@ fn frozen_carries_attestation_from_locked_dep() {
                 log_index: "1".into(),
                 integrated_time: "2".into(),
             }),
-            bundle_pin: None,
+            bundle_pin: Some("a".repeat(64)),
         }),
-        "frozen reconstruction must carry the attestation claim from LockedDep"
+        "frozen reconstruction must carry the attestation claim (incl. bundle_pin) from LockedDep"
     );
 }
 
@@ -534,6 +541,7 @@ fn local_dep(name: &str, path: &str) -> milpa_types::ResolvedDep {
         aliases: vec![],
         active_flags: vec![],
         attestation: None,
+        registry_namespace: None,
     }
 }
 
@@ -639,6 +647,7 @@ fn rebuild_deps_view_preserves_local_symlink_alongside_cas_dep() {
         aliases: vec![],
         active_flags: vec![],
         attestation: None,
+        registry_namespace: None,
     };
     let graph = milpa_types::ResolvedGraph { deps: vec![local, git] };
 

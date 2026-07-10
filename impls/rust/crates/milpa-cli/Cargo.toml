@@ -14,7 +14,10 @@ path = "src/main.rs"
 milpa-core = { workspace = true }
 milpa-manifest = { workspace = true }
 tempfile = "3"
-
-[dev-dependencies]
-# Test-only: craft tampered bundle fixtures for the S4b strict-fails integration test.
+# deps-rationale: P3a (RFC per-entry-attestation.md §5 conformance seam):
+# build_entry_trust_gate parses MILPA_ENTRY_TRUST_MOCK_MAP (a JSON object of
+# subject-coordinate -> result-string) — the same conformance-internal seam
+# shape MILPA_INDEX_TRUST_MOCK_VERIFIER uses for a single value. Was
+# previously a dev-only dependency (tampered-bundle test fixtures); now also
+# needed by production CLI code, so it moves out of [dev-dependencies].
 serde_json = "1"

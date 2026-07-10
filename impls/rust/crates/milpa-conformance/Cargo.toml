@@ -22,3 +22,9 @@ milpa-types = { workspace = true }
 # Used in run_index_trust_fixture (Item 4 M4): real workspace manifest writes for
 # fixture-355 and fixture-349 runners require a temp dir outside the fixture dir.
 tempfile = "3"
+# deps-rationale: P3a (RFC per-entry-attestation.md §3, §5, Conformance
+# section) — fixture_entry_trust_config parses MILPA_ENTRY_TRUST_MOCK_MAP (a
+# JSON object of subject-coordinate -> result-string), the shared fixture
+# env-var contract mirrored from the Python in-process adapter's
+# `_fixture_entry_trust_config`.
+serde_json = "1"

@@ -341,6 +341,18 @@ class _Candidate:
     # index entry) and for named deps whose index entry had no attestation
     # record or one that collapsed to unattested at index-parse time.
     attestation: EntryAttestation | None = None
+    # P3a (RFC per-entry-attestation.md §3): True iff this candidate was
+    # materialised via the named-dep (registry) path — the entry-trust gate's
+    # discriminator for "is this a registry-resolved dep at all", distinct
+    # from ``attestation is None`` (which is also true for an unattested
+    # registry dep). False for URL/tarball/local/member candidates.
+    is_registry: bool = False
+    # P3a: the entry's REAL index namespace (registry.py IndexVersion.namespace),
+    # always populated for registry candidates — distinct from the manifest-
+    # qualification-only namespace used for the lockfile record (a bare dep
+    # declaration has no qualifier there, but still resolves through a real
+    # namespaced index entry). Empty string for non-registry candidates.
+    registry_namespace: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +568,9 @@ class _Provider:
             # index — already None when absent or collapsed (registry.py's
             # conservative-collapse rule), so no re-derivation needed here.
             attestation=iv.attestation,
+            # P3a: this candidate came from the named-dep (registry) path.
+            is_registry=True,
+            registry_namespace=iv.namespace,
         )
 
         # S3: compute and store dep_active_flags for this named dep.
@@ -2538,7 +2553,10 @@ def resolve(
     # ------------------------------------------------------------------
     # Step 9: build the ResolvedGraph (attach cert for CLI §2.5)
     # ------------------------------------------------------------------
-    graph = _build_graph(solution, provider, deps_dir, params.strategy, aliases_map=aliases_map)
+    graph = _build_graph(
+        solution, provider, deps_dir, params.strategy,
+        aliases_map=aliases_map, entry_trust=params.entry_trust,
+    )
 
     # ------------------------------------------------------------------
     # Step 10: S5 attestation policy enforcement
@@ -3323,12 +3341,22 @@ def _build_graph(
     deps_dir: Path,
     strategy: Strategy,
     aliases_map: dict[str, str] | None = None,
+    entry_trust: "EntryTrustConfig | None" = None,
 ) -> ResolvedGraph:
     """Map ``solve()``'s solution dict to a ``ResolvedGraph``.
 
     ``aliases_map`` maps non-canonical name → canonical name (populated by
     the Phase B dedup pass).  Used to populate ``ResolvedDep.aliases`` on
     the surviving canonical dep.
+
+    ``entry_trust`` (P3a, RFC per-entry-attestation.md §3): when not ``None``,
+    the entry-trust gate runs HERE, per selected registry-resolved dep — this
+    is the "post-solve, per selected dep" point the RFC specs: ``solution``
+    is already the solver's FINAL pick (backtracking is done), and this loop
+    iterates exactly the selected set, never a rejected/enumerated candidate.
+    A ``strict``-policy failure raises and aborts graph construction (RFC §3:
+    "a failing selected version is a hard, late resolve failure with no
+    automatic fallback").
     """
     GP = GitProvenance
     LP = LocalProvenance
@@ -3428,6 +3456,33 @@ def _build_graph(
 
         version_str = format_version_str(version)
 
+        # P3a (RFC per-entry-attestation.md §3, §5): the entry-trust gate —
+        # post-solve, per selected registry-resolved dep. Runs BEFORE the
+        # ResolvedDep is assembled so a strict-policy failure aborts graph
+        # construction outright (no partially-built graph escapes).
+        if entry_trust is not None and cand.is_registry:
+            from milpa.entry_trust import enforce_entry_trust, evaluate_entry_attestation
+
+            _gate_result, _gate_cause = evaluate_entry_attestation(
+                attestation=cand.attestation,
+                content_hash=cand.identity or "",
+                namespace=cand.registry_namespace,
+                name=_bare_name,
+                version=version_str,
+                verifier=entry_trust.verifier,
+                bundle_store=entry_trust.bundle_store,
+                trust_bundle=entry_trust.trust_bundle,
+                expected_vendor_signer=entry_trust.expected_vendor_signer,
+            )
+            enforce_entry_trust(
+                _gate_result,
+                entry_trust.policy,
+                namespace=cand.registry_namespace,
+                name=_bare_name,
+                version=version_str,
+                cause=_gate_cause,
+            )
+
         # S4: build cond_requires from the candidate's requires_predicates dict.
         # requires_predicates maps name → list[predicate_tuple]; a dep in ≥2
         # when-branches yields ≥2 entries per name, each becoming one CondRequire.
@@ -3500,6 +3555,9 @@ def _build_graph(
             # RFC per-entry-attestation.md P2: carry the attestation claim from
             # the candidate (None for non-named deps and unattested entries).
             attestation=cand.attestation,
+            # P3a: the entry's REAL index namespace, for milpa verify's
+            # offline re-verification (only meaningful alongside attestation).
+            registry_namespace=cand.registry_namespace if cand.is_registry else None,
         )
         deps.append(resolved)
 
@@ -4070,7 +4128,10 @@ def resolve_workspace(
     # ------------------------------------------------------------------
     # Build graph (attach cert for CLI §2.5)
     # ------------------------------------------------------------------
-    graph = _build_graph(solution, provider, deps_dir, params.strategy, aliases_map=ws_aliases_map)
+    graph = _build_graph(
+        solution, provider, deps_dir, params.strategy,
+        aliases_map=ws_aliases_map, entry_trust=params.entry_trust,
+    )
 
     # §13 attestation policy enforcement — mirrors single-package resolve().
     # Effective policy: OR of flag/env (via _ws_is_strict computed above) and

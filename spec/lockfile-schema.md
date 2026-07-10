@@ -532,10 +532,44 @@ dep "widget" {
             log_index "<decimal-string>"
             integrated_time "<decimal-string>"
         }
+        bundle sha256="<64-hex>"     // omitted when the index entry carried no bundle pin (P3a)
+        namespace "<namespace>"      // the entry's real index namespace; "" when unqualified (P3a)
     }
     provenance { ... }
 }
 ```
+
+> NORMATIVE (P3a addition, RFC `rfc-per-entry-attestation.md` §7): the
+> `bundle sha256=` child, when present, carries the SAME delivery-integrity
+> pin as the index-side `EntryAttestation.bundle_pin` (§3.2's `bundle
+> sha256=` node) — bare 64-lowercase-hex, no `sha256:` prefix (the property
+> key already names the algorithm). This is NOT the digest half of the
+> subject (that exclusion, discussed below, still holds) — it is the hash of
+> the attestation BUNDLE'S BYTES, the store's native content-addressed key
+> (`entry_bundle_store.py`). It is recorded so `milpa verify`'s offline
+> re-verification (§7) can locate the cached bundle for a locked dep without
+> any index available — the same "hash pin recorded in the lockfile so an
+> offline consumer can find the cached artifact" shape as the `dep_decl`
+> pin (§3.7). Additive optional field: follows the `dep_decl` optional-field
+> precedent (no `LOCKFILE_SCHEMA_VERSION` bump — both impls' parsers already
+> skip unknown child nodes, and an older client simply omits the field it
+> doesn't understand).
+
+> NORMATIVE (P3a addition): the `namespace` child carries the entry's REAL
+> index namespace (`registry-protocol.md` §3.1's `Package.namespace`) — NOT
+> the dep-arg-level qualification convention `dep "widget" { namespace
+> "<ns>" ... }` uses elsewhere in this schema (§3.9's own parent dep block
+> may have no top-level `namespace` child at all when the manifest declared
+> a bare, unqualified name — the index entry it resolved against still has a
+> real namespace, and losing that information here would make it
+> unrecoverable offline). `namespace` is MANDATORY within the `attestation`
+> block whenever the block itself is present (mirrors `kind`) — always
+> written, even as the empty string for an entry published under no
+> namespace — because `milpa verify`'s offline re-verification (§7) needs it
+> to rebuild the exact `pkg:tianguis/<namespace>/<name>@<version>` subject
+> coordinate with no index available. A P3a-vintage-or-later writer always
+> emits it; a pre-P3a lockfile (no `namespace` child inside `attestation`)
+> parses with the value defaulting to `""` (forward-compat).
 
 > NORMATIVE: The lockfile records the attestation **claim**, never a
 > verification **outcome**. No field in this block (or anywhere else in the

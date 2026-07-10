@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from milpa.cas import CAStore
+from milpa.entry_trust import EntryTrustConfig
 from milpa.fetchers.cas_admitting import CasAdmittingFetcher
 from milpa.index_trust import IndexTrustConfig
 from milpa.lockfile import Lockfile
@@ -102,6 +103,13 @@ class MilpaEnv:
     #: Stored here (not read from env) because it comes from CLI arg parsing in main().
     require_attested_index: bool = False
 
+    #: P3a (RFC per-entry-attestation.md §4): True when
+    #: ``--require-attested-entries`` CLI flag was passed. Escalates the
+    #: effective entry-trust policy from warn → strict (never touches off).
+    #: Mirrors ``require_attested_index`` — stored here (not read from env)
+    #: because it comes from CLI arg parsing in main().
+    require_attested_entries: bool = False
+
 
 @dataclass(frozen=True)
 class ResolveParams:
@@ -144,3 +152,11 @@ class ResolveParams:
     features: frozenset[str] = frozenset()
     no_default_features: bool = False
     all_features: bool = False
+    # P3a (RFC per-entry-attestation.md §3, §4): the entry-trust gate config.
+    # ``None`` disables the gate entirely (equivalent to policy "off" but also
+    # covers "not wired for this call site yet" — e.g. verbs that don't touch
+    # the index).  Unlike index-trust (gated once at index load, BEFORE
+    # resolve() runs, via MilpaEnv), entry-trust gates at the selection step
+    # INSIDE the resolver (§3), so it travels on the per-call ResolveParams,
+    # not the per-process MilpaEnv.
+    entry_trust: "EntryTrustConfig | None" = None

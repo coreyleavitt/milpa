@@ -224,11 +224,33 @@ class LockAttestation:
 
     Records the CLAIM only, never a verification outcome (lockfile-schema.md
     §3.9 NORMATIVE) — ``milpa show`` and the frozen path render this as an
-    UNVERIFIED claim until the (later) P3 gate exists.
+    UNVERIFIED claim until the P3 gate exists.
+
+    ``bundle_pin`` (P3a addition, RFC per-entry-attestation.md §7): the SAME
+    delivery-integrity hash as ``registry.EntryAttestation.bundle_pin`` — NOT
+    the digest half of the subject (that stays excluded; the dep's
+    ``identity`` field already carries it, per §3.9's original NORMATIVE
+    text). Recorded so ``milpa verify``'s offline re-verification can locate
+    the cached bundle for a locked dep with no index available — the
+    ``dep_decl``-pin precedent, extended to bundles. ``None`` when the index
+    entry carried no bundle pin (the ordinary pre-delivery / P2-vintage-lock
+    state).
+
+    ``namespace`` (P3a addition): the entry's REAL index namespace
+    (``registry.IndexVersion.namespace``) — distinct from ``LockedDep.
+    namespace``, which records only whether the MANIFEST dep declaration was
+    explicitly qualified (``None`` for the common bare-name case, even though
+    the underlying index entry always has a real namespace). Needed so
+    ``milpa verify``'s offline re-verification (§7) can rebuild the exact
+    ``pkg:tianguis/<namespace>/<name>@<version>`` subject coordinate with no
+    index available. Always populated when the attestation block itself is
+    present (mirrors ``kind``: mandatory, not optional).
     """
 
     kind: AttestationKind
     rekor: RekorRef | None = None
+    bundle_pin: str | None = None
+    namespace: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -351,9 +373,16 @@ class ResolvedDep:
     # carried through unconditionally from IndexVersion.attestation for
     # registry-resolved deps (None for URL/tarball/local/member deps, which
     # have no index entry — resolver.py never sets this for those kinds).
-    # Converted to the narrower LockAttestation (bundle_pin dropped) at the
-    # LockedDep construction boundary — see _locked_from_resolved.
+    # Converted to the narrower LockAttestation at the LockedDep construction
+    # boundary — see _locked_from_resolved.
     attestation: EntryAttestation | None = None
+    # P3a addition: the entry's REAL index namespace (registry.IndexVersion.
+    # namespace), distinct from `namespace` above (manifest-qualification
+    # only). None for non-registry deps. Folded into LockAttestation.namespace
+    # at the LockedDep construction boundary (see _locked_from_resolved) —
+    # not a top-level LockedDep field, since it is only meaningful alongside
+    # an attestation block.
+    registry_namespace: str | None = None
 
 
 @dataclass(frozen=True)
@@ -757,6 +786,8 @@ def _parse_lock_attestation(node: KdlNode, dep_name: str) -> LockAttestation | N
     kind_label: str | None = None
     signer: str | None = None
     rekor: RekorRef | None = None
+    bundle_pin: str | None = None
+    namespace: str = ""
 
     for child in node_children(node):
         cname = node_name(child)
@@ -768,6 +799,15 @@ def _parse_lock_attestation(node: KdlNode, dep_name: str) -> LockAttestation | N
             signer = value_as_str(args[0]) if args else None
         elif cname == "rekor":
             rekor = _parse_lock_rekor_block(child)
+        elif cname == "bundle":
+            # P3a: delivery-integrity pin (lockfile-schema.md §3.9 P3a addition).
+            bundle_pin = node_prop_str(child, "sha256")
+        elif cname == "namespace":
+            # P3a: the entry's REAL index namespace — absent on P2-vintage
+            # lockfiles (forward-compat: defaults to "" — the same value an
+            # unqualified index entry would carry).
+            args = node_args(child)
+            namespace = (value_as_str(args[0]) if args else None) or ""
 
     if kind_label == "author-signed":
         if not signer:
@@ -777,10 +817,14 @@ def _parse_lock_attestation(node: KdlNode, dep_name: str) -> LockAttestation | N
                 stacklevel=2,
             )
             return None
-        return LockAttestation(kind=AuthorSigned(signer=signer), rekor=rekor)
+        return LockAttestation(
+            kind=AuthorSigned(signer=signer), rekor=rekor, bundle_pin=bundle_pin, namespace=namespace
+        )
 
     if kind_label == "milpa-vendored":
-        return LockAttestation(kind=MilpaVendored(), rekor=rekor)
+        return LockAttestation(
+            kind=MilpaVendored(), rekor=rekor, bundle_pin=bundle_pin, namespace=namespace
+        )
 
     warnings.warn(
         f"dep {dep_name!r}: lockfile attestation block collapsed to absent — "
@@ -1068,7 +1112,12 @@ def _locked_from_resolved(d: ResolvedDep) -> LockedDep:
         # carries bundle_pin) to LockAttestation (lockfile-side, no bundle_pin —
         # lockfile-schema.md §3.9 NORMATIVE excludes the delivery pin).
         attestation=(
-            LockAttestation(kind=d.attestation.kind, rekor=d.attestation.rekor)
+            LockAttestation(
+                kind=d.attestation.kind,
+                rekor=d.attestation.rekor,
+                bundle_pin=d.attestation.bundle_pin,
+                namespace=d.registry_namespace or "",
+            )
             if d.attestation is not None
             else None
         ),
@@ -1210,6 +1259,14 @@ def _format_lock_attestation(att: LockAttestation) -> list[str]:
         out.append(f"            log_index {_kdl_str(att.rekor.log_index)}")
         out.append(f"            integrated_time {_kdl_str(att.rekor.integrated_time)}")
         out.append("        }")
+    if att.bundle_pin is not None:
+        # P3a: delivery-integrity pin (lockfile-schema.md §3.9 P3a addition).
+        out.append(f"        bundle sha256={_kdl_str(att.bundle_pin)}")
+    # P3a: the entry's REAL index namespace — always emitted (mandatory, like
+    # `kind`), even when empty (an unqualified index entry legitimately has
+    # namespace ""); needed by milpa verify's offline re-verification (§7)
+    # to rebuild the exact subject coordinate with no index available.
+    out.append(f"        namespace {_kdl_str(att.namespace)}")
     out.append("    }")
     return out
 

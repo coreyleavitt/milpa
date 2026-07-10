@@ -19,4 +19,12 @@
 #   mirrors the CLI's MILPA_INDEX_URL→HttpDepDeclStore path, so an absent dep-decl/
 #   with an index present raises TNG-DEPDECL-FETCH-FAILED (was RES-UNATTESTED-METADATA).
 #
+# P3a (RFC per-entry-attestation.md §5): Rust parity landed (manifest
+# `entry-trust` node, `EntryTrustConfig`, `EntryBundleVerifier`, the gate call
+# site in `resolver.rs::build_graph`, `check_member_entry_trust_declarations`
+# in `workspace.rs`) — the 11 entry-trust fixtures (367-377) green in-process
+# for Rust via the shared `MILPA_ENTRY_TRUST_MOCK_MAP` / `entry-bundles/` /
+# `MILPA_ENTRY_BUNDLE_DIR` seam, unchanged from the fixtures Python already
+# consumed. Removed from this file.
+#
 # known_failing is now EMPTY — every fixture greens in-process for Rust.

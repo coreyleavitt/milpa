@@ -261,6 +261,18 @@ def _make_parser() -> argparse.ArgumentParser:
             "(RFC registry-trust-federation §6.2, §7.4)."
         ),
     )
+    # P3a (RFC per-entry-attestation.md §4): entry-trust flag.
+    parser.add_argument(
+        "--require-attested-entries",
+        action="store_true",
+        default=False,
+        help=(
+            "escalate entry-trust policy from 'warn' to 'strict'; CI hard-fail toggle. "
+            "Cannot set or clear 'off' — only the manifest can declare "
+            "entry-trust \"off\". Mirrors --require-attested-index for the "
+            "per-entry author-attribution axis (RFC per-entry-attestation.md §4)."
+        ),
+    )
 
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
 
@@ -560,6 +572,58 @@ def _load_manifest_trust_fields(
     return str(m.index_trust_policy), m.index_trust_signer, m.index_trust_bundle
 
 
+def _resolve_trust_bundle_and_signer(
+    env_bundle_path: "str | None",
+    manifest_bundle: "str | None",
+    env_signer: "str | None",
+    manifest_signer: "str | None",
+) -> "tuple[object, str]":
+    """Resolve ``(TrustBundle, expected_signer)`` from index-trust inputs.
+
+    Extracted from ``_build_index_trust`` so ``_build_entry_trust`` (P3a) can
+    derive the SAME effective vendor-bot identity Layer 1 resolved (RFC
+    per-entry-attestation.md §5 NORMATIVE: the vendored-kind expected signer
+    must be "the SAME effective vendor-bot identity Layer 1 resolved... never
+    a second hardcoded copy of the default") without duplicating the
+    file-loading / priority logic. Both callers pass their own env/manifest
+    values (index-trust and entry-trust share the trust-root/signer INPUTS —
+    ``MILPA_INDEX_TRUST_SIGNER`` / ``index-trust-signer`` — even though they
+    are separate policy axes, RFC §4).
+    """
+    from milpa.index_trust import DEFAULT_INDEX_SIGNER, TrustBundle
+
+    # Build trust bundle: env override path > manifest path > production embedded.
+    bundle_path = env_bundle_path or manifest_bundle
+    if bundle_path:
+        # spec/cli-contract.md §8.6 NORMATIVE: the value MUST be a file:// URL.
+        # Bare paths (no file:// prefix) MUST be rejected.
+        if not bundle_path.startswith("file://"):
+            raise MilpaError(
+                MILPA_INTERNAL,
+                f"MILPA_INDEX_TRUST_BUNDLE (or index-trust-bundle manifest node) "
+                f"must be a file:// URL; got: {bundle_path!r}. "
+                f"Use file:///abs/path/to/bundle.json (three slashes for an absolute path).",
+            )
+        # Strip the file:// scheme to get a filesystem path.
+        fs_path = bundle_path[len("file://"):]
+        try:
+            raw = Path(fs_path).read_bytes()
+        except OSError as exc:
+            raise MilpaError(
+                MILPA_INTERNAL,
+                f"cannot read index-trust-bundle file {fs_path!r}: {exc}",
+                path=fs_path,
+            ) from exc
+        trust_bundle: object = TrustBundle(raw_json=raw, label=f"custom:{fs_path}")
+    else:
+        trust_bundle = TrustBundle.production()
+
+    # Build expected signer: env > manifest > default tianguis signer (SSOT constant).
+    expected_signer = env_signer or manifest_signer or DEFAULT_INDEX_SIGNER
+
+    return trust_bundle, expected_signer
+
+
 def _build_index_trust(
     env: MilpaEnv,
     project_dir: Path,
@@ -629,34 +693,9 @@ def _build_index_trust(
     if policy == "off":
         return None, None
 
-    # 4. Build trust bundle: env override path > manifest path > production embedded.
-    bundle_path = env_bundle_path or manifest_bundle
-    if bundle_path:
-        # spec/cli-contract.md §8.6 NORMATIVE: the value MUST be a file:// URL.
-        # Bare paths (no file:// prefix) MUST be rejected.
-        if not bundle_path.startswith("file://"):
-            raise MilpaError(
-                MILPA_INTERNAL,
-                f"MILPA_INDEX_TRUST_BUNDLE (or index-trust-bundle manifest node) "
-                f"must be a file:// URL; got: {bundle_path!r}. "
-                f"Use file:///abs/path/to/bundle.json (three slashes for an absolute path).",
-            )
-        # Strip the file:// scheme to get a filesystem path.
-        fs_path = bundle_path[len("file://"):]
-        try:
-            raw = Path(fs_path).read_bytes()
-        except OSError as exc:
-            raise MilpaError(
-                MILPA_INTERNAL,
-                f"cannot read index-trust-bundle file {fs_path!r}: {exc}",
-                path=fs_path,
-            ) from exc
-        trust_bundle = TrustBundle(raw_json=raw, label=f"custom:{fs_path}")
-    else:
-        trust_bundle = TrustBundle.production()
-
-    # 5. Build expected signer: env > manifest > default tianguis signer (SSOT constant).
-    expected_signer = env_signer or manifest_signer or DEFAULT_INDEX_SIGNER
+    trust_bundle, expected_signer = _resolve_trust_bundle_and_signer(
+        env_bundle_path, manifest_bundle, env_signer, manifest_signer
+    )
 
     config = IndexTrustConfig(
         policy=policy,
@@ -702,6 +741,167 @@ def _build_index_trust(
         verifier = SigstoreVerifier()
 
     return config, verifier
+
+
+# ---------------------------------------------------------------------------
+# P3a — entry-trust gate config (RFC per-entry-attestation.md §3, §4, §5)
+# ---------------------------------------------------------------------------
+
+
+def _load_manifest_entry_trust_policy(project_dir: Path) -> str:
+    """Load the entry-trust policy from the resolution ROOT.  Pure I/O.
+
+    entry-trust is a root-only policy (RFC §4), mirroring
+    ``_load_manifest_trust_fields`` for index-trust: the resolution root is
+    the workspace root manifest (for a workspace) or the package manifest
+    itself (standalone). Members MUST NOT declare it —
+    ``find_workspace_root`` (via ``load_workspace``) raises
+    ``WS-ENTRY-TRUST-ON-MEMBER`` when one does, and that error PROPAGATES
+    from here.
+
+    Only a genuinely-absent standalone manifest degrades to ``"warn"``; a
+    present-but-invalid workspace is a hard error.
+    """
+    ws = find_workspace_root(project_dir)
+    if ws is not None:
+        return ws.workspace_manifest.entry_trust_policy
+    try:
+        m = load_or_discover_manifest(project_dir)
+    except (OSError, MilpaError):
+        return "warn"
+    return m.entry_trust_policy
+
+
+def _build_entry_trust(
+    env: MilpaEnv,
+    project_dir: Path,
+) -> "object | None":
+    """Build the ``EntryTrustConfig`` for the entry-trust gate, or ``None``.
+
+    Returns ``None`` when the effective policy is ``'off'`` (gate disabled) —
+    ``resolve()`` / ``resolve_workspace()`` never invoke the gate machinery
+    in that case (mirrors ``_build_index_trust``'s ``(None, None)``).
+
+    Authority model (RFC §4, §5):
+    1. Load the entry-trust policy from the resolution ROOT
+       (``_load_manifest_entry_trust_policy``).
+    2. Compute effective policy = effective_trust_policy(manifest, flag, env).
+    3. If off → return None.
+    4. Reuse index-trust's trust-root + expected-signer resolution
+       (``_resolve_trust_bundle_and_signer``) — RFC §5 NORMATIVE: the
+       vendored-kind expected signer MUST be the SAME effective vendor-bot
+       identity Layer 1 resolved, never a second hardcoded copy.
+    5. Build the bundle store: ``MILPA_ENTRY_BUNDLE_DIR`` (mirror of
+       ``MILPA_DEP_DECL_DIR``) or derived from the index URL.
+    6. Build verifier: ``MockEntryVerifier`` from the
+       ``MILPA_ENTRY_TRUST_MOCK_MAP`` / ``MILPA_ENTRY_TRUST_MOCK_DEFAULT``
+       conformance seam (file://-index-only guard, mirroring
+       ``MILPA_INDEX_TRUST_MOCK_VERIFIER``), or ``SigstoreEntryVerifier``
+       in production.
+    """
+    import json as _json
+
+    from milpa.entry_bundle_store import entry_bundle_store_from_paths
+    from milpa.entry_trust import (
+        BundleMalformed,
+        DigestMismatch,
+        EntryTrustConfig,
+        MockEntryVerifier,
+        SignatureInvalid,
+        SignerMismatch,
+        SigstoreEntryVerifier,
+        SubjectMismatch,
+        Trusted,
+    )
+    from milpa.trust import effective_trust_policy
+
+    # 1. Read entry-trust env vars.
+    env_entry_trust_raw = os.environ.get("MILPA_ENTRY_TRUST", "").strip() or None
+
+    # 2. Load manifest entry-trust policy (root-scoped SSOT).
+    manifest_policy = _load_manifest_entry_trust_policy(project_dir)
+
+    # 3. Compute effective policy.
+    policy = effective_trust_policy(
+        manifest_policy,  # type: ignore[arg-type]
+        flag=env.require_attested_entries,
+        env_override=env_entry_trust_raw,
+    )
+
+    if policy == "off":
+        return None
+
+    # 4. Reuse index-trust's trust-root + expected-signer resolution (RFC §5).
+    env_signer = os.environ.get("MILPA_INDEX_TRUST_SIGNER", "").strip() or None
+    env_bundle_path = os.environ.get("MILPA_INDEX_TRUST_BUNDLE", "").strip() or None
+    _, manifest_signer, manifest_bundle = _load_manifest_trust_fields(project_dir)
+    trust_bundle, expected_signer = _resolve_trust_bundle_and_signer(
+        env_bundle_path, manifest_bundle, env_signer, manifest_signer
+    )
+
+    # 5. Build the bundle-acquisition store.
+    entry_bundle_dir_str = os.environ.get("MILPA_ENTRY_BUNDLE_DIR", "").strip()
+    entry_bundle_dir = Path(entry_bundle_dir_str) if entry_bundle_dir_str else None
+    raw_index_url = os.environ.get("MILPA_INDEX_URL")
+    index_url = raw_index_url if raw_index_url else None
+    bundle_store = entry_bundle_store_from_paths(
+        entry_bundle_dir, index_url, no_index=env.no_index
+    )
+
+    # 6. Build verifier: MockEntryVerifier from conformance seam, SigstoreEntryVerifier
+    # in production. Mirrors MILPA_INDEX_TRUST_MOCK_VERIFIER's file://-only guard.
+    _MOCK_MAP = {
+        "trusted": Trusted,
+        "bundle-malformed": BundleMalformed,
+        "digest-mismatch": DigestMismatch,
+        "subject-mismatch": SubjectMismatch,
+        "signature-invalid": SignatureInvalid,
+        "signer-mismatch": SignerMismatch,
+    }
+    mock_map_raw = os.environ.get("MILPA_ENTRY_TRUST_MOCK_MAP", "").strip()
+    mock_default_raw = os.environ.get("MILPA_ENTRY_TRUST_MOCK_DEFAULT", "").strip()
+    verifier: object
+    if mock_map_raw or mock_default_raw:
+        # Guard: mock seam is conformance-internal; ONLY honored for file:// indexes.
+        if not (raw_index_url or "").startswith("file://"):
+            raise MilpaError(
+                MILPA_INTERNAL,
+                "MILPA_ENTRY_TRUST_MOCK_MAP / MILPA_ENTRY_TRUST_MOCK_DEFAULT are "
+                "conformance-internal and only honored for file:// index URLs "
+                "(all conformance fixtures use file://; production indexes are "
+                "https). These variables must not be set in production or with "
+                "non-file:// index URLs.",
+            )
+        default_result = _MOCK_MAP.get(mock_default_raw, Trusted) if mock_default_raw else Trusted
+        by_subject: dict[str, object] = {}
+        if mock_map_raw:
+            try:
+                raw_map = _json.loads(mock_map_raw)
+                for k, v in raw_map.items():
+                    if v not in _MOCK_MAP:
+                        raise MilpaError(
+                            MILPA_INTERNAL,
+                            f"MILPA_ENTRY_TRUST_MOCK_MAP entry {k!r}={v!r} is not a valid "
+                            f"result wire string (expected one of: {', '.join(_MOCK_MAP)}). "
+                            "Test seam must never fail-open silently.",
+                        )
+                    by_subject[k] = _MOCK_MAP[v]
+            except _json.JSONDecodeError as exc:
+                raise MilpaError(
+                    MILPA_INTERNAL,
+                    f"MILPA_ENTRY_TRUST_MOCK_MAP is not valid JSON: {exc}",
+                ) from exc
+        verifier = MockEntryVerifier(default=default_result, by_subject=by_subject)
+    else:
+        verifier = SigstoreEntryVerifier()
+
+    return EntryTrustConfig(
+        policy=policy,
+        trust_bundle=trust_bundle,
+        expected_vendor_signer=expected_signer,
+        verifier=verifier,
+        bundle_store=bundle_store,
+    )
 
 
 def _load_index_for_verb(env: MilpaEnv, project_dir: "Path | None" = None) -> MilpaEnv:
@@ -783,6 +983,84 @@ def _reverify_cached_index_bundle(env: MilpaEnv, project_dir: "Path | None") -> 
         return  # explicitly no index → nothing to reverify
     config, verifier = _build_index_trust(env, project_dir) if project_dir is not None else (None, None)
     reverify_cached_index(index_url_from_env(), _default_cache_dir(), config, verifier)
+
+
+def _reverify_cached_entry_attestations(
+    env: "MilpaEnv | None",
+    project_dir: "Path | None",
+    lockfile: "Lockfile",
+) -> None:
+    """P3a (RFC per-entry-attestation.md §7): re-verify CACHED per-entry
+    attestation bundles offline — NEVER fetches.
+
+    For each locked dep carrying an ``attestation`` block, re-derive the
+    verification outcome from the cached bundle (crypto + subject binding,
+    no freshness — mirrors ``reverify_cached_index``'s shape) against the
+    lockfile's recorded kind/signer/namespace. Missing cached bundle →
+    ``TNG-ENTRY-BUNDLE-MISSING`` (warn/strict per policy). Skips silently
+    when ``env``/``project_dir`` is ``None`` (unit-test bypass, mirrors
+    ``_reverify_cached_index_bundle``) or when the effective entry-trust
+    policy is ``off``.
+
+    Offline invariant: this function checks ``bundle_store.is_cached(pin)``
+    BEFORE ever calling ``bundle_store.get(pin)`` — for ``HttpEntryBundleStore``,
+    ``get()`` on an uncached pin would attempt a real network fetch, which
+    ``milpa verify`` must never do. A pin that is present but not cached is
+    reported as ``TNG-ENTRY-BUNDLE-MISSING`` (cause ``unfetchable``), exactly
+    as if the bundle had never been fetched.
+    """
+    if env is None or project_dir is None:
+        return
+
+    from milpa.entry_trust import (
+        BundleMissing,
+        build_entry_subject,
+        enforce_entry_trust,
+        evaluate_entry_attestation,
+    )
+    from milpa.registry import EntryAttestation
+
+    config = _build_entry_trust(env, project_dir)
+    if config is None:
+        return  # policy off
+
+    for dep in lockfile.deps:
+        att = dep.attestation
+        if att is None:
+            continue
+
+        cause: "str | None" = None
+        if att.bundle_pin is None:
+            result = BundleMissing
+            cause = "no-pin"
+        elif config.bundle_store is None or not config.bundle_store.is_cached(att.bundle_pin):
+            # NEVER fetch — a present-but-uncached pin is unfetchable-from-cache.
+            result = BundleMissing
+            cause = "unfetchable"
+        else:
+            # Cached: reuse the shared gate pipeline. bundle_store.get() on a
+            # cached pin never touches the network (verified is_cached above).
+            reconstructed = EntryAttestation(kind=att.kind, rekor=att.rekor, bundle_pin=att.bundle_pin)
+            result, cause = evaluate_entry_attestation(
+                attestation=reconstructed,
+                content_hash=dep.identity or "",
+                namespace=att.namespace,
+                name=dep.name,
+                version=dep.version,
+                verifier=config.verifier,
+                bundle_store=config.bundle_store,
+                trust_bundle=config.trust_bundle,
+                expected_vendor_signer=config.expected_vendor_signer,
+            )
+
+        enforce_entry_trust(
+            result,
+            config.policy,
+            namespace=att.namespace,
+            name=dep.name,
+            version=dep.version,
+            cause=cause,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1181,6 +1459,8 @@ def cmd_fetch(
         features=features,
         no_default_features=no_default_features,
         all_features=all_features,
+        # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
+        entry_trust=_build_entry_trust(env, project_dir),
     )
 
     # Resolve — intercept any MilpaError to write a failure certificate when
@@ -1312,6 +1592,8 @@ def _cmd_fetch_workspace(
         features=features,
         no_default_features=no_default_features,
         all_features=all_features,
+        # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
+        entry_trust=_build_entry_trust(env, ws_root),
     )
 
     # Resolve — intercept any MilpaError to write a failure certificate when
@@ -1402,6 +1684,8 @@ def cmd_lock(
         features=features,
         no_default_features=no_default_features,
         all_features=all_features,
+        # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
+        entry_trust=_build_entry_trust(env, project_dir),
     )
 
     # Resolve — intercept any MilpaError to write a failure certificate when
@@ -1459,6 +1743,8 @@ def _cmd_lock_workspace(
         features=features,
         no_default_features=no_default_features,
         all_features=all_features,
+        # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
+        entry_trust=_build_entry_trust(env, ws_root),
     )
 
     # Resolve — intercept any MilpaError to write a failure certificate when
@@ -1750,6 +2036,24 @@ def cmd_verify(
         except MilpaError as exc:
             print(
                 f"cached index attestation reverify failed: {exc.message}",
+                file=sys.stderr,
+            )
+            _emit_slug(exc.slug)
+            return 1
+
+    # -------------------------------------------------------------------------
+    # P3a (RFC per-entry-attestation.md §7): offline reverify of CACHED
+    # per-entry attestation bundles. Same shape as the index reverify above —
+    # never fetches, independent of the online dep_decl edge check below.
+    # -------------------------------------------------------------------------
+    if env is not None:
+        try:
+            _reverify_cached_entry_attestations(
+                env, ws.root_dir if ws is not None else project_dir, lockfile
+            )
+        except MilpaError as exc:
+            print(
+                f"cached entry attestation reverify failed: {exc.message}",
                 file=sys.stderr,
             )
             _emit_slug(exc.slug)
@@ -2343,6 +2647,8 @@ def _cmd_add_git(
         profile=profile,
         prior=None,
         manifest_dir=project_dir,
+        # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
+        entry_trust=_build_entry_trust(env, project_dir),
     )
 
     graph = resolve(proposed_manifest, deps_dir, env_with_index, params)
@@ -2697,6 +3003,8 @@ def cmd_update(
             features=features,
             no_default_features=no_default_features,
             all_features=all_features,
+            # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
+            entry_trust=_build_entry_trust(env, project_dir),
         )
         graph = resolve(manifest, deps_dir, env_with_index, params)
         lockfile_val = from_graph(graph, strategy=str(strategy))
@@ -2755,6 +3063,8 @@ def cmd_update(
         features=features,
         no_default_features=no_default_features,
         all_features=all_features,
+        # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
+        entry_trust=_build_entry_trust(env, project_dir),
     )
 
     graph = resolve(manifest, deps_dir, env_with_index, params)
@@ -2833,6 +3143,8 @@ def _cmd_update_workspace(
         features=features,
         no_default_features=no_default_features,
         all_features=all_features,
+        # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
+        entry_trust=_build_entry_trust(env, ws_root),
     )
 
     graph = resolve_workspace(workspace, deps_dir, env_with_index, params)
@@ -3001,6 +3313,8 @@ def _cmd_add_from_member_dir(
         profile=profile,
         prior=None,
         manifest_dir=ws_root,
+        # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
+        entry_trust=_build_entry_trust(env, ws_root),
     )
 
     try:
@@ -3435,6 +3749,8 @@ def main(argv: list[str] | None = None) -> int:
     # Here we stash the env + flag inputs in MilpaEnv for use in _load_index_for_verb.
     _require_attested_index = getattr(args, "require_attested_index", False)
     _refresh_index = getattr(args, "refresh_index", False)
+    # P3a: entry-trust escalation flag (mirrors _require_attested_index).
+    _require_attested_entries = getattr(args, "require_attested_entries", False)
 
     # Update the env with index-trust state (env vars + flags).
     # require_attested_index escalates the effective policy warn→strict per-verb
@@ -3444,6 +3760,7 @@ def main(argv: list[str] | None = None) -> int:
         env,
         refresh_index=_refresh_index,
         require_attested_index=_require_attested_index,
+        require_attested_entries=_require_attested_entries,
     )
 
     # Dispatch.

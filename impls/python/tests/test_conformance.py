@@ -348,6 +348,101 @@ def _fixture_all_features(fixture_dir: Path) -> bool:
     return env_flag(read_env_file(fixture_dir), "MILPA_ALL_FEATURES")
 
 
+def _fixture_entry_trust_config(fixture_dir: Path, doc: object) -> "object | None":
+    """Build the ``EntryTrustConfig`` for a resolve fixture, or ``None``.
+
+    P3a (RFC per-entry-attestation.md §3, §5, Conformance section) — the
+    impl-neutral fixture env-var contract, mirrored by the Rust runner:
+
+      ``entry-trust "<policy>"`` (manifest field)
+          Base policy, read from the parsed manifest/workspace-root exactly
+          as production does — layered with ``MILPA_ENTRY_TRUST`` via the
+          SAME ``effective_trust_policy`` SSOT used everywhere else.
+
+      ``MILPA_ENTRY_TRUST``
+          Env override for the policy (fixture ``env`` file).
+
+      ``MILPA_ENTRY_TRUST_MOCK_MAP``
+          JSON object: subject coordinate string
+          (``"pkg:tianguis/<ns>/<name>@<version>"``) → one of
+          ``{trusted, bundle-malformed, digest-mismatch, subject-mismatch,
+          signature-invalid, signer-mismatch}`` — the six outcomes the
+          VERIFIER (not the gate) can produce (stages 2-7).  Un-keyed
+          subjects get ``MILPA_ENTRY_TRUST_MOCK_DEFAULT`` (default
+          ``"trusted"``).
+
+      ``entry-bundles/<sha256_hex>.bundle``
+          Fixture sub-directory, auto-detected exactly like ``dep-decl/`` —
+          backs a ``FileEntryBundleStore`` (the ``MILPA_ENTRY_BUNDLE_DIR``
+          mirror).  Absent → no bundle store (every attested entry with a
+          ``bundle`` pin resolves as ``TNG-ENTRY-BUNDLE-MISSING``/unfetchable
+          — the correct behaviour for a fixture that doesn't ship bundles).
+
+    Returns ``None`` when the fixture declares NEITHER a manifest
+    ``entry-trust`` field NOR ``MILPA_ENTRY_TRUST`` — the gate stays
+    unconfigured (disabled) so the hundreds of pre-existing named-dep
+    fixtures that predate P3a are completely unaffected.
+    """
+    from milpa.entry_bundle_store import FileEntryBundleStore
+    from milpa.entry_trust import (
+        BundleMalformed,
+        DigestMismatch,
+        EntryTrustConfig,
+        MockEntryVerifier,
+        SignatureInvalid,
+        SignerMismatch,
+        SubjectMismatch,
+        Trusted,
+    )
+    from milpa.index_trust import DEFAULT_INDEX_SIGNER, TrustBundle
+    from milpa.trust import effective_trust_policy
+
+    env_vars = read_env_file(fixture_dir)
+    env_policy = env_vars.get("MILPA_ENTRY_TRUST", "").strip() or None
+
+    manifest_policy = None
+    manifest_explicit = False
+    if isinstance(doc, (Manifest, WorkspaceManifest)):
+        manifest_policy = doc.entry_trust_policy
+        manifest_explicit = doc.entry_trust_policy_explicit
+
+    if env_policy is None and not manifest_explicit:
+        return None
+
+    policy = effective_trust_policy(manifest_policy, flag=False, env_override=env_policy)
+
+    _wire_map = {
+        "trusted": Trusted,
+        "bundle-malformed": BundleMalformed,
+        "digest-mismatch": DigestMismatch,
+        "subject-mismatch": SubjectMismatch,
+        "signature-invalid": SignatureInvalid,
+        "signer-mismatch": SignerMismatch,
+    }
+    mock_default_raw = env_vars.get("MILPA_ENTRY_TRUST_MOCK_DEFAULT", "trusted").strip()
+    default_result = _wire_map.get(mock_default_raw, Trusted)
+
+    by_subject: dict[str, object] = {}
+    mock_map_raw = env_vars.get("MILPA_ENTRY_TRUST_MOCK_MAP", "").strip()
+    if mock_map_raw:
+        raw_map = json.loads(mock_map_raw)
+        for k, v in raw_map.items():
+            by_subject[k] = _wire_map[v]
+
+    bundle_dir = fixture_dir / "entry-bundles"
+    bundle_store = FileEntryBundleStore(bundle_dir) if bundle_dir.is_dir() else None
+
+    expected_signer = env_vars.get("MILPA_INDEX_TRUST_SIGNER", "").strip() or DEFAULT_INDEX_SIGNER
+
+    return EntryTrustConfig(
+        policy=policy,
+        trust_bundle=TrustBundle.test(),
+        expected_vendor_signer=expected_signer,
+        verifier=MockEntryVerifier(default=default_result, by_subject=by_subject),
+        bundle_store=bundle_store,
+    )
+
+
 # ---------------------------------------------------------------------------
 # MilpaEnv construction for in-process conformance
 # ---------------------------------------------------------------------------
@@ -2053,6 +2148,9 @@ def _execute_fixture(
         features=_fixture_cli_features(fixture_dir),
         no_default_features=_fixture_no_default_features(fixture_dir),
         all_features=_fixture_all_features(fixture_dir),
+        # P3a (RFC per-entry-attestation.md §3, §5): entry-trust gate config;
+        # None (gate disabled) unless the fixture opts in.
+        entry_trust=_fixture_entry_trust_config(fixture_dir, doc),
     )
 
     try:

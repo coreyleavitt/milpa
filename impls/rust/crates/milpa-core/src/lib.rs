@@ -23,6 +23,8 @@ pub mod dep_decl;
 pub mod dep_decl_store;
 pub mod discovery;
 pub mod edge_sources;
+pub mod entry_bundle_store;
+pub mod entry_trust;
 pub mod error;
 pub mod fetch;
 pub mod fetchers;
@@ -52,6 +54,13 @@ pub use dep_decl_store::{
     FileDepDeclStore, HttpDepDeclStore,
 };
 pub use discovery::{discover_manifest, load_manifest};
+pub use entry_bundle_store::{
+    entry_bundle_store_from_paths, EntryBundleStore, FileEntryBundleStore, HttpEntryBundleStore,
+};
+pub use entry_trust::{
+    build_entry_subject, enforce_entry_trust, evaluate_entry_attestation, EntryBundleVerifier,
+    EntrySubject, EntryTrustConfig, EntryVerificationResult, MockEntryVerifier, SigstoreEntryVerifier,
+};
 pub use error::{CoreError, MilpaError};
 pub use index_cache::{
     derive_bundle_url, get_bundle_url, index_url_from_env, load_index, BundleError,
@@ -99,8 +108,8 @@ pub use milpa_solver::RefutationEntry;
 pub use safe_extract::{extract_tar, ExtractionResult, Limits};
 pub use store::{default_store, CaStore};
 pub use workspace::{
-    check_member_index_trust_declarations, load_workspace, load_workspace_with_member_override,
-    LoadedMember, LoadedWorkspace,
+    check_member_entry_trust_declarations, check_member_index_trust_declarations, load_workspace,
+    load_workspace_with_member_override, LoadedMember, LoadedWorkspace,
 };
 
 /// The union of every error code the Rust implementation can currently emit,

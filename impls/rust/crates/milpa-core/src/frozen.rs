@@ -431,14 +431,20 @@ fn resolved_from_locked(locked: &LockedDep) -> Result<ResolvedDep, MilpaError> {
         active_flags: locked.active_flags.clone(),
         // RFC per-entry-attestation.md P2 (§8 Command Coverage): the frozen
         // path carries the lockfile's attestation CLAIM through, nothing
-        // re-checked. Widen LockAttestation (no bundle_pin) back to the
-        // EntryAttestation shape ResolvedDep carries; bundle_pin is always
-        // None here since it was never persisted to the lockfile (§3.9).
+        // re-checked (no gate runs here — §8 command-coverage table). P3a:
+        // bundle_pin round-trips too (lockfile-schema §3.9 addition) since
+        // milpa verify's offline re-verification needs it downstream of a
+        // frozen resolve too. Widen LockAttestation back to the
+        // EntryAttestation shape ResolvedDep carries.
         attestation: locked.attestation.as_ref().map(|a| EntryAttestation {
             kind: a.kind.clone(),
             rekor: a.rekor.clone(),
-            bundle_pin: None,
+            bundle_pin: a.bundle_pin.clone(),
         }),
+        // P3a: the frozen path does not run the entry-trust gate (§8), so
+        // registry_namespace (only meaningful at gate-evaluation time) is not
+        // reconstructed here — mirrors the Python frozen path.
+        registry_namespace: None,
     })
 }
 
