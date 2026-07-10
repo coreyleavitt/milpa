@@ -9,12 +9,14 @@
   Part-2 P1 (3b920ac), P2 (d4404ad), P3a (baad9a4); A1 (fb6e707),
   A2a (4f607a5), A2b (a53afd7), A2c (cbe1682), A2d (bdc419e),
   A2e (3911cdd), A3 (22e07db), A4a (76dcc63), A4b (224ca14),
-  A5 (b9a620e), A6 (pending commit) = 14/14 — **ALL SLICES DONE**. A6
+  A5 (b9a620e), A6 (b3211bf) = 14/14 — **ALL SLICES DONE**. A6
   flipped the staged rows (`attestation`/`rekor`/`attestation-epoch`) to
   live in both impls, closed the attestation/`rekor` canonical-rendering
   spec gap, wired the previously-unparsed `attestation-epoch` root field,
   and inverted fixture 389 + added 404–410. RFC #185 is now fully
-  implemented; only spec/RFC housekeeping (this doc, ledger) remains.
+  implemented in both impls. **Next stage: `/code-review` over the RFC
+  scope** (rfc-flow stage 4; typically 2–3 rounds, ship at 0
+  critical/high). P3b/P4 of Part 2 remain blocked on tianguis delivery.
 
 ## Origin (why this RFC exists)
 
