@@ -35,7 +35,6 @@
 //! fetch is hard-failed immediately (no marker, no fallback).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
@@ -223,43 +222,15 @@ fn net_or_io(e: std::io::Error) -> MilpaError {
 // Internal write helper (Item 4 — extracted from ×4 inline occurrences)
 // ---------------------------------------------------------------------------
 
-/// A per-write-unique sibling temp path for `path` (PID + monotonic counter
-/// + wall-clock nanos).
-///
-/// registry-protocol §3.5.2 NORMATIVE (concurrency): a FIXED temp sibling
-/// name lets two concurrent writers interleave partial writes before either
-/// renames — a hazard for every index-cache write (bundle sidecar, index
-/// file, and the baseline pair). Every write in this module goes through
-/// this helper (via [`atomic_write_bytes`]) so no site can regress to a
-/// fixed name. Mirrors `index_cache.py::_unique_temp_path` (PID + random
-/// suffix); the atomic-rename safety property does not depend on
-/// cryptographic randomness, only on no two concurrent writers choosing the
-/// SAME temp name — PID + a process-local monotonic counter + nanosecond
-/// timestamp is sufficient.
-static TEMP_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn unique_temp_path(path: &Path) -> PathBuf {
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let counter = TEMP_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut p = path.as_os_str().to_os_string();
-    p.push(format!(".tmp.{pid}.{nanos}.{counter}"));
-    PathBuf::from(p)
-}
-
 /// Write `data` to `path` atomically (unique sibling tmp + rename). Used for
 /// EVERY index-cache sidecar write (bundle, index, baseline, `.baseline.meta`)
 /// per registry-protocol §3.5.2 NORMATIVE (concurrency).
+///
+/// Delegates to [`crate::atomic_cache::atomic_write_bytes`] — the single
+/// source of truth for the per-write-unique-temp-name pattern, shared with
+/// `dep_decl_store.rs` and `entry_bundle_store.rs`.
 fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<(), MilpaError> {
-    let tmp = unique_temp_path(path);
-    std::fs::write(&tmp, data).map_err(net_or_io)?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        net_or_io(e)
-    })
+    crate::atomic_cache::atomic_write_bytes(path, data).map_err(net_or_io)
 }
 
 /// Atomic index-cache write: tmp write → rename (atomic on POSIX) → stamp write.

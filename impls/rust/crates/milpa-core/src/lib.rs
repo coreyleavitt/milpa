@@ -18,6 +18,7 @@ pub use milpa_types::{
 };
 use milpa_types::ResolvedGraph;
 
+pub mod atomic_cache;
 pub mod dag_identity;
 pub mod dep_decl;
 pub mod dep_decl_store;

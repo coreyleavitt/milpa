@@ -67,7 +67,6 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
-import secrets
 import sys
 import urllib.error
 import urllib.request
@@ -76,6 +75,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse, urlunparse
 
+from milpa.atomic_cache import atomic_write_bytes as _atomic_write_bytes
+from milpa.atomic_cache import unique_temp_path as _unique_temp_path
 from milpa.errors import MILPA_INDEX_UNREACHABLE, MilpaError
 
 if TYPE_CHECKING:
@@ -1020,31 +1021,6 @@ def _refetch_with_recovery(
     _apply_ratchet_writes(cache_file, gate_decision, fetched_bytes)
 
     return gate_decision.index
-
-
-def _unique_temp_path(path: Path) -> Path:
-    """A per-write-unique sibling temp path for *path* (PID + random suffix).
-
-    registry-protocol §3.5.2 NORMATIVE (concurrency): a FIXED temp sibling
-    name lets two concurrent writers interleave partial writes before either
-    renames — a latent hazard for every index-cache write (bundle sidecar,
-    index file, and now the baseline pair). Every write in this module goes
-    through this helper (or ``_atomic_write_bytes``, which calls it) so no
-    site can regress to a fixed name.
-    """
-    return Path(f"{path}.tmp.{os.getpid()}.{secrets.token_hex(8)}")
-
-
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Write ``data`` to ``path`` atomically (unique sibling tmp + os.replace)."""
-    tmp = _unique_temp_path(path)
-    try:
-        tmp.write_bytes(data)
-        os.replace(tmp, path)
-    except OSError:
-        with contextlib.suppress(OSError):
-            tmp.unlink(missing_ok=True)
-        raise
 
 
 # ---------------------------------------------------------------------------

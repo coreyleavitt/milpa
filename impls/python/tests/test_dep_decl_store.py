@@ -260,6 +260,99 @@ def test_http_store_fetch_from_file_url(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# CR4 — fixed-temp-filename race (registry-protocol §3.5.2 NORMATIVE
+# (concurrency)): cache writes must use a per-write-unique temp sibling, and
+# a locally-corrupt cache entry must self-heal rather than poison forever.
+# ---------------------------------------------------------------------------
+
+
+def test_http_store_cache_write_uses_unique_temp_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for CR4: the cache write must go through
+    ``atomic_cache.unique_temp_path`` (per-write-unique), never a fixed
+    ``<hex>.kdl.tmp`` sibling — two concurrent fetches of the same uncached
+    artifact must never be able to interleave partial writes."""
+    import milpa.atomic_cache as atomic_cache_module
+
+    artifact_bytes, hash_str = _artifact_and_hash()
+    hex_digest = hash_str.removeprefix("sha256:")
+    serve_dir = tmp_path / "serve"
+    dep_decl_dir = serve_dir / "dep-decl"
+    dep_decl_dir.mkdir(parents=True)
+    (dep_decl_dir / f"{hex_digest}.kdl").write_bytes(artifact_bytes)
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    seen_tmp_paths: list[Path] = []
+    original = atomic_cache_module.unique_temp_path
+
+    def _spy(path: Path) -> Path:
+        tmp = original(path)
+        seen_tmp_paths.append(tmp)
+        return tmp
+
+    monkeypatch.setattr(atomic_cache_module, "unique_temp_path", _spy)
+
+    HttpDepDeclStore(base_url=f"file://{serve_dir}", cache_dir=cache_dir).get(hash_str)
+    (cache_dir / f"{hex_digest}.kdl").unlink()
+    HttpDepDeclStore(base_url=f"file://{serve_dir}", cache_dir=cache_dir).get(hash_str)
+
+    assert len(seen_tmp_paths) == 2
+    assert seen_tmp_paths[0] != seen_tmp_paths[1], (
+        "two writes to the same cache path must use different temp sibling names"
+    )
+    for tmp in seen_tmp_paths:
+        assert not str(tmp).endswith(".kdl.tmp"), (
+            "must not regress to a fixed .kdl.tmp sibling name"
+        )
+
+
+def test_http_store_corrupted_cache_self_heals_by_refetching(tmp_path: Path) -> None:
+    """A locally-corrupt cache entry (e.g. left by the pre-fix race) must be
+    discarded and transparently re-fetched, not raise HASH-MISMATCH forever."""
+    artifact_bytes, hash_str = _artifact_and_hash()
+    hex_digest = hash_str.removeprefix("sha256:")
+    serve_dir = tmp_path / "serve"
+    dep_decl_dir = serve_dir / "dep-decl"
+    dep_decl_dir.mkdir(parents=True)
+    (dep_decl_dir / f"{hex_digest}.kdl").write_bytes(artifact_bytes)
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    # Simulate a truncated/corrupt cache entry under the correct hash name.
+    (cache_dir / f"{hex_digest}.kdl").write_bytes(b"truncated garbage")
+
+    store = HttpDepDeclStore(base_url=f"file://{serve_dir}", cache_dir=cache_dir)
+    result = store.get(hash_str)
+    assert result == artifact_bytes
+    # Cache is repaired: a subsequent get (origin removed) still succeeds.
+    (dep_decl_dir / f"{hex_digest}.kdl").unlink()
+    assert store.get(hash_str) == artifact_bytes
+
+
+def test_http_store_server_content_mismatch_stays_hard_error(tmp_path: Path) -> None:
+    """A mismatch on FRESHLY FETCHED bytes (the server serving the wrong
+    content for the hash) must stay a hard error — self-heal only applies to
+    the locally-corrupt-cache path, never to content the server just sent."""
+    artifact_bytes, hash_str = _artifact_and_hash()
+    hex_digest = hash_str.removeprefix("sha256:")
+    serve_dir = tmp_path / "serve"
+    dep_decl_dir = serve_dir / "dep-decl"
+    dep_decl_dir.mkdir(parents=True)
+    # Origin serves bytes that do NOT hash to `hash_str` — genuine fetch
+    # mismatch, nothing pre-cached.
+    (dep_decl_dir / f"{hex_digest}.kdl").write_bytes(b"wrong content entirely")
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    store = HttpDepDeclStore(base_url=f"file://{serve_dir}", cache_dir=cache_dir)
+    with pytest.raises(MilpaError) as exc_info:
+        store.get(hash_str)
+    assert exc_info.value.slug == TNG_DEPDECL_HASH_MISMATCH
+    assert not (cache_dir / f"{hex_digest}.kdl").is_file()
+
+
+# ---------------------------------------------------------------------------
 # index_base_url — §3.3 URL-derivation table
 # ---------------------------------------------------------------------------
 

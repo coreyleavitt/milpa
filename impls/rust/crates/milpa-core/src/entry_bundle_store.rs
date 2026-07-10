@@ -178,8 +178,20 @@ impl EntryBundleStore for HttpEntryBundleStore {
         if let Some(cache_path) = self.cache_path(bundle_pin) {
             if cache_path.is_file() {
                 if let Ok(cached) = std::fs::read(&cache_path) {
-                    verify(&cached, bundle_pin)?;
-                    return Ok(cached);
+                    match verify(&cached, bundle_pin) {
+                        Ok(()) => return Ok(cached),
+                        Err(_) => {
+                            // Locally-corrupt cache entry (e.g. a truncated
+                            // write left behind by the pre-unique-temp-name
+                            // concurrency race, or plain disk corruption) —
+                            // self-heal by discarding it and falling through
+                            // to re-fetch, rather than a permanent hard
+                            // failure. A mismatch on FRESHLY FETCHED bytes
+                            // below (the server genuinely served the wrong
+                            // content) stays a hard error via `?`.
+                            let _ = std::fs::remove_file(&cache_path);
+                        }
+                    }
                 }
                 // Corrupted cache read: fall through to re-fetch.
             }
@@ -189,16 +201,14 @@ impl EntryBundleStore for HttpEntryBundleStore {
         let bytes = http_get_bytes(&url, bundle_pin)?;
         verify(&bytes, bundle_pin)?;
 
-        // Atomic-ish best-effort cache write (a write failure is non-fatal —
-        // the bytes were already verified).
+        // Atomic best-effort cache write (unique-per-write temp sibling +
+        // rename — registry-protocol §3.5.2 NORMATIVE (concurrency); a
+        // write failure is non-fatal, the bytes were already verified).
         if let Some(cache_path) = self.cache_path(bundle_pin) {
             if let Some(parent) = cache_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let tmp_path = cache_path.with_extension("bundle.tmp");
-            if std::fs::write(&tmp_path, &bytes).is_ok() {
-                let _ = std::fs::rename(&tmp_path, &cache_path);
-            }
+            let _ = crate::atomic_cache::atomic_write_bytes(&cache_path, &bytes);
         }
 
         Ok(bytes)
@@ -388,6 +398,128 @@ mod tests {
         let store = FileEntryBundleStore::new(tmp.path());
         let err = store.get(&hash).unwrap_err();
         assert_eq!(err.code(), "TNG-ENTRY-BUNDLE-PIN-MISMATCH");
+    }
+
+    // -----------------------------------------------------------------------
+    // HttpEntryBundleStore — file:// transport (no live network)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn http_store_file_url_happy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = b"{\"fake\":\"bundle\"}";
+        let hash = bundle_hash(data);
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(origin.join("attestation")).unwrap();
+        std::fs::write(origin.join("attestation").join(format!("{hash}.bundle")), data).unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let base_url = format!("file://{}/", origin.to_str().unwrap());
+        let store = HttpEntryBundleStore::new(base_url, Some(cache_dir.clone()));
+        let got = store.get(&hash).unwrap();
+        assert_eq!(got, data);
+        assert!(store.is_cached(&hash));
+        assert_eq!(std::fs::read(cache_dir.join(format!("{hash}.bundle"))).unwrap(), data);
+    }
+
+    #[test]
+    fn http_store_cache_hit_avoids_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = b"{\"fake\":\"bundle\"}";
+        let hash = bundle_hash(data);
+        let cache_dir = tmp.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join(format!("{hash}.bundle")), data).unwrap();
+
+        // base_url is unreachable; cache has the bundle, so get() must not hit it.
+        let store = HttpEntryBundleStore::new("https://unreachable.invalid/", Some(cache_dir));
+        let got = store.get(&hash).unwrap();
+        assert_eq!(got, data);
+    }
+
+    // -----------------------------------------------------------------------
+    // CR4 — fixed-temp-filename race (registry-protocol §3.5.2 NORMATIVE
+    // (concurrency)): a locally-corrupt cache entry must self-heal rather
+    // than poison forever, and concurrent fetches of the same uncached
+    // bundle must never tear a partial write into the final cache path.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn http_store_corrupted_cache_self_heals_by_refetching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = b"{\"fake\":\"bundle\"}";
+        let hash = bundle_hash(data);
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(origin.join("attestation")).unwrap();
+        std::fs::write(origin.join("attestation").join(format!("{hash}.bundle")), data).unwrap();
+        let cache_dir = tmp.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        // Simulate a truncated/corrupt cache entry under the correct pin.
+        std::fs::write(cache_dir.join(format!("{hash}.bundle")), b"truncated garbage").unwrap();
+
+        let base_url = format!("file://{}/", origin.to_str().unwrap());
+        let store = HttpEntryBundleStore::new(base_url, Some(cache_dir.clone()));
+        let got = store.get(&hash).unwrap();
+        assert_eq!(got, data);
+        // Cache is repaired: a subsequent get (origin removed) still succeeds.
+        std::fs::remove_file(origin.join("attestation").join(format!("{hash}.bundle"))).unwrap();
+        assert_eq!(store.get(&hash).unwrap(), data);
+    }
+
+    #[test]
+    fn http_store_server_content_mismatch_stays_hard_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = b"{\"fake\":\"bundle\"}";
+        let hash = bundle_hash(data);
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(origin.join("attestation")).unwrap();
+        // Origin serves bytes that do NOT hash to `hash` — genuine fetch
+        // mismatch, nothing pre-cached.
+        std::fs::write(
+            origin.join("attestation").join(format!("{hash}.bundle")),
+            b"wrong content entirely",
+        )
+        .unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let base_url = format!("file://{}/", origin.to_str().unwrap());
+        let store = HttpEntryBundleStore::new(base_url, Some(cache_dir.clone()));
+        let err = store.get(&hash).unwrap_err();
+        assert_eq!(err.code(), "TNG-ENTRY-BUNDLE-PIN-MISMATCH");
+        assert!(!store.is_cached(&hash));
+    }
+
+    #[test]
+    fn http_store_concurrent_fetch_of_same_pin_never_corrupts_cache() {
+        // Regression for the fixed-temp-name race (CR4): N threads racing a
+        // fetch of the SAME uncached bundle must all succeed with the
+        // correct bytes, and the final on-disk cache entry must never be a
+        // torn/interleaved write (each writer now uses a per-write-unique
+        // temp sibling — crate::atomic_cache — so no two writers can share
+        // a temp file).
+        let tmp = tempfile::tempdir().unwrap();
+        let data = vec![b'Q'; 65536];
+        let hash = bundle_hash(&data);
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(origin.join("attestation")).unwrap();
+        std::fs::write(origin.join("attestation").join(format!("{hash}.bundle")), &data).unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let base_url = format!("file://{}/", origin.to_str().unwrap());
+        let store = std::sync::Arc::new(HttpEntryBundleStore::new(base_url, Some(cache_dir.clone())));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let store = std::sync::Arc::clone(&store);
+                let hash = hash.clone();
+                std::thread::spawn(move || store.get(&hash))
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap().unwrap(), data);
+        }
+        let cached = std::fs::read(cache_dir.join(format!("{hash}.bundle"))).unwrap();
+        assert_eq!(cached, data, "final cache entry must be a complete write, never torn");
     }
 
     #[test]

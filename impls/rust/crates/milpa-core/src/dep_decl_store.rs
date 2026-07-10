@@ -162,8 +162,19 @@ impl DepDeclStore for HttpDepDeclStore {
                     ))
                 })?;
                 // SECURITY: verify even from cache (detect disk corruption / tampering)
-                verify(&bytes, dep_decl_hash_str)?;
-                return Ok(bytes);
+                match verify(&bytes, dep_decl_hash_str) {
+                    Ok(()) => return Ok(bytes),
+                    Err(_) => {
+                        // Locally-corrupt cache entry (e.g. a truncated write
+                        // left behind by the pre-unique-temp-name concurrency
+                        // race, or plain disk corruption) — self-heal by
+                        // discarding it and falling through to re-fetch,
+                        // rather than a permanent hard failure. A mismatch on
+                        // FRESHLY FETCHED bytes below (the server genuinely
+                        // served the wrong content) stays a hard error via `?`.
+                        let _ = std::fs::remove_file(&cache_path);
+                    }
+                }
             }
         }
 
@@ -173,12 +184,17 @@ impl DepDeclStore for HttpDepDeclStore {
         verify(&bytes, dep_decl_hash_str)?;
 
         // Write to cache (best-effort: cache write failures are non-fatal).
+        // Atomic: unique-per-write temp sibling + rename (registry-protocol
+        // §3.5.2 NORMATIVE (concurrency)) — a bare `fs::write` to the final
+        // path (the pre-fix behavior here) is not just non-atomic under a
+        // fixed temp name, it has NO temp file at all, so a concurrent
+        // reader can observe a partial write directly at the cache path.
         if let Some(ref cache_dir) = self.cache_dir {
             if let Err(e) = std::fs::create_dir_all(cache_dir) {
                 eprintln!("milpa: dep-decl cache dir create failed: {e}");
             } else {
                 let cache_path = cache_dir.join(format!("{hex}.kdl"));
-                if let Err(e) = std::fs::write(&cache_path, &bytes) {
+                if let Err(e) = crate::atomic_cache::atomic_write_bytes(&cache_path, &bytes) {
                     eprintln!("milpa: dep-decl cache write failed: {e}");
                 }
             }
@@ -552,6 +568,90 @@ mod tests {
         );
         let err = store.get("sha256:0000000000000000000000000000000000000000000000000000000000000000").unwrap_err();
         assert_eq!(err.code(), "TNG-DEPDECL-FETCH-FAILED");
+    }
+
+    // -----------------------------------------------------------------------
+    // CR4 — fixed-temp-filename race (registry-protocol §3.5.2 NORMATIVE
+    // (concurrency)): a locally-corrupt cache entry must self-heal rather
+    // than poison forever, and concurrent fetches of the same uncached
+    // artifact must never tear a partial write into the final cache path.
+    // (The pre-fix Rust cache write here was even more exposed than the
+    // "fixed temp name" pattern: it wrote `std::fs::write` directly to the
+    // final cache path with NO temp file at all.)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn http_store_corrupted_cache_self_heals_by_refetching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = b"dep_decl {\n    dep_decl_schema_version 0\n    src_dir \"src\"\n}\n";
+        let hash = dep_decl_hash(data);
+        let hex = hash.strip_prefix("sha256:").unwrap();
+        let dep_decl_dir = tmp.path().join("dep-decl");
+        std::fs::create_dir_all(&dep_decl_dir).unwrap();
+        std::fs::write(dep_decl_dir.join(format!("{hex}.kdl")), data).unwrap();
+        let cache_dir = tmp.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        // Simulate a truncated/corrupt cache entry under the correct hash name.
+        std::fs::write(cache_dir.join(format!("{hex}.kdl")), b"truncated garbage").unwrap();
+
+        let base_url = format!("file://{}/", tmp.path().to_str().unwrap());
+        let store = HttpDepDeclStore::new(base_url, Some(cache_dir.clone()));
+        let got = store.get(&hash).unwrap();
+        assert_eq!(got, data);
+        // Cache is repaired: a subsequent get (origin removed) still succeeds.
+        std::fs::remove_file(dep_decl_dir.join(format!("{hex}.kdl"))).unwrap();
+        assert_eq!(store.get(&hash).unwrap(), data);
+    }
+
+    #[test]
+    fn http_store_server_content_mismatch_stays_hard_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = b"dep_decl {\n    dep_decl_schema_version 0\n    src_dir \"src\"\n}\n";
+        let hash = dep_decl_hash(data);
+        let hex = hash.strip_prefix("sha256:").unwrap();
+        let dep_decl_dir = tmp.path().join("dep-decl");
+        std::fs::create_dir_all(&dep_decl_dir).unwrap();
+        // Origin serves bytes that do NOT hash to `hash` — genuine fetch
+        // mismatch, nothing pre-cached.
+        std::fs::write(dep_decl_dir.join(format!("{hex}.kdl")), b"wrong content entirely").unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let base_url = format!("file://{}/", tmp.path().to_str().unwrap());
+        let store = HttpDepDeclStore::new(base_url, Some(cache_dir.clone()));
+        let err = store.get(&hash).unwrap_err();
+        assert_eq!(err.code(), "TNG-DEPDECL-HASH-MISMATCH");
+        assert!(!cache_dir.join(format!("{hex}.kdl")).is_file());
+    }
+
+    #[test]
+    fn http_store_concurrent_fetch_of_same_hash_never_corrupts_cache() {
+        // Regression for CR4: N threads racing a fetch of the SAME uncached
+        // artifact must all succeed with the correct bytes, and the final
+        // on-disk cache entry must never be a torn/interleaved write.
+        let tmp = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..65536).map(|i| (i % 251) as u8).collect();
+        let hash = dep_decl_hash(&data);
+        let hex = hash.strip_prefix("sha256:").unwrap().to_string();
+        let dep_decl_dir = tmp.path().join("dep-decl");
+        std::fs::create_dir_all(&dep_decl_dir).unwrap();
+        std::fs::write(dep_decl_dir.join(format!("{hex}.kdl")), &data).unwrap();
+        let cache_dir = tmp.path().join("cache");
+
+        let base_url = format!("file://{}/", tmp.path().to_str().unwrap());
+        let store = std::sync::Arc::new(HttpDepDeclStore::new(base_url, Some(cache_dir.clone())));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let store = std::sync::Arc::clone(&store);
+                let hash = hash.clone();
+                std::thread::spawn(move || store.get(&hash))
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap().unwrap(), data);
+        }
+        let cached = std::fs::read(cache_dir.join(format!("{hex}.kdl"))).unwrap();
+        assert_eq!(cached, data, "final cache entry must be a complete write, never torn");
     }
 
     // -----------------------------------------------------------------------

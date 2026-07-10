@@ -59,10 +59,12 @@ SECURITY INVARIANT (NORMATIVE):
 
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 from typing import Protocol
 
+from milpa.atomic_cache import atomic_write_bytes
 from milpa.errors import (
     TNG_ENTRY_BUNDLE_MISSING,
     TNG_ENTRY_BUNDLE_PIN_MISMATCH,
@@ -250,8 +252,20 @@ class HttpEntryBundleStore:
             except OSError:
                 cached_bytes = None  # corrupted cache: fall through to re-fetch
             if cached_bytes is not None:
-                _verify(cached_bytes, bundle_pin)
-                return cached_bytes
+                try:
+                    _verify(cached_bytes, bundle_pin)
+                except MilpaError:
+                    # Locally-corrupt cache entry (e.g. a truncated write left
+                    # behind by the pre-unique-temp-name concurrency race, or
+                    # plain disk corruption) — self-heal by discarding it and
+                    # falling through to re-fetch, rather than a permanent
+                    # hard failure. A mismatch on FRESHLY FETCHED bytes below
+                    # (the server genuinely served the wrong content) stays a
+                    # hard error — that path never reaches this except clause.
+                    with contextlib.suppress(OSError):
+                        cache_path.unlink(missing_ok=True)
+                else:
+                    return cached_bytes
 
         # Cache miss: fetch from network.
         artifact_url = self._artifact_url(bundle_pin)
@@ -304,17 +318,11 @@ class HttpEntryBundleStore:
         # Verify before caching — don't persist a corrupt/tampered bundle.
         _verify(fetched_bytes, bundle_pin)
 
-        # Atomic write to cache.
+        # Atomic write to cache (unique-per-write temp sibling + os.replace —
+        # registry-protocol §3.5.2 NORMATIVE (concurrency); see atomic_cache.py).
         self._cache_dir.mkdir(parents=True, exist_ok=True)
-        tmp_path = cache_path.with_suffix(".bundle.tmp")
-        try:
-            tmp_path.write_bytes(fetched_bytes)
-            os.replace(tmp_path, cache_path)
-        except OSError:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        with contextlib.suppress(OSError):
+            atomic_write_bytes(cache_path, fetched_bytes)
             # Cache write failure is non-fatal; the bytes were already verified.
 
         return fetched_bytes

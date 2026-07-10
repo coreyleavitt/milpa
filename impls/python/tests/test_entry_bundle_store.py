@@ -133,6 +133,95 @@ def test_http_store_not_found_raises_bundle_missing(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# CR4 — fixed-temp-filename race (registry-protocol §3.5.2 NORMATIVE
+# (concurrency)): cache writes must use a per-write-unique temp sibling, and
+# a locally-corrupt cache entry must self-heal rather than poison forever.
+# ---------------------------------------------------------------------------
+
+
+def test_http_store_cache_write_uses_unique_temp_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for CR4: the cache write must go through
+    ``atomic_cache.unique_temp_path`` (per-write-unique), never a fixed
+    ``<pin>.bundle.tmp`` sibling — two concurrent fetches of the same
+    uncached bundle must never be able to interleave partial writes."""
+    import milpa.atomic_cache as atomic_cache_module
+
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    (origin / "attestation").mkdir()
+    cache = tmp_path / "cache"
+    bundle_bytes, pin = _bundle_and_pin()
+    (origin / "attestation" / f"{pin}.bundle").write_bytes(bundle_bytes)
+
+    seen_tmp_paths: list[Path] = []
+    original = atomic_cache_module.unique_temp_path
+
+    def _spy(path: Path) -> Path:
+        tmp = original(path)
+        seen_tmp_paths.append(tmp)
+        return tmp
+
+    monkeypatch.setattr(atomic_cache_module, "unique_temp_path", _spy)
+
+    HttpEntryBundleStore(base_url=f"file://{origin}", cache_dir=cache).get(pin)
+    (cache / f"{pin}.bundle").unlink()
+    HttpEntryBundleStore(base_url=f"file://{origin}", cache_dir=cache).get(pin)
+
+    assert len(seen_tmp_paths) == 2
+    assert seen_tmp_paths[0] != seen_tmp_paths[1], (
+        "two writes to the same cache path must use different temp sibling names"
+    )
+    for tmp in seen_tmp_paths:
+        assert not str(tmp).endswith(".bundle.tmp"), (
+            "must not regress to a fixed .bundle.tmp sibling name"
+        )
+
+
+def test_http_store_corrupted_cache_self_heals_by_refetching(tmp_path: Path) -> None:
+    """A locally-corrupt cache entry (e.g. left by the pre-fix race) must be
+    discarded and transparently re-fetched, not raise PIN-MISMATCH forever."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    (origin / "attestation").mkdir()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    bundle_bytes, pin = _bundle_and_pin()
+    (origin / "attestation" / f"{pin}.bundle").write_bytes(bundle_bytes)
+    # Simulate a truncated/corrupt cache entry under the correct pin.
+    (cache / f"{pin}.bundle").write_bytes(b"truncated garbage")
+
+    store = HttpEntryBundleStore(base_url=f"file://{origin}", cache_dir=cache)
+    result = store.get(pin)
+    assert result == bundle_bytes
+    # Cache is repaired: a subsequent get (origin removed) still succeeds.
+    (origin / "attestation" / f"{pin}.bundle").unlink()
+    assert store.get(pin) == bundle_bytes
+
+
+def test_http_store_server_content_mismatch_stays_hard_error(tmp_path: Path) -> None:
+    """A mismatch on FRESHLY FETCHED bytes (the server serving the wrong
+    content for the pin) must stay a hard error — self-heal only applies to
+    the locally-corrupt-cache path, never to content the server just sent."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    (origin / "attestation").mkdir()
+    cache = tmp_path / "cache"
+    bundle_bytes, pin = _bundle_and_pin()
+    # Origin serves bytes that do NOT hash to `pin` (server misconfiguration
+    # / tampering) — nothing pre-cached, so this is a genuine fetch mismatch.
+    (origin / "attestation" / f"{pin}.bundle").write_bytes(b"wrong content entirely")
+
+    store = HttpEntryBundleStore(base_url=f"file://{origin}", cache_dir=cache)
+    with pytest.raises(MilpaError) as exc_info:
+        store.get(pin)
+    assert exc_info.value.slug == TNG_ENTRY_BUNDLE_PIN_MISMATCH
+    # Must NOT have cached the bad bytes.
+    assert not store.is_cached(pin)
+
+
+# ---------------------------------------------------------------------------
 # entry_bundle_store_from_paths — priority table
 # ---------------------------------------------------------------------------
 
