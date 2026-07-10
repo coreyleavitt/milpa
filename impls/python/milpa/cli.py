@@ -998,8 +998,10 @@ def _load_index_for_verb(env: MilpaEnv, project_dir: "Path | None" = None) -> Mi
     # Build IndexTrustConfig + verifier when project_dir is provided.
     config: object = None
     verifier: object = None
+    index_history_policy = "off"
     if project_dir is not None:
         config, verifier = _build_index_trust(env, project_dir)
+        index_history_policy = _build_index_history(env, project_dir)
 
     # Absent → DEFAULT_INDEX_URL; non-empty → that URL.
     # load_default_index() calls index_url_from_env() which handles both cases.
@@ -1008,6 +1010,7 @@ def _load_index_for_verb(env: MilpaEnv, project_dir: "Path | None" = None) -> Mi
             config=config,
             verifier=verifier,
             refresh=env.refresh_index,
+            index_history_policy=index_history_policy,
         )
     except MilpaError as exc:
         if exc.slug == MILPA_INDEX_UNREACHABLE:

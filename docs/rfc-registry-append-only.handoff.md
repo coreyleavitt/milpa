@@ -133,9 +133,18 @@ verified index is a valid *successor* of the previous one. Freshness
       off from gate-absent); context.py untouched (no consumer yet); Rust
       DEFERRED hold-open re-opened for the 1 WS slug ("A3/A4a parity
       pending"). 24 tests. Gates: pytest 2793 + rust-conformance green.
-- [ ] A2d — seam wiring + baseline lifecycle (parse-at-gate refactor BOTH
-      seams; no-clobber pin; `.meta` lockstep; corrupt mapping; unique
-      temp names; root-field check).
+- [x] A2d (2026-07-10) — seam wiring + baseline lifecycle: new
+      index_ratchet_seam.py (build_index_state w/ raw re-walk only for
+      published_at; parse_baseline→BASELINE-CORRUPT; evaluate_gate pure);
+      index_cache.py gates BOTH seams (load_index State-2 +
+      _refetch_with_recovery) post-Layer-1 pre-write; parse-at-gate
+      no-clobber UNCONDITIONAL (incl. off); unique temp names (PID+random)
+      for all writes; baseline+.meta = two separate atomic writes (spec
+      read: pair ≠ cross-file transaction — no blocker); 4 slugs
+      (ROOT-MUTATED/ROLLBACK/ENTRY-MUTATED/BASELINE-CORRUPT) + Rust
+      DEFERRED extended; policy default "off" at the load_index param so
+      ~150 existing call sites unchanged, CLI threads real policy. 32
+      tests. Gates: pytest 2825 + rust-conformance green.
 - [ ] A2e — `milpa index` verb family (nested subparser; workspace/store
       precedent). Slugs land per-sub-slice (bijection lint is set-equality
       only — `ID_NAME_TOO_LONG` precedent; Rust `all_codes()` + DEFERRED).

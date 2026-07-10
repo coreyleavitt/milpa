@@ -22,10 +22,18 @@ Bundle sidecar files (RFC §7.2):
   ``<key>.index.kdl.bundle``  ← Sigstore bundle (NEW S5)
   ``<key>.index.kdl.no-bundle`` ← degraded marker (warn only; bundle 404)
 
+Append-only ratchet baseline sidecars (registry-protocol §3.5.2/§6, RFC
+registry-append-only.md A2d — a SECOND, independent sidecar pair, gated by
+the ``index-history`` policy axis rather than ``index-trust``):
+  ``<key>.index.kdl.baseline``      ← last index that passed the ratchet cleanly
+  ``<key>.index.kdl.baseline.meta`` ← established_at / reported_digest / reported_at
+
 Crash recovery (RFC §7.2 — bounded):
   On a cache READ, a digest-mismatch or missing bundle sidecar → delete both
   sidecars + refetch ONCE.  If the refetch ALSO fails verification → hard-fail
-  regardless of policy (active-adversary signal).
+  regardless of policy (active-adversary signal).  The append-only ratchet gate
+  (below) runs identically on this bounded refetch as on an ordinary State-2
+  fetch — a candidate arriving via crash recovery is exactly as untrusted.
 
 ``MILPA_INDEX_URL``, when set to a non-empty string, overrides the default
 index URL for every index-fetching operation in that invocation.  Supports
@@ -33,11 +41,25 @@ the ``file://`` scheme so air-gapped / harness deployments can substitute a
 private or local index (``cli-contract.md`` §8.1 NORMATIVE).
 
 Cache writes are atomic: write bundle sidecar first, then atomic-rename index
-file.  Concurrent readers that observe a half-written pair trigger crash-recovery
-(digest mismatch → single bounded refetch), which is safe and self-correcting.
+file, then (only on a clean ratchet diff) the baseline pair.  Every write in
+this module — bundle, index, baseline, ``.baseline.meta`` — goes through a
+per-write-unique temp sibling name (``_unique_temp_path``, PID + random
+suffix) before ``os.replace``, so two concurrent writers can never interleave
+partial writes through a shared fixed ``.tmp`` name (registry-protocol §3.5.2
+NORMATIVE (concurrency)). Concurrent readers that observe a half-written pair
+trigger crash-recovery (digest mismatch → single bounded refetch), which is
+safe and self-correcting.
 
-Spec authority: ``spec/registry-protocol.md`` §6; ``spec/cli-contract.md`` §8;
-``docs/rfc-registry-trust-federation.md`` §4, §6.5, §7.
+The append-only ratchet gate (``index_ratchet_seam.py`` — pure parse/diff/
+decide; this module owns all I/O) runs AFTER Layer-1 bundle verification
+succeeds and BEFORE any cache mutation, including the bundle sidecar write:
+parse-at-gate means an unparseable candidate can never clobber a good cache,
+and a ``index-history "strict"`` violation aborts before any write at all.
+See registry-protocol §3.5.2 for the full policy/write-ordering contract.
+
+Spec authority: ``spec/registry-protocol.md`` §6, §3.5; ``spec/cli-contract.md``
+§8; ``docs/rfc-registry-trust-federation.md`` §4, §6.5, §7;
+``docs/rfc-registry-append-only.md`` §2.
 """
 
 from __future__ import annotations
@@ -45,6 +67,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+import secrets
 import sys
 import urllib.error
 import urllib.request
@@ -56,6 +79,7 @@ from urllib.parse import urlparse, urlunparse
 from milpa.errors import MILPA_INDEX_UNREACHABLE, MilpaError
 
 if TYPE_CHECKING:
+    from milpa.index_ratchet_seam import GateDecision
     from milpa.index_trust import IndexBundleVerifier, IndexTrustConfig
     from milpa.registry import Index
 
@@ -178,6 +202,20 @@ def _no_bundle_marker_path(cache_file: Path) -> Path:
     return Path(str(cache_file) + ".no-bundle")
 
 
+def _baseline_path(cache_file: Path) -> Path:
+    """Append-only ratchet baseline sidecar: ``<cache_file>.baseline`` — a
+    full copy of the last index that passed the ratchet cleanly
+    (registry-protocol §3.5.2, §6)."""
+    return Path(str(cache_file) + ".baseline")
+
+
+def _baseline_meta_path(cache_file: Path) -> Path:
+    """Ratchet baseline metadata sidecar: ``<cache_file>.baseline.meta``
+    (registry-protocol §3.5.2, §6) — ``established_at`` / ``reported_digest``
+    / ``reported_at``, one file, written atomically as a unit."""
+    return Path(str(cache_file) + ".baseline.meta")
+
+
 def _read_stamp(stamp_file: Path) -> int | None:
     """Read a sidecar stamp file and return its unix-second value, or ``None``."""
     try:
@@ -295,6 +333,8 @@ def load_index(
     verifier: "IndexBundleVerifier | None" = None,
     bundle_http_get: "BundleHttpGet | None" = None,
     refresh: bool = False,
+    # A2d addition — append-only ratchet seam:
+    index_history_policy: str = "off",
 ) -> "Index":
     """Fetch + cache + parse the ``index.kdl`` at *url*.
 
@@ -326,6 +366,17 @@ def load_index(
                      Returns raw bytes; raises ``_BundleNotFound`` on 404.
         refresh:     When True, bypass cache TTL and force a fresh index+bundle
                      fetch (``--refresh-index``).
+        index_history_policy:
+                     ``"off" | "warn" | "strict"`` (registry-protocol §3.5.2)
+                     — the append-only ratchet's own policy axis, orthogonal
+                     to ``index-trust``. Runs on EVERY network-fetch path
+                     (this function's State 2 body, and the bounded
+                     crash-recovery refetch), never on a pure cache read.
+                     Defaults to ``"off"`` (disabled) — production callers
+                     (``load_default_index`` / ``cli.py``) pass the resolved
+                     manifest/env policy explicitly; this default only
+                     preserves this low-level function's pre-A2d behavior
+                     for callers that don't opt in.
 
     Returns:
         Parsed ``Index``.
@@ -334,6 +385,12 @@ def load_index(
         ``MilpaError(MILPA_INDEX_UNREACHABLE)`` — network failure with no
         usable cache (state 4).
         ``MilpaError(TNG-INDEX-*)`` — trust gate failure under strict policy.
+        ``MilpaError(TNG-INDEX-ROOT-MUTATED | TNG-INDEX-ROLLBACK |
+        TNG-ENTRY-MUTATED)`` — append-only ratchet violation under
+        ``index_history_policy="strict"``.
+        ``MilpaError(TNG-INDEX-BASELINE-CORRUPT)`` — an existing baseline
+        sidecar is unparseable, regardless of ``index_history_policy``
+        (except ``"off"``, which never reads it).
         Any ``MilpaError(TNG-*)`` raised by ``parse_index`` — propagate unchanged.
     """
     from milpa.registry import parse_index  # local import to avoid circular at module level
@@ -371,6 +428,7 @@ def load_index(
                             http_get=http_get, bundle_http_get=bundle_http_get,
                             config=config, verifier=verifier,
                             now_unix=now_unix, is_recovery=True,
+                            index_history_policy=index_history_policy,
                         )
                     # is_network_fetch=False: freshness NOT re-asserted on cache reads.
                     _verify_and_enforce(
@@ -401,6 +459,7 @@ def load_index(
                         http_get=http_get, bundle_http_get=bundle_http_get,
                         config=config, verifier=verifier,
                         now_unix=now_unix, is_recovery=True,
+                        index_history_policy=index_history_policy,
                     )
             try:
                 return parse_index(index_bytes.decode("utf-8"))
@@ -540,6 +599,24 @@ def load_index(
             )
 
     # -------------------------------------------------------------------------
+    # Append-only ratchet gate (registry-protocol §3.5.2, RFC
+    # registry-append-only.md §2) — runs regardless of index-trust (its own
+    # `index-history` axis), AFTER Layer-1 verification succeeds and BEFORE
+    # any cache mutation begins, including the bundle sidecar write below.
+    # Parse-at-gate: an unparseable candidate raises here and NEVER reaches
+    # the writes that follow, so a good cache is never clobbered. Under
+    # `strict`, a ratchet violation also raises here — no bundle write, no
+    # index write, no stamp advance (fail closed).
+    # -------------------------------------------------------------------------
+    gate_decision = _run_ratchet_gate(
+        policy=index_history_policy,
+        cache_file=cache_file,
+        candidate_bytes=fetched_bytes,
+        now_unix=now_unix,
+        url=url,
+    )
+
+    # -------------------------------------------------------------------------
     # Atomic write: bundle sidecar first, then index rename (RFC §7.2).
     # -------------------------------------------------------------------------
     # Write bundle sidecar first so a reader that sees the index always has its bundle.
@@ -559,28 +636,18 @@ def load_index(
                 bundle_file.unlink(missing_ok=True)
         # Under strict+bundle_was_404/bundle_transport_error: enforce_index_trust already raised.
 
-    # Atomic write of the index (temp sibling + os.replace).
-    tmp_file = cache_file.with_suffix(f".kdl.tmp.{now_unix}")
-    try:
-        tmp_file.write_bytes(fetched_bytes)
-        os.replace(tmp_file, cache_file)
-    except OSError:
-        with contextlib.suppress(OSError):
-            tmp_file.unlink(missing_ok=True)
-        raise
+    # Atomic write of the index (unique temp sibling + os.replace).
+    _atomic_write_bytes(cache_file, fetched_bytes)
 
     # Record fetch time to the sidecar (governs freshness, not fs mtime).
     _write_stamp(stamp_file, now_unix)
 
-    try:
-        return parse_index(fetched_bytes.decode("utf-8"))
-    except UnicodeDecodeError as exc:
-        from milpa.errors import TNG_KDL_SYNTAX
-        raise MilpaError(
-            TNG_KDL_SYNTAX,
-            f"index bytes from {url!r} are not valid UTF-8: {exc}",
-            url=url,
-        ) from exc
+    # Sticky-advance the ratchet baseline (only on a clean diff / TOFU —
+    # write ordering steps 5-6, strictly after the index write above so the
+    # baseline only ever reflects content actually served).
+    _apply_ratchet_writes(cache_file, gate_decision, fetched_bytes)
+
+    return gate_decision.index
 
 
 # ---------------------------------------------------------------------------
@@ -619,6 +686,99 @@ def _delete_bundle_sidecars(bundle_file: Path, no_bundle_marker: Path) -> None:
         no_bundle_marker.unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------------------------
+# Append-only ratchet gate (registry-protocol §3.5.2, RFC
+# registry-append-only.md §2/§3, slice A2d).  ``index_ratchet_seam.py`` is
+# pure computation (no I/O); this module owns every read/write of the
+# baseline sidecar pair, mirroring how it already owns the bundle/index/
+# stamp sidecars.
+# ---------------------------------------------------------------------------
+
+
+def _run_ratchet_gate(
+    *,
+    policy: str,
+    cache_file: Path,
+    candidate_bytes: bytes,
+    now_unix: int,
+    url: str,
+) -> "GateDecision":
+    """Parse-at-gate + the append-only ratchet check.  Reads the baseline
+    sidecar pair (when *policy* is not ``"off"``); performs NO writes.
+
+    Raises ``MilpaError`` — decode/parse failure on the candidate (any
+    policy), ``TNG-INDEX-BASELINE-CORRUPT`` (any policy except ``"off"``),
+    or the primary violation's slug under ``"strict"`` — in every case
+    BEFORE the caller has written anything to the cache.
+    """
+    from milpa.errors import TNG_KDL_SYNTAX
+    from milpa.index_ratchet_seam import BaselineMeta, evaluate_gate, parse_baseline_meta
+
+    try:
+        candidate_text = candidate_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MilpaError(
+            TNG_KDL_SYNTAX,
+            f"index bytes from {url!r} are not valid UTF-8: {exc}",
+            url=url,
+        ) from exc
+
+    baseline_path = _baseline_path(cache_file)
+    meta_path = _baseline_meta_path(cache_file)
+
+    baseline_text: str | None = None
+    if policy != "off" and baseline_path.is_file():
+        raw = baseline_path.read_bytes()
+        try:
+            baseline_text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            from milpa.errors import TNG_INDEX_BASELINE_CORRUPT
+            raise MilpaError(
+                TNG_INDEX_BASELINE_CORRUPT,
+                f"baseline sidecar at {baseline_path} is not valid UTF-8: {exc}; "
+                "re-establish the trust anchor via `milpa index accept`",
+            ) from exc
+
+    existing_meta = BaselineMeta()
+    if policy != "off" and meta_path.is_file():
+        # .meta is advisory (§3.5.2 NORMATIVE): a decode failure here is
+        # self-healing (treated as unset), never an error — mirrors
+        # parse_baseline_meta's own try/except for KDL-level corruption.
+        try:
+            meta_text = meta_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            meta_text = ""
+        existing_meta = parse_baseline_meta(meta_text)
+
+    return evaluate_gate(
+        policy=policy,
+        candidate_text=candidate_text,
+        baseline_text=baseline_text,
+        existing_meta=existing_meta,
+        now_unix=now_unix,
+        url=url,
+    )
+
+
+def _apply_ratchet_writes(cache_file: Path, decision: "GateDecision", candidate_bytes: bytes) -> None:
+    """Write the baseline sidecar pair per *decision* (write ordering steps
+    5-6 — MUST be called strictly after the index file write, and only for
+    the writer callers that just wrote a genuinely-new candidate: TOFU
+    establishment and clean-diff sticky-advance always set ``advance``; a
+    ``warn``-dirty new-digest report sets only ``new_meta``.  A no-op when
+    neither is set (``"off"`` policy, or a recurring warn)."""
+    if not decision.advance and decision.new_meta is None:
+        return
+    if decision.advance:
+        # Full copy of the candidate bytes ACTUALLY SERVED (never a
+        # re-serialization) — §3.5.2 NORMATIVE (write ordering).
+        _atomic_write_bytes(_baseline_path(cache_file), candidate_bytes)
+    if decision.new_meta is not None:
+        _atomic_write_bytes(
+            _baseline_meta_path(cache_file), decision.new_meta.render().encode("utf-8")
+        )
+
+
 def _refetch_with_recovery(
     *,
     url: str,
@@ -633,15 +793,20 @@ def _refetch_with_recovery(
     verifier: "IndexBundleVerifier",
     now_unix: int,
     is_recovery: bool,
+    index_history_policy: str = "off",
 ) -> "Index":
     """Bounded crash-recovery refetch (RFC §7.2).
 
     Called when a CACHE READ detects a missing/corrupt bundle sidecar (interrupted
     write scenario).  Performs ONE network refetch.  If the refetch ALSO fails
     verification, hard-fail regardless of policy (active-adversary signal).
-    """
-    from milpa.registry import parse_index
 
+    A candidate arriving via this path is exactly as untrusted as an
+    ordinary State-2 fetch — the append-only ratchet gate (registry-protocol
+    §3.5.2) runs here identically, after Layer-1 verification succeeds and
+    before any write, so forced cache corruption can't smuggle a history
+    rewrite past the ratchet.
+    """
     # Attempt one recovery refetch.
     fetch_error: str | None = None
     fetched_bytes: bytes | None = None
@@ -709,6 +874,18 @@ def _refetch_with_recovery(
                 url=url,
             )
 
+    # Append-only ratchet gate — after Layer-1 verification succeeds, before
+    # any write (registry-protocol §3.5.2; same placement as the ordinary
+    # State-2 body in ``load_index``). Parse-at-gate + strict-violation both
+    # raise here, before "Write recovered state" below runs.
+    gate_decision = _run_ratchet_gate(
+        policy=index_history_policy,
+        cache_file=cache_file,
+        candidate_bytes=fetched_bytes,
+        now_unix=now_unix,
+        url=url,
+    )
+
     # Write recovered state.
     if fetched_bundle is not None:
         _atomic_write_bytes(bundle_file, fetched_bundle)
@@ -721,31 +898,29 @@ def _refetch_with_recovery(
         with contextlib.suppress(OSError):
             bundle_file.unlink(missing_ok=True)
 
-    tmp_file = cache_file.with_suffix(f".kdl.tmp.recovery.{now_unix}")
-    try:
-        tmp_file.write_bytes(fetched_bytes)
-        os.replace(tmp_file, cache_file)
-    except OSError:
-        with contextlib.suppress(OSError):
-            tmp_file.unlink(missing_ok=True)
-        raise
-
+    _atomic_write_bytes(cache_file, fetched_bytes)
     _write_stamp(stamp_file, now_unix)
+    _apply_ratchet_writes(cache_file, gate_decision, fetched_bytes)
 
-    try:
-        return parse_index(fetched_bytes.decode("utf-8"))
-    except UnicodeDecodeError as exc:
-        from milpa.errors import TNG_KDL_SYNTAX
-        raise MilpaError(
-            TNG_KDL_SYNTAX,
-            f"index bytes from {url!r} are not valid UTF-8: {exc}",
-            url=url,
-        ) from exc
+    return gate_decision.index
+
+
+def _unique_temp_path(path: Path) -> Path:
+    """A per-write-unique sibling temp path for *path* (PID + random suffix).
+
+    registry-protocol §3.5.2 NORMATIVE (concurrency): a FIXED temp sibling
+    name lets two concurrent writers interleave partial writes before either
+    renames — a latent hazard for every index-cache write (bundle sidecar,
+    index file, and now the baseline pair). Every write in this module goes
+    through this helper (or ``_atomic_write_bytes``, which calls it) so no
+    site can regress to a fixed name.
+    """
+    return Path(f"{path}.tmp.{os.getpid()}.{secrets.token_hex(8)}")
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Write ``data`` to ``path`` atomically (sibling tmp + os.replace)."""
-    tmp = Path(str(path) + ".tmp")
+    """Write ``data`` to ``path`` atomically (unique sibling tmp + os.replace)."""
+    tmp = _unique_temp_path(path)
     try:
         tmp.write_bytes(data)
         os.replace(tmp, path)
@@ -802,6 +977,7 @@ def load_default_index(
     verifier: "IndexBundleVerifier | None" = None,
     bundle_http_get: "BundleHttpGet | None" = None,
     refresh: bool = False,
+    index_history_policy: str = "off",
 ) -> "Index":
     """Load the index from ``MILPA_INDEX_URL`` (or the default URL).
 
@@ -815,6 +991,10 @@ def load_default_index(
     - ``verifier``:    ``IndexBundleVerifier``; REQUIRED when config is not None.
     - ``bundle_http_get``: defaults to ``urllib_bundle_http_get`` when config set.
     - ``refresh``:     force re-fetch bypassing TTL (``--refresh-index``).
+    - ``index_history_policy``: the append-only ratchet's policy axis
+      (``"off" | "warn" | "strict"``, registry-protocol §3.5.2); orthogonal
+      to ``config``/``verifier`` (index-trust). Defaults to ``"off"``;
+      ``cli.py`` passes the resolved manifest/env policy.
     """
     import time
 
@@ -832,4 +1012,5 @@ def load_default_index(
         verifier=verifier,
         bundle_http_get=effective_bundle_get,
         refresh=refresh,
+        index_history_policy=index_history_policy,
     )

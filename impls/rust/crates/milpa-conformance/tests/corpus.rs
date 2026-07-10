@@ -162,7 +162,24 @@ fn spec_error_codes() -> BTreeSet<String> {
 /// slug this implementation currently defers: the `index-history`
 /// manifest field / `MILPA_INDEX_HISTORY` env / effective-policy plumbing
 /// has no Rust counterpart yet. Rust parity is scheduled for A3/A4a.
-const DEFERRED: &[&str] = &["WS-INDEX-HISTORY-ON-MEMBER"];
+///
+/// A2d (RFC `rfc-registry-append-only.md`, Python-only slice): wired the
+/// append-only consumer ratchet at the index-cache seam — added
+/// `TNG-INDEX-ROOT-MUTATED`, `TNG-INDEX-ROLLBACK`, `TNG-ENTRY-MUTATED`, and
+/// `TNG-INDEX-BASELINE-CORRUPT` to spec/errors.md and errors.py, with
+/// Python raise sites in `index_ratchet_seam.py` (`evaluate_gate` /
+/// `parse_baseline`) called from `index_cache.py`'s `load_index` and
+/// `_refetch_with_recovery`. All four join `WS-INDEX-HISTORY-ON-MEMBER` in
+/// this list — the whole `index-history` axis (engine, seam, and its
+/// member-declaration guard) has no Rust counterpart yet. A3 parity
+/// pending.
+const DEFERRED: &[&str] = &[
+    "WS-INDEX-HISTORY-ON-MEMBER",
+    "TNG-INDEX-ROOT-MUTATED",
+    "TNG-INDEX-ROLLBACK",
+    "TNG-ENTRY-MUTATED",
+    "TNG-INDEX-BASELINE-CORRUPT",
+];
 
 /// Spec codes this implementation intentionally never emits.
 const EXEMPT: &[&str] = &[

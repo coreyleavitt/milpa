@@ -278,6 +278,13 @@ TNG_INDEX_SIGNATURE_INVALID = "TNG-INDEX-SIGNATURE-INVALID"
 TNG_INDEX_DIGEST_MISMATCH = "TNG-INDEX-DIGEST-MISMATCH"
 TNG_INDEX_SIGNER_MISMATCH = "TNG-INDEX-SIGNER-MISMATCH"
 TNG_INDEX_BUNDLE_STALE = "TNG-INDEX-BUNDLE-STALE"
+# TNG-INDEX-*/TNG-ENTRY-MUTATED — append-only invariant & consumer ratchet
+# (registry-protocol §3.5, RFC registry-append-only.md A2d, Python-only
+# slice; Rust parity deferred to A3 — see corpus.rs DEFERRED).
+TNG_INDEX_ROOT_MUTATED = "TNG-INDEX-ROOT-MUTATED"
+TNG_INDEX_ROLLBACK = "TNG-INDEX-ROLLBACK"
+TNG_ENTRY_MUTATED = "TNG-ENTRY-MUTATED"
+TNG_INDEX_BASELINE_CORRUPT = "TNG-INDEX-BASELINE-CORRUPT"
 # TNG-ENTRY-* codes — per-entry Sigstore attestation gate (RFC
 # per-entry-attestation.md §5, P3a).  Eight codes, added to spec/errors.md AND
 # errors.py in the same commit per the bijection invariant.  Stage order (§5

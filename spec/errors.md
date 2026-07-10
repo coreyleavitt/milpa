@@ -1192,6 +1192,30 @@ The Sigstore bundle is cryptographically valid but was signed beyond the maximum
 
 **Triggered:** `verify_index_bundle` in `index_trust.py` on a network-fetch path (States 2 + crash-recovery refetch) finds `now - SET.integratedTime >= MILPA_INDEX_MAX_AGE` (default 7 days = 604800 s).  Indicates a rollback attack or a frozen CDN.  This check is NEVER asserted on pure cache reads (States 1 and 3) so offline/air-gapped invocations never fail on staleness; only the network-fetch boundary is defended (RFC §4 step 6, §7.2).
 
+### `TNG-INDEX-ROOT-MUTATED`
+
+A document-root field (`schema_version`, or `attestation-epoch` once Part 2's P2 slice lands) violates its `registry-protocol.md §3.5.1` root-field order — a `schema_version` decrease, or a change to an already-set `attestation-epoch`.
+
+**Triggered:** the append-only ratchet's dominance fold (`ratchet.py`'s `Baseline.check`, wired at the index-cache seam by `index_ratchet_seam.py`) finds a violation on the reserved root pseudo-entry (`namespace = name = version = ""`). Ranks first (`class_rank` 0) in the composite violation ordering — document-level violations beat entry-level. Gated by the `index-history` policy axis (`off | warn | strict`, default `warn`); under `off` the ratchet never runs. Defined in `registry-protocol.md §3.5.2`/`§3.5.3`.
+
+### `TNG-INDEX-ROLLBACK`
+
+A package or version present in the consumer's ratchet baseline is absent from the candidate index — the presence component of the `§3.5.1` dominance product order failing (a `present → absent` transition is never legal).
+
+**Triggered:** `Baseline.check` finds a baseline entry key with no candidate counterpart. Ranks second (`class_rank` 1) in the composite violation ordering. Gated by `index-history`. Defined in `registry-protocol.md §3.5.2`/`§3.5.3`.
+
+### `TNG-ENTRY-MUTATED`
+
+An entry present in both the baseline and the candidate violates a `§3.5.1` field-class order: a frozen-field change (`content_hash`, `published_at`, the `dep_decl`/`dep_decl_schema_version` lockstep pair), an attestation-monotone downgrade/strip/re-attribution/re-pin, or a provenance removed from the append-only multiset. The sub-class discriminator (`frozen-changed` / `frozen-unset` / `monotone-stripped` / `monotone-reattributed` / `monotone-downgraded` / `monotone-repinned` / `provenance-removed`) lives in the violation payload, not in a separate slug.
+
+**Triggered:** `Baseline.check` finds a per-field dominance failure on a non-root entry key present on both sides. Ranks third (`class_rank` 2) in the composite violation ordering. Gated by `index-history`. Defined in `registry-protocol.md §3.5.2`/`§3.5.3`.
+
+### `TNG-INDEX-BASELINE-CORRUPT`
+
+The `<cache-key>.index.kdl.baseline` sidecar exists but is unparseable, truncated, or declares a `schema_version` beyond this consumer's understood range (local-trust-state skew, distinct from `TNG-SCHEMA-UNKNOWN` which is about served content).
+
+**Triggered:** `index_ratchet_seam.parse_baseline` (or the raw UTF-8 decode preceding it) fails on the on-disk baseline sidecar. Hard-fails **regardless of `index-history` policy** (`warn` and `strict` alike; the check cannot fire under `off` because the baseline is never read in that mode) — an absent baseline means legitimate first contact (TOFU); a present-but-broken one must never silently degrade to TOFU, or "corrupt the baseline file" would be a free ratchet reset. No raw parser slug (`TNG-KDL-SYNTAX`, `TNG-SCHEMA-UNKNOWN`) leaks through this path. Recovery is `milpa index accept`. Defined in `registry-protocol.md §3.5.2`.
+
 ### `TNG-ENTRY-UNATTESTED`
 
 The selected registry entry carries no per-entry attestation record — absent, of an unrecognized `attestation` kind, or structurally invalid (e.g. `"author-signed"` with no `signed_by`), all of which conservatively collapse to unattested at index-parse time (registry-protocol §3.2).
