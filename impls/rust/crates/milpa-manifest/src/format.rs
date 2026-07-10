@@ -83,6 +83,12 @@ pub fn format_manifest(m: &Manifest) -> String {
         lines.push(format!("entry-trust \"{}\"", trust_policy_str(&m.entry_trust_policy)));
         lines.push(String::new());
     }
+    // index-history (A3, rfc-registry-append-only.md §2). Same absent-stays-
+    // absent rule as index-trust/entry-trust above.
+    if m.index_history_policy_explicit {
+        lines.push(format!("index-history \"{}\"", trust_policy_str(&m.index_history_policy)));
+        lines.push(String::new());
+    }
     if !m.deps.is_empty() {
         lines.push("deps {".to_string());
         for dep in &m.deps {
@@ -262,6 +268,12 @@ pub fn format_workspace_manifest(ws: &Workspace) -> String {
     // entry-trust (P3a, RFC per-entry-attestation.md §4 — root-authority policy).
     if ws.entry_trust_policy_explicit {
         lines.push(format!("entry-trust \"{}\"", trust_policy_str(&ws.entry_trust_policy)));
+        lines.push(String::new());
+    }
+
+    // index-history (A3, rfc-registry-append-only.md §2 — root-authority policy).
+    if ws.index_history_policy_explicit {
+        lines.push(format!("index-history \"{}\"", trust_policy_str(&ws.index_history_policy)));
         lines.push(String::new());
     }
 
@@ -645,6 +657,8 @@ mod tests {
             index_trust_policy_explicit: false,
             entry_trust_policy: crate::TrustPolicy::Warn,
             entry_trust_policy_explicit: false,
+            index_history_policy: crate::TrustPolicy::Warn,
+            index_history_policy_explicit: false,
             optional_auto_flags: std::collections::BTreeSet::new(),
         }
     }
@@ -1051,6 +1065,8 @@ mod tests {
             index_trust_bundle: Some("file:///etc/milpa/trust-bundle.json".into()),
             entry_trust_policy: crate::TrustPolicy::Warn,
             entry_trust_policy_explicit: false,
+            index_history_policy: crate::TrustPolicy::Warn,
+            index_history_policy_explicit: false,
         };
 
         let text = format_workspace_manifest(&ws);
@@ -1225,6 +1241,111 @@ mod tests {
 
     // A workspace member manifest declaring `entry-trust` must raise
     // `WS-ENTRY-TRUST-ON-MEMBER` — proven at the `milpa-core` workspace-load
+    // layer (`workspace_tests.rs`), not here; this crate only proves the
+    // per-manifest parse/format round-trip.
+
+    // A3 (rfc-registry-append-only.md §2): index-history round-trip tests —
+    // mirror the entry-trust ones above.
+
+    #[test]
+    fn package_manifest_index_history_strict_round_trips() {
+        let mut m = base();
+        m.index_history_policy = crate::TrustPolicy::Strict;
+        m.index_history_policy_explicit = true;
+
+        let text = format_manifest(&m);
+        assert!(text.contains("index-history \"strict\""), "missing index-history node:\n{text}");
+
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Package(p) => p,
+            other => panic!("expected package, got {other:?}"),
+        };
+        assert_eq!(reparsed.index_history_policy, m.index_history_policy);
+        assert_eq!(reparsed.index_history_policy_explicit, m.index_history_policy_explicit);
+        assert_eq!(reparsed, m);
+    }
+
+    /// A manifest that never declared `index-history` at all must NOT gain
+    /// one on round-trip (absent-stays-absent).
+    #[test]
+    fn package_manifest_without_index_history_stays_absent() {
+        let m = base();
+        let text = format_manifest(&m);
+        assert!(!text.contains("index-history"), "must not fabricate an index-history node:\n{text}");
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Package(p) => p,
+            other => panic!("expected package, got {other:?}"),
+        };
+        assert!(!reparsed.index_history_policy_explicit);
+    }
+
+    /// Explicit `index-history "warn"` (matching the default value) must
+    /// still survive a round trip — the absent-stays-absent rule is about
+    /// WHERE the field is declared, not what value it holds.
+    #[test]
+    fn package_manifest_index_history_warn_explicit_round_trips() {
+        let mut m = base();
+        m.index_history_policy = crate::TrustPolicy::Warn;
+        m.index_history_policy_explicit = true;
+
+        let text = format_manifest(&m);
+        assert!(text.contains("index-history \"warn\""), "missing explicit index-history node:\n{text}");
+
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Package(p) => p,
+            other => panic!("expected package, got {other:?}"),
+        };
+        assert_eq!(reparsed.index_history_policy, m.index_history_policy);
+        assert_eq!(reparsed.index_history_policy_explicit, m.index_history_policy_explicit);
+    }
+
+    #[test]
+    fn workspace_manifest_index_history_strict_round_trips() {
+        let mut ws = crate::Workspace {
+            name: Some("my-ws".into()),
+            members: vec!["member-a".into()],
+            overrides: Vec::new(),
+            flags: Vec::new(),
+            ..Default::default()
+        };
+        ws.index_history_policy = crate::TrustPolicy::Strict;
+        ws.index_history_policy_explicit = true;
+
+        let text = format_workspace_manifest(&ws);
+        assert!(text.contains("index-history \"strict\""), "missing index-history node:\n{text}");
+
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Workspace(w) => w,
+            other => panic!("expected workspace, got {other:?}"),
+        };
+        assert_eq!(reparsed.index_history_policy, ws.index_history_policy);
+        assert_eq!(reparsed.index_history_policy_explicit, ws.index_history_policy_explicit);
+        assert_eq!(reparsed, ws);
+    }
+
+    /// Flip side: a workspace that never declared `index-history` at all
+    /// must NOT gain one on round-trip (absent-stays-absent).
+    #[test]
+    fn workspace_manifest_without_index_history_stays_absent() {
+        let ws = crate::Workspace {
+            name: Some("my-ws".into()),
+            members: vec!["member-a".into()],
+            overrides: Vec::new(),
+            flags: Vec::new(),
+            ..Default::default()
+        };
+        let text = format_workspace_manifest(&ws);
+        assert!(!text.contains("index-history"), "must not fabricate an index-history node:\n{text}");
+
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Workspace(w) => w,
+            other => panic!("expected workspace, got {other:?}"),
+        };
+        assert!(!reparsed.index_history_policy_explicit);
+    }
+
+    // A workspace member manifest declaring `index-history` must raise
+    // `WS-INDEX-HISTORY-ON-MEMBER` — proven at the `milpa-core` workspace-load
     // layer (`workspace_tests.rs`), not here; this crate only proves the
     // per-manifest parse/format round-trip.
 }

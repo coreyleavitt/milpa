@@ -164,6 +164,33 @@ pub struct IndexVersion {
     /// gate can build the exact `pkg:tianguis/<namespace>/<name>@<version>`
     /// subject coordinate (§1) for a bare-name dep.
     pub namespace: String,
+    /// A2a (registry-protocol §3.2 "published_at"): ISO 8601 publication
+    /// timestamp, parse-to-typed. `None` when absent OR malformed — a
+    /// malformed value MUST NOT raise (the parser's ordinary optional-scalar
+    /// robustness posture). Also the SET_ONCE input the A3 ratchet compares
+    /// (`ratchet.rs`); the DIGEST-relevant raw served string is captured
+    /// separately by [`raw_published_at`] (never derived from this typed
+    /// value, which does not round-trip losslessly to source text).
+    pub published_at: Option<Timestamp>,
+    /// A2a (registry-protocol §3.2 "Yank triple"): defaults to `false`. A
+    /// malformed (non-boolean) value MUST NOT raise — surfaced as the
+    /// default.
+    pub yanked: bool,
+    /// A2a: ISO 8601 timestamp of the yank, or `None` when absent/malformed.
+    pub yanked_at: Option<Timestamp>,
+    /// A2a: free-text yank explanation, or `None` when absent.
+    pub yanked_reason: Option<String>,
+    /// A3 (`rfc-registry-append-only.md`): the RAW served text of the
+    /// `published_at` child argument, exactly as it appears in the document
+    /// — never derived from `published_at` above (whose typed
+    /// representation does not round-trip losslessly to source text, e.g. a
+    /// `Z`-suffixed offset). `None` iff the child node is absent (mirrors
+    /// `published_at`'s own absence, regardless of whether the raw text
+    /// happened to be malformed — a malformed-but-present raw string is
+    /// still the digest-relevant "value exactly as served"). Consumed only
+    /// by `ratchet.rs`'s canonical-digest seam; not part of the type's
+    /// public equality contract for any other purpose.
+    pub published_at_raw: Option<String>,
 }
 
 /// A package: a `(namespace, name)` identity plus its versions (newest-first).
@@ -534,6 +561,16 @@ fn parse_version_node(
     }
     let (attestation, diagnostics) = parse_entry_attestation(namespace, pkg_name, ver, node);
 
+    // A2a (registry-protocol §3.2 "published_at" / "Yank triple"): parse-to-
+    // typed, malformed -> None/default, never a hard error.
+    let published_at_raw = child_arg_str(node, "published_at");
+    let published_at = published_at_raw.as_deref().and_then(parse_iso8601_timestamp);
+    let yanked = child_arg_bool(node, "yanked").unwrap_or(false);
+    let yanked_at = child_arg_str(node, "yanked_at")
+        .as_deref()
+        .and_then(parse_iso8601_timestamp);
+    let yanked_reason = child_arg_str(node, "yanked_reason");
+
     Ok((
         IndexVersion {
             version: ver.to_string(),
@@ -545,9 +582,137 @@ fn parse_version_node(
             // P3a: the enclosing Package's real namespace (always populated,
             // even for bare/unqualified index entries — namespace "" then).
             namespace: namespace.to_string(),
+            published_at,
+            yanked,
+            yanked_at,
+            yanked_reason,
+            published_at_raw,
         },
         diagnostics,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// A2a timestamp parsing (registry-protocol §3.2) — no external date crate:
+// the ratchet engine (`ratchet.rs`) only needs EQUALITY over this type (the
+// set-once dominance check), never arithmetic or formatting, so a minimal
+// hand-rolled ISO-8601/RFC-3339 parser normalizing to a UTC instant is
+// sufficient and keeps milpa-core dep-light. Mirrors Python's
+// `_parse_timestamp` (`datetime.fromisoformat`): malformed input -> `None`,
+// never an error.
+// ---------------------------------------------------------------------------
+
+/// A parsed timestamp, normalized to a UTC instant: seconds since the Unix
+/// epoch plus a sub-second nanosecond remainder. `Eq`-able (no floats) so it
+/// can ride `IndexVersion`'s derived `PartialEq + Eq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timestamp {
+    pub unix_seconds: i64,
+    pub nanos: u32,
+}
+
+/// Parse `YYYY-MM-DDTHH:MM:SS[.fraction][Z|±HH:MM]` (`T` may also be a space
+/// or lowercase `t`; an absent offset is treated as UTC). Returns `None` on
+/// any malformed input — the caller's absence posture, never a raised error.
+pub fn parse_iso8601_timestamp(raw: &str) -> Option<Timestamp> {
+    let bytes = raw.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let digit = |i: usize| -> Option<i64> {
+        bytes.get(i).filter(|b| b.is_ascii_digit()).map(|b| (*b - b'0') as i64)
+    };
+    let two = |i: usize| -> Option<i64> { Some(digit(i)? * 10 + digit(i + 1)?) };
+    let four = |i: usize| -> Option<i64> {
+        Some(digit(i)? * 1000 + digit(i + 1)? * 100 + digit(i + 2)? * 10 + digit(i + 3)?)
+    };
+
+    let year = four(0)?;
+    if bytes.get(4) != Some(&b'-') {
+        return None;
+    }
+    let month = two(5)?;
+    if bytes.get(7) != Some(&b'-') {
+        return None;
+    }
+    let day = two(8)?;
+    match bytes.get(10) {
+        Some(b'T') | Some(b't') | Some(b' ') => {}
+        _ => return None,
+    }
+    let hour = two(11)?;
+    if bytes.get(13) != Some(&b':') {
+        return None;
+    }
+    let minute = two(14)?;
+    if bytes.get(16) != Some(&b':') {
+        return None;
+    }
+    let second = two(17)?;
+
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=60).contains(&second) {
+        return None;
+    }
+
+    let mut idx = 19;
+    let mut nanos: u32 = 0;
+    if matches!(bytes.get(idx), Some(b'.') | Some(b',')) {
+        idx += 1;
+        let start = idx;
+        while bytes.get(idx).is_some_and(u8::is_ascii_digit) {
+            idx += 1;
+        }
+        if idx == start {
+            return None; // "." with no digits following
+        }
+        let frac = &raw[start..idx];
+        let mut digits: String = frac.chars().take(9).collect();
+        while digits.len() < 9 {
+            digits.push('0');
+        }
+        nanos = digits.parse().ok()?;
+    }
+
+    let offset_seconds: i64 = match bytes.get(idx) {
+        None => 0, // naive: treated as UTC
+        Some(b'Z') | Some(b'z') => {
+            idx += 1;
+            0
+        }
+        Some(sign @ (b'+' | b'-')) => {
+            let sign_mult: i64 = if *sign == b'+' { 1 } else { -1 };
+            let oh = two(idx + 1)?;
+            if bytes.get(idx + 3) != Some(&b':') {
+                return None;
+            }
+            let om = two(idx + 4)?;
+            if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
+                return None;
+            }
+            idx += 6;
+            sign_mult * (oh * 3600 + om * 60)
+        }
+        _ => return None,
+    };
+    if idx != bytes.len() {
+        return None; // trailing garbage
+    }
+
+    let days = days_from_civil(year, month as u32, day as u32);
+    let unix_seconds = days * 86400 + hour * 3600 + minute * 60 + second - offset_seconds;
+    Some(Timestamp { unix_seconds, nanos })
+}
+
+/// Howard Hinnant's `days_from_civil` — days since the Unix epoch
+/// (1970-01-01) for a proleptic-Gregorian civil date. `m` is 1-12.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (i64::from(m) + 9) % 12; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719468
 }
 
 /// Parse the `attestation`/`signed_by`/`rekor`/`bundle` sibling child nodes of
@@ -702,6 +867,23 @@ fn child_arg_i64(node: &KdlNode, child_name: &str) -> Option<i64> {
                 .find(|e| e.name().is_none())
                 .and_then(|e| e.value().as_integer())
                 .and_then(|v| i64::try_from(v).ok())
+        })
+}
+
+/// First positional arg (boolean) of `node`'s child named `child_name`, or
+/// `None` when the child is absent or its first arg is not a boolean
+/// (registry-protocol §3.2 — `yanked`'s robustness posture: a malformed
+/// value MUST NOT raise, it surfaces as absent).
+fn child_arg_bool(node: &KdlNode, child_name: &str) -> Option<bool> {
+    children(node)
+        .into_iter()
+        .find(|c| c.name().value() == child_name)
+        .and_then(|child| {
+            child
+                .entries()
+                .iter()
+                .find(|e| e.name().is_none())
+                .and_then(|e| e.value().as_bool())
         })
 }
 

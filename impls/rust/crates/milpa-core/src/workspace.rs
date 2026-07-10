@@ -177,6 +177,12 @@ pub struct LoadedWorkspace {
     /// are structurally forbidden from declaring it; see
     /// [`check_member_entry_trust_declarations`]).
     pub entry_trust_policy: milpa_manifest::TrustPolicy,
+    /// A3 (rfc-registry-append-only.md §2): the workspace ROOT's own
+    /// `index-history` value — same root-authority model as index-trust /
+    /// entry-trust: this IS the effective policy for the whole workspace
+    /// invocation (members are structurally forbidden from declaring it; see
+    /// [`check_member_index_history_declarations`]).
+    pub index_history_policy: milpa_manifest::TrustPolicy,
 }
 
 /// Load and structurally validate the workspace at `root`.
@@ -308,6 +314,7 @@ pub fn load_workspace(root: &Path) -> Result<LoadedWorkspace, MilpaError> {
     // load_workspace_from_manifest.
     check_member_index_trust_declarations(&members)?;
     check_member_entry_trust_declarations(&members)?;
+    check_member_index_history_declarations(&members)?;
 
     Ok(LoadedWorkspace {
         root: root.to_path_buf(),
@@ -318,6 +325,7 @@ pub fn load_workspace(root: &Path) -> Result<LoadedWorkspace, MilpaError> {
         index_trust_signer: parsed.index_trust_signer,
         index_trust_bundle: parsed.index_trust_bundle,
         entry_trust_policy: parsed.entry_trust_policy,
+        index_history_policy: parsed.index_history_policy,
     })
 }
 
@@ -419,6 +427,7 @@ pub fn load_workspace_from_manifest(
     // S8: same root-authority validation as load_workspace() — see there.
     check_member_index_trust_declarations(&members)?;
     check_member_entry_trust_declarations(&members)?;
+    check_member_index_history_declarations(&members)?;
 
     Ok(LoadedWorkspace {
         root: root.to_path_buf(),
@@ -429,6 +438,7 @@ pub fn load_workspace_from_manifest(
         index_trust_signer: parsed.index_trust_signer.clone(),
         index_trust_bundle: parsed.index_trust_bundle.clone(),
         entry_trust_policy: parsed.entry_trust_policy.clone(),
+        index_history_policy: parsed.index_history_policy.clone(),
     })
 }
 
@@ -495,6 +505,7 @@ pub fn load_workspace_with_member_override(
     // declaration, so re-validate the full member list here too.
     check_member_index_trust_declarations(&new_members)?;
     check_member_entry_trust_declarations(&new_members)?;
+    check_member_index_history_declarations(&new_members)?;
 
     Ok(LoadedWorkspace {
         root: workspace.root.clone(),
@@ -505,6 +516,7 @@ pub fn load_workspace_with_member_override(
         index_trust_signer: workspace.index_trust_signer.clone(),
         index_trust_bundle: workspace.index_trust_bundle.clone(),
         entry_trust_policy: workspace.entry_trust_policy.clone(),
+        index_history_policy: workspace.index_history_policy.clone(),
     })
 }
 
@@ -575,6 +587,42 @@ pub fn check_member_entry_trust_declarations(
                 "WS-ENTRY-TRUST-ON-MEMBER",
                 format!(
                     "entry-trust is a workspace-root policy; declare it in the \
+                     workspace root manifest, not in member {:?}",
+                    member.path
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// A3: workspace index-history root-authority validation
+// (rfc-registry-append-only.md §2)
+// ---------------------------------------------------------------------------
+
+/// Raise `WS-INDEX-HISTORY-ON-MEMBER` if any workspace member declares
+/// `index-history`.
+///
+/// index-history is a workspace-ROOT policy (rfc-registry-append-only.md
+/// §2): one shared baseline per effective index URL, one ratchet posture —
+/// mirrors [`check_member_entry_trust_declarations`] for the sibling
+/// entry-trust axis.
+///
+/// Fires even when a member's declared `index-history` value matches the
+/// default (`warn`) — the rule is about WHERE the field is declared, not
+/// what value it holds, so `Manifest::index_history_policy_explicit` (not
+/// just a non-default value) is what triggers this check. Mirrors
+/// `workspace.py:_check_member_index_history_declarations`.
+pub fn check_member_index_history_declarations(
+    members: &[LoadedMember],
+) -> Result<(), MilpaError> {
+    for member in members {
+        if member.manifest.index_history_policy_explicit {
+            return Err(ws(
+                "WS-INDEX-HISTORY-ON-MEMBER",
+                format!(
+                    "index-history is a workspace-root policy; declare it in the \
                      workspace root manifest, not in member {:?}",
                     member.path
                 ),

@@ -158,9 +158,20 @@ verified index is a valid *successor* of the previous one. Freshness
       (defensible reading, flagged). NOTE: agent violated NO-GIT once
       (stash/pop, recovered clean, disclosed). 24 tests. Gates: pytest
       2849 + rust-conformance green.
-- [ ] A3 — Rust parity: ONE seam (`load_index` folds recovery via
-      `is_recovery` — no second function); PartialEq/Eq already derived;
-      drop DEFERRED.
+- [x] A3 (2026-07-10) — Rust parity for A2a–A2e complete: ratchet.rs
+      (30 tests, Python digest vectors ported VERBATIM — byte equality),
+      index_ratchet_seam.rs (simpler: IndexVersion carries published_at_raw
+      so no re-walk), registry.rs typed parse + hand-rolled ISO-8601,
+      index-history axis + WS check, load_index_with_history (single
+      is_recovery seam, ~35 call sites untouched via Off-default wrapper),
+      unique temp names for ALL sidecar writes, full index status/accept
+      verbs byte-exact; all 7 slugs live; DEFERRED emptied. ⚠ A4b
+      MUST-RESOLVE: provenance-violation digest fallback rendering is
+      impl-specific (Python str(value) repr vs Rust rendering) — the spec
+      pins raw-as-served only for document strings; any provenance-removed
+      differential fixture will force a normative rendering definition +
+      both-impl alignment (spec sharpening belongs to A4b). Gates: rust
+      workspace + conformance + pytest 2849 all green.
 - [ ] A4a — harness seeding, asymmetric: Python extends
       `_execute_index_trust_fixture` (NOT `_build_env`); **A4a-rs** builds
       the Rust cache-exercising runner path from scratch (today it feeds

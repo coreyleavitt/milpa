@@ -280,6 +280,18 @@ pub struct Manifest {
     /// "warn"` must still raise `WS-ENTRY-TRUST-ON-MEMBER` even though the
     /// value matches the default.
     pub entry_trust_policy_explicit: bool,
+    /// A3 (rfc-registry-append-only.md §2; registry-protocol §3.5.2): the
+    /// append-only consumer ratchet's policy axis from `index-history
+    /// "warn"|"strict"|"off"` (default: warn). Root-scoped like
+    /// `index_trust_policy`/`entry_trust_policy` — one shared baseline per
+    /// effective index URL, not per member.
+    pub index_history_policy: TrustPolicy,
+    /// `true` iff the source declared an `index-history` node explicitly
+    /// (absent-stays-absent, mirrors `entry_trust_policy_explicit`). A
+    /// workspace MEMBER manifest that explicitly declares `index-history
+    /// "warn"` must still raise `WS-INDEX-HISTORY-ON-MEMBER` even though the
+    /// value matches the default.
+    pub index_history_policy_explicit: bool,
     /// S7: flag names that were auto-injected by optional-dep desugaring.
     /// `format_manifest` skips these from the `flags {}` block (they're implied
     /// by `optional=#true` on the dep; serializing them would cause a re-parse clash).
@@ -333,6 +345,14 @@ pub struct Workspace {
     /// `true` iff the source declared an `entry-trust` node (absent-stays-
     /// absent rule, mirrors `Manifest::entry_trust_policy_explicit`).
     pub entry_trust_policy_explicit: bool,
+    /// A3 (rfc-registry-append-only.md §2): index-history, declared ONLY on
+    /// the resolution root — same root-authority model as index-trust /
+    /// entry-trust. A member manifest declaring it raises
+    /// `WS-INDEX-HISTORY-ON-MEMBER` at workspace-load time (`workspace.rs`).
+    pub index_history_policy: TrustPolicy,
+    /// `true` iff the source declared an `index-history` node (absent-stays-
+    /// absent rule, mirrors `Manifest::index_history_policy_explicit`).
+    pub index_history_policy_explicit: bool,
 }
 
 /// The two disjoint manifest roles (grammar §1). Detected by the presence of a
@@ -600,6 +620,8 @@ const PACKAGE_TOP_LEVEL: &[&str] = &[
     "index-trust-bundle",
     // P3a (RFC per-entry-attestation.md §4): per-entry attestation gate.
     "entry-trust",
+    // A3 (rfc-registry-append-only.md §2): the append-only consumer ratchet.
+    "index-history",
 ];
 const WORKSPACE_TOP_LEVEL: &[&str] = &[
     "workspace",
@@ -612,6 +634,8 @@ const WORKSPACE_TOP_LEVEL: &[&str] = &[
     "index-trust-bundle",
     // P3a: per-entry attestation gate, legal ONLY on the workspace root.
     "entry-trust",
+    // A3: the append-only consumer ratchet, legal ONLY on the workspace root.
+    "index-history",
 ];
 
 // ---------------------------------------------------------------------------
@@ -874,6 +898,23 @@ fn parse_entry_trust_node(node: &KdlNode) -> Result<TrustPolicy, ManifestError> 
     parse_trust_policy(val.unwrap(), "entry-trust").map_err(|e| err("MAN-UNKNOWN-TOP-LEVEL", e))
 }
 
+/// Shared parser for the `index-history "<policy>"` node (package and
+/// workspace-root manifests both accept it). A3 (rfc-registry-append-only.md
+/// §2): shares the `TrustPolicy` type + `parse_trust_policy` mechanism with
+/// entry-trust / index-trust / attestation-policy, on its own axis.
+fn parse_index_history_node(node: &KdlNode) -> Result<TrustPolicy, ManifestError> {
+    let a = args(node);
+    let val = a.first().and_then(|e| e.value().as_string());
+    if a.len() != 1 || val.is_none() {
+        return Err(err(
+            "MAN-UNKNOWN-TOP-LEVEL",
+            "'index-history' takes exactly one string argument \
+             ('warn', 'strict', or 'off')",
+        ));
+    }
+    parse_trust_policy(val.unwrap(), "index-history").map_err(|e| err("MAN-UNKNOWN-TOP-LEVEL", e))
+}
+
 fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
     let mut members: Vec<String> = Vec::new();
     let mut overrides: Vec<Override> = Vec::new();
@@ -888,6 +929,9 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
     // P3a (RFC per-entry-attestation.md §4): root-authority entry-trust field.
     let mut ws_entry_trust_policy = TrustPolicy::Warn;
     let mut ws_entry_trust_policy_explicit = false;
+    // A3 (rfc-registry-append-only.md §2): root-authority index-history field.
+    let mut ws_index_history_policy = TrustPolicy::Warn;
+    let mut ws_index_history_policy_explicit = false;
 
     for node in doc.nodes() {
         match node.name().value() {
@@ -918,6 +962,11 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
                 // P3a (RFC per-entry-attestation.md §4): root-authority policy.
                 ws_entry_trust_policy = parse_entry_trust_node(node)?;
                 ws_entry_trust_policy_explicit = true;
+            }
+            "index-history" => {
+                // A3 (rfc-registry-append-only.md §2): root-authority policy.
+                ws_index_history_policy = parse_index_history_node(node)?;
+                ws_index_history_policy_explicit = true;
             }
             "workspace" => {
                 for child in children(node) {
@@ -1000,6 +1049,8 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
         index_trust_policy_explicit: ws_index_trust_policy_explicit,
         entry_trust_policy: ws_entry_trust_policy,
         entry_trust_policy_explicit: ws_entry_trust_policy_explicit,
+        index_history_policy: ws_index_history_policy,
+        index_history_policy_explicit: ws_index_history_policy_explicit,
     })
 }
 
@@ -1145,6 +1196,9 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
     // P3a (RFC per-entry-attestation.md §4): entry-trust node.
     let mut entry_trust_policy = TrustPolicy::Warn;
     let mut entry_trust_policy_explicit = false;
+    // A3 (rfc-registry-append-only.md §2): index-history node.
+    let mut index_history_policy = TrustPolicy::Warn;
+    let mut index_history_policy_explicit = false;
 
     // S5b: seen_names key is the solver variable (namespace::name or bare name),
     // so two qualified deps with the same bare name but different namespaces
@@ -1315,6 +1369,11 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
                 entry_trust_policy = parse_entry_trust_node(node)?;
                 entry_trust_policy_explicit = true;
             }
+            "index-history" => {
+                // A3: the append-only consumer ratchet policy (RFC §2).
+                index_history_policy = parse_index_history_node(node)?;
+                index_history_policy_explicit = true;
+            }
             "workspace" => {
                 return Err(err(
                     "MAN-WORKSPACE-IN-PACKAGE",
@@ -1453,6 +1512,8 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
         index_trust_policy_explicit,
         entry_trust_policy,
         entry_trust_policy_explicit,
+        index_history_policy,
+        index_history_policy_explicit,
         optional_auto_flags,
     })
 }

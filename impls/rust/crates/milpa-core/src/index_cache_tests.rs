@@ -1087,3 +1087,134 @@ fn strict_transport_error_returns_bundle_missing_slug() {
         "index must NOT be written when strict + transport error (spec §7.2)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A3 (rfc-registry-append-only.md §2): the append-only ratchet wired into
+// load_index_with_history. No trust gate (config=None) — the ratchet's
+// index-history axis is orthogonal to index-trust.
+// ---------------------------------------------------------------------------
+
+const INDEX2: &str = "schema_version 1\npackage \"bar\" {\n    version \"1.0.0\" {\n        content_hash \"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n    }\n}\n";
+const INDEX1: &str = "schema_version 1\npackage \"bar\" {\n    version \"1.0.0\" {\n        content_hash \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n    }\n}\n";
+
+fn load_with_history(
+    url: &str,
+    cache_dir: &std::path::Path,
+    http_get: HttpGet<'_>,
+    now: u64,
+    refresh: bool,
+    policy: &TrustPolicy,
+) -> Result<Index, MilpaError> {
+    load_index_with_history(url, cache_dir, http_get, DEFAULT_TTL_SECONDS, now, None, None, None, refresh, policy)
+}
+
+#[test]
+fn a3_first_fetch_establishes_tofu_baseline() {
+    let d = tmp();
+    let get = |_: &str| Ok(INDEX1.as_bytes().to_vec());
+    let result = load_with_history(URL, d.path(), &get, 1000, false, &TrustPolicy::Warn);
+    assert!(result.is_ok());
+
+    let cache_file = cache_path_for(URL, d.path());
+    assert!(baseline_path(&cache_file).exists(), "TOFU must write the baseline sidecar");
+    assert!(baseline_meta_path(&cache_file).exists(), "TOFU must write .baseline.meta");
+    let baseline_bytes = std::fs::read(baseline_path(&cache_file)).unwrap();
+    assert_eq!(baseline_bytes, INDEX1.as_bytes());
+}
+
+#[test]
+fn a3_off_policy_never_writes_baseline() {
+    let d = tmp();
+    let get = |_: &str| Ok(INDEX1.as_bytes().to_vec());
+    let result = load_with_history(URL, d.path(), &get, 1000, false, &TrustPolicy::Off);
+    assert!(result.is_ok());
+    let cache_file = cache_path_for(URL, d.path());
+    assert!(!baseline_path(&cache_file).exists(), "off policy must never write a baseline");
+}
+
+#[test]
+fn a3_clean_refetch_advances_baseline_to_new_bytes() {
+    let d = tmp();
+    // First fetch: TOFU with INDEX1.
+    let get1 = |_: &str| Ok(INDEX1.as_bytes().to_vec());
+    load_with_history(URL, d.path(), &get1, 1000, false, &TrustPolicy::Warn).unwrap();
+
+    // Refetch (forced) with an appended-but-compatible INDEX1 (same bytes = clean diff).
+    let get2 = |_: &str| Ok(INDEX1.as_bytes().to_vec());
+    let result = load_with_history(URL, d.path(), &get2, 2000, true, &TrustPolicy::Warn);
+    assert!(result.is_ok());
+    let cache_file = cache_path_for(URL, d.path());
+    let baseline_bytes = std::fs::read(baseline_path(&cache_file)).unwrap();
+    assert_eq!(baseline_bytes, INDEX1.as_bytes());
+}
+
+#[test]
+fn a3_strict_dirty_refetch_hard_fails_no_cache_mutation_at_all() {
+    let d = tmp();
+    // First fetch: TOFU with INDEX1 (content_hash = aaa...).
+    let get1 = |_: &str| Ok(INDEX1.as_bytes().to_vec());
+    load_with_history(URL, d.path(), &get1, 1000, false, &TrustPolicy::Strict).unwrap();
+
+    let cache_file = cache_path_for(URL, d.path());
+    let index_bytes_before = std::fs::read(&cache_file).unwrap();
+    let stamp_before = std::fs::read_to_string(cache_file.with_extension("kdl.at")).unwrap();
+    let baseline_before = std::fs::read(baseline_path(&cache_file)).unwrap();
+
+    // Forced refetch with a MUTATED content_hash (content_hash = bbb...) — a
+    // frozen-field violation under Strict.
+    let get2 = |_: &str| Ok(INDEX2.as_bytes().to_vec());
+    let err = load_with_history(URL, d.path(), &get2, 2000, true, &TrustPolicy::Strict).unwrap_err();
+    assert_eq!(err.code(), "TNG-ENTRY-MUTATED");
+
+    // No cache mutation at all (index, stamp, baseline all byte-identical to before).
+    assert_eq!(std::fs::read(&cache_file).unwrap(), index_bytes_before);
+    assert_eq!(std::fs::read_to_string(cache_file.with_extension("kdl.at")).unwrap(), stamp_before);
+    assert_eq!(std::fs::read(baseline_path(&cache_file)).unwrap(), baseline_before);
+}
+
+#[test]
+fn a3_warn_dirty_refetch_serves_new_index_but_baseline_stays_sticky() {
+    let d = tmp();
+    let get1 = |_: &str| Ok(INDEX1.as_bytes().to_vec());
+    load_with_history(URL, d.path(), &get1, 1000, false, &TrustPolicy::Warn).unwrap();
+
+    let cache_file = cache_path_for(URL, d.path());
+    let baseline_before = std::fs::read(baseline_path(&cache_file)).unwrap();
+
+    let get2 = |_: &str| Ok(INDEX2.as_bytes().to_vec());
+    let result = load_with_history(URL, d.path(), &get2, 2000, true, &TrustPolicy::Warn);
+    assert!(result.is_ok(), "warn must serve the new index, not hard-fail");
+
+    // Served cache advances to the new bytes...
+    assert_eq!(std::fs::read(&cache_file).unwrap(), INDEX2.as_bytes());
+    // ...but the ratchet baseline is sticky — unchanged.
+    assert_eq!(std::fs::read(baseline_path(&cache_file)).unwrap(), baseline_before);
+}
+
+#[test]
+fn a3_baseline_corrupt_maps_to_baseline_corrupt_regardless_of_policy() {
+    let d = tmp();
+    let get1 = |_: &str| Ok(INDEX1.as_bytes().to_vec());
+    load_with_history(URL, d.path(), &get1, 1000, false, &TrustPolicy::Warn).unwrap();
+    let cache_file = cache_path_for(URL, d.path());
+    // Corrupt the baseline sidecar directly.
+    std::fs::write(baseline_path(&cache_file), b"not kdl {{{").unwrap();
+
+    let get2 = |_: &str| Ok(INDEX1.as_bytes().to_vec());
+    let err = load_with_history(URL, d.path(), &get2, 2000, true, &TrustPolicy::Warn).unwrap_err();
+    assert_eq!(err.code(), "TNG-INDEX-BASELINE-CORRUPT");
+}
+
+#[test]
+fn a3_write_baseline_pair_atomic_swap_for_accept_verb() {
+    let d = tmp();
+    let meta = BaselineMeta {
+        established_at: Some("2026-01-01T00:00:00+00:00".to_string()),
+        reported_digest: None,
+        reported_at: None,
+    };
+    write_baseline_pair(URL, d.path(), INDEX1.as_bytes(), &meta).unwrap();
+    let (baseline_p, meta_p) = baseline_sidecar_paths(URL, d.path());
+    assert_eq!(std::fs::read(&baseline_p).unwrap(), INDEX1.as_bytes());
+    assert!(std::fs::read_to_string(&meta_p).unwrap().contains("established_at"));
+}

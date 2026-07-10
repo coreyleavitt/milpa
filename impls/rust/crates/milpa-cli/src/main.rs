@@ -13,27 +13,31 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use milpa_core::{
-    add_mirror, apply_workspace_manifest_change, build_flag_defines, check_frozen_active_flags_mismatch,
+    add_mirror, apply_workspace_manifest_change, baseline_sidecar_paths, build_flag_defines,
+    build_index_state, canonical_digest, check_frozen_active_flags_mismatch,
     check_workspace_frozen_active_flags_mismatch,
     dep_decl_store::DepDeclStore, discover_manifest, effective_trust_policy,
-    fetch::{FetchError, FetcherRegistry}, format_nimcfg, format_workspace_nimcfgs, from_graph,
-    load_index, load_lockfile, load_manifest, load_workspace,
+    fetch::{FetchError, FetcherRegistry}, fetch_verified_candidate_text, format_nimcfg,
+    format_workspace_nimcfgs, from_graph, index_url_from_env, iso_timestamp,
+    load_index_with_history, load_lockfile, load_manifest, load_workspace,
+    parse_baseline, parse_baseline_meta, print_yank_notice,
     LoadedMember, LoadedWorkspace,
     make_dep_decl_store, mutate_manifest_file, parse_env_bool, parse_lockfile, parse_source_spec,
     parse_version,
     resolve, resolve_with_cert, resolve_with_features, resolve_workspace_frozen,
     resolve_workspace_with_cert, resolve_workspace_with_features,
-    verify_lockfile_against_deps, workspace_any_member_strict, write_lockfile, CaStore,
+    verify_lockfile_against_deps, workspace_any_member_strict, write_baseline_pair, write_lockfile,
+    Baseline, BaselineMeta, CaStore,
     CasAdmittingFetcher, CoreError, DefaultRegistry, FailureCert, FileDepDeclStore,
     FrozenResolver, Index, ManifestDoc, Milpa, MilpaError, MockedFetcher, Profile,
-    ProvenanceRecord, Strategy, SuccessCert, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS,
+    ProvenanceRecord, RatchetOutcome, Strategy, SuccessCert, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS,
 };
 use milpa_manifest::{valid_flag_name, Dep, FlagRequest, Manifest, OverrideTarget, UrlDep, Workspace};
 
 const VERSION: &str = "0.1.0";
 
 const USAGE: &str = "usage: milpa [-C <dir>] [-j <N>] [-s <mode>] [--frozen] \
-[--no-index] [--certificate <path>] <fetch|lock|show|verify|clean|add|remove|update|hash> [args]";
+[--no-index] [--certificate <path>] <fetch|lock|show|verify|clean|add|remove|update|workspace|store|index|hash> [args]";
 
 fn main() {
     // Gap-1 R4: catch any Rust panic, emit a human line + the machine-readable
@@ -145,6 +149,7 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
         "remove" => cmd_remove(dir, cli.strategy, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index),
         "store" => cmd_store(&cli.rest),
         "workspace" => cmd_workspace(dir, &cli.rest, cli.strategy, cli.no_index, cli.require_attested_index, cli.refresh_index),
+        "index" => cmd_index(dir, &cli.rest, cli.no_index, cli.require_attested_index),
         "hash" => cmd_hash(&cli.rest, dir),
         other => {
             // Gap-1 §3: unknown verb is a usage error → exit 2 (no milpa-error: line).
@@ -449,12 +454,16 @@ fn cmd_verify(
     // P3a (RFC per-entry-attestation.md §7): captured alongside the index-trust
     // fields for the offline entry-attestation reverify below.
     let mut verify_entry_trust_policy = milpa_manifest::TrustPolicy::Warn;
+    // A3 (rfc-registry-append-only.md §2): captured alongside the other
+    // policy axes for the dep_decl edge check's maybe_index() call below.
+    let mut verify_index_history_policy = milpa_manifest::TrustPolicy::Warn;
     match discover_manifest(dir) {
         Ok(milpa_manifest::ManifestDoc::Package(ref manifest)) => {
             verify_index_policy = manifest.index_trust_policy.clone();
             verify_index_signer = manifest.index_trust_signer.clone();
             verify_index_bundle = manifest.index_trust_bundle.clone();
             verify_entry_trust_policy = manifest.entry_trust_policy.clone();
+            verify_index_history_policy = manifest.index_history_policy.clone();
             if let Err(e) = check_frozen_active_flags_mismatch(
                 manifest,
                 &lock,
@@ -483,6 +492,7 @@ fn cmd_verify(
             verify_index_signer = s;
             verify_index_bundle = b;
             verify_entry_trust_policy = ws.entry_trust_policy.clone();
+            verify_index_history_policy = ws.index_history_policy.clone();
             if let Err(e) = check_workspace_frozen_active_flags_mismatch(
                 &ws,
                 &lock,
@@ -595,7 +605,8 @@ fn cmd_verify(
         // Determine online state: MILPA_INDEX_URL must be set.
         // maybe_index() returns None when offline/unreachable (treats as absent).
         // Pass verify_index_policy (captured above from manifest) and the threaded flags.
-        let index_opt = maybe_index(no_index, &verify_index_policy, verify_index_signer, verify_index_bundle, require_attested_index, refresh_index)?;
+        let verify_history_policy = effective_index_history_policy(&verify_index_history_policy);
+        let index_opt = maybe_index(no_index, &verify_index_policy, verify_index_signer, verify_index_bundle, require_attested_index, refresh_index, &verify_history_policy)?;
         if index_opt.is_none() {
             // Offline / unreachable.
             if strict {
@@ -2359,6 +2370,32 @@ fn read_env_index_trust_policy() -> Option<milpa_manifest::TrustPolicy> {
     })
 }
 
+/// Read `MILPA_INDEX_HISTORY` env var as a `TrustPolicy`. Returns `None` if
+/// unset or unrecognized. Mirrors `read_env_index_trust_policy` /
+/// `read_env_entry_trust_policy` for the A3 (`rfc-registry-append-only.md`
+/// §2) index-history axis.
+fn read_env_index_history_policy() -> Option<milpa_manifest::TrustPolicy> {
+    use milpa_manifest::TrustPolicy;
+    std::env::var("MILPA_INDEX_HISTORY").ok().and_then(|v| match v.trim() {
+        "strict" => Some(TrustPolicy::Strict),
+        "warn" => Some(TrustPolicy::Warn),
+        "off" => Some(TrustPolicy::Off),
+        _ => None,
+    })
+}
+
+/// A3 (`rfc-registry-append-only.md` §2; registry-protocol §3.4.0/§3.5.2):
+/// the effective `index-history` policy — manifest field + `MILPA_INDEX_HISTORY`
+/// env layering through the shared `effective_trust_policy` SSOT (the SAME
+/// authority formula `index-trust`/`entry-trust` use). Unlike those two axes,
+/// no CLI flag escalates this axis (cli-contract.md §8.7 defines none), so
+/// `flag` is always `false`.
+fn effective_index_history_policy(manifest_policy: &milpa_manifest::TrustPolicy) -> milpa_manifest::TrustPolicy {
+    use milpa_core::effective_trust_policy;
+    let env_policy = read_env_index_history_policy();
+    effective_trust_policy(manifest_policy, false, env_policy.as_ref())
+}
+
 /// Resolve the manifest-level index-trust `(policy, signer, bundle)` for `dir`.
 ///
 /// This is the SSOT trust-field resolution-root helper (RD-M4 code-review
@@ -2403,6 +2440,7 @@ fn resolve_index_trust_fields(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn maybe_index(
     no_index: bool,
     manifest_policy: &milpa_manifest::TrustPolicy,
@@ -2410,6 +2448,7 @@ fn maybe_index(
     manifest_bundle: Option<String>,
     require_attested_index: bool,
     refresh_index: bool,
+    index_history_policy: &milpa_manifest::TrustPolicy,
 ) -> Result<Option<Index>, MilpaError> {
     // --no-index flag OR present-but-empty MILPA_INDEX_URL → explicitly no
     // index (the flag overrides any configured index). Absent → default URL.
@@ -2446,7 +2485,7 @@ fn maybe_index(
     use milpa_core::BundleHttpGet;
     let gate = build_index_trust_gate(manifest_policy, manifest_signer, manifest_bundle, require_attested_index, &url)?;
     match gate {
-        None => load_index_raw(&url, &http, now, None, None, None, refresh_index),
+        None => load_index_raw(&url, &http, now, None, None, None, refresh_index, index_history_policy),
         Some(active) => load_index_raw(
             &url,
             &http,
@@ -2455,6 +2494,7 @@ fn maybe_index(
             Some(active.verifier.as_ref()),
             Some(active.bundle_fn.as_ref() as BundleHttpGet<'_>),
             refresh_index,
+            index_history_policy,
         ),
     }
 }
@@ -2865,7 +2905,8 @@ fn reverify_cached_entry_attestations(
     Ok(())
 }
 
-/// Internal helper: call load_index with pre-resolved arguments.
+/// Internal helper: call load_index_with_history with pre-resolved arguments.
+#[allow(clippy::too_many_arguments)]
 fn load_index_raw<'a>(
     url: &str,
     http: &dyn Fn(&str) -> Result<Vec<u8>, String>,
@@ -2874,8 +2915,9 @@ fn load_index_raw<'a>(
     verifier: Option<&'a dyn milpa_core::index_trust::IndexBundleVerifier>,
     bundle_http: Option<milpa_core::BundleHttpGet<'a>>,
     refresh_index: bool,
+    index_history_policy: &milpa_manifest::TrustPolicy,
 ) -> Result<Option<Index>, MilpaError> {
-    match load_index(
+    match load_index_with_history(
         url,
         &index_cache_dir(),
         http,
@@ -2885,6 +2927,7 @@ fn load_index_raw<'a>(
         verifier,
         bundle_http,
         refresh_index,
+        index_history_policy,
     ) {
         Ok(index) => Ok(Some(index)),
         // Non-catalog sentinels: index is unreachable or cache I/O failed.
@@ -3068,7 +3111,8 @@ fn maybe_index_for_workspace(
     refresh_index: bool,
 ) -> Result<Option<Index>, MilpaError> {
     let (policy, signer, bundle) = workspace_index_trust_fields(ws);
-    maybe_index(no_index, &policy, signer, bundle, require_attested_index, refresh_index)
+    let history_policy = effective_index_history_policy(&ws.index_history_policy);
+    maybe_index(no_index, &policy, signer, bundle, require_attested_index, refresh_index, &history_policy)
 }
 
 /// RD-M4 SSOT: extract a single-package manifest's index-trust fields and
@@ -3079,6 +3123,7 @@ fn maybe_index_for_manifest(
     require_attested_index: bool,
     refresh_index: bool,
 ) -> Result<Option<Index>, MilpaError> {
+    let history_policy = effective_index_history_policy(&m.index_history_policy);
     maybe_index(
         no_index,
         &m.index_trust_policy,
@@ -3086,7 +3131,394 @@ fn maybe_index_for_manifest(
         m.index_trust_bundle.clone(),
         require_attested_index,
         refresh_index,
+        &history_policy,
     )
+}
+
+// ---------------------------------------------------------------------------
+// cmd_index_status / cmd_index_accept (A3 — rfc-registry-append-only.md;
+// cli-contract.md §5.12) — the append-only-ratchet inspection/reset surface.
+// Mirrors `cli.py`'s `cmd_index_status`/`cmd_index_accept`.
+//
+// Both verbs share: the `--no-index` hard error, the effective index URL +
+// index-history policy (`index_verb_setup`), member-dir → workspace-root
+// delegation (S11e, via `find_parent_workspace` — the same helper
+// `update`/`add`/`remove` already use), and the fetch-and-verify + diff
+// machinery used by `--refresh` (status) and the ordinary path (accept).
+// Neither verb duplicates the dominance-fold/digest logic — both compose
+// `milpa_core::ratchet`/`index_ratchet_seam` primitives directly.
+// ---------------------------------------------------------------------------
+
+/// Two-level dispatch for `milpa index <status|accept>` — the third instance
+/// of the nested-subparser pattern `workspace add-member`/`remove-member`
+/// established (cli-contract §5.10/§5.12): sub-verbs routed through one
+/// `index` dispatcher, an unrecognised sub-verb exits 2.
+fn cmd_index(
+    dir: &Path,
+    rest: &[String],
+    no_index: bool,
+    require_attested_index: bool,
+) -> Result<i32, MilpaError> {
+    let sub = rest.first().map(|s| s.as_str());
+    match sub {
+        Some("status") => {
+            let refresh = rest[1..].iter().any(|a| a == "--refresh");
+            cmd_index_status(dir, no_index, require_attested_index, refresh)
+        }
+        Some("accept") => cmd_index_accept(dir, no_index, require_attested_index),
+        _ => {
+            eprintln!("index: usage: milpa index <status [--refresh]|accept>");
+            Ok(2)
+        }
+    }
+}
+
+/// Shared preamble for `index status`/`index accept`: the `--no-index` hard
+/// error, the effective index URL, and the effective `index-history` policy.
+///
+/// Member-dir delegation (S11e): `find_parent_workspace(dir)` — the SAME
+/// helper `update`/`add`/`remove` use — resolves a member directory to its
+/// workspace root's policy. The baseline sidecar pair is keyed purely by
+/// index URL in the process-global cache dir, so a member-dir invocation is
+/// byte-identical to a root-dir invocation by construction, not by a
+/// special-cased delegation path (there is no member-level baseline state
+/// to delegate FROM in the first place).
+fn index_verb_setup(dir: &Path, no_index: bool) -> Result<(String, milpa_manifest::TrustPolicy), MilpaError> {
+    if no_index_requested(no_index) {
+        return Err(MilpaError::Core(CoreError::Tianguis(
+            "TNG-INDEX-NOT-CONFIGURED",
+            "milpa index: no index is configured (--no-index, or an empty \
+             MILPA_INDEX_URL) — there is no index to load or compare against"
+                .to_string(),
+        )));
+    }
+    let url = index_url_from_env();
+
+    let manifest_policy = if let Some((_, ws)) = find_parent_workspace(dir)? {
+        ws.index_history_policy.clone()
+    } else {
+        match discover_manifest(dir) {
+            Ok(milpa_manifest::ManifestDoc::Workspace(_)) => {
+                let ws = load_workspace(dir)?;
+                ws.index_history_policy.clone()
+            }
+            Ok(milpa_manifest::ManifestDoc::Package(m)) => m.index_history_policy.clone(),
+            Err(e) if e.code() == "MAN-NO-MANIFEST" => milpa_manifest::TrustPolicy::Warn,
+            Err(e) => return Err(e),
+        }
+    };
+    Ok((url, effective_index_history_policy(&manifest_policy)))
+}
+
+/// Force a network fetch + trust-gate verification of `url`'s index
+/// candidate for `index status --refresh` / `index accept`. Touches no
+/// cache state ([`fetch_verified_candidate_text`] performs no writes).
+///
+/// Returns `(candidate_text, index_trust_is_off)` — the second element
+/// drives the index-trust-off caveat both verbs must print (cli-contract
+/// §5.12 NORMATIVE (contract points)).
+fn fetch_index_candidate(
+    dir: &Path,
+    url: &str,
+    require_attested_index: bool,
+) -> Result<(String, bool), MilpaError> {
+    let (manifest_policy, manifest_signer, manifest_bundle) = if let Some((_, ws)) = find_parent_workspace(dir)? {
+        workspace_index_trust_fields(&ws)
+    } else {
+        resolve_index_trust_fields(dir)?
+    };
+    let gate = build_index_trust_gate(&manifest_policy, manifest_signer, manifest_bundle, require_attested_index, url)?;
+    let is_off = gate.is_none();
+
+    let http = |u: &str| -> Result<Vec<u8>, String> {
+        let out = std::process::Command::new("curl")
+            .args(["-fsSL", u])
+            .output()
+            .map_err(|e| format!("curl: {e}"))?;
+        if out.status.success() {
+            Ok(out.stdout)
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    };
+
+    use milpa_core::BundleHttpGet;
+    let text = match &gate {
+        None => fetch_verified_candidate_text(url, &http, None, None, None)?,
+        Some(active) => fetch_verified_candidate_text(
+            url,
+            &http,
+            Some(active.bundle_fn.as_ref() as BundleHttpGet<'_>),
+            Some(&active.cfg),
+            Some(active.verifier.as_ref()),
+        )?,
+    };
+    Ok((text, is_off))
+}
+
+/// Read-only local inspection of the baseline sidecar pair — the plain
+/// `index status` (no `--refresh`) path. NEVER raises: a present-but-corrupt
+/// baseline is reported as `baseline: corrupt`, not `TNG-INDEX-BASELINE-CORRUPT`
+/// (cli-contract §5.12 NORMATIVE — `status` is a read-only inspection tool
+/// and must not hard-fail on a broken local trust state).
+///
+/// Returns `(baseline_state, established_at, pending, last_reported)`, each
+/// already formatted for display (`(none)` for absent timestamps).
+fn read_local_baseline_status(
+    baseline_path: &Path,
+    meta_path: &Path,
+) -> (&'static str, String, &'static str, String) {
+    if !baseline_path.is_file() {
+        return ("absent", "(none)".to_string(), "no", "(none)".to_string());
+    }
+    let Ok(baseline_bytes) = std::fs::read(baseline_path) else {
+        return ("corrupt", "(none)".to_string(), "no", "(none)".to_string());
+    };
+    let Ok(baseline_text) = String::from_utf8(baseline_bytes) else {
+        return ("corrupt", "(none)".to_string(), "no", "(none)".to_string());
+    };
+    if parse_baseline(&baseline_text).is_err() {
+        return ("corrupt", "(none)".to_string(), "no", "(none)".to_string());
+    }
+
+    let meta = if meta_path.is_file() {
+        std::fs::read_to_string(meta_path)
+            .map(|t| parse_baseline_meta(&t))
+            .unwrap_or_default()
+    } else {
+        BaselineMeta::default()
+    };
+
+    let established_at = meta.established_at.clone().unwrap_or_else(|| "(none)".to_string());
+    if let Some(digest) = &meta.reported_digest {
+        if !digest.is_empty() {
+            return (
+                "present",
+                established_at,
+                "yes",
+                meta.reported_at.clone().unwrap_or_else(|| "(none)".to_string()),
+            );
+        }
+    }
+    ("present", established_at, "no", "(none)".to_string())
+}
+
+/// The fixed-format `index status` block (cli-contract §5.12 NORMATIVE
+/// (status block, fixed format)) — a 19-character label+colon column,
+/// mirroring `show --index-trust`'s convention (§5.3a).
+#[allow(clippy::too_many_arguments)]
+fn format_index_status_block(
+    index_url: &str,
+    policy: &str,
+    baseline: &str,
+    established_at: &str,
+    pending: &str,
+    last_reported: &str,
+) -> String {
+    let fields: [(&str, &str); 6] = [
+        ("index-url:", index_url),
+        ("policy:", policy),
+        ("baseline:", baseline),
+        ("established-at:", established_at),
+        ("pending:", pending),
+        ("last-reported:", last_reported),
+    ];
+    let mut out = String::new();
+    for (label, value) in fields {
+        out.push_str(&format!("{label:<19}{value}\n"));
+    }
+    out
+}
+
+/// Diff `candidate_text` against the on-disk baseline at `baseline_path` —
+/// the shared computation behind `status --refresh` and `accept`.
+///
+/// Returns `(outcome, baseline_state)`: `outcome` is `Some` when
+/// `baseline_state == "present"`, else `None`. Composes
+/// `index_ratchet_seam::build_index_state`/`parse_baseline` and
+/// `ratchet::Baseline` directly — no dominance-fold/digest logic is
+/// reimplemented here.
+///
+/// Yank-transition notices (legal, non-error) are printed to stderr here,
+/// reusing `index_ratchet_seam::print_yank_notice` — the SAME stderr line
+/// the ordinary ratchet-gated fetch path prints.
+fn compute_index_diff(candidate_text: &str, baseline_path: &Path) -> Result<(Option<RatchetOutcome>, &'static str), MilpaError> {
+    let (_, candidate_state) = build_index_state(candidate_text)?;
+
+    if !baseline_path.is_file() {
+        return Ok((None, "absent"));
+    }
+    let Ok(baseline_bytes) = std::fs::read(baseline_path) else {
+        return Ok((None, "corrupt"));
+    };
+    let Ok(baseline_text) = String::from_utf8(baseline_bytes) else {
+        return Ok((None, "corrupt"));
+    };
+    let baseline_state = match parse_baseline(&baseline_text) {
+        Ok(s) => s,
+        Err(_) => return Ok((None, "corrupt")),
+    };
+
+    let outcome = Baseline::new(baseline_state).check(&candidate_state);
+    for transition in &outcome.transitions {
+        print_yank_notice(transition);
+    }
+    Ok((Some(outcome), "present"))
+}
+
+/// Render the shared three-branch diff text (cli-contract §5.12 NORMATIVE
+/// (violation-line format...) / (`accept` MUST...)) used by both
+/// `status --refresh` and `accept`. Returns `(text, clean)`; `clean` is
+/// meaningful only for the `"present"` branch — callers decide exit
+/// code / write behavior per-verb from `baseline_state` + `clean` (the two
+/// verbs have DIFFERENT rules for the absent/corrupt branches: `status`
+/// treats corrupt as attention-worthy, `accept` treats it as successful
+/// re-establishment).
+fn render_index_verb_diff(outcome: Option<&RatchetOutcome>, baseline_state: &str) -> (String, bool) {
+    if baseline_state == "absent" {
+        return ("no prior baseline — this fetch establishes the trust anchor\n".to_string(), true);
+    }
+    if baseline_state == "corrupt" {
+        return (
+            "baseline unreadable — cannot show what changed; re-establishing the trust anchor\n".to_string(),
+            true,
+        );
+    }
+
+    let outcome = outcome.expect("outcome must be Some when baseline_state == present");
+    if outcome.clean() {
+        return ("nothing to accept\n".to_string(), true);
+    }
+
+    let violations = &outcome.violations;
+    let mut lines: Vec<String> = Vec::new();
+    if violations.iter().any(|v| v.field == "attestation-epoch") {
+        // registry-protocol §3.5.1 (staged — attestation-epoch enforcement
+        // lands at A6): the blast-radius sentence cli-contract §5.12
+        // requires before the ordinary diff. Unreachable via the live fetch
+        // path until the engine's `include_staged` gate flips.
+        lines.push(
+            "accepting this change reclassifies every entry between the \
+             epochs as pre-epoch/legacy, nullifying the attestation mandate \
+             for all of them — an index-wide consequence, not a one-row one"
+                .to_string(),
+        );
+    }
+    for v in violations {
+        lines.push(
+            [
+                "violation:",
+                v.class,
+                &v.entry_key.namespace,
+                &v.entry_key.name,
+                &v.entry_key.version,
+                &v.field,
+                v.kind,
+                &v.baseline_value,
+                &v.candidate_value,
+            ]
+            .join("\t"),
+        );
+    }
+    lines.push(format!("digest: {}", canonical_digest(violations)));
+    (lines.join("\n") + "\n", false)
+}
+
+/// `milpa index status [--refresh]` — read-only append-only-ratchet
+/// inspection. NEVER writes to disk, under any invocation, including
+/// `--refresh` (cli-contract §5.12 NORMATIVE).
+fn cmd_index_status(
+    dir: &Path,
+    no_index: bool,
+    require_attested_index: bool,
+    refresh: bool,
+) -> Result<i32, MilpaError> {
+    let (url, policy) = index_verb_setup(dir, no_index)?;
+    let cache_dir = index_cache_dir();
+    let (baseline_p, meta_p) = baseline_sidecar_paths(&url, &cache_dir);
+    let policy_str = trust_policy_wire(&policy);
+
+    if !refresh {
+        let (baseline_state, established_at, pending, last_reported) = read_local_baseline_status(&baseline_p, &meta_p);
+        let block = format_index_status_block(&url, policy_str, baseline_state, &established_at, pending, &last_reported);
+        print!("{block}");
+        return Ok(if baseline_state == "corrupt" || pending == "yes" { 1 } else { 0 });
+    }
+
+    let (candidate_text, trust_off) = fetch_index_candidate(dir, &url, require_attested_index)?;
+    if trust_off {
+        eprintln!(
+            "[milpa] warning: index-trust is \"off\" — this fetch has no \
+             cryptographic basis; the diff below attests only to continuity \
+             of whatever the transport delivered"
+        );
+    }
+
+    let (outcome, baseline_state) = compute_index_diff(&candidate_text, &baseline_p)?;
+    let (text, clean) = render_index_verb_diff(outcome.as_ref(), baseline_state);
+    print!("{text}");
+
+    if baseline_state == "corrupt" {
+        return Ok(1);
+    }
+    if baseline_state == "absent" {
+        return Ok(0);
+    }
+    Ok(if clean { 0 } else { 1 })
+}
+
+/// `milpa index accept` — fetch, print the diff, and atomically accept the
+/// new trust baseline (cli-contract §5.12). Non-interactive; idempotent;
+/// per-URL. Its ONLY mutation is the atomic baseline-pair swap, performed
+/// UNLESS the diff against a present, parseable baseline is already clean
+/// (the idempotent no-op case — `nothing to accept`, no write).
+fn cmd_index_accept(dir: &Path, no_index: bool, require_attested_index: bool) -> Result<i32, MilpaError> {
+    let (url, policy) = index_verb_setup(dir, no_index)?;
+    let cache_dir = index_cache_dir();
+    let (baseline_p, _meta_p) = baseline_sidecar_paths(&url, &cache_dir);
+
+    let (candidate_text, trust_off) = fetch_index_candidate(dir, &url, require_attested_index)?;
+    if trust_off {
+        eprintln!(
+            "[milpa] warning: index-trust is \"off\" — this fetch has no \
+             cryptographic basis; accepting it attests only to continuity of \
+             whatever the transport delivered"
+        );
+    }
+    if policy == milpa_manifest::TrustPolicy::Off {
+        eprintln!(
+            "[milpa] warning: index-history is \"off\" — the baseline \
+             written by this accept will not be consulted again until the \
+             axis is re-enabled"
+        );
+    }
+
+    let (outcome, baseline_state) = compute_index_diff(&candidate_text, &baseline_p)?;
+    let (text, clean) = render_index_verb_diff(outcome.as_ref(), baseline_state);
+    print!("{text}");
+
+    if baseline_state == "present" && clean {
+        return Ok(0); // idempotent no-op — nothing to accept, no write.
+    }
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let new_meta = BaselineMeta {
+        established_at: Some(iso_timestamp(now as i64)),
+        reported_digest: None,
+        reported_at: None,
+    };
+    write_baseline_pair(&url, &cache_dir, candidate_text.as_bytes(), &new_meta)?;
+    Ok(0)
+}
+
+/// The manifest-node wire string for a `TrustPolicy` value (`"off"`/`"warn"`/`"strict"`).
+fn trust_policy_wire(p: &milpa_manifest::TrustPolicy) -> &'static str {
+    use milpa_manifest::TrustPolicy;
+    match p {
+        TrustPolicy::Off => "off",
+        TrustPolicy::Warn => "warn",
+        TrustPolicy::Strict => "strict",
+    }
 }
 
 // S11e / RD-H2: the member-override reconstruction used to live here as a
@@ -4208,7 +4640,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_URL", &url) };
         unsafe { std::env::set_var("XDG_CACHE_HOME", tmp.path()) };
 
-        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Off, None, None, false, false);
+        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Off, None, None, false, false, &milpa_manifest::TrustPolicy::Off);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };
@@ -4241,7 +4673,7 @@ mod tests {
         };
         unsafe { std::env::set_var("XDG_CACHE_HOME", tmp.path()) };
 
-        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Off, None, None, false, false);
+        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Off, None, None, false, false, &milpa_manifest::TrustPolicy::Off);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };
@@ -4332,7 +4764,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_URL", "https://example.com/index.kdl") };
         unsafe { std::env::set_var("MILPA_INDEX_TRUST_MOCK_VERIFIER", "trusted") };
 
-        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Warn, None, None, false, false);
+        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Warn, None, None, false, false, &milpa_manifest::TrustPolicy::Off);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
@@ -4360,7 +4792,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///nonexistent-mock-seam-test.kdl") };
         unsafe { std::env::set_var("MILPA_INDEX_TRUST_MOCK_VERIFIER", "trusted") };
 
-        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Warn, None, None, false, false);
+        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Warn, None, None, false, false, &milpa_manifest::TrustPolicy::Off);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
@@ -4392,7 +4824,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///nonexistent-milpa-strict-test.kdl") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
 
-        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Strict, None, None, false, false);
+        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Strict, None, None, false, false, &milpa_manifest::TrustPolicy::Off);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };
@@ -4416,7 +4848,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///nonexistent-off-test.kdl") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
 
-        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Off, None, None, false, false);
+        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Off, None, None, false, false, &milpa_manifest::TrustPolicy::Off);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };

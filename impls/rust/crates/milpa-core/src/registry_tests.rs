@@ -229,6 +229,11 @@ fn ver(v: &str, hash: &str, provs: Vec<Provenance>) -> IndexVersion {
         dep_decl_schema_version: None,
         attestation: None,
         namespace: String::new(),
+        published_at: None,
+        yanked: false,
+        yanked_at: None,
+        yanked_reason: None,
+        published_at_raw: None,
     }
 }
 
@@ -583,4 +588,146 @@ fn test_no_attestation_node_is_unattested() {
     let (iv, diagnostics) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
     assert!(iv.attestation.is_none());
     assert!(diagnostics.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// A2a — published_at + yank triple parse-to-typed extension
+// (registry-protocol §3.2 "published_at" / "Yank triple"; mirrors
+// impls/python/tests/test_registry.py::TestA2aPublishedAtAndYankTriple)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a2a_published_at_parsed_to_timestamp() {
+    let doc = one_version_node("        published_at \"2026-06-01T00:00:00Z\"\n");
+    let node = version_child(&doc);
+    let (iv, _) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    assert_eq!(
+        iv.published_at,
+        parse_iso8601_timestamp("2026-06-01T00:00:00Z")
+    );
+    assert_eq!(iv.published_at_raw.as_deref(), Some("2026-06-01T00:00:00Z"));
+}
+
+#[test]
+fn a2a_published_at_absent_yields_none() {
+    let doc = one_version_node("");
+    let node = version_child(&doc);
+    let (iv, _) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    assert!(iv.published_at.is_none());
+    assert!(iv.published_at_raw.is_none());
+}
+
+#[test]
+fn a2a_malformed_published_at_yields_none_no_diagnostic() {
+    let doc = one_version_node("        published_at \"not-a-timestamp\"\n");
+    let node = version_child(&doc);
+    let (iv, diagnostics) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    assert!(iv.published_at.is_none());
+    // Raw text is still captured (digest needs "exactly as served" even when
+    // malformed) but the typed value is absent, and no diagnostic fires.
+    assert_eq!(iv.published_at_raw.as_deref(), Some("not-a-timestamp"));
+    assert!(diagnostics.is_empty());
+}
+
+#[test]
+fn a2a_yanked_true_parsed() {
+    let doc = one_version_node("        yanked #true\n");
+    let node = version_child(&doc);
+    let (iv, _) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    assert!(iv.yanked);
+}
+
+#[test]
+fn a2a_yanked_at_parsed_to_timestamp() {
+    let doc = one_version_node("        yanked_at \"2026-07-01T12:00:00Z\"\n");
+    let node = version_child(&doc);
+    let (iv, _) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    assert_eq!(
+        iv.yanked_at,
+        parse_iso8601_timestamp("2026-07-01T12:00:00Z")
+    );
+}
+
+#[test]
+fn a2a_yanked_reason_parsed() {
+    let doc = one_version_node("        yanked_reason \"ships a vulnerable bearssl pin\"\n");
+    let node = version_child(&doc);
+    let (iv, _) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    assert_eq!(iv.yanked_reason.as_deref(), Some("ships a vulnerable bearssl pin"));
+}
+
+#[test]
+fn a2a_yanked_absent_defaults_false() {
+    let doc = one_version_node("");
+    let node = version_child(&doc);
+    let (iv, _) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    assert!(!iv.yanked);
+}
+
+#[test]
+fn a2a_yanked_at_absent_yields_none() {
+    let doc = one_version_node("");
+    let node = version_child(&doc);
+    let (iv, _) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    assert!(iv.yanked_at.is_none());
+}
+
+#[test]
+fn a2a_yanked_reason_absent_yields_none() {
+    let doc = one_version_node("");
+    let node = version_child(&doc);
+    let (iv, _) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    assert!(iv.yanked_reason.is_none());
+}
+
+#[test]
+fn a2a_malformed_yanked_defaults_false_no_diagnostic() {
+    let doc = one_version_node("        yanked \"not-a-bool\"\n");
+    let node = version_child(&doc);
+    let (iv, diagnostics) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    assert!(!iv.yanked);
+    assert!(diagnostics.is_empty());
+}
+
+#[test]
+fn a2a_malformed_yanked_at_yields_none_no_diagnostic() {
+    let doc = one_version_node("        yanked_at \"also-not-a-timestamp\"\n");
+    let node = version_child(&doc);
+    let (iv, diagnostics) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    assert!(iv.yanked_at.is_none());
+    assert!(diagnostics.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// ISO-8601 timestamp parser — malformed/edge cases (registry.rs's hand-rolled
+// parser; no external date crate — see registry.rs module docs).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn iso8601_parses_z_suffixed() {
+    let t = parse_iso8601_timestamp("2026-05-26T04:49:44Z").unwrap();
+    // 2026-05-26T04:49:44Z: sanity-check against an independently computed
+    // Unix timestamp (via `date -u -d ... +%s`-equivalent reasoning is not
+    // available offline here, so this pins internal consistency: re-parsing
+    // the same string is idempotent and two different instants differ).
+    let t2 = parse_iso8601_timestamp("2026-05-26T04:49:44Z").unwrap();
+    assert_eq!(t, t2);
+    let t3 = parse_iso8601_timestamp("2026-05-26T04:49:45Z").unwrap();
+    assert_ne!(t, t3);
+    assert_eq!(t3.unix_seconds, t.unix_seconds + 1);
+}
+
+#[test]
+fn iso8601_offset_and_z_agree_on_same_instant() {
+    let z = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+    let offset = parse_iso8601_timestamp("2026-01-01T01:00:00+01:00").unwrap();
+    assert_eq!(z, offset);
+}
+
+#[test]
+fn iso8601_rejects_garbage() {
+    assert!(parse_iso8601_timestamp("not-a-timestamp").is_none());
+    assert!(parse_iso8601_timestamp("").is_none());
+    assert!(parse_iso8601_timestamp("2026-13-01T00:00:00Z").is_none()); // month 13
+    assert!(parse_iso8601_timestamp("2026-01-01T00:00:00+99:99").is_none());
 }

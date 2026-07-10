@@ -279,6 +279,33 @@ impl CoreError {
             // when a workspace MEMBER declares entry-trust — that field is a
             // workspace-ROOT-only policy, mirroring WS-INDEX-TRUST-ON-MEMBER.
             "WS-ENTRY-TRUST-ON-MEMBER",
+            // A3 (rfc-registry-append-only.md; registry-protocol §3.5): the
+            // append-only invariant & consumer ratchet. Emitted by the
+            // index-cache ratchet gate (index_ratchet_seam.rs, wired inside
+            // index_cache.rs::load_index) when a candidate index fails to
+            // dominate the locally-cached baseline under the effective
+            // `index-history` policy.
+            "TNG-INDEX-ROOT-MUTATED",
+            "TNG-INDEX-ROLLBACK",
+            "TNG-ENTRY-MUTATED",
+            // A3: the baseline sidecar exists but is unparseable/truncated —
+            // hard-fails regardless of `index-history` policy (§3.5.2
+            // NORMATIVE (baseline corruption is not TOFU)).
+            "TNG-INDEX-BASELINE-CORRUPT",
+            // A3: workspace index-history root-authority validation. Emitted
+            // by check_member_index_history_declarations in workspace.rs
+            // when a workspace MEMBER declares `index-history` — that field
+            // is a workspace-ROOT-only policy, mirroring
+            // WS-INDEX-TRUST-ON-MEMBER / WS-ENTRY-TRUST-ON-MEMBER.
+            "WS-INDEX-HISTORY-ON-MEMBER",
+            // A3 (cli-contract.md §5.12): the `milpa index status`/`milpa
+            // index accept` verb family. NOT-CONFIGURED is the `--no-index`
+            // (or empty MILPA_INDEX_URL) hard error both verbs raise (no
+            // index to load or compare against). BASELINE-WRITE-FAILED is
+            // `accept`'s loud, distinct error on an I/O failure during its
+            // atomic baseline-pair swap (never a silent no-op).
+            "TNG-INDEX-NOT-CONFIGURED",
+            "TNG-INDEX-BASELINE-WRITE-FAILED",
         ]
     }
 }

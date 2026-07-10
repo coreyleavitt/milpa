@@ -256,6 +256,8 @@ fn manifest_full(deps: Vec<Dep>, dev_deps: Vec<Dep>, overrides: Vec<Override>) -
         index_trust_policy_explicit: false,
         entry_trust_policy: milpa_manifest::TrustPolicy::Warn,
         entry_trust_policy_explicit: false,
+        index_history_policy: milpa_manifest::TrustPolicy::Warn,
+        index_history_policy_explicit: false,
         optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }
@@ -442,6 +444,11 @@ fn resolve_named_dep_strategy_selects_version() {
         dep_decl_schema_version: None,
         attestation: None,
         namespace: String::new(),
+        published_at: None,
+        yanked: false,
+        yanked_at: None,
+        yanked_reason: None,
+        published_at_raw: None,
     };
     let index = Index {
         packages: vec![Package {
@@ -543,6 +550,11 @@ fn s5b_phase_a_error_slug_divergence_spike() {
                 dep_decl_schema_version: None,
                 attestation: None,
                 namespace: String::new(),
+                published_at: None,
+                yanked: false,
+                yanked_at: None,
+                yanked_reason: None,
+                published_at_raw: None,
             }],
         }],
     };
@@ -2361,6 +2373,8 @@ fn manifest_with_flags(name: &str, flags: Vec<milpa_manifest::FlagDecl>) -> milp
         index_trust_policy_explicit: false,
         entry_trust_policy: milpa_manifest::TrustPolicy::Warn,
         entry_trust_policy_explicit: false,
+        index_history_policy: milpa_manifest::TrustPolicy::Warn,
+        index_history_policy_explicit: false,
         optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }

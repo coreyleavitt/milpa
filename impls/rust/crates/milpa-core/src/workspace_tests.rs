@@ -563,6 +563,49 @@ fn member_declaring_index_trust_bundle_is_ws_index_trust_on_member() {
     assert_eq!(result.code(), "WS-INDEX-TRUST-ON-MEMBER");
 }
 
+// ---------------------------------------------------------------------------
+// A3 (rfc-registry-append-only.md §2): index-history root-authority
+// validation — mirrors the index-trust / entry-trust tests above.
+// ---------------------------------------------------------------------------
+
+/// The workspace root MAY declare `index-history`; it becomes the effective
+/// policy for the whole workspace invocation.
+#[test]
+fn workspace_root_index_history_flows_through() {
+    let tmp = workspace_dir(
+        "index-history \"strict\"\nworkspace {\n    member \"sub\"\n}\n",
+        &[("sub", Some("name \"sub\"\nkind \"library\"\n"))],
+    );
+    let ws = load_workspace(tmp.path()).unwrap();
+    assert_eq!(ws.index_history_policy, milpa_manifest::TrustPolicy::Strict);
+}
+
+/// A member declaring `index-history "strict"` is a hard error —
+/// WS-INDEX-HISTORY-ON-MEMBER — raised BEFORE any index fetch, even when
+/// the root declares nothing.
+#[test]
+fn member_declaring_index_history_is_ws_index_history_on_member() {
+    let tmp = workspace_dir(
+        "workspace {\n    member \"sub\"\n}\n",
+        &[("sub", Some("name \"sub\"\nkind \"library\"\nindex-history \"strict\"\n"))],
+    );
+    let result = load_workspace(tmp.path()).unwrap_err();
+    assert_eq!(result.code(), "WS-INDEX-HISTORY-ON-MEMBER");
+}
+
+/// A member declaring `index-history "warn"` — the SAME as the default
+/// value — still errors: the rule is about WHERE the field is declared,
+/// not what value it holds.
+#[test]
+fn member_declaring_index_history_warn_default_value_is_still_ws_index_history_on_member() {
+    let tmp = workspace_dir(
+        "workspace {\n    member \"sub\"\n}\n",
+        &[("sub", Some("name \"sub\"\nkind \"library\"\nindex-history \"warn\"\n"))],
+    );
+    let result = load_workspace(tmp.path()).unwrap_err();
+    assert_eq!(result.code(), "WS-INDEX-HISTORY-ON-MEMBER");
+}
+
 /// Two members, one declaring index-trust — still errors (fires on the first
 /// offending member encountered; two members previously "agreeing" is no
 /// longer a legal escape hatch under the root-authority model).

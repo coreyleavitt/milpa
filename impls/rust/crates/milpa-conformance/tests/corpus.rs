@@ -155,43 +155,18 @@ fn spec_error_codes() -> BTreeSet<String> {
 /// `check_member_entry_trust_declarations` in `workspace.rs`. All 9 codes
 /// moved from DEFERRED to `implemented_error_codes()`.
 ///
-/// A2c (RFC `rfc-registry-append-only.md`, Python-only slice): added
-/// `WS-INDEX-HISTORY-ON-MEMBER` to spec/errors.md and errors.py, with a
-/// Python raise site in `workspace.py`'s `_check_member_index_history_declarations`
-/// (mirroring `_check_member_entry_trust_declarations`). This is the ONE
-/// slug this implementation currently defers: the `index-history`
-/// manifest field / `MILPA_INDEX_HISTORY` env / effective-policy plumbing
-/// has no Rust counterpart yet. Rust parity is scheduled for A3/A4a.
-///
-/// A2d (RFC `rfc-registry-append-only.md`, Python-only slice): wired the
-/// append-only consumer ratchet at the index-cache seam — added
-/// `TNG-INDEX-ROOT-MUTATED`, `TNG-INDEX-ROLLBACK`, `TNG-ENTRY-MUTATED`, and
-/// `TNG-INDEX-BASELINE-CORRUPT` to spec/errors.md and errors.py, with
-/// Python raise sites in `index_ratchet_seam.py` (`evaluate_gate` /
-/// `parse_baseline`) called from `index_cache.py`'s `load_index` and
-/// `_refetch_with_recovery`. All four join `WS-INDEX-HISTORY-ON-MEMBER` in
-/// this list — the whole `index-history` axis (engine, seam, and its
-/// member-declaration guard) has no Rust counterpart yet. A3 parity
-/// pending.
-///
-/// A2e (RFC `rfc-registry-append-only.md`, Python-only slice,
-/// cli-contract.md §5.12): added the `milpa index status`/`milpa index
-/// accept` verb family — `TNG-INDEX-NOT-CONFIGURED` (the `--no-index`
-/// hard-error both verbs raise) and `TNG-INDEX-BASELINE-WRITE-FAILED`
-/// (`accept`'s loud baseline-swap-I/O-failure error) to spec/errors.md and
-/// errors.py, with Python raise sites in `cli.py` (`_index_verb_setup`) and
-/// `index_cache.py` (`write_baseline_pair`). Both join the rest of the
-/// `index-history` axis in this list — no Rust `milpa index` subcommand
-/// exists yet. A3 parity pending.
-const DEFERRED: &[&str] = &[
-    "WS-INDEX-HISTORY-ON-MEMBER",
-    "TNG-INDEX-ROOT-MUTATED",
-    "TNG-INDEX-ROLLBACK",
-    "TNG-ENTRY-MUTATED",
-    "TNG-INDEX-BASELINE-CORRUPT",
-    "TNG-INDEX-NOT-CONFIGURED",
-    "TNG-INDEX-BASELINE-WRITE-FAILED",
-];
+/// A3 (RFC `rfc-registry-append-only.md`): full Rust parity for the
+/// append-only consumer ratchet landed — `WS-INDEX-HISTORY-ON-MEMBER`
+/// (`check_member_index_history_declarations` in `workspace.rs`),
+/// `TNG-INDEX-ROOT-MUTATED`/`TNG-INDEX-ROLLBACK`/`TNG-ENTRY-MUTATED`/
+/// `TNG-INDEX-BASELINE-CORRUPT` (the ratchet engine `ratchet.rs` + the
+/// `index_ratchet_seam.rs` gate, wired into `index_cache.rs`'s
+/// `load_index_with_history`), and `TNG-INDEX-NOT-CONFIGURED`/
+/// `TNG-INDEX-BASELINE-WRITE-FAILED` (the `milpa index status`/`milpa
+/// index accept` verb family in `milpa-cli/src/main.rs`). All 7 codes
+/// moved from DEFERRED to `implemented_error_codes()` — the `index-history`
+/// axis is no longer Python-only.
+const DEFERRED: &[&str] = &[];
 
 /// Spec codes this implementation intentionally never emits.
 const EXEMPT: &[&str] = &[

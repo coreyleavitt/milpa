@@ -31,10 +31,12 @@ pub mod fetchers;
 pub mod frozen;
 pub mod identity;
 pub mod index_cache;
+pub mod index_ratchet_seam;
 pub mod index_trust;
 pub mod lockfile;
 pub mod manifest_writer;
 pub mod nimcfg;
+pub mod ratchet;
 pub mod registry;
 // Offline Rekor inclusion adapter (S2). `pub(crate)` API; consumed by `index_trust`'s
 // `SigstoreVerifier`.
@@ -63,9 +65,15 @@ pub use entry_trust::{
 };
 pub use error::{CoreError, MilpaError};
 pub use index_cache::{
-    derive_bundle_url, get_bundle_url, index_url_from_env, load_index, BundleError,
+    baseline_sidecar_paths, derive_bundle_url, fetch_verified_candidate_text, get_bundle_url,
+    index_url_from_env, load_index, load_index_with_history, write_baseline_pair, BundleError,
     BundleHttpGet, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS,
 };
+pub use index_ratchet_seam::{
+    build_index_state, evaluate_gate, iso_timestamp, parse_baseline, parse_baseline_meta,
+    print_yank_notice, BaselineMeta, GateDecision,
+};
+pub use ratchet::{canonical_digest, Baseline, EntryKey, RatchetOutcome, Violation};
 pub use lockfile::{
     format_lockfile, from_graph, load_lockfile, parse_lockfile, strip_dep_pin,
     verify_against_graph, verify_lockfile_against_deps, write_lockfile,
