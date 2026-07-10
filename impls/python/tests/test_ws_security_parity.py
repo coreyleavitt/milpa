@@ -19,6 +19,7 @@ import pytest
 
 from milpa.errors import (
     MilpaError,
+    WS_INDEX_HISTORY_ON_MEMBER,
     WS_INDEX_TRUST_ON_MEMBER,
     WS_MEMBER_DIR_MISSING,
     WS_MEMBER_DOT,
@@ -609,5 +610,119 @@ class TestWorkspaceMemberIndexTrustRejected:
 
         assert not hasattr(workspace_mod, "merge_workspace_index_trust_policy")
         assert not hasattr(workspace_mod, "_check_conflicting_signers")
+
+
+# ---------------------------------------------------------------------------
+# A2c (RFC registry-append-only.md §2, spec/registry-protocol.md §3.4.0 /
+# §3.5.2): index-history root authority — mirrors the index-trust root-
+# authority tests above for the sibling axis. index-history has no
+# signer/bundle sub-fields (the ratchet is a pure content diff, not a
+# Sigstore verification), so this axis is a single-node mirror.
+# ---------------------------------------------------------------------------
+
+
+def _write_workspace_root_with_index_history(
+    root: Path,
+    *,
+    policy: str | None = None,
+    member_name: str = "sub",
+) -> None:
+    """Write a workspace root manifest optionally carrying an index-history field.
+
+    The root always declares one member ``sub`` with a plain manifest (no
+    index-history field) so the workspace loads cleanly when the root's field
+    is legal.
+    """
+    lines = []
+    if policy is not None:
+        lines.append(f'index-history "{policy}"')
+    lines.append(f'workspace {{\n    member "{member_name}"\n}}')
+    (root / "milpa.kdl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_member(root / member_name, member_name)
+
+
+def _write_workspace_member_with_index_history(
+    root: Path,
+    *,
+    member_policy: str | None = None,
+    root_policy: str | None = None,
+    member_name: str = "sub",
+) -> None:
+    """Write a workspace where a MEMBER illegally declares an index-history field."""
+    root_lines = []
+    if root_policy is not None:
+        root_lines.append(f'index-history "{root_policy}"')
+    root_lines.append(f'workspace {{\n    member "{member_name}"\n}}')
+    (root / "milpa.kdl").write_text("\n".join(root_lines) + "\n", encoding="utf-8")
+
+    member_dir = root / member_name
+    member_dir.mkdir(parents=True, exist_ok=True)
+    member_lines = [f'name "{member_name}"', 'kind "library"']
+    if member_policy is not None:
+        member_lines.append(f'index-history "{member_policy}"')
+    (member_dir / "milpa.kdl").write_text("\n".join(member_lines) + "\n", encoding="utf-8")
+
+
+class TestWorkspaceRootIndexHistoryAuthority:
+    """Root declares index-history; a plain member coexists with no error."""
+
+    def test_root_declares_strict_no_error(self, tmp_path: Path) -> None:
+        _write_workspace_root_with_index_history(tmp_path, policy="strict")
+        loaded = load_workspace(tmp_path)
+        assert loaded.workspace_manifest.index_history_policy == "strict"
+
+    def test_root_declares_off_no_error(self, tmp_path: Path) -> None:
+        """Root-declared 'off' preserves the baseline (A2d) but is a legal declaration."""
+        _write_workspace_root_with_index_history(tmp_path, policy="off")
+        loaded = load_workspace(tmp_path)
+        assert loaded.workspace_manifest.index_history_policy == "off"
+
+    def test_root_declares_nothing_defaults_warn(self, tmp_path: Path) -> None:
+        _write_workspace_root_with_index_history(tmp_path)
+        loaded = load_workspace(tmp_path)
+        assert loaded.workspace_manifest.index_history_policy == "warn"
+
+
+class TestWorkspaceMemberIndexHistoryRejected:
+    """A member declaring index-history → WS-INDEX-HISTORY-ON-MEMBER."""
+
+    def test_member_declares_policy_raises(self, tmp_path: Path) -> None:
+        _write_workspace_member_with_index_history(tmp_path, member_policy="strict")
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace(tmp_path)
+        assert exc_info.value.slug == WS_INDEX_HISTORY_ON_MEMBER
+
+    def test_member_declares_default_matching_policy_still_raises(self, tmp_path: Path) -> None:
+        """Explicit 'warn' on a member still errors — the rule is about WHERE, not the value."""
+        _write_workspace_member_with_index_history(tmp_path, member_policy="warn")
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace(tmp_path)
+        assert exc_info.value.slug == WS_INDEX_HISTORY_ON_MEMBER
+
+    def test_error_includes_member_path(self, tmp_path: Path) -> None:
+        _write_workspace_member_with_index_history(
+            tmp_path, member_policy="strict", member_name="pkg-b"
+        )
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace(tmp_path)
+        combined = exc_info.value.message + str(exc_info.value.context)
+        assert "pkg-b" in combined
+
+    def test_fires_regardless_of_root_policy(self, tmp_path: Path) -> None:
+        """The check fires even when the root ALSO legally declares a policy."""
+        _write_workspace_member_with_index_history(
+            tmp_path, member_policy="strict", root_policy="warn"
+        )
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace(tmp_path)
+        assert exc_info.value.slug == WS_INDEX_HISTORY_ON_MEMBER
+
+    def test_fires_via_load_workspace_from_manifest(self, tmp_path: Path) -> None:
+        """load_workspace_from_manifest (used by add/remove orchestration) also rejects."""
+        _write_workspace_member_with_index_history(tmp_path, member_policy="strict")
+        ws_manifest = WorkspaceManifest(members=("sub",))
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace_from_manifest(tmp_path, ws_manifest)
+        assert exc_info.value.slug == WS_INDEX_HISTORY_ON_MEMBER
 
 

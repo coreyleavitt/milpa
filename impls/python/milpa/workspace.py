@@ -32,6 +32,7 @@ fallback).  ``manifest.py`` has none.
 Error codes raised here (WS-* and file-level MAN-*/NIMBLE-*):
     WS-INDEX-TRUST-ON-MEMBER  — member manifest declares index-trust (root-only field)
     WS-ENTRY-TRUST-ON-MEMBER  — member manifest declares entry-trust (root-only field)
+    WS-INDEX-HISTORY-ON-MEMBER — member manifest declares index-history (root-only field)
     WS-MEMBER-DIR-MISSING     — declared member dir does not exist
     WS-MEMBER-DOT             — "." used as member path
     WS-MEMBER-DUPLICATE-NAME  — two members share a package name
@@ -61,6 +62,7 @@ from milpa.errors import (
     NIMBLE_FILE_NOT_FOUND,
     NIMBLE_FILE_UNREADABLE,
     WS_ENTRY_TRUST_ON_MEMBER,
+    WS_INDEX_HISTORY_ON_MEMBER,
     WS_INDEX_TRUST_ON_MEMBER,
     WS_MEMBER_DIR_MISSING,
     WS_MEMBER_DOT,
@@ -402,6 +404,7 @@ def load_workspace(workspace_root: Path) -> LoadedWorkspace:
     # raised here BEFORE any index fetch.
     _check_member_index_trust_declarations(members)
     _check_member_entry_trust_declarations(members)
+    _check_member_index_history_declarations(members)
 
     return LoadedWorkspace(
         root_dir=workspace_root,
@@ -535,6 +538,7 @@ def load_workspace_from_manifest(
     # S5 redesign: same root-authority validation as load_workspace() — see there.
     _check_member_index_trust_declarations(members)
     _check_member_entry_trust_declarations(members)
+    _check_member_index_history_declarations(members)
 
     return LoadedWorkspace(
         root_dir=workspace_root,
@@ -607,6 +611,7 @@ def load_workspace_with_member_override(
     # declaration, so re-validate the full member list here too.
     _check_member_index_trust_declarations(new_members)
     _check_member_entry_trust_declarations(new_members)
+    _check_member_index_history_declarations(new_members)
 
     return LoadedWorkspace(
         root_dir=workspace.root_dir,
@@ -810,6 +815,37 @@ def _check_member_entry_trust_declarations(members: list["LoadedMember"]) -> Non
             raise MilpaError(
                 WS_ENTRY_TRUST_ON_MEMBER,
                 "entry-trust is a workspace-root policy; declare it in the "
+                f"workspace root manifest, not in member {member.rel_path!r}",
+                member=member.rel_path,
+            )
+
+
+# ---------------------------------------------------------------------------
+# A2c — workspace index-history root-authority helper
+# (RFC registry-append-only.md §2, spec/registry-protocol.md §3.4.0 / §3.5.2)
+# ---------------------------------------------------------------------------
+
+
+def _check_member_index_history_declarations(members: list["LoadedMember"]) -> None:
+    """Raise WS-INDEX-HISTORY-ON-MEMBER if any member declares an index-history field.
+
+    index-history is a workspace-ROOT policy (RFC registry-append-only.md §2):
+    the append-only consumer ratchet compares one process-global, workspace-
+    shared index against one baseline — mirrors
+    ``_check_member_entry_trust_declarations`` / ``_check_member_index_trust_declarations``
+    for the sibling axes.
+
+    Fires even when a member's declared ``index-history`` value matches the
+    default (``'warn'``) — the rule is about WHERE the field is declared, not
+    what value it holds, so ``Manifest.index_history_policy_explicit`` (not
+    just a non-default value) is what triggers this check.
+    """
+    for member in members:
+        m = member.manifest
+        if m.index_history_policy_explicit:
+            raise MilpaError(
+                WS_INDEX_HISTORY_ON_MEMBER,
+                "index-history is a workspace-root policy; declare it in the "
                 f"workspace root manifest, not in member {member.rel_path!r}",
                 member=member.rel_path,
             )

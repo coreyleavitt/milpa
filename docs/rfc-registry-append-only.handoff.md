@@ -125,8 +125,14 @@ verified index is a valid *successor* of the previous one. Freshness
       convention (field="", kind=frozen-unset) PINNED IN SPEC §3.5.3 by
       orchestrator; 30 in-memory tests incl. hand-computed digest vectors.
       Gate: pytest 2766 green.
-- [ ] A2c — `index-history` axis plumbing (follow `_build_index_trust`
-      pattern; `MilpaEnv.index_trust_config` is dead code — don't inherit).
+- [x] A2c (2026-07-10) — `index-history` axis plumbing: manifest field
+      (root-scoped, both parsers+serializers), WS-INDEX-HISTORY-ON-MEMBER
+      (slug + spec/errors.md + all 3 workspace-construction sites),
+      `_build_index_history` returns bare TrustPolicy str via
+      effective_trust_policy (off is a real value — A2d must distinguish
+      off from gate-absent); context.py untouched (no consumer yet); Rust
+      DEFERRED hold-open re-opened for the 1 WS slug ("A3/A4a parity
+      pending"). 24 tests. Gates: pytest 2793 + rust-conformance green.
 - [ ] A2d — seam wiring + baseline lifecycle (parse-at-gate refactor BOTH
       seams; no-clobber pin; `.meta` lockstep; corrupt mapping; unique
       temp names; root-field check).

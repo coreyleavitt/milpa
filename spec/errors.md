@@ -1336,6 +1336,12 @@ A workspace member manifest declares `entry-trust`. entry-trust is a workspace-R
 
 **Triggered:** every workspace-construction path (loading a workspace from disk, from an in-memory manifest, or with a proposed member-manifest override for a pending mutation) iterates workspace member manifests and finds that one declares `entry-trust` — including an explicit `entry-trust "warn"` that matches the default value. This check fires at workspace-construction time, mirroring `WS-INDEX-TRUST-ON-MEMBER`'s check for the sibling index-trust axis. The error context includes the offending member's path. The fix is to move the declaration to the workspace root manifest.
 
+### `WS-INDEX-HISTORY-ON-MEMBER`
+
+A workspace member manifest declares `index-history`. index-history is a workspace-ROOT policy (`spec/registry-protocol.md §3.4.0`, the generic policy-axis model; instantiated for this axis at `spec/registry-protocol.md §3.5.2`) — the append-only consumer ratchet compares the process-global, workspace-shared registry index against a single baseline, so only the resolution root (the workspace root manifest) may declare its policy.
+
+**Triggered:** every workspace-construction path (loading a workspace from disk, from an in-memory manifest, or with a proposed member-manifest override for a pending mutation) iterates workspace member manifests and finds that one declares `index-history` — including an explicit `index-history "warn"` that matches the default value. This check fires at workspace-construction time, mirroring `WS-ENTRY-TRUST-ON-MEMBER` / `WS-INDEX-TRUST-ON-MEMBER`'s checks for the sibling axes. The error context includes the offending member's path. The fix is to move the declaration to the workspace root manifest.
+
 ### `WS-INDEX-TRUST-ON-MEMBER`
 
 A workspace member manifest declares `index-trust`, `index-trust-signer`, or `index-trust-bundle`. index-trust is a workspace-ROOT policy — the registry index is a process-global, workspace-shared resource, so only the resolution root (the workspace root manifest) may declare trust policy.

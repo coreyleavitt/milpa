@@ -1647,6 +1647,36 @@ class TestTopLevelNodeDispatch:
         assert m.index_trust_signer == signer
         assert m.index_trust_bundle == bundle_url
 
+    # -----------------------------------------------------------------------
+    # A2c (RFC registry-append-only.md §2): index-history node
+    # -----------------------------------------------------------------------
+
+    def test_index_history_warn(self) -> None:
+        """``index-history \"warn\"`` is parsed and stored on the Manifest."""
+        m = parse_manifest('name "x"\nindex-history "warn"\n')
+        assert m.index_history_policy == "warn"
+        assert m.index_history_policy_explicit is True
+
+    def test_index_history_strict(self) -> None:
+        """``index-history \"strict\"`` is parsed correctly."""
+        m = parse_manifest('name "x"\nindex-history "strict"\n')
+        assert m.index_history_policy == "strict"
+
+    def test_index_history_off(self) -> None:
+        """``index-history \"off\"`` preserves the baseline without gating (A2d)."""
+        m = parse_manifest('name "x"\nindex-history "off"\n')
+        assert m.index_history_policy == "off"
+
+    def test_index_history_default_is_warn(self) -> None:
+        """When absent, ``index_history_policy`` defaults to ``'warn'`` and is not explicit."""
+        m = parse_manifest('name "x"\n')
+        assert m.index_history_policy == "warn"
+        assert m.index_history_policy_explicit is False
+
+    def test_index_history_rejects_invalid_value(self) -> None:
+        """``index-history \"enable\"`` → MAN-UNKNOWN-TOP-LEVEL."""
+        assert_slug('name "x"\nindex-history "enable"\n', E.MAN_UNKNOWN_TOP_LEVEL)
+
     def test_dispatch_exhaustive_with_index_trust(self) -> None:
         """The exhaustive dispatch test extended with S5 nodes."""
         signer = "https://github.com/acme/reg/.github/workflows/sign.yaml@refs/heads/main"

@@ -904,6 +904,63 @@ def _build_entry_trust(
     )
 
 
+# ---------------------------------------------------------------------------
+# A2c — index-history policy-axis plumbing (RFC registry-append-only.md §2,
+# spec/registry-protocol.md §3.4.0 / §3.5.2)
+# ---------------------------------------------------------------------------
+
+
+def _load_manifest_index_history_policy(project_dir: Path) -> str:
+    """Load the index-history policy from the resolution ROOT.  Pure I/O.
+
+    index-history is a root-only policy (RFC registry-append-only.md §2),
+    mirroring ``_load_manifest_entry_trust_policy`` for the sibling axis: the
+    resolution root is the workspace root manifest (for a workspace) or the
+    package manifest itself (standalone). Members MUST NOT declare it —
+    ``find_workspace_root`` (via the ``load_workspace`` it performs) raises
+    ``WS-INDEX-HISTORY-ON-MEMBER`` when one does, and that error PROPAGATES
+    from here.
+
+    Only a genuinely-absent standalone manifest degrades to ``"warn"``; a
+    present-but-invalid workspace is a hard error.
+    """
+    ws = find_workspace_root(project_dir)
+    if ws is not None:
+        return ws.workspace_manifest.index_history_policy
+    try:
+        m = load_or_discover_manifest(project_dir)
+    except (OSError, MilpaError):
+        return "warn"
+    return m.index_history_policy
+
+
+def _build_index_history(env: MilpaEnv, project_dir: Path) -> str:
+    """Compute the effective ``index-history`` policy for this invocation.
+
+    A2c is pure policy-axis plumbing: manifest field + ``MILPA_INDEX_HISTORY``
+    env layering, resolved through the shared ``effective_trust_policy`` SSOT
+    (``trust.py``) — the SAME authority formula ``index-trust`` / ``entry-trust``
+    use (spec/registry-protocol.md §3.4.0). Unlike those two axes, no CLI flag
+    escalates ``index-history`` (spec/cli-contract.md §8.7 defines none), so
+    ``flag`` is always ``False``.
+
+    Returns the bare ``TrustPolicy`` value, not a config object: this axis has
+    no signer/bundle/verifier inputs — the ratchet is a pure content diff
+    against a locally-cached baseline, not a Sigstore verification. The A2d
+    slice consumes this policy at the index-cache seam to gate the ratchet
+    (baseline read/compare/write); A2c performs no baseline I/O.
+    """
+    from milpa.trust import effective_trust_policy
+
+    env_history_raw = os.environ.get("MILPA_INDEX_HISTORY", "").strip() or None
+    manifest_policy = _load_manifest_index_history_policy(project_dir)
+    return effective_trust_policy(
+        manifest_policy,  # type: ignore[arg-type]
+        flag=False,
+        env_override=env_history_raw,
+    )
+
+
 def _load_index_for_verb(env: MilpaEnv, project_dir: "Path | None" = None) -> MilpaEnv:
     """Return a new MilpaEnv with the index eagerly loaded (or None if unreachable).
 

@@ -184,6 +184,9 @@ _PACKAGE_TOP_LEVEL: frozenset[str] = frozenset(
         "index-trust-bundle",
         # P3a (RFC per-entry-attestation.md §4): per-entry attestation gate.
         "entry-trust",
+        # A2c (RFC registry-append-only.md §2, spec/registry-protocol.md §3.5.2):
+        # append-only consumer ratchet policy.
+        "index-history",
     }
 )
 
@@ -253,6 +256,10 @@ _WORKSPACE_TOP_LEVEL: frozenset[str] = frozenset(
         # legal ONLY on the workspace root — same root-authority reasoning as
         # index-trust (one shared graph, one trust posture).
         "entry-trust",
+        # A2c (RFC registry-append-only.md §2, spec/registry-protocol.md §3.5.2):
+        # append-only consumer ratchet policy, legal ONLY on the workspace root —
+        # same root-authority reasoning (one shared index, one baseline).
+        "index-history",
     }
 )
 
@@ -567,6 +574,18 @@ class Manifest:
     rule, mirrors ``index_trust_policy_explicit``).  A workspace MEMBER manifest that
     explicitly declares ``entry-trust "warn"`` must still raise
     ``WS-ENTRY-TRUST-ON-MEMBER`` even though the value matches the default."""
+    # A2c (RFC registry-append-only.md §2, spec/registry-protocol.md §3.4.0 /
+    # §3.5.2): append-only consumer ratchet policy.  Root-scoped like
+    # index-trust / entry-trust (one shared index, one baseline) but simpler
+    # still — no signer/bundle sub-fields; the ratchet is a pure content diff
+    # against the locally-cached baseline, not a Sigstore verification.
+    index_history_policy: TrustPolicy = "warn"
+    """Effective index-history policy parsed from ``index-history`` node; defaults to ``'warn'``."""
+    index_history_policy_explicit: bool = False
+    """``True`` iff the source declared an ``index-history`` node (absent-stays-absent
+    rule, mirrors ``entry_trust_policy_explicit``).  A workspace MEMBER manifest that
+    explicitly declares ``index-history "warn"`` must still raise
+    ``WS-INDEX-HISTORY-ON-MEMBER`` even though the value matches the default."""
 
 
 @dataclass(frozen=True)
@@ -615,6 +634,15 @@ class WorkspaceManifest:
     entry_trust_policy_explicit: bool = False
     """``True`` iff the source declared an ``entry-trust`` node (absent-stays-absent
     rule, mirrors ``Manifest.entry_trust_policy_explicit``)."""
+    # A2c (RFC registry-append-only.md §2): index-history, declared ONLY on the
+    # resolution root — same root-authority model as index-trust / entry-trust.
+    # A member manifest declaring it raises ``WS-INDEX-HISTORY-ON-MEMBER`` at
+    # workspace-load time (``workspace.py``, not this module).
+    index_history_policy: TrustPolicy = "warn"
+    """Effective index-history policy for the whole workspace; defaults to ``'warn'``."""
+    index_history_policy_explicit: bool = False
+    """``True`` iff the source declared an ``index-history`` node (absent-stays-absent
+    rule, mirrors ``Manifest.index_history_policy_explicit``)."""
 
 
 # ---------------------------------------------------------------------------
@@ -988,6 +1016,24 @@ def _parse_entry_trust_node(n: "KdlNode") -> TrustPolicy:
     return _parse_trust_policy(raw_args[0], node="entry-trust")
 
 
+def _parse_index_history_node(n: "KdlNode") -> TrustPolicy:
+    """Parse an ``index-history "<policy>"`` node into a ``TrustPolicy``.
+
+    A2c (RFC registry-append-only.md §2): shares the ``TrustPolicy`` type and
+    ``_parse_trust_policy`` mechanism with index-trust / entry-trust /
+    attestation-policy, on its own axis (spec/registry-protocol.md §3.4.0).
+    """
+    raw_args = node_args(n)
+    if len(raw_args) != 1 or not isinstance(raw_args[0], str):
+        raise MilpaError(
+            MAN_UNKNOWN_TOP_LEVEL,
+            "'index-history' takes exactly one string argument "
+            "('warn', 'strict', or 'off')",
+            node="index-history",
+        )
+    return _parse_trust_policy(raw_args[0], node="index-history")
+
+
 def _parse_index_trust_signer_node(n: "KdlNode") -> str:
     """Parse an ``index-trust-signer "<identity>"`` node into its raw string."""
     raw_args = node_args(n)
@@ -1035,6 +1081,9 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
     # P3a: entry-trust node (RFC per-entry-attestation.md §4)
     entry_trust_policy: TrustPolicy = "warn"
     entry_trust_policy_explicit: bool = False
+    # A2c: index-history node (RFC registry-append-only.md §2)
+    index_history_policy: TrustPolicy = "warn"
+    index_history_policy_explicit: bool = False
     seen_top_level: set[str] = set()
 
     for n in nodes(doc):
@@ -1180,6 +1229,11 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
             entry_trust_policy = _parse_entry_trust_node(n)
             entry_trust_policy_explicit = True
 
+        elif nm == "index-history":
+            # A2c: append-only consumer ratchet policy (RFC registry-append-only.md §2).
+            index_history_policy = _parse_index_history_node(n)
+            index_history_policy_explicit = True
+
         elif nm == "flags":
             flags = _parse_flags_block(n)
 
@@ -1253,6 +1307,8 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
         index_trust_policy_explicit=index_trust_policy_explicit,
         entry_trust_policy=entry_trust_policy,
         entry_trust_policy_explicit=entry_trust_policy_explicit,
+        index_history_policy=index_history_policy,
+        index_history_policy_explicit=index_history_policy_explicit,
     )
 
 
@@ -1295,6 +1351,9 @@ def _parse_workspace_doc(doc: KdlDocument) -> WorkspaceManifest:
     # P3a (RFC per-entry-attestation.md §4): same root-authority model.
     ws_entry_trust_policy: TrustPolicy = "warn"
     ws_entry_trust_policy_explicit: bool = False
+    # A2c (RFC registry-append-only.md §2): same root-authority model.
+    ws_index_history_policy: TrustPolicy = "warn"
+    ws_index_history_policy_explicit: bool = False
 
     for n in nodes(doc):
         nm = node_name(n)
@@ -1383,6 +1442,11 @@ def _parse_workspace_doc(doc: KdlDocument) -> WorkspaceManifest:
             ws_entry_trust_policy = _parse_entry_trust_node(n)
             ws_entry_trust_policy_explicit = True
 
+        elif nm == "index-history":
+            # A2c (RFC registry-append-only.md §2): root-authority policy.
+            ws_index_history_policy = _parse_index_history_node(n)
+            ws_index_history_policy_explicit = True
+
     return WorkspaceManifest(
         members=tuple(members),
         overrides=tuple(overrides),
@@ -1394,6 +1458,8 @@ def _parse_workspace_doc(doc: KdlDocument) -> WorkspaceManifest:
         index_trust_policy_explicit=ws_index_trust_policy_explicit,
         entry_trust_policy=ws_entry_trust_policy,
         entry_trust_policy_explicit=ws_entry_trust_policy_explicit,
+        index_history_policy=ws_index_history_policy,
+        index_history_policy_explicit=ws_index_history_policy_explicit,
     )
 
 
@@ -2896,6 +2962,12 @@ def format_manifest(manifest: Manifest) -> str:
         lines.append(f'entry-trust "{_kdl_str(manifest.entry_trust_policy)}"')
         lines.append("")
 
+    # index-history (A2c, RFC registry-append-only.md §2). Same absent-stays-
+    # absent rule as index-trust / entry-trust (§ above).
+    if manifest.index_history_policy_explicit:
+        lines.append(f'index-history "{_kdl_str(manifest.index_history_policy)}"')
+        lines.append("")
+
     # kind — always last (Rust canonical ordering)
     lines.append(f'kind "{_kdl_str(manifest.kind)}"')
 
@@ -3033,6 +3105,11 @@ def format_workspace_manifest(ws: "WorkspaceManifest") -> str:
     # entry-trust (P3a, RFC per-entry-attestation.md §4 — root-authority policy).
     if ws.entry_trust_policy_explicit:
         lines.append(f'entry-trust "{_kdl_str(ws.entry_trust_policy)}"')
+        lines.append("")
+
+    # index-history (A2c, RFC registry-append-only.md §2 — root-authority policy).
+    if ws.index_history_policy_explicit:
+        lines.append(f'index-history "{_kdl_str(ws.index_history_policy)}"')
         lines.append("")
 
     # Strip any trailing blank line so the file ends after the last block.

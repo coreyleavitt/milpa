@@ -155,9 +155,14 @@ fn spec_error_codes() -> BTreeSet<String> {
 /// `check_member_entry_trust_declarations` in `workspace.rs`. All 9 codes
 /// moved from DEFERRED to `implemented_error_codes()`.
 ///
-/// `DEFERRED` is now EMPTY — every spec code either has a Rust raise site or
-/// is listed in `EXEMPT` below.
-const DEFERRED: &[&str] = &[];
+/// A2c (RFC `rfc-registry-append-only.md`, Python-only slice): added
+/// `WS-INDEX-HISTORY-ON-MEMBER` to spec/errors.md and errors.py, with a
+/// Python raise site in `workspace.py`'s `_check_member_index_history_declarations`
+/// (mirroring `_check_member_entry_trust_declarations`). This is the ONE
+/// slug this implementation currently defers: the `index-history`
+/// manifest field / `MILPA_INDEX_HISTORY` env / effective-policy plumbing
+/// has no Rust counterpart yet. Rust parity is scheduled for A3/A4a.
+const DEFERRED: &[&str] = &["WS-INDEX-HISTORY-ON-MEMBER"];
 
 /// Spec codes this implementation intentionally never emits.
 const EXEMPT: &[&str] = &[

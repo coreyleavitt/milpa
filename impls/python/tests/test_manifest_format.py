@@ -294,6 +294,51 @@ class TestIndexTrustRoundTrip:
         assert reparsed.index_trust_policy == "warn"
 
 
+class TestIndexHistoryRoundTrip:
+    """A2c (RFC registry-append-only.md §2): index-history must survive a
+    format_manifest → parse_manifest round trip.  Mirrors TestIndexTrustRoundTrip
+    for the sibling axis — a declared "strict" policy must not silently revert
+    to the "warn" default when `milpa add`/`remove` rewrite milpa.kdl.
+    """
+
+    def test_policy_round_trips(self) -> None:
+        m = Manifest(
+            name="pkg",
+            deps=(),
+            index_history_policy="strict",
+            index_history_policy_explicit=True,
+        )
+        out = format_manifest(m)
+        assert 'index-history "strict"' in out
+
+        reparsed = parse_manifest(out)
+        assert reparsed.index_history_policy == "strict"
+        assert reparsed.index_history_policy_explicit is True
+
+    def test_policy_not_explicit_stays_absent(self) -> None:
+        """A manifest that never declared index-history must not gain one on format."""
+        m = Manifest(name="pkg", deps=())
+        out = format_manifest(m)
+        assert "index-history " not in out
+        assert "index-history\n" not in out
+        reparsed = parse_manifest(out)
+        assert reparsed.index_history_policy_explicit is False
+        assert reparsed.index_history_policy == "warn"
+
+    def test_explicit_warn_round_trips_as_explicit(self) -> None:
+        """index-history "warn" (matching the default value) must still round-trip
+        as explicitly declared — the WHERE, not the value, is what matters for
+        WS-INDEX-HISTORY-ON-MEMBER (spec: registry-protocol.md §3.4.0 / §3.5.2)."""
+        text = 'name "pkg"\nindex-history "warn"\n'
+        m = parse_manifest(text)
+        assert m.index_history_policy_explicit is True
+        out = format_manifest(m)
+        assert 'index-history "warn"' in out
+        reparsed = parse_manifest(out)
+        assert reparsed.index_history_policy_explicit is True
+        assert reparsed.index_history_policy == "warn"
+
+
 class TestUrlAnnotation:
     """§2: (url) annotation required on all URL fields in serialized output."""
 
@@ -1427,6 +1472,60 @@ class TestFormatWorkspaceManifest:
             "remove-member rewrite must not revert a declared strict policy to warn"
         )
         assert reparsed.index_trust_policy_explicit is True
+
+    # -- A2c: index-history round-trip (workspace root, root-authority model) --
+
+    def test_index_history_policy_round_trip(self) -> None:
+        """A workspace-root index-history "strict" must survive a
+        format_workspace_manifest → parse round trip.  Mirrors the index-trust
+        round-trip tests above for the sibling axis."""
+        from milpa.manifest import WorkspaceManifest, format_workspace_manifest, parse_workspace_or_manifest
+        ws = WorkspaceManifest(
+            members=("pkg",),
+            index_history_policy="strict",
+            index_history_policy_explicit=True,
+        )
+        out = format_workspace_manifest(ws)
+        assert 'index-history "strict"' in out
+
+        reparsed = parse_workspace_or_manifest(out)
+        assert isinstance(reparsed, WorkspaceManifest)
+        assert reparsed.index_history_policy == "strict"
+        assert reparsed.index_history_policy_explicit is True
+
+    def test_index_history_not_explicit_stays_absent(self) -> None:
+        """A workspace root that never declared index-history must not gain one."""
+        from milpa.manifest import WorkspaceManifest, format_workspace_manifest, parse_workspace_or_manifest
+        ws = WorkspaceManifest(members=("pkg",))
+        out = format_workspace_manifest(ws)
+        assert "index-history " not in out
+        assert "index-history\n" not in out
+        reparsed = parse_workspace_or_manifest(out)
+        assert isinstance(reparsed, WorkspaceManifest)
+        assert reparsed.index_history_policy_explicit is False
+        assert reparsed.index_history_policy == "warn"
+
+    def test_index_history_survives_add_member_rewrite(self) -> None:
+        """A workspace-root "strict" policy must survive a simulated
+        add-member rewrite (`milpa workspace add-member`)."""
+        from dataclasses import replace
+
+        from milpa.manifest import WorkspaceManifest, format_workspace_manifest, parse_workspace_or_manifest
+
+        ws = WorkspaceManifest(
+            members=("pkg-a",),
+            index_history_policy="strict",
+            index_history_policy_explicit=True,
+        )
+        ws_with_new_member = replace(ws, members=ws.members + ("pkg-b",))
+        out = format_workspace_manifest(ws_with_new_member)
+        reparsed = parse_workspace_or_manifest(out)
+        assert isinstance(reparsed, WorkspaceManifest)
+        assert reparsed.members == ("pkg-a", "pkg-b")
+        assert reparsed.index_history_policy == "strict", (
+            "add-member rewrite must not revert a declared strict policy to warn"
+        )
+        assert reparsed.index_history_policy_explicit is True
 
 
 # ---------------------------------------------------------------------------
