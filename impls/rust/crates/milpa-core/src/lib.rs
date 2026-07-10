@@ -12,7 +12,10 @@
 use std::path::Path;
 
 use milpa_manifest::{Manifest, Workspace};
-pub use milpa_types::{ActivationSource, LockedDep, Lockfile, ProvenanceRecord};
+pub use milpa_types::{
+    ActivationSource, AttestationKind, EntryAttestation, LockAttestation, LockedDep, Lockfile,
+    ProvenanceRecord, RekorRef,
+};
 use milpa_types::ResolvedGraph;
 
 pub mod dag_identity;

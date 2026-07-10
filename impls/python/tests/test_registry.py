@@ -41,8 +41,10 @@ from milpa.errors import (
 from milpa.registry import (
     TIANGUIS_INDEX_SCHEMA_VERSION,
     AmbiguousName,
+    AuthorSigned,
     GitIndexProvenance,
     Index,
+    MilpaVendored,
     OciIndexProvenance,
     Package,
     _validate_commit_sha,
@@ -149,12 +151,189 @@ class TestParseIndexValid:
         assert prov.ref == "HEAD"
         assert prov.commit_sha == "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
 
-    def test_rekor_block_is_tolerated_and_ignored(self) -> None:
-        """rekor block MUST NOT cause a parse error; IndexVersion has no rekor field."""
+    def test_rekor_block_folds_into_attestation(self) -> None:
+        """rekor folds into EntryAttestation.rekor when attestation is present.
+
+        Inverts the prior tolerate-and-ignore behavior: registry-protocol.md
+        §3.2 now parses `attestation`/`signed_by`/`rekor` into a typed
+        `EntryAttestation` record instead of discarding them (RFC
+        per-entry-attestation.md P2 slice).
+        """
         idx = parse_index(MINIMAL_INDEX)
         nimkdl = next(p for p in idx.packages if p.name == "nimkdl")
         iv = nimkdl.versions[0]
-        assert not hasattr(iv, "rekor")
+        assert iv.attestation is not None
+        assert isinstance(iv.attestation.kind, AuthorSigned)
+        assert iv.attestation.kind.signer == (
+            "https://github.com/coreyleavitt/tianguis/.github/workflows/publish.yaml"
+        )
+        assert iv.attestation.rekor is not None
+        assert iv.attestation.rekor.uuid == (
+            "108e9186e8c5677abce5a62d285437741218f878474a02d9a4dac01dc12e39b979336e712890d636"
+        )
+        assert iv.attestation.rekor.log_index == "1753541583"
+        assert iv.attestation.rekor.integrated_time == "1780881469"
+        assert iv.attestation.bundle_pin is None
+
+    def test_rekor_without_attestation_is_tolerated_and_ignored(self) -> None:
+        """A lone `rekor` block with no `attestation` kind is still forward-compat
+        ignored — there is no kind to tag it with (registry-protocol §3.2 NORMATIVE)."""
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+        rekor {
+            uuid "abc"
+            log_index "1"
+            integrated_time "2"
+        }
+    }
+}
+"""
+        idx = parse_index(text)
+        iv = idx.packages[0].versions[0]
+        assert iv.attestation is None
+
+    def test_milpa_vendored_has_no_signer(self) -> None:
+        idx = parse_index(MINIMAL_INDEX)
+        chronos = next(p for p in idx.packages if p.name == "chronos")
+        iv = chronos.versions[0]
+        assert iv.attestation is not None
+        assert isinstance(iv.attestation.kind, MilpaVendored)
+        assert iv.attestation.rekor is None
+        assert iv.attestation.bundle_pin is None
+
+    def test_unrecognized_attestation_kind_collapses_to_unattested(self) -> None:
+        """Closed kind set (registry-protocol §3.2 NORMATIVE): an unrecognized
+        `attestation` value MUST collapse to None with an observable diagnostic."""
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+        attestation "bogus-kind"
+    }
+}
+"""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            idx = parse_index(text)
+        iv = idx.packages[0].versions[0]
+        assert iv.attestation is None
+        messages = [str(w.message) for w in caught]
+        assert any("bogus-kind" in m and "foo" in m for m in messages)
+
+    def test_author_signed_missing_signed_by_collapses_to_unattested(self) -> None:
+        """`author-signed` with no sibling `signed_by` is structurally invalid —
+        MUST collapse to None with an observable diagnostic (registry-protocol §3.2)."""
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+        attestation "author-signed"
+    }
+}
+"""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            idx = parse_index(text)
+        iv = idx.packages[0].versions[0]
+        assert iv.attestation is None
+        messages = [str(w.message) for w in caught]
+        assert any("author-signed" in m and "foo" in m for m in messages)
+
+    def test_bundle_pin_captured_when_valid(self) -> None:
+        hex64 = "a" * 64
+        text = f"""\
+schema_version 1
+package "foo" {{
+    version "1.0.0" {{
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {{
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }}
+        attestation "author-signed"
+        signed_by "https://example.com/workflow.yaml"
+        bundle sha256="{hex64}"
+    }}
+}}
+"""
+        idx = parse_index(text)
+        iv = idx.packages[0].versions[0]
+        assert iv.attestation is not None
+        assert iv.attestation.bundle_pin == hex64
+
+    def test_malformed_bundle_pin_drops_pin_without_collapsing_kind(self) -> None:
+        """A malformed `bundle sha256=` value normalizes ONLY bundle_pin to None
+        — it MUST NOT collapse an otherwise well-formed kind/signer pairing
+        (registry-protocol §3.2 NORMATIVE)."""
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+        attestation "author-signed"
+        signed_by "https://example.com/workflow.yaml"
+        bundle sha256="not-valid-hex"
+    }
+}
+"""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            idx = parse_index(text)
+        iv = idx.packages[0].versions[0]
+        assert iv.attestation is not None
+        assert isinstance(iv.attestation.kind, AuthorSigned)
+        assert iv.attestation.bundle_pin is None
+        messages = [str(w.message) for w in caught]
+        assert any("bundle" in m and "not-valid-hex" in m for m in messages)
+
+    def test_no_attestation_node_is_unattested(self) -> None:
+        """A legacy entry with none of the four sibling nodes parses as unattested,
+        with no diagnostic (absence is not a collapse — registry-protocol §3.2)."""
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+    }
+}
+"""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            idx = parse_index(text)
+        iv = idx.packages[0].versions[0]
+        assert iv.attestation is None
+        assert len(caught) == 0
 
     def test_url_annotated_form_accepted(self) -> None:
         """(url)-annotated URL values must be accepted (registry-protocol §3.3 NORMATIVE)."""

@@ -1534,7 +1534,23 @@ def cmd_show(project_dir: Path) -> int:
         # that a dep was deduped (e.g. "bar" → canonical "foo").
         if dep.aliases:
             print(f"  aliases     {', '.join(sorted(dep.aliases))}")
+        # RFC per-entry-attestation.md P2 (§7): render the lockfile's
+        # attestation block as an UNVERIFIED claim — no crypto has ever been
+        # run over it.  The wording upgrades to a verified fact only once the
+        # (later) P3 entry-trust gate exists; this schema does not change.
+        if dep.attestation is not None:
+            print(f"  attestation {_format_attestation_claim(dep.attestation)}")
     return 0
+
+
+def _format_attestation_claim(att: object) -> str:
+    from milpa.lockfile import LockAttestation
+    from milpa.registry import AuthorSigned
+
+    assert isinstance(att, LockAttestation)
+    if isinstance(att.kind, AuthorSigned):
+        return f"claims author-signed by {att.kind.signer}"
+    return "claims milpa-vendored"
 
 
 def _format_provenance(p: object) -> str:

@@ -13,7 +13,7 @@ use std::path::Path;
 
 use milpa_manifest::{Dep, Manifest};
 use milpa_solver::{parse_version, Strategy};
-use milpa_types::{LockedDep, Lockfile, ProvenanceRecord, ResolvedDep, ResolvedGraph};
+use milpa_types::{EntryAttestation, LockedDep, Lockfile, ProvenanceRecord, ResolvedDep, ResolvedGraph};
 
 use crate::error::{CoreError, MilpaError};
 use crate::store::CaStore;
@@ -429,6 +429,16 @@ fn resolved_from_locked(locked: &LockedDep) -> Result<ResolvedDep, MilpaError> {
         aliases: locked.aliases.clone(),
         // S5: frozen path carries active_flags from the lockfile.
         active_flags: locked.active_flags.clone(),
+        // RFC per-entry-attestation.md P2 (§8 Command Coverage): the frozen
+        // path carries the lockfile's attestation CLAIM through, nothing
+        // re-checked. Widen LockAttestation (no bundle_pin) back to the
+        // EntryAttestation shape ResolvedDep carries; bundle_pin is always
+        // None here since it was never persisted to the lockfile (§3.9).
+        attestation: locked.attestation.as_ref().map(|a| EntryAttestation {
+            kind: a.kind.clone(),
+            rekor: a.rekor.clone(),
+            bundle_pin: None,
+        }),
     })
 }
 

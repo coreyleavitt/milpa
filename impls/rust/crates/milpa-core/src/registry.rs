@@ -18,7 +18,7 @@
 use kdl::{KdlDocument, KdlNode};
 use milpa_manifest::{kdl_block_comment_depth, kdl_brace_depth, KDL_MAX_NESTING_DEPTH};
 use milpa_solver::{parse_version, VersionSet};
-use milpa_types::Provenance;
+use milpa_types::{AttestationKind, EntryAttestation, Provenance, RekorRef};
 
 use crate::error::CoreError;
 
@@ -151,6 +151,11 @@ pub struct IndexVersion {
     /// The DepDecl schema version integer that produced `dep_decl`
     /// (registry-protocol §3.2.1).  `None` when absent.
     pub dep_decl_schema_version: Option<i64>,
+    /// RFC per-entry-attestation.md P2 (registry-protocol §3.2): the per-entry
+    /// Layer 2 attribution CLAIM, or `None` when the entry carries no
+    /// attestation record, OR when a present record failed the closed-set /
+    /// structural-validity check and conservatively collapsed to unattested.
+    pub attestation: Option<EntryAttestation>,
 }
 
 /// A package: a `(namespace, name)` identity plus its versions (newest-first).
@@ -212,6 +217,13 @@ impl Index {
         check_schema_version(&doc)?;
 
         let mut packages: Vec<Package> = Vec::new();
+        // RFC per-entry-attestation.md P2 (registry-protocol §3.2 NORMATIVE
+        // "parse boundary shape"): the version-node parser returns collapse
+        // diagnostics; `Index::parse`'s PUBLIC signature stays a bare `Index`
+        // (deliberate scope decision — mirrors the Python impl), so
+        // diagnostics accumulate here and surface via the established
+        // `[milpa] warning:` eprintln convention instead of a return value.
+        let mut diagnostics: Vec<String> = Vec::new();
         for node in doc.nodes() {
             if node.name().value() != "package" {
                 continue;
@@ -239,7 +251,9 @@ impl Index {
                     continue; // duplicate-version tolerance: keep the first
                 }
                 seen.push(ver.clone());
-                versions.push(parse_version_node(&ver, child)?);
+                let (iv, iv_diagnostics) = parse_version_node(&namespace, &name, &ver, child)?;
+                diagnostics.extend(iv_diagnostics);
+                versions.push(iv);
             }
 
             // Newest-first: parseable versions descending, then unparseable in
@@ -259,6 +273,9 @@ impl Index {
                 namespace,
                 versions: parseable,
             });
+        }
+        for diag in &diagnostics {
+            eprintln!("[milpa] warning: {diag}");
         }
         Ok(Index { packages })
     }
@@ -450,7 +467,18 @@ fn check_schema_version(doc: &KdlDocument) -> Result<(), CoreError> {
     Ok(())
 }
 
-fn parse_version_node(ver: &str, node: &KdlNode) -> Result<IndexVersion, CoreError> {
+/// Parse one `version "<ver>" { … }` node into an `IndexVersion`.
+///
+/// Returns `(IndexVersion, collapse diagnostics)` — registry-protocol §3.2
+/// NORMATIVE "parse boundary shape". The diagnostics list is non-empty only
+/// when the entry's attestation record collapsed (closed-set violation,
+/// structurally-invalid `author-signed`, or a malformed `bundle` pin).
+fn parse_version_node(
+    namespace: &str,
+    pkg_name: &str,
+    ver: &str,
+    node: &KdlNode,
+) -> Result<(IndexVersion, Vec<String>), CoreError> {
     let content_hash = child_arg_str(node, "content_hash").unwrap_or_default();
     let dep_decl_raw = child_arg_str(node, "dep_decl").filter(|s| !s.is_empty());
     if let Some(ref ptr) = dep_decl_raw {
@@ -496,13 +524,125 @@ fn parse_version_node(ver: &str, node: &KdlNode) -> Result<IndexVersion, CoreErr
             _ => {}
         }
     }
-    Ok(IndexVersion {
-        version: ver.to_string(),
-        content_hash,
-        provenances,
-        dep_decl,
-        dep_decl_schema_version,
-    })
+    let (attestation, diagnostics) = parse_entry_attestation(namespace, pkg_name, ver, node);
+
+    Ok((
+        IndexVersion {
+            version: ver.to_string(),
+            content_hash,
+            provenances,
+            dep_decl,
+            dep_decl_schema_version,
+            attestation,
+        },
+        diagnostics,
+    ))
+}
+
+/// Parse the `attestation`/`signed_by`/`rekor`/`bundle` sibling child nodes of
+/// one `version` node into an `EntryAttestation` or `None` (registry-protocol
+/// §3.2 NORMATIVE).
+///
+/// Conservative collapse: an unrecognized `attestation` kind, or
+/// `"author-signed"` with no `signed_by`, collapses the WHOLE record to
+/// `None` (unattested) with an observable diagnostic. A malformed `bundle`
+/// pin is narrower — it collapses only the bundle pin to `None`, never the
+/// enclosing kind/signer pairing (registry-protocol §3.2 NORMATIVE).
+fn parse_entry_attestation(
+    namespace: &str,
+    pkg_name: &str,
+    ver: &str,
+    node: &KdlNode,
+) -> (Option<EntryAttestation>, Vec<String>) {
+    let coordinate = format!("pkg:tianguis/{namespace}/{pkg_name}@{ver}");
+    let mut diagnostics: Vec<String> = Vec::new();
+
+    let attestation_label = child_arg_str(node, "attestation");
+    let rekor = parse_rekor_block(node);
+    let (bundle_pin, bundle_diag) = parse_bundle_pin(node, &coordinate);
+    diagnostics.extend(bundle_diag);
+
+    let Some(label) = attestation_label else {
+        // No attestation kind: a lone `rekor` block (if any) does not
+        // construct an EntryAttestation — there is no kind to tag it with
+        // (§3.2 NORMATIVE).
+        return (None, diagnostics);
+    };
+
+    let kind: AttestationKind = match label.as_str() {
+        "author-signed" => {
+            let signed_by = child_arg_str(node, "signed_by");
+            match signed_by {
+                Some(signer) if !signer.is_empty() => AttestationKind::AuthorSigned { signer },
+                _ => {
+                    diagnostics.push(format!(
+                        "attestation claim for {coordinate} collapsed to unattested: \
+                         \"author-signed\" with no signed_by (registry-protocol §3.2)"
+                    ));
+                    return (None, diagnostics);
+                }
+            }
+        }
+        "milpa-vendored" => AttestationKind::MilpaVendored,
+        other => {
+            diagnostics.push(format!(
+                "attestation claim for {coordinate} collapsed to unattested: \
+                 unrecognized kind {other:?} (registry-protocol §3.2)"
+            ));
+            return (None, diagnostics);
+        }
+    };
+
+    (
+        Some(EntryAttestation {
+            kind,
+            rekor,
+            bundle_pin,
+        }),
+        diagnostics,
+    )
+}
+
+/// Parse the optional `rekor { uuid; log_index; integrated_time }` block.
+fn parse_rekor_block(node: &KdlNode) -> Option<RekorRef> {
+    for child in children(node) {
+        if child.name().value() == "rekor" {
+            return Some(RekorRef {
+                uuid: child_arg_str(child, "uuid").unwrap_or_default(),
+                log_index: child_arg_str(child, "log_index").unwrap_or_default(),
+                integrated_time: child_arg_str(child, "integrated_time").unwrap_or_default(),
+            });
+        }
+    }
+    None
+}
+
+/// Parse the optional `bundle sha256="<64-hex>"` delivery-integrity pin.
+///
+/// A malformed value normalizes to `None` with a diagnostic, WITHOUT
+/// collapsing the enclosing kind/signer pairing (registry-protocol §3.2
+/// NORMATIVE — an absent bundle pin is the ordinary, expected pre-delivery
+/// state, not evidence of a malformed claim).
+fn parse_bundle_pin(node: &KdlNode, coordinate: &str) -> (Option<String>, Vec<String>) {
+    for child in children(node) {
+        if child.name().value() != "bundle" {
+            continue;
+        }
+        let Some(raw) = child_prop_str(child, "sha256") else {
+            return (None, Vec::new());
+        };
+        if is_lower_hex(&raw, 64) {
+            return (Some(raw), Vec::new());
+        }
+        return (
+            None,
+            vec![format!(
+                "bundle pin for {coordinate} dropped: malformed sha256 value \
+                 {raw:?} (registry-protocol §3.2)"
+            )],
+        );
+    }
+    (None, Vec::new())
 }
 
 /// First positional argument of `node` as a string, or `None`.
@@ -522,6 +662,17 @@ fn child_arg_str(node: &KdlNode, child_name: &str) -> Option<String> {
         .into_iter()
         .find(|c| c.name().value() == child_name)
         .and_then(first_arg_str)
+}
+
+/// Named property `key="…"` (not a positional arg) on `node`, as a string, or
+/// `None` if absent / wrong type. Used for `bundle sha256="<64-hex>"`, whose
+/// value is a KDL property rather than a positional argument.
+fn child_prop_str(node: &KdlNode, key: &str) -> Option<String> {
+    node.entries()
+        .iter()
+        .find(|e| e.name().map(|n| n.value()) == Some(key))
+        .and_then(|e| e.value().as_string())
+        .map(str::to_string)
 }
 
 /// First positional arg (integer) of `node`'s child named `child_name`, or

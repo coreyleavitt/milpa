@@ -192,6 +192,49 @@ class TestFrozenCarriesAliases:
 
 
 # ---------------------------------------------------------------------------
+# Test 1b — RFC per-entry-attestation.md P2 (§8 Command Coverage): the frozen
+# fetch path carries the lockfile's attestation CLAIM through, nothing
+# re-checked. Mirrors TestFrozenCarriesAliases's tracer/regression shape.
+# ---------------------------------------------------------------------------
+
+
+class TestFrozenCarriesAttestation:
+    def test_attestation_carried_through_frozen_reconstruction(self, tmp_path: Path) -> None:
+        import dataclasses
+
+        from milpa.lockfile import LockAttestation
+        from milpa.registry import AuthorSigned, EntryAttestation, RekorRef
+
+        env, identity = _make_env_with_tree(tmp_path)
+        deps_dir = tmp_path / "_deps"
+
+        att = LockAttestation(
+            kind=AuthorSigned(signer="https://example.com/wf.yaml"),
+            rekor=RekorRef(uuid="u", log_index="1", integrated_time="2"),
+        )
+        locked = dataclasses.replace(_locked_dep("foo", identity=identity), attestation=att)
+        lockfile = Lockfile(deps=(locked,), strategy="maxver")
+        manifest = _manifest_with_dep("foo")
+
+        graph = resolve_frozen(manifest, lockfile, env, deps_dir)
+
+        dep = graph.deps[0]
+        assert dep.attestation == EntryAttestation(kind=att.kind, rekor=att.rekor, bundle_pin=None)
+
+    def test_no_attestation_stays_none(self, tmp_path: Path) -> None:
+        env, identity = _make_env_with_tree(tmp_path)
+        deps_dir = tmp_path / "_deps"
+
+        locked = _locked_dep("foo", identity=identity)
+        lockfile = Lockfile(deps=(locked,), strategy="maxver")
+        manifest = _manifest_with_dep("foo")
+
+        graph = resolve_frozen(manifest, lockfile, env, deps_dir)
+
+        assert graph.deps[0].attestation is None
+
+
+# ---------------------------------------------------------------------------
 # Test 2 — provenances: all provenances carried (not just first)
 # ---------------------------------------------------------------------------
 

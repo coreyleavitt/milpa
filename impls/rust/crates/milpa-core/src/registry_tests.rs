@@ -227,6 +227,7 @@ fn ver(v: &str, hash: &str, provs: Vec<Provenance>) -> IndexVersion {
         provenances: provs,
         dep_decl: None,
         dep_decl_schema_version: None,
+        attestation: None,
     }
 }
 
@@ -367,4 +368,218 @@ fn s2_dep_decl_schema_version_absent_yields_none() {
     let idx = Index::parse(&index_without_dep_decl()).unwrap();
     let iv = &idx.packages[0].versions[0];
     assert!(iv.dep_decl_schema_version.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// RFC per-entry-attestation.md P2 — EntryAttestation parse (registry-protocol §3.2)
+// ---------------------------------------------------------------------------
+
+fn index_author_signed_with_rekor() -> String {
+    format!(
+        "schema_version 1\n\
+         package \"nimkdl\" {{\n\
+         \x20   namespace \"coreyleavitt\"\n\
+         \x20   version \"0.1.4\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://github.com/coreyleavitt/nimkdl\"\n\
+         \x20           ref \"v0.1.4\"\n\
+         \x20       }}\n\
+         \x20       attestation \"author-signed\"\n\
+         \x20       signed_by \"https://github.com/coreyleavitt/tianguis/.github/workflows/publish.yaml\"\n\
+         \x20       rekor {{\n\
+         \x20           uuid \"108e9186e8c5677abce5a62d285437741218f878474a02d9a4dac01dc12e39b979336e712890d636\"\n\
+         \x20           log_index \"1753541583\"\n\
+         \x20           integrated_time \"1780881469\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n"
+    )
+}
+
+#[test]
+fn test_rekor_block_folds_into_attestation() {
+    // Inverts the prior tolerate-and-ignore behavior: registry-protocol.md
+    // §3.2 now parses `attestation`/`signed_by`/`rekor` into a typed
+    // `EntryAttestation` record instead of discarding them (RFC
+    // per-entry-attestation.md P2 slice).
+    let idx = Index::parse(&index_author_signed_with_rekor()).unwrap();
+    let iv = &idx.packages[0].versions[0];
+    let att = iv.attestation.as_ref().expect("must be attested");
+    match &att.kind {
+        AttestationKind::AuthorSigned { signer } => {
+            assert_eq!(
+                signer,
+                "https://github.com/coreyleavitt/tianguis/.github/workflows/publish.yaml"
+            );
+        }
+        AttestationKind::MilpaVendored => panic!("expected AuthorSigned"),
+    }
+    let rekor = att.rekor.as_ref().expect("rekor must be present");
+    assert_eq!(
+        rekor.uuid,
+        "108e9186e8c5677abce5a62d285437741218f878474a02d9a4dac01dc12e39b979336e712890d636"
+    );
+    assert_eq!(rekor.log_index, "1753541583");
+    assert_eq!(rekor.integrated_time, "1780881469");
+    assert!(att.bundle_pin.is_none());
+}
+
+#[test]
+fn test_rekor_without_attestation_is_tolerated_and_ignored() {
+    // A lone `rekor` block with no `attestation` kind is still forward-compat
+    // ignored — there is no kind to tag it with (registry-protocol §3.2 NORMATIVE).
+    let text = format!(
+        "schema_version 1\n\
+         package \"foo\" {{\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://example.com/foo.git\"\n\
+         \x20           ref \"main\"\n\
+         \x20       }}\n\
+         \x20       rekor {{\n\
+         \x20           uuid \"abc\"\n\
+         \x20           log_index \"1\"\n\
+         \x20           integrated_time \"2\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n"
+    );
+    let idx = Index::parse(&text).unwrap();
+    let iv = &idx.packages[0].versions[0];
+    assert!(iv.attestation.is_none());
+}
+
+#[test]
+fn test_milpa_vendored_has_no_signer() {
+    let text = format!(
+        "schema_version 1\n\
+         package \"chronos\" {{\n\
+         \x20   namespace \"status-im\"\n\
+         \x20   version \"4.0.3\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://github.com/status-im/nim-chronos\"\n\
+         \x20           ref \"HEAD\"\n\
+         \x20       }}\n\
+         \x20       attestation \"milpa-vendored\"\n\
+         \x20   }}\n\
+         }}\n"
+    );
+    let idx = Index::parse(&text).unwrap();
+    let iv = &idx.packages[0].versions[0];
+    let att = iv.attestation.as_ref().expect("must be attested");
+    assert!(matches!(att.kind, AttestationKind::MilpaVendored));
+    assert!(att.rekor.is_none());
+    assert!(att.bundle_pin.is_none());
+}
+
+/// A minimal single-version `version` KdlNode for exercising `parse_version_node`
+/// directly (diagnostics-vector assertions — this test module is a submodule of
+/// `registry` via `super::*`, so private items are reachable).
+fn one_version_node(inner: &str) -> kdl::KdlDocument {
+    let text = format!(
+        "package \"foo\" {{\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://example.com/foo.git\"\n\
+         \x20           ref \"main\"\n\
+         \x20       }}\n\
+         {inner}\
+         \x20   }}\n\
+         }}\n"
+    );
+    kdl::KdlDocument::parse(&text).unwrap()
+}
+
+fn version_child(doc: &kdl::KdlDocument) -> kdl::KdlNode {
+    let pkg = doc.nodes().iter().find(|n| n.name().value() == "package").unwrap();
+    pkg.children()
+        .unwrap()
+        .nodes()
+        .iter()
+        .find(|n| n.name().value() == "version")
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn test_unrecognized_attestation_kind_collapses_to_unattested() {
+    // Closed kind set (registry-protocol §3.2 NORMATIVE): an unrecognized
+    // `attestation` value MUST collapse to None with an observable diagnostic.
+    let doc = one_version_node("        attestation \"bogus-kind\"\n");
+    let node = version_child(&doc);
+    let (iv, diagnostics) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    assert!(iv.attestation.is_none());
+    assert!(
+        diagnostics.iter().any(|m| m.contains("bogus-kind") && m.contains("foo")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn test_author_signed_missing_signed_by_collapses_to_unattested() {
+    // `author-signed` with no sibling `signed_by` is structurally invalid —
+    // MUST collapse to None with an observable diagnostic (registry-protocol §3.2).
+    let doc = one_version_node("        attestation \"author-signed\"\n");
+    let node = version_child(&doc);
+    let (iv, diagnostics) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    assert!(iv.attestation.is_none());
+    assert!(
+        diagnostics.iter().any(|m| m.contains("author-signed") && m.contains("foo")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn test_bundle_pin_captured_when_valid() {
+    let hex64 = "a".repeat(64);
+    let doc = one_version_node(&format!(
+        "        attestation \"author-signed\"\n\
+         \x20       signed_by \"https://example.com/workflow.yaml\"\n\
+         \x20       bundle sha256=\"{hex64}\"\n"
+    ));
+    let node = version_child(&doc);
+    let (iv, diagnostics) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    let att = iv.attestation.expect("must be attested");
+    assert_eq!(att.bundle_pin.as_deref(), Some(hex64.as_str()));
+    assert!(diagnostics.is_empty());
+}
+
+#[test]
+fn test_malformed_bundle_pin_drops_pin_without_collapsing_kind() {
+    // A malformed `bundle sha256=` value normalizes ONLY bundle_pin to None
+    // — it MUST NOT collapse an otherwise well-formed kind/signer pairing
+    // (registry-protocol §3.2 NORMATIVE).
+    let doc = one_version_node(
+        "        attestation \"author-signed\"\n\
+         \x20       signed_by \"https://example.com/workflow.yaml\"\n\
+         \x20       bundle sha256=\"not-valid-hex\"\n",
+    );
+    let node = version_child(&doc);
+    let (iv, diagnostics) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    let att = iv.attestation.expect("kind/signer must survive");
+    assert!(matches!(att.kind, AttestationKind::AuthorSigned { .. }));
+    assert!(att.bundle_pin.is_none());
+    assert!(
+        diagnostics.iter().any(|m| m.contains("bundle") && m.contains("not-valid-hex")),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn test_no_attestation_node_is_unattested() {
+    // A legacy entry with none of the four sibling nodes parses as unattested,
+    // with no diagnostic (absence is not a collapse — registry-protocol §3.2).
+    let doc = one_version_node("");
+    let node = version_child(&doc);
+    let (iv, diagnostics) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    assert!(iv.attestation.is_none());
+    assert!(diagnostics.is_empty());
 }

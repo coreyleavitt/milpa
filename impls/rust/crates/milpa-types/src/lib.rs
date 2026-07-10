@@ -244,6 +244,59 @@ impl Provenance {
     }
 }
 
+/// Durable Rekor transparency-log reference (registry-protocol §3.2).
+///
+/// Kind-independent — carried on [`EntryAttestation`] and [`LockAttestation`]
+/// regardless of `AttestationKind`. Fields default to `""` on parse when a
+/// sub-node is absent (robustness — mirrors the Python `_parse_rekor_block`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RekorRef {
+    pub uuid: String,
+    pub log_index: String,
+    pub integrated_time: String,
+}
+
+/// Per-entry Layer 2 attestation kind (registry-protocol §3.2 NORMATIVE —
+/// CLOSED set: `"author-signed"` | `"milpa-vendored"` are the only recognized
+/// values; anything else collapses to unattested at the parse boundary).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttestationKind {
+    /// `attestation "author-signed"` — `signer` is REQUIRED for this kind.
+    AuthorSigned { signer: String },
+    /// `attestation "milpa-vendored"` — no per-entry signer field by design.
+    /// The effective signer for this kind is derived at *verification* time
+    /// (not parse time) from Layer 1's resolved vendor-bot identity (RFC
+    /// per-entry-attestation.md §5). The parser never reads or stores a
+    /// signer for this kind.
+    MilpaVendored,
+}
+
+/// Per-entry Layer 2 author-attribution CLAIM (attribution, not integrity),
+/// index-side (registry-protocol §3.2). Parsed from the `attestation` /
+/// `signed_by` / `rekor` / `bundle` sibling child nodes on one `version` node.
+/// Records the CLAIM only — whether it is cryptographically true is a later
+/// (P3) question; this type carries zero verification state.
+///
+/// `bundle_pin` — sha256 hex of the attestation bundle BYTES (the `bundle
+/// sha256=` delivery-integrity pin). `None` is the normal, expected state
+/// before per-entry bundle delivery ships (P4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryAttestation {
+    pub kind: AttestationKind,
+    pub rekor: Option<RekorRef>,
+    pub bundle_pin: Option<String>,
+}
+
+/// Per-entry Layer 2 attestation CLAIM, lockfile-side (lockfile-schema §3.9).
+/// Narrower than [`EntryAttestation`]: no `bundle_pin` — the lockfile records
+/// the claim only, never a delivery-integrity pin (that lives in the index,
+/// re-derived at verification time from the cached index, not persisted here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockAttestation {
+    pub kind: AttestationKind,
+    pub rekor: Option<RekorRef>,
+}
+
 /// One dep after resolution: identity (content hash) ⊥ provenances.
 ///
 /// `provenances` is a `Vec` of emission-level [`ProvenanceRecord`]s (6 kinds each),
@@ -287,6 +340,14 @@ pub struct ResolvedDep {
     /// the S4a fixpoint; carried through `build_graph` → lockfile emission.
     /// Empty when no flags are declared or none are active.
     pub active_flags: Vec<String>,
+    /// RFC per-entry-attestation.md P2: the index's `EntryAttestation` CLAIM,
+    /// carried through unconditionally from `IndexVersion.attestation` for
+    /// registry-named deps. `None` for URL/tarball/local/member deps (no
+    /// index entry) and for named deps whose index entry carried no
+    /// attestation (or one that collapsed — registry-protocol §3.2).
+    /// Converted to the narrower `LockAttestation` (bundle_pin dropped) at
+    /// the `locked_from_resolved` boundary.
+    pub attestation: Option<EntryAttestation>,
 }
 
 /// The resolved dependency graph — the resolver's output, the emitters' input.
@@ -419,6 +480,11 @@ pub struct LockedDep {
     /// multiple manifest names (dedup). Lexicographically sorted. Omitted from
     /// KDL entirely when empty. See lockfile-schema §3.8.
     pub aliases: Vec<String>,
+    /// RFC per-entry-attestation.md P2 (lockfile-schema §3.9): the per-entry
+    /// attestation CLAIM, narrowed from `ResolvedDep.attestation` (bundle_pin
+    /// dropped). `None` for non-named deps and for named deps with no (or a
+    /// collapsed) index attestation record.
+    pub attestation: Option<LockAttestation>,
 }
 
 /// The parsed `milpa.lock` as data (parse/emit logic lives in `milpa-core`).

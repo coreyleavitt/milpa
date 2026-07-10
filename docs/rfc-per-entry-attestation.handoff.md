@@ -14,9 +14,14 @@
       lockfile-schema §3.9 attestation block (claim-not-outcome, no
       schema-version bump, collapse-on-read posture). No slugs (P3).
       Gate: full pytest green (2633 passed).
-- [ ] P2 — attribution surfacing w/o gating: parse `EntryAttestation` into
-      `IndexVersion` (both impls, (typed, diagnostics) boundary); lockfile
-      claim record; `milpa show` unverified-claim rendering.
+- [x] P2 — attribution surfacing w/o gating (2026-07-10): `EntryAttestation`
+      parse-to-typed in BOTH impls ((typed, diagnostics) boundary; Python
+      via registry.py's existing warnings seam, Rust via `[milpa] warning:`
+      eprintln); lockfile claim block (LockAttestation, no bundle_pin,
+      after active_flags); resolver candidate carry-through; `milpa show`
+      "claims author-signed by X" wording; BONUS bug fixed in both impls —
+      frozen path wasn't carrying the claim (RFC §8 table), pinned with
+      regression tests. Gates: pytest 2660 green; dev-rust workspace green.
 - [ ] P3a — mock-gated gate: `entry-trust` axis, selection-step pipeline,
       nine slugs, `EntryBundleVerifier` + keyed MockVerifier + acquisition
       surface, `milpa verify` offline re-verify, conformance matrix.

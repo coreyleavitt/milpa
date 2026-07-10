@@ -64,6 +64,7 @@ fn locked(name: &str, version: &str, identity: Option<&str>, prov: ProvenanceRec
         dep_decl: None,
         cond_requires: vec![],
         aliases: vec![],
+        attestation: None,
     }
 }
 
@@ -357,6 +358,58 @@ fn frozen_carries_aliases_from_locked_dep() {
         "frozen reconstruction must carry aliases from LockedDep");
 }
 
+/// RFC per-entry-attestation.md P2 (§8 Command Coverage): the frozen fetch
+/// path must carry the lockfile's attestation CLAIM through, widened back to
+/// `EntryAttestation` with `bundle_pin: None` (never persisted to the
+/// lockfile — §3.9). Mirrors `frozen_carries_aliases_from_locked_dep`.
+#[test]
+fn frozen_carries_attestation_from_locked_dep() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, identity) = store_with_foo(tmp.path());
+    let mut locked_dep = locked("foo", "0.0.1", Some(&identity), git_rec());
+    locked_dep.attestation = Some(milpa_types::LockAttestation {
+        kind: milpa_types::AttestationKind::AuthorSigned {
+            signer: "https://example.com/wf.yaml".into(),
+        },
+        rekor: Some(milpa_types::RekorRef {
+            uuid: "u".into(),
+            log_index: "1".into(),
+            integrated_time: "2".into(),
+        }),
+    });
+    let lf = lock("maxver", vec![locked_dep]);
+    let dd = deps_dir(&tmp);
+    let graph = resolve_frozen(&manifest(vec![named("foo", None)]), &lf, &store, &dd).unwrap();
+    let dep = &graph.deps[0];
+    assert_eq!(
+        dep.attestation,
+        Some(milpa_types::EntryAttestation {
+            kind: milpa_types::AttestationKind::AuthorSigned {
+                signer: "https://example.com/wf.yaml".into(),
+            },
+            rekor: Some(milpa_types::RekorRef {
+                uuid: "u".into(),
+                log_index: "1".into(),
+                integrated_time: "2".into(),
+            }),
+            bundle_pin: None,
+        }),
+        "frozen reconstruction must carry the attestation claim from LockedDep"
+    );
+}
+
+/// No attestation on the locked dep → frozen reconstruction stays `None`.
+#[test]
+fn frozen_no_attestation_stays_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, identity) = store_with_foo(tmp.path());
+    let locked_dep = locked("foo", "0.0.1", Some(&identity), git_rec());
+    let lf = lock("maxver", vec![locked_dep]);
+    let dd = deps_dir(&tmp);
+    let graph = resolve_frozen(&manifest(vec![named("foo", None)]), &lf, &store, &dd).unwrap();
+    assert_eq!(graph.deps[0].attestation, None);
+}
+
 /// Alias symlink materializes in _deps/ after resolve_frozen on a deduped dep.
 #[test]
 fn frozen_alias_symlink_created_in_deps() {
@@ -436,6 +489,7 @@ fn frozen_carries_all_provenances() {
         dep_decl: None,
         cond_requires: vec![],
         aliases: vec![],
+        attestation: None,
     };
     let lf = lock("maxver", vec![locked_dep]);
     let dd = deps_dir(&tmp);
@@ -479,6 +533,7 @@ fn local_dep(name: &str, path: &str) -> milpa_types::ResolvedDep {
         cond_requires: vec![],
         aliases: vec![],
         active_flags: vec![],
+        attestation: None,
     }
 }
 
@@ -583,6 +638,7 @@ fn rebuild_deps_view_preserves_local_symlink_alongside_cas_dep() {
         cond_requires: vec![],
         aliases: vec![],
         active_flags: vec![],
+        attestation: None,
     };
     let graph = milpa_types::ResolvedGraph { deps: vec![local, git] };
 

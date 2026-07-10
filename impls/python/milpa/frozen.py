@@ -62,6 +62,7 @@ from milpa.lockfile import (
     ResolvedGraph,
 )
 from milpa.manifest import Manifest, MemberDep, NamedDep
+from milpa.registry import EntryAttestation
 from milpa.version import DepKey, VersionSet, parse_version
 from milpa.workspace import LoadedWorkspace
 
@@ -156,6 +157,16 @@ def _reconstruct_from_locked(locked: LockedDep) -> ResolvedDep:
         aliases=locked.aliases,
         # C1: carry namespace for qualified named deps (None for all others).
         namespace=getattr(locked, "namespace", None),
+        # RFC per-entry-attestation.md P2 (§8 Command Coverage): the frozen
+        # path carries the lockfile's attestation CLAIM through, nothing
+        # re-checked. Widen LockAttestation (no bundle_pin) back to the
+        # EntryAttestation shape ResolvedDep carries; bundle_pin is always
+        # None here since it was never persisted to the lockfile (§3.9).
+        attestation=(
+            EntryAttestation(kind=locked.attestation.kind, rekor=locked.attestation.rekor)
+            if locked.attestation is not None
+            else None
+        ),
     )
 
 

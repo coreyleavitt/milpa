@@ -438,6 +438,7 @@ fn resolve_named_dep_strategy_selects_version() {
         }],
         dep_decl: None,
         dep_decl_schema_version: None,
+        attestation: None,
     };
     let index = Index {
         packages: vec![Package {
@@ -537,6 +538,7 @@ fn s5b_phase_a_error_slug_divergence_spike() {
                 }],
                 dep_decl: None,
                 dep_decl_schema_version: None,
+                attestation: None,
             }],
         }],
     };
@@ -1001,6 +1003,7 @@ fn resolve_prior_lockfile_pin_rejects_hostile_bytes() {
             dep_decl: None,
             cond_requires: Vec::new(),
             aliases: Vec::new(),
+            attestation: None,
         }],
     };
     let err = resolve(
@@ -1048,6 +1051,7 @@ fn resolve_prior_lockfile_pin_accepts_matching_bytes() {
             dep_decl: None,
             cond_requires: Vec::new(),
             aliases: Vec::new(),
+            attestation: None,
         }],
     };
     let graph = resolve(
@@ -1107,6 +1111,7 @@ fn prior_with_zero_identity(dep_name: &str, url: &str) -> Lockfile {
             dep_decl: None,
             cond_requires: Vec::new(),
             aliases: Vec::new(),
+            attestation: None,
         }],
     }
 }
@@ -1899,6 +1904,7 @@ fn tarball_prior(name: &str, url: &str, identity: &str, sha256: &str) -> Lockfil
             dep_decl: None,
             cond_requires: Vec::new(),
             aliases: Vec::new(),
+            attestation: None,
         }],
     }
 }
@@ -2622,6 +2628,7 @@ deps {
                 dep_decl: None,
                 cond_requires: vec![],
                 aliases: vec![],
+                attestation: None,
             },
         ],
     };

@@ -29,11 +29,19 @@ ProvenanceRecord kinds (lockfile-schema.md §4):
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from milpa.predicate import Predicate
+from milpa.registry import (
+    AttestationKind,
+    AuthorSigned,
+    EntryAttestation,
+    MilpaVendored,
+    RekorRef,
+)
 from milpa.errors import (
     CAS_STORE_IO_ERROR,
     LOCK_DEP_FIELD_ARITY,
@@ -200,6 +208,30 @@ class CondRequire:
 
 
 # ---------------------------------------------------------------------------
+# LockAttestation — per-entry attestation CLAIM, lockfile-side (§3.9)
+#
+# Mirrors registry.EntryAttestation minus `bundle_pin`: lockfile-schema.md
+# §3.9 NORMATIVE explicitly excludes the bundle pin from the lockfile (it is
+# delivery metadata, not part of the attribution claim itself). `kind` is
+# reused directly from registry.py (AuthorSigned/MilpaVendored) — one closed
+# set, one source of truth, shared by the index-parse and lockfile layers.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LockAttestation:
+    """Per-entry Layer 2 attestation CLAIM as recorded in the lockfile.
+
+    Records the CLAIM only, never a verification outcome (lockfile-schema.md
+    §3.9 NORMATIVE) — ``milpa show`` and the frozen path render this as an
+    UNVERIFIED claim until the (later) P3 gate exists.
+    """
+
+    kind: AttestationKind
+    rekor: RekorRef | None = None
+
+
+# ---------------------------------------------------------------------------
 # Lockfile data model
 # ---------------------------------------------------------------------------
 
@@ -245,6 +277,13 @@ class LockedDep:
     # always the BARE name.  Never folded into the dep arg with ``::``
     # (solver-internal encoding ONLY; see DepKey.solver_var / from_solver_var).
     namespace: str | None = None
+    # RFC per-entry-attestation.md P2: the per-entry attestation CLAIM, carried
+    # from the index's EntryAttestation at lock time (lockfile-schema.md §3.9).
+    # None for URL/local/member deps (no index entry) and for registry-resolved
+    # deps whose index entry had no attestation record or one that collapsed
+    # to unattested at index-parse time — absence of this field IS the
+    # unattested state (no sentinel value is written).
+    attestation: LockAttestation | None = None
 
 
 @dataclass(frozen=True)
@@ -308,6 +347,13 @@ class ResolvedDep:
     # C1 (rfc-resolver-correctness.md): namespace for qualified named deps.
     # Same semantics as LockedDep.namespace — see that field's docstring.
     namespace: str | None = None
+    # RFC per-entry-attestation.md P2: the index's EntryAttestation CLAIM,
+    # carried through unconditionally from IndexVersion.attestation for
+    # registry-resolved deps (None for URL/tarball/local/member deps, which
+    # have no index entry — resolver.py never sets this for those kinds).
+    # Converted to the narrower LockAttestation (bundle_pin dropped) at the
+    # LockedDep construction boundary — see _locked_from_resolved.
+    attestation: EntryAttestation | None = None
 
 
 @dataclass(frozen=True)
@@ -507,6 +553,7 @@ def _parse_dep(node: KdlNode) -> LockedDep:
     cond_requires: list[CondRequire] = []  # S4: additive cond-require annotations
     aliases: tuple[str, ...] = ()  # Phase B: alternate names for deduped deps
     namespace: str | None = None  # C1: qualified dep namespace (§3.9)
+    attestation: LockAttestation | None = None  # per-entry attestation claim (§3.9)
 
     for child in node_children(node):
         cname = node_name(child)
@@ -558,6 +605,8 @@ def _parse_dep(node: KdlNode) -> LockedDep:
             aliases = _parse_dep_aliases(child)
         elif cname == "active_flags":
             active_flags = _parse_dep_active_flags(child)
+        elif cname == "attestation":
+            attestation = _parse_lock_attestation(child, dep_name)
         elif cname == "provenance":
             provenances.append(_parse_provenance_block(child, dep_name))
         elif cname == "dep_decl":
@@ -584,6 +633,7 @@ def _parse_dep(node: KdlNode) -> LockedDep:
         cond_requires=tuple(cond_requires),
         aliases=aliases,
         namespace=namespace,
+        attestation=attestation,
     )
 
 
@@ -693,6 +743,69 @@ def _parse_dep_aliases(node: KdlNode) -> tuple[str, ...]:
             )
         aliases.append(s)
     return tuple(sorted(aliases))
+
+
+def _parse_lock_attestation(node: KdlNode, dep_name: str) -> LockAttestation | None:
+    """Parse the ``attestation { kind; signer; rekor { … } }`` block (§3.9).
+
+    Malformed input (unrecognized ``kind``, or ``"author-signed"`` with no
+    ``signer``) collapses to ``None`` with a diagnostic naming *dep_name* —
+    the same conservative-collapse posture registry-protocol.md §3.2 defines
+    for index parsing, applied here to a lockfile being read
+    (lockfile-schema.md §3.9 NORMATIVE).
+    """
+    kind_label: str | None = None
+    signer: str | None = None
+    rekor: RekorRef | None = None
+
+    for child in node_children(node):
+        cname = node_name(child)
+        if cname == "kind":
+            args = node_args(child)
+            kind_label = value_as_str(args[0]) if args else None
+        elif cname == "signer":
+            args = node_args(child)
+            signer = value_as_str(args[0]) if args else None
+        elif cname == "rekor":
+            rekor = _parse_lock_rekor_block(child)
+
+    if kind_label == "author-signed":
+        if not signer:
+            warnings.warn(
+                f"dep {dep_name!r}: lockfile attestation block collapsed to "
+                f"absent — \"author-signed\" with no signer (lockfile-schema §3.9)",
+                stacklevel=2,
+            )
+            return None
+        return LockAttestation(kind=AuthorSigned(signer=signer), rekor=rekor)
+
+    if kind_label == "milpa-vendored":
+        return LockAttestation(kind=MilpaVendored(), rekor=rekor)
+
+    warnings.warn(
+        f"dep {dep_name!r}: lockfile attestation block collapsed to absent — "
+        f"unrecognized kind {kind_label!r} (lockfile-schema §3.9)",
+        stacklevel=2,
+    )
+    return None
+
+
+def _parse_lock_rekor_block(node: KdlNode) -> RekorRef:
+    """Parse the nested ``rekor { uuid; log_index; integrated_time }`` block."""
+
+    def _scalar(name: str) -> str:
+        for child in node_children(node):
+            if node_name(child) == name:
+                args = node_args(child)
+                if args:
+                    return value_as_str(args[0]) or ""
+        return ""
+
+    return RekorRef(
+        uuid=_scalar("uuid"),
+        log_index=_scalar("log_index"),
+        integrated_time=_scalar("integrated_time"),
+    )
 
 
 def _parse_cond_require(node: KdlNode) -> "CondRequire | None":
@@ -951,6 +1064,14 @@ def _locked_from_resolved(d: ResolvedDep) -> LockedDep:
         aliases=d.aliases,
         # C1: carry namespace for qualified named deps (None for all others).
         namespace=d.namespace,
+        # RFC per-entry-attestation.md P2: narrow EntryAttestation (index-side,
+        # carries bundle_pin) to LockAttestation (lockfile-side, no bundle_pin —
+        # lockfile-schema.md §3.9 NORMATIVE excludes the delivery pin).
+        attestation=(
+            LockAttestation(kind=d.attestation.kind, rekor=d.attestation.rekor)
+            if d.attestation is not None
+            else None
+        ),
     )
 
 
@@ -1069,6 +1190,30 @@ def _format_cond_require(cr: "CondRequire") -> list[str]:
         return out
 
 
+def _format_lock_attestation(att: LockAttestation) -> list[str]:
+    """Emit the ``attestation { kind; signer; rekor { … } }`` block (§3.9).
+
+    ``signer`` is emitted only for ``AuthorSigned`` (absent for
+    ``MilpaVendored`` — mirrors the source index record's structural
+    invariant). The nested ``rekor`` block is omitted entirely when the
+    source index entry carried none.
+    """
+    out = ["    attestation {"]
+    if isinstance(att.kind, AuthorSigned):
+        out.append(f'        kind {_kdl_str("author-signed")}')
+        out.append(f"        signer {_kdl_str(att.kind.signer)}")
+    else:
+        out.append(f'        kind {_kdl_str("milpa-vendored")}')
+    if att.rekor is not None:
+        out.append("        rekor {")
+        out.append(f"            uuid {_kdl_str(att.rekor.uuid)}")
+        out.append(f"            log_index {_kdl_str(att.rekor.log_index)}")
+        out.append(f"            integrated_time {_kdl_str(att.rekor.integrated_time)}")
+        out.append("        }")
+    out.append("    }")
+    return out
+
+
 def format_lockfile(lockfile: Lockfile) -> str:
     """Render a ``Lockfile`` to byte-exact KDL 2.0 text.
 
@@ -1123,6 +1268,10 @@ def format_lockfile(lockfile: Lockfile) -> str:
         if dep.active_flags:
             flag_args = " ".join(_kdl_str(f) for f in dep.active_flags)
             lines.append(f"    active_flags {flag_args}")
+        # attestation — per-entry Layer 2 claim (§3.9). Positioned after
+        # active_flags, before provenance blocks (lockfile-schema.md §2.4).
+        if dep.attestation is not None:
+            lines.extend(_format_lock_attestation(dep.attestation))
         # dep_decl pin — S6: emitted only when present (forward-compat additive)
         if dep.dep_decl is not None:
             lines.append(f"    dep_decl {_kdl_str(dep.dep_decl)}")

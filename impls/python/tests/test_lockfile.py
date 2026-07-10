@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import stat
 import tempfile
+import warnings
 from pathlib import Path
 
 import pytest
@@ -48,6 +49,7 @@ from milpa.lockfile import (
     CondRequire,
     GitProvenanceRecord,
     LocalProvenanceRecord,
+    LockAttestation,
     LockedDep,
     Lockfile,
     MemberProvenanceRecord,
@@ -65,6 +67,7 @@ from milpa.lockfile import (
     write_lockfile,
 )
 from milpa.predicate import Predicate
+from milpa.registry import AuthorSigned, MilpaVendored, RekorRef
 
 # ---------------------------------------------------------------------------
 # Fixture paths
@@ -2994,6 +2997,205 @@ dep "foo" {{
         lf = parse_lockfile(text)
         dep = lf.deps[0]
         assert dep.aliases == ("alpha", "zebra")
+
+
+# ---------------------------------------------------------------------------
+# RFC per-entry-attestation.md P2 — attestation field (lockfile-schema §3.9)
+# ---------------------------------------------------------------------------
+
+
+def _make_locked_dep_with_attestation(
+    name: str = "foo",
+    attestation: LockAttestation | None = None,
+) -> LockedDep:
+    return LockedDep(
+        name=name,
+        identity=_VALID_IDENTITY,
+        version="1.0.0",
+        src_dir="src",
+        requires=(),
+        provenances=(GitProvenanceRecord(url="https://example.com/foo.git"),),
+        attestation=attestation,
+    )
+
+
+class TestAttestationField:
+    """Tests for the attestation field on LockedDep (lockfile-schema §3.9)."""
+
+    def test_attestation_default_none(self) -> None:
+        dep = _make_locked_dep_with_attestation()
+        assert dep.attestation is None
+
+    def test_attestation_omitted_when_none(self) -> None:
+        dep = _make_locked_dep_with_attestation()
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        assert "attestation" not in text
+
+    def test_author_signed_emitted_with_signer(self) -> None:
+        att = LockAttestation(kind=AuthorSigned(signer="https://example.com/wf.yaml"))
+        dep = _make_locked_dep_with_attestation(attestation=att)
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        assert "    attestation {" in text
+        assert '        kind "author-signed"' in text
+        assert '        signer "https://example.com/wf.yaml"' in text
+        assert "rekor" not in text
+
+    def test_milpa_vendored_emitted_without_signer(self) -> None:
+        att = LockAttestation(kind=MilpaVendored())
+        dep = _make_locked_dep_with_attestation(attestation=att)
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        assert '        kind "milpa-vendored"' in text
+        assert "signer" not in text
+
+    def test_rekor_block_emitted_when_present(self) -> None:
+        att = LockAttestation(
+            kind=AuthorSigned(signer="https://example.com/wf.yaml"),
+            rekor=RekorRef(uuid="abc123", log_index="42", integrated_time="1000"),
+        )
+        dep = _make_locked_dep_with_attestation(attestation=att)
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        assert "        rekor {" in text
+        assert '            uuid "abc123"' in text
+        assert '            log_index "42"' in text
+        assert '            integrated_time "1000"' in text
+
+    def test_rekor_block_omitted_when_absent(self) -> None:
+        att = LockAttestation(kind=AuthorSigned(signer="https://example.com/wf.yaml"))
+        dep = _make_locked_dep_with_attestation(attestation=att)
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        assert "rekor" not in text
+
+    def test_position_after_active_flags_before_provenance(self) -> None:
+        dep = LockedDep(
+            name="foo",
+            identity=_VALID_IDENTITY,
+            version="1.0.0",
+            src_dir="src",
+            requires=(),
+            provenances=(GitProvenanceRecord(url="https://example.com/foo.git"),),
+            active_flags=("ssl",),
+            attestation=LockAttestation(kind=MilpaVendored()),
+        )
+        lf = Lockfile(deps=(dep,))
+        text = format_lockfile(lf)
+        flags_pos = text.find('    active_flags "ssl"')
+        att_pos = text.find("    attestation {")
+        prov_pos = text.find("    provenance {")
+        assert flags_pos < att_pos < prov_pos, (
+            f"Expected active_flags < attestation < provenance\n"
+            f"flags_pos={flags_pos}, att_pos={att_pos}, prov_pos={prov_pos}\ntext:\n{text}"
+        )
+
+    def test_round_trip_parse_format_identical_author_signed(self) -> None:
+        att = LockAttestation(
+            kind=AuthorSigned(signer="https://example.com/wf.yaml"),
+            rekor=RekorRef(uuid="abc", log_index="1", integrated_time="2"),
+        )
+        dep = _make_locked_dep_with_attestation(attestation=att)
+        lf = Lockfile(deps=(dep,))
+        text1 = format_lockfile(lf)
+        lf2 = parse_lockfile(text1)
+        text2 = format_lockfile(lf2)
+        assert text1 == text2
+        assert lf2.deps[0].attestation == att
+
+    def test_round_trip_parse_format_identical_milpa_vendored(self) -> None:
+        att = LockAttestation(kind=MilpaVendored())
+        dep = _make_locked_dep_with_attestation(attestation=att)
+        lf = Lockfile(deps=(dep,))
+        text1 = format_lockfile(lf)
+        lf2 = parse_lockfile(text1)
+        text2 = format_lockfile(lf2)
+        assert text1 == text2
+        assert lf2.deps[0].attestation == att
+
+    def test_malformed_unrecognized_kind_collapses_to_absent(self) -> None:
+        text = f"""\
+// generated by milpa; reproducible build snapshot
+version 1
+strategy "maxver"
+
+dep "foo" {{
+    identity "{_VALID_IDENTITY}"
+    version "1.0.0"
+    src_dir "src"
+    requires
+    attestation {{
+        kind "bogus-kind"
+    }}
+    provenance {{
+        origin "observed"
+        kind "git"
+        url "https://example.com/foo.git"
+    }}
+}}
+"""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            lf = parse_lockfile(text)
+        assert lf.deps[0].attestation is None
+        messages = [str(w.message) for w in caught]
+        assert any("bogus-kind" in m and "foo" in m for m in messages)
+
+    def test_malformed_author_signed_missing_signer_collapses_to_absent(self) -> None:
+        text = f"""\
+// generated by milpa; reproducible build snapshot
+version 1
+strategy "maxver"
+
+dep "foo" {{
+    identity "{_VALID_IDENTITY}"
+    version "1.0.0"
+    src_dir "src"
+    requires
+    attestation {{
+        kind "author-signed"
+    }}
+    provenance {{
+        origin "observed"
+        kind "git"
+        url "https://example.com/foo.git"
+    }}
+}}
+"""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            lf = parse_lockfile(text)
+        assert lf.deps[0].attestation is None
+        messages = [str(w.message) for w in caught]
+        assert any("author-signed" in m and "foo" in m for m in messages)
+
+    def test_older_parser_forward_compat_skip(self) -> None:
+        """An unrecognized `attestation` node is skipped like any other unknown
+        child node — a lockfile with the block still parses successfully."""
+        text = f"""\
+// generated by milpa; reproducible build snapshot
+version 1
+strategy "maxver"
+
+dep "foo" {{
+    identity "{_VALID_IDENTITY}"
+    version "1.0.0"
+    src_dir "src"
+    requires
+    attestation {{
+        kind "milpa-vendored"
+    }}
+    provenance {{
+        origin "observed"
+        kind "git"
+        url "https://example.com/foo.git"
+    }}
+}}
+"""
+        lf = parse_lockfile(text)
+        assert lf.deps[0].name == "foo"
+        assert lf.deps[0].attestation == LockAttestation(kind=MilpaVendored())
 
 
 # ---------------------------------------------------------------------------

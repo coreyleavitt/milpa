@@ -374,6 +374,7 @@ mod tests {
             cond_requires: vec![],
             aliases: vec![],
             active_flags: vec![],
+            attestation: None,
         }
     }
 
@@ -462,6 +463,7 @@ mod tests {
             cond_requires: vec![],
             aliases,
             active_flags: vec![],
+            attestation: None,
         }
     }
 
@@ -554,6 +556,7 @@ mod tests {
             cond_requires: vec![],
             aliases: vec![],
             active_flags,
+            attestation: None,
         }
     }
 

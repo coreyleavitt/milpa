@@ -12,7 +12,8 @@
 use kdl::{KdlDocument, KdlNode, KdlValue};
 use milpa_manifest::{contains_unsafe_char, valid_flag_name, kdl_block_comment_depth, kdl_brace_depth, KDL_MAX_NESTING_DEPTH};
 use milpa_types::{
-    LockedDep, Lockfile, ProvenanceRecord, ResolvedDep, ResolvedGraph, LOCKFILE_SCHEMA_VERSION,
+    AttestationKind, LockAttestation, LockedDep, Lockfile, ProvenanceRecord, RekorRef,
+    ResolvedDep, ResolvedGraph, LOCKFILE_SCHEMA_VERSION,
 };
 
 use crate::error::CoreError;
@@ -139,6 +140,7 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
     let mut cond_requires: Vec<milpa_types::CondRequire> = Vec::new(); // S4
     let mut aliases: Vec<String> = Vec::new(); // Phase B: alternate names
     let mut provenances: Vec<ProvenanceRecord> = Vec::new();
+    let mut attestation: Option<LockAttestation> = None; // RFC per-entry-attestation.md P2 (§3.9)
 
     for child in children(node) {
         match child.name().value() {
@@ -241,6 +243,13 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
                 }
             }
             "provenance" => provenances.push(parse_provenance(child, &name)?),
+            // RFC per-entry-attestation.md P2 (lockfile-schema §3.9): the
+            // per-entry attestation CLAIM block. Malformed → None + a
+            // `[milpa] warning:` diagnostic (conservative collapse, mirrors
+            // registry-protocol §3.2's posture applied here to the lockfile).
+            "attestation" => {
+                attestation = parse_lock_attestation(child, &name);
+            }
             _ => {}
         }
     }
@@ -257,7 +266,84 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
         dep_decl,
         cond_requires,
         aliases,
+        attestation,
     })
+}
+
+/// Parse the `attestation { kind; signer; rekor { … } }` block (§3.9).
+///
+/// Malformed input (unrecognized `kind`, or `"author-signed"` with no
+/// `signer`) collapses to `None` with a diagnostic naming `dep_name` — the
+/// same conservative-collapse posture registry-protocol.md §3.2 defines for
+/// index parsing, applied here to a lockfile being read (lockfile-schema.md
+/// §3.9 NORMATIVE).
+fn parse_lock_attestation(node: &KdlNode, dep_name: &str) -> Option<LockAttestation> {
+    let mut kind_label: Option<String> = None;
+    let mut signer: Option<String> = None;
+    let mut rekor: Option<RekorRef> = None;
+
+    for child in children(node) {
+        match child.name().value() {
+            "kind" => {
+                kind_label = args(child)
+                    .first()
+                    .and_then(|e| e.value().as_string().map(str::to_string));
+            }
+            "signer" => {
+                signer = args(child)
+                    .first()
+                    .and_then(|e| e.value().as_string().map(str::to_string));
+            }
+            "rekor" => {
+                rekor = Some(parse_lock_rekor_block(child));
+            }
+            _ => {}
+        }
+    }
+
+    match kind_label.as_deref() {
+        Some("author-signed") => match signer {
+            Some(s) if !s.is_empty() => Some(LockAttestation {
+                kind: AttestationKind::AuthorSigned { signer: s },
+                rekor,
+            }),
+            _ => {
+                eprintln!(
+                    "[milpa] warning: dep {dep_name:?}: lockfile attestation block \
+                     collapsed to absent — \"author-signed\" with no signer \
+                     (lockfile-schema §3.9)"
+                );
+                None
+            }
+        },
+        Some("milpa-vendored") => Some(LockAttestation {
+            kind: AttestationKind::MilpaVendored,
+            rekor,
+        }),
+        other => {
+            eprintln!(
+                "[milpa] warning: dep {dep_name:?}: lockfile attestation block \
+                 collapsed to absent — unrecognized kind {other:?} (lockfile-schema §3.9)"
+            );
+            None
+        }
+    }
+}
+
+/// Parse the nested `rekor { uuid; log_index; integrated_time }` block.
+fn parse_lock_rekor_block(node: &KdlNode) -> RekorRef {
+    let scalar = |name: &str| -> String {
+        children(node)
+            .into_iter()
+            .find(|c| c.name().value() == name)
+            .and_then(|c| args(c).first().and_then(|e| e.value().as_string().map(str::to_string)))
+            .unwrap_or_default()
+    };
+    RekorRef {
+        uuid: scalar("uuid"),
+        log_index: scalar("log_index"),
+        integrated_time: scalar("integrated_time"),
+    }
 }
 
 /// Known predicate-name vocabulary (M1: whitelist for untrusted lockfile input).
@@ -686,6 +772,14 @@ pub fn format_lockfile(lockfile: &Lockfile) -> String {
         if !dep.active_flags.is_empty() {
             lines.push(format!("    active_flags {}", join_kdl(&dep.active_flags)));
         }
+        // RFC per-entry-attestation.md P2 (lockfile-schema §3.9): the per-entry
+        // Layer 2 claim. Positioned after active_flags, before dep_decl/
+        // provenance blocks (lockfile-schema §2.4).
+        if let Some(att) = &dep.attestation {
+            for line in format_lock_attestation(att) {
+                lines.push(line);
+            }
+        }
         // S6: emit dep_decl pin before provenance (§3.7).
         if let Some(dd) = &dep.dep_decl {
             lines.push(format!("    dep_decl {}", kdl_str(dd)));
@@ -705,6 +799,36 @@ pub fn format_lockfile(lockfile: &Lockfile) -> String {
         lines.push(String::new());
     }
     lines.join("\n")
+}
+
+/// Emit the `attestation { kind; signer; rekor { … } }` block (§3.9).
+///
+/// `signer` is emitted only for `AuthorSigned` (absent for `MilpaVendored` —
+/// mirrors the source index record's structural invariant). The nested
+/// `rekor` block is omitted entirely when the source index entry carried none.
+fn format_lock_attestation(att: &LockAttestation) -> Vec<String> {
+    let mut out = vec!["    attestation {".to_string()];
+    match &att.kind {
+        AttestationKind::AuthorSigned { signer } => {
+            out.push(format!("        kind {}", kdl_str("author-signed")));
+            out.push(format!("        signer {}", kdl_str(signer)));
+        }
+        AttestationKind::MilpaVendored => {
+            out.push(format!("        kind {}", kdl_str("milpa-vendored")));
+        }
+    }
+    if let Some(rekor) = &att.rekor {
+        out.push("        rekor {".to_string());
+        out.push(format!("            uuid {}", kdl_str(&rekor.uuid)));
+        out.push(format!("            log_index {}", kdl_str(&rekor.log_index)));
+        out.push(format!(
+            "            integrated_time {}",
+            kdl_str(&rekor.integrated_time)
+        ));
+        out.push("        }".to_string());
+    }
+    out.push("    }".to_string());
+    out
 }
 
 /// Total sort key for a `CondRequire`: `(name, canonical-predicate-string)`.
@@ -1027,6 +1151,13 @@ fn locked_from_resolved(d: &ResolvedDep) -> LockedDep {
         // The resolver populates ResolvedDep.aliases via finalize(); from_graph
         // carries them through so the lockfile emits the aliases line.
         aliases: d.aliases.clone(),
+        // RFC per-entry-attestation.md P2: narrow EntryAttestation (index-side,
+        // carries bundle_pin) to LockAttestation (lockfile-side, no bundle_pin —
+        // the lockfile records the claim only, never the delivery pin).
+        attestation: d.attestation.as_ref().map(|a| LockAttestation {
+            kind: a.kind.clone(),
+            rekor: a.rekor.clone(),
+        }),
     }
 }
 
@@ -1655,6 +1786,7 @@ mod tests {
                 dep_decl: None,
                 cond_requires: vec![],
                 aliases: vec![],
+                attestation: None,
             }],
         }
     }
@@ -1719,6 +1851,7 @@ mod tests {
                 dep_decl: None,
                 cond_requires: vec![],
                 aliases: vec![],
+                attestation: None,
             }],
         };
         let text = format_lockfile(&lock);
@@ -1763,6 +1896,7 @@ mod tests {
                 dep_decl: None,
                 cond_requires: vec![],
                 aliases: vec![],
+                attestation: None,
             }],
         };
         let text = format_lockfile(&lock);
@@ -1814,6 +1948,7 @@ mod tests {
                 dep_decl: None,
                 cond_requires: vec![],
                 aliases: vec![],
+                attestation: None,
             }],
         };
         let text = format_lockfile(&lock);
@@ -1878,6 +2013,7 @@ mod tests {
                     dep_decl: None,
                     cond_requires: vec![],
                     aliases: vec![],
+                    attestation: None,
                 }],
             };
             let reparsed = parse_lockfile(&format_lockfile(&lock)).unwrap();
@@ -1923,6 +2059,7 @@ mod tests {
             cond_requires: vec![],
             aliases: vec![],
             active_flags: vec![],
+            attestation: None,
         }
     }
 
@@ -2138,6 +2275,7 @@ mod tests {
                 dep_decl: None,
                 cond_requires: vec![],
                 aliases: vec![],
+                attestation: None,
             }],
         };
         // foo is not on disk → "missing" divergence.
@@ -2172,6 +2310,7 @@ mod tests {
             dep_decl: None,
             cond_requires: vec![],
             aliases,
+            attestation: None,
         }
     }
 
@@ -2529,6 +2668,7 @@ mod tests {
             dep_decl: None,
             cond_requires: vec![],
             aliases: vec![],
+            attestation: None,
         }
     }
 
@@ -2650,6 +2790,7 @@ mod tests {
                 dep_decl: None,
                 cond_requires: vec![],
                 aliases: vec![],
+                attestation: None,
             }],
         };
         let d = verify_lockfile_against_deps(&lock, &deps_dir);
@@ -2708,6 +2849,7 @@ mod tests {
             dep_decl: None,
             cond_requires,
             aliases: vec![],
+            attestation: None,
         }
     }
 
@@ -3182,6 +3324,7 @@ mod tests {
             dep_decl: None,
             cond_requires: vec![],
             aliases,
+            attestation: None,
         }
     }
 
@@ -3231,6 +3374,7 @@ mod tests {
             dep_decl: None,
             cond_requires: vec![cr("bar", vec![pred("platform", "linux", false)])],
             aliases: vec!["baz".into()],
+            attestation: None,
         };
         let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
         let text = format_lockfile(&lf);
@@ -3389,6 +3533,7 @@ mod tests {
             dep_decl: None,
             cond_requires: Vec::new(),
             aliases: Vec::new(),
+            attestation: None,
         }
     }
 
@@ -3543,6 +3688,7 @@ mod tests {
             dep_decl: None,
             cond_requires: vec![],
             provenances: provs,
+            attestation: None,
         }
     }
 
@@ -3627,5 +3773,300 @@ mod tests {
         let b = result.deps.iter().find(|d| d.name == "b").unwrap();
         assert_eq!(b.identity.as_deref(), Some(VALID_ID));
         assert_eq!(b.provenances, dep_b.provenances);
+    }
+
+    // -------------------------------------------------------------------------
+    // RFC per-entry-attestation.md P2 — LockedDep.attestation (lockfile-schema §3.9)
+    // -------------------------------------------------------------------------
+
+    fn make_locked_dep_with_attestation(attestation: Option<LockAttestation>) -> LockedDep {
+        let mut dep = make_locked_dep("foo", Some(VALID_ID), vec![make_git_prov("observed")]);
+        dep.attestation = attestation;
+        dep
+    }
+
+    #[test]
+    fn test_attestation_default_none() {
+        let dep = make_locked_dep_with_attestation(None);
+        assert!(dep.attestation.is_none());
+    }
+
+    #[test]
+    fn test_attestation_omitted_when_none() {
+        let dep = make_locked_dep_with_attestation(None);
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let text = format_lockfile(&lf);
+        assert!(!text.contains("attestation"));
+    }
+
+    #[test]
+    fn test_author_signed_emitted_with_signer() {
+        let att = LockAttestation {
+            kind: AttestationKind::AuthorSigned { signer: "https://example.com/wf.yaml".into() },
+            rekor: None,
+        };
+        let dep = make_locked_dep_with_attestation(Some(att));
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let text = format_lockfile(&lf);
+        assert!(text.contains("    attestation {"));
+        assert!(text.contains("        kind \"author-signed\""));
+        assert!(text.contains("        signer \"https://example.com/wf.yaml\""));
+        assert!(!text.contains("rekor"));
+    }
+
+    #[test]
+    fn test_milpa_vendored_emitted_without_signer() {
+        let att = LockAttestation { kind: AttestationKind::MilpaVendored, rekor: None };
+        let dep = make_locked_dep_with_attestation(Some(att));
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let text = format_lockfile(&lf);
+        assert!(text.contains("        kind \"milpa-vendored\""));
+        assert!(!text.contains("signer"));
+    }
+
+    #[test]
+    fn test_rekor_block_emitted_when_present() {
+        let att = LockAttestation {
+            kind: AttestationKind::AuthorSigned { signer: "https://example.com/wf.yaml".into() },
+            rekor: Some(RekorRef {
+                uuid: "abc123".into(),
+                log_index: "42".into(),
+                integrated_time: "1000".into(),
+            }),
+        };
+        let dep = make_locked_dep_with_attestation(Some(att));
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let text = format_lockfile(&lf);
+        assert!(text.contains("        rekor {"));
+        assert!(text.contains("            uuid \"abc123\""));
+        assert!(text.contains("            log_index \"42\""));
+        assert!(text.contains("            integrated_time \"1000\""));
+    }
+
+    #[test]
+    fn test_rekor_block_omitted_when_absent() {
+        let att = LockAttestation {
+            kind: AttestationKind::AuthorSigned { signer: "https://example.com/wf.yaml".into() },
+            rekor: None,
+        };
+        let dep = make_locked_dep_with_attestation(Some(att));
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let text = format_lockfile(&lf);
+        assert!(!text.contains("rekor"));
+    }
+
+    #[test]
+    fn test_position_after_active_flags_before_provenance() {
+        let dep = LockedDep {
+            name: "foo".into(),
+            namespace: None,
+            identity: Some(VALID_ID.into()),
+            version: "1.0.0".into(),
+            src_dir: "src".into(),
+            requires: vec![],
+            provenances: vec![ProvenanceRecord::Git {
+                url: "https://example.com/foo.git".into(),
+                ref_spec: None,
+                commit_sha: None,
+                origin: "observed".into(),
+                submodule_shas: vec![],
+            }],
+            active_flags: vec!["ssl".into()],
+            dep_decl: None,
+            cond_requires: vec![],
+            aliases: vec![],
+            attestation: Some(LockAttestation { kind: AttestationKind::MilpaVendored, rekor: None }),
+        };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let text = format_lockfile(&lf);
+        let flags_pos = text.find("    active_flags \"ssl\"").unwrap();
+        let att_pos = text.find("    attestation {").unwrap();
+        let prov_pos = text.find("    provenance {").unwrap();
+        assert!(
+            flags_pos < att_pos && att_pos < prov_pos,
+            "expected active_flags < attestation < provenance\nflags_pos={flags_pos}, \
+             att_pos={att_pos}, prov_pos={prov_pos}\ntext:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_round_trip_parse_format_identical_author_signed() {
+        let att = LockAttestation {
+            kind: AttestationKind::AuthorSigned { signer: "https://example.com/wf.yaml".into() },
+            rekor: Some(RekorRef { uuid: "abc".into(), log_index: "1".into(), integrated_time: "2".into() }),
+        };
+        let dep = make_locked_dep_with_attestation(Some(att.clone()));
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let text1 = format_lockfile(&lf);
+        let lf2 = parse_lockfile(&text1).unwrap();
+        let text2 = format_lockfile(&lf2);
+        assert_eq!(text1, text2);
+        assert_eq!(lf2.deps[0].attestation, Some(att));
+    }
+
+    #[test]
+    fn test_round_trip_parse_format_identical_milpa_vendored() {
+        let att = LockAttestation { kind: AttestationKind::MilpaVendored, rekor: None };
+        let dep = make_locked_dep_with_attestation(Some(att.clone()));
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let text1 = format_lockfile(&lf);
+        let lf2 = parse_lockfile(&text1).unwrap();
+        let text2 = format_lockfile(&lf2);
+        assert_eq!(text1, text2);
+        assert_eq!(lf2.deps[0].attestation, Some(att));
+    }
+
+    #[test]
+    fn test_malformed_unrecognized_kind_collapses_to_absent() {
+        let text = format!(
+            "// generated by milpa; reproducible build snapshot\n\
+             version 1\n\
+             strategy \"maxver\"\n\n\
+             dep \"foo\" {{\n\
+             \x20   identity \"{VALID_ID}\"\n\
+             \x20   version \"1.0.0\"\n\
+             \x20   src_dir \"src\"\n\
+             \x20   requires\n\
+             \x20   attestation {{\n\
+             \x20       kind \"bogus-kind\"\n\
+             \x20   }}\n\
+             \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
+             \x20       kind \"git\"\n\
+             \x20       url \"https://example.com/foo.git\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&text).unwrap();
+        assert!(lf.deps[0].attestation.is_none());
+    }
+
+    #[test]
+    fn test_malformed_author_signed_missing_signer_collapses_to_absent() {
+        let text = format!(
+            "// generated by milpa; reproducible build snapshot\n\
+             version 1\n\
+             strategy \"maxver\"\n\n\
+             dep \"foo\" {{\n\
+             \x20   identity \"{VALID_ID}\"\n\
+             \x20   version \"1.0.0\"\n\
+             \x20   src_dir \"src\"\n\
+             \x20   requires\n\
+             \x20   attestation {{\n\
+             \x20       kind \"author-signed\"\n\
+             \x20   }}\n\
+             \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
+             \x20       kind \"git\"\n\
+             \x20       url \"https://example.com/foo.git\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&text).unwrap();
+        assert!(lf.deps[0].attestation.is_none());
+    }
+
+    #[test]
+    fn test_older_parser_forward_compat_skip() {
+        // An unrecognized `attestation` node is skipped like any other unknown
+        // child node — a lockfile with the block still parses successfully.
+        let text = format!(
+            "// generated by milpa; reproducible build snapshot\n\
+             version 1\n\
+             strategy \"maxver\"\n\n\
+             dep \"foo\" {{\n\
+             \x20   identity \"{VALID_ID}\"\n\
+             \x20   version \"1.0.0\"\n\
+             \x20   src_dir \"src\"\n\
+             \x20   requires\n\
+             \x20   attestation {{\n\
+             \x20       kind \"milpa-vendored\"\n\
+             \x20   }}\n\
+             \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
+             \x20       kind \"git\"\n\
+             \x20       url \"https://example.com/foo.git\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&text).unwrap();
+        assert_eq!(lf.deps[0].name, "foo");
+        assert_eq!(
+            lf.deps[0].attestation,
+            Some(LockAttestation { kind: AttestationKind::MilpaVendored, rekor: None })
+        );
+    }
+
+    #[test]
+    fn test_locked_from_resolved_narrows_entry_attestation_drops_bundle_pin() {
+        // RFC per-entry-attestation.md P2: `locked_from_resolved` narrows the
+        // index-side `EntryAttestation` (which carries `bundle_pin`) to the
+        // lockfile-side `LockAttestation` (no `bundle_pin`) by dropping it.
+        let entry_att = milpa_types::EntryAttestation {
+            kind: AttestationKind::AuthorSigned { signer: "https://example.com/wf.yaml".into() },
+            rekor: Some(RekorRef { uuid: "u".into(), log_index: "1".into(), integrated_time: "2".into() }),
+            bundle_pin: Some("a".repeat(64)),
+        };
+        let resolved = ResolvedDep {
+            name: "foo".into(),
+            namespace: None,
+            identity: VALID_ID.into(),
+            version: milpa_types::Version::release(1, 0, 0),
+            src_dir: "src".into(),
+            requires: vec![],
+            provenances: vec![ProvenanceRecord::Git {
+                url: "https://example.com/foo.git".into(),
+                ref_spec: None,
+                commit_sha: None,
+                origin: "observed".into(),
+                submodule_shas: vec![],
+            }],
+            dep_decl: None,
+            cond_requires: vec![],
+            aliases: vec![],
+            active_flags: vec![],
+            attestation: Some(entry_att),
+        };
+        let graph = ResolvedGraph { deps: vec![resolved] };
+        let lf = from_graph(&graph, "maxver");
+        let locked_att = lf.deps[0].attestation.as_ref().expect("claim must be carried");
+        assert_eq!(
+            locked_att,
+            &LockAttestation {
+                kind: AttestationKind::AuthorSigned { signer: "https://example.com/wf.yaml".into() },
+                rekor: Some(RekorRef {
+                    uuid: "u".into(),
+                    log_index: "1".into(),
+                    integrated_time: "2".into()
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn test_unattested_entry_has_no_lockfile_block() {
+        let resolved = ResolvedDep {
+            name: "foo".into(),
+            namespace: None,
+            identity: VALID_ID.into(),
+            version: milpa_types::Version::release(1, 0, 0),
+            src_dir: "src".into(),
+            requires: vec![],
+            provenances: vec![ProvenanceRecord::Git {
+                url: "https://example.com/foo.git".into(),
+                ref_spec: None,
+                commit_sha: None,
+                origin: "observed".into(),
+                submodule_shas: vec![],
+            }],
+            dep_decl: None,
+            cond_requires: vec![],
+            aliases: vec![],
+            active_flags: vec![],
+            attestation: None,
+        };
+        let graph = ResolvedGraph { deps: vec![resolved] };
+        let lf = from_graph(&graph, "maxver");
+        assert!(lf.deps[0].attestation.is_none());
     }
 }

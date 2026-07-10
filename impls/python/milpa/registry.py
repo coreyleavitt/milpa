@@ -44,6 +44,7 @@ from milpa.kdl_io import (
     node_arg_str,
     node_children,
     node_name,
+    node_prop_str,
     nodes,
     parse_kdl,
     value_as_int,
@@ -71,6 +72,11 @@ _RE_40HEX = re.compile(r"^[0-9a-f]{40}$")
 #: future algorithm change (e.g. sha512) has exactly ONE update site.
 _RE_SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _RE_UNSAFE_NAME = re.compile(r"[/\\]|\.\.")
+#: Bare (no ``sha256:`` prefix) 64-lowercase-hex form — the ``bundle sha256=``
+#: property's value shape (registry-protocol §3.2 NORMATIVE).  Distinct from
+#: ``_RE_SHA256_DIGEST`` (which requires the prefix) because the property key
+#: already names the algorithm.
+_RE_HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def is_safe_name(name: str) -> bool:
@@ -174,6 +180,65 @@ class OciIndexProvenance:
 IndexProvenance = GitIndexProvenance | OciIndexProvenance
 
 # ---------------------------------------------------------------------------
+# Per-entry attestation record (RFC: per-entry-attestation, P1/P2; §3.2)
+#
+# One optional tagged record on IndexVersion — not independently-nullable
+# fields — so the kind/signer correlation is structural, not conventional.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RekorRef:
+    """Durable Rekor transparency-log reference (registry-protocol §3.2)."""
+
+    uuid: str
+    log_index: str
+    integrated_time: str
+
+
+@dataclass(frozen=True)
+class AuthorSigned:
+    """``attestation "author-signed"`` — ``signer`` is REQUIRED for this kind."""
+
+    signer: str
+
+
+@dataclass(frozen=True)
+class MilpaVendored:
+    """``attestation "milpa-vendored"`` — no per-entry signer field by design.
+
+    The effective signer for this kind is derived at *verification* time
+    (not parse time) from Layer 1's resolved vendor-bot identity — see
+    ``rfc-per-entry-attestation.md`` §5.  This parser never reads or stores
+    a signer for the vendored kind.
+    """
+
+
+#: Closed set (registry-protocol §3.2 NORMATIVE) — the only two recognized
+#: ``attestation`` kinds.  Any other value collapses to unattested.
+AttestationKind = AuthorSigned | MilpaVendored
+
+
+@dataclass(frozen=True)
+class EntryAttestation:
+    """Per-entry Layer 2 author-attribution CLAIM (attribution, not integrity).
+
+    Parsed from the ``attestation`` / ``signed_by`` / ``rekor`` / ``bundle``
+    sibling child nodes on one ``version`` node (registry-protocol §3.2).
+    Records the CLAIM only — whether it is cryptographically true is a later
+    (P3) question; this type carries zero verification state.
+
+    ``bundle_pin`` — sha256 hex of the attestation bundle BYTES (the ``bundle
+    sha256=`` delivery-integrity pin).  ``None`` is the normal, expected state
+    before per-entry bundle delivery ships (P4).
+    """
+
+    kind: AttestationKind
+    rekor: RekorRef | None = None
+    bundle_pin: str | None = None
+
+
+# ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
 
@@ -197,6 +262,11 @@ class IndexVersion:
 
     ``dep_decl_schema_version`` — the DepDecl schema version integer that
     produced ``dep_decl`` (registry-protocol §3.2.1).  ``None`` when absent.
+
+    ``attestation`` — the per-entry Layer 2 attribution CLAIM (registry-protocol
+    §3.2), or ``None`` when the entry carries no attestation record, OR when a
+    present record failed the closed-set / structural-validity check and
+    conservatively collapsed to unattested (RFC per-entry-attestation §2).
     """
 
     version: str
@@ -204,6 +274,7 @@ class IndexVersion:
     provenances: tuple[IndexProvenance, ...] = ()
     dep_decl: str | None = None
     dep_decl_schema_version: int | None = None
+    attestation: EntryAttestation | None = None
 
 
 @dataclass(frozen=True)
@@ -490,7 +561,9 @@ def parse_index(text: str) -> Index:
             continue
         _validate_safe_name(name)
         namespace = _child_scalar(top_node, "namespace") or ""
-        versions = _parse_versions(name, top_node)
+        versions, diagnostics = _parse_versions(name, namespace, top_node)
+        for diag in diagnostics:
+            warnings.warn(diag, stacklevel=2)
         packages.append(Package(name=name, namespace=namespace, versions=tuple(versions)))
 
     return Index(packages=packages)
@@ -559,7 +632,9 @@ def _child_scalar_url(parent: KdlNode, child_node_name: str) -> str | None:
     return None
 
 
-def _parse_versions(pkg_name: str, pkg_node: KdlNode) -> list[IndexVersion]:
+def _parse_versions(
+    pkg_name: str, namespace: str, pkg_node: KdlNode
+) -> tuple[list[IndexVersion], list[str]]:
     """Parse all ``version`` children of *pkg_node* into ``IndexVersion`` objects.
 
     Duplicate version strings are tolerated: first wins, subsequent ones emit
@@ -567,9 +642,15 @@ def _parse_versions(pkg_name: str, pkg_node: KdlNode) -> list[IndexVersion]:
 
     Output is sorted: parseable semver versions descending by semver, then
     unparseable versions in document order (registry-protocol §5.2 NORMATIVE).
+
+    Returns ``(versions, diagnostics)`` — *diagnostics* aggregates the
+    per-entry attestation collapse diagnostics from every version node
+    (registry-protocol §3.2 NORMATIVE "parse boundary shape"); the caller
+    threads them to the warning channel.
     """
     seen: list[str] = []
     raw: list[IndexVersion] = []
+    diagnostics: list[str] = []
 
     for child in node_children(pkg_node):
         if node_name(child) != "version":
@@ -585,7 +666,9 @@ def _parse_versions(pkg_name: str, pkg_node: KdlNode) -> list[IndexVersion]:
             )
             continue
         seen.append(ver_str)
-        raw.append(_parse_version_node(ver_str, child))
+        iv, iv_diagnostics = _parse_version_node(namespace, pkg_name, ver_str, child)
+        raw.append(iv)
+        diagnostics.extend(iv_diagnostics)
 
     # Sort: parseable semver versions descending, unparseable in document order.
     # Build explicit list of (IndexVersion, Version) pairs — the filter guarantees
@@ -599,11 +682,19 @@ def _parse_versions(pkg_name: str, pkg_node: KdlNode) -> list[IndexVersion]:
         else:
             unparseable.append(iv)
     parseable_pairs.sort(key=lambda t: t[1], reverse=True)
-    return [t[0] for t in parseable_pairs] + unparseable
+    return [t[0] for t in parseable_pairs] + unparseable, diagnostics
 
 
-def _parse_version_node(ver_str: str, node: KdlNode) -> IndexVersion:
-    """Parse one ``version "<ver>" { … }`` node into an ``IndexVersion``."""
+def _parse_version_node(
+    namespace: str, pkg_name: str, ver_str: str, node: KdlNode
+) -> tuple[IndexVersion, list[str]]:
+    """Parse one ``version "<ver>" { … }`` node into an ``IndexVersion``.
+
+    Returns ``(IndexVersion, collapse diagnostics)`` — registry-protocol §3.2
+    NORMATIVE "parse boundary shape".  The diagnostics list is non-empty only
+    when the entry's attestation record collapsed (closed-set violation,
+    structurally-invalid ``author-signed``, or a malformed ``bundle`` pin).
+    """
     content_hash = _child_scalar(node, "content_hash") or ""
     provenances: list[IndexProvenance] = []
     dep_decl: str | None = None
@@ -623,13 +714,102 @@ def _parse_version_node(ver_str: str, node: KdlNode) -> IndexVersion:
         elif name == "dep_decl_schema_version":
             dep_decl_schema_version = _node_int_arg(child)
 
-    return IndexVersion(
-        version=ver_str,
-        content_hash=content_hash,
-        provenances=tuple(provenances),
-        dep_decl=dep_decl,
-        dep_decl_schema_version=dep_decl_schema_version,
+    attestation, diagnostics = _parse_entry_attestation(namespace, pkg_name, ver_str, node)
+
+    return (
+        IndexVersion(
+            version=ver_str,
+            content_hash=content_hash,
+            provenances=tuple(provenances),
+            dep_decl=dep_decl,
+            dep_decl_schema_version=dep_decl_schema_version,
+            attestation=attestation,
+        ),
+        diagnostics,
     )
+
+
+def _parse_entry_attestation(
+    namespace: str, pkg_name: str, ver_str: str, node: KdlNode
+) -> tuple[EntryAttestation | None, list[str]]:
+    """Parse the ``attestation``/``signed_by``/``rekor``/``bundle`` sibling
+    child nodes of one ``version`` node into an ``EntryAttestation`` or
+    ``None`` (registry-protocol §3.2 NORMATIVE).
+
+    Conservative collapse: an unrecognized ``attestation`` kind, or
+    ``"author-signed"`` with no ``signed_by``, collapses the WHOLE record to
+    ``None`` (unattested) with an observable diagnostic.  A malformed
+    ``bundle`` pin is narrower — it collapses only the bundle pin to ``None``,
+    never the enclosing kind/signer pairing (registry-protocol §3.2 NORMATIVE).
+    """
+    coordinate = f"pkg:tianguis/{namespace}/{pkg_name}@{ver_str}"
+    diagnostics: list[str] = []
+
+    attestation_label = _child_scalar(node, "attestation")
+    rekor = _parse_rekor_block(node)
+    bundle_pin, bundle_diag = _parse_bundle_pin(node, coordinate)
+    diagnostics.extend(bundle_diag)
+
+    if attestation_label is None:
+        # No attestation kind: a lone `rekor` block (if any) does not construct
+        # an EntryAttestation — there is no kind to tag it with (§3.2 NORMATIVE).
+        return None, diagnostics
+
+    kind: AttestationKind
+    if attestation_label == "author-signed":
+        signed_by = _child_scalar(node, "signed_by")
+        if not signed_by:
+            diagnostics.append(
+                f"attestation claim for {coordinate} collapsed to unattested: "
+                f"\"author-signed\" with no signed_by (registry-protocol §3.2)"
+            )
+            return None, diagnostics
+        kind = AuthorSigned(signer=signed_by)
+    elif attestation_label == "milpa-vendored":
+        kind = MilpaVendored()
+    else:
+        diagnostics.append(
+            f"attestation claim for {coordinate} collapsed to unattested: "
+            f"unrecognized kind {attestation_label!r} (registry-protocol §3.2)"
+        )
+        return None, diagnostics
+
+    return EntryAttestation(kind=kind, rekor=rekor, bundle_pin=bundle_pin), diagnostics
+
+
+def _parse_rekor_block(node: KdlNode) -> RekorRef | None:
+    """Parse the optional ``rekor { uuid; log_index; integrated_time }`` block."""
+    for child in node_children(node):
+        if node_name(child) == "rekor":
+            return RekorRef(
+                uuid=_child_scalar(child, "uuid") or "",
+                log_index=_child_scalar(child, "log_index") or "",
+                integrated_time=_child_scalar(child, "integrated_time") or "",
+            )
+    return None
+
+
+def _parse_bundle_pin(node: KdlNode, coordinate: str) -> tuple[str | None, list[str]]:
+    """Parse the optional ``bundle sha256="<64-hex>"`` delivery-integrity pin.
+
+    A malformed value normalizes to ``None`` with a diagnostic, WITHOUT
+    collapsing the enclosing kind/signer pairing (registry-protocol §3.2
+    NORMATIVE — an absent bundle pin is the ordinary, expected pre-delivery
+    state, not evidence of a malformed claim).
+    """
+    for child in node_children(node):
+        if node_name(child) != "bundle":
+            continue
+        raw = node_prop_str(child, "sha256")
+        if raw is None:
+            return None, []
+        if _RE_HEX64.fullmatch(raw):
+            return raw, []
+        return None, [
+            f"bundle pin for {coordinate} dropped: malformed sha256 value "
+            f"{raw!r} (registry-protocol §3.2)"
+        ]
+    return None, []
 
 
 def _parse_provenance_node(node: KdlNode) -> IndexProvenance | None:

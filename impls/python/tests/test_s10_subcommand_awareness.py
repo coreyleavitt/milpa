@@ -37,7 +37,14 @@ from milpa.cli import (
 from milpa.context import MilpaEnv
 from milpa.fetchers.cas_admitting import CasAdmittingFetcher
 from milpa.fetchers.mocked import mocked_registry, url_key
-from milpa.lockfile import GitProvenanceRecord, LockedDep, Lockfile, write_lockfile
+from milpa.lockfile import (
+    GitProvenanceRecord,
+    LockAttestation,
+    LockedDep,
+    Lockfile,
+    write_lockfile,
+)
+from milpa.registry import AuthorSigned, MilpaVendored
 from milpa.version import Strategy
 
 
@@ -86,11 +93,12 @@ def _make_mocked_fixture(
 def _write_locked_dep(
     lock_path: Path,
     dep_name: str,
-    active_flags: tuple[str, ...],
+    active_flags: tuple[str, ...] = (),
     git_url: str = "https://example.com/dep.git",
     ref: str = "main",
     sha: str = "a" * 40,
     identity: str = "dag-sha256:" + "a" * 64,
+    attestation: LockAttestation | None = None,
 ) -> None:
     """Write a minimal lockfile with one dep that has active_flags set."""
     dep = LockedDep(
@@ -108,6 +116,7 @@ def _write_locked_dep(
         ),
         identity=identity,
         active_flags=active_flags,
+        attestation=attestation,
     )
     lf = Lockfile(version=1, strategy="maxver", deps=(dep,))
     write_lockfile(lf, lock_path)
@@ -497,6 +506,59 @@ class TestShowActiveFlags:
         captured = capsys.readouterr()
         assert "active_flags" not in captured.out, (
             f"active_flags line must be omitted when empty:\n{captured.out}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 6b. milpa show: renders the attestation claim (RFC per-entry-attestation
+#     P2 §7) as an UNVERIFIED claim — no crypto has run over it.
+# ---------------------------------------------------------------------------
+
+class TestShowAttestation:
+    def test_show_renders_author_signed_claim(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _write_locked_dep(
+            tmp_path / "milpa.lock",
+            dep_name="widget",
+            attestation=LockAttestation(
+                kind=AuthorSigned(signer="https://example.com/workflow.yaml")
+            ),
+        )
+
+        rc = cmd_show(tmp_path)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "claims author-signed by https://example.com/workflow.yaml" in captured.out, (
+            f"expected unverified-claim wording in show output:\n{captured.out}"
+        )
+
+    def test_show_renders_milpa_vendored_claim(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _write_locked_dep(
+            tmp_path / "milpa.lock",
+            dep_name="widget",
+            attestation=LockAttestation(kind=MilpaVendored()),
+        )
+
+        rc = cmd_show(tmp_path)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "claims milpa-vendored" in captured.out, (
+            f"expected unverified-claim wording in show output:\n{captured.out}"
+        )
+
+    def test_show_no_attestation_line_when_absent(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _write_locked_dep(tmp_path / "milpa.lock", dep_name="widget")
+
+        rc = cmd_show(tmp_path)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "attestation" not in captured.out, (
+            f"attestation line must be omitted when absent:\n{captured.out}"
         )
 
 

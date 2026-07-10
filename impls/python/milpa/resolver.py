@@ -113,7 +113,7 @@ from milpa.edge_sources import (
 from milpa.dep_decl import EdgeSet
 from milpa.nimble import parse_nimble
 from milpa.profile import Profile
-from milpa.registry import GitIndexProvenance, Index, IndexVersion
+from milpa.registry import EntryAttestation, GitIndexProvenance, Index, IndexVersion
 from milpa.solver import SolverError, Term, solve_with_cert
 from milpa.version import DepKey, Strategy, Version, VersionSet, dep_dir_name, format_version_str, parse_version
 from milpa.workspace import LoadedWorkspace
@@ -335,6 +335,12 @@ class _Candidate:
     # Populated by _process_url_worker from receipt.submodule_shas so that
     # _build_graph can wire it into GitProvenanceRecord(submodule_shas=...).
     submodule_shas: dict[str, str] = field(default_factory=dict)
+    # RFC per-entry-attestation.md P2: the index's EntryAttestation CLAIM,
+    # carried unconditionally from IndexVersion.attestation for named
+    # (registry-resolved) deps.  None for URL/tarball/local/member deps (no
+    # index entry) and for named deps whose index entry had no attestation
+    # record or one that collapsed to unattested at index-parse time.
+    attestation: EntryAttestation | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +552,10 @@ class _Provider:
             ),
             dep_decl=_dep_decl_pin,
             requires_predicates=requires_predicates,
+            # RFC per-entry-attestation.md P2: carried straight through from the
+            # index — already None when absent or collapsed (registry.py's
+            # conservative-collapse rule), so no re-derivation needed here.
+            attestation=iv.attestation,
         )
 
         # S3: compute and store dep_active_flags for this named dep.
@@ -3487,6 +3497,9 @@ def _build_graph(
             aliases=tuple(canonical_to_aliases.get(name, [])),
             # C1: carry namespace for qualified named deps.
             namespace=_namespace,
+            # RFC per-entry-attestation.md P2: carry the attestation claim from
+            # the candidate (None for non-named deps and unattested entries).
+            attestation=cand.attestation,
         )
         deps.append(resolved)
 

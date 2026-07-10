@@ -32,7 +32,7 @@ use milpa_solver::{
     parse_version, solve, solve_with_refutation, vs_to_constraint_str, Dep as SolverDep,
     PackageProvider, RefutationEntry, Strategy, VersionSet,
 };
-use milpa_types::{DepKey, EdgeSet, FlagRequest, Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph, Version};
+use milpa_types::{DepKey, EdgeSet, EntryAttestation, FlagRequest, Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph, Version};
 
 use crate::edge_sources::{
     dep_passes_flag_predicates, resolve_edges, DepDeclEdgeSource,
@@ -1144,6 +1144,11 @@ struct Candidate {
     /// Maps dep-name → ALL predicate-vecs across ALL occurrences (C1 fix).
     /// Never consulted for selection/solving. Empty for root/synthetic candidates.
     requires_predicates: std::collections::BTreeMap<String, Vec<Vec<milpa_types::Predicate>>>,
+    /// RFC per-entry-attestation.md P2: the index's `EntryAttestation` CLAIM,
+    /// straight passthrough from the selected `IndexVersion.attestation` for
+    /// named-dep candidates. `None` for URL/tarball/local/member candidates
+    /// (no index entry) and the synthetic root.
+    attestation: Option<EntryAttestation>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1480,6 +1485,7 @@ impl<'a> ResolveProvider<'a> {
             declared_mirror_urls: Vec::new(),
             dep_decl: None,
             requires_predicates: std::collections::BTreeMap::new(),
+            attestation: None,
         };
         self.store_candidate(root);
         Ok(queue)
@@ -1708,6 +1714,7 @@ impl<'a> ResolveProvider<'a> {
                 declared_mirror_urls: Vec::new(), // workspace members have no mirrors
                 dep_decl: None, // workspace members never resolved via DepDecl
                 requires_predicates: std::collections::BTreeMap::new(),
+                attestation: None, // workspace members have no index entry
             });
             root_deps.push(SolverDep::new(member.name.clone(), eq_sentinel()));
             root_requires.push(member.name.clone());
@@ -1822,6 +1829,7 @@ impl<'a> ResolveProvider<'a> {
             declared_mirror_urls: Vec::new(),
             dep_decl: None,
             requires_predicates: std::collections::BTreeMap::new(),
+            attestation: None,
         };
         self.store_candidate(root);
         Ok(queue)
@@ -2181,6 +2189,7 @@ impl<'a> ResolveProvider<'a> {
             declared_mirror_urls,
             dep_decl: None, // URL deps not in the index; no DepDecl pin
             requires_predicates: ex.requires_predicates,
+            attestation: None, // URL deps not in the index; no attestation record
         });
 
         // S3 / S4a / C1: unconditionally seed dep_active_flags for this URL dep so that
@@ -2257,6 +2266,7 @@ impl<'a> ResolveProvider<'a> {
             declared_mirror_urls: Vec::new(), // local deps have no mirrors
             dep_decl: None, // local deps not in the index; no DepDecl pin
             requires_predicates: ex.requires_predicates,
+            attestation: None, // local deps not in the index; no attestation record
         });
         self.process_items(ex.sub_items)?;
         Ok(())
@@ -2309,6 +2319,7 @@ impl<'a> ResolveProvider<'a> {
             }),
             declared_mirror_urls: Vec::new(), // tarball deps have no mirrors
             requires_predicates: ex.requires_predicates,
+            attestation: None, // tarball deps not in the index; no attestation record
         });
         self.process_items(ex.sub_items)?;
         Ok(())
@@ -2459,6 +2470,9 @@ impl<'a> ResolveProvider<'a> {
             declared_mirror_urls: Vec::new(),
             dep_decl: dep_decl_pin,
             requires_predicates: ex.requires_predicates,
+            // RFC per-entry-attestation.md P2: straight passthrough from the
+            // selected index entry — already `None` when absent/collapsed.
+            attestation: entry.attestation.clone(),
         };
         self.store_candidate(candidate);
         self.stubs
@@ -3028,6 +3042,9 @@ impl<'a> ResolveProvider<'a> {
                         provs
                     },
                     dep_decl: c.dep_decl.clone(),
+                    // RFC per-entry-attestation.md P2: straight passthrough
+                    // from the candidate — already `None` for non-named deps.
+                    attestation: c.attestation.clone(),
                     cond_requires,
                     // Phase B: lex-sorted alias list for this canonical dep.
                     // Empty for non-deduped deps.
