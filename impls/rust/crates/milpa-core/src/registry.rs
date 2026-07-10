@@ -73,6 +73,39 @@ fn validate_no_leading_dash(value: &str, field: &str, code: &'static str) -> Res
     }
 }
 
+/// True iff `s` contains an ASCII control character (U+0000-U+001F
+/// inclusive, or U+007F).
+fn has_control_char(s: &str) -> bool {
+    s.chars().any(|c| (c as u32) <= 0x1f || c as u32 == 0x7f)
+}
+
+/// Reject a value containing an ASCII control character (U+0000-U+001F or
+/// U+007F). Registry string fields are attacker-controlled network input
+/// (`index.kdl` is fetched, not authored locally); KDL 2.0's `\u{XXXX}`
+/// escape syntax can deliver a literal control character through an
+/// otherwise well-formed string literal — these are exactly the delimiter
+/// bytes the append-only ratchet's canonical violation digest
+/// (registry-protocol §3.5.3) and its non-scalar renderings use (TAB, LF,
+/// `\x1f`, `\x1e`, `\x01`). Rejected at the parse boundary (registry-protocol
+/// §3.3 NORMATIVE (control-character rejection)) so no downstream consumer —
+/// ratchet comparison, digest rendering, CLI output — ever sees one. A
+/// single, field-independent slug covers every field this validator guards
+/// (same economy `TNG-UNSAFE-OCI-FIELD` already applies across its own two
+/// fields).
+fn validate_no_control_chars(value: &str, field: &str) -> Result<(), CoreError> {
+    if has_control_char(value) {
+        Err(tng(
+            "TNG-UNSAFE-CONTROL-CHAR",
+            format!(
+                "{field} {value:?} contains an ASCII control character \
+                 (U+0000-U+001F or U+007F) — rejected at parse boundary"
+            ),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn is_lower_hex(s: &str, len: usize) -> bool {
     s.len() == len
         && s.bytes()
@@ -272,6 +305,7 @@ impl Index {
             // `..`-name is an active attack vector, not a formatting quirk).
             validate_safe_name(&name)?;
             let namespace = child_arg_str(node, "namespace").unwrap_or_default();
+            validate_no_control_chars(&namespace, "namespace")?;
 
             let mut versions: Vec<IndexVersion> = Vec::new();
             let mut seen: Vec<String> = Vec::new();
@@ -282,6 +316,7 @@ impl Index {
                 let Some(ver) = first_arg_str(child) else {
                     continue;
                 };
+                validate_no_control_chars(&ver, "version")?;
                 if seen.contains(&ver) {
                     continue; // duplicate-version tolerance: keep the first
                 }
@@ -569,6 +604,8 @@ fn parse_version_node(
                 let url = child_arg_str(child, "url").unwrap_or_default();
                 let git_ref = child_arg_str(child, "ref").unwrap_or_default();
                 let commit = child_arg_str(child, "commit_sha");
+                validate_no_control_chars(&url, "git url")?;
+                validate_no_control_chars(&git_ref, "git ref")?;
                 validate_no_leading_dash(&url, "git url", "TNG-UNSAFE-URL")?;
                 validate_no_leading_dash(&git_ref, "git ref", "TNG-UNSAFE-REF")?;
                 if let Some(sha) = &commit {
@@ -584,6 +621,8 @@ fn parse_version_node(
                 let registry = child_arg_str(child, "registry").unwrap_or_default();
                 let repository = child_arg_str(child, "repository").unwrap_or_default();
                 let digest = child_arg_str(child, "digest").unwrap_or_default();
+                validate_no_control_chars(&registry, "oci registry")?;
+                validate_no_control_chars(&repository, "oci repository")?;
                 validate_no_leading_dash(&registry, "oci registry", "TNG-UNSAFE-OCI-FIELD")?;
                 validate_no_leading_dash(&repository, "oci repository", "TNG-UNSAFE-OCI-FIELD")?;
                 validate_oci_digest(&digest)?;
@@ -597,7 +636,7 @@ fn parse_version_node(
             _ => {}
         }
     }
-    let (attestation, diagnostics) = parse_entry_attestation(namespace, pkg_name, ver, node);
+    let (attestation, diagnostics) = parse_entry_attestation(namespace, pkg_name, ver, node)?;
 
     // A2a (registry-protocol §3.2 "published_at" / "Yank triple"): parse-to-
     // typed, malformed -> None/default, never a hard error.
@@ -767,12 +806,12 @@ fn parse_entry_attestation(
     pkg_name: &str,
     ver: &str,
     node: &KdlNode,
-) -> (Option<EntryAttestation>, Vec<String>) {
+) -> Result<(Option<EntryAttestation>, Vec<String>), CoreError> {
     let coordinate = format!("pkg:tianguis/{namespace}/{pkg_name}@{ver}");
     let mut diagnostics: Vec<String> = Vec::new();
 
     let attestation_label = child_arg_str(node, "attestation");
-    let rekor = parse_rekor_block(node);
+    let rekor = parse_rekor_block(node)?;
     let (bundle_pin, bundle_diag) = parse_bundle_pin(node, &coordinate);
     diagnostics.extend(bundle_diag);
 
@@ -780,7 +819,7 @@ fn parse_entry_attestation(
         // No attestation kind: a lone `rekor` block (if any) does not
         // construct an EntryAttestation — there is no kind to tag it with
         // (§3.2 NORMATIVE).
-        return (None, diagnostics);
+        return Ok((None, diagnostics));
     };
 
     let kind: AttestationKind = match label.as_str() {
@@ -793,7 +832,7 @@ fn parse_entry_attestation(
                         "attestation claim for {coordinate} collapsed to unattested: \
                          \"author-signed\" with no signed_by (registry-protocol §3.2)"
                     ));
-                    return (None, diagnostics);
+                    return Ok((None, diagnostics));
                 }
             }
         }
@@ -803,32 +842,38 @@ fn parse_entry_attestation(
                 "attestation claim for {coordinate} collapsed to unattested: \
                  unrecognized kind {other:?} (registry-protocol §3.2)"
             ));
-            return (None, diagnostics);
+            return Ok((None, diagnostics));
         }
     };
 
-    (
+    Ok((
         Some(EntryAttestation {
             kind,
             rekor,
             bundle_pin,
         }),
         diagnostics,
-    )
+    ))
 }
 
 /// Parse the optional `rekor { uuid; log_index; integrated_time }` block.
-fn parse_rekor_block(node: &KdlNode) -> Option<RekorRef> {
+fn parse_rekor_block(node: &KdlNode) -> Result<Option<RekorRef>, CoreError> {
     for child in children(node) {
         if child.name().value() == "rekor" {
-            return Some(RekorRef {
-                uuid: child_arg_str(child, "uuid").unwrap_or_default(),
-                log_index: child_arg_str(child, "log_index").unwrap_or_default(),
-                integrated_time: child_arg_str(child, "integrated_time").unwrap_or_default(),
-            });
+            let uuid = child_arg_str(child, "uuid").unwrap_or_default();
+            let log_index = child_arg_str(child, "log_index").unwrap_or_default();
+            let integrated_time = child_arg_str(child, "integrated_time").unwrap_or_default();
+            validate_no_control_chars(&uuid, "rekor uuid")?;
+            validate_no_control_chars(&log_index, "rekor log_index")?;
+            validate_no_control_chars(&integrated_time, "rekor integrated_time")?;
+            return Ok(Some(RekorRef {
+                uuid,
+                log_index,
+                integrated_time,
+            }));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Parse the optional `bundle sha256="<64-hex>"` delivery-integrity pin.

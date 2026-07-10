@@ -33,6 +33,7 @@ from milpa.errors import (
     TNG_NO_SATISFYING_VERSION,
     TNG_NOT_FOUND,
     TNG_SCHEMA_UNKNOWN,
+    TNG_UNSAFE_CONTROL_CHAR,
     TNG_UNSAFE_NAME,
     TNG_UNSAFE_OCI_FIELD,
     TNG_UNSAFE_REF,
@@ -50,6 +51,7 @@ from milpa.registry import (
     Package,
     _validate_commit_sha,
     _validate_dep_decl_pointer,
+    _validate_no_control_chars,
     _validate_no_leading_dash,
     _validate_oci_digest,
     _validate_safe_name,
@@ -741,6 +743,227 @@ package "foo" {
         with pytest.raises(MilpaError) as exc_info:
             parse_index(text)
         assert exc_info.value.slug == TNG_UNSAFE_OCI_FIELD
+
+    # TNG-UNSAFE-CONTROL-CHAR (CR2 — canonical-digest delimiter injection)
+    #
+    # index.kdl is attacker-controlled network input. KDL 2.0's `\u{XXXX}`
+    # escape syntax delivers a literal ASCII control character through an
+    # otherwise well-formed string literal — confirmed empirically: a
+    # `\u{9}` escape decodes to a literal TAB via kdl_io's parse_kdl. TAB and
+    # LF are exactly the delimiters registry-protocol §3.5.3's canonical
+    # violation digest uses; `\x1f`/`\x1e` are the non-scalar-rendering
+    # delimiters. Left unvalidated, a crafted namespace/version/provenance/
+    # rekor field lets two semantically different violation sets serialize
+    # to identical digest bytes, defeating the warn-mode habituation defense.
+
+    def test_control_char_via_validator(self) -> None:
+        with pytest.raises(MilpaError) as exc_info:
+            _validate_no_control_chars("a\tb", "namespace")
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
+    def test_safe_value_passes_control_char_validator(self) -> None:
+        _validate_no_control_chars("perfectly-normal-value", "namespace")  # must not raise
+
+    def test_control_char_tab_in_namespace_via_kdl_escape(self) -> None:
+        """A `\\u{9}` KDL escape in `namespace` decodes to a literal TAB — the
+        canonical violation digest's field delimiter (registry-protocol
+        §3.5.3). MUST be rejected at parse time (§3.3 NORMATIVE), before it
+        can reach a ratchet-compared or digest-rendered value."""
+        text = """\
+schema_version 1
+package "foo" {
+    namespace "evil\\u{9}namespace"
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
+    def test_control_char_unit_separator_in_version_via_kdl_escape(self) -> None:
+        """A `\\u{1f}` KDL escape (ASCII unit separator — the provenance-record
+        encoding delimiter, §3.5.3) in a version string is rejected."""
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0\\u{1f}evil" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
+    def test_control_char_newline_in_git_url_via_kdl_escape(self) -> None:
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo\\u{a}.git"
+            ref "main"
+        }
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
+    def test_control_char_tab_in_git_ref_via_kdl_escape(self) -> None:
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "ma\\u{9}in"
+        }
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
+    def test_control_char_in_oci_registry_via_kdl_escape(self) -> None:
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "oci"
+            registry "ghcr\\u{9}.io"
+            repository "example/foo"
+            digest "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        }
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
+    def test_control_char_in_oci_repository_via_kdl_escape(self) -> None:
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "oci"
+            registry "ghcr.io"
+            repository "example\\u{9}/foo"
+            digest "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        }
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
+    def test_control_char_tab_in_rekor_uuid_via_kdl_escape(self) -> None:
+        """A `\\u{9}` (TAB) escape in the rekor `uuid` field is rejected —
+        TAB is the canonical violation digest's field-join delimiter
+        (§3.5.3), so an unvalidated uuid could shift the digest's 7-tuple
+        boundaries."""
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+        attestation "milpa-vendored"
+        rekor {
+            uuid "abc\\u{9}def"
+            log_index "1"
+            integrated_time "2"
+        }
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
+    def test_control_char_in_rekor_log_index_via_kdl_escape(self) -> None:
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+        attestation "milpa-vendored"
+        rekor {
+            uuid "abc"
+            log_index "1\\u{9}"
+            integrated_time "2"
+        }
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
+    def test_control_char_in_rekor_integrated_time_via_kdl_escape(self) -> None:
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+        attestation "milpa-vendored"
+        rekor {
+            uuid "abc"
+            log_index "1"
+            integrated_time "2\\u{9}"
+        }
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
+    def test_control_char_conformance_fixture(self) -> None:
+        """Conformance fixture-411: a `\\u{1f}` escape in `namespace` is
+        rejected as TNG-UNSAFE-CONTROL-CHAR (CR2 differential fixture)."""
+        text = _fixture_index("fixture-411-tng-unsafe-control-char")
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
 
 
 # ---------------------------------------------------------------------------

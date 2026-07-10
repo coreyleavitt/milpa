@@ -1331,6 +1331,12 @@ The index declares a schema_version higher than this milpa supports.
 
 **Triggered:** _check_schema_version finds the index schema_version integer is greater than TIANGUIS_INDEX_SCHEMA_VERSION — the caller must upgrade milpa.
 
+### `TNG-UNSAFE-CONTROL-CHAR`
+
+A registry string field (`namespace`, a version string, a git `url`/`ref`, an oci `registry`/`repository`, or a `rekor` `uuid`/`log_index`/`integrated_time`) contains an ASCII control character (U+0000–U+001F inclusive, or U+007F).
+
+**Triggered:** `_validate_no_control_chars` finds a control character in one of the fields above. These fields are attacker-controlled (fetched over the network); KDL 2.0's `\u{XXXX}` escape syntax can deliver a literal control character through an otherwise well-formed string literal, and these exact bytes (`\t`, `\n`, `\x1f`, `\x1e`, `\x01`) are the field/record delimiters the append-only ratchet's canonical violation digest (`registry-protocol.md` §3.5.3) and other raw-value renderings use — left unvalidated, a crafted value lets two semantically different violation sets serialize to identical digest bytes. One slug shared across every covered field, the same economy `TNG-UNSAFE-OCI-FIELD` already applies across its own two fields.
+
 ### `TNG-UNSAFE-NAME`
 
 A package name contains path-traversal characters and is unsafe as a filesystem path component under `_deps/`.

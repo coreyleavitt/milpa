@@ -178,6 +178,12 @@ impl CoreError {
             "TNG-UNSAFE-URL",
             "TNG-UNSAFE-REF",
             "TNG-UNSAFE-OCI-FIELD",
+            // CR2 fix: registry string fields (namespace, version, provenance
+            // url/ref/registry/repository, rekor uuid/log_index/integrated_time)
+            // reject ASCII control characters at the parse boundary — these are
+            // exactly the delimiter bytes the append-only ratchet's canonical
+            // violation digest (registry-protocol §3.5.3) uses.
+            "TNG-UNSAFE-CONTROL-CHAR",
             "TNG-NOT-FOUND",
             "TNG-AMBIGUOUS-NAME",
             "TNG-NO-SATISFYING-VERSION",

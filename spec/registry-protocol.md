@@ -536,6 +536,35 @@ grammar's §4.2, with the additional acceptance of `(url)`-annotated URL values
 > path, a per-entry attestation subject can bind to it without needing to
 > know which mirror serves the bytes at verification time.
 
+> NORMATIVE (control-character rejection): the registry's string-valued
+> identity and provenance fields — `namespace` (§3.1), a `version` node's
+> version string (§3.2), a `git` provenance's `url` and `ref` and an `oci`
+> provenance's `registry` and `repository` (both below), and the `rekor`
+> block's `uuid`, `log_index`, and `integrated_time` (§3.2) — MUST NOT
+> contain an ASCII control character (U+0000–U+001F inclusive, or U+007F). A
+> conformant implementation MUST reject a value containing one at parse
+> time, before the value is stored on the in-memory index type, raising
+> `TNG-UNSAFE-CONTROL-CHAR`. This is a parse-boundary charset check,
+> orthogonal to and applied in addition to each field's own shape validation
+> (leading-dash, hex-digest, closed kind-set, etc.) elsewhere in this
+> section. `index.kdl` is attacker-controlled network input, and KDL 2.0's
+> `\u{XXXX}` escape syntax can deliver a literal control character through
+> an otherwise well-formed string literal; these are exactly the bytes
+> (`\t`, `\n`, `\x1f`, `\x1e`, `\x01`) the append-only ratchet's canonical
+> violation digest (§3.5.3) and other raw-value renderings use as
+> field/record delimiters. Left unvalidated, a crafted field value lets two
+> semantically different violation sets serialize to identical digest bytes
+> — defeating the *warn* row's new-vs-recurring habituation defense
+> (§3.5.2) — and lets a crafted value inject forged violation-shaped lines
+> into diagnostic output. `TNG-UNSAFE-CONTROL-CHAR` is a single,
+> field-independent slug shared across every field this clause covers; the
+> offending field name and value are structured error context, not a
+> distinguishing slug — the same economy `TNG-UNSAFE-OCI-FIELD` already
+> applies across its own two fields. Because this clause makes control
+> characters structurally absent from every value the canonical digest
+> (§3.5.3) ever renders, that section's delimiter choices are safe by
+> construction and need no escaping mechanism of their own.
+
 #### `git` provenance
 
 ```kdl
@@ -1350,6 +1379,18 @@ part of `spec/errors.md` as of this spec-only amendment:
 > as recurring. `baseline_value` is deliberately excluded from the digest
 > (the baseline is frozen while violations persist, so it adds no
 > discriminating information).
+
+> NOTE (delimiter safety rests on the §3.3 parse boundary): the tab (`\t`)
+> and newline (`\n`) delimiters this digest definition uses, and the
+> `\x1f`/`\x1e` delimiters the non-scalar rendering below uses, are safe
+> precisely because §3.3's control-character rejection rule (NORMATIVE
+> (control-character rejection)) keeps every value these renderings draw
+> from — `namespace`, `version`, provenance `url`/`ref`/`registry`/
+> `repository`, and `rekor`'s `uuid`/`log_index`/`integrated_time` —
+> structurally free of ASCII control characters before it ever reaches this
+> digest. This section defines no escaping of its own for those values;
+> §3.3 is the sole reason the delimiter choices here are collision-safe
+> against attacker-controlled field content.
 
 > NORMATIVE (canonical rendering for non-scalar candidate values): "the raw
 > document string exactly as served" (above) is well-defined for every

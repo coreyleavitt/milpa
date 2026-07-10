@@ -2,8 +2,9 @@
 
 ``parse_index(text) -> Index`` parses a KDL 2.0 ``index.kdl`` document into a
 queryable ``Index``.  All security-critical fields (commit SHA shape, OCI digest
-shape, no-leading-dash, unsafe name) are validated at parse time before any
-index-supplied string can reach subprocess argv or the filesystem.
+shape, no-leading-dash, unsafe name, ASCII-control-character rejection) are
+validated at parse time before any index-supplied string can reach subprocess
+argv, the filesystem, or a ratchet-compared / digest-rendered value.
 
 Spec authority: ``spec/registry-protocol.md`` (registry-protocol §2–§5).
 Cross-reference: ``spec/errors.md`` for ``TNG-*`` error codes.
@@ -33,6 +34,7 @@ from milpa.errors import (
     TNG_NO_SATISFYING_VERSION,
     TNG_NOT_FOUND,
     TNG_SCHEMA_UNKNOWN,
+    TNG_UNSAFE_CONTROL_CHAR,
     TNG_UNSAFE_NAME,
     TNG_UNSAFE_OCI_FIELD,
     TNG_UNSAFE_REF,
@@ -78,6 +80,11 @@ _RE_UNSAFE_NAME = re.compile(r"[/\\]|\.\.")
 #: ``_RE_SHA256_DIGEST`` (which requires the prefix) because the property key
 #: already names the algorithm.
 _RE_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+#: ASCII control characters (U+0000-U+001F inclusive, or U+007F). These are
+#: exactly the delimiter bytes the append-only ratchet's canonical violation
+#: digest (registry-protocol §3.5.3) and its non-scalar renderings use
+#: (TAB, LF, ``\x1f``, ``\x1e``, ``\x01``) — see ``_validate_no_control_chars``.
+_RE_CONTROL_CHAR = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def is_safe_name(name: str) -> bool:
@@ -106,6 +113,35 @@ def _validate_no_leading_dash(value: str, field_label: str, slug: str) -> None:
         raise MilpaError(
             slug,
             f"{field_label} {value!r} begins with `-` (flag injection)",
+            value=value,
+        )
+
+
+def _validate_no_control_chars(value: str, field_label: str) -> None:
+    """Reject *value* containing an ASCII control character (U+0000-U+001F or U+007F).
+
+    Registry string fields are attacker-controlled network input (``index.kdl``
+    is fetched, not authored locally); KDL 2.0's ``\\u{XXXX}`` escape syntax can
+    deliver a literal control character through an otherwise well-formed string
+    literal — verified empirically: a ``\\u{9}`` escape decodes to a literal TAB
+    via the ``kdl_io`` façade. These are exactly the delimiter bytes the
+    append-only ratchet's canonical violation digest (registry-protocol
+    §3.5.3) and its non-scalar renderings use (TAB, LF, ``\\x1f``, ``\\x1e``,
+    ``\\x01``). Left unchecked, a crafted value lets two semantically
+    different violation sets serialize to identical digest bytes — defeating
+    the *warn* row's new-vs-recurring habituation defense — and lets a
+    crafted value inject forged violation-shaped lines into diagnostic
+    output. Rejected at the parse boundary (registry-protocol §3.3
+    NORMATIVE) so no downstream consumer — ratchet comparison, digest
+    rendering, CLI output — ever sees one. A single, field-independent slug
+    covers every field this validator guards (same economy
+    ``TNG_UNSAFE_OCI_FIELD`` already applies across its own two fields).
+    """
+    if _RE_CONTROL_CHAR.search(value):
+        raise MilpaError(
+            TNG_UNSAFE_CONTROL_CHAR,
+            f"{field_label} {value!r} contains an ASCII control character "
+            f"(U+0000-U+001F or U+007F) — rejected at parse boundary",
             value=value,
         )
 
@@ -611,8 +647,13 @@ def parse_index(text: str) -> Index:
     Validates schema version, then every package: name safety-checked, each
     version's provenances sanitized (``TNG-UNSAFE-NAME`` / ``TNG-BAD-COMMIT-SHA``
     / ``TNG-BAD-OCI-DIGEST`` / ``TNG-UNSAFE-URL`` / ``TNG-UNSAFE-REF`` /
-    ``TNG-UNSAFE-OCI-FIELD``), and the ``dep_decl`` pointer validated
-    (``TNG-BAD-DEP-DECL``).
+    ``TNG-UNSAFE-OCI-FIELD``), the ``dep_decl`` pointer validated
+    (``TNG-BAD-DEP-DECL``), and every registry string-valued identity/
+    provenance field (``namespace``, a version string, git ``url``/``ref``,
+    oci ``registry``/``repository``, rekor ``uuid``/``log_index``/
+    ``integrated_time``) charset-checked for ASCII control characters
+    (``TNG-UNSAFE-CONTROL-CHAR`` — registry-protocol §3.3 NORMATIVE
+    (control-character rejection)).
 
     Forward-compat rules (registry-protocol §1, §3 NORMATIVE):
       - Unknown top-level nodes are silently skipped.
@@ -644,6 +685,7 @@ def parse_index(text: str) -> Index:
             continue
         _validate_safe_name(name)
         namespace = _child_scalar(top_node, "namespace") or ""
+        _validate_no_control_chars(namespace, "namespace")
         versions, diagnostics = _parse_versions(name, namespace, top_node)
         for diag in diagnostics:
             warnings.warn(diag, stacklevel=2)
@@ -773,6 +815,7 @@ def _parse_versions(
         ver_str = node_arg_str(child, 0)
         if ver_str is None:
             continue  # non-string version arg: silently skipped (§3.2)
+        _validate_no_control_chars(ver_str, "version")
         if ver_str in seen:
             warnings.warn(
                 f"duplicate version {ver_str!r} in package {pkg_name!r} — "
@@ -906,10 +949,16 @@ def _parse_rekor_block(node: KdlNode) -> RekorRef | None:
     """Parse the optional ``rekor { uuid; log_index; integrated_time }`` block."""
     for child in node_children(node):
         if node_name(child) == "rekor":
+            uuid = _child_scalar(child, "uuid") or ""
+            log_index = _child_scalar(child, "log_index") or ""
+            integrated_time = _child_scalar(child, "integrated_time") or ""
+            _validate_no_control_chars(uuid, "rekor uuid")
+            _validate_no_control_chars(log_index, "rekor log_index")
+            _validate_no_control_chars(integrated_time, "rekor integrated_time")
             return RekorRef(
-                uuid=_child_scalar(child, "uuid") or "",
-                log_index=_child_scalar(child, "log_index") or "",
-                integrated_time=_child_scalar(child, "integrated_time") or "",
+                uuid=uuid,
+                log_index=log_index,
+                integrated_time=integrated_time,
             )
     return None
 
@@ -952,6 +1001,8 @@ def _parse_provenance_node(node: KdlNode) -> IndexProvenance | None:
         url = _child_scalar_url(node, "url") or ""
         ref = _child_scalar(node, "ref") or ""
         commit_sha_raw = _child_scalar(node, "commit_sha") or None
+        _validate_no_control_chars(url, "git url")
+        _validate_no_control_chars(ref, "git ref")
         _validate_no_leading_dash(url, "git url", TNG_UNSAFE_URL)
         _validate_no_leading_dash(ref, "git ref", TNG_UNSAFE_REF)
         if commit_sha_raw is not None:
@@ -962,6 +1013,8 @@ def _parse_provenance_node(node: KdlNode) -> IndexProvenance | None:
         registry = _child_scalar(node, "registry") or ""
         repository = _child_scalar(node, "repository") or ""
         digest = _child_scalar(node, "digest") or ""
+        _validate_no_control_chars(registry, "oci registry")
+        _validate_no_control_chars(repository, "oci repository")
         _validate_no_leading_dash(registry, "oci registry", TNG_UNSAFE_OCI_FIELD)
         _validate_no_leading_dash(repository, "oci repository", TNG_UNSAFE_OCI_FIELD)
         _validate_oci_digest(digest)

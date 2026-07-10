@@ -173,6 +173,173 @@ fn leading_dash_oci_field_is_rejected() {
     );
 }
 
+// --- TNG-UNSAFE-CONTROL-CHAR (CR2 — canonical-digest delimiter injection) ---
+//
+// index.kdl is attacker-controlled network input. KDL 2.0's `\u{XXXX}`
+// escape syntax delivers a literal ASCII control character through an
+// otherwise well-formed string literal. TAB and LF are exactly the
+// delimiters registry-protocol §3.5.3's canonical violation digest uses;
+// `\x1f`/`\x1e` are the non-scalar-rendering delimiters. Left unvalidated, a
+// crafted namespace/version/provenance/rekor field lets two semantically
+// different violation sets serialize to identical digest bytes, defeating
+// the warn-mode habituation defense. Mirrors Python's test_registry.py
+// TestValidators control-char suite — same fields, same slug.
+
+#[test]
+fn namespace_control_char_via_kdl_escape_is_rejected() {
+    let text = format!(
+        "schema_version 1\n\
+         package \"bar\" {{\n\
+         \x20   namespace \"evil\\u{{9}}namespace\"\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://e/bar.git\"\n\
+         \x20           ref \"v1\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n"
+    );
+    assert_eq!(
+        Index::parse(&text).unwrap_err().code(),
+        "TNG-UNSAFE-CONTROL-CHAR"
+    );
+}
+
+#[test]
+fn version_string_control_char_via_kdl_escape_is_rejected() {
+    // `\u{1f}` — ASCII unit separator, the provenance-record encoding
+    // delimiter (§3.5.3).
+    let text = format!(
+        "schema_version 1\n\
+         package \"bar\" {{\n\
+         \x20   version \"1.0.0\\u{{1f}}evil\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://e/bar.git\"\n\
+         \x20           ref \"v1\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n"
+    );
+    assert_eq!(
+        Index::parse(&text).unwrap_err().code(),
+        "TNG-UNSAFE-CONTROL-CHAR"
+    );
+}
+
+#[test]
+fn git_url_and_ref_control_char_via_kdl_escape_are_rejected() {
+    assert_eq!(
+        Index::parse(&git_index("https://e/foo\\u{a}.git", "v1", None))
+            .unwrap_err()
+            .code(),
+        "TNG-UNSAFE-CONTROL-CHAR"
+    );
+    assert_eq!(
+        Index::parse(&git_index("https://e/bar.git", "ma\\u{9}in", None))
+            .unwrap_err()
+            .code(),
+        "TNG-UNSAFE-CONTROL-CHAR"
+    );
+}
+
+#[test]
+fn oci_registry_and_repository_control_char_via_kdl_escape_are_rejected() {
+    let registry_text = format!(
+        "schema_version 1\n\
+         package \"bar\" {{\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"oci\"\n\
+         \x20           registry \"ghcr\\u{{9}}.io\"\n\
+         \x20           repository \"e/bar\"\n\
+         \x20           digest \"{ID1}\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n"
+    );
+    assert_eq!(
+        Index::parse(&registry_text).unwrap_err().code(),
+        "TNG-UNSAFE-CONTROL-CHAR"
+    );
+
+    let repository_text = format!(
+        "schema_version 1\n\
+         package \"bar\" {{\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"oci\"\n\
+         \x20           registry \"ghcr.io\"\n\
+         \x20           repository \"e\\u{{9}}/bar\"\n\
+         \x20           digest \"{ID1}\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n"
+    );
+    assert_eq!(
+        Index::parse(&repository_text).unwrap_err().code(),
+        "TNG-UNSAFE-CONTROL-CHAR"
+    );
+}
+
+#[test]
+fn rekor_fields_control_char_via_kdl_escape_are_rejected() {
+    // TAB is the canonical violation digest's field-join delimiter
+    // (§3.5.3) — an unvalidated rekor field could shift the digest's
+    // 7-tuple boundaries.
+    fn rekor_index(uuid: &str, log_index: &str, integrated_time: &str) -> String {
+        format!(
+            "schema_version 1\n\
+             package \"bar\" {{\n\
+             \x20   version \"1.0.0\" {{\n\
+             \x20       content_hash \"{ID1}\"\n\
+             \x20       provenance {{\n\
+             \x20           kind \"git\"\n\
+             \x20           url \"https://e/bar.git\"\n\
+             \x20           ref \"v1\"\n\
+             \x20       }}\n\
+             \x20       attestation \"milpa-vendored\"\n\
+             \x20       rekor {{\n\
+             \x20           uuid \"{uuid}\"\n\
+             \x20           log_index \"{log_index}\"\n\
+             \x20           integrated_time \"{integrated_time}\"\n\
+             \x20       }}\n\
+             \x20   }}\n\
+             }}\n"
+        )
+    }
+
+    assert_eq!(
+        Index::parse(&rekor_index("abc\\u{9}def", "1", "2"))
+            .unwrap_err()
+            .code(),
+        "TNG-UNSAFE-CONTROL-CHAR"
+    );
+    assert_eq!(
+        Index::parse(&rekor_index("abc", "1\\u{9}", "2"))
+            .unwrap_err()
+            .code(),
+        "TNG-UNSAFE-CONTROL-CHAR"
+    );
+    assert_eq!(
+        Index::parse(&rekor_index("abc", "1", "2\\u{9}"))
+            .unwrap_err()
+            .code(),
+        "TNG-UNSAFE-CONTROL-CHAR"
+    );
+}
+
+// fixture-411-tng-unsafe-control-char is exercised end-to-end (both impls,
+// differentially) by the generic conformance corpus runner
+// (milpa-conformance/tests/corpus.rs `discover()` + this crate's Python
+// counterpart tests/test_conformance.py) — no hand-rolled fixture-reading
+// unit test needed here; the targeted-field coverage above is direct-call.
+
 #[test]
 fn unknown_provenance_kind_is_skipped() {
     let text = format!(
