@@ -5,14 +5,16 @@
   additions; ~30 findings consolidated to 23 ledger entries, all resolved
   under the bar and applied; **no open forks**. Round 1 was same day
   (ledger below); Stage 1 (draft + slicing) also 2026-07-09.
-- **Resume:** `/loop` TDD GRIND IN PROGRESS (2026-07-10). DONE+committed:
+- **Resume:** `/loop` TDD GRIND COMPLETE (2026-07-10). DONE+committed:
   Part-2 P1 (3b920ac), P2 (d4404ad), P3a (baad9a4); A1 (fb6e707),
   A2a (4f607a5), A2b (a53afd7), A2c (cbe1682), A2d (bdc419e),
-  A2e (3911cdd), A3 (22e07db), A4a (76dcc63), A4b (224ca14) = 12/14.
-  IN FLIGHT: A5 (yank selection, subagent running). LAST: A6 (staged
-  enforcement flip — un-gated, Part-2 P2 landed). Every slice gated on
-  full pytest + dev-rust; slice details in the checklist below. Resume
-  command: the standing `/loop` grind prompt.
+  A2e (3911cdd), A3 (22e07db), A4a (76dcc63), A4b (224ca14),
+  A5 (b9a620e), A6 (pending commit) = 14/14 — **ALL SLICES DONE**. A6
+  flipped the staged rows (`attestation`/`rekor`/`attestation-epoch`) to
+  live in both impls, closed the attestation/`rekor` canonical-rendering
+  spec gap, wired the previously-unparsed `attestation-epoch` root field,
+  and inverted fixture 389 + added 404–410. RFC #185 is now fully
+  implemented; only spec/RFC housekeeping (this doc, ledger) remains.
 
 ## Origin (why this RFC exists)
 
@@ -208,8 +210,22 @@ verified index is a valid *successor* of the previous one. Freshness
       structurally unaffected (fixture 403); spec/errors.md
       NO-SATISFYING entry sharpened. Fixtures 400–403. Gates: pytest 2889
       + rust workspace green.
-- [ ] A6 — post-Part-2-P2: attestation/rekor/epoch rows, no-rekor test
-      inversion, staged fixtures (incl. root-vs-root tie fixture).
+- [x] A6 (2026-07-10) — staged enforcement flip, both impls: LATTICE
+      `staged`/`include_staged` removed entirely (clean cutover);
+      attestation/rekor/attestation-epoch extraction wired at the seam
+      (epoch previously had NO parser anywhere — new root re-walk, both
+      impls); spec gains the `attestation-epoch` node definition (§1) +
+      `rekor` canonical-rendering instantiation (§3.5.3), both previously
+      missing/deferred; A5-era stale staging prose (2 spots) also fixed
+      while sweeping. Fixture 389 inverted in place (staged-clean ->
+      violation-warn); fixtures 404-410 added (strip/re-attribution/
+      repin+digest/upgrade-clean/rekor-changed/epoch-strict/root-vs-root
+      composite tie). No standalone ratchet-level "no-rekor" test existed
+      to invert — the parse-level one was already inverted at Part-2 P2;
+      the actual pre-A6 pin was `test_attestation_unenforced_by_default_
+      pre_a6`, inverted directly. Digest vector `2c02fbe9…3323` hand-
+      derived + pinned in both unit suites + fixture 406. Gates: pytest
+      green; rust workspace green.
 
 ## Cross-repo / issues
 

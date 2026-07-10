@@ -873,12 +873,33 @@ classification while passing a slug/payload-only differential).
   spec clause, `TNG-NO-SATISFYING-VERSION` message names yanked candidates,
   yank-transition notices, fixtures (excluded / all-yanked / qualified-path /
   frozen-path-unaffected / notice text).
-- **A6** (post-Part-2-P2): attestation-record + `rekor` lattice-row
-  enforcement — parse lands with Part 2's P2; this slice adds the dominance
-  tags, inverts the pinned no-rekor regression test deliberately, and lands
-  the staged fixtures (attestation strip / re-attribution / downgrade /
-  same-kind `bundle_pin` swap / `rekor` mutation / `attestation-epoch`
-  change, × {warn, strict}).
+- [x] **A6** (2026-07-10) — staged enforcement flipped to live, both impls:
+      `ratchet.py`/`ratchet.rs` LATTICE `staged`/`include_staged` removed
+      entirely (clean cutover, no dead parameter — all rows enforce
+      unconditionally); `index_ratchet_seam.py`/`.rs` wire `attestation`
+      (typed `AttestationValue` + canonical `\x1f`-joined raw rendering),
+      `rekor` (Frozen/set-once, same rendering method), and the previously
+      entirely-unparsed `attestation-epoch` root field (new raw re-walk,
+      both impls — no prior parser touched it); spec/registry-protocol.md
+      §3.5.1 gains the `attestation-epoch` document-structure node
+      definition (§1) and the `rekor` canonical-rendering instantiation
+      (§3.5.3, alongside `attestation`'s, both previously deferred);
+      staged/A6-future-tense markers swept to present tense across
+      registry-protocol.md (incl. two pre-existing stale A5 yank-staging
+      leftovers found and fixed) + errors.md. Fixture 389 inverted in place
+      (staged-clean → violation-warn, same ID) since attestation-epoch
+      enforcement flips its outcome; 7 new fixtures 404–410 (strip
+      re-attribution / repin+digest / legal upgrade / rekor-changed /
+      epoch-strict / the root-vs-root composite-tie worked example). No
+      separate "no-rekor" ratchet-level test existed to invert (the parse-
+      level no-rekor pin had already been inverted at Part-2 P2); the
+      pre-A6 `test_attestation_unenforced_by_default_pre_a6` /
+      `attestation_unenforced_by_default_pre_a6` unit tests are what
+      actually pinned "rekor/attestation mutation does NOT violate" and
+      were inverted directly. Hand-derived digest vector
+      `2c02fbe9…3323` (attestation `monotone-repinned`) pinned in both
+      unit suites + fixture 406, mirroring A4b's provenance-digest
+      precedent. Gates: pytest green; `./dev-rust test --workspace` green.
 
 ## Connections
 

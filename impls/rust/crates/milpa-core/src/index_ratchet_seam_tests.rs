@@ -277,3 +277,85 @@ fn provenance_append_only_no_violation() {
     assert!(outcome.violations.is_empty());
     assert!(outcome.advanced);
 }
+
+// ---------------------------------------------------------------------------
+// Attestation canonical digest rendering (A6): the attestation record's
+// canonical-rendering instantiation (registry-protocol §3.5.3 NORMATIVE
+// (canonical rendering for non-scalar candidate values)), live now that the
+// attestation-monotone row enforces. The expected hex is ported VERBATIM
+// from `test_index_history_ratchet.py::TestAttestationCanonicalDigest` —
+// byte equality proves both implementations render the identical candidate
+// text identically, not merely that each is internally consistent. The same
+// hex is pinned in conformance fixture 406's expected/digest.
+// ---------------------------------------------------------------------------
+
+fn attestation_index_text(bundle_pin: &str) -> String {
+    format!(
+        "schema_version 1\n\
+         package \"bar\" {{\n\
+         \x20   namespace \"acme\"\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"sha256:{}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://example.com/bar.git\"\n\
+         \x20           ref \"v1.0.0\"\n\
+         \x20       }}\n\
+         \x20       attestation \"author-signed\"\n\
+         \x20       signed_by \"alice\"\n\
+         \x20       bundle sha256=\"{bundle_pin}\"\n\
+         \x20   }}\n\
+         }}\n",
+        "a".repeat(64)
+    )
+}
+
+#[test]
+fn attestation_repin_hand_computed_digest_vector() {
+    let baseline = attestation_index_text(&"1".repeat(64));
+    let candidate = attestation_index_text(&"2".repeat(64));
+    let (_, baseline_state) = build_index_state(&baseline).unwrap();
+    let (_, candidate_state) = build_index_state(&candidate).unwrap();
+    let outcome = Baseline::new(baseline_state).check(&candidate_state);
+
+    assert_eq!(outcome.violations.len(), 1);
+    let v = &outcome.violations[0];
+    assert_eq!(v.class, "TNG-ENTRY-MUTATED");
+    assert_eq!(v.field, "attestation");
+    assert_eq!(v.kind, "monotone-repinned");
+
+    let expected_candidate_value = format!("author-signed\u{1f}alice\u{1f}{}", "2".repeat(64));
+    assert_eq!(v.candidate_value, expected_candidate_value);
+
+    let digest = canonical_digest(&outcome.violations);
+    assert_eq!(
+        digest,
+        "2c02fbe94260c81db0006a77d8572a54feb58d36d1071bf7191d790087a63323"
+    );
+}
+
+#[test]
+fn attestation_strip_is_absent_candidate_value() {
+    let baseline = "schema_version 1\n\
+         package \"bar\" {\n\
+         \x20   namespace \"acme\"\n\
+         \x20   version \"1.0.0\" {\n\
+         \x20       content_hash \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\
+         \x20       provenance {\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://example.com/bar.git\"\n\
+         \x20           ref \"v1.0.0\"\n\
+         \x20       }\n\
+         \x20       attestation \"milpa-vendored\"\n\
+         \x20   }\n\
+         }\n";
+    let candidate = baseline.replace("\x20       attestation \"milpa-vendored\"\n", "");
+
+    let (_, baseline_state) = build_index_state(baseline).unwrap();
+    let (_, candidate_state) = build_index_state(&candidate).unwrap();
+    let outcome = Baseline::new(baseline_state).check(&candidate_state);
+    assert_eq!(outcome.violations.len(), 1);
+    let v = &outcome.violations[0];
+    assert_eq!(v.kind, "monotone-stripped");
+    assert_eq!(v.candidate_value, "");
+}

@@ -1194,7 +1194,7 @@ The Sigstore bundle is cryptographically valid but was signed beyond the maximum
 
 ### `TNG-INDEX-ROOT-MUTATED`
 
-A document-root field (`schema_version`, or `attestation-epoch` once Part 2's P2 slice lands) violates its `registry-protocol.md §3.5.1` root-field order — a `schema_version` decrease, or a change to an already-set `attestation-epoch`.
+A document-root field (`schema_version` or `attestation-epoch`) violates its `registry-protocol.md §3.5.1` root-field order — a `schema_version` decrease, or a change to an already-set `attestation-epoch`.
 
 **Triggered:** the append-only ratchet's dominance fold (`ratchet.py`'s `Baseline.check`, wired at the index-cache seam by `index_ratchet_seam.py`) finds a violation on the reserved root pseudo-entry (`namespace = name = version = ""`). Ranks first (`class_rank` 0) in the composite violation ordering — document-level violations beat entry-level. Gated by the `index-history` policy axis (`off | warn | strict`, default `warn`); under `off` the ratchet never runs. Defined in `registry-protocol.md §3.5.2`/`§3.5.3`.
 

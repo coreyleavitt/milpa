@@ -43,21 +43,17 @@ has the literal document text in hand — supplies ``raw`` explicitly.
 omitted, as a convenience for hand-built test fixtures; production callers
 MUST pass the literal raw text.
 
-Staged enforcement (registry-protocol §3.5.1 NORMATIVE (staged enforcement))
+Full enforcement (registry-protocol §3.5.1 NORMATIVE (staged enforcement))
 ------------------------------------------------------------------------------
-The lattice is complete in this module from day one — every order kind and
-every field's transition logic is implemented and directly testable. But
-two lattice rows constrain fields whose *enforcement* the spec defers to
-`rfc-registry-append-only.md`'s A6 slice (after Part 2's P2 parser change
-"lands" in the RFC's sequencing sense — a scheduling commitment independent
-of whether the underlying parser support happens to exist already):
-the attestation record (``attestation`` — attestation-monotone) and the
+The lattice has been complete in this module from day one — every order kind
+and every field's transition logic was implemented and directly testable
+before its enforcement went live. The last two rows to gain enforcement, the
+attestation record (``attestation`` — attestation-monotone) and the
 ``rekor`` block (frozen/set-once), plus the ``attestation-epoch`` root field
-(also set-once). These rows are tagged ``staged=True`` in ``LATTICE`` and
-are excluded from ``Baseline.check()`` by default. Pass
-``include_staged=True`` to exercise the full lattice (used by this module's
-own tests to prove the logic is A6-ready); production call sites (A2d) must
-not flip that flag before A6.
+(also set-once), landed at `rfc-registry-append-only.md`'s A6 slice, once
+Part 2's P2 parser change made their inputs parse-to-typed. As of A6 every
+row in ``LATTICE`` is live in ``Baseline.check()`` unconditionally — there is
+no longer a staged/full distinction to select between.
 """
 
 from __future__ import annotations
@@ -274,11 +270,6 @@ class RatchetOutcome:
 @dataclass(frozen=True)
 class FieldSpec:
     kind: OrderKind
-    #: True = enforcement deferred to rfc-registry-append-only.md's A6 slice
-    #: (§3.5.1 NORMATIVE (staged enforcement)). The row's logic is complete
-    #: and testable regardless; only ``Baseline.check()``'s default
-    #: exclusion is staged.
-    staged: bool = False
 
 
 #: NOTE: ``dep_decl`` / ``dep_decl_schema_version`` are NOT listed here —
@@ -288,9 +279,9 @@ LATTICE: dict[str, FieldSpec] = {
     # --- Frozen / set-once (entry-level) ---
     "content_hash": FieldSpec(OrderKind.SET_ONCE),
     "published_at": FieldSpec(OrderKind.SET_ONCE),
-    "rekor": FieldSpec(OrderKind.SET_ONCE, staged=True),
+    "rekor": FieldSpec(OrderKind.SET_ONCE),
     # --- Attestation-monotone (entry-level) ---
-    "attestation": FieldSpec(OrderKind.ATTESTATION_MONOTONE, staged=True),
+    "attestation": FieldSpec(OrderKind.ATTESTATION_MONOTONE),
     # --- Append-only-multiset (entry-level) ---
     "provenances": FieldSpec(OrderKind.APPEND_ONLY_MULTISET),
     # --- Advisory-mutable (entry-level) — never violates; yank transitions
@@ -299,7 +290,7 @@ LATTICE: dict[str, FieldSpec] = {
     "yanked": FieldSpec(OrderKind.ADVISORY_MUTABLE),
     # --- Root fields (document-level, reserved empty key) ---
     "schema_version": FieldSpec(OrderKind.ORDINAL_NON_DECREASING),
-    "attestation-epoch": FieldSpec(OrderKind.SET_ONCE, staged=True),
+    "attestation-epoch": FieldSpec(OrderKind.SET_ONCE),
 }
 
 #: Field groups that move in lockstep (§3.5.1: "``dep_decl`` **together
@@ -392,8 +383,6 @@ def _dominates_entry(
     key: EntryKey,
     baseline_entry: RatchetEntry,
     candidate_entry: RatchetEntry,
-    *,
-    include_staged: bool,
 ) -> list[Violation]:
     is_root = key == ROOT_KEY
     cls = ROOT_MUTATED if is_root else ENTRY_MUTATED
@@ -419,8 +408,6 @@ def _dominates_entry(
             )
 
     for field_name, spec in LATTICE.items():
-        if spec.staged and not include_staged:
-            continue
         b_field = baseline_entry.get(field_name)
         c_field = candidate_entry.get(field_name)
         kind = _DISPATCH[spec.kind](b_field.value, c_field.value)
@@ -501,15 +488,13 @@ class Baseline:
     def __init__(self, state: IndexState):
         self.state = state
 
-    def check(self, candidate: IndexState, *, include_staged: bool = False) -> RatchetOutcome:
+    def check(self, candidate: IndexState) -> RatchetOutcome:
         violations: list[Violation] = []
         transitions: list[Transition] = []
 
         root_baseline = self.state.get(ROOT_KEY, RatchetEntry())
         root_candidate = candidate.get(ROOT_KEY, RatchetEntry())
-        violations.extend(
-            _dominates_entry(ROOT_KEY, root_baseline, root_candidate, include_staged=include_staged)
-        )
+        violations.extend(_dominates_entry(ROOT_KEY, root_baseline, root_candidate))
 
         for key, b_entry in self.state.items():
             if key == ROOT_KEY:
@@ -518,7 +503,7 @@ class Baseline:
                 violations.append(_rollback_violation(key))
                 continue
             c_entry = candidate[key]
-            violations.extend(_dominates_entry(key, b_entry, c_entry, include_staged=include_staged))
+            violations.extend(_dominates_entry(key, b_entry, c_entry))
             transition = _yank_transition(key, b_entry, c_entry)
             if transition is not None:
                 transitions.append(transition)

@@ -12,8 +12,8 @@ Covers:
     lockstep group.
   - Ordinal-non-decreasing root field (``schema_version``), incl.
     absent ≡ spec default 1.
-  - Attestation-monotone lattice (staged pre-A6: unenforced by default,
-    fully checkable via ``include_staged=True``).
+  - Attestation-monotone lattice + ``rekor`` frozen row (A6: live by
+    default, no staging flag).
   - Append-only-multiset provenance (append legal; in-place mutation caught
     as removal).
   - Advisory-mutable yank triple: transitions, never violations.
@@ -208,20 +208,27 @@ def test_schema_version_absent_is_default_one() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Attestation-monotone — staged pre-A6
+# Attestation-monotone + rekor frozen row — live as of A6 (registry-protocol
+# §3.5.1 NORMATIVE (staged enforcement); rfc-registry-append-only.md A6).
+# Pre-A6 these rows were tagged staged=True and excluded from
+# Baseline.check() by default, checkable only via a since-removed
+# include_staged=True escape hatch. A6 removed the staging flag entirely
+# (clean cutover, no dead parameter) — the assertions below, un-gated, ARE
+# the inversion of that pre-A6 posture.
 # ---------------------------------------------------------------------------
 
 
-def test_attestation_unenforced_by_default_pre_a6() -> None:
-    """The row is staged: Baseline.check()'s default excludes it, so even
-    a stripped attestation is silently unenforced today."""
+def test_attestation_strip_is_violation() -> None:
+    """A6 inversion: pre-A6 this stayed silently unenforced (staged=True);
+    live as of A6, a stripped attestation IS a violation."""
     baseline_state = {V1: entry(attestation=AttestationValue(kind="milpa-vendored"))}
     candidate_state = {V1: entry(attestation=None)}
     outcome = Baseline(baseline_state).check(candidate_state)
-    assert outcome.violations == []
+    assert len(outcome.violations) == 1
+    assert outcome.violations[0].kind == MONOTONE_STRIPPED
 
 
-def test_attestation_upgrades_legal_under_include_staged() -> None:
+def test_attestation_upgrades_are_legal() -> None:
     for baseline_val, candidate_val in [
         (None, AttestationValue(kind="milpa-vendored")),
         (None, AttestationValue(kind="author-signed", signer="alice")),
@@ -232,53 +239,72 @@ def test_attestation_upgrades_legal_under_include_staged() -> None:
     ]:
         baseline_state = {V1: entry(attestation=baseline_val)}
         candidate_state = {V1: entry(attestation=candidate_val)}
-        outcome = Baseline(baseline_state).check(candidate_state, include_staged=True)
+        outcome = Baseline(baseline_state).check(candidate_state)
         assert outcome.violations == [], (baseline_val, candidate_val)
 
 
-def test_attestation_strip_forbidden_under_include_staged() -> None:
-    baseline_state = {V1: entry(attestation=AttestationValue(kind="milpa-vendored"))}
-    candidate_state = {V1: entry(attestation=None)}
-    outcome = Baseline(baseline_state).check(candidate_state, include_staged=True)
-    assert len(outcome.violations) == 1
-    assert outcome.violations[0].kind == MONOTONE_STRIPPED
-
-
-def test_attestation_reattribution_forbidden_under_include_staged() -> None:
+def test_attestation_reattribution_is_violation() -> None:
     baseline_state = {V1: entry(attestation=AttestationValue(kind="author-signed", signer="alice"))}
     candidate_state = {V1: entry(attestation=AttestationValue(kind="author-signed", signer="bob"))}
-    outcome = Baseline(baseline_state).check(candidate_state, include_staged=True)
+    outcome = Baseline(baseline_state).check(candidate_state)
     assert len(outcome.violations) == 1
     assert outcome.violations[0].kind == MONOTONE_REATTRIBUTED
 
 
-def test_attestation_downgrade_forbidden_under_include_staged() -> None:
+def test_attestation_downgrade_is_violation() -> None:
     baseline_state = {V1: entry(attestation=AttestationValue(kind="author-signed", signer="alice"))}
     candidate_state = {V1: entry(attestation=AttestationValue(kind="milpa-vendored"))}
-    outcome = Baseline(baseline_state).check(candidate_state, include_staged=True)
+    outcome = Baseline(baseline_state).check(candidate_state)
     assert len(outcome.violations) == 1
     assert outcome.violations[0].kind == MONOTONE_DOWNGRADED
 
 
-def test_attestation_repin_forbidden_under_include_staged() -> None:
+def test_attestation_repin_is_violation() -> None:
     baseline_state = {
         V1: entry(attestation=AttestationValue(kind="author-signed", signer="alice", bundle_pin="p1"))
     }
     candidate_state = {
         V1: entry(attestation=AttestationValue(kind="author-signed", signer="alice", bundle_pin="p2"))
     }
-    outcome = Baseline(baseline_state).check(candidate_state, include_staged=True)
+    outcome = Baseline(baseline_state).check(candidate_state)
     assert len(outcome.violations) == 1
     assert outcome.violations[0].kind == MONOTONE_REPINNED
 
 
-def test_attestation_vendored_signer_rotation_unconstrained_under_include_staged() -> None:
+def test_attestation_vendored_signer_rotation_unconstrained() -> None:
     """MilpaVendored -> MilpaVendored is unconstrained (bug ratchet, not a
     security boundary) — no signer is tracked for vendored at all."""
     baseline_state = {V1: entry(attestation=AttestationValue(kind="milpa-vendored"))}
     candidate_state = {V1: entry(attestation=AttestationValue(kind="milpa-vendored"))}
-    outcome = Baseline(baseline_state).check(candidate_state, include_staged=True)
+    outcome = Baseline(baseline_state).check(candidate_state)
     assert outcome.violations == []
+
+
+def test_rekor_backfill_is_legal() -> None:
+    baseline_state = {V1: entry(rekor=None)}
+    candidate_state = {V1: entry(rekor=("uuid-1", "1", "1000"))}
+    outcome = Baseline(baseline_state).check(candidate_state)
+    assert outcome.violations == []
+
+
+def test_rekor_mutated_is_violation() -> None:
+    """A6: the rekor block is Frozen/set-once — a later mutation of a
+    previously-set rekor reference (not merely backfilling an absent one)
+    is caught, just like content_hash."""
+    baseline_state = {V1: entry(rekor=("uuid-1", "1", "1000"))}
+    candidate_state = {V1: entry(rekor=("uuid-2", "2", "2000"))}
+    outcome = Baseline(baseline_state).check(candidate_state)
+    assert len(outcome.violations) == 1
+    v = outcome.violations[0]
+    assert v.field == "rekor"
+    assert v.kind == FROZEN_CHANGED
+
+
+def test_rekor_unset_is_violation() -> None:
+    baseline_state = {V1: entry(rekor=("uuid-1", "1", "1000"))}
+    candidate_state = {V1: entry(rekor=None)}
+    outcome = Baseline(baseline_state).check(candidate_state)
+    assert outcome.violations[0].kind == FROZEN_UNSET
 
 
 # ---------------------------------------------------------------------------
@@ -357,9 +383,14 @@ def test_no_yank_change_is_no_transition() -> None:
 
 
 def test_root_fields_fold_under_reserved_empty_key_with_tiebreak() -> None:
+    """The RFC's own worked example (root-vs-root tie): both
+    ``attestation-epoch`` and ``schema_version`` violate in the same
+    candidate — composite ordering breaks the rank/entry-key tie (both rank
+    0, both the reserved empty key) on the trailing ``field`` component.
+    Live unconditionally as of A6 — no ``include_staged`` escape hatch."""
     baseline_state = {ROOT_KEY: entry(schema_version=2, **{"attestation-epoch": "E1"})}
     candidate_state = {ROOT_KEY: entry(schema_version=1, **{"attestation-epoch": "E2"})}
-    outcome = Baseline(baseline_state).check(candidate_state, include_staged=True)
+    outcome = Baseline(baseline_state).check(candidate_state)
     assert outcome.advanced is False
     assert len(outcome.violations) == 2
     # both rank 0 (ROOT_MUTATED), both empty entry key -> tie broken by
@@ -370,15 +401,20 @@ def test_root_fields_fold_under_reserved_empty_key_with_tiebreak() -> None:
     assert all(v.kind == ROOT_FIELD_CHANGED for v in outcome.violations)
 
 
-def test_attestation_epoch_set_once_under_include_staged() -> None:
+def test_attestation_epoch_set_once() -> None:
+    """A6 inversion: pre-A6 this row was silently unenforced by default;
+    live as of A6, a changed attestation-epoch IS a violation."""
     baseline_state = {ROOT_KEY: raw_entry({"attestation-epoch": RawField("E1")})}
     candidate_state = {ROOT_KEY: raw_entry({"attestation-epoch": RawField("E2")})}
-    outcome = Baseline(baseline_state).check(candidate_state, include_staged=True)
+    outcome = Baseline(baseline_state).check(candidate_state)
     assert len(outcome.violations) == 1
     assert outcome.violations[0].field == "attestation-epoch"
     assert outcome.violations[0].kind == ROOT_FIELD_CHANGED
 
-    # unenforced by default (pre-A6):
+
+def test_attestation_epoch_backfill_is_legal() -> None:
+    baseline_state = {ROOT_KEY: raw_entry({"attestation-epoch": RawField(None)})}
+    candidate_state = {ROOT_KEY: raw_entry({"attestation-epoch": RawField("E1")})}
     outcome = Baseline(baseline_state).check(candidate_state)
     assert outcome.violations == []
 

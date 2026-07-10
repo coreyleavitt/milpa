@@ -20,14 +20,16 @@ Two responsibilities:
    the parsed KDL document (via the SAME validated, typed ``Index`` that
    ``registry.parse_index`` already produces — single source of truth for
    structural validation) to pair each field's typed value with its raw
-   served string where the two can diverge (only ``published_at``: every
-   other lattice field enforced at A2d — ``content_hash``, ``dep_decl``(+
-   schema version), ``schema_version``, ``yanked``(+reason) — is already a
-   string/int/bool whose ``str()`` round-trips losslessly). The staged rows
-   (``attestation``, ``rekor``, ``attestation-epoch``) are NOT extracted
-   here: ``Baseline.check()`` excludes them by default until A6, so building
-   them now would be dead code (registry-protocol §3.5.1 NORMATIVE (staged
-   enforcement)).
+   served string where the two can diverge: ``published_at`` (per-entry) and
+   ``attestation-epoch`` (root) need the re-walk; every other lattice field
+   — ``content_hash``, ``dep_decl``(+ schema version), ``schema_version``,
+   ``yanked``(+reason) — is already a string/int/bool whose ``str()``
+   round-trips losslessly, and ``attestation``/``rekor`` get their own
+   canonical (never ``str()``/``repr()``) rendering per §3.5.3 NORMATIVE
+   (canonical rendering for non-scalar candidate values) — see
+   ``_attestation_canonical_raw`` / ``_rekor_canonical_raw`` below, live as
+   of A6 alongside the ``attestation``/``rekor``/``attestation-epoch`` rows'
+   enforcement (registry-protocol §3.5.1 NORMATIVE (staged enforcement)).
 
    ``build_index_state`` IS the parse-at-gate seam: call it (directly, or
    via ``evaluate_gate``) BEFORE any cache mutation. A raised ``MilpaError``
@@ -60,6 +62,7 @@ from milpa.kdl_io import (
 )
 from milpa.ratchet import (
     ROOT_KEY,
+    AttestationValue,
     Baseline,
     EntryKey,
     IndexState,
@@ -69,7 +72,15 @@ from milpa.ratchet import (
     Violation,
     canonical_digest,
 )
-from milpa.registry import GitIndexProvenance, Index, OciIndexProvenance, parse_index
+from milpa.registry import (
+    AuthorSigned,
+    EntryAttestation,
+    GitIndexProvenance,
+    Index,
+    OciIndexProvenance,
+    RekorRef,
+    parse_index,
+)
 
 # ---------------------------------------------------------------------------
 # Candidate/baseline text -> (typed Index, ratchet IndexState)
@@ -116,15 +127,63 @@ def _provenance_canonical_raw(provenances: tuple[object, ...]) -> str:
     return "\x1e".join(encoded)
 
 
+def _attestation_canonical_raw(attestation: EntryAttestation | None) -> str:
+    """Canonical, cross-impl-identical rendering of an ``EntryAttestation``
+    for the §3.5.3 canonical violation digest (NORMATIVE (canonical
+    rendering for non-scalar candidate values), the ``attestation``
+    instantiation, live as of A6): a single closed field set — ``kind``,
+    ``signer`` (``author-signed`` only, ``""`` for ``milpa-vendored``),
+    ``bundle_pin`` (``""`` when unset) — encoded as
+    ``<kind>\\x1f<signer>\\x1f<bundle_pin>``. ``""`` when *attestation* is
+    absent, consistent with the scalar-field absent-component convention.
+    Mirrors ``index_ratchet_seam.rs::attestation_canonical_raw`` byte-for-byte."""
+    if attestation is None:
+        return ""
+    if isinstance(attestation.kind, AuthorSigned):
+        kind, signer = "author-signed", attestation.kind.signer
+    else:
+        kind, signer = "milpa-vendored", ""
+    return kind + "\x1f" + signer + "\x1f" + (attestation.bundle_pin or "")
+
+
+def _attestation_typed_value(attestation: EntryAttestation | None) -> AttestationValue | None:
+    """``EntryAttestation`` -> ``ratchet.AttestationValue`` structural
+    snapshot (dominance-comparison shape; ``ratchet.py`` stays
+    registry-agnostic, so this conversion lives at the seam)."""
+    if attestation is None:
+        return None
+    if isinstance(attestation.kind, AuthorSigned):
+        return AttestationValue(kind="author-signed", signer=attestation.kind.signer, bundle_pin=attestation.bundle_pin)
+    return AttestationValue(kind="milpa-vendored", signer=None, bundle_pin=attestation.bundle_pin)
+
+
+def _rekor_canonical_raw(rekor: RekorRef | None) -> str:
+    """Canonical rendering of the ``rekor`` block for the canonical
+    violation digest (§3.5.3 NORMATIVE (canonical rendering for non-scalar
+    candidate values) — the ``rekor`` instantiation, live as of A6): the
+    same closed-field-set method, field order ``uuid``, ``log_index``,
+    ``integrated_time``, joined by ``\\x1f``. ``""`` when *rekor* is absent.
+    Mirrors ``index_ratchet_seam.rs::rekor_canonical_raw`` byte-for-byte."""
+    if rekor is None:
+        return ""
+    return rekor.uuid + "\x1f" + rekor.log_index + "\x1f" + rekor.integrated_time
+
+
 def _index_state_from(doc: KdlDocument, index: Index) -> IndexState:
     state: IndexState = {
-        ROOT_KEY: RatchetEntry(fields={"schema_version": RawField(value=_raw_schema_version(doc))}),
+        ROOT_KEY: RatchetEntry(
+            fields={
+                "schema_version": RawField(value=_raw_schema_version(doc)),
+                "attestation-epoch": RawField(value=_raw_attestation_epoch(doc)),
+            }
+        ),
     }
 
     raw_published_at = _collect_raw_published_at(doc)
     for pkg in index.packages:
         for iv in pkg.versions:
             key = EntryKey(namespace=iv.namespace, name=pkg.name, version=iv.version)
+            rekor = iv.attestation.rekor if iv.attestation is not None else None
             state[key] = RatchetEntry(
                 fields={
                     "content_hash": RawField(value=iv.content_hash or None),
@@ -139,6 +198,11 @@ def _index_state_from(doc: KdlDocument, index: Index) -> IndexState:
                     ),
                     "yanked": RawField(value=iv.yanked),
                     "yanked_reason": RawField(value=iv.yanked_reason),
+                    "attestation": RawField(
+                        value=_attestation_typed_value(iv.attestation),
+                        raw=_attestation_canonical_raw(iv.attestation),
+                    ),
+                    "rekor": RawField(value=rekor, raw=_rekor_canonical_raw(rekor)),
                 }
             )
     return state
@@ -153,6 +217,20 @@ def _raw_schema_version(doc: KdlDocument) -> int | None:
             continue
         args = node_args(n)
         return value_as_int(args[0]) if args else None
+    return None
+
+
+def _raw_attestation_epoch(doc: KdlDocument) -> str | None:
+    """The document-root ``attestation-epoch`` string, or ``None`` if absent
+    (`rfc-per-entry-attestation.md` open question 2; registry-protocol
+    §3.5.1 root-field table — set-once, live as of A6). An opaque epoch
+    identifier: no reformatting margin, so the typed value doubles as its
+    own raw digest rendering (the scalar-field convention above)."""
+    for n in nodes(doc):
+        if node_name(n) != "attestation-epoch":
+            continue
+        args = node_args(n)
+        return node_arg_str(n, 0) if args else None
     return None
 
 

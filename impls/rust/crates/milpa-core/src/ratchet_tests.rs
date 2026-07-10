@@ -217,7 +217,14 @@ fn schema_version_absent_is_default_one() {
 }
 
 // ---------------------------------------------------------------------------
-// Attestation-monotone — staged pre-A6
+// Attestation-monotone + rekor frozen row — live as of A6 (registry-protocol
+// §3.5.1 NORMATIVE (staged enforcement); rfc-registry-append-only.md A6).
+// Pre-A6 these rows were tagged staged: true and excluded from
+// Baseline::check by default, checkable only via a since-removed
+// check_with(.., include_staged: true) escape hatch. A6 removed the staging
+// flag entirely (clean cutover, no dead parameter) — the assertions below,
+// un-gated, ARE the inversion of that pre-A6 posture. Mirrors
+// impls/python/tests/test_ratchet.py.
 // ---------------------------------------------------------------------------
 
 fn att(kind: &str, signer: Option<&str>, bundle_pin: Option<&str>) -> FieldValue {
@@ -228,19 +235,26 @@ fn att(kind: &str, signer: Option<&str>, bundle_pin: Option<&str>) -> FieldValue
     })
 }
 
+fn rekor(uuid: &str, log_index: &str, integrated_time: &str) -> FieldValue {
+    FieldValue::Str(format!("{uuid}\u{1f}{log_index}\u{1f}{integrated_time}"))
+}
+
 #[test]
-fn attestation_unenforced_by_default_pre_a6() {
+fn attestation_strip_is_violation() {
+    // A6 inversion: pre-A6 this stayed silently unenforced (staged: true);
+    // live as of A6, a stripped attestation IS a violation.
     let mut baseline = IndexState::new();
     baseline.insert(v1(), entry(&[("attestation", att("milpa-vendored", None, None))]));
     let mut candidate = IndexState::new();
     candidate.insert(v1(), entry(&[]));
 
     let outcome = Baseline::new(baseline).check(&candidate);
-    assert!(outcome.violations.is_empty());
+    assert_eq!(outcome.violations.len(), 1);
+    assert_eq!(outcome.violations[0].kind, MONOTONE_STRIPPED);
 }
 
 #[test]
-fn attestation_upgrades_legal_under_include_staged() {
+fn attestation_upgrades_are_legal() {
     let cases: Vec<(Option<FieldValue>, FieldValue)> = vec![
         (None, att("milpa-vendored", None, None)),
         (None, att("author-signed", Some("alice"), None)),
@@ -259,49 +273,37 @@ fn attestation_upgrades_legal_under_include_staged() {
         let mut candidate = IndexState::new();
         candidate.insert(v1(), entry(&[("attestation", candidate_val)]));
 
-        let outcome = Baseline::new(baseline).check_with(&candidate, true);
+        let outcome = Baseline::new(baseline).check(&candidate);
         assert!(outcome.violations.is_empty());
     }
 }
 
 #[test]
-fn attestation_strip_forbidden_under_include_staged() {
-    let mut baseline = IndexState::new();
-    baseline.insert(v1(), entry(&[("attestation", att("milpa-vendored", None, None))]));
-    let mut candidate = IndexState::new();
-    candidate.insert(v1(), entry(&[]));
-
-    let outcome = Baseline::new(baseline).check_with(&candidate, true);
-    assert_eq!(outcome.violations.len(), 1);
-    assert_eq!(outcome.violations[0].kind, MONOTONE_STRIPPED);
-}
-
-#[test]
-fn attestation_reattribution_forbidden_under_include_staged() {
+fn attestation_reattribution_is_violation() {
     let mut baseline = IndexState::new();
     baseline.insert(v1(), entry(&[("attestation", att("author-signed", Some("alice"), None))]));
     let mut candidate = IndexState::new();
     candidate.insert(v1(), entry(&[("attestation", att("author-signed", Some("bob"), None))]));
 
-    let outcome = Baseline::new(baseline).check_with(&candidate, true);
+    let outcome = Baseline::new(baseline).check(&candidate);
     assert_eq!(outcome.violations.len(), 1);
     assert_eq!(outcome.violations[0].kind, MONOTONE_REATTRIBUTED);
 }
 
 #[test]
-fn attestation_downgrade_forbidden_under_include_staged() {
+fn attestation_downgrade_is_violation() {
     let mut baseline = IndexState::new();
     baseline.insert(v1(), entry(&[("attestation", att("author-signed", Some("alice"), None))]));
     let mut candidate = IndexState::new();
     candidate.insert(v1(), entry(&[("attestation", att("milpa-vendored", None, None))]));
 
-    let outcome = Baseline::new(baseline).check_with(&candidate, true);
+    let outcome = Baseline::new(baseline).check(&candidate);
     assert_eq!(outcome.violations.len(), 1);
     assert_eq!(outcome.violations[0].kind, MONOTONE_DOWNGRADED);
 }
 
 #[test]
-fn attestation_repin_forbidden_under_include_staged() {
+fn attestation_repin_is_violation() {
     let mut baseline = IndexState::new();
     baseline.insert(
         v1(),
@@ -313,20 +315,59 @@ fn attestation_repin_forbidden_under_include_staged() {
         entry(&[("attestation", att("author-signed", Some("alice"), Some("p2")))]),
     );
 
-    let outcome = Baseline::new(baseline).check_with(&candidate, true);
+    let outcome = Baseline::new(baseline).check(&candidate);
     assert_eq!(outcome.violations.len(), 1);
     assert_eq!(outcome.violations[0].kind, MONOTONE_REPINNED);
 }
 
 #[test]
-fn attestation_vendored_signer_rotation_unconstrained_under_include_staged() {
+fn attestation_vendored_signer_rotation_unconstrained() {
     let mut baseline = IndexState::new();
     baseline.insert(v1(), entry(&[("attestation", att("milpa-vendored", None, None))]));
     let mut candidate = IndexState::new();
     candidate.insert(v1(), entry(&[("attestation", att("milpa-vendored", None, None))]));
 
-    let outcome = Baseline::new(baseline).check_with(&candidate, true);
+    let outcome = Baseline::new(baseline).check(&candidate);
     assert!(outcome.violations.is_empty());
+}
+
+#[test]
+fn rekor_backfill_is_legal() {
+    let mut baseline = IndexState::new();
+    baseline.insert(v1(), entry(&[]));
+    let mut candidate = IndexState::new();
+    candidate.insert(v1(), entry(&[("rekor", rekor("uuid-1", "1", "1000"))]));
+
+    let outcome = Baseline::new(baseline).check(&candidate);
+    assert!(outcome.violations.is_empty());
+}
+
+#[test]
+fn rekor_mutated_is_violation() {
+    // A6: the rekor block is Frozen/set-once — a later mutation of a
+    // previously-set rekor reference (not merely backfilling an absent one)
+    // is caught, just like content_hash.
+    let mut baseline = IndexState::new();
+    baseline.insert(v1(), entry(&[("rekor", rekor("uuid-1", "1", "1000"))]));
+    let mut candidate = IndexState::new();
+    candidate.insert(v1(), entry(&[("rekor", rekor("uuid-2", "2", "2000"))]));
+
+    let outcome = Baseline::new(baseline).check(&candidate);
+    assert_eq!(outcome.violations.len(), 1);
+    let v = &outcome.violations[0];
+    assert_eq!(v.field, "rekor");
+    assert_eq!(v.kind, FROZEN_CHANGED);
+}
+
+#[test]
+fn rekor_unset_is_violation() {
+    let mut baseline = IndexState::new();
+    baseline.insert(v1(), entry(&[("rekor", rekor("uuid-1", "1", "1000"))]));
+    let mut candidate = IndexState::new();
+    candidate.insert(v1(), entry(&[]));
+
+    let outcome = Baseline::new(baseline).check(&candidate);
+    assert_eq!(outcome.violations[0].kind, FROZEN_UNSET);
 }
 
 // ---------------------------------------------------------------------------
@@ -440,6 +481,11 @@ fn no_yank_change_is_no_transition() {
 
 #[test]
 fn root_fields_fold_under_reserved_empty_key_with_tiebreak() {
+    // The RFC's own worked example (root-vs-root tie): both
+    // attestation-epoch and schema_version violate in the same candidate —
+    // composite ordering breaks the rank/entry-key tie (both rank 0, both
+    // the reserved empty key) on the trailing field component. Live
+    // unconditionally as of A6 — no include_staged escape hatch.
     let mut baseline = IndexState::new();
     baseline.insert(
         EntryKey::root(),
@@ -451,7 +497,7 @@ fn root_fields_fold_under_reserved_empty_key_with_tiebreak() {
         entry(&[("schema_version", i(1)), ("attestation-epoch", s("E2"))]),
     );
 
-    let outcome = Baseline::new(baseline).check_with(&candidate, true);
+    let outcome = Baseline::new(baseline).check(&candidate);
     assert!(!outcome.advanced);
     assert_eq!(outcome.violations.len(), 2);
     let fields: Vec<&str> = outcome.violations.iter().map(|v| v.field.as_str()).collect();
@@ -462,18 +508,27 @@ fn root_fields_fold_under_reserved_empty_key_with_tiebreak() {
 }
 
 #[test]
-fn attestation_epoch_set_once_under_include_staged() {
+fn attestation_epoch_set_once() {
+    // A6 inversion: pre-A6 this row was silently unenforced by default;
+    // live as of A6, a changed attestation-epoch IS a violation.
     let mut baseline = IndexState::new();
     baseline.insert(EntryKey::root(), entry(&[("attestation-epoch", s("E1"))]));
     let mut candidate = IndexState::new();
     candidate.insert(EntryKey::root(), entry(&[("attestation-epoch", s("E2"))]));
 
-    let outcome = Baseline::new(baseline.clone()).check_with(&candidate, true);
+    let outcome = Baseline::new(baseline).check(&candidate);
     assert_eq!(outcome.violations.len(), 1);
     assert_eq!(outcome.violations[0].field, "attestation-epoch");
     assert_eq!(outcome.violations[0].kind, ROOT_FIELD_CHANGED);
+}
 
-    // unenforced by default (pre-A6):
+#[test]
+fn attestation_epoch_backfill_is_legal() {
+    let mut baseline = IndexState::new();
+    baseline.insert(EntryKey::root(), entry(&[]));
+    let mut candidate = IndexState::new();
+    candidate.insert(EntryKey::root(), entry(&[("attestation-epoch", s("E1"))]));
+
     let outcome = Baseline::new(baseline).check(&candidate);
     assert!(outcome.violations.is_empty());
 }

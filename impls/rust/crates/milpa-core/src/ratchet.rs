@@ -8,12 +8,10 @@
 //! no CLI. It answers exactly one question — "does *candidate* legally
 //! dominate *baseline*?" — and reports the answer as data.
 //!
-//! Staged rows (`attestation`, `rekor`, `attestation-epoch`) are tagged
-//! `staged: true` in the lattice and excluded from [`Baseline::check`] by
-//! default (registry-protocol §3.5.1 NORMATIVE (staged enforcement)); pass
-//! `include_staged: true` to exercise the full lattice — used only by this
-//! module's own tests. Production call sites (A3's index-cache seam) must
-//! not flip that flag before A6.
+//! Every row in the lattice, including `attestation`, `rekor`, and
+//! `attestation-epoch`, is live in [`Baseline::check`] unconditionally as of
+//! A6 (registry-protocol §3.5.1 NORMATIVE (staged enforcement)) — there is
+//! no staged/full distinction to select between.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -272,16 +270,10 @@ impl RatchetOutcome {
 #[derive(Debug, Clone, Copy)]
 struct FieldSpec {
     kind: OrderKind,
-    /// True = enforcement deferred to `rfc-registry-append-only.md`'s A6
-    /// slice (§3.5.1 NORMATIVE (staged enforcement)).
-    staged: bool,
 }
 
 const fn spec(kind: OrderKind) -> FieldSpec {
-    FieldSpec { kind, staged: false }
-}
-const fn staged_spec(kind: OrderKind) -> FieldSpec {
-    FieldSpec { kind, staged: true }
+    FieldSpec { kind }
 }
 
 /// NOTE: `dep_decl` / `dep_decl_schema_version` are NOT listed here — they
@@ -292,9 +284,9 @@ fn lattice() -> Vec<(&'static str, FieldSpec)> {
         // --- Frozen / set-once (entry-level) ---
         ("content_hash", spec(OrderKind::SetOnce)),
         ("published_at", spec(OrderKind::SetOnce)),
-        ("rekor", staged_spec(OrderKind::SetOnce)),
+        ("rekor", spec(OrderKind::SetOnce)),
         // --- Attestation-monotone (entry-level) ---
-        ("attestation", staged_spec(OrderKind::AttestationMonotone)),
+        ("attestation", spec(OrderKind::AttestationMonotone)),
         // --- Append-only-multiset (entry-level) ---
         ("provenances", spec(OrderKind::AppendOnlyMultiset)),
         // --- Advisory-mutable (entry-level) — never violates; yank
@@ -302,7 +294,7 @@ fn lattice() -> Vec<(&'static str, FieldSpec)> {
         ("yanked", spec(OrderKind::AdvisoryMutable)),
         // --- Root fields (document-level, reserved empty key) ---
         ("schema_version", spec(OrderKind::OrdinalNonDecreasing)),
-        ("attestation-epoch", staged_spec(OrderKind::SetOnce)),
+        ("attestation-epoch", spec(OrderKind::SetOnce)),
     ]
 }
 
@@ -419,12 +411,7 @@ fn dispatch(kind: OrderKind, baseline: Option<&FieldValue>, candidate: Option<&F
 // The generic dominance fold (§3.5.1 NORMATIVE (dominance fold)).
 // ---------------------------------------------------------------------------
 
-fn dominates_entry(
-    key: &EntryKey,
-    baseline_entry: &RatchetEntry,
-    candidate_entry: &RatchetEntry,
-    include_staged: bool,
-) -> Vec<Violation> {
+fn dominates_entry(key: &EntryKey, baseline_entry: &RatchetEntry, candidate_entry: &RatchetEntry) -> Vec<Violation> {
     let is_root = key.is_root();
     let cls = if is_root { ROOT_MUTATED } else { ENTRY_MUTATED };
     let mut violations: Vec<Violation> = Vec::new();
@@ -471,9 +458,6 @@ fn dominates_entry(
     }
 
     for (field_name, fspec) in lattice() {
-        if fspec.staged && !include_staged {
-            continue;
-        }
         let b_field = baseline_entry.get(field_name);
         let c_field = candidate_entry.get(field_name);
         if let Some(kind) = dispatch(fspec.kind, b_field.value.as_ref(), c_field.value.as_ref()) {
@@ -565,17 +549,13 @@ impl Baseline {
     }
 
     pub fn check(&self, candidate: &IndexState) -> RatchetOutcome {
-        self.check_with(candidate, false)
-    }
-
-    pub fn check_with(&self, candidate: &IndexState, include_staged: bool) -> RatchetOutcome {
         let mut violations: Vec<Violation> = Vec::new();
         let mut transitions: Vec<Transition> = Vec::new();
 
         let empty = RatchetEntry::new();
         let root_baseline = self.state.get(&EntryKey::root()).unwrap_or(&empty);
         let root_candidate = candidate.get(&EntryKey::root()).unwrap_or(&empty);
-        violations.extend(dominates_entry(&EntryKey::root(), root_baseline, root_candidate, include_staged));
+        violations.extend(dominates_entry(&EntryKey::root(), root_baseline, root_candidate));
 
         for (key, b_entry) in &self.state {
             if key.is_root() {
@@ -587,7 +567,7 @@ impl Baseline {
                     continue;
                 }
                 Some(c_entry) => {
-                    violations.extend(dominates_entry(key, b_entry, c_entry, include_staged));
+                    violations.extend(dominates_entry(key, b_entry, c_entry));
                     if let Some(t) = yank_transition(key, b_entry, c_entry) {
                         transitions.push(t);
                     }

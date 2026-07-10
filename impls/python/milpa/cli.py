@@ -2674,13 +2674,9 @@ def _render_index_verb_diff(outcome: object, baseline_state: str) -> "tuple[str,
     violations = outcome.violations  # type: ignore[attr-defined]
     lines: list[str] = []
     if any(v.field == "attestation-epoch" for v in violations):
-        # registry-protocol §3.5.1 (staged — attestation-epoch enforcement
-        # lands at A6): the blast-radius sentence cli-contract §5.12
-        # requires before the ordinary diff. Written now so the print path
-        # is A6-ready; unreachable via the live fetch path until the
-        # engine's `include_staged` gate flips (ratchet.py's own docstring
-        # NORMATIVE (staged enforcement)) — exercised directly in tests via
-        # a hand-built violation set.
+        # registry-protocol §3.5.1: attestation-epoch enforcement is live as
+        # of A6. The blast-radius sentence cli-contract §5.12 requires
+        # before the ordinary diff.
         lines.append(
             "accepting this change reclassifies every entry between the "
             "epochs as pre-epoch/legacy, nullifying the attestation mandate "

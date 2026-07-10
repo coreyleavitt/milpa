@@ -19,8 +19,14 @@
 //!    retains only typed values, forcing a separate raw-KDL re-walk for
 //!    `published_at`), Rust's `IndexVersion` already carries
 //!    `published_at_raw` alongside the typed `published_at` (registry.rs),
-//!    so this module needs only ONE extra raw lookup — the document-root
-//!    `schema_version` integer, which `Index` itself does not retain.
+//!    so this module needs only TWO extra raw lookups — the document-root
+//!    `schema_version` integer and `attestation-epoch` string, neither of
+//!    which `Index` itself retains. `attestation`/`rekor` get their own
+//!    canonical (never `Debug`-derived) rendering per §3.5.3 NORMATIVE
+//!    (canonical rendering for non-scalar candidate values) — see
+//!    [`attestation_canonical_raw`] / [`rekor_canonical_raw`] below, live as
+//!    of A6 alongside the `attestation`/`rekor`/`attestation-epoch` rows'
+//!    enforcement (registry-protocol §3.5.1 NORMATIVE (staged enforcement)).
 //!
 //! 2. **The gate decision** ([`evaluate_gate`]) — TOFU establishment, the
 //!    sticky-advance clean/dirty branch, warn's new-vs-recurring habituation
@@ -56,7 +62,8 @@ fn tng(code: &'static str, message: impl Into<String>) -> MilpaError {
 pub fn build_index_state(text: &str) -> Result<(Index, IndexState), MilpaError> {
     let index = Index::parse(text).map_err(MilpaError::from)?;
     let schema_version = raw_schema_version(text)?;
-    Ok((index.clone(), index_state_from(schema_version, &index)))
+    let attestation_epoch = raw_attestation_epoch(text)?;
+    Ok((index.clone(), index_state_from(schema_version, attestation_epoch, &index)))
 }
 
 /// The document-root `schema_version` integer, or `None` if absent (the
@@ -82,12 +89,39 @@ fn raw_schema_version(text: &str) -> Result<Option<i64>, MilpaError> {
     Ok(None)
 }
 
-fn index_state_from(schema_version: Option<i64>, index: &Index) -> IndexState {
+/// The document-root `attestation-epoch` string, or `None` if absent
+/// (`rfc-per-entry-attestation.md` open question 2; registry-protocol
+/// §3.5.1 root-field table — set-once, live as of A6). An opaque epoch
+/// identifier: no reformatting margin, so the typed value doubles as its
+/// own raw digest rendering (the scalar-field convention). A SEPARATE
+/// re-walk for the same reason as `raw_schema_version` — `Index` does not
+/// retain this root field.
+fn raw_attestation_epoch(text: &str) -> Result<Option<String>, MilpaError> {
+    let doc = KdlDocument::parse(text)
+        .map_err(|e| tng("TNG-KDL-SYNTAX", format!("index KDL syntax error: {e}")))?;
+    for node in doc.nodes() {
+        if node.name().value() != "attestation-epoch" {
+            continue;
+        }
+        return Ok(node
+            .entries()
+            .iter()
+            .find(|e| e.name().is_none())
+            .and_then(|e| e.value().as_string())
+            .map(str::to_string));
+    }
+    Ok(None)
+}
+
+fn index_state_from(schema_version: Option<i64>, attestation_epoch: Option<String>, index: &Index) -> IndexState {
     let mut state = IndexState::new();
 
     let mut root = RatchetEntry::new();
     if let Some(v) = schema_version {
         root = root.set("schema_version", RawField::new(FieldValue::Int(v)));
+    }
+    if let Some(e) = attestation_epoch {
+        root = root.set("attestation-epoch", RawField::new(FieldValue::Str(e)));
     }
     state.insert(EntryKey::root(), root);
 
@@ -119,7 +153,15 @@ fn index_state_from(schema_version: Option<i64>, index: &Index) -> IndexState {
                 entry = entry.set("yanked_reason", RawField::new(FieldValue::Str(r.clone())));
             }
             if let Some(att) = &iv.attestation {
-                entry = entry.set("attestation", RawField::new(FieldValue::Attestation(encode_attestation(att))));
+                let raw = attestation_canonical_raw(Some(att));
+                entry = entry.set(
+                    "attestation",
+                    RawField::with_raw(FieldValue::Attestation(encode_attestation(att)), raw),
+                );
+                if let Some(r) = &att.rekor {
+                    let raw = rekor_canonical_raw(Some(r));
+                    entry = entry.set("rekor", RawField::with_raw(FieldValue::Str(raw.clone()), raw));
+                }
             }
             state.insert(key, entry);
         }
@@ -204,6 +246,41 @@ fn encode_attestation(att: &milpa_types::EntryAttestation) -> AttestationValue {
             bundle_pin: att.bundle_pin.clone(),
         },
     }
+}
+
+/// Canonical, cross-impl-identical rendering of an `EntryAttestation` for
+/// the §3.5.3 canonical violation digest (NORMATIVE (canonical rendering
+/// for non-scalar candidate values) — the `attestation` instantiation, live
+/// as of A6): a single closed field set — `kind`, `signer` (`author-signed`
+/// only, empty for `milpa-vendored`), `bundle_pin` (empty when unset) —
+/// encoded as `<kind>\x1f<signer>\x1f<bundle_pin>`. Empty string when
+/// `attestation` is absent, consistent with the scalar-field absent-
+/// component convention. Mirrors
+/// `index_ratchet_seam.py::_attestation_canonical_raw` byte-for-byte.
+fn attestation_canonical_raw(att: Option<&milpa_types::EntryAttestation>) -> String {
+    use milpa_types::AttestationKind;
+    let Some(att) = att else {
+        return String::new();
+    };
+    let (kind, signer) = match &att.kind {
+        AttestationKind::AuthorSigned { signer } => ("author-signed", signer.as_str()),
+        AttestationKind::MilpaVendored => ("milpa-vendored", ""),
+    };
+    format!("{kind}\u{1f}{signer}\u{1f}{}", att.bundle_pin.as_deref().unwrap_or(""))
+}
+
+/// Canonical rendering of the `rekor` block for the canonical violation
+/// digest (§3.5.3 NORMATIVE (canonical rendering for non-scalar candidate
+/// values) — the `rekor` instantiation, live as of A6): the same
+/// closed-field-set method, field order `uuid`, `log_index`,
+/// `integrated_time`, joined by `\x1f`. Empty string when `rekor` is
+/// absent. Mirrors `index_ratchet_seam.py::_rekor_canonical_raw`
+/// byte-for-byte.
+fn rekor_canonical_raw(rekor: Option<&milpa_types::RekorRef>) -> String {
+    let Some(r) = rekor else {
+        return String::new();
+    };
+    format!("{}\u{1f}{}\u{1f}{}", r.uuid, r.log_index, r.integrated_time)
 }
 
 // ---------------------------------------------------------------------------

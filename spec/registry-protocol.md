@@ -51,11 +51,10 @@ A conformant implementation of this spec MUST:
    optional-scalar robustness posture instead (a malformed value surfaces as
    absent, no collapse diagnostic, no hard error — §3.2). Layer 2
    enforcement over the parsed attestation record — the `entry-trust` gate —
-   is a separate, later normative surface (§3.2, "gate lands separately");
-   likewise, enforcement of the append-only consumer ratchet over
-   `published_at` and the yank fields (§3.5) is staged to
-   `rfc-registry-append-only.md`'s A2/A5 slices, not this spec-only
-   amendment.
+   is a separate normative surface (§3.2, "gate lands separately"); the
+   append-only consumer ratchet's own enforcement over every lattice row,
+   including `attestation`, `rekor`, and `attestation-epoch`, is live (§3.5;
+   `rfc-registry-append-only.md`'s A2/A5/A6 slices landed it).
 7. Treat unknown provenance `kind` values as forward-compat: skip the
    provenance record rather than failing, provided at least one known-kind
    provenance remains on the version.
@@ -78,6 +77,12 @@ An `index.kdl` document is a flat sequence of top-level nodes. The parser
 recognises two kinds of top-level node:
 
 - `schema_version <int>` — optional schema-version declaration (§2).
+- `attestation-epoch "<string>"` — optional, opaque epoch identifier
+  (`rfc-per-entry-attestation.md` open question 2). Set-once under the
+  append-only ratchet's root-field class (§3.5.1); absent means no epoch has
+  been established. Not itself a trust or verification primitive — it is a
+  marker the ratchet (§3.5) and the future post-epoch attestation mandate
+  key off of.
 - `package "<name>" { … }` — a named-package entry (§3).
 
 All other top-level nodes MUST be silently skipped (forward-compat).
@@ -499,12 +504,9 @@ when relevant (§5.2).
 > a consumer's ratchet baseline and a candidate index MUST be reported as a
 > non-fatal notice — never an error, never silent (§3.5.3).
 
-> NORMATIVE (staged — enforcement lands at `rfc-registry-append-only.md`'s
-> A5 slice): once `yanked` is `#true`, the version MUST be excluded from
+> NORMATIVE: once `yanked` is `#true`, the version MUST be excluded from
 > *new* candidate enumeration — §5.2 amendment below specifies the
-> selection semantics. This clause specifies only the parse-to-typed
-> contract and the field's semantic status as of this spec-only amendment
-> (A1); selection-time exclusion is not yet enforced.
+> selection semantics (live as of `rfc-registry-append-only.md`'s A5 slice).
 
 > NOTE: There is no `--allow-yanked` escape hatch in milpa v1 — reproducing
 > an already-locked yanked version is fully covered by the frozen path
@@ -1090,22 +1092,18 @@ the invariant above:
 > re-ordering, or re-formatting the `index.kdl` document is always legal
 > and produces no violation.
 
-> NORMATIVE (staged enforcement): the lattice above is complete in this
-> spec as of this amendment, but two rows constrain fields the parse
-> boundary does not yet type: the attestation record and the `rekor` block
-> (§3.2 still specifies these as parsed-and-ignored pending
-> `rfc-per-entry-attestation.md`'s P2 slice, and a pinned regression test
-> asserts `IndexVersion` carries no `rekor` attribute today). Enforcement
-> of a given row lands with the slice that makes its fields parse-to-typed:
-> `content_hash` / `dep_decl` / `dep_decl_schema_version` / presence /
-> provenances are parseable today; `published_at` and the yank triple gain
-> parse-to-typed handling, and this section's checks over them gain
-> enforcement, at `rfc-registry-append-only.md`'s A2 slice; the attestation
-> record and `rekor` rows (including the `attestation-epoch` root field)
-> enforce at that RFC's A6 slice, after Part 2's P2 parser change lands.
-> Until the corresponding slice lands, this section specifies the target
-> behavior; it does not itself change what any implementation currently
-> enforces.
+> NORMATIVE (staged enforcement, HISTORICAL): the lattice above was complete
+> in this spec from the amendment that introduced it, but enforcement of
+> each row landed with the implementation slice that made its fields
+> parse-to-typed: `content_hash` / `dep_decl` / `dep_decl_schema_version` /
+> presence / provenances enforced from the outset; `published_at` and the
+> yank triple gained enforcement at `rfc-registry-append-only.md`'s A2
+> slice; the attestation record, the `rekor` block, and the
+> `attestation-epoch` root field gained enforcement at that RFC's A6 slice,
+> after Part 2's P2 parser change landed (the pinned no-`rekor`-attribute
+> regression test was inverted at P2 itself; the ratchet-level staged-row
+> exclusion was removed at A6). As of A6 every row in the lattice above
+> enforces unconditionally — there is no remaining staged/full distinction.
 
 #### 3.5.2  The consumer ratchet
 
@@ -1359,9 +1357,10 @@ part of `spec/errors.md` as of this spec-only amendment:
 > via its own raw-served capture — `published_at`): the field's literal
 > text has no reformatting margin, so the typed value's string form and the
 > served text coincide. It is **not** well-defined as stated for a field
-> whose order kind compares a *collection* rather than a scalar — today
-> only the `provenances` row (Append-only-multiset, §3.5.1), and the
-> `attestation` row once A6 lifts its staged status. A `candidate_value`
+> whose order kind compares a *collection*, or a multi-field record, rather
+> than a bare scalar — the `provenances` row (Append-only-multiset,
+> §3.5.1), the `attestation` row (Attestation-monotone), and the `rekor`
+> row (Frozen). A `candidate_value`
 > naively rendered via each implementation's native `Debug`/`repr` of such
 > a collection is exactly the "value re-formatting" divergence surface the
 > paragraph above warns about — and the divergence is real, not
@@ -1397,14 +1396,22 @@ part of `spec/errors.md` as of this spec-only amendment:
 > list; a differential conformance fixture pins this (`rfc-registry-append-
 > only.md`'s A4b).
 >
-> Instantiation for `attestation` (deferred to A6, staged per §3.5.1
-> NORMATIVE (staged enforcement)): the attestation record's rendering
-> follows the same method — field order `kind`, `signer`
-> (`author-signed` only, empty for `milpa-vendored`), `bundle_pin`
-> (empty when unset) — a single element, so the sort/join step is
-> trivial, but the delimiter and empty-field convention are the same for
-> consistency. A6 MUST NOT invent a second rendering method when it lifts
-> this row's staged status.
+> Instantiation for `attestation` (live from A6): the attestation record's
+> rendering follows the same method — field order `kind`, `signer`
+> (`author-signed` only, empty for `milpa-vendored`), `bundle_pin` (empty
+> when unset) — a single element, so the sort/join step is trivial, but the
+> delimiter and empty-field convention are the same for consistency: an
+> absent `attestation` record renders as the empty string (the scalar
+> absent-component convention), never a rendered `None`/`null`/similar.
+>
+> Instantiation for `rekor` (live from A6): the same closed-field-set
+> method, field order `uuid`, `log_index`, `integrated_time`; again a
+> single element, so no sort/join is needed beyond the trivial one-element
+> case. An absent `rekor` block renders as the empty string. Both
+> implementations MUST produce byte-identical output for the same
+> candidate attestation/rekor value; a differential conformance fixture
+> pins the `attestation` instantiation (`rfc-registry-append-only.md`'s A6,
+> fixture 406).
 
 > NORMATIVE (remediation hints required): both the `warn` diagnostic text
 > and the `strict` error text MUST name the two sanctioned exits: revert
@@ -1559,8 +1566,8 @@ Once a package is found, its versions are filtered by the constraint.
 > does not define constraint syntax; cross-reference
 > `spec/resolver-semantics.md` (S6) for the constraint grammar.
 
-> NORMATIVE (staged — enforcement lands at `rfc-registry-append-only.md`'s
-> A5 slice): once a version's `yanked` field (§3.2) is `#true`, it MUST be
+> NORMATIVE (live as of `rfc-registry-append-only.md`'s A5 slice): once a
+> version's `yanked` field (§3.2) is `#true`, it MUST be
 > excluded from constraint-filtered candidate enumeration, before ordering
 > and constraint matching, in **both** named-lookup entry points —
 > `resolve_named_all` (§5.5) and its S5b qualified counterpart

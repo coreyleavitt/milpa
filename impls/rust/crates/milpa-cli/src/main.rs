@@ -3393,10 +3393,9 @@ fn render_index_verb_diff(outcome: Option<&RatchetOutcome>, baseline_state: &str
     let violations = &outcome.violations;
     let mut lines: Vec<String> = Vec::new();
     if violations.iter().any(|v| v.field == "attestation-epoch") {
-        // registry-protocol §3.5.1 (staged — attestation-epoch enforcement
-        // lands at A6): the blast-radius sentence cli-contract §5.12
-        // requires before the ordinary diff. Unreachable via the live fetch
-        // path until the engine's `include_staged` gate flips.
+        // registry-protocol §3.5.1: attestation-epoch enforcement is live as
+        // of A6. The blast-radius sentence cli-contract §5.12 requires
+        // before the ordinary diff.
         lines.push(
             "accepting this change reclassifies every entry between the \
              epochs as pre-epoch/legacy, nullifying the attestation mandate \

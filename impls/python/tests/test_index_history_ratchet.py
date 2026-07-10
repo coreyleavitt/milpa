@@ -444,6 +444,91 @@ package "bar" {
 
 
 # ---------------------------------------------------------------------------
+# Attestation canonical digest rendering (A6): the attestation record's
+# canonical-rendering instantiation (registry-protocol §3.5.3 NORMATIVE
+# (canonical rendering for non-scalar candidate values)), live now that the
+# attestation-monotone row enforces. Same style as
+# TestProvenanceCanonicalDigest — hand-assembles the expected digest input
+# from the spec's algorithm directly. The SAME hex is ported verbatim into
+# ratchet_tests.rs / index_ratchet_seam_tests.rs and into conformance
+# fixture 406's expected/digest (cross-impl differential pin).
+# ---------------------------------------------------------------------------
+
+
+class TestAttestationCanonicalDigest:
+    def test_repin_hand_computed_digest_vector(self) -> None:
+        baseline_text = """schema_version 1
+package "bar" {
+    namespace "acme"
+    version "1.0.0" {
+        content_hash "sha256:%s"
+        provenance {
+            kind "git"
+            url "https://example.com/bar.git"
+            ref "v1.0.0"
+        }
+        attestation "author-signed"
+        signed_by "alice"
+        bundle sha256="%s"
+    }
+}
+""" % ("a" * 64, "1" * 64)
+        candidate_text = baseline_text.replace("1" * 64, "2" * 64)
+        _, baseline_state = build_index_state(baseline_text)
+        _, candidate_state = build_index_state(candidate_text)
+        outcome = Baseline(baseline_state).check(candidate_state)
+
+        assert len(outcome.violations) == 1
+        v = outcome.violations[0]
+        assert v.class_ == TNG_ENTRY_MUTATED
+        assert v.field == "attestation"
+        assert v.kind == "monotone-repinned"
+
+        candidate_value = "author-signed\x1falice\x1f" + "2" * 64
+        assert v.candidate_value == candidate_value
+
+        expected_line = (
+            "TNG-ENTRY-MUTATED\tacme\tbar\t1.0.0\tattestation\tmonotone-repinned\t"
+            + candidate_value
+            + "\n"
+        )
+        expected_digest = hashlib.sha256(expected_line.encode("utf-8")).hexdigest()
+        assert expected_digest == (
+            "2c02fbe94260c81db0006a77d8572a54feb58d36d1071bf7191d790087a63323"
+        )
+        assert canonical_digest(outcome.violations) == expected_digest
+
+    def test_strip_is_absent_candidate_value(self) -> None:
+        """An absent attestation renders as the empty string in the digest
+        (the absent-component convention scalar fields already use) — not
+        a rendered ``"None"`` or similar."""
+        baseline_text = """schema_version 1
+package "bar" {
+    namespace "acme"
+    version "1.0.0" {
+        content_hash "sha256:%s"
+        provenance {
+            kind "git"
+            url "https://example.com/bar.git"
+            ref "v1.0.0"
+        }
+        attestation "milpa-vendored"
+    }
+}
+""" % ("a" * 64)
+        candidate_text = baseline_text.replace(
+            '        attestation "milpa-vendored"\n', ""
+        )
+        _, baseline_state = build_index_state(baseline_text)
+        _, candidate_state = build_index_state(candidate_text)
+        outcome = Baseline(baseline_state).check(candidate_state)
+        assert len(outcome.violations) == 1
+        v = outcome.violations[0]
+        assert v.kind == "monotone-stripped"
+        assert v.candidate_value == ""
+
+
+# ---------------------------------------------------------------------------
 # off: preserves existing files untouched, never reads them
 # ---------------------------------------------------------------------------
 

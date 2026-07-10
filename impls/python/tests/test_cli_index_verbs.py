@@ -346,10 +346,10 @@ class TestAcceptCorrupt:
 
 
 # ---------------------------------------------------------------------------
-# epoch-change acceptance -> blast-radius sentence (renderer unit test —
-# attestation-epoch enforcement is staged to A6 in the live fetch path, so
-# this is exercised directly against a hand-built violation set, per
-# ratchet.py's own "include_staged" precedent for staged-row coverage).
+# epoch-change acceptance -> blast-radius sentence (renderer unit test,
+# exercised directly against a hand-built violation set — attestation-epoch
+# enforcement is live as of A6; see test_index_history_ratchet.py /
+# fixture-404 for the end-to-end live-path coverage).
 # ---------------------------------------------------------------------------
 
 
