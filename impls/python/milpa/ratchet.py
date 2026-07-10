@@ -362,6 +362,19 @@ def _dominates_advisory(baseline: object, candidate: object) -> str | None:
     return None  # everything comparable, both directions legal
 
 
+def _lockstep_raw(entry: RatchetEntry, group: tuple[str, ...]) -> str:
+    """The lockstep group's closed-field-set rendering (§3.5.3 NORMATIVE
+    (lockstep-group candidate_value is a closed-field-set record, not its
+    first member)): the group's raw values, in declared order, joined by
+    ``\\x1f`` — the same method §3.5.3 already uses for ``attestation``/
+    ``rekor`` (single-element closed-field-set records). Rendering from
+    ONLY the first member (``dep_decl``) would leave ``candidate_value``
+    blind to a violation whose sole change is a later group member (e.g.
+    ``dep_decl_schema_version``), masking a genuinely new mutation as a
+    recurring one under §3.5.2's warn-mode digest comparison."""
+    return "\x1f".join(entry.get(f).raw_str() for f in group)
+
+
 _DISPATCH: dict[OrderKind, Callable[[object, object], str | None]] = {
     OrderKind.SET_ONCE: _dominates_set_once,
     OrderKind.ORDINAL_NON_DECREASING: _dominates_ordinal,
@@ -402,8 +415,8 @@ def _dominates_entry(
                     entry_key=key,
                     field=group[0],
                     kind=reported,
-                    baseline_value=baseline_entry.get(group[0]).raw_str(),
-                    candidate_value=candidate_entry.get(group[0]).raw_str(),
+                    baseline_value=_lockstep_raw(baseline_entry, group),
+                    candidate_value=_lockstep_raw(candidate_entry, group),
                 )
             )
 

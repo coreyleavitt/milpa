@@ -521,6 +521,80 @@ def test_digest_changes_on_remutation_of_same_field() -> None:
     assert canonical_digest([v2]) != canonical_digest([v3])
 
 
+def test_lockstep_group_second_mutation_produces_distinct_digest() -> None:
+    """CR3 regression: the lockstep group's ``candidate_value`` MUST
+    incorporate BOTH ``dep_decl`` and ``dep_decl_schema_version`` — not just
+    ``dep_decl``'s raw text — or two distinct schema-version-only mutations
+    from the same sticky baseline (§3.5.2's sticky-advance: the baseline
+    does not move while a violation is outstanding) render byte-identical
+    ``candidate_value``s and collapse to the same digest, mislabeling the
+    second, genuinely new mutation as "recurring" under §3.5.2's warn-mode
+    habituation defense (registry-protocol §3.5.3 NORMATIVE (lockstep-group
+    candidate_value is a closed-field-set record, not its first member)).
+
+    Hand-derivation (never copied from ``canonical_digest``'s own output):
+    the group renders as ``dep_decl`` and ``dep_decl_schema_version``'s raw
+    values, in declared order, joined by U+001F (the same closed-field-set
+    method §3.5.3 already specifies for ``attestation``/``rekor``), then the
+    standard tab-joined 7-tuple line, sha256'd."""
+    dep_decl_hash = "sha256:" + "d" * 64
+    baseline_state = {V1: entry(dep_decl=dep_decl_hash, dep_decl_schema_version=0)}
+    candidate_1 = {V1: entry(dep_decl=dep_decl_hash, dep_decl_schema_version=1)}
+    candidate_2 = {V1: entry(dep_decl=dep_decl_hash, dep_decl_schema_version=2)}
+
+    outcome_1 = Baseline(baseline_state).check(candidate_1)
+    outcome_2 = Baseline(baseline_state).check(candidate_2)
+    assert len(outcome_1.violations) == 1
+    assert len(outcome_2.violations) == 1
+    v1_violation = outcome_1.violations[0]
+    v2_violation = outcome_2.violations[0]
+    assert v1_violation.field == "dep_decl"
+    assert v1_violation.kind == FROZEN_CHANGED
+
+    expected_candidate_1 = dep_decl_hash + "\x1f" + "1"
+    expected_candidate_2 = dep_decl_hash + "\x1f" + "2"
+    assert v1_violation.candidate_value == expected_candidate_1
+    assert v2_violation.candidate_value == expected_candidate_2
+
+    expected_line_1 = (
+        "TNG-ENTRY-MUTATED\tacme\tfoo\t1.0.0\tdep_decl\tfrozen-changed\t" + expected_candidate_1 + "\n"
+    )
+    expected_line_2 = (
+        "TNG-ENTRY-MUTATED\tacme\tfoo\t1.0.0\tdep_decl\tfrozen-changed\t" + expected_candidate_2 + "\n"
+    )
+    expected_digest_1 = hashlib.sha256(expected_line_1.encode("utf-8")).hexdigest()
+    expected_digest_2 = hashlib.sha256(expected_line_2.encode("utf-8")).hexdigest()
+    assert expected_digest_1 == "04f16fde7c87b266c0face0ed4ff0b06c9c1c41d60294bc9d8a2f749f90ffe4d"
+    assert expected_digest_2 == "90654e2381cb940b9b78e558a5d0797b5ad2c9f7b7f0b93132da235db7ef601b"
+
+    assert canonical_digest(outcome_1.violations) == expected_digest_1
+    assert canonical_digest(outcome_2.violations) == expected_digest_2
+    # The regression lock: before the fix, both digests were
+    # sha256("...dep_decl\tfrozen-changed\t" + dep_decl_hash + "\n") —
+    # identical — because candidate_value was built from dep_decl alone.
+    assert expected_digest_1 != expected_digest_2
+
+
+def test_lockstep_group_dep_decl_text_change_still_distinct_digest() -> None:
+    """A change to ``dep_decl``'s own text (``dep_decl_schema_version`` held
+    constant) must still produce a correctly-composed, distinct digest — the
+    CR3 fix must not regress the pre-existing dep_decl-alone-changed case."""
+    baseline_state = {V1: entry(dep_decl="sha256:" + "d" * 64, dep_decl_schema_version=1)}
+    candidate_state = {V1: entry(dep_decl="sha256:" + "e" * 64, dep_decl_schema_version=1)}
+    outcome = Baseline(baseline_state).check(candidate_state)
+    assert len(outcome.violations) == 1
+    v = outcome.violations[0]
+    expected_candidate_value = "sha256:" + "e" * 64 + "\x1f" + "1"
+    assert v.candidate_value == expected_candidate_value
+
+    expected_line = (
+        "TNG-ENTRY-MUTATED\tacme\tfoo\t1.0.0\tdep_decl\tfrozen-changed\t" + expected_candidate_value + "\n"
+    )
+    expected_digest = hashlib.sha256(expected_line.encode("utf-8")).hexdigest()
+    assert expected_digest == "481fcbe6d2d2672273226076e32dc79e10c138b38012788d51dbd9382fac8fb9"
+    assert canonical_digest(outcome.violations) == expected_digest
+
+
 def test_digest_unaffected_by_baseline_value_change() -> None:
     key = EntryKey(namespace="acme", name="foo", version="1.0.0")
     v_a = Violation(

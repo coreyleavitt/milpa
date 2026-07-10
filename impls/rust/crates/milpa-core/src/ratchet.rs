@@ -414,6 +414,19 @@ fn dominates_advisory(_baseline: Option<&FieldValue>, _candidate: Option<&FieldV
     None // everything comparable, both directions legal
 }
 
+/// The lockstep group's closed-field-set rendering (§3.5.3 NORMATIVE
+/// (lockstep-group candidate_value is a closed-field-set record, not its
+/// first member)): the group's raw values, in declared order, joined by
+/// `\x1f` — the same method §3.5.3 already uses for `attestation`/`rekor`
+/// (single-element closed-field-set records). Rendering from ONLY the
+/// first member (`dep_decl`) would leave `candidate_value` blind to a
+/// violation whose sole change is a later group member (e.g.
+/// `dep_decl_schema_version`), masking a genuinely new mutation as a
+/// recurring one under §3.5.2's warn-mode digest comparison.
+fn lockstep_raw(entry: &RatchetEntry, group: &[&str]) -> String {
+    group.iter().map(|f| entry.get(f).raw_str()).collect::<Vec<_>>().join("\u{1f}")
+}
+
 fn dispatch(kind: OrderKind, baseline: Option<&FieldValue>, candidate: Option<&FieldValue>) -> Option<&'static str> {
     match kind {
         OrderKind::SetOnce => dominates_set_once(baseline, candidate),
@@ -468,8 +481,8 @@ fn dominates_entry(key: &EntryKey, baseline_entry: &RatchetEntry, candidate_entr
                 entry_key: key.clone(),
                 field: group[0].to_string(),
                 kind: reported,
-                baseline_value: baseline_entry.get(group[0]).raw_str(),
-                candidate_value: candidate_entry.get(group[0]).raw_str(),
+                baseline_value: lockstep_raw(baseline_entry, group),
+                candidate_value: lockstep_raw(candidate_entry, group),
             });
         }
     }

@@ -158,6 +158,112 @@ fn dep_decl_schema_version_alone_changing_is_violation() {
     assert_eq!(v.class, ENTRY_MUTATED);
 }
 
+#[test]
+fn lockstep_group_second_mutation_produces_distinct_digest() {
+    // CR3 regression: the lockstep group's `candidate_value` MUST
+    // incorporate BOTH `dep_decl` and `dep_decl_schema_version` — not just
+    // `dep_decl`'s raw text — or two distinct schema-version-only mutations
+    // from the same sticky baseline (§3.5.2's sticky-advance) render
+    // byte-identical `candidate_value`s and collapse to the same digest,
+    // mislabeling the second, genuinely new mutation as "recurring" under
+    // §3.5.2's warn-mode habituation defense (registry-protocol §3.5.3
+    // NORMATIVE (lockstep-group candidate_value is a closed-field-set
+    // record, not its first member)).
+    //
+    // Hand-derivation (never copied from `canonical_digest`'s own output):
+    // the group renders as `dep_decl` and `dep_decl_schema_version`'s raw
+    // values, in declared order, joined by U+001F (the same closed-field-set
+    // method §3.5.3 already specifies for `attestation`/`rekor`), then the
+    // standard tab-joined 7-tuple line, sha256'd. MUST match
+    // `impls/python/tests/test_ratchet.py`'s vectors exactly.
+    let dep_decl_hash = hash64('d');
+    let mut baseline = IndexState::new();
+    baseline.insert(
+        v1(),
+        entry(&[
+            ("dep_decl", s(&dep_decl_hash)),
+            ("dep_decl_schema_version", i(0)),
+        ]),
+    );
+    let mut candidate_1 = IndexState::new();
+    candidate_1.insert(
+        v1(),
+        entry(&[
+            ("dep_decl", s(&dep_decl_hash)),
+            ("dep_decl_schema_version", i(1)),
+        ]),
+    );
+    let mut candidate_2 = IndexState::new();
+    candidate_2.insert(
+        v1(),
+        entry(&[
+            ("dep_decl", s(&dep_decl_hash)),
+            ("dep_decl_schema_version", i(2)),
+        ]),
+    );
+
+    let outcome_1 = Baseline::new(baseline.clone()).check(&candidate_1);
+    let outcome_2 = Baseline::new(baseline).check(&candidate_2);
+    assert_eq!(outcome_1.violations.len(), 1);
+    assert_eq!(outcome_2.violations.len(), 1);
+    let v1_violation = &outcome_1.violations[0];
+    let v2_violation = &outcome_2.violations[0];
+    assert_eq!(v1_violation.field, "dep_decl");
+    assert_eq!(v1_violation.kind, FROZEN_CHANGED);
+
+    let expected_candidate_1 = format!("{dep_decl_hash}\u{1f}1");
+    let expected_candidate_2 = format!("{dep_decl_hash}\u{1f}2");
+    assert_eq!(v1_violation.candidate_value, expected_candidate_1);
+    assert_eq!(v2_violation.candidate_value, expected_candidate_2);
+
+    let expected_line_1 =
+        format!("TNG-ENTRY-MUTATED\tacme\tfoo\t1.0.0\tdep_decl\tfrozen-changed\t{expected_candidate_1}\n");
+    let expected_line_2 =
+        format!("TNG-ENTRY-MUTATED\tacme\tfoo\t1.0.0\tdep_decl\tfrozen-changed\t{expected_candidate_2}\n");
+    let expected_digest_1 = hex::encode(Sha256::digest(expected_line_1.as_bytes()));
+    let expected_digest_2 = hex::encode(Sha256::digest(expected_line_2.as_bytes()));
+    assert_eq!(expected_digest_1, "04f16fde7c87b266c0face0ed4ff0b06c9c1c41d60294bc9d8a2f749f90ffe4d");
+    assert_eq!(expected_digest_2, "90654e2381cb940b9b78e558a5d0797b5ad2c9f7b7f0b93132da235db7ef601b");
+
+    assert_eq!(canonical_digest(&outcome_1.violations), expected_digest_1);
+    assert_eq!(canonical_digest(&outcome_2.violations), expected_digest_2);
+    // The regression lock: before the fix, both digests were
+    // sha256("...dep_decl\tfrozen-changed\t" + dep_decl_hash + "\n") —
+    // identical — because candidate_value was built from dep_decl alone.
+    assert_ne!(expected_digest_1, expected_digest_2);
+}
+
+#[test]
+fn lockstep_group_dep_decl_text_change_still_distinct_digest() {
+    // A change to `dep_decl`'s own text (`dep_decl_schema_version` held
+    // constant) must still produce a correctly-composed, distinct digest —
+    // the CR3 fix must not regress the pre-existing dep_decl-alone-changed
+    // case.
+    let mut baseline = IndexState::new();
+    baseline.insert(
+        v1(),
+        entry(&[("dep_decl", s(&hash64('d'))), ("dep_decl_schema_version", i(1))]),
+    );
+    let mut candidate = IndexState::new();
+    candidate.insert(
+        v1(),
+        entry(&[("dep_decl", s(&hash64('e'))), ("dep_decl_schema_version", i(1))]),
+    );
+
+    let outcome = Baseline::new(baseline).check(&candidate);
+    assert_eq!(outcome.violations.len(), 1);
+    let v = &outcome.violations[0];
+    let expected_candidate_value = format!("{}\u{1f}1", hash64('e'));
+    assert_eq!(v.candidate_value, expected_candidate_value);
+
+    let expected_line = format!(
+        "TNG-ENTRY-MUTATED\tacme\tfoo\t1.0.0\tdep_decl\tfrozen-changed\t{expected_candidate_value}\n"
+    );
+    let expected_digest = hex::encode(Sha256::digest(expected_line.as_bytes()));
+    assert_eq!(expected_digest, "481fcbe6d2d2672273226076e32dc79e10c138b38012788d51dbd9382fac8fb9");
+    assert_eq!(canonical_digest(&outcome.violations), expected_digest);
+}
+
 // ---------------------------------------------------------------------------
 // Ordinal-non-decreasing root field (schema_version)
 // ---------------------------------------------------------------------------

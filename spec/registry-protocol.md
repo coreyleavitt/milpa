@@ -1455,6 +1455,33 @@ part of `spec/errors.md` as of this spec-only amendment:
 > pins the `attestation` instantiation (`rfc-registry-append-only.md`'s A6,
 > fixture 406).
 
+> NORMATIVE (lockstep-group candidate_value is a closed-field-set record,
+> not its first member): §3.5.1's `dep_decl` **together with**
+> `dep_decl_schema_version` lockstep group is reported as one violation
+> under the primary field name `dep_decl`, but the record it names has
+> *two* fields, and the digest that guards against habituation (§3.5.2's
+> *warn* row) is only as strong as `candidate_value`'s ability to change
+> when the underlying state changes. A `candidate_value` built from
+> `dep_decl` alone is blind to a violation whose only change is
+> `dep_decl_schema_version`: two distinct group mutations that hold
+> `dep_decl`'s raw text constant (e.g. baseline `schema_version = 0`,
+> refresh 1 flips it to `1`, refresh 2 later flips the still-unresolved
+> baseline to `2`) would render byte-identical `candidate_value`s and
+> collapse to the same digest — the second, genuinely new mutation would
+> be misreported as a recurring alarm, exactly the failure mode §3.5.3's
+> canonical-digest clause exists to prevent. The lockstep group MUST
+> therefore be treated as a closed-field-set record under the same method
+> as `attestation`/`rekor` above, not as a scalar: `candidate_value` (and
+> `baseline_value`) is the two members' raw values, in the group's
+> declared order (`dep_decl`, `dep_decl_schema_version`), joined by `\x1f`;
+> an absent member renders as the empty string, consistent with the scalar
+> absent-component convention. Because the group is a single record (not a
+> collection of records), no `\x1e`-joined sort/join step applies — the
+> same trivial one-element case as `attestation`/`rekor`. Both
+> implementations MUST produce byte-identical output for the same
+> candidate `(dep_decl, dep_decl_schema_version)` pair; a differential
+> conformance fixture pins this instantiation.
+
 > NORMATIVE (remediation hints required): both the `warn` diagnostic text
 > and the `strict` error text MUST name the two sanctioned exits: revert
 > the mutation upstream, or run `milpa index accept` after out-of-band
