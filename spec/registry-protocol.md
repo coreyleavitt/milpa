@@ -1353,6 +1353,59 @@ part of `spec/errors.md` as of this spec-only amendment:
 > (the baseline is frozen while violations persist, so it adds no
 > discriminating information).
 
+> NORMATIVE (canonical rendering for non-scalar candidate values): "the raw
+> document string exactly as served" (above) is well-defined for every
+> scalar-typed field (`content_hash`, `dep_decl`, `schema_version`, and —
+> via its own raw-served capture — `published_at`): the field's literal
+> text has no reformatting margin, so the typed value's string form and the
+> served text coincide. It is **not** well-defined as stated for a field
+> whose order kind compares a *collection* rather than a scalar — today
+> only the `provenances` row (Append-only-multiset, §3.5.1), and the
+> `attestation` row once A6 lifts its staged status. A `candidate_value`
+> naively rendered via each implementation's native `Debug`/`repr` of such
+> a collection is exactly the "value re-formatting" divergence surface the
+> paragraph above warns about — and the divergence is real, not
+> hypothetical (confirmed during `rfc-registry-append-only.md`'s A3/A4b
+> slices: two independent implementations produced different bytes for
+> identical semantic content). This clause fixes it at the root,
+> generically, so any future collection-typed lattice row inherits a
+> defined rendering without a new prose carve-out:
+>
+> For a collection-typed field, `candidate_value` (and `baseline_value`,
+> though it is excluded from the digest per above) is the **canonically
+> sorted, delimiter-joined encoding of each element's own closed field set**,
+> never the language's native collection `Debug`/`repr`/`str`: encode each
+> element as its field values, in the field's declared document order,
+> joined by `\x1f` (ASCII unit separator); join the encoded elements,
+> **sorted lexicographically by their own encoding** (never by document
+> position — record order is itself advisory-mutable for the
+> `provenances` row, §3.5.1, so the digest MUST NOT depend on it), with
+> `\x1e` (ASCII record separator). An absent optional element field renders
+> as the empty string, consistent with the scalar rule above. This is a
+> canonical *re-encoding*, not a re-derivation: every field a `provenance`
+> record carries is itself a validated, unambiguous string with no
+> reformatting margin of its own (§3.3 — `url`/`ref`/`commit_sha` for
+> `git`, `registry`/`repository`/`digest` for `oci`), so the rendering is
+> as honest to "raw as served" as a scalar field's literal text is.
+>
+> Instantiation for `provenances` (live from A4b): each element renders as
+> `git\x1f<url>\x1f<ref>\x1f<commit_sha-or-empty>` or
+> `oci\x1f<registry>\x1f<repository>\x1f<digest>`, per the record's `kind`
+> (§3.3); an unrecognized `kind` (forward-compat skip, §3.3) never reaches
+> this rendering because it is dropped at parse time. Both implementations
+> MUST produce byte-identical output for the same candidate provenance
+> list; a differential conformance fixture pins this (`rfc-registry-append-
+> only.md`'s A4b).
+>
+> Instantiation for `attestation` (deferred to A6, staged per §3.5.1
+> NORMATIVE (staged enforcement)): the attestation record's rendering
+> follows the same method — field order `kind`, `signer`
+> (`author-signed` only, empty for `milpa-vendored`), `bundle_pin`
+> (empty when unset) — a single element, so the sort/join step is
+> trivial, but the delimiter and empty-field convention are the same for
+> consistency. A6 MUST NOT invent a second rendering method when it lifts
+> this row's staged status.
+
 > NORMATIVE (remediation hints required): both the `warn` diagnostic text
 > and the `strict` error text MUST name the two sanctioned exits: revert
 > the mutation upstream, or run `milpa index accept` after out-of-band

@@ -1,0 +1,19 @@
+schema_version 1
+package "bar" {
+    namespace "acme"
+    version "1.0.0" {
+        content_hash "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        provenance {
+            kind "git"
+            url "https://example.com/bar.git"
+            ref "v1.0.0"
+            commit_sha "cafef00dcafef00dcafef00dcafef00dcafef00d"
+        }
+        provenance {
+            kind "oci"
+            registry "ghcr.io"
+            repository "acme/bar"
+            digest "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+    }
+}

@@ -111,7 +111,8 @@ fn index_state_from(schema_version: Option<i64>, index: &Index) -> IndexState {
             }
             if !iv.provenances.is_empty() {
                 let items: Vec<String> = iv.provenances.iter().map(encode_provenance).collect();
-                entry = entry.set("provenances", RawField::new(FieldValue::StrList(items)));
+                let raw = provenance_canonical_raw(&iv.provenances);
+                entry = entry.set("provenances", RawField::with_raw(FieldValue::StrList(items), raw));
             }
             entry = entry.set("yanked", RawField::new(FieldValue::Bool(iv.yanked)));
             if let Some(r) = &iv.yanked_reason {
@@ -151,6 +152,42 @@ fn encode_provenance(p: &milpa_types::Provenance) -> String {
             format!("unrecognized\u{1}{p:?}")
         }
     }
+}
+
+/// Canonical, cross-impl-identical rendering of a provenance multiset for
+/// the §3.5.3 canonical violation digest (NORMATIVE (canonical rendering
+/// for non-scalar candidate values)) — the MUST-RESOLVE item flagged at A3:
+/// `FieldValue::StrList`'s `raw_str()` fallback is Rust's `Debug` format
+/// for `Vec<String>`, which diverges byte-for-byte from Python's
+/// dataclass-tuple `str()` fallback for identical semantic content. Each
+/// record is encoded as `<kind>\x1f<field1>\x1f<field2>\x1f<field3>` in the
+/// record's own declared field order (git: url, ref, commit_sha; oci:
+/// registry, repository, digest; an absent optional field renders as the
+/// empty string); records are sorted lexicographically by their own
+/// encoding (never by document position — order is advisory-mutable,
+/// §3.5.1) and joined with `\x1e`. Mirrors
+/// `index_ratchet_seam.py::_provenance_canonical_raw` byte-for-byte.
+fn provenance_canonical_raw(provenances: &[milpa_types::Provenance]) -> String {
+    use milpa_types::Provenance;
+    let mut encoded: Vec<String> = provenances
+        .iter()
+        .map(|p| match p {
+            Provenance::Git { url, ref_spec, commit_sha } => {
+                format!("git\u{1f}{url}\u{1f}{ref_spec}\u{1f}{}", commit_sha.as_deref().unwrap_or(""))
+            }
+            Provenance::Oci { registry, repository, digest } => {
+                format!("oci\u{1f}{registry}\u{1f}{repository}\u{1f}{digest}")
+            }
+            // registry.rs's index parser only ever constructs Git/Oci provenance
+            // records (§3.3); unreachable here but the match must stay
+            // exhaustive since `Provenance` is a shared closed enum (RFC §4.6).
+            Provenance::Tarball { .. } | Provenance::Local { .. } => {
+                format!("unrecognized\u{1f}{p:?}")
+            }
+        })
+        .collect();
+    encoded.sort();
+    encoded.join("\u{1e}")
 }
 
 fn encode_attestation(att: &milpa_types::EntryAttestation) -> AttestationValue {
@@ -371,7 +408,17 @@ pub fn evaluate_gate(
     let message = format_violation_message(&outcome.violations, &digest, recurring, existing_meta.reported_at.as_deref());
 
     if *policy == TrustPolicy::Strict {
-        return Err(tng(outcome.violations[0].class, format!("{message}\n  index: {url:?}")));
+        // Structured digest (registry-protocol §3.5.3 NORMATIVE (canonical
+        // violation digest)), not embedded-in-message-text — mirrors
+        // Python's `MilpaError(..., digest=digest, ...)` context kwarg
+        // (`index_ratchet_seam.py::evaluate_gate`). See
+        // `CoreError::RatchetViolation`'s doc comment for why this is a
+        // dedicated variant rather than `tng()`'s 2-tuple `Tianguis`.
+        return Err(MilpaError::Core(CoreError::RatchetViolation {
+            code: outcome.violations[0].class,
+            message: format!("{message}\n  index: {url:?}"),
+            digest,
+        }));
     }
 
     // warn: serve the new index (bundle/index/stamp advance as usual); the

@@ -116,6 +116,26 @@ fn strict_dirty_diff_hard_fails_with_primary_slug() {
 }
 
 #[test]
+fn strict_hard_fail_carries_structured_digest() {
+    // §3.5.3 NORMATIVE (canonical violation digest): the strict path must
+    // expose the digest as STRUCTURED data (mirrors Python's
+    // `MilpaError.context["digest"]`), not only embedded in message text —
+    // the conformance differential asserts cross-impl digest equality via
+    // this accessor, not by scraping `err.message()` (this module's error
+    // model asserts on codes/structured fields, never message text).
+    let baseline = index_text(ID1);
+    let candidate = index_text(ID2);
+    let (_, baseline_state) = build_index_state(&baseline).unwrap();
+    let (_, candidate_state) = build_index_state(&candidate).unwrap();
+    let outcome = Baseline::new(baseline_state).check(&candidate_state);
+    let expected_digest = canonical_digest(&outcome.violations);
+
+    let existing_meta = BaselineMeta::default();
+    let err = evaluate_gate(&TrustPolicy::Strict, &candidate, Some(&baseline), &existing_meta, 6_500, "u").unwrap_err();
+    assert_eq!(err.ratchet_digest(), Some(expected_digest.as_str()));
+}
+
+#[test]
 fn strict_rollback_hard_fails_with_rollback_slug() {
     let baseline = format!(
         "schema_version 1\n\
@@ -175,4 +195,85 @@ fn iso_timestamp_matches_known_instant() {
     // 2026-01-01T00:00:00+00:00 in unix seconds.
     let ts = crate::registry::parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
     assert_eq!(iso_timestamp(ts.unix_seconds), "2026-01-01T00:00:00+00:00");
+}
+
+// ---------------------------------------------------------------------------
+// Provenance-multiset canonical digest rendering (A4b MUST-RESOLVE, flagged
+// at A3: the raw-fallback rendering of a provenance-removed violation's
+// candidate_value was impl-specific — Rust's Debug-derive fallback for
+// `FieldValue::StrList` vs Python's dataclass-tuple `str()` fallback. Fixed
+// at the root in `provenance_canonical_raw` (registry-protocol §3.5.3
+// NORMATIVE (canonical rendering for non-scalar candidate values)). The
+// expected hex is ported VERBATIM from
+// `test_index_history_ratchet.py::TestProvenanceCanonicalDigest` — byte
+// equality proves both implementations render the identical candidate text
+// identically, not merely that each is internally consistent.
+// ---------------------------------------------------------------------------
+
+fn provenance_index_text(commit_sha: &str) -> String {
+    format!(
+        "schema_version 1\n\
+         package \"bar\" {{\n\
+         \x20   namespace \"acme\"\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"sha256:{}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://example.com/bar.git\"\n\
+         \x20           ref \"v1.0.0\"\n\
+         \x20           commit_sha \"{commit_sha}\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n",
+        "a".repeat(64)
+    )
+}
+
+#[test]
+fn provenance_in_place_mutation_hand_computed_digest_vector() {
+    let baseline = provenance_index_text("cafef00dcafef00dcafef00dcafef00dcafef00d");
+    let candidate = provenance_index_text("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+    let (_, baseline_state) = build_index_state(&baseline).unwrap();
+    let (_, candidate_state) = build_index_state(&candidate).unwrap();
+    let outcome = Baseline::new(baseline_state).check(&candidate_state);
+
+    assert_eq!(outcome.violations.len(), 1);
+    let v = &outcome.violations[0];
+    assert_eq!(v.class, "TNG-ENTRY-MUTATED");
+    assert_eq!(v.field, "provenances");
+    assert_eq!(v.kind, "provenance-removed");
+
+    let expected_candidate_value =
+        "git\u{1f}https://example.com/bar.git\u{1f}v1.0.0\u{1f}deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    assert_eq!(v.candidate_value, expected_candidate_value);
+
+    let digest = canonical_digest(&outcome.violations);
+    assert_eq!(
+        digest,
+        "2d659ca5067920f2faea49046c99caf525fc8c8ce85726554193f340d3ab3c78"
+    );
+}
+
+#[test]
+fn provenance_append_only_no_violation() {
+    let baseline = provenance_index_text("cafef00dcafef00dcafef00dcafef00dcafef00d");
+    let mut candidate = provenance_index_text("cafef00dcafef00dcafef00dcafef00dcafef00d");
+    // Append a second (oci) provenance record before the closing braces.
+    let insertion = format!(
+        "\x20       provenance {{\n\
+         \x20           kind \"oci\"\n\
+         \x20           registry \"ghcr.io\"\n\
+         \x20           repository \"acme/bar\"\n\
+         \x20           digest \"sha256:{}\"\n\
+         \x20       }}\n\
+         \x20   }}\n}}\n",
+        "b".repeat(64)
+    );
+    candidate = candidate.replacen("\x20   }\n}\n", &insertion, 1);
+
+    let (_, baseline_state) = build_index_state(&baseline).unwrap();
+    let (_, candidate_state) = build_index_state(&candidate).unwrap();
+    let outcome = Baseline::new(baseline_state).check(&candidate_state);
+    assert!(outcome.violations.is_empty());
+    assert!(outcome.advanced);
 }

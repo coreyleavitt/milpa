@@ -185,8 +185,17 @@ verified index is a valid *successor* of the previous one. Freshness
       load_index_with_history — seam wiring covered by A3's unit/CLI
       tests; A4b may revisit if differential needs full-path fidelity.
       Gates: pytest 2851 + rust workspace/conformance green.
-- [ ] A4b — fixture matrix + differential (slugs AND payload ordering AND
-      canonical digests).
+- [x] A4b (2026-07-10) — fixture matrix 380–399 (each pins a distinct
+      §3.5 clause; 399 = the literal aaa/zzz worked example w/ digest) +
+      differential digest equality via expected/digest + expected/recurring
+      runner keys (structured digest source: MilpaError.context["digest"] /
+      new CoreError::RatchetViolation{digest} — Rust previously exposed the
+      digest only in message text). MUST-RESOLVE closed at the root: new
+      §3.5.3 NORMATIVE canonical rendering for non-scalar candidate_value
+      (sorted \x1f/\x1e element encodings, never repr/Debug; provenances
+      instantiated now, attestation named-deferred to A6); both seams
+      supply explicit raw; hand-derived vector 2d659ca5… pinned in both
+      unit suites + fixture 386. Gates: pytest 2874 + rust workspace green.
 - [ ] A5 — yank selection (both lookup paths), notices, NO-SATISFYING
       naming, fixtures.
 - [ ] A6 — post-Part-2-P2: attestation/rekor/epoch rows, no-rekor test

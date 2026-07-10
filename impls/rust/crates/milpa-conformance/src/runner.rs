@@ -2702,11 +2702,15 @@ fn run_index_trust_fixture(fx: &Fixture) -> Result<Produced, String> {
     // file I/O — then `expected/baseline-state` / `expected/baseline` assert
     // the post-run `.baseline` sidecar bytes.
     let mut baseline_post_state_err: Option<String> = None;
+    let mut got_digest: Option<String> = None;
+    let mut got_recurring: Option<bool> = None;
     if dir.join("baseline-seed").is_dir() {
         match run_index_history_ratchet(dir, &env) {
-            Ok((ratchet_outcome, post_state_err)) => {
-                got_outcome = ratchet_outcome;
-                baseline_post_state_err = post_state_err;
+            Ok(r) => {
+                got_outcome = r.outcome;
+                baseline_post_state_err = r.post_state_err;
+                got_digest = r.digest;
+                got_recurring = r.recurring;
             }
             Err(e) => return Err(e),
         }
@@ -2720,7 +2724,83 @@ fn run_index_trust_fixture(fx: &Fixture) -> Result<Produced, String> {
     if let Some(msg) = baseline_post_state_err {
         return Err(msg);
     }
+
+    // A4b: canonical violation digest cross-impl equality (registry-protocol
+    // §3.5.3 NORMATIVE (canonical violation digest)) — `expected/digest`
+    // is an exact hex match, present only on fixtures where the spec fixes
+    // the bytes. Sourced from the STRUCTURED `MilpaError::ratchet_digest()`
+    // on the strict path, or scanned out of `evaluate_gate`'s own
+    // `digest=<hex>` / `digest unchanged: <hex>` diagnostic text on the warn
+    // path (the only observable surface for a non-erroring outcome).
+    let digest_expected_path = dir.join("expected").join("digest");
+    if digest_expected_path.is_file() {
+        let expected_digest = std::fs::read_to_string(&digest_expected_path)
+            .map(|s| s.trim().to_string())
+            .map_err(|e| format!("cannot read expected/digest: {e}"))?;
+        match &got_digest {
+            Some(d) if *d == expected_digest => {}
+            Some(d) => {
+                return Err(format!(
+                    "digest mismatch:\n  expected: {expected_digest:?}\n  actual:   {d:?}"
+                ))
+            }
+            None => return Err("expected/digest declared but no digest was observable".to_string()),
+        }
+    }
+
+    // A4b: recurring-vs-new habituation-defense marker (§3.5.2 NORMATIVE
+    // (per-policy behavior), the `warn` row) — `expected/recurring` is
+    // "true" or "false", scanned from the same warn diagnostic text.
+    let recurring_expected_path = dir.join("expected").join("recurring");
+    if recurring_expected_path.is_file() {
+        let expected_recurring_str = std::fs::read_to_string(&recurring_expected_path)
+            .map(|s| s.trim().to_string())
+            .map_err(|e| format!("cannot read expected/recurring: {e}"))?;
+        let expected_recurring = match expected_recurring_str.as_str() {
+            "true" => true,
+            "false" => false,
+            other => return Err(format!("invalid expected/recurring marker: {other:?}")),
+        };
+        match got_recurring {
+            Some(r) if r == expected_recurring => {}
+            Some(r) => {
+                return Err(format!(
+                    "recurring mismatch:\n  expected: {expected_recurring:?}\n  actual:   {r:?}"
+                ))
+            }
+            None => {
+                return Err(
+                    "expected/recurring declared but no warn diagnostic was observable".to_string(),
+                )
+            }
+        }
+    }
+
     Ok(Produced::IndexTrustPass { outcome: got_outcome })
+}
+
+/// Scan diagnostic text for a contiguous 64-character lowercase-hex run —
+/// the canonical violation digest (§3.5.3), the only such token the
+/// warn/strict diagnostic text ever contains (message wording never embeds
+/// any other sha256-shaped value — content_hash values are not printed).
+fn extract_digest_from_message(msg: &str) -> Option<String> {
+    let bytes: Vec<char> = msg.chars().collect();
+    let is_hex = |c: char| c.is_ascii_digit() || ('a'..='f').contains(&c);
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_hex(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && is_hex(bytes[i]) {
+                i += 1;
+            }
+            if i - start == 64 {
+                return Some(bytes[start..i].iter().collect());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 /// A4a-rs: run the append-only ratchet (registry-protocol §3.5.2) for an
@@ -2747,10 +2827,25 @@ fn run_index_trust_fixture(fx: &Fixture) -> Result<Produced, String> {
 ///   `MILPA_INDEX_HISTORY_MANIFEST` — manifest-level `index-history` policy
 ///                                    (absent → "warn", the spec default)
 ///   `MILPA_INDEX_HISTORY`          — env override (mirrors `MILPA_INDEX_TRUST`)
+///
+/// A4b adds `digest`/`recurring` to the result (§3.5.3 differential):
+/// `digest` is the structured `MilpaError::ratchet_digest()` on the strict
+/// error path, or scanned out of `GateDecision::warn_message` text on the
+/// warn path (`None` on a clean/TOFU/off outcome — nothing to report);
+/// `recurring` is scanned from the same warn text (`None` off the strict/
+/// clean paths — recurring-vs-new is a warn-only habituation concept,
+/// §3.5.2's per-policy table).
+struct RatchetRunResult {
+    outcome: String,
+    digest: Option<String>,
+    recurring: Option<bool>,
+    post_state_err: Option<String>,
+}
+
 fn run_index_history_ratchet(
     dir: &Path,
     env: &std::collections::HashMap<String, String>,
-) -> Result<(String, Option<String>), String> {
+) -> Result<RatchetRunResult, String> {
     use milpa_core::ratchet::{ENTRY_MUTATED, ROLLBACK, ROOT_MUTATED};
     use milpa_core::{baseline_sidecar_paths, evaluate_gate, parse_baseline_meta, BaselineMeta, TrustPolicy};
 
@@ -2829,8 +2924,13 @@ fn run_index_history_ratchet(
 
     let now_unix: i64 = 0; // deterministic; only feeds established_at/reported_at (not byte-checked here)
 
+    let mut digest: Option<String> = None;
+    let mut recurring: Option<bool> = None;
     let outcome = match evaluate_gate(&policy, &candidate_text, baseline_text.as_deref(), &existing_meta, now_unix, &url) {
-        Err(e) => format!("error:{}", e.code()),
+        Err(e) => {
+            digest = e.ratchet_digest().map(|s| s.to_string());
+            format!("error:{}", e.code())
+        }
         Ok(decision) => {
             // Apply the writes evaluate_gate authorized (mirrors
             // index_cache.rs's apply_ratchet_writes — inlined here since
@@ -2846,6 +2946,8 @@ fn run_index_history_ratchet(
             match &decision.warn_message {
                 None => "trusted".to_string(),
                 Some(msg) => {
+                    digest = extract_digest_from_message(msg);
+                    recurring = Some(msg.contains("recurring (first reported"));
                     let mut slug = None;
                     for candidate in [ROOT_MUTATED, ROLLBACK, ENTRY_MUTATED] {
                         if msg.contains(&format!("({candidate})")) {
@@ -2866,7 +2968,7 @@ fn run_index_history_ratchet(
     // expected/baseline exact bytes, against the post-run .baseline sidecar.
     let post_state_err = check_ratchet_baseline_post_state(dir, &seed_dir, &baseline_path);
 
-    Ok((outcome, post_state_err))
+    Ok(RatchetRunResult { outcome, digest, recurring, post_state_err })
 }
 
 /// A4a-rs: byte-compare the post-run `.baseline` sidecar (at `baseline_path`)

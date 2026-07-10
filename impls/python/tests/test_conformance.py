@@ -1868,6 +1868,8 @@ def _execute_index_trust_fixture(
 
         # Capture stderr to detect warn outcome (warn emits a line with the slug).
         stderr_buf = io.StringIO()
+        got_digest: str | None = None
+        got_recurring: bool | None = None
         try:
             with contextlib.redirect_stderr(stderr_buf):
                 _load_index_for_verb(minimal_env, project_dir)
@@ -1902,8 +1904,21 @@ def _execute_index_trust_fixture(
                     if f"({slug_candidate})" in stderr_content:
                         got_outcome = f"warn:{slug_candidate}"
                         break
+                # A4b: canonical violation digest + recurring-vs-new marker
+                # (§3.5.3), scanned from the SAME diagnostic text the slug
+                # above came from — the only observable surface for a
+                # non-erroring (warn) outcome (registry-protocol §3.5.3
+                # NORMATIVE (canonical violation digest); §3.5.2's warn row).
+                got_digest = _extract_digest_from_text(stderr_content)
+                got_recurring = "recurring (first reported" in stderr_content
         except _ME as e:
             got_outcome = f"error:{e.slug}"
+            # A4b: on the strict path the digest rides the error's structured
+            # context (index_ratchet_seam.py's `evaluate_gate` passes
+            # `digest=digest` into `MilpaError(...)`), never message text —
+            # mirrors Rust's `MilpaError::ratchet_digest()` accessor.
+            digest_ctx = e.context.get("digest")
+            got_digest = digest_ctx if isinstance(digest_ctx, str) else None
     finally:
         for k, v in saved.items():
             if v is None:
@@ -1924,7 +1939,43 @@ def _execute_index_trust_fixture(
     if baseline_msg is not None:
         return ("fail", baseline_msg)
 
+    # A4b: expected/digest (exact hex match) and expected/recurring
+    # ("true"/"false") — optional, present only where the spec fixes the
+    # bytes or the behavior is under differential test.
+    digest_file = fixture_dir / "expected" / "digest"
+    if digest_file.is_file():
+        expected_digest = digest_file.read_text(encoding="utf-8").strip()
+        if got_digest != expected_digest:
+            return (
+                "fail",
+                f"digest mismatch:\n  expected: {expected_digest!r}\n  actual:   {got_digest!r}",
+            )
+
+    recurring_file = fixture_dir / "expected" / "recurring"
+    if recurring_file.is_file():
+        marker = recurring_file.read_text(encoding="utf-8").strip()
+        if marker not in ("true", "false"):
+            return ("fail", f"invalid expected/recurring marker: {marker!r}")
+        expected_recurring = marker == "true"
+        if got_recurring != expected_recurring:
+            return (
+                "fail",
+                f"recurring mismatch:\n  expected: {expected_recurring!r}\n  actual:   {got_recurring!r}",
+            )
+
     return ("pass", "")
+
+
+def _extract_digest_from_text(text: str) -> str | None:
+    """Scan diagnostic text for a contiguous 64-character lowercase-hex run —
+    the canonical violation digest (§3.5.3), the only such token the
+    warn/strict diagnostic text ever contains (message wording never embeds
+    any other sha256-shaped value — content_hash values are not printed).
+    Mirrors the Rust runner's ``extract_digest_from_message``."""
+    import re
+
+    m = re.search(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", text)
+    return m.group(0) if m else None
 
 
 # ---------------------------------------------------------------------------

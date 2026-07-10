@@ -33,6 +33,7 @@ Covers (per the A2d test plan):
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -45,7 +46,8 @@ from milpa.errors import (
     MilpaError,
 )
 from milpa.index_cache import DEFAULT_TTL_SECONDS, cache_path_for, load_index
-from milpa.index_ratchet_seam import parse_baseline_meta
+from milpa.index_ratchet_seam import build_index_state, parse_baseline_meta
+from milpa.ratchet import Baseline, canonical_digest
 from milpa.index_trust import (
     IndexTrustConfig,
     MockVerifier,
@@ -282,6 +284,24 @@ class TestStrictHardFail:
         assert violations[0]["version"] == "1.0.0"
         assert "digest" in exc_info.value.context
 
+    def test_strict_digest_matches_independently_computed_outcome(self, tmp_path: Path) -> None:
+        """The digest riding the strict MilpaError's context (structured
+        data, mirrors Rust's ``MilpaError::ratchet_digest()``) must equal
+        the digest computed directly from the same baseline/candidate pair
+        via the pure engine — proves the seam's error path doesn't recompute
+        or reformat it differently from the diagnostic path."""
+        get1, _ = make_get(V1_ONLY)
+        load_index(URL, tmp_path, get1, 100, 1000, index_history_policy="strict")
+
+        _, baseline_state = build_index_state(V1_ONLY)
+        _, candidate_state = build_index_state(V1_MUTATED)
+        expected_digest = canonical_digest(Baseline(baseline_state).check(candidate_state).violations)
+
+        get2, _ = make_get(V1_MUTATED)
+        with pytest.raises(MilpaError) as exc_info:
+            load_index(URL, tmp_path, get2, 100, 1101, index_history_policy="strict")
+        assert exc_info.value.context["digest"] == expected_digest
+
 
 # ---------------------------------------------------------------------------
 # Recurring vs. new violation digest (habituation defense)
@@ -324,6 +344,103 @@ class TestRecurringVsNewDigest:
 
         meta_after_second = parse_baseline_meta(_meta_file(tmp_path).read_text(encoding="utf-8"))
         assert meta_after_second.reported_digest != meta_after_first.reported_digest
+
+
+# ---------------------------------------------------------------------------
+# Provenance-multiset canonical digest rendering (A4b MUST-RESOLVE, flagged
+# at A3: the raw-fallback rendering of a provenance-removed violation's
+# candidate_value was impl-specific — Python's dataclass-tuple str()
+# fallback vs Rust's Debug-derive fallback for FieldValue::StrList. Fixed at
+# the root in index_ratchet_seam.py's _provenance_canonical_raw (registry-
+# protocol §3.5.3 NORMATIVE (canonical rendering for non-scalar candidate
+# values)). This hand-assembles the expected digest input from the spec's
+# algorithm directly (not by calling canonical_digest and comparing to
+# itself) — same style as test_ratchet.py's hand-computed vectors — and the
+# SAME hex is ported verbatim into ratchet_tests.rs and into conformance
+# fixture 386's expected/digest (cross-impl differential pin).
+# ---------------------------------------------------------------------------
+
+
+class TestProvenanceCanonicalDigest:
+    def test_in_place_mutation_hand_computed_digest_vector(self) -> None:
+        baseline_text = """schema_version 1
+package "bar" {
+    namespace "acme"
+    version "1.0.0" {
+        content_hash "sha256:%s"
+        provenance {
+            kind "git"
+            url "https://example.com/bar.git"
+            ref "v1.0.0"
+            commit_sha "cafef00dcafef00dcafef00dcafef00dcafef00d"
+        }
+    }
+}
+""" % ("a" * 64)
+        candidate_text = baseline_text.replace(
+            "cafef00dcafef00dcafef00dcafef00dcafef00d",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        )
+        _, baseline_state = build_index_state(baseline_text)
+        _, candidate_state = build_index_state(candidate_text)
+        outcome = Baseline(baseline_state).check(candidate_state)
+
+        assert len(outcome.violations) == 1
+        v = outcome.violations[0]
+        assert v.class_ == TNG_ENTRY_MUTATED
+        assert v.field == "provenances"
+        assert v.kind == "provenance-removed"
+
+        candidate_value = (
+            "git\x1fhttps://example.com/bar.git\x1fv1.0.0"
+            "\x1fdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        )
+        assert v.candidate_value == candidate_value
+
+        expected_line = (
+            "TNG-ENTRY-MUTATED\tacme\tbar\t1.0.0\tprovenances\tprovenance-removed\t"
+            + candidate_value
+            + "\n"
+        )
+        expected_digest = hashlib.sha256(expected_line.encode("utf-8")).hexdigest()
+        assert expected_digest == (
+            "2d659ca5067920f2faea49046c99caf525fc8c8ce85726554193f340d3ab3c78"
+        )
+        assert canonical_digest(outcome.violations) == expected_digest
+
+    def test_append_only_no_violation(self) -> None:
+        """A NEW provenance record appended to the multiset is legal — the
+        removal check only fires when a baseline record's encoding is
+        missing from the candidate (§3.5.1 Append-only-multiset row)."""
+        baseline_text = """schema_version 1
+package "bar" {
+    namespace "acme"
+    version "1.0.0" {
+        content_hash "sha256:%s"
+        provenance {
+            kind "git"
+            url "https://example.com/bar.git"
+            ref "v1.0.0"
+            commit_sha "cafef00dcafef00dcafef00dcafef00dcafef00d"
+        }
+    }
+}
+""" % ("a" * 64)
+        candidate_text = baseline_text.replace(
+            "    }\n}\n",
+            '        provenance {\n'
+            '            kind "oci"\n'
+            '            registry "ghcr.io"\n'
+            '            repository "acme/bar"\n'
+            f'            digest "sha256:{"b" * 64}"\n'
+            "        }\n"
+            "    }\n}\n",
+        )
+        _, baseline_state = build_index_state(baseline_text)
+        _, candidate_state = build_index_state(candidate_text)
+        outcome = Baseline(baseline_state).check(candidate_state)
+        assert outcome.violations == []
+        assert outcome.advanced is True
 
 
 # ---------------------------------------------------------------------------

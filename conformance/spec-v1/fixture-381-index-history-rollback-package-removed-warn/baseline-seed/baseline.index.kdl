@@ -1,0 +1,23 @@
+schema_version 1
+package "bar" {
+    namespace "acme"
+    version "1.0.0" {
+        content_hash "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        provenance {
+            kind "git"
+            url "https://example.com/bar.git"
+            ref "v1.0.0"
+        }
+    }
+}
+package "baz" {
+    namespace "acme"
+    version "1.0.0" {
+        content_hash "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        provenance {
+            kind "git"
+            url "https://example.com/baz.git"
+            ref "v1.0.0"
+        }
+    }
+}

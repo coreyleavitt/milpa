@@ -1,0 +1,12 @@
+schema_version 1
+package "aaa" {
+    namespace "ns"
+    version "1.0.0" {
+        content_hash "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        provenance {
+            kind "git"
+            url "https://example.com/aaa.git"
+            ref "v1.0.0"
+        }
+    }
+}

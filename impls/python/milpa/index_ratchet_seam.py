@@ -69,7 +69,7 @@ from milpa.ratchet import (
     Violation,
     canonical_digest,
 )
-from milpa.registry import Index, parse_index
+from milpa.registry import GitIndexProvenance, Index, OciIndexProvenance, parse_index
 
 # ---------------------------------------------------------------------------
 # Candidate/baseline text -> (typed Index, ratchet IndexState)
@@ -90,6 +90,32 @@ def build_index_state(text: str) -> tuple[Index, IndexState]:
     return index, _index_state_from(doc, index)
 
 
+def _provenance_canonical_raw(provenances: tuple[object, ...]) -> str:
+    """Canonical, cross-impl-identical rendering of a provenance multiset for
+    the §3.5.3 canonical violation digest (NORMATIVE (canonical rendering
+    for non-scalar candidate values)) — the MUST-RESOLVE item flagged at A3:
+    a naive ``str(value)``/``repr(value)`` fallback renders Python
+    dataclasses one way and Rust's ``Debug`` derive another way, for
+    identical semantic content. Each record is encoded as
+    ``<kind>\\x1f<field1>\\x1f<field2>\\x1f<field3>`` in the record's own
+    declared field order (git: url, ref, commit_sha; oci: registry,
+    repository, digest; an absent optional field renders as the empty
+    string); records are sorted lexicographically by their own encoding
+    (never by document position — order is advisory-mutable, §3.5.1) and
+    joined with ``\\x1e``. Mirrors
+    ``index_ratchet_seam.rs::provenance_canonical_raw`` byte-for-byte."""
+    encoded: list[str] = []
+    for p in provenances:
+        if isinstance(p, GitIndexProvenance):
+            encoded.append("git\x1f" + p.url + "\x1f" + p.ref + "\x1f" + (p.commit_sha or ""))
+        elif isinstance(p, OciIndexProvenance):
+            encoded.append("oci\x1f" + p.registry + "\x1f" + p.repository + "\x1f" + p.digest)
+        else:  # pragma: no cover — parse_index never constructs other kinds (§3.3)
+            encoded.append("unrecognized\x1f" + repr(p))
+    encoded.sort()
+    return "\x1e".join(encoded)
+
+
 def _index_state_from(doc: KdlDocument, index: Index) -> IndexState:
     state: IndexState = {
         ROOT_KEY: RatchetEntry(fields={"schema_version": RawField(value=_raw_schema_version(doc))}),
@@ -108,7 +134,9 @@ def _index_state_from(doc: KdlDocument, index: Index) -> IndexState:
                     ),
                     "dep_decl": RawField(value=iv.dep_decl),
                     "dep_decl_schema_version": RawField(value=iv.dep_decl_schema_version),
-                    "provenances": RawField(value=iv.provenances),
+                    "provenances": RawField(
+                        value=iv.provenances, raw=_provenance_canonical_raw(iv.provenances)
+                    ),
                     "yanked": RawField(value=iv.yanked),
                     "yanked_reason": RawField(value=iv.yanked_reason),
                 }

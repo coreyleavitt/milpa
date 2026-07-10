@@ -44,6 +44,15 @@ pub enum CoreError {
         sources_a: Vec<String>,
         sources_b: Vec<String>,
     },
+    /// Append-only ratchet violation under `index-history "strict"`
+    /// (`TNG-INDEX-ROOT-MUTATED` / `TNG-INDEX-ROLLBACK` / `TNG-ENTRY-MUTATED`;
+    /// registry-protocol §3.5.2/§3.5.3, `rfc-registry-append-only.md` A4b).
+    /// Carries the canonical violation digest (§3.5.3 NORMATIVE (canonical
+    /// violation digest)) as structured data — never scraped from message
+    /// text, per this module's design note above — so conformance fixtures
+    /// can assert cross-impl digest equality on the `strict` path the same
+    /// way Python's `MilpaError.context["digest"]` already does.
+    RatchetViolation { code: &'static str, message: String, digest: String },
 }
 
 impl CoreError {
@@ -57,6 +66,7 @@ impl CoreError {
             | CoreError::Workspace(c, _)
             | CoreError::DepDecl(c, _) => c,
             CoreError::FlagConflict { .. } => "RESOLVE-FLAG-CONFLICT",
+            CoreError::RatchetViolation { code, .. } => code,
         }
     }
 
@@ -76,6 +86,7 @@ impl CoreError {
                 // all diagnostic info; conformance only checks code(), not message.
                 "mutually exclusive flags co-active after fixpoint"
             }
+            CoreError::RatchetViolation { message, .. } => message,
         }
     }
 
@@ -327,6 +338,19 @@ impl MilpaError {
             MilpaError::Solver(e) => e.code(),
             MilpaError::Fetch(e) => e.code(),
             MilpaError::Core(e) => e.code(),
+        }
+    }
+
+    /// The canonical violation digest (§3.5.3 NORMATIVE (canonical violation
+    /// digest)), when this error is a `strict`-policy append-only ratchet
+    /// violation (`CoreError::RatchetViolation`). `None` for every other
+    /// error — mirrors Python's `MilpaError.context.get("digest")`, as
+    /// structured data rather than a message-text scrape (see
+    /// `CoreError::RatchetViolation`'s doc comment).
+    pub fn ratchet_digest(&self) -> Option<&str> {
+        match self {
+            MilpaError::Core(CoreError::RatchetViolation { digest, .. }) => Some(digest.as_str()),
+            _ => None,
         }
     }
 }
