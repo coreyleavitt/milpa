@@ -117,9 +117,14 @@ verified index is a valid *successor* of the previous one. Freshness
       + Appendix B + normative item 19; Part-1 RFC note. Slugs referenced
       as "(lands with implementation slice)". Gate: pytest green.
 - [x] A2a (2026-07-10) — Python parse ext: IndexVersion +published_at/yanked/yanked_at/yanked_reason (typed, malformed→None/False no-diagnostic posture); 18 tests; raw-string retention deliberately NOT added (ratchet raw candidate_value = A2b/A2d extraction concern). Gate: pytest 2736 green.
-- [ ] A2b — `ratchet.py` standalone (RatchetOutcome, disjoint tags,
-      reserved root key, lockstep groups, composite ordering, canonical
-      digest) + in-memory unit tests.
+- [x] A2b (2026-07-10) — `ratchet.py` standalone: Baseline.check →
+      RatchetOutcome(violations, advanced, transitions); RawField(value,
+      raw) input shape (caller supplies raw-as-served — A2d seam concern);
+      staged=True rows (attestation/rekor/epoch) excluded by default,
+      include_staged=True proves A6-readiness; whole-entry rollback
+      convention (field="", kind=frozen-unset) PINNED IN SPEC §3.5.3 by
+      orchestrator; 30 in-memory tests incl. hand-computed digest vectors.
+      Gate: pytest 2766 green.
 - [ ] A2c — `index-history` axis plumbing (follow `_build_index_trust`
       pattern; `MilpaEnv.index_trust_config` is dead code — don't inherit).
 - [ ] A2d — seam wiring + baseline lifecycle (parse-at-gate refactor BOTH

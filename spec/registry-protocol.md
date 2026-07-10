@@ -1327,6 +1327,15 @@ part of `spec/errors.md` as of this spec-only amendment:
 > and the incident-response distinction between them (a rollback suggests
 > takedown; a `content_hash` swap suggests live substitution; an
 > attestation downgrade may be a backfill-tool bug).
+>
+> Whole-entry *presence* violations (a baseline version or package node
+> absent from the candidate — the presence component of §3.5.1's product
+> order) are reported with `field` = the empty string and
+> `kind = frozen-unset`: presence is a Frozen-class member with no field
+> of its own, so the reserved empty field name mirrors the reserved
+> empty entry key used for root fields. This rendering is normative —
+> the canonical violation digest below hashes these components, so both
+> implementations MUST emit identical bytes for the same rollback.
 
 > NORMATIVE (canonical violation digest): the habituation defense of
 > §3.5.2's *warn* row depends on both implementations computing the *same*
