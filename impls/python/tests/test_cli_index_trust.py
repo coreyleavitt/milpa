@@ -376,6 +376,33 @@ class TestShowIndexTrustManifestPolicy:
             f"no manifest → default policy must be warn:\n{out}"
         )
 
+    def test_broken_manifest_hard_fails_not_swallowed(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """CR5: a syntactically-broken milpa.kdl must hard-fail, not degrade to warn.
+
+        The manifest-absent degrade (``_manifest_absent`` / ``MAN-NO-MANIFEST``)
+        is scoped to "no milpa.kdl at all" — a PRESENT-but-broken manifest is a
+        genuine error and must propagate as ``MAN-KDL-SYNTAX``, not be swallowed
+        into a normal-looking ``policy: warn`` line.
+        """
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        (project_dir / "milpa.kdl").write_text("this is not valid { kdl\n", encoding="utf-8")
+
+        from milpa.cli import cmd_show_index_trust
+        with pytest.raises(MilpaError) as exc_info:
+            cmd_show_index_trust(project_dir)
+        assert exc_info.value.slug == "MAN-KDL-SYNTAX", (
+            f"CR5: broken manifest must hard-fail with MAN-KDL-SYNTAX, not be "
+            f"swallowed to warn; got slug={exc_info.value.slug!r}"
+        )
+        out = capsys.readouterr().out
+        assert "policy:" not in out, (
+            f"CR5: must not print a normal-looking status block on a broken "
+            f"manifest; got:\n{out}"
+        )
+
     def test_off_in_manifest_shown_as_off(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

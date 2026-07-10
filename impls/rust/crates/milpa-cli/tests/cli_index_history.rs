@@ -310,3 +310,40 @@ fn fetch_warn_dirty_refetch_makes_status_pending() {
     assert_eq!(status_code, 1, "a pending violation makes status exit 1");
     assert!(stdout.contains("pending:           yes"), "stdout:\n{stdout}");
 }
+
+// ---------------------------------------------------------------------------
+// CR5 — a syntactically-broken milpa.kdl must hard-fail, not degrade to warn
+// ---------------------------------------------------------------------------
+//
+// `index_verb_setup`'s manifest-absent degrade (main.rs) matches ONLY
+// `MAN-NO-MANIFEST`; every other manifest error (e.g. `MAN-KDL-SYNTAX` here)
+// must propagate as a real hard failure — not be swallowed into a
+// normal-looking `policy: warn` status block. Coverage gap identified during
+// the CR5 review of the Python sibling loaders (already correct in Rust by
+// construction; this closes the missing test).
+
+#[test]
+fn status_hard_fails_on_broken_manifest() {
+    let h = setup(None, 'a');
+    std::fs::write(h.proj.join("milpa.kdl"), "this is not valid { kdl\n").unwrap();
+    let (code, stdout, stderr) = run(&h, &["index", "status"], &[]);
+    assert_eq!(code, 1, "stderr:\n{stderr}");
+    assert!(stderr.contains("MAN-KDL-SYNTAX"), "stderr:\n{stderr}");
+    assert!(
+        !stdout.contains("policy:"),
+        "broken manifest must not print a normal status block:\n{stdout}"
+    );
+}
+
+#[test]
+fn accept_hard_fails_on_broken_manifest() {
+    let h = setup(None, 'a');
+    std::fs::write(h.proj.join("milpa.kdl"), "this is not valid { kdl\n").unwrap();
+    let (code, _stdout, stderr) = run(&h, &["index", "accept"], &[]);
+    assert_eq!(code, 1, "stderr:\n{stderr}");
+    assert!(stderr.contains("MAN-KDL-SYNTAX"), "stderr:\n{stderr}");
+    assert!(
+        !h.cache.exists(),
+        "accept must not write a baseline when the manifest is broken"
+    );
+}

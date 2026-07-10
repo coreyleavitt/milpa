@@ -465,6 +465,90 @@ class TestMemberDirDelegation:
 
 
 # ---------------------------------------------------------------------------
+# CR5 — a syntactically-broken milpa.kdl must hard-fail, not degrade to warn
+# ---------------------------------------------------------------------------
+
+
+class TestBrokenManifestHardFails:
+    """``index status`` / ``index accept`` must propagate a real ``MAN-*``
+    manifest error instead of degrading it to ``policy: warn`` and printing a
+    normal-looking status block.
+
+    ``_load_manifest_index_history_policy``'s degrade-to-warn is scoped to a
+    genuinely ABSENT manifest (``MAN-NO-MANIFEST``, spec/cli-contract.md
+    §5.12's soft-fail carve-out is about corrupt LOCAL TRUST STATE — a corrupt
+    baseline — not manifest-parse errors). A PRESENT-but-broken ``milpa.kdl``
+    (``MAN-KDL-SYNTAX`` here) must hard-fail like every other manifest error
+    (§5 NORMATIVE: "On any failure (manifest error, …) … exit 1").
+    """
+
+    def _write_broken_manifest(self, project_dir: Path) -> None:
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "milpa.kdl").write_text("this is not valid { kdl\n", encoding="utf-8")
+
+    def test_status_hard_fails_on_broken_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        project_dir = tmp_path / "proj"
+        self._write_broken_manifest(project_dir)
+        index_path = tmp_path / "index.kdl"
+        _write_index(index_path)
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+        monkeypatch.setenv("MILPA_INDEX_URL", f"file://{index_path}")
+        monkeypatch.delenv("MILPA_INDEX_HISTORY", raising=False)
+        monkeypatch.delenv("MILPA_INDEX_TRUST", raising=False)
+
+        exit_code = _run(project_dir, "status")
+        out = capsys.readouterr()
+        assert exit_code == 1
+        assert "milpa-error: MAN-KDL-SYNTAX" in out.err
+        assert "policy:" not in out.out, (
+            f"CR5: broken manifest must not be swallowed into a normal status "
+            f"block; got:\n{out.out}"
+        )
+
+    def test_accept_hard_fails_on_broken_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        project_dir = tmp_path / "proj"
+        self._write_broken_manifest(project_dir)
+        index_path = tmp_path / "index.kdl"
+        _write_index(index_path)
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+        monkeypatch.setenv("MILPA_INDEX_URL", f"file://{index_path}")
+        monkeypatch.delenv("MILPA_INDEX_HISTORY", raising=False)
+        monkeypatch.delenv("MILPA_INDEX_TRUST", raising=False)
+
+        exit_code = _run(project_dir, "accept")
+        out = capsys.readouterr()
+        assert exit_code == 1
+        assert "milpa-error: MAN-KDL-SYNTAX" in out.err
+        assert not (tmp_path / "cache").exists(), (
+            "CR5: accept must not write a baseline when the manifest is broken"
+        )
+
+    def test_status_still_degrades_to_warn_on_genuinely_absent_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Regression guard for the CR5 narrowing: a directory with NO
+        milpa.kdl/.nimble at all must still degrade to the documented
+        ``warn`` default, not start hard-failing too."""
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir(parents=True)
+        index_path = tmp_path / "index.kdl"
+        _write_index(index_path)
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+        monkeypatch.setenv("MILPA_INDEX_URL", f"file://{index_path}")
+        monkeypatch.delenv("MILPA_INDEX_HISTORY", raising=False)
+        monkeypatch.delenv("MILPA_INDEX_TRUST", raising=False)
+
+        exit_code = _run(project_dir, "status")
+        out = capsys.readouterr()
+        assert exit_code == 0
+        assert "policy:            warn" in out.out
+
+
+# ---------------------------------------------------------------------------
 # --no-index -> hard error
 # ---------------------------------------------------------------------------
 

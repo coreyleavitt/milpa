@@ -56,6 +56,7 @@ from milpa.errors import (
     MAN_MIRROR_EDITABLE_PROVENANCE,
     MAN_MUTATE_FILE_NOT_FOUND,
     MAN_MUTATE_WORKSPACE_REFUSED,
+    MAN_NO_MANIFEST,
     MAN_REMOVE_DEP_ABSENT,
     MILPA_INDEX_UNREACHABLE,
     MILPA_INTERNAL,
@@ -559,6 +560,24 @@ def _build_dep_decl_store(no_index: bool = False) -> object | None:
 # ---------------------------------------------------------------------------
 
 
+def _manifest_absent(exc: MilpaError) -> bool:
+    """True iff ``exc`` represents a genuinely-absent manifest.
+
+    SSOT for the trust-axis manifest loaders (``_load_manifest_trust_fields``
+    for index-trust, ``_load_manifest_entry_trust_policy`` for entry-trust,
+    ``_load_manifest_index_history_policy`` for index-history): each degrades
+    to its policy default ONLY when there is no ``milpa.kdl``/``.nimble`` at
+    all (``MAN-NO-MANIFEST``). A PRESENT-but-broken manifest (``MAN-KDL-SYNTAX``,
+    ``MAN-UNKNOWN-TOP-LEVEL``, etc.) is a genuine error and must hard-fail —
+    spec/cli-contract.md §5.12's soft-fail carve-out is scoped to corrupt
+    LOCAL TRUST STATE (a corrupt baseline), not manifest-parse errors; the
+    general convention (§5 NORMATIVE) makes manifest errors hard failures.
+    Silently downgrading a broken manifest to "warn" would hide it behind a
+    normal-looking status block.
+    """
+    return exc.slug == MAN_NO_MANIFEST
+
+
 def _load_manifest_trust_fields(
     project_dir: Path,
 ) -> "tuple[str, str | None, str | None]":
@@ -592,8 +611,10 @@ def _load_manifest_trust_fields(
     # workspace, no package manifest) degrades to defaults.
     try:
         m = load_or_discover_manifest(project_dir)
-    except (OSError, MilpaError):
-        return "warn", None, None
+    except MilpaError as exc:
+        if _manifest_absent(exc):
+            return "warn", None, None
+        raise
     return str(m.index_trust_policy), m.index_trust_signer, m.index_trust_bundle
 
 
@@ -792,8 +813,10 @@ def _load_manifest_entry_trust_policy(project_dir: Path) -> str:
         return ws.workspace_manifest.entry_trust_policy
     try:
         m = load_or_discover_manifest(project_dir)
-    except (OSError, MilpaError):
-        return "warn"
+    except MilpaError as exc:
+        if _manifest_absent(exc):
+            return "warn"
+        raise
     return m.entry_trust_policy
 
 
@@ -954,8 +977,10 @@ def _load_manifest_index_history_policy(project_dir: Path) -> str:
         return ws.workspace_manifest.index_history_policy
     try:
         m = load_or_discover_manifest(project_dir)
-    except (OSError, MilpaError):
-        return "warn"
+    except MilpaError as exc:
+        if _manifest_absent(exc):
+            return "warn"
+        raise
     return m.index_history_policy
 
 

@@ -419,3 +419,34 @@ class TestAddUpdateGateBehavior:
         err = capsys.readouterr().err
         assert "entry-trust warning" in err
         assert "TNG-ENTRY-UNATTESTED" in err
+
+
+# ---------------------------------------------------------------------------
+# CR5 — broken manifest must hard-fail, not degrade to warn
+# ---------------------------------------------------------------------------
+
+
+class TestLoadManifestEntryTrustPolicyManifestErrors:
+    """``_load_manifest_entry_trust_policy``'s degrade-to-warn is scoped to a
+    genuinely ABSENT manifest (``MAN-NO-MANIFEST``) — mirrors the identical
+    CR5 fix applied to ``_load_manifest_trust_fields`` (index-trust) and
+    ``_load_manifest_index_history_policy`` (index-history) via the shared
+    ``_manifest_absent`` predicate.
+    """
+
+    def test_broken_manifest_propagates_not_swallowed(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        (project_dir / "milpa.kdl").write_text("this is not valid { kdl\n", encoding="utf-8")
+
+        from milpa.cli import _load_manifest_entry_trust_policy
+        with pytest.raises(MilpaError) as exc_info:
+            _load_manifest_entry_trust_policy(project_dir)
+        assert exc_info.value.slug == "MAN-KDL-SYNTAX"
+
+    def test_genuinely_absent_manifest_still_degrades_to_warn(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        from milpa.cli import _load_manifest_entry_trust_policy
+        assert _load_manifest_entry_trust_policy(project_dir) == "warn"
