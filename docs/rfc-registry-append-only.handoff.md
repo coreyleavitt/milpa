@@ -109,11 +109,14 @@ verified index is a valid *successor* of the previous one. Freshness
 
 ## Slices
 
-- [ ] A1 — spec: §3.4.0 policy-axis model (+ Part 2 §4 cross-ref); §3.5
-      full ratchet section; §3.2 yank triple + published_at amendment;
-      §5.2; §6 baseline pair + verbs; cli-contract full verb-spec blocks
-      (`index status`/`index accept`) + env + axis; Part 1 note.
-- [ ] A2a — Python parse ext (published_at, yank triple).
+- [x] A1 (2026-07-10, `fb6e707`) — spec: §3.4.0 policy-axis model landed +
+      §3.4.5/§3.4.7 rewritten as instantiations + Part 2 §4 cross-ref;
+      §3.5.1–3.5.4 full ratchet; §3.2 yank triple + published_at typed;
+      §5.2 yank exclusion (staged A5); §6 baseline pair + verbs + clean-row
+      GC non-goal; cli-contract §5.12 verb blocks + §8.7 MILPA_INDEX_HISTORY
+      + Appendix B + normative item 19; Part-1 RFC note. Slugs referenced
+      as "(lands with implementation slice)". Gate: pytest green.
+- [x] A2a (2026-07-10) — Python parse ext: IndexVersion +published_at/yanked/yanked_at/yanked_reason (typed, malformed→None/False no-diagnostic posture); 18 tests; raw-string retention deliberately NOT added (ratchet raw candidate_value = A2b/A2d extraction concern). Gate: pytest 2736 green.
 - [ ] A2b — `ratchet.py` standalone (RatchetOutcome, disjoint tags,
       reserved root key, lockstep groups, composite ordering, canonical
       digest) + in-memory unit tests.

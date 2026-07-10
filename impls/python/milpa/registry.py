@@ -21,6 +21,7 @@ from __future__ import annotations
 import re
 import warnings
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from milpa.errors import (
@@ -277,6 +278,22 @@ class IndexVersion:
     <version>`` subject coordinate (§1) for a bare-name dep, without
     re-deriving it from a solver variable that may have discarded the
     qualifier.
+
+    ``published_at`` — ISO 8601 publication timestamp (registry-protocol
+    §3.2), parsed to ``datetime``.  ``None`` when absent OR when present but
+    malformed — a malformed value uses the parser's ordinary optional-scalar
+    robustness posture (surfaced as absent, no diagnostic, no hard error).
+    This is a *parse-to-typed* field only: it carries no ratchet or watermark
+    semantics here — those land with ``rfc-registry-append-only.md``'s A2b/A5
+    slices.
+
+    ``yanked`` / ``yanked_at`` / ``yanked_reason`` — the yank triple
+    (registry-protocol §3.2 "Yank triple").  ``yanked`` defaults to ``False``
+    when the sibling node is absent or its value is not a boolean.
+    ``yanked_at`` is parsed like ``published_at`` (malformed → ``None``, no
+    diagnostic).  ``yanked_reason`` is free text, or ``None`` when absent.
+    This is parse-to-typed only — selection-time exclusion of yanked
+    versions is a later slice (A5); this field carries no enforcement here.
     """
 
     version: str
@@ -286,6 +303,10 @@ class IndexVersion:
     dep_decl_schema_version: int | None = None
     attestation: EntryAttestation | None = None
     namespace: str = ""
+    published_at: datetime | None = None
+    yanked: bool = False
+    yanked_at: datetime | None = None
+    yanked_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -626,6 +647,38 @@ def _child_scalar(parent: KdlNode, child_node_name: str) -> str | None:
     return None
 
 
+def _child_bool(parent: KdlNode, child_node_name: str) -> bool | None:
+    """Return the first positional bool arg of *parent*'s child named
+    *child_node_name*, or ``None`` if the child is absent or its value is
+    not a boolean (registry-protocol §3.2 — ``yanked``'s robustness posture).
+    """
+    from milpa.kdl_io import node_args, value_as_bool
+
+    for child in node_children(parent):
+        if node_name(child) == child_node_name:
+            args = node_args(child)
+            if not args:
+                return None
+            return value_as_bool(args[0])
+    return None
+
+
+def _parse_timestamp(raw: str | None) -> datetime | None:
+    """Parse an ISO 8601 timestamp string to ``datetime``.
+
+    Registry-protocol §3.2 NORMATIVE: a malformed value MUST NOT raise a hard
+    parse error — it uses the parser's ordinary optional-scalar robustness
+    posture (surfaced as absent).  Applies to both ``published_at`` and
+    ``yanked_at``.
+    """
+    if raw is None:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
 def _child_scalar_url(parent: KdlNode, child_node_name: str) -> str | None:
     """Return the first positional arg of *parent*'s child named *child_node_name*.
 
@@ -727,6 +780,11 @@ def _parse_version_node(
 
     attestation, diagnostics = _parse_entry_attestation(namespace, pkg_name, ver_str, node)
 
+    published_at = _parse_timestamp(_child_scalar(node, "published_at"))
+    yanked = _child_bool(node, "yanked") or False
+    yanked_at = _parse_timestamp(_child_scalar(node, "yanked_at"))
+    yanked_reason = _child_scalar(node, "yanked_reason")
+
     return (
         IndexVersion(
             version=ver_str,
@@ -736,6 +794,10 @@ def _parse_version_node(
             dep_decl_schema_version=dep_decl_schema_version,
             attestation=attestation,
             namespace=namespace,
+            published_at=published_at,
+            yanked=yanked,
+            yanked_at=yanked_at,
+            yanked_reason=yanked_reason,
         ),
         diagnostics,
     )

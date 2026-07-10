@@ -16,6 +16,7 @@ No network access; all inputs are inline KDL strings or conformance fixtures.
 from __future__ import annotations
 
 import warnings
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -1057,3 +1058,137 @@ class TestS2DepDeclOnIndexVersion:
             for iv in pkg.versions:
                 assert iv.dep_decl is None
                 assert iv.dep_decl_schema_version is None
+
+
+# ---------------------------------------------------------------------------
+# 11. A2a — published_at + yank triple parse-to-typed extension
+#     (registry-protocol.md §3.2 "published_at" + "Yank triple";
+#     rfc-registry-append-only.md A2a — parse-to-typed only; no ratchet, no
+#     baseline, no selection-time yank enforcement — those land in A2b/A5)
+# ---------------------------------------------------------------------------
+
+_INDEX_A2A_FULL = """\
+schema_version 1
+
+package "nkdl" {
+    namespace "coreyleavitt"
+    version "0.3.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000002"
+        published_at "2026-06-01T00:00:00Z"
+        yanked #true
+        yanked_at "2026-07-01T12:00:00Z"
+        yanked_reason "ships a vulnerable bearssl pin"
+    }
+}
+"""
+
+_INDEX_A2A_ABSENT = """\
+schema_version 1
+
+package "nkdl" {
+    namespace "coreyleavitt"
+    version "0.3.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000003"
+    }
+}
+"""
+
+_INDEX_A2A_MALFORMED = """\
+schema_version 1
+
+package "nkdl" {
+    namespace "coreyleavitt"
+    version "0.3.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000004"
+        published_at "not-a-timestamp"
+        yanked "not-a-bool"
+        yanked_at "also-not-a-timestamp"
+    }
+}
+"""
+
+
+def _first_version(idx: Index, pkg_name: str = "nkdl"):
+    pkg = next(p for p in idx.packages if p.name == pkg_name)
+    return pkg.versions[0]
+
+
+class TestA2aPublishedAtAndYankTriple:
+    """A2a: published_at and the yank triple parsed to typed IndexVersion fields.
+
+    Parse-to-typed only (registry-protocol §3.2 NORMATIVE). No ratchet
+    enforcement, no baseline comparison, no selection-time yank exclusion —
+    those are later append-only-RFC slices (A2b/A2d/A5).
+    """
+
+    def test_published_at_parsed_to_datetime(self) -> None:
+        iv = _first_version(parse_index(_INDEX_A2A_FULL))
+        assert iv.published_at == datetime.fromisoformat("2026-06-01T00:00:00Z")
+
+    def test_published_at_absent_yields_none(self) -> None:
+        iv = _first_version(parse_index(_INDEX_A2A_ABSENT))
+        assert iv.published_at is None
+
+    def test_malformed_published_at_yields_none_no_warning(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            iv = _first_version(parse_index(_INDEX_A2A_MALFORMED))
+        assert iv.published_at is None
+        assert len(caught) == 0
+
+    def test_yanked_true_parsed(self) -> None:
+        iv = _first_version(parse_index(_INDEX_A2A_FULL))
+        assert iv.yanked is True
+
+    def test_yanked_at_parsed_to_datetime(self) -> None:
+        iv = _first_version(parse_index(_INDEX_A2A_FULL))
+        assert iv.yanked_at == datetime.fromisoformat("2026-07-01T12:00:00Z")
+
+    def test_yanked_reason_parsed(self) -> None:
+        iv = _first_version(parse_index(_INDEX_A2A_FULL))
+        assert iv.yanked_reason == "ships a vulnerable bearssl pin"
+
+    def test_yanked_absent_defaults_false(self) -> None:
+        iv = _first_version(parse_index(_INDEX_A2A_ABSENT))
+        assert iv.yanked is False
+
+    def test_yanked_at_absent_yields_none(self) -> None:
+        iv = _first_version(parse_index(_INDEX_A2A_ABSENT))
+        assert iv.yanked_at is None
+
+    def test_yanked_reason_absent_yields_none(self) -> None:
+        iv = _first_version(parse_index(_INDEX_A2A_ABSENT))
+        assert iv.yanked_reason is None
+
+    def test_malformed_yanked_defaults_false_no_warning(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            iv = _first_version(parse_index(_INDEX_A2A_MALFORMED))
+        assert iv.yanked is False
+        assert len(caught) == 0
+
+    def test_malformed_yanked_at_yields_none_no_warning(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            iv = _first_version(parse_index(_INDEX_A2A_MALFORMED))
+        assert iv.yanked_at is None
+        assert len(caught) == 0
+
+    def test_existing_fixture_still_parses_with_yank_defaults(self) -> None:
+        """MINIMAL_INDEX predates the yank triple — must default cleanly."""
+        idx = parse_index(MINIMAL_INDEX)
+        chronos = next(p for p in idx.packages if p.name == "chronos")
+        iv = chronos.versions[0]
+        assert iv.yanked is False
+        assert iv.yanked_at is None
+        assert iv.yanked_reason is None
+
+    def test_minimal_index_published_at_now_typed(self) -> None:
+        """MINIMAL_INDEX's nimkdl entry already carries ``published_at`` (from
+        the P2 attestation fixture) — confirm it now parses to a typed
+        ``datetime`` rather than being silently ignored (item-6 amendment,
+        registry-protocol §1 NORMATIVE)."""
+        idx = parse_index(MINIMAL_INDEX)
+        nimkdl = next(p for p in idx.packages if p.name == "nimkdl")
+        iv = nimkdl.versions[0]
+        assert iv.published_at == datetime.fromisoformat("2026-05-26T04:49:44Z")
