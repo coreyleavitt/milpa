@@ -16,6 +16,11 @@ Related specs:
   pin reuse behavior
 - `spec/identity.md` (S12) — content-hash canonical algorithm (cross-ref;
   not duplicated here)
+- `spec/registry-protocol.md` §3.2 — the `EntryAttestation` tagged record
+  the §3.9 attestation block records the claim of
+- `docs/rfc-per-entry-attestation.md` — the RFC that specifies the §3.9
+  block's claim-not-outcome semantics and the (later-slice) verifier that
+  re-derives verification outcomes from it
 
 ---
 
@@ -171,6 +176,10 @@ dep "depname2" { ... }
 >   entirely when the dep has no alternate names.
 > - `    active_flags "<f1>" "<f2>" ...` — emitted only when non-empty; args
 >   are double-quoted and space-separated.
+> - `    attestation { }` block (§3.9) — emitted only for registry-resolved
+>   (named) deps that carry a per-entry attestation claim; omitted entirely
+>   otherwise. Positioned after `active_flags` and before `provenance`
+>   blocks.
 > - One or more `    provenance {` blocks — emitted in canonical sorted order
 >   (see §4 for the sort key). The emitter MUST NOT write a `self_mirrors`
 >   node (see §3.7).
@@ -502,6 +511,97 @@ dep "pkg" {
 > NOTE: The conformance fixture `fixture-172-lock-aliases-field` exercises a
 > dep block with `aliases "alpha" "beta"` and pins the byte-exact canonical
 > form via a `lock-roundtrip` round-trip.
+
+### 3.9  `attestation` block (optional, per-entry attestation claim)
+
+Records the per-entry Layer 2 attestation **claim** as parsed from the
+tianguis index at lock time (`spec/registry-protocol.md` §3.2,
+`EntryAttestation`). Applies only to registry-resolved (named) deps — deps
+with no index entry (`git=`/`tarball=`/`local=` URL deps, and `member` deps)
+never carry this block.
+
+```kdl
+dep "widget" {
+    ...
+    active_flags "flag1"
+    attestation {
+        kind "author-signed"        // or "milpa-vendored"
+        signer "<identity>"          // present only when kind is "author-signed"
+        rekor {                      // omitted when the index entry had no rekor block
+            uuid "<hex>"
+            log_index "<decimal-string>"
+            integrated_time "<decimal-string>"
+        }
+    }
+    provenance { ... }
+}
+```
+
+> NORMATIVE: The lockfile records the attestation **claim**, never a
+> verification **outcome**. No field in this block (or anywhere else in the
+> lockfile schema) may encode a stored "verified: true"-shaped assertion —
+> that would be an unverifiable claim once the lockfile leaves the machine
+> that wrote it. Verification MUST always be re-derived from the cached
+> attestation bundle at check time (`milpa verify`); it MUST NOT be read off
+> the lockfile as a cached truth value. This is the same claim/outcome
+> separation `spec/registry-protocol.md` §3.2 draws for the index-side
+> record — the lockfile block is a snapshot of that claim at lock time, nothing
+> more.
+
+> NORMATIVE: `kind` MUST carry exactly one of `"author-signed"` or
+> `"milpa-vendored"` — the same closed set as
+> `spec/registry-protocol.md` §3.2. `signer` MUST be present when `kind` is
+> `"author-signed"` and MUST be absent when `kind` is `"milpa-vendored"`,
+> mirroring the source index record's structural invariant. The digest half
+> of the attestation subject is NOT duplicated in this block: the dep's
+> `identity` field (§3.1) already carries it — the attestation attests to
+> exactly the content hash recorded there, and a per-entry verifier
+> re-derives the comparison from that field, never from a copy stored here.
+
+> NORMATIVE: The nested `rekor` block, when present, carries the same three
+> fields as the index-side `rekor` block (`uuid`, `log_index`,
+> `integrated_time`; `spec/registry-protocol.md` §3.2) and MUST be omitted
+> entirely when the source index entry carried none.
+
+> NORMATIVE: The `attestation` block is emitted if and only if (a) the dep
+> was resolved via the named-dep lookup path against a tianguis index entry
+> (`spec/registry-protocol.md` §5), AND (b) that index entry carried a
+> non-collapsed `EntryAttestation` record (§3.2's closed-set/collapse rule).
+> A dep resolved by URL/local/member provenance, or a registry-resolved dep
+> whose index entry had no attestation record (or one that collapsed to
+> unattested at index-parse time), MUST omit the block entirely — there is
+> no "unattested" sentinel value written to the lockfile; absence of the
+> block IS the unattested state, matching every other optional block in
+> this schema (§3.7, §3.8).
+
+> NORMATIVE: A malformed `attestation` block encountered while **parsing an
+> existing lockfile** (e.g. an unrecognized `kind` value, or `kind
+> "author-signed"` with no `signer`) MUST normalize to "no attestation
+> recorded for this dep" — the same conservative-collapse posture
+> `spec/registry-protocol.md` §3.2 defines for index parsing — rather than
+> raising a hard parse error, with a diagnostic naming the affected dep.
+> This mirrors the source-of-truth collapse rule instead of introducing a
+> second, stricter parse posture for the same shape of claim once it has
+> been re-serialized into the lockfile.
+
+> NORMATIVE: This block's addition does NOT bump `LOCKFILE_SCHEMA_VERSION`
+> (currently `1`). It follows the `aliases` (§3.8) / DepDecl optional-field
+> precedent (`spec/registry-protocol.md` §3.2's `dep_decl` fields): both
+> impls' lockfile parsers hard-fail on an unrecognized `version` integer
+> (§2.1), so bumping the schema version for a purely additive optional
+> field would force-invalidate every existing lockfile rather than degrade
+> gracefully. An older milpa that does not recognize `attestation` skips it
+> (KDL 2.0 unknown-node forward-compat skip) and continues; the dep
+> resolves exactly as it would have with no attestation claim recorded.
+
+> NOTE: This subsection (P1 of `rfc-per-entry-attestation.md`) specifies
+> the schema only; no parser or emitter populates it yet — that lands with
+> the RFC's P2 slice, with zero cryptographic verification ever run at lock
+> time. Until a later slice adds the `entry-trust` gate and its verifier,
+> `milpa show` and the frozen path render this block, once populated, as an
+> **unverified claim** (e.g. "claims author-signed by X") rather than a
+> verified fact. The wording upgrade at that point changes presentation
+> only — this schema does not change.
 
 ---
 

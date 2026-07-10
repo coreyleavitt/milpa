@@ -36,9 +36,17 @@ A conformant implementation of this spec MUST:
    into subprocess argv or the filesystem (§4 of this document).
 5. Implement the named-dep lookup contract: name → candidate list, ordered
    descending by semver, constraint-filtered (§5).
-6. Treat unknown version-node children (including `rekor`, `attestation`,
-   `signed_by`, `published_at`, `upstream`, `namespace`) as forward-compat
-   metadata: parse MUST succeed, fields MUST be ignored.
+6. Treat unrecognized version-node children (children this spec does not
+   define) as forward-compat metadata: parse MUST succeed, unknown fields
+   MUST be ignored. `published_at`, `upstream`, and `namespace` remain
+   informational fields under this clause. `attestation`, `signed_by`,
+   `rekor`, and `bundle` are **not** covered by this clause — they parse into
+   the closed-set `EntryAttestation` tagged record (§3.2); an unrecognized
+   attestation `kind` or a structurally invalid record MUST collapse
+   conservatively to *unattested* (with an observable parse diagnostic)
+   rather than being silently ignored (§3.2). Layer 2 enforcement over the
+   parsed record — the `entry-trust` gate — is a separate, later normative
+   surface (§3.2, "gate lands separately").
 7. Treat unknown provenance `kind` values as forward-compat: skip the
    provenance record rather than failing, provided at least one known-kind
    provenance remains on the version.
@@ -124,14 +132,15 @@ package "<name>" {
             // kind-specific fields (§3.2)
         }
         [provenance { … }]           // additional provenances, preference-ordered
-        attestation "<label>"        // e.g. "author-signed" or "milpa-vendored"
-        signed_by "<identity>"
+        attestation "<label>"        // "author-signed" or "milpa-vendored"; closed set (§3.2)
+        signed_by "<identity>"       // required when attestation is "author-signed"
         published_at "<ISO-8601>"
         rekor {                      // durable Rekor reference; optional
             uuid "<hex>"
             log_index "<decimal-string>"
             integrated_time "<decimal-string>"
         }
+        bundle sha256="<64-hex>"     // per-entry attestation bundle delivery pin; optional (§3.2)
     }
     [version "…" { … }]             // additional versions
 }
@@ -211,24 +220,139 @@ first is canonical, the rest are mirrors. A fetcher MUST attempt them in order.
 > they do not introduce a new or parallel provenance grammar. Implementations
 > MUST NOT write a second provenance parser for the index — one parser, shared.
 
-**`attestation`** (child node, string, optional) — a label indicating the trust
-path: `"author-signed"` (package author signed the OCI artifact via cosign) or
-`"milpa-vendored"` (tianguis vendor-en-absentia bot signed on the author's
-behalf). MAY be absent on legacy entries.
-
-> NOTE: milpa's reader treats `attestation` as forward-compat metadata: it is
-> parsed and then ignored. The trust value is displayed by tianguis.dev; milpa
-> does not enforce it during resolution.
-
-**`signed_by`** (child node, string, optional) — the identity (GitHub Actions
-workflow URL or bot identifier) that produced the attestation. Informational;
-not enforced by milpa.
-
 **`published_at`** (child node, string, optional) — ISO 8601 timestamp of when
-the version was published. Informational.
+the version was published. Informational at this layer; parse-to-typed
+handling and its role as the append-only ratchet's attestation-epoch anchor
+are `rfc-registry-append-only.md`'s A2/A2a scope, not this section's.
+
+#### Per-entry attestation record (`attestation` / `signed_by` / `rekor` / `bundle`)
+
+These four sibling child nodes on a `version` node record Layer 2's per-entry
+author-attribution CLAIM (attribution, not integrity — the whole-index
+integrity gate is Layer 1, §3.4). They parse into **one** optional tagged
+record on `IndexVersion`, not four independently-nullable fields — the
+correlation between `kind`, `signer`, `rekor`, and `bundle_pin` is a
+structural invariant of the data model:
+
+```
+EntryAttestation = {
+  rekor: RekorRef | None,             # kind-independent
+  bundle_pin: Sha256Hex | None,       # sha256 of the bundle BYTES — the
+                                       # delivery-integrity pin (`bundle` node).
+                                       # None is a normal, expected state before
+                                       # per-entry bundle delivery ships.
+  kind: AuthorSigned { signer: str }  # signer REQUIRED for this kind
+      | MilpaVendored,
+}
+# IndexVersion.attestation: EntryAttestation | None
+```
+
+Wire form:
+
+```kdl
+version "<semver>" {
+    …
+    attestation "<label>"        // discriminates `kind`: "author-signed" | "milpa-vendored"
+    signed_by "<identity>"       // REQUIRED when attestation is "author-signed"
+    rekor {                      // optional, kind-independent
+        uuid "<hex>"
+        log_index "<decimal-string>"
+        integrated_time "<decimal-string>"
+    }
+    bundle sha256="<64-hex>"     // optional; sha256 of the attestation bundle BYTES
+}
+```
+
+> NORMATIVE (closed kind set): The `attestation` value set is CLOSED —
+> `"author-signed"` and `"milpa-vendored"` are the only recognized values. A
+> conformant reader MUST parse these into the corresponding
+> `EntryAttestation.kind` variant: `"author-signed"` → `AuthorSigned{signer}`
+> (from the sibling `signed_by` node); `"milpa-vendored"` → `MilpaVendored`
+> (no signer field — the effective signer for this kind is derived at
+> verification time from Layer 1's resolved vendor-bot identity, never read
+> from a per-entry field; see `rfc-per-entry-attestation.md` §5).
+
+> NORMATIVE (conservative collapse): Any `attestation` value outside the
+> closed set, and any structurally invalid record (e.g. `attestation
+> "author-signed"` with no sibling `signed_by`), MUST normalize to
+> `IndexVersion.attestation = None` (*unattested*) — an unrecognized or
+> malformed attestation claim MUST NEVER parse as attested, in an older
+> client or otherwise. The collapse MUST be observable: the parser emits a
+> diagnostic naming the affected `(namespace, name, version)`, distinct from
+> a hard parse error, so a vendor-bot bug surfaces to the operator instead of
+> silently degrading. Persisted state (index cache, lockfile) does NOT
+> distinguish "collapsed due to malformed input" from "never attested" — the
+> Layer-1-verified index snapshot already held in the local cache is the
+> forensic record for what the bot actually emitted, so the collapse loses
+> no auditable information. A malformed `bundle` `sha256=` value (see below)
+> is narrower: it normalizes only `bundle_pin` to `None` and does NOT collapse
+> an otherwise well-formed `kind`/`signer` pairing, because an absent bundle
+> pin is itself the ordinary, expected state before per-entry bundle
+> delivery ships (`rfc-per-entry-attestation.md` §7) — unlike a malformed
+> `kind`/`signer` pairing, it is not evidence of a malformed claim.
+
+> NORMATIVE (parse boundary shape): The version-node parse function in both
+> impls MUST return `(typed index, collapse diagnostics)` — the parsed
+> `IndexVersion` paired with the list of collapse diagnostics produced while
+> parsing it — rather than a bare typed value. This is a small, explicit,
+> cross-impl signature change at the version-node parse boundary (both
+> impls' version-node parsers are pure functions today); callers thread the
+> diagnostics to the warning channel. This clause specifies the parse-time
+> contract only. It does NOT specify a policy gate over the result — no
+> gate exists at this spec layer; enforcement (`entry-trust`) is specified
+> separately and lands with a later slice of `rfc-per-entry-attestation.md`
+> (§3.4 intro).
+
+> NORMATIVE (subject binding — requirement on bundle producers and the
+> future verifier, not this parser): once a bundle exists at the address the
+> `bundle` pin commits to (`rfc-per-entry-attestation.md` §7), it MUST be a
+> Sigstore bundle whose in-toto statement subject binds BOTH
+> `subject[0].digest.sha256` (the entry's `content_hash`, hex form) AND
+> `subject[0].name` (`pkg:tianguis/<namespace>/<name>@<version>`). Digest
+> binding alone is insufficient: `content_hash` is name-independent by
+> design, so with a digest-only subject a byte-identical republish of one
+> package under a different `(namespace, name)` coordinate could point at
+> the original package's genuine, publicly-logged bundle (Rekor is a
+> transparency log) and inherit its signature — earning an attribution the
+> signer never made for that coordinate. Binding both coordinates makes one
+> bundle vouch for exactly one `(namespace, name, version)`, which is the
+> attribution claim this record exists to carry. This clause is a
+> requirement on what a conformant bundle must contain; it does not itself
+> verify anything — no verifier is specified by this document. Verification
+> (subject-binding checks, cryptographic checks, and the `entry-trust`
+> policy gate) is specified separately and lands with a later slice of
+> `rfc-per-entry-attestation.md`; nothing in this section implies that gate
+> exists yet.
+
+> NOTE: `EntryAttestation` records the CLAIM only. Whether the claim is
+> cryptographically true is a question this section does not answer — see
+> `spec/lockfile-schema.md` §3.9 for the same claim-not-outcome framing at
+> the lockfile layer, and `rfc-per-entry-attestation.md` for the verifier
+> design (not yet part of any spec surface).
+
+> NOTE: This subsection **inverts** the prior "parsed and ignored"
+> forward-compat treatment of `attestation`, `signed_by`, and `rekor`
+> (formerly tolerate-and-ignore metadata; see item 6 of "Normative surface"
+> above). Both reference impls conform to the tolerate-and-ignore behavior
+> as of this spec amendment; the parse-to-typed behavior specified here is
+> the target for `rfc-per-entry-attestation.md`'s P2 slice. A spec amendment
+> preceding the implementation that satisfies it is expected RFC-flow
+> sequencing, not a spec/impl mismatch bug.
+
+**`attestation`** (child node, string, optional) — see the tagged record
+above. MAY be absent on legacy entries (parses as `IndexVersion.attestation
+= None`).
+
+**`signed_by`** (child node, string, conditionally required) — the identity
+(GitHub Actions workflow URL or bot identifier) that produced the
+attestation. REQUIRED when `attestation` is `"author-signed"` (its absence
+there makes the record structurally invalid — collapse rule above). Ignored
+when `attestation` is `"milpa-vendored"` (the vendored kind carries no
+per-entry signer field by design — see the closed-set clause above).
 
 **`rekor`** (child node, optional block) — a durable Rekor transparency-log
-reference captured at publish time. Fields:
+reference captured at publish time, folded into `EntryAttestation.rekor`
+when an attestation record is present. Fields:
 
 | Child | Type | Meaning |
 |---|---|---|
@@ -236,17 +360,28 @@ reference captured at publish time. Fields:
 | `log_index` | string | Rekor log index, as a decimal string |
 | `integrated_time` | string | Unix timestamp (seconds) when the entry was integrated, as a decimal string |
 
-> NORMATIVE: A conformant milpa reader MUST tolerate a `rekor` block on a
-> version node. The block MUST NOT cause a parse error. milpa does not
-> validate or enforce Rekor entries during resolution; the block is
-> forward-compat metadata for the tianguis.dev site and auditing tooling.
-> `IndexVersion` carries no `rekor` field; Rekor data is inert to the
-> resolver.
+> NORMATIVE: A conformant reader MUST tolerate a `rekor` block on a version
+> node whether or not `attestation` is present. When `attestation` is
+> present (and the record is not collapsed), `rekor` folds into
+> `EntryAttestation.rekor`. When `attestation` is absent, a `rekor` block
+> alone does not construct an `EntryAttestation` — there is no `kind` to tag
+> it with — and MUST be ignored, the same forward-compat posture as before
+> this amendment.
 
-> NOTE: The test fixture `REKOR_INDEX` in `tests/test_tianguis_client.py`
-> (test `test_rekor_block_is_tolerated_and_ignored`) is the regression pin
-> for this forward-compat requirement. It verifies that `IndexVersion` has no
-> `rekor` attribute after parsing.
+**`bundle`** (child node, `sha256=` property, optional) — the delivery
+integrity pin for the per-entry attestation bundle: the sha256 hex digest of
+the bundle BYTES (not of the bundle's semantic content), folded into
+`EntryAttestation.bundle_pin`. Expected absent during the claim-only window
+that precedes `rfc-per-entry-attestation.md`'s bundle-delivery slice — a
+present `attestation` with no `bundle` pin is a well-formed, ordinary claim;
+a future verifier reports this state as bundle-unavailable, not malformed.
+
+> NORMATIVE: `bundle`'s `sha256=` property, when present, MUST be exactly 64
+> lowercase hexadecimal characters. A malformed value MUST normalize to
+> `bundle_pin = None` (with a collapse diagnostic per the rule above) rather
+> than raising a parse error or collapsing the enclosing `kind`/`signer`
+> pairing — `bundle` is independently-nullable delivery metadata layered on
+> the same forward-compat posture as the rest of this record.
 
 **`dep_decl`** (child node, string, optional) — a `sha256:<64-hex>` hash
 pointer to the DepDecl artifact for this version. The DepDecl artifact encodes
@@ -293,6 +428,19 @@ must be a non-negative integer. When absent, `None` on the in-memory type.
 Index provenance records use the same kind-set and field shapes as the manifest
 grammar's §4.2, with the additional acceptance of `(url)`-annotated URL values
 (the milpa KDL url convention — see `manifest-grammar.md` §2).
+
+> NOTE (invariant this spec leans on elsewhere): a version's `content_hash`
+> (§3.2) is a property of the ENTRY, not of any individual `provenance`
+> record — every provenance listed on one version MUST yield source bytes
+> that hash to that same `content_hash`. This already follows from the
+> identity gate: milpa recomputes the content hash after fetching from
+> whichever provenance it used and treats a mismatch as `CAS-IDENTITY-MISMATCH`
+> (`spec/identity.md`), so a mirror serving different bytes than another
+> provenance on the same entry is a hard error regardless of which
+> provenance was tried. `rfc-per-entry-attestation.md` §1 depends on this:
+> because `content_hash` is well-defined per entry independent of delivery
+> path, a per-entry attestation subject can bind to it without needing to
+> know which mirror serves the bytes at verification time.
 
 #### `git` provenance
 
@@ -353,10 +501,16 @@ Fields: `registry` (required), `repository` (required), `digest` (required).
 
 Layer 1 verifies the Sigstore attestation over the complete `index.kdl`
 document before any claim in the index is trusted. This section is orthogonal
-to the per-entry attestation fields in §3.2 (`attestation`, `signed_by`,
-`rekor`): those fields' "parsed and ignored" normative clauses remain in full
-force under Layer 1. Per-entry Layer 2 verification is a future extension that
-inverts those clauses; it is explicitly out of scope here.
+to the per-entry attestation record in §3.2 (`attestation`, `signed_by`,
+`rekor`, `bundle` — the `EntryAttestation` tagged record): Layer 1's gate
+covers document integrity only and has no dependency on §3.2's per-entry
+fields. Layer 2 — the per-entry attribution gate (`entry-trust`) that
+verifies and enforces the `EntryAttestation` record that §3.2 types — is
+specified separately in `rfc-per-entry-attestation.md` and is not part of
+this document as of this amendment. §3.2 specifies parsing (the fields are
+now typed, not ignored); it does not specify a verifier or a policy gate.
+Nothing in this spec should be read as implying an `entry-trust` gate
+exists yet.
 
 #### 3.4.1  When the gate fires
 

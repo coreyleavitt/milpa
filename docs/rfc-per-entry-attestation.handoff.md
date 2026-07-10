@@ -1,5 +1,29 @@
 # rfc-per-entry-attestation — handoff
 
+- **Stage 3 (tdd grind) IN PROGRESS (2026-07-09):** part of the combined
+  `/loop` grind with `rfc-registry-append-only.md` (queue: P1–P3a then
+  A1, A2a–A2e, A3, A4a(+rs), A4b, A5; A6 gated on P2… see that RFC's
+  handoff). **Resume:** the standing `/loop` grind command.
+
+## Slices (implementation)
+
+- [x] P1 — spec-only (2026-07-09): registry-protocol §3.2 clauses inverted
+      → `EntryAttestation` tagged record (closed set, conservative
+      collapse w/ diagnostic, subject binding, `bundle` pin field,
+      normative-surface item 6 carve-out, §3.4 orthogonality rewrite);
+      lockfile-schema §3.9 attestation block (claim-not-outcome, no
+      schema-version bump, collapse-on-read posture). No slugs (P3).
+      Gate: full pytest green (2633 passed).
+- [ ] P2 — attribution surfacing w/o gating: parse `EntryAttestation` into
+      `IndexVersion` (both impls, (typed, diagnostics) boundary); lockfile
+      claim record; `milpa show` unverified-claim rendering.
+- [ ] P3a — mock-gated gate: `entry-trust` axis, selection-step pipeline,
+      nine slugs, `EntryBundleVerifier` + keyed MockVerifier + acquisition
+      surface, `milpa verify` offline re-verify, conformance matrix.
+- [ ] P3b — real-crypto strict-fails (lands with P4).
+- [ ] P4 — cross-repo tianguis bundle delivery (BLOCKED on tianguis).
+- [ ] P5 — Part 3 owner registry (future).
+
 - **AMENDED 2026-07-09 (post-review):** open questions 1 and 2 RESOLVED after
   Corey's elegance challenge on the cross-repo blocker. OQ1 = content-addressed
   pinned bundle sidecar (§7 rewritten; §2 gains `bundle_pin`; §5 gains stage 1b
