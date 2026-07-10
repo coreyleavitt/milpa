@@ -1,18 +1,16 @@
 # rfc-registry-append-only — handoff
 
-- **Stage:** architect round 1 COMPLETE (2026-07-09) — 4-lens team (depth /
-  breadth / design / feasibility) + a dedicated 5th reviewer for the
-  review-naked Part-2 amendment deltas (per the scope note below, now
-  discharged). All findings resolved under the bar and applied; **no open
-  forks**. Stage 1 (draft + slicing) was 2026-07-09 same day.
-- **Resume:** `/architect docs/rfc-registry-append-only.md round 2` — hunt
-  what's *still* weak, not the round-1 issues (ledger below). Round 2 should
-  particularly pressure-test the round-1 *additions* themselves (they are the
-  newest, least-reviewed text): the root-field class, the `index-history`
-  axis wiring, `milpa index accept` semantics, the set-once Frozen carve-out,
-  and the new-vs-recurring warn mechanism.
-- After round 2: `/loop` grind (per-entry P1–P3a + append-only A1–A5;
-  A6 waits on Part-2 P2).
+- **Stage:** architect round 2 COMPLETE (2026-07-09) — 4-lens team (depth /
+  breadth / design / feasibility) briefed to pressure-test the round-1
+  additions; ~30 findings consolidated to 23 ledger entries, all resolved
+  under the bar and applied; **no open forks**. Round 1 was same day
+  (ledger below); Stage 1 (draft + slicing) also 2026-07-09.
+- **Resume:** the RFC is ready for `/tdd`. Next: `/loop` grind — Part-2
+  P1–P3a + append-only A1, A2a–A2e, A3, A4a (+A4a-rs), A4b, A5; A6 waits
+  on Part-2 P2. A third architect round is NOT recommended: round 2's
+  changes are contract-shaped (verb specs, digest definition, slice
+  mechanics) whose remaining risk is implementation-shaped, which /tdd
+  surfaces better than another prose pass.
 
 ## Origin (why this RFC exists)
 
@@ -24,106 +22,169 @@ signature re-signs history on every publish** — nothing checks that a new
 verified index is a valid *successor* of the previous one. Freshness
 (`TNG-INDEX-BUNDLE-STALE`) cannot see rewrites.
 
-## Key decisions (post round 1)
+## Key decisions (post round 2)
 
-- **Dominance over a product partial order** (round 1 reformulation): entry
-  key `(namespace, name, raw version string)`; presence is a component
-  (`absent < present`), so rollback = the same dominance failure as a frozen
-  change. One generic `dominates()` fold in both impls, fields tagged with
-  order kinds. **Frozen = set-once** (`absent/empty → value` legal exactly
-  once — legacy `content_hash`/`dep_decl` backfill stays possible; any
-  `value → value′`/`→ absent` violates).
-- **Root-field class** (round 1, from the Part-2 delta review):
-  `schema_version` monotone non-decreasing; `attestation-epoch` **set-once**
-  (raising it would nullify the mandate while staying "non-decreasing") →
+- **Dominance over a product partial order**: entry key
+  `(namespace, name, raw version string)`; presence is a component
+  (`absent < present`). **One literal fold** (round 2): root fields ride the
+  same fold as a synthesized reserved entry under the empty key — no
+  parallel root code path. Order-kind tags are **disjoint by name**
+  (round 2): set-once / attestation-monotone / append-only-multiset /
+  advisory-mutable / ordinal-non-decreasing (`schema_version`) — the two
+  "monotone"s are different comparators and must not share a tag.
+- **Set-once is per-observed-history** (round 2): "exactly once" is
+  relative to the current baseline; every trust-anchor re-establishment
+  (TOFU, `index accept`, corrupt recovery) re-anchors it — named as a
+  threat-model residual (the TOFU bound generalized), not a new hole.
+  `index-history off` does NOT create a gap (off freezes but never deletes
+  the baseline).
+- **Root-field class**: `schema_version` ordinal non-decreasing (absent ≡
+  spec default 1; `TNG-SCHEMA-UNKNOWN` preempts the ratchet for
+  newer-than-supported candidates); `attestation-epoch` set-once →
   `TNG-INDEX-ROOT-MUTATED`.
 - **Own policy axis `index-history`** (off/warn/strict, default warn; env
-  `MILPA_INDEX_HISTORY`; root authority + `WS-INDEX-HISTORY-ON-MEMBER`) —
-  the draft's ride-`index-trust` position failed Part 2's own
-  axis-separation test (fails/remediated independently); unsigned-registry
-  and migration-window configs need the split.
-- **Reset = dedicated `milpa index accept` verb, v1** — the draft's
-  cache-clean story was doubly false (`clean` is spec-FORBIDDEN from touching
-  the index cache and never has) and a hygiene-command reset is a
-  silent-rewrite hole. Baseline corrupt-vs-absent: absent → TOFU;
-  present-but-unparseable → `TNG-INDEX-BASELINE-CORRUPT` hard-fail regardless
-  of policy.
-- **Ratchet covers BOTH fetch seams** (`load_index` State 2 AND
-  `_refetch_with_recovery`) and gates **before any cache mutation including
-  the bundle-sidecar write** (torn-write hazard); baseline written atomically
-  AFTER the index; sidecar trio `<key>.index.kdl.baseline{,.at,.reported}`
-  in the glob family.
-- **Sticky baseline** + warn habituation defense (new-vs-recurring via
-  `.reported` digest). Serve-base/compare-base split factored as reusable
-  `ratchet.py` primitive (Part 3 owner-registry reuse).
-- **Four ratchet slugs** with ONE composite precedence
-  `(class_rank: ROOT=0, ROLLBACK=1, MUTATED=2; ns, name, version)`;
-  structured `violations=` payload with sub-class kinds (incl.
-  `monotone-repinned` for same-kind `bundle_pin` swap); remediation hints
-  required.
-- **Yank aligned with tianguis#13**: `yanked`/`yanked_at`/`yanked_reason`
-  (draft's `yank_reason` was an accidental fork); advisory-mutable-but-
-  SURFACED (every transition a stderr notice — un-yank of a CVE-yanked entry
-  is never silent); `--allow-yanked` deliberately dropped (recorded on #13);
-  exclusion in BOTH `resolve_named_all` and `resolve_named_all_qualified`.
-- **Watermark defined**: `T(baseline) = max(published_at)` over baseline
-  entries (never consumer wall-clock), explicit skew tolerance (~24h),
-  indexer-ordering assumption recorded on tianguis#42; omission dodge closed
-  in Part 2 (post-epoch entries lacking `published_at` treated post-epoch,
-  fail-closed).
-- **Staged enforcement**: lattice complete in spec day one; rekor +
-  attestation + epoch rows enforce at A6 (post Part-2 P2 parse); the pinned
-  no-rekor regression test is inverted deliberately at A6.
-- **No in-band correction path** — fix = yank + new version (Go-sumdb
-  position). Migration events alarm and require explicit `index accept`.
-
-## Part-2 delta review (scope note DISCHARGED 2026-07-09)
-
-The review-naked Part-2 amendment sections were reviewed by a dedicated agent;
-fixes applied to `rfc-per-entry-attestation.md`:
-- stage 1b `TNG-ENTRY-BUNDLE-PIN-MISMATCH` → **unconditional hard error**
-  (was policy-gated while citing the unconditional `TNG-DEPDECL-HASH-MISMATCH`
-  precedent); `BUNDLE-MISSING` gains a `cause` payload discriminator.
-- OQ2: `published_at` mandatory post-epoch (fail-closed omission rule +
-  tianguis#42 publish gate); epoch set-once under the root-field class.
-- P3a honest tail added: `entry-trust strict` is code-complete at P3a but
-  non-functional against the live registry until P4 backfills (100%
-  BUNDLE-MISSING in the window).
-- Minors: bundle size-cap sizing note; `MILPA_ENTRY_BUNDLE_DIR` named.
-- OQ3(ii) amended: continuity ratchet = this RFC's monotone order (ownership
-  split: Part 2 owns the type, this RFC owns the order).
+  `MILPA_INDEX_HISTORY`; root authority + `WS-INDEX-HISTORY-ON-MEMBER`).
+  Round 2: `off` neither reads nor writes the baseline but **preserves**
+  it (re-enable resumes from the frozen baseline — expected alarms);
+  corrupt-baseline hard-fail ranges over warn|strict (can't fire under
+  off). **A1 extracts a generic policy-axis model (§3.4.0)** — authority
+  formula + off-rule + member-error pattern stated once, instantiated by
+  index-trust / entry-trust / index-history (spec-prose SSOT; Part 2 §4
+  gets a cross-ref amendment).
+- **`milpa index` verb family** (round 2 split): `status` (read-only, no
+  writes ever; `--refresh` = dry-run diff; exit code = pending-violations
+  gate for CI) + `accept` (same fetch, prints diff, **atomic** baseline
+  swap as its only mutation; loud distinct error on write failure; three
+  explicit branches — present→diff, absent→TOFU-establishment message,
+  corrupt→re-establishment message; epoch-change acceptance must print the
+  blast-radius consequence sentence). Non-interactive by design (no
+  `--yes`); idempotent; per-URL; member-dir delegates to root (S11e);
+  `--no-index` → error; `index-history off` → works + warns;
+  `index-trust off` → honest no-crypto-basis caveat. Full verb-spec blocks
+  land in cli-contract at A1. Nested subparser = third instance of the
+  `workspace`/`store` pattern.
+- **Sidecar pair, not trio** (round 2): `<key>.index.kdl.baseline` +
+  `.baseline.meta` (KDL: `established_at`, `reported_digest`,
+  `reported_at`) — one atomic write, kills the independent-tear class;
+  `.meta` is advisory/self-healing (missing/stale → reported-set unset).
+- **Canonical violation digest (normative, round 2)**: sha256 over
+  composite-sorted tab-joined lines
+  `(class, ns, name, version, field, kind, candidate_value-raw)`;
+  candidate_value included so same-field re-mutation (V₂→V₃) reads as NEW,
+  not recurring; digest equality added to the cross-impl differential.
+- **Composite key gains trailing `field`** (round 2): breaks
+  root-vs-root ties (`attestation-epoch` before `schema_version`).
+- **Concurrency (round 2)**: sticky-advance makes baseline poisoning
+  impossible under races (advances only on clean diff); no lock file; the
+  fixed-`.tmp`-name torn-write hazard (pre-existing Part-1 latent) is
+  fixed at the root in A2d (unique temp names for all index-cache writes).
+- **Parse-at-gate behavior change named + pinned** (round 2): unparseable
+  candidate no longer clobbers a good cache; fixture asserts byte-identity.
+- **Ephemeral CI position** (round 2): frozen path is immune (lockfile
+  content_hash pins = the go.sum analog); resolving CI jobs need
+  `$XDG_CACHE_HOME/milpa/index/` persisted (guidance ships with A2);
+  committable baseline anchor = **#188** (filed round 2, couples to OQ2's
+  compact form).
+- **Baseline schema-skew** (round 2): unparseable-includes-schema-unknown →
+  `TNG-INDEX-BASELINE-CORRUPT` (skew named in message), never raw
+  `TNG-SCHEMA-UNKNOWN`; all baseline parse errors map to BASELINE-CORRUPT.
+- **`[milpa] warning:` prefix** for yank notices (round 2) — the codebase's
+  single non-fatal stderr convention; round-1's invented `notice:` tier
+  dropped (a two-tier taxonomy would be a CLI-contract RFC).
+- **`ratchet.py` monomorphic** (round 2):
+  `Baseline.check(candidate) → RatchetOutcome(violations, advanced)` — the
+  violations list IS the verdict; genericity deferred to Part 3 =
+  consumer #2 in hand.
+- **Strict-masks-yank-notice trade-off named** (round 2, threat model):
+  fail-closed delays a bundled legitimate CVE-yank notice until the
+  unrelated violation resolves.
+- **Yank aligned with tianguis#13** (round 1): `yanked`/`yanked_at`/
+  `yanked_reason`; surfaced transitions; no `--allow-yanked`; both lookup
+  paths. **Watermark** = max(published_at) over baseline + ~24h skew
+  (tianguis#42). **No in-band correction path** (Go-sumdb position).
+- **Staged enforcement**: lattice complete day one; rekor/attestation/epoch
+  rows enforce at A6 (post Part-2 P2; pinned no-rekor test inverted there).
+- **Baseline GC**: accepted non-goal (noted in §6 `clean` row); belongs to
+  the future store-gc mini-RFC, not `clean`.
 
 ## Slices
-- [ ] A1 — spec: registry-protocol §3.5 (key + dominance + lattice + root
-      fields + staging + placement/ordering + precedence + payload + notices
-      + watermark), §3.2 yank triple + published_at amendment, §5.2, §6
-      baseline trio + accept; cli-contract verb + env + axis; Part 1 note.
-- [ ] A2 — Python: parse ext (published_at, yank triple); dominance fold
-      (`ratchet.py`); baseline lifecycle; BOTH seams; `index-history` axis;
-      root-field check (schema_version); `milpa index accept`; 5 slugs
-      (Python raise-site-complete same change; Rust `all_codes()`+DEFERRED).
-- [ ] A3 — Rust parity (both seams; PartialEq/Eq derives on provenance
-      types); drop DEFERRED.
-- [ ] A4a — harness baseline-seeding extension (fixture schema
-      `baseline.index.kdl` + BOTH runners incl. Python in-process adapter).
-- [ ] A4b — fixture matrix + differential (slugs AND payload ordering).
+
+- [ ] A1 — spec: §3.4.0 policy-axis model (+ Part 2 §4 cross-ref); §3.5
+      full ratchet section; §3.2 yank triple + published_at amendment;
+      §5.2; §6 baseline pair + verbs; cli-contract full verb-spec blocks
+      (`index status`/`index accept`) + env + axis; Part 1 note.
+- [ ] A2a — Python parse ext (published_at, yank triple).
+- [ ] A2b — `ratchet.py` standalone (RatchetOutcome, disjoint tags,
+      reserved root key, lockstep groups, composite ordering, canonical
+      digest) + in-memory unit tests.
+- [ ] A2c — `index-history` axis plumbing (follow `_build_index_trust`
+      pattern; `MilpaEnv.index_trust_config` is dead code — don't inherit).
+- [ ] A2d — seam wiring + baseline lifecycle (parse-at-gate refactor BOTH
+      seams; no-clobber pin; `.meta` lockstep; corrupt mapping; unique
+      temp names; root-field check).
+- [ ] A2e — `milpa index` verb family (nested subparser; workspace/store
+      precedent). Slugs land per-sub-slice (bijection lint is set-equality
+      only — `ID_NAME_TOO_LONG` precedent; Rust `all_codes()` + DEFERRED).
+- [ ] A3 — Rust parity: ONE seam (`load_index` folds recovery via
+      `is_recovery` — no second function); PartialEq/Eq already derived;
+      drop DEFERRED.
+- [ ] A4a — harness seeding, asymmetric: Python extends
+      `_execute_index_trust_fixture` (NOT `_build_env`); **A4a-rs** builds
+      the Rust cache-exercising runner path from scratch (today it feeds
+      hardcoded bytes, no XDG_CACHE_HOME); logical seeds → hashed names;
+      post-state byte-comparison step in both.
+- [ ] A4b — fixture matrix + differential (slugs AND payload ordering AND
+      canonical digests).
 - [ ] A5 — yank selection (both lookup paths), notices, NO-SATISFYING
-      message naming, fixtures.
+      naming, fixtures.
 - [ ] A6 — post-Part-2-P2: attestation/rekor/epoch rows, no-rekor test
-      inversion, staged fixtures.
+      inversion, staged fixtures (incl. root-vs-root tie fixture).
 
 ## Cross-repo / issues
-- **milpa#185** (this RFC) · **milpa#186** yanked-but-locked advisory
-  (filed r1) · **milpa#187** Rekor auditor / cross-consumer baseline diff
-  (filed r1) · **tianguis#13** yank contract aligned + `--allow-yanked` delta
-  commented (r1) · **tianguis#42** indexer-ordering assumption commented (r1).
+
+- **milpa#185** (this RFC) · **#186** yanked-but-locked advisory (r1) ·
+  **#187** Rekor auditor / cross-consumer baseline diff (r1) ·
+  **#188** committable baseline anchor for ephemeral CI (r2) ·
+  **tianguis#13** yank contract aligned + `--allow-yanked` delta (r1) ·
+  **tianguis#42** indexer-ordering assumption (r1).
 
 ## Open forks (awaiting Corey)
-- None. Round 1 resolved everything under the bar; two draft positions were
-  REVERSED with grounds (reset-verb-not-clean; own-axis-not-index-trust) —
-  flagged in the round-1 report for veto.
 
-## Review ledger
+- None. Rounds 1+2 resolved everything under the bar. Round-2 reversals of
+  round-1 positions, flagged for veto: (a) `.at`/`.reported` merged into
+  one `.meta` sidecar; (b) `notice:` prefix dropped for the standard
+  `[milpa] warning:`; (c) accept split into `status`+`accept` family;
+  (d) `Baseline[T]` generic dropped to monomorphic.
+
+## Review ledger — round 2
+
+| id | sev | finding (lens) | status | resolution |
+|----|-----|----------------|--------|------------|
+| R2-1 | blocker | `accept` undefined for 2 of its 3 use cases (absent/corrupt baseline have no diffable state) (depth) | FIXED | three explicit branches w/ distinct messages |
+| R2-2 | blocker | ephemeral CI = permanent TOFU; ratchet never activates on merge-gating runners (breadth) | FIXED | §2 Ephemeral environments (frozen-path immunity, cache persistence guidance, #188 filed) + threat-model cross-ref |
+| R2-3 | sig | `accept` partial-failure looks like success; no preview; fourth CLI shape (design+breadth) | FIXED | `index status` (read-only; `--refresh` dry-run) + `accept` (atomic swap only, loud write-failure error); noun-verb family precedent |
+| R2-4 | sig | `accept` contract surface unspecified (exit codes, stdout, --yes, URL, refresh-failure, idempotency, workspace, off/--no-index/trust-off, epoch blast radius) (breadth+depth) | FIXED | contract-points block; full verb-spec blocks at A1 |
+| R2-5 | sig | `off` contradicts "regardless of policy"; re-enable semantics undefined (depth) | FIXED | off never reads/writes, preserves baseline; corrupt check ranges warn\|strict |
+| R2-6 | sig | `.at`/`.reported` torn-write; no first-reported date storage; no canonical digest form (design+depth×2) | FIXED | merged `.meta` (established_at, reported_digest, reported_at); normative digest incl. raw candidate_value; digest in differential |
+| R2-7 | sig | "monotone" names two different comparators — tag-collision footgun (design) | FIXED | attestation-monotone vs ordinal-non-decreasing, disjoint tags mandated |
+| R2-8 | sig | root fields = second fold path (design) | FIXED | reserved empty-key synthetic entry; one literal fold |
+| R2-9 | sig | "exactly once" overstates two-state enforcement (depth) | FIXED | per-observed-history note; anchor-re-establishment residual in threat model |
+| R2-10 | sig | policy-axis spec prose duplicated 3× ("mirrors X" chains) (design) | FIXED | §3.4.0 generic axis model extraction at A1 + Part 2 cross-ref amendment |
+| R2-11 | sig | no concurrency story; fixed `.tmp` name torn-write (pre-existing, tripled here) (breadth) | FIXED | §2 Concurrency (no-poisoning argument; no lock; unique temp names at A2d) |
+| R2-12 | sig | A4a "both runners" false for Rust (no cache path in conformance runner); wrong-adapter trap; hashed-name mapping (feas) | FIXED | Conformance rewrite: asymmetry named, A4a-rs, logical→hashed mapping, post-state comparison |
+| R2-13 | sig | A2 monolith ~6 pieces; bijection-lint "no deferred window" claim false (feas) | FIXED | A2a–A2e split; ID_NAME_TOO_LONG precedent cited, norm per-sub-slice |
+| R2-14 | min | baseline schema-skew (older milpa vs newer baseline) crashes as TNG-SCHEMA-UNKNOWN (breadth) | FIXED | corrupt-includes-schema-unknown; parse errors map to BASELINE-CORRUPT |
+| R2-15 | min | no read-only inspection surface for the new axis's state (breadth) | FIXED | `index status` (merged into R2-3 split) |
+| R2-16 | min | root-vs-root composite tie undefined (depth) | FIXED | trailing `field` key component + A6 fixture |
+| R2-17 | min | TNG-SCHEMA-UNKNOWN precedence + absent-vs-explicit-1 unstated (depth) | FIXED | schema_version row amended |
+| R2-18 | min | strict fail-closed delays bundled legitimate yank notice (depth) | FIXED | named trade-off in threat model |
+| R2-19 | min | `[milpa] notice:` prefix invented; codebase uses `warning:` uniformly (design) | FIXED | reuse `[milpa] warning:`; taxonomy change = separate CLI-contract RFC |
+| R2-20 | min | `Baseline[T]` generic on 1 proven consumer; tuple can't carry violations (design) | FIXED | monomorphic RatchetOutcome(violations, advanced) |
+| R2-21 | min | parse-at-gate is an unstated behavior change (feas) | FIXED | named + no-clobber fixture pinned |
+| R2-22 | min | A3 misdirects (Rust one seam; derives present; MilpaEnv dead field) (feas) | FIXED | A3/A2c wording corrected |
+| R2-23 | min | no GC surface for accumulated per-URL sidecars (breadth) | ACCEPTED | §6 clean-row note; future store-gc mini-RFC owns it |
+
+## Review ledger — round 1
 
 | id | sev | finding (lens) | status | resolution |
 |----|-----|----------------|--------|------------|
@@ -142,8 +203,17 @@ fixes applied to `rfc-per-entry-attestation.md`:
 | R1-13 | sig | precedence two-rules ambiguity (depth) | FIXED | composite sort key + worked example |
 | R1-14 | sig | harness can't seed baselines; "same shape" claim false (feas) | FIXED | A4a slice |
 | R1-15 | sig | tianguis#13 silent fork (breadth) | FIXED | field alignment + delta recorded on #13 |
-| R1-16 | sig | warn habituation (depth) | FIXED | `.reported` new-vs-recurring |
+| R1-16 | sig | warn habituation (depth) | FIXED | `.reported` new-vs-recurring (superseded by R2-6's `.meta`) |
 | R1-17 | sig | P3a strict usability overstated (delta) | FIXED | Part 2 honest tail |
 | R1-18 | min | provenance diff semantics implicit (depth) | FIXED | multiset-by-value + in-place-mutation fixture |
 | R1-19 | min | remediation hints, command table, TOFU wording, sidecar glob, structured payload, bare-name DoS honesty, OQ3 identity-gate rationale, baseline observability (various) | FIXED | §§2/3/6 + threat model |
 | R1-20 | min | yanked-but-locked UX; auditor tooling unrealized (breadth) | DEFERRED | issues #186, #187 filed |
+
+## Part-2 delta review (round 1, scope note DISCHARGED)
+
+Fixes applied to `rfc-per-entry-attestation.md` in round 1: stage 1b
+unconditional; OQ2 published_at mandatory post-epoch + epoch set-once;
+P3a honest tail; bundle size-cap note; `MILPA_ENTRY_BUNDLE_DIR`; OQ3(ii)
+amended (Part 2 owns the type, this RFC owns the order). Round 2 found no
+new Part-2 staleness (checked: `index-history`/`accept`/ratchet
+terminology consistent).
