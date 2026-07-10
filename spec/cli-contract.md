@@ -70,6 +70,10 @@ A conformant implementation of this spec MUST:
     as the environment-variable form of the index-trust policy (§8.6).
 18. Accept `--refresh-index` as a global flag; forces a fresh index and bundle
     fetch, bypassing the cache TTL (§2.9, §8.6).
+19. Honour `MILPA_INDEX_HISTORY` as the environment-variable form of the
+    `index-history` policy axis (§8.7, `spec/registry-protocol.md §3.5.2`);
+    expose the `milpa index status` / `milpa index accept` verb family
+    (§5.12) for inspecting and accepting append-only-ratchet state.
 
 ---
 
@@ -477,8 +481,10 @@ present by default; there is no flag to enable it.
 > NORMATIVE: All human-readable diagnostic output (progress, warnings,
 > error messages) MUST be written to **stderr**.
 
-> NORMATIVE: Machine-readable output — currently only the dep tree
-> printed by `milpa show` — MUST be written to **stdout**.
+> NORMATIVE: Machine-readable output — the dep tree printed by `milpa show`,
+> the observability block printed by `show --index-trust` (§5.3a), and the
+> status/diff block printed by `milpa index status` / `milpa index accept`
+> (§5.12) — MUST be written to **stdout**.
 
 > NORMATIVE: Verbs that produce no machine-readable output (`fetch`,
 > `lock`, `verify`, `clean`, `add`, `remove`, `update`) MUST produce
@@ -1129,6 +1135,206 @@ local sources.
 
 **stderr:** diagnostic on failure only.
 
+### 5.12  `milpa index status` / `milpa index accept`
+
+Two grouped verbs under an `index` subcommand — the inspection and
+explicit reset surface for the append-only consumer ratchet
+(`spec/registry-protocol.md §3.5`). This is the third instance of the
+nested-subparser pattern `workspace add-member`/`remove-member` (§5.10)
+established: sub-verbs routed through one `index` dispatcher, an
+unrecognised sub-verb exits 2.
+
+**Purpose:** `status` is a read-only inspection tool — it reports the
+locally-cached append-only-ratchet state (and, with `--refresh`, previews
+what a forced refresh would find) without ever writing to disk. `accept`
+performs the same forced-refresh diff and then, and only then, atomically
+swaps the local trust baseline — it is the sole sanctioned way to absorb a
+detected history change (`spec/registry-protocol.md §3.5.1`'s "no in-band
+correction path" clause).
+
+**Arguments:**
+
+```
+milpa index status [--refresh]
+milpa index accept
+```
+
+Neither verb takes a URL argument in v1: both operate on the effective
+index URL for the current invocation, resolved exactly as `fetch` resolves
+it (§8.1).
+
+**Global flags used:** `-C` (workspace/member resolution).
+
+> NORMATIVE: `milpa index status` MUST:
+>
+> - Resolve the effective index URL and, when invoked from a workspace
+>   member directory, delegate to the workspace root (S11e symmetry — the
+>   same delegation `add`/`update` already perform, §5.6/§5.8): root-only
+>   axis, one baseline per effective URL, no member-level state.
+> - Without `--refresh`: read ONLY the local baseline sidecar pair for
+>   that URL (`<cache-key>.index.kdl.baseline` / `.baseline.meta`,
+>   `spec/registry-protocol.md §3.5.2`/`§6`) and print the fixed-format
+>   status block below to stdout. MUST NOT perform a network fetch.
+> - Never write to disk, under any invocation of this verb — including
+>   `--refresh`.
+> - Report `baseline: corrupt` in the status block (rather than raising
+>   `TNG-INDEX-BASELINE-CORRUPT`) when the baseline sidecar exists but
+>   fails to parse. `status` is a read-only inspection tool and MUST NOT
+>   hard-fail on a broken local trust state — it exists in part to let an
+>   operator discover that state safely.
+
+> NORMATIVE (status block, fixed format): the canonical field set, in this
+> order, using the same fixed-width label-column convention as
+> `show --index-trust` (§5.3a; a 17-character label+colon column, no
+> trailing whitespace on any line):
+>
+> ```
+> index-url:        <url>
+> policy:            <off|warn|strict>
+> baseline:          <present|absent|corrupt>
+> established-at:    <ISO-8601 timestamp, or (none)>
+> pending:           <yes|no>
+> last-reported:     <ISO-8601 timestamp, or (none)>
+> ```
+>
+> `pending` and `last-reported` are read from `.baseline.meta`'s
+> `reported_digest` / `reported_at` (an empty or absent `reported_digest`
+> means `pending: no`, `last-reported: (none)`). When `baseline` is
+> `absent` or `corrupt`, `established-at`, `pending`, and `last-reported`
+> are printed as `(none)`, `no`, and `(none)` respectively — there is no
+> observed history to report on.
+
+> NORMATIVE (`--refresh`): with `--refresh`, `status` additionally performs
+> the SAME fetch-and-verify sequence `accept` performs (below) — a network
+> fetch of the candidate index, verified under the effective `index-trust`
+> policy (`spec/registry-protocol.md §3.4`) — and then prints the would-be
+> diff, using the three-branch shape and violation-line format specified
+> under `accept` below, WITHOUT writing the bundle sidecar, the index
+> file, the freshness stamp, or the baseline pair (the dry-run of `accept`;
+> `terraform plan` shape). If the forced fetch itself fails (network
+> error, or a Layer-1 rejection under `index-trust "strict"`), `status
+> --refresh` fails with that error and touches no cache state — the
+> `--refresh-index` precedent (§2.9).
+
+> NORMATIVE (exit code): `milpa index status` exits 0 when there is no
+> attention-worthy state — baseline absent (nothing established yet); or,
+> without `--refresh`, `.meta` reports no pending violation set; or, with
+> `--refresh`, the dry-run diff is clean — and exits 1 otherwise (baseline
+> corrupt; or a nonempty violation set, either `.meta`'s recorded pending
+> set without `--refresh`, or the dry-run diff with `--refresh`). This
+> makes the exit code a scriptable CI gate ("am I sitting on an unresolved
+> history violation, and since when").
+
+> NORMATIVE: `milpa index accept` MUST:
+>
+> - Resolve the effective index URL and workspace root exactly as `status`
+>   does (member-dir delegates to root, S11e).
+> - Perform a network fetch of the candidate index, verified under the
+>   effective `index-trust` policy (§3.4). If this fetch fails, `accept`
+>   fails with that error and MUST NOT touch the baseline pair or any
+>   other cache state (the `--refresh-index` precedent, §2.9).
+> - Compute the diff against the local baseline exactly as the ratchet
+>   check does (`spec/registry-protocol.md §3.5.2`), across all three
+>   baseline states, and print exactly one of:
+>   - **present and parseable** — the full composite-ordered violation
+>     diff (the violation-line format below): what is about to be
+>     accepted. An empty violation set prints `nothing to accept` instead
+>     and performs no baseline write (the idempotent no-op case, below).
+>   - **absent** (TOFU) — `no prior baseline — this fetch establishes the
+>     trust anchor` (there is no diff to show).
+>   - **corrupt** (`TNG-INDEX-BASELINE-CORRUPT` state) — `baseline
+>     unreadable — cannot show what changed; re-establishing the trust
+>     anchor` (same anchor-establishment semantics as TOFU, explicit about
+>     the blindness).
+> - On a nonempty violation set that includes an `attestation-epoch`
+>   root-field change (`spec/registry-protocol.md §3.5.1`), print an
+>   additional line, visually distinct from the per-violation lines,
+>   naming the blast radius before the ordinary diff output: accepting
+>   this change reclassifies every entry between the epochs as
+>   pre-epoch/legacy, nullifying the attestation mandate for all of them —
+>   an index-wide consequence, not a one-row one.
+> - **Atomically** swap the baseline: write
+>   `<cache-key>.index.kdl.baseline` (temp + rename) from the fetched
+>   candidate, then rewrite `.baseline.meta` (`reported_digest` cleared,
+>   `established_at` restamped to the current time). A baseline-write
+>   failure MUST be a loud, distinct error — never a
+>   printed-diff-then-silent-no-op — and MUST leave the previous baseline
+>   pair intact.
+> - Exit 0 on success, including the empty-violation-set no-op case.
+
+> NORMATIVE (violation-line format, shared by `status --refresh` and
+> `accept`): each violation is printed to stdout as one tab-joined line,
+> in composite-key order (`spec/registry-protocol.md §3.5.3`), with the
+> label `violation:` followed by the 8-tuple `class`, `namespace`, `name`,
+> `version`, `field`, `kind`, `baseline_value`, `candidate_value` — absent
+> components rendered as empty strings, values exactly as they appear in
+> the document (never re-formatted). This is the same tuple the canonical
+> violation digest (`spec/registry-protocol.md §3.5.3`) is computed over,
+> with `baseline_value` additionally included for human/script
+> consumption. A trailing `digest: <sha256-hex>` line reports the
+> canonical digest of the printed violation set, for correlation with
+> `.baseline.meta`'s `reported_digest`.
+>
+> Yank-state transitions observed while computing the diff are reported
+> the same way the ordinary ratchet check reports them
+> (`spec/registry-protocol.md §3.5.3`'s `[milpa] warning:` stderr line) —
+> on stderr, not folded into the stdout diff — and do not affect either
+> verb's exit code or `accept`'s no-op decision (yank transitions are
+> legal and do not block a clean-diff no-op).
+
+> NORMATIVE (contract points):
+>
+> - Both verbs are **non-interactive** by design: no confirmation prompt,
+>   no `--yes` flag. `accept` is already an explicit, deliberate verb, and
+>   its printed diff is the record of what was accepted.
+> - `accept` is **idempotent**: running it again immediately after a
+>   successful accept sees a clean diff against the just-written baseline
+>   and prints `nothing to accept`, exit 0.
+> - Diff output goes to **stdout**, in the fixed format above, and MUST be
+>   byte-identical across conformant implementations (the
+>   `show --index-trust` precedent, §5.3a).
+> - Both verbs are **per-URL**: they operate on the effective index URL
+>   for the current invocation; there is no cross-URL batch mode in v1.
+> - Invoked from a **workspace member directory**, both verbs delegate to
+>   the root (S11e symmetry): root-only axis, one baseline per effective
+>   URL, no member-level state.
+> - Under **`--no-index`**, both verbs error: there is no index to load
+>   or compare against.
+> - Under **`index-history "off"`**, `status` still reports (including
+>   that the axis is off, in the `policy:` field) and `accept` still
+>   works, but `accept` additionally warns that the baseline it writes
+>   will not be consulted again until the axis is re-enabled.
+> - Under **`index-trust "off"`**, the fetched candidate has NO
+>   cryptographic basis — the diff an operator confirms via `accept`
+>   attests to continuity of whatever content the transport delivered,
+>   nothing more. Both verbs MUST print this caveat (or an equivalent
+>   sentence) whenever the effective `index-trust` policy is `off`; it
+>   MUST NOT be read as "out-of-band confirmation that the rewrite is
+>   legitimate" — that guarantee does not exist in this configuration.
+
+> NOTE: These verbs are `cmd=index` fixtures in the conformance corpus,
+> landing with `rfc-registry-append-only.md`'s A4b slice; the fixture
+> matrix is enumerated in that RFC's Conformance strategy section. Like
+> `workspace add-member`/`remove-member` (§5.10), they are expected to be
+> `CliOnly` from the in-process conformance runner's perspective.
+
+**Conformance fixtures:** land with `rfc-registry-append-only.md`'s A4b
+slice.
+
+**Environment variables consumed:** `MILPA_INDEX_URL`, `MILPA_INDEX_TRUST`
+and its siblings (§8.6), `MILPA_INDEX_HISTORY` (§8.7).
+
+**Exit codes:** `status` — 0 (no attention-worthy state) / 1 (corrupt
+baseline, or a nonempty pending/diff violation set). `accept` — 0 on
+success (including the no-op case) / 1 on fetch failure or baseline-write
+failure.
+
+**stdout:** the fixed-format status/diff block described above; empty on
+failure before any block is printed.
+
+**stderr:** progress/diagnostic messages, yank-transition notices, and (on
+failure) the error diagnostic.
+
 ---
 
 ## 6  `--frozen` flag/exit semantics (normative)
@@ -1641,6 +1847,40 @@ two axes govern different concerns and MUST NOT be conflated.
 > fixture `env` file under the key `mock_verifier_result`, which the conformance
 > runner maps to `MILPA_INDEX_TRUST_MOCK_VERIFIER` when driving the CLI path.
 
+### 8.7  Index-history (append-only ratchet) axis (normative)
+
+This variable controls the append-only consumer ratchet
+(`spec/registry-protocol.md §3.5`) — a policy axis distinct from both
+`MILPA_INDEX_TRUST` (§8.6, whole-index Sigstore verification) and
+`MILPA_REQUIRE_ATTESTED_METADATA` (§8.5, per-dep DepDecl attestation). All
+three fail independently and are remediated independently
+(`spec/registry-protocol.md §3.4.0`) and MUST NOT be conflated.
+
+#### `MILPA_INDEX_HISTORY`
+
+> NORMATIVE: Sets the `index-history` policy for the invocation. Accepted
+> values: `warn` (default), `strict`, `off`. This is an instantiation of
+> the generic policy-axis model (`spec/registry-protocol.md §3.4.0`, whose
+> instantiation table this axis is a row of): when unset, the effective
+> policy is derived from the manifest `index-history` field using the same
+> authority formula `MILPA_INDEX_TRUST` uses (§8.6) — manifest `off` is
+> unconditional and manifest-only; otherwise
+> `max(manifest_policy or "warn", env_policy)`.
+>
+> `index-history` is declared ONLY on the resolution root (root-only axis,
+> `spec/registry-protocol.md §3.4.0`); a workspace member manifest
+> declaring `index-history` MUST raise `WS-INDEX-HISTORY-ON-MEMBER` (lands
+> with implementation slice) — the sibling of `WS-INDEX-TRUST-ON-MEMBER`
+> for this axis.
+
+> NOTE: This is the distinct sibling of `MILPA_INDEX_TRUST` (§8.6) and
+> `MILPA_REQUIRE_ATTESTED_METADATA` (§8.5): `MILPA_INDEX_TRUST` governs
+> whole-index document integrity; `MILPA_REQUIRE_ATTESTED_METADATA` governs
+> per-dep DepDecl attestation; `MILPA_INDEX_HISTORY` governs whether a
+> newly-fetched, already-trusted index is a legal successor of the last one
+> this consumer observed (`spec/registry-protocol.md §3.5`). All three MAY
+> be set independently; none implies or overrides another.
+
 ---
 
 ## 9  `--version`
@@ -1714,6 +1954,7 @@ implementation-specific and not frozen by this spec.
 | `MILPA_INDEX_TRUST_BUNDLE`        | YES       | Fulcio CA + Rekor key bundle  | (embedded production trust bundle; §8.6)         |
 | `MILPA_INDEX_MAX_AGE`             | YES       | bundle freshness window (sec) | `604800` (7 days; §8.6)                          |
 | `MILPA_INDEX_BUNDLE_URL`          | YES       | Sigstore bundle URL override  | (derived from `MILPA_INDEX_URL`; §8.6)           |
+| `MILPA_INDEX_HISTORY`             | YES       | append-only ratchet policy    | `warn` (§8.7)                                    |
 | `XDG_CACHE_HOME`                  | NO        | CAS + index cache base        | `~/.cache`                                       |
 | `ACTIONS_ID_TOKEN_REQUEST_TOKEN`  | NO        | `publish` OIDC (out-of-scope) | —                                                |
 | `ACTIONS_ID_TOKEN_REQUEST_URL`    | NO        | `publish` OIDC (out-of-scope) | —                                                |

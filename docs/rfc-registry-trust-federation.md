@@ -190,6 +190,21 @@ model.
   accept it as fresh. Lowering `MILPA_INDEX_MAX_AGE` tightens the window at the
   cost of requiring network access that often; the 7-day default is a
   deployment-smoothness tradeoff.
+- **Successor validity across the freshness window.** Freshness bounds how OLD
+  a served index may be; it says nothing about whether that index is a valid
+  *continuation* of the previous one this consumer trusted. The vendor-bot
+  re-signs the entirety of history on every publish, so a compromised or buggy
+  bot can rewrite any historical entry (swap a `content_hash`, strip an
+  attestation, roll back a version) and still produce a maximally-fresh,
+  validly-signed index — the freshness check in this section cannot see any
+  of it. **Amendment (`rfc-registry-append-only.md`, `spec/registry-protocol.md
+  §3.5`):** a consumer-side append-only invariant and refresh ratchet close
+  this gap, under its own policy axis (`index-history`, orthogonal to
+  `index-trust` — §3.4.0's axis-separation criterion). After this amendment,
+  a passing `index-trust` gate means "a valid state, signed by the expected
+  identity, recently"; it does not by itself mean "a valid successor of what
+  this consumer trusted before" — that second guarantee is `index-history`'s
+  to give, layered on top of, never merged into, this section's gate.
 
 ---
 

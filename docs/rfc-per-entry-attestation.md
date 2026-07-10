@@ -251,6 +251,20 @@ makes universal `strict` adoptable directly, so per-member scoping is no longer
 load-bearing for adoption — it survives only as a possible UX refinement. The
 root-scoped placement of the knob is decided and unchanged.
 
+**Amendment (`rfc-registry-append-only.md`, applied A1):** the
+authority/effective-policy mechanics this section describes for
+`entry-trust` — manifest `off` unconditional and manifest-only, otherwise
+`max(manifest or "warn", env)`, root-only declaration, and the
+member-declaration-error pattern — are no longer specific to this axis.
+They are now the generic policy-axis model at `spec/registry-protocol.md
+§3.4.0`, instantiated once per axis (`index-trust`, `entry-trust`,
+`index-history`) rather than restated per RFC; `entry-trust`'s row in that
+section's instantiation table records its manifest node (`entry-trust`),
+env var (`MILPA_ENTRY_TRUST`), default (`warn`), and member-error slug
+(`WS-ENTRY-TRUST-ON-MEMBER`). This section remains the normative home for
+what `entry-trust` verification failure means and how it is remediated;
+only the shared authority formula moved.
+
 ### 5. Error codes (8 × `TNG-ENTRY-*`) and the gate pipeline
 
 The gate evaluates the selected entry through this pipeline; each stage maps to

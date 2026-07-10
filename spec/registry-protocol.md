@@ -38,15 +38,24 @@ A conformant implementation of this spec MUST:
    descending by semver, constraint-filtered (§5).
 6. Treat unrecognized version-node children (children this spec does not
    define) as forward-compat metadata: parse MUST succeed, unknown fields
-   MUST be ignored. `published_at`, `upstream`, and `namespace` remain
-   informational fields under this clause. `attestation`, `signed_by`,
-   `rekor`, and `bundle` are **not** covered by this clause — they parse into
-   the closed-set `EntryAttestation` tagged record (§3.2); an unrecognized
-   attestation `kind` or a structurally invalid record MUST collapse
-   conservatively to *unattested* (with an observable parse diagnostic)
-   rather than being silently ignored (§3.2). Layer 2 enforcement over the
-   parsed record — the `entry-trust` gate — is a separate, later normative
-   surface (§3.2, "gate lands separately").
+   MUST be ignored. `upstream` and `namespace` remain informational fields
+   under this clause. `attestation`, `signed_by`, `rekor`, `bundle`,
+   `published_at`, `yanked`, `yanked_at`, and `yanked_reason` are **not**
+   covered by this clause — they parse into typed fields on `IndexVersion`
+   (§3.2) rather than being silently ignored. `attestation` (with its
+   siblings `signed_by`/`rekor`/`bundle`) parses into the closed-set
+   `EntryAttestation` tagged record and MUST collapse conservatively to
+   *unattested* (with an observable parse diagnostic) on an unrecognized
+   `kind` or a structurally invalid record (§3.2). `published_at` and the
+   `yanked`/`yanked_at`/`yanked_reason` triple use the parser's ordinary
+   optional-scalar robustness posture instead (a malformed value surfaces as
+   absent, no collapse diagnostic, no hard error — §3.2). Layer 2
+   enforcement over the parsed attestation record — the `entry-trust` gate —
+   is a separate, later normative surface (§3.2, "gate lands separately");
+   likewise, enforcement of the append-only consumer ratchet over
+   `published_at` and the yank fields (§3.5) is staged to
+   `rfc-registry-append-only.md`'s A2/A5 slices, not this spec-only
+   amendment.
 7. Treat unknown provenance `kind` values as forward-compat: skip the
    provenance record rather than failing, provided at least one known-kind
    provenance remains on the version.
@@ -221,9 +230,29 @@ first is canonical, the rest are mirrors. A fetcher MUST attempt them in order.
 > MUST NOT write a second provenance parser for the index — one parser, shared.
 
 **`published_at`** (child node, string, optional) — ISO 8601 timestamp of when
-the version was published. Informational at this layer; parse-to-typed
-handling and its role as the append-only ratchet's attestation-epoch anchor
-are `rfc-registry-append-only.md`'s A2/A2a scope, not this section's.
+the version was published.
+
+> NORMATIVE: `published_at` is a parse-to-typed field on `IndexVersion`
+> (`published_at: <timestamp> | None`, parsed from ISO 8601). A malformed
+> value MUST NOT raise a hard parse error — it uses the same robustness
+> posture as the parser's other optional scalar children: surfaced as
+> absent. This amends the item-6 forward-compat clause above:
+> `published_at` was previously listed as tolerate-and-ignore metadata; as
+> of this amendment it is typed, not ignored. The parse-to-typed contract
+> is normative as of this amendment; enforcement of the checks that consume
+> the typed value (below) lands with `rfc-registry-append-only.md`'s A2/A2a
+> slice.
+
+> NORMATIVE: In the field-class taxonomy §3.5 defines over successive index
+> states, `published_at` is **Frozen** (set-once): backfilling an
+> absent-or-empty `published_at` to a value is legal exactly once per
+> observed history; a `value → value′` change or a `value → absent`
+> regression on an already-published entry is a ratchet violation (§3.5.1).
+> `published_at` is also the anchor for the publication watermark (§3.5.4)
+> — the append-only ratchet's backdating check. Per Part 2's epoch mandate
+> (`rfc-per-entry-attestation.md` open question 2), `published_at` becomes
+> REQUIRED on post-epoch entries once the attestation epoch ships; that
+> requirement is not yet in force as of this amendment.
 
 #### Per-entry attestation record (`attestation` / `signed_by` / `rekor` / `bundle`)
 
@@ -423,6 +452,69 @@ must be a non-negative integer. When absent, `None` on the in-memory type.
 > exercises a version node with both fields set; both impls must parse it and
 > produce the same resolution output as without the fields.
 
+#### Yank triple (`yanked` / `yanked_at` / `yanked_reason`)
+
+The sanctioned in-band removal story: the append-only invariant (§3.5)
+forbids deleting a published entry, so the registry needs a legal way to
+retire a version from *new* candidate selection without rewriting history.
+These three optional sibling child nodes on a `version` node record that
+state, aligned with tianguis#13's contract:
+
+```kdl
+version "1.4.2" {
+    content_hash "dag-sha256:…"
+    yanked #true
+    yanked_at "2026-07-01T12:00:00Z"                    // optional
+    yanked_reason "ships a vulnerable bearssl pin"      // optional
+}
+```
+
+**`yanked`** (child node, boolean, optional) — marks the version as yanked.
+Absent is equivalent to `#false`.
+
+**`yanked_at`** (child node, string, optional) — ISO 8601 timestamp of the
+most recent yank-state transition. Informational.
+
+**`yanked_reason`** (child node, string, optional) — free-text explanation
+(e.g. `"ships a vulnerable bearssl pin"`). Informational; surfaced in
+ratchet notices (§3.5.3) and in the `TNG-NO-SATISFYING-VERSION` message
+when relevant (§5.2).
+
+> NORMATIVE: `yanked`, `yanked_at`, and `yanked_reason` are parse-to-typed
+> fields on `IndexVersion` (`yanked: bool`, default `false`;
+> `yanked_at: <timestamp> | None`; `yanked_reason: str | None`). A
+> malformed value (e.g. a non-boolean `yanked`) MUST NOT raise a hard parse
+> error — it uses the parser's ordinary optional-scalar robustness posture
+> (surfaced as absent / default `false`), the same posture `published_at`
+> uses above. Older milpa versions that predate these fields tolerate and
+> ignore them (item 6 of "Normative surface").
+
+> NORMATIVE: In the field-class taxonomy §3.5 defines over successive index
+> states, the yank triple is **advisory-mutable-but-surfaced**: both a yank
+> and an un-yank are legal transitions in either direction (a mistaken yank
+> must be reversible — cargo precedent), and the entry's other fields
+> (`content_hash`, `provenance`, `dep_decl`, …) remain frozen while
+> yanked — yanking hides nothing and rewrites nothing. Unlike the rest of
+> the advisory-mutable class, every yank-state transition observed between
+> a consumer's ratchet baseline and a candidate index MUST be reported as a
+> non-fatal notice — never an error, never silent (§3.5.3).
+
+> NORMATIVE (staged — enforcement lands at `rfc-registry-append-only.md`'s
+> A5 slice): once `yanked` is `#true`, the version MUST be excluded from
+> *new* candidate enumeration — §5.2 amendment below specifies the
+> selection semantics. This clause specifies only the parse-to-typed
+> contract and the field's semantic status as of this spec-only amendment
+> (A1); selection-time exclusion is not yet enforced.
+
+> NOTE: There is no `--allow-yanked` escape hatch in milpa v1 — reproducing
+> an already-locked yanked version is fully covered by the frozen path
+> (which never consults `yanked`); a resolution-time override would
+> reintroduce, as a user flag, exactly the silent-downgrade selection the
+> yank notice exists to surface. Recorded as a deliberate delta from
+> tianguis#13's sketch. A non-blocking yanked-but-locked advisory in
+> `verify`/`show` is deferred follow-up scope, filed as #186 — it must not
+> touch resolution behavior.
+
 ### 3.3  Provenance record shapes (index form)
 
 Index provenance records use the same kind-set and field shapes as the manifest
@@ -511,6 +603,78 @@ this document as of this amendment. §3.2 specifies parsing (the fields are
 now typed, not ignored); it does not specify a verifier or a policy gate.
 Nothing in this spec should be read as implying an `entry-trust` gate
 exists yet.
+
+#### 3.4.0  Generic policy-axis model
+
+This spec defines multiple independent trust/integrity axes over the
+registry read path — `index-trust` (this section, whole-index Sigstore
+verification), `entry-trust` (per-entry author attribution,
+`rfc-per-entry-attestation.md` §4), and `index-history` (§3.5, the
+append-only consumer ratchet) — and the count is expected to grow. Each
+axis fails independently, is remediated independently, and is deliberately
+NOT merged into any other axis: `rfc-per-entry-attestation.md` §4 makes the
+axis-separation argument for `entry-trust`, and `rfc-registry-append-only.md`
+§2 makes it for `index-history` (a validly-signed, maximally-fresh index can
+still be an invalid successor — a distinct failure with a distinct fix). All
+axes nonetheless share one authority/effective-policy pattern; this section
+states that pattern **once**, parametrized by (axis name, default policy,
+environment variable, member-declaration error slug), and each axis's own
+subsection instantiates it rather than restating it. The code-level SSOT
+already exists — `trust.py`'s `effective_trust_policy` serves every axis —
+this section applies the same single-source-of-truth discipline to the spec
+prose.
+
+> NORMATIVE (generic effective-policy formula): for an axis with manifest
+> node `<axis>`, environment variable `MILPA_<AXIS>`, and default policy
+> value `<default>` (values drawn from `{off, warn, strict}` unless the
+> axis's own subsection narrows the set):
+>
+> 1. If the manifest declares `<axis> "off"`, the effective policy is `off`
+>    **unconditionally**. No environment variable or CLI flag can override
+>    a manifest `off`. `off` is an auditable opt-out that MUST ONLY be
+>    declared in `milpa.kdl` (committed to version control) —
+>    `MILPA_<AXIS>=off` in the environment is a no-op floor that CANNOT
+>    weaken a manifest `warn` or `strict` policy.
+> 2. Otherwise: `effective = max(manifest_policy or <default>, env_policy)`
+>    over `{warn, strict}`. `MILPA_<AXIS>=off` in the environment is ignored
+>    in this step (same no-op-floor rule as step 1).
+> 3. An axis MAY define additional CLI-flag escalation rules layered on top
+>    of step 2 (e.g. `index-trust`'s `--require-attested-index`, §3.4.5
+>    rule 3). Such flags MAY ONLY strengthen the policy and MUST NOT set or
+>    clear `off`.
+
+> NORMATIVE (root-only declaration): every axis governed by this model is
+> declared ONLY on the **resolution root** — for a standalone package, the
+> package manifest; for a workspace, the workspace ROOT manifest (the one
+> carrying the `workspace { member … }` block). The resource each axis
+> gates (the registry index; for `entry-trust`, the per-entry attestation
+> record within it) is process-global and workspace-shared — the axis is
+> therefore a property of the resolution root, not of each member, and
+> there is no merge across members.
+
+> NORMATIVE (member-declaration error): a workspace MEMBER manifest
+> declaring the axis's manifest node (or any sibling configuration node the
+> axis defines, e.g. `index-trust`'s `-signer`/`-bundle`) MUST raise that
+> axis's dedicated member-declaration error BEFORE any index fetch. This
+> check fires at workspace-load time and fires even when the declared value
+> is textually identical to the default — the rule is about WHERE the field
+> is declared, not what value it holds.
+
+> NORMATIVE (instantiation rows): every axis's member-declaration error is a
+> distinct slug following the `WS-<AXIS>-ON-MEMBER` naming pattern
+> established by `index-trust`:
+>
+> | Axis | Manifest node(s) | Env var | Default | Member-error slug | Normative home |
+> |---|---|---|---|---|---|
+> | `index-trust` | `index-trust`, `index-trust-signer`, `index-trust-bundle` | `MILPA_INDEX_TRUST` | `warn` | `WS-INDEX-TRUST-ON-MEMBER` | §3.4.5 / §3.4.7 (this document) |
+> | `entry-trust` | `entry-trust` | `MILPA_ENTRY_TRUST` | `warn` | `WS-ENTRY-TRUST-ON-MEMBER` | `rfc-per-entry-attestation.md` §4 |
+> | `index-history` | `index-history` | `MILPA_INDEX_HISTORY` | `warn` | `WS-INDEX-HISTORY-ON-MEMBER` | §3.5.2 (this document) |
+>
+> This table is the SSOT for which axes exist and their identifying
+> parameters. Each row's "Normative home" is where the axis's
+> policy-specific behavior (what a verification failure means, what
+> remediation looks like) is actually specified; this section specifies
+> only the shared authority mechanics.
 
 #### 3.4.1  When the gate fires
 
@@ -749,18 +913,14 @@ key. Failure MUST raise `TNG-INDEX-SIGNATURE-INVALID`.
 > instead of settling into degraded mode indefinitely. Under `strict`, a bundle 404
 > MUST raise `TNG-INDEX-BUNDLE-MISSING` and MUST NOT write partial cache state.
 
-> NORMATIVE (effective policy): The effective policy is computed as follows:
->
-> 1. If the manifest declares `index-trust "off"`, the effective policy is `off`
->    unconditionally. No environment variable or CLI flag can override a manifest
->    `off`. `off` is an auditable opt-out that MUST ONLY be declared in `milpa.kdl`
->    (committed to version control). `MILPA_INDEX_TRUST=off` in the environment is
->    a no-op floor — it CANNOT weaken a manifest `warn` or `strict` policy.
-> 2. Otherwise: `base = max(manifest_policy or "warn", env_policy)` over
->    `{warn, strict}`. `MILPA_INDEX_TRUST=off` in the environment is ignored in
->    this step.
-> 3. If `--require-attested-index` is given: effective policy is `strict` (unless
->    rule 1 applies; the flag MUST NOT set or clear `off`).
+> NORMATIVE (effective policy — instantiates §3.4.0): `index-trust` is an
+> instantiation of the generic policy-axis model (§3.4.0) with manifest node
+> `index-trust`, environment variable `MILPA_INDEX_TRUST`, and default
+> `warn`. §3.4.0's rules 1–2 (manifest `off` is unconditional and
+> manifest-only; otherwise `max(manifest_policy or "warn", env_policy)`)
+> apply verbatim. Rule 3 is this axis's CLI-flag escalation: if
+> `--require-attested-index` is given, the effective policy is `strict`
+> (unless §3.4.0 rule 1 applies; the flag MUST NOT set or clear `off`).
 
 #### 3.4.6  Per-URL signer resolution
 
@@ -779,11 +939,15 @@ key. Failure MUST raise `TNG-INDEX-SIGNATURE-INVALID`.
 
 #### 3.4.7  Workspace requirements — root authority
 
-> NORMATIVE (root authority): `index-trust`, `index-trust-signer`, and
-> `index-trust-bundle` are declared ONLY on the **resolution root**. The registry
-> index is a process-global, workspace-shared resource (one index URL per
-> invocation, no per-member index URL) — index-trust is therefore a property of
-> the resolution root, not of each member. The resolution root is:
+`index-trust` (together with its sibling override nodes `index-trust-signer`
+and `index-trust-bundle`) instantiates the generic policy-axis model's
+root-only-declaration and member-declaration-error rules (§3.4.0) with
+member-error slug `WS-INDEX-TRUST-ON-MEMBER`. The registry index is a
+process-global, workspace-shared resource (one index URL per invocation, no
+per-member index URL), which is exactly the structural condition §3.4.0's
+root-only rule generalizes.
+
+> NORMATIVE (root authority — instantiates §3.4.0): The resolution root is:
 >
 > - For a standalone package: the package manifest itself (unchanged).
 > - For a workspace: the workspace ROOT manifest — the one carrying the
@@ -793,20 +957,446 @@ key. Failure MUST raise `TNG-INDEX-SIGNATURE-INVALID`.
 >   `kind`, so declaring them does not trigger the deps/kind rejection).
 >
 > The effective policy for a workspace invocation is simply the root's own
-> `index-trust` value (default `warn` if the node is absent) — there is no
-> merge, and no other manifest contributes to it. Consequently a workspace HAS
-> a manifest-level path to an effective `off`: declare `index-trust "off"` on
-> the workspace root.
+> `index-trust` value (default `warn` if the node is absent) — per §3.4.0
+> there is no merge, and no other manifest contributes to it. Consequently a
+> workspace HAS a manifest-level path to an effective `off`: declare
+> `index-trust "off"` on the workspace root.
 
-> NORMATIVE (member-declaration error): A workspace MEMBER manifest declaring
-> ANY of `index-trust`, `index-trust-signer`, or `index-trust-bundle` MUST raise
-> a hard validation error — `WS-INDEX-TRUST-ON-MEMBER` — BEFORE any index fetch.
-> This check fires at workspace-load time. It fires even when the member's
-> declared value is identical to the default (e.g. an explicit
-> `index-trust "warn"` on a member is still an error) — the rule is about WHERE
-> the field is declared, not what value it holds. `WS-INDEX-TRUST-ON-MEMBER` is
-> distinct from the six `TNG-INDEX-*` error slugs; it is a manifest-structure
-> error that does not involve cryptographic verification.
+> NORMATIVE (member-declaration error — instantiates §3.4.0): A workspace
+> MEMBER manifest declaring ANY of `index-trust`, `index-trust-signer`, or
+> `index-trust-bundle` MUST raise `WS-INDEX-TRUST-ON-MEMBER` BEFORE any
+> index fetch. This check fires at workspace-load time, per §3.4.0's rule
+> (fires even when the member's declared value is identical to the default
+> — e.g. an explicit `index-trust "warn"` on a member is still an error).
+> `WS-INDEX-TRUST-ON-MEMBER` is distinct from the six `TNG-INDEX-*` error
+> slugs; it is a manifest-structure error that does not involve
+> cryptographic verification.
+
+### 3.5  Append-only invariant & refresh ratchet
+
+§3.4's whole-index attestation gate verifies that a served `index.kdl` was
+signed by the expected identity, recently. It does **not** verify that the
+signed index is a valid **successor** of the index a consumer previously
+trusted — a compromised or buggy vendor-bot re-signs the entirety of history
+on every publish, so a mutated historical entry (a swapped `content_hash`, a
+stripped attestation, a rolled-back version) can ship inside a perfectly
+fresh, perfectly valid signed index. This section specifies a
+consumer-side check — the **append-only invariant** over what may change
+between two successive index states, and the **refresh ratchet** that
+enforces it — that closes this gap. It is the normative content of
+`rfc-registry-append-only.md`; that RFC is this section's design record and
+carries the threat model, the residuals this section does not close (TOFU
+at trust-anchor re-establishment, split-view attacks), and the slice
+sequencing that stages enforcement.
+
+This section is orthogonal to §3.4: §3.4 verifies "this document was
+signed by the expected identity, recently"; this section verifies "this
+document is a legal continuation of the last one this consumer trusted".
+Both must pass — the ratchet does not replace the whole-index gate, and
+disabling one axis has no effect on the other (§3.4.0).
+
+#### 3.5.1  The monotone-entry invariant (dominance over a product order)
+
+> NORMATIVE (entry key): For the purpose of this section, an index entry is
+> keyed by `(namespace, name, raw version string exactly as it appears in
+> the document)`. Keying on the raw version string means a cosmetic
+> re-spelling (e.g. `"1.4.2"` → `"01.4.2"`) is a package disappearance plus
+> a package appearance under this key — caught as rollback (below), not
+> silently matched. A `namespace` change is likewise a disappearance under
+> the old key; `namespace` needs no field class of its own because it is
+> *inside* the key.
+
+> NORMATIVE (the invariant): For every entry key present in a consumer's
+> **baseline** index state (§3.5.2), the corresponding entry in a
+> **candidate** index state MUST **dominate** the baseline entry in the
+> product partial order over the field classes below. Entry *presence*
+> is itself a component of that product (`absent < present`; a
+> `present → absent` transition is never legal) — so a version or package
+> disappearing between baseline and candidate is the same dominance failure
+> as a frozen-field mutation, not a separate rule.
+
+Each field is tagged with exactly one of five **disjoint** order kinds. The
+tag names are deliberately distinct even where two orders both read as
+"monotone" in English — a conformant fold implementation MUST NOT share one
+tag between them:
+
+| Class (order kind) | Fields | Legal transitions |
+|---|---|---|
+| **Frozen** (`set-once`: `absent < v`; distinct values incomparable) | `content_hash`; `dep_decl` **together with** `dep_decl_schema_version` (they move in lockstep — mutating the schema version alone re-interprets the pin and is a violation); `published_at` (§3.2); the attestation record's `rekor` block; presence of the version node; presence of the package node | `absent/empty → value` is legal **exactly once per observed history** (§3.5.2's re-anchoring note). `value → value′` and `value → absent` are violations. Legacy backfill (an entry with an empty `content_hash` is unresolvable anyway, `TNG-NO-IDENTITY`, so backfilling it is semantically a first publication) is the sanctioned shape of the one legal transition; same shape for `dep_decl`. |
+| **Attestation-monotone** (the bespoke lattice over attestation kinds — a *distinct* order-kind tag from `ordinal-non-decreasing` below, even though both read as "monotone") | the attestation record (`rfc-per-entry-attestation.md`'s `EntryAttestation` incl. its `bundle` pin). Part 2 owns the *type*; this section owns the *order* over its values. | `None → MilpaVendored`, `None → AuthorSigned(s)`, `MilpaVendored → AuthorSigned(s)` (backfill/upgrade) are legal. `→ None` (stripping), `AuthorSigned(s₁) → AuthorSigned(s₂)` (re-attribution), and `AuthorSigned → MilpaVendored` (downgrade) are violations. `MilpaVendored → MilpaVendored` with a changed `signed_by` (bot workflow identity rotation) is **unconstrained** — vendored attestation is a bug ratchet, not a security boundary. Within an otherwise-unchanged `(kind, signer)`, the record's `bundle` pin MUST be structurally equal; a same-kind `bundle_pin` swap is a violation (`monotone-repinned`) — the pin may change only as part of a legal kind/signer upgrade. This row checks the pin's history *across snapshots* (ratchet-time); it is distinct from and cannot collide with `TNG-ENTRY-BUNDLE-PIN-MISMATCH` (`rfc-per-entry-attestation.md`'s stage 1b), which checks served bytes against the *current* snapshot's pin (acquisition-time transport integrity). |
+| **Append-only** (multiset inclusion, compared by full-field value equality — never by list position) | the `provenance` **multiset** (§3.3) | records may be added (mirrors); removal is a violation. In-place mutation of one record's fields (e.g. `commit_sha`) manifests under multiset comparison as removal + addition — caught as removal. Preference **order** among provenance records is advisory-mutable (reordering is legal — the identity gate makes every provenance of an entry byte-equivalent, §3.3, so order affects availability, not identity). |
+| **Advisory-mutable** (trivial order — everything comparable, both directions legal) | `yanked` / `yanked_at` / `yanked_reason` (mutable both directions, but every transition MUST be surfaced as a ratchet notice, §3.5.3 — never silent); package-level descriptive fields (`upstream`) (mutable and silent) | both directions legal |
+
+**Root-level fields (outside the entry map).** Root fields ride the **same
+generic fold** as entries, not a parallel one: a conformant implementation
+synthesizes one reserved entry under the empty key (`namespace = ""`,
+`name = ""`, `version = ""` — exactly the key the §3.5.3 composite ordering
+already assigns root violations) whose "fields" are the document-root
+fields, each tagged with its own order kind:
+
+| Root field | Order kind | Legal transitions |
+|---|---|---|
+| `schema_version` (§2) | **ordinal-non-decreasing** (plain integer `≤` — its own tag, NOT `attestation-monotone`) | increase is legal (schema evolution); decrease is a violation. `absent` ≡ the spec default (`1`, §2) within this order — removing an explicit `schema_version 2` node is a decrease, not an unclassified state. A candidate declaring a schema *newer than this consumer understands* never reaches the ratchet at all: `TNG-SCHEMA-UNKNOWN` aborts at parse time, unconditionally (§2); the increase-legal row is live only within the consumer's parseable range. |
+| `attestation-epoch` (`rfc-per-entry-attestation.md` open question 2) | **set-once** (the same tag as the entry table's `Frozen` row) | `absent → E` is legal exactly once; any change thereafter is a violation. Set-once, not merely non-decreasing: *raising* the epoch reclassifies every published entry as pre-epoch/legacy and nullifies the attestation mandate while staying technically non-decreasing. |
+
+Violations attributed to the reserved root key raise `TNG-INDEX-ROOT-MUTATED`
+(§3.5.3; lands with implementation slice). Ownership follows the
+attestation-order rule above: this section owns root-field orders; the
+document that introduces a field owns its type.
+
+> NORMATIVE (dominance fold): A conformant implementation MUST implement
+> **one** generic `dominates(baseline_entry, candidate_entry) → violations`
+> fold over field/order-kind tags — root-vs-entry comparison is thereby a
+> *data* difference (which entry key is being compared), not a second code
+> path. Adding a field later means tagging it with an order kind, not
+> writing a new prose carve-out or a new comparison branch.
+
+> NORMATIVE (set-once is per-observed-history): the ratchet (§3.5.2)
+> compares exactly two states, so "exactly once" in the Frozen and
+> attestation-epoch rows above is enforced relative to the *current
+> baseline*, not globally across all of history. Every trust-anchor
+> re-establishment — first-contact TOFU, `milpa index accept`, or
+> corrupt-baseline recovery (§3.5.2) — re-anchors it: a
+> `V₁ → absent → V₂` rewrite whose steps all fell before the new anchor is
+> indistinguishable, at that anchor, from a legal first backfill. This is
+> not a gap unique to this row — it is the same TOFU/re-anchoring bound
+> that applies to the whole ratchet, restated here because the Frozen and
+> set-once rows are where it is most visible. A continuously observing
+> consumer (one that never re-anchors) still catches the rewrite as a
+> `frozen-changed` violation. `index-history "off"` does **not** create a
+> re-anchoring gap: `off` freezes the baseline in place but never deletes
+> it (§3.5.2).
+
+Two derived rules, stated explicitly because they follow non-obviously from
+the invariant above:
+
+> NORMATIVE (no in-band correction path): There is no sanctioned way to
+> "fix" a mis-published entry in place. The sanctioned remedy for a
+> mis-published entry is: yank it (§3.2) and publish a corrected *new*
+> version. An index-generator bug that produced a wrong `dep_decl`, for
+> instance, is a mutation of resolution-relevant history like any other —
+> a "trusted correction" path would be indistinguishable, consumer-side,
+> from the attack this section exists to detect.
+
+> NORMATIVE (registry migration is out-of-band): a catastrophic
+> operator-side history rewrite (e.g. a registry migration) is not
+> absorbed silently by any policy value. Consumers under `warn` or `strict`
+> alarm (§3.5.2); each must explicitly accept the new history via
+> `milpa index accept` (`spec/cli-contract.md`). That friction is
+> deliberate — history rewrites must never be silently absorbable.
+
+> NORMATIVE (semantic, not byte-level): the invariant constrains the
+> **parsed** entry map, never the document's serialization. Re-serializing,
+> re-ordering, or re-formatting the `index.kdl` document is always legal
+> and produces no violation.
+
+> NORMATIVE (staged enforcement): the lattice above is complete in this
+> spec as of this amendment, but two rows constrain fields the parse
+> boundary does not yet type: the attestation record and the `rekor` block
+> (§3.2 still specifies these as parsed-and-ignored pending
+> `rfc-per-entry-attestation.md`'s P2 slice, and a pinned regression test
+> asserts `IndexVersion` carries no `rekor` attribute today). Enforcement
+> of a given row lands with the slice that makes its fields parse-to-typed:
+> `content_hash` / `dep_decl` / `dep_decl_schema_version` / presence /
+> provenances are parseable today; `published_at` and the yank triple gain
+> parse-to-typed handling, and this section's checks over them gain
+> enforcement, at `rfc-registry-append-only.md`'s A2 slice; the attestation
+> record and `rekor` rows (including the `attestation-epoch` root field)
+> enforce at that RFC's A6 slice, after Part 2's P2 parser change lands.
+> Until the corresponding slice lands, this section specifies the target
+> behavior; it does not itself change what any implementation currently
+> enforces.
+
+#### 3.5.2  The consumer ratchet
+
+**Where the check runs.** The ratchet runs on **every code path that
+persists a network-fetched index** — both the ordinary stale-refetch path
+(§6 State 2) and any bounded crash-recovery re-fetch (§3.4.2). A candidate
+arriving via crash recovery is exactly as untrusted as an ordinary State-2
+fetch; leaving it unratcheted would make forced cache corruption a
+smuggling channel. The check runs **after** the §3.4 whole-index gate
+succeeds and **before any cache mutation begins**, including the bundle
+sidecar write — gating only the final index write would leave a
+strict-rejected fetch having already overwritten the bundle sidecar, a torn
+state the next read would misdiagnose as crash corruption.
+
+> NORMATIVE: Pure cache reads and offline fallback (§6 States 1 and 3) MUST
+> NOT run the ratchet — there is no new state to compare. `milpa verify`'s
+> offline re-verification of the cached index is likewise out of scope
+> (single-state, nothing to diff).
+
+**Baseline sidecars.** A conformant implementation maintains a sidecar pair
+per index cache key (§6), distinct from the bundle sidecars of §3.4.2:
+
+- `<cache-key>.index.kdl.baseline` — a full copy of the last index that
+  passed the ratchet cleanly. Written atomically (temp file + rename).
+- `<cache-key>.index.kdl.baseline.meta` — one small KDL document carrying
+  the metadata that must move in lockstep with the baseline:
+  `established_at` (the TOFU/advance timestamp — when this consumer first
+  trusted this URL, or last re-anchored it), `reported_digest` and
+  `reported_at` (the canonical digest, §3.5.3, of the last-warned violation
+  set, and when it was *first* reported — the values the *warn* recurrence
+  text below reads). This is deliberately **one** sidecar with one atomic
+  write, not two independently-torn files: a crash between two separate
+  writes could leave a stale digest that silently mispaints a *new*
+  mutation as recurring.
+
+> NORMATIVE: `.baseline.meta` is advisory (observability and the
+> habituation defense of §3.5.3, never a trust boundary): if it is missing
+> or stale relative to `.baseline` (a crash in the window between their
+> writes), an implementation MUST treat the reported-violation-set as unset
+> — the next warning counts as new. This is self-healing and has no
+> security impact.
+
+Both sidecars are part of the same `<cache-key>.index.kdl*` sidecar family
+as the bundle sidecars (§6); `milpa clean` MUST NOT remove them, for the
+same reason it MUST NOT remove the index cache (§6).
+
+> NORMATIVE (sticky-advance baseline): the baseline advances **only on a
+> clean diff** (no violations). It is deliberately NOT the served cache
+> file: under `warn`, the served cache advances to the new index (matching
+> §3.4's existing warn semantics — warn is observability), but the
+> **comparison base** does not advance on a dirty diff. If it did, a single
+> warning would be the attack's entire cost and the mutated history would
+> become the new baseline (ratchet poisoning: alarm once, then self-heal
+> into the attacker's history). With a sticky baseline, every subsequent
+> refresh re-alarms until the mutation is reverted upstream or the operator
+> explicitly accepts it (`milpa index accept`, below).
+
+> NORMATIVE (write ordering): a conformant implementation MUST write, in
+> order: (1) the ratchet check itself (no mutation); (2) the bundle
+> sidecar; (3) the index file (rename into place); (4) the freshness stamp;
+> (5) the baseline (only on a clean diff); (6) `.baseline.meta` (last). The
+> baseline MUST be written strictly **after** a successful index write, so
+> it only ever reflects content actually served — a crash between them
+> costs one redundant re-diff on the next refresh (safe), whereas writing
+> the baseline first could advance trust past content that was never
+> served. A crash between the baseline and `.meta` writes is covered by
+> `.meta`'s advisory/self-healing rule above.
+
+> NORMATIVE (concurrency): two invocations racing a refresh of the same URL
+> MUST NOT be able to poison the baseline. This follows from sticky-advance
+> by construction: the baseline only ever advances to a candidate that
+> passed a clean diff against a valid baseline, so the worst interleaving
+> is a duplicate warning or a diff computed against a one-step-older
+> baseline — both self-heal on the next refresh. No lock file is required
+> or specified. All index-cache sidecar writes (bundle, index, baseline,
+> `.meta`) MUST use a per-write-unique temporary sibling file name (e.g.
+> PID + random suffix) before the atomic rename — a fixed temporary name
+> allows two concurrent writers to interleave partial writes before either
+> renames, a hazard this section's additional sidecars would otherwise
+> multiply.
+
+> NORMATIVE (baseline corruption is not TOFU): an *absent* baseline file
+> means legitimate first contact (TOFU, below). A *present but
+> unparseable or truncated* baseline — including a baseline whose
+> `schema_version` exceeds this consumer's supported version
+> (`TNG-SCHEMA-UNKNOWN`-shaped skew, but on **local trust state**, not
+> served content) — MUST hard-fail with `TNG-INDEX-BASELINE-CORRUPT`
+> (lands with implementation slice) under **`warn` and `strict` alike**,
+> mirroring §3.4.2's second-mismatch crash-recovery discipline. This check
+> does not fire under `index-history "off"` (the file is never read under
+> that policy — see the policy table below). The error message SHOULD name
+> version skew as a likely cause when applicable, but MUST NOT reuse the
+> generic `TNG-SCHEMA-UNKNOWN` slug, which is reserved for served content.
+> Any parse or decode error on the baseline read maps to
+> `TNG-INDEX-BASELINE-CORRUPT`; raw parser error slugs MUST NOT leak
+> through this path. Silently degrading a corrupt baseline to TOFU would
+> make "corrupt the baseline file" a free ratchet reset. Recovery from this
+> state is `milpa index accept` (below).
+
+> NORMATIVE (the check): a conformant implementation parses the baseline
+> and the candidate with the shared index parser (extended per §3.5.1's
+> staged-enforcement note), diffs the two entry maps, and evaluates the
+> §3.5.1 dominance relation per entry (including the reserved root-field
+> entry). All violations are collected into a structured list (§3.5.3); on
+> any violation the baseline does not advance. Parsing the candidate at
+> this gate — **before** any cache mutation, not after, as an ordinary
+> fetch-then-parse sequence would do — is itself a normative behavior
+> change from a naive implementation: an unparseable candidate MUST NOT
+> clobber a good cache. Fixture-level conformance pins this: fetch OK,
+> candidate fails to parse → the index file, bundle sidecar, and freshness
+> stamp are byte-identical to their pre-fetch state.
+
+**Policy axis: `index-history`.** This section's checks are gated by their
+own policy axis, `index-history` (manifest node) / `MILPA_INDEX_HISTORY`
+(env var), values `off | warn | strict`, default `warn` — an instantiation
+of the generic policy-axis model (§3.4.0) with member-error slug
+`WS-INDEX-HISTORY-ON-MEMBER` (lands with implementation slice). It does
+**not** ride `index-trust`: a validly-signed, maximally-fresh index can
+still be an invalid successor (an independent failure mode), and the
+remediations differ entirely (re-fetch a bundle vs revert upstream / accept
+a migration) — the axis-separation criterion §3.4.0 states. Two concrete
+configurations the single-knob alternative cannot express: an unsigned
+private registry (`index-trust "off"`) still wants history-integrity
+detection (the ratchet is a pure content diff, no Sigstore dependency); a
+known migration window wants `index-trust "strict"` (signatures stay hard)
+together with `index-history "warn"` (acknowledged churn).
+
+> NORMATIVE: when `index-trust` is `off`, the ratchet still runs under its
+> own `index-history` policy — it then compares Layer-1-unverified
+> documents. This is weaker than the signed case, but still detects CDN
+> tampering and index-generator bugs; the residual is stated so it is not
+> mistaken for a guarantee.
+
+> NORMATIVE (per-policy behavior):
+>
+> | `index-history` value | Behavior |
+> |---|---|
+> | `off` | No ratchet runs. The baseline sidecar pair is neither read nor written. An existing baseline is **preserved**, never deleted — re-enabling the axis resumes the comparison from the frozen baseline, so mutations that occurred during the `off` window alarm on the first post-re-enable refresh. This is intended behavior: the churn either gets reverted upstream or is explicitly accepted (`milpa index accept`). |
+> | `warn` (default) | On a violation: warn to stderr; serve the new index (matching §3.4's warn semantics); the baseline does NOT advance. To resist habituation, the warning distinguishes **new** from **recurring** violations: the violation set's canonical digest (§3.5.3) is compared against `.meta`'s `reported_digest`; an unchanged digest is reported as recurring (naming the `reported_at` timestamp), a changed digest is reported as new and `reported_digest`/`reported_at` are rewritten. A chronic unresolved alarm MUST NOT be able to mask a second, later mutation. |
+> | `strict` | On a violation: hard fail; **no cache mutation at all** (no bundle write, no index write, no freshness-stamp advance). The cached previous index remains in place; the resolve that triggered the refresh fails with the violation's slug. Because the freshness stamp never advances, every subsequent invocation re-enters the network-fetch path and re-alarms until the index is reverted upstream or the operator explicitly accepts it. |
+
+**TOFU.** Baselines are per-URL, keyed the same way as every other index
+cache artifact, and persistent: returning to a previously-used
+`MILPA_INDEX_URL` reuses that URL's existing baseline. TOFU applies only to
+a URL with **no baseline file** — first contact ever, not "the URL's
+content changed this invocation."
+
+**The inspection and reset surface.** Two verbs, `milpa index status` and
+`milpa index accept`, are the dedicated, loud, explicit interface for
+inspecting ratchet state and accepting a history change; `milpa clean`
+remains exactly as specified in §6 — it never touches the index cache or
+any baseline sidecar. Full verb-spec blocks (Purpose / NORMATIVE behavior /
+exit codes / stdout-stderr split) are specified in `spec/cli-contract.md`.
+The baseline-sidecar interactions of both verbs are summarized in §6.
+
+**Ephemeral environments (CI).** A fresh cache directory on every run means
+permanent TOFU — the sticky baseline never sticks. Three points, in order
+of how much of the CI population they cover:
+
+1. The dominant CI shape (a committed lockfile driving the frozen path) is
+   already immune: the frozen path never consults the index at all, and
+   the lockfile's per-dep `content_hash` pins are the repo-committed trust
+   anchor for everything the project actually depends on (the `go.sum`
+   analog).
+2. CI jobs that *resolve* (`lock`, `update`, first `add`) get ratchet
+   protection only if the runner persists `$XDG_CACHE_HOME/milpa/index/`
+   across runs (a standard cache-action shape, keyed per index URL).
+   `milpa index status`'s exit code (nonzero on pending violations) gives
+   such pipelines a cheap gate.
+3. A structurally stronger design — a project-local, **committable**
+   baseline anchor, so a fresh runner inherits the repo's trusted history
+   instead of TOFU — is deliberately deferred: filed as **#188**. It is
+   real design work with real interactions (a compact baseline
+   representation and its drift hazard, the `accept` flow, workspace
+   roots) and is out of scope for this amendment.
+
+#### 3.5.3  Error taxonomy & diagnostics
+
+Four checks are specified by §3.5.1; each maps to a distinct slug. All four
+slugs land with their raise sites (bijection discipline) at
+`rfc-registry-append-only.md`'s implementation slices — they are not yet
+part of `spec/errors.md` as of this spec-only amendment:
+
+| Slug (lands with implementation slice) | Condition | Policy |
+|---|---|---|
+| `TNG-INDEX-ROOT-MUTATED` | A document-root field violates its §3.5.1 root-field order (`schema_version` decrease; `attestation-epoch` change once set). | gated by `index-history` |
+| `TNG-INDEX-ROLLBACK` | A package or version present in the baseline is absent from the candidate (the presence-component dominance failure). | gated by `index-history` |
+| `TNG-ENTRY-MUTATED` | An entry present in both baseline and candidate violates a §3.5.1 field-class order (frozen-field change, monotone downgrade/strip/re-attribution/re-pin, provenance removal). | gated by `index-history` |
+| `TNG-INDEX-BASELINE-CORRUPT` | The baseline sidecar exists but is unparseable or truncated. | hard fail **regardless of `index-history` policy** (§3.5.2) |
+
+> NORMATIVE (ordering and precedence — one rule): all violations found in a
+> single diff MUST be sorted by the composite key
+> `(class_rank, namespace, name, version, field)`, where
+> `TNG-INDEX-ROOT-MUTATED` has rank 0 (document-level violations beat
+> entry-level — the bluntest signal), `TNG-INDEX-ROLLBACK` has rank 1, and
+> `TNG-ENTRY-MUTATED` has rank 2 (root-field violations sort with an empty
+> entry key: `namespace = name = version = ""`). The trailing `field`
+> component breaks ties between two violations on the same entry key — in
+> particular, two simultaneous root-field violations (both rank 0, both
+> empty entry key) sort by field name (`attestation-epoch` before
+> `schema_version`). The raised or warned diagnostic carries the *first*
+> element of the sorted list as its slug and the full sorted list as its
+> payload. Both impls MUST produce identical output for the same input:
+> given package `aaa` with a frozen-field mutation and package `zzz` with a
+> version disappearance in the same diff, the reported slug is
+> `TNG-INDEX-ROLLBACK` (rank wins over alphabetical position), the
+> primary-named entry is `zzz`'s, and `aaa`'s mutation appears in the
+> payload list.
+
+> NORMATIVE (structured payload): the raised or warned diagnostic MUST
+> carry `violations=[…]`, where each element is a
+> `(class, entry_key, field, kind, baseline_value, candidate_value)` tuple
+> and `kind` is one of: `frozen-changed | frozen-unset | monotone-stripped
+> | monotone-reattributed | monotone-downgraded | monotone-repinned |
+> provenance-removed | root-field-changed`. The sub-class lives in the
+> payload, not in additional slugs — these sub-classes are deterministic
+> products of the §3.5.1 lattice, so one raise site with a
+> machine-readable discriminator preserves both the bijection discipline
+> and the incident-response distinction between them (a rollback suggests
+> takedown; a `content_hash` swap suggests live substitution; an
+> attestation downgrade may be a backfill-tool bug).
+
+> NORMATIVE (canonical violation digest): the habituation defense of
+> §3.5.2's *warn* row depends on both implementations computing the *same*
+> digest of a violation set. Definition: sha256 over the UTF-8
+> concatenation of one line per violation, the lines in the composite-key
+> order above, each line the tab-joined 7-tuple
+> `(class, namespace, name, version, field, kind, candidate_value)` with
+> absent components rendered as empty strings, each line `\n`-terminated.
+> `candidate_value` is the raw document string exactly as served — never
+> re-formatted, since value re-formatting is the likeliest cross-impl
+> divergence surface — and is included precisely so that a *second*
+> mutation of the same field (e.g. `V₂ → V₃` while the first alarm is
+> still unresolved) changes the digest and is reported as new, not masked
+> as recurring. `baseline_value` is deliberately excluded from the digest
+> (the baseline is frozen while violations persist, so it adds no
+> discriminating information).
+
+> NORMATIVE (remediation hints required): both the `warn` diagnostic text
+> and the `strict` error text MUST name the two sanctioned exits: revert
+> the mutation upstream, or run `milpa index accept` after out-of-band
+> confirmation that the rewrite is legitimate.
+
+> NORMATIVE (yank-transition notices are not errors): a yank-state change
+> observed between the baseline and the candidate (either direction) MUST
+> be reported on stderr, using the codebase's single non-fatal stderr
+> convention, with the stable prefix `[milpa] warning:` — the line reads
+> `[milpa] warning: yank-state changed: <namespace>/<name>@<version>`
+> naming the direction and, when present, `yanked_reason`. Un-yank of an
+> entry that carries a `yanked_reason` (restoring a CVE-yanked version) is
+> the primary case this exists for. Notices fire under `warn` and `strict`
+> alike, MUST NOT affect the exit code, and MUST NOT block the baseline
+> from advancing — the transition is legal under §3.5.1's advisory-mutable
+> class. Because a legal transition advances the baseline, the notice
+> naturally fires once per transition, not on every subsequent refresh.
+> The "legal, not an error, exit code unaffected" semantics live in this
+> spec and in the diagnostic wording, not in the stderr prefix — a
+> `[milpa] warning:` line is not, by itself, evidence of a policy failure.
+
+#### 3.5.4  Publication watermark
+
+> NORMATIVE (definition): for a given baseline, define
+> `T(baseline) := max(published_at)` over the entries present in that
+> baseline (entries without `published_at` contribute nothing to the max).
+> The anchor is verified index content, never the consumer's wall clock —
+> a consumer-clock anchor would add a trust dependency on exactly the
+> party (the local environment) this design otherwise avoids.
+
+A clean baseline is therefore a **watermark**: any entry not present in it
+was necessarily published after the baseline was established.
+
+> NORMATIVE: a **new** entry (one absent from the baseline) claiming
+> `published_at < T(baseline) − skew` is backdated and consumer-detectable
+> without trusting the registry operator. `skew` is an explicit tolerance
+> (reference default: 24 hours) absorbing indexing-pipeline jitter; the
+> check assumes the registry's indexer appends entries in non-decreasing
+> `published_at` order — an operational guarantee that must hold on the
+> registry side, not merely an implementation detail of this check.
+
+Two scope caveats: the watermark is **per-consumer** — a TOFU/first-contact
+consumer has no baseline and gets no backdate protection from this
+mechanism — and an entry that simply **omits** `published_at` dodges the
+check entirely. Closing the omission dodge requires `published_at` to be
+mandatory on post-epoch entries, which is Part 2's epoch mandate
+(`rfc-per-entry-attestation.md` open question 2); that dependency is
+recorded here so this section's baseline semantics are not later weakened
+in a way that breaks it. The backdating check itself
+(a `TNG-ENTRY-BACKDATED`-class check) is out of scope for this section —
+it lands with Part 2's P3 slice, where entry-level policy machinery exists;
+this section guarantees only the baseline semantics (the watermark
+definition above) that make that check possible.
 
 ---
 
@@ -907,6 +1497,25 @@ Once a package is found, its versions are filtered by the constraint.
 > does not define constraint syntax; cross-reference
 > `spec/resolver-semantics.md` (S6) for the constraint grammar.
 
+> NORMATIVE (staged — enforcement lands at `rfc-registry-append-only.md`'s
+> A5 slice): once a version's `yanked` field (§3.2) is `#true`, it MUST be
+> excluded from constraint-filtered candidate enumeration, before ordering
+> and constraint matching, in **both** named-lookup entry points —
+> `resolve_named_all` (§5.5) and its S5b qualified counterpart
+> `resolve_named_all_qualified` (§5.1a). Named explicitly because the
+> qualified path is exactly where a parallel-logic miss has happened
+> before. The frozen path (lockfile-backed reconstruction, which never
+> consults the index) MUST NOT apply this exclusion — an already-locked
+> yanked version continues to reproduce unaffected; yank steers new
+> selection, it never breaks reproduction. If every constraint-satisfying
+> version is excluded because all are yanked, the existing
+> `TNG-NO-SATISFYING-VERSION` error (§5.4) fires and its message MUST
+> additionally name the yanked-but-excluded candidates. There is no
+> `--allow-yanked` escape hatch (§3.2). This clause specifies the selection
+> semantics as of this spec-only amendment (A1); it is not yet enforced —
+> enforcement, fixtures, and the `TNG-NO-SATISFYING-VERSION` message change
+> land at A5.
+
 ### 5.3  Provenance-less version handling
 
 > NORMATIVE: A version entry with no `provenance` child nodes (or whose only
@@ -985,6 +1594,35 @@ single highest-semver satisfying `IndexVersion`. Equivalent to
 > visible within the same cycle. Conformant implementations MAY use a different
 > default TTL; the four-state behavior model above is normative, the 24h value
 > is not.
+
+> NORMATIVE (append-only ratchet baseline sidecars): in addition to the
+> `<cache-key>.index.kdl` index file and its `.bundle` / `.no-bundle`
+> sidecars (§3.4.2), a conformant implementation maintains a second sidecar
+> pair per cache key once the `index-history` axis (§3.5.2) is not `off`:
+> `<cache-key>.index.kdl.baseline` (the last index that passed the
+> append-only ratchet cleanly, a full copy) and
+> `<cache-key>.index.kdl.baseline.meta` (a small KDL document carrying
+> `established_at`, `reported_digest`, and `reported_at`). Both sidecars
+> are part of the same `<cache-key>.index.kdl*` glob family as the bundle
+> sidecars — `milpa clean` MUST NOT remove them, for the same reason it
+> MUST NOT remove the index cache (above). The full lifecycle (sticky
+> advance, write ordering, TOFU, corruption handling, per-policy behavior)
+> is normatively defined in §3.5.2; this clause states only that the
+> baseline pair is part of the index cache's on-disk footprint.
+
+> NORMATIVE: `milpa index status` and `milpa index accept`
+> (`spec/cli-contract.md`, `§3.5.2` of this document) are the only commands
+> that read or write the baseline sidecar pair outside the ordinary
+> ratchet-gated fetch path. `status` never writes it under any invocation,
+> including `--refresh`. `accept`'s only mutation beyond an ordinary forced
+> refresh is the atomic baseline swap.
+
+> NOTE: Per-URL baseline sidecars accumulate for registries no longer in
+> use, the same way index and bundle sidecars already do. This is an
+> accepted non-goal for v1: `milpa clean` deliberately does not
+> garbage-collect them (above) — absolute sizes are trivial and URL churn
+> is rare. A future store-gc mini-RFC (Tier 3 roadmap) is the right home
+> for an index-cache GC clause, not this section or `clean`.
 
 ---
 
