@@ -145,9 +145,19 @@ verified index is a valid *successor* of the previous one. Freshness
       DEFERRED extended; policy default "off" at the load_index param so
       ~150 existing call sites unchanged, CLI threads real policy. 32
       tests. Gates: pytest 2825 + rust-conformance green.
-- [ ] A2e — `milpa index` verb family (nested subparser; workspace/store
-      precedent). Slugs land per-sub-slice (bijection lint is set-equality
-      only — `ID_NAME_TOO_LONG` precedent; Rust `all_codes()` + DEFERRED).
+- [x] A2e (2026-07-10) — `milpa index status|accept` verb family:
+      nested subparser (3rd workspace/store instance); status read-only
+      (byte-checked) w/ --refresh dry-run; accept 3 branches + idempotent
+      + epoch blast-radius sentence (unit-tested vs renderer — row staged
+      to A6); member-dir delegation structural (URL-keyed sidecars);
+      2 new slugs TNG-INDEX-NOT-CONFIGURED + TNG-INDEX-BASELINE-WRITE-
+      FAILED (+ Rust DEFERRED); index_cache gains baseline_sidecar_paths /
+      fetch_verified_candidate_text / write_baseline_pair (no diff-logic
+      duplication); cli-contract §5.12 column-width self-contradiction
+      fixed (19-char). index-trust-off caveat only on FETCHING verbs
+      (defensible reading, flagged). NOTE: agent violated NO-GIT once
+      (stash/pop, recovered clean, disclosed). 24 tests. Gates: pytest
+      2849 + rust-conformance green.
 - [ ] A3 — Rust parity: ONE seam (`load_index` folds recovery via
       `is_recovery` — no second function); PartialEq/Eq already derived;
       drop DEFERRED.

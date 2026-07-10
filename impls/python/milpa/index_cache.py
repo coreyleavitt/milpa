@@ -79,7 +79,7 @@ from urllib.parse import urlparse, urlunparse
 from milpa.errors import MILPA_INDEX_UNREACHABLE, MilpaError
 
 if TYPE_CHECKING:
-    from milpa.index_ratchet_seam import GateDecision
+    from milpa.index_ratchet_seam import BaselineMeta, GateDecision
     from milpa.index_trust import IndexBundleVerifier, IndexTrustConfig
     from milpa.registry import Index
 
@@ -216,6 +216,19 @@ def _baseline_meta_path(cache_file: Path) -> Path:
     return Path(str(cache_file) + ".baseline.meta")
 
 
+def baseline_sidecar_paths(url: str, cache_dir: Path) -> tuple[Path, Path]:
+    """Public accessor for the ratchet baseline sidecar pair's paths for
+    *url* — the ONE naming authority both the ordinary ratchet-gated fetch
+    path (``_run_ratchet_gate`` / ``_apply_ratchet_writes``, above) and
+    ``milpa index status``/``accept`` (``cli.py``, RFC
+    registry-append-only.md A2e) use, so the two never drift (registry-
+    protocol §6 NORMATIVE: "``status``/``accept`` are the only commands that
+    read or write the baseline sidecar pair outside the ordinary
+    ratchet-gated fetch path")."""
+    cache_file = cache_path_for(url, cache_dir)
+    return _baseline_path(cache_file), _baseline_meta_path(cache_file)
+
+
 def _read_stamp(stamp_file: Path) -> int | None:
     """Read a sidecar stamp file and return its unix-second value, or ``None``."""
     try:
@@ -315,6 +328,110 @@ def reverify_cached_index(
     _verify_and_enforce(
         index_bytes, bundle_bytes, config, verifier, url, is_network_fetch=False
     )
+
+
+def fetch_verified_candidate_text(
+    url: str,
+    http_get: HttpGet,
+    bundle_http_get: "BundleHttpGet | None",
+    config: "IndexTrustConfig | None",
+    verifier: "IndexBundleVerifier | None",
+) -> str:
+    """Force a network fetch of *url* and verify it under the effective
+    index-trust policy — WITHOUT any cache mutation (no bundle sidecar, no
+    index write, no freshness stamp, no ratchet baseline touched).
+
+    This is the shared fetch-and-verify primitive for ``milpa index status
+    --refresh`` / ``milpa index accept`` (cli-contract.md §5.12, RFC
+    registry-append-only.md A2e): both need "what would a forced refresh
+    find" as plain text to diff against the local baseline, without any of
+    ``load_index``'s State-2 cache side effects — the ``--refresh-index``
+    precedent (§2.9) applied to a read-only probe. Reuses
+    ``_verify_and_enforce`` (the SAME trust-enforcement call site
+    ``load_index``'s State-2 body uses) and ``_get_bundle_url`` rather than
+    re-implementing policy dispatch — only the "then write it to cache" tail
+    of ``load_index`` is intentionally NOT here.
+
+    Raises whatever ``http_get``/``bundle_http_get`` raise on network
+    failure (the caller wraps this as ``MILPA-INDEX-UNREACHABLE``, mirroring
+    ``load_index``'s State-4 framing), or the mapped ``TNG-INDEX-*`` slug on
+    a trust-gate failure (e.g. under ``strict`` with a missing/invalid
+    bundle) — both propagate BEFORE any cache mutation, since none is ever
+    attempted by this function.
+    """
+    fetched_bytes = http_get(url)
+
+    if config is not None and verifier is not None:
+        fetched_bundle: bytes | None = None
+        if bundle_http_get is not None:
+            bundle_url = _get_bundle_url(url)
+            try:
+                fetched_bundle = bundle_http_get(bundle_url)
+            except _BundleNotFound:
+                fetched_bundle = None
+            except Exception:
+                fetched_bundle = None
+        if fetched_bundle is None:
+            from milpa.index_trust import BundleMissing, enforce_index_trust
+            enforce_index_trust(BundleMissing, config.policy, url)
+        else:
+            _verify_and_enforce(
+                index_bytes=fetched_bytes,
+                bundle_bytes=fetched_bundle,
+                config=config,
+                verifier=verifier,
+                index_url=url,
+                is_network_fetch=True,
+            )
+
+    try:
+        return fetched_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        from milpa.errors import TNG_KDL_SYNTAX
+        raise MilpaError(
+            TNG_KDL_SYNTAX,
+            f"index bytes from {url!r} are not valid UTF-8: {exc}",
+            url=url,
+        ) from exc
+
+
+def write_baseline_pair(
+    url: str,
+    cache_dir: Path,
+    candidate_bytes: bytes,
+    meta: "BaselineMeta",
+) -> None:
+    """Atomically swap the ratchet baseline pair for *url* — the ONLY
+    mutation ``milpa index accept`` performs (cli-contract.md §5.12;
+    registry-protocol §6 NORMATIVE). Each sidecar goes through the same
+    per-write-unique-temp-name atomic writer (``_atomic_write_bytes``) the
+    ordinary ratchet gate uses (§3.5.2 NORMATIVE (concurrency)) — write
+    order is baseline then ``.meta``, matching ``_apply_ratchet_writes``.
+
+    Raises ``MilpaError(TNG_INDEX_BASELINE_WRITE_FAILED)`` — loud and
+    distinct, never a silent no-op — wrapping any ``OSError``. Because each
+    write is atomic (temp + rename) and the baseline is attempted first, a
+    failure creating/renaming the FIRST temp file leaves the previous pair
+    completely untouched; a failure on the second (``.meta``) write after a
+    successful baseline swap is covered by ``.meta``'s documented
+    advisory/self-healing semantics (registry-protocol §3.5.2 NORMATIVE:
+    ".baseline.meta is advisory... if it is missing or stale relative to
+    .baseline... treat the reported-violation-set as unset").
+    """
+    from milpa.errors import TNG_INDEX_BASELINE_WRITE_FAILED
+
+    baseline_path, meta_path = baseline_sidecar_paths(url, cache_dir)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_bytes(baseline_path, candidate_bytes)
+        _atomic_write_bytes(meta_path, meta.render().encode("utf-8"))
+    except OSError as exc:
+        raise MilpaError(
+            TNG_INDEX_BASELINE_WRITE_FAILED,
+            f"failed to write the append-only ratchet baseline for {url!r}: {exc} "
+            "— the previous baseline pair (if any) is left intact",
+            url=url,
+        ) from exc
 
 
 # ---------------------------------------------------------------------------

@@ -57,8 +57,10 @@ from milpa.errors import (
     MAN_MUTATE_FILE_NOT_FOUND,
     MAN_MUTATE_WORKSPACE_REFUSED,
     MAN_REMOVE_DEP_ABSENT,
+    MILPA_INDEX_UNREACHABLE,
     MILPA_INTERNAL,
     TNG_DEPDECL_FETCH_FAILED,
+    TNG_INDEX_NOT_CONFIGURED,
     VERIFY_DEPS_DIR_MISSING,
     VERIFY_EDGE_MISMATCH,
     MilpaError,
@@ -430,6 +432,29 @@ def _make_parser() -> argparse.ArgumentParser:
             "full identity (sha256:<64hex> or bare 64-hex) or a hex-digest prefix "
             "(≥16 hex chars, with or without the 'sha256:' algorithm prefix)"
         ),
+    )
+
+    # index — append-only-ratchet inspection/reset surface (A2e,
+    # rfc-registry-append-only.md; cli-contract.md §5.12). Third instance of
+    # the nested-subparser pattern established by workspace/store, above.
+    sp_index = subparsers.add_parser(
+        "index",
+        help="inspect and accept append-only-ratchet state (status, accept)",
+    )
+    index_sub = sp_index.add_subparsers(dest="index_command", metavar="<index-command>")
+    sp_index_status = index_sub.add_parser(
+        "status",
+        help="report the locally-cached append-only-ratchet state (read-only)",
+    )
+    sp_index_status.add_argument(
+        "--refresh",
+        action="store_true",
+        default=False,
+        help="preview a forced refresh's diff, without writing anything (dry-run)",
+    )
+    index_sub.add_parser(
+        "accept",
+        help="fetch, print the diff, and atomically accept the new trust baseline",
     )
 
     return parser
@@ -2440,6 +2465,351 @@ def cmd_store_path(store: "CAStore", identity_or_prefix: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# cmd_index_status / cmd_index_accept (A2e — rfc-registry-append-only.md;
+# cli-contract.md §5.12) — the append-only-ratchet inspection/reset surface.
+#
+# Both verbs share: the ``--no-index`` hard error, the effective index URL +
+# index-history policy (``_index_verb_setup``), member-dir → workspace-root
+# delegation (S11e — implicit here: ``_build_index_history``/
+# ``_build_index_trust`` already resolve the workspace root internally given
+# a member ``project_dir``, and the baseline sidecar pair is keyed ONLY by
+# index URL in the process-global cache dir — there is no member-level
+# baseline state to delegate FROM in the first place), and the
+# fetch-and-verify + three-branch diff machinery used by ``--refresh``
+# (status) and the ordinary path (accept). Neither verb duplicates the
+# dominance-fold/digest logic — both compose ``ratchet.py`` /
+# ``index_ratchet_seam.py`` primitives directly.
+# ---------------------------------------------------------------------------
+
+
+def _index_verb_setup(project_dir: Path, env: MilpaEnv) -> "tuple[str, str]":
+    """Shared preamble for ``index status``/``index accept``: the
+    ``--no-index`` hard error, the effective index URL, and the effective
+    ``index-history`` policy string.
+
+    Member-dir delegation (S11e) needs no explicit root resolution here:
+    ``_build_index_history`` already walks up to the workspace root given a
+    member ``project_dir`` (mirroring ``_build_index_trust``), and the
+    baseline sidecar pair is keyed purely by index URL in the process-global
+    cache dir — so a member-dir invocation is byte-identical to a root-dir
+    invocation by construction, not by a special-cased delegation path.
+    """
+    from milpa.index_cache import index_url_from_env
+
+    if _no_index_requested(env.no_index):
+        raise MilpaError(
+            TNG_INDEX_NOT_CONFIGURED,
+            "milpa index: no index is configured (--no-index, or an empty "
+            "MILPA_INDEX_URL) — there is no index to load or compare against",
+        )
+    url = index_url_from_env()
+    policy = _build_index_history(env, project_dir)
+    return url, policy
+
+
+def _fetch_index_candidate(
+    env: MilpaEnv, project_dir: Path, url: str
+) -> "tuple[str, bool]":
+    """Force a network fetch + trust-gate verification of *url*'s index
+    candidate for ``index status --refresh`` / ``index accept``. Touches no
+    cache state (``fetch_verified_candidate_text`` performs no writes).
+
+    Returns ``(candidate_text, index_trust_is_off)`` — the second element
+    drives the index-trust-off caveat both verbs must print (cli-contract
+    §5.12 NORMATIVE (contract points)); ``_build_index_trust`` returns
+    ``(None, None)`` exactly when the effective policy is ``off``, so
+    ``config is None`` is a already the SSOT signal.
+
+    A bare network failure is wrapped as ``MILPA-INDEX-UNREACHABLE``
+    (mirroring ``load_index``'s State-4 framing); a trust-gate failure
+    propagates its own ``TNG-INDEX-*`` slug unchanged — either way, no cache
+    mutation has been attempted (the ``--refresh-index`` precedent, §2.9).
+    """
+    from milpa.index_cache import (
+        fetch_verified_candidate_text,
+        urllib_bundle_http_get,
+        urllib_http_get,
+    )
+
+    config, verifier = _build_index_trust(env, project_dir)
+    is_off = config is None
+    bundle_get = urllib_bundle_http_get if config is not None else None
+    try:
+        text = fetch_verified_candidate_text(
+            url, urllib_http_get, bundle_get, config, verifier
+        )
+    except MilpaError:
+        raise
+    except Exception as exc:
+        raise MilpaError(
+            MILPA_INDEX_UNREACHABLE,
+            f"failed to fetch index candidate from {url!r}: {exc}",
+            url=url,
+        ) from exc
+    return text, is_off
+
+
+def _read_local_baseline_status(
+    baseline_path: Path, meta_path: Path
+) -> "tuple[str, str, str, str]":
+    """Read-only local inspection of the baseline sidecar pair — the plain
+    ``index status`` (no ``--refresh``) path. NEVER raises: a present-but-
+    corrupt baseline is reported as ``baseline: corrupt``, not
+    ``TNG-INDEX-BASELINE-CORRUPT`` (cli-contract §5.12 NORMATIVE — ``status``
+    is a read-only inspection tool and must not hard-fail on a broken local
+    trust state).
+
+    Returns ``(baseline_state, established_at, pending, last_reported)``,
+    each already formatted for display (``(none)`` for absent timestamps).
+    """
+    from milpa.index_ratchet_seam import BaselineMeta, parse_baseline, parse_baseline_meta
+
+    if not baseline_path.is_file():
+        return "absent", "(none)", "no", "(none)"
+
+    try:
+        baseline_text = baseline_path.read_bytes().decode("utf-8")
+        parse_baseline(baseline_text)  # presence/parseability only — result unused
+    except (UnicodeDecodeError, MilpaError):
+        return "corrupt", "(none)", "no", "(none)"
+
+    meta = BaselineMeta()
+    if meta_path.is_file():
+        try:
+            meta_text = meta_path.read_text(encoding="utf-8")
+        except OSError:
+            meta_text = ""
+        meta = parse_baseline_meta(meta_text)  # never raises — advisory
+
+    established_at = meta.established_at or "(none)"
+    if meta.reported_digest:
+        return "present", established_at, "yes", (meta.reported_at or "(none)")
+    return "present", established_at, "no", "(none)"
+
+
+def _format_index_status_block(
+    *,
+    index_url: str,
+    policy: str,
+    baseline: str,
+    established_at: str,
+    pending: str,
+    last_reported: str,
+) -> str:
+    """The fixed-format ``index status`` block (cli-contract §5.12
+    NORMATIVE (status block, fixed format)) — a 19-character label+colon
+    column, mirroring ``show --index-trust``'s convention (§5.3a)."""
+    fields = (
+        ("index-url:", index_url),
+        ("policy:", policy),
+        ("baseline:", baseline),
+        ("established-at:", established_at),
+        ("pending:", pending),
+        ("last-reported:", last_reported),
+    )
+    return "\n".join(f"{label:<19}{value}" for label, value in fields) + "\n"
+
+
+def _compute_index_diff(
+    candidate_text: str, baseline_path: Path
+) -> "tuple[object, object, str]":
+    """Diff *candidate_text* against the on-disk baseline at *baseline_path*
+    — the shared computation behind ``status --refresh`` and ``accept``.
+
+    Returns ``(index, outcome, baseline_state)``: ``outcome`` is a
+    ``ratchet.RatchetOutcome`` when ``baseline_state == "present"``, else
+    ``None`` (nothing to diff against for ``absent``/``corrupt``). Composes
+    ``index_ratchet_seam.build_index_state`` / ``parse_baseline`` and
+    ``ratchet.Baseline`` directly — this function does NOT reimplement any
+    dominance-fold or digest logic (single source of truth: ``ratchet.py``).
+
+    Yank-transition notices (legal, non-error) are printed to stderr here,
+    reusing ``index_ratchet_seam``'s own printer — the SAME stderr line the
+    ordinary ratchet-gated fetch path prints (registry-protocol §3.5.3).
+    """
+    from milpa.index_ratchet_seam import _print_yank_notice, build_index_state, parse_baseline
+    from milpa.ratchet import Baseline
+
+    index, candidate_state = build_index_state(candidate_text)
+
+    if not baseline_path.is_file():
+        return index, None, "absent"
+
+    try:
+        baseline_text = baseline_path.read_bytes().decode("utf-8")
+        baseline_state = parse_baseline(baseline_text)
+    except (UnicodeDecodeError, MilpaError):
+        return index, None, "corrupt"
+
+    outcome = Baseline(baseline_state).check(candidate_state)
+    for transition in outcome.transitions:
+        _print_yank_notice(transition)
+    return index, outcome, "present"
+
+
+def _render_index_verb_diff(outcome: object, baseline_state: str) -> "tuple[str, bool]":
+    """Render the shared three-branch diff text (cli-contract §5.12
+    NORMATIVE (violation-line format...) / (``accept`` MUST...)) used by
+    both ``status --refresh`` and ``accept``. Returns ``(text, clean)``;
+    ``clean`` is meaningful only for the ``"present"`` branch (``True`` iff
+    the diff has no violations) — callers decide exit code / write behavior
+    per-verb from ``baseline_state`` + ``clean`` (the two verbs have
+    DIFFERENT rules for the absent/corrupt branches: ``status`` treats
+    corrupt as attention-worthy, ``accept`` treats it as successful
+    re-establishment)."""
+    from milpa.ratchet import canonical_digest
+
+    if baseline_state == "absent":
+        return "no prior baseline — this fetch establishes the trust anchor\n", True
+    if baseline_state == "corrupt":
+        return (
+            "baseline unreadable — cannot show what changed; "
+            "re-establishing the trust anchor\n"
+        ), True
+
+    assert outcome is not None
+    if outcome.clean:  # type: ignore[attr-defined]
+        return "nothing to accept\n", True
+
+    violations = outcome.violations  # type: ignore[attr-defined]
+    lines: list[str] = []
+    if any(v.field == "attestation-epoch" for v in violations):
+        # registry-protocol §3.5.1 (staged — attestation-epoch enforcement
+        # lands at A6): the blast-radius sentence cli-contract §5.12
+        # requires before the ordinary diff. Written now so the print path
+        # is A6-ready; unreachable via the live fetch path until the
+        # engine's `include_staged` gate flips (ratchet.py's own docstring
+        # NORMATIVE (staged enforcement)) — exercised directly in tests via
+        # a hand-built violation set.
+        lines.append(
+            "accepting this change reclassifies every entry between the "
+            "epochs as pre-epoch/legacy, nullifying the attestation mandate "
+            "for all of them — an index-wide consequence, not a one-row one"
+        )
+    for v in violations:
+        lines.append(
+            "\t".join(
+                [
+                    "violation:",
+                    v.class_,
+                    v.entry_key.namespace,
+                    v.entry_key.name,
+                    v.entry_key.version,
+                    v.field,
+                    v.kind,
+                    v.baseline_value,
+                    v.candidate_value,
+                ]
+            )
+        )
+    lines.append(f"digest: {canonical_digest(violations)}")
+    return "\n".join(lines) + "\n", False
+
+
+def cmd_index_status(project_dir: Path, env: MilpaEnv, *, refresh: bool = False) -> int:
+    """``milpa index status [--refresh]`` — read-only append-only-ratchet
+    inspection. NEVER writes to disk, under any invocation, including
+    ``--refresh`` (cli-contract §5.12 NORMATIVE).
+
+    Without ``--refresh``: reads ONLY the local baseline sidecar pair, no
+    network access. With ``--refresh``: performs the same forced
+    fetch-and-verify sequence ``accept`` performs and prints the would-be
+    diff — still writing nothing (the dry-run of ``accept``).
+    """
+    from milpa.index_cache import _default_cache_dir, baseline_sidecar_paths
+
+    url, policy = _index_verb_setup(project_dir, env)
+    cache_dir = _default_cache_dir()
+    baseline_path, meta_path = baseline_sidecar_paths(url, cache_dir)
+
+    if not refresh:
+        baseline_state, established_at, pending, last_reported = _read_local_baseline_status(
+            baseline_path, meta_path
+        )
+        block = _format_index_status_block(
+            index_url=url,
+            policy=policy,
+            baseline=baseline_state,
+            established_at=established_at,
+            pending=pending,
+            last_reported=last_reported,
+        )
+        print(block, end="")
+        return 1 if (baseline_state == "corrupt" or pending == "yes") else 0
+
+    candidate_text, trust_off = _fetch_index_candidate(env, project_dir, url)
+    if trust_off:
+        print(
+            "[milpa] warning: index-trust is \"off\" — this fetch has no "
+            "cryptographic basis; the diff below attests only to continuity "
+            "of whatever the transport delivered",
+            file=sys.stderr,
+        )
+
+    _, outcome, baseline_state = _compute_index_diff(candidate_text, baseline_path)
+    text, clean = _render_index_verb_diff(outcome, baseline_state)
+    print(text, end="")
+
+    if baseline_state == "corrupt":
+        return 1
+    if baseline_state == "absent":
+        return 0
+    return 0 if clean else 1
+
+
+def cmd_index_accept(project_dir: Path, env: MilpaEnv) -> int:
+    """``milpa index accept`` — fetch, print the diff, and atomically accept
+    the new trust baseline (cli-contract §5.12). Non-interactive; idempotent;
+    per-URL. Its ONLY mutation is the atomic baseline-pair swap, performed
+    UNLESS the diff against a present, parseable baseline is already clean
+    (the idempotent no-op case — ``nothing to accept``, no write).
+    """
+    import time
+
+    from milpa.index_cache import (
+        _default_cache_dir,
+        baseline_sidecar_paths,
+        write_baseline_pair,
+    )
+    from milpa.index_ratchet_seam import BaselineMeta, iso_timestamp
+
+    url, policy = _index_verb_setup(project_dir, env)
+    cache_dir = _default_cache_dir()
+    baseline_path, _meta_path = baseline_sidecar_paths(url, cache_dir)
+
+    candidate_text, trust_off = _fetch_index_candidate(env, project_dir, url)
+    if trust_off:
+        print(
+            "[milpa] warning: index-trust is \"off\" — this fetch has no "
+            "cryptographic basis; accepting it attests only to continuity of "
+            "whatever the transport delivered",
+            file=sys.stderr,
+        )
+    if policy == "off":
+        print(
+            "[milpa] warning: index-history is \"off\" — the baseline "
+            "written by this accept will not be consulted again until the "
+            "axis is re-enabled",
+            file=sys.stderr,
+        )
+
+    _, outcome, baseline_state = _compute_index_diff(candidate_text, baseline_path)
+    text, clean = _render_index_verb_diff(outcome, baseline_state)
+    print(text, end="")
+
+    if baseline_state == "present" and clean:
+        return 0  # idempotent no-op — nothing to accept, no write.
+
+    new_meta = BaselineMeta(
+        established_at=iso_timestamp(int(time.time())),
+        reported_digest=None,
+        reported_at=None,
+    )
+    write_baseline_pair(url, cache_dir, candidate_text.encode("utf-8"), new_meta)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # cmd_hash (A0-cmd) — content identity probe
 # ---------------------------------------------------------------------------
 
@@ -3959,6 +4329,17 @@ def main(argv: list[str] | None = None) -> int:
                 # (argparse doesn't expose the subparser directly from args,
                 # so we re-parse to trigger help.)
                 print("usage: milpa store <ls|path> [args]", file=sys.stderr)
+                return 2
+        elif args.command == "index":
+            index_cmd = getattr(args, "index_command", None)
+            if index_cmd == "status":
+                return cmd_index_status(
+                    project_dir, env, refresh=getattr(args, "refresh", False)
+                )
+            elif index_cmd == "accept":
+                return cmd_index_accept(project_dir, env)
+            else:
+                print("usage: milpa index <status|accept> [args]", file=sys.stderr)
                 return 2
         else:
             # Should not happen — argparse validates the command.

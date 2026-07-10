@@ -173,12 +173,24 @@ fn spec_error_codes() -> BTreeSet<String> {
 /// this list — the whole `index-history` axis (engine, seam, and its
 /// member-declaration guard) has no Rust counterpart yet. A3 parity
 /// pending.
+///
+/// A2e (RFC `rfc-registry-append-only.md`, Python-only slice,
+/// cli-contract.md §5.12): added the `milpa index status`/`milpa index
+/// accept` verb family — `TNG-INDEX-NOT-CONFIGURED` (the `--no-index`
+/// hard-error both verbs raise) and `TNG-INDEX-BASELINE-WRITE-FAILED`
+/// (`accept`'s loud baseline-swap-I/O-failure error) to spec/errors.md and
+/// errors.py, with Python raise sites in `cli.py` (`_index_verb_setup`) and
+/// `index_cache.py` (`write_baseline_pair`). Both join the rest of the
+/// `index-history` axis in this list — no Rust `milpa index` subcommand
+/// exists yet. A3 parity pending.
 const DEFERRED: &[&str] = &[
     "WS-INDEX-HISTORY-ON-MEMBER",
     "TNG-INDEX-ROOT-MUTATED",
     "TNG-INDEX-ROLLBACK",
     "TNG-ENTRY-MUTATED",
     "TNG-INDEX-BASELINE-CORRUPT",
+    "TNG-INDEX-NOT-CONFIGURED",
+    "TNG-INDEX-BASELINE-WRITE-FAILED",
 ];
 
 /// Spec codes this implementation intentionally never emits.

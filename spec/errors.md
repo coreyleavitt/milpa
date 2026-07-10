@@ -1214,7 +1214,19 @@ An entry present in both the baseline and the candidate violates a `§3.5.1` fie
 
 The `<cache-key>.index.kdl.baseline` sidecar exists but is unparseable, truncated, or declares a `schema_version` beyond this consumer's understood range (local-trust-state skew, distinct from `TNG-SCHEMA-UNKNOWN` which is about served content).
 
-**Triggered:** `index_ratchet_seam.parse_baseline` (or the raw UTF-8 decode preceding it) fails on the on-disk baseline sidecar. Hard-fails **regardless of `index-history` policy** (`warn` and `strict` alike; the check cannot fire under `off` because the baseline is never read in that mode) — an absent baseline means legitimate first contact (TOFU); a present-but-broken one must never silently degrade to TOFU, or "corrupt the baseline file" would be a free ratchet reset. No raw parser slug (`TNG-KDL-SYNTAX`, `TNG-SCHEMA-UNKNOWN`) leaks through this path. Recovery is `milpa index accept`. Defined in `registry-protocol.md §3.5.2`.
+**Triggered:** `index_ratchet_seam.parse_baseline` (or the raw UTF-8 decode preceding it) fails on the on-disk baseline sidecar. Hard-fails **regardless of `index-history` policy** (`warn` and `strict` alike; the check cannot fire under `off` because the baseline is never read in that mode) — an absent baseline means legitimate first contact (TOFU); a present-but-broken one must never silently degrade to TOFU, or "corrupt the baseline file" would be a free ratchet reset. No raw parser slug (`TNG-KDL-SYNTAX`, `TNG-SCHEMA-UNKNOWN`) leaks through this path. Recovery is `milpa index accept`. Defined in `registry-protocol.md §3.5.2`. Note: `milpa index status` (without `--refresh`) is the one caller that does NOT raise this slug on the same condition — it reports `baseline: corrupt` in its status block instead (cli-contract.md §5.12 NORMATIVE), because it is a read-only inspection tool that must not hard-fail on a broken local trust state.
+
+### `TNG-INDEX-NOT-CONFIGURED`
+
+`milpa index status` or `milpa index accept` was invoked with no index configured (`--no-index`, or an empty `MILPA_INDEX_URL`) — there is no index to load or compare against.
+
+**Triggered:** the shared `index status`/`accept` setup helper (cli.py) finds the effective "no index" condition true (the same three-way `MILPA_INDEX_URL` semantics every other verb uses, cli-contract.md §8.1) before resolving an index URL or touching any baseline sidecar. Defined in `cli-contract.md §5.12` NORMATIVE (contract points).
+
+### `TNG-INDEX-BASELINE-WRITE-FAILED`
+
+`milpa index accept`'s atomic baseline-pair swap (the verb's ONLY mutation) failed with an I/O error.
+
+**Triggered:** `index_cache.write_baseline_pair` catches an `OSError` writing either sidecar of the `<cache-key>.index.kdl.baseline` / `.baseline.meta` pair. Per `cli-contract.md §5.12` NORMATIVE, this MUST be a loud, distinct error — never a printed-diff-then-silent-no-op — and MUST leave a previously-written baseline pair intact; each sidecar is written through the same per-write-unique-temp-name atomic writer (`_atomic_write_bytes`) the ordinary ratchet gate uses, so a failure creating/renaming the first temp file never mutates the existing pair.
 
 ### `TNG-ENTRY-UNATTESTED`
 

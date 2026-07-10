@@ -1185,11 +1185,11 @@ it (§8.1).
 
 > NORMATIVE (status block, fixed format): the canonical field set, in this
 > order, using the same fixed-width label-column convention as
-> `show --index-trust` (§5.3a; a 17-character label+colon column, no
+> `show --index-trust` (§5.3a; a 19-character label+colon column, no
 > trailing whitespace on any line):
 >
 > ```
-> index-url:        <url>
+> index-url:         <url>
 > policy:            <off|warn|strict>
 > baseline:          <present|absent|corrupt>
 > established-at:    <ISO-8601 timestamp, or (none)>

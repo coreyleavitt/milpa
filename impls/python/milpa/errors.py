@@ -285,6 +285,16 @@ TNG_INDEX_ROOT_MUTATED = "TNG-INDEX-ROOT-MUTATED"
 TNG_INDEX_ROLLBACK = "TNG-INDEX-ROLLBACK"
 TNG_ENTRY_MUTATED = "TNG-ENTRY-MUTATED"
 TNG_INDEX_BASELINE_CORRUPT = "TNG-INDEX-BASELINE-CORRUPT"
+# A2e (RFC registry-append-only.md, Python-only slice, cli-contract.md §5.12):
+# the `milpa index status`/`milpa index accept` verb family. NOT-CONFIGURED
+# is the `--no-index` (or empty MILPA_INDEX_URL) hard-error both verbs raise
+# (there is no index to load or compare against); BASELINE-WRITE-FAILED is
+# `accept`'s loud, distinct error on an I/O failure during its atomic
+# baseline-pair swap (never a silent no-op) — raised by
+# `index_cache.write_baseline_pair`. Rust parity deferred to A3 — see
+# corpus.rs DEFERRED (joins the rest of the index-history axis).
+TNG_INDEX_NOT_CONFIGURED = "TNG-INDEX-NOT-CONFIGURED"
+TNG_INDEX_BASELINE_WRITE_FAILED = "TNG-INDEX-BASELINE-WRITE-FAILED"
 # TNG-ENTRY-* codes — per-entry Sigstore attestation gate (RFC
 # per-entry-attestation.md §5, P3a).  Eight codes, added to spec/errors.md AND
 # errors.py in the same commit per the bijection invariant.  Stage order (§5
