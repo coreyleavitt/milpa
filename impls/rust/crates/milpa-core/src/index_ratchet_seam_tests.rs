@@ -201,7 +201,8 @@ fn iso_timestamp_matches_known_instant() {
 // Provenance-multiset canonical digest rendering (A4b MUST-RESOLVE, flagged
 // at A3: the raw-fallback rendering of a provenance-removed violation's
 // candidate_value was impl-specific — Rust's Debug-derive fallback for
-// `FieldValue::StrList` vs Python's dataclass-tuple `str()` fallback. Fixed
+// what is now `FieldValue::ProvenanceList` (then `FieldValue::StrList`) vs
+// Python's dataclass-tuple `str()` fallback. Fixed
 // at the root in `provenance_canonical_raw` (registry-protocol §3.5.3
 // NORMATIVE (canonical rendering for non-scalar candidate values)). The
 // expected hex is ported VERBATIM from
@@ -331,6 +332,68 @@ fn attestation_repin_hand_computed_digest_vector() {
     assert_eq!(
         digest,
         "2c02fbe94260c81db0006a77d8572a54feb58d36d1071bf7191d790087a63323"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// rekor canonical digest rendering (A6) + CR1 structured-comparison
+// regression lock: `rekor` is now stored as `FieldValue::Rekor(RekorRef)`
+// (structured, compared field-by-field) rather than a pre-joined delimiter
+// string, but the DIGEST rendering (`rekor_canonical_raw`) is unchanged —
+// this hand-computed vector proves the digest bytes are byte-identical to
+// before the CR1 fix. Same index shape and digest as conformance fixture
+// 408 (`fixture-408-index-history-rekor-frozen-changed-strict`).
+// ---------------------------------------------------------------------------
+
+fn rekor_index_text(uuid: &str) -> String {
+    format!(
+        "schema_version 1\n\
+         package \"bar\" {{\n\
+         \x20   namespace \"acme\"\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"sha256:{}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://example.com/bar.git\"\n\
+         \x20           ref \"v1.0.0\"\n\
+         \x20       }}\n\
+         \x20       attestation \"milpa-vendored\"\n\
+         \x20       rekor {{\n\
+         \x20           uuid \"{uuid}\"\n\
+         \x20           log_index \"10\"\n\
+         \x20           integrated_time \"1000000000\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n",
+        "a".repeat(64)
+    )
+}
+
+#[test]
+fn rekor_mutation_hand_computed_digest_vector() {
+    let baseline = rekor_index_text(&"a".repeat(64));
+    let candidate = rekor_index_text(&"b".repeat(64));
+    let (_, baseline_state) = build_index_state(&baseline).unwrap();
+    let (_, candidate_state) = build_index_state(&candidate).unwrap();
+    let outcome = Baseline::new(baseline_state).check(&candidate_state);
+
+    assert_eq!(outcome.violations.len(), 1);
+    let v = &outcome.violations[0];
+    assert_eq!(v.class, "TNG-ENTRY-MUTATED");
+    assert_eq!(v.field, "rekor");
+    assert_eq!(v.kind, "frozen-changed");
+
+    let expected_candidate_value = format!("{}\u{1f}10\u{1f}1000000000", "b".repeat(64));
+    assert_eq!(v.candidate_value, expected_candidate_value);
+
+    // Guards the CR1 invariant: switching the COMPARISON value from a
+    // joined `Str` to a structured `Rekor(RekorRef)` must not change the
+    // DIGEST-rendering `raw` value at all — same hex as conformance
+    // fixture 408's `expected/digest`.
+    let digest = canonical_digest(&outcome.violations);
+    assert_eq!(
+        digest,
+        "44b632a79531fc5562f23b8eb6685bff2154156289a5dad5a8fdfbd14ddd06ce"
     );
 }
 

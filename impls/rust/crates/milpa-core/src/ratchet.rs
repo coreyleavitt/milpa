@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
+use milpa_types::{Provenance, RekorRef};
 use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
@@ -110,8 +111,19 @@ pub enum FieldValue {
     Str(String),
     Int(i64),
     Bool(bool),
-    StrList(Vec<String>),
+    /// Structured provenance multiset — compared record-by-record (each
+    /// record's own fields), never via a pre-joined delimiter string. Using
+    /// the real `milpa_types::Provenance` here (not a re-derived structural
+    /// echo type) means dominance comparison rides the same `PartialEq`
+    /// every other consumer of `Provenance` uses — a boundary-shifted pair
+    /// that collides under the canonical-raw *rendering* (§3.5.3, digest-only)
+    /// cannot collide under this comparison too (CR1).
+    ProvenanceList(Vec<Provenance>),
     Attestation(AttestationValue),
+    /// Structured `rekor` block — compared field-by-field via `RekorRef`'s
+    /// derived `PartialEq`, never via a pre-joined delimiter string (CR1,
+    /// same rationale as `ProvenanceList`).
+    Rekor(RekorRef),
 }
 
 /// Structural snapshot of an `EntryAttestation` for ratchet comparison.
@@ -167,7 +179,7 @@ impl RawField {
             FieldValue::Str(s) => s.clone(),
             FieldValue::Int(i) => i.to_string(),
             FieldValue::Bool(b) => b.to_string(),
-            FieldValue::StrList(items) => {
+            FieldValue::ProvenanceList(items) => {
                 // Only reached when no explicit raw was supplied; mirrors
                 // Python's `str(value)` fallback for a tuple — not exercised
                 // by production call sites (provenances always compare, never
@@ -175,6 +187,7 @@ impl RawField {
                 format!("{items:?}")
             }
             FieldValue::Attestation(a) => format!("{a:?}"),
+            FieldValue::Rekor(r) => format!("{r:?}"),
         }
     }
 }
@@ -208,8 +221,9 @@ impl Clone for FieldValue {
             FieldValue::Str(s) => FieldValue::Str(s.clone()),
             FieldValue::Int(i) => FieldValue::Int(*i),
             FieldValue::Bool(b) => FieldValue::Bool(*b),
-            FieldValue::StrList(v) => FieldValue::StrList(v.clone()),
+            FieldValue::ProvenanceList(v) => FieldValue::ProvenanceList(v.clone()),
             FieldValue::Attestation(a) => FieldValue::Attestation(a.clone()),
+            FieldValue::Rekor(r) => FieldValue::Rekor(r.clone()),
         }
     }
 }
@@ -367,27 +381,30 @@ fn dominates_attestation(baseline: Option<&FieldValue>, candidate: Option<&Field
     None // milpa-vendored -> author-signed: upgrade, legal
 }
 
-fn as_str_list(v: Option<&FieldValue>) -> Vec<String> {
+fn as_provenance_list(v: Option<&FieldValue>) -> Vec<Provenance> {
     match v {
-        Some(FieldValue::StrList(items)) => items.clone(),
+        Some(FieldValue::ProvenanceList(items)) => items.clone(),
         _ => Vec::new(),
     }
 }
 
+/// Multiset-subset check on the STRUCTURED `Provenance` records (CR1 fix):
+/// every baseline record, by multiplicity, must have a matching candidate
+/// record under `Provenance`'s field-by-field `PartialEq` — never under a
+/// pre-joined delimiter string (which a crafted field-boundary shift can
+/// collide across two structurally distinct records). `Provenance` doesn't
+/// derive `Hash` (see `milpa-types`), so this is a linear scan per baseline
+/// item rather than a `HashMap`-backed `Counter`; provenance lists are tiny
+/// (a handful of mirrors per entry) so this is not a performance concern.
 fn dominates_multiset(baseline: Option<&FieldValue>, candidate: Option<&FieldValue>) -> Option<&'static str> {
-    let b_items = as_str_list(baseline);
-    let c_items = as_str_list(candidate);
-    let mut b_counts: HashMap<&str, usize> = HashMap::new();
-    for item in &b_items {
-        *b_counts.entry(item.as_str()).or_insert(0) += 1;
-    }
-    let mut c_counts: HashMap<&str, usize> = HashMap::new();
-    for item in &c_items {
-        *c_counts.entry(item.as_str()).or_insert(0) += 1;
-    }
-    for (item, count) in &b_counts {
-        if c_counts.get(item).copied().unwrap_or(0) < *count {
-            return Some(PROVENANCE_REMOVED);
+    let b_items = as_provenance_list(baseline);
+    let mut c_remaining = as_provenance_list(candidate);
+    for b in &b_items {
+        match c_remaining.iter().position(|c| c == b) {
+            Some(pos) => {
+                c_remaining.remove(pos);
+            }
+            None => return Some(PROVENANCE_REMOVED),
         }
     }
     None

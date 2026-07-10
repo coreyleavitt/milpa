@@ -932,6 +932,7 @@ def _parse_entry_attestation(
                 f"\"author-signed\" with no signed_by (registry-protocol §3.2)"
             )
             return None, diagnostics
+        _validate_no_control_chars(signed_by, "signed_by")
         kind = AuthorSigned(signer=signed_by)
     elif attestation_label == "milpa-vendored":
         kind = MilpaVendored()

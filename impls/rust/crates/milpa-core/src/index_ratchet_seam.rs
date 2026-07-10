@@ -144,9 +144,11 @@ fn index_state_from(schema_version: Option<i64>, attestation_epoch: Option<Strin
                 entry = entry.set("dep_decl_schema_version", RawField::new(FieldValue::Int(v)));
             }
             if !iv.provenances.is_empty() {
-                let items: Vec<String> = iv.provenances.iter().map(encode_provenance).collect();
                 let raw = provenance_canonical_raw(&iv.provenances);
-                entry = entry.set("provenances", RawField::with_raw(FieldValue::StrList(items), raw));
+                entry = entry.set(
+                    "provenances",
+                    RawField::with_raw(FieldValue::ProvenanceList(iv.provenances.clone()), raw),
+                );
             }
             entry = entry.set("yanked", RawField::new(FieldValue::Bool(iv.yanked)));
             if let Some(r) = &iv.yanked_reason {
@@ -160,7 +162,7 @@ fn index_state_from(schema_version: Option<i64>, attestation_epoch: Option<Strin
                 );
                 if let Some(r) = &att.rekor {
                     let raw = rekor_canonical_raw(Some(r));
-                    entry = entry.set("rekor", RawField::with_raw(FieldValue::Str(raw.clone()), raw));
+                    entry = entry.set("rekor", RawField::with_raw(FieldValue::Rekor(r.clone()), raw));
                 }
             }
             state.insert(key, entry);
@@ -169,40 +171,14 @@ fn index_state_from(schema_version: Option<i64>, attestation_epoch: Option<Strin
     state
 }
 
-/// Canonical multiset-comparison key for one provenance record. Uses a
-/// control-character delimiter (never legal in a URL/ref/registry field) so
-/// distinct field tuples never collide. NOT a digest-stable "raw served
-/// text" rendering (registry-protocol §3.5.1's append-only-multiset row has
-/// no such requirement — only `published_at`'s Frozen row does, per the
-/// RFC's raw-value-sourcing note); used for equality/multiset comparison
-/// only.
-fn encode_provenance(p: &milpa_types::Provenance) -> String {
-    use milpa_types::Provenance;
-    match p {
-        Provenance::Git { url, ref_spec, commit_sha } => {
-            format!("git\u{1}{url}\u{1}{ref_spec}\u{1}{}", commit_sha.as_deref().unwrap_or(""))
-        }
-        Provenance::Oci { registry, repository, digest } => {
-            format!("oci\u{1}{registry}\u{1}{repository}\u{1}{digest}")
-        }
-        // registry.rs's index parser only ever constructs Git/Oci provenance
-        // records (the index-level provenance kind set is a strict subset of
-        // the manifest grammar — registry-protocol §3.3); Tarball/Local are
-        // unreachable here but the match must stay exhaustive since
-        // `Provenance` is a shared closed enum (RFC §4.6).
-        Provenance::Tarball { .. } | Provenance::Local { .. } => {
-            format!("unrecognized\u{1}{p:?}")
-        }
-    }
-}
-
 /// Canonical, cross-impl-identical rendering of a provenance multiset for
 /// the §3.5.3 canonical violation digest (NORMATIVE (canonical rendering
 /// for non-scalar candidate values)) — the MUST-RESOLVE item flagged at A3:
-/// `FieldValue::StrList`'s `raw_str()` fallback is Rust's `Debug` format
-/// for `Vec<String>`, which diverges byte-for-byte from Python's
-/// dataclass-tuple `str()` fallback for identical semantic content. Each
-/// record is encoded as `<kind>\x1f<field1>\x1f<field2>\x1f<field3>` in the
+/// `FieldValue::ProvenanceList`'s `raw_str()` fallback is Rust's `Debug`
+/// format for `Vec<Provenance>`, which diverges byte-for-byte from Python's
+/// dataclass-tuple `str()` fallback for identical semantic content — this
+/// function supplies the `raw` explicitly so that fallback is never reached
+/// in production. Each record is encoded as `<kind>\x1f<field1>\x1f<field2>\x1f<field3>` in the
 /// record's own declared field order (git: url, ref, commit_sha; oci:
 /// registry, repository, digest; an absent optional field renders as the
 /// empty string); records are sorted lexicographically by their own

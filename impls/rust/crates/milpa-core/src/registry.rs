@@ -826,7 +826,10 @@ fn parse_entry_attestation(
         "author-signed" => {
             let signed_by = child_arg_str(node, "signed_by");
             match signed_by {
-                Some(signer) if !signer.is_empty() => AttestationKind::AuthorSigned { signer },
+                Some(signer) if !signer.is_empty() => {
+                    validate_no_control_chars(&signer, "signed_by")?;
+                    AttestationKind::AuthorSigned { signer }
+                }
                 _ => {
                     diagnostics.push(format!(
                         "attestation claim for {coordinate} collapsed to unattested: \

@@ -334,6 +334,29 @@ fn rekor_fields_control_char_via_kdl_escape_are_rejected() {
     );
 }
 
+#[test]
+fn attestation_signed_by_control_char_via_kdl_escape_is_rejected() {
+    // `signed_by` is rendered raw into the attestation canonical digest
+    // (`attestation_canonical_raw`, §3.5.3) — the same injection exposure
+    // CR2 closed for `rekor`'s fields (registry-protocol §3.3).
+    let text = format!(
+        "schema_version 1\n\
+         package \"bar\" {{\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://e/bar.git\"\n\
+         \x20           ref \"v1\"\n\
+         \x20       }}\n\
+         \x20       attestation \"author-signed\"\n\
+         \x20       signed_by \"alice\\u{{9}}evil\"\n\
+         \x20   }}\n\
+         }}\n"
+    );
+    assert_eq!(Index::parse(&text).unwrap_err().code(), "TNG-UNSAFE-CONTROL-CHAR");
+}
+
 // fixture-411-tng-unsafe-control-char is exercised end-to-end (both impls,
 // differentially) by the generic conformance corpus runner
 // (milpa-conformance/tests/corpus.rs `discover()` + this crate's Python

@@ -539,8 +539,9 @@ grammar's §4.2, with the additional acceptance of `(url)`-annotated URL values
 > NORMATIVE (control-character rejection): the registry's string-valued
 > identity and provenance fields — `namespace` (§3.1), a `version` node's
 > version string (§3.2), a `git` provenance's `url` and `ref` and an `oci`
-> provenance's `registry` and `repository` (both below), and the `rekor`
-> block's `uuid`, `log_index`, and `integrated_time` (§3.2) — MUST NOT
+> provenance's `registry` and `repository` (both below), the `rekor`
+> block's `uuid`, `log_index`, and `integrated_time` (§3.2), and an
+> `attestation "author-signed"` claim's `signed_by` field (§3.2) — MUST NOT
 > contain an ASCII control character (U+0000–U+001F inclusive, or U+007F). A
 > conformant implementation MUST reject a value containing one at parse
 > time, before the value is stored on the in-memory index type, raising

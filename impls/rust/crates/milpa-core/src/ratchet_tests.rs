@@ -5,6 +5,7 @@
 //! which MUST produce identical sha256 hex across both implementations.
 
 use super::*;
+use milpa_types::{Provenance, RekorRef};
 
 fn v1() -> EntryKey {
     EntryKey::new("acme", "foo", "1.0.0")
@@ -236,7 +237,11 @@ fn att(kind: &str, signer: Option<&str>, bundle_pin: Option<&str>) -> FieldValue
 }
 
 fn rekor(uuid: &str, log_index: &str, integrated_time: &str) -> FieldValue {
-    FieldValue::Str(format!("{uuid}\u{1f}{log_index}\u{1f}{integrated_time}"))
+    FieldValue::Rekor(RekorRef {
+        uuid: uuid.to_string(),
+        log_index: log_index.to_string(),
+        integrated_time: integrated_time.to_string(),
+    })
 }
 
 #[test]
@@ -370,22 +375,55 @@ fn rekor_unset_is_violation() {
     assert_eq!(outcome.violations[0].kind, FROZEN_UNSET);
 }
 
+#[test]
+fn rekor_dominance_compares_structured_fields_not_joined_string() {
+    // Regression lock (CR1): this pair's field-delimiter-joined rendering
+    // ("AAA\x1fXXX\x1fYYY\x1f", the canonical `rekor_canonical_raw` used for
+    // digest purposes only) is byte-IDENTICAL on both sides — the `uuid`
+    // boundary shifts by exactly one field's worth of text. A dominance
+    // check that (incorrectly) compared the joined string would see no
+    // change and stay silent. The structured per-field comparison MUST
+    // still flag it, because `uuid` genuinely differs ("AAA\x1fXXX" vs
+    // "AAA").
+    let mut baseline = IndexState::new();
+    baseline.insert(v1(), entry(&[("rekor", rekor("AAA\u{1f}XXX", "YYY", ""))]));
+    let mut candidate = IndexState::new();
+    candidate.insert(v1(), entry(&[("rekor", rekor("AAA", "XXX\u{1f}YYY", ""))]));
+
+    let outcome = Baseline::new(baseline).check(&candidate);
+    assert_eq!(outcome.violations.len(), 1);
+    let v = &outcome.violations[0];
+    assert_eq!(v.field, "rekor");
+    assert_eq!(v.kind, FROZEN_CHANGED);
+}
+
 // ---------------------------------------------------------------------------
 // Append-only-multiset provenance
 // ---------------------------------------------------------------------------
 
-fn provs(items: &[&str]) -> FieldValue {
-    FieldValue::StrList(items.iter().map(|s| s.to_string()).collect())
+fn git_prov(url: &str, ref_spec: &str, commit_sha: &str) -> Provenance {
+    Provenance::Git {
+        url: url.to_string(),
+        ref_spec: ref_spec.to_string(),
+        commit_sha: Some(commit_sha.to_string()),
+    }
+}
+
+fn provs(items: Vec<Provenance>) -> FieldValue {
+    FieldValue::ProvenanceList(items)
 }
 
 #[test]
 fn provenance_append_is_legal() {
     let mut baseline = IndexState::new();
-    baseline.insert(v1(), entry(&[("provenances", provs(&["git|url1|ref1|sha1"]))]));
+    baseline.insert(v1(), entry(&[("provenances", provs(vec![git_prov("url1", "ref1", "sha1")]))]));
     let mut candidate = IndexState::new();
     candidate.insert(
         v1(),
-        entry(&[("provenances", provs(&["git|url1|ref1|sha1", "git|url2|ref1|sha1"]))]),
+        entry(&[(
+            "provenances",
+            provs(vec![git_prov("url1", "ref1", "sha1"), git_prov("url2", "ref1", "sha1")]),
+        )]),
     );
 
     let outcome = Baseline::new(baseline).check(&candidate);
@@ -395,9 +433,9 @@ fn provenance_append_is_legal() {
 #[test]
 fn provenance_in_place_mutation_is_removal_violation() {
     let mut baseline = IndexState::new();
-    baseline.insert(v1(), entry(&[("provenances", provs(&["git|url1|ref1|sha1"]))]));
+    baseline.insert(v1(), entry(&[("provenances", provs(vec![git_prov("url1", "ref1", "sha1")]))]));
     let mut candidate = IndexState::new();
-    candidate.insert(v1(), entry(&[("provenances", provs(&["git|url1|ref1|sha-mutated"]))]));
+    candidate.insert(v1(), entry(&[("provenances", provs(vec![git_prov("url1", "ref1", "sha-mutated")]))]));
 
     let outcome = Baseline::new(baseline).check(&candidate);
     assert_eq!(outcome.violations.len(), 1);
@@ -411,16 +449,47 @@ fn provenance_reorder_is_legal() {
     let mut baseline = IndexState::new();
     baseline.insert(
         v1(),
-        entry(&[("provenances", provs(&["git|url1|ref1|sha1", "git|url2|ref1|sha1"]))]),
+        entry(&[(
+            "provenances",
+            provs(vec![git_prov("url1", "ref1", "sha1"), git_prov("url2", "ref1", "sha1")]),
+        )]),
     );
     let mut candidate = IndexState::new();
     candidate.insert(
         v1(),
-        entry(&[("provenances", provs(&["git|url2|ref1|sha1", "git|url1|ref1|sha1"]))]),
+        entry(&[(
+            "provenances",
+            provs(vec![git_prov("url2", "ref1", "sha1"), git_prov("url1", "ref1", "sha1")]),
+        )]),
     );
 
     let outcome = Baseline::new(baseline).check(&candidate);
     assert!(outcome.violations.is_empty());
+}
+
+#[test]
+fn provenance_dominance_compares_structured_fields_not_joined_string() {
+    // Regression lock (CR1): under the OLD `encode_provenance` joined-string
+    // comparison key ("git\x01url1\x01extra\x01ref1\x01sha1"), this pair
+    // collided byte-for-byte — the `url`/`ref_spec` boundary shifts by
+    // exactly one delimiter's worth of text. A multiset dominance check
+    // built on that joined string would see the baseline record as "still
+    // present" and stay silent. The structured `Provenance` equality MUST
+    // still catch this as a removal, because `url` and `ref_spec` genuinely
+    // differ field-by-field.
+    let baseline_prov = git_prov("url1\u{1}extra", "ref1", "sha1");
+    let candidate_prov = git_prov("url1", "extra\u{1}ref1", "sha1");
+
+    let mut baseline = IndexState::new();
+    baseline.insert(v1(), entry(&[("provenances", provs(vec![baseline_prov]))]));
+    let mut candidate = IndexState::new();
+    candidate.insert(v1(), entry(&[("provenances", provs(vec![candidate_prov]))]));
+
+    let outcome = Baseline::new(baseline).check(&candidate);
+    assert_eq!(outcome.violations.len(), 1);
+    let v = &outcome.violations[0];
+    assert_eq!(v.field, "provenances");
+    assert_eq!(v.kind, PROVENANCE_REMOVED);
 }
 
 // ---------------------------------------------------------------------------

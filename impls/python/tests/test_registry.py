@@ -957,6 +957,30 @@ package "foo" {
             parse_index(text)
         assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
 
+    def test_control_char_in_attestation_signed_by_via_kdl_escape(self) -> None:
+        """A `\\u{9}` (TAB) escape in `signed_by` is rejected — `signed_by`
+        is rendered raw into the attestation canonical digest
+        (`_attestation_canonical_raw`, §3.5.3), the same injection exposure
+        CR2 closed for `rekor`'s fields (registry-protocol §3.3)."""
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+        attestation "author-signed"
+        signed_by "alice\\u{9}evil"
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
     def test_control_char_conformance_fixture(self) -> None:
         """Conformance fixture-411: a `\\u{1f}` escape in `namespace` is
         rejected as TNG-UNSAFE-CONTROL-CHAR (CR2 differential fixture)."""
