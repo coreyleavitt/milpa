@@ -1308,6 +1308,17 @@ unparseable version string), leaving zero candidates to hand to the solver. When
 at least one provenance-bearing candidate exists, an unsatisfiable constraint
 surfaces as `SOLVE-CONFLICT` (the solver's refutation), not this slug.
 
+Also fires directly from `resolve_named_all` / `resolve_named_all_qualified`
+when every version satisfying the query is `yanked` (registry-protocol §5.2 /
+§3.2 "Yank triple", `rfc-registry-append-only.md` A5) — yanked versions are
+excluded from candidate enumeration before ordering and constraint matching in
+both lookup paths, with no `--allow-yanked` escape hatch. In that case the
+message additionally names the yanked-but-excluded candidates (and their
+`yanked_reason` when present), and the structured context carries
+`yanked_excluded: [{version, reason}, …]` alongside the existing `available`
+list. The frozen (lockfile-backed) path never consults `yanked` and is
+unaffected — an already-locked yanked version continues to reproduce.
+
 ### `TNG-NOT-FOUND`
 
 The requested package name is not in the tianguis index.

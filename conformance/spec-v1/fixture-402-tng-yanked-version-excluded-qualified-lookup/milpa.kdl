@@ -1,0 +1,12 @@
+// fixture-402: registry-protocol §5.2 NORMATIVE yank clause, S5b qualified
+// path — named explicitly in the spec as "exactly where a parallel-logic
+// miss has happened before".  A qualified (namespace=) lookup MUST apply
+// the same yank exclusion as the bare-name path (fixture-400): the newer
+// 2.0.0 is yanked, so resolution selects 1.0.0.  No mocked-fetches entry
+// exists for v2.0.0 — a regression that still considers it fails loudly
+// with FETCH-MOCK-MISSING rather than silently reproducing pre-A5 behavior.
+name "myapp"
+kind "application"
+deps {
+    bar namespace="ns1"
+}

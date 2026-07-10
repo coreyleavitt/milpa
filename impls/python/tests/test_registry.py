@@ -857,6 +857,180 @@ package "bar" {
         assert results[0].content_hash == ""
 
 
+class TestYankSelection:
+    """registry-protocol §5.2 NORMATIVE yank clause — both named-lookup entry
+    points (``resolve_named_all`` bare, ``resolve_named_all_qualified`` S5b)
+    MUST exclude ``yanked`` versions from candidate enumeration
+    (rfc-registry-append-only.md A5)."""
+
+    def _idx_with_yanked(self) -> Index:
+        text = """\
+schema_version 1
+package "bar" {
+    version "2.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000002"
+        provenance { kind "git" url "https://example.com/bar.git" ref "v2" }
+        yanked #true
+        yanked_reason "ships a vulnerable bearssl pin"
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance { kind "git" url "https://example.com/bar.git" ref "v1" }
+    }
+}
+"""
+        return parse_index(text)
+
+    def _idx_all_yanked(self) -> Index:
+        text = """\
+schema_version 1
+package "bar" {
+    version "2.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000002"
+        provenance { kind "git" url "https://example.com/bar.git" ref "v2" }
+        yanked #true
+        yanked_reason "ships a vulnerable bearssl pin"
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance { kind "git" url "https://example.com/bar.git" ref "v1" }
+        yanked #true
+    }
+}
+"""
+        return parse_index(text)
+
+    def _idx_with_yanked_qualified(self) -> Index:
+        text = """\
+schema_version 1
+package "bar" {
+    namespace "core"
+    version "2.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000002"
+        provenance { kind "git" url "https://example.com/bar.git" ref "v2" }
+        yanked #true
+        yanked_reason "ships a vulnerable bearssl pin"
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance { kind "git" url "https://example.com/bar.git" ref "v1" }
+    }
+}
+"""
+        return parse_index(text)
+
+    def _idx_all_yanked_qualified(self) -> Index:
+        text = """\
+schema_version 1
+package "bar" {
+    namespace "core"
+    version "2.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000002"
+        provenance { kind "git" url "https://example.com/bar.git" ref "v2" }
+        yanked #true
+        yanked_reason "ships a vulnerable bearssl pin"
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance { kind "git" url "https://example.com/bar.git" ref "v1" }
+        yanked #true
+    }
+}
+"""
+        return parse_index(text)
+
+    # -- bare-name lookup path (resolve_named_all) --------------------------
+
+    def test_bare_yanked_version_excluded_from_enumeration(self) -> None:
+        idx = self._idx_with_yanked()
+        results = idx.resolve_named_all("bar", None)
+        assert [iv.version for iv in results] == ["1.0.0"]
+
+    def test_bare_resolve_named_picks_highest_non_yanked(self) -> None:
+        """A new resolution must skip the yanked 2.0.0 and select 1.0.0."""
+        idx = self._idx_with_yanked()
+        iv = idx.resolve_named("bar", None)
+        assert iv.version == "1.0.0"
+
+    def test_bare_all_yanked_raises_no_satisfying_version(self) -> None:
+        idx = self._idx_all_yanked()
+        with pytest.raises(MilpaError) as exc_info:
+            idx.resolve_named_all("bar", None)
+        assert exc_info.value.slug == TNG_NO_SATISFYING_VERSION
+
+    def test_bare_no_satisfying_version_names_yanked_candidates(self) -> None:
+        """§3.2: yanked_reason is 'surfaced ... in the TNG-NO-SATISFYING-VERSION
+        message when relevant' (§5.2)."""
+        idx = self._idx_all_yanked()
+        with pytest.raises(MilpaError) as exc_info:
+            idx.resolve_named_all("bar", None)
+        message = str(exc_info.value)
+        assert "excluded as yanked" in message
+        assert "2.0.0" in message
+        assert "ships a vulnerable bearssl pin" in message
+        assert "1.0.0" in message
+
+    def test_bare_no_satisfying_version_payload_has_yanked_excluded(self) -> None:
+        idx = self._idx_all_yanked()
+        with pytest.raises(MilpaError) as exc_info:
+            idx.resolve_named_all("bar", None)
+        payload = exc_info.value.context["yanked_excluded"]
+        assert {"version": "2.0.0", "reason": "ships a vulnerable bearssl pin"} in payload
+        assert {"version": "1.0.0", "reason": None} in payload
+
+    def test_bare_no_yank_no_yanked_excluded_segment(self) -> None:
+        """No yank involved: the message MUST NOT gain the new segment."""
+        text = _fixture_index("fixture-090-solve-conflict-index-no-version")
+        idx = parse_index(text)
+        with pytest.raises(MilpaError) as exc_info:
+            idx.resolve_named("bar", ">=9.0.0")
+        assert exc_info.value.slug == TNG_NO_SATISFYING_VERSION
+        assert "excluded as yanked" not in str(exc_info.value)
+        assert exc_info.value.context["yanked_excluded"] == []
+
+    # -- qualified lookup path (resolve_named_all_qualified, S5b) -----------
+    # Named explicitly in registry-protocol §5.2: "the qualified path is
+    # exactly where a parallel-logic miss has happened before."
+
+    def test_qualified_yanked_version_excluded_from_enumeration(self) -> None:
+        idx = self._idx_with_yanked_qualified()
+        results = idx.resolve_named_all_qualified("core", "bar", None)
+        assert [iv.version for iv in results] == ["1.0.0"]
+
+    def test_qualified_all_yanked_raises_no_satisfying_version(self) -> None:
+        idx = self._idx_all_yanked_qualified()
+        with pytest.raises(MilpaError) as exc_info:
+            idx.resolve_named_all_qualified("core", "bar", None)
+        assert exc_info.value.slug == TNG_NO_SATISFYING_VERSION
+
+    def test_qualified_no_satisfying_version_names_yanked_candidates(self) -> None:
+        idx = self._idx_all_yanked_qualified()
+        with pytest.raises(MilpaError) as exc_info:
+            idx.resolve_named_all_qualified("core", "bar", None)
+        message = str(exc_info.value)
+        assert "excluded as yanked" in message
+        assert "ships a vulnerable bearssl pin" in message
+
+    def test_qualified_no_satisfying_version_payload_has_yanked_excluded(self) -> None:
+        idx = self._idx_all_yanked_qualified()
+        with pytest.raises(MilpaError) as exc_info:
+            idx.resolve_named_all_qualified("core", "bar", None)
+        payload = exc_info.value.context["yanked_excluded"]
+        assert {"version": "2.0.0", "reason": "ships a vulnerable bearssl pin"} in payload
+        assert {"version": "1.0.0", "reason": None} in payload
+
+    # -- yank exclusion is unconditional of constraint match (§5.2 NORMATIVE:
+    # "excluded ... before ordering and constraint matching") -------------
+
+    def test_yanked_version_excluded_even_when_only_match_for_constraint(self) -> None:
+        """A yanked version that is the ONLY constraint-satisfying candidate
+        is still excluded — there is no --allow-yanked escape hatch (§3.2)."""
+        idx = self._idx_with_yanked()
+        with pytest.raises(MilpaError) as exc_info:
+            idx.resolve_named_all("bar", "==2.0.0")
+        assert exc_info.value.slug == TNG_NO_SATISFYING_VERSION
+
+
 # ---------------------------------------------------------------------------
 # 6. is_safe_name — property tests
 # ---------------------------------------------------------------------------

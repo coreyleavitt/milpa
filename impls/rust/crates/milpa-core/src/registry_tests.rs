@@ -306,6 +306,169 @@ fn resolve_returns_satisfying_newest_first() {
 }
 
 // ---------------------------------------------------------------------------
+// A5 — yank selection semantics (registry-protocol §5.2 NORMATIVE yank
+// clause), both named-lookup entry points. Mirrors
+// impls/python/tests/test_registry.py::TestYankSelection.
+// ---------------------------------------------------------------------------
+
+fn yanked_ver(v: &str, hash: &str, provs: Vec<Provenance>, reason: Option<&str>) -> IndexVersion {
+    IndexVersion {
+        yanked: true,
+        yanked_reason: reason.map(String::from),
+        ..ver(v, hash, provs)
+    }
+}
+
+#[test]
+fn bare_yanked_version_excluded_from_enumeration() {
+    let idx = Index {
+        packages: vec![pkg(
+            "bar",
+            "",
+            vec![
+                yanked_ver("2.0.0", ID1, vec![git()], Some("ships a vulnerable bearssl pin")),
+                ver("1.0.0", ID1, vec![git()]),
+            ],
+        )],
+    };
+    let got = idx.resolve_named_all("bar", &full(), None).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].version, "1.0.0");
+}
+
+#[test]
+fn bare_all_yanked_raises_no_satisfying_version() {
+    let idx = Index {
+        packages: vec![pkg(
+            "bar",
+            "",
+            vec![
+                yanked_ver("2.0.0", ID1, vec![git()], Some("ships a vulnerable bearssl pin")),
+                yanked_ver("1.0.0", ID1, vec![git()], None),
+            ],
+        )],
+    };
+    let err = idx.resolve_named_all("bar", &full(), None).unwrap_err();
+    assert_eq!(err.code(), "TNG-NO-SATISFYING-VERSION");
+}
+
+#[test]
+fn bare_no_satisfying_version_names_yanked_candidates() {
+    let idx = Index {
+        packages: vec![pkg(
+            "bar",
+            "",
+            vec![yanked_ver(
+                "2.0.0",
+                ID1,
+                vec![git()],
+                Some("ships a vulnerable bearssl pin"),
+            )],
+        )],
+    };
+    let err = idx.resolve_named_all("bar", &full(), None).unwrap_err();
+    assert_eq!(err.code(), "TNG-NO-SATISFYING-VERSION");
+    assert!(err.message().contains("excluded as yanked"));
+    assert!(err.message().contains("2.0.0"));
+    assert!(err.message().contains("ships a vulnerable bearssl pin"));
+}
+
+#[test]
+fn bare_no_yank_no_yanked_excluded_segment() {
+    let idx = Index {
+        packages: vec![pkg("bar", "", vec![ver("1.0.0", ID1, vec![git()])])],
+    };
+    let err = idx
+        .resolve_named_all("bar", &gte(">= 2.0.0"), Some(">= 2.0.0"))
+        .unwrap_err();
+    assert_eq!(err.code(), "TNG-NO-SATISFYING-VERSION");
+    assert!(!err.message().contains("excluded as yanked"));
+}
+
+#[test]
+fn yanked_version_excluded_even_when_only_match_for_constraint() {
+    // No --allow-yanked escape hatch (§3.2): a yanked version that is the
+    // ONLY constraint-satisfying candidate is still excluded.
+    let idx = Index {
+        packages: vec![pkg(
+            "bar",
+            "",
+            vec![
+                yanked_ver("2.0.0", ID1, vec![git()], None),
+                ver("1.0.0", ID1, vec![git()]),
+            ],
+        )],
+    };
+    let err = idx
+        .resolve_named_all("bar", &gte("== 2.0.0"), Some("== 2.0.0"))
+        .unwrap_err();
+    assert_eq!(err.code(), "TNG-NO-SATISFYING-VERSION");
+}
+
+// -- qualified lookup path (resolve_named_all_qualified, S5b) — named
+// explicitly in registry-protocol §5.2: "the qualified path is exactly
+// where a parallel-logic miss has happened before."
+
+#[test]
+fn qualified_yanked_version_excluded_from_enumeration() {
+    let idx = Index {
+        packages: vec![pkg(
+            "bar",
+            "core",
+            vec![
+                yanked_ver("2.0.0", ID1, vec![git()], Some("ships a vulnerable bearssl pin")),
+                ver("1.0.0", ID1, vec![git()]),
+            ],
+        )],
+    };
+    let got = idx
+        .resolve_named_all_qualified("core", "bar", &full(), None)
+        .unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].version, "1.0.0");
+}
+
+#[test]
+fn qualified_all_yanked_raises_no_satisfying_version() {
+    let idx = Index {
+        packages: vec![pkg(
+            "bar",
+            "core",
+            vec![
+                yanked_ver("2.0.0", ID1, vec![git()], Some("ships a vulnerable bearssl pin")),
+                yanked_ver("1.0.0", ID1, vec![git()], None),
+            ],
+        )],
+    };
+    let err = idx
+        .resolve_named_all_qualified("core", "bar", &full(), None)
+        .unwrap_err();
+    assert_eq!(err.code(), "TNG-NO-SATISFYING-VERSION");
+}
+
+#[test]
+fn qualified_no_satisfying_version_names_yanked_candidates() {
+    let idx = Index {
+        packages: vec![pkg(
+            "bar",
+            "core",
+            vec![yanked_ver(
+                "2.0.0",
+                ID1,
+                vec![git()],
+                Some("ships a vulnerable bearssl pin"),
+            )],
+        )],
+    };
+    let err = idx
+        .resolve_named_all_qualified("core", "bar", &full(), None)
+        .unwrap_err();
+    assert_eq!(err.code(), "TNG-NO-SATISFYING-VERSION");
+    assert!(err.message().contains("excluded as yanked"));
+    assert!(err.message().contains("ships a vulnerable bearssl pin"));
+}
+
+// ---------------------------------------------------------------------------
 // S2 — dep_decl + dep_decl_schema_version on IndexVersion
 // ---------------------------------------------------------------------------
 

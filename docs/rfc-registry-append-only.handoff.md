@@ -5,12 +5,14 @@
   additions; ~30 findings consolidated to 23 ledger entries, all resolved
   under the bar and applied; **no open forks**. Round 1 was same day
   (ledger below); Stage 1 (draft + slicing) also 2026-07-09.
-- **Resume:** the RFC is ready for `/tdd`. Next: `/loop` grind — Part-2
-  P1–P3a + append-only A1, A2a–A2e, A3, A4a (+A4a-rs), A4b, A5; A6 waits
-  on Part-2 P2. A third architect round is NOT recommended: round 2's
-  changes are contract-shaped (verb specs, digest definition, slice
-  mechanics) whose remaining risk is implementation-shaped, which /tdd
-  surfaces better than another prose pass.
+- **Resume:** `/loop` TDD GRIND IN PROGRESS (2026-07-10). DONE+committed:
+  Part-2 P1 (3b920ac), P2 (d4404ad), P3a (baad9a4); A1 (fb6e707),
+  A2a (4f607a5), A2b (a53afd7), A2c (cbe1682), A2d (bdc419e),
+  A2e (3911cdd), A3 (22e07db), A4a (76dcc63), A4b (224ca14) = 12/14.
+  IN FLIGHT: A5 (yank selection, subagent running). LAST: A6 (staged
+  enforcement flip — un-gated, Part-2 P2 landed). Every slice gated on
+  full pytest + dev-rust; slice details in the checklist below. Resume
+  command: the standing `/loop` grind prompt.
 
 ## Origin (why this RFC exists)
 
@@ -196,8 +198,16 @@ verified index is a valid *successor* of the previous one. Freshness
       instantiated now, attestation named-deferred to A6); both seams
       supply explicit raw; hand-derived vector 2d659ca5… pinned in both
       unit suites + fixture 386. Gates: pytest 2874 + rust workspace green.
-- [ ] A5 — yank selection (both lookup paths), notices, NO-SATISFYING
-      naming, fixtures.
+- [x] A5 (2026-07-10) — yank selection: _filter_candidates SSOT shared by
+      resolve_named_all + resolve_named_all_qualified (both impls), yank
+      excluded BEFORE constraint matching per §5.2; transition notices
+      turned out already-landed in A2d (_print_yank_notice both impls);
+      NO-SATISFYING = payload/message enrichment of the EXISTING slug
+      (spec-mandated; Python context["yanked_excluded"], Rust message
+      segment — harness asserts .code() only); frozen path proven
+      structurally unaffected (fixture 403); spec/errors.md
+      NO-SATISFYING entry sharpened. Fixtures 400–403. Gates: pytest 2889
+      + rust workspace green.
 - [ ] A6 — post-Part-2-P2: attestation/rekor/epoch rows, no-rekor test
       inversion, staged fixtures (incl. root-vs-root tie fixture).
 

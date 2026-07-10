@@ -1,0 +1,12 @@
+// fixture-401: registry-protocol §5.2 NORMATIVE yank clause — when EVERY
+// version of a package is yanked, the enumerate-all step has zero
+// candidates left after exclusion.  The existing TNG-NO-SATISFYING-VERSION
+// error fires (no new slug — see spec/errors.md); unit tests in
+// test_registry.py::TestYankSelection assert the message additionally
+// names the yanked-but-excluded candidates and their reasons.  There is
+// no --allow-yanked escape hatch (§3.2).
+name "myapp"
+kind "application"
+deps {
+    bar
+}

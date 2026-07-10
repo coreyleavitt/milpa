@@ -1,0 +1,26 @@
+// Not consulted by the frozen path at all (registry-protocol §5.2
+// NORMATIVE: "the frozen path ... MUST NOT apply this exclusion") — kept
+// here only to document the scenario this fixture exercises: the LOCKED
+// version is exactly the one the registry has since yanked.
+schema_version 1
+package "bar" {
+    version "2.0.0" {
+        content_hash "dag-sha256:c0ae3faceec9a23e362b507815b5576ded75de3288c348f5bfde687ddb584962"
+        provenance {
+            kind "git"
+            url "https://github.com/example/bar.git"
+            ref "v2.0.0"
+            commit_sha "cafef00dcafef00dcafef00dcafef00dcafef00d"
+        }
+        yanked #true
+        yanked_reason "ships a vulnerable bearssl pin"
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:5dfa2553103798c5ab6b81fedde7a570944c948a6824dba80f612d98149b41a0"
+        provenance {
+            kind "git"
+            url "https://github.com/example/bar.git"
+            ref "v1.0.0"
+        }
+    }
+}

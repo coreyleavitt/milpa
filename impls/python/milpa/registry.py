@@ -284,16 +284,17 @@ class IndexVersion:
     malformed — a malformed value uses the parser's ordinary optional-scalar
     robustness posture (surfaced as absent, no diagnostic, no hard error).
     This is a *parse-to-typed* field only: it carries no ratchet or watermark
-    semantics here — those land with ``rfc-registry-append-only.md``'s A2b/A5
-    slices.
+    semantics here — those land with ``rfc-registry-append-only.md``'s A2b
+    slice (``ratchet.py``).
 
     ``yanked`` / ``yanked_at`` / ``yanked_reason`` — the yank triple
     (registry-protocol §3.2 "Yank triple").  ``yanked`` defaults to ``False``
     when the sibling node is absent or its value is not a boolean.
     ``yanked_at`` is parsed like ``published_at`` (malformed → ``None``, no
     diagnostic).  ``yanked_reason`` is free text, or ``None`` when absent.
-    This is parse-to-typed only — selection-time exclusion of yanked
-    versions is a later slice (A5); this field carries no enforcement here.
+    Selection-time exclusion of yanked versions from ``resolve_named_all`` /
+    ``resolve_named_all_qualified`` (registry-protocol §5.2) lands at
+    ``rfc-registry-append-only.md``'s A5 slice — see ``_filter_candidates``.
     """
 
     version: str
@@ -333,6 +334,70 @@ class AmbiguousName:
 
     name: str
     namespaces: list[str] = field(default_factory=list)
+
+
+def _filter_candidates(
+    versions: tuple[IndexVersion, ...],
+    vs: VersionSet,
+    *,
+    warn_label: str,
+) -> tuple[list[IndexVersion], list[str], list[IndexVersion]]:
+    """Shared constraint-filtering core for both named-lookup entry points
+    (registry-protocol §5.2 / §5.2 NORMATIVE yank clause).
+
+    Single source of truth so ``resolve_named_all`` (bare) and
+    ``resolve_named_all_qualified`` (S5b) can never drift on selection
+    semantics — the exact bug class §5.2's yank clause calls out
+    ("the qualified path is exactly where a parallel-logic miss has
+    happened before").
+
+    Yank exclusion happens first, unconditionally of the constraint (§5.2
+    NORMATIVE: "excluded ... before ordering and constraint matching") —
+    a yanked version never becomes a candidate regardless of whether it
+    would otherwise satisfy *constraint*. Returns
+    ``(satisfying, provenance_less_version_strings, yanked_excluded)``.
+    """
+    satisfying: list[IndexVersion] = []
+    provenance_less: list[str] = []
+    yanked_excluded: list[IndexVersion] = []
+
+    for iv in versions:
+        parsed = parse_version(iv.version)
+        if parsed is None:
+            continue  # unparseable version strings skipped (§5.2 NORMATIVE)
+        if iv.yanked:
+            yanked_excluded.append(iv)
+            continue
+        if vs.contains(parsed):
+            if not iv.provenances:
+                provenance_less.append(iv.version)
+                warnings.warn(
+                    f"version {iv.version!r} of {warn_label} has no provenance — skipped",
+                    stacklevel=3,
+                )
+                continue
+            satisfying.append(iv)
+
+    return satisfying, provenance_less, yanked_excluded
+
+
+def _format_yanked_excluded(yanked_excluded: list[IndexVersion]) -> str:
+    """Render the yanked-but-excluded segment of a
+    ``TNG-NO-SATISFYING-VERSION`` message (registry-protocol §5.2 /
+    §3.2 ``yanked_reason`` "surfaced ... in the TNG-NO-SATISFYING-VERSION
+    message when relevant")."""
+    parts = []
+    for iv in yanked_excluded:
+        if iv.yanked_reason:
+            parts.append(f"{iv.version} ({iv.yanked_reason})")
+        else:
+            parts.append(iv.version)
+    return ", ".join(parts)
+
+
+def _yanked_excluded_payload(yanked_excluded: list[IndexVersion]) -> list[dict[str, str | None]]:
+    """Structured payload for the ``yanked_excluded`` error-context field."""
+    return [{"version": iv.version, "reason": iv.yanked_reason} for iv in yanked_excluded]
 
 
 @dataclass
@@ -401,22 +466,9 @@ class Index:
         pkg = result
         vs = VersionSet.from_constraint(constraint)
 
-        satisfying: list[IndexVersion] = []
-        provenance_less: list[str] = []
-
-        for iv in pkg.versions:
-            parsed = parse_version(iv.version)
-            if parsed is None:
-                continue  # unparseable version strings skipped (§5.2 NORMATIVE)
-            if vs.contains(parsed):
-                if not iv.provenances:
-                    provenance_less.append(iv.version)
-                    warnings.warn(
-                        f"version {iv.version!r} of {name!r} has no provenance — skipped",
-                        stacklevel=2,
-                    )
-                    continue
-                satisfying.append(iv)
+        satisfying, provenance_less, yanked_excluded = _filter_candidates(
+            pkg.versions, vs, warn_label=repr(name)
+        )
 
         if satisfying:
             return satisfying
@@ -432,13 +484,19 @@ class Index:
                 excluded=provenance_less,
             )
 
+        message = (
+            f"no version of {name!r} satisfies constraint {constraint!r} "
+            f"(available: {', '.join(iv.version for iv in pkg.versions)})"
+        )
+        if yanked_excluded:
+            message += f" (excluded as yanked: {_format_yanked_excluded(yanked_excluded)})"
         raise MilpaError(
             TNG_NO_SATISFYING_VERSION,
-            f"no version of {name!r} satisfies constraint {constraint!r} "
-            f"(available: {', '.join(iv.version for iv in pkg.versions)})",
+            message,
             name=name,
             constraint=constraint,
             available=[iv.version for iv in pkg.versions],
+            yanked_excluded=_yanked_excluded_payload(yanked_excluded),
         )
 
     def resolve_named(
@@ -506,28 +564,15 @@ class Index:
             )
 
         vs = VersionSet.from_constraint(constraint)
+        qualified = f"{namespace}/{name}"
 
-        satisfying: list[IndexVersion] = []
-        provenance_less: list[str] = []
-
-        for iv in pkg.versions:
-            parsed = parse_version(iv.version)
-            if parsed is None:
-                continue
-            if vs.contains(parsed):
-                if not iv.provenances:
-                    provenance_less.append(iv.version)
-                    warnings.warn(
-                        f"version {iv.version!r} of {namespace!r}/{name!r} has no provenance — skipped",
-                        stacklevel=2,
-                    )
-                    continue
-                satisfying.append(iv)
+        satisfying, provenance_less, yanked_excluded = _filter_candidates(
+            pkg.versions, vs, warn_label=repr(qualified)
+        )
 
         if satisfying:
             return satisfying
 
-        qualified = f"{namespace}/{name}"
         if provenance_less:
             raise MilpaError(
                 TNG_NO_PROVENANCE,
@@ -539,13 +584,19 @@ class Index:
                 excluded=provenance_less,
             )
 
+        message = (
+            f"no version of {qualified!r} satisfies constraint {constraint!r} "
+            f"(available: {', '.join(iv.version for iv in pkg.versions)})"
+        )
+        if yanked_excluded:
+            message += f" (excluded as yanked: {_format_yanked_excluded(yanked_excluded)})"
         raise MilpaError(
             TNG_NO_SATISFYING_VERSION,
-            f"no version of {qualified!r} satisfies constraint {constraint!r} "
-            f"(available: {', '.join(iv.version for iv in pkg.versions)})",
+            message,
             name=name,
             constraint=constraint,
             available=[iv.version for iv in pkg.versions],
+            yanked_excluded=_yanked_excluded_payload(yanked_excluded),
         )
 
 

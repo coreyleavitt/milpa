@@ -316,6 +316,46 @@ impl Index {
     }
 
     /// Look up by bare `name` (registry-protocol §3.2). Raise-free.
+    /// Shared constraint-filtering core for both named-lookup entry points
+    /// (registry-protocol §5.2 / §5.2 NORMATIVE yank clause). Single source
+    /// of truth so `resolve_named_all` (bare) and `resolve_named_all_qualified`
+    /// (S5b) never drift on selection semantics — the exact bug class §5.2's
+    /// yank clause calls out ("the qualified path is exactly where a
+    /// parallel-logic miss has happened before").
+    ///
+    /// Yank exclusion happens first, unconditionally of `vs` (§5.2 NORMATIVE:
+    /// "excluded ... before ordering and constraint matching") — a yanked
+    /// version never becomes a candidate regardless of whether it would
+    /// otherwise satisfy the constraint. Returns
+    /// `(satisfying, provenance_less_version_strings, yanked_excluded)`.
+    fn filter_candidates(
+        versions: &[IndexVersion],
+        vs: &VersionSet,
+    ) -> (Vec<IndexVersion>, Vec<String>, Vec<IndexVersion>) {
+        let mut satisfying: Vec<IndexVersion> = Vec::new();
+        let mut provenance_less: Vec<String> = Vec::new();
+        let mut yanked_excluded: Vec<IndexVersion> = Vec::new();
+
+        for v in versions {
+            let Some(parsed) = parse_version(&v.version) else {
+                continue; // unparseable version strings skipped (§5.2 NORMATIVE)
+            };
+            if v.yanked {
+                yanked_excluded.push(v.clone());
+                continue;
+            }
+            if vs.contains(&parsed) {
+                if v.provenances.is_empty() {
+                    provenance_less.push(v.version.clone());
+                    continue;
+                }
+                satisfying.push(v.clone());
+            }
+        }
+
+        (satisfying, provenance_less, yanked_excluded)
+    }
+
     pub fn lookup_bare(&self, name: &str) -> BareLookup {
         let matches: Vec<&Package> = self.packages.iter().filter(|p| p.name == name).collect();
         match matches.as_slice() {
@@ -361,20 +401,8 @@ impl Index {
             BareLookup::Found(pkg) => pkg,
         };
 
-        let mut satisfying: Vec<IndexVersion> = Vec::new();
-        let mut provenance_less: Vec<String> = Vec::new();
-        for v in &pkg.versions {
-            let Some(parsed) = parse_version(&v.version) else {
-                continue;
-            };
-            if vs.contains(&parsed) {
-                if v.provenances.is_empty() {
-                    provenance_less.push(v.version.clone());
-                    continue;
-                }
-                satisfying.push(v.clone());
-            }
-        }
+        let (satisfying, provenance_less, yanked_excluded) =
+            Self::filter_candidates(&pkg.versions, vs);
 
         if satisfying.is_empty() {
             if !provenance_less.is_empty() {
@@ -387,17 +415,21 @@ impl Index {
                     ),
                 ));
             }
-            return Err(tng(
-                "TNG-NO-SATISFYING-VERSION",
-                format!(
-                    "no version of {name:?} satisfies constraint {constraint_desc:?} (available: {})",
-                    pkg.versions
-                        .iter()
-                        .map(|v| v.version.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            ));
+            let mut message = format!(
+                "no version of {name:?} satisfies constraint {constraint_desc:?} (available: {})",
+                pkg.versions
+                    .iter()
+                    .map(|v| v.version.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if !yanked_excluded.is_empty() {
+                message.push_str(&format!(
+                    " (excluded as yanked: {})",
+                    format_yanked_excluded(&yanked_excluded)
+                ));
+            }
+            return Err(tng("TNG-NO-SATISFYING-VERSION", message));
         }
         Ok(satisfying)
     }
@@ -431,20 +463,8 @@ impl Index {
             }
         };
 
-        let mut satisfying: Vec<IndexVersion> = Vec::new();
-        let mut provenance_less: Vec<String> = Vec::new();
-        for v in &pkg.versions {
-            let Some(parsed) = parse_version(&v.version) else {
-                continue;
-            };
-            if vs.contains(&parsed) {
-                if v.provenances.is_empty() {
-                    provenance_less.push(v.version.clone());
-                    continue;
-                }
-                satisfying.push(v.clone());
-            }
-        }
+        let (satisfying, provenance_less, yanked_excluded) =
+            Self::filter_candidates(&pkg.versions, vs);
 
         if satisfying.is_empty() {
             if !provenance_less.is_empty() {
@@ -457,20 +477,38 @@ impl Index {
                     ),
                 ));
             }
-            return Err(tng(
-                "TNG-NO-SATISFYING-VERSION",
-                format!(
-                    "no version of {qualified:?} satisfies constraint {constraint_desc:?} (available: {})",
-                    pkg.versions
-                        .iter()
-                        .map(|v| v.version.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            ));
+            let mut message = format!(
+                "no version of {qualified:?} satisfies constraint {constraint_desc:?} (available: {})",
+                pkg.versions
+                    .iter()
+                    .map(|v| v.version.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if !yanked_excluded.is_empty() {
+                message.push_str(&format!(
+                    " (excluded as yanked: {})",
+                    format_yanked_excluded(&yanked_excluded)
+                ));
+            }
+            return Err(tng("TNG-NO-SATISFYING-VERSION", message));
         }
         Ok(satisfying)
     }
+}
+
+/// Render the yanked-but-excluded segment of a `TNG-NO-SATISFYING-VERSION`
+/// message (registry-protocol §5.2 / §3.2 `yanked_reason` "surfaced ... in
+/// the TNG-NO-SATISFYING-VERSION message when relevant").
+fn format_yanked_excluded(yanked_excluded: &[IndexVersion]) -> String {
+    yanked_excluded
+        .iter()
+        .map(|v| match &v.yanked_reason {
+            Some(r) => format!("{} ({r})", v.version),
+            None => v.version.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ---------------------------------------------------------------------------

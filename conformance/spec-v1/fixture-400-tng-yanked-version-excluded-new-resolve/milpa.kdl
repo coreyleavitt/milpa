@@ -1,0 +1,12 @@
+// fixture-400: registry-protocol §5.2 NORMATIVE yank clause — a new
+// resolution MUST exclude the yanked 2.0.0 and select the highest
+// non-yanked candidate (1.0.0), even though 2.0.0 is newer and would
+// otherwise win under maxver strategy.  Deliberately no mocked-fetches
+// entry exists for v2.0.0 — if an impl regresses and still considers the
+// yanked version, resolution fails with FETCH-MOCK-MISSING instead of
+// silently reproducing the old (pre-A5) behavior.
+name "myapp"
+kind "application"
+deps {
+    bar
+}

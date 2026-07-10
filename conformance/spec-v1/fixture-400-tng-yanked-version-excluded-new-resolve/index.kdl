@@ -1,0 +1,23 @@
+schema_version 1
+package "bar" {
+    version "2.0.0" {
+        content_hash "dag-sha256:9497672a6e7b5af95064d5709cd2a7a0b6ccd07a209fd541eb1402dc7a9e0383"
+        provenance {
+            kind "git"
+            url "https://github.com/example/bar.git"
+            ref "v2.0.0"
+            commit_sha "cafef00dcafef00dcafef00dcafef00dcafef00d"
+        }
+        yanked #true
+        yanked_reason "ships a vulnerable bearssl pin"
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:1902ed126344702d13e9323974de0840ca20483e0bef0bc5b1078890481970ef"
+        provenance {
+            kind "git"
+            url "https://github.com/example/bar.git"
+            ref "v1.0.0"
+            commit_sha "beeff00dbeeff00dbeeff00dbeeff00dbeeff00d"
+        }
+    }
+}

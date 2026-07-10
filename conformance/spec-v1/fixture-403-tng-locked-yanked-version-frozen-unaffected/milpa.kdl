@@ -1,0 +1,13 @@
+// fixture-403: registry-protocol §5.2 NORMATIVE — "an already-locked
+// yanked version continues to reproduce unaffected; yank steers new
+// selection, it never breaks reproduction." The frozen path (lockfile-
+// backed reconstruction) never loads the index and MUST NOT apply the
+// yank exclusion — it must reproduce bar@2.0.0 even though the index
+// (above) now marks it yanked. There is no --allow-yanked escape hatch
+// because none is needed here: the frozen path was never gated on
+// `yanked` in the first place (§3.2).
+name "myapp"
+kind "application"
+deps {
+    bar
+}
