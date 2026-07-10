@@ -172,11 +172,19 @@ verified index is a valid *successor* of the previous one. Freshness
       differential fixture will force a normative rendering definition +
       both-impl alignment (spec sharpening belongs to A4b). Gates: rust
       workspace + conformance + pytest 2849 all green.
-- [ ] A4a — harness seeding, asymmetric: Python extends
-      `_execute_index_trust_fixture` (NOT `_build_env`); **A4a-rs** builds
-      the Rust cache-exercising runner path from scratch (today it feeds
-      hardcoded bytes, no XDG_CACHE_HOME); logical seeds → hashed names;
-      post-state byte-comparison step in both.
+- [x] A4a (2026-07-10) — harness seeding, both runners: fixture keys
+      MILPA_INDEX_HISTORY_MANIFEST/_HISTORY env pair, baseline-seed/
+      (logical names), expected/baseline-state (unchanged|advanced|absent)
+      + optional expected/baseline exact bytes; logical→hashed via the
+      PRODUCTION baseline_sidecar_paths in both impls (no hand-rolled
+      hashing); smoke fixtures 378 (clean advance) + 379 (violation-warn
+      frozen). Real bug caught by TDD: Python runner seeded XDG root, not
+      _default_cache_dir()'s milpa/index/ subpath — fixed. Rust runner
+      note: run_index_history_ratchet drives evaluate_gate + real file I/O
+      directly (fd2 capture unsafe under parallel harness) rather than
+      load_index_with_history — seam wiring covered by A3's unit/CLI
+      tests; A4b may revisit if differential needs full-path fidelity.
+      Gates: pytest 2851 + rust workspace/conformance green.
 - [ ] A4b — fixture matrix + differential (slugs AND payload ordering AND
       canonical digests).
 - [ ] A5 — yank selection (both lookup paths), notices, NO-SATISFYING

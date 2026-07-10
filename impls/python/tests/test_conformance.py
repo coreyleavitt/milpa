@@ -1461,6 +1461,48 @@ def _dag_oracle_local_entries(local_spec: Path, tmp_dir: Path) -> list:
 #                                      MEMBER illegally declares `index-trust "strict"`
 #                                      (root optionally declares MILPA_INDEX_TRUST_MANIFEST)
 #
+# A4a (RFC registry-append-only.md §2, conformance strategy "Harness extension
+# first"): append-only ratchet baseline seeding + post-state assertion, layered
+# onto this SAME fixture tier (not a new `cmd`) — the ratchet gate already runs
+# on every `_load_index_for_verb` call once A2d landed, so a fixture that says
+# nothing about it exercises TOFU (no baseline seeded, no post-state asserted),
+# same as fixtures 338-366. New, optional fixture surface:
+#
+#   MILPA_INDEX_HISTORY_MANIFEST ← manifest-level `index-history` policy, written
+#                                  to the same real milpa.kdl as index-trust
+#                                  (single-package fixtures only — workspace/
+#                                  member-illegal variants don't plumb this in
+#                                  A4a; extend when A4b needs them). Absent →
+#                                  manifest omits the node (defaults to "warn").
+#   MILPA_INDEX_HISTORY          ← env override (set in OS environment for the
+#                                  call, mirrors MILPA_INDEX_TRUST)
+#   baseline-seed/               ← optional directory. LOGICAL seed names (never
+#                                  literal hashed sidecar names — sidecar names
+#                                  are `sha256(url)`-derived and the fixture's
+#                                  `file://` URL differs per checkout, spec §6):
+#     baseline.index.kdl         ← seeds the `.baseline` sidecar (full index text,
+#                                  same shape as `index.kdl` above)
+#     baseline.meta               ← optional; seeds the `.baseline.meta` sidecar
+#                                  verbatim (KDL text, `BaselineMeta.render()` shape)
+#   expected/baseline-state      ← optional; one of "unchanged" | "advanced" |
+#                                  "absent" — post-run byte-comparison of the
+#                                  `.baseline` sidecar against, respectively, the
+#                                  seeded bytes (sticky, no advance), this
+#                                  fixture's served `index.kdl` bytes (clean-diff
+#                                  or TOFU advance), or "no `.baseline` file
+#                                  exists" (`index-history off`, never read/written).
+#   expected/baseline            ← optional; EXACT expected bytes of the post-run
+#                                  `.baseline` sidecar, for cases `baseline-state`'s
+#                                  three markers cannot express. Mutually exclusive
+#                                  with `baseline-state` in practice (both may be
+#                                  declared; both are checked if present).
+#
+# Both the seed→hashed-sidecar mapping and the post-state comparison are
+# resolved with the SAME `index_cache.baseline_sidecar_paths(url, cache_dir)`
+# helper the production ratchet gate and `milpa index status`/`accept` use —
+# the one naming authority (registry-protocol §6 NORMATIVE), so the fixture
+# runner cannot silently drift from the real sidecar layout.
+#
 # Item 2 (H6 root-cause fix): this runner now calls through the REAL CLI functions
 # _build_index_trust + _load_index_for_verb (via load_default_index) rather than
 # calling enforce_index_trust directly. A future regression that unwires the trust
@@ -1492,13 +1534,24 @@ def _dag_oracle_local_entries(local_spec: Path, tmp_dir: Path) -> list:
 # state machine (RFC §10.3).
 
 
-def _write_single_package_manifest(project_dir: Path, manifest_policy: str) -> None:
-    """Write a minimal milpa.kdl with the given index-trust policy to project_dir."""
+def _write_single_package_manifest(
+    project_dir: Path,
+    manifest_policy: str,
+    index_history_policy: str | None = None,
+) -> None:
+    """Write a minimal milpa.kdl with the given index-trust policy to project_dir.
+
+    ``index_history_policy``: when not ``None``, also declares
+    ``index-history "<value>"`` (RFC registry-append-only.md §2/A4a) — the
+    manifest-level half of the ``index-history`` axis, mirroring
+    ``index-trust``'s ``manifest_policy`` parameter. ``None`` omits the node
+    entirely (manifest default applies: ``"warn"``).
+    """
     project_dir.mkdir(parents=True, exist_ok=True)
-    (project_dir / "milpa.kdl").write_text(
-        f'name "conformance-test"\nindex-trust "{manifest_policy}"\n',
-        encoding="utf-8",
-    )
+    lines = ['name "conformance-test"', f'index-trust "{manifest_policy}"']
+    if index_history_policy is not None:
+        lines.append(f'index-history "{index_history_policy}"')
+    (project_dir / "milpa.kdl").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _write_workspace_root_index_trust(project_dir: Path, root_policy: str) -> None:
@@ -1545,6 +1598,119 @@ def _write_workspace_member_illegal_index_trust(project_dir: Path, root_policy: 
     (sub_dir / "milpa.kdl").write_text(
         'name "sub"\nkind "library"\nindex-trust "strict"\n', encoding="utf-8",
     )
+
+
+# ---------------------------------------------------------------------------
+# A4a (RFC registry-append-only.md §2): append-only ratchet baseline seeding
+# + post-state assertion for the index-trust fixture tier above. See the
+# "A4a" block in the fixture-schema comment for the full fixture-key contract.
+# ---------------------------------------------------------------------------
+
+
+def _seed_ratchet_baseline(fixture_dir: Path, index_url: str, cache_dir: Path) -> None:
+    """Seed the ratchet baseline sidecar pair for *index_url* from the
+    fixture's LOGICAL ``baseline-seed/`` directory, if present.
+
+    Maps the fixture's logical seed files (``baseline.index.kdl``, optional
+    ``baseline.meta``) to the real hashed sidecar names via
+    ``index_cache.baseline_sidecar_paths`` — the SAME naming authority the
+    production ratchet gate and ``milpa index status``/``accept`` use
+    (registry-protocol §6 NORMATIVE), so this seeding step can never drift
+    from the real sidecar layout. A no-op when ``baseline-seed/`` is absent
+    (the fixture is a plain TOFU case, same as fixtures 338-366).
+    """
+    from milpa.index_cache import baseline_sidecar_paths
+
+    seed_dir = fixture_dir / "baseline-seed"
+    if not seed_dir.is_dir() or not index_url:
+        return
+
+    seed_index = seed_dir / "baseline.index.kdl"
+    if not seed_index.is_file():
+        raise AssertionError(
+            f"{seed_dir} exists but is missing the required baseline.index.kdl seed"
+        )
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    baseline_path, meta_path = baseline_sidecar_paths(index_url, cache_dir)
+    baseline_path.write_bytes(seed_index.read_bytes())
+
+    seed_meta = seed_dir / "baseline.meta"
+    if seed_meta.is_file():
+        meta_path.write_bytes(seed_meta.read_bytes())
+
+
+def _check_ratchet_baseline_post_state(
+    fixture_dir: Path, index_url: str, cache_dir: Path
+) -> str | None:
+    """Compare the post-run ``.baseline`` sidecar against the fixture's
+    declared expectation. Returns ``None`` (nothing to check — and
+    therefore nothing wrong) when the fixture declares neither
+    ``expected/baseline-state`` nor ``expected/baseline``; otherwise
+    returns ``None`` on a match or a failure message on mismatch.
+
+    ``expected/baseline-state`` markers:
+      - ``"unchanged"`` — baseline bytes equal the SEEDED bytes (sticky —
+        no advance: a warn-policy violation, or ``index-history off``
+        never touching an existing baseline).
+      - ``"advanced"``  — baseline bytes equal this fixture's served
+        ``index.kdl`` bytes (clean-diff sticky-advance, or TOFU
+        establishment).
+      - ``"absent"``    — no ``.baseline`` file exists at all.
+
+    ``expected/baseline`` (if present) is an exact byte-for-byte comparison,
+    for cases the three markers above cannot express. Both may be declared;
+    both are checked.
+    """
+    from milpa.index_cache import baseline_sidecar_paths
+
+    state_file = fixture_dir / "expected" / "baseline-state"
+    exact_file = fixture_dir / "expected" / "baseline"
+    if not state_file.is_file() and not exact_file.is_file():
+        return None
+    if not index_url:
+        return "expected/baseline-state or expected/baseline declared but no index_url"
+
+    baseline_path, _meta_path = baseline_sidecar_paths(index_url, cache_dir)
+    actual_bytes = baseline_path.read_bytes() if baseline_path.is_file() else None
+
+    if state_file.is_file():
+        marker = state_file.read_text(encoding="utf-8").strip()
+        if marker == "absent":
+            if actual_bytes is not None:
+                return "expected/baseline-state=absent but a .baseline sidecar was written"
+        elif marker == "unchanged":
+            seed_index = fixture_dir / "baseline-seed" / "baseline.index.kdl"
+            if not seed_index.is_file():
+                return "expected/baseline-state=unchanged but no baseline-seed/baseline.index.kdl"
+            expected_bytes = seed_index.read_bytes()
+            if actual_bytes != expected_bytes:
+                return (
+                    "post-run .baseline does not match the seeded (unchanged) bytes:\n"
+                    f"  expected: {expected_bytes!r}\n  actual:   {actual_bytes!r}"
+                )
+        elif marker == "advanced":
+            candidate_index = fixture_dir / "index.kdl"
+            if not candidate_index.is_file():
+                return "expected/baseline-state=advanced but fixture has no index.kdl"
+            expected_bytes = candidate_index.read_bytes()
+            if actual_bytes != expected_bytes:
+                return (
+                    "post-run .baseline does not match the served (advanced) candidate bytes:\n"
+                    f"  expected: {expected_bytes!r}\n  actual:   {actual_bytes!r}"
+                )
+        else:
+            return f"invalid expected/baseline-state marker: {marker!r}"
+
+    if exact_file.is_file():
+        expected_bytes = exact_file.read_bytes()
+        if actual_bytes != expected_bytes:
+            return (
+                "post-run .baseline does not match expected/baseline exact bytes:\n"
+                f"  expected: {expected_bytes!r}\n  actual:   {actual_bytes!r}"
+            )
+
+    return None
 
 
 def _execute_index_trust_fixture(
@@ -1595,6 +1761,10 @@ def _execute_index_trust_fixture(
     require_flag = env_flag(env_dict, "MILPA_REQUIRE_ATTESTED_INDEX")
     ws_member_illegal = env_flag(env_dict, "MILPA_INDEX_TRUST_WS_MEMBER_ILLEGAL")
     ws_root_policy = env_dict.get("MILPA_INDEX_TRUST_WS_ROOT")
+    # A4a: index-history axis (RFC registry-append-only.md §2) — manifest-level
+    # field + env override, single-package fixtures only (see schema comment above).
+    index_history_manifest = env_dict.get("MILPA_INDEX_HISTORY_MANIFEST")
+    env_index_history = env_dict.get("MILPA_INDEX_HISTORY")
 
     # Validate mock_verifier_result against known wire strings.
     _VALID_WIRE = {
@@ -1634,11 +1804,15 @@ def _execute_index_trust_fixture(
         _write_workspace_root_index_trust(project_dir, ws_root_policy)
     else:
         # Single-package fixture: write real milpa.kdl with index-trust field.
-        _write_single_package_manifest(project_dir, manifest_policy)
+        _write_single_package_manifest(
+            project_dir, manifest_policy, index_history_policy=index_history_manifest,
+        )
 
     # Point MILPA_INDEX_URL at the fixture's index.kdl via file://.
     index_kdl = fixture_dir / "index.kdl"
     index_url = f"file://{index_kdl.resolve()}" if index_kdl.exists() else ""
+
+    xdg_cache_home = tmp_dir / "index-cache"
 
     # Build a minimal MilpaEnv. _load_index_for_verb only uses no_index,
     # require_attested_index, and refresh_index; fetcher+store are unused.
@@ -1656,15 +1830,19 @@ def _execute_index_trust_fixture(
     _VARS_TO_SET = {
         "MILPA_INDEX_TRUST_MOCK_VERIFIER": mock_result_str,
         "MILPA_INDEX_URL": index_url,
-        "XDG_CACHE_HOME": str(tmp_dir / "index-cache"),
+        "XDG_CACHE_HOME": str(xdg_cache_home),
     }
     if env_trust is not None:
         _VARS_TO_SET["MILPA_INDEX_TRUST"] = env_trust
+    if env_index_history is not None:
+        _VARS_TO_SET["MILPA_INDEX_HISTORY"] = env_index_history
     # Propagate MILPA_INDEX_BUNDLE_URL if the fixture declares it (§3.4.2 override).
     bundle_url_override = env_dict.get("MILPA_INDEX_BUNDLE_URL")
     if bundle_url_override is not None:
         _VARS_TO_SET["MILPA_INDEX_BUNDLE_URL"] = bundle_url_override
     _VARS_TO_CLEAR = ["MILPA_INDEX_TRUST"] if env_trust is None else []
+    if env_index_history is None:
+        _VARS_TO_CLEAR.append("MILPA_INDEX_HISTORY")
     if bundle_url_override is None:
         _VARS_TO_CLEAR.append("MILPA_INDEX_BUNDLE_URL")
 
@@ -1674,6 +1852,17 @@ def _execute_index_trust_fixture(
             os.environ[k] = v
         for k in _VARS_TO_CLEAR:
             os.environ.pop(k, None)
+
+        # A4a: seed the append-only ratchet baseline sidecar pair BEFORE the
+        # load, mapping the fixture's LOGICAL seed files to the real hashed
+        # sidecar names. Computed via the SAME `_default_cache_dir()` helper
+        # `load_default_index` uses internally (XDG_CACHE_HOME/milpa/index) —
+        # NOT the bare XDG_CACHE_HOME dir — so seeding lands exactly where the
+        # production gate will look for it.
+        from milpa.index_cache import _default_cache_dir
+
+        history_cache_dir = _default_cache_dir()
+        _seed_ratchet_baseline(fixture_dir, index_url, history_cache_dir)
 
         _reset_warned_urls()
 
@@ -1698,6 +1887,21 @@ def _execute_index_trust_fixture(
                     if slug_candidate in stderr_content:
                         got_outcome = f"warn:{slug_candidate}"
                         break
+            elif "index-history violation" in stderr_content:
+                # A4a: the append-only ratchet's own warn text (index_ratchet_seam.py
+                # _format_violation_message) — a DIFFERENT stderr shape than the
+                # index-trust warning above (its own axis, §2). Slug candidates are
+                # the ratchet's closed class set (ratchet.py: ROOT_MUTATED / ROLLBACK
+                # / ENTRY_MUTATED), not VerificationResult.
+                from milpa.errors import (
+                    TNG_ENTRY_MUTATED,
+                    TNG_INDEX_ROLLBACK,
+                    TNG_INDEX_ROOT_MUTATED,
+                )
+                for slug_candidate in (TNG_INDEX_ROOT_MUTATED, TNG_INDEX_ROLLBACK, TNG_ENTRY_MUTATED):
+                    if f"({slug_candidate})" in stderr_content:
+                        got_outcome = f"warn:{slug_candidate}"
+                        break
         except _ME as e:
             got_outcome = f"error:{e.slug}"
     finally:
@@ -1707,12 +1911,20 @@ def _execute_index_trust_fixture(
             else:
                 os.environ[k] = v
 
-    if got_outcome == expected_outcome:
-        return ("pass", "")
-    return (
-        "fail",
-        f"outcome mismatch:\n  expected: {expected_outcome!r}\n  actual:   {got_outcome!r}",
-    )
+    if got_outcome != expected_outcome:
+        return (
+            "fail",
+            f"outcome mismatch:\n  expected: {expected_outcome!r}\n  actual:   {got_outcome!r}",
+        )
+
+    # A4a: post-state comparison — the seeding/post-state machinery this slice
+    # adds. A no-op (returns None) when the fixture declares neither
+    # expected/baseline-state nor expected/baseline.
+    baseline_msg = _check_ratchet_baseline_post_state(fixture_dir, index_url, history_cache_dir)
+    if baseline_msg is not None:
+        return ("fail", baseline_msg)
+
+    return ("pass", "")
 
 
 # ---------------------------------------------------------------------------

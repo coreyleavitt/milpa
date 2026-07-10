@@ -2670,7 +2670,7 @@ fn run_index_trust_fixture(fx: &Fixture) -> Result<Produced, String> {
     );
 
     // Invoke enforce_index_trust and determine the outcome.
-    let got_outcome = match enforce_index_trust(result.clone(), &policy, "mock://test-index") {
+    let mut got_outcome = match enforce_index_trust(result.clone(), &policy, "mock://test-index") {
         Err(e) => format!("error:{}", e.code()),
         Ok(()) => {
             if policy == TrustPolicy::Off || result == VerificationResult::Trusted {
@@ -2685,12 +2685,270 @@ fn run_index_trust_fixture(fx: &Fixture) -> Result<Produced, String> {
         }
     };
 
-    if got_outcome == expected_outcome {
-        return Ok(Produced::IndexTrustPass { outcome: got_outcome });
+    // A4a-rs (RFC registry-append-only.md §2, conformance strategy "Harness
+    // extension first"): append-only ratchet baseline seeding + post-state
+    // assertion, layered onto this SAME `index-trust` fixture tier. This
+    // function's index-trust enforcement above never touches a cache dir —
+    // it calls enforce_index_trust directly against literal byte slices, so
+    // there is no existing cache-exercising seam to extend (unlike Python's
+    // `_execute_index_trust_fixture`, which already drives the real
+    // `load_index` cache state machine). A fixture that declares
+    // `baseline-seed/` gets a REAL, isolated per-fixture cache dir built
+    // from scratch here: the fixture's LOGICAL seed files are mapped to the
+    // real hashed sidecar names via `baseline_sidecar_paths` (the SAME
+    // naming authority `load_index_with_history` and `milpa index
+    // status`/`accept` use), the production `evaluate_gate` decides
+    // advance/violation, and the writes it authorizes are applied via real
+    // file I/O — then `expected/baseline-state` / `expected/baseline` assert
+    // the post-run `.baseline` sidecar bytes.
+    let mut baseline_post_state_err: Option<String> = None;
+    if dir.join("baseline-seed").is_dir() {
+        match run_index_history_ratchet(dir, &env) {
+            Ok((ratchet_outcome, post_state_err)) => {
+                got_outcome = ratchet_outcome;
+                baseline_post_state_err = post_state_err;
+            }
+            Err(e) => return Err(e),
+        }
     }
-    Err(format!(
-        "outcome mismatch:\n  expected: {expected_outcome:?}\n  actual:   {got_outcome:?}"
-    ))
+
+    if got_outcome != expected_outcome {
+        return Err(format!(
+            "outcome mismatch:\n  expected: {expected_outcome:?}\n  actual:   {got_outcome:?}"
+        ));
+    }
+    if let Some(msg) = baseline_post_state_err {
+        return Err(msg);
+    }
+    Ok(Produced::IndexTrustPass { outcome: got_outcome })
+}
+
+/// A4a-rs: run the append-only ratchet (registry-protocol §3.5.2) for an
+/// `index-trust` fixture that declares `baseline-seed/`, from scratch —
+/// built new machinery, not an extension of an existing cache-exercising
+/// seam (see the caller's doc comment). Builds a fresh, isolated temp cache
+/// dir, seeds the baseline sidecar pair from the fixture's LOGICAL seed
+/// files, calls the production `evaluate_gate`, applies its writes, and
+/// returns `(outcome, post_state_error)`:
+///
+/// - `outcome` — `"trusted"` (clean diff or TOFU) / `"warn:<SLUG>"` /
+///   `"error:<SLUG>"`, extracted from `GateDecision::warn_message` (the
+///   SAME text `evaluate_gate` also `eprintln!`s — read from the return
+///   value directly rather than capturing real stderr, which is unsafe to
+///   redirect process-wide under a parallel test harness) or the `Err`
+///   variant's slug.
+/// - `post_state_error` — `Some(msg)` when `expected/baseline-state` or
+///   `expected/baseline` is declared and the post-run `.baseline` sidecar
+///   does not match; `None` otherwise (including when neither key is
+///   declared — nothing to check).
+///
+/// Env fields consumed (mirrors the Python adapter's fixture-schema
+/// comment):
+///   `MILPA_INDEX_HISTORY_MANIFEST` — manifest-level `index-history` policy
+///                                    (absent → "warn", the spec default)
+///   `MILPA_INDEX_HISTORY`          — env override (mirrors `MILPA_INDEX_TRUST`)
+fn run_index_history_ratchet(
+    dir: &Path,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<(String, Option<String>), String> {
+    use milpa_core::ratchet::{ENTRY_MUTATED, ROLLBACK, ROOT_MUTATED};
+    use milpa_core::{baseline_sidecar_paths, evaluate_gate, parse_baseline_meta, BaselineMeta, TrustPolicy};
+
+    let seed_dir = dir.join("baseline-seed");
+    let index_kdl = dir.join("index.kdl");
+    let url = format!("file://{}", index_kdl.display());
+
+    let manifest_policy_str = env
+        .get("MILPA_INDEX_HISTORY_MANIFEST")
+        .map(|s| s.as_str())
+        .unwrap_or("warn");
+    let manifest_policy = match manifest_policy_str {
+        "warn" => TrustPolicy::Warn,
+        "strict" => TrustPolicy::Strict,
+        "off" => TrustPolicy::Off,
+        other => {
+            return Err(format!(
+                "invalid MILPA_INDEX_HISTORY_MANIFEST: {other:?}"
+            ))
+        }
+    };
+    let env_override = match env.get("MILPA_INDEX_HISTORY").map(|s| s.as_str()) {
+        Some("warn") => Some(TrustPolicy::Warn),
+        Some("strict") => Some(TrustPolicy::Strict),
+        Some("off") => Some(TrustPolicy::Off),
+        Some(other) => return Err(format!("invalid MILPA_INDEX_HISTORY: {other:?}")),
+        None => None,
+    };
+    let policy = milpa_core::effective_trust_policy(&manifest_policy, false, env_override.as_ref());
+
+    let tmp = tempfile::tempdir().map_err(|e| format!("cannot create ratchet cache tempdir: {e}"))?;
+    let cache_dir = tmp.path();
+    let (baseline_path, meta_path) = baseline_sidecar_paths(&url, cache_dir);
+
+    // Seed: map the fixture's LOGICAL seed files to the real hashed sidecar
+    // names — the naming authority is `baseline_sidecar_paths` itself, so
+    // this mapping can never drift from what `evaluate_gate`'s caller reads.
+    let seed_index = seed_dir.join("baseline.index.kdl");
+    if !seed_index.is_file() {
+        return Err(format!(
+            "{} exists but is missing the required baseline.index.kdl seed",
+            seed_dir.display()
+        ));
+    }
+    std::fs::create_dir_all(cache_dir).map_err(|e| format!("cannot create cache_dir: {e}"))?;
+    let seed_index_bytes =
+        std::fs::read(&seed_index).map_err(|e| format!("cannot read {}: {e}", seed_index.display()))?;
+    std::fs::write(&baseline_path, &seed_index_bytes)
+        .map_err(|e| format!("cannot seed {}: {e}", baseline_path.display()))?;
+    let seed_meta = seed_dir.join("baseline.meta");
+    if seed_meta.is_file() {
+        std::fs::copy(&seed_meta, &meta_path)
+            .map_err(|e| format!("cannot seed {}: {e}", meta_path.display()))?;
+    }
+
+    let candidate_bytes = std::fs::read(&index_kdl)
+        .map_err(|e| format!("cannot read {}: {e}", index_kdl.display()))?;
+    let candidate_text = String::from_utf8(candidate_bytes.clone())
+        .map_err(|e| format!("index.kdl is not valid UTF-8: {e}"))?;
+
+    let baseline_text = if baseline_path.is_file() {
+        Some(
+            std::fs::read_to_string(&baseline_path)
+                .map_err(|e| format!("cannot read {}: {e}", baseline_path.display()))?,
+        )
+    } else {
+        None
+    };
+    let existing_meta = if meta_path.is_file() {
+        let text = std::fs::read_to_string(&meta_path)
+            .map_err(|e| format!("cannot read {}: {e}", meta_path.display()))?;
+        parse_baseline_meta(&text)
+    } else {
+        BaselineMeta::default()
+    };
+
+    let now_unix: i64 = 0; // deterministic; only feeds established_at/reported_at (not byte-checked here)
+
+    let outcome = match evaluate_gate(&policy, &candidate_text, baseline_text.as_deref(), &existing_meta, now_unix, &url) {
+        Err(e) => format!("error:{}", e.code()),
+        Ok(decision) => {
+            // Apply the writes evaluate_gate authorized (mirrors
+            // index_cache.rs's apply_ratchet_writes — inlined here since
+            // that helper is private to milpa-core).
+            if decision.advance {
+                std::fs::write(&baseline_path, &candidate_bytes)
+                    .map_err(|e| format!("cannot write {}: {e}", baseline_path.display()))?;
+            }
+            if let Some(new_meta) = &decision.new_meta {
+                std::fs::write(&meta_path, new_meta.render().as_bytes())
+                    .map_err(|e| format!("cannot write {}: {e}", meta_path.display()))?;
+            }
+            match &decision.warn_message {
+                None => "trusted".to_string(),
+                Some(msg) => {
+                    let mut slug = None;
+                    for candidate in [ROOT_MUTATED, ROLLBACK, ENTRY_MUTATED] {
+                        if msg.contains(&format!("({candidate})")) {
+                            slug = Some(candidate);
+                            break;
+                        }
+                    }
+                    match slug {
+                        Some(s) => format!("warn:{s}"),
+                        None => format!("warn:<unrecognized: {msg}>"),
+                    }
+                }
+            }
+        }
+    };
+
+    // Post-state comparison: expected/baseline-state marker and/or
+    // expected/baseline exact bytes, against the post-run .baseline sidecar.
+    let post_state_err = check_ratchet_baseline_post_state(dir, &seed_dir, &baseline_path);
+
+    Ok((outcome, post_state_err))
+}
+
+/// A4a-rs: byte-compare the post-run `.baseline` sidecar (at `baseline_path`)
+/// against the fixture's declared `expected/baseline-state` marker
+/// (`"unchanged"` / `"advanced"` / `"absent"`) and/or `expected/baseline`
+/// exact bytes. Returns `None` when neither key is declared (nothing to
+/// check) or when the declared expectation(s) match; `Some(message)` on a
+/// mismatch. Mirrors the Python adapter's `_check_ratchet_baseline_post_state`.
+fn check_ratchet_baseline_post_state(
+    dir: &Path,
+    seed_dir: &Path,
+    baseline_path: &Path,
+) -> Option<String> {
+    let state_file = dir.join("expected").join("baseline-state");
+    let exact_file = dir.join("expected").join("baseline");
+    if !state_file.is_file() && !exact_file.is_file() {
+        return None;
+    }
+    let actual_bytes = if baseline_path.is_file() {
+        Some(std::fs::read(baseline_path).ok()?)
+    } else {
+        None
+    };
+
+    if state_file.is_file() {
+        let marker = std::fs::read_to_string(&state_file).ok()?.trim().to_string();
+        match marker.as_str() {
+            "absent" => {
+                if actual_bytes.is_some() {
+                    return Some(
+                        "expected/baseline-state=absent but a .baseline sidecar was written"
+                            .to_string(),
+                    );
+                }
+            }
+            "unchanged" => {
+                let seed_index = seed_dir.join("baseline.index.kdl");
+                if !seed_index.is_file() {
+                    return Some(
+                        "expected/baseline-state=unchanged but no baseline-seed/baseline.index.kdl"
+                            .to_string(),
+                    );
+                }
+                let expected = std::fs::read(&seed_index).ok()?;
+                if actual_bytes.as_deref() != Some(expected.as_slice()) {
+                    return Some(format!(
+                        "post-run .baseline does not match the seeded (unchanged) bytes:\n  expected: {:?}\n  actual:   {:?}",
+                        String::from_utf8_lossy(&expected),
+                        actual_bytes.map(|b| String::from_utf8_lossy(&b).into_owned())
+                    ));
+                }
+            }
+            "advanced" => {
+                let candidate_index = dir.join("index.kdl");
+                if !candidate_index.is_file() {
+                    return Some("expected/baseline-state=advanced but fixture has no index.kdl".to_string());
+                }
+                let expected = std::fs::read(&candidate_index).ok()?;
+                if actual_bytes.as_deref() != Some(expected.as_slice()) {
+                    return Some(format!(
+                        "post-run .baseline does not match the served (advanced) candidate bytes:\n  expected: {:?}\n  actual:   {:?}",
+                        String::from_utf8_lossy(&expected),
+                        actual_bytes.map(|b| String::from_utf8_lossy(&b).into_owned())
+                    ));
+                }
+            }
+            other => return Some(format!("invalid expected/baseline-state marker: {other:?}")),
+        }
+    }
+
+    if exact_file.is_file() {
+        let expected = std::fs::read(&exact_file).ok()?;
+        if actual_bytes.as_deref() != Some(expected.as_slice()) {
+            return Some(format!(
+                "post-run .baseline does not match expected/baseline exact bytes:\n  expected: {:?}\n  actual:   {:?}",
+                String::from_utf8_lossy(&expected),
+                actual_bytes.map(|b| String::from_utf8_lossy(&b).into_owned())
+            ));
+        }
+    }
+
+    None
 }
 
 /// Runner for `cmd=show-index-trust` fixtures (spec/cli-contract.md §5.3a).
