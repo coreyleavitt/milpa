@@ -405,9 +405,21 @@ pub struct GateDecision {
     pub warn_message: Option<String>,
 }
 
-/// The full §3.5.2 decision, given already-read baseline/meta text (this
-/// function performs no I/O — `baseline_text` is `None` exactly when the
-/// baseline sidecar is absent, i.e. TOFU).
+/// The full §3.5.2 decision, given already-read baseline/meta text
+/// (`baseline_text` is `None` exactly when the baseline sidecar is absent,
+/// i.e. TOFU). Touches no filesystem I/O.
+///
+/// This function is NOT entirely stdout/stderr-free: it prints
+/// yank-transition notices ([`print_yank_notice`]) directly and
+/// immediately, because registry-protocol §3.5.3 requires those to fire
+/// "under `warn` and `strict` alike" — including the `strict` path below,
+/// which returns `Err` before ever producing a `GateDecision`, so there is
+/// no later "caller prints it" point to defer to for that one diagnostic.
+/// Every OTHER diagnostic is pure data, not a direct print: the warn-path
+/// violation message comes back via [`GateDecision::warn_message`] for the
+/// caller to print AFTER the ordinary warn-path writes complete (see that
+/// field's doc comment); the strict-path message rides the returned `Err`
+/// itself, for whatever prints that error.
 ///
 /// Errors:
 ///   - the ordinary `TNG-*` parse/validation slug if `candidate_text`
@@ -455,11 +467,18 @@ pub fn evaluate_gate(
     }
 
     if outcome.clean() {
+        // `.filter(|s| !s.is_empty())` (not just `Option`-emptiness) is
+        // deliberate: an empty-string `established_at` (hand-corrupted
+        // meta, or a pre-this-fix write) self-heals the same as an absent
+        // one, rather than freezing the corruption in place forever.
+        // Mirrors Python's `existing_meta.established_at or
+        // iso_timestamp(now_unix)` (`index_ratchet_seam.py`).
         let meta = BaselineMeta {
             established_at: Some(
                 existing_meta
                     .established_at
                     .clone()
+                    .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| iso_timestamp(now_unix)),
             ),
             reported_digest: None,
@@ -488,8 +507,10 @@ pub fn evaluate_gate(
 
     // warn: serve the new index (bundle/index/stamp advance as usual); the
     // baseline itself stays sticky (advance=false); .meta only rewrites on
-    // a NEW digest (habituation defense).
-    eprintln!("{message}");
+    // a NEW digest (habituation defense). The diagnostic itself is NOT
+    // printed here — it rides back as `warn_message` for the caller
+    // (`index_cache.rs`'s `apply_ratchet_writes`) to print AFTER the
+    // writes below complete.
     let new_meta = if recurring {
         None
     } else {

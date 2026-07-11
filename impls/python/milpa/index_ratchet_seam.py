@@ -393,9 +393,22 @@ def evaluate_gate(
     now_unix: int,
     url: str,
 ) -> GateDecision:
-    """The full §3.5.2 decision, given already-read baseline/meta text (this
-    function performs no I/O — ``baseline_text`` is ``None`` exactly when
-    the baseline sidecar is absent, i.e. TOFU).
+    """The full §3.5.2 decision, given already-read baseline/meta text
+    (``baseline_text`` is ``None`` exactly when the baseline sidecar is
+    absent, i.e. TOFU). Touches no filesystem I/O.
+
+    This function is NOT entirely stdout/stderr-free: it prints
+    yank-transition notices (``_print_yank_notice``) directly and
+    immediately, because registry-protocol §3.5.3 requires those to fire
+    "under ``warn`` and ``strict`` alike" — including the ``strict`` path
+    below, which raises before ever returning a ``GateDecision``, so there
+    is no later "caller prints it" point to defer to for that one
+    diagnostic. Every OTHER diagnostic is pure data, not a direct print:
+    the warn-path violation message is returned via
+    ``GateDecision.warn_message`` for the caller to print AFTER the
+    ordinary warn-path writes complete (see ``GateDecision``'s docstring);
+    the strict-path message rides the raised ``MilpaError`` itself, for
+    whatever prints that error.
 
     Raises ``MilpaError``:
       - the ordinary ``TNG-*`` parse/validation slug if *candidate_text*
@@ -428,6 +441,11 @@ def evaluate_gate(
         _print_yank_notice(transition)
 
     if outcome.clean:
+        # `or` (not `is None`) is deliberate: an empty-string
+        # ``established_at`` (hand-corrupted meta, or a pre-this-fix write)
+        # self-heals the same as an absent one, rather than freezing the
+        # corruption in place forever. Rust mirrors this via `.filter(|s|
+        # !s.is_empty())` (`index_ratchet_seam.rs`).
         meta = BaselineMeta(
             established_at=existing_meta.established_at or iso_timestamp(now_unix),
             reported_digest=None,
@@ -453,8 +471,9 @@ def evaluate_gate(
     # warn: serve the new index (bundle/index/stamp advance as usual); the
     # baseline itself stays sticky (advance=False); .meta only rewrites on
     # a NEW digest (habituation defense — §3.5.2 NORMATIVE (per-policy
-    # behavior), the "warn" row).
-    print(message, file=sys.stderr)
+    # behavior), the "warn" row). The diagnostic itself is NOT printed here
+    # — it rides back as `warn_message` for the caller (`index_cache.py`'s
+    # `_apply_ratchet_writes`) to print AFTER the writes below complete.
     new_meta = (
         None
         if recurring

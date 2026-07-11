@@ -880,13 +880,21 @@ def _run_ratchet_gate(
 
 def _apply_ratchet_writes(cache_file: Path, decision: "GateDecision", candidate_bytes: bytes) -> None:
     """Write the baseline sidecar pair per *decision* (write ordering steps
-    5-6 — MUST be called strictly after the index file write, and only for
-    the writer callers that just wrote a genuinely-new candidate: TOFU
-    establishment and clean-diff sticky-advance always set ``advance``; a
-    ``warn``-dirty new-digest report sets only ``new_meta``.  A no-op when
-    neither is set (``"off"`` policy, or a recurring warn)."""
-    if not decision.advance and decision.new_meta is None:
-        return
+    5-6 — MUST be called strictly after the index file write), then print
+    the pending warn diagnostic (if any).
+
+    Writes: TOFU establishment and clean-diff sticky-advance always set
+    ``advance``; a ``warn``-dirty new-digest report sets only ``new_meta``.
+    Neither write fires for ``"off"`` policy or a recurring warn (both leave
+    ``advance`` false and ``new_meta`` ``None``).
+
+    Diagnostic: ``decision.warn_message`` (set on EVERY warn-dirty outcome,
+    recurring or not — ``index_ratchet_seam.evaluate_gate`` stays pure on
+    this path and hands the pre-formatted text back here) is printed to
+    stderr AFTER the writes above, per its own docstring and the
+    warn-serves-the-new-index convention elsewhere in this module. This is
+    the ONE place production code prints it — evaluate_gate itself no
+    longer does."""
     if decision.advance:
         # Full copy of the candidate bytes ACTUALLY SERVED (never a
         # re-serialization) — §3.5.2 NORMATIVE (write ordering).
@@ -895,6 +903,8 @@ def _apply_ratchet_writes(cache_file: Path, decision: "GateDecision", candidate_
         _atomic_write_bytes(
             _baseline_meta_path(cache_file), decision.new_meta.render().encode("utf-8")
         )
+    if decision.warn_message is not None:
+        print(decision.warn_message, file=sys.stderr)
 
 
 def _refetch_with_recovery(

@@ -2834,11 +2834,14 @@ fn extract_digest_from_message(msg: &str) -> Option<String> {
 /// returns `(outcome, post_state_error)`:
 ///
 /// - `outcome` — `"trusted"` (clean diff or TOFU) / `"warn:<SLUG>"` /
-///   `"error:<SLUG>"`, extracted from `GateDecision::warn_message` (the
-///   SAME text `evaluate_gate` also `eprintln!`s — read from the return
-///   value directly rather than capturing real stderr, which is unsafe to
-///   redirect process-wide under a parallel test harness) or the `Err`
-///   variant's slug.
+///   `"error:<SLUG>"`, extracted from `GateDecision::warn_message` — the
+///   pure diagnostic text `evaluate_gate` itself never prints; production's
+///   `index_cache.rs::apply_ratchet_writes` is the only site that
+///   `eprintln!`s it, AFTER the ordinary warn-path writes. Read here
+///   directly from the return value (this runner inlines its own writes
+///   rather than calling that private helper) rather than capturing real
+///   stderr, which is unsafe to redirect process-wide under a parallel test
+///   harness, or the `Err` variant's slug.
 /// - `post_state_error` — `Some(msg)` when `expected/baseline-state` or
 ///   `expected/baseline` is declared and the post-run `.baseline` sidecar
 ///   does not match; `None` otherwise (including when neither key is

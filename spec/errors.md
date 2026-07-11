@@ -1228,6 +1228,25 @@ The `<cache-key>.index.kdl.baseline` sidecar exists but is unparseable, truncate
 
 **Triggered:** `index_cache.write_baseline_pair` catches an `OSError` writing either sidecar of the `<cache-key>.index.kdl.baseline` / `.baseline.meta` pair. Per `cli-contract.md §5.12` NORMATIVE, this MUST be a loud, distinct error — never a printed-diff-then-silent-no-op — and MUST leave a previously-written baseline pair intact; each sidecar is written through the same per-write-unique-temp-name atomic writer (`_atomic_write_bytes`) the ordinary ratchet gate uses, so a failure creating/renaming the first temp file never mutates the existing pair.
 
+The eight `TNG-ENTRY-*` slugs below are the failure states of the `entry-trust`
+gate's single ordered pipeline (one selected registry-resolved dep at a time,
+first-failing-stage-wins). The full per-stage table — condition, slug, and
+warn/strict disposition — is `rfc-per-entry-attestation.md` §5's; this list
+is the compact index into it, so a slug's stage number is traceable from this
+file alone without cross-referencing the RFC for the numbering itself:
+
+| Stage | Slug |
+|---|---|
+| 0. attestation record | `TNG-ENTRY-UNATTESTED` |
+| 1. bundle acquisition | `TNG-ENTRY-BUNDLE-MISSING` |
+| 1b. acquisition integrity | `TNG-ENTRY-BUNDLE-PIN-MISMATCH` |
+| 2. bundle parse | `TNG-ENTRY-BUNDLE-MALFORMED` |
+| 3. subject digest | `TNG-ENTRY-DIGEST-MISMATCH` |
+| 4. subject identity | `TNG-ENTRY-SUBJECT-MISMATCH` |
+| 5. cert + signature | `TNG-ENTRY-SIGNATURE-INVALID` |
+| 6. identity policy | `TNG-ENTRY-SIGNER-MISMATCH` |
+| 7. inclusion | `TNG-ENTRY-SIGNATURE-INVALID` (shared with stage 5) |
+
 ### `TNG-ENTRY-UNATTESTED`
 
 The selected registry entry carries no per-entry attestation record — absent, of an unrecognized `attestation` kind, or structurally invalid (e.g. `"author-signed"` with no `signed_by`), all of which conservatively collapse to unattested at index-parse time (registry-protocol §3.2).
@@ -1250,19 +1269,19 @@ The fetched attestation bundle's bytes do not hash to the `bundle sha256=` pin r
 
 The per-entry Sigstore bundle JSON is unparseable or structurally invalid (pre-crypto failure, before any signature check).
 
-**Triggered:** `EntryBundleVerifier.verify` in `entry_trust.py` finds the bundle bytes are not valid JSON, are not a JSON object, or are missing the required DSSE envelope / `verificationMaterial.tlogEntries` structure. Distinct from `TNG-ENTRY-SIGNATURE-INVALID`, which covers cryptographic failures on a structurally valid bundle. Under `warn` this is a warning; under `strict` it is a hard failure.
+**Triggered:** `EntryBundleVerifier.verify` in `entry_trust.py`, stage 2 of the gate pipeline (RFC §5), finds the bundle bytes are not valid JSON, are not a JSON object, or are missing the required DSSE envelope / `verificationMaterial.tlogEntries` structure. Distinct from `TNG-ENTRY-SIGNATURE-INVALID`, which covers cryptographic failures on a structurally valid bundle. Under `warn` this is a warning; under `strict` it is a hard failure.
 
 ### `TNG-ENTRY-DIGEST-MISMATCH`
 
 The bundle's attested subject digest does not match the selected entry's `content_hash`.
 
-**Triggered:** `EntryBundleVerifier.verify` in `entry_trust.py` extracts `subject[0].digest.sha256` from the DSSE in-toto statement and finds it does not equal the hex of the selected `IndexVersion.content_hash`. Checked BEFORE any cryptographic verification (RFC §1 NORMATIVE, mirroring `registry-protocol.md §3.4.4`'s digest-before-crypto precedence). Without this check a valid, stale bundle (right signer, right signature) would still verify after the entry's `content_hash`/provenance was swapped underneath it. Under `warn` this is a warning; under `strict` it is a hard failure.
+**Triggered:** `EntryBundleVerifier.verify` in `entry_trust.py`, stage 3 of the gate pipeline (RFC §5), extracts `subject[0].digest.sha256` from the DSSE in-toto statement and finds it does not equal the hex of the selected `IndexVersion.content_hash`. Checked BEFORE any cryptographic verification (RFC §1 NORMATIVE, mirroring `registry-protocol.md §3.4.4`'s digest-before-crypto precedence). Without this check a valid, stale bundle (right signer, right signature) would still verify after the entry's `content_hash`/provenance was swapped underneath it. Under `warn` this is a warning; under `strict` it is a hard failure.
 
 ### `TNG-ENTRY-SUBJECT-MISMATCH`
 
 The bundle's attested subject package identity does not match the selected entry's `pkg:tianguis/<namespace>/<name>@<version>` coordinate.
 
-**Triggered:** `EntryBundleVerifier.verify` in `entry_trust.py` extracts `subject[0].name` from the DSSE in-toto statement and finds it does not equal the selected entry's package coordinate. Checked BEFORE any cryptographic verification, alongside the digest check (RFC §1 NORMATIVE). Closes the cross-package replay hole: `content_hash` is name-independent, so without this check a byte-identical republish of one package under a different namespace/name could point at another package's genuine, public bundle and inherit its author's signature. Under `warn` this is a warning; under `strict` it is a hard failure.
+**Triggered:** `EntryBundleVerifier.verify` in `entry_trust.py`, stage 4 of the gate pipeline (RFC §5), extracts `subject[0].name` from the DSSE in-toto statement and finds it does not equal the selected entry's package coordinate. Checked BEFORE any cryptographic verification, alongside the digest check (RFC §1 NORMATIVE). Closes the cross-package replay hole: `content_hash` is name-independent, so without this check a byte-identical republish of one package under a different namespace/name could point at another package's genuine, public bundle and inherit its author's signature. Under `warn` this is a warning; under `strict` it is a hard failure.
 
 ### `TNG-ENTRY-SIGNATURE-INVALID`
 
@@ -1274,7 +1293,7 @@ Cryptographic verification of the per-entry Sigstore bundle failed — either th
 
 The bundle's certificate SubjectAltName does not match the expected signer for the entry's attestation kind.
 
-**Triggered:** `EntryBundleVerifier.verify` in `entry_trust.py` finds the signing certificate's SubjectAltName does not equal the expected signer — for `author-signed` entries, the record's own `signed_by` (chained trust from the Layer-1-verified index); for `milpa-vendored` entries, the SAME effective vendor-bot identity Layer 1 resolved (default SAN + `MILPA_INDEX_TRUST_SIGNER` / manifest override layering — never a second hardcoded copy of the default). Under `warn` this is a warning; under `strict` it is a hard failure.
+**Triggered:** `EntryBundleVerifier.verify` in `entry_trust.py`, stage 6 of the gate pipeline (RFC §5), finds the signing certificate's SubjectAltName does not equal the expected signer — for `author-signed` entries, the record's own `signed_by` (chained trust from the Layer-1-verified index); for `milpa-vendored` entries, the SAME effective vendor-bot identity Layer 1 resolved (default SAN + `MILPA_INDEX_TRUST_SIGNER` / manifest override layering — never a second hardcoded copy of the default). Under `warn` this is a warning; under `strict` it is a hard failure.
 
 ### `TNG-KDL-SYNTAX`
 

@@ -47,7 +47,12 @@ from milpa.errors import (
     MilpaError,
 )
 from milpa.index_cache import DEFAULT_TTL_SECONDS, cache_path_for, load_index
-from milpa.index_ratchet_seam import build_index_state, parse_baseline_meta
+from milpa.index_ratchet_seam import (
+    BaselineMeta,
+    build_index_state,
+    evaluate_gate,
+    parse_baseline_meta,
+)
 from milpa.ratchet import Baseline, canonical_digest
 from milpa.index_trust import (
     IndexTrustConfig,
@@ -182,6 +187,24 @@ class TestCleanAdvance:
         load_index(URL, tmp_path, get2, 100, 1101, index_history_policy="warn")
         assert capsys.readouterr().err == ""
 
+    def test_empty_string_established_at_self_heals_like_absent(self) -> None:
+        """A hand-corrupted (or pre-fix) ``.baseline.meta`` with
+        ``established_at ""`` must regenerate on the next clean diff, the
+        same as a wholly-absent ``established_at`` — NOT freeze the empty
+        string in place forever. Rust's ``evaluate_gate`` is aligned to the
+        same self-healing semantics via ``.filter(|s| !s.is_empty())``
+        (``index_ratchet_seam.rs``)."""
+        decision = evaluate_gate(
+            policy="warn",
+            candidate_text=V1_ONLY,
+            baseline_text=V1_ONLY,  # identical -> clean diff
+            existing_meta=BaselineMeta(established_at=""),
+            now_unix=1101,
+            url=URL,
+        )
+        assert decision.new_meta is not None
+        assert decision.new_meta.established_at not in (None, "")
+
 
 # ---------------------------------------------------------------------------
 # Rollback under warn: reported, baseline stays sticky
@@ -224,6 +247,87 @@ class TestRollbackWarn:
         get2, _ = make_get(V2_ONLY)
         # Must not raise.
         load_index(URL, tmp_path, get2, 100, 1101, index_history_policy="warn")
+
+
+# ---------------------------------------------------------------------------
+# CR8: evaluate_gate's warn diagnostic is pure data, not a direct print —
+# index_cache.py's _apply_ratchet_writes is the sole caller-side print site,
+# AFTER the ordinary warn-path writes complete.
+# ---------------------------------------------------------------------------
+
+
+class TestEvaluateGateWarnMessagePurity:
+    def test_evaluate_gate_does_not_print_the_warn_diagnostic_itself(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Calling evaluate_gate directly (bypassing index_cache.py
+        entirely) on a warn-dirty diff must produce ZERO stderr output —
+        the diagnostic is pure data on GateDecision.warn_message, not a
+        direct print. (Yank-transition notices are the one documented
+        exception, spec-mandated to fire immediately even on the strict
+        path — this scenario has no yank transition, so it isolates the
+        warn-message purity claim specifically.)"""
+        decision = evaluate_gate(
+            policy="warn",
+            candidate_text=V2_ONLY,  # v1.0.0 disappears: rollback
+            baseline_text=V1_ONLY,
+            existing_meta=BaselineMeta(),
+            now_unix=1101,
+            url=URL,
+        )
+        assert capsys.readouterr().err == ""
+        assert decision.warn_message is not None
+        assert "TNG-INDEX-ROLLBACK" in decision.warn_message
+
+    def test_recurring_warn_message_still_populated_though_meta_unwritten(self) -> None:
+        """warn_message is set on EVERY warn-dirty outcome, including the
+        recurring case where new_meta is None (nothing new to persist) —
+        the caller must still print it, so the field must not silently go
+        missing alongside the no-op meta write."""
+        digest_state_baseline = build_index_state(V1_ONLY)[1]
+        digest_state_candidate = build_index_state(V1_MUTATED)[1]
+        digest = canonical_digest(Baseline(digest_state_baseline).check(digest_state_candidate).violations)
+
+        decision = evaluate_gate(
+            policy="warn",
+            candidate_text=V1_MUTATED,
+            baseline_text=V1_ONLY,
+            existing_meta=BaselineMeta(reported_digest=digest),
+            now_unix=1202,
+            url=URL,
+        )
+        assert decision.new_meta is None  # recurring: nothing new to persist
+        assert decision.warn_message is not None  # but still printable
+
+    def test_load_index_prints_warn_message_after_the_writes_complete(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end: the message still reaches stderr via load_index (now
+        via index_cache.py's _apply_ratchet_writes, called strictly after
+        the index/bundle/stamp writes) — verified with a print spy that
+        snapshots the on-disk cache file's content at print time."""
+        import milpa.index_cache as ic
+
+        get1, _ = make_get(V1_ONLY)
+        load_index(URL, tmp_path, get1, 100, 1000, index_history_policy="warn")
+
+        seen_at_print_time: list[bytes] = []
+        real_print = print
+
+        def spy_print(*args, **kwargs):
+            cache_file = cache_path_for(URL, tmp_path)
+            seen_at_print_time.append(cache_file.read_bytes())
+            real_print(*args, **kwargs)
+
+        monkeypatch.setattr(ic, "print", spy_print, raising=False)
+
+        get2, _ = make_get(V2_ONLY)  # rollback -> warn-dirty
+        load_index(URL, tmp_path, get2, 100, 1101, index_history_policy="warn")
+
+        assert len(seen_at_print_time) == 1
+        # By the time the warn diagnostic printed, the index write had
+        # already landed — proving the print fires AFTER, not before/during.
+        assert seen_at_print_time[0] == V2_ONLY.encode("utf-8")
 
 
 # ---------------------------------------------------------------------------

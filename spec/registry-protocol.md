@@ -248,6 +248,23 @@ the version was published.
 > the typed value (below) lands with `rfc-registry-append-only.md`'s A2/A2a
 > slice.
 
+> NORMATIVE (raw source text MUST also be retained): parsing to the typed
+> `<timestamp> | None` value above is not sufficient by itself — the
+> append-only ratchet's canonical violation digest (§3.5.3 NORMATIVE
+> (canonical violation digest)) requires `candidate_value` to be "the raw
+> document string exactly as served — never re-formatted", and an ISO 8601
+> string has reformatting margin the typed value alone cannot reconstruct
+> losslessly (e.g. `Z` vs `+00:00`, fractional-second precision, trailing
+> zero padding). A conformant implementation MUST therefore retain the
+> literal `published_at` source string alongside the typed value at parse
+> time — not derive it by re-serializing the parsed timestamp — so the
+> digest rule above is well-founded rather than only approximately true.
+> This mirrors how the `attestation` and `rekor` fields already require
+> their own dedicated raw/canonical rendering (§3.5.3 NORMATIVE (canonical
+> rendering for non-scalar candidate values)); `published_at` is the one
+> scalar field where the served text and a re-derived typed-value string
+> can legitimately diverge.
+
 > NORMATIVE: In the field-class taxonomy §3.5 defines over successive index
 > states, `published_at` is **Frozen** (set-once): backfilling an
 > absent-or-empty `published_at` to a value is legal exactly once per
@@ -661,11 +678,14 @@ to the per-entry attestation record in §3.2 (`attestation`, `signed_by`,
 covers document integrity only and has no dependency on §3.2's per-entry
 fields. Layer 2 — the per-entry attribution gate (`entry-trust`) that
 verifies and enforces the `EntryAttestation` record that §3.2 types — is
-specified separately in `rfc-per-entry-attestation.md` and is not part of
-this document as of this amendment. §3.2 specifies parsing (the fields are
-now typed, not ignored); it does not specify a verifier or a policy gate.
-Nothing in this spec should be read as implying an `entry-trust` gate
-exists yet.
+specified and enforced, but in a SEPARATE document, `rfc-per-entry-
+attestation.md` §4-§5, not in this document: that RFC owns the verifier,
+the policy gate, and the `TNG-ENTRY-{UNATTESTED,BUNDLE-MISSING,BUNDLE-PIN-
+MISMATCH,BUNDLE-MALFORMED,DIGEST-MISMATCH,SUBJECT-MISMATCH,SIGNATURE-
+INVALID,SIGNER-MISMATCH}` slug family (`errors.md`), all live in both
+implementations as of the RFC's P3a slice. §3.4.0's policy-axis table
+below is the cross-reference between the two documents — this section
+merely records the document boundary, not an absence of the gate.
 
 #### 3.4.0  Generic policy-axis model
 
@@ -1089,6 +1109,22 @@ tag between them:
 | **Attestation-monotone** (the bespoke lattice over attestation kinds — a *distinct* order-kind tag from `ordinal-non-decreasing` below, even though both read as "monotone") | the attestation record (`rfc-per-entry-attestation.md`'s `EntryAttestation` incl. its `bundle` pin). Part 2 owns the *type*; this section owns the *order* over its values. | `None → MilpaVendored`, `None → AuthorSigned(s)`, `MilpaVendored → AuthorSigned(s)` (backfill/upgrade) are legal. `→ None` (stripping), `AuthorSigned(s₁) → AuthorSigned(s₂)` (re-attribution), and `AuthorSigned → MilpaVendored` (downgrade) are violations. `MilpaVendored → MilpaVendored` with a changed `signed_by` (bot workflow identity rotation) is **unconstrained** — vendored attestation is a bug ratchet, not a security boundary. Within an otherwise-unchanged `(kind, signer)`, the record's `bundle` pin MUST be structurally equal; a same-kind `bundle_pin` swap is a violation (`monotone-repinned`) — the pin may change only as part of a legal kind/signer upgrade. This row checks the pin's history *across snapshots* (ratchet-time); it is distinct from and cannot collide with `TNG-ENTRY-BUNDLE-PIN-MISMATCH` (`rfc-per-entry-attestation.md`'s stage 1b), which checks served bytes against the *current* snapshot's pin (acquisition-time transport integrity). |
 | **Append-only** (multiset inclusion, compared by full-field value equality — never by list position) | the `provenance` **multiset** (§3.3) | records may be added (mirrors); removal is a violation. In-place mutation of one record's fields (e.g. `commit_sha`) manifests under multiset comparison as removal + addition — caught as removal. Preference **order** among provenance records is advisory-mutable (reordering is legal — the identity gate makes every provenance of an entry byte-equivalent, §3.3, so order affects availability, not identity). |
 | **Advisory-mutable** (trivial order — everything comparable, both directions legal) | `yanked` / `yanked_at` / `yanked_reason` (mutable both directions, but every transition MUST be surfaced as a ratchet notice, §3.5.3 — never silent); package-level descriptive fields (`upstream`) (mutable and silent) | both directions legal |
+
+> NOTE (presence has its own error family — do not stop at this table):
+> the Frozen row above lists "presence of the version node" and "presence
+> of the package node" alongside `content_hash` / `dep_decl` / `published_at`
+> / `rekor` because all six share the *same order kind* (`set-once`) — but
+> they do NOT share the same error slug. §3.5.3 routes an ordinary
+> same-entry Frozen-field mutation (a `content_hash` swap, etc.) through
+> `TNG-ENTRY-MUTATED` (rank 2), while it routes a presence failure — the
+> entry itself vanishing — through the higher-precedence `TNG-INDEX-ROLLBACK`
+> (rank 1), because "an entry disappeared" is a materially different
+> incident (rollback/takedown) from "a field on a surviving entry changed"
+> (tampering/bug), even though both are instances of the same dominance
+> order. An implementer building the raise sites from this table alone
+> would reasonably reach for one slug for the whole Frozen class; §3.5.3's
+> table is the actual routing authority — consult it before wiring a raise
+> site for a presence violation.
 
 **Root-level fields (outside the entry map).** Root fields ride the **same
 generic fold** as entries, not a parallel one: a conformant implementation
@@ -1689,10 +1725,10 @@ Once a package is found, its versions are filtered by the constraint.
 > version is excluded because all are yanked, the existing
 > `TNG-NO-SATISFYING-VERSION` error (§5.4) fires and its message MUST
 > additionally name the yanked-but-excluded candidates. There is no
-> `--allow-yanked` escape hatch (§3.2). This clause specifies the selection
-> semantics as of this spec-only amendment (A1); it is not yet enforced —
-> enforcement, fixtures, and the `TNG-NO-SATISFYING-VERSION` message change
-> land at A5.
+> `--allow-yanked` escape hatch (§3.2). Enforcement, fixtures, and the
+> `TNG-NO-SATISFYING-VERSION` message change all landed at
+> `rfc-registry-append-only.md`'s A5 slice and are live in both
+> implementations.
 
 ### 5.3  Provenance-less version handling
 

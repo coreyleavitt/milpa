@@ -107,6 +107,55 @@ fn warn_new_mutation_after_recurring_reports_new_digest() {
 }
 
 #[test]
+fn empty_string_established_at_self_heals_like_absent() {
+    // A hand-corrupted (or pre-fix) `.baseline.meta` with `established_at:
+    // Some("")` must regenerate on the next clean diff, the same as a
+    // wholly-absent `established_at` — mirrors Python's `existing_meta.
+    // established_at or iso_timestamp(now_unix)` self-healing semantics
+    // (`index_ratchet_seam.py`).
+    let baseline = index_text(ID1);
+    let candidate = index_text(ID1); // identical -> clean diff
+    let existing_meta = BaselineMeta { established_at: Some(String::new()), ..Default::default() };
+    let decision = evaluate_gate(&TrustPolicy::Warn, &candidate, Some(&baseline), &existing_meta, 2_500, "u").unwrap();
+    let meta = decision.new_meta.unwrap();
+    assert!(meta.established_at.as_deref().is_some_and(|s| !s.is_empty()));
+}
+
+// ---------------------------------------------------------------------------
+// CR8: evaluate_gate's warn diagnostic is pure data on GateDecision — not a
+// direct print. index_cache.rs's apply_ratchet_writes is the sole caller-
+// side print site, AFTER the ordinary warn-path writes complete.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn warn_dirty_diff_populates_warn_message() {
+    let baseline = index_text(ID1);
+    let candidate = index_text(ID2); // content_hash mutated
+    let existing_meta = BaselineMeta::default();
+    let decision = evaluate_gate(&TrustPolicy::Warn, &candidate, Some(&baseline), &existing_meta, 3_100, "u").unwrap();
+    let msg = decision.warn_message.expect("warn-dirty outcome must populate warn_message");
+    assert!(msg.contains("TNG-ENTRY-MUTATED"));
+}
+
+#[test]
+fn recurring_warn_message_still_populated_though_meta_unwritten() {
+    // warn_message is set on EVERY warn-dirty outcome, including the
+    // recurring case where new_meta is None (nothing new to persist) — the
+    // caller must still print it.
+    let baseline = index_text(ID1);
+    let candidate = index_text(ID2);
+    let (_, candidate_state) = build_index_state(&candidate).unwrap();
+    let (_, baseline_state) = build_index_state(&baseline).unwrap();
+    let outcome = Baseline::new(baseline_state).check(&candidate_state);
+    let digest = canonical_digest(&outcome.violations);
+
+    let existing_meta = BaselineMeta { reported_digest: Some(digest), ..Default::default() };
+    let decision = evaluate_gate(&TrustPolicy::Warn, &candidate, Some(&baseline), &existing_meta, 3_200, "u").unwrap();
+    assert!(decision.new_meta.is_none(), "recurring digest must not rewrite .meta");
+    assert!(decision.warn_message.is_some(), "but warn_message must still be populated");
+}
+
+#[test]
 fn strict_dirty_diff_hard_fails_with_primary_slug() {
     let baseline = index_text(ID1);
     let candidate = index_text(ID2);

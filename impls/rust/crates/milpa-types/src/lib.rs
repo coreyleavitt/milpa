@@ -355,8 +355,11 @@ pub struct ResolvedDep {
     /// registry-named deps. `None` for URL/tarball/local/member deps (no
     /// index entry) and for named deps whose index entry carried no
     /// attestation (or one that collapsed — registry-protocol §3.2).
-    /// Converted to the narrower `LockAttestation` (bundle_pin dropped) at
-    /// the `locked_from_resolved` boundary.
+    /// Converted to `LockAttestation` at the `locked_from_resolved` boundary
+    /// — P3a: `bundle_pin` is carried through unconditionally (NOT dropped;
+    /// see `test_locked_from_resolved_carries_bundle_pin_and_namespace` in
+    /// `lockfile.rs`), so `milpa verify`'s offline re-verification can
+    /// locate the cached bundle for a locked dep with no index available.
     pub attestation: Option<EntryAttestation>,
     /// P3a addition (RFC per-entry-attestation.md §3): the entry's REAL index
     /// namespace (`registry::IndexVersion::namespace`), populated only for
@@ -500,9 +503,12 @@ pub struct LockedDep {
     /// KDL entirely when empty. See lockfile-schema §3.8.
     pub aliases: Vec<String>,
     /// RFC per-entry-attestation.md P2 (lockfile-schema §3.9): the per-entry
-    /// attestation CLAIM, narrowed from `ResolvedDep.attestation` (bundle_pin
-    /// dropped). `None` for non-named deps and for named deps with no (or a
-    /// collapsed) index attestation record.
+    /// attestation CLAIM, narrowed from `ResolvedDep.attestation` — P3a:
+    /// `bundle_pin` and `namespace` are carried through unconditionally (NOT
+    /// dropped; see `locked_from_resolved` in `lockfile.rs`), the same two
+    /// fields `LockAttestation`'s own doc comment above describes. `None`
+    /// for non-named deps and for named deps with no (or a collapsed) index
+    /// attestation record.
     pub attestation: Option<LockAttestation>,
 }
 
