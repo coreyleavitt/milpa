@@ -30,6 +30,30 @@ pub const SUPPORTED_ALGORITHMS: &[(&str, usize)] = &[("dag-sha256", 64)];
 /// `store.rs`, whose mkdir/rename/symlink I/O the spec likewise leaves uncoded.
 pub(crate) const INTERNAL_IO: &str = "MILPA-INTERNAL-IO";
 
+/// Split an identity string into its raw `(algorithm, digest)` halves on the
+/// first `':'` (identity.md §2.2 rule 2) — WITHOUT enforcing the
+/// canonical-scheme allowlist (`SUPPORTED_ALGORITHMS`; rules 3-5). This is the
+/// shared validation seam for callers that only need the raw scheme split and
+/// must not silently no-op on malformed input — currently `parse_identity`
+/// itself, and `entry_trust::build_entry_subject`, which extracts a hex digest
+/// from a `content_hash` without needing (or wanting) to couple itself to
+/// `SUPPORTED_ALGORITHMS`.
+///
+/// Raises `ID-NO-ALGORITHM-PREFIX` when there is no `':'` separator at all —
+/// the failure mode a bare `split_once(':').unwrap_or(...)` would otherwise
+/// swallow silently.
+pub fn split_identity_scheme(s: &str) -> Result<(&str, &str), CoreError> {
+    s.split_once(':').ok_or_else(|| {
+        CoreError::Identity(
+            "ID-NO-ALGORITHM-PREFIX",
+            format!(
+                "identity {s:?} is missing the algorithm prefix; \
+                 expected '<algorithm>:<digest>' (e.g. 'sha256:abc...')"
+            ),
+        )
+    })
+}
+
 /// Validate a multihash-encoded identity string against the `<algorithm>:<digest>`
 /// grammar (identity.md §2.2). Returns the `(algorithm, digest)` split on success.
 ///
@@ -37,15 +61,7 @@ pub(crate) const INTERNAL_IO: &str = "MILPA-INTERNAL-IO";
 /// is statically a `&str`, so the type system enforces it. The remaining four
 /// codes mirror `identity.py:parse_identity`.
 pub fn parse_identity(s: &str) -> Result<(&str, &str), CoreError> {
-    let Some((algorithm, digest)) = s.split_once(':') else {
-        return Err(CoreError::Identity(
-            "ID-NO-ALGORITHM-PREFIX",
-            format!(
-                "identity {s:?} is missing the algorithm prefix; \
-                 expected '<algorithm>:<digest>' (e.g. 'sha256:abc...')"
-            ),
-        ));
-    };
+    let (algorithm, digest) = split_identity_scheme(s)?;
     let Some((_, expected_len)) = SUPPORTED_ALGORITHMS.iter().find(|(a, _)| *a == algorithm) else {
         let allowed: Vec<&str> = SUPPORTED_ALGORITHMS.iter().map(|(a, _)| *a).collect();
         return Err(CoreError::Identity(

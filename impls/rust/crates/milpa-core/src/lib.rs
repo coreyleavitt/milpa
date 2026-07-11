@@ -63,6 +63,7 @@ pub use entry_bundle_store::{
 pub use entry_trust::{
     build_entry_subject, enforce_entry_trust, evaluate_entry_attestation, EntryBundleVerifier,
     EntrySubject, EntryTrustConfig, EntryVerificationResult, MockEntryVerifier, SigstoreEntryVerifier,
+    VerifierOutcome,
 };
 pub use error::{CoreError, MilpaError};
 pub use index_cache::{

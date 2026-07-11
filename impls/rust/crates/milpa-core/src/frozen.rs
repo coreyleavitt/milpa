@@ -441,10 +441,16 @@ fn resolved_from_locked(locked: &LockedDep) -> Result<ResolvedDep, MilpaError> {
             rekor: a.rekor.clone(),
             bundle_pin: a.bundle_pin.clone(),
         }),
-        // P3a: the frozen path does not run the entry-trust gate (§8), so
-        // registry_namespace (only meaningful at gate-evaluation time) is not
-        // reconstructed here — mirrors the Python frozen path.
-        registry_namespace: None,
+        // CR13/4: LockAttestation.namespace is populated precisely so
+        // `milpa verify`'s offline re-verification (RFC per-entry-attestation.md
+        // §7) can rebuild the exact pkg:tianguis/<namespace>/<name>@<version>
+        // subject coordinate from a frozen-reconstructed graph with no index
+        // available — carry it back onto registry_namespace (empty string,
+        // the "no attestation" default, folds to None for round-trip symmetry
+        // with `_locked_from_resolved`'s `registry_namespace.unwrap_or_default()`).
+        registry_namespace: locked.attestation.as_ref().and_then(|a| {
+            if a.namespace.is_empty() { None } else { Some(a.namespace.clone()) }
+        }),
     })
 }
 

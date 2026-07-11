@@ -4,14 +4,22 @@
 //!
 //! # Public surface
 //!
-//! - [`EntryVerificationResult`] — 8-variant result type (`Trusted` + 7 slugged
-//!   failure states). NOT an extension of [`crate::index_trust::VerificationResult`]
-//!   — see "Type reuse decision" below.
+//! - [`EntryVerificationResult`] — 8-variant GATE-level result type (`Trusted`
+//!   + 7 slugged failure states). NOT an extension of
+//!   [`crate::index_trust::VerificationResult`] — see "Type reuse decision"
+//!   below.
+//! - [`VerifierOutcome`] — 6-variant VERIFIER-domain result type (CR18): the
+//!   proper subset of `EntryVerificationResult` a real verifier can ever
+//!   produce (excludes the two gate-only states `Unattested`/`BundleMissing`,
+//!   which the gate decides before ever calling the verifier). A dedicated
+//!   type rather than a doc-comment convention makes that exclusion
+//!   type-checked, not merely documented.
 //! - [`EntrySubject`] — `{name, sha256}`, the two-coordinate subject binding
 //!   (RFC §1).
 //! - [`EntryBundleVerifier`] — trait: the injected verifier seam (RFC §6).
-//!   Production code passes [`SigstoreEntryVerifier`]; test/conformance code
-//!   passes [`MockEntryVerifier`].
+//!   Returns [`VerifierOutcome`]. Production code passes
+//!   [`SigstoreEntryVerifier`]; test/conformance code passes
+//!   [`MockEntryVerifier`].
 //! - [`SigstoreEntryVerifier`] — production verifier. See "Extract-or-decline
 //!   decision" below for why real-crypto verification is P3b-gated.
 //! - [`MockEntryVerifier`] — test verifier: keyed per-subject outcome scripting.
@@ -125,20 +133,47 @@ impl EntryVerificationResult {
         }
     }
 
+}
+
+// ---------------------------------------------------------------------------
+// VerifierOutcome — the 6-variant VERIFIER-domain result (CR18)
+// ---------------------------------------------------------------------------
+
+/// The 6-variant result a real verifier ([`EntryBundleVerifier::verify`]) can
+/// ever produce — a proper SUBSET of [`EntryVerificationResult`]'s 8 gate-level
+/// variants, missing `Unattested` and `BundleMissing` (gate-level states the
+/// gate decides BEFORE ever calling the verifier; see
+/// [`evaluate_entry_attestation`]).
+///
+/// CR18: this used to be fenced by a doc comment on
+/// `EntryVerificationResult::from_verifier_value` alone ("never `Unattested`
+/// or `BundleMissing`") — true by convention, not by the type system. Giving
+/// the verifier domain its OWN type makes a verifier returning a gate-only
+/// state UNREPRESENTABLE: [`EntryBundleVerifier::verify`],
+/// [`SigstoreEntryVerifier`], and [`MockEntryVerifier`] all return
+/// `VerifierOutcome` natively; [`From<VerifierOutcome> for EntryVerificationResult`]
+/// is the one widening step, applied once at the gate boundary
+/// ([`evaluate_entry_attestation`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifierOutcome {
+    Trusted,
+    BundleMalformed,
+    DigestMismatch,
+    SubjectMismatch,
+    SignatureInvalid,
+    SignerMismatch,
+}
+
+impl VerifierOutcome {
     /// Parse from the wire-format string used by the conformance mock-VERIFIER
     /// seam (`MILPA_ENTRY_TRUST_MOCK_MAP` / `MILPA_ENTRY_TRUST_MOCK_DEFAULT`).
     ///
-    /// Total over the 6-value VERIFIER domain only — the same set
+    /// Total over this type's 6-value domain — the same set
     /// [`EntryBundleVerifier::verify`] is documented to return. `Unattested`
-    /// and `BundleMissing` are deliberately NOT accepted here: those are
-    /// gate-level states (attestation-record absence / bundle-pin absence)
-    /// that `evaluate_entry_attestation` decides BEFORE ever calling the
-    /// verifier — a mock verifier scripting them would assert something no
-    /// real verifier can ever produce. If a caller ever needs to parse the
-    /// full 8-value gate-result domain from a wire string, that is a
-    /// DIFFERENT total function over a DIFFERENT closed set — do not widen
-    /// this one to cover it (single-source-of-truth-per-domain).
-    pub fn from_verifier_value(s: &str) -> Option<Self> {
+    /// and `BundleMissing` are not representable here at all (not merely
+    /// "not accepted by this parser") — they are gate-level states that
+    /// `evaluate_entry_attestation` decides BEFORE ever calling the verifier.
+    pub fn from_wire_value(s: &str) -> Option<Self> {
         match s {
             "trusted" => Some(Self::Trusted),
             "bundle-malformed" => Some(Self::BundleMalformed),
@@ -147,6 +182,19 @@ impl EntryVerificationResult {
             "signature-invalid" => Some(Self::SignatureInvalid),
             "signer-mismatch" => Some(Self::SignerMismatch),
             _ => None,
+        }
+    }
+}
+
+impl From<VerifierOutcome> for EntryVerificationResult {
+    fn from(v: VerifierOutcome) -> Self {
+        match v {
+            VerifierOutcome::Trusted => Self::Trusted,
+            VerifierOutcome::BundleMalformed => Self::BundleMalformed,
+            VerifierOutcome::DigestMismatch => Self::DigestMismatch,
+            VerifierOutcome::SubjectMismatch => Self::SubjectMismatch,
+            VerifierOutcome::SignatureInvalid => Self::SignatureInvalid,
+            VerifierOutcome::SignerMismatch => Self::SignerMismatch,
         }
     }
 }
@@ -168,16 +216,26 @@ pub struct EntrySubject {
 /// Build the [`EntrySubject`] for one selected entry (RFC §1 coordinate format).
 ///
 /// `content_hash` is milpa's canonical identity string, `dag-sha256:<64-hex>`
-/// (identity.md §2.1) — extraction is scheme-agnostic (`split_once(':')`, the
-/// same primitive [`crate::identity::parse_identity`] uses), never a
-/// hardcoded `sha256:` prefix strip, which would silently no-op on the real
-/// `dag-sha256:` form and leak the algorithm prefix into the subject digest.
-pub fn build_entry_subject(namespace: &str, name: &str, version: &str, content_hash: &str) -> EntrySubject {
-    let hex_digest = content_hash.split_once(':').map(|(_, h)| h).unwrap_or(content_hash);
-    EntrySubject {
+/// (identity.md §2.1) — extraction uses
+/// [`crate::identity::split_identity_scheme`], the same scheme-agnostic split
+/// `parse_identity` itself uses (never a hardcoded `sha256:` prefix strip,
+/// which would silently no-op on the real `dag-sha256:` form and leak the
+/// algorithm prefix into the subject digest). Unlike `parse_identity`, this
+/// does NOT enforce `SUPPORTED_ALGORITHMS` — building a subject coordinate
+/// doesn't need that coupling — but a `content_hash` with no `':'` separator
+/// at all is a genuinely malformed input and must raise `ID-NO-ALGORITHM-
+/// PREFIX`, not silently produce an empty (or whole-string) digest.
+pub fn build_entry_subject(
+    namespace: &str,
+    name: &str,
+    version: &str,
+    content_hash: &str,
+) -> Result<EntrySubject, CoreError> {
+    let (_, hex_digest) = crate::identity::split_identity_scheme(content_hash)?;
+    Ok(EntrySubject {
         name: format!("pkg:tianguis/{namespace}/{name}@{version}"),
         sha256: hex_digest.to_string(),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -196,17 +254,16 @@ pub fn build_entry_subject(namespace: &str, name: &str, version: &str, content_h
 pub trait EntryBundleVerifier: Send + Sync {
     /// Verify the Sigstore bundle against `subject`.
     ///
-    /// Returns one of `{Trusted, BundleMalformed, DigestMismatch,
-    /// SubjectMismatch, SignatureInvalid, SignerMismatch}` — never
-    /// `Unattested` or `BundleMissing` (gate-level states the caller never
-    /// asks the verifier about).
+    /// Returns a [`VerifierOutcome`] — CR18: the verifier-domain type makes
+    /// `Unattested`/`BundleMissing` (gate-level states the caller never asks
+    /// the verifier about) UNREPRESENTABLE here, not merely undocumented.
     fn verify(
         &self,
         subject: &EntrySubject,
         bundle_bytes: &[u8],
         trust_bundle: &TrustBundle,
         expected_signer: &str,
-    ) -> EntryVerificationResult;
+    ) -> VerifierOutcome;
 }
 
 // ---------------------------------------------------------------------------
@@ -224,11 +281,11 @@ impl EntryBundleVerifier for SigstoreEntryVerifier {
         bundle_bytes: &[u8],
         _trust_bundle: &TrustBundle,
         _expected_signer: &str,
-    ) -> EntryVerificationResult {
+    ) -> VerifierOutcome {
         // Stage 2: parse bundle JSON.
         let bundle_json: serde_json::Value = match serde_json::from_slice(bundle_bytes) {
             Ok(v @ serde_json::Value::Object(_)) => v,
-            _ => return EntryVerificationResult::BundleMalformed,
+            _ => return VerifierOutcome::BundleMalformed,
         };
 
         // Pre-crypto subject checks (stages 3 + 4 — RFC §1 NORMATIVE: BOTH
@@ -237,31 +294,31 @@ impl EntryBundleVerifier for SigstoreEntryVerifier {
         // bundle even claim our subject?" (mirrors index_trust.rs's
         // pre-check rationale, §3.4.4 precedent).
         let Some(payload_b64) = bundle_json["dsseEnvelope"]["payload"].as_str() else {
-            return EntryVerificationResult::BundleMalformed;
+            return VerifierOutcome::BundleMalformed;
         };
         let Ok(payload_bytes) = base64::engine::general_purpose::STANDARD.decode(payload_b64) else {
-            return EntryVerificationResult::BundleMalformed;
+            return VerifierOutcome::BundleMalformed;
         };
         let Ok(payload_json) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) else {
-            return EntryVerificationResult::BundleMalformed;
+            return VerifierOutcome::BundleMalformed;
         };
         let Some(subjects) = payload_json["subject"].as_array() else {
-            return EntryVerificationResult::DigestMismatch;
+            return VerifierOutcome::DigestMismatch;
         };
         let Some(first) = subjects.first() else {
-            return EntryVerificationResult::DigestMismatch;
+            return VerifierOutcome::DigestMismatch;
         };
         let Some(claimed_sha256) = first["digest"]["sha256"].as_str() else {
-            return EntryVerificationResult::DigestMismatch;
+            return VerifierOutcome::DigestMismatch;
         };
         if claimed_sha256 != subject.sha256 {
-            return EntryVerificationResult::DigestMismatch;
+            return VerifierOutcome::DigestMismatch;
         }
         let Some(claimed_name) = first["name"].as_str() else {
-            return EntryVerificationResult::SubjectMismatch;
+            return VerifierOutcome::SubjectMismatch;
         };
         if claimed_name != subject.name {
-            return EntryVerificationResult::SubjectMismatch;
+            return VerifierOutcome::SubjectMismatch;
         }
 
         // Stages 5-7 (cert chain + DSSE signature + Rekor inclusion): P3b-gated
@@ -269,7 +326,7 @@ impl EntryBundleVerifier for SigstoreEntryVerifier {
         // structurally valid bundle that reaches here has passed every
         // pre-crypto check but has NOT been cryptographically verified;
         // fail-closed rather than report Trusted.
-        EntryVerificationResult::SignatureInvalid
+        VerifierOutcome::SignatureInvalid
     }
 }
 
@@ -285,12 +342,12 @@ impl EntryBundleVerifier for SigstoreEntryVerifier {
 /// `pkg:tianguis/...` coordinate) to a result; entries not in the map get
 /// `default`.
 pub struct MockEntryVerifier {
-    default: EntryVerificationResult,
-    by_subject: HashMap<String, EntryVerificationResult>,
+    default: VerifierOutcome,
+    by_subject: HashMap<String, VerifierOutcome>,
 }
 
 impl MockEntryVerifier {
-    pub fn new(default: EntryVerificationResult, by_subject: HashMap<String, EntryVerificationResult>) -> Self {
+    pub fn new(default: VerifierOutcome, by_subject: HashMap<String, VerifierOutcome>) -> Self {
         Self { default, by_subject }
     }
 }
@@ -302,7 +359,7 @@ impl EntryBundleVerifier for MockEntryVerifier {
         _bundle_bytes: &[u8],
         _trust_bundle: &TrustBundle,
         _expected_signer: &str,
-    ) -> EntryVerificationResult {
+    ) -> VerifierOutcome {
         self.by_subject.get(&subject.name).copied().unwrap_or(self.default)
     }
 }
@@ -382,12 +439,14 @@ pub fn evaluate_entry_attestation(
     };
 
     // Stages 2-7: bundle parse + subject binding + crypto, delegated to the verifier.
-    let subject = build_entry_subject(namespace, name, version, content_hash);
+    let subject = build_entry_subject(namespace, name, version, content_hash)?;
     let expected_signer = match &att.kind {
         AttestationKind::AuthorSigned { signer } => signer.as_str(),
         AttestationKind::MilpaVendored => expected_vendor_signer,
     };
-    let result = verifier.verify(&subject, &bundle_bytes, trust_bundle, expected_signer);
+    // CR18: verifier.verify returns the narrower VerifierOutcome; widen to the
+    // gate-level EntryVerificationResult here, at the one gate boundary.
+    let result: EntryVerificationResult = verifier.verify(&subject, &bundle_bytes, trust_bundle, expected_signer).into();
     Ok((result, None))
 }
 
@@ -512,23 +571,31 @@ mod tests {
 
     #[test]
     fn build_entry_subject_strips_scheme_agnostically() {
-        let s = build_entry_subject("ns1", "bar", "2.0.0", "dag-sha256:abcd");
+        let s = build_entry_subject("ns1", "bar", "2.0.0", "dag-sha256:abcd").unwrap();
         assert_eq!(s.name, "pkg:tianguis/ns1/bar@2.0.0");
         assert_eq!(s.sha256, "abcd");
+    }
+
+    #[test]
+    fn build_entry_subject_rejects_missing_scheme_separator() {
+        // CR12/2: no ':' at all must raise ID-NO-ALGORITHM-PREFIX, not
+        // silently produce an empty or whole-string digest.
+        let err = build_entry_subject("ns1", "bar", "2.0.0", "not-a-valid-identity").unwrap_err();
+        assert_eq!(err.code(), "ID-NO-ALGORITHM-PREFIX");
     }
 
     #[test]
     fn sigstore_entry_verifier_malformed_json_is_bundle_malformed() {
         let subject = EntrySubject { name: "pkg:tianguis/ns1/bar@2.0.0".into(), sha256: "abcd".into() };
         let result = SigstoreEntryVerifier.verify(&subject, b"not json", &TrustBundle::test(), "signer");
-        assert_eq!(result, EntryVerificationResult::BundleMalformed);
+        assert_eq!(result, VerifierOutcome::BundleMalformed);
     }
 
     #[test]
     fn sigstore_entry_verifier_missing_dsse_is_bundle_malformed() {
         let subject = EntrySubject { name: "pkg:tianguis/ns1/bar@2.0.0".into(), sha256: "abcd".into() };
         let result = SigstoreEntryVerifier.verify(&subject, b"{}", &TrustBundle::test(), "signer");
-        assert_eq!(result, EntryVerificationResult::BundleMalformed);
+        assert_eq!(result, VerifierOutcome::BundleMalformed);
     }
 
     fn make_dsse_bundle(subject_sha256: &str, subject_name: &str) -> Vec<u8> {
@@ -547,7 +614,7 @@ mod tests {
         let subject = EntrySubject { name: "pkg:tianguis/ns1/bar@2.0.0".into(), sha256: "expected".into() };
         let bundle = make_dsse_bundle("wrong", "pkg:tianguis/ns1/bar@2.0.0");
         let result = SigstoreEntryVerifier.verify(&subject, &bundle, &TrustBundle::test(), "signer");
-        assert_eq!(result, EntryVerificationResult::DigestMismatch);
+        assert_eq!(result, VerifierOutcome::DigestMismatch);
     }
 
     #[test]
@@ -555,7 +622,7 @@ mod tests {
         let subject = EntrySubject { name: "pkg:tianguis/ns1/bar@2.0.0".into(), sha256: "abcd".into() };
         let bundle = make_dsse_bundle("abcd", "pkg:tianguis/ns1/OTHER@2.0.0");
         let result = SigstoreEntryVerifier.verify(&subject, &bundle, &TrustBundle::test(), "signer");
-        assert_eq!(result, EntryVerificationResult::SubjectMismatch);
+        assert_eq!(result, VerifierOutcome::SubjectMismatch);
     }
 
     #[test]
@@ -565,32 +632,57 @@ mod tests {
         let subject = EntrySubject { name: "pkg:tianguis/ns1/bar@2.0.0".into(), sha256: "abcd".into() };
         let bundle = make_dsse_bundle("abcd", "pkg:tianguis/ns1/bar@2.0.0");
         let result = SigstoreEntryVerifier.verify(&subject, &bundle, &TrustBundle::test(), "signer");
-        assert_eq!(result, EntryVerificationResult::SignatureInvalid);
+        assert_eq!(result, VerifierOutcome::SignatureInvalid);
     }
 
     #[test]
     fn mock_verifier_keyed_by_subject() {
         let mut by_subject = HashMap::new();
-        by_subject.insert("pkg:tianguis/ns1/bar@2.0.0".to_string(), EntryVerificationResult::SignerMismatch);
-        let mock = MockEntryVerifier::new(EntryVerificationResult::Trusted, by_subject);
+        by_subject.insert("pkg:tianguis/ns1/bar@2.0.0".to_string(), VerifierOutcome::SignerMismatch);
+        let mock = MockEntryVerifier::new(VerifierOutcome::Trusted, by_subject);
 
         let matched = EntrySubject { name: "pkg:tianguis/ns1/bar@2.0.0".into(), sha256: "x".into() };
         let unmatched = EntrySubject { name: "pkg:tianguis/ns1/other@1.0.0".into(), sha256: "x".into() };
         assert_eq!(
             mock.verify(&matched, b"", &TrustBundle::test(), "s"),
-            EntryVerificationResult::SignerMismatch
+            VerifierOutcome::SignerMismatch
         );
         assert_eq!(
             mock.verify(&unmatched, b"", &TrustBundle::test(), "s"),
-            EntryVerificationResult::Trusted
+            VerifierOutcome::Trusted
         );
+    }
+
+    /// CR18: gate-only states are UNREPRESENTABLE in the verifier domain, not
+    /// merely undocumented. `VerifierOutcome::from_wire_value` has no arm for
+    /// "unattested"/"bundle-missing" (they aren't variants of the type at
+    /// all), so a fixture/CLI author cannot script a mock verifier to
+    /// produce a gate-only state even by typo'ing a wire string — the type
+    /// system rejects it, where the old `EntryVerificationResult::
+    /// from_verifier_value` only rejected it by convention (a doc comment).
+    #[test]
+    fn verifier_outcome_cannot_parse_gate_only_states() {
+        assert_eq!(VerifierOutcome::from_wire_value("unattested"), None);
+        assert_eq!(VerifierOutcome::from_wire_value("bundle-missing"), None);
+    }
+
+    /// CR18: `EntryBundleVerifier::verify` — the trait every verifier
+    /// (mock and production) implements — returns `VerifierOutcome` natively;
+    /// this compiles only because the trait signature itself is typed to the
+    /// 6-variant domain, which is the type-level enforcement CR18 asks for.
+    #[test]
+    fn mock_verifier_return_type_is_verifier_outcome() {
+        let subject = EntrySubject { name: "pkg:tianguis/ns1/bar@2.0.0".into(), sha256: "x".into() };
+        let mock = MockEntryVerifier::new(VerifierOutcome::Trusted, HashMap::new());
+        let outcome: VerifierOutcome = mock.verify(&subject, b"", &TrustBundle::test(), "s");
+        assert_eq!(outcome, VerifierOutcome::Trusted);
     }
 
     #[test]
     fn evaluate_stage0_unattested() {
         let (result, cause) = evaluate_entry_attestation(
             None, "dag-sha256:abcd", "ns1", "bar", "2.0.0",
-            &MockEntryVerifier::new(EntryVerificationResult::Trusted, HashMap::new()),
+            &MockEntryVerifier::new(VerifierOutcome::Trusted, HashMap::new()),
             None, &TrustBundle::test(), "vendor-signer",
         ).unwrap();
         assert_eq!(result, EntryVerificationResult::Unattested);
@@ -602,7 +694,7 @@ mod tests {
         let att = EntryAttestation { kind: AttestationKind::MilpaVendored, rekor: None, bundle_pin: None };
         let (result, cause) = evaluate_entry_attestation(
             Some(&att), "dag-sha256:abcd", "ns1", "bar", "2.0.0",
-            &MockEntryVerifier::new(EntryVerificationResult::Trusted, HashMap::new()),
+            &MockEntryVerifier::new(VerifierOutcome::Trusted, HashMap::new()),
             None, &TrustBundle::test(), "vendor-signer",
         ).unwrap();
         assert_eq!(result, EntryVerificationResult::BundleMissing);
@@ -618,7 +710,7 @@ mod tests {
         };
         let (result, cause) = evaluate_entry_attestation(
             Some(&att), "dag-sha256:abcd", "ns1", "bar", "2.0.0",
-            &MockEntryVerifier::new(EntryVerificationResult::Trusted, HashMap::new()),
+            &MockEntryVerifier::new(VerifierOutcome::Trusted, HashMap::new()),
             None, &TrustBundle::test(), "vendor-signer",
         ).unwrap();
         assert_eq!(result, EntryVerificationResult::BundleMissing);
@@ -642,7 +734,7 @@ mod tests {
         };
         let err = evaluate_entry_attestation(
             Some(&att), "dag-sha256:abcd", "ns1", "bar", "2.0.0",
-            &MockEntryVerifier::new(EntryVerificationResult::Trusted, HashMap::new()),
+            &MockEntryVerifier::new(VerifierOutcome::Trusted, HashMap::new()),
             Some(&store), &TrustBundle::test(), "vendor-signer",
         ).unwrap_err();
         assert_eq!(err.code(), "TNG-ENTRY-BUNDLE-PIN-MISMATCH");

@@ -2724,7 +2724,7 @@ fn build_entry_trust_gate(
     require_attested_entries: bool,
     no_index: bool,
 ) -> Result<Option<milpa_core::EntryTrustConfig>, MilpaError> {
-    use milpa_core::entry_trust::{EntryVerificationResult, MockEntryVerifier, SigstoreEntryVerifier};
+    use milpa_core::entry_trust::{MockEntryVerifier, SigstoreEntryVerifier, VerifierOutcome};
     use milpa_core::{effective_trust_policy, EntryBundleVerifier, EntryTrustConfig};
     use milpa_manifest::TrustPolicy;
 
@@ -2772,8 +2772,8 @@ fn build_entry_trust_gate(
             )));
         }
         let default_result = match mock_default_raw.as_deref() {
-            None => EntryVerificationResult::Trusted,
-            Some(raw) => EntryVerificationResult::from_verifier_value(raw).ok_or_else(|| {
+            None => VerifierOutcome::Trusted,
+            Some(raw) => VerifierOutcome::from_wire_value(raw).ok_or_else(|| {
                 MilpaError::Core(CoreError::Tianguis(
                     "MILPA-INTERNAL",
                     format!(
@@ -2785,7 +2785,7 @@ fn build_entry_trust_gate(
                 ))
             })?,
         };
-        let mut by_subject: std::collections::HashMap<String, EntryVerificationResult> =
+        let mut by_subject: std::collections::HashMap<String, VerifierOutcome> =
             std::collections::HashMap::new();
         if let Some(raw) = &mock_map_raw {
             let parsed: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
@@ -2807,7 +2807,7 @@ fn build_entry_trust_gate(
                         format!("MILPA_ENTRY_TRUST_MOCK_MAP entry {k:?} must be a string value"),
                     ))
                 })?;
-                let result = EntryVerificationResult::from_verifier_value(vs).ok_or_else(|| {
+                let result = VerifierOutcome::from_wire_value(vs).ok_or_else(|| {
                     MilpaError::Core(CoreError::Tianguis(
                         "MILPA-INTERNAL",
                         format!(

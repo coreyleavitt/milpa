@@ -67,6 +67,16 @@ def test_build_entry_subject_format() -> None:
     assert subj.sha256 == "a" * 64
 
 
+def test_build_entry_subject_rejects_missing_scheme_separator() -> None:
+    # CR12/2: a content_hash with no ':' separator at all must surface a
+    # clear ID-NO-ALGORITHM-PREFIX error, not silently build a subject with
+    # an empty sha256 digest (which used to surface downstream as a
+    # confusing TNG-ENTRY-DIGEST-MISMATCH instead).
+    with pytest.raises(MilpaError) as exc_info:
+        build_entry_subject("ns1", "foo", "1.2.3", "not-a-valid-identity")
+    assert exc_info.value.slug == "ID-NO-ALGORITHM-PREFIX"
+
+
 # ---------------------------------------------------------------------------
 # evaluate_entry_attestation — stage 0 (UNATTESTED)
 # ---------------------------------------------------------------------------

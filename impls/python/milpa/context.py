@@ -37,7 +37,6 @@ from pathlib import Path
 from milpa.cas import CAStore
 from milpa.entry_trust import EntryTrustConfig
 from milpa.fetchers.cas_admitting import CasAdmittingFetcher
-from milpa.index_trust import IndexTrustConfig
 from milpa.lockfile import Lockfile
 from milpa.profile import Profile
 from milpa.registry import Index
@@ -86,14 +85,6 @@ class MilpaEnv:
     #: configured index (env or default). Read by ``_load_index_for_verb`` and
     #: ``_build_dep_decl_store`` to suppress index loading. (cli-contract §8.1)
     no_index: bool = False
-
-    # S5 (RFC registry-trust-federation §6.4 / §10.1): index-trust configuration.
-    # ``None`` disables the index-trust gate (legacy / no-bundle path).
-    # When set, ``load_index`` consults it for every index fetch/cache-read.
-    # No circular import: index_trust.py imports only milpa.errors + milpa.trust;
-    # context.py's own imports (cas, fetchers, lockfile, profile, registry, version)
-    # do not import index_trust.py.
-    index_trust_config: IndexTrustConfig | None = None
 
     #: Force fresh index+bundle fetch, bypassing cache TTL (``--refresh-index``).
     refresh_index: bool = False

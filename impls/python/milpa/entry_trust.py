@@ -93,6 +93,7 @@ import json
 import sys as _sys
 from typing import Any, Protocol
 
+from milpa import identity
 from milpa.errors import (
     TNG_ENTRY_BUNDLE_MALFORMED,
     TNG_ENTRY_BUNDLE_MISSING,
@@ -180,13 +181,23 @@ def build_entry_subject(namespace: str, name: str, version: str, content_hash: s
     ``content_hash`` is milpa's canonical identity string, ``dag-sha256:<64-hex>``
     (identity.md §2.1) — NOT ``sha256:<64-hex>`` (a stale prefix in the RFC's own
     prose; ``identity.py``'s ``parse_identity`` is the actual canonical scheme,
-    ``dag-sha256`` only, no legacy ``sha256:`` tier).  Extraction uses the same
-    ``str.partition(":")`` the identity module itself uses, so this is correct
-    regardless of which algorithm prefix is in force — never a hardcoded
+    ``dag-sha256`` only, no legacy ``sha256:`` tier).  Extraction uses
+    ``identity.split_identity_scheme``, the same scheme-agnostic split
+    ``parse_identity`` itself uses (never a hardcoded
     ``removeprefix("sha256:")``, which would silently no-op on the real
-    ``dag-sha256:`` form and leak the algorithm prefix into the subject digest.
+    ``dag-sha256:`` form and leak the algorithm prefix into the subject digest).
+    Unlike ``parse_identity``, this does NOT enforce ``SUPPORTED_ALGORITHMS`` —
+    building a subject coordinate doesn't need that coupling — but a
+    ``content_hash`` with no ``:`` separator at all is genuinely malformed and
+    must raise ``MilpaError(ID_NO_ALGORITHM_PREFIX)``, not silently produce an
+    empty digest (which used to surface downstream as a confusing
+    TNG-ENTRY-DIGEST-MISMATCH instead of a clear ID-* error).
+
+    Raises:
+        MilpaError(ID_NOT_A_STRING)        — ``content_hash`` is not a str
+        MilpaError(ID_NO_ALGORITHM_PREFIX) — ``content_hash`` has no ``:`` separator
     """
-    _, _, hex_digest = content_hash.partition(":")
+    _, hex_digest = identity.split_identity_scheme(content_hash)
     return EntrySubject(
         name=f"pkg:tianguis/{namespace}/{name}@{version}",
         sha256=hex_digest,

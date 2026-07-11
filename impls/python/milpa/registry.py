@@ -392,6 +392,14 @@ def _filter_candidates(
     a yanked version never becomes a candidate regardless of whether it
     would otherwise satisfy *constraint*. Returns
     ``(satisfying, provenance_less_version_strings, yanked_excluded)``.
+
+    ``yanked_excluded`` (CR13/5) is scoped to the DIAGNOSTIC use case only:
+    it collects a yanked version iff it WOULD have satisfied *constraint*
+    had it not been yanked. Selection semantics are unaffected — yank
+    exclusion above still happens unconditionally, before matching — this
+    scoping only prevents the "(excluded as yanked: …)" message from citing
+    yanked versions that would have failed the constraint anyway (e.g. a
+    yanked 1.0.0 listed for a ^2.0.0 failure), which is misleading noise.
     """
     satisfying: list[IndexVersion] = []
     provenance_less: list[str] = []
@@ -402,7 +410,8 @@ def _filter_candidates(
         if parsed is None:
             continue  # unparseable version strings skipped (§5.2 NORMATIVE)
         if iv.yanked:
-            yanked_excluded.append(iv)
+            if vs.contains(parsed):
+                yanked_excluded.append(iv)
             continue
         if vs.contains(parsed):
             if not iv.provenances:
@@ -931,12 +940,17 @@ def _parse_entry_attestation(
     attestation_label = _child_scalar(node, "attestation")
     rekor = _parse_rekor_block(node)
     bundle_pin, bundle_diag = _parse_bundle_pin(node, coordinate)
-    diagnostics.extend(bundle_diag)
 
     if attestation_label is None:
-        # No attestation kind: a lone `rekor` block (if any) does not construct
-        # an EntryAttestation — there is no kind to tag it with (§3.2 NORMATIVE).
+        # No attestation kind: a lone `rekor` block or malformed `bundle`
+        # sibling (if any) does not construct an EntryAttestation — there is
+        # no kind to tag it with (§3.2 NORMATIVE). The bundle-pin diagnostic
+        # is therefore suppressed too (CR13/6): it would otherwise fire for a
+        # lone malformed `bundle` sibling even though no EntryAttestation is
+        # ever built in this shape — spurious noise, not a real collapse.
         return None, diagnostics
+
+    diagnostics.extend(bundle_diag)
 
     kind: AttestationKind
     if attestation_label == "author-signed":

@@ -338,6 +338,34 @@ package "foo" {
         assert iv.attestation is None
         assert len(caught) == 0
 
+    def test_lone_malformed_bundle_sibling_with_no_attestation_node_is_silent(
+        self,
+    ) -> None:
+        """CR13/6: a malformed `bundle sha256=` sibling with NO `attestation`
+        node at all must produce NO diagnostic — no EntryAttestation is ever
+        constructed in this shape, so the "bundle pin ... dropped" diagnostic
+        is spurious noise (registry-protocol §3.2)."""
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+        bundle sha256="not-valid-hex"
+    }
+}
+"""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            idx = parse_index(text)
+        iv = idx.packages[0].versions[0]
+        assert iv.attestation is None
+        assert len(caught) == 0
+
     def test_url_annotated_form_accepted(self) -> None:
         """(url)-annotated URL values must be accepted (registry-protocol §3.3 NORMATIVE)."""
         idx = parse_index(MINIMAL_INDEX)
@@ -1353,6 +1381,45 @@ package "bar" {
         assert exc_info.value.slug == TNG_NO_SATISFYING_VERSION
         assert "excluded as yanked" not in str(exc_info.value)
         assert exc_info.value.context["yanked_excluded"] == []
+
+    def _idx_yanked_mixed_satisfies(self) -> Index:
+        """A package where one yanked version WOULD satisfy the constraint
+        (``2.5.0`` under ``^2.0.0``) and one yanked version would NOT
+        (``1.0.0``) — the CR13/5 scoping fixture."""
+        text = """\
+schema_version 1
+package "bar" {
+    version "2.5.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000003"
+        provenance { kind "git" url "https://example.com/bar.git" ref "v2.5" }
+        yanked #true
+        yanked_reason "ships a vulnerable bearssl pin"
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance { kind "git" url "https://example.com/bar.git" ref "v1" }
+        yanked #true
+    }
+}
+"""
+        return parse_index(text)
+
+    def test_bare_yanked_excluded_diagnostic_scoped_to_satisfying_versions(self) -> None:
+        """CR13/5: the '(excluded as yanked: …)' diagnostic must list only
+        yanked versions that WOULD have satisfied the constraint if not
+        yanked — a yanked 1.0.0 must not be listed for a ^2.0.0 failure,
+        even though selection still excludes it (unconditionally, before
+        matching)."""
+        idx = self._idx_yanked_mixed_satisfies()
+        with pytest.raises(MilpaError) as exc_info:
+            idx.resolve_named_all("bar", "^2.0.0")
+        message = str(exc_info.value)
+        yanked_segment = message.split("(excluded as yanked:", 1)[1]
+        assert "2.5.0" in yanked_segment
+        assert "1.0.0" not in yanked_segment
+        payload = exc_info.value.context["yanked_excluded"]
+        assert {"version": "2.5.0", "reason": "ships a vulnerable bearssl pin"} in payload
+        assert all(entry["version"] != "1.0.0" for entry in payload)
 
     # -- qualified lookup path (resolve_named_all_qualified, S5b) -----------
     # Named explicitly in registry-protocol §5.2: "the qualified path is

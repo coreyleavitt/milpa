@@ -173,6 +173,14 @@ def _reconstruct_from_locked(locked: LockedDep) -> ResolvedDep:
             if locked.attestation is not None
             else None
         ),
+        # CR13/4: carry LockAttestation.namespace back onto registry_namespace
+        # — it is populated precisely so milpa verify's offline re-verification
+        # (RFC per-entry-attestation.md §7) can rebuild the exact
+        # pkg:tianguis/<namespace>/<name>@<version> subject coordinate from a
+        # frozen-reconstructed graph with no index available.
+        registry_namespace=(
+            locked.attestation.namespace or None if locked.attestation is not None else None
+        ),
     )
 
 

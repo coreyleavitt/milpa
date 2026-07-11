@@ -691,6 +691,34 @@ fn yanked_version_excluded_even_when_only_match_for_constraint() {
     assert_eq!(err.code(), "TNG-NO-SATISFYING-VERSION");
 }
 
+#[test]
+fn bare_yanked_excluded_diagnostic_scoped_to_satisfying_versions() {
+    // CR13/5: the "(excluded as yanked: …)" diagnostic must list only
+    // yanked versions that WOULD have satisfied the constraint if not
+    // yanked — a yanked 1.0.0 must not be listed for a ^2.0.0 failure,
+    // even though selection still excludes it (unconditionally, before
+    // matching). Mirrors
+    // impls/python/tests/test_registry.py::test_bare_yanked_excluded_diagnostic_scoped_to_satisfying_versions.
+    let idx = Index {
+        packages: vec![pkg(
+            "bar",
+            "",
+            vec![
+                yanked_ver("2.5.0", ID1, vec![git()], Some("ships a vulnerable bearssl pin")),
+                yanked_ver("1.0.0", ID1, vec![git()], None),
+            ],
+        )],
+    };
+    let err = idx
+        .resolve_named_all("bar", &gte("^2.0.0"), Some("^2.0.0"))
+        .unwrap_err();
+    assert_eq!(err.code(), "TNG-NO-SATISFYING-VERSION");
+    let message = err.message();
+    let yanked_segment = message.split_once("(excluded as yanked:").unwrap().1;
+    assert!(yanked_segment.contains("2.5.0"));
+    assert!(!yanked_segment.contains("1.0.0"));
+}
+
 // -- qualified lookup path (resolve_named_all_qualified, S5b) — named
 // explicitly in registry-protocol §5.2: "the qualified path is exactly
 // where a parallel-logic miss has happened before."
@@ -1037,6 +1065,20 @@ fn test_no_attestation_node_is_unattested() {
     let (iv, diagnostics) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
     assert!(iv.attestation.is_none());
     assert!(diagnostics.is_empty());
+}
+
+#[test]
+fn test_lone_malformed_bundle_sibling_with_no_attestation_node_is_silent() {
+    // CR13/6: a malformed `bundle sha256=` sibling with NO `attestation` node
+    // at all must produce NO diagnostic — no EntryAttestation is ever
+    // constructed in this shape, so the "bundle pin ... dropped" diagnostic
+    // is spurious noise (registry-protocol §3.2). Mirrors
+    // impls/python/tests/test_registry.py::test_lone_malformed_bundle_sibling_with_no_attestation_node_is_silent.
+    let doc = one_version_node("        bundle sha256=\"not-valid-hex\"\n");
+    let node = version_child(&doc);
+    let (iv, diagnostics) = parse_version_node("", "foo", "1.0.0", &node).unwrap();
+    assert!(iv.attestation.is_none());
+    assert!(diagnostics.is_empty(), "diagnostics: {diagnostics:?}");
 }
 
 // ---------------------------------------------------------------------------

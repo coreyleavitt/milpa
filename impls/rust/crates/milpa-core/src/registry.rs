@@ -376,6 +376,14 @@ impl Index {
     /// version never becomes a candidate regardless of whether it would
     /// otherwise satisfy the constraint. Returns
     /// `(satisfying, provenance_less_version_strings, yanked_excluded)`.
+    ///
+    /// `yanked_excluded` (CR13/5) is scoped to the DIAGNOSTIC use case only:
+    /// it collects a yanked version iff it WOULD have satisfied `vs` had it
+    /// not been yanked. Selection semantics are unaffected — yank exclusion
+    /// above still happens unconditionally, before matching — this scoping
+    /// only prevents the "(excluded as yanked: …)" message from citing
+    /// yanked versions that would have failed the constraint anyway (e.g. a
+    /// yanked 1.0.0 listed for a ^2.0.0 failure), which is misleading noise.
     fn filter_candidates(
         versions: &[IndexVersion],
         vs: &VersionSet,
@@ -389,7 +397,9 @@ impl Index {
                 continue; // unparseable version strings skipped (§5.2 NORMATIVE)
             };
             if v.yanked {
-                yanked_excluded.push(v.clone());
+                if vs.contains(&parsed) {
+                    yanked_excluded.push(v.clone());
+                }
                 continue;
             }
             if vs.contains(&parsed) {
@@ -830,14 +840,18 @@ fn parse_entry_attestation(
     let attestation_label = child_arg_str(node, "attestation");
     let rekor = parse_rekor_block(node)?;
     let (bundle_pin, bundle_diag) = parse_bundle_pin(node, &coordinate);
-    diagnostics.extend(bundle_diag);
 
     let Some(label) = attestation_label else {
-        // No attestation kind: a lone `rekor` block (if any) does not
-        // construct an EntryAttestation — there is no kind to tag it with
-        // (§3.2 NORMATIVE).
+        // No attestation kind: a lone `rekor` block or malformed `bundle`
+        // sibling (if any) does not construct an EntryAttestation — there is
+        // no kind to tag it with (§3.2 NORMATIVE). The bundle-pin diagnostic
+        // is therefore suppressed too (CR13/6): it would otherwise fire for a
+        // lone malformed `bundle` sibling even though no EntryAttestation is
+        // ever built in this shape — spurious noise, not a real collapse.
         return Ok((None, diagnostics));
     };
+
+    diagnostics.extend(bundle_diag);
 
     let kind: AttestationKind = match label.as_str() {
         "author-signed" => {

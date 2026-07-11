@@ -221,6 +221,34 @@ class TestFrozenCarriesAttestation:
         dep = graph.deps[0]
         assert dep.attestation == EntryAttestation(kind=att.kind, rekor=att.rekor, bundle_pin=None)
 
+    def test_attestation_namespace_carried_through_frozen_reconstruction(
+        self, tmp_path: Path
+    ) -> None:
+        # CR13/4: LockAttestation.namespace is populated precisely so the
+        # subject coordinate can be rebuilt offline (milpa verify, RFC §7) —
+        # the frozen reconstruction must carry it back onto
+        # ResolvedDep.registry_namespace, not silently default it to None.
+        import dataclasses
+
+        from milpa.lockfile import LockAttestation
+        from milpa.registry import AuthorSigned
+
+        env, identity = _make_env_with_tree(tmp_path)
+        deps_dir = tmp_path / "_deps"
+
+        att = LockAttestation(
+            kind=AuthorSigned(signer="https://example.com/wf.yaml"),
+            namespace="ns1",
+        )
+        locked = dataclasses.replace(_locked_dep("foo", identity=identity), attestation=att)
+        lockfile = Lockfile(deps=(locked,), strategy="maxver")
+        manifest = _manifest_with_dep("foo")
+
+        graph = resolve_frozen(manifest, lockfile, env, deps_dir)
+
+        dep = graph.deps[0]
+        assert dep.registry_namespace == "ns1"
+
     def test_no_attestation_stays_none(self, tmp_path: Path) -> None:
         env, identity = _make_env_with_tree(tmp_path)
         deps_dir = tmp_path / "_deps"

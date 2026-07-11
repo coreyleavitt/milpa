@@ -81,6 +81,39 @@ _DIGEST_HEX_LEN: dict[str, int] = {"dag-sha256": 64}
 # ---------------------------------------------------------------------------
 
 
+def split_identity_scheme(s: Any) -> tuple[str, str]:
+    """Split an identity string into its raw ``(algorithm, digest)`` halves.
+
+    Applies only the first two ordered checks from identity.md §2.2 — "must be
+    a string" and "must contain a ``:`` separator" — WITHOUT enforcing the
+    canonical-scheme allowlist (checks 3-5, ``SUPPORTED_ALGORITHMS``). This is
+    the shared validation seam for callers that only need the raw scheme
+    split and must not silently no-op on malformed input — currently
+    ``parse_identity`` itself, and ``entry_trust.build_entry_subject``, which
+    extracts a hex digest from a ``content_hash`` without needing (or
+    wanting) to couple itself to ``SUPPORTED_ALGORITHMS``.
+
+    Raises:
+        MilpaError(ID_NOT_A_STRING)        — input is not a str
+        MilpaError(ID_NO_ALGORITHM_PREFIX) — no ':' separator
+    """
+    if not isinstance(s, str):
+        raise MilpaError(
+            ID_NOT_A_STRING,
+            f"identity must be a string, got {type(s).__name__!r}",
+            got_type=type(s).__name__,
+        )
+    if ":" not in s:
+        raise MilpaError(
+            ID_NO_ALGORITHM_PREFIX,
+            f"identity {s!r} is missing the algorithm prefix; "
+            f"expected '<algorithm>:<digest>' (e.g. 'dag-sha256:abc...')",
+            identity=s,
+        )
+    algorithm, _, digest = s.partition(":")
+    return algorithm, digest
+
+
 def parse_identity(s: Any) -> str:
     """Validate a milpa identity string (two-tier scheme check).
 
@@ -100,24 +133,9 @@ def parse_identity(s: Any) -> str:
         MilpaError(ID_WRONG_DIGEST_LENGTH)     — digest length wrong for algorithm
         MilpaError(ID_NON_HEX_DIGEST)         — digest contains non-lowercase-hex chars
     """
-    # Check 1: must be a string (identity.md §2.2 rule 1)
-    if not isinstance(s, str):
-        raise MilpaError(
-            ID_NOT_A_STRING,
-            f"identity must be a string, got {type(s).__name__!r}",
-            got_type=type(s).__name__,
-        )
-
-    # Check 2: must contain ':' separator (identity.md §2.2 rule 2)
-    if ":" not in s:
-        raise MilpaError(
-            ID_NO_ALGORITHM_PREFIX,
-            f"identity {s!r} is missing the algorithm prefix; "
-            f"expected '<algorithm>:<digest>' (e.g. 'dag-sha256:abc...')",
-            identity=s,
-        )
-
-    algorithm, _, digest = s.partition(":")
+    # Checks 1-2: must be a string, must contain ':' separator (identity.md
+    # §2.2 rules 1-2) — delegated to the shared split_identity_scheme seam.
+    algorithm, digest = split_identity_scheme(s)
 
     # Check 3: algorithm must be in the canonical scheme set (identity.md §2.2 rule 3).
     # Two-tier: CANONICAL_SCHEMES = {dag-sha256}; everything else (including the

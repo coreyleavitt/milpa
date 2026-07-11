@@ -2262,7 +2262,7 @@ fn fixture_entry_trust_config(
     manifest_policy: Option<milpa_core::TrustPolicy>,
     manifest_explicit: bool,
 ) -> Result<Option<milpa_core::EntryTrustConfig>, String> {
-    use milpa_core::entry_trust::{EntryVerificationResult, MockEntryVerifier};
+    use milpa_core::entry_trust::{MockEntryVerifier, VerifierOutcome};
     use milpa_core::index_trust::{TrustBundle, DEFAULT_INDEX_SIGNER};
     use milpa_core::{effective_trust_policy, EntryTrustConfig, FileEntryBundleStore, TrustPolicy};
 
@@ -2293,8 +2293,8 @@ fn fixture_entry_trust_config(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let default_result = match default_raw {
-        None => EntryVerificationResult::Trusted,
-        Some(raw) => EntryVerificationResult::from_verifier_value(&raw).ok_or_else(|| {
+        None => VerifierOutcome::Trusted,
+        Some(raw) => VerifierOutcome::from_wire_value(&raw).ok_or_else(|| {
             format!(
                 "MILPA_ENTRY_TRUST_MOCK_DEFAULT={raw:?} is not a valid result wire string \
                  (expected one of: trusted, bundle-malformed, digest-mismatch, \
@@ -2304,7 +2304,7 @@ fn fixture_entry_trust_config(
         })?,
     };
 
-    let mut by_subject: std::collections::HashMap<String, EntryVerificationResult> =
+    let mut by_subject: std::collections::HashMap<String, VerifierOutcome> =
         std::collections::HashMap::new();
     if let Some(raw) = env.get("MILPA_ENTRY_TRUST_MOCK_MAP") {
         let raw = raw.trim();
@@ -2318,7 +2318,7 @@ fn fixture_entry_trust_config(
                 let vs = v
                     .as_str()
                     .ok_or_else(|| format!("MILPA_ENTRY_TRUST_MOCK_MAP entry {k:?} must be a string value"))?;
-                let r = EntryVerificationResult::from_verifier_value(vs).ok_or_else(|| {
+                let r = VerifierOutcome::from_wire_value(vs).ok_or_else(|| {
                     format!(
                         "MILPA_ENTRY_TRUST_MOCK_MAP entry {k:?}={vs:?} is not a valid result \
                          wire string (expected one of: trusted, bundle-malformed, \

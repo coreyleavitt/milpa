@@ -405,6 +405,14 @@ fn frozen_carries_attestation_from_locked_dep() {
         }),
         "frozen reconstruction must carry the attestation claim (incl. bundle_pin) from LockedDep"
     );
+    // CR13/4: LockAttestation.namespace must round-trip onto registry_namespace
+    // so `milpa verify`'s offline re-verification can rebuild the subject
+    // coordinate with no index available.
+    assert_eq!(
+        dep.registry_namespace,
+        Some("ns1".to_string()),
+        "frozen reconstruction must carry LockAttestation.namespace onto registry_namespace"
+    );
 }
 
 /// No attestation on the locked dep → frozen reconstruction stays `None`.
@@ -417,6 +425,7 @@ fn frozen_no_attestation_stays_none() {
     let dd = deps_dir(&tmp);
     let graph = resolve_frozen(&manifest(vec![named("foo", None)]), &lf, &store, &dd).unwrap();
     assert_eq!(graph.deps[0].attestation, None);
+    assert_eq!(graph.deps[0].registry_namespace, None);
 }
 
 /// Alias symlink materializes in _deps/ after resolve_frozen on a deduped dep.
