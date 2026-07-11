@@ -422,3 +422,46 @@ fn attestation_strip_is_absent_candidate_value() {
     assert_eq!(v.kind, "monotone-stripped");
     assert_eq!(v.candidate_value, "");
 }
+
+// CR15: `attestation-epoch` is a document-root free-text field `Index`
+// itself never surfaces (it lives outside every `package` node) —
+// `raw_attestation_epoch` is the ONLY site that ever extracts it, and it
+// feeds the root pseudo-entry's canonical violation digest (§3.5.3) as a
+// raw, unescaped scalar. A `\u{9}` KDL escape decoding to a literal TAB —
+// the digest's field-join delimiter — must be rejected at this
+// parse-at-gate seam, exactly like every other free-text registry field.
+
+#[test]
+fn attestation_epoch_control_char_via_kdl_escape_is_rejected() {
+    let text = "schema_version 1\n\
+         attestation-epoch \"evil\\u{9}epoch\"\n\
+         package \"bar\" {\n\
+         \x20   version \"1.0.0\" {\n\
+         \x20       content_hash \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\
+         \x20       provenance {\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://example.com/bar.git\"\n\
+         \x20           ref \"v1.0.0\"\n\
+         \x20       }\n\
+         \x20   }\n\
+         }\n";
+    let err = build_index_state(text).unwrap_err();
+    assert_eq!(err.code(), "TNG-UNSAFE-CONTROL-CHAR");
+}
+
+#[test]
+fn safe_attestation_epoch_passes() {
+    let text = "schema_version 1\n\
+         attestation-epoch \"E1\"\n\
+         package \"bar\" {\n\
+         \x20   version \"1.0.0\" {\n\
+         \x20       content_hash \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\
+         \x20       provenance {\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://example.com/bar.git\"\n\
+         \x20           ref \"v1.0.0\"\n\
+         \x20       }\n\
+         \x20   }\n\
+         }\n";
+    build_index_state(text).unwrap();
+}

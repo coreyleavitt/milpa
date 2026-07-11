@@ -648,12 +648,23 @@ def parse_index(text: str) -> Index:
     version's provenances sanitized (``TNG-UNSAFE-NAME`` / ``TNG-BAD-COMMIT-SHA``
     / ``TNG-BAD-OCI-DIGEST`` / ``TNG-UNSAFE-URL`` / ``TNG-UNSAFE-REF`` /
     ``TNG-UNSAFE-OCI-FIELD``), the ``dep_decl`` pointer validated
-    (``TNG-BAD-DEP-DECL``), and every registry string-valued identity/
-    provenance field (``namespace``, a version string, git ``url``/``ref``,
-    oci ``registry``/``repository``, rekor ``uuid``/``log_index``/
-    ``integrated_time``) charset-checked for ASCII control characters
-    (``TNG-UNSAFE-CONTROL-CHAR`` — registry-protocol §3.3 NORMATIVE
-    (control-character rejection)).
+    (``TNG-BAD-DEP-DECL``), and EVERY registry free-text field — ``name``,
+    ``namespace``, a version string, ``content_hash``, git ``url``/``ref``,
+    oci ``registry``/``repository``, ``signed_by``, rekor ``uuid``/
+    ``log_index``/``integrated_time``, ``yanked_reason`` — charset-checked for
+    ASCII control characters (``TNG-UNSAFE-CONTROL-CHAR`` — registry-protocol
+    §3.3 NORMATIVE (control-character rejection)). ``attestation-epoch`` (a
+    document-root free-text field ``parse_index`` does not itself surface —
+    see ``index_ratchet_seam._raw_attestation_epoch``) gets the identical
+    check at its own re-walk site. Fields anchored by a hex/format shape
+    regex (``commit_sha``, oci ``digest``, ``dep_decl`` pointer, ``bundle
+    sha256=``) are safe by construction and deliberately NOT charset-checked
+    — the shape regex already excludes control characters. This is a
+    COMPLETE enumeration (registry-protocol §3.3 NORMATIVE): every free-text
+    field that reaches the append-only ratchet's canonical digest (§3.5.3) or
+    a diagnostic/CLI rendering MUST be charset-checked here or at its own
+    parse site; a new free-text field added to the grammar MUST extend this
+    list, not bypass it.
 
     Forward-compat rules (registry-protocol §1, §3 NORMATIVE):
       - Unknown top-level nodes are silently skipped.
@@ -684,6 +695,7 @@ def parse_index(text: str) -> Index:
             )
             continue
         _validate_safe_name(name)
+        _validate_no_control_chars(name, "name")
         namespace = _child_scalar(top_node, "namespace") or ""
         _validate_no_control_chars(namespace, "namespace")
         versions, diagnostics = _parse_versions(name, namespace, top_node)
@@ -854,6 +866,7 @@ def _parse_version_node(
     structurally-invalid ``author-signed``, or a malformed ``bundle`` pin).
     """
     content_hash = _child_scalar(node, "content_hash") or ""
+    _validate_no_control_chars(content_hash, "content_hash")
     provenances: list[IndexProvenance] = []
     dep_decl: str | None = None
     dep_decl_schema_version: int | None = None
@@ -878,6 +891,8 @@ def _parse_version_node(
     yanked = _child_bool(node, "yanked") or False
     yanked_at = _parse_timestamp(_child_scalar(node, "yanked_at"))
     yanked_reason = _child_scalar(node, "yanked_reason")
+    if yanked_reason is not None:
+        _validate_no_control_chars(yanked_reason, "yanked_reason")
 
     return (
         IndexVersion(

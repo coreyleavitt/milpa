@@ -1333,9 +1333,9 @@ The index declares a schema_version higher than this milpa supports.
 
 ### `TNG-UNSAFE-CONTROL-CHAR`
 
-A registry string field (`namespace`, a version string, a git `url`/`ref`, an oci `registry`/`repository`, or a `rekor` `uuid`/`log_index`/`integrated_time`) contains an ASCII control character (U+0000–U+001F inclusive, or U+007F).
+A registry free-text field contains an ASCII control character (U+0000–U+001F inclusive, or U+007F). The complete, checkable field enumeration — and the completeness principle that keeps it from drifting — lives at `registry-protocol.md` §3.3 NORMATIVE (control-character rejection); do not hand-duplicate the field list here (a prior copy of this list here went stale relative to §3.3's own, which is why this entry now points at it instead of restating it).
 
-**Triggered:** `_validate_no_control_chars` finds a control character in one of the fields above. These fields are attacker-controlled (fetched over the network); KDL 2.0's `\u{XXXX}` escape syntax can deliver a literal control character through an otherwise well-formed string literal, and these exact bytes (`\t`, `\n`, `\x1f`, `\x1e`, `\x01`) are the field/record delimiters the append-only ratchet's canonical violation digest (`registry-protocol.md` §3.5.3) and other raw-value renderings use — left unvalidated, a crafted value lets two semantically different violation sets serialize to identical digest bytes. One slug shared across every covered field, the same economy `TNG-UNSAFE-OCI-FIELD` already applies across its own two fields.
+**Triggered:** `_validate_no_control_chars` finds a control character in one of the free-text fields §3.3 enumerates. These fields are attacker-controlled (fetched over the network); KDL 2.0's `\u{XXXX}` escape syntax can deliver a literal control character through an otherwise well-formed string literal, and these exact bytes (`\t`, `\n`, `\x1f`, `\x1e`, `\x01`) are the field/record delimiters the append-only ratchet's canonical violation digest (`registry-protocol.md` §3.5.3) and other raw-value renderings use — left unvalidated, a crafted value lets two semantically different violation sets serialize to identical digest bytes. One slug shared across every covered field, the same economy `TNG-UNSAFE-OCI-FIELD` already applies across its own two fields.
 
 ### `TNG-UNSAFE-NAME`
 

@@ -43,6 +43,7 @@ from milpa.errors import (
     TNG_INDEX_BASELINE_CORRUPT,
     TNG_INDEX_ROLLBACK,
     TNG_SCHEMA_UNKNOWN,
+    TNG_UNSAFE_CONTROL_CHAR,
     MilpaError,
 )
 from milpa.index_cache import DEFAULT_TTL_SECONDS, cache_path_for, load_index
@@ -653,6 +654,55 @@ class TestParseAtGateNoClobber:
             load_index(URL, tmp_path, get_bad, 100, 1101, index_history_policy="off")
         assert exc_info.value.slug == TNG_SCHEMA_UNKNOWN
         assert cache_file.read_bytes() == pre_index
+
+
+class TestAttestationEpochControlChar:
+    """CR15: ``attestation-epoch`` is a document-root free-text field that
+    ``registry.parse_index`` never surfaces (it lives outside every
+    ``package`` node) — ``index_ratchet_seam._raw_attestation_epoch`` is the
+    ONLY site that ever extracts it, and it feeds the root pseudo-entry's
+    canonical violation digest (§3.5.3) as a raw, unescaped scalar. A
+    `\\u{9}` KDL escape decoding to a literal TAB — the digest's field-join
+    delimiter — must be rejected at this parse-at-gate seam, exactly like
+    every other free-text registry field."""
+
+    def test_control_char_tab_in_attestation_epoch_via_kdl_escape(self) -> None:
+        text = (
+            "schema_version 1\n"
+            'attestation-epoch "evil\\u{9}epoch"\n'
+            'package "foo" {\n'
+            '    version "1.0.0" {\n'
+            '        content_hash "dag-sha256:'
+            '0000000000000000000000000000000000000000000000000000000000000001"\n'
+            "        provenance {\n"
+            '            kind "git"\n'
+            '            url "https://example.com/foo.git"\n'
+            '            ref "main"\n'
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        with pytest.raises(MilpaError) as exc_info:
+            build_index_state(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
+    def test_safe_attestation_epoch_passes(self) -> None:
+        text = (
+            "schema_version 1\n"
+            'attestation-epoch "E1"\n'
+            'package "foo" {\n'
+            '    version "1.0.0" {\n'
+            '        content_hash "dag-sha256:'
+            '0000000000000000000000000000000000000000000000000000000000000001"\n'
+            "        provenance {\n"
+            '            kind "git"\n'
+            '            url "https://example.com/foo.git"\n'
+            '            ref "main"\n'
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        build_index_state(text)  # must not raise
 
 
 # ---------------------------------------------------------------------------

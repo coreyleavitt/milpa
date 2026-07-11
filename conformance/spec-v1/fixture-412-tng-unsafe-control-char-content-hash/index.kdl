@@ -1,0 +1,13 @@
+schema_version 1
+package "bar" {
+    namespace "example"
+    version "1.0.0" {
+        content_hash "sha256:tainted\u{9}\u{a}injected0000000000000000000000000000000000000000"
+        provenance {
+            kind "git"
+            url "https://github.com/example/bar.git"
+            ref "v1.0.0"
+            commit_sha "cafef00dcafef00dcafef00dcafef00dcafef00d"
+        }
+    }
+}

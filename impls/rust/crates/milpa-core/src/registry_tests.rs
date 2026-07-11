@@ -363,6 +363,102 @@ fn attestation_signed_by_control_char_via_kdl_escape_is_rejected() {
 // counterpart tests/test_conformance.py) — no hand-rolled fixture-reading
 // unit test needed here; the targeted-field coverage above is direct-call.
 
+// CR15: the original CR2 field enumeration was hand-built and missed fields
+// that provably reach the same digest / diagnostic output — `content_hash`
+// (a SetOnce ratchet field the §3.5.3 digest renders directly), `name` (the
+// 3rd element of EVERY digest 7-tuple; only `is_safe_name`'s path-traversal
+// blacklist ran on it, which does NOT reject control chars), and
+// `yanked_reason` (unvalidated free text rendered raw into the
+// TNG-NO-SATISFYING-VERSION message and the yank-transition stderr notice).
+// fixture-412/413 (content_hash / name) are exercised end-to-end by the
+// generic conformance corpus runner; the targeted-field coverage below is
+// direct-call, mirroring Python's test_registry.py CR15 suite.
+
+#[test]
+fn content_hash_control_char_via_kdl_escape_is_rejected() {
+    let text = "schema_version 1\n\
+         package \"bar\" {\n\
+         \x20   version \"1.0.0\" {\n\
+         \x20       content_hash \"sha256:tainted\\u{9}\\u{a}injected\"\n\
+         \x20       provenance {\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://e/bar.git\"\n\
+         \x20           ref \"v1\"\n\
+         \x20       }\n\
+         \x20   }\n\
+         }\n";
+    assert_eq!(
+        Index::parse(text).unwrap_err().code(),
+        "TNG-UNSAFE-CONTROL-CHAR"
+    );
+}
+
+#[test]
+fn package_name_control_char_via_kdl_escape_is_rejected() {
+    let text = format!(
+        "schema_version 1\n\
+         package \"pkg\\u{{9}}name\" {{\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://e/bar.git\"\n\
+         \x20           ref \"v1\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n"
+    );
+    assert_eq!(
+        Index::parse(&text).unwrap_err().code(),
+        "TNG-UNSAFE-CONTROL-CHAR"
+    );
+}
+
+#[test]
+fn package_name_path_traversal_still_rejected_alongside_control_char_guard() {
+    // Regression guard: adding the control-char check to `name` MUST NOT
+    // displace the pre-existing path-traversal (`TNG-UNSAFE-NAME`) check —
+    // a `..`-name with no control chars still raises `TNG-UNSAFE-NAME`, not
+    // `TNG-UNSAFE-CONTROL-CHAR`.
+    let text = format!(
+        "schema_version 1\n\
+         package \"../evil\" {{\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://e/bar.git\"\n\
+         \x20           ref \"v1\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n"
+    );
+    assert_eq!(Index::parse(&text).unwrap_err().code(), "TNG-UNSAFE-NAME");
+}
+
+#[test]
+fn yanked_reason_control_char_via_kdl_escape_is_rejected() {
+    let text = format!(
+        "schema_version 1\n\
+         package \"bar\" {{\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"git\"\n\
+         \x20           url \"https://e/bar.git\"\n\
+         \x20           ref \"v1\"\n\
+         \x20       }}\n\
+         \x20       yanked #true\n\
+         \x20       yanked_reason \"evil\\u{{9}}injected\"\n\
+         \x20   }}\n\
+         }}\n"
+    );
+    assert_eq!(
+        Index::parse(&text).unwrap_err().code(),
+        "TNG-UNSAFE-CONTROL-CHAR"
+    );
+}
+
 #[test]
 fn unknown_provenance_kind_is_skipped() {
     let text = format!(

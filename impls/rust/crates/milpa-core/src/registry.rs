@@ -92,7 +92,7 @@ fn has_control_char(s: &str) -> bool {
 /// single, field-independent slug covers every field this validator guards
 /// (same economy `TNG-UNSAFE-OCI-FIELD` already applies across its own two
 /// fields).
-fn validate_no_control_chars(value: &str, field: &str) -> Result<(), CoreError> {
+pub(crate) fn validate_no_control_chars(value: &str, field: &str) -> Result<(), CoreError> {
     if has_control_char(value) {
         Err(tng(
             "TNG-UNSAFE-CONTROL-CHAR",
@@ -259,7 +259,19 @@ impl Index {
     /// Validates the schema version, then every package: the name is safe-checked
     /// and each version's provenances are sanitized at this trust boundary
     /// (`TNG-UNSAFE-NAME` / `TNG-BAD-COMMIT-SHA` / `TNG-BAD-OCI-DIGEST` /
-    /// `TNG-UNSAFE-URL` / `TNG-UNSAFE-REF` / `TNG-UNSAFE-OCI-FIELD`). Duplicate
+    /// `TNG-UNSAFE-URL` / `TNG-UNSAFE-REF` / `TNG-UNSAFE-OCI-FIELD`). EVERY
+    /// free-text field — `name`, `namespace`, a version string, `content_hash`,
+    /// git `url`/`ref`, oci `registry`/`repository`, `signed_by`, rekor
+    /// `uuid`/`log_index`/`integrated_time`, `yanked_reason` — is
+    /// charset-checked for ASCII control characters (`TNG-UNSAFE-CONTROL-CHAR`
+    /// — registry-protocol §3.3 NORMATIVE). `attestation-epoch` (a
+    /// document-root free-text field this type does not surface — see
+    /// `index_ratchet_seam::raw_attestation_epoch`) gets the identical check
+    /// at its own re-walk site. Fields anchored by a hex/format shape regex
+    /// (`commit_sha`, oci `digest`, `dep_decl` pointer, `bundle sha256=`) are
+    /// safe by construction and deliberately NOT charset-checked. This is a
+    /// COMPLETE enumeration (registry-protocol §3.3 NORMATIVE): a new
+    /// free-text field added to the grammar MUST extend this list. Duplicate
     /// versions keep the first (forward-compat skip); unknown provenance kinds
     /// are ignored (a transport this milpa can't fetch shouldn't be fatal — other
     /// provenances on the same version may still be usable). Versions sort
@@ -304,6 +316,7 @@ impl Index {
             // Reject path-traversal names at the boundary (hard error — a crafted
             // `..`-name is an active attack vector, not a formatting quirk).
             validate_safe_name(&name)?;
+            validate_no_control_chars(&name, "name")?;
             let namespace = child_arg_str(node, "namespace").unwrap_or_default();
             validate_no_control_chars(&namespace, "namespace")?;
 
@@ -588,6 +601,7 @@ fn parse_version_node(
     node: &KdlNode,
 ) -> Result<(IndexVersion, Vec<String>), CoreError> {
     let content_hash = child_arg_str(node, "content_hash").unwrap_or_default();
+    validate_no_control_chars(&content_hash, "content_hash")?;
     let dep_decl_raw = child_arg_str(node, "dep_decl").filter(|s| !s.is_empty());
     if let Some(ref ptr) = dep_decl_raw {
         validate_dep_decl_pointer(ptr)?;
@@ -647,6 +661,9 @@ fn parse_version_node(
         .as_deref()
         .and_then(parse_iso8601_timestamp);
     let yanked_reason = child_arg_str(node, "yanked_reason");
+    if let Some(ref reason) = yanked_reason {
+        validate_no_control_chars(reason, "yanked_reason")?;
+    }
 
     Ok((
         IndexVersion {

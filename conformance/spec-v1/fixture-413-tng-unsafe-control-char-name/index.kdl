@@ -1,0 +1,13 @@
+schema_version 1
+package "bar\u{9}evil" {
+    namespace "example"
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://github.com/example/bar.git"
+            ref "v1.0.0"
+            commit_sha "cafef00dcafef00dcafef00dcafef00dcafef00d"
+        }
+    }
+}

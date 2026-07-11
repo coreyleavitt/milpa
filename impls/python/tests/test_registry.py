@@ -989,6 +989,125 @@ package "foo" {
             parse_index(text)
         assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
 
+    # CR15: the original CR2 field enumeration was hand-built and missed
+    # fields that provably reach the same digest / diagnostic output —
+    # `content_hash` (a SetOnce-ordered ratchet field the §3.5.3 digest
+    # renders directly), `name` (the 3rd element of EVERY digest 7-tuple;
+    # only `is_safe_name`'s path-traversal blacklist ran on it, which does
+    # NOT reject control chars), and `yanked_reason` (unvalidated free text
+    # rendered raw — not repr'd — into the TNG-NO-SATISFYING-VERSION message
+    # and the yank-transition stderr notice).
+
+    def test_control_char_tab_in_content_hash_via_kdl_escape(self) -> None:
+        """A `\\u{9}`/`\\u{a}` escape in `content_hash` is rejected —
+        `content_hash` is a SetOnce ratchet field the canonical violation
+        digest (§3.5.3) renders as a raw scalar (`RawField.raw_str()` falls
+        back to `str(value)` — no shape regex constrains this field)."""
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "sha256:tainted\\u{9}\\u{a}injected"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
+    def test_control_char_conformance_fixture_content_hash(self) -> None:
+        """Conformance fixture-412: a `\\u{9}`/`\\u{a}` escape in
+        `content_hash` is rejected as TNG-UNSAFE-CONTROL-CHAR (CR15)."""
+        text = _fixture_index("fixture-412-tng-unsafe-control-char-content-hash")
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
+    def test_control_char_tab_in_name_via_kdl_escape(self) -> None:
+        """A `\\u{9}` escape in the package `name` is rejected — `name` is
+        the 3rd field of EVERY digest 7-tuple `(class, namespace, name,
+        version, field, kind, candidate_value)`. `is_safe_name` (the
+        path-traversal blacklist) does NOT reject control chars, so this
+        needs its own guard alongside — not instead of — that check."""
+        text = """\
+schema_version 1
+package "pkg\\u{9}name" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
+    def test_control_char_conformance_fixture_name(self) -> None:
+        """Conformance fixture-413: a `\\u{9}` escape in the package `name`
+        is rejected as TNG-UNSAFE-CONTROL-CHAR (CR15)."""
+        text = _fixture_index("fixture-413-tng-unsafe-control-char-name")
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
+    def test_unsafe_name_path_traversal_still_rejected_alongside_control_char_guard(
+        self,
+    ) -> None:
+        """Regression guard: adding the control-char check to `name` MUST
+        NOT displace the pre-existing path-traversal (`TNG-UNSAFE-NAME`)
+        check — a `..`-name with no control chars still raises
+        `TNG-UNSAFE-NAME`, not `TNG-UNSAFE-CONTROL-CHAR`."""
+        text = """\
+schema_version 1
+package "../evil" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_NAME
+
+    def test_control_char_tab_in_yanked_reason_via_kdl_escape(self) -> None:
+        """A `\\u{9}` escape in `yanked_reason` is rejected — `yanked_reason`
+        is rendered RAW (not repr'd) into the `TNG-NO-SATISFYING-VERSION`
+        diagnostic message (`_format_yanked_excluded`) and the ratchet's
+        yank-transition stderr notice, and it is a ratchet-compared
+        (ADVISORY_MUTABLE-adjacent) field."""
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+        yanked #true
+        yanked_reason "evil\\u{9}injected"
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
 
 # ---------------------------------------------------------------------------
 # 4. Bare-name lookup

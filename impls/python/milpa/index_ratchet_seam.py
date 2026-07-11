@@ -79,6 +79,7 @@ from milpa.registry import (
     Index,
     OciIndexProvenance,
     RekorRef,
+    _validate_no_control_chars,
     parse_index,
 )
 
@@ -225,12 +226,28 @@ def _raw_attestation_epoch(doc: KdlDocument) -> str | None:
     (`rfc-per-entry-attestation.md` open question 2; registry-protocol
     §3.5.1 root-field table — set-once, live as of A6). An opaque epoch
     identifier: no reformatting margin, so the typed value doubles as its
-    own raw digest rendering (the scalar-field convention above)."""
+    own raw digest rendering (the scalar-field convention above).
+
+    This is a document-root field ``registry.parse_index`` never surfaces
+    (it isn't part of any ``package`` node, so ``parse_index``'s own charset
+    pass never sees it) — this re-walk is the ONLY site that extracts it, so
+    it is ALSO the only site that can charset-check it. Same
+    ``TNG-UNSAFE-CONTROL-CHAR`` guard ``parse_index`` applies to every other
+    free-text field (registry-protocol §3.3 NORMATIVE): unchecked, a control
+    character here would inject straight into the root pseudo-entry's
+    canonical violation digest row (§3.5.3) and the ``accept``/``status``
+    diff text, exactly like an unguarded ``content_hash`` or ``name``.
+    """
     for n in nodes(doc):
         if node_name(n) != "attestation-epoch":
             continue
         args = node_args(n)
-        return node_arg_str(n, 0) if args else None
+        if not args:
+            return None
+        epoch = node_arg_str(n, 0)
+        if epoch is not None:
+            _validate_no_control_chars(epoch, "attestation-epoch")
+        return epoch
     return None
 
 

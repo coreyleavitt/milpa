@@ -536,35 +536,66 @@ grammar's §4.2, with the additional acceptance of `(url)`-annotated URL values
 > path, a per-entry attestation subject can bind to it without needing to
 > know which mirror serves the bytes at verification time.
 
-> NORMATIVE (control-character rejection): the registry's string-valued
-> identity and provenance fields — `namespace` (§3.1), a `version` node's
-> version string (§3.2), a `git` provenance's `url` and `ref` and an `oci`
-> provenance's `registry` and `repository` (both below), the `rekor`
-> block's `uuid`, `log_index`, and `integrated_time` (§3.2), and an
-> `attestation "author-signed"` claim's `signed_by` field (§3.2) — MUST NOT
-> contain an ASCII control character (U+0000–U+001F inclusive, or U+007F). A
-> conformant implementation MUST reject a value containing one at parse
-> time, before the value is stored on the in-memory index type, raising
-> `TNG-UNSAFE-CONTROL-CHAR`. This is a parse-boundary charset check,
-> orthogonal to and applied in addition to each field's own shape validation
-> (leading-dash, hex-digest, closed kind-set, etc.) elsewhere in this
-> section. `index.kdl` is attacker-controlled network input, and KDL 2.0's
-> `\u{XXXX}` escape syntax can deliver a literal control character through
-> an otherwise well-formed string literal; these are exactly the bytes
-> (`\t`, `\n`, `\x1f`, `\x1e`, `\x01`) the append-only ratchet's canonical
-> violation digest (§3.5.3) and other raw-value renderings use as
-> field/record delimiters. Left unvalidated, a crafted field value lets two
-> semantically different violation sets serialize to identical digest bytes
-> — defeating the *warn* row's new-vs-recurring habituation defense
-> (§3.5.2) — and lets a crafted value inject forged violation-shaped lines
-> into diagnostic output. `TNG-UNSAFE-CONTROL-CHAR` is a single,
-> field-independent slug shared across every field this clause covers; the
-> offending field name and value are structured error context, not a
-> distinguishing slug — the same economy `TNG-UNSAFE-OCI-FIELD` already
-> applies across its own two fields. Because this clause makes control
-> characters structurally absent from every value the canonical digest
-> (§3.5.3) ever renders, that section's delimiter choices are safe by
-> construction and need no escaping mechanism of their own.
+> NORMATIVE (control-character rejection): EVERY registry FREE-TEXT field —
+> a field whose grammar does not already anchor it to a closed hex/format
+> shape — MUST NOT contain an ASCII control character (U+0000–U+001F
+> inclusive, or U+007F). A conformant implementation MUST reject a value
+> containing one at parse time, before the value is stored on the in-memory
+> index type, raising `TNG-UNSAFE-CONTROL-CHAR`. This is a parse-boundary
+> charset check, orthogonal to and applied in addition to each field's own
+> shape validation (path-traversal blacklist, leading-dash, hex-digest,
+> closed kind-set, etc.) elsewhere in this section. `index.kdl` is
+> attacker-controlled network input, and KDL 2.0's `\u{XXXX}` escape syntax
+> can deliver a literal control character through an otherwise well-formed
+> string literal; these are exactly the bytes (`\t`, `\n`, `\x1f`, `\x1e`,
+> `\x01`) the append-only ratchet's canonical violation digest (§3.5.3) and
+> other raw-value renderings use as field/record delimiters. Left
+> unvalidated, a crafted field value lets two semantically different
+> violation sets serialize to identical digest bytes — defeating the *warn*
+> row's new-vs-recurring habituation defense (§3.5.2) — and lets a crafted
+> value inject forged violation-shaped lines into diagnostic output.
+> `TNG-UNSAFE-CONTROL-CHAR` is a single, field-independent slug shared
+> across every field this clause covers; the offending field name and value
+> are structured error context, not a distinguishing slug — the same
+> economy `TNG-UNSAFE-OCI-FIELD` already applies across its own two fields.
+>
+> **Completeness principle** (checkable, not a hand list that can drift): a
+> field is IN SCOPE of this clause iff it is free text that reaches either
+> (a) the append-only ratchet's canonical digest / any non-scalar canonical
+> rendering (§3.5.3's `provenance`/`attestation`/`rekor` records), (b) a
+> ratchet dominance comparison, or (c) user-facing diagnostic/CLI text. A
+> new free-text field added anywhere in this grammar that meets that test
+> MUST be added to the enumeration below in the same change that introduces
+> it — it is not optional hardening. The current complete enumeration:
+> `name` (§3.1 — the package name; distinct from, and in ADDITION to, its
+> own path-traversal blacklist below — a blacklisted-character check does
+> not reject control characters, so both run), `namespace` (§3.1),
+> `content_hash` (§3.2 — the SetOnce identity field the digest renders as a
+> raw scalar), a `version` node's version string (§3.2), a `git`
+> provenance's `url` and `ref`, an `oci` provenance's `registry` and
+> `repository` (both below), the `rekor` block's `uuid`, `log_index`, and
+> `integrated_time` (§3.2), an `attestation "author-signed"` claim's
+> `signed_by` field (§3.2), `yanked_reason` (§3.2 — rendered raw, not
+> escaped, into the `TNG-NO-SATISFYING-VERSION` message and the yank
+> ratchet notice, §3.5.3), and the document-root `attestation-epoch` (§3.5.1
+> — a free-text root field that feeds the reserved root pseudo-entry's
+> digest row exactly as any per-entry field feeds its own). Fields NOT in
+> this list are exempt because their own grammar already anchors them to a
+> closed hex/format shape that structurally excludes control characters —
+> not because they were overlooked: `commit_sha` (`^[0-9a-f]{40}$`), an
+> `oci` provenance's `digest` and the `dep_decl` pointer (both
+> `^sha256:[0-9a-f]{64}$`), the `bundle sha256=` pin (`^[0-9a-f]{64}$`), and
+> integer/boolean-typed fields (`schema_version`, `log_index` when
+> integer-shaped, `dep_decl_schema_version`, `yanked`). `published_at` /
+> `yanked_at` are exempt for a distinct, verified reason, not a shape regex:
+> a value containing a control character always fails the ISO-8601 parse
+> that gates whether the raw served text ever reaches the digest (§3.2's
+> malformed-timestamp-is-absent posture), so no control character can reach
+> that field's digest rendering regardless of charset-checking it directly.
+> Because this clause makes control characters structurally absent from
+> every value the canonical digest (§3.5.3) ever renders, that section's
+> delimiter choices are safe by construction and need no escaping mechanism
+> of their own.
 
 #### `git` provenance
 
@@ -1385,13 +1416,22 @@ part of `spec/errors.md` as of this spec-only amendment:
 > and newline (`\n`) delimiters this digest definition uses, and the
 > `\x1f`/`\x1e` delimiters the non-scalar rendering below uses, are safe
 > precisely because §3.3's control-character rejection rule (NORMATIVE
-> (control-character rejection)) keeps every value these renderings draw
-> from — `namespace`, `version`, provenance `url`/`ref`/`registry`/
-> `repository`, and `rekor`'s `uuid`/`log_index`/`integrated_time` —
-> structurally free of ASCII control characters before it ever reaches this
-> digest. This section defines no escaping of its own for those values;
+> (control-character rejection)) keeps EVERY free-text field this digest (or
+> its non-scalar renderings) draws from structurally free of ASCII control
+> characters before any of it ever reaches this digest — that is exactly
+> what §3.3's completeness principle is FOR: every field satisfying test
+> (a)/(b)/(c) there is, by construction, a field this digest draws from, and
+> vice versa. This section defines no escaping of its own for those values;
 > §3.3 is the sole reason the delimiter choices here are collision-safe
-> against attacker-controlled field content.
+> against attacker-controlled field content. (An earlier revision of this
+> NOTE named a fixed field list here — `namespace`, `version`, provenance
+> `url`/`ref`/`registry`/`repository`, and `rekor`'s
+> `uuid`/`log_index`/`integrated_time` — that had silently gone stale
+> relative to §3.3's own enumeration, which by then also covered `name`,
+> `content_hash`, `signed_by`, `yanked_reason`, and `attestation-epoch`: a
+> hand-duplicated list drifts from its source of truth exactly like any
+> other duplicated invariant. This NOTE now points at §3.3's enumeration
+> instead of re-stating it, so there is one list to keep complete, not two.)
 
 > NORMATIVE (canonical rendering for non-scalar candidate values): "the raw
 > document string exactly as served" (above) is well-defined for every

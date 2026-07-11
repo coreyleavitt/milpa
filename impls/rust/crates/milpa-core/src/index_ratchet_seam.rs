@@ -42,7 +42,7 @@ use crate::ratchet::{
     canonical_digest, AttestationValue, Baseline, EntryKey, FieldValue, IndexState, RatchetEntry,
     RawField, Transition, Violation,
 };
-use crate::registry::Index;
+use crate::registry::{validate_no_control_chars, Index};
 
 fn tng(code: &'static str, message: impl Into<String>) -> MilpaError {
     MilpaError::Core(CoreError::Tianguis(code, message.into()))
@@ -96,6 +96,14 @@ fn raw_schema_version(text: &str) -> Result<Option<i64>, MilpaError> {
 /// own raw digest rendering (the scalar-field convention). A SEPARATE
 /// re-walk for the same reason as `raw_schema_version` — `Index` does not
 /// retain this root field.
+///
+/// This is the ONLY site that ever extracts `attestation-epoch` — it lives
+/// outside every `package` node, so `Index::parse`'s own charset pass never
+/// sees it. It feeds the root pseudo-entry's canonical violation digest
+/// (§3.5.3) as a raw, unescaped scalar, so this is ALSO the only site that
+/// can charset-check it — the same `TNG-UNSAFE-CONTROL-CHAR` guard
+/// `Index::parse` applies to every other free-text field (registry-protocol
+/// §3.3 NORMATIVE).
 fn raw_attestation_epoch(text: &str) -> Result<Option<String>, MilpaError> {
     let doc = KdlDocument::parse(text)
         .map_err(|e| tng("TNG-KDL-SYNTAX", format!("index KDL syntax error: {e}")))?;
@@ -103,12 +111,16 @@ fn raw_attestation_epoch(text: &str) -> Result<Option<String>, MilpaError> {
         if node.name().value() != "attestation-epoch" {
             continue;
         }
-        return Ok(node
+        let epoch = node
             .entries()
             .iter()
             .find(|e| e.name().is_none())
             .and_then(|e| e.value().as_string())
-            .map(str::to_string));
+            .map(str::to_string);
+        if let Some(ref e) = epoch {
+            validate_no_control_chars(e, "attestation-epoch").map_err(MilpaError::from)?;
+        }
+        return Ok(epoch);
     }
     Ok(None)
 }
