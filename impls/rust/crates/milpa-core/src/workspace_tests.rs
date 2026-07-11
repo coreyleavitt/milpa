@@ -564,6 +564,40 @@ fn member_declaring_index_trust_bundle_is_ws_index_trust_on_member() {
 }
 
 // ---------------------------------------------------------------------------
+// P3a (rfc-per-entry-attestation.md §4): entry-trust root-authority
+// validation — mirrors the index-trust tests above. Like index-history,
+// entry-trust has no signer/bundle sub-fields (it gates per-entry
+// attestation checking, not a Sigstore verification identity), so this
+// axis is a single-node mirror.
+// ---------------------------------------------------------------------------
+
+/// A member declaring `entry-trust "strict"` is a hard error —
+/// WS-ENTRY-TRUST-ON-MEMBER — raised BEFORE any resolve, even when the root
+/// declares nothing.
+#[test]
+fn member_declaring_entry_trust_is_ws_entry_trust_on_member() {
+    let tmp = workspace_dir(
+        "workspace {\n    member \"sub\"\n}\n",
+        &[("sub", Some("name \"sub\"\nkind \"library\"\nentry-trust \"strict\"\n"))],
+    );
+    let result = load_workspace(tmp.path()).unwrap_err();
+    assert_eq!(result.code(), "WS-ENTRY-TRUST-ON-MEMBER");
+}
+
+/// A member declaring `entry-trust "warn"` — the SAME as the default
+/// value — still errors: the rule is about WHERE the field is declared,
+/// not what value it holds.
+#[test]
+fn member_declaring_entry_trust_warn_default_value_is_still_ws_entry_trust_on_member() {
+    let tmp = workspace_dir(
+        "workspace {\n    member \"sub\"\n}\n",
+        &[("sub", Some("name \"sub\"\nkind \"library\"\nentry-trust \"warn\"\n"))],
+    );
+    let result = load_workspace(tmp.path()).unwrap_err();
+    assert_eq!(result.code(), "WS-ENTRY-TRUST-ON-MEMBER");
+}
+
+// ---------------------------------------------------------------------------
 // A3 (rfc-registry-append-only.md §2): index-history root-authority
 // validation — mirrors the index-trust / entry-trust tests above.
 // ---------------------------------------------------------------------------

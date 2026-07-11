@@ -989,3 +989,65 @@ def test_update_no_mirrors_regression(tmp_path: Path) -> None:
     assert rc == 0
     lock = load_lockfile(tmp_path / "milpa.lock")
     assert any(d.name == "foo" for d in lock.deps)
+
+
+# ---------------------------------------------------------------------------
+# CR11 item 6 — yank exclusion at the ``update`` CLI verb layer.
+#
+# ``fixture-400-tng-yanked-version-excluded-new-resolve`` (registry-protocol
+# §5.2 NORMATIVE yank clause) already proves the RESOLVE-layer filter through
+# the conformance harness's in-process adapter, invoked implicitly via
+# whatever verb the shared corpus runner drives (``fetch``). It never proves
+# the filter survives through the ``update`` CLI verb, which reaches the
+# index over `` MILPA_INDEX_URL`` / ``_load_index_for_verb`` — a DIFFERENT
+# code path than the harness's direct ``env.index=`` injection (`cmd_update`
+# unconditionally re-loads the index from the URL, discarding whatever
+# ``MilpaEnv.index`` the caller constructed). This test reuses fixture-400's
+# already-verified index.kdl + mocked-fetches assets (the yanked-2.0.0 /
+# non-yanked-1.0.0 package "bar", with content_hash values that match the
+# real computed identity of the mocked git content) and drives them through
+# the real ``cmd_update`` verb function via a ``file://`` index URL — the
+# same real CLI layer ``test_cli_index_verbs.py`` exercises for the
+# index-history verbs, applied here to the mutation verb family.
+# ---------------------------------------------------------------------------
+
+_FIXTURE_400 = _REPO_ROOT / "conformance/spec-v1/fixture-400-tng-yanked-version-excluded-new-resolve"
+
+
+def test_cmd_update_skips_yanked_latest_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """update (no dep arg, no prior lock) against a real file:// index whose
+    latest version is yanked -> resolves the highest NON-yanked version, via
+    the real ``update`` CLI verb (not the resolve()-layer test already
+    covered by fixture-400 through the harness adapter / ``fetch``)."""
+    manifest_text = (_FIXTURE_400 / "milpa.kdl").read_text(encoding="utf-8")
+    (tmp_path / "milpa.kdl").write_text(
+        manifest_text + 'index-trust "off"\n', encoding="utf-8"
+    )
+
+    index_path = _FIXTURE_400 / "index.kdl"
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_dir))
+    monkeypatch.setenv("MILPA_CACHE_DIR", str(cache_dir))
+    monkeypatch.setenv("MILPA_INDEX_URL", f"file://{index_path}")
+    monkeypatch.delenv("MILPA_INDEX_TRUST", raising=False)
+    monkeypatch.delenv("MILPA_INDEX_TRUST_MOCK_VERIFIER", raising=False)
+    monkeypatch.delenv("MILPA_INDEX_HISTORY", raising=False)
+
+    env = _mocked_env(_FIXTURE_400 / "mocked-fetches", tmp_path / "cas")
+
+    rc = cmd_update(
+        tmp_path,
+        env,
+        dep_name=None,
+        strategy=Strategy.MAXVER,
+        max_parallel=4,
+    )
+    assert rc == 0
+
+    lock = load_lockfile(tmp_path / "milpa.lock")
+    bar = next(d for d in lock.deps if d.name == "bar")
+    assert bar.version == "1.0.0", (
+        f"update must skip the yanked 2.0.0 and select 1.0.0; got {bar.version!r}"
+    )

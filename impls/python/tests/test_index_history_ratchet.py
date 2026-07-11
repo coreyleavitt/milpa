@@ -502,6 +502,22 @@ package "bar" {
         )
         assert v.candidate_value == candidate_value
 
+        # baseline_value: same §3.5.3 non-scalar rendering method applied to
+        # the BASELINE side's single-element provenance multiset — the
+        # closed-field-set encoding <kind>\x1f<url>\x1f<ref>\x1f<commit_sha>,
+        # by hand from the baseline_text literal above (never copied from
+        # implementation output). baseline_value is excluded from the digest
+        # itself (§3.5.3: "the baseline is frozen while violations persist,
+        # so it adds no discriminating information") but still rides the
+        # payload for human display — a shared misrendering of THIS field
+        # across both impls would not be caught by the digest differential
+        # alone, so it needs its own literal-string pin.
+        baseline_value = (
+            "git\x1fhttps://example.com/bar.git\x1fv1.0.0"
+            "\x1fcafef00dcafef00dcafef00dcafef00dcafef00d"
+        )
+        assert v.baseline_value == baseline_value
+
         expected_line = (
             "TNG-ENTRY-MUTATED\tacme\tbar\t1.0.0\tprovenances\tprovenance-removed\t"
             + candidate_value
@@ -591,6 +607,18 @@ package "bar" {
 
         candidate_value = "author-signed\x1falice\x1f" + "2" * 64
         assert v.candidate_value == candidate_value
+
+        # baseline_value: the same closed-field-set rendering
+        # (<kind>\x1f<signer>\x1f<bundle_pin>, §3.5.3 NORMATIVE (canonical
+        # rendering for non-scalar candidate values), the "attestation"
+        # instantiation) applied to the BASELINE side, by hand from the
+        # baseline_text literal above. Excluded from the digest (§3.5.3) but
+        # still carried on the payload for human display — pinning it here
+        # closes the same differential blind spot the candidate_value pin
+        # closes: a shared misrendering across both impls would pass the
+        # opaque digest match alone.
+        baseline_value = "author-signed\x1falice\x1f" + "1" * 64
+        assert v.baseline_value == baseline_value
 
         expected_line = (
             "TNG-ENTRY-MUTATED\tacme\tbar\t1.0.0\tattestation\tmonotone-repinned\t"

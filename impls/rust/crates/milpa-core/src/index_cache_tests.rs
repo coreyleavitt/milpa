@@ -1218,3 +1218,40 @@ fn a3_write_baseline_pair_atomic_swap_for_accept_verb() {
     assert_eq!(std::fs::read(&baseline_p).unwrap(), INDEX1.as_bytes());
     assert!(std::fs::read_to_string(&meta_p).unwrap().contains("established_at"));
 }
+
+/// CR11 item 4 — `TNG-INDEX-BASELINE-WRITE-FAILED`: `write_baseline_pair`
+/// wraps any I/O failure with the loud, distinct slug (never a silent
+/// no-op). The Python sibling test
+/// (`test_cli_index_verbs.py::test_write_failure_is_loud_and_leaves_previous_pair_intact`)
+/// simulates this via a read-only `chmod`'d cache directory, but that
+/// approach is a NO-OP for a process running as root (root bypasses POSIX
+/// permission bits) — which is exactly the container this Rust suite runs
+/// in by default (Python gates its own version of this test with
+/// `skipif(os.geteuid() == 0)` for the same reason). Rather than skip
+/// entirely, this forces the SAME underlying failure — `create_dir_all`
+/// returning `Err` — through a mechanism that fails regardless of privilege:
+/// making the cache dir's PARENT path component an existing plain FILE, so
+/// `create_dir_all` hits `ENOTDIR`, not a permission check. This exercises
+/// the real "wrap any I/O failure" contract without depending on the
+/// container's effective UID.
+#[test]
+fn a3_write_baseline_pair_reports_write_failed_when_cache_dir_uncreatable() {
+    let d = tmp();
+    // `cache_dir`'s parent path component is a FILE, not a directory —
+    // `std::fs::create_dir_all(cache_dir)` fails with ENOTDIR for any user,
+    // including root.
+    let blocker_file = d.path().join("blocker");
+    std::fs::write(&blocker_file, b"not a directory").unwrap();
+    let cache_dir = blocker_file.join("index");
+
+    let meta = BaselineMeta {
+        established_at: Some("2026-01-01T00:00:00+00:00".to_string()),
+        reported_digest: None,
+        reported_at: None,
+    };
+    let err = write_baseline_pair(URL, &cache_dir, INDEX1.as_bytes(), &meta).unwrap_err();
+    assert_eq!(err.code(), "TNG-INDEX-BASELINE-WRITE-FAILED");
+
+    // No partial write leaked into a sibling of the blocker file.
+    assert!(!cache_dir.exists());
+}

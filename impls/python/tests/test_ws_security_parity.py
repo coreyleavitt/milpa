@@ -19,6 +19,7 @@ import pytest
 
 from milpa.errors import (
     MilpaError,
+    WS_ENTRY_TRUST_ON_MEMBER,
     WS_INDEX_HISTORY_ON_MEMBER,
     WS_INDEX_TRUST_ON_MEMBER,
     WS_MEMBER_DIR_MISSING,
@@ -725,4 +726,76 @@ class TestWorkspaceMemberIndexHistoryRejected:
             load_workspace_from_manifest(tmp_path, ws_manifest)
         assert exc_info.value.slug == WS_INDEX_HISTORY_ON_MEMBER
 
+
+# ---------------------------------------------------------------------------
+# P3a (RFC per-entry-attestation.md §4): entry-trust root authority — mirrors
+# the index-history root-authority tests above for the sibling axis. Like
+# index-history, entry-trust is a single-node field (no signer/bundle
+# sub-fields), so this axis is also a single-node mirror.
+# ---------------------------------------------------------------------------
+
+
+def _write_workspace_member_with_entry_trust(
+    root: Path,
+    *,
+    member_policy: str | None = None,
+    root_policy: str | None = None,
+    member_name: str = "sub",
+) -> None:
+    """Write a workspace where a MEMBER illegally declares an entry-trust field."""
+    root_lines = []
+    if root_policy is not None:
+        root_lines.append(f'entry-trust "{root_policy}"')
+    root_lines.append(f'workspace {{\n    member "{member_name}"\n}}')
+    (root / "milpa.kdl").write_text("\n".join(root_lines) + "\n", encoding="utf-8")
+
+    member_dir = root / member_name
+    member_dir.mkdir(parents=True, exist_ok=True)
+    member_lines = [f'name "{member_name}"', 'kind "library"']
+    if member_policy is not None:
+        member_lines.append(f'entry-trust "{member_policy}"')
+    (member_dir / "milpa.kdl").write_text("\n".join(member_lines) + "\n", encoding="utf-8")
+
+
+class TestWorkspaceMemberEntryTrustRejected:
+    """A member declaring entry-trust → WS-ENTRY-TRUST-ON-MEMBER."""
+
+    def test_member_declares_policy_raises(self, tmp_path: Path) -> None:
+        _write_workspace_member_with_entry_trust(tmp_path, member_policy="strict")
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace(tmp_path)
+        assert exc_info.value.slug == WS_ENTRY_TRUST_ON_MEMBER
+
+    def test_member_declares_default_matching_policy_still_raises(self, tmp_path: Path) -> None:
+        """Explicit 'warn' on a member still errors — the rule is about WHERE, not the value."""
+        _write_workspace_member_with_entry_trust(tmp_path, member_policy="warn")
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace(tmp_path)
+        assert exc_info.value.slug == WS_ENTRY_TRUST_ON_MEMBER
+
+    def test_error_includes_member_path(self, tmp_path: Path) -> None:
+        _write_workspace_member_with_entry_trust(
+            tmp_path, member_policy="strict", member_name="pkg-b"
+        )
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace(tmp_path)
+        combined = exc_info.value.message + str(exc_info.value.context)
+        assert "pkg-b" in combined
+
+    def test_fires_regardless_of_root_policy(self, tmp_path: Path) -> None:
+        """The check fires even when the root ALSO legally declares a policy."""
+        _write_workspace_member_with_entry_trust(
+            tmp_path, member_policy="strict", root_policy="warn"
+        )
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace(tmp_path)
+        assert exc_info.value.slug == WS_ENTRY_TRUST_ON_MEMBER
+
+    def test_fires_via_load_workspace_from_manifest(self, tmp_path: Path) -> None:
+        """load_workspace_from_manifest (used by add/remove orchestration) also rejects."""
+        _write_workspace_member_with_entry_trust(tmp_path, member_policy="strict")
+        ws_manifest = WorkspaceManifest(members=("sub",))
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace_from_manifest(tmp_path, ws_manifest)
+        assert exc_info.value.slug == WS_ENTRY_TRUST_ON_MEMBER
 

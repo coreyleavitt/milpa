@@ -347,3 +347,118 @@ fn accept_hard_fails_on_broken_manifest() {
         "accept must not write a baseline when the manifest is broken"
     );
 }
+
+// ---------------------------------------------------------------------------
+// CR11 item 1 — corrupt-baseline branch for `status`/`accept` (mirrors
+// Python's `TestAcceptCorrupt` in test_cli_index_verbs.py). `status` reports
+// `corrupt` and exits 1 WITHOUT raising (cli-contract §5.12 NORMATIVE:
+// read-only inspection never hard-fails on broken local trust state);
+// `accept` re-establishes the trust anchor over a corrupt baseline (the same
+// "no prior baseline" TOFU posture — a corrupt local file carries no
+// reliable prior state to diff against).
+// ---------------------------------------------------------------------------
+
+fn corrupt_baseline_file(h: &Harness) -> std::path::PathBuf {
+    let (baseline_path, _) = baseline_sidecar_path(h);
+    std::fs::write(&baseline_path, b"not valid kdl {{{").unwrap();
+    baseline_path
+}
+
+#[test]
+fn status_reports_corrupt_without_raising() {
+    let h = setup(None, 'a');
+    run(&h, &["index", "accept"], &[]);
+    let baseline_path = corrupt_baseline_file(&h);
+
+    let (code, stdout, stderr) = run(&h, &["index", "status"], &[]);
+    assert_eq!(code, 1, "stdout:\n{stdout}");
+    assert!(stdout.contains("baseline:          corrupt"), "stdout:\n{stdout}");
+    assert!(stdout.contains("established-at:    (none)"), "stdout:\n{stdout}");
+    assert_eq!(stderr, "", "no TNG-INDEX-BASELINE-CORRUPT hard-fail, no milpa-error: line");
+    // untouched by the read-only inspection.
+    assert_eq!(std::fs::read(&baseline_path).unwrap(), b"not valid kdl {{{");
+}
+
+#[test]
+fn accept_reestablishes_over_corrupt_baseline() {
+    let h = setup(None, 'a');
+    run(&h, &["index", "accept"], &[]);
+    corrupt_baseline_file(&h);
+
+    // Mutate the served index so the re-established baseline is observably
+    // the NEW content, not a leftover of the pre-corruption one.
+    let idx_path = h.proj.parent().unwrap().join("idx").join("index.kdl");
+    let hash_f = "f".repeat(64);
+    std::fs::write(
+        &idx_path,
+        format!(
+            "schema_version 1\npackage \"bar\" {{\n    version \"1.0.0\" {{\n        content_hash \"sha256:{hash_f}\"\n    }}\n}}\n"
+        ),
+    )
+    .unwrap();
+
+    let (code, stdout, _stderr) = run(&h, &["index", "accept"], &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}");
+    assert_eq!(
+        stdout,
+        "baseline unreadable — cannot show what changed; re-establishing the trust anchor\n"
+    );
+
+    let (baseline_path, _) = baseline_sidecar_path(&h);
+    assert_eq!(std::fs::read(&baseline_path).unwrap(), std::fs::read(&idx_path).unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// CR11 item 3 — member-dir delegation (S11e symmetry): `index status`
+// invoked from a workspace MEMBER directory must match the ROOT's output
+// (mirrors Python's `TestMemberDirDelegation.test_member_dir_status_matches_root`
+// in test_cli_index_verbs.py). No Rust unit test previously exercised the
+// index-verb family through a workspace member dir.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn member_dir_status_matches_root() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().join("ws");
+    let member = root.join("sub");
+    let idx_dir = tmp.path().join("idx");
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::create_dir_all(&idx_dir).unwrap();
+    std::fs::write(
+        root.join("milpa.kdl"),
+        "index-trust \"off\"\nworkspace {\n    member \"sub\"\n}\n",
+    )
+    .unwrap();
+    std::fs::write(member.join("milpa.kdl"), "name \"sub\"\nkind \"library\"\n").unwrap();
+    let index_url = write_index(&idx_dir, 'a');
+    let cache = tmp.path().join("cache");
+
+    let run_at = |dir: &Path| -> (i32, String, String) {
+        let mut cmd = Command::new(MILPA);
+        for var in &[
+            "MILPA_INDEX_URL",
+            "MILPA_INDEX_TRUST",
+            "MILPA_INDEX_HISTORY",
+            "MILPA_CACHE_DIR",
+        ] {
+            cmd.env_remove(var);
+        }
+        cmd.env("XDG_CACHE_HOME", &cache);
+        cmd.env("MILPA_CACHE_DIR", &cache);
+        cmd.env("MILPA_INDEX_URL", &index_url);
+        cmd.env("MILPA_INDEX_HISTORY", "warn");
+        cmd.arg("-C").arg(dir).arg("index").arg("status");
+        let out = cmd.output().expect("milpa binary must be runnable");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let (code_root, stdout_root, _) = run_at(&root);
+    let (code_member, stdout_member, _) = run_at(&member);
+    assert_eq!(code_root, code_member);
+    assert_eq!(stdout_root, stdout_member, "member dir must match root's status output byte-for-byte");
+    assert!(stdout_root.contains("baseline:          absent"), "stdout:\n{stdout_root}");
+}

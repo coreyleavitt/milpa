@@ -297,6 +297,18 @@ fn provenance_in_place_mutation_hand_computed_digest_vector() {
         "git\u{1f}https://example.com/bar.git\u{1f}v1.0.0\u{1f}deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
     assert_eq!(v.candidate_value, expected_candidate_value);
 
+    // baseline_value: the same §3.5.3 closed-field-set rendering applied to
+    // the BASELINE side's single-element provenance multiset, by hand from
+    // `provenance_index_text`'s literal `commit_sha` argument above (never
+    // copied from implementation output). Excluded from the digest itself
+    // (§3.5.3: baseline is frozen while violations persist, so it adds no
+    // discriminating information) but still carried on the payload for
+    // human display — a shared misrendering of THIS field across both
+    // impls would not be caught by the opaque digest differential alone.
+    let expected_baseline_value =
+        "git\u{1f}https://example.com/bar.git\u{1f}v1.0.0\u{1f}cafef00dcafef00dcafef00dcafef00dcafef00d";
+    assert_eq!(v.baseline_value, expected_baseline_value);
+
     let digest = canonical_digest(&outcome.violations);
     assert_eq!(
         digest,
@@ -376,6 +388,17 @@ fn attestation_repin_hand_computed_digest_vector() {
 
     let expected_candidate_value = format!("author-signed\u{1f}alice\u{1f}{}", "2".repeat(64));
     assert_eq!(v.candidate_value, expected_candidate_value);
+
+    // baseline_value: the same closed-field-set rendering
+    // (<kind>\u{1f}<signer>\u{1f}<bundle_pin>, §3.5.3 NORMATIVE (canonical
+    // rendering for non-scalar candidate values), the "attestation"
+    // instantiation) applied to the BASELINE side, by hand from
+    // `attestation_index_text`'s literal `bundle_pin` argument above.
+    // Excluded from the digest (§3.5.3) but still carried on the payload
+    // for human display — pinning it here closes the same differential
+    // blind spot the candidate_value pin closes.
+    let expected_baseline_value = format!("author-signed\u{1f}alice\u{1f}{}", "1".repeat(64));
+    assert_eq!(v.baseline_value, expected_baseline_value);
 
     let digest = canonical_digest(&outcome.violations);
     assert_eq!(
