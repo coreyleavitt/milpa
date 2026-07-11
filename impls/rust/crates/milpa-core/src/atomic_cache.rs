@@ -54,11 +54,59 @@ pub fn unique_temp_path(path: &Path) -> PathBuf {
 /// that decision stays visible at each caller.
 pub fn atomic_write_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = unique_temp_path(path);
-    std::fs::write(&tmp, data)?;
+    // CR19: clean up the temp file on ANY failure — both the write itself
+    // (disk full / quota — the earlier fix only cleaned up on rename
+    // failure) and the rename — before propagating the original error.
+    // Mirrors `atomic_cache.py::atomic_write_bytes`, which already cleans up
+    // on both branches.
+    if let Err(e) = std::fs::write(&tmp, data) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         e
     })
+}
+
+/// Read+verify a cached file, self-healing a locally-corrupt entry (CR16).
+///
+/// This is the SHARED cached-read half of the fetch-or-cache pattern (the
+/// write half is [`atomic_write_bytes`] above). Both `HttpDepDeclStore` and
+/// `HttpEntryBundleStore` fetch-or-cache an immutable, hash-pinned artifact;
+/// both need identical cached-read behavior, so it lives here once.
+/// Mirrors `atomic_cache.py::read_verified_or_self_heal`.
+///
+/// Behavior:
+/// - Cache miss (file absent, or unreadable) → `None` (caller falls through
+///   to fetch).
+/// - Cache hit, `verify_fn(bytes)` returns `Err` → the file is a locally
+///   corrupt entry (e.g. a truncated write left behind by the
+///   pre-unique-temp-name concurrency race, or plain disk corruption).
+///   Self-heal: remove it and return `None` so the caller re-fetches,
+///   rather than a permanent hard failure.
+/// - Cache hit, `verify_fn(bytes)` returns `Ok` → the verified bytes.
+///
+/// CRITICAL INVARIANT: self-heal applies ONLY to this cached-read path. A
+/// verify failure on bytes the caller just fetched fresh from the network
+/// (the server genuinely served the wrong content) MUST NOT go through this
+/// function — that call site invokes its own verify directly (via `?`) and
+/// lets the error propagate as a hard error. Routing freshly-fetched bytes
+/// through this function would silently discard evidence of a real
+/// delivery-path/server compromise.
+pub fn read_verified_or_self_heal<E>(
+    cache_path: &Path,
+    verify_fn: impl FnOnce(&[u8]) -> Result<(), E>,
+) -> Option<Vec<u8>> {
+    let cached = std::fs::read(cache_path).ok()?;
+    match verify_fn(&cached) {
+        Ok(()) => Some(cached),
+        Err(_) => {
+            // Locally-corrupt cache entry: self-heal by discarding it.
+            let _ = std::fs::remove_file(cache_path);
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -119,5 +167,93 @@ mod tests {
         let target = tmp_dir.path().join("nonexistent-subdir").join("out.bin");
         assert!(atomic_write_bytes(&target, b"payload").is_err());
         assert!(!target.exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // CR19 — temp-file cleanup on ANY failure (write OR rename), not just
+    // rename. The write path can't be forced to fail deterministically after
+    // partially creating the temp file (no disk-full/quota simulation
+    // available here — the temp filename embeds a live PID+nanos+counter we
+    // can't precompute to pre-seed a conflicting inode), so this test locks
+    // the RENAME-failure cleanup path, and the write-failure branch is a
+    // symmetric code-level guarantee (see `atomic_write_bytes` above: both
+    // branches now call the identical `remove_file` best-effort cleanup
+    // before propagating the error — mirrors `atomic_cache.py`, which cleans
+    // up on both branches with one shared `except OSError` block).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn atomic_write_bytes_rename_failure_cleans_up_temp() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        // Make the target path itself an existing, non-empty directory so
+        // that `fs::rename(tmp, target)` fails (can't rename a file onto a
+        // directory) — this forces the RENAME branch to error out after the
+        // WRITE has already succeeded (the temp file exists on disk).
+        let target = tmp_dir.path().join("target_is_a_dir");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("occupant"), b"keeps dir non-empty").unwrap();
+
+        let result = atomic_write_bytes(&target, b"payload");
+        assert!(result.is_err(), "rename onto an existing directory must fail");
+
+        // No `.tmp.` sibling should remain in tmp_dir after the failure.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp_dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p != &target)
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp file must be cleaned up on rename failure, found: {leftovers:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CR16 — read_verified_or_self_heal
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_verified_or_self_heal_absent_file_is_cache_miss() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let cache_path = tmp_dir.path().join("missing.bin");
+        let got = read_verified_or_self_heal(&cache_path, |_: &[u8]| -> Result<(), ()> { Ok(()) });
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn read_verified_or_self_heal_valid_bytes_returned() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let cache_path = tmp_dir.path().join("valid.bin");
+        std::fs::write(&cache_path, b"good bytes").unwrap();
+
+        let got = read_verified_or_self_heal(&cache_path, |b: &[u8]| -> Result<(), ()> {
+            if b == b"good bytes" {
+                Ok(())
+            } else {
+                Err(())
+            }
+        });
+        assert_eq!(got, Some(b"good bytes".to_vec()));
+        assert!(cache_path.is_file(), "a valid entry must not be removed");
+    }
+
+    #[test]
+    fn read_verified_or_self_heal_corrupt_bytes_unlinked_and_none() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let cache_path = tmp_dir.path().join("corrupt.bin");
+        std::fs::write(&cache_path, b"corrupt garbage").unwrap();
+
+        let got = read_verified_or_self_heal(&cache_path, |b: &[u8]| -> Result<(), ()> {
+            if b == b"good bytes" {
+                Ok(())
+            } else {
+                Err(())
+            }
+        });
+        assert!(got.is_none());
+        assert!(
+            !cache_path.is_file(),
+            "a locally-corrupt cache entry must be self-healed (unlinked)"
+        );
     }
 }

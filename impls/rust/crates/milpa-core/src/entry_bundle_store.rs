@@ -175,25 +175,20 @@ impl HttpEntryBundleStore {
 impl EntryBundleStore for HttpEntryBundleStore {
     fn get(&self, bundle_pin: &str) -> Result<Vec<u8>, MilpaError> {
         // Cache-first (immutable: a hit is always valid; no staleness check).
+        // CR16: cached-read + self-heal is shared with HttpDepDeclStore via
+        // crate::atomic_cache::read_verified_or_self_heal — a locally
+        // corrupt/unreadable cache entry (e.g. a truncated write left behind
+        // by the pre-unique-temp-name concurrency race, or plain disk
+        // corruption) is discarded and treated as a cache miss so the caller
+        // re-fetches, rather than a permanent hard failure. A mismatch on
+        // FRESHLY FETCHED bytes below (the server genuinely served the wrong
+        // content) stays a hard error via `?` — that call never goes through
+        // the self-heal primitive.
         if let Some(cache_path) = self.cache_path(bundle_pin) {
-            if cache_path.is_file() {
-                if let Ok(cached) = std::fs::read(&cache_path) {
-                    match verify(&cached, bundle_pin) {
-                        Ok(()) => return Ok(cached),
-                        Err(_) => {
-                            // Locally-corrupt cache entry (e.g. a truncated
-                            // write left behind by the pre-unique-temp-name
-                            // concurrency race, or plain disk corruption) —
-                            // self-heal by discarding it and falling through
-                            // to re-fetch, rather than a permanent hard
-                            // failure. A mismatch on FRESHLY FETCHED bytes
-                            // below (the server genuinely served the wrong
-                            // content) stays a hard error via `?`.
-                            let _ = std::fs::remove_file(&cache_path);
-                        }
-                    }
-                }
-                // Corrupted cache read: fall through to re-fetch.
+            if let Some(cached) =
+                crate::atomic_cache::read_verified_or_self_heal(&cache_path, |b| verify(b, bundle_pin))
+            {
+                return Ok(cached);
             }
         }
 

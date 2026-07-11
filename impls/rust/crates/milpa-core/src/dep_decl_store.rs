@@ -152,29 +152,22 @@ impl DepDeclStore for HttpDepDeclStore {
         let hex = hex_of(dep_decl_hash_str);
 
         // Check cache first (immutable artifacts: no TTL, no re-fetch needed).
+        // CR16: cached-read + self-heal is shared with HttpEntryBundleStore
+        // via crate::atomic_cache::read_verified_or_self_heal — a locally
+        // corrupt/unreadable cache entry (e.g. a truncated write left behind
+        // by the pre-unique-temp-name concurrency race, or plain disk
+        // corruption) is discarded and treated as a cache miss so the caller
+        // re-fetches, rather than a permanent hard failure. A mismatch on
+        // FRESHLY FETCHED bytes below (the server genuinely served the wrong
+        // content) stays a hard error via `?` — that call never goes through
+        // the self-heal primitive.
         if let Some(ref cache_dir) = self.cache_dir {
             let cache_path = cache_dir.join(format!("{hex}.kdl"));
-            if cache_path.is_file() {
-                let bytes = std::fs::read(&cache_path).map_err(|e| {
-                    MilpaError::Core(CoreError::DepDecl(
-                        "TNG-DEPDECL-FETCH-FAILED",
-                        format!("DepDecl cache read failed for {dep_decl_hash_str:?}: {e}"),
-                    ))
-                })?;
-                // SECURITY: verify even from cache (detect disk corruption / tampering)
-                match verify(&bytes, dep_decl_hash_str) {
-                    Ok(()) => return Ok(bytes),
-                    Err(_) => {
-                        // Locally-corrupt cache entry (e.g. a truncated write
-                        // left behind by the pre-unique-temp-name concurrency
-                        // race, or plain disk corruption) — self-heal by
-                        // discarding it and falling through to re-fetch,
-                        // rather than a permanent hard failure. A mismatch on
-                        // FRESHLY FETCHED bytes below (the server genuinely
-                        // served the wrong content) stays a hard error via `?`.
-                        let _ = std::fs::remove_file(&cache_path);
-                    }
-                }
+            if let Some(bytes) = crate::atomic_cache::read_verified_or_self_heal(
+                &cache_path,
+                |b| verify(b, dep_decl_hash_str),
+            ) {
+                return Ok(bytes);
             }
         }
 

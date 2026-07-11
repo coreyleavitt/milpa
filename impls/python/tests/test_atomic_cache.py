@@ -9,7 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from milpa.atomic_cache import atomic_write_bytes, unique_temp_path
+from milpa.atomic_cache import (
+    atomic_write_bytes,
+    read_verified_or_self_heal,
+    unique_temp_path,
+)
+from milpa.errors import MilpaError
 
 
 class TestUniqueTempPath:
@@ -65,3 +70,52 @@ class TestAtomicWriteBytes:
         # parent dir, so nothing to clean up, but assert the target itself
         # was never created either).
         assert not target.exists()
+
+
+class TestReadVerifiedOrSelfHeal:
+    """CR16: the shared cached-read + self-heal primitive used by both
+    ``HttpDepDeclStore`` and ``HttpEntryBundleStore``."""
+
+    @staticmethod
+    def _verify_equals(expected: bytes):
+        def _verify(actual: bytes) -> None:
+            if actual != expected:
+                raise MilpaError("TEST-MISMATCH", "bytes did not match expected fixture")
+
+        return _verify
+
+    def test_absent_file_is_cache_miss(self, tmp_path: Path) -> None:
+        cache_path = tmp_path / "missing.bin"
+        result = read_verified_or_self_heal(cache_path, self._verify_equals(b"anything"))
+        assert result is None
+
+    def test_valid_bytes_are_returned_and_file_kept(self, tmp_path: Path) -> None:
+        cache_path = tmp_path / "valid.bin"
+        cache_path.write_bytes(b"good bytes")
+        result = read_verified_or_self_heal(cache_path, self._verify_equals(b"good bytes"))
+        assert result == b"good bytes"
+        assert cache_path.is_file(), "a valid entry must not be removed"
+
+    def test_corrupt_bytes_are_unlinked_and_reported_as_miss(self, tmp_path: Path) -> None:
+        cache_path = tmp_path / "corrupt.bin"
+        cache_path.write_bytes(b"truncated garbage")
+        result = read_verified_or_self_heal(cache_path, self._verify_equals(b"good bytes"))
+        assert result is None
+        assert not cache_path.is_file(), (
+            "a locally-corrupt cache entry must be self-healed (unlinked)"
+        )
+
+    def test_non_milpa_error_from_verify_fn_propagates(self, tmp_path: Path) -> None:
+        """Only MilpaError triggers self-heal; a programming-bug exception
+        (e.g. TypeError inside verify_fn) must NOT be swallowed as if it were
+        a corrupt-cache signal."""
+        cache_path = tmp_path / "present.bin"
+        cache_path.write_bytes(b"bytes")
+
+        def _buggy_verify(_actual: bytes) -> None:
+            raise TypeError("not a MilpaError")
+
+        with pytest.raises(TypeError):
+            read_verified_or_self_heal(cache_path, _buggy_verify)
+        # The file must survive: this isn't a self-heal-eligible failure.
+        assert cache_path.is_file()

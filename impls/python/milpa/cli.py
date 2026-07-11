@@ -39,6 +39,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
+from typing import Callable, TypeVar
 
 from milpa import __version__
 from milpa.cas import CAStore, default_store
@@ -578,44 +579,69 @@ def _manifest_absent(exc: MilpaError) -> bool:
     return exc.slug == MAN_NO_MANIFEST
 
 
+_T = TypeVar("_T")
+
+
+def _load_root_policy(
+    project_dir: Path,
+    from_workspace: "Callable[[object], _T]",
+    from_manifest: "Callable[[object], _T]",
+    default: "_T",
+) -> "_T":
+    """Shared control-flow for the root-only trust-axis manifest loaders.
+
+    Every trust-axis policy (index-trust, entry-trust, index-history) is a
+    ROOT-ONLY setting: the resolution root is the workspace root manifest
+    (for a workspace) or the package manifest itself (standalone). Members
+    MUST NOT declare it — ``find_workspace_root`` (via the ``load_workspace``
+    it performs) raises the axis's own ``WS-*-ON-MEMBER`` error when one
+    does, and that error PROPAGATES from here (the workspace branch is
+    UNGUARDED on purpose: a present-but-invalid workspace must raise, never
+    silently fall back to a default).
+
+    Only a genuinely-absent standalone manifest (``_manifest_absent``)
+    degrades to ``default``; any other error (a present-but-broken manifest)
+    re-raises.
+
+    ``from_workspace``/``from_manifest`` extract the axis-specific field(s)
+    from the workspace root manifest / standalone manifest respectively —
+    the one place the three axes genuinely differ (a policy string for
+    entry-trust/index-history, a ``(policy, signer, bundle)`` tuple for
+    index-trust).
+    """
+    ws = find_workspace_root(project_dir)
+    if ws is not None:
+        return from_workspace(ws.workspace_manifest)
+    try:
+        m = load_or_discover_manifest(project_dir)
+    except MilpaError as exc:
+        if _manifest_absent(exc):
+            return default
+        raise
+    return from_manifest(m)
+
+
 def _load_manifest_trust_fields(
     project_dir: Path,
 ) -> "tuple[str, str | None, str | None]":
     """Load (policy, signer, bundle) from the resolution ROOT.  Pure I/O.
 
-    index-trust is a root-only policy (spec §3.4.7): the resolution root is the
-    workspace root manifest (for a workspace) or the package manifest itself
-    (standalone).  Members MUST NOT declare it — ``find_workspace_root`` (via the
-    ``load_workspace`` it performs) raises ``WS-INDEX-TRUST-ON-MEMBER`` when one
-    does, and that error PROPAGATES from here rather than being swallowed, so
-    ``cmd_show_index_trust`` surfaces exactly what the enforcement gate would.
-
-    Only a genuinely-absent standalone manifest degrades to ``("warn", None,
-    None)``; a present-but-invalid workspace is a hard error.
+    index-trust is a root-only policy (spec §3.4.7) — see ``_load_root_policy``
+    for the shared workspace/standalone/absent-manifest control-flow.
 
     SSOT shared by ``_build_index_trust`` (enforcement gate) and
     ``cmd_show_index_trust`` (observability) — spec §5.3a.
     """
-    # Workspace root is the authority for index-trust.  UNGUARDED on purpose: a
-    # present-but-invalid workspace (e.g. a member illegally declaring
-    # index-trust) MUST raise, not silently fall back to warn.
-    ws = find_workspace_root(project_dir)
-    if ws is not None:
-        wm = ws.workspace_manifest
-        return (
+    return _load_root_policy(
+        project_dir,
+        lambda wm: (
             str(wm.index_trust_policy),
             wm.index_trust_signer,
             wm.index_trust_bundle,
-        )
-    # Standalone package is its own root.  A genuinely-absent manifest (not a
-    # workspace, no package manifest) degrades to defaults.
-    try:
-        m = load_or_discover_manifest(project_dir)
-    except MilpaError as exc:
-        if _manifest_absent(exc):
-            return "warn", None, None
-        raise
-    return str(m.index_trust_policy), m.index_trust_signer, m.index_trust_bundle
+        ),
+        lambda m: (str(m.index_trust_policy), m.index_trust_signer, m.index_trust_bundle),
+        ("warn", None, None),
+    )
 
 
 def _resolve_trust_bundle_and_signer(
@@ -797,27 +823,15 @@ def _build_index_trust(
 def _load_manifest_entry_trust_policy(project_dir: Path) -> str:
     """Load the entry-trust policy from the resolution ROOT.  Pure I/O.
 
-    entry-trust is a root-only policy (RFC §4), mirroring
-    ``_load_manifest_trust_fields`` for index-trust: the resolution root is
-    the workspace root manifest (for a workspace) or the package manifest
-    itself (standalone). Members MUST NOT declare it —
-    ``find_workspace_root`` (via ``load_workspace``) raises
-    ``WS-ENTRY-TRUST-ON-MEMBER`` when one does, and that error PROPAGATES
-    from here.
-
-    Only a genuinely-absent standalone manifest degrades to ``"warn"``; a
-    present-but-invalid workspace is a hard error.
+    entry-trust is a root-only policy (RFC §4) — see ``_load_root_policy``
+    for the shared workspace/standalone/absent-manifest control-flow.
     """
-    ws = find_workspace_root(project_dir)
-    if ws is not None:
-        return ws.workspace_manifest.entry_trust_policy
-    try:
-        m = load_or_discover_manifest(project_dir)
-    except MilpaError as exc:
-        if _manifest_absent(exc):
-            return "warn"
-        raise
-    return m.entry_trust_policy
+    return _load_root_policy(
+        project_dir,
+        lambda wm: wm.entry_trust_policy,
+        lambda m: m.entry_trust_policy,
+        "warn",
+    )
 
 
 def _build_entry_trust(
@@ -971,27 +985,16 @@ def _build_entry_trust(
 def _load_manifest_index_history_policy(project_dir: Path) -> str:
     """Load the index-history policy from the resolution ROOT.  Pure I/O.
 
-    index-history is a root-only policy (RFC registry-append-only.md §2),
-    mirroring ``_load_manifest_entry_trust_policy`` for the sibling axis: the
-    resolution root is the workspace root manifest (for a workspace) or the
-    package manifest itself (standalone). Members MUST NOT declare it —
-    ``find_workspace_root`` (via the ``load_workspace`` it performs) raises
-    ``WS-INDEX-HISTORY-ON-MEMBER`` when one does, and that error PROPAGATES
-    from here.
-
-    Only a genuinely-absent standalone manifest degrades to ``"warn"``; a
-    present-but-invalid workspace is a hard error.
+    index-history is a root-only policy (RFC registry-append-only.md §2) —
+    see ``_load_root_policy`` for the shared workspace/standalone/
+    absent-manifest control-flow.
     """
-    ws = find_workspace_root(project_dir)
-    if ws is not None:
-        return ws.workspace_manifest.index_history_policy
-    try:
-        m = load_or_discover_manifest(project_dir)
-    except MilpaError as exc:
-        if _manifest_absent(exc):
-            return "warn"
-        raise
-    return m.index_history_policy
+    return _load_root_policy(
+        project_dir,
+        lambda wm: wm.index_history_policy,
+        lambda m: m.index_history_policy,
+        "warn",
+    )
 
 
 def _build_index_history(env: MilpaEnv, project_dir: Path) -> str:

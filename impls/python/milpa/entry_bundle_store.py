@@ -64,7 +64,7 @@ import os
 from pathlib import Path
 from typing import Protocol
 
-from milpa.atomic_cache import atomic_write_bytes
+from milpa.atomic_cache import atomic_write_bytes, read_verified_or_self_heal
 from milpa.errors import (
     TNG_ENTRY_BUNDLE_MISSING,
     TNG_ENTRY_BUNDLE_PIN_MISMATCH,
@@ -245,27 +245,17 @@ class HttpEntryBundleStore:
             MilpaError(TNG-ENTRY-BUNDLE-PIN-MISMATCH): Hash mismatch.
         """
         # Cache-first (immutable: a hit is always valid; no staleness check).
+        # Self-heal on a locally-corrupt cache entry (CR16 — shared with
+        # HttpDepDeclStore via atomic_cache.read_verified_or_self_heal): a
+        # mismatch on FRESHLY FETCHED bytes below (the server genuinely
+        # served the wrong content) stays a hard error — that path calls
+        # ``_verify`` directly and never reaches the self-heal primitive.
         cache_path = self._cache_path(bundle_pin)
-        if cache_path.is_file():
-            try:
-                cached_bytes = cache_path.read_bytes()
-            except OSError:
-                cached_bytes = None  # corrupted cache: fall through to re-fetch
-            if cached_bytes is not None:
-                try:
-                    _verify(cached_bytes, bundle_pin)
-                except MilpaError:
-                    # Locally-corrupt cache entry (e.g. a truncated write left
-                    # behind by the pre-unique-temp-name concurrency race, or
-                    # plain disk corruption) — self-heal by discarding it and
-                    # falling through to re-fetch, rather than a permanent
-                    # hard failure. A mismatch on FRESHLY FETCHED bytes below
-                    # (the server genuinely served the wrong content) stays a
-                    # hard error — that path never reaches this except clause.
-                    with contextlib.suppress(OSError):
-                        cache_path.unlink(missing_ok=True)
-                else:
-                    return cached_bytes
+        cached_bytes = read_verified_or_self_heal(
+            cache_path, lambda b: _verify(b, bundle_pin)
+        )
+        if cached_bytes is not None:
+            return cached_bytes
 
         # Cache miss: fetch from network.
         artifact_url = self._artifact_url(bundle_pin)

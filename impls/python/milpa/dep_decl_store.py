@@ -47,7 +47,7 @@ import re
 from pathlib import Path
 from typing import Protocol
 
-from milpa.atomic_cache import atomic_write_bytes
+from milpa.atomic_cache import atomic_write_bytes, read_verified_or_self_heal
 from milpa.dep_decl import dep_decl_hash
 from milpa.errors import (
     TNG_DEPDECL_FETCH_FAILED,
@@ -275,28 +275,17 @@ class HttpDepDeclStore:
             )
 
         # Cache-first (immutable: a hit is always valid; no staleness check).
+        # Self-heal on a locally-corrupt cache entry (CR16 — shared with
+        # HttpEntryBundleStore via atomic_cache.read_verified_or_self_heal): a
+        # mismatch on FRESHLY FETCHED bytes below (the server genuinely
+        # served the wrong content) stays a hard error — that path calls
+        # ``_verify`` directly and never reaches the self-heal primitive.
         cache_path = self._cache_path(hex_digest)
-        artifact_bytes: bytes | None = None
-        if cache_path.is_file():
-            try:
-                artifact_bytes = cache_path.read_bytes()
-            except OSError:
-                artifact_bytes = None  # corrupted cache: fall through to re-fetch
-            if artifact_bytes is not None:
-                try:
-                    _verify(artifact_bytes, dep_decl_hash_str)
-                except MilpaError:
-                    # Locally-corrupt cache entry (e.g. a truncated write left
-                    # behind by the pre-unique-temp-name concurrency race, or
-                    # plain disk corruption) — self-heal by discarding it and
-                    # falling through to re-fetch, rather than a permanent
-                    # hard failure. A mismatch on FRESHLY FETCHED bytes below
-                    # (the server genuinely served the wrong content) stays a
-                    # hard error — that path never reaches this except clause.
-                    with contextlib.suppress(OSError):
-                        cache_path.unlink(missing_ok=True)
-                else:
-                    return artifact_bytes
+        artifact_bytes = read_verified_or_self_heal(
+            cache_path, lambda b: _verify(b, dep_decl_hash_str)
+        )
+        if artifact_bytes is not None:
+            return artifact_bytes
 
         # Cache miss: fetch from network.
         artifact_url = self._artifact_url(hex_digest)
