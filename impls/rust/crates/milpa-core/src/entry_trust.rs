@@ -125,13 +125,22 @@ impl EntryVerificationResult {
         }
     }
 
-    /// Parse from the wire-format string used by the conformance mock seam
-    /// (`MILPA_ENTRY_TRUST_MOCK_MAP` / `MILPA_ENTRY_TRUST_MOCK_DEFAULT`).
-    pub fn from_value(s: &str) -> Option<Self> {
+    /// Parse from the wire-format string used by the conformance mock-VERIFIER
+    /// seam (`MILPA_ENTRY_TRUST_MOCK_MAP` / `MILPA_ENTRY_TRUST_MOCK_DEFAULT`).
+    ///
+    /// Total over the 6-value VERIFIER domain only — the same set
+    /// [`EntryBundleVerifier::verify`] is documented to return. `Unattested`
+    /// and `BundleMissing` are deliberately NOT accepted here: those are
+    /// gate-level states (attestation-record absence / bundle-pin absence)
+    /// that `evaluate_entry_attestation` decides BEFORE ever calling the
+    /// verifier — a mock verifier scripting them would assert something no
+    /// real verifier can ever produce. If a caller ever needs to parse the
+    /// full 8-value gate-result domain from a wire string, that is a
+    /// DIFFERENT total function over a DIFFERENT closed set — do not widen
+    /// this one to cover it (single-source-of-truth-per-domain).
+    pub fn from_verifier_value(s: &str) -> Option<Self> {
         match s {
             "trusted" => Some(Self::Trusted),
-            "unattested" => Some(Self::Unattested),
-            "bundle-missing" => Some(Self::BundleMissing),
             "bundle-malformed" => Some(Self::BundleMalformed),
             "digest-mismatch" => Some(Self::DigestMismatch),
             "subject-mismatch" => Some(Self::SubjectMismatch),

@@ -195,6 +195,85 @@ class TestBuildEntryTrust:
         other_subj = build_entry_subject("ns1", "other", "1.0.0", "dag-sha256:" + "a" * 64)
         assert config.verifier.verify(other_subj, b"", config.trust_bundle, "signer") is Trusted
 
+    def test_mock_default_unrecognized_value_fails_loud(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unrecognized MILPA_ENTRY_TRUST_MOCK_DEFAULT must never silently
+        fall back to Trusted — a trust seam fails loud, even in test (mirrors
+        the sibling MILPA_ENTRY_TRUST_MOCK_MAP bad-value path)."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        _write_project(project_dir, _MINIMAL_MILPA_KDL + 'entry-trust "strict"\n')
+        idx_url = _write_local_index(tmp_path)
+        monkeypatch.setenv("MILPA_INDEX_URL", idx_url)
+        monkeypatch.setenv("MILPA_ENTRY_TRUST_MOCK_DEFAULT", "bogus-value")
+
+        from milpa.cli import _build_entry_trust
+        env = _make_minimal_env()
+        with pytest.raises(MilpaError) as exc_info:
+            _build_entry_trust(env, project_dir)
+        assert exc_info.value.slug == MILPA_INTERNAL
+
+    def test_mock_default_gate_only_value_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``unattested`` / ``bundle-missing`` are GATE-level states the
+        verifier itself is documented to never produce (EntryBundleVerifier.verify
+        docstring) — the mock-VERIFIER seam must reject them too, not accept
+        the full 8-value gate domain."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        _write_project(project_dir, _MINIMAL_MILPA_KDL + 'entry-trust "strict"\n')
+        idx_url = _write_local_index(tmp_path)
+        monkeypatch.setenv("MILPA_INDEX_URL", idx_url)
+        monkeypatch.setenv("MILPA_ENTRY_TRUST_MOCK_DEFAULT", "unattested")
+
+        from milpa.cli import _build_entry_trust
+        env = _make_minimal_env()
+        with pytest.raises(MilpaError) as exc_info:
+            _build_entry_trust(env, project_dir)
+        assert exc_info.value.slug == MILPA_INTERNAL
+
+    def test_mock_default_recognized_verifier_value_still_works(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        _write_project(project_dir, _MINIMAL_MILPA_KDL + 'entry-trust "strict"\n')
+        idx_url = _write_local_index(tmp_path)
+        monkeypatch.setenv("MILPA_INDEX_URL", idx_url)
+        monkeypatch.setenv("MILPA_ENTRY_TRUST_MOCK_DEFAULT", "signature-invalid")
+
+        from milpa.cli import _build_entry_trust
+        from milpa.entry_trust import SignatureInvalid, build_entry_subject
+
+        env = _make_minimal_env()
+        config = _build_entry_trust(env, project_dir)
+        assert config is not None
+        subj = build_entry_subject("ns1", "bar", "1.0.0", "dag-sha256:" + "a" * 64)
+        result = config.verifier.verify(subj, b"", config.trust_bundle, "signer")
+        assert result is SignatureInvalid
+
+    def test_mock_map_gate_only_value_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same tightened domain applies to per-subject MOCK_MAP entries."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        _write_project(project_dir, _MINIMAL_MILPA_KDL + 'entry-trust "strict"\n')
+        idx_url = _write_local_index(tmp_path)
+        monkeypatch.setenv("MILPA_INDEX_URL", idx_url)
+        monkeypatch.setenv(
+            "MILPA_ENTRY_TRUST_MOCK_MAP",
+            '{"pkg:tianguis/ns1/bar@1.0.0": "bundle-missing"}',
+        )
+
+        from milpa.cli import _build_entry_trust
+        env = _make_minimal_env()
+        with pytest.raises(MilpaError) as exc_info:
+            _build_entry_trust(env, project_dir)
+        assert exc_info.value.slug == MILPA_INTERNAL
+
     def test_expected_signer_reuses_index_trust_resolution(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

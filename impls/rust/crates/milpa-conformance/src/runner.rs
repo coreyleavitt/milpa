@@ -546,7 +546,7 @@ impl Target for MilpaTarget {
                             &fx.dir,
                             Some(ws_doc.entry_trust_policy.clone()),
                             ws_doc.entry_trust_policy_explicit,
-                        );
+                        )?;
                         let store = milpa_core::CaStore::new(&scratch.cas_root);
                         return match milpa_core::resolve_workspace_with_features(
                             &loaded,
@@ -612,7 +612,7 @@ impl Target for MilpaTarget {
                     &fx.dir,
                     Some(manifest.entry_trust_policy.clone()),
                     manifest.entry_trust_policy_explicit,
-                );
+                )?;
 
                 let store = milpa_core::CaStore::new(&scratch.cas_root);
                 match milpa_core::resolve_with_features(
@@ -2261,7 +2261,7 @@ fn fixture_entry_trust_config(
     fixture_dir: &Path,
     manifest_policy: Option<milpa_core::TrustPolicy>,
     manifest_explicit: bool,
-) -> Option<milpa_core::EntryTrustConfig> {
+) -> Result<Option<milpa_core::EntryTrustConfig>, String> {
     use milpa_core::entry_trust::{EntryVerificationResult, MockEntryVerifier};
     use milpa_core::index_trust::{TrustBundle, DEFAULT_INDEX_SIGNER};
     use milpa_core::{effective_trust_policy, EntryTrustConfig, FileEntryBundleStore, TrustPolicy};
@@ -2279,32 +2279,54 @@ fn fixture_entry_trust_config(
     });
 
     if env_policy.is_none() && !manifest_explicit {
-        return None;
+        return Ok(None);
     }
 
     let base_policy = manifest_policy.unwrap_or(TrustPolicy::Warn);
     let policy = effective_trust_policy(&base_policy, false, env_policy.as_ref());
 
-    let default_result = env
+    // Test seam must never fail-open silently: an unrecognized DEFAULT value is a
+    // fixture-authoring error, not a silent Trusted fallback (mirrors the CLI's
+    // build_entry_trust_gate). Absent/empty still means the documented default.
+    let default_raw = env
         .get("MILPA_ENTRY_TRUST_MOCK_DEFAULT")
-        .and_then(|s| EntryVerificationResult::from_value(s.trim()))
-        .unwrap_or(EntryVerificationResult::Trusted);
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let default_result = match default_raw {
+        None => EntryVerificationResult::Trusted,
+        Some(raw) => EntryVerificationResult::from_verifier_value(&raw).ok_or_else(|| {
+            format!(
+                "MILPA_ENTRY_TRUST_MOCK_DEFAULT={raw:?} is not a valid result wire string \
+                 (expected one of: trusted, bundle-malformed, digest-mismatch, \
+                 subject-mismatch, signature-invalid, signer-mismatch). Test seam must \
+                 never fail-open silently."
+            )
+        })?,
+    };
 
     let mut by_subject: std::collections::HashMap<String, EntryVerificationResult> =
         std::collections::HashMap::new();
     if let Some(raw) = env.get("MILPA_ENTRY_TRUST_MOCK_MAP") {
         let raw = raw.trim();
         if !raw.is_empty() {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
-                if let Some(obj) = parsed.as_object() {
-                    for (k, v) in obj {
-                        if let Some(vs) = v.as_str() {
-                            if let Some(r) = EntryVerificationResult::from_value(vs) {
-                                by_subject.insert(k.clone(), r);
-                            }
-                        }
-                    }
-                }
+            let parsed: serde_json::Value = serde_json::from_str(raw)
+                .map_err(|e| format!("MILPA_ENTRY_TRUST_MOCK_MAP is not valid JSON: {e}"))?;
+            let obj = parsed
+                .as_object()
+                .ok_or_else(|| "MILPA_ENTRY_TRUST_MOCK_MAP must be a JSON object".to_string())?;
+            for (k, v) in obj {
+                let vs = v
+                    .as_str()
+                    .ok_or_else(|| format!("MILPA_ENTRY_TRUST_MOCK_MAP entry {k:?} must be a string value"))?;
+                let r = EntryVerificationResult::from_verifier_value(vs).ok_or_else(|| {
+                    format!(
+                        "MILPA_ENTRY_TRUST_MOCK_MAP entry {k:?}={vs:?} is not a valid result \
+                         wire string (expected one of: trusted, bundle-malformed, \
+                         digest-mismatch, subject-mismatch, signature-invalid, \
+                         signer-mismatch). Test seam must never fail-open silently."
+                    )
+                })?;
+                by_subject.insert(k.clone(), r);
             }
         }
     }
@@ -2322,13 +2344,13 @@ fn fixture_entry_trust_config(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_INDEX_SIGNER.to_string());
 
-    Some(EntryTrustConfig {
+    Ok(Some(EntryTrustConfig {
         policy,
         trust_bundle: TrustBundle::test(),
         expected_vendor_signer: expected_signer,
         verifier: Box::new(MockEntryVerifier::new(default_result, by_subject)),
         bundle_store,
-    })
+    }))
 }
 
 /// §2.8.1: resolve the fixture's project root. When a `project-dir` control file
@@ -3378,5 +3400,62 @@ mod tests {
             }
             other => panic!("expected Outputs, got {other:?}"),
         }
+    }
+
+    // CR6: fixture_entry_trust_config (the in-process adapter's mirror of the
+    // CLI's build_entry_trust_gate) must never fail-open on an unrecognized
+    // MILPA_ENTRY_TRUST_MOCK_DEFAULT, and must reject the two gate-only wire
+    // strings (`unattested`, `bundle-missing`) the verifier itself is
+    // documented to never produce.
+    #[test]
+    fn fixture_entry_trust_config_mock_default_unrecognized_value_fails_loud() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("env"),
+            "MILPA_ENTRY_TRUST=strict\nMILPA_ENTRY_TRUST_MOCK_DEFAULT=bogus-value\n",
+        )
+        .unwrap();
+        let result = fixture_entry_trust_config(tmp.path(), None, false);
+        assert!(result.is_err(), "unrecognized MOCK_DEFAULT must error, not fail-open");
+    }
+
+    #[test]
+    fn fixture_entry_trust_config_mock_default_gate_only_value_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("env"),
+            "MILPA_ENTRY_TRUST=strict\nMILPA_ENTRY_TRUST_MOCK_DEFAULT=unattested\n",
+        )
+        .unwrap();
+        let result = fixture_entry_trust_config(tmp.path(), None, false);
+        assert!(result.is_err(), "gate-only value must be rejected by the mock-verifier seam");
+    }
+
+    #[test]
+    fn fixture_entry_trust_config_mock_default_recognized_value_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("env"),
+            "MILPA_ENTRY_TRUST=strict\nMILPA_ENTRY_TRUST_MOCK_DEFAULT=signature-invalid\n",
+        )
+        .unwrap();
+        let result = fixture_entry_trust_config(tmp.path(), None, false);
+        match result {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected an active gate (Some), got None"),
+            Err(e) => panic!("recognized verifier-domain value must build the gate, got error: {e}"),
+        }
+    }
+
+    #[test]
+    fn fixture_entry_trust_config_mock_map_gate_only_value_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("env"),
+            "MILPA_ENTRY_TRUST=strict\nMILPA_ENTRY_TRUST_MOCK_MAP={\"pkg:tianguis/ns1/bar@1.0.0\": \"bundle-missing\"}\n",
+        )
+        .unwrap();
+        let result = fixture_entry_trust_config(tmp.path(), None, false);
+        assert!(result.is_err(), "gate-only value in MOCK_MAP must be rejected");
     }
 }

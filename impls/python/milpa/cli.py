@@ -920,7 +920,17 @@ def _build_entry_trust(
                 "https). These variables must not be set in production or with "
                 "non-file:// index URLs.",
             )
-        default_result = _MOCK_MAP.get(mock_default_raw, Trusted) if mock_default_raw else Trusted
+        if mock_default_raw:
+            if mock_default_raw not in _MOCK_MAP:
+                raise MilpaError(
+                    MILPA_INTERNAL,
+                    f"MILPA_ENTRY_TRUST_MOCK_DEFAULT={mock_default_raw!r} is not a valid "
+                    f"result wire string (expected one of: {', '.join(_MOCK_MAP)}). "
+                    "Test seam must never fail-open silently.",
+                )
+            default_result = _MOCK_MAP[mock_default_raw]
+        else:
+            default_result = Trusted
         by_subject: dict[str, object] = {}
         if mock_map_raw:
             try:

@@ -419,14 +419,32 @@ def _fixture_entry_trust_config(fixture_dir: Path, doc: object) -> "object | Non
         "signature-invalid": SignatureInvalid,
         "signer-mismatch": SignerMismatch,
     }
-    mock_default_raw = env_vars.get("MILPA_ENTRY_TRUST_MOCK_DEFAULT", "trusted").strip()
-    default_result = _wire_map.get(mock_default_raw, Trusted)
+    # Test seam must never fail-open silently: an unrecognized DEFAULT/MAP value
+    # is a fixture-authoring error, not a silent Trusted fallback (mirrors
+    # milpa.cli._build_entry_trust and the Rust runner's fixture_entry_trust_config).
+    mock_default_raw = env_vars.get("MILPA_ENTRY_TRUST_MOCK_DEFAULT", "").strip()
+    if mock_default_raw:
+        if mock_default_raw not in _wire_map:
+            raise ValueError(
+                f"MILPA_ENTRY_TRUST_MOCK_DEFAULT={mock_default_raw!r} is not a valid "
+                f"result wire string (expected one of: {', '.join(_wire_map)}). "
+                "Test seam must never fail-open silently."
+            )
+        default_result = _wire_map[mock_default_raw]
+    else:
+        default_result = Trusted
 
     by_subject: dict[str, object] = {}
     mock_map_raw = env_vars.get("MILPA_ENTRY_TRUST_MOCK_MAP", "").strip()
     if mock_map_raw:
         raw_map = json.loads(mock_map_raw)
         for k, v in raw_map.items():
+            if v not in _wire_map:
+                raise ValueError(
+                    f"MILPA_ENTRY_TRUST_MOCK_MAP entry {k!r}={v!r} is not a valid "
+                    f"result wire string (expected one of: {', '.join(_wire_map)}). "
+                    "Test seam must never fail-open silently."
+                )
             by_subject[k] = _wire_map[v]
 
     bundle_dir = fixture_dir / "entry-bundles"
@@ -3210,6 +3228,44 @@ class TestConformanceAdapterMachinery:
         env_file.write_text("MILPA_CLI_FEATURES=extras\n", encoding="utf-8")
         profile = _fixture_profile(tmp_path)
         assert profile is None
+
+    def test_fixture_entry_trust_mock_default_unrecognized_value_fails_loud(
+        self, tmp_path: Path
+    ) -> None:
+        """Same fail-loud discipline as the CLI's _build_entry_trust: an
+        unrecognized MILPA_ENTRY_TRUST_MOCK_DEFAULT in a fixture's env file
+        must never silently collapse to Trusted."""
+        (tmp_path / "env").write_text(
+            "MILPA_ENTRY_TRUST=strict\nMILPA_ENTRY_TRUST_MOCK_DEFAULT=bogus-value\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError):
+            _fixture_entry_trust_config(tmp_path, None)
+
+    def test_fixture_entry_trust_mock_default_gate_only_value_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        """``unattested``/``bundle-missing`` are gate-level states the verifier
+        never produces — the mock-VERIFIER seam must reject them too."""
+        (tmp_path / "env").write_text(
+            "MILPA_ENTRY_TRUST=strict\nMILPA_ENTRY_TRUST_MOCK_DEFAULT=unattested\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError):
+            _fixture_entry_trust_config(tmp_path, None)
+
+    def test_fixture_entry_trust_mock_default_recognized_value_works(
+        self, tmp_path: Path
+    ) -> None:
+        from milpa.entry_trust import SignatureInvalid
+
+        (tmp_path / "env").write_text(
+            "MILPA_ENTRY_TRUST=strict\nMILPA_ENTRY_TRUST_MOCK_DEFAULT=signature-invalid\n",
+            encoding="utf-8",
+        )
+        config = _fixture_entry_trust_config(tmp_path, None)
+        assert config is not None
+        assert config.verifier._default is SignatureInvalid  # type: ignore[attr-defined]
 
     def test_cli_only_fixtures_detected(self) -> None:
         """CLI-only verb fixtures (and CLI discovery-guard fixtures) are identified.

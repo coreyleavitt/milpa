@@ -2771,10 +2771,20 @@ fn build_entry_trust_gate(
                     .to_string(),
             )));
         }
-        let default_result = mock_default_raw
-            .as_deref()
-            .and_then(EntryVerificationResult::from_value)
-            .unwrap_or(EntryVerificationResult::Trusted);
+        let default_result = match mock_default_raw.as_deref() {
+            None => EntryVerificationResult::Trusted,
+            Some(raw) => EntryVerificationResult::from_verifier_value(raw).ok_or_else(|| {
+                MilpaError::Core(CoreError::Tianguis(
+                    "MILPA-INTERNAL",
+                    format!(
+                        "MILPA_ENTRY_TRUST_MOCK_DEFAULT={raw:?} is not a valid \
+                         result wire string (expected one of: trusted, bundle-malformed, \
+                         digest-mismatch, subject-mismatch, signature-invalid, \
+                         signer-mismatch). Test seam must never fail-open silently."
+                    ),
+                ))
+            })?,
+        };
         let mut by_subject: std::collections::HashMap<String, EntryVerificationResult> =
             std::collections::HashMap::new();
         if let Some(raw) = &mock_map_raw {
@@ -2797,12 +2807,14 @@ fn build_entry_trust_gate(
                         format!("MILPA_ENTRY_TRUST_MOCK_MAP entry {k:?} must be a string value"),
                     ))
                 })?;
-                let result = EntryVerificationResult::from_value(vs).ok_or_else(|| {
+                let result = EntryVerificationResult::from_verifier_value(vs).ok_or_else(|| {
                     MilpaError::Core(CoreError::Tianguis(
                         "MILPA-INTERNAL",
                         format!(
                             "MILPA_ENTRY_TRUST_MOCK_MAP entry {k:?}={vs:?} is not a valid \
-                             result wire string. Test seam must never fail-open silently."
+                             result wire string (expected one of: trusted, bundle-malformed, \
+                             digest-mismatch, subject-mismatch, signature-invalid, \
+                             signer-mismatch). Test seam must never fail-open silently."
                         ),
                     ))
                 })?;
@@ -5369,6 +5381,79 @@ mod tests {
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
         assert!(result.is_err(), "invalid mock result must error");
         assert_eq!(result.unwrap_err().code(), "MILPA-INTERNAL");
+    }
+
+    #[test]
+    fn build_entry_trust_gate_mock_default_unrecognized_value_fails_loud() {
+        // CR6 fix: an unrecognized MILPA_ENTRY_TRUST_MOCK_DEFAULT must never
+        // silently collapse to Trusted — mirrors the sibling MOCK_MAP bad-value
+        // path, and the index-trust MOCK_VERIFIER precedent above.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///some/index.kdl") };
+        unsafe { std::env::set_var("MILPA_ENTRY_TRUST_MOCK_DEFAULT", "bogus-value") };
+        unsafe { std::env::remove_var("MILPA_ENTRY_TRUST_MOCK_MAP") };
+        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Strict, None, None, false, false);
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+        unsafe { std::env::remove_var("MILPA_ENTRY_TRUST_MOCK_DEFAULT") };
+        match result {
+            Err(e) => assert_eq!(e.code(), "MILPA-INTERNAL"),
+            Ok(_) => panic!("unrecognized MOCK_DEFAULT must error, not fail-open"),
+        }
+    }
+
+    #[test]
+    fn build_entry_trust_gate_mock_default_gate_only_value_rejected() {
+        // `unattested`/`bundle-missing` are gate-level states the verifier
+        // itself is documented to never produce — the mock-VERIFIER seam must
+        // reject them too, not silently accept the full 8-value gate domain.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///some/index.kdl") };
+        unsafe { std::env::set_var("MILPA_ENTRY_TRUST_MOCK_DEFAULT", "unattested") };
+        unsafe { std::env::remove_var("MILPA_ENTRY_TRUST_MOCK_MAP") };
+        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Strict, None, None, false, false);
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+        unsafe { std::env::remove_var("MILPA_ENTRY_TRUST_MOCK_DEFAULT") };
+        match result {
+            Err(e) => assert_eq!(e.code(), "MILPA-INTERNAL"),
+            Ok(_) => panic!("gate-only value must be rejected by the mock-verifier seam"),
+        }
+    }
+
+    #[test]
+    fn build_entry_trust_gate_mock_default_recognized_verifier_value_works() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///some/index.kdl") };
+        unsafe { std::env::set_var("MILPA_ENTRY_TRUST_MOCK_DEFAULT", "signature-invalid") };
+        unsafe { std::env::remove_var("MILPA_ENTRY_TRUST_MOCK_MAP") };
+        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Strict, None, None, false, false);
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+        unsafe { std::env::remove_var("MILPA_ENTRY_TRUST_MOCK_DEFAULT") };
+        match result {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected an active gate (Some), got None"),
+            Err(e) => panic!("recognized verifier-domain value must build the gate, got error: {}", e.code()),
+        }
+    }
+
+    #[test]
+    fn build_entry_trust_gate_mock_map_gate_only_value_rejected() {
+        // Same tightened domain applies to per-subject MOCK_MAP entries.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///some/index.kdl") };
+        unsafe { std::env::remove_var("MILPA_ENTRY_TRUST_MOCK_DEFAULT") };
+        unsafe {
+            std::env::set_var(
+                "MILPA_ENTRY_TRUST_MOCK_MAP",
+                r#"{"pkg:tianguis/ns1/bar@1.0.0": "bundle-missing"}"#,
+            )
+        };
+        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Strict, None, None, false, false);
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+        unsafe { std::env::remove_var("MILPA_ENTRY_TRUST_MOCK_MAP") };
+        match result {
+            Err(e) => assert_eq!(e.code(), "MILPA-INTERNAL"),
+            Ok(_) => panic!("gate-only value in MOCK_MAP must be rejected"),
+        }
     }
 
     // -----------------------------------------------------------------------
