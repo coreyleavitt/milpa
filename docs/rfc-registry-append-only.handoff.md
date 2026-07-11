@@ -1,11 +1,15 @@
 # rfc-registry-append-only — handoff
 
-- **Stage:** architect round 2 COMPLETE (2026-07-09) — 4-lens team (depth /
-  breadth / design / feasibility) briefed to pressure-test the round-1
-  additions; ~30 findings consolidated to 23 ledger entries, all resolved
-  under the bar and applied; **no open forks**. Round 1 was same day
-  (ledger below); Stage 1 (draft + slicing) also 2026-07-09.
-- **Resume:** `/loop` TDD GRIND COMPLETE (2026-07-10). DONE+committed:
+- **Stage:** CODE REVIEW (rfc-flow stage 4) **COMPLETE** (2026-07-10) —
+  3 rounds, terminated at the floor (0 Critical/High/Medium). 10 findings
+  fixed across 8 commits (`b4c4f8f`→`f2480f1`), each gated on full pytest
+  + `dev-rust test --workspace`. CR7 deferred → #189; CR8–CR14, CR18 left
+  as Lows per mandate. **All committed; NOTHING PUSHED** (awaiting Corey).
+- **Resume:** RFC #185 is fully implemented + reviewed. Next: Corey's
+  call — push the branch, or address the residual Lows (CR8–CR14/CR18) in
+  a follow-up. P3b/P4 of Part 2 still blocked on tianguis delivery.
+  (Architect rounds 1+2 COMPLETE 2026-07-09.)
+- **Grind history:** `/loop` TDD GRIND COMPLETE (2026-07-10). DONE+committed:
   Part-2 P1 (3b920ac), P2 (d4404ad), P3a (baad9a4); A1 (fb6e707),
   A2a (4f607a5), A2b (a53afd7), A2c (cbe1682), A2d (bdc419e),
   A2e (3911cdd), A3 (22e07db), A4a (76dcc63), A4b (224ca14),
@@ -245,6 +249,35 @@ verified index is a valid *successor* of the previous one. Freshness
   `[milpa] warning:`; (c) accept split into `status`+`accept` family;
   (d) `Baseline[T]` generic dropped to monomorphic.
 
+## Code-review ledger — stage 4, round 1 (2026-07-10)
+
+Scope: full grind diff `3b920ac~1..b3211bf` (spec + both impls + conformance).
+6 reviewers (Python-correctness, Rust-correctness, spec-fidelity/cross-impl,
+security, design, coverage) → 5 adversarial verifiers on all C/H + subtle
+digest-integrity mediums. Status legend: open / fixed / deferred / wontfix / refuted.
+
+| id | sev | finding | status | proof / reason |
+|----|-----|---------|--------|----------------|
+| CR1 | High | Rust `rekor` (and `provenances`) frozen/multiset dominance compares the `\x1f`/`\x01`-**joined** string, not the structured value → a boundary-shifted mutation passes Rust's ratchet while Python (structured compare) flags it. Cross-impl divergence + tamper-detection bypass for Rust users under strict. `\u{1f}` escapes reach the fields through both KDL parsers (verified). `FieldValue::Attestation` next to it shows the correct pattern. | fixed | CONFIRMED (verifier a37205b, end-to-end). Bounded: attacker must shape baseline bytes in advance (TOFU/sticky-advance). Fix: `FieldValue::Rekor(RekorRef)` + structured provenance-list variant in Rust; keep `raw` digest-only. |
+| CR2 | Med | Canonical-digest **delimiter injection**: `namespace`/`version`/provenance `url`/`ref`/`registry`/`repository` are not charset-validated, so KDL-escaped `\t`/`\n`/`\x1f` collide distinct violation sets to one sha256 and forge lines in `index status`/`accept` output. Spec §3.3/§3.5.3 gap present identically in both impls. | fixed | CONFIRMED (verifier a41011, real seam exploit). Bounded to warn-mode habituation/report fidelity; strict still hard-fails. Root-cause fix (shared with CR1): reject control/delimiter bytes in registry string fields at parse boundary + spec §3.3/§3.5.3. |
+| CR3 | Med | **Lockstep-group digest masking**: the `dep_decl`/`dep_decl_schema_version` group reports `candidate_value` as only `dep_decl`'s text, so a second mutation that changes only `dep_decl_schema_version` yields a byte-identical digest → mislabeled "recurring" not "new", defeating §3.5.3's stated purpose. Both impls. | fixed | CONFIRMED (verifier a41011, digest `ec345fa3` reproduced twice). Warn-mode only. Fix: fold schema-version into the group's reported `candidate_value` in both impls + sharpen §3.5.3. |
+| CR4 | Med | `HttpEntryBundleStore` uses a **fixed** `.bundle.tmp` sibling name — the exact race `index_cache._unique_temp_path` was added in this same diff to fix. Both impls (Rust `entry_bundle_store.rs:198`); also pre-existing in `dep_decl_store.py`. A crash-mid-race leaves a torn cache file that later reads as a hard, un-self-healing `TNG-ENTRY-BUNDLE-PIN-MISMATCH` (permanent poison until manual delete). | **fixed** `6411da7` | Shared `atomic_cache` helper (index_cache + bundle + dep-decl stores unified onto it); read-path self-heal (discard locally-corrupt cache, re-fetch; server-mismatch stays hard). Tests both impls. |
+| CR5 | Med | `milpa index status`/`accept` **manifest-error divergence**: Python swallows a syntactically-broken `milpa.kdl` (broad `except (OSError, MilpaError)` → warn) and prints a normal status block; Rust hard-fails with the `MAN-*` slug. Spec (§5.12 soft-fail is scoped to *local trust state*, not manifest parse) backs **Rust**; Python is the bug. Pre-existing pattern shared across the trust axes (§5.3a). | **fixed** `723d260` | Narrowed all 3 Python trust-axis loaders to MAN-NO-MANIFEST-only via shared `_manifest_absent` predicate; broken-manifest hard-fail tests both impls. |
+| CR6 | Med | Mock verifier env seam: `MILPA_ENTRY_TRUST_MOCK_DEFAULT` **fails open to `Trusted`** on an unrecognized value in **both** impls — directly contradicting the adjacent "Test seam must never fail-open silently" guard on `MOCK_MAP`. Plus a 6-vs-8 wire-string coverage gap (Python's map omits `unattested`/`bundle-missing`; Rust accepts all 8, letting the verifier emit states its own trait forbids). | **fixed** `2221f05` | Fail-loud on unknown MOCK_DEFAULT in 4 sites (incl. both conformance adapters); Rust tightened to 6-value verifier domain (from_verifier_value). file:// gate intact. |
+| CR7 | Med | Rust CLI does **not reject unknown flags/args** for `index accept`/`status` (`milpa index accept --refresh` silently runs the mutating flow); spec §3 requires exit 2. | deferred | CONFIRMED (verifier a7a0d04); re-scoped pre-existing **CLI-wide** Rust looseness (all `rest`-slice verbs). Filed **#189** — out of RFC scope; partial fix would make the CLI inconsistent. |
+| CR8 | Low-Med | `evaluate_gate` docstring claims "performs no I/O" but prints to stderr itself; `GateDecision.warn_message` (designed for the caller to print after writes) is **dead** in production (only the Rust conformance runner reads it). Both impls. | open | CONFIRMED (verifier a5b54f9). No spec-backed ordering requirement; narrow observability window (warn printed before a later write could fail). Fix: either move the print to the documented post-write point via `warn_message`, or drop the field + correct the docstring. |
+| CR9 | Low-Med | `WS-ENTRY-TRUST-ON-MEMBER` has **zero unit tests** in either impl (only conformance fixture-376); sibling `WS-INDEX-HISTORY-ON-MEMBER` has dedicated coverage. Stale "mirror the entry-trust tests above" comment in `workspace_tests.rs` points at nonexistent tests. | open | Coverage gap (reviewer ad8b4cd). Fix: mirror `TestWorkspaceMemberIndexHistoryRejected` in `test_ws_security_parity.py` + `workspace_tests.rs`. |
+| CR10 | Low-Med | Non-scalar violation `candidate_value`/`baseline_value` rendering (provenance multiset, rekor/attestation) is never asserted against an independently-derived **string** — only opaque cross-impl digest equality (fixtures 386/408). Classic differential blind spot ([[testing_differential_blind_spot]]): a shared misrendering passes. | open | Coverage gap. Fix: pin the literal rendered strings in both unit suites. |
+| CR11 | Low | Coverage asymmetries: Rust CLI verb tests miss the corrupt-baseline `accept`/`status` branch, plain-`status` exit-1, and member-dir delegation (all present in Python); `TNG-INDEX-BASELINE-WRITE-FAILED` untested in Rust (Python's test is `skipif root`, silently skipped in-container); `unique_temp_path` has no Rust analog; yank exclusion untested at the `add`/`update` CLI layer. | open | Coverage gaps (reviewer ad8b4cd). Batchable. |
+| CR12 | Low | Design/hygiene cluster: `MilpaEnv.index_trust_config` confirmed-dead, touched-but-not-removed this diff; `entry_bundle_store` duplicates `dep_decl_store` line-for-line (P3a-declined extraction — ensure P3b/P4 actually does it); `build_entry_subject` reimplements the identity split instead of `identity.parse_identity` (silent empty digest on malformed input). | open | Design (reviewer afa3f3d). Root-cause per [[feedback_audit_for_duplication]]. |
+| CR13 | Low | Correctness/polish cluster: `frozen.py` `_reconstruct_from_locked` drops `LockAttestation.namespace` (benign today, latent for future subject-rebuild-from-graph); `yanked_excluded` diagnostic lists non-constraint-satisfying yanked versions (noisy); bundle-pin diagnostics fire even with no `attestation` node; Rust `ResolvedDep`/`LockedDep.attestation` doc comments claim `bundle_pin` dropped (P3a carries it through — comment is now false). | open | Correctness/doc (reviewers ac0292a/a403219). |
+| CR14 | Low | Spec-doc integrity: §3.4 says entry-trust is out-of-scope while §3.4.0 + errors.md fully specify it (contradiction); §3.5.1 Frozen table doesn't signal that *presence* routes to `TNG-INDEX-ROLLBACK` not `TNG-ENTRY-MUTATED`; §5.2 carries a stale "not yet enforced — lands at A5" note (A5 landed `b9a620e`); §3.2 doesn't mandate `published_at` raw-text capture that §3.5.3 relies on; entry-trust stages 0–7 have no single enumeration. `.baseline.meta established_at` empty-vs-absent self-heal diverges (Python regenerates `""`, Rust preserves) — advisory, output-only. | open | Spec/doc (reviewer a5bd648). Batch spec-text pass. |
+
+**Not a finding — tracked deferral:** Rust `SigstoreEntryVerifier` stages 5–7 unconditionally return `SignatureInvalid` (real crypto not wired) while Python calls real `sigstore-python`. This is the **P3b judgment call already awaiting your veto** (sigstore-rs lacks a verify-against-known-digest primitive). Live divergence only once tianguis serves real bundles. Coverage reviewer's "HIGH: real-crypto path has zero coverage" is the same deferral — not actionable pre-P3b.
+
+**Round-1 verdict:** 0 Critical, 1 High (CR1), 6 Medium, rest Low/doc. Nothing above High.
+Awaiting Corey's fix mandate before any change.
+
 ## Review ledger — round 2
 
 | id | sev | finding (lens) | status | resolution |
@@ -306,3 +339,11 @@ P3a honest tail; bundle size-cap note; `MILPA_ENTRY_BUNDLE_DIR`; OQ3(ii)
 amended (Part 2 owns the type, this RFC owns the order). Round 2 found no
 new Part-2 staleness (checked: `index-history`/`accept`/ratchet
 terminology consistent).
+
+**Round-2 verdict:** 1 High (CR15) + 2 Med (CR16/CR17) + 1 Low (CR19) fixed; CR18 left (Low, test-only seam).
+
+## Code-review ledger — stage 4, ROUND 3 (terminating, 2026-07-10)
+
+Re-review of round-2 fix diff `2221f05..HEAD` (CR15 + CR16/CR17/CR19). Two agents (security+completeness, correctness+design). **CLEAN — 0 Critical/High/Medium. Loop terminates at the floor.** Security independently re-derived the CR15 field enumeration from first principles and confirmed completeness; correctness confirmed the wrapper/primitive refactors preserved all invariants (regression suites green), no dead code, cross-impl symmetry intact.
+
+**Stage 4 (code review) COMPLETE.** Fixed this stage: CR1–CR6 (round 1) + CR15/CR16/CR17/CR19 (round 2) = 10 findings across 8 commits (`b4c4f8f`→`f2480f1`), each gated on full pytest + `dev-rust test --workspace`. Deferred: CR7 → #189 (CLI-wide arg validation). Left as Lows per mandate: CR8–CR14 (round-1 doc/coverage/polish), CR18 (from_verifier type-split — test-only seam). Every fix committed; nothing pushed.
