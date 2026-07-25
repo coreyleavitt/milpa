@@ -752,6 +752,12 @@ def make_oras_push() -> OrasPush:
                 "oras", "push", registry_ref,
                 "--artifact-type", artifact_type,
                 "--format", "json",
+                # oras rejects an absolute file path by default (it would
+                # embed the path as the layer's title annotation). The
+                # artifact is a milpa-owned temp file with an absolute path,
+                # so disable that check — the layer bytes + digest are
+                # unaffected.
+                "--disable-path-validation",
                 f"{artifact_path}:{layer_media_type}",
             ],
             capture_output=True,
