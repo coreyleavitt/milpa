@@ -490,10 +490,16 @@ present by default; there is no flag to enable it.
 > `lock`, `verify`, `clean`, `add`, `remove`, `update`) MUST produce
 > **no output on stdout** on a successful run.
 
-> NOTE: The reference implementation follows this routing strictly. All
-> `print(…, file=sys.stderr)` calls are diagnostics; the sole `print(…)`
-> without a `file=` argument is in `cmd_publish`'s dry-run confirmation
-> line, which is incidental to the out-of-scope `publish` verb.
+> NOTE: The reference implementation follows this routing strictly for the
+> verbs the NORMATIVE rules above govern. Within `cmd_publish` (§10,
+> out-of-scope for conformance but described here for accuracy): the sole
+> unguarded `print(…)` (no `file=` argument) is the `--dry-run` plan render,
+> which is JSON meant for inspection or `--output` piping — by design, not
+> incidentally. Every other `cmd_publish` path is diagnostic and goes to
+> stderr: the real-run one-line confirmation
+> (`published <name>@<version> -> <oci_ref>`, printed only when `--output`
+> is absent) uses `file=sys.stderr`, and a real (non-dry-run) publish with
+> `--output` given prints nothing to stdout at all.
 > `cmd_show` writes its dep-tree lines to stdout (the implicit default).
 
 ---
@@ -1904,9 +1910,9 @@ three fail independently and are remediated independently
 author-side packaging and registry-submission pipeline:
 
 ```
-milpa publish --name <pkg> --version <semver> --registry <oci-ref> \
-              --provider <ci> --repo-url <url> --signed-by <identity> \
-              [--dispatch-url <url>] [--oidc-token-env <var>] [--dry-run]
+milpa publish --version <semver> --target <registry>/<repository> \
+              [--name <pkg>] [--tag <tag>] [--output <path>] \
+              [--dry-run] [--allow-untagged]
 ```
 
 It depends on external services (OCI registry, cosign/Sigstore, tianguis
@@ -1914,6 +1920,142 @@ dispatch endpoint) and is not amenable to dir-tree-fixture conformance
 testing. Its exit semantics and env var usage (`ACTIONS_ID_TOKEN_REQUEST_TOKEN`,
 `ACTIONS_ID_TOKEN_REQUEST_URL`, and any per-CI OIDC token vars) are
 implementation-specific and not frozen by this spec.
+
+### 10.1  Behavior
+
+The reference implementation's `publish` is **registry-agnostic**: it knows
+nothing about tianguis, any specific registry's submission conventions, or
+any package index. It performs exactly four steps, each described here for
+context only (none of this is conformance-tested):
+
+1. **Resolve the source.** The publish source is the git repository's HEAD
+   commit tree (read via the git object store, *not* the working directory —
+   untracked/uncommitted files are excluded for free). Three guards run
+   before anything else:
+   - HEAD must resolve to a commit (otherwise `PUBLISH-NOT-GIT-REPO`).
+   - Unless `--allow-untagged` is given, a git tag named exactly `<version>`
+     or `v<version>` must point at HEAD (otherwise
+     `PUBLISH-VERSION-TAG-MISMATCH`) — `--allow-untagged` is the escape
+     hatch for publishing before the release tag exists.
+   - HEAD's tree must contain no submodule (gitlink) entries (otherwise
+     `PUBLISH-SUBMODULE-UNSUPPORTED` — milpa does not vendor submodule
+     contents into a published artifact).
+2. **Compute identity.** The resolved tree is folded into its content-hash
+   identity (the same `dag-sha256:<hex>` algorithm used elsewhere in this
+   spec's identity model) — computed once, before any network I/O. Every
+   enumerated entry's path (and, for a symlink entry, its decoded target) is
+   validated for containment and UTF-8 before the identity is computed:
+   an absolute path or a `..`-escaping path component (source or symlink
+   target) raises `PUBLISH-UNSAFE-PATH`, and a symlink target that is not
+   valid UTF-8 raises `PUBLISH-NON-UTF8-SYMLINK-TARGET`. Both checks run at
+   plan-build time, so `--dry-run` catches an unsafe/corrupted tree too, not
+   only a real push.
+3. **`--dry-run`:** builds the plan above and renders it as a JSON object
+   (package name, version, content hash, target descriptor, and cheap
+   enumeration stats — entry count, total byte size, top-level directory
+   names) to stdout, unconditionally. When `--output <path>` is also given,
+   the identical JSON is additionally written to `<path>`. No network
+   connection, no `oras`/`cosign` subprocess, and no `execute()` call happens
+   on this path by construction — `--dry-run` short-circuits before the
+   impure step, it is not a branch inside it.
+4. **Real run (no `--dry-run`):** packs the resolved tree into a
+   byte-deterministic `tar.gz` (normalized mtimes/uid/gid/mode), pushes it to
+   `<registry>/<repository>:<tag>` via `oras`, derives the immutable
+   digest-pinned reference (`<registry>/<repository>@sha256:<digest>`).
+   Before signing anything, it fetches the just-pushed manifest back and
+   verifies that its (single) layer digest equals a fresh local `sha256` of
+   the packed artifact bytes — a mismatch raises `PUBLISH-DIGEST-MISMATCH`
+   and `cosign` is never invoked; if the manifest cannot be fetched or is not
+   shaped as expected, `PUBLISH-MANIFEST-FETCH-FAILED` is raised instead.
+   Only once verified does it sign that digest-pinned reference keylessly via
+   `cosign` (ambient CI OIDC — Fulcio-issued certificate, Rekor transparency
+   log), and assemble a `PublishReceipt`-shaped result (§10.2). When
+   `--output <path>` is given, the result is written there as JSON and
+   nothing is printed to stdout; otherwise a single one-line confirmation
+   (`published <name>@<version> -> <oci_ref>`) is printed to **stderr**,
+   matching every other verb's summary-line convention.
+
+`--name` auto-derives from the manifest's `name` node when omitted; when
+given explicitly it overrides the manifest. `--version` and `--target` are
+always required (argparse-enforced — omitting either is an argument-parse
+error, not a `publish`-specific diagnostic). `--tag` defaults to `--version`
+when omitted.
+
+### 10.2  `--output` JSON schemas
+
+> NOTE (informative, not conformance-tested — mirrors the §2.5.1 field-list
+> style for a schema that IS a real cross-tool contract): `--output <path>`
+> writes one of two distinct JSON shapes depending on `--dry-run`, both of
+> which are genuine **cross-tool contracts** parsed by external submission
+> tooling (the tianguis composite action) — field names and meanings are
+> stable and MUST NOT be silently renamed or removed by the reference
+> implementation.
+
+**Real-run shape** (no `--dry-run`) — the reference implementation's
+`PublishOutputRecord`, six fields:
+
+- `name`, `version` — the caller-supplied (or manifest/tag-derived) package
+  identity.
+- `content_hash` — the `dag-sha256:<hex>` content identity of the published
+  source tree, computed in step 2 of §10.1. This is the value that
+  downstream attestation tooling (e.g. the tianguis composite action) binds
+  as the attestation subject.
+- `oci_ref` — the full, immutable OCI reference the artifact was pushed to:
+  `<registry>/<repository>@sha256:<digest>`. Always digest-pinned, never the
+  mutable `:<tag>` form used for the push itself.
+- `layer_digest` — the OCI content digest of the pushed manifest/layer,
+  `sha256:<64-hex>` — the same digest embedded in `oci_ref`.
+- `artifact_type` — the OCI artifact-type media type the artifact was pushed
+  as (§10.3).
+
+**Dry-run shape** (`--dry-run --output`) — the reference implementation's
+`PublishDryRunRecord`, deliberately a SEPARATE shape (no `oci_ref`/
+`layer_digest`, since nothing has been pushed yet — modeling them as absent/
+null would misleadingly read as "pushed to nothing" rather than "hasn't
+pushed"):
+
+- `name`, `version`, `content_hash` — same meaning as the real-run shape
+  (`content_hash` is still the plan's precomputed identity; no push has
+  happened).
+- `target` — the resolved push destination as an object: `registry`,
+  `repository`, `tag`, `artifact_type`, `layer_media_type`.
+- `entry_count`, `total_bytes`, `top_dirs` — the cheap enumeration-stats
+  guardrail described in step 3 of §10.1 (`top_dirs` is the sorted set of
+  each entry's first path component).
+
+The two shapes are distinguished by the presence/absence of `--dry-run`, not
+by a discriminant field in the JSON itself.
+
+### 10.3  Media types
+
+The reference implementation publishes every artifact under two
+milpa-owned, fixed OCI media types (there are no `--artifact-type` /
+`--layer-media-type` flags to override them in this slice):
+
+- **Artifact type:** `application/vnd.milpa.source.v1`
+- **Layer media type:** `application/vnd.milpa.source.v1.tar+gzip`
+
+### 10.4  Registry authentication
+
+`publish` runs no login flow of its own and is registry-agnostic: OCI
+registry authentication is the **caller's** responsibility, via whatever
+ambient credential configuration the `oras`/`docker` CLI toolchain already
+honors (e.g. `docker login`, an `oras`-compatible credential helper, or a CI
+job's registry-login step run before `milpa publish`). Signing similarly
+relies on ambient CI OIDC for `cosign`'s keyless flow — `publish` does not
+manage or accept key material.
+
+### 10.5  Rust reference impl
+
+The Rust reference implementation intentionally leaves `publish` in its
+not-implemented branch. This is conformant: §10's opening NORMATIVE
+paragraph does not require any implementation to implement `publish`.
+The NORMATIVE requirement immediately below — that an unimplemented verb
+MUST fail loudly rather than silently no-op — still applies to Rust's
+`publish` branch exactly as it would to any other unimplemented verb. An
+implementation earns "spec-conformant" by either implementing `publish`
+compatibly with this section, or by refusing it cleanly; a silent no-op is
+the one outcome this section forbids either way.
 
 > NORMATIVE: An implementation that does NOT implement `publish` MUST
 > NOT silently succeed when `milpa publish` is invoked — it MUST exit

@@ -150,6 +150,59 @@ _GIT_MODE_TO_BYTE: dict[str, int] = {
 }
 
 
+def parse_ls_tree_z(raw_data: bytes) -> list[tuple[str, str, str, str]]:
+    """Parse ``git ls-tree -r -z`` NUL-delimited stdout into ``(mode, type, sha,
+    path)`` records.
+
+    SSOT for ls-tree -z record parsing (R1-15 NORMATIVE: ``-z`` disables
+    C-quoting so exotic/non-ASCII filenames are preserved faithfully). Shared
+    by ``enumerate_git_entries`` (this module) and ``milpa.publishing``'s
+    submodule-refusal guard (``_refuse_submodules``) so there is exactly ONE
+    ls-tree -z parser in the codebase, not two independently-maintained
+    copies — the two callers still run their own ``git ls-tree`` subprocess
+    (a lightweight listing-only call for the early guard vs. the full
+    listing-plus-``cat-file`` enumeration), but parse the identical NUL-
+    delimited record format through this one function.
+
+    Args:
+        raw_data: The raw ``stdout`` bytes of a ``git ls-tree -r -z <commit>``
+            invocation.
+
+    Returns:
+        A list of ``(mode, obj_type, sha, entry_path)`` tuples, one per
+        tree entry, in ls-tree's own order.
+
+    Raises:
+        MilpaError(ID_NON_UTF8_RELPATH): a tree entry path is not valid UTF-8.
+    """
+    records: list[tuple[str, str, str, str]] = []
+    for raw_record in raw_data.split(b"\x00"):
+        if not raw_record:
+            continue  # skip empty trailing element
+        tab_idx = raw_record.index(b"\t")
+        meta = raw_record[:tab_idx].decode()
+        path_bytes = raw_record[tab_idx + 1:]
+        # NEW-C NORMATIVE: non-UTF-8 path bytes are always an error.
+        # Both Python and Rust reject identically — latin-1 fallback was removed
+        # because it silently produced different on-disk names from Rust's U+FFFD
+        # substitution, causing content_hash divergence with no error raised.
+        # Nim packages never have legitimate non-UTF-8 source filenames.
+        try:
+            entry_path = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise MilpaError(
+                ID_NON_UTF8_RELPATH,
+                f"git tree entry path is not valid UTF-8: {path_bytes!r}; "
+                f"non-UTF-8 source filenames are not supported in milpa (spec/identity.md §1.5)",
+                path=repr(path_bytes),
+            )
+
+        parts = meta.split()
+        mode, obj_type, sha = parts[0], parts[1], parts[2]
+        records.append((mode, obj_type, sha, entry_path))
+    return records
+
+
 def enumerate_git_entries(
     repo: Path,
     commit: str,
@@ -226,39 +279,12 @@ def enumerate_git_entries(
             commit=commit,
         )
 
-    # Parse ls-tree -z output: NUL-terminated records.
-    # Each record: b"<mode> <type> <sha>\t<path>" followed by NUL.
-    # Splitting on NUL and filtering empty trailing element.
+    # Parse ls-tree -z output: NUL-terminated records (SSOT: parse_ls_tree_z,
+    # shared with milpa.publishing's submodule-refusal guard).
     blobs: list[tuple[str, str, str, str]] = []   # (mode, type, sha, path)
     gitlinks: list[tuple[str, str, str, str]] = []
 
-    raw_data = ls_result.stdout
-    # Split on NUL; last element is empty (trailing NUL) — filter it.
-    records = raw_data.split(b"\x00")
-    for raw_record in records:
-        if not raw_record:
-            continue  # skip empty trailing element
-        tab_idx = raw_record.index(b"\t")
-        meta = raw_record[:tab_idx].decode()
-        path_bytes = raw_record[tab_idx + 1:]
-        # NEW-C NORMATIVE: non-UTF-8 path bytes are always an error.
-        # Both Python and Rust reject identically — latin-1 fallback was removed
-        # because it silently produced different on-disk names from Rust's U+FFFD
-        # substitution, causing content_hash divergence with no error raised.
-        # Nim packages never have legitimate non-UTF-8 source filenames.
-        try:
-            entry_path = path_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            raise MilpaError(
-                ID_NON_UTF8_RELPATH,
-                f"git tree entry path is not valid UTF-8: {path_bytes!r}; "
-                f"non-UTF-8 source filenames are not supported in milpa (spec/identity.md §1.5)",
-                path=repr(path_bytes),
-            )
-
-        parts = meta.split()
-        mode, obj_type, sha = parts[0], parts[1], parts[2]
-
+    for mode, obj_type, sha, entry_path in parse_ls_tree_z(ls_result.stdout):
         if mode == "160000":
             gitlinks.append((mode, obj_type, sha, entry_path))
         else:

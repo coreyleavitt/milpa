@@ -35,9 +35,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import os
 import shutil
+import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, TypeVar
 
@@ -457,6 +460,68 @@ def _make_parser() -> argparse.ArgumentParser:
     index_sub.add_parser(
         "accept",
         help="fetch, print the diff, and atomically accept the new trust baseline",
+    )
+
+    # publish — author-side packaging/push/sign (S4, spec/cli-contract.md §10:
+    # out-of-v1.0-conformance, impl-specific).
+    sp_publish = subparsers.add_parser(
+        "publish",
+        help="pack the current git HEAD's source tree, push to an OCI registry, and sign it",
+    )
+    sp_publish.add_argument(
+        "--version",
+        metavar="<semver>",
+        required=True,
+        help="the version being published; checked against a matching git tag on HEAD",
+    )
+    sp_publish.add_argument(
+        "--target",
+        metavar="<registry>/<repository>",
+        required=True,
+        help=(
+            "OCI push destination as one combined token, split on the FIRST '/' "
+            "(mirrors the shipped 'oci=<registry>/<repository>@<digest>' consumer "
+            "grammar) — e.g. ghcr.io/coreyleavitt/z3"
+        ),
+    )
+    sp_publish.add_argument(
+        "--name",
+        metavar="<name>",
+        default=None,
+        help="package name; auto-derived from the manifest's 'name' node if omitted",
+    )
+    sp_publish.add_argument(
+        "--tag",
+        metavar="<tag>",
+        default=None,
+        help="OCI tag to push under; defaults to --version if omitted",
+    )
+    sp_publish.add_argument(
+        "--output",
+        metavar="<path>",
+        default=None,
+        help=(
+            "write the publish result as JSON to <path> — the plan render under "
+            "--dry-run, or the PublishReceipt otherwise"
+        ),
+    )
+    sp_publish.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help=(
+            "build the plan and print it (content hash + enumeration stats) "
+            "without pushing or signing anything; touches no network"
+        ),
+    )
+    sp_publish.add_argument(
+        "--allow-untagged",
+        action="store_true",
+        default=False,
+        help=(
+            "skip the version<->HEAD git-tag binding guard "
+            "(PUBLISH-VERSION-TAG-MISMATCH escape hatch)"
+        ),
     )
 
     return parser
@@ -2844,6 +2909,238 @@ def cmd_index_accept(project_dir: Path, env: MilpaEnv) -> int:
 
 
 # ---------------------------------------------------------------------------
+# cmd_publish (S4) — author-side pack/push/sign CLI wiring
+#
+# spec/cli-contract.md §10: `publish` is impl-specific, out of v1.0
+# conformance. No conformance corpus fixture for this verb (by design — see
+# rfc-distribution-and-publishing.handoff.md).
+# ---------------------------------------------------------------------------
+
+#: milpa-owned OCI media types for a published source artifact (fixed for
+#: this slice — no --artifact-type / --layer-media-type flags; see the RFC
+#: handoff for the media-type registry this pins into).
+_PUBLISH_ARTIFACT_TYPE = "application/vnd.milpa.source.v1"
+_PUBLISH_LAYER_MEDIA_TYPE = "application/vnd.milpa.source.v1.tar+gzip"
+
+
+def _publish_enumeration_stats(entries: "list[MaterializedEntry]") -> dict:
+    """Cheap dry-run guardrail stats over the already-enumerated git tree.
+
+    PURE — no I/O (entries are already materialized in memory by the caller
+    via ``enumerate_git_entries``). ``top_dirs`` is the sorted set of each
+    entry's first path component, so a reviewer can sanity-check "does this
+    look like the right tree" before any bytes leave the machine.
+    """
+    total_bytes = sum(len(e.content) for e in entries)
+    top_dirs = sorted({e.relpath.split("/", 1)[0] for e in entries})
+    return {
+        "entry_count": len(entries),
+        "total_bytes": total_bytes,
+        "top_dirs": top_dirs,
+    }
+
+
+@dataclass(frozen=True)
+class PublishOutputRecord:
+    """M7-code: the typed shape of ``--output``'s REAL-RUN JSON.
+
+    This is a genuine cross-repo wire contract (the tianguis composite
+    action's submission tooling consumes it — mirrors ``PublishReceipt``'s
+    own cross-repo-contract status, spec/cli-contract.md §10.2). Built by
+    exactly ONE call site (``cmd_publish``'s real-run branch) instead of an
+    ad hoc dict literal, so the field set can't silently drift — see
+    ``tests/test_publish_subcommand.py``'s exact-field-set guardrail test.
+
+    Deliberately a SEPARATE type from ``PublishDryRunRecord`` rather than one
+    dataclass with ``Optional`` ``oci_ref``/``layer_digest`` fields: a dry
+    run never pushes anything, so those fields don't merely happen to be
+    absent — they don't exist yet. Modeling that as ``None`` would read as
+    "pushed to nothing" rather than "hasn't pushed".
+    """
+
+    name: str
+    version: str
+    content_hash: str
+    oci_ref: str
+    layer_digest: str
+    artifact_type: str
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+@dataclass(frozen=True)
+class PublishDryRunRecord:
+    """M7-code: the typed shape of ``--dry-run``'s JSON — see
+    ``PublishOutputRecord``'s docstring for why this is a separate type
+    rather than the same one with optional push/sign fields."""
+
+    name: str
+    version: str
+    content_hash: str
+    target: dict
+    entry_count: int
+    total_bytes: int
+    top_dirs: "list[str]"
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+def cmd_publish(
+    project_dir: Path,
+    *,
+    version: str,
+    target: str,
+    name: str | None = None,
+    tag: str | None = None,
+    output_path: Path | None = None,
+    dry_run: bool = False,
+    allow_untagged: bool = False,
+    push: "OrasPush | None" = None,
+    sign: "CosignSign | None" = None,
+    manifest_fetch: "OrasManifestFetch | None" = None,
+) -> int:
+    """``milpa publish`` — pack the git HEAD source tree, push it, verify it,
+    sign it.
+
+    Thin glue over ``milpa.publishing`` (S2/S3a-d + M1, all pure/impure seams
+    already built there): this function's only job is CLI-shaped assembly —
+    derive ``--name`` from the published HEAD tree (M4), split ``--target``
+    via the shared ``split_oci_target`` helper (SSOT with ``source_spec.py``'s
+    ``oci=`` grammar), enumerate the git tree exactly ONCE (M3-cli) and reuse
+    it for the plan's content hash, the dry-run stats, and (real-run)
+    ``execute()``'s pack step, and route dry-run vs real execution.
+
+    Injectability seam: ``push``/``sign``/``manifest_fetch`` default to
+    ``None`` and are filled with the production closures
+    (``make_oras_push``/``make_cosign_sign``/``make_oras_manifest_fetch``)
+    HERE, not at the argparse layer — this keeps ``cmd_publish`` itself
+    unit-testable with fakes (no ``oras``/``cosign`` binaries needed) while
+    the CLI's real invocation (``main()``) never has to know the seam
+    exists. Mirrors how ``cmd_fetch`` et al. take an injected ``MilpaEnv``
+    rather than constructing one internally.
+
+    Dry-run (``--dry-run``): computes the plan, prints it (content hash +
+    cheap enumeration stats) to stdout, and returns — ``execute()`` is never
+    called, so no push/sign/network happens by construction (not a branch
+    inside ``execute``). ``--target`` is still validated (L5): a flag-
+    injection-shaped target must fail identically under ``--dry-run`` and a
+    real run, not only once ``execute()``'s push/sign closures run
+    ``validate_oci_field``.
+
+    Stream discipline (spec/cli-contract.md §4 NOTE): the dry-run render is
+    the SOLE unguarded ``print()`` in this function (stdout); the real-run
+    confirmation now ALWAYS goes to stderr (M6), regardless of ``--output``
+    — ``execute()`` has already pushed+signed (irreversible) by the time
+    ``--output`` is written, so the ``oci_ref`` of a completed publish must
+    reach the operator on some stream even if writing ``--output`` fails.
+    """
+    import json
+
+    from milpa.fetchers.git import enumerate_git_entries
+    from milpa.fetchers.oci import validate_oci_field
+    from milpa.publishing import (
+        PublishTarget,
+        build_publish_plan,
+        execute,
+        make_cosign_sign,
+        make_oras_manifest_fetch,
+        make_oras_push,
+        resolve_publish_name,
+        resolve_publish_source,
+    )
+    from milpa.source_spec import split_oci_target
+
+    registry, repository = split_oci_target(target)
+    # L5: validate the target BEFORE dry-run can "pass" on an unsafe value —
+    # push()/sign() already call validate_oci_field, but dry-run never
+    # reaches them.
+    validate_oci_field("registry", registry)
+    validate_oci_field("repository", repository)
+
+    effective_tag = tag if tag is not None else version
+    pub_target = PublishTarget(
+        registry=registry,
+        repository=repository,
+        tag=effective_tag,
+        artifact_type=_PUBLISH_ARTIFACT_TYPE,
+        layer_media_type=_PUBLISH_LAYER_MEDIA_TYPE,
+    )
+
+    source = resolve_publish_source(project_dir, version, allow_untagged=allow_untagged)
+
+    # M4: --name comes from the PUBLISHED (HEAD) tree, never the working
+    # directory.
+    effective_name = name if name is not None else resolve_publish_name(source)
+
+    # M3-cli / CR-B1: enumerate the git tree exactly ONCE; reuse it for the
+    # plan's content hash (via build_publish_plan's entries= seam), the
+    # dry-run stats, and (real-run) execute()'s pack step. build_publish_plan
+    # is the ONE plan-builder (validate entries -> compute_dag_identity ->
+    # construct PublishPlan) — no second copy of that composition lives here.
+    entries, _submodule_shas = enumerate_git_entries(
+        source.repo, source.commit, submodule_fetch=None
+    )
+    plan = build_publish_plan(source, pub_target, entries=entries)
+
+    if dry_run:
+        stats = _publish_enumeration_stats(entries)
+        dry_run_record = PublishDryRunRecord(
+            name=effective_name,
+            version=version,
+            content_hash=plan.content_hash,
+            # R2-L3: PublishTarget is a plain frozen dataclass with exactly
+            # the fields this wire shape wants (registry/repository/tag/
+            # artifact_type/layer_media_type) -- dataclasses.asdict is the
+            # SSOT serialization rather than a hand-rebuilt field-by-field
+            # dict that could silently drift from PublishTarget's field set.
+            target=dataclasses.asdict(pub_target),
+            entry_count=stats["entry_count"],
+            total_bytes=stats["total_bytes"],
+            top_dirs=stats["top_dirs"],
+        )
+        rendered = json.dumps(dry_run_record.to_dict(), indent=2)
+        print(rendered)
+        if output_path is not None:
+            _atomic_write(output_path, rendered + "\n")
+        return 0
+
+    effective_push = push if push is not None else make_oras_push()
+    effective_sign = sign if sign is not None else make_cosign_sign()
+    effective_manifest_fetch = (
+        manifest_fetch if manifest_fetch is not None else make_oras_manifest_fetch()
+    )
+    receipt = execute(
+        plan,
+        push=effective_push,
+        sign=effective_sign,
+        entries=entries,
+        manifest_fetch=effective_manifest_fetch,
+    )
+
+    output_record = PublishOutputRecord(
+        name=effective_name,
+        version=version,
+        content_hash=receipt.content_hash,
+        oci_ref=receipt.oci_ref,
+        layer_digest=receipt.layer_digest,
+        artifact_type=receipt.artifact_type,
+    )
+
+    # M6: the publish is already irreversible at this point (pushed+signed).
+    # Print the confirmation FIRST and unconditionally, so the oci_ref
+    # reaches the operator even if the --output write below fails.
+    print(
+        f"published {effective_name}@{version} -> {receipt.oci_ref}",
+        file=sys.stderr,
+    )
+    if output_path is not None:
+        _atomic_write(output_path, json.dumps(output_record.to_dict(), indent=2) + "\n")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # cmd_hash (A0-cmd) — content identity probe
 # ---------------------------------------------------------------------------
 
@@ -4352,6 +4649,17 @@ def main(argv: list[str] | None = None) -> int:
             from milpa.source_spec import parse_source_spec
             prov = parse_source_spec(list(args.source), base_dir=project_dir)
             return cmd_hash(prov, env)
+        elif args.command == "publish":
+            return cmd_publish(
+                project_dir,
+                version=args.version,
+                target=args.target,
+                name=args.name,
+                tag=args.tag,
+                output_path=Path(args.output).resolve() if args.output else None,
+                dry_run=args.dry_run,
+                allow_untagged=args.allow_untagged,
+            )
         elif args.command == "store":
             store_cmd = getattr(args, "store_command", None)
             if store_cmd == "ls":

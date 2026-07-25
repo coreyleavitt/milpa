@@ -1034,6 +1034,74 @@ The .nimble file cannot be read (permissions, OS error).
 
 **Triggered:** OS denies reading the .nimble file.
 
+## PUBLISH
+
+### `PUBLISH-COSIGN-FAILED`
+
+`cosign sign` exited non-zero, or the signing subprocess otherwise failed.
+
+**Triggered:** `make_cosign_sign`'s closure runs `cosign sign --yes` against the pushed OCI reference (keyless — ambient CI OIDC); a non-zero exit (OIDC/Fulcio failure, network error, invalid reference, etc.) raises this error with the captured stderr.
+
+### `PUBLISH-DIGEST-MISMATCH`
+
+The manifest fetched back from the registry after a push does not describe the bytes that were just pushed.
+
+**Triggered:** `execute` verifies what cosign is about to sign: the digest `oras push` reports is the OCI *manifest* digest (`sha256(manifest_json)`), not `sha256(artifact_bytes)`, so it does not by itself prove the registry stored the correct bytes. After push, `execute` fetches the manifest back (`manifest_fetch`), reads its first layer's `digest`, and compares it against a fresh local `sha256` of the packed artifact bytes. A mismatch means the registry's stored bytes disagree with what was just packed — `execute` raises this error and refuses to call `sign`.
+
+### `PUBLISH-GIT-TREE-READ-FAILED`
+
+A `git ls-tree` read of the (already HEAD-resolved) publish commit failed at the subprocess level.
+
+**Triggered:** `_refuse_submodules` runs `git ls-tree -r -z <commit>` against a commit that `_resolve_head_commit` already validated resolves; a non-zero exit here means the commit-object read itself failed (a corrupt or incomplete object store, not "no such repo/commit") — distinct from `PUBLISH-NOT-GIT-REPO`, which is reserved for the earlier "HEAD does not resolve at all" guard.
+
+### `PUBLISH-MANIFEST-FETCH-FAILED`
+
+The just-pushed artifact's manifest could not be fetched or was not shaped as expected.
+
+**Triggered:** `make_oras_manifest_fetch`'s closure runs `oras manifest fetch <ref>` and JSON-parses its stdout; a non-zero exit, non-JSON output, or a non-object result raises this error. It is also raised by `execute`'s digest-verification step when the parsed manifest has no `layers` array, an empty one, or a first layer with no (or a non-string) `digest` field — in every case, milpa cannot establish what bytes the registry actually stored, so `sign` is never called.
+
+### `PUBLISH-NO-DIGEST-IN-OUTPUT`
+
+`oras push` succeeded but its `--format json` stdout contained no parseable `sha256:<64-hex>` digest.
+
+**Triggered:** `parse_oras_digest_json` is handed the captured stdout of a successful `oras push --format json` invocation. It looks for a top-level `"digest"` field, then falls back to extracting the digest suffix of a top-level `"reference"` field (`registry/repository@sha256:...`). If the stdout is empty, is not valid JSON, is not a JSON object, or neither field yields a value matching `sha256:<64 lowercase hex>`, this error is raised — the push happened but milpa cannot learn what digest it produced.
+
+### `PUBLISH-NON-UTF8-SYMLINK-TARGET`
+
+A `MODE_SYMLINK` entry's content (the git blob bytes = the link-target string) is not valid UTF-8.
+
+**Triggered:** `build_publish_plan` (and, as defense-in-depth, `pack_source` itself) validates every enumerated entry before packing. Git allows arbitrary bytes as a symlink target; a published artifact cannot safely represent a non-UTF-8 target (the tar packer decodes it as UTF-8 for `TarInfo.linkname`), so this is rejected at plan/pack time rather than surfacing a bare `UnicodeDecodeError`. Mirrors the read-side `ID-NON-UTF8-SYMLINK-TARGET`, scoped to the publish (producer) path.
+
+### `PUBLISH-NOT-GIT-REPO`
+
+The publish source path is not a git work tree, or its HEAD does not resolve to a commit.
+
+**Triggered:** `_resolve_head_commit` runs `git rev-parse --verify HEAD` against the given repo path and it exits non-zero (or returns no commit) — either the path is not a git repository at all, or it is a git repository with no commits yet (an empty repo). This is the ONLY trigger for this slug; a `git ls-tree` failure on an already-resolved commit raises `PUBLISH-GIT-TREE-READ-FAILED` instead.
+
+### `PUBLISH-OCI-PUSH-FAILED`
+
+`oras push` exited non-zero, or the push subprocess otherwise failed.
+
+**Triggered:** `make_oras_push`'s closure runs `oras push` against the target reference; a non-zero exit (registry auth failure, network error, invalid reference, etc.) raises this error with the captured stderr.
+
+### `PUBLISH-SUBMODULE-UNSUPPORTED`
+
+The repo's HEAD tree contains a submodule (a mode-160000 gitlink entry).
+
+**Triggered:** `resolve_publish_source` scans `git ls-tree -r HEAD` and finds a gitlink entry. `milpa publish` reads the git object store directly and does not recurse or vendor submodules, so publishing a tree with a gitlink would silently produce an incomplete artifact; refused outright instead.
+
+### `PUBLISH-UNSAFE-PATH`
+
+An enumerated entry's path (or, for a symlink, its target) is absolute or escapes the tree root via a `..` component.
+
+**Triggered:** `build_publish_plan` (and, as defense-in-depth, `pack_source` itself) validates every enumerated entry's `relpath` — and, for `MODE_SYMLINK` entries, the decoded target — via the same lexical containment logic the read-side fetchers already enforce (`fetchers/git.py`'s `_check_path_containment`, `fetchers/safe_extract.py`'s zip-slip/symlink-escape checks), applied producer-side against a synthetic root since a plan has no real destination directory. Catches a crafted or corrupted git tree that would otherwise ship a zip-slip or symlink-escape payload into the cosign-signed public artifact. Checked at plan-build time so `--dry-run` catches it too, not only at pack time.
+
+### `PUBLISH-VERSION-TAG-MISMATCH`
+
+The published version does not match a git tag pointing at HEAD.
+
+**Triggered:** `resolve_publish_source` checks that a tag named exactly `<version>` or `v<version>` resolves to the same commit as HEAD. Neither tag exists, or one exists but points at a different commit. Raised unless the caller passes `allow_untagged=True`, which skips this guard entirely.
+
 ## RES
 
 ### `RES-NO-INDEX`

@@ -48,6 +48,45 @@ _LOCAL_KEYS: frozenset[str] = frozenset({"local"})
 _OCI_KEYS: frozenset[str] = frozenset({"oci"})
 
 
+def split_oci_target(token: str) -> tuple[str, str]:
+    """Split an ``<registry>/<repository>`` token on its FIRST ``/``.
+
+    Single source of truth for milpa's ``oci=`` grammar (registry-protocol.md
+    / this module's ``oci=<registry>/<repository>@<digest>`` form): the
+    registry is everything before the first ``/``, the repository is
+    everything after (which may itself contain further ``/`` separators,
+    e.g. ``ghcr.io/coreyleavitt/z3`` -> ``("ghcr.io", "coreyleavitt/z3")``).
+
+    Shared by ``parse_source_spec``'s ``oci=`` branch (below) and the
+    ``milpa publish --target`` CLI flag (``cli.py``) — one split
+    implementation, not two.
+
+    Raises:
+        MilpaError(CLI_SOURCE_SPEC_INVALID): ``token`` contains no ``/``, or
+            either side of the split is empty (``"ghcr.io/"``, ``"/pkg"``,
+            ``"/"``) — an empty registry or repository would build a garbled
+            OCI reference that only fails opaquely inside ``oras``/``cosign``
+            subprocess argv, rather than with a clean CLI-level error here.
+    """
+    slash_pos = token.find("/")
+    if slash_pos == -1:
+        raise MilpaError(
+            CLI_SOURCE_SPEC_INVALID,
+            f"registry/repository reference must contain '/'; got {token!r}",
+            value=token,
+        )
+    registry, repository = token[:slash_pos], token[slash_pos + 1:]
+    if not registry or not repository:
+        raise MilpaError(
+            CLI_SOURCE_SPEC_INVALID,
+            f"registry/repository reference must have a non-empty registry "
+            f"AND a non-empty repository on either side of the first '/'; "
+            f"got {token!r}",
+            value=token,
+        )
+    return registry, repository
+
+
 def parse_source_spec(
     tokens: list[str],
     *,
@@ -138,16 +177,21 @@ def parse_source_spec(
                 f"oci= value has empty digest (nothing after '@'); got {raw_oci!r}",
                 value=raw_oci,
             )
-        # Split the registry/repository on the first '/'.
-        slash_pos = ref_part.find("/")
-        if slash_pos == -1:
+        # Split the registry/repository on the first '/' (SSOT: split_oci_target).
+        # R2-L1: only the genuine no-slash case gets the "must contain '/'"
+        # message here; any OTHER failure (e.g. an empty registry or
+        # repository — "ghcr.io/@sha256:..." DOES contain a '/') is
+        # split_oci_target's own MilpaError, which already carries an
+        # accurate message and the CLI_SOURCE_SPEC_INVALID slug, so it is
+        # let through unwrapped rather than re-worded into a factually wrong
+        # "must contain '/'" complaint.
+        if "/" not in ref_part:
             raise MilpaError(
                 CLI_SOURCE_SPEC_INVALID,
                 f"oci= registry/repository reference must contain '/'; got {ref_part!r}",
                 value=raw_oci,
             )
-        registry = ref_part[:slash_pos]
-        repository = ref_part[slash_pos + 1:]
+        registry, repository = split_oci_target(ref_part)
         # Construct OciProvenance; translate any MilpaError from validation
         # (TNG-BAD-OCI-DIGEST / TNG-UNSAFE-OCI-FIELD) into CLI-SOURCE-SPEC-INVALID.
         try:

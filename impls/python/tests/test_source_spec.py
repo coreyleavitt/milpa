@@ -10,7 +10,7 @@ from milpa.errors import CLI_SOURCE_SPEC_INVALID, MilpaError
 from milpa.fetchers.git import GitProvenance
 from milpa.fetchers.local import LocalProvenance
 from milpa.fetchers.oci import OciProvenance
-from milpa.source_spec import parse_source_spec
+from milpa.source_spec import parse_source_spec, split_oci_target
 
 _VALID_DIGEST = "sha256:" + "a" * 64
 
@@ -184,10 +184,12 @@ def test_oci_two_at_raises() -> None:
 
 
 def test_oci_no_slash_before_at_raises() -> None:
-    """oci= value with no '/' before '@' → CLI-SOURCE-SPEC-INVALID."""
+    """oci= value with no '/' before '@' → CLI-SOURCE-SPEC-INVALID with the
+    "must contain '/'" message -- the genuine no-slash case."""
     with pytest.raises(MilpaError) as exc_info:
         parse_source_spec([f"oci=ghcr.io@{_VALID_DIGEST}"])
     assert exc_info.value.slug == CLI_SOURCE_SPEC_INVALID
+    assert "must contain '/'" in exc_info.value.message
 
 
 def test_oci_invalid_digest_raises() -> None:
@@ -206,3 +208,69 @@ def test_oci_mixed_with_git_raises() -> None:
             "ref=main",
         ])
     assert exc_info.value.slug == CLI_SOURCE_SPEC_INVALID
+
+
+# ---------------------------------------------------------------------------
+# M8: split_oci_target rejects an empty registry or repository
+# ---------------------------------------------------------------------------
+
+
+def test_split_oci_target_happy_path() -> None:
+    """Sanity/regression guard: a normal two-segment token still splits on
+    the first '/', unaffected by the M8 empty-side guard."""
+    assert split_oci_target("ghcr.io/coreyleavitt/z3") == ("ghcr.io", "coreyleavitt/z3")
+
+
+def test_split_oci_target_rejects_trailing_slash() -> None:
+    """"ghcr.io/" (empty repository, nothing after the '/') raises
+    CLI-SOURCE-SPEC-INVALID rather than silently returning an empty
+    repository that would build a garbled OCI reference."""
+    with pytest.raises(MilpaError) as exc_info:
+        split_oci_target("ghcr.io/")
+    assert exc_info.value.slug == CLI_SOURCE_SPEC_INVALID
+
+
+def test_split_oci_target_rejects_leading_slash() -> None:
+    """"/pkg" (empty registry, nothing before the '/') raises
+    CLI-SOURCE-SPEC-INVALID."""
+    with pytest.raises(MilpaError) as exc_info:
+        split_oci_target("/pkg")
+    assert exc_info.value.slug == CLI_SOURCE_SPEC_INVALID
+
+
+def test_split_oci_target_rejects_bare_slash() -> None:
+    """"/" alone (both sides empty) raises CLI-SOURCE-SPEC-INVALID."""
+    with pytest.raises(MilpaError) as exc_info:
+        split_oci_target("/")
+    assert exc_info.value.slug == CLI_SOURCE_SPEC_INVALID
+
+
+def test_split_oci_target_rejects_no_slash() -> None:
+    """A bare token with no '/' at all still raises CLI-SOURCE-SPEC-INVALID
+    (pre-existing behavior, pinned here alongside the new empty-side cases)."""
+    with pytest.raises(MilpaError) as exc_info:
+        split_oci_target("ghcr.io")
+    assert exc_info.value.slug == CLI_SOURCE_SPEC_INVALID
+
+
+def test_oci_trailing_slash_registry_raises_via_parse_source_spec() -> None:
+    """The oci= grammar path (parse_source_spec) reuses split_oci_target, so
+    the same empty-repository guard applies end-to-end: oci=ghcr.io/@<digest>
+    (empty repository before '@') raises CLI-SOURCE-SPEC-INVALID."""
+    with pytest.raises(MilpaError) as exc_info:
+        parse_source_spec([f"oci=ghcr.io/@{_VALID_DIGEST}"])
+    assert exc_info.value.slug == CLI_SOURCE_SPEC_INVALID
+
+
+def test_oci_empty_repository_raises_accurate_message_not_must_contain_slash() -> None:
+    """R2-L1: oci=ghcr.io/@<digest> DOES contain a '/' -- the token just has
+    an empty repository segment. The error message must come from
+    split_oci_target's own accurate diagnosis (non-empty registry AND
+    repository), not the stale hardcoded "must contain '/'" wording (which
+    would be factually wrong here: the token plainly contains a '/')."""
+    with pytest.raises(MilpaError) as exc_info:
+        parse_source_spec([f"oci=ghcr.io/@{_VALID_DIGEST}"])
+    assert exc_info.value.slug == CLI_SOURCE_SPEC_INVALID
+    assert "must contain '/'" not in exc_info.value.message
+    assert "non-empty registry" in exc_info.value.message
+    assert "non-empty repository" in exc_info.value.message
