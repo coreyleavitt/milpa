@@ -940,6 +940,53 @@ def test_hardlink_hash_stability() -> None:
     )
 
 
+def test_hardlink_executable_bit_is_preserved_and_sibling_is_not() -> None:
+    """S0b/M10: a hardlink member whose OWN tar mode has the executable bit
+    set must land on disk with 0o111 set after extraction, while a
+    non-executable hardlink sibling must NOT -- pins pass 2's
+    ``candidate.chmod(_regular_file_mode(member))`` branch (mirrors
+    ``test_pack_source_executable_bit_is_set_on_disk_and_regular_is_not`` on
+    the packer side; this test guards the equivalent extractor branch, which
+    previously had no exec-bit-set hardlink case at all).
+    """
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:") as tf:
+        # Hardlink targets (regular files) written first.
+        for name, mode, data in [
+            ("a/exec_target.sh", 0o755, b"#!/bin/sh\necho hi\n"),
+            ("a/plain_target.txt", 0o644, b"not executable\n"),
+        ]:
+            info = tarfile.TarInfo(name=name)
+            info.type = tarfile.REGTYPE
+            info.mode = mode
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+        # Hardlinks: one executable, one not -- each carrying its OWN mode.
+        for name, mode, target in [
+            ("a/exec_link.sh", 0o755, "a/exec_target.sh"),
+            ("a/plain_link.txt", 0o644, "a/plain_target.txt"),
+        ]:
+            info = tarfile.TarInfo(name=name)
+            info.type = tarfile.LNKTYPE
+            info.mode = mode
+            info.linkname = target
+            info.size = 0
+            tf.addfile(info)
+    buf.seek(0)
+
+    with tempfile.TemporaryDirectory() as dest_str:
+        dest = Path(dest_str)
+        extract_tar(buf, dest)
+        exec_link = dest / "a" / "exec_link.sh"
+        plain_link = dest / "a" / "plain_link.txt"
+        assert exec_link.stat().st_mode & 0o111 != 0, (
+            "executable hardlink member must have 0o111 set on disk"
+        )
+        assert plain_link.stat().st_mode & 0o111 == 0, (
+            "non-executable hardlink sibling must NOT have 0o111 set"
+        )
+
+
 # ---------------------------------------------------------------------------
 # R2-02: lzma-alone magic-independent bomb guard
 # ---------------------------------------------------------------------------

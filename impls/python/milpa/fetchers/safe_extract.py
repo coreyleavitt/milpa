@@ -282,6 +282,17 @@ def _decompress_capped(
 _DEFAULT_LIMITS = Limits()
 
 
+def _regular_file_mode(member: tarfile.TarInfo) -> int:
+    """On-disk mode for a regular/hardlink tar member (spec/identity.md §1.7.4).
+
+    Any POSIX execute bit in the tar header's mode → 0o755, else 0o644. Single
+    source of truth shared by both ``extract_tar`` write branches (pass 1
+    regular files, pass 2 hardlink copies) so the two stay in lockstep with
+    ``enumerate_tarball_entries``' identical ``member.mode & 0o111`` check.
+    """
+    return 0o755 if (member.mode & 0o111) else 0o644
+
+
 def extract_tar(
     archive: str | Path | IO[bytes],
     dest: str | Path,
@@ -467,6 +478,12 @@ def extract_tar(
                             entry=member.name,
                             dest=str(dest_root),
                         ) from exc
+                    # Preserve the executable bit (spec/identity.md §1.7.4 disk
+                    # contract). Mirrors enumerate_tarball_entries' mode mapping
+                    # and materialize_git_tree's on-disk chmod (fetchers/git.py)
+                    # so identity is transport-independent end-to-end, not just
+                    # at the object-store-enumeration layer.
+                    candidate.chmod(_regular_file_mode(member))
 
             # device nodes, FIFOs, etc. — silently skip (never legitimate in source)
 
@@ -565,5 +582,11 @@ def extract_tar(
                     link_target=link_target_raw,
                     dest=str(dest_root),
                 ) from exc
+            # Preserve the executable bit on the hardlink's OWN mode (not the
+            # target's) — enumerate_tarball_entries computes mode_byte from the
+            # islnk() member's own `member.mode`, so a hardlink entry with the
+            # exec bit set must chmod its copy the same way pass 1 does for
+            # regular files (see _regular_file_mode).
+            candidate.chmod(_regular_file_mode(member))
 
     return ExtractionResult(file_count=file_count, total_bytes=total_bytes)

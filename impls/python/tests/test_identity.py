@@ -568,3 +568,69 @@ def test_git_materialized_ondisk_equals_object_store_invariant(tmp_path: Path) -
         "materialize_git_tree did not preserve the tree faithfully (exec bit / symlink)"
     )
     assert ondisk_identity == obj_identity
+
+
+# ---------------------------------------------------------------------------
+# B-cutover STEP-1 invariant, tarball/OCI parity twin: a tar-materialized
+# ON-DISK tree (via the REAL extract_tar, shared by TarballFetcher + OciFetcher)
+# hashes identically to the tarball's own object-store enumeration
+# (enumerate_tarball_entries → compute_dag_identity). Mirrors
+# test_git_materialized_ondisk_equals_object_store_invariant above.
+#
+# This is the tarball/OCI sibling of the git invariant: if extract_tar ever
+# drops the exec bit (or a symlink) while writing entries to disk, this is a
+# real correctness BLOCKER (a deterministic TNG-ENTRY-DIGEST-MISMATCH for any
+# package containing an executable file fetched via tarball/OCI), not
+# something to paper over.
+# ---------------------------------------------------------------------------
+
+
+def test_tar_extracted_ondisk_equals_object_store_invariant(tmp_path: Path) -> None:
+    """on-disk(extract_tar-materialized) identity == tarball object-store identity.
+
+    Builds a tar with an executable file (mode 0o111 bits set), a regular
+    file, and a symlink; extracts it via the real ``extract_tar``; asserts the
+    on-disk ``compute_content_hash`` equals the identity computed straight
+    from ``enumerate_tarball_entries`` (the tarball object-store enumerator).
+    """
+    import io
+    import tarfile
+
+    from milpa.dag_identity import compute_dag_identity
+    from milpa.fetchers.safe_extract import extract_tar
+    from milpa.fetchers.tarball import enumerate_tarball_entries
+    from milpa.identity import enumerate_local_entries
+
+    def _add(tf: tarfile.TarFile, name: str, data: bytes, mode: int) -> None:
+        info = tarfile.TarInfo(name=name)
+        info.size = len(data)
+        info.mode = mode
+        tf.addfile(info, io.BytesIO(data))
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:") as tf:
+        _add(tf, "run.sh", b"#!/bin/sh\necho hi\n", 0o755)
+        _add(tf, "readme.txt", b"hello\n", 0o644)
+        link_info = tarfile.TarInfo(name="link")
+        link_info.type = tarfile.SYMTYPE
+        link_info.linkname = "readme.txt"
+        tf.addfile(link_info)
+    tar_bytes = buf.getvalue()
+
+    # Object-store enumeration → identity (the tarball's own source-of-truth entries).
+    obj_entries = enumerate_tarball_entries(tar_bytes)
+    obj_identity = compute_dag_identity(obj_entries)
+
+    # Materialize to disk via the production disk writer (extract_tar), then the
+    # production identity site (compute_content_hash uses enumerate_local_entries).
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    extract_tar(io.BytesIO(tar_bytes), dest)
+    ondisk_identity = compute_content_hash(dest)
+    # Sanity: compute_content_hash IS enumerate_local_entries → compute_dag_identity.
+    assert ondisk_identity == compute_dag_identity(enumerate_local_entries(dest))
+
+    assert ondisk_identity == obj_identity, (
+        "tar-extracted ON-DISK tree hashed differently from the tarball object-store "
+        "enumeration — extract_tar did not preserve the exec bit on disk"
+    )
