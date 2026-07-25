@@ -747,20 +747,23 @@ def make_oras_push() -> OrasPush:
         validate_oci_field("artifact_type", artifact_type)
         validate_oci_field("layer_media_type", layer_media_type)
 
+        # Push with the BASENAME (from the artifact's own directory as cwd),
+        # not the absolute path: oras records the file argument as the layer's
+        # "org.opencontainers.image.title" annotation, and a consumer's
+        # `oras pull` writes the blob back to that title. An absolute path
+        # there makes the pull fail ("path traversal disallowed") unless the
+        # consumer opts into --allow-path-traversal. A relative basename
+        # (source.tar.gz) is a safe title that pulls cleanly and needs no
+        # --disable-path-validation. The layer bytes are unaffected either way.
         result = subprocess.run(
             [
                 "oras", "push", registry_ref,
                 "--artifact-type", artifact_type,
                 "--format", "json",
-                # oras rejects an absolute file path by default (it would
-                # embed the path as the layer's title annotation). The
-                # artifact is a milpa-owned temp file with an absolute path,
-                # so disable that check — the layer bytes + digest are
-                # unaffected.
-                "--disable-path-validation",
-                f"{artifact_path}:{layer_media_type}",
+                f"{artifact_path.name}:{layer_media_type}",
             ],
             capture_output=True,
+            cwd=artifact_path.parent,
         )
         if result.returncode != 0:
             detail = result.stderr.decode(errors="replace").strip()
