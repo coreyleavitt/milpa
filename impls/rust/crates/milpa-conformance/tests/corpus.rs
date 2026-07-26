@@ -188,6 +188,24 @@ const EXEMPT: &[&str] = &[
     "MAN-NIMBLE-PARSE",
     "NIMBLE-FILE-NOT-FOUND",
     "NIMBLE-FILE-UNREADABLE",
+    // `milpa publish` is impl-specific and out of v1.0 conformance
+    // (spec/cli-contract.md §10): the Rust reference impl intentionally stays
+    // in the not-implemented branch (§10's NORMATIVE "unimplemented verb MUST
+    // exit non-zero + diagnostic" still applies — asymmetric-but-conformant),
+    // so it never emits any PUBLISH-* code. These live only in the Python impl
+    // (rfc-distribution-and-publishing Phase 3). If Rust ever ports publish,
+    // move them to implemented_error_codes().
+    "PUBLISH-COSIGN-FAILED",
+    "PUBLISH-DIGEST-MISMATCH",
+    "PUBLISH-GIT-TREE-READ-FAILED",
+    "PUBLISH-MANIFEST-FETCH-FAILED",
+    "PUBLISH-NO-DIGEST-IN-OUTPUT",
+    "PUBLISH-NON-UTF8-SYMLINK-TARGET",
+    "PUBLISH-NOT-GIT-REPO",
+    "PUBLISH-OCI-PUSH-FAILED",
+    "PUBLISH-SUBMODULE-UNSUPPORTED",
+    "PUBLISH-UNSAFE-PATH",
+    "PUBLISH-VERSION-TAG-MISMATCH",
 ];
 
 /// Error-catalog bijection lint (RFC §4.6). Every code in `spec/errors.md`
