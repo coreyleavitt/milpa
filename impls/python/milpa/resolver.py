@@ -70,6 +70,7 @@ from milpa.errors import (
 )
 from milpa.fetchers.git import GitProvenance, GitReceipt
 from milpa.fetchers.local import LocalProvenance
+from milpa.fetchers.oci import OciProvenance
 from milpa.fetchers.tarball import TarballProvenance
 from milpa.fetchers.types import Provenance
 from milpa.identity import compute_content_hash
@@ -77,6 +78,7 @@ from milpa.lockfile import (
     GitProvenanceRecord,
     LocalProvenanceRecord,
     MemberProvenanceRecord,
+    OciProvenanceRecord,
     ProvenanceRecord,
     ResolvedDep,
     ResolvedGraph,
@@ -113,7 +115,7 @@ from milpa.edge_sources import (
 from milpa.dep_decl import EdgeSet
 from milpa.nimble import parse_nimble
 from milpa.profile import Profile
-from milpa.registry import EntryAttestation, GitIndexProvenance, Index, IndexVersion
+from milpa.registry import EntryAttestation, GitIndexProvenance, Index, IndexVersion, OciIndexProvenance
 from milpa.solver import SolverError, Term, solve_with_cert
 from milpa.version import DepKey, Strategy, Version, VersionSet, dep_dir_name, format_version_str, parse_version
 from milpa.workspace import LoadedWorkspace
@@ -476,16 +478,27 @@ class _Provider:
         # Phase B fetch: pick the first provenance from the index.
         prov_record = iv.provenances[0]  # preference-ordered, element 0 is canonical
         if isinstance(prov_record, GitIndexProvenance):
-            prov = GitProvenance(
+            prov: Provenance = GitProvenance(
                 url=prov_record.url,
                 ref=prov_record.ref,
                 commit_sha=prov_record.commit_sha,
             )
+        elif isinstance(prov_record, OciIndexProvenance):
+            prov = OciProvenance(
+                registry=prov_record.registry,
+                repository=prov_record.repository,
+                digest=prov_record.digest,
+            )
         else:
-            # OCI not yet implemented for Phase B; raise loudly.
+            # Genuinely unknown index provenance type — an internal invariant
+            # violation (registry.py's IndexProvenance union is closed to
+            # GitIndexProvenance | OciIndexProvenance), not a user-facing
+            # condition, so this is MILPA-INTERNAL rather than a TNG-* slug.
             raise MilpaError(
-                TNG_NO_IDENTITY,
-                f"package {bare_name!r}: OCI provenance not yet supported in Phase B",
+                MILPA_INTERNAL,
+                f"package {bare_name!r}: unknown index provenance type "
+                f"{type(prov_record).__name__!r} — this is an internal milpa bug; "
+                f"please report it",
                 name=bare_name,
             )
 
@@ -557,10 +570,19 @@ class _Provider:
             src_dir=src_dir,
             dep_terms=dep_terms,
             requires_names=requires_names,
-            provenance=GitProvenance(
-                url=prov_record.url,
-                ref=prov_record.ref,
-                commit_sha=fetched_commit_sha or prov_record.commit_sha,
+            # For git, prefer the receipt's observed commit_sha (the index may
+            # have carried a symbolic ref) — this is the only "fetched update"
+            # a named dep's provenance ever needs. For OCI the digest IS the
+            # immutable identity (no ref-to-commit resolution step exists), so
+            # `prov` (already built above) is used as-is.
+            provenance=(
+                GitProvenance(
+                    url=prov_record.url,
+                    ref=prov_record.ref,
+                    commit_sha=fetched_commit_sha or prov_record.commit_sha,
+                )
+                if isinstance(prov_record, GitIndexProvenance)
+                else prov
             ),
             dep_decl=_dep_decl_pin,
             requires_predicates=requires_predicates,
@@ -3362,6 +3384,7 @@ def _build_graph(
     LP = LocalProvenance
     TP = TarballProvenance
     MP = MemberProvenanceRecord
+    OP = OciProvenance
 
     # Build reverse map: canonical → sorted list of aliases.
     canonical_to_aliases: dict[str, list[str]] = {}
@@ -3393,6 +3416,7 @@ def _build_graph(
             | LocalProvenanceRecord
             | TarballProvenanceRecord
             | MemberProvenanceRecord
+            | OciProvenanceRecord
             | None
         ) = None
         if isinstance(cand.provenance, GP):
@@ -3430,6 +3454,13 @@ def _build_graph(
         elif isinstance(cand.provenance, MP):
             # Member candidate — provenance record already typed correctly.
             observed_record = cand.provenance
+        elif isinstance(cand.provenance, OP):
+            observed_record = OciProvenanceRecord(
+                registry=cand.provenance.registry,
+                repository=cand.provenance.repository,
+                digest=cand.provenance.digest,
+                origin="observed",
+            )
 
         # D-lifecycle: build declared provenance records for each mirror URL that
         # was NOT the observed candidate. Declared = unverified (no commit_sha,
