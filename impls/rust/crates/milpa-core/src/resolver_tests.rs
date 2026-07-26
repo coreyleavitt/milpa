@@ -43,6 +43,9 @@ struct Mock {
 struct FakeReg {
     /// `(url, ref)` → mock for git fetches; also reused for tarball URLs (ref "").
     by_url_ref: BTreeMap<(String, String), Mock>,
+    /// `"registry/repository@digest"` → mock for OCI fetches. Keyed to match
+    /// `fetch_oci`'s `oci_ref` format exactly (see `fetchers.rs::fetch_oci`).
+    by_oci: BTreeMap<String, Mock>,
     calls: RefCell<Vec<(String, String, String)>>,
 }
 
@@ -54,6 +57,20 @@ impl FakeReg {
         }
         FakeReg {
             by_url_ref,
+            by_oci: BTreeMap::new(),
+            calls: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Build a `FakeReg` from OCI mocks keyed by `(registry, repository, digest)`.
+    fn oci(mocks: &[(&str, &str, &str, Mock)]) -> Self {
+        let mut by_oci = BTreeMap::new();
+        for (registry, repository, digest, m) in mocks {
+            by_oci.insert(format!("{registry}/{repository}@{digest}"), m.clone());
+        }
+        FakeReg {
+            by_url_ref: BTreeMap::new(),
+            by_oci,
             calls: RefCell::new(Vec::new()),
         }
     }
@@ -134,7 +151,23 @@ impl FetcherRegistry for FakeReg {
                     .map_err(|e| FetchError::Failed(format!("local copy: {e}")))?;
                 Ok(Receipt::default())
             }
-            other => Err(FetchError::Failed(format!("unmocked: {other:?}"))),
+            Provenance::Oci {
+                registry,
+                repository,
+                digest,
+            } => {
+                let oci_ref = format!("{registry}/{repository}@{digest}");
+                self.calls
+                    .borrow_mut()
+                    .push((name.to_string(), oci_ref.clone(), String::new()));
+                let m = self
+                    .by_oci
+                    .get(&oci_ref)
+                    .ok_or_else(|| FetchError::Failed(format!("no oci mock for {oci_ref:?}")))?
+                    .clone();
+                self.materialize(name, &m, dest)?;
+                Ok(Receipt::default())
+            }
         }
     }
 }
@@ -201,6 +234,7 @@ fn tarball_reg(mocks: &[(&str, Mock)]) -> FakeReg {
     }
     FakeReg {
         by_url_ref,
+        by_oci: BTreeMap::new(),
         calls: RefCell::new(Vec::new()),
     }
 }
@@ -515,6 +549,143 @@ fn resolve_named_dep_without_index_errors() {
     )
     .unwrap_err();
     assert_eq!(err.code(), "RES-NO-INDEX");
+}
+
+// ---------------------------------------------------------------------------
+// OCI consumer resolution (registry named-dep path) — parity with Python's
+// tests/test_oci_registry_consumer.py. Before this test existed, the fake
+// fetcher had no `Provenance::Oci` arm at all; the production code path
+// (`materialize_named` → `fetch_any` → `DefaultRegistry::fetch` →
+// `transport_to_record`) was already fully generic across transport kinds
+// (registry.rs already parses `provenance kind "oci"` straight into
+// `Provenance::Oci`, unlike a hardcoded git-only branch) — this test proves
+// that wiring end to end and pins it as a regression test.
+// ---------------------------------------------------------------------------
+
+const OCI_TEST_REGISTRY: &str = "ghcr.io";
+const OCI_TEST_REPOSITORY: &str = "acme/widget";
+const OCI_TEST_DIGEST: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+fn oci_index(content_hash: &str) -> Index {
+    Index {
+        packages: vec![Package {
+            name: "widget".to_string(),
+            namespace: "acme".to_string(),
+            versions: vec![IndexVersion {
+                version: "1.0.0".to_string(),
+                content_hash: content_hash.to_string(),
+                provenances: vec![Provenance::Oci {
+                    registry: OCI_TEST_REGISTRY.to_string(),
+                    repository: OCI_TEST_REPOSITORY.to_string(),
+                    digest: OCI_TEST_DIGEST.to_string(),
+                }],
+                dep_decl: None,
+                dep_decl_schema_version: None,
+                attestation: None,
+                namespace: "acme".to_string(),
+                published_at: None,
+                yanked: false,
+                yanked_at: None,
+                yanked_reason: None,
+                published_at_raw: None,
+            }],
+        }],
+    }
+}
+
+#[test]
+fn resolve_named_dep_oci_provenance_produces_oci_record() {
+    let body = "srcDir = \"src\"\n";
+    let index = oci_index(&hash_of_nimble("widget", body));
+    let reg = FakeReg::oci(&[(
+        OCI_TEST_REGISTRY,
+        OCI_TEST_REPOSITORY,
+        OCI_TEST_DIGEST,
+        nimble("s-oci", body),
+    )]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![named_dep("widget", None)]);
+    let graph = resolve(
+        &m,
+        Some(&index),
+        &reg,
+        None,
+        None,
+        Strategy::Maxver,
+        &deps_dir(&tmp),
+        None,
+        false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+
+    assert_eq!(graph.deps.len(), 1);
+    let dep = graph.deps.iter().find(|d| d.name == "widget").unwrap();
+
+    // The fake oras-pull transport was actually invoked, with the full OCI
+    // reference built from the index's provenance fields.
+    let oci_ref = format!("{OCI_TEST_REGISTRY}/{OCI_TEST_REPOSITORY}@{OCI_TEST_DIGEST}");
+    assert_eq!(
+        reg.calls(),
+        vec![("widget".to_string(), oci_ref, String::new())]
+    );
+
+    // The candidate carries a Oci ProvenanceRecord, not a Git one.
+    assert_eq!(dep.provenances.len(), 1);
+    match &dep.provenances[0] {
+        ProvenanceRecord::Oci {
+            registry,
+            repository,
+            digest,
+            origin,
+        } => {
+            assert_eq!(registry, OCI_TEST_REGISTRY);
+            assert_eq!(repository, OCI_TEST_REPOSITORY);
+            assert_eq!(digest, OCI_TEST_DIGEST);
+            assert_eq!(origin, "observed");
+        }
+        other => panic!("expected Oci provenance, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_named_dep_oci_provenance_round_trips_through_lockfile() {
+    let body = "srcDir = \"src\"\n";
+    let index = oci_index(&hash_of_nimble("widget", body));
+    let reg = FakeReg::oci(&[(
+        OCI_TEST_REGISTRY,
+        OCI_TEST_REPOSITORY,
+        OCI_TEST_DIGEST,
+        nimble("s-oci", body),
+    )]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![named_dep("widget", None)]);
+    let graph = resolve(
+        &m,
+        Some(&index),
+        &reg,
+        None,
+        None,
+        Strategy::Maxver,
+        &deps_dir(&tmp),
+        None,
+        false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+
+    let lockfile = crate::lockfile::from_graph(&graph, "maxver");
+    let locked = lockfile.deps.iter().find(|d| d.name == "widget").unwrap();
+    assert_eq!(locked.provenances.len(), 1);
+    let locked_prov = &locked.provenances[0];
+    assert!(matches!(locked_prov, ProvenanceRecord::Oci { .. }));
+
+    // Full format -> parse round-trip.
+    let text = crate::lockfile::format_lockfile(&lockfile);
+    assert!(text.contains("kind \"oci\""), "lockfile text missing OCI record:\n{text}");
+    let reparsed = crate::lockfile::parse_lockfile(&text).unwrap();
+    let reparsed_dep = reparsed.deps.iter().find(|d| d.name == "widget").unwrap();
+    assert_eq!(&reparsed_dep.provenances[0], locked_prov);
 }
 
 /// S5b spike — §3.B error-slug divergence diagnostic (workspace-completion RFC).
