@@ -124,12 +124,29 @@ Two trust bundle constants exist in both impls:
 ### 3.2 Signer identity and override
 
 The pinned default signer identity for the whole-index attestation is the GitHub
-Actions OIDC identity of the tianguis reindex workflow:
+Actions OIDC identity of tianguis's `attest-index.yaml` workflow:
 
 ```
 SubjectAltName issuer: https://token.actions.githubusercontent.com
-SubjectAltName value:  https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml@refs/heads/main
+SubjectAltName value:  https://github.com/coreyleavitt/tianguis/.github/workflows/attest-index.yaml@refs/heads/main
 ```
+
+**Revision (§9 resolution):** the original design pinned this identity to
+`reindex.yaml` — but `reindex.yaml` is a one-shot, `workflow_dispatch`-only
+migration workflow with no recurring schedule; it is not what actually
+mutates `index.kdl` day to day (that's the daily `vendor.yaml` cron and
+every author publish via `commit-entry.yaml`). Signing under either of
+those workflows' own ambient identity directly would produce a DIFFERENT
+SAN depending on which one ran, and milpa's verifier accepts only a single
+pinned signer string. The resolution is `attest-index.yaml`: a REUSABLE
+(`workflow_call`, not a composite action) tianguis workflow that both
+`vendor.yaml` and `commit-entry.yaml` invoke as a job immediately after
+committing `index.kdl`. Because `job_workflow_ref` in a reusable workflow's
+OIDC token reflects the CALLEE workflow's path regardless of caller (the
+inverse of a composite action, which preserves the caller's own SAN — see
+tianguis's per-author Model-3 identity design, which relies on that inverse
+property), every whole-index bundle carries the SAME signer identity no
+matter which process produced it.
 
 This identity is pinned because its source is the authoritative public repository;
 changing it requires a milpa release.
@@ -788,33 +805,54 @@ Document alongside `--require-attested-metadata`:
 
 ## 9. tianguis prerequisite
 
-### 9.1 The bundle-delivery gap
+**Status: RESOLVED.** §9.1 describes the ORIGINAL gap (`TNG-INDEX-BUNDLE-
+MISSING`); §9.2 describes the ORIGINAL (superseded) proposed contract; §9.3
+describes the actual shipped resolution. Both are kept for history — the
+shipped design differs from §9.2's original sketch specifically on the
+signing-workflow question, which turned out to need its own answer (see
+§3.2's revision note).
 
-The tianguis `vendor.yaml` and `reindex.yaml` CI workflows currently emit
-Rekor-anchored cosign bundles:
+### 9.1 The bundle-delivery gap (historical)
 
-- `vendor.yaml` produces `vendor-attest.bundle` as a CI workflow artifact.
-- `reindex.yaml` produces `reindex-attest.bundle` as a CI workflow artifact.
+The tianguis `vendor.yaml` and `reindex.yaml` CI workflows used to only emit
+Rekor-anchored cosign bundles as uncommitted CI workflow artifacts
+(`vendor-attest.bundle`, `reindex-attest.bundle`), in the legacy cosign
+bundle schema (not the Sigstore `BUNDLE_0_3` shape this RFC's verifier
+parses). Neither was committed to the tianguis repo alongside `index.kdl`,
+so a consumer fetching `index.kdl` from `raw.githubusercontent.com` had no
+way to retrieve a corresponding bundle at all.
 
-These bundles are **not committed to the tianguis repo** alongside `index.kdl`.
-A consumer fetching `index.kdl` from `raw.githubusercontent.com` has no way to
-retrieve the corresponding bundle.
+### 9.2 Originally proposed contract (superseded)
 
-### 9.2 Required tianguis change
+The original sketch proposed simply updating `vendor.yaml`/`reindex.yaml` in
+place to commit their existing cosign-produced bundle as `index.kdl.bundle`.
+This underspecified the signer-identity question: `index.kdl` is mutated by
+BOTH the daily `vendor.yaml` cron AND every author publish via
+`commit-entry.yaml`, each running under its own ambient OIDC identity, while
+milpa's verifier accepts only one pinned signer string — so whichever
+workflow signed in place would mismatch the other's identity. §9.3 is the
+actual, worked-out resolution.
 
-The tianguis-side change is a **dependency of this RFC's implementation** and
-must be done before S5/S6 (when the live production trust path is wired). The
-exact contract:
+### 9.3 Shipped resolution
 
-- The whole-index bundle MUST be committed to the tianguis repo as
-  `index.kdl.bundle` alongside `index.kdl` in the same commit.
-- The bundle MUST be fetchable at the normatively derived URL (§7.3): strip
-  query and fragment from `MILPA_INDEX_URL`, append `.bundle` to the URL path,
-  reattach query/fragment. For the default URL:
+- The whole-index bundle IS committed to the tianguis repo as
+  `index.kdl.bundle` alongside `index.kdl`, fetchable at the normatively
+  derived URL (§7.3):
   `https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl.bundle`
-
-The tianguis workflows (`vendor.yaml`, `reindex.yaml`) must be updated to commit
-the bundle file rather than (or in addition to) uploading it as a CI artifact.
+- It is produced by `scripts/sign_statement.py` (the sigstore-python library
+  seam already validated for per-entry bundles, tianguis#42) signing a
+  whole-index in-toto Statement (`subject[0].name = "index.kdl"`,
+  `subject[0].digest.sha256 = sha256(index.kdl bytes)`) — NOT `cosign
+  attest-blob`, which emits the legacy cosign bundle schema rather than the
+  `BUNDLE_0_3` shape this RFC's verifier parses.
+- Signing happens in a NEW reusable (`workflow_call`) workflow,
+  `.github/workflows/attest-index.yaml`, which BOTH `vendor.yaml` and
+  `commit-entry.yaml` invoke as a job immediately after their own commit job
+  pushes an `index.kdl` change — so every mutation of `index.kdl`, from
+  either path, re-signs the bundle before it can go stale. See §3.2's
+  revision note for why a reusable workflow (not a composite action, not
+  inlining the signing step per-caller) is what gives a single, caller-
+  independent signer identity.
 
 **File this as a tianguis cross-repo issue** before beginning S5/S6. S3/S4
 (the verifier modules) can proceed using test trust roots and pre-generated test

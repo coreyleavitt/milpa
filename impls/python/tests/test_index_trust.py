@@ -68,9 +68,10 @@ from milpa.index_trust import (
 
 _DUMMY_TRUST_BUNDLE = TrustBundle(raw_json=b'{"__test__": true}', label="test:dummy")
 
-# Default pinned signer identity (RFC §3.2)
+# Default pinned signer identity (RFC §3.2) — the tianguis attest-index.yaml
+# reusable workflow, NOT reindex.yaml (a one-shot migration workflow).
 _DEFAULT_SIGNER = (
-    "https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml@refs/heads/main"
+    "https://github.com/coreyleavitt/tianguis/.github/workflows/attest-index.yaml@refs/heads/main"
 )
 
 
@@ -914,14 +915,18 @@ def test_m4_stale_plus_sig_invalid_reports_bundle_stale() -> None:
 def test_default_index_signer_pins_to_spec_value() -> None:
     """``DEFAULT_INDEX_SIGNER`` must exactly match spec §3.4.4 step 5 / §3.4.6.
 
-    This is the SSOT for the tianguis reindex SAN.  The Rust impl and the spec
-    both reference this value; a change here requires a coordinated update in
-    all three places.  If this test breaks, update the constant AND the spec
-    AND the Rust constant together.
+    This is the SSOT for the tianguis attest-index.yaml SAN (the reusable
+    ``workflow_call`` workflow both ``vendor.yaml`` and ``commit-entry.yaml``
+    invoke to re-sign the whole-index bundle after every commit to
+    ``index.kdl`` — NOT ``reindex.yaml``, a one-shot migration workflow with
+    no recurring schedule).  The Rust impl and the spec both reference this
+    value; a change here requires a coordinated update in all three places.
+    If this test breaks, update the constant AND the spec AND the Rust
+    constant together.
     """
     assert DEFAULT_INDEX_SIGNER == (
         "https://github.com/coreyleavitt/tianguis/"
-        ".github/workflows/reindex.yaml@refs/heads/main"
+        ".github/workflows/attest-index.yaml@refs/heads/main"
     ), (
         "DEFAULT_INDEX_SIGNER must match spec §3.4.4 step 5; "
         "update spec/registry-protocol.md and impls/rust/ in lockstep"

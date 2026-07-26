@@ -1766,7 +1766,7 @@ two axes govern different concerns and MUST NOT be conflated.
 > NORMATIVE: When set to a non-empty value, overrides the expected signer
 > IDENTITY for whole-index attestation. The value MUST be a GitHub Actions OIDC
 > workflow URL or other SubjectAltName string expected in the signing certificate
-> (e.g. `https://github.com/myorg/myregistry/.github/workflows/reindex.yaml@refs/heads/main`).
+> (e.g. `https://github.com/myorg/myregistry/.github/workflows/attest-index.yaml@refs/heads/main`).
 >
 > This variable overrides the signer IDENTITY only. It MUST NOT be used for
 > trust-bundle (CA root) overrides — use `MILPA_INDEX_TRUST_BUNDLE` for that.

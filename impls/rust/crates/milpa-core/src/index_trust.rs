@@ -84,8 +84,19 @@ use crate::trust_root::map_trusted_root;
 /// Default expected SubjectAltName for the tianguis index Sigstore bundle.
 ///
 /// This is the GitHub Actions OIDC workflow SAN for the tianguis
-/// `reindex.yaml` CI workflow on the `main` branch.  It identifies the
+/// `attest-index.yaml` CI workflow on the `main` branch.  It identifies the
 /// signer that ran the attestation step — not the commit author.
+///
+/// `attest-index.yaml` is a REUSABLE (`workflow_call`) workflow — NOT
+/// `reindex.yaml` (a one-shot, workflow_dispatch-only migration workflow
+/// with no recurring schedule). Every commit to `index.kdl` (the daily
+/// `vendor.yaml` cron AND every author publish via `commit-entry.yaml`)
+/// calls into `attest-index.yaml` to re-sign the bundle; because it's a
+/// `workflow_call` reusable workflow (not a composite action), the OIDC
+/// token's `job_workflow_ref` — and therefore the Fulcio cert SAN — is
+/// THIS workflow's path regardless of which top-level workflow invoked it,
+/// giving every whole-index bundle the same signer identity no matter
+/// which process produced it.
 ///
 /// Override via:
 /// - `index-trust-signer "<san>"` in `milpa.kdl` (per-project).
@@ -93,7 +104,7 @@ use crate::trust_root::map_trusted_root;
 ///
 /// spec §3.4.4 step 5 — signer identity check.
 pub const DEFAULT_INDEX_SIGNER: &str =
-    "https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml\
+    "https://github.com/coreyleavitt/tianguis/.github/workflows/attest-index.yaml\
      @refs/heads/main";
 
 /// OIDC issuer pinned alongside the SAN in the signer-identity policy.
@@ -1116,14 +1127,16 @@ mod tests {
     // Item 6 (M6): pin the DEFAULT_INDEX_SIGNER constant to the spec §3.4.4 step 5 value.
     #[test]
     fn default_index_signer_pin_matches_spec() {
-        // Regression guard: the constant must be the tianguis reindex.yaml OIDC SAN.
-        // Changing this accidentally would silently bypass signer-mismatch detection
-        // for any consumer using the default signer.
+        // Regression guard: the constant must be the tianguis attest-index.yaml OIDC SAN
+        // (the reusable `workflow_call` workflow both `vendor.yaml` and `commit-entry.yaml`
+        // invoke to re-sign the whole-index bundle — NOT the one-shot `reindex.yaml`
+        // migration workflow). Changing this accidentally would silently bypass
+        // signer-mismatch detection for any consumer using the default signer.
         assert_eq!(
             DEFAULT_INDEX_SIGNER,
-            "https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml\
+            "https://github.com/coreyleavitt/tianguis/.github/workflows/attest-index.yaml\
              @refs/heads/main",
-            "spec §3.4.4 step 5: DEFAULT_INDEX_SIGNER must match the tianguis reindex workflow"
+            "spec §3.4.4 step 5: DEFAULT_INDEX_SIGNER must match the tianguis attest-index workflow"
         );
     }
 

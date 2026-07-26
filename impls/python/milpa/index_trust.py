@@ -138,12 +138,25 @@ BundleMalformed = VerificationResult.BUNDLE_MALFORMED
 # DEFAULT_INDEX_SIGNER — single source of truth for the tianguis signer SAN
 # ---------------------------------------------------------------------------
 
-#: The pinned default signer SubjectAltName for the tianguis reindex workflow.
-#: This is the SOLE canonical definition — spec §3.4.4 step 5, §3.4.6.
-#: cli.py imports this constant; tests pin it to the exact spec value.
-#: Never duplicate this string: changing it here propagates everywhere.
+#: The pinned default signer SubjectAltName for the tianguis whole-index
+#: attestation workflow. This is the SOLE canonical definition — spec
+#: §3.4.4 step 5, §3.4.6. cli.py imports this constant; tests pin it to the
+#: exact spec value. Never duplicate this string: changing it here
+#: propagates everywhere.
+#:
+#: This is `attest-index.yaml`, a REUSABLE (`workflow_call`) tianguis
+#: workflow — NOT `reindex.yaml` (a one-shot, workflow_dispatch-only
+#: migration workflow that doesn't run on any recurring schedule). Every
+#: commit to `index.kdl` (the daily `vendor.yaml` cron AND every author
+#: publish via `commit-entry.yaml`) calls into `attest-index.yaml` to
+#: re-sign the bundle; because it's a `workflow_call` reusable workflow (not
+#: a composite action), GitHub's Actions OIDC token records
+#: `job_workflow_ref` as THIS workflow's path regardless of which top-level
+#: workflow invoked it — giving every whole-index bundle the SAME signer
+#: identity no matter which process produced it. A composite action would
+#: NOT have this property (the SAN would still vary by caller).
 DEFAULT_INDEX_SIGNER = (
-    "https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml@refs/heads/main"
+    "https://github.com/coreyleavitt/tianguis/.github/workflows/attest-index.yaml@refs/heads/main"
 )
 
 

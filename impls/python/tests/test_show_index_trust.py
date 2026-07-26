@@ -27,7 +27,7 @@ from milpa.index_trust import (
 
 _SIGNER_SAN = (
     "https://github.com/coreyleavitt/tianguis/"
-    ".github/workflows/reindex.yaml@refs/heads/main"
+    ".github/workflows/attest-index.yaml@refs/heads/main"
 )
 _OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 _SUBJECT_SHA256 = "abc123deadbeefabc123deadbeefabc123deadbeefabc123deadbeefabc12345"

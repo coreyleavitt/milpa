@@ -843,7 +843,7 @@ class TestAttestationEpochControlChar:
 
 _DUMMY_BUNDLE = TrustBundle(raw_json=b'{"__test__": true}', label="test:dummy")
 _DEFAULT_SIGNER = (
-    "https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml@refs/heads/main"
+    "https://github.com/coreyleavitt/tianguis/.github/workflows/attest-index.yaml@refs/heads/main"
 )
 _FAKE_BUNDLE_BYTES = b'{"fake_bundle": true}'
 

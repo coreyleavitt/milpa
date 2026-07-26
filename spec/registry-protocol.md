@@ -868,7 +868,16 @@ certificate was expired AT its own `integratedTime`.
 match the expected signer identity. The pinned default identity is:
 
 - Issuer: `https://token.actions.githubusercontent.com`
-- SAN: `https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml@refs/heads/main`
+- SAN: `https://github.com/coreyleavitt/tianguis/.github/workflows/attest-index.yaml@refs/heads/main`
+
+`attest-index.yaml` is tianguis's reusable (`workflow_call`) whole-index
+signing workflow, invoked by every workflow that commits `index.kdl`
+(the daily vendor pass and every author publish) — NOT `reindex.yaml`, a
+one-shot migration workflow with no recurring schedule. Because it is a
+`workflow_call` reusable workflow rather than a composite action, the
+Fulcio certificate's SAN reflects `attest-index.yaml` itself regardless of
+which top-level workflow invoked it, giving every whole-index bundle the
+same signer identity no matter which process produced it.
 
 This identity is overridable via `MILPA_INDEX_TRUST_SIGNER` or the
 `index-trust-signer` manifest node. A SAN mismatch MUST raise
