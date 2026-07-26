@@ -4748,16 +4748,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn default_index_signer_constant_is_reindex_yaml() {
+    fn default_index_signer_constant_is_attest_index_yaml() {
         // Item 6 (M6): DEFAULT_SIGNER promoted to milpa_core::index_trust::DEFAULT_INDEX_SIGNER.
         // Pin test: confirm the value matches spec §3.4.4 step 5 exactly.
         // (The matching pin test also lives in milpa-core's index_trust tests.)
+        //
+        // The pinned identity is `attest-index.yaml`, tianguis's reusable
+        // (`workflow_call`) whole-index signing workflow — NOT `reindex.yaml`
+        // (a one-shot migration workflow with no recurring schedule).
         use milpa_core::index_trust::DEFAULT_INDEX_SIGNER;
         assert_eq!(
             DEFAULT_INDEX_SIGNER,
-            "https://github.com/coreyleavitt/tianguis/.github/workflows/reindex.yaml\
+            "https://github.com/coreyleavitt/tianguis/.github/workflows/attest-index.yaml\
              @refs/heads/main",
-            "spec §3.4.4 step 5 signer identity must be the tianguis reindex workflow"
+            "spec §3.4.4 step 5 signer identity must be the tianguis attest-index workflow"
         );
     }
 

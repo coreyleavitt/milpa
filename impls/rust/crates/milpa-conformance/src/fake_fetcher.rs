@@ -114,9 +114,19 @@ impl FetcherRegistry for FakeFetcher {
                 });
                 Ok(receipt)
             }
-            other => Err(FetchError::Failed(format!(
-                "FakeFetcher: unmocked provenance kind: {other:?}"
-            ))),
+            Provenance::Oci {
+                registry,
+                repository,
+                digest,
+            } => {
+                let receipt = self.inner.fetch(name, p, dest)?;
+                self.calls.borrow_mut().push(FetchCall {
+                    name: name.to_string(),
+                    url: format!("{registry}/{repository}"),
+                    ref_spec: digest.clone(),
+                });
+                Ok(receipt)
+            }
         }
     }
 }

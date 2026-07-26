@@ -4,7 +4,7 @@
 //! it so conformance code keeps its existing `crate::urlkey::url_key` call sites
 //! unchanged.
 
-pub use milpa_core::url_key;
+pub use milpa_core::{oci_key, url_key};
 
 #[cfg(test)]
 mod tests {

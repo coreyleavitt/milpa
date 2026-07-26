@@ -12,7 +12,7 @@ This module provides:
 2. **Per-kind mocked fetchers**:
    - ``MockedGitFetcher``     — reads sha + content from ``mocked-fetches/<url_key>/``
    - ``MockedTarballFetcher`` — reads archive_sha256 + content (§2.3.4)
-   - ``MockedOciFetcher``     — stub (no OCI fixtures defined at v1)
+   - ``MockedOciFetcher``     — reads content + digest-keyed dir (§2.3.5)
 
    Each implements ``can_handle`` + ``fetch`` once; the ``FetcherRegistry``'s
    existing unique-match dispatch routes to it.  No ``match`` on provenance kind
@@ -84,6 +84,25 @@ def url_key(url: str, ref_spec: str) -> str:
         →  "https___example.com_pkg.tar.gz@"   # tarball: empty ref slot
     """
     return f"{_SAFE_CHARS.sub('_', url)}@{_SAFE_CHARS.sub('_', ref_spec)}"
+
+
+def oci_key(registry: str, repository: str, digest: str) -> str:
+    """Encode an OCI ``(registry, repository, digest)`` triple to its
+    ``mocked-fetches/`` subdirectory name (conformance-fixtures.md §2.3.5).
+
+    Mirrors the git (§2.3.1) and tarball (§2.3.4) key splits: ``registry/repository``
+    is the "location" half and ``digest`` is the "pointer" half — reusing ``url_key``
+    as the single SSOT sanitizer rather than a parallel encoder.  Unlike a git ref,
+    an OCI digest is already an immutable content pointer (not a mutable branch/tag),
+    so there is no separate ref-resolution concept for OCI — the digest slots
+    directly into the position ``url_key`` treats as the ref.
+
+    Example::
+
+        oci_key("ghcr.io", "example/bar", "sha256:aa...")
+        →  "ghcr.io_example_bar@sha256_aa..."
+    """
+    return url_key(f"{registry}/{repository}", digest)
 
 
 # ---------------------------------------------------------------------------
@@ -360,36 +379,50 @@ class MockedTarballFetcher(Fetcher):
 
 
 # ---------------------------------------------------------------------------
-# MockedOciFetcher (stub — no OCI fixtures defined at v1)
+# MockedOciFetcher
 # ---------------------------------------------------------------------------
 
 
 class MockedOciFetcher(Fetcher):
-    """Mocked OCI fetcher — stub until OCI fixtures are defined at v1+.
+    """Mocked OCI fetcher — satisfies OCI fetches offline from the fixture tree.
 
-    Raises ``FETCH-MOCK-MISSING`` for every OCI fetch attempt; no fixture
-    layout is specified for OCI at v1.  This stub exists so ``mocked_registry``
-    covers all four transport kinds and the registry's exclusive-dispatch
-    invariant is satisfied for ``OciProvenance`` inputs.
+    Reads ``mocked-fetches/<oci_key(registry, repository, digest)>/`` per
+    conformance-fixtures.md §2.3.5:
+      1. ``content/`` — source tree staged into ``dest``.
+      2. ``<name>.nimble`` (optional) — placed at the root of ``dest``.
+
+    Unlike ``MockedGitFetcher`` (which reads a ``sha`` file for the mutable
+    ref → commit resolution) there is no separate receipt-input file: an OCI
+    digest is already the immutable pointer the caller supplied, so the
+    receipt's ``layer_digest`` is simply echoed back from ``p.digest``.
+
+    Raises ``FETCH-MOCK-MISSING`` if the key directory does not exist.
     """
 
-    def __init__(self, mocked_dir: Path) -> None:  # noqa: ARG002
-        pass
+    def __init__(self, mocked_dir: Path) -> None:
+        self._dir = mocked_dir
 
     def can_handle(self, p: Provenance) -> bool:
         return isinstance(p, OciProvenance)
 
     def fetch(self, name: str, p: Provenance, *, dest: Path) -> OciReceipt:
-        assert isinstance(p, OciProvenance)  # narrowing
-        raise MilpaError(
-            FETCH_MOCK_MISSING,
-            f"mocked fetch: OCI fixtures are not defined at v1 — "
-            f"no mock for {p.registry}/{p.repository}@{p.digest}",
-            dep=name,
-            registry=p.registry,
-            repository=p.repository,
-            digest=p.digest,
-        )
+        assert isinstance(p, OciProvenance)  # narrowing; can_handle enforces
+
+        key_dir = self._dir / oci_key(p.registry, p.repository, p.digest)
+        if not key_dir.is_dir():
+            raise MilpaError(
+                FETCH_MOCK_MISSING,
+                f"mocked fetch: no OCI fixture for {p.registry}/{p.repository}@{p.digest} "
+                f"(expected dir: {key_dir})",
+                dep=name,
+                registry=p.registry,
+                repository=p.repository,
+                digest=p.digest,
+            )
+
+        dest.mkdir(parents=True, exist_ok=True)
+        _stage_mock_content(name, key_dir, dest)
+        return OciReceipt(layer_digest=p.digest)
 
 
 # ---------------------------------------------------------------------------
@@ -430,8 +463,9 @@ def mocked_registry(mocked_dir: Path) -> FetcherRegistry:
 
 
 __all__ = [
-    # SSOT key encoder
+    # SSOT key encoders
     "url_key",
+    "oci_key",
     # Build-mode placeholder (cross-runner stable)
     "TARBALL_SHA256_PLACEHOLDER",
     # Provenance kinds (re-exported from canonical transport modules)

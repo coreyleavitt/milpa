@@ -94,8 +94,8 @@ pub use milpa_manifest::{format_manifest, format_workspace_manifest};
 pub use fetch::{FetchError, Fetcher, FetcherRegistry, Receipt};
 pub use source_spec::parse_source_spec;
 pub use fetchers::{
-    mocked_default_branch, resolve_mock_key, stage_mock_content, url_key, CasAdmittingFetcher,
-    DefaultRegistry, MockedFetcher,
+    mocked_default_branch, oci_key, resolve_mock_key, stage_mock_content, url_key,
+    CasAdmittingFetcher, DefaultRegistry, MockedFetcher,
 };
 pub use frozen::{rebuild_deps_view, resolve_frozen, resolve_workspace_frozen};
 pub use identity::{

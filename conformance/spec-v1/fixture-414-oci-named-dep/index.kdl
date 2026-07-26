@@ -1,0 +1,12 @@
+schema_version 1
+package "bar" {
+    version "1.0.0" {
+        content_hash "dag-sha256:55dee9add0b92d86b14bebe26d7929a6009158d5418cbc3934ae444991996da7"
+        provenance {
+            kind "oci"
+            registry "ghcr.io"
+            repository "example/bar"
+            digest "sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        }
+    }
+}

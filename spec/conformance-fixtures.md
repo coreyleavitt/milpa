@@ -448,6 +448,39 @@ A tarball subdirectory under `mocked-fetches/<key>/` MUST contain:
 > re-assertion — it is treated as a first-fetch; the `expected_sha256` pin on the
 > provenance is not consulted.
 
+#### 2.3.5  OCI mock entries
+
+> NORMATIVE: An **OCI** dep is mocked by a `mocked-fetches/<key>/` entry whose
+> key is `url_key(f"{registry}/{repository}", digest)` (§2.3.1, applied to the
+> `registry/repository` pair as the "location" half and `digest` as the "pointer"
+> half). This mirrors the git split (§2.3.1: `url` = location, `ref` = pointer)
+> and the tarball split (§2.3.4: `url` = location, empty pointer): for OCI, the
+> registry+repository is the location and the content digest is the (already
+> immutable) pointer. For example, `registry="ghcr.io"`, `repository="example/bar"`,
+> `digest="sha256:aa..."` encodes to `ghcr.io_example_bar@sha256_aa...` — the same
+> flat `mocked-fetches/` namespace shared by git and tarball entries, with no
+> per-kind subdirectory prefix.
+
+An OCI subdirectory under `mocked-fetches/<key>/` MUST contain:
+
+**`content/`** (required) and **`<name>.nimble`** (optional)
+
+> NORMATIVE: Identical semantics to the git and tarball cases (§2.3.2, §2.3.4):
+> `content/` is the source tree staged into `dest` and hashed for the identity,
+> and a sibling `<name>.nimble` is flattened into `dest` and included in the
+> hash.
+
+> NOTE: Unlike git (`sha`) and tarball (`archive_sha256`), an OCI mock entry
+> carries **no separate receipt-input file**. The real `OciFetcher`'s receipt
+> (`OciReceipt.layer_digest`) is exactly the `digest` field already present on
+> the `OciProvenance` being fetched — an OCI digest is a content pointer chosen
+> by the caller (the index entry or manifest dep block), not a mutable ref
+> resolved by the transport (contrast git's mutable branch/tag → commit SHA).
+> The mocked fetcher therefore has nothing new to disclose: it stages
+> `content/` (+ `<name>.nimble`) verbatim and returns a receipt that echoes the
+> provenance's own `digest`. `FETCH-MOCK-MISSING` is raised when the key
+> directory does not exist, exactly as for git and tarball.
+
 ### 2.4  `expected/milpa.lock` — expected lockfile
 
 > NORMATIVE: For a success fixture, `expected/milpa.lock` MUST be a valid

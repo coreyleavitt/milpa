@@ -2159,6 +2159,18 @@ pub fn url_key(url: &str, ref_spec: &str) -> String {
     format!("{}@{}", sanitize(url), sanitize(ref_spec))
 }
 
+/// Encode an OCI `(registry, repository, digest)` triple to its
+/// `mocked-fetches/` subdirectory name (conformance-fixtures.md §2.3.5).
+///
+/// Mirrors the git/tarball key split: `registry/repository` is the "location"
+/// half and `digest` is the "pointer" half — reusing [`url_key`] as the single
+/// SSOT sanitizer rather than a parallel encoder. Unlike a git ref, an OCI
+/// digest is already an immutable content pointer, so it slots directly into
+/// the position `url_key` treats as the ref.
+pub fn oci_key(registry: &str, repository: &str, digest: &str) -> String {
+    url_key(&format!("{registry}/{repository}"), digest)
+}
+
 /// A [`FetcherRegistry`] backed by a `mocked-fetches/` fixture tree.
 ///
 /// When `MILPA_MOCKED_FETCHES=<dir>` is set, `milpa-cli` wraps the resolution
@@ -2170,9 +2182,9 @@ pub fn url_key(url: &str, ref_spec: &str) -> String {
 /// 3. Copy `<key>/<name>.nimble` into `dest` if present.
 /// 4. Return a `Receipt` with `resolved_ref = Some(sha)`.
 ///
-/// If the key directory is missing, returns `FETCH-MOCK-MISSING`.
-/// Only `Provenance::Git` is supported; any other provenance yields a clear
-/// (non-catalog) error.
+/// If the key directory is missing, returns `FETCH-MOCK-MISSING`. All four
+/// `Provenance` kinds are handled: `Git`, `Tarball`, `Local` (delegates to the
+/// real `fetch_local`, no mock), and `Oci` (conformance-fixtures.md §2.3.5).
 ///
 /// `milpa-conformance`'s `FakeFetcher` also delegates to [`stage_mock`] for
 /// the core logic, then additionally admits the staged tree into the CAS and
@@ -2305,11 +2317,29 @@ impl FetcherRegistry for MockedFetcher {
                 // Python's mocked_registry. There is nothing to mock. (Slice C "205".)
                 return fetch_local(name, Path::new(path), dest);
             }
-            other => {
-                return Err(FetchError::Failed(format!(
-                    "MockedFetcher: unsupported provenance kind: {other:?}; \
-                     only Git, Tarball, and Local provenance are handled"
-                )));
+            Provenance::Oci {
+                registry,
+                repository,
+                digest,
+            } => {
+                // conformance-fixtures.md §2.3.5: keyed on (registry/repository,
+                // digest) — no separate receipt-input file, since the digest is
+                // already the immutable pointer the caller supplied. Mirrors
+                // fetch_oci's real receipt shape: the lockfile's Oci record is
+                // built directly from Provenance::Oci (resolver.rs), never from
+                // the receipt, so `Receipt::default()` is correct here too.
+                let key_dir = self.mocked_fetches_dir.join(oci_key(registry, repository, digest));
+                if !key_dir.is_dir() {
+                    return Err(FetchError::Transport(
+                        "FETCH-MOCK-MISSING",
+                        format!(
+                            "mocked fetch: no OCI fixture for {registry}/{repository}@{digest} \
+                             (expected dir: {})",
+                            key_dir.display()
+                        ),
+                    ));
+                }
+                (key_dir, Receipt::default())
             }
         };
         clear_dest(dest).map_err(|e| FetchError::Failed(e))?;
