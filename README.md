@@ -33,19 +33,31 @@ uv run python -m milpa --help
 
 `uv sync` reads `impls/python/pyproject.toml`; nothing is installed globally.
 
+Or install it as a standalone `milpa` command (the repo is public):
+
+```bash
+uv tool install "git+https://github.com/coreyleavitt/milpa.git#subdirectory=impls/python"
+milpa --help
+```
+
 ## Usage
 
 Run milpa against any Nim project that has a `milpa.kdl` manifest (or a `.nimble` milpa can read). From your `milpa/impls/python` checkout, point `-C` at the project:
 
 ```bash
-uv run python -m milpa -C /path/to/project fetch    # resolve + clone deps into _deps/, emit nim.cfg + milpa.lock
-uv run python -m milpa -C /path/to/project lock      # resolve + write milpa.lock only (no nim.cfg)
-uv run python -m milpa -C /path/to/project verify    # check _deps/ matches the lockfile
-uv run python -m milpa -C /path/to/project show      # print the resolved graph
-uv run python -m milpa -C /path/to/project clean     # remove _deps/ and generated files
+milpa -C /path/to/project fetch    # resolve + fetch deps into _deps/, emit nim.cfg + milpa.lock
+milpa -C /path/to/project lock     # resolve + write milpa.lock only (no nim.cfg)
+milpa -C /path/to/project verify   # check _deps/ matches the lockfile
+milpa -C /path/to/project show     # print the resolved graph
+milpa -C /path/to/project clean    # remove _deps/ and nim.cfg (keeps milpa.lock)
+milpa -C /path/to/project add …    # add a dep (or a mirror provenance) to milpa.kdl
 ```
 
-`fetch` writes `_deps/`, `nim.cfg`, and `milpa.lock` into the project; `nim` then compiles using the emitted `--path:` lines, with no `nimble` involvement.
+(From a source checkout, prefix with `uv run python -m` instead of the installed `milpa`.)
+
+`fetch` writes `_deps/`, `nim.cfg`, and `milpa.lock` into the project; `nim` then compiles using the emitted `--path:` lines, with no `nimble` involvement. Dependencies can be URL-based (`git=`/`tarball=`), local path checkouts (`local=`), OCI artifacts (`oci=`), or **named packages** resolved through the [tianguis](https://github.com/coreyleavitt/tianguis) registry.
+
+Beyond project resolution, milpa also provides `hash` (content identity of a source tree), `store` (inspect the content-addressed store), `index` (registry append-only-ratchet status/accept), `workspace` (cargo-style multi-member workspaces), and `publish` (pack the git HEAD tree → push to an OCI registry → keyless-cosign-sign it → emit a receipt, for publishing a package to a registry). Run `milpa --help` for the full list.
 
 A Rust reference implementation (byte-identical lockfiles + `nim.cfg`) lives in `impls/rust/` and is run in a container via `./dev-rust`; both impls are validated against the shared conformance corpus in `conformance/`.
 
@@ -55,7 +67,7 @@ The Mesoamerican multi-crop polyculture: corn, beans, and squash grown together 
 
 ## Status
 
-v0 shipped — fresco's hard split unblocked. v0.x and v1 in progress on Tier 1+2 features (`.nimble` compat, parallel fetch, resolution strategies, content-addressed identity Phase A). See `docs/comparison-vs-nimble-atlas.md` for the roadmap.
+Well past v0 (which unblocked fresco's hard split). Shipped since: `.nimble` compat, parallel fetch, resolution strategies + overrides, cargo-style workspaces, content-addressed identity, a Rust reference implementation validated against a shared conformance corpus, and integration with the [tianguis](https://github.com/coreyleavitt/tianguis) registry — named-package resolution, `milpa publish` for author-side publishing, and a Sigstore-based supply-chain trust model (per-entry author-signed attestation + append-only index ratchet). See `docs/comparison-vs-nimble-atlas.md` for the roadmap and the `docs/rfc-*.md` files for the design record.
 
 ## What's structurally distinct
 
@@ -67,9 +79,9 @@ See [`docs/identity-and-provenance.md`](docs/identity-and-provenance.md) for the
 
 Considered. nimble has ~3 active maintainers and the design issues are structural (Turing-complete nimscript manifests, URL not first-class, conflated PM+build+task-runner). Fixes reach users via Nim minor releases — months out. milpa solves the resolution problem in days, locally, with zero ecosystem-coordination cost. nimble continues to work fine for nim-lang-registered packages where you don't need URL-based deps.
 
-## Why not full uv-for-nim
+## Scope
 
-Considered. 8-12 weeks for a competent replacement covering resolver + build invoker + task runner. milpa intentionally scopes to *just* the resolver and emits paths that any `nim` invocation can consume — ~600 lines of Python instead of a multi-month project.
+milpa began as *just* the resolver (the fresco-unblock charter) and has deliberately grown into a full Nim dependency manager: resolution, content-addressed identity, a package-registry client ([tianguis](https://github.com/coreyleavitt/tianguis)), author-side publishing, and a Sigstore-based supply-chain trust model. What it deliberately does **not** do is drive builds or run tasks — it emits a declarative `nim.cfg` (never a NimScript `config.nims`; see [`docs/decision-config-nims.md`](docs/decision-config-nims.md)) that any `nim` invocation consumes. That lane separation — dependency management vs. build/task-running — is intentional, and is what keeps milpa a manifest-is-pure-data tool rather than a `uv`-for-Nim that also owns the build and task-runner surface nimble conflates.
 
 ## License
 
