@@ -30,7 +30,7 @@ milpa -C <project> add …    # add a dependency to milpa.kdl
 ## Features
 
 - **PubGrub resolution** with selectable strategies, overrides, optional dependencies, and conditional `when` blocks.
-- **Content-addressed identity** — a dependency's identity is a hash of its source tree, recorded separately from its provenance (URL/ref/commit, or OCI digest).
+- **Content-addressed identity** — a dependency's identity is a hash of its source tree, recorded separately from its provenance (URL/ref/commit, or OCI digest). This enables offline lockfile verification, deduplication across forks and mirrors, and detection when a dependency's contents change under a moved ref.
 - **Registry** — named packages resolve through tianguis; `milpa publish` packs the git HEAD tree, pushes it to an OCI registry, and keyless-cosign-signs it.
 - **Supply-chain trust** — per-entry Sigstore attestation and an append-only index ratchet, verified at resolve time.
 - **Declarative** — `milpa.kdl` is pure data with no embedded scripting; the output is `nim.cfg`, never NimScript.
