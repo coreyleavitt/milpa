@@ -564,3 +564,34 @@ rotation confirmed deferred with emergency bypass documented in §12.3.)
 
 9. **Active TNG-INDEX-* codes (6):** `BUNDLE-MISSING`, `BUNDLE-MALFORMED`,
    `SIGNATURE-INVALID`, `DIGEST-MISMATCH`, `SIGNER-MISMATCH`, `BUNDLE-STALE`.
+
+## Addendum (2026-07-26): DEFAULT_INDEX_SIGNER → `attest-index.yaml` (supersedes R1-H2's fix)
+
+Closing the tianguis-side `TNG-INDEX-BUNDLE-MISSING` gap (§9) surfaced that
+R1-H2's batch-1 fix ("DEFAULT_SIGNER → reindex.yaml + pin test", line 45
+above) pinned the wrong workflow: `reindex.yaml` is `workflow_dispatch`-only
+with no recurring schedule (it ran once, for the epoch-2 migration) and is
+not what actually mutates `index.kdl` — that's the daily `vendor.yaml` cron
+and every author publish via `commit-entry.yaml`. Neither of those could
+sign under `reindex.yaml`'s identity, and they can't share ONE identity by
+each signing under its own ambient OIDC SAN either (milpa's verifier accepts
+only a single pinned signer string).
+
+Resolved by adding a new tianguis reusable (`workflow_call`) workflow,
+`.github/workflows/attest-index.yaml`, invoked as a job by both `vendor.yaml`
+and `commit-entry.yaml` immediately after each commits `index.kdl`. A
+reusable workflow's OIDC token records `job_workflow_ref` as the CALLEE's
+path regardless of caller (the inverse of a composite action, which
+preserves the CALLER's SAN — see tianguis's per-author Model-3 identity
+design) — so every whole-index bundle now carries the identical signer
+identity, `https://github.com/coreyleavitt/tianguis/.github/workflows/attest-index.yaml@refs/heads/main`,
+no matter which process produced it.
+
+`DEFAULT_INDEX_SIGNER` updated in both impls
+(`impls/python/milpa/index_trust.py`,
+`impls/rust/crates/milpa-core/src/index_trust.rs`) + all pin tests
+(`test_index_trust.py`, `index_trust.rs`, `milpa-cli/src/main.rs`) + spec
+(`spec/registry-protocol.md` §3.4.4 step 5, `spec/cli-contract.md`'s
+override example) + this RFC (§3.2, §9 — §9 now records both the original
+proposal and the shipped resolution, since they differ on exactly this
+signer-identity question).

@@ -332,7 +332,14 @@ anti-pattern `cas_admissible=False` exists to prevent. The action gets `content_
 `milpa hash git=<path> ref=HEAD` already works for standalone hashing via the cas-admissible git path.
 (Corey may veto the drop — see report.)
 
-## Cross-repo (after milpa publish lands)
+## Cross-repo E2E — BUILT 2026-07-25 (uncommitted in tianguis + softlink; milpa pushed)
+- milpa publish pushed to origin/main `27435c5`. E2E target = **softlink v0.11.0** (dry-run validated: 162 files, `--name softlink` explicit since no milpa.kdl at that commit).
+- **T1 (tianguis, ~/projects/tianguis — UNCOMMITTED):** `.github/actions/publish/action.yaml` rewritten to unified pack→push→sign→verify→attest→**dispatch** (replaces dead `milpa hash local=` with `milpa publish --output receipt.json` → read content_hash/oci_ref; dispatch POST via `jq -n`, `audience=sigstore` bearer confirmed vs function.go/oidc.go). **Control-loop caught+fixed a real bug:** the step overrode `ACTIONS_ID_TOKEN_REQUEST_TOKEN` with `github.token` (inherited latent from publish.yaml) → would break cosign keyless OIDC; removed. `commit-entry.yaml` milpa pin bumped `130ecd1`(stale, pre-restructure — path didn't exist)→`27435c5` (lockstep). `publish.yaml` retired to an erroring stub (was the SAN-collapse reusable-workflow path + called the deleted monolith). `docs/adoption/github.md` → composite-action pattern.
+- **N1 (softlink, ~/projects/softlink — UNCOMMITTED):** NEW `.github/workflows/tianguis-publish.yaml` (did NOT clobber existing release.yaml). Rewritten by control loop to add `workflow_dispatch` (ref+dry-run inputs, checks out the tagged tree) since release.yaml creates tags via GITHUB_TOKEN → loop-prevention means no auto-chain. Calls the composite action in softlink's own job (SAN fix).
+- All YAML syntax-valid. Q2 (oras login hardcoded ghcr.io) = fine for softlink/GHCR, noted.
+- **FIRING runbook (Corey-gated):** (1) add `MILPA_GIT_READ_PAT` secret to softlink (read-only PAT on milpa, private); (2) commit+push tianguis + softlink; (3) trigger tianguis-publish.yaml via workflow_dispatch ref=v0.11.0 dry-run=true (smoke); (4) set GHCR pkg `ghcr.io/coreyleavitt/softlink` PUBLIC after first publish; (5) real run dry-run=false → dispatch commits entry → ratchet TOFU-pins coreyleavitt as authorizedSigner → **closes tianguis#42**.
+
+## Cross-repo (original R2 plan — superseded by the BUILT section above)
 - [ ] **T1 (tianguis) — bigger than a footnote (R2/breadth C1+C2).** Two surfaces, not one:
       - **`.github/actions/publish/action.yaml`:** call `milpa publish --output receipt.json` (resolves
         git tree, hashes, packs, pushes, cosigns) → read `receipt.content_hash`/`oci_ref`/`digest` →
