@@ -1,0 +1,6 @@
+name "portal"
+kind "library"
+deps {
+    zeta
+    alpha
+}

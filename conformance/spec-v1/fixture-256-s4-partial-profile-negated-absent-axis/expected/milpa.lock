@@ -4,7 +4,7 @@ strategy "maxver"
 
 dep "member-a" {
     identity "dag-sha256:fbbae8a703db436a5fe722eaa24df785d82a601e850652ab1ffc060d7bda95a1"
-    version "0.0.1"
+    version "0.0.0"
     src_dir ""
     requires
     provenance {

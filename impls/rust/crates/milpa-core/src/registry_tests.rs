@@ -1189,36 +1189,68 @@ fn a2a_malformed_yanked_at_yields_none_no_diagnostic() {
     assert!(diagnostics.is_empty());
 }
 
+// Pure ISO-8601 timestamp parser unit tests (`iso8601_*`) moved to
+// `milpa-types` alongside `Timestamp`/`parse_iso8601_timestamp` themselves
+// (D0, rfc-resolution-semantics.md Axis D prerequisite) — they exercise the
+// parser directly, not `registry.rs`'s own IndexVersion-parsing logic. The
+// `a2a_*` tests above stay here: they exercise registry.rs's parse-to-typed
+// wiring (`IndexVersion.published_at`/`yanked_at`), merely using the
+// (re-exported) parser to construct the expected value.
+
 // ---------------------------------------------------------------------------
-// ISO-8601 timestamp parser — malformed/edge cases (registry.rs's hand-rolled
-// parser; no external date crate — see registry.rs module docs).
+// D3 (resolution-semantics RFC §3 Axis D / §4 stage 2): the exclude-newer
+// hard cut at the enumeration layer — pure-function unit tests, isolated
+// from index parsing / the resolver / the solver (mirrors
+// impls/python/tests/test_registry.py::TestFilterByExcludeNewer).
 // ---------------------------------------------------------------------------
 
-#[test]
-fn iso8601_parses_z_suffixed() {
-    let t = parse_iso8601_timestamp("2026-05-26T04:49:44Z").unwrap();
-    // 2026-05-26T04:49:44Z: sanity-check against an independently computed
-    // Unix timestamp (via `date -u -d ... +%s`-equivalent reasoning is not
-    // available offline here, so this pins internal consistency: re-parsing
-    // the same string is idempotent and two different instants differ).
-    let t2 = parse_iso8601_timestamp("2026-05-26T04:49:44Z").unwrap();
-    assert_eq!(t, t2);
-    let t3 = parse_iso8601_timestamp("2026-05-26T04:49:45Z").unwrap();
-    assert_ne!(t, t3);
-    assert_eq!(t3.unix_seconds, t.unix_seconds + 1);
+fn ver_at(v: &str, published_at: Option<Timestamp>) -> IndexVersion {
+    IndexVersion {
+        published_at,
+        ..ver(v, "sha256:x", vec![git()])
+    }
 }
 
 #[test]
-fn iso8601_offset_and_z_agree_on_same_instant() {
-    let z = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
-    let offset = parse_iso8601_timestamp("2026-01-01T01:00:00+01:00").unwrap();
-    assert_eq!(z, offset);
+fn d3_no_bound_is_a_no_op() {
+    let versions = vec![
+        ver_at("1.0.0", None),
+        ver_at("2.0.0", parse_iso8601_timestamp("2026-01-01T00:00:00Z")),
+    ];
+    let (kept, dropped) = filter_by_exclude_newer(&versions, None);
+    assert_eq!(kept, versions);
+    assert_eq!(dropped, 0);
 }
 
 #[test]
-fn iso8601_rejects_garbage() {
-    assert!(parse_iso8601_timestamp("not-a-timestamp").is_none());
-    assert!(parse_iso8601_timestamp("").is_none());
-    assert!(parse_iso8601_timestamp("2026-13-01T00:00:00Z").is_none()); // month 13
-    assert!(parse_iso8601_timestamp("2026-01-01T00:00:00+99:99").is_none());
+fn d3_keeps_versions_at_or_before_the_bound() {
+    let ts = parse_iso8601_timestamp("2026-06-01T00:00:00Z").unwrap();
+    let older = ver_at("1.0.0", parse_iso8601_timestamp("2026-01-01T00:00:00Z"));
+    let exact = ver_at("1.5.0", Some(ts));
+    let newer = ver_at("2.0.0", parse_iso8601_timestamp("2026-12-01T00:00:00Z"));
+    let (kept, dropped) =
+        filter_by_exclude_newer(&[older.clone(), exact.clone(), newer], Some(ts));
+    assert_eq!(kept, vec![older, exact]);
+    assert_eq!(dropped, 1);
+}
+
+#[test]
+fn d3_fail_closed_excludes_unprovable_published_at() {
+    let ts = parse_iso8601_timestamp("2026-06-01T00:00:00Z").unwrap();
+    let unprovable = ver_at("1.0.0", None);
+    let (kept, dropped) = filter_by_exclude_newer(&[unprovable], Some(ts));
+    assert!(kept.is_empty());
+    assert_eq!(dropped, 1);
+}
+
+#[test]
+fn d3_empties_the_set_reports_full_dropped_count() {
+    let ts = parse_iso8601_timestamp("2020-01-01T00:00:00Z").unwrap();
+    let versions = vec![
+        ver_at("1.0.0", parse_iso8601_timestamp("2026-01-01T00:00:00Z")),
+        ver_at("2.0.0", None),
+    ];
+    let (kept, dropped) = filter_by_exclude_newer(&versions, Some(ts));
+    assert!(kept.is_empty());
+    assert_eq!(dropped, 2);
 }

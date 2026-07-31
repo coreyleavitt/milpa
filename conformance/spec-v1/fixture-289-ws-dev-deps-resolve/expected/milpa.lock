@@ -4,7 +4,7 @@ strategy "maxver"
 
 dep "devtool" {
     identity "dag-sha256:89087811956a01bbdbbb1cca1761b294a5f2369715cd8c0864ee9f6a4f02f16e"
-    version "0.0.1"
+    version "0.0.0"
     src_dir ""
     requires
     provenance {
@@ -18,7 +18,7 @@ dep "devtool" {
 
 dep "extlib" {
     identity "dag-sha256:3af28f998d8f9614a60c6fc37e0c08299cd4a06c843a01c88d7a82f9c6d8a704"
-    version "0.0.1"
+    version "0.0.0"
     src_dir ""
     requires
     provenance {
@@ -32,7 +32,7 @@ dep "extlib" {
 
 dep "member-a" {
     identity "dag-sha256:9831e2cafc53cbc3d76f67c44121ac07303b2d8b4c92e26f65ceb3f352e3cbb5"
-    version "0.0.1"
+    version "0.0.0"
     src_dir ""
     requires "devtool" "extlib"
     provenance {
@@ -44,7 +44,7 @@ dep "member-a" {
 
 dep "member-b" {
     identity "dag-sha256:99e90d3f0a73eceb976174c550c06ee14b7510022cf16e70efd9cafff97e8bc6"
-    version "0.0.1"
+    version "0.0.0"
     src_dir ""
     requires "member-a" "testhelper"
     provenance {
@@ -56,7 +56,7 @@ dep "member-b" {
 
 dep "testhelper" {
     identity "dag-sha256:213ada61d29c6c2d450b66c012aa3b9addc8e18c69a300343e512cf561925174"
-    version "0.0.1"
+    version "0.0.0"
     src_dir ""
     requires
     provenance {

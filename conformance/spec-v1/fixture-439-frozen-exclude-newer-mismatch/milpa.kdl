@@ -1,0 +1,13 @@
+// resolution-semantics RFC §3 Axis D, D6 (D5 frozen parity, negative
+// case): the lockfile's recorded top-level exclude_newer is STALE --
+// tighter than the manifest's current effective resolution { exclude-newer
+// } -- frozen must raise FROZEN-EXCLUDE-NEWER-MISMATCH rather than
+// silently accepting a lock recorded under a different time-bound.
+name "myapp"
+kind "application"
+resolution {
+    exclude-newer "2026-01-01T00:00:00Z"
+}
+deps {
+    widget
+}

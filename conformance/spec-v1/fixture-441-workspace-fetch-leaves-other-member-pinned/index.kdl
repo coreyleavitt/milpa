@@ -1,0 +1,41 @@
+schema_version 1
+package "crisol" {
+    version "1.0.0" {
+        content_hash "dag-sha256:d255ceef55d812a9c81b8b4e4d5de728de2b96cabcfa004dd67aade676fa3a3e"
+        provenance {
+            kind "git"
+            url "https://example.com/crisol.git"
+            ref "v1.0.0"
+            commit_sha "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+        }
+    }
+    version "2.0.0" {
+        content_hash "dag-sha256:9fe22a192fb367d2b43f8f78612d78704b6f97cc7f7576cc683aab2a9ffc4ede"
+        provenance {
+            kind "git"
+            url "https://example.com/crisol.git"
+            ref "v2.0.0"
+            commit_sha "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+        }
+    }
+}
+package "httputils" {
+    version "1.0.0" {
+        content_hash "dag-sha256:3bda8d8ad4d926c04b5e9eeb5576c2fe59dc5d950dc8489478a664ef5a9811db"
+        provenance {
+            kind "git"
+            url "https://example.com/httputils.git"
+            ref "v1.0.0"
+            commit_sha "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        }
+    }
+    version "2.0.0" {
+        content_hash "dag-sha256:e2b96e08d9ffb2398670b40347b3ef2463696b8c1db97b01b159547a7c3b8271"
+        provenance {
+            kind "git"
+            url "https://example.com/httputils.git"
+            ref "v2.0.0"
+            commit_sha "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2"
+        }
+    }
+}

@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import pathlib
 import textwrap
+from datetime import datetime, timezone
 
 import pytest
 
@@ -84,7 +85,7 @@ from milpa.manifest import (
     parse_workspace_or_manifest,
 )
 from milpa.profile import Profile
-from milpa.version import VersionSet
+from milpa.version import Strategy, Version, VersionSet
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -409,6 +410,32 @@ class TestUrlDepParse:
         assert isinstance(m.deps[0], UrlDep)
         assert m.deps[0].git == "https://a/foo.git"
 
+    # -------------------------------------------------------------------
+    # A3b (rfc-resolution-semantics.md §3 Axis A (b) step 4): ``version=``
+    # annotation on a UrlDep.
+    # -------------------------------------------------------------------
+
+    def test_url_dep_version_annotation_parsed(self) -> None:
+        """``version="1.2.3"`` on a UrlDep parses into a typed ``Version``."""
+        text = 'name "x"\ndeps {\n    foo git=(url)"https://a/foo.git" ref="main" version="1.2.3"\n}\n'
+        m = parse_manifest(text)
+        dep = m.deps[0]
+        assert isinstance(dep, UrlDep)
+        assert dep.version == Version(1, 2, 3)
+
+    def test_url_dep_version_annotation_absent_is_none(self) -> None:
+        """No ``version=`` property → ``UrlDep.version is None`` (not an error)."""
+        text = 'name "x"\ndeps {\n    foo git=(url)"https://a/foo.git" ref="main"\n}\n'
+        m = parse_manifest(text)
+        assert m.deps[0].version is None  # type: ignore[union-attr]
+
+    def test_url_dep_version_annotation_malformed_raises(self) -> None:
+        """A malformed ``version=`` value is a hard error (MAN-DEP-VERSION-INVALID)
+        — milpa.kdl is milpa's own strict format, same rationale as the
+        top-level package ``version`` field."""
+        text = 'name "x"\ndeps {\n    foo git=(url)"https://a/foo.git" ref="main" version="not-a-version"\n}\n'
+        assert_slug(text, E.MAN_DEP_VERSION_INVALID)
+
 
 # ---------------------------------------------------------------------------
 # 3c-2 — NamedDep parse
@@ -540,6 +567,29 @@ class TestTarballDepParse:
         m = parse_manifest(text)
         assert m.deps[0].strip_components == 0  # type: ignore[union-attr]
 
+    def test_tarball_dep_version_annotation_parsed(self) -> None:
+        """A3b: ``version=`` on a TarballDep parses (reach extended beyond
+        git/url — a constrained tarball dep otherwise has no escape hatch)."""
+        text = textwrap.dedent("""\
+            name "x"
+            deps {
+                foo tarball=(url)"https://example.com/foo.tar.gz" version="2.0.0"
+            }
+        """)
+        m = parse_manifest(text)
+        dep = m.deps[0]
+        assert isinstance(dep, TarballDep)
+        assert dep.version == Version(2, 0, 0)
+
+    def test_tarball_dep_version_annotation_malformed_raises(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            deps {
+                foo tarball=(url)"https://example.com/foo.tar.gz" version="nope"
+            }
+        """)
+        assert_slug(text, E.MAN_DEP_VERSION_INVALID)
+
 
 # ---------------------------------------------------------------------------
 # 3c-4 — LocalDep + MemberDep parse
@@ -569,6 +619,18 @@ class TestLocalDepParse:
         text = fixture_kdl("fixture-016-man-dep-local-path")
         expected = fixture_error("fixture-016-man-dep-local-path")
         assert_slug(text, expected)
+
+    def test_local_dep_version_annotation_parsed(self) -> None:
+        """A3b: ``version=`` on a LocalDep parses."""
+        text = 'name "x"\ndeps {\n    foo local="../foo" version="0.3.0"\n}\n'
+        m = parse_manifest(text)
+        dep = m.deps[0]
+        assert isinstance(dep, LocalDep)
+        assert dep.version == Version(0, 3, 0)
+
+    def test_local_dep_version_annotation_malformed_raises(self) -> None:
+        text = 'name "x"\ndeps {\n    foo local="../foo" version="x.y.z"\n}\n'
+        assert_slug(text, E.MAN_DEP_VERSION_INVALID)
 
 
 class TestMemberDepParse:
@@ -1078,6 +1140,260 @@ class TestOverridesParse:
         assert len(wm.overrides) == 1
         assert wm.overrides[0].name == "shared"
 
+    # -------------------------------------------------------------------
+    # A3b (rfc-resolution-semantics.md §5 grammar; D-A3): ``version=`` on an
+    # ``overrides { pkg … }`` rule — valid regardless of target form.
+    # -------------------------------------------------------------------
+
+    def test_override_version_annotation_on_git_form(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            overrides {
+                pkg "somelib" git=(url)"https://our-fork.example.com/somelib.git" ref="main" version="1.0.0"
+            }
+        """)
+        m = parse_manifest(text)
+        ov = m.overrides[0]
+        assert ov.version == Version(1, 0, 0)
+
+    def test_override_version_annotation_on_local_form(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            overrides {
+                pkg "results" local="../results-fork" version="2.1.0"
+            }
+        """)
+        m = parse_manifest(text)
+        ov = m.overrides[0]
+        assert ov.version == Version(2, 1, 0)
+
+    def test_override_version_annotation_on_member_form(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            overrides {
+                pkg "stew" version="0.9.0" {
+                    member "stew"
+                }
+            }
+        """)
+        m = parse_manifest(text)
+        ov = m.overrides[0]
+        assert ov.version == Version(0, 9, 0)
+
+    def test_override_version_annotation_absent_is_none(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            overrides {
+                pkg "somelib" git=(url)"https://our-fork.example.com/somelib.git" ref="main"
+            }
+        """)
+        m = parse_manifest(text)
+        assert m.overrides[0].version is None
+
+    def test_override_version_annotation_malformed_raises(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            overrides {
+                pkg "somelib" git=(url)"https://our-fork.example.com/somelib.git" ref="main" version="bogus"
+            }
+        """)
+        assert_slug(text, E.MAN_DEP_VERSION_INVALID)
+
+
+# ---------------------------------------------------------------------------
+# C3 (resolution-semantics RFC §3 Axis C / §5): resolution { strategy } block
+# ---------------------------------------------------------------------------
+
+
+class TestResolutionBlockParse:
+    def test_absent_is_none(self) -> None:
+        text = 'name "x"\n'
+        m = parse_manifest(text)
+        assert m.resolution is None
+
+    def test_strategy_maxver(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            resolution {
+                strategy "maxver"
+            }
+        """)
+        m = parse_manifest(text)
+        assert m.resolution is not None
+        assert m.resolution.strategy == Strategy.MAXVER
+
+    def test_strategy_lowest_direct(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            resolution {
+                strategy "lowest-direct"
+            }
+        """)
+        m = parse_manifest(text)
+        assert m.resolution is not None
+        assert m.resolution.strategy == Strategy.LOWEST_DIRECT
+
+    def test_empty_block_is_resolution_with_no_strategy(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            resolution {
+            }
+        """)
+        m = parse_manifest(text)
+        assert m.resolution is not None
+        assert m.resolution.strategy is None
+
+    def test_unknown_child_raises_block_invalid(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            resolution {
+                bogus "x"
+            }
+        """)
+        assert_slug(text, E.MAN_RESOLUTION_BLOCK_INVALID)
+
+    def test_duplicate_strategy_child_raises_block_invalid(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            resolution {
+                strategy "maxver"
+                strategy "minver"
+            }
+        """)
+        assert_slug(text, E.MAN_RESOLUTION_BLOCK_INVALID)
+
+    def test_strategy_wrong_arity_raises_strategy_invalid(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            resolution {
+                strategy
+            }
+        """)
+        assert_slug(text, E.MAN_RESOLUTION_STRATEGY_INVALID)
+
+    def test_strategy_unrecognized_value_raises_strategy_invalid(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            resolution {
+                strategy "bogus"
+            }
+        """)
+        assert_slug(text, E.MAN_RESOLUTION_STRATEGY_INVALID)
+
+    def test_workspace_root_resolution_block_parses(self) -> None:
+        text = textwrap.dedent("""\
+            workspace {
+                member "a"
+            }
+            resolution {
+                strategy "semver"
+            }
+        """)
+        ws = parse_workspace_or_manifest(text)
+        assert isinstance(ws, WorkspaceManifest)
+        assert ws.resolution is not None
+        assert ws.resolution.strategy == Strategy.SEMVER
+
+    # -----------------------------------------------------------------------
+    # D1 (rfc-resolution-semantics.md §3 Axis D): resolution { exclude-newer }
+    # -----------------------------------------------------------------------
+
+    def test_exclude_newer_parses(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            resolution {
+                exclude-newer "2026-01-01T00:00:00Z"
+            }
+        """)
+        m = parse_manifest(text)
+        assert m.resolution is not None
+        assert m.resolution.exclude_newer == datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert m.resolution.strategy is None
+
+    def test_exclude_newer_offsetless_assumes_utc(self) -> None:
+        """R2: an offsetless value (no trailing ``Z``/offset — a very
+        natural thing to type) is NOT rejected and does not silently stay
+        naive; it is normalized by assuming UTC, matching the ``Z``-suffixed
+        spelling exactly."""
+        text = textwrap.dedent("""\
+            name "x"
+            resolution {
+                exclude-newer "2026-01-01T00:00:00"
+            }
+        """)
+        m = parse_manifest(text)
+        assert m.resolution is not None
+        assert m.resolution.exclude_newer == datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert m.resolution.exclude_newer.tzinfo is not None
+
+    def test_exclude_newer_malformed_raises_exclude_newer_invalid(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            resolution {
+                exclude-newer "not-a-timestamp"
+            }
+        """)
+        assert_slug(text, E.MAN_RESOLUTION_EXCLUDE_NEWER_INVALID)
+
+    def test_exclude_newer_wrong_arity_raises_exclude_newer_invalid(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            resolution {
+                exclude-newer
+            }
+        """)
+        assert_slug(text, E.MAN_RESOLUTION_EXCLUDE_NEWER_INVALID)
+
+    def test_duplicate_exclude_newer_child_raises_block_invalid(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            resolution {
+                exclude-newer "2026-01-01T00:00:00Z"
+                exclude-newer "2026-02-01T00:00:00Z"
+            }
+        """)
+        assert_slug(text, E.MAN_RESOLUTION_BLOCK_INVALID)
+
+    def test_strategy_and_exclude_newer_both_parse(self) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            resolution {
+                strategy "minver"
+                exclude-newer "2026-01-01T00:00:00Z"
+            }
+        """)
+        m = parse_manifest(text)
+        assert m.resolution is not None
+        assert m.resolution.strategy == Strategy.MINVER
+        assert m.resolution.exclude_newer == datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def test_unknown_child_still_raises_block_invalid_with_known_children_present(
+        self,
+    ) -> None:
+        text = textwrap.dedent("""\
+            name "x"
+            resolution {
+                strategy "minver"
+                exclude-newer "2026-01-01T00:00:00Z"
+                bogus "x"
+            }
+        """)
+        assert_slug(text, E.MAN_RESOLUTION_BLOCK_INVALID)
+
+    def test_workspace_root_exclude_newer_parses(self) -> None:
+        text = textwrap.dedent("""\
+            workspace {
+                member "a"
+            }
+            resolution {
+                exclude-newer "2026-01-01T00:00:00Z"
+            }
+        """)
+        ws = parse_workspace_or_manifest(text)
+        assert isinstance(ws, WorkspaceManifest)
+        assert ws.resolution is not None
+        assert ws.resolution.exclude_newer == datetime(2026, 1, 1, tzinfo=timezone.utc)
+
 
 # ---------------------------------------------------------------------------
 # 3c-7 — Predicates as data (representation only, no eval)
@@ -1581,6 +1897,38 @@ class TestTopLevelNodeDispatch:
         assert len(m.self_mirrors) == 1
         assert m.cas_dir == "/tmp/cas"
         assert m.spec_version_explicit is True
+
+    # -----------------------------------------------------------------------
+    # A1 (rfc-resolution-semantics.md §3 Axis A / §5): top-level package
+    # ``version`` field — sibling of ``spec-version`` (schema epoch), distinct
+    # concept (the package's own declared release version).
+    # -----------------------------------------------------------------------
+
+    def test_package_version_parsed(self) -> None:
+        """``version \"1.2.3\"`` parses into a typed ``Version`` on the manifest."""
+        m = parse_manifest('name "x"\nversion "1.2.3"\n')
+        assert m.version == Version(1, 2, 3)
+
+    def test_package_version_absent_is_none(self) -> None:
+        """No ``version`` node → ``Manifest.version is None`` (not an error)."""
+        m = parse_manifest('name "x"\n')
+        assert m.version is None
+
+    def test_package_version_malformed_raises(self) -> None:
+        """A malformed ``version`` value is a hard error — this is milpa's own
+        strict manifest, so malformed ≠ silently version-unknown (unlike the
+        ``.nimble`` compat adapter)."""
+        assert_slug(
+            'name "x"\nversion "not-a-version"\n', E.MAN_PACKAGE_VERSION_INVALID
+        )
+
+    def test_package_version_two_component_raises(self) -> None:
+        """A 2-component value (``\"1.2\"``) is not strict 3-component semver."""
+        assert_slug('name "x"\nversion "1.2"\n', E.MAN_PACKAGE_VERSION_INVALID)
+
+    def test_package_version_wrong_type_raises(self) -> None:
+        """A non-string ``version`` argument is malformed."""
+        assert_slug("name \"x\"\nversion 123\n", E.MAN_PACKAGE_VERSION_INVALID)
 
     # -----------------------------------------------------------------------
     # S5: index-trust, index-trust-signer, index-trust-bundle nodes

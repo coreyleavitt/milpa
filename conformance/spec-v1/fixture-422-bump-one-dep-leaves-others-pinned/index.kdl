@@ -1,0 +1,61 @@
+schema_version 1
+package "crisol" {
+    version "2.0.0" {
+        content_hash "dag-sha256:cd67bbecbab1ddf3a42a55b771b7cfbab8eb9b781b2deed106d61ba7747c7a6b"
+        provenance {
+            kind "git"
+            url "https://example.com/crisol.git"
+            ref "v2.0.0"
+            commit_sha "df1bb56bd52305a12a399522b559184d87a82e53"
+        }
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:a2fd011ecc0e73d3dd39e02ea681f1b90377fd4346e57017dfd3f5c32ffff78b"
+        provenance {
+            kind "git"
+            url "https://example.com/crisol.git"
+            ref "v1.0.0"
+            commit_sha "d3c6a8bea4265c1b369be78b5b8f6d2b038d8ba6"
+        }
+    }
+}
+package "bearssl" {
+    version "2.0.0" {
+        content_hash "dag-sha256:3ca11dd4a987c95647eb96be8dd6a7a1644aa0babbe246030b23cab681bfe861"
+        provenance {
+            kind "git"
+            url "https://example.com/bearssl.git"
+            ref "v2.0.0"
+            commit_sha "9c32d57f032670cc1a842f49b7343e4435e28dbd"
+        }
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:07eb3b0f3f1004831e73b25a888e40a6841d1f722935b5462b61f728d5280426"
+        provenance {
+            kind "git"
+            url "https://example.com/bearssl.git"
+            ref "v1.0.0"
+            commit_sha "96e07a78a8702872fccae5f575e19193545e57f3"
+        }
+    }
+}
+package "httputils" {
+    version "2.0.0" {
+        content_hash "dag-sha256:088de10e04624b980875c56b488e1b36b1796467f750f56172196e0b44410b7e"
+        provenance {
+            kind "git"
+            url "https://example.com/httputils.git"
+            ref "v2.0.0"
+            commit_sha "268758f178ed2bc8f146bc669cbd7cca0ef1ccc9"
+        }
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:933ec8bdd2d022ec17ce6b0a18c9f7d68cec9f2bad6f8fa739abe52d6697c1d2"
+        provenance {
+            kind "git"
+            url "https://example.com/httputils.git"
+            ref "v1.0.0"
+            commit_sha "b38045b42353a89de9edbae4de4dc856ecedcd03"
+        }
+    }
+}

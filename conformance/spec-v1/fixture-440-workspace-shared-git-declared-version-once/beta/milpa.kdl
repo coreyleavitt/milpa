@@ -1,0 +1,6 @@
+name "beta"
+kind "library"
+src_dir "src"
+deps {
+    lib-shared git=(url)"https://example.com/lib-shared.git" ref="v0.6.0"
+}

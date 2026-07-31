@@ -11,9 +11,11 @@
 
 use kdl::{KdlDocument, KdlNode, KdlValue};
 use milpa_manifest::{contains_unsafe_char, valid_flag_name, kdl_block_comment_depth, kdl_brace_depth, KDL_MAX_NESTING_DEPTH};
+use milpa_solver::VersionSource;
 use milpa_types::{
-    AttestationKind, LockAttestation, LockedDep, Lockfile, ProvenanceRecord, RekorRef,
-    ResolvedDep, ResolvedGraph, LOCKFILE_SCHEMA_VERSION,
+    format_iso8601_timestamp, parse_iso8601_timestamp, AttestationKind, LockAttestation,
+    LockedDep, Lockfile, ProvenanceRecord, RekorRef, ResolvedDep, ResolvedGraph, Timestamp,
+    LOCKFILE_SCHEMA_VERSION,
 };
 
 use crate::error::CoreError;
@@ -51,6 +53,7 @@ pub fn parse_lockfile(text: &str) -> LockResult<Lockfile> {
     let mut deps: Vec<LockedDep> = Vec::new();
     let mut strategy: Option<String> = None;
     let mut version: Option<u32> = None;
+    let mut exclude_newer: Option<Timestamp> = None;
 
     for node in doc.nodes() {
         match node.name().value() {
@@ -64,6 +67,7 @@ pub fn parse_lockfile(text: &str) -> LockResult<Lockfile> {
                     }
                 }
             }
+            "exclude_newer" => exclude_newer = Some(scalar_timestamp(node, "exclude_newer")?),
             "dep" => deps.push(parse_dep(node)?),
             _ => {}
         }
@@ -94,7 +98,38 @@ pub fn parse_lockfile(text: &str) -> LockResult<Lockfile> {
     Ok(Lockfile {
         version,
         strategy,
+        exclude_newer,
         deps,
+    })
+}
+
+/// D5 (resolution-semantics RFC §3 Axis D / §5): the OPTIONAL top-level
+/// `exclude_newer "<ts>"` node. Unlike `strategy` (required), a present-but-
+/// malformed node is a hard parse error (arity → `LOCK-FIELD-ARITY`, wrong
+/// type or an unparseable ISO 8601 timestamp → `LOCK-FIELD-TYPE`) — mirrors
+/// `scalar_u32`'s exact error-shape convention for a scalar top-level field.
+fn scalar_timestamp(node: &KdlNode, field: &str) -> LockResult<Timestamp> {
+    let a = args(node);
+    let [entry] = a.as_slice() else {
+        return Err(err(
+            "LOCK-FIELD-ARITY",
+            format!("{field:?} takes exactly one value"),
+        ));
+    };
+    let raw = match entry.value().as_string() {
+        Some(s) => s,
+        None => {
+            return Err(err(
+                "LOCK-FIELD-TYPE",
+                format!("{field:?} must be a string (got {})", entry.value()),
+            ));
+        }
+    };
+    parse_iso8601_timestamp(raw).ok_or_else(|| {
+        err(
+            "LOCK-FIELD-TYPE",
+            format!("{field:?} value {raw:?} is not a valid ISO 8601 timestamp"),
+        )
     })
 }
 
@@ -141,6 +176,7 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
     let mut aliases: Vec<String> = Vec::new(); // Phase B: alternate names
     let mut provenances: Vec<ProvenanceRecord> = Vec::new();
     let mut attestation: Option<LockAttestation> = None; // RFC per-entry-attestation.md P2 (§3.9)
+    let mut declared_version_source: Option<String> = None; // A5: sibling source for `version`
 
     for child in children(node) {
         match child.name().value() {
@@ -187,6 +223,18 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
                 identity = Some(val);
             }
             "version" => version = scalar_str(child, &name, "version")?,
+            // A5: forward-compat lenient parse (mirrors the attestation
+            // `kind` collapse convention, lockfile-schema §3.9) — an
+            // unrecognized value or malformed arity silently collapses to
+            // None rather than raising; no new error slug is warranted for
+            // a purely additive/diagnostic field.
+            "declared_version_source" => {
+                declared_version_source = args(child)
+                    .first()
+                    .and_then(|e| e.value().as_string())
+                    .and_then(|s| VersionSource::from_str_lenient(s))
+                    .map(|s| s.as_str().to_string());
+            }
             "src_dir" => {
                 let s = scalar_str(child, &name, "src_dir")?;
                 // Security: validate src_dir at the lockfile parse boundary.
@@ -267,6 +315,7 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
         cond_requires,
         aliases,
         attestation,
+        declared_version_source,
     })
 }
 
@@ -753,8 +802,15 @@ pub fn format_lockfile(lockfile: &Lockfile) -> String {
         HEADER.to_string(),
         format!("version {}", lockfile.version),
         format!("strategy {}", kdl_str(&lockfile.strategy)),
-        String::new(),
     ];
+    // D5 (resolution-semantics RFC §3 Axis D / §5): optional top-level
+    // `exclude_newer` node — emitted only when the effective time-bound was
+    // set (never a sentinel), positioned right after `strategy` and before
+    // the blank line separating the header from the dep blocks.
+    if let Some(ts) = &lockfile.exclude_newer {
+        lines.push(format!("exclude_newer {}", kdl_str(&format_iso8601_timestamp(ts))));
+    }
+    lines.push(String::new());
     for dep in &lockfile.deps {
         lines.push(format!("dep {} {{", kdl_str(&dep.name)));
         // C1: emit namespace child FIRST (before identity) to match Python's
@@ -766,6 +822,12 @@ pub fn format_lockfile(lockfile: &Lockfile) -> String {
             lines.push(format!("    identity {}", kdl_str(identity)));
         }
         lines.push(format!("    version {}", kdl_str(&dep.version)));
+        // A5: declared_version_source — the sibling field to version, emitted
+        // only when a source exists (a version-unknown dep's "0.0.0" carries
+        // no source at all, §5 NORMATIVE — the unambiguous boundary pairing).
+        if let Some(src) = &dep.declared_version_source {
+            lines.push(format!("    declared_version_source {}", kdl_str(src)));
+        }
         lines.push(format!("    src_dir {}", kdl_str(&dep.src_dir)));
         if dep.requires.is_empty() {
             lines.push("    requires".to_string());
@@ -1121,7 +1183,15 @@ pub fn write_lockfile(
 /// `Provenance` source — they are produced only by the workspace resolve (S11)
 /// and the legacy read path, never from a resolved graph, so they cannot arise
 /// here.
-pub fn from_graph(graph: &ResolvedGraph, strategy: &str) -> Lockfile {
+/// `exclude_newer` (D5, resolution-semantics RFC §3 Axis D / §5): the
+/// EFFECTIVE time-bound this resolve ran under, recorded verbatim into the
+/// lockfile's top-level `exclude_newer` node (`None` ⇒ the node is omitted
+/// entirely by `format_lockfile` — never a sentinel timestamp).
+pub fn from_graph(
+    graph: &ResolvedGraph,
+    strategy: &str,
+    exclude_newer: Option<Timestamp>,
+) -> Lockfile {
     let mut deps: Vec<LockedDep> = graph.deps.iter().map(locked_from_resolved).collect();
     // C1: sort by (namespace, name) so two qualified deps with the same bare name
     // (e.g. ns1::bar and ns2::bar) land in a stable, deterministic order.
@@ -1134,6 +1204,7 @@ pub fn from_graph(graph: &ResolvedGraph, strategy: &str) -> Lockfile {
     Lockfile {
         version: LOCKFILE_SCHEMA_VERSION,
         strategy: strategy.to_string(),
+        exclude_newer,
         deps,
     }
 }
@@ -1196,6 +1267,9 @@ fn locked_from_resolved(d: &ResolvedDep) -> LockedDep {
             bundle_pin: a.bundle_pin.clone(),
             namespace: d.registry_namespace.clone().unwrap_or_default(),
         }),
+        // A5: carry the sibling declared-version source straight through —
+        // never recomputed at the lockfile boundary.
+        declared_version_source: d.declared_version_source.clone(),
     }
 }
 
@@ -1260,6 +1334,127 @@ pub fn verify_against_graph(lockfile: &Lockfile, graph: &ResolvedGraph) -> Resul
             format!(
                 "lockfile does not match resolved graph:\n  {}",
                 errors.join("\n  ")
+            ),
+        ))
+    }
+}
+
+/// `--locked` guard (resolution-semantics RFC §3 Axis B / §6 D-B2).
+///
+/// `--locked` always performs a REAL resolve (with the B2 minimal-change/
+/// prior-lock preference already applied via the resolver's own `prior`
+/// threading) and then asserts the result is IDENTICAL to the committed
+/// lock — distinct from `frozen`, which skips solving entirely and only
+/// reconstructs.
+///
+/// **Drift is identity-based (D-B2), never version-label-based:** the
+/// comparison keys on `identity` (content hash) + the canonicalized
+/// `provenances` set only. The version string is deliberately NEVER
+/// consulted — the one-time Axis-A `0.0.1`->real-declared-version relabel
+/// of an identity-unchanged git/url/local/tarball dep is therefore
+/// compatible, not drift.
+///
+/// Provenances are compared after sorting each side by the same canonical
+/// `provenance_sort_key` the emitter uses (lockfile-schema.md §4.0) —
+/// `graph.deps[i].provenances` is observed-first/unsorted (sorted only at
+/// KDL emission time), while `prior.deps[i].provenances` was parsed back
+/// from already-canonically-sorted text, so comparing raw Vec order would
+/// produce false-positive drift.
+///
+/// Returns `RES-LOCKED-DRIFT` naming every drifted/added/removed package,
+/// or — when `prior` is `None` — because there is no committed lockfile to
+/// reproduce against at all (a best-in-class CI guard cannot assert
+/// reproducibility with nothing to reproduce).
+///
+/// `exclude_newer` is the EFFECTIVE time-bound this `--locked` resolve just
+/// ran under (D5, §6 D-D3 no-silent-drop). Dropping a previously-recorded
+/// bound RELAXES semantics (silently un-freezes the project), so — unlike
+/// identity/provenance, which are compared per-dep above — this is a single
+/// whole-lockfile comparison: `prior.exclude_newer` present but the new
+/// effective value absent (or a genuinely different timestamp) is drift.
+pub fn check_locked_drift(
+    prior: Option<&Lockfile>,
+    graph: &ResolvedGraph,
+    exclude_newer: Option<Timestamp>,
+) -> Result<(), CoreError> {
+    use milpa_types::dep_dir_name;
+    use std::collections::BTreeMap;
+
+    let Some(prior) = prior else {
+        return Err(err(
+            "RES-LOCKED-DRIFT",
+            "--locked requires a committed milpa.lock to verify against, but \
+             none was found; run `milpa lock` (or `milpa fetch`/`milpa lock` \
+             without --locked) to create one"
+                .to_string(),
+        ));
+    };
+
+    let locked: BTreeMap<String, &LockedDep> = prior
+        .deps
+        .iter()
+        .map(|d| (dep_dir_name(&d.name, d.namespace.as_deref()), d))
+        .collect();
+    let resolved: BTreeMap<String, &ResolvedDep> = graph
+        .deps
+        .iter()
+        .map(|d| (dep_dir_name(&d.name, d.namespace.as_deref()), d))
+        .collect();
+
+    let mut drifted: Vec<String> = Vec::new();
+    for name in resolved.keys() {
+        if !locked.contains_key(name.as_str()) {
+            drifted.push(format!(
+                "{name}: added — resolved but absent from the committed lockfile"
+            ));
+        }
+    }
+    for name in locked.keys() {
+        if !resolved.contains_key(name.as_str()) {
+            drifted.push(format!(
+                "{name}: removed — present in the committed lockfile, absent from the resolve"
+            ));
+        }
+    }
+    for (name, r) in &resolved {
+        let Some(l) = locked.get(name.as_str()) else { continue };
+        // D-B2: identity + provenance ONLY — the version label is never
+        // consulted (a version relabel with unchanged identity is not drift).
+        if l.identity.as_deref() != Some(r.identity.as_str()) {
+            drifted.push(format!(
+                "{name}: identity changed — lockfile={:?}, resolve={:?}",
+                l.identity, r.identity
+            ));
+            continue;
+        }
+        let mut locked_provs = l.provenances.clone();
+        locked_provs.sort_by_key(provenance_sort_key);
+        let mut actual_provs = r.provenances.clone();
+        actual_provs.sort_by_key(provenance_sort_key);
+        if locked_provs != actual_provs {
+            drifted.push(format!(
+                "{name}: provenance changed — lockfile={locked_provs:?}, resolve={actual_provs:?}"
+            ));
+        }
+    }
+
+    // D5 (§6 D-D3 no-silent-drop): a dropped or changed `exclude_newer` bound
+    // is drift too, compared once for the whole lockfile (not per-dep).
+    if prior.exclude_newer != exclude_newer {
+        drifted.push(format!(
+            "exclude_newer: changed — lockfile={:?}, resolve={:?}",
+            prior.exclude_newer, exclude_newer
+        ));
+    }
+
+    if drifted.is_empty() {
+        Ok(())
+    } else {
+        Err(err(
+            "RES-LOCKED-DRIFT",
+            format!(
+                "--locked: resolved graph deviates from the committed lockfile:\n  {}",
+                drifted.join("\n  ")
             ),
         ))
     }
@@ -1666,6 +1861,89 @@ mod tests {
         assert_eq!(err.code(), "LOCK-STRATEGY-MISSING");
     }
 
+    // --- D5 (resolution-semantics RFC §3 Axis D / §5): top-level exclude_newer ---
+
+    #[test]
+    fn exclude_newer_absent_by_default() {
+        let lock = parse_lockfile("version 1\nstrategy \"maxver\"\n").unwrap();
+        assert_eq!(lock.exclude_newer, None);
+    }
+
+    #[test]
+    fn exclude_newer_parses_present_node() {
+        let lock = parse_lockfile(
+            "version 1\nstrategy \"maxver\"\nexclude_newer \"2026-01-01T00:00:00Z\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            lock.exclude_newer,
+            Some(parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap())
+        );
+    }
+
+    #[test]
+    fn exclude_newer_wrong_arity_raises_lock_field_arity() {
+        let err = parse_lockfile(
+            "version 1\nstrategy \"maxver\"\nexclude_newer \"a\" \"b\"\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "LOCK-FIELD-ARITY");
+    }
+
+    #[test]
+    fn exclude_newer_non_string_raises_lock_field_type() {
+        let err = parse_lockfile("version 1\nstrategy \"maxver\"\nexclude_newer 42\n").unwrap_err();
+        assert_eq!(err.code(), "LOCK-FIELD-TYPE");
+    }
+
+    #[test]
+    fn exclude_newer_unparseable_timestamp_raises_lock_field_type() {
+        let err =
+            parse_lockfile("version 1\nstrategy \"maxver\"\nexclude_newer \"not-a-date\"\n")
+                .unwrap_err();
+        assert_eq!(err.code(), "LOCK-FIELD-TYPE");
+    }
+
+    #[test]
+    fn exclude_newer_omitted_from_emission_when_absent() {
+        let lock = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![] };
+        let text = format_lockfile(&lock);
+        assert!(!text.contains("exclude_newer"), "text: {text}");
+    }
+
+    #[test]
+    fn exclude_newer_emitted_right_after_strategy_when_present() {
+        let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+        let lock = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: Some(ts), deps: vec![] };
+        let text = format_lockfile(&lock);
+        assert_eq!(
+            text,
+            "// generated by milpa; reproducible build snapshot\n\
+             version 1\n\
+             strategy \"maxver\"\n\
+             exclude_newer \"2026-01-01T00:00:00Z\"\n"
+        );
+    }
+
+    #[test]
+    fn exclude_newer_round_trips_through_format_and_parse() {
+        let ts = parse_iso8601_timestamp("2026-06-15T12:34:56Z").unwrap();
+        let lock = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: Some(ts), deps: vec![] };
+        let text = format_lockfile(&lock);
+        let reparsed = parse_lockfile(&text).unwrap();
+        assert_eq!(reparsed.exclude_newer, Some(ts));
+    }
+
+    #[test]
+    fn from_graph_carries_exclude_newer_through() {
+        let graph = ResolvedGraph { deps: vec![] };
+        let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+        let lock = from_graph(&graph, "maxver", Some(ts));
+        assert_eq!(lock.exclude_newer, Some(ts));
+        let lock_none = from_graph(&graph, "maxver", None);
+        assert_eq!(lock_none.exclude_newer, None);
+    }
+
     #[test]
     fn self_mirrors_silently_ignored() {
         // S3 purge: legacy `self_mirrors` nodes are silently ignored (§3.7).
@@ -1806,7 +2084,9 @@ mod tests {
         Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![LockedDep {
+                declared_version_source: None,
                 name: "foo".into(),
                 namespace: None,
                 identity: Some(VALID_ID.into()),
@@ -1859,6 +2139,7 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![],
         };
         assert_eq!(
@@ -1874,7 +2155,9 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![LockedDep {
+                declared_version_source: None,
                 name: "foo".into(),
                 namespace: None,
                 identity: None,
@@ -1916,7 +2199,9 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![LockedDep {
+                declared_version_source: None,
                 name: "safe-name".into(),  // must be clean: LOCK-DEP-NAME-INVALID rejects non-charset chars
                 namespace: None,
                 identity: None,
@@ -1968,7 +2253,9 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![LockedDep {
+                declared_version_source: None,
                 name: "foo".into(),
                 namespace: None,
                 identity: None,
@@ -2039,7 +2326,9 @@ mod tests {
             let lock = Lockfile {
                 version: 1,
                 strategy: "maxver".into(),
+                exclude_newer: None,
                 deps: vec![LockedDep {
+                    declared_version_source: None,
                     name: "foo".into(),
                     namespace: None,
                     identity: None,
@@ -2086,6 +2375,7 @@ mod tests {
 
     fn rdep(name: &str, prov: ProvenanceRecord, requires: Vec<&str>) -> ResolvedDep {
         ResolvedDep {
+            declared_version_source: None,
             name: name.into(),
             namespace: None,
             identity: format!("dag-sha256:{}", "0".repeat(63) + "1"),
@@ -2126,7 +2416,7 @@ mod tests {
                 ),
             ],
         };
-        let lock = from_graph(&graph, "maxver");
+        let lock = from_graph(&graph, "maxver", None);
         assert_eq!(lock.version, LOCKFILE_SCHEMA_VERSION);
         assert_eq!(lock.strategy, "maxver");
         let names: Vec<&str> = lock.deps.iter().map(|d| d.name.as_str()).collect();
@@ -2144,7 +2434,7 @@ mod tests {
                 vec![],
             )],
         };
-        let lock = from_graph(&graph, "minver");
+        let lock = from_graph(&graph, "minver", None);
         assert_eq!(lock.strategy, "minver");
         let dep = &lock.deps[0];
         assert_eq!(dep.version, "0.0.1");
@@ -2195,7 +2485,7 @@ mod tests {
                 ),
             ],
         };
-        let lock = from_graph(&graph, "maxver");
+        let lock = from_graph(&graph, "maxver", None);
         let by_name = |n: &str| {
             lock.deps
                 .iter()
@@ -2252,7 +2542,7 @@ mod tests {
         let graph = ResolvedGraph {
             deps: vec![rdep("foo", git("https://e/foo.git", "", None), vec![])],
         };
-        let lock = from_graph(&graph, "maxver");
+        let lock = from_graph(&graph, "maxver", None);
         assert_eq!(
             lock.deps[0].provenances,
             vec![ProvenanceRecord::Git {
@@ -2274,7 +2564,7 @@ mod tests {
                 vec![],
             )],
         };
-        let lock = from_graph(&graph, "maxver");
+        let lock = from_graph(&graph, "maxver", None);
         // A lockfile produced from the graph matches it.
         assert!(verify_against_graph(&lock, &graph).is_ok());
 
@@ -2294,6 +2584,199 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------------
+    // B3 (resolution-semantics RFC §3 Axis B / §6 D-B2): check_locked_drift
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn check_locked_drift_matching_graph_passes() {
+        let graph = ResolvedGraph {
+            deps: vec![rdep("foo", git("https://e/foo.git", "v1", Some("c1")), vec![])],
+        };
+        let lock = from_graph(&graph, "maxver", None);
+        assert!(check_locked_drift(Some(&lock), &graph, None).is_ok());
+    }
+
+    #[test]
+    fn check_locked_drift_no_prior_lock_raises() {
+        let graph = ResolvedGraph {
+            deps: vec![rdep("foo", git("https://e/foo.git", "v1", Some("c1")), vec![])],
+        };
+        assert_eq!(
+            check_locked_drift(None, &graph, None).unwrap_err().code(),
+            "RES-LOCKED-DRIFT"
+        );
+    }
+
+    #[test]
+    fn check_locked_drift_empty_both_passes() {
+        let graph = ResolvedGraph { deps: vec![] };
+        let lock = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![] };
+        assert!(check_locked_drift(Some(&lock), &graph, None).is_ok());
+    }
+
+    #[test]
+    fn check_locked_drift_version_relabel_with_unchanged_identity_is_not_drift() {
+        // The headline D-B2 case: the one-time Axis-A 0.0.1 -> real-declared-
+        // version relabel of an identity-unchanged dep must NOT be reported
+        // as drift — only identity + provenance are compared, never `version`.
+        let graph = ResolvedGraph {
+            deps: vec![rdep("foo", git("https://e/foo.git", "v1", Some("c1")), vec![])],
+        };
+        let mut lock = from_graph(&graph, "maxver", None);
+        lock.deps[0].version = "0.0.1".into();
+        lock.deps[0].declared_version_source = None;
+        // graph's resolved version (e.g. "1.2.3" post-relabel) differs from
+        // the lock's recorded "0.0.1" — must still pass.
+        let mut relabeled_graph = graph.clone();
+        relabeled_graph.deps[0].version = milpa_types::Version::release(1, 2, 3);
+        assert!(check_locked_drift(Some(&lock), &relabeled_graph, None).is_ok());
+    }
+
+    #[test]
+    fn check_locked_drift_identity_change_raises_naming_the_package() {
+        let graph = ResolvedGraph {
+            deps: vec![rdep("foo", git("https://e/foo.git", "v1", Some("c1")), vec![])],
+        };
+        let lock = from_graph(&graph, "maxver", None);
+        let mut drifted_graph = graph.clone();
+        drifted_graph.deps[0].identity = format!("dag-sha256:{}", "b".repeat(64));
+        let err = check_locked_drift(Some(&lock), &drifted_graph, None).unwrap_err();
+        assert_eq!(err.code(), "RES-LOCKED-DRIFT");
+        assert!(err.message().contains("foo"));
+    }
+
+    #[test]
+    fn check_locked_drift_provenance_change_with_unchanged_identity_raises() {
+        // A different commit_sha — same content identity — IS drift (D-B2:
+        // identity + provenance, not identity alone).
+        let graph = ResolvedGraph {
+            deps: vec![rdep("foo", git("https://e/foo.git", "v1", Some("c1")), vec![])],
+        };
+        let lock = from_graph(&graph, "maxver", None);
+        let mut drifted_graph = graph.clone();
+        drifted_graph.deps[0].provenances = vec![git("https://e/foo.git", "v1", Some("c2"))];
+        let err = check_locked_drift(Some(&lock), &drifted_graph, None).unwrap_err();
+        assert_eq!(err.code(), "RES-LOCKED-DRIFT");
+        assert!(err.message().contains("foo"));
+    }
+
+    #[test]
+    fn check_locked_drift_added_dep_raises() {
+        let lock = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![] };
+        let graph = ResolvedGraph {
+            deps: vec![rdep("foo", git("https://e/foo.git", "v1", Some("c1")), vec![])],
+        };
+        let err = check_locked_drift(Some(&lock), &graph, None).unwrap_err();
+        assert_eq!(err.code(), "RES-LOCKED-DRIFT");
+        assert!(err.message().contains("foo"));
+    }
+
+    #[test]
+    fn check_locked_drift_removed_dep_raises() {
+        let graph = ResolvedGraph {
+            deps: vec![rdep("foo", git("https://e/foo.git", "v1", Some("c1")), vec![])],
+        };
+        let lock = from_graph(&graph, "maxver", None);
+        let empty = ResolvedGraph { deps: vec![] };
+        let err = check_locked_drift(Some(&lock), &empty, None).unwrap_err();
+        assert_eq!(err.code(), "RES-LOCKED-DRIFT");
+        assert!(err.message().contains("foo"));
+    }
+
+    #[test]
+    fn check_locked_drift_provenance_order_is_not_significant() {
+        // The lockfile's provenances arrive pre-sorted (canonical KDL emit
+        // order); the graph's arrive observed-first (unsorted until
+        // emission). Comparing raw Vec order would produce false-positive
+        // drift — the check must canonicalize both sides first.
+        let p_git = git("https://e/foo.git", "v1", Some("c1"));
+        let p_declared = ProvenanceRecord::Git {
+            url: "https://mirror.e/foo.git".into(),
+            ref_spec: opt("v1"),
+            commit_sha: None,
+            origin: "declared".into(),
+            submodule_shas: vec![],
+        };
+        let lock = Lockfile {
+            version: 1,
+            strategy: "maxver".into(),
+            exclude_newer: None,
+            deps: vec![LockedDep {
+                declared_version_source: None,
+                name: "foo".into(),
+                namespace: None,
+                identity: Some(format!("dag-sha256:{}", "0".repeat(63) + "1")),
+                version: "0.0.1".into(),
+                src_dir: "src".into(),
+                requires: vec![],
+                // Canonical order: declared before observed.
+                provenances: vec![p_declared.clone(), p_git.clone()],
+                active_flags: vec![],
+                dep_decl: None,
+                cond_requires: vec![],
+                aliases: vec![],
+                attestation: None,
+            }],
+        };
+        // Graph side: observed-first (unsorted), as the resolver actually builds it.
+        let graph = ResolvedGraph {
+            deps: vec![rdep("foo", p_git, vec![])],
+        };
+        let mut graph = graph;
+        graph.deps[0].provenances = vec![graph.deps[0].provenances[0].clone(), p_declared];
+        assert!(check_locked_drift(Some(&lock), &graph, None).is_ok());
+    }
+
+    // -------------------------------------------------------------------------
+    // D5 (resolution-semantics RFC §3 Axis D / §6 D-D3): no-silent-drop —
+    // a dropped or changed `exclude_newer` is drift too, compared once for
+    // the whole lockfile (not per-dep).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn check_locked_drift_dropped_exclude_newer_raises() {
+        let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+        let graph = ResolvedGraph { deps: vec![] };
+        let lock = from_graph(&graph, "maxver", Some(ts));
+        // The new resolve's effective exclude_newer is None — a silent drop.
+        let err = check_locked_drift(Some(&lock), &graph, None).unwrap_err();
+        assert_eq!(err.code(), "RES-LOCKED-DRIFT");
+        assert!(err.message().contains("exclude_newer"), "message: {}", err.message());
+    }
+
+    #[test]
+    fn check_locked_drift_changed_exclude_newer_raises() {
+        let ts_old = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+        let ts_new = parse_iso8601_timestamp("2027-01-01T00:00:00Z").unwrap();
+        let graph = ResolvedGraph { deps: vec![] };
+        let lock = from_graph(&graph, "maxver", Some(ts_old));
+        let err = check_locked_drift(Some(&lock), &graph, Some(ts_new)).unwrap_err();
+        assert_eq!(err.code(), "RES-LOCKED-DRIFT");
+    }
+
+    #[test]
+    fn check_locked_drift_unchanged_exclude_newer_passes() {
+        let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+        let graph = ResolvedGraph { deps: vec![] };
+        let lock = from_graph(&graph, "maxver", Some(ts));
+        assert!(check_locked_drift(Some(&lock), &graph, Some(ts)).is_ok());
+    }
+
+    #[test]
+    fn check_locked_drift_newly_added_exclude_newer_raises() {
+        // The inverse direction: TIGHTENING a bound that wasn't there before
+        // is also a real divergence from the committed lock (still surfaced
+        // as drift, even though it makes the resolve MORE restrictive — the
+        // `--locked` contract is "reproduce exactly what's committed", not
+        // "only complain about relaxations").
+        let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+        let graph = ResolvedGraph { deps: vec![] };
+        let lock = from_graph(&graph, "maxver", None);
+        let err = check_locked_drift(Some(&lock), &graph, Some(ts)).unwrap_err();
+        assert_eq!(err.code(), "RES-LOCKED-DRIFT");
+    }
+
     #[test]
     fn verify_lockfile_against_deps_reports_divergences() {
         let dir = std::env::temp_dir().join("milpa-s13-verify-test");
@@ -2302,7 +2785,9 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![LockedDep {
+                declared_version_source: None,
                 name: "foo".into(),
                 namespace: None,
                 identity: Some("dag-sha256:00".into()),
@@ -2332,6 +2817,7 @@ mod tests {
     /// Build a minimal LockedDep for verify tests.
     fn make_verify_dep(name: &str, aliases: Vec<String>) -> LockedDep {
         LockedDep {
+            declared_version_source: None,
             name: name.into(),
             namespace: None,
             identity: Some(VALID_ID.into()),
@@ -2378,6 +2864,7 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![make_verify_dep("foo", vec![])],
         };
         let d = verify_lockfile_against_deps(&lock, &deps_dir);
@@ -2416,6 +2903,7 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![make_verify_dep("foo", vec![])],
         };
         let d = verify_lockfile_against_deps(&lock, &deps_dir);
@@ -2443,6 +2931,7 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![make_verify_dep("foo", vec![])],
         };
         let d = verify_lockfile_against_deps(&lock, &deps_dir);
@@ -2468,6 +2957,7 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![make_verify_dep("foo", vec![])],
         };
         let d = verify_lockfile_against_deps(&lock, &deps_dir);
@@ -2525,6 +3015,7 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![make_verify_dep("foo", vec![])],
         };
         let d = verify_lockfile_against_deps(&lock, &deps_dir);
@@ -2562,6 +3053,7 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![make_verify_dep("foo", vec!["foo-alias".into()])],
         };
         let d = verify_lockfile_against_deps(&lock, &deps_dir);
@@ -2586,6 +3078,7 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![make_verify_dep("foo", vec!["foo-alias".into()])],
         };
         let d = verify_lockfile_against_deps(&lock, &deps_dir);
@@ -2612,6 +3105,7 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![make_verify_dep("foo", vec!["foo-alias".into()])],
         };
         let d = verify_lockfile_against_deps(&lock, &deps_dir);
@@ -2636,6 +3130,7 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![make_verify_dep("foo", vec!["foo-alias".into()])],
         };
         let d = verify_lockfile_against_deps(&lock, &deps_dir);
@@ -2662,6 +3157,7 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![make_verify_dep("foo", vec!["foo-alias".into()])],
         };
         let d = verify_lockfile_against_deps(&lock, &deps_dir);
@@ -2681,6 +3177,7 @@ mod tests {
     /// that verify passes based on identity alone and ignores provenance metadata.
     fn make_verify_dep_multi_prov(name: &str, identity: &str) -> LockedDep {
         LockedDep {
+            declared_version_source: None,
             name: name.into(),
             namespace: None,
             identity: Some(identity.into()),
@@ -2735,6 +3232,7 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![make_verify_dep_multi_prov("foo", &actual_identity)],
         };
         let d = verify_lockfile_against_deps(&lock, &deps_dir);
@@ -2769,6 +3267,7 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![make_verify_dep_multi_prov("foo", &wrong_identity)],
         };
         let d = verify_lockfile_against_deps(&lock, &deps_dir);
@@ -2811,7 +3310,9 @@ mod tests {
         let lock = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![LockedDep {
+                declared_version_source: None,
                 name: "foo".into(),
                 namespace: None,
                 identity: Some(actual_identity),
@@ -2856,7 +3357,7 @@ mod tests {
                 ),
             ],
         };
-        let lock = from_graph(&graph, "maxver");
+        let lock = from_graph(&graph, "maxver", None);
         let text = format_lockfile(&lock);
         let reparsed = parse_lockfile(&text).unwrap();
         assert_eq!(reparsed, lock);
@@ -2871,6 +3372,7 @@ mod tests {
 
     fn make_locked(cond_requires: Vec<milpa_types::CondRequire>) -> LockedDep {
         LockedDep {
+            declared_version_source: None,
             name: "qux".into(),
             namespace: None,
             identity: Some(VALID_ID.into()),
@@ -2913,6 +3415,7 @@ mod tests {
         let lf = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![dep],
         };
         let text = format_lockfile(&lf);
@@ -2924,7 +3427,7 @@ mod tests {
     #[test]
     fn s4_single_predicate_inline_not_negated() {
         let dep = make_locked(vec![cr("extra", vec![pred("platform", "linux", false)])]);
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text = format_lockfile(&lf);
         assert!(text.contains("    cond-require \"extra\" platform=\"linux\""), "got:\n{text}");
     }
@@ -2932,7 +3435,7 @@ mod tests {
     #[test]
     fn s4_single_predicate_inline_negated() {
         let dep = make_locked(vec![cr("extra", vec![pred("platform", "linux", true)])]);
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text = format_lockfile(&lf);
         assert!(text.contains("    cond-require \"extra\" platform=(not)\"linux\""), "got:\n{text}");
     }
@@ -2947,7 +3450,7 @@ mod tests {
                 pred("platform", "linux", true),
             ],
         )]);
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text = format_lockfile(&lf);
         let expected_block = "    cond-require \"macstuff\" {\n        when platform=\"macosx\"\n        when platform=(not)\"linux\"\n    }";
         assert!(text.contains(expected_block), "got:\n{text}");
@@ -2956,7 +3459,7 @@ mod tests {
     #[test]
     fn s4_cond_require_after_requires_line() {
         let dep = make_locked(vec![cr("extra", vec![pred("platform", "linux", false)])]);
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text = format_lockfile(&lf);
         let req_pos = text.find("    requires \"bar\" \"extra\"").unwrap();
         let cr_pos = text.find("    cond-require \"extra\"").unwrap();
@@ -3052,7 +3555,7 @@ mod tests {
     #[test]
     fn s4_round_trip_inline_single() {
         let dep = make_locked(vec![cr("extra", vec![pred("platform", "linux", false)])]);
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let reparsed = parse_lockfile(&format_lockfile(&lf)).unwrap();
         assert_eq!(reparsed.deps[0].cond_requires, lf.deps[0].cond_requires);
     }
@@ -3060,7 +3563,7 @@ mod tests {
     #[test]
     fn s4_round_trip_negated() {
         let dep = make_locked(vec![cr("extra", vec![pred("platform", "linux", true)])]);
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let reparsed = parse_lockfile(&format_lockfile(&lf)).unwrap();
         assert!(reparsed.deps[0].cond_requires[0].predicates[0].negated);
     }
@@ -3074,7 +3577,7 @@ mod tests {
                 pred("platform", "linux", true),
             ],
         )]);
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let reparsed = parse_lockfile(&format_lockfile(&lf)).unwrap();
         assert_eq!(reparsed.deps[0].cond_requires, lf.deps[0].cond_requires);
     }
@@ -3137,8 +3640,8 @@ mod tests {
         // requires line must be byte-identical with or without cond_requires.
         let dep_no_cond = make_locked(vec![]);
         let dep_with_cond = make_locked(vec![cr("extra", vec![pred("platform", "linux", false)])]);
-        let text_no = format_lockfile(&Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep_no_cond] });
-        let text_with = format_lockfile(&Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep_with_cond] });
+        let text_no = format_lockfile(&Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep_no_cond] });
+        let text_with = format_lockfile(&Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep_with_cond] });
         assert!(text_no.contains("    requires \"bar\" \"extra\""));
         assert!(text_with.contains("    requires \"bar\" \"extra\""));
     }
@@ -3238,7 +3741,7 @@ mod tests {
         let cr_zlib = cr("zlib", vec![pred("platform", "linux", false)]);
         let cr_asm  = cr("asm",  vec![pred("arch", "amd64", false)]);
         let dep = make_locked(vec![cr_zlib, cr_asm]);
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text = format_lockfile(&lf);
         let asm_pos  = text.find("cond-require \"asm\"").expect("asm not found");
         let zlib_pos = text.find("cond-require \"zlib\"").expect("zlib not found");
@@ -3254,8 +3757,8 @@ mod tests {
         let cr_linux = cr("foo", vec![pred("platform", "linux",  false)]);
         let dep1 = make_locked(vec![cr_mac.clone(), cr_linux.clone()]);
         let dep2 = make_locked(vec![cr_linux, cr_mac]);
-        let text1 = format_lockfile(&Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep1] });
-        let text2 = format_lockfile(&Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep2] });
+        let text1 = format_lockfile(&Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep1] });
+        let text2 = format_lockfile(&Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep2] });
         assert_eq!(text1, text2, "insertion-order must not affect output");
     }
 
@@ -3346,6 +3849,7 @@ mod tests {
 
     fn make_locked_with_aliases(aliases: Vec<String>) -> LockedDep {
         LockedDep {
+            declared_version_source: None,
             name: "foo".into(),
             namespace: None,
             identity: Some(VALID_ID.into()),
@@ -3370,7 +3874,7 @@ mod tests {
     #[test]
     fn aliases_empty_omitted_from_output() {
         let dep = make_locked_with_aliases(vec![]);
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text = format_lockfile(&lf);
         assert!(!text.contains("aliases"), "expected no aliases line: {text:?}");
     }
@@ -3378,7 +3882,7 @@ mod tests {
     #[test]
     fn aliases_emitted_when_non_empty() {
         let dep = make_locked_with_aliases(vec!["bar".into(), "baz".into()]);
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text = format_lockfile(&lf);
         assert!(text.contains("    aliases \"bar\" \"baz\""), "got:\n{text}");
     }
@@ -3387,7 +3891,7 @@ mod tests {
     fn aliases_emitted_lex_sorted() {
         // Constructed in non-sorted order; emitter must sort.
         let dep = make_locked_with_aliases(vec!["zebra".into(), "alpha".into(), "mango".into()]);
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text = format_lockfile(&lf);
         assert!(text.contains("    aliases \"alpha\" \"mango\" \"zebra\""), "got:\n{text}");
     }
@@ -3396,6 +3900,7 @@ mod tests {
     fn aliases_position_after_cond_requires_before_active_flags() {
         // Field order: requires → cond-require* → aliases → active_flags
         let dep = LockedDep {
+            declared_version_source: None,
             name: "foo".into(),
             namespace: None,
             identity: Some(VALID_ID.into()),
@@ -3415,7 +3920,7 @@ mod tests {
             aliases: vec!["baz".into()],
             attestation: None,
         };
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text = format_lockfile(&lf);
         let cr_pos = text.find("    cond-require \"bar\"").unwrap();
         let aliases_pos = text.find("    aliases \"baz\"").unwrap();
@@ -3427,7 +3932,7 @@ mod tests {
     #[test]
     fn aliases_round_trips_parse_format_parse() {
         let dep = make_locked_with_aliases(vec!["alpha".into(), "beta".into()]);
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text1 = format_lockfile(&lf);
         let lf2 = parse_lockfile(&text1).unwrap();
         let text2 = format_lockfile(&lf2);
@@ -3458,6 +3963,177 @@ mod tests {
         );
         let lf = parse_lockfile(&sample).unwrap();
         assert_eq!(lf.deps[0].aliases, vec!["alpha".to_string(), "zebra".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // A5 (resolution-semantics RFC §3 Axis A (b) / §5) — declared_version_source
+    // field: the sibling to `version` naming WHICH precedence step produced it.
+    // -----------------------------------------------------------------------
+
+    fn make_locked_with_dvs(version: &str, declared_version_source: Option<String>) -> LockedDep {
+        LockedDep {
+            declared_version_source,
+            name: "foo".into(),
+            namespace: None,
+            identity: Some(VALID_ID.into()),
+            version: version.into(),
+            src_dir: "src".into(),
+            requires: vec![],
+            provenances: vec![ProvenanceRecord::Git {
+                url: "https://example.com/foo.git".into(),
+                ref_spec: None,
+                commit_sha: None,
+                origin: "observed".into(),
+                submodule_shas: vec![],
+            }],
+            active_flags: vec![],
+            dep_decl: None,
+            cond_requires: vec![],
+            aliases: vec![],
+            attestation: None,
+        }
+    }
+
+    #[test]
+    fn dvs_emitted_when_present() {
+        let dep = make_locked_with_dvs("1.0.0", Some("nimble".into()));
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
+        let text = format_lockfile(&lf);
+        assert!(
+            text.contains("    declared_version_source \"nimble\""),
+            "got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn dvs_omitted_when_absent() {
+        let dep = make_locked_with_dvs("1.0.0", None);
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
+        let text = format_lockfile(&lf);
+        assert!(
+            !text.contains("declared_version_source"),
+            "expected no declared_version_source line: {text:?}"
+        );
+    }
+
+    #[test]
+    fn dvs_each_precedence_value_round_trips() {
+        for source in ["manifest", "nimble", "tag", "annotation"] {
+            let dep = make_locked_with_dvs("1.0.0", Some(source.into()));
+            let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
+            let text1 = format_lockfile(&lf);
+            let lf2 = parse_lockfile(&text1).unwrap();
+            assert_eq!(lf2.deps[0].declared_version_source, Some(source.to_string()));
+            let text2 = format_lockfile(&lf2);
+            assert_eq!(text1, text2);
+        }
+    }
+
+    #[test]
+    fn dvs_positioned_immediately_after_version() {
+        let dep = make_locked_with_dvs("1.0.0", Some("tag".into()));
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
+        let text = format_lockfile(&lf);
+        let version_pos = text.find("    version \"1.0.0\"").unwrap();
+        let dvs_pos = text.find("    declared_version_source \"tag\"").unwrap();
+        let src_dir_pos = text.find("    src_dir \"src\"").unwrap();
+        assert!(version_pos < dvs_pos, "version must precede declared_version_source: {text:?}");
+        assert!(dvs_pos < src_dir_pos, "declared_version_source must precede src_dir: {text:?}");
+    }
+
+    #[test]
+    fn dvs_version_unknown_pairing_0_0_0_and_no_source() {
+        // §5 NORMATIVE: version-unknown emits the absent-version literal
+        // "0.0.0" with declared_version_source omitted entirely — a
+        // combination no Known case ever produces (a Known always names its
+        // source).
+        let dep = make_locked_with_dvs("0.0.0", None);
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
+        let text = format_lockfile(&lf);
+        assert!(text.contains("    version \"0.0.0\""), "got:\n{text}");
+        assert!(!text.contains("declared_version_source"), "got:\n{text}");
+        let lf2 = parse_lockfile(&text).unwrap();
+        assert_eq!(lf2.deps[0].version, "0.0.0");
+        assert_eq!(lf2.deps[0].declared_version_source, None);
+    }
+
+    #[test]
+    fn dvs_parse_from_kdl() {
+        let sample = format!(
+            "// generated by milpa; reproducible build snapshot\n\
+             version 1\n\
+             strategy \"maxver\"\n\
+             \n\
+             dep \"foo\" {{\n\
+             \x20   identity \"{VALID_ID}\"\n\
+             \x20   version \"1.2.3\"\n\
+             \x20   declared_version_source \"annotation\"\n\
+             \x20   src_dir \"src\"\n\
+             \x20   requires\n\
+             \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
+             \x20       kind \"git\"\n\
+             \x20       url \"https://example.com/foo.git\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&sample).unwrap();
+        assert_eq!(lf.deps[0].version, "1.2.3");
+        assert_eq!(lf.deps[0].declared_version_source, Some("annotation".to_string()));
+    }
+
+    #[test]
+    fn dvs_unrecognized_value_collapses_to_none() {
+        // Forward-compat: an unrecognized declared_version_source value
+        // (e.g. from a future format revision) collapses to None rather
+        // than raising — no new error slug is warranted for a purely
+        // additive field (mirrors the attestation `kind` collapse
+        // convention).
+        let sample = format!(
+            "// generated by milpa; reproducible build snapshot\n\
+             version 1\n\
+             strategy \"maxver\"\n\
+             \n\
+             dep \"foo\" {{\n\
+             \x20   identity \"{VALID_ID}\"\n\
+             \x20   version \"1.2.3\"\n\
+             \x20   declared_version_source \"from-the-future\"\n\
+             \x20   src_dir \"src\"\n\
+             \x20   requires\n\
+             \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
+             \x20       kind \"git\"\n\
+             \x20       url \"https://example.com/foo.git\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&sample).unwrap();
+        assert_eq!(lf.deps[0].declared_version_source, None);
+    }
+
+    #[test]
+    fn dvs_absent_node_still_tolerated() {
+        // Forward-compat baseline: a lockfile with no declared_version_source
+        // node at all (pre-A5 shape) still parses fine — additive, no bump.
+        let sample = format!(
+            "// generated by milpa; reproducible build snapshot\n\
+             version 1\n\
+             strategy \"maxver\"\n\
+             \n\
+             dep \"foo\" {{\n\
+             \x20   identity \"{VALID_ID}\"\n\
+             \x20   version \"0.0.1\"\n\
+             \x20   src_dir \"src\"\n\
+             \x20   requires\n\
+             \x20   provenance {{\n\
+             \x20       origin \"observed\"\n\
+             \x20       kind \"git\"\n\
+             \x20       url \"https://example.com/foo.git\"\n\
+             \x20   }}\n\
+             }}\n"
+        );
+        let lf = parse_lockfile(&sample).unwrap();
+        assert_eq!(lf.deps[0].declared_version_source, None);
     }
 
     // -----------------------------------------------------------------------
@@ -3558,6 +4234,7 @@ mod tests {
     /// Helper: a minimal LockedDep with LocalProvenanceRecord and no identity.
     fn local_locked_dep(name: &str, path: &str) -> LockedDep {
         LockedDep {
+            declared_version_source: None,
             name: name.to_string(),
             namespace: None,
             identity: None, // local deps carry NO identity
@@ -3590,6 +4267,7 @@ mod tests {
         let lf = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![local_locked_dep("mylib", "../src")],
         };
         let divs = verify_lockfile_against_deps(&lf, &deps_dir);
@@ -3609,6 +4287,7 @@ mod tests {
         let lf = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![local_locked_dep("mylib", "../nonexistent")],
         };
         let divs = verify_lockfile_against_deps(&lf, &deps_dir);
@@ -3635,6 +4314,7 @@ mod tests {
         let lf = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![local_locked_dep("mylib", "../src")],
         };
         let divs = verify_lockfile_against_deps(&lf, &deps_dir);
@@ -3657,6 +4337,7 @@ mod tests {
         let lf = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![local_locked_dep("mylib", "../src")],
         };
         let divs = verify_lockfile_against_deps(&lf, &deps_dir);
@@ -3690,6 +4371,7 @@ mod tests {
         let lf = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![dep],
         };
         let divs = verify_lockfile_against_deps(&lf, &deps_dir);
@@ -3716,6 +4398,7 @@ mod tests {
 
     fn make_locked_dep(name: &str, identity: Option<&str>, provs: Vec<ProvenanceRecord>) -> LockedDep {
         LockedDep {
+            declared_version_source: None,
             name: name.into(),
             namespace: None,
             version: "1.0.0".into(),
@@ -3740,6 +4423,7 @@ mod tests {
         let lf = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![dep],
         };
 
@@ -3762,6 +4446,7 @@ mod tests {
         let lf = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![dep],
         };
 
@@ -3785,6 +4470,7 @@ mod tests {
         let lf = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![dep],
         };
 
@@ -3803,6 +4489,7 @@ mod tests {
         let lf = Lockfile {
             version: 1,
             strategy: "maxver".into(),
+            exclude_newer: None,
             deps: vec![dep_a, dep_b.clone()],
         };
 
@@ -3833,7 +4520,7 @@ mod tests {
     #[test]
     fn test_attestation_omitted_when_none() {
         let dep = make_locked_dep_with_attestation(None);
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text = format_lockfile(&lf);
         assert!(!text.contains("attestation"));
     }
@@ -3847,7 +4534,7 @@ mod tests {
             namespace: String::new(),
         };
         let dep = make_locked_dep_with_attestation(Some(att));
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text = format_lockfile(&lf);
         assert!(text.contains("    attestation {"));
         assert!(text.contains("        kind \"author-signed\""));
@@ -3864,7 +4551,7 @@ mod tests {
             namespace: String::new(),
         };
         let dep = make_locked_dep_with_attestation(Some(att));
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text = format_lockfile(&lf);
         assert!(text.contains("        kind \"milpa-vendored\""));
         assert!(!text.contains("signer"));
@@ -3883,7 +4570,7 @@ mod tests {
             namespace: String::new(),
         };
         let dep = make_locked_dep_with_attestation(Some(att));
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text = format_lockfile(&lf);
         assert!(text.contains("        rekor {"));
         assert!(text.contains("            uuid \"abc123\""));
@@ -3900,7 +4587,7 @@ mod tests {
             namespace: String::new(),
         };
         let dep = make_locked_dep_with_attestation(Some(att));
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text = format_lockfile(&lf);
         assert!(!text.contains("rekor"));
     }
@@ -3908,6 +4595,7 @@ mod tests {
     #[test]
     fn test_position_after_active_flags_before_provenance() {
         let dep = LockedDep {
+            declared_version_source: None,
             name: "foo".into(),
             namespace: None,
             identity: Some(VALID_ID.into()),
@@ -3932,7 +4620,7 @@ mod tests {
                 namespace: String::new(),
             }),
         };
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text = format_lockfile(&lf);
         let flags_pos = text.find("    active_flags \"ssl\"").unwrap();
         let att_pos = text.find("    attestation {").unwrap();
@@ -3953,7 +4641,7 @@ mod tests {
             namespace: String::new(),
         };
         let dep = make_locked_dep_with_attestation(Some(att.clone()));
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text1 = format_lockfile(&lf);
         let lf2 = parse_lockfile(&text1).unwrap();
         let text2 = format_lockfile(&lf2);
@@ -3970,7 +4658,7 @@ mod tests {
             namespace: String::new(),
         };
         let dep = make_locked_dep_with_attestation(Some(att.clone()));
-        let lf = Lockfile { version: 1, strategy: "maxver".into(), deps: vec![dep] };
+        let lf = Lockfile { version: 1, strategy: "maxver".into(), exclude_newer: None, deps: vec![dep] };
         let text1 = format_lockfile(&lf);
         let lf2 = parse_lockfile(&text1).unwrap();
         let text2 = format_lockfile(&lf2);
@@ -4077,6 +4765,7 @@ mod tests {
             bundle_pin: Some("a".repeat(64)),
         };
         let resolved = ResolvedDep {
+            declared_version_source: None,
             name: "foo".into(),
             namespace: None,
             identity: VALID_ID.into(),
@@ -4098,7 +4787,7 @@ mod tests {
             registry_namespace: Some("ns1".into()),
         };
         let graph = ResolvedGraph { deps: vec![resolved] };
-        let lf = from_graph(&graph, "maxver");
+        let lf = from_graph(&graph, "maxver", None);
         let locked_att = lf.deps[0].attestation.as_ref().expect("claim must be carried");
         assert_eq!(
             locked_att,
@@ -4118,6 +4807,7 @@ mod tests {
     #[test]
     fn test_unattested_entry_has_no_lockfile_block() {
         let resolved = ResolvedDep {
+            declared_version_source: None,
             name: "foo".into(),
             namespace: None,
             identity: VALID_ID.into(),
@@ -4139,7 +4829,7 @@ mod tests {
             registry_namespace: None,
         };
         let graph = ResolvedGraph { deps: vec![resolved] };
-        let lf = from_graph(&graph, "maxver");
+        let lf = from_graph(&graph, "maxver", None);
         assert!(lf.deps[0].attestation.is_none());
     }
 }

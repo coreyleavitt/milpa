@@ -1,0 +1,20 @@
+// fixture-441 (rfc-resolution-semantics.md §3 Axis W — W1): Axis B folded
+// into a workspace — a bare `fetch` (default "resolve" cmd) re-resolving a
+// workspace with a COMMITTED shared lock threads `prior` through
+// `_cmd_fetch_workspace`, so an unrelated member's dep stays pinned.
+//
+// Prior committed milpa.lock (this dir): baseline resolve against a
+// v1-only index — member-a's `crisol` and member-b's `httputils` both
+// pinned at 1.0.0.
+//
+// This manifest bumps ONLY member-a's constraint (`crisol ">= 2.0.0"`),
+// forcing crisol to move. member-b's httputils is untouched and MUST stay
+// pinned at 1.0.0 even though the (now v1+v2) index offers 2.0.0 and maxver
+// (the default strategy) would pick it in a fresh, prior-blind resolve.
+// Complements fixture-426 (which covers `workspace add-member` threading
+// prior) — together they cover both workspace-resolve entry points the RFC
+// names for Axis W's Axis-B fold-in.
+workspace {
+    member "member-a"
+    member "member-b"
+}

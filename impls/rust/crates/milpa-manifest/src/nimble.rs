@@ -60,6 +60,15 @@ pub enum NimbleRequirement {
 pub struct NimbleManifest {
     pub requires: Vec<NimbleRequirement>,
     pub src_dir: Option<String>,
+    /// The package's own declared release version, scanned from a
+    /// `version = "x.y.z"` assignment (A1 — rfc-resolution-semantics.md §3
+    /// Axis A (b) step 2, the `.nimble` compat adapter for milpa.kdl's native
+    /// `version` field). `None` when absent OR malformed — this scanner is
+    /// **total** (never raises), so a 2-component or non-numeric value
+    /// silently falls through to version-unknown rather than being reported
+    /// as an error (mirrors `src_dir`'s last-assignment-wins NimScript
+    /// semantics).
+    pub version: Option<milpa_types::Version>,
 }
 
 /// Parse a `.nimble` file's text into a [`NimbleManifest`]. Never fails: an
@@ -74,6 +83,7 @@ pub struct NimbleManifest {
 pub fn parse_nimble(text: &str) -> NimbleManifest {
     let lines: Vec<&str> = text.lines().collect();
     let mut src_dir: Option<String> = None;
+    let mut raw_version: Option<String> = None;
 
     // --- Step 1: run the S3a branch tracker ---
     let branches = parse_when_branches(&lines);
@@ -101,6 +111,16 @@ pub fn parse_nimble(text: &str) -> NimbleManifest {
 
         if let Some(dir) = match_src_dir(&line) {
             src_dir = Some(dir);
+            i += 1;
+            continue;
+        }
+
+        // A1: `version = "..."` or `version = ...` — last assignment wins,
+        // same NimScript semantics as `srcDir` above. Validation is deferred
+        // to after the scan loop (`parse_version`); this only captures the
+        // raw text.
+        if let Some(v) = match_version(&line) {
+            raw_version = Some(v);
             i += 1;
             continue;
         }
@@ -149,7 +169,13 @@ pub fn parse_nimble(text: &str) -> NimbleManifest {
         })
         .collect();
 
-    NimbleManifest { requires, src_dir }
+    NimbleManifest {
+        requires,
+        src_dir,
+        // A1: totality contract — a malformed/2-component/non-numeric raw
+        // value parses to `None` (version-unknown), never raises.
+        version: raw_version.and_then(|v| milpa_solver::parse_version(&v)),
+    }
 }
 
 /// Extract specs from the colon-tail of a `when`/`elif`/`else` header line.
@@ -223,6 +249,30 @@ fn match_src_dir(line: &str) -> Option<String> {
         return None;
     }
     // The remainder must be only an optional closing quote + trailing space.
+    let remainder = &rest[value.len()..];
+    let remainder = remainder.strip_prefix('"').unwrap_or(remainder);
+    if remainder.trim().is_empty() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// A1: match a `version = "..."` or `version = ...` assignment line — the raw
+/// text is returned unvalidated (same shape as [`match_src_dir`]); the caller
+/// feeds it through `parse_version` and discards on `None` (totality).
+fn match_version(line: &str) -> Option<String> {
+    let rest = line.trim_start().strip_prefix("version")?;
+    let rest = rest.trim_start().strip_prefix('=')?;
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('"').unwrap_or(rest);
+    let value: String = rest
+        .chars()
+        .take_while(|c| *c != '"' && !c.is_whitespace())
+        .collect();
+    if value.is_empty() {
+        return None;
+    }
     let remainder = &rest[value.len()..];
     let remainder = remainder.strip_prefix('"').unwrap_or(remainder);
     if remainder.trim().is_empty() {
@@ -600,6 +650,51 @@ mod tests {
             parse_nimble("  srcDir=\"src\"\n").src_dir.as_deref(),
             Some("src")
         );
+    }
+
+    // -------------------------------------------------------------------
+    // A1 (rfc-resolution-semantics.md §3 Axis A (b) step 2): `version` field
+    // — the compat adapter for the existing Nim ecosystem's declared version.
+    // Totality contract holds: a malformed value falls through to `None`
+    // (version-unknown), it is NEVER a raised error — the scanner never raises.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn version_quoted_and_unquoted() {
+        assert_eq!(
+            parse_nimble("version = \"1.2.3\"\n").version,
+            Some(milpa_types::Version::release(1, 2, 3))
+        );
+        assert_eq!(
+            parse_nimble("version = 1.2.3\n").version,
+            Some(milpa_types::Version::release(1, 2, 3))
+        );
+    }
+
+    #[test]
+    fn no_version_is_none() {
+        assert!(parse_nimble("requires \"foo\"\n").version.is_none());
+    }
+
+    #[test]
+    fn version_last_assignment_wins() {
+        // Mirrors srcDir's last-assignment-wins NimScript semantics.
+        assert_eq!(
+            parse_nimble("version = \"1.0.0\"\nversion = \"2.0.0\"\n").version,
+            Some(milpa_types::Version::release(2, 0, 0))
+        );
+    }
+
+    #[test]
+    fn version_malformed_is_none_not_panicking() {
+        // A malformed value is version-unknown, not a parse error — the
+        // scanner is total (unlike milpa.kdl's strict MAN-PACKAGE-VERSION-INVALID).
+        assert!(parse_nimble("version = \"not-a-version\"\n").version.is_none());
+    }
+
+    #[test]
+    fn version_two_component_is_none() {
+        assert!(parse_nimble("version = \"0.1\"\n").version.is_none());
     }
 
     #[test]

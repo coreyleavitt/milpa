@@ -4,7 +4,8 @@ strategy "maxver"
 
 dep "foo" {
     identity "dag-sha256:06fd4bd2db63e1f5cdf907c6e51b59448c802ddf8918a6bb69866eaa3362cd10"
-    version "0.0.1"
+    version "1.0.0"
+    declared_version_source "nimble"
     src_dir "src"
     requires "relonly"
     provenance {
@@ -18,7 +19,8 @@ dep "foo" {
 
 dep "relonly" {
     identity "dag-sha256:df6c822818c8d26316c03ef981bbd7b9ce79eb97a2296f2491522d7bddabb028"
-    version "0.0.1"
+    version "1.0.0"
+    declared_version_source "nimble"
     src_dir "src"
     requires
     provenance {

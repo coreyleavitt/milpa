@@ -1,0 +1,15 @@
+// resolution-semantics RFC §3 Axis D / §6 D-D2 -- THE motivating LTS-
+// snapshot / security-freeze case: a branch-ref git dep already committed
+// to milpa.lock (reproducible in steady state -- the resolver reuses the
+// locked commit_sha, not live HEAD). Tightening exclude-newer over that
+// ALREADY-LOCKED pin so its committer date now exceeds the bound is an
+// UNCONDITIONAL RES-EXCLUDE-NEWER-PIN, no fallback -- unlike an index dep,
+// a git dep has exactly one candidate; there is nothing to re-select.
+name "myapp"
+kind "application"
+resolution {
+    exclude-newer "2023-01-01T00:00:00Z"
+}
+deps {
+    widget git=(url)"https://example.com/widget.git" ref="main"
+}

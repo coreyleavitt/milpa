@@ -1,0 +1,6 @@
+name "myapp"
+kind "application"
+deps {
+    zeta
+    alpha
+}

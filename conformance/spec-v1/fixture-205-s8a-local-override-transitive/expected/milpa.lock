@@ -3,7 +3,8 @@ version 1
 strategy "maxver"
 
 dep "mylib" {
-    version "0.0.1"
+    version "0.2.0"
+    declared_version_source "nimble"
     src_dir ""
     requires
     provenance {
@@ -15,7 +16,7 @@ dep "mylib" {
 
 dep "translib" {
     identity "dag-sha256:51224ffa03f35b2f5987c8654c5fcd8942f9400d9bdb9c8f501fa32b7471ad9b"
-    version "0.0.1"
+    version "0.0.0"
     src_dir "src"
     requires "mylib"
     provenance {

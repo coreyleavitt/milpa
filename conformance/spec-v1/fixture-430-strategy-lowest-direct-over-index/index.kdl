@@ -1,0 +1,74 @@
+// fixture-430: "direct" and "transitive" each have THREE candidate
+// versions (1.0.0/1.5.0/2.0.0). Only the winning candidate per package
+// (per --strategy lowest-direct's root-direct/transitive split) has a
+// mocked-fetches/ entry with a real content_hash; the other two are
+// index-enumerated but never fetched, pinned to the empty-root dag-sha256
+// stub (mirrors fixture-415/427-429's convention). The WINNING candidates'
+// declared commit_sha here is deliberately kept byte-identical to their
+// mocked-fetches/.../sha file (mirrors every pre-existing fixture's
+// convention): the two impls disagree on which of those two sources a
+// named/index git dep's *lockfile* commit_sha is ultimately drawn from
+// (Python re-derives it from the fetch receipt, Rust carries the index's
+// declared value through unconditionally — a genuine, pre-existing,
+// orthogonal production divergence, reported not fixed here since it is
+// unrelated to strategy selection; see the C4 handoff entry). Keeping
+// them equal in this fixture avoids incidentally depending on that gap.
+schema_version 1
+package "direct" {
+    version "2.0.0" {
+        content_hash "dag-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        provenance {
+            kind "git"
+            url "https://example.com/direct.git"
+            ref "v2.0.0"
+            commit_sha "d000000000000000000000000000000000000000"
+        }
+    }
+    version "1.5.0" {
+        content_hash "dag-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        provenance {
+            kind "git"
+            url "https://example.com/direct.git"
+            ref "v1.5.0"
+            commit_sha "d111111111111111111111111111111111111111"
+        }
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:61d087c1f6aae57d22bf07b6d3d600a4d2a9faedb1cbfddcffc88b57c086165e"
+        provenance {
+            kind "git"
+            url "https://example.com/direct.git"
+            ref "v1.0.0"
+            commit_sha "1111111111111111111111111111111111111111"
+        }
+    }
+}
+package "transitive" {
+    version "2.0.0" {
+        content_hash "dag-sha256:ac6d93f4f1a2e23e6c19db5ccaba1c9a49baac62dc482c909f88180f0ddfc41d"
+        provenance {
+            kind "git"
+            url "https://example.com/transitive.git"
+            ref "v2.0.0"
+            commit_sha "2222222222222222222222222222222222222222"
+        }
+    }
+    version "1.5.0" {
+        content_hash "dag-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        provenance {
+            kind "git"
+            url "https://example.com/transitive.git"
+            ref "v1.5.0"
+            commit_sha "e111111111111111111111111111111111111111"
+        }
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        provenance {
+            kind "git"
+            url "https://example.com/transitive.git"
+            ref "v1.0.0"
+            commit_sha "e222222222222222222222222222222222222222"
+        }
+    }
+}

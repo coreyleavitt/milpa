@@ -1,0 +1,14 @@
+// fixture-424 (rfc-resolution-semantics.md B6): edit-existing-
+// constraint, widens. Prior lock has foo pinned at 2.0.0 (as if
+// previously constrained "< 3.0.0") and bar pinned at 2.0.0
+// (unconstrained the whole time). This manifest WIDENS foo to
+// unconstrained — 3.0.0 now satisfies too, but foo's locked 2.0.0
+// STILL satisfies the wider range, so foo MUST stay pinned at
+// 2.0.0 (not bumped to 3.0.0, which a fresh maxver resolve would
+// pick). bar is untouched and MUST also stay pinned at 2.0.0.
+name "myapp"
+kind "application"
+deps {
+    foo
+    bar
+}

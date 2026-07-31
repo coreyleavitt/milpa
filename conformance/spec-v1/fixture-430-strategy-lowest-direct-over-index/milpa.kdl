@@ -1,0 +1,15 @@
+// fixture-430 (resolution-semantics RFC §3 Axis C, C2/C4): --strategy
+// lowest-direct end-to-end at the CLI/conformance level. "direct" is a
+// ROOT-DIRECT named/index dep with THREE candidates (1.0.0/1.5.0/2.0.0);
+// "transitive" is discovered ONLY via direct's own .nimble bare `requires`
+// line (never root-declared) and also has THREE candidates. Under the SAME
+// configured lowest-direct strategy, direct picks its LOWEST satisfying
+// version (1.0.0) while transitive picks its HIGHEST (2.0.0) -- proving the
+// effective-strategy precompute is keyed on root-directness, not the
+// strategy value alone (C2's provider.is_root_direct mechanism, exercised
+// here at CLI/conformance granularity for the first time).
+name "myapp"
+kind "application"
+deps {
+    direct ">= 1.0.0"
+}

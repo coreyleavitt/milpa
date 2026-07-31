@@ -4,7 +4,8 @@ strategy "maxver"
 
 dep "extra_a" {
     identity "dag-sha256:09bec745269cb05558daf4d56ec9501b084162faf10ff29b1b2f37ca6250e2e9"
-    version "0.0.1"
+    version "1.0.0"
+    declared_version_source "nimble"
     src_dir "src"
     requires
     provenance {
@@ -18,7 +19,8 @@ dep "extra_a" {
 
 dep "extra_b" {
     identity "dag-sha256:b161297126c2d8e56260c3c0b83a292269c1cd6adaf5c514bb6577d8cdd4ab13"
-    version "0.0.1"
+    version "1.0.0"
+    declared_version_source "nimble"
     src_dir "src"
     requires
     provenance {
@@ -32,7 +34,8 @@ dep "extra_b" {
 
 dep "extra_c" {
     identity "dag-sha256:d1b5504548065482e18f90b58cd089dd856c8be894f34c615bfdea6c7a0ebf7f"
-    version "0.0.1"
+    version "1.0.0"
+    declared_version_source "nimble"
     src_dir "src"
     requires
     provenance {
@@ -46,7 +49,8 @@ dep "extra_c" {
 
 dep "foo" {
     identity "dag-sha256:597979430eb387b963a932b093035cc0c04ffbee425966be19da201438950239"
-    version "0.0.1"
+    version "1.0.0"
+    declared_version_source "nimble"
     src_dir "src"
     requires "extra_a" "extra_b" "extra_c"
     cond-require "extra_a" platform="linux"

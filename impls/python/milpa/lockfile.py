@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,7 @@ from milpa.registry import (
     EntryAttestation,
     MilpaVendored,
     RekorRef,
+    _parse_timestamp,
 )
 from milpa.errors import (
     CAS_STORE_IO_ERROR,
@@ -61,12 +63,14 @@ from milpa.errors import (
     LOCK_STRATEGY_MISSING,
     LOCK_VERSION_MISSING,
     LOCK_VERSION_UNSUPPORTED,
+    RES_LOCKED_DRIFT,
     VERIFY_ALIAS_SYMLINK_MISSING,
     VERIFY_EDGE_MISMATCH,
     MilpaError,
 )
 from milpa.identity import compute_content_hash, parse_identity
-from milpa.manifest import contains_unsafe_char, valid_dep_name
+from milpa.manifest import _format_resolution_timestamp, contains_unsafe_char, valid_dep_name
+from milpa.version import VersionSource
 from milpa.version import dep_dir_name  # noqa: F401 — re-exported (callers may import from here)
 from milpa.kdl_io import (
     KdlNode,
@@ -306,6 +310,17 @@ class LockedDep:
     # to unattested at index-parse time — absence of this field IS the
     # unattested state (no sentinel value is written).
     attestation: LockAttestation | None = None
+    # A5 (resolver-semantics RFC §3 Axis A (b) / §5): sibling field to
+    # ``version`` — WHICH precedence step (manifest|nimble|tag|annotation)
+    # produced a git/url/local/tarball/member dep's declared version. Kept
+    # deliberately distinct from ``version`` itself (identity ⊥ provenance
+    # discipline applied to version ⊥ source — never merged into a sum type).
+    # Always emitted when a source exists; ``None`` for a version-unknown dep
+    # (which also always has ``version == "0.0.0"`` — a combination no
+    # ``Known`` case ever produces, §5 NORMATIVE) and for named/index-
+    # resolved deps (out of Axis A's scope — their version comes straight
+    # from the index, never through the 4-step precedence).
+    declared_version_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -315,6 +330,14 @@ class Lockfile:
     deps: tuple[LockedDep, ...]
     strategy: str = "maxver"
     version: int = LOCKFILE_SCHEMA_VERSION
+    # D5 (resolution-semantics RFC §3 Axis D / §5): the EFFECTIVE
+    # ``exclude_newer`` time-bound this lockfile was resolved under, recorded
+    # for diagnostics and the frozen fast-path ``FROZEN-EXCLUDE-NEWER-
+    # MISMATCH`` check (mirrors ``strategy``'s exact role for
+    # ``FROZEN-STRATEGY-MISMATCH``). ``None`` when no bound was in effect —
+    # a conformant emitter omits the top-level ``exclude_newer`` node
+    # entirely in that case (never a sentinel timestamp).
+    exclude_newer: datetime | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +406,9 @@ class ResolvedDep:
     # not a top-level LockedDep field, since it is only meaningful alongside
     # an attestation block.
     registry_namespace: str | None = None
+    # A5: sibling source for `version` — see LockedDep.declared_version_source
+    # for the full contract; carried straight through in _locked_from_resolved.
+    declared_version_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -494,6 +520,7 @@ def parse_lockfile(text: str) -> Lockfile:
     deps: list[LockedDep] = []
     strategy: str | None = None
     schema_version: int | None = None
+    exclude_newer: datetime | None = None
 
     for node in nodes(doc):
         name = node_name(node)
@@ -501,6 +528,8 @@ def parse_lockfile(text: str) -> Lockfile:
             schema_version = _parse_top_version(node)
         elif name == "strategy":
             strategy = _parse_top_strategy(node)
+        elif name == "exclude_newer":
+            exclude_newer = _parse_top_exclude_newer(node)
         elif name == "dep":
             deps.append(_parse_dep(node))
         # Any other top-level node is silently ignored for forward compat
@@ -524,7 +553,12 @@ def parse_lockfile(text: str) -> Lockfile:
             "lockfile missing required 'strategy' node; regenerate via 'milpa fetch'",
         )
 
-    return Lockfile(deps=tuple(deps), strategy=strategy, version=schema_version)
+    return Lockfile(
+        deps=tuple(deps),
+        strategy=strategy,
+        version=schema_version,
+        exclude_newer=exclude_newer,
+    )
 
 
 def _parse_top_version(node: KdlNode) -> int:
@@ -568,6 +602,40 @@ def _parse_top_strategy(node: KdlNode) -> str:
     )
 
 
+def _parse_top_exclude_newer(node: KdlNode) -> datetime:
+    """Parse the OPTIONAL top-level ``exclude_newer`` node → a ``datetime``.
+
+    D5 (resolution-semantics RFC §3 Axis D / §5). Unlike ``strategy``
+    (required), this node is optional — absent entirely when no bound is in
+    effect. A PRESENT-but-malformed node (wrong arity, non-string arg, or an
+    unparseable ISO 8601 timestamp) is still a hard parse error — mirrors
+    ``_parse_top_version``'s arity/type-error convention (``LOCK_FIELD_ARITY``
+    / ``LOCK_FIELD_TYPE``), not a new dedicated slug.
+    """
+    args = node_args(node)
+    if len(args) != 1:
+        raise MilpaError(
+            LOCK_FIELD_ARITY,
+            f"'exclude_newer' node takes exactly one argument, got {len(args)}",
+        )
+    val = args[0]
+    s = value_as_str(val)
+    if s is None:
+        raise MilpaError(
+            LOCK_FIELD_TYPE,
+            f"'exclude_newer' must be a string, got {val!r}",
+            got=val,
+        )
+    parsed = _parse_timestamp(s)
+    if parsed is None:
+        raise MilpaError(
+            LOCK_FIELD_TYPE,
+            f"'exclude_newer' value {s!r} is not a valid ISO 8601 timestamp",
+            got=s,
+        )
+    return parsed
+
+
 def _parse_dep(node: KdlNode) -> LockedDep:
     """Parse a ``dep`` block into a ``LockedDep``."""
     dep_name = _require_dep_name(node)
@@ -583,6 +651,7 @@ def _parse_dep(node: KdlNode) -> LockedDep:
     aliases: tuple[str, ...] = ()  # Phase B: alternate names for deduped deps
     namespace: str | None = None  # C1: qualified dep namespace (§3.9)
     attestation: LockAttestation | None = None  # per-entry attestation claim (§3.9)
+    declared_version_source: str | None = None  # A5: sibling source for `version`
 
     for child in node_children(node):
         cname = node_name(child)
@@ -614,6 +683,20 @@ def _parse_dep(node: KdlNode) -> LockedDep:
             identity = _parse_dep_identity(child, dep_name)
         elif cname == "version":
             version = _parse_dep_scalar_str(child, dep_name, "version")
+        elif cname == "declared_version_source":
+            # A5: forward-compat lenient parse (mirrors the attestation
+            # ``kind`` collapse convention, lockfile-schema.md §3.9) — an
+            # unrecognized value or malformed arity silently collapses to
+            # None rather than raising; no new error slug is warranted for
+            # a purely additive/diagnostic field.
+            _dvs_args = node_args(child)
+            if len(_dvs_args) == 1:
+                _dvs_val = value_as_str(_dvs_args[0])
+                if _dvs_val is not None:
+                    try:
+                        declared_version_source = str(VersionSource(_dvs_val))
+                    except ValueError:
+                        declared_version_source = None
         elif cname == "src_dir":
             src_dir = _parse_dep_scalar_str(child, dep_name, "src_dir")
             # Security: validate src_dir at the lockfile parse boundary.
@@ -663,6 +746,7 @@ def _parse_dep(node: KdlNode) -> LockedDep:
         aliases=aliases,
         namespace=namespace,
         attestation=attestation,
+        declared_version_source=declared_version_source,
     )
 
 
@@ -1067,7 +1151,12 @@ def _req_name_to_lockfile(s: str) -> str:
     return s
 
 
-def from_graph(graph: ResolvedGraph, *, strategy: str = "maxver") -> Lockfile:
+def from_graph(
+    graph: ResolvedGraph,
+    *,
+    strategy: str = "maxver",
+    exclude_newer: datetime | None = None,
+) -> Lockfile:
     """Convert a ResolvedGraph into a Lockfile.
 
     Deps are sorted by ``(namespace or "", name)`` so that two qualified deps
@@ -1075,6 +1164,11 @@ def from_graph(graph: ResolvedGraph, *, strategy: str = "maxver") -> Lockfile:
     stable, deterministic order (lockfile-schema.md §2.3 + §2.4 +
     resolver-semantics.md §4.4). Same graph always produces byte-identical
     lockfile text.
+
+    ``exclude_newer`` (D5, resolution-semantics RFC §3 Axis D / §5): the
+    EFFECTIVE time-bound this resolve ran under, recorded verbatim into the
+    lockfile's top-level ``exclude_newer`` node (``None`` ⇒ the node is
+    omitted entirely by ``format_lockfile`` — never a sentinel timestamp).
     """
     deps = tuple(
         sorted(
@@ -1082,7 +1176,7 @@ def from_graph(graph: ResolvedGraph, *, strategy: str = "maxver") -> Lockfile:
             key=lambda d: (d.namespace or "", d.name),
         )
     )
-    return Lockfile(deps=deps, strategy=strategy)
+    return Lockfile(deps=deps, strategy=strategy, exclude_newer=exclude_newer)
 
 
 def _locked_from_resolved(d: ResolvedDep) -> LockedDep:
@@ -1121,6 +1215,9 @@ def _locked_from_resolved(d: ResolvedDep) -> LockedDep:
             if d.attestation is not None
             else None
         ),
+        # A5: sibling source for the declared version — carried straight
+        # through, never recomputed at the lockfile boundary.
+        declared_version_source=d.declared_version_source,
     )
 
 
@@ -1281,6 +1378,7 @@ def format_lockfile(lockfile: Lockfile) -> str:
       1. Header comment
       2. ``version 1`` (integer, unquoted)
       3. ``strategy "<name>"``
+      3a. ``exclude_newer "<ts>"`` (D5, OPTIONAL — emitted only when set)
       4. Blank line
       5. dep blocks (lexicographic order), each followed by blank line
       6. File ends with the blank line after the last dep block (last byte = 0x0A)
@@ -1289,8 +1387,16 @@ def format_lockfile(lockfile: Lockfile) -> str:
         _HEADER,
         f"version {lockfile.version}",
         f"strategy {_kdl_str(lockfile.strategy)}",
-        "",
     ]
+    # D5 (resolution-semantics RFC §3 Axis D / §5): optional top-level
+    # exclude_newer node — emitted only when the effective time-bound was
+    # set (never a sentinel), positioned right after strategy and before
+    # the blank line separating the header from the dep blocks.
+    if lockfile.exclude_newer is not None:
+        lines.append(
+            f"exclude_newer {_kdl_str(_format_resolution_timestamp(lockfile.exclude_newer))}"
+        )
+    lines.append("")
     for dep in lockfile.deps:
         lines.append(f"dep {_kdl_str(dep.name)} {{")
         # C1: namespace child node — emitted FIRST when non-None (§3.9).
@@ -1301,6 +1407,13 @@ def format_lockfile(lockfile: Lockfile) -> str:
         if dep.identity is not None:
             lines.append(f"    identity {_kdl_str(dep.identity)}")
         lines.append(f"    version {_kdl_str(dep.version)}")
+        # A5: declared_version_source — the sibling field to version, emitted
+        # only when a source exists (a version-unknown dep's "0.0.0" carries
+        # no source at all, §5 NORMATIVE — the unambiguous boundary pairing).
+        if dep.declared_version_source is not None:
+            lines.append(
+                f"    declared_version_source {_kdl_str(dep.declared_version_source)}"
+            )
         lines.append(f"    src_dir {_kdl_str(dep.src_dir)}")
         # requires — always emitted; bare when empty, args when non-empty
         if dep.requires:
@@ -1482,6 +1595,101 @@ def verify_against_graph(
             LOCK_GRAPH_MISMATCH,
             "lockfile does not match resolved graph:\n  " + "\n  ".join(errors),
             mismatches=errors,
+        )
+
+
+def check_locked_drift(
+    prior: "Lockfile | None",
+    graph: ResolvedGraph,
+    exclude_newer: datetime | None = None,
+) -> None:
+    """``--locked`` guard (resolution-semantics RFC §3 Axis B / §6 D-B2).
+
+    ``--locked`` always performs a REAL resolve (with the B2 minimal-change/
+    prior-lock preference already applied via ``prior``) and then asserts the
+    result is IDENTICAL to the committed lock — distinct from ``frozen``,
+    which skips solving entirely and only reconstructs.
+
+    **Drift is identity-based (D-B2), never version-label-based:** the
+    comparison keys on ``identity`` (content hash) + the canonicalized
+    ``provenances`` set only. The version string is deliberately NEVER
+    consulted — the one-time Axis-A ``0.0.1``→real-declared-version relabel
+    of an identity-unchanged git/url/local/tarball dep is therefore
+    compatible, not drift.
+
+    Provenances are compared after sorting each side by the same canonical
+    ``_provenance_sort_key`` the emitter uses (lockfile-schema.md §4.0) —
+    ``graph.deps[i].provenances`` is observed-first/unsorted (sorted only at
+    KDL emission time), while ``prior.deps[i].provenances`` was parsed back
+    from already-canonically-sorted text, so comparing raw tuple order would
+    produce false-positive drift.
+
+    ``exclude_newer`` (D5, §6 D-D3 no-silent-drop) is the EFFECTIVE
+    ``exclude_newer`` this ``--locked`` resolve just ran under. Dropping a
+    previously-recorded bound RELAXES semantics (silently un-freezes the
+    project), so — unlike identity/provenance, which are compared per-dep
+    above — this is a single whole-lockfile comparison: ``prior.
+    exclude_newer`` present but the new effective value absent (or a
+    genuinely different timestamp) is drift.
+
+    Raises ``MilpaError(RES_LOCKED_DRIFT)`` naming every drifted/added/
+    removed package, or — when ``prior`` is ``None`` — because there is no
+    committed lockfile to reproduce against at all (a best-in-class CI guard
+    cannot assert reproducibility with nothing to reproduce).
+    """
+    if prior is None:
+        raise MilpaError(
+            RES_LOCKED_DRIFT,
+            "--locked requires a committed milpa.lock to verify against, but "
+            "none was found; run `milpa lock` (or `milpa fetch`/`milpa lock` "
+            "without --locked) to create one",
+        )
+
+    locked_by_name = {dep_dir_name(d.name, d.namespace): d for d in prior.deps}
+    graph_by_name = {dep_dir_name(d.name, d.namespace): d for d in graph.deps}
+
+    drifted: list[str] = []
+    for name in sorted(graph_by_name.keys() - locked_by_name.keys()):
+        drifted.append(
+            f"{name}: added — resolved but absent from the committed lockfile"
+        )
+    for name in sorted(locked_by_name.keys() - graph_by_name.keys()):
+        drifted.append(
+            f"{name}: removed — present in the committed lockfile, absent from the resolve"
+        )
+    for name in sorted(graph_by_name.keys() & locked_by_name.keys()):
+        locked = locked_by_name[name]
+        actual = graph_by_name[name]
+        # D-B2: identity + provenance ONLY — the version label is never
+        # consulted (a version relabel with unchanged identity is not drift).
+        if locked.identity != actual.identity:
+            drifted.append(
+                f"{name}: identity changed — "
+                f"lockfile={locked.identity!r}, resolve={actual.identity!r}"
+            )
+            continue
+        locked_provs = tuple(sorted(locked.provenances, key=_provenance_sort_key))
+        actual_provs = tuple(sorted(actual.provenances, key=_provenance_sort_key))
+        if locked_provs != actual_provs:
+            drifted.append(
+                f"{name}: provenance changed — "
+                f"lockfile={locked_provs!r}, resolve={actual_provs!r}"
+            )
+
+    # D5 (§6 D-D3 no-silent-drop): a dropped or changed exclude_newer bound
+    # is drift too, compared once for the whole lockfile (not per-dep).
+    if prior.exclude_newer != exclude_newer:
+        drifted.append(
+            f"exclude_newer: changed — lockfile={prior.exclude_newer!r}, "
+            f"resolve={exclude_newer!r}"
+        )
+
+    if drifted:
+        raise MilpaError(
+            RES_LOCKED_DRIFT,
+            "--locked: resolved graph deviates from the committed lockfile:\n  "
+            + "\n  ".join(drifted),
+            drifted=drifted,
         )
 
 

@@ -4,7 +4,7 @@ strategy "maxver"
 
 dep "mylib" {
     identity "dag-sha256:2d141243f1da1512825d42b9a3111d808e39be2a946ad2d54727ad9b09f36ac1"
-    version "0.0.1"
+    version "0.0.0"
     src_dir ""
     requires
     provenance {

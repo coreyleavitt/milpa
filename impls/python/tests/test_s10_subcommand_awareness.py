@@ -44,7 +44,7 @@ from milpa.lockfile import (
     Lockfile,
     write_lockfile,
 )
-from milpa.registry import AuthorSigned, MilpaVendored
+from milpa.registry import AuthorSigned, MilpaVendored, _parse_timestamp
 from milpa.version import Strategy
 
 
@@ -99,11 +99,14 @@ def _write_locked_dep(
     sha: str = "a" * 40,
     identity: str = "dag-sha256:" + "a" * 64,
     attestation: LockAttestation | None = None,
+    version: str = "1.0.0",
+    declared_version_source: str | None = None,
+    strategy: str = "maxver",
 ) -> None:
     """Write a minimal lockfile with one dep that has active_flags set."""
     dep = LockedDep(
         name=dep_name,
-        version="1.0.0",
+        version=version,
         src_dir="",
         requires=(),
         provenances=(
@@ -117,8 +120,9 @@ def _write_locked_dep(
         identity=identity,
         active_flags=active_flags,
         attestation=attestation,
+        declared_version_source=declared_version_source,
     )
-    lf = Lockfile(version=1, strategy="maxver", deps=(dep,))
+    lf = Lockfile(version=1, strategy=strategy, deps=(dep,))
     write_lockfile(lf, lock_path)
 
 
@@ -248,6 +252,94 @@ class TestAddFeatures:
         assert "\n        flag " not in text, (
             f"No flag children expected without --features:\n{text}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 2b. A3b: milpa add --git --version x.y.z  writes version= on the dep node
+# ---------------------------------------------------------------------------
+
+class TestAddVersion:
+    """A3b (rfc-resolution-semantics.md §3 Axis A (b) step 4): ``milpa add
+    --git --version x.y.z`` writes a ``version=`` annotation on the new dep
+    — the natural-site workflow, mirrors ``--optional``/``--features``."""
+
+    def test_add_version_writes_version_annotation(self, tmp_path: Path) -> None:
+        manifest_path = tmp_path / "milpa.kdl"
+        manifest_path.write_text(_minimal_manifest_kdl(), encoding="utf-8")
+
+        url = "https://example.com/mydep.git"
+        sha = "d" * 40
+        mocked_dir = tmp_path / "mocked"
+        _make_mocked_fixture(mocked_dir, url, "main", sha)
+        env = _make_mocked_env(mocked_dir, tmp_path)
+
+        rc = cmd_add(
+            tmp_path,
+            env,
+            dep_name="mydep",
+            git_url=url,
+            mirror_url=None,
+            ref="main",
+            strategy=Strategy.MAXVER,
+            max_parallel=1,
+            version="1.2.3",
+        )
+        assert rc == 0, "cmd_add with --version must exit 0"
+        text = manifest_path.read_text(encoding="utf-8")
+        assert 'version="1.2.3"' in text, f'version="1.2.3" not in manifest:\n{text}'
+
+    def test_add_no_version_no_version_annotation(self, tmp_path: Path) -> None:
+        """add without --version writes no version= at all (default None)."""
+        manifest_path = tmp_path / "milpa.kdl"
+        manifest_path.write_text(_minimal_manifest_kdl(), encoding="utf-8")
+
+        url = "https://example.com/mydep.git"
+        sha = "d" * 40
+        mocked_dir = tmp_path / "mocked"
+        _make_mocked_fixture(mocked_dir, url, "main", sha)
+        env = _make_mocked_env(mocked_dir, tmp_path)
+
+        rc = cmd_add(
+            tmp_path,
+            env,
+            dep_name="mydep",
+            git_url=url,
+            mirror_url=None,
+            ref="main",
+            strategy=Strategy.MAXVER,
+            max_parallel=1,
+        )
+        assert rc == 0
+        text = manifest_path.read_text(encoding="utf-8")
+        assert "version=" not in text, f"version= must not appear when not requested:\n{text}"
+
+    def test_add_version_malformed_rejected(self, tmp_path: Path) -> None:
+        """A malformed --version value is rejected before anything is written
+        (same slug as the manifest grammar, MAN-DEP-VERSION-INVALID)."""
+        manifest_path = tmp_path / "milpa.kdl"
+        original_text = _minimal_manifest_kdl()
+        manifest_path.write_text(original_text, encoding="utf-8")
+
+        url = "https://example.com/mydep.git"
+        sha = "d" * 40
+        mocked_dir = tmp_path / "mocked"
+        _make_mocked_fixture(mocked_dir, url, "main", sha)
+        env = _make_mocked_env(mocked_dir, tmp_path)
+
+        rc = cmd_add(
+            tmp_path,
+            env,
+            dep_name="mydep",
+            git_url=url,
+            mirror_url=None,
+            ref="main",
+            strategy=Strategy.MAXVER,
+            max_parallel=1,
+            version="not-a-version",
+        )
+        assert rc == 1, "malformed --version must reject with exit 1"
+        # The manifest must be left unmodified — no partial write.
+        assert manifest_path.read_text(encoding="utf-8") == original_text
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +651,122 @@ class TestShowAttestation:
         captured = capsys.readouterr()
         assert "attestation" not in captured.out, (
             f"attestation line must be omitted when absent:\n{captured.out}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 6c. milpa show: A7 (rfc-resolution-semantics.md §3 Axis A) — surfaces the
+#     declared-version source per dep + the top-level strategy/exclude-newer
+#     header.
+# ---------------------------------------------------------------------------
+
+class TestShowDeclaredVersionSource:
+    """show prints the declared-version source next to each dep's version."""
+
+    @pytest.mark.parametrize(
+        "source", ["manifest", "nimble", "tag", "annotation"]
+    )
+    def test_show_prints_declared_version_source(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], source: str
+    ) -> None:
+        _write_locked_dep(
+            tmp_path / "milpa.lock",
+            dep_name="mylib",
+            version="2.3.4",
+            declared_version_source=source,
+        )
+
+        rc = cmd_show(tmp_path)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert f"{'mylib':20s} 2.3.4 ({source})" in captured.out, (
+            f"expected version+source pairing not in show output:\n{captured.out}"
+        )
+
+    def test_show_marks_version_unknown_when_source_absent(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A5's flattening pairing: version '0.0.0' + no source => version-unknown."""
+        _write_locked_dep(
+            tmp_path / "milpa.lock",
+            dep_name="mylib",
+            version="0.0.0",
+            declared_version_source=None,
+        )
+
+        rc = cmd_show(tmp_path)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert f"{'mylib':20s} 0.0.0 (version-unknown)" in captured.out, (
+            f"expected version-unknown marker not in show output:\n{captured.out}"
+        )
+
+    def test_show_no_suffix_for_named_dep_real_version_no_source(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A named/index dep has no source either, but a real version — not unknown."""
+        _write_locked_dep(
+            tmp_path / "milpa.lock",
+            dep_name="mylib",
+            version="1.2.3",
+            declared_version_source=None,
+        )
+
+        rc = cmd_show(tmp_path)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert f"{'mylib':20s} 1.2.3" in captured.out
+        assert "(version-unknown)" not in captured.out
+        assert "1.2.3 (" not in captured.out
+
+
+class TestShowHeader:
+    """show prints a top-level resolution-state header before the dep list."""
+
+    def test_show_prints_strategy(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _write_locked_dep(tmp_path / "milpa.lock", dep_name="mylib", strategy="minver")
+
+        rc = cmd_show(tmp_path)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "strategy    minver" in captured.out, (
+            f"expected strategy header not in show output:\n{captured.out}"
+        )
+
+    def test_show_omits_exclude_newer_when_absent(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """exclude-newer (Axis D / D5) is omitted from the header when the
+        lockfile recorded no bound — must never be faked as present."""
+        _write_locked_dep(tmp_path / "milpa.lock", dep_name="mylib")
+
+        rc = cmd_show(tmp_path)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "exclude-newer" not in captured.out, (
+            f"exclude-newer must be omitted when the lockfile has none:\n{captured.out}"
+        )
+
+    def test_show_prints_exclude_newer_when_present(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """exclude-newer (Axis D / D5) IS printed in the header when the
+        lockfile recorded a bound (mirrors Rust's R11 fix)."""
+        lf = Lockfile(
+            version=1,
+            strategy="maxver",
+            exclude_newer=_parse_timestamp("2026-01-01T00:00:00Z"),
+            deps=(),
+        )
+        write_lockfile(lf, tmp_path / "milpa.lock")
+
+        rc = cmd_show(tmp_path)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "exclude-newer 2026-01-01T00:00:00Z" in captured.out, (
+            f"expected exclude-newer header line not in show output:\n{captured.out}"
         )
 
 

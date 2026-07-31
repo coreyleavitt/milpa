@@ -27,8 +27,15 @@ A conformant implementation of this spec MUST:
    resolves the working directory before any verb executes.
 3. Accept `--frozen` as a global flag; apply its exit-1 semantics only
    to `fetch` (the only verb with a frozen fast-path).
-4. Accept `-s`/`--strategy` with the three values `maxver`, `minver`,
-   `semver`; default to `maxver` when absent.
+4. Accept `-s`/`--strategy` with the four values `maxver`, `minver`,
+   `semver`, `lowest-direct`, **scoped to the resolve-triggering verbs**
+   (`fetch`/`lock`/`update`/`add`/`remove`/`workspace add-member`/
+   `workspace remove-member` — resolution-semantics RFC §3 Axis C, D-C2;
+   NOT a global pre-verb flag). When absent, the effective strategy is
+   resolved in precedence order: the manifest's `resolution { strategy }`
+   (§manifest-grammar), else `maxver` (§2.10). The lockfile's recorded
+   `strategy` is NEVER a precedence tier here — it is diagnostic/
+   frozen-parity only, never a live resolution input (§2.10 R9).
 5. Accept `-j`/`--parallel` as a global concurrency limit; default to 8.
 6. Route all human-readable diagnostic output to **stderr**; route all
    machine-readable output (currently only `milpa show`'s dep tree) to
@@ -118,20 +125,13 @@ uses them. Verbs that have no use for a flag silently ignore it.
 
 ### 2.3  `-s <mode>` / `--strategy <mode>`
 
-> NORMATIVE: Resolution strategy. Accepted values:
->
-> - `maxver` (default) — select the highest version satisfying constraints
-> - `minver` — select the lowest version satisfying constraints (useful for
->   library authors verifying minimum-version compatibility)
-> - `semver` — select the highest version within the same major as the
->   constraint's lower bound
->
-> The strategy is recorded in `milpa.lock` and MUST match when
-> `--frozen` is used (mismatch raises `FROZEN-STRATEGY-MISMATCH` and,
-> with `--frozen`, exits 1). Cross-reference S6 for selection semantics.
+> NORMATIVE: **No longer a global flag** (resolution-semantics RFC §3 Axis
+> C, C3/D-C2) — scoped to the resolve-triggering verbs. See §2.10 for the
+> full normative treatment (accepted values, precedence, and the
+> lock-preference bypass semantics).
 
 > NORMATIVE: An implementation MUST reject any `--strategy` value not in
-> the set `{maxver, minver, semver}`.
+> the set `{maxver, minver, semver, lowest-direct}`.
 
 ### 2.4  `--frozen`
 
@@ -400,6 +400,149 @@ during resolution (RFC #23 §3.4). They apply to `fetch`, `lock`, and `update`.
 > cache TTL. Under `strict` policy, if the freshly fetched bundle fails
 > verification, the resolve still fails as normal.
 
+### 2.10  `-s <mode>` / `--strategy <mode>` — scoped (resolution-semantics RFC §3 Axis C, C3/D-C2)
+
+> NORMATIVE: `--strategy` is registered on the resolve-triggering verbs
+> only — `fetch`, `lock`, `update`, `add`, `remove`, `workspace add-member`,
+> `workspace remove-member` — the same scoping discipline as `--locked`/
+> `--upgrade` (§5.1). It is **not** a global pre-verb flag: an
+> implementation MUST NOT parse it before the verb token, and a verb that
+> does not accept it (`show`, `verify`, `clean`, `store`, `index`, `hash`)
+> is not required to recognize it.
+
+> NORMATIVE: Accepted values:
+>
+> - `maxver` — select the highest version satisfying constraints
+> - `minver` — select the lowest version satisfying constraints (useful for
+>   library authors verifying minimum-version compatibility)
+> - `semver` — select the highest version within the same major as the
+>   constraint's lower bound
+> - `lowest-direct` (resolver-semantics RFC §3 Axis C, #111; matches uv's
+>   `--resolution lowest-direct`) — applies `minver` to root-direct deps
+>   (declared in the root manifest, or named by an `overrides` rule) and
+>   `maxver` to every transitive dep. This is a **surface value only**: the
+>   implementation MUST resolve it to a concrete per-package `minver`/
+>   `maxver` before candidate selection runs — it is never itself a
+>   selection rule the picker executes (resolver-semantics RFC §4 stage 4,
+>   D-C2).
+>
+> An implementation MUST reject any `--strategy` value not in this set as
+> a usage error (exit 2).
+
+> NORMATIVE: **Precedence** (the effective strategy for one verb's
+> resolve): explicit CLI `--strategy` (if given) wins outright; else the
+> manifest's `resolution { strategy "<value>" }` (§manifest-grammar,
+> root-only for a workspace); else `maxver`. The implementation MUST
+> compute this per resolve-triggering verb invocation, against that verb's
+> own parsed manifest — never as a single value computed once before any
+> manifest is read. The committed lockfile's recorded `strategy` is NOT a
+> precedence tier: it is diagnostic/frozen-parity only (§7.1
+> `FROZEN-STRATEGY-MISMATCH`), never a live resolution input (R9). An
+> implementation MUST NOT fall back to the lockfile's recorded strategy
+> when both CLI and manifest are unspecified — doing so makes a one-off
+> `--strategy X` invisibly and permanently govern every future bare
+> resolve (hidden sticky state), which this clause forbids.
+
+> NORMATIVE: **Lock-preference bypass** (interaction with the
+> minimal-change default, §6/resolver-semantics RFC §4 stage 4). The
+> minimal-change preference (prior-lock pin reuse) MUST be bypassed for a
+> package only when BOTH of the following hold:
+>
+> 1. the effective strategy was **explicitly sourced** — an explicit CLI
+>    `--strategy` or a manifest `resolution { strategy }` declaration —
+>    never a merely default-filled value (R9); and
+> 2. the effective strategy **diverges in value** from the lockfile's
+>    recorded `strategy` — comparing `effective strategy !=
+>    lockfile.strategy`, **never** whether `--strategy` was typed on the
+>    command line alone.
+>
+> Condition 1 is the R9 regression guard: without it, a BARE resolve (no
+> CLI flag, no manifest `resolution` block) against a lock recorded under
+> a non-default strategy would compute effective=`maxver` (the default),
+> see it "diverge" from the lock, and bypass — newest-wins bumping the
+> WHOLE graph on every plain `milpa fetch`. Stability of a bare re-resolve
+> against a non-default-strategy lock instead rides entirely on the
+> minimal-change preference itself (§6) — never on treating the lockfile's
+> strategy as live governing state. Condition 2 is the pre-existing #192
+> guard: gating on flag *presence* alone is incorrect, since it would make
+> `milpa fetch --strategy maxver` (spelling out the default) silently flip
+> the whole graph to newest-wins even when nothing has changed.
+>
+> Bypass scope is strategy-specific: `maxver`/`minver`/`semver` diverging
+> from the lock bypasses the **whole graph**; `lowest-direct` diverging
+> from the lock bypasses **root-direct packages only** (transitives keep
+> their lock preference — a whole-graph bypass under `lowest-direct` would
+> drag unrelated transitives forward, reproducing #192 through a
+> different door). When the effective strategy equals the lock's recorded
+> strategy, or when the effective strategy is merely default-filled
+> (neither CLI nor manifest named it), there is no bypass.
+
+> The strategy is recorded in `milpa.lock` and MUST match the manifest's
+> effective strategy when `--frozen` is used (mismatch raises
+> `FROZEN-STRATEGY-MISMATCH` and, with `--frozen`, exits 1). Cross-reference
+> S6 for selection semantics.
+
+### 2.11  `--exclude-newer <ts>` — scoped to `fetch`/`lock` ONLY (resolution-semantics RFC §3 Axis D, D2)
+
+> NORMATIVE: `--exclude-newer` is registered on `fetch`/`lock` ONLY —
+> narrower than `--strategy`'s per-verb scoping (§2.10). A time-bound CLI
+> override is a fetch/lock-time CI concern (e.g. `milpa fetch
+> --exclude-newer <ts>` to reproduce an LTS snapshot); `add`/`update`/
+> `remove`/`workspace add-member`/`workspace remove-member` do not accept
+> this flag at all — they always resolve against the manifest's committed
+> `resolution { exclude-newer }` bound (or no bound), with no CLI override.
+
+> NORMATIVE: The value MUST be an ISO 8601 timestamp, parsed with the same
+> parser the manifest's `resolution { exclude-newer }` node uses
+> (§manifest-grammar). A malformed value raises `CLI-EXCLUDE-NEWER-INVALID`
+> (exit 1, a diagnosed failure with a `milpa-error:` line) — distinct from
+> `--strategy`'s malformed-value handling (a closed enum via `choices`,
+> exit 2 usage error): a timestamp has no such closed enum of valid
+> spellings, so a malformed value gets a real catalog slug instead.
+>
+> NORMATIVE: A timestamp with no UTC offset (no trailing `Z` and no
+> `+HH:MM`/`-HH:MM` suffix) MUST be interpreted as UTC, not as local time.
+
+> NORMATIVE: **Precedence** (the effective exclude-newer bound for one
+> `fetch`/`lock` invocation): explicit CLI `--exclude-newer` (if given)
+> wins outright; else the manifest's `resolution { exclude-newer "<ts>" }`
+> (root-only for a workspace); else no bound (`None`) — `fetch`/`lock`
+> deliberately do NOT fall back to the lockfile's own recorded
+> `exclude_newer` as a third tier: an absent CLI flag and absent manifest
+> declaration is a genuine "nothing declared this run" result for these two
+> verbs. This is what makes `--locked`'s no-silent-drop guard (D5, below)
+> meaningful — see the NOTE.
+
+> NOTE: The manifest-recorded bound (once declared) is honored by *every*
+> resolve-triggering verb automatically — `add`, `update`, `remove`, and
+> the workspace paths all resolve through the same effective-value seam
+> with no new plumbing, even though only `fetch`/`lock` can override it
+> from the command line. See resolution-semantics RFC §3 Axis D "Verb
+> reach". The actual index candidate filtering (by `published_at`, D3) and
+> git pinned-ref committer-date validation (D4) are specified in
+> `resolver-semantics.md` §3/§10, not repeated here.
+
+> NORMATIVE (D5, resolution-semantics RFC §5 / §6 D-D3 no-silent-drop): the
+> EFFECTIVE exclude-newer bound is recorded in `milpa.lock` as a top-level
+> `exclude_newer` node (`lockfile-schema.md` §2.2a) — omitted entirely when
+> no bound is in effect. `--frozen`/`frozen` compares the lockfile's
+> recorded value against the manifest's effective `resolution {
+> exclude-newer }` (built manifest-sourced from the start, mirroring how
+> C3b fixed `FROZEN-STRATEGY-MISMATCH`'s baseline) and raises
+> `FROZEN-EXCLUDE-NEWER-MISMATCH` on any divergence. Dropping a
+> previously-recorded bound relaxes semantics and MUST NOT happen
+> silently:
+> - `--locked` treats "recorded in the committed lock, absent (or
+>   different) in the new resolve's effective value" as drift
+>   (`RES-LOCKED-DRIFT`).
+> - `add`/`update`/`remove`/`workspace add-member`/`workspace
+>   remove-member` (which have no CLI `--exclude-newer` surface) carry the
+>   prior lockfile's recorded `exclude_newer` FORWARD as a third precedence
+>   tier — manifest, if declared, still wins — when re-resolving, rather
+>   than silently reverting to "no bound." `fetch`/`lock` do NOT get this
+>   third tier (see the precedence NORMATIVE above); `--locked` is the
+>   guard that protects those two verbs instead.
+
 ---
 
 ## 3  Exit-code taxonomy
@@ -511,7 +654,14 @@ present by default; there is no flag to enable it.
 **Purpose:** Resolve the manifest, clone all deps into `_deps/`, emit
 `nim.cfg`, and write `milpa.lock`. Workspace-aware.
 
-**Arguments:** none beyond global flags.
+**Arguments:** `--locked` (B3, resolution-semantics RFC §3 Axis B) and
+`--upgrade [<dep>...]` (B4, resolution-semantics RFC §3 Axis B / D-B3),
+both scoped to this verb (not global flags). `--locked` and `--upgrade`
+together is `CLI-LOCKED-UPGRADE-CONFLICT` (one forbids deviation from the
+committed lock, the other forces it). Also `--exclude-newer <ts>` (D2,
+resolution-semantics RFC §3 Axis D — see §2.11), scoped to this verb ONLY
+(narrower than `--strategy`/`--locked`/`--upgrade`'s per-resolve-verb
+scoping); a malformed value is `CLI-EXCLUDE-NEWER-INVALID`.
 
 **Global flags used:** `-C`, `-j`, `-s`, `--frozen`.
 
@@ -520,6 +670,40 @@ every pinned identity, resolution skips fetching and only symlinks
 `_deps/` from the CAS. With `--frozen`, any precondition failure exits 1.
 Without `--frozen`, precondition failure falls through to full resolution.
 See S6 for the no-network + solver-bypass guarantees.
+
+> NORMATIVE: `--locked` performs a REAL resolve (with the minimal-change/
+> prior-lock preference applied, exactly like a plain `fetch`) and then
+> asserts the result is identical to the committed `milpa.lock` —
+> **distinct from `--frozen`**, which skips solving entirely and only
+> reconstructs. `--locked` therefore MUST NOT be silently short-circuited
+> by the frozen fast-path described above, even when no `milpa.lock`
+> vs. `_deps/`/CAS precondition would otherwise fail it: when `--locked`
+> is present, the implementation MUST perform the full resolve. The
+> comparison keys on content-hash `identity` + `provenances` only, **never**
+> the version label (resolution-semantics RFC §6 D-B2) — a version
+> relabel of an identity-unchanged dep is not drift. Any deviation (a
+> dep's identity or provenance changed, or a dep was added/removed
+> relative to the committed lock), or the absence of a committed
+> `milpa.lock` to compare against, is `RES-LOCKED-DRIFT`, exit 1. On a
+> `RES-LOCKED-DRIFT` failure, `milpa.lock`/`nim.cfg` MUST be left
+> unmodified (the drift check runs before any write).
+
+> NORMATIVE: `--upgrade [<dep>...]` opts the resolve out of the
+> minimal-change/prior-lock preference (B1/B2) — bare `--upgrade` (no dep
+> names) opts out GLOBALLY (pull the latest allowed version everywhere,
+> the pre-minimal-change newest-wins default, now explicit); `--upgrade
+> <dep> [<dep>...]` opts out ONLY for the named deps, leaving every other
+> dep's locked preference intact. This is implemented as DELEGATION to
+> the exact strip-pin-then-resolve mechanism `milpa update`/`milpa update
+> <dep>` already performs (resolution-semantics RFC §6 D-B3) — the same
+> shared internal helper backs both, so they cannot structurally drift.
+> Because `--upgrade` must force a real re-resolve, its presence — like
+> `--locked`'s — MUST also skip the implicit frozen fast-path described
+> above; otherwise an up-to-date project would silently take the no-solve
+> reconstruction path and `--upgrade` would have no effect. A named
+> `--upgrade <dep>` with no committed `milpa.lock` to scope against, or a
+> named dep absent from the committed lock, fails the same way
+> `update <dep>` does (`LOCK-FILE-NOT-FOUND` / `LOCK-DEP-NOT-FOUND`).
 
 > NORMATIVE: On success, `fetch` MUST:
 >
@@ -553,7 +737,13 @@ See S6 for the no-network + solver-bypass guarantees.
 **Purpose:** Resolve the manifest and write `milpa.lock`; do NOT emit
 `nim.cfg` or populate `_deps/`.
 
-**Arguments:** none beyond global flags.
+**Arguments:** `--locked` (B3, resolution-semantics RFC §3 Axis B — see
+§5.1's `--locked` NORMATIVE clause; `lock` already always full-resolves,
+so no frozen-fast-path bypass is needed here) and `--upgrade [<dep>...]`
+(B4, resolution-semantics RFC §3 Axis B / D-B3 — see §5.1's `--upgrade`
+NORMATIVE clause; the frozen-fast-path bypass is likewise moot since
+`lock` never takes it), both scoped to this verb. `--locked` +
+`--upgrade` together is `CLI-LOCKED-UPGRADE-CONFLICT`.
 
 **Global flags used:** `-C`, `-j`, `-s`. (`--frozen` is accepted but has
 no effect; `lock` always runs the full resolver.)
@@ -808,7 +998,7 @@ manifest mutation — no network fetch, no lockfile write.
 **Arguments:**
 
 ```
-milpa add <dep> --git <url> [--ref <ref>]
+milpa add <dep> --git <url> [--ref <ref>] [--version <x.y.z>]
 milpa add <dep> --mirror <url>
 ```
 
@@ -820,6 +1010,14 @@ milpa add <dep> --mirror <url>
 >   `git ls-remote --symref HEAD` (or the mocked-fetches tree under
 >   `MILPA_MOCKED_FETCHES`); if discovery fails, fail with
 >   `FETCH-REF-DISCOVERY-FAILED` (exit 1).
+> - If `--version <x.y.z>` is given, write it as a `version=` annotation
+>   on the new dep node (resolution-semantics RFC §3 Axis A (b) step 4):
+>   the natural-site workflow for the resolver's declared-version escape
+>   hatch, mirroring the existing `--optional`/`--features` writable
+>   annotations. A malformed value is rejected with
+>   `MAN-DEP-VERSION-INVALID` (exit 1) BEFORE any resolve is attempted or
+>   any file is written — the same validation `milpa.kdl` itself applies
+>   to a hand-authored `version=` property.
 > - Run a full resolve over the proposed manifest (manifest + new dep).
 > - On successful resolve, atomically write the updated `milpa.kdl` and
 >   `milpa.lock`.
@@ -2067,8 +2265,8 @@ the one outcome this section forbids either way.
 
 | Verb      | Args                     | `--frozen` | `-j` | `-s` | `--certificate` | Stdout     | Stderr           | Exit |
 |-----------|--------------------------|-----------|------|------|-----------------|------------|------------------|------|
-| `fetch`   | —                        | yes       | yes  | yes  | yes (§2.5)      | none       | progress/error   | 0/1  |
-| `lock`    | —                        | ignored   | yes  | yes  | yes (§2.5)      | none       | progress/error   | 0/1  |
+| `fetch`   | `[--locked] [--upgrade [<dep>...]] [--exclude-newer <ts>]` (§5.1, §2.11) | yes       | yes  | yes  | yes (§2.5)      | none       | progress/error   | 0/1  |
+| `lock`    | `[--locked] [--upgrade [<dep>...]] [--exclude-newer <ts>]` (§5.2, §2.11) | ignored   | yes  | yes  | yes (§2.5)      | none       | progress/error   | 0/1  |
 | `show`    | —                        | ignored   | —    | —    | ignored         | dep tree   | error only       | 0/1  |
 | `verify`  | —                        | ignored   | —    | —    | ignored         | none       | progress/error   | 0/1  |
 | `clean`   | —                        | ignored   | —    | —    | ignored         | none       | none/confirm     | 0    |

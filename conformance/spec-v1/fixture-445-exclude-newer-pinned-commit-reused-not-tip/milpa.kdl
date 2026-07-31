@@ -1,0 +1,17 @@
+// resolution-semantics RFC §3 Axis D / §6 D-D2 -- branch-ref-once-locked
+// reproducibility, disambiguated from a fresh ref-tip refetch. The prior
+// milpa.lock below pins commit 1111...1 (an OLD commit); the mocked git
+// fixture's flat `sha`/`committer_date` describe a DIFFERENT, newer live
+// tip (2222...2, dated 2026) whose date would fail the bound below. Only
+// if the resolver correctly reuses the PRIOR LOCK'S PINNED commit (per
+// `_git_pin_for_url_dep`, §8) and validates exclude-newer against THAT
+// commit's own committer date (2020, from the per-sha
+// `committer_date@1111...1` override) does this resolve cleanly.
+name "myapp"
+kind "application"
+resolution {
+    exclude-newer "2021-01-01T00:00:00Z"
+}
+deps {
+    widget git=(url)"https://example.com/widget.git" ref="main"
+}

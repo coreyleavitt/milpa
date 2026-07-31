@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -72,6 +73,7 @@ from milpa.errors import (
     MAN_DEP_TARBALL_URL,
     MAN_DEP_UNKNOWN_CHILD,
     MAN_DEP_UNKNOWN_PROPS,
+    MAN_DEP_VERSION_INVALID,
     MAN_FLAG_DEFAULT_TYPE,
     MAN_FLAG_DEFINES_ARG_TYPE,
     MAN_FLAG_DEFINES_UNSAFE,
@@ -100,6 +102,7 @@ from milpa.errors import (
     MAN_OVERRIDE_REF_MISSING,
     MAN_OVERRIDE_TARGET_AMBIGUOUS,
     MAN_OVERRIDE_UNKNOWN_PROPS,
+    MAN_PACKAGE_VERSION_INVALID,
     MAN_PREDICATE_CHILD_ARG_TYPE,
     MAN_PREDICATE_CHILD_NO_ARGS,
     MAN_PREDICATE_FORM_CONFLICT,
@@ -107,6 +110,9 @@ from milpa.errors import (
     MAN_PREDICATE_UNKNOWN,
     MAN_PREDICATE_UNSUPPORTED_ANNOTATION,
     MAN_PREDICATE_VALUE_TYPE,
+    MAN_RESOLUTION_BLOCK_INVALID,
+    MAN_RESOLUTION_EXCLUDE_NEWER_INVALID,
+    MAN_RESOLUTION_STRATEGY_INVALID,
     MAN_SPEC_VERSION_TYPE,
     MAN_SPEC_VERSION_UNSUPPORTED,
     MAN_SRC_DIR_TYPE,
@@ -141,8 +147,9 @@ from milpa.kdl_io import (
     value_as_strict_int,
 )
 from milpa.predicate import Predicate  # SSOT for Predicate; re-exported below
+from milpa.registry import _parse_timestamp  # shared ISO 8601 parser (D0/D1)
 from milpa.trust import TrustPolicy, _parse_trust_policy
-from milpa.version import VersionSet
+from milpa.version import Strategy, Version, VersionSet, format_version_str, parse_version
 
 # Re-export so ``milpa.manifest.Predicate`` still resolves for all existing
 # importers (back-compat; the new SSOT is ``milpa.predicate``).
@@ -177,6 +184,10 @@ _PACKAGE_TOP_LEVEL: frozenset[str] = frozenset(
         "mirrors",
         "cas",
         "spec-version",
+        # A1 (rfc-resolution-semantics.md §3 Axis A / §5): the package's own
+        # declared release version — orthogonal to "spec-version" (the schema
+        # epoch). Absent = version-unknown (not an error).
+        "version",
         "attestation-policy",
         # S5 (RFC registry-trust-federation §6.4): whole-index attestation gate.
         "index-trust",
@@ -187,12 +198,16 @@ _PACKAGE_TOP_LEVEL: frozenset[str] = frozenset(
         # A2c (RFC registry-append-only.md §2, spec/registry-protocol.md §3.5.2):
         # append-only consumer ratchet policy.
         "index-history",
+        # C3 (rfc-resolution-semantics.md §3 Axis C / §5): manifest-level
+        # resolution policy block. First appearance carries only `strategy`;
+        # Axis D's `exclude-newer` extends it in a later slice.
+        "resolution",
     }
 )
 
 # Property names recognized on a UrlDep node (dispatched to UrlDep, not NamedDep).
 _URL_DEP_KNOWN_PROPS: frozenset[str] = frozenset(
-    {"git", "ref", "platform", "arch", "nim", "milpa", "flag", "optional"}
+    {"git", "ref", "platform", "arch", "nim", "milpa", "flag", "optional", "version"}
 )
 
 # Implementation detail of valid_dep_name — do NOT call .match() on this
@@ -260,6 +275,11 @@ _WORKSPACE_TOP_LEVEL: frozenset[str] = frozenset(
         # append-only consumer ratchet policy, legal ONLY on the workspace root —
         # same root-authority reasoning (one shared index, one baseline).
         "index-history",
+        # C3 (rfc-resolution-semantics.md §3 Axis C / §5, Axis W): manifest
+        # resolution policy — root-only for a workspace (one shared lock, one
+        # resolution policy). A member-level `resolution` block is reserved
+        # for rejection in a later slice (Axis D/W1).
+        "resolution",
     }
 )
 
@@ -293,6 +313,12 @@ class UrlDep:
     ``optional`` is retained for round-trip serialization; the parse-time
     desugar pass (S7 RFC #23 §3.2) injects the auto-flag + ``flag=`` predicate
     into the manifest, so resolution never sees this field directly.
+
+    ``version`` is the A3b ``version=`` annotation (§3 Axis A (b) step 4):
+    a user-supplied declared version, consulted by ``declared_version_for``
+    only when the fetched package's own manifest/tag (steps 1-3) yield none.
+    ``None`` when absent (the common case — most git deps ship a real version
+    or a version-shaped tag and never need this escape hatch).
     """
 
     name: str
@@ -302,6 +328,7 @@ class UrlDep:
     predicates: tuple[Predicate, ...] = ()
     flag_requests: tuple[FlagRequest, ...] = ()
     optional: bool = False
+    version: Version | None = None
 
 
 @dataclass(frozen=True)
@@ -368,11 +395,15 @@ class LocalDep:
     ``predicates`` are evaluated before the dep is passed to the solver
     (§6.3 NORMATIVE: all five dep forms support ``when``-conditional syntax).
     Populated from enclosing ``when`` block predicates by ``_parse_local_dep``.
+
+    ``version`` is the A3b ``version=`` annotation (§3 Axis A (b) step 4) —
+    see ``UrlDep.version`` for the full rationale; ``None`` when absent.
     """
 
     name: str
     path: str
     predicates: tuple[Predicate, ...] = ()
+    version: Version | None = None
 
 
 @dataclass(frozen=True)
@@ -389,6 +420,9 @@ class TarballDep:
     ``predicates`` are evaluated before the dep is passed to the solver
     (§6.3 NORMATIVE: all five dep forms support ``when``-conditional syntax).
     Populated from enclosing ``when`` block predicates by ``_parse_tarball_dep``.
+
+    ``version`` is the A3b ``version=`` annotation (§3 Axis A (b) step 4) —
+    see ``UrlDep.version`` for the full rationale; ``None`` when absent.
     """
 
     name: str
@@ -396,6 +430,7 @@ class TarballDep:
     sha256: str | None = None
     strip_components: int = 0
     predicates: tuple[Predicate, ...] = ()
+    version: Version | None = None
 
 
 @dataclass(frozen=True)
@@ -472,10 +507,21 @@ class Override:
     ``MAN-OVERRIDE-TARGET-AMBIGUOUS``.
 
     Project-wide scope.  Does not propagate to downstream consumers.
+
+    ``version`` is the A3b ``version=`` annotation on the override rule
+    itself (§3 Axis A (b) step 4, D-A3): orthogonal to ``target`` — an
+    annotation *labels* a version, an override *redirects* the source, and
+    they compose by re-derivation.  When this override redirects a dep, the
+    Axis-A precedence (steps 1-4) re-runs against the *override target's*
+    manifest; ``version`` here is that target's step 4.  A ``version=``
+    left on the now-redirected ORIGINAL dep declaration is dead and ignored
+    (never a conflict) because the redirect discards the original
+    declaration entirely and builds a fresh dep from the override target.
     """
 
     name: str
     target: OverrideTarget
+    version: Version | None = None
 
 
 @dataclass(frozen=True)
@@ -519,6 +565,27 @@ class FlagDecl:
 
 
 @dataclass(frozen=True)
+class Resolution:
+    """Manifest-level resolution policy (``resolution { }`` block).
+
+    First appearance of this block (C3, rfc-resolution-semantics.md §3 Axis
+    C / §5) carried only ``strategy``; D1 (§3 Axis D) adds ``exclude_newer``
+    as a sibling field, no block-parser reshape needed.  Root-only for a
+    workspace (one shared lock, one resolution policy) — a member-level
+    ``resolution`` block is reserved for rejection in a later slice (Axis
+    D/W1), not built here.
+
+    ``strategy``/``exclude_newer`` are each ``None`` when the block was
+    declared but did not name that child (or the block itself is absent —
+    see ``Manifest.resolution``/``WorkspaceManifest.resolution``, both
+    ``None`` when no ``resolution { }`` node was declared at all).
+    """
+
+    strategy: Strategy | None = None
+    exclude_newer: datetime | None = None
+
+
+@dataclass(frozen=True)
 class Manifest:
     """A parsed package manifest (milpa.kdl in package role).
 
@@ -545,6 +612,12 @@ class Manifest:
     cas_dir: str = ""
     spec_version: int = 1
     spec_version_explicit: bool = False
+    # A1 (rfc-resolution-semantics.md §3 Axis A (b) step 1): the package's own
+    # declared release version, parsed from a top-level ``version "x.y.z"``
+    # node.  ``None`` means no version declared (version-unknown) — not an
+    # error.  Distinct from ``spec_version`` (the manifest schema epoch) and
+    # orthogonal to content-hash identity (spec/identity.md §4.1).
+    version: Version | None = None
     dev_deps: tuple[Dep, ...] = ()
     had_comments: bool = False
     attestation_policy: TrustPolicy = "warn"
@@ -586,6 +659,14 @@ class Manifest:
     rule, mirrors ``entry_trust_policy_explicit``).  A workspace MEMBER manifest that
     explicitly declares ``index-history "warn"`` must still raise
     ``WS-INDEX-HISTORY-ON-MEMBER`` even though the value matches the default."""
+    # C3 (rfc-resolution-semantics.md §3 Axis C / §5): manifest-level
+    # resolution policy (``resolution { strategy "..." }``).  ``None`` means
+    # no ``resolution { }`` node was declared at all — distinct from a
+    # declared-but-empty block (``Resolution(strategy=None)``), though both
+    # behave identically at the effective-strategy precedence point (C3's
+    # CLI > manifest > lockfile-recorded > default chain falls through
+    # either way).
+    resolution: "Resolution | None" = None
 
 
 @dataclass(frozen=True)
@@ -643,6 +724,11 @@ class WorkspaceManifest:
     index_history_policy_explicit: bool = False
     """``True`` iff the source declared an ``index-history`` node (absent-stays-absent
     rule, mirrors ``Manifest.index_history_policy_explicit``)."""
+    # C3 (rfc-resolution-semantics.md §3 Axis C / §5, Axis W): root-only
+    # resolution policy — see ``Manifest.resolution`` for the field's
+    # semantics; identical here, just declared on the workspace root instead
+    # of a package manifest (one shared lock, one resolution policy).
+    resolution: "Resolution | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -1072,6 +1158,8 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
     cas_dir: str = ""
     spec_version: int = 1
     spec_version_explicit: bool = False
+    # A1: top-level package ``version`` field (§3 Axis A (b) step 1).
+    version: Version | None = None
     attestation_policy: TrustPolicy = "warn"
     # S5: index-trust nodes (RFC registry-trust-federation §6.4)
     index_trust_policy: TrustPolicy = "warn"
@@ -1084,6 +1172,8 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
     # A2c: index-history node (RFC registry-append-only.md §2)
     index_history_policy: TrustPolicy = "warn"
     index_history_policy_explicit: bool = False
+    # C3: resolution { strategy "..." } block (rfc-resolution-semantics.md §3 Axis C)
+    resolution: Resolution | None = None
     seen_top_level: set[str] = set()
 
     for n in nodes(doc):
@@ -1094,6 +1184,11 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
             epoch = _parse_spec_version_node(n)
             spec_version = epoch
             spec_version_explicit = True
+            continue
+
+        # --- version (A1: package's own declared release version) ---
+        if nm == "version":
+            version = _parse_package_version_node(n)
             continue
 
         # --- workspace in a package manifest ---
@@ -1237,6 +1332,11 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
         elif nm == "flags":
             flags = _parse_flags_block(n)
 
+        elif nm == "resolution":
+            # C3 (rfc-resolution-semantics.md §3 Axis C / §5): manifest
+            # resolution policy block.
+            resolution = _parse_resolution_block(n)
+
     if name is None:
         raise MilpaError(
             MAN_NAME_MISSING,
@@ -1298,6 +1398,7 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
         cas_dir=cas_dir,
         spec_version=spec_version,
         spec_version_explicit=spec_version_explicit,
+        version=version,
         dev_deps=tuple(dev_deps),
         attestation_policy=attestation_policy,
         optional_auto_flags=optional_auto_flags,
@@ -1309,6 +1410,7 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
         entry_trust_policy_explicit=entry_trust_policy_explicit,
         index_history_policy=index_history_policy,
         index_history_policy_explicit=index_history_policy_explicit,
+        resolution=resolution,
     )
 
 
@@ -1354,6 +1456,9 @@ def _parse_workspace_doc(doc: KdlDocument) -> WorkspaceManifest:
     # A2c (RFC registry-append-only.md §2): same root-authority model.
     ws_index_history_policy: TrustPolicy = "warn"
     ws_index_history_policy_explicit: bool = False
+    # C3 (rfc-resolution-semantics.md §3 Axis C / §5, Axis W): resolution
+    # policy block, root-only for a workspace.
+    ws_resolution: Resolution | None = None
 
     for n in nodes(doc):
         nm = node_name(n)
@@ -1447,6 +1552,11 @@ def _parse_workspace_doc(doc: KdlDocument) -> WorkspaceManifest:
             ws_index_history_policy = _parse_index_history_node(n)
             ws_index_history_policy_explicit = True
 
+        elif nm == "resolution":
+            # C3 (rfc-resolution-semantics.md §3 Axis C / §5): root-only
+            # resolution policy block.
+            ws_resolution = _parse_resolution_block(n)
+
     return WorkspaceManifest(
         members=tuple(members),
         overrides=tuple(overrides),
@@ -1460,6 +1570,7 @@ def _parse_workspace_doc(doc: KdlDocument) -> WorkspaceManifest:
         entry_trust_policy_explicit=ws_entry_trust_policy_explicit,
         index_history_policy=ws_index_history_policy,
         index_history_policy_explicit=ws_index_history_policy_explicit,
+        resolution=ws_resolution,
     )
 
 
@@ -1621,6 +1732,43 @@ def _parse_dep_node(
 # ---------------------------------------------------------------------------
 
 
+def _parse_dep_version_prop(n: KdlNode, *, context: str) -> "Version | None":
+    """Parse an optional ``version=`` property (A3b §3 Axis A (b) step 4).
+
+    Valid on git/url/local/tarball dep declarations and on ``overrides
+    { pkg … version= }`` rules (§5 grammar; D-A3) — every call site passes
+    its own error-message ``context`` (e.g. ``"dep 'foo'"`` or ``"override
+    for 'foo'"``).  Absent → ``None`` (steps 1-3 already tried by
+    ``declared_version_for``; the annotation is a last-resort escape hatch).
+
+    ``milpa.kdl`` is milpa's own strict manifest format, so a malformed
+    value is a hard parse error (``MAN-DEP-VERSION-INVALID``) — same
+    rationale as ``_parse_package_version_node``'s
+    ``MAN-PACKAGE-VERSION-INVALID``, reusing the same ``parse_version``
+    (single source of truth for the semver grammar, no parallel parser).
+    """
+    props = node_props(n)
+    if "version" not in props:
+        return None
+    raw = node_prop_str(n, "version")
+    if raw is None:
+        raise MilpaError(
+            MAN_DEP_VERSION_INVALID,
+            f"{context}: 'version=' must be a string",
+            context=context,
+        )
+    parsed = parse_version(raw)
+    if parsed is None:
+        raise MilpaError(
+            MAN_DEP_VERSION_INVALID,
+            f"{context}: 'version=' value {raw!r} is not a valid semver "
+            "version (expected 'x.y.z')",
+            context=context,
+            value=raw,
+        )
+    return parsed
+
+
 def _parse_url_dep(
     n: KdlNode,
     *,
@@ -1734,6 +1882,9 @@ def _parse_url_dep(
         list(outer_predicates) + inline_predicates + child_predicates
     )
 
+    # A3b: version= annotation (§3 Axis A (b) step 4).
+    version = _parse_dep_version_prop(n, context=f"dep {dep_name!r}")
+
     return UrlDep(
         name=dep_name,
         git=git_url,
@@ -1742,6 +1893,7 @@ def _parse_url_dep(
         predicates=tuple(all_predicates),
         flag_requests=tuple(flag_requests),
         optional=optional,
+        version=version,
     )
 
 
@@ -2117,9 +2269,9 @@ def _parse_local_dep(
     """
     props = node_props(n)
 
-    # Check for unknown properties (anything except "local")
+    # Check for unknown properties (anything except "local" and "version")
     for prop_key in props:
-        if prop_key != "local":
+        if prop_key not in ("local", "version"):
             raise MilpaError(
                 MAN_DEP_UNKNOWN_PROPS,
                 f"dep {dep_name!r}: LocalDep does not accept property {prop_key!r}",
@@ -2143,7 +2295,10 @@ def _parse_local_dep(
             dep=dep_name,
         )
 
-    return LocalDep(name=dep_name, path=path, predicates=outer_predicates)
+    # A3b: version= annotation (§3 Axis A (b) step 4).
+    version = _parse_dep_version_prop(n, context=f"dep {dep_name!r}")
+
+    return LocalDep(name=dep_name, path=path, predicates=outer_predicates, version=version)
 
 
 def _parse_tarball_dep(
@@ -2240,12 +2395,16 @@ def _parse_tarball_dep(
             )
         strip_components = strip_v
 
+    # A3b: version= annotation (§3 Axis A (b) step 4).
+    version = _parse_dep_version_prop(n, context=f"dep {dep_name!r}")
+
     return TarballDep(
         name=dep_name,
         url=url,
         sha256=sha256,
         strip_components=strip_components,
         predicates=outer_predicates,
+        version=version,
     )
 
 
@@ -2294,13 +2453,15 @@ def _parse_overrides_block(block: KdlNode) -> list[Override]:
         children = node_children(child)
 
         # Known properties across all forms; validate unknowns first.
-        _OVERRIDE_KNOWN_PROPS = frozenset({"git", "ref", "local"})
+        # A3b: 'version' is valid on every target form (D-A3 — orthogonal to
+        # which redirect form is chosen; labels that target's step 4).
+        _OVERRIDE_KNOWN_PROPS = frozenset({"git", "ref", "local", "version"})
         for prop_key in props:
             if prop_key not in _OVERRIDE_KNOWN_PROPS:
                 raise MilpaError(
                     MAN_OVERRIDE_UNKNOWN_PROPS,
                     f"override for {pkg_name!r}: unknown property {prop_key!r} "
-                    "(allowed: 'git', 'ref', 'local')",
+                    "(allowed: 'git', 'ref', 'local', 'version')",
                     name=pkg_name,
                     prop=prop_key,
                 )
@@ -2375,7 +2536,12 @@ def _parse_overrides_block(block: KdlNode) -> list[Override]:
                 name=pkg_name,
             )
         seen_names.add(pkg_name)
-        overrides.append(Override(name=pkg_name, target=target))
+
+        # A3b: version= annotation on the override rule (§3 Axis A (b) step 4,
+        # D-A3) — valid regardless of which target form was selected above.
+        ov_version = _parse_dep_version_prop(child, context=f"override for {pkg_name!r}")
+
+        overrides.append(Override(name=pkg_name, target=target, version=ov_version))
 
     return overrides
 
@@ -2752,6 +2918,155 @@ def _parse_spec_version_node(n: KdlNode) -> int:
     return epoch
 
 
+def _parse_package_version_node(n: KdlNode) -> Version:
+    """Parse a top-level ``version "x.y.z"`` node (A1 §3 Axis A (b) step 1).
+
+    ``milpa.kdl`` is milpa's own strict manifest format, so a malformed value
+    is a hard parse error (``MAN-PACKAGE-VERSION-INVALID``) — unlike the
+    ``.nimble`` compat adapter, which falls through to version-unknown for a
+    malformed ``version`` (totality contract, ``nimble.py``).  Reuses
+    ``parse_version`` (``version.py``), the single source of truth for the
+    semver grammar — no parallel parser.
+    """
+    raw_args = node_args(n)
+    if len(raw_args) != 1 or not isinstance(raw_args[0], str):
+        raise MilpaError(
+            MAN_PACKAGE_VERSION_INVALID,
+            "'version' takes exactly one positional string argument "
+            "(e.g. \"1.2.3\")",
+            node="version",
+        )
+    parsed = parse_version(raw_args[0])
+    if parsed is None:
+        raise MilpaError(
+            MAN_PACKAGE_VERSION_INVALID,
+            f"'version' value {raw_args[0]!r} is not a valid semver "
+            "version (expected 'x.y.z')",
+            value=raw_args[0],
+        )
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# Internal — resolution block parser (C3, rfc-resolution-semantics.md §3
+# Axis C / §5; shared by package + workspace manifests)
+# ---------------------------------------------------------------------------
+
+# Recognized children of a ``resolution { }`` block. Deliberately a small,
+# extensible set — D1 (rfc-resolution-semantics.md §3 Axis D) adds
+# ``exclude-newer`` alongside C3's ``strategy``.
+_RESOLUTION_KNOWN_CHILDREN: frozenset[str] = frozenset({"strategy", "exclude-newer"})
+
+
+def _parse_resolution_strategy_node(n: KdlNode) -> Strategy:
+    """Parse a ``strategy "<value>"`` child of a ``resolution { }`` block.
+
+    Malformed arity/type or an unrecognized wire value is a hard parse
+    error (``MAN-RESOLUTION-STRATEGY-INVALID``) — mirrors
+    ``_parse_package_version_node``'s strictness (``milpa.kdl`` is milpa's
+    own strict format).
+    """
+    raw_args = node_args(n)
+    if len(raw_args) != 1 or not isinstance(raw_args[0], str):
+        raise MilpaError(
+            MAN_RESOLUTION_STRATEGY_INVALID,
+            "'resolution.strategy' takes exactly one positional string "
+            "argument ('maxver', 'minver', 'semver', or 'lowest-direct')",
+            node="strategy",
+        )
+    try:
+        return Strategy(raw_args[0])
+    except ValueError:
+        raise MilpaError(
+            MAN_RESOLUTION_STRATEGY_INVALID,
+            f"'resolution.strategy' value {raw_args[0]!r} is not a "
+            "recognized strategy (expected 'maxver', 'minver', 'semver', "
+            "or 'lowest-direct')",
+            value=raw_args[0],
+        ) from None
+
+
+def _parse_resolution_exclude_newer_node(n: KdlNode) -> datetime:
+    """Parse an ``exclude-newer "<ts>"`` child of a ``resolution { }`` block.
+
+    Malformed arity/type or an unparseable ISO 8601 timestamp is a hard
+    parse error (``MAN-RESOLUTION-EXCLUDE-NEWER-INVALID``) — mirrors
+    ``_parse_resolution_strategy_node``'s strictness.  Reuses the shared
+    registry-protocol timestamp parser (``_parse_timestamp``,
+    ``registry.py``, D0/D1) rather than a second implementation.  That
+    parser is deliberately fail-soft for its own callers (``published_at``/
+    ``yanked_at`` fall back to absent per registry-protocol §3.2) — here a
+    malformed value is instead escalated to a hard parse error, since
+    ``resolution { exclude-newer }`` is a manifest declaration, not an
+    optional informational index field.
+    """
+    raw_args = node_args(n)
+    if len(raw_args) != 1 or not isinstance(raw_args[0], str):
+        raise MilpaError(
+            MAN_RESOLUTION_EXCLUDE_NEWER_INVALID,
+            "'resolution.exclude-newer' takes exactly one positional "
+            "string argument (an ISO 8601 timestamp)",
+            node="exclude-newer",
+        )
+    parsed = _parse_timestamp(raw_args[0])
+    if parsed is None:
+        raise MilpaError(
+            MAN_RESOLUTION_EXCLUDE_NEWER_INVALID,
+            f"'resolution.exclude-newer' value {raw_args[0]!r} is not a "
+            "parseable ISO 8601 timestamp",
+            value=raw_args[0],
+        )
+    return parsed
+
+
+def _format_resolution_timestamp(dt: datetime) -> str:
+    """Format a ``resolution { exclude-newer }`` timestamp back to canonical
+    UTC ISO 8601 (``...Z``) — the inverse of ``_parse_timestamp``.
+
+    Normalizes to UTC (mirrors the Rust ``Timestamp``'s own "always a
+    normalized UTC instant" contract, D0) so the emitted wire form is
+    canonical regardless of the offset spelling in the source text.
+    Sub-second precision is preserved only when present (never a fake
+    trailing ``.000000``).
+    """
+    dt_utc = dt.astimezone(timezone.utc) if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+    if dt_utc.microsecond:
+        frac = f"{dt_utc.microsecond:06d}".rstrip("0")
+        return dt_utc.strftime("%Y-%m-%dT%H:%M:%S") + f".{frac}Z"
+    return dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_resolution_block(n: KdlNode) -> "Resolution":
+    """Parse a ``resolution { }`` block (C3 §3 Axis C / D1 §3 Axis D / §5).
+
+    Unknown child node, or a duplicate ``strategy``/``exclude-newer`` child,
+    is a hard parse error (``MAN-RESOLUTION-BLOCK-INVALID``) — a single
+    clear failure mode for "this block is malformed", distinct from a
+    malformed VALUE inside a recognized child
+    (``MAN-RESOLUTION-STRATEGY-INVALID`` / ``MAN-RESOLUTION-EXCLUDE-NEWER-
+    INVALID``).
+    """
+    strategy: Strategy | None = None
+    exclude_newer: datetime | None = None
+    seen: set[str] = set()
+    for child in node_children(n):
+        child_nm = node_name(child)
+        if child_nm not in _RESOLUTION_KNOWN_CHILDREN or child_nm in seen:
+            raise MilpaError(
+                MAN_RESOLUTION_BLOCK_INVALID,
+                f"unknown or duplicate node {child_nm!r} in 'resolution' block "
+                f"(allowed: {', '.join(sorted(_RESOLUTION_KNOWN_CHILDREN))}, "
+                "each at most once)",
+                node=child_nm,
+            )
+        seen.add(child_nm)
+        if child_nm == "strategy":
+            strategy = _parse_resolution_strategy_node(child)
+        elif child_nm == "exclude-newer":
+            exclude_newer = _parse_resolution_exclude_newer_node(child)
+    return Resolution(strategy=strategy, exclude_newer=exclude_newer)
+
+
 # ---------------------------------------------------------------------------
 # Serializer — format_manifest (hand-rolled canonical KDL 2.0)
 # ---------------------------------------------------------------------------
@@ -2814,6 +3129,33 @@ def format_manifest(manifest: Manifest) -> str:
     lines.append(f'name "{_kdl_str(manifest.name)}"')
     lines.append("")
 
+    # version — A1 (§3 Axis A (b) step 1): the package's own declared release
+    # version, present iff manifest.version is set (absent-stays-absent,
+    # mirroring spec-version above — no default value to fall back to).
+    if manifest.version is not None:
+        lines.append(f'version "{format_version_str(manifest.version)}"')
+        lines.append("")
+
+    # resolution { strategy "..."; exclude-newer "..." } — C3 (§3 Axis C /
+    # §5) + D1 (§3 Axis D). Emitted only when there is actual content (either
+    # child set); an empty/absent block is behaviorally identical at the
+    # effective-strategy/exclude-newer precedence point, so there is nothing
+    # to preserve on round-trip for the empty case.
+    if manifest.resolution is not None and (
+        manifest.resolution.strategy is not None
+        or manifest.resolution.exclude_newer is not None
+    ):
+        lines.append("resolution {")
+        if manifest.resolution.strategy is not None:
+            lines.append(f'    strategy "{_kdl_str(manifest.resolution.strategy)}"')
+        if manifest.resolution.exclude_newer is not None:
+            lines.append(
+                '    exclude-newer '
+                f'"{_format_resolution_timestamp(manifest.resolution.exclude_newer)}"'
+            )
+        lines.append("}")
+        lines.append("")
+
     # src_dir (only when non-empty)
     if manifest.src_dir:
         lines.append(f'src_dir "{_kdl_str(manifest.src_dir)}"')
@@ -2849,20 +3191,27 @@ def format_manifest(manifest: Manifest) -> str:
         lines.append("overrides {")
         for ov in manifest.overrides:
             t = ov.target
+            # A3b: version= annotation on the override rule itself (§3 Axis A
+            # (b) step 4, D-A3) — valid regardless of target form.
+            ov_version_suffix = (
+                f' version="{format_version_str(ov.version)}"' if ov.version is not None else ""
+            )
             if isinstance(t, GitTarget):
                 lines.append(
                     f'    pkg "{_kdl_str(ov.name)}"'
                     f' git=(url)"{_kdl_str(t.git)}"'
                     f' ref="{_kdl_str(t.ref)}"'
+                    f'{ov_version_suffix}'
                 )
             elif isinstance(t, LocalTarget):
                 lines.append(
                     f'    pkg "{_kdl_str(ov.name)}"'
                     f' local="{_kdl_str(t.path)}"'
+                    f'{ov_version_suffix}'
                 )
             elif isinstance(t, MemberTarget):
                 lines.append(
-                    f'    pkg "{_kdl_str(ov.name)}" {{'
+                    f'    pkg "{_kdl_str(ov.name)}"{ov_version_suffix} {{'
                 )
                 lines.append(
                     f'        member "{_kdl_str(t.member_name)}"'
@@ -3004,6 +3353,26 @@ def format_workspace_manifest(ws: "WorkspaceManifest") -> str:
     # name (optional on workspace root)
     if ws.name is not None:
         lines.append(f'name "{_kdl_str(ws.name)}"')
+        lines.append("")
+
+    # resolution { strategy "..."; exclude-newer "..." } — C3 (§3 Axis C /
+    # §5) + D1 (§3 Axis D), root-only. Emitted right after `name` (matches
+    # Rust's canonical position for workspace-root policy fields —
+    # index-trust/entry-trust/index-history follow the pre-existing,
+    # out-of-scope Python/Rust ordering divergence documented elsewhere;
+    # this NEW field does not inherit it).
+    if ws.resolution is not None and (
+        ws.resolution.strategy is not None or ws.resolution.exclude_newer is not None
+    ):
+        lines.append("resolution {")
+        if ws.resolution.strategy is not None:
+            lines.append(f'    strategy "{_kdl_str(ws.resolution.strategy)}"')
+        if ws.resolution.exclude_newer is not None:
+            lines.append(
+                '    exclude-newer '
+                f'"{_format_resolution_timestamp(ws.resolution.exclude_newer)}"'
+            )
+        lines.append("}")
         lines.append("")
 
     # workspace { member "..." }
@@ -3224,6 +3593,8 @@ def _format_dep_line(dep: Dep) -> str:
 
     if isinstance(dep, LocalDep):
         node_body = f'"{_kdl_str(dep.name)}" local="{_kdl_str(dep.path)}"'
+        if dep.version is not None:
+            node_body += f' version="{format_version_str(dep.version)}"'
         if dep.predicates:
             inner = f"        {node_body}"
             when_props = _format_predicate_props(dep.predicates)
@@ -3239,6 +3610,8 @@ def _format_dep_line(dep: Dep) -> str:
             parts.append(f'sha256="{_kdl_str(dep.sha256)}"')
         if dep.strip_components != 0:
             parts.append(f"strip_components={dep.strip_components}")
+        if dep.version is not None:
+            parts.append(f'version="{format_version_str(dep.version)}"')
         node_body = " ".join(parts)
         if dep.predicates:
             inner = f"        {node_body}"
@@ -3267,6 +3640,10 @@ def _format_dep_line(dep: Dep) -> str:
         f' git=(url)"{_kdl_str(dep.git)}"'
         f' ref="{_kdl_str(dep.ref)}"'
     )
+    # version= annotation — A3b (§3 Axis A (b) step 4), Cargo's {git, ref,
+    # version} pattern.  Present iff dep.version is set.
+    if dep.version is not None:
+        head += f' version="{format_version_str(dep.version)}"'
     # optional=#true — round-trip preservation (S7 RFC #23 §3.2).
     if dep.optional:
         head += " optional=#true"

@@ -1,0 +1,5 @@
+name "member-b"
+kind "library"
+deps {
+    httputils
+}

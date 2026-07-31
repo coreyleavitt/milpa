@@ -247,6 +247,14 @@ the version was published.
 > is normative as of this amendment; enforcement of the checks that consume
 > the typed value (below) lands with `rfc-registry-append-only.md`'s A2/A2a
 > slice.
+>
+> NORMATIVE (timezone): an ISO 8601 timestamp with no UTC offset or `Z`
+> suffix (a naive/offsetless value) MUST be interpreted as UTC. Both
+> reference implementations normalize a naive-parsed value to UTC before any
+> comparison, so a `published_at`/`yanked_at` value and an `exclude-newer`
+> bound are always compared as timezone-aware instants (a naive-vs-aware
+> comparison must never occur). Applies equally to `yanked_at` and to the
+> resolution `exclude-newer` bound this field is compared against.
 
 > NORMATIVE (raw source text MUST also be retained): parsing to the typed
 > `<timestamp> | None` value above is not sufficient by itself — the

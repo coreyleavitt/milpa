@@ -371,7 +371,7 @@ def apply_workspace_manifest_change(
     # Step 5: Resolution succeeded — commit both outputs atomically.
     # Write manifest first, then lock.  (The only residual window is an
     # fs-write failure between the two writes — same as single-package.)
-    lockfile_val = from_graph(graph, strategy=str(params.strategy))
+    lockfile_val = from_graph(graph, strategy=str(params.strategy), exclude_newer=params.exclude_newer)
     manifest_path = root / "milpa.kdl"
     lock_path = root / "milpa.lock"
 
@@ -490,7 +490,7 @@ def apply_member_manifest_change(
 
     # Step 6: Resolution succeeded — commit both outputs atomically.
     # Write member manifest first, then shared lock.
-    lockfile_val = from_graph(graph, strategy=str(params.strategy))
+    lockfile_val = from_graph(graph, strategy=str(params.strategy), exclude_newer=params.exclude_newer)
     lock_path = workspace_root / "milpa.lock"
 
     before = _count_comments(member_text)

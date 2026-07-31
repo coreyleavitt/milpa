@@ -33,6 +33,7 @@ Error codes raised here (WS-* and file-level MAN-*/NIMBLE-*):
     WS-INDEX-TRUST-ON-MEMBER  — member manifest declares index-trust (root-only field)
     WS-ENTRY-TRUST-ON-MEMBER  — member manifest declares entry-trust (root-only field)
     WS-INDEX-HISTORY-ON-MEMBER — member manifest declares index-history (root-only field)
+    MAN-RESOLUTION-MEMBER-SCOPE — member manifest declares resolution { } (root-only block)
     WS-MEMBER-DIR-MISSING     — declared member dir does not exist
     WS-MEMBER-DOT             — "." used as member path
     WS-MEMBER-DUPLICATE-NAME  — two members share a package name
@@ -59,6 +60,7 @@ from milpa.errors import (
     MAN_FILE_UNREADABLE,
     MAN_NIMBLE_AMBIGUOUS,
     MAN_NO_MANIFEST,
+    MAN_RESOLUTION_MEMBER_SCOPE,
     NIMBLE_FILE_NOT_FOUND,
     NIMBLE_FILE_UNREADABLE,
     WS_ENTRY_TRUST_ON_MEMBER,
@@ -405,6 +407,7 @@ def load_workspace(workspace_root: Path) -> LoadedWorkspace:
     _check_member_index_trust_declarations(members)
     _check_member_entry_trust_declarations(members)
     _check_member_index_history_declarations(members)
+    _check_member_resolution_declarations(members)
 
     return LoadedWorkspace(
         root_dir=workspace_root,
@@ -539,6 +542,7 @@ def load_workspace_from_manifest(
     _check_member_index_trust_declarations(members)
     _check_member_entry_trust_declarations(members)
     _check_member_index_history_declarations(members)
+    _check_member_resolution_declarations(members)
 
     return LoadedWorkspace(
         root_dir=workspace_root,
@@ -612,6 +616,7 @@ def load_workspace_with_member_override(
     _check_member_index_trust_declarations(new_members)
     _check_member_entry_trust_declarations(new_members)
     _check_member_index_history_declarations(new_members)
+    _check_member_resolution_declarations(new_members)
 
     return LoadedWorkspace(
         root_dir=workspace.root_dir,
@@ -846,6 +851,42 @@ def _check_member_index_history_declarations(members: list["LoadedMember"]) -> N
             raise MilpaError(
                 WS_INDEX_HISTORY_ON_MEMBER,
                 "index-history is a workspace-root policy; declare it in the "
+                f"workspace root manifest, not in member {member.rel_path!r}",
+                member=member.rel_path,
+            )
+
+
+# ---------------------------------------------------------------------------
+# W1 — workspace resolution-block root-authority helper
+# (rfc-resolution-semantics.md §3 Axis W, §5 MAN-RESOLUTION-MEMBER-SCOPE)
+# ---------------------------------------------------------------------------
+
+
+def _check_member_resolution_declarations(members: list["LoadedMember"]) -> None:
+    """Raise MAN-RESOLUTION-MEMBER-SCOPE if any member declares a resolution block.
+
+    resolution { } (strategy / exclude-newer) is a workspace-ROOT policy
+    (rfc-resolution-semantics.md §3 Axis W): one shared lock implies one
+    resolution policy, so only the workspace root manifest may declare it —
+    mirrors ``_check_member_index_trust_declarations`` /
+    ``_check_member_entry_trust_declarations`` /
+    ``_check_member_index_history_declarations`` for the sibling root-only-
+    policy axes, though this slug keeps the dominant ``MAN-`` prefix (the
+    RFC's own §5 slug enumeration) rather than the ``WS-*-ON-MEMBER`` pattern
+    those unrelated fields use.
+
+    Fires even when a member's declared ``resolution { }`` block is empty or
+    matches the root's own policy — the rule is about WHERE the block is
+    declared, not what it contains, so ``Manifest.resolution is not None``
+    (parsed presence of the node) is what triggers this check. A standalone
+    (non-workspace) manifest declaring ``resolution { }`` is unaffected — this
+    check only runs over workspace members.
+    """
+    for member in members:
+        if member.manifest.resolution is not None:
+            raise MilpaError(
+                MAN_RESOLUTION_MEMBER_SCOPE,
+                "resolution { } is a workspace-root policy; declare it in the "
                 f"workspace root manifest, not in member {member.rel_path!r}",
                 member=member.rel_path,
             )

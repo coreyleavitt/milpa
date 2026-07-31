@@ -14,12 +14,23 @@ use milpa_types::{PreId, Version};
 /// Version-selection strategy (resolver-semantics §4.2/§4.3). `Maxver` is the
 /// default; `Minver` locks to the floor; `Semver` stays within the constraint
 /// lower bound's major.
+///
+/// `LowestDirect` (resolver-semantics RFC §3 Axis C, #111; wire string
+/// `lowest-direct`, matching uv's `--resolution lowest-direct`): applies
+/// `Minver` to root-direct deps and `Maxver` to everything else — the
+/// practical way to test that advertised lower bounds actually build. This is
+/// a **surface value only** (CLI flag / lockfile `strategy` node): the
+/// provider resolves it to a concrete per-package `EffectiveStrategy` before
+/// the pick ever runs (`effective_strategy`, D-C2) — `pick_version`'s
+/// `strategy` argument has NO `LowestDirect` case; its type (`EffectiveStrategy`)
+/// structurally cannot represent it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Strategy {
     #[default]
     Maxver,
     Minver,
     Semver,
+    LowestDirect,
 }
 
 impl Strategy {
@@ -29,6 +40,115 @@ impl Strategy {
             Strategy::Maxver => "maxver",
             Strategy::Minver => "minver",
             Strategy::Semver => "semver",
+            Strategy::LowestDirect => "lowest-direct",
+        }
+    }
+
+    /// Parse the canonical wire string (`as_str`'s inverse). `None` for an
+    /// unrecognized value — never a panic, so callers decide the error slug
+    /// (C3, resolver-semantics RFC §3 Axis C / §5): the CLI `--strategy` flag
+    /// and the manifest `resolution { strategy }` block both reuse this SSOT
+    /// rather than duplicating the match.
+    pub fn parse(s: &str) -> Option<Strategy> {
+        match s {
+            "maxver" => Some(Strategy::Maxver),
+            "minver" => Some(Strategy::Minver),
+            "semver" => Some(Strategy::Semver),
+            "lowest-direct" => Some(Strategy::LowestDirect),
+            _ => None,
+        }
+    }
+}
+
+/// C2 (resolver-semantics RFC §3 Axis C / §4 stage 4, D-C2): the concrete
+/// strategy the picker (`pick_version`) can execute — deliberately narrower
+/// than the surface `Strategy` (it has no `LowestDirect` variant). The
+/// provider's `effective_strategy` precompute is the ONLY place a `Strategy`
+/// value is converted to this type; `LowestDirect` is interpreted there
+/// (`Minver` for a root-direct package, `Maxver` otherwise) and never flows
+/// any further — `pick_version`'s `match` is exhaustive over exactly these
+/// three variants, so a future accidental attempt to pass `LowestDirect` into
+/// the picker is a compile error, not a runtime footgun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveStrategy {
+    Maxver,
+    Minver,
+    Semver,
+}
+
+/// C2 (resolver-semantics RFC §3 Axis C / §4 stage 4, D-C2): resolve the
+/// provider's configured `Strategy` — which may be the surface-only
+/// `LowestDirect` — to a concrete `EffectiveStrategy` for one package.
+/// `LowestDirect` becomes `Minver` for a root-direct package
+/// (`is_root_direct`) and `Maxver` otherwise; every other strategy passes
+/// through unchanged. This is the provider-level effective-strategy
+/// precompute the RFC's design deepening calls for — `pick_version` never
+/// learns `LowestDirect` exists.
+fn effective_strategy(strategy: Strategy, is_root_direct: bool) -> EffectiveStrategy {
+    match strategy {
+        Strategy::Maxver => EffectiveStrategy::Maxver,
+        Strategy::Minver => EffectiveStrategy::Minver,
+        Strategy::Semver => EffectiveStrategy::Semver,
+        Strategy::LowestDirect => {
+            if is_root_direct {
+                EffectiveStrategy::Minver
+            } else {
+                EffectiveStrategy::Maxver
+            }
+        }
+    }
+}
+
+/// A5 (resolution-semantics RFC §3 Axis A (b) / §5): which precedence branch
+/// produced a git/url/local/tarball/member dep's declared-version label
+/// (`declared_version_for`, `edge_sources.rs`). Mirrors `milpa/version.py`'s
+/// `VersionSource` StrEnum.
+///
+/// `Manifest` names the *role* — "this package's own manifest" — not the
+/// literal file syntax of the day, so the wire value in the lockfile survives
+/// a future manifest-format evolution. The four values mirror precedence
+/// steps 1-4 exactly:
+///
+/// - `Manifest`: the fetched package's own `milpa.kdl version` field (step 1).
+/// - `Nimble`: the fetched package's `.nimble version` (step 2, A1 scanner).
+/// - `Tag`: a version-shaped git ref tag, `v?X.Y.Z` (step 3, A3).
+/// - `Annotation`: the dep declaration's `version=` annotation, or an
+///   `overrides { … version= }` rule's (step 4, A3b).
+///
+/// A version-unknown dep (no step matched) carries no `VersionSource` at all
+/// — `None` (Option, not a 5th variant; §5 NORMATIVE: the lockfile pairs
+/// `0.0.0` + absent source for that case, a combination no `Known` case ever
+/// produces since a `Known` always names its source).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionSource {
+    Manifest,
+    Nimble,
+    Tag,
+    Annotation,
+}
+
+impl VersionSource {
+    /// Canonical lockfile spelling (`declared_version_source "manifest"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VersionSource::Manifest => "manifest",
+            VersionSource::Nimble => "nimble",
+            VersionSource::Tag => "tag",
+            VersionSource::Annotation => "annotation",
+        }
+    }
+
+    /// Parse a lockfile-recorded value back into a `VersionSource`. `None`
+    /// for any unrecognized value — forward-compat lenient collapse (mirrors
+    /// the attestation `kind` collapse convention, lockfile-schema §3.9); no
+    /// new error slug is warranted for a purely additive field.
+    pub fn from_str_lenient(s: &str) -> Option<VersionSource> {
+        match s {
+            "manifest" => Some(VersionSource::Manifest),
+            "nimble" => Some(VersionSource::Nimble),
+            "tag" => Some(VersionSource::Tag),
+            "annotation" => Some(VersionSource::Annotation),
+            _ => None,
         }
     }
 }
@@ -390,6 +510,16 @@ impl VersionSet {
 
     pub fn is_empty(&self) -> bool {
         self.intervals.is_empty()
+    }
+
+    /// Whether this set admits every version (no constrainer has narrowed it
+    /// at all). Canonical form makes structural equality exact set equality
+    /// (see the struct doc), so this is just an equality check against
+    /// [`VersionSet::full`] — used by A4's version-unknown partition to
+    /// classify a package's accumulated range at its decision point
+    /// (resolver-semantics RFC §3 Axis A (c)).
+    pub fn is_full(&self) -> bool {
+        self == &VersionSet::full()
     }
 
     /// Set intersection.
@@ -762,9 +892,9 @@ fn split_or(s: &str) -> Vec<&str> {
 // incompatibility learning, backjumping, and the derivation tree.
 // ---------------------------------------------------------------------------
 
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
-use std::convert::Infallible;
 
 /// One dependency edge: a required package plus the version set it is constrained
 /// to. Mirrors a positive `Term` from the Python provider's `dependencies`
@@ -797,6 +927,64 @@ pub trait PackageProvider {
 
     /// The dependencies of `package` at `version`.
     fn dependencies(&self, package: &str, version: &Version) -> Vec<Dep>;
+
+    /// A4 (resolver-semantics RFC §3 Axis A (c)): true iff `package` has no
+    /// declared version — a git/url/local/tarball dep whose manifest/
+    /// `.nimble`/tag/`version=` precedence chain (Axis A (b)) all missed, so
+    /// it carries only the internal sentinel label. Drives two things in the
+    /// solver seam: `prioritize` gives such packages strictly lowest decision
+    /// priority (decided only after every reachable constrainer, including a
+    /// lazily-materialized named/index dep, is already expanded — §3 Axis A
+    /// (c) explains why this can't be a pre-solve pre-pass), and
+    /// `choose_version` classifies at that decision point (range `full()` →
+    /// unconstrained, unaffected; range non-`full()` → hard error, never a
+    /// guessed candidate). Default `false`: providers with no version-unknown
+    /// concept (in-memory test fakes) are unaffected.
+    fn is_version_unknown(&self, _package: &str) -> bool {
+        false
+    }
+
+    /// B2 (resolver-semantics RFC §4 stage 4): the prior lockfile's recorded
+    /// version for `package`, if one exists — assembled upstream by the
+    /// resolver's provider from `params.prior`/`maybe_prior_lockfile` (an
+    /// O(1) lookup per package). Fed to `pick_version` as the RFC's
+    /// `FromLock(v)` preference, which short-circuits strategy ordering when
+    /// `v` survives the constraint filter (B1). Default `None`: providers
+    /// with no prior-lock concept (in-memory test fakes) are unaffected.
+    fn preference(&self, _package: &str) -> Option<Version> {
+        None
+    }
+
+    /// C2 (resolver-semantics RFC §3 Axis C, D-C2): true iff `package` is a
+    /// root-declared or override-named dep (the resolver's `root_authority`
+    /// set, §10 provenance precedence). Drives the `LowestDirect`
+    /// effective-strategy precompute (`effective_strategy`): `Minver` for a
+    /// root-direct package, `Maxver` otherwise. Default `false`: providers
+    /// with no root-authority concept (in-memory test fakes) treat every
+    /// package as transitive.
+    fn is_root_direct(&self, _package: &str) -> bool {
+        false
+    }
+
+    /// R3 (resolver-semantics RFC §4.2.1, NORMATIVE): the BFS-insertion index
+    /// at which `package` was FIRST reached from the root manifest — root
+    /// deps in their manifest declaration order, then transitives in first-
+    /// occurrence order. `prioritize` uses this as its tie-break AMONG
+    /// non-version-unknown packages (Reverse of this value, so the smallest
+    /// index — earliest declared/reached — decides first), so Rust's
+    /// decision order matches Python's `_next_undecided` (which walks
+    /// partial-solution assignments in that exact insertion order) instead of
+    /// alphabetical package name. This is load-bearing for which canonical
+    /// solution an AMBIGUOUS (diamond) graph resolves to — §4.2.1's worked
+    /// example is normative on it.
+    ///
+    /// Default `usize::MAX`: providers with no BFS-order concept (in-memory
+    /// test fakes) tie at the same sentinel for every package, so
+    /// `prioritize` falls through to its OWN name tie-break unchanged —
+    /// every pre-R3 test's decision order is preserved byte-for-byte.
+    fn declaration_order(&self, _package: &str) -> usize {
+        usize::MAX
+    }
 }
 
 /// One refutation entry: a package name and its constraint string. Used in the
@@ -821,9 +1009,19 @@ pub fn solve<P: PackageProvider>(
     root_version: Version,
     strategy: Strategy,
 ) -> Result<BTreeMap<String, Version>, SolverError> {
-    let adapter = ProviderAdapter { provider, strategy };
+    let adapter = ProviderAdapter::new(provider, strategy);
     match pubgrub::resolve(&adapter, root.to_string(), root_version) {
         Ok(selected) => Ok(selected.into_iter().collect()),
+        // A4: `choose_version` raised this at a version-unknown package's own
+        // (last-scheduled) decision point, before returning any candidate —
+        // `pubgrub` never saw an out-of-range choice. Surface the structured
+        // facts as their own `SolverError` variant (not stringified into
+        // `Conflict`) so the resolver can build the root-authority-aware
+        // remedy text.
+        Err(pubgrub::PubGrubError::ErrorChoosingVersion {
+            source: ProviderError::VersionUnknownConstrained { package, constrainers },
+            ..
+        }) => Err(SolverError::VersionUnknownConstrained { package, constrainers }),
         Err(pubgrub::PubGrubError::NoSolution(mut tree)) => {
             // Collapse chains of "no versions" derivations into their external
             // cause so the narration names the exhausted package directly.
@@ -833,8 +1031,9 @@ pub fn solve<P: PackageProvider>(
             Err(SolverError::Conflict(prose))
         }
         // The other `PubGrubError` variants only arise when the provider's
-        // associated `Err` is produced — ours is `Infallible`, so these are
-        // unreachable; render defensively rather than panic.
+        // associated `Err` is produced with a variant not matched above —
+        // unreachable today (`ProviderError` has one variant); render
+        // defensively rather than panic.
         Err(other) => Err(SolverError::Conflict(other.to_string())),
     }
 }
@@ -850,9 +1049,18 @@ pub fn solve_with_refutation<P: PackageProvider>(
     root_version: Version,
     strategy: Strategy,
 ) -> Result<BTreeMap<String, Version>, (SolverError, Vec<RefutationEntry>)> {
-    let adapter = ProviderAdapter { provider, strategy };
+    let adapter = ProviderAdapter::new(provider, strategy);
     match pubgrub::resolve(&adapter, root.to_string(), root_version) {
         Ok(selected) => Ok(selected.into_iter().collect()),
+        // A4: not a SOLVE-CONFLICT — no refutation to extract (mirrors how a
+        // non-solver MilpaError failure carries an empty FailureCert).
+        Err(pubgrub::PubGrubError::ErrorChoosingVersion {
+            source: ProviderError::VersionUnknownConstrained { package, constrainers },
+            ..
+        }) => Err((
+            SolverError::VersionUnknownConstrained { package, constrainers },
+            Vec::new(),
+        )),
         Err(pubgrub::PubGrubError::NoSolution(mut tree)) => {
             tree.collapse_no_versions();
             let prose =
@@ -927,12 +1135,95 @@ fn extract_refutation(
     out
 }
 
+/// Errors a [`PackageProvider`] implementation can signal back through the
+/// `pubgrub` callback seam (`DependencyProvider::Err`). The sole variant is
+/// A4's version-unknown-constrained classification, raised from
+/// `choose_version` at a version-unknown package's (last-scheduled) decision
+/// point, before any candidate is returned — so `pubgrub` never sees an
+/// out-of-range choice (no panic exposure, `solver.rs:217` in the vendored
+/// `pubgrub` 0.4.0 source).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProviderError {
+    /// `package` has no declared version (a git/url/local/tarball dep whose
+    /// manifest/`.nimble`/tag/`version=` precedence chain all missed) but the
+    /// accumulated range at its decision point is non-`full()`.
+    /// `constrainers` names EVERY `(consumer, constraint)` pair that
+    /// contributed — never just the first (the amoxtli incident floored two
+    /// packages at once).
+    VersionUnknownConstrained {
+        package: String,
+        constrainers: Vec<(String, String)>,
+    },
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProviderError::VersionUnknownConstrained { package, constrainers } => {
+                write!(
+                    f,
+                    "{package} is version-unknown but constrained by {constrainers:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
 /// Adapts a milpa [`PackageProvider`] + [`Strategy`] into `pubgrub`'s
-/// `DependencyProvider`. Zero-cost: it just routes `pubgrub`'s callbacks to the
-/// milpa queries and applies the strategy in `choose_version`.
+/// `DependencyProvider`. Routes `pubgrub`'s callbacks to the milpa queries,
+/// applies the strategy in `choose_version`, and (A4) records which consumer
+/// places which constraint on which target package as `get_dependencies`
+/// discovers them — read back at the target's own decision point so
+/// `RES-VERSION-UNKNOWN-CONSTRAINED` can enumerate every accumulated
+/// constrainer, not just the first.
 struct ProviderAdapter<'a, P: PackageProvider> {
     provider: &'a P,
     strategy: Strategy,
+    /// target package name → { consumer name → constraint_str }, recorded as
+    /// `get_dependencies` returns them. `get_dependencies` is always called
+    /// for a consumer BEFORE that consumer's constraint can appear in any
+    /// other package's accumulated `range` (that is how `pubgrub` accumulates
+    /// ranges at all), so this map is guaranteed complete for `package` by
+    /// the time `choose_version(package, _)` runs — no separate ordering
+    /// mechanism needed beyond `prioritize` itself.
+    ///
+    /// R8: keyed by consumer name (not appended as a growing list) so a
+    /// consumer's entry is OVERWRITTEN, never merely added to, on every
+    /// `get_dependencies` call for that consumer — see `consumer_targets`'s
+    /// doc for how a stale/phantom entry from an abandoned (backtracked-past)
+    /// decision gets cleared, not just superseded.
+    constrainers: RefCell<BTreeMap<String, BTreeMap<String, String>>>,
+    /// R8: consumer name → the target package names it recorded a
+    /// non-`full()` constraint against on its MOST RECENT `get_dependencies`
+    /// call. `pubgrub` calls `get_dependencies` exactly once per (package,
+    /// version) decision attempt, and a consumer that is later backtracked
+    /// past is always EITHER re-decided (a fresh `get_dependencies` call for
+    /// the same consumer name) or the whole resolve fails outright — so
+    /// "clear this consumer's previously-recorded targets, then record
+    /// today's" on every call makes the running `constrainers` map
+    /// self-healing: an entry from an abandoned decision (recorded, then the
+    /// consumer backtracked and re-decided to a version that drops or
+    /// changes the constraint) never lingers as a phantom past the consumer's
+    /// next `get_dependencies` call. Mirrors the backtrack-correctness
+    /// Python's `_accumulated_constrainers` was DESIGNED to have (its
+    /// docstring: "only ever names constrainers that actually apply to the
+    /// accepted solve state") — Rust achieves it structurally since
+    /// `pubgrub`'s `DependencyProvider` callbacks expose no direct partial-
+    /// solution introspection to derive it any other way.
+    consumer_targets: RefCell<BTreeMap<String, Vec<String>>>,
+}
+
+impl<'a, P: PackageProvider> ProviderAdapter<'a, P> {
+    fn new(provider: &'a P, strategy: Strategy) -> Self {
+        ProviderAdapter {
+            provider,
+            strategy,
+            constrainers: RefCell::new(BTreeMap::new()),
+            consumer_targets: RefCell::new(BTreeMap::new()),
+        }
+    }
 }
 
 impl<P: PackageProvider> pubgrub::DependencyProvider for ProviderAdapter<'_, P> {
@@ -940,10 +1231,20 @@ impl<P: PackageProvider> pubgrub::DependencyProvider for ProviderAdapter<'_, P> 
     type V = Version;
     type VS = VersionSet;
     type M = String;
-    // Smallest package name → highest priority (the S0(b) BFS-by-name order);
-    // ties are impossible since names are unique, keeping resolution deterministic.
-    type Priority = Reverse<String>;
-    type Err = Infallible;
+    // A4: version-unknown packages get strictly lowest priority — the leading
+    // `bool` dominates tuple `Ord` regardless of the rest of the tuple, so a
+    // version-unknown package is decided only after every reachable
+    // non-version-unknown package (§3 Axis A (c): this guarantees its
+    // accumulated range is complete before classification). R3 (resolver-
+    // semantics RFC §4.2.1, NORMATIVE): within each class, the tie-break is
+    // `Reverse` of the package's BFS-insertion `declaration_order` — smallest
+    // index (earliest declared/reached from root) → highest priority — NOT
+    // alphabetical name. This matches Python's `_next_undecided`, which walks
+    // partial-solution assignments in that exact insertion order; alphabetical
+    // name is now only the LAST-resort tie-break, for providers with no
+    // declaration-order concept (every package ties at `usize::MAX`).
+    type Priority = (bool, Reverse<usize>, Reverse<String>);
+    type Err = ProviderError;
 
     fn prioritize(
         &self,
@@ -951,7 +1252,11 @@ impl<P: PackageProvider> pubgrub::DependencyProvider for ProviderAdapter<'_, P> 
         _range: &Self::VS,
         _stats: &pubgrub::PackageResolutionStatistics,
     ) -> Self::Priority {
-        Reverse(package.clone())
+        (
+            !self.provider.is_version_unknown(package),
+            Reverse(self.provider.declaration_order(package)),
+            Reverse(package.clone()),
+        )
     }
 
     fn choose_version(
@@ -959,13 +1264,44 @@ impl<P: PackageProvider> pubgrub::DependencyProvider for ProviderAdapter<'_, P> 
         package: &Self::P,
         range: &Self::VS,
     ) -> Result<Option<Self::V>, Self::Err> {
+        // A4: classify at this (last-scheduled, by `prioritize`) decision
+        // point — range is guaranteed complete. `full()` → unconstrained,
+        // fall through to the ordinary pick (the existing sentinel candidate
+        // is trivially in-range, no panic). Non-`full()` → hard error before
+        // any candidate is returned.
+        if self.provider.is_version_unknown(package) && !range.is_full() {
+            // R8: read back the per-consumer map (self-healed on every
+            // `get_dependencies` call — see `consumer_targets`'s doc), never
+            // a raw append-only history. Sorted by consumer name (BTreeMap
+            // iteration) for deterministic output.
+            let constrainers: Vec<(String, String)> = self
+                .constrainers
+                .borrow()
+                .get(package)
+                .map(|m| m.iter().map(|(c, s)| (c.clone(), s.clone())).collect())
+                .unwrap_or_default();
+            return Err(ProviderError::VersionUnknownConstrained {
+                package: package.clone(),
+                constrainers,
+            });
+        }
         let candidates: Vec<Version> = self
             .provider
             .versions(package)
             .into_iter()
             .filter(|v| range.contains(v))
             .collect();
-        Ok(pick_version(candidates, range, self.strategy))
+        // B2: the provider assembles the preference from `params.prior` (an
+        // O(1) lookup, per-package) — `pick_version` itself never learns
+        // about lockfiles. A provider with no prior-lock concept (in-memory
+        // test fakes) falls through to `None` via the trait's default
+        // `preference`, so pre-B2 callers are unaffected.
+        let preference = self.provider.preference(package);
+        // C2: resolve the configured strategy (which may be the surface-only
+        // `LowestDirect`) to a concrete per-package `EffectiveStrategy` BEFORE
+        // the pick — `pick_version` never sees `Strategy::LowestDirect`.
+        let strategy = effective_strategy(self.strategy, self.provider.is_root_direct(package));
+        Ok(pick_version(candidates, range, strategy, preference))
     }
 
     fn get_dependencies(
@@ -984,27 +1320,90 @@ impl<P: PackageProvider> pubgrub::DependencyProvider for ProviderAdapter<'_, P> 
                 .and_modify(|vs| *vs = vs.intersect(&dep.constraint))
                 .or_insert(dep.constraint);
         }
+        // A4/R8: record every non-full() constraint `package` places on
+        // another package, keyed by the TARGET so RES-VERSION-UNKNOWN-
+        // CONSTRAINED can read back "who constrains me" at the target's own
+        // decision point. full() constraints are never load-bearing for a
+        // conflict (D-A2), so they are skipped here too (mirrors the §5.2
+        // refutation's own skip).
+        //
+        // R8: `package` (the consumer) OVERWRITES its own entries every call
+        // — first clearing whatever targets it recorded on its PREVIOUS
+        // `get_dependencies` call (if any), then recording today's. This is
+        // what makes the map backtrack-correct: if `package` was decided,
+        // recorded a constraint, then got backtracked past and re-decided to
+        // a different (or no) constraint, the stale entry from the abandoned
+        // decision is cleared here — never left as a phantom for a version-
+        // unknown target's error message to name.
+        {
+            let mut constrainers = self.constrainers.borrow_mut();
+            let mut consumer_targets = self.consumer_targets.borrow_mut();
+            if let Some(prev_targets) = consumer_targets.remove(package) {
+                for prev_target in prev_targets {
+                    if let Some(m) = constrainers.get_mut(&prev_target) {
+                        m.remove(package);
+                    }
+                }
+            }
+            let mut current_targets: Vec<String> = Vec::new();
+            for (target, vs) in &merged {
+                if vs.is_full() {
+                    continue;
+                }
+                let cstr = vs_to_constraint_str(vs);
+                constrainers
+                    .entry(target.clone())
+                    .or_default()
+                    .insert(package.clone(), cstr);
+                current_targets.push(target.clone());
+            }
+            if !current_targets.is_empty() {
+                consumer_targets.insert(package.clone(), current_targets);
+            }
+        }
         Ok(pubgrub::Dependencies::Available(
             merged.into_iter().collect(),
         ))
     }
 }
 
+/// Axis B (resolver-semantics RFC §4 stage 4): a plain preference value
+/// threaded into the pure pick. `None` means no preference (today's
+/// behavior). `Some(v)` is the RFC's `FromLock(v)` — the prior lockfile's
+/// recorded version for this package, assembled *upstream* (B2) from the
+/// resolve params. The picker never learns about lockfiles, manifests, or
+/// provenance; it only ever sees this plain value.
+type Preference = Option<Version>;
+
 /// Pick a version from `candidates` (already filtered to `range`) per `strategy`.
 /// `None` (no candidate) makes `pubgrub` derive a "no versions" conflict and
 /// backtrack — which is also how `SemVer`'s cross-major refusal surfaces.
+///
+/// `preference` (Axis B, RFC §4 stage 4) short-circuits the strategy
+/// ordering — NOT a candidate reorder, which would be inert against the
+/// order-independent `max`/lower-bound pick below. If `preference` is
+/// `FromLock(v)` (i.e. `Some(v)`) and `v` survived the constraint filter
+/// (`candidates.contains(v)`, which already implies `v` is in `range`), it
+/// wins outright. Otherwise fall through to the ordinary strategy pick,
+/// unchanged.
 fn pick_version(
     candidates: Vec<Version>,
     range: &VersionSet,
-    strategy: Strategy,
+    strategy: EffectiveStrategy,
+    preference: Preference,
 ) -> Option<Version> {
     if candidates.is_empty() {
         return None;
     }
+    if let Some(pref) = &preference {
+        if candidates.contains(pref) {
+            return Some(pref.clone());
+        }
+    }
     match strategy {
-        Strategy::Maxver => candidates.into_iter().max(),
-        Strategy::Minver => candidates.into_iter().min(),
-        Strategy::Semver => pick_semver(candidates, range),
+        EffectiveStrategy::Maxver => candidates.into_iter().max(),
+        EffectiveStrategy::Minver => candidates.into_iter().min(),
+        EffectiveStrategy::Semver => pick_semver(candidates, range),
     }
 }
 
@@ -1024,25 +1423,51 @@ fn pick_semver(candidates: Vec<Version>, range: &VersionSet) -> Option<Version> 
 // the uncoded `ConstraintError`.
 // ---------------------------------------------------------------------------
 
-/// Errors from solving. `SOLVE-CONFLICT` is the only solver code in
-/// `spec/errors.md` (unsatisfiable constraints). The `String` payload is the
-/// `pubgrub` derivation-tree narration (the structured form lives in the tree,
-/// mirroring how the Python impl carries a `ConflictChain`).
+/// Errors from solving. `SOLVE-CONFLICT` is the only solver code the
+/// resolver ever wraps as `MilpaError::Solver(_)` unchanged; the `String`
+/// payload is the `pubgrub` derivation-tree narration (the structured form
+/// lives in the tree, mirroring how the Python impl carries a
+/// `ConflictChain`).
+///
+/// `VersionUnknownConstrained` (A4, resolver-semantics RFC §3 Axis A (c)) is
+/// the OTHER outcome `solve`/`solve_with_refutation` can return, but it is
+/// never surfaced to the user as `MilpaError::Solver(_)` — the resolver
+/// (which alone knows whether the package has a user-owned declaration site)
+/// always intercepts this variant explicitly and rebuilds
+/// `RES-VERSION-UNKNOWN-CONSTRAINED` with the branching remedy text
+/// (`res_err`, not `From<SolverError>`). `code()`/`all_codes()` still cover
+/// it defensively so no match here is ever silently partial.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SolverError {
     /// No assignment satisfies the constraints.
     Conflict(String),
+    /// `package` has no declared version but its accumulated range is
+    /// non-`full()` at its (last-scheduled) decision point. `constrainers`
+    /// names every `(consumer, constraint)` pair that contributed — never
+    /// just the first (the amoxtli incident floored two packages at once).
+    VersionUnknownConstrained {
+        package: String,
+        constrainers: Vec<(String, String)>,
+    },
 }
 
 impl SolverError {
     pub fn code(&self) -> &'static str {
         match self {
             SolverError::Conflict(_) => "SOLVE-CONFLICT",
+            SolverError::VersionUnknownConstrained { .. } => "RES-VERSION-UNKNOWN-CONSTRAINED",
         }
     }
 
     /// Every catalog code this domain can emit (companion to `code()` for
     /// error-catalog parity). Every entry MUST be a real spec slug.
+    ///
+    /// `RES-VERSION-UNKNOWN-CONSTRAINED` is deliberately NOT listed here: the
+    /// resolver always intercepts `SolverError::VersionUnknownConstrained`
+    /// before it can be wrapped as `MilpaError::Solver(_)` (see the enum doc
+    /// comment), so the code never actually reaches the user via this path —
+    /// it is listed once, honestly, in `CoreError::all_codes()` instead
+    /// (where `res_err` actually constructs it).
     pub fn all_codes() -> &'static [&'static str] {
         &["SOLVE-CONFLICT"]
     }
@@ -1052,6 +1477,12 @@ impl std::fmt::Display for SolverError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SolverError::Conflict(narration) => f.write_str(narration),
+            SolverError::VersionUnknownConstrained { package, constrainers } => {
+                write!(
+                    f,
+                    "{package} is version-unknown but constrained by {constrainers:?}"
+                )
+            }
         }
     }
 }
@@ -1061,6 +1492,7 @@ impl std::error::Error for SolverError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     // --- helpers -----------------------------------------------------------
 
@@ -1078,10 +1510,407 @@ mod tests {
         assert_eq!(Strategy::Semver.as_str(), "semver");
     }
 
+    // --- B1: preference-aware pick (resolver-semantics RFC §4 stage 4) -----
+    //
+    // Unit-tests `pick_version` directly (not through `solve()` — B1 is
+    // pick-only mechanism; feeding a real preference from the prior lockfile
+    // is B2). `preference` is the RFC's `FromLock(v) | None` as a plain
+    // `Option<Version>` value.
+
+    fn pick_candidates() -> Vec<Version> {
+        vec![v(1, 0, 0), v(1, 5, 0), v(2, 0, 0)]
+    }
+
+    #[test]
+    fn pick_no_preference_reproduces_maxver() {
+        let chosen = pick_version(
+            pick_candidates(),
+            &VersionSet::full(),
+            EffectiveStrategy::Maxver,
+            None,
+        );
+        assert_eq!(chosen, Some(v(2, 0, 0)));
+    }
+
+    #[test]
+    fn pick_no_preference_reproduces_minver() {
+        let chosen = pick_version(
+            pick_candidates(),
+            &VersionSet::full(),
+            EffectiveStrategy::Minver,
+            None,
+        );
+        assert_eq!(chosen, Some(v(1, 0, 0)));
+    }
+
+    #[test]
+    fn pick_preference_in_range_wins_over_maxver() {
+        let chosen = pick_version(
+            pick_candidates(),
+            &VersionSet::full(),
+            EffectiveStrategy::Maxver,
+            Some(v(1, 5, 0)),
+        );
+        assert_eq!(chosen, Some(v(1, 5, 0)));
+    }
+
+    #[test]
+    fn pick_preference_in_range_wins_over_minver() {
+        let chosen = pick_version(
+            pick_candidates(),
+            &VersionSet::full(),
+            EffectiveStrategy::Minver,
+            Some(v(1, 5, 0)),
+        );
+        assert_eq!(chosen, Some(v(1, 5, 0)));
+    }
+
+    #[test]
+    fn pick_preference_out_of_range_falls_through_to_maxver() {
+        let chosen = pick_version(
+            pick_candidates(),
+            &VersionSet::full(),
+            EffectiveStrategy::Maxver,
+            Some(v(9, 9, 9)),
+        );
+        assert_eq!(chosen, Some(v(2, 0, 0)));
+    }
+
+    #[test]
+    fn pick_preference_out_of_range_falls_through_to_minver() {
+        let chosen = pick_version(
+            pick_candidates(),
+            &VersionSet::full(),
+            EffectiveStrategy::Minver,
+            Some(v(9, 9, 9)),
+        );
+        assert_eq!(chosen, Some(v(1, 0, 0)));
+    }
+
+    /// A preference that is within `range` (the accumulated constraint) but
+    /// is not one of the actual `candidates` (e.g. never enumerated / never
+    /// published) is exactly the "out of range" case — it cannot bypass the
+    /// real candidate list to force an otherwise-unavailable version through.
+    #[test]
+    fn pick_preference_not_in_candidates_even_if_in_range() {
+        let chosen = pick_version(
+            vec![v(1, 0, 0), v(2, 0, 0)],
+            &VersionSet::gte(v(1, 0, 0)),
+            EffectiveStrategy::Maxver,
+            Some(v(1, 5, 0)), // in `range` but not a real candidate
+        );
+        assert_eq!(chosen, Some(v(2, 0, 0)));
+    }
+
+    // --- C2: LowestDirect effective-strategy precompute (resolver-semantics
+    // RFC §3 Axis C / §4 stage 4, D-C2, #111) ---------------------------------
+    //
+    // `effective_strategy` resolves the surface-only `Strategy::LowestDirect`
+    // to a concrete `EffectiveStrategy` — `Minver` for a root-direct package,
+    // `Maxver` otherwise — BEFORE `pick_version` ever runs. `pick_version`'s
+    // `match` above is exhaustive over exactly `EffectiveStrategy`'s three
+    // variants; there is no `LowestDirect` case, and the type cannot express
+    // one.
+
+    #[test]
+    fn effective_strategy_passes_through_non_lowest_direct() {
+        assert_eq!(
+            effective_strategy(Strategy::Maxver, true),
+            EffectiveStrategy::Maxver
+        );
+        assert_eq!(
+            effective_strategy(Strategy::Minver, false),
+            EffectiveStrategy::Minver
+        );
+        assert_eq!(
+            effective_strategy(Strategy::Semver, true),
+            EffectiveStrategy::Semver
+        );
+    }
+
+    #[test]
+    fn effective_strategy_lowest_direct_root_direct_is_minver() {
+        assert_eq!(
+            effective_strategy(Strategy::LowestDirect, true),
+            EffectiveStrategy::Minver
+        );
+    }
+
+    #[test]
+    fn effective_strategy_lowest_direct_transitive_is_maxver() {
+        assert_eq!(
+            effective_strategy(Strategy::LowestDirect, false),
+            EffectiveStrategy::Maxver
+        );
+    }
+
+    /// A provider with no root-authority concept (the trait's default
+    /// `is_root_direct` — `false`) treats every package as transitive under
+    /// `LowestDirect`.
+    struct NoRootAuthorityProvider {
+        versions_map: BTreeMap<String, Vec<Version>>,
+        deps_map: BTreeMap<(String, Version), Vec<Dep>>,
+    }
+
+    impl PackageProvider for NoRootAuthorityProvider {
+        fn versions(&self, package: &str) -> Vec<Version> {
+            self.versions_map.get(package).cloned().unwrap_or_default()
+        }
+        fn dependencies(&self, package: &str, version: &Version) -> Vec<Dep> {
+            self.deps_map
+                .get(&(package.to_string(), version.clone()))
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    /// A synthetic provider carrying an explicit root-direct package-name set
+    /// (mirrors `ResolveProvider::is_root_direct`, isolating the SOLVER-side
+    /// mechanism from resolver-level root-authority construction — covered by
+    /// `milpa-core`'s `resolve_c2_*` resolver-level tests instead).
+    struct RootAuthorityProvider {
+        versions_map: BTreeMap<String, Vec<Version>>,
+        deps_map: BTreeMap<(String, Version), Vec<Dep>>,
+        root_direct: BTreeSet<String>,
+    }
+
+    impl PackageProvider for RootAuthorityProvider {
+        fn versions(&self, package: &str) -> Vec<Version> {
+            self.versions_map.get(package).cloned().unwrap_or_default()
+        }
+        fn dependencies(&self, package: &str, version: &Version) -> Vec<Dep> {
+            self.deps_map
+                .get(&(package.to_string(), version.clone()))
+                .cloned()
+                .unwrap_or_default()
+        }
+        fn is_root_direct(&self, package: &str) -> bool {
+            self.root_direct.contains(package)
+        }
+    }
+
+    /// End-to-end through `solve()` — the whole point of the design
+    /// deepening. A root-direct dep with multiple candidates picks the
+    /// LOWEST satisfying version; a transitive dep with multiple candidates
+    /// still picks the HIGHEST — under the SAME `Strategy::LowestDirect`.
+    #[test]
+    fn solve_lowest_direct_contrast_root_direct_minver_transitive_maxver() {
+        let mut versions_map = BTreeMap::new();
+        versions_map.insert("__root__".to_string(), vec![v(0, 0, 1)]);
+        versions_map.insert("direct".to_string(), vec![v(1, 0, 0), v(2, 0, 0)]);
+        versions_map.insert("transitive".to_string(), vec![v(1, 0, 0), v(2, 0, 0)]);
+
+        let mut deps_map = BTreeMap::new();
+        deps_map.insert(
+            ("__root__".to_string(), v(0, 0, 1)),
+            vec![Dep {
+                package: "direct".to_string(),
+                constraint: VersionSet::full(),
+            }],
+        );
+        for ver in [v(1, 0, 0), v(2, 0, 0)] {
+            deps_map.insert(
+                ("direct".to_string(), ver),
+                vec![Dep {
+                    package: "transitive".to_string(),
+                    constraint: VersionSet::full(),
+                }],
+            );
+        }
+        deps_map.insert(("transitive".to_string(), v(1, 0, 0)), vec![]);
+        deps_map.insert(("transitive".to_string(), v(2, 0, 0)), vec![]);
+
+        let mut root_direct = BTreeSet::new();
+        root_direct.insert("direct".to_string());
+        let provider = RootAuthorityProvider {
+            versions_map,
+            deps_map,
+            root_direct,
+        };
+
+        let sol = solve(&provider, "__root__", v(0, 0, 1), Strategy::LowestDirect).unwrap();
+        assert_eq!(sol["direct"], v(1, 0, 0)); // root-direct -> Minver
+        assert_eq!(sol["transitive"], v(2, 0, 0)); // transitive -> Maxver
+    }
+
+    /// Regression: a provider with no root-authority concept treats every
+    /// package as transitive, so `LowestDirect` degenerates to plain `Maxver`
+    /// everywhere (the optional-hook-absence contract, mirroring A4/B2's own
+    /// hook-default regression tests).
+    #[test]
+    fn solve_lowest_direct_no_root_authority_hook_is_all_maxver() {
+        let mut versions_map = BTreeMap::new();
+        versions_map.insert("__root__".to_string(), vec![v(0, 0, 1)]);
+        versions_map.insert("dep".to_string(), vec![v(1, 0, 0), v(2, 0, 0)]);
+        let mut deps_map = BTreeMap::new();
+        deps_map.insert(
+            ("__root__".to_string(), v(0, 0, 1)),
+            vec![Dep {
+                package: "dep".to_string(),
+                constraint: VersionSet::full(),
+            }],
+        );
+        deps_map.insert(("dep".to_string(), v(1, 0, 0)), vec![]);
+        deps_map.insert(("dep".to_string(), v(2, 0, 0)), vec![]);
+        let provider = NoRootAuthorityProvider {
+            versions_map,
+            deps_map,
+        };
+
+        let sol = solve(&provider, "__root__", v(0, 0, 1), Strategy::LowestDirect).unwrap();
+        assert_eq!(sol["dep"], v(2, 0, 0));
+    }
+
     #[test]
     fn solver_error_codes_are_stable() {
         assert_eq!(SolverError::Conflict("x".into()).code(), "SOLVE-CONFLICT");
         assert_eq!(SolverError::all_codes(), &["SOLVE-CONFLICT"]);
+    }
+
+    // --- B2: feeding prior-lock versions as preferences through `solve()` --
+    // (resolver-semantics RFC §4 stage 4, Axis B — #192/#70)
+    //
+    // B1 (above) unit-tests `pick_version`'s short-circuit in isolation. B2's
+    // job is *feeding* the preference from the prior lockfile — the
+    // resolver-level wiring (`ResolveProvider::preference`) is exercised end
+    // to end in `milpa-core`'s `resolver_tests.rs`; here we prove the
+    // SOLVER-side threading (`solve()` → `ProviderAdapter::choose_version` →
+    // `PackageProvider::preference` → `pick_version`) with a synthetic
+    // in-memory provider, isolating the solver mechanism from resolver/
+    // index/fetch concerns.
+
+    /// `DictProvider` + an explicit `package -> Version` preference map.
+    /// Mirrors `DictProvider`'s plain-default-trait-method pattern: a real
+    /// production provider derives `preference` from the prior lockfile
+    /// (`ResolveProvider::preference`); this test double just takes the
+    /// answer directly.
+    struct PreferenceDictProvider {
+        inner: DictProvider,
+        preferences: BTreeMap<String, Version>,
+    }
+
+    impl PreferenceDictProvider {
+        fn new(entries: Vec<ProviderEntry<'_>>, preferences: Vec<(&str, Version)>) -> Self {
+            PreferenceDictProvider {
+                inner: DictProvider::new(entries),
+                preferences: preferences.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            }
+        }
+    }
+
+    impl PackageProvider for PreferenceDictProvider {
+        fn versions(&self, package: &str) -> Vec<Version> {
+            self.inner.versions(package)
+        }
+
+        fn dependencies(&self, package: &str, version: &Version) -> Vec<Dep> {
+            self.inner.dependencies(package, version)
+        }
+
+        fn preference(&self, package: &str) -> Option<Version> {
+            self.preferences.get(package).cloned()
+        }
+    }
+
+    // RED → GREEN: a provider with NO `preference` override (plain
+    // `DictProvider`) is unaffected — the trait's default `preference`
+    // returns `None` unconditionally, so a fresh resolve (no prior lock) is
+    // byte-for-byte unchanged. Every other `DictProvider`-based test in this
+    // module is an implicit proof of this too; this test states it
+    // explicitly for B2.
+    #[test]
+    fn provider_without_preference_override_is_unaffected() {
+        let p = DictProvider::new(vec![
+            (
+                "root",
+                vec![(v(0, 0, 1), vec![Dep::new("dep", VersionSet::full())])],
+            ),
+            ("dep", vec![(v(1, 0, 0), vec![]), (v(2, 0, 0), vec![])]),
+        ]);
+        let sol = solve(&p, "root", v(0, 0, 1), Strategy::Maxver).unwrap();
+        assert_eq!(sol.get("dep"), Some(&v(2, 0, 0)));
+    }
+
+    // RED → GREEN: a locked version still within the accumulated constraint
+    // wins over the strategy's newest pick — the minimal-change default.
+    #[test]
+    fn locked_version_wins_when_still_satisfiable() {
+        let p = PreferenceDictProvider::new(
+            vec![
+                (
+                    "root",
+                    vec![(v(0, 0, 1), vec![Dep::new("dep", VersionSet::full())])],
+                ),
+                (
+                    "dep",
+                    vec![
+                        (v(1, 0, 0), vec![]),
+                        (v(1, 5, 0), vec![]),
+                        (v(2, 0, 0), vec![]),
+                    ],
+                ),
+            ],
+            vec![("dep", v(1, 5, 0))],
+        );
+        let sol = solve(&p, "root", v(0, 0, 1), Strategy::Maxver).unwrap();
+        assert_eq!(sol.get("dep"), Some(&v(1, 5, 0)));
+    }
+
+    // RED → GREEN: a locked version no longer satisfying the accumulated
+    // constraint is FORCED to move — the preference falls through to the
+    // ordinary strategy pick over the surviving candidates.
+    #[test]
+    fn locked_version_forced_out_when_no_longer_satisfiable() {
+        let p = PreferenceDictProvider::new(
+            vec![
+                (
+                    "root",
+                    vec![(
+                        v(0, 0, 1),
+                        vec![Dep::new("dep", VersionSet::from_constraint(Some(">=2.0.0")).unwrap())],
+                    )],
+                ),
+                (
+                    "dep",
+                    vec![
+                        (v(1, 0, 0), vec![]),
+                        (v(1, 5, 0), vec![]),
+                        (v(2, 0, 0), vec![]),
+                    ],
+                ),
+            ],
+            vec![("dep", v(1, 0, 0))], // no longer >= 2.0.0
+        );
+        let sol = solve(&p, "root", v(0, 0, 1), Strategy::Maxver).unwrap();
+        assert_eq!(sol.get("dep"), Some(&v(2, 0, 0)));
+    }
+
+    // RED → GREEN (the #192 core win): bumping ONE dep's constraint so its
+    // locked version no longer satisfies forces ONLY that dep to move; an
+    // unrelated, unconstrained dep stays at its locked version even though a
+    // newer version exists and a fresh maxver resolve would pick it.
+    #[test]
+    fn bump_one_dep_leaves_unrelated_dep_pinned() {
+        let p = PreferenceDictProvider::new(
+            vec![
+                (
+                    "root",
+                    vec![(
+                        v(0, 0, 1),
+                        vec![
+                            Dep::new("bumped", VersionSet::from_constraint(Some(">=2.0.0")).unwrap()),
+                            Dep::new("unrelated", VersionSet::full()),
+                        ],
+                    )],
+                ),
+                ("bumped", vec![(v(1, 0, 0), vec![]), (v(2, 0, 0), vec![])]),
+                ("unrelated", vec![(v(1, 0, 0), vec![]), (v(2, 0, 0), vec![])]),
+            ],
+            vec![("bumped", v(1, 0, 0)), ("unrelated", v(1, 0, 0))],
+        );
+        let sol = solve(&p, "root", v(0, 0, 1), Strategy::Maxver).unwrap();
+        assert_eq!(sol.get("bumped"), Some(&v(2, 0, 0))); // forced: 1.0.0 no longer >= 2.0.0
+        assert_eq!(sol.get("unrelated"), Some(&v(1, 0, 0))); // stays locked, NOT newest-wins-bumped
     }
 
     // --- parse_version -----------------------------------------------------
@@ -1102,6 +1931,25 @@ mod tests {
         assert_eq!(parse_version("1.2.3-"), None);
         assert_eq!(parse_version("1.2.3+"), None);
         assert_eq!(parse_version(""), None);
+    }
+
+    #[test]
+    fn parse_oversized_and_overflowing_component_returns_none() {
+        // R10 (cross-impl parity): a crafted tag/version with an oversized
+        // or u64-overflowing numeric component (attacker-controlled input —
+        // a git tag, a `.nimble`/`milpa.kdl` `version=` string, a registry
+        // index entry) must return `None`, never panic or wrap. Rust already
+        // does this by construction (`str::parse::<u64>()` fails closed on
+        // overflow); this pins the behavior and matches Python's
+        // `parse_version`, which is bounded to the same u64 ceiling so a
+        // crafted digit run that overflows CPython's own int<->str
+        // conversion limit (~4300 digits) can't diverge between impls.
+        let huge = "9".repeat(6000);
+        assert_eq!(parse_version(&format!("v{huge}.0.0")), None);
+        let one_past_u64_max = (u64::MAX as u128 + 1).to_string();
+        assert_eq!(parse_version(&format!("{one_past_u64_max}.0.0")), None);
+        // The boundary itself is still valid.
+        assert_eq!(parse_version(&format!("{}.0.0", u64::MAX)), Some(v(u64::MAX, 0, 0)));
     }
 
     #[test]
@@ -1649,5 +2497,245 @@ mod tests {
         ]);
         let err = solve(&p, "root", v(1, 0, 0), Strategy::Semver).unwrap_err();
         assert_eq!(err.code(), "SOLVE-CONFLICT");
+    }
+
+    // -------------------------------------------------------------------
+    // R3 (resolver-semantics RFC §4.2.1, NORMATIVE): `prioritize`'s
+    // tie-break must be BFS-insertion `declaration_order`, not alphabetical
+    // package name — the same ambiguous-diamond shape as conformance
+    // fixture-444-declaration-order-tiebreak, exercised directly at the
+    // solver level (no fetch/resolver plumbing).
+    // -------------------------------------------------------------------
+
+    struct DeclOrderProvider {
+        inner: DictProvider,
+        order: BTreeMap<String, usize>,
+    }
+
+    impl PackageProvider for DeclOrderProvider {
+        fn versions(&self, package: &str) -> Vec<Version> {
+            self.inner.versions(package)
+        }
+        fn dependencies(&self, package: &str, version: &Version) -> Vec<Dep> {
+            self.inner.dependencies(package, version)
+        }
+        fn declaration_order(&self, package: &str) -> usize {
+            self.order.get(package).copied().unwrap_or(usize::MAX)
+        }
+    }
+
+    /// "zeta" and "alpha" each have an ambiguous 2-version choice that forks
+    /// on "shared": zeta@2.0.0 requires shared<=1.0.0, alpha@2.0.0 requires
+    /// shared>=2.0.0 — mutually exclusive, so only ONE of the two can keep
+    /// its max version once "shared"'s accumulated range would otherwise go
+    /// empty; the other gets backtracked to 1.0.0 (no constraint on shared).
+    /// Whichever is DECIDED FIRST wins — this is exactly the tie-break R3
+    /// fixes.
+    fn ambiguous_diamond() -> DictProvider {
+        DictProvider::new(vec![
+            (
+                "root",
+                vec![(
+                    v(1, 0, 0),
+                    vec![
+                        Dep::new("zeta", VersionSet::full()),
+                        Dep::new("alpha", VersionSet::full()),
+                    ],
+                )],
+            ),
+            (
+                "zeta",
+                vec![
+                    (v(2, 0, 0), vec![require("shared", "<= 1.0.0")]),
+                    (v(1, 0, 0), vec![]),
+                ],
+            ),
+            (
+                "alpha",
+                vec![
+                    (v(2, 0, 0), vec![require("shared", ">= 2.0.0")]),
+                    (v(1, 0, 0), vec![]),
+                ],
+            ),
+            ("shared", vec![(v(1, 0, 0), vec![]), (v(2, 0, 0), vec![])]),
+        ])
+    }
+
+    #[test]
+    fn solve_prioritizes_declaration_order_over_alphabetical_name() {
+        // zeta declared FIRST (index 0), alpha SECOND (index 1) — matches
+        // conformance fixture-444's manifest (`deps { zeta; alpha }`).
+        // Alphabetically alpha < zeta, so a name tie-break would pick the
+        // OPPOSITE winner; declaration order must make zeta win.
+        let p = DeclOrderProvider {
+            inner: ambiguous_diamond(),
+            order: BTreeMap::from([("zeta".to_string(), 0), ("alpha".to_string(), 1)]),
+        };
+        let sol = solve(&p, "root", v(1, 0, 0), Strategy::Maxver).unwrap();
+        assert_eq!(
+            sol["zeta"],
+            v(2, 0, 0),
+            "declaration-order-first package must win its max version: {sol:?}"
+        );
+        assert_eq!(
+            sol["alpha"],
+            v(1, 0, 0),
+            "declaration-order-second package must roll back: {sol:?}"
+        );
+        assert_eq!(sol["shared"], v(1, 0, 0));
+    }
+
+    #[test]
+    fn solve_reversed_declaration_order_flips_the_canonical_solution() {
+        // SAME graph, order reversed (alpha declared first this time) —
+        // proves the tie-break is genuinely order-driven (not a hidden
+        // per-name bias): whichever package's declaration_order is smaller
+        // wins, regardless of which name it is.
+        let p = DeclOrderProvider {
+            inner: ambiguous_diamond(),
+            order: BTreeMap::from([("alpha".to_string(), 0), ("zeta".to_string(), 1)]),
+        };
+        let sol = solve(&p, "root", v(1, 0, 0), Strategy::Maxver).unwrap();
+        assert_eq!(sol["alpha"], v(2, 0, 0));
+        assert_eq!(sol["zeta"], v(1, 0, 0));
+        assert_eq!(sol["shared"], v(2, 0, 0));
+    }
+
+    #[test]
+    fn solve_falls_back_to_alphabetical_name_without_declaration_order() {
+        // Plain `DictProvider` has no `declaration_order` override — every
+        // package ties at the trait's `usize::MAX` default, so `prioritize`
+        // falls through to its LAST-resort name tie-break unchanged
+        // (byte-for-byte the pre-R3 behavior): alphabetically-first "alpha"
+        // decides before "zeta" and wins.
+        let p = ambiguous_diamond();
+        let sol = solve(&p, "root", v(1, 0, 0), Strategy::Maxver).unwrap();
+        assert_eq!(sol["alpha"], v(2, 0, 0));
+        assert_eq!(sol["zeta"], v(1, 0, 0));
+        assert_eq!(sol["shared"], v(2, 0, 0));
+    }
+
+    // -------------------------------------------------------------------
+    // R8: `constrainers` must be backtrack-correct — a consumer decided,
+    // recording a constraint, then backtracked past and re-decided
+    // differently, must NOT leave a phantom entry for a version-unknown
+    // target's error message to name.
+    // -------------------------------------------------------------------
+
+    /// `DictProvider` + an explicit version-unknown package-name set (A4),
+    /// mirroring the Python test double `VersionUnknownDictProvider`
+    /// (impls/python/tests/test_solver.py) — isolates the SOLVER-side
+    /// mechanism from resolver-level concerns (candidate labeling, lazy
+    /// stub materialization).
+    struct VersionUnknownDictProvider {
+        inner: DictProvider,
+        version_unknown_names: BTreeSet<String>,
+    }
+
+    impl PackageProvider for VersionUnknownDictProvider {
+        fn versions(&self, package: &str) -> Vec<Version> {
+            self.inner.versions(package)
+        }
+        fn dependencies(&self, package: &str, version: &Version) -> Vec<Dep> {
+            self.inner.dependencies(package, version)
+        }
+        fn is_version_unknown(&self, package: &str) -> bool {
+            self.version_unknown_names.contains(package)
+        }
+    }
+
+    #[test]
+    fn version_unknown_constrained_names_real_constrainer_not_phantom_after_backtrack() {
+        // root -> A (full), C (full, version-unknown target).
+        // A has two candidates:
+        //   A@2.0.0 depends on C >= 5.0.0 (a REAL-looking constraint — but
+        //     this decision gets abandoned) AND Z >= 9.0.0 (Z's only version
+        //     is 1.0.0, so this is impossible and forces a backtrack of A's
+        //     own decision).
+        //   A@1.0.0 depends on C <= 8.0.0 (the ONE constraint that survives
+        //     to the final, accepted solve state).
+        // Pre-R8, Rust's never-pruned `constrainers` map would ALSO retain
+        // A's abandoned ">=5.0.0" entry from the first (backtracked) decision
+        // alongside the real "<=8.0.0" one. Post-R8, `get_dependencies`
+        // re-decides A@1.0.0 and OVERWRITES A's previously-recorded targets,
+        // clearing the phantom.
+        let p = VersionUnknownDictProvider {
+            inner: DictProvider::new(vec![
+                (
+                    "root",
+                    vec![(
+                        v(0, 0, 1),
+                        vec![Dep::new("A", VersionSet::full()), Dep::new("C", VersionSet::full())],
+                    )],
+                ),
+                (
+                    "A",
+                    vec![
+                        (
+                            v(2, 0, 0),
+                            vec![require("C", ">= 5.0.0"), require("Z", ">= 9.0.0")],
+                        ),
+                        (v(1, 0, 0), vec![require("C", "<= 8.0.0")]),
+                    ],
+                ),
+                ("C", vec![(v(1, 0, 0), vec![])]),
+                ("Z", vec![(v(1, 0, 0), vec![])]),
+            ]),
+            version_unknown_names: BTreeSet::from(["C".to_string()]),
+        };
+        let err = solve(&p, "root", v(0, 0, 1), Strategy::Maxver).unwrap_err();
+        match err {
+            SolverError::VersionUnknownConstrained { package, constrainers } => {
+                assert_eq!(package, "C");
+                assert_eq!(
+                    constrainers,
+                    vec![("A".to_string(), "<=8.0.0".to_string())],
+                    "must name ONLY the real, final constrainer — no phantom from A's \
+                     abandoned 2.0.0 decision: {constrainers:?}"
+                );
+            }
+            other => panic!("expected VersionUnknownConstrained, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn version_unknown_constrained_enumerates_multiple_real_constrainers() {
+        // Mirrors conformance fixture-419 (A4 multi-constrainer): two
+        // INDEPENDENT, non-conflicting consumers each floor the same
+        // version-unknown target — no backtracking here, both must survive.
+        let p = VersionUnknownDictProvider {
+            inner: DictProvider::new(vec![
+                (
+                    "root",
+                    vec![(
+                        v(0, 0, 1),
+                        vec![
+                            Dep::new("bar", VersionSet::full()),
+                            Dep::new("baz", VersionSet::full()),
+                            Dep::new("foo", VersionSet::full()),
+                        ],
+                    )],
+                ),
+                ("bar", vec![(v(1, 0, 0), vec![require("foo", ">= 0.2.8")])]),
+                ("baz", vec![(v(1, 0, 0), vec![require("foo", "<= 0.9.0")])]),
+                ("foo", vec![(v(0, 0, 1), vec![])]),
+            ]),
+            version_unknown_names: BTreeSet::from(["foo".to_string()]),
+        };
+        let err = solve(&p, "root", v(0, 0, 1), Strategy::Maxver).unwrap_err();
+        match err {
+            SolverError::VersionUnknownConstrained { package, constrainers } => {
+                assert_eq!(package, "foo");
+                let got: BTreeSet<(String, String)> = constrainers.into_iter().collect();
+                assert_eq!(
+                    got,
+                    BTreeSet::from([
+                        ("bar".to_string(), ">=0.2.8".to_string()),
+                        ("baz".to_string(), "<=0.9.0".to_string()),
+                    ])
+                );
+            }
+            other => panic!("expected VersionUnknownConstrained, got {other:?}"),
+        }
     }
 }

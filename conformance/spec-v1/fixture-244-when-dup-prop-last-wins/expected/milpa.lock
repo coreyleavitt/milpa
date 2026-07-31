@@ -3,7 +3,8 @@ version 1
 strategy "maxver"
 
 dep "extralib" {
-    version "0.0.1"
+    version "0.1.0"
+    declared_version_source "nimble"
     src_dir ""
     requires
     provenance {

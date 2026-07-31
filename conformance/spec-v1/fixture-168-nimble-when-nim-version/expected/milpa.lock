@@ -4,7 +4,8 @@ strategy "maxver"
 
 dep "foo" {
     identity "dag-sha256:d836b59f29e0beaac8da4a12255872b087b3619a57d854ec47a6f793727028d0"
-    version "0.0.1"
+    version "1.0.0"
+    declared_version_source "nimble"
     src_dir "src"
     requires "nimcompat"
     cond-require "nimcompat" {
@@ -22,7 +23,8 @@ dep "foo" {
 
 dep "nimcompat" {
     identity "dag-sha256:b21ffd6f8a429b45545b9c5dcfd0547201e1aa0a475076f2aa26495fa8daaa4d"
-    version "0.0.1"
+    version "1.0.0"
+    declared_version_source "nimble"
     src_dir "src"
     requires
     provenance {

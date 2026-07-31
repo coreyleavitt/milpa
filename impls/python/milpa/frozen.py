@@ -8,7 +8,7 @@ from the lockfile and the CAS alone.  This is enforced by signature:
 ``resolve_frozen`` takes ``MilpaEnv`` but NOT ``ResolveParams`` — there is no
 ``strategy`` / ``max_parallel`` / ``prior`` available here (RFC §4.4 NORMATIVE).
 
-The 9 resolver-level ``FROZEN-*`` preconditions (§7.1) are:
+The resolver-level ``FROZEN-*`` preconditions (§7.1) are:
 
 1. ``FROZEN-STRATEGY-MISMATCH`` — lockfile.strategy != default requested strategy.
 2. ``FROZEN-MANIFEST-DEP-NOT-IN-LOCK`` — manifest dep has no lockfile entry.
@@ -19,6 +19,8 @@ The 9 resolver-level ``FROZEN-*`` preconditions (§7.1) are:
 7. ``FROZEN-MEMBER-DEP`` — locked dep has member provenance (single-package raises).
 8. ``FROZEN-MEMBER-NOT-IN-WORKSPACE`` — lockfile member not in workspace members.
 9. ``FROZEN-MEMBER-IDENTITY-DRIFT`` — member on-disk hash ≠ lockfile pin.
+10. ``FROZEN-EXCLUDE-NEWER-MISMATCH`` (D5) — lockfile.exclude_newer != the
+    manifest's effective ``resolution { exclude-newer }``.
 
 The 2 CLI-level guards (``FROZEN-NO-LOCKFILE``, ``FROZEN-NO-CAS``) are raised in
 ``cli.py`` BEFORE the resolve path is entered (RFC §8 scope clarification).
@@ -42,6 +44,7 @@ from pathlib import Path
 from milpa.context import MilpaEnv
 from milpa.errors import (
     FROZEN_CONSTRAINT_UNSATISFIED,
+    FROZEN_EXCLUDE_NEWER_MISMATCH,
     FROZEN_IDENTITY_NOT_IN_STORE,
     FROZEN_LOCAL_DEP,
     FROZEN_LOCKED_VERSION_UNPARSEABLE,
@@ -63,13 +66,59 @@ from milpa.lockfile import (
 )
 from milpa.manifest import Manifest, MemberDep, NamedDep
 from milpa.registry import EntryAttestation
-from milpa.version import DepKey, VersionSet, parse_version
+from milpa.version import DepKey, Strategy, VersionSet, parse_version
 from milpa.workspace import LoadedWorkspace
 
-# The default strategy string used when no explicit strategy is passed.
-# Frozen path checks: lockfile.strategy must match "maxver" (the default for
-# the frozen command — no strategy param is available to override it).
-_DEFAULT_STRATEGY = "maxver"
+
+def _frozen_baseline_strategy(manifest: "Manifest | object") -> Strategy:
+    """C3b (resolution-semantics RFC §3 Axis C / §6 D-C2, §7 C3b): the
+    ``FROZEN-STRATEGY-MISMATCH`` baseline.
+
+    NOT a hardcoded ``"maxver"`` literal — the manifest's *effective*
+    ``resolution { strategy }`` (default ``maxver`` when the block is
+    absent or declared without a ``strategy`` child). Reuses
+    ``resolver._resolve_effective_strategy`` (the C3 SSOT for strategy
+    precedence) with ``cli_strategy=None`` (the frozen path has no CLI
+    ``--strategy`` surface). R9: the function has no lockfile-prior tier at
+    all anymore (the lockfile-recorded strategy is diagnostic-only, never a
+    live input) — it collapses to tiers 2 (manifest) + 3 (global default)
+    only, which is exactly what this baseline needs (the frozen path's
+    ``lockfile`` IS the very value this baseline gets compared against;
+    a lockfile-prior tier would have made the mismatch check compare the
+    lockfile's strategy to itself and never fire).
+
+    Returns a ``Strategy`` (a ``StrEnum``), which compares equal to the
+    lockfile's plain ``str`` ``strategy`` field directly — no ``str()``
+    conversion needed at the call site.
+    """
+    from milpa.resolver import _resolve_effective_strategy  # avoid circular import
+
+    decl = _resolve_effective_strategy(None, manifest)
+    return decl if decl is not None else Strategy.MAXVER
+
+
+def _frozen_baseline_exclude_newer(manifest: "Manifest | object") -> "object | None":
+    """D5 (resolution-semantics RFC §3 Axis D / §7 D5): the
+    ``FROZEN-EXCLUDE-NEWER-MISMATCH`` baseline.
+
+    Built manifest-sourced from the start (mirrors ``_frozen_baseline_
+    strategy`` / C3b EXACTLY) — the manifest's *effective*
+    ``resolution { exclude-newer }`` (default ``None`` when the block is
+    absent or declared without an ``exclude-newer`` child). Reuses
+    ``resolver._resolve_effective_exclude_newer`` (the D2/D5 SSOT for
+    exclude-newer precedence) with ``cli_exclude_newer=None`` (the frozen
+    path has no CLI ``--exclude-newer`` surface) and ``prior=None`` —
+    deliberately, since the frozen path's lockfile IS the very value this
+    baseline gets compared against; threading it through as tier 3 would
+    make the mismatch check compare the lockfile's value to itself and
+    never fire. Collapses to tier 2 (manifest) + the ``None`` default only.
+
+    Returns a ``datetime | None``, comparable directly against the
+    lockfile's ``exclude_newer`` field.
+    """
+    from milpa.resolver import _resolve_effective_exclude_newer  # avoid circular import
+
+    return _resolve_effective_exclude_newer(None, manifest, None)
 
 
 def _locked_index(deps: object) -> "dict[DepKey, LockedDep]":
@@ -181,6 +230,9 @@ def _reconstruct_from_locked(locked: LockedDep) -> ResolvedDep:
         registry_namespace=(
             locked.attestation.namespace or None if locked.attestation is not None else None
         ),
+        # A5: carry the sibling declared-version source straight through —
+        # frozen reconstruction re-derives nothing (no solve, no re-fetch).
+        declared_version_source=locked.declared_version_source,
     )
 
 
@@ -218,15 +270,31 @@ def resolve_frozen(
     MilpaError
         Any of the 10 ``FROZEN-*`` precondition codes.
     """
-    # Condition 1: FROZEN-STRATEGY-MISMATCH
-    if lockfile.strategy != _DEFAULT_STRATEGY:
+    # Condition 1: FROZEN-STRATEGY-MISMATCH (C3b: baseline = manifest's
+    # effective ``resolution { strategy }``, not the hardcoded literal).
+    _baseline_strategy = _frozen_baseline_strategy(manifest)
+    if lockfile.strategy != _baseline_strategy:
         raise MilpaError(
             FROZEN_STRATEGY_MISMATCH,
             f"lockfile strategy {lockfile.strategy!r} does not match "
-            f"the requested strategy {_DEFAULT_STRATEGY!r}; re-run 'milpa fetch' "
+            f"the requested strategy {_baseline_strategy!r}; re-run 'milpa fetch' "
             f"with the desired strategy to regenerate the lockfile",
             lockfile_strategy=lockfile.strategy,
-            requested_strategy=_DEFAULT_STRATEGY,
+            requested_strategy=_baseline_strategy,
+        )
+
+    # D5: FROZEN-EXCLUDE-NEWER-MISMATCH (baseline = manifest's effective
+    # ``resolution { exclude-newer }``, built the same way as the strategy
+    # baseline above — manifest-sourced from the start, C3b's own fix).
+    _baseline_exclude_newer = _frozen_baseline_exclude_newer(manifest)
+    if lockfile.exclude_newer != _baseline_exclude_newer:
+        raise MilpaError(
+            FROZEN_EXCLUDE_NEWER_MISMATCH,
+            f"lockfile exclude-newer {lockfile.exclude_newer!r} does not match "
+            f"the requested exclude-newer {_baseline_exclude_newer!r}; re-run "
+            f"'milpa fetch' with the desired exclude-newer to regenerate the lockfile",
+            lockfile_exclude_newer=lockfile.exclude_newer,
+            requested_exclude_newer=_baseline_exclude_newer,
         )
 
     # S1 (#142): alias-aware lookup — maps canonical name AND every alias to
@@ -365,15 +433,33 @@ def resolve_workspace_frozen(
     """
     from milpa.resolver import FilterContext, filter_manifest  # avoid circular import
 
-    # Condition 1: FROZEN-STRATEGY-MISMATCH
-    if lockfile.strategy != _DEFAULT_STRATEGY:
+    # Condition 1: FROZEN-STRATEGY-MISMATCH (C3b: baseline = the workspace
+    # root manifest's effective ``resolution { strategy }``, not the
+    # hardcoded literal — root-only, same root-authority model as
+    # index-trust/entry-trust).
+    _baseline_strategy = _frozen_baseline_strategy(workspace.workspace_manifest)
+    if lockfile.strategy != _baseline_strategy:
         raise MilpaError(
             FROZEN_STRATEGY_MISMATCH,
             f"lockfile strategy {lockfile.strategy!r} does not match "
-            f"the requested strategy {_DEFAULT_STRATEGY!r}; re-run 'milpa fetch' "
+            f"the requested strategy {_baseline_strategy!r}; re-run 'milpa fetch' "
             f"with the desired strategy to regenerate the lockfile",
             lockfile_strategy=lockfile.strategy,
-            requested_strategy=_DEFAULT_STRATEGY,
+            requested_strategy=_baseline_strategy,
+        )
+
+    # D5: FROZEN-EXCLUDE-NEWER-MISMATCH (baseline = the workspace root
+    # manifest's effective ``resolution { exclude-newer }`` — root-only,
+    # same root-authority model as strategy above).
+    _baseline_exclude_newer = _frozen_baseline_exclude_newer(workspace.workspace_manifest)
+    if lockfile.exclude_newer != _baseline_exclude_newer:
+        raise MilpaError(
+            FROZEN_EXCLUDE_NEWER_MISMATCH,
+            f"lockfile exclude-newer {lockfile.exclude_newer!r} does not match "
+            f"the requested exclude-newer {_baseline_exclude_newer!r}; re-run "
+            f"'milpa fetch' with the desired exclude-newer to regenerate the lockfile",
+            lockfile_exclude_newer=lockfile.exclude_newer,
+            requested_exclude_newer=_baseline_exclude_newer,
         )
 
     # S1 (#142): alias-aware lookup — maps canonical name AND every alias to

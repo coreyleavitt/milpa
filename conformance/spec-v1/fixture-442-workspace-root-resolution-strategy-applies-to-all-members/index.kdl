@@ -1,0 +1,59 @@
+schema_version 1
+package "widget-a" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0566e4068fee0b4cad65b3e09db2c3a40a9e93ed1145a3638bb9516f50327658"
+        provenance {
+            kind "git"
+            url "https://example.com/widget-a.git"
+            ref "v1.0.0"
+            commit_sha "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+        }
+    }
+    version "1.5.0" {
+        content_hash "dag-sha256:ed0bfd1579b2f06e91a0d69b4f3afcf19632f8a10f3f84b7cb3961f643b024af"
+        provenance {
+            kind "git"
+            url "https://example.com/widget-a.git"
+            ref "v1.5.0"
+            commit_sha "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        }
+    }
+    version "2.0.0" {
+        content_hash "dag-sha256:668d3240ddc340ab1c49b9e6531aa4fdb0beffcb1a36d5b942c9581da8475e1d"
+        provenance {
+            kind "git"
+            url "https://example.com/widget-a.git"
+            ref "v2.0.0"
+            commit_sha "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2"
+        }
+    }
+}
+package "widget-b" {
+    version "1.0.0" {
+        content_hash "dag-sha256:586de6a827d1d963067828605b4c5340d16089fcc84a2cb212cf5f6372bd321b"
+        provenance {
+            kind "git"
+            url "https://example.com/widget-b.git"
+            ref "v1.0.0"
+            commit_sha "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0"
+        }
+    }
+    version "1.5.0" {
+        content_hash "dag-sha256:081336ded6c16b813d0858062ae11c63b31f60718b7142f587a8cb08b64c13de"
+        provenance {
+            kind "git"
+            url "https://example.com/widget-b.git"
+            ref "v1.5.0"
+            commit_sha "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"
+        }
+    }
+    version "2.0.0" {
+        content_hash "dag-sha256:e6a66d1d42b7a381b79d0554add56115bd1dc75398ae9b9c7cc55302bb653339"
+        provenance {
+            kind "git"
+            url "https://example.com/widget-b.git"
+            ref "v2.0.0"
+            commit_sha "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+        }
+    }
+}

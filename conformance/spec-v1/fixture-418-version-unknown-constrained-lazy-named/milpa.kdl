@@ -1,0 +1,24 @@
+// fixture-418: A4 (resolver-semantics RFC §3 Axis A (c)) — the ordering
+// hazard the last-scheduling decision-priority rule exists for.
+//
+// bearssl is a version-unknown git dep (untagged branch pin, no .nimble
+// version) declared BEFORE its constrainer. The constrainer, chronos, is a
+// NAMED (index) dep whose own floor ("bearssl >= 0.2.8") only materializes
+// LAZILY, mid-solve, the first time PubGrub selects a candidate for it — it
+// is not knowable at bearssl's naive declaration-order turn.
+//
+// Without A4's decision-priority rule (version-unknown packages scheduled
+// strictly last), bearssl would be decided at the sentinel BEFORE chronos is
+// ever expanded; chronos's later-discovered floor would then conflict with
+// the already-decided bearssl and degrade to a generic SOLVE-CONFLICT after
+// backtracking exhausts both single-candidate packages — never this
+// fixture's crisp RES-VERSION-UNKNOWN-CONSTRAINED. With A4, chronos (not
+// version-unknown) is decided first, its floor lands in bearssl's
+// accumulated range, and only THEN is bearssl classified — at a decision
+// point where the range is guaranteed complete.
+name "myapp"
+kind "application"
+deps {
+    bearssl git=(url)"https://example.com/bearssl.git" ref="main"
+    chronos
+}

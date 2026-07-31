@@ -1,0 +1,13 @@
+// resolution-semantics RFC (rfc-resolution-semantics.md) §3 Axis D, D6:
+// exclude-newer filters a multi-candidate INDEX dep at ENUMERATION (D3) --
+// 2.0.0's published_at postdates the bound so it is dropped before the
+// solver ever sees it; the newest SURVIVING version (1.5.0) is selected,
+// not the newest overall.
+name "myapp"
+kind "application"
+resolution {
+    exclude-newer "2026-06-01T00:00:00Z"
+}
+deps {
+    widget ">= 1.0.0"
+}

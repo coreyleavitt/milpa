@@ -1,0 +1,2 @@
+bar -> <CAS_ROOT>/dag-sha256/655e0b180ae6ddf37882994a6d0316ba4e5fc99dabe1ee7ec54043b775a79718/
+foo -> <CAS_ROOT>/dag-sha256/ee4c31f74ad165d9fe2086bbd1df183a50939b2f958face335e7a60fd44155c8/

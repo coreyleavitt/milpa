@@ -1,0 +1,26 @@
+// fixture-432: "anchor" has TWO candidates -- the locked 1.0.0 and a NEWER
+// 2.0.0 that maxver (the governing strategy, matching the lock) would pick
+// on a FRESH resolve with no prior lock. Only the locked candidate has a
+// real mocked-fetches/ entry; 2.0.0 is index-enumerated but MUST NEVER be
+// fetched (fetching it would itself prove the bypass fired).
+schema_version 1
+package "anchor" {
+    version "2.0.0" {
+        content_hash "dag-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        provenance {
+            kind "git"
+            url "https://example.com/anchor.git"
+            ref "v2.0.0"
+            commit_sha "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:8a66af90364aac8d5aaa2de038af6097c2276c3f26e5df9ae45821b249667fe6"
+        provenance {
+            kind "git"
+            url "https://example.com/anchor.git"
+            ref "v1.0.0"
+            commit_sha "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+    }
+}

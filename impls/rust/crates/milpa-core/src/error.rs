@@ -152,6 +152,21 @@ impl CoreError {
             "LOCK-GRAPH-MISMATCH",
             // resolver orchestration (resolver-semantics §3/§10) — S7b. The
             // workspace RES-WS-* codes wire with the workspace path in S11.
+            // D3 (resolution-semantics RFC §3 Axis D / §4 stage 2): the
+            // exclude-newer hard cut on index/named candidates, applied at
+            // the enumeration layer. A DISTINCT error class from
+            // TNG-NO-SATISFYING-VERSION — fires only when the time-bound
+            // itself empties an otherwise-non-empty candidate set.
+            "RES-EXCLUDE-NEWER-EMPTY",
+            // D4 (resolution-semantics RFC §3 Axis D / §6 D-D1/D-D2): a git/
+            // url dep is pinned to one resolved commit (no candidate set),
+            // so exclude-newer VALIDATES that commit's committer date rather
+            // than filtering a list — fires unconditionally (no fallback)
+            // when the committer date exceeds the bound.
+            "RES-EXCLUDE-NEWER-PIN",
+            // B3 (resolution-semantics RFC §3 Axis B / §6 D-B2): `--locked`
+            // drift guard — identity + provenance based, never version-label.
+            "RES-LOCKED-DRIFT",
             "RES-NO-INDEX",
             "RES-PROVENANCE-CONFLICT",
             // S4c: post-fixpoint mutual-exclusion check (RFC #23 §3.1.4).
@@ -159,6 +174,14 @@ impl CoreError {
             // S5: attestation policy enforcement — strict mode raises this when
             // any resolved dep fell back to un-attested .nimble metadata.
             "RES-UNATTESTED-METADATA",
+            // A4 (resolver-semantics RFC §3 Axis A (c)): a version-unknown
+            // git/url/local/tarball dep is constrained by an accumulated
+            // range that is non-full() at its (last-scheduled) decision
+            // point, with no declared version to satisfy it. Built by
+            // version_unknown_constrained_err from
+            // SolverError::VersionUnknownConstrained (never surfaced as
+            // MilpaError::Solver — see that variant's doc comment).
+            "RES-VERSION-UNKNOWN-CONSTRAINED",
             // workspace resolve-time checks (resolver §11) — S11b.
             "RES-WS-NO-INDEX",
             "RES-WS-OVERRIDE-MEMBER-COLLISION",
@@ -196,6 +219,10 @@ impl CoreError {
             // loader in S11 — added then (subset rule: list only codes emitted).
             "FROZEN-ACTIVE-FLAGS-MISMATCH",
             "FROZEN-STRATEGY-MISMATCH",
+            // D5 (resolution-semantics RFC §3 Axis D / §7 D5): baseline sourced
+            // from the manifest's effective `resolution { exclude-newer }`,
+            // mirroring FROZEN-STRATEGY-MISMATCH exactly (C3b).
+            "FROZEN-EXCLUDE-NEWER-MISMATCH",
             "FROZEN-MANIFEST-DEP-NOT-IN-LOCK",
             "FROZEN-LOCKED-VERSION-UNPARSEABLE",
             "FROZEN-CONSTRAINT-UNSATISFIED",
@@ -246,8 +273,16 @@ impl CoreError {
             "TNG-DEPDECL-SCHEMA-MISMATCH",
             "TNG-DEPDECL-SCHEMA-UNSUPPORTED",
             // CLI-layer argument-validation errors (spec/errors.md §CLI).
+            // CLI-EXCLUDE-NEWER-INVALID: malformed `--exclude-newer <ts>` value
+            // (fetch/lock only, D2, resolution-semantics RFC §3 Axis D) — distinct
+            // from the manifest's own MAN-RESOLUTION-EXCLUDE-NEWER-INVALID.
+            "CLI-EXCLUDE-NEWER-INVALID",
             // CLI-FEATURE-FLAGS-CONFLICT: --all-features + --no-default-features together.
             "CLI-FEATURE-FLAGS-CONFLICT",
+            // CLI-LOCKED-UPGRADE-CONFLICT: --locked + --upgrade together (B4,
+            // resolution-semantics RFC §3 Axis B / D-B3) — one forbids
+            // deviation from the committed lock, the other forces it.
+            "CLI-LOCKED-UPGRADE-CONFLICT",
             // CLI-SOURCE-SPEC-INVALID: malformed source-spec tokens for `milpa hash`
             // (spec/cli-contract.md §5.11; A0 slice).
             "CLI-SOURCE-SPEC-INVALID",
@@ -315,6 +350,21 @@ impl CoreError {
             // is a workspace-ROOT-only policy, mirroring
             // WS-INDEX-TRUST-ON-MEMBER / WS-ENTRY-TRUST-ON-MEMBER.
             "WS-INDEX-HISTORY-ON-MEMBER",
+            // W1 (rfc-resolution-semantics.md §3 Axis W, §5): workspace
+            // resolution-block root-authority validation. Emitted by
+            // check_member_resolution_declarations in workspace.rs when a
+            // workspace MEMBER declares a `resolution { }` block — that
+            // block is a workspace-ROOT-only policy (one shared lock, one
+            // resolution policy), mirroring WS-INDEX-TRUST-ON-MEMBER /
+            // WS-ENTRY-TRUST-ON-MEMBER / WS-INDEX-HISTORY-ON-MEMBER for the
+            // sibling root-only-policy axes. Deliberately kept the dominant
+            // `MAN-` prefix (the RFC's own §5 slug enumeration —
+            // `resolution { }` is itself a `MAN-RESOLUTION-*`-owned manifest
+            // construct) rather than the `WS-*-ON-MEMBER` naming used by
+            // those unrelated fields; still raised from CoreError::Workspace
+            // like its siblings since it fires at workspace-load time, not
+            // manifest-parse time.
+            "MAN-RESOLUTION-MEMBER-SCOPE",
             // A3 (cli-contract.md §5.12): the `milpa index status`/`milpa
             // index accept` verb family. NOT-CONFIGURED is the `--no-index`
             // (or empty MILPA_INDEX_URL) hard error both verbs raise (no

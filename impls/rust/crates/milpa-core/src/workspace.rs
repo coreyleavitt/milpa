@@ -183,6 +183,10 @@ pub struct LoadedWorkspace {
     /// invocation (members are structurally forbidden from declaring it; see
     /// [`check_member_index_history_declarations`]).
     pub index_history_policy: milpa_manifest::TrustPolicy,
+    /// C3 (rfc-resolution-semantics.md §3 Axis C / §5, Axis W): the
+    /// workspace ROOT's own `resolution { strategy }` value — root-only
+    /// (one shared lock, one resolution policy).
+    pub resolution: Option<milpa_manifest::Resolution>,
 }
 
 /// Load and structurally validate the workspace at `root`.
@@ -315,6 +319,7 @@ pub fn load_workspace(root: &Path) -> Result<LoadedWorkspace, MilpaError> {
     check_member_index_trust_declarations(&members)?;
     check_member_entry_trust_declarations(&members)?;
     check_member_index_history_declarations(&members)?;
+    check_member_resolution_declarations(&members)?;
 
     Ok(LoadedWorkspace {
         root: root.to_path_buf(),
@@ -326,6 +331,7 @@ pub fn load_workspace(root: &Path) -> Result<LoadedWorkspace, MilpaError> {
         index_trust_bundle: parsed.index_trust_bundle,
         entry_trust_policy: parsed.entry_trust_policy,
         index_history_policy: parsed.index_history_policy,
+        resolution: parsed.resolution,
     })
 }
 
@@ -428,6 +434,7 @@ pub fn load_workspace_from_manifest(
     check_member_index_trust_declarations(&members)?;
     check_member_entry_trust_declarations(&members)?;
     check_member_index_history_declarations(&members)?;
+    check_member_resolution_declarations(&members)?;
 
     Ok(LoadedWorkspace {
         root: root.to_path_buf(),
@@ -439,6 +446,7 @@ pub fn load_workspace_from_manifest(
         index_trust_bundle: parsed.index_trust_bundle.clone(),
         entry_trust_policy: parsed.entry_trust_policy.clone(),
         index_history_policy: parsed.index_history_policy.clone(),
+        resolution: parsed.resolution,
     })
 }
 
@@ -506,6 +514,7 @@ pub fn load_workspace_with_member_override(
     check_member_index_trust_declarations(&new_members)?;
     check_member_entry_trust_declarations(&new_members)?;
     check_member_index_history_declarations(&new_members)?;
+    check_member_resolution_declarations(&new_members)?;
 
     Ok(LoadedWorkspace {
         root: workspace.root.clone(),
@@ -517,6 +526,7 @@ pub fn load_workspace_with_member_override(
         index_trust_bundle: workspace.index_trust_bundle.clone(),
         entry_trust_policy: workspace.entry_trust_policy.clone(),
         index_history_policy: workspace.index_history_policy.clone(),
+        resolution: workspace.resolution,
     })
 }
 
@@ -623,6 +633,49 @@ pub fn check_member_index_history_declarations(
                 "WS-INDEX-HISTORY-ON-MEMBER",
                 format!(
                     "index-history is a workspace-root policy; declare it in the \
+                     workspace root manifest, not in member {:?}",
+                    member.path
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// W1: workspace resolution-block root-authority validation
+// (rfc-resolution-semantics.md §3 Axis W, §5 MAN-RESOLUTION-MEMBER-SCOPE)
+// ---------------------------------------------------------------------------
+
+/// Raise `MAN-RESOLUTION-MEMBER-SCOPE` if any workspace member declares a
+/// `resolution { }` block.
+///
+/// `resolution { }` (`strategy` / `exclude-newer`) is a workspace-ROOT policy
+/// (rfc-resolution-semantics.md §3 Axis W): one shared lock implies one
+/// resolution policy, so only the workspace root manifest may declare it —
+/// mirrors [`check_member_index_trust_declarations`] /
+/// [`check_member_entry_trust_declarations`] /
+/// [`check_member_index_history_declarations`] for the sibling root-only-
+/// policy axes, though this slug keeps the dominant `MAN-` prefix (the RFC's
+/// own §5 slug enumeration) rather than the `WS-*-ON-MEMBER` pattern those
+/// unrelated fields use.
+///
+/// Fires even when a member's declared `resolution { }` block is empty or
+/// matches the root's own policy — the rule is about WHERE the block is
+/// declared, not what it contains, so `Manifest::resolution.is_some()`
+/// (parsed presence of the node) is what triggers this check. A standalone
+/// (non-workspace) manifest declaring `resolution { }` is unaffected — this
+/// check only runs over workspace members. Mirrors
+/// `workspace.py:_check_member_resolution_declarations`.
+pub fn check_member_resolution_declarations(
+    members: &[LoadedMember],
+) -> Result<(), MilpaError> {
+    for member in members {
+        if member.manifest.resolution.is_some() {
+            return Err(ws(
+                "MAN-RESOLUTION-MEMBER-SCOPE",
+                format!(
+                    "resolution {{ }} is a workspace-root policy; declare it in the \
                      workspace root manifest, not in member {:?}",
                     member.path
                 ),

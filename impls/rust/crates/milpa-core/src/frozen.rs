@@ -11,9 +11,11 @@
 
 use std::path::Path;
 
-use milpa_manifest::{Dep, Manifest};
+use milpa_manifest::{Dep, Manifest, Resolution};
 use milpa_solver::{parse_version, Strategy};
-use milpa_types::{EntryAttestation, LockedDep, Lockfile, ProvenanceRecord, ResolvedDep, ResolvedGraph};
+use milpa_types::{
+    EntryAttestation, LockedDep, Lockfile, ProvenanceRecord, ResolvedDep, ResolvedGraph, Timestamp,
+};
 
 use crate::error::{CoreError, MilpaError};
 use crate::store::CaStore;
@@ -23,17 +25,19 @@ fn frozen(code: &'static str, message: impl Into<String>) -> MilpaError {
 }
 
 /// Reconstruct a [`ResolvedGraph`] from `manifest` + `lock` + `store` — no
-/// network, no fetcher. The requested strategy is the default (`maxver`); the
-/// `Resolver`/`FrozenResolver` trait surface carries no strategy override (that
-/// is the CLI's concern, S13). Returns a coded `FROZEN-*` error on any
-/// precondition failure.
+/// network, no fetcher. The requested strategy is the manifest's EFFECTIVE
+/// `resolution { strategy }` (C3b — [`frozen_baseline_strategy`]), default
+/// `maxver` when absent; the `Resolver`/`FrozenResolver` trait surface
+/// carries no CLI strategy override (that is the CLI's concern, S13).
+/// Returns a coded `FROZEN-*` error on any precondition failure.
 pub fn resolve_frozen(
     manifest: &Manifest,
     lock: &Lockfile,
     store: &CaStore,
     deps_dir: &Path,
 ) -> Result<ResolvedGraph, MilpaError> {
-    check_strategy(Strategy::default(), lock)?;
+    check_strategy(frozen_baseline_strategy(manifest.resolution), lock)?;
+    check_exclude_newer(frozen_baseline_exclude_newer(manifest.resolution), lock)?;
     check_manifest_alignment(manifest, lock)?;
 
     std::fs::create_dir_all(deps_dir).map_err(|e| {
@@ -109,7 +113,8 @@ pub fn resolve_workspace_frozen(
     store: &CaStore,
     deps_dir: &Path,
 ) -> Result<ResolvedGraph, MilpaError> {
-    check_strategy(Strategy::default(), lock)?;
+    check_strategy(frozen_baseline_strategy(workspace.resolution), lock)?;
+    check_exclude_newer(frozen_baseline_exclude_newer(workspace.resolution), lock)?;
     for member in &workspace.members {
         check_manifest_alignment(&member.manifest, lock)?;
     }
@@ -307,6 +312,26 @@ pub fn rebuild_deps_view(
 // Precondition helpers
 // ---------------------------------------------------------------------------
 
+/// C3b (resolution-semantics RFC §3 Axis C / §6 D-C2, §7 C3b): the
+/// `FROZEN-STRATEGY-MISMATCH` baseline.
+///
+/// NOT a hardcoded `Strategy::default()` (`maxver`) — the manifest's
+/// *effective* `resolution { strategy }` (default `maxver` when the block
+/// is absent or declared without a `strategy` child). This deliberately
+/// mirrors only tiers 2 (manifest) + 3 (global default) of the CLI's
+/// `resolve_effective_strategy` precedence chain (`milpa-cli/src/main.rs`)
+/// — there is no CLI `--strategy` tier here (the frozen path has no such
+/// surface). R9 (resolution-semantics RFC §3 Axis C NORMATIVE): the CLI's
+/// `resolve_effective_strategy` has no lockfile-prior tier at all anymore
+/// (the lockfile-recorded strategy is diagnostic/frozen-parity only, never
+/// a live input) — which is exactly what this baseline always needed: the
+/// frozen path's "prior" IS the very lockfile this baseline gets compared
+/// against, so a lockfile-prior tier would have made the mismatch check
+/// compare the lockfile's strategy to itself and never fire.
+fn frozen_baseline_strategy(resolution: Option<Resolution>) -> Strategy {
+    resolution.and_then(|r| r.strategy).unwrap_or_default()
+}
+
 fn check_strategy(strategy: Strategy, lock: &Lockfile) -> Result<(), MilpaError> {
     if strategy.as_str() != lock.strategy {
         return Err(frozen(
@@ -315,6 +340,39 @@ fn check_strategy(strategy: Strategy, lock: &Lockfile) -> Result<(), MilpaError>
                 "strategy mismatch: lockfile built with {:?}, requested {:?}",
                 lock.strategy,
                 strategy.as_str()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// D5 (resolution-semantics RFC §3 Axis D / §7 D5): the
+/// `FROZEN-EXCLUDE-NEWER-MISMATCH` baseline. Mirrors
+/// [`frozen_baseline_strategy`] EXACTLY — built manifest-sourced from the
+/// start (the manifest's effective `resolution { exclude-newer }`, default
+/// `None` when absent), never a hardcoded literal. The frozen path has no
+/// CLI `--exclude-newer` surface (that flag is fetch/lock-only, §3 Axis D
+/// "Verb reach") and no third (lockfile) precedence tier — the very
+/// lockfile this baseline gets compared against IS the "prior" here, so
+/// there is nothing to fall back to beyond the manifest.
+fn frozen_baseline_exclude_newer(resolution: Option<Resolution>) -> Option<Timestamp> {
+    resolution.and_then(|r| r.exclude_newer)
+}
+
+/// D5: compare the lockfile's recorded `exclude_newer` against the
+/// manifest-sourced baseline. Mismatch (in either direction — a newly
+/// unset manifest bound with a lock still recording one, a newly set
+/// manifest bound with no matching lock record, or two genuinely
+/// different timestamps) raises `FROZEN-EXCLUDE-NEWER-MISMATCH`.
+fn check_exclude_newer(baseline: Option<Timestamp>, lock: &Lockfile) -> Result<(), MilpaError> {
+    if baseline != lock.exclude_newer {
+        return Err(frozen(
+            "FROZEN-EXCLUDE-NEWER-MISMATCH",
+            format!(
+                "exclude-newer mismatch: lockfile recorded {:?}, requested {:?}; \
+                 re-run 'milpa fetch' with the desired exclude-newer to regenerate \
+                 the lockfile",
+                lock.exclude_newer, baseline
             ),
         ));
     }
@@ -451,6 +509,9 @@ fn resolved_from_locked(locked: &LockedDep) -> Result<ResolvedDep, MilpaError> {
         registry_namespace: locked.attestation.as_ref().and_then(|a| {
             if a.namespace.is_empty() { None } else { Some(a.namespace.clone()) }
         }),
+        // A5: carry the sibling declared-version source straight through —
+        // frozen reconstruction re-derives nothing (no solve, no re-fetch).
+        declared_version_source: locked.declared_version_source.clone(),
     })
 }
 

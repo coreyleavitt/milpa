@@ -46,6 +46,7 @@ from milpa.fetchers.git import GitProvenance, GitReceipt
 from milpa.fetchers.local import LocalFetcher, LocalProvenance, LocalReceipt
 from milpa.fetchers.oci import OciProvenance, OciReceipt
 from milpa.fetchers.tarball import TarballFetcher, TarballProvenance, TarballReceipt
+from milpa.registry import _parse_timestamp
 from milpa.fetchers.types import (
     Fetcher,
     FetcherRegistry,
@@ -181,9 +182,28 @@ class MockedGitFetcher(Fetcher):
     """Mocked git fetcher — satisfies git fetches offline from the fixture tree.
 
     Reads ``mocked-fetches/<url_key(url, ref)>/`` per conformance-fixtures.md §2.3.2:
-      1. ``sha`` — the commit SHA to return in the receipt.
+      1. ``sha`` — the commit SHA to return in the receipt when the incoming
+         ``Provenance`` is UNPINNED (no ``commit_sha``): the ref's current tip.
       2. ``content/`` — source tree staged into ``dest``.
       3. ``<name>.nimble`` (optional) — placed at the root of ``dest``.
+      4. ``committer_date`` (optional, D6 — resolution-semantics RFC §3 Axis D)
+         — an ISO 8601 timestamp string returned as ``GitReceipt.committer_date``,
+         so a mocked git fixture can drive ``exclude_newer`` validation
+         (D4/§6 D-D1/D-D2) without a real git repo. Absent → ``None`` (the
+         pre-D6 default; exclude-newer validation is a no-op for such a dep,
+         mirroring how a real fetch always has a date, but a fixture that
+         doesn't care about D4 needn't author one).
+      5. D-D2 additive extension: when the incoming ``Provenance`` IS pinned
+         (``commit_sha`` set — git-pin reuse, resolver.py's
+         ``_git_pin_for_url_dep``), the pin is echoed back verbatim as the
+         receipt's commit SHA (never ``sha``'s value) — mirroring the real
+         ``GitFetcher``, which always reports precisely the pinned SHA it was
+         given, never the ref's current tip. Its committer date prefers an
+         optional ``committer_date@<commit_sha>`` override file over the flat
+         ``committer_date`` above, letting a fixture distinguish "the pinned
+         commit's own date" from "the ref's current tip date". Absent
+         override file (the common case) falls back to the flat file, same
+         as the unpinned case — so no pre-existing fixture is affected.
 
     Raises ``FETCH-MOCK-MISSING`` if the key directory does not exist.
     """
@@ -208,18 +228,45 @@ class MockedGitFetcher(Fetcher):
                 ref=p.ref,
             )
 
-        sha_file = key_dir / "sha"
-        if not sha_file.is_file():
-            raise MilpaError(
-                FETCH_MOCK_MISSING,
-                f"mock fixture: cannot read {sha_file}: file not found",
-                dep=name,
-            )
-        commit_sha = sha_file.read_text(encoding="utf-8").strip()
+        if p.commit_sha is not None:
+            # D-D2 additive extension: an exact-commit pin (git-pin reuse)
+            # is echoed back verbatim, exactly like the real GitFetcher
+            # (which always checks out and reports precisely the pinned
+            # SHA it was given, never the ref's current tip) — see class
+            # docstring point 5. Every pre-existing fixture that exercises
+            # pin-reuse writes its flat ``sha`` file equal to the pin it
+            # constructs, so this is a no-op for all of them; it only
+            # changes behavior when a fixture pins a commit DIFFERENT from
+            # the flat ``sha`` file, which no fixture did before this slice.
+            commit_sha = p.commit_sha
+        else:
+            sha_file = key_dir / "sha"
+            if not sha_file.is_file():
+                raise MilpaError(
+                    FETCH_MOCK_MISSING,
+                    f"mock fixture: cannot read {sha_file}: file not found",
+                    dep=name,
+                )
+            commit_sha = sha_file.read_text(encoding="utf-8").strip()
+
+        committer_date = None
+        committer_date_file = key_dir / "committer_date"
+        if p.commit_sha is not None:
+            # D-D2 additive extension: an exact-commit pin prefers its own
+            # per-sha override file, if the fixture provides one — see the
+            # class docstring point 5. Absent → fall back to the flat file
+            # below (today's behavior, unaffected by commit_sha).
+            per_sha_file = key_dir / f"committer_date@{p.commit_sha}"
+            if per_sha_file.is_file():
+                committer_date_file = per_sha_file
+        if committer_date_file.is_file():
+            # Reuse the SSOT ISO-8601 parser (registry.py, shared with
+            # published_at/yanked_at) rather than a second parser.
+            committer_date = _parse_timestamp(committer_date_file.read_text(encoding="utf-8").strip())
 
         dest.mkdir(parents=True, exist_ok=True)
         _stage_mock_content(name, key_dir, dest)
-        return GitReceipt(commit_sha=commit_sha)
+        return GitReceipt(commit_sha=commit_sha, committer_date=committer_date)
 
 
 # ---------------------------------------------------------------------------

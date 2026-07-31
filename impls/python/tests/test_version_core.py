@@ -76,6 +76,87 @@ def test_parse_none_returns_none() -> None:
     assert parse_version(None) is None  # type: ignore[arg-type]
 
 
+def test_parse_oversized_digit_run_returns_none_not_raises() -> None:
+    """R10: CPython >=3.11 caps int<->str conversion at ~4300 digits; a
+    crafted tag/version with an oversized numeric component (e.g. an
+    attacker-controlled git ref) must still hit ``parse_version``'s
+    documented "non-canonical -> None" contract, never an uncaught
+    ``ValueError`` from the bare ``int()`` call."""
+    huge = "9" * 6000
+    assert parse_version(f"v{huge}.0.0") is None
+    assert parse_version(f"1.{huge}.0") is None
+    assert parse_version(f"1.0.{huge}") is None
+
+
+def test_parse_component_exceeding_u64_returns_none() -> None:
+    """Parity with Rust's ``parse_numeric_component`` (``s.parse::<u64>()``):
+    a component that fits Python's own int type but overflows a u64 must
+    still parse to ``None`` in Python, so both impls agree on what counts as
+    a valid version rather than Python silently accepting more than Rust."""
+    too_big = str(2**64)  # one past u64::MAX
+    assert parse_version(f"{too_big}.0.0") is None
+
+
+def test_parse_component_at_u64_max_still_parses() -> None:
+    """The u64 boundary itself is still a valid (if absurd) component."""
+    u64_max = 2**64 - 1
+    v = parse_version(f"{u64_max}.0.0")
+    assert v is not None
+    assert v.major == u64_max
+
+
+# ---------------------------------------------------------------------------
+# RR6: oversized/overflowing prerelease identifiers must not raise, and must
+# classify the same way Rust's ``parse_pre_identifiers`` does (fall back to
+# the alphanumeric/string form rather than crash or silently reject).
+# ---------------------------------------------------------------------------
+
+
+def test_parse_prerelease_oversized_digit_run_becomes_alpha_not_raises() -> None:
+    """RR6: unlike a release component, an oversized all-digit *prerelease*
+    identifier (e.g. a crafted git ref/tag) must not propagate the bare
+    ``int()`` call's ``ValueError`` (CPython's ~4300-digit int<->str
+    conversion cap). Rust's ``parse_pre_identifiers`` falls back to
+    ``PreId::Alpha`` for exactly this case ("fall back to Alpha so parsing
+    never panics") — Python must match: parse succeeds, the identifier is
+    kept as the plain string."""
+    huge = "9" * 6000
+    v = parse_version(f"1.0.0-{huge}")
+    assert v is not None
+    assert v.pre == (huge,)
+
+
+def test_parse_prerelease_component_exceeding_u64_becomes_alpha() -> None:
+    """An all-digit prerelease identifier that overflows u64 but is still a
+    small, ordinary Python int (no CPython cap involved) must ALSO fall back
+    to the string/Alpha form — parity with Rust's ``parse::<u64>()`` overflow
+    fallback, not just the CPython-cap edge case."""
+    too_big = str(2**64)  # one past u64::MAX
+    v = parse_version(f"1.0.0-{too_big}")
+    assert v is not None
+    assert v.pre == (too_big,)
+
+
+def test_parse_prerelease_ordinary_numeric_ids_unaffected() -> None:
+    """No regression: ordinary numeric prerelease identifiers still classify
+    as NUMERIC (int), not string, and still compare/sort correctly."""
+    v1 = parse_version("1.0.0-1")
+    v2 = parse_version("1.0.0-2")
+    v_dotted = parse_version("1.0.0-0.3.7")
+    assert v1 is not None and v2 is not None and v_dotted is not None
+    assert v1.pre == (1,)
+    assert v2.pre == (2,)
+    assert v_dotted.pre == (0, 3, 7)
+    assert v1 < v2  # numeric compare, not string compare
+
+
+def test_parse_prerelease_rc_dot_numeric_unaffected() -> None:
+    """No regression on the common ``-rc.N`` shape (mixed alpha + numeric)."""
+    v = parse_version("1.0.0-rc.2")
+    assert v is not None
+    assert v.pre == ("rc", 2)
+
+
 def test_format_simple() -> None:
     v = Version(1, 2, 3)
     assert format_version_str(v) == "1.2.3"

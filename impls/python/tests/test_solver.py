@@ -31,7 +31,12 @@ from milpa.solver import (
     SolveSuccess,
     Term,
     TermRelation,
+    VersionUnknownConstrained,
     WitnessEntry,
+    _accumulated_constrainers,
+    _effective_strategy_for,
+    _next_undecided,
+    _pick_version,
     build_success_certificate,
     certificate_to_json,
     render_conflict_chain,
@@ -65,6 +70,14 @@ class DictProvider:
 
     ``versions_map``: {pkg: [Version, ...]}
     ``deps_map``:     {(pkg, version): [Term, ...]}
+
+    Deliberately has NO ``is_version_unknown`` method — this is the A4
+    regression contract: ``_is_version_unknown`` (solver.py) falls back to
+    ``False`` via ``getattr`` for any provider that doesn't implement it, so
+    every existing test in this file (all built on this class) is an
+    implicit proof that the two-pass ``_next_undecided`` degenerates to the
+    original single-pass scan — same order, byte-for-byte — when no
+    version-unknown package is in play.
     """
 
     def __init__(
@@ -80,6 +93,53 @@ class DictProvider:
 
     def dependencies(self, package: str, version: Version) -> list[Term]:
         return list(self._deps.get((package, version), []))
+
+
+class VersionUnknownDictProvider(DictProvider):
+    """``DictProvider`` + an explicit version-unknown package-name set (A4).
+
+    A real production provider derives ``is_version_unknown`` from a
+    candidate's declared-version precedence chain (resolver.py); this test
+    double just takes the answer directly, isolating the SOLVER-side
+    mechanism (decision priority + classification) from resolver-level
+    concerns (candidate labeling, lazy stub materialization — covered by the
+    conformance corpus instead, e.g. fixture-418/419).
+    """
+
+    def __init__(
+        self,
+        versions_map: dict[str, list[Version]],
+        deps_map: dict[tuple[str, Version], list[Term]],
+        version_unknown_names: set[str],
+    ) -> None:
+        super().__init__(versions_map, deps_map)
+        self._version_unknown_names = version_unknown_names
+
+    def is_version_unknown(self, package: str) -> bool:
+        return package in self._version_unknown_names
+
+
+class RootAuthorityDictProvider(DictProvider):
+    """``DictProvider`` + an explicit root-direct package-name set (C2).
+
+    A real production provider derives ``is_root_direct`` from the manifest's
+    ``root_authority`` set (resolver.py); this test double just takes the
+    answer directly, isolating the SOLVER-side mechanism (the effective-
+    strategy precompute) from resolver-level concerns (root-authority
+    construction — covered by ``test_c2_lowest_direct.py`` instead).
+    """
+
+    def __init__(
+        self,
+        versions_map: dict[str, list[Version]],
+        deps_map: dict[tuple[str, Version], list[Term]],
+        root_direct_names: set[str],
+    ) -> None:
+        super().__init__(versions_map, deps_map)
+        self._root_direct_names = root_direct_names
+
+    def is_root_direct(self, package: str) -> bool:
+        return package in self._root_direct_names
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +429,327 @@ class TestSolveSatisfiable:
 
 
 # ---------------------------------------------------------------------------
+# A4 — version-unknown partition (resolver-semantics RFC §3 Axis A (c))
+# ---------------------------------------------------------------------------
+
+
+class TestVersionUnknownPartition:
+    """Solver-side mechanism: decision priority + hard-error classification.
+
+    Resolver-level concerns (candidate labeling, lazy named-stub
+    materialization, root-authority remedy branching) are covered end-to-end
+    by the conformance corpus (fixture-418/419); these tests isolate the
+    SOLVER's own two halves of A4: ``_next_undecided``'s last-scheduling and
+    the classification raised from ``_make_decision``.
+    """
+
+    def test_unconstrained_version_unknown_resolves_via_sentinel(self) -> None:
+        """Regression: the fresco/intonaco untagged-branch-pin case.
+
+        A version-unknown package nothing else constrains resolves with zero
+        ceremony via its existing (sentinel) candidate — no exception, no
+        special casing visible to the caller.
+        """
+        provider = VersionUnknownDictProvider(
+            versions_map={
+                "__root__": [v(0, 0, 1)],
+                "foo": [v(0, 0, 1)],
+            },
+            deps_map={
+                ("__root__", v(0, 0, 1)): [Term.require("foo", VersionSet.full())],
+                ("foo", v(0, 0, 1)): [],
+            },
+            version_unknown_names={"foo"},
+        )
+        sol = solve(provider, "__root__", v(0, 0, 1))
+        assert sol["foo"] == v(0, 0, 1)
+
+    def test_version_unknown_scheduled_after_normal_packages(self) -> None:
+        """``_next_undecided`` defers a version-unknown package to a second
+        pass — decided only once every normal-class package is decided.
+
+        root requires foo (version-unknown) FIRST in declaration order, then
+        bar (normal). Under the OLD single-pass scan, foo would be returned
+        first (it's undecided with a non-empty effective_set as soon as
+        root's requirement lands). Under A4, bar must come back first.
+        """
+        provider = VersionUnknownDictProvider(
+            versions_map={
+                "__root__": [v(0, 0, 1)],
+                "foo": [v(0, 0, 1)],
+                "bar": [v(1, 0, 0)],
+            },
+            deps_map={
+                ("__root__", v(0, 0, 1)): [
+                    Term.require("foo", VersionSet.full()),
+                    Term.require("bar", VersionSet.full()),
+                ],
+                ("foo", v(0, 0, 1)): [],
+                ("bar", v(1, 0, 0)): [],
+            },
+            version_unknown_names={"foo"},
+        )
+        partial = PartialSolution()
+        # Mirror the root-decision + unit-propagation the real loop performs:
+        # both "foo" and "bar" land as full()-constrained derivations, foo
+        # first (declaration order), exactly the hazard scenario.
+        partial.add_decision("__root__", v(0, 0, 1))
+        partial.add_derivation(
+            Term.require("foo", VersionSet.full()),
+            cause=Incompatibility(terms=(), cause="dependency:__root__@0.0.1"),
+        )
+        partial.add_derivation(
+            Term.require("bar", VersionSet.full()),
+            cause=Incompatibility(terms=(), cause="dependency:__root__@0.0.1"),
+        )
+        assert _next_undecided(partial, provider) == "bar"
+
+    def test_constrained_version_unknown_raises_naming_the_constrainer(self) -> None:
+        """A version-unknown package floored by another dep's requirement
+        raises ``VersionUnknownConstrained`` naming the real constrainer —
+        never a generic ``SolverError``/``SOLVE-CONFLICT``, and never an
+        out-of-range candidate silently returned.
+        """
+        provider = VersionUnknownDictProvider(
+            versions_map={
+                "__root__": [v(0, 0, 1)],
+                "foo": [v(0, 0, 1)],
+                "bar": [v(1, 0, 0)],
+            },
+            deps_map={
+                ("__root__", v(0, 0, 1)): [
+                    Term.require("foo", VersionSet.full()),
+                    Term.require("bar", VersionSet.full()),
+                ],
+                ("foo", v(0, 0, 1)): [],
+                # bar's floor on foo is only discovered when bar is decided —
+                # bar must be decided BEFORE foo for this to exercise the
+                # ordering hazard (A4 guarantees it via decision priority).
+                ("bar", v(1, 0, 0)): [Term.require("foo", vs_gte(1, 0, 0))],
+            },
+            version_unknown_names={"foo"},
+        )
+        with pytest.raises(VersionUnknownConstrained) as exc_info:
+            solve(provider, "__root__", v(0, 0, 1))
+        exc = exc_info.value
+        assert exc.package == "foo"
+        assert exc.constrainers == (("bar", ">=1.0.0"),)
+
+    def test_constrained_version_unknown_enumerates_all_constrainers(self) -> None:
+        """Two independent constrainers on the same version-unknown package
+        are BOTH named (the amoxtli incident floored two packages at once —
+        a serial fail-fix-rerun loop is the papercut this avoids)."""
+        provider = VersionUnknownDictProvider(
+            versions_map={
+                "__root__": [v(0, 0, 1)],
+                "foo": [v(0, 0, 1)],
+                "bar": [v(1, 0, 0)],
+                "baz": [v(1, 0, 0)],
+            },
+            deps_map={
+                ("__root__", v(0, 0, 1)): [
+                    Term.require("foo", VersionSet.full()),
+                    Term.require("bar", VersionSet.full()),
+                    Term.require("baz", VersionSet.full()),
+                ],
+                ("foo", v(0, 0, 1)): [],
+                ("bar", v(1, 0, 0)): [Term.require("foo", vs_gte(0, 2, 8))],
+                ("baz", v(1, 0, 0)): [Term.require("foo", VersionSet.lte(v(0, 9, 0)))],
+            },
+            version_unknown_names={"foo"},
+        )
+        with pytest.raises(VersionUnknownConstrained) as exc_info:
+            solve(provider, "__root__", v(0, 0, 1))
+        assert set(exc_info.value.constrainers) == {
+            ("bar", ">=0.2.8"),
+            ("baz", "<=0.9.0"),
+        }
+
+    def test_constrained_version_unknown_no_phantom_after_backtrack(self) -> None:
+        """R8b (phantom constrainer after backtrack): a consumer ``A`` is
+        speculatively decided at its highest version (``2.0.0``, MAXVER),
+        which floors the version-unknown ``foo`` at ``>=5.0.0`` — but
+        ``A@2.0.0`` ALSO requires ``bump`` at a version that doesn't exist,
+        an unrelated-to-``foo`` conflict discovered as soon as ``A@2.0.0`` is
+        decided (``bump`` was already pinned to its only version BEFORE
+        ``A`` — the conflict fires in the SAME unit-propagation pass that
+        processes ``A``'s new incompatibilities, so the backtrack undoes
+        ``A``'s decision directly, no cascade needed). ``A`` is re-decided at
+        ``1.0.0``, which floors ``foo`` at ``<=8.0.0`` instead.
+
+        Because incompatibilities are permanent (append-only, never undone
+        by backtracking), the ``A@2.0.0 -> foo>=5.0.0`` incompat is STILL in
+        the recorded list when ``foo``'s ``VersionUnknownConstrained`` fires.
+        Only ``A``'s FINAL decided version (``1.0.0``) may be named as a
+        constrainer — the ``>=5.0.0`` entry from the backtracked-away
+        ``2.0.0`` decision is a phantom and must NOT appear.
+        """
+        provider = VersionUnknownDictProvider(
+            versions_map={
+                "__root__": [v(0, 0, 1)],
+                "A": [v(1, 0, 0), v(2, 0, 0)],
+                "bump": [v(1, 0, 0)],
+                "foo": [v(0, 0, 1)],
+            },
+            deps_map={
+                ("__root__", v(0, 0, 1)): [
+                    Term.require("bump", VersionSet.full()),
+                    Term.require("A", VersionSet.full()),
+                ],
+                ("A", v(2, 0, 0)): [
+                    Term.require("foo", vs_gte(5, 0, 0)),
+                    # Impossible: `bump` only has 1.0.0, already decided by
+                    # the time `A` is picked (root lists `bump` before `A`).
+                    # This is what forces the backtrack of A@2.0.0 — it has
+                    # nothing to do with `foo`.
+                    Term.require("bump", vs_gte(2, 0, 0)),
+                ],
+                ("A", v(1, 0, 0)): [Term.require("foo", VersionSet.lte(v(8, 0, 0)))],
+                ("bump", v(1, 0, 0)): [],
+            },
+            version_unknown_names={"foo"},
+        )
+        with pytest.raises(VersionUnknownConstrained) as exc_info:
+            solve(provider, "__root__", v(0, 0, 1))
+        exc = exc_info.value
+        assert exc.package == "foo"
+        # ONLY the real constrainer from A's final decided version (1.0.0) —
+        # the phantom (A, '>=5.0.0') from the backtracked A@2.0.0 speculative
+        # decision must be gone.
+        assert exc.constrainers == (("A", "<=8.0.0"),)
+
+    def test_next_undecided_order_unchanged_with_no_version_unknown_packages(
+        self,
+    ) -> None:
+        """When no package is version-unknown, the two-pass scan degenerates
+        to the ORIGINAL single-pass insertion-order scan — byte-for-byte the
+        same return value (fixture-063's NORMATIVE BFS-order invariant is
+        unaffected). Uses plain ``DictProvider`` (no ``is_version_unknown``
+        at all) to prove the default-False fallback, not a hardcoded False.
+        """
+        provider = DictProvider(
+            versions_map={"__root__": [v(0, 0, 1)], "x": [v(1, 0, 0)], "y": [v(1, 0, 0)]},
+            deps_map={},
+        )
+        partial = PartialSolution()
+        partial.add_decision("__root__", v(0, 0, 1))
+        partial.add_derivation(
+            Term.require("x", VersionSet.full()),
+            cause=Incompatibility(terms=(), cause="dependency:__root__@0.0.1"),
+        )
+        partial.add_derivation(
+            Term.require("y", VersionSet.full()),
+            cause=Incompatibility(terms=(), cause="dependency:__root__@0.0.1"),
+        )
+        assert _next_undecided(partial, provider) == "x"
+
+
+class TestAccumulatedConstrainers:
+    """Direct unit tests for ``_accumulated_constrainers`` (A4/R8b).
+
+    ``_accumulated_constrainers`` now takes a ``partial`` argument (R8b: it
+    reads the consumer's FINAL decided version from ``partial.decisions()``,
+    not just the append-only ``incompats`` history) — every fixture here
+    builds a ``PartialSolution`` with the relevant consumers decided at the
+    version the fixture's incompat names, so the "is this consumer's
+    decision still live" filter always passes and the pre-existing
+    full()/synthetic-cause/dedupe behavior is unaffected.
+    """
+
+    def test_skips_full_and_synthetic_causes(self) -> None:
+        incompats = [
+            # A full() requirement (e.g. a git/url self-term, D-A2) — never a
+            # real constrainer, must be skipped.
+            Incompatibility(
+                terms=(
+                    Term.require("consumer1", vs_eq(1, 0, 0)),
+                    Term.forbid("foo", VersionSet.full()),
+                ),
+                cause="dependency:consumer1@1.0.0",
+            ),
+            # Synthetic backtracking bookkeeping — not a real dep-graph fact.
+            Incompatibility(
+                terms=(Term.require("foo", vs_eq(0, 0, 1)),),
+                cause="conflict-blocks:foo@0.0.1",
+            ),
+            # The real constrainer.
+            Incompatibility(
+                terms=(
+                    Term.require("consumer2", vs_eq(1, 0, 0)),
+                    Term.forbid("foo", vs_gte(0, 2, 8)),
+                ),
+                cause="dependency:consumer2@1.0.0",
+            ),
+        ]
+        partial = PartialSolution()
+        partial.add_decision("consumer1", v(1, 0, 0))
+        partial.add_decision("consumer2", v(1, 0, 0))
+        result = _accumulated_constrainers(incompats, "foo", partial)
+        assert result == (("consumer2", ">=0.2.8"),)
+
+    def test_dedupes_identical_consumer_constraint_pairs(self) -> None:
+        incompat = Incompatibility(
+            terms=(
+                Term.require("consumer", vs_eq(1, 0, 0)),
+                Term.forbid("foo", vs_gte(0, 2, 8)),
+            ),
+            cause="dependency:consumer@1.0.0",
+        )
+        partial = PartialSolution()
+        partial.add_decision("consumer", v(1, 0, 0))
+        result = _accumulated_constrainers([incompat, incompat], "foo", partial)
+        assert result == (("consumer", ">=0.2.8"),)
+
+    def test_skips_stale_incompat_from_backtracked_consumer_version(self) -> None:
+        """R8b: an incompat recorded when ``consumer`` was speculatively
+        decided at ``2.0.0`` must NOT be named once ``consumer`` is finally
+        decided at a DIFFERENT version (``1.0.0``) — the ``2.0.0`` incompat is
+        a stale, permanent fact from a decision that was backtracked away.
+        """
+        incompats = [
+            # Recorded while `consumer` was speculatively at 2.0.0 (later
+            # backtracked) — a phantom, must be skipped.
+            Incompatibility(
+                terms=(
+                    Term.require("consumer", vs_eq(2, 0, 0)),
+                    Term.forbid("foo", vs_gte(5, 0, 0)),
+                ),
+                cause="dependency:consumer@2.0.0",
+            ),
+            # Recorded at `consumer`'s FINAL decided version — real.
+            Incompatibility(
+                terms=(
+                    Term.require("consumer", vs_eq(1, 0, 0)),
+                    Term.forbid("foo", VersionSet.lte(v(8, 0, 0))),
+                ),
+                cause="dependency:consumer@1.0.0",
+            ),
+        ]
+        partial = PartialSolution()
+        partial.add_decision("consumer", v(1, 0, 0))
+        result = _accumulated_constrainers(incompats, "foo", partial)
+        assert result == (("consumer", "<=8.0.0"),)
+
+    def test_skips_incompat_from_consumer_never_finally_decided(self) -> None:
+        """A consumer with NO entry in ``partial.decisions()`` at all (e.g.
+        fully backtracked away and never re-decided by the time this is
+        called) contributes nothing — absence of a final decision is not
+        distinguishable from staleness."""
+        incompats = [
+            Incompatibility(
+                terms=(
+                    Term.require("consumer", vs_eq(2, 0, 0)),
+                    Term.forbid("foo", vs_gte(5, 0, 0)),
+                ),
+                cause="dependency:consumer@2.0.0",
+            ),
+        ]
+        partial = PartialSolution()  # `consumer` never decided
+        result = _accumulated_constrainers(incompats, "foo", partial)
+        assert result == ()
+
+
+# ---------------------------------------------------------------------------
 # 6b-2 — Strategy dispatch
 # ---------------------------------------------------------------------------
 
@@ -460,6 +841,337 @@ class TestStrategyDispatch:
         )
         sol = solve(provider, "__root__", v(0, 0, 1), strategy=Strategy.SEMVER)
         assert sol["dep"] == v(3, 0, 0)
+
+
+# ---------------------------------------------------------------------------
+# C2 — LowestDirect effective-strategy precompute (resolver-semantics RFC
+# §3 Axis C / §4 stage 4, D-C2, #111)
+#
+# ``LowestDirect`` is a surface value only. ``_effective_strategy_for``
+# resolves it to a concrete MINVER (root-direct) / MAXVER (transitive)
+# strategy BEFORE ``_pick_version`` ever runs — the picker itself gains no
+# ``LowestDirect`` case. Solver-level (synthetic provider), isolating the
+# mechanism from resolver-level root-authority construction (covered by
+# ``test_c2_lowest_direct.py``).
+# ---------------------------------------------------------------------------
+
+
+class TestEffectiveStrategyPrecompute:
+    def _provider(self, root_direct_names: set[str]) -> RootAuthorityDictProvider:
+        return RootAuthorityDictProvider(
+            versions_map={
+                "__root__": [v(0, 0, 1)],
+                "dep": [v(1, 0, 0), v(1, 5, 0), v(2, 0, 0)],
+            },
+            deps_map={
+                ("__root__", v(0, 0, 1)): [Term.require("dep", vs_gte(1, 0, 0))],
+                ("dep", v(1, 0, 0)): [],
+                ("dep", v(1, 5, 0)): [],
+                ("dep", v(2, 0, 0)): [],
+            },
+            root_direct_names=root_direct_names,
+        )
+
+    # RED → GREEN: a non-LowestDirect strategy passes through unchanged,
+    # regardless of directness.
+    def test_non_lowest_direct_passes_through(self) -> None:
+        provider = self._provider(root_direct_names={"dep"})
+        assert _effective_strategy_for(provider, "dep", Strategy.MAXVER) == Strategy.MAXVER
+        assert _effective_strategy_for(provider, "dep", Strategy.MINVER) == Strategy.MINVER
+        assert _effective_strategy_for(provider, "dep", Strategy.SEMVER) == Strategy.SEMVER
+
+    # RED → GREEN: LowestDirect resolves to MINVER for a root-direct package.
+    def test_lowest_direct_resolves_to_minver_for_root_direct(self) -> None:
+        provider = self._provider(root_direct_names={"dep"})
+        assert (
+            _effective_strategy_for(provider, "dep", Strategy.LOWEST_DIRECT)
+            == Strategy.MINVER
+        )
+
+    # RED → GREEN: LowestDirect resolves to MAXVER for a transitive package.
+    def test_lowest_direct_resolves_to_maxver_for_transitive(self) -> None:
+        provider = self._provider(root_direct_names=set())
+        assert (
+            _effective_strategy_for(provider, "dep", Strategy.LOWEST_DIRECT)
+            == Strategy.MAXVER
+        )
+
+    # RED → GREEN: a provider with no root-authority concept (plain
+    # DictProvider) treats every package as transitive — the optional-hook
+    # default, mirroring A4/B2's own hook-absence regression contract.
+    def test_no_root_authority_hook_defaults_to_transitive(self) -> None:
+        provider = DictProvider(
+            versions_map={"dep": [v(1, 0, 0)]},
+            deps_map={},
+        )
+        assert (
+            _effective_strategy_for(provider, "dep", Strategy.LOWEST_DIRECT)
+            == Strategy.MAXVER
+        )
+
+    # RED → GREEN: end-to-end through solve() — the whole point of the
+    # design deepening. A root-direct dep with multiple candidates picks the
+    # LOWEST satisfying version; a transitive dep with multiple candidates
+    # still picks the HIGHEST — under the SAME `strategy=LOWEST_DIRECT`.
+    def test_solve_contrast_root_direct_minver_transitive_maxver(self) -> None:
+        provider = RootAuthorityDictProvider(
+            versions_map={
+                "__root__": [v(0, 0, 1)],
+                "direct": [v(1, 0, 0), v(2, 0, 0)],
+                "transitive": [v(1, 0, 0), v(2, 0, 0)],
+            },
+            deps_map={
+                ("__root__", v(0, 0, 1)): [
+                    Term.require("direct", VersionSet.full()),
+                ],
+                ("direct", v(1, 0, 0)): [
+                    Term.require("transitive", VersionSet.full()),
+                ],
+                ("direct", v(2, 0, 0)): [
+                    Term.require("transitive", VersionSet.full()),
+                ],
+                ("transitive", v(1, 0, 0)): [],
+                ("transitive", v(2, 0, 0)): [],
+            },
+            root_direct_names={"direct"},
+        )
+        sol = solve(
+            provider, "__root__", v(0, 0, 1), strategy=Strategy.LOWEST_DIRECT
+        )
+        assert sol["direct"] == v(1, 0, 0)  # root-direct -> MINVER
+        assert sol["transitive"] == v(2, 0, 0)  # transitive -> MAXVER
+
+    # RED → GREEN (design assertion): `_pick_version` has no `LowestDirect`
+    # case — calling it directly with that value hits none of the match's
+    # arms and raises, rather than silently guessing a version.
+    def test_pick_version_has_no_lowest_direct_case(self) -> None:
+        with pytest.raises(AssertionError):
+            _pick_version(
+                [v(1, 0, 0), v(2, 0, 0)],
+                VersionSet.full(),
+                Strategy.LOWEST_DIRECT,
+                "dep",
+            )
+
+
+# ---------------------------------------------------------------------------
+# B1 — preference-aware pick (resolver-semantics RFC §4 stage 4, Axis B)
+#
+# Unit-tests ``_pick_version`` directly (not through ``solve()`` — B1 is
+# pick-only mechanism; feeding a real preference from the prior lockfile is
+# B2). ``preference`` is the RFC's ``FromLock(v) | None`` as a plain
+# ``Version | None`` value.
+# ---------------------------------------------------------------------------
+
+
+class TestPreferenceAwarePick:
+    def _candidates(self) -> list[Version]:
+        return [v(1, 0, 0), v(1, 5, 0), v(2, 0, 0)]
+
+    # RED → GREEN: preference=None must reproduce today's behavior exactly —
+    # zero behavior change is the whole point of B1.
+    def test_no_preference_reproduces_maxver(self) -> None:
+        chosen = _pick_version(
+            self._candidates(), VersionSet.full(), Strategy.MAXVER, "dep"
+        )
+        assert chosen == v(2, 0, 0)
+
+    def test_no_preference_reproduces_minver(self) -> None:
+        chosen = _pick_version(
+            self._candidates(),
+            VersionSet.full(),
+            Strategy.MINVER,
+            "dep",
+            preference=None,
+        )
+        assert chosen == v(1, 0, 0)
+
+    # RED → GREEN: an in-range preference short-circuits the strategy,
+    # even when the strategy would pick a different (higher) version.
+    def test_preference_in_range_wins_over_maxver(self) -> None:
+        chosen = _pick_version(
+            self._candidates(),
+            VersionSet.full(),
+            Strategy.MAXVER,
+            "dep",
+            preference=v(1, 5, 0),
+        )
+        assert chosen == v(1, 5, 0)
+
+    def test_preference_in_range_wins_over_minver(self) -> None:
+        chosen = _pick_version(
+            self._candidates(),
+            VersionSet.full(),
+            Strategy.MINVER,
+            "dep",
+            preference=v(1, 5, 0),
+        )
+        assert chosen == v(1, 5, 0)
+
+    # RED → GREEN: a preference outside candidates ∩ allowed is ignored —
+    # falls through to the strategy pick unchanged.
+    def test_preference_out_of_range_falls_through_to_strategy(self) -> None:
+        chosen = _pick_version(
+            self._candidates(),
+            VersionSet.full(),
+            Strategy.MAXVER,
+            "dep",
+            preference=v(9, 9, 9),
+        )
+        assert chosen == v(2, 0, 0)
+
+    def test_preference_out_of_range_falls_through_to_minver(self) -> None:
+        chosen = _pick_version(
+            self._candidates(),
+            VersionSet.full(),
+            Strategy.MINVER,
+            "dep",
+            preference=v(9, 9, 9),
+        )
+        assert chosen == v(1, 0, 0)
+
+    # A preference that survives the constraint filter but not the candidate
+    # list itself (e.g. excluded by the accumulated ``allowed`` range) is
+    # exactly the "out of range" case above, since ``candidates`` is always
+    # pre-filtered by ``allowed.contains`` (the docstring's invariant) — this
+    # test pins that a preference cannot bypass ``allowed`` to force an
+    # otherwise-disallowed version through.
+    def test_preference_not_in_candidates_even_if_constructed_in_range(self) -> None:
+        chosen = _pick_version(
+            candidates=[v(1, 0, 0), v(2, 0, 0)],
+            allowed=vs_gte(1, 0, 0),
+            strategy=Strategy.MAXVER,
+            package="dep",
+            preference=v(1, 5, 0),  # in `allowed` but not a real candidate
+        )
+        assert chosen == v(2, 0, 0)
+
+
+# ---------------------------------------------------------------------------
+# B2 — feeding prior-lock versions as preferences through solve()
+# (resolver-semantics RFC §4 stage 4, Axis B — #192/#70)
+#
+# B1 (above) unit-tests ``_pick_version``'s short-circuit in isolation. B2's
+# job is *feeding* the preference from ``params.prior`` — the resolver-level
+# wiring (``_Provider.preference``) is exercised end to end in
+# ``test_b2_prior_lock_preference.py``; here we prove the SOLVER-side
+# threading (``solve()`` → ``_make_decision`` → ``_preference_for`` →
+# ``_pick_version``) with a synthetic in-memory provider, isolating the
+# solver mechanism from resolver/index/fetch concerns.
+# ---------------------------------------------------------------------------
+
+
+class PreferenceDictProvider(DictProvider):
+    """``DictProvider`` + an explicit ``package -> Version`` preference map.
+
+    Mirrors ``VersionUnknownDictProvider``'s optional-hook pattern (A4): a
+    real production provider derives ``preference`` from ``params.prior``
+    (resolver.py's ``_Provider.preference``); this test double just takes the
+    answer directly, isolating the solver-side mechanism (threading the
+    preference into the decision loop) from resolver-level concerns (lockfile
+    lookup, DepKey decomposition — covered by ``test_b2_prior_lock_preference.py``).
+    """
+
+    def __init__(
+        self,
+        versions_map: dict[str, list[Version]],
+        deps_map: dict[tuple[str, Version], list[Term]],
+        preference_map: dict[str, Version],
+    ) -> None:
+        super().__init__(versions_map, deps_map)
+        self._preference_map = preference_map
+
+    def preference(self, package: str) -> Version | None:
+        return self._preference_map.get(package)
+
+
+class TestB2PriorLockPreferenceThroughSolve:
+    # RED → GREEN: a provider with NO ``preference`` hook (plain
+    # ``DictProvider``) is unaffected — ``_preference_for`` falls back to
+    # ``None`` via ``getattr``, so a fresh resolve (no prior lock) is
+    # byte-for-byte unchanged. Every other test in this file that uses plain
+    # ``DictProvider`` is an implicit proof of this too; this test states it
+    # explicitly for B2.
+    def test_provider_without_preference_hook_is_unaffected(self) -> None:
+        provider = DictProvider(
+            versions_map={
+                "__root__": [v(0, 0, 1)],
+                "dep": [v(1, 0, 0), v(2, 0, 0)],
+            },
+            deps_map={
+                ("__root__", v(0, 0, 1)): [Term.require("dep", VersionSet.full())],
+                ("dep", v(1, 0, 0)): [],
+                ("dep", v(2, 0, 0)): [],
+            },
+        )
+        sol = solve(provider, "__root__", v(0, 0, 1), strategy=Strategy.MAXVER)
+        assert sol["dep"] == v(2, 0, 0)
+
+    # RED → GREEN: a locked version still within the accumulated constraint
+    # wins over the strategy's newest pick — the minimal-change default.
+    def test_locked_version_wins_when_still_satisfiable(self) -> None:
+        provider = PreferenceDictProvider(
+            versions_map={
+                "__root__": [v(0, 0, 1)],
+                "dep": [v(1, 0, 0), v(1, 5, 0), v(2, 0, 0)],
+            },
+            deps_map={
+                ("__root__", v(0, 0, 1)): [Term.require("dep", VersionSet.full())],
+                ("dep", v(1, 0, 0)): [],
+                ("dep", v(1, 5, 0)): [],
+                ("dep", v(2, 0, 0)): [],
+            },
+            preference_map={"dep": v(1, 5, 0)},
+        )
+        sol = solve(provider, "__root__", v(0, 0, 1), strategy=Strategy.MAXVER)
+        assert sol["dep"] == v(1, 5, 0)
+
+    # RED → GREEN: a locked version no longer satisfying the accumulated
+    # constraint is FORCED to move — the preference falls through to the
+    # ordinary strategy pick over the surviving candidates.
+    def test_locked_version_forced_out_when_no_longer_satisfiable(self) -> None:
+        provider = PreferenceDictProvider(
+            versions_map={
+                "root": [v(0, 0, 1)],
+                "dep": [v(1, 0, 0), v(1, 5, 0), v(2, 0, 0)],
+            },
+            deps_map={
+                ("root", v(0, 0, 1)): [Term.require("dep", vs_gte(2, 0, 0))],
+                ("dep", v(1, 0, 0)): [],
+                ("dep", v(1, 5, 0)): [],
+                ("dep", v(2, 0, 0)): [],
+            },
+            preference_map={"dep": v(1, 0, 0)},  # no longer >= 2.0.0
+        )
+        sol = solve(provider, "root", v(0, 0, 1), strategy=Strategy.MAXVER)
+        assert sol["dep"] == v(2, 0, 0)
+
+    # RED → GREEN (the #192 core win): bumping ONE dep's constraint so its
+    # locked version no longer satisfies forces ONLY that dep to move; an
+    # unrelated, unconstrained dep stays at its locked version even though a
+    # newer version exists and a fresh maxver resolve would pick it.
+    def test_bump_one_dep_leaves_unrelated_dep_pinned(self) -> None:
+        provider = PreferenceDictProvider(
+            versions_map={
+                "root": [v(0, 0, 1)],
+                "bumped": [v(1, 0, 0), v(2, 0, 0)],
+                "unrelated": [v(1, 0, 0), v(2, 0, 0)],
+            },
+            deps_map={
+                ("root", v(0, 0, 1)): [
+                    Term.require("bumped", vs_gte(2, 0, 0)),
+                    Term.require("unrelated", VersionSet.full()),
+                ],
+                ("bumped", v(1, 0, 0)): [],
+                ("bumped", v(2, 0, 0)): [],
+                ("unrelated", v(1, 0, 0)): [],
+                ("unrelated", v(2, 0, 0)): [],
+            },
+            preference_map={"bumped": v(1, 0, 0), "unrelated": v(1, 0, 0)},
+        )
+        sol = solve(provider, "root", v(0, 0, 1), strategy=Strategy.MAXVER)
+        assert sol["bumped"] == v(2, 0, 0)  # forced: 1.0.0 no longer >= 2.0.0
+        assert sol["unrelated"] == v(1, 0, 0)  # stays locked, NOT newest-wins-bumped
 
 
 # ---------------------------------------------------------------------------

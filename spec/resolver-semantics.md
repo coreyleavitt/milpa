@@ -144,35 +144,176 @@ both.
 URL deps, local deps, and workspace-member deps are resolved by
 **identity** (content hash) rather than version-range negotiation.
 They do not appear in a named registry; only one concrete tree exists
-for each such dep in a given resolution.
+for each such dep in a given resolution. This section also specifies the
+**declared version** these deps carry alongside their identity — a
+solver-facing label, never an identity input (`spec/identity.md
+§4.1a`) — per the resolution-semantics RFC's Axis A (#191).
+
+### 3.1  Exactly one candidate; self-term is `full()`
 
 > NORMATIVE: A conformant resolver MUST present each URL dep, local dep,
-> and workspace-member dep to the solver as a package with exactly one
-> canonical version — a fixed, non-range singleton. The solver treats
-> these deps as decided by identity; it MUST NOT attempt to backtrack
-> across different versions of a URL/local/member dep.
+> and workspace-member dep to the solver as a package with **exactly one
+> candidate** — a fixed, non-range singleton (§3.3 states what value that
+> candidate carries). The solver treats these deps as decided by
+> identity; it MUST NOT attempt to backtrack across different candidates
+> of a URL/local/member dep, because there is only ever one.
 
-> NORMATIVE: The solver MUST emit a constraint of the form
-> `require(<name>, {canonical_version})` for every URL, local, and
-> member dep. The exact value of `canonical_version` is an
-> implementation detail; what is normative is that (a) there is
-> exactly one such version per dep, (b) it is the same value whether
-> the dep appears as a direct manifest dep or as a transitive require,
-> and (c) the identity check (content-hash verification) is performed
-> **outside** the solver, by the fetcher layer, before the candidate is
-> handed to the solver.
+> NORMATIVE: The **requiring term** contributed by the dep's own
+> declaration site — whether it is declared directly in a manifest's
+> `deps`/`dev-deps` or reached as a transitive `requires` — MUST be
+> `full()` (the unconstrained version set), never `eq(<version>)` fixed
+> to the dep's own candidate version. This holds independent of whether
+> the candidate's declared version is knowable at declaration time: for a
+> fetched dep (git/url/tarball) the declaration's term is built *before*
+> the fetch runs, while the candidate's real declared version (§3.2) is
+> only known *after* the fetch resolves the source tree. A `full()` term
+> removes any pre-commitment, so there is no window in which the
+> pre-fetch term and the post-fetch candidate could disagree and produce
+> a spurious `SOLVE-CONFLICT` on every dep that has a real declared
+> version. (A workspace member has no fetch step, so this particular
+> causality hazard does not apply to it, but the `full()` self-term is
+> still required — it is what lets a member satisfy another member's
+> floor on it when the member declares a version, §11.)
 
-This convention is what makes `fetch_any` + content-hash verification
-compose correctly with backtracking: the solver never needs to
-distinguish "which URL version" — identity is settled before the solver
-runs.
+> NORMATIVE: The only constraints a URL/local/member dep's single
+> candidate must satisfy are those contributed by **other** deps that
+> require it (e.g. an index dep's `.nimble` floor on it). The dep's own
+> self-term never constrains its own candidate.
 
-> NOTE: The reference implementation uses the sentinel
-> `_URL_DEP_VERSION = Version(0, 0, 1)` as the canonical version for
-> all URL/local/member deps (`resolver.py`). The exact sentinel value
-> is an incidental implementation choice; a Rust port may use any
-> fixed singleton value, including an opaque discriminant. What is
-> normative is the one-version-per-dep shape, not `(0,0,1)`.
+> NOTE: The reference implementation builds this term as
+> `VersionSet.full()` (`resolver.py`, `milpa-solver/src/lib.rs`) at every
+> site that previously built `eq(_URL_DEP_VERSION)` — root seeding,
+> mid-solve fixpoint blocks, and the workspace member-seeding path alike.
+
+### 3.2  Declared version — manifest-agnostic precedence
+
+> NORMATIVE: The **declared version** — the value that labels a URL,
+> local, tarball, or workspace-member dep's sole candidate for constraint
+> satisfaction (§3.1) — is derived by trying these sources in order,
+> stopping at the first that yields a value:
+>
+> 1. the fetched (or, for a member, in-tree) package's own `milpa.kdl`
+>    `version` field — native and authoritative;
+> 2. else its `.nimble` `version` field (the compat adapter for the
+>    existing Nim ecosystem; `spec/manifest-grammar.md`);
+> 3. else, **git deps only** (a dep with a `ref`), a version-shaped tag
+>    (`v?X.Y.Z`, parsed the same way as any other version literal);
+> 4. else, an explicit `version=` annotation on the dep's own
+>    declaration — or, for a purely-transitive dep with no root-owned
+>    declaration site, on an `overrides { pkg … version= }` rule
+>    targeting it (`spec/manifest-grammar.md`; distinct from an
+>    override's source *redirect* — the annotation only supplies a
+>    missing version label, it does not change which source is used);
+> 5. else, the dep is **version-unknown** (§3.4).
+>
+> A named/index dep's version comes directly from the tianguis index and
+> is never subject to this precedence — its version is never ambiguous.
+
+> NORMATIVE: When an `overrides {}` rule redirects a dep to a different
+> source, this precedence re-runs against the **override target's**
+> manifest/tag/annotation; a `version=` left on the now-redirected
+> original declaration is not read (the redirect changed which manifest
+> is in play, which is not itself a conflict to detect).
+
+> NOTE: The reference implementation is `declared_version_for`
+> (`edge_sources.py`/`edge_sources.rs`); it reuses the same version
+> parser as every other version literal in the system (`parse_version`),
+> so a malformed value (e.g. `"0.1"`, non-numeric) is never a hard parse
+> error — it simply fails to yield a value, and precedence falls through
+> to the next step, ending at version-unknown if steps 1–4 all miss.
+
+### 3.3  Candidate labeling and the lockfile boundary
+
+> NORMATIVE: The dep's single candidate (§3.1) is labeled with the
+> declared version from §3.2 when one exists. This label is a
+> **constraint-satisfaction fact only**: it is compared against other
+> deps' constraints on this package name exactly like any indexed
+> version, but it is never an input to, and is never derived from, the
+> dep's `content_hash` (`spec/identity.md §4.1a`). Two dependency trees
+> carrying the same declared version but different content remain
+> distinct by identity.
+
+> NOTE: When no declared version exists (version-unknown, §3.4) the
+> reference implementation still labels the internal candidate with a
+> fixed internal sentinel token (e.g. `0.0.1`) purely so the solver has a
+> concrete value to reason about; that token is an implementation detail,
+> flattened to the reserved literal `"0.0.0"` at the lockfile boundary
+> (`spec/lockfile-schema.md §3.2`), paired with an absent
+> `declared_version_source` (§3.2a) — the unambiguous version-unknown
+> encoding.
+
+### 3.4  Version-unknown: the constrained/unconstrained partition
+
+A dep can legitimately reach §3.2 step 5 (version-unknown) — for
+example, an untagged branch pin with no `milpa.kdl`/`.nimble` version and
+no `version=` annotation. Because such a dep is still fully and uniquely
+resolved by content-hash identity (§3.1, `spec/identity.md`), this is not
+itself a defect. What matters is whether **another** dep imposes a range
+constraint on it.
+
+> NORMATIVE: A conformant resolver MUST classify a version-unknown dep at
+> the moment its solver decision is made — not earlier, and not by
+> conflict-path introspection after the fact; see the ordering rule below
+> — into exactly one of:
+>
+> - **unconstrained** — the accumulated constraint range for this
+>   package is still the full/unbounded set (nothing floors or ceilings
+>   it). The resolver proceeds normally, deciding the dep via its single
+>   candidate (§3.1/§3.3); no error, no ceremony. This is the common
+>   untagged-branch-pin case (e.g. an unreleased fork tracked at the tip
+>   of a branch).
+> - **constrained, with no declared version available** — some other
+>   dep's requirement narrows the accumulated range below full. The
+>   resolver MUST raise `RES-VERSION-UNKNOWN-CONSTRAINED` rather than
+>   silently satisfying, or refusing to satisfy, the foreign constraint by
+>   guessing a version. The error MUST enumerate **every** consumer that
+>   contributes a constraint on the package (not just the first) and MUST
+>   name the constrained package. Its remedy text MUST branch on whether
+>   the constrained dep has a user-editable declaration site: root-declared
+>   → "add a `version=` annotation (or pin a versioned tag)"; purely
+>   transitive (no declaration the user owns) → "add a root-level pin or
+>   an `overrides { … version= }` rule naming this package."
+>
+> (A constrained dep that DOES have a declared version, §3.2, is not
+> version-unknown at all — it is an ordinary versioned dep subject to
+> ordinary constraint satisfaction, and `SOLVE-CONFLICT` on a genuine
+> incompatibility.)
+
+> NORMATIVE: **Decision-priority ordering.** Because milpa's provider
+> materializes named/index deps' own requirements **lazily** — the first
+> time the solver selects a candidate for them — a depender's floor on a
+> version-unknown package is not visible until the depender itself has
+> been decided. A conformant resolver MUST therefore give a version-unknown
+> package **strictly lowest decision priority** among all packages the
+> solver has yet to decide. This guarantees that, by the time a
+> version-unknown package's own decision is made, every other reachable
+> package has already been decided and its constraints (if any) are
+> already folded into the accumulated range — so the unconstrained/
+> constrained classification above is exact, never a premature guess a
+> later-discovered floor could invalidate. A resolver that classifies a
+> version-unknown package before all its potential constrainers are
+> decided (e.g. a naive declaration-order or BFS-order scan) risks
+> committing the package's sentinel candidate while the range still looks
+> unconstrained, then discovering a real conflict against an
+> already-decided single-candidate package later — degrading to a generic
+> `SOLVE-CONFLICT` instead of the precise `RES-VERSION-UNKNOWN-CONSTRAINED`.
+> Relative order among version-unknown packages themselves, and among all
+> other (normal-class) packages, is otherwise unaffected by this rule — it
+> only requires that version-unknown packages be decided last.
+
+> NOTE: The reference implementation's Rust provider extends its priority
+> function so a version-unknown package's priority is dominated by a
+> `not is_version_unknown` boolean ahead of any existing tie-break
+> (`milpa-solver/src/lib.rs`); Python's BFS-order `_next_undecided`
+> (§4.2.1) performs a two-pass scan — normal-class packages first, in
+> their existing deterministic order, version-unknown packages after, in
+> their own relative order — so this rule is additive to, not a
+> replacement for, the existing canonical package order P.
+
+Cross-reference: `spec/errors.md` for `RES-VERSION-UNKNOWN-CONSTRAINED`;
+`spec/manifest-grammar.md` for the package `version` field, the dep-level
+`version=` annotation, and the `overrides { … version= }` grammar;
+`spec/lockfile-schema.md` §3.2/§3.2a for the wire encoding.
 
 ---
 
@@ -544,6 +685,39 @@ error `MAN-PREDICATE-MIXED-NEGATION`) is defined in
 > Profile predicates are evaluated by `_predicate_satisfied`; version
 > predicates go through `_version_satisfies` → `VersionSet.from_constraint`.
 
+### 6.1  Resolution scope: single-config is the deliberate default (#110)
+
+> NORMATIVE (scope decision, closes #110): milpa resolves for a **single
+> configuration** — the active profile. `when`-gated conditional deps are
+> *stripped* against that profile per §6 before the solver runs, and the
+> emitted lockfile reflects the **resolving machine's configuration only**.
+> milpa does NOT resolve the union of a manifest's platform branches, and a
+> lockfile is NOT a universal (all-target) artifact.
+
+Rationale. uv's universal-lock motivation (per-platform *binary wheels*) does
+not transfer to Nim: milpa deps are source, and platform variation is expressed
+by compile-time `when` in the consumer, not by divergent resolved artifacts. A
+single-config lock is therefore the correct default, not a limitation — building
+union-resolution now would be speculative machinery for a consumer that does not
+yet exist ([[feedback_minimal_over_completeness]], [[positioning_no_generic]]).
+
+> NOTE (deferred, seam-ready): a **universal resolution** mode remains *defined
+> but unimplemented*. Should a concrete cross-platform-divergent Nim consumer
+> appear, it would: solve the union of `when` branches; record per-target
+> provenance/identity under the `CondRequire`/marker dimension **already carried
+> in the lockfile** (reserved for exactly this); and teach `verify` to check the
+> active slice. The schema seam exists today; the resolution behavior is
+> deferred. This is a landed scope *decision*, not a build.
+
+> NORMATIVE (Axis B per-config boundary): the minimal-change guarantee (§8 prior-
+> lockfile preference — bumping one dep does not move unrelated deps) is
+> **per-lockfile / per-configuration, not per-manifest**. A `when`-gated dep that
+> is stripped on the resolving machine has no entry in that machine's lockfile,
+> so on a *different* configuration it has no prior preference to reuse and
+> resolves fresh (newest-wins) — the same residual gap the single-config default
+> defers above. Tooling MUST NOT describe minimal-change as spanning
+> configurations it did not resolve.
+
 ---
 
 ## 6a  DepKey — resolver identity key
@@ -701,6 +875,12 @@ cross-references this section rather than restating the list.
 >    workspace member that is not present in the current workspace.
 > 9. **`FROZEN-MEMBER-IDENTITY-DRIFT`** — a workspace member's on-disk
 >     `content_hash` differs from the lockfile's pinned identity.
+> 10. **`FROZEN-EXCLUDE-NEWER-MISMATCH`** (D5, resolution-semantics RFC
+>     §3 Axis D) — the lockfile's recorded top-level `exclude_newer`
+>     (`lockfile-schema.md` §2.2a) does not equal the manifest's EFFECTIVE
+>     `resolution { exclude-newer }` (default: unset). Built manifest-
+>     sourced from the start, mirroring exactly how #1
+>     (`FROZEN-STRATEGY-MISMATCH`) is built — never a hardcoded literal.
 >
 > No other `FROZEN-*` *resolve-path preconditions* exist; this list is
 > closed. Two further `FROZEN-*` codes — `FROZEN-NO-LOCKFILE` and
@@ -929,10 +1109,12 @@ When a package name is not in the root authority set but two transitive
 deps declare different provenances for it, the resolver must handle the
 ambiguity explicitly.
 
-> NORMATIVE: If two transitive deps declare different provenances for
-> the same package name and the root manifest has no authority over that
-> name, the resolver MUST raise `RES-PROVENANCE-CONFLICT`.  It MUST NOT
-> silently pick one provenance over the other.
+> NORMATIVE: If two transitive **URL** deps (i.e. both claims are
+> git-transport provenances — the same-transport case) declare different
+> provenances for the same package name and the root manifest has no
+> authority over that name, the resolver MUST raise
+> `RES-PROVENANCE-CONFLICT`.  It MUST NOT silently pick one provenance
+> over the other.
 
 > NORMATIVE: If two transitive deps declare the **same** provenance
 > (same transport kind, same URL/path, same ref) for the same package
@@ -944,6 +1126,19 @@ ambiguity explicitly.
 > unification layer for packages from different URLs that happen to
 > produce the same content hash.  The provenance gate fires first (on
 > the URL+ref key); content-hash dedup fires after fetch.
+
+> NOTE: **Cross-kind (named-vs-URL) divergence.**  The guarantee above is
+> scoped to two disagreeing URL-transport claims.  When a non-root-
+> authoritative name receives one **named** (index-resolved) claim and one
+> **URL** claim, whether the provenance gate evaluates the pair at all is
+> currently **implementation-divergent**: the Python reference
+> implementation's provenance gate (`_check_provenance_gate`) is invoked
+> only from the URL-item BFS path, so a named claim never enters the gate
+> and the conflict is not detected there; the Rust reference
+> implementation's gate is generic over `Item` (including `Item::Named`)
+> and does detect and raise on the pair. Reconciling this divergence is
+> tracked as issue #193 and is deliberately out of scope for this
+> section — this NOTE records current behavior, not a target.
 
 ### 10.4  Orthogonality with dev-deps
 
@@ -961,6 +1156,42 @@ The expected output shows `shared` resolved to the root's provenance
 
 Cross-reference: `spec/manifest-grammar.md` §3.4 for the `overrides {}`
 block syntax.  `spec/errors.md` for `RES-PROVENANCE-CONFLICT`.
+
+### 10.5  Provenance-gate precedence over version conflicts (Axis A interaction)
+
+> NORMATIVE: For the same-transport case scoped by §10.3 (two disagreeing
+> URL-transport claims), the provenance gate (§10.1–§10.3) MUST be
+> evaluated, and any `RES-PROVENANCE-CONFLICT` it produces MUST be raised,
+> **before** the solver reaches a version-level decision for the contested
+> package name. Concretely: a conformant resolver MUST suppress a
+> non-root-authoritative transitive provenance claim (or raise
+> `RES-PROVENANCE-CONFLICT` for two disagreeing non-root URL claims) at
+> the point the second provenance is discovered — before that provenance
+> is ever fetched, and therefore before any declared version (§3.2) it
+> might carry could enter the solver's accumulated constraint set for
+> that package name. Per §10.3's NOTE, this ordering guarantee does not
+> currently extend jointly across both reference implementations to the
+> cross-kind (named-vs-URL) case — see #193.
+
+> NORMATIVE: This ordering is load-bearing now that declared versions are
+> real (§3, Axis A): two disagreeing sources could each declare a
+> genuine, differing version for the same package name, and an
+> implementation that fetched both before gating would produce a generic
+> `SOLVE-CONFLICT` — a diagnostic regression versus the precise
+> `RES-PROVENANCE-CONFLICT` this section requires. Gating on the
+> provenance key (URL+ref, or equivalent) alone, independent of any
+> version either source carries, is what keeps this ordering correct
+> regardless of what either source declares.
+
+> NOTE: The reference implementation's BFS wave-drain loop calls
+> `_check_provenance_gate` and, on suppression, `continue`s before
+> submitting the fetch worker for the suppressed provenance (`resolver.py`)
+> — the conflicting source's manifest, and therefore any version it
+> declares, is never read.
+
+Cross-reference: `spec/errors.md` for `RES-PROVENANCE-CONFLICT` and
+`RES-VERSION-UNKNOWN-CONSTRAINED`; §3 for the declared-version mechanism
+this section's precedence protects.
 
 ---
 
@@ -1236,6 +1467,7 @@ All codes are defined in `spec/errors.md`.
 | `FROZEN-MEMBER-DEP` | Workspace member dep cannot use frozen path in single-package context (§7.1 #7) |
 | `FROZEN-MEMBER-NOT-IN-WORKSPACE` | Lockfile references member not present in workspace (§7.1 #8) |
 | `FROZEN-MEMBER-IDENTITY-DRIFT` | Member on-disk hash differs from lockfile pin (§7.1 #9) |
+| `FROZEN-EXCLUDE-NEWER-MISMATCH` | `--frozen` lockfile `exclude_newer` ≠ manifest's effective `resolution { exclude-newer }` (§7.1 #10) |
 | `FETCH-ALL-FAILED` | Every mirror candidate failed (network error or identity mismatch) (§8a) |
 | `RES-PROVENANCE-CONFLICT` | Two transitive deps declare different provenances for the same name (§10.3) |
 | `MAN-PREDICATE-MIXED-NEGATION` | Predicate mixes negated and non-negated values (manifest-grammar §6) |

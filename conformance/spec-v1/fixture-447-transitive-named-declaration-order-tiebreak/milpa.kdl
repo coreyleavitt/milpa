@@ -1,0 +1,5 @@
+name "myapp"
+kind "application"
+deps {
+    portal git=(url)"https://example.com/portal.git" ref="v1.0.0"
+}

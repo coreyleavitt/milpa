@@ -1,0 +1,23 @@
+// fixture-415: Axis A (b)/(D-A2) — a git dep's real declared version (read
+// from its own .nimble) satisfies another dep's named `>=` floor.
+//
+// Before A2: every git/url/local/tarball dep entered the solver as the fixed
+// sentinel 0.0.1, regardless of what its own .nimble declared.  A dep that is
+// ALSO a floored transitive (here: chronos requires "bearssl >= 0.2.8")
+// could not be pinned by URL — 0.0.1 < 0.2.8 => SOLVE-CONFLICT (#191, the
+// amoxtli incident this RFC is named for).
+//
+// After A2: bearssl's candidate is labeled with its real .nimble version
+// (0.5.0), which satisfies chronos's floor.  bearssl's own self-term is
+// full() (not eq(0.0.1)), so it no longer self-conflicts against its own
+// real-version candidate either (the causality fix, §3 Axis A (a)).
+//
+// chronos itself declares no version in its .nimble — it stays version-
+// unknown (the existing 0.0.1 sentinel label), proving the version-unknown
+// path is unaffected (no regression) in the very same fixture.
+name "myapp"
+kind "application"
+deps {
+    bearssl git=(url)"https://example.com/bearssl.git" ref="v1"
+    chronos git=(url)"https://example.com/chronos.git" ref="main"
+}

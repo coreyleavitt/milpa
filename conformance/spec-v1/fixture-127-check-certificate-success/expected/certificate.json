@@ -7,24 +7,24 @@
     },
     {
       "package": "alpha",
-      "version": "0.0.1"
+      "version": "1.2.0"
     },
     {
       "package": "beta",
-      "version": "0.0.1"
+      "version": "0.5.0"
     }
   ],
   "witness": [
     {
       "package": "alpha",
-      "version": "0.0.1",
-      "constraint": ">=0.0.1 & <=0.0.1",
+      "version": "1.2.0",
+      "constraint": "any version",
       "satisfied_by": "__root__"
     },
     {
       "package": "beta",
-      "version": "0.0.1",
-      "constraint": ">=0.0.1 & <=0.0.1",
+      "version": "0.5.0",
+      "constraint": "any version",
       "satisfied_by": "__root__"
     }
   ]

@@ -261,6 +261,7 @@ fn format_workspace_manifest_url_annotation_on_git_override() {
                 url: "https://github.com/example/dep-x.git".into(),
                 git_ref: "main".into(),
             },
+            version: None,
         }],
         flags: Vec::new(),
         name: None,
@@ -281,6 +282,7 @@ fn format_workspace_manifest_idempotent() {
                 url: "https://github.com/example/dep-x.git".into(),
                 git_ref: "main".into(),
             },
+            version: None,
         }],
         flags: vec![milpa_manifest::FlagDecl {
             name: "extras".into(),
@@ -395,8 +397,10 @@ fn s9b_atomicity_resolution_failure_leaves_manifest_unchanged() {
         None,  // no profile
         None,  // no prior lock
         milpa_solver::Strategy::default(),
+        false,
         &store,
         false,
+        None,
         |mut ws| {
             // Add a member whose directory does NOT exist — should fail.
             ws.members.push("ghost-does-not-exist".to_string());
@@ -443,8 +447,10 @@ fn s9b_atomicity_existing_lock_unchanged_on_failure() {
         None,
         None,
         milpa_solver::Strategy::default(),
+        false,
         &store,
         false,
+        None,
         |mut ws| {
             ws.members.push("ghost".to_string());
             ws
@@ -480,8 +486,10 @@ fn s9b_happy_path_writes_manifest_and_lock() {
         None,
         None,
         milpa_solver::Strategy::default(),
+        false,
         &store,
         false,
+        None,
         |mut ws| {
             ws.members.push("member-b".to_string());
             ws
@@ -539,8 +547,10 @@ fn s9b_workspace_typed_path_not_refused() {
         None,
         None,
         milpa_solver::Strategy::default(),
+        false,
         &store,
         false,
+        None,
         |ws| ws, // identity
     );
     match &result {

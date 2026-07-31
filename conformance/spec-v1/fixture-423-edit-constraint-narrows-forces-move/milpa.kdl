@@ -1,0 +1,14 @@
+// fixture-423 (rfc-resolution-semantics.md B6): edit-existing-
+// constraint, narrows. Prior lock has foo/bar both pinned at
+// 1.0.0 (originally unconstrained). This manifest narrows foo's
+// constraint to ">= 1.5.0" — the locked 1.0.0 no longer satisfies,
+// so foo is FORCED to move (to the newest satisfying version,
+// 2.0.0, under the default maxver strategy). bar's constraint is
+// untouched (still unconstrained) and MUST stay pinned at 1.0.0
+// even though 1.5.0/2.0.0 are available.
+name "myapp"
+kind "application"
+deps {
+    foo ">= 1.5.0"
+    bar
+}

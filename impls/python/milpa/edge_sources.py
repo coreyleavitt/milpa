@@ -44,8 +44,10 @@ from milpa.errors import (
     TNG_DEPDECL_SCHEMA_UNSUPPORTED,
     MilpaError,
 )
-from milpa.manifest import contains_unsafe_char
+from milpa.manifest import contains_unsafe_char, parse_manifest
+from milpa.nimble import parse_nimble
 from milpa.predicate import dep_passes_flag_predicates
+from milpa.version import VersionSource, parse_version
 
 if TYPE_CHECKING:
     from milpa.manifest import Override
@@ -91,6 +93,21 @@ class EdgeSourceCtx:
         Root-manifest overrides dict (name → Override); passed to MilpaKdlEdgeSource
         and NimbleEdgeSource so they can convert an overridden NamedDep into a
         URL-sentinel term correctly.
+    ref:
+        The dep declaration's git ``ref`` (branch/tag/SHA), or ``None``.  Only
+        ever populated by the git/url worker (§3 Axis A (b) step 3 — A3); local/
+        tarball/named/member deps have no ref and always leave this ``None``.
+        Consumed solely by ``declared_version_for``'s step-3 tag fallback.
+    version:
+        The dep declaration's own ``version=`` annotation (§3 Axis A (b) step 4
+        — A3b), or ``None``.  Populated by the git/url/local/tarball workers
+        from ``UrlDep.version``/``LocalDep.version``/``TarballDep.version`` —
+        for an override-redirected dep this is the OVERRIDE RULE's
+        ``version=`` (D-A3: the redirect discards the original declaration
+        entirely and builds a fresh dep from the override target, so a stale
+        annotation on the now-redirected original is never read). Named/member
+        deps never populate this (out of A3b's grammar scope). Consumed
+        solely by ``declared_version_for``'s step-4 fallback.
     """
 
     dep_path: Path | None
@@ -107,6 +124,8 @@ class EdgeSourceCtx:
     # Single-hop scope: set by the resolver for DIRECT deps only in S3;
     # the full fixpoint arrives in S4a.
     active_flags: frozenset[str] = field(default_factory=frozenset)
+    ref: str | None = None
+    version: "Version | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +260,97 @@ def _find_nimble_file(dep_path: Path, dep_name: str) -> Path | None:
         if named:
             return named[0]
         return matches[0]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# declared_version_for — Axis A (b) precedence steps 1-2 (resolution-semantics
+# RFC §3 Axis A). A candidate-labeling concern, orthogonal to EdgeSource: this
+# answers "what version does this package call itself", not "what does this
+# package require" — so it is a standalone function, not an EdgeSet field
+# (EdgeSet is the spec-owned edge type, spec/dep-decl.md §1; cramming a
+# package's own version into it would conflate two distinct concerns).
+# ---------------------------------------------------------------------------
+
+
+def declared_version_for(ctx: EdgeSourceCtx) -> "tuple[Version, VersionSource] | None":
+    """The fetched package's own declared version, source-agnostic (§3 Axis A (b)).
+
+    Precedence (steps 1-4):
+
+    1. the fetched package's ``milpa.kdl`` ``version`` field (A1's manifest parse) —
+       ``VersionSource.MANIFEST``;
+    2. else its ``.nimble`` ``version`` (A1's nimble scanner) — ``VersionSource.NIMBLE``;
+    3. else, **git deps only** (``ctx.ref`` populated), a version-shaped git
+       ``ref`` tag (``v?X.Y.Z``) — parsed via the same ``parse_version`` used
+       everywhere else (A3) — ``VersionSource.TAG``;
+    4. else, the dep declaration's own ``version=`` annotation (``ctx.version``,
+       A3b) — the user-supplied escape hatch for when the fetched artifact
+       (steps 1-2) and its ref (step 3) yield no version.  Note steps 1-3 WIN
+       over the annotation when present: the annotation only fills the gap —
+       ``VersionSource.ANNOTATION``.
+
+    Reads the SAME on-disk files ``MilpaKdlEdgeSource``/``NimbleEdgeSource`` already
+    parse for requires, but for a different question — hence a peer function, not
+    a shared field. Non-fatal on any read/parse failure or absence: falls through
+    to the next step, ultimately ``None`` (version-unknown; A2 keeps the sentinel
+    label for that case — the constrained/unconstrained partition + hard error is
+    A4, out of scope here).
+
+    Returns ``(version, source)`` as one pair — never merged into a sum type at
+    the STORAGE boundary (A5, §3 Axis A: value and source stay two sibling
+    fields on the candidate/lockfile record); paired here only so a single
+    ``declared_version_for`` call yields both facts without a second,
+    potentially file-re-reading, lookup (mirrors ``_candidate_label``'s
+    existing ``(label, version_unknown)`` pairing).
+
+    Only meaningful for git/url/local/tarball/member deps. Named/index deps get
+    their real version from the index directly (``IndexVersion.version``) and
+    never call this.
+    """
+    if ctx.dep_path is not None:
+        if ctx.has_milpa_kdl:
+            kdl_path = ctx.dep_path / "milpa.kdl"
+            try:
+                text = kdl_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                text = None
+            if text is not None:
+                try:
+                    manifest = parse_manifest(text)
+                except MilpaError:
+                    manifest = None
+                if manifest is not None and manifest.version is not None:
+                    return manifest.version, VersionSource.MANIFEST
+
+        nimble_path = _find_nimble_file(ctx.dep_path, ctx.dep_name)
+        if nimble_path is not None:
+            try:
+                text = nimble_path.read_text(encoding="utf-8")
+            except OSError:
+                text = None
+            if text is not None:
+                nm = parse_nimble(text)
+                if nm.version is not None:
+                    return nm.version, VersionSource.NIMBLE
+
+    # Step 3 (A3): git tag-derived fallback.  ``ctx.ref`` is populated only by
+    # the git/url worker — local/tarball/named/member contexts leave it None,
+    # so this step is a no-op for them.  A branch name, bare SHA, or ``main``
+    # simply fails ``parse_version``'s strict semver grammar and falls through
+    # to version-unknown (A4, out of scope) — no separate "is this a tag"
+    # check is needed beyond the version shape itself.
+    if ctx.ref is not None:
+        tag_version = parse_version(ctx.ref)
+        if tag_version is not None:
+            return tag_version, VersionSource.TAG
+
+    # Step 4 (A3b): the dep declaration's ``version=`` annotation.  Only
+    # reached when steps 1-3 all missed — steps 1-3 WIN over the annotation
+    # when present (this is a gap-filler, not an override).
+    if ctx.version is not None:
+        return ctx.version, VersionSource.ANNOTATION
+
     return None
 
 
@@ -614,7 +724,6 @@ def resolve_edges(
 def edgeset_to_terms(
     es: EdgeSet,
     overrides_by_name: dict[str, "Override"],
-    url_dep_version: "Version",
 ) -> tuple[list["Term"], list[str], dict[str, "list[tuple[object, ...]]"]]:
     """Convert an ``EdgeSet`` to the solver's ``(dep_terms, requires_names, requires_predicates)`` tuple.
 
@@ -624,7 +733,16 @@ def edgeset_to_terms(
 
     NORMATIVE: applies the same override-coercion as the main BFS loop —
     a named dep whose name is in ``overrides_by_name`` is treated as a URL
-    dep at the sentinel version.
+    dep.
+
+    Axis A (a) (resolution-semantics RFC §3, D-A2): a URL/local/tarball
+    require's own term — and an overridden named require's term — is always
+    ``VersionSet.full()``, never ``eq(sentinel)``.  Such a dep has exactly one
+    real candidate (materialised elsewhere), so ``full()`` is harmless and
+    fixes the causality hole of a pre-fetch term racing the post-fetch
+    candidate label (which now carries the real declared version when one is
+    parseable — ``declared_version_for``).  There is therefore no longer a
+    "sentinel version" parameter here; the self-term does not need one.
 
     Parameters
     ----------
@@ -632,9 +750,6 @@ def edgeset_to_terms(
         The EdgeSet from any EdgeSource.
     overrides_by_name:
         Root-manifest overrides dict (name → Override).
-    url_dep_version:
-        The sentinel version used for URL/local/member/overridden-named deps
-        (``_URL_DEP_VERSION`` from resolver.py).
 
     Returns
     -------
@@ -669,12 +784,12 @@ def edgeset_to_terms(
 
     for entry in es.requires:
         if isinstance(entry, UrlRequire):
-            # URL requires → sentinel version.
+            # URL requires → full() self-term (Axis A (a), D-A2).
             dep_name = _name_from_url(entry.url)
             if dep_name is None:
                 continue
             if dep_name not in seen_dep_names:
-                dep_terms.append(Term.require(dep_name, VersionSet.eq(url_dep_version)))
+                dep_terms.append(Term.require(dep_name, VersionSet.full()))
                 requires_names.append(dep_name)
                 seen_dep_names.add(dep_name)
             if entry.predicates:
@@ -692,9 +807,9 @@ def edgeset_to_terms(
             _svar = _entry_dk.solver_var()  # "bar" or "ns1::bar"
             if _svar not in seen_dep_names:
                 if entry.name in overrides_by_name:
-                    # Named dep with override → URL at sentinel.
+                    # Named dep with override → URL-like full() self-term (D-A2).
                     dep_terms.append(
-                        Term.require(_svar, VersionSet.eq(url_dep_version))
+                        Term.require(_svar, VersionSet.full())
                     )
                 else:
                     # Parse constraint_str → VersionSet.

@@ -511,6 +511,19 @@ impl Target for MilpaTarget {
                 // file) for conditional-dep predicate filtering (§6).
                 let profile = fixture_profile(&fx.dir);
 
+                // resolution-semantics RFC §3 Axis C (C1) / Axis W (W1): a
+                // `resolve` fixture MAY carry a `--strategy <value>` cmd-file
+                // token, selecting maxver/minver/semver over the index. This is
+                // only the CLI-tier slot of the effective-strategy precedence
+                // (cli > manifest `resolution { strategy }` > default; R9
+                // dropped the lockfile-prior tier — it is diagnostic/
+                // frozen-parity only, never a live input) — computed
+                // per-branch below (workspace vs. package), once the
+                // manifest is in scope, mirroring `resolve_effective_strategy`
+                // (milpa-cli/main.rs) exactly. See `fixture_strategy`'s doc
+                // comment for the W1 gap this closed.
+                let cli_strategy = fixture_strategy(fx);
+
                 // §8 prior-lockfile pin reuse: a `resolve` fixture MAY ship a
                 // milpa.lock input (conformance-fixtures §2.9 / resolver-semantics
                 // §8). Load it (gracefully — absent/unparseable ⇒ None, a soft
@@ -547,6 +560,30 @@ impl Target for MilpaTarget {
                             Some(ws_doc.entry_trust_policy.clone()),
                             ws_doc.entry_trust_policy_explicit,
                         )?;
+                        // D6 (resolution-semantics RFC §3 Axis D): the EFFECTIVE
+                        // exclude-newer bound — cmd-token > the workspace root's own
+                        // `resolution { exclude-newer }` > None. See the free
+                        // function comment above `Cmd::Resolve` match arm for why
+                        // this is inlined rather than a named helper.
+                        let ws_exclude_newer = fixture_exclude_newer_cli(fx)
+                            .or_else(|| ws_doc.resolution.and_then(|r| r.exclude_newer));
+                        // W1/R9 (resolution-semantics RFC §3 Axis W / Axis C):
+                        // the EFFECTIVE strategy for this workspace resolve —
+                        // cli-token > the workspace root's own `resolution {
+                        // strategy }` > default (R9 dropped the lockfile-prior
+                        // tier — diagnostic/frozen-parity only, never a live
+                        // input). Mirrors `resolve_effective_strategy`
+                        // (milpa-cli/main.rs) exactly; see the free-function
+                        // comment above `Cmd::Resolve` for why this is inlined
+                        // rather than a named helper. `ws_strategy_explicit`
+                        // mirrors `strategy_is_explicit` — feeds the B2
+                        // lock-preference bypass gate (never the
+                        // lockfile-recorded strategy).
+                        let ws_strategy_explicit =
+                            cli_strategy.is_some() || ws_doc.resolution.and_then(|r| r.strategy).is_some();
+                        let ws_strategy = cli_strategy
+                            .or_else(|| ws_doc.resolution.and_then(|r| r.strategy))
+                            .unwrap_or_default();
                         let store = milpa_core::CaStore::new(&scratch.cas_root);
                         return match milpa_core::resolve_workspace_with_features(
                             &loaded,
@@ -554,7 +591,8 @@ impl Target for MilpaTarget {
                             &fetcher,
                             profile.as_ref(),
                             prior_lock.as_ref(),
-                            milpa_core::Strategy::default(),
+                            ws_strategy,
+                            ws_strategy_explicit,
                             &scratch.deps_dir,
                             ws_require_attested,
                             &store,
@@ -562,6 +600,7 @@ impl Target for MilpaTarget {
                             ws_cli_no_default,
                             ws_cli_all_features,
                             entry_trust.as_ref(),
+                            ws_exclude_newer,
                         ) {
                             Ok(graph) => {
                                 // B-nimcfg: _deps/ view rebuilt internally by resolve_workspace
@@ -570,7 +609,7 @@ impl Target for MilpaTarget {
                                 let ws_flag_defines = milpa_core::build_flag_defines(&graph, &scratch.deps_dir);
                                 Ok(Produced::WorkspaceOutputs {
                                     lock_text: milpa_core::format_lockfile(&milpa_core::from_graph(
-                                        &graph, "maxver",
+                                        &graph, ws_strategy.as_str(), ws_exclude_newer,
                                     )),
                                     member_nimcfgs: milpa_core::format_workspace_nimcfgs(
                                         &loaded, &graph, Some(&ws_flag_defines),
@@ -614,6 +653,30 @@ impl Target for MilpaTarget {
                     manifest.entry_trust_policy_explicit,
                 )?;
 
+                // D6 (resolution-semantics RFC §3 Axis D): the EFFECTIVE
+                // exclude-newer bound — cmd-token > the manifest's own
+                // `resolution { exclude-newer }` > None. See the comment above
+                // the `Cmd::Resolve` match arm for why this is inlined rather
+                // than a named helper.
+                let exclude_newer = fixture_exclude_newer_cli(fx)
+                    .or_else(|| manifest.resolution.and_then(|r| r.exclude_newer));
+
+                // W1/R9 (resolution-semantics RFC §3 Axis W / Axis C): the
+                // EFFECTIVE strategy for this resolve — cli-token > the
+                // manifest's own `resolution { strategy }` > default (R9
+                // dropped the lockfile-prior tier — diagnostic/frozen-parity
+                // only, never a live input). Mirrors `resolve_effective_strategy`
+                // (milpa-cli/main.rs) exactly; see the free-function comment
+                // above the `Cmd::Resolve` match arm for why this is inlined
+                // rather than a named helper. `strategy_explicit` mirrors
+                // `strategy_is_explicit` — feeds the B2 lock-preference bypass
+                // gate (never the lockfile-recorded strategy).
+                let strategy_explicit =
+                    cli_strategy.is_some() || manifest.resolution.and_then(|r| r.strategy).is_some();
+                let strategy = cli_strategy
+                    .or_else(|| manifest.resolution.and_then(|r| r.strategy))
+                    .unwrap_or_default();
+
                 let store = milpa_core::CaStore::new(&scratch.cas_root);
                 match milpa_core::resolve_with_features(
                     &manifest,
@@ -621,7 +684,8 @@ impl Target for MilpaTarget {
                     &fetcher,
                     profile.as_ref(),
                     prior_lock.as_ref(),
-                    milpa_core::Strategy::default(),
+                    strategy,
+                    strategy_explicit,
                     &scratch.deps_dir,
                     dep_decl_store,
                     require_attested_metadata,
@@ -630,14 +694,18 @@ impl Target for MilpaTarget {
                     cli_no_default,
                     cli_all_features,
                     entry_trust.as_ref(),
+                    exclude_newer,
                 ) {
                     // S9: emit the byte-diff outputs. `_deps_structure.txt` is read
                     // by the harness from the materialized (symlinked) `_deps/`.
                     Ok(graph) => {
                         // B-nimcfg: _deps/ view rebuilt internally by resolve
                         // (alias symlinks + stale removal). No external call needed.
-                        let lock_text =
-                            milpa_core::format_lockfile(&milpa_core::from_graph(&graph, "maxver"));
+                        let lock_text = milpa_core::format_lockfile(&milpa_core::from_graph(
+                            &graph,
+                            strategy.as_str(),
+                            exclude_newer,
+                        ));
                         // §7.5 S6: compute flag_defines from dep manifests (SSOT).
                         let flag_defines = milpa_core::build_flag_defines(&graph, &scratch.deps_dir);
                         let nimcfg_text =
@@ -709,9 +777,18 @@ impl Target for MilpaTarget {
                         Ok(graph) => {
                             // S11 §3.8: build flag_defines (SSOT) for unified -d: in per-member nim.cfg.
                             let ws_flag_defines = milpa_core::build_flag_defines(&graph, &scratch.deps_dir);
+                            // C4 (resolution-semantics RFC §3 Axis C): the frozen path
+                            // reconstructs from the lockfile, it never decides a
+                            // strategy — re-emit the INPUT lockfile's own recorded
+                            // `strategy` string verbatim, not a hardcoded "maxver"
+                            // literal (masked until now: every pre-C4 frozen fixture
+                            // happened to be locked under maxver).
                             Ok(Produced::WorkspaceOutputs {
+                                // D5: the frozen path never re-decides exclude_newer either
+                                // — re-emit the INPUT lockfile's own recorded value verbatim
+                                // (same rationale as `strategy` just above).
                                 lock_text: milpa_core::format_lockfile(&milpa_core::from_graph(
-                                    &graph, "maxver",
+                                    &graph, &lock.strategy, lock.exclude_newer,
                                 )),
                                 member_nimcfgs: milpa_core::format_workspace_nimcfgs(&loaded, &graph, Some(&ws_flag_defines)),
                             })
@@ -744,8 +821,16 @@ impl Target for MilpaTarget {
                 match milpa_core::Milpa.resolve_frozen(&manifest, &lock, &store, &scratch.deps_dir)
                 {
                     Ok(graph) => {
-                        let lock_text =
-                            milpa_core::format_lockfile(&milpa_core::from_graph(&graph, "maxver"));
+                        // C4: re-emit the INPUT lockfile's own recorded strategy
+                        // (see the workspace-frozen arm above for the full rationale).
+                        // D5: re-emit the INPUT lockfile's own recorded `exclude_newer`
+                        // verbatim (frozen never re-decides it — see the workspace-frozen
+                        // arm above for the full rationale).
+                        let lock_text = milpa_core::format_lockfile(&milpa_core::from_graph(
+                            &graph,
+                            &lock.strategy,
+                            lock.exclude_newer,
+                        ));
                         // §7.5 S6: compute flag_defines from dep manifests (SSOT).
                         let flag_defines = milpa_core::build_flag_defines(&graph, &scratch.deps_dir);
                         let nimcfg_text =
@@ -832,6 +917,7 @@ impl Target for MilpaTarget {
                             profile.as_ref(),
                             None,
                             milpa_core::Strategy::default(),
+                            false, // strategy_explicit: default-filled, no CLI/manifest override
                             &scratch.deps_dir,
                             false, // verify pre-phase: no attestation flag
                             &store,
@@ -839,6 +925,8 @@ impl Target for MilpaTarget {
                             verify_cli_no_default,
                             verify_cli_all_features,
                             // P3a: no verify-kind fixture drives entry-trust; gate disabled.
+                            None,
+                            // D2: no verify-kind fixture drives exclude-newer either.
                             None,
                         ).map_err(|e| e.code().to_string())
                     }
@@ -850,6 +938,7 @@ impl Target for MilpaTarget {
                             profile.as_ref(),
                             None,
                             milpa_core::Strategy::default(),
+                            false, // strategy_explicit: default-filled, no CLI/manifest override
                             &scratch.deps_dir,
                             dep_decl_store,
                             false,
@@ -2362,6 +2451,68 @@ fn fixture_entry_trust_config(
 /// `Path::join` silently discard `fx.dir`, and `..` components could escape the
 /// fixture sandbox. Either condition is a fixture-authoring error; panic with a
 /// clear message rather than silently reading from an unintended location.
+/// Resolve a fixture's `--strategy <value>` cmd-file token (resolution-
+/// semantics RFC §3 Axis C, C1/C4) onto `Option<milpa_core::Strategy>`.
+/// `None` ⇒ no cmd-token override present (W1, §3 Axis W — mirrors
+/// `fixture_exclude_newer_cli`'s own `Option` return exactly): the CLI-tier
+/// slot of the 3-tier effective-strategy precedence computed inline at each
+/// `Cmd::Resolve` call site below (cli-token > manifest `resolution {
+/// strategy }` > prior-lock `strategy` > default), NOT a hardcoded MAXVER
+/// short-circuit. The four wire strings are the same pinned, cross-impl,
+/// lockfile-serialized literal the CLI's own `parse_strategy`/
+/// `resolve_effective_strategy` (main.rs) match on — duplicated here
+/// deliberately (fixture.rs stays free of milpa input parsing; this is the
+/// `Target` side of that boundary).
+///
+/// **W1 fixed a genuine, pre-existing gap**: before this, `None` collapsed
+/// straight to `Strategy::default()` here, so a `resolve` fixture relying on
+/// a manifest-declared `resolution { strategy }` (with no cmd-file
+/// `--strategy` token) would silently resolve under MAXVER in this in-process
+/// runner even though the real CLI honors the manifest via
+/// `resolve_effective_strategy`. No existing corpus fixture before W1
+/// exercised the manifest-default-application path (every C1-C4 strategy
+/// fixture used an explicit cmd-file token), so this drifted unnoticed —
+/// the exact "harness lags the CLI wiring" pattern D6 had already fixed for
+/// the sibling `exclude-newer` axis (see `fixture_exclude_newer_cli` below).
+fn fixture_strategy(fx: &Fixture) -> Option<milpa_core::Strategy> {
+    match fx.strategy.as_deref() {
+        None => None,
+        Some("maxver") => Some(milpa_core::Strategy::Maxver),
+        Some("minver") => Some(milpa_core::Strategy::Minver),
+        Some("semver") => Some(milpa_core::Strategy::Semver),
+        Some("lowest-direct") => Some(milpa_core::Strategy::LowestDirect),
+        Some(other) => panic!("fixture cmd: unknown --strategy value {other:?}"),
+    }
+}
+
+/// Resolve a fixture's `--exclude-newer <ts>` cmd-file token (resolution-
+/// semantics RFC §3 Axis D, D6) onto `milpa_types::Timestamp`. `None` ⇒ no
+/// cmd-token override present — mirrors `fixture_strategy`'s split between
+/// this module (parsing the wire value) and `fixture.rs` (leaving the raw
+/// string alone).
+fn fixture_exclude_newer_cli(fx: &Fixture) -> Option<milpa_types::Timestamp> {
+    match fx.exclude_newer.as_deref() {
+        None => None,
+        Some(raw) => match milpa_types::parse_iso8601_timestamp(raw) {
+            Some(ts) => Some(ts),
+            None => panic!("fixture cmd: malformed --exclude-newer value {raw:?}"),
+        },
+    }
+}
+
+// The EFFECTIVE exclude-newer bound for a live `resolve` fixture is
+// `fixture_exclude_newer_cli(fx).or_else(|| manifest.resolution.and_then(|r|
+// r.exclude_newer))` — cmd-token > the manifest's own `resolution {
+// exclude-newer }` > `None`. Mirrors the CLI's `fetch`/`lock` 2-tier
+// `resolve_effective_exclude_newer(cli, resolution, prior: None)`
+// (`milpa-cli/src/main.rs`) — that function lives in the `milpa-cli` binary
+// crate (not a library `milpa-conformance` can depend on), so the one-line
+// precedence is inlined at each `Cmd::Resolve` call site below rather than
+// reached across the crate boundary (same rationale as `fixture_strategy`
+// above) or given its own wrapper (naming the manifest/workspace `Resolution`
+// field's type here would require adding `milpa-manifest` as a direct
+// dependency just for this one call).
+
 fn fixture_project_root(fx: &Fixture) -> PathBuf {
     match std::fs::read_to_string(fx.dir.join("project-dir")) {
         Ok(s) if !s.trim().is_empty() => {
@@ -3228,6 +3379,8 @@ mod tests {
             dir: tmp.path().to_path_buf(),
             cmd: Cmd::Resolve,
             no_index: false,
+            strategy: None,
+            exclude_newer: None,
             expected: Expected::Success,
         };
         match MilpaTarget.execute(&fx, &scratch) {
@@ -3250,6 +3403,8 @@ mod tests {
             dir: tmp.path().to_path_buf(),
             cmd: Cmd::Resolve,
             no_index: false,
+            strategy: None,
+            exclude_newer: None,
             expected: Expected::Error("MAN-NAME-MISSING".into()),
         };
         assert_eq!(
@@ -3279,6 +3434,8 @@ mod tests {
             dir: tmp.path().to_path_buf(),
             cmd: Cmd::Frozen,
             no_index: false,
+            strategy: None,
+            exclude_newer: None,
             expected: Expected::Success,
         };
         match MilpaTarget.execute(&fx, &scratch) {
@@ -3307,6 +3464,8 @@ mod tests {
             dir: tmp.path().to_path_buf(),
             cmd: Cmd::Frozen,
             no_index: false,
+            strategy: None,
+            exclude_newer: None,
             expected: Expected::Error("FROZEN-STRATEGY-MISMATCH".into()),
         };
         assert_eq!(
@@ -3327,6 +3486,8 @@ mod tests {
             dir,
             cmd: Cmd::Resolve,
             no_index,
+            strategy: None,
+            exclude_newer: None,
             expected: Expected::Success,
         };
 
@@ -3392,6 +3553,8 @@ mod tests {
             dir: tmp.path().to_path_buf(),
             cmd: Cmd::Frozen,
             no_index: false,
+            strategy: None,
+            exclude_newer: None,
             expected: Expected::Success,
         };
         match MilpaTarget.execute(&fx, &scratch) {

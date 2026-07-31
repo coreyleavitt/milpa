@@ -1,0 +1,13 @@
+// fixture-422 (rfc-resolution-semantics.md B6): the amoxtli #192
+// shape at CLI granularity. Prior lock has crisol/bearssl/httputils
+// all pinned at 1.0.0. This manifest bumps ONLY crisol's constraint
+// (">= 2.0.0"), forcing it to move; bearssl/httputils are untouched
+// and MUST stay pinned at 1.0.0 even though 2.0.0 is available and
+// maxver (the default strategy) would pick it in a fresh resolve.
+name "myapp"
+kind "application"
+deps {
+    crisol ">= 2.0.0"
+    bearssl
+    httputils
+}

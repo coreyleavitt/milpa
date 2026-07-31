@@ -1,0 +1,9 @@
+// resolution-semantics RFC (rfc-resolution-semantics.md) §3 Axis C, C1:
+// a genuine 3-candidate index dep, so maxver/minver/semver select DIFFERENT
+// versions from the SAME manifest + index. The `cmd` file (--strategy) is
+// the only thing that varies across fixture-427/428/429.
+name "myapp"
+kind "application"
+deps {
+    widget ">= 1.0.0"
+}

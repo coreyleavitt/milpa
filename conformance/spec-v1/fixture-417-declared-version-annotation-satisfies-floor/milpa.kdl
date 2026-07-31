@@ -1,0 +1,21 @@
+// fixture-417: Axis A (b) step 4 (A3b) — a git dep's `version=` annotation
+// satisfies another dep's named `>=` floor.
+//
+// bearssl is pinned to branch "main" (not version-shaped — steps 1-2-3 all
+// miss: its .nimble carries no `version` field, and "main" is not a
+// version-shaped tag), so `declared_version_for` falls all the way to step
+// 4: the dep declaration's own `version="0.5.0"` annotation.  0.5.0
+// satisfies chronos's `bearssl >= 0.2.8` floor (0.0.1, the pre-Axis-A
+// sentinel, would not have) — this is the amoxtli incident (#191),
+// minimized: the user supplies the one fact the fetched artifact lacked.
+//
+// chronos itself declares no version in its .nimble and carries no
+// annotation — it stays version-unknown (the existing 0.0.1 sentinel
+// label), proving the version-unknown path is unaffected (no regression)
+// in the very same fixture.
+name "myapp"
+kind "application"
+deps {
+    bearssl git=(url)"https://example.com/bearssl.git" ref="main" version="0.5.0"
+    chronos git=(url)"https://example.com/chronos.git" ref="main"
+}

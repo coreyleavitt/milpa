@@ -364,6 +364,18 @@ Each subdirectory under `mocked-fetches/<key>/` MUST contain:
 > into `dest`, so the distinction has no effect on the hash: the `.nimble` is
 > hashed exactly as if it had been placed inside `content/` at the tree root.
 
+**`committer_date`** (optional, D6 — resolution-semantics RFC §3 Axis D / §6 D-D1/D-D2)
+
+> NORMATIVE: If present, a plain text file containing a single ISO 8601
+> timestamp (the same grammar as `index.kdl`'s `published_at`), returned as
+> `GitReceipt.committer_date` (Python) / `Receipt.committer_date` (Rust) —
+> the mocked-transport analogue of the real `GitFetcher`'s resolved-commit
+> committer-date read (D4). This lets a fixture drive `exclude_newer`
+> validation (`RES-EXCLUDE-NEWER-PIN`) against a git/url dep without a real
+> git repository. If absent, `committer_date` is `None` — the pre-D6
+> default, under which `exclude_newer` validation is a no-op for that dep
+> (unchanged from every pre-D6 fixture).
+
 #### 2.3.3  Mocked ref-resolution (default-branch discovery)
 
 > NORMATIVE: When `MILPA_MOCKED_FETCHES` is set, **ref-resolution** (the
@@ -565,11 +577,12 @@ the CAS-admission and symlink-creation steps defined in `spec/identity.md`
 ### 2.7  `cmd` — entry-point selector (optional)
 
 > NORMATIVE: If `cmd` is present, its **first whitespace-separated token** MUST
-> be one of the following selectors. The `resolve` / `parse-lockfile` / `frozen`
-> selectors take no further tokens. The mutation selectors (`add` / `remove` /
-> `update`) and the liveness selectors (`show` / `--version`) take the argv
-> tokens defined below. The `check-certificate` selector takes an optional
-> verb token (`fetch` or `lock`; default `fetch`).
+> be one of the following selectors. The `parse-lockfile` / `frozen` selectors
+> take no further tokens. `resolve` takes no further tokens **except** the
+> optional `--strategy <value>` pair (§2.7.4). The mutation selectors (`add` /
+> `remove` / `update`) and the liveness selectors (`show` / `--version`) take
+> the argv tokens defined below. The `check-certificate` selector takes an
+> optional verb token (`fetch` or `lock`; default `fetch`).
 >
 > - `resolve` — parse `milpa.kdl` (and optionally `index.kdl`) and resolve the
 >   dep graph against mocked-fetches. This is the default when `cmd` is absent.
@@ -748,6 +761,75 @@ the CAS-admission and symlink-creation steps defined in `spec/identity.md`
 > assert the certificate even if `--certificate` were passed; conversely, a
 > `check-certificate` fixture MUST pass `--certificate` and MUST assert the
 > JSON. The two fixture types are orthogonal.
+
+#### 2.7.4  `--strategy <value>` token (resolution-semantics RFC §3 Axis C)
+
+> NORMATIVE: A `cmd` file whose selector is `resolve` (including the implicit
+> default when `cmd` is absent) MAY carry a trailing `--strategy <value>`
+> token pair, e.g. `resolve --strategy minver`. `<value>` MUST be one of the
+> four wire strings `maxver` / `minver` / `semver` / `lowest-direct`. When
+> present, the runner MUST invoke the resolve path with that strategy in
+> place of the default; when absent, the runner MUST use the
+> implementation's default strategy (`maxver`), unchanged from every
+> pre-existing fixture. `check-certificate` fixtures (§2.7.3) share this
+> token on the same `cmd` line (the verb token and `--strategy` pair are
+> independent and MAY both be present); no other `cmd` selector recognizes
+> `--strategy` — a `frozen`/`parse-lockfile`/mutation/liveness fixture that
+> needs a non-default strategy expresses it via the manifest's own
+> `resolution { strategy }` (Axis C, C3) instead.
+
+> NOTE: This is the only per-fixture mechanism for selecting `minver`/`semver`
+> over the index end-to-end (`resolve_named_all` already returns the full
+> candidate list; `--strategy` picks which candidate the picker settles on).
+> See `conformance/spec-v1/fixture-427-strategy-minver-over-index`,
+> `fixture-428-strategy-semver-over-index`, and
+> `fixture-429-strategy-maxver-over-index` for the canonical three-candidate
+> (spanning two majors) example that makes all three strategies disagree in
+> the same shared `index.kdl` shape. `fixture-430-strategy-lowest-direct-over-index`
+> (Axis C, C4) is the `lowest-direct` counterpart: a root-direct package and a
+> purely transitive package (discovered only via the root-direct package's
+> own `.nimble` `requires` line), each with three candidates, resolve to
+> OPPOSITE picks (lowest vs. highest) under the same configured strategy —
+> proving the effective-strategy precompute is keyed on root-directness, not
+> the strategy value alone.
+
+> NOTE (C4): a `frozen` fixture's manifest MAY declare a non-default
+> `resolution { strategy }` (see §2.9's manifest/lockfile-pairing convention)
+> to exercise `FROZEN-STRATEGY-MISMATCH`'s baseline against a non-`maxver`
+> project — see `fixture-431-frozen-non-default-strategy`. Separately, a
+> `resolve` fixture MAY carry an EXPLICIT `--strategy <value>` token whose
+> value equals the fixture's prior `milpa.lock` `strategy` field, to prove
+> the lock-preference bypass gates on **value-divergence** from the locked
+> strategy, never on CLI flag *presence* — see
+> `fixture-432-strategy-maxver-explicit-on-maxver-lock-is-noop`.
+
+#### 2.7.5  `--exclude-newer <ts>` token (resolution-semantics RFC §3 Axis D)
+
+> NORMATIVE: A `cmd` file whose selector is `resolve` (including the implicit
+> default when `cmd` is absent) MAY carry a trailing `--exclude-newer <ts>`
+> token pair, e.g. `resolve --exclude-newer 2026-06-01T00:00:00Z`. `<ts>` MUST
+> be a valid ISO 8601 timestamp (the same grammar as `index.kdl`'s
+> `published_at` and the manifest's `resolution { exclude-newer }`). This
+> token and `--strategy` (§2.7.4) are independent and MAY both be present on
+> the same `cmd` line. When present, the runner MUST compute the EFFECTIVE
+> exclude-newer bound as this token's value overriding the manifest's own
+> `resolution { exclude-newer }` (cmd-token > manifest > absent — the same
+> 2-tier precedence the CLI's `fetch`/`lock` verbs use, resolver-semantics
+> §3 Axis D "Verb reach"; no third `--locked`-only prior-lockfile tier
+> applies to this in-corpus token), and thread that value into the live
+> resolve. When absent, the effective bound is the manifest's own
+> `resolution { exclude-newer }` value, or unset if the manifest declares
+> none — unchanged from every pre-D6 fixture. No other `cmd` selector
+> recognizes `--exclude-newer`; a `frozen` fixture expresses its bound via
+> the manifest's own `resolution { exclude-newer }` (Axis D, D1) and the
+> paired `milpa.lock`'s top-level `exclude_newer` field instead (§2.9's
+> manifest/lockfile-pairing convention, mirroring `--strategy`'s own note).
+
+> NOTE: The reconstructed `expected/milpa.lock` byte-diff for a `resolve`
+> fixture MUST reflect this SAME effective value (the top-level
+> `exclude_newer` node, §5 lockfile schema) — a fixture using this token to
+> drive selection/validation also, structurally, proves D5's "recorded in
+> the lockfile" behavior.
 
 ### 2.8  `env` — target-profile overrides (optional)
 

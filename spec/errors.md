@@ -60,6 +60,14 @@ A `_deps/<name>` symlink resolves to a CAS store entry but reading that entry ra
 
 ## CLI
 
+### `CLI-EXCLUDE-NEWER-INVALID`
+
+`--exclude-newer <ts>` (fetch/lock only) was supplied with a value that is not a parseable ISO 8601 timestamp.
+
+**Triggered:** The CLI layer parses the `--exclude-newer` value with the shared timestamp parser (the same one the manifest's `resolution { exclude-newer }` node uses); a malformed value raises this CODE rather than silently falling back to "unspecified." Distinct from `MAN-RESOLUTION-EXCLUDE-NEWER-INVALID`, which is a manifest-parse-time error over the committed `milpa.kdl` — this one is a CLI-argument-time error over the `--exclude-newer` flag itself. Exit code 1 (diagnosed failure, single `milpa-error:` line on stderr). The flag is registered on `fetch`/`lock` only (resolution-semantics RFC §3 Axis D "Verb reach"): a CLI time-bound override is a fetch/lock-time CI concern, so `add`/`update`/`remove` do not accept it at all and always read the manifest's committed bound.
+
+**Fix:** Pass an ISO 8601 timestamp (e.g. `2026-01-01T00:00:00Z`) to `--exclude-newer`, or omit the flag to defer to the manifest's `resolution { exclude-newer }` (or no bound at all).
+
 ### `CLI-FEATURE-FLAGS-CONFLICT`
 
 `--all-features` and `--no-default-features` are mutually exclusive and were both supplied on the same invocation.
@@ -67,6 +75,14 @@ A `_deps/<name>` symlink resolves to a CAS store entry but reading that entry ra
 **Triggered:** The CLI layer detects that `--all-features` and `--no-default-features` are both active (whether via command-line flags or the equivalent env vars `MILPA_ALL_FEATURES` + `MILPA_NO_DEFAULT_FEATURES` in the conformance harness). `--all-features` activates every declared root flag; `--no-default-features` suppresses all defaults and starts from an empty baseline — the two intents are contradictory. Cargo rejects this combination and milpa follows the same policy. Exit code 1 (diagnosed failure, single `milpa-error:` line on stderr).
 
 **Fix:** Pass at most one of `--all-features` or `--no-default-features` per invocation.
+
+### `CLI-LOCKED-UPGRADE-CONFLICT`
+
+`--locked` and `--upgrade` were both supplied on the same `fetch`/`lock` invocation.
+
+**Triggered:** The CLI layer detects that `--locked` and `--upgrade` (resolution-semantics RFC §3 Axis B) are both active. `--locked` asserts the resolve deviates from the committed `milpa.lock` in no way at all; `--upgrade` exists precisely to force a deviation (globally, or for the named deps) by opting those packages out of the minimal-change lock-preference. The two intents are contradictory. Exit code 1 (diagnosed failure, single `milpa-error:` line on stderr).
+
+**Fix:** Pass at most one of `--locked` or `--upgrade` per invocation.
 
 ### `CLI-SOURCE-SPEC-INVALID`
 
@@ -229,6 +245,14 @@ The CLI feature selection (``--features``, ``--no-default-features``, ``--all-fe
 A manifest NamedDep's version constraint is no longer satisfied by the locked version.
 
 **Triggered:** _check_manifest_alignment checks VersionSet.from_constraint against the locked version and finds it fails.
+
+### `FROZEN-EXCLUDE-NEWER-MISMATCH`
+
+The manifest's effective `resolution { exclude-newer }` time-bound (default: unset) differs from what the lockfile recorded.
+
+**Triggered:** the frozen path's exclude-newer check compares the manifest-sourced baseline (built the same way as `FROZEN-STRATEGY-MISMATCH`'s baseline, C3b) against `lockfile.exclude_newer` and finds them unequal.
+
+**Fix:** re-run `milpa fetch` with the desired `exclude-newer` (or update `resolution { exclude-newer }` in `milpa.kdl`) to regenerate the lockfile.
 
 ### `FROZEN-IDENTITY-NOT-IN-STORE`
 
@@ -649,6 +673,14 @@ Unknown property on a dep declaration.
 
 **Triggered:** A dep child node carries a property not in the dep-form's allowed set.
 
+### `MAN-DEP-VERSION-INVALID`
+
+The `version=` annotation on a dep declaration or an `overrides { pkg … }` rule is not a valid strict semver (`x.y.z`, optional pre-release/build suffix).
+
+**Triggered:** A `git=`/`url=`/`local=`/`tarball=` dep declaration, or a `pkg` override rule, carries a `version=` property whose value is missing, is not a string, or does not parse as a semver version (§3 Axis A (b) step 4 — resolution-semantics RFC). `version=` is a user-supplied declared-version annotation, filling the gap when the fetched package's own manifest (`milpa.kdl`/`.nimble`) and its git tag (steps 1–3) yield no version; it is milpa's own grammar (not a third-party format), so a malformed value is a hard parse error rather than a fall-through to version-unknown. Valid at both attachment sites (D-A3): a dep declaration (root-declared deps) and an `overrides { pkg … version= }` rule (transitive deps with no user-owned declaration) — they compose by re-derivation, never by conflict.
+
+**Fix:** Declare `version="x.y.z"` with a valid three-component semver value on the dep node or the `pkg` override rule, or omit the property entirely if no annotation is needed.
+
 ### `MAN-FILE-NOT-FOUND`
 
 The manifest file path does not exist.
@@ -900,6 +932,14 @@ Unknown property on a pkg override.
 
 **Triggered:** A pkg override has a property not in {git, ref, local}.
 
+### `MAN-PACKAGE-VERSION-INVALID`
+
+The top-level package `version` value is not a valid strict semver (`x.y.z`, optional pre-release/build suffix).
+
+**Triggered:** The manifest parser encounters a top-level `version` node whose argument is missing, is not a string, or does not parse as a semver version. `milpa.kdl` is milpa's own strict manifest format, so a malformed declared version is a hard parse error — unlike the `.nimble` compat scanner, which treats a malformed `version` as version-unknown rather than raising.
+
+**Fix:** Declare `version "x.y.z"` with a valid three-component semver value, or omit the node entirely if the package has no declared version yet.
+
 ### `MAN-PREDICATE-CHILD-ARG-TYPE`
 
 Predicate child-node arg must be a string.
@@ -947,6 +987,38 @@ Predicate value must be a string.
 `milpa remove` rejected: the dep is not declared in milpa.kdl.
 
 **Triggered:** cmd_remove finds <dep> is not present in the manifest's deps block.
+
+### `MAN-RESOLUTION-BLOCK-INVALID`
+
+Unknown or duplicate child node inside a `resolution { }` block.
+
+**Triggered:** The manifest parser encounters a `resolution { }` block containing a node other than `strategy` or `exclude-newer` (the only recognized children), or more than one of either child.
+
+**Fix:** Only declare `strategy "<value>"` and/or `exclude-newer "<timestamp>"` inside `resolution { }`, each at most once.
+
+### `MAN-RESOLUTION-EXCLUDE-NEWER-INVALID`
+
+The `resolution { exclude-newer }` value is not a parseable ISO 8601 timestamp.
+
+**Triggered:** A `resolution { exclude-newer ... }` node has the wrong arity, a non-string argument, or a value that is not a parseable ISO 8601 timestamp.
+
+**Fix:** Declare `exclude-newer "<ISO 8601 timestamp>"` (e.g. `"2026-01-01T00:00:00Z"`) inside `resolution { }`.
+
+### `MAN-RESOLUTION-MEMBER-SCOPE`
+
+A workspace member manifest declares a `resolution { }` block.
+
+**Triggered:** `resolution { }` (`strategy` and/or `exclude-newer`) is a whole-workspace policy — one shared lock implies one resolution policy — so it may only be declared on the workspace root manifest. Workspace construction (loading from disk, from an in-memory manifest, or with a proposed member-manifest override for a pending mutation) iterates member manifests and finds one declares `resolution { }` — including a block whose contents match the root's own policy or the implementation defaults. This check fires at workspace-construction time, mirroring `WS-INDEX-TRUST-ON-MEMBER` / `WS-ENTRY-TRUST-ON-MEMBER` / `WS-INDEX-HISTORY-ON-MEMBER`'s checks for the sibling root-only-policy axes (though this slug keeps the dominant `MAN-` prefix — the block being rejected is itself a `MAN-RESOLUTION-*`-owned manifest construct — rather than following the `WS-*-ON-MEMBER` naming used by those unrelated fields). A standalone (non-workspace) package manifest declaring `resolution { }` is unaffected — the rule only applies to a manifest loaded as a workspace member. The error context includes the offending member's path.
+
+**Fix:** Move the `resolution { }` block to the workspace root manifest; remove it from the member manifest.
+
+### `MAN-RESOLUTION-STRATEGY-INVALID`
+
+The `resolution { strategy }` value is not a recognized strategy.
+
+**Triggered:** A `resolution { strategy ... }` node has the wrong arity, a non-string argument, or a value that is not one of `maxver`, `minver`, `semver`, `lowest-direct`.
+
+**Fix:** Declare `strategy "maxver"` (or `minver`/`semver`/`lowest-direct`) inside `resolution { }`.
 
 ### `MAN-SPEC-VERSION-TYPE`
 
@@ -1104,6 +1176,24 @@ The published version does not match a git tag pointing at HEAD.
 
 ## RES
 
+### `RES-EXCLUDE-NEWER-EMPTY`
+
+An active `exclude_newer` time-bound filtered every candidate version of a named/index dep out of its enumerated candidate set.
+
+**Triggered:** resolution-semantics RFC §3 Axis D / §4 stage 2: when an effective `exclude_newer` timestamp is set (CLI `--exclude-newer` or manifest `resolution { exclude-newer }`), the enumeration layer (`_enumerate_named_stubs` / registry.py's `filter_by_exclude_newer`) drops every candidate `IndexVersion` whose `published_at` is not provably `<= exclude_newer` — **fail-closed**: a candidate whose `published_at` is absent or malformed is excluded too, overriding that field's ordinary permissive-informational default (§6 D-D3), since an unprovable date cannot pass the "predates the bound" test. This filter runs at the constraint-blind stage-1 enumeration, strictly before the solver's own accumulated-constraint filter (stage 3) — so when it empties an otherwise-non-empty candidate set, milpa raises this DISTINCT error naming the count of versions dropped, rather than letting the package fall through to a generic `TNG-NO-SATISFYING-VERSION` / `SOLVE-CONFLICT`, which would conflate "no version ever satisfied the constraints" with "versions existed but the time-bound excluded them all." Only index/named deps are filtered here — git/url/local/tarball singleton pins are validated (not selected) against the same bound, a distinct mechanism (D4).
+
+### `RES-EXCLUDE-NEWER-PIN`
+
+An active `exclude_newer` time-bound rejected a git/url dep's pinned commit because its committer date is newer than the bound.
+
+**Triggered:** resolution-semantics RFC §3 Axis D / §6 D-D1/D-D2: git/url deps are pinned to one author-chosen `ref` (branch, tag, or exact commit), not a candidate set milpa selects among — so `exclude_newer` **validates** the resolved commit rather than filtering a candidate list the way `RES-EXCLUDE-NEWER-EMPTY` does for index/named deps. After the dep is fetched (or its pin reused from a prior lock, `_git_pin_for_url_dep` — including a branch ref, which is reproducible once locked), milpa reads the resolved commit's own **committer date** — never an annotated tag's tagger date, even when `ref` names a tag: the SHA passed to `git log` is always an already-peeled `^{commit}` object (`GitFetcher`'s `_git_committer_date`, a bounded transport addition reading off the already-full local clone with no extra network round trip). If that committer date is provably `> exclude_newer`, this error fires naming the dep, its commit SHA, its committer date, and the bound. **Unconditional, with no fallback**: unlike an index dep, a git/url dep has exactly one candidate, so there is nothing to re-select — newly setting or tightening `exclude_newer` over an already-locked pin whose date now exceeds the bound always hits this error (the LTS-snapshot/security-freeze scenario Axis D is motivated by). Local/tarball deps have no commit and are not validated by this check (no meaningful timestamp exists for them). Like `RES-EXCLUDE-NEWER-EMPTY`, this is a reproducibility/LTS aid, not a security control — committer dates are forgeable (§6 D-D3).
+
+### `RES-LOCKED-DRIFT`
+
+`--locked` was passed on `fetch`/`lock`, but the freshly-resolved graph deviates from the committed `milpa.lock` — or no committed lockfile exists to compare against at all.
+
+**Triggered:** `--locked` always performs a REAL resolve (with the B2 minimal-change/prior-lock preference applied, exactly like a plain `fetch`/`lock`) and then asserts the result is identical to the committed lock — distinct from `--frozen`, which skips solving entirely and only reconstructs. The comparison (resolution-semantics RFC §3 Axis B / §6 D-B2) is **identity-based**: it keys on content-hash `identity` + the `provenances` set, **never** on the version label. So the one-time Axis-A `0.0.1`→real-declared-version relabel of an identity-unchanged git/url/local/tarball dep is compatible, not drift. Raised when: (a) a dep's resolved `identity` differs from its locked `identity`; (b) a dep's resolved provenance set differs from its locked provenance set (e.g. a different commit/URL/digest) even though `identity` is unchanged; (c) a dep is present in one side and absent from the other (added/removed since the lock was committed); or (d) there is no committed `milpa.lock` at all — `--locked` cannot guarantee reproducibility with nothing to reproduce. The message names every drifted/added/removed package and what deviated.
+
 ### `RES-NO-INDEX`
 
 Manifest has named dep(s) but no tianguis index was provided.
@@ -1130,6 +1220,12 @@ Under strict attestation policy, one or more resolved deps used un-attested `.ni
 
 **Triggered:** `resolve()` completes but the effective attestation policy is strict (either `attestation-policy "strict"` in `milpa.kdl` or `--require-attested-metadata` on the CLI) and at least one dep's edges came from the `NimbleFallback` source (no index-attested DepDecl). Under non-strict (default permissive) policy, a summary warning is emitted to stderr instead.
 
+### `RES-VERSION-UNKNOWN-CONSTRAINED`
+
+A git/url/local/tarball dep has no declared version (resolution-semantics RFC §3 Axis A (b) precedence steps 1-4 all missed — no `milpa.kdl version`, no `.nimble version`, no version-shaped git tag, no `version=` annotation), but another dep's floor/ceiling constrains it.
+
+**Triggered:** the version-unknown/constrained partition (resolution-semantics RFC §3 Axis A (c) / §6 D-A1). A version-unknown package is given strictly lowest decision priority so it is decided only after every other reachable package — including a named/index dep that materializes its own constraint lazily, mid-solve — so the accumulated constraint range at its decision point is guaranteed complete. If that range is still `full()` (nothing constrains it), the package resolves via the existing sentinel with no error — the common untagged-branch-pin case (e.g. fresco/intonaco). If the range is non-`full()`, milpa refuses to guess a version that might silently satisfy the sentinel but not the real fetched artifact: it raises this error instead of silently swallowing the constraint (the round-2 "satisfy-any" behavior this RFC replaces) or degrading to a generic `SOLVE-CONFLICT` (which a naive pre-solve check would produce against a lazily-materialized constrainer). The message enumerates **every** accumulated constrainer, not just the first, and the remedy branches: for a dep the root manifest declares directly (or redirects via an `overrides` rule), add a `version=` annotation there or pin a versioned git tag; for a purely transitive dep with no user-owned declaration site, add a root-level pin or an `overrides { pkg … version= }` rule for it.
+
 ### `RES-WS-MEMBER-REF-UNKNOWN`
 
 A workspace member references a `member "X"` dep that doesn't exist.
@@ -1140,7 +1236,7 @@ A workspace member references a `member "X"` dep that doesn't exist.
 
 A named dep auto-coerced to a workspace member does not satisfy the declared version constraint.
 
-**Triggered:** A `NamedDep` whose name matches a workspace member auto-coerces to that member (resolver-semantics §11.5), but the dep's declared version constraint is not satisfied by the member's sentinel version (`0.0.1`).  The constraint is not silently discarded — a `foo >= 2.0.0` dep where member `foo` is at sentinel `0.0.1` raises this error.
+**Triggered:** A `NamedDep` whose name matches a workspace member auto-coerces to that member (resolver-semantics §11.5), but the dep's declared version constraint is not satisfied by the member's own version — its declared `milpa.kdl`/`.nimble` version (resolution-semantics RFC A2c) when present, else the version-unknown sentinel (`0.0.1`).  The constraint is not silently discarded — a `foo >= 2.0.0` dep where member `foo` is undeclared (sentinel `0.0.1`) or declares e.g. `1.0.0` raises this error.  (The auto-coerce *requiring* term itself is `full()`, not `eq(version)` — a member has exactly one candidate, so PubGrub never pre-commits to a version label; this check is the real semantic gate.)
 
 ### `RES-WS-NO-INDEX`
 

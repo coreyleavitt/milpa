@@ -1,0 +1,38 @@
+// chronos: the LAZILY-MATERIALIZED constrainer. Its own "requires bearssl
+// >= 0.2.8" floor (chronos.nimble) is only discovered when PubGrub first
+// selects a candidate for it and the provider fetches+parses it — not
+// knowable at Phase A enumeration time. This is the ordering hazard A4's
+// decision-priority rule protects against (§3 Axis A (c)).
+//
+// bearssl: a nimble `requires` line naming a bare package (no URL) is always
+// resolved through the index (Phase A enumeration), even though bearssl is
+// ALSO root-declared as a git dep in this same fixture (mirrors fixture-415's
+// own index-stub convention) — the eager git candidate and this stub share
+// the solver package name, and `_Provider.versions` unions both. This stub's
+// version (0.1.0) is deliberately BELOW chronos's floor (>= 0.2.8) so it can
+// never satisfy the constraint either — the fixture's outcome depends
+// entirely on A4's classification of the real (version-unknown) git
+// candidate, not on this stub ever being selected or fetched.
+schema_version 1
+package "bearssl" {
+    version "0.1.0" {
+        content_hash "dag-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        provenance {
+            kind "git"
+            url "https://example.com/bearssl-index-only.git"
+            ref "v0.1.0"
+            commit_sha "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000"
+        }
+    }
+}
+package "chronos" {
+    version "1.0.0" {
+        content_hash "dag-sha256:d67791f79b0f357e40ab765a13184048684b4cd6b39bdd9f2defba72699eecc9"
+        provenance {
+            kind "git"
+            url "https://example.com/chronos.git"
+            ref "v1.0.0"
+            commit_sha "cccc2222cccc2222cccc2222cccc2222cccc2222"
+        }
+    }
+}

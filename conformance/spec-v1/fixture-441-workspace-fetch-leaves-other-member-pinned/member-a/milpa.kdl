@@ -1,0 +1,5 @@
+name "member-a"
+kind "library"
+deps {
+    crisol ">= 2.0.0"
+}

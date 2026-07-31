@@ -1,0 +1,59 @@
+schema_version 1
+package "foo" {
+    version "3.0.0" {
+        content_hash "dag-sha256:63b7183aa1d29a05c94ca0683b824f65034966e8ed2fda1d701940967769f3a0"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "v3.0.0"
+            commit_sha "3b2a313543f222ef92302b5b761581271ec76814"
+        }
+    }
+    version "2.0.0" {
+        content_hash "dag-sha256:ee4c31f74ad165d9fe2086bbd1df183a50939b2f958face335e7a60fd44155c8"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "v2.0.0"
+            commit_sha "e55b45cb1b203b7e8c6e5057bbae11c2978f38d0"
+        }
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:a57d55f95814ec1b08cc0bbc0625d0d2f75be480360908942e5ccbf3df3237bb"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "v1.0.0"
+            commit_sha "43cdb44f32e54bfb9b47d00f1a8f91c6daa1caf4"
+        }
+    }
+}
+package "bar" {
+    version "3.0.0" {
+        content_hash "dag-sha256:165f4ccc5c7af5a2cf2018b27a91797b095a0b274810d39cf9119ac17dfbd232"
+        provenance {
+            kind "git"
+            url "https://example.com/bar.git"
+            ref "v3.0.0"
+            commit_sha "d9206bd14880c97b2d54ea7a2455ea88c007861b"
+        }
+    }
+    version "2.0.0" {
+        content_hash "dag-sha256:7028c5e1f7028cdb9b606fee32f106ce057ae4e30bd60de2ee8799f8411baae6"
+        provenance {
+            kind "git"
+            url "https://example.com/bar.git"
+            ref "v2.0.0"
+            commit_sha "1bff673b0033a54f9d840630af4f3d594672ed0f"
+        }
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:655e0b180ae6ddf37882994a6d0316ba4e5fc99dabe1ee7ec54043b775a79718"
+        provenance {
+            kind "git"
+            url "https://example.com/bar.git"
+            ref "v1.0.0"
+            commit_sha "019e6731cfc10a566e1d1cd67a8b780f91999d50"
+        }
+    }
+}

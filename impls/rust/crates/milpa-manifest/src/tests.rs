@@ -189,6 +189,64 @@ fn error_codes_match_fixtures() {
         ("name \"x\"\nmirrors {\n  mirror 42\n}\n", "MAN-URL-ARG-TYPE"),
         ("name \"x\"\nspec-version \"one\"\n", "MAN-SPEC-VERSION-TYPE"),
         ("name \"x\"\nspec-version 99\n", "MAN-SPEC-VERSION-UNSUPPORTED"),
+        // A1 (rfc-resolution-semantics.md §3 Axis A / §5): top-level package
+        // `version` — malformed value is a hard error (milpa.kdl is milpa's
+        // own strict manifest format, unlike the `.nimble` compat adapter).
+        ("name \"x\"\nversion \"not-a-version\"\n", "MAN-PACKAGE-VERSION-INVALID"),
+        ("name \"x\"\nversion \"1.2\"\n", "MAN-PACKAGE-VERSION-INVALID"),
+        ("name \"x\"\nversion 123\n", "MAN-PACKAGE-VERSION-INVALID"),
+        // A3b (rfc-resolution-semantics.md §3 Axis A (b) step 4): dep-level
+        // `version=` annotation — same strict-format rationale as the
+        // top-level `version` field, on git/local/tarball deps and on
+        // `overrides { pkg … version= }` rules.
+        (
+            "name \"x\"\ndeps {\n  foo git=(url)\"https://a/f.git\" ref=\"m\" version=\"nope\"\n}\n",
+            "MAN-DEP-VERSION-INVALID",
+        ),
+        (
+            "name \"x\"\ndeps {\n  foo local=\"../f\" version=\"nope\"\n}\n",
+            "MAN-DEP-VERSION-INVALID",
+        ),
+        (
+            "name \"x\"\ndeps {\n  foo tarball=(url)\"https://a/f.tar.gz\" version=\"nope\"\n}\n",
+            "MAN-DEP-VERSION-INVALID",
+        ),
+        (
+            "name \"x\"\noverrides {\n  pkg \"foo\" git=(url)\"https://a/f.git\" ref=\"m\" version=\"nope\"\n}\n",
+            "MAN-DEP-VERSION-INVALID",
+        ),
+        // C3 (rfc-resolution-semantics.md §3 Axis C / §5): resolution {
+        // strategy } block — unknown/duplicate child vs. malformed value.
+        (
+            "name \"x\"\nresolution {\n  bogus \"y\"\n}\n",
+            "MAN-RESOLUTION-BLOCK-INVALID",
+        ),
+        (
+            "name \"x\"\nresolution {\n  strategy \"maxver\"\n  strategy \"minver\"\n}\n",
+            "MAN-RESOLUTION-BLOCK-INVALID",
+        ),
+        (
+            "name \"x\"\nresolution {\n  strategy\n}\n",
+            "MAN-RESOLUTION-STRATEGY-INVALID",
+        ),
+        (
+            "name \"x\"\nresolution {\n  strategy \"bogus\"\n}\n",
+            "MAN-RESOLUTION-STRATEGY-INVALID",
+        ),
+        // D1 (rfc-resolution-semantics.md §3 Axis D): resolution {
+        // exclude-newer } — unknown/duplicate child vs. malformed value.
+        (
+            "name \"x\"\nresolution {\n  exclude-newer\n}\n",
+            "MAN-RESOLUTION-EXCLUDE-NEWER-INVALID",
+        ),
+        (
+            "name \"x\"\nresolution {\n  exclude-newer \"not-a-timestamp\"\n}\n",
+            "MAN-RESOLUTION-EXCLUDE-NEWER-INVALID",
+        ),
+        (
+            "name \"x\"\nresolution {\n  exclude-newer \"2026-01-01T00:00:00Z\"\n  exclude-newer \"2026-02-01T00:00:00Z\"\n}\n",
+            "MAN-RESOLUTION-BLOCK-INVALID",
+        ),
         // Workspace role.
         (
             "workspace {\n  member \"a\"\n}\nkind \"library\"\n",
@@ -350,6 +408,187 @@ fn spec_version_present_and_default() {
     let absent = pkg("name \"a\"\n");
     assert_eq!(absent.spec_version, 1);
     assert!(!absent.spec_version_explicit);
+}
+
+/// A1 (rfc-resolution-semantics.md §3 Axis A (b) step 1): the top-level
+/// package `version` field — sibling of `spec-version` (schema epoch),
+/// distinct concept (the package's own declared release version).
+#[test]
+fn package_version_present_and_absent() {
+    let m = pkg("name \"x\"\nversion \"1.2.3\"\n");
+    assert_eq!(m.version, Some(milpa_types::Version::release(1, 2, 3)));
+
+    let absent = pkg("name \"x\"\n");
+    assert!(absent.version.is_none());
+}
+
+/// C3 (rfc-resolution-semantics.md §3 Axis C / §5): the manifest
+/// `resolution { strategy }` block — present iff declared, extensible
+/// (only `strategy` recognized today; Axis D adds `exclude-newer` later).
+#[test]
+fn resolution_block_present_and_absent() {
+    let m = pkg("name \"x\"\nresolution {\n  strategy \"lowest-direct\"\n}\n");
+    assert_eq!(
+        m.resolution.and_then(|r| r.strategy),
+        Some(milpa_solver::Strategy::LowestDirect)
+    );
+
+    let absent = pkg("name \"x\"\n");
+    assert!(absent.resolution.is_none());
+
+    // A declared-but-empty block is a distinct Some(Resolution{strategy:None})
+    // from a genuinely absent node — both behave identically at the
+    // effective-strategy precedence point, but the parse itself must not
+    // collapse "empty block" into "absent block".
+    let empty = pkg("name \"x\"\nresolution {\n}\n");
+    assert_eq!(
+        empty.resolution,
+        Some(Resolution {
+            strategy: None,
+            exclude_newer: None,
+        })
+    );
+}
+
+/// C3 (Axis W): a workspace root may declare `resolution { strategy }` too
+/// (root-only — one shared lock, one resolution policy).
+#[test]
+fn workspace_resolution_block_present_and_absent() {
+    let w = ws("workspace {\n  member \"a\"\n}\nresolution {\n  strategy \"semver\"\n}\n");
+    assert_eq!(
+        w.resolution.and_then(|r| r.strategy),
+        Some(milpa_solver::Strategy::Semver)
+    );
+
+    let absent = ws("workspace {\n  member \"a\"\n}\n");
+    assert!(absent.resolution.is_none());
+}
+
+/// D1 (rfc-resolution-semantics.md §3 Axis D): the manifest
+/// `resolution { exclude-newer }` block — present iff declared, and
+/// composes cleanly with C3's `strategy` sibling.
+#[test]
+fn resolution_exclude_newer_present_and_absent() {
+    let m = pkg("name \"x\"\nresolution {\n  exclude-newer \"2026-01-01T00:00:00Z\"\n}\n");
+    assert_eq!(
+        m.resolution.and_then(|r| r.exclude_newer),
+        milpa_types::parse_iso8601_timestamp("2026-01-01T00:00:00Z")
+    );
+
+    let absent = pkg("name \"x\"\n");
+    assert!(absent.resolution.is_none());
+}
+
+/// D1: a `resolution { }` block declaring BOTH `strategy` and
+/// `exclude-newer` parses both fields together (they are independent
+/// siblings, not a mutually-exclusive choice).
+#[test]
+fn resolution_strategy_and_exclude_newer_both_parse() {
+    let m = pkg(
+        "name \"x\"\nresolution {\n  strategy \"minver\"\n  exclude-newer \"2026-01-01T00:00:00Z\"\n}\n",
+    );
+    let r = m.resolution.unwrap();
+    assert_eq!(r.strategy, Some(milpa_solver::Strategy::Minver));
+    assert_eq!(
+        r.exclude_newer,
+        milpa_types::parse_iso8601_timestamp("2026-01-01T00:00:00Z")
+    );
+}
+
+/// D1: an unknown child still raises `MAN-RESOLUTION-BLOCK-INVALID` even
+/// when both recognized children (`strategy`, `exclude-newer`) are also
+/// present in the same block.
+#[test]
+fn resolution_unknown_child_still_invalid_with_known_children_present() {
+    let code = doc_err(
+        "name \"x\"\nresolution {\n  strategy \"minver\"\n  exclude-newer \"2026-01-01T00:00:00Z\"\n  bogus \"y\"\n}\n",
+    );
+    assert_eq!(code, "MAN-RESOLUTION-BLOCK-INVALID");
+}
+
+/// D1 (Axis W): a workspace root may declare `resolution { exclude-newer }`
+/// too (root-only — one shared lock, one resolution policy).
+#[test]
+fn workspace_resolution_exclude_newer_present_and_absent() {
+    let w = ws("workspace {\n  member \"a\"\n}\nresolution {\n  exclude-newer \"2026-01-01T00:00:00Z\"\n}\n");
+    assert_eq!(
+        w.resolution.and_then(|r| r.exclude_newer),
+        milpa_types::parse_iso8601_timestamp("2026-01-01T00:00:00Z")
+    );
+}
+
+/// A3b (rfc-resolution-semantics.md §3 Axis A (b) step 4): the dep-level
+/// `version=` annotation on git/local/tarball deps — present iff declared,
+/// distinct from an override (which redirects the source, D-A3).
+#[test]
+fn dep_version_annotation_present_and_absent() {
+    let with_version = pkg(
+        "name \"x\"\ndeps {\n  foo git=(url)\"https://a/f.git\" ref=\"m\" version=\"1.2.3\"\n}\n",
+    );
+    let Dep::Url(u) = &with_version.deps[0] else {
+        panic!("expected UrlDep")
+    };
+    assert_eq!(u.version, Some(milpa_types::Version::release(1, 2, 3)));
+
+    let without_version = pkg("name \"x\"\ndeps {\n  foo git=(url)\"https://a/f.git\" ref=\"m\"\n}\n");
+    let Dep::Url(u2) = &without_version.deps[0] else {
+        panic!("expected UrlDep")
+    };
+    assert!(u2.version.is_none());
+}
+
+#[test]
+fn local_dep_version_annotation() {
+    let m = pkg("name \"x\"\ndeps {\n  foo local=\"../foo\" version=\"0.3.0\"\n}\n");
+    let Dep::Local(l) = &m.deps[0] else {
+        panic!("expected LocalDep")
+    };
+    assert_eq!(l.version, Some(milpa_types::Version::release(0, 3, 0)));
+}
+
+#[test]
+fn tarball_dep_version_annotation() {
+    let m = pkg(
+        "name \"x\"\ndeps {\n  foo tarball=(url)\"https://a/f.tar.gz\" version=\"2.0.0\"\n}\n",
+    );
+    let Dep::Tarball(t) = &m.deps[0] else {
+        panic!("expected TarballDep")
+    };
+    assert_eq!(t.version, Some(milpa_types::Version::release(2, 0, 0)));
+}
+
+/// A3b/D-A3: `version=` on an override rule — orthogonal to `target` (label
+/// vs redirect), valid regardless of which target form is selected.
+#[test]
+fn override_version_annotation_all_forms() {
+    let git_form = pkg(
+        "name \"x\"\noverrides {\n  pkg \"foo\" git=(url)\"https://a/f.git\" ref=\"m\" version=\"1.0.0\"\n}\n",
+    );
+    assert_eq!(
+        git_form.overrides[0].version,
+        Some(milpa_types::Version::release(1, 0, 0))
+    );
+
+    let local_form = pkg(
+        "name \"x\"\noverrides {\n  pkg \"foo\" local=\"../foo\" version=\"2.1.0\"\n}\n",
+    );
+    assert_eq!(
+        local_form.overrides[0].version,
+        Some(milpa_types::Version::release(2, 1, 0))
+    );
+
+    let member_form = pkg(
+        "name \"x\"\noverrides {\n  pkg \"foo\" version=\"0.9.0\" {\n    member \"foo\"\n  }\n}\n",
+    );
+    assert_eq!(
+        member_form.overrides[0].version,
+        Some(milpa_types::Version::release(0, 9, 0))
+    );
+
+    let absent = pkg(
+        "name \"x\"\noverrides {\n  pkg \"foo\" git=(url)\"https://a/f.git\" ref=\"m\"\n}\n",
+    );
+    assert!(absent.overrides[0].version.is_none());
 }
 
 #[test]

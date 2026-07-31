@@ -1,0 +1,61 @@
+schema_version 1
+package "zeta" {
+    version "2.0.0" {
+        content_hash "dag-sha256:dc97e948d6e482126d156a53f326c54ce82872f2798b7f066d842d25f4817bd0"
+        provenance {
+            kind "git"
+            url "https://example.com/zeta.git"
+            ref "v2.0.0"
+            commit_sha "aa00000000000000000000000000000000000002"
+        }
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:41dc64085eeb37e4b5af18968bd24a5e886d9c4721e3265a1b3d549f6b793127"
+        provenance {
+            kind "git"
+            url "https://example.com/zeta.git"
+            ref "v1.0.0"
+            commit_sha "aa00000000000000000000000000000000000001"
+        }
+    }
+}
+package "alpha" {
+    version "2.0.0" {
+        content_hash "dag-sha256:9fc4c0ed5751d79728924922df3e2b20bbd94d009c38572843f8e86016233de7"
+        provenance {
+            kind "git"
+            url "https://example.com/alpha.git"
+            ref "v2.0.0"
+            commit_sha "bb00000000000000000000000000000000000002"
+        }
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:a45affd9fa338aca315d49ffde89e8130370d3469b22463487f9c847ad8f893e"
+        provenance {
+            kind "git"
+            url "https://example.com/alpha.git"
+            ref "v1.0.0"
+            commit_sha "bb00000000000000000000000000000000000001"
+        }
+    }
+}
+package "shared" {
+    version "2.0.0" {
+        content_hash "dag-sha256:2b3ba8eb99e2035c4727662cc5a04a57527caee8d36fd823ea3e6d5518220ab5"
+        provenance {
+            kind "git"
+            url "https://example.com/shared.git"
+            ref "v2.0.0"
+            commit_sha "cc00000000000000000000000000000000000002"
+        }
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:2fbea98a2fc92632e18552c2fa9013ff70955faee2d5652d39a67d1ac444b063"
+        provenance {
+            kind "git"
+            url "https://example.com/shared.git"
+            ref "v1.0.0"
+            commit_sha "cc00000000000000000000000000000000000001"
+        }
+    }
+}

@@ -1,0 +1,17 @@
+// resolution-semantics RFC §3 Axis D / §6 D-D2 -- mirror of fixture-445,
+// proving the opposite direction: the prior milpa.lock pins commit
+// 3333...3, whose own committer date (2026, via the per-sha
+// `committer_date@3333...3` override) is NEWER than the bound below and
+// must raise RES-EXCLUDE-NEWER-PIN -- even though the mocked fixture's
+// flat `sha`/`committer_date` (a different, unrelated live tip 4444...4,
+// dated 2020) would PASS the same bound. A resolver that incorrectly fell
+// back to the flat/tip date instead of the pinned commit's own date would
+// wrongly resolve this cleanly.
+name "myapp"
+kind "application"
+resolution {
+    exclude-newer "2021-01-01T00:00:00Z"
+}
+deps {
+    widget git=(url)"https://example.com/widget.git" ref="main"
+}

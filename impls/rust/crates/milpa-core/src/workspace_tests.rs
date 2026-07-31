@@ -762,3 +762,117 @@ fn override_unknown_member_dir_raises_member_dir_missing() {
     let result = load_workspace_with_member_override(&ws, &nonmember, proposed).unwrap_err();
     assert_eq!(result.code(), "WS-MEMBER-DIR-MISSING");
 }
+
+// ---------------------------------------------------------------------------
+// W1 (rfc-resolution-semantics.md §3 Axis W, §5): resolution { } root-
+// authority validation — mirrors the index-trust / entry-trust / index-
+// history tests above for the resolution-policy axis. Unlike those single-
+// node fields, `resolution { }` is a whole BLOCK (`strategy` + `exclude-
+// newer` children), so presence is `Manifest::resolution.is_some()` rather
+// than a policy-string comparison.
+// ---------------------------------------------------------------------------
+
+/// The workspace root MAY declare `resolution { }`; it becomes the effective
+/// policy for the whole workspace invocation.
+#[test]
+fn workspace_root_resolution_flows_through() {
+    let tmp = workspace_dir(
+        "resolution {\n    strategy \"minver\"\n}\nworkspace {\n    member \"sub\"\n}\n",
+        &[("sub", Some("name \"sub\"\nkind \"library\"\n"))],
+    );
+    let ws = load_workspace(tmp.path()).unwrap();
+    assert!(ws.resolution.is_some());
+    assert_eq!(ws.resolution.unwrap().strategy, Some(milpa_solver::Strategy::Minver));
+}
+
+/// A workspace root declaring no `resolution { }` block stays `None`.
+#[test]
+fn workspace_root_resolution_absent_stays_none() {
+    let tmp = workspace_dir(
+        "workspace {\n    member \"sub\"\n}\n",
+        &[("sub", Some("name \"sub\"\nkind \"library\"\n"))],
+    );
+    let ws = load_workspace(tmp.path()).unwrap();
+    assert!(ws.resolution.is_none());
+}
+
+/// A member declaring an EMPTY `resolution { }` block is a hard error —
+/// MAN-RESOLUTION-MEMBER-SCOPE — fires even with no children at all: the
+/// rule is about WHERE the block is declared, not what it contains.
+#[test]
+fn member_declaring_empty_resolution_block_is_man_resolution_member_scope() {
+    let tmp = workspace_dir(
+        "workspace {\n    member \"sub\"\n}\n",
+        &[("sub", Some("name \"sub\"\nkind \"library\"\nresolution {\n}\n"))],
+    );
+    let result = load_workspace(tmp.path()).unwrap_err();
+    assert_eq!(result.code(), "MAN-RESOLUTION-MEMBER-SCOPE");
+}
+
+/// A member declaring `resolution { strategy "..." }` is also rejected — the
+/// same check catches a populated block, not just an empty one.
+#[test]
+fn member_declaring_resolution_with_strategy_is_man_resolution_member_scope() {
+    let tmp = workspace_dir(
+        "workspace {\n    member \"sub\"\n}\n",
+        &[(
+            "sub",
+            Some("name \"sub\"\nkind \"library\"\nresolution {\n    strategy \"maxver\"\n}\n"),
+        )],
+    );
+    let result = load_workspace(tmp.path()).unwrap_err();
+    assert_eq!(result.code(), "MAN-RESOLUTION-MEMBER-SCOPE");
+}
+
+/// The check fires even when the root ALSO legally declares a resolution
+/// block.
+#[test]
+fn member_resolution_fires_regardless_of_root_policy() {
+    let tmp = workspace_dir(
+        "resolution {\n    strategy \"maxver\"\n}\nworkspace {\n    member \"sub\"\n}\n",
+        &[("sub", Some("name \"sub\"\nkind \"library\"\nresolution {\n}\n"))],
+    );
+    let result = load_workspace(tmp.path()).unwrap_err();
+    assert_eq!(result.code(), "MAN-RESOLUTION-MEMBER-SCOPE");
+}
+
+/// `load_workspace_from_manifest` (the in-memory mutation path) enforces the
+/// same member-declaration check as `load_workspace`.
+#[test]
+fn load_workspace_from_manifest_also_raises_man_resolution_member_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sub_dir = tmp.path().join("sub");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+    std::fs::write(
+        sub_dir.join("milpa.kdl"),
+        "name \"sub\"\nkind \"library\"\nresolution {\n}\n",
+    )
+    .unwrap();
+    let parsed = milpa_manifest::Workspace {
+        members: vec!["sub".to_string()],
+        overrides: vec![],
+        flags: vec![],
+        name: None,
+        ..Default::default()
+    };
+    let result = load_workspace_from_manifest(tmp.path(), &parsed).unwrap_err();
+    assert_eq!(result.code(), "MAN-RESOLUTION-MEMBER-SCOPE");
+}
+
+/// A standalone (non-workspace) package manifest declaring `resolution { }`
+/// is unaffected — the MAN-RESOLUTION-MEMBER-SCOPE rule only applies to a
+/// manifest loaded as a workspace MEMBER, per rfc-resolution-semantics.md §3
+/// Axis W.
+#[test]
+fn standalone_manifest_with_resolution_block_is_unaffected() {
+    let parsed = milpa_manifest::parse_document(
+        "name \"solo\"\nkind \"library\"\nresolution {\n    strategy \"minver\"\n}\n",
+    )
+    .unwrap();
+    match parsed {
+        milpa_manifest::ManifestDoc::Package(m) => {
+            assert!(m.resolution.is_some());
+        }
+        other => panic!("expected package, got {other:?}"),
+    }
+}

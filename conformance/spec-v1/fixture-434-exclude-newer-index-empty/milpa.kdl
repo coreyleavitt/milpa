@@ -1,0 +1,12 @@
+// resolution-semantics RFC §3 Axis D, D6: exclude-newer filters ALL of
+// widget's candidates (both published_at values postdate the bound) --
+// the enumeration layer must raise the DISTINCT RES-EXCLUDE-NEWER-EMPTY,
+// never a generic no-satisfying-version / SOLVE-CONFLICT (D3).
+name "myapp"
+kind "application"
+resolution {
+    exclude-newer "2020-01-01T00:00:00Z"
+}
+deps {
+    widget ">= 1.0.0"
+}

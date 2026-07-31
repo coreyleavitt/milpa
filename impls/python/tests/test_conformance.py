@@ -57,6 +57,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -101,7 +102,13 @@ from milpa.manifest import (
     parse_workspace_or_manifest,
 )
 from milpa.profile import Profile
-from milpa.resolver import resolve, resolve_workspace
+from milpa.registry import _parse_timestamp
+from milpa.resolver import (
+    _resolve_effective_exclude_newer,
+    _resolve_effective_strategy,
+    resolve,
+    resolve_workspace,
+)
 from milpa.solver import SolverError, certificate_to_json
 from milpa.version import Strategy
 from milpa.workspace import load_workspace
@@ -193,7 +200,53 @@ class Fixture:
             _cmd_text = ""
         self.cmd: str = self._parse_cmd(_cmd_text)
         self.no_index: bool = "--no-index" in _cmd_text.split()
+        # resolution-semantics RFC §3 Axis C (C1) / Axis W (W1): a fixture MAY
+        # carry a `--strategy <value>` token, selecting maxver/minver/semver
+        # over the index. Absent → None (mirrors `exclude_newer`'s own
+        # convention just below) — the CLI-tier slot of
+        # `_resolve_effective_strategy`'s precedence (cli > manifest >
+        # MAXVER default; R9 dropped the lockfile-recorded tier — it is
+        # diagnostic/frozen-parity only, never a live input), so a fixture
+        # with no `--strategy` token but a manifest `resolution { strategy }`
+        # block correctly falls through to tier 2 instead of silently
+        # short-circuiting to MAXVER. W1 found this: every C1-C4 conformance
+        # fixture happened to exercise strategy selection via an explicit
+        # cmd-file `--strategy` token (never the manifest-block
+        # default-application path), so this in-process adapter had drifted
+        # from the real CLI (which already calls `_resolve_effective_strategy`,
+        # not a hardcoded default) — [[feedback_gate_active_impl_pytest]]'s
+        # exact "harness lags the CLI wiring" pattern. `Strategy(args.strategy)`
+        # (cli.py) is still the same three wire strings, same StrEnum, when a
+        # token IS present.
+        self.strategy: Strategy | None = self._parse_strategy(_cmd_text)
+        # resolution-semantics RFC §3 Axis D (D6): a fixture MAY carry a
+        # `--exclude-newer <ts>` token, mirroring `--strategy`'s own §2.7.4
+        # convention. Absent -> None (unset — the pre-D6 default, unchanged
+        # for every existing fixture). Reuses the SSOT ISO-8601 parser
+        # (registry.py's `_parse_timestamp`, shared with published_at) rather
+        # than a second parser.
+        self.exclude_newer: datetime | None = self._parse_exclude_newer(_cmd_text)
         self.expected_error: str | None = self._read_expected_error()
+
+    @staticmethod
+    def _parse_strategy(text: str) -> "Strategy | None":
+        tokens = text.split()
+        if "--strategy" in tokens:
+            idx = tokens.index("--strategy")
+            return Strategy(tokens[idx + 1])
+        return None
+
+    @staticmethod
+    def _parse_exclude_newer(text: str) -> "datetime | None":
+        tokens = text.split()
+        if "--exclude-newer" in tokens:
+            idx = tokens.index("--exclude-newer")
+            raw = tokens[idx + 1]
+            parsed = _parse_timestamp(raw)
+            if parsed is None:
+                raise ValueError(f"fixture cmd: malformed --exclude-newer value {raw!r}")
+            return parsed
+        return None
 
     @staticmethod
     def _parse_cmd(text: str) -> str:
@@ -2411,15 +2464,51 @@ def _execute_fixture(
             # so the caller can park it as xfail.
             raise
 
-        # Success: byte-diff against expected/
-        return _diff_success(fixture, graph, doc, tmp_dir, deps_dir)
+        # Success: byte-diff against expected/. C4: the frozen path reproduces
+        # the INPUT lockfile's own recorded strategy verbatim (it never runs a
+        # solver), NOT fixture.strategy — see _diff_success's docstring. D5/D6:
+        # same rationale for exclude_newer — frozen never re-decides it either.
+        return _diff_success(
+            fixture,
+            graph,
+            doc,
+            tmp_dir,
+            deps_dir,
+            strategy_override=lockfile.strategy,
+            exclude_newer_override=lockfile.exclude_newer,
+        )
 
     # ------------------------------------------------------------------
     # resolve path (live)
     # ------------------------------------------------------------------
     prior = _load_prior_lockfile(fixture_dir) if cmd == "resolve" else None
+    # D6 (resolution-semantics RFC §3 Axis D): the EFFECTIVE exclude-newer
+    # bound for this live resolve — cmd-token `--exclude-newer` (fixture.
+    # exclude_newer) > the manifest's own `resolution { exclude-newer }` >
+    # None. Mirrors the CLI's `fetch`/`lock` 2-tier call (cli.py:1821,
+    # `_resolve_effective_exclude_newer(exclude_newer, manifest)`, no
+    # `prior` argument) — the SAME production function, not a reimplementation.
+    effective_exclude_newer = _resolve_effective_exclude_newer(fixture.exclude_newer, doc)
+    # W1/R9 (resolution-semantics RFC §3 Axis W / Axis C): the EFFECTIVE
+    # strategy for this live resolve — cmd-token `--strategy` (fixture.
+    # strategy) > the manifest's own `resolution { strategy }` > MAXVER (R9
+    # dropped the lockfile-recorded tier — diagnostic/frozen-parity only,
+    # never a live input). Mirrors the CLI's `_cmd_fetch_workspace`/
+    # `cmd_fetch` call (cli.py, `_resolve_effective_strategy(strategy,
+    # manifest)`) — the SAME production function, not a reimplementation.
+    # `doc` is either a single-package `Manifest` or a workspace-root
+    # `WorkspaceManifest`, and `_resolve_effective_strategy` reads
+    # `.resolution` off either via `getattr`, mirroring
+    # `_resolve_effective_exclude_newer` just above. `strategy_explicit`
+    # is derived from the same single call's `Strategy | None` result
+    # (mirrors the CLI's own derivation) — feeds the B2 lock-preference
+    # bypass gate (never the lockfile-recorded strategy).
+    _strategy_decl = _resolve_effective_strategy(fixture.strategy, doc)
+    strategy_explicit = _strategy_decl is not None
+    effective_strategy = _strategy_decl if _strategy_decl is not None else Strategy.MAXVER
     params = ResolveParams(
-        strategy=Strategy.MAXVER,
+        strategy=effective_strategy,
+        strategy_explicit=strategy_explicit,
         max_parallel=1,
         profile=profile,
         prior=prior,
@@ -2432,6 +2521,7 @@ def _execute_fixture(
         # P3a (RFC per-entry-attestation.md §3, §5): entry-trust gate config;
         # None (gate disabled) unless the fixture opts in.
         entry_trust=_fixture_entry_trust_config(fixture_dir, doc),
+        exclude_newer=effective_exclude_newer,
     )
 
     try:
@@ -2457,8 +2547,20 @@ def _execute_fixture(
         # Resolver not yet wired — signal this as a "not_wired" state
         raise
 
-    # Success: byte-diff against expected/
-    return _diff_success(fixture, graph, doc, tmp_dir, deps_dir)
+    # Success: byte-diff against expected/. W1/D6: re-emit the SAME effective
+    # strategy/exclude_newer this resolve actually ran under into the
+    # reconstructed lockfile — NOT the raw `fixture.strategy` cmd-token
+    # (which may be None), mirroring the frozen-path call above / C4's own
+    # rationale.
+    return _diff_success(
+        fixture,
+        graph,
+        doc,
+        tmp_dir,
+        deps_dir,
+        strategy_override=str(effective_strategy),
+        exclude_newer_override=effective_exclude_newer,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2548,6 +2650,9 @@ def _execute_check_certificate(
                 # empty failure cert that Rust emits for these cases (cli-contract §2.5.2).
                 cert_json_str = certificate_to_json(None)
             got_cert = json.loads(cert_json_str)
+            if _REGEN_MODE:
+                _regen_write(expected_cert_path, cert_json_str + "\n")
+                return ("pass", "")
             mismatch = compare_certificate_json(got_cert, expected_cert)
             if mismatch:
                 return ("fail", f"failure certificate mismatch: {mismatch}")
@@ -2568,14 +2673,24 @@ def _execute_check_certificate(
     got_cert_str = certificate_to_json(cert_obj)
     got_cert = json.loads(got_cert_str)
 
-    mismatch = compare_certificate_json(got_cert, expected_cert)
-    if mismatch:
-        return ("fail", f"success certificate mismatch: {mismatch}")
+    if _REGEN_MODE:
+        _regen_write(expected_cert_path, got_cert_str + "\n")
+    else:
+        mismatch = compare_certificate_json(got_cert, expected_cert)
+        if mismatch:
+            return ("fail", f"success certificate mismatch: {mismatch}")
 
     # Also assert the normal success outputs (milpa.lock etc) depending on verb.
     # For 'fetch', assert lock + nim.cfg + _deps_structure.txt.
     # For 'lock', assert only milpa.lock.
-    return _diff_success(fixture, graph, doc, tmp_dir, deps_dir)
+    # W1: check-certificate's `params.strategy` above is unconditionally
+    # `Strategy.MAXVER` (check-certificate never carries a `--strategy`
+    # token, nor reads the manifest's `resolution { strategy }` — a
+    # pre-existing, narrower scope than `resolve`'s own effective-strategy
+    # precedence). Pass that SAME literal explicitly rather than relying on
+    # `_diff_success`'s `fixture.strategy` fallback, which is now `None`
+    # (no cmd-token) for every check-certificate fixture post-W1.
+    return _diff_success(fixture, graph, doc, tmp_dir, deps_dir, strategy_override="maxver")
 
 
 # ---------------------------------------------------------------------------
@@ -2808,8 +2923,38 @@ def _diff_success(
     doc: Manifest | WorkspaceManifest,
     tmp_dir: Path,
     deps_dir: Path,
+    *,
+    strategy_override: str | None = None,
+    exclude_newer_override: "datetime | None" = None,
 ) -> tuple[Literal["pass", "fail", "skip"], str]:
-    """Byte-diff the produced outputs against expected/."""
+    """Byte-diff the produced outputs against expected/.
+
+    ``strategy_override`` (C4, resolution-semantics RFC §3 Axis C; W1
+    corrected the fallback): the ``strategy`` string re-emitted into the
+    reconstructed ``milpa.lock``. Every call site now passes this
+    EXPLICITLY (W1, §3 Axis W): the ``resolve`` path passes
+    ``str(effective_strategy)`` (the SAME `_resolve_effective_strategy`
+    result used for `params.strategy`, precedence cli > manifest >
+    prior-lock > MAXVER); ``check-certificate`` passes the literal
+    ``"maxver"`` (its own `params.strategy` is unconditionally
+    `Strategy.MAXVER` — that cmd never reads `--strategy` or the manifest's
+    `resolution { strategy }`); ``frozen`` passes ``lockfile.strategy``
+    (frozen reconstruction doesn't decide a strategy at all, it reproduces
+    the INPUT lockfile's own recorded ``strategy`` string verbatim — surfaced
+    by fixture-431's non-default ``minver`` lock, the first frozen fixture
+    where a hardcoded MAXVER default would have diverged). The
+    ``str(fixture.strategy)`` fallback below is now purely defensive — every
+    production call site supplies an override — and guards against
+    ``fixture.strategy`` being ``None`` (no cmd-token; W1 changed its type
+    from a MAXVER-defaulting ``Strategy`` to ``Strategy | None`` so the
+    manifest-block precedence tier is reachable at all).
+
+    ``exclude_newer_override`` (D6, resolution-semantics RFC §3 Axis D):
+    same rationale, one axis over — the EFFECTIVE exclude-newer bound the
+    live resolve actually ran under (cmd-token > manifest > None), or the
+    frozen path's verbatim ``lockfile.exclude_newer`` re-emission. Defaults
+    to ``None`` so pre-D6 call sites are unaffected.
+    """
     from milpa.lockfile import format_lockfile, from_graph
     from milpa.nimcfg import build_flag_defines, format_nimcfg, format_workspace_nimcfgs
     from milpa.workspace import load_workspace
@@ -2820,7 +2965,14 @@ def _diff_success(
     expected_dir = fixture.dir / "expected"
 
     try:
-        lockfile_obj = from_graph(graph)  # type: ignore[arg-type]
+        strategy_str = (
+            strategy_override
+            if strategy_override is not None
+            else (str(fixture.strategy) if fixture.strategy is not None else "maxver")
+        )
+        lockfile_obj = from_graph(
+            graph, strategy=strategy_str, exclude_newer=exclude_newer_override
+        )  # type: ignore[arg-type]
         lock_text = format_lockfile(lockfile_obj)
     except Exception as e:
         return ("fail", f"from_graph/format_lockfile failed: {e}")

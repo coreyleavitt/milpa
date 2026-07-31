@@ -197,6 +197,129 @@ fn git_absent_pinned_commit_is_commit_absent() {
     assert_eq!(err.code(), "FETCH-GIT-COMMIT-ABSENT");
 }
 
+// --- D4: committer-date read (resolution-semantics RFC §3 Axis D) ----------
+//
+// A commit with a pinned committer date, plus an ANNOTATED tag on it whose
+// own TAGGER date is deliberately far LATER — the anti-tagger-date guard
+// fixture. `fetch_git`'s `Receipt.committer_date` must always report the
+// COMMIT's date, never the tag's, regardless of which ref (branch/tag/exact
+// commit) resolved it.
+
+fn make_repo_with_dated_commit_and_tag(
+    dir: &std::path::Path,
+    commit_unix: i64,
+    tag_unix: i64,
+    tag_name: &str,
+) -> Option<String> {
+    std::fs::create_dir_all(dir).ok()?;
+    let commit_env = format!("{commit_unix} +0000");
+    let tag_env = format!("{tag_unix} +0000");
+
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["init", "-q", "-b", "main"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    std::fs::write(dir.join("foo.nim"), b"echo 1").ok()?;
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+        .args(["add", "."])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgSign=false"])
+        .args(["commit", "-q", "-m", "init"])
+        .env("GIT_AUTHOR_DATE", &commit_env)
+        .env("GIT_COMMITTER_DATE", &commit_env)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    // Annotated tag, minted under a DIFFERENT (later) committer-date env —
+    // that becomes the tag object's own "tagger" timestamp, distinct from
+    // the commit's committer date above.
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c", "user.email=t@t", "-c", "user.name=t",
+            "-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false",
+        ])
+        .args(["tag", "-a", tag_name, "-m", "release"])
+        .env("GIT_COMMITTER_DATE", &tag_env)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+
+    Some(sha)
+}
+
+const D4_COMMIT_UNIX: i64 = 1_577_836_800; // 2020-01-01T00:00:00Z
+const D4_TAG_UNIX: i64 = 1_780_000_000; // far later than the commit
+
+#[test]
+fn fetch_git_committer_date_via_tag_ref_is_the_commits_date_not_the_tags() {
+    let d = tmp();
+    let repo = d.path().join("origin");
+    let Some(sha) =
+        make_repo_with_dated_commit_and_tag(&repo, D4_COMMIT_UNIX, D4_TAG_UNIX, "v1.0.0")
+    else {
+        eprintln!("skipping: git unavailable");
+        return;
+    };
+    let dest = d.path().join("_deps/dep");
+    let r = fetch_git("dep", &repo.to_string_lossy(), "v1.0.0", None, &dest).unwrap();
+    assert_eq!(r.resolved_ref.as_deref(), Some(sha.as_str()));
+    let cd = r.committer_date.expect("committer_date must be set for a git fetch");
+    assert_eq!(cd.unix_seconds, D4_COMMIT_UNIX);
+    assert_ne!(cd.unix_seconds, D4_TAG_UNIX);
+}
+
+#[test]
+fn fetch_git_committer_date_via_branch_ref() {
+    let d = tmp();
+    let repo = d.path().join("origin");
+    let Some(sha) =
+        make_repo_with_dated_commit_and_tag(&repo, D4_COMMIT_UNIX, D4_TAG_UNIX, "v1.0.0")
+    else {
+        eprintln!("skipping: git unavailable");
+        return;
+    };
+    let dest = d.path().join("_deps/dep");
+    let r = fetch_git("dep", &repo.to_string_lossy(), "main", None, &dest).unwrap();
+    assert_eq!(r.resolved_ref.as_deref(), Some(sha.as_str()));
+    assert_eq!(r.committer_date.unwrap().unix_seconds, D4_COMMIT_UNIX);
+}
+
+#[test]
+fn fetch_git_committer_date_via_exact_commit_pin() {
+    let d = tmp();
+    let repo = d.path().join("origin");
+    let Some(sha) =
+        make_repo_with_dated_commit_and_tag(&repo, D4_COMMIT_UNIX, D4_TAG_UNIX, "v1.0.0")
+    else {
+        eprintln!("skipping: git unavailable");
+        return;
+    };
+    let dest = d.path().join("_deps/dep");
+    let r = fetch_git("dep", &repo.to_string_lossy(), "main", Some(&sha), &dest).unwrap();
+    assert_eq!(r.committer_date.unwrap().unix_seconds, D4_COMMIT_UNIX);
+}
+
 // --- R1-01: git zip-slip containment in materialize_git_tree ---------------
 
 /// Helper: create a git blob object by writing it raw into the object store.

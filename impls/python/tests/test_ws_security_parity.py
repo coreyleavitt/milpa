@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from milpa.errors import (
+    MAN_RESOLUTION_MEMBER_SCOPE,
     MilpaError,
     WS_ENTRY_TRUST_ON_MEMBER,
     WS_INDEX_HISTORY_ON_MEMBER,
@@ -27,7 +28,7 @@ from milpa.errors import (
     WS_MEMBER_IS_WORKSPACE,
     WS_MEMBER_PATH_ESCAPE,
 )
-from milpa.manifest import WorkspaceManifest
+from milpa.manifest import WorkspaceManifest, parse_manifest
 from milpa.workspace import (
     load_workspace,
     load_workspace_from_manifest,
@@ -798,4 +799,119 @@ class TestWorkspaceMemberEntryTrustRejected:
         with pytest.raises(MilpaError) as exc_info:
             load_workspace_from_manifest(tmp_path, ws_manifest)
         assert exc_info.value.slug == WS_ENTRY_TRUST_ON_MEMBER
+
+
+# ---------------------------------------------------------------------------
+# W1 (rfc-resolution-semantics.md §3 Axis W, §5 MAN-RESOLUTION-MEMBER-SCOPE):
+# resolution { } root authority — mirrors the index-history/entry-trust
+# root-authority tests above for the resolution-policy axis. Unlike those
+# single-node fields, resolution { } is a whole BLOCK (strategy + exclude-
+# newer children), so presence is `Manifest.resolution is not None` rather
+# than a policy-string comparison.
+# ---------------------------------------------------------------------------
+
+
+def _write_workspace_root_with_resolution(
+    root: Path,
+    *,
+    strategy: str | None = None,
+    member_name: str = "sub",
+) -> None:
+    """Write a workspace root manifest optionally carrying a resolution { } block."""
+    lines = []
+    if strategy is not None:
+        lines.append(f'resolution {{\n    strategy "{strategy}"\n}}')
+    lines.append(f'workspace {{\n    member "{member_name}"\n}}')
+    (root / "milpa.kdl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_member(root / member_name, member_name)
+
+
+def _write_workspace_member_with_resolution(
+    root: Path,
+    *,
+    member_has_resolution: bool,
+    root_strategy: str | None = None,
+    member_name: str = "sub",
+) -> None:
+    """Write a workspace where a MEMBER illegally declares a resolution { } block."""
+    root_lines = []
+    if root_strategy is not None:
+        root_lines.append(f'resolution {{\n    strategy "{root_strategy}"\n}}')
+    root_lines.append(f'workspace {{\n    member "{member_name}"\n}}')
+    (root / "milpa.kdl").write_text("\n".join(root_lines) + "\n", encoding="utf-8")
+
+    member_dir = root / member_name
+    member_dir.mkdir(parents=True, exist_ok=True)
+    member_lines = [f'name "{member_name}"', 'kind "library"']
+    if member_has_resolution:
+        member_lines.append('resolution {\n}')
+    (member_dir / "milpa.kdl").write_text("\n".join(member_lines) + "\n", encoding="utf-8")
+
+
+class TestWorkspaceRootResolutionAuthority:
+    """Root declares resolution { }; a plain member coexists with no error."""
+
+    def test_root_declares_strategy_no_error(self, tmp_path: Path) -> None:
+        _write_workspace_root_with_resolution(tmp_path, strategy="minver")
+        loaded = load_workspace(tmp_path)
+        assert loaded.workspace_manifest.resolution is not None
+        assert loaded.workspace_manifest.resolution.strategy is not None
+
+    def test_root_declares_nothing_stays_none(self, tmp_path: Path) -> None:
+        _write_workspace_root_with_resolution(tmp_path)
+        loaded = load_workspace(tmp_path)
+        assert loaded.workspace_manifest.resolution is None
+
+
+class TestWorkspaceMemberResolutionRejected:
+    """A member declaring resolution { } → MAN-RESOLUTION-MEMBER-SCOPE."""
+
+    def test_member_declares_empty_block_raises(self, tmp_path: Path) -> None:
+        """Fires even for an EMPTY resolution { } block — the rule is about WHERE
+        the block is declared, not what it contains."""
+        _write_workspace_member_with_resolution(tmp_path, member_has_resolution=True)
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace(tmp_path)
+        assert exc_info.value.slug == MAN_RESOLUTION_MEMBER_SCOPE
+
+    def test_error_includes_member_path(self, tmp_path: Path) -> None:
+        _write_workspace_member_with_resolution(
+            tmp_path, member_has_resolution=True, member_name="pkg-b"
+        )
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace(tmp_path)
+        combined = exc_info.value.message + str(exc_info.value.context)
+        assert "pkg-b" in combined
+
+    def test_fires_regardless_of_root_policy(self, tmp_path: Path) -> None:
+        """The check fires even when the root ALSO legally declares a resolution block."""
+        _write_workspace_member_with_resolution(
+            tmp_path, member_has_resolution=True, root_strategy="maxver"
+        )
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace(tmp_path)
+        assert exc_info.value.slug == MAN_RESOLUTION_MEMBER_SCOPE
+
+    def test_fires_via_load_workspace_from_manifest(self, tmp_path: Path) -> None:
+        """load_workspace_from_manifest (used by add/remove orchestration) also rejects."""
+        _write_workspace_member_with_resolution(tmp_path, member_has_resolution=True)
+        ws_manifest = WorkspaceManifest(members=("sub",))
+        with pytest.raises(MilpaError) as exc_info:
+            load_workspace_from_manifest(tmp_path, ws_manifest)
+        assert exc_info.value.slug == MAN_RESOLUTION_MEMBER_SCOPE
+
+    def test_plain_member_with_no_resolution_block_is_fine(self, tmp_path: Path) -> None:
+        _write_workspace_member_with_resolution(tmp_path, member_has_resolution=False)
+        loaded = load_workspace(tmp_path)
+        assert loaded.members[0].manifest.resolution is None
+
+
+def test_standalone_manifest_with_resolution_block_is_unaffected() -> None:
+    """A standalone (non-workspace) package manifest declaring resolution { } is FINE —
+    the MAN-RESOLUTION-MEMBER-SCOPE rule only applies to a manifest loaded as a
+    workspace MEMBER, per rfc-resolution-semantics.md §3 Axis W."""
+    text = 'name "solo"\nkind "library"\nresolution {\n    strategy "minver"\n}\n'
+    manifest = parse_manifest(text)
+    assert manifest.resolution is not None
+    assert manifest.resolution.strategy is not None
 

@@ -15,22 +15,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use milpa_core::{
     add_mirror, apply_workspace_manifest_change, baseline_sidecar_paths, build_flag_defines,
     build_index_state, canonical_digest, check_frozen_active_flags_mismatch,
+    check_locked_drift,
     check_workspace_frozen_active_flags_mismatch,
     dep_decl_store::DepDeclStore, discover_manifest, effective_trust_policy,
     fetch::{FetchError, FetcherRegistry}, fetch_verified_candidate_text, format_nimcfg,
     format_workspace_nimcfgs, from_graph, index_url_from_env, iso_timestamp,
     load_index_with_history, load_lockfile, load_manifest, load_workspace,
     parse_baseline, parse_baseline_meta, print_yank_notice,
+    registry::{parse_iso8601_timestamp, Timestamp},
     LoadedMember, LoadedWorkspace,
     make_dep_decl_store, mutate_manifest_file, parse_env_bool, parse_lockfile, parse_source_spec,
     parse_version,
-    resolve, resolve_with_cert, resolve_with_features, resolve_workspace_frozen,
+    resolve_with_cert, resolve_with_features, resolve_workspace_frozen,
     resolve_workspace_with_cert, resolve_workspace_with_features,
     verify_lockfile_against_deps, workspace_any_member_strict, write_baseline_pair, write_lockfile,
     Baseline, BaselineMeta, CaStore,
     CasAdmittingFetcher, CoreError, DefaultRegistry, FailureCert, FileDepDeclStore,
     FrozenResolver, Index, ManifestDoc, Milpa, MilpaError, MockedFetcher, Profile,
-    ProvenanceRecord, RatchetOutcome, Strategy, SuccessCert, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS,
+    ProvenanceRecord, RatchetOutcome, Strategy, SuccessCert, Version, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS,
 };
 use milpa_manifest::{valid_flag_name, Dep, FlagRequest, Manifest, OverrideTarget, UrlDep, Workspace};
 
@@ -62,9 +64,14 @@ fn main() {
 }
 
 /// Parsed global flags + the verb and its tail.
+///
+/// C3 (resolution-semantics RFC §3 Axis C / D-C2): `--strategy` is NO LONGER
+/// a global pre-dispatch field here — it moved to a per-verb scan of `rest`
+/// (`strategy_flag_value`), mirroring `--locked`/`--upgrade`'s existing
+/// scoping, so a `Strategy(Option)` sentinel can distinguish "unspecified"
+/// from an explicit `--strategy maxver`.
 struct Cli {
     directory: PathBuf,
-    strategy: Strategy,
     frozen: bool,
     /// Path for the §5 result certificate (cli-contract §2.5). `None` when
     /// `--certificate` is absent; `Some(path)` when present. Only used by
@@ -98,7 +105,24 @@ struct Cli {
 }
 
 fn run(args: &[String]) -> Result<i32, MilpaError> {
-    if args.iter().any(|a| a == "--version") {
+    // Scan only the pre-verb prefix (mirrors parse_args's own loop boundary:
+    // global flags precede the first non-dash token, the verb). A3b added a
+    // subcommand-scoped `--version` flag (`add --git ... --version x.y.z`) —
+    // scanning the WHOLE argv here would collide with it (`milpa add foo
+    // --git <url> --version 1.2.3` would print the binary version and exit
+    // 0 instead of running `add`).
+    //
+    // L1: the boundary must be computed the same way `parse_args` walks
+    // global flags — a naive "first token not starting with `-`" scan stops
+    // at the VALUE of a value-consuming global flag (`-C <dir>`,
+    // `--certificate <path>`, `-j <N>`), not at the flag itself. That made
+    // `milpa -C <dir> --version` treat `<dir>` as the verb boundary, slicing
+    // `--version` OUT of the pre-verb region entirely — it fell through to
+    // `parse_args`, which rejects a bare `--version` token, printing USAGE
+    // and exiting 2 instead of printing the version and exiting 0.
+    // `pre_verb_slice` mirrors `parse_args`'s own flag/value pairing so the
+    // two never disagree about where the verb starts.
+    if pre_verb_slice(args).iter().any(|a| a == "--version") {
         println!("milpa {VERSION}");
         return Ok(0);
     }
@@ -130,6 +154,62 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
         )));
     }
 
+    // B4 (resolution-semantics RFC §3 Axis B / D-B3): `--locked` (forbids
+    // deviation) and `--upgrade` (forces it) are contradictory — reject
+    // before dispatching to fetch/lock. Scoped to those two verbs, mirroring
+    // where both flags are actually parsed (inside `cmd_fetch`).
+    if matches!(cli.verb.as_str(), "fetch" | "lock")
+        && cli.rest.iter().any(|a| a == "--locked")
+        && upgrade_flag_values(&cli.rest).is_some()
+    {
+        return Err(MilpaError::Core(CoreError::Resolver(
+            "CLI-LOCKED-UPGRADE-CONFLICT",
+            "--locked and --upgrade are mutually exclusive: --locked forbids any \
+             deviation from the committed lock while --upgrade forces it for the \
+             targeted package(s) — pass at most one"
+                .into(),
+        )));
+    }
+
+    // C3 (resolution-semantics RFC §3 Axis C / D-C2): `--strategy` is now
+    // scoped to the resolve-triggering verbs (fetch/lock/update/add/remove/
+    // workspace add-member/remove-member), parsed from `rest` — mirrors
+    // `--locked`/`--upgrade`'s existing scoping, not the old global
+    // pre-verb flag loop. A malformed value (present but unrecognized) is
+    // a usage error (exit 2), matching the old global loop's short-circuit.
+    // Verbs that don't consult it (show/verify/clean/...) never scan for
+    // it — same "silently ignored on a non-owning verb" behavior every
+    // other scoped flag already has in this hand-rolled parser.
+    let strategy_cli: Option<Strategy> = if matches!(
+        cli.verb.as_str(),
+        "fetch" | "lock" | "update" | "add" | "remove" | "workspace"
+    ) {
+        match strategy_flag_value(&cli.rest) {
+            Ok(v) => v,
+            Err(()) => {
+                eprintln!("{USAGE}");
+                return Ok(2);
+            }
+        }
+    } else {
+        None
+    };
+
+    // D2 (resolution-semantics RFC §3 Axis D): `--exclude-newer <ts>` is
+    // scoped to fetch/lock ONLY — narrower than `--strategy`'s per-verb
+    // scoping (§3 Axis D "Verb reach": a CLI time-bound override is a
+    // fetch/lock-time CI concern; add/update/remove always read the
+    // manifest's committed bound instead, with no CLI override at all).
+    // A malformed value is a diagnosed failure (CLI-EXCLUDE-NEWER-INVALID,
+    // exit 1 + slug) — NOT a bare usage error like a malformed `--strategy`
+    // (that flag is a closed enum via `choices`; a timestamp has no such
+    // enum, so it gets a real slug instead of an exit-2 parse error).
+    let exclude_newer_cli: Option<Timestamp> = if matches!(cli.verb.as_str(), "fetch" | "lock") {
+        exclude_newer_flag_value(&cli.rest)?
+    } else {
+        None
+    };
+
     match cli.verb.as_str() {
         "show" => {
             // `--index-trust` flag on `show`: describe cached bundle claims.
@@ -142,13 +222,13 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
         }
         "verify" => cmd_verify(dir, cli.require_attested_metadata, cli.no_index, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries),
         "clean" => cmd_clean(dir),
-        "fetch" => cmd_fetch(dir, cli.strategy, cli.frozen, true, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries),
-        "lock" => cmd_fetch(dir, cli.strategy, cli.frozen, false, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries),
-        "update" => cmd_update(dir, cli.strategy, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries),
-        "add" => cmd_add(dir, cli.strategy, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries),
-        "remove" => cmd_remove(dir, cli.strategy, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index),
+        "fetch" => cmd_fetch(dir, strategy_cli, cli.frozen, true, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries, exclude_newer_cli),
+        "lock" => cmd_fetch(dir, strategy_cli, cli.frozen, false, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries, exclude_newer_cli),
+        "update" => cmd_update(dir, strategy_cli, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries),
+        "add" => cmd_add(dir, strategy_cli, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries),
+        "remove" => cmd_remove(dir, strategy_cli, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index),
         "store" => cmd_store(&cli.rest),
-        "workspace" => cmd_workspace(dir, &cli.rest, cli.strategy, cli.no_index, cli.require_attested_index, cli.refresh_index),
+        "workspace" => cmd_workspace(dir, &cli.rest, strategy_cli, cli.no_index, cli.require_attested_index, cli.refresh_index),
         "index" => cmd_index(dir, &cli.rest, cli.no_index, cli.require_attested_index),
         "hash" => cmd_hash(&cli.rest, dir),
         other => {
@@ -159,10 +239,38 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
     }
 }
 
+/// L1: compute the pre-verb prefix the SAME way `parse_args` walks global
+/// flags, so a value-consuming global flag's value is never mistaken for
+/// the verb boundary. This must recognize every value-consuming global flag
+/// `parse_args` recognizes (`-C`/`--directory`, `-j`/`--parallel`,
+/// `--certificate`) plus every boolean one, so `--version` anywhere in the
+/// true pre-verb region is found regardless of what precedes it. Stops at
+/// the first token that is either the verb (doesn't start with `-`) or an
+/// unrecognized flag (left for `parse_args` to reject).
+fn pre_verb_slice(args: &[String]) -> &[String] {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-C" | "--directory" | "-j" | "--parallel" | "--certificate" => {
+                // Value-consuming: skip the flag AND its value. If the value
+                // is missing (flag is the last token), stop at the end —
+                // `parse_args` will reject the truncated invocation itself.
+                i = (i + 2).min(args.len());
+            }
+            "--frozen" | "--no-index" | "--require-attested-metadata"
+            | "--require-attested-index" | "--require-attested-entries"
+            | "--refresh-index" | "--version" => {
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    &args[..i]
+}
+
 /// Hand-rolled arg parse: global flags (some take a value), then the verb + tail.
 fn parse_args(args: &[String]) -> Option<Cli> {
     let mut directory = PathBuf::from(".");
-    let mut strategy = Strategy::default();
     let mut frozen = false;
     let mut no_index = false;
     let mut certificate: Option<PathBuf> = None;
@@ -191,10 +299,6 @@ fn parse_args(args: &[String]) -> Option<Cli> {
             }
             "-j" | "--parallel" => {
                 args.get(i + 1)?; // accepted; the serial reference ignores -j (§4.4)
-                i += 2;
-            }
-            "-s" | "--strategy" => {
-                strategy = parse_strategy(args.get(i + 1)?)?;
                 i += 2;
             }
             "--frozen" => {
@@ -235,7 +339,6 @@ fn parse_args(args: &[String]) -> Option<Cli> {
     }
     Some(Cli {
         directory,
-        strategy,
         frozen,
         certificate,
         require_attested_metadata,
@@ -248,13 +351,159 @@ fn parse_args(args: &[String]) -> Option<Cli> {
     })
 }
 
-fn parse_strategy(s: &str) -> Option<Strategy> {
-    match s {
-        "maxver" => Some(Strategy::Maxver),
-        "minver" => Some(Strategy::Minver),
-        "semver" => Some(Strategy::Semver),
-        _ => None,
+/// C3 (resolution-semantics RFC §3 Axis C / D-C2): parse `--strategy`/`-s`
+/// from the verb's tail args (`rest`) — scoped per-verb, mirroring
+/// `--locked`/`--upgrade`'s existing scoping (`upgrade_flag_values`), NOT
+/// the old global pre-verb flag loop. `Ok(None)` = flag absent (unspecified
+/// — the caller's `resolve_effective_strategy` defers to the manifest, else
+/// the global default); `Ok(Some(s))` = explicit, always wins; `Err(())` = present
+/// with a missing or unrecognized value (usage error, exit 2 — mirrors the
+/// old global loop's `parse_strategy(..)?` short-circuit via `Option`).
+fn strategy_flag_value(rest: &[String]) -> Result<Option<Strategy>, ()> {
+    let Some(idx) = rest.iter().position(|a| a == "-s" || a == "--strategy") else {
+        return Ok(None);
+    };
+    match rest.get(idx + 1).and_then(|v| Strategy::parse(v)) {
+        Some(s) => Ok(Some(s)),
+        None => Err(()),
     }
+}
+
+/// C3 (resolution-semantics RFC §3 Axis C / D-C2): resolve the
+/// EXPLICITLY-DECLARED strategy for one verb's resolve, walking the
+/// precedence chain ONCE — explicit CLI `--strategy` > the manifest's
+/// `resolution { strategy }` > `None` (neither source declared one).
+///
+/// `cli_strategy` is `None` when `--strategy` was not passed (the
+/// `Option<Strategy>` sentinel plumbing) — distinct from an explicit
+/// `--strategy maxver`, which always wins even though it names the default
+/// value.
+///
+/// RR1 (duplicate-precedence-walk cleanup): this used to be a PAIR of
+/// near-identical functions — `resolve_effective_strategy` (returning a
+/// default-filled `Strategy`) and a sibling `strategy_is_explicit`
+/// (returning whether it was explicit) — that walked this SAME precedence
+/// chain twice per call site (~10 sites in this file alone). Collapsed
+/// into a single walk: every call site now derives BOTH facts from this
+/// one `Option<Strategy>` result:
+///
+/// ```ignore
+/// let decl = resolve_effective_strategy(cli_strategy, resolution);
+/// let strategy_explicit = decl.is_some();
+/// let strategy = decl.unwrap_or_default();
+/// ```
+///
+/// R9 (resolution-semantics RFC §3 Axis C NORMATIVE text: "the lockfile-
+/// recorded strategy is diagnostic/frozen-parity only, never a live
+/// input"): there used to be a third tier here that fell back to the prior
+/// lockfile's recorded `strategy` before the global default. That made a
+/// one-off `--strategy X` invisibly and permanently govern every future
+/// bare resolve (hidden sticky state), and made the lockfile a live
+/// resolution input rather than a pure diagnostic record — contradicting
+/// the RFC text above. That tier is gone; this function takes no `prior`
+/// argument at all.
+///
+/// Stability of a bare re-resolve against a lock recorded under a
+/// non-default strategy is preserved a DIFFERENT way — via B2's
+/// lock-preference mechanism (`ResolveProvider::preference`), not by
+/// treating the lockfile's strategy as a governing tier here. See
+/// `ResolveProvider::bypasses_lock_preference` for how: the bypass that
+/// would otherwise drop B2's preference and newest-wins the whole graph
+/// only fires when the strategy declared here is `Some` AND diverges from
+/// the lock's recorded value — never when it is merely default-filled.
+fn resolve_effective_strategy(
+    cli_strategy: Option<Strategy>,
+    resolution: Option<milpa_manifest::Resolution>,
+) -> Option<Strategy> {
+    if let Some(s) = cli_strategy {
+        return Some(s);
+    }
+    resolution.and_then(|r| r.strategy)
+}
+
+/// D2 (resolution-semantics RFC §3 Axis D): parse `--exclude-newer <ts>`
+/// from the verb's tail args (`rest`) — scoped to `fetch`/`lock` ONLY by the
+/// caller (narrower than `--strategy`'s per-verb scoping; see the call site
+/// in `run()`). `Ok(None)` = flag absent (unspecified — the caller's
+/// `resolve_effective_exclude_newer` defers to the manifest); `Ok(Some(ts))`
+/// = explicit, parsed via the shared `parse_iso8601_timestamp`; `Err(_)` =
+/// present with a missing or unparseable value — a DIAGNOSED failure
+/// (`CLI-EXCLUDE-NEWER-INVALID`, exit 1 + slug), unlike `strategy_flag_value`'s
+/// bare `Err(())` usage error: a timestamp has no closed enum of valid
+/// spellings the way `-s`/`--strategy` does via `choices`, so a malformed
+/// value gets a real catalog slug instead of a silent exit-2.
+fn exclude_newer_flag_value(rest: &[String]) -> Result<Option<Timestamp>, MilpaError> {
+    let Some(idx) = rest.iter().position(|a| a == "--exclude-newer") else {
+        return Ok(None);
+    };
+    match rest.get(idx + 1) {
+        Some(raw) => match parse_iso8601_timestamp(raw) {
+            Some(ts) => Ok(Some(ts)),
+            None => Err(MilpaError::Core(CoreError::Resolver(
+                "CLI-EXCLUDE-NEWER-INVALID",
+                format!("--exclude-newer value {raw:?} is not a parseable ISO 8601 timestamp"),
+            ))),
+        },
+        None => Err(MilpaError::Core(CoreError::Resolver(
+            "CLI-EXCLUDE-NEWER-INVALID",
+            "--exclude-newer requires a value (an ISO 8601 timestamp)".into(),
+        ))),
+    }
+}
+
+/// D2/D5 (resolution-semantics RFC §3 Axis D): resolve the EFFECTIVE
+/// exclude-newer time-bound for one verb's resolve, in precedence order —
+/// explicit CLI `--exclude-newer` > the manifest's `resolution {
+/// exclude-newer }` > the prior lockfile's recorded `exclude_newer` > `None`
+/// (no time bound).
+///
+/// NOTE (R9): `resolve_effective_strategy` no longer has an analogous
+/// lockfile-fallback tier at all — the lockfile-recorded `strategy` is
+/// diagnostic/frozen-parity only, never a live input (unlike
+/// `exclude_newer`, which legitimately keeps its own D5 no-silent-drop
+/// lockfile-fallback tier here, by design, for the verbs that call this
+/// with a real `prior`). The two functions' precedence chains are NOT
+/// symmetric post-R9 — this asymmetry is intentional.
+///
+/// (`prior` is the ACTUAL on-disk lockfile, never the resolve-scoped
+/// `prior` that `update`/`--upgrade` null out or strip for B2's
+/// minimal-change preference).
+///
+/// **D5 (no-silent-drop, §6 D-D3):** the third (lockfile) tier is load-
+/// bearing, not decorative — a bound set ONLY via a one-off CLI
+/// `--exclude-newer` on `fetch`/`lock` (with no matching `resolution {
+/// exclude-newer }` ever added to the manifest) is recorded in the
+/// lockfile by D5. Without this tier, the very next `update`/`remove`
+/// (which never see a CLI flag) would silently drop that bound —
+/// `resolution` is `None`, tier 2 misses, and the project would silently
+/// un-freeze. Falling back to the lockfile's own recorded value here
+/// closes that hole — this is precisely the D5 asymmetry that makes
+/// `exclude_newer`'s lockfile tier CORRECT while `strategy`'s equivalent
+/// (now-removed) tier was WRONG (R9): `exclude_newer` has no CLI surface
+/// on `add`/`update`/`remove`, so falling back to the lockfile is the only
+/// way to avoid silently dropping a committed bound; `strategy` DOES have
+/// a CLI surface on every resolve-triggering verb, so an unspecified
+/// `--strategy` is a genuine "use the default" signal, not a gap to patch.
+///
+/// Only `fetch`/`lock` register the CLI flag (§3 Axis D "Verb reach" — a
+/// time-bound CLI override is a fetch/lock-time CI concern). Every other
+/// resolve-triggering verb (`add`/`update`/`remove`/workspace
+/// add-member/remove-member) always calls this with `cli_exclude_newer:
+/// None`, so it transparently falls through to tiers 2/3 — the manifest's
+/// committed bound (or, absent that, the lockfile's carried-forward bound)
+/// is honored with no new CLI plumbing at those call sites.
+fn resolve_effective_exclude_newer(
+    cli_exclude_newer: Option<Timestamp>,
+    resolution: Option<milpa_manifest::Resolution>,
+    prior: Option<&milpa_core::Lockfile>,
+) -> Option<Timestamp> {
+    if cli_exclude_newer.is_some() {
+        return cli_exclude_newer;
+    }
+    if let Some(ts) = resolution.and_then(|r| r.exclude_newer) {
+        return Some(ts);
+    }
+    prior.and_then(|p| p.exclude_newer)
 }
 
 // --- verbs -----------------------------------------------------------------
@@ -284,6 +533,91 @@ fn format_provenance_record(p: &ProvenanceRecord) -> String {
 }
 
 /// `milpa show` — print the locked dep graph (stdout).
+/// A7 (rfc-resolution-semantics.md §3 Axis A / §5): the `" (<label>)"` suffix
+/// `cmd_show` prints next to a dep's version. Pure/testable in isolation
+/// (Rust's `cmd_show` writes straight to stdout via `println!`, which isn't
+/// easily captured without a subprocess — see `s10_show_prints_active_flags`'s
+/// note above — so the branching logic itself lives here where it CAN be
+/// unit-tested directly).
+///
+/// - `declared_version_source` present → `" (<source>)"` (manifest/nimble/
+///   tag/annotation).
+/// - absent AND `version == "0.0.0"` → `" (version-unknown)"`, the A5
+///   flattening pairing (§5 NORMATIVE: version-unknown is defined by THIS
+///   pairing, not by source-absence alone).
+/// - absent AND any other version (e.g. a named/index dep, out of Axis A's
+///   scope, which also carries no source) → no suffix; it has a real known
+///   version, just not one of the four Axis-A sources.
+fn version_suffix(declared_version_source: &Option<String>, version: &str) -> String {
+    if let Some(src) = declared_version_source {
+        format!(" ({src})")
+    } else if version == "0.0.0" {
+        " (version-unknown)".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Render a [`Timestamp`] back to canonical UTC ISO 8601
+/// (`YYYY-MM-DDTHH:MM:SS[.fraction]Z`) for `cmd_show`'s `exclude-newer`
+/// header line — the exact wire form the Python reference's
+/// `_format_resolution_timestamp` produces, and byte-identical to
+/// `milpa_types::format_iso8601_timestamp` (the lockfile writer's own
+/// serializer for this same field, `milpa-core::lockfile.rs`).
+///
+/// This duplicates that function's algorithm rather than calling it: only
+/// `Timestamp` itself (via `milpa_core::registry`'s re-export) is reachable
+/// from `milpa-cli` today — `milpa-types` is not a direct dependency of this
+/// crate, and neither `milpa-core` nor `milpa-manifest` re-exports
+/// `format_iso8601_timestamp` (they re-export `parse_iso8601_timestamp` and
+/// `Timestamp`, but not the formatter). Follow-up: add
+/// `format_iso8601_timestamp` to `milpa-core`'s `pub use` list (one line,
+/// next to its existing `Timestamp` re-export) and delete this copy.
+fn format_timestamp_for_show(ts: &Timestamp) -> String {
+    // Howard Hinnant's `civil_from_days` (proleptic Gregorian, days-since-
+    // epoch -> (year, month, day)) — transcribed verbatim from
+    // `milpa_types::format_iso8601_timestamp`'s private helper of the same
+    // name.
+    let z = ts.unix_seconds.div_euclid(86400) + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+
+    let secs_of_day = ts.unix_seconds.rem_euclid(86400);
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    let second = secs_of_day % 60;
+    if ts.nanos == 0 {
+        format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+    } else {
+        let mut frac = format!("{:09}", ts.nanos);
+        while frac.ends_with('0') {
+            frac.pop();
+        }
+        format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}.{frac}Z")
+    }
+}
+
+/// A7/D5 (rfc-resolution-semantics.md §3 Axis D / §5): the `exclude-newer`
+/// header line `cmd_show` prints right after `strategy` — `None` when the
+/// lockfile recorded no bound (a genuine absence, never a fake/hardcoded
+/// line), `Some("exclude-newer <ts>")` otherwise. Pure/testable in
+/// isolation for the same reason `version_suffix` is: `cmd_show` writes
+/// straight to stdout via `println!`, so the branching + formatting logic
+/// lives in a helper that CAN be unit-tested directly. Mirrors the Python
+/// reference's `cmd_show`: `f"exclude-newer {_format_resolution_timestamp(lockfile.exclude_newer)}"`.
+fn exclude_newer_header_line(exclude_newer: &Option<Timestamp>) -> Option<String> {
+    exclude_newer
+        .as_ref()
+        .map(|ts| format!("exclude-newer {}", format_timestamp_for_show(ts)))
+}
+
 fn cmd_show(dir: &Path) -> Result<i32, MilpaError> {
     let text = std::fs::read_to_string(dir.join("milpa.lock")).map_err(|_| {
         MilpaError::Core(CoreError::Lockfile(
@@ -292,8 +626,28 @@ fn cmd_show(dir: &Path) -> Result<i32, MilpaError> {
         ))
     })?;
     let lock = parse_lockfile(&text)?;
+
+    // A7 (rfc-resolution-semantics.md §3 Axis A): top-level resolution-state
+    // header, printed once before the per-dep list. `strategy` is always
+    // shown; `exclude_newer` (D5) is shown only when the lockfile recorded
+    // one (never a fake/hardcoded value for the absent case) — see
+    // `exclude_newer_header_line`'s doc comment for the exact contract.
+    println!("strategy    {}", lock.strategy);
+    if let Some(line) = exclude_newer_header_line(&lock.exclude_newer) {
+        println!("{line}");
+    }
+
     for dep in &lock.deps {
-        println!("{:20} {}", dep.name, dep.version);
+        // A7: surface the declared-version source next to the version —
+        // `manifest`/`nimble`/`tag`/`annotation` when a source was recorded
+        // (A5), or `(version-unknown)` for the A5 flattening pairing
+        // (`version == "0.0.0"` + no `declared_version_source`). A
+        // named/index dep also has no `declared_version_source` (out of
+        // Axis A's scope) but is NOT version-unknown — it is only flagged
+        // when paired with the flattened `0.0.0` sentinel, per the RFC's
+        // unambiguous pairing.
+        let suffix = version_suffix(&dep.declared_version_source, &dep.version);
+        println!("{:20} {}{}", dep.name, dep.version, suffix);
         if let Some(id) = &dep.identity {
             // Print algo:digest[:8] — matches Python `{algo}:{digest[:8]}`.
             if let Some((algo, digest)) = id.split_once(':') {
@@ -907,7 +1261,7 @@ fn build_registry() -> Box<dyn FetcherRegistry> {
 #[allow(clippy::too_many_arguments)]
 fn cmd_fetch(
     dir: &Path,
-    strategy: Strategy,
+    strategy_cli: Option<Strategy>,
     frozen: bool,
     emit_nimcfg: bool,
     cert_path: Option<&Path>,
@@ -917,6 +1271,11 @@ fn cmd_fetch(
     require_attested_index: bool,
     refresh_index: bool,
     require_attested_entries: bool,
+    // D2 (resolution-semantics RFC §3 Axis D): the CLI `--exclude-newer`
+    // value (fetch/lock only — the ONLY two verbs `cmd_fetch` implements).
+    // `None` when unspecified; resolved to the EFFECTIVE value against this
+    // verb's own manifest below, mirroring `strategy_cli`.
+    exclude_newer_cli: Option<Timestamp>,
 ) -> Result<i32, MilpaError> {
     let deps_dir = dir.join("_deps");
     let doc = discover_manifest(dir)?;
@@ -925,6 +1284,20 @@ fn cmd_fetch(
     // the verb's rest args.  Mirrors how `cmd_update` accepts --features.
     // Needed for the workspace path's resolve_workspace_with_features call.
     let (cli_features, cli_no_default, cli_all_features) = parse_feature_args(rest);
+
+    // B3 (resolution-semantics RFC §3 Axis B): `--locked` is scoped to
+    // fetch/lock only (this fn handles both verbs), parsed from `rest` the
+    // same way `--features`/`--all-features` are — not the global pre-verb
+    // flag loop, which is reserved for the legacy `--frozen`/`--strategy`
+    // flags this RFC does not migrate (that is Axis C's C3, later).
+    let locked = rest.iter().any(|a| a == "--locked");
+
+    // B4 (resolution-semantics RFC §3 Axis B / D-B3): `--upgrade [<dep>...]`
+    // is scoped the same way `--locked` is — parsed from `rest`, not the
+    // pre-verb global flag loop. `None` = flag absent (ordinary
+    // minimal-change applies); `Some(vec![])` = bare (opt out globally);
+    // `Some(names)` = opt out only for those deps.
+    let upgrade = upgrade_flag_values(rest);
 
     // All fetches go through CasAdmittingFetcher so that _deps/<name> is
     // always a relative CAS symlink (matching Python's registry layer and the
@@ -937,6 +1310,25 @@ fn cmd_fetch(
 
     if let ManifestDoc::Workspace(_) = doc {
         let ws = load_workspace(dir)?;
+        // C3/R9 (resolution-semantics RFC §3 Axis C / D-C2): resolve the
+        // EFFECTIVE strategy (+ whether it was explicitly sourced) ONCE,
+        // valid for both the frozen and non-frozen paths below (the frozen
+        // path's `write_lockfile` rewrite, further down, also needs a
+        // strategy value) — against the WORKSPACE ROOT manifest (Axis W:
+        // resolution{} is root-only).
+        let strategy_decl = resolve_effective_strategy(strategy_cli, ws.resolution);
+        let strategy_explicit = strategy_decl.is_some();
+        let strategy = strategy_decl.unwrap_or_default();
+        // D2: resolve the EFFECTIVE exclude-newer bound the same way, against
+        // the WORKSPACE ROOT manifest (Axis D is root-only, same as
+        // strategy). Deliberately NO lockfile (tier-3) fallback here — unlike
+        // `update`/`remove`, `fetch`/`lock` DO have a CLI override, so an
+        // absent CLI + absent manifest is a genuine "nothing declared this
+        // run" result. This is exactly what makes `--locked`'s no-silent-drop
+        // check (below) meaningful: comparing THIS honest 2-tier value
+        // against the committed lock's recorded value is how a real drop
+        // gets caught (D5, §6 D-D3).
+        let exclude_newer = resolve_effective_exclude_newer(exclude_newer_cli, ws.resolution, None);
         let graph = if frozen {
             // Workspace frozen path: reconstruct from lockfile + CAS, check
             // FROZEN-MEMBER-NOT-IN-WORKSPACE and FROZEN-MEMBER-IDENTITY-DRIFT.
@@ -963,6 +1355,13 @@ fn cmd_fetch(
             let profile = profile_from_env();
             // §8: reuse existing pins (idempotent repeated fetch — see single-pkg path).
             let prior = maybe_prior_lockfile(&dir.join("milpa.lock"));
+            // C3: `strategy` (the effective value) was already computed above,
+            // before the frozen/non-frozen split.
+            // B4: delegate to the SAME strip-pin mechanism `milpa update` uses (D-B3).
+            let prior = match &upgrade {
+                Some(names) => strip_pins_for_upgrade(prior, names)?,
+                None => prior,
+            };
             // P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
             let entry_trust = build_entry_trust_gate(
                 &ws.entry_trust_policy,
@@ -979,21 +1378,24 @@ fn cmd_fetch(
                     dir, &ws, &deps_dir,
                     index.as_ref(), registry.as_ref(),
                     profile.as_ref(), prior.as_ref(),
-                    strategy, emit_nimcfg, cert_dest,
+                    strategy, strategy_explicit, emit_nimcfg, cert_dest,
                     require_attested_metadata,
                     &cli_features, cli_no_default, cli_all_features,
                     entry_trust.as_ref(),
+                    locked,
+                    exclude_newer,
                 );
             }
 
             // S2 (workspace-completion §3.A): CLI feature-selection wired in.
-            resolve_workspace_with_features(
+            let ws_graph = resolve_workspace_with_features(
                 &ws,
                 index.as_ref(),
                 registry.as_ref(),
                 profile.as_ref(),
                 prior.as_ref(),
                 strategy,
+                strategy_explicit,
                 &deps_dir,
                 require_attested_metadata,
                 &build_store(),
@@ -1001,10 +1403,19 @@ fn cmd_fetch(
                 cli_no_default,
                 cli_all_features,
                 entry_trust.as_ref(),
-            )?
+                exclude_newer,
+            )?;
+            // B3: --locked asserts the resolve matches the committed lock
+            // (identity + provenance, never the version label — D-B2)
+            // BEFORE anything is written, so a drifted resolve never
+            // clobbers the committed lockfile/nim.cfg.
+            if locked {
+                check_locked_drift(prior.as_ref(), &ws_graph, exclude_newer)?;
+            }
+            ws_graph
         };
         write_lockfile(
-            &from_graph(&graph, strategy.as_str()),
+            &from_graph(&graph, strategy.as_str(), exclude_newer),
             &dir.join("milpa.lock"),
         )?;
         if emit_nimcfg {
@@ -1030,6 +1441,20 @@ fn cmd_fetch(
     let ManifestDoc::Package(manifest) = doc else {
         unreachable!("workspace handled above");
     };
+
+    // C3/R9 (resolution-semantics RFC §3 Axis C / D-C2): resolve the
+    // EFFECTIVE strategy (+ whether it was explicitly sourced) ONCE, valid
+    // for both the frozen and non-frozen paths below (the frozen path's
+    // `write_lockfile` rewrite, further down, also needs a strategy value)
+    // — against the current manifest.
+    let strategy_decl = resolve_effective_strategy(strategy_cli, manifest.resolution);
+    let strategy_explicit = strategy_decl.is_some();
+    let strategy = strategy_decl.unwrap_or_default();
+    // D2: resolve the EFFECTIVE exclude-newer bound the same way. Deliberately
+    // NO lockfile (tier-3) fallback here — see the workspace branch above for
+    // the full rationale (fetch/lock's CLI override makes an honest 2-tier
+    // value the correct "new resolve" input to `--locked`'s drift check).
+    let exclude_newer = resolve_effective_exclude_newer(exclude_newer_cli, manifest.resolution, None);
 
     let graph = if frozen {
         // Gap-1 E (partial): FROZEN-NO-LOCKFILE — distinguish "no lockfile"
@@ -1060,6 +1485,13 @@ fn cmd_fetch(
         // §8: reuse the existing lockfile's pins so repeated `fetch`/`lock` runs
         // are idempotent and a silently-moved ref / substituted archive is caught.
         let prior = maybe_prior_lockfile(&dir.join("milpa.lock"));
+        // C3: `strategy` (the effective value) was already computed above,
+        // before the frozen/non-frozen split.
+        // B4: delegate to the SAME strip-pin mechanism `milpa update` uses (D-B3).
+        let prior = match &upgrade {
+            Some(names) => strip_pins_for_upgrade(prior, names)?,
+            None => prior,
+        };
 
         // S3b: wire dep_decl_store from environment (MILPA_DEP_DECL_DIR or MILPA_INDEX_URL).
         // Built before the cert branch so both paths share the same store — single
@@ -1084,8 +1516,10 @@ fn cmd_fetch(
             // Finding-High-1: strict attestation; Finding-High-2: DepDecl wiring).
             return cmd_fetch_with_cert(
                 dir, &manifest, &deps_dir, index.as_ref(), registry.as_ref(),
-                profile.as_ref(), prior.as_ref(), strategy, emit_nimcfg, cert_dest,
+                profile.as_ref(), prior.as_ref(), strategy, strategy_explicit, emit_nimcfg, cert_dest,
                 dep_decl_store, require_attested_metadata, entry_trust.as_ref(),
+                locked,
+                exclude_newer,
             );
         }
 
@@ -1093,13 +1527,14 @@ fn cmd_fetch(
         // workspace path already does via resolve_workspace_with_features). The
         // bare resolve() ignored --features, so feature/profile fixtures passed
         // in-process but diverged black-box (Slice F, fixture-209/210/211/...).
-        resolve_with_features(
+        let pkg_graph = resolve_with_features(
             &manifest,
             index.as_ref(),
             registry.as_ref(),
             profile.as_ref(),
             prior.as_ref(),
             strategy,
+            strategy_explicit,
             &deps_dir,
             dep_decl_store,
             require_attested_metadata,
@@ -1108,11 +1543,17 @@ fn cmd_fetch(
             cli_no_default,
             cli_all_features,
             entry_trust.as_ref(),
-        )?
+            exclude_newer,
+        )?;
+        // B3: see the workspace branch above for the rationale.
+        if locked {
+            check_locked_drift(prior.as_ref(), &pkg_graph, exclude_newer)?;
+        }
+        pkg_graph
     };
 
     write_lockfile(
-        &from_graph(&graph, strategy.as_str()),
+        &from_graph(&graph, strategy.as_str(), exclude_newer),
         &dir.join("milpa.lock"),
     )?;
     if emit_nimcfg {
@@ -1148,18 +1589,37 @@ fn cmd_fetch_with_cert(
     profile: Option<&Profile>,
     prior: Option<&milpa_core::Lockfile>,
     strategy: Strategy,
+    // R9: see `resolve_effective_strategy`'s doc comment.
+    strategy_explicit: bool,
     emit_nimcfg: bool,
     cert_dest: &Path,
     dep_decl_store: Option<&dyn DepDeclStore>,
     require_attested_metadata: bool,
     entry_trust: Option<&milpa_core::EntryTrustConfig>,
+    locked: bool,
+    // D2 (resolution-semantics RFC §3 Axis D): the EFFECTIVE exclude-newer
+    // time-bound this resolve is running under.
+    exclude_newer: Option<Timestamp>,
 ) -> Result<i32, MilpaError> {
-    match resolve_with_cert(manifest, index, registry, profile, prior, strategy, deps_dir, dep_decl_store, require_attested_metadata, &build_store(), entry_trust) {
+    match resolve_with_cert(manifest, index, registry, profile, prior, strategy, strategy_explicit, deps_dir, dep_decl_store, require_attested_metadata, &build_store(), entry_trust, exclude_newer) {
         Ok((graph, cert)) => {
+            // B3: --locked asserts the resolve matches the committed lock
+            // BEFORE any cert/lockfile/nim.cfg write. A drift is reported
+            // via an EMPTY failure cert — mirrors the existing convention
+            // for every other non-SOLVE-CONFLICT MilpaError failure.
+            if locked {
+                if let Err(e) = check_locked_drift(prior, &graph, exclude_newer) {
+                    let _ = write_failure_cert(
+                        cert_dest,
+                        &FailureCert { message: String::new(), refutation: Vec::new() },
+                    );
+                    return Err(e.into());
+                }
+            }
             // Write the success certificate (best-effort; a cert write failure
             // does NOT abort the command — the lock/nim.cfg still land).
             let _ = write_success_cert(cert_dest, &cert);
-            write_lockfile(&from_graph(&graph, strategy.as_str()), &dir.join("milpa.lock"))?;
+            write_lockfile(&from_graph(&graph, strategy.as_str(), exclude_newer), &dir.join("milpa.lock"))?;
             if emit_nimcfg {
                 let flag_defines = build_flag_defines(&graph, deps_dir);
                 let _ = std::fs::write(
@@ -1198,6 +1658,8 @@ fn cmd_fetch_workspace_with_cert(
     profile: Option<&Profile>,
     prior: Option<&milpa_core::Lockfile>,
     strategy: Strategy,
+    // R9: see `resolve_effective_strategy`'s doc comment.
+    strategy_explicit: bool,
     emit_nimcfg: bool,
     cert_dest: &Path,
     require_attested_metadata: bool,
@@ -1205,18 +1667,33 @@ fn cmd_fetch_workspace_with_cert(
     no_default_features: bool,
     all_features: bool,
     entry_trust: Option<&milpa_core::EntryTrustConfig>,
+    locked: bool,
+    // D2 (resolution-semantics RFC §3 Axis D): the EFFECTIVE exclude-newer
+    // time-bound this resolve is running under.
+    exclude_newer: Option<Timestamp>,
 ) -> Result<i32, MilpaError> {
     match resolve_workspace_with_cert(
-        ws, index, registry, profile, prior, strategy, deps_dir,
+        ws, index, registry, profile, prior, strategy, strategy_explicit, deps_dir,
         require_attested_metadata, &build_store(),
         features, no_default_features, all_features,
         entry_trust,
+        exclude_newer,
     ) {
         Ok((graph, cert)) => {
+            // B3: see cmd_fetch_with_cert for the rationale.
+            if locked {
+                if let Err(e) = check_locked_drift(prior, &graph, exclude_newer) {
+                    let _ = write_failure_cert(
+                        cert_dest,
+                        &FailureCert { message: String::new(), refutation: Vec::new() },
+                    );
+                    return Err(e.into());
+                }
+            }
             // Write success certificate (best-effort; a cert write failure does
             // NOT abort the command — lock/nim.cfg still land).
             let _ = write_success_cert(cert_dest, &cert);
-            write_lockfile(&from_graph(&graph, strategy.as_str()), &dir.join("milpa.lock"))?;
+            write_lockfile(&from_graph(&graph, strategy.as_str(), exclude_newer), &dir.join("milpa.lock"))?;
             if emit_nimcfg {
                 let ws_flag_defines = milpa_core::build_flag_defines(&graph, deps_dir);
                 for (path, text) in format_workspace_nimcfgs(ws, &graph, Some(&ws_flag_defines)) {
@@ -1251,47 +1728,42 @@ fn cmd_fetch_workspace_with_cert(
 ///   drop ONLY that pin; pass all other pins to the resolver as `prior` so they
 ///   stay stable; re-resolve; write the new lockfile.
 #[allow(clippy::too_many_arguments)]
-fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, require_attested_index: bool, refresh_index: bool, require_attested_entries: bool) -> Result<i32, MilpaError> {
+fn cmd_update(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_index: bool, require_attested_index: bool, refresh_index: bool, require_attested_entries: bool) -> Result<i32, MilpaError> {
     let name = rest.first().cloned();
     let lock_path = dir.join("milpa.lock");
 
     // Scoped update: load the lockfile and build the prior (all pins minus the
     // named dep). Reject if the named dep is not pinned.
-    let prior: Option<milpa_core::Lockfile> = match &name {
-        None => None,
-        Some(name) => {
-            // §5.8: with a <dep> arg but no lockfile, exit 1 (no prior pins to
-            // drop selectively — `milpa fetch` is the correct action).
-            if !lock_path.exists() {
-                return Err(MilpaError::Core(CoreError::Lockfile(
-                    "LOCK-FILE-NOT-FOUND",
-                    "update: no milpa.lock — run `milpa fetch` first".into(),
-                )));
-            }
-            let full = load_lockfile(&lock_path)?;
-
-            // D-update-remove: alias→canonical resolution (Phase D item 5).
-            // If `name` is an alias of a canonical dep, operate on the canonical.
-            let canonical = canonical_name_for(name, &full);
-
-            if !full.deps.iter().any(|d| d.name == canonical) {
-                let mut known: Vec<&str> = full.deps.iter().map(|d| d.name.as_str()).collect();
-                known.sort_unstable();
-                eprintln!(
-                    "update: no dep {name:?} in lockfile (known: {})",
-                    if known.is_empty() {
-                        "<none>".to_string()
-                    } else {
-                        known.join(", ")
-                    }
-                );
-                eprintln!("milpa-error: LOCK-DEP-NOT-FOUND");
-                return Ok(1);
-            }
-            // Strip the pin for the canonical dep: retains declared Git provenances
-            // (Phase D item 5) and clears identity → dep re-resolves fresh.
-            Some(milpa_core::strip_dep_pin(full, &canonical))
+    //
+    // B4 (resolution-semantics RFC §3 Axis B / D-B3): the guard + strip below
+    // delegates to `strip_pins_for_upgrade` — the SAME shared mechanism
+    // `--upgrade [<dep>...]` on fetch/lock uses, so the two verbs cannot
+    // structurally drift. This covers the D-update-remove alias→canonical
+    // resolution (Phase D item 5), the not-in-lockfile guard, and the
+    // pin-strip (retains declared mirror provenances per Phase D item 5;
+    // clears identity so the dep re-resolves fresh) in one call.
+    let dep_names: Vec<String> = name.iter().cloned().collect();
+    let prior_loaded: Option<milpa_core::Lockfile> = if dep_names.is_empty() {
+        None
+    } else {
+        // §5.8: with a <dep> arg but no lockfile, exit 1 (no prior pins to
+        // drop selectively — `milpa fetch` is the correct action).
+        if !lock_path.exists() {
+            return Err(MilpaError::Core(CoreError::Lockfile(
+                "LOCK-FILE-NOT-FOUND",
+                "update: no milpa.lock — run `milpa fetch` first".into(),
+            )));
         }
+        Some(load_lockfile(&lock_path)?)
+    };
+    let prior = match strip_pins_for_upgrade(prior_loaded, &dep_names) {
+        Ok(p) => p,
+        Err(e) if e.code() == "LOCK-DEP-NOT-FOUND" => {
+            eprintln!("update: {}", message_of(&e));
+            eprintln!("milpa-error: LOCK-DEP-NOT-FOUND");
+            return Ok(1);
+        }
+        Err(e) => return Err(e),
     };
 
     let doc = discover_manifest(dir)?;
@@ -1312,6 +1784,21 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
             require_attested_entries,
             no_index,
         )?;
+        // C3/R9 (resolution-semantics RFC §3 Axis C / D-C2): resolve the
+        // EFFECTIVE strategy (+ whether it was explicitly sourced) against
+        // the WORKSPACE ROOT manifest — independent of `prior` above, which
+        // this verb deliberately nulls/strips for B2's minimal-change
+        // preference (dropping a dep's pin must not also reset the
+        // governing strategy).
+        let strategy_decl = resolve_effective_strategy(strategy_cli, ws.resolution);
+        let strategy_explicit = strategy_decl.is_some();
+        let strategy = strategy_decl.unwrap_or_default();
+        // D2/D5: `update` has no CLI `--exclude-newer` flag (fetch/lock only,
+        // §3 Axis D "Verb reach") — falls through to the manifest's committed
+        // bound, then (D5, no-silent-drop) the lockfile's own recorded bound.
+        let exclude_newer = resolve_effective_exclude_newer(
+            None, ws.resolution, maybe_prior_lockfile(&lock_path).as_ref(),
+        );
         let graph = resolve_workspace_with_features(
             &ws,
             index.as_ref(),
@@ -1319,6 +1806,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
             profile.as_ref(),
             prior.as_ref(),
             strategy,
+            strategy_explicit,
             &ws_deps_dir,
             false, // cmd_update does not accept --require-attested-metadata (fetch/lock only)
             &build_store(),
@@ -1326,8 +1814,9 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
             false,
             false,
             entry_trust.as_ref(),
+            exclude_newer,
         )?;
-        write_lockfile(&from_graph(&graph, strategy.as_str()), &lock_path)?;
+        write_lockfile(&from_graph(&graph, strategy.as_str(), exclude_newer), &lock_path)?;
         eprintln!(
             "updated {} across {} members",
             name.as_deref().unwrap_or("all deps"),
@@ -1354,26 +1843,37 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
             no_index,
         )?;
         // Re-build prior against the SHARED lockfile, not a member-local one.
-        let ws_prior: Option<milpa_core::Lockfile> = match &name {
-            None => None,
-            Some(_) => {
-                if !ws_lock_path.exists() {
-                    eprintln!("update: no milpa.lock at {} — run `milpa fetch` first", ws_lock_path.display());
-                    eprintln!("milpa-error: LOCK-FILE-NOT-FOUND");
-                    return Ok(1);
-                }
-                let full = load_lockfile(&ws_lock_path)?;
-                let canonical = canonical_name_for(name.as_ref().unwrap(), &full);
-                if !full.deps.iter().any(|d| d.name == canonical) {
-                    eprintln!("update: no dep {:?} in lockfile", name.as_ref().unwrap());
-                    eprintln!("milpa-error: LOCK-DEP-NOT-FOUND");
-                    return Ok(1);
-                }
-                // Strip the pin for the canonical dep: retains declared Git provenances
-                // (Phase D item 5) and clears identity → dep re-resolves fresh.
-                Some(milpa_core::strip_dep_pin(full, &canonical))
+        // B4 (D-B3): same shared `strip_pins_for_upgrade` delegation as the
+        // root/direct-workspace path above.
+        let ws_prior_loaded: Option<milpa_core::Lockfile> = if dep_names.is_empty() {
+            None
+        } else {
+            if !ws_lock_path.exists() {
+                eprintln!("update: no milpa.lock at {} — run `milpa fetch` first", ws_lock_path.display());
+                eprintln!("milpa-error: LOCK-FILE-NOT-FOUND");
+                return Ok(1);
             }
+            Some(load_lockfile(&ws_lock_path)?)
         };
+        let ws_prior = match strip_pins_for_upgrade(ws_prior_loaded, &dep_names) {
+            Ok(p) => p,
+            Err(e) if e.code() == "LOCK-DEP-NOT-FOUND" => {
+                eprintln!("update: {}", message_of(&e));
+                eprintln!("milpa-error: LOCK-DEP-NOT-FOUND");
+                return Ok(1);
+            }
+            Err(e) => return Err(e),
+        };
+        // C3/R9: resolve the EFFECTIVE strategy (+ whether it was
+        // explicitly sourced) against the WORKSPACE ROOT manifest.
+        let strategy_decl = resolve_effective_strategy(strategy_cli, ws.resolution);
+        let strategy_explicit = strategy_decl.is_some();
+        let strategy = strategy_decl.unwrap_or_default();
+        // D2/D5: no CLI flag on `update` — manifest-only, then (no-silent-
+        // drop) the lockfile's own recorded bound, same as the root path above.
+        let exclude_newer = resolve_effective_exclude_newer(
+            None, ws.resolution, maybe_prior_lockfile(&ws_lock_path).as_ref(),
+        );
         let graph = resolve_workspace_with_features(
             &ws,
             index.as_ref(),
@@ -1381,6 +1881,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
             profile.as_ref(),
             ws_prior.as_ref(),
             strategy,
+            strategy_explicit,
             &ws_deps_dir,
             false,
             &build_store(),
@@ -1388,8 +1889,9 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
             false,
             false,
             entry_trust.as_ref(),
+            exclude_newer,
         )?;
-        write_lockfile(&from_graph(&graph, strategy.as_str()), &ws_lock_path)?;
+        write_lockfile(&from_graph(&graph, strategy.as_str(), exclude_newer), &ws_lock_path)?;
         eprintln!(
             "updated {} across {} members",
             name.as_deref().unwrap_or("all deps"),
@@ -1413,6 +1915,17 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
         require_attested_entries,
         no_index,
     )?;
+    // C3/R9: resolve the EFFECTIVE strategy (+ whether it was explicitly
+    // sourced) against the current manifest — independent of `prior` above
+    // (same rationale as the workspace branch).
+    let strategy_decl = resolve_effective_strategy(strategy_cli, manifest.resolution);
+    let strategy_explicit = strategy_decl.is_some();
+    let strategy = strategy_decl.unwrap_or_default();
+    // D2/D5: no CLI flag on `update` — manifest-only, then (no-silent-drop)
+    // the lockfile's own recorded bound.
+    let exclude_newer = resolve_effective_exclude_newer(
+        None, manifest.resolution, maybe_prior_lockfile(&lock_path).as_ref(),
+    );
     let graph = resolve_with_features(
         &manifest,
         index.as_ref(),
@@ -1420,6 +1933,7 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
         profile.as_ref(),
         prior.as_ref(),
         strategy,
+        strategy_explicit,
         &deps_dir,
         dep_decl_store,
         false, // require_attested_metadata: not surfaced by `update` verb
@@ -1428,15 +1942,34 @@ fn cmd_update(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
         false,
         false,
         entry_trust.as_ref(),
+        exclude_newer,
     )?;
-    write_lockfile(&from_graph(&graph, strategy.as_str()), &lock_path)?;
+    write_lockfile(&from_graph(&graph, strategy.as_str(), exclude_newer), &lock_path)?;
     eprintln!("updated {}", name.as_deref().unwrap_or("all deps"));
     Ok(0)
 }
 
+/// A3b (§3 Axis A (b) step 4): parse `add --git`'s `--version` flag.
+///
+/// Returns `Ok(None)` when absent. A malformed value is rejected with the
+/// same slug as the manifest grammar (`MAN-DEP-VERSION-INVALID`) — the CLI
+/// writes the exact `version=` annotation a hand-edit would, so a malformed
+/// value is rejected the same way before anything is written.
+fn parse_add_version_flag(rest: &[String]) -> Result<Option<Version>, MilpaError> {
+    match flag_value(rest, "--version") {
+        None => Ok(None),
+        Some(raw) => parse_version(&raw).map(Some).ok_or_else(|| {
+            MilpaError::Manifest(milpa_manifest::ManifestError::new(
+                "MAN-DEP-VERSION-INVALID",
+                format!("--version value {raw:?} is not a valid semver version (expected 'x.y.z')"),
+            ))
+        }),
+    }
+}
+
 /// `milpa add <name> --git <url> [--ref <r>]` / `add <name> --mirror <url>`.
 #[allow(clippy::too_many_arguments)]
-fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, require_attested_index: bool, refresh_index: bool, require_attested_entries: bool) -> Result<i32, MilpaError> {
+fn cmd_add(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_index: bool, require_attested_index: bool, refresh_index: bool, require_attested_entries: bool) -> Result<i32, MilpaError> {
     let Some(name) = rest.first().cloned().filter(|n| !n.starts_with('-')) else {
         // Gap-1 C: no-name → usage error → exit 2 (no milpa-error: line).
         eprintln!("add: usage: milpa add <name> --git <url> [--ref <r>] | --mirror <url>");
@@ -1474,6 +2007,10 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
             format!("dep {name:?} is already declared in milpa.kdl"),
         )));
     }
+
+    // A3b (§3 Axis A (b) step 4): --version validation, shared by both the
+    // member-dir and single-package paths below.
+    let version_annotation = parse_add_version_flag(rest)?;
 
     // S11e: if this is a member dir (has a parent workspace), delegate to
     // workspace-level add: mutate the MEMBER's manifest + re-resolve the WHOLE
@@ -1532,6 +2069,7 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
             predicates: Vec::new(),
             flag_requests: flag_reqs_ws.clone(),
             optional: optional_flag,
+            version: version_annotation.clone(),
         }));
 
         // Rebuild the workspace with the proposed member manifest.
@@ -1541,6 +2079,20 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
         // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
         let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index)?;
         let profile = profile_from_env();
+        // B7 (RFC resolution-semantics.md §3 Axis B): thread the SHARED
+        // workspace lock as `prior` so adding a dep to one member re-resolves
+        // minimally — other members' already-locked deps stay pinned.
+        let prior = maybe_prior_lockfile(&ws_lock_path);
+        // C3/R9 (resolution-semantics RFC §3 Axis C / D-C2): resolve the
+        // EFFECTIVE strategy (+ whether it was explicitly sourced) against
+        // the WORKSPACE ROOT manifest (Axis W: resolution{} is root-only).
+        let strategy_decl = resolve_effective_strategy(strategy_cli, ws.resolution);
+        let strategy_explicit = strategy_decl.is_some();
+        let strategy = strategy_decl.unwrap_or_default();
+        // D2/D5: no CLI flag on `add` — manifest-only, against the WORKSPACE
+        // ROOT manifest (same root-only rationale as strategy above), then
+        // (no-silent-drop) the shared lock's own recorded bound.
+        let exclude_newer = resolve_effective_exclude_newer(None, ws.resolution, prior.as_ref());
         // P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
         let entry_trust = build_entry_trust_gate(
             &ws.entry_trust_policy,
@@ -1554,8 +2106,9 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
             index.as_ref(),
             build_registry().as_ref(),
             profile.as_ref(),
-            None,
+            prior.as_ref(),
             strategy,
+            strategy_explicit,
             &ws_deps_dir,
             false,
             &build_store(),
@@ -1563,6 +2116,7 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
             false,
             false,
             entry_trust.as_ref(),
+            exclude_newer,
         )?;
 
         // Atomic write: member manifest first, then shared workspace lock.
@@ -1570,6 +2124,7 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
         let name_c = name.clone();
         let url_c = url.clone();
         let git_ref_c = git_ref_ws.clone();
+        let version_c = version_annotation.clone();
         mutate_manifest_file(&dir.join("milpa.kdl"), move |mut m| {
             m.deps.push(Dep::Url(UrlDep {
                 name: name_c,
@@ -1579,10 +2134,11 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
                 predicates: Vec::new(),
                 flag_requests: flag_reqs_ws,
                 optional: optional_flag,
+                version: version_c,
             }));
             m
         })?;
-        write_lockfile(&from_graph(&graph, strategy.as_str()), &ws_lock_path)?;
+        write_lockfile(&from_graph(&graph, strategy.as_str(), exclude_newer), &ws_lock_path)?;
         eprintln!("added dep");
         return Ok(0);
     }
@@ -1654,12 +2210,25 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
         predicates: Vec::new(),
         flag_requests: flag_reqs.clone(),
         optional,
+        version: version_annotation.clone(),
     }));
 
     let deps_dir = dir.join("_deps");
     let registry = build_registry();
     let index = maybe_index_for_manifest(no_index, &existing, require_attested_index, refresh_index)?;
     let profile = profile_from_env();
+    // B7 (RFC resolution-semantics.md §3 Axis B): thread the committed lock as
+    // `prior` so minimal-change re-resolution applies — the new dep resolves
+    // while every other already-locked dep stays pinned (#192 through this door).
+    let prior = maybe_prior_lockfile(&dir.join("milpa.lock"));
+    // C3/R9: resolve the EFFECTIVE strategy (+ whether it was explicitly
+    // sourced) against the current manifest.
+    let strategy_decl = resolve_effective_strategy(strategy_cli, existing.resolution);
+    let strategy_explicit = strategy_decl.is_some();
+    let strategy = strategy_decl.unwrap_or_default();
+    // D2/D5: no CLI flag on `add` — manifest-only, then (no-silent-drop) the
+    // lockfile's own recorded bound.
+    let exclude_newer = resolve_effective_exclude_newer(None, existing.resolution, prior.as_ref());
     // P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
     let entry_trust = build_entry_trust_gate(
         &existing.entry_trust_policy,
@@ -1673,8 +2242,9 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
         index.as_ref(),
         registry.as_ref(),
         profile.as_ref(),
-        None,
+        prior.as_ref(),
         strategy,
+        strategy_explicit,
         &deps_dir,
         None,
         false,
@@ -1683,6 +2253,7 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
         false,
         false,
         entry_trust.as_ref(),
+        exclude_newer,
     )?;
 
     // Resolution succeeded → commit both outputs.
@@ -1695,10 +2266,11 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
             predicates: Vec::new(),
             flag_requests: flag_reqs,
             optional,
+            version: version_annotation.clone(),
         }));
         m
     })?;
-    write_lockfile(&from_graph(&graph, strategy.as_str()), &dir.join("milpa.lock"))?;
+    write_lockfile(&from_graph(&graph, strategy.as_str(), exclude_newer), &dir.join("milpa.lock"))?;
     eprintln!("added dep");
     Ok(0)
 }
@@ -1727,15 +2299,15 @@ fn cmd_add(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, requ
 fn cmd_workspace(
     dir: &Path,
     rest: &[String],
-    strategy: Strategy,
+    strategy_cli: Option<Strategy>,
     no_index: bool,
     require_attested_index: bool,
     refresh_index: bool,
 ) -> Result<i32, MilpaError> {
     let sub = rest.first().map(|s| s.as_str());
     match sub {
-        Some("add-member") => cmd_workspace_add_member(dir, &rest[1..], strategy, no_index, require_attested_index, refresh_index),
-        Some("remove-member") => cmd_workspace_remove_member(dir, &rest[1..], strategy, no_index, require_attested_index, refresh_index),
+        Some("add-member") => cmd_workspace_add_member(dir, &rest[1..], strategy_cli, no_index, require_attested_index, refresh_index),
+        Some("remove-member") => cmd_workspace_remove_member(dir, &rest[1..], strategy_cli, no_index, require_attested_index, refresh_index),
         _ => {
             eprintln!("workspace: usage: milpa workspace <add-member|remove-member> [args]");
             Ok(2)
@@ -1746,7 +2318,7 @@ fn cmd_workspace(
 fn cmd_workspace_add_member(
     dir: &Path,
     rest: &[String],
-    strategy: Strategy,
+    strategy_cli: Option<Strategy>,
     no_index: bool,
     require_attested_index: bool,
     refresh_index: bool,
@@ -1838,16 +2410,32 @@ fn cmd_workspace_add_member(
     // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
     let index = maybe_index_for_workspace(no_index, &current_ws, require_attested_index, refresh_index)?;
     let profile = profile_from_env();
+    // B7 (RFC resolution-semantics.md §3 Axis B): thread the SHARED workspace
+    // lock as `prior` — adding a member re-resolves minimally, so the OTHER
+    // members' already-locked deps stay pinned instead of newest-wins-bumping.
+    let prior = maybe_prior_lockfile(&dir.join("milpa.lock"));
+    // C3/R9 (resolution-semantics RFC §3 Axis C / D-C2): resolve the
+    // EFFECTIVE strategy (+ whether it was explicitly sourced) against the
+    // WORKSPACE ROOT manifest (Axis W: resolution{} is root-only) —
+    // `current_ws` above is already the workspace root's loaded manifest.
+    let strategy_decl = resolve_effective_strategy(strategy_cli, current_ws.resolution);
+    let strategy_explicit = strategy_decl.is_some();
+    let strategy = strategy_decl.unwrap_or_default();
+    // D2/D5: no CLI flag on `workspace add-member` — manifest-only, then
+    // (no-silent-drop) the shared lock's own recorded bound.
+    let exclude_newer = resolve_effective_exclude_newer(None, current_ws.resolution, prior.as_ref());
     let _rel_path = rel_path.clone();
     apply_workspace_manifest_change(
         dir,
         index.as_ref(),
         registry.as_ref(),
         profile.as_ref(),
-        None,
+        prior.as_ref(),
         strategy,
+        strategy_explicit,
         &build_store(),
         false,
+        exclude_newer,
         move |mut ws: Workspace| {
             ws.members.push(_rel_path.clone());
             ws
@@ -1861,7 +2449,7 @@ fn cmd_workspace_add_member(
 fn cmd_workspace_remove_member(
     dir: &Path,
     rest: &[String],
-    strategy: Strategy,
+    strategy_cli: Option<Strategy>,
     no_index: bool,
     require_attested_index: bool,
     refresh_index: bool,
@@ -1985,16 +2573,30 @@ fn cmd_workspace_remove_member(
     // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
     let index = maybe_index_for_workspace(no_index, &current_ws, require_attested_index, refresh_index)?;
     let profile = profile_from_env();
+    // B7 (RFC resolution-semantics.md §3 Axis B): thread the SHARED workspace
+    // lock as `prior` — removing a member re-resolves minimally, so remaining
+    // members' already-locked deps stay pinned.
+    let prior = maybe_prior_lockfile(&dir.join("milpa.lock"));
+    // C3/R9: resolve the EFFECTIVE strategy (+ whether it was explicitly
+    // sourced) against the WORKSPACE ROOT manifest.
+    let strategy_decl = resolve_effective_strategy(strategy_cli, current_ws.resolution);
+    let strategy_explicit = strategy_decl.is_some();
+    let strategy = strategy_decl.unwrap_or_default();
+    // D2/D5: no CLI flag on `workspace remove-member` — manifest-only, then
+    // (no-silent-drop) the shared lock's own recorded bound.
+    let exclude_newer = resolve_effective_exclude_newer(None, current_ws.resolution, prior.as_ref());
     let _matched_path = matched_path.clone();
     apply_workspace_manifest_change(
         dir,
         index.as_ref(),
         registry.as_ref(),
         profile.as_ref(),
-        None,
+        prior.as_ref(),
         strategy,
+        strategy_explicit,
         &build_store(),
         false,
+        exclude_newer,
         move |mut ws: Workspace| {
             ws.members.retain(|p| p != &_matched_path);
             ws
@@ -2103,6 +2705,53 @@ fn canonical_name_for(name: &str, lockfile: &milpa_core::Lockfile) -> String {
     name.to_string()
 }
 
+/// Strip the recorded pin for each name in `dep_names` (alias→canonical
+/// resolved against `prior`), or drop every pin when `dep_names` is empty.
+///
+/// THE shared mechanism behind both `milpa update`/`milpa update <dep>` and
+/// `--upgrade [<dep>...]` on `fetch`/`lock` (resolution-semantics RFC §3
+/// Axis B / D-B3): bare (`dep_names` empty) drops every pin outright
+/// (`Ok(None)` — the caller re-resolves with no prior at all, newest-wins
+/// for the whole graph, identical to bare `update`); named opts out ONLY
+/// for those deps, looping `milpa_core::strip_dep_pin` once per name so
+/// every other dep's pin is untouched and keeps B2's minimal-change
+/// preference. Both `cmd_update` and `cmd_fetch`'s `--upgrade` path call
+/// this ONE function, so the two verbs cannot structurally drift.
+fn strip_pins_for_upgrade(
+    prior: Option<milpa_core::Lockfile>,
+    dep_names: &[String],
+) -> Result<Option<milpa_core::Lockfile>, MilpaError> {
+    if dep_names.is_empty() {
+        return Ok(None);
+    }
+    let Some(mut result) = prior else {
+        return Err(MilpaError::Core(CoreError::Lockfile(
+            "LOCK-FILE-NOT-FOUND",
+            "no milpa.lock to scope --upgrade/update against — run `milpa fetch` first".into(),
+        )));
+    };
+    for name in dep_names {
+        let canonical = canonical_name_for(name, &result);
+        if !result.deps.iter().any(|d| d.name == canonical) {
+            let mut known: Vec<&str> = result.deps.iter().map(|d| d.name.as_str()).collect();
+            known.sort_unstable();
+            return Err(MilpaError::Core(CoreError::Lockfile(
+                "LOCK-DEP-NOT-FOUND",
+                format!(
+                    "no dep {name:?} in lockfile (known: {})",
+                    if known.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                ),
+            )));
+        }
+        result = milpa_core::strip_dep_pin(result, &canonical);
+    }
+    Ok(Some(result))
+}
+
 /// S5b: Convert a CLI dep-name from slash form to double-colon solver_var form.
 ///
 /// `"ns1/bar"` → `"ns1::bar"`.  Names without a slash are returned unchanged.
@@ -2144,7 +2793,7 @@ fn dep_remove_key(dep: &milpa_manifest::Dep) -> String {
 /// manifest, reject an undeclared dep, build the proposed manifest (minus the
 /// dep), run a FULL resolve, and only on success atomically write BOTH
 /// `milpa.kdl` and `milpa.lock`. On any failure both files are left unmodified.
-fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, require_attested_index: bool, refresh_index: bool) -> Result<i32, MilpaError> {
+fn cmd_remove(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_index: bool, require_attested_index: bool, refresh_index: bool) -> Result<i32, MilpaError> {
     let Some(name) = rest.first().cloned() else {
         // Gap-1 C: no-name → usage error → exit 2 (no milpa-error: line).
         eprintln!("remove: usage: milpa remove <name>");
@@ -2202,6 +2851,15 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
         // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
         let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index)?;
         let profile = profile_from_env();
+        // C3/R9 (resolution-semantics RFC §3 Axis C / D-C2): resolve the
+        // EFFECTIVE strategy (+ whether it was explicitly sourced) against
+        // the WORKSPACE ROOT manifest (Axis W: resolution{} is root-only).
+        let strategy_decl = resolve_effective_strategy(strategy_cli, ws.resolution);
+        let strategy_explicit = strategy_decl.is_some();
+        let strategy = strategy_decl.unwrap_or_default();
+        // D2/D5: no CLI flag on `remove` — manifest-only, then (no-silent-
+        // drop) the shared lock's own recorded bound.
+        let exclude_newer = resolve_effective_exclude_newer(None, ws.resolution, shared_prior.as_ref());
         let graph = resolve_workspace_with_features(
             &ws_with_override,
             index.as_ref(),
@@ -2209,6 +2867,7 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
             profile.as_ref(),
             shared_prior.as_ref(),
             strategy,
+            strategy_explicit,
             &ws_deps_dir,
             false,
             &build_store(),
@@ -2219,6 +2878,7 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
             // entry-trust command-coverage set (fetch/lock/add/update only) —
             // mirrors the Python impl's cli.py wiring.
             None,
+            exclude_newer,
         )?;
 
         // Atomic write: member manifest first, then shared workspace lock.
@@ -2229,7 +2889,7 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
             m.deps.retain(|d| dep_remove_key(d) != canonical_c.as_str());
             m
         })?;
-        write_lockfile(&from_graph(&graph, strategy.as_str()), &ws_lock_path)?;
+        write_lockfile(&from_graph(&graph, strategy.as_str(), exclude_newer), &ws_lock_path)?;
         eprintln!("removed {canonical_ws}");
         return Ok(0);
     }
@@ -2243,11 +2903,14 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
     // If `name` is an alias of a canonical lockfile dep, resolve to the manifest
     // dep name so the guard and mutation operate on the correct entry.
     let lock_path = dir.join("milpa.lock");
-    let prior_lock: Option<milpa_core::Lockfile> = if lock_path.exists() {
-        Some(load_lockfile(&lock_path)?)
-    } else {
-        None
-    };
+    // B7-gap (C3): use the shared soft-fail loader — same helper the other
+    // resolve-triggering verbs (fetch/lock/add/update) use — so a missing or
+    // corrupt prior degrades to a fresh resolve rather than hard-failing, and
+    // (critically) so the SAME prior gets threaded into `resolve()` below for
+    // minimal-change re-resolution (B2). Previously this branch hardcoded
+    // `None` into the `resolve()` call, so `milpa remove` dragged unrelated
+    // transitives to newest-available instead of keeping them pinned.
+    let prior_lock: Option<milpa_core::Lockfile> = maybe_prior_lockfile(&lock_path);
     let canonical: String = if let Some(ref lf) = prior_lock {
         canonical_name_for(&name_key, lf)
     } else {
@@ -2279,17 +2942,38 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
     let registry = build_registry();
     let index = maybe_index_for_manifest(no_index, &existing, require_attested_index, refresh_index)?;
     let profile = profile_from_env();
-    let graph = resolve(
+    // C3/R9: resolve the EFFECTIVE strategy (+ whether it was explicitly
+    // sourced) against the current manifest (`prior_lock`, above, is used
+    // for alias resolution too — see B7-gap comment further up).
+    let strategy_decl = resolve_effective_strategy(strategy_cli, existing.resolution);
+    let strategy_explicit = strategy_decl.is_some();
+    let strategy = strategy_decl.unwrap_or_default();
+    // D2/D5: `remove` has no CLI `--exclude-newer` flag (fetch/lock only) —
+    // manifest-only, then (no-silent-drop, D-D3) the already-loaded on-disk
+    // lock's own recorded bound. Previously this branch called the bare
+    // `resolve()` convenience wrapper, which hardcodes `exclude_newer: None`
+    // internally — that silently dropped a committed bound on every
+    // single-package `milpa remove`. Switched to `resolve_with_features`
+    // (same defaults `resolve()` uses: no entry-trust gate, no CLI feature
+    // selection) so a real effective value can be threaded through.
+    let exclude_newer = resolve_effective_exclude_newer(None, existing.resolution, prior_lock.as_ref());
+    let graph = resolve_with_features(
         &proposed,
         index.as_ref(),
         registry.as_ref(),
         profile.as_ref(),
-        None,
+        prior_lock.as_ref(),
         strategy,
+        strategy_explicit,
         &deps_dir,
         None,
         false,
         &build_store(),
+        &std::collections::BTreeSet::new(),
+        false,
+        false,
+        None,
+        exclude_newer,
     )?;
 
     // D-update-remove Phase D item 5: warn per alias that the prior lockfile
@@ -2323,7 +3007,7 @@ fn cmd_remove(dir: &Path, strategy: Strategy, rest: &[String], no_index: bool, r
             m
         })?;
     }
-    write_lockfile(&from_graph(&graph, strategy.as_str()), &dir.join("milpa.lock"))?;
+    write_lockfile(&from_graph(&graph, strategy.as_str(), exclude_newer), &dir.join("milpa.lock"))?;
     eprintln!("removed {canonical}");
     Ok(0)
 }
@@ -3674,6 +4358,32 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
+/// Parses `--upgrade [<dep>...]` from the verb's tail args (B4,
+/// resolution-semantics RFC §3 Axis B / D-B3). Returns `None` when the flag
+/// is absent (ordinary minimal-change applies); `Some(vec![])` for a bare
+/// `--upgrade` (opt out globally); `Some(names)` for `--upgrade <dep>...`
+/// (opt out only for those deps). Collects every token after `--upgrade` up
+/// to the next dash-prefixed token (single `-s`/`-C` or double `--strategy`/
+/// `--frozen`/etc.) or the end of `rest` — mirrors how Python argparse's
+/// `nargs="*"` stops at ANY option-looking token, not only a `--long` one
+/// (R12: `-s`/`--strategy` is also legal on `fetch`/`lock`, so a boundary
+/// that only recognized `--` would over-collect `milpa fetch --upgrade foo
+/// -s minver` as upgrade targets `["foo", "-s", "minver"]`, spuriously
+/// rejecting the nonexistent dep `"-s"`). No dep name legitimately starts
+/// with `-` (dep names are package identifiers), so this is a safe,
+/// unambiguous boundary.
+fn upgrade_flag_values(rest: &[String]) -> Option<Vec<String>> {
+    let idx = rest.iter().position(|a| a == "--upgrade")?;
+    let mut names = Vec::new();
+    for tok in &rest[idx + 1..] {
+        if tok.starts_with('-') {
+            break;
+        }
+        names.push(tok.clone());
+    }
+    Some(names)
+}
+
 /// Best-effort human message for the stderr diagnostic line.
 fn message_of(e: &MilpaError) -> String {
     match e {
@@ -3689,19 +4399,273 @@ mod tests {
 
     #[test]
     fn parses_global_flags_then_verb() {
+        // C3 (resolution-semantics RFC §3 Axis C / D-C2): `-s`/`--strategy`
+        // moved out of the global pre-verb flag loop (scoped per-verb now,
+        // parsed from `rest` via `strategy_flag_value`) — this test only
+        // exercises the flags that REMAIN global (`-C`/`--frozen`).
         let cli = parse_args(&[
             "-C".into(),
             "/tmp/p".into(),
-            "-s".into(),
-            "minver".into(),
             "--frozen".into(),
             "fetch".into(),
         ])
         .unwrap();
         assert_eq!(cli.directory, PathBuf::from("/tmp/p"));
-        assert!(matches!(cli.strategy, Strategy::Minver));
         assert!(cli.frozen);
         assert_eq!(cli.verb, "fetch");
+    }
+
+    /// C3 (resolution-semantics RFC §3 Axis C / D-C2): `-s`/`--strategy` is
+    /// no longer a global pre-verb flag — it must appear in the verb's tail
+    /// (`rest`), parsed by `strategy_flag_value`.
+    #[test]
+    fn strategy_flag_scoped_to_verb_tail() {
+        let cli = parse_args(&[
+            "fetch".into(),
+            "-s".into(),
+            "minver".into(),
+        ])
+        .unwrap();
+        assert_eq!(cli.verb, "fetch");
+        assert_eq!(strategy_flag_value(&cli.rest), Ok(Some(Strategy::Minver)));
+    }
+
+    /// C2 (resolver-semantics RFC §3 Axis C, D-C1): the `lowest-direct`
+    /// wire string parses like any other `--strategy` value — C3 now via
+    /// the scoped `strategy_flag_value` (not a `Cli.strategy` global field).
+    #[test]
+    fn parses_lowest_direct_strategy_flag() {
+        let cli = parse_args(&[
+            "fetch".into(),
+            "--strategy".into(),
+            "lowest-direct".into(),
+        ])
+        .unwrap();
+        assert_eq!(cli.verb, "fetch");
+        assert_eq!(
+            strategy_flag_value(&cli.rest),
+            Ok(Some(Strategy::LowestDirect))
+        );
+    }
+
+    /// C3: an unrecognized `--strategy` value is a parse error (`Err(())`),
+    /// not silently ignored — mirrors the old global loop's short-circuit.
+    #[test]
+    fn strategy_flag_malformed_value_errors() {
+        let cli = parse_args(&["fetch".into(), "--strategy".into(), "bogus".into()]).unwrap();
+        assert_eq!(strategy_flag_value(&cli.rest), Err(()));
+    }
+
+    /// C3: `--strategy` absent from the verb's tail is `Ok(None)` — the
+    /// "unspecified" sentinel that defers to the manifest/lockfile.
+    #[test]
+    fn strategy_flag_absent_is_none() {
+        let cli = parse_args(&["fetch".into()]).unwrap();
+        assert_eq!(strategy_flag_value(&cli.rest), Ok(None));
+    }
+
+    // -----------------------------------------------------------------------
+    // D2 (resolution-semantics RFC §3 Axis D) — `--exclude-newer <ts>` CLI
+    // sentinel + fetch/lock-only scoping + precedence.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn exclude_newer_flag_parses_valid_timestamp() {
+        let cli = parse_args(&[
+            "fetch".into(),
+            "--exclude-newer".into(),
+            "2026-01-01T00:00:00Z".into(),
+        ])
+        .unwrap();
+        let ts = exclude_newer_flag_value(&cli.rest).unwrap().unwrap();
+        assert_eq!(ts, parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap());
+    }
+
+    #[test]
+    fn exclude_newer_flag_absent_is_none() {
+        let cli = parse_args(&["fetch".into()]).unwrap();
+        assert_eq!(exclude_newer_flag_value(&cli.rest).unwrap(), None);
+    }
+
+    /// D2: a malformed value is a DIAGNOSED failure (CLI-EXCLUDE-NEWER-INVALID),
+    /// not a bare `Err(())` usage error like `strategy_flag_value` — a
+    /// timestamp has no closed enum of valid spellings.
+    #[test]
+    fn exclude_newer_flag_malformed_value_errors_with_slug() {
+        let cli = parse_args(&[
+            "fetch".into(),
+            "--exclude-newer".into(),
+            "not-a-timestamp".into(),
+        ])
+        .unwrap();
+        let err = exclude_newer_flag_value(&cli.rest).unwrap_err();
+        assert_eq!(err.code(), "CLI-EXCLUDE-NEWER-INVALID");
+    }
+
+    #[test]
+    fn exclude_newer_flag_missing_value_errors_with_slug() {
+        let cli = parse_args(&["fetch".into(), "--exclude-newer".into()]).unwrap();
+        let err = exclude_newer_flag_value(&cli.rest).unwrap_err();
+        assert_eq!(err.code(), "CLI-EXCLUDE-NEWER-INVALID");
+    }
+
+    /// D2 precedence: explicit CLI value always wins over the manifest's
+    /// `resolution { exclude-newer }` (and over the lockfile's recorded
+    /// value, tier 3).
+    #[test]
+    fn resolve_effective_exclude_newer_cli_overrides_manifest() {
+        let cli_ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+        let manifest_ts = parse_iso8601_timestamp("2020-01-01T00:00:00Z").unwrap();
+        let resolution = milpa_manifest::Resolution { strategy: None, exclude_newer: Some(manifest_ts) };
+        assert_eq!(
+            resolve_effective_exclude_newer(Some(cli_ts), Some(resolution), None),
+            Some(cli_ts)
+        );
+    }
+
+    /// D2 precedence: unspecified CLI defers to the manifest's declared bound.
+    #[test]
+    fn resolve_effective_exclude_newer_falls_back_to_manifest() {
+        let manifest_ts = parse_iso8601_timestamp("2020-01-01T00:00:00Z").unwrap();
+        let resolution = milpa_manifest::Resolution { strategy: None, exclude_newer: Some(manifest_ts) };
+        assert_eq!(
+            resolve_effective_exclude_newer(None, Some(resolution), None),
+            Some(manifest_ts)
+        );
+    }
+
+    /// D5 precedence (§6 D-D3 no-silent-drop): absent CLI AND absent manifest
+    /// falls back to tier 3 — the prior lockfile's own recorded bound —
+    /// rather than silently resetting to `None`.
+    #[test]
+    fn resolve_effective_exclude_newer_falls_back_to_prior_lockfile() {
+        let lock_ts = parse_iso8601_timestamp("2019-06-01T00:00:00Z").unwrap();
+        let lock = milpa_core::Lockfile {
+            version: 1,
+            strategy: "maxver".into(),
+            exclude_newer: Some(lock_ts),
+            deps: vec![],
+        };
+        assert_eq!(
+            resolve_effective_exclude_newer(None, None, Some(&lock)),
+            Some(lock_ts)
+        );
+    }
+
+    /// D5: the manifest tier still wins over the lockfile tier when both are
+    /// present (manifest is the more-recently-authored, durable source).
+    #[test]
+    fn resolve_effective_exclude_newer_manifest_wins_over_prior_lockfile() {
+        let manifest_ts = parse_iso8601_timestamp("2020-01-01T00:00:00Z").unwrap();
+        let lock_ts = parse_iso8601_timestamp("2019-06-01T00:00:00Z").unwrap();
+        let resolution = milpa_manifest::Resolution { strategy: None, exclude_newer: Some(manifest_ts) };
+        let lock = milpa_core::Lockfile {
+            version: 1,
+            strategy: "maxver".into(),
+            exclude_newer: Some(lock_ts),
+            deps: vec![],
+        };
+        assert_eq!(
+            resolve_effective_exclude_newer(None, Some(resolution), Some(&lock)),
+            Some(manifest_ts)
+        );
+    }
+
+    /// Absent CLI, absent manifest, absent (or no) prior lockfile resolves to
+    /// `None` — no time bound, the true "nothing was ever set" case.
+    #[test]
+    fn resolve_effective_exclude_newer_none_when_all_absent() {
+        assert_eq!(resolve_effective_exclude_newer(None, None, None), None);
+        let resolution = milpa_manifest::Resolution { strategy: None, exclude_newer: None };
+        assert_eq!(resolve_effective_exclude_newer(None, Some(resolution), None), None);
+        let lock = milpa_core::Lockfile {
+            version: 1,
+            strategy: "maxver".into(),
+            exclude_newer: None,
+            deps: vec![],
+        };
+        assert_eq!(
+            resolve_effective_exclude_newer(None, None, Some(&lock)),
+            None
+        );
+    }
+
+    /// D2 end-to-end: `milpa fetch --exclude-newer <bogus>` surfaces the CLI
+    /// slug through the real `run()` dispatch (no mocked fetch needed — the
+    /// malformed-value check fires before any resolve is attempted).
+    #[test]
+    fn e2e_fetch_malformed_exclude_newer_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\n",
+        ).unwrap();
+
+        let rc = run(&[
+            "-C".into(),
+            proj.to_str().unwrap().into(),
+            "fetch".into(),
+            "--exclude-newer".into(),
+            "not-a-timestamp".into(),
+        ]);
+        let err = rc.unwrap_err();
+        assert_eq!(err.code(), "CLI-EXCLUDE-NEWER-INVALID");
+    }
+
+    /// D2 end-to-end: same malformed-value check on `lock`.
+    #[test]
+    fn e2e_lock_malformed_exclude_newer_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\n",
+        ).unwrap();
+
+        let rc = run(&[
+            "-C".into(),
+            proj.to_str().unwrap().into(),
+            "lock".into(),
+            "--exclude-newer".into(),
+            "not-a-timestamp".into(),
+        ]);
+        let err = rc.unwrap_err();
+        assert_eq!(err.code(), "CLI-EXCLUDE-NEWER-INVALID");
+    }
+
+    /// D2 scoping: `--exclude-newer` is registered on fetch/lock ONLY — on
+    /// `update` it is never even scanned (§3 Axis D "Verb reach": narrower
+    /// than `--strategy`'s per-verb scoping). Passing it to `update` must
+    /// NOT surface CLI-EXCLUDE-NEWER-INVALID even with a malformed value —
+    /// the flag is simply not consulted there (mirrors how `--strategy` is
+    /// silently ignored on `show`/`clean`, per this hand-rolled parser's
+    /// existing "not-registered" philosophy for out-of-scope verbs).
+    #[test]
+    fn e2e_update_does_not_register_exclude_newer_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\n",
+        ).unwrap();
+
+        let rc = run(&[
+            "-C".into(),
+            proj.to_str().unwrap().into(),
+            "update".into(),
+            "--exclude-newer".into(),
+            "not-a-timestamp".into(),
+        ]);
+        // `update` treats its first `rest` token as the <dep> name — it never
+        // scans for `--exclude-newer` at all, so whatever error surfaces here
+        // must NOT be CLI-EXCLUDE-NEWER-INVALID.
+        if let Err(e) = rc {
+            assert_ne!(e.code(), "CLI-EXCLUDE-NEWER-INVALID");
+        }
     }
 
     #[test]
@@ -3859,7 +4823,7 @@ mod tests {
         let manifest = "name \"app\"\nkind \"application\"\ndeps {\n  foo git=(url)\"https://e/foo.git\" ref=\"main\"\n}\n";
         std::fs::write(dir.join("milpa.kdl"), manifest).unwrap();
         // remove of an absent dep → exit 1 (MAN-REMOVE-DEP-ABSENT).
-        assert_eq!(cmd_remove(dir, Strategy::default(), &["ghost".into()], false, false, false).unwrap(), 1);
+        assert_eq!(cmd_remove(dir, Some(Strategy::default()), &["ghost".into()], false, false, false).unwrap(), 1);
         // manifest is unmodified; no lockfile was written.
         assert_eq!(std::fs::read_to_string(dir.join("milpa.kdl")).unwrap(), manifest);
         assert!(!dir.join("milpa.lock").exists());
@@ -3892,7 +4856,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let r = cmd_remove(&proj, Strategy::default(), &["foo".into()], false, false, false);
+        let r = cmd_remove(&proj, Some(Strategy::default()), &["foo".into()], false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(r.unwrap(), 0, "remove should resolve + write both files");
@@ -3926,12 +4890,12 @@ mod tests {
 
         // First, fetch to produce a baseline lockfile with both pins.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        assert_eq!(cmd_fetch(&proj, Strategy::default(), false, true, None, false, false, &[], false, false, false).unwrap(), 0);
+        assert_eq!(cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None).unwrap(), 0);
         let baseline = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
         assert!(baseline.contains("\"foo\"") && baseline.contains("\"bar\""));
 
         // Scoped update of foo: succeeds, writes the lockfile, leaves kdl intact.
-        let r = cmd_update(&proj, Strategy::default(), &["foo".into()], false, false, false, false);
+        let r = cmd_update(&proj, Some(Strategy::default()), &["foo".into()], false, false, false, false);
         let after_kdl = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
         let after_lock = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
@@ -3940,6 +4904,208 @@ mod tests {
         assert_eq!(after_kdl, manifest, "update MUST NOT mutate milpa.kdl");
         // Both deps still present (bar retained via prior, foo re-resolved).
         assert!(after_lock.contains("\"foo\"") && after_lock.contains("\"bar\""));
+    }
+
+    // -------------------------------------------------------------------------
+    // B3 (resolution-semantics RFC §3 Axis B / §6 D-B2): `--locked` CLI slice.
+    // Anti-hollow: calls `cmd_fetch` directly (the real fn `fetch`/`lock`
+    // dispatch to) with `--locked` in `rest`, exactly as `run()` would pass it.
+    // -------------------------------------------------------------------------
+
+    /// `--locked` on an up-to-date lock passes (resolve == lock).
+    #[test]
+    fn locked_passes_when_up_to_date_via_mock() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let url = "https://example.com/foo.git";
+        let mocked = make_mocked_fetches(tmp.path(), url, "main", &"a".repeat(40), &[("foo.nim", b"# foo")]);
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=(url)\"{url}\" ref=\"main\"\n}}\n"),
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let baseline = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None);
+        assert_eq!(baseline.unwrap(), 0);
+
+        let locked_arg = vec!["--locked".to_string()];
+        let r = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &locked_arg, false, false, false, None);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(r.unwrap(), 0, "--locked on an up-to-date lock should pass");
+    }
+
+    /// `--locked` also accepted on the `lock` verb (both dispatch through
+    /// `cmd_fetch` with `emit_nimcfg=false`).
+    #[test]
+    fn locked_passes_on_lock_verb_too_via_mock() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let url = "https://example.com/foo.git";
+        let mocked = make_mocked_fetches(tmp.path(), url, "main", &"a".repeat(40), &[("foo.nim", b"# foo")]);
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=(url)\"{url}\" ref=\"main\"\n}}\n"),
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let baseline = cmd_fetch(&proj, Some(Strategy::default()), false, false, None, false, false, &[], false, false, false, None);
+        assert_eq!(baseline.unwrap(), 0);
+
+        let locked_arg = vec!["--locked".to_string()];
+        let r = cmd_fetch(&proj, Some(Strategy::default()), false, false, None, false, false, &locked_arg, false, false, false, None);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(r.unwrap(), 0, "--locked on `lock` should also pass");
+    }
+
+    /// `--locked` with no committed lockfile at all -> RES-LOCKED-DRIFT.
+    #[test]
+    fn locked_with_no_prior_lock_fails_via_mock() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let url = "https://example.com/foo.git";
+        let mocked = make_mocked_fetches(tmp.path(), url, "main", &"a".repeat(40), &[("foo.nim", b"# foo")]);
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=(url)\"{url}\" ref=\"main\"\n}}\n"),
+        )
+        .unwrap();
+        assert!(!proj.join("milpa.lock").exists());
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let locked_arg = vec!["--locked".to_string()];
+        let r = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &locked_arg, false, false, false, None);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(r.unwrap_err().code(), "RES-LOCKED-DRIFT");
+    }
+
+    /// A manifest edit that moves the dep to a different ref (different
+    /// commit_sha/provenance) -> RES-LOCKED-DRIFT naming the drifted
+    /// package; the committed lockfile must NOT be clobbered.
+    #[test]
+    fn locked_detects_drift_after_manifest_edit_via_mock() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let url = "https://example.com/foo.git";
+        let mocked = make_mocked_fetches(tmp.path(), url, "v1.0.0", &"a".repeat(40), &[("foo.nim", b"# foo v1")]);
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=(url)\"{url}\" ref=\"v1.0.0\"\n}}\n"),
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        assert_eq!(
+            cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None).unwrap(),
+            0
+        );
+        let baseline_lock = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
+
+        // Move the dep to a different tag.
+        let _ = make_mocked_fetches(tmp.path(), url, "v2.0.0", &"b".repeat(40), &[("foo.nim", b"# foo v2")]);
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=(url)\"{url}\" ref=\"v2.0.0\"\n}}\n"),
+        )
+        .unwrap();
+
+        let locked_arg = vec!["--locked".to_string()];
+        let r = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &locked_arg, false, false, false, None);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        let err = r.unwrap_err();
+        assert_eq!(err.code(), "RES-LOCKED-DRIFT");
+        assert!(message_of(&err).contains("foo"));
+
+        // The committed lockfile must be unchanged (still pinned to v1.0.0).
+        let after_lock = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
+        assert_eq!(after_lock, baseline_lock);
+    }
+
+    /// D5 (resolution-semantics RFC §3 Axis D / §6 D-D3 no-silent-drop):
+    /// `--locked` must treat a DROPPED `exclude_newer` (present in the
+    /// committed lock, absent from the new resolve) as drift — a silent
+    /// relaxation of the time-bound is exactly the kind of divergence
+    /// `--locked` exists to catch.
+    #[test]
+    fn locked_flags_dropped_exclude_newer_as_drift() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let url = "https://example.com/foo.git";
+        let mocked = make_mocked_fetches(tmp.path(), url, "main", &"a".repeat(40), &[("foo.nim", b"# foo")]);
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=(url)\"{url}\" ref=\"main\"\n}}\n"),
+        )
+        .unwrap();
+
+        let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        // Baseline: fetch WITH --exclude-newer (records it in the lock).
+        let baseline = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, Some(ts));
+        assert_eq!(baseline.unwrap(), 0);
+        let baseline_lock = load_lockfile(&proj.join("milpa.lock")).unwrap();
+        assert_eq!(baseline_lock.exclude_newer, Some(ts));
+
+        // `--locked` with NO --exclude-newer this time (manifest declares no
+        // resolution{} block either) — the effective value is None, dropping
+        // the committed bound. Must raise RES-LOCKED-DRIFT, not silently pass.
+        let locked_arg = vec!["--locked".to_string()];
+        let r = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &locked_arg, false, false, false, None);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        let err = r.unwrap_err();
+        assert_eq!(err.code(), "RES-LOCKED-DRIFT");
+        assert!(message_of(&err).contains("exclude_newer"), "message: {}", message_of(&err));
+    }
+
+    /// D5: `--locked` PASSES when the effective exclude_newer still matches
+    /// the committed lock's recorded value (no drift).
+    #[test]
+    fn locked_passes_when_exclude_newer_unchanged() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let url = "https://example.com/foo.git";
+        let mocked = make_mocked_fetches(tmp.path(), url, "main", &"a".repeat(40), &[("foo.nim", b"# foo")]);
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=(url)\"{url}\" ref=\"main\"\n}}\n"),
+        )
+        .unwrap();
+
+        let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let baseline = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, Some(ts));
+        assert_eq!(baseline.unwrap(), 0);
+
+        // Same --exclude-newer passed again alongside --locked: no drift.
+        let locked_arg = vec!["--locked".to_string()];
+        let r = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &locked_arg, false, false, false, Some(ts));
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(r.unwrap(), 0, "--locked with an unchanged exclude_newer must pass");
     }
 
     /// Scoped `update <dep>` rejects a dep not in the lockfile (LOCK-DEP-NOT-FOUND,
@@ -3957,7 +5123,7 @@ mod tests {
         .unwrap();
 
         // No lockfile yet → scoped update fails with LOCK-FILE-NOT-FOUND.
-        let no_lock = cmd_update(&proj, Strategy::default(), &["ghost".into()], false, false, false, false);
+        let no_lock = cmd_update(&proj, Some(Strategy::default()), &["ghost".into()], false, false, false, false);
         assert!(no_lock.is_err());
         assert_eq!(no_lock.unwrap_err().code(), "LOCK-FILE-NOT-FOUND");
 
@@ -3967,8 +5133,675 @@ mod tests {
             "// generated by milpa; reproducible build snapshot\nversion 1\nstrategy \"maxver\"\n",
         )
         .unwrap();
-        let r = cmd_update(&proj, Strategy::default(), &["ghost".into()], false, false, false, false);
+        let r = cmd_update(&proj, Some(Strategy::default()), &["ghost".into()], false, false, false, false);
         assert_eq!(r.unwrap(), 1, "dep-not-in-lock → exit 1");
+    }
+
+    // -------------------------------------------------------------------------
+    // B4 (resolution-semantics RFC §3 Axis B / D-B3): `--upgrade [<dep>...]`
+    // on fetch/lock, implemented as DELEGATION to `strip_pins_for_upgrade` —
+    // the SAME shared mechanism `update`/`update <dep>` uses. Real NAMED/index
+    // deps with two real content-hash-matched mocked-git versions each (B2's
+    // preference only ever bites a multi-candidate named dep; a root-declared
+    // git dep has exactly one solver-visible candidate regardless).
+    // -------------------------------------------------------------------------
+
+    /// Stage real v1.0.0/v2.0.0 mocked git content for `name` under `base`'s
+    /// shared `mocked-fetches/` dir; returns (mocked_dir, content_hash_v1,
+    /// content_hash_v2) computed the SAME way the resolver will at fetch time
+    /// (the mocked fetcher copies `content/*` verbatim with no `.nimble`
+    /// sibling here, so hashing `content/` directly is byte-identical to
+    /// hashing the materialized dest).
+    fn b4_stage_two_versions(
+        base: &std::path::Path,
+        name: &str,
+        sha_prefix: &str,
+    ) -> (std::path::PathBuf, String, String) {
+        let url = format!("https://example.com/{name}.git");
+        let nim_name = format!("{name}.nim");
+        let body_v1 = format!("# {name} v1").into_bytes();
+        let body_v2 = format!("# {name} v2").into_bytes();
+        let sha1 = format!("{sha_prefix}1").repeat(20);
+        let sha2 = format!("{sha_prefix}2").repeat(20);
+        let _ = make_mocked_fetches(base, &url, "v1.0.0", &sha1, &[(nim_name.as_str(), body_v1.as_slice())]);
+        let mocked = make_mocked_fetches(base, &url, "v2.0.0", &sha2, &[(nim_name.as_str(), body_v2.as_slice())]);
+        let content1 = mocked.join(milpa_core::url_key(&url, "v1.0.0")).join("content");
+        let content2 = mocked.join(milpa_core::url_key(&url, "v2.0.0")).join("content");
+        let h1 = milpa_core::compute_content_hash(&content1).unwrap();
+        let h2 = milpa_core::compute_content_hash(&content2).unwrap();
+        (mocked, h1, h2)
+    }
+
+    /// Build an `index.kdl` text for `pkgs` (name -> (hash_v1, hash_v2));
+    /// `include_v2` controls whether the 2.0.0 candidate is listed at all
+    /// (simulates "a newer version got published" between two resolves).
+    fn b4_index_kdl(pkgs: &[(&str, (String, String))], include_v2: bool) -> String {
+        let mut s = String::from("schema_version 1\n");
+        for (name, (h1, h2)) in pkgs {
+            s.push_str(&format!(
+                "package \"{name}\" {{\n    version \"1.0.0\" {{\n        content_hash \"{h1}\"\n        provenance {{\n            kind \"git\"\n            url \"https://example.com/{name}.git\"\n            ref \"v1.0.0\"\n            commit_sha \"{}\"\n        }}\n    }}\n",
+                "a".repeat(40),
+            ));
+            if include_v2 {
+                s.push_str(&format!(
+                    "    version \"2.0.0\" {{\n        content_hash \"{h2}\"\n        provenance {{\n            kind \"git\"\n            url \"https://example.com/{name}.git\"\n            ref \"v2.0.0\"\n            commit_sha \"{}\"\n        }}\n    }}\n",
+                    "b".repeat(40),
+                ));
+            }
+            s.push_str("}\n");
+        }
+        s
+    }
+
+    const B4_ROOT_KDL: &str =
+        "name \"myapp\"\nkind \"application\"\nindex-trust \"off\"\ndeps {\n    foo\n    bar\n}\n";
+
+    /// A fresh project resolved once against a v1-only index (both foo/bar
+    /// lock to 1.0.0 — the only candidate at that point). MILPA_INDEX_URL /
+    /// MILPA_MOCKED_FETCHES must already be set by the caller (ENV_MUTEX-guarded).
+    fn b4_make_locked_project(tmp: &std::path::Path, subdir: &str) -> std::path::PathBuf {
+        let proj = tmp.join(subdir);
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("milpa.kdl"), B4_ROOT_KDL).unwrap();
+        let rc = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None).unwrap();
+        assert_eq!(rc, 0);
+        let versions = b4_versions(&proj.join("milpa.lock"));
+        assert_eq!(
+            versions,
+            std::collections::BTreeMap::from([
+                ("foo".to_string(), "1.0.0".to_string()),
+                ("bar".to_string(), "1.0.0".to_string()),
+            ]),
+        );
+        proj
+    }
+
+    fn b4_versions(lock_path: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+        let lf = load_lockfile(lock_path).unwrap();
+        lf.deps.into_iter().map(|d| (d.name, d.version)).collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // R12 (code review): `upgrade_flag_values` must stop collecting
+    // dep-name tokens at ANY dash-prefixed token (single `-s` or double
+    // `--strategy`), matching Python argparse's `nargs="*"` option-boundary
+    // behavior. Before the fix it only recognized `--`-prefixed tokens as
+    // boundaries, so `milpa fetch --upgrade foo -s minver` collected
+    // `["foo", "-s", "minver"]` as upgrade targets — `strip_pins_for_upgrade`
+    // then raised a spurious `LOCK-DEP-NOT-FOUND` for the nonexistent dep
+    // `"-s"`, and the `-s minver` strategy flag was swallowed instead of
+    // being parsed by `strategy_flag_value`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn r12_upgrade_stops_at_single_dash_short_flag() {
+        let rest = vec!["--upgrade".to_string(), "foo".to_string(), "-s".to_string(), "minver".to_string()];
+        assert_eq!(upgrade_flag_values(&rest), Some(vec!["foo".to_string()]));
+        // The strategy flag must still be independently parseable from the
+        // same `rest` — proving `-s minver` was left alone, not consumed.
+        assert_eq!(strategy_flag_value(&rest), Ok(Some(Strategy::Minver)));
+    }
+
+    #[test]
+    fn r12_upgrade_stops_at_double_dash_long_flag() {
+        let rest = vec!["--upgrade".to_string(), "foo".to_string(), "--strategy".to_string(), "minver".to_string()];
+        assert_eq!(upgrade_flag_values(&rest), Some(vec!["foo".to_string()]));
+    }
+
+    #[test]
+    fn r12_upgrade_collects_multiple_dep_names() {
+        let rest = vec!["--upgrade".to_string(), "foo".to_string(), "bar".to_string()];
+        assert_eq!(
+            upgrade_flag_values(&rest),
+            Some(vec!["foo".to_string(), "bar".to_string()])
+        );
+    }
+
+    #[test]
+    fn r12_bare_upgrade_with_nothing_after_means_whole_graph() {
+        let rest = vec!["--upgrade".to_string()];
+        assert_eq!(upgrade_flag_values(&rest), Some(vec![]));
+    }
+
+    #[test]
+    fn r12_upgrade_immediately_followed_by_strategy_flag_collects_zero_targets() {
+        let rest = vec!["--upgrade".to_string(), "--strategy".to_string(), "minver".to_string()];
+        assert_eq!(upgrade_flag_values(&rest), Some(vec![]));
+        assert_eq!(strategy_flag_value(&rest), Ok(Some(Strategy::Minver)));
+    }
+
+    #[test]
+    fn r12_upgrade_absent_is_none() {
+        let rest = vec!["fetch".to_string()];
+        assert_eq!(upgrade_flag_values(&rest), None);
+    }
+
+    /// Bare `--upgrade` opts out of the minimal-change preference GLOBALLY:
+    /// contrasted with a plain re-fetch (which keeps both locked), it pulls
+    /// the newest allowed version for the whole graph.
+    #[test]
+    fn b4_bare_upgrade_pulls_newest_everywhere_via_mock() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        let (mocked, foo_h1, foo_h2) = b4_stage_two_versions(base, "foo", "1");
+        let (_, bar_h1, bar_h2) = b4_stage_two_versions(base, "bar", "2");
+        let hashes = vec![("foo", (foo_h1, foo_h2)), ("bar", (bar_h1, bar_h2))];
+        let index_v1_path = base.join("index-v1.kdl");
+        std::fs::write(&index_v1_path, b4_index_kdl(&hashes, false)).unwrap();
+        let index_v1v2_path = base.join("index-v1v2.kdl");
+        std::fs::write(&index_v1v2_path, b4_index_kdl(&hashes, true)).unwrap();
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1_path.display())) };
+        let proj = b4_make_locked_project(base, "proj");
+
+        // A newer version got published.
+        unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1v2_path.display())) };
+
+        // Plain re-fetch (no --upgrade): minimal-change keeps both locked.
+        let rc = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None).unwrap();
+        assert_eq!(rc, 0);
+        assert_eq!(
+            b4_versions(&proj.join("milpa.lock")),
+            std::collections::BTreeMap::from([
+                ("foo".to_string(), "1.0.0".to_string()),
+                ("bar".to_string(), "1.0.0".to_string()),
+            ]),
+        );
+
+        // Bare --upgrade: opts out GLOBALLY -> both move to the newest.
+        let upgrade_arg = vec!["--upgrade".to_string()];
+        let rc = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &upgrade_arg, false, false, false, None).unwrap();
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+        assert_eq!(rc, 0);
+        assert_eq!(
+            b4_versions(&proj.join("milpa.lock")),
+            std::collections::BTreeMap::from([
+                ("foo".to_string(), "2.0.0".to_string()),
+                ("bar".to_string(), "2.0.0".to_string()),
+            ]),
+        );
+    }
+
+    /// `--upgrade <dep>` moves ONLY the named dep; the unrelated dep stays
+    /// locked even though a newer version exists.
+    #[test]
+    fn b4_scoped_upgrade_moves_only_named_dep_via_mock() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        let (mocked, foo_h1, foo_h2) = b4_stage_two_versions(base, "foo", "1");
+        let (_, bar_h1, bar_h2) = b4_stage_two_versions(base, "bar", "2");
+        let hashes = vec![("foo", (foo_h1, foo_h2)), ("bar", (bar_h1, bar_h2))];
+        let index_v1_path = base.join("index-v1.kdl");
+        std::fs::write(&index_v1_path, b4_index_kdl(&hashes, false)).unwrap();
+        let index_v1v2_path = base.join("index-v1v2.kdl");
+        std::fs::write(&index_v1v2_path, b4_index_kdl(&hashes, true)).unwrap();
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1_path.display())) };
+        let proj = b4_make_locked_project(base, "proj");
+        unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1v2_path.display())) };
+
+        let upgrade_arg = vec!["--upgrade".to_string(), "foo".to_string()];
+        let rc = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &upgrade_arg, false, false, false, None).unwrap();
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+        assert_eq!(rc, 0);
+        let versions = b4_versions(&proj.join("milpa.lock"));
+        assert_eq!(versions["foo"], "2.0.0", "opted out -> newest");
+        assert_eq!(versions["bar"], "1.0.0", "untouched -> stays locked");
+    }
+
+    /// Delegation equivalence (D-B3): `--upgrade`/`--upgrade <dep>` on
+    /// fetch/lock produce the SAME resolved versions as `update`/
+    /// `update <dep>` from the same starting lock.
+    #[test]
+    fn b4_upgrade_delegation_equivalence_via_mock() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        let (mocked, foo_h1, foo_h2) = b4_stage_two_versions(base, "foo", "1");
+        let (_, bar_h1, bar_h2) = b4_stage_two_versions(base, "bar", "2");
+        let hashes = vec![("foo", (foo_h1, foo_h2)), ("bar", (bar_h1, bar_h2))];
+        let index_v1_path = base.join("index-v1.kdl");
+        std::fs::write(&index_v1_path, b4_index_kdl(&hashes, false)).unwrap();
+        let index_v1v2_path = base.join("index-v1v2.kdl");
+        std::fs::write(&index_v1v2_path, b4_index_kdl(&hashes, true)).unwrap();
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1_path.display())) };
+        let proj_a = b4_make_locked_project(base, "a");
+        let proj_b = b4_make_locked_project(base, "b");
+        let proj_c = b4_make_locked_project(base, "c");
+        let proj_d = b4_make_locked_project(base, "d");
+        unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1v2_path.display())) };
+
+        // Bare: fetch --upgrade vs bare update.
+        let upgrade_bare = vec!["--upgrade".to_string()];
+        assert_eq!(
+            cmd_fetch(&proj_a, Some(Strategy::default()), false, true, None, false, false, &upgrade_bare, false, false, false, None).unwrap(),
+            0
+        );
+        assert_eq!(
+            cmd_update(&proj_b, Some(Strategy::default()), &[], false, false, false, false).unwrap(),
+            0
+        );
+        assert_eq!(b4_versions(&proj_a.join("milpa.lock")), b4_versions(&proj_b.join("milpa.lock")));
+
+        // Scoped: fetch --upgrade foo vs update foo.
+        let upgrade_foo = vec!["--upgrade".to_string(), "foo".to_string()];
+        assert_eq!(
+            cmd_fetch(&proj_c, Some(Strategy::default()), false, true, None, false, false, &upgrade_foo, false, false, false, None).unwrap(),
+            0
+        );
+        assert_eq!(
+            cmd_update(&proj_d, Some(Strategy::default()), &["foo".to_string()], false, false, false, false).unwrap(),
+            0
+        );
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+        assert_eq!(b4_versions(&proj_c.join("milpa.lock")), b4_versions(&proj_d.join("milpa.lock")));
+        let versions_c = b4_versions(&proj_c.join("milpa.lock"));
+        assert_eq!(versions_c["foo"], "2.0.0");
+        assert_eq!(versions_c["bar"], "1.0.0");
+    }
+
+    /// `--locked` + `--upgrade` together -> `CLI-LOCKED-UPGRADE-CONFLICT`,
+    /// via the real `run()` dispatch (the mutual-exclusion check lives
+    /// there, before any verb runs — no manifest or fetch infra needed).
+    #[test]
+    fn b4_locked_and_upgrade_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("milpa.kdl"), "name \"app\"\nkind \"application\"\n").unwrap();
+
+        for verb_args in [
+            vec!["fetch".to_string(), "--locked".to_string(), "--upgrade".to_string()],
+            vec!["fetch".to_string(), "--locked".to_string(), "--upgrade".to_string(), "foo".to_string()],
+            vec!["lock".to_string(), "--locked".to_string(), "--upgrade".to_string()],
+        ] {
+            let mut argv = vec!["-C".to_string(), proj.to_str().unwrap().to_string()];
+            argv.extend(verb_args);
+            let rc = run(&argv);
+            let err = rc.unwrap_err();
+            assert_eq!(err.code(), "CLI-LOCKED-UPGRADE-CONFLICT");
+        }
+    }
+
+    // NOTE: no Rust-side "upgrade bypasses the frozen fast-path" test is
+    // needed here — mirrors B3's own documented asymmetry (this file's
+    // `locked_passes_when_up_to_date_via_mock` region): Rust's `cmd_fetch`
+    // only takes the frozen reconstruction branch when `--frozen` is
+    // EXPLICITLY passed (the `if frozen { .. } else { .. }` split above), so
+    // there is no implicit "attempt frozen whenever a lock+CAS exist" path
+    // for `--upgrade` to bypass — Rust's plain fetch/lock always fully
+    // resolves already. Python's `cmd_fetch` DOES attempt an implicit frozen
+    // fast-path unconditionally, which is why that bypass fix + its test
+    // exist only on the Python side (`test_b4_upgrade.py`'s
+    // `TestUpgradeBypassesFrozenFastPath`).
+
+    // -------------------------------------------------------------------------
+    // B7 (resolution-semantics RFC §3 Axis B, final Axis-B slice): thread
+    // `prior` through the remaining resolve-triggering verbs that hardcoded
+    // `prior=None` — `add` (both the standalone-package `cmd_add` path and
+    // the member-dir delegation path), `workspace add-member`, and
+    // `workspace remove-member`. Reuses the B4 helpers (`b4_stage_two_versions`
+    // / `b4_index_kdl` / `b4_versions`) — same "lock against v1-only index,
+    // then swap to v1+v2" shape that genuinely exercises "would move under a
+    // fresh/newest-wins resolve".
+    // -------------------------------------------------------------------------
+
+    /// Stage a single-version git dep used as the NEWLY ADDED dep for `add`
+    /// tests (`milpa add --git` fetches directly — never index-resolved).
+    /// Writes an explicit `.nimble` `version = "1.0.0"` sibling of `content/`
+    /// so the added dep's resolved version is deterministic (Axis A) rather
+    /// than falling back to the version-unknown sentinel.
+    fn b7_stage_new_dep(base: &std::path::Path, name: &str, sha: &str) -> std::path::PathBuf {
+        let url = format!("https://example.com/{name}.git");
+        let nim_name = format!("{name}.nim");
+        let body = format!("# {name} v1").into_bytes();
+        let mocked = make_mocked_fetches(base, &url, "main", sha, &[(nim_name.as_str(), body.as_slice())]);
+        let key_dir = mocked.join(milpa_core::url_key(&url, "main"));
+        std::fs::write(
+            key_dir.join(format!("{name}.nimble")),
+            "# Package\nversion = \"1.0.0\"\nauthor = \"e\"\ndescription = \"d\"\nlicense = \"MIT\"\n",
+        )
+        .unwrap();
+        mocked
+    }
+
+    /// `milpa add baz --git ...` resolves baz while foo/bar — already locked
+    /// at 1.0.0 — stay pinned even though the index now also offers 2.0.0 for
+    /// both (would newest-wins-bump them pre-B7).
+    #[test]
+    fn b7_add_leaves_existing_deps_pinned() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        let (mocked, foo_h1, foo_h2) = b4_stage_two_versions(base, "foo", "1");
+        let (_, bar_h1, bar_h2) = b4_stage_two_versions(base, "bar", "2");
+        let hashes = vec![("foo", (foo_h1, foo_h2)), ("bar", (bar_h1, bar_h2))];
+        let index_v1_path = base.join("index-v1.kdl");
+        std::fs::write(&index_v1_path, b4_index_kdl(&hashes, false)).unwrap();
+        let index_v1v2_path = base.join("index-v1v2.kdl");
+        std::fs::write(&index_v1v2_path, b4_index_kdl(&hashes, true)).unwrap();
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1_path.display())) };
+        let proj = b4_make_locked_project(base, "proj");
+
+        // A newer version of both got published.
+        unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1v2_path.display())) };
+        b7_stage_new_dep(base, "baz", &"c".repeat(40));
+
+        let rc = cmd_add(
+            &proj,
+            Some(Strategy::default()),
+            &["baz".to_string(), "--git".to_string(), "https://example.com/baz.git".to_string(), "--ref".to_string(), "main".to_string()],
+            false,
+            false,
+            false,
+            false,
+        );
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+
+        assert_eq!(rc.unwrap(), 0);
+        let versions = b4_versions(&proj.join("milpa.lock"));
+        assert_eq!(versions["baz"], "1.0.0", "the newly added dep resolves");
+        assert_eq!(versions["foo"], "1.0.0", "B7: unrelated locked dep must NOT move");
+        assert_eq!(versions["bar"], "1.0.0", "B7: unrelated locked dep must NOT move");
+    }
+
+    /// `milpa add` invoked from a workspace MEMBER dir re-resolves the WHOLE
+    /// shared workspace graph; B7: another member's already-locked dep (foo,
+    /// in member-a) must stay pinned when a new dep is added to member-b,
+    /// even though foo's index now also offers 2.0.0.
+    #[test]
+    fn b7_add_from_member_dir_leaves_other_members_pinned() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        let (mocked, foo_h1, foo_h2) = b4_stage_two_versions(base, "foo", "1");
+        let hashes = vec![("foo", (foo_h1, foo_h2))];
+        let index_v1_path = base.join("index-v1.kdl");
+        std::fs::write(&index_v1_path, b4_index_kdl(&hashes, false)).unwrap();
+        let index_v1v2_path = base.join("index-v1v2.kdl");
+        std::fs::write(&index_v1v2_path, b4_index_kdl(&hashes, true)).unwrap();
+
+        let root = base.join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("milpa.kdl"),
+            "workspace {\n    member \"member-a\"\n    member \"member-b\"\n}\nindex-trust \"off\"\n",
+        )
+        .unwrap();
+        let member_a = root.join("member-a");
+        std::fs::create_dir_all(&member_a).unwrap();
+        std::fs::write(
+            member_a.join("milpa.kdl"),
+            "name \"liba\"\nkind \"library\"\ndeps {\n    foo\n}\n",
+        )
+        .unwrap();
+        let member_b = root.join("member-b");
+        std::fs::create_dir_all(&member_b).unwrap();
+        std::fs::write(member_b.join("milpa.kdl"), "name \"libb\"\nkind \"library\"\n").unwrap();
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1_path.display())) };
+        let rc = cmd_fetch(&root, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None).unwrap();
+        assert_eq!(rc, 0);
+        assert_eq!(b4_versions(&root.join("milpa.lock"))["foo"], "1.0.0");
+
+        // foo's index now also offers 2.0.0.
+        unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1v2_path.display())) };
+        b7_stage_new_dep(base, "baz", &"c".repeat(40));
+
+        let rc = cmd_add(
+            &member_b,
+            Some(Strategy::default()),
+            &["baz".to_string(), "--git".to_string(), "https://example.com/baz.git".to_string(), "--ref".to_string(), "main".to_string()],
+            false,
+            false,
+            false,
+            false,
+        );
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+
+        assert_eq!(rc.unwrap(), 0);
+        let versions = b4_versions(&root.join("milpa.lock"));
+        assert_eq!(versions["baz"], "1.0.0");
+        assert_eq!(versions["foo"], "1.0.0", "B7: member-a's dep must NOT move");
+        assert!(!member_b.join("milpa.lock").exists(), "no member-local lock (D5)");
+    }
+
+    /// Adding a new member to the workspace re-resolves the shared graph; B7:
+    /// the EXISTING member's already-locked dep (foo) stays pinned even
+    /// though the index now also offers 2.0.0.
+    #[test]
+    fn b7_workspace_add_member_leaves_other_members_pinned() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        let (mocked, foo_h1, foo_h2) = b4_stage_two_versions(base, "foo", "1");
+        let (_, bar_h1, bar_h2) = b4_stage_two_versions(base, "bar", "2");
+        let foo_only = vec![("foo", (foo_h1.clone(), foo_h2.clone()))];
+        let both = vec![("foo", (foo_h1, foo_h2)), ("bar", (bar_h1, bar_h2))];
+        let index_v1_path = base.join("index-v1.kdl");
+        std::fs::write(&index_v1_path, b4_index_kdl(&foo_only, false)).unwrap();
+        let index_v1v2_path = base.join("index-v1v2.kdl");
+        std::fs::write(&index_v1v2_path, b4_index_kdl(&both, true)).unwrap();
+
+        let root = base.join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("milpa.kdl"),
+            "workspace {\n    member \"member-a\"\n}\nindex-trust \"off\"\n",
+        )
+        .unwrap();
+        let member_a = root.join("member-a");
+        std::fs::create_dir_all(&member_a).unwrap();
+        std::fs::write(
+            member_a.join("milpa.kdl"),
+            "name \"liba\"\nkind \"library\"\ndeps {\n    foo\n}\n",
+        )
+        .unwrap();
+        // member-c is the NEW member being added — declared on disk now,
+        // added to the workspace manifest by the verb under test.
+        let member_c = root.join("member-c");
+        std::fs::create_dir_all(&member_c).unwrap();
+        std::fs::write(
+            member_c.join("milpa.kdl"),
+            "name \"libc\"\nkind \"library\"\ndeps {\n    bar\n}\n",
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1_path.display())) };
+        let rc = cmd_fetch(&root, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None).unwrap();
+        assert_eq!(rc, 0);
+        assert_eq!(b4_versions(&root.join("milpa.lock"))["foo"], "1.0.0");
+
+        // foo's index now also offers 2.0.0; bar (member-c's own dep) is new.
+        unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1v2_path.display())) };
+        let rc = cmd_workspace_add_member(&root, &["member-c".to_string()], Some(Strategy::default()), false, false, false);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+
+        assert_eq!(rc.unwrap(), 0);
+        let versions = b4_versions(&root.join("milpa.lock"));
+        assert_eq!(versions["foo"], "1.0.0", "B7: member-a's dep must NOT move");
+        assert!(versions.contains_key("bar"), "member-c's own dep resolves");
+        let text = std::fs::read_to_string(root.join("milpa.kdl")).unwrap();
+        assert!(text.contains("member-c"));
+    }
+
+    /// Removing a member re-resolves the shared graph minimally; B7: the
+    /// REMAINING member's already-locked dep (foo) stays pinned even though
+    /// the index now also offers 2.0.0.
+    #[test]
+    fn b7_workspace_remove_member_leaves_remaining_members_pinned() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        let (mocked, foo_h1, foo_h2) = b4_stage_two_versions(base, "foo", "1");
+        let (_, bar_h1, bar_h2) = b4_stage_two_versions(base, "bar", "2");
+        let hashes = vec![("foo", (foo_h1, foo_h2)), ("bar", (bar_h1, bar_h2))];
+        let index_v1_path = base.join("index-v1.kdl");
+        std::fs::write(&index_v1_path, b4_index_kdl(&hashes, false)).unwrap();
+        let index_v1v2_path = base.join("index-v1v2.kdl");
+        std::fs::write(&index_v1v2_path, b4_index_kdl(&hashes, true)).unwrap();
+
+        let root = base.join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("milpa.kdl"),
+            "workspace {\n    member \"member-a\"\n    member \"member-b\"\n}\nindex-trust \"off\"\n",
+        )
+        .unwrap();
+        let member_a = root.join("member-a");
+        std::fs::create_dir_all(&member_a).unwrap();
+        std::fs::write(
+            member_a.join("milpa.kdl"),
+            "name \"liba\"\nkind \"library\"\ndeps {\n    foo\n}\n",
+        )
+        .unwrap();
+        let member_b = root.join("member-b");
+        std::fs::create_dir_all(&member_b).unwrap();
+        std::fs::write(
+            member_b.join("milpa.kdl"),
+            "name \"libb\"\nkind \"library\"\ndeps {\n    bar\n}\n",
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1_path.display())) };
+        let rc = cmd_fetch(&root, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None).unwrap();
+        assert_eq!(rc, 0);
+        let baseline = b4_versions(&root.join("milpa.lock"));
+        assert_eq!(baseline["foo"], "1.0.0");
+        assert_eq!(baseline["bar"], "1.0.0");
+
+        unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1v2_path.display())) };
+        let rc = cmd_workspace_remove_member(&root, &["member-b".to_string()], Some(Strategy::default()), false, false, false);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+
+        assert_eq!(rc.unwrap(), 0);
+        let versions = b4_versions(&root.join("milpa.lock"));
+        assert!(!versions.contains_key("bar"), "member-b's dep is gone");
+        assert_eq!(versions["foo"], "1.0.0", "B7: member-a's dep must NOT move");
+        let text = std::fs::read_to_string(root.join("milpa.kdl")).unwrap();
+        assert!(!text.contains("member-b"));
+    }
+
+    /// C3 (B7-gap): `milpa remove bar` on a standalone (non-workspace) project
+    /// re-resolves the manifest minus `bar`; B7 requires the prior lock be
+    /// threaded into that re-resolve so `foo` — already locked at 1.0.0 —
+    /// stays pinned even though the index now ALSO offers 2.0.0 for foo.
+    /// Pre-fix, `cmd_remove`'s single-package branch hardcoded `prior: None`
+    /// into the `resolve()` call, so this newest-wins-dragged foo to 2.0.0.
+    #[test]
+    fn b7_remove_leaves_other_dep_pinned() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        let (mocked, foo_h1, foo_h2) = b4_stage_two_versions(base, "foo", "1");
+        let (_, bar_h1, bar_h2) = b4_stage_two_versions(base, "bar", "2");
+        let hashes = vec![("foo", (foo_h1, foo_h2)), ("bar", (bar_h1, bar_h2))];
+        let index_v1_path = base.join("index-v1.kdl");
+        std::fs::write(&index_v1_path, b4_index_kdl(&hashes, false)).unwrap();
+        let index_v1v2_path = base.join("index-v1v2.kdl");
+        std::fs::write(&index_v1v2_path, b4_index_kdl(&hashes, true)).unwrap();
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1_path.display())) };
+        let proj = b4_make_locked_project(base, "proj");
+
+        // A newer version of foo (the dep NOT being removed) got published.
+        unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1v2_path.display())) };
+
+        let rc = cmd_remove(&proj, Some(Strategy::default()), &["bar".to_string()], false, false, false);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+
+        assert_eq!(rc.unwrap(), 0);
+        let versions = b4_versions(&proj.join("milpa.lock"));
+        assert!(!versions.contains_key("bar"), "removed dep is gone from the lock");
+        assert_eq!(versions["foo"], "1.0.0", "B7: unrelated locked dep must NOT move");
+        let text = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+        assert!(!text.contains("bar"), "removed dep is gone from the manifest");
+    }
+
+    /// D5 (resolution-semantics RFC §3 Axis D / §6 D-D3 no-silent-drop):
+    /// `milpa remove <dep>` (single-package path — previously the bare
+    /// `resolve()` wrapper, which hardcodes `exclude_newer: None`) must
+    /// CARRY FORWARD the prior lockfile's recorded `exclude_newer`, not
+    /// silently drop it, when the manifest declares no `resolution {
+    /// exclude-newer }` of its own.
+    #[test]
+    fn remove_carries_forward_exclude_newer_no_silent_drop() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let foo_url = "https://example.com/foo.git";
+        let bar_url = "https://example.com/bar.git";
+        let foo_sha = "c".repeat(40);
+        let bar_sha = "d".repeat(40);
+
+        // milpa.kdl: two git deps, NO resolution{} block.
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            format!(
+                "name \"app\"\nkind \"application\"\ndeps {{\n  \
+                 foo git=(url)\"{foo_url}\" ref=\"main\"\n  \
+                 bar git=(url)\"{bar_url}\" ref=\"main\"\n}}\n"
+            ),
+        )
+        .unwrap();
+
+        let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+        let mocked = make_mocked_fetches(tmp.path(), foo_url, "main", &foo_sha, &[("foo.nim", b"version = \"1.0.0\"\n")]);
+        // Both fetches share one mocked-fetches root (keyed by url+ref).
+        let _ = make_mocked_fetches(tmp.path(), bar_url, "main", &bar_sha, &[("bar.nim", b"version = \"1.0.0\"\n")]);
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        // Real baseline fetch WITH --exclude-newer (records correct identities
+        // for both deps + the exclude_newer bound) — avoids hand-fabricating
+        // identity hashes that would spuriously trip FETCH-PROVENANCE-DIVERGENCE.
+        let baseline = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, Some(ts));
+        assert_eq!(baseline.unwrap(), 0, "baseline fetch must succeed");
+        let baseline_lock = load_lockfile(&proj.join("milpa.lock")).unwrap();
+        assert_eq!(baseline_lock.exclude_newer, Some(ts));
+
+        let r = cmd_remove(&proj, Some(Strategy::default()), &["bar".into()], false, false, false);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(r.unwrap(), 0, "remove must succeed");
+        let new_lock = parse_lockfile(
+            &std::fs::read_to_string(proj.join("milpa.lock")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            new_lock.exclude_newer,
+            Some(ts),
+            "single-package `remove` must carry forward the prior lock's exclude_newer, not drop it"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4005,6 +5838,7 @@ mod tests {
             submodule_shas: vec![],
         });
         let dep = milpa_core::LockedDep {
+            declared_version_source: None,
             name: dep_name.to_string(),
             namespace: None,
             identity: Some(identity.to_string()),
@@ -4021,6 +5855,7 @@ mod tests {
         let lf = milpa_core::Lockfile {
             version: 1,
             strategy: "maxver".to_string(),
+            exclude_newer: None,
             deps: vec![dep],
         };
         write_lockfile(&lf, lock_path).unwrap();
@@ -4068,7 +5903,7 @@ mod tests {
         let mocked = make_mocked_fetches(tmp.path(), primary_url, "main", &sha, &[("foo.nim", b"version = \"1.0.0\"\n")]);
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let r = cmd_update(&proj, Strategy::default(), &["foo".into()], false, false, false, false);
+        let r = cmd_update(&proj, Some(Strategy::default()), &["foo".into()], false, false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(r.unwrap(), 0, "update must succeed");
@@ -4081,6 +5916,82 @@ mod tests {
         assert!(
             lock_text.contains(mirror2_url),
             "mirror2 must be preserved in new lockfile; lock:\n{lock_text}"
+        );
+    }
+
+    /// D5 (resolution-semantics RFC §3 Axis D / §6 D-D3 no-silent-drop):
+    /// a bare `milpa update` (drops ALL pins, full re-resolve) with NO
+    /// `resolution { exclude-newer }` in the manifest must CARRY FORWARD the
+    /// prior lockfile's own recorded `exclude_newer` — never silently drop
+    /// it — because dropping it would relax semantics (silently un-freeze
+    /// the project). This is the exact scenario a one-off `milpa fetch
+    /// --exclude-newer <ts>` (never mirrored into the manifest) creates.
+    #[test]
+    fn update_carries_forward_exclude_newer_no_silent_drop() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let url = "https://example.com/foo.git";
+        let sha = "b".repeat(40);
+        let identity = format!("dag-sha256:{}", "b".repeat(64));
+
+        // milpa.kdl: NO resolution{} block at all.
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            format!("name \"app\"\nkind \"application\"\ndeps {{\n  foo git=(url)\"{url}\" ref=\"main\"\n}}\n"),
+        )
+        .unwrap();
+
+        // Prior lockfile: recorded a real exclude_newer bound (e.g. from a
+        // one-off `milpa fetch --exclude-newer` never mirrored into the manifest).
+        let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+        let dep = milpa_core::LockedDep {
+            declared_version_source: None,
+            name: "foo".to_string(),
+            namespace: None,
+            identity: Some(identity),
+            version: "0.0.1".to_string(),
+            src_dir: String::new(),
+            requires: vec![],
+            provenances: vec![milpa_core::ProvenanceRecord::Git {
+                url: url.to_string(),
+                ref_spec: Some("main".to_string()),
+                commit_sha: Some(sha.clone()),
+                origin: "observed".to_string(),
+                submodule_shas: vec![],
+            }],
+            active_flags: vec![],
+            dep_decl: None,
+            cond_requires: vec![],
+            aliases: vec![],
+            attestation: None,
+        };
+        let lf = milpa_core::Lockfile {
+            version: 1,
+            strategy: "maxver".to_string(),
+            exclude_newer: Some(ts),
+            deps: vec![dep],
+        };
+        write_lockfile(&lf, &proj.join("milpa.lock")).unwrap();
+
+        let mocked = make_mocked_fetches(tmp.path(), url, "main", &sha, &[("foo.nim", b"version = \"1.0.0\"\n")]);
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        // Bare `update` — no dep arg, drops ALL pins, full re-resolve.
+        let r = cmd_update(&proj, None, &[], false, false, false, false);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(r.unwrap(), 0, "update must succeed");
+        let new_lock = parse_lockfile(
+            &std::fs::read_to_string(proj.join("milpa.lock")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            new_lock.exclude_newer,
+            Some(ts),
+            "bare `update` must carry forward the prior lock's exclude_newer, not drop it"
         );
     }
 
@@ -4124,7 +6035,7 @@ mod tests {
         let mocked = make_mocked_fetches(tmp.path(), primary_url, "main", &sha, &[("foo.nim", b"version = \"1.0.0\"\n")]);
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let r = cmd_update(&proj, Strategy::default(), &["foo".into()], false, false, false, false);
+        let r = cmd_update(&proj, Some(Strategy::default()), &["foo".into()], false, false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(r.unwrap(), 0, "update must succeed");
@@ -4176,7 +6087,7 @@ mod tests {
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         // Pass alias 'baz' as dep_name — must resolve to canonical 'foo'.
-        let r = cmd_update(&proj, Strategy::default(), &["baz".into()], false, false, false, false);
+        let r = cmd_update(&proj, Some(Strategy::default()), &["baz".into()], false, false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(
@@ -4224,7 +6135,7 @@ mod tests {
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         // Pass alias 'baz' — must resolve to canonical 'foo' for manifest check.
-        let r = cmd_remove(&proj, Strategy::default(), &["baz".into()], false, false, false);
+        let r = cmd_remove(&proj, Some(Strategy::default()), &["baz".into()], false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(
@@ -4275,7 +6186,7 @@ mod tests {
         // (warning is non-fatal) and trust the implementation emits to stderr.
         // The unit-level check: cmd_remove with alias in prior must exit 0.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let r = cmd_remove(&proj, Strategy::default(), &["foo".into()], false, false, false);
+        let r = cmd_remove(&proj, Some(Strategy::default()), &["foo".into()], false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         // Removal must succeed (warning is non-fatal).
@@ -4317,7 +6228,7 @@ mod tests {
         let mocked = make_mocked_fetches(tmp.path(), primary_url, "main", &sha, &[("foo.nim", b"version = \"1.0.0\"\n")]);
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let r = cmd_update(&proj, Strategy::default(), &["foo".into()], false, false, false, false);
+        let r = cmd_update(&proj, Some(Strategy::default()), &["foo".into()], false, false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(r.unwrap(), 0, "update with no mirrors must succeed");
@@ -4351,7 +6262,7 @@ mod tests {
         // (1) add with explicit --ref → resolve + write both files.
         let r = cmd_add(
             &proj,
-            Strategy::default(),
+            Some(Strategy::default()),
             &["foo".into(), "--git".into(), url.into(), "--ref".into(), "main".into()],
             false,
             false,
@@ -4364,7 +6275,7 @@ mod tests {
         // (2) duplicate guard.
         let dup = cmd_add(
             &proj,
-            Strategy::default(),
+            Some(Strategy::default()),
             &["foo".into(), "--git".into(), url.into(), "--ref".into(), "main".into()],
             false,
             false,
@@ -4375,7 +6286,7 @@ mod tests {
         // (3) add a second dep with NO --ref → mocked default-branch discovery.
         let url2 = "https://example.com/bar.git";
         let _ = make_mocked_fetches(tmp.path(), url2, "trunk", &"c".repeat(40), &[("bar.nim", b"# bar")]);
-        let r2 = cmd_add(&proj, Strategy::default(), &["bar".into(), "--git".into(), url2.into()], false, false, false, false);
+        let r2 = cmd_add(&proj, Some(Strategy::default()), &["bar".into(), "--git".into(), url2.into()], false, false, false, false);
         let after_add2 = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
 
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
@@ -4409,11 +6320,11 @@ mod tests {
     fn usage_subcmds_return_exit_2() {
         // remove with no name → exit 2.
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(cmd_remove(tmp.path(), Strategy::default(), &[], false, false, false).unwrap(), 2);
+        assert_eq!(cmd_remove(tmp.path(), Some(Strategy::default()), &[], false, false, false).unwrap(), 2);
         // add with no name → exit 2.
-        assert_eq!(cmd_add(tmp.path(), Strategy::default(), &[], false, false, false, false).unwrap(), 2);
+        assert_eq!(cmd_add(tmp.path(), Some(Strategy::default()), &[], false, false, false, false).unwrap(), 2);
         // add with no --git/--mirror → exit 2.
-        assert_eq!(cmd_add(tmp.path(), Strategy::default(), &["foo".into()], false, false, false, false).unwrap(), 2);
+        assert_eq!(cmd_add(tmp.path(), Some(Strategy::default()), &["foo".into()], false, false, false, false).unwrap(), 2);
     }
 
     // --- MILPA_MOCKED_FETCHES integration -----------------------------------
@@ -4467,7 +6378,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX; unique env var name; cleaned up after.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false, false, &[], false, false, false);
+        let result = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert!(result.is_ok(), "expected Ok, got {result:?}");
@@ -4483,6 +6394,108 @@ mod tests {
             foo_meta.file_type().is_symlink(),
             "_deps/foo must be a CAS symlink after mocked fetch (BLOCKER-R1)"
         );
+    }
+
+    /// C3 (resolution-semantics RFC §3 Axis C / D-C2): unspecified CLI
+    /// `--strategy` (`None`) defers to the manifest's `resolution { strategy }`.
+    #[test]
+    fn fetch_unspecified_cli_uses_manifest_resolution_strategy() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+        let cas_dir = tmp.path().join("cas");
+        unsafe { std::env::set_var("MILPA_CACHE_DIR", &cas_dir) };
+
+        let mocked = make_mocked_fetches(
+            tmp.path(),
+            "https://example.com/foo.git",
+            "main",
+            &"a".repeat(40),
+            &[("foo.nim", b"# foo")],
+        );
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\nresolution {\n  strategy \"minver\"\n}\ndeps {\n  foo git=(url)\"https://example.com/foo.git\" ref=\"main\"\n}\n",
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let result = cmd_fetch(&proj, None, false, true, None, false, false, &[], false, false, false, None);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+        unsafe { std::env::remove_var("MILPA_CACHE_DIR") };
+
+        assert_eq!(result.unwrap(), 0);
+        let lock = milpa_core::load_lockfile(&proj.join("milpa.lock")).unwrap();
+        assert_eq!(lock.strategy, "minver");
+    }
+
+    /// C3: explicit CLI `--strategy` overrides the manifest's declared
+    /// `resolution { strategy }`.
+    #[test]
+    fn fetch_explicit_cli_overrides_manifest_resolution_strategy() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+        let cas_dir = tmp.path().join("cas");
+        unsafe { std::env::set_var("MILPA_CACHE_DIR", &cas_dir) };
+
+        let mocked = make_mocked_fetches(
+            tmp.path(),
+            "https://example.com/foo.git",
+            "main",
+            &"a".repeat(40),
+            &[("foo.nim", b"# foo")],
+        );
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\nresolution {\n  strategy \"minver\"\n}\ndeps {\n  foo git=(url)\"https://example.com/foo.git\" ref=\"main\"\n}\n",
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let result = cmd_fetch(&proj, Some(Strategy::Semver), false, true, None, false, false, &[], false, false, false, None);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+        unsafe { std::env::remove_var("MILPA_CACHE_DIR") };
+
+        assert_eq!(result.unwrap(), 0);
+        let lock = milpa_core::load_lockfile(&proj.join("milpa.lock")).unwrap();
+        assert_eq!(lock.strategy, "semver");
+    }
+
+    /// C3: absent CLI `--strategy` AND no manifest `resolution { strategy }`
+    /// defaults to `"maxver"` (unchanged pre-C3 behavior).
+    #[test]
+    fn fetch_absent_cli_and_manifest_defaults_to_maxver() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+        let cas_dir = tmp.path().join("cas");
+        unsafe { std::env::set_var("MILPA_CACHE_DIR", &cas_dir) };
+
+        let mocked = make_mocked_fetches(
+            tmp.path(),
+            "https://example.com/foo.git",
+            "main",
+            &"a".repeat(40),
+            &[("foo.nim", b"# foo")],
+        );
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\ndeps {\n  foo git=(url)\"https://example.com/foo.git\" ref=\"main\"\n}\n",
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let result = cmd_fetch(&proj, None, false, true, None, false, false, &[], false, false, false, None);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+        unsafe { std::env::remove_var("MILPA_CACHE_DIR") };
+
+        assert_eq!(result.unwrap(), 0);
+        let lock = milpa_core::load_lockfile(&proj.join("milpa.lock")).unwrap();
+        assert_eq!(lock.strategy, "maxver");
     }
 
     /// Live `cmd_fetch` (non-frozen) must build alias symlinks for deduped deps
@@ -4554,7 +6567,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked_dir) };
-        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false, false, &[], false, false, false);
+        let result = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
         unsafe { std::env::remove_var("MILPA_CACHE_DIR") };
 
@@ -4615,7 +6628,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let result = cmd_fetch(&proj, Strategy::default(), false, true, None, false, false, &[], false, false, false);
+        let result = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert!(result.is_err(), "expected Err, got {result:?}");
@@ -5665,7 +7678,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         let rc = cmd_add(
             &proj,
-            Strategy::default(),
+            Some(Strategy::default()),
             &["mydep".into(), "--git".into(), url.into(), "--ref".into(), "main".into(), "--optional".into()],
             false,
             false,
@@ -5697,7 +7710,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         let rc = cmd_add(
             &proj,
-            Strategy::default(),
+            Some(Strategy::default()),
             &[
                 "featdep".into(), "--git".into(), url.into(),
                 "--ref".into(), "main".into(),
@@ -5716,6 +7729,191 @@ mod tests {
         assert!(kdl.contains("flag \"beta\""), "flag beta must be in manifest:\n{kdl}");
     }
 
+    /// A3b (rfc-resolution-semantics.md §3 Axis A (b) step 4): cmd_add
+    /// --version writes version= on the new dep node — the natural-site
+    /// workflow, mirrors --optional/--features.
+    #[test]
+    fn a3b_add_version_writes_version_annotation() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj_ver");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\n",
+        ).unwrap();
+
+        let url = "https://example.com/verdep.git";
+        let sha = "d".repeat(40);
+        let mocked = make_mocked_fetches(tmp.path(), url, "main", &sha, &[("dep.nim", b"# dep")]);
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let rc = cmd_add(
+            &proj,
+            Some(Strategy::default()),
+            &[
+                "verdep".into(), "--git".into(), url.into(),
+                "--ref".into(), "main".into(),
+                "--version".into(), "1.2.3".into(),
+            ],
+            false,
+            false,
+            false,
+            false,
+        );
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(rc.unwrap(), 0, "add --version must exit 0");
+        let kdl = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+        assert!(kdl.contains("version=\"1.2.3\""), "version=\"1.2.3\" must be in manifest:\n{kdl}");
+    }
+
+    /// A3b: cmd_add without --version writes no version= at all.
+    #[test]
+    fn a3b_add_no_version_no_version_annotation() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj_ver2");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\n",
+        ).unwrap();
+
+        let url = "https://example.com/noverdep.git";
+        let sha = "e".repeat(40);
+        let mocked = make_mocked_fetches(tmp.path(), url, "main", &sha, &[("dep.nim", b"# dep")]);
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let rc = cmd_add(
+            &proj,
+            Some(Strategy::default()),
+            &["noverdep".into(), "--git".into(), url.into(), "--ref".into(), "main".into()],
+            false,
+            false,
+            false,
+            false,
+        );
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(rc.unwrap(), 0);
+        let kdl = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+        assert!(!kdl.contains("version="), "version= must not appear when not requested:\n{kdl}");
+    }
+
+    /// A3b: a malformed --version value is rejected (MAN-DEP-VERSION-INVALID)
+    /// before anything is written — same slug as the manifest grammar.
+    #[test]
+    fn a3b_add_version_malformed_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj_ver3");
+        std::fs::create_dir_all(&proj).unwrap();
+        let original = "name \"app\"\nkind \"application\"\n";
+        std::fs::write(proj.join("milpa.kdl"), original).unwrap();
+
+        let rc = cmd_add(
+            &proj,
+            Some(Strategy::default()),
+            &[
+                "baddep".into(), "--git".into(), "https://example.com/baddep.git".into(),
+                "--ref".into(), "main".into(),
+                "--version".into(), "not-a-version".into(),
+            ],
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(rc.is_err(), "malformed --version must reject");
+        if let Err(e) = rc {
+            assert_eq!(e.code(), "MAN-DEP-VERSION-INVALID");
+        }
+        // Manifest must be left unmodified — no partial write.
+        let kdl = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+        assert_eq!(kdl, original);
+    }
+
+    /// A3b: `milpa --version` (top-level, no subcommand) still prints the
+    /// binary version and exits 0 — the pre-verb-scoped scan must not break
+    /// the existing top-level flag.
+    #[test]
+    fn a3b_top_level_version_flag_still_works() {
+        let rc = run(&["--version".to_string()]);
+        assert_eq!(rc.unwrap(), 0);
+    }
+
+    /// L1: `milpa -C <dir> --version` must print the version and exit 0.
+    /// Before the fix, the naive "first non-dash token" pre-verb scan
+    /// stopped at `<dir>` (the VALUE of `-C`, not a flag), slicing
+    /// `--version` out of the region it scans — the flag was silently never
+    /// found, and the invocation fell through to `parse_args`, which
+    /// rejects a bare `--version` (not a recognized verb) with USAGE + exit
+    /// 2 instead of printing the version.
+    #[test]
+    fn l1_dash_c_dir_then_version_prints_version_exits_0() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rc = run(&[
+            "-C".to_string(),
+            tmp.path().to_str().unwrap().to_string(),
+            "--version".to_string(),
+        ]);
+        assert_eq!(rc.unwrap(), 0, "-C <dir> --version must exit 0");
+    }
+
+    /// L1: `milpa --certificate <path> --version` must likewise print the
+    /// version and exit 0 — same class of bug as the `-C` case, for the
+    /// other value-consuming global flag.
+    #[test]
+    fn l1_certificate_path_then_version_prints_version_exits_0() {
+        let rc = run(&[
+            "--certificate".to_string(),
+            "/tmp/does-not-need-to-exist.json".to_string(),
+            "--version".to_string(),
+        ]);
+        assert_eq!(rc.unwrap(), 0, "--certificate <path> --version must exit 0");
+    }
+
+    /// A3b: the root-cause collision fix — `milpa add <dep> --git <url>
+    /// --version x.y.z` run through the FULL `run()` entry point (not just
+    /// `cmd_add` directly) must reach `cmd_add`, not the top-level
+    /// `--version` early-exit (which also returns `Ok(0)`, so a bare
+    /// exit-code assertion cannot distinguish the bug — this test checks the
+    /// manifest was actually written).
+    #[test]
+    fn a3b_run_add_version_does_not_collide_with_top_level_version_flag() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj_ver_run");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("milpa.kdl"),
+            "name \"app\"\nkind \"application\"\n",
+        ).unwrap();
+
+        let url = "https://example.com/rundep.git";
+        let sha = "f".repeat(40);
+        let mocked = make_mocked_fetches(tmp.path(), url, "main", &sha, &[("dep.nim", b"# dep")]);
+        unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
+        let rc = run(&[
+            "-C".into(),
+            proj.to_str().unwrap().into(),
+            "add".into(),
+            "rundep".into(),
+            "--git".into(),
+            url.into(),
+            "--ref".into(),
+            "main".into(),
+            "--version".into(),
+            "1.2.3".into(),
+        ]);
+        unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
+
+        assert_eq!(rc.unwrap(), 0);
+        let kdl = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
+        assert!(
+            kdl.contains("version=\"1.2.3\""),
+            "add must have actually run (not the top-level --version early-exit):\n{kdl}"
+        );
+    }
+
     /// S10: cmd_add --optional rejects dep whose name clashes with existing flag.
     #[test]
     fn s10_add_optional_clash_rejected() {
@@ -5730,7 +7928,7 @@ mod tests {
 
         let rc = cmd_add(
             &proj,
-            Strategy::default(),
+            Some(Strategy::default()),
             &["myflag".into(), "--git".into(), "https://example.com/myflag.git".into(),
               "--ref".into(), "main".into(), "--optional".into()],
             false,
@@ -5747,6 +7945,160 @@ mod tests {
         // manifest must be unchanged.
         let kdl = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
         assert!(!kdl.contains("myflag.git"), "manifest must not be modified after clash");
+    }
+
+    /// A7 (rfc-resolution-semantics.md §3 Axis A / §5): `version_suffix` pure
+    /// unit tests — the branching logic `cmd_show` prints next to a dep's
+    /// version. See its doc comment for the contract.
+    #[test]
+    fn a7_version_suffix_shows_source_when_present() {
+        for src in ["manifest", "nimble", "tag", "annotation"] {
+            assert_eq!(
+                version_suffix(&Some(src.to_string()), "2.3.4"),
+                format!(" ({src})")
+            );
+        }
+    }
+
+    #[test]
+    fn a7_version_suffix_marks_version_unknown_when_source_absent() {
+        // A5's flattening pairing: version "0.0.0" + no source => version-unknown.
+        assert_eq!(version_suffix(&None, "0.0.0"), " (version-unknown)");
+    }
+
+    #[test]
+    fn a7_version_suffix_empty_for_named_dep_real_version_no_source() {
+        // A named/index dep has no source either, but a real version — not unknown.
+        assert_eq!(version_suffix(&None, "1.2.3"), "");
+    }
+
+    /// R11: `format_timestamp_for_show` must byte-match
+    /// `milpa_types::format_iso8601_timestamp` (the same known instants that
+    /// crate's own tests assert against) since it's a transcribed copy of
+    /// that function — this is the regression net for the transcription.
+    #[test]
+    fn r11_format_timestamp_for_show_whole_seconds() {
+        let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(format_timestamp_for_show(&ts), "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn r11_format_timestamp_for_show_arbitrary_instant() {
+        let ts = parse_iso8601_timestamp("2026-06-15T12:30:45Z").unwrap();
+        assert_eq!(format_timestamp_for_show(&ts), "2026-06-15T12:30:45Z");
+    }
+
+    #[test]
+    fn r11_format_timestamp_for_show_normalizes_offset_to_utc_z() {
+        let ts = parse_iso8601_timestamp("2026-01-01T01:00:00+01:00").unwrap();
+        assert_eq!(format_timestamp_for_show(&ts), "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn r11_format_timestamp_for_show_omits_fraction_when_zero() {
+        let ts = Timestamp { unix_seconds: 0, nanos: 0 };
+        assert_eq!(format_timestamp_for_show(&ts), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn r11_format_timestamp_for_show_includes_fraction_when_present() {
+        let ts = Timestamp { unix_seconds: 0, nanos: 500_000_000 };
+        assert_eq!(format_timestamp_for_show(&ts), "1970-01-01T00:00:00.5Z");
+    }
+
+    #[test]
+    fn r11_exclude_newer_header_line_none_when_absent() {
+        assert_eq!(exclude_newer_header_line(&None), None);
+    }
+
+    #[test]
+    fn r11_exclude_newer_header_line_some_when_present() {
+        let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(
+            exclude_newer_header_line(&Some(ts)).as_deref(),
+            Some("exclude-newer 2026-01-01T00:00:00Z")
+        );
+    }
+
+    /// A7: cmd_show's header prints `strategy` and exits 0. This fixture's
+    /// lockfile has no `exclude_newer` node, so `lock.exclude_newer` must
+    /// parse to `None` and `exclude_newer_header_line` must therefore omit
+    /// the line entirely (R11 regression: `cmd_show` must never print a
+    /// fake/hardcoded `exclude-newer` value for the absent case).
+    #[test]
+    fn a7_show_prints_strategy_header_and_exits_0() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("show_strategy_header");
+        std::fs::create_dir_all(&proj).unwrap();
+        let lock_text = concat!(
+            "// generated by milpa; reproducible build snapshot\n",
+            "version 1\nstrategy \"minver\"\n\n",
+            "dep \"mylib\" {\n",
+            "    identity \"dag-sha256:", "a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+            "    version \"1.0.0\"\n",
+            "    src_dir \"\"\n",
+            "    requires\n",
+            "    provenance {\n",
+            "        origin \"observed\"\n",
+            "        kind \"git\"\n",
+            "        url \"https://example.com/mylib.git\"\n",
+            "        ref \"main\"\n",
+            "        commit_sha \"", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "\"\n",
+            "    }\n",
+            "}\n",
+        );
+        std::fs::write(proj.join("milpa.lock"), lock_text).unwrap();
+        let lock = parse_lockfile(&std::fs::read_to_string(proj.join("milpa.lock")).unwrap()).unwrap();
+        assert_eq!(lock.strategy, "minver");
+        assert_eq!(lock.exclude_newer, None, "fixture has no exclude_newer node");
+        assert_eq!(
+            exclude_newer_header_line(&lock.exclude_newer),
+            None,
+            "cmd_show must omit the exclude-newer line when the lockfile recorded no bound"
+        );
+        let rc = cmd_show(&proj).unwrap();
+        assert_eq!(rc, 0, "show must exit 0 and print the strategy header");
+    }
+
+    /// R11: `cmd_show`'s header must print an `exclude-newer <ts>` line,
+    /// mirroring the Python reference's `cmd_show` (`cli.py`), when the
+    /// lockfile recorded a D5 `exclude_newer` bound. Prior to this fix,
+    /// `cmd_show` unconditionally omitted the field even though
+    /// `Lockfile.exclude_newer` already existed (a stale "not implemented
+    /// yet" comment had drifted from reality) — a cross-impl `show`
+    /// divergence.
+    #[test]
+    fn r11_show_prints_exclude_newer_header_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("show_exclude_newer");
+        std::fs::create_dir_all(&proj).unwrap();
+        let lock_text = concat!(
+            "// generated by milpa; reproducible build snapshot\n",
+            "version 1\nstrategy \"minver\"\nexclude_newer \"2026-06-15T12:30:45Z\"\n\n",
+            "dep \"mylib\" {\n",
+            "    identity \"dag-sha256:", "a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+            "    version \"1.0.0\"\n",
+            "    src_dir \"\"\n",
+            "    requires\n",
+            "    provenance {\n",
+            "        origin \"observed\"\n",
+            "        kind \"git\"\n",
+            "        url \"https://example.com/mylib.git\"\n",
+            "        ref \"main\"\n",
+            "        commit_sha \"", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "\"\n",
+            "    }\n",
+            "}\n",
+        );
+        std::fs::write(proj.join("milpa.lock"), lock_text).unwrap();
+        let lock = parse_lockfile(&std::fs::read_to_string(proj.join("milpa.lock")).unwrap()).unwrap();
+        assert!(lock.exclude_newer.is_some(), "fixture's exclude_newer node must parse");
+        assert_eq!(
+            exclude_newer_header_line(&lock.exclude_newer).as_deref(),
+            Some("exclude-newer 2026-06-15T12:30:45Z"),
+            "must match Python cmd_show's exact label + timestamp wire format"
+        );
+        let rc = cmd_show(&proj).unwrap();
+        assert_eq!(rc, 0, "show must exit 0 with an exclude_newer bound present");
     }
 
     /// S10: cmd_show prints active_flags for deps that have them.
@@ -6202,7 +8554,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         let rc = cmd_add(
             &proj,
-            Strategy::Minver,
+            Some(Strategy::Minver),
             &["dep9".into(), "--git".into(), url.into(), "--ref".into(), "main".into()],
             false,
             false,
@@ -6254,12 +8606,12 @@ mod tests {
 
         // Fetch first so there's a lockfile and _deps/ to satisfy remove's resolve.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        cmd_fetch(&proj, Strategy::Minver, false, true, None, false, false, &[], false, false, false).unwrap();
+        cmd_fetch(&proj, Some(Strategy::Minver), false, true, None, false, false, &[], false, false, false, None).unwrap();
 
         // Remove dpa with minver strategy.
         let rc = cmd_remove(
             &proj,
-            Strategy::Minver,
+            Some(Strategy::Minver),
             &["dpa".into()],
             false,
             false,

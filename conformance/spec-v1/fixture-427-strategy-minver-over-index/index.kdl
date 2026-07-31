@@ -1,0 +1,30 @@
+schema_version 1
+package "widget" {
+    version "2.0.0" {
+        content_hash "dag-sha256:d728c0d70215fc412cd4fd6bd684276a439844c1a15eb082c05b86b8bde761e6"
+        provenance {
+            kind "git"
+            url "https://example.com/widget.git"
+            ref "v2.0.0"
+            commit_sha "dd0000000000000000000000000000000000002a"
+        }
+    }
+    version "1.5.0" {
+        content_hash "dag-sha256:fb180b3b124a26369e14772b749edb6efe364eea90a9d2c2eda9957783614303"
+        provenance {
+            kind "git"
+            url "https://example.com/widget.git"
+            ref "v1.5.0"
+            commit_sha "dd0000000000000000000000000000000000001b"
+        }
+    }
+    version "1.0.0" {
+        content_hash "dag-sha256:6ba4e3cff1fd5c6566ca9ebf2f5db359f65794a6c9c9e1dea18f21da0280ae21"
+        provenance {
+            kind "git"
+            url "https://example.com/widget.git"
+            ref "v1.0.0"
+            commit_sha "dd0000000000000000000000000000000000001a"
+        }
+    }
+}

@@ -53,7 +53,7 @@ from pathlib import Path
 
 from milpa.manifest import NamedDep, UrlDep
 from milpa.predicate import Predicate
-from milpa.version import VersionSet
+from milpa.version import Version, VersionSet, parse_version
 
 # ---------------------------------------------------------------------------
 # NimbleManifest — the scanner's output
@@ -66,6 +66,14 @@ class NimbleManifest:
 
     ``deps`` is an ordered tuple of ``UrlDep | NamedDep`` (the ``"nim"``
     entry is excluded per §5.4).  ``src_dir`` is ``None`` when not found.
+
+    ``version`` is the package's own declared release version scanned from a
+    ``version = "x.y.z"`` assignment (A1 — RFC rfc-resolution-semantics.md §3
+    Axis A (b) step 2, the ``.nimble`` compat adapter for milpa.kdl's native
+    ``version`` field).  ``None`` when absent OR malformed — this scanner is
+    **total** (never raises), so a 2-component or non-numeric value silently
+    falls through to version-unknown rather than being reported as an error
+    (mirrors ``src_dir``'s last-assignment-wins NimScript semantics).
 
     ``dep_predicates`` is a tuple aligned by index with ``deps``.  Each
     element is the tuple of ``Predicate`` instances that apply to that dep
@@ -84,6 +92,7 @@ class NimbleManifest:
     deps: tuple[UrlDep | NamedDep, ...]
     src_dir: str | None
     dep_predicates: tuple[tuple[Predicate, ...], ...] = ()
+    version: Version | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +128,12 @@ _REQUIRES_RE: re.Pattern[str] = re.compile(r"^\s*requires\s+(.*)\s*$")
 # ``srcDir = "..."`` or ``srcDir = ...`` (quotes optional per §5.2).
 _SRCDIR_RE: re.Pattern[str] = re.compile(r'^\s*srcDir\s*=\s*"?([^"\s]+)"?\s*$')
 
+# A1: ``version = "..."`` or ``version = ...`` (quotes optional, same shape
+# as ``_SRCDIR_RE``).  Validation (does this parse as a strict semver?) is
+# NOT done here — this regex only extracts the raw text; ``parse_nimble``
+# feeds it through ``parse_version`` and discards on ``None`` (totality).
+_VERSION_RE: re.Pattern[str] = re.compile(r'^\s*version\s*=\s*"?([^"\s]+)"?\s*$')
+
 # Extract all double-quoted strings from a line/continuation.
 _QUOTED_RE: re.Pattern[str] = re.compile(r'"([^"]*)"')
 
@@ -149,6 +164,7 @@ def parse_nimble(
     """
     lines = text.splitlines()
     src_dir: str | None = None
+    raw_version: str | None = None
 
     # --- Step 1: run the S3a branch tracker to get per-line predicate mapping ---
     branches = parse_when_branches(lines)
@@ -180,6 +196,15 @@ def parse_nimble(
         srcdir_m = _SRCDIR_RE.match(line)
         if srcdir_m:
             src_dir = srcdir_m.group(1)  # overwrite on every match (last wins)
+            i += 1
+            continue
+
+        # A1: ``version`` — last assignment wins, same NimScript semantics as
+        # ``srcDir`` above.  Validation is deferred to after the scan loop
+        # (parse_version); the raw text is captured here only.
+        version_m = _VERSION_RE.match(line)
+        if version_m:
+            raw_version = version_m.group(1)
             i += 1
             continue
 
@@ -249,6 +274,9 @@ def parse_nimble(
         deps=tuple(deps),
         src_dir=src_dir,
         dep_predicates=tuple(dep_predicates),
+        # A1: totality contract — a malformed/2-component/non-numeric raw
+        # value parses to None (version-unknown), never raises.
+        version=parse_version(raw_version) if raw_version is not None else None,
     )
 
 

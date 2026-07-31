@@ -291,8 +291,19 @@ pub fn apply_workspace_manifest_change<F>(
     profile: Option<&milpa_manifest::Profile>,
     prior: Option<&milpa_types::Lockfile>,
     strategy: milpa_solver::Strategy,
+    // R9 (resolution-semantics RFC §3 Axis C NORMATIVE / D-C2): whether
+    // `strategy` was EXPLICITLY sourced (CLI or manifest), as opposed to
+    // default-filled — threaded through to `resolve_workspace_with_features`
+    // (mirrors `strategy`'s exact threading here). See
+    // `ResolveProvider::strategy_explicit`'s doc.
+    strategy_explicit: bool,
     store: &crate::store::CaStore,
     require_attested_metadata: bool,
+    // D5 (resolution-semantics RFC §3 Axis D / §5): the EFFECTIVE
+    // exclude-newer time-bound this resolve is running under — threaded
+    // through to `resolve_workspace_with_features` and recorded in the
+    // written lockfile (mirrors `strategy`'s exact threading here).
+    exclude_newer: Option<milpa_types::Timestamp>,
     mutate: F,
 ) -> Result<(milpa_types::ResolvedGraph, WriteResult), MilpaError>
 where
@@ -333,16 +344,22 @@ where
     // Step 5: Resolve the proposed workspace IN MEMORY.  Any resolution or
     // network failure raises here — manifest and lock are still unmodified.
     let deps_dir = root.join("_deps");
-    let graph = crate::resolver::resolve_workspace(
+    let graph = crate::resolver::resolve_workspace_with_features(
         &proposed_ws,
         index,
         fetcher,
         profile,
         prior,
         strategy,
+        strategy_explicit,
         &deps_dir,
         require_attested_metadata,
         store,
+        &std::collections::BTreeSet::new(),
+        false,
+        false,
+        None,
+        exclude_newer,
     )?;
 
     // Step 6: Resolution succeeded — commit both outputs atomically.
@@ -359,7 +376,7 @@ where
 
     let lock_path = root.join("milpa.lock");
     crate::lockfile::write_lockfile(
-        &crate::lockfile::from_graph(&graph, strategy.as_str()),
+        &crate::lockfile::from_graph(&graph, strategy.as_str(), exclude_newer),
         &lock_path,
     )?;
 

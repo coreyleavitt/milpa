@@ -1250,6 +1250,24 @@ pub fn fetch_git(
         }
     };
 
+    // D4 (resolution-semantics RFC §3 Axis D): read the resolved commit's own
+    // committer date off the object store already present in clone_scratch —
+    // a bounded transport addition, no extra network round trip. Must happen
+    // before ScratchGuard's Drop cleans up clone_scratch on return.
+    //
+    // L2: best-effort, NOT `?`. This transport function has no idea whether
+    // the caller's resolve even has an `exclude_newer` bound in play —
+    // `committer_date`'s only consumer is the resolver's exclude-newer
+    // validation (`resolver.rs::process_url`), which is `Option`-typed on
+    // both sides already. Propagating a `git log` hiccup here as
+    // `FETCH-GIT-FAILED` would fail the WHOLE fetch even for a resolve that
+    // never asked for a time bound at all. Degrade a read failure to `None`
+    // instead; the resolver fails closed (still raises `RES-EXCLUDE-NEWER-PIN`)
+    // when a bound IS set but the date came back unreadable, so the
+    // exclude-newer safety property is not silently bypassed — only a fetch
+    // that doesn't need the date is spared.
+    let committer_date = git_committer_date(name, url, &clone_scratch, &commit).ok();
+
     // Materialize the object-store tree into dest.
     std::fs::create_dir_all(dest).map_err(|e| transport(
         "FETCH-GIT-FAILED",
@@ -1344,7 +1362,52 @@ pub fn fetch_git(
         archive_sha256: None,
         submodule_shas,
         identity: None,
+        committer_date,
     })
+}
+
+/// D4 (resolution-semantics RFC §3 Axis D / §6 D-D1): return the committer
+/// date of `commit` in `repo` (a `--no-checkout` clone scratch holding the
+/// object store).
+///
+/// **Committer date, NEVER an annotated tag's tagger date.** `%cI` is git's
+/// own strict-ISO-8601 committer-date format for `git log`, run against a
+/// *commit* object — `commit` here is always an already-peeled `^{commit}`
+/// SHA (both the exact-pin `ensure_commit_present` path and the ref-
+/// resolution `try_resolve_ref`/`git_resolve_ref` paths dereference through
+/// any tag object before this point), so there is no tag object in the loop
+/// for this to accidentally read a tagger date from.
+fn git_committer_date(
+    name: &str,
+    url: &str,
+    repo: &Path,
+    commit: &str,
+) -> Result<milpa_types::Timestamp, FetchError> {
+    let out = Command::new("git")
+        .arg("-C").arg(repo)
+        .args(["log", "-1", "--format=%cI", "--end-of-options", commit])
+        .output()
+        .map_err(|e| transport(
+            "FETCH-GIT-FAILED",
+            format!("fetching {name:?} from {url:?}: cannot spawn git log: {e}"),
+        ))?;
+    if !out.status.success() {
+        return Err(transport(
+            "FETCH-GIT-FAILED",
+            format!(
+                "fetching {name:?} from {url:?}: reading committer date for commit {commit:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim(),
+            ),
+        ));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    milpa_types::parse_iso8601_timestamp(raw.trim()).ok_or_else(|| transport(
+        "FETCH-GIT-FAILED",
+        format!(
+            "fetching {name:?} from {url:?}: git log produced an unparseable committer date {:?} for commit {commit:?}",
+            raw.trim(),
+        ),
+    ))
 }
 
 /// Ensure `sha` is present in the local repo at `dest`, using a 4-step
@@ -2177,10 +2240,23 @@ pub fn oci_key(registry: &str, repository: &str, digest: &str) -> String {
 /// with this registry instead of [`DefaultRegistry`]. Every fetch is satisfied
 /// offline from `<dir>/<url_key(url, ref)>/`:
 ///
-/// 1. Read `<key>/sha` — the commit SHA to return in the receipt.
+/// 1. Read `<key>/sha` — the commit SHA to return in the receipt when the
+///    request is unpinned (no `commit_sha` on the incoming `Provenance::Git`).
 /// 2. Copy `<key>/content/` verbatim into `dest` (if the sub-directory exists).
 /// 3. Copy `<key>/<name>.nimble` into `dest` if present.
-/// 4. Return a `Receipt` with `resolved_ref = Some(sha)`.
+/// 4. Read `<key>/committer_date` (optional, D6 — resolution-semantics RFC
+///    §3 Axis D) — an ISO 8601 timestamp returned as `Receipt.committer_date`,
+///    so a mocked git fixture can drive `exclude_newer` validation (D4)
+///    without a real git repo. Absent -> `None`.
+/// 5. D-D2 additive extension: when the request IS pinned (`commit_sha =
+///    Some(sha)`, i.e. git-pin reuse per `_git_pin_for_url_dep`), the pin is
+///    echoed back verbatim as `resolved_ref` (never `<key>/sha`'s value) —
+///    mirroring the real `GitFetcher`. Its committer date prefers an optional
+///    `<key>/committer_date@<sha>` override file over the flat
+///    `<key>/committer_date`, letting a fixture distinguish "the pinned
+///    commit's own date" from "the ref's current tip date". Absent override
+///    file -> falls back to the flat file, same as the unpinned case.
+/// 6. Return a `Receipt` with `resolved_ref` set per the above.
 ///
 /// If the key directory is missing, returns `FETCH-MOCK-MISSING`. All four
 /// `Provenance` kinds are handled: `Git`, `Tarball`, `Local` (delegates to the
@@ -2208,12 +2284,45 @@ impl FetcherRegistry for MockedFetcher {
         // returns the recorded archive sha256 (gating an existing pin first,
         // exactly like the real `fetch_tarball` — conformance-fixtures.md §2.3.4).
         let (key_dir, receipt) = match p {
-            Provenance::Git { url, ref_spec, .. } => {
+            Provenance::Git {
+                url,
+                ref_spec,
+                commit_sha,
+            } => {
                 let (sha, key_dir) = resolve_mock_key(&self.mocked_fetches_dir, url, ref_spec)?;
+                // D-D2 (resolution-semantics RFC §3 Axis D / §6 D-D2, additive
+                // extension): when the incoming Provenance carries an exact
+                // commit_sha pin (git-pin reuse), echo it back verbatim —
+                // exactly like the real GitFetcher, which always checks out
+                // and reports precisely the pinned SHA it was given, never
+                // the ref's current tip. Every pre-existing fixture that
+                // exercises pin-reuse writes its flat `sha` file equal to the
+                // pin it constructs, so this is a no-op for all of them.
+                let resolved_ref = commit_sha.clone().unwrap_or(sha);
+                // D6 (resolution-semantics RFC §3 Axis D): an optional
+                // `committer_date` file lets a mocked git fixture drive
+                // `exclude_newer` validation (D4) without a real git repo.
+                // Absent -> None (pre-D6 default, no-op for that check).
+                //
+                // D-D2 additive extension: when pinned, prefer a per-commit-sha
+                // override file `committer_date@<sha>` if the fixture provides
+                // one — lets a fixture distinguish "the pinned commit's own
+                // committer date" from "the ref's current tip date". Absent ->
+                // falls back to the flat `committer_date` file (today's
+                // default, unaffected by commit_sha).
+                let committer_date_path = commit_sha
+                    .as_ref()
+                    .map(|sha| key_dir.join(format!("committer_date@{sha}")))
+                    .filter(|p| p.is_file())
+                    .unwrap_or_else(|| key_dir.join("committer_date"));
+                let committer_date = std::fs::read_to_string(committer_date_path)
+                    .ok()
+                    .and_then(|s| milpa_types::parse_iso8601_timestamp(s.trim()));
                 (
                     key_dir,
                     Receipt {
-                        resolved_ref: Some(sha),
+                        resolved_ref: Some(resolved_ref),
+                        committer_date,
                         ..Default::default()
                     },
                 )

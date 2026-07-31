@@ -1,0 +1,13 @@
+// resolution-semantics RFC §3 Axis D, D6 (D4 in a shared-corpus fixture
+// for the first time): a git dep's PINNED ref has exactly one candidate,
+// so exclude-newer VALIDATES the resolved commit's committer date rather
+// than filtering a candidate set. The commit predates the bound --
+// resolve succeeds normally.
+name "myapp"
+kind "application"
+resolution {
+    exclude-newer "2026-01-01T00:00:00Z"
+}
+deps {
+    widget git=(url)"https://example.com/widget.git" ref="v1.0.0"
+}

@@ -29,7 +29,7 @@ use std::path::Path;
 
 use milpa_manifest::nimble::{parse_nimble, NimbleRequirement};
 use milpa_manifest::{contains_unsafe_char, Dep, Manifest, ManifestError, Override};
-use milpa_solver::{Dep as SolverDep, VersionSet};
+use milpa_solver::{Dep as SolverDep, VersionSet, VersionSource};
 use milpa_types::{EdgeSet, EdgeSource, NamedRequire, RequireEntry, UrlRequire, Version};
 
 
@@ -165,6 +165,21 @@ pub struct EdgeSourceCtx<'a> {
     /// activation). Merged with the dep's own defaults by `build_edgeset_from_manifest`
     /// before filtering. Empty for transitive hops (S4a multi-hop is separate).
     pub active_flags: BTreeSet<String>,
+    /// The dep declaration's git ref (branch/tag/SHA), or `None`. Only ever
+    /// populated by `process_url` (§3 Axis A (b) step 3 — A3); local/tarball/
+    /// named/member deps have no ref and always leave this `None`. Consumed
+    /// solely by `declared_version_for`'s step-3 tag fallback.
+    pub ref_: Option<&'a str>,
+    /// The dep declaration's own `version=` annotation (§3 Axis A (b) step 4
+    /// — A3b), or `None`. Populated by `process_url`/`process_local`/
+    /// `process_tarball` from `UrlDep.version`/`LocalDep.version`/
+    /// `TarballDep.version` — for an override-redirected dep this is the
+    /// OVERRIDE RULE's `version=` (D-A3: the redirect discards the original
+    /// declaration entirely and builds a fresh dep from the override target,
+    /// so a stale annotation on the now-redirected original is never read).
+    /// Named/member deps never populate this (out of A3b's grammar scope).
+    /// Consumed solely by `declared_version_for`'s step-4 fallback.
+    pub version: Option<Version>,
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +318,85 @@ fn empty_milpa_kdl() -> EdgeSet {
         src_dir: String::new(),
         source: EdgeSource::MilpaKdl,
     }
+}
+
+/// Axis A (b) precedence steps 1-4 (resolution-semantics RFC §3 Axis A): the
+/// fetched package's own declared version, source-agnostic.
+///
+/// Precedence (steps 1-4):
+///
+/// 1. the fetched package's `milpa.kdl` `version` field (A1's manifest parse) —
+///    `VersionSource::Manifest`;
+/// 2. else its `.nimble` `version` (A1's nimble scanner) — `VersionSource::Nimble`;
+/// 3. else, **git deps only** (`ctx.ref_` populated), a version-shaped git ref
+///    tag (`v?X.Y.Z`) — parsed via the same `parse_version` used everywhere
+///    else (A3) — `VersionSource::Tag`;
+/// 4. else, the dep declaration's own `version=` annotation (`ctx.version`,
+///    A3b) — the user-supplied escape hatch for when the fetched artifact
+///    (steps 1-2) and its ref (step 3) yield no version. Steps 1-3 WIN over
+///    the annotation when present — `VersionSource::Annotation`.
+///
+/// Reads the SAME on-disk files `MilpaKdlEdgeSource`/`NimbleEdgeSource` already
+/// parse for requires, but for a different question — hence a peer function,
+/// not a shared field. Non-fatal on any read/parse failure or absence: falls
+/// through to the next step, ultimately `None` (version-unknown; A2 keeps the
+/// sentinel label for that case — the constrained/unconstrained partition +
+/// hard error is A4, out of scope here).
+///
+/// Only meaningful for git/url/local/tarball deps. Named/index deps get their
+/// real version from the index directly and never call this.
+///
+/// Returns `(version, source)` as one pair — never merged into a sum type at
+/// the STORAGE boundary (A5, §3 Axis A: value and source stay two sibling
+/// fields on the candidate/lockfile record); paired here only so a single
+/// `declared_version_for` call yields both facts without a second,
+/// potentially file-re-reading, lookup (mirrors `candidate_label`'s existing
+/// `(label, version_unknown)` pairing).
+///
+/// Mirrors `milpa/edge_sources.py`'s `declared_version_for`.
+pub fn declared_version_for(ctx: &EdgeSourceCtx) -> Option<(Version, VersionSource)> {
+    if let Some(dep_path) = ctx.dep_path {
+        if ctx.has_milpa_kdl {
+            let kdl_path = dep_path.join("milpa.kdl");
+            if let Ok(text) = std::fs::read_to_string(&kdl_path) {
+                if let Ok(manifest) = milpa_manifest::parse_manifest(&text) {
+                    if let Some(v) = manifest.version {
+                        return Some((v, VersionSource::Manifest));
+                    }
+                }
+            }
+        }
+
+        if let Some(nimble_path) = find_nimble(dep_path, ctx.dep_name) {
+            if let Ok(text) = std::fs::read_to_string(&nimble_path) {
+                let nm = parse_nimble(&text);
+                if let Some(v) = nm.version {
+                    return Some((v, VersionSource::Nimble));
+                }
+            }
+        }
+    }
+
+    // Step 3 (A3): git tag-derived fallback. `ctx.ref_` is populated only by
+    // `process_url` — local/tarball/named/member contexts leave it `None`, so
+    // this step is a no-op for them. A branch name, bare SHA, or `main` simply
+    // fails `parse_version`'s strict semver grammar and falls through to
+    // version-unknown (A4, out of scope) — no separate "is this a tag" check
+    // is needed beyond the version shape itself.
+    if let Some(r) = ctx.ref_ {
+        if let Some(v) = milpa_solver::parse_version(r) {
+            return Some((v, VersionSource::Tag));
+        }
+    }
+
+    // Step 4 (A3b): the dep declaration's `version=` annotation. Only reached
+    // when steps 1-3 all missed — steps 1-3 WIN over the annotation when
+    // present (this is a gap-filler, not an override).
+    if let Some(v) = &ctx.version {
+        return Some((v.clone(), VersionSource::Annotation));
+    }
+
+    None
 }
 
 /// Normative transitive projection (§9 + §10.2): reads ONLY `manifest.deps`,
@@ -524,15 +618,22 @@ impl<'a> DepDeclEdgeSource<'a> {
 /// `(Vec<SolverDep>, Vec<String>, Vec<SubItem>)`.
 ///
 /// The caller supplies `overrides_by_name` so that a named transitive dep that
-/// is itself overridden enters the solver with `eq_sentinel()` (§10).
-/// `url_dep_version` is the singleton version for URL deps (§3).
+/// is itself overridden is detected (S8).
+///
+/// Axis A (a) (resolution-semantics RFC §3, D-A2): a URL require's own term —
+/// and an overridden named require's term — is always `VersionSet::full()`,
+/// never `eq(sentinel)`.  Such a dep has exactly one real candidate
+/// (materialised elsewhere), so `full()` is harmless and fixes the causality
+/// hole of a pre-fetch term racing the post-fetch candidate label (which now
+/// carries the real declared version when one is parseable —
+/// `declared_version_for`).  There is therefore no longer a "sentinel version"
+/// parameter here; the self-term does not need one.
 ///
 /// Returns `(deps, requires_names, sub_items)`. `sub_items` are the `Item`
 /// variants that must be enqueued for BFS processing.
 pub fn edgeset_to_terms(
     es: &EdgeSet,
     overrides_by_name: &BTreeMap<String, Override>,
-    url_dep_version: Version,
 ) -> EdgeSetTerms {
     let mut deps: Vec<SolverDep> = Vec::new();
     let mut requires_names: Vec<String> = Vec::new();
@@ -559,8 +660,9 @@ pub fn edgeset_to_terms(
                     None => continue, // malformed URL; skip silently (resolver handles error paths)
                 };
                 // Dedup the SOLVER TERM only (one Term per name).
+                // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                 if !seen_dep_names.contains(&name) {
-                    deps.push(SolverDep::new(name.clone(), VersionSet::eq(url_dep_version.clone())));
+                    deps.push(SolverDep::new(name.clone(), VersionSet::full()));
                     requires_names.push(name.clone());
                     seen_dep_names.insert(name.clone());
                 }
@@ -578,8 +680,8 @@ pub fn edgeset_to_terms(
             RequireEntry::Named(n) => {
                 if !seen_dep_names.contains(&n.name) {
                     let vs = if overrides_by_name.contains_key(&n.name) {
-                        // Overridden named dep → enters as eq_sentinel (§10)
-                        VersionSet::eq(url_dep_version.clone())
+                        // Overridden named dep → URL-like full() self-term (D-A2).
+                        VersionSet::full()
                     } else {
                         // Constraint already validated at parse boundary; re-parse here
                         // is safe (the string came from a correctly-parsed manifest).
@@ -714,6 +816,8 @@ mod tests {
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
             active_flags: BTreeSet::new(),
+            ref_: None,
+            version: None,
         };
         let version = url_ver();
         let mut cache: BTreeMap<(String, Version), EdgeSet> = BTreeMap::new();
@@ -755,6 +859,8 @@ mod tests {
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
             active_flags: BTreeSet::new(),
+            ref_: None,
+            version: None,
         };
         // Even though has_milpa_kdl=false → nimble path, cache returns pre-populated value.
         let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
@@ -784,6 +890,8 @@ mod tests {
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
             active_flags: BTreeSet::new(),
+            ref_: None,
+            version: None,
         };
         let version = url_ver();
         let mut cache = BTreeMap::new();
@@ -809,6 +917,8 @@ mod tests {
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
             active_flags: BTreeSet::new(),
+            ref_: None,
+            version: None,
         };
         let version = url_ver();
         let mut cache = BTreeMap::new();
@@ -838,6 +948,8 @@ mod tests {
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
             active_flags: BTreeSet::new(),
+            ref_: None,
+            version: None,
         };
         let version = url_ver();
         let mut cache = BTreeMap::new();
@@ -876,6 +988,8 @@ mod tests {
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
             active_flags: BTreeSet::new(),
+            ref_: None,
+            version: None,
         };
         let version = url_ver();
         let mut cache = BTreeMap::new();
@@ -911,6 +1025,8 @@ mod tests {
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
             active_flags: BTreeSet::new(),
+            ref_: None,
+            version: None,
         };
         let version = url_ver();
         let mut cache = BTreeMap::new();
@@ -941,6 +1057,8 @@ mod tests {
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
             active_flags: BTreeSet::new(),
+            ref_: None,
+            version: None,
         };
         let version = url_ver();
         let mut cache = BTreeMap::new();
@@ -998,7 +1116,7 @@ overrides {
             src_dir: String::new(),
             source: EdgeSource::MilpaKdl,
         };
-        let terms = edgeset_to_terms(&es, &no_overrides(), url_ver());
+        let terms = edgeset_to_terms(&es, &no_overrides());
         assert_eq!(terms.requires_names, vec!["foo"]);
         assert_eq!(terms.url_requires.len(), 1);
         assert_eq!(terms.named_requires.len(), 0);
@@ -1016,7 +1134,7 @@ overrides {
             src_dir: String::new(),
             source: EdgeSource::MilpaKdl,
         };
-        let terms = edgeset_to_terms(&es, &no_overrides(), url_ver());
+        let terms = edgeset_to_terms(&es, &no_overrides());
         assert_eq!(terms.requires_names, vec!["bar"]);
         assert_eq!(terms.named_requires.len(), 1);
         assert_eq!(terms.named_requires[0].0, "bar");
@@ -1056,7 +1174,7 @@ overrides {
             src_dir: String::new(),
             source: EdgeSource::NimbleFallback,
         };
-        let terms = edgeset_to_terms(&es, &no_overrides(), url_ver());
+        let terms = edgeset_to_terms(&es, &no_overrides());
         // Dep appears exactly once in the solver (one requires_name)
         assert_eq!(terms.requires_names.iter().filter(|n| n.as_str() == "foo").count(), 1);
         // Both predicate-vecs must be recorded
@@ -1090,7 +1208,7 @@ overrides {
             src_dir: String::new(),
             source: EdgeSource::NimbleFallback,
         };
-        let terms = edgeset_to_terms(&es, &no_overrides(), url_ver());
+        let terms = edgeset_to_terms(&es, &no_overrides());
         // Dep appears exactly once in requires_names
         assert_eq!(terms.requires_names.iter().filter(|n| n.as_str() == "foo").count(), 1);
         // Both predicate-vecs recorded
@@ -1114,7 +1232,7 @@ overrides {
             src_dir: String::new(),
             source: EdgeSource::NimbleFallback,
         };
-        let terms = edgeset_to_terms(&es, &no_overrides(), url_ver());
+        let terms = edgeset_to_terms(&es, &no_overrides());
         let preds = terms.requires_predicates.get("extra").unwrap();
         assert_eq!(preds.len(), 1);
         assert_eq!(preds[0], vec![p]);
@@ -1144,6 +1262,8 @@ overrides {
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
             active_flags: BTreeSet::new(),
+            ref_: None,
+            version: None,
         };
         let version = url_ver();
         let mut cache = BTreeMap::new();
@@ -1178,6 +1298,8 @@ overrides {
             dep_decl_schema_version: None,
             overrides_by_name: &overrides,
             active_flags: BTreeSet::new(),
+            ref_: None,
+            version: None,
         };
         let version = url_ver();
         let mut cache = BTreeMap::new();
@@ -1188,5 +1310,363 @@ overrides {
             }
             other => panic!("expected UrlRequire, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // declared_version_for — Axis A (b) step 3 (A3): git tag-derived fallback
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn declared_version_for_git_tag_with_v_prefix() {
+        // A git dep pinned to tag `v1.2.3` with no milpa.kdl/.nimble version
+        // resolves its declared version from the tag (step 3).
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = tmp.path().join("pkg");
+        std::fs::create_dir_all(&dep_path).unwrap();
+        let overrides = no_overrides();
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "pkg",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: false,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: Some("v1.2.3"),
+            version: None,
+        };
+        assert_eq!(declared_version_for(&ctx), Some((Version::release(1, 2, 3), VersionSource::Tag)));
+    }
+
+    #[test]
+    fn declared_version_for_git_tag_without_v_prefix() {
+        // A bare `1.2.3` tag (no leading `v`) also parses (step 3).
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = tmp.path().join("pkg");
+        std::fs::create_dir_all(&dep_path).unwrap();
+        let overrides = no_overrides();
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "pkg",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: false,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: Some("1.2.3"),
+            version: None,
+        };
+        assert_eq!(
+            declared_version_for(&ctx),
+            Some((Version::release(1, 2, 3), VersionSource::Tag))
+        );
+    }
+
+    #[test]
+    fn declared_version_for_branch_ref_stays_version_unknown() {
+        // A branch ref (`main`) is not version-shaped — no regression: stays
+        // version-unknown (`None`), same as before A3.
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = tmp.path().join("pkg");
+        std::fs::create_dir_all(&dep_path).unwrap();
+        let overrides = no_overrides();
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "pkg",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: false,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: Some("main"),
+            version: None,
+        };
+        assert_eq!(declared_version_for(&ctx), None);
+    }
+
+    #[test]
+    fn declared_version_for_sha_ref_stays_version_unknown() {
+        // A commit-SHA ref is not version-shaped — stays version-unknown.
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = tmp.path().join("pkg");
+        std::fs::create_dir_all(&dep_path).unwrap();
+        let overrides = no_overrides();
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "pkg",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: false,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: Some("aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000"),
+            version: None,
+        };
+        assert_eq!(declared_version_for(&ctx), None);
+    }
+
+    #[test]
+    fn declared_version_for_milpa_kdl_version_wins_over_tag() {
+        // Steps 1-2 still take precedence over step 3: a fetched `milpa.kdl
+        // version` wins over a differing tag (precedence preserved).
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = make_dep_tree(tmp.path(), "pkg", "name \"pkg\"\nversion \"2.0.0\"\n");
+        let overrides = no_overrides();
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "pkg",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: true,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: Some("v9.9.9"),
+            version: None,
+        };
+        assert_eq!(
+            declared_version_for(&ctx),
+            Some((Version::release(2, 0, 0), VersionSource::Manifest))
+        );
+    }
+
+    #[test]
+    fn declared_version_for_nimble_version_wins_over_tag() {
+        // A fetched `.nimble version` (step 2) wins over a differing tag
+        // (step 3 never reached).
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = make_nimble_tree(tmp.path(), "pkg", "version = \"0.5.0\"\nauthor = \"x\"\n");
+        let overrides = no_overrides();
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "pkg",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: false,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: Some("v9.9.9"),
+            version: None,
+        };
+        assert_eq!(
+            declared_version_for(&ctx),
+            Some((Version::release(0, 5, 0), VersionSource::Nimble))
+        );
+    }
+
+    #[test]
+    fn declared_version_for_milpa_kdl_version_wins_over_differing_nimble_version() {
+        // L11: step 1 (`milpa.kdl version`) must win over step 2 (`.nimble
+        // version`) when a fetched tree carries BOTH and they DIFFER — the
+        // existing coverage only proved step 1/2 beat step 3 (git tag) and
+        // step 4 (the `version=` annotation) individually; this proves the
+        // step-1-over-step-2 edge of the SAME precedence chain directly,
+        // with no tag/annotation in play to potentially mask a
+        // short-circuit bug in `declared_version_for`'s own early-return.
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = make_dep_tree(tmp.path(), "pkg", "name \"pkg\"\nversion \"3.0.0\"\n");
+        std::fs::write(
+            dep_path.join("pkg.nimble"),
+            "version = \"1.0.0\"\nauthor = \"x\"\n",
+        )
+        .unwrap();
+        let overrides = no_overrides();
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "pkg",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: true,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: None,
+            version: None,
+        };
+        assert_eq!(
+            declared_version_for(&ctx),
+            Some((Version::release(3, 0, 0), VersionSource::Manifest)),
+            "milpa.kdl version=3.0.0 must win over the differing .nimble version=1.0.0"
+        );
+    }
+
+    #[test]
+    fn declared_version_for_no_ref_stays_version_unknown() {
+        // Local/tarball/member/named contexts leave `ref_: None` — step 3 is
+        // a no-op, unaffected by A3 (no regression for non-git dep kinds).
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = tmp.path().join("pkg");
+        std::fs::create_dir_all(&dep_path).unwrap();
+        let overrides = no_overrides();
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "pkg",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: false,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: None,
+            version: None,
+        };
+        assert_eq!(declared_version_for(&ctx), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // declared_version_for — Axis A (b) step 4 (A3b): version= annotation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn declared_version_for_annotation_used_when_no_other_source() {
+        // A version= annotation (ctx.version) is used when steps 1-3
+        // (milpa.kdl, .nimble, git tag) all miss.
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = tmp.path().join("pkg");
+        std::fs::create_dir_all(&dep_path).unwrap();
+        let overrides = no_overrides();
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "pkg",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: false,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: Some("main"),
+            version: Some(Version::release(1, 5, 0)),
+        };
+        assert_eq!(
+            declared_version_for(&ctx),
+            Some((Version::release(1, 5, 0), VersionSource::Annotation))
+        );
+    }
+
+    #[test]
+    fn declared_version_for_annotation_used_with_no_ref_at_all() {
+        // local/tarball deps have no `ref` concept at all — the annotation
+        // still applies (A3b extends the reach to local/tarball, not just git).
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = tmp.path().join("pkg");
+        std::fs::create_dir_all(&dep_path).unwrap();
+        let overrides = no_overrides();
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "pkg",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: false,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: None,
+            version: Some(Version::release(2, 2, 2)),
+        };
+        assert_eq!(
+            declared_version_for(&ctx),
+            Some((Version::release(2, 2, 2), VersionSource::Annotation))
+        );
+    }
+
+    #[test]
+    fn declared_version_for_milpa_kdl_version_wins_over_annotation() {
+        // Step 1 (milpa.kdl version) still wins over the annotation when
+        // present — the annotation is a gap-filler, never an override.
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = make_dep_tree(tmp.path(), "pkg", "name \"pkg\"\nversion \"2.0.0\"\n");
+        let overrides = no_overrides();
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "pkg",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: true,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: None,
+            version: Some(Version::release(9, 9, 9)),
+        };
+        assert_eq!(
+            declared_version_for(&ctx),
+            Some((Version::release(2, 0, 0), VersionSource::Manifest))
+        );
+    }
+
+    #[test]
+    fn declared_version_for_nimble_version_wins_over_annotation() {
+        // Step 2 (.nimble version) still wins over the annotation when present.
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = make_nimble_tree(tmp.path(), "pkg", "version = \"0.5.0\"\nauthor = \"x\"\n");
+        let overrides = no_overrides();
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "pkg",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: false,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: None,
+            version: Some(Version::release(9, 9, 9)),
+        };
+        assert_eq!(
+            declared_version_for(&ctx),
+            Some((Version::release(0, 5, 0), VersionSource::Nimble))
+        );
+    }
+
+    #[test]
+    fn declared_version_for_git_tag_wins_over_annotation() {
+        // Step 3 (git tag) still wins over the annotation when present.
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = tmp.path().join("pkg");
+        std::fs::create_dir_all(&dep_path).unwrap();
+        let overrides = no_overrides();
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "pkg",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: false,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: Some("v1.2.3"),
+            version: Some(Version::release(9, 9, 9)),
+        };
+        assert_eq!(
+            declared_version_for(&ctx),
+            Some((Version::release(1, 2, 3), VersionSource::Tag))
+        );
+    }
+
+    #[test]
+    fn declared_version_for_annotation_absent_stays_version_unknown() {
+        // No annotation, no other source → still version-unknown (no regression).
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = tmp.path().join("pkg");
+        std::fs::create_dir_all(&dep_path).unwrap();
+        let overrides = no_overrides();
+        let ctx = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "pkg",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: false,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: Some("main"),
+            version: None,
+        };
+        assert_eq!(declared_version_for(&ctx), None);
     }
 }

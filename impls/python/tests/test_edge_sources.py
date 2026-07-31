@@ -20,10 +20,11 @@ from milpa.edge_sources import (
     EdgeSourceCtx,
     MilpaKdlEdgeSource,
     NimbleEdgeSource,
+    declared_version_for,
     edgeset_to_terms,
     resolve_edges,
 )
-from milpa.version import Version
+from milpa.version import Version, VersionSource
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +41,8 @@ def _ctx(
     is_overridden: bool = False,
     has_milpa_kdl: bool = False,
     overrides: dict | None = None,
+    ref: str | None = None,
+    version: "Version | None" = None,
 ) -> EdgeSourceCtx:
     return EdgeSourceCtx(
         dep_path=dep_path,
@@ -48,6 +51,8 @@ def _ctx(
         is_overridden=is_overridden,
         has_milpa_kdl=has_milpa_kdl,
         overrides_by_name=overrides or {},
+        ref=ref,
+        version=version,
     )
 
 
@@ -483,7 +488,7 @@ def test_edgeset_to_terms_named_require() -> None:
         src_dir="",
         source=EdgeSource.MILPA_KDL,
     )
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, _V)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {})
 
     assert requires_names == ["stew"]
     assert len(dep_terms) == 1
@@ -493,25 +498,31 @@ def test_edgeset_to_terms_named_require() -> None:
     assert requires_predicates == {}
 
 
-def test_edgeset_to_terms_overridden_named_becomes_url_sentinel() -> None:
-    """A named require whose name is in overrides_by_name gets the URL sentinel version."""
+def test_edgeset_to_terms_overridden_named_becomes_full_self_term() -> None:
+    """Axis A (a)/D-A2: a named require overridden to a URL-like target gets a
+    ``full()`` self-term, never ``eq(sentinel)`` — the causality fix (the term
+    is built pre-fetch; the real candidate label is assigned post-fetch by the
+    resolver worker, ``_candidate_label``). Previously this asserted the OLD
+    ``eq(sentinel)`` behavior the RFC identifies as the causal bug (a
+    versioned override target would spuriously SOLVE-CONFLICT against it)."""
     from milpa.manifest import Override
 
     from milpa.manifest import GitTarget
+    from milpa.version import VersionSet
     ov = Override(name="stew", target=GitTarget(git="https://github.com/example/stew.git", ref="main"))
     es = EdgeSet(
         requires=[NamedRequire(name="stew", constraint_str=">= 0.1.0")],
         src_dir="",
         source=EdgeSource.MILPA_KDL,
     )
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {"stew": ov}, _V)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {"stew": ov})
 
     assert requires_names == ["stew"]
     assert len(dep_terms) == 1
     t = dep_terms[0]
     assert t.package == "stew"
-    # Should require exactly the sentinel version.
-    assert t.versions.contains(_V)
+    # full() self-term: unconditionally satisfied by any real candidate version.
+    assert t.versions == VersionSet.full()
     assert requires_predicates == {}
 
 
@@ -525,7 +536,7 @@ def test_edgeset_to_terms_nim_excluded() -> None:
         src_dir="",
         source=EdgeSource.NIMBLE_FALLBACK,
     )
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, _V)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {})
 
     assert "nim" not in requires_names
     assert "stew" in requires_names
@@ -533,7 +544,11 @@ def test_edgeset_to_terms_nim_excluded() -> None:
 
 
 def test_edgeset_to_terms_url_require() -> None:
-    """UrlRequire entries become Term.require at sentinel version with derived name."""
+    """Axis A (a)/D-A2: UrlRequire entries become Term.require at a ``full()``
+    self-term (never ``eq(sentinel)``) with the derived name. Previously this
+    asserted the OLD ``eq(sentinel)`` behavior — see
+    ``test_edgeset_to_terms_overridden_named_becomes_full_self_term`` above."""
+    from milpa.version import VersionSet
     es = EdgeSet(
         requires=[
             UrlRequire(url="https://github.com/status-im/nim-chronos.git", ref="v3")
@@ -541,11 +556,11 @@ def test_edgeset_to_terms_url_require() -> None:
         src_dir="",
         source=EdgeSource.DEP_DECL,
     )
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, _V)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {})
 
     assert "nim-chronos" in requires_names
     assert len(dep_terms) == 1
-    assert dep_terms[0].versions.contains(_V)
+    assert dep_terms[0].versions == VersionSet.full()
     assert requires_predicates == {}
 
 
@@ -813,3 +828,223 @@ def test_s25_negated_flag_predicate_url_dep_excluded_when_flag_default_on(
     assert not any("extra" in u for u in all_urls), (
         "UrlDep gated by NOT flag=ssl (ssl is default=#true) must be EXCLUDED"
     )
+
+
+# ---------------------------------------------------------------------------
+# declared_version_for — Axis A (b) step 3 (A3): git tag-derived fallback
+# ---------------------------------------------------------------------------
+
+
+def test_declared_version_for_git_tag_with_v_prefix(tmp_path: Path) -> None:
+    """A git dep pinned to tag ``v1.2.3`` with no milpa.kdl/.nimble version
+    resolves its declared version from the tag (step 3)."""
+    dep_path = tmp_path / "pkg"
+    dep_path.mkdir()
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg", ref="v1.2.3")
+    assert declared_version_for(ctx) == (Version(1, 2, 3), VersionSource.TAG)
+
+
+def test_declared_version_for_git_tag_without_v_prefix(tmp_path: Path) -> None:
+    """A bare ``1.2.3`` tag (no leading ``v``) also parses (step 3)."""
+    dep_path = tmp_path / "pkg"
+    dep_path.mkdir()
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg", ref="1.2.3")
+    assert declared_version_for(ctx) == (Version(1, 2, 3), VersionSource.TAG)
+
+
+def test_declared_version_for_branch_ref_stays_version_unknown(tmp_path: Path) -> None:
+    """A branch ref (``main``) is not version-shaped — no regression: stays
+    version-unknown (``None``), same as before A3."""
+    dep_path = tmp_path / "pkg"
+    dep_path.mkdir()
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg", ref="main")
+    assert declared_version_for(ctx) is None
+
+
+def test_declared_version_for_sha_ref_stays_version_unknown(tmp_path: Path) -> None:
+    """A commit-SHA ref is not version-shaped — stays version-unknown."""
+    dep_path = tmp_path / "pkg"
+    dep_path.mkdir()
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg", ref="aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000")
+    assert declared_version_for(ctx) is None
+
+
+def test_declared_version_for_oversized_tag_stays_version_unknown_not_raises(tmp_path: Path) -> None:
+    """R10: a crafted git tag with an oversized numeric component (a
+    plausible attacker-controlled ``ref``) must fall through to
+    version-unknown via ``parse_version``'s total contract, never propagate
+    an uncaught ``ValueError`` up through ``declared_version_for``."""
+    dep_path = tmp_path / "pkg"
+    dep_path.mkdir()
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg", ref="v" + "9" * 6000 + ".0.0")
+    assert declared_version_for(ctx) is None
+
+
+def test_declared_version_for_huge_prerelease_tag_parses_not_raises(tmp_path: Path) -> None:
+    """RR6: an untrusted git ref with a huge prerelease identifier (e.g. a
+    crafted tag) must return cleanly through the real caller path
+    (``declared_version_for`` -> ``parse_version``) — not raise. Matches
+    Rust's Alpha-fallback classification: the release triple still parses,
+    the oversized digit run stays as a string prerelease identifier."""
+    dep_path = tmp_path / "pkg"
+    dep_path.mkdir()
+    huge = "9" * 6000
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg", ref=f"v1.0.0-{huge}")
+    assert declared_version_for(ctx) == (
+        Version(1, 0, 0, pre=(huge,)),
+        VersionSource.TAG,
+    )
+
+
+def test_declared_version_for_milpa_kdl_version_wins_over_tag(tmp_path: Path) -> None:
+    """Steps 1-2 still take precedence over step 3: a fetched ``milpa.kdl
+    version`` wins over a differing tag (precedence preserved)."""
+    dep_path = _make_dep_tree(tmp_path, "pkg", 'name "pkg"\nversion "2.0.0"\n')
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg", has_milpa_kdl=True, ref="v9.9.9")
+    assert declared_version_for(ctx) == (Version(2, 0, 0), VersionSource.MANIFEST)
+
+
+def test_declared_version_for_milpa_kdl_version_wins_over_nimble(tmp_path: Path) -> None:
+    """Step 1 (milpa.kdl version) wins over step 2 (.nimble version) when a
+    fetched package declares BOTH and they DIFFER (precedence pair not
+    otherwise covered: every other adjacent pair — kdl-vs-tag, nimble-vs-tag,
+    kdl-vs-annotation, nimble-vs-annotation, tag-vs-annotation — already has
+    a dedicated test; this is the missing step-1-vs-step-2 case)."""
+    dep_path = _make_dep_tree(tmp_path, "pkg", 'name "pkg"\nversion "2.0.0"\n')
+    (dep_path / "pkg.nimble").write_text(
+        'version = "0.5.0"\nauthor = "x"\n', encoding="utf-8"
+    )
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg", has_milpa_kdl=True)
+    assert declared_version_for(ctx) == (Version(2, 0, 0), VersionSource.MANIFEST)
+
+
+def test_declared_version_for_nimble_version_wins_over_tag(tmp_path: Path) -> None:
+    """A fetched ``.nimble version`` (step 2) wins over a differing tag
+    (step 3 never reached)."""
+    dep_path = _make_nimble_tree(
+        tmp_path, "pkg", 'version = "0.5.0"\nauthor = "x"\n'
+    )
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg", has_milpa_kdl=False, ref="v9.9.9")
+    assert declared_version_for(ctx) == (Version(0, 5, 0), VersionSource.NIMBLE)
+
+
+def test_declared_version_for_no_ref_stays_version_unknown(tmp_path: Path) -> None:
+    """Local/tarball/member contexts leave ``ref=None`` — step 3 is a no-op,
+    unaffected by A3 (no regression for non-git dep kinds)."""
+    dep_path = tmp_path / "pkg"
+    dep_path.mkdir()
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg", ref=None)
+    assert declared_version_for(ctx) is None
+
+
+# ---------------------------------------------------------------------------
+# declared_version_for — Axis A (b) step 4 (A3b): version= annotation
+# ---------------------------------------------------------------------------
+
+
+def test_declared_version_for_annotation_used_when_no_other_source(tmp_path: Path) -> None:
+    """A ``version=`` annotation (``ctx.version``) is used when steps 1-3
+    (milpa.kdl, .nimble, git tag) all miss."""
+    dep_path = tmp_path / "pkg"
+    dep_path.mkdir()
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg", ref="main", version=Version(1, 5, 0))
+    assert declared_version_for(ctx) == (Version(1, 5, 0), VersionSource.ANNOTATION)
+
+
+def test_declared_version_for_annotation_used_with_no_ref_at_all(tmp_path: Path) -> None:
+    """local/tarball deps have no ``ref`` concept at all — the annotation
+    still applies (A3b extends the reach to local/tarball, not just git)."""
+    dep_path = tmp_path / "pkg"
+    dep_path.mkdir()
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg", ref=None, version=Version(2, 2, 2))
+    assert declared_version_for(ctx) == (Version(2, 2, 2), VersionSource.ANNOTATION)
+
+
+def test_declared_version_for_milpa_kdl_version_wins_over_annotation(tmp_path: Path) -> None:
+    """Step 1 (milpa.kdl version) still wins over the annotation when present
+    — the annotation is a gap-filler, never an override."""
+    dep_path = _make_dep_tree(tmp_path, "pkg", 'name "pkg"\nversion "2.0.0"\n')
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg", has_milpa_kdl=True, version=Version(9, 9, 9))
+    assert declared_version_for(ctx) == (Version(2, 0, 0), VersionSource.MANIFEST)
+
+
+def test_declared_version_for_nimble_version_wins_over_annotation(tmp_path: Path) -> None:
+    """Step 2 (.nimble version) still wins over the annotation when present."""
+    dep_path = _make_nimble_tree(tmp_path, "pkg", 'version = "0.5.0"\nauthor = "x"\n')
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg", has_milpa_kdl=False, version=Version(9, 9, 9))
+    assert declared_version_for(ctx) == (Version(0, 5, 0), VersionSource.NIMBLE)
+
+
+def test_declared_version_for_git_tag_wins_over_annotation(tmp_path: Path) -> None:
+    """Step 3 (git tag) still wins over the annotation when present."""
+    dep_path = tmp_path / "pkg"
+    dep_path.mkdir()
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg", ref="v1.2.3", version=Version(9, 9, 9))
+    assert declared_version_for(ctx) == (Version(1, 2, 3), VersionSource.TAG)
+
+
+def test_declared_version_for_annotation_absent_stays_version_unknown(tmp_path: Path) -> None:
+    """No annotation, no other source → still version-unknown (no regression)."""
+    dep_path = tmp_path / "pkg"
+    dep_path.mkdir()
+    ctx = _ctx(dep_path=dep_path, dep_name="pkg", ref="main", version=None)
+    assert declared_version_for(ctx) is None
+
+
+# ---------------------------------------------------------------------------
+# A3b/D-A3: override composition — a redirect's own version= wins; a stale
+# annotation on the now-redirected ORIGINAL declaration is dead and ignored.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_git_override_uses_override_version_not_original() -> None:
+    """_apply_git_override_to_url_dep builds a fresh UrlDep from the override
+    target alone — the override rule's own version= wins; the original dep's
+    version= (now redirected away from) is structurally discarded."""
+    from milpa.manifest import GitTarget, Override, UrlDep
+    from milpa.resolver import _apply_git_override_to_url_dep
+
+    original = UrlDep(
+        name="foo",
+        git="https://example.com/foo.git",
+        ref="main",
+        version=Version(1, 0, 0),
+    )
+    ov = Override(
+        name="foo",
+        target=GitTarget(git="https://fork.example.com/foo.git", ref="patched"),
+        version=Version(2, 0, 0),
+    )
+    result = _apply_git_override_to_url_dep(original, ov)
+    assert result.git == "https://fork.example.com/foo.git"
+    assert result.ref == "patched"
+    assert result.version == Version(2, 0, 0), (
+        "override's own version= must win over the original dep's version="
+    )
+
+
+def test_apply_override_local_target_uses_override_version() -> None:
+    """_apply_override's LocalTarget branch also sources version from the
+    override rule, not the original dep."""
+    from milpa.manifest import LocalTarget, Override
+    from milpa.resolver import _apply_override
+
+    ov = Override(
+        name="foo",
+        target=LocalTarget(path="../foo-fork"),
+        version=Version(3, 0, 0),
+    )
+    result = _apply_override("foo", ov)
+    assert result.path == "../foo-fork"
+    assert result.version == Version(3, 0, 0)
+
+
+def test_apply_override_git_target_absent_version_is_none() -> None:
+    """No version= on the override rule → the redirected dep's version is
+    None (falls through to steps 1-3 at fetch time, same as any other dep)."""
+    from milpa.manifest import GitTarget, Override
+    from milpa.resolver import _apply_override
+
+    ov = Override(name="foo", target=GitTarget(git="https://fork.example.com/foo.git", ref="patched"))
+    result = _apply_override("foo", ov)
+    assert result.version is None

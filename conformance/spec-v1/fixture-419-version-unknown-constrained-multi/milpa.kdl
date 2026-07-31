@@ -1,0 +1,20 @@
+// fixture-419: A4 multi-constrainer enumeration (resolver-semantics RFC §3
+// Axis A (c) / §6 D-A1) — the amoxtli incident floored TWO packages at once,
+// so RES-VERSION-UNKNOWN-CONSTRAINED must enumerate ALL accumulated
+// constrainers, not just the first (a serial fail-fix-rerun loop is exactly
+// the papercut best-in-class resolvers avoid).
+//
+// bearssl is a version-unknown git dep (untagged branch pin, no .nimble
+// version) declared FIRST. TWO different named/index deps each lazily
+// discover their own floor on it only once PubGrub materializes them:
+// chronos requires "bearssl >= 0.2.8"; httputils requires "bearssl <= 0.9.0".
+// Both ranges are mutually compatible (bearssl's accumulated range becomes
+// ">=0.2.8 & <=0.9.0", still non-full()) — the fixture is about the error's
+// completeness, not a further conflict between the two constrainers.
+name "myapp"
+kind "application"
+deps {
+    bearssl git=(url)"https://example.com/bearssl.git" ref="main"
+    chronos
+    httputils
+}

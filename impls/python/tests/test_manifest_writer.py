@@ -159,6 +159,124 @@ def test_format_manifest_spec_version_only_when_explicit() -> None:
     assert "spec-version 1" in format_manifest(m_explicit)
 
 
+def test_format_manifest_package_version_only_when_present() -> None:
+    """A1: top-level ``version`` is emitted iff ``Manifest.version`` is set —
+    absent-stays-absent (§5), mirroring the ``spec-version`` explicit rule."""
+    from milpa.version import Version
+
+    m_absent = Manifest(name="myapp", deps=(), version=None)
+    m_present = Manifest(name="myapp", deps=(), version=Version(1, 2, 3))
+    assert "version" not in format_manifest(m_absent)
+    assert 'version "1.2.3"' in format_manifest(m_present)
+
+
+def test_format_manifest_roundtrip_package_version() -> None:
+    """A1: format→parse round-trip preserves the declared package version."""
+    from milpa.version import Version
+
+    m = Manifest(name="myapp", deps=(), version=Version(1, 2, 3))
+    text = format_manifest(m)
+    reparsed = parse_manifest(text)
+    assert reparsed.version == Version(1, 2, 3)
+
+
+def test_format_manifest_resolution_block_only_when_strategy_present() -> None:
+    """C3: ``resolution { strategy }`` is emitted iff a strategy is set —
+    absent-stays-absent, mirroring the package ``version`` field's rule."""
+    from milpa.manifest import Resolution
+    from milpa.version import Strategy
+
+    m_absent = Manifest(name="myapp", deps=(), resolution=None)
+    m_empty = Manifest(name="myapp", deps=(), resolution=Resolution(strategy=None))
+    m_present = Manifest(
+        name="myapp", deps=(), resolution=Resolution(strategy=Strategy.SEMVER)
+    )
+    assert "resolution" not in format_manifest(m_absent)
+    assert "resolution" not in format_manifest(m_empty)
+    assert 'strategy "semver"' in format_manifest(m_present)
+
+
+def test_format_manifest_roundtrip_resolution_strategy() -> None:
+    """C3: format→parse round-trip preserves the manifest resolution strategy."""
+    from milpa.manifest import Resolution
+    from milpa.version import Strategy
+
+    m = Manifest(
+        name="myapp", deps=(), resolution=Resolution(strategy=Strategy.LOWEST_DIRECT)
+    )
+    text = format_manifest(m)
+    reparsed = parse_manifest(text)
+    assert reparsed.resolution is not None
+    assert reparsed.resolution.strategy == Strategy.LOWEST_DIRECT
+
+
+def test_format_manifest_resolution_block_only_when_exclude_newer_present() -> None:
+    """D1: ``resolution { exclude-newer }`` is emitted iff set — same
+    absent-stays-absent rule as C3's ``strategy``."""
+    from datetime import datetime, timezone
+
+    from milpa.manifest import Resolution
+
+    m_absent = Manifest(name="myapp", deps=(), resolution=None)
+    m_empty = Manifest(name="myapp", deps=(), resolution=Resolution())
+    m_present = Manifest(
+        name="myapp",
+        deps=(),
+        resolution=Resolution(
+            exclude_newer=datetime(2026, 1, 1, tzinfo=timezone.utc)
+        ),
+    )
+    assert "resolution" not in format_manifest(m_absent)
+    assert "resolution" not in format_manifest(m_empty)
+    assert 'exclude-newer "2026-01-01T00:00:00Z"' in format_manifest(m_present)
+
+
+def test_format_manifest_roundtrip_resolution_exclude_newer() -> None:
+    """D1: format→parse round-trip preserves the manifest exclude-newer bound."""
+    from datetime import datetime, timezone
+
+    from milpa.manifest import Resolution
+
+    m = Manifest(
+        name="myapp",
+        deps=(),
+        resolution=Resolution(
+            exclude_newer=datetime(2026, 6, 15, 12, 30, 0, tzinfo=timezone.utc)
+        ),
+    )
+    text = format_manifest(m)
+    reparsed = parse_manifest(text)
+    assert reparsed.resolution is not None
+    assert reparsed.resolution.exclude_newer == datetime(
+        2026, 6, 15, 12, 30, 0, tzinfo=timezone.utc
+    )
+
+
+def test_format_manifest_roundtrip_resolution_strategy_and_exclude_newer() -> None:
+    """D1: a resolution block with BOTH ``strategy`` and ``exclude-newer``
+    round-trips both fields together."""
+    from datetime import datetime, timezone
+
+    from milpa.manifest import Resolution
+    from milpa.version import Strategy
+
+    m = Manifest(
+        name="myapp",
+        deps=(),
+        resolution=Resolution(
+            strategy=Strategy.MINVER,
+            exclude_newer=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+    text = format_manifest(m)
+    assert 'strategy "minver"' in text
+    assert 'exclude-newer "2026-01-01T00:00:00Z"' in text
+    reparsed = parse_manifest(text)
+    assert reparsed.resolution is not None
+    assert reparsed.resolution.strategy == Strategy.MINVER
+    assert reparsed.resolution.exclude_newer == datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
 def test_format_manifest_override_block() -> None:
     """Override block renders pkg with git=(url) and ref."""
     ov = Override(name="foo", target=GitTarget(git="https://github.com/fork/foo.git", ref="dev"))
@@ -189,6 +307,80 @@ def test_format_manifest_roundtrip_url_dep() -> None:
     assert pd.git == dep.git
     assert pd.ref == dep.ref
     assert pd.name == dep.name
+
+
+def test_format_manifest_roundtrip_url_dep_version_annotation() -> None:
+    """A3b: a UrlDep's ``version=`` annotation round-trips through
+    format→parse (the hand-rolled emitter has silently dropped a new field
+    before, RFC §5 — pin the round-trip, not just the parse)."""
+    from milpa.version import Version
+
+    dep = UrlDep(
+        name="foo", git="https://github.com/example/foo.git", ref="main",
+        version=Version(1, 2, 3),
+    )
+    m = Manifest(name="myapp", deps=(dep,), kind="application")
+    text = format_manifest(m)
+    assert 'version="1.2.3"' in text
+    reparsed = parse_manifest(text)
+    pd = reparsed.deps[0]
+    assert isinstance(pd, UrlDep)
+    assert pd.version == Version(1, 2, 3)
+
+
+def test_format_manifest_local_dep_version_annotation_absent_when_none() -> None:
+    """A3b: no ``version=`` emitted when a LocalDep declares none."""
+    dep = LocalDep(name="foo", path="../foo")
+    m = Manifest(name="myapp", deps=(dep,))
+    text = format_manifest(m)
+    assert "version=" not in text
+
+
+def test_format_manifest_roundtrip_local_dep_version_annotation() -> None:
+    """A3b: a LocalDep's ``version=`` annotation round-trips."""
+    from milpa.version import Version
+
+    dep = LocalDep(name="foo", path="../foo", version=Version(0, 5, 0))
+    m = Manifest(name="myapp", deps=(dep,))
+    text = format_manifest(m)
+    assert 'version="0.5.0"' in text
+    reparsed = parse_manifest(text)
+    pd = reparsed.deps[0]
+    assert isinstance(pd, LocalDep)
+    assert pd.version == Version(0, 5, 0)
+
+
+def test_format_manifest_roundtrip_tarball_dep_version_annotation() -> None:
+    """A3b: a TarballDep's ``version=`` annotation round-trips."""
+    from milpa.version import Version
+
+    dep = TarballDep(
+        name="foo", url="https://example.com/foo.tar.gz", version=Version(3, 0, 0),
+    )
+    m = Manifest(name="myapp", deps=(dep,))
+    text = format_manifest(m)
+    assert 'version="3.0.0"' in text
+    reparsed = parse_manifest(text)
+    pd = reparsed.deps[0]
+    assert isinstance(pd, TarballDep)
+    assert pd.version == Version(3, 0, 0)
+
+
+def test_format_manifest_roundtrip_override_version_annotation() -> None:
+    """A3b/D-A3: an override rule's ``version=`` annotation round-trips
+    (orthogonal to the target form — tested on the git form here)."""
+    from milpa.version import Version
+
+    ov = Override(
+        name="foo",
+        target=GitTarget(git="https://github.com/fork/foo.git", ref="dev"),
+        version=Version(2, 0, 0),
+    )
+    m = Manifest(name="myapp", deps=(), overrides=(ov,))
+    text = format_manifest(m)
+    assert 'version="2.0.0"' in text
+    reparsed = parse_manifest(text)
+    assert reparsed.overrides[0].version == Version(2, 0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +425,93 @@ def test_mutate_identity(tmp_path: Path) -> None:
     text = kdl.read_text()
     assert 'name "myapp"' in text
     assert text.startswith("// generated by milpa")
+
+
+def test_mutate_roundtrip_package_version(tmp_path: Path) -> None:
+    """A1: a manifest already declaring ``version`` survives an unrelated
+    mutation through ``mutate_manifest_file`` — the hand-rolled per-field
+    emitter has silently dropped a new field before when the emit line was
+    forgotten (RFC rfc-resolution-semantics.md §5); this pins the field so a
+    future omission fails loudly."""
+    kdl = tmp_path / "milpa.kdl"
+    kdl.write_text('name "myapp"\nversion "1.2.3"\nkind "library"\n')
+
+    result = mutate_manifest_file(kdl, lambda m: m)
+    assert isinstance(result, WriteResult)
+    text = kdl.read_text()
+    assert 'version "1.2.3"' in text
+
+    reparsed = parse_manifest(text)
+    from milpa.version import Version
+
+    assert reparsed.version == Version(1, 2, 3)
+
+
+def test_mutate_roundtrip_resolution_strategy(tmp_path: Path) -> None:
+    """C3: a manifest already declaring ``resolution { strategy }`` survives
+    an unrelated mutation through ``mutate_manifest_file`` — same
+    silent-drop trap the package ``version`` field guards against (§5)."""
+    kdl = tmp_path / "milpa.kdl"
+    kdl.write_text(
+        'name "myapp"\nresolution {\n    strategy "minver"\n}\nkind "library"\n'
+    )
+
+    result = mutate_manifest_file(kdl, lambda m: m)
+    assert isinstance(result, WriteResult)
+    text = kdl.read_text()
+    assert 'strategy "minver"' in text
+
+    reparsed = parse_manifest(text)
+    from milpa.version import Strategy
+
+    assert reparsed.resolution is not None
+    assert reparsed.resolution.strategy == Strategy.MINVER
+
+
+def test_mutate_roundtrip_resolution_exclude_newer(tmp_path: Path) -> None:
+    """D1: a manifest already declaring ``resolution { exclude-newer }``
+    survives an unrelated mutation through ``mutate_manifest_file`` — same
+    silent-drop trap C3's ``strategy`` guards against (§5)."""
+    kdl = tmp_path / "milpa.kdl"
+    kdl.write_text(
+        'name "myapp"\nresolution {\n'
+        '    exclude-newer "2026-01-01T00:00:00Z"\n}\nkind "library"\n'
+    )
+
+    result = mutate_manifest_file(kdl, lambda m: m)
+    assert isinstance(result, WriteResult)
+    text = kdl.read_text()
+    assert 'exclude-newer "2026-01-01T00:00:00Z"' in text
+
+    reparsed = parse_manifest(text)
+    from datetime import datetime, timezone
+
+    assert reparsed.resolution is not None
+    assert reparsed.resolution.exclude_newer == datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def test_mutate_roundtrip_url_dep_version_annotation(tmp_path: Path) -> None:
+    """A3b: a UrlDep's ``version=`` annotation survives an unrelated mutation
+    through ``mutate_manifest_file`` (same silent-drop trap as the top-level
+    package version — pin the round-trip through the real writer, not just
+    a direct format_manifest call)."""
+    kdl = tmp_path / "milpa.kdl"
+    kdl.write_text(
+        'name "myapp"\nkind "library"\n'
+        'deps {\n    foo git=(url)"https://github.com/example/foo.git" ref="main" version="1.2.3"\n}\n'
+    )
+
+    result = mutate_manifest_file(kdl, lambda m: m)
+    assert isinstance(result, WriteResult)
+    text = kdl.read_text()
+    assert 'version="1.2.3"' in text
+
+    reparsed = parse_manifest(text)
+    from milpa.version import Version
+
+    dep = reparsed.deps[0]
+    assert isinstance(dep, UrlDep)
+    assert dep.version == Version(1, 2, 3)
 
 
 def test_mutate_adds_dep(tmp_path: Path) -> None:
@@ -313,6 +592,53 @@ def test_mutate_workspace_identity(tmp_path: Path) -> None:
     )
     assert isinstance(reparsed, WorkspaceManifest)
     assert reparsed.members == ("member-a", "member-b")
+
+
+def test_mutate_workspace_roundtrip_resolution_strategy(tmp_path: Path) -> None:
+    """C3 (Axis W: resolution{} is root-only): a workspace root manifest
+    already declaring ``resolution { strategy }`` survives an unrelated
+    mutation through ``mutate_workspace_manifest_file``."""
+    from milpa.manifest import parse_workspace_or_manifest
+    from milpa.version import Strategy
+
+    kdl = tmp_path / "milpa.kdl"
+    kdl.write_text(
+        'resolution {\n    strategy "semver"\n}\n' + _WS_KDL
+    )
+
+    result = mutate_workspace_manifest_file(kdl, lambda ws: ws)
+    assert result.path == kdl
+    text = kdl.read_text()
+    assert 'strategy "semver"' in text
+
+    reparsed = parse_workspace_or_manifest(text)
+    assert isinstance(reparsed, WorkspaceManifest)
+    assert reparsed.resolution is not None
+    assert reparsed.resolution.strategy == Strategy.SEMVER
+
+
+def test_mutate_workspace_roundtrip_resolution_exclude_newer(tmp_path: Path) -> None:
+    """D1 (Axis W: resolution{} is root-only): a workspace root manifest
+    already declaring ``resolution { exclude-newer }`` survives an
+    unrelated mutation through ``mutate_workspace_manifest_file``."""
+    from datetime import datetime, timezone
+
+    from milpa.manifest import parse_workspace_or_manifest
+
+    kdl = tmp_path / "milpa.kdl"
+    kdl.write_text(
+        'resolution {\n    exclude-newer "2026-01-01T00:00:00Z"\n}\n' + _WS_KDL
+    )
+
+    result = mutate_workspace_manifest_file(kdl, lambda ws: ws)
+    assert result.path == kdl
+    text = kdl.read_text()
+    assert 'exclude-newer "2026-01-01T00:00:00Z"' in text
+
+    reparsed = parse_workspace_or_manifest(text)
+    assert isinstance(reparsed, WorkspaceManifest)
+    assert reparsed.resolution is not None
+    assert reparsed.resolution.exclude_newer == datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
 def test_mutate_workspace_add_member(tmp_path: Path) -> None:

@@ -59,8 +59,11 @@ from milpa.errors import (
     FETCH_ALL_FAILED,
     FETCH_PROVENANCE_DIVERGENCE,
     MILPA_INTERNAL,
+    RES_EXCLUDE_NEWER_EMPTY,
+    RES_EXCLUDE_NEWER_PIN,
     RES_NO_INDEX,
     RES_PROVENANCE_CONFLICT,
+    RES_VERSION_UNKNOWN_CONSTRAINED,
     RES_WS_MEMBER_REF_UNKNOWN,
     RES_WS_MEMBER_VERSION_CONSTRAINT,
     RES_WS_NO_INDEX,
@@ -77,6 +80,7 @@ from milpa.identity import compute_content_hash
 from milpa.lockfile import (
     GitProvenanceRecord,
     LocalProvenanceRecord,
+    Lockfile,
     MemberProvenanceRecord,
     OciProvenanceRecord,
     ProvenanceRecord,
@@ -108,6 +112,7 @@ from milpa.edge_sources import (
     MilpaKdlEdgeSource,
     NimbleEdgeSource,
     _resolve_edges_pure,
+    declared_version_for,
     edgeset_to_bfs_deps,
     edgeset_to_terms,
     resolve_edges,
@@ -115,9 +120,25 @@ from milpa.edge_sources import (
 from milpa.dep_decl import EdgeSet
 from milpa.nimble import parse_nimble
 from milpa.profile import Profile
-from milpa.registry import EntryAttestation, GitIndexProvenance, Index, IndexVersion, OciIndexProvenance
-from milpa.solver import SolverError, Term, solve_with_cert
-from milpa.version import DepKey, Strategy, Version, VersionSet, dep_dir_name, format_version_str, parse_version
+from milpa.registry import (
+    EntryAttestation,
+    GitIndexProvenance,
+    Index,
+    IndexVersion,
+    OciIndexProvenance,
+    filter_by_exclude_newer,
+)
+from milpa.solver import SolverError, Term, VersionUnknownConstrained, solve_with_cert
+from milpa.version import (
+    DepKey,
+    Strategy,
+    Version,
+    VersionSet,
+    VersionSource,
+    dep_dir_name,
+    format_version_str,
+    parse_version,
+)
 from milpa.workspace import LoadedWorkspace
 
 if TYPE_CHECKING:
@@ -131,6 +152,104 @@ if TYPE_CHECKING:
 # URL deps, local deps, and member deps have exactly one canonical version.
 # The exact sentinel value is an incidental implementation detail (§3 NOTE).
 _URL_DEP_VERSION: Version = Version(0, 0, 1)
+
+
+def _candidate_label(ctx: EdgeSourceCtx) -> tuple[Version, VersionSource | None, bool]:
+    """Axis A (b): the git/url/local/tarball candidate's version label (D-A2).
+
+    Precedence steps 1-4 (§3 Axis A): the fetched package's ``milpa.kdl
+    version``, else its ``.nimble version`` (A1), else — git deps only,
+    ``ctx.ref`` populated — a version-shaped tag (A3), else the dep
+    declaration's ``version=`` annotation (``ctx.version``, A3b).  None
+    present/parseable → the existing sentinel.  Member candidates never call
+    this (A2c owns their label, via ``_member_candidate_version``).
+
+    Returns ``(label, source, version_unknown)`` — ``source`` is the A5
+    sibling field (``None`` iff ``version_unknown``); ``version_unknown`` is
+    True iff no declared version was found (A4: the sentinel value alone is
+    not a reliable signal, since a real declared version could coincidentally
+    equal it; both are computed here, from the same ``declared_version_for``
+    call, so callers never need a second — potentially file-re-reading — lookup).
+    """
+    declared = declared_version_for(ctx)
+    if declared is not None:
+        version, source = declared
+        return version, source, False
+    return _URL_DEP_VERSION, None, True
+
+
+def _member_candidate_version(
+    manifest: Manifest, abs_dir: Path
+) -> tuple[Version, VersionSource | None]:
+    """A2c/A5: a workspace member's declared-version label + source (§3 Axis A
+    member block, D-A2).
+
+    Same precedence as ``_candidate_label`` (``milpa.kdl version`` else
+    ``.nimble version`` else sentinel), but step 1 is free here: a member's
+    manifest is already parsed in memory (A1's ``milpa.kdl version`` field),
+    so no extra I/O is needed to check it.  ``has_milpa_kdl=False`` is passed
+    to ``declared_version_for`` deliberately — step 1 has already been
+    settled by ``manifest.version`` above, so the reused call goes straight
+    to step 2 (the ``.nimble`` scan of the member's own directory).
+
+    A member that declares no version (no ``milpa.kdl version``, no
+    ``.nimble``) keeps the existing sentinel, paired with ``source=None`` —
+    version-unknown just works for an unconstrained member; the
+    constrained-and-unknown partition + ``RES-VERSION-UNKNOWN-CONSTRAINED``
+    hard error is A4, out of scope here.
+
+    Returns ``(label, source)`` — the same two-sibling-field pairing
+    ``_candidate_label`` returns for git/url/local/tarball candidates.
+    """
+    if manifest.version is not None:
+        return manifest.version, VersionSource.MANIFEST
+    ctx = EdgeSourceCtx(
+        dep_path=abs_dir,
+        dep_name=manifest.name,
+        dep_decl=None,
+        is_overridden=False,
+        has_milpa_kdl=False,
+    )
+    declared = declared_version_for(ctx)
+    if declared is not None:
+        version, source = declared
+        return version, source
+    return _URL_DEP_VERSION, None
+
+
+def _version_unknown_constrained_err(
+    exc: VersionUnknownConstrained, root_authority: set[str]
+) -> MilpaError:
+    """A4 (resolver-semantics RFC §3 Axis A (c) / §6 D-A1): wrap
+    ``VersionUnknownConstrained``'s raw facts into
+    ``RES-VERSION-UNKNOWN-CONSTRAINED``, branching the remedy on whether
+    ``exc.package`` has a user-owned declaration site (``root_authority`` — a
+    root-declared dep or an override rule) or is a purely transitive dep with
+    no such site. ``exc.constrainers`` is enumerated in full (never just the
+    first — the amoxtli incident floored two packages at once).
+    """
+    constrainer_strs = [
+        f"{consumer!r} requires {constraint!r}"
+        for consumer, constraint in exc.constrainers
+    ]
+    if exc.package in root_authority:
+        remedy = (
+            f"add a version= annotation to {exc.package!r}'s dep declaration "
+            f"(or the overrides rule redirecting it), or pin a versioned git tag"
+        )
+    else:
+        remedy = (
+            f"add a root-level pin for {exc.package!r} or an "
+            f"overrides {{ {exc.package} … version= }} rule"
+        )
+    return MilpaError(
+        RES_VERSION_UNKNOWN_CONSTRAINED,
+        f"{exc.package!r} has no declared version (a git/url/local/tarball dep "
+        f"with no milpa.kdl/.nimble/tag/version= source) but is constrained by: "
+        f"{'; '.join(constrainer_strs)} — {remedy}",
+        name=exc.package,
+        constrainers=[{"by": c, "constraint": v} for c, v in exc.constrainers],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +474,30 @@ class _Candidate:
     # declaration has no qualifier there, but still resolves through a real
     # namespaced index entry). Empty string for non-registry candidates.
     registry_namespace: str = ""
+    # A4 (resolver-semantics RFC §3 Axis A (c)): True iff this candidate's
+    # ``version`` is the sentinel purely because no declared version was
+    # found (``declared_version_for(ctx) is None``) — NOT a value-equality
+    # check against the sentinel, since a real declared version could
+    # coincidentally equal it. Drives the decision-priority + hard-error
+    # partition via ``_Provider.is_version_unknown``. Always False for the
+    # root and named/index candidates (always a real version) and,
+    # deliberately, for workspace members too: a member's own solver term is
+    # unconditionally ``full()`` (A2c), so no real PubGrub constraint can
+    # ever reach it — applying the last-scheduling rule to members would
+    # only reorder when their transitive deps are discovered, with no
+    # hard-error path to gain, so A4 scopes the mechanism to the git/url/
+    # local/tarball candidates it actually protects.
+    version_unknown: bool = False
+    # A5 (resolver-semantics RFC §3 Axis A (b) / §5): the sibling field to
+    # ``version`` — WHICH precedence step produced it (manifest/nimble/tag/
+    # annotation), or ``None`` for a version-unknown candidate (``declared_
+    # version_for(ctx) is None``).  Never merged into ``version`` itself (two
+    # sibling fields, not a sum type — identity ⊥ provenance discipline
+    # applied to version ⊥ source).  Populated at the same 4 call sites as
+    # ``version_unknown`` (the 3 fetch workers + the member-candidate
+    # builder); always ``None`` for root/named candidates, which never call
+    # ``declared_version_for``/``_candidate_label``/``_member_candidate_version``.
+    declared_version_source: VersionSource | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +523,7 @@ class _Provider:
         params: ResolveParams,
         overrides_by_name: dict[str, Override],
         root_authority: set[str],
+        root_direct_keys: set[DepKey],
         seen_named: set[DepKey],
         seen_url: set[tuple[str, str]],
         provenance_gate: dict[str, tuple[tuple[object, ...], bool]],
@@ -405,6 +549,12 @@ class _Provider:
 
         # Shared dedup sets (owned by resolve(), borrowed here for callbacks)
         self._root_authority = root_authority
+        # R6: namespace-aware authority set, used ONLY by is_root_direct (the
+        # C2/C3 lowest-direct precompute + bypass scoping) — NEVER by the
+        # provenance gate, which stays on the bare-name `root_authority` set
+        # above (a separate concern; its namespace behavior is #193, out of
+        # scope here).
+        self._root_direct_keys = root_direct_keys
         self._seen_named = seen_named
         self._seen_url = seen_url
         self._provenance_gate = provenance_gate
@@ -551,7 +701,7 @@ class _Provider:
             strict_attestation=self._strict_attestation,  # S5: policy-gated FETCH-FAILED fallback
         )
         dep_terms, requires_names, requires_predicates = edgeset_to_terms(
-            es, self._overrides_by_name, _URL_DEP_VERSION
+            es, self._overrides_by_name
         )
         src_dir = es.src_dir
 
@@ -659,6 +809,141 @@ class _Provider:
             return list(candidate.dep_terms)
         raise KeyError(f"no candidate for {package!r} @ {version}")
 
+    def is_version_unknown(self, package: str) -> bool:
+        """A4 (resolver-semantics RFC §3 Axis A (c)): True iff ``package``'s
+        sole eager candidate has no declared version.
+
+        All single-candidate kinds (git/url/local/tarball) that can go
+        version-unknown are added to ``_candidates`` eagerly during the BFS
+        phase, before the solver ever runs — so by the time
+        ``milpa.solver.solve`` queries this, the eager candidate (if any) is
+        already present. Named/index candidates always carry
+        ``version_unknown=False`` (see that field's doc comment); an
+        as-yet-unmaterialized stub correctly falls through to False too.
+        """
+        for c in self._candidates.get(package, {}).values():
+            return c.version_unknown
+        return False
+
+    def is_root_direct(self, package: str) -> bool:
+        """C2 (resolver-semantics RFC §3 Axis C, D-C2): True iff ``package``
+        is a root-declared or override-named dep — used for the solver's
+        ``LowestDirect`` effective-strategy precompute (and C3's bypass
+        scoping), never for provenance gating (which stays in
+        ``_check_provenance_gate`` against the bare-name ``root_authority``
+        set — a separate concern, #193).
+
+        ``package`` is a solver_var string; decomposed via
+        ``DepKey.from_solver_var`` (the SOLE site for that) into a FULL
+        ``DepKey`` (name AND namespace) and checked against
+        ``root_direct_keys`` — a namespace-aware set (R6 fix). A bare-name-
+        only check would wrongly match a namespace-qualified TRANSITIVE dep
+        against an unrelated root dep that merely shares the same bare name
+        under a DIFFERENT namespace (e.g. root ``ns1::foo`` must NOT make a
+        purely-transitive ``ns2::foo`` look root-direct).
+        """
+        dk = DepKey.from_solver_var(package)
+        return dk in self._root_direct_keys
+
+    def _bypasses_lock_preference(self, package: str) -> bool:
+        """C3/R9 (resolver-semantics RFC §3 Axis C, D-C2): whether B2's
+        lock-preference is BYPASSED for ``package``.
+
+        The bypass requires BOTH of:
+
+        1. ``self._params.strategy_explicit`` — the effective strategy this
+           resolve is running under was EXPLICITLY sourced (CLI
+           ``--strategy`` or manifest ``resolution { strategy }``), never
+           merely default-filled. R9 (§3 Axis C NORMATIVE: the lockfile-
+           recorded strategy is "diagnostic/frozen-parity only, never a
+           live input"): a bare resolve with no CLI flag and no manifest
+           ``resolution`` block must NEVER bypass, even against a lock
+           recorded under a non-default strategy — otherwise a bare
+           ``milpa fetch`` on a ``minver``-recorded lock would compute
+           effective=``maxver`` (the default), see it "diverge" from the
+           lock, and newest-wins the WHOLE graph — a worse regression than
+           the sticky-state bug this fixes. Stability of a bare re-resolve
+           rides on B2's preference mechanism below, not on treating the
+           lock's strategy as live governing state.
+        2. **value-divergence**, never CLI flag *presence* alone:
+           ``str(self._params.strategy) != self._params.prior.strategy``
+           (the effective strategy versus the strategy string the
+           committed lock was actually produced under). This is the
+           load-bearing regression guard (#192): ``milpa fetch --strategy
+           maxver`` on an already-maxver lock must be a NO-OP — a
+           presence-gate ("was --strategy typed") would instead flip the
+           whole graph to newest-wins even when the effective strategy
+           equals the locked one.
+
+        Scope is strategy-specific, per D-C2:
+        - ``maxver``/``minver``/``semver`` diverging from the lock: bypass
+          is WHOLE-GRAPH (every package).
+        - ``lowest-direct`` diverging from the lock: bypass is
+          ROOT-DIRECT-ONLY (``is_root_direct``) — transitives keep their
+          lock preference, because a whole-graph bypass under
+          ``lowest-direct`` would drag unrelated transitives forward
+          (#192 again, through a different door).
+
+        A pure function of (explicit-sourced?, effective strategy, locked
+        strategy, directness) — assembled here as ``preference = None`` for
+        the bypassed packages, never a concept the picker itself learns
+        about (§4 stage 4: "bypass is not a picker parameter").
+        """
+        prior = self._params.prior
+        if prior is None:
+            return False
+        if not self._params.strategy_explicit:
+            return False
+        if str(self._params.strategy) == prior.strategy:
+            return False
+        if self._params.strategy == Strategy.LOWEST_DIRECT:
+            return self.is_root_direct(package)
+        return True
+
+    def preference(self, package: str) -> Version | None:
+        """B2 (resolver-semantics RFC §4 stage 4): the prior lockfile's
+        recorded version for ``package``, if one exists and parses.
+
+        ``package`` is a solver_var string (e.g. ``"ns::bar"`` for a
+        qualified named dep); decomposed via ``DepKey.from_solver_var`` (the
+        SOLE site for that, per its docstring) so the lookup matches against
+        ``LockedDep.name``/``LockedDep.namespace`` — never a raw ``::``
+        split. Returns ``None`` when there is no prior lock, the package is
+        new (not in the prior lock), its recorded version string doesn't
+        parse (never a hard error — a preference miss just falls through to
+        ordinary strategy selection in ``_pick_version``), or C3's
+        value-divergence bypass applies (``_bypasses_lock_preference``).
+        """
+        if self._params.prior is None:
+            return None
+        if self._bypasses_lock_preference(package):
+            return None
+        dk = DepKey.from_solver_var(package)
+        locked = next(
+            (
+                d
+                for d in self._params.prior.deps
+                if d.name == dk.name and d.namespace == dk.namespace
+            ),
+            None,
+        )
+        if locked is None:
+            return None
+        if locked.identity is None:
+            # B4 (RFC resolution-semantics.md §3 Axis B / D-B3): a
+            # pin-stripped entry (``strip_dep_pin`` — the shared mechanism
+            # both ``update <dep>`` and ``--upgrade <dep>`` delegate to)
+            # carries no preference. This is the SAME "identity=None means
+            # unpinned" convention ``_git_pin_for_url_dep`` already applies
+            # for git-pin reuse, extended uniformly here so a NAMED/index
+            # dep (the only kind where this distinction is observable —
+            # git/url/local/tarball deps have exactly one solver-visible
+            # candidate regardless, per the RFC's own B2 dependency note)
+            # actually opts out of the minimal-change preference when its
+            # pin is stripped, instead of silently keeping its old version.
+            return None
+        return parse_version(locked.version)
+
     def get(self, name: str, version: Version) -> _Candidate:
         """Retrieve a candidate (materialising a stub if needed)."""
         if name in self._candidates and version in self._candidates[name]:
@@ -750,6 +1035,126 @@ def _compute_cli_active_seed(
     # Default: default-true flags ∪ --features.
     default_seed: frozenset[str] = frozenset(fd.name for fd in flags if fd.default)
     return default_seed | features
+
+
+def _resolve_effective_strategy(
+    cli_strategy: Strategy | None,
+    manifest: "Manifest | object",
+) -> Strategy | None:
+    """C3 (resolution-semantics RFC §3 Axis C / D-C2): resolve the
+    EXPLICITLY-DECLARED strategy for one verb's resolve, walking the
+    precedence chain ONCE:
+
+    1. explicit CLI ``--strategy`` (``cli_strategy is not None``);
+    2. else the manifest's ``resolution { strategy }`` (``manifest`` is
+       either a single-package ``Manifest`` or a workspace-root
+       ``WorkspaceManifest`` — both carry a ``.resolution`` field; accessed
+       via ``getattr`` so either type works here without an isinstance
+       branch);
+    3. else ``None`` — neither source declared a strategy.
+
+    RR1 (duplicate-precedence-walk cleanup): this used to be a PAIR of
+    near-identical functions — ``_resolve_effective_strategy`` (returning
+    a default-filled ``Strategy``) and a sibling ``_is_strategy_explicit``
+    (returning whether it was explicit) — that walked this SAME precedence
+    chain twice per call site (~12 sites in ``cli.py`` alone). Collapsed
+    into a single walk: every call site now derives BOTH facts from this
+    one ``Strategy | None`` result::
+
+        decl = _resolve_effective_strategy(cli_strategy, manifest)
+        strategy_explicit = decl is not None
+        strategy = decl if decl is not None else Strategy.MAXVER
+
+    R9 (resolution-semantics RFC §3 Axis C NORMATIVE text: "the lockfile-
+    recorded strategy is diagnostic/frozen-parity only, never a live
+    input"): there used to be a third tier here that fell back to
+    ``prior.strategy`` before the global default. That made a one-off
+    ``--strategy X`` invisibly and permanently govern every future bare
+    resolve (hidden sticky state), and made the lockfile a live resolution
+    input rather than a pure diagnostic record — contradicting the RFC
+    text above. That tier is gone; ``manifest`` is the only thing this
+    function ever reads besides the CLI arg.
+
+    Stability of a bare re-resolve against a lock recorded under a
+    non-default strategy is preserved a DIFFERENT way — via B2's
+    lock-preference mechanism (``_Provider.preference``), not by treating
+    the lockfile's strategy as a governing tier here. See
+    ``_bypasses_lock_preference`` for how: the bypass that would otherwise
+    drop B2's preference and newest-wins the whole graph only fires when
+    the strategy declared here is not ``None`` AND diverges from the
+    lock's recorded value — never when it is merely default-filled.
+
+    Lives here (not in ``cli.py``) so it is the SINGLE SOURCE OF TRUTH for
+    strategy precedence usable by BOTH the CLI layer (every
+    resolve-triggering verb) and the frozen path (C3b, ``frozen.py``'s
+    ``FROZEN-STRATEGY-MISMATCH`` baseline) — which calls this with the
+    same two-arg signature (there is no CLI ``--strategy`` in the frozen
+    path, so it collapses to tier 2 only, then default-fills to MAXVER
+    itself since the baseline has no ``strategy_explicit`` need).
+    """
+    if cli_strategy is not None:
+        return cli_strategy
+    resolution = getattr(manifest, "resolution", None)
+    if resolution is not None and resolution.strategy is not None:
+        return resolution.strategy
+    return None
+
+
+def _resolve_effective_exclude_newer(
+    cli_exclude_newer: "datetime | None",
+    manifest: "Manifest | object",
+    prior: "Lockfile | None" = None,
+) -> "datetime | None":
+    """D2/D5 (resolution-semantics RFC §3 Axis D): resolve the EFFECTIVE
+    exclude-newer time-bound for one verb's resolve, in precedence order:
+
+    1. explicit CLI ``--exclude-newer`` (``cli_exclude_newer is not None``);
+    2. else the manifest's ``resolution { exclude-newer }`` (``manifest`` is
+       either a single-package ``Manifest`` or a workspace-root
+       ``WorkspaceManifest`` — both carry a ``.resolution`` field; accessed
+       via ``getattr`` so either type works here without an isinstance
+       branch, mirroring ``_resolve_effective_strategy``);
+    3. else ``prior.exclude_newer`` when a prior lockfile was passed;
+    4. else ``None`` (no time bound).
+
+    **Callers choose whether tier 3 is live, by what they pass for
+    ``prior``** — this is the load-bearing design point, not an oversight:
+
+    - ``fetch``/``lock`` (the only verbs with a CLI ``--exclude-newer``
+      surface, §3 Axis D "Verb reach") call this with ``prior=None``,
+      collapsing to the ORIGINAL 2-tier chain (CLI > manifest > ``None``).
+      An absent CLI flag + absent manifest declaration is therefore a
+      genuine "nothing declared this run" result for these verbs — which is
+      exactly what makes ``--locked``'s no-silent-drop check meaningful
+      (D5, §6 D-D3): comparing THIS honest 2-tier value against the
+      committed lock's recorded value is how a real drop gets caught.
+    - ``add``/``update``/``remove``/workspace add-member/remove-member have
+      NO CLI override at all, so they call this with the REAL on-disk prior
+      lockfile — tier 3 then CARRIES FORWARD a bound that was set only via
+      a one-off ``fetch --exclude-newer`` and never mirrored into the
+      manifest, rather than silently dropping it (D5, §6 D-D3 no-silent-drop
+      — the exact scenario the RFC's own text calls out for these verbs).
+
+    ``prior`` here (when passed) must be the ACTUAL on-disk lockfile, never
+    the resolve-scoped ``prior`` that ``update``/``--upgrade`` null out or
+    strip for B2's minimal-change preference.
+
+    NOTE (R9): ``_resolve_effective_strategy`` no longer has an analogous
+    tier 3 at all — the lockfile-recorded ``strategy`` is diagnostic/
+    frozen-parity only, never a live input (unlike ``exclude_newer``,
+    which legitimately keeps its own D5 no-silent-drop lockfile-fallback
+    tier here, by design, for the verbs that call this with a real
+    ``prior``). The two functions' precedence chains are NOT symmetric
+    post-R9 — this asymmetry is intentional, not a residual inconsistency.
+    """
+    if cli_exclude_newer is not None:
+        return cli_exclude_newer
+    resolution = getattr(manifest, "resolution", None)
+    if resolution is not None and resolution.exclude_newer is not None:
+        return resolution.exclude_newer
+    if prior is not None and prior.exclude_newer is not None:
+        return prior.exclude_newer
+    return None
 
 
 def _compute_root_active_seed(
@@ -1111,9 +1516,15 @@ def _apply_git_override_to_url_dep(dep: UrlDep, ov: Override) -> UrlDep:
     (S8b).  LocalTarget is NOT handled here — callers that accept the override
     result must use ``_apply_override`` to get the correct ``Dep`` union type.
     This function is kept for existing git-path callers that return ``UrlDep``.
+
+    A3b/D-A3: the redirected dep's ``version`` is the OVERRIDE RULE's
+    ``version=`` (``ov.version``), never the original ``dep.version`` — this
+    function builds a brand-new ``UrlDep`` from the override target alone, so
+    a stale annotation on the now-redirected original is structurally
+    discarded, never read.
     """
     if isinstance(ov.target, GitTarget):
-        return UrlDep(name=dep.name, git=ov.target.git, ref=ov.target.ref)
+        return UrlDep(name=dep.name, git=ov.target.git, ref=ov.target.ref, version=ov.version)
     if isinstance(ov.target, LocalTarget):
         raise NotImplementedError(
             f"LocalTarget override for {dep.name!r} is not yet wired "
@@ -1158,11 +1569,15 @@ def _apply_override(name: str, ov: Override) -> "UrlDep | LocalDep":
     Returns ``UrlDep`` for git-form overrides and ``LocalDep`` for local-form
     overrides.  The caller is responsible for routing to the correct BFS queue
     slot (``("url", dep)`` vs ``("local", dep)``).
+
+    A3b/D-A3: ``version=ov.version`` — the override rule's own annotation,
+    never the original dep's (discarded by construction; see
+    ``_apply_git_override_to_url_dep``).
     """
     if isinstance(ov.target, GitTarget):
-        return UrlDep(name=name, git=ov.target.git, ref=ov.target.ref)
+        return UrlDep(name=name, git=ov.target.git, ref=ov.target.ref, version=ov.version)
     if isinstance(ov.target, LocalTarget):
-        return LocalDep(name=name, path=ov.target.path)
+        return LocalDep(name=name, path=ov.target.path, version=ov.version)
     if isinstance(ov.target, MemberTarget):
         # Should not reach here — callers intercept MemberTarget before _apply_override.
         # If this fires, a new call-site was added without handling S8b.
@@ -1181,14 +1596,19 @@ def _dep_to_term(
 
     Returns ``(None, None)`` for dep kinds that are not solver-visible
     (MemberDep — member resolution is a workspace concern, slice 9d).
+
+    Axis A (a) (D-A2): a git/url/tarball/local dep's own term — and an
+    overridden named dep's term (redirected to such a kind) — is always
+    ``VersionSet.full()``, never ``eq(sentinel)``.  The candidate label
+    (real declared version, when parseable) is assigned post-fetch;
+    ``full()`` removes the pre-commitment so it never races the label.
     """
     if isinstance(dep, UrlDep):
-        # Override may redirect the URL.
+        # Override may redirect the URL; term is full() either way.
         if dep.name in overrides_by_name:
             ov = overrides_by_name[dep.name]
-            # Still sentinel version — override changes the URL, not the version.
             _ = ov  # override consumed by the fetch step; term is the same
-        return (Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)), dep.name)
+        return (Term.require(dep.name, VersionSet.full()), dep.name)
 
     if isinstance(dep, NamedDep):
         if dep.name == "nim":
@@ -1197,16 +1617,16 @@ def _dep_to_term(
         _dep_key = DepKey(name=dep.name, namespace=dep.namespace)
         svar = _dep_key.solver_var()  # = dep.name for namespace=None (backward compat)
         vs = dep.constraint_set if dep.constraint_set is not None else VersionSet.full()
-        # Check if this named dep is overridden (becomes a URL dep at sentinel).
+        # Check if this named dep is overridden (becomes a URL-like dep, full() term).
         if dep.name in overrides_by_name:
-            return (Term.require(svar, VersionSet.eq(_URL_DEP_VERSION)), svar)
+            return (Term.require(svar, VersionSet.full()), svar)
         return (Term.require(svar, vs), svar)
 
     if isinstance(dep, TarballDep):
-        return (Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)), dep.name)
+        return (Term.require(dep.name, VersionSet.full()), dep.name)
 
     if isinstance(dep, LocalDep):
-        return (Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)), dep.name)
+        return (Term.require(dep.name, VersionSet.full()), dep.name)
 
     if isinstance(dep, MemberDep):
         # Member resolution is a workspace concern (slice 9d).
@@ -1227,6 +1647,7 @@ def _enumerate_named_stubs(
     provider: _Provider,
     deps_dir: Path,
     env: MilpaEnv,
+    exclude_newer: "datetime | None" = None,
 ) -> None:
     """Phase A: enumerate all satisfying IndexVersions as stubs (no fetch).
 
@@ -1239,6 +1660,16 @@ def _enumerate_named_stubs(
     the full candidate space — constraint accumulation is the solver's job.
     The dep_terms (registered in Phase B materialisation) will carry the
     actual constraint as incompatibility terms.
+
+    D3 (resolution-semantics RFC §3 Axis D / §4 stage 2): *this* is "the
+    enumeration layer" the RFC names — after stage 1's constraint-blind
+    enumerate above, ``exclude_newer`` (when set) applies a hard,
+    fail-closed ``published_at`` cut over the SAME candidate list, strictly
+    before the solver ever sees it (stage 3's accumulated-constraint filter
+    is the solver's, unaffected).  Emptying an otherwise-non-empty candidate
+    set this way raises ``RES-EXCLUDE-NEWER-EMPTY`` — a distinct error class
+    from ``TNG-NO-SATISFYING-VERSION``, per #100's error-taxonomy
+    discipline.
     """
     # S5b: use qualified lookup when namespace is set, bare lookup otherwise.
     # Qualified lookup bypasses TNG-AMBIGUOUS-NAME (registry-protocol §5.1).
@@ -1248,6 +1679,23 @@ def _enumerate_named_stubs(
         )
     else:
         all_versions = index.resolve_named_all(dep_key.name, constraint=None)
+
+    if exclude_newer is not None:
+        kept, dropped = filter_by_exclude_newer(all_versions, exclude_newer)
+        if dropped and not kept:
+            raise MilpaError(
+                RES_EXCLUDE_NEWER_EMPTY,
+                f"{dep_key.name!r} has {dropped} candidate version(s), but "
+                f"exclude-newer {exclude_newer.isoformat()!r} excluded all of "
+                f"them (a candidate with no provable published_at is excluded "
+                f"too, fail-closed)",
+                name=dep_key.name,
+                namespace=dep_key.namespace,
+                exclude_newer=exclude_newer.isoformat(),
+                dropped=dropped,
+            )
+        all_versions = kept
+
     stubs: list[_NamedStub] = []
     for iv in all_versions:
         ver = _parse_version_strict(iv.version)
@@ -1382,7 +1830,10 @@ def _run_bfs_wave_loop(
                     # owns satisfiability via incompatibility accumulation;
                     # pre-filtering would emit TNG-NO-SATISFYING-VERSION
                     # instead of the canonical SOLVE-CONFLICT on the error path.
-                    _enumerate_named_stubs(dep_key_n, None, index, provider, deps_dir, env)
+                    _enumerate_named_stubs(
+                        dep_key_n, None, index, provider, deps_dir, env,
+                        exclude_newer=params.exclude_newer,
+                    )
                 # Named items are always processed inline, not as futures.
                 continue
 
@@ -1393,7 +1844,7 @@ def _run_bfs_wave_loop(
                     ov = overrides_by_name[dep_u.name]
                     # S8a: LocalTarget override → route to the "local" BFS slot.
                     if isinstance(ov.target, LocalTarget):
-                        _local_ov = LocalDep(name=dep_u.name, path=ov.target.path)
+                        _local_ov = LocalDep(name=dep_u.name, path=ov.target.path, version=ov.version)
                         if _local_ov.path not in seen_local:
                             seen_local.add(_local_ov.path)
                             record_discovery(_local_ov.name)
@@ -1613,8 +2064,9 @@ def _run_bfs_wave_loop(
                                 _nsub_name = getattr(_nsub, "name", None)
                                 if _nsub_name and _nsub_name not in _pcand.requires_names:
                                     if isinstance(_nsub, UrlDep):
+                                        # Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                                         _pcand.dep_terms.append(
-                                            _S4bTerm.require(_nsub_name, _S4bVS.eq(_URL_DEP_VERSION))
+                                            _S4bTerm.require(_nsub_name, _S4bVS.full())
                                         )
                                     else:
                                         _vs_sub = getattr(_nsub, "constraint_set", None) or _S4bVS.full()
@@ -1865,12 +2317,13 @@ def _s4a_run_fixpoint(
                     dep_key = (sub_dep.git, sub_dep.ref)
                     if dep_key in seen_url:
                         # Already fetched — just extend the parent's terms if needed.
+                        # Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                         if target_cand is not None:
                             if sub_dep.name not in target_cand.requires_names:
                                 from milpa.solver import Term as _Term
                                 from milpa.version import VersionSet as _VS
                                 target_cand.dep_terms.append(
-                                    _Term.require(sub_dep.name, _VS.eq(_URL_DEP_VERSION))
+                                    _Term.require(sub_dep.name, _VS.full())
                                 )
                                 target_cand.requires_names.append(sub_dep.name)
                         continue
@@ -1881,7 +2334,7 @@ def _s4a_run_fixpoint(
                             from milpa.solver import Term as _Term
                             from milpa.version import VersionSet as _VS
                             target_cand.dep_terms.append(
-                                _Term.require(sub_dep.name, _VS.eq(_URL_DEP_VERSION))
+                                _Term.require(sub_dep.name, _VS.full())
                             )
                             target_cand.requires_names.append(sub_dep.name)
                     _enqueue_dep(sub_dep, overrides_by_name, bfs_queue)
@@ -2260,9 +2713,30 @@ def resolve(
     # ------------------------------------------------------------------
     # Step 3: root authority set (§10 provenance precedence)
     # ------------------------------------------------------------------
-    root_authority: set[str] = {
-        d.name for d in all_root_deps
-    } | {ov.name for ov in manifest.overrides}
+    # RR2 (R6 dual-set cleanup): build the namespace-aware set ONCE, then
+    # derive the bare-name authority set as a pure name-projection of it —
+    # replacing two independently hand-built collections (which could
+    # silently desync when a dep kind was added to one loop and missed in
+    # the other) with one populated collection + one projection.
+    #
+    # Each root dep's ACTUAL namespace is threaded through (NamedDep carries
+    # `.namespace`; url/local/tarball/member deps have none, so
+    # `getattr(..., None)` yields the same None that DepKey.from_solver_var
+    # decomposes their bare solver var into). Overrides are name-based only
+    # (no namespace concept).
+    root_direct_keys: set[DepKey] = {
+        DepKey(name=d.name, namespace=getattr(d, "namespace", None))
+        for d in all_root_deps
+    } | {DepKey(name=ov.name) for ov in manifest.overrides}
+
+    # R6: namespace-aware authority set — used ONLY by is_root_direct (the
+    # lowest-direct precompute), never the provenance gate above, which
+    # stays on this bare-name projection. Provably byte-identical to the
+    # old independently-built `root_authority` set: both are sourced from
+    # exactly `all_root_deps` (regular + dev-deps) + `manifest.overrides`
+    # names — the SAME two sources — so projecting `root_direct_keys` down
+    # to just its `.name` field yields the exact same set of bare names.
+    root_authority: set[str] = {k.name for k in root_direct_keys}
 
     # provenance_gate: name → (prov_key, is_root_authority)
     #
@@ -2308,6 +2782,7 @@ def resolve(
         params=params,
         overrides_by_name=overrides_by_name,
         root_authority=root_authority,
+        root_direct_keys=root_direct_keys,
         seen_named=seen_named,
         seen_url=seen_url,
         provenance_gate=provenance_gate,
@@ -2343,9 +2818,10 @@ def resolve(
                 ov = overrides_by_name[dep.name]
                 # S8a: LocalTarget override on a root UrlDep → local BFS slot.
                 if isinstance(ov.target, LocalTarget):
-                    root_terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
+                    # Axis A (a)/D-A2: full() self-term, never eq(sentinel).
+                    root_terms.append(Term.require(dep.name, VersionSet.full()))
                     root_requires.append(dep.name)
-                    bfs_queue.append(("local", LocalDep(name=dep.name, path=ov.target.path)))
+                    bfs_queue.append(("local", LocalDep(name=dep.name, path=ov.target.path, version=ov.version)))
                     _record_discovery(dep.name)
                     continue
                 # S8b: MemberTarget in a single-package manifest is a no-op (no
@@ -2357,7 +2833,9 @@ def resolve(
                     effective_dep = _apply_git_override_to_url_dep(dep, ov)
             else:
                 effective_dep = dep
-            root_terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
+            # Axis A (a)/D-A2: full() self-term, never eq(sentinel) — the causality
+            # fix (term built pre-fetch; the real label is assigned post-fetch).
+            root_terms.append(Term.require(dep.name, VersionSet.full()))
             root_requires.append(dep.name)
             bfs_queue.append(("url", effective_dep))
             _record_discovery(dep.name)  # Phase B: root URL deps in declaration order
@@ -2370,11 +2848,12 @@ def resolve(
                 ov = overrides_by_name[dep.name]
                 # S8a: LocalTarget override on a root NamedDep → local BFS slot.
                 if isinstance(ov.target, LocalTarget):
+                    # Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                     root_terms.append(
-                        Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION))
+                        Term.require(dep.name, VersionSet.full())
                     )
                     root_requires.append(dep.name)
-                    bfs_queue.append(("local", LocalDep(name=dep.name, path=ov.target.path)))
+                    bfs_queue.append(("local", LocalDep(name=dep.name, path=ov.target.path, version=ov.version)))
                     _record_discovery(dep.name)  # Phase B: overridden named → local
                     continue
                 # S8b: MemberTarget in a single-package manifest is a no-op;
@@ -2391,8 +2870,9 @@ def resolve(
                 effective_dep = _apply_git_override_to_url_dep(
                     UrlDep(name=dep.name, git="", ref=""), ov
                 )
+                # Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                 root_terms.append(
-                    Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION))
+                    Term.require(dep.name, VersionSet.full())
                 )
                 root_requires.append(dep.name)
                 bfs_queue.append(("url", effective_dep))
@@ -2410,13 +2890,15 @@ def resolve(
                     provider._flag_requests_by_name[_dk.solver_var()] = dep.flag_requests
 
         elif isinstance(dep, TarballDep):
-            root_terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
+            # Axis A (a)/D-A2: full() self-term, never eq(sentinel).
+            root_terms.append(Term.require(dep.name, VersionSet.full()))
             root_requires.append(dep.name)
             bfs_queue.append(("tarball", dep))
             _record_discovery(dep.name)  # Phase B: root tarball deps in declaration order
 
         elif isinstance(dep, LocalDep):
-            root_terms.append(Term.require(dep.name, VersionSet.eq(_URL_DEP_VERSION)))
+            # Axis A (a)/D-A2: full() self-term, never eq(sentinel).
+            root_terms.append(Term.require(dep.name, VersionSet.full()))
             root_requires.append(dep.name)
             bfs_queue.append(("local", dep))
             _record_discovery(dep.name)  # Phase B: root local deps in declaration order
@@ -2549,7 +3031,10 @@ def resolve(
         if _dk_t in seen_named or _dk_t.name == "nim":
             return
         seen_named.add(_dk_t)
-        _enumerate_named_stubs(_dk_t, None, index, provider, deps_dir, env)
+        _enumerate_named_stubs(
+            _dk_t, None, index, provider, deps_dir, env,
+            exclude_newer=params.exclude_newer,
+        )
 
     provider.set_transitive_callback(_on_transitive_named)
 
@@ -2563,6 +3048,8 @@ def resolve(
             Version(0, 0, 0),
             strategy=params.strategy,
         )
+    except VersionUnknownConstrained as exc:
+        raise _version_unknown_constrained_err(exc, root_authority) from exc
     except SolverError as exc:
         from milpa.errors import SOLVE_CONFLICT
         raise MilpaError(
@@ -2825,6 +3312,8 @@ def _process_url_worker(
         has_milpa_kdl=has_milpa_kdl,
         overrides_by_name=overrides_by_name,
         active_flags=requested_flags,  # S3: consumer-requested flags
+        ref=dep.ref,  # A3: git tag-derived version fallback (step 3)
+        version=dep.version,  # A3b: version= annotation fallback (step 4)
     )
     # Call _resolve_edges_pure (worker thread — no shared edge_cache yet).
     # The main thread seals edge_cache from the returned EdgeSet.
@@ -2835,7 +3324,7 @@ def _process_url_worker(
         dep_decl_source=DepDeclEdgeSource(env.dep_decl_store) if env.dep_decl_store is not None else None,
     )
 
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name)
     src_dir = es.src_dir
 
     commit_sha: str | None = result.receipt.transport_fields().get("commit_sha")
@@ -2847,9 +3336,36 @@ def _process_url_worker(
         else {}
     )
 
+    # D4 (resolution-semantics RFC §3 Axis D / §6 D-D1/D-D2): exclude-newer
+    # VALIDATION for the pinned git commit — not selection (git deps have
+    # exactly one candidate, unlike an index dep's enumerated set, which is
+    # filtered at the enumeration layer instead, D3).  Keys on the resolved
+    # commit's own COMMITTER date (never an annotated tag's tagger date —
+    # guaranteed by GitReceipt.committer_date's own contract).  local/tarball
+    # deps have no commit and are not validated here (no meaningful timestamp).
+    if params.exclude_newer is not None and isinstance(result.receipt, GitReceipt):
+        committer_date = result.receipt.committer_date
+        if committer_date is not None and committer_date > params.exclude_newer:
+            raise MilpaError(
+                RES_EXCLUDE_NEWER_PIN,
+                f"{dep.name!r} is pinned to commit {commit_sha!r} whose "
+                f"committer date {committer_date.isoformat()!r} is newer than "
+                f"exclude-newer {params.exclude_newer.isoformat()!r} — git/url "
+                f"deps have exactly one candidate (validated, not selected), "
+                f"so there is no older version to fall back to; loosen or "
+                f"remove exclude-newer, or pin an older commit",
+                name=dep.name,
+                commit_sha=commit_sha,
+                committer_date=committer_date.isoformat(),
+                exclude_newer=params.exclude_newer.isoformat(),
+            )
+
+    # Axis A (b)/D-A2: label with the fetched package's declared version
+    # (milpa.kdl → .nimble), else the sentinel (version-unknown stays as-is).
+    _candidate_version, _version_source, _version_unknown = _candidate_label(ctx)
     candidate = _Candidate(
         name=dep.name,
-        version=_URL_DEP_VERSION,
+        version=_candidate_version,
         identity=result.identity,
         src_dir=src_dir,
         dep_terms=dep_terms,
@@ -2861,6 +3377,9 @@ def _process_url_worker(
         requires_predicates=requires_predicates,
         # R1-04: submodule SHA provenance from the GitReceipt (H5).
         submodule_shas=submodule_shas,
+        # A4: no declared version found — version-unknown.
+        version_unknown=_version_unknown,
+        declared_version_source=_version_source,
     )
 
     # Collect transitive deps for the BFS queue (returned to caller for enqueuing).
@@ -2880,7 +3399,7 @@ def _enqueue_dep(
             ov = overrides_by_name[dep.name]
             # S8a: LocalTarget override → route to local BFS slot.
             if isinstance(ov.target, LocalTarget):
-                bfs_queue.append(("local", LocalDep(name=dep.name, path=ov.target.path)))
+                bfs_queue.append(("local", LocalDep(name=dep.name, path=ov.target.path, version=ov.version)))
                 return
             # S8b: MemberTarget override — member already pre-registered in workspace;
             # no external queue entry (provenance gate suppresses any stale git claim).
@@ -2895,7 +3414,7 @@ def _enqueue_dep(
             ov = overrides_by_name[dep.name]
             # S8a: LocalTarget override → route to local BFS slot.
             if isinstance(ov.target, LocalTarget):
-                bfs_queue.append(("local", LocalDep(name=dep.name, path=ov.target.path)))
+                bfs_queue.append(("local", LocalDep(name=dep.name, path=ov.target.path, version=ov.version)))
                 return
             # S8b: MemberTarget override — member already pre-registered in workspace.
             if isinstance(ov.target, MemberTarget):
@@ -3008,19 +3527,23 @@ def _process_tarball_worker(
         is_overridden=False,  # Tarball deps cannot be overridden (no name-override mechanism)
         has_milpa_kdl=has_milpa_kdl,
         overrides_by_name=overrides_by_name,
+        version=dep.version,  # A3b: version= annotation fallback (step 4)
     )
     es = _resolve_edges_pure(
         dep.name, _URL_DEP_VERSION, ctx,
         dep_decl_source=DepDeclEdgeSource(env.dep_decl_store) if env.dep_decl_store is not None else None,
     )
 
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name)
     src_dir = es.src_dir
     recorded_sha256 = dep.sha256 or archive_sha256 or locked_sha256
 
+    # Axis A (b)/D-A2: label with the fetched package's declared version
+    # (milpa.kdl → .nimble), else the sentinel (version-unknown stays as-is).
+    _candidate_version, _version_source, _version_unknown = _candidate_label(ctx)
     candidate = _Candidate(
         name=dep.name,
-        version=_URL_DEP_VERSION,
+        version=_candidate_version,
         identity=result.identity,
         src_dir=src_dir,
         dep_terms=dep_terms,
@@ -3031,6 +3554,9 @@ def _process_tarball_worker(
             strip_components=dep.strip_components,
         ),
         requires_predicates=requires_predicates,
+        # A4: no declared version found — version-unknown.
+        version_unknown=_version_unknown,
+        declared_version_source=_version_source,
     )
     transitive_deps = edgeset_to_bfs_deps(es, overrides_by_name)
     return candidate, transitive_deps, es
@@ -3079,24 +3605,31 @@ def _process_local_worker(
         is_overridden=False,  # Local deps are always literal paths; no override applies
         has_milpa_kdl=has_milpa_kdl,
         overrides_by_name=overrides_by_name,
+        version=dep.version,  # A3b: version= annotation fallback (step 4)
     )
     es = _resolve_edges_pure(
         dep.name, _URL_DEP_VERSION, ctx,
         dep_decl_source=DepDeclEdgeSource(env.dep_decl_store) if env.dep_decl_store is not None else None,
     )
 
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name, _URL_DEP_VERSION)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name)
     src_dir = es.src_dir
 
+    # Axis A (b)/D-A2: label with the fetched package's declared version
+    # (milpa.kdl → .nimble), else the sentinel (version-unknown stays as-is).
+    _candidate_version, _version_source, _version_unknown = _candidate_label(ctx)
     candidate = _Candidate(
         name=dep.name,
-        version=_URL_DEP_VERSION,
+        version=_candidate_version,
         identity=result.identity,
         src_dir=src_dir,
         dep_terms=dep_terms,
         requires_names=requires_names,
         provenance=_LocalDepProvenance(declared_path=declared_path_str),
         requires_predicates=requires_predicates,
+        # A4: no declared version found — version-unknown.
+        version_unknown=_version_unknown,
+        declared_version_source=_version_source,
     )
     transitive_deps = edgeset_to_bfs_deps(es, overrides_by_name)
     return candidate, transitive_deps, es
@@ -3485,7 +4018,20 @@ def _build_graph(
         _all_provs.extend(declared_records)
         all_provenances: tuple[ProvenanceRecord, ...] = tuple(_all_provs)
 
-        version_str = format_version_str(version)
+        # A5 (§5 NORMATIVE): a version-unknown candidate flattens to the
+        # absent-version literal "0.0.0" at the lockfile boundary — paired
+        # with declared_version_source=None, a combination no Known case
+        # ever produces (a Known always names its source). Scoped to
+        # non-registry candidates ONLY (`not cand.is_registry`): a named/
+        # index dep's real version comes straight from the index and never
+        # goes through declared_version_for, so it always keeps its real
+        # formatted version regardless of declared_version_source (which is
+        # simply never populated for that kind — out of Axis A's scope).
+        version_str = (
+            "0.0.0"
+            if (not cand.is_registry and cand.declared_version_source is None)
+            else format_version_str(version)
+        )
 
         # P3a (RFC per-entry-attestation.md §3, §5): the entry-trust gate —
         # post-solve, per selected registry-resolved dep. Runs BEFORE the
@@ -3589,6 +4135,14 @@ def _build_graph(
             # P3a: the entry's REAL index namespace, for milpa verify's
             # offline re-verification (only meaningful alongside attestation).
             registry_namespace=cand.registry_namespace if cand.is_registry else None,
+            # A5: sibling source for the declared version (None for
+            # version-unknown and for named/index candidates, which never
+            # populate it — see the field's doc comment on _Candidate).
+            declared_version_source=(
+                cand.declared_version_source.value
+                if cand.declared_version_source is not None
+                else None
+            ),
         )
         deps.append(resolved)
 
@@ -3604,18 +4158,29 @@ def _build_member_candidate(
     manifest: Manifest,
     abs_dir: Path,
     overrides_by_name: dict[str, Override],
-    members_by_name: frozenset[str],
+    member_versions: dict[str, Version],
+    member_version_sources: dict[str, VersionSource | None],
 ) -> tuple[_Candidate, list[object]]:
     """Build a _Candidate for a workspace member (never fetched, cas_admissible=False).
 
     Returns ``(_Candidate, [])`` — members have no external transitive deps to
     enqueue (their deps are seeded explicitly in resolve_workspace).
+
+    ``member_versions`` maps every workspace member's name to its own
+    candidate-label version (A2c: ``_member_candidate_version`` — the
+    member's declared ``milpa.kdl``/``.nimble`` version, else the sentinel),
+    precomputed once for ALL members by the caller so this function can
+    validate a same-name reference against the *referenced* member's real
+    version, not just its own.
     """
     identity = compute_content_hash(abs_dir)
 
     # Build solver terms from ALL member deps (regular + dev-deps, per §11).
-    # Member-named refs → sentinel version (in-tree candidate).
-    # Named deps that match a workspace member → sentinel (auto-coerce).
+    # Member-named refs and named deps matching a member name (auto-coerce)
+    # both get a full() self-term (D-A2: a member has exactly one candidate,
+    # like a git/url/local/tarball dep — justified by "one candidate, must
+    # satisfy floors", NOT by the fetched-kinds' pre-fetch/post-fetch
+    # causality argument, since a member has no fetch).
     dep_terms: list[Term] = []
     requires_names: list[str] = []
 
@@ -3623,32 +4188,38 @@ def _build_member_candidate(
 
     for dep in all_member_deps:
         name = dep.name
-        # Auto-coerce: MemberDep or named dep matching a member name → sentinel.
-        if isinstance(dep, MemberDep) or name in members_by_name:
-            # Breadth-P1c (S5): when a NamedDep auto-coerces to a member, check
-            # that the member's sentinel version satisfies the declared constraint.
-            # Silently discarding the constraint is a correctness hole — the
-            # consumer said ">= 2.0.0" but the member is at sentinel 0.0.1.
+        # Auto-coerce: MemberDep or named dep matching a member name → full().
+        if isinstance(dep, MemberDep) or name in member_versions:
+            # Breadth-P1c (S5) + A2c: when a NamedDep auto-coerces to a member,
+            # check that the member's OWN declared (or sentinel, if undeclared)
+            # version satisfies the declared constraint. Silently discarding
+            # the constraint is a correctness hole — the consumer said
+            # ">= 2.0.0" and the member must actually be at a version that
+            # satisfies it. This is a real semantic check, independent of the
+            # full() self-term below (which exists so PubGrub never
+            # pre-commits to a version label the one-candidate member might
+            # not carry — the check above is where real conflicts surface).
             if isinstance(dep, NamedDep) and dep.constraint_set is not None:
-                if not dep.constraint_set.contains(_URL_DEP_VERSION):
+                target_version = member_versions[name]
+                if not dep.constraint_set.contains(target_version):
                     raise MilpaError(
                         RES_WS_MEMBER_VERSION_CONSTRAINT,
                         f"named dep {name!r} auto-coerces to workspace member "
                         f"{name!r} but the declared constraint "
                         f"{dep.constraint!r} is not satisfied by the member's "
-                        f"sentinel version {_URL_DEP_VERSION} "
-                        f"(member deps carry version {_URL_DEP_VERSION}; "
+                        f"version {target_version} "
+                        f"(member {name!r} is at version {target_version}; "
                         f"declared constraint must match)",
                         dep=name,
                         constraint=dep.constraint,
                         member=manifest.name,
                     )
-            dep_terms.append(Term.require(name, VersionSet.eq(_URL_DEP_VERSION)))
+            dep_terms.append(Term.require(name, VersionSet.full()))
             requires_names.append(name)
             continue
-        # Override: named dep with override → URL at sentinel.
+        # Override: named dep with override → URL-like full() self-term (D-A2).
         if name in overrides_by_name:
-            dep_terms.append(Term.require(name, VersionSet.eq(_URL_DEP_VERSION)))
+            dep_terms.append(Term.require(name, VersionSet.full()))
             requires_names.append(name)
             continue
         # Regular dep: same logic as _dep_to_term.
@@ -3659,12 +4230,15 @@ def _build_member_candidate(
 
     return _Candidate(
         name=manifest.name,
-        version=_URL_DEP_VERSION,
+        version=member_versions[manifest.name],
         identity=identity,
         src_dir=manifest.src_dir or "",
         dep_terms=dep_terms,
         requires_names=requires_names,
         provenance=MemberProvenanceRecord(name=manifest.name),
+        # A5: sibling source for the member's own version label (D-A2's
+        # existing precomputed-once-for-all-members pattern, extended).
+        declared_version_source=member_version_sources[manifest.name],
     ), []
 
 
@@ -3740,6 +4314,23 @@ def resolve_workspace(
         m.manifest.name for m in workspace.members
     )
 
+    # A2c: each member's own candidate-label version, computed once up front
+    # so both the member's own candidate AND any other member's same-name
+    # auto-coerce reference (which needs the *referenced* member's real
+    # version, not its own) read the same value (§3 Axis A member block, D-A2).
+    # A5: also capture the sibling source per member (same precomputed-once
+    # call — no second, potentially file-re-reading, lookup).
+    _member_version_pairs: dict[str, tuple[Version, VersionSource | None]] = {
+        m.manifest.name: _member_candidate_version(m.manifest, m.abs_dir)
+        for m in workspace.members
+    }
+    member_versions: dict[str, Version] = {
+        name: v for name, (v, _src) in _member_version_pairs.items()
+    }
+    member_version_sources: dict[str, VersionSource | None] = {
+        name: src for name, (_v, src) in _member_version_pairs.items()
+    }
+
     # RES-WS-OVERRIDE-MEMBER-COLLISION: a non-member-target override name cannot
     # also be a member name.  MemberTarget overrides (pkg "X" { member "X" }) are
     # the INTENDED form of S8b patch and are explicitly exempted — they redirect a
@@ -3796,12 +4387,34 @@ def resolve_workspace(
     # ------------------------------------------------------------------
     # Build provider with workspace root authority
     # ------------------------------------------------------------------
-    # Root authority = all member names + override names (§10 NORMATIVE).
-    root_authority: set[str] = set(members_by_name) | set(overrides_by_name)
+    # RR2 (R6 dual-set cleanup): build the namespace-aware set ONCE
+    # (members + overrides + every member dep), then derive the bare-name
+    # authority set as a pure name-projection of it — replacing two
+    # independently hand-built + independently mutated collections with one
+    # populated collection + one projection.
+    #
+    # R6: namespace-aware set — used ONLY by is_root_direct (the
+    # lowest-direct precompute), never the provenance gate. Member names and
+    # overrides have no namespace concept; each member dep's ACTUAL namespace
+    # is threaded through the same way as the single-package resolve() path.
+    root_direct_keys: set[DepKey] = {DepKey(name=n) for n in members_by_name} | {
+        DepKey(name=n) for n in overrides_by_name
+    }
     for m in workspace.members:
         all_deps = list(m.manifest.deps) + list(m.manifest.dev_deps)
         for dep in all_deps:
-            root_authority.add(dep.name)
+            root_direct_keys.add(
+                DepKey(name=dep.name, namespace=getattr(dep, "namespace", None))
+            )
+
+    # Root authority = all member names + override names + every member dep's
+    # name (§10 NORMATIVE) — provably byte-identical to the old
+    # independently-built set: both are sourced from exactly
+    # `members_by_name` + `overrides_by_name` + every member's own
+    # deps/dev-deps names — the SAME sources — so projecting
+    # `root_direct_keys` down to just its `.name` field yields the exact
+    # same set of bare names.
+    root_authority: set[str] = {k.name for k in root_direct_keys}
 
     provenance_gate: dict[str, tuple[tuple[object, ...], bool]] = {}
     seen_url: set[tuple[str, str]] = set()
@@ -3841,6 +4454,7 @@ def resolve_workspace(
         params=params,
         overrides_by_name=overrides_by_name,
         root_authority=root_authority,
+        root_direct_keys=root_direct_keys,
         seen_named=seen_named,
         seen_url=seen_url,
         provenance_gate=provenance_gate,
@@ -3864,15 +4478,23 @@ def resolve_workspace(
         member_manifest = filter_manifest(member.manifest, _member_ctx)
 
         cand, _ = _build_member_candidate(
-            member_manifest, member.abs_dir, overrides_by_name, members_by_name
+            member_manifest,
+            member.abs_dir,
+            overrides_by_name,
+            member_versions,
+            member_version_sources,
         )
         provider.add(cand)
 
     # ------------------------------------------------------------------
     # Build root candidate requiring all members
     # ------------------------------------------------------------------
+    # A2c/D-A2: full() self-term — the root always requires all members
+    # regardless of their (real or sentinel) version label; a member has
+    # exactly one candidate, so pre-committing to a version here would
+    # spuriously conflict with a versioned member.
     root_terms: list[Term] = [
-        Term.require(m.manifest.name, VersionSet.eq(_URL_DEP_VERSION))
+        Term.require(m.manifest.name, VersionSet.full())
         for m in workspace.members
     ]
     root_requires: list[str] = [m.manifest.name for m in workspace.members]
@@ -3948,7 +4570,7 @@ def resolve_workspace(
                 ov = overrides_by_name[name]
                 # S8a: LocalTarget override → route to local BFS slot.
                 if isinstance(ov.target, LocalTarget):
-                    bfs_queue.append(("local", LocalDep(name=name, path=ov.target.path)))
+                    bfs_queue.append(("local", LocalDep(name=name, path=ov.target.path, version=ov.version)))
                     _ws_record_discovery(name)  # Phase B: overridden dep in seed order
                 elif isinstance(ov.target, MemberTarget):
                     # S8b: MemberTarget override — member already pre-registered.
@@ -4110,7 +4732,10 @@ def resolve_workspace(
             return
         seen_named.add(_dk_wt)
         _ws_record_discovery(_dk_wt.solver_var())  # Phase B: lazy-materialized named dep
-        _enumerate_named_stubs(_dk_wt, None, index, provider, deps_dir, env)
+        _enumerate_named_stubs(
+            _dk_wt, None, index, provider, deps_dir, env,
+            exclude_newer=params.exclude_newer,
+        )
 
     provider.set_transitive_callback(_on_transitive_named)
 
@@ -4147,6 +4772,8 @@ def resolve_workspace(
             Version(0, 0, 0),
             strategy=params.strategy,
         )
+    except VersionUnknownConstrained as exc:
+        raise _version_unknown_constrained_err(exc, root_authority) from exc
     except SolverError as exc:
         from milpa.errors import SOLVE_CONFLICT
         raise MilpaError(

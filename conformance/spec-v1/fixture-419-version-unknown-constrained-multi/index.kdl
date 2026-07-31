@@ -1,0 +1,44 @@
+// A4 multi-constrainer fixture. chronos and httputils each lazily discover
+// their own floor/ceiling on bearssl only once PubGrub materializes them
+// (Phase B) — neither is knowable at Phase A enumeration time.
+//
+// bearssl: a nimble `requires` line naming a bare package (no URL) is always
+// resolved through the index, even though bearssl is ALSO root-declared as a
+// git dep here (mirrors fixture-415/418's index-stub convention). This
+// stub's version (0.1.0) is below BOTH constrainers' ranges so it can never
+// satisfy either — the fixture's outcome depends entirely on A4's
+// classification of the real (version-unknown) git candidate.
+schema_version 1
+package "bearssl" {
+    version "0.1.0" {
+        content_hash "dag-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        provenance {
+            kind "git"
+            url "https://example.com/bearssl-index-only.git"
+            ref "v0.1.0"
+            commit_sha "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000"
+        }
+    }
+}
+package "chronos" {
+    version "1.0.0" {
+        content_hash "dag-sha256:d67791f79b0f357e40ab765a13184048684b4cd6b39bdd9f2defba72699eecc9"
+        provenance {
+            kind "git"
+            url "https://example.com/chronos.git"
+            ref "v1.0.0"
+            commit_sha "cccc2222cccc2222cccc2222cccc2222cccc2222"
+        }
+    }
+}
+package "httputils" {
+    version "1.0.0" {
+        content_hash "dag-sha256:fe03e7af13afab53f82b39e2383e5163748c426b39f8fe8caff69471d5fa28e2"
+        provenance {
+            kind "git"
+            url "https://example.com/httputils.git"
+            ref "v1.0.0"
+            commit_sha "dddd3333dddd3333dddd3333dddd3333dddd3333"
+        }
+    }
+}

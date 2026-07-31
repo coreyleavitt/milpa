@@ -1,0 +1,2 @@
+crisol -> <CAS_ROOT>/dag-sha256/9fe22a192fb367d2b43f8f78612d78704b6f97cc7f7576cc683aab2a9ffc4ede/
+httputils -> <CAS_ROOT>/dag-sha256/3bda8d8ad4d926c04b5e9eeb5576c2fe59dc5d950dc8489478a664ef5a9811db/

@@ -1,0 +1,5 @@
+name "libc"
+kind "library"
+deps {
+    httputils
+}

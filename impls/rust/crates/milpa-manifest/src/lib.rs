@@ -14,8 +14,8 @@ use std::collections::BTreeSet;
 
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 
-use milpa_solver::VersionSet;
-use milpa_types::Version;
+use milpa_solver::{parse_version, Strategy, VersionSet};
+use milpa_types::{parse_iso8601_timestamp, Timestamp, Version};
 
 pub mod format;
 pub mod nimble;
@@ -55,6 +55,11 @@ pub struct UrlDep {
     /// The parse-time desugar injects the auto-flag + gate predicate;
     /// `format_manifest` emits `optional=#true` instead of the gate.
     pub optional: bool,
+    /// A3b (§3 Axis A (b) step 4): a user-supplied declared-version
+    /// annotation, consulted by `declared_version_for` only when the fetched
+    /// package's own manifest/tag (steps 1-3) yield none. `None` when absent
+    /// (the common case).
+    pub version: Option<Version>,
 }
 
 /// A dep resolved through the tianguis index by name (grammar §3.2 NamedDep).
@@ -112,6 +117,8 @@ pub struct LocalDep {
     pub name: String,
     pub path: String,
     pub predicates: Vec<Predicate>,
+    /// A3b (§3 Axis A (b) step 4) — see `UrlDep::version` for the rationale.
+    pub version: Option<Version>,
 }
 
 /// A dep declared by tarball URL (grammar §3.2 TarballDep).
@@ -126,6 +133,8 @@ pub struct TarballDep {
     pub sha256: Option<String>,
     pub strip_components: u32,
     pub predicates: Vec<Predicate>,
+    /// A3b (§3 Axis A (b) step 4) — see `UrlDep::version` for the rationale.
+    pub version: Option<Version>,
 }
 
 /// A workspace-internal member reference (grammar §3.2 MemberDep).
@@ -204,6 +213,11 @@ pub enum OverrideTarget {
 pub struct Override {
     pub name: String,
     pub target: OverrideTarget,
+    /// A3b (§3 Axis A (b) step 4, D-A3): a `version=` annotation on the
+    /// override rule itself — orthogonal to `target` (label vs redirect).
+    /// When this override redirects a dep, the Axis-A precedence re-runs
+    /// against the override target's manifest; this is that target's step 4.
+    pub version: Option<Version>,
 }
 
 /// A cross-package flag-activation entry inside an `enables` node (S1 RFC #23 §3.1.1).
@@ -234,6 +248,25 @@ pub struct FlagDecl {
     pub conflicts: Vec<String>,
 }
 
+/// Manifest-level resolution policy (`resolution { }` block).
+///
+/// First appearance of this block (C3, rfc-resolution-semantics.md §3 Axis C
+/// / §5) carried only `strategy`; D1 (§3 Axis D) adds `exclude_newer` as a
+/// sibling field, no block-parser reshape needed. Root-only for a workspace
+/// (one shared lock, one resolution policy) — a member-level `resolution`
+/// block is reserved for rejection in a later slice (Axis D/W1), not built
+/// here.
+///
+/// `strategy`/`exclude_newer` are each `None` when the block was declared
+/// but did not name that child (or the block itself is absent — see
+/// `Manifest::resolution`/`Workspace::resolution`, both `None` when no
+/// `resolution { }` node was declared at all).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Resolution {
+    pub strategy: Option<Strategy>,
+    pub exclude_newer: Option<Timestamp>,
+}
+
 /// A parsed `milpa.kdl` package manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
@@ -248,6 +281,12 @@ pub struct Manifest {
     pub cas_dir: String,
     pub spec_version: i64,
     pub spec_version_explicit: bool,
+    /// A1 (rfc-resolution-semantics.md §3 Axis A (b) step 1): the package's own
+    /// declared release version, parsed from a top-level `version "x.y.z"`
+    /// node. `None` means no version declared (version-unknown) — not an
+    /// error. Distinct from `spec_version` (the manifest schema epoch) and
+    /// orthogonal to content-hash identity (spec/identity.md §4.1).
+    pub version: Option<Version>,
     /// S5: attestation policy from `attestation-policy "warn"|"strict"|"off"` (default: warn).
     /// S1 (RFC rfc-registry-trust-federation): renamed from `AttestationPolicy`;
     /// the user-facing "permissive" value is renamed to "warn" (pre-v1 breaking cutover).
@@ -296,6 +335,10 @@ pub struct Manifest {
     /// `format_manifest` skips these from the `flags {}` block (they're implied
     /// by `optional=#true` on the dep; serializing them would cause a re-parse clash).
     pub optional_auto_flags: std::collections::BTreeSet<String>,
+    /// C3 (rfc-resolution-semantics.md §3 Axis C / §5): manifest-level
+    /// resolution policy (`resolution { strategy "..." }`). `None` means no
+    /// `resolution { }` node was declared at all.
+    pub resolution: Option<Resolution>,
 }
 
 /// A parsed workspace-root `milpa.kdl` (grammar §7). Pure container: member
@@ -353,6 +396,10 @@ pub struct Workspace {
     /// `true` iff the source declared an `index-history` node (absent-stays-
     /// absent rule, mirrors `Manifest::index_history_policy_explicit`).
     pub index_history_policy_explicit: bool,
+    /// C3 (rfc-resolution-semantics.md §3 Axis C / §5, Axis W): root-only
+    /// resolution policy — see `Manifest::resolution` for the field's
+    /// semantics; identical here, just declared on the workspace root.
+    pub resolution: Option<Resolution>,
 }
 
 /// The two disjoint manifest roles (grammar §1). Detected by the presence of a
@@ -464,6 +511,7 @@ const MAN_CODES: &[&str] = &[
     "MAN-CAS-DIR-TYPE",
     "MAN-SPEC-VERSION-TYPE",
     "MAN-SPEC-VERSION-UNSUPPORTED",
+    "MAN-PACKAGE-VERSION-INVALID",
     "MAN-DEP-DUPLICATE",
     "MAN-DEP-NAME-INVALID",
     "MAN-DEP-OPTIONAL-FLAG-CLASH",
@@ -485,6 +533,7 @@ const MAN_CODES: &[&str] = &[
     "MAN-DEP-FLAG-TOO-MANY-ARGS",
     "MAN-DEP-FLAG-BOOL",
     "MAN-DEP-UNKNOWN-CHILD",
+    "MAN-DEP-VERSION-INVALID",
     "MAN-GIT-URL-NO-SCHEME",
     "MAN-GIT-URL-BAD-SCHEME",
     "MAN-OVERRIDE-KIND",
@@ -522,6 +571,9 @@ const MAN_CODES: &[&str] = &[
     "MAN-WORKSPACE-MEMBER-ARITY",
     "MAN-WORKSPACE-MEMBER-DUPLICATE",
     "MAN-WORKSPACE-UNKNOWN-TOP-LEVEL",
+    "MAN-RESOLUTION-BLOCK-INVALID",
+    "MAN-RESOLUTION-EXCLUDE-NEWER-INVALID",
+    "MAN-RESOLUTION-STRATEGY-INVALID",
 ];
 
 fn err(code: &'static str, message: impl Into<String>) -> ManifestError {
@@ -599,7 +651,7 @@ fn children(node: &KdlNode) -> Vec<&KdlNode> {
 }
 
 const PREDICATE_PROPS: &[&str] = &["platform", "arch", "nim", "milpa", "flag"];
-const URL_DEP_PROPS: &[&str] = &["git", "ref", "platform", "arch", "nim", "milpa", "flag", "optional"];
+const URL_DEP_PROPS: &[&str] = &["git", "ref", "platform", "arch", "nim", "milpa", "flag", "optional", "version"];
 const FLAG_DECL_PROPS: &[&str] = &["default", "description"];
 const VALID_KINDS: &[&str] = &["library", "application"];
 const VALID_GIT_SCHEMES: &[&str] = &["https", "http", "ssh", "git"];
@@ -614,6 +666,10 @@ const PACKAGE_TOP_LEVEL: &[&str] = &[
     "mirrors",
     "cas",
     "spec-version",
+    // A1 (rfc-resolution-semantics.md §3 Axis A / §5): the package's own
+    // declared release version — orthogonal to "spec-version" (the schema
+    // epoch). Absent = version-unknown (not an error).
+    "version",
     "attestation-policy",
     "index-trust",
     "index-trust-signer",
@@ -622,6 +678,10 @@ const PACKAGE_TOP_LEVEL: &[&str] = &[
     "entry-trust",
     // A3 (rfc-registry-append-only.md §2): the append-only consumer ratchet.
     "index-history",
+    // C3 (rfc-resolution-semantics.md §3 Axis C / §5): manifest-level
+    // resolution policy block. First appearance carries only `strategy`;
+    // Axis D's `exclude-newer` extends it in a later slice.
+    "resolution",
 ];
 const WORKSPACE_TOP_LEVEL: &[&str] = &[
     "workspace",
@@ -636,6 +696,11 @@ const WORKSPACE_TOP_LEVEL: &[&str] = &[
     "entry-trust",
     // A3: the append-only consumer ratchet, legal ONLY on the workspace root.
     "index-history",
+    // C3 (rfc-resolution-semantics.md §3 Axis C / §5, Axis W): manifest
+    // resolution policy — root-only for a workspace (one shared lock, one
+    // resolution policy). A member-level `resolution` block is reserved for
+    // rejection in a later slice (Axis D/W1).
+    "resolution",
 ];
 
 // ---------------------------------------------------------------------------
@@ -932,6 +997,9 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
     // A3 (rfc-registry-append-only.md §2): root-authority index-history field.
     let mut ws_index_history_policy = TrustPolicy::Warn;
     let mut ws_index_history_policy_explicit = false;
+    // C3 (rfc-resolution-semantics.md §3 Axis C / §5): root-only resolution
+    // policy block.
+    let mut ws_resolution: Option<Resolution> = None;
 
     for node in doc.nodes() {
         match node.name().value() {
@@ -967,6 +1035,11 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
                 // A3 (rfc-registry-append-only.md §2): root-authority policy.
                 ws_index_history_policy = parse_index_history_node(node)?;
                 ws_index_history_policy_explicit = true;
+            }
+            "resolution" => {
+                // C3 (rfc-resolution-semantics.md §3 Axis C / §5): root-only
+                // resolution policy block.
+                ws_resolution = Some(check_resolution_block(node)?);
             }
             "workspace" => {
                 for child in children(node) {
@@ -1051,6 +1124,7 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
         entry_trust_policy_explicit: ws_entry_trust_policy_explicit,
         index_history_policy: ws_index_history_policy,
         index_history_policy_explicit: ws_index_history_policy_explicit,
+        resolution: ws_resolution,
     })
 }
 
@@ -1188,6 +1262,8 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
     let mut cas_dir = String::new();
     let mut spec_version: i64 = 1;
     let mut spec_version_explicit = false;
+    // A1: top-level package `version` field (§3 Axis A (b) step 1).
+    let mut version: Option<Version> = None;
     let mut attestation_policy = TrustPolicy::Warn;
     let mut index_trust_policy = TrustPolicy::Warn;
     let mut index_trust_signer: Option<String> = None;
@@ -1199,6 +1275,8 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
     // A3 (rfc-registry-append-only.md §2): index-history node.
     let mut index_history_policy = TrustPolicy::Warn;
     let mut index_history_policy_explicit = false;
+    // C3 (rfc-resolution-semantics.md §3 Axis C / §5): resolution { } block.
+    let mut resolution: Option<Resolution> = None;
 
     // S5b: seen_names key is the solver variable (namespace::name or bare name),
     // so two qualified deps with the same bare name but different namespaces
@@ -1220,6 +1298,14 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
             "spec-version" => {
                 spec_version = check_spec_version(node)?;
                 spec_version_explicit = true;
+            }
+            "version" => {
+                // A1: the package's own declared release version, distinct
+                // from "spec-version" (the schema epoch). milpa.kdl is
+                // milpa's own strict manifest format, so a malformed value is
+                // a hard parse error — unlike the `.nimble` compat scanner,
+                // which falls through to version-unknown (totality contract).
+                version = Some(check_package_version(node)?);
             }
             "name" => {
                 if name.is_some() {
@@ -1374,6 +1460,11 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
                 index_history_policy = parse_index_history_node(node)?;
                 index_history_policy_explicit = true;
             }
+            "resolution" => {
+                // C3 (rfc-resolution-semantics.md §3 Axis C / §5): manifest
+                // resolution policy block.
+                resolution = Some(check_resolution_block(node)?);
+            }
             "workspace" => {
                 return Err(err(
                     "MAN-WORKSPACE-IN-PACKAGE",
@@ -1505,6 +1596,7 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
         cas_dir,
         spec_version,
         spec_version_explicit,
+        version,
         attestation_policy,
         index_trust_policy,
         index_trust_signer,
@@ -1515,6 +1607,7 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
         index_history_policy,
         index_history_policy_explicit,
         optional_auto_flags,
+        resolution,
     })
 }
 
@@ -1603,6 +1696,156 @@ fn check_spec_version(node: &KdlNode) -> Result<i64, ManifestError> {
         ));
     }
     Ok(epoch)
+}
+
+/// Parse a top-level `version "x.y.z"` node (A1 §3 Axis A (b) step 1).
+///
+/// `milpa.kdl` is milpa's own strict manifest format, so a malformed value is
+/// a hard parse error (`MAN-PACKAGE-VERSION-INVALID`) — unlike the `.nimble`
+/// compat adapter, which falls through to version-unknown for a malformed
+/// `version` (totality contract, `nimble.rs`). Reuses `milpa_solver::parse_version`,
+/// the single source of truth for the semver grammar — no parallel parser.
+fn check_package_version(node: &KdlNode) -> Result<Version, ManifestError> {
+    let a = args(node);
+    let val = a.first().and_then(|e| e.value().as_string());
+    if a.len() != 1 || val.is_none() {
+        return Err(err(
+            "MAN-PACKAGE-VERSION-INVALID",
+            "'version' takes exactly one positional string argument (e.g. \"1.2.3\")",
+        ));
+    }
+    let raw = val.unwrap();
+    parse_version(raw).ok_or_else(|| {
+        err(
+            "MAN-PACKAGE-VERSION-INVALID",
+            format!("'version' value {raw:?} is not a valid semver version (expected 'x.y.z')"),
+        )
+    })
+}
+
+/// Recognized children of a `resolution { }` block (C3 §3 Axis C / D1 §3
+/// Axis D / §5).
+const RESOLUTION_KNOWN_CHILDREN: &[&str] = &["strategy", "exclude-newer"];
+
+/// Parse a `strategy "<value>"` child of a `resolution { }` block.
+///
+/// Malformed arity/type or an unrecognized wire value is a hard parse error
+/// (`MAN-RESOLUTION-STRATEGY-INVALID`) — mirrors `check_package_version`'s
+/// strictness (`milpa.kdl` is milpa's own strict format).
+fn check_resolution_strategy(node: &KdlNode) -> Result<Strategy, ManifestError> {
+    let a = args(node);
+    let val = a.first().and_then(|e| e.value().as_string());
+    if a.len() != 1 || val.is_none() {
+        return Err(err(
+            "MAN-RESOLUTION-STRATEGY-INVALID",
+            "'resolution.strategy' takes exactly one positional string argument \
+             ('maxver', 'minver', 'semver', or 'lowest-direct')",
+        ));
+    }
+    let raw = val.unwrap();
+    Strategy::parse(raw).ok_or_else(|| {
+        err(
+            "MAN-RESOLUTION-STRATEGY-INVALID",
+            format!(
+                "'resolution.strategy' value {raw:?} is not a recognized strategy \
+                 (expected 'maxver', 'minver', 'semver', or 'lowest-direct')"
+            ),
+        )
+    })
+}
+
+/// Parse an `exclude-newer "<ts>"` child of a `resolution { }` block.
+///
+/// Malformed arity/type or an unparseable ISO 8601 timestamp is a hard
+/// parse error (`MAN-RESOLUTION-EXCLUDE-NEWER-INVALID`) — mirrors
+/// `check_resolution_strategy`'s strictness. Reuses the shared
+/// `milpa_types::parse_iso8601_timestamp` (D0) rather than a second parser.
+fn check_resolution_exclude_newer(node: &KdlNode) -> Result<Timestamp, ManifestError> {
+    let a = args(node);
+    let val = a.first().and_then(|e| e.value().as_string());
+    if a.len() != 1 || val.is_none() {
+        return Err(err(
+            "MAN-RESOLUTION-EXCLUDE-NEWER-INVALID",
+            "'resolution.exclude-newer' takes exactly one positional string argument \
+             (an ISO 8601 timestamp)",
+        ));
+    }
+    let raw = val.unwrap();
+    parse_iso8601_timestamp(raw).ok_or_else(|| {
+        err(
+            "MAN-RESOLUTION-EXCLUDE-NEWER-INVALID",
+            format!(
+                "'resolution.exclude-newer' value {raw:?} is not a parseable ISO 8601 timestamp"
+            ),
+        )
+    })
+}
+
+/// Parse a `resolution { }` block (C3 §3 Axis C / D1 §3 Axis D / §5).
+///
+/// Unknown child node, or a duplicate `strategy`/`exclude-newer` child, is a
+/// hard parse error (`MAN-RESOLUTION-BLOCK-INVALID`) — a single clear
+/// failure mode for "this block is malformed", distinct from a malformed
+/// VALUE inside a recognized child (`MAN-RESOLUTION-STRATEGY-INVALID` /
+/// `MAN-RESOLUTION-EXCLUDE-NEWER-INVALID`).
+fn check_resolution_block(node: &KdlNode) -> Result<Resolution, ManifestError> {
+    let mut strategy: Option<Strategy> = None;
+    let mut exclude_newer: Option<Timestamp> = None;
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for child in children(node) {
+        let child_nm = child.name().value();
+        if !RESOLUTION_KNOWN_CHILDREN.contains(&child_nm) || seen.contains(child_nm) {
+            return Err(err(
+                "MAN-RESOLUTION-BLOCK-INVALID",
+                format!(
+                    "unknown or duplicate node {child_nm:?} in 'resolution' block \
+                     (allowed: {}, each at most once)",
+                    RESOLUTION_KNOWN_CHILDREN.join(", ")
+                ),
+            ));
+        }
+        seen.insert(child_nm);
+        match child_nm {
+            "strategy" => strategy = Some(check_resolution_strategy(child)?),
+            "exclude-newer" => exclude_newer = Some(check_resolution_exclude_newer(child)?),
+            _ => unreachable!("guarded by RESOLUTION_KNOWN_CHILDREN above"),
+        }
+    }
+    Ok(Resolution {
+        strategy,
+        exclude_newer,
+    })
+}
+
+/// Parse an optional `version=` property (A3b §3 Axis A (b) step 4).
+///
+/// Valid on git/url/local/tarball dep declarations and on `overrides { pkg
+/// … version= }` rules (§5 grammar; D-A3) — every call site passes its own
+/// `context` string for the error message (e.g. `dep "foo"` or `override for
+/// "foo"`). Absent → `None` (steps 1-3 already tried by
+/// `declared_version_for`; the annotation is a last-resort escape hatch).
+///
+/// `milpa.kdl` is milpa's own strict manifest format, so a malformed value is
+/// a hard parse error (`MAN-DEP-VERSION-INVALID`) — same rationale as
+/// `check_package_version`'s `MAN-PACKAGE-VERSION-INVALID`, reusing the same
+/// `parse_version` (single source of truth for the semver grammar).
+fn parse_dep_version_prop(node: &KdlNode, context: &str) -> Result<Option<Version>, ManifestError> {
+    let Some(entry) = prop(node, "version") else {
+        return Ok(None);
+    };
+    let Some(raw) = entry.value().as_string() else {
+        return Err(err(
+            "MAN-DEP-VERSION-INVALID",
+            format!("{context}: 'version=' must be a string"),
+        ));
+    };
+    match parse_version(raw) {
+        Some(v) => Ok(Some(v)),
+        None => Err(err(
+            "MAN-DEP-VERSION-INVALID",
+            format!("{context}: 'version=' value {raw:?} is not a valid semver version (expected 'x.y.z')"),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1798,6 +2041,9 @@ fn parse_url_dep_inner(node: &KdlNode, dep_nm: &str) -> Result<UrlDep, ManifestE
         },
     };
 
+    // A3b: version= annotation (§3 Axis A (b) step 4).
+    let version = parse_dep_version_prop(node, &format!("dep {name:?}"))?;
+
     Ok(UrlDep {
         name,
         git,
@@ -1806,6 +2052,7 @@ fn parse_url_dep_inner(node: &KdlNode, dep_nm: &str) -> Result<UrlDep, ManifestE
         predicates,
         flag_requests,
         optional,
+        version,
     })
 }
 
@@ -1892,7 +2139,7 @@ fn parse_local_dep_inner(node: &KdlNode, dep_nm: &str) -> Result<LocalDep, Manif
     let name = dep_nm.to_string();
     let extra: Vec<&str> = prop_names(node)
         .into_iter()
-        .filter(|p| *p != "local")
+        .filter(|p| *p != "local" && *p != "version")
         .collect();
     if !extra.is_empty() {
         return Err(err(
@@ -1900,11 +2147,14 @@ fn parse_local_dep_inner(node: &KdlNode, dep_nm: &str) -> Result<LocalDep, Manif
             format!("dep {name:?}: unknown property/properties {extra:?} on a local dep"),
         ));
     }
+    // A3b: version= annotation (§3 Axis A (b) step 4).
+    let version = parse_dep_version_prop(node, &format!("dep {name:?}"))?;
     match prop(node, "local").unwrap().value().as_string() {
         Some(p) if !p.is_empty() => Ok(LocalDep {
             name,
             path: p.to_string(),
             predicates: vec![], // Populated by expand_dep_child from when-block.
+            version,
         }),
         _ => Err(err(
             "MAN-DEP-LOCAL-PATH",
@@ -1923,7 +2173,7 @@ fn parse_tarball_dep(node: &KdlNode) -> Result<TarballDep, ManifestError> {
 
 fn parse_tarball_dep_inner(node: &KdlNode, dep_nm: &str) -> Result<TarballDep, ManifestError> {
     let name = dep_nm.to_string();
-    let allowed = ["tarball", "sha256", "strip_components"];
+    let allowed = ["tarball", "sha256", "strip_components", "version"];
     let extra: Vec<&str> = prop_names(node)
         .into_iter()
         .filter(|p| !allowed.contains(p))
@@ -1974,12 +2224,15 @@ fn parse_tarball_dep_inner(node: &KdlNode, dep_nm: &str) -> Result<TarballDep, M
             }
         },
     };
+    // A3b: version= annotation (§3 Axis A (b) step 4).
+    let version = parse_dep_version_prop(node, &format!("dep {name:?}"))?;
     Ok(TarballDep {
         name,
         url,
         sha256,
         strip_components,
         predicates: vec![], // Populated by expand_dep_child from when-block.
+        version,
     })
 }
 
@@ -2502,7 +2755,9 @@ fn parse_flag_decl(node: &KdlNode) -> Result<FlagDecl, ManifestError> {
 }
 
 /// Known property keys on a `pkg` override node across all target forms.
-const OVERRIDE_KNOWN_PROPS: &[&str] = &["git", "ref", "local"];
+/// A3b: `version` is valid on every target form (D-A3 — orthogonal to which
+/// redirect form is chosen; labels that target's step 4).
+const OVERRIDE_KNOWN_PROPS: &[&str] = &["git", "ref", "local", "version"];
 
 fn parse_override(node: &KdlNode) -> Result<Override, ManifestError> {
     if node.name().value() != "pkg" {
@@ -2618,7 +2873,11 @@ fn parse_override(node: &KdlNode) -> Result<Override, ManifestError> {
         OverrideTarget::Member { member_name }
     };
 
-    Ok(Override { name, target })
+    // A3b: version= annotation on the override rule (§3 Axis A (b) step 4,
+    // D-A3) — valid regardless of which target form was selected above.
+    let version = parse_dep_version_prop(node, &format!("override for {name:?}"))?;
+
+    Ok(Override { name, target, version })
 }
 
 // ---------------------------------------------------------------------------

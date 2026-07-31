@@ -1,0 +1,20 @@
+// fixture-442 (rfc-resolution-semantics.md §3 Axis W — W1): Axis D folded
+// into a workspace, SUCCESS side — a `resolution { }` block declared on
+// the WORKSPACE ROOT is legal and applies as the effective policy for the
+// WHOLE workspace resolve, not just the root package itself.
+//
+// member-a and member-b each require a DIFFERENT named/index dep
+// (widget-a / widget-b) that offers three versions (1.0.0/1.5.0/2.0.0).
+// With no `resolution` block the default `maxver` strategy would pick
+// 2.0.0 for both. Both resolve to 1.0.0 here — proving the root's
+// `resolution { strategy "minver" }` is genuinely the effective policy
+// for EVERY member's resolve, not merely parsed-and-ignored. See
+// fixture-443 for the companion member-scope REJECTION (a member may not
+// declare its own `resolution { }` block).
+resolution {
+    strategy "minver"
+}
+workspace {
+    member "member-a"
+    member "member-b"
+}

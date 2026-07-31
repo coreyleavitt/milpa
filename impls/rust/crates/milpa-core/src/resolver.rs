@@ -30,9 +30,9 @@ use std::path::{Path, PathBuf};
 use milpa_manifest::{Dep, LocalDep, Manifest, Override, OverrideTarget, Predicate, Profile, TarballDep, UrlDep};
 use milpa_solver::{
     parse_version, solve, solve_with_refutation, vs_to_constraint_str, Dep as SolverDep,
-    PackageProvider, RefutationEntry, Strategy, VersionSet,
+    PackageProvider, RefutationEntry, SolverError, Strategy, VersionSet, VersionSource,
 };
-use milpa_types::{DepKey, EdgeSet, EntryAttestation, FlagRequest, Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph, Version};
+use milpa_types::{DepKey, EdgeSet, EntryAttestation, FlagRequest, Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph, Timestamp, Version, format_iso8601_timestamp};
 
 use crate::edge_sources::{
     dep_passes_flag_predicates, resolve_edges, DepDeclEdgeSource,
@@ -43,7 +43,7 @@ use crate::fetch::{FetchError, FetcherRegistry, Receipt};
 use crate::frozen::rebuild_deps_view;
 use crate::identity::compute_content_hash;
 use crate::lockfile::cond_require_sort_key;
-use crate::registry::{Index, IndexVersion};
+use crate::registry::{filter_by_exclude_newer, Index, IndexVersion};
 use crate::store::CaStore;
 use crate::workspace::LoadedWorkspace;
 
@@ -87,15 +87,20 @@ pub fn resolve(
     profile: Option<&Profile>,
     prior: Option<&Lockfile>,
     strategy: Strategy,
+    // R9 (resolver-semantics RFC §3 Axis C NORMATIVE / D-C2): whether
+    // `strategy` was EXPLICITLY sourced (CLI or manifest), as opposed to
+    // default-filled. See `ResolveProvider::strategy_explicit`'s doc.
+    strategy_explicit: bool,
     deps_dir: &Path,
     dep_decl_store: Option<&dyn crate::dep_decl_store::DepDeclStore>,
     require_attested_metadata: bool,
     store: &CaStore,
 ) -> Result<ResolvedGraph, MilpaError> {
     resolve_with_features(
-        manifest, index, fetcher, profile, prior, strategy, deps_dir,
+        manifest, index, fetcher, profile, prior, strategy, strategy_explicit, deps_dir,
         dep_decl_store, require_attested_metadata, store,
         &std::collections::BTreeSet::new(), false, false,
+        None,
         None,
     )
 }
@@ -113,6 +118,8 @@ pub fn resolve_with_features(
     profile: Option<&Profile>,
     prior: Option<&Lockfile>,
     strategy: Strategy,
+    // R9: see `resolve`'s doc comment.
+    strategy_explicit: bool,
     deps_dir: &Path,
     dep_decl_store: Option<&dyn crate::dep_decl_store::DepDeclStore>,
     require_attested_metadata: bool,
@@ -123,6 +130,12 @@ pub fn resolve_with_features(
     // P3a (RFC per-entry-attestation.md §3): entry-trust gate config; `None`
     // disables the gate entirely.
     entry_trust: Option<&crate::entry_trust::EntryTrustConfig>,
+    // D2 (resolution-semantics RFC §3 Axis D): the EFFECTIVE exclude-newer
+    // time-bound this resolve is running under (already resolved by the CLI
+    // layer's precedence chain — CLI `--exclude-newer` > manifest
+    // `resolution { exclude-newer }` > `None`). Stored on `ResolveProvider`
+    // (mirrors `strategy`) — unused for now, D3/D4 read it.
+    exclude_newer: Option<Timestamp>,
 ) -> Result<ResolvedGraph, MilpaError> {
     // S9 (RFC #23 §3.4): compute root CLI active-flag seed when any CLI
     // feature-selection is present. Mirrors Python's _compute_root_active_seed.
@@ -251,7 +264,7 @@ pub fn resolve_with_features(
         index,
         fetcher,
         deps_dir,
-        ProviderOpts { prior, dep_decl_store, require_attested_metadata },
+        ProviderOpts { prior, dep_decl_store, require_attested_metadata, strategy, strategy_explicit, exclude_newer },
         &empty_index,
     )?;
 
@@ -298,7 +311,17 @@ pub fn resolve_with_features(
     let canonical_aliases = provider.finalize();
 
     // Solve over the materialized + stubbed candidate universe.
-    let solution = solve(&provider, ROOT, root_version(), strategy)?;
+    let solution = match solve(&provider, ROOT, root_version(), strategy) {
+        Ok(s) => s,
+        Err(SolverError::VersionUnknownConstrained { package, constrainers }) => {
+            return Err(version_unknown_constrained_err(
+                &package,
+                &constrainers,
+                &provider.root_authority,
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     // A lazy fetch failure during solve is captured (the provider's queries are
     // infallible); surface it in preference to any downstream solver outcome.
@@ -381,6 +404,7 @@ pub(crate) fn resolve_default_strategy(
         profile,
         prior,
         Strategy::default(),
+        false, // strategy_explicit: this scaffold trait has no CLI/manifest strategy input
         deps_dir,
         None, // dep_decl_store: None (trait path, no dep-decl support)
         false, // require_attested_metadata: false (trait path, no S5 flag)
@@ -615,6 +639,8 @@ pub fn resolve_workspace_with_features(
     profile: Option<&Profile>,
     prior: Option<&Lockfile>,
     strategy: Strategy,
+    // R9: see `resolve`'s doc comment.
+    strategy_explicit: bool,
     deps_dir: &Path,
     require_attested_metadata: bool,
     store: &CaStore,
@@ -624,6 +650,10 @@ pub fn resolve_workspace_with_features(
     // P3a (RFC per-entry-attestation.md §3): entry-trust gate config; `None`
     // disables the gate entirely.
     entry_trust: Option<&crate::entry_trust::EntryTrustConfig>,
+    // D2 (resolution-semantics RFC §3 Axis D): the EFFECTIVE exclude-newer
+    // time-bound this resolve is running under. See `resolve_with_features`'s
+    // doc comment.
+    exclude_newer: Option<Timestamp>,
 ) -> Result<ResolvedGraph, MilpaError> {
     // Compute workspace-root cli_seed (mirrors resolve_with_features logic).
     use std::collections::HashSet;
@@ -664,8 +694,9 @@ pub fn resolve_workspace_with_features(
     };
 
     resolve_workspace_inner(
-        workspace, index, fetcher, profile, prior, strategy, deps_dir,
+        workspace, index, fetcher, profile, prior, strategy, strategy_explicit, deps_dir,
         require_attested_metadata, store, ws_cli_seed.as_ref(), entry_trust,
+        exclude_newer,
     )
 }
 
@@ -680,15 +711,18 @@ pub fn resolve_workspace(
     profile: Option<&Profile>,
     prior: Option<&Lockfile>,
     strategy: Strategy,
+    // R9: see `resolve`'s doc comment.
+    strategy_explicit: bool,
     deps_dir: &Path,
     require_attested_metadata: bool,
     store: &CaStore,
 ) -> Result<ResolvedGraph, MilpaError> {
     resolve_workspace_inner(
-        workspace, index, fetcher, profile, prior, strategy, deps_dir,
+        workspace, index, fetcher, profile, prior, strategy, strategy_explicit, deps_dir,
         require_attested_metadata, store,
         None, // ws_cli_seed: no feature selection inputs
         None, // entry_trust: gate disabled (backward-compat wrapper)
+        None, // exclude_newer: no time bound (backward-compat wrapper)
     )
 }
 
@@ -713,6 +747,8 @@ pub fn resolve_workspace_with_cert(
     profile: Option<&Profile>,
     prior: Option<&Lockfile>,
     strategy: Strategy,
+    // R9: see `resolve`'s doc comment.
+    strategy_explicit: bool,
     deps_dir: &Path,
     require_attested_metadata: bool,
     store: &CaStore,
@@ -722,6 +758,10 @@ pub fn resolve_workspace_with_cert(
     // P3a (RFC per-entry-attestation.md §3): entry-trust gate config; `None`
     // disables the gate entirely.
     entry_trust: Option<&crate::entry_trust::EntryTrustConfig>,
+    // D2 (resolution-semantics RFC §3 Axis D): the EFFECTIVE exclude-newer
+    // time-bound this resolve is running under. See `resolve_with_features`'s
+    // doc comment.
+    exclude_newer: Option<Timestamp>,
 ) -> Result<(ResolvedGraph, SuccessCert), (MilpaError, FailureCert)> {
     // Macro: wrap a plain MilpaError in the cert-failure pair with an empty
     // FailureCert (the cert only carries meaning for SOLVE-CONFLICT).
@@ -853,6 +893,9 @@ pub fn resolve_workspace_with_cert(
         prior,
         None,
         ws_is_strict,
+        strategy,
+        strategy_explicit,
+        exclude_newer,
     );
 
     match provider.seed_workspace(workspace, profile, ws_cli_seed.as_ref()) {
@@ -880,6 +923,16 @@ pub fn resolve_workspace_with_cert(
             rebuild_deps_view(&graph, deps_dir, store);
             Ok((graph, cert))
         }
+        // A4: not a SOLVE-CONFLICT — build the root-authority-aware
+        // RES-VERSION-UNKNOWN-CONSTRAINED directly (never MilpaError::Solver),
+        // with an empty FailureCert (mirrors every other non-solver failure).
+        Err((SolverError::VersionUnknownConstrained { package, constrainers }, _)) => {
+            lift_err!(version_unknown_constrained_err(
+                &package,
+                &constrainers,
+                &provider.root_authority,
+            ));
+        }
         Err((solver_err, refutation)) => {
             let message = solver_err.to_string();
             Err((
@@ -904,11 +957,17 @@ fn resolve_workspace_inner(
     profile: Option<&Profile>,
     prior: Option<&Lockfile>,
     strategy: Strategy,
+    // R9: see `resolve`'s doc comment.
+    strategy_explicit: bool,
     deps_dir: &Path,
     require_attested_metadata: bool,
     store: &CaStore,
     ws_cli_seed: Option<&std::collections::HashSet<String>>,
     entry_trust: Option<&crate::entry_trust::EntryTrustConfig>,
+    // D2 (resolution-semantics RFC §3 Axis D): the EFFECTIVE exclude-newer
+    // time-bound this resolve is running under. See `resolve_with_features`'s
+    // doc comment.
+    exclude_newer: Option<Timestamp>,
 ) -> Result<ResolvedGraph, MilpaError> {
     let overrides: BTreeMap<String, Override> = workspace
         .overrides
@@ -1005,6 +1064,9 @@ fn resolve_workspace_inner(
         prior,
         None, // dep_decl_store: workspace path does not support DepDecl (S3b not yet wired for workspace)
         ws_is_strict,
+        strategy,
+        strategy_explicit,
+        exclude_newer,
     );
     let queue = provider.seed_workspace(workspace, profile, ws_cli_seed)?;
     provider.process_items(queue)?;
@@ -1013,7 +1075,17 @@ fn resolve_workspace_inner(
     // S4c post-fixpoint flag-conflict validation (same algorithm as single-package).
     provider.check_s4c_flag_conflicts(deps_dir)?;
     let canonical_aliases_ws = provider.finalize();
-    let solution = solve(&provider, ROOT, root_version(), strategy)?;
+    let solution = match solve(&provider, ROOT, root_version(), strategy) {
+        Ok(s) => s,
+        Err(SolverError::VersionUnknownConstrained { package, constrainers }) => {
+            return Err(version_unknown_constrained_err(
+                &package,
+                &constrainers,
+                &provider.root_authority,
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
     if let Some(e) = provider.take_error() {
         return Err(e);
     }
@@ -1126,6 +1198,17 @@ struct Extracted {
     /// A dep appearing in ≥2 `when` branches yields ≥2 inner `Vec<Predicate>`
     /// entries (C1 fix — accumulate, not overwrite).
     requires_predicates: std::collections::BTreeMap<String, Vec<Vec<milpa_types::Predicate>>>,
+    /// Axis A (b)/D-A2: the fetched package's own declared version, full
+    /// precedence steps 1-4 (`declared_version_for`: `milpa.kdl version` /
+    /// `.nimble version` / git tag (A3) / `version=` annotation (A3b)).
+    /// `None` when no step matched — the candidate then keeps the
+    /// `url_dep_version()` sentinel label.
+    declared_version: Option<Version>,
+    /// A5 (resolver-semantics RFC §3 Axis A (b) / §5): the sibling field to
+    /// `declared_version` — WHICH precedence step produced it. `None` iff
+    /// `declared_version` is `None` (version-unknown); set from the SAME
+    /// `declared_version_for` call as `declared_version` (no second lookup).
+    declared_version_source: Option<VersionSource>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1173,6 +1256,29 @@ struct Candidate {
     /// P3a: the entry's REAL index namespace (`registry::IndexVersion::namespace`),
     /// populated for registry candidates only. Empty string otherwise.
     registry_namespace: String,
+    /// A4 (resolver-semantics RFC §3 Axis A (c)): `true` iff this candidate's
+    /// `version` is the sentinel purely because no declared version was found
+    /// (`Extracted.declared_version.is_none()`) — NOT a value-equality check
+    /// against the sentinel, since a real declared version could coincidentally
+    /// equal it. Drives the decision-priority + hard-error partition via
+    /// `ResolveProvider::is_version_unknown`. Always `false` for the
+    /// synthetic root and named/index candidates (always a real version) and,
+    /// deliberately, for workspace members too: a member's own solver term is
+    /// unconditionally `full()` (A2c), so no real PubGrub constraint can ever
+    /// reach it — applying the last-scheduling rule to members would only
+    /// reorder when their transitive deps are discovered, with no hard-error
+    /// path to gain, so A4 scopes the mechanism to the git/url/local/tarball
+    /// candidates it actually protects.
+    version_unknown: bool,
+    /// A5 (resolver-semantics RFC §3 Axis A (b) / §5): the sibling field to
+    /// `version` — WHICH precedence step (manifest/nimble/tag/annotation)
+    /// produced it. `None` for a version-unknown candidate and for the
+    /// synthetic root/named-index candidates (out of Axis A's scope — a
+    /// named dep's version comes straight from the index, never through the
+    /// 4-step precedence). Never merged into `version` itself (two sibling
+    /// fields, not a sum type — identity ⊥ provenance discipline applied to
+    /// version ⊥ source).
+    declared_version_source: Option<VersionSource>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1236,6 +1342,15 @@ struct ResolveProvider<'a> {
     overrides: BTreeMap<String, Override>,
     prior: Option<&'a Lockfile>,
     root_authority: BTreeSet<String>,
+    /// R6: namespace-aware authority set — used ONLY by `is_root_direct` (the
+    /// C2/C3 lowest-direct precompute + bypass scoping), NEVER the
+    /// bare-name `root_authority` above (which stays as-is for the
+    /// provenance gate — a separate concern, #193, out of scope here). Each
+    /// root dep's ACTUAL namespace is threaded through (only `Dep::Named`
+    /// carries one; every other dep kind and every override contributes a
+    /// bare `DepKey` — same `None`/absent namespace `DepKey::from_solver_var`
+    /// decomposes their solver var into).
+    root_direct_keys: BTreeSet<DepKey>,
     /// Workspace member names — pre-registered candidates that are never fetched
     /// and never index-resolved (a member-named transitive dep is satisfied by
     /// the in-tree member). Empty in single-package mode.
@@ -1266,6 +1381,15 @@ struct ResolveProvider<'a> {
     /// first enqueued (root deps in declaration order, then transitives in first-
     /// occurrence order). Used by `finalize()` to pick the canonical name in each
     /// dedup group (earliest-discovered wins over lex-min).
+    ///
+    /// L13 (RR3 cross-reference): this field has a SECOND consumer —
+    /// `declaration_order()` below backs the solver's own decision-priority
+    /// tie-break (R3, resolver-semantics RFC §4.2.1 NORMATIVE) directly off
+    /// this same `Vec`. A change here motivated purely by dedup canonicalization
+    /// (e.g. reordering when names are pushed, or swapping to a different
+    /// discovery strategy) will ALSO silently perturb solve order — the two
+    /// concerns are coupled through this one field. See the matching note at
+    /// `declaration_order()`.
     discovery_order: RefCell<Vec<String>>,
 
     error: RefCell<Option<MilpaError>>,
@@ -1295,6 +1419,32 @@ struct ResolveProvider<'a> {
     /// after pre-seeding each member's default-active flags into `dep_active_flags`.
     /// Empty in single-package mode.
     member_manifests: RefCell<BTreeMap<String, milpa_manifest::Manifest>>,
+
+    /// C3 (resolver-semantics RFC §3 Axis C / D-C2): the effective strategy
+    /// this resolve is running under (see `ResolveProvider::new`'s doc
+    /// comment). Used only by `preference`'s value-divergence bypass gate —
+    /// never threaded into the picker itself (`solve`'s own `strategy`
+    /// argument, passed separately, remains the sole input there).
+    strategy: Strategy,
+
+    /// R9 (resolver-semantics RFC §3 Axis C NORMATIVE / D-C2): whether
+    /// `strategy` above was EXPLICITLY sourced (CLI `--strategy` or
+    /// manifest `resolution { strategy }`), as opposed to default-filled.
+    /// Gates `bypasses_lock_preference` together with value-divergence —
+    /// the lockfile-recorded strategy is diagnostic/frozen-parity only,
+    /// never a live input, so a merely default-filled `strategy` must
+    /// never bypass B2's lock-preference even when it numerically differs
+    /// from the lock's recorded value.
+    strategy_explicit: bool,
+
+    /// D2 (resolution-semantics RFC §3 Axis D): the EFFECTIVE exclude-newer
+    /// time-bound this resolve is running under (already resolved by the
+    /// CLI layer's precedence chain — CLI `--exclude-newer` > manifest
+    /// `resolution { exclude-newer }` > `None`). Mirrors `strategy`'s
+    /// placement exactly. D3 (`process_named`) reads it to filter index
+    /// candidates by `published_at`; D4 (git pinned-ref committer-date
+    /// validation) is a later slice.
+    exclude_newer: Option<Timestamp>,
 }
 
 /// The cross-name gate's verdict for an item (§10).
@@ -1314,6 +1464,20 @@ impl<'a> ResolveProvider<'a> {
         prior: Option<&'a Lockfile>,
         dep_decl_store: Option<&'a dyn crate::dep_decl_store::DepDeclStore>,
         strict_attestation: bool,
+        // C3 (resolver-semantics RFC §3 Axis C / D-C2): the EFFECTIVE
+        // strategy this resolve is running under (already resolved by the
+        // CLI layer's precedence chain — CLI > manifest > default). Stored
+        // so `preference()` can compare it against `prior.strategy` for the
+        // value-divergence bypass gate.
+        strategy: Strategy,
+        // R9: whether `strategy` above was EXPLICITLY sourced (CLI or
+        // manifest), as opposed to default-filled. See the field doc on
+        // `ResolveProvider::strategy_explicit`.
+        strategy_explicit: bool,
+        // D2 (resolution-semantics RFC §3 Axis D): the EFFECTIVE exclude-newer
+        // time-bound this resolve is running under (already resolved by the
+        // CLI layer's precedence chain). Stored — unused for now, D3/D4 read it.
+        exclude_newer: Option<Timestamp>,
     ) -> Self {
         let project_root = deps_dir
             .parent()
@@ -1327,6 +1491,7 @@ impl<'a> ResolveProvider<'a> {
             overrides,
             prior,
             root_authority: BTreeSet::new(),
+            root_direct_keys: BTreeSet::new(),
             member_names: BTreeSet::new(),
             candidates: RefCell::new(BTreeMap::new()),
             stubs: RefCell::new(BTreeMap::new()),
@@ -1343,7 +1508,63 @@ impl<'a> ResolveProvider<'a> {
             flag_requests_by_name: RefCell::new(BTreeMap::new()),
             dep_active_flags: RefCell::new(BTreeMap::new()),
             member_manifests: RefCell::new(BTreeMap::new()),
+            strategy,
+            strategy_explicit,
+            exclude_newer,
         }
+    }
+
+    /// C3/R9 (resolver-semantics RFC §3 Axis C, D-C2): whether B2's
+    /// lock-preference is BYPASSED for `package`.
+    ///
+    /// The bypass requires BOTH of:
+    ///
+    /// 1. `self.strategy_explicit` — the effective strategy this resolve is
+    ///    running under was EXPLICITLY sourced (CLI `--strategy` or manifest
+    ///    `resolution { strategy }`), never merely default-filled. R9 (§3
+    ///    Axis C NORMATIVE: the lockfile-recorded strategy is
+    ///    "diagnostic/frozen-parity only, never a live input"): a bare
+    ///    resolve with no CLI flag and no manifest `resolution` block must
+    ///    NEVER bypass, even against a lock recorded under a non-default
+    ///    strategy — otherwise a bare `milpa fetch` on a `minver`-recorded
+    ///    lock would compute effective=`maxver` (the default), see it
+    ///    "diverge" from the lock, and newest-wins the WHOLE graph — a worse
+    ///    regression than the sticky-state bug this fixes. Stability of a
+    ///    bare re-resolve rides on B2's preference mechanism below, not on
+    ///    treating the lock's strategy as live governing state.
+    /// 2. **value-divergence**, never CLI flag *presence* alone:
+    ///    `self.strategy.as_str() != prior.strategy` (the effective strategy
+    ///    versus the strategy string the committed lock was actually
+    ///    produced under). This is the load-bearing regression guard
+    ///    (#192): `milpa fetch --strategy maxver` on an already-maxver lock
+    ///    must be a NO-OP — a presence-gate ("was --strategy typed") would
+    ///    instead flip the whole graph to newest-wins even when the
+    ///    effective strategy equals the locked one.
+    ///
+    /// Scope is strategy-specific, per D-C2:
+    /// - `Maxver`/`Minver`/`Semver` diverging from the lock: bypass is
+    ///   WHOLE-GRAPH (every package).
+    /// - `LowestDirect` diverging from the lock: bypass is
+    ///   ROOT-DIRECT-ONLY (`is_root_direct`) — transitives keep their lock
+    ///   preference, because a whole-graph bypass under `LowestDirect`
+    ///   would drag unrelated transitives forward (#192 again, through a
+    ///   different door).
+    ///
+    /// A pure function of (explicit-sourced?, effective strategy, locked
+    /// strategy, directness) — assembled here as `preference = None` for the
+    /// bypassed packages, never a concept the picker itself learns about
+    /// (§4 stage 4: "bypass is not a picker parameter").
+    fn bypasses_lock_preference(&self, prior: &Lockfile, package: &str) -> bool {
+        if !self.strategy_explicit {
+            return false;
+        }
+        if self.strategy.as_str() == prior.strategy {
+            return false;
+        }
+        if self.strategy == Strategy::LowestDirect {
+            return self.is_root_direct(package);
+        }
+        true
     }
 
     /// Build the synthetic root candidate from `manifest.deps + dev_deps` (§9)
@@ -1354,36 +1575,51 @@ impl<'a> ResolveProvider<'a> {
         let mut root_requires: Vec<String> = Vec::new();
         let mut queue: Vec<Item> = Vec::new();
         let mut seen_by_name: BTreeMap<String, (PKey, bool)> = BTreeMap::new();
-        let mut authority: BTreeSet<String> = BTreeSet::new();
+        // RR2 (R6 dual-set cleanup): build the namespace-aware set ONCE (see
+        // `root_direct_keys`'s field doc comment for its role in
+        // `is_root_direct`), then derive the bare-name `root_authority` set
+        // as a pure name-projection of it below — replacing two
+        // independently hand-built collections with one populated
+        // collection + one projection.
+        let mut root_direct_keys: BTreeSet<DepKey> = BTreeSet::new();
 
         let all_deps = manifest.deps.iter().chain(manifest.dev_deps.iter());
         for dep in all_deps {
             let name = dep.name().to_string();
-            authority.insert(name.clone());
+            let dep_namespace = match dep {
+                Dep::Named(n) => n.namespace.clone(),
+                _ => None,
+            };
+            root_direct_keys.insert(DepKey { name: name.clone(), namespace: dep_namespace });
             match dep {
                 Dep::Tarball(t) => {
-                    root_deps.push(SolverDep::new(name.clone(), eq_sentinel()));
+                    // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
+                    root_deps.push(SolverDep::new(name.clone(), VersionSet::full()));
                     root_requires.push(name.clone());
                     seen_by_name.insert(name.clone(), (PKey::Tarball(t.url.clone()), true));
                     self.discovery_order.borrow_mut().push(name); // Phase B: root deps in declaration order
                     queue.push(Item::Tarball(t.clone()));
                 }
                 Dep::Local(l) => {
-                    root_deps.push(SolverDep::new(name.clone(), eq_sentinel()));
+                    // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
+                    root_deps.push(SolverDep::new(name.clone(), VersionSet::full()));
                     root_requires.push(name.clone());
                     seen_by_name.insert(name.clone(), (PKey::Local(l.path.clone()), true));
                     self.discovery_order.borrow_mut().push(name); // Phase B: root deps in declaration order
                     queue.push(Item::Local(l.clone()));
                 }
                 Dep::Url(u) => {
-                    root_deps.push(SolverDep::new(name.clone(), eq_sentinel()));
+                    // Axis A (a)/D-A2: full() self-term, never eq(sentinel) — the
+                    // causality fix (term built pre-fetch; the real label is
+                    // assigned post-fetch), unconditional of override kind.
+                    root_deps.push(SolverDep::new(name.clone(), VersionSet::full()));
                     root_requires.push(name.clone());
                     // S8a: LocalTarget override on root UrlDep → local pkey + local item.
                     if let Some(ov) = self.overrides.get(&name) {
                         if let OverrideTarget::Local { path } = &ov.target {
                             seen_by_name.insert(name.clone(), (PKey::Local(path.clone()), true));
                             self.discovery_order.borrow_mut().push(name.clone());
-                            queue.push(Item::Local(LocalDep { name, path: path.clone(), predicates: vec![] }));
+                            queue.push(Item::Local(LocalDep { name, path: path.clone(), predicates: vec![], version: ov.version.clone() }));
                             continue;
                         }
                         // S8b: MemberTarget on a root UrlDep in single-package manifest is a
@@ -1429,7 +1665,8 @@ impl<'a> ResolveProvider<'a> {
                         // Override routes a named dep to a URL/local fetch → singleton.
                         // Overrides are keyed by bare name (manifests use bare names in overrides).
                         let ov = &self.overrides[&name];
-                        root_deps.push(SolverDep::new(solver_var.clone(), eq_sentinel()));
+                        // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
+                        root_deps.push(SolverDep::new(solver_var.clone(), VersionSet::full()));
                         match &ov.target {
                             // S8a: LocalTarget override on root NamedDep → local pkey + item.
                             OverrideTarget::Local { path } => {
@@ -1439,14 +1676,14 @@ impl<'a> ResolveProvider<'a> {
                                 );
                                 root_requires.push(solver_var.clone());
                                 self.discovery_order.borrow_mut().push(solver_var.clone());
-                                queue.push(Item::Local(LocalDep { name, path: path.clone(), predicates: vec![] }));
+                                queue.push(Item::Local(LocalDep { name, path: path.clone(), predicates: vec![], version: ov.version.clone() }));
                                 continue;
                             }
                             OverrideTarget::Member { .. } => {
                                 // S8b: MemberTarget in a single-package manifest is a no-op
                                 // (no workspace context; no member candidate pre-registered).
                                 // Treat as if the override were absent: resolve as named dep.
-                                root_deps.pop(); // undo the sentinel push
+                                root_deps.pop(); // undo the full() self-term push
                                 root_deps.push(SolverDep::new(solver_var.clone(), vs.clone()));
                                 // S5b: PKey::Named carries qualified DepKey
                                 seen_by_name.insert(solver_var.clone(), (PKey::Named(dep_key.clone()), true));
@@ -1485,7 +1722,8 @@ impl<'a> ResolveProvider<'a> {
         }
 
         for ov in &manifest.overrides {
-            authority.insert(ov.name.clone());
+            // Overrides are name-based only (no namespace concept).
+            root_direct_keys.insert(DepKey::bare(ov.name.clone()));
             // S8: pre-seed the gate for each override kind via the SSOT helper.
             // S8a: LocalTarget → PKey::Local; S8b: MemberTarget → PKey::Member
             // (no-op in single-package context, but gate is pre-seeded for consistency).
@@ -1495,7 +1733,14 @@ impl<'a> ResolveProvider<'a> {
                 .or_insert_with(|| (pk, true));
         }
 
-        self.root_authority = authority;
+        // R6: root_authority derived as pure name-projection of
+        // root_direct_keys — provably byte-identical to the old
+        // independently-built set: both are sourced from exactly
+        // `manifest.deps`/`dev_deps` names + `manifest.overrides` names —
+        // the SAME sources — so projecting `root_direct_keys` down to just
+        // its `name` field yields the exact same set of bare names.
+        self.root_authority = root_direct_keys.iter().map(|k| k.name.clone()).collect();
+        self.root_direct_keys = root_direct_keys;
         *self.seen_by_name.borrow_mut() = seen_by_name;
 
         let root = Candidate {
@@ -1512,6 +1757,8 @@ impl<'a> ResolveProvider<'a> {
             attestation: None,
             is_registry: false,
             registry_namespace: String::new(),
+            version_unknown: false,
+            declared_version_source: None,
         };
         self.store_candidate(root);
         Ok(queue)
@@ -1539,10 +1786,19 @@ impl<'a> ResolveProvider<'a> {
         let mut root_requires: Vec<String> = Vec::new();
         let mut queue: Vec<Item> = Vec::new();
         let mut seen_by_name: BTreeMap<String, (PKey, bool)> = BTreeMap::new();
-        let mut authority: BTreeSet<String> = members_by_name.clone();
+        // RR2 (R6 dual-set cleanup): build the namespace-aware set ONCE (see
+        // `root_direct_keys`'s field doc comment for its role in
+        // `is_root_direct`), then derive the bare-name `root_authority` set
+        // as a pure name-projection of it below — replacing two
+        // independently hand-built + independently mutated collections with
+        // one populated collection + one projection. Member names and
+        // overrides have no namespace concept, so they contribute bare
+        // `DepKey`s here.
+        let mut root_direct_keys: BTreeSet<DepKey> =
+            members_by_name.iter().map(|n| DepKey::bare(n.clone())).collect();
 
         for ov in &workspace.overrides {
-            authority.insert(ov.name.clone());
+            root_direct_keys.insert(DepKey::bare(ov.name.clone()));
             // S8: pre-seed the gate for each override kind via the SSOT helper.
             // S8a: LocalTarget → PKey::Local; S8b: MemberTarget → PKey::Member.
             // Pre-seeding with is_root=true means any transitive dep claiming this
@@ -1550,6 +1806,32 @@ impl<'a> ResolveProvider<'a> {
             let pk = override_target_to_pkey(&ov.target);
             seen_by_name.insert(ov.name.clone(), (pk, true));
         }
+
+        // A2c: each member's own candidate-label version, computed once up
+        // front so both the member's own candidate AND any other member's
+        // same-name auto-coerce reference (which needs the *referenced*
+        // member's real version, not its own) read the same value (§3 Axis A
+        // member block, D-A2). A5: also capture the sibling source per member
+        // (same precomputed-once call — no second, potentially
+        // file-re-reading, lookup).
+        let member_version_pairs: BTreeMap<String, (Version, Option<VersionSource>)> = workspace
+            .members
+            .iter()
+            .map(|m| {
+                (
+                    m.name.clone(),
+                    member_candidate_version(&m.name, &m.manifest, &m.directory, &self.overrides),
+                )
+            })
+            .collect();
+        let member_versions: BTreeMap<String, Version> = member_version_pairs
+            .iter()
+            .map(|(name, (v, _src))| (name.clone(), v.clone()))
+            .collect();
+        let member_version_sources: BTreeMap<String, Option<VersionSource>> = member_version_pairs
+            .iter()
+            .map(|(name, (_v, src))| (name.clone(), *src))
+            .collect();
 
         for member in &workspace.members {
             // S2 (RFC: workspace-completion §3.A): apply FilterCtx to the member
@@ -1578,43 +1860,59 @@ impl<'a> ResolveProvider<'a> {
             let mut requires: Vec<String> = Vec::new();
             for dep in manifest.deps.iter().chain(manifest.dev_deps.iter()) {
                 let name = dep.name().to_string();
-                authority.insert(name.clone());
+                let dep_namespace = match dep {
+                    Dep::Named(n) => n.namespace.clone(),
+                    _ => None,
+                };
+                root_direct_keys.insert(DepKey { name: name.clone(), namespace: dep_namespace });
 
                 // Member ref / member-named auto-coercion: satisfied by the
                 // in-tree member candidate, no fetch, no queue.
                 if matches!(dep, Dep::Member(_)) || members_by_name.contains(&name) {
-                    // Breadth-P1c (S5): when a NamedDep auto-coerces to a member,
-                    // verify the declared constraint is satisfied by the member's
-                    // sentinel version.  Silently discarding the constraint is a
-                    // correctness hole — e.g. ">= 2.0.0" vs sentinel 0.0.1.
+                    // Breadth-P1c (S5) + A2c: when a NamedDep auto-coerces to a
+                    // member, verify the declared constraint is satisfied by the
+                    // member's OWN declared (or sentinel, if undeclared) version.
+                    // Silently discarding the constraint is a correctness hole —
+                    // e.g. ">= 2.0.0" vs a member that doesn't satisfy it. This is
+                    // a real semantic check, independent of the full() self-term
+                    // below (which exists so PubGrub never pre-commits to a
+                    // version label the one-candidate member might not carry —
+                    // the check here is where real conflicts surface).
                     if let Dep::Named(nd) = dep {
                         if let Some(ref vs) = nd.parsed_constraint {
-                            if !vs.contains(&url_dep_version()) {
+                            let target_version = &member_versions[&name];
+                            if !vs.contains(target_version) {
                                 return Err(res_err(
                                     "RES-WS-MEMBER-VERSION-CONSTRAINT",
                                     format!(
                                         "named dep {:?} auto-coerces to workspace member {:?} \
                                          but the declared constraint {:?} is not satisfied by \
-                                         the member's sentinel version {} \
-                                         (member deps carry version {}; \
+                                         the member's version {} \
+                                         (member {:?} is at version {}; \
                                          declared constraint must match)",
                                         name, name,
                                         nd.constraint.as_deref().unwrap_or(""),
-                                        url_dep_version(),
-                                        url_dep_version(),
+                                        target_version,
+                                        name, target_version,
                                     ),
                                 ));
                             }
                         }
                     }
-                    terms.push(SolverDep::new(name.clone(), eq_sentinel()));
+                    // D-A2: full() self-term — a member has exactly one
+                    // candidate, so the requiring term must not pre-commit to
+                    // any particular version label (mirrors url/git/local/
+                    // tarball's full() self-term; justified by "one candidate,
+                    // must satisfy floors", not causality — members have no fetch).
+                    terms.push(SolverDep::new(name.clone(), VersionSet::full()));
                     requires.push(name);
                     continue;
                 }
 
                 if self.overrides.contains_key(&name) {
                     let ov = &self.overrides[&name];
-                    terms.push(SolverDep::new(name.clone(), eq_sentinel()));
+                    // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
+                    terms.push(SolverDep::new(name.clone(), VersionSet::full()));
                     requires.push(name.clone());
                     // S8a: LocalTarget override → local item; S8b: MemberTarget → no-op
                     // (member already pre-registered; gate was pre-seeded above); git → url.
@@ -1625,7 +1923,7 @@ impl<'a> ResolveProvider<'a> {
                             if !self.discovery_order.borrow().contains(&name) {
                                 self.discovery_order.borrow_mut().push(name.clone());
                             }
-                            queue.push(Item::Local(LocalDep { name: name.clone(), path: path.clone(), predicates: vec![] }));
+                            queue.push(Item::Local(LocalDep { name: name.clone(), path: path.clone(), predicates: vec![], version: ov.version.clone() }));
                         }
                         OverrideTarget::Member { member_name } => {
                             // S8b: member already pre-registered; gate pre-seeded with
@@ -1652,7 +1950,8 @@ impl<'a> ResolveProvider<'a> {
 
                 match dep {
                     Dep::Url(u) => {
-                        terms.push(SolverDep::new(name.clone(), eq_sentinel()));
+                        // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
+                        terms.push(SolverDep::new(name.clone(), VersionSet::full()));
                         requires.push(name.clone());
                         let entry = seen_by_name
                             .entry(name.clone())
@@ -1665,7 +1964,8 @@ impl<'a> ResolveProvider<'a> {
                         queue.push(Item::Url(u.clone()));
                     }
                     Dep::Local(l) => {
-                        terms.push(SolverDep::new(name.clone(), eq_sentinel()));
+                        // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
+                        terms.push(SolverDep::new(name.clone(), VersionSet::full()));
                         requires.push(name.clone());
                         seen_by_name
                             .entry(name.clone())
@@ -1676,7 +1976,8 @@ impl<'a> ResolveProvider<'a> {
                         queue.push(Item::Local(l.clone()));
                     }
                     Dep::Tarball(t) => {
-                        terms.push(SolverDep::new(name.clone(), eq_sentinel()));
+                        // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
+                        terms.push(SolverDep::new(name.clone(), VersionSet::full()));
                         requires.push(name.clone());
                         seen_by_name
                             .entry(name.clone())
@@ -1728,7 +2029,9 @@ impl<'a> ResolveProvider<'a> {
             let identity = compute_content_hash(&member.directory)?;
             self.store_candidate(Candidate {
                 name: member.name.clone(),
-                version: url_dep_version(),
+                // A2c/D-A2: the member's own declared version (milpa.kdl/
+                // .nimble), else the sentinel — computed once above.
+                version: member_versions[&member.name].clone(),
                 identity,
                 src_dir: member.manifest.src_dir.clone(),
                 requires_names: requires,
@@ -1743,8 +2046,20 @@ impl<'a> ResolveProvider<'a> {
                 attestation: None, // workspace members have no index entry
                 is_registry: false,
                 registry_namespace: String::new(),
+                // A4: members are deliberately excluded from the version-unknown
+                // partition (see Candidate.version_unknown's doc comment) — their
+                // self-term is unconditionally full(), so no real constraint can
+                // ever reach one regardless of this flag.
+                version_unknown: false,
+                // A5: sibling source for the member's own version label (D-A2's
+                // existing precomputed-once-for-all-members pattern, extended).
+                declared_version_source: member_version_sources[&member.name],
             });
-            root_deps.push(SolverDep::new(member.name.clone(), eq_sentinel()));
+            // A2c/D-A2: full() self-term — the root always requires all
+            // members regardless of their (real or sentinel) version label; a
+            // member has exactly one candidate, so pre-committing to a
+            // version here would spuriously conflict with a versioned member.
+            root_deps.push(SolverDep::new(member.name.clone(), VersionSet::full()));
             root_requires.push(member.name.clone());
         }
 
@@ -1843,7 +2158,15 @@ impl<'a> ResolveProvider<'a> {
             }
         }
 
-        self.root_authority = authority;
+        // R6: root_authority derived as pure name-projection of
+        // root_direct_keys — provably byte-identical to the old
+        // independently-built + independently-mutated set: both are
+        // sourced from exactly `members_by_name` + `workspace.overrides`
+        // names + every member's own deps/dev-deps names — the SAME
+        // sources — so projecting `root_direct_keys` down to just its
+        // `name` field yields the exact same set of bare names.
+        self.root_authority = root_direct_keys.iter().map(|k| k.name.clone()).collect();
+        self.root_direct_keys = root_direct_keys;
         *self.seen_by_name.borrow_mut() = seen_by_name;
 
         let root = Candidate {
@@ -1860,6 +2183,8 @@ impl<'a> ResolveProvider<'a> {
             attestation: None,
             is_registry: false,
             registry_namespace: String::new(),
+            version_unknown: false,
+            declared_version_source: None,
         };
         self.store_candidate(root);
         Ok(queue)
@@ -1954,16 +2279,20 @@ impl<'a> ResolveProvider<'a> {
                 Some(ov) => match &ov.target {
                     // S8a: LocalTarget override → route to local transport.
                     OverrideTarget::Local { path } => {
-                        Item::Local(LocalDep { name: d.name.clone(), path: path.clone(), predicates: vec![] })
+                        Item::Local(LocalDep { name: d.name.clone(), path: path.clone(), predicates: vec![], version: ov.version.clone() })
                     }
                     // S8b: MemberTarget — member already pre-registered; gate was pre-seeded
                     // with PKey::Member(member_name) + is_root=true in seed_workspace.
                     // Return the item unchanged; the gate will suppress it (root wins over
                     // any non-matching pkey).
                     OverrideTarget::Member { .. } => item,
-                    // Existing git path.
+                    // Existing git path. A3b/D-A3: version= is the OVERRIDE
+                    // RULE's own annotation, never the original dep's — the
+                    // fresh UrlDep is built from the override target alone,
+                    // so a stale annotation on the redirected original is
+                    // structurally discarded, never read.
                     OverrideTarget::Git { url, git_ref } => {
-                        Item::Url(url_dep(&d.name, url, git_ref))
+                        Item::Url(url_dep(&d.name, url, git_ref, ov.version.clone()))
                     }
                 },
                 None => item,
@@ -1972,16 +2301,16 @@ impl<'a> ResolveProvider<'a> {
                 Some(ov) => match &ov.target {
                     // S8a: LocalTarget override → route to local transport.
                     OverrideTarget::Local { path } => {
-                        Item::Local(LocalDep { name: name.clone(), path: path.clone(), predicates: vec![] })
+                        Item::Local(LocalDep { name: name.clone(), path: path.clone(), predicates: vec![], version: ov.version.clone() })
                     }
                     // S8b: MemberTarget — member already pre-registered; gate was pre-seeded
                     // with PKey::Member(member_name) + is_root=true in seed_workspace.
                     // Return the item unchanged; the gate will suppress it (root wins over
                     // any non-matching pkey).
                     OverrideTarget::Member { .. } => item,
-                    // Existing git path.
+                    // Existing git path (A3b/D-A3: see comment above).
                     OverrideTarget::Git { url, git_ref } => {
-                        Item::Url(url_dep(name, url, git_ref))
+                        Item::Url(url_dep(name, url, git_ref, ov.version.clone()))
                     }
                 },
                 None => item,
@@ -2073,11 +2402,17 @@ impl<'a> ResolveProvider<'a> {
                                                 if let Some(version_map) = cands.get_mut(&dep.name) {
                                                     if let Some(cand) = version_map.values_mut().next() {
                                                         if !cand.requires_names.contains(&sub_name) {
+                                                            // Axis A (a)/D-A2: full() self-term for
+                                                            // url/local/tarball, overridden-named, AND
+                                                            // member (A2c) — every one of these dep
+                                                            // kinds has exactly one candidate, so the
+                                                            // requiring term must never pre-commit to
+                                                            // a version label.
                                                             let vs = match sub_dep {
-                                                                Dep::Url(_) | Dep::Local(_) | Dep::Tarball(_) | Dep::Member(_) => eq_sentinel(),
+                                                                Dep::Url(_) | Dep::Local(_) | Dep::Tarball(_) | Dep::Member(_) => VersionSet::full(),
                                                                 Dep::Named(n) => {
                                                                     if self.overrides.contains_key(&n.name) {
-                                                                        eq_sentinel()
+                                                                        VersionSet::full()
                                                                     } else {
                                                                         let c = n.constraint.as_deref().filter(|s| !s.is_empty());
                                                                         VersionSet::from_constraint(c).unwrap_or_else(|_| VersionSet::full())
@@ -2102,8 +2437,9 @@ impl<'a> ResolveProvider<'a> {
                                                     // H2: check by full DepKey (namespace-aware).
                                                     let n_key = DepKey { name: n.name.clone(), namespace: n.namespace.clone() };
                                                     if !self.seen_named.borrow().contains(&n_key) {
+                                                        // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                                                         let constraint = if self.overrides.contains_key(&n.name) {
-                                                            eq_sentinel()
+                                                            VersionSet::full()
                                                         } else {
                                                             let c = n.constraint.as_deref().filter(|s| !s.is_empty());
                                                             VersionSet::from_constraint(c).unwrap_or_else(|_| VersionSet::full())
@@ -2178,6 +2514,48 @@ impl<'a> ResolveProvider<'a> {
         let (identity, receipt, observed_idx) =
             self.fetch_any_tracked(&dep.name, &provs, &dest, expected_identity.as_deref())?;
 
+        // D4 (resolution-semantics RFC §3 Axis D / §6 D-D1/D-D2): exclude-
+        // newer VALIDATION for the pinned git commit — not selection (a git
+        // dep has exactly one candidate, unlike an index dep's enumerated
+        // set, filtered at the enumeration layer instead, D3). Keys on the
+        // resolved commit's own COMMITTER date (never an annotated tag's
+        // tagger date — guaranteed by `git_committer_date`'s own contract).
+        //
+        // L2: `receipt.committer_date` is best-effort at the transport layer
+        // (`fetch_git` degrades a `git log` read failure to `None` rather
+        // than failing the whole fetch — see its call site) — this is the
+        // SAME absence-posture non-git transports (local/tarball/OCI) already
+        // use, and the established, widely-relied-upon convention across
+        // this whole test suite (D5 lock-drift / `--locked` coverage in
+        // particular): `committer_date: None` on a Receipt means "not
+        // validated by D4", full stop, regardless of WHY it's absent (wrong
+        // transport, or a real transport whose date read failed). An earlier
+        // draft of this fix made a `None` here fail closed when a bound was
+        // set, reasoning that a hiccup shouldn't silently bypass the check —
+        // that reasoning was wrong: it broke every existing mocked-git test
+        // that passes `--exclude-newer` without also populating a
+        // `committer_date` fixture (D5's tests never cared about D4 at all).
+        // The transport-layer fix (never fail the whole fetch over this read)
+        // is the complete, correct scope of L2; this comparison's absence
+        // handling is intentionally UNCHANGED.
+        if let (Some(bound), Some(committer_date)) = (self.exclude_newer, receipt.committer_date) {
+            if committer_date > bound {
+                return Err(res_err(
+                    "RES-EXCLUDE-NEWER-PIN",
+                    format!(
+                        "{:?} is pinned to commit {:?} whose committer date {} is newer \
+                         than exclude-newer {} — git/url deps have exactly one candidate \
+                         (validated, not selected), so there is no older version to fall \
+                         back to; loosen or remove exclude-newer, or pin an older commit",
+                        dep.name,
+                        receipt.resolved_ref.as_deref().unwrap_or("(unknown)"),
+                        format_iso8601_timestamp(&committer_date),
+                        format_iso8601_timestamp(&bound),
+                    ),
+                ));
+            }
+        }
+
         let observed_url = &all_candidate_urls[observed_idx];
         let declared_mirror_urls: Vec<String> = all_candidate_urls
             .iter()
@@ -2194,15 +2572,18 @@ impl<'a> ResolveProvider<'a> {
             .map(|fr| fr.name.clone())
             .collect();
         let ex =
-            self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None, requested_flags.clone())?;
+            self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None, requested_flags.clone(), Some(&dep.git_ref), dep.version.clone())?;
 
         // Record the observed provenance with the resolved commit SHA.
         // (preferring the freshly-resolved SHA over a pin) for emission.
         let commit = receipt.resolved_ref.or(pinned_sha);
         let identity_str = identity.clone(); // save before move into Candidate
+        // Axis A (b)/D-A2: label with the fetched package's declared version
+        // (milpa.kdl → .nimble), else the sentinel (version-unknown stays as-is).
+        let candidate_version = candidate_label(ex.declared_version.as_ref());
         self.store_candidate(Candidate {
             name: dep.name.clone(),
-            version: url_dep_version(),
+            version: candidate_version,
             identity,
             src_dir: ex.src_dir,
             requires_names: ex.requires_names,
@@ -2222,6 +2603,9 @@ impl<'a> ResolveProvider<'a> {
             attestation: None, // URL deps not in the index; no attestation record
             is_registry: false,
             registry_namespace: String::new(),
+            // A4: no declared version found (steps 1-4 all missed) — version-unknown.
+            version_unknown: ex.declared_version.is_none(),
+            declared_version_source: ex.declared_version_source,
         });
 
         // S3 / S4a / C1: unconditionally seed dep_active_flags for this URL dep so that
@@ -2281,10 +2665,13 @@ impl<'a> ResolveProvider<'a> {
         // dedup (which is CAS-only). Mirrors Python FetcherRegistry → identity=None.
         let identity = String::new();
         let ex =
-            self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None, BTreeSet::new())?;
+            self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None, BTreeSet::new(), None, dep.version.clone())?;
+        // Axis A (b)/D-A2: label with the fetched package's declared version
+        // (milpa.kdl → .nimble), else the sentinel (version-unknown stays as-is).
+        let candidate_version = candidate_label(ex.declared_version.as_ref());
         self.store_candidate(Candidate {
             name: dep.name.clone(),
-            version: url_dep_version(),
+            version: candidate_version,
             identity,
             src_dir: ex.src_dir,
             requires_names: ex.requires_names,
@@ -2301,6 +2688,10 @@ impl<'a> ResolveProvider<'a> {
             attestation: None, // local deps not in the index; no attestation record
             is_registry: false,
             registry_namespace: String::new(),
+            // A4: no declared version found (steps 1-2 only for local — no
+            // ref/tag, A3b annotation covered by step 4) — version-unknown.
+            version_unknown: ex.declared_version.is_none(),
+            declared_version_source: ex.declared_version_source,
         });
         self.process_items(ex.sub_items)?;
         Ok(())
@@ -2329,7 +2720,7 @@ impl<'a> ResolveProvider<'a> {
             expected_identity.as_deref(),
         )?;
         let ex =
-            self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None, BTreeSet::new())?;
+            self.extract_requires(&dest, &dep.name, &url_dep_version(), false, None, None, BTreeSet::new(), None, dep.version.clone())?;
         // §5: record the TOFU pin. A manifest `sha256=` is authoritative; else
         // capture the digest the fetcher just computed (first fetch), falling
         // back to the prior lock's pin (refetch preserves it).
@@ -2338,9 +2729,12 @@ impl<'a> ResolveProvider<'a> {
             .clone()
             .or(receipt.archive_sha256)
             .or(locked_sha256);
+        // Axis A (b)/D-A2: label with the fetched package's declared version
+        // (milpa.kdl → .nimble), else the sentinel (version-unknown stays as-is).
+        let candidate_version = candidate_label(ex.declared_version.as_ref());
         self.store_candidate(Candidate {
             name: dep.name.clone(),
-            version: url_dep_version(),
+            version: candidate_version,
             identity,
             src_dir: ex.src_dir,
             requires_names: ex.requires_names,
@@ -2356,6 +2750,9 @@ impl<'a> ResolveProvider<'a> {
             attestation: None, // tarball deps not in the index; no attestation record
             is_registry: false,
             registry_namespace: String::new(),
+            // A4: no declared version found — version-unknown.
+            version_unknown: ex.declared_version.is_none(),
+            declared_version_source: ex.declared_version_source,
         });
         self.process_items(ex.sub_items)?;
         Ok(())
@@ -2364,10 +2761,18 @@ impl<'a> ResolveProvider<'a> {
     /// Phase A: enumerate index versions for a named dep as stubs (no fetch).
     /// `constraint` is a pre-parsed `VersionSet` — validated at the parse
     /// boundary (manifest: `MAN-DEP-NAMED-CONSTRAINT`; nimble:
-    /// `MAN-NIMBLE-CONSTRAINT`). No re-parsing occurs here.
-    /// Phase A: enumerate index versions for a named dep as stubs (no fetch).
+    /// `MAN-NIMBLE-CONSTRAINT`) but INTENTIONALLY UNUSED (`_constraint`)
+    /// here: resolver-semantics §2.1 is normative that Phase A enumeration
+    /// MUST NOT pre-filter by the declared constraint (see the `enumerate_all
+    /// = VersionSet::full()` a few lines down) — the solver's own
+    /// accumulated-constraint filter (stage 3) is what actually narrows the
+    /// candidate set, so a satisfiability failure surfaces as the canonical
+    /// `SOLVE-CONFLICT` rather than a premature `TNG-NO-SATISFYING-VERSION`.
+    /// The parameter is kept (not dropped from the signature) purely so
+    /// every call site still documents that a constraint exists for this
+    /// dep, even though this enumeration step doesn't act on it.
     /// `namespace` is `Some("ns")` for S5b qualified deps; `None` for bare/transitive.
-    fn process_named(&self, name: &str, constraint: VersionSet, namespace: Option<&str>) -> Result<(), MilpaError> {
+    fn process_named(&self, name: &str, _constraint: VersionSet, namespace: Option<&str>) -> Result<(), MilpaError> {
         // Track by DepKey — qualified key if namespace is set, bare otherwise.
         let dep_key = DepKey { name: name.to_string(), namespace: namespace.map(str::to_string) };
         // For "nim" we mark as seen but skip index enumeration.
@@ -2403,6 +2808,28 @@ impl<'a> ResolveProvider<'a> {
                 .resolve_named_all(name, &enumerate_all, raw_str)
                 .map_err(MilpaError::from)?
         };
+        // D3 (resolution-semantics RFC §3 Axis D / §4 stage 2): the
+        // exclude-newer hard cut at the ENUMERATION layer — applied here,
+        // over the SAME stage-1 constraint-blind candidate list, strictly
+        // before the solver's own accumulated-constraint filter (stage 3).
+        // Emptying an otherwise-non-empty candidate set raises the distinct
+        // RES-EXCLUDE-NEWER-EMPTY, never a generic no-satisfying-version /
+        // solve-conflict (#100's error-taxonomy discipline).
+        let (versions, dropped) = filter_by_exclude_newer(&versions, self.exclude_newer);
+        if dropped > 0 && versions.is_empty() {
+            let ts = self
+                .exclude_newer
+                .expect("dropped > 0 implies exclude_newer is Some");
+            return Err(res_err(
+                "RES-EXCLUDE-NEWER-EMPTY",
+                format!(
+                    "{name:?} has {dropped} candidate version(s), but exclude-newer \
+                     {:?} excluded all of them (a candidate with no provable \
+                     published_at is excluded too, fail-closed)",
+                    format_iso8601_timestamp(&ts),
+                ),
+            ));
+        }
         let mut by_ver: BTreeMap<Version, IndexVersion> = BTreeMap::new();
         for e in versions {
             if let Some(v) = parse_version(&e.version) {
@@ -2480,7 +2907,9 @@ impl<'a> ResolveProvider<'a> {
         let ex = self.extract_requires(&dest, bare_name, version, false,
                 entry.dep_decl.as_deref(),
                 entry.dep_decl_schema_version,
-                named_active_flags)?;
+                named_active_flags,
+                None,
+                None)?;
         // S6: dep_decl pin records the artifact hash only when DepDeclEdgeSource was
         // actually used (edge_set.source == DepDecl). If we fell back to milpa.kdl or
         // nimble (e.g. non-strict FETCH-FAILED), the pin is None — matching Python:
@@ -2512,6 +2941,11 @@ impl<'a> ResolveProvider<'a> {
             // P3a: this candidate came from the named-dep (registry) path.
             is_registry: true,
             registry_namespace: entry.namespace.clone(),
+            // A4: named/index deps always carry a real version from the index.
+            version_unknown: false,
+            // A5: out of Axis A's scope — a named dep's version comes
+            // straight from the index, never through the 4-step precedence.
+            declared_version_source: None,
         };
         self.store_candidate(candidate);
         self.stubs
@@ -2652,6 +3086,16 @@ impl<'a> ResolveProvider<'a> {
         // When non-empty, the edge_cache is bypassed (flag-parameterized EdgeSets
         // are not cached; S4a multi-hop fixpoint will handle caching).
         active_flags: BTreeSet<String>,
+        // A3 (§3 Axis A (b) step 3): the git dep's declared ref, or `None`.
+        // Only `process_url` passes `Some(&dep.git_ref)`; local/tarball/named
+        // callers pass `None` (no ref concept for those dep kinds).
+        ref_: Option<&str>,
+        // A3b (§3 Axis A (b) step 4): the dep declaration's own `version=`
+        // annotation, or `None`. `process_url`/`process_local`/`process_tarball`
+        // pass `dep.version.clone()`; `process_named` passes `None` (named/
+        // index deps get their real version from the index directly, out of
+        // A3b's grammar scope).
+        version_annotation: Option<Version>,
     ) -> Result<Extracted, MilpaError> {
         let has_milpa_kdl = dest.join("milpa.kdl").is_file();
 
@@ -2680,6 +3124,8 @@ impl<'a> ResolveProvider<'a> {
             dep_decl_schema_version,
             overrides_by_name: &self.overrides,
             active_flags: active_flags.clone(),
+            ref_,
+            version: version_annotation,
         };
 
         // Clause (a): use Provider's shared cache when active_flags is empty.
@@ -2696,14 +3142,27 @@ impl<'a> ResolveProvider<'a> {
             resolve_edges(name, version, &ctx, &mut *cache, None, None, dds_ref)?.clone()
         };
 
-        self.edgeset_to_extracted(&es, name)
+        // Axis A (b)/D-A2: the fetched package's own declared version (full
+        // precedence steps 1-4: milpa.kdl / .nimble / git tag / version=
+        // annotation). Computed from the SAME ctx built above — a
+        // candidate-labeling concern, orthogonal to the EdgeSet (requires)
+        // extraction above. A5: the paired sibling source is carried through
+        // from this SAME call — never a second, potentially file-re-reading,
+        // lookup.
+        let declared = crate::edge_sources::declared_version_for(&ctx);
+
+        let mut extracted = self.edgeset_to_extracted(&es, name)?;
+        extracted.declared_version = declared.as_ref().map(|(v, _)| v.clone());
+        extracted.declared_version_source = declared.map(|(_, s)| s);
+        Ok(extracted)
     }
 
     /// Convert an `EdgeSet` → `Extracted` (solver deps, names, src_dir, sub-items).
     /// Override-aware: named transitive deps that are themselves overridden enter
-    /// as `eq_sentinel()` (§10); named deps without override use their constraint.
-    /// The original `EdgeSet` is preserved on the struct so callers can inspect
-    /// `edge_set.source` (e.g. `EdgeSource::DepDecl`) at the use-site.
+    /// as `VersionSet::full()` (§10, Axis A (a)/D-A2); named deps without override
+    /// use their constraint. The original `EdgeSet` is preserved on the struct so
+    /// callers can inspect `edge_set.source` (e.g. `EdgeSource::DepDecl`) at the
+    /// use-site. `declared_version` is left `None` here — set by `extract_requires`.
     fn edgeset_to_extracted(&self, es: &EdgeSet, _name: &str) -> Result<Extracted, MilpaError> {
         use milpa_types::RequireEntry;
         let mut deps: Vec<SolverDep> = Vec::new();
@@ -2721,8 +3180,9 @@ impl<'a> ResolveProvider<'a> {
                     let dep_name = name_from_url(&u.url)?;
                     // Dedup the SOLVER TERM only — a dep name must appear exactly
                     // once as a Term.
+                    // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                     if !seen_dep_names.contains(&dep_name) {
-                        deps.push(SolverDep::new(dep_name.clone(), eq_sentinel()));
+                        deps.push(SolverDep::new(dep_name.clone(), VersionSet::full()));
                         requires_names.push(dep_name.clone());
                         seen_dep_names.insert(dep_name.clone());
                     }
@@ -2736,7 +3196,11 @@ impl<'a> ResolveProvider<'a> {
                     // S4b: reconstruct flag_requests from UrlRequire so process_url
                     // sees them for multi-consumer union (§3.1.3). FlagRequest is the
                     // SSOT (milpa-types); no conversion needed.
-                    let mut url_d = url_dep(&dep_name, &u.url, &u.ref_);
+                    // A3b: UrlRequire (a transitive package's own dep declaration)
+                    // has no version= field — the annotation's grammar scope is
+                    // root-declared deps + override rules only (D-A3), so this
+                    // reconstruction always passes None.
+                    let mut url_d = url_dep(&dep_name, &u.url, &u.ref_, None);
                     url_d.flag_requests = u.flag_requests.clone();
                     items.push(Item::Url(url_d));
                     // S4: accumulate predicates if non-empty (do not overwrite).
@@ -2751,10 +3215,10 @@ impl<'a> ResolveProvider<'a> {
                     let solver_var = n_key.solver_var();
                     if !seen_dep_names.contains(&solver_var) {
                         // Override check: a named transitive dep that is itself overridden
-                        // enters as eq_sentinel() so the resolver routes it through the
-                        // override URL fetch (§10).
+                        // is routed through the override URL fetch (§10). Axis A (a)/D-A2:
+                        // its self-term is full(), never eq(sentinel).
                         let vs = if self.overrides.contains_key(&n.name) {
-                            eq_sentinel()
+                            VersionSet::full()
                         } else {
                             // Constraint validation: milpa.kdl constraints are validated
                             // at the manifest-parse boundary (MAN-DEP-NAMED-CONSTRAINT) and
@@ -2813,6 +3277,10 @@ impl<'a> ResolveProvider<'a> {
             sub_items: items,
             edge_set: es.clone(),
             requires_predicates,
+            // Set by `extract_requires` after this returns (needs `ctx`, not
+            // available at this EdgeSet→terms projection layer).
+            declared_version: None,
+            declared_version_source: None,
         })
     }
 
@@ -2926,6 +3394,9 @@ impl<'a> ResolveProvider<'a> {
         }
 
         // Build a discovery-order index for fast lookup.
+        // L13 (RR3 cross-reference): `discovery_order` also backs
+        // `declaration_order()`, the solver's decision-priority tie-break —
+        // see the field's doc comment for the coupling this implies.
         let discovery_index: BTreeMap<String, usize>;
         let large: usize;
         {
@@ -3086,11 +3557,27 @@ impl<'a> ResolveProvider<'a> {
                     }
                 }
 
+                // A5 (§5 NORMATIVE): a version-unknown candidate flattens to
+                // the absent-version literal `0.0.0` at the lockfile boundary
+                // — paired with declared_version_source=None, a combination
+                // no Known case ever produces (a Known always names its
+                // source). Scoped to non-registry candidates ONLY
+                // (`!c.is_registry`): a named/index dep's real version comes
+                // straight from the index and never goes through
+                // declared_version_for, so it always keeps its real version
+                // regardless of declared_version_source (which is simply
+                // never populated for that kind — out of Axis A's scope).
+                let emitted_version = if !c.is_registry && c.declared_version_source.is_none() {
+                    Version::release(0, 0, 0)
+                } else {
+                    c.version.clone()
+                };
+
                 Ok(ResolvedDep {
                     name: dep_key.name.clone(),
                     namespace: dep_key.namespace.clone(),
                     identity: c.identity.clone(),
-                    version: c.version.clone(),
+                    version: emitted_version,
                     src_dir: c.src_dir.clone(),
                     requires: c.requires_names.clone(),
                     // D-lifecycle: assemble provenances = observed + declared mirrors.
@@ -3132,6 +3619,10 @@ impl<'a> ResolveProvider<'a> {
                     } else {
                         None
                     },
+                    // A5: sibling source for the declared version (None for
+                    // version-unknown and for named/index candidates, which
+                    // never populate it — see Candidate's doc comment).
+                    declared_version_source: c.declared_version_source.map(|s| s.as_str().to_string()),
                     cond_requires,
                     // Phase B: lex-sorted alias list for this canonical dep.
                     // Empty for non-deduped deps.
@@ -3432,11 +3923,17 @@ impl<'a> ResolveProvider<'a> {
                             if let Some(version_map) = cands.get_mut(target_name) {
                                 if let Some(cand) = version_map.values_mut().next() {
                                     if !cand.requires_names.contains(&sub_name) {
+                                        // Axis A (a)/D-A2: full() self-term for
+                                        // url/local/tarball, overridden-named, AND
+                                        // member (A2c) — every one of these dep
+                                        // kinds has exactly one candidate, so the
+                                        // requiring term must never pre-commit to
+                                        // a version label.
                                         let vs = match dep {
-                                            Dep::Url(_) | Dep::Local(_) | Dep::Tarball(_) | Dep::Member(_) => eq_sentinel(),
+                                            Dep::Url(_) | Dep::Local(_) | Dep::Tarball(_) | Dep::Member(_) => VersionSet::full(),
                                             Dep::Named(n) => {
                                                 if self.overrides.contains_key(&n.name) {
-                                                    eq_sentinel()
+                                                    VersionSet::full()
                                                 } else {
                                                     let constraint_opt = n.constraint.as_deref().filter(|s| !s.is_empty());
                                                     VersionSet::from_constraint(constraint_opt).unwrap_or_else(|_| VersionSet::full())
@@ -3464,8 +3961,9 @@ impl<'a> ResolveProvider<'a> {
                                 // H2: check by full DepKey (namespace-aware).
                                 let n_key = DepKey { name: n.name.clone(), namespace: n.namespace.clone() };
                                 if !self.seen_named.borrow().contains(&n_key) {
+                                    // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                                     let constraint = if self.overrides.contains_key(&n.name) {
-                                        eq_sentinel()
+                                        VersionSet::full()
                                     } else {
                                         let c = n.constraint.as_deref().filter(|s| !s.is_empty());
                                         VersionSet::from_constraint(c).unwrap_or_else(|_| VersionSet::full())
@@ -3652,6 +4150,104 @@ impl PackageProvider for ResolveProvider<'_> {
         }
         Vec::new()
     }
+
+    /// A4 (resolver-semantics RFC §3 Axis A (c)): all single-candidate kinds
+    /// (git/url/local/tarball) that can go version-unknown are added to
+    /// `candidates` eagerly during the BFS phase, before the solver ever
+    /// runs — so by the time `milpa_solver::solve` queries this, the eager
+    /// candidate (if any) is already present. Named/index stubs never reach
+    /// this predicate as `true` (their eventual `Candidate` always carries
+    /// `version_unknown: false` — see that field's doc comment); an
+    /// as-yet-unmaterialized stub correctly falls through to `false` too.
+    fn is_version_unknown(&self, package: &str) -> bool {
+        self.candidates
+            .borrow()
+            .get(package)
+            .and_then(|m| m.values().next())
+            .map(|c| c.version_unknown)
+            .unwrap_or(false)
+    }
+
+    /// B2 (resolver-semantics RFC §4 stage 4): the prior lockfile's recorded
+    /// version for `package`, if one exists and parses. `package` is a
+    /// solver_var string (e.g. `"ns::bar"` for a qualified named dep);
+    /// decomposed via `DepKey::from_solver_var` (the SOLE site for that) so
+    /// the lookup matches against `LockedDep::name`/`LockedDep::namespace` —
+    /// never a raw `::` split. `None` when there is no prior lock, the
+    /// package is new, or its recorded version string doesn't parse (never
+    /// a hard error — a preference miss just falls through to ordinary
+    /// strategy selection in `pick_version`).
+    fn preference(&self, package: &str) -> Option<Version> {
+        let prior = self.prior?;
+        if self.bypasses_lock_preference(prior, package) {
+            return None;
+        }
+        let dk = DepKey::from_solver_var(package);
+        let locked = prior
+            .deps
+            .iter()
+            .find(|d| d.name == dk.name && d.namespace == dk.namespace)?;
+        // B4 (RFC resolution-semantics.md §3 Axis B / D-B3): a pin-stripped
+        // entry (`strip_dep_pin` — the shared mechanism both `update <dep>`
+        // and `--upgrade <dep>` delegate to) carries no preference. Mirrors
+        // Python's `_Provider.preference` — same "identity=None means
+        // unpinned" convention `_git_pin_for_url_dep` already applies for
+        // git-pin reuse, extended here so a NAMED/index dep (the only kind
+        // where this is observable — git/url/local/tarball deps have
+        // exactly one solver-visible candidate regardless) actually opts
+        // out of the minimal-change preference when its pin is stripped.
+        locked.identity.as_ref()?;
+        parse_version(&locked.version)
+    }
+
+    /// C2 (resolver-semantics RFC §3 Axis C, D-C2): true iff `package` is a
+    /// root-declared or override-named dep — used by the solver's
+    /// `LowestDirect` effective-strategy precompute (and C3's bypass
+    /// scoping), never for provenance gating (which stays in the dedicated
+    /// provenance-gate helper against the bare-name `root_authority` set —
+    /// a separate concern, #193).
+    ///
+    /// `package` is a solver_var string; decomposed via
+    /// `DepKey::from_solver_var` (the SOLE site for that) into a FULL
+    /// `DepKey` (name AND namespace) and checked against
+    /// `root_direct_keys` — a namespace-aware set (R6 fix). A bare-name-only
+    /// check would wrongly match a namespace-qualified TRANSITIVE dep
+    /// against an unrelated root dep that merely shares the same bare name
+    /// under a DIFFERENT namespace (e.g. root `ns1::foo` must NOT make a
+    /// purely-transitive `ns2::foo` look root-direct).
+    fn is_root_direct(&self, package: &str) -> bool {
+        let dk = DepKey::from_solver_var(package);
+        self.root_direct_keys.contains(&dk)
+    }
+
+    /// R3 (resolver-semantics RFC §4.2.1, NORMATIVE): the BFS-insertion index
+    /// at which `package` (a solver_var — matches `discovery_order`'s own
+    /// keying, see that field's doc) was first reached. Backed directly by
+    /// `discovery_order`, which ALREADY records exactly this — root deps in
+    /// declaration order (`seed_root`), then transitive deps in first-
+    /// enqueue order (`gate`), including named-dep sub-items enrolled lazily
+    /// mid-solve (`materialize_named`'s `process_items(ex.sub_items)`) — so
+    /// this is live/current at every call, never a stale pre-solve snapshot.
+    /// `usize::MAX` (the trait default, via `.unwrap_or` here for a name that
+    /// — unexpectedly — isn't in `discovery_order` yet) defers to
+    /// `prioritize`'s own name tie-break, same as any provider with no
+    /// BFS-order concept.
+    ///
+    /// L13 (RR3 cross-reference): `discovery_order`'s OTHER consumer is
+    /// `finalize()`'s Phase-B dedup canonicalization (see that field's doc
+    /// comment), which picks the canonical name in an identity-dedup group
+    /// by the SAME BFS-insertion index this reads. The two concerns share
+    /// one field on purpose (both want "who was discovered first"), but that
+    /// means a dedup-motivated change to `discovery_order`'s population order
+    /// changes solve determinism too — never edit one consumer's expectations
+    /// in isolation.
+    fn declaration_order(&self, package: &str) -> usize {
+        self.discovery_order
+            .borrow()
+            .iter()
+            .position(|n| n == package)
+            .unwrap_or(usize::MAX)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3684,6 +4280,66 @@ fn topo_visit(
 
 fn eq_sentinel() -> VersionSet {
     VersionSet::eq(url_dep_version())
+}
+
+/// Axis A (b) (D-A2): the git/url/local/tarball candidate's version label.
+///
+/// Precedence steps 1-4 (§3 Axis A): the fetched package's `milpa.kdl version`,
+/// else its `.nimble version` (A1), else — git deps only — a version-shaped
+/// tag (A3), else the dep declaration's `version=` annotation (A3b). None
+/// present/parseable → the existing sentinel (the version-unknown partition +
+/// hard error is A4, out of scope here). Member candidates never call this
+/// (A2c owns their label).
+fn candidate_label(declared_version: Option<&Version>) -> Version {
+    declared_version.cloned().unwrap_or_else(url_dep_version)
+}
+
+/// A2c: a workspace member's declared-version label (§3 Axis A member block, D-A2).
+///
+/// Mirrors `candidate_label`'s precedence (`milpa.kdl version` else `.nimble
+/// version` else sentinel), but step 1 is free here — a member's manifest is
+/// already parsed in memory (A1's `milpa.kdl version` field), no extra I/O
+/// needed to check it. `has_milpa_kdl: false` is passed to
+/// `declared_version_for` deliberately: step 1 has already been settled by
+/// `manifest.version` above, so the reused call goes straight to step 2 (the
+/// `.nimble` scan of the member's own directory).
+///
+/// A member that declares no version (no `milpa.kdl version`, no `.nimble`)
+/// keeps the existing sentinel, paired with `source: None` — version-unknown
+/// just works for an unconstrained member; the constrained-and-unknown
+/// partition + `RES-VERSION-UNKNOWN-CONSTRAINED` hard error is A4, out of
+/// scope here.
+///
+/// Returns `(label, source)` — the same two-sibling-field pairing
+/// `declared_version_for`/`candidate_label` use for git/url/local/tarball
+/// candidates (A5).
+///
+/// Mirrors `milpa/resolver.py`'s `_member_candidate_version`.
+fn member_candidate_version(
+    name: &str,
+    manifest: &Manifest,
+    directory: &Path,
+    overrides_by_name: &BTreeMap<String, Override>,
+) -> (Version, Option<VersionSource>) {
+    if let Some(v) = manifest.version.clone() {
+        return (v, Some(VersionSource::Manifest));
+    }
+    let ctx = EdgeSourceCtx {
+        dep_path: Some(directory),
+        dep_name: name,
+        dep_decl: None,
+        is_overridden: false,
+        has_milpa_kdl: false,
+        dep_decl_schema_version: None,
+        overrides_by_name,
+        active_flags: BTreeSet::new(),
+        ref_: None,
+        version: None,
+    };
+    match crate::edge_sources::declared_version_for(&ctx) {
+        Some((v, s)) => (v, Some(s)),
+        None => (url_dep_version(), None),
+    }
 }
 
 fn git_prov(url: &str, git_ref: &str, commit_sha: Option<String>) -> Provenance {
@@ -3754,7 +4410,7 @@ fn opt(s: &str) -> Option<String> {
     }
 }
 
-fn url_dep(name: &str, git: &str, git_ref: &str) -> UrlDep {
+fn url_dep(name: &str, git: &str, git_ref: &str, version: Option<Version>) -> UrlDep {
     UrlDep {
         name: name.to_string(),
         git: git.to_string(),
@@ -3763,6 +4419,7 @@ fn url_dep(name: &str, git: &str, git_ref: &str) -> UrlDep {
         predicates: Vec::new(),
         flag_requests: Vec::new(),
         optional: false,
+        version,
     }
 }
 
@@ -4150,6 +4807,43 @@ fn res_err(code: &'static str, msg: String) -> MilpaError {
     MilpaError::Core(CoreError::Resolver(code, msg))
 }
 
+/// A4 (resolver-semantics RFC §3 Axis A (c) / §6 D-A1): wrap
+/// `SolverError::VersionUnknownConstrained`'s raw facts into
+/// `RES-VERSION-UNKNOWN-CONSTRAINED`, branching the remedy on whether
+/// `package` has a user-owned declaration site (`root_authority` — a
+/// root-declared dep or an override rule) or is a purely transitive dep with
+/// no such site. `constrainers` is enumerated in full (never just the first
+/// — the amoxtli incident floored two packages at once).
+fn version_unknown_constrained_err(
+    package: &str,
+    constrainers: &[(String, String)],
+    root_authority: &BTreeSet<String>,
+) -> MilpaError {
+    let constrainer_strs: Vec<String> = constrainers
+        .iter()
+        .map(|(consumer, constraint)| format!("{consumer:?} requires {constraint:?}"))
+        .collect();
+    let remedy = if root_authority.contains(package) {
+        format!(
+            "add a version= annotation to {package:?}'s dep declaration (or the \
+             overrides rule redirecting it), or pin a versioned git tag"
+        )
+    } else {
+        format!(
+            "add a root-level pin for {package:?} or an overrides {{ {package} … \
+             version= }} rule"
+        )
+    };
+    res_err(
+        "RES-VERSION-UNKNOWN-CONSTRAINED",
+        format!(
+            "{package:?} has no declared version (a git/url/local/tarball dep with \
+             no milpa.kdl/.nimble/tag/version= source) but is constrained by: {} — {remedy}",
+            constrainer_strs.join("; "),
+        ),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Trust-policy SSOT helpers (S1 — RFC rfc-registry-trust-federation)
 // ---------------------------------------------------------------------------
@@ -4306,6 +5000,17 @@ struct ProviderOpts<'a> {
     prior: Option<&'a Lockfile>,
     dep_decl_store: Option<&'a dyn crate::dep_decl_store::DepDeclStore>,
     require_attested_metadata: bool,
+    // C3 (resolver-semantics RFC §3 Axis C / D-C2): the effective strategy
+    // this resolve is running under — see `ResolveProvider::new`'s doc
+    // comment.
+    strategy: Strategy,
+    // R9: whether `strategy` was EXPLICITLY sourced — see
+    // `ResolveProvider::strategy_explicit`'s doc.
+    strategy_explicit: bool,
+    // D2 (resolution-semantics RFC §3 Axis D): the effective exclude-newer
+    // time-bound this resolve is running under — see `ResolveProvider::new`'s
+    // doc comment. Unused for now (D3/D4 consume it).
+    exclude_newer: Option<Timestamp>,
 }
 
 /// Build the [`ResolveProvider`] for a single-package resolve (both the
@@ -4333,7 +5038,7 @@ fn build_single_provider<'a>(
     opts: ProviderOpts<'a>,
     empty_index: &'a Index,
 ) -> Result<(ResolveProvider<'a>, bool), MilpaError> {
-    let ProviderOpts { prior, dep_decl_store, require_attested_metadata } = opts;
+    let ProviderOpts { prior, dep_decl_store, require_attested_metadata, strategy, strategy_explicit, exclude_newer } = opts;
     let overrides: BTreeMap<String, Override> = manifest
         .overrides
         .iter()
@@ -4382,6 +5087,9 @@ fn build_single_provider<'a>(
         prior,
         dep_decl_store,
         strict_attestation,
+        strategy,
+        strategy_explicit,
+        exclude_newer,
     );
 
     Ok((provider, strict_attestation))
@@ -4478,6 +5186,8 @@ pub fn resolve_with_cert(
     profile: Option<&milpa_manifest::Profile>,
     prior: Option<&Lockfile>,
     strategy: Strategy,
+    // R9: see `resolve`'s doc comment.
+    strategy_explicit: bool,
     deps_dir: &std::path::Path,
     dep_decl_store: Option<&dyn crate::dep_decl_store::DepDeclStore>,
     require_attested_metadata: bool,
@@ -4485,6 +5195,10 @@ pub fn resolve_with_cert(
     // P3a (RFC per-entry-attestation.md §3): entry-trust gate config; `None`
     // disables the gate entirely.
     entry_trust: Option<&crate::entry_trust::EntryTrustConfig>,
+    // D2 (resolution-semantics RFC §3 Axis D): the EFFECTIVE exclude-newer
+    // time-bound this resolve is running under. See `resolve_with_features`'s
+    // doc comment.
+    exclude_newer: Option<Timestamp>,
 ) -> Result<(ResolvedGraph, SuccessCert), (MilpaError, FailureCert)> {
     // Delegates to `solve_with_refutation` instead of `solve`; all setup is
     // identical to `resolve` — factored through `build_single_provider` (D-F2).
@@ -4503,7 +5217,7 @@ pub fn resolve_with_cert(
         index,
         fetcher,
         deps_dir,
-        ProviderOpts { prior, dep_decl_store, require_attested_metadata },
+        ProviderOpts { prior, dep_decl_store, require_attested_metadata, strategy, strategy_explicit, exclude_newer },
         &empty_index,
     ) {
         Ok(r) => r,
@@ -4548,6 +5262,15 @@ pub fn resolve_with_cert(
             // Mirrors resolve() — the cert path must also own the rebuild.
             rebuild_deps_view(&graph, deps_dir, store);
             Ok((graph, cert))
+        }
+        // A4: not a SOLVE-CONFLICT — build the root-authority-aware
+        // RES-VERSION-UNKNOWN-CONSTRAINED directly (never MilpaError::Solver),
+        // with an empty FailureCert (mirrors every other non-solver failure).
+        Err((SolverError::VersionUnknownConstrained { package, constrainers }, _)) => {
+            return Err((
+                version_unknown_constrained_err(&package, &constrainers, &provider.root_authority),
+                FailureCert { message: String::new(), refutation: Vec::new() },
+            ));
         }
         Err((solver_err, refutation)) => {
             let message = solver_err.to_string();

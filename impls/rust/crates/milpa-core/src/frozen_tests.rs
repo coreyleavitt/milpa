@@ -4,7 +4,9 @@
 
 use super::*;
 use milpa_manifest::{Dep, Manifest, NamedDep};
-use milpa_types::{LockedDep, Lockfile, ProvenanceRecord, LOCKFILE_SCHEMA_VERSION};
+use milpa_types::{
+    parse_iso8601_timestamp, LockedDep, Lockfile, ProvenanceRecord, LOCKFILE_SCHEMA_VERSION,
+};
 
 fn manifest(deps: Vec<Dep>) -> Manifest {
     Manifest {
@@ -19,6 +21,7 @@ fn manifest(deps: Vec<Dep>) -> Manifest {
         cas_dir: String::new(),
         spec_version: 1,
         spec_version_explicit: false,
+        version: None,
         attestation_policy: milpa_manifest::TrustPolicy::Warn,
         index_trust_policy: milpa_manifest::TrustPolicy::Warn,
         index_trust_signer: None,
@@ -28,6 +31,7 @@ fn manifest(deps: Vec<Dep>) -> Manifest {
         entry_trust_policy_explicit: false,
         index_history_policy: milpa_manifest::TrustPolicy::Warn,
         index_history_policy_explicit: false,
+        resolution: None,
         optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }
@@ -51,12 +55,27 @@ fn lock(strategy: &str, deps: Vec<LockedDep>) -> Lockfile {
     Lockfile {
         version: LOCKFILE_SCHEMA_VERSION,
         strategy: strategy.into(),
+        exclude_newer: None,
+        deps,
+    }
+}
+
+fn lock_with_exclude_newer(
+    strategy: &str,
+    exclude_newer: Option<milpa_types::Timestamp>,
+    deps: Vec<LockedDep>,
+) -> Lockfile {
+    Lockfile {
+        version: LOCKFILE_SCHEMA_VERSION,
+        strategy: strategy.into(),
+        exclude_newer,
         deps,
     }
 }
 
 fn locked(name: &str, version: &str, identity: Option<&str>, prov: ProvenanceRecord) -> LockedDep {
     LockedDep {
+        declared_version_source: None,
         name: name.into(),
         namespace: None,
         identity: identity.map(str::to_string),
@@ -102,7 +121,7 @@ fn deps_dir(tmp: &tempfile::TempDir) -> std::path::PathBuf {
 fn strategy_mismatch() {
     let tmp = tempfile::tempdir().unwrap();
     let store = CaStore::new(tmp.path().join(".cas"));
-    // default request is maxver; lockfile says minver.
+    // no resolution{} block → baseline defaults to maxver; lockfile says minver.
     let err = resolve_frozen(
         &manifest(vec![]),
         &lock("minver", vec![]),
@@ -111,6 +130,143 @@ fn strategy_mismatch() {
     )
     .unwrap_err();
     assert_eq!(err.code(), "FROZEN-STRATEGY-MISMATCH");
+}
+
+/// C3b (resolution-semantics RFC §3 Axis C / §7 C3b): the
+/// `FROZEN-STRATEGY-MISMATCH` baseline must be the manifest's EFFECTIVE
+/// `resolution { strategy }`, not a hardcoded `maxver` literal. Before the
+/// fix, this scenario (a `minver` manifest with a genuinely-consistent
+/// `minver` lock) spuriously raised `FROZEN-STRATEGY-MISMATCH` because the
+/// baseline was hardcoded to `Strategy::default()` (`maxver`).
+#[test]
+fn frozen_baseline_follows_manifest_minver_strategy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = CaStore::new(tmp.path().join(".cas"));
+    let mut m = manifest(vec![]);
+    m.resolution = Some(Resolution {
+        strategy: Some(Strategy::Minver),
+        exclude_newer: None,
+    });
+    let graph = resolve_frozen(&m, &lock("minver", vec![]), &store, &deps_dir(&tmp))
+        .expect("minver manifest + minver lock must NOT raise FROZEN-STRATEGY-MISMATCH");
+    assert_eq!(graph.deps.len(), 0);
+}
+
+/// The fix narrows the baseline, it does not disable the check: a REAL
+/// divergence between the manifest's declared strategy and the lock's
+/// recorded strategy must still raise FROZEN-STRATEGY-MISMATCH.
+#[test]
+fn frozen_baseline_catches_genuine_manifest_strategy_divergence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = CaStore::new(tmp.path().join(".cas"));
+    let mut m = manifest(vec![]);
+    m.resolution = Some(Resolution {
+        strategy: Some(Strategy::Minver),
+        exclude_newer: None,
+    });
+    // Lock genuinely recorded "maxver" while the manifest declares "minver".
+    let err = resolve_frozen(&m, &lock("maxver", vec![]), &store, &deps_dir(&tmp)).unwrap_err();
+    assert_eq!(err.code(), "FROZEN-STRATEGY-MISMATCH");
+}
+
+/// Regression guard: with NO `resolution {}` block at all, the baseline
+/// stays `maxver` (unchanged behavior).
+#[test]
+fn frozen_baseline_default_maxver_unchanged_with_no_resolution_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = CaStore::new(tmp.path().join(".cas"));
+    let graph = resolve_frozen(
+        &manifest(vec![]),
+        &lock("maxver", vec![]),
+        &store,
+        &deps_dir(&tmp),
+    )
+    .expect("no resolution block + maxver lock must succeed (default baseline unchanged)");
+    assert_eq!(graph.deps.len(), 0);
+}
+
+// -----------------------------------------------------------------------
+// D5 (resolution-semantics RFC §3 Axis D / §7 D5): FROZEN-EXCLUDE-NEWER-MISMATCH
+// — the same manifest-sourced-baseline-from-the-start shape C3b built for
+// FROZEN-STRATEGY-MISMATCH, mirrored exactly.
+// -----------------------------------------------------------------------
+
+#[test]
+fn exclude_newer_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = CaStore::new(tmp.path().join(".cas"));
+    let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+    // no resolution{} block → baseline is None; lockfile recorded a bound.
+    let err = resolve_frozen(
+        &manifest(vec![]),
+        &lock_with_exclude_newer("maxver", Some(ts), vec![]),
+        &store,
+        &deps_dir(&tmp),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "FROZEN-EXCLUDE-NEWER-MISMATCH");
+}
+
+/// The baseline is manifest-sourced from the start (built the same way as
+/// C3b fixed `FROZEN-STRATEGY-MISMATCH`): a manifest declaring `resolution
+/// { exclude-newer }` matching the lock's recorded value passes.
+#[test]
+fn frozen_baseline_follows_manifest_exclude_newer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = CaStore::new(tmp.path().join(".cas"));
+    let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+    let mut m = manifest(vec![]);
+    m.resolution = Some(Resolution {
+        strategy: None,
+        exclude_newer: Some(ts),
+    });
+    let graph = resolve_frozen(
+        &m,
+        &lock_with_exclude_newer("maxver", Some(ts), vec![]),
+        &store,
+        &deps_dir(&tmp),
+    )
+    .expect("matching manifest exclude-newer + lock must NOT raise FROZEN-EXCLUDE-NEWER-MISMATCH");
+    assert_eq!(graph.deps.len(), 0);
+}
+
+/// A REAL divergence (different timestamps) must still raise.
+#[test]
+fn frozen_baseline_catches_genuine_manifest_exclude_newer_divergence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = CaStore::new(tmp.path().join(".cas"));
+    let ts_manifest = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+    let ts_lock = parse_iso8601_timestamp("2020-01-01T00:00:00Z").unwrap();
+    let mut m = manifest(vec![]);
+    m.resolution = Some(Resolution {
+        strategy: None,
+        exclude_newer: Some(ts_manifest),
+    });
+    let err = resolve_frozen(
+        &m,
+        &lock_with_exclude_newer("maxver", Some(ts_lock), vec![]),
+        &store,
+        &deps_dir(&tmp),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "FROZEN-EXCLUDE-NEWER-MISMATCH");
+}
+
+/// Regression guard: with NO `resolution {}` block and NO recorded
+/// `exclude_newer` in the lock, both baselines are `None` — unchanged
+/// (pre-Axis-D) behavior.
+#[test]
+fn frozen_baseline_default_none_unchanged_with_no_resolution_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = CaStore::new(tmp.path().join(".cas"));
+    let graph = resolve_frozen(
+        &manifest(vec![]),
+        &lock("maxver", vec![]),
+        &store,
+        &deps_dir(&tmp),
+    )
+    .expect("no resolution block + no recorded exclude_newer must succeed");
+    assert_eq!(graph.deps.len(), 0);
 }
 
 #[test]
@@ -242,6 +398,155 @@ fn make_workspace_with_member(
     std::fs::write(member_dir.join("milpa.kdl"), member_kdl).unwrap();
     let ws = crate::workspace::load_workspace(root).unwrap();
     (tmp, ws)
+}
+
+/// Same as [`make_workspace_with_member`], plus a root-level `resolution {
+/// strategy "..." }` block — the workspace root is the sole legal
+/// declaration site (same root-authority model as index-trust/entry-trust).
+fn make_workspace_with_member_and_resolution(
+    member_name: &str,
+    member_kdl: &str,
+    resolution_block: &str,
+) -> (tempfile::TempDir, crate::workspace::LoadedWorkspace) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("milpa.kdl"),
+        format!("workspace {{\n    member \"{member_name}\"\n}}\n{resolution_block}"),
+    )
+    .unwrap();
+    let member_dir = root.join(member_name);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    std::fs::write(member_dir.join("milpa.kdl"), member_kdl).unwrap();
+    let ws = crate::workspace::load_workspace(root).unwrap();
+    (tmp, ws)
+}
+
+/// C3b: `resolve_workspace_frozen`'s baseline must be the workspace ROOT
+/// manifest's effective `resolution { strategy }` — a `minver` root with a
+/// genuinely-consistent `minver` lock must NOT raise
+/// FROZEN-STRATEGY-MISMATCH.
+#[test]
+fn workspace_frozen_baseline_follows_root_resolution_strategy() {
+    let (tmp, ws) = make_workspace_with_member_and_resolution(
+        "libfoo",
+        "name \"libfoo\"\nkind \"library\"\n",
+        "resolution {\n    strategy \"minver\"\n}\n",
+    );
+    let store = CaStore::new(tmp.path().join(".cas"));
+    let member_dir = tmp.path().join("libfoo");
+    let identity = crate::compute_content_hash(&member_dir).unwrap();
+    let lf = lock(
+        "minver",
+        vec![locked(
+            "libfoo",
+            "0.0.1",
+            Some(&identity),
+            ProvenanceRecord::Member {
+                name: "libfoo".into(),
+                origin: "observed".into(),
+            },
+        )],
+    );
+    let graph = crate::frozen::resolve_workspace_frozen(&ws, &lf, &store, &tmp.path().join("_deps"))
+        .expect("minver root + minver lock must NOT raise FROZEN-STRATEGY-MISMATCH");
+    assert_eq!(graph.deps.len(), 1);
+}
+
+/// The fix narrows the baseline, it does not disable the check: a REAL
+/// divergence between the workspace root's declared strategy and the
+/// lock's recorded strategy must still raise FROZEN-STRATEGY-MISMATCH.
+#[test]
+fn workspace_frozen_baseline_catches_genuine_root_strategy_divergence() {
+    let (tmp, ws) = make_workspace_with_member_and_resolution(
+        "libfoo",
+        "name \"libfoo\"\nkind \"library\"\n",
+        "resolution {\n    strategy \"minver\"\n}\n",
+    );
+    let store = CaStore::new(tmp.path().join(".cas"));
+    let member_dir = tmp.path().join("libfoo");
+    let identity = crate::compute_content_hash(&member_dir).unwrap();
+    // Lock genuinely recorded "maxver" while the root manifest declares "minver".
+    let lf = lock(
+        "maxver",
+        vec![locked(
+            "libfoo",
+            "0.0.1",
+            Some(&identity),
+            ProvenanceRecord::Member {
+                name: "libfoo".into(),
+                origin: "observed".into(),
+            },
+        )],
+    );
+    let err = crate::frozen::resolve_workspace_frozen(&ws, &lf, &store, &tmp.path().join("_deps"))
+        .unwrap_err();
+    assert_eq!(err.code(), "FROZEN-STRATEGY-MISMATCH");
+}
+
+/// D5 workspace analog: `resolve_workspace_frozen`'s `exclude_newer`
+/// baseline must be the workspace ROOT manifest's effective `resolution {
+/// exclude-newer }` — a matching root + lock must NOT raise
+/// FROZEN-EXCLUDE-NEWER-MISMATCH.
+#[test]
+fn workspace_frozen_baseline_follows_root_resolution_exclude_newer() {
+    let (tmp, ws) = make_workspace_with_member_and_resolution(
+        "libfoo",
+        "name \"libfoo\"\nkind \"library\"\n",
+        "resolution {\n    exclude-newer \"2026-01-01T00:00:00Z\"\n}\n",
+    );
+    let store = CaStore::new(tmp.path().join(".cas"));
+    let member_dir = tmp.path().join("libfoo");
+    let identity = crate::compute_content_hash(&member_dir).unwrap();
+    let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+    let lf = lock_with_exclude_newer(
+        "maxver",
+        Some(ts),
+        vec![locked(
+            "libfoo",
+            "0.0.1",
+            Some(&identity),
+            ProvenanceRecord::Member {
+                name: "libfoo".into(),
+                origin: "observed".into(),
+            },
+        )],
+    );
+    let graph = crate::frozen::resolve_workspace_frozen(&ws, &lf, &store, &tmp.path().join("_deps"))
+        .expect("matching root exclude-newer + lock must NOT raise FROZEN-EXCLUDE-NEWER-MISMATCH");
+    assert_eq!(graph.deps.len(), 1);
+}
+
+/// A REAL divergence between the root's declared exclude-newer and the
+/// lock's recorded value must still raise.
+#[test]
+fn workspace_frozen_baseline_catches_genuine_root_exclude_newer_divergence() {
+    let (tmp, ws) = make_workspace_with_member_and_resolution(
+        "libfoo",
+        "name \"libfoo\"\nkind \"library\"\n",
+        "resolution {\n    exclude-newer \"2026-01-01T00:00:00Z\"\n}\n",
+    );
+    let store = CaStore::new(tmp.path().join(".cas"));
+    let member_dir = tmp.path().join("libfoo");
+    let identity = crate::compute_content_hash(&member_dir).unwrap();
+    // Lock genuinely recorded a different timestamp than the root declares.
+    let ts_lock = parse_iso8601_timestamp("2020-01-01T00:00:00Z").unwrap();
+    let lf = lock_with_exclude_newer(
+        "maxver",
+        Some(ts_lock),
+        vec![locked(
+            "libfoo",
+            "0.0.1",
+            Some(&identity),
+            ProvenanceRecord::Member {
+                name: "libfoo".into(),
+                origin: "observed".into(),
+            },
+        )],
+    );
+    let err = crate::frozen::resolve_workspace_frozen(&ws, &lf, &store, &tmp.path().join("_deps"))
+        .unwrap_err();
+    assert_eq!(err.code(), "FROZEN-EXCLUDE-NEWER-MISMATCH");
 }
 
 #[test]
@@ -496,6 +801,7 @@ fn frozen_carries_all_provenances() {
         submodule_shas: vec![],
     };
     let locked_dep = LockedDep {
+        declared_version_source: None,
         name: "foo".into(),
         namespace: None,
         identity: Some(identity),
@@ -537,6 +843,7 @@ fn frozen_carries_all_provenances() {
 /// Helper: a minimal ResolvedDep with a Local provenance and no identity.
 fn local_dep(name: &str, path: &str) -> milpa_types::ResolvedDep {
     milpa_types::ResolvedDep {
+        declared_version_source: None,
         name: name.into(),
         namespace: None,
         identity: String::new(),
@@ -640,6 +947,7 @@ fn rebuild_deps_view_preserves_local_symlink_alongside_cas_dep() {
 
     let local = local_dep("locallib", &local_src.to_string_lossy());
     let git = milpa_types::ResolvedDep {
+        declared_version_source: None,
         name: "foo".into(),
         namespace: None,
         identity: identity.clone(),

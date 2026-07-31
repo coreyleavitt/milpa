@@ -370,6 +370,17 @@ pub struct ResolvedDep {
     /// `LockAttestation::namespace` at the `locked_from_resolved` boundary;
     /// not otherwise emitted.
     pub registry_namespace: Option<String>,
+    /// A5 (resolution-semantics RFC §3 Axis A (b) / §5): the sibling field to
+    /// `version` — WHICH precedence step (`manifest`/`nimble`/`tag`/
+    /// `annotation`) produced a git/url/local/tarball/member dep's declared
+    /// version. Stored as the plain lockfile-schema string (mirrors
+    /// `Lockfile.strategy: String` — `milpa-types` cannot depend on
+    /// `milpa-solver`, which owns the `VersionSource` enum, so the value is
+    /// converted to its canonical spelling at the `milpa-core` boundary).
+    /// `None` for a version-unknown dep (which also always has
+    /// `version == 0.0.0` — a combination no `Known` case ever produces, §5
+    /// NORMATIVE) and for named/index-resolved deps (out of Axis A's scope).
+    pub declared_version_source: Option<String>,
 }
 
 /// The resolved dependency graph — the resolver's output, the emitters' input.
@@ -510,6 +521,12 @@ pub struct LockedDep {
     /// for non-named deps and for named deps with no (or a collapsed) index
     /// attestation record.
     pub attestation: Option<LockAttestation>,
+    /// A5 (resolution-semantics RFC §3 Axis A (b) / §5): sibling field to
+    /// `version` — see `ResolvedDep.declared_version_source` for the full
+    /// contract. Always emitted when a source exists; `None` for a
+    /// version-unknown dep (`version == "0.0.0"`, no source — the
+    /// unambiguous boundary pairing, §5 NORMATIVE) and for named/index deps.
+    pub declared_version_source: Option<String>,
 }
 
 /// The parsed `milpa.lock` as data (parse/emit logic lives in `milpa-core`).
@@ -519,6 +536,16 @@ pub struct Lockfile {
     /// distinct namespace from the manifest `spec-version` (lockfile-schema §2.1).
     pub version: u32,
     pub strategy: String,
+    /// D5 (resolution-semantics RFC §3 Axis D / §5): the EFFECTIVE
+    /// `exclude_newer` time-bound this lockfile was resolved under, recorded
+    /// for diagnostics and the frozen fast-path `FROZEN-EXCLUDE-NEWER-MISMATCH`
+    /// check (mirrors `strategy`'s exact role for `FROZEN-STRATEGY-MISMATCH`).
+    /// `None` when no bound was in effect — a conformant emitter omits the
+    /// top-level `exclude_newer` node entirely in that case (never a sentinel
+    /// timestamp), the same "emit only when present" rule `strategy` does NOT
+    /// get (strategy is unconditionally required) but `declared_version_source`
+    /// and other additive fields do.
+    pub exclude_newer: Option<Timestamp>,
     pub deps: Vec<LockedDep>,
 }
 
@@ -530,6 +557,7 @@ impl Default for Lockfile {
         Lockfile {
             version: LOCKFILE_SCHEMA_VERSION,
             strategy: "maxver".to_string(),
+            exclude_newer: None,
             deps: Vec::new(),
         }
     }
@@ -695,6 +723,184 @@ pub enum ActivationSource {
     EdgeRequest,
     EnablesRule,
     Cli,
+}
+
+// ---------------------------------------------------------------------------
+// A2a timestamp parsing (registry-protocol §3.2) — no external date crate:
+// the ratchet engine (`milpa-core::ratchet`) only needs EQUALITY over this
+// type (the set-once dominance check), never arithmetic or formatting, so a
+// minimal hand-rolled ISO-8601/RFC-3339 parser normalizing to a UTC instant is
+// sufficient and keeps this crate dep-light. Mirrors Python's
+// `_parse_timestamp` (`datetime.fromisoformat`): malformed input -> `None`,
+// never an error.
+//
+// D0 (rfc-resolution-semantics.md Axis D prerequisite): moved here from
+// `milpa-core::registry` so `milpa-manifest` can reach it too (D1 parses and
+// validates a manifest `resolution { exclude-newer }` timestamp at parse
+// time) without `milpa-manifest` depending on its own downstream crate
+// `milpa-core`, which would be a cargo cycle. Pure move — no behavior change.
+// `milpa-core::registry` re-exports both items for back-compat (all existing
+// `milpa_core::registry::{Timestamp, parse_iso8601_timestamp}` references
+// compile unchanged).
+// ---------------------------------------------------------------------------
+
+/// A parsed timestamp, normalized to a UTC instant: seconds since the Unix
+/// epoch plus a sub-second nanosecond remainder. `Eq`-able (no floats) so it
+/// can ride `IndexVersion`'s derived `PartialEq + Eq`. `Ord` (D3,
+/// resolution-semantics RFC §3 Axis D / §6 D-D3) is the derived
+/// lexicographic order over `(unix_seconds, nanos)` — exactly chronological
+/// order, since both fields are already a normalized UTC instant — used by
+/// the exclude-newer `published_at <= ts` comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Timestamp {
+    pub unix_seconds: i64,
+    pub nanos: u32,
+}
+
+/// Parse `YYYY-MM-DDTHH:MM:SS[.fraction][Z|±HH:MM]` (`T` may also be a space
+/// or lowercase `t`; an absent offset is treated as UTC). Returns `None` on
+/// any malformed input — the caller's absence posture, never a raised error.
+pub fn parse_iso8601_timestamp(raw: &str) -> Option<Timestamp> {
+    let bytes = raw.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let digit = |i: usize| -> Option<i64> {
+        bytes.get(i).filter(|b| b.is_ascii_digit()).map(|b| (*b - b'0') as i64)
+    };
+    let two = |i: usize| -> Option<i64> { Some(digit(i)? * 10 + digit(i + 1)?) };
+    let four = |i: usize| -> Option<i64> {
+        Some(digit(i)? * 1000 + digit(i + 1)? * 100 + digit(i + 2)? * 10 + digit(i + 3)?)
+    };
+
+    let year = four(0)?;
+    if bytes.get(4) != Some(&b'-') {
+        return None;
+    }
+    let month = two(5)?;
+    if bytes.get(7) != Some(&b'-') {
+        return None;
+    }
+    let day = two(8)?;
+    match bytes.get(10) {
+        Some(b'T') | Some(b't') | Some(b' ') => {}
+        _ => return None,
+    }
+    let hour = two(11)?;
+    if bytes.get(13) != Some(&b':') {
+        return None;
+    }
+    let minute = two(14)?;
+    if bytes.get(16) != Some(&b':') {
+        return None;
+    }
+    let second = two(17)?;
+
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=60).contains(&second) {
+        return None;
+    }
+
+    let mut idx = 19;
+    let mut nanos: u32 = 0;
+    if matches!(bytes.get(idx), Some(b'.') | Some(b',')) {
+        idx += 1;
+        let start = idx;
+        while bytes.get(idx).is_some_and(u8::is_ascii_digit) {
+            idx += 1;
+        }
+        if idx == start {
+            return None; // "." with no digits following
+        }
+        let frac = &raw[start..idx];
+        let mut digits: String = frac.chars().take(9).collect();
+        while digits.len() < 9 {
+            digits.push('0');
+        }
+        nanos = digits.parse().ok()?;
+    }
+
+    let offset_seconds: i64 = match bytes.get(idx) {
+        None => 0, // naive: treated as UTC
+        Some(b'Z') | Some(b'z') => {
+            idx += 1;
+            0
+        }
+        Some(sign @ (b'+' | b'-')) => {
+            let sign_mult: i64 = if *sign == b'+' { 1 } else { -1 };
+            let oh = two(idx + 1)?;
+            if bytes.get(idx + 3) != Some(&b':') {
+                return None;
+            }
+            let om = two(idx + 4)?;
+            if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
+                return None;
+            }
+            idx += 6;
+            sign_mult * (oh * 3600 + om * 60)
+        }
+        _ => return None,
+    };
+    if idx != bytes.len() {
+        return None; // trailing garbage
+    }
+
+    let days = days_from_civil(year, month as u32, day as u32);
+    let unix_seconds = days * 86400 + hour * 3600 + minute * 60 + second - offset_seconds;
+    Some(Timestamp { unix_seconds, nanos })
+}
+
+/// Howard Hinnant's `days_from_civil` — days since the Unix epoch
+/// (1970-01-01) for a proleptic-Gregorian civil date. `m` is 1-12.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (i64::from(m) + 9) % 12; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719468
+}
+
+/// Howard Hinnant's `civil_from_days` — the inverse of [`days_from_civil`]:
+/// a proleptic-Gregorian civil date (year, month `1-12`, day `1-31`) for a
+/// day count since the Unix epoch (1970-01-01). Used by
+/// [`format_iso8601_timestamp`] (D1, rfc-resolution-semantics.md §3 Axis D)
+/// to render a normalized [`Timestamp`] back to a wire ISO 8601 string.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Format a [`Timestamp`] back to canonical UTC ISO 8601
+/// (`YYYY-MM-DDTHH:MM:SS[.fraction]Z`) — the inverse of
+/// [`parse_iso8601_timestamp`]. `Timestamp` is always a normalized UTC
+/// instant (no separate offset is retained from the original text), so the
+/// canonical wire form always ends in `Z` — matching the RFC's own
+/// `resolution { exclude-newer "…Z" }` example (D1). Sub-second precision
+/// is included only when `nanos != 0` (never a fake trailing `.000000000`).
+pub fn format_iso8601_timestamp(ts: &Timestamp) -> String {
+    let (y, m, d) = civil_from_days(ts.unix_seconds.div_euclid(86400));
+    let secs_of_day = ts.unix_seconds.rem_euclid(86400);
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    let second = secs_of_day % 60;
+    if ts.nanos == 0 {
+        format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+    } else {
+        let mut frac = format!("{:09}", ts.nanos);
+        while frac.ends_with('0') {
+            frac.pop();
+        }
+        format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}.{frac}Z")
+    }
 }
 
 #[cfg(test)]
@@ -913,4 +1119,106 @@ mod tests {
         assert_eq!(dep_dir_name("bar", Some("ns1")), "@ns1/bar");
     }
 
+    // ISO-8601 timestamp parser — malformed/edge cases (moved from
+    // `milpa-core::registry_tests` in D0; see `parse_iso8601_timestamp` docs
+    // above for why this is hand-rolled rather than an external date crate).
+
+    #[test]
+    fn iso8601_parses_z_suffixed() {
+        let t = parse_iso8601_timestamp("2026-05-26T04:49:44Z").unwrap();
+        // 2026-05-26T04:49:44Z: sanity-check against an independently computed
+        // Unix timestamp (via `date -u -d ... +%s`-equivalent reasoning is not
+        // available offline here, so this pins internal consistency: re-parsing
+        // the same string is idempotent and two different instants differ).
+        let t2 = parse_iso8601_timestamp("2026-05-26T04:49:44Z").unwrap();
+        assert_eq!(t, t2);
+        let t3 = parse_iso8601_timestamp("2026-05-26T04:49:45Z").unwrap();
+        assert_ne!(t, t3);
+        assert_eq!(t3.unix_seconds, t.unix_seconds + 1);
+    }
+
+    #[test]
+    fn iso8601_offset_and_z_agree_on_same_instant() {
+        let z = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+        let offset = parse_iso8601_timestamp("2026-01-01T01:00:00+01:00").unwrap();
+        assert_eq!(z, offset);
+    }
+
+    #[test]
+    fn iso8601_offsetless_assumes_utc() {
+        // R2 (cross-impl parity): an offsetless-but-otherwise-valid timestamp
+        // (no trailing `Z`/offset — a very natural thing to type in a
+        // manifest `resolution { exclude-newer }` or `--exclude-newer` CLI
+        // value) must parse the same as its `Z`-suffixed spelling. Rust
+        // already does this by construction (`offset_seconds = 0` when no
+        // offset is present); this pins the behavior so it can't regress,
+        // and matches Python's `_parse_timestamp`, which normalizes a naive
+        // `datetime.fromisoformat` result to UTC for the same reason.
+        let naive = parse_iso8601_timestamp("2026-01-01T00:00:00").unwrap();
+        let z = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(naive, z);
+    }
+
+    #[test]
+    fn iso8601_rejects_garbage() {
+        assert!(parse_iso8601_timestamp("not-a-timestamp").is_none());
+        assert!(parse_iso8601_timestamp("").is_none());
+        assert!(parse_iso8601_timestamp("2026-13-01T00:00:00Z").is_none()); // month 13
+        assert!(parse_iso8601_timestamp("2026-01-01T00:00:00+99:99").is_none());
+    }
+
+    // format_iso8601_timestamp (D1, rfc-resolution-semantics.md §3 Axis D) —
+    // the inverse of parse_iso8601_timestamp, used by the manifest
+    // `resolution { exclude-newer }` round-trip emitter.
+
+    #[test]
+    fn format_iso8601_round_trips_whole_seconds() {
+        let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(format_iso8601_timestamp(&ts), "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn format_iso8601_round_trips_arbitrary_instant() {
+        let ts = parse_iso8601_timestamp("2026-06-15T12:30:45Z").unwrap();
+        assert_eq!(format_iso8601_timestamp(&ts), "2026-06-15T12:30:45Z");
+    }
+
+    #[test]
+    fn format_iso8601_normalizes_an_offset_to_utc_z() {
+        let ts = parse_iso8601_timestamp("2026-01-01T01:00:00+01:00").unwrap();
+        assert_eq!(format_iso8601_timestamp(&ts), "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn format_iso8601_omits_fraction_when_zero() {
+        let ts = Timestamp {
+            unix_seconds: 0,
+            nanos: 0,
+        };
+        assert_eq!(format_iso8601_timestamp(&ts), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn format_iso8601_includes_fraction_when_present() {
+        let ts = Timestamp {
+            unix_seconds: 0,
+            nanos: 500_000_000,
+        };
+        assert_eq!(format_iso8601_timestamp(&ts), "1970-01-01T00:00:00.5Z");
+    }
+
+    #[test]
+    fn civil_from_days_is_the_inverse_of_days_from_civil() {
+        for (y, m, d) in [
+            (1970, 1, 1),
+            (2026, 1, 1),
+            (2026, 6, 15),
+            (2000, 2, 29), // leap day
+            (1969, 12, 31),
+            (1900, 3, 1),
+        ] {
+            let days = days_from_civil(y, m, d);
+            assert_eq!(civil_from_days(days), (y, m, d), "round-trip for {y}-{m}-{d}");
+        }
+    }
 }

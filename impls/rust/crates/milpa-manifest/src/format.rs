@@ -47,6 +47,34 @@ pub fn format_manifest(m: &Manifest) -> String {
         lines.push(format!("name \"{}\"", kdl_str(name)));
         lines.push(String::new());
     }
+    // version — A1 (§3 Axis A (b) step 1): the package's own declared release
+    // version, present iff `m.version` is set (absent-stays-absent, mirroring
+    // spec-version above — no default value to fall back to).
+    if let Some(version) = &m.version {
+        lines.push(format!("version \"{}\"", milpa_solver::format_version_str(version)));
+        lines.push(String::new());
+    }
+    // resolution { strategy "..."; exclude-newer "..." } — C3 (§3 Axis C /
+    // §5) + D1 (§3 Axis D). Emitted only when there is actual content
+    // (either child set); an empty/absent block is behaviorally identical
+    // at the effective-strategy/exclude-newer precedence point, so there is
+    // nothing to preserve on round-trip for the empty case.
+    if let Some(resolution) = m.resolution {
+        if resolution.strategy.is_some() || resolution.exclude_newer.is_some() {
+            lines.push("resolution {".to_string());
+            if let Some(strategy) = resolution.strategy {
+                lines.push(format!("    strategy \"{}\"", strategy.as_str()));
+            }
+            if let Some(ts) = resolution.exclude_newer {
+                lines.push(format!(
+                    "    exclude-newer \"{}\"",
+                    milpa_types::format_iso8601_timestamp(&ts)
+                ));
+            }
+            lines.push("}".to_string());
+            lines.push(String::new());
+        }
+    }
     if !m.src_dir.is_empty() {
         lines.push(format!("src_dir \"{}\"", kdl_str(&m.src_dir)));
         lines.push(String::new());
@@ -108,21 +136,28 @@ pub fn format_manifest(m: &Manifest) -> String {
     if !m.overrides.is_empty() {
         lines.push("overrides {".to_string());
         for ov in &m.overrides {
+            // A3b: version= annotation on the override rule itself (§3 Axis A
+            // (b) step 4, D-A3) — valid regardless of target form.
+            let version_suffix = ov
+                .version
+                .as_ref()
+                .map(|v| format!(" version=\"{}\"", milpa_solver::format_version_str(v)))
+                .unwrap_or_default();
             match &ov.target {
                 OverrideTarget::Git { url, git_ref } => {
                     lines.push(format!(
-                        "    pkg \"{}\" git=(url)\"{}\" ref=\"{}\"",
-                        kdl_str(&ov.name), kdl_str(url), kdl_str(git_ref)
+                        "    pkg \"{}\" git=(url)\"{}\" ref=\"{}\"{}",
+                        kdl_str(&ov.name), kdl_str(url), kdl_str(git_ref), version_suffix
                     ));
                 }
                 OverrideTarget::Local { path } => {
                     lines.push(format!(
-                        "    pkg \"{}\" local=\"{}\"",
-                        kdl_str(&ov.name), kdl_str(path)
+                        "    pkg \"{}\" local=\"{}\"{}",
+                        kdl_str(&ov.name), kdl_str(path), version_suffix
                     ));
                 }
                 OverrideTarget::Member { member_name } => {
-                    lines.push(format!("    pkg \"{}\" {{", kdl_str(&ov.name)));
+                    lines.push(format!("    pkg \"{}\"{} {{", kdl_str(&ov.name), version_suffix));
                     lines.push(format!("        member \"{}\"", kdl_str(member_name)));
                     lines.push("    }".to_string());
                 }
@@ -243,6 +278,30 @@ pub fn format_workspace_manifest(ws: &Workspace) -> String {
         lines.push(String::new());
     }
 
+    // resolution { strategy "..."; exclude-newer "..." } — C3 (§3 Axis C /
+    // §5) + D1 (§3 Axis D), root-only. Emitted right after `name` (matches
+    // this formatter's own canonical position for workspace-root policy
+    // fields — index-trust/entry-trust/index-history below follow the
+    // pre-existing, out-of-scope Python/Rust ordering divergence documented
+    // in the resolution-semantics handoff; this NEW field does not inherit
+    // it).
+    if let Some(resolution) = ws.resolution {
+        if resolution.strategy.is_some() || resolution.exclude_newer.is_some() {
+            lines.push("resolution {".to_string());
+            if let Some(strategy) = resolution.strategy {
+                lines.push(format!("    strategy \"{}\"", strategy.as_str()));
+            }
+            if let Some(ts) = resolution.exclude_newer {
+                lines.push(format!(
+                    "    exclude-newer \"{}\"",
+                    milpa_types::format_iso8601_timestamp(&ts)
+                ));
+            }
+            lines.push("}".to_string());
+            lines.push(String::new());
+        }
+    }
+
     // index-trust / index-trust-signer / index-trust-bundle (RD-M2 code-review
     // item; spec §3.4.7 root-authority model — the workspace root is the
     // resolution root for index-trust purposes). Mirrors `format_manifest`'s
@@ -289,18 +348,24 @@ pub fn format_workspace_manifest(ws: &Workspace) -> String {
     if !ws.overrides.is_empty() {
         lines.push("overrides {".to_string());
         for ov in &ws.overrides {
+            // A3b: version= annotation on the override rule itself.
+            let version_suffix = ov
+                .version
+                .as_ref()
+                .map(|v| format!(" version=\"{}\"", milpa_solver::format_version_str(v)))
+                .unwrap_or_default();
             match &ov.target {
                 OverrideTarget::Git { url, git_ref } => {
                     lines.push(format!(
-                        "    pkg \"{}\" git=(url)\"{}\" ref=\"{}\"",
-                        kdl_str(&ov.name), kdl_str(url), kdl_str(git_ref)
+                        "    pkg \"{}\" git=(url)\"{}\" ref=\"{}\"{}",
+                        kdl_str(&ov.name), kdl_str(url), kdl_str(git_ref), version_suffix
                     ));
                 }
                 OverrideTarget::Local { path } => {
-                    lines.push(format!("    pkg \"{}\" local=\"{}\"", kdl_str(&ov.name), kdl_str(path)));
+                    lines.push(format!("    pkg \"{}\" local=\"{}\"{}", kdl_str(&ov.name), kdl_str(path), version_suffix));
                 }
                 OverrideTarget::Member { member_name } => {
-                    lines.push(format!("    pkg \"{}\" {{", kdl_str(&ov.name)));
+                    lines.push(format!("    pkg \"{}\"{} {{", kdl_str(&ov.name), version_suffix));
                     lines.push(format!("        member \"{}\"", kdl_str(member_name)));
                     lines.push("    }".to_string());
                 }
@@ -444,6 +509,11 @@ fn format_dep_line(dep: &Dep) -> String {
                 "    \"{}\" git=(url)\"{}\" ref=\"{}\"",
                 kdl_str(&u.name), kdl_str(&u.git), kdl_str(&u.git_ref)
             );
+            // version= annotation — A3b (§3 Axis A (b) step 4), Cargo's
+            // {git, ref, version} pattern. Present iff u.version is set.
+            if let Some(version) = &u.version {
+                head.push_str(&format!(" version=\"{}\"", milpa_solver::format_version_str(version)));
+            }
             // S7: emit `optional=#true` and strip the auto-injected gate predicate.
             if u.optional {
                 head.push_str(" optional=#true");
@@ -525,7 +595,10 @@ fn format_dep_line(dep: &Dep) -> String {
             }
         }
         Dep::Local(l) => {
-            let node_body = format!("\"{}\" local=\"{}\"", kdl_str(&l.name), kdl_str(&l.path));
+            let mut node_body = format!("\"{}\" local=\"{}\"", kdl_str(&l.name), kdl_str(&l.path));
+            if let Some(version) = &l.version {
+                node_body.push_str(&format!(" version=\"{}\"", milpa_solver::format_version_str(version)));
+            }
             if !l.predicates.is_empty() {
                 let preds: Vec<&_> = l.predicates.iter().collect();
                 let when_props = format_predicate_props(&preds);
@@ -545,6 +618,9 @@ fn format_dep_line(dep: &Dep) -> String {
             }
             if t.strip_components != 0 {
                 parts.push(format!("strip_components={}", t.strip_components));
+            }
+            if let Some(version) = &t.version {
+                parts.push(format!("version=\"{}\"", milpa_solver::format_version_str(version)));
             }
             let node_body = parts.join(" ");
             if !t.predicates.is_empty() {
@@ -650,6 +726,7 @@ mod tests {
             cas_dir: String::new(),
             spec_version: 1,
             spec_version_explicit: false,
+            version: None,
             attestation_policy: crate::TrustPolicy::Warn,
             index_trust_policy: crate::TrustPolicy::Warn,
             index_trust_signer: None,
@@ -659,6 +736,7 @@ mod tests {
             entry_trust_policy_explicit: false,
             index_history_policy: crate::TrustPolicy::Warn,
             index_history_policy_explicit: false,
+        resolution: None,
             optional_auto_flags: std::collections::BTreeSet::new(),
         }
     }
@@ -688,6 +766,7 @@ mod tests {
                 predicates: Vec::new(),
                 flag_requests: Vec::new(),
                 optional: false,
+                version: None,
             }),
             Dep::Named(NamedDep {
                 name: "bar".into(),
@@ -719,6 +798,227 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // A1 (rfc-resolution-semantics.md §3 Axis A (b) step 1 / §5): top-level
+    // package `version` field round-trip. The hand-rolled per-field emitter
+    // has silently dropped a new field before when an emit line was
+    // forgotten — this pins the field so a future omission fails loudly.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn package_version_emitted_only_when_present() {
+        let m_absent = base();
+        let mut m_present = base();
+        m_present.version = Some(milpa_types::Version::release(1, 2, 3));
+        assert!(!format_manifest(&m_absent).contains("version"));
+        assert!(format_manifest(&m_present).contains("version \"1.2.3\""));
+    }
+
+    #[test]
+    fn package_version_round_trips() {
+        let mut m = base();
+        m.version = Some(milpa_types::Version::release(1, 2, 3));
+        let text = format_manifest(&m);
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Package(p) => p,
+            other => panic!("expected package, got {other:?}"),
+        };
+        assert_eq!(reparsed, m);
+    }
+
+    // -----------------------------------------------------------------------
+    // C3 (rfc-resolution-semantics.md §3 Axis C / §5): manifest
+    // `resolution { strategy }` block round-trip — same silent-drop trap as
+    // the package `version` field above.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolution_strategy_emitted_only_when_present() {
+        let m_absent = base();
+        let mut m_empty = base();
+        m_empty.resolution = Some(crate::Resolution {
+            strategy: None,
+            exclude_newer: None,
+        });
+        let mut m_present = base();
+        m_present.resolution = Some(crate::Resolution {
+            strategy: Some(milpa_solver::Strategy::Semver),
+            exclude_newer: None,
+        });
+        assert!(!format_manifest(&m_absent).contains("resolution"));
+        assert!(!format_manifest(&m_empty).contains("resolution"));
+        assert!(format_manifest(&m_present).contains("strategy \"semver\""));
+    }
+
+    #[test]
+    fn resolution_strategy_round_trips() {
+        let mut m = base();
+        m.resolution = Some(crate::Resolution {
+            strategy: Some(milpa_solver::Strategy::LowestDirect),
+            exclude_newer: None,
+        });
+        let text = format_manifest(&m);
+        assert!(text.contains("strategy \"lowest-direct\""));
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Package(p) => p,
+            other => panic!("expected package, got {other:?}"),
+        };
+        assert_eq!(
+            reparsed.resolution.and_then(|r| r.strategy),
+            Some(milpa_solver::Strategy::LowestDirect)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D1 (rfc-resolution-semantics.md §3 Axis D): manifest
+    // `resolution { exclude-newer }` block round-trip.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolution_exclude_newer_emitted_only_when_present() {
+        let m_absent = base();
+        let mut m_empty = base();
+        m_empty.resolution = Some(crate::Resolution {
+            strategy: None,
+            exclude_newer: None,
+        });
+        let mut m_present = base();
+        m_present.resolution = Some(crate::Resolution {
+            strategy: None,
+            exclude_newer: milpa_types::parse_iso8601_timestamp("2026-01-01T00:00:00Z"),
+        });
+        assert!(!format_manifest(&m_absent).contains("resolution"));
+        assert!(!format_manifest(&m_empty).contains("resolution"));
+        assert!(format_manifest(&m_present).contains("exclude-newer \"2026-01-01T00:00:00Z\""));
+    }
+
+    #[test]
+    fn resolution_exclude_newer_round_trips() {
+        let mut m = base();
+        m.resolution = Some(crate::Resolution {
+            strategy: None,
+            exclude_newer: milpa_types::parse_iso8601_timestamp("2026-06-15T12:30:45Z"),
+        });
+        let text = format_manifest(&m);
+        assert!(text.contains("exclude-newer \"2026-06-15T12:30:45Z\""));
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Package(p) => p,
+            other => panic!("expected package, got {other:?}"),
+        };
+        assert_eq!(
+            reparsed.resolution.and_then(|r| r.exclude_newer),
+            milpa_types::parse_iso8601_timestamp("2026-06-15T12:30:45Z")
+        );
+    }
+
+    #[test]
+    fn resolution_strategy_and_exclude_newer_both_round_trip() {
+        let mut m = base();
+        m.resolution = Some(crate::Resolution {
+            strategy: Some(milpa_solver::Strategy::Minver),
+            exclude_newer: milpa_types::parse_iso8601_timestamp("2026-01-01T00:00:00Z"),
+        });
+        let text = format_manifest(&m);
+        assert!(text.contains("strategy \"minver\""));
+        assert!(text.contains("exclude-newer \"2026-01-01T00:00:00Z\""));
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Package(p) => p,
+            other => panic!("expected package, got {other:?}"),
+        };
+        let r = reparsed.resolution.unwrap();
+        assert_eq!(r.strategy, Some(milpa_solver::Strategy::Minver));
+        assert_eq!(
+            r.exclude_newer,
+            milpa_types::parse_iso8601_timestamp("2026-01-01T00:00:00Z")
+        );
+    }
+
+    /// A3b (§3 Axis A (b) step 4): a UrlDep's `version=` annotation
+    /// round-trips through format→parse (the hand-rolled emitter has
+    /// silently dropped a new field before — pin the round-trip, not just
+    /// the parse).
+    #[test]
+    fn url_dep_version_annotation_round_trips() {
+        let mut m = base();
+        m.deps = vec![Dep::Url(UrlDep {
+            name: "foo".into(),
+            git: "https://e/foo.git".into(),
+            git_ref: "main".into(),
+            mirrors: Vec::new(),
+            predicates: Vec::new(),
+            flag_requests: Vec::new(),
+            optional: false,
+            version: Some(milpa_solver::parse_version("1.2.3").unwrap()),
+        })];
+        let text = format_manifest(&m);
+        assert!(text.contains("version=\"1.2.3\""), "text:\n{text}");
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Package(p) => p,
+            other => panic!("expected package, got {other:?}"),
+        };
+        assert_eq!(reparsed, m);
+    }
+
+    #[test]
+    fn local_dep_version_annotation_round_trips() {
+        let mut m = base();
+        m.deps = vec![Dep::Local(crate::LocalDep {
+            name: "foo".into(),
+            path: "../foo".into(),
+            predicates: Vec::new(),
+            version: Some(milpa_solver::parse_version("0.5.0").unwrap()),
+        })];
+        let text = format_manifest(&m);
+        assert!(text.contains("version=\"0.5.0\""), "text:\n{text}");
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Package(p) => p,
+            other => panic!("expected package, got {other:?}"),
+        };
+        assert_eq!(reparsed, m);
+    }
+
+    #[test]
+    fn tarball_dep_version_annotation_round_trips() {
+        let mut m = base();
+        m.deps = vec![Dep::Tarball(crate::TarballDep {
+            name: "foo".into(),
+            url: "https://example.com/foo.tar.gz".into(),
+            sha256: None,
+            strip_components: 0,
+            predicates: Vec::new(),
+            version: Some(milpa_solver::parse_version("3.0.0").unwrap()),
+        })];
+        let text = format_manifest(&m);
+        assert!(text.contains("version=\"3.0.0\""), "text:\n{text}");
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Package(p) => p,
+            other => panic!("expected package, got {other:?}"),
+        };
+        assert_eq!(reparsed, m);
+    }
+
+    /// A3b/D-A3: an override rule's `version=` annotation round-trips
+    /// (orthogonal to the target form — tested on the git form here).
+    #[test]
+    fn override_version_annotation_round_trips() {
+        let mut m = base();
+        m.overrides = vec![crate::Override {
+            name: "foo".into(),
+            target: OverrideTarget::Git {
+                url: "https://github.com/fork/foo.git".into(),
+                git_ref: "dev".into(),
+            },
+            version: Some(milpa_solver::parse_version("2.0.0").unwrap()),
+        }];
+        let text = format_manifest(&m);
+        assert!(text.contains("version=\"2.0.0\""), "text:\n{text}");
+        let reparsed = match crate::parse_document(&text).unwrap() {
+            crate::ManifestDoc::Package(p) => p,
+            other => panic!("expected package, got {other:?}"),
+        };
+        assert_eq!(reparsed, m);
+    }
+
+    // -----------------------------------------------------------------------
     // Conditional-dep round-trip tests (§8 / #163)
     // Predicates must survive format → parse for ALL 5 dep forms.
     // -----------------------------------------------------------------------
@@ -745,6 +1045,7 @@ mod tests {
             name: "locallib".into(),
             path: "../locallib".into(),
             predicates: vec![platform_pred("linux")],
+            version: None,
         })];
         let text = format_manifest(&m);
         // Must use when-block form.
@@ -772,6 +1073,7 @@ mod tests {
             sha256: None,
             strip_components: 0,
             predicates: vec![platform_pred("macosx")],
+            version: None,
         })];
         let text = format_manifest(&m);
         assert!(text.contains("when"), "expected when-block in:\n{text}");
@@ -899,6 +1201,7 @@ mod tests {
                 name: "locallib".into(),
                 path: "./locallib".into(),
                 predicates: Vec::new(),
+                version: None,
             }),
             Dep::Member(crate::MemberDep {
                 name: "sub".into(),
@@ -1067,6 +1370,7 @@ mod tests {
             entry_trust_policy_explicit: false,
             index_history_policy: crate::TrustPolicy::Warn,
             index_history_policy_explicit: false,
+        resolution: None,
         };
 
         let text = format_workspace_manifest(&ws);

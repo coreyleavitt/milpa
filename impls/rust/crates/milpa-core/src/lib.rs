@@ -14,7 +14,7 @@ use std::path::Path;
 use milpa_manifest::{Manifest, Workspace};
 pub use milpa_types::{
     ActivationSource, AttestationKind, EntryAttestation, LockAttestation, LockedDep, Lockfile,
-    ProvenanceRecord, RekorRef,
+    ProvenanceRecord, RekorRef, Version,
 };
 use milpa_types::ResolvedGraph;
 
@@ -77,8 +77,8 @@ pub use index_ratchet_seam::{
 };
 pub use ratchet::{canonical_digest, Baseline, EntryKey, RatchetOutcome, Violation};
 pub use lockfile::{
-    format_lockfile, from_graph, load_lockfile, parse_lockfile, strip_dep_pin,
-    verify_against_graph, verify_lockfile_against_deps, write_lockfile,
+    check_locked_drift, format_lockfile, from_graph, load_lockfile, parse_lockfile,
+    strip_dep_pin, verify_against_graph, verify_lockfile_against_deps, write_lockfile,
 };
 pub use manifest_writer::{
     add_mirror, apply_workspace_manifest_change, mutate_manifest_file,
@@ -201,6 +201,7 @@ impl Resolver for Milpa {
             params.profile,
             params.prior,
             milpa_solver::Strategy::default(),
+            false, // strategy_explicit: this scaffold trait has no CLI/manifest strategy input
             deps_dir,
             params.require_attested_metadata,
             store,

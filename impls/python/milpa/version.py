@@ -241,11 +241,54 @@ class Strategy(StrEnum):
       declared floor; surfaces accidental use of newer features).
     - ``SEMVER``: highest version within the same major as the constraint's
       lower bound (protects against accidental cross-major upgrades).
+    - ``LOWEST_DIRECT`` (resolver-semantics RFC §3 Axis C, #111; wire string
+      ``lowest-direct``, matching uv's ``--resolution lowest-direct``): applies
+      ``MINVER`` to root-direct deps and ``MAXVER`` to everything else — the
+      practical way to test that advertised lower bounds actually build. This
+      is a **surface value only** (CLI flag / lockfile ``strategy`` node): the
+      provider resolves it to a concrete per-package ``MINVER``/``MAXVER``
+      *before* the pick ever runs (``_effective_strategy_for``, D-C2) —
+      ``_pick_version``'s ``strategy`` argument, and its ``match``, never see
+      this value.
     """
 
     MAXVER = "maxver"
     MINVER = "minver"
     SEMVER = "semver"
+    LOWEST_DIRECT = "lowest-direct"
+
+
+# ---------------------------------------------------------------------------
+# VersionSource — Axis A (b) / A5 (resolution-semantics RFC §3 Axis A, §5)
+# ---------------------------------------------------------------------------
+
+
+class VersionSource(StrEnum):
+    """Which precedence branch produced a git/url/local/tarball/member dep's
+    declared-version label (``declared_version_for``, ``edge_sources.py``).
+
+    ``manifest`` names the *role* — "this package's own manifest" — not the
+    literal file syntax of the day, so the wire value in the lockfile survives
+    a future manifest-format evolution. The four values mirror the precedence
+    steps 1-4 exactly:
+
+    - ``MANIFEST``: the fetched package's own ``milpa.kdl version`` field (step 1).
+    - ``NIMBLE``: the fetched package's ``.nimble version`` (step 2, A1 scanner).
+    - ``TAG``: a version-shaped git ref tag, ``v?X.Y.Z`` (step 3, A3).
+    - ``ANNOTATION``: the dep declaration's ``version=`` annotation, or an
+      ``overrides { … version= }`` rule's (step 4, A3b).
+
+    A version-unknown dep (no step matched) carries no ``VersionSource`` at
+    all — ``declared_version_source`` is ``None`` (Option, not a 5th member;
+    §5 NORMATIVE: the lockfile pairs ``0.0.0`` + absent source for that case,
+    a combination no ``Known`` case ever produces since a ``Known`` version
+    always names its source).
+    """
+
+    MANIFEST = "manifest"
+    NIMBLE = "nimble"
+    TAG = "tag"
+    ANNOTATION = "annotation"
 
 
 # ---------------------------------------------------------------------------
@@ -261,15 +304,71 @@ _VERSION_RE = re.compile(
 )
 
 
+#: Upper bound for a parsed release-component value — mirrors Rust's
+#: ``parse_numeric_component`` (``s.parse::<u64>()``), so a value that
+#: overflows ``u64`` is rejected in Python too (cross-impl parity).
+_U64_MAX = (1 << 64) - 1
+
+
+def _parse_numeric_component(digits: str) -> int | None:
+    """Parse one release-component digit run into an ``int``, or ``None``.
+
+    Total by construction — never raises. Two distinct hazards, both
+    reachable from attacker-controlled input (a crafted git tag, a
+    ``.nimble``/``milpa.kdl`` ``version=`` string, a registry index entry):
+
+    - CPython >=3.11 caps int<->str conversion at ~4300 digits; a bare
+      ``int()`` call on an oversized digit run raises ``ValueError``. Caught
+      here so ``parse_version`` stays total, matching its documented
+      "returns None for non-canonical" contract.
+    - A digit run that parses fine as a Python ``int`` but exceeds
+      ``u64::MAX`` would silently diverge from Rust's
+      ``parse_numeric_component``, which rejects it via
+      ``str::parse::<u64>()``. Bounding here keeps both impls in agreement.
+    """
+    try:
+        value = int(digits)
+    except ValueError:
+        return None
+    if value > _U64_MAX:
+        return None
+    return value
+
+
 def _parse_pre_identifiers(pre_str: str) -> tuple[PreId, ...]:
     """Parse a semver prerelease string into typed identifiers.
 
-    Per semver 2.0: identifiers consisting entirely of digits are
-    parsed as integers (no leading zeros). Others remain strings.
+    Per semver 2.0: identifiers consisting entirely of digits are parsed as
+    integers (no leading zeros). Others remain strings.
+
+    Total by construction — never raises. Mirrors Rust's
+    ``parse_pre_identifiers``, which normalizes an all-digit identifier via
+    ``str::parse::<u64>()`` and, on overflow, "fall[s] back to Alpha so
+    parsing never panics". Two hazards apply here just as they do to
+    ``_parse_numeric_component`` (RR6 — the sibling was previously exempt,
+    which was the bug):
+
+    - CPython >=3.11 caps int<->str conversion at ~4300 digits; a bare
+      ``int()`` call on an oversized all-digit identifier (e.g. a crafted
+      git tag) raises ``ValueError``.
+    - A digit run that parses fine as a Python ``int`` but exceeds
+      ``u64::MAX`` would silently diverge from Rust's classification.
+
+    Either hazard falls back to keeping the identifier as its plain STRING
+    (alphanumeric) form — exactly Rust's ``PreId::Alpha`` fallback — rather
+    than raising or silently accepting more than Rust does.
     """
     parts: list[PreId] = []
     for part in pre_str.split("."):
-        parts.append(int(part) if part.isdigit() else part)
+        value: PreId = part
+        if part.isdigit():
+            try:
+                n = int(part)
+            except ValueError:
+                n = None
+            if n is not None and n <= _U64_MAX:
+                value = n
+        parts.append(value)
     return tuple(parts)
 
 
@@ -285,9 +384,11 @@ def parse_version(text: str | None) -> Version | None:
     m = _VERSION_RE.fullmatch(text.strip())
     if m is None:
         return None
-    major = int(m.group(1))
-    minor = int(m.group(2))
-    patch = int(m.group(3))
+    major = _parse_numeric_component(m.group(1))
+    minor = _parse_numeric_component(m.group(2))
+    patch = _parse_numeric_component(m.group(3))
+    if major is None or minor is None or patch is None:
+        return None
     pre_str = m.group(4)
     build_str = m.group(5)
     pre = _parse_pre_identifiers(pre_str) if pre_str else ()
@@ -564,6 +665,18 @@ class VersionSet:
 
     def is_empty(self) -> bool:
         return len(self.intervals) == 0
+
+    def is_full(self) -> bool:
+        """True iff this set is the unbounded ``(-∞, +∞)`` set (§4 D-A2 use:
+        a ``full()`` self-term is never violated, so it never belongs in a
+        refutation / weak-UNSAT core — see ``SolverError.refutation``).
+
+        Checks semantic fullness (both bounds unset), not literal equality
+        with ``full()``'s canonical tuple — the closed-ness flags on an
+        unbounded (``None``) endpoint are never consulted by ``contains``
+        (see above), so they must not be consulted here either.
+        """
+        return len(self.intervals) == 1 and self.intervals[0][0] is None and self.intervals[0][1] is None
 
     def intersect(self, other: VersionSet) -> VersionSet:
         """``self ∩ other``"""

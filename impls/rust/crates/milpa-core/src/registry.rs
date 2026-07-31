@@ -19,6 +19,13 @@ use kdl::{KdlDocument, KdlNode};
 use milpa_manifest::{kdl_block_comment_depth, kdl_brace_depth, KDL_MAX_NESTING_DEPTH};
 use milpa_solver::{parse_version, VersionSet};
 use milpa_types::{AttestationKind, EntryAttestation, Provenance, RekorRef};
+// D0 (rfc-resolution-semantics.md Axis D prerequisite): `Timestamp` +
+// `parse_iso8601_timestamp` moved to `milpa-types` so `milpa-manifest` can
+// reach them too (D1) without a crate cycle. Re-exported here for back-compat
+// — all existing `crate::registry::{Timestamp, parse_iso8601_timestamp}` /
+// `milpa_core::registry::{Timestamp, parse_iso8601_timestamp}` references
+// compile unchanged.
+pub use milpa_types::{parse_iso8601_timestamp, Timestamp};
 
 use crate::error::CoreError;
 
@@ -555,6 +562,48 @@ impl Index {
     }
 }
 
+/// D3 (resolution-semantics RFC §3 Axis D / §4 stage 2): the exclude-newer
+/// hard cut at the enumeration layer.
+///
+/// Drops every candidate whose `published_at` is not provably `<=
+/// exclude_newer` *before* the solver ever sees the candidate set ("the
+/// enumeration layer drops candidates with `published_at > ts` *before* the
+/// solver sees them"). `exclude_newer: None` is a no-op (returns `versions`
+/// unchanged, 0 dropped) — the overwhelmingly common case, not a filter over
+/// an empty bound.
+///
+/// **Fail-closed (§6 D-D3).** `published_at`'s ordinary optional-scalar
+/// posture is *permissive*: absent-or-malformed collapses to `None` with no
+/// diagnostic (see `IndexVersion::published_at`'s own doc comment). That
+/// default is deliberately OVERRIDDEN here — a candidate whose publication
+/// timestamp cannot be established fails the "provably predates
+/// `exclude_newer`" test by construction, so it is EXCLUDED, never
+/// permissively kept.
+///
+/// Returns `(kept, dropped_count)`. The caller (`process_named`, the
+/// enumeration site) raises `RES-EXCLUDE-NEWER-EMPTY` when `dropped_count`
+/// empties an otherwise-non-empty candidate set — a DISTINCT error class
+/// from `TNG-NO-SATISFYING-VERSION` on purpose (§4 stage placement: this
+/// filter runs against the constraint-blind stage-1 enumeration, before the
+/// solver's own accumulated-constraint filter at stage 3, so a caller can
+/// tell "no version ever satisfied the constraints" from "versions existed
+/// but the time-bound excluded them all").
+pub fn filter_by_exclude_newer(
+    versions: &[IndexVersion],
+    exclude_newer: Option<Timestamp>,
+) -> (Vec<IndexVersion>, usize) {
+    let Some(ts) = exclude_newer else {
+        return (versions.to_vec(), 0);
+    };
+    let kept: Vec<IndexVersion> = versions
+        .iter()
+        .filter(|iv| iv.published_at.is_some_and(|pa| pa <= ts))
+        .cloned()
+        .collect();
+    let dropped = versions.len() - kept.len();
+    (kept, dropped)
+}
+
 /// Render the yanked-but-excluded segment of a `TNG-NO-SATISFYING-VERSION`
 /// message (registry-protocol §5.2 / §3.2 `yanked_reason` "surfaced ... in
 /// the TNG-NO-SATISFYING-VERSION message when relevant").
@@ -694,129 +743,6 @@ fn parse_version_node(
         },
         diagnostics,
     ))
-}
-
-// ---------------------------------------------------------------------------
-// A2a timestamp parsing (registry-protocol §3.2) — no external date crate:
-// the ratchet engine (`ratchet.rs`) only needs EQUALITY over this type (the
-// set-once dominance check), never arithmetic or formatting, so a minimal
-// hand-rolled ISO-8601/RFC-3339 parser normalizing to a UTC instant is
-// sufficient and keeps milpa-core dep-light. Mirrors Python's
-// `_parse_timestamp` (`datetime.fromisoformat`): malformed input -> `None`,
-// never an error.
-// ---------------------------------------------------------------------------
-
-/// A parsed timestamp, normalized to a UTC instant: seconds since the Unix
-/// epoch plus a sub-second nanosecond remainder. `Eq`-able (no floats) so it
-/// can ride `IndexVersion`'s derived `PartialEq + Eq`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Timestamp {
-    pub unix_seconds: i64,
-    pub nanos: u32,
-}
-
-/// Parse `YYYY-MM-DDTHH:MM:SS[.fraction][Z|±HH:MM]` (`T` may also be a space
-/// or lowercase `t`; an absent offset is treated as UTC). Returns `None` on
-/// any malformed input — the caller's absence posture, never a raised error.
-pub fn parse_iso8601_timestamp(raw: &str) -> Option<Timestamp> {
-    let bytes = raw.as_bytes();
-    if bytes.len() < 19 {
-        return None;
-    }
-    let digit = |i: usize| -> Option<i64> {
-        bytes.get(i).filter(|b| b.is_ascii_digit()).map(|b| (*b - b'0') as i64)
-    };
-    let two = |i: usize| -> Option<i64> { Some(digit(i)? * 10 + digit(i + 1)?) };
-    let four = |i: usize| -> Option<i64> {
-        Some(digit(i)? * 1000 + digit(i + 1)? * 100 + digit(i + 2)? * 10 + digit(i + 3)?)
-    };
-
-    let year = four(0)?;
-    if bytes.get(4) != Some(&b'-') {
-        return None;
-    }
-    let month = two(5)?;
-    if bytes.get(7) != Some(&b'-') {
-        return None;
-    }
-    let day = two(8)?;
-    match bytes.get(10) {
-        Some(b'T') | Some(b't') | Some(b' ') => {}
-        _ => return None,
-    }
-    let hour = two(11)?;
-    if bytes.get(13) != Some(&b':') {
-        return None;
-    }
-    let minute = two(14)?;
-    if bytes.get(16) != Some(&b':') {
-        return None;
-    }
-    let second = two(17)?;
-
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=60).contains(&second) {
-        return None;
-    }
-
-    let mut idx = 19;
-    let mut nanos: u32 = 0;
-    if matches!(bytes.get(idx), Some(b'.') | Some(b',')) {
-        idx += 1;
-        let start = idx;
-        while bytes.get(idx).is_some_and(u8::is_ascii_digit) {
-            idx += 1;
-        }
-        if idx == start {
-            return None; // "." with no digits following
-        }
-        let frac = &raw[start..idx];
-        let mut digits: String = frac.chars().take(9).collect();
-        while digits.len() < 9 {
-            digits.push('0');
-        }
-        nanos = digits.parse().ok()?;
-    }
-
-    let offset_seconds: i64 = match bytes.get(idx) {
-        None => 0, // naive: treated as UTC
-        Some(b'Z') | Some(b'z') => {
-            idx += 1;
-            0
-        }
-        Some(sign @ (b'+' | b'-')) => {
-            let sign_mult: i64 = if *sign == b'+' { 1 } else { -1 };
-            let oh = two(idx + 1)?;
-            if bytes.get(idx + 3) != Some(&b':') {
-                return None;
-            }
-            let om = two(idx + 4)?;
-            if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
-                return None;
-            }
-            idx += 6;
-            sign_mult * (oh * 3600 + om * 60)
-        }
-        _ => return None,
-    };
-    if idx != bytes.len() {
-        return None; // trailing garbage
-    }
-
-    let days = days_from_civil(year, month as u32, day as u32);
-    let unix_seconds = days * 86400 + hour * 3600 + minute * 60 + second - offset_seconds;
-    Some(Timestamp { unix_seconds, nanos })
-}
-
-/// Howard Hinnant's `days_from_civil` — days since the Unix epoch
-/// (1970-01-01) for a proleptic-Gregorian civil date. `m` is 1-12.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let mp = (i64::from(m) + 9) % 12; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146097 + doe - 719468
 }
 
 /// Parse the `attestation`/`signed_by`/`rekor`/`bundle` sibling child nodes of

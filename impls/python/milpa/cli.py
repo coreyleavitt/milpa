@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, TypeVar
 
@@ -48,7 +49,9 @@ from milpa import __version__
 from milpa.cas import CAStore, default_store
 from milpa.context import MilpaEnv, ResolveParams
 from milpa.errors import (
+    CLI_EXCLUDE_NEWER_INVALID,
     CLI_FEATURE_FLAGS_CONFLICT,
+    CLI_LOCKED_UPGRADE_CONFLICT,
     FETCH_REF_DISCOVERY_FAILED,
     FROZEN_ACTIVE_FLAGS_MISMATCH,
     FROZEN_NO_LOCKFILE,
@@ -80,6 +83,7 @@ from milpa.lockfile import (
     GitProvenanceRecord,
     LockedDep,
     Lockfile,
+    check_locked_drift,
     from_graph,
     load_lockfile,
     strip_dep_pin,
@@ -90,7 +94,13 @@ from milpa.manifest import Manifest, flag_enables_closure
 from milpa.nimcfg import build_flag_defines, format_nimcfg, format_workspace_nimcfgs
 from milpa.predicate import dep_passes_flag_predicates
 from milpa.profile import Profile
-from milpa.resolver import resolve, resolve_workspace
+from milpa.registry import _parse_timestamp
+from milpa.resolver import (
+    _resolve_effective_exclude_newer,
+    _resolve_effective_strategy,
+    resolve,
+    resolve_workspace,
+)
 from milpa.solver import SolverError, SolveSuccess, certificate_to_json
 from milpa.version import DepKey, Strategy
 from milpa.workspace import (
@@ -159,6 +169,132 @@ def _add_feature_args(sp: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_locked_arg(sp: argparse.ArgumentParser) -> None:
+    """Add the B3 (resolution-semantics RFC §3 Axis B) ``--locked`` flag.
+
+    Scoped to ``fetch``/``lock`` only (per-verb registration), like the other
+    new resolution flags this RFC introduces — distinct from the legacy
+    global ``--frozen``/``--strategy`` flags (RFC §3 Axis C's C3 migrates
+    those to the same scoping later; this flag starts scoped from day one).
+    """
+    sp.add_argument(
+        "--locked",
+        action="store_true",
+        default=False,
+        help=(
+            "resolve normally (with the minimal-change preference), then "
+            "assert the result matches the committed milpa.lock exactly "
+            "(identity + provenance, never the version label); fail with "
+            "RES-LOCKED-DRIFT on any deviation or if no lockfile is "
+            "committed. Distinct from --frozen: --locked always solves."
+        ),
+    )
+
+
+def _add_upgrade_arg(sp: argparse.ArgumentParser) -> None:
+    """Add the B4 (resolution-semantics RFC §3 Axis B / D-B3) ``--upgrade`` flag.
+
+    Scoped to ``fetch``/``lock`` only (per-verb registration), like
+    ``--locked``. Semantics:
+
+    - bare ``--upgrade`` (no dep names): opt out of the minimal-change
+      (lock-preference) default GLOBALLY — pull the latest allowed
+      version everywhere (the pre-B2 newest-wins default, now explicit).
+    - ``--upgrade <dep> [<dep>...]``: opt out ONLY for the named deps;
+      every other dep keeps its locked preference.
+
+    Implemented as DELEGATION to the exact strip-pin mechanism ``milpa
+    update``/``milpa update <dep>`` already uses — see
+    ``_strip_pins_for_upgrade``, the one shared helper both call, so the
+    two verbs cannot structurally drift (D-B3). Mutually exclusive with
+    ``--locked`` (``CLI-LOCKED-UPGRADE-CONFLICT``): one forbids deviation,
+    the other forces it.
+    """
+    sp.add_argument(
+        "--upgrade",
+        nargs="*",
+        metavar="<dep>",
+        default=None,
+        help=(
+            "opt out of the minimal-change (lock-preference) default and "
+            "pull the latest allowed version; with no names, globally "
+            "(the pre-minimal-change newest-wins default); with one or "
+            "more <dep> names, only for those deps — everything else "
+            "stays locked. Delegates to the same mechanism as `milpa "
+            "update`/`milpa update <dep>`. Mutually exclusive with "
+            "--locked (CLI-LOCKED-UPGRADE-CONFLICT)."
+        ),
+    )
+
+
+def _add_strategy_arg(sp: argparse.ArgumentParser) -> None:
+    """Add the C3 (resolution-semantics RFC §3 Axis C / D-C2) ``--strategy``
+    flag, scoped per-verb (fetch/lock/update/add/remove/workspace
+    add-member/remove-member — the resolve-triggering verbs), like
+    ``--locked``/``--upgrade`` — NOT the old global, pre-dispatch
+    registration (valid, and silently ignored, on ``show``/``clean``/etc.).
+
+    ``default=None`` is the load-bearing part: ``None`` means "unspecified,
+    defer to the manifest's ``resolution { strategy }``, else the global
+    default (maxver)" — distinct from an explicit ``--strategy maxver``,
+    which always wins even though it names the default value. Before this,
+    both impls resolved ``--strategy`` to a *concrete* ``Strategy`` via a
+    literal default, so there was no way to tell "typed the default" from
+    "typed nothing" — the precedence chain and the D-C2 bypass-on-
+    value-divergence both require that distinction.
+
+    R9 (§3 Axis C NORMATIVE: the lockfile-recorded strategy is
+    "diagnostic/frozen-parity only, never a live input"): unspecified
+    ``--strategy`` no longer falls through to the committed lockfile's
+    recorded strategy — a bare resolve's stability against a non-default
+    lock rides on B2's lock-preference mechanism instead (see
+    ``resolver._resolve_effective_strategy`` / ``_bypasses_lock_preference``).
+    """
+    sp.add_argument(
+        "-s",
+        "--strategy",
+        metavar="<mode>",
+        choices=("maxver", "minver", "semver", "lowest-direct"),
+        default=None,
+        help=(
+            "resolution strategy: maxver, minver, semver, lowest-direct "
+            "(minver for root-direct deps, maxver for transitive deps). "
+            "Unspecified (the default) defers to the manifest's "
+            "'resolution { strategy }' if declared, else maxver."
+        ),
+    )
+
+
+def _add_exclude_newer_arg(sp: argparse.ArgumentParser) -> None:
+    """Add the D2 (resolution-semantics RFC §3 Axis D) ``--exclude-newer``
+    flag, scoped to ``fetch``/``lock`` ONLY — narrower than ``--strategy``'s
+    per-verb scoping.  §3 Axis D "Verb reach": a CLI time-bound override is
+    a fetch/lock-time CI concern (``milpa fetch --exclude-newer <ts>`` to
+    test an LTS snapshot); ``add``/``update``/``remove`` always read the
+    manifest's committed ``resolution { exclude-newer }`` bound instead —
+    they do not accept this flag at all (a hard parse error, exit 2, if
+    passed there).
+
+    ``default=None`` is the same load-bearing sentinel ``_add_strategy_arg``
+    uses: ``None`` means "unspecified, defer to the manifest's
+    ``resolution { exclude-newer }`` (or no bound at all)" — distinct from
+    an explicit value.  The raw string is validated + parsed to a
+    ``datetime`` in ``main()`` (not here — argparse has no ISO-8601 type
+    hook that raises milpa's own ``CLI-EXCLUDE-NEWER-INVALID`` slug with a
+    ``milpa-error:`` line rather than argparse's own exit-2 usage error).
+    """
+    sp.add_argument(
+        "--exclude-newer",
+        metavar="<ts>",
+        default=None,
+        help=(
+            "resolve as of this point in time (ISO 8601, e.g. "
+            "2026-01-01T00:00:00Z): overrides the manifest's "
+            "'resolution { exclude-newer }' if declared. fetch/lock only."
+        ),
+    )
+
+
 def _parse_features(raw: str) -> frozenset[str]:
     """Parse the ``--features`` comma-list into a frozenset of flag names.
 
@@ -196,14 +332,6 @@ def _make_parser() -> argparse.ArgumentParser:
         type=int,
         default=8,
         help="number of concurrent fetches (default: 8)",
-    )
-    parser.add_argument(
-        "-s",
-        "--strategy",
-        metavar="<mode>",
-        choices=("maxver", "minver", "semver"),
-        default="maxver",
-        help="resolution strategy: maxver (default), minver, semver",
     )
     parser.add_argument(
         "--frozen",
@@ -289,6 +417,10 @@ def _make_parser() -> argparse.ArgumentParser:
         help="resolve manifest, clone deps, emit nim.cfg, write lockfile",
     )
     _add_feature_args(sp_fetch)
+    _add_locked_arg(sp_fetch)
+    _add_upgrade_arg(sp_fetch)
+    _add_strategy_arg(sp_fetch)
+    _add_exclude_newer_arg(sp_fetch)
 
     # lock
     sp_lock = subparsers.add_parser(
@@ -296,6 +428,10 @@ def _make_parser() -> argparse.ArgumentParser:
         help="resolve manifest and write lockfile (no nim.cfg, no _deps/)",
     )
     _add_feature_args(sp_lock)
+    _add_locked_arg(sp_lock)
+    _add_upgrade_arg(sp_lock)
+    _add_strategy_arg(sp_lock)
+    _add_exclude_newer_arg(sp_lock)
 
     # show
     sp_show = subparsers.add_parser(
@@ -336,6 +472,17 @@ def _make_parser() -> argparse.ArgumentParser:
     mode.add_argument("--git", metavar="<url>")
     mode.add_argument("--mirror", metavar="<url>")
     sp_add.add_argument("--ref", metavar="<ref>")
+    # A3b (§3 Axis A (b) step 4): write a version= annotation on the new dep,
+    # the natural-site workflow for the resolver's declared-version escape hatch.
+    sp_add.add_argument(
+        "--version",
+        metavar="<version>",
+        help=(
+            "write a 'version=' annotation on the new dep (resolution-semantics "
+            "RFC §3 Axis A (b) step 4): a declared version the resolver uses "
+            "when the fetched package's own manifest/tag yield none"
+        ),
+    )
     # S10 (RFC #23 §3.7): optional + features flags for `add`.
     sp_add.add_argument(
         "--optional",
@@ -355,6 +502,7 @@ def _make_parser() -> argparse.ArgumentParser:
             "(written as `flag` children on the dep node, RFC #23 §3.7)"
         ),
     )
+    _add_strategy_arg(sp_add)
 
     # remove (stub — 10e)
     sp_remove = subparsers.add_parser(
@@ -362,6 +510,7 @@ def _make_parser() -> argparse.ArgumentParser:
         help="remove a dep from milpa.kdl (10e, not yet implemented)",
     )
     sp_remove.add_argument("dep_name", metavar="<dep>")
+    _add_strategy_arg(sp_remove)
 
     # update (stub — 10e)
     sp_update = subparsers.add_parser(
@@ -370,6 +519,7 @@ def _make_parser() -> argparse.ArgumentParser:
     )
     sp_update.add_argument("dep_name", metavar="<dep>", nargs="?", default=None)
     _add_feature_args(sp_update)
+    _add_strategy_arg(sp_update)
 
     # workspace — workspace management subcommands (S10, D4)
     sp_workspace = subparsers.add_parser(
@@ -387,11 +537,13 @@ def _make_parser() -> argparse.ArgumentParser:
         metavar="<path>",
         help="path to the member directory (relative to the workspace root)",
     )
+    _add_strategy_arg(sp_ws_add)
 
     sp_ws_remove = ws_sub.add_parser(
         "remove-member",
         help="remove a member from the workspace (drops the member node, then relocks)",
     )
+    _add_strategy_arg(sp_ws_remove)
     sp_ws_remove.add_argument(
         "name_or_path",
         metavar="<name|path>",
@@ -1268,6 +1420,59 @@ def _maybe_load_prior_lockfile(lock_path: Path) -> None | object:
         return None
 
 
+def _frozen_fast_path_gate(
+    locked: bool,
+    upgrade: "tuple[str, ...] | None",
+    cli_strategy: Strategy | None,
+    cli_exclude_newer: "datetime | None",
+    prior: "Lockfile | None",
+) -> bool:
+    """R1 (resolution-semantics RFC §3 Axes C/D, code-review finding):
+    whether ``cmd_fetch``/``_cmd_fetch_workspace`` may even ATTEMPT the
+    frozen no-solve fast-path (as opposed to going straight to a full
+    resolve).
+
+    RR4 (duplicate-fast-path-gate cleanup): this predicate used to be
+    duplicated VERBATIM in both ``cmd_fetch`` and ``_cmd_fetch_workspace``.
+    Extracted here as the single copy both call.
+
+    ONE unified predicate folds in every reason a real solve is required:
+    ``--locked`` (B3), ``--upgrade`` (B4), an EXPLICIT ``--strategy``
+    diverging from the prior lock's recorded strategy (C3), or an
+    EXPLICIT ``--exclude-newer`` diverging from the prior lock's recorded
+    bound (D2).
+
+    Deliberately narrower than "effective diverges from lock": this only
+    reacts to an EXPLICIT CLI override (``cli_strategy``/``cli_exclude_newer``
+    actually passed, i.e. not ``None``), not a merely-effective divergence
+    sourced from the manifest's own ``resolution { }`` block — that
+    divergence is already correctly detected INSIDE ``resolve_frozen``
+    itself (``FROZEN-STRATEGY-MISMATCH``/``FROZEN-EXCLUDE-NEWER-MISMATCH``,
+    C3b/D5), where the fast-path is still attempted and raises (or
+    silently falls through when ``--frozen`` is absent) exactly as before.
+    Consistent with RR1's single-walk ``_resolve_effective_strategy``: the
+    caller passes the RAW CLI arg here (captured before it's overwritten by
+    the effective-strategy derivation), not the derived ``strategy_explicit``
+    boolean — mirroring this gate's pre-existing CLI-only divergence scope.
+    """
+    strategy_diverges = (
+        cli_strategy is not None
+        and prior is not None
+        and cli_strategy != prior.strategy
+    )
+    exclude_newer_diverges = (
+        cli_exclude_newer is not None
+        and prior is not None
+        and cli_exclude_newer != prior.exclude_newer
+    )
+    return (
+        not locked
+        and upgrade is None
+        and not strategy_diverges
+        and not exclude_newer_diverges
+    )
+
+
 # ---------------------------------------------------------------------------
 # Atomic file write helper
 # ---------------------------------------------------------------------------
@@ -1533,7 +1738,7 @@ def cmd_fetch(
     project_dir: Path,
     env: MilpaEnv,
     *,
-    strategy: Strategy,
+    strategy: Strategy | None,
     max_parallel: int,
     frozen: bool,
     certificate_path: Path | None = None,
@@ -1541,17 +1746,68 @@ def cmd_fetch(
     features: frozenset[str] = frozenset(),
     no_default_features: bool = False,
     all_features: bool = False,
+    locked: bool = False,
+    upgrade: tuple[str, ...] | None = None,
+    exclude_newer: datetime | None = None,
 ) -> int:
     """Resolve, fetch, emit nim.cfg + milpa.lock.
 
     Frozen fast-path:
-    - Attempt if lockfile + CAS available.
-    - --frozen absent → silent fallthrough on failure.
+    - Attempt only when the lockfile exists AND a single unified gate says
+      no real solve is required (see R1 below).
+    - --frozen absent → silent fallthrough on failure (or when the gate
+      says a real resolve is required).
     - --frozen present → FROZEN-* slug + exit 1 on failure.
 
     Two CLI-level guards are raised HERE before entering the frozen resolver:
     - FROZEN-NO-LOCKFILE: lockfile absent.
     - FROZEN-NO-CAS: CAS not available (store missing).
+
+    B3 (resolution-semantics RFC §3 Axis B): ``--locked`` always performs a
+    REAL resolve and asserts the result matches the committed lockfile
+    (``check_locked_drift``) — distinct from ``frozen``, which reconstructs
+    with no solve at all.  ``locked`` is one of the reasons folded into the
+    unified fast-path gate (R1 below), so ``--locked`` cannot be silently
+    short-circuited by it.
+
+    B4 (resolution-semantics RFC §3 Axis B / D-B3): ``upgrade`` is ``None``
+    when ``--upgrade`` was not passed (ordinary minimal-change applies);
+    an empty tuple for bare ``--upgrade`` (opt out globally); a non-empty
+    tuple of dep names for ``--upgrade <dep>...`` (opt out for only those).
+    For the SAME reason as ``locked`` above, its presence (non-``None``) is
+    also folded into the unified gate — otherwise an up-to-date project
+    would silently take the no-solve reconstruction path and ``--upgrade``
+    would have no effect at all.
+
+    R1 (code-review finding, resolution-semantics RFC §3 Axes C/D): the
+    EFFECTIVE strategy and exclude-newer bound are computed
+    UNCONDITIONALLY, up front — before the fast-path decision is made —
+    via the SAME precedence chain (CLI > manifest > lockfile-recorded >
+    default) the full-resolve path uses (``_resolve_effective_strategy`` /
+    ``_resolve_effective_exclude_newer``), so both are always ready for
+    ``ResolveParams`` regardless of which path is taken.
+
+    The fast-path gate itself, however, only reacts to an EXPLICIT CLI
+    override (``--strategy``/``--exclude-newer`` actually passed) that
+    diverges from what the prior committed lock recorded — NOT the general
+    "effective diverges from lock" comparison. This is deliberate: when
+    neither flag is passed and only the MANIFEST's ``resolution { }`` block
+    has drifted from the lock, that divergence is already correctly
+    detected INSIDE ``resolve_frozen`` itself (``FROZEN-STRATEGY-MISMATCH``/
+    ``FROZEN-EXCLUDE-NEWER-MISMATCH``, C3b/D5) — the fast-path is still
+    attempted there, and it raises (or silently falls through when
+    ``--frozen`` is absent) exactly as before. The bug this fixes is a
+    narrower, CLI-specific blind spot: ``resolve_frozen`` has no visibility
+    into ``--strategy``/``--exclude-newer`` at all (by design — it takes no
+    ``ResolveParams``), so only an external, pre-attempt gate can catch a
+    CLI override that diverges from an otherwise genuinely in-sync lock.
+    Without it, ``milpa fetch --strategy lowest-direct`` (or
+    ``--exclude-newer <ts>``) on an already-locked, manifest-unchanged
+    project would silently reconstruct from the stale lock and exit 0,
+    never honoring the flag. This replaces the old ad-hoc
+    ``elif not locked and upgrade is None:`` gate (which had already
+    accreted two booleans across B3/B4 and would silently need two more)
+    with one predicate folding in every reason a real solve is required.
     """
     # Workspace detection (cli-contract.md §7.1).
     ws = find_workspace_root(project_dir)
@@ -1569,6 +1825,9 @@ def cmd_fetch(
             features=features,
             no_default_features=no_default_features,
             all_features=all_features,
+            locked=locked,
+            upgrade=upgrade,
+            exclude_newer=exclude_newer,
         )
 
     # --- Single-package path ---
@@ -1582,6 +1841,41 @@ def cmd_fetch(
     deps_dir = project_dir / "_deps"
     _DEPS_RELATIVE = Path("_deps")  # relative form for nim.cfg
 
+    # R1: capture the RAW CLI-provided strategy/exclude-newer (before they
+    # get overwritten by the effective computation below) — the fast-path
+    # gate needs to know whether the USER EXPLICITLY passed ``--strategy``/
+    # ``--exclude-newer`` and, if so, whether that explicit value diverges
+    # from the prior lock's recorded value.  This is deliberately narrower
+    # than "effective diverges from lock": when neither flag was passed and
+    # only the MANIFEST's ``resolution { }`` block diverges from the lock,
+    # that divergence is already correctly detected INSIDE ``resolve_frozen``
+    # itself (``FROZEN-STRATEGY-MISMATCH``/``FROZEN-EXCLUDE-NEWER-MISMATCH``,
+    # C3b/D5) — attempting the fast-path there and letting it raise (rather
+    # than skipping the attempt here) is what lets ``--frozen`` report the
+    # precise slug instead of silently doing a full resolve.  The R1 bug
+    # this fixes is specifically the CLI blind spot: those manifest-only
+    # checks have no visibility into ``--strategy``/``--exclude-newer``, so
+    # only an external, pre-attempt gate can catch a CLI override that
+    # diverges from an otherwise genuinely in-sync lock.
+    cli_strategy_arg = strategy
+    cli_exclude_newer_arg = exclude_newer
+
+    # Load the prior lockfile (if any) and compute the EFFECTIVE
+    # strategy/exclude-newer UNCONDITIONALLY, before deciding whether the
+    # frozen fast-path may even be attempted — C3 (resolution-semantics
+    # RFC §3 Axis C / D-C2) and D2 (Axis D) against this verb's own
+    # manifest + the ACTUAL on-disk prior lock.  Computed here (rather than
+    # only in the full-resolve path further below) so it's ready either way.
+    prior = _maybe_load_prior_lockfile(lock_path) if lock_path.exists() else None
+    # R9 (resolution-semantics RFC §3 Axis C / D-C2): whether the effective
+    # strategy below was EXPLICITLY sourced (CLI or manifest) — feeds the
+    # B2 lock-preference bypass gate (never the lockfile-recorded strategy,
+    # which is diagnostic-only, never a live input).
+    _strategy_decl = _resolve_effective_strategy(cli_strategy_arg, manifest)
+    strategy_explicit = _strategy_decl is not None
+    strategy = _strategy_decl if _strategy_decl is not None else Strategy.MAXVER
+    exclude_newer = _resolve_effective_exclude_newer(cli_exclude_newer_arg, manifest)
+
     # CLI-level guard 1: FROZEN-NO-LOCKFILE.
     if not lock_path.exists():
         if frozen:
@@ -1589,56 +1883,68 @@ def cmd_fetch(
             _emit_slug(FROZEN_NO_LOCKFILE)
             return 1
     else:
-        # Attempt the frozen fast-path.
-        # FROZEN-NO-CAS: our store is always available (default_store); the
-        # resolver raises FROZEN-IDENTITY-NOT-IN-STORE per-dep if the CAS has
-        # no entry.  FROZEN-NO-CAS would apply if store=None, which never happens.
-        try:
-            prior_lock = load_lockfile(lock_path)
-            # S9 (RFC #23 §3.4): FROZEN-ACTIVE-FLAGS-MISMATCH check.
-            # Recompute the active-flag closure from the current manifest + CLI
-            # feature inputs; compare to the lockfile's stored active_flags.
-            # A mismatch means the lock was produced under a different selection.
-            _check_frozen_active_flags_mismatch(
-                manifest, prior_lock,
-                features=features,
-                no_default_features=no_default_features,
-                all_features=all_features,
-            )
-            frozen_graph = resolve_frozen(manifest, prior_lock, env, deps_dir)
-            # Frozen path succeeded.
-            nim_cfg_text = format_nimcfg(
-                frozen_graph,
-                deps_dir=_DEPS_RELATIVE,
-                self_src_dir=self_src_dir,
-                flag_defines=build_flag_defines(frozen_graph, deps_dir),
-            )
-            _atomic_write(project_dir / "nim.cfg", nim_cfg_text)
-            print(
-                f"resolved {len(frozen_graph.deps)} deps (frozen)",
-                file=sys.stderr,
-            )
-            return 0
-        except MilpaError as exc:
-            if frozen:
-                print(f"frozen: {exc.message}", file=sys.stderr)
-                _emit_slug(exc.slug)
-                return 1
-            # Silent fallthrough to full resolve.
-        except Exception as exc:
-            if frozen:
-                print(f"frozen: {exc}", file=sys.stderr)
-                _emit_slug(MILPA_INTERNAL)
-                return 1
-            # Silent fallthrough.
+        # R1/RR4: ONE unified predicate (shared with _cmd_fetch_workspace via
+        # _frozen_fast_path_gate) folds in every reason a real solve is
+        # required — --locked (B3), --upgrade (B4), an EXPLICIT --strategy
+        # diverging from the lock's recorded strategy (C3), or an EXPLICIT
+        # --exclude-newer diverging from the lock's recorded bound (D2).
+        attempt_frozen = _frozen_fast_path_gate(
+            locked, upgrade, cli_strategy_arg, cli_exclude_newer_arg, prior
+        )
+        if attempt_frozen:
+            # FROZEN-NO-CAS: our store is always available (default_store); the
+            # resolver raises FROZEN-IDENTITY-NOT-IN-STORE per-dep if the CAS has
+            # no entry.  FROZEN-NO-CAS would apply if store=None, which never happens.
+            try:
+                prior_lock = load_lockfile(lock_path)
+                # S9 (RFC #23 §3.4): FROZEN-ACTIVE-FLAGS-MISMATCH check.
+                # Recompute the active-flag closure from the current manifest + CLI
+                # feature inputs; compare to the lockfile's stored active_flags.
+                # A mismatch means the lock was produced under a different selection.
+                _check_frozen_active_flags_mismatch(
+                    manifest, prior_lock,
+                    features=features,
+                    no_default_features=no_default_features,
+                    all_features=all_features,
+                )
+                frozen_graph = resolve_frozen(manifest, prior_lock, env, deps_dir)
+                # Frozen path succeeded.
+                nim_cfg_text = format_nimcfg(
+                    frozen_graph,
+                    deps_dir=_DEPS_RELATIVE,
+                    self_src_dir=self_src_dir,
+                    flag_defines=build_flag_defines(frozen_graph, deps_dir),
+                )
+                _atomic_write(project_dir / "nim.cfg", nim_cfg_text)
+                print(
+                    f"resolved {len(frozen_graph.deps)} deps (frozen)",
+                    file=sys.stderr,
+                )
+                return 0
+            except MilpaError as exc:
+                if frozen:
+                    print(f"frozen: {exc.message}", file=sys.stderr)
+                    _emit_slug(exc.slug)
+                    return 1
+                # Silent fallthrough to full resolve.
+            except Exception as exc:
+                if frozen:
+                    print(f"frozen: {exc}", file=sys.stderr)
+                    _emit_slug(MILPA_INTERNAL)
+                    return 1
+                # Silent fallthrough.
 
     # Full resolve path — load index.
     env_with_index = _load_index_for_verb(env, project_dir)
 
-    prior = _maybe_load_prior_lockfile(lock_path)
+    # B4: delegate to the SAME strip-pin mechanism `milpa update` uses
+    # (D-B3) — only when --upgrade was actually passed (upgrade is not None).
+    if upgrade is not None:
+        prior = _strip_pins_for_upgrade(prior, upgrade)
     profile = Profile.from_environment()
     params = ResolveParams(
         strategy=strategy,
+        strategy_explicit=strategy_explicit,
         max_parallel=max_parallel,
         profile=profile,
         prior=prior,  # type: ignore[arg-type]
@@ -1649,6 +1955,8 @@ def cmd_fetch(
         all_features=all_features,
         # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
         entry_trust=_build_entry_trust(env, project_dir),
+        # D2: effective exclude-newer bound (unused for now — D3/D4 consume it).
+        exclude_newer=exclude_newer,
     )
 
     # Resolve — intercept any MilpaError to write a failure certificate when
@@ -1657,6 +1965,12 @@ def cmd_fetch(
     # (kind:failure, message:null, refutation:[]) matching Rust's behaviour.
     try:
         graph = resolve(manifest, deps_dir, env_with_index, params)
+        # B3: --locked asserts the resolve matches the committed lock
+        # (identity + provenance, never the version label — D-B2) BEFORE
+        # anything is written, so a drifted resolve never clobbers the
+        # committed lockfile/nim.cfg.
+        if locked:
+            check_locked_drift(prior, graph, exclude_newer)
     except MilpaError as exc:
         if certificate_path is not None:
             if exc.slug == "SOLVE-CONFLICT":
@@ -1670,7 +1984,7 @@ def cmd_fetch(
     if certificate_path is not None and graph.cert is not None:
         _write_certificate(certificate_path, graph.cert)
 
-    lockfile = from_graph(graph, strategy=str(strategy))
+    lockfile = from_graph(graph, strategy=str(strategy), exclude_newer=exclude_newer)
     nim_cfg_text = format_nimcfg(
         graph,
         deps_dir=_DEPS_RELATIVE,
@@ -1688,7 +2002,7 @@ def _cmd_fetch_workspace(
     workspace: object,
     env: MilpaEnv,
     *,
-    strategy: Strategy,
+    strategy: Strategy | None,
     max_parallel: int,
     frozen: bool,
     certificate_path: Path | None = None,
@@ -1696,6 +2010,9 @@ def _cmd_fetch_workspace(
     features: frozenset[str] = frozenset(),
     no_default_features: bool = False,
     all_features: bool = False,
+    locked: bool = False,
+    upgrade: tuple[str, ...] | None = None,
+    exclude_newer: datetime | None = None,
 ) -> int:
     """Workspace variant of cmd_fetch."""
     from milpa.workspace import LoadedWorkspace
@@ -1705,6 +2022,26 @@ def _cmd_fetch_workspace(
     lock_path = ws_root / "milpa.lock"
     deps_dir = ws_root / "_deps"
 
+    # R1: capture the RAW CLI-provided strategy/exclude-newer BEFORE they
+    # get overwritten by the effective computation — see cmd_fetch's
+    # docstring for why the divergence gate must be scoped to an EXPLICIT
+    # CLI override, not the general effective-vs-lock comparison (manifest-
+    # only divergence is already correctly handled inside
+    # resolve_workspace_frozen's own C3b/D5 checks).
+    cli_strategy_arg = strategy
+    cli_exclude_newer_arg = exclude_newer
+
+    # Load the prior lockfile (if any) and compute the EFFECTIVE
+    # strategy/exclude-newer against the WORKSPACE ROOT manifest (Axis W:
+    # resolution{} is root-only) UNCONDITIONALLY, before deciding whether
+    # the frozen fast-path may even be attempted — mirrors cmd_fetch.
+    prior = _maybe_load_prior_lockfile(lock_path) if lock_path.exists() else None
+    # R9: see cmd_fetch's mirror comment above _resolve_effective_strategy.
+    _strategy_decl = _resolve_effective_strategy(cli_strategy_arg, workspace.workspace_manifest)
+    strategy_explicit = _strategy_decl is not None
+    strategy = _strategy_decl if _strategy_decl is not None else Strategy.MAXVER
+    exclude_newer = _resolve_effective_exclude_newer(cli_exclude_newer_arg, workspace.workspace_manifest)
+
     # Frozen fast-path.
     if not lock_path.exists():
         if frozen:
@@ -1712,66 +2049,78 @@ def _cmd_fetch_workspace(
             _emit_slug(FROZEN_NO_LOCKFILE)
             return 1
     else:
-        try:
-            prior_lock = load_lockfile(lock_path)
-            # S2 (RFC: workspace-completion §3.A / Breadth-P1b):
-            # FROZEN-ACTIVE-FLAGS-MISMATCH check for workspaces.  Must run BEFORE
-            # resolve_workspace_frozen so the correct slug fires rather than
-            # FROZEN-MANIFEST-DEP-NOT-IN-LOCK.  Per cli-contract.md:318-325,
-            # workspaces are NOT exempt from this check.
-            _check_workspace_frozen_active_flags_mismatch(
-                workspace, prior_lock,
-                features=features,
-                no_default_features=no_default_features,
-                all_features=all_features,
-            )
-            # Compute the profile and ws_cli_seed for resolve_workspace_frozen so it
-            # can filter member deps (flag-excluded deps must not fire
-            # FROZEN-MANIFEST-DEP-NOT-IN-LOCK).
-            _frozen_profile = Profile.from_environment()
-            _frozen_cli_seed: frozenset[str] | None
-            _ws_has_feats = bool(features) or no_default_features or all_features
-            if _ws_has_feats:
-                from milpa.resolver import _compute_workspace_cli_seed as _cws
-                _frozen_cli_seed = _cws(workspace.workspace_manifest, features, no_default_features, all_features)
-            else:
-                _frozen_cli_seed = None
-            frozen_graph = resolve_workspace_frozen(
-                workspace, prior_lock, env, deps_dir,
-                profile=_frozen_profile, cli_seed=_frozen_cli_seed,
-            )
-            # Emit per-member nim.cfgs. flag_defines carries the workspace-wide
-            # flag-union -d: defines (§3.8); without it members lose their defines.
-            per_member = format_workspace_nimcfgs(
-                workspace, frozen_graph,
-                flag_defines=build_flag_defines(frozen_graph, deps_dir),
-            )
-            for rel_path, nim_cfg_text in per_member.items():
-                _atomic_write(ws_root / rel_path / "nim.cfg", nim_cfg_text)
-            print(
-                f"resolved {len(frozen_graph.deps)} deps across "
-                f"{len(workspace.members)} members (frozen); "
-                f"emitted {len(per_member)} nim.cfg(s)",
-                file=sys.stderr,
-            )
-            return 0
-        except MilpaError as exc:
-            if frozen:
-                print(f"frozen: {exc.message}", file=sys.stderr)
-                _emit_slug(exc.slug)
-                return 1
-        except Exception as exc:
-            if frozen:
-                print(f"frozen: {exc}", file=sys.stderr)
-                _emit_slug(MILPA_INTERNAL)
-                return 1
+        # R1/RR4: ONE unified predicate (shared with cmd_fetch via
+        # _frozen_fast_path_gate) — see cmd_fetch's docstring — folds in
+        # --locked (B3), --upgrade (B4), an EXPLICIT --strategy diverging
+        # from the lock (C3), and an EXPLICIT --exclude-newer diverging
+        # from the lock (D2).
+        attempt_frozen = _frozen_fast_path_gate(
+            locked, upgrade, cli_strategy_arg, cli_exclude_newer_arg, prior
+        )
+        if attempt_frozen:
+            try:
+                prior_lock = load_lockfile(lock_path)
+                # S2 (RFC: workspace-completion §3.A / Breadth-P1b):
+                # FROZEN-ACTIVE-FLAGS-MISMATCH check for workspaces.  Must run BEFORE
+                # resolve_workspace_frozen so the correct slug fires rather than
+                # FROZEN-MANIFEST-DEP-NOT-IN-LOCK.  Per cli-contract.md:318-325,
+                # workspaces are NOT exempt from this check.
+                _check_workspace_frozen_active_flags_mismatch(
+                    workspace, prior_lock,
+                    features=features,
+                    no_default_features=no_default_features,
+                    all_features=all_features,
+                )
+                # Compute the profile and ws_cli_seed for resolve_workspace_frozen so it
+                # can filter member deps (flag-excluded deps must not fire
+                # FROZEN-MANIFEST-DEP-NOT-IN-LOCK).
+                _frozen_profile = Profile.from_environment()
+                _frozen_cli_seed: frozenset[str] | None
+                _ws_has_feats = bool(features) or no_default_features or all_features
+                if _ws_has_feats:
+                    from milpa.resolver import _compute_workspace_cli_seed as _cws
+                    _frozen_cli_seed = _cws(workspace.workspace_manifest, features, no_default_features, all_features)
+                else:
+                    _frozen_cli_seed = None
+                frozen_graph = resolve_workspace_frozen(
+                    workspace, prior_lock, env, deps_dir,
+                    profile=_frozen_profile, cli_seed=_frozen_cli_seed,
+                )
+                # Emit per-member nim.cfgs. flag_defines carries the workspace-wide
+                # flag-union -d: defines (§3.8); without it members lose their defines.
+                per_member = format_workspace_nimcfgs(
+                    workspace, frozen_graph,
+                    flag_defines=build_flag_defines(frozen_graph, deps_dir),
+                )
+                for rel_path, nim_cfg_text in per_member.items():
+                    _atomic_write(ws_root / rel_path / "nim.cfg", nim_cfg_text)
+                print(
+                    f"resolved {len(frozen_graph.deps)} deps across "
+                    f"{len(workspace.members)} members (frozen); "
+                    f"emitted {len(per_member)} nim.cfg(s)",
+                    file=sys.stderr,
+                )
+                return 0
+            except MilpaError as exc:
+                if frozen:
+                    print(f"frozen: {exc.message}", file=sys.stderr)
+                    _emit_slug(exc.slug)
+                    return 1
+            except Exception as exc:
+                if frozen:
+                    print(f"frozen: {exc}", file=sys.stderr)
+                    _emit_slug(MILPA_INTERNAL)
+                    return 1
 
     # Full workspace resolve.
     env_with_index = _load_index_for_verb(env, ws_root)
-    prior = _maybe_load_prior_lockfile(lock_path)
+    # B4: delegate to the SAME strip-pin mechanism `milpa update` uses (D-B3).
+    if upgrade is not None:
+        prior = _strip_pins_for_upgrade(prior, upgrade)
     profile = Profile.from_environment()
     params = ResolveParams(
         strategy=strategy,
+        strategy_explicit=strategy_explicit,
         max_parallel=max_parallel,
         profile=profile,
         prior=prior,  # type: ignore[arg-type]
@@ -1782,12 +2131,17 @@ def _cmd_fetch_workspace(
         all_features=all_features,
         # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
         entry_trust=_build_entry_trust(env, ws_root),
+        # D2: effective exclude-newer bound (unused for now — D3/D4 consume it).
+        exclude_newer=exclude_newer,
     )
 
     # Resolve — intercept any MilpaError to write a failure certificate when
     # --certificate is set (cli-contract §2.5.2).  Mirrors the single-package path.
     try:
         graph = resolve_workspace(workspace, deps_dir, env_with_index, params)
+        # B3: see cmd_fetch's docstring — assert before anything is written.
+        if locked:
+            check_locked_drift(prior, graph, exclude_newer)
     except MilpaError as exc:
         if certificate_path is not None:
             if exc.slug == "SOLVE-CONFLICT":
@@ -1801,7 +2155,7 @@ def _cmd_fetch_workspace(
     if certificate_path is not None and graph.cert is not None:
         _write_certificate(certificate_path, graph.cert)
 
-    lockfile = from_graph(graph, strategy=str(strategy))
+    lockfile = from_graph(graph, strategy=str(strategy), exclude_newer=exclude_newer)
     per_member = format_workspace_nimcfgs(
         workspace, graph, flag_defines=build_flag_defines(graph, deps_dir),
     )
@@ -1828,18 +2182,28 @@ def cmd_lock(
     project_dir: Path,
     env: MilpaEnv,
     *,
-    strategy: Strategy,
+    strategy: Strategy | None,
     max_parallel: int,
     certificate_path: Path | None = None,
     require_attested_metadata: bool = False,
     features: frozenset[str] = frozenset(),
     no_default_features: bool = False,
     all_features: bool = False,
+    locked: bool = False,
+    upgrade: tuple[str, ...] | None = None,
+    exclude_newer: datetime | None = None,
 ) -> int:
     """Resolve + write milpa.lock; do NOT emit nim.cfg or populate _deps/.
 
     Always full-resolves (never frozen fast-path). Still passes a loaded
     prior lockfile for §8 pin reuse (cli-contract.md §5.2).
+
+    B3: ``locked`` asserts the resolve matches the committed lock
+    (``check_locked_drift``) before anything is (re)written.
+
+    B4: ``upgrade`` delegates to the SAME strip-pin mechanism `milpa
+    update` uses (D-B3) — see ``cmd_fetch``'s docstring for the ``None``/
+    empty-tuple/named-tuple contract.
     """
     ws = find_workspace_root(project_dir)
     if ws is not None:
@@ -1853,6 +2217,9 @@ def cmd_lock(
             features=features,
             no_default_features=no_default_features,
             all_features=all_features,
+            locked=locked,
+            upgrade=upgrade,
+            exclude_newer=exclude_newer,
         )
 
     manifest = load_or_discover_manifest(project_dir)
@@ -1861,9 +2228,20 @@ def cmd_lock(
 
     env_with_index = _load_index_for_verb(env, project_dir)
     prior = _maybe_load_prior_lockfile(lock_path)
+    # C3/R9: resolve the EFFECTIVE strategy (+ whether it was explicitly
+    # sourced) before the --upgrade strip below.
+    _strategy_decl = _resolve_effective_strategy(strategy, manifest)
+    strategy_explicit = _strategy_decl is not None
+    strategy = _strategy_decl if _strategy_decl is not None else Strategy.MAXVER
+    # D2: resolve the EFFECTIVE exclude-newer bound the same way.
+    exclude_newer = _resolve_effective_exclude_newer(exclude_newer, manifest)
+    # B4: delegate to the SAME strip-pin mechanism `milpa update` uses (D-B3).
+    if upgrade is not None:
+        prior = _strip_pins_for_upgrade(prior, upgrade)
     profile = Profile.from_environment()
     params = ResolveParams(
         strategy=strategy,
+        strategy_explicit=strategy_explicit,
         max_parallel=max_parallel,
         profile=profile,
         prior=prior,  # type: ignore[arg-type]
@@ -1874,12 +2252,16 @@ def cmd_lock(
         all_features=all_features,
         # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
         entry_trust=_build_entry_trust(env, project_dir),
+        # D2: effective exclude-newer bound (unused for now — D3/D4 consume it).
+        exclude_newer=exclude_newer,
     )
 
     # Resolve — intercept any MilpaError to write a failure certificate when
     # --certificate is set (cli-contract §2.5.2).  Mirrors the fetch path.
     try:
         graph = resolve(manifest, deps_dir, env_with_index, params)
+        if locked:
+            check_locked_drift(prior, graph, exclude_newer)
     except MilpaError as exc:
         if certificate_path is not None:
             if exc.slug == "SOLVE-CONFLICT":
@@ -1893,7 +2275,7 @@ def cmd_lock(
     if certificate_path is not None and graph.cert is not None:
         _write_certificate(certificate_path, graph.cert)
 
-    lockfile = from_graph(graph, strategy=str(strategy))
+    lockfile = from_graph(graph, strategy=str(strategy), exclude_newer=exclude_newer)
     write_lockfile(lockfile, lock_path)
     print(f"locked {len(graph.deps)} deps", file=sys.stderr)
     return 0
@@ -1903,13 +2285,16 @@ def _cmd_lock_workspace(
     workspace: object,
     env: MilpaEnv,
     *,
-    strategy: Strategy,
+    strategy: Strategy | None,
     max_parallel: int,
     certificate_path: Path | None = None,
     require_attested_metadata: bool = False,
     features: frozenset[str] = frozenset(),
     no_default_features: bool = False,
     all_features: bool = False,
+    locked: bool = False,
+    upgrade: tuple[str, ...] | None = None,
+    exclude_newer: datetime | None = None,
 ) -> int:
     from milpa.workspace import LoadedWorkspace
     assert isinstance(workspace, LoadedWorkspace)
@@ -1920,9 +2305,21 @@ def _cmd_lock_workspace(
 
     env_with_index = _load_index_for_verb(env, ws_root)
     prior = _maybe_load_prior_lockfile(lock_path)
+    # C3/R9: resolve the EFFECTIVE strategy (+ whether it was explicitly
+    # sourced) against the WORKSPACE ROOT manifest before the --upgrade
+    # strip below.
+    _strategy_decl = _resolve_effective_strategy(strategy, workspace.workspace_manifest)
+    strategy_explicit = _strategy_decl is not None
+    strategy = _strategy_decl if _strategy_decl is not None else Strategy.MAXVER
+    # D2: resolve the EFFECTIVE exclude-newer bound the same way.
+    exclude_newer = _resolve_effective_exclude_newer(exclude_newer, workspace.workspace_manifest)
+    # B4: delegate to the SAME strip-pin mechanism `milpa update` uses (D-B3).
+    if upgrade is not None:
+        prior = _strip_pins_for_upgrade(prior, upgrade)
     profile = Profile.from_environment()
     params = ResolveParams(
         strategy=strategy,
+        strategy_explicit=strategy_explicit,
         max_parallel=max_parallel,
         profile=profile,
         prior=prior,  # type: ignore[arg-type]
@@ -1933,12 +2330,16 @@ def _cmd_lock_workspace(
         all_features=all_features,
         # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
         entry_trust=_build_entry_trust(env, ws_root),
+        # D2: effective exclude-newer bound (unused for now — D3/D4 consume it).
+        exclude_newer=exclude_newer,
     )
 
     # Resolve — intercept any MilpaError to write a failure certificate when
     # --certificate is set (cli-contract §2.5.2).  Mirrors the fetch path.
     try:
         graph = resolve_workspace(workspace, deps_dir, env_with_index, params)
+        if locked:
+            check_locked_drift(prior, graph, exclude_newer)
     except MilpaError as exc:
         if certificate_path is not None:
             if exc.slug == "SOLVE-CONFLICT":
@@ -1952,7 +2353,7 @@ def _cmd_lock_workspace(
     if certificate_path is not None and graph.cert is not None:
         _write_certificate(certificate_path, graph.cert)
 
-    lockfile = from_graph(graph, strategy=str(strategy))
+    lockfile = from_graph(graph, strategy=str(strategy), exclude_newer=exclude_newer)
     write_lockfile(lockfile, lock_path)
     print(f"locked {len(graph.deps)} deps", file=sys.stderr)
     return 0
@@ -1984,8 +2385,31 @@ def cmd_show(project_dir: Path) -> int:
         _emit_slug(exc.slug)
         return 1
 
+    # A7 (rfc-resolution-semantics.md §3 Axis A): top-level resolution-state
+    # header, printed once before the per-dep list. `strategy` is always
+    # shown; `exclude_newer` (D5) is shown only when the lockfile recorded
+    # one (never a fake/hardcoded value for the absent case).
+    print(f"strategy    {lockfile.strategy}")
+    if lockfile.exclude_newer is not None:
+        from milpa.manifest import _format_resolution_timestamp
+
+        print(f"exclude-newer {_format_resolution_timestamp(lockfile.exclude_newer)}")
+
     for dep in lockfile.deps:
-        print(f"{dep.name:20s} {dep.version}")
+        # A7: surface the declared-version source next to the version —
+        # `manifest`/`nimble`/`tag`/`annotation` when a source was recorded
+        # (A5), or `(version-unknown)` for the A5 flattening pairing
+        # (`version "0.0.0"` + no `declared_version_source`). A named/index
+        # dep also has no `declared_version_source` (out of Axis A's scope)
+        # but is NOT version-unknown — it is only flagged when paired with
+        # the flattened `0.0.0` sentinel, per the RFC's unambiguous pairing.
+        if dep.declared_version_source:
+            version_suffix = f" ({dep.declared_version_source})"
+        elif dep.version == "0.0.0":
+            version_suffix = " (version-unknown)"
+        else:
+            version_suffix = ""
+        print(f"{dep.name:20s} {dep.version}{version_suffix}")
         if dep.identity:
             algo, _, digest = dep.identity.partition(":")
             print(f"  identity    {algo}:{digest[:8]}")
@@ -3195,15 +3619,18 @@ def cmd_add(
     git_url: str | None,
     mirror_url: str | None,
     ref: str | None,
-    strategy: Strategy,
+    strategy: Strategy | None,
     max_parallel: int,
     optional: bool = False,
     features: "tuple[str, ...] | frozenset[str]" = (),
+    version: str | None = None,
 ) -> int:
     """Add a new dep (--git) or mirror provenance (--mirror) to milpa.kdl.
 
     S10 (RFC #23 §3.7): ``--optional`` writes ``optional=#true`` on the dep node;
     ``--features a,b`` writes ``flag "a"`` / ``flag "b"`` children.
+    A3b (§3 Axis A (b) step 4): ``--version x.y.z`` writes a ``version=``
+    annotation on the new dep node (git dep only per this slice's CLI surface).
 
     spec/cli-contract.md §5.6.
     """
@@ -3240,6 +3667,7 @@ def cmd_add(
             max_parallel=max_parallel,
             optional=optional,
             features=features,
+            version=version,
         )
 
     if git_url is not None:
@@ -3255,6 +3683,7 @@ def cmd_add(
             max_parallel=max_parallel,
             optional=optional,
             features=features,
+            version=version,
         )
 
     if mirror_url is not None:
@@ -3286,10 +3715,11 @@ def _cmd_add_git(
     dep_name: str,
     git_url: str,
     ref: str | None,
-    strategy: Strategy,
+    strategy: Strategy | None,
     max_parallel: int,
     optional: bool = False,
     features: "tuple[str, ...] | frozenset[str]" = (),
+    version: str | None = None,
 ) -> int:
     """Implement ``milpa add <dep> --git <url> [--ref <ref>] [--optional] [--features f1,f2]``.
 
@@ -3385,6 +3815,24 @@ def _cmd_add_git(
             _emit_slug(MAN_DEP_OPTIONAL_FLAG_CLASH)
             return 1
 
+    # A3b (§3 Axis A (b) step 4): --version validation, same slug as the
+    # manifest grammar (MAN-DEP-VERSION-INVALID) — the CLI writes the exact
+    # annotation a hand-edit would, so a malformed value is rejected the same
+    # way before anything is written.
+    parsed_version: "Version | None" = None
+    if version is not None:
+        from milpa.errors import MAN_DEP_VERSION_INVALID
+        from milpa.version import parse_version
+        parsed_version = parse_version(version)
+        if parsed_version is None:
+            print(
+                f"milpa add: --version value {version!r} is not a valid semver "
+                "version (expected 'x.y.z')",
+                file=sys.stderr,
+            )
+            _emit_slug(MAN_DEP_VERSION_INVALID)
+            return 1
+
     # Build the new dep + resolve.
     flag_reqs: tuple[FlagRequest, ...] = tuple(
         FlagRequest(name=f, enabled=True) for f in features
@@ -3395,6 +3843,7 @@ def _cmd_add_git(
         ref=ref,
         optional=optional,
         flag_requests=flag_reqs,
+        version=parsed_version,
     )
     from dataclasses import replace as _replace
     proposed_manifest = _replace(manifest, deps=manifest.deps + (new_dep,))
@@ -3402,18 +3851,32 @@ def _cmd_add_git(
     env_with_index = _load_index_for_verb(env, project_dir)
     deps_dir = project_dir / "_deps"
     profile = Profile.from_environment()
+    # B7 (RFC resolution-semantics.md §3 Axis B): thread the committed lock as
+    # `prior` so minimal-change re-resolution applies — the new dep resolves
+    # while every other already-locked dep stays pinned (#192 through this door).
+    _add_prior = _maybe_load_prior_lockfile(lock_path)
+    # C3/R9: resolve the EFFECTIVE strategy (+ whether it was explicitly
+    # sourced) against the current manifest.
+    _strategy_decl = _resolve_effective_strategy(strategy, manifest)
+    strategy_explicit = _strategy_decl is not None
+    strategy = _strategy_decl if _strategy_decl is not None else Strategy.MAXVER
+    # D2/D5: no CLI flag on `add` — manifest-only, then (no-silent-drop) the
+    # lockfile's own recorded bound.
+    exclude_newer = _resolve_effective_exclude_newer(None, manifest, _add_prior)
     params = ResolveParams(
         strategy=strategy,
+        strategy_explicit=strategy_explicit,
         max_parallel=max_parallel,
         profile=profile,
-        prior=None,
+        prior=_add_prior,  # type: ignore[arg-type]
         manifest_dir=project_dir,
+        exclude_newer=exclude_newer,
         # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
         entry_trust=_build_entry_trust(env, project_dir),
     )
 
     graph = resolve(proposed_manifest, deps_dir, env_with_index, params)
-    lockfile_val = from_graph(graph, strategy=str(strategy))
+    lockfile_val = from_graph(graph, strategy=str(strategy), exclude_newer=exclude_newer)
 
     # Atomic write: manifest first, then lock.
     mutate_manifest_file(manifest_path, lambda _m: proposed_manifest)
@@ -3458,7 +3921,7 @@ def _cmd_add_mirror(
     *,
     dep_name: str,
     mirror_url: str,
-    strategy: Strategy,
+    strategy: Strategy | None,
     max_parallel: int,
 ) -> int:
     """Implement ``milpa add <dep> --mirror <url>``.
@@ -3555,6 +4018,51 @@ def resolve_alias_to_canonical(name: str, lockfile: Lockfile) -> str:
     return name
 
 
+def _strip_pins_for_upgrade(
+    prior: Lockfile | None,
+    dep_names: tuple[str, ...],
+) -> Lockfile | None:
+    """Strip the recorded pin for each dep in ``dep_names``.
+
+    THE shared mechanism behind both ``milpa update``/``milpa update <dep>``
+    and ``--upgrade [<dep>...]`` on ``fetch``/``lock`` (resolution-semantics
+    RFC §3 Axis B / D-B3) — both callers delegate to this ONE function, so
+    the two verbs cannot structurally drift.
+
+    - ``dep_names`` empty (bare ``update`` / bare ``--upgrade``): drop
+      EVERY pin outright — returns ``None`` (the caller re-resolves with
+      no prior at all, newest-wins for the whole graph).
+    - ``dep_names`` non-empty (``update <dep>`` / ``--upgrade <dep> ...``):
+      opt out ONLY for those deps, looping ``strip_dep_pin`` (lockfile.py)
+      once per name (alias→canonical resolved against the running lock)
+      so every other dep's pin is untouched and keeps B2's minimal-change
+      preference.
+
+    Raises ``MilpaError(LOCK_FILE_NOT_FOUND)`` if ``dep_names`` is
+    non-empty and ``prior`` is ``None`` (nothing to scope a named upgrade
+    against). Raises ``MilpaError(LOCK_DEP_NOT_FOUND)`` if a name isn't
+    present in ``prior``.
+    """
+    if not dep_names:
+        return None
+    if prior is None:
+        raise MilpaError(
+            LOCK_FILE_NOT_FOUND,
+            "no milpa.lock to scope --upgrade/update against — run "
+            "`milpa fetch` first",
+        )
+    result = prior
+    for dep_name in dep_names:
+        canonical_name = resolve_alias_to_canonical(dep_name, result)
+        if not any(d.name == canonical_name for d in result.deps):
+            raise MilpaError(
+                LOCK_DEP_NOT_FOUND,
+                f"{dep_name!r} not found in lockfile",
+            )
+        result = strip_dep_pin(result, canonical_name)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # cmd_remove (10e)
 # ---------------------------------------------------------------------------
@@ -3565,7 +4073,7 @@ def cmd_remove(
     env: MilpaEnv,
     *,
     dep_name: str,
-    strategy: Strategy,
+    strategy: Strategy | None,
     max_parallel: int,
 ) -> int:
     """Remove a dep from milpa.kdl and regenerate the lockfile.
@@ -3667,16 +4175,26 @@ def cmd_remove(
     env_with_index = _load_index_for_verb(env, project_dir)
     deps_dir = project_dir / "_deps"
     profile = Profile.from_environment()
+    # C3/R9: resolve the EFFECTIVE strategy (+ whether it was explicitly
+    # sourced) against the current manifest.
+    _strategy_decl = _resolve_effective_strategy(strategy, manifest)
+    strategy_explicit = _strategy_decl is not None
+    strategy = _strategy_decl if _strategy_decl is not None else Strategy.MAXVER
+    # D2/D5: no CLI flag on `remove` — manifest-only, then (no-silent-drop)
+    # the already-loaded on-disk lock's own recorded bound.
+    exclude_newer = _resolve_effective_exclude_newer(None, manifest, prior_for_alias)
     params = ResolveParams(
         strategy=strategy,
+        strategy_explicit=strategy_explicit,
         max_parallel=max_parallel,
         profile=profile,
         prior=prior_for_alias,  # type: ignore[arg-type]
         manifest_dir=project_dir,
+        exclude_newer=exclude_newer,
     )
 
     graph = resolve(proposed_manifest, deps_dir, env_with_index, params)
-    lockfile_val = from_graph(graph, strategy=str(strategy))
+    lockfile_val = from_graph(graph, strategy=str(strategy), exclude_newer=exclude_newer)
 
     # D-update-remove Phase D item 5: warn per alias (Phase D item 5).
     # If the removed canonical had aliases in the prior lockfile, warn about
@@ -3717,7 +4235,7 @@ def cmd_update(
     env: MilpaEnv,
     *,
     dep_name: str | None,
-    strategy: Strategy,
+    strategy: Strategy | None,
     max_parallel: int,
     features: frozenset[str] = frozenset(),
     no_default_features: bool = False,
@@ -3753,10 +4271,27 @@ def cmd_update(
     deps_dir = project_dir / "_deps"
     profile = Profile.from_environment()
 
+    # C3/R9 (resolution-semantics RFC §3 Axis C / D-C2): resolve the
+    # EFFECTIVE strategy (+ whether it was explicitly sourced) against the
+    # manifest — independent of the `prior` this verb deliberately
+    # nulls/strips below for B2's minimal-change preference. Dropping a
+    # dep's pin (or all pins, for bare `update`) must not also reset the
+    # project's governing strategy.
+    _strategy_decl = _resolve_effective_strategy(strategy, manifest)
+    strategy_explicit = _strategy_decl is not None
+    strategy = _strategy_decl if _strategy_decl is not None else Strategy.MAXVER
+    # D2/D5: no CLI flag on `update` — manifest-only, then (no-silent-drop)
+    # the lockfile's own recorded bound — against the ACTUAL on-disk lock,
+    # same rationale as `strategy` just above.
+    exclude_newer = _resolve_effective_exclude_newer(
+        None, manifest, _maybe_load_prior_lockfile(lock_path)
+    )
+
     if dep_name is None:
         # ``update`` with no arg — drop ALL pins (prior=None).
         params = ResolveParams(
             strategy=strategy,
+            strategy_explicit=strategy_explicit,
             max_parallel=max_parallel,
             profile=profile,
             prior=None,
@@ -3764,11 +4299,12 @@ def cmd_update(
             features=features,
             no_default_features=no_default_features,
             all_features=all_features,
+            exclude_newer=exclude_newer,
             # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
             entry_trust=_build_entry_trust(env, project_dir),
         )
         graph = resolve(manifest, deps_dir, env_with_index, params)
-        lockfile_val = from_graph(graph, strategy=str(strategy))
+        lockfile_val = from_graph(graph, strategy=str(strategy), exclude_newer=exclude_newer)
         write_lockfile(lockfile_val, lock_path)
         print("updated all deps", file=sys.stderr)
         return 0
@@ -3784,28 +4320,19 @@ def cmd_update(
 
     prior_lock = load_lockfile(lock_path)
 
-    # D-update-remove: alias→canonical resolution (Phase D item 5).
-    # If dep_name matches an alias in the lockfile, operate on the canonical dep.
-    canonical_name = resolve_alias_to_canonical(dep_name, prior_lock)
-
-    # Guard: dep (or its canonical) must be in the lockfile.
-    if not any(d.name == canonical_name for d in prior_lock.deps):
-        print(
-            f"milpa update: {dep_name!r} not found in lockfile",
-            file=sys.stderr,
-        )
-        _emit_slug(LOCK_DEP_NOT_FOUND)
+    # B4 (RFC resolution-semantics.md §3 Axis B / D-B3): delegate to the
+    # SAME shared strip-pin mechanism `--upgrade [<dep>...]` on fetch/lock
+    # uses, so the two verbs cannot structurally drift. This covers the
+    # D-update-remove alias→canonical resolution (Phase D item 5), the
+    # not-in-lockfile guard, and the pin-strip (retains declared mirror
+    # provenances per Phase D item 5; clears identity so the dep re-resolves
+    # fresh) in one call.
+    try:
+        filtered_prior = _strip_pins_for_upgrade(prior_lock, (dep_name,))
+    except MilpaError as exc:
+        print(f"milpa update: {exc.message}", file=sys.stderr)
+        _emit_slug(exc.slug)
         return 1
-
-    # Build a filtered prior: keep all deps EXCEPT the canonical being updated,
-    # then add back a "pin-stripped" entry for it that retains its declared
-    # mirror provenances (Phase D item 5: explicit provenance preservation).
-    # Stripping identity=None means _git_pin_for_url_dep returns None (no pin),
-    # so the dep re-resolves fresh. The declared provenances survive so
-    # _prior_declared_mirror_urls can carry them forward. URLs that are no
-    # longer in milpa.kdl mirrors are naturally dropped by the D-lifecycle
-    # dedup logic (only manifest_mirror_urls + primary make it into declared).
-    filtered_prior = strip_dep_pin(prior_lock, canonical_name)
 
     # S10 (RFC #23 §3.7): re-resolve with the lockfile's recorded active_flags
     # for reproducibility.  "Re-resolves with the lockfile's recorded active_flags"
@@ -3817,6 +4344,7 @@ def cmd_update(
     # lockfile does not store the prior --features invocation (§3.4 normative).
     params = ResolveParams(
         strategy=strategy,
+        strategy_explicit=strategy_explicit,
         max_parallel=max_parallel,
         profile=profile,
         prior=filtered_prior,
@@ -3824,12 +4352,13 @@ def cmd_update(
         features=features,
         no_default_features=no_default_features,
         all_features=all_features,
+        exclude_newer=exclude_newer,
         # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
         entry_trust=_build_entry_trust(env, project_dir),
     )
 
     graph = resolve(manifest, deps_dir, env_with_index, params)
-    lockfile_val = from_graph(graph, strategy=str(strategy))
+    lockfile_val = from_graph(graph, strategy=str(strategy), exclude_newer=exclude_newer)
     write_lockfile(lockfile_val, lock_path)
     print(f"updated {dep_name}", file=sys.stderr)
     return 0
@@ -3846,7 +4375,7 @@ def _cmd_update_workspace(
     env: MilpaEnv,
     *,
     dep_name: str | None,
-    strategy: Strategy,
+    strategy: Strategy | None,
     max_parallel: int,
     features: frozenset[str] = frozenset(),
     no_default_features: bool = False,
@@ -3879,24 +4408,35 @@ def _cmd_update_workspace(
     # update with no arg: drop ALL pins (prior=None).
     # update <dep>: drop only that dep's pin.
     prior = _maybe_load_prior_lockfile(lock_path)
+    # C3/R9: resolve the EFFECTIVE strategy (+ whether it was explicitly
+    # sourced) against the WORKSPACE ROOT manifest — before the drop/strip
+    # below (same rationale as the standalone cmd_update: dropping pins
+    # must not also reset the governing strategy).
+    _strategy_decl = _resolve_effective_strategy(strategy, workspace.workspace_manifest)
+    strategy_explicit = _strategy_decl is not None
+    strategy = _strategy_decl if _strategy_decl is not None else Strategy.MAXVER
+    # D2/D5: no CLI flag on `update` — manifest-only, then (no-silent-drop)
+    # the lockfile's own recorded bound — computed against the FRESH
+    # on-disk `prior`, before the drop/strip below (same rationale as
+    # `strategy` just above).
+    exclude_newer = _resolve_effective_exclude_newer(None, workspace.workspace_manifest, prior)
     if dep_name is None:
         prior = None  # Full drop — re-resolve from scratch.
     elif prior is not None:
-        # Scoped: drop only this dep's pin from the prior.
-        canonical_name = resolve_alias_to_canonical(dep_name, prior)
-        if not any(d.name == canonical_name for d in prior.deps):
-            print(
-                f"milpa update: {dep_name!r} not found in lockfile",
-                file=sys.stderr,
-            )
-            _emit_slug(LOCK_DEP_NOT_FOUND)
+        # Scoped: drop only this dep's pin from the prior. B4: delegates to
+        # the SAME shared helper the standalone path + --upgrade use (D-B3).
+        try:
+            prior = _strip_pins_for_upgrade(prior, (dep_name,))
+        except MilpaError as exc:
+            print(f"milpa update: {exc.message}", file=sys.stderr)
+            _emit_slug(exc.slug)
             return 1
-        prior = strip_dep_pin(prior, canonical_name)
 
     env_with_index = _load_index_for_verb(env, ws_root)
     profile = Profile.from_environment()
     params = ResolveParams(
         strategy=strategy,
+        strategy_explicit=strategy_explicit,
         max_parallel=max_parallel,
         profile=profile,
         prior=prior,  # type: ignore[arg-type]
@@ -3904,12 +4444,13 @@ def _cmd_update_workspace(
         features=features,
         no_default_features=no_default_features,
         all_features=all_features,
+        exclude_newer=exclude_newer,
         # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
         entry_trust=_build_entry_trust(env, ws_root),
     )
 
     graph = resolve_workspace(workspace, deps_dir, env_with_index, params)
-    lockfile_val = from_graph(graph, strategy=str(strategy))
+    lockfile_val = from_graph(graph, strategy=str(strategy), exclude_newer=exclude_newer)
     write_lockfile(lockfile_val, lock_path)
     print(
         f"updated {dep_name or 'all deps'} across {len(workspace.members)} members",
@@ -3936,10 +4477,11 @@ def _cmd_add_from_member_dir(
     git_url: str | None,
     mirror_url: str | None,
     ref: str | None,
-    strategy: Strategy,
+    strategy: Strategy | None,
     max_parallel: int,
     optional: bool = False,
     features: "tuple[str, ...] | frozenset[str]" = (),
+    version: str | None = None,
 ) -> int:
     """S11e: ``milpa add`` invoked from a member dir.
 
@@ -4048,6 +4590,22 @@ def _cmd_add_from_member_dir(
             _emit_slug(MAN_DEP_OPTIONAL_FLAG_CLASH)
             return 1
 
+    # A3b (§3 Axis A (b) step 4): --version validation — same slug/behavior
+    # as the single-package path (_cmd_add_git).
+    parsed_version: "Version | None" = None
+    if version is not None:
+        from milpa.errors import MAN_DEP_VERSION_INVALID
+        from milpa.version import parse_version
+        parsed_version = parse_version(version)
+        if parsed_version is None:
+            print(
+                f"milpa add: --version value {version!r} is not a valid semver "
+                "version (expected 'x.y.z')",
+                file=sys.stderr,
+            )
+            _emit_slug(MAN_DEP_VERSION_INVALID)
+            return 1
+
     # Build the mutator: adds the new dep to whatever manifest the primitive reads.
     flag_reqs: tuple[FlagRequest, ...] = tuple(
         FlagRequest(name=f, enabled=True) for f in features
@@ -4058,6 +4616,7 @@ def _cmd_add_from_member_dir(
         ref=ref,
         optional=optional,
         flag_requests=flag_reqs,
+        version=parsed_version,
     )
 
     def _mutate_add(m: "Manifest") -> "Manifest":
@@ -4068,12 +4627,29 @@ def _cmd_add_from_member_dir(
     # in-memory → write member manifest → write shared lock.
     env_with_index = _load_index_for_verb(env, ws_root)
     profile = Profile.from_environment()
+    # B7 (RFC resolution-semantics.md §3 Axis B): thread the SHARED workspace
+    # lock as `prior` so adding a dep to one member re-resolves minimally —
+    # other members' already-locked deps stay pinned.
+    _add_member_prior = _maybe_load_prior_lockfile(ws_root / "milpa.lock")
+    # C3/R9: resolve the EFFECTIVE strategy (+ whether it was explicitly
+    # sourced) against the WORKSPACE ROOT manifest (Axis W: resolution{} is
+    # root-only).
+    _strategy_decl = _resolve_effective_strategy(strategy, workspace.workspace_manifest)
+    strategy_explicit = _strategy_decl is not None
+    strategy = _strategy_decl if _strategy_decl is not None else Strategy.MAXVER
+    # D2/D5: no CLI flag on `add` — manifest-only, against the WORKSPACE
+    # ROOT manifest, then (no-silent-drop) the shared lock's own recorded bound.
+    exclude_newer = _resolve_effective_exclude_newer(
+        None, workspace.workspace_manifest, _add_member_prior
+    )
     params = ResolveParams(
         strategy=strategy,
+        strategy_explicit=strategy_explicit,
         max_parallel=max_parallel,
         profile=profile,
-        prior=None,
+        prior=_add_member_prior,  # type: ignore[arg-type]
         manifest_dir=ws_root,
+        exclude_newer=exclude_newer,
         # P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
         entry_trust=_build_entry_trust(env, ws_root),
     )
@@ -4097,7 +4673,7 @@ def _cmd_remove_from_member_dir(
     env: MilpaEnv,
     *,
     dep_name: str,
-    strategy: Strategy,
+    strategy: Strategy | None,
     max_parallel: int,
 ) -> int:
     """S11e: ``milpa remove`` invoked from a member dir.
@@ -4144,12 +4720,24 @@ def _cmd_remove_from_member_dir(
     # Re-resolve the WHOLE workspace via the SSOT orchestration primitive.
     env_with_index = _load_index_for_verb(env, ws_root)
     profile = Profile.from_environment()
+    # C3/R9: resolve the EFFECTIVE strategy (+ whether it was explicitly
+    # sourced) against the WORKSPACE ROOT manifest.
+    _strategy_decl = _resolve_effective_strategy(strategy, workspace.workspace_manifest)
+    strategy_explicit = _strategy_decl is not None
+    strategy = _strategy_decl if _strategy_decl is not None else Strategy.MAXVER
+    # D2/D5: no CLI flag on `remove` — manifest-only, then (no-silent-drop)
+    # the shared lock's own recorded bound.
+    exclude_newer = _resolve_effective_exclude_newer(
+        None, workspace.workspace_manifest, prior_for_alias
+    )
     params = ResolveParams(
         strategy=strategy,
+        strategy_explicit=strategy_explicit,
         max_parallel=max_parallel,
         profile=profile,
         prior=prior_for_alias,  # type: ignore[arg-type]
         manifest_dir=ws_root,
+        exclude_newer=exclude_newer,
     )
 
     try:
@@ -4175,7 +4763,7 @@ def cmd_workspace_add_member(
     env: MilpaEnv,
     *,
     member_path: str,
-    strategy: Strategy,
+    strategy: Strategy | None,
     max_parallel: int,
 ) -> int:
     """Append a member node to the workspace manifest and relock.
@@ -4263,12 +4851,32 @@ def cmd_workspace_add_member(
         rel_path = member_path  # fallback: use as given
 
     # Delegate to apply_workspace_manifest_change (atomic validate→resolve→write).
+    # B7 (RFC resolution-semantics.md §3 Axis B): thread the SHARED workspace
+    # lock as `prior` — adding a member re-resolves minimally, so the OTHER
+    # members' already-locked deps stay pinned instead of newest-wins-bumping.
     profile = Profile.from_environment()
+    _ws_add_prior = _maybe_load_prior_lockfile(root / "milpa.lock")
+    # C3: resolve the EFFECTIVE strategy against the WORKSPACE ROOT manifest
+    # (Axis W: resolution{} is root-only) — parsed here directly (this
+    # function only pre-parses the MEMBER's manifest above, for validation).
+    _root_manifest_for_strategy = parse_workspace_or_manifest(
+        (root / "milpa.kdl").read_text(encoding="utf-8")
+    )
+    _strategy_decl = _resolve_effective_strategy(strategy, _root_manifest_for_strategy)
+    strategy_explicit = _strategy_decl is not None
+    strategy = _strategy_decl if _strategy_decl is not None else Strategy.MAXVER
+    # D2/D5: no CLI flag on `workspace add-member` — manifest-only, then
+    # (no-silent-drop) the shared lock's own recorded bound.
+    exclude_newer = _resolve_effective_exclude_newer(
+        None, _root_manifest_for_strategy, _ws_add_prior
+    )
     params = ResolveParams(
         strategy=strategy,
+        strategy_explicit=strategy_explicit,
         max_parallel=max_parallel,
         profile=profile,
-        prior=None,
+        prior=_ws_add_prior,  # type: ignore[arg-type]
+        exclude_newer=exclude_newer,
     )
     env_with_index = _load_index_for_verb(env, root)
 
@@ -4291,7 +4899,7 @@ def cmd_workspace_remove_member(
     env: MilpaEnv,
     *,
     name_or_path: str,
-    strategy: Strategy,
+    strategy: Strategy | None,
     max_parallel: int,
 ) -> int:
     """Drop a member node from the workspace manifest and relock.
@@ -4404,12 +5012,27 @@ def cmd_workspace_remove_member(
         return 1
 
     # Delegate to apply_workspace_manifest_change (atomic validate→resolve→write).
+    # B7 (RFC resolution-semantics.md §3 Axis B): thread the SHARED workspace
+    # lock as `prior` — removing a member re-resolves minimally, so remaining
+    # members' already-locked deps stay pinned.
     profile = Profile.from_environment()
+    _ws_remove_prior = _maybe_load_prior_lockfile(root / "milpa.lock")
+    # C3: resolve the EFFECTIVE strategy against the WORKSPACE ROOT manifest
+    # (Axis W: resolution{} is root-only) — ``ws_manifest`` above is already
+    # the workspace root's manifest.
+    _strategy_decl = _resolve_effective_strategy(strategy, ws_manifest)
+    strategy_explicit = _strategy_decl is not None
+    strategy = _strategy_decl if _strategy_decl is not None else Strategy.MAXVER
+    # D2/D5: no CLI flag on `workspace remove-member` — manifest-only, then
+    # (no-silent-drop) the shared lock's own recorded bound.
+    exclude_newer = _resolve_effective_exclude_newer(None, ws_manifest, _ws_remove_prior)
     params = ResolveParams(
         strategy=strategy,
+        strategy_explicit=strategy_explicit,
         max_parallel=max_parallel,
         profile=profile,
-        prior=None,
+        prior=_ws_remove_prior,  # type: ignore[arg-type]
+        exclude_newer=exclude_newer,
     )
     env_with_index = _load_index_for_verb(env, root)
 
@@ -4471,8 +5094,17 @@ def main(argv: list[str] | None = None) -> int:
         _emit_slug(MILPA_INTERNAL)
         return 1
 
-    # Resolve strategy enum.
-    strategy = Strategy(args.strategy)
+    # C3 (resolution-semantics RFC §3 Axis C / D-C2): ``--strategy`` is now
+    # an ``Option<Strategy>`` sentinel, scoped per-verb (not every subcommand
+    # has this attribute — ``getattr`` handles that safely, mirroring
+    # ``locked``/``upgrade`` below). ``None`` means unspecified; each verb's
+    # cmd_* function resolves the EFFECTIVE strategy against its own parsed
+    # manifest + lockfile (``_resolve_effective_strategy``) — this is no
+    # longer a single global value computed once here.
+    _cli_strategy_raw = getattr(args, "strategy", None)
+    strategy: Strategy | None = (
+        Strategy(_cli_strategy_raw) if _cli_strategy_raw is not None else None
+    )
 
     # Parse --certificate path (cli-contract.md §2.5).
     certificate_path: Path | None = (
@@ -4548,6 +5180,43 @@ def main(argv: list[str] | None = None) -> int:
                 "--no-default-features suppresses all defaults — pass at most one",
             )
 
+        # B4 (resolution-semantics RFC §3 Axis B / D-B3): `--locked` (forbids
+        # deviation) and `--upgrade` (forces it) are contradictory. `_cli_upgrade`
+        # is None when --upgrade was not passed, [] for bare --upgrade, or a
+        # list of dep names — any non-None value conflicts with --locked.
+        _cli_locked = getattr(args, "locked", False)
+        _cli_upgrade_raw = getattr(args, "upgrade", None)
+        if _cli_locked and _cli_upgrade_raw is not None:
+            raise MilpaError(
+                CLI_LOCKED_UPGRADE_CONFLICT,
+                "--locked and --upgrade are mutually exclusive: --locked "
+                "forbids any deviation from the committed lock while "
+                "--upgrade forces it for the targeted package(s) — pass "
+                "at most one",
+            )
+        _cli_upgrade: tuple[str, ...] | None = (
+            tuple(_cli_upgrade_raw) if _cli_upgrade_raw is not None else None
+        )
+
+        # D2 (resolution-semantics RFC §3 Axis D): `--exclude-newer <ts>` is
+        # scoped to fetch/lock only (`_add_exclude_newer_arg`); other verbs
+        # never have this attribute, so `getattr` defaults to `None`.  A
+        # malformed value raises CLI-EXCLUDE-NEWER-INVALID (exit 1 + slug),
+        # distinct from the manifest's own MAN-RESOLUTION-EXCLUDE-NEWER-
+        # INVALID parse error. Reuses the same shared timestamp parser
+        # (`_parse_timestamp`) the manifest node uses (D1) rather than a
+        # second implementation.
+        _cli_exclude_newer_raw = getattr(args, "exclude_newer", None)
+        cli_exclude_newer: datetime | None = None
+        if _cli_exclude_newer_raw is not None:
+            cli_exclude_newer = _parse_timestamp(_cli_exclude_newer_raw)
+            if cli_exclude_newer is None:
+                raise MilpaError(
+                    CLI_EXCLUDE_NEWER_INVALID,
+                    f"--exclude-newer value {_cli_exclude_newer_raw!r} is not "
+                    "a parseable ISO 8601 timestamp",
+                )
+
         if args.command == "fetch":
             return cmd_fetch(
                 project_dir,
@@ -4560,6 +5229,9 @@ def main(argv: list[str] | None = None) -> int:
                 features=_cli_features,
                 no_default_features=_cli_no_default,
                 all_features=_cli_all_features,
+                locked=_cli_locked,
+                upgrade=_cli_upgrade,
+                exclude_newer=cli_exclude_newer,
             )
         elif args.command == "lock":
             return cmd_lock(
@@ -4572,6 +5244,9 @@ def main(argv: list[str] | None = None) -> int:
                 features=_cli_features,
                 no_default_features=_cli_no_default,
                 all_features=_cli_all_features,
+                locked=_cli_locked,
+                upgrade=_cli_upgrade,
+                exclude_newer=cli_exclude_newer,
             )
         elif args.command == "show":
             if getattr(args, "index_trust", False):
@@ -4604,6 +5279,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_parallel=args.parallel,
                 optional=_add_optional,
                 features=_add_features,
+                version=getattr(args, "version", None),
             )
         elif args.command == "remove":
             return cmd_remove(

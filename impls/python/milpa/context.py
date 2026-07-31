@@ -32,6 +32,7 @@ Spec: docs/rfc-python-clean-room-rewrite.md §4.4 (S9a).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from milpa.cas import CAStore
@@ -112,6 +113,19 @@ class ResolveParams:
         Version-selection rule for named deps (default ``maxver``).
         Recorded in the lockfile; the frozen fast-path checks for mismatch.
 
+    strategy_explicit:
+        R9 (resolution-semantics RFC §3 Axis C / D-C2): whether ``strategy``
+        above was EXPLICITLY sourced (CLI ``--strategy`` or manifest
+        ``resolution { strategy }``), as opposed to default-filled (neither
+        present). Computed by the CLI layer alongside ``strategy`` itself
+        (derived from ``resolver._resolve_effective_strategy``'s
+        ``Strategy | None`` result via ``decl is not None``). Consumed ONLY by
+        ``_Provider._bypasses_lock_preference`` (never the picker) — the
+        lockfile-recorded strategy is diagnostic/frozen-parity only, never
+        a live input, so a merely default-filled ``strategy`` must never
+        bypass B2's lock-preference even when it numerically differs from
+        the lock's recorded value.
+
     max_parallel:
         Parallelism level for the fetch stage (``ThreadPoolExecutor`` workers).
         MUST NOT affect the contents of any output artifact — only throughput.
@@ -128,9 +142,21 @@ class ResolveParams:
         pin reuse).  ``None`` means no prior / ``update`` with no ``<dep>``
         (drops all pins).  The frozen path does NOT accept ``ResolveParams``
         — it never has a ``prior`` because it never re-resolves.
+
+    exclude_newer:
+        D2 (resolution-semantics RFC §3 Axis D): the EFFECTIVE time-bound for
+        this resolve, already resolved by the CLI layer's precedence chain
+        (``_resolve_effective_exclude_newer``: CLI ``--exclude-newer`` >
+        manifest ``resolution { exclude-newer }`` > ``None``).  ``None``
+        means no time bound is active.  Stored here — mirroring ``strategy``
+        — so it rides ``self._params`` all the way into ``_Provider``;
+        nothing consumes it yet (D3 filters index candidates by
+        ``published_at``, D4 validates a pinned git ref's committer date —
+        both later slices).
     """
 
     strategy: Strategy = Strategy.MAXVER
+    strategy_explicit: bool = False
     max_parallel: int = 4
     profile: Profile | None = None
     prior: Lockfile | None = None
@@ -151,3 +177,6 @@ class ResolveParams:
     # INSIDE the resolver (§3), so it travels on the per-call ResolveParams,
     # not the per-process MilpaEnv.
     entry_trust: "EntryTrustConfig | None" = None
+    # D2 (resolution-semantics RFC §3 Axis D): the effective exclude-newer
+    # time-bound (CLI > manifest > None). See the docstring above.
+    exclude_newer: datetime | None = None

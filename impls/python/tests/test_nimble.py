@@ -34,6 +34,7 @@ from milpa.nimble import (
     parse_nimble,
 )
 from milpa.predicate import Predicate
+from milpa.version import Version
 from milpa.workspace import _load_nimble_file
 
 # ---------------------------------------------------------------------------
@@ -246,6 +247,52 @@ class TestSrcDir:
     def test_no_srcdir_is_none(self) -> None:
         m = parse_nimble('requires "foo"\n')
         assert m.src_dir is None
+
+
+# ---------------------------------------------------------------------------
+# A1 (rfc-resolution-semantics.md §3 Axis A (b) step 2): ``version`` field —
+# the compat adapter for the existing Nim ecosystem's declared version.
+# Totality contract holds: a malformed value falls through to ``None``
+# (version-unknown), it is NEVER a raised error — the scanner never raises.
+# ---------------------------------------------------------------------------
+
+
+class TestVersion:
+    def test_version_quoted(self) -> None:
+        m = parse_nimble('version = "1.2.3"')
+        assert m.version == Version(1, 2, 3)
+
+    def test_version_unquoted(self) -> None:
+        m = parse_nimble("version = 1.2.3")
+        assert m.version == Version(1, 2, 3)
+
+    def test_no_version_is_none(self) -> None:
+        m = parse_nimble('requires "foo"\n')
+        assert m.version is None
+
+    def test_version_last_assignment_wins(self) -> None:
+        """Mirrors srcDir's last-assignment-wins NimScript semantics."""
+        m = parse_nimble('version = "1.0.0"\nversion = "2.0.0"\n')
+        assert m.version == Version(2, 0, 0)
+
+    def test_version_malformed_is_none_not_raised(self) -> None:
+        """A malformed value is version-unknown, not a parse error — the
+        scanner is total (unlike milpa.kdl's strict MAN-PACKAGE-VERSION-INVALID)."""
+        m = parse_nimble('version = "not-a-version"\n')
+        assert m.version is None
+
+    def test_version_two_component_is_none(self) -> None:
+        """A 2-component value (\"0.1\") is not strict 3-component semver."""
+        m = parse_nimble('version = "0.1"\n')
+        assert m.version is None
+
+    def test_version_oversized_digit_run_is_none_not_raised(self) -> None:
+        """R10: a crafted ``.nimble`` ``version =`` field with an oversized
+        numeric component must be version-unknown (``None``), never an
+        uncaught ``ValueError`` propagating out of the scanner — the same
+        totality contract as any other malformed value."""
+        m = parse_nimble(f'version = "{"9" * 6000}.0.0"\n')
+        assert m.version is None
 
 
 # ---------------------------------------------------------------------------

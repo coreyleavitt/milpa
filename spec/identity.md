@@ -842,6 +842,32 @@ proxy for the other.
 > the reference default is identity-bearing **and** CAS-admissible
 > (immutable-by-default).
 
+### 4.1a  Declared version is not an identity input (normative SSOT)
+
+> NORMATIVE: A dep's **declared version** — the package's own `milpa.kdl`
+> `version` field, its `.nimble` `version` field, a git-tag-derived version, or
+> an explicit `version=` annotation on the dep declaration (`spec/resolver-
+> semantics.md` Axis A: manifest-agnostic declared-version precedence) — is a
+> **constraint-satisfaction label**, orthogonal to `content_hash` / `identity`.
+> It MUST NOT be read as an input to, mixed into, or otherwise influence the
+> content-hash computation of §1. Two provenances that produce the same
+> `content_hash` are the same identity regardless of what version label each
+> one carries (including differing labels, or one carrying a label the other
+> lacks); two provenances with different `content_hash` values are different
+> identities even when they happen to carry the identical declared version
+> string. This is the same identity ⊥ provenance discipline (§4) extended to
+> a third orthogonal fact: identity is content, provenance is transport, and
+> declared version is a solver-facing label — none of the three is derivable
+> from, or substitutable for, either of the other two.
+
+> NORMATIVE: A dep whose declared version cannot be established from any of
+> the sources above (**version-unknown**, `spec/resolver-semantics.md` Axis A
+> (c)) is not a degraded or partial identity: its `content_hash` is computed
+> and recorded exactly as for any other dep (§1). "Version-unknown" describes
+> only the absence of a constraint-satisfaction label — never an absence or
+> weakening of identity. See `spec/lockfile-schema.md` §3.2/§3.2a for the
+> lockfile-boundary encoding of the version-unknown case.
+
 The downstream consequences, each keyed to the axis it actually depends on:
 
 > NORMATIVE: **(a) Lockfile emission — IDENTITY-BEARING axis.** The `identity`

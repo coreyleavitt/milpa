@@ -1,0 +1,18 @@
+// fixture-420: Axis A (b) step 1 (A1/A2) — a git dep's declared version,
+// derived from the FETCHED package's own `milpa.kdl version` field, satisfies
+// another dep's named `>=` floor.
+//
+// bearssl is pinned to branch "main" (not a version-shaped tag — step 3
+// cannot fire) with a root `milpa.kdl` declaring `version "0.6.0"`; its
+// `.nimble` carries no `version` field (step 2 would also miss). 0.6.0
+// satisfies chronos's `bearssl >= 0.2.8` floor.
+//
+// This proves the declared_version_source field records "manifest" (not
+// "nimble"/"tag"/"annotation") specifically for the milpa.kdl precedence
+// step — the one branch fixture-415/416/417 do not exercise.
+name "myapp"
+kind "application"
+deps {
+    bearssl git=(url)"https://example.com/bearssl.git" ref="main"
+    chronos git=(url)"https://example.com/chronos.git" ref="main"
+}

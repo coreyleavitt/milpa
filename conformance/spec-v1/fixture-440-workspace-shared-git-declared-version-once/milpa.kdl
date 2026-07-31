@@ -1,0 +1,16 @@
+// fixture-440 (rfc-resolution-semantics.md §3 Axis W — W1): Axis A folded
+// into a workspace. Two members (alpha, beta) each require the SAME git dep
+// at the SAME url+ref. Per spec/resolver-semantics.md §11 (multi-root BFS,
+// one shared lock), that dep is one shared graph node — resolved (and its
+// declared version derived) ONCE, not per-member.
+//
+// lib-shared is pinned to the version-shaped tag "v0.6.0" (no milpa.kdl/
+// .nimble version field present, so declared_version_for's step 3 — the
+// A3 git-tag fallback — is what produces the version). The expected lock
+// carries exactly ONE "lib-shared" dep block with version "0.6.0" and
+// declared_version_source "tag" — proving the derivation happened once for
+// the whole workspace, not twice (once per requiring member).
+workspace {
+    member "alpha"
+    member "beta"
+}

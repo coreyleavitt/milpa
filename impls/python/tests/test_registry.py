@@ -16,7 +16,7 @@ No network access; all inputs are inline KDL strings or conformance fixtures.
 from __future__ import annotations
 
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -46,15 +46,18 @@ from milpa.registry import (
     AuthorSigned,
     GitIndexProvenance,
     Index,
+    IndexVersion,
     MilpaVendored,
     OciIndexProvenance,
     Package,
+    _parse_timestamp,
     _validate_commit_sha,
     _validate_dep_decl_pointer,
     _validate_no_control_chars,
     _validate_no_leading_dash,
     _validate_oci_digest,
     _validate_safe_name,
+    filter_by_exclude_newer,
     is_safe_name,
     parse_index,
 )
@@ -1799,3 +1802,103 @@ class TestA2aPublishedAtAndYankTriple:
         nimkdl = next(p for p in idx.packages if p.name == "nimkdl")
         iv = nimkdl.versions[0]
         assert iv.published_at == datetime.fromisoformat("2026-05-26T04:49:44Z")
+
+
+class TestParseTimestamp:
+    """R2: ``_parse_timestamp`` must normalize an offsetless-but-valid ISO
+    8601 string to a UTC-AWARE datetime, never a naive one — every
+    downstream comparison (D3 exclude-newer filtering, D4 git committer-date
+    validation) is against a tz-aware datetime, and naive-vs-aware
+    comparison raises ``TypeError``."""
+
+    def test_offsetless_timestamp_is_utc_aware(self) -> None:
+        parsed = _parse_timestamp("2026-01-01T00:00:00")
+        assert parsed is not None
+        assert parsed.tzinfo is not None
+        assert parsed.utcoffset() == timezone.utc.utcoffset(None)
+        assert parsed == datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def test_offset_bearing_timestamp_still_parses_unchanged(self) -> None:
+        parsed = _parse_timestamp("2026-01-01T00:00:00Z")
+        assert parsed == datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def test_offset_bearing_non_utc_timestamp_preserved(self) -> None:
+        parsed = _parse_timestamp("2026-01-01T00:00:00+05:00")
+        assert parsed is not None
+        assert parsed.tzinfo is not None
+        # Same instant as 2026-01-01T00:00:00 in +05:00, i.e. 2025-12-31T19:00:00Z.
+        assert parsed.astimezone(timezone.utc) == datetime(
+            2025, 12, 31, 19, 0, 0, tzinfo=timezone.utc
+        )
+
+    def test_offsetless_and_z_suffixed_compare_without_raising(self) -> None:
+        """The exact R2 crash reproduction: comparing a normalized offsetless
+        parse against a tz-aware parse must not raise ``TypeError``."""
+        naive_origin = _parse_timestamp("2026-01-01T00:00:00")
+        aware = _parse_timestamp("2026-06-01T00:00:00Z")
+        assert naive_origin is not None and aware is not None
+        assert naive_origin < aware  # would raise TypeError pre-fix
+
+    def test_malformed_still_returns_none(self) -> None:
+        assert _parse_timestamp("not-a-timestamp") is None
+
+    def test_none_input_returns_none(self) -> None:
+        assert _parse_timestamp(None) is None
+
+
+class TestFilterByExcludeNewer:
+    """D3 (resolution-semantics RFC §3 Axis D / §4 stage 2): the exclude-newer
+    hard cut at the enumeration layer — pure-function unit tests, isolated
+    from index parsing / the resolver / the solver."""
+
+    def _iv(self, version: str, published_at: datetime | None) -> IndexVersion:
+        return IndexVersion(version=version, published_at=published_at)
+
+    def test_no_bound_is_a_no_op(self) -> None:
+        versions = [self._iv("1.0.0", None), self._iv("2.0.0", datetime.fromisoformat("2026-01-01T00:00:00Z"))]
+        kept, dropped = filter_by_exclude_newer(versions, None)
+        assert kept == versions
+        assert dropped == 0
+
+    def test_keeps_versions_at_or_before_the_bound(self) -> None:
+        ts = datetime.fromisoformat("2026-06-01T00:00:00Z")
+        older = self._iv("1.0.0", datetime.fromisoformat("2026-01-01T00:00:00Z"))
+        exact = self._iv("1.5.0", ts)
+        newer = self._iv("2.0.0", datetime.fromisoformat("2026-12-01T00:00:00Z"))
+        kept, dropped = filter_by_exclude_newer([older, exact, newer], ts)
+        assert kept == [older, exact]
+        assert dropped == 1
+
+    def test_fail_closed_excludes_unprovable_published_at(self) -> None:
+        """A candidate with no published_at (absent-or-malformed at parse
+        time) is excluded when a bound is active — the RFC's explicit
+        override of published_at's ordinarily-permissive default."""
+        ts = datetime.fromisoformat("2026-06-01T00:00:00Z")
+        unprovable = self._iv("1.0.0", None)
+        kept, dropped = filter_by_exclude_newer([unprovable], ts)
+        assert kept == []
+        assert dropped == 1
+
+    def test_empties_the_set_reports_full_dropped_count(self) -> None:
+        ts = datetime.fromisoformat("2020-01-01T00:00:00Z")
+        versions = [
+            self._iv("1.0.0", datetime.fromisoformat("2026-01-01T00:00:00Z")),
+            self._iv("2.0.0", None),
+        ]
+        kept, dropped = filter_by_exclude_newer(versions, ts)
+        assert kept == []
+        assert dropped == 2
+
+    def test_offsetless_bound_from_parse_timestamp_does_not_raise(self) -> None:
+        """R2: an offsetless bound (as a caller would get from
+        ``resolution { exclude-newer "2026-06-01T00:00:00" }`` or
+        ``--exclude-newer 2026-06-01T00:00:00``, both routed through the
+        shared ``_parse_timestamp``) must compare cleanly against tz-aware
+        ``published_at`` candidates — never a naive-vs-aware ``TypeError``."""
+        ts = _parse_timestamp("2026-06-01T00:00:00")  # no trailing Z/offset
+        assert ts is not None
+        older = self._iv("1.0.0", datetime.fromisoformat("2026-01-01T00:00:00Z"))
+        newer = self._iv("2.0.0", datetime.fromisoformat("2026-12-01T00:00:00Z"))
+        kept, dropped = filter_by_exclude_newer([older, newer], ts)
+        assert kept == [older]
+        assert dropped == 1

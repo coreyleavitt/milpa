@@ -145,6 +145,22 @@ pub struct Fixture {
     /// in-process `Target` must resolve with NO index, overriding any
     /// `index.kdl`, so a named dep raises `RES-NO-INDEX`.
     pub no_index: bool,
+    /// `--strategy <value>` raw token from the `cmd` file (resolution-
+    /// semantics RFC §3 Axis C, C1), if present. Kept as an unparsed `String`
+    /// deliberately — this module stays free of milpa input parsing (module
+    /// doc); the `Target` (runner.rs) is the one that maps the wire string
+    /// onto `milpa_core::Strategy`, exactly as the CLI's own `parse_strategy`
+    /// does. `None` ⇒ the `Target` falls back to the strategy default.
+    pub strategy: Option<String>,
+    /// `--exclude-newer <ts>` raw token from the `cmd` file (resolution-
+    /// semantics RFC §3 Axis D, D6), if present. Mirrors `strategy`: kept as
+    /// an unparsed `String` here (this module stays free of milpa input
+    /// parsing); `runner.rs` maps it onto `milpa_types::Timestamp` and
+    /// combines it with the manifest's own `resolution { exclude-newer }`
+    /// (cmd-token > manifest > `None` — the same 2-tier precedence the CLI's
+    /// `fetch`/`lock` verbs use). `None` ⇒ no cmd-token override; the
+    /// manifest value (or absence) governs alone.
+    pub exclude_newer: Option<String>,
     pub expected: Expected,
 }
 
@@ -157,14 +173,31 @@ impl Fixture {
             Ok(slug) => Expected::Error(slug.trim().to_string()),
             Err(_) => Expected::Success,
         };
-        let no_index = std::fs::read_to_string(dir.join("cmd"))
-            .map(|t| t.split_whitespace().any(|w| w == "--no-index"))
-            .unwrap_or(false);
+        let cmd_text = std::fs::read_to_string(dir.join("cmd")).unwrap_or_default();
+        let no_index = cmd_text.split_whitespace().any(|w| w == "--no-index");
+        let strategy = {
+            let words: Vec<&str> = cmd_text.split_whitespace().collect();
+            words
+                .iter()
+                .position(|&w| w == "--strategy")
+                .and_then(|i| words.get(i + 1))
+                .map(|s| s.to_string())
+        };
+        let exclude_newer = {
+            let words: Vec<&str> = cmd_text.split_whitespace().collect();
+            words
+                .iter()
+                .position(|&w| w == "--exclude-newer")
+                .and_then(|i| words.get(i + 1))
+                .map(|s| s.to_string())
+        };
         Fixture {
             id: id.into(),
             dir: dir.to_path_buf(),
             cmd: Cmd::from_dir(dir),
             no_index,
+            strategy,
+            exclude_newer,
             expected,
         }
     }

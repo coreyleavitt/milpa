@@ -1,0 +1,15 @@
+// fixture-443 (rfc-resolution-semantics.md §3 Axis W — W1): Axis D folded
+// into a workspace, REJECTION side — a `resolution { }` block declared on
+// a workspace MEMBER manifest (not the root) is a hard error. One shared
+// lock implies one resolution policy, so `resolution { }` is root-only —
+// mirrors WS-INDEX-TRUST-ON-MEMBER / WS-ENTRY-TRUST-ON-MEMBER /
+// WS-INDEX-HISTORY-ON-MEMBER for the sibling root-only-policy axes, though
+// this slug keeps the dominant MAN- prefix (spec/errors.md).
+//
+// member-a's `resolution { strategy "maxver" }` block matches what the
+// default policy would already be — proving the rule fires on WHERE the
+// block is declared, not on any value divergence. See fixture-442 for the
+// companion SUCCESS case (the same block, legally declared on the root).
+workspace {
+    member "member-a"
+}

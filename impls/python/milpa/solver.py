@@ -404,6 +404,13 @@ class SolverError(Exception):
                     # meaning depender requires pkg IN required_vs.
                     # The required range is t.versions directly (NOT its complement).
                     required = t.versions
+                    # D-A2: a full() requirement (e.g. a git/url/local/tarball
+                    # dep's full() self-term) is never violated by any candidate,
+                    # so it can never contribute to *why* a conflict is
+                    # unsatisfiable — including it would just be noise in the
+                    # weak-UNSAT core.  Skip it.
+                    if required.is_full():
+                        continue
                     # Use constraint-string form for §5.2 checkability.
                     constraint_str = _vs_to_constraint_str(required)
                     key = (t.package, constraint_str)
@@ -413,6 +420,104 @@ class SolverError(Exception):
                             RefutationEntry(package=t.package, constraint=constraint_str)
                         )
         return tuple(entries)
+
+
+class VersionUnknownConstrained(Exception):
+    """Raised by ``_make_decision`` for A4's version-unknown partition
+    (resolver-semantics RFC §3 Axis A (c) / §6 D-A1).
+
+    A version-unknown package (``provider.is_version_unknown(package)``) is
+    scheduled with strictly lowest decision priority (``_next_undecided``), so
+    by the time it is decided, every potential constrainer — including a
+    named/index dep whose own floor only materializes lazily, mid-solve — has
+    already been expanded and its floor is in the accumulated range. If that
+    range is still ``full()``, the package is unconstrained and the existing
+    sentinel decision proceeds normally (no exception). If the range is
+    non-``full()``, this is raised INSTEAD of returning any candidate to the
+    solver — never a generic ``SolverError``/``SOLVE-CONFLICT``, and never an
+    out-of-range value.
+
+    Deliberately NOT a ``MilpaError`` subclass: ``solver.py`` stays
+    domain-agnostic (it doesn't know about manifests, root authority, or error
+    slugs). The resolver catches this alongside ``SolverError`` and builds
+    ``RES-VERSION-UNKNOWN-CONSTRAINED`` with the root-authority-aware
+    branching remedy text (something only the resolver can determine).
+
+    ``constrainers``: every ``(consumer, constraint_str)`` pair that
+    contributed a non-``full()`` term on ``package`` — enumerated in full
+    (the amoxtli incident floored two packages at once; a serial
+    fail-fix-rerun loop is exactly the papercut this RFC avoids).
+    """
+
+    def __init__(self, package: str, constrainers: tuple[tuple[str, str], ...]) -> None:
+        self.package = package
+        self.constrainers = constrainers
+        super().__init__(
+            f"{package!r} is version-unknown but constrained by: {constrainers!r}"
+        )
+
+
+def _accumulated_constrainers(
+    incompats: list[Incompatibility], target_pkg: str, partial: PartialSolution
+) -> tuple[tuple[str, str], ...]:
+    """Every ``(consumer, constraint_str)`` pair placing a non-``full()``
+    constraint on ``target_pkg``, read from the incompatibilities recorded so
+    far (mirrors ``SolverError.refutation``'s own walk, but keyed by consumer
+    name rather than collapsed to the target package alone — A4 needs to name
+    *who* imposed each constraint, not just what the constraint was).
+
+    Only ``"dependency:"``-caused incompatibilities are considered (skips the
+    synthetic ``"conflict-blocks:"``/``"root"`` incompats the backtracking
+    loop adds — those are solver bookkeeping, not real dep-graph facts).
+
+    R8b (phantom constrainer after backtrack): incompatibilities are
+    append-only and RETAINED across backtracking — they're permanent learned
+    facts, not undone when a decision is. So an incompat recorded when some
+    consumer ``C`` was speculatively decided at version ``v1`` survives even
+    after ``C`` is backtracked and re-decided at a different ``v2``. Only the
+    consumer's FINAL decided version (``partial.decisions()``, the live
+    partial-solution state) may name a constrainer — a stale incompat whose
+    consumer term doesn't match ``C``'s final version is a constraint from a
+    version that is NOT in the solution, and must be skipped.
+    """
+    final_decisions = partial.decisions()
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for ic in incompats:
+        if not ic.cause.startswith("dependency:"):
+            continue
+        target_term: Term | None = None
+        consumer_term: Term | None = None
+        for t in ic.terms:
+            if not t.positive and t.package == target_pkg:
+                target_term = t
+            elif t.positive:
+                consumer_term = t
+        if target_term is None or consumer_term is None:
+            continue
+        required = target_term.versions
+        if required.is_full():
+            continue
+        # R8b: the consumer term is always a decision-point singleton
+        # (`Term.require(package, VersionSet.eq(chosen))` — see the
+        # `dependency:` incompat built in `_make_decision`), same shape
+        # `PartialSolution.decisions()` extracts from. Skip this incompat
+        # unless the consumer is STILL finally decided at exactly that
+        # version — otherwise it's a stale fact from a backtracked-away
+        # decision and would name a phantom constrainer.
+        consumer_pkg = consumer_term.package
+        final_version = final_decisions.get(consumer_pkg)
+        if final_version is None:
+            continue
+        consumer_version = consumer_term.versions.intervals[0][0]
+        if consumer_version != final_version:
+            continue
+        constraint_str = _vs_to_constraint_str(required)
+        key = (consumer_pkg, constraint_str)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------
@@ -588,12 +693,35 @@ def _make_decision(
 
     Returns the decided package name, or ``None`` if the solution is complete.
     Raises ``_Conflict`` if the chosen package has no satisfying version.
+    Raises ``VersionUnknownConstrained`` (A4) if ``package`` is version-unknown
+    and its accumulated range is non-``full()`` at this (last-scheduled)
+    decision point.
     """
-    package = _next_undecided(partial)
+    package = _next_undecided(partial, provider)
     if package is None:
         return None
 
     allowed = partial.effective_set(package)
+
+    # A4 (resolver-semantics RFC §3 Axis A (c)): classify a version-unknown
+    # package at its own decision point — `_next_undecided` guarantees this is
+    # the LAST such package decided, so `allowed` is the complete accumulated
+    # range (every constrainer, including a lazily-materialized named/index
+    # dep, has already been expanded). `full()` → unconstrained, fall through
+    # to the ordinary pick below (the sentinel is trivially in-range). Non-
+    # `full()` → hard error, raised BEFORE any candidate is returned — no
+    # out-of-range value, no generic SOLVE-CONFLICT.
+    if _is_version_unknown(provider, package) and not allowed.is_full():
+        raise VersionUnknownConstrained(
+            package, _accumulated_constrainers(incompats, package, partial)
+        )
+
+    # C2 (resolver-semantics RFC §3 Axis C / §4 stage 4, D-C2): resolve the
+    # configured ``strategy`` — which may be the surface-only
+    # ``LOWEST_DIRECT`` — to a concrete per-package strategy BEFORE the pick.
+    # ``_pick_version`` never sees ``LOWEST_DIRECT``.
+    effective_strategy = _effective_strategy_for(provider, package, strategy)
+
     available = provider.versions(package)
     candidates = [v for v in available if allowed.contains(v)]
     if not candidates:
@@ -604,7 +732,16 @@ def _make_decision(
             )
         )
 
-    chosen = _pick_version(candidates, allowed, strategy, package)
+    # B2 (resolver-semantics RFC §4 stage 4): the provider assembles the
+    # preference from ``params.prior`` (an O(1) lookup, per-package) — the
+    # pick itself never learns about lockfiles. A provider with no
+    # prior-lock concept (in-memory test fakes) falls through to ``None``
+    # via ``_preference_for``'s optional-hook default, so pre-B2 callers are
+    # unaffected.
+    preference = _preference_for(provider, package)
+    chosen = _pick_version(
+        candidates, allowed, effective_strategy, package, preference=preference
+    )
 
     for dep_term in provider.dependencies(package, chosen):
         if not dep_term.positive:
@@ -623,17 +760,45 @@ def _make_decision(
     return package
 
 
+# Axis B (resolver-semantics RFC §4 stage 4): a plain preference value
+# threaded into the pure pick. ``None`` means no preference (today's
+# behavior). A non-``None`` value is the RFC's ``FromLock(v)`` — the prior
+# lockfile's recorded version for this package, assembled *upstream* (B2)
+# from ``params.prior``. The picker never learns about lockfiles, manifests,
+# or provenance; it only ever sees this plain value.
+Preference = Version | None
+
+
 def _pick_version(
     candidates: list[Version],
     allowed: VersionSet,
     strategy: Strategy,
     package: str,
+    preference: Preference = None,
 ) -> Version:
     """Pick a version from ``candidates`` according to ``strategy``.
 
     All candidates are guaranteed to satisfy the accumulated constraint
     (already filtered by ``allowed.contains``).
+
+    ``preference`` (Axis B, RFC §4 stage 4) short-circuits the strategy
+    ordering — NOT a candidate reorder, which would be inert against the
+    order-independent ``max``/lower-bound pick below. If ``preference`` is
+    ``FromLock(v)`` (i.e. not ``None``) and ``v`` survived the constraint
+    filter (``v in candidates``, which already implies ``v`` is in
+    ``allowed``), it wins outright. Otherwise fall through to the ordinary
+    strategy pick, unchanged.
+
+    ``strategy`` is always a concrete ``MAXVER``/``MINVER``/``SEMVER`` value
+    (C2, resolver-semantics RFC §4 stage 4, D-C2) — ``LowestDirect`` is a
+    surface-only value the provider resolves to one of these three, per
+    package, BEFORE calling this function (``_effective_strategy_for``). This
+    ``match`` deliberately has no ``LowestDirect`` case and never will; the
+    trailing ``raise`` documents (and enforces) that invariant rather than
+    silently falling through.
     """
+    if preference is not None and preference in candidates:
+        return preference
     match strategy:
         case Strategy.MAXVER:
             return max(candidates)
@@ -641,6 +806,11 @@ def _pick_version(
             return min(candidates)
         case Strategy.SEMVER:
             return _pick_semver(candidates, allowed, package)
+    raise AssertionError(
+        f"_pick_version received {strategy!r}; LowestDirect (and any other "
+        "non-concrete strategy) must be resolved to Minver/Maxver/Semver by "
+        "_effective_strategy_for before reaching the picker (D-C2)"
+    )
 
 
 def _pick_semver(
@@ -680,9 +850,93 @@ def _lower_bound_of(vs: VersionSet) -> Version | None:
     return min(b for b in bounds if b is not None)
 
 
-def _next_undecided(partial: PartialSolution) -> str | None:
-    """Find a package with positive constraints but no decision yet."""
+def _is_version_unknown(provider: PackageProvider, package: str) -> bool:
+    """A4: query the provider's optional ``is_version_unknown`` hook.
+
+    Not part of the ``PackageProvider`` Protocol's required shape — synthetic
+    test providers (e.g. ``DictProvider``) never implement it and correctly
+    default to ``False`` (no version-unknown concept exists for them). Only
+    the resolver's production provider (which knows about git/url/local/
+    tarball candidate labeling) implements it for real.
+    """
+    checker = getattr(provider, "is_version_unknown", None)
+    if checker is None:
+        return False
+    return bool(checker(package))
+
+
+def _preference_for(provider: PackageProvider, package: str) -> "Preference":
+    """B2: query the provider's optional ``preference`` hook.
+
+    Not part of the ``PackageProvider`` Protocol's required shape — mirrors
+    ``_is_version_unknown``'s optional-hook pattern. Synthetic test providers
+    (e.g. ``DictProvider``) never implement it and correctly default to
+    ``None`` (no prior-lock concept exists for them). Only the resolver's
+    production provider (which knows about ``params.prior``) implements it
+    for real, returning the prior lockfile's recorded version for ``package``
+    (a solver_var string) when one exists — the RFC's ``FromLock(v)``.
+    """
+    getter = getattr(provider, "preference", None)
+    if getter is None:
+        return None
+    return getter(package)
+
+
+def _is_root_direct(provider: PackageProvider, package: str) -> bool:
+    """C2 (resolver-semantics RFC §3 Axis C): query the provider's optional
+    ``is_root_direct`` hook.
+
+    Mirrors ``_is_version_unknown``'s optional-hook pattern — not part of the
+    ``PackageProvider`` Protocol's required shape, so synthetic test providers
+    with no root-authority concept correctly default to ``False`` (every
+    package is treated as transitive). Only the resolver's production
+    provider (which knows the manifest's ``root_authority`` set) implements
+    it for real.
+    """
+    checker = getattr(provider, "is_root_direct", None)
+    if checker is None:
+        return False
+    return bool(checker(package))
+
+
+def _effective_strategy_for(
+    provider: PackageProvider, package: str, strategy: Strategy
+) -> Strategy:
+    """C2 (resolver-semantics RFC §3 Axis C / §4 stage 4, D-C2): resolve the
+    configured ``strategy`` to a concrete per-package strategy.
+
+    ``LowestDirect`` is NOT a picker case — it is *exactly* ``MINVER`` for a
+    root-direct package (``_is_root_direct``) and ``MAXVER`` otherwise. This
+    is the provider-level effective-strategy precompute the RFC's design
+    deepening calls for: it is the ONLY place ``Strategy.LOWEST_DIRECT`` is
+    ever interpreted. Every other configured strategy passes through
+    unchanged. ``_pick_version`` — called only with this function's return
+    value — never sees ``Strategy.LOWEST_DIRECT``, and its ``match`` has no
+    case for it.
+    """
+    if strategy is not Strategy.LOWEST_DIRECT:
+        return strategy
+    return Strategy.MINVER if _is_root_direct(provider, package) else Strategy.MAXVER
+
+
+def _next_undecided(partial: PartialSolution, provider: PackageProvider) -> str | None:
+    """Find a package with positive constraints but no decision yet.
+
+    A4 (resolver-semantics RFC §3 Axis A (c)): version-unknown packages are
+    scheduled STRICTLY LAST — deferred to a second pass — so that by the time
+    one is decided, every potential constrainer (including a lazily-
+    materialized named/index dep) has already been expanded and its floor is
+    already in the accumulated range (`effective_set`). This is NOT a static
+    pre-classification: `is_version_unknown` is queried fresh on each call, in
+    the SAME insertion-order scan this function has always used (fixture-063
+    is NORMATIVE on that order) — just gated into two passes. When no
+    version-unknown package is in play (the common case — including every
+    fixture that predates A4), the deferred list stays empty and this is
+    byte-for-byte the original single-pass scan: same order, no behavior
+    change.
+    """
     seen: set[str] = set()
+    deferred: list[str] = []
     for a in partial.assignments:
         pkg = a.term.package
         if pkg in seen:
@@ -690,9 +944,13 @@ def _next_undecided(partial: PartialSolution) -> str | None:
         seen.add(pkg)
         if partial.has_decision(pkg):
             continue
-        if not partial.effective_set(pkg).is_empty():
-            return pkg
-    return None
+        if partial.effective_set(pkg).is_empty():
+            continue
+        if _is_version_unknown(provider, pkg):
+            deferred.append(pkg)
+            continue
+        return pkg
+    return deferred[0] if deferred else None
 
 
 # ---------------------------------------------------------------------------

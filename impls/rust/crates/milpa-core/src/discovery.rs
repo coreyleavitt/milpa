@@ -146,6 +146,7 @@ pub fn manifest_from_nimble(nm: &NimbleManifest, name: &str) -> Manifest {
                     predicates: Vec::new(),
                     flag_requests: Vec::new(),
                     optional: false,
+                    version: None,
                 }));
             }
             NimbleRequirement::Named {
@@ -183,6 +184,11 @@ pub fn manifest_from_nimble(nm: &NimbleManifest, name: &str) -> Manifest {
         cas_dir: String::new(),
         spec_version: 1,
         spec_version_explicit: false,
+        // A1: .nimble-auto-discovery synthesis does not wire the scanned
+        // `.nimble` version through (mirrors Python `_manifest_from_nimble`,
+        // workspace.py — out of this slice's scope; the declared-version
+        // precedence chain that reads `.nimble` as an adapter is Axis A2).
+        version: None,
         attestation_policy: milpa_manifest::TrustPolicy::Warn,
         index_trust_policy: milpa_manifest::TrustPolicy::Warn,
         index_trust_signer: None,
@@ -192,6 +198,7 @@ pub fn manifest_from_nimble(nm: &NimbleManifest, name: &str) -> Manifest {
         entry_trust_policy_explicit: false,
         index_history_policy: milpa_manifest::TrustPolicy::Warn,
         index_history_policy_explicit: false,
+        resolution: None,
         optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }

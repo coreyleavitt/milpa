@@ -120,9 +120,9 @@ uses the `(url)` annotation to mark URL strings.
 
 > NORMATIVE: A package manifest MUST contain exactly one `name` node and at
 > most one each of: `kind`, `deps`, `dev-deps`, `overrides`, `src_dir`, `flags`,
-> `mirrors`, `cas`, `spec-version`, `attestation-policy`. Any other top-level
-> node name MUST raise `MAN-UNKNOWN-TOP-LEVEL`. Two `name` nodes MUST raise
-> `MAN-NAME-DUPLICATE`.
+> `mirrors`, `cas`, `spec-version`, `version`, `attestation-policy`,
+> `resolution`. Any other top-level node name MUST raise `MAN-UNKNOWN-TOP-LEVEL`.
+> Two `name` nodes MUST raise `MAN-NAME-DUPLICATE`.
 
 > NORMATIVE: The `name` node MUST carry exactly one positional string argument
 > (the package name). Missing `name` raises `MAN-NAME-MISSING`; wrong arity or
@@ -143,6 +143,30 @@ uses the `(url)` annotation to mark URL strings.
 > characters would inject extra lines into nim.cfg `--path:` directives when
 > the value is incorporated verbatim. A parser MUST validate the value at parse
 > time and raise `MAN-SRC-DIR-UNSAFE` if any forbidden character is present.
+
+#### `version` field (resolution-semantics RFC §3 Axis A / §5, A1)
+
+> NORMATIVE: The `version` node MUST carry exactly one positional string
+> argument that parses as a strict 3-component semver (`X.Y.Z`) — the same
+> grammar `parse_version` enforces for every other version literal in the
+> system (dep constraints, lockfile-recorded versions, git tags). Wrong
+> arity, a non-string argument, or a value that does not parse as `X.Y.Z`
+> MUST raise `MAN-PACKAGE-VERSION-INVALID`. Unlike the `.nimble` compatibility fallback
+> (which treats a malformed `version` as version-unknown rather than a hard
+> error), `milpa.kdl` is milpa's own strict manifest format, so a malformed
+> `version` is always a parse error, never silently downgraded to absent.
+>
+> The node is optional. When absent, the package's version is not declared
+> by this source — it falls through to the next step of the resolver's
+> declared-version precedence chain (resolution-semantics RFC §3 Axis A (b):
+> this field, else the package's `.nimble` `version`, else — for git deps
+> only — a version-shaped git ref tag, else the dep declaration's own
+> `version=` annotation; see `spec/lockfile-schema.md` §3.2 for where the
+> resulting value and its source are recorded). This `version` node is the
+> **highest-precedence** step in that chain — when present, it wins over
+> the `.nimble` version, the git tag, and the `version=` annotation. It is
+> orthogonal to `spec-version` (the manifest schema epoch, §3.1 above); the
+> two MUST NOT be confused.
 
 #### `attestation-policy` field
 
@@ -177,6 +201,55 @@ uses the `(url)` annotation to mark URL strings.
 > one `(url)`-annotated URL argument. Unknown child names raise
 > `MAN-MIRRORS-UNKNOWN-CHILD`; wrong arity raises `MAN-MIRRORS-ARITY`; a plain
 > (unannotated) string raises `MAN-URL-ARG-TYPE`.
+
+#### `resolution` block (resolution-semantics RFC §3 Axis C/D / §5, C3/D1)
+
+> NORMATIVE: The `resolution` block declares manifest-level resolution
+> policy. It recognizes two children, `strategy` (C3) and `exclude-newer`
+> (D1), each optional and independent — a block may declare either, both, or
+> neither. Any other child node name, or a duplicate `strategy`/`exclude-newer`
+> child, MUST raise `MAN-RESOLUTION-BLOCK-INVALID`.
+>
+> ```kdl
+> resolution {
+>     strategy "maxver"
+>     exclude-newer "2026-01-01T00:00:00Z"
+> }
+> ```
+>
+> NORMATIVE: `strategy` MUST carry exactly one positional string argument
+> whose value is one of `"maxver"`, `"minver"`, `"semver"`, or
+> `"lowest-direct"` (the same wire values as CLI `--strategy`, §cli-contract
+> §2.10). Wrong arity, a non-string argument, or any other value MUST raise
+> `MAN-RESOLUTION-STRATEGY-INVALID`.
+>
+> NORMATIVE: `resolution { strategy }` participates in the CLI `--strategy`
+> precedence chain (CLI > manifest > `maxver` default, §cli-contract
+> §2.10 — the lockfile's recorded strategy is NOT a precedence tier; it is
+> diagnostic/frozen-parity only, never a live resolution input) — it is
+> consulted only when `--strategy` is not passed on that invocation. In a
+> workspace, `resolution` is **root-only** (§7): one shared lock implies
+> one resolution policy for the whole
+> workspace.
+>
+> NORMATIVE: `exclude-newer` MUST carry exactly one positional string
+> argument that parses as an ISO 8601 timestamp (the same parser used for
+> the registry protocol's `published_at`/`yanked_at` fields). Wrong arity, a
+> non-string argument, or an unparseable value MUST raise
+> `MAN-RESOLUTION-EXCLUDE-NEWER-INVALID`. Unlike `published_at`/`yanked_at`
+> (which treat a malformed value as absent), a malformed
+> `resolution { exclude-newer }` is a hard parse error — it is a manifest
+> declaration, not an optional informational index field.
+>
+> NORMATIVE: A timestamp with no UTC offset (no trailing `Z` and no
+> `+HH:MM`/`-HH:MM` suffix) MUST be interpreted as UTC, not as local time.
+>
+> NORMATIVE: `resolution { exclude-newer }` declares the time-bound
+> consulted by resolution's exclude-newer filtering/validation
+> (resolution-semantics RFC §3 Axis D) — this D1 slice covers manifest
+> parse/round-trip only; the CLI `--exclude-newer` override, the index
+> candidate filter, and the git pinned-ref validation are later slices of
+> the same RFC. Root-only in a workspace, same rationale as `strategy`.
 
 ### 3.2  The `deps` block
 
@@ -225,6 +298,14 @@ Grammar: `<name> git=(url)"<URL>" ref="<git-ref>" [<predicate-props>] [{ … }]`
 >   multi-value child node (§6.2).
 >
 > Any other child name raises `MAN-DEP-UNKNOWN-CHILD`.
+
+> NORMATIVE (resolution-semantics RFC §3 Axis A (b) step 4): A UrlDep MAY
+> carry an optional `version="x.y.z"` property — a user-supplied declared
+> version, consulted by the resolver only when the fetched package's own
+> manifest (`milpa.kdl`/`.nimble`) and its git tag yield no version (Cargo's
+> `{ git, version }` pattern). Distinct from an `overrides { pkg … }` rule
+> (§3.4): the annotation *labels* a version, an override *redirects* the
+> source. A malformed `version=` value raises `MAN-DEP-VERSION-INVALID`.
 
 #### NamedDep
 
@@ -293,8 +374,11 @@ Grammar: `<name> local="<path>"`
 
 > NORMATIVE: A LocalDep MUST carry exactly one `local=` property whose value is
 > a non-empty string (a relative-to-project or absolute filesystem path).
-> Empty or non-string value raises `MAN-DEP-LOCAL-PATH`. No other properties
-> are permitted (`MAN-DEP-UNKNOWN-PROPS`).
+> Empty or non-string value raises `MAN-DEP-LOCAL-PATH`. An optional
+> `version="x.y.z"` property is also permitted (resolution-semantics RFC §3
+> Axis A (b) step 4 — see UrlDep above); a malformed value raises
+> `MAN-DEP-VERSION-INVALID`. No other properties are permitted
+> (`MAN-DEP-UNKNOWN-PROPS`).
 
 > NORMATIVE: LocalDep is NOT CAS-admissible. The fetcher MUST expose the
 > source tree at `_deps/<name>` via a **symlink** to the source path; it MUST
@@ -311,9 +395,13 @@ Grammar: `<name> tarball=(url)"<URL>" [sha256="<hex>"] [strip_components=<N>]`
 > non-empty). A plain (unannotated) string or non-string raises `MAN-URL-ARG-TYPE`;
 > an empty string raises `MAN-DEP-TARBALL-URL`.
 > Other permitted properties: `sha256` (optional string; raises
-> `MAN-DEP-TARBALL-SHA` if non-string when present) and `strip_components`
+> `MAN-DEP-TARBALL-SHA` if non-string when present), `strip_components`
 > (optional non-negative integer; raises `MAN-DEP-TARBALL-STRIP` if negative,
-> non-numeric, or boolean). Default `strip_components` is `0`.
+> non-numeric, or boolean; default `0`), and `version="x.y.z"` (optional —
+> resolution-semantics RFC §3 Axis A (b) step 4, see UrlDep above; a
+> malformed value raises `MAN-DEP-VERSION-INVALID`). This reach extension —
+> a tarball dep gets the same declared-version escape hatch as git/url/local
+> — avoids a constrained tarball dep having no remedy but the hard error.
 
 > NORMATIVE: A conformant tarball fetcher MUST support the following compression
 > formats, detected by magic bytes on the downloaded archive before extraction:
@@ -411,7 +499,22 @@ Grammar: `member "<name>"`
 >
 > Other error codes: unknown override kind → `MAN-OVERRIDE-KIND`; wrong arity →
 > `MAN-OVERRIDE-ARITY`; duplicate name → `MAN-OVERRIDE-DUPLICATE`; unknown property
-> → `MAN-OVERRIDE-UNKNOWN-PROPS` (known properties: `git`, `ref`, `local`).
+> → `MAN-OVERRIDE-UNKNOWN-PROPS` (known properties: `git`, `ref`, `local`, `version`).
+
+> NORMATIVE (resolution-semantics RFC §3 Axis A (b) step 4, D-A3): A `pkg`
+> override rule MAY additionally carry a `version="x.y.z"` property,
+> regardless of which target form is selected. This is **orthogonal** to the
+> target — the target *redirects* which source is used; `version=` *labels*
+> the redirected target's declared version, the same annotation concept as
+> the dep-form `version=` above, but attached to the override rule because a
+> purely transitive dep has no dep declaration of its own to annotate. A
+> malformed value raises `MAN-DEP-VERSION-INVALID`.
+>
+> **Composition rule:** when a `pkg` rule redirects a dep, the declared-version
+> precedence (steps 1-4) re-runs against the *override target's* manifest, and
+> this `version=` is that target's step 4. A `version=` left on the
+> now-redirected ORIGINAL dep declaration is dead and ignored — not a
+> conflict, since the redirect discards the original declaration entirely.
 >
 > ```kdl
 > overrides {
@@ -1023,9 +1126,17 @@ The profile fields are normalized to Nim's `hostOS` / `hostCPU` vocabulary.
 
 > NORMATIVE: A workspace manifest contains a `workspace { }` block and
 > optionally `name`, `overrides`, `spec-version`, `flags`, `index-trust`,
-> `index-trust-signer`, and `index-trust-bundle` top-level nodes. It MUST NOT
-> contain `deps` or `kind` (`MAN-WORKSPACE-HAS-DEPS-OR-KIND`). Any other
-> top-level node raises `MAN-WORKSPACE-UNKNOWN-TOP-LEVEL`.
+> `index-trust-signer`, `index-trust-bundle`, and `resolution` top-level
+> nodes. It MUST NOT contain `deps` or `kind`
+> (`MAN-WORKSPACE-HAS-DEPS-OR-KIND`). Any other top-level node raises
+> `MAN-WORKSPACE-UNKNOWN-TOP-LEVEL`.
+
+> NORMATIVE (resolution-semantics RFC §3 Axis C / Axis W, C3): the
+> `resolution { }` block, when present on a workspace, follows the same
+> grammar as the package-manifest `resolution` block (§3.1) and is
+> **root-only** — one shared lock implies one resolution policy for the
+> whole workspace. (A member-level `resolution` block's rejection is
+> reserved for a later slice, Axis D/W1 — not yet enforced.)
 
 > NORMATIVE: The `name` node, when present, MUST carry exactly one positional
 > string argument. It is **informational only**: implementations MAY store or
@@ -1115,6 +1226,7 @@ This section specifies the normative constraints on that output.
 deps {
     // URL dep
     <name> git=(url)"<https|http|ssh|git URL>" ref="<git-ref>"
+           [version="<x.y.z>"]           // A3b: declared-version annotation
            [platform="<token>" | platform=(not)"<token>"]
            [arch="<token>"     | arch=(not)"<token>"]
            [nim="<semver-or-constraint>"]
@@ -1130,10 +1242,10 @@ deps {
     <name> "<version-constraint>"    // e.g. ">= 0.5.0"
 
     // Local dep
-    <name> local="<path>"
+    <name> local="<path>" [version="<x.y.z>"]
 
     // Tarball dep
-    <name> tarball=(url)"<URL>" [sha256="<hex>"] [strip_components=<N>]
+    <name> tarball=(url)"<URL>" [sha256="<hex>"] [strip_components=<N>] [version="<x.y.z>"]
 
     // Workspace-internal member dep
     member "<member-name>"

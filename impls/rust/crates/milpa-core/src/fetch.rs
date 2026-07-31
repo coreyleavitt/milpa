@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use milpa_types::Provenance;
+use milpa_types::{Provenance, Timestamp};
 
 /// What a fetcher reports after materializing bytes into `dest`. Deliberately
 /// not an identity — identity is computed by the caller from the bytes on disk.
@@ -38,6 +38,21 @@ pub struct Receipt {
     /// field that proves the hash subcommand and the real fetch path use the
     /// same identity derivation (spec/cli-contract.md §5.11 NORMATIVE).
     pub identity: Option<String>,
+    /// D4 (resolution-semantics RFC §3 Axis D / §6 D-D1/D-D2): the resolved
+    /// git commit's own COMMITTER date — never an annotated tag's tagger
+    /// date. Read off the already-full local clone by `fetch_git` (a bounded
+    /// transport addition, no extra network round trip); `None` for every
+    /// non-git transport (local/tarball/OCI have no commit, so they are not
+    /// validated against `exclude_newer` — only git/url deps are, D4's scope).
+    ///
+    /// L2: also `None` for a git fetch whose date read itself failed (a
+    /// `git log` hiccup) — `fetch_git` degrades that failure to `None`
+    /// rather than failing the whole fetch. This folds into the SAME
+    /// absence posture as the non-git case just above: the resolver's
+    /// exclude-newer check treats any `None` here as "not validated",
+    /// regardless of whether the transport never had a date or a real git
+    /// transport's read of one failed.
+    pub committer_date: Option<Timestamp>,
 }
 
 /// Fetch errors.

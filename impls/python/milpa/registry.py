@@ -22,7 +22,7 @@ from __future__ import annotations
 import re
 import warnings
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from milpa.errors import (
@@ -445,6 +445,48 @@ def _yanked_excluded_payload(yanked_excluded: list[IndexVersion]) -> list[dict[s
     return [{"version": iv.version, "reason": iv.yanked_reason} for iv in yanked_excluded]
 
 
+def filter_by_exclude_newer(
+    versions: "tuple[IndexVersion, ...] | list[IndexVersion]",
+    exclude_newer: datetime | None,
+) -> tuple[list[IndexVersion], int]:
+    """Axis D / §4 stage 2 — the exclude-newer hard cut at the enumeration layer.
+
+    Drops every candidate whose ``published_at`` is not provably ``<=
+    exclude_newer`` *before* the solver ever sees the candidate set
+    (resolution-semantics RFC §3 Axis D / §4 stage 2: "the enumeration layer
+    drops candidates with ``published_at > ts`` *before* the solver sees
+    them").  ``exclude_newer is None`` is a no-op (returns *versions*
+    unchanged, 0 dropped) — the overwhelmingly common case, not a filter over
+    an empty bound.
+
+    **Fail-closed (§6 D-D3).** ``published_at``'s ordinary optional-scalar
+    posture is *permissive*: absent-or-malformed collapses to ``None`` with
+    no diagnostic (``IndexVersion.published_at``'s own docstring). That
+    default is deliberately OVERRIDDEN here — a candidate whose publication
+    timestamp cannot be established fails the "provably predates
+    *exclude_newer*" test by construction, so it is EXCLUDED, never
+    permissively kept.
+
+    Returns ``(kept, dropped_count)``. The caller (the enumeration site,
+    ``_enumerate_named_stubs`` in ``resolver.py``) raises
+    ``RES-EXCLUDE-NEWER-EMPTY`` when *dropped_count* empties an
+    otherwise-non-empty candidate set — kept a DISTINCT error class from
+    ``TNG-NO-SATISFYING-VERSION`` on purpose (§4 stage placement: this filter
+    runs against the constraint-blind stage-1 enumeration, before the
+    solver's own accumulated-constraint filter at stage 3, so a caller can
+    tell "no version ever satisfied the constraints" from "versions existed
+    but the time-bound excluded them all").
+    """
+    if exclude_newer is None:
+        return list(versions), 0
+    kept = [
+        iv
+        for iv in versions
+        if iv.published_at is not None and iv.published_at <= exclude_newer
+    ]
+    return kept, len(versions) - len(kept)
+
+
 @dataclass
 class Index:
     """The parsed registry index.
@@ -778,19 +820,36 @@ def _child_bool(parent: KdlNode, child_node_name: str) -> bool | None:
 
 
 def _parse_timestamp(raw: str | None) -> datetime | None:
-    """Parse an ISO 8601 timestamp string to ``datetime``.
+    """Parse an ISO 8601 timestamp string to an aware (UTC-normalized)
+    ``datetime``.
 
     Registry-protocol §3.2 NORMATIVE: a malformed value MUST NOT raise a hard
     parse error — it uses the parser's ordinary optional-scalar robustness
     posture (surfaced as absent).  Applies to both ``published_at`` and
     ``yanked_at``.
+
+    R2: ``datetime.fromisoformat`` returns a NAIVE datetime for an
+    offsetless-but-otherwise-valid string (e.g. a hand-typed
+    ``resolution { exclude-newer "2026-01-01T00:00:00" }`` with no trailing
+    ``Z``/offset — a very natural thing to type).  Every downstream
+    comparison is against a tz-AWARE datetime (D3's ``IndexVersion
+    .published_at``, D4's git committer date from ``%cI``), and naive-vs-
+    aware comparison raises ``TypeError``.  A dependency cutoff is
+    conceptually UTC regardless of spelling, so a naive result is normalized
+    by ASSUMING UTC here — the single place this parser is called from —
+    rather than left naive for callers to trip over.  This mirrors Rust's
+    ``parse_iso8601_timestamp``, which treats an absent offset as UTC
+    (``offset_seconds = 0``) by construction; both impls now agree.
     """
     if raw is None:
         return None
     try:
-        return datetime.fromisoformat(raw)
+        parsed = datetime.fromisoformat(raw)
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _child_scalar_url(parent: KdlNode, child_node_name: str) -> str | None:

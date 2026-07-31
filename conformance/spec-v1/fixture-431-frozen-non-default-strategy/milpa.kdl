@@ -1,0 +1,15 @@
+// fixture-431 (resolution-semantics RFC §3 Axis C, C3b/C4): a manifest
+// declaring a NON-DEFAULT `resolution { strategy }` (minver, not the
+// maxver default) whose lockfile was recorded under that same strategy.
+// `frozen` MUST pass -- the FROZEN-STRATEGY-MISMATCH baseline is the
+// manifest's own *effective* resolution.strategy (C3b), not a hardcoded
+// "maxver" literal, which would otherwise spuriously fail this frozen
+// run on every reproducible-build invocation of this project.
+name "myapp"
+kind "application"
+deps {
+    widget
+}
+resolution {
+    strategy "minver"
+}

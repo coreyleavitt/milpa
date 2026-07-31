@@ -1,0 +1,16 @@
+// fixture-432 (resolution-semantics RFC §3 Axis C, round-3-Critical guard,
+// C4): "anchor" is locked at 1.0.0 (strategy "maxver") with a NEWER 2.0.0
+// candidate sitting in the index. The manifest constraint is untouched --
+// the ONLY delta between the committed state and this fixture's cmd is
+// the EXPLICIT `--strategy maxver` cmd token (spelling out the very same
+// value the lock was already produced under). "anchor" MUST stay pinned
+// at 1.0.0: the bypass trigger is `effective strategy != lockfile.strategy`
+// (value-divergence), never CLI flag *presence* -- gating on presence
+// would make `milpa fetch --strategy maxver` (e.g. spelled out in a CI
+// script) silently flip the whole graph to newest-wins, resurrecting #192
+// through the single most innocuous invocation in the surface.
+name "myapp"
+kind "application"
+deps {
+    anchor
+}

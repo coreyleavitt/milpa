@@ -4,7 +4,8 @@ strategy "maxver"
 
 dep "foo" {
     identity "dag-sha256:2ab62f8e68e12f2733281a154fe8482f37f1b93da70fee32b4c3b258ed603455"
-    version "0.0.1"
+    version "1.0.0"
+    declared_version_source "nimble"
     src_dir "src"
     requires
     provenance {

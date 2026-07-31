@@ -4,7 +4,7 @@ strategy "maxver"
 
 dep "lib-consumer" {
     identity "dag-sha256:4b54243fa8c3f525655cd157dd8408ae4ba88bcccd09afa7489359d89078106b"
-    version "0.0.1"
+    version "0.0.0"
     src_dir ""
     requires "lib-target"
     provenance {
@@ -18,7 +18,7 @@ dep "lib-consumer" {
 
 dep "lib-enabler" {
     identity "dag-sha256:1ff1ebe826cb60dc0780235ccc7c444fe4992367d99c23b909f0314ed907a059"
-    version "0.0.1"
+    version "0.0.0"
     src_dir ""
     requires "lib-target"
     active_flags "enabler-flag"
@@ -33,7 +33,7 @@ dep "lib-enabler" {
 
 dep "lib-end" {
     identity "dag-sha256:2fbe28e6dde1b7f20399d700d54607c62c73d689242b331c7d71662ed30bcf96"
-    version "0.0.1"
+    version "0.0.0"
     src_dir ""
     requires
     provenance {
@@ -47,7 +47,7 @@ dep "lib-end" {
 
 dep "lib-target" {
     identity "dag-sha256:0805547cea1e40609dcdb261ce5555535b58a1cb77120d2eee2a1a8fd4064b94"
-    version "0.0.1"
+    version "0.0.0"
     src_dir ""
     requires "lib-end"
     active_flags "feat-x" "feat-y"

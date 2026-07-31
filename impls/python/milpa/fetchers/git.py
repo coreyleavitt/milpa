@@ -41,6 +41,7 @@ import os
 import posixpath
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -125,10 +126,22 @@ class GitReceipt(ProvenanceReceipt):
     recursed (H5).  Empty dict when the dep has no submodules.  This is
     PROVENANCE, not identity — recorded alongside ``commit_sha`` in the lockfile
     git provenance block (spec/lockfile-schema.md §4.1).
+
+    ``committer_date`` — the resolved commit's own committer date (timezone-
+    aware), read off the already-full local clone with no extra network round
+    trip (resolution-semantics RFC §3 Axis D / D-D1).  **Always the COMMIT's
+    committer date, NEVER an annotated tag's tagger date** — ``commit`` (the
+    value passed to ``git log``) is always a peeled ``^{commit}`` SHA by the
+    time this is read (both the exact-pin and ref-resolution paths dereference
+    through any tag object before this point), so this is correct even when
+    ``ref`` names an annotated tag.  ``None`` only if the read genuinely could
+    not be performed (defensive — a resolved commit always has a committer
+    date in practice).
     """
 
     commit_sha: str
     submodule_shas: dict[str, str] = dataclasses.field(default_factory=dict)
+    committer_date: datetime | None = None
 
     def transport_fields(self) -> dict[str, str]:
         return {"commit_sha": self.commit_sha}
@@ -863,6 +876,12 @@ class GitFetcher(Fetcher):
                     )
                     commit = _git_resolve_ref(clone_scratch, p.ref)
 
+            # --- committer date (D4, resolution-semantics RFC §3 Axis D) ----
+            # A bounded transport addition: read off the object store already
+            # present in clone_scratch (no extra network round trip).  Must
+            # happen before the finally-block cleanup below.
+            committer_date = _git_committer_date(name, p, clone_scratch, commit)
+
             # --- materialize the object-store tree into dest ----------------
             # spec/plugin-contract.md §2.3 + §2.4.1 NORMATIVE: the ONLY path
             # that produces bytes entering the CAS.
@@ -950,7 +969,11 @@ class GitFetcher(Fetcher):
             # spec/identity.md §1.7.1 NORMATIVE: scratch removed after cat-file pass.
             shutil.rmtree(clone_scratch_parent, ignore_errors=True)
 
-        return GitReceipt(commit_sha=commit, submodule_shas=submodule_shas)
+        return GitReceipt(
+            commit_sha=commit,
+            submodule_shas=submodule_shas,
+            committer_date=committer_date,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -982,6 +1005,39 @@ def _run_git(name: str, p: GitProvenance, argv: list[str]) -> None:
             url=p.url,
             ref=p.ref,
         )
+
+
+def _git_committer_date(name: str, p: GitProvenance, repo: Path, commit: str) -> datetime:
+    """Return the committer date of *commit* in *repo* (timezone-aware).
+
+    D4 (resolution-semantics RFC §3 Axis D / §6 D-D1): ``exclude_newer``
+    validation for git/url deps must key on the COMMIT's own committer date,
+    never an annotated tag's tagger date.  ``%cI`` is git's own strict-ISO-8601
+    committer-date format for ``git log``; run against a *commit* object (the
+    caller always passes an already-peeled ``^{commit}`` SHA, never a tag
+    object SHA — see ``GitReceipt.committer_date``'s docstring), so there is
+    no tag object in the loop for this to accidentally read a tagger date
+    from.
+
+    Raises ``MilpaError(FETCH_GIT_FAILED)`` if the read fails (should not
+    happen for a commit already confirmed present, but this is a real
+    diagnosed failure, not something to silently swallow into ``None``).
+    """
+    result = subprocess.run(
+        ["git", "-C", str(repo), "log", "-1", "--format=%cI", "--end-of-options", commit],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise MilpaError(
+            FETCH_GIT_FAILED,
+            f"reading committer date for {name!r} commit {commit!r} failed: "
+            f"{result.stderr.strip()}",
+            dep=name,
+            url=p.url,
+            commit_sha=commit,
+        )
+    return datetime.fromisoformat(result.stdout.strip())
 
 
 def _git_head_sha(dest: Path) -> str:

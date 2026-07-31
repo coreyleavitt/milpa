@@ -357,6 +357,7 @@ mod tests {
 
     fn dep(name: &str, src_dir: &str) -> ResolvedDep {
         ResolvedDep {
+            declared_version_source: None,
             name: name.into(),
             namespace: None,
             identity: "dag-sha256:00".into(),
@@ -447,6 +448,7 @@ mod tests {
 
     fn dep_with_aliases(name: &str, src_dir: &str, aliases: Vec<String>) -> ResolvedDep {
         ResolvedDep {
+            declared_version_source: None,
             name: name.into(),
             namespace: None,
             identity: "dag-sha256:00".into(),
@@ -541,6 +543,7 @@ mod tests {
 
     fn dep_with_flags(name: &str, active_flags: Vec<String>) -> ResolvedDep {
         ResolvedDep {
+            declared_version_source: None,
             name: name.into(),
             namespace: None,
             identity: "dag-sha256:00".into(),

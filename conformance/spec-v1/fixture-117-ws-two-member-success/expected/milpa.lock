@@ -4,7 +4,7 @@ strategy "maxver"
 
 dep "liba" {
     identity "dag-sha256:d7e91fe34f15cbc45580d860f258b0196e865ed1e6dab1cf624cc5023f2c731f"
-    version "0.0.1"
+    version "0.0.0"
     src_dir "src"
     requires
     provenance {
@@ -16,7 +16,7 @@ dep "liba" {
 
 dep "libb" {
     identity "dag-sha256:a023a51a48c5962a76e5cfef3345799d8aba17608469ae9dae229af12fe7dfa8"
-    version "0.0.1"
+    version "0.0.0"
     src_dir "src"
     requires "liba"
     provenance {
