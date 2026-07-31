@@ -41,7 +41,32 @@
       (pub(crate) only); needs the vendored-patch decision at P3b.
       Gates: pytest 2723 green; dev-rust workspace + conformance green.
 - [ ] P3b — real-crypto strict-fails (lands with P4).
-- [ ] P4 — cross-repo tianguis bundle delivery (BLOCKED on tianguis).
+- [~] P4 — cross-repo tianguis bundle delivery. **STARTED 2026-07-11 in the
+      tianguis repo (/home/corey/projects/tianguis) via /tdd, tracking issue
+      coreyleavitt/tianguis#42.** Five deliverables: (1) content-addressed
+      `attestation/<sha256>.bundle` tree (sibling of `dep-decl/`); (2) index
+      `bundle sha256=` pin emission per attested entry; (3) DSSE subject binds
+      digest AND `pkg:tianguis/<ns>/<name>@<version>`; (4) batched backfill
+      workflow (doubles as milpa P4 real-crypto fixture source); (5)
+      publish-time epoch gate via root `attestation-epoch` (rides #185 ratchet
+      so it can't be backdated/stripped). milpa-side contract: RFC §7 + §1.
+      Planning in progress; tianguis will get its own handoff doc. milpa-side
+      P3b (real-crypto strict wiring, incl. the Rust sigstore-rs
+      verify-against-known-digest vendored-patch decision) lands after this.
+      **Plan + handoff:** `tianguis/docs/rfc-attestation-delivery.handoff.md`
+      (9 slices S1–S9; full author-signed scope chosen). Grinding: S1 bundle
+      pin, S2 root attestation-epoch, S3 in-toto statement builder DONE +
+      committed in tianguis (`6d5ba94`/`54f8baf`/pending-S3); milpa-side wire
+      formats verified against registry.py/entry_trust.py. Gate = nim 2.2.0
+      podman container (recipe in the tianguis handoff).
+      **Progress 2026-07-11:** S1–S7a DONE + gate-green in tianguis (bundle
+      pin field, root attestation-epoch, in-toto statement builder, CAS bundle
+      store, publish-time epoch gate, GH-Pages serve step, bundle-pin admission
+      wiring). **CI boundary reached:** S7b (vendored minting workflow), S8
+      (author-signed protocol redesign — dispatch Cloud Function + author
+      tooling, carries an open design sub-decision), S9 (backfill) are all
+      GH-Actions/cosign/cross-service — NOT local-gate-able, need CI + Corey's
+      S8 design call. Details in the tianguis handoff's "CI boundary" section.
 - [ ] P5 — Part 3 owner registry (future).
 
 - **AMENDED 2026-07-09 (post-review):** open questions 1 and 2 RESOLVED after

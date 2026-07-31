@@ -7,7 +7,26 @@ softlink all pushed/live.
 
 ---
 
-## ⏩ RESUME HERE — sigstore `envelopeHash` upstream (milpa #183 / rfc-attestation-verifier S7)
+## ✅ FILED 2026-07-29 — upstream issue + PR are LIVE
+
+The upstream contribution is done and public:
+- **Issue:** sigstore/sigstore-rs#608 (bug report + full repro + reference-client precedent + Related #596)
+- **PR:** sigstore/sigstore-rs#609 — `Fixes #608`, **DCO passing**, **mergeable**, against current
+  upstream `main` (`038e36a`). Fork `coreyleavitt/sigstore-rs@fix/dsse-envelopehash-reserialization`,
+  commit `272da57` (Signed-off-by Corey Leavitt <corey@leavitt.dev>).
+- Local hygiene + drafts committed & pushed to milpa main (`7952317`, `5a239a2`).
+- Three local-hygiene fixes to `.vendor-sigstore` DONE (rationale corrected, dead `envelope_json`
+  removed, orphaned docstring + wrong test cases purged). Executable regression stays green:
+  `milpa-core index_trust::tests::s5_real_bundle_verifies_trusted_end_to_end`.
+
+**REMAINING (passive):** keep the `[patch.crates-io]` → `.vendor-sigstore` in `impls/rust/Cargo.toml`
+until an upstream release ships the fix; then delete `.vendor-sigstore/` + the patch stanza (milpa
+#183 close-out). If maintainers prefer warn-only (issue option 2) over removal, update the PR branch.
+Watch #608/#609 for maintainer response.
+
+---
+
+## (historical) sigstore `envelopeHash` upstream (milpa #183 / rfc-attestation-verifier S7)
 
 ### Verdict (PROVEN + independently re-verified by the control loop)
 Upstream sigstore-rs's DSSE `envelopeHash` tlog check (`sha256(serde_json::to_vec(&dsse))`
