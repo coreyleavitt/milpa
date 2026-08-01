@@ -5687,6 +5687,157 @@ fn resolve_lattice_lone_url_pin_of_non_registry_name_stands() {
     }
 }
 
+/// Builds a single-package, single-version, OCI-ONLY `Index` for `name` — no
+/// git provenance recorded, so a transitive `git=` claim against it can never
+/// be URL-compared and must fall back to content-identity validation
+/// (§10.0/§10.3 "incomparable transport"). Mirrors Python's
+/// `_index_kdl_one_pkg_oci`.
+fn lattice_index_oci(name: &str, content_hash: &str) -> Index {
+    Index {
+        packages: vec![Package {
+            name: name.to_string(),
+            namespace: String::new(),
+            versions: vec![IndexVersion {
+                version: "1.0.0".into(),
+                content_hash: content_hash.to_string(),
+                provenances: vec![Provenance::Oci {
+                    registry: "ghcr.io".to_string(),
+                    repository: format!("example/{name}"),
+                    digest: format!("sha256:{}", "b".repeat(64)),
+                }],
+                dep_decl: None,
+                dep_decl_schema_version: None,
+                attestation: None,
+                namespace: String::new(),
+                published_at: None,
+                yanked: false,
+                yanked_at: None,
+                yanked_reason: None,
+                published_at_raw: None,
+            }],
+        }],
+    }
+}
+
+#[test]
+fn resolve_lattice_oci_only_content_hash_matches_accepted() {
+    // The real gap #193 closes (amoxtli's softlink case): the registry entry
+    // for `foo-ocimatch` is OCI-only (e.g. published via `milpa publish`
+    // FROM a git repo) — there is no git source recorded to URL-compare
+    // against. A transitive pins `foo-ocimatch` by the ORIGINATING git URL.
+    // The transitive's fetched content_hash MATCHES the registry's recorded
+    // content_hash — same package, different transport — so the claim is
+    // ACCEPTED and resolves normally, exactly like the git-vs-git agreement
+    // case.
+    let t1_url = "https://example.com/t1-ocimatch.git";
+    let foo_source_url = "https://github.com/example/foo-ocimatch.git";
+    let foo_body = "# foo-ocimatch source\n";
+
+    let reg = FakeReg::git(&[
+        (t1_url, "main", nimble("t1-ocimatch", &format!("requires \"{foo_source_url}#v1.0.0\"\n"))),
+        (foo_source_url, "v1.0.0", nimble("foo-ocimatch", foo_body)),
+    ]);
+    let foo_hash = hash_of_nimble("foo-ocimatch", foo_body);
+    let index = lattice_index_oci("foo-ocimatch", &foo_hash);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("t1-ocimatch", t1_url, "main")]);
+    let graph = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap();
+
+    let foo = graph.deps.iter().find(|d| d.name == "foo-ocimatch").expect("foo-ocimatch in graph");
+    assert_eq!(foo.identity, foo_hash);
+    match foo.provenances.first().expect("provenance") {
+        ProvenanceRecord::Git { url, .. } => assert_eq!(url, foo_source_url),
+        other => panic!("expected git provenance, got {other:?}"),
+    }
+    assert!(
+        reg.calls().iter().any(|c| c.1 == foo_source_url),
+        "the agreeing (by content identity) pin must be genuinely fetched"
+    );
+}
+
+#[test]
+fn resolve_lattice_oci_only_content_hash_mismatch_conflicts() {
+    // Same shape as above, except the transitive's git source fetches to
+    // DIFFERENT content than anything the registry has recorded (e.g. a
+    // fork or a substitution) — a genuinely different package — which MUST
+    // raise RES-PROVENANCE-CONFLICT, discovered only AFTER the fetch
+    // (identity is the only comparable fact for an OCI-only entry). The
+    // fetch itself is NOT a provenance conflict; the mismatch is.
+    let t1_url = "https://example.com/t1-ocimismatch.git";
+    // The fork URL's basename MUST be exactly "foo-ocimismatch" (matching the
+    // registry package name) — a nimble `requires "<url>#<ref>"` line derives
+    // the transitive dep's NAME from the URL's basename (mirrors the existing
+    // lattice tests' convention, e.g. `resolve_lattice_lone_url_pin_of_registry_name_disagrees_conflicts`'s
+    // `foolone` naming) — only the HOST differs from the registry's own
+    // originating source, so the dep name still resolves against the same
+    // registry entry.
+    let foo_fork_url = "https://fork.example.com/foo-ocimismatch.git";
+    let foo_registry_body = "# foo-ocimismatch registry original\n";
+    let foo_fork_body = "# foo-ocimismatch fork\n";
+
+    let reg = FakeReg::git(&[
+        (t1_url, "main", nimble("t1-ocimismatch", &format!("requires \"{foo_fork_url}#main\"\n"))),
+        (foo_fork_url, "main", nimble("foo-ocimismatch", foo_fork_body)),
+    ]);
+    let foo_registry_hash = hash_of_nimble("foo-ocimismatch", foo_registry_body);
+    let foo_fork_hash = hash_of_nimble("foo-ocimismatch", foo_fork_body);
+    assert_ne!(foo_registry_hash, foo_fork_hash);
+    let index = lattice_index_oci("foo-ocimismatch", &foo_registry_hash);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("t1-ocimismatch", t1_url, "main")]);
+    let err = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert!(format!("{err:?}").contains("foo-ocimismatch"));
+
+    // The mismatching pin genuinely WAS fetched — the deferred check only
+    // fires post-fetch, unlike the immediate (no-content-hash-to-check)
+    // conflict cases.
+    assert!(
+        reg.calls().iter().any(|c| c.1 == foo_fork_url),
+        "the deferred check runs AFTER the fetch, so the fork must have been fetched"
+    );
+}
+
+#[test]
+fn resolve_lattice_oci_only_empty_content_hash_conflicts_before_fetch() {
+    // The registry entry is OCI-only AND carries no content_hash (legacy
+    // entry, predating the identity mandate) — there is nothing to validate
+    // against, even deferred. This MUST conflict immediately, at gate time,
+    // exactly like the "no comparable transport" behavior — the
+    // transitive's git source must NEVER be fetched.
+    let t1_url = "https://example.com/t1-ociempty.git";
+    let foo_source_url = "https://github.com/example/foo-ociempty.git";
+    let foo_body = "# foo-ociempty source\n";
+
+    let reg = FakeReg::git(&[
+        (t1_url, "main", nimble("t1-ociempty", &format!("requires \"{foo_source_url}#v1.0.0\"\n"))),
+        (foo_source_url, "v1.0.0", nimble("foo-ociempty", foo_body)),
+    ]);
+    let index = lattice_index_oci("foo-ociempty", "");
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("t1-ociempty", t1_url, "main")]);
+    let err = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert!(format!("{err:?}").contains("foo-ociempty"));
+
+    assert!(
+        reg.calls().iter().all(|c| c.1 != foo_source_url),
+        "the cannot-validate case must conflict BEFORE any fetch is dispatched"
+    );
+}
+
 // --- direct unit tests: `normalize_git_source_url` / -----------------------
 // --- `validate_transitive_url_against_registry` -----------------------------
 
@@ -5852,15 +6003,112 @@ fn validate_transitive_url_disagrees_different_repository() {
 }
 
 #[test]
-fn validate_transitive_url_disagrees_incomparable_oci_only_entry() {
-    // The registry entry is OCI-only — a git= claim can never be compared to
-    // it, so it is treated as a disagreement (conservative).
+fn validate_transitive_url_oci_only_entry_with_content_hash_defers() {
+    // The registry entry is OCI-only — a git= claim can never be
+    // URL-compared to it, so the decision is DEFERRED to content identity:
+    // the function returns the set of recorded content_hash values (never
+    // errors directly) so the caller can validate once the transitive's
+    // git source is fetched and hashed. This is the #193-gap fix: an OCI
+    // artifact published FROM a git repo and a transitive pinning that repo
+    // by URL are the SAME package.
     let pkg = Package {
         name: "foo".to_string(),
         namespace: String::new(),
         versions: vec![IndexVersion {
             version: "1.0.0".into(),
             content_hash: format!("sha256:{}", "a".repeat(64)),
+            provenances: vec![Provenance::Oci {
+                registry: "ghcr.io".to_string(),
+                repository: "example/foo".to_string(),
+                digest: format!("sha256:{}", "b".repeat(64)),
+            }],
+            dep_decl: None,
+            dep_decl_schema_version: None,
+            attestation: None,
+            namespace: String::new(),
+            published_at: None,
+            yanked: false,
+            yanked_at: None,
+            yanked_reason: None,
+            published_at_raw: None,
+        }],
+    };
+    let result = super::validate_transitive_url_against_registry(
+        "foo", "https://example.com/foo.git", &pkg,
+    )
+    .expect("incomparable transport with content_hash must defer, not error");
+    assert_eq!(result, Some(vec![format!("sha256:{}", "a".repeat(64))]));
+}
+
+#[test]
+fn validate_transitive_url_oci_only_entry_multiple_versions_defers_union_of_hashes() {
+    // Content_hash is gathered across ALL versions, not just the newest —
+    // mirrors `registry_git_urls`'s "every version" convention for the
+    // git-comparison path.
+    let pkg = Package {
+        name: "foo".to_string(),
+        namespace: String::new(),
+        versions: vec![
+            IndexVersion {
+                version: "2.0.0".into(),
+                content_hash: format!("sha256:{}", "c".repeat(64)),
+                provenances: vec![Provenance::Oci {
+                    registry: "ghcr.io".to_string(),
+                    repository: "example/foo".to_string(),
+                    digest: format!("sha256:{}", "d".repeat(64)),
+                }],
+                dep_decl: None,
+                dep_decl_schema_version: None,
+                attestation: None,
+                namespace: String::new(),
+                published_at: None,
+                yanked: false,
+                yanked_at: None,
+                yanked_reason: None,
+                published_at_raw: None,
+            },
+            IndexVersion {
+                version: "1.0.0".into(),
+                content_hash: format!("sha256:{}", "a".repeat(64)),
+                provenances: vec![Provenance::Oci {
+                    registry: "ghcr.io".to_string(),
+                    repository: "example/foo".to_string(),
+                    digest: format!("sha256:{}", "b".repeat(64)),
+                }],
+                dep_decl: None,
+                dep_decl_schema_version: None,
+                attestation: None,
+                namespace: String::new(),
+                published_at: None,
+                yanked: false,
+                yanked_at: None,
+                yanked_reason: None,
+                published_at_raw: None,
+            },
+        ],
+    };
+    let mut result = super::validate_transitive_url_against_registry(
+        "foo", "https://example.com/foo.git", &pkg,
+    )
+    .expect("must defer")
+    .expect("must be Some");
+    result.sort();
+    assert_eq!(
+        result,
+        vec![format!("sha256:{}", "a".repeat(64)), format!("sha256:{}", "c".repeat(64))],
+    );
+}
+
+#[test]
+fn validate_transitive_url_disagrees_oci_only_entry_no_content_hash_recorded() {
+    // OCI-only AND no content_hash recorded either (legacy entry) — nothing
+    // to validate against even deferred — immediate conflict.
+    let pkg = Package {
+        name: "foo".to_string(),
+        namespace: String::new(),
+        versions: vec![IndexVersion {
+            version: "1.0.0".into(),
+            content_hash: String::new(),
             provenances: vec![Provenance::Oci {
                 registry: "ghcr.io".to_string(),
                 repository: "example/foo".to_string(),
@@ -5886,8 +6134,9 @@ fn validate_transitive_url_disagrees_incomparable_oci_only_entry() {
 
 #[test]
 fn validate_transitive_url_disagrees_no_provenance_at_all() {
-    // A package version with no provenance recorded whatsoever — also
-    // incomparable, also a disagreement.
+    // A package version with no provenance recorded whatsoever, and no
+    // content_hash either — also incomparable by source or identity —
+    // immediate conflict.
     let pkg = Package {
         name: "foo".to_string(),
         namespace: String::new(),
@@ -5911,6 +6160,36 @@ fn validate_transitive_url_disagrees_no_provenance_at_all() {
     )
     .unwrap_err();
     assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+}
+
+#[test]
+fn validate_transitive_url_defers_no_provenance_at_all_but_content_hash_present() {
+    // No provenance recorded at all, but content_hash IS present — same
+    // deferred path as OCI-only (the "incomparable transport" branch is
+    // keyed on absence of a git provenance, not on OCI specifically).
+    let pkg = Package {
+        name: "foo".to_string(),
+        namespace: String::new(),
+        versions: vec![IndexVersion {
+            version: "1.0.0".into(),
+            content_hash: format!("sha256:{}", "e".repeat(64)),
+            provenances: vec![],
+            dep_decl: None,
+            dep_decl_schema_version: None,
+            attestation: None,
+            namespace: String::new(),
+            published_at: None,
+            yanked: false,
+            yanked_at: None,
+            yanked_reason: None,
+            published_at_raw: None,
+        }],
+    };
+    let result = super::validate_transitive_url_against_registry(
+        "foo", "https://example.com/foo.git", &pkg,
+    )
+    .expect("must defer");
+    assert_eq!(result, Some(vec![format!("sha256:{}", "e".repeat(64))]));
 }
 
 // --- direct gate-unit tests: `ResolveProvider::gate`'s tier decision table -

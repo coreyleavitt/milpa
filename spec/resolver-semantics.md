@@ -1105,20 +1105,49 @@ ranks them.
 >   agreement, the ref only selects a version): the claim is ACCEPTED and
 >   resolves normally. This is the benign common case — a transitive pinning a
 >   specific commit of the registry's own package.
-> - **Disagrees** (a *different* source — a fork or a substitution; or a source
->   whose transport cannot be compared to the registry record, e.g. a `git=`
->   claim against an OCI-only registry entry): the resolver MUST raise
->   `RES-PROVENANCE-CONFLICT`. It MUST NOT silently redirect the name to the
->   registry (that would override a library's deliberate fork), and MUST NOT
->   silently honor the transitive's source (that would let a transitive
->   substitute a registry name's source). The remedy is to declare the name in
->   the root manifest (tier 1), where the project owner arbitrates.
+> - **Disagrees** (a *different* source repository is recorded for the name):
+>   the resolver MUST raise `RES-PROVENANCE-CONFLICT`. It MUST NOT silently
+>   redirect the name to the registry (that would override a library's
+>   deliberate fork), and MUST NOT silently honor the transitive's source
+>   (that would let a transitive substitute a registry name's source). The
+>   remedy is to declare the name in the root manifest (tier 1), where the
+>   project owner arbitrates.
+> - **Incomparable transport** (the registry has no comparable git source
+>   recorded for the name at all — e.g. an OCI-only entry, published by
+>   `milpa publish` from a source repository, or an entry with no provenance
+>   recorded — so the source-URL comparison above cannot be performed): the
+>   resolver MUST NOT treat this as an automatic disagreement. Instead it MUST
+>   fall back to **content identity**: a package published to the registry
+>   under one transport and a transitive claim of the same package under a
+>   *different* transport are the same package if and only if they resolve to
+>   the same `content_hash` (identity is milpa's one transport-independent
+>   fact, spec/identity.md). Compare the transitive's git source's fetched
+>   `content_hash` against the `content_hash` recorded across **every**
+>   version of the registry's package entry (not just the newest — mirroring
+>   the git-URL comparison's "every version" rule):
+>   - **Matches** any recorded `content_hash` → ACCEPTED (same package, a
+>     different transport) — resolves normally, exactly like a URL agreement.
+>   - **Matches none** of the recorded `content_hash` values → `RES-PROVENANCE-CONFLICT`
+>     (a genuinely different package — a fork or a substitution).
+>   - The registry records **no `content_hash` for any version** (empty/legacy
+>     entries predating the identity mandate) — there is nothing to validate
+>     against, even by identity → `RES-PROVENANCE-CONFLICT` immediately,
+>     without fetching anything.
 >
-> This decision is made at claim-discovery time from the static, pre-loaded
-> index record, so it is order-independent and never commits a candidate that
-> a later (even mid-solve) claim would have to retract. A transitive claim for
-> a name that is NOT root-declared and NOT in the registry index is a plain
-> tier-3 claim (§10.3).
+> The agree/disagree-by-URL decision is made at claim-discovery time from the
+> static, pre-loaded index record, so it is order-independent and never
+> commits a candidate that a later (even mid-solve) claim would have to
+> retract. The incomparable-transport/content-identity decision is likewise a
+> static function of the name's registry record alone (never of which other
+> claims exist), but its *outcome* is necessarily confirmed only once the
+> transitive's own source has been fetched and content-hashed — a claim
+> pending this confirmation is accepted provisionally (never blocks or is
+> blocked by another pending/agreeing claim for the same name) and the
+> resolver MUST raise `RES-PROVENANCE-CONFLICT` immediately upon a confirmed
+> mismatch. A transport failure while fetching the transitive's source is an
+> ordinary fetch error, never reinterpreted as a provenance conflict. A
+> transitive claim for a name that is NOT root-declared and NOT in the
+> registry index is a plain tier-3 claim (§10.3).
 
 > NORMATIVE: This is §10.2's principle — *only the root may redirect a dep's
 > source* — made precise for named packages. A transitive that self-declares a
@@ -1190,12 +1219,21 @@ registry index, else tier 3 — and arbitrates accordingly.
 > transitive self-declared claim (`git=`/`tarball=`) for that name is validated
 > against the registry's recorded source (§10.0): a claim that AGREES (the
 > registry's own source repository) is accepted and resolves normally; a claim
-> that DISAGREES (a different source, or an incomparable transport) MUST raise
-> `RES-PROVENANCE-CONFLICT` — the resolver MUST NOT silently redirect the name
-> to the registry, and MUST NOT silently honor the transitive's source. The
-> remedy is to declare the name in the root manifest (tier 1). This holds
-> regardless of BFS discovery order (the registry record is a static,
-> pre-loaded fact).
+> that DISAGREES (a different source repository is recorded) MUST raise
+> `RES-PROVENANCE-CONFLICT`. When the registry has NO comparable git source
+> recorded for the name (incomparable transport — e.g. an OCI-only entry) the
+> resolver MUST instead validate by CONTENT IDENTITY (§10.0): the claim's
+> fetched `content_hash` compared against every `content_hash` recorded across
+> the registry package's versions — a match ACCEPTS the claim (same package,
+> different transport), no match (or no `content_hash` recorded at all to
+> compare against) MUST raise `RES-PROVENANCE-CONFLICT`. In every conflicting
+> case, the resolver MUST NOT silently redirect the name to the registry, and
+> MUST NOT silently honor the transitive's source. The remedy is to declare
+> the name in the root manifest (tier 1). This holds regardless of BFS
+> discovery order (the registry record is a static, pre-loaded fact) — the
+> content-identity sub-case is confirmed only once the claim's source has been
+> fetched, but the decision of WHETHER to validate by URL vs. by identity is
+> itself a static fact of the registry record alone.
 
 > NORMATIVE: If a non-root name is NOT in the registry index and receives two
 > tier-3 claims (self-declared `git=`/`tarball=`) with different provenance

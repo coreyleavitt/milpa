@@ -84,6 +84,27 @@ root.
   url-vs-url-no-registry conflict, + normalize/validate unit tests. A4's transitive
   case updated (disagreeing transitive → conflict).
 
-## Not done
-- Nothing committed (spec §10, both impls, fixtures 448/449, tests, the concurrency
-  fix, this handoff). Awaiting Corey.
+## Post-ship extension (in flight): OCI content-hash fallback
+- SHIPPED core #193 committed+pushed as `1ff17bd` (feat: validate transitive provenance).
+- **Real gap found by amoxtli:** a package published to tianguis via **OCI** (from a git
+  repo) then referenced by that **git URL** by a transitive → the "incomparable transport
+  (git vs OCI) → conflict" rule fires (softlink: amoxtli's crisol/nkdl chain git-references
+  it; tianguis has it as OCI). git-softlink and OCI-softlink are the SAME package.
+- **Fix (in flight, add1857439, Python-first):** when the registry entry has no comparable
+  git source, validate by CONTENT IDENTITY instead of conflicting — compare the git source's
+  `content_hash` (milpa already hashes every fetch) to the registry's recorded
+  `IndexVersion.content_hash`. Same identity → accept; different → conflict; unavailable
+  (legacy/empty) → conflict. Confirmed: `IndexVersion.content_hash` exists; OCI entry has no
+  source URL. Spec §10 gets the incomparable-transport clause updated. Rust mirror after.
+- **amoxtli lock: BLOCKED on this fix** — re-resolving amoxtli with shipped milpa (incl #193)
+  fails RES-PROVENANCE-CONFLICT on softlink; once the OCI fallback lands, re-resolve → real
+  versions → commit ONLY amoxtli's milpa.lock (Corey: their in-progress code-review work
+  touches neither milpa.lock nor milpa.kdl, so the lock change is isolated).
+
+## Follow-up queued (separate from #193): root-satisfies-own-name
+- softlink's own milpa.kdl needs `overrides { pkg "softlink" local="." }` because a transitive
+  (proptest) `requires "softlink"` fetches a SECOND softlink instead of binding the root tree
+  under build. milpa has member-satisfies-own-name (workspace, #25) but NOT root-satisfies-
+  own-name (standalone) — a workspace-symmetry gap. With the rule the override is unnecessary.
+  Subtlety: root's declared version must satisfy the transitive's constraint on its own name,
+  else inconsistent-build ERROR (not fetch-a-second-copy). FILE as a GH issue (Corey-gated).

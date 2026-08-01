@@ -1808,6 +1808,18 @@ def _run_bfs_wave_loop(
     # this map rather than reconstructing ``deps_dir / name`` themselves.
     url_dep_paths: dict[str, Path] = {}
 
+    # §10.0/§10.3 content-hash deferred validation: when a registry-owned
+    # name has no comparable git source (OCI-only entry / no provenance),
+    # ``_validate_transitive_url_against_registry`` defers the accept/reject
+    # decision to AFTER this claim's own fetch computes its content_hash
+    # (identity) — see that function's docstring. Keyed by ``id(future)``
+    # (NOT by name): two dispatches for the SAME name can coexist in one
+    # wave (the "two agreeing pins, different refs" dest-disambiguation
+    # branch below applies equally here, since a deferred claim also
+    # bypasses the tier gate). Populated at dispatch time (below), consumed
+    # and popped in the wave-drain loop once each future resolves.
+    pending_identity_validation: dict[int, frozenset[str]] = {}
+
     i = 0
     while i < len(bfs_queue):
         # --- Collect the next wave of I/O-bound items -------------------
@@ -1955,36 +1967,59 @@ def _run_bfs_wave_loop(
                 #     plus the registry record alone (never of collisions
                 #     with other claims), so it is order-independent by
                 #     construction (§10.5).
-                #   - DISAGREES (a different source repo, or a transport that
-                #     cannot be compared — e.g. this git= claim against an
-                #     OCI-only registry entry) → raise
+                #   - DISAGREES (a different source repo) → raise
                 #     RES-PROVENANCE-CONFLICT here, before any fetch is ever
                 #     dispatched. MUST NOT silently redirect to the registry
                 #     and MUST NOT silently honor the transitive's source —
                 #     the remedy is to declare the name in the root manifest
                 #     (tier 1 arbitrates).
+                #   - INCOMPARABLE TRANSPORT (e.g. this git= claim against an
+                #     OCI-only registry entry, or an entry with no provenance
+                #     at all) → the URL comparison above is impossible, so
+                #     fall back to CONTENT IDENTITY: if the registry has a
+                #     content_hash recorded for ANY version, DEFER — accept
+                #     this claim provisionally (same bypass as AGREES above)
+                #     and check its fetched content_hash against the
+                #     registry's recorded set once the wave-drain loop below
+                #     has it (``pending_identity_validation``); match → same
+                #     package via a different transport, stays accepted;
+                #     mismatch → RES-PROVENANCE-CONFLICT, raised post-fetch.
+                #     No content_hash recorded anywhere (legacy/empty) →
+                #     nothing to validate against even deferred — raise
+                #     RES-PROVENANCE-CONFLICT immediately, same as DISAGREES.
                 # A ROOT url dep for a registry-known name is NEVER
                 # validated — root_authority already excludes it here (root
                 # stays tier-1; see overrides_by_name check above, which only
                 # ever fires for root-authority names).
-                # ``_registry_validated_agreement`` is True only when this
-                # claim was checked above and found to AGREE with the
-                # registry's recorded source — in that case the tier-based
-                # gate below is deliberately BYPASSED (see the comment
-                # block above): an agreeing claim is no longer a competing,
-                # untrusted source, so two agreeing pins of the same real
-                # repo (different refs, from different transitives) must
-                # each proceed independently rather than being arbitrated
-                # against each other as if they disagreed.
+                # ``_registry_validated_agreement`` is True whenever this
+                # claim was checked above and did NOT raise — either an
+                # outright AGREEMENT (git-source URL match) or a DEFERRED
+                # content-hash validation (registry has no comparable git
+                # source, but a content_hash exists to check the fetched
+                # identity against once this dep is fetched below) — in
+                # either case the tier-based gate below is deliberately
+                # BYPASSED (see the comment block above): a claim that is
+                # accepted (or accepted-pending-validation) is no longer a
+                # competing, untrusted source, so two such pins of the same
+                # real package (different refs, from different transitives)
+                # must each proceed independently rather than being
+                # arbitrated against each other as if they disagreed. A
+                # deferred claim that later FAILS its content-hash check
+                # raises RES-PROVENANCE-CONFLICT post-fetch, in the
+                # wave-drain loop below (see ``pending_identity_validation``).
                 _registry_validated_agreement = False
+                _deferred_identity_hashes: frozenset[str] | None = None
                 if dep_u.name not in root_authority:
                     _registry_pkg = index.lookup_bare(dep_u.name)
                     if isinstance(_registry_pkg, Package):
-                        _validate_transitive_url_against_registry(
-                            dep_u.name, dep_u.git, _registry_pkg,
+                        _deferred_identity_hashes = (
+                            _validate_transitive_url_against_registry(
+                                dep_u.name, dep_u.git, _registry_pkg,
+                            )
                         )
-                        # Agreement (no raise): accepted — fall through to
-                        # ordinary tier-3 processing below, bypassing the
+                        # No raise: accepted (outright, or pending the
+                        # deferred content-hash check below) — fall through
+                        # to ordinary tier-3 processing, bypassing the
                         # tier-based gate.
                         _registry_validated_agreement = True
                     elif _registry_pkg is not None:
@@ -2066,6 +2101,12 @@ def _run_bfs_wave_loop(
                 wave_futures.append(_url_fut)
                 # S3: record dep reference so result-drain can compute dep_active_flags.
                 future_to_url_dep[id(_url_fut)] = dep_u
+                # §10.0/§10.3: this dispatch is pending a deferred content-hash
+                # validation — record which content_hash set to check the
+                # fetched identity against once the wave-drain loop below
+                # picks up this future's result.
+                if _deferred_identity_hashes is not None:
+                    pending_identity_validation[id(_url_fut)] = _deferred_identity_hashes
 
             elif kind == "tarball":
                 dep_t: TarballDep = item[1]
@@ -2127,6 +2168,44 @@ def _run_bfs_wave_loop(
                     )
                     cand_r, transitive_deps_r, es_r, dest_r = cand_and_deps_u
                     url_dep_paths[cand_r.name] = dest_r
+                    # §10.0/§10.3 content-hash deferred validation: resolve
+                    # the accept/reject decision now that the fetch is done
+                    # and this candidate's identity (content_hash) is known.
+                    # A transport failure never reaches here — `fut.result()`
+                    # above already propagated it as an ordinary fetch error
+                    # (FETCH-ALL-FAILED / FETCH-PROVENANCE-DIVERGENCE), so a
+                    # genuine network/transport problem is never misreported
+                    # as a provenance conflict; only a SUCCESSFUL fetch's
+                    # identity is ever compared here.
+                    _deferred_hashes_r = pending_identity_validation.pop(id(fut), None)
+                    if (
+                        _deferred_hashes_r is not None
+                        and cand_r.identity not in _deferred_hashes_r
+                    ):
+                        _orig_dep_for_msg = future_to_url_dep.get(id(fut))
+                        _claim_url = (
+                            _orig_dep_for_msg.git
+                            if _orig_dep_for_msg is not None
+                            else cand_r.name
+                        )
+                        raise MilpaError(
+                            RES_PROVENANCE_CONFLICT,
+                            f"provenance conflict for package {cand_r.name!r}: "
+                            f"a transitive dependency's git source "
+                            f"({_claim_url!r}) fetched content identity "
+                            f"{cand_r.identity!r}, which does not match any "
+                            f"content_hash recorded for {cand_r.name!r} in "
+                            f"the tianguis registry "
+                            f"({sorted(_deferred_hashes_r)!r}) — the registry "
+                            f"entry has no comparable git source (e.g. an "
+                            f"OCI-only entry), so identity was compared "
+                            f"instead, and it disagrees: this is a different "
+                            f"package. The root manifest does not override "
+                            f"{cand_r.name!r}. Add {cand_r.name!r} to your "
+                            f"milpa.kdl deps (or override it) to choose "
+                            f"which source to use.",
+                            name=cand_r.name,
+                        )
                 else:
                     # tarball/local workers still return the plain 3-tuple —
                     # their destination IS always deps_dir/name (root-declared
@@ -3402,42 +3481,77 @@ def _validate_transitive_url_against_registry(
     name: str,
     dep_git_url: str,
     pkg: Package,
-) -> None:
+) -> frozenset[str] | None:
     """Validate a transitive's self-declared ``git=`` source for the
     registry-owned name *name* against tianguis's recorded source for *pkg*
     (resolver-semantics.md §10.0/§10.3 NORMATIVE — "Registry validation").
 
-    AGREES (the transitive's git URL, normalized, matches a git source
-    recorded for ANY version of *pkg*) → returns ``None`` (silently) — the
-    caller falls through and treats the claim as an accepted, ordinary tier-3
-    url dep. A differing ``ref``/``commit_sha`` is NOT a disagreement (the
-    ref only selects a version of the same repo) — this function never
-    compares those fields.
+    Returns one of:
 
-    DISAGREES (no recorded git source matches — either a different
-    repository, or *pkg* has no comparable git source at all, e.g. an
-    OCI-only registry entry) → raises ``MilpaError(RES-PROVENANCE-CONFLICT)``
-    naming the transitive's source, the registry's recorded source(s), and
-    the remedy (root-declare the name).
+    - ``None`` — the claim is fully resolved as an AGREEMENT: the
+      transitive's git URL, normalized, matches a git source recorded for
+      ANY version of *pkg*. The caller falls through and treats the claim
+      as an accepted, ordinary tier-3 url dep. A differing ``ref``/
+      ``commit_sha`` is NOT a disagreement (the ref only selects a version
+      of the same repo) — this function never compares those fields.
+    - A non-empty ``frozenset[str]`` of ``content_hash`` values — *pkg* has
+      NO comparable git source recorded (OCI-only entry, or no provenance
+      at all), so the URL comparison above is impossible, but at least one
+      of *pkg*'s versions DOES record a ``content_hash``. milpa's identity
+      is transport-independent (spec/identity.md) — a package published to
+      the registry as an OCI artifact FROM a git repo, and a transitive
+      pinning that SAME repo by URL, are the same package under different
+      transports. The decision is therefore DEFERRED to content identity:
+      the caller MUST fetch the transitive's git source, compute its
+      ``content_hash``, and check membership in the returned set — a match
+      means AGREE (accept), a non-match means DISAGREE
+      (``RES-PROVENANCE-CONFLICT``, raised by the caller post-fetch).
+
+    Raises ``MilpaError(RES-PROVENANCE-CONFLICT)`` when the claim is already
+    resolvable as a DISAGREEMENT with no further (post-fetch) check needed:
+
+    - a git source IS recorded for *pkg* and none matches ``dep_git_url``
+      (a different repository), or
+    - *pkg* has no comparable git source AND no ``content_hash`` recorded
+      for any version either — nothing exists to validate against, even
+      deferred (legacy/empty entries).
+
+    Never fetches anything itself — this function is a cheap, static,
+    pre-fetch check; a deferred (frozenset) result only names WHAT to check
+    once the caller's own fetch pipeline (which runs regardless, since the
+    claim is accepted-pending-validation) has computed the identity.
     """
     git_provs = _registry_git_provenances(pkg)
     if not git_provs:
+        # Incomparable transport (OCI-only entry, or no provenance recorded
+        # at all): fall back to CONTENT IDENTITY, milpa's one transport-
+        # independent fact. A package published to tianguis as an OCI
+        # artifact FROM a git repo (e.g. `milpa publish` from a source
+        # checkout) and a transitive pinning that repo by URL are the SAME
+        # package under different transports — content_hash is the only
+        # thing left that can prove (or disprove) that.
+        content_hashes = frozenset(
+            iv.content_hash for iv in pkg.versions if iv.content_hash
+        )
+        if content_hashes:
+            return content_hashes
         raise MilpaError(
             RES_PROVENANCE_CONFLICT,
             f"provenance conflict for package {name!r}: a transitive "
             f"dependency declares a git source ({dep_git_url!r}), but the "
             f"tianguis registry has no comparable git source recorded for "
             f"{name!r} (the registry entry is OCI-only, or has no "
-            f"provenance at all) — the transport cannot be validated. "
-            f"The root manifest does not override {name!r}. Add "
-            f"{name!r} to your milpa.kdl deps (or override it) to choose "
-            f"which source to use.",
+            f"provenance at all), and no content_hash is recorded for any "
+            f"version of {name!r} either — the transport cannot be "
+            f"validated by source or by identity. The root manifest does "
+            f"not override {name!r}. Add {name!r} to your milpa.kdl deps "
+            f"(or override it) to choose which source to use.",
             name=name,
         )
     claim_norm = _normalize_git_source_url(dep_git_url)
     registry_urls = {p.url for p in git_provs}
     if claim_norm in {_normalize_git_source_url(u) for u in registry_urls}:
-        return
+        return None
     raise MilpaError(
         RES_PROVENANCE_CONFLICT,
         f"provenance conflict for package {name!r}: a transitive "

@@ -1260,39 +1260,74 @@ fn registry_git_urls(pkg: &Package) -> Vec<String> {
 /// §10.0/§10.3 NORMATIVE — "Registry validation").
 ///
 /// AGREES (the transitive's git URL, normalized, matches a git source
-/// recorded for ANY version of *pkg*) → returns `Ok(())` — the caller falls
+/// recorded for ANY version of *pkg*) → returns `Ok(None)` — the caller falls
 /// through and treats the claim as an accepted, ordinary tier-3 url dep. A
 /// differing `ref`/`commit_sha` is NOT a disagreement (the ref only selects a
 /// version of the same repo) — this function never compares those fields.
 ///
-/// DISAGREES (no recorded git source matches — either a different
-/// repository, or *pkg* has no comparable git source at all, e.g. an
-/// OCI-only registry entry) → returns `Err(RES-PROVENANCE-CONFLICT)` naming
-/// the transitive's source, the registry's recorded source(s), and the
-/// remedy (root-declare the name). Mirrors Python's
+/// INCOMPARABLE TRANSPORT (*pkg* has no comparable git source recorded at
+/// all — an OCI-only registry entry, or no provenance recorded whatsoever)
+/// → the URL comparison above is impossible, so the decision is DEFERRED to
+/// content identity: if ≥1 of *pkg*'s versions records a non-empty
+/// `content_hash`, returns `Ok(Some(hashes))` — milpa's identity is
+/// transport-independent (spec/identity.md), so a package published to the
+/// registry as an OCI artifact FROM a git repo, and a transitive pinning
+/// that SAME repo by URL, are the same package under different transports.
+/// The caller MUST fetch the transitive's git source, compute its
+/// `content_hash`, and check membership in the returned set once the fetch
+/// completes — a match means AGREE (accept), a non-match means DISAGREE
+/// (`RES-PROVENANCE-CONFLICT`, raised by the caller post-fetch).
+///
+/// DISAGREES, with no further (post-fetch) check possible → returns
+/// `Err(RES-PROVENANCE-CONFLICT)` immediately:
+/// - a git source IS recorded for *pkg* and none matches `dep_git_url` (a
+///   different repository), or
+/// - *pkg* has no comparable git source AND no `content_hash` recorded for
+///   any version either — nothing exists to validate against, even
+///   deferred (legacy/empty entries).
+///
+/// Never fetches anything itself — this is a cheap, static, pre-fetch
+/// check; a deferred (`Some`) result only names WHAT to check once the
+/// caller's own fetch has computed the identity. Mirrors Python's
 /// `_validate_transitive_url_against_registry`.
 fn validate_transitive_url_against_registry(
     name: &str,
     dep_git_url: &str,
     pkg: &Package,
-) -> Result<(), MilpaError> {
+) -> Result<Option<Vec<String>>, MilpaError> {
     let registry_urls = registry_git_urls(pkg);
     if registry_urls.is_empty() {
+        // Incomparable transport (OCI-only entry, or no provenance recorded
+        // at all): fall back to CONTENT IDENTITY, milpa's one transport-
+        // independent fact.
+        let mut content_hashes: Vec<String> = pkg
+            .versions
+            .iter()
+            .filter(|iv| !iv.content_hash.is_empty())
+            .map(|iv| iv.content_hash.clone())
+            .collect();
+        content_hashes.sort();
+        content_hashes.dedup();
+        if !content_hashes.is_empty() {
+            return Ok(Some(content_hashes));
+        }
         return Err(res_err(
             "RES-PROVENANCE-CONFLICT",
             format!(
                 "provenance conflict for package {name:?}: a transitive dependency \
                  declares a git source ({dep_git_url:?}), but the tianguis registry has \
                  no comparable git source recorded for {name:?} (the registry entry is \
-                 OCI-only, or has no provenance at all) — the transport cannot be \
-                 validated. The root manifest does not override {name:?}. Add {name:?} \
-                 to your milpa.kdl deps (or override it) to choose which source to use."
+                 OCI-only, or has no provenance at all), and no content_hash is recorded \
+                 for any version of {name:?} either — the transport cannot be validated \
+                 by source or by identity. The root manifest does not override {name:?}. \
+                 Add {name:?} to your milpa.kdl deps (or override it) to choose which \
+                 source to use."
             ),
         ));
     }
     let claim_norm = normalize_git_source_url(dep_git_url);
     if registry_urls.iter().any(|u| normalize_git_source_url(u) == claim_norm) {
-        return Ok(());
+        return Ok(None);
     }
     let mut sorted_urls: Vec<String> = registry_urls;
     sorted_urls.sort();
@@ -2350,14 +2385,14 @@ impl<'a> ResolveProvider<'a> {
     /// the survivors. Gating before fetching is what makes the conflict win over
     /// an unrelated fetch failure of the first sibling (resolver-semantics §10).
     fn process_items(&self, items: Vec<Item>) -> Result<(), MilpaError> {
-        let mut survivors: Vec<Item> = Vec::new();
+        let mut survivors: Vec<(Item, Option<Vec<String>>)> = Vec::new();
         for item in items {
             if let Some(gated) = self.gate_only(item)? {
                 survivors.push(gated);
             }
         }
-        for item in survivors {
-            self.dispatch(item)?;
+        for (item, pending_content_hashes) in survivors {
+            self.dispatch(item, pending_content_hashes)?;
         }
         Ok(())
     }
@@ -2365,8 +2400,12 @@ impl<'a> ResolveProvider<'a> {
     /// Apply overrides, then the validate-against-registry check (for a
     /// transitive `Url` claim on a registry-index name), then the tier
     /// precedence gate, to one item. Returns the (possibly rewritten) item to
-    /// dispatch, `None` if suppressed, or `RES-PROVENANCE-CONFLICT`.
-    fn gate_only(&self, item: Item) -> Result<Option<Item>, MilpaError> {
+    /// dispatch plus, when the registry validation DEFERRED its decision to
+    /// content identity (§10.0/§10.3 "incomparable transport" — an OCI-only
+    /// entry or no provenance at all, but ≥1 recorded `content_hash`), the
+    /// set of `content_hash` values the caller's own fetch must be checked
+    /// against post-fetch; `None` if suppressed; or `RES-PROVENANCE-CONFLICT`.
+    fn gate_only(&self, item: Item) -> Result<Option<(Item, Option<Vec<String>>)>, MilpaError> {
         let mut item = self.apply_override(item);
 
         // §10.0/§10.3/§10.5 validate-against-registry lattice: a non-root
@@ -2383,18 +2422,22 @@ impl<'a> ResolveProvider<'a> {
             if !self.root_authority.contains(&name) {
                 match self.index.lookup_bare(&name) {
                     BareLookup::Found(pkg) => {
-                        // AGREES (no error) → ACCEPT: fall through to ordinary
-                        // tier-3 url processing below, bypassing the tier gate
-                        // entirely — an agreeing claim is no longer a
-                        // competing, untrusted source, so two agreeing pins of
-                        // the same real repo at different refs (from
+                        // AGREES (Ok(None)) → ACCEPT outright: fall through to
+                        // ordinary tier-3 url processing below, bypassing the
+                        // tier gate entirely — an agreeing claim is no longer
+                        // a competing, untrusted source, so two agreeing pins
+                        // of the same real repo at different refs (from
                         // different transitives) must coexist as candidates,
                         // never conflict with each other or with a same-named
-                        // `Named` claim. DISAGREES → propagate
-                        // RES-PROVENANCE-CONFLICT here, before any fetch is
-                        // ever dispatched.
-                        validate_transitive_url_against_registry(&name, &git, &pkg)?;
-                        return Ok(Some(item));
+                        // `Named` claim. INCOMPARABLE TRANSPORT (Ok(Some(hashes)))
+                        // → ACCEPT PENDING a post-fetch content-identity check
+                        // (same bypass, but the caller must still verify once
+                        // this claim's own fetch has computed its identity —
+                        // see `process_url`'s `pending_content_hashes` check).
+                        // DISAGREES (Err) → propagate RES-PROVENANCE-CONFLICT
+                        // here, before any fetch is ever dispatched.
+                        let deferred = validate_transitive_url_against_registry(&name, &git, &pkg)?;
+                        return Ok(Some((item, deferred)));
                     }
                     BareLookup::Ambiguous(_) => {
                         // Multiple namespaces share this bare name — orthogonal
@@ -2422,14 +2465,18 @@ impl<'a> ResolveProvider<'a> {
                     item.name()
                 ),
             )),
-            Gate::Proceed => Ok(Some(item)),
+            Gate::Proceed => Ok(Some((item, None))),
         }
     }
 
     /// Dispatch an already-gated item to its transport worker (no re-gating).
-    fn dispatch(&self, item: Item) -> Result<(), MilpaError> {
+    /// `pending_content_hashes` is `Some` only for an `Item::Url` whose
+    /// registry validation deferred to content identity (§10.0/§10.3) — every
+    /// other item kind ignores it (it is always `None` for them, since
+    /// `gate_only` only ever attaches it to a `Url` item).
+    fn dispatch(&self, item: Item, pending_content_hashes: Option<Vec<String>>) -> Result<(), MilpaError> {
         match item {
-            Item::Url(dep) => self.process_url(dep),
+            Item::Url(dep) => self.process_url(dep, pending_content_hashes),
             Item::Local(dep) => self.process_local(dep),
             Item::Tarball(dep) => self.process_tarball(dep),
             Item::Named { name, constraint, namespace } => self.process_named(&name, constraint, namespace.as_deref()),
@@ -2571,7 +2618,14 @@ impl<'a> ResolveProvider<'a> {
 
     // --- transport workers -------------------------------------------------
 
-    fn process_url(&self, dep: UrlDep) -> Result<(), MilpaError> {
+    /// `pending_content_hashes` is `Some` iff `gate_only`'s registry
+    /// validation deferred this claim's accept/reject decision to content
+    /// identity (§10.0/§10.3 "incomparable transport" — a registry-index
+    /// name with no comparable git source recorded, e.g. an OCI-only entry,
+    /// but ≥1 recorded `content_hash`). Checked once the fetch below
+    /// succeeds and this candidate's `identity` is known — see the check
+    /// right after `fetch_any_tracked` returns.
+    fn process_url(&self, dep: UrlDep, pending_content_hashes: Option<Vec<String>>) -> Result<(), MilpaError> {
         let key = (dep.git.clone(), dep.git_ref.clone());
         if !self.seen_url.borrow_mut().insert(key) {
             // S4b: multi-consumer union (RFC #23 §3.1.3).
@@ -2761,6 +2815,38 @@ impl<'a> ResolveProvider<'a> {
         let dest = self.deps_dir.join(&dep.name);
         let (identity, receipt, observed_idx) =
             self.fetch_any_tracked(&dep.name, &provs, &dest, expected_identity.as_deref())?;
+
+        // §10.0/§10.3 content-hash deferred validation: `gate_only`'s
+        // registry check found no comparable git source for this name
+        // (OCI-only entry, or no provenance at all) and deferred the
+        // accept/reject decision to content identity — resolve it now that
+        // the fetch above succeeded and this candidate's identity is known.
+        // A transport failure never reaches here (the `?` above already
+        // propagated it as an ordinary fetch error), so a genuine network/
+        // transport problem is never misreported as a provenance conflict;
+        // only a SUCCESSFUL fetch's identity is ever compared. Mirrors
+        // Python's wave-drain `pending_identity_validation` check
+        // (`_run_bfs_wave_loop`).
+        if let Some(content_hashes) = pending_content_hashes {
+            if !content_hashes.iter().any(|h| h == &identity) {
+                let mut sorted_hashes = content_hashes;
+                sorted_hashes.sort();
+                return Err(res_err(
+                    "RES-PROVENANCE-CONFLICT",
+                    format!(
+                        "provenance conflict for package {:?}: a transitive dependency's \
+                         git source ({:?}) fetched content identity {:?}, which does not \
+                         match any content_hash recorded for {:?} in the tianguis registry \
+                         ({sorted_hashes:?}) — the registry entry has no comparable git \
+                         source (e.g. an OCI-only entry), so identity was compared instead, \
+                         and it disagrees: this is a different package. The root manifest \
+                         does not override {:?}. Add {:?} to your milpa.kdl deps (or \
+                         override it) to choose which source to use.",
+                        dep.name, dep.git, identity, dep.name, dep.name, dep.name,
+                    ),
+                ));
+            }
+        }
 
         // D4 (resolution-semantics RFC §3 Axis D / §6 D-D1/D-D2): exclude-
         // newer VALIDATION for the pinned git commit — not selection (a git
