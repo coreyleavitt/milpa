@@ -1,0 +1,6 @@
+name "myapp"
+kind "application"
+deps {
+    wrapa git=(url)"https://example.com/wrapa.git" ref="main"
+    wrapb git=(url)"https://example.com/wrapb.git" ref="main"
+}

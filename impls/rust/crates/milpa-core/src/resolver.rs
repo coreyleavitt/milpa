@@ -43,7 +43,7 @@ use crate::fetch::{FetchError, FetcherRegistry, Receipt};
 use crate::frozen::rebuild_deps_view;
 use crate::identity::compute_content_hash;
 use crate::lockfile::cond_require_sort_key;
-use crate::registry::{filter_by_exclude_newer, Index, IndexVersion};
+use crate::registry::{filter_by_exclude_newer, BareLookup, Index, IndexVersion, Package};
 use crate::store::CaStore;
 use crate::workspace::LoadedWorkspace;
 
@@ -1162,6 +1162,151 @@ impl Item {
             Item::Tarball(d) => PKey::Tarball(d.url.clone()),
         }
     }
+
+    /// The item's authority tier (resolver-semantics §10.0 — the provenance
+    /// lattice), absent any root-authority upgrade (the gate itself applies
+    /// the `TIER_ROOT` override for root-declared names — see `gate()`).
+    /// `Named` (index-resolved) claims are tier 2 (a deference to the
+    /// attested tianguis registry); every self-declared transport
+    /// (Url/Local/Tarball) is tier 3 (untrusted).
+    fn tier(&self) -> u8 {
+        match self {
+            Item::Named { .. } => TIER_REGISTRY,
+            Item::Url(_) | Item::Local(_) | Item::Tarball(_) => TIER_SELF_URL,
+        }
+    }
+}
+
+/// Authority tiers (resolver-semantics.md §10.0 — the provenance lattice).
+/// 1 = Root (root/member deps + dev-deps + overrides) — the project owner.
+/// 2 = Registry (a `named`/index claim) — the attested tianguis registry.
+/// 3 = Self-declared URL/local/tarball (transitive) — untrusted.
+/// A higher tier (LOWER number) suppresses a lower-tier (HIGHER number)
+/// disagreement, deterministically, without error. Mirrors Python's
+/// `TIER_ROOT`/`TIER_REGISTRY`/`TIER_SELF_URL` (resolver.py).
+const TIER_ROOT: u8 = 1;
+const TIER_REGISTRY: u8 = 2;
+const TIER_SELF_URL: u8 = 3;
+
+// ---------------------------------------------------------------------------
+// Registry-validation mechanism (resolver-semantics.md §10.0/§10.3 — the
+// validate-against-registry rework of the provenance lattice's tier-2 rule).
+// Mirrors Python's `_normalize_git_source_url` / `_registry_git_provenances` /
+// `_validate_transitive_url_against_registry` (resolver.py).
+// ---------------------------------------------------------------------------
+
+/// Normalize *url* for git-source AGREEMENT comparison (§10.0).
+///
+/// Strips a trailing `/` and a trailing `.git` suffix, and lowercases the
+/// scheme + authority (host[:port]) component only — path casing is
+/// preserved, since many git hosts are path-case-sensitive (unlike the
+/// hostname). This is deliberately NOT full URL canonicalization (no
+/// userinfo/port-default handling, no ssh-vs-https transport unification, no
+/// percent-decoding) — the only thing this comparison needs to answer is "is
+/// this the same repository the registry records", which the milpa KDL
+/// `(url)` convention (spec's git urls are always full `scheme://host/path`
+/// form, never SCP-style `git@host:path`) makes tractable with this narrow
+/// normalization. Mirrors Python's `_normalize_git_source_url` exactly.
+fn normalize_git_source_url(url: &str) -> String {
+    let mut s = url.trim().to_string();
+    if let Some(stripped) = s.strip_suffix('/') {
+        s = stripped.to_string();
+    }
+    if let Some(stripped) = s.strip_suffix(".git") {
+        s = stripped.to_string();
+    }
+    match s.find("://") {
+        Some(idx) => {
+            let scheme = &s[..idx];
+            let rest = &s[idx + 3..];
+            let (authority, path) = match rest.find('/') {
+                Some(slash) => (&rest[..slash], &rest[slash..]),
+                None => (rest, ""),
+            };
+            format!("{}://{}{}", scheme.to_lowercase(), authority.to_lowercase(), path)
+        }
+        // No recognizable scheme://authority (e.g. a malformed or SCP-style
+        // value) — fall back to the stripped-and-lowercased whole string so
+        // comparison is still total (never panics), just less precise.
+        None => s.to_lowercase(),
+    }
+}
+
+/// All git source URLs recorded for *pkg*, across EVERY version (index
+/// document order, i.e. `Index::lookup_bare`'s `Package.versions` ordering,
+/// then per-version provenance-preference order).
+///
+/// A package's source repository is ordinarily stable across versions (only
+/// the ref/tag changes), so checking every version's recorded provenance —
+/// not just the newest — is what makes agreement-checking robust to a
+/// transitive pinning an OLDER version's tag of the registry's own repo.
+/// Mirrors Python's `_registry_git_provenances` (narrowed to just the URLs,
+/// which is all `validate_transitive_url_against_registry` needs — `ref`/
+/// `commit_sha` are never compared).
+fn registry_git_urls(pkg: &Package) -> Vec<String> {
+    let mut out = Vec::new();
+    for iv in &pkg.versions {
+        for prov in &iv.provenances {
+            if let Provenance::Git { url, .. } = prov {
+                out.push(url.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Validate a transitive's self-declared `git=` source for the registry-owned
+/// *name* against tianguis's recorded source for *pkg* (resolver-semantics.md
+/// §10.0/§10.3 NORMATIVE — "Registry validation").
+///
+/// AGREES (the transitive's git URL, normalized, matches a git source
+/// recorded for ANY version of *pkg*) → returns `Ok(())` — the caller falls
+/// through and treats the claim as an accepted, ordinary tier-3 url dep. A
+/// differing `ref`/`commit_sha` is NOT a disagreement (the ref only selects a
+/// version of the same repo) — this function never compares those fields.
+///
+/// DISAGREES (no recorded git source matches — either a different
+/// repository, or *pkg* has no comparable git source at all, e.g. an
+/// OCI-only registry entry) → returns `Err(RES-PROVENANCE-CONFLICT)` naming
+/// the transitive's source, the registry's recorded source(s), and the
+/// remedy (root-declare the name). Mirrors Python's
+/// `_validate_transitive_url_against_registry`.
+fn validate_transitive_url_against_registry(
+    name: &str,
+    dep_git_url: &str,
+    pkg: &Package,
+) -> Result<(), MilpaError> {
+    let registry_urls = registry_git_urls(pkg);
+    if registry_urls.is_empty() {
+        return Err(res_err(
+            "RES-PROVENANCE-CONFLICT",
+            format!(
+                "provenance conflict for package {name:?}: a transitive dependency \
+                 declares a git source ({dep_git_url:?}), but the tianguis registry has \
+                 no comparable git source recorded for {name:?} (the registry entry is \
+                 OCI-only, or has no provenance at all) — the transport cannot be \
+                 validated. The root manifest does not override {name:?}. Add {name:?} \
+                 to your milpa.kdl deps (or override it) to choose which source to use."
+            ),
+        ));
+    }
+    let claim_norm = normalize_git_source_url(dep_git_url);
+    if registry_urls.iter().any(|u| normalize_git_source_url(u) == claim_norm) {
+        return Ok(());
+    }
+    let mut sorted_urls: Vec<String> = registry_urls;
+    sorted_urls.sort();
+    sorted_urls.dedup();
+    Err(res_err(
+        "RES-PROVENANCE-CONFLICT",
+        format!(
+            "provenance conflict for package {name:?}: a transitive dependency declares \
+             source {dep_git_url:?}, but the tianguis registry records {sorted_urls:?} \
+             for {name:?} — a different source repository. The root manifest does not \
+             override {name:?}. Add {name:?} to your milpa.kdl deps (or override it) to \
+             choose which source to use."
+        ),
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1369,7 +1514,14 @@ struct ResolveProvider<'a> {
     seen_named: RefCell<BTreeSet<DepKey>>,  // S5a: qualified key (namespace+name)
     seen_local: RefCell<BTreeSet<String>>,
     seen_tarball: RefCell<BTreeSet<String>>,
-    seen_by_name: RefCell<BTreeMap<String, (PKey, bool)>>,
+    /// The cross-name provenance gate's memory (§10.0): for each gate key
+    /// (bare name, or namespace-qualified solver_var for a `Named` item),
+    /// the CURRENTLY-AUTHORITATIVE claim's `PKey` and its authority tier
+    /// (`TIER_ROOT`/`TIER_REGISTRY`/`TIER_SELF_URL`). Generalizes the
+    /// pre-#193 `(PKey, bool is_root)` pair into a 3-value tier so a tier-2
+    /// registry claim can suppress — or be suppressed by — a tier-3
+    /// self-declared claim, not just the root-vs-everything binary.
+    seen_by_name: RefCell<BTreeMap<String, (PKey, u8)>>,
 
     /// S3 RFC #23: resolver-scoped map of dep_name → flag_requests from the ROOT
     /// manifest's named dep declarations. Populated during `seed_root`; consumed
@@ -1574,7 +1726,7 @@ impl<'a> ResolveProvider<'a> {
         let mut root_deps: Vec<SolverDep> = Vec::new();
         let mut root_requires: Vec<String> = Vec::new();
         let mut queue: Vec<Item> = Vec::new();
-        let mut seen_by_name: BTreeMap<String, (PKey, bool)> = BTreeMap::new();
+        let mut seen_by_name: BTreeMap<String, (PKey, u8)> = BTreeMap::new();
         // RR2 (R6 dual-set cleanup): build the namespace-aware set ONCE (see
         // `root_direct_keys`'s field doc comment for its role in
         // `is_root_direct`), then derive the bare-name `root_authority` set
@@ -1596,7 +1748,7 @@ impl<'a> ResolveProvider<'a> {
                     // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                     root_deps.push(SolverDep::new(name.clone(), VersionSet::full()));
                     root_requires.push(name.clone());
-                    seen_by_name.insert(name.clone(), (PKey::Tarball(t.url.clone()), true));
+                    seen_by_name.insert(name.clone(), (PKey::Tarball(t.url.clone()), TIER_ROOT));
                     self.discovery_order.borrow_mut().push(name); // Phase B: root deps in declaration order
                     queue.push(Item::Tarball(t.clone()));
                 }
@@ -1604,7 +1756,7 @@ impl<'a> ResolveProvider<'a> {
                     // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                     root_deps.push(SolverDep::new(name.clone(), VersionSet::full()));
                     root_requires.push(name.clone());
-                    seen_by_name.insert(name.clone(), (PKey::Local(l.path.clone()), true));
+                    seen_by_name.insert(name.clone(), (PKey::Local(l.path.clone()), TIER_ROOT));
                     self.discovery_order.borrow_mut().push(name); // Phase B: root deps in declaration order
                     queue.push(Item::Local(l.clone()));
                 }
@@ -1617,7 +1769,7 @@ impl<'a> ResolveProvider<'a> {
                     // S8a: LocalTarget override on root UrlDep → local pkey + local item.
                     if let Some(ov) = self.overrides.get(&name) {
                         if let OverrideTarget::Local { path } = &ov.target {
-                            seen_by_name.insert(name.clone(), (PKey::Local(path.clone()), true));
+                            seen_by_name.insert(name.clone(), (PKey::Local(path.clone()), TIER_ROOT));
                             self.discovery_order.borrow_mut().push(name.clone());
                             queue.push(Item::Local(LocalDep { name, path: path.clone(), predicates: vec![], version: ov.version.clone() }));
                             continue;
@@ -1627,7 +1779,7 @@ impl<'a> ResolveProvider<'a> {
                         if let OverrideTarget::Member { member_name } = &ov.target {
                             let _ = member_name;
                             let pkey = PKey::Url(u.git.clone(), u.git_ref.clone());
-                            seen_by_name.insert(name.clone(), (pkey, true));
+                            seen_by_name.insert(name.clone(), (pkey, TIER_ROOT));
                             self.discovery_order.borrow_mut().push(name);
                             queue.push(Item::Url(u.clone()));
                             continue;
@@ -1640,7 +1792,7 @@ impl<'a> ResolveProvider<'a> {
                         }
                         None => PKey::Url(u.git.clone(), u.git_ref.clone()),
                     };
-                    seen_by_name.insert(name.clone(), (pkey, true));
+                    seen_by_name.insert(name.clone(), (pkey, TIER_ROOT));
                     self.discovery_order.borrow_mut().push(name); // Phase B: root deps in declaration order
                     queue.push(Item::Url(u.clone()));
                 }
@@ -1672,7 +1824,7 @@ impl<'a> ResolveProvider<'a> {
                             OverrideTarget::Local { path } => {
                                 seen_by_name.insert(
                                     solver_var.clone(),
-                                    (PKey::Local(path.clone()), true),
+                                    (PKey::Local(path.clone()), TIER_ROOT),
                                 );
                                 root_requires.push(solver_var.clone());
                                 self.discovery_order.borrow_mut().push(solver_var.clone());
@@ -1686,19 +1838,19 @@ impl<'a> ResolveProvider<'a> {
                                 root_deps.pop(); // undo the full() self-term push
                                 root_deps.push(SolverDep::new(solver_var.clone(), vs.clone()));
                                 // S5b: PKey::Named carries qualified DepKey
-                                seen_by_name.insert(solver_var.clone(), (PKey::Named(dep_key.clone()), true));
+                                seen_by_name.insert(solver_var.clone(), (PKey::Named(dep_key.clone()), TIER_ROOT));
                             }
                             OverrideTarget::Git { url, git_ref } => {
                                 seen_by_name.insert(
                                     solver_var.clone(),
-                                    (PKey::Url(url.clone(), git_ref.clone()), true),
+                                    (PKey::Url(url.clone(), git_ref.clone()), TIER_ROOT),
                                 );
                             }
                         }
                     } else {
                         root_deps.push(SolverDep::new(solver_var.clone(), vs.clone()));
                         // S5b: PKey::Named carries qualified DepKey
-                        seen_by_name.insert(solver_var.clone(), (PKey::Named(dep_key.clone()), true));
+                        seen_by_name.insert(solver_var.clone(), (PKey::Named(dep_key.clone()), TIER_ROOT));
                     }
                     root_requires.push(solver_var.clone());
                     self.discovery_order.borrow_mut().push(solver_var.clone()); // Phase B: root deps in declaration order
@@ -1730,7 +1882,7 @@ impl<'a> ResolveProvider<'a> {
             let pk = override_target_to_pkey(&ov.target);
             seen_by_name
                 .entry(ov.name.clone())
-                .or_insert_with(|| (pk, true));
+                .or_insert_with(|| (pk, TIER_ROOT));
         }
 
         // R6: root_authority derived as pure name-projection of
@@ -1785,7 +1937,7 @@ impl<'a> ResolveProvider<'a> {
         let mut root_deps: Vec<SolverDep> = Vec::new();
         let mut root_requires: Vec<String> = Vec::new();
         let mut queue: Vec<Item> = Vec::new();
-        let mut seen_by_name: BTreeMap<String, (PKey, bool)> = BTreeMap::new();
+        let mut seen_by_name: BTreeMap<String, (PKey, u8)> = BTreeMap::new();
         // RR2 (R6 dual-set cleanup): build the namespace-aware set ONCE (see
         // `root_direct_keys`'s field doc comment for its role in
         // `is_root_direct`), then derive the bare-name `root_authority` set
@@ -1804,7 +1956,7 @@ impl<'a> ResolveProvider<'a> {
             // Pre-seeding with is_root=true means any transitive dep claiming this
             // name via a different pkey is suppressed by the gate (root wins).
             let pk = override_target_to_pkey(&ov.target);
-            seen_by_name.insert(ov.name.clone(), (pk, true));
+            seen_by_name.insert(ov.name.clone(), (pk, TIER_ROOT));
         }
 
         // A2c: each member's own candidate-label version, computed once up
@@ -1919,7 +2071,7 @@ impl<'a> ResolveProvider<'a> {
                     match &ov.target {
                         OverrideTarget::Local { path } => {
                             let pkey = PKey::Local(path.clone());
-                            seen_by_name.entry(name.clone()).or_insert((pkey, true));
+                            seen_by_name.entry(name.clone()).or_insert((pkey, TIER_ROOT));
                             if !self.discovery_order.borrow().contains(&name) {
                                 self.discovery_order.borrow_mut().push(name.clone());
                             }
@@ -1935,7 +2087,7 @@ impl<'a> ResolveProvider<'a> {
                         OverrideTarget::Git { url, git_ref } => {
                             seen_by_name
                                 .entry(name.clone())
-                                .or_insert((PKey::Url(url.clone(), git_ref.clone()), true));
+                                .or_insert((PKey::Url(url.clone(), git_ref.clone()), TIER_ROOT));
                             // Override converts Named→Url at dispatch; constraint is unused.
                             queue.push(Item::Named {
                                 name: name.clone(),
@@ -1955,7 +2107,7 @@ impl<'a> ResolveProvider<'a> {
                         requires.push(name.clone());
                         let entry = seen_by_name
                             .entry(name.clone())
-                            .or_insert((PKey::Url(u.git.clone(), u.git_ref.clone()), true));
+                            .or_insert((PKey::Url(u.git.clone(), u.git_ref.clone()), TIER_ROOT));
                         // Phase B: record first-insertion in discovery order (workspace deps).
                         let _ = entry; // or_insert returns &mut; just track first-time by checking the queue
                         if !self.discovery_order.borrow().contains(&name) {
@@ -1969,7 +2121,7 @@ impl<'a> ResolveProvider<'a> {
                         requires.push(name.clone());
                         seen_by_name
                             .entry(name.clone())
-                            .or_insert((PKey::Local(l.path.clone()), true));
+                            .or_insert((PKey::Local(l.path.clone()), TIER_ROOT));
                         if !self.discovery_order.borrow().contains(&name) {
                             self.discovery_order.borrow_mut().push(name.clone());
                         }
@@ -1981,7 +2133,7 @@ impl<'a> ResolveProvider<'a> {
                         requires.push(name.clone());
                         seen_by_name
                             .entry(name.clone())
-                            .or_insert((PKey::Tarball(t.url.clone()), true));
+                            .or_insert((PKey::Tarball(t.url.clone()), TIER_ROOT));
                         if !self.discovery_order.borrow().contains(&name) {
                             self.discovery_order.borrow_mut().push(name.clone());
                         }
@@ -2001,7 +2153,7 @@ impl<'a> ResolveProvider<'a> {
                         requires.push(solver_var.clone());
                         seen_by_name
                             .entry(solver_var.clone())
-                            .or_insert((PKey::Named(dep_key), true));  // S5b
+                            .or_insert((PKey::Named(dep_key), TIER_ROOT));  // S5b
                         if !self.discovery_order.borrow().contains(&solver_var) {
                             self.discovery_order.borrow_mut().push(solver_var.clone());
                         }
@@ -2210,11 +2362,55 @@ impl<'a> ResolveProvider<'a> {
         Ok(())
     }
 
-    /// Apply overrides then the precedence gate to one item. Returns the
-    /// (override-rewritten) item to dispatch, `None` if suppressed, or
-    /// `RES-PROVENANCE-CONFLICT`.
+    /// Apply overrides, then the validate-against-registry check (for a
+    /// transitive `Url` claim on a registry-index name), then the tier
+    /// precedence gate, to one item. Returns the (possibly rewritten) item to
+    /// dispatch, `None` if suppressed, or `RES-PROVENANCE-CONFLICT`.
     fn gate_only(&self, item: Item) -> Result<Option<Item>, MilpaError> {
-        let item = self.apply_override(item);
+        let mut item = self.apply_override(item);
+
+        // §10.0/§10.3/§10.5 validate-against-registry lattice: a non-root
+        // name present in the registry index is tier-2 (registry-owned) as a
+        // STATIC property of the name — decided here, at claim-discovery
+        // time, from the (already-loaded) index alone, NOT from whether some
+        // other claim also exists for this name. A transitive's self-declared
+        // `git=` source for such a name MUST be validated against the
+        // registry's own recorded source BEFORE it is ever fetched (§10.5).
+        // Mirrors Python's `_run_bfs_wave_loop` `kind == "url"` branch.
+        if let Item::Url(dep) = &item {
+            let name = dep.name.clone();
+            let git = dep.git.clone();
+            if !self.root_authority.contains(&name) {
+                match self.index.lookup_bare(&name) {
+                    BareLookup::Found(pkg) => {
+                        // AGREES (no error) → ACCEPT: fall through to ordinary
+                        // tier-3 url processing below, bypassing the tier gate
+                        // entirely — an agreeing claim is no longer a
+                        // competing, untrusted source, so two agreeing pins of
+                        // the same real repo at different refs (from
+                        // different transitives) must coexist as candidates,
+                        // never conflict with each other or with a same-named
+                        // `Named` claim. DISAGREES → propagate
+                        // RES-PROVENANCE-CONFLICT here, before any fetch is
+                        // ever dispatched.
+                        validate_transitive_url_against_registry(&name, &git, &pkg)?;
+                        return Ok(Some(item));
+                    }
+                    BareLookup::Ambiguous(_) => {
+                        // Multiple namespaces share this bare name — orthogonal
+                        // to source validation (there is no single package
+                        // record to validate a source against). Preserve the
+                        // pre-existing redirect-to-named behavior so the
+                        // standard TNG-AMBIGUOUS-NAME diagnostic
+                        // (namespace-qualification remedy) fires, unchanged by
+                        // the validate-against-registry rework.
+                        item = Item::Named { name, constraint: VersionSet::full(), namespace: None };
+                    }
+                    BareLookup::NotFound => {}
+                }
+            }
+        }
+
         match self.gate(&item) {
             Gate::Suppress => Ok(None),
             Gate::Conflict(a, b) => Err(res_err(
@@ -2240,9 +2436,40 @@ impl<'a> ResolveProvider<'a> {
         }
     }
 
-    /// The cross-name precedence gate (§10). First claim on a name wins when it
-    /// has root authority; two non-root claims with different provenance
-    /// conflict; the same key falls through to transport dedup.
+    /// The cross-name authority-tier precedence gate (resolver-semantics
+    /// §10.0 — the provenance lattice). First claim on a name registers at
+    /// its tier (root-authority names are always recorded at `TIER_ROOT`,
+    /// regardless of the claim's own kind — mirrors Python's
+    /// `_check_provenance_gate`). A later claim with the SAME provenance key
+    /// is a dedup (proceed, regardless of tier — two `Named` claims for the
+    /// same bare name always share one `PKey::Named` value, so they always
+    /// take this branch, never the tier compare below). A later claim with a
+    /// DIFFERENT key is arbitrated by tier: a higher tier (lower number)
+    /// always wins — suppressing a weaker claim already on record, or
+    /// overwriting-and-proceeding when the NEW claim is stronger than what's
+    /// on record. Two differently-keyed claims at the SAME non-root tier
+    /// conflict — in practice this is only reachable for two tier-3
+    /// (self-declared url/local/tarball) claims, since two tier-2 (`Named`)
+    /// claims for the same bare name always share `PKey::Named` and dedup
+    /// above.
+    ///
+    /// Under validate-against-registry (§10.0/§10.3/§10.5), this gate's
+    /// `tier < prior_tier` overwrite branch is unreachable for a registry-
+    /// index name's `Url` claim at all: `gate_only` validates every `Url`
+    /// item for a non-root, index-member name against the registry BEFORE it
+    /// ever reaches this gate — an agreeing claim bypasses the gate entirely
+    /// (accepted directly, coexisting with any `Named` stub for the same
+    /// name), and a disagreeing claim raises `RES-PROVENANCE-CONFLICT`
+    /// immediately at its own validation, aborting resolution before a
+    /// `Named` claim for the same name is ever processed. So this overwrite
+    /// branch is reachable only for a name that is NOT in the registry index
+    /// (a bare `requires` with no index entry): there, a later `Named` claim
+    /// winning over an earlier tier-3 `Url` candidate is harmless without any
+    /// post-hoc sweep of `self.candidates` — `process_named` eagerly
+    /// enumerates the index for that name the moment this claim is
+    /// dispatched and raises `TNG-NOT-FOUND` immediately (the name genuinely
+    /// isn't in the index), aborting resolution before the solver ever runs,
+    /// regardless of any stale tier-3 candidate already materialized.
     fn gate(&self, item: &Item) -> Gate {
         let name = item.name();
         if name == "nim" {
@@ -2252,22 +2479,43 @@ impl<'a> ResolveProvider<'a> {
         // distinct entries in seen_by_name (both have bare name "bar").
         let key = item.gate_key();
         let pkey = item.pkey();
+        let tier = item.tier();
         let mut seen = self.seen_by_name.borrow_mut();
-        match seen.get(&key) {
+        // Clone the prior entry (if any) up front — the tier-upgrade branch
+        // below needs to mutate `seen` while comparing against the prior
+        // claim, so the comparison values must not stay borrowed from `seen`.
+        let prior = seen.get(&key).cloned();
+        match prior {
             None => {
-                seen.insert(key.clone(), (pkey, false));
+                seen.insert(key.clone(), (pkey, tier));
                 // Phase B: record transitive dep first-enqueue (BFS-insertion order).
                 // Root deps are recorded in seed_root(); transitive deps land here.
                 self.discovery_order.borrow_mut().push(key.clone());
                 Gate::Proceed
             }
-            Some((prior_key, is_root)) => {
-                if *prior_key == pkey {
+            Some((prior_key, prior_tier)) => {
+                if prior_key == pkey {
                     Gate::Proceed
-                } else if *is_root || self.root_authority.contains(&key) {
+                } else if prior_tier == TIER_ROOT || self.root_authority.contains(&key) {
+                    // §10.1: root authority wins over every tier, no error.
                     Gate::Suppress
+                } else if tier > prior_tier {
+                    // New claim is strictly weaker than what's on record — suppress
+                    // it BEFORE any fetch is ever dispatched (§10.5).
+                    Gate::Suppress
+                } else if tier < prior_tier {
+                    // New claim is strictly stronger (a `Named` claim beating a
+                    // recorded tier-3 URL for a name NOT in the registry index —
+                    // see this fn's doc comment for why no stale-candidate sweep
+                    // is needed here) — it wins: overwrite the gate entry and
+                    // proceed.
+                    seen.insert(key.clone(), (pkey, tier));
+                    Gate::Proceed
                 } else {
-                    Gate::Conflict(prior_key.clone(), pkey)
+                    // Same (non-root) tier, different pkey — only reachable for two
+                    // tier-3 claims (two tier-2 `Named` claims for the same bare
+                    // name always share `PKey::Named` and dedup above).
+                    Gate::Conflict(prior_key, pkey)
                 }
             }
         }

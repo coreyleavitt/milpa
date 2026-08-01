@@ -1,0 +1,5 @@
+name "wrap"
+kind "library"
+deps {
+    shared git=(url)"https://x.example.com/shared.git" ref="v8.0.0"
+}

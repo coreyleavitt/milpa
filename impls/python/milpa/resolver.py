@@ -48,6 +48,7 @@ Spec authority: spec/resolver-semantics.md
 from __future__ import annotations
 
 import re
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -121,11 +122,13 @@ from milpa.dep_decl import EdgeSet
 from milpa.nimble import parse_nimble
 from milpa.profile import Profile
 from milpa.registry import (
+    AmbiguousName,
     EntryAttestation,
     GitIndexProvenance,
     Index,
     IndexVersion,
     OciIndexProvenance,
+    Package,
     filter_by_exclude_newer,
 )
 from milpa.solver import SolverError, Term, VersionUnknownConstrained, solve_with_cert
@@ -526,7 +529,7 @@ class _Provider:
         root_direct_keys: set[DepKey],
         seen_named: set[DepKey],
         seen_url: set[tuple[str, str]],
-        provenance_gate: dict[str, tuple[tuple[object, ...], bool]],
+        provenance_gate: dict[str, tuple[tuple[object, ...], int]],
         edge_cache: dict[tuple[str, Version], EdgeSet] | None = None,
         strict_attestation: bool = False,
     ) -> None:
@@ -1778,7 +1781,7 @@ def _run_bfs_wave_loop(
     env: "MilpaEnv",
     params: "ResolveParams",
     index: "Index",
-    provenance_gate: "dict[str, tuple[tuple[object, ...], bool]]",
+    provenance_gate: "dict[str, tuple[tuple[object, ...], int]]",
     root_authority: "set[str]",
     record_discovery: "Callable[[str], None]",
 ) -> None:
@@ -1795,6 +1798,16 @@ def _run_bfs_wave_loop(
     from concurrent.futures import Future as _Future
     from typing import cast as _cast
 
+    # Eager-fetch tree location for each successfully-fetched URL dep, keyed
+    # by candidate name — persists ACROSS waves (S4b's multi-consumer-union
+    # re-read can reference a name fetched in an EARLIER wave). This is the
+    # single source of truth for "where is this url dep's fetched tree on
+    # disk right now" — since ``_process_url_worker``'s scratch destination
+    # is a unique per-invocation path (not necessarily ``deps_dir / name``;
+    # see its docstring), the S3/S4b flag-re-read blocks below MUST consult
+    # this map rather than reconstructing ``deps_dir / name`` themselves.
+    url_dep_paths: dict[str, Path] = {}
+
     i = 0
     while i < len(bfs_queue):
         # --- Collect the next wave of I/O-bound items -------------------
@@ -1809,6 +1822,14 @@ def _run_bfs_wave_loop(
         # URL dep (multi-consumer union, §3.1.3).  Keyed by dep name; applied after
         # the wave drain so the dep's identity is confirmed.
         wave_pending_flag_reqs: dict[str, list[FlagRequest]] = {}
+        # Names for which a url-dep fetch worker has already been submitted
+        # THIS wave — reset every wave (concurrency, not cross-wave, is the
+        # only thing that can race). Ordinarily every name gets exactly one
+        # url-dep candidate, so this set only ever gains a SECOND entry for
+        # a name in the rare validate-against-registry "two agreeing pins of
+        # the same registry name, different refs" shape (resolver-semantics
+        # §10.0/§10.3) — see the ``kind == "url"`` dest computation below.
+        wave_url_names_dispatched: set[str] = set()
 
         j = i
         while j < len(bfs_queue):
@@ -1825,15 +1846,54 @@ def _run_bfs_wave_loop(
                 if dep_key_n not in seen_named and dep_key_n.name != "nim":
                     seen_named.add(dep_key_n)
                     record_discovery(dep_key_n.solver_var())  # Phase B: transitive named dep
-                    # Enumerate-all normative (resolver-semantics §2.1):
-                    # do NOT pre-filter by constraint here.  The solver
-                    # owns satisfiability via incompatibility accumulation;
-                    # pre-filtering would emit TNG-NO-SATISFYING-VERSION
-                    # instead of the canonical SOLVE-CONFLICT on the error path.
-                    _enumerate_named_stubs(
-                        dep_key_n, None, index, provider, deps_dir, env,
-                        exclude_newer=params.exclude_newer,
+                    # §10.0 authority lattice: a ``named`` claim is a tier-2
+                    # (registry) deference — route it through the SAME gate
+                    # the tier-3 url branch uses, keyed on the bare name (the
+                    # gate stays bare-name-scoped, matching root_authority;
+                    # see R6's comment on ``_root_direct_keys`` — the gate's
+                    # namespace scoping is a separate, pre-existing concern,
+                    # not part of #193). This (a) suppresses a transitive's
+                    # named claim for a root-authority name (§10.1 — root
+                    # wins over EVERY tier, not just tier-3), (b) lets a
+                    # tier-2 claim for a NON-index name that nonetheless
+                    # collides with an already-recorded tier-3 URL win the
+                    # gate (§10.3) — which only ever routes into
+                    # ``_enumerate_named_stubs`` raising ``TNG-NOT-FOUND``,
+                    # since a genuinely index-member name's tier-3 claims are
+                    # ALREADY redirected to a ``named`` item at the url
+                    # branch's gate-time check (see the ``kind == "url"``
+                    # case below) and so never reach this gate as tier-3 in
+                    # the first place — and (c) if a tier-3 URL for the SAME
+                    # non-index name arrives afterward, gets suppressed
+                    # before it is ever fetched (§10.5).
+                    #
+                    # Namespaced named deps (``dep_key_n.namespace is not
+                    # None``) are deliberately EXCLUDED from the gate: the
+                    # gate is bare-name-keyed, and a bare-name key would
+                    # wrongly collapse two DIFFERENT packages that merely
+                    # share a bare name under different namespaces (e.g.
+                    # root-direct ``ns1::foo`` vs a purely-transitive
+                    # ``ns2::foo`` — see
+                    # ``test_c2_lowest_direct.TestNamespaceQualifiedTransitiveNotConfusedWithRootDirect``).
+                    # Namespaced deps keep the pre-#193 behavior: always
+                    # enumerated, never gated.
+                    _proceed = (
+                        dep_key_n.namespace is not None
+                        or _check_provenance_gate(
+                            dep_key_n.name, _NAMED_PKEY, provenance_gate,
+                            root_authority, tier=TIER_REGISTRY,
+                        )
                     )
+                    if _proceed:
+                        # Enumerate-all normative (resolver-semantics §2.1):
+                        # do NOT pre-filter by constraint here.  The solver
+                        # owns satisfiability via incompatibility accumulation;
+                        # pre-filtering would emit TNG-NO-SATISFYING-VERSION
+                        # instead of the canonical SOLVE-CONFLICT on the error path.
+                        _enumerate_named_stubs(
+                            dep_key_n, None, index, provider, deps_dir, env,
+                            exclude_newer=params.exclude_newer,
+                        )
                 # Named items are always processed inline, not as futures.
                 continue
 
@@ -1867,28 +1927,102 @@ def _run_bfs_wave_loop(
                     if isinstance(ov.target, MemberTarget):
                         continue
                     dep_u = _apply_git_override_to_url_dep(dep_u, ov)
-                pkey_u = ("url", dep_u.git, dep_u.ref)
-                # S4b: record the prior provenance entry BEFORE calling the gate,
-                # so we can distinguish same-provenance dedup from root-suppression.
-                # Same-provenance dedup (prior[0] == pkey_u) = additional consumer of
-                # the same dep → accumulate flag_requests for the union (§3.1.3).
-                # Root-suppression (different pkey) = dep overridden by root → skip.
-                _prior_prov_u = provenance_gate.get(dep_u.name)
-                if not _check_provenance_gate(
-                    dep_u.name, pkey_u, provenance_gate, root_authority
-                ):
-                    # S4b: if this is a same-provenance dedup, the current item is
-                    # a second (or later) consumer of the same dep.  Accumulate its
-                    # flag_requests so the union is computed in the S4b block below.
-                    if (
-                        _prior_prov_u is not None
-                        and _prior_prov_u[0] == pkey_u
-                        and dep_u.flag_requests
-                    ):
-                        wave_pending_flag_reqs.setdefault(dep_u.name, []).extend(
-                            dep_u.flag_requests
+                # §10.0/§10.3/§10.5 validate-against-registry lattice: a non-
+                # root name present in the registry index is tier-2
+                # (registry-owned) as a STATIC property of the name — decided
+                # here, at claim-discovery time, from the (already-loaded)
+                # index alone, NOT from whether some other claim also exists
+                # for this name. A transitive's self-declared git= source for
+                # such a name MUST be validated against the registry's own
+                # recorded source BEFORE it is ever fetched (§10.5):
+                #   - AGREES (same git repository the registry records for
+                #     this name — a differing `ref` is still agreement, the
+                #     ref only selects a version) → ACCEPT: fall through to
+                #     ordinary tier-3 url processing below, unchanged. This
+                #     is a legitimate pin of the registry's own package: it
+                #     is fetched and resolves normally; content-hash dedup
+                #     (§3 Phase B) unifies it with any registry-version
+                #     candidate for the same name, and ordinary solver
+                #     version-negotiation reconciles differing pinned
+                #     versions. This deliberately bypasses
+                #     ``_check_provenance_gate``'s single-claim-per-name
+                #     arbitration below — once validated, this is no longer a
+                #     competing, untrusted source, so two agreeing pins (e.g.
+                #     two different transitives pinning two different refs of
+                #     the same real repo) must coexist as candidates, never
+                #     conflict with each other or with a same-named `named`
+                #     claim. The decision is a static function of THIS claim
+                #     plus the registry record alone (never of collisions
+                #     with other claims), so it is order-independent by
+                #     construction (§10.5).
+                #   - DISAGREES (a different source repo, or a transport that
+                #     cannot be compared — e.g. this git= claim against an
+                #     OCI-only registry entry) → raise
+                #     RES-PROVENANCE-CONFLICT here, before any fetch is ever
+                #     dispatched. MUST NOT silently redirect to the registry
+                #     and MUST NOT silently honor the transitive's source —
+                #     the remedy is to declare the name in the root manifest
+                #     (tier 1 arbitrates).
+                # A ROOT url dep for a registry-known name is NEVER
+                # validated — root_authority already excludes it here (root
+                # stays tier-1; see overrides_by_name check above, which only
+                # ever fires for root-authority names).
+                # ``_registry_validated_agreement`` is True only when this
+                # claim was checked above and found to AGREE with the
+                # registry's recorded source — in that case the tier-based
+                # gate below is deliberately BYPASSED (see the comment
+                # block above): an agreeing claim is no longer a competing,
+                # untrusted source, so two agreeing pins of the same real
+                # repo (different refs, from different transitives) must
+                # each proceed independently rather than being arbitrated
+                # against each other as if they disagreed.
+                _registry_validated_agreement = False
+                if dep_u.name not in root_authority:
+                    _registry_pkg = index.lookup_bare(dep_u.name)
+                    if isinstance(_registry_pkg, Package):
+                        _validate_transitive_url_against_registry(
+                            dep_u.name, dep_u.git, _registry_pkg,
                         )
-                    continue
+                        # Agreement (no raise): accepted — fall through to
+                        # ordinary tier-3 processing below, bypassing the
+                        # tier-based gate.
+                        _registry_validated_agreement = True
+                    elif _registry_pkg is not None:
+                        # AmbiguousName: multiple namespaces share this bare
+                        # name — orthogonal to source validation (there is no
+                        # single package record to validate a source
+                        # against). Preserve the pre-existing redirect-to-
+                        # named behavior so the standard TNG-AMBIGUOUS-NAME
+                        # diagnostic (namespace-qualification remedy) fires,
+                        # unchanged by the validate-against-registry rework.
+                        bfs_queue.append(
+                            ("named", DepKey(name=dep_u.name, namespace=None), None)
+                        )
+                        continue
+                pkey_u = ("url", dep_u.git, dep_u.ref)
+                if not _registry_validated_agreement:
+                    # S4b: record the prior provenance entry BEFORE calling the gate,
+                    # so we can distinguish same-provenance dedup from root-suppression.
+                    # Same-provenance dedup (prior[0] == pkey_u) = additional consumer of
+                    # the same dep → accumulate flag_requests for the union (§3.1.3).
+                    # Root-suppression (different pkey) = dep overridden by root → skip.
+                    _prior_prov_u = provenance_gate.get(dep_u.name)
+                    if not _check_provenance_gate(
+                        dep_u.name, pkey_u, provenance_gate, root_authority,
+                        tier=TIER_SELF_URL,
+                    ):
+                        # S4b: if this is a same-provenance dedup, the current item is
+                        # a second (or later) consumer of the same dep.  Accumulate its
+                        # flag_requests so the union is computed in the S4b block below.
+                        if (
+                            _prior_prov_u is not None
+                            and _prior_prov_u[0] == pkey_u
+                            and dep_u.flag_requests
+                        ):
+                            wave_pending_flag_reqs.setdefault(dep_u.name, []).extend(
+                                dep_u.flag_requests
+                            )
+                        continue
                 url_key_u = (dep_u.git, dep_u.ref)
                 if url_key_u in seen_url:
                     # Same URL already submitted in a prior wave (cross-wave dup).
@@ -1900,13 +2034,30 @@ def _run_bfs_wave_loop(
                     continue
                 seen_url.add(url_key_u)
                 record_discovery(dep_u.name)  # Phase B: transitive URL dep first-enqueue
-                # Submit to thread pool — captures dep_u by value (closure).
+                # Ordinarily dest is exactly deps_dir/name (unchanged from
+                # before) — the disambiguated branch is reachable only when
+                # ANOTHER url-dep candidate for this SAME name was already
+                # dispatched earlier in THIS wave (only possible via the
+                # validate-against-registry "two agreeing pins, different
+                # refs" shape, since every other path enforces at most one
+                # url-dep candidate per name — see _check_provenance_gate).
+                # Concurrent CasAdmittingFetcher symlink placement at the
+                # SAME dest across two threads races and raises an OS-level
+                # error; a unique suffix on the SECOND-and-later occurrence
+                # sidesteps it without touching the common case at all.
+                if dep_u.name in wave_url_names_dispatched:
+                    _dest_u = deps_dir / f"{dep_u.name}.{uuid.uuid4().hex[:12]}"
+                else:
+                    _dest_u = deps_dir / dep_u.name
+                wave_url_names_dispatched.add(dep_u.name)
+                # Submit to thread pool — captures dep_u/_dest_u by value (closure).
                 def _url_worker(
                     _dep: UrlDep = dep_u,
+                    _dest: Path = _dest_u,
                 ) -> tuple[str, object]:  # (kind, result)
                     return ("url", _process_url_worker(
                         _dep,
-                        deps_dir=deps_dir,
+                        dest=_dest,
                         env=env,
                         params=params,
                         overrides_by_name=overrides_by_name,
@@ -1966,10 +2117,26 @@ def _run_bfs_wave_loop(
             fetch_result = fut_result[1]
             # Register candidate, seal edge_cache, and enqueue transitives.
             if kind_result in ("url", "tarball", "local"):
-                cand_and_deps: tuple[_Candidate, list[object], EdgeSet] = _cast(
-                    "tuple[_Candidate, list[object], EdgeSet]", fetch_result
-                )
-                cand_r, transitive_deps_r, es_r = cand_and_deps
+                if kind_result == "url":
+                    # _process_url_worker's scratch destination is NOT
+                    # necessarily deps_dir/name (see its docstring) — record
+                    # it in url_dep_paths so the S3/S4b re-reads below (and
+                    # any later wave's S4b re-read) find the real tree.
+                    cand_and_deps_u: tuple[_Candidate, list[object], EdgeSet, Path] = _cast(
+                        "tuple[_Candidate, list[object], EdgeSet, Path]", fetch_result
+                    )
+                    cand_r, transitive_deps_r, es_r, dest_r = cand_and_deps_u
+                    url_dep_paths[cand_r.name] = dest_r
+                else:
+                    # tarball/local workers still return the plain 3-tuple —
+                    # their destination IS always deps_dir/name (root-declared
+                    # only; M2 security gate drops transitive tarball/local
+                    # deps before they ever reach this loop, so no two
+                    # distinct claims can ever share a name here).
+                    cand_and_deps: tuple[_Candidate, list[object], EdgeSet] = _cast(
+                        "tuple[_Candidate, list[object], EdgeSet]", fetch_result
+                    )
+                    cand_r, transitive_deps_r, es_r = cand_and_deps
                 provider.add(cand_r)
                 # Seal the edge_cache for this (name, version) — clause (a).
                 # First-encounter wins; no overwrite (worker produced the EdgeSet
@@ -1989,7 +2156,10 @@ def _run_bfs_wave_loop(
                         if _orig_url_dep is not None
                         else ()
                     )
-                    _dep_kdl = deps_dir / cand_r.name / "milpa.kdl"
+                    # dest_r is this SAME candidate's actual fetched tree
+                    # (bound above, this branch only reachable when
+                    # kind_result == "url") — NOT necessarily deps_dir/name.
+                    _dep_kdl = dest_r / "milpa.kdl"
                     _url_manifest_flags: tuple[FlagDecl, ...] = ()
                     if _dep_kdl.exists():
                         try:
@@ -2023,7 +2193,13 @@ def _run_bfs_wave_loop(
                     if _pcand.identity is None:
                         continue
                     # Load the dep's manifest (already on disk from BFS fetch).
-                    _pkdl = deps_dir / _pname / "milpa.kdl"
+                    # url_dep_paths is the single source of truth for where a
+                    # url dep's fetched tree actually landed (NOT necessarily
+                    # deps_dir/name — see _process_url_worker's docstring);
+                    # this consumer may be referencing a name fetched in an
+                    # EARLIER wave, so the map (not just this wave's dest_r)
+                    # is required here.
+                    _pkdl = url_dep_paths.get(_pname, deps_dir / _pname) / "milpa.kdl"
                     _pmf: tuple[FlagDecl, ...] = ()
                     _pmanifest = None
                     if _pkdl.exists():
@@ -2097,7 +2273,7 @@ def _s4a_run_fixpoint(
     env: "MilpaEnv",
     params: "ResolveParams",
     index: "Index",
-    provenance_gate: "dict[str, tuple[tuple[object, ...], bool]]",
+    provenance_gate: "dict[str, tuple[tuple[object, ...], int]]",
     root_authority: "set[str]",
     record_discovery: "Callable[[str], None]",
     extra_manifests: "dict[str, object] | None" = None,
@@ -2738,15 +2914,18 @@ def resolve(
     # to just its `.name` field yields the exact same set of bare names.
     root_authority: set[str] = {k.name for k in root_direct_keys}
 
-    # provenance_gate: name → (prov_key, is_root_authority)
+    # provenance_gate: name → (prov_key, authority_tier)  (§10.0: 1=root,
+    # 2=registry/named, 3=self-declared url/local/tarball)
     #
     # NOT pre-seeded: root deps register themselves as they are processed
     # in the BFS loop.  The gate is used for TRANSITIVE conflict detection:
     # when a transitive dep tries to claim a name that root authority already
-    # registered with a DIFFERENT pkey, the transitive claim is suppressed.
-    # ``root_authority`` (the name set above) is the check for suppression —
-    # the gate stores which pkey a root dep actually used.
-    provenance_gate: dict[str, tuple[tuple[object, ...], bool]] = {}
+    # registered with a DIFFERENT pkey, the transitive claim is suppressed;
+    # when a registry (tier-2) claim and a self-declared (tier-3) claim
+    # disagree, the registry wins regardless of discovery order.
+    # ``root_authority`` (the name set above) is the check for root
+    # suppression — the gate stores which pkey+tier a claim actually used.
+    provenance_gate: dict[str, tuple[tuple[object, ...], int]] = {}
 
     # ------------------------------------------------------------------
     # Step 4: build the provider and dedup sets
@@ -3140,37 +3319,221 @@ def resolve(
 # ---------------------------------------------------------------------------
 
 
+# Authority tiers (resolver-semantics.md §10.0 — the provenance lattice).
+# 1 = Root (root/member deps + dev-deps + overrides) — the project owner.
+# 2 = Registry (a ``named``/index claim) — the attested tianguis registry.
+# 3 = Self-declared URL (transitive git=/local=/tarball=) — untrusted.
+# A higher tier (LOWER number) suppresses a lower-tier (HIGHER number)
+# disagreement, deterministically, without error.
+TIER_ROOT = 1
+TIER_REGISTRY = 2
+TIER_SELF_URL = 3
+
+# Sentinel pkey for a ``named``/registry claim: a ``named`` dep is a
+# deference to the tianguis registry, not a self-declared source — every
+# named claim for the same solver_var is therefore the SAME conceptual
+# claim regardless of which transitive makes it or what version constraint
+# it carries (constraints aren't provenance).  Two named claims for the
+# same name can never disagree at the provenance-key level.
+_NAMED_PKEY: tuple[object, ...] = ("named",)
+
+
+# ---------------------------------------------------------------------------
+# Registry-validation mechanism (resolver-semantics.md §10.0/§10.3 — the
+# validate-against-registry rework of the provenance lattice's tier-2 rule).
+# ---------------------------------------------------------------------------
+
+
+def _normalize_git_source_url(url: str) -> str:
+    """Normalize *url* for git-source AGREEMENT comparison (§10.0).
+
+    Strips a trailing ``/`` and a trailing ``.git`` suffix, and lowercases
+    the scheme + authority (host[:port]) component only — path casing is
+    preserved, since many git hosts are path-case-sensitive (unlike the
+    hostname). This is deliberately NOT full URL canonicalization (no
+    userinfo/port-default handling, no ssh-vs-https transport unification,
+    no percent-decoding) — the only thing this comparison needs to answer is
+    "is this the same repository the registry records", which the milpa KDL
+    ``(url)`` convention (spec's git urls are always full ``scheme://host/
+    path`` form, never SCP-style ``git@host:path``) makes tractable with
+    this narrow normalization. Reused (in spirit) from the existing
+    ``.git``-suffix stripping in ``edge_sources._name_from_url`` /
+    ``nimble.url_to_name`` (M3 SSOT for name derivation) — this function is
+    the analogous single source of truth for URL *comparison*, not name
+    derivation, so it is not literally the same code path, but applies the
+    identical ``.git``-suffix convention.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    s = url.strip()
+    if s.endswith("/"):
+        s = s[:-1]
+    if s.endswith(".git"):
+        s = s[:-4]
+    parts = urlsplit(s)
+    if not parts.netloc:
+        # No recognizable scheme://authority (e.g. a malformed or SCP-style
+        # value) — fall back to the stripped-and-lowercased whole string so
+        # comparison is still total (never raises), just less precise.
+        return s.lower()
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, "", ""))
+
+
+def _registry_git_provenances(pkg: Package) -> list[GitIndexProvenance]:
+    """All ``GitIndexProvenance`` records recorded for *pkg*, across EVERY
+    version (registry-protocol document order, i.e. newest-version-first per
+    ``Index.lookup_bare``'s ``Package.versions`` ordering, then per-version
+    preference order).
+
+    A package's source repository is ordinarily stable across versions (only
+    the ref/tag changes), so checking every version's recorded provenance —
+    not just the newest — is what makes agreement-checking robust to a
+    transitive pinning an OLDER version's tag of the registry's own repo.
+    """
+    out: list[GitIndexProvenance] = []
+    for iv in pkg.versions:
+        for prov in iv.provenances:
+            if isinstance(prov, GitIndexProvenance):
+                out.append(prov)
+    return out
+
+
+def _validate_transitive_url_against_registry(
+    name: str,
+    dep_git_url: str,
+    pkg: Package,
+) -> None:
+    """Validate a transitive's self-declared ``git=`` source for the
+    registry-owned name *name* against tianguis's recorded source for *pkg*
+    (resolver-semantics.md §10.0/§10.3 NORMATIVE — "Registry validation").
+
+    AGREES (the transitive's git URL, normalized, matches a git source
+    recorded for ANY version of *pkg*) → returns ``None`` (silently) — the
+    caller falls through and treats the claim as an accepted, ordinary tier-3
+    url dep. A differing ``ref``/``commit_sha`` is NOT a disagreement (the
+    ref only selects a version of the same repo) — this function never
+    compares those fields.
+
+    DISAGREES (no recorded git source matches — either a different
+    repository, or *pkg* has no comparable git source at all, e.g. an
+    OCI-only registry entry) → raises ``MilpaError(RES-PROVENANCE-CONFLICT)``
+    naming the transitive's source, the registry's recorded source(s), and
+    the remedy (root-declare the name).
+    """
+    git_provs = _registry_git_provenances(pkg)
+    if not git_provs:
+        raise MilpaError(
+            RES_PROVENANCE_CONFLICT,
+            f"provenance conflict for package {name!r}: a transitive "
+            f"dependency declares a git source ({dep_git_url!r}), but the "
+            f"tianguis registry has no comparable git source recorded for "
+            f"{name!r} (the registry entry is OCI-only, or has no "
+            f"provenance at all) — the transport cannot be validated. "
+            f"The root manifest does not override {name!r}. Add "
+            f"{name!r} to your milpa.kdl deps (or override it) to choose "
+            f"which source to use.",
+            name=name,
+        )
+    claim_norm = _normalize_git_source_url(dep_git_url)
+    registry_urls = {p.url for p in git_provs}
+    if claim_norm in {_normalize_git_source_url(u) for u in registry_urls}:
+        return
+    raise MilpaError(
+        RES_PROVENANCE_CONFLICT,
+        f"provenance conflict for package {name!r}: a transitive "
+        f"dependency declares source {dep_git_url!r}, but the tianguis "
+        f"registry records {sorted(registry_urls)!r} for {name!r} — a "
+        f"different source repository. The root manifest does not "
+        f"override {name!r}. Add {name!r} to your milpa.kdl deps (or "
+        f"override it) to choose which source to use.",
+        name=name,
+    )
+
+
 def _check_provenance_gate(
     name: str,
     pkey: tuple[object, ...],
-    provenance_gate: dict[str, tuple[tuple[object, ...], bool]],
+    provenance_gate: dict[str, tuple[tuple[object, ...], int]],
     root_authority: set[str],
+    tier: int,
 ) -> bool:
-    """Check the provenance gate for ``name`` with key ``pkey``.
+    """Check the provenance gate for ``name`` with key ``pkey`` at ``tier``.
 
-    Returns True if the dep should be fetched; False if suppressed.
-    Raises MilpaError(RES-PROVENANCE-CONFLICT) on irresolvable transitive conflict.
+    Returns True if the dep should be fetched/enumerated; False if suppressed.
+    Raises MilpaError(RES-PROVENANCE-CONFLICT) on an irresolvable tier-3-vs-
+    tier-3 disagreement.
 
-    Gate semantics (resolver-semantics.md §10):
-    - First claim for a name: register + proceed.
-    - Same pkey as prior claim: dedup → suppress (already fetching or fetched).
-    - Different pkey + prior was a root-authority claim: root wins → suppress.
-    - Different pkey + both transitive: conflict → raise.
+    Gate semantics (resolver-semantics.md §10.0 authority lattice,
+    validate-against-registry per §10.3/§10.5 — a name's tier is decided
+    from static facts alone: root-authority membership and registry-index
+    membership, never from which claims happen to collide):
+    - First claim for a name: register (name in ``root_authority`` forces
+      the recorded tier to ``TIER_ROOT`` regardless of the caller-supplied
+      ``tier`` — root's own declaration, whatever kind it is, is always the
+      binding tier-1 claim) + proceed.
+    - Same pkey as prior claim: dedup → suppress (already fetching/enumerated).
+    - Different pkey + either side is root-authority: root wins → suppress,
+      no error (§10.1).
+    - Different pkey, non-root, differing tiers: the higher tier (lower
+      number) wins, deterministically and ORDER-INDEPENDENTLY —
+      * the new claim's tier is weaker (higher number) than the recorded
+        claim's → suppress the new claim (return False) — for a tier-3 URL
+        arriving after a tier-2 registry claim was already recorded, this
+        suppression happens BEFORE the fetch is ever dispatched (§10.5);
+      * the new claim's tier is stronger (lower number) than the recorded
+        claim's — the new claim wins: overwrite the gate entry and proceed
+        (return True).  This branch is reached only for a ``named`` claim
+        (tier=``TIER_REGISTRY``) arriving after a tier-3 URL claim was
+        already recorded for a name that is NOT in the registry index (an
+        index-member name's url claims never reach this gate at TIER_SELF_URL
+        at all — see below); letting the ``named`` claim proceed here just
+        routes it into ``_enumerate_named_stubs``, which immediately raises
+        ``TNG-NOT-FOUND`` (the name genuinely isn't in the index) — so no
+        eager tier-3 candidate for that name can survive into the solver
+        either; resolution aborts here regardless of the stale candidate.
+        No post-hoc sweep of ``provider._candidates`` is needed.
+    - Different pkey, non-root, SAME tier (only reachable for two tier-3
+      claims — two tier-2 claims always share ``_NAMED_PKEY`` and dedup
+      above): conflict, UNLESS a tier-2 (registry) claim for this name is
+      already on record — impossible to reach with prior/new both at tier 3
+      while a tier-2 entry is recorded (a tier-2 registration always
+      upgrades the stored tier to 2), so reaching this branch already
+      proves no tier-2 claim exists → raise RES-PROVENANCE-CONFLICT. Per
+      §10.3, this now also proves the name is NOT in the registry index: an
+      index-member name's url claims are validated against the registry's
+      recorded source (``_validate_transitive_url_against_registry``, called
+      from the ``kind == "url"`` case in ``_run_bfs_wave_loop``) BEFORE ever
+      reaching this gate — an agreeing claim bypasses this gate entirely
+      (accepted directly, never registered here, so two agreeing pins of
+      the same real repo at different refs never collide with each other),
+      and a disagreeing claim raises RES-PROVENANCE-CONFLICT immediately at
+      its own validation, never becoming a candidate that could reach this
+      gate as ``TIER_SELF_URL``. So two claims recorded here at the same
+      (tier-3) level can only belong to a non-index name.
     """
     is_root = name in root_authority
     prior = provenance_gate.get(name)
     if prior is None:
         # First time we see this name — register and proceed.
-        provenance_gate[name] = (pkey, is_root)
+        provenance_gate[name] = (pkey, TIER_ROOT if is_root else tier)
         return True
     if prior[0] == pkey:
-        # Same provenance — already fetching/fetched; dedup.
+        # Same provenance — already fetching/fetched/enumerated; dedup.
         return False
     # Different provenance for the same name.
-    if prior[1] or is_root:
+    if is_root or prior[1] == TIER_ROOT:
         # Root authority (either the prior or this call is root) — suppress.
         return False
-    # Non-root disagreement: two transitives want different provenances.
+    if tier > prior[1]:
+        # New claim is strictly lower authority than the recorded claim.
+        return False
+    if tier < prior[1]:
+        # New claim is strictly higher authority — it wins (see docstring
+        # for why no stale-candidate sweep is needed here).
+        provenance_gate[name] = (pkey, tier)
+        return True
+    # Same (non-root) tier, different pkey: only two tier-3 claims can reach
+    # here (see docstring) — a genuine untrusted-tier disagreement.
     raise MilpaError(
         RES_PROVENANCE_CONFLICT,
         f"provenance conflict for package {name!r}: "
@@ -3184,17 +3547,39 @@ def _check_provenance_gate(
 
 def _process_url_worker(
     dep: UrlDep,
-    deps_dir: Path,
+    dest: Path,
     env: MilpaEnv,
     params: ResolveParams,
     overrides_by_name: dict[str, Override],
-) -> tuple[_Candidate, list[object], EdgeSet]:
+) -> tuple[_Candidate, list[object], EdgeSet, Path]:
     """Fetch one URL dep (worker: pure I/O, no shared-state mutation).
 
-    Returns ``(_Candidate, transitive_dep_list, edge_set)`` where:
+    ``dest`` is the caller-computed scratch destination for this fetch —
+    ordinarily ``deps_dir / dep.name``, EXCEPT when the caller (the
+    ``kind == "url"`` branch of ``_run_bfs_wave_loop``) detects that a
+    SECOND, differently-keyed url-dep candidate for the SAME name is being
+    dispatched within the SAME BFS wave (only reachable via the validate-
+    against-registry rework, resolver-semantics.md §10.0/§10.3: two
+    transitives that each AGREE with a registry name's source, at different
+    refs, both bypass the provenance gate and are legitimately fetched
+    concurrently) — in that case the caller disambiguates ``dest`` with a
+    unique suffix so the two concurrent ``CasAdmittingFetcher`` symlink
+    placements don't race on the same path (which otherwise raises an
+    OS-level error, e.g. "Cannot call rmtree on a symbolic link", aborting
+    resolution outright). This function never computes ``dest`` itself so
+    that the ordinary (non-colliding) case stays byte-for-byte identical to
+    before — every OTHER consumer of ``deps_dir / dep.name`` (S3/S4a/S4b's
+    manifest re-reads) is unaffected by the rare disambiguated case, since
+    ``url_dep_paths`` (populated by the caller from this function's
+    returned ``fetched_path``) is the only place that needs to know the
+    real location.
+
+    Returns ``(_Candidate, transitive_dep_list, edge_set, fetched_path)`` where:
     - ``transitive_dep_list`` are raw dep objects for BFS enqueuing.
     - ``edge_set`` is the EdgeSet produced by the appropriate source (MilpaKdl
       or Nimble); the caller seals this into the resolver-scoped ``edge_cache``.
+    - ``fetched_path`` is simply ``dest`` echoed back, for the caller's
+      ``url_dep_paths`` bookkeeping.
 
     This is the thread-pool worker body for 9b-7 parallel fetch (§4.4 NORMATIVE:
     output is deterministic regardless of -j because the lockfile is lex-sorted).
@@ -3237,7 +3622,7 @@ def _process_url_worker(
         for url in _all_candidate_urls
     ]
 
-    dest = deps_dir / dep.name
+    # dest is caller-computed — see the docstring above.
     last_transport_exc: Exception | None = None
     result = None
     observed_prov: GitProvenance | None = None
@@ -3385,7 +3770,7 @@ def _process_url_worker(
     # Collect transitive deps for the BFS queue (returned to caller for enqueuing).
     # S2b: derived from the EdgeSet (already flag-filtered); no second parse.
     transitive_deps = edgeset_to_bfs_deps(es, overrides_by_name)
-    return candidate, transitive_deps, es
+    return candidate, transitive_deps, es, dest
 
 
 def _enqueue_dep(
@@ -4416,22 +4801,23 @@ def resolve_workspace(
     # same set of bare names.
     root_authority: set[str] = {k.name for k in root_direct_keys}
 
-    provenance_gate: dict[str, tuple[tuple[object, ...], bool]] = {}
+    provenance_gate: dict[str, tuple[tuple[object, ...], int]] = {}
     seen_url: set[tuple[str, str]] = set()
     seen_named: set[DepKey] = set()  # S5a: qualified key (namespace+name)
     seen_local: set[str] = set()
     seen_tarball: set[str] = set()
 
-    # S8b: pre-seed the provenance gate for MemberTarget overrides (root authority,
-    # is_root=True).  Any transitive dep that arrives with the same name but a
-    # different provenance key (e.g. a git URL) will be suppressed by the gate
-    # because the root authority wins.  This ensures that even if an external
+    # S8b: pre-seed the provenance gate for MemberTarget overrides (root
+    # authority, TIER_ROOT).  Any transitive dep that arrives with the same
+    # name but a different provenance key (e.g. a git URL, or a `named`
+    # claim) will be suppressed by the gate because the root authority wins
+    # over every tier (§10.0).  This ensures that even if an external
     # package declares a dep on "innerlib" as a git URL, we never fetch it when
     # an override says { member "innerlib" }.
     for _ov in workspace.workspace_manifest.overrides:
         if isinstance(_ov.target, MemberTarget):
             # Use the SSOT helper to map OverrideTarget → pkey (M9).
-            provenance_gate[_ov.name] = (_override_target_to_pkey(_ov), True)
+            provenance_gate[_ov.name] = (_override_target_to_pkey(_ov), TIER_ROOT)
 
     # Phase B dedup: BFS-insertion discovery order (mirrors resolve()).
     # Members are pre-registered and NOT in discovery_order (they are

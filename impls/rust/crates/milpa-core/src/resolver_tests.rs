@@ -5191,3 +5191,918 @@ fn resolve_a4_version_unknown_constrained_names_both_real_constrainers() {
         "message must name asyncdispatch's constraint: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #193 — the three-tier provenance authority lattice (resolver-semantics.md
+// §10.0), REVISED to validate-against-registry (§10.0/§10.3/§10.5). Mirrors
+// Python's `tests/test_provenance_lattice.py`: resolver-level scenarios +
+// direct gate-unit tests of `ResolveProvider::gate`'s tier decision table,
+// plus direct unit tests of `normalize_git_source_url` /
+// `validate_transitive_url_against_registry`.
+//
+// Tier 1 (highest) Root      — root/member deps + dev-deps + overrides.
+// Tier 2           Registry  — a `Named`/index claim.
+// Tier 3 (lowest)  Self-URL  — a transitive url/local/tarball claim.
+//
+// **Design revision (validate-against-registry):** the registry is a TRUSTED
+// DEFAULT, not an explicit per-build choice. For a non-root name present in
+// the registry index, a transitive self-declared `git=` claim is VALIDATED
+// against the registry's recorded source for the name (`gate_only`, BEFORE
+// the tier-based `gate()` below is ever consulted):
+//   - AGREES (same git repository the registry records — a differing `ref`
+//     is still agreement) → ACCEPTED and resolves normally, exactly like an
+//     ordinary tier-3 url dep — this BYPASSES the tier gate entirely, so two
+//     agreeing pins of the same real repo (different refs, from different
+//     transitives) coexist rather than being arbitrated against each other.
+//     This SUPERSEDES the prior "membership-based redirect" design (a lone
+//     agreeing url pin is no longer silently redirected to the registry's
+//     own version — it is accepted AS ITSELF).
+//   - DISAGREES (a different source repository, or an incomparable
+//     transport) → raises `RES-PROVENANCE-CONFLICT` — even for a LONE
+//     disagreeing claim, with no competing claim anywhere else in the graph
+//     (the headline behavioral change from the prior disagreement-only
+//     design: a transitive can no longer silently substitute a registry
+//     name's source, nor can it silently be overridden by the registry).
+//
+// Ordering note: unlike Python's wave-based concurrent BFS, Rust's
+// `process_items` gates a batch then DISPATCHES each survivor depth-first —
+// dispatching a URL/tarball/local item recursively drains its own subtree
+// (via a nested `process_items` call) before the outer loop's next sibling
+// is even visited. So here, ordering between two competing claims is forced
+// by ROOT-DEP DECLARATION ORDER (which branch is listed first in the root
+// manifest), not by hop-count — the branch declared first has its entire
+// subtree fully resolved (fetched, gated, sub-dep processed) before the
+// next declared branch is ever dispatched. Under validate-against-registry
+// this ordering barely matters for a registry-known name's url claim: the
+// claim is validated at its OWN discovery, a static function of the name +
+// the (already-loaded) index record alone — never of which other claims
+// happen to exist or when they are discovered.
+// ---------------------------------------------------------------------------
+
+/// Builds a single-package, single-version `Index` for `name`, backed by a
+/// git provenance at `(url, ref)` whose content matches `hash_of_nimble` — so
+/// the identity gate passes when the resolver fetches it as a `Named` claim.
+fn lattice_index(name: &str, url: &str, refp: &str, body: &str) -> Index {
+    lattice_index_ver(name, url, refp, "1.0.0", body)
+}
+
+/// Like `lattice_index`, but lets the caller pick the recorded version string
+/// (mirrors Python's `_index_kdl_one_pkg`'s `version` positional).
+fn lattice_index_ver(name: &str, url: &str, refp: &str, version: &str, body: &str) -> Index {
+    Index {
+        packages: vec![Package {
+            name: name.to_string(),
+            namespace: String::new(),
+            versions: vec![IndexVersion {
+                version: version.into(),
+                content_hash: hash_of_nimble(name, body),
+                provenances: vec![Provenance::Git {
+                    url: url.to_string(),
+                    ref_spec: refp.to_string(),
+                    commit_sha: None,
+                }],
+                dep_decl: None,
+                dep_decl_schema_version: None,
+                attestation: None,
+                namespace: String::new(),
+                published_at: None,
+                yanked: false,
+                yanked_at: None,
+                yanked_reason: None,
+                published_at_raw: None,
+            }],
+        }],
+    }
+}
+
+/// Two single-version packages in one `Index` — mirrors Python's
+/// `_index_kdl_two_pkgs`, for the mid-solve-residual scenario below (which
+/// needs BOTH `outer` and `foo` to be registry-known).
+#[allow(clippy::too_many_arguments)]
+fn lattice_index_two(
+    name1: &str, url1: &str, ref1: &str, body1: &str,
+    name2: &str, url2: &str, ref2: &str, body2: &str,
+) -> Index {
+    let mut idx = lattice_index(name1, url1, ref1, body1);
+    idx.packages.extend(lattice_index(name2, url2, ref2, body2).packages);
+    idx
+}
+
+#[test]
+fn resolve_lattice_disagreeing_url_conflicts_url_branch_discovered_first() {
+    // §10.0/§10.3/§10.5: a tier-3 self-declared URL claim for `foo` (a
+    // registry-known name) DISAGREES with the registry's recorded source
+    // (`pin.example.com` vs `registry.example.com`). `wrapa` (the url
+    // branch) is declared FIRST, so its own subtree — including `foo`'s
+    // validation — runs before `wrapb` (the named branch) is ever visited.
+    // Under validate-against-registry this raises RES-PROVENANCE-CONFLICT
+    // at wrapa's own discovery, regardless of wrapb's competing claim.
+    let wrapa_url = "https://example.com/wrapa.git";
+    let wrapb_url = "https://example.com/wrapb.git";
+    let foo_pin_url = "https://pin.example.com/foo.git";
+    let foo_registry_url = "https://registry.example.com/foo.git";
+    let foo_registry_body = "# registry\n";
+
+    let reg = FakeReg::git(&[
+        (wrapa_url, "main", nimble("wrapa", &format!("requires \"{foo_pin_url}#v9.9.9\"\n"))),
+        (wrapb_url, "main", nimble("wrapb", "requires \"foo\"\n")),
+        (foo_pin_url, "v9.9.9", nimble("foo", "# url-pin\n")),
+        (foo_registry_url, "v1.0.0", nimble("foo", foo_registry_body)),
+    ]);
+    let index = lattice_index("foo", foo_registry_url, "v1.0.0", foo_registry_body);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![
+        url_dep("wrapa", wrapa_url, "main"),
+        url_dep("wrapb", wrapb_url, "main"),
+    ]);
+    let err = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert!(format!("{err:?}").contains("foo"));
+
+    // The disagreeing pin must genuinely never have been fetched — validated
+    // and rejected BEFORE any fetch is dispatched (§10.5).
+    assert!(
+        reg.calls().iter().all(|c| c.1 != foo_pin_url),
+        "the disagreeing pin must never be fetched"
+    );
+}
+
+#[test]
+fn resolve_lattice_disagreeing_url_conflicts_named_branch_discovered_first() {
+    // Same shape, roles swapped: `wrapb` (the named branch) is declared
+    // FIRST. The outcome MUST be identical — `wrapa`'s disagreeing url claim
+    // still conflicts, at its own discovery, regardless of the registry
+    // claim already being on record (order-independence, §10.5).
+    let wrapa_url = "https://example.com/wrapa-swap.git";
+    let wrapb_url = "https://example.com/wrapb-swap.git";
+    let foo_pin_url = "https://pin.example.com/foo.git";
+    let foo_registry_url = "https://registry.example.com/foo.git";
+    let foo_registry_body = "# registry\n";
+
+    let reg = FakeReg::git(&[
+        (wrapb_url, "main", nimble("wrapb", "requires \"foo\"\n")),
+        (wrapa_url, "main", nimble("wrapa", &format!("requires \"{foo_pin_url}#v9.9.9\"\n"))),
+        (foo_pin_url, "v9.9.9", nimble("foo", "# url-pin\n")),
+        (foo_registry_url, "v1.0.0", nimble("foo", foo_registry_body)),
+    ]);
+    let index = lattice_index("foo", foo_registry_url, "v1.0.0", foo_registry_body);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![
+        url_dep("wrapb", wrapb_url, "main"),
+        url_dep("wrapa", wrapa_url, "main"),
+    ]);
+    let err = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert!(format!("{err:?}").contains("foo"));
+
+    assert!(
+        reg.calls().iter().all(|c| c.1 != foo_pin_url),
+        "the disagreeing pin must never be fetched"
+    );
+}
+
+#[test]
+fn resolve_lattice_mid_solve_residual_closed_by_immediate_validation() {
+    // THE old residual (would have needed a post-hoc sweep) — now closed by
+    // construction under validate-against-registry. `foo` is a registry-
+    // known name. An eager tier-3 URL transitive (`wrapa`, declared FIRST)
+    // claims `foo` via `git=` at a DIFFERENT repository than the registry's
+    // — this is discovered and validated during wrapa's own eager subtree,
+    // BEFORE `outer` (ALSO a registry package, declared second) is ever even
+    // dispatched. `outer`'s OWN bare-name claim on `foo` — discoverable only
+    // when the solver would materialize outer's selected candidate — is
+    // never even reached: the conflict fires from the registry index alone
+    // (a static, pre-loaded fact), without needing outer's claim to exist or
+    // be discovered.
+    let wrapa_url = "https://example.com/wrapa-mid.git";
+    let outer_url = "https://registry.example.com/outer-mid.git";
+    // The pin/registry URLs' basenames MUST be exactly "foo" — a nimble
+    // `requires "<url>#<ref>"` line derives the transitive dep's NAME from
+    // the URL's basename, and that derived name is what must collide with
+    // the registry package name "foo" below.
+    let foo_pin_url = "https://pin.example.com/foo.git";
+    let foo_registry_url = "https://registry.example.com/foo.git";
+    let outer_body = "requires \"foo\"\n";
+    let foo_registry_body = "# registry\n";
+
+    let reg = FakeReg::git(&[
+        (wrapa_url, "main", nimble("wrapa-mid", &format!("requires \"{foo_pin_url}#v9.9.9\"\n"))),
+        // outer's own manifest requires foo by bare name — never even
+        // fetched: wrapa's own claim already aborts resolution before outer
+        // is ever selected/materialized.
+        (outer_url, "v1.0.0", nimble("outer-mid", outer_body)),
+        (foo_pin_url, "v9.9.9", nimble("foo", "# url-pin\n")),
+        (foo_registry_url, "v1.0.0", nimble("foo", foo_registry_body)),
+    ]);
+    let index = lattice_index_two(
+        "outer-mid", outer_url, "v1.0.0", outer_body,
+        "foo", foo_registry_url, "v1.0.0", foo_registry_body,
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![
+        url_dep("wrapa-mid", wrapa_url, "main"),
+        named_dep("outer-mid", None),
+    ]);
+    let err = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert!(format!("{err:?}").contains("foo"));
+
+    assert!(
+        reg.calls().iter().all(|c| c.1 != foo_pin_url && c.1 != outer_url),
+        "neither the disagreeing pin nor outer (never selected) may be fetched"
+    );
+}
+
+#[test]
+fn resolve_lattice_two_disagreeing_urls_for_registry_name_both_conflict() {
+    // §10.0/§10.3: three transitives claim `shared` — `q` by bare name
+    // (registry), `r1`/`r2` via TWO DIFFERENT self-declared URLs (via nested
+    // `mid1`/`mid2` hops) — BOTH of which DISAGREE with the registry's
+    // recorded source. Under validate-against-registry, EACH disagreeing url
+    // is independently invalid: whichever the BFS reaches first raises
+    // RES-PROVENANCE-CONFLICT. (Under the prior membership-based redesign
+    // this fixture demonstrated "registry wins, no conflict" — the revision
+    // inverts that outcome.)
+    let q_url = "https://example.com/q.git";
+    let r1_url = "https://example.com/r1.git";
+    let r2_url = "https://example.com/r2.git";
+    let mid1_url = "https://example.com/mid1.git";
+    let mid2_url = "https://example.com/mid2.git";
+    let shared_x_url = "https://x.example.com/shared.git";
+    let shared_y_url = "https://y.example.com/shared.git";
+    let shared_registry_url = "https://registry.example.com/shared.git";
+    let shared_registry_body = "# registry\n";
+
+    let reg = FakeReg::git(&[
+        (q_url, "main", nimble("q", "requires \"shared\"\n")),
+        (r1_url, "main", nimble("r1", &format!("requires \"{mid1_url}#main\"\n"))),
+        (r2_url, "main", nimble("r2", &format!("requires \"{mid2_url}#main\"\n"))),
+        (mid1_url, "main", nimble("mid1", &format!("requires \"{shared_x_url}#v8.0.0\"\n"))),
+        (mid2_url, "main", nimble("mid2", &format!("requires \"{shared_y_url}#v9.0.0\"\n"))),
+        (shared_x_url, "v8.0.0", nimble("shared", "# x\n")),
+        (shared_y_url, "v9.0.0", nimble("shared", "# y\n")),
+        (shared_registry_url, "v1.0.0", nimble("shared", shared_registry_body)),
+    ]);
+    let index = lattice_index("shared", shared_registry_url, "v1.0.0", shared_registry_body);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![
+        url_dep("q", q_url, "main"),
+        url_dep("r1", r1_url, "main"),
+        url_dep("r2", r2_url, "main"),
+    ]);
+    let err = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert!(format!("{err:?}").contains("shared"));
+}
+
+#[test]
+fn resolve_lattice_root_beats_both_registry_and_url() {
+    // §10.0/§10.1: root declares `shared` directly (tier 1). One transitive
+    // claims `shared` by bare name (tier 2, registry-known) and ANOTHER
+    // transitive claims it via a different self-declared URL (tier 3,
+    // disagreeing with the registry). Root wins over BOTH — no conflict, no
+    // validation is even attempted (root_authority excludes `shared` from
+    // the validate-against-registry branch entirely); the resolved
+    // provenance is root's own.
+    let root_shared_url = "https://root.example.com/shared.git";
+    let t1_url = "https://example.com/t1.git";
+    let t2_url = "https://example.com/t2.git";
+    let evil_shared_url = "https://evil.example.com/shared.git";
+    let shared_registry_url = "https://registry.example.com/shared.git";
+    let shared_registry_body = "# registry\n";
+
+    let reg = FakeReg::git(&[
+        (root_shared_url, "main", nimble("shared", "# root-pin\n")),
+        (t1_url, "main", nimble("t1", "requires \"shared\"\n")),
+        (t2_url, "main", nimble("t2", &format!("requires \"{evil_shared_url}#main\"\n"))),
+        (evil_shared_url, "main", nimble("shared", "# evil\n")),
+        (shared_registry_url, "v1.0.0", nimble("shared", shared_registry_body)),
+    ]);
+    let index = lattice_index("shared", shared_registry_url, "v1.0.0", shared_registry_body);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![
+        url_dep("shared", root_shared_url, "main"),
+        url_dep("t1", t1_url, "main"),
+        url_dep("t2", t2_url, "main"),
+    ]);
+    let graph = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap();
+
+    let shared: Vec<_> = graph.deps.iter().filter(|d| d.name == "shared").collect();
+    assert_eq!(shared.len(), 1);
+    match shared[0].provenances.first().expect("provenance") {
+        ProvenanceRecord::Git { url, .. } => assert_eq!(url, root_shared_url),
+        other => panic!("expected git provenance, got {other:?}"),
+    }
+    assert!(
+        reg.calls().iter().all(|c| c.1 != evil_shared_url && c.1 != shared_registry_url),
+        "neither the registry nor the evil transitive url may ever be fetched"
+    );
+}
+
+#[test]
+fn resolve_lattice_lone_url_pin_of_registry_name_agrees_is_accepted() {
+    // A transitive url-pins `foo` — a name that ALSO exists in the registry —
+    // at the SAME repository the registry records, just a DIFFERENT `ref`
+    // (an older tag). No competing named claim exists anywhere else in the
+    // graph. Under validate-against-registry, this is ACCEPTED (not
+    // redirected): `foo` resolves from the transitive's OWN pinned ref,
+    // genuinely fetched — this supersedes the prior membership-based design,
+    // under which this exact shape was silently redirected to the
+    // registry's version instead.
+    let t1_url = "https://example.com/t1agree.git";
+    let foo_registry_url = "https://registry.example.com/fooagree.git";
+    let foo_older_body = "# older-tag\n";
+    let foo_registry_body = "# registry\n";
+
+    let reg = FakeReg::git(&[
+        (t1_url, "main", nimble("t1agree", &format!("requires \"{foo_registry_url}#v0.9.0\"\n"))),
+        (foo_registry_url, "v0.9.0", nimble("fooagree", foo_older_body)),
+        (foo_registry_url, "v1.0.0", nimble("fooagree", foo_registry_body)),
+    ]);
+    let index = lattice_index("fooagree", foo_registry_url, "v1.0.0", foo_registry_body);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("t1agree", t1_url, "main")]);
+    let graph = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap();
+
+    let foo = graph.deps.iter().find(|d| d.name == "fooagree").expect("fooagree in graph");
+    // Accepted AS ITSELF: resolves from the transitive's own pinned ref/tag,
+    // NOT redirected to the registry's version.
+    assert_eq!(foo.version, v(0, 9, 0));
+    match foo.provenances.first().expect("provenance") {
+        ProvenanceRecord::Git { url, ref_spec, .. } => {
+            assert_eq!(url, foo_registry_url);
+            assert_eq!(ref_spec.as_deref(), Some("v0.9.0"));
+        }
+        other => panic!("expected git provenance, got {other:?}"),
+    }
+    // Genuinely fetched (accepted claims are ordinary tier-3 url deps).
+    assert!(
+        reg.calls().iter().any(|c| c.1 == foo_registry_url && c.2 == "v0.9.0"),
+        "the agreeing pin must be genuinely fetched at its OWN ref"
+    );
+}
+
+#[test]
+fn resolve_lattice_lone_url_pin_of_registry_name_disagrees_conflicts() {
+    // §10.0 NORMATIVE, validate-against-registry: a transitive url-pins
+    // `foo` — a name that ALSO exists in the registry — at a DIFFERENT
+    // repository than the registry records, with NO competing claim
+    // anywhere else in the graph. This is the headline behavioral change
+    // from the pure disagreement-only design: a LONE transitive claim can
+    // conflict with a KNOWN registry name, with no second claim needed to
+    // arbitrate against.
+    let t1_url = "https://example.com/t1lone.git";
+    let foo_pin_url = "https://pin.example.com/foolone.git";
+    let foo_registry_url = "https://registry.example.com/foolone.git";
+    let foo_registry_body = "# registry\n";
+
+    let reg = FakeReg::git(&[
+        (t1_url, "main", nimble("t1lone", &format!("requires \"{foo_pin_url}#main\"\n"))),
+        (foo_pin_url, "main", nimble("foolone", "# url-pin\n")),
+        (foo_registry_url, "v1.0.0", nimble("foolone", foo_registry_body)),
+    ]);
+    let index = lattice_index("foolone", foo_registry_url, "v1.0.0", foo_registry_body);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("t1lone", t1_url, "main")]);
+    let err = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert!(format!("{err:?}").contains("foolone"));
+
+    assert!(
+        reg.calls().iter().all(|c| c.1 != foo_pin_url),
+        "the disagreeing lone pin must never be fetched"
+    );
+}
+
+#[test]
+fn resolve_lattice_two_agreeing_url_pins_of_same_registry_name_coexist() {
+    // Two DIFFERENT transitives each pin `foo` — a registry-known name — at
+    // the registry's OWN repository, but at two DIFFERENT refs. Both AGREE
+    // with the registry (same repo), so BOTH are accepted: they coexist as
+    // independent candidates, never conflicting with EACH OTHER (agreement
+    // is validated per-claim against the static registry record, never
+    // between claims). Ordinary solver version-negotiation (maxver) then
+    // picks the higher version. Rust's BFS is synchronous (no thread pool),
+    // so the two sequential fetches to `_deps/foocoexist` (re-linked from
+    // the CAS on each fetch) never race — unlike Python's concurrent wave
+    // dispatch, which needs an explicit dest-disambiguation escape hatch.
+    let t1_url = "https://example.com/t1coexist.git";
+    let t2_url = "https://example.com/t2coexist.git";
+    let foo_registry_url = "https://registry.example.com/foocoexist.git";
+    let foo_v2_body = "# v2\n";
+    let foo_v3_body = "# v3\n";
+    let foo_registry_body = "# registry\n";
+
+    let reg = FakeReg::git(&[
+        (t1_url, "main", nimble("t1coexist", &format!("requires \"{foo_registry_url}#v2.0.0\"\n"))),
+        (t2_url, "main", nimble("t2coexist", &format!("requires \"{foo_registry_url}#v3.0.0\"\n"))),
+        (foo_registry_url, "v1.0.0", nimble("foocoexist", foo_registry_body)),
+        (foo_registry_url, "v2.0.0", nimble("foocoexist", foo_v2_body)),
+        (foo_registry_url, "v3.0.0", nimble("foocoexist", foo_v3_body)),
+    ]);
+    let index = lattice_index("foocoexist", foo_registry_url, "v1.0.0", foo_registry_body);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![
+        url_dep("t1coexist", t1_url, "main"),
+        url_dep("t2coexist", t2_url, "main"),
+    ]);
+    let graph = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap();
+
+    let foo = graph.deps.iter().find(|d| d.name == "foocoexist").expect("foocoexist in graph");
+    assert_eq!(foo.version, v(3, 0, 0), "maxver picks the higher of the two coexisting pins");
+    match foo.provenances.first().expect("provenance") {
+        ProvenanceRecord::Git { url, ref_spec, .. } => {
+            assert_eq!(url, foo_registry_url);
+            assert_eq!(ref_spec.as_deref(), Some("v3.0.0"));
+        }
+        other => panic!("expected git provenance, got {other:?}"),
+    }
+    // Both agreeing pins were genuinely fetched (peacefully coexisting
+    // candidates) — neither was blocked by the other.
+    assert!(reg.calls().iter().any(|c| c.1 == foo_registry_url && c.2 == "v2.0.0"));
+    assert!(reg.calls().iter().any(|c| c.1 == foo_registry_url && c.2 == "v3.0.0"));
+}
+
+#[test]
+fn resolve_lattice_lone_url_pin_of_non_registry_name_stands() {
+    // A transitive url-pins a name that is NOT in the registry index at all
+    // (the index exists and is non-trivial, but has no entry for `bar`) —
+    // there is nothing to validate against, so this is the plain tier-3 case
+    // (§10.3's second rule). The url pin stands, exactly as before.
+    let t1_url = "https://example.com/t1bar.git";
+    let bar_pin_url = "https://pin.example.com/bar.git";
+    let unrelated_url = "https://registry.example.com/unrelated.git";
+    let unrelated_body = "# unrelated\n";
+
+    let reg = FakeReg::git(&[
+        (t1_url, "main", nimble("t1bar", &format!("requires \"{bar_pin_url}#main\"\n"))),
+        (bar_pin_url, "main", nimble("bar", "# bar-pin\n")),
+        (unrelated_url, "v1.0.0", nimble("unrelated", unrelated_body)),
+    ]);
+    let index = lattice_index("unrelated", unrelated_url, "v1.0.0", unrelated_body);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("t1bar", t1_url, "main")]);
+    let graph = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap();
+
+    let bar = graph.deps.iter().find(|d| d.name == "bar").expect("bar in graph");
+    match bar.provenances.first().expect("provenance") {
+        ProvenanceRecord::Git { url, .. } => assert_eq!(url, bar_pin_url),
+        other => panic!("expected git provenance, got {other:?}"),
+    }
+}
+
+// --- direct unit tests: `normalize_git_source_url` / -----------------------
+// --- `validate_transitive_url_against_registry` -----------------------------
+
+#[test]
+fn normalize_git_source_url_trailing_git_suffix_stripped() {
+    assert_eq!(
+        super::normalize_git_source_url("https://example.com/foo.git"),
+        super::normalize_git_source_url("https://example.com/foo"),
+    );
+}
+
+#[test]
+fn normalize_git_source_url_trailing_slash_stripped() {
+    assert_eq!(
+        super::normalize_git_source_url("https://example.com/foo/"),
+        super::normalize_git_source_url("https://example.com/foo"),
+    );
+}
+
+#[test]
+fn normalize_git_source_url_scheme_and_host_case_insensitive() {
+    assert_eq!(
+        super::normalize_git_source_url("HTTPS://Example.COM/foo.git"),
+        super::normalize_git_source_url("https://example.com/foo.git"),
+    );
+}
+
+#[test]
+fn normalize_git_source_url_path_case_preserved() {
+    // Path casing is NOT normalized — many git hosts are path-case-sensitive.
+    assert_ne!(
+        super::normalize_git_source_url("https://example.com/Foo.git"),
+        super::normalize_git_source_url("https://example.com/foo.git"),
+    );
+}
+
+#[test]
+fn normalize_git_source_url_different_hosts_differ() {
+    assert_ne!(
+        super::normalize_git_source_url("https://a.example.com/foo.git"),
+        super::normalize_git_source_url("https://b.example.com/foo.git"),
+    );
+}
+
+/// Build a minimal single-version `Package` carrying one git provenance, for
+/// the `validate_transitive_url_against_registry` unit tests below.
+fn pkg_with_git(name: &str, url: &str, refp: &str) -> Package {
+    Package {
+        name: name.to_string(),
+        namespace: String::new(),
+        versions: vec![IndexVersion {
+            version: "1.0.0".into(),
+            content_hash: format!("sha256:{}", "0".repeat(64)),
+            provenances: vec![Provenance::Git {
+                url: url.to_string(),
+                ref_spec: refp.to_string(),
+                commit_sha: None,
+            }],
+            dep_decl: None,
+            dep_decl_schema_version: None,
+            attestation: None,
+            namespace: String::new(),
+            published_at: None,
+            yanked: false,
+            yanked_at: None,
+            yanked_reason: None,
+            published_at_raw: None,
+        }],
+    }
+}
+
+#[test]
+fn validate_transitive_url_agrees_same_url_same_ref() {
+    let pkg = pkg_with_git("foo", "https://registry.example.com/foo.git", "v1.0.0");
+    super::validate_transitive_url_against_registry(
+        "foo", "https://registry.example.com/foo.git", &pkg,
+    )
+    .expect("agreement must not error");
+}
+
+#[test]
+fn validate_transitive_url_agrees_same_repo_different_ref() {
+    // Different ref, same repo: still an agreement (ref only selects a version).
+    let pkg = pkg_with_git("foo", "https://registry.example.com/foo.git", "v1.0.0");
+    super::validate_transitive_url_against_registry(
+        "foo", "https://registry.example.com/foo.git", &pkg,
+    )
+    .expect("differing ref must still agree");
+}
+
+#[test]
+fn validate_transitive_url_agrees_matches_an_older_versions_provenance() {
+    // The claim matches version 1.0.0's recorded source, not the newest
+    // (2.0.0's) — agreement checks EVERY version's provenance, not just the
+    // latest.
+    let pkg = Package {
+        name: "foo".to_string(),
+        namespace: String::new(),
+        versions: vec![
+            IndexVersion {
+                version: "2.0.0".into(),
+                content_hash: format!("sha256:{}", "0".repeat(64)),
+                provenances: vec![Provenance::Git {
+                    url: "https://registry.example.com/foo-v2.git".to_string(),
+                    ref_spec: "v2.0.0".to_string(),
+                    commit_sha: None,
+                }],
+                dep_decl: None,
+                dep_decl_schema_version: None,
+                attestation: None,
+                namespace: String::new(),
+                published_at: None,
+                yanked: false,
+                yanked_at: None,
+                yanked_reason: None,
+                published_at_raw: None,
+            },
+            IndexVersion {
+                version: "1.0.0".into(),
+                content_hash: format!("sha256:{}", "0".repeat(64)),
+                provenances: vec![Provenance::Git {
+                    url: "https://registry.example.com/foo.git".to_string(),
+                    ref_spec: "v1.0.0".to_string(),
+                    commit_sha: None,
+                }],
+                dep_decl: None,
+                dep_decl_schema_version: None,
+                attestation: None,
+                namespace: String::new(),
+                published_at: None,
+                yanked: false,
+                yanked_at: None,
+                yanked_reason: None,
+                published_at_raw: None,
+            },
+        ],
+    };
+    super::validate_transitive_url_against_registry(
+        "foo", "https://registry.example.com/foo.git", &pkg,
+    )
+    .expect("must match the older version's recorded source");
+}
+
+#[test]
+fn validate_transitive_url_agrees_normalized_git_suffix_and_case() {
+    let pkg = pkg_with_git("foo", "https://Registry.example.com/foo.git", "v1.0.0");
+    // No ".git" suffix on the claim, different host casing: still agrees.
+    super::validate_transitive_url_against_registry(
+        "foo", "https://registry.example.com/foo", &pkg,
+    )
+    .expect("normalized comparison must agree");
+}
+
+#[test]
+fn validate_transitive_url_disagrees_different_repository() {
+    let pkg = pkg_with_git("foo", "https://registry.example.com/foo.git", "v1.0.0");
+    let err = super::validate_transitive_url_against_registry(
+        "foo", "https://pin.example.com/foo.git", &pkg,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert!(format!("{err:?}").contains("foo"));
+}
+
+#[test]
+fn validate_transitive_url_disagrees_incomparable_oci_only_entry() {
+    // The registry entry is OCI-only — a git= claim can never be compared to
+    // it, so it is treated as a disagreement (conservative).
+    let pkg = Package {
+        name: "foo".to_string(),
+        namespace: String::new(),
+        versions: vec![IndexVersion {
+            version: "1.0.0".into(),
+            content_hash: format!("sha256:{}", "a".repeat(64)),
+            provenances: vec![Provenance::Oci {
+                registry: "ghcr.io".to_string(),
+                repository: "example/foo".to_string(),
+                digest: format!("sha256:{}", "b".repeat(64)),
+            }],
+            dep_decl: None,
+            dep_decl_schema_version: None,
+            attestation: None,
+            namespace: String::new(),
+            published_at: None,
+            yanked: false,
+            yanked_at: None,
+            yanked_reason: None,
+            published_at_raw: None,
+        }],
+    };
+    let err = super::validate_transitive_url_against_registry(
+        "foo", "https://example.com/foo.git", &pkg,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+}
+
+#[test]
+fn validate_transitive_url_disagrees_no_provenance_at_all() {
+    // A package version with no provenance recorded whatsoever — also
+    // incomparable, also a disagreement.
+    let pkg = Package {
+        name: "foo".to_string(),
+        namespace: String::new(),
+        versions: vec![IndexVersion {
+            version: "1.0.0".into(),
+            content_hash: String::new(),
+            provenances: vec![],
+            dep_decl: None,
+            dep_decl_schema_version: None,
+            attestation: None,
+            namespace: String::new(),
+            published_at: None,
+            yanked: false,
+            yanked_at: None,
+            yanked_reason: None,
+            published_at_raw: None,
+        }],
+    };
+    let err = super::validate_transitive_url_against_registry(
+        "foo", "https://example.com/foo.git", &pkg,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+}
+
+// --- direct gate-unit tests: `ResolveProvider::gate`'s tier decision table -
+
+/// A minimal `ResolveProvider` for direct `gate()` unit tests — no
+/// fetch/solve involved. Mirrors `is_root_direct_namespace_aware_direct_unit_coverage`'s
+/// construction pattern above.
+fn gate_provider<'a>(reg: &'a FakeReg, idx: &'a Index, tmp: &tempfile::TempDir) -> super::ResolveProvider<'a> {
+    super::ResolveProvider::new(
+        reg, idx, deps_dir(tmp), BTreeMap::new(), None, None, false, Strategy::Maxver, false, None,
+    )
+}
+
+fn url_item(name: &str, git: &str, refp: &str) -> super::Item {
+    super::Item::Url(UrlDep {
+        name: name.to_string(),
+        git: git.to_string(),
+        git_ref: refp.to_string(),
+        mirrors: Vec::new(),
+        predicates: Vec::new(),
+        flag_requests: Vec::new(),
+        optional: false,
+        version: None,
+    })
+}
+
+fn named_item(name: &str) -> super::Item {
+    super::Item::Named {
+        name: name.to_string(),
+        constraint: milpa_solver::VersionSet::full(),
+        namespace: None,
+    }
+}
+
+#[test]
+fn gate_first_claim_registers_and_proceeds() {
+    let empty_index = Index { packages: vec![] };
+    let empty_reg = FakeReg::git(&[]);
+    let tmp = tempfile::tempdir().unwrap();
+    let p = gate_provider(&empty_reg, &empty_index, &tmp);
+
+    assert!(matches!(p.gate(&url_item("foo", "u1", "main")), super::Gate::Proceed));
+    assert_eq!(
+        p.seen_by_name.borrow().get("foo"),
+        Some(&(super::PKey::Url("u1".into(), "main".into()), super::TIER_SELF_URL)),
+    );
+}
+
+#[test]
+fn gate_same_pkey_dedups() {
+    // Unlike Python's `_check_provenance_gate` (which fuses transport-level
+    // dedup into the gate and returns False/suppress for a repeat same-pkey
+    // claim), Rust's `gate()` returns Proceed for a same-pkey repeat and
+    // relies on the SEPARATE transport-level `seen_url`/`seen_named`/
+    // `seen_local`/`seen_tarball` sets (plus, for URL deps, the S4b
+    // multi-consumer flag-request-union logic in `process_url`) to avoid a
+    // real re-fetch. This is a pre-existing, unchanged architectural split —
+    // #193 only generalizes the TIER the gate arbitrates on, never this
+    // same-pkey branch. "Dedup" here means: the claim does not conflict or
+    // get suppressed by tier — the ACTUAL fetch-once guarantee lives one
+    // layer down, at dispatch.
+    let empty_index = Index { packages: vec![] };
+    let empty_reg = FakeReg::git(&[]);
+    let tmp = tempfile::tempdir().unwrap();
+    let p = gate_provider(&empty_reg, &empty_index, &tmp);
+
+    p.gate(&url_item("foo", "u1", "main"));
+    assert!(matches!(p.gate(&url_item("foo", "u1", "main")), super::Gate::Proceed));
+}
+
+#[test]
+fn gate_named_claims_always_dedup_same_sentinel() {
+    // Two `Named` claims for the same bare name always carry the same
+    // `PKey::Named(DepKey { name, namespace: None })` — the gate always takes
+    // the same-pkey branch (Proceed; see `gate_same_pkey_dedups`'s doc
+    // comment on why that's Proceed, not Suppress, in Rust's design), never
+    // the tier-compare/Conflict branch, regardless of which transitive
+    // introduces the claim or what constraint each carries (constraints
+    // aren't provenance). The real enumerate-once dedup for `Named` claims is
+    // `seen_named` (a `BTreeSet<DepKey>`) in `process_named`.
+    let empty_index = Index { packages: vec![] };
+    let empty_reg = FakeReg::git(&[]);
+    let tmp = tempfile::tempdir().unwrap();
+    let p = gate_provider(&empty_reg, &empty_index, &tmp);
+
+    p.gate(&named_item("foo"));
+    assert!(matches!(p.gate(&named_item("foo")), super::Gate::Proceed));
+}
+
+#[test]
+fn gate_root_wins_over_tier3_url() {
+    let empty_index = Index { packages: vec![] };
+    let empty_reg = FakeReg::git(&[]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut p = gate_provider(&empty_reg, &empty_index, &tmp);
+    p.root_authority = std::collections::BTreeSet::from(["foo".to_string()]);
+    // Mirrors what `seed_root` would have already written before any BFS item
+    // is ever gated: the root's own claim, recorded at TIER_ROOT.
+    p.seen_by_name.borrow_mut().insert(
+        "foo".to_string(),
+        (super::PKey::Url("root-u".into(), "main".into()), super::TIER_ROOT),
+    );
+
+    assert!(matches!(p.gate(&url_item("foo", "evil-u", "main")), super::Gate::Suppress));
+    assert_eq!(
+        p.seen_by_name.borrow().get("foo"),
+        Some(&(super::PKey::Url("root-u".into(), "main".into()), super::TIER_ROOT)),
+        "root's own entry must be untouched",
+    );
+}
+
+#[test]
+fn gate_root_wins_over_tier2_named() {
+    let empty_index = Index { packages: vec![] };
+    let empty_reg = FakeReg::git(&[]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut p = gate_provider(&empty_reg, &empty_index, &tmp);
+    p.root_authority = std::collections::BTreeSet::from(["foo".to_string()]);
+    p.seen_by_name.borrow_mut().insert(
+        "foo".to_string(),
+        (super::PKey::Url("root-u".into(), "main".into()), super::TIER_ROOT),
+    );
+
+    assert!(matches!(p.gate(&named_item("foo")), super::Gate::Suppress));
+    assert_eq!(
+        p.seen_by_name.borrow().get("foo"),
+        Some(&(super::PKey::Url("root-u".into(), "main".into()), super::TIER_ROOT)),
+    );
+}
+
+#[test]
+fn gate_tier2_beats_tier3_arriving_after() {
+    // Tier-3 registers first; a differently-keyed tier-2 claim arrives
+    // second — it wins (overwrites the gate entry), Proceed.
+    use milpa_types::DepKey;
+
+    let empty_index = Index { packages: vec![] };
+    let empty_reg = FakeReg::git(&[]);
+    let tmp = tempfile::tempdir().unwrap();
+    let p = gate_provider(&empty_reg, &empty_index, &tmp);
+
+    p.gate(&url_item("foo", "u1", "main"));
+    assert!(matches!(p.gate(&named_item("foo")), super::Gate::Proceed));
+    assert_eq!(
+        p.seen_by_name.borrow().get("foo"),
+        Some(&(super::PKey::Named(DepKey::bare("foo")), super::TIER_REGISTRY)),
+    );
+}
+
+#[test]
+fn gate_tier3_suppressed_when_arriving_after_tier2() {
+    // Tier-2 registers first; a tier-3 claim arrives second — suppressed
+    // BEFORE any fetch would be dispatched.
+    use milpa_types::DepKey;
+
+    let empty_index = Index { packages: vec![] };
+    let empty_reg = FakeReg::git(&[]);
+    let tmp = tempfile::tempdir().unwrap();
+    let p = gate_provider(&empty_reg, &empty_index, &tmp);
+
+    p.gate(&named_item("foo"));
+    assert!(matches!(p.gate(&url_item("foo", "u1", "main")), super::Gate::Suppress));
+    assert_eq!(
+        p.seen_by_name.borrow().get("foo"),
+        Some(&(super::PKey::Named(DepKey::bare("foo")), super::TIER_REGISTRY)),
+        "the registry entry stays authoritative",
+    );
+}
+
+#[test]
+fn gate_tier3_vs_tier3_conflicts_when_no_tier2() {
+    let empty_index = Index { packages: vec![] };
+    let empty_reg = FakeReg::git(&[]);
+    let tmp = tempfile::tempdir().unwrap();
+    let p = gate_provider(&empty_reg, &empty_index, &tmp);
+
+    p.gate(&url_item("foo", "u1", "main"));
+    assert!(matches!(p.gate(&url_item("foo", "u2", "main")), super::Gate::Conflict(_, _)));
+}
+
+#[test]
+fn gate_tier3_vs_tier3_no_conflict_once_tier2_on_record() {
+    // Once a tier-2 claim is recorded for a name, a differing tier-3 claim is
+    // just suppressed (registry already won) — the tier-3-vs-tier-3 conflict
+    // branch is never reached, even for a SECOND differently-keyed tier-3
+    // claim.
+    let empty_index = Index { packages: vec![] };
+    let empty_reg = FakeReg::git(&[]);
+    let tmp = tempfile::tempdir().unwrap();
+    let p = gate_provider(&empty_reg, &empty_index, &tmp);
+
+    p.gate(&named_item("foo"));
+    p.gate(&url_item("foo", "u1", "main"));
+    assert!(matches!(p.gate(&url_item("foo", "u2", "main")), super::Gate::Suppress));
+}

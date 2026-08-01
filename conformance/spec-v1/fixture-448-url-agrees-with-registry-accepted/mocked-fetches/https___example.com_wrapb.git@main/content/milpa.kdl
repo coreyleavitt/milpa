@@ -1,0 +1,5 @@
+name "wrapb"
+kind "library"
+deps {
+    wrapb2 git=(url)"https://example.com/wrapb2.git" ref="main"
+}

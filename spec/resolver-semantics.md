@@ -1063,7 +1063,84 @@ dev-dep `d` appear).
 This section defines which provenance (source) wins when multiple parts of
 the dependency graph declare conflicting sources for the same package name.
 
-### 10.1  Root authority
+### 10.0  Authority tiers (the provenance lattice)
+
+Not all provenance claims are equally trustworthy. A `git=`/`local=`/`tarball=`
+dep is a **self-declared, unauthenticated source assertion** — any package in
+the transitive graph can assert "name X lives at this source," which is the
+dependency-confusion / provenance-hijack vector. A **named** (index/registry)
+dep is not a source assertion at all — it is a *deference to the tianguis
+registry*, milpa's root of trust for names. These are not peer claims; milpa
+ranks them.
+
+> NORMATIVE: Every provenance claim for a package name belongs to exactly one
+> **authority tier**:
+>
+> | Tier | Source | Trust |
+> |---|---|---|
+> | 1 (highest) | **Root** — a name in the root authority set (§10.1): root/member `deps`, `dev-deps`, `overrides {}` | the project owner |
+> | 2 | **Registry** — a `named` (index-resolved) claim | the attested registry |
+> | 3 (lowest) | **Self-declared URL** — a transitive `git=` / `local=` / `tarball=` claim | none |
+>
+> The precedence rule is a total order on tiers: **a higher tier owns a name
+> against any lower-tier claim, deterministically and without error.** A
+> `RES-PROVENANCE-CONFLICT` is raised only for a disagreement *within the same
+> untrusted tier* — two tier-3 claims with different provenance keys for a name
+> that is neither root-declared (tier 1) nor present in the registry index
+> (tier 2). Two claims with the *same* provenance key are duplicates (dedup).
+
+> NORMATIVE: **A name's authority tier is a property of the name, decided from
+> static, order-independent facts — not from which claims happen to collide.**
+> Root (tier 1) is an *explicit* per-build authority; the registry (tier 2) is
+> a *trusted default*, not an explicit per-build choice. A resolver MUST NOT
+> silently resolve a genuine source disagreement over a non-root name — it
+> either accepts an *agreeing* claim or escalates to the root.
+
+> NORMATIVE: **Registry validation (tier 2).** For a non-root name that exists
+> in the registry index, a transitive self-declared claim (`git=`/`tarball=`)
+> for that name MUST be validated against the registry's recorded source for
+> the name:
+> - **Agrees** (the self-declared source is the registry's own source for the
+>   name — same git repository; a specific `ref` of that repository is still an
+>   agreement, the ref only selects a version): the claim is ACCEPTED and
+>   resolves normally. This is the benign common case — a transitive pinning a
+>   specific commit of the registry's own package.
+> - **Disagrees** (a *different* source — a fork or a substitution; or a source
+>   whose transport cannot be compared to the registry record, e.g. a `git=`
+>   claim against an OCI-only registry entry): the resolver MUST raise
+>   `RES-PROVENANCE-CONFLICT`. It MUST NOT silently redirect the name to the
+>   registry (that would override a library's deliberate fork), and MUST NOT
+>   silently honor the transitive's source (that would let a transitive
+>   substitute a registry name's source). The remedy is to declare the name in
+>   the root manifest (tier 1), where the project owner arbitrates.
+>
+> This decision is made at claim-discovery time from the static, pre-loaded
+> index record, so it is order-independent and never commits a candidate that
+> a later (even mid-solve) claim would have to retract. A transitive claim for
+> a name that is NOT root-declared and NOT in the registry index is a plain
+> tier-3 claim (§10.3).
+
+> NORMATIVE: This is §10.2's principle — *only the root may redirect a dep's
+> source* — made precise for named packages. A transitive that self-declares a
+> source **agreeing** with the registry has not redirected anything (it named
+> the same source), so it is accepted. A transitive that self-declares a source
+> **disagreeing** with the registry is attempting a redirection it has no
+> authority to make; rather than silently pick either the registry or the
+> transitive's source, the resolver escalates to the only authority that may
+> redirect a source — the root — via `RES-PROVENANCE-CONFLICT`. Root authority
+> (tier 1) is the sole silent override, because it is an explicit human choice,
+> not a guess.
+
+> NORMATIVE: The lattice is orthogonal to the **attestation policy** (§
+> `attestation-policy`, `RES-UNATTESTED-METADATA`). The lattice decides *which
+> tier owns* a name; the attestation policy independently decides *how much to
+> trust* a registry (tier-2) resolution. A conformant implementation MUST NOT
+> fold attestation strength into the tier comparison: a registry-known name is
+> tier-2-owned regardless of whether its entry is attested, and the attestation
+> policy then governs (warn vs `RES-UNATTESTED-METADATA`) exactly as it would
+> for any registry resolution.
+
+### 10.1  Root authority (tier 1)
 
 > NORMATIVE: The **root authority set** is the set of all package names
 > declared in the root manifest's `deps`, `dev-deps`, and `overrides {}`
@@ -1105,40 +1182,36 @@ project owner controls which sources are authoritative.
 
 ### 10.3  Non-root provenance disagreement
 
-When a package name is not in the root authority set but two transitive
-deps declare different provenances for it, the resolver must handle the
-ambiguity explicitly.
+When a package name is not in the root authority set (tier 1), the resolver
+assigns its tier from §10.0 — registry-owned (tier 2) if the name is in the
+registry index, else tier 3 — and arbitrates accordingly.
 
-> NORMATIVE: If two transitive **URL** deps (i.e. both claims are
-> git-transport provenances — the same-transport case) declare different
-> provenances for the same package name and the root manifest has no
-> authority over that name, the resolver MUST raise
-> `RES-PROVENANCE-CONFLICT`.  It MUST NOT silently pick one provenance
-> over the other.
+> NORMATIVE: If a non-root name is present in the registry index (tier 2), a
+> transitive self-declared claim (`git=`/`tarball=`) for that name is validated
+> against the registry's recorded source (§10.0): a claim that AGREES (the
+> registry's own source repository) is accepted and resolves normally; a claim
+> that DISAGREES (a different source, or an incomparable transport) MUST raise
+> `RES-PROVENANCE-CONFLICT` — the resolver MUST NOT silently redirect the name
+> to the registry, and MUST NOT silently honor the transitive's source. The
+> remedy is to declare the name in the root manifest (tier 1). This holds
+> regardless of BFS discovery order (the registry record is a static,
+> pre-loaded fact).
 
-> NORMATIVE: If two transitive deps declare the **same** provenance
-> (same transport kind, same URL/path, same ref) for the same package
-> name, they are treated as duplicates — the second occurrence is
-> suppressed and resolution proceeds normally.
+> NORMATIVE: If a non-root name is NOT in the registry index and receives two
+> tier-3 claims (self-declared `git=`/`tarball=`) with different provenance
+> keys, the resolver MUST raise `RES-PROVENANCE-CONFLICT`. It MUST NOT silently
+> pick one tier-3 provenance over the other.
 
-> NOTE: For URL deps, "same provenance" means the same `(git_url, ref)`
-> pair.  Content-hash dedup (§3, Phase B) provides an additional
-> unification layer for packages from different URLs that happen to
-> produce the same content hash.  The provenance gate fires first (on
-> the URL+ref key); content-hash dedup fires after fetch.
+> NORMATIVE: If two claims declare the **same** provenance key (same transport
+> kind, same URL/path, same ref; or two named claims resolving to the same
+> registry entry) for the same package name, they are duplicates — the second
+> occurrence is suppressed and resolution proceeds normally.
 
-> NOTE: **Cross-kind (named-vs-URL) divergence.**  The guarantee above is
-> scoped to two disagreeing URL-transport claims.  When a non-root-
-> authoritative name receives one **named** (index-resolved) claim and one
-> **URL** claim, whether the provenance gate evaluates the pair at all is
-> currently **implementation-divergent**: the Python reference
-> implementation's provenance gate (`_check_provenance_gate`) is invoked
-> only from the URL-item BFS path, so a named claim never enters the gate
-> and the conflict is not detected there; the Rust reference
-> implementation's gate is generic over `Item` (including `Item::Named`)
-> and does detect and raise on the pair. Reconciling this divergence is
-> tracked as issue #193 and is deliberately out of scope for this
-> section — this NOTE records current behavior, not a target.
+> NOTE: For URL deps, "same provenance key" means the same `(git_url, ref)`
+> pair.  Content-hash dedup (§3, Phase B) provides an additional unification
+> layer for packages from different URLs that happen to produce the same
+> content hash.  The provenance lattice fires first (pre-fetch, on the tier +
+> provenance key); content-hash dedup fires after fetch.
 
 ### 10.4  Orthogonality with dev-deps
 
@@ -1159,19 +1232,24 @@ block syntax.  `spec/errors.md` for `RES-PROVENANCE-CONFLICT`.
 
 ### 10.5  Provenance-gate precedence over version conflicts (Axis A interaction)
 
-> NORMATIVE: For the same-transport case scoped by §10.3 (two disagreeing
-> URL-transport claims), the provenance gate (§10.1–§10.3) MUST be
-> evaluated, and any `RES-PROVENANCE-CONFLICT` it produces MUST be raised,
-> **before** the solver reaches a version-level decision for the contested
-> package name. Concretely: a conformant resolver MUST suppress a
-> non-root-authoritative transitive provenance claim (or raise
-> `RES-PROVENANCE-CONFLICT` for two disagreeing non-root URL claims) at
-> the point the second provenance is discovered — before that provenance
-> is ever fetched, and therefore before any declared version (§3.2) it
-> might carry could enter the solver's accumulated constraint set for
-> that package name. Per §10.3's NOTE, this ordering guarantee does not
-> currently extend jointly across both reference implementations to the
-> cross-kind (named-vs-URL) case — see #193.
+> NORMATIVE: A name's authority (§10.0) MUST be resolved at **claim-discovery
+> time** from static facts — the root authority set (tier 1, known at parse
+> time) and the registry index record (tier 2, known once the index is loaded)
+> — not from which claims later collide. Concretely: when a transitive
+> self-declared claim (`git=`/`tarball=`) is discovered for a name that is
+> root-declared or present in the registry index, the resolver MUST resolve its
+> disposition **at that point** — suppress it (root name), accept it (registry
+> name, source agrees), or raise `RES-PROVENANCE-CONFLICT` (registry name,
+> source disagrees) — before a disagreeing provenance is ever fetched, and
+> therefore before any declared version (§3.2) it might carry could enter the
+> solver's accumulated constraint set. Because this disposition is a static
+> function of the name and the registry record (not of claim collisions), it is
+> order-independent and never requires retracting an already-committed solver
+> candidate. This is what makes the rule robust to a tier-2 (registry) claim
+> that is only discovered later — e.g. mid-solve, as a transitive of another
+> named dep: any conflicting tier-3 claim for that name was already dispositioned
+> (accepted-if-agreeing or conflicted-if-disagreeing) at its own discovery, so no
+> stale, unvalidated tier-3 candidate can survive to be reconciled.
 
 > NORMATIVE: This ordering is load-bearing now that declared versions are
 > real (§3, Axis A): two disagreeing sources could each declare a

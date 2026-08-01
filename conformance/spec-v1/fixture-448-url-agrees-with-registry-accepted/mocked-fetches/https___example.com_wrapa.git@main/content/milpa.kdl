@@ -1,0 +1,5 @@
+name "wrapa"
+kind "library"
+deps {
+    foo git=(url)"https://registry.example.com/foo.git" ref="v9.9.9"
+}

@@ -1,0 +1,4 @@
+foo -> <CAS_ROOT>/dag-sha256/63de8e4297b8833e28dd4344c3fc3e6616689fd010659715cba8ecdf87ec67c1/
+wrapa -> <CAS_ROOT>/dag-sha256/728f303dc54ae945b1508e29d6d9306c8c059ced99994aa327cdd4237c1e7c15/
+wrapb -> <CAS_ROOT>/dag-sha256/b5ff248ee3113354e56cdc5f0d81971d504c7ad9f1e9833e053cb3408c72922a/
+wrapb2 -> <CAS_ROOT>/dag-sha256/d9cbfc318a81cfc291dae1cb9b701d3debe40c0e06868c1e6fbbdc2458a3d0f7/

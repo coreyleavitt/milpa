@@ -268,11 +268,47 @@ package "asyncdispatch" {{
         assert by_name == {"chronos": ">=0.2.8", "asyncdispatch": "<=0.9.0"}
 
 
-class TestVersionUnknownConstrainedTransitive:
-    """bearssl is introduced only by a transitive package's OWN milpa.kdl —
-    no root declaration, no override — → remedy = root-level pin/overrides."""
+class TestRegistryValidationPreemptsTransitiveVersionUnknown:
+    """Historical note: this fixture used to be
+    ``TestVersionUnknownConstrainedTransitive`` and asserted
+    ``RES-VERSION-UNKNOWN-CONSTRAINED`` — ``bearssl`` was introduced ONLY by
+    a transitive package's (``wrapper``'s) OWN ``git=`` pin (no root
+    declaration, no override), stayed version-unknown (untagged ``ref``),
+    and ``chronos`` (a bare, registry-resolved ROOT dep) supplied a real
+    external constraint (``>= 0.2.8``) on it via its OWN ``.nimble``
+    ``requires`` line — discovered only when the solver materialises
+    ``chronos`` (mid-solve; a named dep's own manifest is read lazily, at
+    materialisation, never during the eager BFS). It was later renamed
+    ``TestRegistryRedirectClosesTransitiveVersionUnknown`` under the
+    (superseded) membership-based redesign, which silently REDIRECTED
+    wrapper's url pin to the registry (asserting a downstream
+    ``SOLVE-CONFLICT`` once ``bearssl`` resolved from the registry's
+    concrete ``0.1.0`` instead).
 
-    def test_purely_transitive_remedy_branch(self, tmp_path: Path) -> None:
+    Under validate-against-registry (resolver-semantics.md §10.0/§10.3, the
+    final design), redirect is gone: wrapper's transitive ``git=`` claim for
+    ``bearssl`` (``https://example.com/bearssl.git``) is validated against
+    the registry's recorded source for ``bearssl``
+    (``https://example.com/bearssl-index-only.git``) — a DIFFERENT
+    repository. This DISAGREES, so it raises ``RES-PROVENANCE-CONFLICT``
+    immediately, at wrapper's own claim-discovery time (eager BFS) — before
+    ``bearssl`` ever becomes a version-unknown candidate, before ``chronos``
+    is ever materialised (mid-solve), and before the solver ever runs. The
+    version-unknown-constrained machinery and the downstream
+    ``SOLVE-CONFLICT`` this test used to exercise are both entirely
+    preempted: the provenance lattice's validation (§10.5's claim-discovery-
+    time ordering) takes precedence over every later mechanism, including
+    the version-unknown-constrained special path this test file is
+    otherwise about. This is a second, independent proof (alongside
+    ``test_provenance_lattice.py``'s dedicated mid-solve-residual test) that
+    the validation is order-independent: it doesn't matter that the
+    competing tier-2 claim here (``chronos``'s own ``requires "bearssl"``)
+    is discovered strictly mid-solve, long after wrapper's claim was already
+    rejected."""
+
+    def test_disagreeing_transitive_pin_conflicts_before_version_unknown_ever_applies(
+        self, tmp_path: Path
+    ) -> None:
         mocked_dir = tmp_path / "mocked-fetches"
         mocked_dir.mkdir()
         _make_git_mock(
@@ -344,11 +380,18 @@ package "chronos" {{
             "}\n"
         )
         err = _resolve_and_expect_error(tmp_path, root_kdl, env)
-        assert err.slug == RES_VERSION_UNKNOWN_CONSTRAINED
-        assert "'bearssl'" in err.message
-        assert "root-level pin" in err.message
-        assert "overrides { bearssl" in err.message
-        assert "version= annotation" not in err.message
+        from milpa.errors import RES_PROVENANCE_CONFLICT
+        assert err.slug == RES_PROVENANCE_CONFLICT
+        assert "bearssl" in err.message
+
+        # Stronger than the slug/message check: wrapper's url pin for
+        # bearssl must genuinely NEVER have been fetched — validated and
+        # rejected at claim-discovery time, before dispatch, long before
+        # chronos (the mid-solve competing claim) is ever materialised.
+        bearssl_pin_hash = _content_hash_for(
+            mocked_dir, "https://example.com/bearssl.git", "main", "bearssl"
+        )
+        assert not env.store.contains(bearssl_pin_hash)
 
 
 class TestVersionUnknownUnconstrainedRegression:
