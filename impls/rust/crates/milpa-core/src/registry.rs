@@ -694,8 +694,17 @@ fn parse_version_node(
                 let registry = child_arg_str(child, "registry").unwrap_or_default();
                 let repository = child_arg_str(child, "repository").unwrap_or_default();
                 let digest = child_arg_str(child, "digest").unwrap_or_default();
+                // Optional `source` child (registry-protocol §3.3): the git
+                // repository this artifact was packed and published from.
+                // Accepts both plain-string and `(url)`-annotated form —
+                // `child_arg_str` already strips the annotation transparently
+                // (same helper `url`'s git-provenance parsing above uses).
+                let source_url = child_arg_str(child, "source");
                 validate_no_control_chars(&registry, "oci registry")?;
                 validate_no_control_chars(&repository, "oci repository")?;
+                if let Some(ref s) = source_url {
+                    validate_no_control_chars(s, "oci source")?;
+                }
                 validate_no_leading_dash(&registry, "oci registry", "TNG-UNSAFE-OCI-FIELD")?;
                 validate_no_leading_dash(&repository, "oci repository", "TNG-UNSAFE-OCI-FIELD")?;
                 validate_oci_digest(&digest)?;
@@ -703,6 +712,7 @@ fn parse_version_node(
                     registry,
                     repository,
                     digest,
+                    source_url,
                 });
             }
             // Unknown / missing kind: forward-compat skip.

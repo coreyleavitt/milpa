@@ -1192,7 +1192,8 @@ const TIER_SELF_URL: u8 = 3;
 // Registry-validation mechanism (resolver-semantics.md §10.0/§10.3 — the
 // validate-against-registry rework of the provenance lattice's tier-2 rule).
 // Mirrors Python's `_normalize_git_source_url` / `_registry_git_provenances` /
-// `_validate_transitive_url_against_registry` (resolver.py).
+// `_registry_oci_source_urls` / `_validate_transitive_url_against_registry`
+// (resolver.py).
 // ---------------------------------------------------------------------------
 
 /// Normalize *url* for git-source AGREEMENT comparison (§10.0).
@@ -1255,36 +1256,57 @@ fn registry_git_urls(pkg: &Package) -> Vec<String> {
     out
 }
 
+/// All non-empty OCI `source_url` values recorded for *pkg*, across EVERY
+/// version (same "every version, not just newest" convention as
+/// `registry_git_urls` — the originating git repo of an OCI-published
+/// package is ordinarily stable across versions). Mirrors Python's
+/// `_registry_oci_source_urls`.
+fn registry_oci_source_urls(pkg: &Package) -> Vec<String> {
+    let mut out = Vec::new();
+    for iv in &pkg.versions {
+        for prov in &iv.provenances {
+            if let Provenance::Oci { source_url: Some(u), .. } = prov {
+                if !u.is_empty() {
+                    out.push(u.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Validate a transitive's self-declared `git=` source for the registry-owned
 /// *name* against tianguis's recorded source for *pkg* (resolver-semantics.md
-/// §10.0/§10.3 NORMATIVE — "Registry validation").
+/// §10.0/§10.3 NORMATIVE — "Registry validation"), in preference order:
 ///
-/// AGREES (the transitive's git URL, normalized, matches a git source
-/// recorded for ANY version of *pkg*) → returns `Ok(None)` — the caller falls
-/// through and treats the claim as an accepted, ordinary tier-3 url dep. A
-/// differing `ref`/`commit_sha` is NOT a disagreement (the ref only selects a
-/// version of the same repo) — this function never compares those fields.
-///
-/// INCOMPARABLE TRANSPORT (*pkg* has no comparable git source recorded at
-/// all — an OCI-only registry entry, or no provenance recorded whatsoever)
-/// → the URL comparison above is impossible, so the decision is DEFERRED to
-/// content identity: if ≥1 of *pkg*'s versions records a non-empty
-/// `content_hash`, returns `Ok(Some(hashes))` — milpa's identity is
-/// transport-independent (spec/identity.md), so a package published to the
-/// registry as an OCI artifact FROM a git repo, and a transitive pinning
-/// that SAME repo by URL, are the same package under different transports.
-/// The caller MUST fetch the transitive's git source, compute its
-/// `content_hash`, and check membership in the returned set once the fetch
-/// completes — a match means AGREE (accept), a non-match means DISAGREE
-/// (`RES-PROVENANCE-CONFLICT`, raised by the caller post-fetch).
-///
-/// DISAGREES, with no further (post-fetch) check possible → returns
-/// `Err(RES-PROVENANCE-CONFLICT)` immediately:
-/// - a git source IS recorded for *pkg* and none matches `dep_git_url` (a
-///   different repository), or
-/// - *pkg* has no comparable git source AND no `content_hash` recorded for
-///   any version either — nothing exists to validate against, even
-///   deferred (legacy/empty entries).
+/// 1. A recorded git source (`Provenance::Git`) — AGREES (the transitive's
+///    git URL, normalized, matches a git source recorded for ANY version of
+///    *pkg*) → returns `Ok(None)` — the caller falls through and treats the
+///    claim as an accepted, ordinary tier-3 url dep. A differing `ref`/
+///    `commit_sha` is NOT a disagreement (the ref only selects a version of
+///    the same repo) — this function never compares those fields. DISAGREES
+///    (no git source matches `dep_git_url`) → `Err(RES-PROVENANCE-CONFLICT)`
+///    immediately.
+/// 2. Otherwise, an OCI entry's recorded `source_url` (the git repository
+///    the artifact was published FROM) — the SAME URL comparison as step 1,
+///    preferred over content-identity: AGREES (same repo, any ref/version)
+///    → `Ok(None)`; DISAGREES (a different repo) → `Err(RES-PROVENANCE-CONFLICT)`,
+///    resolved statically, pre-fetch, exactly like step 1's disagreement.
+/// 3. Only when NEITHER a git source NOR an OCI `source_url` is recorded
+///    (INCOMPARABLE TRANSPORT — e.g. an OCI-only entry predating the
+///    `source_url` field, or no provenance recorded whatsoever) does this
+///    fall back to CONTENT IDENTITY: if ≥1 of *pkg*'s versions records a
+///    non-empty `content_hash`, returns `Ok(Some(hashes))` — milpa's identity
+///    is transport-independent (spec/identity.md), so a package published to
+///    the registry as an OCI artifact FROM a git repo, and a transitive
+///    pinning that SAME repo by URL, are the same package under different
+///    transports. The caller MUST fetch the transitive's git source, compute
+///    its `content_hash`, and check membership in the returned set once the
+///    fetch completes — a match means AGREE (accept), a non-match means
+///    DISAGREE (`RES-PROVENANCE-CONFLICT`, raised by the caller post-fetch).
+///    No `content_hash` recorded for any version either → nothing exists to
+///    validate against, even deferred (legacy/empty entries) →
+///    `Err(RES-PROVENANCE-CONFLICT)` immediately.
 ///
 /// Never fetches anything itself — this is a cheap, static, pre-fetch
 /// check; a deferred (`Some`) result only names WHAT to check once the
@@ -1296,50 +1318,78 @@ fn validate_transitive_url_against_registry(
     pkg: &Package,
 ) -> Result<Option<Vec<String>>, MilpaError> {
     let registry_urls = registry_git_urls(pkg);
-    if registry_urls.is_empty() {
-        // Incomparable transport (OCI-only entry, or no provenance recorded
-        // at all): fall back to CONTENT IDENTITY, milpa's one transport-
-        // independent fact.
-        let mut content_hashes: Vec<String> = pkg
-            .versions
-            .iter()
-            .filter(|iv| !iv.content_hash.is_empty())
-            .map(|iv| iv.content_hash.clone())
-            .collect();
-        content_hashes.sort();
-        content_hashes.dedup();
-        if !content_hashes.is_empty() {
-            return Ok(Some(content_hashes));
+    if !registry_urls.is_empty() {
+        let claim_norm = normalize_git_source_url(dep_git_url);
+        if registry_urls.iter().any(|u| normalize_git_source_url(u) == claim_norm) {
+            return Ok(None);
         }
+        let mut sorted_urls: Vec<String> = registry_urls;
+        sorted_urls.sort();
+        sorted_urls.dedup();
         return Err(res_err(
             "RES-PROVENANCE-CONFLICT",
             format!(
-                "provenance conflict for package {name:?}: a transitive dependency \
-                 declares a git source ({dep_git_url:?}), but the tianguis registry has \
-                 no comparable git source recorded for {name:?} (the registry entry is \
-                 OCI-only, or has no provenance at all), and no content_hash is recorded \
-                 for any version of {name:?} either — the transport cannot be validated \
-                 by source or by identity. The root manifest does not override {name:?}. \
-                 Add {name:?} to your milpa.kdl deps (or override it) to choose which \
-                 source to use."
+                "provenance conflict for package {name:?}: a transitive dependency declares \
+                 source {dep_git_url:?}, but the tianguis registry records {sorted_urls:?} \
+                 for {name:?} — a different source repository. The root manifest does not \
+                 override {name:?}. Add {name:?} to your milpa.kdl deps (or override it) to \
+                 choose which source to use."
             ),
         ));
     }
-    let claim_norm = normalize_git_source_url(dep_git_url);
-    if registry_urls.iter().any(|u| normalize_git_source_url(u) == claim_norm) {
-        return Ok(None);
+
+    // No git provenance recorded — try the OCI `source_url` fact next (still
+    // a static, pre-fetch, URL-comparable source), BEFORE falling back to
+    // the (post-fetch, deferred) content-hash mechanism. An OCI artifact
+    // published FROM a git repo, referenced by a transitive at that SAME
+    // repo (even at a newer/different ref than any published version — the
+    // version solver reconciles that), is the same package.
+    let oci_source_urls = registry_oci_source_urls(pkg);
+    if !oci_source_urls.is_empty() {
+        let claim_norm = normalize_git_source_url(dep_git_url);
+        if oci_source_urls.iter().any(|u| normalize_git_source_url(u) == claim_norm) {
+            return Ok(None);
+        }
+        let mut sorted_urls: Vec<String> = oci_source_urls;
+        sorted_urls.sort();
+        sorted_urls.dedup();
+        return Err(res_err(
+            "RES-PROVENANCE-CONFLICT",
+            format!(
+                "provenance conflict for package {name:?}: a transitive dependency declares \
+                 source {dep_git_url:?}, but the tianguis registry records OCI publish \
+                 source(s) {sorted_urls:?} for {name:?} — a different source repository. \
+                 The root manifest does not override {name:?}. Add {name:?} to your \
+                 milpa.kdl deps (or override it) to choose which source to use."
+            ),
+        ));
     }
-    let mut sorted_urls: Vec<String> = registry_urls;
-    sorted_urls.sort();
-    sorted_urls.dedup();
+
+    // Incomparable transport (OCI-only entry with no recorded source_url, or
+    // no provenance recorded at all): fall back to CONTENT IDENTITY, milpa's
+    // one transport-independent fact.
+    let mut content_hashes: Vec<String> = pkg
+        .versions
+        .iter()
+        .filter(|iv| !iv.content_hash.is_empty())
+        .map(|iv| iv.content_hash.clone())
+        .collect();
+    content_hashes.sort();
+    content_hashes.dedup();
+    if !content_hashes.is_empty() {
+        return Ok(Some(content_hashes));
+    }
     Err(res_err(
         "RES-PROVENANCE-CONFLICT",
         format!(
-            "provenance conflict for package {name:?}: a transitive dependency declares \
-             source {dep_git_url:?}, but the tianguis registry records {sorted_urls:?} \
-             for {name:?} — a different source repository. The root manifest does not \
-             override {name:?}. Add {name:?} to your milpa.kdl deps (or override it) to \
-             choose which source to use."
+            "provenance conflict for package {name:?}: a transitive dependency \
+             declares a git source ({dep_git_url:?}), but the tianguis registry has \
+             no comparable git source recorded for {name:?} (the registry entry is \
+             OCI-only with no recorded publish source, or has no provenance at all), \
+             and no content_hash is recorded for any version of {name:?} either — the \
+             transport cannot be validated by source or by identity. The root manifest \
+             does not override {name:?}. Add {name:?} to your milpa.kdl deps (or \
+             override it) to choose which source to use."
         ),
     ))
 }
@@ -1353,6 +1403,11 @@ enum PKey {
     /// S8b: sentinel for a MemberTarget override — the dep is satisfied by a
     /// pre-registered workspace member candidate, no external fetch.
     Member(String),
+    /// §14.2: sentinel for the standalone root's own self-candidate — a
+    /// transitive claim on the root's own declared name is satisfied by the
+    /// pre-registered root-self candidate, never fetched. Mirrors
+    /// Python's `_ROOT_SELF_PKEY`.
+    RootSelf(String),
 }
 
 /// What `extract_requires` returns after converting an `EdgeSet` to solver
@@ -1536,6 +1591,19 @@ struct ResolveProvider<'a> {
     /// the in-tree member). Empty in single-package mode.
     member_names: BTreeSet<String>,
 
+    /// §14: the standalone root's own declared `name`, when resolving a
+    /// single-package (non-workspace) manifest with a name. `None` for
+    /// `resolve_workspace` (which never sets this — §11.5's member
+    /// auto-coerce is a separate, pre-existing mechanism) and for a
+    /// standalone manifest with no declared name at all.
+    root_self_name: Option<String>,
+    /// §14.1/§14.3: the root-self candidate's label version (same
+    /// precedence `member_candidate_version` uses), paired with
+    /// `root_self_name` — used by `gate_only` to validate a transitive
+    /// `Named` claim's constraint against the root's own version BEFORE
+    /// the gate suppresses it (§14.2).
+    root_self_version: Option<Version>,
+
     candidates: RefCell<BTreeMap<String, BTreeMap<Version, Candidate>>>,
     stubs: RefCell<BTreeMap<String, BTreeMap<Version, IndexVersion>>>,
 
@@ -1680,6 +1748,8 @@ impl<'a> ResolveProvider<'a> {
             root_authority: BTreeSet::new(),
             root_direct_keys: BTreeSet::new(),
             member_names: BTreeSet::new(),
+            root_self_name: None,
+            root_self_version: None,
             candidates: RefCell::new(BTreeMap::new()),
             stubs: RefCell::new(BTreeMap::new()),
             edge_cache: RefCell::new(BTreeMap::new()),
@@ -1918,6 +1988,63 @@ impl<'a> ResolveProvider<'a> {
             seen_by_name
                 .entry(ov.name.clone())
                 .or_insert_with(|| (pk, TIER_ROOT));
+        }
+
+        // ------------------------------------------------------------------
+        // §14 "root satisfies its own name": pre-register the root itself as
+        // a candidate for its OWN declared name — a standalone package is a
+        // workspace-of-one (§11.5's member self-registration, applied to the
+        // non-workspace path). No dep_terms of its own: the root's deps are
+        // already fully represented by the synthetic root candidate below;
+        // this candidate exists purely so a transitive `requires
+        // "<manifest.name>"` has something to bind to other than a second
+        // fetch. A manifest with no declared name has nothing to register a
+        // self-candidate for — skipped entirely (§14.4 ordinary case).
+        // ------------------------------------------------------------------
+        if let Some(name) = manifest.name.clone() {
+            // §14.1: same declared-version precedence `member_candidate_version`
+            // already applies for a workspace member, against the root's own
+            // project directory instead of a member's directory.
+            let (root_self_version, root_self_version_source) =
+                member_candidate_version(&name, manifest, &self.project_root, &self.overrides);
+
+            // §14.2: the root's own name is root-authoritative (§10.1).
+            root_direct_keys.insert(DepKey::bare(name.clone()));
+
+            // §14.2: pre-seed the provenance gate so the FIRST transitive
+            // claim on the root's own name is already a "second" claim
+            // against this sentinel entry — suppressed by the ordinary
+            // root-wins branch in `gate()`, with no dedicated root-self case
+            // needed there. Mirrors the MemberTarget-override pre-seed
+            // technique above (same reason: register root authority for a
+            // name BEFORE any transitive claim on it can arrive).
+            seen_by_name.insert(name.clone(), (PKey::RootSelf(name.clone()), TIER_ROOT));
+
+            self.root_self_name = Some(name.clone());
+            self.root_self_version = Some(root_self_version.clone());
+
+            self.store_candidate(Candidate {
+                name: name.clone(),
+                version: root_self_version,
+                // §14.5: no separate identity — the project root is not an
+                // isolated, independently-hashed tree the way a fetched dep
+                // or workspace member directory is (it typically also holds
+                // _deps/, milpa.lock, etc.); mirrors the synthetic root's
+                // own identity (empty).
+                identity: String::new(),
+                src_dir: manifest.src_dir.clone(),
+                requires_names: Vec::new(),
+                deps: Vec::new(),
+                provenance: Some(ProvenanceRecord::Root { name: name.clone(), origin: "observed".to_string() }),
+                declared_mirror_urls: Vec::new(),
+                dep_decl: None,
+                requires_predicates: std::collections::BTreeMap::new(),
+                attestation: None,
+                is_registry: false,
+                registry_namespace: String::new(),
+                version_unknown: false,
+                declared_version_source: root_self_version_source,
+            });
         }
 
         // R6: root_authority derived as pure name-projection of
@@ -2407,6 +2534,36 @@ impl<'a> ResolveProvider<'a> {
     /// against post-fetch; `None` if suppressed; or `RES-PROVENANCE-CONFLICT`.
     fn gate_only(&self, item: Item) -> Result<Option<(Item, Option<Vec<String>>)>, MilpaError> {
         let mut item = self.apply_override(item);
+
+        // §14.3: validate (and possibly raise) a transitive `Named` claim on
+        // the standalone root's own name BEFORE the gate suppresses it below
+        // (§14.2) — a no-op unless `root_self_name` is set (standalone
+        // resolve only; `resolve_workspace` never sets it) AND this claim's
+        // (unqualified) name equals it.
+        if let Item::Named { name, constraint, namespace } = &item {
+            if namespace.is_none() {
+                if let Some(root_name) = &self.root_self_name {
+                    if name == root_name {
+                        if let Some(root_version) = &self.root_self_version {
+                            if !constraint.contains(root_version) {
+                                return Err(res_err(
+                                    "RES-ROOT-SELF-VERSION-CONSTRAINT",
+                                    format!(
+                                        "{name:?} is the resolving package's own name; a \
+                                         transitive dep requires {name:?} but the root's own \
+                                         declared version {root_version} does not satisfy it \
+                                         — the root itself is the only candidate for its own \
+                                         name (no second copy is fetched); add a version= \
+                                         annotation matching the constraint, or resolve the \
+                                         mismatch with the transitive consumer"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // §10.0/§10.3/§10.5 validate-against-registry lattice: a non-root
         // name present in the registry index is tier-2 (registry-owned) as a
@@ -4726,6 +4883,7 @@ fn transport_to_record(p: &Provenance) -> ProvenanceRecord {
             registry,
             repository,
             digest,
+            ..
         } => ProvenanceRecord::Oci {
             registry: registry.clone(),
             repository: repository.clone(),

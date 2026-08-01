@@ -169,6 +169,10 @@ pub fn parse_source_spec<S: AsRef<str>>(
             registry: registry.to_string(),
             repository: repository.to_string(),
             digest: digest.to_string(),
+            // Manifest `oci=` dep declarations have no `source` concept
+            // (registry-protocol §3.3's manifest-grammar carve-out) — always
+            // `None` here.
+            source_url: None,
         });
     }
 
@@ -352,7 +356,7 @@ mod tests {
         assert!(
             matches!(
                 &result,
-                Provenance::Oci { registry, repository, digest: d }
+                Provenance::Oci { registry, repository, digest: d, .. }
                 if registry == "ghcr.io" && repository == "org/pkg" && d == &digest
             ),
             "expected OCI provenance, got {result:?}"

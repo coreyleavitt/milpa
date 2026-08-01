@@ -1,0 +1,6 @@
+name "helper"
+kind "library"
+src_dir "src"
+deps {
+    myapp
+}

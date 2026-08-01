@@ -206,11 +206,25 @@ class GitIndexProvenance:
 
 @dataclass(frozen=True)
 class OciIndexProvenance:
-    """OCI provenance record as stored in the index."""
+    """OCI provenance record as stored in the index.
+
+    ``source_url`` — OPTIONAL: the ``(url)``-annotated (or plain-string) git
+    repository this artifact was packed and published from (registry-protocol
+    §3.3 "oci provenance" — the ``source`` child). ``None`` on every entry
+    published before this field existed, and on any OCI-published version
+    whose publisher genuinely had no git source to record (e.g. a
+    local/tarball-sourced publish). Purely additive/informational at the
+    parse layer: absence changes no other behavior. It exists so a consumer
+    (the resolver) can reconcile an OCI-only registry entry against an
+    unrelated transitive ``git=`` reference to the SAME upstream repository —
+    without it, the two are structurally indistinguishable even when they
+    are, in fact, the same package.
+    """
 
     registry: str
     repository: str
     digest: str
+    source_url: str | None = None
 
 
 #: Union type for index-level provenance records.
@@ -701,7 +715,7 @@ def parse_index(text: str) -> Index:
     ``TNG-UNSAFE-OCI-FIELD``), the ``dep_decl`` pointer validated
     (``TNG-BAD-DEP-DECL``), and EVERY registry free-text field — ``name``,
     ``namespace``, a version string, ``content_hash``, git ``url``/``ref``,
-    oci ``registry``/``repository``, ``signed_by``, rekor ``uuid``/
+    oci ``registry``/``repository``/``source`` (optional), ``signed_by``, rekor ``uuid``/
     ``log_index``/``integrated_time``, ``yanked_reason`` — charset-checked for
     ASCII control characters (``TNG-UNSAFE-CONTROL-CHAR`` — registry-protocol
     §3.3 NORMATIVE (control-character rejection)). ``attestation-epoch`` (a
@@ -1102,12 +1116,17 @@ def _parse_provenance_node(node: KdlNode) -> IndexProvenance | None:
         registry = _child_scalar(node, "registry") or ""
         repository = _child_scalar(node, "repository") or ""
         digest = _child_scalar(node, "digest") or ""
+        source_url = _child_scalar_url(node, "source")
         _validate_no_control_chars(registry, "oci registry")
         _validate_no_control_chars(repository, "oci repository")
+        if source_url is not None:
+            _validate_no_control_chars(source_url, "oci source")
         _validate_no_leading_dash(registry, "oci registry", TNG_UNSAFE_OCI_FIELD)
         _validate_no_leading_dash(repository, "oci repository", TNG_UNSAFE_OCI_FIELD)
         _validate_oci_digest(digest)
-        return OciIndexProvenance(registry=registry, repository=repository, digest=digest)
+        return OciIndexProvenance(
+            registry=registry, repository=repository, digest=digest, source_url=source_url
+        )
 
     # Unknown kind: silently skipped (forward-compat).
     return None

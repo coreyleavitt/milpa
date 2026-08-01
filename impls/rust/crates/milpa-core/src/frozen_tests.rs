@@ -376,6 +376,34 @@ fn identity_not_in_store() {
     assert_eq!(err.code(), "FROZEN-IDENTITY-NOT-IN-STORE");
 }
 
+/// §14.5: a `root`-kind entry (identity=None, never fetched) does NOT trip
+/// `FROZEN-IDENTITY-NOT-IN-STORE` the way an ordinary CAS-backed dep with no
+/// identity would — it reconstructs straight from the lockfile, the same way
+/// a workspace member bypasses the CAS-presence check (though `root` is
+/// valid in single-package context, unlike `member`, which bails above).
+#[test]
+fn root_self_dep_bypasses_cas_presence_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = CaStore::new(tmp.path().join(".cas"));
+    let lf = lock(
+        "maxver",
+        vec![locked(
+            "myapp",
+            "1.0.0",
+            None,
+            ProvenanceRecord::Root {
+                name: "myapp".into(),
+                origin: "observed".into(),
+            },
+        )],
+    );
+    let graph = resolve_frozen(&manifest(vec![]), &lf, &store, &deps_dir(&tmp)).unwrap();
+    assert_eq!(graph.deps.len(), 1);
+    assert_eq!(graph.deps[0].name, "myapp");
+    assert!(graph.deps[0].identity.is_empty());
+    assert!(matches!(graph.deps[0].provenances[0], ProvenanceRecord::Root { .. }));
+}
+
 // ---------------------------------------------------------------------------
 // Workspace frozen path tests (fixtures 085, 086)
 // ---------------------------------------------------------------------------

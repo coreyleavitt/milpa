@@ -1,0 +1,18 @@
+// fixture-451: spec/resolver-semantics.md §14 "root satisfies its own name".
+//
+// A standalone package is a workspace-of-one (the non-workspace analog of
+// §11.5's workspace-member self-registration). "myapp" declares version
+// "1.0.0" and depends on "helper" (git). helper's OWN milpa.kdl declares a
+// bare `requires "myapp"` — a transitive reference back to the resolving
+// root's own name (the real-world motivator: a project's own transitive
+// test-only dep, e.g. proptest, requiring the project's own package name).
+//
+// Expected: the resolved graph contains exactly ONE "myapp" entry — the
+// ROOT itself (a `root`-kind provenance record), never a second, separately
+// fetched copy. helper.requires includes "myapp".
+name "myapp"
+kind "application"
+version "1.0.0"
+deps {
+    helper git=(url)"https://example.com/helper.git" ref="v1.0.0"
+}

@@ -335,6 +335,7 @@ impl FetcherRegistry for DefaultRegistry {
                 registry,
                 repository,
                 digest,
+                ..
             } => fetch_oci(name, registry, repository, digest, dest)?,
         };
         // Compute content identity for CAS-admissible provenances. Local/editable
@@ -2430,6 +2431,7 @@ impl FetcherRegistry for MockedFetcher {
                 registry,
                 repository,
                 digest,
+                ..
             } => {
                 // conformance-fixtures.md §2.3.5: keyed on (registry/repository,
                 // digest) — no separate receipt-input file, since the digest is

@@ -154,6 +154,33 @@ package "{name}" {{
 """
 
 
+def _index_kdl_one_pkg_oci_with_source(
+    name: str, *, registry: str, repository: str, digest: str, content_hash: str,
+    source_url: str,
+) -> str:
+    """An OCI registry entry that also records the ``source_url`` the
+    artifact was published FROM (registry-protocol §3.3 oci provenance's
+    optional ``source`` child) — the shape
+    ``_validate_transitive_url_against_registry`` URL-matches against
+    BEFORE falling back to content-hash (resolver-semantics.md §10.0/§10.3
+    "OCI source_url" clause)."""
+    return f"""\
+schema_version 1
+package "{name}" {{
+    version "1.0.0" {{
+        content_hash "{content_hash}"
+        provenance {{
+            kind "oci"
+            registry "{registry}"
+            repository "{repository}"
+            digest "{digest}"
+            source "{source_url}"
+        }}
+    }}
+}}
+"""
+
+
 def _index_kdl_two_pkgs(
     name1: str, *, url1: str, ref1: str, content_hash1: str, commit_sha1: str,
     name2: str, url2: str, ref2: str, content_hash2: str, commit_sha2: str,
@@ -832,6 +859,126 @@ class TestOciOnlyRegistryEntryEmptyContentHashConflicts:
         assert not env.store.contains(foo_hash)
 
 
+class TestOciSourceUrlMatchAcceptedAcrossVersionDrift:
+    """The real gap this fixture closes (the amoxtli/softlink@main case in
+    miniature): the registry entry for ``foo`` is OCI-only, but records the
+    ``source_url`` it was published FROM. A transitive pins ``foo`` by that
+    SAME git URL, but at a ref (``main``) that was NEVER published as a
+    registry version (the registry only has ``v1.0.0``). Content-hash
+    comparison would conflict here (``main``'s tree differs from the
+    published ``v1.0.0`` tree) — but the ``source_url`` URL-match accepts
+    it outright, regardless of version/ref drift, because it is
+    unambiguously the same source repository. Conformance fixture-452
+    mirrors this scenario."""
+
+    def test_transitive_pinned_ahead_of_published_version_is_accepted(
+        self, tmp_path: Path
+    ) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+
+        t1_url = "https://example.com/t1.git"
+        foo_source_url = "https://github.com/example/foo.git"
+
+        _stage(
+            mocked_dir, t1_url, "main", sha="1" * 40,
+            kdl=(
+                'name "t1"\nkind "library"\ndeps {\n'
+                f'    foo git=(url)"{foo_source_url}" ref="main"\n'
+                "}\n"
+            ),
+        )
+        # The transitive pins `main`, a ref AHEAD of (and with different
+        # content than) the published v1.0.0 — content-hash would conflict.
+        _stage(mocked_dir, foo_source_url, "main", sha="2" * 40, marker="foo-at-main")
+        _stage(
+            mocked_dir, foo_source_url, "v1.0.0", sha="3" * 40,
+            marker="foo-at-v1.0.0",
+        )
+
+        foo_v1_hash = _content_hash_for(mocked_dir, foo_source_url, "v1.0.0")
+        foo_main_hash = _content_hash_for(mocked_dir, foo_source_url, "main")
+        assert foo_v1_hash != foo_main_hash
+
+        index_kdl = _index_kdl_one_pkg_oci_with_source(
+            "foo", registry="ghcr.io", repository="example/foo",
+            digest="sha256:" + "b" * 64, content_hash=foo_v1_hash,
+            source_url=foo_source_url,
+        )
+        env = _env(tmp_path, mocked_dir, index_kdl)
+
+        root_kdl = (
+            'name "myapp"\nkind "application"\n'
+            "deps {\n"
+            f'    t1 git=(url)"{t1_url}" ref="main"\n'
+            "}\n"
+        )
+        graph = _resolve(root_kdl, env, tmp_path)
+
+        foo = _dep(graph, "foo")
+        # Accepted as the `main`-pinned identity — NOT reconciled against
+        # (or rejected in favor of) the registry's v1.0.0 content_hash.
+        assert foo.identity == foo_main_hash
+        assert env.store.contains(foo_main_hash)
+
+
+class TestOciSourceUrlMismatchConflicts:
+    """Same OCI-with-``source_url`` shape as above, except the transitive
+    pins a DIFFERENT repository — a genuine disagreement, raised
+    statically, before any fetch (no deferred content-hash check needed,
+    since ``source_url`` is a directly comparable fact)."""
+
+    def test_different_repository_conflicts_before_fetch(
+        self, tmp_path: Path
+    ) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        mocked_dir.mkdir()
+
+        t1_url = "https://example.com/t1.git"
+        foo_fork_url = "https://github.com/example/foo-fork.git"
+        foo_registry_source_url = "https://github.com/example/foo.git"
+
+        _stage(
+            mocked_dir, t1_url, "main", sha="1" * 40,
+            kdl=(
+                'name "t1"\nkind "library"\ndeps {\n'
+                f'    foo git=(url)"{foo_fork_url}" ref="main"\n'
+                "}\n"
+            ),
+        )
+        _stage(mocked_dir, foo_fork_url, "main", sha="2" * 40, marker="fork")
+        _stage(
+            mocked_dir, foo_registry_source_url, "v1.0.0", sha="3" * 40,
+            marker="registry-original",
+        )
+
+        foo_registry_hash = _content_hash_for(
+            mocked_dir, foo_registry_source_url, "v1.0.0"
+        )
+        index_kdl = _index_kdl_one_pkg_oci_with_source(
+            "foo", registry="ghcr.io", repository="example/foo",
+            digest="sha256:" + "b" * 64, content_hash=foo_registry_hash,
+            source_url=foo_registry_source_url,
+        )
+        env = _env(tmp_path, mocked_dir, index_kdl)
+
+        root_kdl = (
+            'name "myapp"\nkind "application"\n'
+            "deps {\n"
+            f'    t1 git=(url)"{t1_url}" ref="main"\n'
+            "}\n"
+        )
+        with pytest.raises(MilpaError) as exc_info:
+            _resolve(root_kdl, env, tmp_path)
+        assert exc_info.value.slug == RES_PROVENANCE_CONFLICT
+        assert "foo" in exc_info.value.message
+
+        # Rejected BEFORE any fetch — source_url comparison is static and
+        # pre-fetch, same guarantee as the git-vs-git disagreement case.
+        foo_fork_hash = _content_hash_for(mocked_dir, foo_fork_url, "main")
+        assert not env.store.contains(foo_fork_hash)
+
+
 class TestTwoAgreeingUrlPinsOfSameRegistryNameCoexist:
     """Two DIFFERENT transitives each pin ``foo`` — a registry-known name —
     at the registry's OWN repository, but at two DIFFERENT refs. Both
@@ -1343,6 +1490,107 @@ class TestValidateTransitiveUrlAgainstRegistry:
             "foo", "https://example.com/foo.git", pkg,
         )
         assert result == frozenset({"sha256:" + "e" * 64})
+
+    def test_agrees_oci_source_url_match_no_git_provenance(self) -> None:
+        # An OCI-only entry that DOES carry a source_url: a git= claim
+        # matching that source_url is an outright AGREE (returns None, no
+        # deferred content-hash check needed) — even though NO
+        # GitIndexProvenance is recorded at all. This is the amoxtli/
+        # softlink@main case in miniature: the transitive pins a ref that
+        # was never published as a registry version.
+        pkg = Package(
+            name="foo", namespace="",
+            versions=(
+                IndexVersion(
+                    version="1.0.0",
+                    content_hash="sha256:" + "a" * 64,
+                    provenances=(
+                        OciIndexProvenance(
+                            registry="ghcr.io", repository="example/foo",
+                            digest="sha256:" + "b" * 64,
+                            source_url="https://github.com/example/foo.git",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        result = _validate_transitive_url_against_registry(
+            "foo", "https://github.com/example/foo.git", pkg,
+        )
+        assert result is None
+
+    def test_agrees_oci_source_url_normalized_git_suffix_and_case(self) -> None:
+        pkg = Package(
+            name="foo", namespace="",
+            versions=(
+                IndexVersion(
+                    version="1.0.0",
+                    content_hash="sha256:" + "a" * 64,
+                    provenances=(
+                        OciIndexProvenance(
+                            registry="ghcr.io", repository="example/foo",
+                            digest="sha256:" + "b" * 64,
+                            source_url="https://Github.com/example/foo.git",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        result = _validate_transitive_url_against_registry(
+            "foo", "https://github.com/example/foo", pkg,
+        )
+        assert result is None
+
+    def test_disagrees_oci_source_url_different_repository(self) -> None:
+        # A recorded source_url that does NOT match the claim is a genuine
+        # disagreement — resolved statically, pre-fetch, exactly like the
+        # git-vs-git disagreement case (no deferred content-hash fallback).
+        pkg = Package(
+            name="foo", namespace="",
+            versions=(
+                IndexVersion(
+                    version="1.0.0",
+                    content_hash="sha256:" + "a" * 64,
+                    provenances=(
+                        OciIndexProvenance(
+                            registry="ghcr.io", repository="example/foo",
+                            digest="sha256:" + "b" * 64,
+                            source_url="https://github.com/example/foo.git",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        with pytest.raises(MilpaError) as exc_info:
+            _validate_transitive_url_against_registry(
+                "foo", "https://github.com/example/foo-fork.git", pkg,
+            )
+        assert exc_info.value.slug == RES_PROVENANCE_CONFLICT
+        assert "foo" in exc_info.value.message
+
+    def test_oci_no_source_url_still_defers_to_content_hash(self) -> None:
+        # OCI provenance with source_url=None (unset) is indistinguishable
+        # from a legacy entry for THIS decision — falls through to the
+        # pre-existing content-hash fallback, unchanged.
+        pkg = Package(
+            name="foo", namespace="",
+            versions=(
+                IndexVersion(
+                    version="1.0.0",
+                    content_hash="sha256:" + "a" * 64,
+                    provenances=(
+                        OciIndexProvenance(
+                            registry="ghcr.io", repository="example/foo",
+                            digest="sha256:" + "b" * 64,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        result = _validate_transitive_url_against_registry(
+            "foo", "https://example.com/foo.git", pkg,
+        )
+        assert result == frozenset({"sha256:" + "a" * 64})
 
 
 def _iv_git(version: str, *, url: str, ref: str):

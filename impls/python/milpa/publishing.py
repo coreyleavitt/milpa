@@ -273,6 +273,42 @@ def _refuse_submodules(repo: Path, commit: str) -> None:
             )
 
 
+def resolve_source_git_url(source: PublishSource) -> str | None:
+    """Derive the package's canonical source git URL from ``source.repo``'s
+    configured ``origin`` remote.
+
+    This is the value a downstream registry entry's OCI ``provenance``
+    record's optional ``source`` field (registry-protocol §3.3) is meant to
+    carry — the git repository this artifact was packed and published
+    from, letting a consumer reconcile an OCI-only registry entry against
+    an unrelated transitive ``git=`` reference to the SAME upstream repo (a
+    reconciliation that is otherwise structurally impossible: an OCI
+    provenance record has no URL of its own to compare against).
+
+    Best-effort, never raises: a repo with no ``origin`` remote configured
+    (or on which the ``git remote get-url`` subprocess fails for any other
+    reason) returns ``None`` rather than erroring out — a purely local,
+    never-pushed clone is an ordinary, fully-supported ``milpa publish``
+    input, not a failure condition, and registry-protocol keeps the
+    ``source`` field optional for exactly this reason (older entries, and
+    entries published from a non-git source, both lack it).
+
+    Separate, optional concern from ``resolve_publish_source``'s
+    (irreversible) HEAD/tag/submodule preflight guards — like
+    ``resolve_publish_name``, it does not participate in any of those
+    checks or in ``PublishSource``'s own shape.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(source.repo), "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    url = result.stdout.strip()
+    return url or None
+
+
 def resolve_publish_name(source: PublishSource) -> str:
     """M4: derive a package's ``--name`` from ``milpa.kdl`` in the HEAD tree,
     NOT the working directory.
@@ -333,11 +369,20 @@ class PublishPlan:
     Deliberately carries NEITHER the materialized entries NOR any push
     digest — only the source handle, the precomputed content identity, and
     the target metadata. See the module docstring for why.
+
+    ``source_url`` — the git repository ``source`` was packed from, per
+    ``resolve_source_git_url``; ``None`` when the repo has no ``origin``
+    remote configured. Purely informational at this layer: nothing in this
+    module consumes it yet — it is carried on the plan so a caller (the CLI
+    wiring in ``cmd_publish``) has it available to populate a downstream
+    registry entry's optional OCI-provenance ``source`` field
+    (registry-protocol §3.3) without re-deriving it.
     """
 
     source: PublishSource
     content_hash: str
     target: PublishTarget
+    source_url: str | None = None
 
 
 def _entries_or_derive(
@@ -387,11 +432,18 @@ def build_publish_plan(
     at plan-build time, so a ``--dry-run`` catches it too (not only a real
     ``pack_source`` call). This applies whether ``entries`` was re-derived
     here or supplied by the caller.
+
+    Also derives ``PublishPlan.source_url`` via ``resolve_source_git_url`` —
+    a local-only ``git remote get-url origin`` read (no network fetch, no
+    push); ``None`` when ``source.repo`` has no ``origin`` remote configured.
     """
     entries = _entries_or_derive(source, entries)
     _check_entries_safe(entries)
     content_hash = compute_dag_identity(entries)
-    return PublishPlan(source=source, content_hash=content_hash, target=target)
+    source_url = resolve_source_git_url(source)
+    return PublishPlan(
+        source=source, content_hash=content_hash, target=target, source_url=source_url
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -515,12 +567,19 @@ class PublishReceipt:
         (``milpa/fetchers/oci.py``) so the two receipts are consistent.
     artifact_type:
         The OCI artifact-type media type the artifact was pushed as.
+    source_url:
+        Carried straight through from ``PublishPlan.source_url`` (never
+        re-derived here) — the git repository ``source`` was packed from,
+        or ``None`` when the repo has no ``origin`` remote configured. See
+        ``PublishPlan.source_url``'s docstring for the downstream consumer
+        (registry-protocol §3.3's optional OCI-provenance ``source`` field).
     """
 
     content_hash: str
     oci_ref: str
     layer_digest: str
     artifact_type: str
+    source_url: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -991,9 +1050,9 @@ def execute(
        that don't match what was just packed.
     7. **Sign** that immutable digest-pinned ref (not the mutable tag), only
        once verified — cosign attests to the exact bytes that were pushed.
-    8. **Assemble** the ``PublishReceipt``: ``content_hash`` comes straight
-       from the plan (already computed by ``build_publish_plan`` — never
-       recomputed here).
+    8. **Assemble** the ``PublishReceipt``: ``content_hash`` and
+       ``source_url`` come straight from the plan (already computed by
+       ``build_publish_plan`` — neither is recomputed here).
     """
     entries = _entries_or_derive(plan.source, entries)
     artifact_bytes = pack_source(entries)
@@ -1036,4 +1095,5 @@ def execute(
         oci_ref=oci_ref,
         layer_digest=digest,
         artifact_type=plan.target.artifact_type,
+        source_url=plan.source_url,
     )

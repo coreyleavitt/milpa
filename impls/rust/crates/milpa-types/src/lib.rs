@@ -227,6 +227,21 @@ pub enum Provenance {
         registry: String,
         repository: String,
         digest: String,
+        /// registry-protocol §3.3: the OPTIONAL `source` child on an `oci`
+        /// index-provenance record — the git repository this artifact was
+        /// packed and published from (e.g. what `milpa publish` resolved
+        /// from the source repo's `origin` remote at publish time). `None`
+        /// for every construction site OTHER than `registry::parse_version_node`
+        /// (manifest `oci=` dep declarations and resolved-dep transport
+        /// dispatch have no `source` concept — registry-protocol §3.3's
+        /// manifest-grammar carve-out) and for registry entries published
+        /// before this field existed. Mirrors Python's
+        /// `OciIndexProvenance.source_url` — this shared enum conflates the
+        /// registry-index-provenance role Python splits into a separate
+        /// `OciIndexProvenance` type with the manifest/resolved-dep transport
+        /// role `Provenance` otherwise plays; `source_url` only has meaning
+        /// in the former.
+        source_url: Option<String>,
     },
 }
 
@@ -393,9 +408,10 @@ pub struct ResolvedGraph {
 ///
 /// **Distinct from the transport [`Provenance`] enum**, deliberately. `Provenance`
 /// models the four *transport* kinds a fetcher dispatches on; `ProvenanceRecord`
-/// models what a `milpa.lock` *records about where bytes came from* — five kinds,
-/// because it additionally carries workspace-internal `Member` references,
-/// which is not a transport.
+/// models what a `milpa.lock` *records about where bytes came from* — six kinds,
+/// because it additionally carries workspace-internal `Member` references and
+/// the standalone-root self-reference `Root` (resolver-semantics §14), neither
+/// of which is a transport.
 /// They are different sets by design, so they are different types (mirrors the
 /// Python `ProvenanceRecord` union in `lockfile.py`). Optional fields are `None`
 /// when omitted from the KDL — never an empty string.
@@ -440,6 +456,20 @@ pub enum ProvenanceRecord {
         /// "observed" or "declared".
         origin: String,
     },
+    /// resolver-semantics §14 "root satisfies its own name": a transitive
+    /// reference to the resolving STANDALONE root's own declared `name`,
+    /// satisfied by the root itself — never a second, separately-fetched
+    /// copy. The non-workspace analog of `Member`; a DISTINCT kind (not a
+    /// reuse of `Member`) because `frozen.rs`'s `FROZEN-MEMBER-DEP` guard
+    /// hard-rejects a `Member`-kind provenance in a single-package
+    /// (non-workspace) lockfile — conflating the two would trip that
+    /// invariant. `origin` is always `"observed"` (the root is never a
+    /// "declared" mirror source).
+    Root {
+        name: String,
+        /// "observed" or "declared" (always "observed" in practice).
+        origin: String,
+    },
 }
 
 impl ProvenanceRecord {
@@ -451,6 +481,7 @@ impl ProvenanceRecord {
             ProvenanceRecord::Local { origin, .. } => origin,
             ProvenanceRecord::Member { origin, .. } => origin,
             ProvenanceRecord::Oci { origin, .. } => origin,
+            ProvenanceRecord::Root { origin, .. } => origin,
         }
     }
 
@@ -462,6 +493,7 @@ impl ProvenanceRecord {
             ProvenanceRecord::Local { .. } => "local",
             ProvenanceRecord::Member { .. } => "member",
             ProvenanceRecord::Oci { .. } => "oci",
+            ProvenanceRecord::Root { .. } => "root",
         }
     }
 }

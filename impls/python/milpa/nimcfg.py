@@ -20,7 +20,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from milpa.lockfile import MemberProvenanceRecord, ResolvedDep, ResolvedGraph
+from milpa.lockfile import (
+    MemberProvenanceRecord,
+    ResolvedDep,
+    ResolvedGraph,
+    RootProvenanceRecord,
+)
 from milpa.version import dep_dir_name
 
 if TYPE_CHECKING:
@@ -91,6 +96,13 @@ def format_nimcfg(
     # on-disk layout and the lockfile sort order (both use dep_dir_name).
     ordered = sorted(graph.deps, key=lambda d: dep_dir_name(d.name, d.namespace))
     for dep in ordered:
+        # §14.5: the standalone root's own self-satisfying entry gets NO
+        # --path: line here — its source directory is already emitted as the
+        # self_src_dir line above (it IS the root); a --path: pointing at
+        # "_deps/<name>" would reference a directory that is never created
+        # (the root's tree is never staged into _deps/).
+        if _is_root_self_dep(dep):
+            continue
         path_lines.append(f'--path:"{_path_for(dep, deps_dir)}"')
         # B-nimcfg: emit one --path: per alias (lex-sorted, already sorted on dep).
         # Each alias path mirrors the canonical: _deps/<alias>[/<src_dir>].
@@ -105,7 +117,7 @@ def format_nimcfg(
     define_symbols: list[str] = []
     if flag_defines is not None:
         for dep in ordered:
-            if not dep.active_flags:
+            if _is_root_self_dep(dep) or not dep.active_flags:
                 continue
             dep_flag_table = flag_defines.get(dep.name, {})
             for flag_name in dep.active_flags:
@@ -311,6 +323,11 @@ def _dep_target(
 def _is_member_dep(dep: ResolvedDep) -> bool:
     """True when the dep has a MemberProvenanceRecord (workspace member)."""
     return any(isinstance(p, MemberProvenanceRecord) for p in dep.provenances)
+
+
+def _is_root_self_dep(dep: ResolvedDep) -> bool:
+    """True when the dep has a RootProvenanceRecord (§14 root-self entry)."""
+    return any(isinstance(p, RootProvenanceRecord) for p in dep.provenances)
 
 
 def _member_dep_closure(

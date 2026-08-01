@@ -1112,16 +1112,35 @@ ranks them.
 >   (that would let a transitive substitute a registry name's source). The
 >   remedy is to declare the name in the root manifest (tier 1), where the
 >   project owner arbitrates.
+> - **No git source recorded, but an OCI entry's `source_url` is** (the
+>   registry entry is published via OCI, and the publisher recorded the git
+>   repository the artifact was packed and published FROM — registry-protocol
+>   §3.3's OCI `source` child): the resolver MUST prefer this recorded
+>   `source_url` for the SAME URL comparison as the git-source case above,
+>   BEFORE falling back to content identity. A claim whose git URL, normalized,
+>   matches a `source_url` recorded for **any** version of the registry's
+>   package entry is an AGREEMENT — ACCEPTED and resolves normally — even when
+>   the transitive pins a ref/version that was never published to the registry
+>   (e.g. pinning `@main` ahead of the newest published release): the ref only
+>   selects a version of the same repo, exactly as for a recorded
+>   `GitIndexProvenance`, and this decision never depends on `content_hash` at
+>   all. A claim whose git URL matches no recorded `source_url` DISAGREES and
+>   MUST raise `RES-PROVENANCE-CONFLICT` immediately — this is resolved
+>   statically, pre-fetch, exactly like the git-vs-git disagreement case,
+>   since a recorded `source_url` is just as directly comparable a fact as a
+>   recorded git provenance.
 > - **Incomparable transport** (the registry has no comparable git source
->   recorded for the name at all — e.g. an OCI-only entry, published by
->   `milpa publish` from a source repository, or an entry with no provenance
->   recorded — so the source-URL comparison above cannot be performed): the
->   resolver MUST NOT treat this as an automatic disagreement. Instead it MUST
->   fall back to **content identity**: a package published to the registry
->   under one transport and a transitive claim of the same package under a
->   *different* transport are the same package if and only if they resolve to
->   the same `content_hash` (identity is milpa's one transport-independent
->   fact, spec/identity.md). Compare the transitive's git source's fetched
+>   recorded for the name at all, AND no OCI entry records a `source_url`
+>   either — e.g. an OCI-only entry published before the `source_url` field
+>   existed, or an entry with no provenance recorded — so NEITHER source-URL
+>   comparison above can be performed): the resolver MUST NOT treat this as an
+>   automatic disagreement. Instead it MUST fall back to **content identity**
+>   — the legacy mechanism, retained for entries that record no comparable
+>   source at all: a package published to the registry under one transport
+>   and a transitive claim of the same package under a *different* transport
+>   are the same package if and only if they resolve to the same
+>   `content_hash` (identity is milpa's one transport-independent fact,
+>   spec/identity.md). Compare the transitive's git source's fetched
 >   `content_hash` against the `content_hash` recorded across **every**
 >   version of the registry's package entry (not just the newest — mirroring
 >   the git-URL comparison's "every version" rule):
@@ -1134,7 +1153,8 @@ ranks them.
 >     against, even by identity → `RES-PROVENANCE-CONFLICT` immediately,
 >     without fetching anything.
 >
-> The agree/disagree-by-URL decision is made at claim-discovery time from the
+> The agree/disagree-by-URL decision (against either a recorded git source or
+> a recorded OCI `source_url`) is made at claim-discovery time from the
 > static, pre-loaded index record, so it is order-independent and never
 > commits a candidate that a later (even mid-solve) claim would have to
 > retract. The incomparable-transport/content-identity decision is likewise a
@@ -1176,7 +1196,10 @@ ranks them.
 > blocks.  For a workspace, every workspace member contributes its `deps`,
 > `dev-deps`, and the workspace-level `overrides {}` block to the root
 > authority set.  Workspace members themselves are also root-authoritative
-> (they are not subject to transitive override).
+> (they are not subject to transitive override).  For a standalone
+> (non-workspace) resolve, the root manifest's OWN declared `name` is
+> likewise root-authoritative (§14) — the standalone analog of a workspace
+> member being root-authoritative in its own name.
 
 > NORMATIVE: When a transitive dependency (a dep reachable via fetching
 > another dep's milpa.kdl or .nimble) declares a provenance for a package
@@ -1217,23 +1240,32 @@ registry index, else tier 3 — and arbitrates accordingly.
 
 > NORMATIVE: If a non-root name is present in the registry index (tier 2), a
 > transitive self-declared claim (`git=`/`tarball=`) for that name is validated
-> against the registry's recorded source (§10.0): a claim that AGREES (the
-> registry's own source repository) is accepted and resolves normally; a claim
-> that DISAGREES (a different source repository is recorded) MUST raise
-> `RES-PROVENANCE-CONFLICT`. When the registry has NO comparable git source
-> recorded for the name (incomparable transport — e.g. an OCI-only entry) the
-> resolver MUST instead validate by CONTENT IDENTITY (§10.0): the claim's
-> fetched `content_hash` compared against every `content_hash` recorded across
-> the registry package's versions — a match ACCEPTS the claim (same package,
-> different transport), no match (or no `content_hash` recorded at all to
-> compare against) MUST raise `RES-PROVENANCE-CONFLICT`. In every conflicting
-> case, the resolver MUST NOT silently redirect the name to the registry, and
-> MUST NOT silently honor the transitive's source. The remedy is to declare
-> the name in the root manifest (tier 1). This holds regardless of BFS
-> discovery order (the registry record is a static, pre-loaded fact) — the
-> content-identity sub-case is confirmed only once the claim's source has been
-> fetched, but the decision of WHETHER to validate by URL vs. by identity is
-> itself a static fact of the registry record alone.
+> against the registry's recorded source (§10.0), in preference order:
+> 1. A recorded git source (`GitIndexProvenance`) — a claim that AGREES (the
+>    registry's own source repository) is accepted and resolves normally; a
+>    claim that DISAGREES (a different source repository is recorded) MUST
+>    raise `RES-PROVENANCE-CONFLICT`.
+> 2. Otherwise, an OCI entry's recorded `source_url` (the git repository the
+>    artifact was published FROM) — the SAME URL comparison as step 1, so it
+>    is preferred over content-identity: AGREES (same repo, any ref/version)
+>    → accepted and resolves normally; DISAGREES (a different repo) MUST
+>    raise `RES-PROVENANCE-CONFLICT`, resolved statically, pre-fetch.
+> 3. Only when NEITHER a git source nor an OCI `source_url` is recorded
+>    (incomparable transport — e.g. an OCI-only entry predating the
+>    `source_url` field) does the resolver fall back to CONTENT IDENTITY
+>    (§10.0): the claim's fetched `content_hash` compared against every
+>    `content_hash` recorded across the registry package's versions — a match
+>    ACCEPTS the claim (same package, different transport), no match (or no
+>    `content_hash` recorded at all to compare against) MUST raise
+>    `RES-PROVENANCE-CONFLICT`.
+>
+> In every conflicting case, the resolver MUST NOT silently redirect the name
+> to the registry, and MUST NOT silently honor the transitive's source. The
+> remedy is to declare the name in the root manifest (tier 1). This holds
+> regardless of BFS discovery order (the registry record is a static,
+> pre-loaded fact) — the content-identity sub-case (step 3) is confirmed only
+> once the claim's source has been fetched, but the decision of WHICH of the
+> three steps applies is itself a static fact of the registry record alone.
 
 > NORMATIVE: If a non-root name is NOT in the registry index and receives two
 > tier-3 claims (self-declared `git=`/`tarball=`) with different provenance
@@ -1567,6 +1599,151 @@ Attestation policy governs how the resolver handles `NimbleFallback` deps.
 
 ---
 
+## 14  Root satisfies its own name (standalone-root self-satisfaction)
+
+A **standalone package is a workspace-of-one.** §11.5 establishes that a
+workspace member is pre-registered as a candidate for its own name, and a
+`NamedDep` whose name matches a member auto-coerces to that member's
+candidate rather than being looked up in the tianguis index or fetched a
+second time. This section establishes the identical rule for the
+**non-workspace** (single-package) resolve path: the root itself is
+pre-registered as a candidate for its own declared `name`, so that a
+transitive dep's `requires "<root's own name>"` is satisfied by the root's
+own working tree — never by fetching a second, distinct copy of that name.
+
+Concrete motivation: a package `P` (e.g. a real-world case: the `name
+"softlink"` root of the `softlink` project) has a transitive dep `D` (e.g. a
+test-only dependency such as `proptest`) whose OWN manifest declares
+`requires "P"` (or, concretely, `requires "softlink"`) — perhaps because
+`D` is designed to be usable both standalone and as a component of `P`.
+Without this rule, that transitive claim resolves as an ordinary named
+dep: it is looked up in the tianguis index (or, if the root happens to
+also have declared itself as a named/URL dep somewhere reachable, is
+fetched again) — producing a SECOND, distinct copy of `P` in `_deps/`,
+alongside the tree already under build. This is never correct: `P` is
+already being built; a second copy is redundant at best and a
+provenance/version inconsistency at worst.
+
+### 14.1  Root self-candidate registration
+
+> NORMATIVE: When resolving a standalone (non-workspace) manifest, a
+> conformant implementation MUST pre-register the root itself as a
+> candidate for its own declared `name`, using the same declared-version
+> precedence as §3 Axis A / §11.5's member block (`milpa.kdl version`,
+> else `.nimble version` found in the root's own project directory, else
+> the version-unknown sentinel `0.0.1`). This candidate:
+>
+> - carries the root's own `src_dir` and declared version;
+> - carries NO outgoing dep terms of its own — the root's own `deps`/
+>   `dev-deps` are already fully represented by the ordinary root-BFS seed
+>   (§4.2.1); registering them a second time on this candidate would be
+>   redundant, not incremental;
+> - is never fetched, never staged into the CAS, and never subject to
+>   Phase B content-hash dedup (identical treatment to a workspace member,
+>   §11.5, which is likewise pre-registered rather than fetched).
+
+### 14.2  Suppression of transitive claims on the root's own name
+
+> NORMATIVE: The root's own declared `name` MUST be added to the root
+> authority set (§10.1) for a standalone resolve, exactly as a workspace
+> member's name is root-authoritative for a workspace resolve. Any
+> transitive claim on that name — whether a `named` (registry-style)
+> claim, or a self-declared `git=`/`tarball=`/`local=` claim — MUST be
+> suppressed by the same provenance-gate mechanism that suppresses any
+> other transitive claim on a root-authority name (§10.1, §10.5): it MUST
+> NOT be fetched, MUST NOT be looked up in the tianguis index, and MUST
+> NOT affect resolution. The root's own pre-registered candidate (§14.1)
+> is the sole candidate for that name.
+
+### 14.3  Version-constraint validation
+
+> NORMATIVE: When a transitive `NamedDep` claim on the root's own name
+> carries an explicit version constraint (e.g. `requires "P >= 2.0.0"`),
+> the implementation MUST validate that constraint against the root's own
+> candidate-label version (§14.1) BEFORE suppressing the claim. If the
+> root's own version does not satisfy the constraint, the implementation
+> MUST raise `RES-ROOT-SELF-VERSION-CONSTRAINT` — it MUST NOT silently
+> discard the constraint (the consumer's `>= 2.0.0` is a real requirement
+> that the resolver is not free to ignore just because the target
+> happens to be the root) and MUST NOT fetch an unrelated second copy of
+> the name to satisfy it. This mirrors `RES-WS-MEMBER-VERSION-CONSTRAINT`
+> (§11.5) exactly, with the root's own candidate in place of the member's.
+>
+> This check is performed once, at the first transitive claim on the
+> root's own name (mirroring the workspace member check, which is
+> likewise performed once per auto-coerced `NamedDep` occurrence, not
+> re-validated against every subsequent consumer). A second, later
+> transitive consumer with an even stricter, unsatisfiable constraint is
+> still caught — but as an ordinary `SOLVE-CONFLICT` from PubGrub's own
+> constraint accumulation over the root's single candidate, not as this
+> dedicated diagnostic. Both outcomes are correct (the build never
+> silently succeeds against a version the root does not carry); only the
+> diagnostic's specificity differs.
+
+### 14.4  Ordinary case is unaffected
+
+> NORMATIVE: When no transitive dep ever requires the root's own name,
+> the root's self-candidate (§14.1) MUST NOT appear in the resolved
+> graph — it is never selected by the solver (no term ever names it), so
+> `ResolvedGraph.deps` is byte-identical to a resolve of the same manifest
+> under a spec version that lacks this rule. This rule is purely additive:
+> it only changes behavior for the (previously either erroneous or
+> workaround-requiring) self-referential case.
+
+### 14.5  Lockfile representation
+
+> NORMATIVE: When the root's self-candidate IS selected (§14.1–§14.3), its
+> `ResolvedDep` entry uses a distinct `root` provenance kind (`name` field
+> only) — NOT the `member` kind (§4.4 of `lockfile-schema.md`), because
+> `member` is workspace-scoped (its `_deps/<name>` symlink convention and
+> its `FROZEN-MEMBER-DEP` single-package rejection both presuppose a
+> workspace context that does not exist here). `root` is identity-bearing
+> in name only: its lockfile `identity` field is `None` (mirroring the
+> synthetic root-of-solve node, which also carries no separate identity)
+> — the standalone project root is not an isolated, independently-hashed
+> tree the way a fetched dep or a workspace member's own directory is (it
+> typically also contains `_deps/`, `milpa.lock`, and other resolver-
+> owned artifacts that must not be folded into a content hash).
+>
+> `nim.cfg` emission MUST NOT emit a `--path:` line for the root's own
+> `root`-kind entry — the root's own source directory is already emitted
+> as the (always-first) self-`src_dir` path line (`lockfile-schema.md`
+> §7.1/§7.4); a second `--path:"_deps/<name>"` line would point at a
+> directory that does not exist (the root's tree is never staged into
+> `_deps/`).
+
+> NOTE: The reference implementation is in `resolve()` in `resolver.py`.
+> The root's self-candidate is built once, alongside the synthetic
+> `__root__` node, via the same `_member_candidate_version`-style
+> precedence helper §11.5 already uses for workspace members
+> (`_root_self_candidate_version`, a thin standalone-manifest-dir variant
+> of `_member_candidate_version`). Suppression (§14.2) is achieved by
+> pre-seeding the resolver's `provenance_gate` dict with a sentinel entry
+> for the root's own name (mirroring the existing `MemberTarget`-override
+> pre-seed technique in `resolve_workspace`) — the existing
+> `_check_provenance_gate` machinery then suppresses any subsequent
+> transitive claim with no additional gate logic. The version check
+> (§14.3) is a small, explicit, early check inline in the shared
+> `_run_bfs_wave_loop`'s `"named"` BFS-item branch, gated on an optional
+> `root_self_name`/`root_self_version` pair threaded through that function
+> (and `_s4a_run_fixpoint`) — `None` by default, so `resolve_workspace`
+> (which does not pass them) is entirely unaffected.
+>
+> NOTE (known gap, out of scope for this rule): the same *mechanism* —
+> suppressing a THIRD-PARTY transitive dep's claim on a workspace member's
+> own name and validating its version constraint — is not currently wired
+> for the workspace path the way §14.2/§14.3 wire it for the standalone
+> path. §11.5's existing auto-coerce only covers a `NamedDep` declared
+> directly on ANOTHER workspace member's own `deps`/`dev-deps` list; a
+> transitive dep fetched from outside the workspace (analogous to
+> `proptest` in this section's motivating example) that itself requires a
+> member's name currently resolves via the ordinary registry path and
+> fails with `TNG-NOT-FOUND` if that name is not a real index entry. This
+> is a pre-existing gap, not introduced or widened by this section, and
+> is left for separate follow-up.
+
+---
+
 ## Appendix A  Error codes referenced by this document
 
 All codes are defined in `spec/errors.md`.
@@ -1588,3 +1765,4 @@ All codes are defined in `spec/errors.md`.
 | `RES-PROVENANCE-CONFLICT` | Two transitive deps declare different provenances for the same name (§10.3) |
 | `MAN-PREDICATE-MIXED-NEGATION` | Predicate mixes negated and non-negated values (manifest-grammar §6) |
 | `RES-UNATTESTED-METADATA` | Strict policy: ≥1 named dep resolved from un-attested `.nimble` metadata (§13.3) |
+| `RES-ROOT-SELF-VERSION-CONSTRAINT` | Standalone root's own version does not satisfy a transitive's constraint on the root's own name (§14.3) |

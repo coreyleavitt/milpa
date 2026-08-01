@@ -597,8 +597,9 @@ grammar's §4.2, with the additional acceptance of `(url)`-annotated URL values
 > not reject control characters, so both run), `namespace` (§3.1),
 > `content_hash` (§3.2 — the SetOnce identity field the digest renders as a
 > raw scalar), a `version` node's version string (§3.2), a `git`
-> provenance's `url` and `ref`, an `oci` provenance's `registry` and
-> `repository` (both below), the `rekor` block's `uuid`, `log_index`, and
+> provenance's `url` and `ref`, an `oci` provenance's `registry`,
+> `repository`, and `source` (optional; both below), the `rekor` block's
+> `uuid`, `log_index`, and
 > `integrated_time` (§3.2), an `attestation "author-signed"` claim's
 > `signed_by` field (§3.2), `yanked_reason` (§3.2 — rendered raw, not
 > escaped, into the `TNG-NO-SATISFYING-VERSION` message and the yank
@@ -658,10 +659,12 @@ provenance {
     registry "<hostname>"
     repository "<org/name>"
     digest "sha256:<64-hex>"
+    source (url)"<git URL>"    // optional — the source git repo this artifact was published from
 }
 ```
 
-Fields: `registry` (required), `repository` (required), `digest` (required).
+Fields: `registry` (required), `repository` (required), `digest` (required),
+`source` (optional).
 
 > NORMATIVE: `digest` MUST be in `sha256:<64 lowercase hex>` form. Any other
 > format MUST raise `TNG-BAD-OCI-DIGEST` at parse time.
@@ -669,6 +672,38 @@ Fields: `registry` (required), `repository` (required), `digest` (required).
 > NORMATIVE: `registry` and `repository` MUST NOT begin with `-`. A leading
 > dash on either field MUST raise `TNG-UNSAFE-OCI-FIELD` at parse time
 > (flag-injection prevention; these values flow into `oras` argv).
+
+> NORMATIVE: `source`, when present, is the canonical git repository this
+> artifact was packed and published from (e.g. the URL `milpa publish`
+> resolved from the source repo's `origin` remote at publish time). It MUST
+> be accepted in both plain-string and `(url)`-annotated form, per the milpa
+> KDL url convention (mirroring `git` provenance's own `url` field). A
+> conformant parser MUST treat its absence as an ordinary, tolerated state —
+> `None`/absent, never a hard error — because every entry published before
+> this field existed lacks it, and an OCI-published version whose publisher
+> had no git source to record (e.g. a local/tarball-sourced publish)
+> legitimately has none either.
+>
+> This is a deliberate, narrow exception to this section's opening NORMATIVE
+> rule that index provenance records are a strict subset of the manifest
+> provenance-descriptor grammar (`manifest-grammar.md` §4.2's `oci`
+> descriptor has no `source` field, and none is added there): `source`
+> records registry-specific PUBLISH provenance — which git repository
+> produced the artifact — a concept that has no meaning in a manifest's
+> `oci=` dependency declaration (which only says where to fetch from, not
+> where the artifact originally came from). It exists to let a resolver
+> reconcile an OCI-only registry entry against an unrelated transitive
+> `git=` reference to the SAME upstream repository — without it, the two are
+> structurally indistinguishable even when they name the same package.
+>
+> NOTE: `source` participates in the same control-character rejection as
+> every other registry free-text field (§3.3's completeness principle,
+> below) and in the `provenance` record's existing Append-only-multiset
+> comparison (§3.5.1) — a record whose `source` alone changes is compared
+> by full-field value equality exactly like any other field change,
+> without a spec amendment. Its independent leading-dash check is
+> deliberately NOT required — unlike `registry`/`repository`, `source` never
+> flows into `oras`/`cosign` subprocess argv.
 
 #### Unknown kinds
 
@@ -1531,6 +1566,24 @@ part of `spec/errors.md` as of this spec-only amendment:
 > list; a differential conformance fixture pins this (`rfc-registry-append-
 > only.md`'s A4b).
 >
+> KNOWN GAP (tracked, not yet closed): the `oci` instantiation above does
+> NOT yet include the optional `source` field (§3.3) in its rendering. This
+> does not weaken *detection* — the dominance function above compares the
+> full typed `provenances` value (§3.5.1's "full-field value equality"),
+> so a `source`-only mutation is still caught as a violation exactly like
+> any other field change — but it DOES mean two distinct violations that
+> differ only in `source` currently render to the SAME `candidate_value`
+> bytes, which is precisely the digest-collision blind spot this NORMATIVE
+> subsection exists to close for every OTHER field (see the `git`
+> instantiation's `commit_sha`, added for the identical reason). Closing it
+> requires appending `\x1f<source-or-empty>` to the `oci` encoding in BOTH
+> reference implementations' provenance-rendering functions
+> (`index_ratchet_seam.py::_provenance_canonical_raw` /
+> `index_ratchet_seam.rs::provenance_canonical_raw`) in lockstep, plus a
+> differential conformance fixture pinning the new byte output (mirroring
+> A4b) — deferred to a follow-up slice rather than bundled into the `source`
+> field's initial (purely additive, parse/emit-only) introduction.
+>
 > Instantiation for `attestation` (live from A6): the attestation record's
 > rendering follows the same method — field order `kind`, `signer`
 > (`author-signed` only, empty for `milpa-vendored`), `bundle_pin` (empty
@@ -1908,6 +1961,7 @@ package "nimkdl" {
             registry "ghcr.io"
             repository "coreyleavitt/nimkdl"
             digest "sha256:e51aab085ef4f58ed3827742f3314cadb901ac1da36988cae05bb221f3652c24"
+            source (url)"https://github.com/coreyleavitt/nimkdl"
         }
         attestation "author-signed"
         signed_by "https://github.com/coreyleavitt/tianguis/.github/workflows/publish.yaml"

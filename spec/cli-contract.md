@@ -2190,7 +2190,7 @@ when omitted.
 > implementation.
 
 **Real-run shape** (no `--dry-run`) — the reference implementation's
-`PublishOutputRecord`, six fields:
+`PublishOutputRecord`, seven fields:
 
 - `name`, `version` — the caller-supplied (or manifest/tag-derived) package
   identity.
@@ -2205,6 +2205,15 @@ when omitted.
   `sha256:<64-hex>` — the same digest embedded in `oci_ref`.
 - `artifact_type` — the OCI artifact-type media type the artifact was pushed
   as (§10.3).
+- `source_url` — the git repository the published source tree was packed
+  from, read from `source`'s `origin` remote (`git remote get-url origin`,
+  verbatim, no reformatting) at plan-build time. `null` when the published
+  repo has no `origin` remote configured (an ordinary, fully-supported case,
+  not an error) — the key is always present in the JSON; absence is
+  represented as `null`, never by omitting the key. This is the value
+  downstream tooling (e.g. the tianguis composite action) writes into a
+  registry entry's optional OCI-provenance `source` field
+  (registry-protocol.md §3.3).
 
 **Dry-run shape** (`--dry-run --output`) — the reference implementation's
 `PublishDryRunRecord`, deliberately a SEPARATE shape (no `oci_ref`/

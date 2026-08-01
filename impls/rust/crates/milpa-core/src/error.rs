@@ -169,6 +169,13 @@ impl CoreError {
             "RES-LOCKED-DRIFT",
             "RES-NO-INDEX",
             "RES-PROVENANCE-CONFLICT",
+            // §14.3 (resolver-semantics §14 "root satisfies its own name"):
+            // a transitive `Named` claim on the standalone root's own name
+            // carries a version constraint the root's own declared version
+            // does not satisfy. Mirrors RES-WS-MEMBER-VERSION-CONSTRAINT
+            // exactly, with the root's own self-candidate in place of a
+            // workspace member. Raised in `resolver.rs`'s `gate_only`.
+            "RES-ROOT-SELF-VERSION-CONSTRAINT",
             // S4c: post-fixpoint mutual-exclusion check (RFC #23 §3.1.4).
             "RESOLVE-FLAG-CONFLICT",
             // S5: attestation policy enforcement — strict mode raises this when

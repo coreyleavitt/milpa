@@ -60,6 +60,7 @@ from milpa.publishing import (
     parse_oras_digest_json,
     resolve_publish_name,
     resolve_publish_source,
+    resolve_source_git_url,
 )
 from milpa.fetchers.git import enumerate_git_entries, parse_ls_tree_z
 
@@ -210,9 +211,73 @@ def test_build_publish_plan_carries_no_entries_or_digest(tmp_path: Path) -> None
         "source",
         "content_hash",
         "target",
+        "source_url",
     }
     assert plan.source == source
     assert plan.target == target
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 3b — resolve_source_git_url / PublishPlan.source_url (data-layer
+# mechanism for registry-protocol §3.3's optional oci-provenance `source`
+# field — reconciling an OCI-published entry against a transitive git=
+# reference to the same upstream repo)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_source_git_url_returns_none_when_no_origin_remote(tmp_path: Path) -> None:
+    """A purely local, never-pushed clone (the fixture repos everywhere else
+    in this file) has no `origin` remote configured — this is the ordinary,
+    fully-supported case, not an error, so it resolves to None rather than
+    raising."""
+    repo, commit = _make_local_git_repo(tmp_path)
+    source = PublishSource(repo=repo, commit=commit)
+
+    assert resolve_source_git_url(source) is None
+
+
+def test_resolve_source_git_url_reads_origin_remote(tmp_path: Path) -> None:
+    """When `origin` IS configured, its URL is returned verbatim (whatever
+    `git remote get-url` reports — no milpa-side reformatting)."""
+    repo, commit = _make_local_git_repo(tmp_path)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin",
+         "https://github.com/coreyleavitt/z3.git"],
+        check=True, capture_output=True,
+    )
+    source = PublishSource(repo=repo, commit=commit)
+
+    assert resolve_source_git_url(source) == "https://github.com/coreyleavitt/z3.git"
+
+
+def test_build_publish_plan_source_url_none_without_origin_remote(tmp_path: Path) -> None:
+    """build_publish_plan's derived source_url mirrors resolve_source_git_url
+    exactly: absent for a repo with no origin remote."""
+    repo, commit = _make_local_git_repo(tmp_path)
+    source = PublishSource(repo=repo, commit=commit)
+    target = _make_target()
+
+    plan = build_publish_plan(source, target)
+
+    assert plan.source_url is None
+
+
+def test_build_publish_plan_source_url_populated_from_origin_remote(tmp_path: Path) -> None:
+    """build_publish_plan populates source_url from the repo's origin remote
+    — the mechanism a downstream caller (cmd_publish) uses to populate a
+    registry entry's optional OCI-provenance `source` field."""
+    repo, commit = _make_local_git_repo(tmp_path)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin",
+         "https://github.com/coreyleavitt/z3.git"],
+        check=True, capture_output=True,
+    )
+    source = PublishSource(repo=repo, commit=commit)
+    target = _make_target()
+
+    plan = build_publish_plan(source, target)
+
+    assert plan.source_url == "https://github.com/coreyleavitt/z3.git"
 
 
 # ---------------------------------------------------------------------------
@@ -246,12 +311,12 @@ def test_publish_receipt_oci_ref_matches_oci_provenance_reference() -> None:
 def test_publish_receipt_field_set_matches_spec_schema() -> None:
     """PublishReceipt's field set is a cross-repo contract: spec/cli-contract.md
     §10.2 documents it as EXACTLY {content_hash, oci_ref, layer_digest,
-    artifact_type} — a genuine cross-tool contract consumed by the tianguis
-    composite action's submission tooling. Pin the dataclass's field set so
-    an addition, removal, or rename here is caught by a failing test rather
-    than silently drifting from the spec prose (whichever side changes, the
-    other must be updated too — this test is the tripwire, not the source of
-    truth).
+    artifact_type, source_url} — a genuine cross-tool contract consumed by the
+    tianguis composite action's submission tooling. Pin the dataclass's field
+    set so an addition, removal, or rename here is caught by a failing test
+    rather than silently drifting from the spec prose (whichever side changes,
+    the other must be updated too — this test is the tripwire, not the source
+    of truth).
 
     RED-first check: this assertion is exact-set equality, not subset/superset
     — it fails just as loudly if a field is ADDED to PublishReceipt as if one
@@ -259,7 +324,69 @@ def test_publish_receipt_field_set_matches_spec_schema() -> None:
     the dataclass.
     """
     field_names = {f.name for f in dataclasses.fields(PublishReceipt)}
-    assert field_names == {"content_hash", "oci_ref", "layer_digest", "artifact_type"}
+    assert field_names == {
+        "content_hash", "oci_ref", "layer_digest", "artifact_type", "source_url",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 4b — execute() carries PublishPlan.source_url through to the
+# PublishReceipt unchanged (never re-derived at execute() time)
+# ---------------------------------------------------------------------------
+
+
+def test_execute_receipt_carries_source_url_from_plan(tmp_path: Path) -> None:
+    """execute()'s PublishReceipt.source_url must come straight from
+    plan.source_url (which build_publish_plan already derived via
+    resolve_source_git_url) — never re-derived or dropped at execute() time."""
+    repo, commit = _make_local_git_repo(tmp_path)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin",
+         "https://github.com/coreyleavitt/z3.git"],
+        check=True, capture_output=True,
+    )
+    source = PublishSource(repo=repo, commit=commit)
+    target = _make_target()
+    plan = build_publish_plan(source, target)
+    assert plan.source_url == "https://github.com/coreyleavitt/z3.git"
+
+    canned_digest = "sha256:" + "b" * 64
+
+    def fake_push(artifact_path, registry_ref, artifact_type, layer_media_type):
+        return canned_digest
+
+    def fake_sign(oci_ref):
+        pass
+
+    fake_manifest_fetch = _make_fake_manifest_fetch(_local_artifact_digest(repo, commit))
+
+    receipt = execute(plan, push=fake_push, sign=fake_sign, manifest_fetch=fake_manifest_fetch)
+
+    assert receipt.source_url == "https://github.com/coreyleavitt/z3.git"
+
+
+def test_execute_receipt_source_url_none_without_origin_remote(tmp_path: Path) -> None:
+    """Mirror of the above for the no-`origin`-remote case: PublishReceipt.source_url
+    is None, matching plan.source_url, not some sentinel/empty string."""
+    repo, commit = _make_local_git_repo(tmp_path)
+    source = PublishSource(repo=repo, commit=commit)
+    target = _make_target()
+    plan = build_publish_plan(source, target)
+    assert plan.source_url is None
+
+    canned_digest = "sha256:" + "c" * 64
+
+    def fake_push(artifact_path, registry_ref, artifact_type, layer_media_type):
+        return canned_digest
+
+    def fake_sign(oci_ref):
+        pass
+
+    fake_manifest_fetch = _make_fake_manifest_fetch(_local_artifact_digest(repo, commit))
+
+    receipt = execute(plan, push=fake_push, sign=fake_sign, manifest_fetch=fake_manifest_fetch)
+
+    assert receipt.source_url is None
 
 
 # ---------------------------------------------------------------------------

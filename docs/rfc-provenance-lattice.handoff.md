@@ -101,7 +101,26 @@ root.
   versions → commit ONLY amoxtli's milpa.lock (Corey: their in-progress code-review work
   touches neither milpa.lock nor milpa.kdl, so the lock change is isolated).
 
-## Follow-up queued (separate from #193): root-satisfies-own-name
+## IN PROGRESS (Corey: "do 1 [OCI source-url] but do root-satisfies-own-name now as well")
+Amoxtli finding: the OCI content-hash fallback (`f889621`) does NOT fix amoxtli —
+softlink@main (git, content `2f1a4cfb`, v0.3.3) genuinely differs from the registry's
+OCI softlink (`8ffc81bb`, v0.11.0); content-hash is version-specific so it can't tell
+"same package newer version" from "different package". Root cause: `OciIndexProvenance`
+records no SOURCE repo url. Two features now in flight:
+- **Task 1 — OCI source-url (systemic fix for amoxtli):** record the source git url in
+  OCI index entries (milpa publish → registry-protocol → tianguis backfill); resolver
+  validates git-vs-OCI by SAME-REPO URL match (content-hash only as last resort). Then
+  softlink@main url-matches the registry's softlink source → same package → version-solve,
+  no conflict. Data layer: a05a58e5 (registry.py/publishing.py/registry-protocol.md).
+  Resolver layer: AFTER root-satisfies-own-name frees resolver.py. tianguis backfill of
+  softlink's source url + amoxtli re-resolve are the final (cross-repo) steps.
+- **Task 2 — root-satisfies-own-name:** af03e9ce (resolver.py/resolver-semantics.md) —
+  standalone root satisfies transitive requires on its own name (mirrors workspace member
+  self-satisfy); retires softlink's `overrides { pkg "softlink" local="." }`.
+Sequence: [A root-self-satisfy Py] + [B OCI-data Py] parallel → [Task1 resolver-validate Py]
+→ Rust mirrors of both → tianguis softlink source-url backfill → amoxtli re-resolve + commit lock.
+
+## Follow-up (now being done): root-satisfies-own-name
 - softlink's own milpa.kdl needs `overrides { pkg "softlink" local="." }` because a transitive
   (proptest) `requires "softlink"` fetches a SECOND softlink instead of binding the root tree
   under build. milpa has member-satisfies-own-name (workspace, #25) but NOT root-satisfies-

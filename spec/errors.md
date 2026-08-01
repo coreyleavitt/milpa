@@ -1214,6 +1214,12 @@ Two transitive deps declare different provenance (source) for the same package n
 
 **Triggered:** A package name is first encountered via one transport (URL/local/named) and then a transitive dep requests it via a different, incompatible transport/URL, and the root manifest has no authority over that name (it is not declared in deps, dev-deps, or overrides).
 
+### `RES-ROOT-SELF-VERSION-CONSTRAINT`
+
+A transitive dep requires the resolving STANDALONE root's own name, but the declared version constraint is not satisfied by the root's own version.
+
+**Triggered:** A standalone (non-workspace) resolve encounters a transitive `NamedDep` whose name equals the root manifest's own `name` (resolver-semantics §14 "root satisfies its own name" — the non-workspace analog of the workspace member auto-coerce, §11.5). The root itself is the sole candidate for its own name — no second copy is ever fetched — but the transitive's declared version constraint is still checked against the root's own declared version (`milpa.kdl version`, else `.nimble version`, else the version-unknown sentinel `0.0.1`, same precedence as A2c). A constraint the root's version does not satisfy (e.g. a transitive `foo >= 2.0.0` when root `foo` declares `1.0.0`) raises this error rather than silently discarding the constraint or fetching an unrelated second `foo` to satisfy it.
+
 ### `RES-UNATTESTED-METADATA`
 
 Under strict attestation policy, one or more resolved deps used un-attested `.nimble` metadata (no `dep_decl` pointer in the index, or the `dep_decl` artifact was unreachable and the policy does not allow fallback).

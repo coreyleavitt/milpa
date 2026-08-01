@@ -118,6 +118,7 @@ impl FetcherRegistry for FakeFetcher {
                 registry,
                 repository,
                 digest,
+                ..
             } => {
                 let receipt = self.inner.fetch(name, p, dest)?;
                 self.calls.borrow_mut().push(FetchCall {

@@ -1,7 +1,7 @@
 """milpa.lock — reproducible-build snapshot of a resolved dep graph.
 
 Owns:
-  - ProvenanceRecord discriminated union (5 variants)
+  - ProvenanceRecord discriminated union (6 variants)
   - LockedDep, Lockfile — lockfile data model
   - ResolvedDep, ResolvedGraph — resolver output types (owned here to avoid
     forward-import cycles: resolver.py imports and *produces* these types;
@@ -25,6 +25,11 @@ ProvenanceRecord kinds (lockfile-schema.md §4):
     local    — §4.3: path (req, as-declared relative)
     member   — §4.4: name (req, workspace member name)
     oci      — §4.5: registry/repository/digest (all req)
+    root     — resolver-semantics.md §14: name (req) — a transitive dep's
+               reference to the resolving STANDALONE root's own name,
+               satisfied by the root itself (never a second fetched copy).
+               A standalone package is a workspace-of-one; `root` is the
+               non-workspace analog of `member`.
 """
 
 from __future__ import annotations
@@ -180,6 +185,29 @@ class OciProvenanceRecord:
     kind: str = field(default="oci", init=False)
 
 
+@dataclass(frozen=True)
+class RootProvenanceRecord:
+    """Provenance for a transitive reference to the resolving STANDALONE
+    root's own name (resolver-semantics.md §14 "root satisfies its own name").
+
+    A standalone package is a workspace-of-one: when some transitive dep's
+    own manifest requires the root's own declared name, the root itself
+    satisfies that reference — never a second, separately-fetched copy.
+    This is the non-workspace analog of ``member`` (§4.4); deliberately a
+    DISTINCT kind (not a reuse of ``member``) because ``frozen.py``'s
+    ``FROZEN-MEMBER-DEP`` guard hard-rejects a ``member``-kind provenance in
+    a single-package (non-workspace) lockfile — conflating the two would
+    trip that invariant.
+
+    origin: always "observed" — the root is never a "declared" mirror
+    source (it is not a mirror at all).
+    """
+
+    name: str
+    origin: str = "observed"
+    kind: str = field(default="root", init=False)
+
+
 #: Discriminated union of all provenance record variants.
 ProvenanceRecord = (
     GitProvenanceRecord
@@ -187,6 +215,7 @@ ProvenanceRecord = (
     | LocalProvenanceRecord
     | MemberProvenanceRecord
     | OciProvenanceRecord
+    | RootProvenanceRecord
 )
 
 # ---------------------------------------------------------------------------
@@ -459,7 +488,7 @@ def _parse_dep_identity_str(val: Any, dep_name: str) -> str:
 #
 # Key: (origin_rank, kind_rank, primary, secondary)
 #   origin_rank: declared=0, observed=1
-#   kind_rank:   git=0, tarball=1, oci=2, local=3, member=4
+#   kind_rank:   git=0, tarball=1, oci=2, local=3, member=4, root=5
 #   (primary, secondary): per-kind fields, bytewise over post-escape KDL form
 # ---------------------------------------------------------------------------
 
@@ -470,6 +499,7 @@ _KIND_RANK: dict[str, int] = {
     "oci": 2,
     "local": 3,
     "member": 4,
+    "root": 5,
 }
 
 
@@ -496,6 +526,9 @@ def _provenance_sort_key(p: "ProvenanceRecord") -> tuple[int, int, str, str]:
         primary = _kdl_str(p.path)
         secondary = ""
     elif isinstance(p, MemberProvenanceRecord):
+        primary = _kdl_str(p.name)
+        secondary = ""
+    elif isinstance(p, RootProvenanceRecord):
         primary = _kdl_str(p.name)
         secondary = ""
     else:
@@ -1102,11 +1135,16 @@ def _parse_provenance_block(node: KdlNode, dep_name: str) -> ProvenanceRecord:
             digest=_req_field(fields, "digest", dep_name),
             origin=origin,
         )
+    if kind == "root":
+        return RootProvenanceRecord(
+            name=_req_field(fields, "name", dep_name),
+            origin=origin,
+        )
 
     raise MilpaError(
         LOCK_PROV_KIND_UNKNOWN,
         f"dep {dep_name!r}: unknown provenance kind {kind!r} "
-        f"(known: git, tarball, local, member, oci)",
+        f"(known: git, tarball, local, member, oci, root)",
         dep=dep_name,
         kind=kind,
     )
@@ -1446,7 +1484,7 @@ def format_lockfile(lockfile: Lockfile) -> str:
         if dep.dep_decl is not None:
             lines.append(f"    dep_decl {_kdl_str(dep.dep_decl)}")
         # provenance blocks — sorted by canonical key (§4.0): declared < observed;
-        # git < tarball < oci < local < member; then (primary, secondary).
+        # git < tarball < oci < local < member < root; then (primary, secondary).
         for prov in sorted(dep.provenances, key=_provenance_sort_key):
             lines.append("    provenance {")
             for pline in _format_provenance_fields(prov):
@@ -1467,6 +1505,7 @@ def _format_provenance_fields(p: ProvenanceRecord) -> list[str]:
       local:    origin / kind / path
       member:   origin / kind / name
       oci:      origin / kind / registry / repository / digest
+      root:     origin / kind / name
 
     origin is ALWAYS emitted (never omitted), regardless of value.
     Optional fields (ref, commit_sha, sha256) are omitted when None.
@@ -1494,6 +1533,8 @@ def _format_provenance_fields(p: ProvenanceRecord) -> list[str]:
         out.append(f"registry {_kdl_str(p.registry)}")
         out.append(f"repository {_kdl_str(p.repository)}")
         out.append(f"digest {_kdl_str(p.digest)}")
+    elif isinstance(p, RootProvenanceRecord):
+        out.append(f"name {_kdl_str(p.name)}")
     return out
 
 

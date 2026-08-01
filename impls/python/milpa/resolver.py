@@ -64,6 +64,7 @@ from milpa.errors import (
     RES_EXCLUDE_NEWER_PIN,
     RES_NO_INDEX,
     RES_PROVENANCE_CONFLICT,
+    RES_ROOT_SELF_VERSION_CONSTRAINT,
     RES_VERSION_UNKNOWN_CONSTRAINED,
     RES_WS_MEMBER_REF_UNKNOWN,
     RES_WS_MEMBER_VERSION_CONSTRAINT,
@@ -87,6 +88,7 @@ from milpa.lockfile import (
     ProvenanceRecord,
     ResolvedDep,
     ResolvedGraph,
+    RootProvenanceRecord,
     TarballProvenanceRecord,
 )
 from milpa.manifest import (
@@ -218,6 +220,83 @@ def _member_candidate_version(
         version, source = declared
         return version, source
     return _URL_DEP_VERSION, None
+
+
+def _root_self_candidate_version(
+    manifest: Manifest, manifest_dir: Path | None
+) -> tuple[Version, VersionSource | None]:
+    """§14.1: the standalone root's own candidate-label version — a
+    standalone package is a workspace-of-one, so this uses the EXACT same
+    precedence ``_member_candidate_version`` already applies for a workspace
+    member (``milpa.kdl version`` else ``.nimble version`` else the
+    sentinel), just against the root's own project directory instead of a
+    member's directory.
+
+    ``manifest_dir`` is ``ResolveParams.manifest_dir`` — ``None`` for some
+    call sites (mostly unit tests constructing a manifest in memory with no
+    real project directory).  Without a real directory there is nothing to
+    ``.nimble``-scan, so this falls back to ``manifest.version`` (if set)
+    else the sentinel — the same terminal fallback
+    ``_member_candidate_version`` reaches when neither `milpa.kdl version`
+    nor a `.nimble` file is found.
+    """
+    if manifest_dir is None:
+        if manifest.version is not None:
+            return manifest.version, VersionSource.MANIFEST
+        return _URL_DEP_VERSION, None
+    return _member_candidate_version(manifest, manifest_dir)
+
+
+def _validate_root_self_constraint(
+    dep_key: "DepKey",
+    constraint_str: str | None,
+    root_self_name: str | None,
+    root_self_version: "Version | None",
+) -> None:
+    """§14.3: validate a transitive claim's version constraint against the
+    standalone root's own candidate-label version, when the claim's name IS
+    the root's own name.
+
+    A no-op (returns without raising) when ``root_self_name`` is ``None``
+    (the workspace path never passes it — resolve_workspace's pre-existing
+    member auto-coerce, §11.5, is a separate mechanism and untouched by
+    this function), the claim is namespaced (a namespaced name can never be
+    the bare root name — root deps carry no namespace), the claim's name
+    doesn't match, or the claim carries no explicit constraint.
+
+    Raises ``MilpaError(RES-ROOT-SELF-VERSION-CONSTRAINT)`` when the root's
+    own version does not satisfy the constraint — mirrors
+    ``RES-WS-MEMBER-VERSION-CONSTRAINT``'s reasoning exactly (§11.5): the
+    consumer's constraint is a real requirement, never silently discarded,
+    and never "solved" by fetching an unrelated second copy of the name.
+    """
+    if (
+        root_self_name is None
+        or dep_key.namespace is not None
+        or dep_key.name != root_self_name
+    ):
+        return
+    if not constraint_str:
+        return
+    try:
+        vs = VersionSet.from_constraint(constraint_str)
+    except Exception:
+        return
+    if root_self_version is not None and not vs.contains(root_self_version):
+        raise MilpaError(
+            RES_ROOT_SELF_VERSION_CONSTRAINT,
+            f"{dep_key.name!r} is the resolving package's own name; a "
+            f"transitive dep requires {dep_key.name!r} {constraint_str!r} "
+            f"but the root's own declared version "
+            f"{format_version_str(root_self_version)!r} does not satisfy "
+            f"it — the root itself is the only candidate for its own name "
+            f"(no second copy is fetched); add a version= annotation "
+            f"matching the constraint, or resolve the mismatch with the "
+            f"transitive consumer",
+            name=dep_key.name,
+            constraint=constraint_str,
+            version=format_version_str(root_self_version),
+        )
 
 
 def _version_unknown_constrained_err(
@@ -431,13 +510,14 @@ class _Candidate:
 
     name: str
     version: Version
-    identity: str | None        # sha256:<hex>; None for root/__root__ only
+    identity: str | None        # sha256:<hex>; None for root/__root__/root-self (§14.5) only
     src_dir: str
     dep_terms: list[Term]       # solver terms for this dep's declared requires
     requires_names: list[str]   # dep names (parallel to dep_terms, for graph)
     # typed; None only for __root__
     provenance: (
-        Provenance | _LocalDepProvenance | MemberProvenanceRecord | None
+        Provenance | _LocalDepProvenance | MemberProvenanceRecord
+        | RootProvenanceRecord | None
     ) = None
     # D-lifecycle: declared mirror URLs (manifest mirrors + prior declared) that
     # were NOT the observed candidate. Stored by _process_url_worker so
@@ -1784,6 +1864,8 @@ def _run_bfs_wave_loop(
     provenance_gate: "dict[str, tuple[tuple[object, ...], int]]",
     root_authority: "set[str]",
     record_discovery: "Callable[[str], None]",
+    root_self_name: "str | None" = None,
+    root_self_version: "Version | None" = None,
 ) -> None:
     """BFS wave-drain loop — runs in-place on *bfs_queue*.
 
@@ -1794,6 +1876,14 @@ def _run_bfs_wave_loop(
     Parameters mirror the closed-over locals in the old per-function copies
     except ``record_discovery``, which is the only thing that differed between
     the single-package and workspace copies.
+
+    ``root_self_name``/``root_self_version`` (§14.3): standalone-resolve-only
+    — the root's own name + candidate-label version, used to validate a
+    transitive ``named`` claim's constraint against the root's own version
+    BEFORE the provenance gate suppresses it (§14.2).  Both ``None`` (the
+    default) for ``resolve_workspace``, which never passes them — the
+    workspace member auto-coerce (§11.5) is a separate, pre-existing
+    mechanism, untouched by this parameter.
     """
     from concurrent.futures import Future as _Future
     from typing import cast as _cast
@@ -1858,6 +1948,14 @@ def _run_bfs_wave_loop(
                 if dep_key_n not in seen_named and dep_key_n.name != "nim":
                     seen_named.add(dep_key_n)
                     record_discovery(dep_key_n.solver_var())  # Phase B: transitive named dep
+                    # §14.3: validate (and possibly raise) BEFORE the gate
+                    # suppresses this claim below — a no-op unless this claim
+                    # names the standalone root's own name (root_self_name is
+                    # None for resolve_workspace and for any resolve() call
+                    # where nothing needs it).
+                    _validate_root_self_constraint(
+                        dep_key_n, item[2], root_self_name, root_self_version,
+                    )
                     # §10.0 authority lattice: a ``named`` claim is a tier-2
                     # (registry) deference — route it through the SAME gate
                     # the tier-3 url branch uses, keyed on the bare name (the
@@ -1966,22 +2064,30 @@ def _run_bfs_wave_loop(
                 #     claim. The decision is a static function of THIS claim
                 #     plus the registry record alone (never of collisions
                 #     with other claims), so it is order-independent by
-                #     construction (§10.5).
-                #   - DISAGREES (a different source repo) → raise
+                #     construction (§10.5). When no git provenance is
+                #     recorded but an OCI entry's ``source_url`` matches
+                #     instead (the package was published via OCI FROM this
+                #     same git repo), this is ALSO an outright AGREE — a
+                #     differing version/ref is still not a disagreement,
+                #     the version solver reconciles it.
+                #   - DISAGREES (a different source repo — checked first
+                #     against recorded git provenance, then, if none, against
+                #     any recorded OCI ``source_url``) → raise
                 #     RES-PROVENANCE-CONFLICT here, before any fetch is ever
                 #     dispatched. MUST NOT silently redirect to the registry
                 #     and MUST NOT silently honor the transitive's source —
                 #     the remedy is to declare the name in the root manifest
                 #     (tier 1 arbitrates).
-                #   - INCOMPARABLE TRANSPORT (e.g. this git= claim against an
-                #     OCI-only registry entry, or an entry with no provenance
-                #     at all) → the URL comparison above is impossible, so
-                #     fall back to CONTENT IDENTITY: if the registry has a
-                #     content_hash recorded for ANY version, DEFER — accept
-                #     this claim provisionally (same bypass as AGREES above)
-                #     and check its fetched content_hash against the
-                #     registry's recorded set once the wave-drain loop below
-                #     has it (``pending_identity_validation``); match → same
+                #   - INCOMPARABLE TRANSPORT (an OCI-only registry entry with
+                #     NO recorded ``source_url`` either, or an entry with no
+                #     provenance at all) → the URL comparisons above are both
+                #     impossible, so fall back to CONTENT IDENTITY: if the
+                #     registry has a content_hash recorded for ANY version,
+                #     DEFER — accept this claim provisionally (same bypass as
+                #     AGREES above) and check its fetched content_hash
+                #     against the registry's recorded set once the
+                #     wave-drain loop below has it
+                #     (``pending_identity_validation``); match → same
                 #     package via a different transport, stays accepted;
                 #     mismatch → RES-PROVENANCE-CONFLICT, raised post-fetch.
                 #     No content_hash recorded anywhere (legacy/empty) →
@@ -2356,6 +2462,8 @@ def _s4a_run_fixpoint(
     root_authority: "set[str]",
     record_discovery: "Callable[[str], None]",
     extra_manifests: "dict[str, object] | None" = None,
+    root_self_name: "str | None" = None,
+    root_self_version: "Version | None" = None,
 ) -> None:
     """S4a outer dep×flag fixpoint loop.
 
@@ -2655,6 +2763,8 @@ def _s4a_run_fixpoint(
             provenance_gate=provenance_gate,
             root_authority=root_authority,
             record_discovery=record_discovery,
+            root_self_name=root_self_name,
+            root_self_version=root_self_version,
         )
 
         # After each BFS wave we loop back to step 1 to re-check if the newly-
@@ -3177,6 +3287,50 @@ def resolve(
     provider.add(root_cand)
 
     # ------------------------------------------------------------------
+    # Step 5b (§14 "root satisfies its own name"): pre-register the root
+    # itself as a candidate for its OWN declared name — a standalone package
+    # is a workspace-of-one (§11.5's member self-registration, applied to
+    # the non-workspace path).  No dep_terms of its own: the root's deps are
+    # already fully represented by root_cand above; this candidate exists
+    # purely so a transitive `requires "<manifest.name>"` has something to
+    # bind to other than a second fetch.
+    # ------------------------------------------------------------------
+    _root_self_version, _root_self_version_source = _root_self_candidate_version(
+        manifest, params.manifest_dir
+    )
+    root_self_cand = _Candidate(
+        name=manifest.name,
+        version=_root_self_version,
+        # §14.5: no separate identity — the project root is not an isolated,
+        # independently-hashed tree the way a fetched dep or workspace
+        # member directory is (it typically also holds _deps/, milpa.lock,
+        # etc.); mirrors __root__'s own identity=None.
+        identity=None,
+        src_dir=manifest.src_dir or "",
+        dep_terms=[],
+        requires_names=[],
+        provenance=RootProvenanceRecord(name=manifest.name),
+        declared_version_source=_root_self_version_source,
+    )
+    provider.add(root_self_cand)
+
+    # §14.2: the root's own name is root-authoritative (§10.1) — added here
+    # (rather than folded into the root_direct_keys/root_authority
+    # construction above) so the two additions stay visually adjacent to the
+    # self-candidate they protect.
+    root_direct_keys.add(DepKey(name=manifest.name))
+    root_authority.add(manifest.name)
+
+    # §14.2: pre-seed the provenance gate so the FIRST transitive claim on
+    # the root's own name is already a "second" claim against this sentinel
+    # entry — suppressed by the ordinary root-wins branch in
+    # ``_check_provenance_gate``, with no dedicated root-self case needed
+    # there.  Mirrors ``resolve_workspace``'s MemberTarget-override pre-seed
+    # (same technique, same reason: register root authority for a name
+    # BEFORE any transitive claim on it can arrive).
+    provenance_gate[manifest.name] = (_ROOT_SELF_PKEY, TIER_ROOT)
+
+    # ------------------------------------------------------------------
     # Step 6: BFS materialisation loop (slice 9b-7: parallel fetch)
     #
     # The BFS queue is processed in waves (see _run_bfs_wave_loop for the
@@ -3213,6 +3367,8 @@ def resolve(
             provenance_gate=provenance_gate,
             root_authority=root_authority,
             record_discovery=_record_discovery,
+            root_self_name=manifest.name,
+            root_self_version=_root_self_version,
         )
 
         # ------------------------------------------------------------------
@@ -3244,6 +3400,8 @@ def resolve(
             provenance_gate=provenance_gate,
             root_authority=root_authority,
             record_discovery=_record_discovery,
+            root_self_name=manifest.name,
+            root_self_version=_root_self_version,
         )
 
     # ------------------------------------------------------------------
@@ -3289,6 +3447,15 @@ def resolve(
         if _dk_t in seen_named or _dk_t.name == "nim":
             return
         seen_named.add(_dk_t)
+        # §14.2: a late (solve-time-discovered) transitive claim on the
+        # root's own name must NOT be enumerated from the registry either —
+        # the root's own pre-registered candidate (Step 5b) is already the
+        # sole candidate for that name. This mirrors the BFS "named" branch's
+        # provenance-gate suppression, but this callback fires OUTSIDE the
+        # gate machinery entirely (Phase B lazy materialisation, not BFS), so
+        # the check is inline here instead.
+        if _dk_t.namespace is None and _dk_t.name == manifest.name:
+            return
         _enumerate_named_stubs(
             _dk_t, None, index, provider, deps_dir, env,
             exclude_newer=params.exclude_newer,
@@ -3416,6 +3583,14 @@ TIER_SELF_URL = 3
 # same name can never disagree at the provenance-key level.
 _NAMED_PKEY: tuple[object, ...] = ("named",)
 
+# §14.2: sentinel pkey pre-seeded into ``provenance_gate`` for the standalone
+# root's own name, before any transitive claim on it can arrive.  Any real
+# claim's pkey (``_NAMED_PKEY``, or a ``("url", git, ref)`` tuple) is
+# structurally distinct from this sentinel, so ``_check_provenance_gate``
+# always takes the "different provenance, root wins" branch — suppressing
+# the claim with no dedicated root-self logic in the gate itself.
+_ROOT_SELF_PKEY: tuple[object, ...] = ("root-self",)
+
 
 # ---------------------------------------------------------------------------
 # Registry-validation mechanism (resolver-semantics.md §10.0/§10.3 — the
@@ -3477,6 +3652,20 @@ def _registry_git_provenances(pkg: Package) -> list[GitIndexProvenance]:
     return out
 
 
+def _registry_oci_source_urls(pkg: Package) -> list[str]:
+    """All non-``None`` ``OciIndexProvenance.source_url`` values recorded
+    for *pkg*, across EVERY version (same "every version, not just newest"
+    convention as ``_registry_git_provenances`` — the originating git repo
+    of an OCI-published package is ordinarily stable across versions).
+    """
+    out: list[str] = []
+    for iv in pkg.versions:
+        for prov in iv.provenances:
+            if isinstance(prov, OciIndexProvenance) and prov.source_url:
+                out.append(prov.source_url)
+    return out
+
+
 def _validate_transitive_url_against_registry(
     name: str,
     dep_git_url: str,
@@ -3489,32 +3678,42 @@ def _validate_transitive_url_against_registry(
     Returns one of:
 
     - ``None`` — the claim is fully resolved as an AGREEMENT: the
-      transitive's git URL, normalized, matches a git source recorded for
-      ANY version of *pkg*. The caller falls through and treats the claim
-      as an accepted, ordinary tier-3 url dep. A differing ``ref``/
-      ``commit_sha`` is NOT a disagreement (the ref only selects a version
-      of the same repo) — this function never compares those fields.
+      transitive's git URL, normalized, matches EITHER a git source
+      recorded for ANY version of *pkg*, OR an OCI entry's recorded
+      ``source_url`` for ANY version of *pkg*. The caller falls through and
+      treats the claim as an accepted, ordinary tier-3 url dep. A differing
+      ``ref``/``commit_sha``/version is NOT a disagreement (it only selects
+      a version, or a newer unreleased ref, of the same repo) — this
+      function never compares those fields.
     - A non-empty ``frozenset[str]`` of ``content_hash`` values — *pkg* has
-      NO comparable git source recorded (OCI-only entry, or no provenance
-      at all), so the URL comparison above is impossible, but at least one
-      of *pkg*'s versions DOES record a ``content_hash``. milpa's identity
-      is transport-independent (spec/identity.md) — a package published to
-      the registry as an OCI artifact FROM a git repo, and a transitive
-      pinning that SAME repo by URL, are the same package under different
-      transports. The decision is therefore DEFERRED to content identity:
-      the caller MUST fetch the transitive's git source, compute its
-      ``content_hash``, and check membership in the returned set — a match
-      means AGREE (accept), a non-match means DISAGREE
-      (``RES-PROVENANCE-CONFLICT``, raised by the caller post-fetch).
+      NO comparable git source recorded (no ``GitIndexProvenance``, and no
+      OCI entry has a recorded ``source_url``), so the URL comparison above
+      is impossible, but at least one of *pkg*'s versions DOES record a
+      ``content_hash``. milpa's identity is transport-independent
+      (spec/identity.md) — a package published to the registry as an OCI
+      artifact FROM a git repo, and a transitive pinning that SAME repo by
+      URL, are the same package under different transports. The decision
+      is therefore DEFERRED to content identity: the caller MUST fetch the
+      transitive's git source, compute its ``content_hash``, and check
+      membership in the returned set — a match means AGREE (accept), a
+      non-match means DISAGREE (``RES-PROVENANCE-CONFLICT``, raised by the
+      caller post-fetch). This is the FALLBACK path, only reached when
+      NEITHER a git source NOR an OCI ``source_url`` is recorded anywhere
+      for *pkg* (e.g. legacy entries predating the ``source_url`` field).
 
     Raises ``MilpaError(RES-PROVENANCE-CONFLICT)`` when the claim is already
     resolvable as a DISAGREEMENT with no further (post-fetch) check needed:
 
     - a git source IS recorded for *pkg* and none matches ``dep_git_url``
       (a different repository), or
-    - *pkg* has no comparable git source AND no ``content_hash`` recorded
-      for any version either — nothing exists to validate against, even
-      deferred (legacy/empty entries).
+    - no git source is recorded, but an OCI ``source_url`` IS recorded and
+      none matches ``dep_git_url`` (a different repository — this is
+      resolved statically, pre-fetch, exactly like the git-vs-git
+      disagreement case, since a recorded ``source_url`` is just as
+      comparable a fact as a recorded git provenance), or
+    - *pkg* has no comparable git source, no OCI ``source_url``, AND no
+      ``content_hash`` recorded for any version either — nothing exists to
+      validate against, even deferred (legacy/empty entries).
 
     Never fetches anything itself — this function is a cheap, static,
     pre-fetch check; a deferred (frozenset) result only names WHAT to check
@@ -3522,44 +3721,68 @@ def _validate_transitive_url_against_registry(
     claim is accepted-pending-validation) has computed the identity.
     """
     git_provs = _registry_git_provenances(pkg)
-    if not git_provs:
-        # Incomparable transport (OCI-only entry, or no provenance recorded
-        # at all): fall back to CONTENT IDENTITY, milpa's one transport-
-        # independent fact. A package published to tianguis as an OCI
-        # artifact FROM a git repo (e.g. `milpa publish` from a source
-        # checkout) and a transitive pinning that repo by URL are the SAME
-        # package under different transports — content_hash is the only
-        # thing left that can prove (or disprove) that.
-        content_hashes = frozenset(
-            iv.content_hash for iv in pkg.versions if iv.content_hash
-        )
-        if content_hashes:
-            return content_hashes
+    if git_provs:
+        claim_norm = _normalize_git_source_url(dep_git_url)
+        registry_urls = {p.url for p in git_provs}
+        if claim_norm in {_normalize_git_source_url(u) for u in registry_urls}:
+            return None
         raise MilpaError(
             RES_PROVENANCE_CONFLICT,
             f"provenance conflict for package {name!r}: a transitive "
-            f"dependency declares a git source ({dep_git_url!r}), but the "
-            f"tianguis registry has no comparable git source recorded for "
-            f"{name!r} (the registry entry is OCI-only, or has no "
-            f"provenance at all), and no content_hash is recorded for any "
-            f"version of {name!r} either — the transport cannot be "
-            f"validated by source or by identity. The root manifest does "
-            f"not override {name!r}. Add {name!r} to your milpa.kdl deps "
-            f"(or override it) to choose which source to use.",
+            f"dependency declares source {dep_git_url!r}, but the tianguis "
+            f"registry records {sorted(registry_urls)!r} for {name!r} — a "
+            f"different source repository. The root manifest does not "
+            f"override {name!r}. Add {name!r} to your milpa.kdl deps (or "
+            f"override it) to choose which source to use.",
             name=name,
         )
-    claim_norm = _normalize_git_source_url(dep_git_url)
-    registry_urls = {p.url for p in git_provs}
-    if claim_norm in {_normalize_git_source_url(u) for u in registry_urls}:
-        return None
+
+    # No git provenance recorded — try the OCI ``source_url`` fact next
+    # (still a static, pre-fetch, URL-comparable source), BEFORE falling
+    # back to the (post-fetch, deferred) content-hash mechanism. An OCI
+    # artifact published FROM a git repo, referenced by a transitive at
+    # that SAME repo (even at a newer/different ref than any published
+    # version — the version solver reconciles that), is the same package.
+    oci_source_urls = _registry_oci_source_urls(pkg)
+    if oci_source_urls:
+        claim_norm = _normalize_git_source_url(dep_git_url)
+        if claim_norm in {_normalize_git_source_url(u) for u in oci_source_urls}:
+            return None
+        raise MilpaError(
+            RES_PROVENANCE_CONFLICT,
+            f"provenance conflict for package {name!r}: a transitive "
+            f"dependency declares source {dep_git_url!r}, but the tianguis "
+            f"registry records OCI publish source(s) "
+            f"{sorted(set(oci_source_urls))!r} for {name!r} — a different "
+            f"source repository. The root manifest does not override "
+            f"{name!r}. Add {name!r} to your milpa.kdl deps (or override "
+            f"it) to choose which source to use.",
+            name=name,
+        )
+
+    # Incomparable transport (OCI-only entry with no recorded source_url,
+    # or no provenance recorded at all): fall back to CONTENT IDENTITY,
+    # milpa's one transport-independent fact. A package published to
+    # tianguis as an OCI artifact FROM a git repo (e.g. `milpa publish` from
+    # a source checkout) and a transitive pinning that repo by URL are the
+    # SAME package under different transports — content_hash is the only
+    # thing left that can prove (or disprove) that.
+    content_hashes = frozenset(
+        iv.content_hash for iv in pkg.versions if iv.content_hash
+    )
+    if content_hashes:
+        return content_hashes
     raise MilpaError(
         RES_PROVENANCE_CONFLICT,
         f"provenance conflict for package {name!r}: a transitive "
-        f"dependency declares source {dep_git_url!r}, but the tianguis "
-        f"registry records {sorted(registry_urls)!r} for {name!r} — a "
-        f"different source repository. The root manifest does not "
-        f"override {name!r}. Add {name!r} to your milpa.kdl deps (or "
-        f"override it) to choose which source to use.",
+        f"dependency declares a git source ({dep_git_url!r}), but the "
+        f"tianguis registry has no comparable git source recorded for "
+        f"{name!r} (the registry entry is OCI-only with no recorded "
+        f"publish source, or has no provenance at all), and no "
+        f"content_hash is recorded for any version of {name!r} either — "
+        f"the transport cannot be validated by source or by identity. The "
+        f"root manifest does not override {name!r}. Add {name!r} to your "
+        f"milpa.kdl deps (or override it) to choose which source to use.",
         name=name,
     )
 
@@ -4417,6 +4640,7 @@ def _build_graph(
     TP = TarballProvenance
     MP = MemberProvenanceRecord
     OP = OciProvenance
+    RP = RootProvenanceRecord
 
     # Build reverse map: canonical → sorted list of aliases.
     canonical_to_aliases: dict[str, list[str]] = {}
@@ -4449,6 +4673,7 @@ def _build_graph(
             | TarballProvenanceRecord
             | MemberProvenanceRecord
             | OciProvenanceRecord
+            | RootProvenanceRecord
             | None
         ) = None
         if isinstance(cand.provenance, GP):
@@ -4493,6 +4718,10 @@ def _build_graph(
                 digest=cand.provenance.digest,
                 origin="observed",
             )
+        elif isinstance(cand.provenance, RP):
+            # §14.5: root-self candidate — provenance record already typed
+            # correctly (mirrors the member branch above).
+            observed_record = cand.provenance
 
         # D-lifecycle: build declared provenance records for each mirror URL that
         # was NOT the observed candidate. Declared = unverified (no commit_sha,

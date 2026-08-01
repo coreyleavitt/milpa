@@ -146,6 +146,67 @@ class TestParseIndexValid:
         assert prov.registry == "ghcr.io"
         assert prov.repository == "coreyleavitt/nimkdl"
 
+    def test_oci_provenance_source_url_absent_by_default(self) -> None:
+        """MINIMAL_INDEX's oci provenance has no `source` child — an older
+        (pre-this-field) index entry — so source_url parses to None, not an
+        empty string or a hard error (registry-protocol §3.3 — optional,
+        purely additive)."""
+        idx = parse_index(MINIMAL_INDEX)
+        nimkdl = next(p for p in idx.packages if p.name == "nimkdl")
+        prov = nimkdl.versions[0].provenances[0]
+        assert isinstance(prov, OciIndexProvenance)
+        assert prov.source_url is None
+
+    def test_oci_provenance_source_url_parsed_url_annotated(self) -> None:
+        """`source (url)"…"` — the milpa KDL url convention — parses into
+        `OciIndexProvenance.source_url` as a plain string (registry-protocol
+        §3.3), mirroring how `git`'s own `url` field already accepts the
+        annotation."""
+        text = """\
+schema_version 1
+package "z3" {
+    namespace "coreyleavitt"
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "oci"
+            registry "ghcr.io"
+            repository "coreyleavitt/z3"
+            digest "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+            source (url)"https://github.com/coreyleavitt/z3"
+        }
+    }
+}
+"""
+        idx = parse_index(text)
+        prov = idx.packages[0].versions[0].provenances[0]
+        assert isinstance(prov, OciIndexProvenance)
+        assert prov.source_url == "https://github.com/coreyleavitt/z3"
+
+    def test_oci_provenance_source_url_parsed_plain_string(self) -> None:
+        """`source` also accepts a plain (non-annotated) string, per the
+        milpa url convention's back-compat acceptance."""
+        text = """\
+schema_version 1
+package "z3" {
+    namespace "coreyleavitt"
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "oci"
+            registry "ghcr.io"
+            repository "coreyleavitt/z3"
+            digest "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+            source "https://github.com/coreyleavitt/z3"
+        }
+    }
+}
+"""
+        idx = parse_index(text)
+        prov = idx.packages[0].versions[0].provenances[0]
+        assert isinstance(prov, OciIndexProvenance)
+        assert prov.source_url == "https://github.com/coreyleavitt/z3"
+
     def test_git_provenance_parsed(self) -> None:
         idx = parse_index(MINIMAL_INDEX)
         chronos = next(p for p in idx.packages if p.name == "chronos")
@@ -904,6 +965,29 @@ package "foo" {
             registry "ghcr.io"
             repository "example\\u{9}/foo"
             digest "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        }
+    }
+}
+"""
+        with pytest.raises(MilpaError) as exc_info:
+            parse_index(text)
+        assert exc_info.value.slug == TNG_UNSAFE_CONTROL_CHAR
+
+    def test_control_char_in_oci_source_via_kdl_escape(self) -> None:
+        """The optional oci provenance `source` field gets the same
+        control-character rejection as every other registry free-text field
+        (registry-protocol §3.3 NORMATIVE — control-character rejection)."""
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "oci"
+            registry "ghcr.io"
+            repository "example/foo"
+            digest "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+            source "https://example.com/foo\\u{9}.git"
         }
     }
 }

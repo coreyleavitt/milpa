@@ -622,6 +622,7 @@ def test_publish_output_record_field_set_matches_wire_contract() -> None:
     field_names = {f.name for f in dataclasses.fields(PublishOutputRecord)}
     assert field_names == {
         "name", "version", "content_hash", "oci_ref", "layer_digest", "artifact_type",
+        "source_url",
     }
 
 
@@ -667,6 +668,66 @@ def test_real_run_output_json_keys_match_publish_output_record(tmp_path: Path) -
     assert rc == 0
     record = json.loads(out_path.read_text())
     assert set(record.keys()) == {f.name for f in dataclasses.fields(PublishOutputRecord)}
+
+
+def test_real_run_output_json_source_url_null_without_origin_remote(tmp_path: Path) -> None:
+    """A repo with no `origin` remote configured (the ordinary case for these
+    fixtures) must publish with `source_url: null` in the --output JSON — key
+    present, value null, per spec/cli-contract.md §10.2 (never omitted)."""
+    repo = _make_publishable_repo(tmp_path, version="1.2.3")
+    out_path = tmp_path / "receipt.json"
+    fake_push = _make_fake_push()
+    fake_sign = _make_fake_sign()
+    fake_manifest_fetch = _make_matching_manifest_fetch(repo)
+
+    rc = cmd_publish(
+        repo,
+        version="1.2.3",
+        target="ghcr.io/coreyleavitt/widget",
+        output_path=out_path,
+        push=fake_push,
+        sign=fake_sign,
+        manifest_fetch=fake_manifest_fetch,
+    )
+
+    assert rc == 0
+    record = json.loads(out_path.read_text())
+    assert "source_url" in record
+    assert record["source_url"] is None
+
+
+def test_real_run_output_json_includes_source_url_for_git_sourced_publish(
+    tmp_path: Path,
+) -> None:
+    """A repo WITH an `origin` remote configured must surface that remote's
+    URL verbatim as `source_url` in the real-run --output JSON — the
+    mechanism the tianguis composite action uses to populate a registry
+    entry's optional OCI-provenance `source` field (registry-protocol.md
+    §3.3)."""
+    repo = _make_publishable_repo(tmp_path, version="1.2.3")
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin",
+         "https://github.com/coreyleavitt/widget.git"],
+        check=True, capture_output=True,
+    )
+    out_path = tmp_path / "receipt.json"
+    fake_push = _make_fake_push()
+    fake_sign = _make_fake_sign()
+    fake_manifest_fetch = _make_matching_manifest_fetch(repo)
+
+    rc = cmd_publish(
+        repo,
+        version="1.2.3",
+        target="ghcr.io/coreyleavitt/widget",
+        output_path=out_path,
+        push=fake_push,
+        sign=fake_sign,
+        manifest_fetch=fake_manifest_fetch,
+    )
+
+    assert rc == 0
+    record = json.loads(out_path.read_text())
+    assert record["source_url"] == "https://github.com/coreyleavitt/widget.git"
 
 
 def test_dry_run_output_json_keys_match_publish_dry_run_record(tmp_path: Path) -> None:

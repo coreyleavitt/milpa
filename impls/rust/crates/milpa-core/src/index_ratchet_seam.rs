@@ -205,7 +205,15 @@ fn provenance_canonical_raw(provenances: &[milpa_types::Provenance]) -> String {
             Provenance::Git { url, ref_spec, commit_sha } => {
                 format!("git\u{1f}{url}\u{1f}{ref_spec}\u{1f}{}", commit_sha.as_deref().unwrap_or(""))
             }
-            Provenance::Oci { registry, repository, digest } => {
+            Provenance::Oci { registry, repository, digest, .. } => {
+                // NOTE: `source_url` is deliberately NOT rendered into this
+                // digest — mirrors Python's `_provenance_canonical_raw`,
+                // which also encodes only registry/repository/digest for an
+                // oci record. This one encoding is the exception to the
+                // general "every field participates in append-only
+                // multiset equality" rule (registry-protocol §3.3's
+                // completeness principle governs raw-value CONTROL-CHAR
+                // checking, not this specific digest rendering).
                 format!("oci\u{1f}{registry}\u{1f}{repository}\u{1f}{digest}")
             }
             // registry.rs's index parser only ever constructs Git/Oci provenance

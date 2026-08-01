@@ -71,6 +71,13 @@ pub fn resolve_frozen(
                     ),
                 ));
             }
+            Some(ProvenanceRecord::Root { .. }) => {
+                // §14.5: the root-self entry is never fetched and carries no
+                // separate identity (None) — the CAS-presence check does not
+                // apply to it (it is never IN the store to begin with, by
+                // design). Skip straight to reconstruction, same as a
+                // workspace member skips it in `resolve_workspace_frozen` below.
+            }
             _ => {
                 // Pre-validate CAS presence for each dep before rebuilding.
                 // This ensures FROZEN-IDENTITY-NOT-IN-STORE is raised eagerly.
@@ -152,6 +159,13 @@ pub fn resolve_workspace_frozen(
                         locked.name
                     ),
                 ));
+            }
+            Some(ProvenanceRecord::Root { .. }) => {
+                // §14.5: a root-self entry is a standalone-only concept and
+                // is not expected in a workspace lockfile, but if present it
+                // is never fetched and carries no identity — skip the
+                // CAS-presence check the same way as the single-package path.
+                resolved.push(resolved_from_locked(locked)?);
             }
             _ => {
                 // Pre-validate CAS presence before rebuilding.

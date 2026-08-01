@@ -529,6 +529,7 @@ fn format_provenance_record(p: &ProvenanceRecord) -> String {
         ProvenanceRecord::Oci { registry, repository, digest, .. } => {
             format!("oci {registry}/{repository}@{}", &digest[..digest.len().min(15)])
         }
+        ProvenanceRecord::Root { name, .. } => format!("root {name}"),
     }
 }
 

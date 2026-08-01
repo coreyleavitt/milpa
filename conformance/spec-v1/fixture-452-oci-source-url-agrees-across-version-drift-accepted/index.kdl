@@ -1,0 +1,13 @@
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:2232b29cf8ca5c84ab47c67e7408babffaf16309ccea283a035729ba4d87d74a"
+        provenance {
+            kind "oci"
+            registry "ghcr.io"
+            repository "example/foo"
+            digest "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            source "https://github.com/example/foo.git"
+        }
+    }
+}

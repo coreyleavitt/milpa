@@ -173,6 +173,101 @@ fn leading_dash_oci_field_is_rejected() {
     );
 }
 
+// --- registry-protocol §3.3: the optional oci provenance `source` field ----
+// (the git repository an OCI artifact was packed and published from) -------
+
+#[test]
+fn oci_provenance_source_url_absent_by_default() {
+    // No `source` child on the oci provenance — an older (pre-this-field)
+    // index entry — so source_url parses to None, not an empty string or a
+    // hard error (registry-protocol §3.3 — optional, purely additive).
+    // Mirrors Python's `test_oci_provenance_source_url_absent_by_default`.
+    let text = format!(
+        "schema_version 1\n\
+         package \"bar\" {{\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"oci\"\n\
+         \x20           registry \"ghcr.io\"\n\
+         \x20           repository \"e/bar\"\n\
+         \x20           digest \"sha256:{}\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n",
+        "b".repeat(64)
+    );
+    let idx = Index::parse(&text).unwrap();
+    match &idx.packages[0].versions[0].provenances[0] {
+        Provenance::Oci { source_url, .. } => assert_eq!(*source_url, None),
+        other => panic!("expected oci, got {other:?}"),
+    }
+}
+
+#[test]
+fn oci_provenance_source_url_parsed_url_annotated() {
+    // `source (url)"…"` — the milpa KDL url convention — parses into
+    // `Provenance::Oci::source_url` as a plain string (registry-protocol
+    // §3.3), mirroring how `git`'s own `url` field already accepts the
+    // annotation. Mirrors Python's
+    // `test_oci_provenance_source_url_parsed_url_annotated`.
+    let text = format!(
+        "schema_version 1\n\
+         package \"z3\" {{\n\
+         \x20   namespace \"coreyleavitt\"\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"oci\"\n\
+         \x20           registry \"ghcr.io\"\n\
+         \x20           repository \"coreyleavitt/z3\"\n\
+         \x20           digest \"sha256:{}\"\n\
+         \x20           source (url)\"https://github.com/coreyleavitt/z3\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n",
+        "b".repeat(64)
+    );
+    let idx = Index::parse(&text).unwrap();
+    match &idx.packages[0].versions[0].provenances[0] {
+        Provenance::Oci { source_url, .. } => {
+            assert_eq!(source_url.as_deref(), Some("https://github.com/coreyleavitt/z3"))
+        }
+        other => panic!("expected oci, got {other:?}"),
+    }
+}
+
+#[test]
+fn oci_provenance_source_url_parsed_plain_string() {
+    // `source` also accepts a plain (non-annotated) string, per the milpa
+    // url convention's back-compat acceptance. Mirrors Python's
+    // `test_oci_provenance_source_url_parsed_plain_string`.
+    let text = format!(
+        "schema_version 1\n\
+         package \"z3\" {{\n\
+         \x20   namespace \"coreyleavitt\"\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"oci\"\n\
+         \x20           registry \"ghcr.io\"\n\
+         \x20           repository \"coreyleavitt/z3\"\n\
+         \x20           digest \"sha256:{}\"\n\
+         \x20           source \"https://github.com/coreyleavitt/z3\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n",
+        "b".repeat(64)
+    );
+    let idx = Index::parse(&text).unwrap();
+    match &idx.packages[0].versions[0].provenances[0] {
+        Provenance::Oci { source_url, .. } => {
+            assert_eq!(source_url.as_deref(), Some("https://github.com/coreyleavitt/z3"))
+        }
+        other => panic!("expected oci, got {other:?}"),
+    }
+}
+
 // --- TNG-UNSAFE-CONTROL-CHAR (CR2 — canonical-digest delimiter injection) ---
 //
 // index.kdl is attacker-controlled network input. KDL 2.0's `\u{XXXX}`
@@ -283,6 +378,33 @@ fn oci_registry_and_repository_control_char_via_kdl_escape_are_rejected() {
     );
     assert_eq!(
         Index::parse(&repository_text).unwrap_err().code(),
+        "TNG-UNSAFE-CONTROL-CHAR"
+    );
+}
+
+#[test]
+fn oci_provenance_source_control_char_via_kdl_escape_is_rejected() {
+    // The optional oci provenance `source` field gets the same control-
+    // character rejection as every other registry free-text field
+    // (registry-protocol §3.3 NORMATIVE — control-character rejection).
+    // Mirrors Python's `test_control_char_in_oci_source_via_kdl_escape`.
+    let text = format!(
+        "schema_version 1\n\
+         package \"bar\" {{\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"{ID1}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"oci\"\n\
+         \x20           registry \"ghcr.io\"\n\
+         \x20           repository \"e/bar\"\n\
+         \x20           digest \"{ID1}\"\n\
+         \x20           source \"https://example.com/foo\\u{{9}}.git\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n"
+    );
+    assert_eq!(
+        Index::parse(&text).unwrap_err().code(),
         "TNG-UNSAFE-CONTROL-CHAR"
     );
 }

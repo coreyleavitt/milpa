@@ -2457,6 +2457,7 @@ def _format_provenance(p: object) -> str:
         LocalProvenanceRecord,
         MemberProvenanceRecord,
         OciProvenanceRecord,
+        RootProvenanceRecord,
         TarballProvenanceRecord,
     )
 
@@ -2475,6 +2476,8 @@ def _format_provenance(p: object) -> str:
         return f"member {p.name}"
     if isinstance(p, OciProvenanceRecord):
         return f"oci {p.registry}/{p.repository}@{p.digest[:15]}"
+    if isinstance(p, RootProvenanceRecord):
+        return f"root {p.name}"
     return str(p)
 
 
@@ -3380,6 +3383,14 @@ class PublishOutputRecord:
     run never pushes anything, so those fields don't merely happen to be
     absent — they don't exist yet. Modeling that as ``None`` would read as
     "pushed to nothing" rather than "hasn't pushed".
+
+    ``source_url`` IS genuinely optional (carried straight from
+    ``PublishReceipt.source_url`` / ``PublishPlan.source_url``): ``None`` when
+    the published repo has no ``origin`` remote configured. Unlike
+    ``oci_ref``/``layer_digest``, this absence is a real "hasn't happened"
+    outcome even on a completed real run, so it IS modeled as an ``Optional``
+    field here (serializes to JSON ``null``, key always present) rather than
+    split into a third record type.
     """
 
     name: str
@@ -3388,6 +3399,7 @@ class PublishOutputRecord:
     oci_ref: str
     layer_digest: str
     artifact_type: str
+    source_url: str | None = None
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -3550,6 +3562,7 @@ def cmd_publish(
         oci_ref=receipt.oci_ref,
         layer_digest=receipt.layer_digest,
         artifact_type=receipt.artifact_type,
+        source_url=receipt.source_url,
     )
 
     # M6: the publish is already irreversible at this point (pushed+signed).
