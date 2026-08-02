@@ -785,7 +785,15 @@ def edgeset_to_terms(
     for entry in es.requires:
         if isinstance(entry, UrlRequire):
             # URL requires → full() self-term (Axis A (a), D-A2).
-            dep_name = _name_from_url(entry.url)
+            # ONE-NAME-PER-DECLARATION: prefer the DECLARED node name
+            # (milpa.kdl/.nimble source, e.g. `"z3" git=(url)"…/nim-z3.git"`)
+            # so the solver term this parent candidate carries agrees with
+            # the name `edgeset_to_bfs_deps` enqueues the child under (it
+            # already prefers `entry.name`) and the name root-authority /
+            # `overrides {}` / the provenance gate key on. Falls back to the
+            # URL-tail derivation only when no declared name exists (DepDecl-
+            # sourced entries, where `entry.name` is always None).
+            dep_name = entry.name if entry.name is not None else _name_from_url(entry.url)
             if dep_name is None:
                 continue
             if dep_name not in seen_dep_names:

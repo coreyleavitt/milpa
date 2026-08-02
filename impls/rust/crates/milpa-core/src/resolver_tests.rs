@@ -6812,3 +6812,140 @@ fn root_self_no_version_set_on_root_is_also_unaffected() {
     let names: Vec<&str> = graph.deps.iter().map(|d| d.name.as_str()).collect();
     assert_eq!(names, vec!["dep-e"]);
 }
+
+// ---------------------------------------------------------------------------
+// Alias-name bug (HIGH): a transitive milpa.kdl's KDL node name for a nested
+// `git=` sub-dep must be the AUTHORITATIVE name across the whole
+// edge-sourcing boundary — the solver term the parent candidate carries, the
+// BFS-enqueued dep, the provenance-gate key, and root-authority/overrides
+// suppression must all agree on ONE name.
+//
+// Mirrors `impls/python/tests/test_kdl_transitive_alias_name.py`: the
+// wrapper's own `milpa.kdl` declares a git sub-dep under node name `"foo"`
+// whose URL tail is deliberately different (`real-bar-repo`). Before the
+// fix, `edgeset_to_extracted` derived the parent's solver term/BFS-enqueue
+// name purely from the URL tail (`name_from_url`), disagreeing with the
+// gate/override/root-authority name (the declared node name) — collapsing
+// resolution to SOLVE-CONFLICT even though the declared name is fully
+// satisfiable by a root dep or an `overrides {}` rule.
+// ---------------------------------------------------------------------------
+
+const ALIAS_WRAPPER_URL: &str = "https://example.com/alias-wrapper.git";
+// Deliberately named so the URL tail ("real-bar-repo") differs from the node
+// name the wrapper's milpa.kdl declares for it ("foo").
+const ALIAS_FOO_URL: &str = "https://example.com/alias-real-bar-repo.git";
+
+fn alias_wrapper_and_foo_reg() -> FakeReg {
+    let wrapper_kdl = format!(
+        "name \"alias-wrapper\"\nkind \"library\"\ndeps {{\n    \"foo\" git=(url)\"{ALIAS_FOO_URL}\" ref=\"main\"\n}}\n"
+    );
+    FakeReg::git(&[
+        (
+            ALIAS_WRAPPER_URL,
+            "main",
+            milpa_kdl("aliaswrapper0aliaswrapper0aliaswrapper0", &wrapper_kdl),
+        ),
+        (
+            ALIAS_FOO_URL,
+            "main",
+            nimble("aliasfoo0aliasfoo0aliasfoo0aliasfoo0", ""),
+        ),
+    ])
+}
+
+#[test]
+fn alias_name_root_dep_unifies_with_mismatched_alias_name() {
+    // Root directly declares "foo" at the SAME url/ref the transitive
+    // wrapper package aliases under node name "foo" (url tail
+    // "alias-real-bar-repo"). Root authority over "foo" must unify with the
+    // transitive's "foo" requirement — resolution succeeds, no conflict.
+    let reg = alias_wrapper_and_foo_reg();
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![
+        url_dep("alias-wrapper", ALIAS_WRAPPER_URL, "main"),
+        url_dep("foo", ALIAS_FOO_URL, "main"),
+    ]);
+    let graph = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+
+    let mut names: Vec<&str> = graph.deps.iter().map(|d| d.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, vec!["alias-wrapper", "foo"]);
+
+    let foo = graph.deps.iter().find(|d| d.name == "foo").unwrap();
+    match foo.provenances.first().expect("provenance") {
+        ProvenanceRecord::Git { url, .. } => assert_eq!(url, ALIAS_FOO_URL),
+        other => panic!("expected git, got {other:?}"),
+    }
+}
+
+#[test]
+fn alias_name_override_unifies_with_mismatched_alias_name() {
+    // Root has NO direct dep on "foo" — instead an `overrides {}` rule
+    // redirects the name "foo" to the same url/ref. Root authority via
+    // override must ALSO unify with the transitive's declared-name "foo"
+    // requirement.
+    let reg = alias_wrapper_and_foo_reg();
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest_full(
+        vec![url_dep("alias-wrapper", ALIAS_WRAPPER_URL, "main")],
+        Vec::new(),
+        vec![Override {
+            name: "foo".into(),
+            target: OverrideTarget::Git {
+                url: ALIAS_FOO_URL.into(),
+                git_ref: "main".into(),
+            },
+            version: None,
+        }],
+    );
+    let graph = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+
+    let mut names: Vec<&str> = graph.deps.iter().map(|d| d.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, vec!["alias-wrapper", "foo"]);
+
+    let foo = graph.deps.iter().find(|d| d.name == "foo").unwrap();
+    match foo.provenances.first().expect("provenance") {
+        ProvenanceRecord::Git { url, .. } => assert_eq!(url, ALIAS_FOO_URL),
+        other => panic!("expected git, got {other:?}"),
+    }
+}
+
+#[test]
+fn alias_name_ordinary_matching_name_transitive_still_works() {
+    // Regression pin: an ordinary transitive git dep whose node name ALREADY
+    // matches its URL tail must keep working exactly as before (no root
+    // involvement needed — the transitive's own single candidate satisfies it).
+    let baz_url = "https://example.com/baz.git";
+    let wrapper_url = "https://example.com/alias-wrapper-baz.git";
+    let wrapper_kdl = format!(
+        "name \"alias-wrapper-baz\"\nkind \"library\"\ndeps {{\n    baz git=(url)\"{baz_url}\" ref=\"main\"\n}}\n"
+    );
+    let reg = FakeReg::git(&[
+        (
+            wrapper_url,
+            "main",
+            milpa_kdl("aliaswrapperbaz0aliaswrapperbaz0", &wrapper_kdl),
+        ),
+        (baz_url, "main", nimble("aliasbaz0aliasbaz0aliasbaz0", "")),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("alias-wrapper-baz", wrapper_url, "main")]);
+    let graph = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+
+    let mut names: Vec<&str> = graph.deps.iter().map(|d| d.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, vec!["alias-wrapper-baz", "baz"]);
+}

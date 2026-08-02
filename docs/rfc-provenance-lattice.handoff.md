@@ -4,7 +4,16 @@
 - `1feffe4` resolution-semantics RFC · `1ff17bd` #193 provenance lattice · `f889621` OCI content-hash fallback · `31454de` root-satisfies-own-name (spec §14) + OCI source-URL provenance validation (registry-protocol §3.3, resolver-semantics §10 3-step, cli-contract §10.2).
 - Final: Python 3498/0-fail; Rust workspace exit 0 (milpa-core 945, milpa-cli 162, milpa-conformance 224, bijection + corpus ok).
 
-## REMAINING (crosses into live-registry / cross-repo — Corey-gated)
+## ALL CODE SHIPPED (milpa + tianguis)
+- milpa main: `31454de` (root-satisfies-own-name §14 + OCI source-URL data/resolver/publish), `79be709` (§3.5.3 OCI digest source inclusion). Python 3500/0-fail; Rust workspace exit 0 (946 milpa-core, bijection+corpus ok).
+- tianguis main: `2770d3d` (OCI source write-path: model/kdl_io/addentry/cli + dispatch/handler.go + publish action + commit-entry workflow). Full Nim suite green. index.kdl untouched. Rebased cleanly over the daily vendor/attest bot commits.
+
+## REMAINING — ONE live-CI step, Corey's to trigger
+- **Publish a new softlink version through its (now source-recording) publish CI.** softlink's existing tianguis entry (0.11.0) has no `source` and can't be cleanly backfilled (mergeVendored idempotency discards a same-version re-add; a hand-edit is a ratchet mutation). A NEW version's first admission carries `source` as an ordinary append. This is a live OCI push + GH Actions + dispatch chain I can't run.
+- **Then amoxtli resolves:** its transitive git-references softlink@main; once tianguis's softlink entry records `source`, milpa source-URL-matches git@main → agree → softlink resolves (no conflict). Then re-resolve amoxtli → commit ONLY its milpa.lock.
+- **Bonus cleanup (softlink repo, Corey):** softlink can now DROP `overrides { pkg "softlink" local="." }` — root-satisfies-own-name (§14) makes it unnecessary.
+
+## (historical) earlier remaining-notes
 - **amoxtli STILL blocked on softlink:** the milpa RESOLVER now supports OCI source-URL match, but amoxtli won't resolve until softlink's tianguis OCI entry actually RECORDS its source url. Getting it there needs a LIVE tianguis-registry op: (a) manual backfill of tianguis index.kdl (may trip the append-only ratchet TNG-ENTRY-MUTATED), or (b) re-publish softlink via the new milpa publish (records source) + update the tianguis composite action to WRITE the source field into the index entry. Both are cross-repo, live-registry — confirm approach with Corey before mutating the registry. Interim alt: root-declare softlink in amoxtli milpa.kdl (tier-1) — but Corey said stay off amoxtli's milpa.kdl.
 - **§3.5.3 ratchet-digest source inclusion (flagged by the OCI-data agent):** the oci canonical-violation digest doesn't include `source` — violation DETECTION is unaffected (full typed compare), only the habituation-suppression digest coalesces source-only-differing violations. Both impls, lockstep + differential fixture. Touches the LIVE ratchet's canonical digest (one-time re-alert side effect). Small; do-not-defer candidate but interacts with the tianguis work.
 - **Follow-ups (Corey-gated GH issues):** workspace member required by an external transitive → TNG-NOT-FOUND (pre-existing, found by the root-self agent).

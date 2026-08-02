@@ -226,7 +226,7 @@ fn parse_require_node(node: &KdlNode) -> Option<RequireEntry> {
             .and_then(|e| e.value().as_string())
             .unwrap_or("")
             .to_string();
-        Some(RequireEntry::Url(UrlRequire { url, ref_, predicates: Vec::new(), flag_requests: Vec::new() }))
+        Some(RequireEntry::Url(UrlRequire { url, ref_, predicates: Vec::new(), flag_requests: Vec::new(), name: None }))
     } else {
         // Named form: require "<name>" "<constraint>"
         let name = first.value().as_string()?.to_string();
@@ -300,6 +300,7 @@ mod tests {
                     ref_: "v3.2.0".to_string(),
                     predicates: Vec::new(),
                     flag_requests: Vec::new(),
+                    name: None,
                 }),
             ],
             "src".to_string(),
@@ -418,6 +419,7 @@ mod tests {
                 ref_: "main".into(),
                 predicates: Vec::new(),
                 flag_requests: Vec::new(),
+                name: None,
             })]
         );
     }

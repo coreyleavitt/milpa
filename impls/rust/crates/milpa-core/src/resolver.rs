@@ -3668,7 +3668,21 @@ impl<'a> ResolveProvider<'a> {
         for entry in &es.requires {
             match entry {
                 RequireEntry::Url(u) => {
-                    let dep_name = name_from_url(&u.url)?;
+                    // Prefer the DECLARED KDL node name over the URL-tail
+                    // derivation (alias-name fix, spec §10.1 override-a-transitive
+                    // workflow): a transitive milpa.kdl may declare a git sub-dep
+                    // under a node name that differs from its URL's tail (e.g.
+                    // `"z3" git=(url)"https://…/nim-z3.git"`). The parent's solver
+                    // term, the BFS child enqueue (`Item::Url` below), the
+                    // provenance-gate key, and root-authority/overrides
+                    // suppression must all agree on ONE name — the declared name
+                    // when present (`u.name`), falling back to the URL-tail
+                    // derivation only for DepDecl-sourced entries (`u.name` is
+                    // `None`). Mirrors Python's `edgeset_to_terms`.
+                    let dep_name = match &u.name {
+                        Some(n) => n.clone(),
+                        None => name_from_url(&u.url)?,
+                    };
                     // Dedup the SOLVER TERM only — a dep name must appear exactly
                     // once as a Term.
                     // Axis A (a)/D-A2: full() self-term, never eq(sentinel).

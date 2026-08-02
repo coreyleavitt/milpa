@@ -696,6 +696,22 @@ pub struct UrlRequire {
     pub predicates: Vec<Predicate>,
     /// S4b: consumer-side flag requests (RFC #23 §3.1.3); empty by default.
     pub flag_requests: Vec<FlagRequest>,
+    /// The declared dep name when sourced from a `milpa.kdl` (the KDL node
+    /// name) — mirrors `milpa/dep_decl.py`'s `UrlRequire.name`. `None` when
+    /// sourced from a DepDecl artifact (URL + ref only, no name) or a
+    /// `.nimble` file (nimble `requires` lines have no separate node name).
+    ///
+    /// This is THE fix for the alias-name bug (spec §10.1 override-a-
+    /// transitive workflow): a transitive `milpa.kdl` may declare a git
+    /// sub-dep under a node name that differs from its URL's tail (e.g.
+    /// `"z3" git=(url)"https://…/nim-z3.git"`). The parent's solver term,
+    /// the BFS child enqueue, the provenance-gate key, and root-authority/
+    /// overrides suppression must all agree on ONE name — the DECLARED name
+    /// when present, falling back to the URL-tail derivation only when no
+    /// declared name exists. See `edgeset_to_terms` / `resolver.rs`'s
+    /// `edgeset_to_extracted`, both of which prefer this field over
+    /// `url_tail_name`/`name_from_url`.
+    pub name: Option<String>,
 }
 
 /// One entry in `EdgeSet.requires`: either a named dep or a URL dep.
@@ -1043,6 +1059,7 @@ mod tests {
             ref_: "main".into(),
             predicates: Vec::new(),
             flag_requests: Vec::new(),
+            name: None,
         };
         let predicated = UrlRequire {
             url: "https://example.com/foo.git".into(),
@@ -1053,6 +1070,7 @@ mod tests {
                 negated: false,
             }],
             flag_requests: Vec::new(),
+            name: None,
         };
         assert_ne!(plain, predicated);
     }

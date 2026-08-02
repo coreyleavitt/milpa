@@ -98,11 +98,17 @@ pub fn build_edgeset_with_flags(manifest: &Manifest, active_flags: &BTreeSet<Str
             Dep::Url(u) => {
                 // S4b: carry flag_requests so the caller can reconstruct Item::Url.flag_requests
                 // for multi-consumer union (§3.1.3). FlagRequest is the SSOT (milpa-types).
+                //
+                // Carry the DECLARED KDL node name (`u.name`) so the parent's
+                // solver term / BFS enqueue / provenance-gate key all agree with
+                // this name even when it differs from the URL's tail (the
+                // alias-name bug — spec §10.1 override-a-transitive workflow).
                 requires.push(RequireEntry::Url(UrlRequire {
                     url: u.git.clone(),
                     ref_: u.git_ref.clone(),
                     predicates: Vec::new(),
                     flag_requests: u.flag_requests.clone(),
+                    name: Some(u.name.clone()),
                 }));
             }
             Dep::Named(n) => {
@@ -243,6 +249,12 @@ impl NimbleEdgeSource {
                         ref_,
                         predicates: predicates.clone(),
                         flag_requests: Vec::new(),
+                        // Nimble `requires` lines carry only a URL, no separate
+                        // declared node name — always fall back to the URL-tail
+                        // derivation downstream (matches Python: nimble-sourced
+                        // UrlDep.name is itself URL-derived, so leaving this
+                        // None and falling back yields an identical result).
+                        name: None,
                     }));
                 }
                 NimbleRequirement::Named { name, constraint, predicates, .. } => {
@@ -415,6 +427,7 @@ pub fn manifest_to_edgeset(manifest: &Manifest) -> EdgeSet {
                     ref_: u.git_ref.clone(),
                     predicates: Vec::new(),
                     flag_requests: Vec::new(),
+                    name: Some(u.name.clone()),
                 }));
             }
             Dep::Named(n) => {
@@ -654,10 +667,19 @@ pub fn edgeset_to_terms(
     for entry in &es.requires {
         match entry {
             RequireEntry::Url(u) => {
-                // URL dep name derived from the URL tail (mirrors name_from_url in resolver).
-                let name = match url_tail_name(&u.url) {
-                    Some(n) => n,
-                    None => continue, // malformed URL; skip silently (resolver handles error paths)
+                // Prefer the DECLARED node name (milpa.kdl/nimble source) over the
+                // URL-tail derivation — mirrors Python's `edgeset_to_terms`. This is
+                // the alias-name fix: a transitive milpa.kdl may declare a git
+                // sub-dep under a node name that differs from its URL's tail, and
+                // that declared name must be what the parent's solver term / BFS
+                // enqueue / gate key all agree on. Only DepDecl-sourced entries
+                // (name=None) fall back to the URL-tail derivation.
+                let name = match &u.name {
+                    Some(n) => n.clone(),
+                    None => match url_tail_name(&u.url) {
+                        Some(n) => n,
+                        None => continue, // malformed URL; skip silently (resolver handles error paths)
+                    },
                 };
                 // Dedup the SOLVER TERM only (one Term per name).
                 // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
@@ -1112,6 +1134,7 @@ overrides {
                 ref_: "main".to_string(),
                 predicates: Vec::new(),
                 flag_requests: Vec::new(),
+                name: None,
             })],
             src_dir: String::new(),
             source: EdgeSource::MilpaKdl,
@@ -1197,12 +1220,14 @@ overrides {
                     ref_: "main".to_string(),
                     predicates: vec![p_linux.clone()],
                     flag_requests: Vec::new(),
+                    name: None,
                 }),
                 RequireEntry::Url(UrlRequire {
                     url: url.to_string(),
                     ref_: "main".to_string(),
                     predicates: vec![p_mac.clone()],
                     flag_requests: Vec::new(),
+                    name: None,
                 }),
             ],
             src_dir: String::new(),
