@@ -1559,30 +1559,25 @@ part of `spec/errors.md` as of this spec-only amendment:
 >
 > Instantiation for `provenances` (live from A4b): each element renders as
 > `git\x1f<url>\x1f<ref>\x1f<commit_sha-or-empty>` or
-> `oci\x1f<registry>\x1f<repository>\x1f<digest>`, per the record's `kind`
-> (§3.3); an unrecognized `kind` (forward-compat skip, §3.3) never reaches
-> this rendering because it is dropped at parse time. Both implementations
-> MUST produce byte-identical output for the same candidate provenance
-> list; a differential conformance fixture pins this (`rfc-registry-append-
-> only.md`'s A4b).
+> `oci\x1f<registry>\x1f<repository>\x1f<digest>\x1f<source-or-empty>`, per
+> the record's `kind` (§3.3); an unrecognized `kind` (forward-compat skip,
+> §3.3) never reaches this rendering because it is dropped at parse time.
+> Both implementations MUST produce byte-identical output for the same
+> candidate provenance list; a differential conformance fixture pins this
+> (`rfc-registry-append-only.md`'s A4b, and fixture 453 for the `oci`
+> `source` field specifically).
 >
-> KNOWN GAP (tracked, not yet closed): the `oci` instantiation above does
-> NOT yet include the optional `source` field (§3.3) in its rendering. This
-> does not weaken *detection* — the dominance function above compares the
-> full typed `provenances` value (§3.5.1's "full-field value equality"),
-> so a `source`-only mutation is still caught as a violation exactly like
-> any other field change — but it DOES mean two distinct violations that
-> differ only in `source` currently render to the SAME `candidate_value`
-> bytes, which is precisely the digest-collision blind spot this NORMATIVE
-> subsection exists to close for every OTHER field (see the `git`
-> instantiation's `commit_sha`, added for the identical reason). Closing it
-> requires appending `\x1f<source-or-empty>` to the `oci` encoding in BOTH
-> reference implementations' provenance-rendering functions
-> (`index_ratchet_seam.py::_provenance_canonical_raw` /
-> `index_ratchet_seam.rs::provenance_canonical_raw`) in lockstep, plus a
-> differential conformance fixture pinning the new byte output (mirroring
-> A4b) — deferred to a follow-up slice rather than bundled into the `source`
-> field's initial (purely additive, parse/emit-only) introduction.
+> CLOSED (was tracked as a KNOWN GAP): the `oci` instantiation's optional
+> `source` field (§3.3) is now part of the rendering (the trailing
+> `\x1f<source-or-empty>` above), for the identical reason the `git`
+> instantiation's `commit_sha` participates: detection was never weakened
+> by its prior absence — the dominance function above compares the full
+> typed `provenances` value (§3.5.1's "full-field value equality"), so a
+> `source`-only mutation was always caught as a violation — but two
+> distinct violations differing only in `source` used to render to the
+> SAME `candidate_value` bytes, which was precisely the digest-collision
+> blind spot this NORMATIVE subsection exists to close for every field.
+> Two such violations now hash distinctly.
 >
 > Instantiation for `attestation` (live from A6): the attestation record's
 > rendering follows the same method — field order `kind`, `signer`

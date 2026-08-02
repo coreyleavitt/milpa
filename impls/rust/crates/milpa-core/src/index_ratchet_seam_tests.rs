@@ -316,6 +316,85 @@ fn provenance_in_place_mutation_hand_computed_digest_vector() {
     );
 }
 
+// registry-protocol §3.5.3's closed KNOWN GAP: an `oci` provenance mutation
+// that differs ONLY in the optional `source` field used to render identical
+// `candidate_value` bytes to one that never had a `source` at all — the
+// exact digest-collision blind spot the NORMATIVE canonical-rendering
+// subsection exists to close for every other field (mirrors the `git`
+// instantiation's `commit_sha` coverage above). Fixed by appending
+// `\x1f<source-or-empty>` to the `oci` encoding in `provenance_canonical_raw`.
+// The expected hex is ported VERBATIM from
+// `test_index_history_ratchet.py::TestProvenanceCanonicalDigest::test_oci_source_field_included_in_digest`
+// — byte equality proves both implementations render the identical
+// candidate text identically. Same hex is pinned again in conformance
+// fixture 453 (mirroring fixture 386).
+#[test]
+fn provenance_oci_source_field_included_in_digest() {
+    let baseline = format!(
+        "schema_version 1\n\
+         package \"bar\" {{\n\
+         \x20   namespace \"acme\"\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"sha256:{}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"oci\"\n\
+         \x20           registry \"ghcr.io\"\n\
+         \x20           repository \"acme/bar\"\n\
+         \x20           digest \"sha256:{}\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n",
+        "a".repeat(64),
+        "b".repeat(64)
+    );
+    let candidate = format!(
+        "schema_version 1\n\
+         package \"bar\" {{\n\
+         \x20   namespace \"acme\"\n\
+         \x20   version \"1.0.0\" {{\n\
+         \x20       content_hash \"sha256:{}\"\n\
+         \x20       provenance {{\n\
+         \x20           kind \"oci\"\n\
+         \x20           registry \"ghcr.io\"\n\
+         \x20           repository \"acme/bar\"\n\
+         \x20           digest \"sha256:{}\"\n\
+         \x20           source \"https://example.com/bar.git\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n",
+        "a".repeat(64),
+        "b".repeat(64)
+    );
+    let (_, baseline_state) = build_index_state(&baseline).unwrap();
+    let (_, candidate_state) = build_index_state(&candidate).unwrap();
+    let outcome = Baseline::new(baseline_state).check(&candidate_state);
+
+    assert_eq!(outcome.violations.len(), 1);
+    let v = &outcome.violations[0];
+    assert_eq!(v.class, "TNG-ENTRY-MUTATED");
+    assert_eq!(v.field, "provenances");
+    assert_eq!(v.kind, "provenance-removed");
+
+    let expected_candidate_value = format!(
+        "oci\u{1f}ghcr.io\u{1f}acme/bar\u{1f}sha256:{}\u{1f}https://example.com/bar.git",
+        "b".repeat(64)
+    );
+    assert_eq!(v.candidate_value, expected_candidate_value);
+
+    // baseline_value: absent `source` renders as the empty string (trailing
+    // `\x1f`) — a new canonical form, not a compat-preserving one (no
+    // committed fixture pins the pre-`source` oci digest bytes).
+    let expected_baseline_value =
+        format!("oci\u{1f}ghcr.io\u{1f}acme/bar\u{1f}sha256:{}\u{1f}", "b".repeat(64));
+    assert_eq!(v.baseline_value, expected_baseline_value);
+
+    let digest = canonical_digest(&outcome.violations);
+    assert_eq!(
+        digest,
+        "50dd2402807e46c2645f6ef4eebf3e75b67321aacda2aa758fed9224041f31ee"
+    );
+}
+
 #[test]
 fn provenance_append_only_no_violation() {
     let baseline = provenance_index_text("cafef00dcafef00dcafef00dcafef00dcafef00d");

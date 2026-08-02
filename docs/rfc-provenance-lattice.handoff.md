@@ -1,5 +1,15 @@
 # Provenance authority — validate-against-registry (#193) — handoff
 
+## SHIPPED to milpa main (both impls, byte-identical, green)
+- `1feffe4` resolution-semantics RFC · `1ff17bd` #193 provenance lattice · `f889621` OCI content-hash fallback · `31454de` root-satisfies-own-name (spec §14) + OCI source-URL provenance validation (registry-protocol §3.3, resolver-semantics §10 3-step, cli-contract §10.2).
+- Final: Python 3498/0-fail; Rust workspace exit 0 (milpa-core 945, milpa-cli 162, milpa-conformance 224, bijection + corpus ok).
+
+## REMAINING (crosses into live-registry / cross-repo — Corey-gated)
+- **amoxtli STILL blocked on softlink:** the milpa RESOLVER now supports OCI source-URL match, but amoxtli won't resolve until softlink's tianguis OCI entry actually RECORDS its source url. Getting it there needs a LIVE tianguis-registry op: (a) manual backfill of tianguis index.kdl (may trip the append-only ratchet TNG-ENTRY-MUTATED), or (b) re-publish softlink via the new milpa publish (records source) + update the tianguis composite action to WRITE the source field into the index entry. Both are cross-repo, live-registry — confirm approach with Corey before mutating the registry. Interim alt: root-declare softlink in amoxtli milpa.kdl (tier-1) — but Corey said stay off amoxtli's milpa.kdl.
+- **§3.5.3 ratchet-digest source inclusion (flagged by the OCI-data agent):** the oci canonical-violation digest doesn't include `source` — violation DETECTION is unaffected (full typed compare), only the habituation-suppression digest coalesces source-only-differing violations. Both impls, lockstep + differential fixture. Touches the LIVE ratchet's canonical digest (one-time re-alert side effect). Small; do-not-defer candidate but interacts with the tianguis work.
+- **Follow-ups (Corey-gated GH issues):** workspace member required by an external transitive → TNG-NOT-FOUND (pre-existing, found by the root-self agent).
+
+
 - **Stage:** COMPLETE — shipped in BOTH impls, byte-identical. Closes #193.
 - **Final suites GREEN:** Python 3465/0-fail/33-skip; Rust workspace exit 0
   (milpa-core 921, milpa-cli 162, milpa-conformance 224, bijection + conformance

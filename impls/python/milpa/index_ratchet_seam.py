@@ -109,19 +109,31 @@ def _provenance_canonical_raw(provenances: tuple[object, ...]) -> str:
     a naive ``str(value)``/``repr(value)`` fallback renders Python
     dataclasses one way and Rust's ``Debug`` derive another way, for
     identical semantic content. Each record is encoded as
-    ``<kind>\\x1f<field1>\\x1f<field2>\\x1f<field3>`` in the record's own
-    declared field order (git: url, ref, commit_sha; oci: registry,
-    repository, digest; an absent optional field renders as the empty
-    string); records are sorted lexicographically by their own encoding
-    (never by document position — order is advisory-mutable, §3.5.1) and
-    joined with ``\\x1e``. Mirrors
+    ``<kind>\\x1f<field1>\\x1f<field2>\\x1f<field3>[\\x1f<field4>]`` in the
+    record's own declared field order (git: url, ref, commit_sha; oci:
+    registry, repository, digest, source; an absent optional field renders
+    as the empty string); records are sorted lexicographically by their own
+    encoding (never by document position — order is advisory-mutable,
+    §3.5.1) and joined with ``\\x1e``. The ``oci`` instantiation's ``source``
+    field was added closing the digest-collision gap tracked at
+    registry-protocol §3.5.3 (two violations differing only in ``source``
+    used to hash identically). Mirrors
     ``index_ratchet_seam.rs::provenance_canonical_raw`` byte-for-byte."""
     encoded: list[str] = []
     for p in provenances:
         if isinstance(p, GitIndexProvenance):
             encoded.append("git\x1f" + p.url + "\x1f" + p.ref + "\x1f" + (p.commit_sha or ""))
         elif isinstance(p, OciIndexProvenance):
-            encoded.append("oci\x1f" + p.registry + "\x1f" + p.repository + "\x1f" + p.digest)
+            encoded.append(
+                "oci\x1f"
+                + p.registry
+                + "\x1f"
+                + p.repository
+                + "\x1f"
+                + p.digest
+                + "\x1f"
+                + (p.source_url or "")
+            )
         else:  # pragma: no cover — parse_index never constructs other kinds (§3.3)
             encoded.append("unrecognized\x1f" + repr(p))
     encoded.sort()

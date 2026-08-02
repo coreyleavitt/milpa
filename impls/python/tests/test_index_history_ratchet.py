@@ -529,6 +529,70 @@ package "bar" {
         )
         assert canonical_digest(outcome.violations) == expected_digest
 
+    def test_oci_source_field_included_in_digest(self) -> None:
+        """registry-protocol §3.5.3's closed KNOWN GAP: an ``oci`` provenance
+        mutation that differs ONLY in the optional ``source`` field used to
+        render identical ``candidate_value`` bytes to one that never had a
+        ``source`` at all — the exact digest-collision blind spot the
+        NORMATIVE canonical-rendering subsection exists to close for every
+        other field (mirrors the ``git`` instantiation's ``commit_sha``
+        coverage above). Fixed by appending ``\\x1f<source-or-empty>`` to the
+        ``oci`` encoding in ``_provenance_canonical_raw``. Same hex is ported
+        verbatim into ``index_ratchet_seam_tests.rs`` and conformance fixture
+        453 (cross-impl differential pin, mirroring fixture 386)."""
+        baseline_text = """schema_version 1
+package "bar" {
+    namespace "acme"
+    version "1.0.0" {
+        content_hash "sha256:%s"
+        provenance {
+            kind "oci"
+            registry "ghcr.io"
+            repository "acme/bar"
+            digest "sha256:%s"
+        }
+    }
+}
+""" % ("a" * 64, "b" * 64)
+        candidate_text = baseline_text.replace(
+            'digest "sha256:%s"\n        }' % ("b" * 64),
+            'digest "sha256:%s"\n            source "https://example.com/bar.git"\n        }' % ("b" * 64),
+        )
+        _, baseline_state = build_index_state(baseline_text)
+        _, candidate_state = build_index_state(candidate_text)
+        outcome = Baseline(baseline_state).check(candidate_state)
+
+        assert len(outcome.violations) == 1
+        v = outcome.violations[0]
+        assert v.class_ == TNG_ENTRY_MUTATED
+        assert v.field == "provenances"
+        assert v.kind == "provenance-removed"
+
+        candidate_value = (
+            "oci\x1fghcr.io\x1facme/bar\x1fsha256:" + "b" * 64 + "\x1fhttps://example.com/bar.git"
+        )
+        assert v.candidate_value == candidate_value
+
+        # baseline_value: same rendering, absent `source` renders as the
+        # empty string (trailing `\x1f`) — NOT the same bytes as before
+        # `source` existed in the encoding at all. That's expected: this is
+        # a new canonical form, not a compat-preserving one (no committed
+        # fixture pins the pre-`source` oci digest bytes — verified via the
+        # conformance corpus).
+        baseline_value = "oci\x1fghcr.io\x1facme/bar\x1fsha256:" + "b" * 64 + "\x1f"
+        assert v.baseline_value == baseline_value
+
+        expected_line = (
+            "TNG-ENTRY-MUTATED\tacme\tbar\t1.0.0\tprovenances\tprovenance-removed\t"
+            + candidate_value
+            + "\n"
+        )
+        expected_digest = hashlib.sha256(expected_line.encode("utf-8")).hexdigest()
+        assert expected_digest == (
+            "50dd2402807e46c2645f6ef4eebf3e75b67321aacda2aa758fed9224041f31ee"
+        )
+        assert canonical_digest(outcome.violations) == expected_digest
+
     def test_append_only_no_violation(self) -> None:
         """A NEW provenance record appended to the multiset is legal — the
         removal check only fires when a baseline record's encoding is

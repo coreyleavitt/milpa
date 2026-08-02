@@ -190,13 +190,17 @@ fn index_state_from(schema_version: Option<i64>, attestation_epoch: Option<Strin
 /// format for `Vec<Provenance>`, which diverges byte-for-byte from Python's
 /// dataclass-tuple `str()` fallback for identical semantic content — this
 /// function supplies the `raw` explicitly so that fallback is never reached
-/// in production. Each record is encoded as `<kind>\x1f<field1>\x1f<field2>\x1f<field3>` in the
+/// in production. Each record is encoded as
+/// `<kind>\x1f<field1>\x1f<field2>\x1f<field3>[\x1f<field4>]` in the
 /// record's own declared field order (git: url, ref, commit_sha; oci:
-/// registry, repository, digest; an absent optional field renders as the
-/// empty string); records are sorted lexicographically by their own
+/// registry, repository, digest, source; an absent optional field renders
+/// as the empty string); records are sorted lexicographically by their own
 /// encoding (never by document position — order is advisory-mutable,
-/// §3.5.1) and joined with `\x1e`. Mirrors
-/// `index_ratchet_seam.py::_provenance_canonical_raw` byte-for-byte.
+/// §3.5.1) and joined with `\x1e`. The `oci` instantiation's `source` field
+/// was added closing the digest-collision gap tracked at registry-protocol
+/// §3.5.3 (two violations differing only in `source` used to hash
+/// identically). Mirrors `index_ratchet_seam.py::_provenance_canonical_raw`
+/// byte-for-byte.
 fn provenance_canonical_raw(provenances: &[milpa_types::Provenance]) -> String {
     use milpa_types::Provenance;
     let mut encoded: Vec<String> = provenances
@@ -205,16 +209,11 @@ fn provenance_canonical_raw(provenances: &[milpa_types::Provenance]) -> String {
             Provenance::Git { url, ref_spec, commit_sha } => {
                 format!("git\u{1f}{url}\u{1f}{ref_spec}\u{1f}{}", commit_sha.as_deref().unwrap_or(""))
             }
-            Provenance::Oci { registry, repository, digest, .. } => {
-                // NOTE: `source_url` is deliberately NOT rendered into this
-                // digest — mirrors Python's `_provenance_canonical_raw`,
-                // which also encodes only registry/repository/digest for an
-                // oci record. This one encoding is the exception to the
-                // general "every field participates in append-only
-                // multiset equality" rule (registry-protocol §3.3's
-                // completeness principle governs raw-value CONTROL-CHAR
-                // checking, not this specific digest rendering).
-                format!("oci\u{1f}{registry}\u{1f}{repository}\u{1f}{digest}")
+            Provenance::Oci { registry, repository, digest, source_url } => {
+                format!(
+                    "oci\u{1f}{registry}\u{1f}{repository}\u{1f}{digest}\u{1f}{}",
+                    source_url.as_deref().unwrap_or("")
+                )
             }
             // registry.rs's index parser only ever constructs Git/Oci provenance
             // records (§3.3); unreachable here but the match must stay
